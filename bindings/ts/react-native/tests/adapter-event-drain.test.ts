@@ -15,7 +15,7 @@ vi.mock("../src/NativeMinip2p", () => ({
 }));
 
 const event = (peerId: string) => ({
-  inner: { peerId },
+  inner: { connId: 1n, peerId, protocols: [] },
   tag: "PeerReady",
 });
 

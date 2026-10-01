@@ -8,10 +8,9 @@ pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
 pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_platform::{Deadline as PollDeadline, EntropySource, Now, SharedEntropy};
 pub use minip2p_swarm::{
-    // Part of `EndpointEvent` / `SwarmEvent` public shapes (`ConnectionClosed`,
-    // `Error`); re-exported so portable callers can name them without a direct
-    // swarm dependency.
-    ConnectionCloseCause,
+    // Part of `EndpointEvent` / `SwarmEvent` public shapes (`Error`);
+    // re-exported so portable callers can name them without a direct swarm
+    // dependency.
     DriverError,
     IdentifyMessage,
     SwarmBuilder,
@@ -167,11 +166,11 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     ///
     /// Every candidate is dialed immediately. Candidate completion order is
     /// not a public contract. The swarm still keeps a single connection per
-    /// peer: a race loser that finishes after the winner may supersede it
-    /// (`ConnectionClosed { Superseded }` then a new `ConnectionEstablished`).
-    /// The attempt is already settled at the first established connection
-    /// (including a simultaneous inbound), and the app sees those as ordinary
-    /// connection events.
+    /// peer: a race loser that finishes after the winner may replace it
+    /// ([`EndpointEvent::ConnectionReplaced`]). The attempt is already
+    /// settled at the first established connection (including a
+    /// simultaneous inbound), and the app sees the hand-over as an ordinary
+    /// connection event.
     #[expect(
         clippy::result_large_err,
         reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."
@@ -585,8 +584,7 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         self.emit_connect_events(now, events);
         for event in self.endpoint.poll_runtime(now)? {
             let consumed = self.endpoint.observe_connect(&event, now);
-            self.discovery
-                .observe(&event, self.endpoint.runtime().core(), now.monotonic_ms);
+            self.discovery.observe(&event, now.monotonic_ms);
             if !consumed {
                 events.push(event.into());
             }
@@ -889,18 +887,15 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         self.feed_nat_to_connect(now);
     }
 
-    /// Returns the latest NAT-orchestrated path to `peer`.
+    /// Returns the NAT-orchestrated path of `peer`'s current connection.
     ///
-    /// Cleared once the connection it describes is gone: the peer's last
-    /// relay circuit for `Relayed`, its last direct connection for a direct
-    /// path, or its last connection of any kind. It is never rewritten to the
-    /// kind that remains, so this can return `None` while the peer stays
+    /// It follows a Connection replacement to the new connection's origin
+    /// and is gone once the peer disconnects. Connections NAT did not
+    /// announce have no path, so this can return `None` while the peer is
     /// connected.
     #[cfg(feature = "portable-relay")]
     pub fn path(&self, peer: &PeerId) -> Option<minip2p_nat::Path> {
-        self.nat
-            .as_ref()
-            .and_then(|nat| nat.path(peer, self.endpoint.runtime()))
+        self.nat.as_ref().and_then(|nat| nat.path(peer))
     }
 
     /// Returns the currently held relay reservation, when any.
@@ -1091,7 +1086,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         for event in self.endpoint.poll_runtime(now)? {
             let engine_consumed = self.endpoint.observe_connect(&event, now);
             if let Some(discovery) = self.discovery.as_mut() {
-                discovery.observe(&event, self.endpoint.runtime().core(), now.monotonic_ms);
+                discovery.observe(&event, now.monotonic_ms);
             }
             #[cfg(feature = "portable-autonat")]
             let claimed = engine_consumed

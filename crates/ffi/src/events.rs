@@ -58,6 +58,11 @@ pub struct ConnectionInfo {
     pub conn_id: u64,
     /// Remote transport address, when recorded.
     pub remote_addr: Option<String>,
+    /// Protocols this connection advertised through Identify, once it is
+    /// ready (`PeerReady` for this `conn_id`); `None` until then. Readiness,
+    /// connection and protocols come from one snapshot, so a ready wait can
+    /// trust them together.
+    pub ready_protocols: Option<Vec<String>>,
 }
 
 /// Coarse local reachability state.
@@ -189,27 +194,43 @@ pub enum P2pEvent {
         /// Human-readable diagnostic detail.
         detail: String,
     },
-    /// A verified connection was established.
+    /// A peer went from disconnected to connected over a verified connection.
     ConnectionEstablished {
         /// Remote peer.
         peer_id: String,
         /// Endpoint-local transport connection id.
         conn_id: u64,
     },
-    /// A connection closed.
+    /// The peer's last connection closed; the peer is now disconnected.
     ConnectionClosed {
         /// Remote peer.
         peer_id: String,
         /// Endpoint-local transport connection id.
         conn_id: u64,
     },
-    /// A peer completed Identify and is ready for application protocols.
+    /// A newer connection took the peer's single connection slot from `old`.
+    /// The peer stays connected; every stream on `old` ended with it, and a
+    /// fresh `PeerReady` follows for `new`.
+    ConnectionReplaced {
+        /// Remote peer.
+        peer_id: String,
+        /// The replaced connection id.
+        old: u64,
+        /// The connection id now carrying the peer.
+        new: u64,
+    },
+    /// A peer's connection completed Identify and is ready for application
+    /// protocols. Fires once per connection; one whose `conn_id` is no longer
+    /// the peer's current connection is stale.
     PeerReady {
         /// Remote peer.
         peer_id: String,
+        /// The connection that became ready.
+        conn_id: u64,
         /// Protocols advertised by the peer.
         protocols: Vec<String>,
     },
+
     /// A peer supplied a new Identify snapshot.
     IdentifyReceived {
         /// Remote peer.

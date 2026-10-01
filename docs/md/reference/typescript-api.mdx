@@ -94,20 +94,20 @@ and shutdown order.
 
 ## State queries
 
-| API                      | Result                                            |
-| ------------------------ | ------------------------------------------------- |
-| `peerId()`               | Local peer ID.                                    |
-| `listenAddrs()`          | Currently bound peer multiaddresses.              |
-| `connectedPeers()`       | Peer IDs with live transport connections.         |
-| `isPeerReady(peerId)`    | Whether Identify completed.                       |
-| `peerInfo(peerId)`       | Latest remote Identify snapshot, if known.        |
-| `knownPeers()`           | Multi-source discovery address book.              |
-| `discoveryNowMs()`       | Discovery monotonic time, when enabled.           |
-| `path(peerId)`           | Authoritative current `Path`, if connected.       |
-| `connectionInfo(peerId)` | Selected `{ connId, remoteAddr? }`, if connected. |
-| `reachability()`         | Latest AutoNAT reachability verdict.              |
-| `activeReservation()`    | Active relay reservation metadata.                |
-| `circuitAddress`         | Usable local circuit address, when reserved.      |
+| API | Result |
+| --- | --- |
+| `peerId()` | Local peer ID. |
+| `listenAddrs()` | Currently bound peer multiaddresses. |
+| `connectedPeers()` | Peer IDs with live transport connections. |
+| `isPeerReady(peerId)` | Whether the current connection completed Identify. |
+| `peerInfo(peerId)` | Latest remote Identify snapshot, if known. |
+| `knownPeers()` | Multi-source discovery address book. |
+| `discoveryNowMs()` | Discovery monotonic time, when enabled. |
+| `path(peerId)` | Authoritative current `Path`, if connected. |
+| `connectionInfo(peerId)` | Selected `{ connId, remoteAddr?, readyProtocols? }`, if connected; `readyProtocols` is set once that connection is ready. |
+| `reachability()` | Latest AutoNAT reachability verdict. |
+| `activeReservation()` | Active relay reservation metadata. |
+| `circuitAddress` | Usable local circuit address, when reserved. |
 
 ## Operations
 
@@ -118,7 +118,7 @@ Promise operations use `{ timeoutMs?, signal? }`. Their default timeout is 65 se
 | `connect(target, options?)` | First usable path to a `ConnectTarget`: a peer ID, one complete peer address, or a list of complete addresses naming one peer. |
 | `startConnect(target)` / `waitConnectResult(connectId, options?)` | Split-phase connection flow using a `connectId`. |
 | `cancelConnect(connectId)` | Cancel an attempt; its terminal event settles any pending wait. |
-| `waitPeerReady(peerId, options?)` | Peer ID and advertised protocol list after Identify. |
+| `waitPeerReady(peerId, options?)` | Peer ID and advertised protocol list once the peer's current connection completes Identify. A `peerReady` for a replaced connection does not resolve it. |
 | `ping(peerId, options?)` | RTT in milliseconds. |
 | `openStream(peerId, protocol, options?)` | Negotiated `Stream`. |
 | `disconnect(peerId)` | Close the active peer connection. |
@@ -158,11 +158,13 @@ Stream events are `data`, `remoteWriteClosed`, `closed`, and `dataOverflow`.
 | Family | Named events |
 | --- | --- |
 | Endpoint and queue | `eventsDropped`, `queueOverflow`, `driverFailed`, `handlerError`, `endpointError` |
-| Connection and Identify | `connectionEstablished`, `connectionClosed`, `peerReady`, `identifyReceived` |
+| Connection and Identify | `connectionEstablished`, `connectionClosed`, `connectionReplaced`, `peerReady`, `identifyReceived` |
 | Ping and streams | `pingRttMeasured`, `pingTimeout`, `stream` |
 | Relay and NAT | `reachabilityChanged`, `publicAddressesChanged`, `relayReserved`, `relayReservationLost`, `pathEstablished`, `pathUpgraded`, `holePunchFailed`, `connectFailed`, `connectCancelled`, `inboundDirectUpgrade` |
 | Pubsub | `message`, `peerSubscribed`, `peerUnsubscribed`, `gossipsubOutboundFailure`, `gossipsubProtocolViolation` |
 | Discovery | `peerDiscovered`, `peerUpdated`, `peerExpired`, `discoveryDialFailed`, `discoveryProtocolViolation` |
+
+`connectionReplaced` (`{ peerId, old, new }`) reports a newer connection taking over the peer's single connection slot; the peer stays connected, streams and pending opens on `old` end with `StreamClosedError`, and `peerReady` (which carries `connId`) fires again for `new`. `connectionClosed` means the peer's last connection closed.
 
 The catch-all stream uses `inboundStream` metadata instead of the live `stream` handle. Subscribe to the named `stream` event to claim an inbound stream.
 

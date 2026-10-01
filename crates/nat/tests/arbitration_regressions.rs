@@ -220,7 +220,6 @@ fn promoted_circuit_closed_before_fallback_fails_the_leg() {
         &SwarmEvent::ConnectionClosed {
             conn_id: conn,
             peer_id: h.target.clone(),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         true,
         at(400),
@@ -616,4 +615,65 @@ fn punch_conn_established_during_window_is_direct_punched() {
             ..
         }] if *connect_id == id
     ));
+}
+
+/// Hands the target's connection `old` over to the direct connection `new`.
+fn replace_target(h: &mut Harness, old: ConnectionId, new: ConnectionId, t: u64) {
+    h.agent.handle_event_with_disposition_classified(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: h.target.clone(),
+            old,
+            new,
+        },
+        new.is_circuit(),
+        at(t),
+    );
+}
+
+#[test]
+fn direct_replacement_of_the_provisional_circuit_upgrades_once() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, circuit) = drive_to_relayed(&mut h);
+
+    replace_target(&mut h, circuit, ConnectionId::new(50), 400);
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathUpgraded {
+            connect_id,
+            from: Path::Relayed { .. },
+            to: Path::DirectDialed,
+            ..
+        }] if *connect_id == id
+    ));
+    assert_eq!(h.agent.path(&h.target), Some(&Path::DirectDialed));
+}
+
+#[test]
+fn direct_replacement_after_the_attempt_ended_reports_against_its_origin() {
+    let mut h = Harness::with_relay(NatConfig {
+        force_relay: true,
+        ..NatConfig::default()
+    });
+    let id = h.start(RELAY_NOW, at(0));
+    let relay = dial_token_for(&drain_actions(&mut h.agent), &h.relay);
+    h.agent.dial_result(relay, Ok(ConnectionId::new(2)), at(5));
+    h.relay_session_ready(at(10));
+    let stream = StreamId::new(7);
+    let open = open_stream_token(&drain_actions(&mut h.agent));
+    h.agent.stream_open_result(open, Ok(stream), at(15));
+    h.stream_ready(stream, at(20));
+    drain_actions(&mut h.agent);
+    h.stream_data(stream, hop_status(Status::Ok), at(30));
+    let promotion = drain_actions(&mut h.agent);
+    let target = h.target.clone();
+    let circuit = complete_promotion(&mut h.agent, &target, &promotion, at(31));
+    drain_events(&mut h.agent);
+    assert!(h.agent.is_idle(), "a forced relay attempt ends at Relayed");
+
+    replace_target(&mut h, circuit, ConnectionId::new(50), 400);
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathUpgraded { connect_id, to: Path::DirectDialed, .. }] if *connect_id == id
+    ));
+    assert_eq!(h.agent.path(&h.target), Some(&Path::DirectDialed));
 }

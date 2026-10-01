@@ -199,6 +199,19 @@ impl Prober {
         }
     }
 
+    /// The server's connection was replaced. A probe still waiting for
+    /// readiness carries on with the new connection; one whose stream lived
+    /// on the old connection is lost like on a disconnect.
+    fn on_connection_replaced(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
+        if self
+            .flight
+            .as_ref()
+            .is_some_and(|f| f.stage != ExchangeStage::WaitPeerReady)
+        {
+            self.on_peer_disconnected(peer, shared, now);
+        }
+    }
+
     fn on_dial_result(
         &mut self,
         result: &Result<ConnectionId, String>,
@@ -628,7 +641,7 @@ impl ReservationManager {
         } else if shared.is_connected(&relay_peer) || shared.session_dial_pending(&relay_peer, now)
         {
             // Connected, or a connect attempt's relay leg is already dialing
-            // this relay: share that connection instead of superseding it.
+            // this relay: share that connection instead of replacing it.
             ExchangeStage::WaitPeerReady
         } else {
             let deadline_ms = shared.config.relay_leg_deadline_ms;
@@ -712,9 +725,7 @@ impl ReservationManager {
                     core::mem::replace(&mut self.state, ResState::Idle)
                     && let Some(stream) = stage.stream()
                 {
-                    // As above, the connection is terminal. Never reset by
-                    // peer after eager supersession has installed a
-                    // replacement connection.
+                    // As above, the connection is terminal; nothing to reset.
                     shared.release_stream(peer, stream);
                 }
                 if let Some(held) = self.held.take() {
@@ -727,6 +738,42 @@ impl ReservationManager {
             }
             _ => {}
         }
+    }
+
+    /// The connection carrying our reservation (or its acquisition) to
+    /// `peer` was replaced. rust-libp2p relays drop a reservation with the
+    /// connection that made it, so the old exchange is cancelled and a fresh
+    /// acquisition starts on the new connection once it is `PeerReady`. A
+    /// failure there reports the held reservation lost exactly once.
+    fn on_connection_replaced(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
+        let relay = match &self.state {
+            ResState::Reserved { relay, .. } | ResState::Acquiring { relay, .. }
+                if relay.peer_id() == peer =>
+            {
+                relay.clone()
+            }
+            _ => return,
+        };
+        match core::mem::replace(&mut self.state, ResState::Idle) {
+            ResState::Reserved { .. } => self.held = Some(peer.clone()),
+            ResState::Acquiring { stage, .. } => {
+                // The stream lived on the retired connection: release it
+                // without a peer-scoped reset that could hit the new one.
+                if let Some(stream) = stage.stream() {
+                    shared.release_stream(peer, stream);
+                }
+                shared
+                    .tokens
+                    .retain(|_, purpose| *purpose != TokenPurpose::OpenReserve(peer.clone()));
+            }
+            _ => {}
+        }
+        self.state = ResState::Acquiring {
+            relay,
+            stage: ExchangeStage::WaitPeerReady,
+            machine: None,
+            deadline: now.mono_ms + shared.config.relay_leg_deadline_ms,
+        };
     }
 
     fn on_dial_result(
@@ -1014,6 +1061,11 @@ impl Housekeeping {
     pub(crate) fn on_peer_disconnected(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
         self.prober.on_peer_disconnected(peer, shared, now);
         self.reservations.on_peer_disconnected(peer, shared, now);
+    }
+
+    pub(crate) fn on_connection_replaced(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
+        self.prober.on_connection_replaced(peer, shared, now);
+        self.reservations.on_connection_replaced(peer, shared, now);
     }
 
     pub(crate) fn on_probe_dial_result(

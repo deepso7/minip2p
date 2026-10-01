@@ -348,6 +348,13 @@ impl InboundCircuit {
         if is_circuit {
             if self.promoted == Some(conn_id) {
                 self.handshake_deadline = None;
+                shared.record_origin(
+                    conn_id,
+                    crate::Path::Relayed {
+                        relay: self.relay.clone(),
+                    },
+                    None,
+                );
                 let directly_connected = shared.is_directly_connected(peer);
                 if !self.path_announced && !directly_connected {
                     self.path_announced = true;
@@ -382,6 +389,7 @@ impl InboundCircuit {
         }
         self.blast = None;
         self.linger_until = None;
+        shared.record_origin(conn_id, crate::Path::DirectPunched, None);
         shared.push_event(NatEvent::InboundDirectUpgrade { peer: peer.clone() });
         if self.released {
             self.done = true;

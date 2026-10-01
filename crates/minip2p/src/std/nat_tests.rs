@@ -1,10 +1,10 @@
 //! Standard Endpoint NAT regression tests.
 use minip2p_core::Multiaddr;
-use minip2p_nat::{NatAction, NatAgent, NatEvent, Now, Path};
+use minip2p_nat::{NatAction, NatAgent, NatEvent, Now};
 use minip2p_platform::StdEntropy;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::Transport;
-use minip2p_transport::{ConnectionId, ConnectionNamespace, StreamId};
+use minip2p_transport::{ConnectionId, StreamId};
 use std::time::Instant;
 type NatDriver = crate::nat::NatDriver<StdEntropy>;
 use super::NextEvent;
@@ -400,6 +400,7 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
     agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: relay_peer.clone(),
+            conn_id: ConnectionId::new(1),
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
         Now::from_mono(3),
@@ -526,115 +527,6 @@ fn confirmed_public_addresses_are_advertised_and_cleared() {
 }
 
 #[test]
-fn endpoint_path_tracks_outbound_and_inbound_establishment_and_upgrade() {
-    let mut endpoint = Endpoint::builder()
-        .nat_config(NatConfig::default())
-        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
-        .expect("quic listen address")
-        .bind()
-        .expect("bind endpoint");
-    let peer = Ed25519Keypair::from_secret_key_bytes([74; 32]).peer_id();
-    let inbound = Ed25519Keypair::from_secret_key_bytes([75; 32]).peer_id();
-    let relay = Ed25519Keypair::from_secret_key_bytes([76; 32]).peer_id();
-    let recorded = |endpoint: &Endpoint, peer| {
-        endpoint
-            .nat
-            .as_ref()
-            .expect("NAT configured")
-            .recorded_path(peer)
-            .cloned()
-    };
-
-    {
-        let driver = endpoint.nat.as_mut().expect("NAT configured");
-        let connect_id = minip2p_core::ConnectId::from_u64(1);
-        driver.observe(&NatEvent::PathEstablished {
-            connect_id,
-            peer: peer.clone(),
-            path: Path::Relayed {
-                relay: relay.clone(),
-            },
-        });
-    }
-    assert_eq!(
-        recorded(&endpoint, &peer),
-        Some(Path::Relayed {
-            relay: relay.clone()
-        })
-    );
-
-    {
-        let driver = endpoint.nat.as_mut().expect("NAT configured");
-        let connect_id = minip2p_core::ConnectId::from_u64(1);
-        driver.observe(&NatEvent::PathUpgraded {
-            connect_id,
-            peer: peer.clone(),
-            from: Path::Relayed {
-                relay: relay.clone(),
-            },
-            to: Path::DirectPunched,
-        });
-        driver.observe(&NatEvent::InboundPathEstablished {
-            peer: inbound.clone(),
-            path: Path::Relayed {
-                relay: relay.clone(),
-            },
-        });
-    }
-    assert_eq!(
-        recorded(&endpoint, &inbound),
-        Some(Path::Relayed {
-            relay: relay.clone()
-        })
-    );
-
-    {
-        let driver = endpoint.nat.as_mut().expect("NAT configured");
-        driver.observe(&NatEvent::InboundDirectUpgrade {
-            peer: inbound.clone(),
-        });
-    }
-    assert_eq!(recorded(&endpoint, &peer), Some(Path::DirectPunched));
-    assert_eq!(recorded(&endpoint, &inbound), Some(Path::DirectPunched));
-    // Neither peer holds a live connection here, so the public read hides
-    // the recorded paths.
-    assert_eq!(endpoint.path(&peer), None);
-    assert_eq!(endpoint.path(&inbound), None);
-}
-
-#[test]
-fn path_is_live_only_while_a_connection_of_its_kind_remains() {
-    let relayed = Path::Relayed {
-        relay: Ed25519Keypair::from_secret_key_bytes([78; 32]).peer_id(),
-    };
-    let circuit = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 1).unwrap();
-    let direct = ConnectionId::namespaced(ConnectionNamespace::QUIC_IPV4, 1).unwrap();
-    let other_direct = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).unwrap();
-    // (recorded path, peer's established connections, live)
-    let cases = [
-        // The path's own connection closed: stale even though the peer
-        // stays connected over the other kind.
-        (Path::DirectPunched, vec![circuit], false),
-        (Path::DirectDialed, vec![circuit], false),
-        (relayed.clone(), vec![direct], false),
-        // A connection of the path's kind remains.
-        (Path::DirectPunched, vec![direct, circuit], true),
-        (relayed.clone(), vec![direct, circuit], true),
-        (Path::DirectDialed, vec![other_direct], true),
-        // The peer has no connection left.
-        (relayed.clone(), vec![], false),
-        (Path::DirectDialed, vec![], false),
-    ];
-    for (path, connections, live) in cases {
-        assert_eq!(
-            crate::nat::path_is_live(&path, connections.iter().copied()),
-            live,
-            "path {path:?}, connections {connections:?}"
-        );
-    }
-}
-
-#[test]
 fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently() {
     let mut pair = negotiated_bridge();
     let key = (pair.inner_conn, pair.stream);
@@ -692,16 +584,16 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
 }
 
 #[test]
-fn promotion_uses_action_connection_after_same_batch_relay_supersede() {
+fn promotion_uses_action_connection_after_same_batch_relay_replacement() {
     let mut pair = negotiated_bridge();
     let old_conn = pair.inner_conn;
     let stream = pair.stream;
     let relay_peer = pair.relay_addr.peer_id().clone();
     let (mut driver, promotion) = promotion_driver(&pair, false);
 
-    // Establish a replacement relay connection, but stop as soon as both
-    // public Established events have been delivered. At this seam the
-    // core points at B while its eager close of A is still deferred.
+    // Replace the relay connection, but stop as soon as both public
+    // ConnectionReplaced events have been delivered. At this seam the core
+    // points at B while the transport close of A is still deferred.
     pair.relay
         .swarm_mut()
         .dial(&pair.local_addr)
@@ -712,17 +604,17 @@ fn promotion_uses_action_connection_after_same_batch_relay_supersede() {
     while replacement.is_none() || !relay_established {
         assert!(Instant::now() < deadline, "replacement did not establish");
         if replacement.is_none()
-            && let Some(EndpointEvent::ConnectionEstablished { peer_id, conn_id }) = pair
+            && let Some(EndpointEvent::ConnectionReplaced { peer_id, old, new }) = pair
                 .local
                 .next_event(std::time::Duration::from_millis(10))
                 .expect("drive local replacement")
             && peer_id == relay_peer
-            && conn_id != old_conn
         {
-            replacement = Some(conn_id);
+            assert_eq!(old, old_conn);
+            replacement = Some(new);
         }
         if !relay_established
-            && let Some(EndpointEvent::ConnectionEstablished { peer_id, .. }) = pair
+            && let Some(EndpointEvent::ConnectionReplaced { peer_id, .. }) = pair
                 .relay
                 .next_event(std::time::Duration::from_millis(10))
                 .expect("drive relay replacement")
@@ -813,31 +705,47 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
     ));
     assert!(!closed.promoted().contains_key(&closed_key));
 
-    // An inner relay connection close drops every circuit riding it.
-    let mut inner_pair = negotiated_bridge();
-    let inner_key = (inner_pair.inner_conn, inner_pair.stream);
-    let (mut inner, action) = promotion_driver(&inner_pair, false);
-    execute(&mut inner, action, &mut inner_pair.local);
-    let promoted = circuit_id(&inner, inner_key);
-    inner.ingest(
-        &SwarmEvent::ConnectionClosed {
-            peer_id: inner_pair.relay_addr.peer_id().clone(),
-            conn_id: inner_pair.inner_conn,
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        },
-        inner_pair.local.swarm.runtime_mut(),
-        minip2p_platform::Now::from_millis(10),
-    );
-    assert!(!inner.promoted().contains_key(&inner_key));
-    let events = inner_pair
-        .local
-        .swarm
-        .transport_mut()
-        .poll(minip2p_platform::Now::from_millis(0))
-        .expect("promoted circuit closure");
-    assert!(events.iter().any(
-        |event| matches!(event, minip2p_transport::TransportEvent::Closed { id } if *id == promoted)
-    ));
+    // An inner relay connection that closes, or is replaced (its streams end
+    // with it), drops every circuit riding it.
+    for replaced in [false, true] {
+        let mut inner_pair = negotiated_bridge();
+        let inner_key = (inner_pair.inner_conn, inner_pair.stream);
+        let (mut inner, action) = promotion_driver(&inner_pair, false);
+        execute(&mut inner, action, &mut inner_pair.local);
+        let promoted = circuit_id(&inner, inner_key);
+        let peer_id = inner_pair.relay_addr.peer_id().clone();
+        let carrier_gone = if replaced {
+            SwarmEvent::ConnectionReplaced {
+                peer_id,
+                old: inner_pair.inner_conn,
+                new: ConnectionId::new(9_998),
+            }
+        } else {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                conn_id: inner_pair.inner_conn,
+            }
+        };
+        inner.ingest(
+            &carrier_gone,
+            inner_pair.local.swarm.runtime_mut(),
+            minip2p_platform::Now::from_millis(10),
+        );
+        assert!(!inner.promoted().contains_key(&inner_key));
+        let events = inner_pair
+            .local
+            .swarm
+            .transport_mut()
+            .poll(minip2p_platform::Now::from_millis(0))
+            .expect("promoted circuit closure");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                minip2p_transport::TransportEvent::Closed { id } if *id == promoted
+            )),
+            "replaced={replaced}"
+        );
+    }
 
     // A circuit lifecycle close also removes its reverse map entry.
     let mut circuit_pair = negotiated_bridge();
@@ -849,7 +757,6 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         &SwarmEvent::ConnectionClosed {
             peer_id: Ed25519Keypair::from_secret_key_bytes([73; 32]).peer_id(),
             conn_id: promoted,
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         circuit_pair.local.swarm.runtime_mut(),
         minip2p_platform::Now::from_millis(10),

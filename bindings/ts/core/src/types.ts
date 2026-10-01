@@ -175,9 +175,31 @@ export interface Minip2pNamedEventMap {
     readonly kind: DriverFailureKind;
     readonly detail: string;
   };
+  /** A peer went from disconnected to connected on `connId`. */
   connectionEstablished: { readonly peerId: string; readonly connId: number };
+  /** The peer's last connection closed; the peer is now disconnected. */
   connectionClosed: { readonly peerId: string; readonly connId: number };
-  peerReady: { readonly peerId: string; readonly protocols: readonly string[] };
+  /**
+   * A newer connection took the peer's single connection slot from `old`.
+   * The peer stays connected: this stands in for both a `connectionClosed`
+   * for `old` and a `connectionEstablished` for `new`. Every stream and
+   * pending open on `old` ends with it, and a fresh `peerReady` follows for
+   * `new`.
+   */
+  connectionReplaced: {
+    readonly peerId: string;
+    readonly old: number;
+    readonly new: number;
+  };
+  /**
+   * Identify completed on `connId`. Fires once per connection; one whose
+   * `connId` is no longer the peer's current connection is stale.
+   */
+  peerReady: {
+    readonly peerId: string;
+    readonly connId: number;
+    readonly protocols: readonly string[];
+  };
   identifyReceived: { readonly peerId: string; readonly info: IdentifyInfo };
   pingRttMeasured: { readonly peerId: string; readonly rttMs: number };
   pingTimeout: { readonly peerId: string };
@@ -332,6 +354,11 @@ export interface ConnectionInfo {
   readonly connId: number;
   /** Remote transport address, when known. */
   readonly remoteAddr?: string;
+  /**
+   * Protocols this connection advertised, once it is ready; absent until
+   * then. Readiness, `connId` and protocols come from one native snapshot.
+   */
+  readonly readyProtocols?: readonly string[];
 }
 
 /** Options accepted by {@link Minip2pBase.once}. */
@@ -390,6 +417,7 @@ export const P2pEvent_Tags = {
   ConnectFailed: "ConnectFailed",
   ConnectionClosed: "ConnectionClosed",
   ConnectionEstablished: "ConnectionEstablished",
+  ConnectionReplaced: "ConnectionReplaced",
   DiscoveryDialFailed: "DiscoveryDialFailed",
   DiscoveryProtocolViolation: "DiscoveryProtocolViolation",
   DriverFailed: "DriverFailed",
@@ -450,9 +478,10 @@ export type P2pEvent =
       { peerId: string; connId: number }
     >
   | RawEvent<
-      typeof P2pEvent_Tags.PeerReady,
-      { peerId: string; protocols: readonly string[] }
+      typeof P2pEvent_Tags.ConnectionReplaced,
+      Minip2pNamedEventMap["connectionReplaced"]
     >
+  | RawEvent<typeof P2pEvent_Tags.PeerReady, Minip2pNamedEventMap["peerReady"]>
   | RawEvent<
       typeof P2pEvent_Tags.IdentifyReceived,
       { peerId: string; info: IdentifyInfo }

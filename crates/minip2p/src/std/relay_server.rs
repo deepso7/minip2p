@@ -56,7 +56,10 @@ impl RelayServerDriver {
 
     pub(crate) fn ingest(&mut self, event: &SwarmEvent, swarm: &mut EndpointSwarm) -> bool {
         let now = self.now();
-        if let SwarmEvent::ConnectionClosed { conn_id, .. } = event {
+        // A closed or replaced connection takes its in-flight negotiations with it.
+        if let SwarmEvent::ConnectionClosed { conn_id, .. }
+        | SwarmEvent::ConnectionReplaced { old: conn_id, .. } = event
+        {
             for token in take_pending_for_connection(&mut self.pending_opens, *conn_id) {
                 self.agent.stream_open_result(
                     token,
@@ -102,12 +105,15 @@ impl RelayServerDriver {
             | SwarmEvent::StreamRemoteWriteClosed { conn_id, .. }
             | SwarmEvent::StreamWriteStopped { conn_id, .. }
             | SwarmEvent::StreamClosed { conn_id, .. } => conn_id.is_circuit(),
+            // The agent's flag describes the connection taking the slot.
+            SwarmEvent::ConnectionReplaced { new, .. } => new.is_circuit(),
             _ => false,
         };
         // The first event at this time sample runs the agent tick before
         // dispatch, preserving deadline-first ordering for the batch.
         let claimed = self.agent.handle_event(event, is_circuit, now);
-        if let SwarmEvent::ConnectionEstablished { conn_id, .. } = event
+        if let SwarmEvent::ConnectionEstablished { conn_id, .. }
+        | SwarmEvent::ConnectionReplaced { new: conn_id, .. } = event
             && let Some(address) = swarm.connection_remote_addr(*conn_id).cloned()
         {
             self.agent.set_connection_addr(*conn_id, address);

@@ -14,7 +14,7 @@
 //! to force the same deadline-first order without an event. Exact
 //! [`minip2p_transport::ConnectionId`] identity is retained throughout; the
 //! service relies on Swarm's single live connection per peer while still
-//! rejecting stale results from superseded connections.
+//! rejecting stale results from replaced connections.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]

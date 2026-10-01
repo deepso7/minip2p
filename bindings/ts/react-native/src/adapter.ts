@@ -151,10 +151,13 @@ class ReactNativeBackend implements Minip2pBackend {
     if (info === undefined) {
       return undefined;
     }
-    const connId = this.#connectionIds.toPublic(info.connId);
-    return info.remoteAddr === undefined
-      ? { connId }
-      : { connId, remoteAddr: info.remoteAddr };
+    return {
+      connId: this.#connectionIds.toPublic(info.connId),
+      ...(info.remoteAddr !== undefined && { remoteAddr: info.remoteAddr }),
+      ...(info.readyProtocols !== undefined && {
+        readyProtocols: info.readyProtocols,
+      }),
+    };
   }
 
   circuitAddress(relayAddress: string, peerId: string): string {
@@ -306,8 +309,8 @@ export function circuitAddress(relayAddress: string, peerId: string): string {
  * Native connection IDs span the full `u64` range, so they cannot round-trip
  * through a JavaScript `number`. Each endpoint owns one map so a native ID
  * resolves to the same public ID in events and synchronous results. An entry
- * is released once its `ConnectionClosed` event is normalized, which bounds
- * the map by live connections. Public numbers come from a counter that never
+ * is released once its `ConnectionClosed`, or the `ConnectionReplaced` that
+ * retires it, is normalized, which bounds the map by live connections. Public numbers come from a counter that never
  * repeats, so an event arriving after the release gets a fresh number instead
  * of aliasing a live connection. Stream and connect-attempt IDs are not
  * mapped because they round-trip into native calls, and native allocates
@@ -352,6 +355,8 @@ function normalizeEvent(
   ) as P2pEvent;
   if (normalized.tag === P2pEvent_Tags.ConnectionClosed) {
     connectionIds.release(normalized.inner.connId);
+  } else if (normalized.tag === P2pEvent_Tags.ConnectionReplaced) {
+    connectionIds.release(normalized.inner.old);
   }
   return normalized;
 }
@@ -370,10 +375,17 @@ function normalizeReservation(
   return normalizeBigInts(reservation) as RelayReservationInfo;
 }
 
+/** Event fields carrying a native connection ID (`old`/`new` belong to `ConnectionReplaced`). */
+const CONNECTION_ID_KEYS: ReadonlySet<string> = new Set([
+  "connId",
+  "old",
+  "new",
+]);
+
 /**
- * Converts native `bigint` fields to numbers. `connId` fields go through the
- * endpoint's connection map when one is supplied; every other `u64` keeps the
- * checked conversion.
+ * Converts native `bigint` fields to numbers. Connection ID fields go through
+ * the endpoint's connection map when one is supplied; every other `u64` keeps
+ * the checked conversion.
  */
 function normalizeBigInts(
   value: unknown,
@@ -381,7 +393,9 @@ function normalizeBigInts(
   key?: string
 ): unknown {
   if (typeof value === "bigint") {
-    return key === "connId" && connectionIds !== undefined
+    return key !== undefined &&
+      CONNECTION_ID_KEYS.has(key) &&
+      connectionIds !== undefined
       ? connectionIds.toPublic(value)
       : u64ToNumber(value, "native u64");
   }

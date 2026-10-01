@@ -418,6 +418,7 @@ impl Harness {
         self.agent.handle_event(
             &SwarmEvent::PeerReady {
                 peer_id: self.relay.clone(),
+                conn_id: ConnectionId::new(1),
                 protocols: vec![HOP_PROTOCOL_ID.to_string()],
             },
             now,

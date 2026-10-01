@@ -77,8 +77,9 @@ pub struct SwarmRuntime<T: Transport, E: EntropySource> {
 
     /// Transport actions ordered after application events by the Sans-I/O
     /// core. They are dispatched only after the buffered events have been
-    /// returned to the application. In particular, supersession must expose
-    /// `ConnectionClosed` before closing the old transport connection.
+    /// returned to the application. In particular, a Connection replacement
+    /// must deliver `ConnectionReplaced` before closing the old transport
+    /// connection.
     after_event_actions: VecDeque<SwarmAction>,
 
     /// Externally validated addresses advertised through Identify in
@@ -205,7 +206,8 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         &mut self.core
     }
 
-    /// Returns peers currently surfaced through `ConnectionEstablished` and not yet closed.
+    /// Returns peers currently surfaced through `ConnectionEstablished` and
+    /// not yet closed. A Connection replacement keeps the peer listed.
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.core.connected_peers()
     }
@@ -215,9 +217,15 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         self.core.peer_info(peer_id)
     }
 
-    /// Returns whether `peer_id` has emitted `PeerReady`.
+    /// Returns whether `peer_id`'s current connection has emitted `PeerReady`.
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
         self.core.is_peer_ready(peer_id)
+    }
+
+    /// Returns the peer's current connection and its Identify info when that
+    /// connection is ready; see [`SwarmCore::peer_readiness`].
+    pub fn peer_readiness(&self, peer_id: &PeerId) -> Option<(ConnectionId, &IdentifyMessage)> {
+        self.core.peer_readiness(peer_id)
     }
 
     /// Returns this node's own `PeerId`.
@@ -395,7 +403,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         }
     }
 
-    /// Marks a restored dial so a late handshake cannot supersede an existing
+    /// Marks a restored dial so a late handshake cannot replace an existing
     /// peer connection. See [`SwarmCore::veto_establish`].
     pub fn veto_establish(&mut self, conn_id: ConnectionId) {
         self.core.veto_establish(conn_id);
@@ -631,7 +639,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
 
         // Actions deferred by the previous poll are now safe to dispatch if
         // every event that preceded them has been returned to the caller.
-        // Do this before reading more transport input so superseded
+        // Do this before reading more transport input so replaced
         // connections cannot produce another batch ahead of their close.
         self.flush_actions(now_ms);
 
@@ -678,7 +686,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     pub fn next_deadline(&self, now: Now) -> Option<Deadline> {
         // Work already queued needs another drive iteration whatever the
         // timers say. `poll` defers actions ordered after an event until the
-        // application has seen that event, so a supersession's
+        // application has seen that event, so a replacement's
         // `CloseConnection` can be sitting here with no timer to wake it.
         if !self.after_event_actions.is_empty() || !self.event_buffer.is_empty() {
             return Some(Deadline::IMMEDIATE);
@@ -736,6 +744,13 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
                     self.event_buffer.push_back(event);
                 }
             }
+        }
+
+        // A connection that never established took its placeholder peer's
+        // events with it; drop the ones this runtime already buffered.
+        for peer in self.core.take_discarded_placeholders() {
+            self.event_buffer
+                .retain(|event| event.peer_id() != Some(&peer));
         }
     }
 
@@ -1261,7 +1276,6 @@ mod tests {
             .push_back(SwarmEvent::ConnectionClosed {
                 peer_id: Ed25519Keypair::generate().peer_id(),
                 conn_id: ConnectionId::new(1),
-                cause: crate::ConnectionCloseCause::Transport,
             });
         assert_eq!(runtime.next_deadline(now), Some(Deadline::IMMEDIATE));
     }
@@ -1423,7 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn veto_establish_closes_dial_without_superseding_existing_peer() {
+    fn veto_establish_closes_dial_without_replacing_existing_peer() {
         let peer = Ed25519Keypair::generate().peer_id();
         let existing_addr = PeerAddr::new(
             "/ip4/198.51.100.9/udp/4001/quic-v1".parse().expect("addr"),
@@ -1486,14 +1500,10 @@ mod tests {
             events.iter().all(|event| {
                 !matches!(
                     event,
-                    SwarmEvent::ConnectionClosed {
-                        conn_id,
-                        cause: crate::ConnectionCloseCause::Superseded,
-                        ..
-                    } if *conn_id == existing
+                    SwarmEvent::ConnectionReplaced { old, .. } if *old == existing
                 )
             }),
-            "existing connection must not be superseded; got {events:?}"
+            "existing connection must not be replaced; got {events:?}"
         );
         assert_eq!(runtime.connection_id(&peer), Some(existing));
         assert!(

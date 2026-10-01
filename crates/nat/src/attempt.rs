@@ -310,6 +310,9 @@ impl ConnectAttempt {
         }
         if is_circuit {
             if self.promoted == Some(conn_id) {
+                if let Some(relay) = self.relay_peer().cloned() {
+                    shared.record_origin(conn_id, Path::Relayed { relay }, Some(self.id));
+                }
                 self.announce_relay_path(shared);
                 if shared.config.force_relay {
                     self.done = true;
@@ -331,6 +334,7 @@ impl ConnectAttempt {
         };
         match &self.best {
             None => {
+                shared.record_origin(conn_id, path.clone(), Some(self.id));
                 self.best = Some(path.clone());
                 shared.push_event(NatEvent::PathEstablished {
                     connect_id: self.id,
@@ -339,6 +343,7 @@ impl ConnectAttempt {
                 });
             }
             Some(Path::Relayed { .. }) => {
+                shared.record_origin(conn_id, path.clone(), Some(self.id));
                 let from = self.best.replace(path.clone()).expect("checked Some above");
                 shared.push_event(NatEvent::PathUpgraded {
                     connect_id: self.id,
@@ -347,11 +352,36 @@ impl ConnectAttempt {
                     to: path,
                 });
             }
-            // A duplicate direct connection (QUIC supersede) — nothing new.
+            // A second direct connection replacing the first — nothing new.
             Some(_) => return,
         }
         let _ = now;
         self.punch_deadline = None;
+        self.teardown_relay_leg(shared);
+        self.done = true;
+    }
+
+    /// The target's connection `old` was replaced while the peer stays
+    /// connected. Called after `new` was applied: when `old` was the circuit
+    /// this attempt promoted and nothing better took over, the attempt is
+    /// complete on `new` rather than failed by `old`'s retirement.
+    pub(crate) fn on_target_replaced(
+        &mut self,
+        peer: &PeerId,
+        old: ConnectionId,
+        shared: &mut Shared,
+    ) {
+        if self.done || *peer != self.peer || self.promoted != Some(old) {
+            return;
+        }
+        self.promoted = None;
+        self.bridge_alive = false;
+        self.punch_deadline = None;
+        // The DCUtR stream lived on `old`; a peer-scoped reset could hit a
+        // stream of `new` that reuses its id.
+        if let Some(stream) = self.dcutr_stream.take() {
+            shared.release_stream(peer, stream);
+        }
         self.teardown_relay_leg(shared);
         self.done = true;
     }
@@ -386,18 +416,18 @@ impl ConnectAttempt {
             return;
         }
         // Waiting for relay readiness and issuing OpenStream are peer-scoped,
-        // so a connection close has no exact ownership signal. In particular,
-        // Swarm reports Closed(old) before Established(new) for a QUIC
-        // supersede. Keep both pre-allocation phases alive: PeerReady or the
-        // open result continues them on the replacement, while a real loss is
-        // still bounded by the relay deadline (and usually an open error).
+        // so a connection close has no exact ownership signal. Keep both
+        // pre-allocation phases alive: after a Connection replacement
+        // PeerReady or the open result continues them on the new
+        // connection, while a real loss is still bounded by the relay
+        // deadline (and usually an open error).
         // Allocated stream phases retain conservative teardown until
         // StreamReady records exact ownership in `bridge_inner_conn`.
         match self.leg {
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {
                 // The exact owning connection is terminal. Release local
                 // state without a peer-scoped reset that could target its
-                // eager replacement.
+                // replacement.
                 shared.release_stream(peer, stream);
                 self.leg = RelayLeg::Failed;
                 self.fail_relay_leg(

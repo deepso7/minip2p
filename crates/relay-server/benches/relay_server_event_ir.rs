@@ -10,7 +10,7 @@ use minip2p_relay_server::{
     CircuitCloseReason, RateLimit, RelayServerAction, RelayServerAgent, RelayServerConfig,
     RelayServerEvent, ReservationCloseReason, StreamKey,
 };
-use minip2p_swarm::{ConnectionCloseCause, SwarmEvent};
+use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 use std::hint::black_box;
 
@@ -324,7 +324,6 @@ fn scale_agent_and_closed_source() -> (RelayServerAgent, SwarmEvent) {
     let closed = SwarmEvent::ConnectionClosed {
         peer_id: peer("source", 0),
         conn_id: source_conn(0),
-        cause: ConnectionCloseCause::Transport,
     };
     (scale_agent(), closed)
 }

@@ -218,7 +218,9 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
         _ => panic!("connection predicate returned a different event"),
     };
     log.wait_for(|event| {
-        matches!(event, P2pEvent::PeerReady { peer_id, protocols }
+        matches!(event, P2pEvent::PeerReady {
+            peer_id, protocols, ..
+        }
             if peer_id == &go_peer && protocols.iter().any(|id| id == ECHO_PROTOCOL))
     });
     let identify = log.wait_for(|event| {

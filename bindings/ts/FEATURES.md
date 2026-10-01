@@ -7,7 +7,8 @@
 | Identity, peer ID, bound addresses | `@minip2p/react-native` exports `generateSecretKey` and `peerIdFromSecretKey`; the portable `@minip2p/core` endpoint API exposes `peerId` and `listenAddrs` |
 | Address-shaped QUIC and TCP listeners | `listen` configuration |
 | Ping | Promise-returning `ping`, plus typed ping events |
-| Identify readiness and snapshots | `isPeerReady`, `waitPeerReady`, `peerInfo`, Identify events |
+| Identify readiness and snapshots | `isPeerReady`, `waitPeerReady` (follows the peer's current connection), `peerInfo`, `connectionInfo(peerId).readyProtocols`, Identify events |
+| Connection lifecycle | `connectionEstablished`, `connectionReplaced` (the peer stays connected; streams on `old` end), and `connectionClosed` (the peer disconnected) events |
 | Custom protocol registration | `protocols` configuration, `addProtocol` |
 | Negotiated streams | Promise-returning `openStream` and `Stream` handles with `write`, `read`, `closeWrite`, `reset`, and `abandon` |
 | Connection targets and Connect IDs | Promise-returning `connect(target)`, split-phase `startConnect(target)`/`waitConnectResult`/`cancelConnect`, and typed terminal events |

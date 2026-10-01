@@ -10,7 +10,7 @@ use minip2p_relay::{
     MAX_PENDING_BRIDGE_SIZE, Reservation, STOP_PROTOCOL_ID, Status, StopInitiator,
     StopInitiatorInput, StopInitiatorOutcome, StopInitiatorOutput, encode_hop_status,
 };
-use minip2p_swarm::{ConnectionCloseCause, DriverError, SwarmEvent, SwarmRuntime};
+use minip2p_swarm::{DriverError, SwarmEvent, SwarmRuntime};
 use minip2p_transport::{ConnectionId, Transport};
 
 use crate::address::normalize_addrs;
@@ -309,6 +309,9 @@ impl RelayServerAgent {
 
     /// Feeds one Swarm event and returns whether the service claimed it.
     ///
+    /// `is_circuit` says whether the event's connection is a relay circuit;
+    /// for [`SwarmEvent::ConnectionReplaced`] it describes `new`.
+    ///
     /// The first event for a `Now` sample processes due deadlines. Subsequent
     /// events with that same sample share the completed sweep; call
     /// [`handle_tick`](Self::handle_tick) to force a sweep independently.
@@ -319,12 +322,12 @@ impl RelayServerAgent {
                 self.on_connection_established(peer_id.clone(), *conn_id, is_circuit);
                 false
             }
-            SwarmEvent::ConnectionClosed {
-                peer_id,
-                conn_id,
-                cause,
-            } => {
-                self.on_connection_closed(peer_id, *conn_id, *cause);
+            SwarmEvent::ConnectionClosed { peer_id, conn_id } => {
+                self.on_connection_closed(peer_id, *conn_id);
+                false
+            }
+            SwarmEvent::ConnectionReplaced { peer_id, old, new } => {
+                self.on_connection_replaced(peer_id, *old, *new, is_circuit);
                 false
             }
             SwarmEvent::StreamReady {
@@ -890,25 +893,6 @@ impl RelayServerAgent {
         conn_id: ConnectionId,
         is_circuit: bool,
     ) {
-        let replaced: Vec<_> = self
-            .connections
-            .iter()
-            .filter_map(|(id, connection)| {
-                (connection.peer_id == peer_id && *id != conn_id).then_some(*id)
-            })
-            .collect();
-        for old_conn_id in replaced {
-            self.on_connection_closed(&peer_id, old_conn_id, ConnectionCloseCause::Superseded);
-        }
-        if let Some(old) = self.reservations.get(&peer_id)
-            && old.conn_id != conn_id
-        {
-            self.reservations.remove(&peer_id);
-            self.events.push_back(RelayServerEvent::ReservationClosed {
-                peer_id: peer_id.clone(),
-                reason: ReservationCloseReason::Superseded,
-            });
-        }
         self.connections.insert(
             conn_id,
             Connection {
@@ -919,12 +903,29 @@ impl RelayServerAgent {
         );
     }
 
-    fn on_connection_closed(
+    /// Applies `new` before retiring `old`.
+    ///
+    /// A reservation on `old` moves to a direct `new` with its original
+    /// expiry; a circuit `new` cannot hold one, so retiring `old` closes it.
+    /// Uncommitted RESERVE exchanges and every circuit on `old` end with it.
+    fn on_connection_replaced(
         &mut self,
         peer_id: &PeerId,
-        conn_id: ConnectionId,
-        cause: ConnectionCloseCause,
+        old: ConnectionId,
+        new: ConnectionId,
+        is_circuit: bool,
     ) {
+        self.on_connection_established(peer_id.clone(), new, is_circuit);
+        if !is_circuit
+            && let Some(reservation) = self.reservations.get_mut(peer_id)
+            && reservation.conn_id == old
+        {
+            reservation.conn_id = new;
+        }
+        self.on_connection_closed(peer_id, old);
+    }
+
+    fn on_connection_closed(&mut self, peer_id: &PeerId, conn_id: ConnectionId) {
         let affected: Vec<_> = self
             .circuits
             .iter()
@@ -940,7 +941,7 @@ impl RelayServerAgent {
             })
             .collect();
         for (key, leg) in affected {
-            self.close_circuit(key, CircuitCloseReason::ConnectionClosed { leg, cause });
+            self.close_circuit(key, CircuitCloseReason::ConnectionClosed { leg });
         }
         let pending: Vec<_> = self
             .pending_circuits
@@ -971,10 +972,7 @@ impl RelayServerAgent {
             self.reservations.remove(peer_id);
             self.events.push_back(RelayServerEvent::ReservationClosed {
                 peer_id: peer_id.clone(),
-                reason: match cause {
-                    ConnectionCloseCause::Transport => ReservationCloseReason::ConnectionClosed,
-                    ConnectionCloseCause::Superseded => ReservationCloseReason::Superseded,
-                },
+                reason: ReservationCloseReason::ConnectionClosed,
             });
         }
         let closed_hop_streams: Vec<_> = self
@@ -1431,14 +1429,12 @@ impl RelayServerAgent {
             }
             | CircuitCloseReason::ConnectionClosed {
                 leg: CircuitLeg::Source,
-                ..
             } => (false, true),
             CircuitCloseReason::StreamReset {
                 leg: CircuitLeg::Destination,
             }
             | CircuitCloseReason::ConnectionClosed {
                 leg: CircuitLeg::Destination,
-                ..
             } => (true, false),
             _ => (true, true),
         };
@@ -1562,7 +1558,10 @@ impl RelayServerAgent {
             .flatten();
         let status = if wire.is_none() {
             Some(Status::ReservationRefused)
-        } else if !self.consume_reservation_limits(&peer_id, key.conn_id, now.monotonic_ms) {
+        // Renewals keep an admitted reservation alive and spend no token.
+        } else if !renewed
+            && !self.consume_reservation_limits(&peer_id, key.conn_id, now.monotonic_ms)
+        {
             Some(Status::ResourceLimitExceeded)
         } else {
             (pending_for_peer
@@ -2052,6 +2051,35 @@ mod tests {
             false,
             Now::from_millis(0),
         );
+    }
+
+    fn replace(
+        agent: &mut RelayServerAgent,
+        peer_id: &PeerId,
+        old: ConnectionId,
+        new: ConnectionId,
+        new_is_circuit: bool,
+        now_ms: u64,
+    ) {
+        agent.handle_event(
+            &SwarmEvent::ConnectionReplaced {
+                peer_id: peer_id.clone(),
+                old,
+                new,
+            },
+            new_is_circuit,
+            Now::from_millis(now_ms),
+        );
+    }
+
+    fn reserve_request() -> HopMessage {
+        HopMessage {
+            kind: HopMessageType::Reserve,
+            peer: None,
+            reservation: None,
+            limit: None,
+            status: None,
+        }
     }
 
     fn feed_hop(
@@ -2664,14 +2692,13 @@ mod tests {
     }
 
     #[test]
-    fn successful_full_capacity_renewal_consumes_a_rate_token() {
+    fn renewal_spends_no_rate_token() {
         let remote = PeerId::from_public_key_protobuf(b"client-renewal-token");
         let conn_id = ConnectionId::new(343);
         let config = RelayServerConfig {
-            max_reservations: 1,
             reservation_rate_limit_per_peer: Some(RateLimit {
-                capacity: 2,
-                refill_interval_ms: 1_000,
+                capacity: 1,
+                refill_interval_ms: 1_000_000,
             }),
             reservation_rate_limit_per_ip: None,
             ..RelayServerConfig::default()
@@ -2691,43 +2718,20 @@ mod tests {
             },
         );
         for stream_id in [2, 3] {
-            feed_hop(
-                &mut agent,
-                &remote,
-                StreamKey {
-                    conn_id,
-                    stream_id: StreamId::new(stream_id),
-                },
-                HopMessage {
-                    kind: HopMessageType::Reserve,
-                    peer: None,
-                    reservation: None,
-                    limit: None,
-                    status: None,
-                },
-                &[],
-            );
-            if stream_id == 2 {
-                let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap()
-                else {
-                    panic!("renewal response");
-                };
-                agent.send_stream_result(token, Ok(()), Now::from_millis(10));
-                assert!(matches!(
-                    agent.poll_event(),
-                    Some(RelayServerEvent::ReservationAccepted { renewed: true, .. })
-                ));
-                let _ = agent.poll_action();
-                assert_eq!(agent.reservation_count(), 1);
-            } else {
-                assert!(matches!(
-                    agent.poll_event(),
-                    Some(RelayServerEvent::ReservationDenied {
-                        status: Status::ResourceLimitExceeded,
-                        ..
-                    })
-                ));
-            }
+            let stream = StreamKey {
+                conn_id,
+                stream_id: StreamId::new(stream_id),
+            };
+            feed_hop(&mut agent, &remote, stream, reserve_request(), &[]);
+            let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+                panic!("renewal response");
+            };
+            agent.send_stream_result(token, Ok(()), Now::from_millis(0));
+            assert!(matches!(
+                agent.poll_event(),
+                Some(RelayServerEvent::ReservationAccepted { renewed: true, .. })
+            ));
+            while agent.poll_action().is_some() {}
         }
     }
 
@@ -2897,7 +2901,6 @@ mod tests {
                 SwarmEvent::ConnectionClosed {
                     peer_id: first,
                     conn_id: first_stream.conn_id,
-                    cause: ConnectionCloseCause::Transport,
                 }
             } else {
                 SwarmEvent::StreamClosed {
@@ -2944,17 +2947,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stale_old_connection_close_cannot_remove_replacement_reservation() {
-        let local = PeerId::from_public_key_protobuf(b"relay-stale");
-        let remote = PeerId::from_public_key_protobuf(b"client-stale");
+    fn single_reservation_agent(duration_secs: u64) -> (RelayServerAgent, PeerId) {
         let config = RelayServerConfig {
+            reservation_duration_secs: duration_secs,
             reservation_rate_limit_per_peer: None,
             reservation_rate_limit_per_ip: None,
             ..RelayServerConfig::default()
         };
-        let mut agent = RelayServerAgent::new(local, config).unwrap();
+        let mut agent =
+            RelayServerAgent::new(PeerId::from_public_key_protobuf(b"relay-replace"), config)
+                .unwrap();
         agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        let remote = PeerId::from_public_key_protobuf(b"client-replace");
         reserve(
             &mut agent,
             &remote,
@@ -2963,38 +2967,57 @@ mod tests {
                 stream_id: StreamId::new(1),
             },
         );
-        establish(&mut agent, &remote, ConnectionId::new(36));
-        assert!(matches!(
-            agent.poll_event(),
-            Some(RelayServerEvent::ReservationClosed {
-                reason: crate::ReservationCloseReason::Superseded,
-                ..
-            })
-        ));
-        reserve(
-            &mut agent,
-            &remote,
-            StreamKey {
-                conn_id: ConnectionId::new(36),
-                stream_id: StreamId::new(1),
-            },
-        );
+        (agent, remote)
+    }
 
+    #[test]
+    fn direct_replacement_rebinds_reservation_with_its_original_expiry() {
+        let (mut agent, remote) = single_reservation_agent(1);
+        let new = ConnectionId::new(36);
+        replace(&mut agent, &remote, ConnectionId::new(35), new, false, 500);
+        assert_eq!(agent.reservation_connection(&remote), Some(new));
+        assert_eq!(agent.poll_event(), None);
+
+        // A stale close for the old connection cannot touch the rebound reservation.
         agent.handle_event(
             &SwarmEvent::ConnectionClosed {
                 peer_id: remote.clone(),
                 conn_id: ConnectionId::new(35),
-                cause: minip2p_swarm::ConnectionCloseCause::Superseded,
             },
             false,
-            Now::from_millis(1),
+            Now::from_millis(500),
         );
+        assert_eq!(agent.reservation_connection(&remote), Some(new));
 
-        assert_eq!(
-            agent.reservation_connection(&remote),
-            Some(ConnectionId::new(36))
+        agent.handle_tick(Now::from_millis(1_000));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::ReservationClosed {
+                reason: crate::ReservationCloseReason::Expired,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn circuit_replacement_closes_reservation() {
+        let (mut agent, remote) = single_reservation_agent(60);
+        replace(
+            &mut agent,
+            &remote,
+            ConnectionId::new(35),
+            ConnectionId::new(36),
+            true,
+            1,
         );
-        assert_eq!(agent.poll_event(), None);
+        assert!(!agent.has_reservation(&remote));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::ReservationClosed {
+                peer_id,
+                reason: crate::ReservationCloseReason::ConnectionClosed,
+            }) if peer_id == remote
+        ));
     }
 
     #[test]
@@ -3206,13 +3229,10 @@ mod tests {
     }
 
     #[test]
-    fn stale_old_connection_cannot_commit_after_defensive_replacement() {
-        let local = PeerId::from_public_key_protobuf(b"relay-old-input");
+    fn replacement_cancels_an_uncommitted_reserve_on_old() {
         let remote = PeerId::from_public_key_protobuf(b"client-old-input");
-        let old = ConnectionId::new(40);
-        let new = ConnectionId::new(41);
         let old_stream = StreamKey {
-            conn_id: old,
+            conn_id: ConnectionId::new(40),
             stream_id: StreamId::new(1),
         };
         let config = RelayServerConfig {
@@ -3220,40 +3240,29 @@ mod tests {
             reservation_rate_limit_per_ip: None,
             ..RelayServerConfig::default()
         };
-        let mut agent = RelayServerAgent::new(local, config).unwrap();
+        let mut agent =
+            RelayServerAgent::new(PeerId::from_public_key_protobuf(b"relay-old-input"), config)
+                .unwrap();
         agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
-        establish(&mut agent, &remote, old);
-        establish(&mut agent, &remote, new);
+        establish(&mut agent, &remote, old_stream.conn_id);
+        feed_hop(&mut agent, &remote, old_stream, reserve_request(), &[]);
+        let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+            panic!("reservation response");
+        };
 
-        feed_hop(
+        replace(
             &mut agent,
             &remote,
-            old_stream,
-            HopMessage {
-                kind: HopMessageType::Reserve,
-                peer: None,
-                reservation: None,
-                limit: None,
-                status: None,
-            },
-            &[],
+            old_stream.conn_id,
+            ConnectionId::new(41),
+            false,
+            1,
         );
-        while let Some(action) = agent.poll_action() {
-            match action {
-                RelayServerAction::SendStream { token, .. } => {
-                    agent.send_stream_result(token, Ok(()), Now::from_millis(1));
-                }
-                RelayServerAction::ResetStream { token, .. } => {
-                    agent.reset_stream_result(token, Ok(()), Now::from_millis(1));
-                }
-                RelayServerAction::CloseStreamWrite { token, .. } => {
-                    agent.close_stream_write_result(token, Ok(()), Now::from_millis(1));
-                }
-                RelayServerAction::OpenStream { .. } => panic!("no STOP open"),
-            }
-        }
+        agent.send_stream_result(token, Ok(()), Now::from_millis(1));
 
-        assert_eq!(agent.reservation_connection(&remote), None);
+        assert!(!agent.has_reservation(&remote));
+        assert!(!agent.owns_stream(old_stream));
+        assert_eq!(agent.poll_event(), None);
     }
 
     #[test]
@@ -4186,6 +4195,39 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn replacing_a_leg_connection_closes_its_circuit() {
+        let (mut agent, _, destination, source_stream, stop_stream) =
+            connected_circuit(RelayServerConfig::default(), 0);
+        replace(
+            &mut agent,
+            &destination,
+            stop_stream.conn_id,
+            ConnectionId::new(62),
+            false,
+            1,
+        );
+
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitClosed {
+                reason: CircuitCloseReason::ConnectionClosed {
+                    leg: CircuitLeg::Destination,
+                },
+                ..
+            })
+        ));
+        assert_eq!(agent.circuit_count(), 0);
+        assert!(matches!(
+            agent.poll_action(),
+            Some(RelayServerAction::ResetStream { stream, .. }) if stream == source_stream
+        ));
+        assert_eq!(
+            agent.reservation_connection(&destination),
+            Some(ConnectionId::new(62))
+        );
     }
 
     #[test]

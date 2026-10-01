@@ -106,6 +106,7 @@ impl Hk {
         self.agent.handle_event(
             &SwarmEvent::PeerReady {
                 peer_id: peer.clone(),
+                conn_id: ConnectionId::new(1),
                 protocols: protocols.iter().map(|p| p.to_string()).collect(),
             },
             now,
@@ -579,26 +580,9 @@ fn lost_relay_connection_emits_lost_and_reacquires() {
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay.clone(),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(5_000),
     );
-    assert_eq!(
-        hk.agent.next_timeout(5_000),
-        Some(0),
-        "the possible peer disconnect must be reconciled promptly"
-    );
-    assert!(
-        drain_events(&mut hk.agent).is_empty(),
-        "peer-scoped loss waits for same-batch replacements"
-    );
-    hk.agent.handle_tick(at(5_000));
-    assert!(
-        drain_events(&mut hk.agent).is_empty(),
-        "the first driver tick only stages peer-disconnect reconciliation"
-    );
-    assert_eq!(hk.agent.next_timeout(5_000), Some(0));
-    hk.agent.handle_tick(at(5_000));
     let events = drain_events(&mut hk.agent);
     assert!(matches!(
         events.as_slice(),
@@ -637,7 +621,6 @@ fn retiring_one_relay_connection_keeps_reservation_on_live_replacement() {
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(1),
             peer_id: relay,
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(21),
     );
@@ -652,51 +635,77 @@ fn retiring_one_relay_connection_keeps_reservation_on_live_replacement() {
     );
 }
 
+/// Replaces the relay connection 1 with 2 and returns the actions the agent
+/// queues once the new connection is ready.
+fn replace_relay_connection(hk: &mut Hk, now: Now) -> Vec<NatAction> {
+    let relay = hk.relay.clone();
+    hk.agent.handle_event(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: relay.clone(),
+            old: ConnectionId::new(1),
+            new: ConnectionId::new(2),
+        },
+        now,
+    );
+    assert!(
+        drain_events(&mut hk.agent).is_empty(),
+        "a hand-over is not a reservation loss"
+    );
+    let actions = drain_actions(&mut hk.agent);
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, NatAction::ResetStream { .. })),
+        "the old exchange must not reset a stream id on the new connection"
+    );
+    assert_eq!(
+        hop_open_count(&actions, &relay),
+        0,
+        "waits for PeerReady(new)"
+    );
+    hk.agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: relay,
+            conn_id: ConnectionId::new(2),
+            protocols: vec![HOP_PROTOCOL_ID.to_string()],
+        },
+        now,
+    );
+    drain_actions(&mut hk.agent)
+}
+
 #[test]
-fn close_then_establish_relay_supersede_preserves_the_reservation() {
+fn replacing_the_reservation_connection_reacquires_on_the_new_one() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
-    let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_900)), at_unix(10, 1_000));
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::RelayReserved { .. }]
-    ));
+    reserve_via_relay(&mut hk, hop_reserve_ok(None), at_unix(10, 1_000));
     drain_actions(&mut hk.agent); // completed exchange's close-write
 
-    // Start renewal, then replace the relay connection before the new
-    // reservation exchange completes. Swarm exposes the eager close before
-    // the replacement establishment; that ordering must not manufacture a
-    // peer disconnect while the replacement session is live.
+    let relay = hk.relay.clone();
+    let actions = replace_relay_connection(&mut hk, at(20));
+    assert_eq!(hop_open_count(&actions, &relay), 1);
+    assert_eq!(dial_count_for(&actions, &relay), 0);
+}
+
+#[test]
+fn replacement_during_a_refresh_starts_exactly_one_exchange_on_new() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_900)), at_unix(10, 1_000));
+    drain_actions(&mut hk.agent); // completed exchange's close-write
+
+    // Start the renewal and get its stream allocated on connection 1.
     let renew_at = 10 + 780 * 1_000;
     hk.agent.handle_tick(at_unix(renew_at, 1_790));
     let relay = hk.relay.clone();
-    hk.agent.handle_event(
-        &SwarmEvent::ConnectionClosed {
-            conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: relay.clone(),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        },
-        at_unix(renew_at + 1, 1_790),
-    );
-    // `Endpoint::poll_new_event_driven` ticks immediately after this one
-    // close event, before it asks Swarm for the buffered replacement.
-    hk.agent.handle_tick(at_unix(renew_at + 1, 1_790));
-    assert!(drain_events(&mut hk.agent).is_empty());
-    assert_eq!(hk.agent.next_timeout(renew_at + 1), Some(0));
-    hk.agent.handle_event(
-        &SwarmEvent::ConnectionEstablished {
-            conn_id: minip2p_transport::ConnectionId::new(2),
-            peer_id: relay.clone(),
-        },
-        at_unix(renew_at + 2, 1_790),
-    );
-    hk.agent.handle_tick(at_unix(renew_at + 2, 1_790));
+    let token = open_stream_token_for(&drain_actions(&mut hk.agent), &relay);
+    let stream = hk.fresh_stream();
+    hk.agent
+        .stream_open_result(token, Ok(stream), at_unix(renew_at, 1_790));
 
-    assert!(drain_events(&mut hk.agent).is_empty());
+    let actions = replace_relay_connection(&mut hk, at_unix(renew_at + 1, 1_790));
+    assert_eq!(hop_open_count(&actions, &relay), 1);
     assert!(
-        !drain_actions(&mut hk.agent)
-            .iter()
-            .any(|action| matches!(action, NatAction::ResetStream { .. })),
-        "supersede cleanup must not reset a stream id on the replacement connection"
+        !hk.agent.owns_stream(&relay, stream),
+        "the old exchange is gone"
     );
 }
 

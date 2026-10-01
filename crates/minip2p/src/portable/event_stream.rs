@@ -5,7 +5,7 @@
 //! through [`EndpointEvent`].
 
 use minip2p_core::{PeerAddr, PeerId};
-use minip2p_swarm::{ConnectionCloseCause, IdentifyMessage, SwarmEvent, SwarmRuntimeError};
+use minip2p_swarm::{IdentifyMessage, SwarmEvent, SwarmRuntimeError};
 use minip2p_transport::{ConnectionId, StreamId};
 
 use super::connect::{ConnectId, ConnectOutcome};
@@ -35,25 +35,42 @@ use super::connect::{ConnectId, ConnectOutcome};
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum EndpointEvent {
-    /// A new connection was established and identity verified.
+    /// A peer went from disconnected to connected: its first connection was
+    /// established and its identity verified.
     ConnectionEstablished {
         peer_id: PeerId,
         conn_id: ConnectionId,
     },
-    /// A connection was closed.
+    /// The peer's last connection closed; the peer is now disconnected.
     ConnectionClosed {
         peer_id: PeerId,
         conn_id: ConnectionId,
-        cause: ConnectionCloseCause,
+    },
+    /// A newer connection took the peer's single connection slot from `old`.
+    ///
+    /// The peer stays connected: this takes the place of a
+    /// `ConnectionClosed` for `old` and a `ConnectionEstablished` for `new`.
+    /// Every stream and pending open on `old` ends with it, without
+    /// per-stream terminal events. Readiness belongs to a connection, so a
+    /// fresh [`Self::PeerReady`] follows for `new` once it is identified.
+    ConnectionReplaced {
+        peer_id: PeerId,
+        old: ConnectionId,
+        new: ConnectionId,
     },
     /// Identify information received from a remote peer.
     IdentifyReceived {
         peer_id: PeerId,
         info: IdentifyMessage,
     },
-    /// A peer is ready for application-level operations.
+    /// A peer is ready for application-level operations on `conn_id`.
+    ///
+    /// Fires once per connection. A `PeerReady` whose `conn_id` is no longer
+    /// the peer's current connection (see [`Self::ConnectionReplaced`]) is
+    /// stale.
     PeerReady {
         peer_id: PeerId,
+        conn_id: ConnectionId,
         protocols: alloc::vec::Vec<alloc::string::String>,
     },
     /// A ping RTT measurement completed.
@@ -166,19 +183,25 @@ impl From<SwarmEvent> for EndpointEvent {
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
                 Self::ConnectionEstablished { peer_id, conn_id }
             }
-            SwarmEvent::ConnectionClosed {
-                peer_id,
-                conn_id,
-                cause,
-            } => Self::ConnectionClosed {
-                peer_id,
-                conn_id,
-                cause,
-            },
+            SwarmEvent::ConnectionClosed { peer_id, conn_id } => {
+                Self::ConnectionClosed { peer_id, conn_id }
+            }
+            SwarmEvent::ConnectionReplaced { peer_id, old, new } => {
+                Self::ConnectionReplaced { peer_id, old, new }
+            }
             SwarmEvent::IdentifyReceived { peer_id, info } => {
                 Self::IdentifyReceived { peer_id, info }
             }
-            SwarmEvent::PeerReady { peer_id, protocols } => Self::PeerReady { peer_id, protocols },
+            SwarmEvent::PeerReady {
+                peer_id,
+                conn_id,
+                protocols,
+            } => Self::PeerReady {
+                peer_id,
+                conn_id,
+                protocols,
+            },
+
             SwarmEvent::PingRttMeasured { peer_id, rtt_ms } => {
                 Self::PingRttMeasured { peer_id, rtt_ms }
             }

@@ -137,7 +137,7 @@ describe("React Native connection identities", () => {
         inner: { peerId: PEER, rttMs: 2n ** 63n },
         tag: "PingRttMeasured",
       },
-      { inner: { peerId: PEER, protocols: [] }, tag: "PeerReady" },
+      { inner: { connId: 1n, peerId: PEER, protocols: [] }, tag: "PeerReady" },
     ]);
 
     fake.ring();

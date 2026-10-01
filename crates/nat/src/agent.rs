@@ -15,7 +15,7 @@ use crate::config::NatConfig;
 use crate::events::{NatAction, NatEvent};
 use crate::housekeeping::Housekeeping;
 use crate::inbound::InboundCircuit;
-use crate::types::{NatToken, Now, PromoteError, ReachabilityState, ReservationInfo};
+use crate::types::{NatToken, Now, Path, PromoteError, ReachabilityState, ReservationInfo};
 
 /// Roles a stream owned by the agent can play. Streams not in the registry
 /// belong to the application (`Released` is modeled as removal).
@@ -89,6 +89,17 @@ pub(crate) enum StreamInput<'a> {
     Closed,
 }
 
+/// How a connection came to carry a peer's path, recorded when a NAT machine
+/// announces it. It outlives the attempt that created it, so a later
+/// Connection replacement can still report the upgrade against it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Origin {
+    pub(crate) path: Path,
+    /// The attempt that created the connection; `None` for an inbound
+    /// circuit or a connection no attempt made.
+    pub(crate) connect_id: Option<ConnectId>,
+}
+
 /// State shared between the agent shell and its attempt state machines.
 pub(crate) struct Shared {
     pub(crate) local_peer_id: PeerId,
@@ -100,9 +111,11 @@ pub(crate) struct Shared {
     pub(crate) registry: BTreeMap<PeerId, BTreeMap<StreamId, StreamRole>>,
     pub(crate) tokens: BTreeMap<NatToken, TokenPurpose>,
     next_token: u64,
-    /// Established connections per peer. Connection ids preserve concurrent
-    /// lifecycle provenance across eager supersession events.
+    /// Established connections per peer. A Connection replacement swaps the
+    /// old id for the new one, so a connected peer holds its current one.
     pub(crate) connected: BTreeMap<PeerId, BTreeSet<ConnectionId>>,
+    /// Path origin of each established connection that carries one.
+    pub(crate) origins: BTreeMap<ConnectionId, Origin>,
     /// Established connections classified as direct by the driver.
     pub(crate) direct_connections: BTreeSet<ConnectionId>,
     /// Peers that reached `PeerReady`, with their advertised protocols.
@@ -123,8 +136,8 @@ pub(crate) struct Shared {
     /// Session dials in flight: relay-leg, reservation, and probe dials whose
     /// connection has not yet established. Concurrent machines targeting the
     /// same infrastructure peer wait on the first dial instead of issuing
-    /// their own — a second connection to the same peer supersedes the first,
-    /// and the supersede scrubs the winner's streams. Values carry the dialed
+    /// their own — a second connection to the same peer replaces the first,
+    /// and the replacement ends the winner's streams. Values carry the dialed
     /// peer and an expiry (`mono_ms`) so a handshake that never completes
     /// cannot suppress dialing forever.
     pending_session_dials: BTreeMap<NatToken, (PeerId, u64)>,
@@ -142,6 +155,16 @@ impl Shared {
         self.connected
             .get(peer)
             .is_some_and(|ids| ids.iter().any(|id| self.direct_connections.contains(id)))
+    }
+
+    /// Records the path a connection carries for its peer.
+    pub(crate) fn record_origin(
+        &mut self,
+        conn_id: ConnectionId,
+        path: Path,
+        connect_id: Option<ConnectId>,
+    ) {
+        self.origins.insert(conn_id, Origin { path, connect_id });
     }
 
     pub(crate) fn alloc_token(&mut self, purpose: TokenPurpose) -> NatToken {
@@ -392,12 +415,6 @@ pub struct NatAgent {
     attempts: BTreeMap<ConnectId, ConnectAttempt>,
     housekeeping: Housekeeping,
     inbound: BTreeMap<u64, InboundCircuit>,
-    /// Peers whose last known connection closed. Swarm reports an eager
-    /// `ConnectionClosed(old)` before `ConnectionEstablished(replacement)`
-    /// during supersession, so peer-scoped housekeeping is first staged and
-    /// reconciled only if a second tick arrives without the replacement.
-    pending_peer_disconnects: BTreeSet<PeerId>,
-    reconcile_peer_disconnects: BTreeSet<PeerId>,
     next_inbound_id: u64,
 }
 
@@ -415,6 +432,7 @@ impl NatAgent {
                 tokens: BTreeMap::new(),
                 next_token: 0,
                 connected: BTreeMap::new(),
+                origins: BTreeMap::new(),
                 direct_connections: BTreeSet::new(),
                 ready: BTreeMap::new(),
                 stream_connections: BTreeMap::new(),
@@ -426,8 +444,6 @@ impl NatAgent {
             attempts: BTreeMap::new(),
             housekeeping,
             inbound: BTreeMap::new(),
-            pending_peer_disconnects: BTreeSet::new(),
-            reconcile_peer_disconnects: BTreeSet::new(),
             next_inbound_id: 0,
         }
     }
@@ -474,6 +490,18 @@ impl NatAgent {
         }
     }
 
+    /// The path the peer's current connection carries, when a NAT machine
+    /// announced one for it (or for the connection it replaced).
+    pub fn path(&self, peer: &PeerId) -> Option<&Path> {
+        self.shared
+            .connected
+            .get(peer)?
+            .iter()
+            .rev()
+            .find_map(|conn_id| self.shared.origins.get(conn_id))
+            .map(|origin| &origin.path)
+    }
+
     /// Updates the validated addresses advertised during DCUtR exchanges.
     pub fn set_listen_addrs(&mut self, addrs: &[Multiaddr]) {
         self.shared.listen_addrs = addrs.to_vec();
@@ -498,8 +526,10 @@ impl NatAgent {
         self.handle_event_with_disposition_classified(event, false, now)
     }
 
-    /// Feeds one swarm event with the driver's transport classification.
-    /// Circuit connection lifecycle events are correlated with promotions.
+    /// Feeds one swarm event with the driver's transport classification of
+    /// the connection it brings up: `conn_id` for `ConnectionEstablished`,
+    /// `new` for `ConnectionReplaced`. Circuit connection lifecycle events
+    /// are correlated with promotions.
     /// Direct `ConnectionEstablished` still updates path snapshots for an
     /// Inactive or racing relay leg.
     pub fn handle_event_with_disposition_classified(
@@ -513,79 +543,23 @@ impl NatAgent {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
                 touched_state = true;
-                self.pending_peer_disconnects.remove(peer_id);
-                self.reconcile_peer_disconnects.remove(peer_id);
-                self.shared.dialed.remove(conn_id);
-                // Any session dial toward this peer has done its job (ours
-                // landed, or another machine's did — either way the peer is
-                // reachable now and further dials would supersede).
-                self.shared
-                    .pending_session_dials
-                    .retain(|_, (dialed, _)| dialed != peer_id);
-                self.shared
-                    .connected
-                    .entry(peer_id.clone())
-                    .or_default()
-                    .insert(*conn_id);
-                if !is_circuit {
-                    self.shared.direct_connections.insert(*conn_id);
-                }
-                for attempt in self.attempts.values_mut() {
-                    attempt.on_connection_established(
-                        peer_id,
-                        *conn_id,
-                        is_circuit,
-                        &mut self.shared,
-                        now,
-                    );
-                }
-                for circuit in self.inbound.values_mut() {
-                    circuit.on_connection_established(
-                        peer_id,
-                        *conn_id,
-                        is_circuit,
-                        &mut self.shared,
-                        now,
-                    );
+                self.connection_up(peer_id, *conn_id, is_circuit, now);
+            }
+            SwarmEvent::ConnectionClosed { peer_id, conn_id } => {
+                touched_state = true;
+                self.connection_down(peer_id, *conn_id, now);
+                let disconnected = !self.shared.is_connected(peer_id);
+                if disconnected {
+                    self.shared.connected.remove(peer_id);
+                    self.shared.ready.remove(peer_id);
+                    self.shared.observed_addrs.remove(peer_id);
+                    self.housekeeping
+                        .on_peer_disconnected(peer_id, &mut self.shared, now);
                 }
             }
-            SwarmEvent::ConnectionClosed {
-                peer_id, conn_id, ..
-            } => {
+            SwarmEvent::ConnectionReplaced { peer_id, old, new } => {
                 touched_state = true;
-                self.shared.dialed.remove(conn_id);
-                self.shared.direct_connections.remove(conn_id);
-                let mut peer_disconnected = false;
-                if let Some(ids) = self.shared.connected.get_mut(peer_id) {
-                    ids.remove(conn_id);
-                    peer_disconnected = ids.is_empty();
-                    if peer_disconnected {
-                        self.shared.connected.remove(peer_id);
-                        self.shared.ready.remove(peer_id);
-                    }
-                }
-                for attempt in self.attempts.values_mut() {
-                    attempt.on_connection_closed(peer_id, *conn_id, &mut self.shared, now);
-                }
-                if peer_disconnected {
-                    self.pending_peer_disconnects.insert(peer_id.clone());
-                }
-                for circuit in self.inbound.values_mut() {
-                    circuit.on_connection_closed(peer_id, *conn_id, &mut self.shared);
-                }
-                let closed_streams: Vec<_> = self
-                    .shared
-                    .stream_connections
-                    .iter()
-                    .filter(|(_, owner)| **owner == *conn_id)
-                    .map(|((peer, stream), _)| (peer.clone(), *stream))
-                    .collect();
-                for (peer, stream) in closed_streams {
-                    self.shared.release_stream(&peer, stream);
-                }
-                self.shared
-                    .pending_session_dials
-                    .retain(|_, (dialed, _)| dialed != peer_id);
+                self.connection_replaced(peer_id, *old, *new, is_circuit, now);
             }
             SwarmEvent::IdentifyReceived { peer_id, info } => {
                 // The remote reports the transport address it sees us from.
@@ -597,7 +571,9 @@ impl NatAgent {
                 self.shared
                     .record_observed_addr(peer_id, info.observed_addr.as_deref());
             }
-            SwarmEvent::PeerReady { peer_id, protocols } => {
+            SwarmEvent::PeerReady {
+                peer_id, protocols, ..
+            } => {
                 touched_state = true;
                 self.shared.ready.insert(peer_id.clone(), protocols.clone());
                 for attempt in self.attempts.values_mut() {
@@ -774,19 +750,6 @@ impl NatAgent {
     /// Advances time-based state: stagger expiry, leg deadlines, punch
     /// windows, connect deadlines.
     pub fn handle_tick(&mut self, now: Now) {
-        // The std driver may tick after each individual event. Age newly
-        // closed peers for one complete tick so an eager Close(old) can be
-        // followed by Established(replacement) on the next poll turn.
-        let disconnected = core::mem::take(&mut self.reconcile_peer_disconnects);
-        for peer in disconnected {
-            if !self.shared.is_connected(&peer) {
-                self.housekeeping
-                    .on_peer_disconnected(&peer, &mut self.shared, now);
-                self.shared.observed_addrs.remove(&peer);
-            }
-        }
-        self.reconcile_peer_disconnects
-            .append(&mut self.pending_peer_disconnects);
         for attempt in self.attempts.values_mut() {
             attempt.on_tick(&mut self.shared, now);
         }
@@ -1009,10 +972,6 @@ impl NatAgent {
     /// Milliseconds until the earliest pending deadline, if any. Drivers
     /// fold this into their poll budget, mirroring `SwarmCore::next_timeout`.
     pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
-        if !self.pending_peer_disconnects.is_empty() || !self.reconcile_peer_disconnects.is_empty()
-        {
-            return Some(0);
-        }
         self.attempts
             .values()
             .filter_map(ConnectAttempt::next_deadline)
@@ -1055,9 +1014,113 @@ impl NatAgent {
             && self.shared.events.is_empty()
             && self.attempts.is_empty()
             && self.inbound.is_empty()
-            && self.pending_peer_disconnects.is_empty()
-            && self.reconcile_peer_disconnects.is_empty()
             && self.housekeeping.is_quiet()
+    }
+
+    /// A connection to `peer` became usable: record it and let the machines
+    /// that wait on the peer see it.
+    fn connection_up(&mut self, peer: &PeerId, conn_id: ConnectionId, is_circuit: bool, now: Now) {
+        self.shared.dialed.remove(&conn_id);
+        // Any session dial toward this peer has done its job (ours landed, or
+        // another machine's did — either way the peer is reachable now and
+        // further dials would replace this connection).
+        self.shared
+            .pending_session_dials
+            .retain(|_, (dialed, _)| dialed != peer);
+        self.shared
+            .connected
+            .entry(peer.clone())
+            .or_default()
+            .insert(conn_id);
+        if !is_circuit {
+            self.shared.direct_connections.insert(conn_id);
+        }
+        for attempt in self.attempts.values_mut() {
+            attempt.on_connection_established(peer, conn_id, is_circuit, &mut self.shared, now);
+        }
+        for circuit in self.inbound.values_mut() {
+            circuit.on_connection_established(peer, conn_id, is_circuit, &mut self.shared, now);
+        }
+    }
+
+    /// `conn_id` is gone: its streams, its path origin, and every machine
+    /// state bound to it end. Peer-level state is the caller's call.
+    fn connection_down(&mut self, peer: &PeerId, conn_id: ConnectionId, now: Now) {
+        self.shared.dialed.remove(&conn_id);
+        self.shared.direct_connections.remove(&conn_id);
+        self.shared.origins.remove(&conn_id);
+        if let Some(ids) = self.shared.connected.get_mut(peer) {
+            ids.remove(&conn_id);
+        }
+        for attempt in self.attempts.values_mut() {
+            attempt.on_connection_closed(peer, conn_id, &mut self.shared, now);
+        }
+        for circuit in self.inbound.values_mut() {
+            circuit.on_connection_closed(peer, conn_id, &mut self.shared);
+        }
+        let closed_streams: Vec<_> = self
+            .shared
+            .stream_connections
+            .iter()
+            .filter(|(_, owner)| **owner == conn_id)
+            .map(|((peer, stream), _)| (peer.clone(), *stream))
+            .collect();
+        for (peer, stream) in closed_streams {
+            self.shared.release_stream(&peer, stream);
+        }
+        self.shared
+            .pending_session_dials
+            .retain(|_, (dialed, _)| dialed != peer);
+    }
+
+    /// A Connection replacement: `new` is applied before `old` is retired,
+    /// so no relay leg or inbound flow fails just because `old` went away.
+    /// The peer never counts as disconnected; its readiness and observed
+    /// address belong to `old` and are refreshed by `new`'s Identify.
+    fn connection_replaced(
+        &mut self,
+        peer: &PeerId,
+        old: ConnectionId,
+        new: ConnectionId,
+        is_circuit: bool,
+        now: Now,
+    ) {
+        let old_origin = self.shared.origins.get(&old).cloned();
+        self.shared.ready.remove(peer);
+        self.shared.observed_addrs.remove(peer);
+        self.connection_up(peer, new, is_circuit, now);
+        for attempt in self.attempts.values_mut() {
+            attempt.on_target_replaced(peer, old, &mut self.shared);
+        }
+        self.connection_down(peer, old, now);
+        self.housekeeping
+            .on_connection_replaced(peer, &mut self.shared, now);
+
+        // The selected path becomes `new`'s origin. A machine that announced
+        // `new` just now recorded it (with its own event); otherwise a
+        // direct `new` takes over from `old`'s path, and leaving a relay
+        // is reported once, against whatever created that relayed path.
+        let Some(old_origin) = old_origin else {
+            return;
+        };
+        if self.shared.origins.contains_key(&new) || is_circuit {
+            return;
+        }
+        let to = Path::DirectDialed;
+        self.shared
+            .record_origin(new, to.clone(), old_origin.connect_id);
+        if !matches!(old_origin.path, Path::Relayed { .. }) {
+            return;
+        }
+        self.shared.push_event(match old_origin.connect_id {
+            Some(connect_id) => NatEvent::PathUpgraded {
+                connect_id,
+                peer: peer.clone(),
+                from: old_origin.path,
+                to,
+            },
+            None => NatEvent::InboundDirectUpgrade { peer: peer.clone() },
+        });
     }
 
     /// The role of an agent-owned stream on exactly this connection.

@@ -12,6 +12,7 @@ Errors are public classes exported by `@minip2p/node` and `@minip2p/react-native
 | A Promise rejects with `TimeoutError` | No matching result arrived before `timeoutMs` | Confirm the peer and network, then choose a suitable timeout. |
 | A Promise rejects with `AbortError` | Its `AbortSignal` fired | Treat cancellation as expected control flow and create a new controller before retrying. |
 | `waitPeerReady` rejects with `PeerDisconnectedError` | The connection closed before Identify completed | Reconnect and wait again. |
+| A stream or pending `openStream` fails with `StreamClosedError` after `connectionReplaced` | A newer connection replaced the one carrying it | Open the stream again; the peer is still connected. |
 | `openStream` rejects with `OpenStreamError` | The peer is not ready, lacks the protocol, or negotiation failed | Wait for `peerReady` and register the same protocol version on both peers. |
 | An inbound stream closes immediately | No named `stream` handler or waiter claimed it | Subscribe with `endpoint.on("stream", ...)`. |
 | `read()` rejects after adding a `data` handler | Pull and flowing reads were mixed | Pick one read mode for the stream lifetime. |

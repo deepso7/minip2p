@@ -136,8 +136,9 @@ pub enum NatEvent {
         peer: PeerId,
         error: NatError,
     },
-    /// An inbound circuit's hole punch succeeded; the peer is now directly
-    /// connected.
+    /// An inbound relayed path became direct: an inbound circuit's hole
+    /// punch succeeded, or a direct connection replaced the circuit later.
+    /// The peer is now directly connected.
     InboundDirectUpgrade { peer: PeerId },
 }
 

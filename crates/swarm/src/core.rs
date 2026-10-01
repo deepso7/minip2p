@@ -48,8 +48,8 @@ use minip2p_ping::{
 use minip2p_transport::{ConnectionId, StreamId, TransportEvent};
 
 use crate::events::{
-    ConnectionCloseCause, OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent,
-    SwarmInput, SwarmOutput, SwarmRuntimeError,
+    OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
+    SwarmRuntimeError,
 };
 
 // ---------------------------------------------------------------------------
@@ -161,6 +161,44 @@ fn connection_action_matches(action: &SwarmAction, conn_id: ConnectionId) -> boo
     }
 }
 
+/// Mutable form of [`SwarmEvent::peer_id`].
+fn event_peer_mut(event: &mut SwarmEvent) -> Option<&mut PeerId> {
+    match event {
+        SwarmEvent::ConnectionEstablished { peer_id, .. }
+        | SwarmEvent::ConnectionClosed { peer_id, .. }
+        | SwarmEvent::ConnectionReplaced { peer_id, .. }
+        | SwarmEvent::IdentifyReceived { peer_id, .. }
+        | SwarmEvent::PeerReady { peer_id, .. }
+        | SwarmEvent::PingRttMeasured { peer_id, .. }
+        | SwarmEvent::PingTimeout { peer_id }
+        | SwarmEvent::StreamReady { peer_id, .. }
+        | SwarmEvent::StreamData { peer_id, .. }
+        | SwarmEvent::StreamRemoteWriteClosed { peer_id, .. }
+        | SwarmEvent::StreamWriteStopped { peer_id, .. }
+        | SwarmEvent::StreamClosed { peer_id, .. } => Some(peer_id),
+        SwarmEvent::Error(error) => error.peer_id.as_mut(),
+        SwarmEvent::DialFailed { .. } => None,
+    }
+}
+
+/// The connection a transport event belongs to; `None` for listener events.
+fn transport_event_connection(event: &TransportEvent) -> Option<ConnectionId> {
+    match event {
+        TransportEvent::Connected { id, .. }
+        | TransportEvent::StreamOpened { id, .. }
+        | TransportEvent::IncomingStream { id, .. }
+        | TransportEvent::StreamData { id, .. }
+        | TransportEvent::StreamRemoteWriteClosed { id, .. }
+        | TransportEvent::StreamWriteStopped { id, .. }
+        | TransportEvent::StreamClosed { id, .. }
+        | TransportEvent::Closed { id }
+        | TransportEvent::Error { id, .. }
+        | TransportEvent::IncomingConnection { id, .. }
+        | TransportEvent::PeerIdentityVerified { id, .. } => Some(*id),
+        TransportEvent::Listening { .. } => None,
+    }
+}
+
 fn push_unique(protocols: &mut Vec<String>, protocol_id: String) {
     if !protocols.iter().any(|existing| existing == &protocol_id) {
         protocols.push(protocol_id);
@@ -242,7 +280,8 @@ pub struct SwarmCore {
     local_addresses: Vec<Multiaddr>,
     /// Latest Identify payload received for each peer.
     peer_info: BTreeMap<PeerId, IdentifyMessage>,
-    /// Peers for which `PeerReady` has already been emitted.
+    /// Peers whose current connection has emitted `PeerReady`. Cleared on a
+    /// Connection replacement: readiness belongs to a connection.
     ready_peers: BTreeSet<PeerId>,
     /// Peers that have been surfaced through `ConnectionEstablished`.
     established_peers: BTreeSet<PeerId>,
@@ -251,16 +290,26 @@ pub struct SwarmCore {
     pending_dials: BTreeMap<ConnectionId, PendingDial>,
     /// Pending dials that must not establish. Checked before
     /// [`Self::register_connection`] / identity upgrade so a late handshake
-    /// cannot supersede an already-valid peer connection (e.g. after a failed
+    /// cannot replace an already-valid peer connection (e.g. after a failed
     /// `abort_dial`). Cleared on close, not on the first establish-stage event.
     vetoed_establishes: BTreeSet<ConnectionId>,
+    /// Connections handed over by a Connection replacement, awaiting the
+    /// transport's `Closed`. Every other transport event on them is ignored,
+    /// so a late identity, stream, or establish event can never re-register
+    /// a retired connection or displace its replacement.
+    retired_connections: BTreeSet<ConnectionId>,
+    /// Placeholder peers discarded since the runtime last asked, so it can
+    /// purge their events it already buffered. See
+    /// [`Self::take_discarded_placeholders`].
+    discarded_placeholders: Vec<PeerId>,
 
     // --- Output queues ---
     events: VecDeque<SwarmEvent>,
     actions: VecDeque<SwarmAction>,
     /// Actions that must not execute until already-queued application events
-    /// have been surfaced. Supersession uses this to expose the old
-    /// connection's eager close before asking the transport to close it.
+    /// have been surfaced. A Connection replacement uses this to deliver
+    /// `ConnectionReplaced` before asking the transport to close the old
+    /// connection.
     after_event_actions: VecDeque<SwarmAction>,
 }
 
@@ -303,6 +352,8 @@ impl SwarmCore {
             established_peers: BTreeSet::new(),
             pending_dials: BTreeMap::new(),
             vetoed_establishes: BTreeSet::new(),
+            retired_connections: BTreeSet::new(),
+            discarded_placeholders: Vec::new(),
             events: VecDeque::new(),
             actions: VecDeque::new(),
             after_event_actions: VecDeque::new(),
@@ -704,12 +755,10 @@ impl SwarmCore {
         self.established_peers.contains(peer_id)
     }
 
-    /// Returns every established connection with its peer, primaries
-    /// included, in ascending id order. A peer can hold several at once
-    /// (e.g. a relay circuit plus a direct connection after a late identity
-    /// upgrade). A peer's connections drop out once it is no longer
-    /// connected (see [`SwarmCore::is_peer_connected`]); pending dials never
-    /// appear.
+    /// Returns every established connection with its peer, in ascending id
+    /// order. Each connected peer holds exactly one: a Connection
+    /// replacement retires the old connection immediately. Pending dials
+    /// and replaced connections never appear.
     pub fn established_connections(&self) -> impl Iterator<Item = (ConnectionId, &PeerId)> {
         self.conn_to_peer
             .iter()
@@ -728,9 +777,35 @@ impl SwarmCore {
         self.peer_info.get(peer_id)
     }
 
-    /// Returns whether `peer_id` has reached the application-ready state.
+    /// Returns whether `peer_id`'s current connection has reached the
+    /// application-ready state.
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
         self.ready_peers.contains(peer_id)
+    }
+
+    /// Returns the peer's current connection and its Identify info when that
+    /// connection is ready, as one coherent snapshot.
+    ///
+    /// Ready waits use this instead of separate readiness, connection, and
+    /// Identify getters, which could each describe a different connection
+    /// around a Connection replacement.
+    pub fn peer_readiness(&self, peer_id: &PeerId) -> Option<(ConnectionId, &IdentifyMessage)> {
+        if !self.ready_peers.contains(peer_id) {
+            return None;
+        }
+        Some((
+            *self.peer_to_conn.get(peer_id)?,
+            self.peer_info.get(peer_id)?,
+        ))
+    }
+
+    /// Returns the placeholder peers discarded since the last call.
+    ///
+    /// A connection that never establishes may have produced events under a
+    /// synthetic placeholder peer id. The core purges the ones it still
+    /// holds; a runtime that buffers events must purge its copies too.
+    pub fn take_discarded_placeholders(&mut self) -> Vec<PeerId> {
+        core::mem::take(&mut self.discarded_placeholders)
     }
 
     /// Returns the active transport connection selected for `peer_id`.
@@ -787,7 +862,7 @@ impl SwarmCore {
             .insert(conn_id, PendingDial { addr, last_error });
     }
 
-    /// Marks `conn_id` so establish-stage events cannot register or supersede.
+    /// Marks `conn_id` so establish-stage events cannot register or replace.
     ///
     /// Used after a failed [`crate::SwarmRuntime::abort_dial`]: the dial is
     /// restored as pending, but must not displace an existing peer connection
@@ -807,6 +882,19 @@ impl SwarmCore {
     }
 
     fn handle_transport_event(&mut self, event: TransportEvent, now_ms: u64) {
+        if let Some(id) = transport_event_connection(&event)
+            && self.retired_connections.contains(&id)
+        {
+            // A replaced connection was already reported through
+            // `ConnectionReplaced`; only its final close is bookkeeping.
+            if matches!(event, TransportEvent::Closed { .. }) {
+                self.retired_connections.remove(&id);
+                self.vetoed_establishes.remove(&id);
+                self.conn_to_remote_addr.remove(&id);
+                self.forget_connection_streams(id);
+            }
+            return;
+        }
         match event {
             TransportEvent::Connected { id, endpoint } => {
                 self.conn_to_remote_addr
@@ -1165,20 +1253,23 @@ impl SwarmCore {
         }));
     }
 
+    /// Emits `PeerReady` for the peer's current connection once it is
+    /// established and identified. Placeholder peers are never ready.
     fn try_emit_peer_ready(&mut self, peer_id: &PeerId) {
-        if self.ready_peers.contains(peer_id) {
+        if self.ready_peers.contains(peer_id) || !self.established_peers.contains(peer_id) {
             return;
         }
         let Some(info) = self.peer_info.get(peer_id) else {
             return;
         };
-        if !self.peer_to_conn.contains_key(peer_id) {
+        let Some(&conn_id) = self.peer_to_conn.get(peer_id) else {
             return;
-        }
+        };
 
         self.ready_peers.insert(peer_id.clone());
         self.events.push_back(SwarmEvent::PeerReady {
             peer_id: peer_id.clone(),
+            conn_id,
             protocols: info.protocols.clone(),
         });
     }
@@ -1291,18 +1382,7 @@ impl SwarmCore {
             }
             // Placeholder peers from pre-identity Connected may already hold
             // ping/identify state; drop only that non-established bookkeeping.
-            if !self.established_peers.contains(&peer_id) {
-                self.inform_ping(PingInput::RemovePeer {
-                    peer_id: peer_id.clone(),
-                });
-                self.inform_identify(IdentifyInput::RemovePeer {
-                    peer_id: peer_id.clone(),
-                });
-                self.drain_ping_outputs();
-                self.drain_identify_outputs();
-                self.pending_pings.remove(&peer_id);
-                self.ping_deadlines.remove(&peer_id);
-            }
+            self.discard_placeholder(&peer_id);
         }
         self.conn_to_remote_addr.remove(&conn_id);
         self.forget_connection_streams(conn_id);
@@ -1310,196 +1390,207 @@ impl SwarmCore {
             .push_back(SwarmAction::CloseConnection { conn_id });
     }
 
-    fn register_connection(&mut self, id: ConnectionId, peer_id: PeerId) {
-        let is_new = !self.conn_to_peer.contains_key(&id);
-
-        // If a different connection to the same peer already exists, close
-        // it so it doesn't orphan in conn_to_peer. Last connection wins.
-        if let Some(&existing_id) = self.peer_to_conn.get(&peer_id)
-            && existing_id != id
-        {
-            self.supersede_connection(existing_id);
-        }
-
-        self.set_conn_peer(id, peer_id.clone());
-        self.peer_to_conn.insert(peer_id.clone(), id);
-
-        if is_new {
-            self.pending_dials.remove(&id);
-            self.established_peers.insert(peer_id.clone());
-            self.events.push_back(SwarmEvent::ConnectionEstablished {
-                peer_id: peer_id.clone(),
-                conn_id: id,
-            });
-
-            // Auto-open identify.
-            if let Err(e) = self.queue_open_protocol_stream(
-                &peer_id,
-                IDENTIFY_PROTOCOL_ID,
-                ProtocolKind::IdentifyInitiator,
-            ) {
-                self.emit_error(
-                    SwarmErrorKind::Identify,
-                    Some(peer_id.clone()),
-                    Some(id),
-                    format!("failed to queue identify stream to {peer_id}: {e}"),
-                );
-            }
-
-            if self.pending_pings.contains_key(&peer_id)
-                && self.find_negotiated_ping_stream(&peer_id).is_none()
-                && !self.has_pending_ping_stream(&peer_id)
-                && let Err(e) =
-                    self.queue_open_protocol_stream(&peer_id, PING_PROTOCOL_ID, ProtocolKind::Ping)
-            {
-                self.emit_error(
-                    SwarmErrorKind::Ping,
-                    Some(peer_id.clone()),
-                    Some(id),
-                    format!("failed to requeue pending ping stream to {peer_id}: {e}"),
-                );
-            }
-        }
-    }
-
-    fn supersede_connection(&mut self, old_id: ConnectionId) {
-        if let Some(peer_id) = self.conn_to_peer.remove(&old_id) {
-            self.events.push_back(SwarmEvent::ConnectionClosed {
-                peer_id: peer_id.clone(),
-                conn_id: old_id,
-                cause: ConnectionCloseCause::Superseded,
-            });
-            let pending_ping = self.pending_pings.remove(&peer_id);
-            self.inform_ping(PingInput::RemovePeer {
-                peer_id: peer_id.clone(),
-            });
-            self.inform_identify(IdentifyInput::RemovePeer {
-                peer_id: peer_id.clone(),
-            });
-            self.drain_ping_outputs();
-            self.drain_identify_outputs();
-            if let Some(payload) = pending_ping {
-                self.pending_pings.insert(peer_id.clone(), payload);
-            }
-            self.ping_deadlines.remove(&peer_id);
-            self.peer_info.remove(&peer_id);
-            self.ready_peers.remove(&peer_id);
-            self.established_peers.remove(&peer_id);
-        }
-        self.conn_to_remote_addr.remove(&old_id);
-        self.stream_owner.retain(|key, _| key.conn_id != old_id);
-        self.reset_pending.retain(|(cid, _)| *cid != old_id);
-        self.abandoned_streams.retain(|(cid, _)| *cid != old_id);
-        self.inbound_negotiators
-            .retain(|(cid, _), _| *cid != old_id);
-        self.outbound_negotiators
-            .retain(|(cid, _), _| *cid != old_id);
-        self.pending_opens.retain(|_, p| p.conn_id != old_id);
-        self.actions
-            .retain(|action| !connection_action_matches(action, old_id));
-        self.after_event_actions
-            .retain(|action| !connection_action_matches(action, old_id));
-        self.after_event_actions
-            .push_back(SwarmAction::CloseConnection { conn_id: old_id });
-    }
-
-    fn upgrade_connection_identity(&mut self, conn_id: ConnectionId, new_peer_id: PeerId) {
-        let existing = self.conn_to_peer.get(&conn_id).cloned();
-
-        match existing {
-            Some(ref current) if *current == new_peer_id => return,
-            Some(ref stale) => {
-                self.peer_to_conn.remove(stale);
-                self.inform_ping(PingInput::MigratePeer {
-                    old_peer_id: stale.clone(),
-                    new_peer_id: new_peer_id.clone(),
-                });
-                self.inform_identify(IdentifyInput::MigratePeer {
-                    old_peer_id: stale.clone(),
-                    new_peer_id: new_peer_id.clone(),
-                });
-                self.drain_ping_outputs();
-                self.drain_identify_outputs();
-                if let Some(payload) = self.pending_pings.remove(stale) {
-                    self.pending_pings.insert(new_peer_id.clone(), payload);
-                }
-                if let Some(due) = self.ping_deadlines.remove(stale) {
-                    self.ping_deadlines.insert(new_peer_id.clone(), due);
-                }
-                if let Some(info) = self.peer_info.remove(stale) {
-                    self.peer_info.insert(new_peer_id.clone(), info);
-                }
-                if self.ready_peers.remove(stale) {
-                    self.ready_peers.insert(new_peer_id.clone());
-                }
-                if self.established_peers.remove(stale) {
-                    self.established_peers.insert(new_peer_id.clone());
-                }
-                self.migrate_buffered_events(stale, &new_peer_id);
-            }
-            None => {}
-        }
-
-        self.set_conn_peer(conn_id, new_peer_id.clone());
-        self.peer_to_conn.insert(new_peer_id.clone(), conn_id);
-        self.pending_dials.remove(&conn_id);
-        self.established_peers.insert(new_peer_id.clone());
-
-        self.events.push_back(SwarmEvent::ConnectionEstablished {
-            peer_id: new_peer_id.clone(),
-            conn_id,
+    /// Clears Ping and Identify state for `peer_id`, including a pending
+    /// ping and its timer.
+    fn reset_peer_protocols(&mut self, peer_id: &PeerId) {
+        self.inform_ping(PingInput::RemovePeer {
+            peer_id: peer_id.clone(),
         });
+        self.inform_identify(IdentifyInput::RemovePeer {
+            peer_id: peer_id.clone(),
+        });
+        self.drain_ping_outputs();
+        self.drain_identify_outputs();
+        self.pending_pings.remove(peer_id);
+        self.ping_deadlines.remove(peer_id);
+    }
 
-        self.try_emit_peer_ready(&new_peer_id);
+    /// Drops the synthetic placeholder peer of a connection that never
+    /// established, with every event it produced that is still queued.
+    /// Established peers are left alone.
+    fn discard_placeholder(&mut self, peer_id: &PeerId) {
+        if self.established_peers.contains(peer_id) {
+            return;
+        }
+        self.reset_peer_protocols(peer_id);
+        self.peer_info.remove(peer_id);
+        self.events.retain(|event| event.peer_id() != Some(peer_id));
+        self.discarded_placeholders.push(peer_id.clone());
+    }
 
+    /// Starts the swarm's own protocols on a peer's new current connection:
+    /// Identify, and a ping stream when a ping is waiting to be sent.
+    fn start_connection_protocols(&mut self, peer_id: &PeerId, conn_id: ConnectionId) {
         if let Err(e) = self.queue_open_protocol_stream(
-            &new_peer_id,
+            peer_id,
             IDENTIFY_PROTOCOL_ID,
             ProtocolKind::IdentifyInitiator,
         ) {
             self.emit_error(
                 SwarmErrorKind::Identify,
-                Some(new_peer_id.clone()),
+                Some(peer_id.clone()),
                 Some(conn_id),
-                format!(
-                    "failed to queue identify stream to {new_peer_id} after identity upgrade: {e}"
-                ),
+                format!("failed to queue identify stream to {peer_id}: {e}"),
+            );
+        }
+
+        if self.pending_pings.contains_key(peer_id)
+            && self.find_negotiated_ping_stream(peer_id).is_none()
+            && !self.has_pending_ping_stream(peer_id)
+            && let Err(e) =
+                self.queue_open_protocol_stream(peer_id, PING_PROTOCOL_ID, ProtocolKind::Ping)
+        {
+            self.emit_error(
+                SwarmErrorKind::Ping,
+                Some(peer_id.clone()),
+                Some(conn_id),
+                format!("failed to requeue pending ping stream to {peer_id}: {e}"),
             );
         }
     }
 
+    /// Takes `old` out of `peer_id`'s connection slot ahead of a Connection
+    /// replacement.
+    ///
+    /// Everything that belonged to `old` ends: its streams, pending opens,
+    /// queued actions, and the peer's readiness and Identify info. `old` is
+    /// retired until the transport reports it closed, and its close is
+    /// ordered after the events queued so far. Returns the payload of a ping
+    /// pending or in flight on `old`, which the caller re-sends on the new
+    /// connection; its timer restarts then, so no `PingTimeout` is reported
+    /// for the hand-over.
+    fn retire_for_replacement(
+        &mut self,
+        peer_id: &PeerId,
+        old: ConnectionId,
+    ) -> Option<[u8; PING_PAYLOAD_LEN]> {
+        // The in-flight payload lives in Ping's per-peer state; read it
+        // before that state is reset.
+        let ping_intent = self
+            .ping
+            .in_flight_payload(peer_id)
+            .or_else(|| self.pending_pings.get(peer_id).copied());
+        self.reset_peer_protocols(peer_id);
+        self.peer_info.remove(peer_id);
+        self.ready_peers.remove(peer_id);
+
+        self.conn_to_peer.remove(&old);
+        self.conn_to_remote_addr.remove(&old);
+        self.forget_connection_streams(old);
+        self.actions
+            .retain(|action| !connection_action_matches(action, old));
+        self.after_event_actions
+            .retain(|action| !connection_action_matches(action, old));
+        self.retired_connections.insert(old);
+        self.after_event_actions
+            .push_back(SwarmAction::CloseConnection { conn_id: old });
+        ping_intent
+    }
+
+    /// Makes `conn_id` the peer's current connection and reports it: as
+    /// `ConnectionReplaced` when it takes the slot from `old` of an already
+    /// connected peer, otherwise as `ConnectionEstablished`.
+    fn announce_connection(
+        &mut self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        old: Option<ConnectionId>,
+        ping_intent: Option<[u8; PING_PAYLOAD_LEN]>,
+    ) {
+        self.set_conn_peer(conn_id, peer_id.clone());
+        self.peer_to_conn.insert(peer_id.clone(), conn_id);
+        self.pending_dials.remove(&conn_id);
+        if let Some(payload) = ping_intent {
+            self.pending_pings.insert(peer_id.clone(), payload);
+        }
+        match old {
+            Some(old) if self.established_peers.contains(peer_id) => {
+                self.events.push_back(SwarmEvent::ConnectionReplaced {
+                    peer_id: peer_id.clone(),
+                    old,
+                    new: conn_id,
+                });
+            }
+            _ => {
+                self.established_peers.insert(peer_id.clone());
+                self.events.push_back(SwarmEvent::ConnectionEstablished {
+                    peer_id: peer_id.clone(),
+                    conn_id,
+                });
+            }
+        }
+    }
+
+    fn register_connection(&mut self, id: ConnectionId, peer_id: PeerId) {
+        if self.conn_to_peer.contains_key(&id) {
+            return;
+        }
+        // Last connection wins: a newer connection to the same peer replaces
+        // the existing one.
+        let old = self
+            .peer_to_conn
+            .get(&peer_id)
+            .copied()
+            .filter(|old| *old != id);
+        let ping_intent = old.and_then(|old| self.retire_for_replacement(&peer_id, old));
+        self.announce_connection(&peer_id, id, old, ping_intent);
+        self.start_connection_protocols(&peer_id, id);
+    }
+
+    fn upgrade_connection_identity(&mut self, conn_id: ConnectionId, new_peer_id: PeerId) {
+        let existing = self.conn_to_peer.get(&conn_id).cloned();
+        if existing.as_ref() == Some(&new_peer_id) {
+            return;
+        }
+
+        // An already connected peer is handed over exactly as on
+        // `Connected`: the upgraded connection is the newest and wins.
+        let old = self
+            .peer_to_conn
+            .get(&new_peer_id)
+            .copied()
+            .filter(|old| *old != conn_id);
+        let ping_intent = old.and_then(|old| self.retire_for_replacement(&new_peer_id, old));
+
+        if let Some(stale) = existing {
+            // State gathered under the placeholder belongs to this
+            // connection, so it moves to the verified peer.
+            self.peer_to_conn.remove(&stale);
+            self.inform_ping(PingInput::MigratePeer {
+                old_peer_id: stale.clone(),
+                new_peer_id: new_peer_id.clone(),
+            });
+            self.inform_identify(IdentifyInput::MigratePeer {
+                old_peer_id: stale.clone(),
+                new_peer_id: new_peer_id.clone(),
+            });
+            self.drain_ping_outputs();
+            self.drain_identify_outputs();
+            if let Some(payload) = self.pending_pings.remove(&stale) {
+                self.pending_pings.insert(new_peer_id.clone(), payload);
+            }
+            if let Some(due) = self.ping_deadlines.remove(&stale) {
+                self.ping_deadlines.insert(new_peer_id.clone(), due);
+            }
+            if let Some(info) = self.peer_info.remove(&stale) {
+                self.peer_info.insert(new_peer_id.clone(), info);
+            }
+            self.ready_peers.remove(&stale);
+            self.established_peers.remove(&stale);
+            self.migrate_buffered_events(&stale, &new_peer_id);
+        }
+
+        self.announce_connection(&new_peer_id, conn_id, old, ping_intent);
+        self.try_emit_peer_ready(&new_peer_id);
+        self.start_connection_protocols(&new_peer_id, conn_id);
+    }
+
     fn migrate_buffered_events(&mut self, old: &PeerId, new: &PeerId) {
         for event in &mut self.events {
-            match event {
-                SwarmEvent::ConnectionEstablished { peer_id, .. }
-                | SwarmEvent::ConnectionClosed { peer_id, .. }
-                | SwarmEvent::PingTimeout { peer_id } => {
-                    if peer_id == old {
-                        *peer_id = new.clone();
-                    }
-                }
-                SwarmEvent::IdentifyReceived { peer_id, .. }
-                | SwarmEvent::PingRttMeasured { peer_id, .. }
-                | SwarmEvent::StreamReady { peer_id, .. }
-                | SwarmEvent::StreamData { peer_id, .. }
-                | SwarmEvent::StreamRemoteWriteClosed { peer_id, .. }
-                | SwarmEvent::StreamWriteStopped { peer_id, .. }
-                | SwarmEvent::StreamClosed { peer_id, .. } => {
-                    if peer_id == old {
-                        *peer_id = new.clone();
-                    }
-                }
-                SwarmEvent::PeerReady { peer_id, .. } => {
-                    if peer_id == old {
-                        *peer_id = new.clone();
-                    }
-                }
-                SwarmEvent::Error(error) => {
-                    if error.peer_id.as_ref() == Some(old) {
-                        error.peer_id = Some(new.clone());
-                    }
-                }
-                SwarmEvent::DialFailed { .. } => {}
+            if let Some(peer_id) = event_peer_mut(event)
+                && peer_id == old
+            {
+                *peer_id = new.clone();
             }
         }
     }
@@ -1704,55 +1795,23 @@ impl SwarmCore {
                 addr: pending.addr,
                 reason,
             });
-            if let Some(peer_id) = self.conn_to_peer.remove(&conn_id)
-                && self.peer_to_conn.get(&peer_id) == Some(&conn_id)
-            {
-                self.peer_to_conn.remove(&peer_id);
-                // Connected-without-identity synthesizes a placeholder peer
-                // that ping/identify may already hold. Drop that state here;
-                // this connection never established, so there is no
-                // ConnectionClosed application event.
-                self.inform_ping(PingInput::RemovePeer {
-                    peer_id: peer_id.clone(),
-                });
-                self.inform_identify(IdentifyInput::RemovePeer {
-                    peer_id: peer_id.clone(),
-                });
-                self.drain_ping_outputs();
-                self.drain_identify_outputs();
-                self.pending_pings.remove(&peer_id);
-                self.ping_deadlines.remove(&peer_id);
-            }
-            self.forget_connection_streams(conn_id);
-            return;
         }
 
-        if let Some(peer_id) = self.conn_to_peer.remove(&conn_id) {
-            let was_active = self.peer_to_conn.get(&peer_id) == Some(&conn_id);
-            if was_active {
-                self.peer_to_conn.remove(&peer_id);
-                self.inform_ping(PingInput::RemovePeer {
-                    peer_id: peer_id.clone(),
-                });
-                self.inform_identify(IdentifyInput::RemovePeer {
-                    peer_id: peer_id.clone(),
-                });
-                self.drain_ping_outputs();
-                self.drain_identify_outputs();
-                self.pending_pings.remove(&peer_id);
-                self.ping_deadlines.remove(&peer_id);
+        if let Some(peer_id) = self.conn_to_peer.remove(&conn_id)
+            && self.peer_to_conn.get(&peer_id) == Some(&conn_id)
+        {
+            self.peer_to_conn.remove(&peer_id);
+            if self.established_peers.remove(&peer_id) {
+                self.reset_peer_protocols(&peer_id);
                 self.peer_info.remove(&peer_id);
                 self.ready_peers.remove(&peer_id);
-                // Pre-identity Connected synthesizes a placeholder peer that
-                // never established. After forget_dial, Closed must not emit
-                // ConnectionClosed for a peer the app never saw Established.
-                if self.established_peers.remove(&peer_id) {
-                    self.events.push_back(SwarmEvent::ConnectionClosed {
-                        peer_id,
-                        conn_id,
-                        cause: ConnectionCloseCause::Transport,
-                    });
-                }
+                self.events
+                    .push_back(SwarmEvent::ConnectionClosed { peer_id, conn_id });
+            } else {
+                // Connected-without-identity synthesizes a placeholder peer
+                // the application never saw established, so there is no
+                // ConnectionClosed for it.
+                self.discard_placeholder(&peer_id);
             }
         }
 
@@ -3101,45 +3160,6 @@ mod tests {
     }
 
     #[test]
-    fn superseding_connection_invalidates_old_streams() {
-        let mut core = test_core();
-        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
-        let original_conn = ConnectionId::new(10);
-        let newer_conn = ConnectionId::new(11);
-        let stream_id = StreamId::new(8);
-
-        feed(
-            &mut core,
-            TransportEvent::Connected {
-                id: original_conn,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
-            },
-        );
-        core.insert_stream_owner(
-            original_conn,
-            stream_id,
-            ProtocolKind::User("/minip2p/test/1.0.0".into()),
-        );
-
-        feed(
-            &mut core,
-            TransportEvent::Connected {
-                id: newer_conn,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
-            },
-        );
-
-        let err = core
-            .send_stream(&peer_id, stream_id, b"lost".to_vec())
-            .expect_err("supersede should remove streams owned by original connection");
-        assert!(matches!(
-            err,
-            SwarmError::StreamNotFound { peer_id: p, stream_id: s }
-                if p == peer_id && s == stream_id
-        ));
-    }
-
-    #[test]
     fn closing_one_connection_keeps_same_stream_id_on_another() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"two-connection-peer");
@@ -3204,9 +3224,9 @@ mod tests {
     }
 
     #[test]
-    fn superseding_connection_discards_undrained_old_actions() {
+    fn replacement_discards_undrained_old_actions() {
         let mut core = test_core();
-        let peer_id = PeerId::from_public_key_protobuf(b"undrained-superseded-peer");
+        let peer_id = PeerId::from_public_key_protobuf(b"undrained-replaced-peer");
         let original = ConnectionId::new(12);
         let replacement = ConnectionId::new(13);
         let stream = StreamId::new(8);
@@ -3225,18 +3245,16 @@ mod tests {
         );
         core.send_stream(&peer_id, stream, b"stale".to_vec())
             .expect("old connection stream should initially be active");
-        core.close_stream_write(&peer_id, stream)
-            .expect("old connection stream should initially be active");
         core.reset_stream(&peer_id, stream)
             .expect("old connection stream should initially be active");
 
-        // Supersede before draining the original connection's automatic
+        // Replace before draining the original connection's automatic
         // Identify open or the application-requested stream actions.
         feed(
             &mut core,
             TransportEvent::Connected {
                 id: replacement,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
             },
         );
 
@@ -3244,7 +3262,7 @@ mod tests {
             core.actions
                 .iter()
                 .all(|action| !connection_action_matches(action, original)),
-            "no ordinary action for the superseded connection may reach the driver"
+            "no ordinary action for the replaced connection may reach the driver"
         );
         assert!(
             core.pending_opens
@@ -3255,83 +3273,347 @@ mod tests {
             core.after_event_actions.as_slices(),
             ([SwarmAction::CloseConnection { conn_id }], []) if *conn_id == original
         ));
+        assert!(matches!(
+            core.send_stream(&peer_id, stream, b"lost".to_vec()),
+            Err(SwarmError::StreamNotFound { .. })
+        ));
     }
 
-    #[test]
-    fn superseding_connection_reports_old_close_before_new_establishment() {
-        let mut core = test_core();
-        let peer_id = PeerId::from_public_key_protobuf(b"superseded-peer");
-        let original = ConnectionId::new(20);
-        let replacement = ConnectionId::new(21);
+    /// Feeds a second connection to an already connected peer, as the
+    /// dialer (`Connected`) or the listener (`IncomingConnection` first).
+    fn connect_again(core: &mut SwarmCore, peer_id: &PeerId, conn_id: ConnectionId, inbound: bool) {
+        if inbound {
+            feed(
+                core,
+                TransportEvent::IncomingConnection {
+                    id: conn_id,
+                    endpoint: ConnectionEndpoint::new(loopback_transport()),
+                },
+            );
+        }
         feed(
-            &mut core,
+            core,
             TransportEvent::Connected {
-                id: original,
+                id: conn_id,
                 endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
             },
         );
-        let _ = drain_events(&mut core);
-        feed(
-            &mut core,
-            TransportEvent::Connected {
-                id: replacement,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
-            },
-        );
-        let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
-        let lifecycle: Vec<_> = outputs
+    }
+
+    /// The lifecycle events and the `old` close action among `outputs`, in order.
+    fn lifecycle(outputs: &[SwarmOutput]) -> Vec<String> {
+        outputs
             .iter()
             .filter_map(|output| match output {
-                SwarmOutput::Event(event @ SwarmEvent::ConnectionEstablished { .. })
-                | SwarmOutput::Event(event @ SwarmEvent::ConnectionClosed { .. }) => Some(event),
+                SwarmOutput::Event(SwarmEvent::ConnectionEstablished { conn_id, .. }) => {
+                    Some(format!("established {conn_id}"))
+                }
+                SwarmOutput::Event(SwarmEvent::ConnectionClosed { conn_id, .. }) => {
+                    Some(format!("closed {conn_id}"))
+                }
+                SwarmOutput::Event(SwarmEvent::ConnectionReplaced { old, new, .. }) => {
+                    Some(format!("replaced {old}->{new}"))
+                }
+                SwarmOutput::Action(SwarmAction::CloseConnection { conn_id }) => {
+                    Some(format!("close {conn_id}"))
+                }
                 _ => None,
             })
-            .collect();
-        assert!(matches!(
-            lifecycle.as_slice(),
-            [
-                SwarmEvent::ConnectionClosed {
-                    conn_id: closed,
-                    cause: ConnectionCloseCause::Superseded,
-                    ..
-                },
-                SwarmEvent::ConnectionEstablished { conn_id: second, .. },
-            ] if *closed == original && *second == replacement
-        ));
-        let closed_position = outputs
-            .iter()
-            .position(|output| matches!(output, SwarmOutput::Event(SwarmEvent::ConnectionClosed { conn_id, .. }) if *conn_id == original))
-            .expect("eager close event");
-        let close_action_position = outputs
-            .iter()
-            .position(|output| matches!(output, SwarmOutput::Action(SwarmAction::CloseConnection { conn_id }) if *conn_id == original))
-            .expect("transport close action");
-        assert!(closed_position < close_action_position);
+            .collect()
     }
 
     #[test]
-    fn transport_loss_reports_transport_close_cause() {
+    fn replacement_on_dial_and_listen_side_reports_only_connection_replaced() {
+        for inbound in [false, true] {
+            let mut core = test_core();
+            let peer_id = PeerId::from_public_key_protobuf(b"replaced-peer");
+            let original = ConnectionId::new(20);
+            let replacement = ConnectionId::new(21);
+            connect_again(&mut core, &peer_id, original, false);
+            let _ = drain_events(&mut core);
+
+            connect_again(&mut core, &peer_id, replacement, inbound);
+            assert!(core.is_peer_connected(&peer_id), "inbound={inbound}");
+            assert_eq!(core.connection_id(&peer_id), Some(replacement));
+            let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+            assert_eq!(
+                lifecycle(&outputs),
+                ["replaced 20->21", "close 20"],
+                "inbound={inbound}"
+            );
+            assert!(
+                outputs.iter().any(|output| matches!(
+                    output,
+                    SwarmOutput::Action(SwarmAction::OpenStream { conn_id, .. }) if *conn_id == replacement
+                )),
+                "the new connection is re-identified (inbound={inbound})"
+            );
+
+            // The transport's close of the retired connection is silent.
+            feed(&mut core, TransportEvent::Closed { id: original });
+            assert!(drain_events(&mut core).is_empty(), "inbound={inbound}");
+            assert!(core.is_peer_connected(&peer_id));
+        }
+    }
+
+    #[test]
+    fn identity_upgrade_onto_connected_peer_replaces_without_orphan() {
         let mut core = test_core();
-        let peer_id = PeerId::from_public_key_protobuf(b"transport-closed-peer");
-        let conn_id = ConnectionId::new(71);
+        let peer_id = PeerId::from_public_key_protobuf(b"upgrade-replaced-peer");
+        let original = ConnectionId::new(30);
+        let upgraded = ConnectionId::new(31);
+        connect_again(&mut core, &peer_id, original, false);
+        let _ = drain_events(&mut core);
+
         feed(
             &mut core,
             TransportEvent::Connected {
-                id: conn_id,
-                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+                id: upgraded,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
             },
         );
+        feed(
+            &mut core,
+            TransportEvent::PeerIdentityVerified {
+                id: upgraded,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                previous_peer_id: None,
+            },
+        );
+        let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+        assert_eq!(lifecycle(&outputs), ["replaced 30->31", "close 30"]);
+        assert_eq!(
+            core.established_connections().collect::<Vec<_>>(),
+            [(upgraded, &peer_id)],
+            "the old connection must not linger as an orphan"
+        );
+
+        // Late events on the retired id never re-register it, and its close
+        // is not reported a second time.
+        feed(
+            &mut core,
+            TransportEvent::PeerIdentityVerified {
+                id: original,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+                previous_peer_id: None,
+            },
+        );
+        feed(
+            &mut core,
+            TransportEvent::IncomingStream {
+                id: original,
+                stream_id: StreamId::new(3),
+            },
+        );
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: original,
+                stream_id: StreamId::new(3),
+                data: multistream_frame(MULTISTREAM_PROTOCOL_ID),
+            },
+        );
+        assert!(core::iter::from_fn(|| core.poll_output()).next().is_none());
+        assert_eq!(core.connection_id(&peer_id), Some(upgraded));
+        feed(&mut core, TransportEvent::Closed { id: original });
+        assert!(drain_events(&mut core).is_empty());
+        assert!(core.is_peer_connected(&peer_id));
+    }
+
+    /// Completes the Identify exchange the core opened on `conn_id`,
+    /// advertising `protocols`.
+    fn identify_on(
+        core: &mut SwarmCore,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        protocols: &[&str],
+    ) {
+        use minip2p_core::encode_frame;
+
+        let token = drain_actions(core)
+            .into_iter()
+            .find_map(|action| match action {
+                SwarmAction::OpenStream {
+                    conn_id: open_conn,
+                    token,
+                } if open_conn == conn_id => Some(token),
+                _ => None,
+            })
+            .expect("identify OpenStream on the connection");
+        core.handle_input(SwarmInput::StreamOpened {
+            conn_id,
+            stream_id,
+            token,
+            now_ms: 0,
+        });
+        let mut accept = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        accept.extend_from_slice(&multistream_frame(IDENTIFY_PROTOCOL_ID));
+        feed(
+            core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: accept,
+            },
+        );
+        let info = IdentifyMessage {
+            protocol_version: Some("ipfs/0.1.0".into()),
+            agent_version: Some("test".into()),
+            public_key: None,
+            listen_addrs: Vec::new(),
+            observed_addr: None,
+            protocols: protocols.iter().map(|p| (*p).into()).collect(),
+        };
+        feed(
+            core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: encode_frame(&info.encode()),
+            },
+        );
+        feed(
+            core,
+            TransportEvent::StreamRemoteWriteClosed {
+                id: conn_id,
+                stream_id,
+            },
+        );
+    }
+
+    fn ready_conns(events: &[SwarmEvent]) -> Vec<ConnectionId> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SwarmEvent::PeerReady { conn_id, .. } => Some(*conn_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn readiness_belongs_to_the_current_connection() {
+        let mut core = test_core();
+        core.add_protocol("/app/1").expect("register");
+        let peer_id = PeerId::from_public_key_protobuf(b"per-connection-ready-peer");
+        let original = ConnectionId::new(40);
+        let replacement = ConnectionId::new(41);
+        connect_again(&mut core, &peer_id, original, false);
+        identify_on(&mut core, original, StreamId::new(1), &[]);
+        assert_eq!(ready_conns(&drain_events(&mut core)), [original]);
+
+        connect_again(&mut core, &peer_id, replacement, false);
+        assert!(core.is_peer_connected(&peer_id));
+        assert!(!core.is_peer_ready(&peer_id), "readiness ends with `old`");
+        assert!(core.peer_readiness(&peer_id).is_none());
+        assert!(core.peer_info(&peer_id).is_none());
+        // Stale Identify data from `old` must not reject the open.
+        core.open_stream(&peer_id, "/app/1")
+            .expect("not ready yet, so no protocol rejection");
+
+        identify_on(&mut core, replacement, StreamId::new(1), &["/app/1"]);
+        assert_eq!(ready_conns(&drain_events(&mut core)), [replacement]);
+        assert_eq!(
+            core.peer_readiness(&peer_id).map(|(conn, _)| conn),
+            Some(replacement)
+        );
+    }
+
+    #[test]
+    fn replacement_before_first_readiness_identifies_the_new_connection() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"early-replaced-peer");
+        let original = ConnectionId::new(50);
+        let replacement = ConnectionId::new(51);
+        connect_again(&mut core, &peer_id, original, false);
+        let _ = drain_actions(&mut core);
+        connect_again(&mut core, &peer_id, replacement, false);
+
+        identify_on(&mut core, replacement, StreamId::new(1), &[]);
+        let events = drain_events(&mut core);
+        assert_eq!(ready_conns(&events), [replacement]);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::ConnectionEstablished { .. } | SwarmEvent::ConnectionClosed { .. }
+            )),
+            "a hand-over is never a disconnect: {events:?}"
+        );
+    }
+
+    #[test]
+    fn in_flight_ping_is_resent_on_the_new_connection_without_timeout() {
+        let mut core = test_core(); // default request_timeout_ms = 10_000
+        let peer_id = PeerId::from_public_key_protobuf(b"ping-replaced-peer");
+        let original = ConnectionId::new(60);
+        let replacement = ConnectionId::new(61);
+        let payload = [9; PING_PAYLOAD_LEN];
+        setup_outbound_ping_stream(&mut core, &peer_id, original, StreamId::new(4));
+        core.ping(&peer_id, payload, 0).expect("ping in flight");
+        let _ = drain_actions(&mut core);
+
+        connect_again(&mut core, &peer_id, replacement, false);
+        let token = drain_actions(&mut core)
+            .into_iter()
+            .filter_map(|action| match action {
+                SwarmAction::OpenStream { conn_id, token } if conn_id == replacement => Some(token),
+                _ => None,
+            })
+            .next_back()
+            .expect("ping stream re-opened on the new connection");
+        assert_eq!(core.next_timeout(5_000), None, "the old timer is gone");
+
+        // Well past the original deadline: still no timeout for the hand-over.
+        core.handle_input(SwarmInput::Tick { now_ms: 20_000 });
+        assert!(
+            !drain_events(&mut core)
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::PingTimeout { .. }))
+        );
+
+        let stream_id = StreamId::new(8);
+        core.handle_input(SwarmInput::StreamOpened {
+            conn_id: replacement,
+            stream_id,
+            token,
+            now_ms: 20_000,
+        });
+        let _ = drain_actions(&mut core);
+        let mut accept = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        accept.extend_from_slice(&multistream_frame(PING_PROTOCOL_ID));
+        core.handle_input(SwarmInput::Transport {
+            event: TransportEvent::StreamData {
+                id: replacement,
+                stream_id,
+                data: accept,
+            },
+            now_ms: 20_000,
+        });
+        assert!(drain_actions(&mut core).iter().any(|action| matches!(
+            action,
+            SwarmAction::SendStream { conn_id, data, .. }
+                if *conn_id == replacement && data.as_slice() == payload.as_slice()
+        )));
+        assert_eq!(
+            core.next_timeout(20_000),
+            Some(10_001),
+            "the timeout restarts at the re-send"
+        );
+    }
+
+    #[test]
+    fn transport_loss_reports_connection_closed() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"transport-closed-peer");
+        let conn_id = ConnectionId::new(71);
+        connect_again(&mut core, &peer_id, conn_id, false);
         let _ = drain_events(&mut core);
 
         feed(&mut core, TransportEvent::Closed { id: conn_id });
 
         assert!(matches!(
             drain_events(&mut core).as_slice(),
-            [SwarmEvent::ConnectionClosed {
-                conn_id: closed,
-                cause: ConnectionCloseCause::Transport,
-                ..
-            }] if *closed == conn_id
+            [SwarmEvent::ConnectionClosed { conn_id: closed, .. }] if *closed == conn_id
         ));
     }
 
@@ -3460,7 +3742,7 @@ mod tests {
     }
 
     #[test]
-    fn superseding_connection_resets_stale_ping_stream() {
+    fn replacement_resets_stale_ping_stream() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
         let original_conn = ConnectionId::new(10);
@@ -3516,7 +3798,7 @@ mod tests {
     }
 
     #[test]
-    fn superseding_connection_requeues_pending_ping_open() {
+    fn replacement_requeues_pending_ping_open() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
         let original_conn = ConnectionId::new(10);
@@ -3865,11 +4147,7 @@ mod tests {
         feed(&mut core, TransportEvent::Closed { id: conn_id });
         assert!(matches!(
             drain_events(&mut core).as_slice(),
-            [SwarmEvent::ConnectionClosed {
-                conn_id: closed,
-                cause: ConnectionCloseCause::Transport,
-                ..
-            }] if *closed == conn_id
+            [SwarmEvent::ConnectionClosed { conn_id: closed, .. }] if *closed == conn_id
         ));
     }
 
@@ -4082,7 +4360,7 @@ mod tests {
     }
 
     #[test]
-    fn established_connections_lists_every_connection_of_a_connected_peer() {
+    fn established_connections_lists_each_connected_peers_current_connection() {
         let mut core = test_core();
         let peer = PeerId::from_public_key_protobuf(b"multi-connection-peer");
         let circuit = ConnectionId::new(1);
@@ -4097,8 +4375,8 @@ mod tests {
                 endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
             },
         );
-        // A late identity upgrade adds a second connection without
-        // superseding the first; an unverified connection is not the peer's.
+        // A late identity upgrade replaces the first connection; an
+        // unverified connection is not the peer's.
         feed(
             &mut core,
             TransportEvent::Connected {
@@ -4123,11 +4401,9 @@ mod tests {
         );
         assert_eq!(
             core.established_connections().collect::<Vec<_>>(),
-            vec![(circuit, &peer), (direct, &peer)]
+            vec![(direct, &peer)]
         );
 
-        // Closing the primary ends the peer's established state, so the
-        // leftover mapping is no longer reported.
         feed(&mut core, TransportEvent::Closed { id: direct });
         assert_eq!(core.established_connections().count(), 0);
     }
