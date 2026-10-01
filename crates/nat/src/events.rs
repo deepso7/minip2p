@@ -127,7 +127,8 @@ pub enum NatEvent {
         attempt: u32,
         reason: String,
     },
-    /// All punch windows are exhausted; the established relayed connection
+    /// All punch windows are exhausted (or another attempt's circuit took
+    /// over the peer's connection); the established relayed connection
     /// remains the final path for this attempt.
     FellBackToRelay { connect_id: ConnectId, peer: PeerId },
     /// The attempt ended with no usable path.

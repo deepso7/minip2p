@@ -1123,11 +1123,9 @@ impl NatAgent {
         self.connection_up(peer, new, is_circuit, now);
         // A circuit another attempt promoted stays that attempt's: adopting
         // it would let this attempt close it on cancel.
-        let new_promoted = self.attempts.values().any(|a| a.promotes(new));
-        if !new_promoted {
-            for attempt in self.attempts.values_mut() {
-                attempt.on_target_replaced(peer, old, new, &mut self.shared);
-            }
+        let new_owned = self.attempts.values().any(|a| a.promotes(new));
+        for attempt in self.attempts.values_mut() {
+            attempt.on_target_replaced(peer, old, new, new_owned, &mut self.shared);
         }
         self.notify_connection_down(peer, old, now);
 

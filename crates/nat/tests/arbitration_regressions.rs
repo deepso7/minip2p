@@ -722,7 +722,7 @@ fn circuit_replacing_the_promoted_circuit_keeps_the_attempt_alive() {
 }
 
 #[test]
-fn circuit_promoted_by_another_attempt_is_never_adopted() {
+fn circuit_promoted_by_another_attempt_settles_the_displaced_one_as_relayed() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (first, circuit) = drive_to_relayed(&mut h);
 
@@ -742,7 +742,20 @@ fn circuit_promoted_by_another_attempt_is_never_adopted() {
         .promote_result(promote_token(&promotion), Ok(other_circuit), at(314));
     replace_target(&mut h, circuit, other_circuit, 315);
     drain_actions(&mut h.agent);
-    drain_events(&mut h.agent);
+    let events = drain_events(&mut h.agent);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            NatEvent::FellBackToRelay { connect_id, .. } if *connect_id == first
+        )),
+        "the displaced attempt ends on its relayed path: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, NatEvent::ConnectFailed { .. })),
+        "the peer stays connected, so no attempt fails: {events:?}"
+    );
 
     h.agent.cancel(first, at(320));
     assert!(

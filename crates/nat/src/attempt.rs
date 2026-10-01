@@ -372,21 +372,31 @@ impl ConnectAttempt {
     /// promoted and `new` is another circuit, the attempt carries on over
     /// `new`: a punch in flight may still upgrade it, and otherwise it falls
     /// back to relay as usual. A DCUtR exchange lived on `old` and ends.
-    /// The caller skips this when another attempt promoted `new`; `old`
-    /// then simply closes for this attempt.
+    ///
+    /// When `new_owned` (another attempt promoted `new`), `new` stays that
+    /// attempt's and this one ends on the relayed path it already reported.
     pub(crate) fn on_target_replaced(
         &mut self,
         peer: &PeerId,
         old: ConnectionId,
         new: ConnectionId,
+        new_owned: bool,
         shared: &mut Shared,
     ) {
         if self.done || *peer != self.peer || self.promoted != Some(old) {
             return;
         }
-        self.promoted = Some(new);
+        // `old` retires with the swarm; there is nothing left to close.
+        self.promoted = (!new_owned).then_some(new);
         if let Some(stream) = self.dcutr_stream {
             self.finish_failed_dcutr(stream, "DCUtR circuit was replaced".into(), shared);
+        } else if new_owned {
+            shared.abort_attempt_dials(self.id);
+            shared.push_event(NatEvent::FellBackToRelay {
+                connect_id: self.id,
+                peer: self.peer.clone(),
+            });
+            self.done = true;
         }
     }
 
