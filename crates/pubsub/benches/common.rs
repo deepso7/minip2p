@@ -384,6 +384,7 @@ pub fn assert_heartbeat_ran(agent: &mut GossipsubAgent) {
     );
     // topic -> peer -> advertised ids
     let mut gossip: BTreeMap<String, BTreeMap<PeerId, BTreeSet<Vec<u8>>>> = BTreeMap::new();
+    let mut ihave_ids = 0;
     while let Some(action) = agent.poll_action() {
         let (_, peer, _, data) = as_send(action).expect("heartbeat only sends");
         let payload = match decode_frame(&data) {
@@ -396,6 +397,7 @@ pub fn assert_heartbeat_ran(agent: &mut GossipsubAgent) {
         assert!(control.graft.is_empty() && control.prune.is_empty());
         for ihave in control.ihave {
             let topic = ihave.topic_id.expect("IHAVE names its topic");
+            ihave_ids += ihave.message_ids.len();
             gossip
                 .entry(topic)
                 .or_default()
@@ -408,6 +410,12 @@ pub fn assert_heartbeat_ran(agent: &mut GossipsubAgent) {
     let gossip_peers = GossipsubConfig::default().d_lazy;
     let newest = HEARTBEAT_CACHE_WINDOWS - HEARTBEAT_GOSSIP_WINDOWS as u64..HEARTBEAT_CACHE_WINDOWS;
     assert_eq!(gossip.len(), usize::from(HEARTBEAT_TOPICS), "IHAVE topics");
+    // The per-peer sets below would hide duplicates, so count every id sent.
+    assert_eq!(
+        ihave_ids,
+        usize::from(HEARTBEAT_TOPICS) * gossip_peers * HEARTBEAT_GOSSIP_WINDOWS,
+        "IHAVE ids sent"
+    );
     for index in 0..HEARTBEAT_TOPICS {
         let topic = heartbeat_topic(index);
         let recipients = gossip.get(&topic).expect("IHAVE for every topic");
