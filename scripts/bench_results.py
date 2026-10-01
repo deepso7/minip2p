@@ -10,11 +10,34 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 SCHEMA_VERSION = 1
 TIERS = ("rust-micro", "rust-wall", "node-ffi")
-METRICS = {"rust-micro": "Ir", "rust-wall": "median_ns", "node-ffi": "median_ns"}
+
+
+class Metric(NamedTuple):
+    higher_is_better: bool
+    # Classified metrics get noise/changed/notable bands; the rest are informational.
+    classified: bool
+
+
+# Fixed registry: every row's metric must be listed here. Any tier may use any metric.
+METRICS = {
+    "Ir": Metric(higher_is_better=False, classified=True),
+    "median_ns": Metric(higher_is_better=False, classified=False),
+    "mb_per_s": Metric(higher_is_better=True, classified=False),
+    "wakeups_per_s": Metric(higher_is_better=False, classified=False),
+    "cpu_ms_per_s": Metric(higher_is_better=False, classified=False),
+    # Allocations over real transports depend on scheduling and read chunking.
+    "allocs_per_mb": Metric(higher_is_better=False, classified=False),
+    "bytes_allocated_per_mb": Metric(higher_is_better=False, classified=False),
+    # Isolated agent operations with fixed inputs allocate deterministically.
+    "allocs_per_msg": Metric(higher_is_better=False, classified=True),
+    "bytes_allocated_per_msg": Metric(higher_is_better=False, classified=True),
+    "rtt_us_p50": Metric(higher_is_better=False, classified=False),
+    "rtt_us_p99": Metric(higher_is_better=False, classified=False),
+}
 EXPECTED_CRITERION = {
     "multiaddr/parse_text", "multiaddr/encode_binary", "multiaddr/decode_binary",
     "yamux/64KiB/session_send_and_drain", "yamux/64KiB/session_receive_and_drain",
@@ -43,6 +66,10 @@ GUNGRAUN_NAMES = {
     "relay_handle_event_same_now_128_pending_hops": "relay_handle_event_same_now_128_pending_hops",
 }
 EXPECTED_VITEST = {"sdk_drain_flood", "raw_drain_events", "connected_peers_sync"}
+# Rows a bench measures itself (for example throughput or allocations), keyed by
+# (tier, name, metric). Each such bench writes a JSON array of rows into the
+# `custom` collector's root; list every row it emits here.
+EXPECTED_CUSTOM: set[tuple[str, str, str]] = set()
 IR_PINS = {
     "rust": "Rust toolchain",
     "profile": "optimization profile",
@@ -80,8 +107,8 @@ def validate(document: Any) -> dict[str, Any]:
             raise BenchError(f"row {index} has unknown tier {tier!r}")
         if not isinstance(name, str) or not name:
             raise BenchError(f"row {index} requires a non-empty name")
-        if metric != METRICS[tier]:
-            raise BenchError(f"row {index} must use metric {METRICS[tier]!r}")
+        if not isinstance(metric, str) or metric not in METRICS:
+            raise BenchError(f"row {index} has unknown metric {metric!r}")
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise BenchError(f"row {index} requires a finite non-negative value")
         key = (tier, name, metric)
@@ -193,6 +220,29 @@ def collect_gungraun(root: Path, output: Path, git_sha: str, since: Path) -> Non
     write_results(git_sha, rows, output)
 
 
+def collect_custom(root: Path, output: Path, git_sha: str, since: Path) -> None:
+    """Merge the row arrays that benches wrote into `root` after `since`, requiring exactly `EXPECTED_CUSTOM`."""
+    try:
+        started_at = since.stat().st_mtime_ns
+    except OSError as error:
+        raise BenchError(f"cannot read custom run marker {since}: {error}") from error
+    rows = []
+    for path in sorted(root.glob("*.json")):
+        if path.stat().st_mtime_ns <= started_at:
+            continue
+        document = load_json(path)
+        if not isinstance(document, list):
+            raise BenchError(f"custom rows file must hold a JSON array: {path}")
+        rows.extend(document)
+    validate({"schema_version": SCHEMA_VERSION, "git_sha": git_sha, "rows": rows})
+    keys = {(row["tier"], row["name"], row["metric"]) for row in rows}
+    if keys != EXPECTED_CUSTOM:
+        missing = sorted(EXPECTED_CUSTOM - keys)
+        unexpected = sorted(keys - EXPECTED_CUSTOM)
+        raise BenchError(f"custom row set mismatch; missing={missing}, unexpected={unexpected}")
+    write_results(git_sha, rows, output)
+
+
 def git_bytes(tree: str, path: str) -> bytes:
     result = subprocess.run(
         ["git", "show", f"{tree}:{path}"], capture_output=True, check=False
@@ -245,7 +295,7 @@ def compare_rows(
     for row in current["rows"]:
         key = (row["tier"], row["name"], row["metric"])
         reason = "no baseline" if baseline is None else None
-        if reason is None and row["tier"] == "rust-micro" and ir_reason:
+        if reason is None and row["metric"] == "Ir" and ir_reason:
             reason = ir_reason
         if reason is None and key not in old:
             reason = "missing baseline row"
@@ -257,12 +307,14 @@ def compare_rows(
             compared.append(ComparedRow(*key, baseline_value, row["value"], None, "unclassified", "", "zero baseline"))
             continue
         delta = (row["value"] - baseline_value) / baseline_value * 100
-        if row["tier"] != "rust-micro":
-            compared.append(ComparedRow(*key, baseline_value, row["value"], delta, "informational", ""))
+        metric = METRICS[row["metric"]]
+        better = -delta if metric.higher_is_better else delta
+        direction = "improved" if better < 0 else "regressed" if better > 0 else ""
+        if not metric.classified:
+            compared.append(ComparedRow(*key, baseline_value, row["value"], delta, "informational", direction))
             continue
         magnitude = abs(delta)
         classification = "notable" if magnitude >= 2.0 else "changed" if magnitude >= 1.0 else "noise"
-        direction = "improved" if delta < 0 else "regressed" if delta > 0 else ""
         compared.append(ComparedRow(*key, baseline_value, row["value"], delta, classification, direction))
     current_keys = {(row["tier"], row["name"], row["metric"]) for row in current["rows"]}
     for key, baseline_value in old.items():
@@ -311,11 +363,11 @@ def render(
         visible = [row for row in rows if row.tier == tier and row.classification != "noise"]
         if not visible:
             continue
-        lines += ["", f"### {tier}", "", "| benchmark | baseline | current | Δ% | class | direction |", "| --- | ---: | ---: | ---: | --- | --- |"]
+        lines += ["", f"### {tier}", "", "| benchmark | metric | baseline | current | Δ% | class | direction |", "| --- | --- | ---: | ---: | ---: | --- | --- |"]
         for row in visible:
             delta = "—" if row.delta is None else f"{row.delta:+.2f}%"
             classification = row.classification if row.reason is None else f"{row.classification} ({row.reason})"
-            lines.append(f"| {markdown_code(row.name)} | {display_value(row.baseline)} | {display_value(row.current)} | {delta} | {classification} | {row.direction} |")
+            lines.append(f"| {markdown_code(row.name)} | `{row.metric}` | {display_value(row.baseline)} | {display_value(row.current)} | {delta} | {classification} | {row.direction} |")
     return "\n".join(lines) + "\n"
 
 
@@ -360,6 +412,12 @@ def parser() -> argparse.ArgumentParser:
     gungraun_parser.add_argument("--git-sha", required=True)
     gungraun_parser.add_argument("--since", type=Path, required=True)
     gungraun_parser.set_defaults(run=lambda args: collect_gungraun(args.root, args.output, args.git_sha, args.since))
+    custom_parser = commands.add_parser("custom")
+    custom_parser.add_argument("--root", type=Path, default=Path("target/bench-results/custom"))
+    custom_parser.add_argument("--output", type=Path, required=True)
+    custom_parser.add_argument("--git-sha", required=True)
+    custom_parser.add_argument("--since", type=Path, required=True)
+    custom_parser.set_defaults(run=lambda args: collect_custom(args.root, args.output, args.git_sha, args.since))
     compare_parser = commands.add_parser("compare")
     compare_parser.add_argument("--current", type=Path, required=True)
     compare_parser.add_argument("--baseline", type=Path)
