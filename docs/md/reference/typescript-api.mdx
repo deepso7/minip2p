@@ -187,3 +187,5 @@ Use `instanceof` for control flow and the typed `kind` fields for telemetry.
 | `BackpressureError` | The outbound pubsub queue is full. |
 | `MessageTooLargeError` | A payload exceeds the protocol limit. |
 | `NotPermittedError` | Endpoint policy rejected the operation. |
+
+Other native failures, such as an invalid peer ID or address, are rethrown unchanged. On Node.js they are `Error`s whose `code` is the native `FfiError` variant name (for example `InvalidPeerId`) and whose `detail`, when present, is the variant's detail text.

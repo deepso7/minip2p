@@ -1,3 +1,8 @@
+import {
+  BackpressureError,
+  MessageTooLargeError,
+  NotPermittedError,
+} from "./errors.js";
 import type {
   Bytes,
   ConnectionInfo,
@@ -103,6 +108,31 @@ export {
   type P2pEventByTag,
   type PathKind,
 } from "./types.js";
+
+/**
+ * Returns the typed SDK error for a native `FfiError` variant name, or
+ * `undefined` for variants that adapters rethrow unchanged. `detail` is the
+ * variant's detail field, when it has one.
+ */
+export const typedFfiError = (
+  tag: string | undefined,
+  detail: string | undefined
+): Error | undefined => {
+  switch (tag) {
+    case "Backpressure": {
+      return new BackpressureError();
+    }
+    case "MessageTooLarge": {
+      return new MessageTooLargeError();
+    }
+    case "NotPermitted": {
+      return new NotPermittedError(detail);
+    }
+    default: {
+      return undefined;
+    }
+  }
+};
 
 /** Platform implementation used to construct endpoints and identity helpers. */
 export interface Minip2pBackendFactory {

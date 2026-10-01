@@ -10,7 +10,7 @@ import type {
   Reachability,
   RelayReservationInfo,
 } from "@minip2p/core";
-import { resolveEndpointConfig } from "@minip2p/core/backend";
+import { resolveEndpointConfig, typedFfiError } from "@minip2p/core/backend";
 import type {
   BackendConnectTarget,
   BackendOpenStream,
@@ -29,9 +29,12 @@ class NodeBackend implements Minip2pBackend {
   readonly #streamIds = new IdMap();
 
   constructor(config: Minip2pConfig) {
-    this.#endpoint = new nativeBinding.NodeEndpoint(
-      toUint8Array(config.secretKey),
-      resolveEndpointConfig(config)
+    this.#endpoint = translateErrors(
+      () =>
+        new nativeBinding.NodeEndpoint(
+          toUint8Array(config.secretKey),
+          resolveEndpointConfig(config)
+        )
     );
     this.#events = new EventDrain(
       () => this.#endpoint.drainEvents(256),
@@ -41,8 +44,10 @@ class NodeBackend implements Minip2pBackend {
 
   start(listener: (event: P2pEvent) => void): void {
     this.#events.start(listener);
-    this.#endpoint.start(() => {
-      this.#events.ring();
+    translateErrors(() => {
+      this.#endpoint.start(() => {
+        this.#events.ring();
+      });
     });
   }
 
@@ -68,28 +73,28 @@ class NodeBackend implements Minip2pBackend {
   }
 
   connectedPeers(): string[] {
-    return this.#endpoint.connectedPeers();
+    return translateErrors(() => this.#endpoint.connectedPeers());
   }
 
   isPeerReady(peerId: string): boolean {
-    return this.#endpoint.isPeerReady(peerId);
+    return translateErrors(() => this.#endpoint.isPeerReady(peerId));
   }
 
   peerInfo(peerId: string): IdentifyInfo | undefined {
-    const info = this.#endpoint.peerInfo(peerId);
+    const info = translateErrors(() => this.#endpoint.peerInfo(peerId));
     return info === null || info === undefined
       ? undefined
       : normalizeIdentifyInfo(info);
   }
 
   knownPeers(): KnownPeerInfo[] {
-    return this.#endpoint
-      .knownPeers()
-      .map((peer) => normalizeRecord<KnownPeerInfo>(peer));
+    return translateErrors(() => this.#endpoint.knownPeers()).map((peer) =>
+      normalizeRecord<KnownPeerInfo>(peer)
+    );
   }
 
   discoveryNowMs(): number | undefined {
-    const value = this.#endpoint.discoveryNowMs();
+    const value = translateErrors(() => this.#endpoint.discoveryNowMs());
     return value === null || value === undefined
       ? undefined
       : bigintToNumber(value, "clock");
@@ -97,16 +102,18 @@ class NodeBackend implements Minip2pBackend {
 
   activeReservation(): RelayReservationInfo | undefined {
     return normalizeOptional<RelayReservationInfo>(
-      this.#endpoint.activeReservation()
+      translateErrors(() => this.#endpoint.activeReservation())
     );
   }
 
   path(peerId: string): PathKind | undefined {
-    return normalizeOptional<PathKind>(this.#endpoint.path(peerId));
+    return normalizeOptional<PathKind>(
+      translateErrors(() => this.#endpoint.path(peerId))
+    );
   }
 
   connectionInfo(peerId: string): ConnectionInfo | undefined {
-    const info = this.#endpoint.connectionInfo(peerId);
+    const info = translateErrors(() => this.#endpoint.connectionInfo(peerId));
     if (info === null || info === undefined) {
       return undefined;
     }
@@ -117,11 +124,11 @@ class NodeBackend implements Minip2pBackend {
   }
 
   circuitAddress(relayAddress: string, peerId: string): string {
-    return nativeBinding.circuitAddress(relayAddress, peerId);
+    return circuitAddress(relayAddress, peerId);
   }
 
   reachability(): Reachability {
-    return this.#endpoint.reachability() as Reachability;
+    return translateErrors(() => this.#endpoint.reachability()) as Reachability;
   }
 
   setActive(active: boolean): void {
@@ -129,27 +136,35 @@ class NodeBackend implements Minip2pBackend {
   }
 
   subscribe(topic: string): boolean {
-    return this.#endpoint.subscribe(topic);
+    return translateErrors(() => this.#endpoint.subscribe(topic));
   }
 
   unsubscribe(topic: string): boolean {
-    return this.#endpoint.unsubscribe(topic);
+    return translateErrors(() => this.#endpoint.unsubscribe(topic));
   }
 
   publish(topic: string, data: Uint8Array): void {
-    this.#endpoint.publish(topic, data);
+    translateErrors(() => {
+      this.#endpoint.publish(topic, data);
+    });
   }
 
   ping(peerId: string): void {
-    this.#endpoint.ping(peerId);
+    translateErrors(() => {
+      this.#endpoint.ping(peerId);
+    });
   }
 
   addProtocol(protocolId: string): void {
-    this.#endpoint.addProtocol(protocolId);
+    translateErrors(() => {
+      this.#endpoint.addProtocol(protocolId);
+    });
   }
 
   openStream(peerId: string, protocolId: string): BackendOpenStream {
-    const stream = this.#endpoint.openStream(peerId, protocolId);
+    const stream = translateErrors(() =>
+      this.#endpoint.openStream(peerId, protocolId)
+    );
     return {
       connId: this.#connectionIds.toPublic(stream.connId),
       streamId: this.#streamIds.toPublic(stream.streamId),
@@ -157,38 +172,59 @@ class NodeBackend implements Minip2pBackend {
   }
 
   sendStream(peerId: string, streamId: number, data: Uint8Array): void {
-    this.#endpoint.sendStream(peerId, this.#streamIds.toNative(streamId), data);
+    translateErrors(() => {
+      this.#endpoint.sendStream(
+        peerId,
+        this.#streamIds.toNative(streamId),
+        data
+      );
+    });
   }
 
   closeStreamWrite(peerId: string, streamId: number): void {
-    this.#endpoint.closeStreamWrite(peerId, this.#streamIds.toNative(streamId));
+    translateErrors(() => {
+      this.#endpoint.closeStreamWrite(
+        peerId,
+        this.#streamIds.toNative(streamId)
+      );
+    });
   }
 
   resetStream(peerId: string, streamId: number): void {
-    this.#endpoint.resetStream(peerId, this.#streamIds.toNative(streamId));
+    translateErrors(() => {
+      this.#endpoint.resetStream(peerId, this.#streamIds.toNative(streamId));
+    });
   }
 
   abandonStream(peerId: string, streamId: number): void {
-    this.#endpoint.abandonStream(peerId, this.#streamIds.toNative(streamId));
+    translateErrors(() => {
+      this.#endpoint.abandonStream(peerId, this.#streamIds.toNative(streamId));
+    });
   }
 
   // Connect IDs are not mapped because they round-trip into native calls,
   // and native allocates them well inside the safe integer range.
   connect(target: BackendConnectTarget): number {
     return bigintToNumber(
-      this.#endpoint.connect(
-        target.kind === "peer" ? target.peerId : [...target.addresses]
+      translateErrors(() =>
+        this.#endpoint.connect(
+          target.kind === "peer" ? target.peerId : [...target.addresses]
+        )
       ),
       "connectId"
     );
   }
 
   cancelConnect(id: number): void {
-    this.#endpoint.cancelConnect(BigInt(id));
+    translateErrors(() => {
+      this.#endpoint.cancelConnect(BigInt(id));
+    });
   }
 
   disconnect(peerId: string): void {
-    this.#endpoint.disconnect(peerId);
+    translateErrors(() => {
+      this.#endpoint.disconnect(peerId);
+    });
   }
 }
 
@@ -211,12 +247,42 @@ export function generateSecretKey(): Uint8Array {
 
 /** Derives a peer ID from raw Ed25519 secret key material. */
 export function peerIdFromSecretKey(secretKey: Bytes): string {
-  return nativeBinding.peerIdFromSecretKey(toUint8Array(secretKey));
+  return translateErrors(() =>
+    nativeBinding.peerIdFromSecretKey(toUint8Array(secretKey))
+  );
 }
 
 /** Builds a circuit multiaddress through a direct relay address. */
 export function circuitAddress(relayAddress: string, peerId: string): string {
-  return nativeBinding.circuitAddress(relayAddress, peerId);
+  return translateErrors(() =>
+    nativeBinding.circuitAddress(relayAddress, peerId)
+  );
+}
+
+/**
+ * Rethrows a native `FfiError` as its typed SDK error. The addon tags each
+ * error with the variant name as `code` and its detail field as `detail`;
+ * untyped variants are rethrown unchanged with both properties intact.
+ */
+function translateErrors<T>(operation: () => T): T {
+  try {
+    return operation();
+  } catch (error) {
+    throw (
+      typedFfiError(
+        stringProperty(error, "code"),
+        stringProperty(error, "detail")
+      ) ?? error
+    );
+  }
+}
+
+function stringProperty(value: unknown, key: string): string | undefined {
+  if (value === null || typeof value !== "object") {
+    return undefined;
+  }
+  const property: unknown = Reflect.get(value, key);
+  return typeof property === "string" ? property : undefined;
 }
 
 function toUint8Array(value: Bytes): Uint8Array {

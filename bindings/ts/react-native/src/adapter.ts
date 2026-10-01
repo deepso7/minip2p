@@ -1,11 +1,6 @@
 /* oxlint-disable class-methods-use-this, complexity, func-style, max-classes-per-file, no-use-before-define -- The adapter keeps its contract-complete native endpoint and public SDK subclass together, and uses hoisted conversion helpers. */
 
-import {
-  BackpressureError,
-  MessageTooLargeError,
-  Minip2pBase,
-  NotPermittedError,
-} from "@minip2p/core";
+import { Minip2pBase } from "@minip2p/core";
 import type {
   Bytes,
   ConnectionInfo,
@@ -15,7 +10,11 @@ import type {
   Reachability,
   RelayReservationInfo,
 } from "@minip2p/core";
-import { P2pEvent_Tags, resolveEndpointConfig } from "@minip2p/core/backend";
+import {
+  P2pEvent_Tags,
+  resolveEndpointConfig,
+  typedFfiError,
+} from "@minip2p/core/backend";
 import type {
   BackendConnectTarget,
   Minip2pBackend,
@@ -28,7 +27,6 @@ import type {
 import { EventDrain } from "./event-drain";
 import {
   ConnectTarget,
-  FfiError_Tags,
   P2pEndpoint,
   circuitAddress as nativeCircuitAddress,
   generateSecretKey as nativeGenerateSecretKey,
@@ -434,27 +432,16 @@ function translateErrors<T>(operation: () => T): T {
   try {
     return operation();
   } catch (error) {
-    const tag = getErrorTag(error);
-    switch (tag) {
-      case FfiError_Tags.Backpressure: {
-        throw new BackpressureError();
-      }
-      case FfiError_Tags.MessageTooLarge: {
-        throw new MessageTooLargeError();
-      }
-      case FfiError_Tags.NotPermitted: {
-        throw new NotPermittedError(getErrorDetail(error));
-      }
-      default: {
-        throw error;
-      }
-    }
+    throw typedFfiError(getErrorTag(error), getErrorDetail(error)) ?? error;
   }
 }
 
-function getErrorTag(error: unknown): FfiError_Tags | undefined {
-  return typeof error === "object" && error !== null && "tag" in error
-    ? (error.tag as FfiError_Tags)
+function getErrorTag(error: unknown): string | undefined {
+  return typeof error === "object" &&
+    error !== null &&
+    "tag" in error &&
+    typeof error.tag === "string"
+    ? error.tag
     : undefined;
 }
 
