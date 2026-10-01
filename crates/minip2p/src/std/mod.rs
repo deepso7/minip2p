@@ -1038,9 +1038,20 @@ impl Endpoint {
     /// streams. Neither service claims connection lifecycle or `PeerReady`,
     /// so both still observe the shared connection state.
     ///
+    /// A stale `PeerReady` (queued before its connection was replaced)
+    /// reaches only the application: drivers act peer-scoped, so it would
+    /// start work on the replacement before that connection is ready.
+    ///
     /// Returns `true` when a driver claimed the event.
     #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn ingest_into_drivers(&mut self, event: &SwarmEvent) -> bool {
+        if let SwarmEvent::PeerReady {
+            peer_id, conn_id, ..
+        } = event
+            && self.swarm.connection_id(peer_id) != Some(*conn_id)
+        {
+            return false;
+        }
         #[cfg(any(feature = "discovery", feature = "mdns"))]
         if let Some(discovery) = self.discovery.as_mut() {
             let now_ms = self.swarm.now().monotonic_ms;

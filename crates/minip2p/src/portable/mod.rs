@@ -1089,19 +1089,31 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             if let Some(discovery) = self.discovery.as_mut() {
                 discovery.observe(&event, self.endpoint.runtime().core(), now.monotonic_ms);
             }
+            // A stale `PeerReady` (its connection was replaced later in this
+            // batch) reaches only the application: the drivers act
+            // peer-scoped and would start work on the not-yet-ready
+            // replacement.
+            #[cfg(any(feature = "portable-autonat", feature = "pubsub"))]
+            let stale_ready = matches!(
+                &event,
+                SwarmEvent::PeerReady { peer_id, conn_id, .. }
+                    if self.endpoint.connection_id(peer_id) != Some(*conn_id)
+            );
             #[cfg(feature = "portable-autonat")]
             let claimed = engine_consumed
-                || self
-                    .nat
-                    .as_mut()
-                    .is_some_and(|nat| nat.ingest(&event, self.endpoint.runtime_mut(), now));
+                || (!stale_ready
+                    && self
+                        .nat
+                        .as_mut()
+                        .is_some_and(|nat| nat.ingest(&event, self.endpoint.runtime_mut(), now)));
             #[cfg(not(feature = "portable-autonat"))]
             let claimed = engine_consumed;
             #[cfg(feature = "pubsub")]
             let claimed = claimed
-                || self.gossipsub.as_mut().is_some_and(|pubsub| {
-                    pubsub.ingest(&event, self.endpoint.runtime_mut(), now.monotonic_ms)
-                });
+                || (!stale_ready
+                    && self.gossipsub.as_mut().is_some_and(|pubsub| {
+                        pubsub.ingest(&event, self.endpoint.runtime_mut(), now.monotonic_ms)
+                    }));
             if !claimed {
                 output.push(event.into());
             }
