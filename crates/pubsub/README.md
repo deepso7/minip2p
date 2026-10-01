@@ -42,7 +42,7 @@ Delivered `GossipsubEvent::Message` values include a `signed` flag. It is true o
 Fixtures live in `benches/common.rs`; every measurement uses a fresh one built outside the measured region.
 
 - `publish` / `publish_ir`: a local 60 KiB publish to a 32-peer mesh.
-- `router` / `router_ir`: forwarding one fresh, StrictSigned 1 KiB message, delivered and authored by a mesh peer, to the other N−1 peers of an N = 8, 32 or 128 mesh, from handing the inbound frame to the agent through draining its actions; and one heartbeat at 1,000 peers and 100 topics with 500 cached messages over 5 history windows. Each run asserts the forward reached exactly the non-source mesh peers, or that the heartbeat ran and gossiped the 3 newest windows.
+- `router` / `router_ir`: forwarding one fresh, StrictSigned 1 KiB message, delivered and authored by a mesh peer, to the other N−1 peers of an N = 8, 32 or 128 mesh, from handing the inbound frame to the agent through draining its actions; and one heartbeat at 1,000 peers and 100 topics with 500 cached messages over 5 history windows. Each run asserts the forward reached exactly the non-source mesh peers, or that the heartbeat ran, left every mesh alone, and sent each topic's ids from the 3 newest windows to `d_lazy` non-mesh subscribers of that topic.
 - `router_allocs`: heap allocations and bytes allocated over the same forwarding boundary, counted by `stats_alloc` as the binary's global allocator.
 
 ```bash
