@@ -174,8 +174,11 @@ fn transfer(client: &mut Endpoint, peer: &PeerId, progress: &Progress) -> (Mark,
                 }
             }
         }
-        // Flushes queued bytes; the sink's progress interrupts this wait.
-        next_event(client, Duration::from_millis(5));
+        // Flushes queued bytes. The sink's progress interrupts this wait,
+        // which returns so the window refills at once (`next_event` would
+        // swallow the interrupt and sleep out the deadline). The sender has
+        // no use for the outcome or any event.
+        let _outcome = client.wait(Duration::from_millis(5)).expect("drive client");
     };
     client
         .close_stream_write(peer, stream)
