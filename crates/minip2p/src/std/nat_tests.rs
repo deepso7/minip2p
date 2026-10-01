@@ -400,7 +400,7 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
     agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: relay_peer.clone(),
-            conn_id: ConnectionId::new(1),
+            conn_id: pair.inner_conn,
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
         Now::from_mono(3),

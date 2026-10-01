@@ -1747,3 +1747,34 @@ fn zero_fanout_ttl_reselects_for_each_publish() {
         "the fixed RNG seed demonstrates that a zero TTL starts a fresh selection"
     );
 }
+
+#[test]
+fn replacement_drops_undrained_actions_for_the_old_connection() {
+    let mut agent = agent();
+    agent.subscribe("room", 0).unwrap();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    let other = peer(3);
+    connect(&mut agent, &other, &[MESHSUB_PROTOCOL_ID_V11], 0);
+
+    // Both peers' opens are still queued when `remote` is handed over.
+    agent.handle_event(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: remote.clone(),
+            old: ConnectionId::new(1),
+            new: ConnectionId::new(2),
+        },
+        1,
+    );
+    let actions = drain_actions(&mut agent);
+    let open_for = |target: &PeerId| {
+        actions.iter().any(
+            |action| matches!(action, GossipsubAction::OpenStream { peer, .. } if peer == target),
+        )
+    };
+    assert!(
+        !open_for(&remote),
+        "an open for the old connection must not run"
+    );
+    assert!(open_for(&other), "other peers' work is untouched");
+}

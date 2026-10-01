@@ -68,7 +68,7 @@ fn hop_exchange(w: &mut World, relay: &PeerId, conn: u64, status: Status, now: u
     w.agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: relay.clone(),
-            conn_id: ConnectionId::new(1),
+            conn_id,
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
         at(now),
@@ -241,7 +241,7 @@ fn dial_failure_after_the_relay_became_ready_is_ignored() {
     w.agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: w.a.clone(),
-            conn_id: ConnectionId::new(1),
+            conn_id: ConnectionId::new(9),
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
         at(10),
@@ -282,7 +282,7 @@ fn dial_failure_while_the_relay_is_connected_waits_for_peer_ready() {
     w.agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: w.a.clone(),
-            conn_id: ConnectionId::new(1),
+            conn_id: ConnectionId::new(9),
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
         at(30),

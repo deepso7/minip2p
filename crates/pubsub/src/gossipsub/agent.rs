@@ -855,11 +855,20 @@ impl GossipsubAgent {
     /// while the peer stays known and backoff survives. Sends stay paused
     /// until `PeerReady` for the new connection picks the version again; the
     /// next outbound stream then re-announces subscriptions.
+    ///
+    /// Undrained actions for the peer go too: they target the old
+    /// connection's streams (by peer-scoped id) or open with its version.
     fn on_connection_replaced(&mut self, peer: &PeerId) {
         if self.peers.contains_key(peer) {
             self.remove_peer(peer, "connection replaced");
             self.peers.insert(peer.clone(), PeerState::default());
         }
+        self.actions.retain(|action| match action {
+            GossipsubAction::OpenStream { peer: p, .. }
+            | GossipsubAction::SendStream { peer: p, .. }
+            | GossipsubAction::CloseStreamWrite { peer: p, .. }
+            | GossipsubAction::ResetStream { peer: p, .. } => p != peer,
+        });
     }
 
     fn remove_peer(&mut self, peer: &PeerId, cause: &str) {
