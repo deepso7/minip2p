@@ -40,7 +40,9 @@ pub struct WaitCounters {
 }
 
 impl WaitCounters {
-    /// Member waits that blocked and then woke, whatever woke them.
+    /// Member waits with a non-zero timeout that returned, whatever ended
+    /// them. A `ready` wait may have found input at once, without blocking;
+    /// either way the driver wakes to poll.
     pub fn wakeups(&self) -> u64 {
         self.ready + self.timed_out + self.interrupted
     }

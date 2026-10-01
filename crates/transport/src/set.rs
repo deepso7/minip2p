@@ -663,6 +663,10 @@ mod tests {
         /// Whether a wait finds input ready.
         #[cfg(feature = "std")]
         ready: bool,
+        /// Input arrives once this many blocking waits have run out, so a
+        /// test can end a set's wait after a known number of turns.
+        #[cfg(feature = "std")]
+        ready_after: Option<usize>,
         /// Whether this member can park at all. Set before joining a set: a
         /// member's handle is taken when it joins.
         #[cfg(feature = "std")]
@@ -833,7 +837,9 @@ mod tests {
             }
             let (can_wait, ready) = {
                 let log = self.log();
-                (log.can_wait, log.ready)
+                let blocking = log.waits.iter().filter(|wait| !wait.is_zero()).count();
+                let arrived = log.ready_after.is_some_and(|after| blocking > after);
+                (log.can_wait, log.ready || arrived)
             };
             if !can_wait {
                 return crate::WaitOutcome::Unsupported;
@@ -1566,11 +1572,14 @@ mod tests {
         #[test]
         fn bench_counters_see_every_slice_a_driver_level_counter_would_miss() {
             let (mut set, tcp, quic) = waking_duo();
+            quic.log().ready_after = Some(2);
             let before = crate::bench::wait_counters();
 
+            // A budget that cannot run out: QUIC's input ends the wait, after
+            // three turns each.
             assert_eq!(
-                set.wait_for_input(Duration::from_millis(60)),
-                WaitOutcome::TimedOut
+                set.wait_for_input(Duration::from_secs(30)),
+                WaitOutcome::Ready
             );
             let seen = crate::bench::wait_counters().since(&before);
             // Probes are non-blocking and not wakeups; every slice is one.
@@ -1579,11 +1588,12 @@ mod tests {
                 .into_iter()
                 .chain(quic.waits())
                 .filter(|wait| !wait.is_zero())
-                .count() as u64;
+                .count();
+            assert_eq!(slices, 6, "two members, three turns each");
             assert_eq!(seen.set_waits, 1, "the driver made one wait");
-            assert!(slices > 2, "two idle members take turns: {slices}");
-            assert_eq!(seen.timed_out, slices, "and each turn is counted");
-            assert_eq!(seen.wakeups(), slices);
+            assert_eq!(seen.timed_out, 5, "every turn that ran out is counted");
+            assert_eq!(seen.ready, 1, "and so is the one that found input");
+            assert_eq!(seen.wakeups(), 6);
         }
 
         #[cfg(feature = "bench")]
