@@ -39,6 +39,12 @@ fn timed<F, R>(
 
 fn forwarding(c: &mut Criterion) {
     let mut group = c.benchmark_group("pubsub/gossipsub_forward_1KiB");
+    // Building a fixture costs several times the forward it feeds, and
+    // Criterion sizes runs by measured time only, so shorten the runs.
+    group
+        .sample_size(50)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(1));
     for n in [8, 32, 128] {
         group.bench_function(n.to_string(), |b| {
             b.iter_custom(|iters| {

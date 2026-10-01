@@ -11,7 +11,7 @@
     reason = "each bench binary uses a subset of these fixtures"
 )]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use minip2p_core::PeerId;
 use minip2p_identity::Ed25519Keypair;
@@ -303,6 +303,23 @@ fn heartbeat_peer_topics(i: u16) -> [String; 2] {
     ]
 }
 
+/// The heartbeat peers subscribed to `topic`.
+fn heartbeat_subscribers(topic: &str) -> BTreeSet<PeerId> {
+    (0..HEARTBEAT_PEERS)
+        .filter(|i| heartbeat_peer_topics(*i).iter().any(|t| t == topic))
+        .map(|i| peer(FIRST_PEER + i))
+        .collect()
+}
+
+/// The wire id (`from ++ seqno`) of the agent's publish to topic `t{topic}` in
+/// cache window `window`: the fixture publishes topics in order, window by window.
+fn heartbeat_message_id(window: u64, topic: u16) -> Vec<u8> {
+    let seqno = INITIAL_SEQNO + window * u64::from(HEARTBEAT_TOPICS) + u64::from(topic);
+    let mut id = peer(LOCAL).to_bytes();
+    id.extend_from_slice(&seqno.to_be_bytes());
+    id
+}
+
 pub fn heartbeat_fixture() -> GossipsubAgent {
     let mut config = GossipsubConfig::default();
     config.d_low = config.d;
@@ -339,10 +356,7 @@ pub fn heartbeat_fixture() -> GossipsubAgent {
     while agent.poll_event().is_some() {}
 
     for (index, topic) in (0..HEARTBEAT_TOPICS).zip(&topics) {
-        let subscribers: BTreeSet<PeerId> = (0..HEARTBEAT_PEERS)
-            .filter(|i| heartbeat_peer_topics(*i).contains(topic))
-            .map(|i| peer(FIRST_PEER + i))
-            .collect();
+        let subscribers = heartbeat_subscribers(topic);
         assert_eq!(
             subscribers.len(),
             usize::from(2 * HEARTBEAT_PEERS / HEARTBEAT_TOPICS),
@@ -360,16 +374,18 @@ pub fn heartbeat(agent: &mut GossipsubAgent) {
     agent.handle_tick(HEARTBEAT_AT_MS);
 }
 
-/// Asserts the tick ran a heartbeat: the next one is a full interval away and
-/// it gossiped the 3 newest windows (3 ids per topic) to 6 peers per topic.
+/// Asserts the tick ran a heartbeat: the next one is a full interval away,
+/// no mesh changed, and for every topic exactly `d_lazy` non-mesh subscribers
+/// got IHAVE for exactly that topic's messages in the 3 newest windows.
 pub fn assert_heartbeat_ran(agent: &mut GossipsubAgent) {
     assert_eq!(
         agent.next_timeout(HEARTBEAT_AT_MS),
         Some(HEARTBEAT_INTERVAL_MS)
     );
-    let mut ihave_ids = 0;
+    // topic -> peer -> advertised ids
+    let mut gossip: BTreeMap<String, BTreeMap<PeerId, BTreeSet<Vec<u8>>>> = BTreeMap::new();
     while let Some(action) = agent.poll_action() {
-        let (_, _, _, data) = as_send(action).expect("heartbeat only sends");
+        let (_, peer, _, data) = as_send(action).expect("heartbeat only sends");
         let payload = match decode_frame(&data) {
             FrameDecode::Complete { payload, consumed } if consumed == data.len() => Some(payload),
             _ => None,
@@ -378,13 +394,36 @@ pub fn assert_heartbeat_ran(agent: &mut GossipsubAgent) {
         let rpc = Rpc::decode(payload).expect("valid heartbeat RPC");
         let control: ControlMessage = rpc.control.expect("heartbeat sends control");
         assert!(control.graft.is_empty() && control.prune.is_empty());
-        ihave_ids += control
-            .ihave
-            .iter()
-            .map(|ihave| ihave.message_ids.len())
-            .sum::<usize>();
+        for ihave in control.ihave {
+            let topic = ihave.topic_id.expect("IHAVE names its topic");
+            gossip
+                .entry(topic)
+                .or_default()
+                .entry(peer.clone())
+                .or_default()
+                .extend(ihave.message_ids);
+        }
     }
+
     let gossip_peers = GossipsubConfig::default().d_lazy;
-    let expected = usize::from(HEARTBEAT_TOPICS) * gossip_peers * HEARTBEAT_GOSSIP_WINDOWS;
-    assert_eq!(ihave_ids, expected, "IHAVE ids gossiped");
+    let newest = HEARTBEAT_CACHE_WINDOWS - HEARTBEAT_GOSSIP_WINDOWS as u64..HEARTBEAT_CACHE_WINDOWS;
+    assert_eq!(gossip.len(), usize::from(HEARTBEAT_TOPICS), "IHAVE topics");
+    for index in 0..HEARTBEAT_TOPICS {
+        let topic = heartbeat_topic(index);
+        let recipients = gossip.get(&topic).expect("IHAVE for every topic");
+        assert_eq!(recipients.len(), gossip_peers, "{topic} gossip peers");
+        let subscribers = heartbeat_subscribers(&topic);
+        let mesh = agent.mesh_peers(&topic);
+        let expected: BTreeSet<Vec<u8>> = newest
+            .clone()
+            .map(|window| heartbeat_message_id(window, index))
+            .collect();
+        for (peer, ids) in recipients {
+            assert!(
+                subscribers.contains(peer) && !mesh.contains(peer),
+                "{topic} gossip target"
+            );
+            assert_eq!(ids, &expected, "{topic} IHAVE ids");
+        }
+    }
 }
