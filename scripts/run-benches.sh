@@ -15,6 +15,9 @@ wall)
   cargo bench -p minip2p-tcp --bench readiness_poll
   cargo bench -p minip2p-rs --features tcp --bench endpoint_e2e
   python3 scripts/bench_results.py criterion --since target/bench-results/criterion-start --output target/bench-results/rust-wall.json --git-sha "$git_sha"
+  python3 scripts/bench_results.py start --output target/bench-results/custom-start
+  cargo bench -p minip2p-rs --features tcp,nat,relay-server --bench endpoint_throughput
+  python3 scripts/bench_results.py custom --since target/bench-results/custom-start --output target/bench-results/custom.json --git-sha "$git_sha"
   ;;
 ir)
   python3 scripts/bench_results.py start --output target/bench-results/gungraun-start
