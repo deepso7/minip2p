@@ -74,7 +74,11 @@ EXPECTED_VITEST = {"sdk_drain_flood", "raw_drain_events", "connected_peers_sync"
 # Rows a bench measures itself (for example throughput or allocations), keyed by
 # (tier, name, metric). Each such bench writes a JSON array of rows into the
 # `custom` collector's root; list every row it emits here.
-EXPECTED_CUSTOM: set[tuple[str, str, str]] = set()
+EXPECTED_CUSTOM: set[tuple[str, str, str]] = {
+    ("rust-wall", f"endpoint_throughput/{case}", metric)
+    for case in ("tcp", "quic", "relayed")
+    for metric in ("mb_per_s", "allocs_per_mb", "bytes_allocated_per_mb")
+}
 IR_PINS = {
     "rust": "Rust toolchain",
     "profile": "optimization profile",
