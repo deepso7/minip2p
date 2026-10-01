@@ -361,25 +361,26 @@ impl ConnectAttempt {
         self.done = true;
     }
 
-    /// The target's connection `old` was replaced while the peer stays
-    /// connected. Called after `new` was applied: when `old` was the circuit
-    /// this attempt promoted and nothing better took over, the attempt is
-    /// complete on `new` rather than failed by `old`'s retirement.
+    /// The target's connection `old` was replaced by `new` while the peer
+    /// stays connected. Called after `new` was applied, so a direct `new`
+    /// already settled the attempt. When `old` was the circuit this attempt
+    /// promoted and `new` is another circuit, the attempt carries on over
+    /// `new`: a punch in flight may still upgrade it, and otherwise it falls
+    /// back to relay as usual. A DCUtR exchange lived on `old` and ends.
     pub(crate) fn on_target_replaced(
         &mut self,
         peer: &PeerId,
         old: ConnectionId,
+        new: ConnectionId,
         shared: &mut Shared,
     ) {
         if self.done || *peer != self.peer || self.promoted != Some(old) {
             return;
         }
-        self.promoted = None;
-        self.bridge_alive = false;
-        self.punch_deadline = None;
-        self.teardown_relay_leg(shared);
-
-        self.done = true;
+        self.promoted = Some(new);
+        if let Some(stream) = self.dcutr_stream {
+            self.finish_failed_dcutr(stream, "DCUtR circuit was replaced".into(), shared);
+        }
     }
 
     pub(crate) fn on_connection_closed(

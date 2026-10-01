@@ -18,7 +18,7 @@ use minip2p_nat::NatEvent;
 use minip2p_platform::{EntropySource, Now};
 #[cfg(feature = "pubsub")]
 use minip2p_pubsub::GossipsubEvent;
-use minip2p_swarm::{SwarmEvent, SwarmRuntime};
+use minip2p_swarm::{SwarmCore, SwarmEvent, SwarmRuntime};
 
 #[cfg(feature = "_nat-driver")]
 use crate::nat::NatDriver;
@@ -170,13 +170,15 @@ impl DiscoveryDriver {
 
     /// Observes connection lifecycle for the book, whichever driver claimed
     /// the event. A Connection replacement keeps the peer connected, so
-    /// only the peer-level transitions matter.
-    pub(crate) fn observe(&mut self, event: &SwarmEvent, now_ms: u64) {
+    /// only the peer-level transitions matter. Events trail the swarm's
+    /// state, so a close is a disconnect only if the peer has not already
+    /// reconnected.
+    pub(crate) fn observe(&mut self, event: &SwarmEvent, core: &SwarmCore, now_ms: u64) {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 self.book.peer_connected(peer_id, now_ms);
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, .. } if core.conn_for(peer_id).is_none() => {
                 self.book.peer_disconnected(peer_id, now_ms);
             }
             _ => {}

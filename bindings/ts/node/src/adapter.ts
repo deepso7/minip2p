@@ -378,7 +378,10 @@ function normalizeNativeValue(
     );
     const { connId, streamId } = record;
     if (maps !== undefined && streamId !== undefined) {
-      if (typeof streamId !== "bigint" && typeof streamId !== "number") {
+      if (
+        (typeof streamId !== "bigint" && typeof streamId !== "number") ||
+        (connId !== undefined && typeof connId !== "number")
+      ) {
         throw new TypeError("The native addon returned an invalid stream ID");
       }
       // Public stream IDs are allocated per connection. A record without a

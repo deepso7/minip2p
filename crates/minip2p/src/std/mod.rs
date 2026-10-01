@@ -1044,7 +1044,7 @@ impl Endpoint {
         #[cfg(any(feature = "discovery", feature = "mdns"))]
         if let Some(discovery) = self.discovery.as_mut() {
             let now_ms = self.swarm.now().monotonic_ms;
-            discovery.observe(event, now_ms);
+            discovery.observe(event, self.swarm.core(), now_ms);
         }
         let mut claimed = false;
         #[cfg(feature = "relay-server")]

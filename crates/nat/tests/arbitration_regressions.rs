@@ -696,3 +696,27 @@ fn direct_replacement_during_dcutr_never_resets_the_retired_stream_by_peer() {
     );
     assert!(!h.agent.owns_stream(&h.target, dcutr));
 }
+
+#[test]
+fn circuit_replacing_the_promoted_circuit_keeps_the_attempt_alive() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, circuit) = drive_to_relayed(&mut h);
+    let other_circuit = ConnectionId::new(TEST_CIRCUIT_ID + 1);
+
+    replace_target(&mut h, circuit, other_circuit, 400);
+    assert!(
+        drain_events(&mut h.agent).is_empty(),
+        "a relay-to-relay hand-over neither fails nor settles the attempt"
+    );
+    assert!(
+        !h.agent.is_idle(),
+        "the attempt still owns the relayed path"
+    );
+
+    // A later direct connection still upgrades the attempt's path.
+    replace_target(&mut h, other_circuit, ConnectionId::new(50), 500);
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathUpgraded { connect_id, to: Path::DirectDialed, .. }] if *connect_id == id
+    ));
+}

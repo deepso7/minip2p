@@ -584,7 +584,8 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         self.emit_connect_events(now, events);
         for event in self.endpoint.poll_runtime(now)? {
             let consumed = self.endpoint.observe_connect(&event, now);
-            self.discovery.observe(&event, now.monotonic_ms);
+            self.discovery
+                .observe(&event, self.endpoint.runtime().core(), now.monotonic_ms);
             if !consumed {
                 events.push(event.into());
             }
@@ -1086,7 +1087,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         for event in self.endpoint.poll_runtime(now)? {
             let engine_consumed = self.endpoint.observe_connect(&event, now);
             if let Some(discovery) = self.discovery.as_mut() {
-                discovery.observe(&event, now.monotonic_ms);
+                discovery.observe(&event, self.endpoint.runtime().core(), now.monotonic_ms);
             }
             #[cfg(feature = "portable-autonat")]
             let claimed = engine_consumed

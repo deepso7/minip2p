@@ -746,9 +746,10 @@ impl ReservationManager {
 
     /// The connection carrying our reservation (or its acquisition) to
     /// `peer` was replaced. rust-libp2p relays drop a reservation with the
-    /// connection that made it, so the old exchange is cancelled and a fresh
-    /// acquisition starts on the new connection once it is `PeerReady`. A
-    /// failure there reports the held reservation lost exactly once.
+    /// connection that made it, so a held reservation is reported lost at
+    /// once (withdrawing its circuit address), the old exchange is
+    /// cancelled, and a fresh acquisition starts on the new connection once
+    /// it is `PeerReady`.
     fn on_connection_replaced(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
         let relay = match &self.state {
             ResState::Reserved { relay, .. } | ResState::Acquiring { relay, .. }
@@ -758,20 +759,23 @@ impl ReservationManager {
             }
             _ => return,
         };
-        match core::mem::replace(&mut self.state, ResState::Idle) {
-            ResState::Reserved { .. } => self.held = Some(peer.clone()),
-            ResState::Acquiring { stage, .. } => {
-                // The stream lived on the retired connection: release it
-                // without a peer-scoped reset that could hit the new one.
-                if let Some(stream) = stage.stream() {
-                    shared.release_stream(peer, stream);
-                }
-                shared
-                    .tokens
-                    .retain(|_, purpose| *purpose != TokenPurpose::OpenReserve(peer.clone()));
-            }
-            _ => {}
+        let was_reserved = matches!(self.state, ResState::Reserved { .. });
+        if let Some(held) = self.held.take().or(was_reserved.then(|| peer.clone())) {
+            shared.push_event(NatEvent::RelayReservationLost { relay: held });
         }
+        if let ResState::Acquiring { stage, .. } =
+            core::mem::replace(&mut self.state, ResState::Idle)
+        {
+            // The stream lived on the retired connection: release it without
+            // a peer-scoped reset that could hit the new one.
+            if let Some(stream) = stage.stream() {
+                shared.release_stream(peer, stream);
+            }
+            shared
+                .tokens
+                .retain(|_, purpose| *purpose != TokenPurpose::OpenReserve(peer.clone()));
+        }
+
         self.state = ResState::Acquiring {
             relay,
             stage: ExchangeStage::WaitPeerReady,
@@ -786,13 +790,16 @@ impl ReservationManager {
         shared: &mut Shared,
         now: Now,
     ) {
+        // A failed extra dial is moot while the relay is connected anyway
+        // (say, over the connection that replaced the one we reserved on).
         if result.is_err()
             && matches!(
                 &self.state,
                 ResState::Acquiring {
+                    relay,
                     stage: ExchangeStage::WaitPeerReady,
                     ..
-                }
+                } if !shared.is_connected(relay.peer_id())
             )
         {
             self.fail_acquire(shared, now);

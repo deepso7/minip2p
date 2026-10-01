@@ -1122,7 +1122,7 @@ impl NatAgent {
         self.forget_connection(peer, old);
         self.connection_up(peer, new, is_circuit, now);
         for attempt in self.attempts.values_mut() {
-            attempt.on_target_replaced(peer, old, &mut self.shared);
+            attempt.on_target_replaced(peer, old, new, &mut self.shared);
         }
         self.notify_connection_down(peer, old, now);
 

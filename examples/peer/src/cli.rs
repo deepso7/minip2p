@@ -306,11 +306,13 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
             );
         }
         EndpointEvent::PeerReady {
-            peer_id, protocols, ..
+            peer_id,
+            conn_id,
+            protocols,
         } => {
             let protocol_list = format_protocols(protocols);
             println!(
-                "[{role}] peer-ready peer={peer_id} protocols={} list=[{}]",
+                "[{role}] peer-ready peer={peer_id} conn={conn_id} protocols={} list=[{}]",
                 protocols.len(),
                 protocol_list
             );

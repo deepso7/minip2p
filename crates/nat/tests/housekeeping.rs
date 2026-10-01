@@ -647,10 +647,11 @@ fn replace_relay_connection(hk: &mut Hk, now: Now) -> Vec<NatAction> {
         },
         now,
     );
-    assert!(
-        drain_events(&mut hk.agent).is_empty(),
-        "a hand-over is not a reservation loss"
-    );
+    // The relay dropped the reservation with its connection: withdraw it now.
+    assert!(matches!(
+        drain_events(&mut hk.agent).as_slice(),
+        [NatEvent::RelayReservationLost { relay: r }] if *r == relay
+    ));
     let actions = drain_actions(&mut hk.agent);
     assert!(
         !actions
