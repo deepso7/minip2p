@@ -54,11 +54,12 @@ fn populated_agent(now: Now) -> (RelayServerAgent, SwarmEvent) {
 fn relay_server_event(c: &mut Criterion) {
     let now = Now::from_millis(1);
     c.bench_function("relay_handle_event_same_now_128_pending_hops", |b| {
-        b.iter_batched(
+        // By reference, so tearing the agent down stays out of the timing.
+        b.iter_batched_ref(
             || populated_agent(now),
-            |(mut agent, inert)| {
+            |(agent, inert)| {
                 for _ in 0..EVENTS_PER_BATCH {
-                    black_box(agent.handle_event(black_box(&inert), false, black_box(now)));
+                    black_box(agent.handle_event(black_box(&*inert), false, black_box(now)));
                 }
             },
             BatchSize::SmallInput,
