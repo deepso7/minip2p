@@ -34,7 +34,7 @@
 use std::time::{Duration, Instant};
 
 use cpu_time::ProcessTime;
-use minip2p::{Endpoint, EndpointWaitOutcome};
+use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome, PeerDiscoveryConfig};
 use minip2p_transport::bench::{WaitCounters, wait_counters};
 
 /// Startup work (listen, first mDNS probes, Gossipsub heartbeats) to skip.
@@ -85,7 +85,14 @@ fn bind(variant: Variant) -> Endpoint {
         builder = builder.relay_server().gossipsub();
     }
     if variant.mdns {
-        builder = builder.mdns();
+        // Nearby mDNS peers must not be dialed: the endpoint stays peerless.
+        builder = builder
+            .mdns()
+            .peer_discovery_config(PeerDiscoveryConfig {
+                auto_dial: false,
+                ..PeerDiscoveryConfig::default()
+            })
+            .expect("peer discovery config");
     }
     let mut endpoint = builder.bind().expect("bind endpoint");
     endpoint.listen_all().expect("listen");
@@ -95,11 +102,19 @@ fn bind(variant: Variant) -> Endpoint {
     endpoint
 }
 
-/// Drives `endpoint` until `until`, dropping every event.
+/// Drives `endpoint` until `until`, dropping every event. A connection would
+/// make the sample no longer idle, so it fails the bench instead.
 fn drive(endpoint: &mut Endpoint, until: Instant) {
-    while let EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted =
-        endpoint.wait(until).expect("endpoint wait")
-    {}
+    loop {
+        match endpoint.wait(until).expect("endpoint wait") {
+            EndpointWaitOutcome::Event(event) => assert!(
+                !matches!(event, EndpointEvent::ConnectionEstablished { .. }),
+                "an idle endpoint connected: {event:?}"
+            ),
+            EndpointWaitOutcome::Interrupted => {}
+            EndpointWaitOutcome::Deadline => return,
+        }
+    }
 }
 
 struct Measured {
