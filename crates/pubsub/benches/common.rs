@@ -303,12 +303,21 @@ fn heartbeat_peer_topics(i: u16) -> [String; 2] {
     ]
 }
 
-/// The heartbeat peers subscribed to `topic`.
-fn heartbeat_subscribers(topic: &str) -> BTreeSet<PeerId> {
+/// The heartbeat peers subscribed to `topic`, in join order.
+fn heartbeat_subscribers(topic: &str) -> Vec<PeerId> {
     (0..HEARTBEAT_PEERS)
         .filter(|i| heartbeat_peer_topics(*i).iter().any(|t| t == topic))
         .map(|i| peer(FIRST_PEER + i))
         .collect()
+}
+
+/// The expected mesh for `topic`: with `d_low = d`, the first `d` subscribers
+/// to join are grafted, and nothing later changes it.
+fn heartbeat_mesh(topic: &str) -> Vec<PeerId> {
+    let mut mesh = heartbeat_subscribers(topic);
+    mesh.truncate(GossipsubConfig::default().d);
+    mesh.sort();
+    mesh
 }
 
 /// The wire id (`from ++ seqno`) of the agent's publish to topic `t{topic}` in
@@ -362,9 +371,12 @@ pub fn heartbeat_fixture() -> GossipsubAgent {
             usize::from(2 * HEARTBEAT_PEERS / HEARTBEAT_TOPICS),
             "topic {index} subscribers"
         );
-        let mesh = agent.mesh_peers(topic);
-        assert_eq!(mesh.len(), degree, "topic {index} mesh degree");
-        assert!(mesh.iter().all(|peer| subscribers.contains(peer)));
+        assert_eq!(heartbeat_mesh(topic).len(), degree);
+        assert_eq!(
+            agent.mesh_peers(topic),
+            heartbeat_mesh(topic),
+            "topic {index} mesh"
+        );
     }
     agent
 }
@@ -421,7 +433,8 @@ pub fn assert_heartbeat_ran(agent: &mut GossipsubAgent) {
         let recipients = gossip.get(&topic).expect("IHAVE for every topic");
         assert_eq!(recipients.len(), gossip_peers, "{topic} gossip peers");
         let subscribers = heartbeat_subscribers(&topic);
-        let mesh = agent.mesh_peers(&topic);
+        let mesh = heartbeat_mesh(&topic);
+        assert_eq!(agent.mesh_peers(&topic), mesh, "{topic} mesh unchanged");
         let expected: BTreeSet<Vec<u8>> = newest
             .clone()
             .map(|window| heartbeat_message_id(window, index))
