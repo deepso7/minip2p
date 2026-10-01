@@ -136,6 +136,10 @@ The default implementation returns `WaitOutcome::Unsupported`, so `impl Blocking
 
 The two defaults are only correct together, for a leaf transport. A transport that wraps another and forwards `wait_for_input` **must** also forward `wait_handle`, or callers get an inert handle while the wait still blocks inside the inner transport.
 
+## Bench counters (`bench` feature)
+
+A driver sees one return from the set's `wait_for_input`, but with several members that one call waits on each of them in turn, in short slices, and each slice that ends is a real wakeup. The `bench` feature (off by default, implies `std`) counts waits at that member level: blocking member waits by outcome (ready, timed out, interrupted), set waits that sent the driver to its fallback sleep because no member could park, and the outer set waits a driver-level counter would see. `minip2p_transport::bench::wait_counters()` returns the calling thread's counts; subtract two snapshots with `WaitCounters::since`. It exists for idle benchmarks such as `minip2p-rs`'s `endpoint_idle`; without the feature none of it is compiled.
+
 ## no_std
 
 Disable default features:
