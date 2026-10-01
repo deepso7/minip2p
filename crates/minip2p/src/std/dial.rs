@@ -1,152 +1,270 @@
-//! Turns one std endpoint dial target into the concrete addresses to try.
+//! Name resolution for the std Endpoint: turns a `/dns*` candidate into the
+//! concrete addresses to dial, without blocking the driver.
 //!
 //! A host can be reachable over more than one transport and more than one
 //! address family, and a `/dns` name can answer with both. Deciding which of
 //! those to dial is the endpoint's job rather than any one transport's: the
-//! transports below it each serve one address shape, and none of them can see
-//! the others' sockets.
+//! transports below it each serve one address shape, accept only `/ip4` and
+//! `/ip6`, and never resolve names.
 //!
-//! Resolution happens here, so what reaches a transport is always a concrete
-//! `/ip4` or `/ip6` address it can act on without asking the network anything.
+//! A lookup blocks for as long as the system resolver takes, so it never runs
+//! on the driver thread. [`Resolver::expand`] starts one detached thread per
+//! distinct in-flight name and reports the candidate as resolving. The thread
+//! wakes the driver through the transport [`WaitHandle`]; the next tick drains
+//! [`Resolver::take_answers`] and hands them to the Connection-attempt engine,
+//! which dials what [`answer_for`] rebuilt or records the failure.
 
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, ToSocketAddrs};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use minip2p_core::{Multiaddr, PeerAddr, Protocol};
-use minip2p_transport::TransportError;
+use minip2p_transport::WaitHandle;
+
+use crate::portable::connect::{Expansion, NameAnswer};
 
 /// Which IP family an address belongs to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Family {
+enum Family {
     V4,
     V6,
 }
 
 impl Family {
-    fn of(addr: SocketAddr) -> Self {
-        match addr {
-            SocketAddr::V4(_) => Self::V4,
-            SocketAddr::V6(_) => Self::V6,
+    fn of(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(_) => Self::V4,
+            IpAddr::V6(_) => Self::V6,
         }
     }
 }
 
-/// The concrete addresses `addr` names, at most one per family.
-///
-/// A `/ip4` or `/ip6` target is already concrete and expands to itself. A
-/// `/dns*` target is resolved and reduced to the first answer per family, which
-/// is what makes one `dial` reach a dual-stack peer over both: two addresses
-/// from the same family would be the same peer twice.
-///
-/// Everything after the host is carried through untouched, so the shape that
-/// went in -- `/udp/quic-v1`, `/tcp`, whatever follows -- is the shape that
-/// comes out, and routing it stays the set's decision.
-pub(crate) fn targets(addr: &PeerAddr) -> Result<Vec<(Family, PeerAddr)>, TransportError> {
+/// The name a `/dns*` candidate asks about, and the family it wants.
+struct Name<'a> {
+    host: &'a str,
+    filter: Option<Family>,
+}
+
+/// The name `addr` needs resolved: `Ok(None)` for an `/ip4` or `/ip6`
+/// address, which is already concrete, and `Err` for one that cannot be
+/// dialed or resolved at all.
+fn name_of(addr: &PeerAddr) -> Result<Option<Name<'_>>, String> {
     let protocols = addr.transport().protocols();
     let Some((host, rest)) = protocols.split_first() else {
         return Err(invalid("dial target has no host component"));
     };
-
-    let (name, filter) = match host {
-        Protocol::Ip4(_) | Protocol::Ip6(_) => {
-            let family = match host {
-                Protocol::Ip4(_) => Family::V4,
-                _ => Family::V6,
-            };
-            return Ok(vec![(family, addr.clone())]);
-        }
-        Protocol::Dns(name) => (name, None),
-        Protocol::Dns4(name) => (name, Some(Family::V4)),
-        Protocol::Dns6(name) => (name, Some(Family::V6)),
+    let (host, filter) = match host {
+        Protocol::Ip4(_) | Protocol::Ip6(_) => return Ok(None),
+        Protocol::Dns(name) => (name.as_str(), None),
+        Protocol::Dns4(name) => (name.as_str(), Some(Family::V4)),
+        Protocol::Dns6(name) => (name.as_str(), Some(Family::V6)),
         _ => return Err(invalid("dial target has no host component")),
     };
-    let literal = name
+    let literal = host
         .strip_prefix('[')
-        .and_then(|name| name.strip_suffix(']'))
-        .unwrap_or(name.as_str());
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     if literal.parse::<IpAddr>().is_ok() {
         return Err(invalid(
             "a /dns component must contain a DNS name, not an IP address",
         ));
     }
-
-    // The port belongs to whichever transport the address names, so it is read
-    // from the address rather than assumed: `/tcp/4001` and `/udp/4001` are
-    // the same query to the resolver.
-    let port = rest
+    // Nothing to dial without a port, and guessing one would dial a service
+    // the caller never named.
+    if !rest
         .iter()
-        .find_map(|protocol| match protocol {
-            Protocol::Tcp(port) | Protocol::Udp(port) => Some(*port),
-            _ => None,
-        })
-        .ok_or_else(|| invalid("a dns dial target needs a /tcp or /udp port to resolve"))?;
-
-    // `(name, port)` rather than a reassembled `"name:port"`: the string form
-    // has to be parsed back apart, and a name carrying a colon would be split
-    // in the wrong place. This is the same resolution the TCP provider does.
-    let resolved = (name.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|error| invalid(format!("dns resolution failed for {name}: {error}")))?;
-
-    let targets = rebuild(addr, rest, resolved, filter)?;
-    if targets.is_empty() {
-        return Err(invalid(format!(
-            "dns resolution returned no usable address for {name}"
-        )));
+        .any(|protocol| matches!(protocol, Protocol::Tcp(_) | Protocol::Udp(_)))
+    {
+        return Err(invalid("a dns dial target needs a /tcp or /udp port"));
     }
-    Ok(targets)
+    Ok(Some(Name { host, filter }))
 }
 
-/// Turns what a resolver answered into dial targets: the first address of each
-/// wanted family, wearing the shape of the address that was asked about.
+/// The dial targets a resolver answer gives `addr`, or why there are none.
 ///
-/// Split out from resolution so the choosing can be tested without a network:
-/// a resolver that answers with four addresses of one family is one dial, not
-/// four, and no test can make DNS produce that on demand.
+/// `None` while `answers` holds nothing for `addr`'s name, so the candidate
+/// keeps waiting. The engine calls this for every still-resolving candidate
+/// when a tick has answers, which is why one lookup serves every attempt that
+/// named the host: `/dns4` and `/dns6` filter the shared answer.
+pub(crate) fn answer_for(
+    addr: &PeerAddr,
+    answers: &BTreeMap<String, Answer>,
+) -> Option<NameAnswer> {
+    let Ok(Some(Name { host, filter })) = name_of(addr) else {
+        return None;
+    };
+    Some(match answers.get(host)? {
+        Err(error) => Err(format!("dns resolution failed for {host}: {error}")),
+        Ok(ips) => rebuild(addr, ips.iter().copied(), filter).and_then(|targets| {
+            if targets.is_empty() {
+                Err(format!(
+                    "dns resolution returned no usable address for {host}"
+                ))
+            } else {
+                Ok(targets)
+            }
+        }),
+    })
+}
+
+/// Turns what a resolver answered into dial targets: the first address of
+/// each wanted family, wearing the shape of the address that was asked about.
+///
+/// At most one per family is what makes one `connect` reach a dual-stack peer
+/// over both: two addresses from the same family would be the same peer
+/// twice. Everything after the host -- `/udp/4001/quic-v1`, `/tcp/4001` -- is
+/// carried through untouched, so routing it stays the transport set's call.
 fn rebuild(
     addr: &PeerAddr,
-    rest: &[Protocol],
-    resolved: impl IntoIterator<Item = SocketAddr>,
+    resolved: impl IntoIterator<Item = IpAddr>,
     filter: Option<Family>,
-) -> Result<Vec<(Family, PeerAddr)>, TransportError> {
-    let mut targets: Vec<(Family, PeerAddr)> = Vec::new();
-    for socket_addr in resolved {
-        let family = Family::of(socket_addr);
-        if filter.is_some_and(|wanted| wanted != family) {
+) -> Result<Vec<PeerAddr>, String> {
+    let rest = addr.transport().protocols().get(1..).unwrap_or_default();
+    let mut seen = Vec::new();
+    let mut targets = Vec::new();
+    for ip in resolved {
+        let family = Family::of(ip);
+        if filter.is_some_and(|wanted| wanted != family) || seen.contains(&family) {
             continue;
         }
-        if targets.iter().any(|(seen, _)| *seen == family) {
-            continue;
-        }
-        let mut expanded = vec![host_protocol(socket_addr.ip())];
+        seen.push(family);
+        let mut expanded = vec![match ip {
+            IpAddr::V4(v4) => Protocol::Ip4(v4.octets()),
+            IpAddr::V6(v6) => Protocol::Ip6(v6.octets()),
+        }];
         expanded.extend_from_slice(rest);
-        let transport = Multiaddr::from_protocols(expanded);
-        let target = PeerAddr::new(transport, addr.peer_id().clone())
+        let target = PeerAddr::new(Multiaddr::from_protocols(expanded), addr.peer_id().clone())
             .map_err(|error| invalid(format!("resolved address was not a peer addr: {error}")))?;
-        targets.push((family, target));
+        targets.push(target);
     }
     Ok(targets)
 }
 
-fn host_protocol(ip: IpAddr) -> Protocol {
-    match ip {
-        IpAddr::V4(v4) => Protocol::Ip4(v4.octets()),
-        IpAddr::V6(v6) => Protocol::Ip6(v6.octets()),
-    }
+fn invalid(reason: impl Into<String>) -> String {
+    format!("invalid address for dial target: {}", reason.into())
 }
 
-fn invalid(reason: impl Into<String>) -> TransportError {
-    TransportError::InvalidAddress {
-        context: "dial target",
-        reason: reason.into(),
-    }
-}
+/// What a lookup produced: the host's IP addresses, or the resolver's error.
+pub(crate) type Answer = Result<Vec<IpAddr>, String>;
 
-/// The shared `admit_connect` expansion for the std endpoint: DNS-shaped
-/// resolution into concrete dial targets, with the refusal as display text.
-pub(crate) fn expand_dial_targets(addr: &PeerAddr) -> Result<Vec<PeerAddr>, String> {
-    targets(addr)
-        .map(|targets| targets.into_iter().map(|(_, addr)| addr).collect())
+/// Lookup threads that may be blocked in the resolver at once, one per
+/// distinct name.
+const MAX_IN_FLIGHT_LOOKUPS: usize = 32;
+
+/// A blocking name lookup. Swappable only inside the crate, so tests can
+/// inject one that stalls or fails; there is no public resolver API.
+pub(crate) type Lookup = Arc<dyn Fn(&str) -> Answer + Send + Sync>;
+
+/// The system resolver. The port is irrelevant to which addresses a name
+/// has, so it asks with 0 and the candidate's own port is kept by [`rebuild`].
+fn system_lookup(host: &str) -> Answer {
+    (host, 0)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
         .map_err(|error| error.to_string())
+}
+
+/// Runs lookups off the driver and collects their answers for it.
+///
+/// There is no cache and no DNS-specific timeout: every answer is applied
+/// once and forgotten, and the Connection attempt's deadline bounds the wait.
+/// A lookup cannot be cancelled, so an answer for an attempt that has already
+/// settled is simply dropped.
+pub(crate) struct Resolver {
+    lookup: Lookup,
+    wake: WaitHandle,
+    /// Names with a lookup thread running or an answer not yet taken.
+    in_flight: BTreeSet<String>,
+    /// Lookup threads still blocked in the resolver; what the cap counts.
+    /// An answered name leaves this at once, before its answer is taken.
+    running: Arc<AtomicUsize>,
+    answers_tx: Sender<(String, Answer)>,
+    answers_rx: Receiver<(String, Answer)>,
+}
+
+impl Resolver {
+    /// A resolver on the system lookup that wakes the driver with `wake`.
+    pub(crate) fn new(wake: WaitHandle) -> Self {
+        Self::with_lookup(wake, Arc::new(system_lookup))
+    }
+
+    /// A resolver on `lookup`: the test seam.
+    pub(crate) fn with_lookup(wake: WaitHandle, lookup: Lookup) -> Self {
+        let (answers_tx, answers_rx) = channel();
+        Self {
+            lookup,
+            wake,
+            in_flight: BTreeSet::new(),
+            running: Arc::default(),
+            answers_tx,
+            answers_rx,
+        }
+    }
+
+    /// Admission's expand step: a concrete address is dialed as is, a name
+    /// starts (or joins) its lookup and resolves later, and anything else is
+    /// refused with the reason.
+    pub(crate) fn expand(&mut self, addr: &PeerAddr) -> Expansion {
+        match name_of(addr) {
+            Err(reason) => Expansion::Refused(reason),
+            Ok(None) => Expansion::Ready(vec![addr.clone()]),
+            Ok(Some(Name { host, .. })) => match self.start(host) {
+                Ok(()) => Expansion::Resolving,
+                Err(reason) => Expansion::Refused(reason),
+            },
+        }
+    }
+
+    /// Starts a lookup of `host` unless one is already in flight.
+    fn start(&mut self, host: &str) -> Result<(), String> {
+        if self.in_flight.contains(host) {
+            return Ok(());
+        }
+        // A stalled resolver holds its thread until the OS gives up, so the
+        // number of lookup threads is capped rather than trusted to whatever
+        // candidates discovery or the application supplies.
+        if self.running.load(Ordering::SeqCst) >= MAX_IN_FLIGHT_LOOKUPS {
+            return Err(format!(
+                "not looking up {host}: {MAX_IN_FLIGHT_LOOKUPS} dns lookups are already in flight"
+            ));
+        }
+        let lookup = Arc::clone(&self.lookup);
+        let answers = self.answers_tx.clone();
+        let wake = self.wake.clone();
+        let running = Arc::clone(&self.running);
+        let name = host.to_owned();
+        running.fetch_add(1, Ordering::SeqCst);
+        std::thread::Builder::new()
+            .name("minip2p-dns".into())
+            .spawn(move || {
+                let answer = lookup(&name);
+                running.fetch_sub(1, Ordering::SeqCst);
+                // A closed channel means the endpoint is gone and nobody
+                // is waiting for this answer.
+                if answers.send((name, answer)).is_ok() {
+                    wake.interrupt();
+                }
+            })
+            .map_err(|error| {
+                self.running.fetch_sub(1, Ordering::SeqCst);
+                format!("could not start a dns lookup for {host}: {error}")
+            })?;
+        self.in_flight.insert(host.to_owned());
+        Ok(())
+    }
+
+    /// Every answer that arrived since the last call, keyed by name. Each
+    /// name leaves the in-flight set, so a later attempt looks it up afresh.
+    pub(crate) fn take_answers(&mut self) -> BTreeMap<String, Answer> {
+        let mut answers = BTreeMap::new();
+        while let Ok((name, answer)) = self.answers_rx.try_recv() {
+            self.in_flight.remove(&name);
+            answers.insert(name, answer);
+        }
+        answers
+    }
 }
 
 #[cfg(test)]
@@ -159,123 +277,175 @@ mod tests {
         PeerAddr::new(transport, Ed25519Keypair::generate().peer_id()).expect("peer addr")
     }
 
-    #[test]
-    fn a_concrete_address_is_its_own_only_target() {
-        let addr = peer_addr("/ip4/198.51.100.7/udp/4001/quic-v1");
-        assert_eq!(targets(&addr).expect("targets"), vec![(Family::V4, addr)]);
+    fn answers(host: &str, answer: Answer) -> BTreeMap<String, Answer> {
+        BTreeMap::from([(host.to_string(), answer)])
+    }
 
-        let addr = peer_addr("/ip6/2001:db8::1/tcp/4001");
-        assert_eq!(targets(&addr).expect("targets"), vec![(Family::V6, addr)]);
+    fn transports(targets: Vec<PeerAddr>) -> Vec<String> {
+        targets
+            .iter()
+            .map(|target| target.transport().to_string())
+            .collect()
     }
 
     #[test]
-    fn a_name_expands_to_one_target_per_family_keeping_the_shape() {
-        // localhost is the one name a test may rely on, and it is exactly the
-        // interesting case: it answers with both families.
-        let addr = peer_addr("/dns/localhost/tcp/4001");
-        let expanded = targets(&addr).expect("targets");
-
-        assert!(
-            !expanded.is_empty(),
-            "localhost has to resolve to something"
+    fn a_concrete_address_needs_no_resolution() {
+        let mut resolver = Resolver::with_lookup(
+            WaitHandle::noop(),
+            Arc::new(|_| panic!("a concrete address must not be looked up")),
         );
-        for (family, target) in &expanded {
-            let protocols = target.transport().protocols();
-            let (host, rest) = protocols
-                .split_first()
-                .expect("a rebuilt peer address always has its concrete host");
-            assert!(
-                matches!(
-                    (family, host),
-                    (Family::V4, Protocol::Ip4(_)) | (Family::V6, Protocol::Ip6(_))
-                ),
-                "the host is concrete and matches its family: {protocols:?}"
-            );
-            assert_eq!(
-                rest,
-                &[Protocol::Tcp(4001)],
-                "everything after the host is the caller's, not the resolver's"
-            );
-            assert_eq!(target.peer_id(), addr.peer_id());
+        for text in [
+            "/ip4/198.51.100.7/udp/4001/quic-v1",
+            "/ip6/2001:db8::1/tcp/4001",
+        ] {
+            let addr = peer_addr(text);
+            assert!(matches!(
+                resolver.expand(&addr),
+                Expansion::Ready(targets) if targets == vec![addr.clone()]
+            ));
         }
-    }
-
-    #[test]
-    fn a_dns_component_is_resolved_as_a_name_and_not_as_an_address() {
-        // The whole `/dns` component is the query. Reassembling it into
-        // `"name:port"` and handing that to the resolver hands over something
-        // that is parsed as an address first, so a bracketed IP literal in a
-        // `/dns` component would resolve -- an address wearing a name's
-        // clothes, taking the path meant for names. The TCP provider resolves
-        // the same way, and this is the endpoint agreeing with it.
-        let addr = peer_addr("/dns/[::1]/tcp/4001");
-        assert!(
-            matches!(targets(&addr), Err(TransportError::InvalidAddress { .. })),
-            "an IP literal is not a name to look up"
-        );
-        let addr = peer_addr("/dns/127.0.0.1/tcp/4001");
-        assert!(
-            matches!(targets(&addr), Err(TransportError::InvalidAddress { .. })),
-            "an IPv4 literal is not a name to look up"
-        );
     }
 
     #[test]
     fn a_family_is_dialed_once_however_many_addresses_it_answered_with() {
         let addr = peer_addr("/dns/example.invalid/udp/4001/quic-v1");
-        let answers = vec![
-            "198.51.100.7:4001".parse().expect("v4"),
-            "198.51.100.8:4001".parse().expect("v4"),
-            "[2001:db8::1]:4001".parse().expect("v6"),
-            "[2001:db8::2]:4001".parse().expect("v6"),
+        let ips = vec![
+            "198.51.100.7".parse().expect("v4"),
+            "198.51.100.8".parse().expect("v4"),
+            "2001:db8::1".parse().expect("v6"),
+            "2001:db8::2".parse().expect("v6"),
         ];
 
         // Two dials over the same socket to the same peer is a wasted
         // connection, not a second path -- the point of trying more than one
         // is trying more than one *way*.
-        let targets = rebuild(
-            &addr,
-            &[Protocol::Udp(4001), Protocol::QuicV1],
-            answers,
-            None,
-        )
-        .expect("rebuild");
+        let targets = answer_for(&addr, &answers("example.invalid", Ok(ips)))
+            .expect("answered")
+            .expect("targets");
         assert_eq!(
-            targets
-                .iter()
-                .map(|(family, target)| (*family, target.transport().to_string()))
-                .collect::<Vec<_>>(),
+            transports(targets),
             vec![
-                (Family::V4, "/ip4/198.51.100.7/udp/4001/quic-v1".to_string()),
-                (Family::V6, "/ip6/2001:db8::1/udp/4001/quic-v1".to_string()),
+                "/ip4/198.51.100.7/udp/4001/quic-v1".to_string(),
+                "/ip6/2001:db8::1/udp/4001/quic-v1".to_string(),
             ],
-            "the first answer of each family, in the order they arrived"
+            "the first answer of each family, in the order they arrived, \
+             keeping everything after the host"
         );
     }
 
     #[test]
-    fn a_family_specific_name_stays_in_its_family() {
-        let addr = peer_addr("/dns4/localhost/udp/4001/quic-v1");
-        for (family, target) in targets(&addr).expect("targets") {
-            assert_eq!(family, Family::V4, "/dns4 must not produce an ipv6 dial");
-            let (host, _) = target
-                .transport()
-                .protocols()
-                .split_first()
-                .expect("resolved peer address has a concrete host");
-            assert!(matches!(host, Protocol::Ip4(_)));
+    fn a_family_specific_name_filters_the_shared_answer() {
+        let ips: Vec<IpAddr> = vec![
+            "2001:db8::1".parse().expect("v6"),
+            "198.51.100.7".parse().expect("v4"),
+        ];
+        let shared = answers("example.invalid", Ok(ips));
+
+        let v4 = answer_for(&peer_addr("/dns4/example.invalid/tcp/4001"), &shared)
+            .expect("answered")
+            .expect("targets");
+        assert_eq!(transports(v4), vec!["/ip4/198.51.100.7/tcp/4001"]);
+
+        let v6 = answer_for(&peer_addr("/dns6/example.invalid/tcp/4001"), &shared)
+            .expect("answered")
+            .expect("targets");
+        assert_eq!(transports(v6), vec!["/ip6/2001:db8::1/tcp/4001"]);
+
+        let only_v6 = answers(
+            "example.invalid",
+            Ok(vec!["2001:db8::1".parse().expect("v6")]),
+        );
+        let refused = answer_for(&peer_addr("/dns4/example.invalid/tcp/4001"), &only_v6)
+            .expect("answered")
+            .expect_err("no v4 answer");
+        assert!(refused.contains("example.invalid"), "{refused}");
+    }
+
+    #[test]
+    fn a_failed_lookup_names_the_host() {
+        let addr = peer_addr("/dns/example.invalid/tcp/4001");
+        let reason = answer_for(&addr, &answers("example.invalid", Err("NXDOMAIN".into())))
+            .expect("answered")
+            .expect_err("failed");
+        assert!(
+            reason.contains("example.invalid") && reason.contains("NXDOMAIN"),
+            "{reason}"
+        );
+        assert!(
+            answer_for(&addr, &answers("other.invalid", Err("NXDOMAIN".into()))).is_none(),
+            "another name's answer leaves the candidate waiting"
+        );
+    }
+
+    #[test]
+    fn a_dns_component_is_resolved_as_a_name_and_not_as_an_address() {
+        // An IP literal in a `/dns` component is an address wearing a
+        // name's clothes; it is refused rather than taking the path meant for
+        // names.
+        let mut resolver = Resolver::with_lookup(
+            WaitHandle::noop(),
+            Arc::new(|_| panic!("an IP literal must not be looked up")),
+        );
+        for text in ["/dns/[::1]/tcp/4001", "/dns/127.0.0.1/tcp/4001"] {
+            assert!(
+                matches!(resolver.expand(&peer_addr(text)), Expansion::Refused(_)),
+                "{text} is not a name to look up"
+            );
         }
     }
 
     #[test]
     fn a_name_without_a_port_cannot_be_resolved() {
-        // Nothing to ask the resolver for. Guessing a port would dial a
-        // service the caller never named.
-        let addr = peer_addr("/dns/localhost");
-        let error = targets(&addr).expect_err("no port");
-        assert!(
-            matches!(&error, TransportError::InvalidAddress { reason, .. } if reason.contains("port")),
-            "got {error:?}"
+        let mut resolver = Resolver::with_lookup(
+            WaitHandle::noop(),
+            Arc::new(|_| panic!("a portless name must not be looked up")),
         );
+        let refused = resolver.expand(&peer_addr("/dns/localhost"));
+        assert!(
+            matches!(&refused, Expansion::Refused(reason) if reason.contains("port")),
+            "a portless name is refused"
+        );
+    }
+
+    #[test]
+    fn lookups_in_flight_are_capped() {
+        let (release_tx, release_rx) = channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let mut resolver = Resolver::with_lookup(
+            WaitHandle::noop(),
+            Arc::new(move |_: &str| {
+                // Held until the test ends, like a dead resolver.
+                match release_rx.lock().expect("lock").recv() {
+                    Ok(()) | Err(_) => {}
+                }
+                Err("released".into())
+            }),
+        );
+        for index in 0..MAX_IN_FLIGHT_LOOKUPS {
+            let addr = peer_addr(&format!("/dns/host{index}.invalid/tcp/4001"));
+            assert!(matches!(resolver.expand(&addr), Expansion::Resolving));
+        }
+        let refused = resolver.expand(&peer_addr("/dns/one-more.invalid/tcp/4001"));
+        assert!(
+            matches!(&refused, Expansion::Refused(reason) if reason.contains("one-more.invalid")),
+            "a name past the cap is refused with an actionable reason"
+        );
+        assert!(
+            matches!(
+                resolver.expand(&peer_addr("/dns4/host0.invalid/tcp/4002")),
+                Expansion::Resolving
+            ),
+            "a name already in flight still joins its lookup"
+        );
+
+        // Finished lookups free their slots before their answers are taken.
+        drop(release_tx);
+        while resolver.running.load(Ordering::SeqCst) > 0 {
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            resolver.expand(&peer_addr("/dns/one-more.invalid/tcp/4001")),
+            Expansion::Resolving
+        ));
     }
 }

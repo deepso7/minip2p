@@ -89,6 +89,8 @@ loop {
 }
 ```
 
+A driver may hold a `Dial` back instead of echoing it at once, for example to resolve a `/dns*` relay or AutoNAT server address off its event loop (transports accept only IP addresses). Before dialing and echoing such a deferred dial, it calls `agent.deferred_dial_wanted(token, now)` and drops the dial when that returns `false`: the owning flight has moved on, and a late result must not land on a newer one.
+
 The `minip2p` crate (cargo feature `nat`) wires exactly this loop into `Endpoint` so applications get `connect(target)`, `ConnectSettled`, and `EndpointEvent::Nat(..)` from `Endpoint::wait` without touching the pump. Attempt terminals (`ConnectFailed`, `FellBackToRelay`) are consumed by the Endpoint's Connection-attempt engine and surface only as `ConnectSettled`:
 
 ```rust,ignore

@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::time::Duration;
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, SocketAddr};
 
 use minip2p_core::{Multiaddr, Protocol};
 use minip2p_platform::Now;
@@ -101,36 +101,23 @@ fn disable_nagle(stream: &mio::net::TcpStream) -> Result<(), TcpError> {
         .map_err(|error| io_error("disabling Nagle's algorithm", &error))
 }
 
-/// Resolves a dial address, performing a blocking name lookup for `/dns*`.
+/// The socket address a dial targets, rejecting names.
 ///
-/// Resolution is I/O, which is why it lives here rather than in the portable
-/// transport. It blocks, matching the QUIC adapter; a host that cannot afford
-/// that should resolve names itself and dial the resulting `/ip4` or `/ip6`
-/// address.
+/// A name lookup blocks, and `connect` runs on the driver thread, so this
+/// provider never resolves: the std `Endpoint` resolves `/dns*` candidates off
+/// its driver, and a direct caller resolves the name itself first.
 fn dial_addr(addr: &Multiaddr) -> Result<SocketAddr, TcpError> {
     let (host, port) = host_and_port(addr, "tcp dial")?;
-    // `(name, port)` rather than a reassembled `"name:port"`: the string form
-    // has to be parsed back apart, and a name carrying a colon would be split
-    // in the wrong place.
-    let resolve = |name: &str, want: fn(&SocketAddr) -> bool| -> Result<SocketAddr, TcpError> {
-        (name, port)
-            .to_socket_addrs()
-            .map_err(|error| TcpError::Address {
-                context: "tcp dial",
-                reason: format!("resolving {name} failed: {error}"),
-            })?
-            .find(want)
-            .ok_or_else(|| TcpError::Address {
-                context: "tcp dial",
-                reason: format!("{name} resolved to no usable address"),
-            })
-    };
     match host {
         Protocol::Ip4(octets) => Ok(SocketAddr::new(IpAddr::from(octets), port)),
         Protocol::Ip6(octets) => Ok(SocketAddr::new(IpAddr::from(octets), port)),
-        Protocol::Dns(name) => resolve(&name, |_| true),
-        Protocol::Dns4(name) => resolve(&name, |addr| addr.is_ipv4()),
-        Protocol::Dns6(name) => resolve(&name, |addr| addr.is_ipv6()),
+        Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) => Err(TcpError::Address {
+            context: "tcp dial",
+            reason: format!(
+                "{addr} names a host; resolve it to /ip4 or /ip6 first \
+                 (this provider does not resolve names)"
+            ),
+        }),
         _ => Err(TcpError::Address {
             context: "tcp dial",
             reason: format!("{addr} has no host component"),
@@ -191,16 +178,17 @@ struct Socket {
 /// written until it reports `WouldBlock` -- anything less would leave bytes
 /// sitting in a kernel buffer with no further notification coming.
 ///
-/// The exception is [`connect`](TcpProvider::connect) to a `/dns*` address,
-/// which blocks for the name lookup before the connect starts; see
-/// [Names](#names). Dialing an `/ip4` or `/ip6` address never blocks, and the
-/// connect itself is asynchronous either way -- it completes on a later
-/// [`poll`](TcpProvider::poll) as [`TcpEvent::Connected`].
+/// [`connect`](TcpProvider::connect) never blocks either: the connect
+/// completes on a later [`poll`](TcpProvider::poll) as
+/// [`TcpEvent::Connected`].
 ///
 /// # Names
 ///
-/// `/dns`, `/dns4`, and `/dns6` dial addresses are resolved here, with a
-/// blocking lookup. Listening requires a concrete `/ip4` or `/ip6` host.
+/// Dialing and listening take `/ip4` or `/ip6` hosts only. A `/dns*` address
+/// is refused with [`TcpError::Address`], because a name lookup blocks and
+/// would stall every connection on the driver thread. The std `minip2p`
+/// `Endpoint` resolves names off its driver; a direct caller resolves the name
+/// itself and dials the result.
 ///
 /// A wildcard listen host binds every interface, including ones that appear
 /// later. IPv6 listeners are IPv6-only, so explicit IPv4 and IPv6 wildcards can

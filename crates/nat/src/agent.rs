@@ -797,6 +797,37 @@ impl NatAgent {
         self.reap_done();
     }
 
+    /// Whether a [`NatAction::Dial`] the driver deferred is still wanted,
+    /// retiring it when it is not.
+    ///
+    /// A driver that holds a dial back (to resolve a `/dns*` host off its
+    /// event loop) asks this before dialing and before echoing the result.
+    /// A relay, reservation, or AutoNAT dial is wanted until its owning
+    /// flight's deadline or until the peer connected some other way. After
+    /// that the dial is retired with no result delivered, so a late answer
+    /// cannot land on a newer flight, and the driver drops it.
+    pub fn deferred_dial_wanted(&mut self, token: NatToken, now: Now) -> bool {
+        let Some(purpose) = self.shared.tokens.get(&token) else {
+            return false;
+        };
+        if !matches!(
+            purpose,
+            TokenPurpose::RelayDial(..) | TokenPurpose::ProbeDial | TokenPurpose::ReserveDial
+        ) {
+            return true;
+        }
+        let wanted = self
+            .shared
+            .pending_session_dials
+            .get(&token)
+            .is_some_and(|(_, expires)| *expires > now.mono_ms);
+        if !wanted {
+            self.shared.tokens.remove(&token);
+            self.shared.pending_session_dials.remove(&token);
+        }
+        wanted
+    }
+
     /// Reports the result of a [`NatAction::Dial`] the driver executed.
     pub fn dial_result(&mut self, token: NatToken, result: Result<ConnectionId, String>, now: Now) {
         let Some(purpose) = self.shared.tokens.remove(&token) else {

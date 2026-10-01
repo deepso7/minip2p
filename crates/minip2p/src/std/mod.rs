@@ -48,6 +48,8 @@ use crate::GossipsubError;
 #[cfg(any(feature = "discovery", feature = "mdns"))]
 use crate::discovery::{DiscoveryDriver, resolve_book_candidates};
 #[cfg(feature = "nat")]
+use crate::portable::connect::Expansion;
+#[cfg(feature = "nat")]
 use crate::portable::connect::cancel_attempt;
 use crate::portable::connect::{ConnectAdmission, admit_connect};
 #[cfg(feature = "pubsub")]
@@ -299,6 +301,14 @@ pub struct Endpoint {
     /// The Endpoint event stream's queue: events produced by a step beyond
     /// the one returned.
     pending_events: std::collections::VecDeque<EndpointEvent>,
+    /// Name resolution for `/dns*` candidates, off the driver thread.
+    resolver: dial::Resolver,
+    /// NAT relay and AutoNAT dials waiting on Name resolution.
+    #[cfg(feature = "nat")]
+    nat_dials: Vec<(minip2p_nat::NatToken, PeerAddr)>,
+    /// Set by [`Endpoint::wait_handle`] interrupts, so [`Endpoint::wait`] can
+    /// tell a caller's interrupt from a lookup thread waking the driver.
+    caller_interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(feature = "nat", feature = "relay-server"))]
     caller_external_addresses: Vec<Multiaddr>,
     #[cfg(any(feature = "nat", feature = "relay-server"))]
@@ -322,9 +332,17 @@ impl Endpoint {
     ///
     /// Taken through the transport trait rather than the concrete QUIC
     /// endpoint, so it stays correct once the endpoint drives more than one
-    /// transport.
+    /// transport. Use this handle rather than the transport's own: the
+    /// endpoint also wakes its wait internally (a finished name lookup), and
+    /// only this handle's interrupts surface as
+    /// [`EndpointWaitOutcome::Interrupted`].
     pub fn wait_handle(&self) -> WaitHandle {
-        minip2p_transport::BlockingTransport::wait_handle(self.swarm.transport())
+        let transport = minip2p_transport::BlockingTransport::wait_handle(self.swarm.transport());
+        let caller_interrupt = std::sync::Arc::clone(&self.caller_interrupt);
+        WaitHandle::new(move || {
+            caller_interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
+            transport.interrupt();
+        })
     }
 
     /// Starts building an endpoint.
@@ -373,17 +391,24 @@ impl Endpoint {
     /// configured relay exists, the attempt settles
     /// [`crate::ConnectFailure::NoUsableRoute`] through one terminal event.
     ///
-    /// Every candidate is DNS-expanded and dialed immediately. Candidate
-    /// completion order is not a public contract. The swarm still keeps a
+    /// Every `/ip4` and `/ip6` candidate is dialed immediately, and the relay
+    /// leg (when there is one) starts at once. Candidate completion order is
+    /// not a public contract. The swarm still keeps a
     /// single connection per peer: a race loser that finishes after the winner
     /// may supersede it (`ConnectionClosed { Superseded }` then a new
     /// `ConnectionEstablished`). The attempt is already settled at the first
     /// established connection (including a simultaneous inbound), and the app
     /// sees those as ordinary connection events.
     ///
-    /// Candidates may name the IP family explicitly (`/ip4`, `/ip6`); a
-    /// `/dns` candidate is resolved and dialed over every family it answers
-    /// with.
+    /// Candidates may name the IP family explicitly (`/ip4`, `/ip6`) or a
+    /// host (`/dns`, `/dns4`, `/dns6`). This call never blocks on DNS: a
+    /// name is looked up on a background thread and joins the race when it
+    /// answers, dialed once per family it answers with (`/dns4` and `/dns6`
+    /// keep to their family). A failed lookup is a failed candidate whose
+    /// reason names the host; the attempt fails only when every candidate,
+    /// including names still resolving, has failed and no relay leg remains.
+    /// There is no separate DNS timeout: the attempt deadline covers the
+    /// lookup. Under `force_relay` names are not looked up at all.
     #[expect(
         clippy::result_large_err,
         reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."
@@ -418,7 +443,7 @@ impl Endpoint {
                 candidates,
                 allow_relay,
             },
-            &mut dial::expand_dial_targets,
+            &mut |addr| self.resolver.expand(addr),
             now.monotonic_ms,
         );
         #[cfg(feature = "nat")]
@@ -617,7 +642,7 @@ impl Endpoint {
     /// (NAT, relay service, Gossipsub) are consumed here and never surface as
     /// application stream events.
     pub fn poll(&mut self) -> Result<Vec<EndpointEvent>, Error> {
-        self.tick_connect();
+        self.tick_connect()?;
         let mut events: Vec<EndpointEvent> = self.pending_events.drain(..).collect();
         let polled = self.swarm.poll()?;
         if polled.is_empty() {
@@ -703,7 +728,7 @@ impl Endpoint {
             // A shortened step deadline is an internal timer, not the
             // caller's. Tick first so an attempt Timeout lands as
             // ConnectSettled.
-            self.tick_connect();
+            self.tick_connect()?;
             if let Some(event) = self.pending_events.pop_front() {
                 return Ok(EndpointWaitOutcome::Event(event));
             }
@@ -732,15 +757,81 @@ impl Endpoint {
                     }
                     self.pending_events.extend(produced);
                 }
-                PollNext::Interrupted => return Ok(EndpointWaitOutcome::Interrupted),
+                PollNext::Interrupted => {
+                    // Anything but a caller's interrupt is a lookup thread
+                    // with an answer; the next `tick_connect` applies it.
+                    if self
+                        .caller_interrupt
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return Ok(EndpointWaitOutcome::Interrupted);
+                    }
+                }
             }
         }
     }
 
-    fn tick_connect(&mut self) {
+    /// Starts lookups for NAT dials to named hosts, expires due attempts,
+    /// applies finished lookups to the Connection attempts and NAT dials
+    /// still waiting on them, and queues whatever settled.
+    ///
+    /// Runs before every blocking wait, so a lookup is under way before the
+    /// driver sleeps, and its answer is applied on the wake it causes.
+    fn tick_connect(&mut self) -> Result<(), Error> {
+        #[cfg(feature = "nat")]
+        let mut nat_answered = Vec::new();
+        #[cfg(feature = "nat")]
+        if let Some(nat) = self.nat.as_mut() {
+            // A lookup can outlive the flight that wanted it; retire those so
+            // retries during a stall do not pile up.
+            let now = self.swarm.now();
+            self.nat_dials
+                .retain(|(token, _)| nat.named_dial_wanted(*token, now));
+            for (token, addr) in nat.take_named_dials() {
+                match self.resolver.expand(&addr) {
+                    Expansion::Resolving => self.nat_dials.push((token, addr)),
+                    Expansion::Ready(targets) => nat_answered.push((token, Ok(targets))),
+                    Expansion::Refused(reason) => nat_answered.push((token, Err(reason))),
+                }
+            }
+        }
+        // Expire first: an answer that arrives after an attempt's deadline
+        // must not turn its Timeout into another outcome.
         let now_ms = self.swarm.now().monotonic_ms;
         self.connect.tick(self.swarm.runtime_mut(), now_ms);
+        let answers = self.resolver.take_answers();
+        if !answers.is_empty() {
+            self.connect.resolved(
+                &mut |addr| dial::answer_for(addr, &answers),
+                self.swarm.runtime_mut(),
+            );
+            #[cfg(feature = "nat")]
+            self.nat_dials
+                .retain(|(token, addr)| match dial::answer_for(addr, &answers) {
+                    Some(result) => {
+                        nat_answered.push((*token, result));
+                        false
+                    }
+                    None => true,
+                });
+        }
+        #[cfg(feature = "nat")]
+        if !nat_answered.is_empty()
+            && let Some(nat) = self.nat.as_mut()
+        {
+            let now = self.swarm.now();
+            for (token, result) in nat_answered {
+                nat.named_dial_resolved(token, result, self.swarm.runtime_mut(), now);
+            }
+            // The agent reacted to its dials; run a full step so discovery
+            // sweeps what that queued before anything is drained.
+            let mut produced = Vec::new();
+            self.finish_step(&mut produced)?;
+            self.pending_events.extend(produced);
+            return Ok(());
+        }
         self.flush_step_events();
+        Ok(())
     }
 
     /// Queues output produced outside a swarm step (API calls, timers):
@@ -1004,7 +1095,7 @@ impl Endpoint {
                 self.nat.as_mut(),
                 &mut self.connect,
                 self.swarm.runtime_mut(),
-                &mut dial::expand_dial_targets,
+                &mut |addr| self.resolver.expand(addr),
                 now,
             );
             // Both discovery features imply `nat`.
@@ -2078,7 +2169,9 @@ fn build_endpoint(
             .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
             .collect();
         let agent = minip2p_nat::NatAgent::new(swarm.local_peer_id().clone(), config);
-        NatDriver::new(agent, relay_addrs, minip2p_platform::StdEntropy)
+        // Relay and AutoNAT server addresses may name a host; the endpoint
+        // resolves those off the driver, like Connection-attempt candidates.
+        NatDriver::new(agent, relay_addrs, minip2p_platform::StdEntropy).park_named_dials()
     });
     #[cfg(feature = "relay-server")]
     let relay_server = options
@@ -2235,6 +2328,9 @@ fn build_endpoint(
     } else {
         None
     };
+    let resolver = dial::Resolver::new(minip2p_transport::BlockingTransport::wait_handle(
+        swarm.transport(),
+    ));
     Ok(Endpoint {
         swarm,
         connect: ConnectEngine::new(
@@ -2251,6 +2347,10 @@ fn build_endpoint(
         #[cfg(feature = "mdns")]
         mdns,
         pending_events: std::collections::VecDeque::new(),
+        resolver,
+        #[cfg(feature = "nat")]
+        nat_dials: Vec::new(),
+        caller_interrupt: std::sync::Arc::default(),
         #[cfg(any(feature = "nat", feature = "relay-server"))]
         caller_external_addresses: Vec::new(),
         #[cfg(any(feature = "nat", feature = "relay-server"))]
@@ -2479,6 +2579,247 @@ mod tests {
             ConnectOutcome::Cancelled
         ));
         assert!(dialer.connected_peers().is_empty());
+    }
+
+    /// A lookup that reports each name it is asked for on `started` and
+    /// then blocks until the test sends it an answer (or drops the sender).
+    fn stalling_lookup() -> (
+        dial::Lookup,
+        std::sync::mpsc::Receiver<String>,
+        std::sync::mpsc::Sender<dial::Answer>,
+    ) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel::<dial::Answer>();
+        let answer_rx = std::sync::Mutex::new(answer_rx);
+        let lookup: dial::Lookup = Arc::new(move |host: &str| {
+            drop(started_tx.send(host.to_string()));
+            let answer = answer_rx.lock().expect("lookup lock").recv();
+            answer.unwrap_or_else(|_| Err("test ended".to_string()))
+        });
+        (lookup, started_rx, answer_tx)
+    }
+
+    fn quic_endpoint() -> Endpoint {
+        Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind")
+    }
+
+    fn with_lookup(endpoint: &mut Endpoint, lookup: dial::Lookup) {
+        let wake = minip2p_transport::BlockingTransport::wait_handle(endpoint.swarm.transport());
+        endpoint.resolver = dial::Resolver::with_lookup(wake, lookup);
+    }
+
+    /// `addr` with its host swapped for the name `host`.
+    fn named(addr: &PeerAddr, host: &str) -> PeerAddr {
+        let mut protocols = addr.transport().protocols().to_vec();
+        *protocols.first_mut().expect("a host") = Protocol::Dns(host.to_string());
+        PeerAddr::new(Multiaddr::from_protocols(protocols), addr.peer_id().clone())
+            .expect("named peer addr")
+    }
+
+    #[test]
+    fn a_stalled_lookup_does_not_hold_up_other_attempts() {
+        let mut listener = quic_endpoint();
+        let addr = listener.listen().expect("listen");
+        let _driver = Driven::new(listener);
+        let mut dialer = quic_endpoint();
+        let (lookup, started, _answer) = stalling_lookup();
+        with_lookup(&mut dialer, lookup);
+
+        let stalled_peer = Ed25519Keypair::generate().peer_id();
+        let stalled = dialer
+            .connect(named(
+                &PeerAddr::new(addr.transport().clone(), stalled_peer).expect("addr"),
+                "stalled.invalid",
+            ))
+            .expect("connect returns without waiting for the lookup");
+        assert_eq!(started.recv().expect("lookup started"), "stalled.invalid");
+
+        let id = dialer.connect(addr).expect("connect");
+        assert!(matches!(
+            connect_outcome(&mut dialer, id),
+            ConnectOutcome::Connected { .. }
+        ));
+        assert!(
+            dialer.connect.is_pending(stalled),
+            "the stalled attempt is still waiting on its lookup"
+        );
+    }
+
+    #[test]
+    fn an_ip_candidate_dials_while_a_name_in_the_same_attempt_resolves() {
+        let mut listener = quic_endpoint();
+        let addr = listener.listen().expect("listen");
+        let _driver = Driven::new(listener);
+        let mut dialer = quic_endpoint();
+        let (lookup, _started, _answer) = stalling_lookup();
+        with_lookup(&mut dialer, lookup);
+
+        let id = dialer
+            .connect(vec![named(&addr, "stalled.invalid"), addr.clone()])
+            .expect("connect");
+        let ConnectOutcome::Connected { conn_id } = connect_outcome(&mut dialer, id) else {
+            panic!("the /ip4 candidate must not wait for the name");
+        };
+        assert_eq!(
+            dialer.connection_remote_addr(conn_id),
+            Some(addr.transport())
+        );
+    }
+
+    #[test]
+    fn attempts_naming_one_host_share_a_lookup_and_its_failure() {
+        let mut dialer = quic_endpoint();
+        let (lookup, started, answer) = stalling_lookup();
+        with_lookup(&mut dialer, lookup);
+        let peer = Ed25519Keypair::generate().peer_id();
+        let target = |text: &str| {
+            PeerAddr::new(text.parse().expect("addr"), peer.clone()).expect("peer addr")
+        };
+
+        let first = dialer
+            .connect(target("/dns/gone.invalid/udp/4001/quic-v1"))
+            .expect("connect");
+        let second = dialer
+            .connect(target("/dns4/gone.invalid/udp/4002/quic-v1"))
+            .expect("connect");
+        assert_eq!(started.recv().expect("lookup started"), "gone.invalid");
+        assert!(
+            started.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the second attempt joined the first lookup"
+        );
+        answer
+            .send(Err("NXDOMAIN".to_string()))
+            .expect("lookup waiting");
+
+        // The lookup thread wakes the driver; that is not the caller's
+        // interrupt, so `wait` keeps going instead of surfacing it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut unsettled = vec![first, second];
+        while !unsettled.is_empty() {
+            match dialer.wait(deadline).expect("wait") {
+                EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+                    connect_id,
+                    outcome,
+                    ..
+                }) => {
+                    let ConnectOutcome::Failed(ConnectFailure::NoUsableRoute {
+                        candidates, ..
+                    }) = outcome
+                    else {
+                        panic!("expected NoUsableRoute, got {outcome:?}");
+                    };
+                    assert!(
+                        candidates[0].reason.contains("gone.invalid")
+                            && candidates[0].reason.contains("NXDOMAIN"),
+                        "the reason names the host: {}",
+                        candidates[0].reason
+                    );
+                    unsettled.retain(|id| *id != connect_id);
+                }
+                EndpointWaitOutcome::Event(_) => {}
+                other => panic!("expected both attempts to settle, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_a_resolving_attempt_is_immediate_and_the_late_answer_is_dropped() {
+        let mut listener = quic_endpoint();
+        let addr = listener.listen().expect("listen");
+        let _driver = Driven::new(listener);
+        let mut dialer = quic_endpoint();
+        let (lookup, started, answer) = stalling_lookup();
+        with_lookup(&mut dialer, lookup);
+
+        let id = dialer
+            .connect(named(&addr, "late.invalid"))
+            .expect("connect");
+        started.recv().expect("lookup started");
+        dialer.cancel_connect(id);
+        assert!(matches!(
+            dialer.poll().expect("poll").as_slice(),
+            [EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome: ConnectOutcome::Cancelled,
+                ..
+            }] if *connect_id == id
+        ));
+
+        // An answer that would reach the live listener, had anything kept it.
+        answer
+            .send(Ok(vec![std::net::Ipv4Addr::LOCALHOST.into()]))
+            .expect("lookup waiting");
+        let until = std::time::Instant::now() + Duration::from_millis(500);
+        while let Some(event) = dialer.next_event(until).expect("drive") {
+            assert!(
+                !matches!(
+                    event,
+                    EndpointEvent::ConnectSettled { .. }
+                        | EndpointEvent::ConnectionEstablished { .. }
+                ),
+                "the late answer must have no effect, got {event:?}"
+            );
+        }
+        assert!(dialer.connected_peers().is_empty());
+    }
+
+    #[test]
+    fn an_answer_after_the_deadline_leaves_the_attempt_timed_out() {
+        let mut dialer = Endpoint::builder()
+            .connect_deadline(Duration::from_millis(50))
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind");
+        let (lookup, started, answer) = stalling_lookup();
+        with_lookup(&mut dialer, lookup);
+        let target = PeerAddr::new(
+            "/dns/slow.invalid/udp/4001/quic-v1".parse().expect("addr"),
+            Ed25519Keypair::generate().peer_id(),
+        )
+        .expect("peer addr");
+
+        let id = dialer.connect(target).expect("connect");
+        started.recv().expect("lookup started");
+        // The answer lands past the deadline but before the next poll: the
+        // attempt already ran out of time, so the answer must not decide it.
+        std::thread::sleep(Duration::from_millis(100));
+        answer
+            .send(Err("NXDOMAIN".to_string()))
+            .expect("lookup waiting");
+        // Give the lookup thread time to queue its answer.
+        std::thread::sleep(Duration::from_millis(50));
+        match connect_outcome(&mut dialer, id) {
+            ConnectOutcome::Failed(ConnectFailure::Timeout { candidates, .. }) => {
+                assert!(candidates[0].reason.contains("resolving"), "{candidates:?}");
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dns_candidate_connects_through_the_system_resolver() {
+        let mut listener = quic_endpoint();
+        let addr = listener.listen().expect("listen");
+        let _driver = Driven::new(listener);
+        let mut dialer = quic_endpoint();
+
+        let mut protocols = addr.transport().protocols().to_vec();
+        *protocols.first_mut().expect("a host") = Protocol::Dns4("localhost".to_string());
+        let target = PeerAddr::new(Multiaddr::from_protocols(protocols), addr.peer_id().clone())
+            .expect("named peer addr");
+        let id = dialer.connect(target).expect("connect");
+        let ConnectOutcome::Connected { conn_id } = connect_outcome(&mut dialer, id) else {
+            panic!("localhost must resolve and connect");
+        };
+        assert_eq!(
+            dialer.connection_remote_addr(conn_id),
+            Some(addr.transport())
+        );
     }
 
     #[cfg(feature = "tcp")]

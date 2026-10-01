@@ -88,8 +88,8 @@ pub enum TcpEvent {
     Connected {
         /// The stream that is now writable.
         socket: SocketHandle,
-        /// The address actually reached, which for a `/dns*` dial is the
-        /// resolved one rather than the requested one.
+        /// The address actually reached, which a provider that resolves
+        /// names reports instead of the requested `/dns*` one.
         remote: Multiaddr,
     },
     /// Bytes arrived, in stream order.
@@ -163,8 +163,9 @@ pub(crate) fn host_and_port(
 ///
 /// Providers speak `/tcp` multiaddrs, not platform socket types, which is what
 /// keeps the transport `no_std`. Interpreting a `/dns*` host is a provider's
-/// job because resolution is I/O: a hosted provider may resolve it, and an
-/// embedded one may reject it. Providers report the concrete address they
+/// job because resolution is I/O. Both bundled providers reject it, since a
+/// lookup inside `connect` would block the driver; a custom provider may
+/// resolve it. Providers report the concrete address they
 /// actually bound or reached, so the transport can describe endpoints without
 /// knowing how they were derived.
 ///

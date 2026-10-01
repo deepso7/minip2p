@@ -6,5 +6,5 @@ We rejected making hosts pre-resolve: the discovery sweep and advertised address
 
 ## Consequences
 
-- There is no DNS-specific timeout: the attempt deadline bounds resolution, and a result that arrives after the attempt settles is dropped. `getaddrinfo` cannot be cancelled, so a dead resolver holds one thread per distinct name until the OS gives up.
+- There is no DNS-specific timeout: the attempt deadline bounds resolution, and a result that arrives after the attempt settles is dropped. `getaddrinfo` cannot be cancelled, so a dead resolver holds one thread per distinct name until the OS gives up. At most 32 names are looked up at once; a candidate past that cap is a failed candidate with a reason saying so.
 - Direct `Transport` users and `send_raw_udp` callers must pass resolved addresses.

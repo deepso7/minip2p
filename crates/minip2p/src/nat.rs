@@ -78,6 +78,14 @@ pub(crate) struct NatDriver<E> {
     /// The bound-address revision the agent's `listen_addrs` were seeded
     /// from; callers can bind through any swarm path between driver turns.
     listen_addrs_revision: u64,
+    /// Whether `Dial` actions to a `/dns*` host are parked for the
+    /// composition to resolve instead of handed to a transport that would
+    /// refuse them. Only the std Endpoint, which owns Name resolution, sets it.
+    #[cfg(feature = "nat")]
+    park_named_dials: bool,
+    /// `Dial` actions to a `/dns*` host awaiting [`Self::take_named_dials`].
+    #[cfg(feature = "nat")]
+    named_dials: Vec<(minip2p_nat::NatToken, minip2p_core::PeerAddr)>,
     #[cfg(all(test, feature = "nat", feature = "quic"))]
     pub(crate) bridge_reset_attempts: Vec<(ConnectionId, StreamId)>,
 }
@@ -104,9 +112,69 @@ impl<E: EntropySource> NatDriver<E> {
             // an untouched revision would advertise a dial-back address
             // that drops packets.
             listen_addrs_revision: 0,
+            #[cfg(feature = "nat")]
+            park_named_dials: false,
+            #[cfg(feature = "nat")]
+            named_dials: Vec::new(),
             #[cfg(all(test, feature = "nat", feature = "quic"))]
             bridge_reset_attempts: Vec::new(),
         }
+    }
+
+    /// Parks relay and AutoNAT dials to `/dns*` hosts for the caller to
+    /// resolve off the driver; see [`Self::take_named_dials`].
+    #[cfg(feature = "nat")]
+    pub(crate) fn park_named_dials(mut self) -> Self {
+        self.park_named_dials = true;
+        self
+    }
+
+    /// Moves out the parked `/dns*` dials. Each must come back through
+    /// [`Self::named_dial_resolved`] once its name has an answer.
+    #[cfg(feature = "nat")]
+    pub(crate) fn take_named_dials(
+        &mut self,
+    ) -> Vec<(minip2p_nat::NatToken, minip2p_core::PeerAddr)> {
+        core::mem::take(&mut self.named_dials)
+    }
+
+    /// Whether the agent still waits on a parked dial; retires it when not.
+    /// See [`NatAgent::deferred_dial_wanted`].
+    #[cfg(feature = "nat")]
+    pub(crate) fn named_dial_wanted(
+        &mut self,
+        token: minip2p_nat::NatToken,
+        sample: PlatformNow,
+    ) -> bool {
+        self.agent.deferred_dial_wanted(token, to_nat_now(sample))
+    }
+
+    /// Finishes a parked dial: dials the first resolved address the swarm
+    /// accepts, or reports the resolution failure, then pumps the agent. An
+    /// answer for a dial the agent no longer waits on is dropped.
+    #[cfg(feature = "nat")]
+    pub(crate) fn named_dial_resolved<T: NatTransport, R: EntropySource>(
+        &mut self,
+        token: minip2p_nat::NatToken,
+        resolved: crate::portable::connect::NameAnswer,
+        swarm: &mut SwarmRuntime<T, R>,
+        sample: PlatformNow,
+    ) {
+        if !self.named_dial_wanted(token, sample) {
+            return;
+        }
+        let result = resolved.and_then(|targets| {
+            let mut last = alloc::string::String::from("name resolved to no address");
+            for target in targets {
+                match swarm.dial(&target) {
+                    Ok(conn_id) => return Ok(conn_id),
+                    Err(error) => last = error.to_string(),
+                }
+            }
+            Err(last)
+        });
+        self.agent.dial_result(token, result, to_nat_now(sample));
+        self.pump(swarm, sample);
     }
 
     /// Cancels a pending connect's NAT leg; settled or unknown ids are a
@@ -546,6 +614,16 @@ impl<E: EntropySource> NatDriver<E> {
     ) {
         let now = to_nat_now(sample);
         match action {
+            #[cfg(feature = "nat")]
+            NatAction::Dial { token, addr }
+                if self.park_named_dials
+                    && matches!(
+                        addr.transport().protocols().first(),
+                        Some(Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_))
+                    ) =>
+            {
+                self.named_dials.push((token, addr));
+            }
             NatAction::Dial { token, addr } => {
                 let result = swarm.dial(&addr).map_err(|e| e.to_string());
                 self.agent.dial_result(token, result, now);
