@@ -209,6 +209,10 @@ impl Prober {
             .is_some_and(|f| f.stage != ExchangeStage::WaitPeerReady)
         {
             self.on_peer_disconnected(peer, shared, now);
+            // A late open result for the retired flight must find no token.
+            shared
+                .tokens
+                .retain(|_, purpose| *purpose != TokenPurpose::OpenProbe(peer.clone()));
         }
     }
 

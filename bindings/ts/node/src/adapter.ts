@@ -378,13 +378,16 @@ function normalizeNativeValue(
     );
     const { connId, streamId } = record;
     if (maps !== undefined && streamId !== undefined) {
-      if (
-        typeof connId !== "number" ||
-        (typeof streamId !== "bigint" && typeof streamId !== "number")
-      ) {
+      if (typeof streamId !== "bigint" && typeof streamId !== "number") {
         throw new TypeError("The native addon returned an invalid stream ID");
       }
-      record.streamId = maps.streamIds.toPublic(connId, BigInt(streamId));
+      // Public stream IDs are allocated per connection. A record without a
+      // connection (an endpoint error, say) cannot name a public stream.
+      if (typeof connId === "number") {
+        record.streamId = maps.streamIds.toPublic(connId, BigInt(streamId));
+      } else {
+        delete record.streamId;
+      }
     }
     return record;
   }

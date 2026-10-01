@@ -25,7 +25,7 @@ Out of scope: reservation vouchers, relay discovery/autorelay, ACLs, metrics, pr
 ```text
 crates/relay                         One HOP or STOP stream's wire state.
 crates/swarm                         Directional protocol registration and
-                                     connection-close cause.
+                                     connection replacement (#230).
 crates/relay-server                  Whole sans-I/O relay service and policy.
 crates/minip2p/src/std/relay_server  I/O adapter and Endpoint composition.
 ```
@@ -167,7 +167,6 @@ pub enum RelayServerEvent {
 pub enum ReservationCloseReason {
     Expired,
     ConnectionClosed,
-    Superseded,
     InternalFailure,
 }
 
@@ -185,12 +184,12 @@ pub enum CircuitCloseReason {
     DurationLimit,
     StreamReset { leg: CircuitLeg },
     ForwardFailed { direction: CircuitDirection },
-    ConnectionClosed { leg: CircuitLeg, cause: ConnectionCloseCause },
+    ConnectionClosed { leg: CircuitLeg },
     InternalFailure,
 }
 ```
 
-Denial events expose the exact `minip2p_relay::Status`, re-exported from `minip2p`. All event and reason types above, `RelayServerConfig`, `RateLimit`, the three error types, `RelayServerAddressErrorKind`, `RelayServerRuntimeError{,Kind}`, and `ConnectionCloseCause` are also re-exported.
+Denial events expose the exact `minip2p_relay::Status`, re-exported from `minip2p`. All event and reason types above, `RelayServerConfig`, `RateLimit`, the three error types, `RelayServerAddressErrorKind`, and `RelayServerRuntimeError{,Kind}` are also re-exported.
 
 `RelayServerRuntimeError` follows the Swarm error pattern: public `kind`, optional `peer_id`, and human-readable `detail`, with no connection/stream key or agent token. `RelayServerRuntimeErrorKind` has stable operation categories `OpenStream`, `SendStream`, `CloseStream`, `ResetStream`, and `InternalInvariant`. Synchronous configuration/control failures use returned errors; asynchronous transport/driver failures use `RelayServerEvent::Error`. An internal failure that terminates a committed lifecycle emits both its stable close reason and one diagnostic error event.
 
@@ -253,21 +252,9 @@ Do not broaden this migration into unrelated DCUtR/AutoNAT behavior. A relay-ser
 
 HOP on a circuit connection still negotiates, then returns `PERMISSION_DENIED`. This intentional rust-libp2p deviation makes the denial deterministic instead of failing negotiation.
 
-### Connection-close cause
+### Connection replacement
 
-Make the breaking Swarm event change:
-
-```rust
-pub enum ConnectionCloseCause { Transport, Superseded }
-
-SwarmEvent::ConnectionClosed {
-    peer_id: PeerId,
-    conn_id: ConnectionId,
-    cause: ConnectionCloseCause,
-}
-```
-
-The synchronous last-wins replacement path emits `Superseded`; transport loss and explicit transport closure emit `Transport`. Migrate every consumer and fixture in Swarm, NAT, portable/std Endpoint drivers, discovery, pubsub, and their tests in the same PR. Relay reservation closure maps the two causes to `Superseded` and `ConnectionClosed` respectively.
+Revised by #230: the Swarm no longer reports a close cause. A last-wins hand-over is one `SwarmEvent::ConnectionReplaced { peer_id, old, new }`, and `ConnectionClosed { peer_id, conn_id }` means the peer's last connection closed. On a replacement, a reservation bound to `old` moves to a direct `new` with its original expiry, or closes with `ReservationCloseReason::ConnectionClosed` when `new` is a circuit. Circuits on `old` close with `CircuitCloseReason::ConnectionClosed { leg }`.
 
 The Swarm remains single-connection-per-peer. Relay state stores exact `ConnectionId`s and verifies an opened STOP stream landed on the reservation's connection. No new connection-targeted send API is needed while that invariant holds; document this load-bearing assumption.
 
@@ -298,9 +285,8 @@ With no usable address, deny new reservations and renewals with `RESERVATION_REF
 There is at most one committed reservation per peer. The record stores its owning connection, monotonic deadline, and optional Unix expiry metadata.
 
 - RESERVE on the owning connection is a renewal.
-- A new connection supersedes the old one first, emits one `Superseded` close, and may then make a fresh reservation.
-- If a custom low-level driver reports a replacement connection without the expected old-connection close, the agent defensively applies the same last-wins supersession before accepting work from the replacement.
-- Every request, including renewal, consumes the peer/IP reservation limiter tokens. A successful renewal replaces its capacity slot rather than consuming another global slot.
+- A replacement connection (`ConnectionReplaced`) takes over a reservation when it is direct, keeping the original expiry; a circuit replacement closes the reservation with `ConnectionClosed`.
+- A renewal consumes no peer/IP reservation limiter token and replaces its capacity slot rather than consuming another global slot; a fresh reservation consumes both.
 - Admission order for every syntactically valid RESERVE is: accepting and a usable address set; peer limiter; IP limiter; exact global capacity; response acceptance and commit. A denial at the availability step consumes no token. The peer token is consumed before the IP check, and a capacity-denied attempt consumes both applicable tokens but no slot. Capacity uses would-exceed semantics, so equality is allowed and zero denies new work. Renewal performs the same checks but treats its existing slot as replacement capacity.
 
 The IP key is the first IP4/IP6 component of the exact connection's remote transport address. When none exists, the IP limiter is not applicable. Failed availability returns `RESERVATION_REFUSED`; rate/capacity denial returns `RESOURCE_LIMIT_EXCEEDED`.
@@ -309,7 +295,7 @@ Initial acceptance commits only after the success response is accepted by the tr
 
 Renewal commits only after its response is accepted. Replace both deadlines from renewal time and emit `renewed: true`; do not emit a close. A failed renewal response preserves the previous reservation and deadline.
 
-Internal lifetime uses only `monotonic_now + reservation_duration`. Optional `unix_now + duration` is wire/event metadata and uses saturating arithmetic. When wall time is absent, omit both the wire `Reservation.expire` value and the event expiry while enforcing the full monotonic lifetime. Missing, jumping, or saturated wall time never changes expiry. At a timestamp, process `now >= deadline` before connection events or other inputs. A committed reservation emits exactly one terminal event: `Expired`, `ConnectionClosed`, `Superseded`, or `InternalFailure`. Never close an uncommitted/nonexistent reservation. Administrative pause emits no closure.
+Internal lifetime uses only `monotonic_now + reservation_duration`. Optional `unix_now + duration` is wire/event metadata and uses saturating arithmetic. When wall time is absent, omit both the wire `Reservation.expire` value and the event expiry while enforcing the full monotonic lifetime. Missing, jumping, or saturated wall time never changes expiry. At a timestamp, process `now >= deadline` before connection events or other inputs. A committed reservation emits exactly one terminal event: `Expired`, `ConnectionClosed`, or `InternalFailure`. Never close an uncommitted/nonexistent reservation. Administrative pause emits no closure.
 
 ### CONNECT admission
 
@@ -375,9 +361,9 @@ In `crates/relay`:
 Land the cross-cutting Swarm work first:
 
 - independent inbound/outbound/Identify protocol roles while preserving generic application registration;
-- `ConnectionCloseCause` and every consumer/test migration;
+- the connection-replacement handling and every consumer/test migration;
 - exact connection remote-address lookup for IP limiting; and
-- tests for outbound-only HOP, advertised inbound HOP, MSS snapshots, and both close causes.
+- tests for outbound-only HOP, advertised inbound HOP, MSS snapshots, and connection replacement.
 
 Then add `minip2p-relay-server` with the frozen config, errors, events, token bucket limiters, address normalization, reservation/circuit tables, tokenized control/forward sends, monotonic scheduling, and exactly-once terminal state. Limiter maps use an expiry-ordered schedule and sweep only due entries; they do not scan all peer/IP keys per request. All deadline/refill arithmetic saturates. Add README/rustdoc for every public item.
 

@@ -1029,6 +1029,11 @@ impl SwarmCore {
         _now_ms: u64,
     ) {
         let Some(pending) = self.pending_opens.remove(&token) else {
+            // An open issued on a replaced connection ended with it; its late
+            // acknowledgement is not a driver error.
+            if self.retired_connections.contains(&conn_id) {
+                return;
+            }
             self.emit_error(
                 SwarmErrorKind::Driver,
                 None,
@@ -3277,6 +3282,17 @@ mod tests {
             core.send_stream(&peer_id, stream, b"lost".to_vec()),
             Err(SwarmError::StreamNotFound { .. })
         ));
+
+        // A driver acknowledging an open it issued on the retired connection
+        // is not a driver error.
+        let _ = drain_events(&mut core);
+        core.handle_input(SwarmInput::StreamOpened {
+            conn_id: original,
+            stream_id: StreamId::new(12),
+            token: OpenStreamToken(999),
+            now_ms: 0,
+        });
+        assert!(drain_events(&mut core).is_empty());
     }
 
     /// Feeds a second connection to an already connected peer, as the

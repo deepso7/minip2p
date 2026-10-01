@@ -389,7 +389,11 @@ impl InboundCircuit {
         }
         self.blast = None;
         self.linger_until = None;
-        shared.record_origin(conn_id, crate::Path::DirectPunched, None);
+        // An attempt that dialed this connection already recorded where it
+        // came from; only an otherwise unexplained one is the punch.
+        if !shared.origins.contains_key(&conn_id) {
+            shared.record_origin(conn_id, crate::Path::DirectPunched, None);
+        }
         shared.push_event(NatEvent::InboundDirectUpgrade { peer: peer.clone() });
         if self.released {
             self.done = true;

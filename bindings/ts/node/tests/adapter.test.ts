@@ -353,6 +353,29 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
+  test("delivers an endpoint error that names a stream but no connection", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const details: string[] = [];
+    endpoint.on("endpointError", ({ detail }) => details.push(detail));
+    fake.enqueue(
+      [
+        {
+          inner: { detail: "boom", kind: 0, streamId: 4n },
+          tag: "EndpointError",
+        },
+      ],
+      []
+    );
+
+    fake.ring();
+    await settle();
+
+    expect(details).toEqual(["boom"]);
+    endpoint.close();
+  });
+
   test("forgets connection identifiers after ConnectionClosed", async () => {
     vi.useFakeTimers();
     const endpoint = createEndpoint();
