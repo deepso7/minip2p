@@ -12,7 +12,8 @@ Definitions only. For recipes, follow the linked guides.
 | **PeerId** | Authenticated public-key identity of a peer. |
 | **Multiaddr** | Transport address without a peer identity (for example `/ip4/…/udp/…/quic-v1` or `/ip4/…/tcp/…`). |
 | **PeerAddr** | A `Multiaddr` plus a terminal `/p2p/<peer-id>`. A complete peer address, as a Connection target names one. |
-| **PeerReady** | Event after the first Identify exchange; supplies advertised protocols. `open_stream` is already allowed once connected. |
+| **PeerReady** | Event after a connection's first Identify exchange; supplies advertised protocols and names the connection (`conn_id`). Fires again after a Connection replacement. `open_stream` is already allowed once connected. |
+| **Connection replacement** | A newer connection taking a peer's single connection slot from an older one, reported as one `ConnectionReplaced { peer_id, old, new }`. The peer never counts as disconnected; the old connection's streams and readiness end with it. |
 | **Connection attempt** | One application-level effort to reach a peer, started by `connect`. It has one Connect ID and exactly one terminal (`ConnectSettled`): connected, failed, or cancelled. Only explicit cancellation stops it; abandoning a wait does not. |
 | **Connection target** | What `connect` takes: a `PeerId`, one complete `PeerAddr`, or a non-empty list of complete addresses that all name the same peer. |
 | **Transport dial** | One mechanism-level dial of one peer address. A Connection attempt may run several; raw dials outside an attempt live on the swarm. |

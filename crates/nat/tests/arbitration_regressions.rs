@@ -220,7 +220,6 @@ fn promoted_circuit_closed_before_fallback_fails_the_leg() {
         &SwarmEvent::ConnectionClosed {
             conn_id: conn,
             peer_id: h.target.clone(),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         true,
         at(400),
@@ -616,4 +615,160 @@ fn punch_conn_established_during_window_is_direct_punched() {
             ..
         }] if *connect_id == id
     ));
+}
+
+/// Hands the target's connection `old` over to the direct connection `new`.
+fn replace_target(h: &mut Harness, old: ConnectionId, new: ConnectionId, t: u64) {
+    h.agent.handle_event_with_disposition_classified(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: h.target.clone(),
+            old,
+            new,
+        },
+        new.is_circuit(),
+        at(t),
+    );
+}
+
+#[test]
+fn direct_replacement_of_the_provisional_circuit_upgrades_once() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, circuit) = drive_to_relayed(&mut h);
+
+    replace_target(&mut h, circuit, ConnectionId::new(50), 400);
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathUpgraded {
+            connect_id,
+            from: Path::Relayed { .. },
+            to: Path::DirectDialed,
+            ..
+        }] if *connect_id == id
+    ));
+    assert_eq!(h.agent.path(&h.target), Some(&Path::DirectDialed));
+}
+
+#[test]
+fn direct_replacement_after_the_attempt_ended_reports_against_its_origin() {
+    let mut h = Harness::with_relay(NatConfig {
+        force_relay: true,
+        ..NatConfig::default()
+    });
+    let id = h.start(RELAY_NOW, at(0));
+    let relay = dial_token_for(&drain_actions(&mut h.agent), &h.relay);
+    h.agent.dial_result(relay, Ok(ConnectionId::new(2)), at(5));
+    h.relay_session_ready(at(10));
+    let stream = StreamId::new(7);
+    let open = open_stream_token(&drain_actions(&mut h.agent));
+    h.agent.stream_open_result(open, Ok(stream), at(15));
+    h.stream_ready(stream, at(20));
+    drain_actions(&mut h.agent);
+    h.stream_data(stream, hop_status(Status::Ok), at(30));
+    let promotion = drain_actions(&mut h.agent);
+    let target = h.target.clone();
+    let circuit = complete_promotion(&mut h.agent, &target, &promotion, at(31));
+    drain_events(&mut h.agent);
+    assert!(h.agent.is_idle(), "a forced relay attempt ends at Relayed");
+
+    replace_target(&mut h, circuit, ConnectionId::new(50), 400);
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathUpgraded { connect_id, to: Path::DirectDialed, .. }] if *connect_id == id
+    ));
+    assert_eq!(h.agent.path(&h.target), Some(&Path::DirectDialed));
+}
+
+#[test]
+fn direct_replacement_during_dcutr_never_resets_the_retired_stream_by_peer() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (_, circuit) = drive_to_relayed(&mut h);
+    let dcutr = StreamId::new(3);
+    open_inbound_dcutr(&mut h, circuit, dcutr);
+    drain_actions(&mut h.agent);
+
+    replace_target(&mut h, circuit, ConnectionId::new(50), 400);
+    assert!(
+        !drain_actions(&mut h.agent).iter().any(|action| matches!(
+            action,
+            NatAction::ResetStream { stream_id, .. } if *stream_id == dcutr
+        )),
+        "the DCUtR stream ended with the circuit; a reset by peer could hit the new connection"
+    );
+    assert!(!h.agent.owns_stream(&h.target, dcutr));
+}
+
+#[test]
+fn circuit_replacing_the_promoted_circuit_keeps_the_attempt_alive() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, circuit) = drive_to_relayed(&mut h);
+    let other_circuit = ConnectionId::new(TEST_CIRCUIT_ID + 1);
+
+    replace_target(&mut h, circuit, other_circuit, 400);
+    assert!(
+        drain_events(&mut h.agent).is_empty(),
+        "a relay-to-relay hand-over neither fails nor settles the attempt"
+    );
+    assert!(
+        !h.agent.is_idle(),
+        "the attempt still owns the relayed path"
+    );
+
+    // A later direct connection still upgrades the attempt's path.
+    replace_target(&mut h, other_circuit, ConnectionId::new(50), 500);
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathUpgraded { connect_id, to: Path::DirectDialed, .. }] if *connect_id == id
+    ));
+}
+
+#[test]
+fn circuit_promoted_by_another_attempt_settles_the_displaced_one_as_relayed() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (first, circuit) = drive_to_relayed(&mut h);
+
+    // A second attempt to the same peer bridges and promotes its own circuit
+    // over the already-ready relay.
+    let second = h.start(RELAY_NOW, at(310));
+    let actions = drain_actions(&mut h.agent);
+    let stream = StreamId::new(8);
+    h.agent
+        .stream_open_result(open_stream_token(&actions), Ok(stream), at(311));
+    h.stream_ready(stream, at(312));
+    drain_actions(&mut h.agent);
+    h.stream_data(stream, hop_status(Status::Ok), at(313));
+    let promotion = drain_actions(&mut h.agent);
+    let other_circuit = ConnectionId::new(TEST_CIRCUIT_ID + 1);
+    h.agent
+        .promote_result(promote_token(&promotion), Ok(other_circuit), at(314));
+    replace_target(&mut h, circuit, other_circuit, 315);
+    drain_actions(&mut h.agent);
+    let events = drain_events(&mut h.agent);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            NatEvent::FellBackToRelay { connect_id, .. } if *connect_id == first
+        )),
+        "the displaced attempt ends on its relayed path: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, NatEvent::ConnectFailed { .. })),
+        "the peer stays connected, so no attempt fails: {events:?}"
+    );
+
+    h.agent.cancel(first, at(320));
+    assert!(
+        !drain_actions(&mut h.agent).iter().any(|action| matches!(
+            action,
+            NatAction::CloseCircuit { conn_id } if *conn_id == other_circuit
+        )),
+        "cancelling the first attempt must not close the second attempt's circuit"
+    );
+
+    h.agent.cancel(second, at(321));
+    assert!(drain_actions(&mut h.agent).iter().any(|action| matches!(
+        action,
+        NatAction::CloseCircuit { conn_id } if *conn_id == other_circuit
+    )));
 }

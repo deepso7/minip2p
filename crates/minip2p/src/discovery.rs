@@ -169,7 +169,10 @@ impl DiscoveryDriver {
     }
 
     /// Observes connection lifecycle for the book, whichever driver claimed
-    /// the event.
+    /// the event. A Connection replacement keeps the peer connected, so
+    /// only the peer-level transitions matter. Events trail the swarm's
+    /// state, so a close is a disconnect only if the peer has not already
+    /// reconnected.
     pub(crate) fn observe(&mut self, event: &SwarmEvent, core: &SwarmCore, now_ms: u64) {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {

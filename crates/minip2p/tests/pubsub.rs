@@ -243,7 +243,7 @@ fn invalid_gossipsub_config_fails_before_transport_bind() {
 
 #[cfg(feature = "nat")]
 #[test]
-fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
+fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
     use minip2p::{NatConfig, NatEvent, Path, ReservationPolicy};
 
     let relay = relay_support::RelayServer::spawn();
@@ -313,9 +313,9 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
         saw_message(&all[1], b"over relay")
     });
 
-    // A direct connection supersedes the ready circuit. The public sequence
-    // must close the old id before establishing the replacement, and the
-    // pubsub driver must re-open and re-announce subscriptions.
+    // A direct connection replaces the ready circuit. The public sequence is
+    // one ConnectionReplaced (never a close or a second establishment), and
+    // the pubsub driver must re-open and re-announce subscriptions.
     // A raw swarm dial forces the direct replacement; `connect` would
     // settle against the existing relayed connection.
     a.swarm_mut().dial(&b_addr).expect("manual direct upgrade");
@@ -326,7 +326,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
     while !a_resubscribed || !b_resubscribed {
         assert!(
             Instant::now() < upgrade_deadline,
-            "pubsub did not recover after supersede: {a_sequence:?}"
+            "pubsub did not recover after replacement: {a_sequence:?}"
         );
         if let Some(event) = a
             .next_event(Duration::from_millis(20))
@@ -336,10 +336,13 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
                 EndpointEvent::ConnectionClosed {
                     peer_id, conn_id, ..
                 } if peer_id == b_peer => {
-                    a_sequence.push(("closed", conn_id));
+                    a_sequence.push(("closed", conn_id, conn_id));
                 }
                 EndpointEvent::ConnectionEstablished { peer_id, conn_id } if peer_id == b_peer => {
-                    a_sequence.push(("established", conn_id));
+                    a_sequence.push(("established", conn_id, conn_id));
+                }
+                EndpointEvent::ConnectionReplaced { peer_id, old, new } if peer_id == b_peer => {
+                    a_sequence.push(("replaced", old, new));
                 }
                 EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed { topic, .. })
                     if topic == TOPIC =>
@@ -361,12 +364,14 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
     assert!(
         matches!(
             a_sequence.as_slice(),
-            [("closed", closed), ("established", direct), ..]
-                if *closed == circuit_id && direct.as_u64() & (1 << 63) == 0
+            [("replaced", old, direct)]
+                if *old == circuit_id && !direct.is_circuit()
         ),
-        "supersede ordering: {a_sequence:?}"
+        "replacement sequence: {a_sequence:?}"
     );
     assert!(a.swarm().transport().circuit_ids().is_empty());
+    assert_eq!(a.path(&b_peer), Some(Path::DirectDialed));
+
     a.publish(TOPIC, b"after upgrade")
         .expect("publish after upgrade");
     drive_until(&mut [&mut a, &mut b], Duration::from_secs(10), |all| {

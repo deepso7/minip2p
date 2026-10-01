@@ -82,6 +82,7 @@ export interface NativeEndpoint {
     | {
         readonly connId: bigint;
         readonly remoteAddr?: string | null;
+        readonly readyProtocols?: string[] | null;
       }
     | null
     | undefined;

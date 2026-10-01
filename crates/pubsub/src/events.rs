@@ -98,7 +98,7 @@ pub enum GossipsubEvent {
     },
     /// Outbound work that never reached an accepted stream write was
     /// discarded: per item for establishment failures/timeouts, or one
-    /// aggregate when a disconnect/supersede drops queued work. An accepted
+    /// aggregate when a disconnect or connection replacement drops queued work. An accepted
     /// write is committed; later delivery cannot be observed here.
     OutboundFailure {
         /// The peer the work was addressed to.

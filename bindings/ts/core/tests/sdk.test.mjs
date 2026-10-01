@@ -56,12 +56,13 @@ test("named and catch-all subscribers receive flattened events", async () => {
   endpoint.on((event) => all.push(event));
 
   backend.emit({
-    inner: { peerId: "peer", protocols: ["/test/1"] },
+    inner: { connId: 2, peerId: "peer", protocols: ["/test/1"] },
     tag: P2pEvent_Tags.PeerReady,
   });
   await tick();
 
   assert.deepEqual(named[0], {
+    connId: 2,
     peerId: "peer",
     protocols: ["/test/1"],
   });
@@ -81,11 +82,11 @@ test("events iteration yields endpoint events in order and ends on close", async
   })();
 
   backend.emit({
-    inner: { peerId: "first", protocols: ["/test/1"] },
+    inner: { connId: 2, peerId: "first", protocols: ["/test/1"] },
     tag: P2pEvent_Tags.PeerReady,
   });
   backend.emit({
-    inner: { peerId: "second", protocols: ["/test/2"] },
+    inner: { connId: 3, peerId: "second", protocols: ["/test/2"] },
     tag: P2pEvent_Tags.PeerReady,
   });
   await tick();
@@ -94,11 +95,13 @@ test("events iteration yields endpoint events in order and ends on close", async
   await reading;
   assert.deepEqual(events, [
     {
+      connId: 2,
       peerId: "first",
       protocols: ["/test/1"],
       type: "peerReady",
     },
     {
+      connId: 3,
       peerId: "second",
       protocols: ["/test/2"],
       type: "peerReady",
@@ -138,7 +141,7 @@ test("events iteration ends immediately for a pre-aborted signal", async () => {
 
 function peerReady(peerId) {
   return {
-    inner: { peerId, protocols: ["/test/1"] },
+    inner: { connId: 2, peerId, protocols: ["/test/1"] },
     tag: P2pEvent_Tags.PeerReady,
   };
 }
@@ -1418,32 +1421,121 @@ test("connection close rejects only opens on that connection", async () => {
   endpoint.close();
 });
 
-test("waitPeerReady ignores a superseded connection but rejects final disconnect", async () => {
+function peerReadyOn(connId) {
+  return {
+    inner: { connId, peerId: "peer", protocols: [`/conn/${connId}`] },
+    tag: P2pEvent_Tags.PeerReady,
+  };
+}
+
+test("waitPeerReady resolves only for the current connection's peerReady", async () => {
   const backend = new MockBackend();
-  backend.connected = ["peer"];
+  // Native state is ahead of the queued events: 1 was already replaced by 2.
+  backend.connections.set("peer", { connId: 2 });
   const endpoint = new TestMinip2p(backend);
   const ready = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
+
+  backend.emit(peerReadyOn(1));
+  backend.emit({
+    inner: { new: 2, old: 1, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectionReplaced,
+  });
+  assert.equal(await remainsPending(ready), true);
+
+  backend.emit(peerReadyOn(2));
+  assert.deepEqual(await ready, { peerId: "peer", protocols: ["/conn/2"] });
+  endpoint.close();
+});
+
+test("waitPeerReady ignores readiness of a connection queued before the snapshot", async () => {
+  const backend = new MockBackend();
+  backend.connections.set("peer", { connId: 2 });
+  const endpoint = new TestMinip2p(backend);
+  const ready = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
+
+  // Events for connection 1 were still queued when the wait snapshotted 2.
+  backend.emit({
+    inner: { connId: 1, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectionEstablished,
+  });
+  backend.emit(peerReadyOn(1));
+  assert.equal(await remainsPending(ready), true);
+  endpoint.close();
+});
+
+test("waitPeerReady follows a connection established after the call", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const ready = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
+
+  backend.connections.set("peer", { connId: 2 });
+  backend.emit({
+    inner: { connId: 2, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectionEstablished,
+  });
+  backend.emit(peerReadyOn(2));
+  assert.deepEqual(await ready, { peerId: "peer", protocols: ["/conn/2"] });
+  endpoint.close();
+});
+
+test("waitPeerReady reads readiness from one connectionInfo snapshot", async () => {
+  const backend = new MockBackend();
+  backend.connections.set("peer", { connId: 2, readyProtocols: ["/a/1"] });
+  const endpoint = new TestMinip2p(backend);
+
+  assert.deepEqual(await endpoint.waitPeerReady("peer"), {
+    peerId: "peer",
+    protocols: ["/a/1"],
+  });
+  endpoint.close();
+});
+
+test("waitPeerReady rejects only once the peer is disconnected", async () => {
+  const backend = new MockBackend();
+  backend.connected = ["peer"];
+  backend.connections.set("peer", { connId: 2 });
+  const endpoint = new TestMinip2p(backend);
+  const disconnected = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
+
+  // A stale close from before the peer reconnected.
   backend.emit({
     inner: { connId: 1, peerId: "peer" },
     tag: P2pEvent_Tags.ConnectionClosed,
   });
-  assert.equal(await remainsPending(ready), true);
-  backend.emit({
-    inner: { peerId: "peer", protocols: ["/test/1"] },
-    tag: P2pEvent_Tags.PeerReady,
-  });
-  assert.deepEqual(await ready, {
-    peerId: "peer",
-    protocols: ["/test/1"],
-  });
-
-  const disconnected = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
+  assert.equal(await remainsPending(disconnected), true);
   backend.connected = [];
   backend.emit({
     inner: { connId: 2, peerId: "peer" },
     tag: P2pEvent_Tags.ConnectionClosed,
   });
   await assert.rejects(disconnected, PeerDisconnectedError);
+  endpoint.close();
+});
+
+test("connection replacement ends only the old connection's streams and opens", async () => {
+  const backend = new MockBackend();
+  backend.connected = ["peer"];
+  backend.openResults.push(
+    { connId: 2, streamId: 7 },
+    { connId: 2, streamId: 8 },
+    { connId: 3, streamId: 9 }
+  );
+  const endpoint = new TestMinip2p(backend);
+  const opened = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 7 }));
+  const stream = await opened;
+  const reading = stream.read();
+  const pending = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  const live = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+
+  backend.emit({
+    inner: { new: 3, old: 2, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectionReplaced,
+  });
+
+  await assert.rejects(reading, StreamClosedError);
+  await assert.rejects(pending, StreamClosedError);
+  assert.equal(await remainsPending(live), true);
   endpoint.close();
 });
 

@@ -348,6 +348,13 @@ impl InboundCircuit {
         if is_circuit {
             if self.promoted == Some(conn_id) {
                 self.handshake_deadline = None;
+                shared.record_origin(
+                    conn_id,
+                    crate::Path::Relayed {
+                        relay: self.relay.clone(),
+                    },
+                    None,
+                );
                 let directly_connected = shared.is_directly_connected(peer);
                 if !self.path_announced && !directly_connected {
                     self.path_announced = true;
@@ -382,6 +389,11 @@ impl InboundCircuit {
         }
         self.blast = None;
         self.linger_until = None;
+        // An attempt that dialed this connection already recorded where it
+        // came from; only an otherwise unexplained one is the punch.
+        if !shared.origins.contains_key(&conn_id) {
+            shared.record_origin(conn_id, crate::Path::DirectPunched, None);
+        }
         shared.push_event(NatEvent::InboundDirectUpgrade { peer: peer.clone() });
         if self.released {
             self.done = true;
@@ -584,14 +596,9 @@ impl InboundCircuit {
         let Some(stream_id) = self.dcutr_stream.take() else {
             return;
         };
-        let Some(peer) = self.source.as_ref() else {
-            return;
-        };
-        shared.push_action(NatAction::ResetStream {
-            peer: peer.clone(),
-            stream_id,
-        });
-        shared.release_stream(peer, stream_id);
+        if let Some(peer) = self.source.as_ref() {
+            shared.reset_owned_stream(peer, stream_id);
+        }
     }
 }
 

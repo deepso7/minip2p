@@ -7,7 +7,7 @@ describe("MockBackend", () => {
   test("injects events only after a listener starts", () => {
     const backend = new MockBackend();
     const event = {
-      inner: { peerId: "peer", protocols: ["/test/1"] },
+      inner: { connId: 2, peerId: "peer", protocols: ["/test/1"] },
       tag: P2pEvent_Tags.PeerReady,
     };
 

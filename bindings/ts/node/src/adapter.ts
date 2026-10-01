@@ -10,7 +10,11 @@ import type {
   Reachability,
   RelayReservationInfo,
 } from "@minip2p/core";
-import { resolveEndpointConfig, typedFfiError } from "@minip2p/core/backend";
+import {
+  P2pEvent_Tags,
+  resolveEndpointConfig,
+  typedFfiError,
+} from "@minip2p/core/backend";
 import type {
   BackendConnectTarget,
   BackendOpenStream,
@@ -26,7 +30,7 @@ class NodeBackend implements Minip2pBackend {
   readonly #connectionIds = new IdMap();
   readonly #endpoint: NativeEndpoint;
   readonly #events: EventDrain;
-  readonly #streamIds = new IdMap();
+  readonly #streamIds = new StreamIdMap();
 
   constructor(config: Minip2pConfig) {
     this.#endpoint = translateErrors(
@@ -117,10 +121,15 @@ class NodeBackend implements Minip2pBackend {
     if (info === null || info === undefined) {
       return undefined;
     }
-    const connId = this.#connectionIds.toPublic(info.connId);
-    return typeof info.remoteAddr === "string"
-      ? { connId, remoteAddr: info.remoteAddr }
-      : { connId };
+    return {
+      connId: this.#connectionIds.toPublic(info.connId),
+      ...(typeof info.remoteAddr === "string" && {
+        remoteAddr: info.remoteAddr,
+      }),
+      ...(Array.isArray(info.readyProtocols) && {
+        readyProtocols: info.readyProtocols,
+      }),
+    };
   }
 
   circuitAddress(relayAddress: string, peerId: string): string {
@@ -165,9 +174,10 @@ class NodeBackend implements Minip2pBackend {
     const stream = translateErrors(() =>
       this.#endpoint.openStream(peerId, protocolId)
     );
+    const connId = this.#connectionIds.toPublic(stream.connId);
     return {
-      connId: this.#connectionIds.toPublic(stream.connId),
-      streamId: this.#streamIds.toPublic(stream.streamId),
+      connId,
+      streamId: this.#streamIds.toPublic(connId, stream.streamId),
     };
   }
 
@@ -326,26 +336,29 @@ function normalizeIdentifyInfo(value: unknown): IdentifyInfo {
   );
 }
 
+/** Event fields carrying a native connection ID (`old`/`new` belong to `ConnectionReplaced`). */
+const CONNECTION_ID_KEYS: ReadonlySet<string> = new Set([
+  "connId",
+  "old",
+  "new",
+]);
+
 function normalizeNativeValue(
   value: unknown,
   key?: string,
   maps?: NativeIdMaps
 ): unknown {
-  if (typeof value === "number" && maps !== undefined) {
-    if (key === "connId") {
+  const isId = typeof value === "bigint" || typeof value === "number";
+  if (isId && maps !== undefined && key !== undefined) {
+    if (CONNECTION_ID_KEYS.has(key)) {
       return maps.connectionIds.toPublic(BigInt(value));
     }
     if (key === "streamId") {
-      return maps.streamIds.toPublic(BigInt(value));
+      // Mapped with its connection once the whole record is normalized.
+      return value;
     }
   }
   if (typeof value === "bigint") {
-    if (key === "connId" && maps !== undefined) {
-      return maps.connectionIds.toPublic(value);
-    }
-    if (key === "streamId" && maps !== undefined) {
-      return maps.streamIds.toPublic(value);
-    }
     return bigintToNumber(value, "native value");
   }
   if (Array.isArray(value)) {
@@ -355,7 +368,7 @@ function normalizeNativeValue(
     return value;
   }
   if (value !== null && typeof value === "object") {
-    return Object.fromEntries(
+    const record: Record<string, unknown> = Object.fromEntries(
       Object.entries(value)
         .filter(([, item]) => item !== null)
         .map(([itemKey, item]) => [
@@ -363,6 +376,23 @@ function normalizeNativeValue(
           normalizeNativeValue(item, itemKey, maps),
         ])
     );
+    const { connId, streamId } = record;
+    if (maps !== undefined && streamId !== undefined) {
+      if (
+        (typeof streamId !== "bigint" && typeof streamId !== "number") ||
+        (connId !== undefined && typeof connId !== "number")
+      ) {
+        throw new TypeError("The native addon returned an invalid stream ID");
+      }
+      // Public stream IDs are allocated per connection. A record without a
+      // connection (an endpoint error, say) cannot name a public stream.
+      if (typeof connId === "number") {
+        record.streamId = maps.streamIds.toPublic(connId, BigInt(streamId));
+      } else {
+        delete record.streamId;
+      }
+    }
+    return record;
   }
   return value;
 }
@@ -370,7 +400,7 @@ function normalizeNativeValue(
 function normalizeEvent(
   value: unknown,
   connectionIds: IdMap,
-  streamIds: IdMap
+  streamIds: StreamIdMap
 ): P2pEvent {
   const event = normalizeNativeValue(value, undefined, {
     connectionIds,
@@ -386,45 +416,59 @@ function normalizeEvent(
   ) {
     event.inner = normalizeEventBytes(event.tag, event.inner);
   }
-  retireTerminalIds(event, connectionIds, streamIds);
-  return event as P2pEvent;
+  const normalized = event as P2pEvent;
+  retireTerminalIds(normalized, connectionIds, streamIds);
+  return normalized;
 }
 
+/**
+ * Stops new native events from reaching identifiers this event ends, so a
+ * reused native ID gets a fresh public number. The public numbers stay
+ * resolvable until {@link releaseTerminalIds} runs after dispatch.
+ */
 function retireTerminalIds(
-  event: { readonly tag?: unknown; readonly inner?: unknown },
+  event: P2pEvent,
   connectionIds: IdMap,
-  streamIds: IdMap
+  streamIds: StreamIdMap
 ): void {
-  visitTerminalIds(event, connectionIds, streamIds, (map, id) => {
-    map.retirePublic(id);
-  });
+  const connId = endedConnection(event);
+  if (connId !== undefined) {
+    connectionIds.retirePublic(connId);
+    streamIds.retireConnection(connId);
+  }
+  if (event.tag === P2pEvent_Tags.StreamClosed) {
+    streamIds.retirePublic(event.inner.streamId);
+  }
 }
 
+/** Frees identifiers this event ended, once the SDK has dispatched it. */
 function releaseTerminalIds(
-  event: { readonly tag?: unknown; readonly inner?: unknown },
+  event: P2pEvent,
   connectionIds: IdMap,
-  streamIds: IdMap
+  streamIds: StreamIdMap
 ): void {
-  visitTerminalIds(event, connectionIds, streamIds, (map, id) => {
-    map.deletePublic(id);
-  });
+  const connId = endedConnection(event);
+  if (connId !== undefined) {
+    connectionIds.deletePublic(connId);
+    streamIds.deleteConnection(connId);
+  }
+  if (event.tag === P2pEvent_Tags.StreamClosed) {
+    streamIds.deletePublic(event.inner.streamId);
+  }
 }
 
-function visitTerminalIds(
-  event: { readonly tag?: unknown; readonly inner?: unknown },
-  connectionIds: IdMap,
-  streamIds: IdMap,
-  visit: (map: IdMap, value: unknown) => void
-): void {
-  if (event.inner === null || typeof event.inner !== "object") {
-    return;
+/**
+ * The connection this event ends. A closed or replaced connection reports no
+ * per-stream terminal events, so its streams end with it.
+ */
+function endedConnection(event: P2pEvent): number | undefined {
+  if (event.tag === P2pEvent_Tags.ConnectionClosed) {
+    return event.inner.connId;
   }
-  if (event.tag === "ConnectionClosed") {
-    visit(connectionIds, Reflect.get(event.inner, "connId"));
+  if (event.tag === P2pEvent_Tags.ConnectionReplaced) {
+    return event.inner.old;
   }
-  if (event.tag === "StreamClosed") {
-    visit(streamIds, Reflect.get(event.inner, "streamId"));
-  }
+  return undefined;
 }
 
 function normalizeEventBytes(tag: string, value: unknown): unknown {
@@ -540,7 +584,7 @@ class EventDrain {
 
 interface NativeIdMaps {
   readonly connectionIds: IdMap;
-  readonly streamIds: IdMap;
+  readonly streamIds: StreamIdMap;
 }
 
 class IdMap {
@@ -568,26 +612,83 @@ class IdMap {
     return native;
   }
 
-  deletePublic(value: unknown): void {
-    if (typeof value !== "number") {
-      return;
+  deletePublic(publicId: number): void {
+    this.retirePublic(publicId);
+    this.#nativeByPublic.delete(publicId);
+  }
+
+  retirePublic(publicId: number): void {
+    const native = this.#nativeByPublic.get(publicId);
+    if (native !== undefined && this.#publicByNative.get(native) === publicId) {
+      this.#publicByNative.delete(native);
     }
-    const native = this.#nativeByPublic.get(value);
-    if (native !== undefined) {
-      this.#nativeByPublic.delete(value);
-      if (this.#publicByNative.get(native) === value) {
-        this.#publicByNative.delete(native);
-      }
+  }
+}
+
+/**
+ * Maps native stream IDs, which are unique only within their connection, to
+ * public numbers that never repeat. Each stream remembers its public
+ * connection, so a closed or replaced connection frees every stream on it.
+ */
+class StreamIdMap {
+  readonly #publicByKey = new Map<string, number>();
+  readonly #streams = new Map<
+    number,
+    { readonly connId: number; readonly key: string; readonly native: bigint }
+  >();
+  #next = 1;
+
+  toPublic(connId: number, native: bigint): number {
+    const key = `${connId}:${native}`;
+    const existing = this.#publicByKey.get(key);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const publicId = this.#next;
+    this.#next += 1;
+    this.#publicByKey.set(key, publicId);
+    this.#streams.set(publicId, { connId, key, native });
+    return publicId;
+  }
+
+  toNative(publicId: number): bigint {
+    const stream = this.#streams.get(publicId);
+    if (stream === undefined) {
+      throw new RangeError(`Unknown native identifier ${publicId}`);
+    }
+    return stream.native;
+  }
+
+  deletePublic(publicId: number): void {
+    this.retirePublic(publicId);
+    this.#streams.delete(publicId);
+  }
+
+  retirePublic(publicId: number): void {
+    const stream = this.#streams.get(publicId);
+    if (
+      stream !== undefined &&
+      this.#publicByKey.get(stream.key) === publicId
+    ) {
+      this.#publicByKey.delete(stream.key);
     }
   }
 
-  retirePublic(value: unknown): void {
-    if (typeof value !== "number") {
-      return;
+  deleteConnection(connId: number): void {
+    for (const publicId of this.#onConnection(connId)) {
+      this.deletePublic(publicId);
     }
-    const native = this.#nativeByPublic.get(value);
-    if (native !== undefined && this.#publicByNative.get(native) === value) {
-      this.#publicByNative.delete(native);
+  }
+
+  retireConnection(connId: number): void {
+    for (const publicId of this.#onConnection(connId)) {
+      this.retirePublic(publicId);
     }
+  }
+
+  #onConnection(connId: number): number[] {
+    return [...this.#streams]
+      .filter(([, stream]) => stream.connId === connId)
+      .map(([publicId]) => publicId);
   }
 }

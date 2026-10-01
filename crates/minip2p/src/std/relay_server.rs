@@ -56,7 +56,10 @@ impl RelayServerDriver {
 
     pub(crate) fn ingest(&mut self, event: &SwarmEvent, swarm: &mut EndpointSwarm) -> bool {
         let now = self.now();
-        if let SwarmEvent::ConnectionClosed { conn_id, .. } = event {
+        // A closed or replaced connection takes its in-flight negotiations with it.
+        if let SwarmEvent::ConnectionClosed { conn_id, .. }
+        | SwarmEvent::ConnectionReplaced { old: conn_id, .. } = event
+        {
             for token in take_pending_for_connection(&mut self.pending_opens, *conn_id) {
                 self.agent.stream_open_result(
                     token,
@@ -102,12 +105,15 @@ impl RelayServerDriver {
             | SwarmEvent::StreamRemoteWriteClosed { conn_id, .. }
             | SwarmEvent::StreamWriteStopped { conn_id, .. }
             | SwarmEvent::StreamClosed { conn_id, .. } => conn_id.is_circuit(),
+            // The agent's flag describes the connection taking the slot.
+            SwarmEvent::ConnectionReplaced { new, .. } => new.is_circuit(),
             _ => false,
         };
         // The first event at this time sample runs the agent tick before
         // dispatch, preserving deadline-first ordering for the batch.
         let claimed = self.agent.handle_event(event, is_circuit, now);
-        if let SwarmEvent::ConnectionEstablished { conn_id, .. } = event
+        if let SwarmEvent::ConnectionEstablished { conn_id, .. }
+        | SwarmEvent::ConnectionReplaced { new: conn_id, .. } = event
             && let Some(address) = swarm.connection_remote_addr(*conn_id).cloned()
         {
             self.agent.set_connection_addr(*conn_id, address);
@@ -177,9 +183,13 @@ impl RelayServerDriver {
                 stream,
                 data,
             } => {
-                let result = swarm
-                    .send_stream(&peer_id, stream.stream_id, data)
-                    .map_err(|error| error.to_string());
+                let result = if stream_connection_gone(swarm, stream) {
+                    Err(String::from("the stream's connection is gone"))
+                } else {
+                    swarm
+                        .send_stream(&peer_id, stream.stream_id, data)
+                        .map_err(|error| error.to_string())
+                };
                 self.agent.send_stream_result(token, result, now);
             }
             RelayServerAction::CloseStreamWrite {
@@ -187,9 +197,13 @@ impl RelayServerDriver {
                 peer_id,
                 stream,
             } => {
-                let result = swarm
-                    .close_stream_write(&peer_id, stream.stream_id)
-                    .map_err(|error| error.to_string());
+                let result = if stream_connection_gone(swarm, stream) {
+                    Err(String::from("the stream's connection is gone"))
+                } else {
+                    swarm
+                        .close_stream_write(&peer_id, stream.stream_id)
+                        .map_err(|error| error.to_string())
+                };
                 self.agent.close_stream_write_result(token, result, now);
             }
             RelayServerAction::ResetStream {
@@ -197,13 +211,25 @@ impl RelayServerDriver {
                 peer_id,
                 stream,
             } => {
-                let result = swarm
-                    .reset_stream(&peer_id, stream.stream_id)
-                    .map_err(|error| error.to_string());
+                // A stream whose connection is gone is already reset.
+                let result = if stream_connection_gone(swarm, stream) {
+                    Ok(())
+                } else {
+                    swarm
+                        .reset_stream(&peer_id, stream.stream_id)
+                        .map_err(|error| error.to_string())
+                };
                 self.agent.reset_stream_result(token, result, now);
             }
         }
     }
+}
+
+/// Whether `stream`'s exact connection is gone (closed or replaced). Swarm
+/// stream calls are peer-scoped, so acting on such a stream could hit a
+/// stream of the peer's new connection that reuses its id.
+fn stream_connection_gone(swarm: &EndpointSwarm, stream: StreamKey) -> bool {
+    swarm.connection_remote_addr(stream.conn_id).is_none()
 }
 
 #[cfg(test)]

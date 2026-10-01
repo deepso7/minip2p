@@ -619,70 +619,13 @@ impl ConnectEngine {
                 true
             }
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
-                // Abort Ok(false) tombstones may never see DialFailed once the
-                // candidate has established — drop the stale id here.
-                self.suppressed.remove(conn_id);
-                // Every in-flight attempt for this peer succeeds together: the
-                // swarm keeps one connection per peer, so a later attempt's
-                // dial (or an inbound) is success for the earlier ones too.
-                let ids: Vec<ConnectId> = self
-                    .attempts
-                    .iter()
-                    .filter(|(_, attempt)| &attempt.peer == peer_id)
-                    .map(|(id, _)| *id)
-                    .collect();
-                let circuit = conn_id.is_circuit();
-                for id in ids {
-                    let Some(mut attempt) = self.attempts.remove(&id) else {
-                        continue;
-                    };
-                    if !circuit {
-                        self.abort_pending(
-                            runtime,
-                            attempt
-                                .direct
-                                .keys()
-                                .copied()
-                                .filter(|pending| pending != conn_id),
-                        );
-                        self.push_settled(
-                            id,
-                            attempt.peer,
-                            ConnectOutcome::Connected { conn_id: *conn_id },
-                        );
-                        continue;
-                    }
-                    match attempt.relay {
-                        RelayLeg::None | RelayLeg::Failed(_) => {
-                            self.abort_pending(runtime, attempt.direct.keys().copied());
-                            self.push_settled(
-                                id,
-                                attempt.peer,
-                                ConnectOutcome::Connected { conn_id: *conn_id },
-                            );
-                        }
-                        RelayLeg::Pending { forced, relay } => {
-                            if forced {
-                                self.abort_pending(runtime, attempt.direct.keys().copied());
-                                self.push_settled(
-                                    id,
-                                    attempt.peer,
-                                    ConnectOutcome::Connected { conn_id: *conn_id },
-                                );
-                            } else {
-                                attempt.relay = RelayLeg::Provisional {
-                                    conn_id: *conn_id,
-                                    forced,
-                                    relay,
-                                };
-                                self.attempts.insert(id, attempt);
-                            }
-                        }
-                        RelayLeg::Provisional { .. } => {
-                            self.attempts.insert(id, attempt);
-                        }
-                    }
-                }
+                self.peer_connected(peer_id, *conn_id, runtime);
+                false
+            }
+            SwarmEvent::ConnectionReplaced { peer_id, new, .. } => {
+                // `new` satisfies every pending attempt for the peer exactly
+                // as a first establishment would, whichever side made it.
+                self.peer_connected(peer_id, *new, runtime);
                 false
             }
             SwarmEvent::ConnectionClosed { conn_id, .. } => {
@@ -708,6 +651,62 @@ impl ConnectEngine {
                 false
             }
             _ => false,
+        }
+    }
+
+    /// `conn_id` is now the peer's connection. Every in-flight attempt for
+    /// the peer succeeds together: the swarm keeps one connection per peer,
+    /// so a later attempt's dial (or an inbound) is success for the earlier
+    /// ones too. A circuit is only provisional while a direct leg can still
+    /// win; it becomes the attempt's provisional path, replacing an older
+    /// provisional circuit.
+    fn peer_connected<T: Transport, E: EntropySource>(
+        &mut self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        runtime: &mut SwarmRuntime<T, E>,
+    ) {
+        // Abort Ok(false) tombstones may never see DialFailed once the
+        // candidate has established — drop the stale id here.
+        self.suppressed.remove(&conn_id);
+        let ids: Vec<ConnectId> = self
+            .attempts
+            .iter()
+            .filter(|(_, attempt)| &attempt.peer == peer_id)
+            .map(|(id, _)| *id)
+            .collect();
+        let circuit = conn_id.is_circuit();
+        for id in ids {
+            let Some(mut attempt) = self.attempts.remove(&id) else {
+                continue;
+            };
+            let settle = match attempt.relay {
+                _ if !circuit => true,
+                RelayLeg::None | RelayLeg::Failed(_) => true,
+                RelayLeg::Pending { forced, .. } | RelayLeg::Provisional { forced, .. } => forced,
+            };
+            if settle {
+                self.abort_pending(
+                    runtime,
+                    attempt
+                        .direct
+                        .keys()
+                        .copied()
+                        .filter(|pending| *pending != conn_id),
+                );
+                self.push_settled(id, attempt.peer, ConnectOutcome::Connected { conn_id });
+                continue;
+            }
+            if let RelayLeg::Pending { forced, relay }
+            | RelayLeg::Provisional { forced, relay, .. } = attempt.relay
+            {
+                attempt.relay = RelayLeg::Provisional {
+                    conn_id,
+                    forced,
+                    relay,
+                };
+            }
+            self.attempts.insert(id, attempt);
         }
     }
 
@@ -1615,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_abort_establish_does_not_supersede_existing_connection() {
+    fn failed_abort_establish_does_not_replace_existing_connection() {
         let peer = peer(b"keep-alive");
         let existing_addr = addr(&peer, 4000);
         let target = addr(&peer, 4001);
@@ -1676,13 +1675,9 @@ mod tests {
         assert!(
             events.iter().all(|event| !matches!(
                 event,
-                EndpointEvent::ConnectionClosed {
-                    conn_id,
-                    cause: minip2p_swarm::ConnectionCloseCause::Superseded,
-                    ..
-                } if *conn_id == existing
+                EndpointEvent::ConnectionReplaced { old, .. } if *old == existing
             )),
-            "existing connection must not be superseded; got {events:?}"
+            "existing connection must not be replaced; got {events:?}"
         );
         assert_eq!(
             runtime.connection_id(&peer),
@@ -1926,11 +1921,53 @@ mod tests {
             .transport_mut()
             .push_connected(ConnectionId::new(1), peer.clone(), target);
         let events = drain(&mut engine, &mut runtime, 0);
+        // The direct connection replaces the provisional circuit: one
+        // hand-over, never a disconnect, and exactly one terminal.
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EndpointEvent::ConnectionReplaced { old, new, .. }
+                    if *old == circuit_conn && *new == ConnectionId::new(1)
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EndpointEvent::ConnectionClosed { .. })),
+            "{events:?}"
+        );
         assert!(matches!(
             settled_for(&events, id),
             Some(ConnectOutcome::Connected { conn_id }) if *conn_id == ConnectionId::new(1)
         ));
         assert!(settled_for(&drain(&mut engine, &mut runtime, 1), id).is_none());
+    }
+
+    #[test]
+    fn provisional_circuit_replaced_by_another_circuit_settles_on_the_new_one() {
+        let peer = peer(b"relay-swap");
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(1_000);
+        let id = admit(
+            &mut engine,
+            peer.clone(),
+            Vec::new(),
+            RelayPolicy::Race,
+            &mut runtime,
+            0,
+        );
+        for conn in [circuit(3), circuit(4)] {
+            runtime
+                .transport_mut()
+                .push_connected(conn, peer.clone(), addr(&peer, 9));
+            assert!(settled_for(&drain(&mut engine, &mut runtime, 0), id).is_none());
+        }
+        let events = drain(&mut engine, &mut runtime, 1_000);
+        assert!(matches!(
+            settled_for(&events, id),
+            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == circuit(4)
+        ));
     }
 
     #[cfg(feature = "nat")]

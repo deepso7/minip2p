@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use minip2p::{Ed25519Keypair, Endpoint, EndpointEvent, PeerId};
+use minip2p::{ConnectionId, Ed25519Keypair, Endpoint, EndpointEvent, PeerId};
 
 #[path = "../../../tests/support/endpoint.rs"]
 mod endpoint_support;
@@ -185,7 +185,7 @@ fn close_drains_replacement_connection() {
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
 
     // Queue a same-peer handshake without polling the listener, so close()
-    // is the first drive that can supersede and establish the replacement.
+    // is the first drive that can establish the replacement.
     let mut replacement = Endpoint::builder()
         .identity(dialer_key)
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
@@ -221,20 +221,10 @@ fn close_drains_replacement_connection() {
     }
     let _replacement = remote.join().expect("replacement driver thread");
 
-    let established: Vec<_> = events
-        .iter()
-        .filter_map(|event| match event {
-            EndpointEvent::ConnectionEstablished { peer_id, conn_id }
-                if peer_id == &dialer_peer =>
-            {
-                Some(*conn_id)
-            }
-            _ => None,
-        })
-        .collect();
+    let established = replacement_connections(&events, &dialer_peer);
     assert!(
         !established.is_empty(),
-        "close must observe the replacement ConnectionEstablished: {events:?}"
+        "close must observe the replacement ConnectionReplaced: {events:?}"
     );
     for conn_id in established {
         assert!(
@@ -280,7 +270,7 @@ fn close_drains_pending_replacement_handshake() {
             .expect("send replacement initial");
     }
     // Accept the Initial without waiting for Connected; close() must keep
-    // polling after the superseded peer leaves connected_peers.
+    // polling until the replacement connection is gone.
     let _ = listener
         .next_event(Duration::from_millis(10))
         .expect("accept replacement initial");
@@ -305,20 +295,10 @@ fn close_drains_pending_replacement_handshake() {
     }
     let _replacement = remote.join().expect("replacement driver thread");
 
-    let established: Vec<_> = events
-        .iter()
-        .filter_map(|event| match event {
-            EndpointEvent::ConnectionEstablished { peer_id, conn_id }
-                if peer_id == &dialer_peer =>
-            {
-                Some(*conn_id)
-            }
-            _ => None,
-        })
-        .collect();
+    let established = replacement_connections(&events, &dialer_peer);
     assert!(
         !established.is_empty(),
-        "close must observe the pending replacement ConnectionEstablished: {events:?}"
+        "close must observe the pending replacement ConnectionReplaced: {events:?}"
     );
     for conn_id in established {
         assert!(
@@ -330,4 +310,15 @@ fn close_drains_pending_replacement_handshake() {
             "close must drain the pending replacement {conn_id:?}: {events:?}"
         );
     }
+}
+
+/// Connections that took `peer`'s slot over from an earlier one.
+fn replacement_connections(events: &[EndpointEvent], peer: &PeerId) -> Vec<ConnectionId> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EndpointEvent::ConnectionReplaced { peer_id, new, .. } if peer_id == peer => Some(*new),
+            _ => None,
+        })
+        .collect()
 }

@@ -47,7 +47,9 @@ Use `Multiaddr` when choosing where to listen. Use `PeerAddr` when connecting to
 
 ## Connection readiness
 
-`ConnectionEstablished` means the transport finished connecting and authenticated the peer. `PeerReady` comes later, after the first Identify exchange has supplied the peer's supported protocols and advertised addresses.
+`ConnectionEstablished` means the peer went from disconnected to connected: the transport finished connecting and authenticated it. `PeerReady` comes later, after the connection's first Identify exchange has supplied the peer's supported protocols and advertised addresses.
+
+An endpoint keeps one connection per peer. When a newer connection takes over (a punched direct path replacing a relay circuit, or a late duplicate dial), the endpoint reports one `ConnectionReplaced { peer_id, old, new }` instead of a close and a second establishment; the peer stays connected throughout. Streams on `old` end with it without their own close events. Readiness belongs to a connection, so `PeerReady { conn_id, .. }` fires again for `new`; a `PeerReady` whose `conn_id` is not the peer's current connection is stale. `ConnectionClosed` means the peer's last connection closed.
 
 `open_stream` is allowed once the peer is connected. The remote-protocol advertisement check applies only after `PeerReady`; before that, negotiation proceeds without an early `RemoteDoesNotSupport` reject. Waiting for Identify is application policy when you want the advertised protocol list first, not a stack requirement for opening a known protocol.
 

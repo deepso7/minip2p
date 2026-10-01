@@ -611,15 +611,17 @@ impl GossipsubAgent {
     pub fn handle_event(&mut self, event: &SwarmEvent, now_ms: u64) -> bool {
         self.arm_heartbeat(now_ms);
         match event {
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                self.on_connection_established(peer_id);
+            SwarmEvent::ConnectionReplaced { peer_id, .. } => {
+                self.on_connection_replaced(peer_id);
                 false
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 self.remove_peer(peer_id, "connection closed");
                 false
             }
-            SwarmEvent::PeerReady { peer_id, protocols } => {
+            SwarmEvent::PeerReady {
+                peer_id, protocols, ..
+            } => {
                 let version = if protocols.iter().any(|p| p == MESHSUB_PROTOCOL_ID_V11) {
                     Some(MeshsubVersion::V11)
                 } else if protocols.iter().any(|p| p == MESHSUB_PROTOCOL_ID_V10) {
@@ -847,11 +849,26 @@ impl GossipsubAgent {
         }
     }
 
-    fn on_connection_established(&mut self, peer: &PeerId) {
+    /// Hands a known peer over to its replacement connection: every stream,
+    /// queued item, and the advertised version belonged to the old
+    /// connection, so they are dropped (with the usual aggregated failure)
+    /// while the peer stays known and backoff survives. Sends stay paused
+    /// until `PeerReady` for the new connection picks the version again; the
+    /// next outbound stream then re-announces subscriptions.
+    ///
+    /// Undrained actions for the peer go too: they target the old
+    /// connection's streams (by peer-scoped id) or open with its version.
+    fn on_connection_replaced(&mut self, peer: &PeerId) {
         if self.peers.contains_key(peer) {
-            self.remove_peer(peer, "connection superseded");
+            self.remove_peer(peer, "connection replaced");
             self.peers.insert(peer.clone(), PeerState::default());
         }
+        self.actions.retain(|action| match action {
+            GossipsubAction::OpenStream { peer: p, .. }
+            | GossipsubAction::SendStream { peer: p, .. }
+            | GossipsubAction::CloseStreamWrite { peer: p, .. }
+            | GossipsubAction::ResetStream { peer: p, .. } => p != peer,
+        });
     }
 
     fn remove_peer(&mut self, peer: &PeerId, cause: &str) {

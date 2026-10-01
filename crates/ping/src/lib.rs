@@ -269,6 +269,17 @@ impl PingProtocol {
             .and_then(|peer| peer.outbound_stream)
     }
 
+    /// Returns the payload of the ping in flight to `peer_id`, if any.
+    ///
+    /// A host that hands the peer over to a new connection reads this before
+    /// removing the peer, so it can re-send the same ping there.
+    pub fn in_flight_payload(&self, peer_id: &PeerId) -> Option<[u8; PING_PAYLOAD_LEN]> {
+        self.peers
+            .get(peer_id)
+            .and_then(|peer| peer.pending_ping.as_ref())
+            .map(|pending| pending.payload)
+    }
+
     /// Registers a negotiated inbound stream from a peer.
     fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) -> Vec<PingAction> {
         let peer = self.peers.entry(peer_id.clone()).or_default();

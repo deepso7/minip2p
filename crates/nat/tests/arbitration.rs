@@ -397,7 +397,7 @@ fn write_stop_resets_only_nat_owned_streams() {
 }
 
 #[test]
-fn relay_supersede_does_not_abort_waiting_for_peer_ready() {
+fn relay_replacement_does_not_abort_waiting_for_peer_ready() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.start(RELAY_NOW, at(0));
     drain_actions(&mut h.agent); // relay dial
@@ -410,25 +410,19 @@ fn relay_supersede_does_not_abort_waiting_for_peer_ready() {
         at(10),
     );
     h.agent.handle_event(
-        &SwarmEvent::ConnectionClosed {
-            conn_id: ConnectionId::new(1),
+        &SwarmEvent::ConnectionReplaced {
             peer_id: h.relay.clone(),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
+            old: ConnectionId::new(1),
+            new: ConnectionId::new(2),
         },
         at(11),
-    );
-    h.agent.handle_event(
-        &SwarmEvent::ConnectionEstablished {
-            conn_id: ConnectionId::new(2),
-            peer_id: h.relay.clone(),
-        },
-        at(12),
     );
     assert!(drain_events(&mut h.agent).is_empty());
 
     h.agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: h.relay.clone(),
+            conn_id: ConnectionId::new(2),
             protocols: vec![HOP_PROTOCOL_ID.into()],
         },
         at(13),
@@ -440,7 +434,7 @@ fn relay_supersede_does_not_abort_waiting_for_peer_ready() {
 }
 
 #[test]
-fn relay_supersede_does_not_abort_an_open_hop_request() {
+fn relay_replacement_does_not_abort_an_open_hop_request() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.start(RELAY_NOW, at(0));
     drain_actions(&mut h.agent); // relay dial
@@ -449,19 +443,12 @@ fn relay_supersede_does_not_abort_an_open_hop_request() {
     let open_token = open_stream_token(&open);
 
     h.agent.handle_event(
-        &SwarmEvent::ConnectionClosed {
-            conn_id: ConnectionId::new(1),
+        &SwarmEvent::ConnectionReplaced {
             peer_id: h.relay.clone(),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
+            old: ConnectionId::new(1),
+            new: ConnectionId::new(2),
         },
         at(11),
-    );
-    h.agent.handle_event(
-        &SwarmEvent::ConnectionEstablished {
-            conn_id: ConnectionId::new(2),
-            peer_id: h.relay.clone(),
-        },
-        at(12),
     );
     assert!(drain_events(&mut h.agent).is_empty());
 
@@ -469,7 +456,7 @@ fn relay_supersede_does_not_abort_an_open_hop_request() {
     h.agent.stream_open_result(open_token, Ok(stream), at(13));
     assert!(
         h.agent.owns_stream(&h.relay, stream),
-        "the HOP open result must remain owned after relay supersession"
+        "the HOP open result must remain owned after relay replacement"
     );
 }
 
@@ -600,7 +587,8 @@ fn duplicate_direct_connection_does_not_double_report() {
     h.target_connected(at(50));
     assert_eq!(drain_events(&mut h.agent).len(), 1);
 
-    // A QUIC supersede re-emits ConnectionEstablished for the same peer.
+    // A repeated establishment for the same peer adds nothing new.
+
     h.target_connected(at(60));
     assert!(drain_events(&mut h.agent).is_empty());
     assert!(drain_actions(&mut h.agent).is_empty());
@@ -715,12 +703,9 @@ fn reporter_disconnect_drops_its_observation() {
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay,
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(1),
     );
-    h.agent.handle_tick(at(1));
-    h.agent.handle_tick(at(1));
 
     let obs = advertised_dcutr_addrs(&mut h, 10);
     assert_eq!(
@@ -737,7 +722,6 @@ fn untracked_connection_close_is_ignored() {
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(999),
             peer_id: peer(b"untracked-peer"),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(1),
     );

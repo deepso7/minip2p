@@ -122,6 +122,7 @@ fn establish_relay_session(agent: &mut NatAgent, relay: &PeerId, ms: u64) {
     agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: relay.clone(),
+            conn_id: CLIENT_RELAY_CONN,
             protocols: vec![minip2p_nat::HOP_PROTOCOL_ID.to_owned()],
         },
         nat_now(ms),

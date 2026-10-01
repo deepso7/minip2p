@@ -348,7 +348,7 @@ fn portable_autonat_rejects_reservation_policy_without_a_relay() {
 
 fn has_ready(events: &[EndpointEvent], peer: &PeerId) -> bool {
     events.iter().any(|event| {
-        matches!(event, EndpointEvent::PeerReady { peer_id, protocols }
+        matches!(event, EndpointEvent::PeerReady { peer_id, protocols, .. }
             if peer_id == peer && protocols.iter().any(|protocol| protocol == PROTOCOL))
     })
 }

@@ -7,6 +7,7 @@ import type {
   P2pEvent,
 } from "../../core/src/backend.js";
 import { Reachability } from "../../core/src/index.js";
+import type { ConnectionInfo } from "../../core/src/index.js";
 
 export type MockBackendOperation =
   | readonly ["abandon" | "closeWrite" | "reset", string, number]
@@ -19,6 +20,8 @@ export class MockBackend implements Minip2pBackend {
   abandonError: unknown;
   closed = false;
   connected: string[] = [];
+  /** `connectionInfo` snapshots by peer ID. */
+  connections = new Map<string, ConnectionInfo>();
   nextConnectId = 1;
   nextStreamId = 3;
   openResults: BackendOpenStream[] = [];
@@ -78,8 +81,8 @@ export class MockBackend implements Minip2pBackend {
     return undefined;
   }
 
-  connectionInfo(): undefined {
-    return undefined;
+  connectionInfo(peerId: string): ConnectionInfo | undefined {
+    return this.connections.get(peerId);
   }
 
   circuitAddress(relayAddress: string, peerId: string): string {

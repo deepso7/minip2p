@@ -288,6 +288,9 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
         EndpointEvent::ConnectionClosed { peer_id, .. } => {
             println!("[{role}] disconnected peer={peer_id}");
         }
+        EndpointEvent::ConnectionReplaced { peer_id, old, new } => {
+            println!("[{role}] connection-replaced peer={peer_id} old={old} new={new}");
+        }
         EndpointEvent::IdentifyReceived { peer_id, info } => {
             let agent = info.agent_version.as_deref().unwrap_or("?");
             let nprotos = info.protocols.len();
@@ -302,10 +305,14 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
                 "[{role}] identify peer={peer_id} agent={agent} protocols={nprotos} list=[{protocols}] observed={observed}"
             );
         }
-        EndpointEvent::PeerReady { peer_id, protocols } => {
+        EndpointEvent::PeerReady {
+            peer_id,
+            conn_id,
+            protocols,
+        } => {
             let protocol_list = format_protocols(protocols);
             println!(
-                "[{role}] peer-ready peer={peer_id} protocols={} list=[{}]",
+                "[{role}] peer-ready peer={peer_id} conn={conn_id} protocols={} list=[{}]",
                 protocols.len(),
                 protocol_list
             );

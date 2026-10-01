@@ -443,6 +443,7 @@ mod tests {
     fn carry_cap_drops_oldest_messages_before_lifecycle_events() {
         let lifecycle = P2pEvent::PeerReady {
             peer_id: "peer".into(),
+            conn_id: 1,
             protocols: Vec::new(),
         };
         let mut carry = Carry::default();

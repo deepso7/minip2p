@@ -1,5 +1,6 @@
 /* oxlint-disable class-methods-use-this, max-classes-per-file, promise/avoid-new -- The fake implements the native endpoint boundary used by the adapter, including one deferred drain observation. */
 
+import { StreamClosedError } from "@minip2p/core";
 import { describeAdapterContract } from "@minip2p/test-fixtures/adapter-contract";
 import type { NativeEventLiteral } from "@minip2p/test-fixtures/adapter-contract";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -19,7 +20,12 @@ const native = vi.hoisted(() => {
     readonly abandonedStreams: { peerId: string; streamId: bigint }[] = [];
     readonly cancelledConnects: bigint[] = [];
     readonly connectTargets: (string | string[])[] = [];
-    connection: { connId: bigint; remoteAddr?: string } | null = null;
+    connection: {
+      connId: bigint;
+      remoteAddr?: string;
+      readyProtocols?: string[];
+    } | null = null;
+    nextStream = { connId: 10n, streamId: 20n };
     readonly drainLimits: number[] = [];
     readonly #batches: Event[][] = [];
     #doorbell: (() => void) | undefined;
@@ -99,7 +105,7 @@ const native = vi.hoisted(() => {
       return [];
     }
 
-    connectionInfo(): { connId: bigint; remoteAddr?: string } | null {
+    connectionInfo(): typeof this.connection {
       return this.connection;
     }
 
@@ -122,7 +128,7 @@ const native = vi.hoisted(() => {
     }
 
     openStream(): { readonly connId: bigint; readonly streamId: bigint } {
-      return { connId: 10n, streamId: 20n };
+      return this.nextStream;
     }
 
     path(): null {
@@ -186,6 +192,17 @@ const settle = async (): Promise<void> => {
   await vi.runAllTimersAsync();
   await Promise.resolve();
 };
+
+const localStreamReady = (connId: bigint) => ({
+  inner: {
+    connId,
+    initiatedLocally: true,
+    peerId: "remote",
+    protocolId: "/test/1",
+    streamId: 20n,
+  },
+  tag: "StreamReady",
+});
 
 describe("Node adapter", () => {
   afterEach(() => {
@@ -336,6 +353,29 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
+  test("delivers an endpoint error that names a stream but no connection", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const details: string[] = [];
+    endpoint.on("endpointError", ({ detail }) => details.push(detail));
+    fake.enqueue(
+      [
+        {
+          inner: { detail: "boom", kind: 0, streamId: 4n },
+          tag: "EndpointError",
+        },
+      ],
+      []
+    );
+
+    fake.ring();
+    await settle();
+
+    expect(details).toEqual(["boom"]);
+    endpoint.close();
+  });
+
   test("forgets connection identifiers after ConnectionClosed", async () => {
     vi.useFakeTimers();
     const endpoint = createEndpoint();
@@ -425,6 +465,53 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
+  test("a replaced connection's streams end and their native IDs map afresh", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+
+    const firstPending = endpoint.openStream("remote", "/test/1");
+    fake.enqueue([localStreamReady(10n)], []);
+    fake.ring();
+    await settle();
+    const first = await firstPending;
+    const firstRead = first.read();
+    const firstEnded =
+      expect(firstRead).rejects.toBeInstanceOf(StreamClosedError);
+
+    fake.nextStream = { connId: 11n, streamId: 20n };
+    const secondPending = endpoint.openStream("remote", "/test/1");
+    fake.enqueue(
+      [
+        {
+          inner: { new: 11n, old: 10n, peerId: "remote" },
+          tag: "ConnectionReplaced",
+        },
+        localStreamReady(11n),
+        {
+          inner: {
+            connId: 11n,
+            data: new Uint8Array([7]),
+            peerId: "remote",
+            streamId: 20n,
+          },
+          tag: "StreamData",
+        },
+      ],
+      []
+    );
+    fake.ring();
+    await settle();
+    const second = await secondPending;
+
+    await firstEnded;
+    expect(second.streamId).not.toBe(first.streamId);
+    expect(new Uint8Array((await second.read()) ?? [])).toEqual(
+      new Uint8Array([7])
+    );
+    endpoint.close();
+  });
+
   test("handles an unclaimed ready stream closed in the same drain", async () => {
     vi.useFakeTimers();
     const endpoint = createEndpoint();
@@ -449,7 +536,7 @@ describe("Node adapter", () => {
           tag: "StreamClosed",
         },
         {
-          inner: { peerId: "after", protocols: [] },
+          inner: { connId: 11n, peerId: "after", protocols: [] },
           tag: "PeerReady",
         },
       ],
@@ -496,8 +583,11 @@ describeAdapterContract("Node", {
         fake.enqueue([...events], []);
         fake.ring();
       },
-      setConnectionInfo: (connId: bigint, remoteAddr?: string) => {
-        fake.connection = { connId, remoteAddr };
+      setConnectionInfo: (info) => {
+        fake.connection = info;
+      },
+      setNextStream: (connId, streamId) => {
+        fake.nextStream = { connId, streamId };
       },
     };
   },

@@ -113,6 +113,7 @@ fn fuzz_pubsub(data: &[u8]) {
     let _ = agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
             protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
         },
         0,
