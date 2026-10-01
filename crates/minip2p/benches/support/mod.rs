@@ -149,6 +149,7 @@ impl Relayed {
         let mut client = peer(ReservationPolicy::Never);
         let client_peer = client.peer_id().clone();
         let connect_id = client.connect(&target_peer).expect("relayed connect");
+        let deadline = Instant::now() + SETUP_TIMEOUT;
         let (mut circuit, mut client_ready, mut target_ready) = (false, false, false);
         while !(circuit && client_ready && target_ready) {
             assert!(Instant::now() < deadline, "relayed connect timed out");
