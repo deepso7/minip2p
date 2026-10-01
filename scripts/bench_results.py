@@ -64,6 +64,11 @@ GUNGRAUN_NAMES = {
     "next_timeout": "peer_book_128_peers_16_addrs/next_timeout",
     "gossipsub_publish_32x60_kib": "pubsub/gossipsub_publish_32x60KiB",
     "relay_handle_event_same_now_128_pending_hops": "relay_handle_event_same_now_128_pending_hops",
+    "relay_1k_next_timeout": "relay_server_1k/next_timeout",
+    "relay_1k_tick_idle": "relay_server_1k/tick_idle",
+    "relay_1k_tick_expire_100": "relay_server_1k/tick_expire_100",
+    "relay_1k_reserve_new_peer": "relay_server_1k/reserve_new_peer",
+    "relay_1k_close_connection_100_circuits": "relay_server_1k/close_connection_100_circuits",
 }
 EXPECTED_VITEST = {"sdk_drain_flood", "raw_drain_events", "connected_peers_sync"}
 # Rows a bench measures itself (for example throughput or allocations), keyed by
