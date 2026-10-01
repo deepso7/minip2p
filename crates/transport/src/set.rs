@@ -515,7 +515,7 @@ mod blocking_set {
         fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
             let outcome = self.wait_members(timeout);
             #[cfg(feature = "bench")]
-            crate::bench::record_set_wait(outcome);
+            crate::bench::record_set_wait(timeout, outcome);
             outcome
         }
 

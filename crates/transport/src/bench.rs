@@ -30,12 +30,13 @@ pub struct WaitCounters {
     pub timed_out: u64,
     /// Member waits with a non-zero timeout ended by a [`WaitHandle`](crate::WaitHandle).
     pub interrupted: u64,
-    /// Set waits that found no member able to park and returned
-    /// [`WaitOutcome::Unsupported`], sending a blocking driver to its fallback
-    /// sleep.
+    /// Set waits with a non-zero timeout that found no member able to park
+    /// and returned [`WaitOutcome::Unsupported`], sending a blocking driver
+    /// to its fallback sleep.
     pub fallback_sleeps: u64,
-    /// Outer `TransportSet::wait_for_input` calls: what a driver-level counter
-    /// would see. Not included in [`wakeups`](Self::wakeups).
+    /// Outer `TransportSet::wait_for_input` calls with a non-zero timeout:
+    /// what a driver-level counter would see. Not included in
+    /// [`wakeups`](Self::wakeups).
     pub set_waits: u64,
 }
 
@@ -48,13 +49,16 @@ impl WaitCounters {
     }
 
     /// The counts accumulated since `earlier`, a snapshot from the same thread.
+    ///
+    /// Saturates at zero, so a snapshot from another thread or one taken
+    /// later gives zeros rather than wrapped counts.
     pub fn since(&self, earlier: &Self) -> Self {
         Self {
-            ready: self.ready - earlier.ready,
-            timed_out: self.timed_out - earlier.timed_out,
-            interrupted: self.interrupted - earlier.interrupted,
-            fallback_sleeps: self.fallback_sleeps - earlier.fallback_sleeps,
-            set_waits: self.set_waits - earlier.set_waits,
+            ready: self.ready.saturating_sub(earlier.ready),
+            timed_out: self.timed_out.saturating_sub(earlier.timed_out),
+            interrupted: self.interrupted.saturating_sub(earlier.interrupted),
+            fallback_sleeps: self.fallback_sleeps.saturating_sub(earlier.fallback_sleeps),
+            set_waits: self.set_waits.saturating_sub(earlier.set_waits),
         }
     }
 }
@@ -89,8 +93,12 @@ pub(crate) fn record_member_wait(timeout: Duration, outcome: WaitOutcome) {
     });
 }
 
-/// Counts one outer set wait and whether it left the driver to sleep.
-pub(crate) fn record_set_wait(outcome: WaitOutcome) {
+/// Counts one outer set wait that may block, and whether it left the driver
+/// to sleep. A non-blocking poll is neither.
+pub(crate) fn record_set_wait(timeout: Duration, outcome: WaitOutcome) {
+    if timeout.is_zero() {
+        return;
+    }
     update(|counters| {
         counters.set_waits += 1;
         if outcome == WaitOutcome::Unsupported {
