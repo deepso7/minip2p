@@ -1419,6 +1419,7 @@ dependencies = [
  "minip2p-identity",
  "minip2p-swarm",
  "minip2p-transport",
+ "stats_alloc",
  "thiserror",
 ]
 
