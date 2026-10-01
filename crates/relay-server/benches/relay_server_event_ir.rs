@@ -60,11 +60,13 @@ fn populated_agent() -> (RelayServerAgent, SwarmEvent, Now) {
 
 #[library_benchmark]
 #[bench::relay_handle_event_same_now_128_pending_hops(populated_agent())]
-fn relay_event(input: (RelayServerAgent, SwarmEvent, Now)) {
+fn relay_event(input: (RelayServerAgent, SwarmEvent, Now)) -> (RelayServerAgent, SwarmEvent) {
     let (mut agent, event, now) = input;
     for _ in 0..EVENTS_PER_BATCH {
         black_box(agent.handle_event(black_box(&event), false, black_box(now)));
     }
+    // Returned so their teardown is not counted.
+    (agent, event)
 }
 
 // --- 1k active reservations and 1k active circuits ---------------------------

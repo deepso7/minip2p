@@ -4,6 +4,7 @@
 //! draining, and event emission.
 
 use std::collections::{HashMap, VecDeque};
+use std::mem;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -132,6 +133,14 @@ pub struct QuicConnection {
     /// send time. While one is held, `flush` generates nothing further for
     /// this connection, so packets leave in order and never early.
     paced: Option<PacedPacket>,
+    /// Something may have left stream input for `poll_streams` to find:
+    /// readable data, or a peer's STOP_SENDING.
+    ///
+    /// Set before every `conn.recv` (even a failing one: quiche may apply
+    /// some frames before erroring) and before a local reset, which returns
+    /// unsent credit and can re-list a stopped stream as writable while no
+    /// packet arrives. Idle polls skip the scans while it is clear.
+    streams_dirty: bool,
 }
 
 /// Whether a flush waits for quiche's pacing send times.
@@ -175,6 +184,7 @@ impl QuicConnection {
             last_recv_ms: None,
             sent_keepalive_since_recv: false,
             paced: None,
+            streams_dirty: false,
         }
     }
 
@@ -376,6 +386,7 @@ impl QuicConnection {
     ) -> Result<(), TransportError> {
         let recv_info = quiche::RecvInfo { from, to: local };
 
+        self.streams_dirty = true;
         match self.conn.recv(buf, recv_info) {
             Ok(_) => {
                 self.last_recv_ms = Some(now.monotonic_ms);
@@ -648,6 +659,7 @@ impl QuicConnection {
         // Fail with `StreamNotFound` before touching quiche.
         self.stream_state_mut(stream_id)?;
         self.drop_send_queue(stream_id.as_u64());
+        self.streams_dirty = true;
 
         // `Done` means quiche already shut that half down or collected the
         // stream (e.g. after the peer's STOP_SENDING and FIN), so there is
@@ -729,13 +741,30 @@ impl QuicConnection {
             return Ok(());
         }
 
+        if mem::take(&mut self.streams_dirty) {
+            self.scan_stream_input(events, stream_read_buffer);
+        }
+
+        self.drain_send_queue(events);
+        self.flush(socket, pending_datagrams, max_pending_datagrams)?;
+        self.gc_closed_streams();
+        Ok(())
+    }
+
+    /// Reports peer STOP_SENDINGs, then reads every readable stream to
+    /// exhaustion. Only runs while `streams_dirty` is set.
+    fn scan_stream_input(
+        &mut self,
+        events: &mut Vec<TransportEvent>,
+        stream_read_buffer: &mut [u8],
+    ) {
         // Catch STOP_SENDING before reading: once the peer's FIN is read,
         // quiche may collect the stream and every later write would only
         // report `Done`. quiche marks a stopped stream writable, but lists no
         // writable streams while connection credit is exhausted, so readable
         // streams (the ones a FIN could collect) are checked as well.
-        let candidates: Vec<u64> = self.conn.writable().chain(self.conn.readable()).collect();
-        for raw_stream_id in candidates {
+        // Both iterators own a snapshot of ids, so the loop may mutate `conn`.
+        for raw_stream_id in self.conn.writable().chain(self.conn.readable()) {
             if let Err(quiche::Error::StreamStopped(error_code)) =
                 self.conn.stream_capacity(raw_stream_id)
             {
@@ -792,11 +821,6 @@ impl QuicConnection {
                 }
             }
         }
-
-        self.drain_send_queue(events);
-        self.flush(socket, pending_datagrams, max_pending_datagrams)?;
-        self.gc_closed_streams();
-        Ok(())
     }
 
     /// Sends quiche's output packets via the UDP socket, honouring pacing.

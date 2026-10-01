@@ -17,7 +17,7 @@ check:
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
     scripts/run-feature-matrix.sh clippy
-    cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+    cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
 
 # Mirrors CI's `test` job. Needs cargo-nextest: https://get.nexte.st
 test:

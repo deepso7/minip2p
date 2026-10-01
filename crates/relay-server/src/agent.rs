@@ -427,23 +427,13 @@ impl RelayServerAgent {
                 conn_id,
                 stream_id,
                 ..
-            } => {
-                // Every relay stream needs to write, so a stopped one is reset;
-                // the `StreamClosed` that follows runs the usual teardown.
-                let key = StreamKey {
+            } => self.on_stream_write_stopped(
+                peer_id,
+                StreamKey {
                     conn_id: *conn_id,
                     stream_id: *stream_id,
-                };
-                let owned = self.circuits.contains_key(&key)
-                    || self.stop_to_source.contains_key(&key)
-                    || self.hop_workers.contains_key(&key)
-                    || self.pending_circuits.contains_key(&key)
-                    || self.rejected_hop_streams.contains_key(&key);
-                if owned {
-                    self.queue_reset(peer_id.clone(), key);
-                }
-                owned
-            }
+                },
+            ),
             SwarmEvent::StreamClosed {
                 conn_id, stream_id, ..
             } => {
@@ -567,6 +557,25 @@ impl RelayServerAgent {
         }
         self.reservation_limiters.sweep(now.monotonic_ms);
         self.circuit_limiters.sweep(now.monotonic_ms);
+    }
+
+    /// Resets a relay stream the peer stopped; returns whether we own it.
+    ///
+    /// Every relay stream needs to write, so a stopped one is reset; the
+    /// `StreamClosed` that follows runs the usual teardown. Kept out of line
+    /// and cold: inlined, its lookups slowed every `handle_event` call.
+    #[cold]
+    #[inline(never)]
+    fn on_stream_write_stopped(&mut self, peer_id: &PeerId, key: StreamKey) -> bool {
+        let owned = self.circuits.contains_key(&key)
+            || self.stop_to_source.contains_key(&key)
+            || self.hop_workers.contains_key(&key)
+            || self.pending_circuits.contains_key(&key)
+            || self.rejected_hop_streams.contains_key(&key);
+        if owned {
+            self.queue_reset(peer_id.clone(), key);
+        }
+        owned
     }
 
     /// Sweeps deadlines before the first event in a driver batch.
