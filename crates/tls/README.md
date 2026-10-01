@@ -6,8 +6,29 @@ Implements the [libp2p TLS spec](https://github.com/libp2p/specs/blob/master/tls
 
 ## What it does
 
-- **Certificate generation**: creates a self-signed X.509 certificate with an ephemeral ECDSA P-256 signing key and a libp2p Public Key Extension (OID `1.3.6.1.4.1.53594.1.1`) carrying the Ed25519 host identity.
-- **Certificate verification**: parses a peer's DER-encoded certificate, verifies the self-signature and the extension's host-key signature, and derives the remote peer's `PeerId`.
+- **Certificate generation**: creates a self-signed X.509 certificate with an ephemeral ECDSA P-256 signing key and a libp2p Public Key Extension (OID `1.3.6.1.4.1.53594.1.1`) carrying the Ed25519 host identity. The `std` wrapper backdates NotBefore by one hour, so a verifier whose clock runs slightly behind still accepts a fresh certificate.
+- **Certificate verification**: parses a peer's DER-encoded certificate, verifies the self-signature, and derives the remote peer's `PeerId` from the extension's host-key signature. It rejects a certificate that is expired or not yet valid, carries the libp2p extension more than once, or carries any other critical extension. Each rejection is a distinct `TlsError` variant.
+
+The crate reads no clock, so the caller passes the current time:
+
+```rust
+use minip2p_tls::verify_libp2p_certificate;
+
+// `now` is a `core::time::Duration` since the Unix epoch.
+let peer_id = verify_libp2p_certificate(&cert_der, now)?;
+```
+
+The spec also forbids certificate chains. The verifier sees one certificate, so the transport must reject a peer that presents more than one (the QUIC transport does).
+
+### Host key types
+
+| Key type | Verified |
+| --- | --- |
+| Ed25519 | yes |
+| ECDSA P-256 | yes |
+| ECDSA on other curves | no, `TlsError::UnsupportedKeyType` |
+| secp256k1 | no, deferred (would need a `k256` dependency); `TlsError::UnsupportedKeyType` |
+| RSA | no, optional in the spec; `TlsError::UnsupportedKeyType` |
 
 ## `no_std` support
 
