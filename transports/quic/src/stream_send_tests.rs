@@ -56,6 +56,12 @@ impl RawPeer {
         if self.conn.timeout().is_some_and(|timeout| timeout.is_zero()) {
             self.conn.on_timeout();
         }
+        self.flush();
+    }
+
+    /// Sends whatever quiche has to say without receiving anything, so the
+    /// server sees no acknowledgement of what it sent since the last pump.
+    fn flush(&mut self) {
         let mut out = [0u8; 1350];
         while let Ok((len, info)) = self.conn.send(&mut out) {
             let packet = out.get(..len).expect("sent length fits");
@@ -338,6 +344,157 @@ fn stop_sending_is_reported_while_connection_credit_is_exhausted() {
         stream_id: stream,
         error_code: 5,
     }));
+}
+
+/// With no send credit quiche lists no writable stream, so a stop on a stream
+/// with nothing to read stays hidden. Resetting another stream hands back its
+/// unsent credit and re-lists the stopped one, with no packet arriving to
+/// prompt a scan.
+#[test]
+fn stop_hidden_by_exhausted_credit_surfaces_after_a_local_reset() {
+    let mut server = listening_server(30_000);
+    let (mut peer, id) = accept(&mut server, &mut [], |config| {
+        config.set_initial_max_data(2_000);
+    });
+    peer.conn.stream_send(0, b"hi", false).expect("open 0");
+    peer.conn.stream_send(4, b"hi", false).expect("open 4");
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "both inbound streams",
+        |events| {
+            [0, 4].iter().all(|&raw| {
+                events.iter().any(|event| {
+                    matches!(event, TransportEvent::StreamData { stream_id, .. }
+                        if *stream_id == StreamId::new(raw))
+                })
+            })
+        },
+    );
+
+    // Drive the connection by hand behind a full datagram queue, so nothing
+    // leaves: quiche takes the write up to the credit and holds it unsent.
+    let local = server.local_addr();
+    let socket = &server.socket;
+    let conn = server.connections.get_mut(&id).expect("connection");
+    let mut held = VecDeque::from([PendingDatagram {
+        bytes: Vec::new(),
+        destination: local,
+    }]);
+    let mut read_buffer = vec![0; STREAM_READ_BUFFER_SIZE];
+    let mut events = Vec::new();
+    conn.send_stream(
+        StreamId::new(0),
+        vec![7; 10_000],
+        socket,
+        &mut events,
+        &mut held,
+        1,
+    )
+    .expect("send");
+
+    peer.conn
+        .stream_shutdown(4, quiche::Shutdown::Read, 7)
+        .expect("stop sending");
+    peer.flush();
+    std::thread::sleep(Duration::from_millis(20));
+    let mut buf = [0u8; 65535];
+    let mut received = 0;
+    while let Ok((len, from)) = socket.recv_from(&mut buf) {
+        let packet = buf.get_mut(..len).expect("received length fits");
+        conn.recv_packet(
+            packet,
+            from,
+            local,
+            now(),
+            socket,
+            &mut events,
+            &mut held,
+            1,
+        )
+        .expect("recv");
+        received += 1;
+    }
+    assert!(received > 0, "the stop never reached the server");
+    conn.poll_streams(&mut events, socket, &mut read_buffer, &mut held, 1)
+        .expect("poll");
+    let stopped = |events: &[TransportEvent]| {
+        events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::StreamWriteStopped { .. }))
+    };
+    assert!(!stopped(&events), "the stop should be hidden: {events:?}");
+
+    conn.reset_stream(StreamId::new(0), &mut events)
+        .expect("reset");
+    conn.poll_streams(&mut events, socket, &mut read_buffer, &mut held, 1)
+        .expect("poll");
+    assert!(events.contains(&TransportEvent::StreamWriteStopped {
+        id,
+        stream_id: StreamId::new(4),
+        error_code: 7,
+    }));
+}
+
+/// Idle polls skip the stream scans; data spanning several read-buffer fills
+/// must still arrive whole and once, with nothing left for idle polls to find.
+#[test]
+fn data_beyond_one_read_buffer_arrives_once_and_idle_polls_stay_silent() {
+    let mut server = listening_server(30_000);
+    let (mut peer, id) = accept(&mut server, &mut [], |_| {});
+    let payload: Vec<u8> = (0..3 * STREAM_READ_BUFFER_SIZE + 7)
+        .map(|i| i as u8)
+        .collect();
+
+    let mut sent = 0;
+    let mut events = Vec::new();
+    let start = Instant::now();
+    while !events
+        .iter()
+        .any(|event| matches!(event, TransportEvent::StreamRemoteWriteClosed { .. }))
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out after {sent} bytes sent"
+        );
+        let rest = payload.get(sent..).expect("sent within payload");
+        if !rest.is_empty()
+            && let Ok(written) = peer.conn.stream_send(0, rest, true)
+        {
+            sent += written;
+        }
+        peer.pump();
+        events.extend(server.poll(now()).expect("poll"));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let received: Vec<u8> = events
+        .iter()
+        .filter_map(|event| match event {
+            TransportEvent::StreamData { data, .. } => Some(data.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(received, payload);
+
+    // Let the final acknowledgements settle, then go quiet.
+    peer.pump();
+    std::thread::sleep(Duration::from_millis(20));
+    let mut idle = server.poll(now()).expect("poll");
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(2));
+        idle.extend(server.poll(now()).expect("idle poll"));
+    }
+    assert!(
+        idle.iter().all(|event| !matches!(
+            event,
+            TransportEvent::StreamData { .. } | TransportEvent::StreamRemoteWriteClosed { .. }
+        )),
+        "idle polls repeated stream input on {id:?}: {idle:?}"
+    );
 }
 
 #[test]
