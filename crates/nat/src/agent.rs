@@ -1121,8 +1121,13 @@ impl NatAgent {
         // must not make a relayed `new` look redundant.
         self.forget_connection(peer, old);
         self.connection_up(peer, new, is_circuit, now);
-        for attempt in self.attempts.values_mut() {
-            attempt.on_target_replaced(peer, old, new, &mut self.shared);
+        // A circuit another attempt promoted stays that attempt's: adopting
+        // it would let this attempt close it on cancel.
+        let new_promoted = self.attempts.values().any(|a| a.promotes(new));
+        if !new_promoted {
+            for attempt in self.attempts.values_mut() {
+                attempt.on_target_replaced(peer, old, new, &mut self.shared);
+            }
         }
         self.notify_connection_down(peer, old, now);
 

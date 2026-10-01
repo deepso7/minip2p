@@ -720,3 +720,42 @@ fn circuit_replacing_the_promoted_circuit_keeps_the_attempt_alive() {
         [NatEvent::PathUpgraded { connect_id, to: Path::DirectDialed, .. }] if *connect_id == id
     ));
 }
+
+#[test]
+fn circuit_promoted_by_another_attempt_is_never_adopted() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (first, circuit) = drive_to_relayed(&mut h);
+
+    // A second attempt to the same peer bridges and promotes its own circuit
+    // over the already-ready relay.
+    let second = h.start(RELAY_NOW, at(310));
+    let actions = drain_actions(&mut h.agent);
+    let stream = StreamId::new(8);
+    h.agent
+        .stream_open_result(open_stream_token(&actions), Ok(stream), at(311));
+    h.stream_ready(stream, at(312));
+    drain_actions(&mut h.agent);
+    h.stream_data(stream, hop_status(Status::Ok), at(313));
+    let promotion = drain_actions(&mut h.agent);
+    let other_circuit = ConnectionId::new(TEST_CIRCUIT_ID + 1);
+    h.agent
+        .promote_result(promote_token(&promotion), Ok(other_circuit), at(314));
+    replace_target(&mut h, circuit, other_circuit, 315);
+    drain_actions(&mut h.agent);
+    drain_events(&mut h.agent);
+
+    h.agent.cancel(first, at(320));
+    assert!(
+        !drain_actions(&mut h.agent).iter().any(|action| matches!(
+            action,
+            NatAction::CloseCircuit { conn_id } if *conn_id == other_circuit
+        )),
+        "cancelling the first attempt must not close the second attempt's circuit"
+    );
+
+    h.agent.cancel(second, at(321));
+    assert!(drain_actions(&mut h.agent).iter().any(|action| matches!(
+        action,
+        NatAction::CloseCircuit { conn_id } if *conn_id == other_circuit
+    )));
+}

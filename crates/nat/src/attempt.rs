@@ -168,6 +168,11 @@ impl ConnectAttempt {
         Some(attempt)
     }
 
+    /// Whether `conn_id` is the circuit this attempt promoted.
+    pub(crate) fn promotes(&self, conn_id: ConnectionId) -> bool {
+        self.promoted == Some(conn_id)
+    }
+
     pub(crate) fn is_done(&self) -> bool {
         self.done
     }
@@ -367,6 +372,8 @@ impl ConnectAttempt {
     /// promoted and `new` is another circuit, the attempt carries on over
     /// `new`: a punch in flight may still upgrade it, and otherwise it falls
     /// back to relay as usual. A DCUtR exchange lived on `old` and ends.
+    /// The caller skips this when another attempt promoted `new`; `old`
+    /// then simply closes for this attempt.
     pub(crate) fn on_target_replaced(
         &mut self,
         peer: &PeerId,
