@@ -499,6 +499,10 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
     // Drive until the dialer has nothing left to do. Parking is the state the
     // rest of the test needs, so wait for it rather than for a slice of time:
     // under load a fixed slice buys far fewer polls than it looks like it does.
+    //
+    // A timeout here does mean parked: the provider keeps WRITABLE interest
+    // registered for as long as the transport has bytes to write, so a wait
+    // that expires says the socket has no room and nothing arrived either.
     let filling = Instant::now();
     while pair.dialer.wait_for_input(Duration::from_millis(10)) != WaitOutcome::TimedOut {
         let _ = pair.dialer.poll(Now::from_millis(0)).expect("poll dialer");

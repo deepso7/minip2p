@@ -478,6 +478,8 @@ fn quiet_pair_stays_up_past_idle_timeout() {
     // expire the connection on a loaded box. quiche's effective timeout is
     // max(idle, 3×PTO), so the margin has to cover the idle interval itself.
     const IDLE_MS: u64 = 1_000;
+    /// Twice the idle timeout: reaching the end of it without a close is
+    /// itself the proof that the keepalive held the pair up.
     const OBSERVE: std::time::Duration = std::time::Duration::from_millis(2 * IDLE_MS);
 
     let limits = QuicLimits {
@@ -487,8 +489,7 @@ fn quiet_pair_stays_up_past_idle_timeout() {
     let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
     let (server_id, client_id, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
 
-    let started = std::time::Instant::now();
-    let deadline = started + OBSERVE;
+    let deadline = std::time::Instant::now() + OBSERVE;
     let mut closed = false;
     while std::time::Instant::now() < deadline {
         closed |= server
@@ -527,10 +528,6 @@ fn quiet_pair_stays_up_past_idle_timeout() {
     assert!(
         !closed,
         "ack-eliciting keepalive must keep a quiet pair past the idle timeout"
-    );
-    assert!(
-        started.elapsed() >= std::time::Duration::from_millis(IDLE_MS),
-        "the pair has to outlive the idle interval for this to prove anything"
     );
 }
 

@@ -160,9 +160,13 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
     // the test to prove anything, the keepalive has to be well inside it, and
     // the timeout has to be long enough that a descheduled thread cannot expire
     // the relay connection on a loaded box.
-    const IDLE_MS: u64 = 1_000;
+    const IDLE_MS: u64 = 1_500;
     const KEEPALIVE_MS: u64 = 300;
-    const OBSERVE: std::time::Duration = std::time::Duration::from_millis(1_000 + 2 * IDLE_MS);
+    /// Twice the transport timeout: reaching the end of it with the
+    /// reservation intact is itself the proof that the keepalive, not luck,
+    /// kept the connection up. A stall would have to exceed `IDLE_MS` minus
+    /// the age of the last keepalive — over a second — to expire it.
+    const OBSERVE: std::time::Duration = std::time::Duration::from_millis(2 * IDLE_MS);
 
     let limits = QuicLimits {
         idle_timeout_ms: IDLE_MS,
@@ -193,8 +197,7 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
 
     let mut reservation_events = drive_until_reserved(&mut client, &mut relay, "QUIC");
 
-    let started = Instant::now();
-    let observe_until = started + OBSERVE;
+    let observe_until = Instant::now() + OBSERVE;
     let mut ping_rtts = 0;
     while Instant::now() < observe_until {
         match client
@@ -230,10 +233,6 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
         .is_some()
     {}
 
-    assert!(
-        started.elapsed() >= std::time::Duration::from_millis(IDLE_MS),
-        "the reservation has to outlive the transport timeout for this to prove anything"
-    );
     assert!(ping_rtts > 0, "reservation liveness should send QUIC pings");
     assert!(client.active_reservation().is_some());
     assert_eq!(

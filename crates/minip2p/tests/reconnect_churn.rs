@@ -3,7 +3,7 @@
 
 #![cfg(feature = "quic")]
 
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -102,17 +102,30 @@ impl Driver {
 
 /// Drives `endpoint` on its own thread until [`Driver::stop`].
 ///
-/// Returns once the thread is running, so a `close()` that races it cannot
-/// start draining before the peer is able to answer. The thread runs for as
-/// long as the test needs it to; `DRIVER_BACKSTOP` is only there to end a
-/// thread whose stop signal was lost.
+/// Returns once the thread has driven the endpoint once, so a `close()` that
+/// races it cannot spend its drain on a peer that has never been polled.
+/// Signalling before that first poll would only prove the thread was spawned.
+/// The poll runs on the remote endpoint, so it takes nothing from the event
+/// stream the close assertions read.
+///
+/// The thread then runs for as long as the test needs it to; `DRIVER_BACKSTOP`
+/// is only there to end a thread whose stop signal was lost.
 fn spawn_driver(mut endpoint: Endpoint, what: &'static str) -> Driver {
     let (stop, stopped) = mpsc::channel();
     let (started, running) = mpsc::channel();
     let handle = thread::spawn(move || {
+        let _ = endpoint.next_event(Duration::from_millis(10)).expect(what);
         started.send(()).expect("the test waits for this thread");
         let backstop = Instant::now() + DRIVER_BACKSTOP;
-        while stopped.try_recv().is_err() {
+        loop {
+            match stopped.try_recv() {
+                // A disconnected channel means the test dropped the driver
+                // without stopping it — a panic on the way to `stop()`. Leave
+                // rather than drive on to the backstop and panic detached,
+                // which would bury the real failure under 30s of silence.
+                Ok(()) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
+            }
             assert!(
                 Instant::now() < backstop,
                 "{what}: stop signal never arrived"

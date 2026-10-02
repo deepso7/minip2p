@@ -56,7 +56,9 @@ default-filter = '''
 # `max-threads = 1` would only keep the group's own members apart, leaving the
 # rest of the suite running alongside.
 #
-# Overrides are per profile, so the feature matrix needs its own copy below.
+# Spelled out under both profiles rather than relying on how overrides resolve
+# across them: the feature matrix runs these same tests, and the cost of the
+# duplicate is a few lines.
 [[profile.default.overrides]]
 filter = '''
   (
