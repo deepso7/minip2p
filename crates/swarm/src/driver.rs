@@ -1352,8 +1352,12 @@ mod tests {
             .wait_outcomes
             .push_back(WaitOutcome::Interrupted);
 
+        // The deadline has to outlast the interrupt by enough that the resume
+        // is what is being observed. `run_until` re-reads the clock after
+        // consuming an interrupt, so a deadline measured in milliseconds is
+        // really asserting that this thread was not descheduled in between.
         let found = swarm
-            .run_until(Duration::from_millis(1), |_| false)
+            .run_until(Duration::from_millis(500), |_| false)
             .expect("wait");
 
         assert!(found.is_none());
