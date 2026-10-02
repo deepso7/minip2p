@@ -1,3 +1,22 @@
+# Timing in tests
+#
+# These are wall-clock tests of a networking stack, run in parallel. Under load
+# a thread can be descheduled for longer than any budget a test would pick, so:
+#
+# - A fixed-duration loop must never stand in for progress. Drive until the
+#   thing you are waiting for is observable — the peer reclaimed, the socket
+#   parked, the event arrived — and let the loop end there.
+# - A remaining time limit is a failure backstop or the timer under test,
+#   nothing else. Backstops should be generous; they only turn a hang into a
+#   readable failure.
+# - A test of a deliberately bounded production timer (`Endpoint::close()`
+#   drains for a fixed 500ms) cannot be made load-proof from the inside. It
+#   keeps its strict assertions and gets `threads-required =
+#   "num-test-threads"` below, so nothing else runs beside it.
+# - "Nothing happens during this quiet window" assertions are best effort:
+#   starvation can only make them pass when they should fail, never the other
+#   way round, so they are left alone.
+#
 # The `variants` profile drops one test: the reconnect-churn soak.
 #
 # It is gated on `quic` alone and does 50 connect/handshake/drop rounds to guard
@@ -20,3 +39,50 @@ default-filter = '''
     and test(=listener_reclaims_state_after_dialer_drop_without_disconnect)
   )
 '''
+
+# Two QUIC tests wait on quiche's idle timer, whose effective value is
+# max(idle, 3×PTO). PTO follows the RTT quiche measures, and a descheduled
+# thread inflates that, so under load the timer these tests are waiting for
+# moves further away the more loaded the box is — a margin cannot be picked that
+# survives it. They take the box instead.
+#
+# The close-drain tests assert on the events `Endpoint::close()` returns, and
+# `close()` drains for a fixed 500ms by design — shutdown stays bounded, so the
+# events it returns are best effort. The assertions are not: they are what keeps
+# a superseded connection from being dropped silently. The only way to have both
+# is to stop the box from stealing those 500ms, so these three run alone.
+#
+# `threads-required` is what does that. A `[test-groups]` entry with
+# `max-threads = 1` would only keep the group's own members apart, leaving the
+# rest of the suite running alongside.
+#
+# Overrides are per profile, so the feature matrix needs its own copy below.
+[[profile.default.overrides]]
+filter = '''
+  (
+    binary_id(minip2p-rs::reconnect_churn)
+    and (
+      test(=listener_reclaims_state_after_dialer_close)
+      or test(=close_drains_replacement_connection)
+      or test(=close_drains_pending_replacement_handshake)
+    )
+  )
+  or test(=stream_send_tests::stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling)
+  or test(=quic_deadline_is_exposed_and_driven_without_socket_input)
+'''
+threads-required = "num-test-threads"
+
+[[profile.variants.overrides]]
+filter = '''
+  (
+    binary_id(minip2p-rs::reconnect_churn)
+    and (
+      test(=listener_reclaims_state_after_dialer_close)
+      or test(=close_drains_replacement_connection)
+      or test(=close_drains_pending_replacement_handshake)
+    )
+  )
+  or test(=stream_send_tests::stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling)
+  or test(=quic_deadline_is_exposed_and_driven_without_socket_input)
+'''
+threads-required = "num-test-threads"
