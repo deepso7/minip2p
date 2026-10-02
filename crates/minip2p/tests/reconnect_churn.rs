@@ -3,6 +3,8 @@
 
 #![cfg(feature = "quic")]
 
+use std::sync::mpsc::{self, Sender};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use minip2p::{Ed25519Keypair, Endpoint, EndpointEvent, PeerId};
@@ -12,8 +14,14 @@ mod endpoint_support;
 use endpoint_support::NextEvent;
 
 const CHURN_ROUNDS: usize = 50;
-/// Must stay ≪ default `QuicLimits::idle_timeout_ms` (30s).
-const RECLAIM_WITHIN: Duration = Duration::from_millis(500);
+/// Failure backstop for the reclaim wait, not a budget it has to fit in.
+///
+/// These tests prove reclamation does not wait for the QUIC idle timeout (30s
+/// by default), so the cap only has to stay well under that; the loop ends the
+/// moment reclamation is observable, however long the box took to get there.
+const RECLAIM_BACKSTOP: Duration = Duration::from_secs(5);
+/// Failure backstop for a driver thread whose stop signal never arrives.
+const DRIVER_BACKSTOP: Duration = Duration::from_secs(30);
 
 fn wait_peer_ready(
     listener: &mut Endpoint,
@@ -54,8 +62,10 @@ fn ping_until_rtt(listener: &mut Endpoint, dialer: &mut Endpoint, listener_peer:
 }
 
 fn assert_listener_reclaimed(listener: &mut Endpoint, dialer_peer: &PeerId, round: usize) {
-    let deadline = Instant::now() + RECLAIM_WITHIN;
-    while Instant::now() < deadline && !listener.connected_peers().is_empty() {
+    let backstop = Instant::now() + RECLAIM_BACKSTOP;
+    while Instant::now() < backstop
+        && (!listener.connected_peers().is_empty() || listener.peer_info(dialer_peer).is_some())
+    {
         let _ = listener
             .next_event(Duration::from_millis(10))
             .expect("drive listener reclaim");
@@ -63,13 +73,56 @@ fn assert_listener_reclaimed(listener: &mut Endpoint, dialer_peer: &PeerId, roun
 
     assert!(
         listener.connected_peers().is_empty(),
-        "round {round}: listener still tracks connected peers {:?} after {RECLAIM_WITHIN:?}",
+        "round {round}: listener still tracks connected peers {:?} after {RECLAIM_BACKSTOP:?}",
         listener.connected_peers()
     );
     assert!(
         listener.peer_info(dialer_peer).is_none(),
-        "round {round}: listener retained identify state for {dialer_peer}"
+        "round {round}: listener retained identify state for {dialer_peer} after {RECLAIM_BACKSTOP:?}"
     );
+}
+
+/// A peer driven on its own thread so the endpoint under test can block.
+struct Driver {
+    stop: Sender<()>,
+    handle: JoinHandle<Endpoint>,
+}
+
+impl Driver {
+    /// Stops the thread and returns the endpoint it was driving.
+    fn stop(self) -> Endpoint {
+        // A send error means the thread already left on its backstop, which
+        // the join below reports as the panic it is.
+        match self.stop.send(()) {
+            Ok(()) | Err(_) => {}
+        }
+        self.handle.join().expect("driver thread")
+    }
+}
+
+/// Drives `endpoint` on its own thread until [`Driver::stop`].
+///
+/// Returns once the thread is running, so a `close()` that races it cannot
+/// start draining before the peer is able to answer. The thread runs for as
+/// long as the test needs it to; `DRIVER_BACKSTOP` is only there to end a
+/// thread whose stop signal was lost.
+fn spawn_driver(mut endpoint: Endpoint, what: &'static str) -> Driver {
+    let (stop, stopped) = mpsc::channel();
+    let (started, running) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        started.send(()).expect("the test waits for this thread");
+        let backstop = Instant::now() + DRIVER_BACKSTOP;
+        while stopped.try_recv().is_err() {
+            assert!(
+                Instant::now() < backstop,
+                "{what}: stop signal never arrived"
+            );
+            let _ = endpoint.next_event(Duration::from_millis(10)).expect(what);
+        }
+        endpoint
+    });
+    running.recv().expect("driver thread starts");
+    Driver { stop, handle }
 }
 
 fn bind_loopback() -> Endpoint {
@@ -114,25 +167,10 @@ fn listener_reclaims_state_after_dialer_close() {
 
     // Drive the listener so QUIC close can complete; otherwise Drop would
     // be the only path that notifies the peer.
-    let (stop_remote, remote_stop) = std::sync::mpsc::channel();
-    let remote = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if remote_stop.try_recv().is_ok() {
-                break;
-            }
-            let _ = listener
-                .next_event(Duration::from_millis(10))
-                .expect("drive listener during close");
-        }
-        listener
-    });
+    let remote = spawn_driver(listener, "drive listener during close");
 
     let events = dialer.close().expect("close flushes disconnects");
-    match stop_remote.send(()) {
-        Ok(()) | Err(_) => {}
-    }
-    let mut listener = remote.join().expect("listener driver thread");
+    let mut listener = remote.stop();
 
     assert!(
         events.iter().any(|event| matches!(
@@ -201,25 +239,10 @@ fn close_drains_replacement_connection() {
             .expect("send replacement handshake");
     }
 
-    let (stop_remote, remote_stop) = std::sync::mpsc::channel();
-    let remote = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if remote_stop.try_recv().is_ok() {
-                break;
-            }
-            let _ = replacement
-                .next_event(Duration::from_millis(10))
-                .expect("drive replacement during close");
-        }
-        replacement
-    });
+    let remote = spawn_driver(replacement, "drive replacement during close");
 
     let events = listener.close().expect("close drains replacements");
-    match stop_remote.send(()) {
-        Ok(()) | Err(_) => {}
-    }
-    let _replacement = remote.join().expect("replacement driver thread");
+    let _replacement = remote.stop();
 
     let established: Vec<_> = events
         .iter()
@@ -285,25 +308,10 @@ fn close_drains_pending_replacement_handshake() {
         .next_event(Duration::from_millis(10))
         .expect("accept replacement initial");
 
-    let (stop_remote, remote_stop) = std::sync::mpsc::channel();
-    let remote = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if remote_stop.try_recv().is_ok() {
-                break;
-            }
-            let _ = replacement
-                .next_event(Duration::from_millis(10))
-                .expect("drive replacement during close");
-        }
-        replacement
-    });
+    let remote = spawn_driver(replacement, "drive replacement during close");
 
     let events = listener.close().expect("close drains pending replacement");
-    match stop_remote.send(()) {
-        Ok(()) | Err(_) => {}
-    }
-    let _replacement = remote.join().expect("replacement driver thread");
+    let _replacement = remote.stop();
 
     let established: Vec<_> = events
         .iter()
