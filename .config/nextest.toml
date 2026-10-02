@@ -40,11 +40,15 @@ default-filter = '''
   )
 '''
 
-# Two QUIC tests wait on quiche's idle timer, whose effective value is
+# Three tests wait on quiche's idle timer, whose effective value is
 # max(idle, 3×PTO). PTO follows the RTT quiche measures, and a descheduled
 # thread inflates that, so under load the timer these tests are waiting for
 # moves further away the more loaded the box is — a margin cannot be picked that
 # survives it. They take the box instead.
+#
+# The relay reservation test is here for the other half of that: it drives both
+# endpoints from one thread, so a thread that stops polling for long enough
+# expires the connection its assertions require to still be up.
 #
 # The close-drain tests assert on the events `Endpoint::close()` returns, and
 # `close()` drains for a fixed 500ms by design — shutdown stays bounded, so the
@@ -71,6 +75,7 @@ filter = '''
   )
   or test(=stream_send_tests::stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling)
   or test(=quic_deadline_is_exposed_and_driven_without_socket_input)
+  or test(=std::nat_tests::idle_quic_relay_reservation_stays_live_past_transport_timeout)
 '''
 threads-required = "num-test-threads"
 
@@ -86,5 +91,6 @@ filter = '''
   )
   or test(=stream_send_tests::stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling)
   or test(=quic_deadline_is_exposed_and_driven_without_socket_input)
+  or test(=std::nat_tests::idle_quic_relay_reservation_stays_live_past_transport_timeout)
 '''
 threads-required = "num-test-threads"
