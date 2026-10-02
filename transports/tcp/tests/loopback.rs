@@ -496,10 +496,17 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
     pair.dialer
         .send_stream(id, stream, payload)
         .expect("queue more than the socket will take");
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(200) {
+    // Drive until the dialer has nothing left to do. Parking is the state the
+    // rest of the test needs, so wait for it rather than for a slice of time:
+    // under load a fixed slice buys far fewer polls than it looks like it does.
+    //
+    // A timeout here does mean parked: the provider keeps WRITABLE interest
+    // registered for as long as the transport has bytes to write, so a wait
+    // that expires says the socket has no room and nothing arrived either.
+    let filling = Instant::now();
+    while pair.dialer.wait_for_input(Duration::from_millis(10)) != WaitOutcome::TimedOut {
         let _ = pair.dialer.poll(Now::from_millis(0)).expect("poll dialer");
-        thread::sleep(Duration::from_millis(1));
+        assert!(filling.elapsed() < PATIENCE, "the socket never filled");
     }
 
     // Nothing to read and nowhere to write: the driver has to park.
@@ -514,12 +521,18 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
     // the peer's Yamux acknowledgement arriving -- is deliberately not claimed:
     // loopback buffering makes a socket that stays full unreliable to arrange,
     // so writability cannot be isolated from the bytes coming back.
-    // One poll only takes a bounded bite, so keep the peer reading until it has
-    // actually consumed enough to matter.
+    //
+    // One poll only takes a bounded bite, so the peer reads until the dialer
+    // has something to wake for. The zero-budget probe asks that question
+    // without blocking, and without waiting on the whole 512 KiB: Yamux only
+    // sends what the window allows, and a partial frame raises no data event.
     let draining = Instant::now();
-    while draining.elapsed() < Duration::from_millis(200) {
+    while pair.dialer.wait_for_input(Duration::ZERO) == WaitOutcome::TimedOut {
         let _ = pair.listener.poll(Now::from_millis(0)).expect("peer reads");
-        thread::sleep(Duration::from_millis(1));
+        assert!(
+            draining.elapsed() < PATIENCE,
+            "the peer never drained enough to wake the writer"
+        );
     }
     let began = Instant::now();
     assert_eq!(
