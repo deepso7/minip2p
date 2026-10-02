@@ -106,10 +106,14 @@ fn drive_until(
     what: &str,
     mut done: impl FnMut(&[TransportEvent]) -> bool,
 ) {
+    // Failure backstop, not a budget. Some of these waits are on quiche's idle
+    // timer, whose effective value is max(idle, 3×PTO) — and PTO follows the
+    // RTT quiche measures, which a descheduled thread inflates. The cap has to
+    // sit well clear of that.
     let start = Instant::now();
     while !done(events) {
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < Duration::from_secs(30),
             "timed out waiting for {what}; events: {events:?}"
         );
         std::thread::sleep(Duration::from_millis(2));

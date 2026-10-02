@@ -433,8 +433,11 @@ fn dial_enforces_max_connections() {
 
 #[test]
 fn quic_deadline_is_exposed_and_driven_without_socket_input() {
+    // Long enough that a stall between the handshake and the check below
+    // cannot expire the connection and leave no timer armed. What this proves
+    // is that the timer fires without socket input, not how soon.
     let limits = QuicLimits {
-        idle_timeout_ms: 50,
+        idle_timeout_ms: 1_000,
         ..QuicLimits::default()
     };
     let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
@@ -444,17 +447,17 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
         "connected QUIC session must arm a timer"
     );
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    // The close is what this waits for, so the loop ends when it arrives. The
+    // cap is a failure backstop: under load the idle timer is driven by however
+    // many polls this thread gets, not by how long it sat here.
+    let backstop = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let mut closed = false;
-    while std::time::Instant::now() < deadline {
+    while !closed && std::time::Instant::now() < backstop {
         closed |= client
             .poll(common::now())
             .expect("poll")
             .into_iter()
             .any(|event| matches!(event, TransportEvent::Closed { id, .. } if id == conn_id));
-        if closed {
-            break;
-        }
         let sleep = client
             .next_deadline()
             .map(|deadline| std::time::Duration::from_millis(deadline.millis_until(common::now())))
@@ -469,14 +472,23 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
 
 #[test]
 fn quiet_pair_stays_up_past_idle_timeout() {
+    // The idle timeout and the window it is watched for move together: the
+    // window has to outlast the idle interval for the test to prove anything,
+    // and the interval has to be long enough that a descheduled thread cannot
+    // expire the connection on a loaded box. quiche's effective timeout is
+    // max(idle, 3×PTO), so the margin has to cover the idle interval itself.
+    const IDLE_MS: u64 = 1_000;
+    const OBSERVE: std::time::Duration = std::time::Duration::from_millis(2 * IDLE_MS);
+
     let limits = QuicLimits {
-        idle_timeout_ms: 80,
+        idle_timeout_ms: IDLE_MS,
         ..QuicLimits::default()
     };
     let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
     let (server_id, client_id, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    let started = std::time::Instant::now();
+    let deadline = started + OBSERVE;
     let mut closed = false;
     while std::time::Instant::now() < deadline {
         closed |= server
@@ -500,9 +512,25 @@ fn quiet_pair_stays_up_past_idle_timeout() {
             std::thread::sleep(sleep);
         }
     }
+
+    // A stall can carry the loop past its deadline, leaving a `Closed` that
+    // arrived during the stall unread. Poll once more before judging, or the
+    // test passes exactly when it should fail.
+    for (node, id) in [(&mut server, server_id), (&mut client, client_id)] {
+        closed |= node
+            .poll(common::now())
+            .expect("final poll")
+            .into_iter()
+            .any(|event| matches!(event, TransportEvent::Closed { id: closed_id, .. } if closed_id == id));
+    }
+
     assert!(
         !closed,
         "ack-eliciting keepalive must keep a quiet pair past the idle timeout"
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(IDLE_MS),
+        "the pair has to outlive the idle interval for this to prove anything"
     );
 }
 
