@@ -164,7 +164,7 @@ Stream events are `data`, `remoteWriteClosed`, `closed`, and `dataOverflow`.
 | Pubsub | `message`, `peerSubscribed`, `peerUnsubscribed`, `gossipsubOutboundFailure`, `gossipsubProtocolViolation` |
 | Discovery | `peerDiscovered`, `peerUpdated`, `peerExpired`, `discoveryDialFailed`, `discoveryProtocolViolation` |
 
-`connectionReplaced` (`{ peerId, old, new }`) reports a newer connection taking over the peer's single connection slot; the peer stays connected, streams and pending opens on `old` end with `StreamClosedError`, and `peerReady` (which carries `connId`) fires again for `new`. `connectionClosed` means the peer's last connection closed.
+`connectionReplaced` (`{ peerId, oldConnId, newConnId }`) reports a newer connection taking over the peer's single connection slot; the peer stays connected, streams and pending opens on `oldConnId` end with `StreamClosedError`, and `peerReady` (which carries `connId`) fires again for `newConnId`. `connectionClosed` means the peer's last connection closed.
 
 The catch-all stream uses `inboundStream` metadata instead of the live `stream` handle. Subscribe to the named `stream` event to claim an inbound stream.
 

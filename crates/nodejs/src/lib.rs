@@ -600,9 +600,17 @@ fn event_value(event: P2pEvent) -> serde_json::Value {
             "ConnectionClosed",
             serde_json::json!({ "peerId": peer_id, "connId": conn_id }),
         ),
-        P2pEvent::ConnectionReplaced { peer_id, old, new } => (
+        P2pEvent::ConnectionReplaced {
+            peer_id,
+            old_conn_id,
+            new_conn_id,
+        } => (
             "ConnectionReplaced",
-            serde_json::json!({ "peerId": peer_id, "old": old, "new": new }),
+            serde_json::json!({
+                "peerId": peer_id,
+                "oldConnId": old_conn_id,
+                "newConnId": new_conn_id,
+            }),
         ),
         P2pEvent::PeerReady {
             peer_id,

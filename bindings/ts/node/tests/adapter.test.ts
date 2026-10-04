@@ -484,7 +484,7 @@ describe("Node adapter", () => {
     fake.enqueue(
       [
         {
-          inner: { new: 11n, old: 10n, peerId: "remote" },
+          inner: { newConnId: 11n, oldConnId: 10n, peerId: "remote" },
           tag: "ConnectionReplaced",
         },
         localStreamReady(11n),

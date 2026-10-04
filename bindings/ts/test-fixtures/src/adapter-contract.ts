@@ -210,7 +210,10 @@ export function describeAdapterContract(
       const endpoint = harness.create();
       const native = harness.native();
       const established: number[] = [];
-      const replaced: { readonly old: number; readonly new: number }[] = [];
+      const replaced: {
+        readonly oldConnId: number;
+        readonly newConnId: number;
+      }[] = [];
       endpoint.on("connectionEstablished", ({ connId }) =>
         established.push(connId)
       );
@@ -232,7 +235,7 @@ export function describeAdapterContract(
       });
       native.deliver([
         {
-          inner: { new: NEXT_CONN_ID, old: CONN_ID, peerId: PEER },
+          inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
           tag: "ConnectionReplaced",
         },
       ]);
@@ -241,10 +244,10 @@ export function describeAdapterContract(
       await ended;
       const current = endpoint.connectionInfo(PEER);
       expect(replaced).toMatchObject([
-        { new: current?.connId, old: established[0] },
+        { newConnId: current?.connId, oldConnId: established[0] },
       ]);
       expect(current).toEqual({
-        connId: replaced[0]?.new,
+        connId: replaced[0]?.newConnId,
         readyProtocols: ["/test/1"],
       });
       expect(await endpoint.waitPeerReady(PEER)).toEqual({

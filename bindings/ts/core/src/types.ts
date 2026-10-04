@@ -180,16 +180,16 @@ export interface Minip2pNamedEventMap {
   /** The peer's last connection closed; the peer is now disconnected. */
   connectionClosed: { readonly peerId: string; readonly connId: number };
   /**
-   * A newer connection took the peer's single connection slot from `old`.
-   * The peer stays connected: this stands in for both a `connectionClosed`
-   * for `old` and a `connectionEstablished` for `new`. Every stream and
-   * pending open on `old` ends with it, and a fresh `peerReady` follows for
-   * `new`.
+   * A newer connection took the peer's single connection slot from
+   * `oldConnId`. The peer stays connected: this stands in for both a
+   * `connectionClosed` for `oldConnId` and a `connectionEstablished` for
+   * `newConnId`. Every stream and pending open on `oldConnId` ends with it,
+   * and a fresh `peerReady` follows for `newConnId`.
    */
   connectionReplaced: {
     readonly peerId: string;
-    readonly old: number;
-    readonly new: number;
+    readonly oldConnId: number;
+    readonly newConnId: number;
   };
   /**
    * Identify completed on `connId`. Fires once per connection; one whose

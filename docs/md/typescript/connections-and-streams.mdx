@@ -29,7 +29,7 @@ console.log(result.connectId, result.path);
 
 A string that starts with `/` is an address; any other string is a peer ID. Transport and IP family come from the addresses, and every candidate races under one attempt. Malformed targets throw synchronously; a valid peer ID with no route is admitted and then rejects with `ConnectFailedError`.
 
-`connect` resolves with `{ connectId, peerId, path }`. The first path may be `directDialed`, `directPunched`, or `relayed`. Call `path(peerId)` when you need the current answer; a relayed connection can upgrade after the original Promise resolves. An upgrade arrives as `connectionReplaced` (`{ peerId, old, new }`): the peer stays connected, streams on `old` end with `StreamClosedError`, and Identify runs again on `new`, so `waitPeerReady` waits for the new connection's `peerReady`.
+`connect` resolves with `{ connectId, peerId, path }`. The first path may be `directDialed`, `directPunched`, or `relayed`. Call `path(peerId)` when you need the current answer; a relayed connection can upgrade after the original Promise resolves. An upgrade arrives as `connectionReplaced` (`{ peerId, oldConnId, newConnId }`): the peer stays connected, streams on `oldConnId` end with `StreamClosedError`, and Identify runs again on `newConnId`, so `waitPeerReady` waits for the new connection's `peerReady`.
 
 ## Timeouts and cancellation
 

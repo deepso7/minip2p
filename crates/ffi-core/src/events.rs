@@ -166,16 +166,17 @@ pub enum P2pEvent {
         /// Endpoint-local transport connection id.
         conn_id: u64,
     },
-    /// A newer connection took the peer's single connection slot from `old`.
-    /// The peer stays connected; every stream on `old` ended with it, and a
-    /// fresh `PeerReady` follows for `new`.
+    /// A newer connection took the peer's single connection slot from
+    /// `old_conn_id`.
+    /// The peer stays connected; every stream on `old_conn_id` ended with
+    /// it, and a fresh `PeerReady` follows for `new_conn_id`.
     ConnectionReplaced {
         /// Remote peer.
         peer_id: String,
         /// The replaced connection id.
-        old: u64,
+        old_conn_id: u64,
         /// The connection id now carrying the peer.
-        new: u64,
+        new_conn_id: u64,
     },
     /// A peer's connection completed Identify and is ready for application
     /// protocols. Fires once per connection; one whose `conn_id` is no longer
@@ -459,8 +460,8 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
         },
         EndpointEvent::ConnectionReplaced { peer_id, old, new } => P2pEvent::ConnectionReplaced {
             peer_id: peer_id.to_base58(),
-            old: old.as_u64(),
-            new: new.as_u64(),
+            old_conn_id: old.as_u64(),
+            new_conn_id: new.as_u64(),
         },
         EndpointEvent::IdentifyReceived { peer_id, info } => P2pEvent::IdentifyReceived {
             peer_id: peer_id.to_base58(),

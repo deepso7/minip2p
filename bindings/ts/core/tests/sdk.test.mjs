@@ -1437,7 +1437,7 @@ test("waitPeerReady resolves only for the current connection's peerReady", async
 
   backend.emit(peerReadyOn(1));
   backend.emit({
-    inner: { new: 2, old: 1, peerId: "peer" },
+    inner: { newConnId: 2, oldConnId: 1, peerId: "peer" },
     tag: P2pEvent_Tags.ConnectionReplaced,
   });
   assert.equal(await remainsPending(ready), true);
@@ -1529,7 +1529,7 @@ test("connection replacement ends only the old connection's streams and opens", 
   const live = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
 
   backend.emit({
-    inner: { new: 3, old: 2, peerId: "peer" },
+    inner: { newConnId: 3, oldConnId: 2, peerId: "peer" },
     tag: P2pEvent_Tags.ConnectionReplaced,
   });
 

@@ -1220,7 +1220,7 @@ export class Minip2pBase {
       // terminal events, so they end here.
       this.#connectionEnded(
         event.inner.peerId,
-        event.inner.old,
+        event.inner.oldConnId,
         new StreamClosedError("The stream's connection was replaced"),
         new StreamClosedError(
           "The stream's connection was replaced before it became ready"

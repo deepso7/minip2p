@@ -2215,12 +2215,13 @@ inner: {peerId: string; connId: bigint }): ConnectionClosed_ {
     type ConnectionReplaced__interface = {
         tag: P2pEvent_Tags.ConnectionReplaced;
         inner:
-Readonly<{peerId: string; old: bigint; new: bigint}>
+Readonly<{peerId: string; oldConnId: bigint; newConnId: bigint}>
     };
     /**
-     * A newer connection took the peer's single connection slot from `old`.
-     * The peer stays connected; every stream on `old` ended with it, and a
-     * fresh `PeerReady` follows for `new`.
+     * A newer connection took the peer's single connection slot from
+     * `old_conn_id`.
+     * The peer stays connected; every stream on `old_conn_id` ended with
+     * it, and a fresh `PeerReady` follows for `new_conn_id`.
      */
     class ConnectionReplaced_ extends UniffiEnum implements ConnectionReplaced__interface {
         /**
@@ -2230,15 +2231,15 @@ Readonly<{peerId: string; old: bigint; new: bigint}>
         readonly [uniffiTypeNameSymbol] = "P2pEvent";
         readonly tag = P2pEvent_Tags.ConnectionReplaced;
         readonly inner:
-Readonly<{peerId: string; old: bigint; new: bigint}>;
+Readonly<{peerId: string; oldConnId: bigint; newConnId: bigint}>;
         constructor(
-inner: {peerId: string; old: bigint; new: bigint }) {
+inner: {peerId: string; oldConnId: bigint; newConnId: bigint }) {
             super("P2pEvent", "ConnectionReplaced");
 
             this.inner = Object.freeze(inner);
         }
         static new(
-inner: {peerId: string; old: bigint; new: bigint }): ConnectionReplaced_ {
+inner: {peerId: string; oldConnId: bigint; newConnId: bigint }): ConnectionReplaced_ {
             return new ConnectionReplaced_(inner);
         }
 
@@ -3336,7 +3337,7 @@ const FfiConverterTypeP2pEvent = (() => {
                 case 2: return new P2pEvent.DriverFailed({kind: FfiConverterTypeDriverFailureKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
                 case 3: return new P2pEvent.ConnectionEstablished({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
                 case 4: return new P2pEvent.ConnectionClosed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
-                case 5: return new P2pEvent.ConnectionReplaced({peerId: FfiConverterString.readFromCursor(c), old: FfiConverterUInt64.readFromCursor(c), new: FfiConverterUInt64.readFromCursor(c) });
+                case 5: return new P2pEvent.ConnectionReplaced({peerId: FfiConverterString.readFromCursor(c), oldConnId: FfiConverterUInt64.readFromCursor(c), newConnId: FfiConverterUInt64.readFromCursor(c) });
                 case 6: return new P2pEvent.PeerReady({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), protocols: FfiConverterSequenceString.readFromCursor(c) });
                 case 7: return new P2pEvent.IdentifyReceived({peerId: FfiConverterString.readFromCursor(c), info: FfiConverterTypeIdentifyInfo.readFromCursor(c) });
                 case 8: return new P2pEvent.PingRttMeasured({peerId: FfiConverterString.readFromCursor(c), rttMs: FfiConverterUInt64.readFromCursor(c) });
@@ -3405,8 +3406,8 @@ const FfiConverterTypeP2pEvent = (() => {
                     c.writeI32(5);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
-                    FfiConverterUInt64.writeIntoCursor(inner.old, c);
-                    FfiConverterUInt64.writeIntoCursor(inner.new, c);
+                    FfiConverterUInt64.writeIntoCursor(inner.oldConnId, c);
+                    FfiConverterUInt64.writeIntoCursor(inner.newConnId, c);
                     return;
                 }
                 case P2pEvent_Tags.PeerReady: {
@@ -3680,8 +3681,8 @@ const FfiConverterTypeP2pEvent = (() => {
                     const inner = value.inner;
                     let size = 4;
                     size += FfiConverterString.allocationSize(inner.peerId);
-                    size += FfiConverterUInt64.allocationSize(inner.old);
-                    size += FfiConverterUInt64.allocationSize(inner.new);
+                    size += FfiConverterUInt64.allocationSize(inner.oldConnId);
+                    size += FfiConverterUInt64.allocationSize(inner.newConnId);
                     return size;
                 }
                 case P2pEvent_Tags.PeerReady: {

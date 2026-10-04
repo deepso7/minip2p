@@ -356,7 +356,7 @@ function normalizeEvent(
   if (normalized.tag === P2pEvent_Tags.ConnectionClosed) {
     connectionIds.release(normalized.inner.connId);
   } else if (normalized.tag === P2pEvent_Tags.ConnectionReplaced) {
-    connectionIds.release(normalized.inner.old);
+    connectionIds.release(normalized.inner.oldConnId);
   }
   return normalized;
 }
@@ -375,11 +375,11 @@ function normalizeReservation(
   return normalizeBigInts(reservation) as RelayReservationInfo;
 }
 
-/** Event fields carrying a native connection ID (`old`/`new` belong to `ConnectionReplaced`). */
+/** Event fields carrying a native connection ID. */
 const CONNECTION_ID_KEYS: ReadonlySet<string> = new Set([
   "connId",
-  "old",
-  "new",
+  "oldConnId",
+  "newConnId",
 ]);
 
 /**

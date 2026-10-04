@@ -336,11 +336,11 @@ function normalizeIdentifyInfo(value: unknown): IdentifyInfo {
   );
 }
 
-/** Event fields carrying a native connection ID (`old`/`new` belong to `ConnectionReplaced`). */
+/** Event fields carrying a native connection ID. */
 const CONNECTION_ID_KEYS: ReadonlySet<string> = new Set([
   "connId",
-  "old",
-  "new",
+  "oldConnId",
+  "newConnId",
 ]);
 
 function normalizeNativeValue(
@@ -466,7 +466,7 @@ function endedConnection(event: P2pEvent): number | undefined {
     return event.inner.connId;
   }
   if (event.tag === P2pEvent_Tags.ConnectionReplaced) {
-    return event.inner.old;
+    return event.inner.oldConnId;
   }
   return undefined;
 }
