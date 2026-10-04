@@ -281,6 +281,9 @@ impl<E: EntropySource> NatDriver<E> {
         let handled = self
             .agent
             .handle_event_with_disposition_classified(event, is_circuit, now);
+        if !handled {
+            self.stream_conns.unclaimed(event);
+        }
         // A gone carrier connection (closed, or replaced: its streams end
         // with it) closes the bridges it carried.
         if let SwarmEvent::ConnectionClosed { conn_id, .. }

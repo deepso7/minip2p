@@ -155,6 +155,9 @@ impl GossipsubDriver {
     ) -> bool {
         self.stream_conns.observe(event);
         let handled = self.agent.handle_event(event, now_ms);
+        if !handled {
+            self.stream_conns.unclaimed(event);
+        }
         self.pump(swarm, now_ms);
         handled
     }

@@ -89,6 +89,14 @@ fn simultaneous_connect_keeps_one_shared_connection(listen: &str, ephemeral_dial
             )),
             "the peer must never disconnect: {events:?}"
         );
+        // A losing dial completes as DialFailed, which the `connect` the
+        // winner already settled absorbs.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EndpointEvent::DialFailed { .. })),
+            "a settled connect must not surface its losing dial: {events:?}"
+        );
     }
     assert!(a.is_peer_ready(&b_peer) && b.is_peer_ready(&a_peer));
     assert_eq!(a.connected_peers(), std::slice::from_ref(&b_peer));

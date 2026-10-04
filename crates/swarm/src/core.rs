@@ -1457,12 +1457,21 @@ impl SwarmCore {
     }
 
     /// Closes `conn_id`, the losing half of a simultaneous dial, without
-    /// announcing it. The peer is already connected over the winner, which
-    /// also settled any Connection attempt this dial belonged to, so it does
-    /// not report `DialFailed` either. Like a replaced connection, it stays
-    /// retired until the transport reports it closed.
+    /// announcing it: the peer is already connected over the winner. If it
+    /// was our dial, the dial still completes as `DialFailed`, as every dial
+    /// that ends before `ConnectionEstablished` does; a Connection attempt
+    /// the winner already settled consumes it. Like a replaced connection,
+    /// it stays retired until the transport reports it closed.
     fn reject_simultaneous_dial(&mut self, conn_id: ConnectionId) {
-        self.pending_dials.remove(&conn_id);
+        if let Some(pending) = self.pending_dials.remove(&conn_id) {
+            self.events.push_back(SwarmEvent::DialFailed {
+                conn_id,
+                addr: pending.addr,
+                reason: String::from(
+                    "lost a simultaneous dial: the peer is connected over the lower peer's dial",
+                ),
+            });
+        }
         self.close_unannounced(conn_id);
         self.retired_connections.insert(conn_id);
     }
@@ -4851,15 +4860,29 @@ mod tests {
                 register(&mut core, &peer, new, !current_outbound, upgrade, 4_999);
                 let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
                 assert_eq!(lifecycle(&outputs), ["close 2"], "{case}");
-                assert!(
-                    !outputs
-                        .iter()
-                        .any(|output| matches!(output, SwarmOutput::Event(_))),
-                    "{case}: {outputs:?}"
-                );
+                // Only our own losing dial reports anything: it completes as
+                // DialFailed. The peer's losing dial closes with no event.
+                let events: Vec<_> = outputs
+                    .iter()
+                    .filter_map(|output| match output {
+                        SwarmOutput::Event(event) => Some(event),
+                        SwarmOutput::Action(_) => None,
+                    })
+                    .collect();
+                if current_outbound {
+                    assert!(events.is_empty(), "{case}: {events:?}");
+                } else {
+                    assert!(
+                        matches!(
+                            events.as_slice(),
+                            [SwarmEvent::DialFailed { conn_id, .. }] if *conn_id == new
+                        ),
+                        "{case}: {events:?}"
+                    );
+                }
                 assert_eq!(core.connection_id(&peer), Some(current), "{case}");
 
-                // Its close is silent too: no DialFailed for our losing dial.
+                // Its transport close is bookkeeping only.
                 feed(&mut core, TransportEvent::Closed { id: new });
                 assert!(drain_events(&mut core).is_empty(), "{case}");
                 assert_eq!(core.connection_id(&peer), Some(current), "{case}");

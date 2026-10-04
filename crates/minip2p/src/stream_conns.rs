@@ -53,6 +53,23 @@ impl StreamConns {
         }
     }
 
+    /// Forgets the stream a `StreamReady` announced when the agent did not
+    /// claim it: an application stream is never the agent's to act on.
+    pub(crate) fn unclaimed(&mut self, event: &SwarmEvent) {
+        if let SwarmEvent::StreamReady {
+            peer_id,
+            conn_id,
+            stream_id,
+            ..
+        } = event
+        {
+            let key = (peer_id.clone(), *stream_id);
+            if self.0.get(&key) == Some(conn_id) {
+                self.0.remove(&key);
+            }
+        }
+    }
+
     /// The connection `peer_id`'s stream `stream_id` was observed on, if it
     /// is still live.
     pub(crate) fn get(&self, peer_id: &PeerId, stream_id: StreamId) -> Option<ConnectionId> {
@@ -86,5 +103,26 @@ mod tests {
             stream_id,
         });
         assert_eq!(conns.get(&peer_id, stream_id), Some(new));
+    }
+
+    #[test]
+    fn a_stream_the_agent_did_not_claim_is_forgotten() {
+        let peer_id = PeerId::from_public_key_protobuf(b"stream-conns-app");
+        let ready = SwarmEvent::StreamReady {
+            peer_id: peer_id.clone(),
+            conn_id: ConnectionId::new(1),
+            stream_id: StreamId::new(3),
+            protocol_id: "/app/1".into(),
+            initiated_locally: false,
+        };
+        let mut conns = StreamConns::default();
+        conns.observe(&ready);
+        assert_eq!(
+            conns.get(&peer_id, StreamId::new(3)),
+            Some(ConnectionId::new(1))
+        );
+
+        conns.unclaimed(&ready);
+        assert_eq!(conns.get(&peer_id, StreamId::new(3)), None);
     }
 }
