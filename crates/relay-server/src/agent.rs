@@ -664,7 +664,7 @@ impl RelayServerAgent {
         &mut self,
         token: RelayServerToken,
         result: Result<(), String>,
-        _now: Now,
+        now: Now,
     ) {
         let Some(PendingOperation::Send { peer_id, effect }) =
             self.pending_operations.remove(&token)
@@ -674,11 +674,30 @@ impl RelayServerAgent {
         match result {
             Ok(()) => match effect {
                 SendEffect::CommitReservation(pending) => {
-                    if self
+                    let connected = self
                         .connections
                         .get(&pending.conn_id)
-                        .is_some_and(|connection| connection.peer_id == pending.peer_id)
+                        .is_some_and(|connection| connection.peer_id == pending.peer_id);
+                    // A renewal whose reservation lapsed while its response
+                    // was in flight would recreate it: admit it as new.
+                    let lapsed = pending.renewed
+                        && !self
+                            .reservations
+                            .get(&pending.peer_id)
+                            .is_some_and(|reservation| reservation.conn_id == pending.conn_id);
+                    if connected
+                        && lapsed
+                        && !self.admit_new_reservation(
+                            &pending.peer_id,
+                            pending.conn_id,
+                            now.monotonic_ms,
+                        )
                     {
+                        self.events.push_back(RelayServerEvent::ReservationDenied {
+                            peer_id: pending.peer_id,
+                            status: Status::ResourceLimitExceeded,
+                        });
+                    } else if connected {
                         self.reservations.insert(
                             pending.peer_id.clone(),
                             ReservationRecord {
@@ -690,7 +709,7 @@ impl RelayServerAgent {
                         self.events
                             .push_back(RelayServerEvent::ReservationAccepted {
                                 peer_id: pending.peer_id,
-                                renewed: pending.renewed,
+                                renewed: pending.renewed && !lapsed,
                                 expires_unix_secs: pending.expires_unix_secs,
                             });
                     }
@@ -698,7 +717,7 @@ impl RelayServerAgent {
                 }
                 SendEffect::CommitCircuit(source_stream) => {
                     self.complete_hop(source_stream);
-                    self.commit_circuit(source_stream, _now);
+                    self.commit_circuit(source_stream, now);
                 }
                 SendEffect::StopRequest(_) => {}
                 SendEffect::Forward {
@@ -1542,19 +1561,6 @@ impl RelayServerAgent {
                 } if pending.peer_id == peer_id
             )
         });
-        let pending_initial = self
-            .pending_operations
-            .values()
-            .filter(|operation| {
-                matches!(
-                    operation,
-                    PendingOperation::Send {
-                        effect: SendEffect::CommitReservation(pending),
-                        ..
-                    } if !pending.renewed
-                )
-            })
-            .count();
         let deadline_ms = now
             .monotonic_ms
             .saturating_add(self.config.reservation_duration_secs.saturating_mul(1_000));
@@ -1568,16 +1574,12 @@ impl RelayServerAgent {
         let status = if wire.is_none() {
             Some(Status::ReservationRefused)
         // Renewals keep an admitted reservation alive and spend no token.
-        } else if !renewed
-            && !self.consume_reservation_limits(&peer_id, key.conn_id, now.monotonic_ms)
+        } else if !renewed && !self.admit_new_reservation(&peer_id, key.conn_id, now.monotonic_ms)
+            || pending_for_peer
         {
             Some(Status::ResourceLimitExceeded)
         } else {
-            (pending_for_peer
-                || (!renewed
-                    && self.reservations.len().saturating_add(pending_initial)
-                        >= self.config.max_reservations))
-                .then_some(Status::ResourceLimitExceeded)
+            None
         };
         if let Some(status) = status {
             self.events.push_back(RelayServerEvent::ReservationDenied {
@@ -1648,6 +1650,33 @@ impl RelayServerAgent {
             addrs.pop();
         }
         None
+    }
+
+    /// Admission for a new reservation: spends a rate-limit token, then
+    /// checks `max_reservations` against committed and pending new ones.
+    fn admit_new_reservation(
+        &mut self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        now_ms: u64,
+    ) -> bool {
+        if !self.consume_reservation_limits(peer_id, conn_id, now_ms) {
+            return false;
+        }
+        let pending_initial = self
+            .pending_operations
+            .values()
+            .filter(|operation| {
+                matches!(
+                    operation,
+                    PendingOperation::Send {
+                        effect: SendEffect::CommitReservation(pending),
+                        ..
+                    } if !pending.renewed
+                )
+            })
+            .count();
+        self.reservations.len().saturating_add(pending_initial) < self.config.max_reservations
     }
 
     fn consume_reservation_limits(
@@ -4309,5 +4338,137 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// One-second reservations, so a tick can expire one long before the
+    /// control-stream timeout, and the given per-peer token budget.
+    fn lapse_config(tokens: Option<u32>, max_reservations: usize) -> RelayServerConfig {
+        RelayServerConfig {
+            reservation_duration_secs: 1,
+            max_reservations,
+            reservation_rate_limit_per_peer: tokens.map(|capacity| RateLimit {
+                capacity,
+                refill_interval_ms: 1_000_000,
+            }),
+            reservation_rate_limit_per_ip: None,
+            ..RelayServerConfig::default()
+        }
+    }
+
+    /// Reserves for `peer`, decides a renewal, then lets a tick expire the
+    /// reservation before the renewal's response is reported sent. Returns
+    /// the renewal's send token.
+    fn lapse_renewal(
+        agent: &mut RelayServerAgent,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+    ) -> RelayServerToken {
+        let stream = |stream_id| StreamKey {
+            conn_id,
+            stream_id: StreamId::new(stream_id),
+        };
+        reserve(agent, peer, stream(1));
+        feed_hop(agent, peer, stream(2), reserve_request(), &[]);
+        let Some(RelayServerAction::SendStream { token, .. }) = agent.poll_action() else {
+            panic!("renewal response");
+        };
+        while agent.poll_action().is_some() {}
+        agent.handle_tick(Now::from_millis(1_000));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::ReservationClosed {
+                reason: ReservationCloseReason::Expired,
+                ..
+            })
+        ));
+        token
+    }
+
+    fn relay(config: RelayServerConfig) -> RelayServerAgent {
+        let mut agent =
+            RelayServerAgent::new(PeerId::from_public_key_protobuf(b"relay-lapse"), config)
+                .unwrap();
+        agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        agent
+    }
+
+    #[test]
+    fn lapsed_renewal_is_admitted_as_a_new_reservation() {
+        let mut agent = relay(lapse_config(Some(2), 128));
+        let peer = PeerId::from_public_key_protobuf(b"client-lapse");
+        let conn_id = ConnectionId::new(351);
+        let token = lapse_renewal(&mut agent, &peer, conn_id);
+
+        agent.send_stream_result(token, Ok(()), Now::from_millis(1_000));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::ReservationAccepted { renewed: false, .. })
+        ));
+        assert_eq!(agent.reservation_count(), 1);
+
+        // That spent the second and last token: once it lapses too, a new
+        // reservation is refused.
+        agent.handle_tick(Now::from_millis(2_000));
+        let _ = agent.poll_event();
+        while agent.poll_action().is_some() {}
+        let fresh = StreamKey {
+            conn_id,
+            stream_id: StreamId::new(3),
+        };
+        feed_hop(&mut agent, &peer, fresh, reserve_request(), &[]);
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::ReservationDenied {
+                status: Status::ResourceLimitExceeded,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lapsed_renewal_without_a_token_is_denied() {
+        let mut agent = relay(lapse_config(Some(1), 128));
+        let peer = PeerId::from_public_key_protobuf(b"client-lapse-no-token");
+        let token = lapse_renewal(&mut agent, &peer, ConnectionId::new(352));
+
+        agent.send_stream_result(token, Ok(()), Now::new(1_000, 1_700_000_000));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::ReservationDenied {
+                status: Status::ResourceLimitExceeded,
+                ..
+            })
+        ));
+        assert_eq!(agent.reservation_expires_unix_secs(&peer), None);
+        assert_eq!(agent.reservation_count(), 0);
+    }
+
+    #[test]
+    fn lapsed_renewal_respects_max_reservations() {
+        let mut agent = relay(lapse_config(None, 1));
+        let peer = PeerId::from_public_key_protobuf(b"client-lapse-full");
+        let token = lapse_renewal(&mut agent, &peer, ConnectionId::new(353));
+        // Another peer takes the slot the lapsed reservation freed.
+        let other = PeerId::from_public_key_protobuf(b"client-lapse-other");
+        reserve(
+            &mut agent,
+            &other,
+            StreamKey {
+                conn_id: ConnectionId::new(354),
+                stream_id: StreamId::new(1),
+            },
+        );
+        assert_eq!(agent.reservation_count(), 1);
+
+        agent.send_stream_result(token, Ok(()), Now::from_millis(1_000));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::ReservationDenied {
+                status: Status::ResourceLimitExceeded,
+                ..
+            })
+        ));
+        assert_eq!(agent.reservation_count(), 1);
+        assert_eq!(agent.reservation_expires_unix_secs(&peer), None);
     }
 }

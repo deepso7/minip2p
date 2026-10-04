@@ -712,6 +712,10 @@ fn circuit_replacing_the_promoted_circuit_keeps_the_attempt_alive() {
         !h.agent.is_idle(),
         "the attempt still owns the relayed path"
     );
+    assert!(
+        matches!(h.agent.path(&h.target), Some(Path::Relayed { relay }) if *relay == h.relay),
+        "the adopted circuit carries the attempt's relayed path"
+    );
 
     // A later direct connection still upgrades the attempt's path.
     replace_target(&mut h, other_circuit, ConnectionId::new(50), 500);
