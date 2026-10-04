@@ -53,9 +53,10 @@ default-filter = '''
 # Two more prove a quiet connection survives past its idle timeout —
 # `quiet_pair_stays_up_…` and `idle_quic_relay_reservation_stays_live_…` —
 # driving both endpoints from one thread: a thread that stops polling for long
-# enough expires the connection their assertions require to still be up. Run
-# alone, PTO also stays at loopback scale, so the effective timeout they have to
-# outlast is the configured one.
+# enough expires the connection their assertions require to still be up.
+# Running alone also keeps PTO near loopback scale, so the effective timeout
+# they have to outlast stays near the configured one. That mitigates rather
+# than bounds it: a pause from outside the suite can still stretch PTO.
 #
 # The close-drain tests assert on the events `Endpoint::close()` returns, and
 # `close()` drains for a fixed 500ms by design — shutdown stays bounded, so the

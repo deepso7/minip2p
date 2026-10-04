@@ -474,9 +474,10 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
 fn quiet_pair_stays_up_past_idle_timeout() {
     // The window has to outlast quiche's effective idle timeout,
     // max(idle, 3×PTO), for the test to prove anything. This test runs alone
-    // (see `.config/nextest.toml`), so PTO stays at loopback scale and the
-    // effective timeout is the configured one; the same isolation keeps a
-    // descheduled thread from expiring the connection.
+    // (see `.config/nextest.toml`), which keeps PTO near loopback scale and so
+    // the effective timeout near the configured one, and keeps a descheduled
+    // thread from expiring the connection. That is mitigation, not a bound: a
+    // pause from outside the suite during the handshake can still stretch PTO.
     const IDLE_MS: u64 = 1_000;
     /// Twice the idle timeout: reaching the end of it without a close is
     /// itself the proof that the keepalive held the pair up.
