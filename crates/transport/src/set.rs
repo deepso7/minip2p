@@ -503,8 +503,57 @@ mod blocking_set {
         }
     }
 
+    /// One member wait that may block, counted under the `bench` feature.
+    fn member_wait(member: &mut super::BoxedTransport, timeout: Duration) -> WaitOutcome {
+        let outcome = member.wait_for_input(timeout);
+        #[cfg(feature = "bench")]
+        crate::bench::record_member_wait(timeout, outcome);
+        outcome
+    }
+
     impl BlockingTransport for TransportSet {
         fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
+            let outcome = self.wait_members(timeout);
+            #[cfg(feature = "bench")]
+            crate::bench::record_set_wait(timeout, outcome);
+            outcome
+        }
+
+        fn wait_handle(&self) -> WaitHandle {
+            // The set blocks inside whichever member holds the current slice,
+            // and a caller cannot know which. Nudging all of them is what makes
+            // one handle interrupt the set rather than whichever member
+            // happened to be next.
+            //
+            // The list is the set's own and is read when the handle fires, not
+            // when it is taken, so a member that joins later is woken by a
+            // handle a host already holds. That is why nothing wakeable in the
+            // list yet is not grounds for an inert handle either: a host wires
+            // its wakeup path while composing the set, and a handle that had
+            // answered "inert" then would leave the set asleep inside every
+            // member that filled it afterwards. An empty list simply reaches
+            // nobody, for as long as it stays empty.
+            let wakers = alloc::sync::Arc::clone(&self.wakers);
+            WaitHandle::new(move || {
+                // Held across the whole fan-out so a wait draining its
+                // siblings sees either all of this interrupt or none of it.
+                let mut handles = wakers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if handles.handles.is_empty() {
+                    handles.pending = true;
+                }
+                for handle in &handles.handles {
+                    handle.interrupt();
+                }
+            })
+        }
+    }
+
+    impl TransportSet {
+        /// [`BlockingTransport::wait_for_input`] for the set, short of
+        /// counting the outer call itself under `bench`.
+        fn wait_members(&mut self, timeout: Duration) -> WaitOutcome {
             // Events a failed poll held back are input the caller has not seen.
             if !self.pending.is_empty() {
                 return WaitOutcome::Ready;
@@ -514,7 +563,7 @@ mod blocking_set {
             // one idle wait into a wakeup every slice. Its own handle, which
             // the set's reaches, still wakes it at once.
             if let [member] = &mut self.members[..] {
-                return member.transport.wait_for_input(timeout);
+                return member_wait(&mut member.transport, timeout);
             }
 
             // Probe every member without blocking before blocking on any of
@@ -569,43 +618,13 @@ mod blocking_set {
                     let Some(member) = self.members.get_mut(index) else {
                         return WaitOutcome::Unsupported;
                     };
-                    match member.transport.wait_for_input(slice) {
+                    match member_wait(&mut member.transport, slice) {
                         WaitOutcome::Ready => return WaitOutcome::Ready,
                         WaitOutcome::Interrupted => return self.settle_interrupt(index),
                         WaitOutcome::TimedOut | WaitOutcome::Unsupported => {}
                     }
                 }
             }
-        }
-
-        fn wait_handle(&self) -> WaitHandle {
-            // The set blocks inside whichever member holds the current slice,
-            // and a caller cannot know which. Nudging all of them is what makes
-            // one handle interrupt the set rather than whichever member
-            // happened to be next.
-            //
-            // The list is the set's own and is read when the handle fires, not
-            // when it is taken, so a member that joins later is woken by a
-            // handle a host already holds. That is why nothing wakeable in the
-            // list yet is not grounds for an inert handle either: a host wires
-            // its wakeup path while composing the set, and a handle that had
-            // answered "inert" then would leave the set asleep inside every
-            // member that filled it afterwards. An empty list simply reaches
-            // nobody, for as long as it stays empty.
-            let wakers = alloc::sync::Arc::clone(&self.wakers);
-            WaitHandle::new(move || {
-                // Held across the whole fan-out so a wait draining its
-                // siblings sees either all of this interrupt or none of it.
-                let mut handles = wakers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if handles.handles.is_empty() {
-                    handles.pending = true;
-                }
-                for handle in &handles.handles {
-                    handle.interrupt();
-                }
-            })
         }
     }
 }
@@ -644,6 +663,10 @@ mod tests {
         /// Whether a wait finds input ready.
         #[cfg(feature = "std")]
         ready: bool,
+        /// Input arrives once this many blocking waits have run out, so a
+        /// test can end a set's wait after a known number of turns.
+        #[cfg(feature = "std")]
+        ready_after: Option<usize>,
         /// Whether this member can park at all. Set before joining a set: a
         /// member's handle is taken when it joins.
         #[cfg(feature = "std")]
@@ -814,7 +837,9 @@ mod tests {
             }
             let (can_wait, ready) = {
                 let log = self.log();
-                (log.can_wait, log.ready)
+                let blocking = log.waits.iter().filter(|wait| !wait.is_zero()).count();
+                let arrived = log.ready_after.is_some_and(|after| blocking > after);
+                (log.can_wait, log.ready || arrived)
             };
             if !can_wait {
                 return crate::WaitOutcome::Unsupported;
@@ -1541,6 +1566,49 @@ mod tests {
                 "the only member that can park gets the whole budget, not a \
                  share of it split with one that cannot: {blocking:?}"
             );
+        }
+
+        #[cfg(feature = "bench")]
+        #[test]
+        fn bench_counters_see_every_slice_a_driver_level_counter_would_miss() {
+            let (mut set, tcp, quic) = waking_duo();
+            quic.log().ready_after = Some(2);
+            let before = crate::bench::wait_counters();
+
+            // A budget that cannot run out: QUIC's input ends the wait, after
+            // three turns each.
+            assert_eq!(
+                set.wait_for_input(Duration::from_secs(30)),
+                WaitOutcome::Ready
+            );
+            let seen = crate::bench::wait_counters().since(&before);
+            // Probes are non-blocking and not wakeups; every slice is one.
+            let slices = tcp
+                .waits()
+                .into_iter()
+                .chain(quic.waits())
+                .filter(|wait| !wait.is_zero())
+                .count();
+            assert_eq!(slices, 6, "two members, three turns each");
+            assert_eq!(seen.set_waits, 1, "the driver made one wait");
+            assert_eq!(seen.timed_out, 5, "every turn that ran out is counted");
+            assert_eq!(seen.ready, 1, "and so is the one that found input");
+            assert_eq!(seen.wakeups(), 6);
+        }
+
+        #[cfg(feature = "bench")]
+        #[test]
+        fn bench_counters_see_the_fallback_sleep_of_a_set_that_cannot_park() {
+            let (mut set, ..) = duo();
+            let before = crate::bench::wait_counters();
+
+            assert_eq!(
+                set.wait_for_input(Duration::from_secs(30)),
+                WaitOutcome::Unsupported
+            );
+            let seen = crate::bench::wait_counters().since(&before);
+            assert_eq!(seen.fallback_sleeps, 1);
+            assert_eq!(seen.wakeups(), 0, "nothing parked, so nothing woke");
         }
     }
 }

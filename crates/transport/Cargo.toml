@@ -16,6 +16,8 @@ workspace = true
 [features]
 default = ["std"]
 std = ["minip2p-core/std", "minip2p-platform/std", "thiserror/std"]
+# Bench-only `TransportSet` wait counters; see `minip2p_transport::bench`.
+bench = ["std"]
 
 [dependencies]
 minip2p-core = { path = "../core", version = "0.7.1", default-features = false }

@@ -7,6 +7,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "bench")]
+pub mod bench;
 #[cfg(feature = "std")]
 mod blocking;
 mod connection_endpoint;

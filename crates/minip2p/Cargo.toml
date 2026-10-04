@@ -49,6 +49,9 @@ relay-server = ["std", "dep:minip2p-relay-server"]
 pubsub = ["dep:minip2p-pubsub"]
 discovery = ["nat", "pubsub", "_discovery-driver"]
 mdns = ["nat", "dep:minip2p-mdns", "_discovery-driver"]
+# Bench-only `TransportSet` wait counters (`minip2p_transport::bench`), read by
+# the `endpoint_idle` bench. Off by default and compiled out when off.
+bench = ["std", "minip2p-transport/bench"]
 # Internal aliases for capability-driver dependencies, reached only through
 # the public features above; not a supported opt-in surface.
 _circuit-driver = ["dep:minip2p-circuit"]
@@ -75,6 +78,7 @@ minip2p-transport = { path = "../transport", version = "0.7.1", default-features
 thiserror = { version = "2.0.20", default-features = false }
 
 [dev-dependencies]
+cpu-time = "1.0.0"
 criterion = "0.8.2"
 minip2p-relay = { path = "../relay" }
 minip2p-test-support = { path = "../test-support" }
@@ -83,3 +87,8 @@ minip2p-test-support = { path = "../test-support" }
 name = "endpoint_e2e"
 harness = false
 required-features = ["quic", "tcp"]
+
+[[bench]]
+name = "endpoint_idle"
+harness = false
+required-features = ["quic", "tcp", "relay-server", "pubsub", "mdns", "bench"]

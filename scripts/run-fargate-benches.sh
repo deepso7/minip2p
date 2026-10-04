@@ -20,6 +20,7 @@ pnpm --filter @minip2p/node bench
 python3 scripts/bench_results.py merge \
   target/bench-results/rust-micro.json \
   target/bench-results/rust-wall.json \
+  target/bench-results/custom.json \
   target/bench-results/node-ffi.json \
   --output target/bench-results/current.json \
   --git-sha "$BENCH_GIT_SHA"

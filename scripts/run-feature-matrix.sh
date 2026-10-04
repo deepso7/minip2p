@@ -26,7 +26,7 @@ minip2p-rs|no-default|std,tcp,relay-server
 minip2p-rs|default|tcp
 minip2p-rs|no-default|std,tcp
 minip2p-rs|default|discovery,mdns,tcp
-minip2p-rs|default|discovery,mdns,tcp,relay-server
+minip2p-rs|default|discovery,mdns,tcp,relay-server,bench
 minip2p-rs|no-default|smoltcp
 minip2p-rs|no-default|smoltcp,pubsub
 minip2p-rs|default|nat,smoltcp
@@ -38,6 +38,7 @@ minip2p-rs|no-default|portable-relay,pubsub
 minip2p-rs|default|nat,portable-relay,pubsub
 minip2p-tcp|default|smoltcp
 minip2p-mdns|default|smoltcp
+minip2p-transport|default|bench
 EOF
 )
 

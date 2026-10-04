@@ -216,3 +216,11 @@ Discovery source timestamps use a driver-private monotonic epoch. Compute their 
 With the `pubsub` feature, `.gossipsub()` enables gossipsub and advertises `/meshsub/1.1.0` plus `/meshsub/1.0.0`. Pass a `GossipsubConfig` to `.gossipsub_config(...)` to tune mesh policy; an invalid configuration fails `bind()` before any socket is allocated.
 
 Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see `minip2p::RESERVED_PROTOCOL_IDS`) belong to the endpoint's own handlers; registering one via `EndpointBuilder::protocol` makes the bind step fail, and `Endpoint::add_protocol` rejects it with `SwarmError::ReservedProtocol`.
+
+## Benchmarks
+
+`benches/endpoint_e2e.rs` times connection setup, ping, echo, and transfer over QUIC and TCP. `benches/endpoint_idle.rs` measures what an idle endpoint with no peers costs: `TransportSet` member-wait wakeups per second and process CPU milliseconds per second, for QUIC alone, for QUIC + TCP with the relay server, Gossipsub, and mDNS started, and for the same without mDNS. It needs the `bench` feature, which compiles in the wait counters from `minip2p_transport::bench` and is off by default:
+
+```bash
+cargo bench -p minip2p-rs --features tcp,relay-server,pubsub,mdns,bench --bench endpoint_idle
+```
