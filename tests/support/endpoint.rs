@@ -8,20 +8,10 @@
 //! # Timing
 //!
 //! These tests run in parallel against a real network stack, so a thread can be
-//! descheduled for longer than any budget a test would pick. The convention,
-//! also recorded in `.config/nextest.toml`:
-//!
-//! - Never let a fixed-duration loop stand in for progress. Drive until what
-//!   you are waiting for is observable and end the loop there.
-//! - A remaining time limit is a failure backstop or the timer under test.
-//!   Backstops are generous; they only turn a hang into a readable failure.
-//! - Poll once more after an observation window closes. A stall can carry the
-//!   loop past its deadline with the event that would have failed it unread.
-//! - A test of a deliberately bounded production timer cannot be made
-//!   load-proof from the inside. Keep its assertions strict and give it
-//!   `threads-required = "num-test-threads"` in `.config/nextest.toml`.
-//! - "Nothing happens during this window" assertions are best effort:
-//!   starvation can only make them pass when they should fail.
+//! descheduled for longer than any budget a test would pick. Drive until what
+//! you are waiting for is observable rather than for a fixed slice of time, and
+//! keep time limits as failure backstops. The full convention, and the tests
+//! that run alone because they cannot follow it, live in `.config/nextest.toml`.
 
 use minip2p::{Deadline, Endpoint, EndpointEvent, EndpointWaitOutcome, Error};
 

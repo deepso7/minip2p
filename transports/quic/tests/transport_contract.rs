@@ -472,11 +472,11 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
 
 #[test]
 fn quiet_pair_stays_up_past_idle_timeout() {
-    // The idle timeout and the window it is watched for move together: the
-    // window has to outlast the idle interval for the test to prove anything,
-    // and the interval has to be long enough that a descheduled thread cannot
-    // expire the connection on a loaded box. quiche's effective timeout is
-    // max(idle, 3×PTO), so the margin has to cover the idle interval itself.
+    // The window has to outlast quiche's effective idle timeout,
+    // max(idle, 3×PTO), for the test to prove anything. This test runs alone
+    // (see `.config/nextest.toml`), so PTO stays at loopback scale and the
+    // effective timeout is the configured one; the same isolation keeps a
+    // descheduled thread from expiring the connection.
     const IDLE_MS: u64 = 1_000;
     /// Twice the idle timeout: reaching the end of it without a close is
     /// itself the proof that the keepalive held the pair up.

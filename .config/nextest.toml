@@ -13,9 +13,12 @@
 #   drains for a fixed 500ms) cannot be made load-proof from the inside. It
 #   keeps its strict assertions and gets `threads-required =
 #   "num-test-threads"` below, so nothing else runs beside it.
-# - "Nothing happens during this quiet window" assertions are best effort:
-#   starvation can only make them pass when they should fail, never the other
-#   way round, so they are left alone.
+# - Poll once more after an observation window closes. A stall can carry the
+#   loop past its deadline with the event that would have failed it unread.
+# - "Nothing arrives during this quiet window" assertions are best effort:
+#   starvation can only make them pass when they should fail, so they are left
+#   alone. "The connection stays up" is the opposite case — starvation expires
+#   timers and fails it with nothing broken — so it takes the box as well.
 #
 # The `variants` profile drops one test: the reconnect-churn soak.
 #
@@ -40,15 +43,17 @@ default-filter = '''
   )
 '''
 
-# Three tests wait on quiche's idle timer, whose effective value is
+# Two tests wait on quiche's idle timer, whose effective value is
 # max(idle, 3×PTO). PTO follows the RTT quiche measures, and a descheduled
 # thread inflates that, so under load the timer these tests are waiting for
 # moves further away the more loaded the box is — a margin cannot be picked that
 # survives it. They take the box instead.
 #
-# The relay reservation test is here for the other half of that: it drives both
-# endpoints from one thread, so a thread that stops polling for long enough
-# expires the connection its assertions require to still be up.
+# Two more prove a quiet connection survives past its idle timeout, driving both
+# endpoints from one thread: a thread that stops polling for longer than the
+# timeout expires the connection their assertions require to still be up. Run
+# alone, PTO also stays at loopback scale, so their observation windows outlast
+# the effective timeout rather than only the configured one.
 #
 # The close-drain tests assert on the events `Endpoint::close()` returns, and
 # `close()` drains for a fixed 500ms by design — shutdown stays bounded, so the
@@ -58,11 +63,8 @@ default-filter = '''
 #
 # `threads-required` is what does that. A `[test-groups]` entry with
 # `max-threads = 1` would only keep the group's own members apart, leaving the
-# rest of the suite running alongside.
-#
-# Spelled out under both profiles rather than relying on how overrides resolve
-# across them: the feature matrix runs these same tests, and the cost of the
-# duplicate is a few lines.
+# rest of the suite running alongside. Default-profile overrides also apply
+# under `variants`, so this one entry covers the feature matrix too.
 [[profile.default.overrides]]
 filter = '''
   (
@@ -75,22 +77,7 @@ filter = '''
   )
   or test(=stream_send_tests::stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling)
   or test(=quic_deadline_is_exposed_and_driven_without_socket_input)
-  or test(=std::nat_tests::idle_quic_relay_reservation_stays_live_past_transport_timeout)
-'''
-threads-required = "num-test-threads"
-
-[[profile.variants.overrides]]
-filter = '''
-  (
-    binary_id(minip2p-rs::reconnect_churn)
-    and (
-      test(=listener_reclaims_state_after_dialer_close)
-      or test(=close_drains_replacement_connection)
-      or test(=close_drains_pending_replacement_handshake)
-    )
-  )
-  or test(=stream_send_tests::stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling)
-  or test(=quic_deadline_is_exposed_and_driven_without_socket_input)
+  or test(=quiet_pair_stays_up_past_idle_timeout)
   or test(=std::nat_tests::idle_quic_relay_reservation_stays_live_past_transport_timeout)
 '''
 threads-required = "num-test-threads"

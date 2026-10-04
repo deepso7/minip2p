@@ -217,7 +217,7 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
     }
 
     // A stall can carry the loop past its deadline with events still queued,
-    // including a reservation that was lost during it. Drain both sides before
+    // including a reservation that was lost during it. Drain the client before
     // judging rather than reading state the last poll never caught up with.
     while let Some(event) = client
         .next_event(std::time::Duration::ZERO)
@@ -227,11 +227,6 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
             reservation_events.push(event);
         }
     }
-    while relay
-        .next_event(std::time::Duration::ZERO)
-        .expect("drain relay")
-        .is_some()
-    {}
 
     assert!(ping_rtts > 0, "reservation liveness should send QUIC pings");
     assert!(client.active_reservation().is_some());
