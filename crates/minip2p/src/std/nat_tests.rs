@@ -157,7 +157,7 @@ fn drive_until_reserved(
 fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
     // The timeout has to be long enough that a stall cannot expire the relay
     // connection: the transport keeps a quiet connection alive at half of it,
-    // so one would have to exceed most of `IDLE_MS`. This test also runs alone
+    // so one would have to exceed half of `IDLE_MS`. This test also runs alone
     // (see `.config/nextest.toml`), since it drives both endpoints from one
     // thread.
     const IDLE_MS: u64 = 1_500;
