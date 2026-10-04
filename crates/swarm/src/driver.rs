@@ -776,13 +776,13 @@ mod tests {
 
     /// Deterministic transport that surfaces two connections to the same
     /// peer on consecutive polls and records when the driver closes one.
-    struct SupersessionTransport {
+    struct ReplacementTransport {
         event_batches: VecDeque<Vec<TransportEvent>>,
         next_stream: u64,
         close_calls: Vec<ConnectionId>,
     }
 
-    impl SupersessionTransport {
+    impl ReplacementTransport {
         fn new(peer_id: PeerId, original: ConnectionId, replacement: ConnectionId) -> Self {
             let endpoint = || ConnectionEndpoint::with_peer_id(Multiaddr::new(), peer_id.clone());
             Self {
@@ -802,7 +802,7 @@ mod tests {
         }
     }
 
-    impl Transport for SupersessionTransport {
+    impl Transport for ReplacementTransport {
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
             Err(TransportError::Unsupported { operation: "dial" })
         }
@@ -850,15 +850,15 @@ mod tests {
         }
     }
 
-    impl BlockingTransport for SupersessionTransport {}
+    impl BlockingTransport for ReplacementTransport {}
 
     fn replacement_swarm(
         remote_peer: PeerId,
         original: ConnectionId,
         replacement: ConnectionId,
-    ) -> Swarm<SupersessionTransport> {
+    ) -> Swarm<ReplacementTransport> {
         let keypair = Ed25519Keypair::generate();
-        let transport = SupersessionTransport::new(remote_peer, original, replacement);
+        let transport = ReplacementTransport::new(remote_peer, original, replacement);
         let identify = IdentifyConfig {
             protocol_version: "test/1".into(),
             agent_version: "test/1".into(),

@@ -791,8 +791,8 @@ fn when_private_policy_follows_the_reachability_verdict() {
 /// Regression test for a failure first seen against a live relay: the
 /// reservation manager and a connect attempt's relay leg both dialed the
 /// relay while the first handshake was still in flight (real-network RTT),
-/// producing two connections — and the second superseded the first, killing
-/// the attempt with "relay connection was superseded".
+/// producing two connections — and the second replaced the first, killing
+/// the attempt with "relay connection was replaced".
 #[test]
 fn concurrent_reservation_and_connect_share_one_relay_dial() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
@@ -811,7 +811,7 @@ fn concurrent_reservation_and_connect_share_one_relay_dial() {
     assert_eq!(
         dial_count_for(&actions, &relay),
         0,
-        "a second relay dial supersedes the first connection: {actions:?}"
+        "a second relay dial replaces the first connection: {actions:?}"
     );
 
     // The shared connection comes up: both machines proceed, each opening
@@ -837,7 +837,7 @@ fn concurrent_reservation_and_connect_share_one_relay_dial() {
 /// deadline. A probe dial is legitimate for `probe_deadline_ms` (20s); if
 /// the entry expired at the relay-leg deadline (12s) instead, a connect
 /// attempt arriving in between would dial the same peer a second time —
-/// recreating the supersede this map exists to prevent.
+/// recreating the replacement this map exists to prevent.
 #[test]
 fn pending_probe_dial_covers_the_probe_deadline_not_the_relay_legs() {
     // The AutoNAT server doubles as the configured relay, so the probe's
@@ -856,7 +856,7 @@ fn pending_probe_dial_covers_the_probe_deadline_not_the_relay_legs() {
 
     // A connect starts past the relay-leg deadline but inside the probe
     // deadline: the probe's dial is still in flight, so the relay leg must
-    // join it rather than open a superseding second connection.
+    // join it rather than open a second, replacing connection.
     start(
         &mut hk.agent,
         1,

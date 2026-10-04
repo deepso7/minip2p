@@ -549,7 +549,7 @@ fn open_direct_channel(
     // `PathEstablished` and `PathUpgraded` can land before the connection's
     // own `ConnectionEstablished` is taken from the Endpoint event stream.
     // Drain what is already queued before opening the stream, so a stale
-    // establishment cannot masquerade as a superseding punch connection —
+    // establishment cannot masquerade as a replacing punch connection —
     // that would burn the stream and force a needless retry on every plain
     // direct dial.
     for event in endpoint
@@ -628,7 +628,7 @@ fn ping_loop(
                     stats.print_summary();
                     return Err(format!("ping send: {e}").into());
                 }
-                // A punch race can supersede the direct connection moments
+                // A punch race can replace the direct connection moments
                 // after the upgrade; the stream dies silently and this send
                 // is the first to notice. Reopen on the surviving connection
                 // — the reopen resends every outstanding seq, this one
@@ -741,7 +741,7 @@ fn ping_loop(
                 return Err("ping channel closed".into());
             }
             // Connection lifecycle is connection-scoped, while this channel
-            // is peer-scoped. During QUIC supersession the old circuit can
+            // is peer-scoped. During a QUIC Connection replacement the old circuit can
             // close just before the replacement direct connection is
             // delivered. The matching StreamClosed event (or a failed send)
             // is the authoritative signal that this channel itself died.

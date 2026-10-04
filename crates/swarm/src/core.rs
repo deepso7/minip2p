@@ -473,7 +473,7 @@ impl SwarmCore {
     ///
     /// Actions are normally prioritized over application events because
     /// executing an action can feed more input back into the core. Connection
-    /// supersession is the one exception: its transport close is deferred
+    /// replacement is the one exception: its transport close is deferred
     /// until the eager old-connection event has been yielded.
     pub fn poll_output(&mut self) -> Option<SwarmOutput> {
         if let Some(action) = self.actions.pop_front() {
@@ -3503,6 +3503,50 @@ mod tests {
     }
 
     #[test]
+    fn replacement_chain_reports_each_hand_over_then_closes_in_order() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"chained-peer");
+        let (old, new, newer) = (
+            ConnectionId::new(1),
+            ConnectionId::new(2),
+            ConnectionId::new(3),
+        );
+        for conn_id in [old, new, newer] {
+            connect_again(&mut core, &peer_id, conn_id, false);
+        }
+
+        let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+        assert_eq!(
+            lifecycle(&outputs),
+            [
+                "established 1",
+                "replaced 1->2",
+                "replaced 2->3",
+                "close 1",
+                "close 2"
+            ]
+        );
+        let retired: Vec<_> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                SwarmOutput::Action(action)
+                    if connection_action_matches(action, old)
+                        || connection_action_matches(action, new) =>
+                {
+                    Some(action)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            retired.len(),
+            2,
+            "only the closes target retired ids: {retired:?}"
+        );
+        assert_eq!(core.connection_id(&peer_id), Some(newer));
+    }
+
+    #[test]
     fn identity_upgrade_onto_connected_peer_replaces_without_orphan() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"upgrade-replaced-peer");
@@ -4021,7 +4065,7 @@ mod tests {
                     ..
                 } if *conn_id == newer_conn && *stream_id == stale_stream
             )),
-            "ping must not send on a stream id from the superseded connection"
+            "ping must not send on a stream id from the replaced connection"
         );
     }
 

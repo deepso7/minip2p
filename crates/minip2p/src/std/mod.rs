@@ -3262,7 +3262,7 @@ mod tests {
     #[test]
     fn a_peer_is_reached_over_the_transport_its_address_names() {
         // One peer per transport: the swarm keeps a single connection per
-        // peer, so two paths to one host would be the second superseding the
+        // peer, so two paths to one host would be the second replacing the
         // first rather than a test of which path each address took.
         let mut over_tcp = Endpoint::builder()
             .listen_on("/ip4/127.0.0.1/tcp/0")

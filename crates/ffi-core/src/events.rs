@@ -189,7 +189,6 @@ pub enum P2pEvent {
         /// Protocols advertised by the peer.
         protocols: Vec<String>,
     },
-
     /// A peer supplied a new Identify snapshot.
     IdentifyReceived {
         /// Remote peer.
@@ -476,7 +475,6 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
             conn_id: conn_id.as_u64(),
             protocols,
         },
-
         EndpointEvent::PingRttMeasured { peer_id, rtt_ms } => P2pEvent::PingRttMeasured {
             peer_id: peer_id.to_base58(),
             rtt_ms,
@@ -815,6 +813,30 @@ mod tests {
             Some(P2pEvent::ConnectionEstablished {
                 peer_id: remote.to_base58(),
                 conn_id: 17,
+            })
+        );
+        assert_eq!(
+            convert_swarm(EndpointEvent::ConnectionReplaced {
+                peer_id: remote.clone(),
+                old: ConnectionId::new(17),
+                new: ConnectionId::new(18),
+            }),
+            Some(P2pEvent::ConnectionReplaced {
+                peer_id: remote.to_base58(),
+                old_conn_id: 17,
+                new_conn_id: 18,
+            })
+        );
+        assert_eq!(
+            convert_swarm(EndpointEvent::PeerReady {
+                peer_id: remote.clone(),
+                conn_id: ConnectionId::new(18),
+                protocols: vec!["/example/1".into()],
+            }),
+            Some(P2pEvent::PeerReady {
+                peer_id: remote.to_base58(),
+                conn_id: 18,
+                protocols: vec!["/example/1".into()],
             })
         );
     }

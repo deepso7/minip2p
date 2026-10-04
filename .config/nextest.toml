@@ -61,7 +61,7 @@ default-filter = '''
 # The close-drain tests assert on the events `Endpoint::close()` returns, and
 # `close()` drains for a fixed 500ms by design — shutdown stays bounded, so the
 # events it returns are best effort. The assertions are not: they are what keeps
-# a superseded connection from being dropped silently. The only way to have both
+# a replaced connection from being dropped silently. The only way to have both
 # is to stop the box from stealing those 500ms, so these three run alone.
 #
 # `threads-required` is what does that. A `[test-groups]` entry with

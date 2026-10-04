@@ -894,7 +894,7 @@ impl ConnectEngine {
     /// Aborts a candidate dial. When the dial was already gone (`Ok(false)`)
     /// or `close` failed (`Err`, pending restored), a `DialFailed` may still
     /// be queued — tombstone the id so `observe` consumes it. On `Err`, also
-    /// veto establishment so a restored dial cannot supersede an existing peer
+    /// veto establishment so a restored dial cannot replace an existing peer
     /// connection.
     fn abort_one<T: Transport, E: EntropySource>(
         &mut self,

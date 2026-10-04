@@ -804,7 +804,6 @@ export class Minip2pBase {
     });
     return Promise.race([ready, disconnected]).finally(() => {
       removeExternalAbort?.();
-
       controller.abort();
     });
   }

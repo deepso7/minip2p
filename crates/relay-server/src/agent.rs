@@ -4237,8 +4237,50 @@ mod tests {
 
     #[test]
     fn replacing_a_leg_connection_closes_its_circuit() {
+        for leg in [CircuitLeg::Source, CircuitLeg::Destination] {
+            let (mut agent, source, destination, source_stream, stop_stream) =
+                connected_circuit(RelayServerConfig::default(), 0);
+            let (peer, old, other_stream) = match leg {
+                CircuitLeg::Source => (&source, source_stream.conn_id, stop_stream),
+                CircuitLeg::Destination => (&destination, stop_stream.conn_id, source_stream),
+            };
+            replace(&mut agent, peer, old, ConnectionId::new(62), false, 1);
+
+            assert!(
+                matches!(
+                    agent.poll_event(),
+                    Some(RelayServerEvent::CircuitClosed {
+                        reason: CircuitCloseReason::ConnectionClosed { leg: closed },
+                        ..
+                    }) if closed == leg
+                ),
+                "{leg:?}"
+            );
+            assert_eq!(agent.circuit_count(), 0, "{leg:?}");
+            assert!(
+                matches!(
+                    agent.poll_action(),
+                    Some(RelayServerAction::ResetStream { stream, .. }) if stream == other_stream
+                ),
+                "{leg:?}: the surviving leg's stream is reset"
+            );
+            // Only the destination's own reservation follows its connection.
+            let reservation_conn = match leg {
+                CircuitLeg::Source => stop_stream.conn_id,
+                CircuitLeg::Destination => ConnectionId::new(62),
+            };
+            assert_eq!(
+                agent.reservation_connection(&destination),
+                Some(reservation_conn),
+                "{leg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replacing_the_destination_fails_a_pending_connect() {
         let (mut agent, _, destination, source_stream, stop_stream) =
-            connected_circuit(RelayServerConfig::default(), 0);
+            pending_stop(RelayServerConfig::default(), 0);
         replace(
             &mut agent,
             &destination,
@@ -4250,22 +4292,22 @@ mod tests {
 
         assert!(matches!(
             agent.poll_event(),
-            Some(RelayServerEvent::CircuitClosed {
-                reason: CircuitCloseReason::ConnectionClosed {
-                    leg: CircuitLeg::Destination,
-                },
+            Some(RelayServerEvent::CircuitDenied {
+                status: Status::ConnectionFailed,
                 ..
             })
         ));
-        assert_eq!(agent.circuit_count(), 0);
-        assert!(matches!(
-            agent.poll_action(),
-            Some(RelayServerAction::ResetStream { stream, .. }) if stream == source_stream
-        ));
-        assert_eq!(
-            agent.reservation_connection(&destination),
-            Some(ConnectionId::new(62))
+        let actions: Vec<_> = core::iter::from_fn(|| agent.poll_action()).collect();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                RelayServerAction::SendStream { stream, .. } if *stream == source_stream
+            )),
+            "the source hears the failure: {actions:?}"
         );
+        assert!(agent.pending_circuits.is_empty());
+        assert!(agent.stop_to_source.is_empty());
+        assert!(!agent.owns_stream(stop_stream));
     }
 
     #[test]

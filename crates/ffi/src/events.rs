@@ -231,7 +231,6 @@ pub enum P2pEvent {
         /// Protocols advertised by the peer.
         protocols: Vec<String>,
     },
-
     /// A peer supplied a new Identify snapshot.
     IdentifyReceived {
         /// Remote peer.

@@ -948,7 +948,7 @@ fn write_stop_resets_the_outbound_stream_and_is_claimed_on_inbound() {
 }
 
 #[test]
-fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
+fn disconnect_preserves_backoff_and_replacement_reannounces_subscriptions() {
     let mut agent = agent();
     agent.subscribe("room", 0).unwrap();
     let remote = peer(2);
@@ -1037,7 +1037,7 @@ fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
         },
         6,
     );
-    let superseded = make_ready(
+    let replaced = make_ready(
         &mut agent,
         &remote,
         StreamId::new(12),
@@ -1045,14 +1045,14 @@ fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
         6,
     );
     let rpc = decode_rpc(
-        &sent(&superseded)
-            .expect("supersede subscription snapshot")
+        &sent(&replaced)
+            .expect("replacement subscription snapshot")
             .0,
     );
     assert_eq!(rpc.subscriptions.len(), 1);
     assert_eq!(rpc.subscriptions[0].subscribe, Some(true));
     assert_eq!(rpc.subscriptions[0].topic_id.as_deref(), Some("room"));
-    ack(&mut agent, &remote, &superseded, 6);
+    ack(&mut agent, &remote, &replaced, 6);
     drain_actions(&mut agent);
     inbound_open(&mut agent, &remote, StreamId::new(13), 6);
     remote_subscribe(&mut agent, &remote, StreamId::new(13), "room", 7);
