@@ -4,7 +4,7 @@
 use alloc::collections::BTreeMap;
 
 use minip2p_core::PeerId;
-use minip2p_swarm::SwarmEvent;
+use minip2p_swarm::{SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
 use minip2p_transport::{ConnectionId, StreamId};
 
 /// The connection each stream an internal agent may act on was observed on.
@@ -43,6 +43,21 @@ impl StreamConns {
                 if self.0.get(&key) == Some(conn_id) {
                     self.0.remove(&key);
                 }
+            }
+            // A stream whose negotiation failed is reset without a
+            // `StreamClosed`. The error may not name the peer, but the
+            // connection and stream id identify the stream.
+            SwarmEvent::Error(SwarmRuntimeError {
+                kind:
+                    SwarmErrorKind::Multistream
+                    | SwarmErrorKind::UnsupportedProtocol
+                    | SwarmErrorKind::OpenStreamFailed,
+                conn_id: Some(conn_id),
+                stream_id: Some(stream_id),
+                ..
+            }) => {
+                self.0
+                    .retain(|(_, stream), conn| stream != stream_id || conn != conn_id);
             }
             // Streams end with their connection without per-stream events.
             SwarmEvent::ConnectionClosed { conn_id, .. }
@@ -103,6 +118,30 @@ mod tests {
             stream_id,
         });
         assert_eq!(conns.get(&peer_id, stream_id), Some(new));
+    }
+
+    #[test]
+    fn a_stream_whose_negotiation_failed_is_forgotten() {
+        let peer_id = PeerId::from_public_key_protobuf(b"stream-conns-unsupported");
+        let (conn_id, stream_id) = (ConnectionId::new(1), StreamId::new(3));
+        let mut conns = StreamConns::default();
+        conns.opened(&peer_id, conn_id, stream_id);
+        let failed = |conn_id, stream_id| {
+            SwarmEvent::Error(SwarmRuntimeError {
+                kind: SwarmErrorKind::UnsupportedProtocol,
+                peer_id: None,
+                conn_id: Some(conn_id),
+                stream_id: Some(stream_id),
+                detail: "remote peer does not support protocol".into(),
+            })
+        };
+
+        // Another connection's stream 3 failing leaves this one.
+        conns.observe(&failed(ConnectionId::new(2), stream_id));
+        assert_eq!(conns.get(&peer_id, stream_id), Some(conn_id));
+
+        conns.observe(&failed(conn_id, stream_id));
+        assert_eq!(conns.get(&peer_id, stream_id), None);
     }
 
     #[test]

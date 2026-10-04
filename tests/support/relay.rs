@@ -112,22 +112,14 @@ impl RelayMachine {
                 conn_id,
                 stream_id,
             } => self.drop_stream(endpoint, &(peer_id, conn_id, stream_id)),
-            EndpointEvent::ConnectionClosed { peer_id, .. } => {
-                let dead: Vec<_> = self
-                    .bridges
-                    .keys()
-                    .filter(|(peer, _, _)| peer == &peer_id)
-                    .cloned()
-                    .collect();
-                for key in dead {
-                    self.drop_stream(endpoint, &key);
-                }
-                self.hop_buffers.retain(|(peer, _, _), _| peer != &peer_id);
-                self.pending_stops
-                    .retain(|(peer, _, _), _| peer != &peer_id);
-                self.hop_to_stop
-                    .retain(|(peer, _, _), stop| peer != &peer_id && stop.0 != peer_id);
-            }
+            // A replaced connection ends its streams without per-stream
+            // `StreamClosed` events, exactly like a closed one.
+            EndpointEvent::ConnectionClosed { peer_id, conn_id }
+            | EndpointEvent::ConnectionReplaced {
+                peer_id,
+                old: conn_id,
+                ..
+            } => self.drop_connection(endpoint, &peer_id, conn_id),
             _ => {}
         }
         Ok(())
@@ -295,6 +287,25 @@ impl RelayMachine {
         self.bridges.insert(key, pending.hop);
         self.trace.push("bridge active".into());
         Ok(())
+    }
+
+    /// Forgets every stream on `(peer, conn)`, resetting the far half of
+    /// its bridges and its pending STOP streams.
+    fn drop_connection(&mut self, endpoint: &mut Endpoint, peer: &PeerId, conn: ConnectionId) {
+        let on_conn = |(p, c, _): &StreamKey| p == peer && *c == conn;
+        let dead: Vec<_> = self
+            .bridges
+            .keys()
+            .chain(self.hop_to_stop.keys())
+            .filter(|key| on_conn(key))
+            .cloned()
+            .collect();
+        for key in dead {
+            self.drop_stream(endpoint, &key);
+        }
+        self.hop_buffers.retain(|key, _| !on_conn(key));
+        self.pending_stops.retain(|key, _| !on_conn(key));
+        self.hop_to_stop.retain(|_, stop| !on_conn(stop));
     }
 
     fn drop_stream(&mut self, endpoint: &mut Endpoint, key: &StreamKey) {

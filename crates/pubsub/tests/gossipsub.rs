@@ -93,10 +93,21 @@ fn make_ready(
 }
 
 fn inbound_open(agent: &mut GossipsubAgent, peer: &PeerId, stream_id: StreamId, now_ms: u64) {
+    inbound_open_on(agent, peer, ConnectionId::new(1), stream_id, now_ms);
+}
+
+/// [`inbound_open`] on a specific connection, e.g. a replacement's `new`.
+fn inbound_open_on(
+    agent: &mut GossipsubAgent,
+    peer: &PeerId,
+    conn_id: ConnectionId,
+    stream_id: StreamId,
+    now_ms: u64,
+) {
     assert!(agent.handle_event(
         &SwarmEvent::StreamReady {
             peer_id: peer.clone(),
-            conn_id: ConnectionId::new(1),
+            conn_id,
             stream_id,
             protocol_id: MESHSUB_PROTOCOL_ID_V11.to_string(),
             initiated_locally: false,
@@ -112,10 +123,21 @@ fn inbound_rpc(
     rpc: Rpc,
     now_ms: u64,
 ) {
+    inbound_rpc_on(agent, peer, ConnectionId::new(1), stream_id, rpc, now_ms);
+}
+
+fn inbound_rpc_on(
+    agent: &mut GossipsubAgent,
+    peer: &PeerId,
+    conn_id: ConnectionId,
+    stream_id: StreamId,
+    rpc: Rpc,
+    now_ms: u64,
+) {
     assert!(agent.handle_event(
         &SwarmEvent::StreamData {
             peer_id: peer.clone(),
-            conn_id: ConnectionId::new(1),
+            conn_id,
             stream_id,
             data: encode_frame(&rpc.encode()),
         },
@@ -130,9 +152,21 @@ fn remote_subscribe(
     topic: &str,
     now_ms: u64,
 ) {
-    inbound_rpc(
+    remote_subscribe_on(agent, peer, ConnectionId::new(1), stream_id, topic, now_ms);
+}
+
+fn remote_subscribe_on(
+    agent: &mut GossipsubAgent,
+    peer: &PeerId,
+    conn_id: ConnectionId,
+    stream_id: StreamId,
+    topic: &str,
+    now_ms: u64,
+) {
+    inbound_rpc_on(
         agent,
         peer,
+        conn_id,
         stream_id,
         Rpc {
             subscriptions: vec![SubOpts {
@@ -1823,8 +1857,9 @@ fn subscription_events_stay_balanced_across_a_replacement() {
         },
         2,
     );
-    inbound_open(&mut agent, &remote, StreamId::new(9), 2);
-    remote_subscribe(&mut agent, &remote, StreamId::new(9), "room", 3);
+    let new_conn = ConnectionId::new(2);
+    inbound_open_on(&mut agent, &remote, new_conn, StreamId::new(9), 2);
+    remote_subscribe_on(&mut agent, &remote, new_conn, StreamId::new(9), "room", 3);
 
     assert_eq!(
         subscription_events(&drain_events(&mut agent), &remote),

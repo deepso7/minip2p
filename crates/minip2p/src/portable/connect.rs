@@ -727,13 +727,16 @@ impl ConnectEngine {
                 if keep_dials {
                     let pending: Vec<ConnectionId> = pending.collect();
                     self.suppressed.extend(pending.iter().copied());
+                    // A later settle opens a new window for every kept dial.
+                    let expires_ms = now_ms.saturating_add(SIMULTANEOUS_DIAL_WINDOW_MS);
                     let retained =
                         self.retained
                             .entry(peer_id.clone())
                             .or_insert_with(|| RetainedDials {
                                 dials: BTreeSet::new(),
-                                expires_ms: now_ms.saturating_add(SIMULTANEOUS_DIAL_WINDOW_MS),
+                                expires_ms,
                             });
+                    retained.expires_ms = retained.expires_ms.max(expires_ms);
                     retained.dials.extend(pending);
                 } else {
                     self.abort_pending(runtime, pending);
@@ -751,6 +754,18 @@ impl ConnectEngine {
                 };
             }
             self.attempts.insert(id, attempt);
+        }
+    }
+
+    /// Aborts the dials kept open for `peer`'s simultaneous dial, so an
+    /// explicit disconnect is not undone by one of them landing later.
+    pub(crate) fn abort_retained<T: Transport, E: EntropySource>(
+        &mut self,
+        peer: &PeerId,
+        runtime: &mut SwarmRuntime<T, E>,
+    ) {
+        if let Some(retained) = self.retained.remove(peer) {
+            self.abort_pending(runtime, retained.dials);
         }
     }
 
@@ -1655,6 +1670,49 @@ mod tests {
         assert_eq!(closes, vec![ConnectionId::new(1), ConnectionId::new(2)]);
         assert_eq!(engine.next_deadline(), None);
         assert!(engine.suppressed.is_empty() && engine.retained.is_empty());
+    }
+
+    #[test]
+    fn disconnecting_the_peer_aborts_its_kept_dials() {
+        let (mut runtime, mut engine, peer, _) = lower_peer_settled_by_the_peers_dial();
+        engine.abort_retained(&peer, &mut runtime);
+        let mut closes = runtime.transport().closes.clone();
+        closes.sort();
+        assert_eq!(closes, vec![ConnectionId::new(1), ConnectionId::new(2)]);
+        assert!(engine.suppressed.is_empty() && engine.retained.is_empty());
+    }
+
+    #[test]
+    fn a_later_settle_extends_the_kept_dials_window() {
+        let (mut runtime, mut engine, peer, inbound) = lower_peer_settled_by_the_peers_dial();
+        // The peer's dial closes; a new attempt dials, and the peer's next
+        // dial settles it inside the first window.
+        runtime.transport_mut().push_closed(inbound);
+        drain(&mut engine, &mut runtime, 1_000);
+        let id = engine.connect(addr(&peer, 3).into(), &mut runtime, 3_000);
+        runtime.transport_mut().push_connected(
+            ConnectionId::new(100),
+            peer.clone(),
+            addr(&peer, 1),
+        );
+        let events = drain(&mut engine, &mut runtime, 3_000);
+        assert!(settled_for(&events, id).is_some(), "{events:?}");
+
+        let later = 3_000 + SIMULTANEOUS_DIAL_WINDOW_MS;
+        assert_eq!(engine.next_deadline(), Some(Deadline::from_millis(later)));
+        drain(&mut engine, &mut runtime, SIMULTANEOUS_DIAL_WINDOW_MS);
+        assert!(runtime.transport().closes.is_empty(), "window still open");
+        drain(&mut engine, &mut runtime, later);
+        let mut closes = runtime.transport().closes.clone();
+        closes.sort();
+        assert_eq!(
+            closes,
+            vec![
+                ConnectionId::new(1),
+                ConnectionId::new(2),
+                ConnectionId::new(3)
+            ]
+        );
     }
 
     #[test]

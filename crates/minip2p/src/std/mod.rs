@@ -503,8 +503,11 @@ impl Endpoint {
         self.swarm.ping(peer_id)
     }
 
-    /// Closes the active connection to `peer_id`.
+    /// Closes the active connection to `peer_id`, aborting any dials still
+    /// kept open for its simultaneous dial so none of them reconnects it.
     pub fn disconnect(&mut self, peer_id: &PeerId) -> Result<(), Error> {
+        self.connect
+            .abort_retained(peer_id, self.swarm.runtime_mut());
         self.swarm.disconnect(peer_id)
     }
 

@@ -422,19 +422,31 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
             && !sent
             && a_events.iter().any(|event| {
                 matches!(event, EndpointEvent::StreamReady {
-                    peer_id, stream_id, initiated_locally: true, ..
-                } if peer_id == &b_peer && *stream_id == stream)
+                    peer_id, conn_id, stream_id, initiated_locally: true, ..
+                } if peer_id == &b_peer && *conn_id == conn && *stream_id == stream)
             })
         {
             a.send_stream(&b_peer, conn, stream, PAYLOAD.to_vec(), now)
                 .unwrap();
             sent = true;
         }
+        // B's current connection to A: stream ids are only unique per
+        // connection, so delivery is matched on it too.
+        let b_conn = b_events.iter().rev().find_map(|event| match event {
+            EndpointEvent::ConnectionEstablished { peer_id, conn_id } if peer_id == &a_peer => {
+                Some(*conn_id)
+            }
+            EndpointEvent::ConnectionReplaced { peer_id, new, .. } if peer_id == &a_peer => {
+                Some(*new)
+            }
+            _ => None,
+        });
         let received = app_stream.is_some_and(|(_, stream)| {
             b_events.iter().any(|event| {
                 matches!(event, EndpointEvent::StreamData {
-                    peer_id, stream_id, data, ..
-                } if peer_id == &a_peer && *stream_id == stream && data == PAYLOAD)
+                    peer_id, conn_id, stream_id, data,
+                } if peer_id == &a_peer && Some(*conn_id) == b_conn
+                    && *stream_id == stream && data == PAYLOAD)
             })
         });
         if received && !relay_cut {

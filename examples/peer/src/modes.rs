@@ -272,6 +272,16 @@ fn handle_listen_event(
         } => {
             echo_streams.remove(&(peer_id.clone(), *conn_id, *stream_id));
         }
+        // A closed or replaced connection ends its streams without
+        // per-stream `StreamClosed` events, so untrack them all here.
+        EndpointEvent::ConnectionClosed { peer_id, conn_id }
+        | EndpointEvent::ConnectionReplaced {
+            peer_id,
+            old: conn_id,
+            ..
+        } => {
+            echo_streams.retain(|(peer, conn, _)| peer != peer_id || conn != conn_id);
+        }
         _ => {}
     }
 }
@@ -512,18 +522,14 @@ fn open_echo_stream(
             } if peer_id == peer && *conn_id == conn && *stream_id == stream => {
                 return Ok((conn, stream));
             }
-            EndpointEvent::ConnectionEstablished { peer_id, .. } if peer_id == peer => {
+            EndpointEvent::ConnectionReplaced { peer_id, old, .. }
+                if peer_id == peer && *old == conn =>
+            {
                 print_event("dial", &event);
                 // A second punch connection just replaced the one this
-                // stream was opened on — the swarm keeps the newcomer and
-                // silently drops the stream, so its `StreamReady` will
-                // never arrive. Abandon it and let the caller retry on the
-                // settled connection. (The caller drained stale
-                // establishments before opening, so this only fires for a
-                // genuine replacement racing the setup.)
-                if let Err(error) = endpoint.reset_stream(peer, conn, stream) {
-                    eprintln!("[dial] failed to reset replaced echo stream: {error}");
-                }
+                // stream was opened on; the stream ended with it, so its
+                // `StreamReady` will never arrive. Let the caller retry on
+                // the new connection right away.
                 return Err("connection replaced during echo stream setup".into());
             }
             _ => print_event("dial", &event),
@@ -569,18 +575,6 @@ fn open_direct_channel(
 ) -> Result<Channel, Box<dyn Error>> {
     let setup = Instant::now() + SETUP_DEADLINE;
     let deadline = drain_deadline.map_or(setup, |drain| drain.min(setup));
-    // `PathEstablished` and `PathUpgraded` can land before the connection's
-    // own `ConnectionEstablished` is taken from the Endpoint event stream.
-    // Drain what is already queued before opening the stream, so a stale
-    // establishment cannot masquerade as a replacing punch connection —
-    // that would burn the stream and force a needless retry on every plain
-    // direct dial.
-    for event in endpoint
-        .poll()
-        .map_err(|e| format!("draining queued events: {e}"))?
-    {
-        print_event("dial", &event);
-    }
     let (conn, stream) = open_echo_stream(endpoint, peer, deadline)?;
     let channel = Channel {
         send_peer: peer.clone(),

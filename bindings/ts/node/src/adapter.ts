@@ -1,6 +1,6 @@
 /* oxlint-disable class-methods-use-this, func-style, max-classes-per-file, no-await-in-loop, no-use-before-define, prefer-destructuring, promise/avoid-new, unicorn/no-useless-undefined -- The adapter keeps the contract-complete native endpoint, value conversion, handle maps, and drain loop together at the binding boundary. */
 
-import { Minip2pBase } from "@minip2p/core";
+import { Minip2pBase, StreamClosedError } from "@minip2p/core";
 import type {
   Bytes,
   ConnectionInfo,
@@ -56,7 +56,7 @@ class NodeBackend implements Minip2pBackend {
   }
 
   eventHandled(event: P2pEvent): void {
-    releaseTerminalIds(event, this.#connectionIds, this.#streamIds);
+    releaseTerminalIds(event, this.#streamIds);
   }
 
   close(): void {
@@ -227,6 +227,8 @@ class NodeBackend implements Minip2pBackend {
    * Native connection and stream IDs for a public stream. Native names the
    * stream by both, so an operation for a connection that native already
    * replaced fails there instead of reaching a stream on the new connection.
+   * A connection whose close or replacement this adapter has already drained
+   * has no native ID, so the operation throws `StreamClosedError`.
    */
   #nativeStream(connId: number, streamId: number): [bigint, bigint] {
     return [
@@ -446,8 +448,10 @@ function normalizeEvent(
 
 /**
  * Stops new native events from reaching identifiers this event ends, so a
- * reused native ID gets a fresh public number. The public numbers stay
- * resolvable until {@link releaseTerminalIds} runs after dispatch.
+ * reused native ID gets a fresh public number. An ended connection is
+ * released at once, so a stream operation queued behind its event throws
+ * `StreamClosedError` without reaching native; stream numbers stay resolvable
+ * until {@link releaseTerminalIds} runs after dispatch.
  */
 function retireTerminalIds(
   event: P2pEvent,
@@ -456,7 +460,7 @@ function retireTerminalIds(
 ): void {
   const connId = endedConnection(event);
   if (connId !== undefined) {
-    connectionIds.retirePublic(connId);
+    connectionIds.deletePublic(connId);
     streamIds.retireConnection(connId);
   }
   if (event.tag === P2pEvent_Tags.StreamClosed) {
@@ -464,15 +468,10 @@ function retireTerminalIds(
   }
 }
 
-/** Frees identifiers this event ended, once the SDK has dispatched it. */
-function releaseTerminalIds(
-  event: P2pEvent,
-  connectionIds: IdMap,
-  streamIds: StreamIdMap
-): void {
+/** Frees stream identifiers this event ended, once the SDK dispatched it. */
+function releaseTerminalIds(event: P2pEvent, streamIds: StreamIdMap): void {
   const connId = endedConnection(event);
   if (connId !== undefined) {
-    connectionIds.deletePublic(connId);
     streamIds.deleteConnection(connId);
   }
   if (event.tag === P2pEvent_Tags.StreamClosed) {
@@ -627,22 +626,19 @@ class IdMap {
     return publicId;
   }
 
+  /** The native ID of a live public connection; only stream ops ask. */
   toNative(publicId: number): bigint {
     const native = this.#nativeByPublic.get(publicId);
     if (native === undefined) {
-      throw new RangeError(`Unknown native identifier ${publicId}`);
+      throw new StreamClosedError("The stream's connection ended");
     }
     return native;
   }
 
   deletePublic(publicId: number): void {
-    this.retirePublic(publicId);
-    this.#nativeByPublic.delete(publicId);
-  }
-
-  retirePublic(publicId: number): void {
     const native = this.#nativeByPublic.get(publicId);
-    if (native !== undefined && this.#publicByNative.get(native) === publicId) {
+    if (native !== undefined) {
+      this.#nativeByPublic.delete(publicId);
       this.#publicByNative.delete(native);
     }
   }
@@ -677,7 +673,7 @@ class StreamIdMap {
   toNative(publicId: number): bigint {
     const stream = this.#streams.get(publicId);
     if (stream === undefined) {
-      throw new RangeError(`Unknown native identifier ${publicId}`);
+      throw new StreamClosedError("The stream closed");
     }
     return stream.native;
   }

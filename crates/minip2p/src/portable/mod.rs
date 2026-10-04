@@ -283,8 +283,10 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         self.runtime.ping(peer_id, now.monotonic_ms)
     }
 
-    /// Disconnects from a peer.
+    /// Disconnects from a peer, aborting any dials still kept open for its
+    /// simultaneous dial so none of them reconnects it.
     pub fn disconnect(&mut self, peer_id: &PeerId, now: Now) -> Result<(), DriverError> {
+        self.connect.abort_retained(peer_id, &mut self.runtime);
         self.runtime.disconnect(peer_id, now.monotonic_ms)
     }
 

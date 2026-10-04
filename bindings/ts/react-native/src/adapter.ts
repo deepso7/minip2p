@@ -1,6 +1,6 @@
 /* oxlint-disable class-methods-use-this, complexity, func-style, max-classes-per-file, no-use-before-define -- The adapter keeps its contract-complete native endpoint and public SDK subclass together, and uses hoisted conversion helpers. */
 
-import { Minip2pBase } from "@minip2p/core";
+import { Minip2pBase, StreamClosedError } from "@minip2p/core";
 import type {
   Bytes,
   ConnectionInfo,
@@ -325,11 +325,12 @@ export function circuitAddress(relayAddress: string, peerId: string): string {
  * through a JavaScript `number`. Each endpoint owns one map so a native ID
  * resolves to the same public ID in events and synchronous results. An entry
  * is released once its `ConnectionClosed`, or the `ConnectionReplaced` that
- * retires it, is normalized, which bounds the map by live connections. Public numbers come from a counter that never
- * repeats, so an event arriving after the release gets a fresh number instead
- * of aliasing a live connection. Stream operations map the public ID back
- * to native. Stream and connect-attempt IDs are not mapped because native
- * allocates them well inside the safe integer range.
+ * retires it, is normalized, which bounds the map by live connections. Public
+ * numbers come from a counter that never repeats, so an event arriving after
+ * the release gets a fresh number instead of aliasing a live connection.
+ * Stream operations map the public ID back to native. Stream and
+ * connect-attempt IDs are not mapped because native allocates them well
+ * inside the safe integer range.
  */
 class ConnectionIdMap {
   readonly #publicByNative = new Map<bigint, number>();
@@ -350,12 +351,14 @@ class ConnectionIdMap {
 
   /**
    * The native ID behind a public one. Stream operations pass it back so
-   * native rejects a stream whose connection it already replaced.
+   * native rejects a stream whose connection it already replaced. A released
+   * connection throws `StreamClosedError`: its stream operation can run after
+   * the release but before the SDK dispatches the ending event.
    */
   toNative(publicId: number): bigint {
     const native = this.#nativeByPublic.get(publicId);
     if (native === undefined) {
-      throw new RangeError(`Unknown connection identifier ${publicId}`);
+      throw new StreamClosedError("The stream's connection ended");
     }
     return native;
   }

@@ -30,7 +30,7 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 ### Connections
 
-**Connection replacement**: A newer connection to a peer taking the single per-peer connection slot from an older one. The peer never counts as disconnected. Everything that belonged to the old connection ends with it, including its streams and its readiness. The newest connection wins, except in a simultaneous dial: when two direct connections in opposite directions register within a few seconds of each other, both peers keep the one dialed by the lower peer ID and close the other unannounced; a losing dial still completes as a dial failure. _Avoid_: supersede, reconnect
+**Connection replacement**: A newer connection to a peer taking the single per-peer connection slot from an older one. The peer never counts as disconnected. Everything that belonged to the old connection ends with it, including its streams and its readiness. The newest connection wins, except in a simultaneous dial: when two direct connections in opposite directions register within `SIMULTANEOUS_DIAL_WINDOW_MS` (5 s) of each other, both peers keep the one dialed by the lower peer ID. If the lower peer's dial arrives second, it replaces the other as usual (`ConnectionReplaced`); only the higher peer's dial arriving second is closed unannounced, and if that dial was our own it completes as a dial failure. _Avoid_: supersede, reconnect
 
 **Peer readiness**: A peer's current connection has completed Identify, so its protocols are known. Readiness belongs to a connection: after a Connection replacement the peer becomes ready again once the new connection is identified.
 

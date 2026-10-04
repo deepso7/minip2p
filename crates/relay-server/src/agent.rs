@@ -487,22 +487,6 @@ impl RelayServerAgent {
     /// Processes every deadline due at or before `now`.
     pub fn handle_tick(&mut self, now: Now) {
         self.last_event_tick_ms = Some(now.monotonic_ms);
-        let renewing = self.renewing_peers();
-        let expired: Vec<_> = self
-            .reservations
-            .iter()
-            .filter_map(|(peer, reservation)| {
-                (reservation.deadline_ms <= now.monotonic_ms && !renewing.contains(peer))
-                    .then_some(peer.clone())
-            })
-            .collect();
-        for peer_id in expired {
-            self.reservations.remove(&peer_id);
-            self.events.push_back(RelayServerEvent::ReservationClosed {
-                peer_id,
-                reason: ReservationCloseReason::Expired,
-            });
-        }
         let duration_limited: Vec<_> = self
             .circuits
             .iter()
@@ -559,6 +543,24 @@ impl RelayServerAgent {
             .collect();
         for key in stop_timed_out {
             self.fail_pending_connect(key, Status::ConnectionFailed);
+        }
+        // After the timeouts above: one may have cancelled a pending renewal,
+        // and its reservation must not outlive this sweep.
+        let renewing = self.renewing_peers();
+        let expired: Vec<_> = self
+            .reservations
+            .iter()
+            .filter_map(|(peer, reservation)| {
+                (reservation.deadline_ms <= now.monotonic_ms && !renewing.contains(peer))
+                    .then_some(peer.clone())
+            })
+            .collect();
+        for peer_id in expired {
+            self.reservations.remove(&peer_id);
+            self.events.push_back(RelayServerEvent::ReservationClosed {
+                peer_id,
+                reason: ReservationCloseReason::Expired,
+            });
         }
         self.reservation_limiters.sweep(now.monotonic_ms);
         self.circuit_limiters.sweep(now.monotonic_ms);
@@ -4465,5 +4467,31 @@ mod tests {
             })
         ));
         assert_eq!(agent.reservation_expires_unix_secs(&peer), None);
+    }
+
+    #[test]
+    fn a_renewal_timing_out_with_its_reservation_expires_it_in_the_same_tick() {
+        let mut agent = relay(RelayServerConfig {
+            control_stream_timeout_ms: 1_000,
+            ..short_reservations()
+        });
+        let peer = PeerId::from_public_key_protobuf(b"client-renewal-timeout");
+        renew_past_deadline(&mut agent, &peer, ConnectionId::new(353));
+
+        let mut events = Vec::new();
+        while let Some(event) = agent.poll_event() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RelayServerEvent::ReservationClosed {
+                    reason: ReservationCloseReason::Expired,
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
+        assert_eq!(agent.reservation_count(), 0);
     }
 }

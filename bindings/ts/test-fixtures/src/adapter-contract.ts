@@ -305,6 +305,60 @@ export function describeAdapterContract(
       endpoint.close();
     });
 
+    test("a write queued behind a drained replacement throws StreamClosedError", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      native.setNextStream(CONN_ID, 4n);
+      const opening = endpoint.openStream(PEER, "/test/1");
+      native.deliver([
+        {
+          inner: {
+            connId: CONN_ID,
+            initiatedLocally: true,
+            peerId: PEER,
+            protocolId: "/test/1",
+            streamId: 4n,
+          },
+          tag: "StreamReady",
+        },
+      ]);
+      await drained();
+      const stream = await opening;
+      const writeErrors: unknown[] = [];
+      stream.on("data", () => {
+        try {
+          stream.write("reply");
+        } catch (error) {
+          writeErrors.push(error);
+        }
+      });
+
+      // The adapter drains both events before the SDK dispatches the data,
+      // so the reply runs after the old connection's identity is released.
+      native.deliver([
+        {
+          inner: {
+            connId: CONN_ID,
+            data: new Uint8Array([1]).buffer,
+            peerId: PEER,
+            streamId: 4n,
+          },
+          tag: "StreamData",
+        },
+        {
+          inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
+          tag: "ConnectionReplaced",
+        },
+      ]);
+      await drained();
+
+      expect(writeErrors).toHaveLength(1);
+      expect(writeErrors[0]).toBeInstanceOf(StreamClosedError);
+      expect(native.writes).toEqual([]);
+      endpoint.close();
+    });
+
     test("native config carries the shared defaults", () => {
       harness
         .create({
