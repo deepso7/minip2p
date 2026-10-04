@@ -102,6 +102,10 @@ impl InboundCircuit {
         }
     }
 
+    pub(crate) fn promotes(&self, conn_id: ConnectionId) -> bool {
+        self.promoted == Some(conn_id)
+    }
+
     pub(crate) fn is_done(&self) -> bool {
         self.done
     }

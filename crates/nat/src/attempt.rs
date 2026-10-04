@@ -373,8 +373,9 @@ impl ConnectAttempt {
     /// `new`: a punch in flight may still upgrade it, and otherwise it falls
     /// back to relay as usual. A DCUtR exchange lived on `old` and ends.
     ///
-    /// When `new_owned` (another attempt promoted `new`), `new` stays that
-    /// attempt's and this one ends on the relayed path it already reported.
+    /// When `new_owned` (another attempt or an inbound circuit promoted
+    /// `new`), `new` stays its owner's and this attempt ends on the relayed
+    /// path it already reported.
     pub(crate) fn on_target_replaced(
         &mut self,
         peer: &PeerId,

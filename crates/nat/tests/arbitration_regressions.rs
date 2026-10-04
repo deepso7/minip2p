@@ -772,3 +772,47 @@ fn circuit_promoted_by_another_attempt_settles_the_displaced_one_as_relayed() {
         NatAction::CloseCircuit { conn_id } if *conn_id == other_circuit
     )));
 }
+
+#[test]
+fn circuit_promoted_by_an_inbound_circuit_is_not_adopted_by_the_attempt() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (first, circuit) = drive_to_relayed(&mut h);
+
+    // The target dials us through the same relay; our inbound circuit is
+    // promoted and replaces the attempt's circuit.
+    let stop = StreamId::new(40);
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: ConnectionId::new(1),
+            peer_id: h.relay.clone(),
+            stream_id: stop,
+            protocol_id: minip2p_nat::STOP_PROTOCOL_ID.into(),
+            initiated_locally: false,
+        },
+        at(310),
+    );
+    let target = h.target.clone();
+    h.stream_data(stop, stop_connect(&target), at(311));
+    let promotion = drain_actions(&mut h.agent);
+    let inbound_circuit = ConnectionId::new(TEST_CIRCUIT_ID + 1);
+    h.agent
+        .promote_result(promote_token(&promotion), Ok(inbound_circuit), at(312));
+    replace_target(&mut h, circuit, inbound_circuit, 313);
+    drain_actions(&mut h.agent);
+    assert!(
+        drain_events(&mut h.agent).iter().any(|event| matches!(
+            event,
+            NatEvent::FellBackToRelay { connect_id, .. } if *connect_id == first
+        )),
+        "the displaced attempt ends on its relayed path"
+    );
+
+    h.agent.cancel(first, at(320));
+    assert!(
+        !drain_actions(&mut h.agent).iter().any(|action| matches!(
+            action,
+            NatAction::CloseCircuit { conn_id } if *conn_id == inbound_circuit
+        )),
+        "cancelling the attempt must not close the inbound circuit"
+    );
+}
