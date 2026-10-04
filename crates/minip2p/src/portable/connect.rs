@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 
 use minip2p_core::{PeerAddr, PeerId};
 use minip2p_platform::{Deadline, EntropySource};
-use minip2p_swarm::{SwarmEvent, SwarmRuntime};
+use minip2p_swarm::{SIMULTANEOUS_DIAL_WINDOW_MS, SwarmEvent, SwarmRuntime};
 use minip2p_transport::{ConnectionId, Transport};
 
 use super::event_stream::EndpointEvent;
@@ -291,7 +291,19 @@ pub(crate) struct ConnectEngine {
     /// Conn ids whose `DialFailed` may already be queued after settle/cancel.
     /// Consumed on observe so a same-batch loser failure does not reach the app.
     suppressed: BTreeSet<ConnectionId>,
+    /// Our dials still open after the peer's dial settled their attempts,
+    /// per peer (see [`Self::peer_connected`]). The first to become the
+    /// peer's connection aborts the rest; whatever is left is aborted when
+    /// the simultaneous-dial window ends.
+    retained: BTreeMap<PeerId, RetainedDials>,
     events: VecDeque<EndpointEvent>,
+}
+
+/// Dials kept open for one peer's simultaneous dial.
+struct RetainedDials {
+    dials: BTreeSet<ConnectionId>,
+    /// Absolute mono-ms at which the tie-break no longer applies.
+    expires_ms: u64,
 }
 
 struct Attempt {
@@ -397,6 +409,7 @@ impl ConnectEngine {
             deadline_ms,
             attempts: BTreeMap::new(),
             suppressed: BTreeSet::new(),
+            retained: BTreeMap::new(),
             events: VecDeque::new(),
         }
     }
@@ -589,7 +602,7 @@ impl ConnectEngine {
         &mut self,
         event: &SwarmEvent,
         runtime: &mut SwarmRuntime<T, E>,
-        _now_ms: u64,
+        now_ms: u64,
     ) -> bool {
         match event {
             SwarmEvent::DialFailed {
@@ -597,6 +610,7 @@ impl ConnectEngine {
                 addr,
                 reason,
             } => {
+                self.forget_retained(*conn_id);
                 if self.suppressed.remove(conn_id) {
                     return true;
                 }
@@ -619,13 +633,13 @@ impl ConnectEngine {
                 true
             }
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
-                self.peer_connected(peer_id, *conn_id, runtime);
+                self.peer_connected(peer_id, *conn_id, runtime, now_ms);
                 false
             }
             SwarmEvent::ConnectionReplaced { peer_id, new, .. } => {
                 // `new` satisfies every pending attempt for the peer exactly
                 // as a first establishment would, whichever side made it.
-                self.peer_connected(peer_id, *new, runtime);
+                self.peer_connected(peer_id, *new, runtime, now_ms);
                 false
             }
             SwarmEvent::ConnectionClosed { conn_id, .. } => {
@@ -666,16 +680,26 @@ impl ConnectEngine {
     /// are the lower peer. That is the peer's half of a simultaneous dial:
     /// the peer may already have accepted one of our dials, and both sides
     /// keep the lower peer's dial (`SIMULTANEOUS_DIAL_WINDOW_MS`), so ours
-    /// can only replace `conn_id`. Their failures stay inside the engine.
+    /// can only replace `conn_id`. Their failures stay inside the engine, and
+    /// they stay bounded: the first of them to become the peer's connection
+    /// aborts the others, and the rest are aborted once the window ends.
     fn peer_connected<T: Transport, E: EntropySource>(
         &mut self,
         peer_id: &PeerId,
         conn_id: ConnectionId,
         runtime: &mut SwarmRuntime<T, E>,
+        now_ms: u64,
     ) {
         // Abort Ok(false) tombstones may never see DialFailed once the
         // candidate has established — drop the stale id here.
         self.suppressed.remove(&conn_id);
+        if let Some(mut retained) = self.retained.remove(peer_id) {
+            if retained.dials.remove(&conn_id) {
+                self.abort_pending(runtime, retained.dials);
+            } else {
+                self.retained.insert(peer_id.clone(), retained);
+            }
+        }
         let ids: Vec<ConnectId> = self
             .attempts
             .iter()
@@ -701,7 +725,16 @@ impl ConnectEngine {
                     .copied()
                     .filter(|pending| *pending != conn_id);
                 if keep_dials {
-                    self.suppressed.extend(pending);
+                    let pending: Vec<ConnectionId> = pending.collect();
+                    self.suppressed.extend(pending.iter().copied());
+                    let retained =
+                        self.retained
+                            .entry(peer_id.clone())
+                            .or_insert_with(|| RetainedDials {
+                                dials: BTreeSet::new(),
+                                expires_ms: now_ms.saturating_add(SIMULTANEOUS_DIAL_WINDOW_MS),
+                            });
+                    retained.dials.extend(pending);
                 } else {
                     self.abort_pending(runtime, pending);
                 }
@@ -726,6 +759,17 @@ impl ConnectEngine {
         runtime: &mut SwarmRuntime<T, E>,
         now_ms: u64,
     ) {
+        let lapsed: Vec<PeerId> = self
+            .retained
+            .iter()
+            .filter(|(_, retained)| now_ms >= retained.expires_ms)
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        for peer in lapsed {
+            if let Some(retained) = self.retained.remove(&peer) {
+                self.abort_pending(runtime, retained.dials);
+            }
+        }
         let expired: Vec<ConnectId> = self
             .attempts
             .iter()
@@ -773,8 +817,10 @@ impl ConnectEngine {
         }
         self.attempts
             .values()
-            .map(|attempt| Deadline::from_millis(attempt.expires_ms))
+            .map(|attempt| attempt.expires_ms)
+            .chain(self.retained.values().map(|retained| retained.expires_ms))
             .min()
+            .map(Deadline::from_millis)
     }
 
     pub(crate) fn pop_event(&mut self) -> Option<EndpointEvent> {
@@ -785,6 +831,14 @@ impl ConnectEngine {
         let id = ConnectId::from_u64(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
         id
+    }
+
+    /// Drops a retained dial that ended on its own.
+    fn forget_retained(&mut self, conn_id: ConnectionId) {
+        self.retained.retain(|_, retained| {
+            retained.dials.remove(&conn_id);
+            !retained.dials.is_empty()
+        });
     }
 
     fn owner(&self, conn_id: ConnectionId) -> Option<ConnectId> {
@@ -1523,10 +1577,16 @@ mod tests {
         assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
     }
 
-    #[test]
-    fn lower_peer_keeps_its_dials_when_the_peers_dial_settles_the_attempt() {
-        // Sorts above the runtime's own id: we are the lower peer, so a
-        // simultaneous dial keeps our dial on both sides.
+    /// Connects to a peer that sorts above the runtime's own id (so we are
+    /// the lower peer) over two candidates, then lets the peer's own dial
+    /// arrive first. Returns the runtime, engine, peer and that inbound
+    /// connection; the attempt is settled and both dials are still open.
+    fn lower_peer_settled_by_the_peers_dial() -> (
+        SwarmRuntime<FakeTransport, SeqEntropy>,
+        ConnectEngine,
+        PeerId,
+        ConnectionId,
+    ) {
         let peer = peer(&[0xff; 40]);
         let (first, second) = (addr(&peer, 1), addr(&peer, 2));
         let mut runtime = runtime(FakeTransport::default());
@@ -1537,19 +1597,26 @@ mod tests {
         let inbound = ConnectionId::new(99);
         runtime
             .transport_mut()
-            .push_connected(inbound, peer.clone(), first.clone());
+            .push_connected(inbound, peer.clone(), first);
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(matches!(
             settled_for(&events, id),
             Some(ConnectOutcome::Connected { conn_id }) if *conn_id == inbound
         ));
         assert!(runtime.transport().closes.is_empty(), "dials stay up");
+        (runtime, engine, peer, inbound)
+    }
 
-        // One dial lands and replaces the peer's; the other fails silently.
+    #[test]
+    fn lower_peer_keeps_its_dials_until_one_replaces_the_peers_dial() {
+        let (mut runtime, mut engine, peer, inbound) = lower_peer_settled_by_the_peers_dial();
+
+        // One dial lands and replaces the peer's; that aborts the other, so
+        // it cannot land later and replace the winner on one side only.
+        let first = addr(&peer, 1);
         runtime
             .transport_mut()
             .push_connected(ConnectionId::new(1), peer.clone(), first);
-        runtime.transport_mut().push_closed(ConnectionId::new(2));
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(
             events.iter().any(|event| matches!(
@@ -1559,6 +1626,7 @@ mod tests {
             )),
             "{events:?}"
         );
+        assert_eq!(runtime.transport().closes, vec![ConnectionId::new(2)]);
         assert!(
             events.iter().all(|event| !matches!(
                 event,
@@ -1566,6 +1634,21 @@ mod tests {
             )),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn lower_peer_aborts_its_kept_dials_when_the_window_ends() {
+        let (mut runtime, mut engine, _, _) = lower_peer_settled_by_the_peers_dial();
+        assert_eq!(
+            engine.next_deadline(),
+            Some(Deadline::from_millis(SIMULTANEOUS_DIAL_WINDOW_MS))
+        );
+
+        drain(&mut engine, &mut runtime, SIMULTANEOUS_DIAL_WINDOW_MS);
+        let mut closes = runtime.transport().closes.clone();
+        closes.sort();
+        assert_eq!(closes, vec![ConnectionId::new(1), ConnectionId::new(2)]);
+        assert_eq!(engine.next_deadline(), None);
     }
 
     #[test]
