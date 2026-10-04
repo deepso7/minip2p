@@ -223,8 +223,10 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
         .next_event(std::time::Duration::ZERO)
         .expect("drain client")
     {
-        if let EndpointEvent::Nat(event) = event {
-            reservation_events.push(event);
+        match event {
+            EndpointEvent::PingRttMeasured { .. } => ping_rtts += 1,
+            EndpointEvent::Nat(event) => reservation_events.push(event),
+            _ => {}
         }
     }
 
