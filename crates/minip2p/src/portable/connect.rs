@@ -956,7 +956,11 @@ impl ConnectEngine {
         conn_id: ConnectionId,
     ) {
         match runtime.abort_dial(conn_id) {
-            Ok(true) => {}
+            // Aborted before it could fail, so no `DialFailed` will come to
+            // consume a tombstone (a kept dial already has one).
+            Ok(true) => {
+                self.suppressed.remove(&conn_id);
+            }
             Ok(false) => {
                 self.suppressed.insert(conn_id);
             }
@@ -1627,6 +1631,7 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(runtime.transport().closes, vec![ConnectionId::new(2)]);
+        assert!(engine.suppressed.is_empty() && engine.retained.is_empty());
         assert!(
             events.iter().all(|event| !matches!(
                 event,
@@ -1649,6 +1654,7 @@ mod tests {
         closes.sort();
         assert_eq!(closes, vec![ConnectionId::new(1), ConnectionId::new(2)]);
         assert_eq!(engine.next_deadline(), None);
+        assert!(engine.suppressed.is_empty() && engine.retained.is_empty());
     }
 
     #[test]
