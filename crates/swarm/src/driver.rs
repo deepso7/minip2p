@@ -684,6 +684,9 @@ mod tests {
     struct IdleTransport {
         poll_calls: usize,
         wait_outcomes: VecDeque<WaitOutcome>,
+        /// Reported once `wait_outcomes` runs out. `TimedOut` returns at once,
+        /// which spins; `Unsupported` makes the driver sleep between polls.
+        default_wait: Option<WaitOutcome>,
         wait_calls: usize,
         /// Every time sample the driver handed to `poll`.
         samples: Vec<Now>,
@@ -761,6 +764,7 @@ mod tests {
             self.wait_budgets.push(budget);
             self.wait_outcomes
                 .pop_front()
+                .or(self.default_wait)
                 .unwrap_or(WaitOutcome::TimedOut)
         }
     }
@@ -1352,8 +1356,17 @@ mod tests {
             .wait_outcomes
             .push_back(WaitOutcome::Interrupted);
 
+        // Nothing here matches, so the loop runs to its deadline. Reporting
+        // `Unsupported` once the script runs out makes the driver sleep
+        // between polls instead of spinning for that whole time.
+        swarm.transport_mut().default_wait = Some(WaitOutcome::Unsupported);
+
+        // The deadline has to outlast the interrupt by enough that the resume
+        // is what is being observed. `run_until` re-reads the clock after
+        // consuming an interrupt, so a deadline measured in milliseconds is
+        // really asserting that this thread was not descheduled in between.
         let found = swarm
-            .run_until(Duration::from_millis(1), |_| false)
+            .run_until(Duration::from_millis(500), |_| false)
             .expect("wait");
 
         assert!(found.is_none());

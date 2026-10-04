@@ -490,47 +490,57 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
     let stream = pair.dialer.open_stream(id).expect("open substream");
     settle(&mut pair.dialer, &mut pair.listener);
 
-    // Fill the socket without the peer reading, so the write is refused and the
-    // remainder sits in the transport's buffer.
+    // Queue more than the peer's Yamux window allows without the peer reading,
+    // so the remainder sits in the dialer's buffer waiting for credit. On
+    // loopback the kernel takes everything the window lets through; it is the
+    // window, not the socket, that holds the rest back.
     let payload = vec![7u8; 512 * 1024];
     pair.dialer
         .send_stream(id, stream, payload)
-        .expect("queue more than the socket will take");
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(200) {
+        .expect("queue more than the window allows");
+    // Drive until the dialer has nothing left to do. Parking is the state the
+    // rest of the test needs, so wait for it rather than for a slice of time:
+    // under load a fixed slice buys far fewer polls than it looks like it does.
+    // A timeout means parked: nothing arrived, and nothing is left to send.
+    let parking = Instant::now();
+    while pair.dialer.wait_for_input(Duration::from_millis(10)) != WaitOutcome::TimedOut {
         let _ = pair.dialer.poll(Now::from_millis(0)).expect("poll dialer");
-        thread::sleep(Duration::from_millis(1));
+        assert!(parking.elapsed() < PATIENCE, "the dialer never parked");
     }
 
-    // Nothing to read and nowhere to write: the driver has to park.
+    // Writes buffered behind an idle peer are nothing to wake for.
     assert_eq!(
         pair.dialer.wait_for_input(Duration::from_millis(100)),
         WaitOutcome::TimedOut,
-        "a full socket with an idle peer is nothing to wake for"
+        "buffered writes with an idle peer are nothing to wake for"
     );
 
-    // The peer now acts, and the dialer must wake promptly rather than sleep out
-    // its budget. Which readiness does it -- the socket having room again, or
-    // the peer's Yamux acknowledgement arriving -- is deliberately not claimed:
-    // loopback buffering makes a socket that stays full unreliable to arrange,
-    // so writability cannot be isolated from the bytes coming back.
-    // One poll only takes a bounded bite, so keep the peer reading until it has
-    // actually consumed enough to matter.
+    // The peer now acts, and the parked dialer must be told. Which readiness
+    // does it -- the socket having room again, or the peer's Yamux window
+    // update arriving -- is deliberately not claimed: loopback buffering makes
+    // a socket that stays full unreliable to arrange.
+    //
+    // One poll only takes a bounded bite, so the peer reads until the dialer
+    // reports something. The zero-budget probe is the assertion: it returns
+    // `Ready` from the same readiness a blocking wait would wake on, and the
+    // provider keeps what it saw, so a blocking wait afterwards would only be
+    // answered from that state.
     let draining = Instant::now();
-    while draining.elapsed() < Duration::from_millis(200) {
+    let woke = loop {
+        match pair.dialer.wait_for_input(Duration::ZERO) {
+            WaitOutcome::TimedOut => {}
+            outcome => break outcome,
+        }
         let _ = pair.listener.poll(Now::from_millis(0)).expect("peer reads");
-        thread::sleep(Duration::from_millis(1));
-    }
-    let began = Instant::now();
+        assert!(
+            draining.elapsed() < PATIENCE,
+            "the peer never drained enough to wake the writer"
+        );
+    };
     assert_eq!(
-        pair.dialer.wait_for_input(PATIENCE),
+        woke,
         WaitOutcome::Ready,
-        "a drained socket must wake the writer"
-    );
-    assert!(
-        began.elapsed() < Duration::from_secs(5),
-        "the wake took {:?}",
-        began.elapsed()
+        "a draining peer must wake the writer"
     );
 }
 

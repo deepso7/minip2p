@@ -4,6 +4,14 @@
 )]
 
 //! Test-only convenience over `Endpoint::wait`.
+//!
+//! # Timing
+//!
+//! These tests run in parallel against a real network stack, so a thread can be
+//! descheduled for longer than any budget a test would pick. Drive until what
+//! you are waiting for is observable rather than for a fixed slice of time, and
+//! keep time limits as failure backstops. The full convention, and the tests
+//! that run alone because they cannot follow it, live in `.config/nextest.toml`.
 
 use minip2p::{Deadline, Endpoint, EndpointEvent, EndpointWaitOutcome, Error};
 
