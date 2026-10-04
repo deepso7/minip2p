@@ -906,7 +906,7 @@ impl SwarmCore {
                     return;
                 }
                 if let Some(peer_id) = endpoint.peer_id() {
-                    self.register_connection(id, peer_id.clone());
+                    self.register_connection(id, peer_id.clone(), now_ms);
                 } else {
                     // Peer identity is not yet known. Synthesize a placeholder PeerId
                     // for internal bookkeeping so protocol handlers can still
@@ -929,7 +929,7 @@ impl SwarmCore {
                     return;
                 }
                 if let Some(peer_id) = endpoint.peer_id() {
-                    self.upgrade_connection_identity(id, peer_id.clone());
+                    self.upgrade_connection_identity(id, peer_id.clone(), now_ms);
                 }
             }
             TransportEvent::IncomingConnection { id, endpoint } => {
@@ -1463,12 +1463,23 @@ impl SwarmCore {
     /// ordered after the events queued so far. Returns the payload of a ping
     /// pending or in flight on `old`, which the caller re-sends on the new
     /// connection; its timer restarts then, so no `PingTimeout` is reported
-    /// for the hand-over.
+    /// for the hand-over. A ping already past its deadline at `now_ms` times
+    /// out instead of being re-sent.
     fn retire_for_replacement(
         &mut self,
         peer_id: &PeerId,
         old: ConnectionId,
+        now_ms: u64,
     ) -> Option<[u8; PING_PAYLOAD_LEN]> {
+        // The runtime feeds transport events before the tick of the same
+        // poll, so fire a timeout that is already due before handing over.
+        if self
+            .ping_deadlines
+            .get(peer_id)
+            .is_some_and(|due| *due <= now_ms)
+        {
+            self.handle_tick(now_ms);
+        }
         // The in-flight payload lives in Ping's per-peer state; read it
         // before that state is reset.
         let ping_intent = self
@@ -1526,7 +1537,7 @@ impl SwarmCore {
         }
     }
 
-    fn register_connection(&mut self, id: ConnectionId, peer_id: PeerId) {
+    fn register_connection(&mut self, id: ConnectionId, peer_id: PeerId, now_ms: u64) {
         if self.conn_to_peer.contains_key(&id) {
             return;
         }
@@ -1537,12 +1548,17 @@ impl SwarmCore {
             .get(&peer_id)
             .copied()
             .filter(|old| *old != id);
-        let ping_intent = old.and_then(|old| self.retire_for_replacement(&peer_id, old));
+        let ping_intent = old.and_then(|old| self.retire_for_replacement(&peer_id, old, now_ms));
         self.announce_connection(&peer_id, id, old, ping_intent);
         self.start_connection_protocols(&peer_id, id);
     }
 
-    fn upgrade_connection_identity(&mut self, conn_id: ConnectionId, new_peer_id: PeerId) {
+    fn upgrade_connection_identity(
+        &mut self,
+        conn_id: ConnectionId,
+        new_peer_id: PeerId,
+        now_ms: u64,
+    ) {
         let existing = self.conn_to_peer.get(&conn_id).cloned();
         if existing.as_ref() == Some(&new_peer_id) {
             return;
@@ -1555,7 +1571,8 @@ impl SwarmCore {
             .get(&new_peer_id)
             .copied()
             .filter(|old| *old != conn_id);
-        let ping_intent = old.and_then(|old| self.retire_for_replacement(&new_peer_id, old));
+        let ping_intent =
+            old.and_then(|old| self.retire_for_replacement(&new_peer_id, old, now_ms));
 
         if let Some(stale) = existing {
             // State gathered under the placeholder belongs to this
@@ -3615,6 +3632,42 @@ mod tests {
             Some(10_001),
             "the timeout restarts at the re-send"
         );
+    }
+
+    #[test]
+    fn overdue_ping_times_out_instead_of_being_resent_on_replacement() {
+        let mut core = test_core(); // default request_timeout_ms = 10_000
+        let peer_id = PeerId::from_public_key_protobuf(b"ping-overdue-peer");
+        let original = ConnectionId::new(62);
+        let replacement = ConnectionId::new(63);
+        setup_outbound_ping_stream(&mut core, &peer_id, original, StreamId::new(4));
+        core.ping(&peer_id, [7; PING_PAYLOAD_LEN], 0)
+            .expect("ping in flight");
+        let _ = drain_actions(&mut core);
+
+        // The replacement arrives in the same poll as the overdue tick, ahead
+        // of it.
+        core.handle_input(SwarmInput::Transport {
+            event: TransportEvent::Connected {
+                id: replacement,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+            now_ms: 12_000,
+        });
+        assert!(
+            drain_events(&mut core)
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::PingTimeout { .. })),
+            "the ping was already due"
+        );
+        assert!(
+            !drain_actions(&mut core).iter().any(|action| matches!(
+                action,
+                SwarmAction::OpenStream { conn_id, .. } if *conn_id == replacement
+            )),
+            "a timed-out ping is not re-sent"
+        );
+        assert_eq!(core.next_timeout(12_000), None);
     }
 
     #[test]
