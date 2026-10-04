@@ -99,26 +99,42 @@ impl P2pEndpoint {
     ) -> Result<OpenStreamResult, FfiError> {
         self.0.open_stream(peer_id, protocol_id)
     }
-    /// Sends bytes on a stream.
+    /// Sends bytes on a stream, named by its connection and stream ids.
     pub fn send_stream(
         &self,
         peer_id: String,
+        conn_id: u64,
         stream_id: u64,
         data: Vec<u8>,
     ) -> Result<(), FfiError> {
-        self.0.send_stream(peer_id, stream_id, data)
+        self.0.send_stream(peer_id, conn_id, stream_id, data)
     }
     /// Half-closes a stream's write side.
-    pub fn close_stream_write(&self, peer_id: String, stream_id: u64) -> Result<(), FfiError> {
-        self.0.close_stream_write(peer_id, stream_id)
+    pub fn close_stream_write(
+        &self,
+        peer_id: String,
+        conn_id: u64,
+        stream_id: u64,
+    ) -> Result<(), FfiError> {
+        self.0.close_stream_write(peer_id, conn_id, stream_id)
     }
     /// Resets a stream.
-    pub fn reset_stream(&self, peer_id: String, stream_id: u64) -> Result<(), FfiError> {
-        self.0.reset_stream(peer_id, stream_id)
+    pub fn reset_stream(
+        &self,
+        peer_id: String,
+        conn_id: u64,
+        stream_id: u64,
+    ) -> Result<(), FfiError> {
+        self.0.reset_stream(peer_id, conn_id, stream_id)
     }
     /// Forgets a stream.
-    pub fn abandon_stream(&self, peer_id: String, stream_id: u64) -> Result<(), FfiError> {
-        self.0.abandon_stream(peer_id, stream_id)
+    pub fn abandon_stream(
+        &self,
+        peer_id: String,
+        conn_id: u64,
+        stream_id: u64,
+    ) -> Result<(), FfiError> {
+        self.0.abandon_stream(peer_id, conn_id, stream_id)
     }
     /// Starts one Connection attempt and returns its Connect ID.
     pub fn connect(&self, target: ConnectTarget) -> Result<u64, FfiError> {

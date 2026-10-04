@@ -267,20 +267,25 @@ export class Stream {
     if (this.#closed) {
       throw new ClosedError();
     }
-    this.#backend.sendStream(this.peerId, this.streamId, toUint8Array(data));
+    this.#backend.sendStream(
+      this.peerId,
+      this.connId,
+      this.streamId,
+      toUint8Array(data)
+    );
   }
 
   /** Half-closes the local write side while keeping reads available. */
   closeWrite(): void {
     if (!this.#closed) {
-      this.#backend.closeStreamWrite(this.peerId, this.streamId);
+      this.#backend.closeStreamWrite(this.peerId, this.connId, this.streamId);
     }
   }
 
   /** Abruptly resets the stream and emits `closed`. */
   reset(): void {
     if (!this.#closed) {
-      this.#backend.resetStream(this.peerId, this.streamId);
+      this.#backend.resetStream(this.peerId, this.connId, this.streamId);
       this.terminal();
     }
   }
@@ -289,7 +294,7 @@ export class Stream {
   abandon(): void {
     if (!this.#closed) {
       try {
-        this.#backend.abandonStream(this.peerId, this.streamId);
+        this.#backend.abandonStream(this.peerId, this.connId, this.streamId);
       } catch {
         // A native close can overtake its queued terminal event.
       }
@@ -1095,7 +1100,11 @@ export class Minip2pBase {
       clearPendingOpen(pending);
       pending.reject(error);
       try {
-        this.#backend.abandonStream(pending.peerId, pending.streamId);
+        this.#backend.abandonStream(
+          pending.peerId,
+          pending.connId,
+          pending.streamId
+        );
       } catch {
         // The operation is already failed; native cleanup is best effort.
       }
@@ -1555,7 +1564,11 @@ export class Minip2pBase {
     clearPendingOpen(pending);
     pending.reject(error);
     try {
-      this.#backend.abandonStream(pending.peerId, pending.streamId);
+      this.#backend.abandonStream(
+        pending.peerId,
+        pending.connId,
+        pending.streamId
+      );
     } catch {
       // Cleanup failure must not replace the caller's timeout or abort.
     }

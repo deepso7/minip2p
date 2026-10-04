@@ -71,12 +71,12 @@ interface NativeEndpointConfig {
 }
 
 export interface NativeEndpoint {
-  abandonStream: (peerId: string, streamId: bigint) => void;
+  abandonStream: (peerId: string, connId: bigint, streamId: bigint) => void;
   activeReservation: () => unknown;
   addProtocol: (protocolId: string) => void;
   cancelConnect: (id: bigint) => void;
   close: () => void;
-  closeStreamWrite: (peerId: string, streamId: bigint) => void;
+  closeStreamWrite: (peerId: string, connId: bigint, streamId: bigint) => void;
   connectedPeers: () => string[];
   connectionInfo: (peerId: string) =>
     | {
@@ -104,8 +104,13 @@ export interface NativeEndpoint {
   ping: (peerId: string) => void;
   publish: (topic: string, data: Uint8Array) => void;
   reachability: () => number;
-  resetStream: (peerId: string, streamId: bigint) => void;
-  sendStream: (peerId: string, streamId: bigint, data: Uint8Array) => void;
+  resetStream: (peerId: string, connId: bigint, streamId: bigint) => void;
+  sendStream: (
+    peerId: string,
+    connId: bigint,
+    streamId: bigint,
+    data: Uint8Array
+  ) => void;
   setActive: (active: boolean) => void;
   start: (doorbell: () => void) => void;
   subscribe: (topic: string) => boolean;

@@ -55,11 +55,11 @@ describe("MockBackend", () => {
     expect(backend.connect(target)).toBe(2);
 
     backend.abandonError = new Error("abandon failed");
-    expect(() => backend.abandonStream("peer", 7)).toThrow("abandon failed");
+    expect(() => backend.abandonStream("peer", 2, 7)).toThrow("abandon failed");
     expect(backend.operations).toEqual([
       ["connect", target],
       ["connect", target],
-      ["abandon", "peer", 7],
+      ["abandon", "peer", 2, 7],
     ]);
   });
 });

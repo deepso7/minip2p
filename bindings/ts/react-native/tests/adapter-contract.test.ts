@@ -39,9 +39,13 @@ describeAdapterContract("React Native", {
       setConnectionInfo: (info) => {
         fake.connection = info;
       },
+      setLiveConnection: (connId) => {
+        fake.liveConnId = connId;
+      },
       setNextStream: (connId, streamId) => {
         fake.nextStream = { connId, streamId };
       },
+      writes: fake.writes,
     };
   },
 });

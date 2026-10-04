@@ -291,7 +291,7 @@ test("inbound streams are abandoned only when there is no named or waiter claima
 
   backend.emit(streamReady({ streamId: 8 }));
   await tick();
-  assert.deepEqual(backend.operations.at(-1), ["abandon", "peer", 8]);
+  assert.deepEqual(backend.operations.at(-1), ["abandon", "peer", 2, 8]);
 
   const claimed = endpoint.once("stream", { timeoutMs: 1000 });
   backend.emit(streamReady({ streamId: 9 }));
@@ -299,7 +299,7 @@ test("inbound streams are abandoned only when there is no named or waiter claima
   assert.ok(stream instanceof Stream);
   assert.equal(
     backend.operations.some(
-      (operation) => operation[0] === "abandon" && operation[2] === 9
+      (operation) => operation[0] === "abandon" && operation[3] === 9
     ),
     false
   );
@@ -1128,7 +1128,7 @@ test("local stream reset and abandon emit closed exactly once", async () => {
     stream[operation]();
 
     assert.equal(closed, 1);
-    assert.deepEqual(backend.operations, [[operation, "peer", 3]]);
+    assert.deepEqual(backend.operations, [[operation, "peer", 2, 3]]);
     await assert.rejects(reading, ClosedError);
     await assert.rejects(stream.read(), ClosedError);
     endpoint.close();
@@ -1228,7 +1228,7 @@ test("openStream correlates full available identity and abandons late ready", as
   await assert.rejects(late, TimeoutError);
   backend.emit(streamReady({ initiatedLocally: true, streamId: 4 }));
   await tick();
-  assert.deepEqual(backend.operations.at(-1), ["abandon", "peer", 4]);
+  assert.deepEqual(backend.operations.at(-1), ["abandon", "peer", 2, 4]);
   endpoint.close();
 });
 
@@ -1244,7 +1244,7 @@ test("orphaned locally initiated streams are durably abandoned", async () => {
   await tick();
 
   assert.equal(claimed, 0);
-  assert.deepEqual(backend.operations, [["abandon", "peer", 99]]);
+  assert.deepEqual(backend.operations, [["abandon", "peer", 2, 99]]);
   endpoint.close();
 });
 
@@ -1259,7 +1259,7 @@ test("a throwing inbound stream handler does not claim ownership", async () => {
   await tick();
   await tick();
 
-  assert.deepEqual(backend.operations, [["abandon", "peer", 88]]);
+  assert.deepEqual(backend.operations, [["abandon", "peer", 2, 88]]);
   endpoint.close();
 });
 

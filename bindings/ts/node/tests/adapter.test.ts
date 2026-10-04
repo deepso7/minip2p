@@ -17,7 +17,13 @@ const native = vi.hoisted(() => {
     static latest: FakeNativeEndpoint | undefined;
 
     readonly config: Readonly<Record<string, unknown>>;
-    readonly abandonedStreams: { peerId: string; streamId: bigint }[] = [];
+    readonly abandonedStreams: {
+      peerId: string;
+      connId: bigint;
+      streamId: bigint;
+    }[] = [];
+    readonly writes: { connId: bigint; streamId: bigint }[] = [];
+    liveConnId: bigint | undefined;
     readonly cancelledConnects: bigint[] = [];
     readonly connectTargets: (string | string[])[] = [];
     connection: {
@@ -77,8 +83,8 @@ const native = vi.hoisted(() => {
 
     addProtocol(): void {}
 
-    abandonStream(peerId: string, streamId: bigint): void {
-      this.abandonedStreams.push({ peerId, streamId });
+    abandonStream(peerId: string, connId: bigint, streamId: bigint): void {
+      this.abandonedStreams.push({ connId, peerId, streamId });
       if (this.abandonError !== undefined) {
         throw this.abandonError;
       }
@@ -153,7 +159,14 @@ const native = vi.hoisted(() => {
 
     resetStream(): void {}
 
-    sendStream(): void {}
+    sendStream(_peerId: string, connId: bigint, streamId: bigint): void {
+      if (this.liveConnId !== undefined && connId !== this.liveConnId) {
+        throw new Error(
+          `stream ${streamId} on connection ${connId} is not active`
+        );
+      }
+      this.writes.push({ connId, streamId });
+    }
 
     setActive(): void {}
 
@@ -547,7 +560,7 @@ describe("Node adapter", () => {
     await settle();
 
     expect(fake.abandonedStreams).toEqual([
-      { peerId: "remote", streamId: 20n },
+      { connId: 10n, peerId: "remote", streamId: 20n },
     ]);
     expect(peers).toEqual(["after"]);
     endpoint.close();
@@ -586,9 +599,13 @@ describeAdapterContract("Node", {
       setConnectionInfo: (info) => {
         fake.connection = info;
       },
+      setLiveConnection: (connId) => {
+        fake.liveConnId = connId;
+      },
       setNextStream: (connId, streamId) => {
         fake.nextStream = { connId, streamId };
       },
+      writes: fake.writes,
     };
   },
 });

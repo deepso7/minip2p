@@ -83,7 +83,7 @@ describe("node-ffi", () => {
         throw new Error(`Timed out draining raw events: ${seen}/${BURST}`);
       }
       for (const stream of streams) {
-        rawA.abandonStream(rawB.peerId(), stream.streamId);
+        rawA.abandonStream(rawB.peerId(), stream.connId, stream.streamId);
       }
     }).run();
   });

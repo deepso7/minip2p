@@ -181,35 +181,58 @@ class NodeBackend implements Minip2pBackend {
     };
   }
 
-  sendStream(peerId: string, streamId: number, data: Uint8Array): void {
+  sendStream(
+    peerId: string,
+    connId: number,
+    streamId: number,
+    data: Uint8Array
+  ): void {
     translateErrors(() => {
       this.#endpoint.sendStream(
         peerId,
-        this.#streamIds.toNative(streamId),
+        ...this.#nativeStream(connId, streamId),
         data
       );
     });
   }
 
-  closeStreamWrite(peerId: string, streamId: number): void {
+  closeStreamWrite(peerId: string, connId: number, streamId: number): void {
     translateErrors(() => {
       this.#endpoint.closeStreamWrite(
         peerId,
-        this.#streamIds.toNative(streamId)
+        ...this.#nativeStream(connId, streamId)
       );
     });
   }
 
-  resetStream(peerId: string, streamId: number): void {
+  resetStream(peerId: string, connId: number, streamId: number): void {
     translateErrors(() => {
-      this.#endpoint.resetStream(peerId, this.#streamIds.toNative(streamId));
+      this.#endpoint.resetStream(
+        peerId,
+        ...this.#nativeStream(connId, streamId)
+      );
     });
   }
 
-  abandonStream(peerId: string, streamId: number): void {
+  abandonStream(peerId: string, connId: number, streamId: number): void {
     translateErrors(() => {
-      this.#endpoint.abandonStream(peerId, this.#streamIds.toNative(streamId));
+      this.#endpoint.abandonStream(
+        peerId,
+        ...this.#nativeStream(connId, streamId)
+      );
     });
+  }
+
+  /**
+   * Native connection and stream IDs for a public stream. Native names the
+   * stream by both, so an operation for a connection that native already
+   * replaced fails there instead of reaching a stream on the new connection.
+   */
+  #nativeStream(connId: number, streamId: number): [bigint, bigint] {
+    return [
+      this.#connectionIds.toNative(connId),
+      this.#streamIds.toNative(streamId),
+    ];
   }
 
   // Connect IDs are not mapped because they round-trip into native calls,
