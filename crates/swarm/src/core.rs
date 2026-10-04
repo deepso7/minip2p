@@ -64,6 +64,18 @@ use crate::events::{
 /// rejects them with [`SwarmError::ReservedProtocol`].
 pub const RESERVED_PROTOCOL_IDS: [&str; 2] = [IDENTIFY_PROTOCOL_ID, PING_PROTOCOL_ID];
 
+/// How long a peer's current direct connection counts as one half of a
+/// simultaneous dial, in the core's `now_ms`.
+///
+/// When both peers dial each other at once, each registers its own dial
+/// first and the other's second. Inside this window a direct connection in
+/// the opposite direction therefore does not replace the current one: both
+/// peers keep the connection dialed by the lower [`PeerId`], and the other is
+/// closed unannounced. Past the window the newest connection wins as usual,
+/// so a peer reconnecting after its old connection died silently still gets
+/// through. Kept well under the transports' idle timeouts.
+pub const SIMULTANEOUS_DIAL_WINDOW_MS: u64 = 5_000;
+
 /// Identifies which protocol owns a negotiated stream.
 ///
 /// Kept private; callers refer to protocols by their string ids via
@@ -302,6 +314,12 @@ pub struct SwarmCore {
     /// purge their events it already buffered. See
     /// [`Self::take_discarded_placeholders`].
     discarded_placeholders: Vec<PeerId>,
+    /// This node's peer id, derived from the Identify public key. Breaks
+    /// simultaneous-dial ties; see [`SIMULTANEOUS_DIAL_WINDOW_MS`].
+    local_peer_id: PeerId,
+    /// How and when each peer's current connection took its slot, for the
+    /// simultaneous-dial tie-break. Dropped when it leaves the slot.
+    registrations: BTreeMap<ConnectionId, Registration>,
 
     // --- Output queues ---
     events: VecDeque<SwarmEvent>,
@@ -319,9 +337,20 @@ struct PendingDial {
     last_error: Option<String>,
 }
 
+/// How and when a peer's current connection took its slot.
+#[derive(Clone, Copy)]
+struct Registration {
+    /// Came from one of our dials rather than the peer's.
+    outbound: bool,
+    at_ms: u64,
+}
+
 impl SwarmCore {
     /// Creates a new core with the given identify and ping configs.
+    ///
+    /// The local peer id is derived from `identify_config.public_key`.
     pub fn new(identify_config: IdentifyConfig, ping_config: PingConfig) -> Self {
+        let local_peer_id = PeerId::from_public_key_protobuf(&identify_config.public_key);
         let inbound_protocols = vec![
             IDENTIFY_PROTOCOL_ID.to_string(),
             PING_PROTOCOL_ID.to_string(),
@@ -354,6 +383,8 @@ impl SwarmCore {
             vetoed_establishes: BTreeSet::new(),
             retired_connections: BTreeSet::new(),
             discarded_placeholders: Vec::new(),
+            local_peer_id,
+            registrations: BTreeMap::new(),
             events: VecDeque::new(),
             actions: VecDeque::new(),
             after_event_actions: VecDeque::new(),
@@ -1380,7 +1411,7 @@ impl SwarmCore {
         peer_id
     }
 
-    /// Tears down a vetoed dial without peer-level supersession.
+    /// Tears down a vetoed dial without a Connection replacement.
     ///
     /// Emits [`SwarmEvent::DialFailed`] when the dial was still pending, queues
     /// a transport close for `conn_id` only, and leaves any other connection
@@ -1396,6 +1427,48 @@ impl SwarmCore {
                 reason,
             });
         }
+        self.close_unannounced(conn_id);
+    }
+
+    /// Whether `new` loses a simultaneous dial to `current`, `peer_id`'s
+    /// current connection: both are direct, they go in opposite directions,
+    /// and `current` registered within [`SIMULTANEOUS_DIAL_WINDOW_MS`]. Both
+    /// peers keep the connection the lower peer id dialed, so `new` loses
+    /// when that is `current`.
+    fn loses_simultaneous_dial(
+        &self,
+        peer_id: &PeerId,
+        current: ConnectionId,
+        new: ConnectionId,
+        now_ms: u64,
+    ) -> bool {
+        if current.is_circuit() || new.is_circuit() {
+            return false;
+        }
+        let Some(current) = self.registrations.get(&current) else {
+            return false;
+        };
+        let new_outbound = self.pending_dials.contains_key(&new);
+        let keep_outbound = self.local_peer_id < *peer_id;
+        current.outbound != new_outbound
+            && now_ms.saturating_sub(current.at_ms) < SIMULTANEOUS_DIAL_WINDOW_MS
+            && current.outbound == keep_outbound
+    }
+
+    /// Closes `conn_id`, the losing half of a simultaneous dial, without
+    /// announcing it. The peer is already connected over the winner, which
+    /// also settled any Connection attempt this dial belonged to, so it does
+    /// not report `DialFailed` either. Like a replaced connection, it stays
+    /// retired until the transport reports it closed.
+    fn reject_simultaneous_dial(&mut self, conn_id: ConnectionId) {
+        self.pending_dials.remove(&conn_id);
+        self.close_unannounced(conn_id);
+        self.retired_connections.insert(conn_id);
+    }
+
+    /// Drops what an unannounced connection gathered, including a placeholder
+    /// peer, and queues its transport close.
+    fn close_unannounced(&mut self, conn_id: ConnectionId) {
         if let Some(peer_id) = self.conn_to_peer.remove(&conn_id) {
             if self.peer_to_conn.get(&peer_id) == Some(&conn_id) {
                 self.peer_to_conn.remove(&peer_id);
@@ -1513,6 +1586,7 @@ impl SwarmCore {
 
         self.conn_to_peer.remove(&old);
         self.conn_to_remote_addr.remove(&old);
+        self.registrations.remove(&old);
         self.forget_connection_streams(old);
         self.actions
             .retain(|action| !connection_action_matches(action, old));
@@ -1533,10 +1607,18 @@ impl SwarmCore {
         conn_id: ConnectionId,
         old: Option<ConnectionId>,
         ping_intent: Option<[u8; PING_PAYLOAD_LEN]>,
+        now_ms: u64,
     ) {
         self.set_conn_peer(conn_id, peer_id.clone());
         self.peer_to_conn.insert(peer_id.clone(), conn_id);
-        self.pending_dials.remove(&conn_id);
+        let outbound = self.pending_dials.remove(&conn_id).is_some();
+        self.registrations.insert(
+            conn_id,
+            Registration {
+                outbound,
+                at_ms: now_ms,
+            },
+        );
         if let Some(payload) = ping_intent {
             self.pending_pings.insert(peer_id.clone(), payload);
         }
@@ -1563,14 +1645,18 @@ impl SwarmCore {
             return;
         }
         // Last connection wins: a newer connection to the same peer replaces
-        // the existing one.
+        // the existing one, unless it loses a simultaneous dial.
         let old = self
             .peer_to_conn
             .get(&peer_id)
             .copied()
             .filter(|old| *old != id);
+        if old.is_some_and(|old| self.loses_simultaneous_dial(&peer_id, old, id, now_ms)) {
+            self.reject_simultaneous_dial(id);
+            return;
+        }
         let ping_intent = old.and_then(|old| self.retire_for_replacement(&peer_id, old, now_ms));
-        self.announce_connection(&peer_id, id, old, ping_intent);
+        self.announce_connection(&peer_id, id, old, ping_intent, now_ms);
         self.start_connection_protocols(&peer_id, id);
     }
 
@@ -1586,12 +1672,17 @@ impl SwarmCore {
         }
 
         // An already connected peer is handed over exactly as on
-        // `Connected`: the upgraded connection is the newest and wins.
+        // `Connected`: the upgraded connection is the newest and wins, unless
+        // it loses a simultaneous dial.
         let old = self
             .peer_to_conn
             .get(&new_peer_id)
             .copied()
             .filter(|old| *old != conn_id);
+        if old.is_some_and(|old| self.loses_simultaneous_dial(&new_peer_id, old, conn_id, now_ms)) {
+            self.reject_simultaneous_dial(conn_id);
+            return;
+        }
         let ping_intent =
             old.and_then(|old| self.retire_for_replacement(&new_peer_id, old, now_ms));
 
@@ -1623,7 +1714,7 @@ impl SwarmCore {
             self.migrate_buffered_events(&stale, &new_peer_id);
         }
 
-        self.announce_connection(&new_peer_id, conn_id, old, ping_intent);
+        self.announce_connection(&new_peer_id, conn_id, old, ping_intent, now_ms);
         self.try_emit_peer_ready(&new_peer_id);
         self.start_connection_protocols(&new_peer_id, conn_id);
     }
@@ -1827,6 +1918,7 @@ impl SwarmCore {
 
     fn handle_connection_closed(&mut self, conn_id: ConnectionId) {
         self.conn_to_remote_addr.remove(&conn_id);
+        self.registrations.remove(&conn_id);
         self.vetoed_establishes.remove(&conn_id);
 
         if let Some(pending) = self.pending_dials.remove(&conn_id) {
@@ -4542,5 +4634,140 @@ mod tests {
 
         feed(&mut core, TransportEvent::Closed { id: direct });
         assert_eq!(core.established_connections().count(), 0);
+    }
+
+    /// Peer ids that sort below and above [`tie_break_core`]'s own.
+    const LOWER_PEER: &[u8] = b"a";
+    const HIGHER_PEER: &[u8] = b"z";
+
+    /// A core whose own peer id sorts between `LOWER_PEER` and `HIGHER_PEER`.
+    fn tie_break_core() -> SwarmCore {
+        SwarmCore::new(
+            IdentifyConfig {
+                protocol_version: "minip2p-test/0.1.0".into(),
+                agent_version: "minip2p-test/0.1.0".into(),
+                protocols: Vec::new(),
+                public_key: b"m".to_vec(),
+            },
+            PingConfig::default(),
+        )
+    }
+
+    /// Feeds `conn_id` to `peer` at `now_ms`, as our dial (`outbound`) or the
+    /// peer's, with its identity on `Connected` or, when `upgrade`, through a
+    /// later `PeerIdentityVerified`.
+    fn register(
+        core: &mut SwarmCore,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        outbound: bool,
+        upgrade: bool,
+        now_ms: u64,
+    ) {
+        let endpoint = ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone());
+        let mut events = Vec::new();
+        if outbound {
+            let addr = PeerAddr::new(loopback_transport(), peer.clone()).expect("peer addr");
+            core.note_dial(conn_id, addr);
+        } else {
+            events.push(TransportEvent::IncomingConnection {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            });
+        }
+        if upgrade {
+            events.push(TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            });
+            events.push(TransportEvent::PeerIdentityVerified {
+                id: conn_id,
+                endpoint,
+                previous_peer_id: None,
+            });
+        } else {
+            events.push(TransportEvent::Connected {
+                id: conn_id,
+                endpoint,
+            });
+        }
+        for event in events {
+            core.handle_input(SwarmInput::Transport { event, now_ms });
+        }
+    }
+
+    #[test]
+    fn simultaneous_dial_closes_the_higher_peers_dial_unannounced() {
+        let current = ConnectionId::new(1);
+        let new = ConnectionId::new(2);
+        // The current connection is the lower peer's dial: ours when we are
+        // lower, the peer's when it is.
+        for (peer, current_outbound) in [(HIGHER_PEER, true), (LOWER_PEER, false)] {
+            for upgrade in [false, true] {
+                let case = format!("current_outbound={current_outbound} upgrade={upgrade}");
+                let mut core = tie_break_core();
+                let peer = PeerId::from_public_key_protobuf(peer);
+                register(&mut core, &peer, current, current_outbound, false, 0);
+                let _ = drain_events(&mut core);
+
+                register(&mut core, &peer, new, !current_outbound, upgrade, 4_999);
+                let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+                assert_eq!(lifecycle(&outputs), ["close 2"], "{case}");
+                assert!(
+                    !outputs
+                        .iter()
+                        .any(|output| matches!(output, SwarmOutput::Event(_))),
+                    "{case}: {outputs:?}"
+                );
+                assert_eq!(core.connection_id(&peer), Some(current), "{case}");
+
+                // Its close is silent too: no DialFailed for our losing dial.
+                feed(&mut core, TransportEvent::Closed { id: new });
+                assert!(drain_events(&mut core).is_empty(), "{case}");
+                assert_eq!(core.connection_id(&peer), Some(current), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn newest_connection_wins_outside_a_simultaneous_dial() {
+        let direct = ConnectionId::new(1);
+        let circuit = ConnectionId::namespaced(minip2p_transport::ConnectionNamespace::CIRCUIT, 1)
+            .expect("circuit id");
+        let new = ConnectionId::new(2);
+        // (case, current, current_outbound, new_outbound, new_at_ms). We are
+        // the lower peer, so our own dial wins a simultaneous dial.
+        let cases = [
+            ("new is the lower peer's dial", direct, false, true, 0),
+            ("same direction", direct, true, true, 0),
+            (
+                "current is older than the window",
+                direct,
+                true,
+                false,
+                SIMULTANEOUS_DIAL_WINDOW_MS,
+            ),
+            ("circuit to direct", circuit, true, false, 0),
+        ];
+        for (case, current, current_outbound, new_outbound, new_at_ms) in cases {
+            for upgrade in [false, true] {
+                let mut core = tie_break_core();
+                let peer = PeerId::from_public_key_protobuf(HIGHER_PEER);
+                register(&mut core, &peer, current, current_outbound, false, 0);
+                let _ = drain_events(&mut core);
+
+                register(&mut core, &peer, new, new_outbound, upgrade, new_at_ms);
+                let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+                assert_eq!(
+                    lifecycle(&outputs),
+                    [
+                        format!("replaced {current}->{new}"),
+                        format!("close {current}")
+                    ],
+                    "{case} (upgrade={upgrade})"
+                );
+                assert_eq!(core.connection_id(&peer), Some(new), "{case}");
+            }
+        }
     }
 }

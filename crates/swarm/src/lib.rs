@@ -44,7 +44,7 @@ mod builder;
 #[cfg(feature = "std")]
 mod driver;
 
-pub use crate::core::{RESERVED_PROTOCOL_IDS, SwarmCore};
+pub use crate::core::{RESERVED_PROTOCOL_IDS, SIMULTANEOUS_DIAL_WINDOW_MS, SwarmCore};
 pub use crate::events::{
     OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
     SwarmRuntimeError,

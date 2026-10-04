@@ -660,6 +660,13 @@ impl ConnectEngine {
     /// ones too. A circuit is only provisional while a direct leg can still
     /// win; it becomes the attempt's provisional path, replacing an older
     /// provisional circuit.
+    ///
+    /// Settling aborts the attempt's other direct dials, except when
+    /// `conn_id` is a direct connection none of our attempts dialed and we
+    /// are the lower peer. That is the peer's half of a simultaneous dial:
+    /// the peer may already have accepted one of our dials, and both sides
+    /// keep the lower peer's dial (`SIMULTANEOUS_DIAL_WINDOW_MS`), so ours
+    /// can only replace `conn_id`. Their failures stay inside the engine.
     fn peer_connected<T: Transport, E: EntropySource>(
         &mut self,
         peer_id: &PeerId,
@@ -676,6 +683,8 @@ impl ConnectEngine {
             .map(|(id, _)| *id)
             .collect();
         let circuit = conn_id.is_circuit();
+        let keep_dials =
+            !circuit && self.owner(conn_id).is_none() && runtime.local_peer_id() < peer_id;
         for id in ids {
             let Some(mut attempt) = self.attempts.remove(&id) else {
                 continue;
@@ -686,14 +695,16 @@ impl ConnectEngine {
                 RelayLeg::Pending { forced, .. } | RelayLeg::Provisional { forced, .. } => forced,
             };
             if settle {
-                self.abort_pending(
-                    runtime,
-                    attempt
-                        .direct
-                        .keys()
-                        .copied()
-                        .filter(|pending| *pending != conn_id),
-                );
+                let pending = attempt
+                    .direct
+                    .keys()
+                    .copied()
+                    .filter(|pending| *pending != conn_id);
+                if keep_dials {
+                    self.suppressed.extend(pending);
+                } else {
+                    self.abort_pending(runtime, pending);
+                }
                 self.push_settled(id, attempt.peer, ConnectOutcome::Connected { conn_id });
                 continue;
             }
@@ -1510,6 +1521,51 @@ mod tests {
             Some(ConnectOutcome::Connected { conn_id }) if *conn_id == inbound
         ));
         assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
+    }
+
+    #[test]
+    fn lower_peer_keeps_its_dials_when_the_peers_dial_settles_the_attempt() {
+        // Sorts above the runtime's own id: we are the lower peer, so a
+        // simultaneous dial keeps our dial on both sides.
+        let peer = peer(&[0xff; 40]);
+        let (first, second) = (addr(&peer, 1), addr(&peer, 2));
+        let mut runtime = runtime(FakeTransport::default());
+        assert!(runtime.local_peer_id() < &peer);
+        let mut engine = ConnectEngine::new(30_000);
+        let target = ConnectTarget::try_from(vec![first.clone(), second]).expect("same peer");
+        let id = engine.connect(target, &mut runtime, 0);
+        let inbound = ConnectionId::new(99);
+        runtime
+            .transport_mut()
+            .push_connected(inbound, peer.clone(), first.clone());
+        let events = drain(&mut engine, &mut runtime, 0);
+        assert!(matches!(
+            settled_for(&events, id),
+            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == inbound
+        ));
+        assert!(runtime.transport().closes.is_empty(), "dials stay up");
+
+        // One dial lands and replaces the peer's; the other fails silently.
+        runtime
+            .transport_mut()
+            .push_connected(ConnectionId::new(1), peer.clone(), first);
+        runtime.transport_mut().push_closed(ConnectionId::new(2));
+        let events = drain(&mut engine, &mut runtime, 0);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EndpointEvent::ConnectionReplaced { old, new, .. }
+                    if *old == inbound && *new == ConnectionId::new(1)
+            )),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                EndpointEvent::DialFailed { .. } | EndpointEvent::ConnectSettled { .. }
+            )),
+            "{events:?}"
+        );
     }
 
     #[test]

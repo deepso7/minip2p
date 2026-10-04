@@ -38,6 +38,12 @@ pub enum SwarmEvent {
     /// is connected but not ready. A ping pending or in flight on `old` is
     /// re-sent on `new`. The event is delivered before the transport is asked
     /// to close `old`.
+    ///
+    /// The newest connection wins, except in a simultaneous dial: a direct
+    /// connection in the opposite direction to a direct `old` that registered
+    /// less than [`SIMULTANEOUS_DIAL_WINDOW_MS`](crate::SIMULTANEOUS_DIAL_WINDOW_MS)
+    /// ago replaces it only if the lower peer id dialed it. Otherwise it is
+    /// closed without any event, so both peers keep the same connection.
     ConnectionReplaced {
         peer_id: PeerId,
         old: ConnectionId,
