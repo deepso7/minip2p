@@ -487,20 +487,7 @@ impl RelayServerAgent {
     /// Processes every deadline due at or before `now`.
     pub fn handle_tick(&mut self, now: Now) {
         self.last_event_tick_ms = Some(now.monotonic_ms);
-        // A reservation whose renewal response is already on the wire
-        // stays alive until that renewal commits or fails: the client was
-        // promised the extension.
-        let renewing: BTreeSet<&PeerId> = self
-            .pending_operations
-            .values()
-            .filter_map(|operation| match operation {
-                PendingOperation::Send {
-                    effect: SendEffect::CommitReservation(pending),
-                    ..
-                } if pending.renewed => Some(&pending.peer_id),
-                _ => None,
-            })
-            .collect();
+        let renewing = self.renewing_peers();
         let expired: Vec<_> = self
             .reservations
             .iter()
@@ -839,10 +826,12 @@ impl RelayServerAgent {
 
     /// Returns milliseconds until the earliest timer, with zero meaning due.
     pub fn next_timeout(&self, now: Now) -> Option<u64> {
+        let renewing = self.renewing_peers();
         let reservation = self
             .reservations
-            .values()
-            .map(|value| value.deadline_ms)
+            .iter()
+            .filter(|(peer, _)| !renewing.contains(peer))
+            .map(|(_, value)| value.deadline_ms)
             .min();
         let hop = self
             .hop_workers
@@ -1648,6 +1637,23 @@ impl RelayServerAgent {
             addrs.pop();
         }
         None
+    }
+
+    /// Peers whose renewal response is already on the wire. Their
+    /// reservation stays alive (and off the timer) until that renewal
+    /// commits or fails: the client was promised the extension. The pending
+    /// send is still bounded by its control stream's own timeout.
+    fn renewing_peers(&self) -> BTreeSet<&PeerId> {
+        self.pending_operations
+            .values()
+            .filter_map(|operation| match operation {
+                PendingOperation::Send {
+                    effect: SendEffect::CommitReservation(pending),
+                    ..
+                } if pending.renewed => Some(&pending.peer_id),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Admission for a new reservation: spends a rate-limit token, then
@@ -4427,6 +4433,11 @@ mod tests {
         assert!(
             agent.poll_event().is_none(),
             "the client was already sent SUCCESS for the renewal"
+        );
+        assert_ne!(
+            agent.next_timeout(Now::from_millis(1_000)),
+            Some(0),
+            "the kept-alive deadline must not spin the host's timer"
         );
 
         agent.send_stream_result(token, Ok(()), Now::from_millis(1_000));
