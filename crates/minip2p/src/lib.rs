@@ -24,6 +24,14 @@ mod portable;
 mod pubsub;
 #[cfg(feature = "std")]
 mod std;
+#[cfg(any(
+    feature = "_nat-driver",
+    all(
+        feature = "pubsub",
+        any(feature = "std", feature = "smoltcp", feature = "portable-mdns")
+    )
+))]
+mod stream_conns;
 
 pub use portable::*;
 #[cfg(all(feature = "pubsub", any(feature = "std", feature = "smoltcp")))]

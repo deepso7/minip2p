@@ -84,14 +84,23 @@ export interface Minip2pBackend {
   addProtocol: (protocolId: string) => void;
   /** Starts opening and negotiating an application stream. */
   openStream: (peerId: string, protocolId: string) => BackendOpenStream;
-  /** Sends bytes on an application stream. */
-  sendStream: (peerId: string, streamId: number, data: Uint8Array) => void;
+  /**
+   * Sends bytes on an application stream. Every stream operation names the
+   * stream by connection too; one whose connection is no longer the peer's
+   * throws instead of reaching a stream on a newer connection.
+   */
+  sendStream: (
+    peerId: string,
+    connId: number,
+    streamId: number,
+    data: Uint8Array
+  ) => void;
   /** Half-closes the local stream write side. */
-  closeStreamWrite: (peerId: string, streamId: number) => void;
+  closeStreamWrite: (peerId: string, connId: number, streamId: number) => void;
   /** Abruptly resets a stream. */
-  resetStream: (peerId: string, streamId: number) => void;
+  resetStream: (peerId: string, connId: number, streamId: number) => void;
   /** Resets and relinquishes a stream. */
-  abandonStream: (peerId: string, streamId: number) => void;
+  abandonStream: (peerId: string, connId: number, streamId: number) => void;
   /** Starts one Connection attempt and returns its Connect ID. */
   connect: (target: BackendConnectTarget) => number;
   /** Cancels a Connection attempt; its terminal event still follows. */

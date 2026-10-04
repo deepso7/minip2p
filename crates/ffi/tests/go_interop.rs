@@ -251,10 +251,11 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
     });
     endpoint.send_stream(
         go_peer.clone(),
+        opened.conn_id,
         opened.stream_id,
         PAYLOAD_FROM_MINIP2P.to_vec(),
     )?;
-    endpoint.close_stream_write(go_peer.clone(), opened.stream_id)?;
+    endpoint.close_stream_write(go_peer.clone(), opened.conn_id, opened.stream_id)?;
     let mut echoed_to_minip2p = Vec::with_capacity(PAYLOAD_FROM_MINIP2P.len());
     loop {
         let event = log.take_for(|event| {
@@ -306,17 +307,19 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
         match event {
             P2pEvent::StreamData {
                 peer_id,
+                conn_id,
                 stream_id,
                 data,
-                ..
             } => {
                 received.extend_from_slice(&data);
-                endpoint.send_stream(peer_id, stream_id, data)?;
+                endpoint.send_stream(peer_id, conn_id, stream_id, data)?;
             }
             P2pEvent::StreamRemoteWriteClosed {
-                peer_id, stream_id, ..
+                peer_id,
+                conn_id,
+                stream_id,
             } => {
-                endpoint.close_stream_write(peer_id, stream_id)?;
+                endpoint.close_stream_write(peer_id, conn_id, stream_id)?;
                 break;
             }
             _ => panic!("reverse-echo predicate returned a different event"),

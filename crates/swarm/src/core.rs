@@ -249,8 +249,8 @@ pub struct SwarmCore {
     outbound_negotiators: BTreeMap<(ConnectionId, StreamId), PendingOutbound>,
     /// Streams that completed negotiation: maps to the owning protocol.
     ///
-    /// Keyed peer-first so the `(peer, stream)` lookups behind the public
-    /// stream API are a range query rather than a scan. Each key's peer is
+    /// Keyed peer-first so the `(peer, stream)` lookups behind the ping and
+    /// Identify handlers are a range query rather than a scan. Each key's peer is
     /// always `conn_to_peer[conn]`; [`Self::set_conn_peer`] rekeys on change.
     stream_owner: BTreeMap<OwnedStream, ProtocolKind>,
     /// User streams for which a reset has already been queued.
@@ -628,14 +628,20 @@ impl SwarmCore {
 
     /// Sends raw bytes on a negotiated user stream.
     ///
-    /// Emits a `SendStream` action; the driver executes it.
+    /// Emits a `SendStream` action; the driver executes it. Like every
+    /// user-stream operation, the stream is addressed by connection as well
+    /// as id, because stream ids are only unique per connection: an
+    /// operation for a connection that is no longer `peer_id`'s fails with
+    /// [`SwarmError::StreamNotFound`] instead of reaching a same-numbered
+    /// stream on its replacement.
     pub fn send_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<(), SwarmError> {
-        let conn_id = self.require_stream_conn(peer_id, stream_id)?;
+        self.require_user_stream(peer_id, conn_id, stream_id)?;
         self.actions.push_back(SwarmAction::SendStream {
             conn_id,
             stream_id,
@@ -648,9 +654,10 @@ impl SwarmCore {
     pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
-        let conn_id = self.require_stream_conn(peer_id, stream_id)?;
+        self.require_user_stream(peer_id, conn_id, stream_id)?;
         self.actions
             .push_back(SwarmAction::CloseStreamWrite { conn_id, stream_id });
         Ok(())
@@ -660,9 +667,10 @@ impl SwarmCore {
     pub fn reset_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
-        let conn_id = self.require_stream_conn(peer_id, stream_id)?;
+        self.require_user_stream(peer_id, conn_id, stream_id)?;
         if self.reset_pending.insert((conn_id, stream_id)) {
             self.actions
                 .push_back(SwarmAction::ResetStream { conn_id, stream_id });
@@ -710,45 +718,28 @@ impl SwarmCore {
     pub fn abandon_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
         // Ownership is relinquished even if the transport has already closed
         // and forgotten the stream. In that case there is nothing left to
         // reset, but a terminal event may still be queued for the consumer.
         self.events
-            .retain(|event| !event.matches_stream(peer_id, stream_id));
-        if let Some(key) = self
-            .abandoned_streams
-            .iter()
-            .find(|(conn_id, sid)| {
-                *sid == stream_id && self.conn_to_peer.get(conn_id) == Some(peer_id)
-            })
-            .copied()
-        {
-            if self.reset_pending.insert(key) {
-                self.actions.push_back(SwarmAction::ResetStream {
-                    conn_id: key.0,
-                    stream_id: key.1,
-                });
-            }
-            return Ok(());
-        }
-        let conn_id = self
-            .outbound_negotiators
-            .keys()
-            .find_map(|(conn_id, sid)| {
-                (*sid == stream_id && self.conn_to_peer.get(conn_id) == Some(peer_id))
-                    .then_some(*conn_id)
-            })
-            .or_else(|| self.require_stream_conn(peer_id, stream_id).ok())
-            .ok_or_else(|| SwarmError::StreamNotFound {
-                peer_id: peer_id.clone(),
-                stream_id,
-            })?;
+            .retain(|event| !event.matches_stream(peer_id, conn_id, stream_id));
         let key = (conn_id, stream_id);
+        let peer_conn = self.conn_to_peer.get(&conn_id) == Some(peer_id);
+        let abandoned = peer_conn && self.abandoned_streams.contains(&key);
+        // A stream still negotiating outbound can be abandoned too: its id
+        // was handed out by `open_stream` before `StreamReady`.
+        if !abandoned && !(peer_conn && self.outbound_negotiators.contains_key(&key)) {
+            self.require_user_stream(peer_id, conn_id, stream_id)?;
+        }
         if self.reset_pending.insert(key) {
             self.actions
                 .push_back(SwarmAction::ResetStream { conn_id, stream_id });
+        }
+        if abandoned {
+            return Ok(());
         }
         self.abandoned_streams.insert(key);
         self.remove_stream_owner(conn_id, stream_id);
@@ -1160,19 +1151,29 @@ impl SwarmCore {
             })
     }
 
-    fn require_stream_conn(
+    /// Checks that `conn_id` is `peer_id`'s connection and holds the
+    /// negotiated user stream `stream_id`. Streams of a replaced or closed
+    /// connection are forgotten with it, so they never match.
+    fn require_user_stream(
         &self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
-    ) -> Result<ConnectionId, SwarmError> {
-        self.peer_streams(peer_id, stream_id)
-            .find_map(|(conn_id, protocol)| {
-                matches!(protocol, ProtocolKind::User(_)).then_some(conn_id)
-            })
-            .ok_or_else(|| SwarmError::StreamNotFound {
+    ) -> Result<(), SwarmError> {
+        if self.conn_to_peer.get(&conn_id) == Some(peer_id)
+            && matches!(
+                self.stream_protocol(conn_id, stream_id),
+                Some(ProtocolKind::User(_))
+            )
+        {
+            Ok(())
+        } else {
+            Err(SwarmError::StreamNotFound {
                 peer_id: peer_id.clone(),
+                conn_id,
                 stream_id,
             })
+        }
     }
 
     fn conn_for_owned_stream(
@@ -3025,9 +3026,9 @@ mod tests {
             data: vec![1],
         });
 
-        core.reset_stream(&peer, stream).unwrap();
-        core.abandon_stream(&peer, stream).unwrap();
-        core.abandon_stream(&peer, stream).unwrap();
+        core.reset_stream(&peer, conn, stream).unwrap();
+        core.abandon_stream(&peer, conn, stream).unwrap();
+        core.abandon_stream(&peer, conn, stream).unwrap();
         let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
         assert_eq!(
             outputs
@@ -3085,7 +3086,7 @@ mod tests {
             },
         );
 
-        core.abandon_stream(&peer, stream).unwrap();
+        core.abandon_stream(&peer, conn, stream).unwrap();
 
         assert!(!core.outbound_negotiators.contains_key(&key));
         assert!(core.abandoned_streams.contains(&key));
@@ -3108,25 +3109,25 @@ mod tests {
         core.peer_to_conn.insert(peer.clone(), conn);
         core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
 
-        core.reset_stream(&peer, stream).unwrap();
+        core.reset_stream(&peer, conn, stream).unwrap();
         assert!(matches!(
             core.poll_output(),
             Some(SwarmOutput::Action(SwarmAction::ResetStream { .. }))
         ));
         core.reset_stream_failed(conn, stream);
-        core.reset_stream(&peer, stream).unwrap();
+        core.reset_stream(&peer, conn, stream).unwrap();
         assert!(matches!(
             core.poll_output(),
             Some(SwarmOutput::Action(SwarmAction::ResetStream { .. }))
         ));
         core.reset_stream_failed(conn, stream);
-        core.abandon_stream(&peer, stream).unwrap();
+        core.abandon_stream(&peer, conn, stream).unwrap();
         assert!(matches!(
             core.poll_output(),
             Some(SwarmOutput::Action(SwarmAction::ResetStream { .. }))
         ));
         core.reset_stream_failed(conn, stream);
-        core.abandon_stream(&peer, stream).unwrap();
+        core.abandon_stream(&peer, conn, stream).unwrap();
         assert!(matches!(
             core.poll_output(),
             Some(SwarmOutput::Action(SwarmAction::ResetStream { .. }))
@@ -3150,7 +3151,7 @@ mod tests {
                 stream_id: stream,
             },
         );
-        assert!(core.abandon_stream(&peer, stream).is_err());
+        assert!(core.abandon_stream(&peer, conn, stream).is_err());
         assert!(core.poll_output().is_none());
     }
 
@@ -3236,7 +3237,7 @@ mod tests {
             ProtocolKind::User("/minip2p/test/1.0.0".into()),
         );
 
-        core.send_stream(&peer_id, stream_id, b"ok".to_vec())
+        core.send_stream(&peer_id, original_conn, stream_id, b"ok".to_vec())
             .expect("user stream should be active on original connection");
         let actions = drain_actions(&mut core);
 
@@ -3310,7 +3311,7 @@ mod tests {
 
         feed(&mut core, TransportEvent::Closed { id: closed });
         drain_actions(&mut core);
-        core.send_stream(&peer_id, stream_id, b"ok".to_vec())
+        core.send_stream(&peer_id, surviving, stream_id, b"ok".to_vec())
             .expect("stream on the surviving connection should remain");
         assert!(matches!(
             drain_actions(&mut core).as_slice(),
@@ -3319,7 +3320,7 @@ mod tests {
 
         feed(&mut core, TransportEvent::Closed { id: surviving });
         assert!(matches!(
-            core.reset_stream(&peer_id, stream_id),
+            core.reset_stream(&peer_id, surviving, stream_id),
             Err(SwarmError::StreamNotFound { .. })
         ));
     }
@@ -3350,10 +3351,10 @@ mod tests {
         );
         drain_actions(&mut core);
 
-        core.close_stream_write(&verified, stream_id)
+        core.close_stream_write(&verified, conn_id, stream_id)
             .expect("stream should follow the connection to its verified peer");
         assert!(matches!(
-            core.close_stream_write(&placeholder, stream_id),
+            core.close_stream_write(&placeholder, conn_id, stream_id),
             Err(SwarmError::StreamNotFound { .. })
         ));
     }
@@ -3378,9 +3379,9 @@ mod tests {
             stream,
             ProtocolKind::User("/minip2p/test/1.0.0".into()),
         );
-        core.send_stream(&peer_id, stream, b"stale".to_vec())
+        core.send_stream(&peer_id, original, stream, b"stale".to_vec())
             .expect("old connection stream should initially be active");
-        core.reset_stream(&peer_id, stream)
+        core.reset_stream(&peer_id, original, stream)
             .expect("old connection stream should initially be active");
 
         // Replace before draining the original connection's automatic
@@ -3409,7 +3410,7 @@ mod tests {
             ([SwarmAction::CloseConnection { conn_id }], []) if *conn_id == original
         ));
         assert!(matches!(
-            core.send_stream(&peer_id, stream, b"lost".to_vec()),
+            core.send_stream(&peer_id, original, stream, b"lost".to_vec()),
             Err(SwarmError::StreamNotFound { .. })
         ));
 
@@ -3466,6 +3467,99 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A peer whose stream 3 lived on `old` and now lives on `new`, after
+    /// `old` was replaced (or closed, then reconnected as `new`).
+    fn peer_with_stream_on_two_generations(
+        replace: bool,
+    ) -> (SwarmCore, PeerId, ConnectionId, ConnectionId, StreamId) {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"two-generation-peer");
+        let (old, new, stream) = (
+            ConnectionId::new(40),
+            ConnectionId::new(41),
+            StreamId::new(3),
+        );
+        let user = || ProtocolKind::User("/test/1".into());
+        connect_again(&mut core, &peer_id, old, false);
+        core.insert_stream_owner(old, stream, user());
+        if !replace {
+            feed(&mut core, TransportEvent::Closed { id: old });
+        }
+        connect_again(&mut core, &peer_id, new, false);
+        core.insert_stream_owner(new, stream, user());
+        while core.poll_output().is_some() {}
+        (core, peer_id, old, new, stream)
+    }
+
+    /// Runs every user-stream operation against `conn_id`.
+    fn stream_ops(
+        core: &mut SwarmCore,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) -> [Result<(), SwarmError>; 4] {
+        [
+            core.send_stream(peer_id, conn_id, stream_id, b"x".to_vec()),
+            core.close_stream_write(peer_id, conn_id, stream_id),
+            core.reset_stream(peer_id, conn_id, stream_id),
+            core.abandon_stream(peer_id, conn_id, stream_id),
+        ]
+    }
+
+    #[test]
+    fn stream_ops_for_an_old_connection_never_reach_its_successor() {
+        for replace in [true, false] {
+            let (mut core, peer_id, old, new, stream) =
+                peer_with_stream_on_two_generations(replace);
+
+            for result in stream_ops(&mut core, &peer_id, old, stream) {
+                assert!(
+                    matches!(
+                        result,
+                        Err(SwarmError::StreamNotFound { conn_id, .. }) if conn_id == old
+                    ),
+                    "replace={replace}"
+                );
+            }
+            assert!(core.poll_output().is_none(), "replace={replace}");
+
+            for result in stream_ops(&mut core, &peer_id, new, stream) {
+                result.expect("the live connection's stream accepts every op");
+            }
+            let actions = drain_actions(&mut core);
+            assert_eq!(
+                actions.len(),
+                3,
+                "send, close, one reset; replace={replace}"
+            );
+            assert!(
+                actions
+                    .iter()
+                    .all(|action| connection_action_matches(action, new)),
+                "replace={replace}"
+            );
+        }
+    }
+
+    #[test]
+    fn abandoning_an_old_connection_stream_keeps_the_successors_events() {
+        let (mut core, peer_id, old, new, stream) = peer_with_stream_on_two_generations(true);
+        let data = |conn_id| SwarmEvent::StreamData {
+            peer_id: peer_id.clone(),
+            conn_id,
+            stream_id: stream,
+            data: vec![1],
+        };
+        core.events.push_back(data(old));
+        core.events.push_back(data(new));
+
+        assert!(core.abandon_stream(&peer_id, old, stream).is_err());
+        assert!(matches!(
+            drain_events(&mut core).as_slice(),
+            [SwarmEvent::StreamData { conn_id, .. }] if *conn_id == new
+        ));
     }
 
     #[test]
@@ -3969,7 +4063,7 @@ mod tests {
                 target: ProtocolKind::User("/test/1".into()),
             },
         );
-        core.reset_stream(&peer, stream)
+        core.reset_stream(&peer, conn, stream)
             .expect("active user stream can be reset");
         core.abandoned_streams.insert(key);
         core.actions.push_back(SwarmAction::SendStream {

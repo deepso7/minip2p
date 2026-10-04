@@ -22,6 +22,7 @@ use minip2p_transport::{ConnectionId, StreamId, Transport};
 
 use crate::EndpointEvent;
 use crate::portable::connect::ConnectEngine;
+use crate::stream_conns::StreamConns;
 
 /// Converts a host time sample into the agent's clock pair.
 pub(crate) fn to_nat_now(now: PlatformNow) -> Now {
@@ -57,6 +58,8 @@ pub(crate) struct NatDriver<E> {
     public_addrs: Vec<Multiaddr>,
     /// Exact adopted bridge keys mapped to their promoted circuit ids.
     promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
+    /// Connection of each stream the agent addresses by peer and id.
+    stream_conns: StreamConns,
     /// How many queued events the Connection engine has already observed.
     observed: usize,
     /// The bound-address revision the agent's `listen_addrs` were seeded
@@ -88,6 +91,7 @@ impl<E: EntropySource> NatDriver<E> {
             relay_addrs,
             public_addrs: Vec::new(),
             promoted: BTreeMap::new(),
+            stream_conns: StreamConns::default(),
             observed: 0,
             // Matches a fresh runtime: seed only after a real `listen*`
             // call bumped the revision. Some transports report bound-but-
@@ -262,6 +266,7 @@ impl<E: EntropySource> NatDriver<E> {
         sample: PlatformNow,
     ) -> bool {
         self.sync_listen_addrs(swarm);
+        self.stream_conns.observe(event);
         let now = to_nat_now(sample);
         if self.inject_straggler(event, swarm) {
             self.pump(swarm, sample);
@@ -590,6 +595,10 @@ impl<E: EntropySource> NatDriver<E> {
             } => {
                 let result = swarm
                     .open_stream(&peer, &protocol_id, now.mono_ms)
+                    .map(|(conn_id, stream_id)| {
+                        self.stream_conns.opened(&peer, conn_id, stream_id);
+                        stream_id
+                    })
                     .map_err(|e| e.to_string());
                 self.agent.stream_open_result(token, result, now);
             }
@@ -599,23 +608,30 @@ impl<E: EntropySource> NatDriver<E> {
                 data,
             } => {
                 // Failures surface through the agent's own timeouts and the
-                // swarm's error events; nothing to echo synchronously.
-                match swarm.send_stream(&peer, stream_id, data, now.mono_ms) {
-                    Ok(()) | Err(_) => {}
+                // swarm's error events; nothing to echo synchronously. A
+                // stream whose connection is gone is skipped the same way.
+                if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
+                    match swarm.send_stream(&peer, conn_id, stream_id, data, now.mono_ms) {
+                        Ok(()) | Err(_) => {}
+                    }
                 }
             }
             NatAction::CloseStreamWrite { peer, stream_id } => {
                 // A stale close must not replace the lifecycle event that
                 // triggered this action.
-                match swarm.close_stream_write(&peer, stream_id, now.mono_ms) {
-                    Ok(()) | Err(_) => {}
+                if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
+                    match swarm.close_stream_write(&peer, conn_id, stream_id, now.mono_ms) {
+                        Ok(()) | Err(_) => {}
+                    }
                 }
             }
             NatAction::ResetStream { peer, stream_id } => {
                 // Reset is cleanup, so a stream already gone is equivalent
                 // to a successful reset.
-                match swarm.reset_stream(&peer, stream_id, now.mono_ms) {
-                    Ok(()) | Err(_) => {}
+                if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
+                    match swarm.reset_stream(&peer, conn_id, stream_id, now.mono_ms) {
+                        Ok(()) | Err(_) => {}
+                    }
                 }
             }
             NatAction::Disconnect { peer } => {

@@ -594,41 +594,52 @@ impl Endpoint {
     /// Allowed once the peer is connected. Identify (`PeerReady`) is not
     /// required first; after Identify completes, an unsupported protocol can
     /// fail early with [`SwarmError::RemoteDoesNotSupport`].
-    pub fn open_stream(&mut self, peer_id: &PeerId, protocol_id: &str) -> Result<StreamId, Error> {
-        self.swarm.open_stream(peer_id, protocol_id)
-    }
-
-    /// Opens an application stream and returns its connection and stream ids.
-    pub fn open_stream_with_connection(
+    ///
+    /// Returns the connection and stream ids. Stream ids are only unique per
+    /// connection, so every later stream operation takes both.
+    pub fn open_stream(
         &mut self,
         peer_id: &PeerId,
         protocol_id: &str,
     ) -> Result<(ConnectionId, StreamId), Error> {
-        self.swarm.open_stream_with_connection(peer_id, protocol_id)
+        self.swarm.open_stream(peer_id, protocol_id)
     }
 
     /// Sends bytes on a negotiated application stream.
+    ///
+    /// Fails with [`SwarmError::StreamNotFound`] if `conn_id` is no longer
+    /// the peer's connection holding the stream (for example after
+    /// `ConnectionReplaced`), so a write never reaches a same-numbered stream
+    /// on a newer connection. The other stream operations behave the same.
     pub fn send_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         data: impl Into<Vec<u8>>,
     ) -> Result<(), Error> {
-        self.swarm.send_stream(peer_id, stream_id, data.into())
+        self.swarm
+            .send_stream(peer_id, conn_id, stream_id, data.into())
     }
 
     /// Half-closes the local write side of an application stream.
     pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), Error> {
-        self.swarm.close_stream_write(peer_id, stream_id)
+        self.swarm.close_stream_write(peer_id, conn_id, stream_id)
     }
 
     /// Resets an application stream.
-    pub fn reset_stream(&mut self, peer_id: &PeerId, stream_id: StreamId) -> Result<(), Error> {
-        self.swarm.reset_stream(peer_id, stream_id)
+    pub fn reset_stream(
+        &mut self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), Error> {
+        self.swarm.reset_stream(peer_id, conn_id, stream_id)
     }
 
     /// Resets and forgets an application stream that will no longer be consumed.
@@ -636,10 +647,15 @@ impl Endpoint {
     /// Unlike [`Endpoint::reset_stream`], this also discards matching events
     /// already buffered by the endpoint and suppresses later data, EOF, and
     /// close events for the stream. Repeated calls are idempotent.
-    pub fn abandon_stream(&mut self, peer_id: &PeerId, stream_id: StreamId) -> Result<(), Error> {
-        self.swarm.abandon_stream(peer_id, stream_id)?;
+    pub fn abandon_stream(
+        &mut self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), Error> {
+        self.swarm.abandon_stream(peer_id, conn_id, stream_id)?;
         self.pending_events
-            .retain(|event| !event.matches_stream(peer_id, stream_id));
+            .retain(|event| !event.matches_stream(peer_id, conn_id, stream_id));
         Ok(())
     }
 

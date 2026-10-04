@@ -293,41 +293,78 @@ impl NodeEndpoint {
             .map_err(|error| native_error(&env, error))
     }
 
-    /// Sends bytes on an application stream.
+    /// Sends bytes on an application stream, named by its connection and
+    /// stream ids.
     #[napi]
     pub fn send_stream(
         &self,
         env: Env,
         peer_id: String,
+        conn_id: BigInt,
         stream_id: BigInt,
         data: Uint8Array,
     ) -> Result<()> {
         self.0
-            .send_stream(peer_id, bigint_u64(stream_id, "streamId")?, data.to_vec())
+            .send_stream(
+                peer_id,
+                bigint_u64(conn_id, "connId")?,
+                bigint_u64(stream_id, "streamId")?,
+                data.to_vec(),
+            )
             .map_err(|error| native_error(&env, error))
     }
 
     /// Half-closes the local stream write side.
     #[napi]
-    pub fn close_stream_write(&self, env: Env, peer_id: String, stream_id: BigInt) -> Result<()> {
+    pub fn close_stream_write(
+        &self,
+        env: Env,
+        peer_id: String,
+        conn_id: BigInt,
+        stream_id: BigInt,
+    ) -> Result<()> {
         self.0
-            .close_stream_write(peer_id, bigint_u64(stream_id, "streamId")?)
+            .close_stream_write(
+                peer_id,
+                bigint_u64(conn_id, "connId")?,
+                bigint_u64(stream_id, "streamId")?,
+            )
             .map_err(|error| native_error(&env, error))
     }
 
     /// Resets an application stream.
     #[napi]
-    pub fn reset_stream(&self, env: Env, peer_id: String, stream_id: BigInt) -> Result<()> {
+    pub fn reset_stream(
+        &self,
+        env: Env,
+        peer_id: String,
+        conn_id: BigInt,
+        stream_id: BigInt,
+    ) -> Result<()> {
         self.0
-            .reset_stream(peer_id, bigint_u64(stream_id, "streamId")?)
+            .reset_stream(
+                peer_id,
+                bigint_u64(conn_id, "connId")?,
+                bigint_u64(stream_id, "streamId")?,
+            )
             .map_err(|error| native_error(&env, error))
     }
 
     /// Resets and relinquishes an application stream.
     #[napi]
-    pub fn abandon_stream(&self, env: Env, peer_id: String, stream_id: BigInt) -> Result<()> {
+    pub fn abandon_stream(
+        &self,
+        env: Env,
+        peer_id: String,
+        conn_id: BigInt,
+        stream_id: BigInt,
+    ) -> Result<()> {
         self.0
-            .abandon_stream(peer_id, bigint_u64(stream_id, "streamId")?)
+            .abandon_stream(
+                peer_id,
+                bigint_u64(conn_id, "connId")?,
+                bigint_u64(stream_id, "streamId")?,
+            )
             .map_err(|error| native_error(&env, error))
     }
 

@@ -26,7 +26,7 @@ You can also call `add_protocol` after binding. Registration affects inbound and
 
 Once the attempt settles `Connected`, request a stream. A protocol both peers registered does not need to wait for Identify; match `PeerReady` first only if you want unsupported protocols to fail early with `RemoteDoesNotSupport`.
 
-`open_stream` starts negotiation and returns the allocated stream ID. Wait for the matching `EndpointEvent::StreamReady` before writing:
+`open_stream` starts negotiation and returns the connection and the allocated stream ID. Stream IDs are unique only per connection, so every stream operation takes both. Wait for the matching `EndpointEvent::StreamReady` before writing:
 
 ```rust
 use std::time::{Duration, Instant};
@@ -35,7 +35,7 @@ use minip2p::{ConnectOutcome, EndpointEvent, EndpointWaitOutcome};
 
 let peer_id = target.peer_id().clone();
 let connect_id = node.connect(target)?;
-let mut stream_id = None;
+let mut stream = None;
 let deadline = Instant::now() + Duration::from_secs(10);
 
 loop {
@@ -53,18 +53,19 @@ loop {
             ..
         } if id == connect_id => match outcome {
             ConnectOutcome::Connected { .. } => {
-                stream_id = Some(node.open_stream(&peer_id, ECHO_PROTOCOL)?);
+                stream = Some(node.open_stream(&peer_id, ECHO_PROTOCOL)?);
             }
             other => return Err(format!("connect failed: {other:?}").into()),
         },
         EndpointEvent::StreamReady {
             peer_id: peer,
+            conn_id,
             stream_id: ready,
             protocol_id,
             ..
-        } if peer == peer_id && Some(ready) == stream_id && protocol_id == ECHO_PROTOCOL => {
-            node.send_stream(&peer_id, ready, b"hello".to_vec())?;
-            node.close_stream_write(&peer_id, ready)?;
+        } if peer == peer_id && Some((conn_id, ready)) == stream && protocol_id == ECHO_PROTOCOL => {
+            node.send_stream(&peer_id, conn_id, ready, b"hello".to_vec())?;
+            node.close_stream_write(&peer_id, conn_id, ready)?;
             break;
         }
         other => handle_other_event(other),
@@ -78,34 +79,34 @@ QUIC is a byte stream: writes can be fragmented or coalesced. Add framing when o
 
 ## Accept an inbound stream
 
-Inbound negotiation produces the same `StreamReady` event with `initiated_locally: false`. Track accepted stream IDs so later `StreamData` can be routed to the correct handler:
+Inbound negotiation produces the same `StreamReady` event with `initiated_locally: false`. Track accepted streams by peer, connection, and stream ID so later `StreamData` can be routed to the correct handler:
 
 ```rust
 use std::collections::HashSet;
 
-use minip2p::{EndpointEvent, PeerId, StreamId};
+use minip2p::{ConnectionId, EndpointEvent, PeerId, StreamId};
 
-let mut echo_streams: HashSet<(PeerId, StreamId)> = HashSet::new();
+let mut echo_streams: HashSet<(PeerId, ConnectionId, StreamId)> = HashSet::new();
 
 match event {
     EndpointEvent::StreamReady {
         peer_id,
+        conn_id,
         stream_id,
         protocol_id,
         initiated_locally: false,
-        ..
     } if protocol_id == ECHO_PROTOCOL => {
-        echo_streams.insert((peer_id, stream_id));
+        echo_streams.insert((peer_id, conn_id, stream_id));
     }
     EndpointEvent::StreamData {
         peer_id,
+        conn_id,
         stream_id,
         data,
-        ..
-    } if echo_streams.contains(&(peer_id.clone(), stream_id)) => {
-        node.send_stream(&peer_id, stream_id, data)?;
-        node.close_stream_write(&peer_id, stream_id)?;
-        echo_streams.remove(&(peer_id, stream_id));
+    } if echo_streams.contains(&(peer_id.clone(), conn_id, stream_id)) => {
+        node.send_stream(&peer_id, conn_id, stream_id, data)?;
+        node.close_stream_write(&peer_id, conn_id, stream_id)?;
+        echo_streams.remove(&(peer_id, conn_id, stream_id));
     }
     _ => {}
 }
@@ -118,6 +119,8 @@ match event {
 | `close_stream_write` | Gracefully half-close the local write side; reads may continue. |
 | `reset_stream` | Abruptly terminate the stream while keeping terminal stream events visible. |
 | `abandon_stream` | Reset the stream, purge buffered matching events, and suppress later matching stream events. |
+
+An operation whose connection has closed or been replaced fails with `SwarmError::StreamNotFound` instead of reaching a stream on the peer's new connection that reuses the ID.
 
 Use `abandon_stream` when an application has permanently stopped consuming a stream. Calling it again while the abandon/reset is still pending is safe and keeps an ignored stream's events out of the Endpoint event stream. After the stream is fully forgotten, a later call returns an error.
 

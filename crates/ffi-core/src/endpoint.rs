@@ -8,9 +8,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, Endpoint, EndpointBuilder, GossipsubConfig, GossipsubError, MdnsConfig,
-    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, PublishError, StreamId, TopicError,
-    TransportError, WaitHandle,
+    BeaconConfig, ConnectionId, Endpoint, EndpointBuilder, GossipsubConfig, GossipsubError,
+    MdnsConfig, Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, PublishError, StreamId,
+    TopicError, TransportError, WaitHandle,
 };
 
 use crate::{
@@ -446,7 +446,7 @@ impl P2pEndpoint {
         let peer = parse_peer_id(&peer_id)?;
         self.with_endpoint_mut(|endpoint| {
             endpoint
-                .open_stream_with_connection(&peer, &protocol_id)
+                .open_stream(&peer, &protocol_id)
                 .map(|(conn_id, stream_id)| crate::OpenStreamResult {
                     conn_id: conn_id.as_u64(),
                     stream_id: stream_id.as_u64(),
@@ -456,46 +456,71 @@ impl P2pEndpoint {
     }
 
     /// Sends one byte chunk on an application stream.
+    ///
+    /// Like the other stream operations, the stream is named by connection
+    /// as well as id; an operation for a connection the peer no longer uses
+    /// fails instead of reaching a same-numbered stream on its replacement.
     pub fn send_stream(
         &self,
         peer_id: String,
+        conn_id: u64,
         stream_id: u64,
         data: Vec<u8>,
     ) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         self.with_endpoint_mut(|endpoint| {
             endpoint
-                .send_stream(&peer, StreamId::new(stream_id), data)
+                .send_stream(
+                    &peer,
+                    ConnectionId::new(conn_id),
+                    StreamId::new(stream_id),
+                    data,
+                )
                 .map_err(map_driver_error)
         })
     }
 
     /// Half-closes the local write side of an application stream.
-    pub fn close_stream_write(&self, peer_id: String, stream_id: u64) -> Result<(), FfiError> {
+    pub fn close_stream_write(
+        &self,
+        peer_id: String,
+        conn_id: u64,
+        stream_id: u64,
+    ) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         self.with_endpoint_mut(|endpoint| {
             endpoint
-                .close_stream_write(&peer, StreamId::new(stream_id))
+                .close_stream_write(&peer, ConnectionId::new(conn_id), StreamId::new(stream_id))
                 .map_err(map_driver_error)
         })
     }
 
     /// Resets an application stream while retaining later close events.
-    pub fn reset_stream(&self, peer_id: String, stream_id: u64) -> Result<(), FfiError> {
+    pub fn reset_stream(
+        &self,
+        peer_id: String,
+        conn_id: u64,
+        stream_id: u64,
+    ) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         self.with_endpoint_mut(|endpoint| {
             endpoint
-                .reset_stream(&peer, StreamId::new(stream_id))
+                .reset_stream(&peer, ConnectionId::new(conn_id), StreamId::new(stream_id))
                 .map_err(map_driver_error)
         })
     }
 
     /// Resets and forgets an application stream.
-    pub fn abandon_stream(&self, peer_id: String, stream_id: u64) -> Result<(), FfiError> {
+    pub fn abandon_stream(
+        &self,
+        peer_id: String,
+        conn_id: u64,
+        stream_id: u64,
+    ) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         self.with_endpoint_mut(|endpoint| {
             endpoint
-                .abandon_stream(&peer, StreamId::new(stream_id))
+                .abandon_stream(&peer, ConnectionId::new(conn_id), StreamId::new(stream_id))
                 .map_err(map_driver_error)
         })
     }

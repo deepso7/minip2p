@@ -323,7 +323,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
         relay.assert_healthy();
     }
 
-    let stream = initiator
+    let (conn, stream) = initiator
         .open_stream(&responder_peer, ECHO_PROTOCOL)
         .expect("open echo stream over circuit");
     let payload = b"echo across the promoted circuit".to_vec();
@@ -346,7 +346,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
                 } if peer_id == responder_peer && stream_id == stream => {
                     initiator_stream_ready = true;
                     initiator
-                        .send_stream(&responder_peer, stream, payload.clone())
+                        .send_stream(&responder_peer, conn, stream, payload.clone())
                         .expect("send echo payload");
                 }
                 EndpointEvent::StreamData {
@@ -365,21 +365,23 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             match event {
                 EndpointEvent::StreamReady {
                     peer_id,
+                    conn_id,
                     stream_id,
                     initiated_locally: false,
                     protocol_id,
-                    ..
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
-                    responder_stream = Some(stream_id);
+                    responder_stream = Some((conn_id, stream_id));
                 }
                 EndpointEvent::StreamData {
                     peer_id,
+                    conn_id,
                     stream_id,
                     data,
-                    ..
-                } if peer_id == initiator_peer && Some(stream_id) == responder_stream => {
+                } if peer_id == initiator_peer
+                    && Some((conn_id, stream_id)) == responder_stream =>
+                {
                     responder
-                        .send_stream(&initiator_peer, stream_id, data)
+                        .send_stream(&initiator_peer, conn_id, stream_id, data)
                         .expect("echo payload");
                 }
                 _ => {}
@@ -597,7 +599,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
 
     // And it carries application traffic, which is the only thing that
     // proves the whole stack negotiated over it rather than merely opened.
-    let stream = initiator
+    let (conn, stream) = initiator
         .open_stream(&responder_peer, ECHO_PROTOCOL)
         .expect("open echo stream over circuit");
     let payload = b"echo across a circuit on a TCP relay".to_vec();
@@ -618,7 +620,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
                     ..
                 } if peer_id == responder_peer && stream_id == stream => {
                     initiator
-                        .send_stream(&responder_peer, stream, payload.clone())
+                        .send_stream(&responder_peer, conn, stream, payload.clone())
                         .expect("send echo payload");
                 }
                 EndpointEvent::StreamData {
@@ -637,21 +639,23 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             match event {
                 EndpointEvent::StreamReady {
                     peer_id,
+                    conn_id,
                     stream_id,
                     initiated_locally: false,
                     protocol_id,
-                    ..
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
-                    responder_stream = Some(stream_id);
+                    responder_stream = Some((conn_id, stream_id));
                 }
                 EndpointEvent::StreamData {
                     peer_id,
+                    conn_id,
                     stream_id,
                     data,
-                    ..
-                } if peer_id == initiator_peer && Some(stream_id) == responder_stream => {
+                } if peer_id == initiator_peer
+                    && Some((conn_id, stream_id)) == responder_stream =>
+                {
                     responder
-                        .send_stream(&initiator_peer, stream_id, data)
+                        .send_stream(&initiator_peer, conn_id, stream_id, data)
                         .expect("echo payload");
                 }
                 _ => {}

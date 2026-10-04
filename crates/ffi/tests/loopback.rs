@@ -483,8 +483,13 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
         ready,
         P2pEvent::StreamReady { conn_id, .. } if conn_id == opened.conn_id
     ));
-    a.send_stream(b_peer.clone(), stream_id, b"stream payload".to_vec())?;
-    a.close_stream_write(b_peer, stream_id)?;
+    a.send_stream(
+        b_peer.clone(),
+        opened.conn_id,
+        stream_id,
+        b"stream payload".to_vec(),
+    )?;
+    a.close_stream_write(b_peer, opened.conn_id, stream_id)?;
     assert!(
         b_log
             .wait_for(Duration::from_secs(5), |event| matches!(

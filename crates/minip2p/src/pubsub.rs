@@ -2,6 +2,7 @@
 //! Endpoints. Time is supplied by the host; I/O runs through `SwarmRuntime`.
 
 use alloc::collections::VecDeque;
+use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -11,6 +12,8 @@ use minip2p_pubsub::{GossipsubAction, GossipsubAgent, GossipsubEvent, PublishErr
 use minip2p_swarm::SwarmEvent;
 use minip2p_swarm::{DriverError, SwarmRuntime};
 use minip2p_transport::Transport;
+
+use crate::stream_conns::StreamConns;
 
 /// Errors from endpoint pubsub methods.
 ///
@@ -42,6 +45,8 @@ pub(crate) struct GossipsubDriver {
     pub(crate) agent: GossipsubAgent,
     /// Gossipsub events awaiting the Endpoint event stream.
     pub(crate) events: VecDeque<GossipsubEvent>,
+    /// Connection of each stream the agent addresses by peer and id.
+    stream_conns: StreamConns,
 }
 
 // The `std`/`smoltcp` gates keep portable-mDNS-only builds from carrying
@@ -53,6 +58,7 @@ impl GossipsubDriver {
         Self {
             agent,
             events: VecDeque::new(),
+            stream_conns: StreamConns::default(),
         }
     }
 
@@ -147,6 +153,7 @@ impl GossipsubDriver {
         swarm: &mut SwarmRuntime<T, R>,
         now_ms: u64,
     ) -> bool {
+        self.stream_conns.observe(event);
         let handled = self.agent.handle_event(event, now_ms);
         self.pump(swarm, now_ms);
         handled
@@ -213,6 +220,10 @@ impl GossipsubDriver {
             } => {
                 let result = swarm
                     .open_stream(&peer, &protocol_id, now_ms)
+                    .map(|(conn_id, stream_id)| {
+                        self.stream_conns.opened(&peer, conn_id, stream_id);
+                        stream_id
+                    })
                     .map_err(|e| e.to_string());
                 self.agent.stream_open_result(&peer, token, result, now_ms);
             }
@@ -225,9 +236,12 @@ impl GossipsubDriver {
                 // A synchronously rejected write must reach the agent:
                 // otherwise the stream's eventual close would commit work
                 // whose frame was never accepted.
-                let result = swarm
-                    .send_stream(&peer, stream_id, data, now_ms)
-                    .map_err(|e| e.to_string());
+                let result = match self.stream_conns.get(&peer, stream_id) {
+                    Some(conn_id) => swarm
+                        .send_stream(&peer, conn_id, stream_id, data, now_ms)
+                        .map_err(|e| e.to_string()),
+                    None => Err(format!("stream {stream_id} to {peer} is no longer active")),
+                };
                 self.agent
                     .send_result(&peer, stream_id, token, result, now_ms);
             }
@@ -235,15 +249,19 @@ impl GossipsubDriver {
             // send deadline / close machinery: the frame may well have
             // been delivered, so failing the work here could double-report.
             GossipsubAction::CloseStreamWrite { peer, stream_id } => {
-                match swarm.close_stream_write(&peer, stream_id, now_ms) {
-                    Ok(()) | Err(_) => {}
+                if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
+                    match swarm.close_stream_write(&peer, conn_id, stream_id, now_ms) {
+                        Ok(()) | Err(_) => {}
+                    }
                 }
             }
             GossipsubAction::ResetStream { peer, stream_id } => {
                 // A reset races ordinary teardown, so an already-closed
                 // stream is successful cleanup rather than a second error.
-                match swarm.reset_stream(&peer, stream_id, now_ms) {
-                    Ok(()) | Err(_) => {}
+                if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
+                    match swarm.reset_stream(&peer, conn_id, stream_id, now_ms) {
+                        Ok(()) | Err(_) => {}
+                    }
                 }
             }
         }
