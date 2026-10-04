@@ -646,6 +646,16 @@ fn direct_replacement_of_the_provisional_circuit_upgrades_once() {
         }] if *connect_id == id
     ));
     assert_eq!(h.agent.path(&h.target), Some(&Path::DirectDialed));
+
+    // A late close of the replaced circuit leaves the peer connected.
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            peer_id: h.target.clone(),
+            conn_id: circuit,
+        },
+        at(410),
+    );
+    assert_eq!(h.agent.path(&h.target), Some(&Path::DirectDialed));
 }
 
 #[test]
