@@ -1487,20 +1487,26 @@ impl SwarmCore {
         now_ms: u64,
     ) -> Option<[u8; PING_PAYLOAD_LEN]> {
         // The runtime feeds transport events before the tick of the same
-        // poll, so fire a timeout that is already due before handing over.
-        if self
+        // poll, so a ping already due here would otherwise miss its
+        // timeout. Only this peer's ping is timed out: another peer's reply
+        // may still be later in the batch.
+        let overdue = self
             .ping_deadlines
             .get(peer_id)
-            .is_some_and(|due| *due <= now_ms)
-        {
-            self.handle_tick(now_ms);
-        }
+            .is_some_and(|due| *due <= now_ms);
         // The in-flight payload lives in Ping's per-peer state; read it
         // before that state is reset.
-        let ping_intent = self
-            .ping
-            .in_flight_payload(peer_id)
-            .or_else(|| self.pending_pings.get(peer_id).copied());
+        let ping_intent = if overdue {
+            self.ping_deadlines.remove(peer_id);
+            self.events.push_back(SwarmEvent::PingTimeout {
+                peer_id: peer_id.clone(),
+            });
+            None
+        } else {
+            self.ping
+                .in_flight_payload(peer_id)
+                .or_else(|| self.pending_pings.get(peer_id).copied())
+        };
         self.reset_peer_protocols(peer_id);
         self.peer_info.remove(peer_id);
         self.ready_peers.remove(peer_id);
@@ -3679,10 +3685,13 @@ mod tests {
     fn overdue_ping_times_out_instead_of_being_resent_on_replacement() {
         let mut core = test_core(); // default request_timeout_ms = 10_000
         let peer_id = PeerId::from_public_key_protobuf(b"ping-overdue-peer");
-        let original = ConnectionId::new(62);
+        let other = PeerId::from_public_key_protobuf(b"ping-other-peer");
         let replacement = ConnectionId::new(63);
-        setup_outbound_ping_stream(&mut core, &peer_id, original, StreamId::new(4));
+        setup_outbound_ping_stream(&mut core, &peer_id, ConnectionId::new(62), StreamId::new(4));
+        setup_outbound_ping_stream(&mut core, &other, ConnectionId::new(64), StreamId::new(4));
         core.ping(&peer_id, [7; PING_PAYLOAD_LEN], 0)
+            .expect("ping in flight");
+        core.ping(&other, [8; PING_PAYLOAD_LEN], 0)
             .expect("ping in flight");
         let _ = drain_actions(&mut core);
 
@@ -3695,20 +3704,37 @@ mod tests {
             },
             now_ms: 12_000,
         });
-        assert!(
-            drain_events(&mut core)
-                .iter()
-                .any(|event| matches!(event, SwarmEvent::PingTimeout { .. })),
-            "the ping was already due"
+        let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+        let timed_out: Vec<_> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                SwarmOutput::Event(SwarmEvent::PingTimeout { peer_id }) => Some(peer_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            timed_out,
+            [&peer_id],
+            "only the replaced peer's due ping times out; the other's reply may follow"
+        );
+        let opens = outputs
+            .iter()
+            .filter(|output| {
+                matches!(
+                    output,
+                    SwarmOutput::Action(SwarmAction::OpenStream { conn_id, .. })
+                        if *conn_id == replacement
+                )
+            })
+            .count();
+        assert_eq!(
+            opens, 1,
+            "only Identify opens; a timed-out ping is not re-sent"
         );
         assert!(
-            !drain_actions(&mut core).iter().any(|action| matches!(
-                action,
-                SwarmAction::OpenStream { conn_id, .. } if *conn_id == replacement
-            )),
-            "a timed-out ping is not re-sent"
+            core.next_timeout(12_000).is_some(),
+            "the other peer's timer is still armed"
         );
-        assert_eq!(core.next_timeout(12_000), None);
     }
 
     #[test]
