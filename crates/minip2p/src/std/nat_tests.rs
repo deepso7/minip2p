@@ -155,18 +155,15 @@ fn drive_until_reserved(
 #[cfg(all(feature = "quic", feature = "relay-server"))]
 #[test]
 fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
-    // The transport timeout, the reservation keepalive and the observation
-    // window move together: the window has to outlast the transport timeout for
-    // the test to prove anything, the keepalive has to be well inside it, and
-    // the timeout has to be long enough that a descheduled thread cannot expire
-    // the relay connection on a loaded box.
+    // The timeout has to be long enough that a stall cannot expire the relay
+    // connection: the transport keeps a quiet connection alive at half of it,
+    // so one would have to exceed most of `IDLE_MS`. This test also runs alone
+    // (see `.config/nextest.toml`), since it drives both endpoints from one
+    // thread.
     const IDLE_MS: u64 = 1_500;
     const KEEPALIVE_MS: u64 = 300;
-    /// Twice the transport timeout: reaching the end of it with the
-    /// reservation intact is itself the proof that the keepalive, not luck,
-    /// kept the connection up. A stall would have to exceed `IDLE_MS` minus
-    /// the age of the last keepalive — over a second — to expire it.
-    const OBSERVE: std::time::Duration = std::time::Duration::from_millis(2 * IDLE_MS);
+    /// Failure backstop for a keepalive that never lands, not a window.
+    const BACKSTOP: std::time::Duration = std::time::Duration::from_secs(10);
 
     let limits = QuicLimits {
         idle_timeout_ms: IDLE_MS,
@@ -197,14 +194,25 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
 
     let mut reservation_events = drive_until_reserved(&mut client, &mut relay, "QUIC");
 
-    let observe_until = Instant::now() + OBSERVE;
-    let mut ping_rtts = 0;
-    while Instant::now() < observe_until {
+    // Drive until a ping round trip completes after the transport timeout
+    // would have expired an untouched connection. That ping proves the relay
+    // connection outlived the timeout, so the loop ends on it rather than on a
+    // fixed window.
+    let past_idle = Instant::now() + std::time::Duration::from_millis(IDLE_MS);
+    let backstop = Instant::now() + BACKSTOP;
+    let mut pinged_past_idle = false;
+    while !pinged_past_idle {
+        assert!(
+            Instant::now() < backstop,
+            "no ping completed past the {IDLE_MS}ms transport timeout"
+        );
         match client
             .next_event(std::time::Duration::from_millis(10))
             .expect("drive client")
         {
-            Some(EndpointEvent::PingRttMeasured { .. }) => ping_rtts += 1,
+            Some(EndpointEvent::PingRttMeasured { .. }) => {
+                pinged_past_idle = Instant::now() >= past_idle;
+            }
             Some(EndpointEvent::Nat(event)) => reservation_events.push(event),
             _ => {}
         }
@@ -216,21 +224,18 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
         }
     }
 
-    // A stall can carry the loop past its deadline with events still queued,
-    // including a reservation that was lost during it. Drain the client before
-    // judging rather than reading state the last poll never caught up with.
+    // A loss can be queued behind the ping that ended the loop. Drain the
+    // client before judging rather than reading state the last poll never
+    // caught up with.
     while let Some(event) = client
         .next_event(std::time::Duration::ZERO)
         .expect("drain client")
     {
-        match event {
-            EndpointEvent::PingRttMeasured { .. } => ping_rtts += 1,
-            EndpointEvent::Nat(event) => reservation_events.push(event),
-            _ => {}
+        if let EndpointEvent::Nat(event) = event {
+            reservation_events.push(event);
         }
     }
 
-    assert!(ping_rtts > 0, "reservation liveness should send QUIC pings");
     assert!(client.active_reservation().is_some());
     assert_eq!(
         reservation_events
