@@ -18,9 +18,9 @@ use minip2p::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken
 use minip2p::smoltcp::time::Instant;
 use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 use minip2p::{
-    ConnectFailure, ConnectOutcome, DriverError, Ed25519Keypair, Endpoint, EndpointEvent,
-    EntropySource, Multiaddr, NatConfig, NatEvent, Now, Path, PeerAddr, PeerId, ReservationPolicy,
-    SmoltcpStack, StreamId, SwarmError,
+    ConnectFailure, ConnectOutcome, ConnectionId, DriverError, Ed25519Keypair, Endpoint,
+    EndpointEvent, EntropySource, Multiaddr, NatConfig, NatEvent, Now, Path, PeerAddr, PeerId,
+    ReservationPolicy, SmoltcpStack, StreamId, SwarmError,
 };
 use minip2p_nat::{AUTONAT_PROTOCOL_ID, HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_platform::EntropyError;
@@ -166,13 +166,16 @@ fn relay_config(relay: PeerAddr, reservation_policy: ReservationPolicy) -> NatCo
     }
 }
 
+/// A relay-side stream: its connection and its per-connection id.
+type StreamRef = (ConnectionId, StreamId);
+
 struct RelayService {
     emulator: RelayEmulator,
     a: PeerId,
     b: PeerId,
-    b_reservation: Option<StreamId>,
-    a_bridge: Option<StreamId>,
-    b_stop: Option<StreamId>,
+    b_reservation: Option<StreamRef>,
+    a_bridge: Option<StreamRef>,
+    b_stop: Option<StreamRef>,
     pending: Option<PendingConnectId>,
     bridged: bool,
 }
@@ -200,48 +203,53 @@ impl RelayService {
         match event {
             EndpointEvent::StreamReady {
                 peer_id,
+                conn_id,
                 stream_id,
                 protocol_id,
                 initiated_locally,
                 ..
             } if protocol_id == HOP_PROTOCOL_ID && !initiated_locally => {
                 if peer_id == self.b {
-                    self.b_reservation = Some(stream_id);
+                    self.b_reservation = Some((conn_id, stream_id));
                 } else if peer_id == self.a {
-                    self.a_bridge = Some(stream_id);
+                    self.a_bridge = Some((conn_id, stream_id));
                 }
             }
             EndpointEvent::StreamReady {
                 peer_id,
+                conn_id,
                 stream_id,
                 protocol_id,
                 initiated_locally: true,
                 ..
             } if peer_id == self.b && protocol_id == STOP_PROTOCOL_ID => {
-                self.b_stop = Some(stream_id);
+                self.b_stop = Some((conn_id, stream_id));
                 let request = self.emulator.drain_stop_bytes_for(&self.b);
                 endpoint
-                    .send_stream(&self.b, stream_id, request, now)
+                    .send_stream(&self.b, conn_id, stream_id, request, now)
                     .unwrap();
             }
             EndpointEvent::StreamData {
                 peer_id,
+                conn_id,
                 stream_id,
                 data,
-                ..
-            } if peer_id == self.b && Some(stream_id) == self.b_reservation => {
+            } if peer_id == self.b && Some((conn_id, stream_id)) == self.b_reservation => {
                 self.emulator.on_reserve_request(&self.b, &data).unwrap();
                 let response = self.emulator.drain_hop_bytes_for(&self.b);
                 endpoint
-                    .send_stream(&self.b, stream_id, response, now)
+                    .send_stream(&self.b, conn_id, stream_id, response, now)
                     .unwrap();
             }
             EndpointEvent::StreamData {
                 peer_id,
+                conn_id,
                 stream_id,
                 data,
-                ..
-            } if peer_id == self.a && Some(stream_id) == self.a_bridge && !self.bridged => {
+            } if peer_id == self.a
+                && Some((conn_id, stream_id)) == self.a_bridge
+                && !self.bridged =>
+            {
                 let mut response = Vec::new();
                 let outcome = self
                     .emulator
@@ -266,49 +274,61 @@ impl RelayService {
             }
             EndpointEvent::StreamData {
                 peer_id,
+                conn_id,
                 stream_id,
                 data,
-                ..
-            } if peer_id == self.b && Some(stream_id) == self.b_stop && !self.bridged => {
+            } if peer_id == self.b
+                && Some((conn_id, stream_id)) == self.b_stop
+                && !self.bridged =>
+            {
                 let mut response = Vec::new();
                 let trailing = self
                     .emulator
                     .on_stop_ack_from_target(self.pending.unwrap(), &self.b, &data, &mut response)
                     .unwrap();
                 self.bridged = true;
+                let (conn, stream) = self.a_bridge.unwrap();
                 endpoint
-                    .send_stream(&self.a, self.a_bridge.unwrap(), response, now)
+                    .send_stream(&self.a, conn, stream, response, now)
                     .unwrap();
                 if !trailing.is_empty() {
+                    let (conn, stream) = self.a_bridge.unwrap();
                     endpoint
-                        .send_stream(&self.a, self.a_bridge.unwrap(), trailing, now)
+                        .send_stream(&self.a, conn, stream, trailing, now)
                         .unwrap();
                 }
             }
             EndpointEvent::StreamData {
                 peer_id,
+                conn_id,
                 stream_id,
                 data,
-                ..
-            } if self.bridged && peer_id == self.a && Some(stream_id) == self.a_bridge => {
+            } if self.bridged
+                && peer_id == self.a
+                && Some((conn_id, stream_id)) == self.a_bridge =>
+            {
+                let (conn, stream) = self.b_stop.unwrap();
                 endpoint
-                    .send_stream(&self.b, self.b_stop.unwrap(), data, now)
+                    .send_stream(&self.b, conn, stream, data, now)
                     .unwrap();
             }
             EndpointEvent::StreamData {
                 peer_id,
+                conn_id,
                 stream_id,
                 data,
-                ..
-            } if self.bridged && peer_id == self.b && Some(stream_id) == self.b_stop => {
+            } if self.bridged && peer_id == self.b && Some((conn_id, stream_id)) == self.b_stop => {
+                let (conn, stream) = self.a_bridge.unwrap();
                 endpoint
-                    .send_stream(&self.a, self.a_bridge.unwrap(), data, now)
+                    .send_stream(&self.a, conn, stream, data, now)
                     .unwrap();
             }
             EndpointEvent::StreamClosed {
-                peer_id, stream_id, ..
-            } if (peer_id == self.a && Some(stream_id) == self.a_bridge)
-                || (peer_id == self.b && Some(stream_id) == self.b_stop) =>
+                peer_id,
+                conn_id,
+                stream_id,
+            } if (peer_id == self.a && Some((conn_id, stream_id)) == self.a_bridge)
+                || (peer_id == self.b && Some((conn_id, stream_id)) == self.b_stop) =>
             {
                 self.bridged = false;
                 self.a_bridge = None;
@@ -398,7 +418,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
         if a_relayed && b_relayed && a_settled && app_stream.is_none() {
             app_stream = Some(a.open_stream(&b_peer, APP_PROTOCOL, now).unwrap());
         }
-        if let Some(stream) = app_stream
+        if let Some((conn, stream)) = app_stream
             && !sent
             && a_events.iter().any(|event| {
                 matches!(event, EndpointEvent::StreamReady {
@@ -406,11 +426,11 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
                 } if peer_id == &b_peer && *stream_id == stream)
             })
         {
-            a.send_stream(&b_peer, stream, PAYLOAD.to_vec(), now)
+            a.send_stream(&b_peer, conn, stream, PAYLOAD.to_vec(), now)
                 .unwrap();
             sent = true;
         }
-        let received = app_stream.is_some_and(|stream| {
+        let received = app_stream.is_some_and(|(_, stream)| {
             b_events.iter().any(|event| {
                 matches!(event, EndpointEvent::StreamData {
                     peer_id, stream_id, data, ..

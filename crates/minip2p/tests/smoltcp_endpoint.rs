@@ -18,9 +18,9 @@ use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 #[cfg(feature = "pubsub")]
 use minip2p::{BeaconConfig, GossipsubError, GossipsubEvent};
 use minip2p::{
-    ConnectOutcome, DiscoveryEvent, Ed25519Keypair, Endpoint, EndpointEvent, EntropySource,
-    Multiaddr, Now, PeerAddr, PeerId, PollDeadline, SmoltcpConfig, SmoltcpMdnsConfig, SmoltcpStack,
-    SmoltcpTcpProvider, StreamId, TcpConfig, TcpTransport,
+    ConnectOutcome, ConnectionId, DiscoveryEvent, Ed25519Keypair, Endpoint, EndpointEvent,
+    EntropySource, Multiaddr, Now, PeerAddr, PeerId, PollDeadline, SmoltcpConfig,
+    SmoltcpMdnsConfig, SmoltcpStack, SmoltcpTcpProvider, StreamId, TcpConfig, TcpTransport,
 };
 use minip2p_platform::EntropyError;
 
@@ -388,7 +388,7 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
     let mut dialer_events = Vec::new();
     let mut listener_events = Vec::new();
     let mut ping_started = false;
-    let mut stream: Option<StreamId> = None;
+    let mut stream: Option<(ConnectionId, StreamId)> = None;
     let mut payload_sent = false;
 
     for _ in 0..MAX_STEPS {
@@ -409,7 +409,7 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
             ping_started = true;
         }
 
-        if let Some(stream_id) = stream
+        if let Some((conn_id, stream_id)) = stream
             && !payload_sent
             && dialer_events.iter().any(|event| {
                 matches!(event, EndpointEvent::StreamReady {
@@ -418,10 +418,10 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
             })
         {
             dialer
-                .send_stream(&listener_peer, stream_id, PAYLOAD.to_vec(), now)
+                .send_stream(&listener_peer, conn_id, stream_id, PAYLOAD.to_vec(), now)
                 .expect("payload sends");
             dialer
-                .close_stream_write(&listener_peer, stream_id, now)
+                .close_stream_write(&listener_peer, conn_id, stream_id, now)
                 .expect("write side closes");
             payload_sent = true;
         }
@@ -429,14 +429,14 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
         let ping_finished = dialer_events.iter().any(|event| {
             matches!(event, EndpointEvent::PingRttMeasured { peer_id, .. } if peer_id == &listener_peer)
         });
-        let payload_received = stream.is_some_and(|stream_id| {
+        let payload_received = stream.is_some_and(|(_, stream_id)| {
             listener_events.iter().any(|event| {
                 matches!(event, EndpointEvent::StreamData {
                     peer_id, stream_id: received, data, ..
                 } if peer_id == &dialer_peer && *received == stream_id && data == PAYLOAD)
             })
         });
-        let write_closed = stream.is_some_and(|stream_id| {
+        let write_closed = stream.is_some_and(|(_, stream_id)| {
             listener_events.iter().any(|event| {
                 matches!(event, EndpointEvent::StreamRemoteWriteClosed {
                     peer_id, stream_id: closed, ..

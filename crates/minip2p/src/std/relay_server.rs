@@ -7,7 +7,7 @@ use minip2p_platform::Now;
 use minip2p_relay_server::{
     RelayServerAction, RelayServerAgent, RelayServerEvent, RelayServerToken, StreamKey,
 };
-use minip2p_swarm::SwarmEvent;
+use minip2p_swarm::{DriverError, SwarmError, SwarmEvent};
 use minip2p_transport::ConnectionId;
 
 use crate::EndpointSwarm;
@@ -166,7 +166,7 @@ impl RelayServerDriver {
                     );
                     return;
                 }
-                match swarm.open_stream_with_connection(&peer_id, &protocol_id) {
+                match swarm.open_stream(&peer_id, &protocol_id) {
                     Ok((conn_id, stream_id)) => {
                         self.pending_opens
                             .insert(StreamKey { conn_id, stream_id }, token);
@@ -183,13 +183,9 @@ impl RelayServerDriver {
                 stream,
                 data,
             } => {
-                let result = if stream_connection_gone(swarm, stream) {
-                    Err(String::from("the stream's connection is gone"))
-                } else {
-                    swarm
-                        .send_stream(&peer_id, stream.stream_id, data)
-                        .map_err(|error| error.to_string())
-                };
+                let result = swarm
+                    .send_stream(&peer_id, stream.conn_id, stream.stream_id, data)
+                    .map_err(|error| error.to_string());
                 self.agent.send_stream_result(token, result, now);
             }
             RelayServerAction::CloseStreamWrite {
@@ -197,13 +193,9 @@ impl RelayServerDriver {
                 peer_id,
                 stream,
             } => {
-                let result = if stream_connection_gone(swarm, stream) {
-                    Err(String::from("the stream's connection is gone"))
-                } else {
-                    swarm
-                        .close_stream_write(&peer_id, stream.stream_id)
-                        .map_err(|error| error.to_string())
-                };
+                let result = swarm
+                    .close_stream_write(&peer_id, stream.conn_id, stream.stream_id)
+                    .map_err(|error| error.to_string());
                 self.agent.close_stream_write_result(token, result, now);
             }
             RelayServerAction::ResetStream {
@@ -211,25 +203,16 @@ impl RelayServerDriver {
                 peer_id,
                 stream,
             } => {
-                // A stream whose connection is gone is already reset.
-                let result = if stream_connection_gone(swarm, stream) {
-                    Ok(())
-                } else {
-                    swarm
-                        .reset_stream(&peer_id, stream.stream_id)
-                        .map_err(|error| error.to_string())
+                let result = match swarm.reset_stream(&peer_id, stream.conn_id, stream.stream_id) {
+                    // A stream that is gone (or whose connection is) is
+                    // already reset.
+                    Ok(()) | Err(DriverError::Swarm(SwarmError::StreamNotFound { .. })) => Ok(()),
+                    Err(error) => Err(error.to_string()),
                 };
                 self.agent.reset_stream_result(token, result, now);
             }
         }
     }
-}
-
-/// Whether `stream`'s exact connection is gone (closed or replaced). Swarm
-/// stream calls are peer-scoped, so acting on such a stream could hit a
-/// stream of the peer's new connection that reuses its id.
-fn stream_connection_gone(swarm: &EndpointSwarm, stream: StreamKey) -> bool {
-    swarm.connection_remote_addr(stream.conn_id).is_none()
 }
 
 #[cfg(test)]
