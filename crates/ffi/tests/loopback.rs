@@ -329,9 +329,9 @@ fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
         a_log
             .wait_for(Duration::from_secs(5), |event| matches!(
                 event,
-            P2pEvent::PeerReady { peer_id, protocols }
-                if peer_id == &b_peer
-                    && protocols.iter().any(|protocol| protocol.contains("meshsub"))
+                P2pEvent::PeerReady { peer_id, protocols, .. }
+                    if peer_id == &b_peer
+                        && protocols.iter().any(|protocol| protocol.contains("meshsub"))
             ))
             .is_some()
     );
@@ -428,7 +428,7 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
         a_log
             .wait_for(Duration::from_secs(5), |event| matches!(
                 event,
-                P2pEvent::PeerReady { peer_id, protocols }
+                P2pEvent::PeerReady { peer_id, protocols, .. }
                     if peer_id == &b_peer && protocols.iter().any(|id| id == protocol)
             ))
             .is_some()

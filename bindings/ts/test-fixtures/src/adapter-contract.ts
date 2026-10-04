@@ -6,6 +6,7 @@ import type { BackendConnectTarget } from "../../core/src/backend.js";
 import {
   ConnectCancelledError,
   ConnectResultLostError,
+  StreamClosedError,
   TimeoutError,
 } from "../../core/src/index.js";
 import type { Minip2pBase, Minip2pConfig } from "../../core/src/index.js";
@@ -24,10 +25,19 @@ export interface FakeNativeState {
   readonly connectTargets: readonly BackendConnectTarget[];
   /** Connect IDs passed to native `cancelConnect`. */
   readonly cancelledConnects: readonly bigint[];
-  /** Makes native `connectionInfo` report `connId` for every peer. */
-  setConnectionInfo: (connId: bigint, remoteAddr?: string) => void;
+  /** Makes native `connectionInfo` report `info` for every peer. */
+  setConnectionInfo: (info: NativeConnectionInfo) => void;
+  /** Makes the next native `openStream` return these identities. */
+  setNextStream: (connId: bigint, streamId: bigint) => void;
   /** Queues one native drain batch and rings the doorbell. */
   deliver: (events: readonly NativeEventLiteral[]) => void;
+}
+
+/** A native `connectionInfo` snapshot, in runtime-neutral form. */
+export interface NativeConnectionInfo {
+  readonly connId: bigint;
+  readonly remoteAddr?: string;
+  readonly readyProtocols?: string[];
 }
 
 /** Adapts one runtime's `Minip2p.create` and native fake to the contract. */
@@ -43,6 +53,7 @@ const TCP = `/ip4/127.0.0.1/tcp/4001/p2p/${PEER}`;
 // Native connect IDs are small; connection IDs span the full u64 range.
 const CONNECT_ID = 30n;
 const CONN_ID = 2n ** 63n + 1n;
+const NEXT_CONN_ID = 2n ** 63n + 2n;
 
 const pathEstablished = (connectId: bigint): NativeEventLiteral => ({
   inner: {
@@ -177,7 +188,7 @@ export function describeAdapterContract(
       const native = harness.native();
       const opened: number[] = [];
       endpoint.on("connectionEstablished", ({ connId }) => opened.push(connId));
-      native.setConnectionInfo(CONN_ID, QUIC);
+      native.setConnectionInfo({ connId: CONN_ID, remoteAddr: QUIC });
 
       native.deliver([
         {
@@ -190,6 +201,58 @@ export function describeAdapterContract(
       expect(endpoint.connectionInfo(PEER)).toEqual({
         connId: opened[0],
         remoteAddr: QUIC,
+      });
+      endpoint.close();
+    });
+
+    test("ConnectionReplaced moves the peer to the new connection and ends opens on the old one", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      const established: number[] = [];
+      const replaced: {
+        readonly oldConnId: number;
+        readonly newConnId: number;
+      }[] = [];
+      endpoint.on("connectionEstablished", ({ connId }) =>
+        established.push(connId)
+      );
+      endpoint.on("connectionReplaced", (event) => replaced.push(event));
+      native.deliver([
+        {
+          inner: { connId: CONN_ID, peerId: PEER },
+          tag: "ConnectionEstablished",
+        },
+      ]);
+      await drained();
+      native.setNextStream(CONN_ID, 4n);
+      const opening = endpoint.openStream(PEER, "/test/1", { timeoutMs: 0 });
+      const ended = expect(opening).rejects.toBeInstanceOf(StreamClosedError);
+
+      native.setConnectionInfo({
+        connId: NEXT_CONN_ID,
+        readyProtocols: ["/test/1"],
+      });
+      native.deliver([
+        {
+          inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
+          tag: "ConnectionReplaced",
+        },
+      ]);
+      await drained();
+
+      await ended;
+      const current = endpoint.connectionInfo(PEER);
+      expect(replaced).toMatchObject([
+        { newConnId: current?.connId, oldConnId: established[0] },
+      ]);
+      expect(current).toEqual({
+        connId: replaced[0]?.newConnId,
+        readyProtocols: ["/test/1"],
+      });
+      expect(await endpoint.waitPeerReady(PEER)).toEqual({
+        peerId: PEER,
+        protocols: ["/test/1"],
       });
       endpoint.close();
     });

@@ -570,11 +570,15 @@ impl P2pEndpoint {
     ) -> Result<Option<crate::ConnectionInfo>, FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         self.with_endpoint(|endpoint| {
+            let ready = endpoint.peer_readiness(&peer);
             endpoint
                 .connection_id(&peer)
                 .map(|id| crate::ConnectionInfo {
                     conn_id: id.as_u64(),
                     remote_addr: endpoint.connection_remote_addr(id).map(ToString::to_string),
+                    ready_protocols: ready
+                        .filter(|(ready_id, _)| *ready_id == id)
+                        .map(|(_, info)| info.protocols.clone()),
                 })
         })
     }

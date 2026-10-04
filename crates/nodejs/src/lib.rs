@@ -142,6 +142,8 @@ pub struct NodeConnectionInfo {
     pub conn_id: BigInt,
     /// Remote transport address, when recorded.
     pub remote_addr: Option<String>,
+    /// Protocols this connection advertised, once it is ready.
+    pub ready_protocols: Option<Vec<String>>,
 }
 
 /// A native minip2p endpoint owned by Node.js.
@@ -377,6 +379,7 @@ impl NodeEndpoint {
                 info.map(|info| NodeConnectionInfo {
                     conn_id: info.conn_id.into(),
                     remote_addr: info.remote_addr,
+                    ready_protocols: info.ready_protocols,
                 })
             })
             .map_err(|error| native_error(&env, error))
@@ -597,9 +600,25 @@ fn event_value(event: P2pEvent) -> serde_json::Value {
             "ConnectionClosed",
             serde_json::json!({ "peerId": peer_id, "connId": conn_id }),
         ),
-        P2pEvent::PeerReady { peer_id, protocols } => (
+        P2pEvent::ConnectionReplaced {
+            peer_id,
+            old_conn_id,
+            new_conn_id,
+        } => (
+            "ConnectionReplaced",
+            serde_json::json!({
+                "peerId": peer_id,
+                "oldConnId": old_conn_id,
+                "newConnId": new_conn_id,
+            }),
+        ),
+        P2pEvent::PeerReady {
+            peer_id,
+            conn_id,
+            protocols,
+        } => (
             "PeerReady",
-            serde_json::json!({ "peerId": peer_id, "protocols": protocols }),
+            serde_json::json!({ "peerId": peer_id, "connId": conn_id, "protocols": protocols }),
         ),
         P2pEvent::IdentifyReceived { peer_id, info } => (
             "IdentifyReceived",

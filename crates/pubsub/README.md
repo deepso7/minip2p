@@ -8,6 +8,8 @@ The core is `no_std + alloc`: it performs no I/O, reads no clock, and uses no as
 
 Gossipsub keeps one long-lived outbound stream per ready peer and writes varint-framed RPCs back-to-back. At most one write is awaiting its synchronous result. A successful result commits exactly that frame; a failed result resets the stream while retaining unsent messages and logical control work for a later retry. Subscription state is resynchronized whenever a stream reopens.
 
+Readiness is per connection. On `SwarmEvent::ConnectionReplaced` the agent drops queued work (reported through the usual aggregated `OutboundFailure`), clears everything derived from the old connection — its streams and the advertised meshsub version — and pauses sends while keeping the peer's backoff. `PeerReady` for the new connection picks the version again and re-announces subscriptions on a fresh stream.
+
 Inbound streams may carry multiple framed RPCs; reassembly, peer subscriptions, pending messages, and concurrent inbound streams are all bounded.
 
 Publishing uses all-or-nothing backpressure across the selected recipients. Forwarding, gossip replies, and cache serving are best effort within the configured per-peer queue bound. `OutboundFailure` means work never reached an accepted stream write; it is not an end-to-end delivery receipt.

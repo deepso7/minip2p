@@ -3,7 +3,6 @@ use alloc::vec::Vec;
 
 use minip2p_core::PeerId;
 use minip2p_relay::Status;
-use minip2p_swarm::ConnectionCloseCause;
 use minip2p_transport::{ConnectionId, StreamId};
 
 /// Exact identity of a transport stream.
@@ -69,10 +68,9 @@ pub enum RelayServerAction {
 pub enum ReservationCloseReason {
     /// Its monotonic deadline became due.
     Expired,
-    /// Its owning transport connection closed.
+    /// Its owning transport connection closed, or was replaced by a relay
+    /// circuit. A direct replacement instead rebinds the reservation.
     ConnectionClosed,
-    /// A replacement connection became active for the peer.
-    Superseded,
     /// An invariant failure forced stable lifecycle termination.
     InternalFailure,
 }
@@ -126,12 +124,10 @@ pub enum CircuitCloseReason {
         /// Direction whose destination rejected the chunk.
         direction: CircuitDirection,
     },
-    /// A circuit's underlying connection left Swarm.
+    /// A leg's underlying connection closed or was replaced.
     ConnectionClosed {
         /// Leg carried by the closed connection.
         leg: CircuitLeg,
-        /// Swarm's transport-versus-supersession cause.
-        cause: ConnectionCloseCause,
     },
     /// An invariant failure forced stable lifecycle termination.
     InternalFailure,

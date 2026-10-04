@@ -128,6 +128,7 @@ fn swarm_ping_roundtrip_with_auto_identify() {
                 SwarmEvent::PeerReady {
                     ref peer_id,
                     ref protocols,
+                    ..
                 } => {
                     assert_eq!(peer_id, &server_peer_id);
                     assert!(protocols.contains(&PING_PROTOCOL_ID.to_string()));

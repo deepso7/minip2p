@@ -805,7 +805,9 @@ fn observe_circuit_event(
         EndpointEvent::ConnectionEstablished { peer_id, conn_id } if peer_id == *remote => {
             *circuit = Some(conn_id);
         }
-        EndpointEvent::PeerReady { peer_id, protocols } if peer_id == *remote => {
+        EndpointEvent::PeerReady {
+            peer_id, protocols, ..
+        } if peer_id == *remote => {
             assert!(protocols.iter().any(|protocol| protocol == ECHO_PROTOCOL));
             *ready = true;
         }

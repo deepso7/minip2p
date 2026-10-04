@@ -17,7 +17,7 @@ stream.write(new Uint8Array([1, 2, 3]));
 stream.closeWrite();
 ```
 
-Streams are async iterables. Iteration preserves chunk order, drains bytes buffered before a remote write half-close, and then ends quietly. Local shutdown, reset, peer disconnect, or driver failure rejects the iterator with its terminal error:
+Streams are async iterables. Iteration preserves chunk order, drains bytes buffered before a remote write half-close, and then ends quietly. Local shutdown, reset, peer disconnect, connection replacement, or driver failure rejects the iterator with its terminal error:
 
 ```ts
 for await (const chunk of stream) {
@@ -34,6 +34,8 @@ for await (const event of endpoint.events({ signal })) {
   }
 }
 ```
+
+A peer holds one connection at a time. `connectionEstablished` and `connectionClosed` mark the peer connecting and disconnecting; when a newer connection takes the peer's slot, a single `connectionReplaced` (`{ peerId, oldConnId, newConnId }`) stands in for both, the peer stays connected, and streams and pending opens on `oldConnId` end with `StreamClosedError`. `peerReady` carries the `connId` that completed Identify and fires once per connection. `waitPeerReady` follows the peer's current connection, so a stale `peerReady` for a replaced connection never resolves it; it resolves at once when `connectionInfo(peerId).readyProtocols` shows the current connection is already ready, and rejects with `PeerDisconnectedError` when that connection closes.
 
 `connect` accepts a Connection target: a peer ID, one complete peer multiaddress, or a list of complete addresses naming one peer. For a Connection attempt, a timeout ends only the local wait (`cancelOnTimeout: true` opts into cancelling), an aborted `signal` cancels the attempt (the wait settles from its terminal), and a terminal lost to event overflow rejects with `ConnectResultLostError`. Waits never stop unrelated events from reaching other subscribers.
 

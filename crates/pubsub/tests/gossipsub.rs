@@ -53,6 +53,7 @@ fn connect(agent: &mut GossipsubAgent, peer: &PeerId, protocols: &[&str], now_ms
     agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: peer.clone(),
+            conn_id: ConnectionId::new(1),
             protocols: protocols.iter().map(|id| (*id).to_string()).collect(),
         },
         now_ms,
@@ -991,7 +992,6 @@ fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
         &SwarmEvent::ConnectionClosed {
             peer_id: remote.clone(),
             conn_id: ConnectionId::new(1),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         3,
     );
@@ -1022,15 +1022,17 @@ fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
     assert!(drain_actions(&mut agent).is_empty());
 
     agent.handle_event(
-        &SwarmEvent::ConnectionEstablished {
+        &SwarmEvent::ConnectionReplaced {
             peer_id: remote.clone(),
-            conn_id: ConnectionId::new(2),
+            old: ConnectionId::new(1),
+            new: ConnectionId::new(2),
         },
         6,
     );
     agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: remote.clone(),
+            conn_id: ConnectionId::new(2),
             protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
         },
         6,
@@ -1056,7 +1058,7 @@ fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
     remote_subscribe(&mut agent, &remote, StreamId::new(13), "room", 7);
     assert!(
         agent.mesh_peers("room").is_empty(),
-        "supersede must rebuild peer state without erasing backoff"
+        "replacement must rebuild peer state without erasing backoff"
     );
     assert!(drain_actions(&mut agent).is_empty());
 }
@@ -1112,6 +1114,7 @@ fn queued_prune_reencodes_for_v10_after_stream_reopen() {
     agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
             protocols: vec![MESHSUB_PROTOCOL_ID_V10.to_string()],
         },
         4,
@@ -1435,6 +1438,7 @@ fn open_failure_and_establishment_timeout_retry_only_after_stimulus() {
     agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
             protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
         },
         2,
@@ -1462,6 +1466,7 @@ fn open_failure_and_establishment_timeout_retry_only_after_stimulus() {
     agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
             protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
         },
         11,
@@ -1470,7 +1475,7 @@ fn open_failure_and_establishment_timeout_retry_only_after_stimulus() {
 }
 
 #[test]
-fn disconnect_and_supersede_aggregate_queued_failures() {
+fn disconnect_and_replace_aggregate_queued_failures() {
     let mut agent = agent();
     agent.subscribe("room", 0).unwrap();
     let first = peer(2);
@@ -1497,14 +1502,14 @@ fn disconnect_and_supersede_aggregate_queued_failures() {
         &SwarmEvent::ConnectionClosed {
             peer_id: first.clone(),
             conn_id: ConnectionId::new(1),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         2,
     );
     agent.handle_event(
-        &SwarmEvent::ConnectionEstablished {
+        &SwarmEvent::ConnectionReplaced {
             peer_id: second.clone(),
-            conn_id: ConnectionId::new(2),
+            old: ConnectionId::new(1),
+            new: ConnectionId::new(2),
         },
         2,
     );
@@ -1520,8 +1525,84 @@ fn disconnect_and_supersede_aggregate_queued_failures() {
         peer == &first && reason.contains("connection closed; dropped 1 queued items")
     }));
     assert!(failures.iter().any(|(peer, reason)| {
-        peer == &second && reason.contains("connection superseded; dropped 1 queued items")
+        peer == &second && reason.contains("connection replaced; dropped 1 queued items")
     }));
+}
+
+#[test]
+fn replaced_connection_waits_for_new_peer_ready_before_reannouncing() {
+    let mut agent = agent();
+    agent.subscribe("room", 0).unwrap();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    let subscription = make_ready(
+        &mut agent,
+        &remote,
+        StreamId::new(4),
+        MESHSUB_PROTOCOL_ID_V11,
+        0,
+    );
+    ack(&mut agent, &remote, &subscription, 0);
+    drain_actions(&mut agent);
+
+    agent.handle_event(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: remote.clone(),
+            old: ConnectionId::new(1),
+            new: ConnectionId::new(2),
+        },
+        1,
+    );
+    agent.subscribe("lobby", 1).unwrap();
+    agent.handle_tick(2_000);
+    assert!(
+        drain_actions(&mut agent).is_empty(),
+        "nothing is sent on the old version before PeerReady(new)"
+    );
+
+    agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(2),
+            protocols: vec![MESHSUB_PROTOCOL_ID_V10.to_string()],
+        },
+        2_000,
+    );
+    let token = drain_actions(&mut agent)
+        .into_iter()
+        .find_map(|action| match action {
+            GossipsubAction::OpenStream {
+                token, protocol_id, ..
+            } if protocol_id == MESHSUB_PROTOCOL_ID_V10 => Some(token),
+            _ => None,
+        })
+        .expect("new connection's version is picked afresh");
+    let stream_id = StreamId::new(6);
+    agent.stream_open_result(&remote, token, Ok(stream_id), 2_000);
+    agent.handle_event(
+        &SwarmEvent::StreamReady {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(2),
+            stream_id,
+            protocol_id: MESHSUB_PROTOCOL_ID_V10.to_string(),
+            initiated_locally: true,
+        },
+        2_000,
+    );
+    let actions = drain_actions(&mut agent);
+    let mut topics: Vec<_> = decode_rpc(&sent(&actions).expect("re-announced subscriptions").0)
+        .subscriptions
+        .into_iter()
+        .map(|sub| (sub.subscribe, sub.topic_id.unwrap()))
+        .collect();
+    topics.sort();
+    assert_eq!(
+        topics,
+        [
+            (Some(true), "lobby".to_string()),
+            (Some(true), "room".to_string())
+        ]
+    );
 }
 
 #[test]
@@ -1665,4 +1746,35 @@ fn zero_fanout_ttl_reselects_for_each_publish() {
         reselected, selected,
         "the fixed RNG seed demonstrates that a zero TTL starts a fresh selection"
     );
+}
+
+#[test]
+fn replacement_drops_undrained_actions_for_the_old_connection() {
+    let mut agent = agent();
+    agent.subscribe("room", 0).unwrap();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    let other = peer(3);
+    connect(&mut agent, &other, &[MESHSUB_PROTOCOL_ID_V11], 0);
+
+    // Both peers' opens are still queued when `remote` is handed over.
+    agent.handle_event(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: remote.clone(),
+            old: ConnectionId::new(1),
+            new: ConnectionId::new(2),
+        },
+        1,
+    );
+    let actions = drain_actions(&mut agent);
+    let open_for = |target: &PeerId| {
+        actions.iter().any(
+            |action| matches!(action, GossipsubAction::OpenStream { peer, .. } if peer == target),
+        )
+    };
+    assert!(
+        !open_for(&remote),
+        "an open for the old connection must not run"
+    );
+    assert!(open_for(&other), "other peers' work is untouched");
 }

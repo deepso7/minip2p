@@ -218,6 +218,7 @@ impl World {
                         agent.handle_event(
                             &SwarmEvent::PeerReady {
                                 peer_id: relay.clone(),
+                                conn_id: ConnectionId::new(1),
                                 protocols: vec![
                                     HOP_PROTOCOL_ID.to_string(),
                                     STOP_PROTOCOL_ID.to_string(),
@@ -600,7 +601,7 @@ fn two_agents_punch_to_a_direct_connection() {
 
     // B's punch-back is blast-only (DCUtR for QUIC: the initiator dials).
     // A responder dial would race A's — when both land, the second
-    // connection supersedes the first and scrubs its streams.
+    // connection replaces the first and ends its streams.
     assert_eq!(
         world.punch_dials_from_b, 0,
         "the responder must not dial: {:?}",

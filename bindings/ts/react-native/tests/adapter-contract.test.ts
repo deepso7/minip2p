@@ -36,8 +36,11 @@ describeAdapterContract("React Native", {
         fake.enqueue([...events], []);
         fake.ring();
       },
-      setConnectionInfo: (connId: bigint, remoteAddr?: string) => {
-        fake.connection = { connId, remoteAddr };
+      setConnectionInfo: (info) => {
+        fake.connection = info;
+      },
+      setNextStream: (connId, streamId) => {
+        fake.nextStream = { connId, streamId };
       },
     };
   },

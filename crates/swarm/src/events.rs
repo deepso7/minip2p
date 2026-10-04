@@ -10,42 +10,57 @@ use minip2p_core::{PeerAddr, PeerId};
 use minip2p_identify::IdentifyMessage;
 use minip2p_transport::{ConnectionId, StreamId, TransportEvent};
 
-/// Why an established connection left the Swarm's single-connection slot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectionCloseCause {
-    /// The transport reported loss or completed an explicit close.
-    Transport,
-    /// A newer connection to the same peer replaced this connection.
-    Superseded,
-}
-
 /// Events emitted by the swarm to the application.
 #[derive(Clone, Debug)]
 pub enum SwarmEvent {
-    /// A new connection was established and identity verified.
+    /// A peer went from disconnected to connected: its first connection was
+    /// established and its identity verified.
     ConnectionEstablished {
         peer_id: PeerId,
         conn_id: ConnectionId,
     },
-    /// A connection was closed.
+    /// The peer's last connection closed; the peer is now disconnected.
+    ///
+    /// A connection that is replaced never reports this; see
+    /// [`ConnectionReplaced`](Self::ConnectionReplaced).
     ConnectionClosed {
         peer_id: PeerId,
         conn_id: ConnectionId,
-        cause: ConnectionCloseCause,
+    },
+    /// A newer connection took the peer's single connection slot from `old`.
+    ///
+    /// The peer stays connected throughout: this takes the place of both a
+    /// `ConnectionClosed` for `old` and a `ConnectionEstablished` for `new`.
+    /// Everything that belonged to `old` ends with it, without per-stream
+    /// terminal events: its streams, pending opens, readiness and Identify
+    /// info. The swarm re-identifies the peer on `new`, so a fresh
+    /// [`PeerReady`](Self::PeerReady) follows for `new`; until then the peer
+    /// is connected but not ready. A ping pending or in flight on `old` is
+    /// re-sent on `new`. The event is delivered before the transport is asked
+    /// to close `old`.
+    ConnectionReplaced {
+        peer_id: PeerId,
+        old: ConnectionId,
+        new: ConnectionId,
     },
     /// Identify information received from a remote peer.
     IdentifyReceived {
         peer_id: PeerId,
         info: IdentifyMessage,
     },
-    /// A peer is ready for application-level operations.
+    /// A peer is ready for application-level operations on `conn_id`.
     ///
     /// This fires after the swarm has a stable peer id for the connection and
-    /// has processed the first Identify message from that peer. At this point
-    /// callers can safely use protocol-specific APIs without racing peer-id
-    /// migration or unknown protocol support.
+    /// has processed the first Identify message on it. At this point callers
+    /// can safely use protocol-specific APIs without racing peer-id migration
+    /// or unknown protocol support. Readiness belongs to a connection: it
+    /// fires once per connection, so after a
+    /// [`ConnectionReplaced`](Self::ConnectionReplaced) it fires again for
+    /// the new connection. A `PeerReady` whose `conn_id` is no longer the
+    /// peer's current connection is stale.
     PeerReady {
         peer_id: PeerId,
+        conn_id: ConnectionId,
         protocols: Vec<String>,
     },
     /// A ping RTT measurement completed.
@@ -108,6 +123,27 @@ pub enum SwarmEvent {
 }
 
 impl SwarmEvent {
+    /// The peer this event names; `None` for [`DialFailed`](Self::DialFailed)
+    /// and errors without a peer.
+    pub fn peer_id(&self) -> Option<&PeerId> {
+        match self {
+            Self::ConnectionEstablished { peer_id, .. }
+            | Self::ConnectionClosed { peer_id, .. }
+            | Self::ConnectionReplaced { peer_id, .. }
+            | Self::IdentifyReceived { peer_id, .. }
+            | Self::PeerReady { peer_id, .. }
+            | Self::PingRttMeasured { peer_id, .. }
+            | Self::PingTimeout { peer_id }
+            | Self::StreamReady { peer_id, .. }
+            | Self::StreamData { peer_id, .. }
+            | Self::StreamRemoteWriteClosed { peer_id, .. }
+            | Self::StreamWriteStopped { peer_id, .. }
+            | Self::StreamClosed { peer_id, .. } => Some(peer_id),
+            Self::Error(error) => error.peer_id.as_ref(),
+            Self::DialFailed { .. } => None,
+        }
+    }
+
     /// Returns `true` if this is a stream-scoped event
     /// ([`StreamReady`](Self::StreamReady), [`StreamData`](Self::StreamData),
     /// [`StreamRemoteWriteClosed`](Self::StreamRemoteWriteClosed),

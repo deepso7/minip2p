@@ -168,6 +168,11 @@ impl ConnectAttempt {
         Some(attempt)
     }
 
+    /// Whether `conn_id` is the circuit this attempt promoted.
+    pub(crate) fn promotes(&self, conn_id: ConnectionId) -> bool {
+        self.promoted == Some(conn_id)
+    }
+
     pub(crate) fn is_done(&self) -> bool {
         self.done
     }
@@ -310,6 +315,9 @@ impl ConnectAttempt {
         }
         if is_circuit {
             if self.promoted == Some(conn_id) {
+                if let Some(relay) = self.relay_peer().cloned() {
+                    shared.record_origin(conn_id, Path::Relayed { relay }, Some(self.id));
+                }
                 self.announce_relay_path(shared);
                 if shared.config.force_relay {
                     self.done = true;
@@ -331,6 +339,7 @@ impl ConnectAttempt {
         };
         match &self.best {
             None => {
+                shared.record_origin(conn_id, path.clone(), Some(self.id));
                 self.best = Some(path.clone());
                 shared.push_event(NatEvent::PathEstablished {
                     connect_id: self.id,
@@ -339,6 +348,7 @@ impl ConnectAttempt {
                 });
             }
             Some(Path::Relayed { .. }) => {
+                shared.record_origin(conn_id, path.clone(), Some(self.id));
                 let from = self.best.replace(path.clone()).expect("checked Some above");
                 shared.push_event(NatEvent::PathUpgraded {
                     connect_id: self.id,
@@ -347,13 +357,48 @@ impl ConnectAttempt {
                     to: path,
                 });
             }
-            // A duplicate direct connection (QUIC supersede) — nothing new.
+            // A second direct connection replacing the first — nothing new.
             Some(_) => return,
         }
         let _ = now;
         self.punch_deadline = None;
         self.teardown_relay_leg(shared);
         self.done = true;
+    }
+
+    /// The target's connection `old` was replaced by `new` while the peer
+    /// stays connected. Called after `new` was applied, so a direct `new`
+    /// already settled the attempt. When `old` was the circuit this attempt
+    /// promoted and `new` is another circuit, the attempt carries on over
+    /// `new`: a punch in flight may still upgrade it, and otherwise it falls
+    /// back to relay as usual. A DCUtR exchange lived on `old` and ends.
+    ///
+    /// When `new_owned` (another attempt or an inbound circuit promoted
+    /// `new`), `new` stays its owner's and this attempt ends on the relayed
+    /// path it already reported.
+    pub(crate) fn on_target_replaced(
+        &mut self,
+        peer: &PeerId,
+        old: ConnectionId,
+        new: ConnectionId,
+        new_owned: bool,
+        shared: &mut Shared,
+    ) {
+        if self.done || *peer != self.peer || self.promoted != Some(old) {
+            return;
+        }
+        // `old` retires with the swarm; there is nothing left to close.
+        self.promoted = (!new_owned).then_some(new);
+        if let Some(stream) = self.dcutr_stream {
+            self.finish_failed_dcutr(stream, "DCUtR circuit was replaced".into(), shared);
+        } else if new_owned {
+            shared.abort_attempt_dials(self.id);
+            shared.push_event(NatEvent::FellBackToRelay {
+                connect_id: self.id,
+                peer: self.peer.clone(),
+            });
+            self.done = true;
+        }
     }
 
     pub(crate) fn on_connection_closed(
@@ -386,18 +431,18 @@ impl ConnectAttempt {
             return;
         }
         // Waiting for relay readiness and issuing OpenStream are peer-scoped,
-        // so a connection close has no exact ownership signal. In particular,
-        // Swarm reports Closed(old) before Established(new) for a QUIC
-        // supersede. Keep both pre-allocation phases alive: PeerReady or the
-        // open result continues them on the replacement, while a real loss is
-        // still bounded by the relay deadline (and usually an open error).
+        // so a connection close has no exact ownership signal. Keep both
+        // pre-allocation phases alive: after a Connection replacement
+        // PeerReady or the open result continues them on the new
+        // connection, while a real loss is still bounded by the relay
+        // deadline (and usually an open error).
         // Allocated stream phases retain conservative teardown until
         // StreamReady records exact ownership in `bridge_inner_conn`.
         match self.leg {
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {
                 // The exact owning connection is terminal. Release local
                 // state without a peer-scoped reset that could target its
-                // eager replacement.
+                // replacement.
                 shared.release_stream(peer, stream);
                 self.leg = RelayLeg::Failed;
                 self.fail_relay_leg(
@@ -1067,11 +1112,7 @@ impl ConnectAttempt {
         match self.leg {
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {
                 if let Some(relay_peer) = self.relay_peer().cloned() {
-                    shared.push_action(NatAction::ResetStream {
-                        peer: relay_peer.clone(),
-                        stream_id: stream,
-                    });
-                    shared.release_stream(&relay_peer, stream);
+                    shared.reset_owned_stream(&relay_peer, stream);
                 }
             }
             _ => {}
@@ -1115,11 +1156,7 @@ impl ConnectAttempt {
         match self.leg {
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {
                 if let Some(relay_peer) = self.relay_peer().cloned() {
-                    shared.push_action(NatAction::ResetStream {
-                        peer: relay_peer.clone(),
-                        stream_id: stream,
-                    });
-                    shared.release_stream(&relay_peer, stream);
+                    shared.reset_owned_stream(&relay_peer, stream);
                 }
             }
             RelayLeg::Bridged { stream } => {
@@ -1147,11 +1184,7 @@ impl ConnectAttempt {
 
     fn teardown_dcutr_stream(&mut self, shared: &mut Shared) {
         if let Some(stream_id) = self.dcutr_stream.take() {
-            shared.push_action(NatAction::ResetStream {
-                peer: self.peer.clone(),
-                stream_id,
-            });
-            shared.release_stream(&self.peer, stream_id);
+            shared.reset_owned_stream(&self.peer, stream_id);
         }
         self.dcutr = None;
     }

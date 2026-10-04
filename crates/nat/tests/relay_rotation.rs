@@ -11,7 +11,7 @@ use minip2p_nat::{
     ReservationPolicy,
 };
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
-use minip2p_swarm::{ConnectionCloseCause, SwarmEvent};
+use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
 struct World {
@@ -68,6 +68,7 @@ fn hop_exchange(w: &mut World, relay: &PeerId, conn: u64, status: Status, now: u
     w.agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: relay.clone(),
+            conn_id,
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
         at(now),
@@ -240,6 +241,7 @@ fn dial_failure_after_the_relay_became_ready_is_ignored() {
     w.agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: w.a.clone(),
+            conn_id: ConnectionId::new(9),
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
         at(10),
@@ -280,6 +282,7 @@ fn dial_failure_while_the_relay_is_connected_waits_for_peer_ready() {
     w.agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: w.a.clone(),
+            conn_id: ConnectionId::new(9),
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
         at(30),
@@ -377,7 +380,6 @@ fn circuit_closing_before_it_establishes_moves_to_the_next_relay() {
         &SwarmEvent::ConnectionClosed {
             peer_id: target,
             conn_id: circuit,
-            cause: ConnectionCloseCause::Transport,
         },
         at(30),
     );

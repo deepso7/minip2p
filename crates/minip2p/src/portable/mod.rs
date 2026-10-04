@@ -8,10 +8,9 @@ pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
 pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_platform::{Deadline as PollDeadline, EntropySource, Now, SharedEntropy};
 pub use minip2p_swarm::{
-    // Part of `EndpointEvent` / `SwarmEvent` public shapes (`ConnectionClosed`,
-    // `Error`); re-exported so portable callers can name them without a direct
-    // swarm dependency.
-    ConnectionCloseCause,
+    // Part of `EndpointEvent` / `SwarmEvent` public shapes (`Error`);
+    // re-exported so portable callers can name them without a direct swarm
+    // dependency.
     DriverError,
     IdentifyMessage,
     SwarmBuilder,
@@ -167,11 +166,11 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     ///
     /// Every candidate is dialed immediately. Candidate completion order is
     /// not a public contract. The swarm still keeps a single connection per
-    /// peer: a race loser that finishes after the winner may supersede it
-    /// (`ConnectionClosed { Superseded }` then a new `ConnectionEstablished`).
-    /// The attempt is already settled at the first established connection
-    /// (including a simultaneous inbound), and the app sees those as ordinary
-    /// connection events.
+    /// peer: a race loser that finishes after the winner may replace it
+    /// ([`EndpointEvent::ConnectionReplaced`]). The attempt is already
+    /// settled at the first established connection (including a
+    /// simultaneous inbound), and the app sees the hand-over as an ordinary
+    /// connection event.
     #[expect(
         clippy::result_large_err,
         reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."
@@ -889,18 +888,15 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         self.feed_nat_to_connect(now);
     }
 
-    /// Returns the latest NAT-orchestrated path to `peer`.
+    /// Returns the NAT-orchestrated path of `peer`'s current connection.
     ///
-    /// Cleared once the connection it describes is gone: the peer's last
-    /// relay circuit for `Relayed`, its last direct connection for a direct
-    /// path, or its last connection of any kind. It is never rewritten to the
-    /// kind that remains, so this can return `None` while the peer stays
+    /// It follows a Connection replacement to the new connection's origin
+    /// and is gone once the peer disconnects. Connections NAT did not
+    /// announce have no path, so this can return `None` while the peer is
     /// connected.
     #[cfg(feature = "portable-relay")]
     pub fn path(&self, peer: &PeerId) -> Option<minip2p_nat::Path> {
-        self.nat
-            .as_ref()
-            .and_then(|nat| nat.path(peer, self.endpoint.runtime()))
+        self.nat.as_ref().and_then(|nat| nat.path(peer))
     }
 
     /// Returns the currently held relay reservation, when any.
@@ -1093,19 +1089,27 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             if let Some(discovery) = self.discovery.as_mut() {
                 discovery.observe(&event, self.endpoint.runtime().core(), now.monotonic_ms);
             }
+            // A stale `PeerReady` (its connection was replaced later in this
+            // batch) reaches only the application: the drivers act
+            // peer-scoped and would start work on the not-yet-ready
+            // replacement.
+            #[cfg(any(feature = "portable-autonat", feature = "pubsub"))]
+            let stale_ready = self.endpoint.runtime().core().is_stale_peer_ready(&event);
             #[cfg(feature = "portable-autonat")]
             let claimed = engine_consumed
-                || self
-                    .nat
-                    .as_mut()
-                    .is_some_and(|nat| nat.ingest(&event, self.endpoint.runtime_mut(), now));
+                || (!stale_ready
+                    && self
+                        .nat
+                        .as_mut()
+                        .is_some_and(|nat| nat.ingest(&event, self.endpoint.runtime_mut(), now)));
             #[cfg(not(feature = "portable-autonat"))]
             let claimed = engine_consumed;
             #[cfg(feature = "pubsub")]
             let claimed = claimed
-                || self.gossipsub.as_mut().is_some_and(|pubsub| {
-                    pubsub.ingest(&event, self.endpoint.runtime_mut(), now.monotonic_ms)
-                });
+                || (!stale_ready
+                    && self.gossipsub.as_mut().is_some_and(|pubsub| {
+                        pubsub.ingest(&event, self.endpoint.runtime_mut(), now.monotonic_ms)
+                    }));
             if !claimed {
                 output.push(event.into());
             }

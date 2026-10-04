@@ -395,10 +395,10 @@ impl Endpoint {
     /// leg (when there is one) starts at once. Candidate completion order is
     /// not a public contract. The swarm still keeps a
     /// single connection per peer: a race loser that finishes after the winner
-    /// may supersede it (`ConnectionClosed { Superseded }` then a new
-    /// `ConnectionEstablished`). The attempt is already settled at the first
-    /// established connection (including a simultaneous inbound), and the app
-    /// sees those as ordinary connection events.
+    /// may replace it ([`EndpointEvent::ConnectionReplaced`]). The attempt is
+    /// already settled at the first established connection (including a
+    /// simultaneous inbound), and the app sees the hand-over as an ordinary
+    /// connection event.
     ///
     /// Candidates may name the IP family explicitly (`/ip4`, `/ip6`) or a
     /// host (`/dns`, `/dns4`, `/dns6`). This call never blocks on DNS: a
@@ -510,18 +510,17 @@ impl Endpoint {
 
     /// Returns the current usable NAT-orchestrated path to `peer_id`.
     ///
-    /// The map is updated before the corresponding NAT event is queued and is
-    /// independent of event consumption. It is cleared once the connection it
-    /// describes is gone: when the peer's last relay circuit closes for
-    /// [`Path::Relayed`], when its last direct connection closes for a direct
-    /// path, or when the peer has no connection left. It is never rewritten to
-    /// the kind that remains, so this can return `None` while the peer stays
-    /// connected. Raw swarm dials are not tracked.
+    /// This is the path origin of the peer's current connection: Direct
+    /// (dialed or punched) or Relayed through a relay, recorded when NAT
+    /// announces it. It is updated before the corresponding NAT event is
+    /// queued and is independent of event consumption. On a
+    /// [`EndpointEvent::ConnectionReplaced`] it becomes the new connection's
+    /// origin, and it is gone once the peer disconnects. Connections NAT did
+    /// not announce (such as raw swarm dials) have no path, so this can return
+    /// `None` while the peer is connected.
     #[cfg(feature = "nat")]
     pub fn path(&self, peer_id: &PeerId) -> Option<Path> {
-        self.nat
-            .as_ref()
-            .and_then(|nat| nat.path(peer_id, self.swarm.runtime()))
+        self.nat.as_ref().and_then(|nat| nat.path(peer_id))
     }
 
     /// Returns peers with an established connection.
@@ -536,6 +535,17 @@ impl Endpoint {
     /// See [State snapshots](Self#state-snapshots).
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
         self.swarm.is_peer_ready(peer_id)
+    }
+
+    /// Returns the peer's current connection and its Identify info once that
+    /// connection is ready, as one coherent snapshot.
+    ///
+    /// Readiness belongs to a connection: after
+    /// [`EndpointEvent::ConnectionReplaced`] this is `None` until the new
+    /// connection's [`EndpointEvent::PeerReady`]. A ready wait checks this
+    /// first, then accepts only a `PeerReady` for the current connection.
+    pub fn peer_readiness(&self, peer_id: &PeerId) -> Option<(ConnectionId, &IdentifyMessage)> {
+        self.swarm.peer_readiness(peer_id)
     }
 
     /// Returns the latest Identify information received for `peer_id`.
@@ -1028,9 +1038,16 @@ impl Endpoint {
     /// streams. Neither service claims connection lifecycle or `PeerReady`,
     /// so both still observe the shared connection state.
     ///
+    /// A stale `PeerReady` (queued before its connection was replaced)
+    /// reaches only the application: drivers act peer-scoped, so it would
+    /// start work on the replacement before that connection is ready.
+    ///
     /// Returns `true` when a driver claimed the event.
     #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn ingest_into_drivers(&mut self, event: &SwarmEvent) -> bool {
+        if self.swarm.core().is_stale_peer_ready(event) {
+            return false;
+        }
         #[cfg(any(feature = "discovery", feature = "mdns"))]
         if let Some(discovery) = self.discovery.as_mut() {
             let now_ms = self.swarm.now().monotonic_ms;
@@ -1366,7 +1383,7 @@ impl Endpoint {
     /// Dropping without `close` still disconnects (errors ignored). Neither
     /// notifies a peer after `kill -9` or a hard partition. A replacement
     /// that lands while draining is disconnected too, including a handshake
-    /// still pending when the superseded connection closes.
+    /// still pending when the replaced connection closes.
     pub fn close(mut self) -> Result<Vec<EndpointEvent>, Error> {
         let mut first_error = None;
         #[cfg(feature = "mdns")]
@@ -3371,7 +3388,6 @@ mod tests {
                 .push_back(EndpointEvent::ConnectionClosed {
                     peer_id: Ed25519Keypair::generate().peer_id(),
                     conn_id: ConnectionId::new(1),
-                    cause: minip2p_swarm::ConnectionCloseCause::Transport,
                 });
         }
         let past = std::time::Instant::now()
@@ -3404,7 +3420,6 @@ mod tests {
             .push_back(EndpointEvent::ConnectionClosed {
                 peer_id: peer.clone(),
                 conn_id: ConnectionId::new(1),
-                cause: minip2p_swarm::ConnectionCloseCause::Transport,
             });
         assert!(matches!(
             endpoint.wait(Duration::ZERO).expect("zero-duration drain"),

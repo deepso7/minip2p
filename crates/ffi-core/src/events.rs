@@ -39,6 +39,11 @@ pub struct ConnectionInfo {
     pub conn_id: u64,
     /// Remote transport address, when recorded.
     pub remote_addr: Option<String>,
+    /// Protocols this connection advertised through Identify, once it is
+    /// ready (`PeerReady` for this `conn_id`); `None` until then. Readiness,
+    /// connection and protocols come from one snapshot, so a ready wait can
+    /// trust them together.
+    pub ready_protocols: Option<Vec<String>>,
 }
 
 /// Coarse local reachability state.
@@ -147,27 +152,44 @@ pub enum P2pEvent {
         /// Human-readable diagnostic detail.
         detail: String,
     },
-    /// A verified connection was established.
+    /// A peer went from disconnected to connected over a verified connection.
     ConnectionEstablished {
         /// Remote peer.
         peer_id: String,
         /// Endpoint-local transport connection id.
         conn_id: u64,
     },
-    /// A connection closed.
+    /// The peer's last connection closed; the peer is now disconnected.
     ConnectionClosed {
         /// Remote peer.
         peer_id: String,
         /// Endpoint-local transport connection id.
         conn_id: u64,
     },
-    /// A peer completed Identify and is ready for application protocols.
+    /// A newer connection took the peer's single connection slot from
+    /// `old_conn_id`.
+    /// The peer stays connected; every stream on `old_conn_id` ended with
+    /// it, and a fresh `PeerReady` follows for `new_conn_id`.
+    ConnectionReplaced {
+        /// Remote peer.
+        peer_id: String,
+        /// The replaced connection id.
+        old_conn_id: u64,
+        /// The connection id now carrying the peer.
+        new_conn_id: u64,
+    },
+    /// A peer's connection completed Identify and is ready for application
+    /// protocols. Fires once per connection; one whose `conn_id` is no longer
+    /// the peer's current connection is stale.
     PeerReady {
         /// Remote peer.
         peer_id: String,
+        /// The connection that became ready.
+        conn_id: u64,
         /// Protocols advertised by the peer.
         protocols: Vec<String>,
     },
+
     /// A peer supplied a new Identify snapshot.
     IdentifyReceived {
         /// Remote peer.
@@ -432,20 +454,29 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
                 conn_id: conn_id.as_u64(),
             }
         }
-        EndpointEvent::ConnectionClosed {
-            peer_id, conn_id, ..
-        } => P2pEvent::ConnectionClosed {
+        EndpointEvent::ConnectionClosed { peer_id, conn_id } => P2pEvent::ConnectionClosed {
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
+        },
+        EndpointEvent::ConnectionReplaced { peer_id, old, new } => P2pEvent::ConnectionReplaced {
+            peer_id: peer_id.to_base58(),
+            old_conn_id: old.as_u64(),
+            new_conn_id: new.as_u64(),
         },
         EndpointEvent::IdentifyReceived { peer_id, info } => P2pEvent::IdentifyReceived {
             peer_id: peer_id.to_base58(),
             info: convert_identify(&info),
         },
-        EndpointEvent::PeerReady { peer_id, protocols } => P2pEvent::PeerReady {
+        EndpointEvent::PeerReady {
+            peer_id,
+            conn_id,
+            protocols,
+        } => P2pEvent::PeerReady {
             peer_id: peer_id.to_base58(),
+            conn_id: conn_id.as_u64(),
             protocols,
         },
+
         EndpointEvent::PingRttMeasured { peer_id, rtt_ms } => P2pEvent::PingRttMeasured {
             peer_id: peer_id.to_base58(),
             rtt_ms,

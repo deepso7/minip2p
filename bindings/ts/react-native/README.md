@@ -60,6 +60,7 @@ Configuration defaults to gossipsub with signed messages and no relay or discove
 - Operations support timeouts and `AbortSignal` cancellation.
 - Events are delivered FIFO through a bounded queue; handle `queueOverflow` by refreshing queryable state.
 - Use a named `stream` handler to claim inbound streams.
+- A peer holds one connection: `connectionReplaced` moves it to a newer connection and ends streams on the old one, and `waitPeerReady` waits for the current connection's `peerReady`.
 - Unsigned pubsub payloads and peer IDs are attacker-controlled.
 - `close()` rejects pending work, closes streams, and shuts down the endpoint.
 

@@ -54,6 +54,7 @@ fn join_mesh_peer(agent: &mut GossipsubAgent, seed: u8) {
     agent.handle_event(
         &SwarmEvent::PeerReady {
             peer_id: remote.clone(),
+            conn_id,
             protocols: vec![MESHSUB_PROTOCOL_ID_V11.into()],
         },
         0,

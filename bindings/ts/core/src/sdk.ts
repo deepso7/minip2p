@@ -757,7 +757,13 @@ export class Minip2pBase {
     this.#backend.addProtocol(protocolId);
   }
 
-  /** Waits for Identify readiness or rejects if the peer disconnects. */
+  /**
+   * Waits until the peer's current connection is ready, or rejects if the
+   * peer disconnects.
+   *
+   * A `peerReady` resolves it only while its connection is still the peer's
+   * current one, so a stale `peerReady` for a replaced connection does not.
+   */
   waitPeerReady(
     peerId: string,
     options: OpOptions = {}
@@ -765,9 +771,10 @@ export class Minip2pBase {
     readonly peerId: string;
     readonly protocols: readonly string[];
   }> {
-    const info = this.isPeerReady(peerId) ? this.peerInfo(peerId) : undefined;
-    if (info !== undefined) {
-      return Promise.resolve({ peerId, protocols: info.protocols });
+    // One snapshot, so readiness, connection and protocols agree.
+    const info = this.connectionInfo(peerId);
+    if (info?.readyProtocols !== undefined) {
+      return Promise.resolve({ peerId, protocols: info.readyProtocols });
     }
     const controller = new AbortController();
     if (options.signal?.aborted === true) {
@@ -776,9 +783,14 @@ export class Minip2pBase {
     const removeExternalAbort = listenAbort(options.signal, () => {
       controller.abort();
     });
+    // Events trail the native state, so a queued `peerReady` counts only if
+    // its connection is still the peer's current one; a replaced
+    // connection's readiness never resolves the wait.
     const ready = this.waitFor("peerReady", {
       ...options,
-      predicate: (event) => event.peerId === peerId,
+      predicate: (event) =>
+        event.peerId === peerId &&
+        this.#backend.connectionInfo(peerId)?.connId === event.connId,
       signal: controller.signal,
     }).then(({ protocols }) => ({ peerId, protocols }));
     const disconnected = this.waitFor("connectionClosed", {
@@ -792,6 +804,7 @@ export class Minip2pBase {
     });
     return Promise.race([ready, disconnected]).finally(() => {
       removeExternalAbort?.();
+
       controller.abort();
     });
   }
@@ -1195,7 +1208,24 @@ export class Minip2pBase {
       this.#correlateOpenError(event.inner);
     }
     if (event.tag === P2pEvent_Tags.ConnectionClosed) {
-      this.#connectionClosed(event.inner.peerId, event.inner.connId);
+      this.#connectionEnded(
+        event.inner.peerId,
+        event.inner.connId,
+        new PeerDisconnectedError(event.inner.peerId, "stream"),
+        new PeerDisconnectedError(event.inner.peerId, "openStream")
+      );
+    }
+    if (event.tag === P2pEvent_Tags.ConnectionReplaced) {
+      // Native ends the replaced connection's streams without per-stream
+      // terminal events, so they end here.
+      this.#connectionEnded(
+        event.inner.peerId,
+        event.inner.oldConnId,
+        new StreamClosedError("The stream's connection was replaced"),
+        new StreamClosedError(
+          "The stream's connection was replaced before it became ready"
+        )
+      );
     }
     if (isConnectTerminal(event)) {
       this.#connectTerminal(event);
@@ -1396,10 +1426,16 @@ export class Minip2pBase {
     );
   }
 
-  #connectionClosed(peerId: string, connId: number): void {
+  /** Ends every stream and pending open on a closed or replaced connection. */
+  #connectionEnded(
+    peerId: string,
+    connId: number,
+    streamError: Error,
+    openError: Error
+  ): void {
     for (const [key, stream] of [...this.#streams]) {
       if (stream.peerId === peerId && stream.connId === connId) {
-        stream.terminal(new PeerDisconnectedError(peerId, "stream"));
+        stream.terminal(streamError);
         this.#streams.delete(key);
       }
     }
@@ -1409,7 +1445,7 @@ export class Minip2pBase {
           pendingOpenKey(pending.peerId, pending.connId, pending.streamId)
         );
         clearPendingOpen(pending);
-        pending.reject(new PeerDisconnectedError(peerId, "openStream"));
+        pending.reject(openError);
       }
     }
   }
@@ -1651,6 +1687,7 @@ function normalizeEvent(
     [P2pEvent_Tags.EventsDropped]: "eventsDropped",
     [P2pEvent_Tags.ConnectionEstablished]: "connectionEstablished",
     [P2pEvent_Tags.ConnectionClosed]: "connectionClosed",
+    [P2pEvent_Tags.ConnectionReplaced]: "connectionReplaced",
     [P2pEvent_Tags.PeerReady]: "peerReady",
     [P2pEvent_Tags.IdentifyReceived]: "identifyReceived",
     [P2pEvent_Tags.PingRttMeasured]: "pingRttMeasured",

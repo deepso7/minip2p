@@ -333,7 +333,6 @@ fn relay_disconnect_before_stop_acceptance_drops_the_circuit() {
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(1),
             peer_id: h.relay.clone(),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(1),
     );
@@ -354,4 +353,139 @@ fn tcp_only_source_still_gets_the_relayed_path() {
         action,
         NatAction::OpenStream { protocol_id, .. } if protocol_id == DCUTR_PROTOCOL_ID
     )));
+}
+
+#[test]
+fn inbound_direct_replacement_after_the_circuit_finished_reports_the_upgrade() {
+    let mut h = inbound_harness(NatConfig {
+        force_relay: true,
+        ..NatConfig::default()
+    });
+    let (circuit, _) = drive_to_relayed(&mut h);
+    assert!(h.agent.is_idle(), "inbound handling finished at Relayed");
+
+    let target = h.target.clone();
+    h.agent.handle_event_with_disposition_classified(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: target.clone(),
+            old: circuit,
+            new: ConnectionId::new(50),
+        },
+        false,
+        at(20),
+    );
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::InboundDirectUpgrade { peer }] if *peer == target
+    ));
+    assert_eq!(h.agent.path(&target), Some(&Path::DirectDialed));
+}
+
+#[test]
+fn circuit_replacement_through_another_relay_updates_the_path_origin() {
+    let relay_b = peer(b"relay-b");
+    let mut config = NatConfig {
+        force_relay: true,
+        ..NatConfig::default()
+    };
+    config.relays.push(
+        PeerAddr::new(maddr("/ip4/203.0.113.2/udp/4001/quic-v1"), relay_b.clone())
+            .expect("valid second relay"),
+    );
+    let mut h = inbound_harness(config);
+    let (circuit_a, _) = drive_to_relayed(&mut h);
+    let target = h.target.clone();
+    assert_eq!(
+        h.agent.path(&target),
+        Some(&Path::Relayed {
+            relay: h.relay.clone()
+        })
+    );
+
+    // The same peer reaches us again through relay B.
+    let stop = StreamId::new(STOP_STREAM + 10);
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: ConnectionId::new(3),
+            peer_id: relay_b.clone(),
+            stream_id: stop,
+            protocol_id: STOP_PROTOCOL_ID.into(),
+            initiated_locally: false,
+        },
+        at(20),
+    );
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            conn_id: ConnectionId::new(3),
+            peer_id: relay_b.clone(),
+            stream_id: stop,
+            data: stop_connect(&target),
+        },
+        at(21),
+    );
+    let circuit_b = ConnectionId::new(TEST_CIRCUIT_ID + 1);
+    let promotion = promote_token(&drain_actions(&mut h.agent));
+    h.agent.promote_result(promotion, Ok(circuit_b), at(22));
+    h.agent.handle_event_with_disposition_classified(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: target.clone(),
+            old: circuit_a,
+            new: circuit_b,
+        },
+        true,
+        at(23),
+    );
+    assert!(
+        !drain_events(&mut h.agent).iter().any(|event| matches!(
+            event,
+            NatEvent::InboundDirectUpgrade { .. } | NatEvent::PathUpgraded { .. }
+        )),
+        "a relay-to-relay hand-over is not an upgrade"
+    );
+    assert_eq!(
+        h.agent.path(&target),
+        Some(&Path::Relayed { relay: relay_b })
+    );
+}
+
+#[test]
+fn inbound_circuit_replacing_a_direct_connection_announces_its_path() {
+    let mut h = inbound_harness(NatConfig::default());
+    let target = h.target.clone();
+    let direct = ConnectionId::new(9);
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: direct,
+            peer_id: target.clone(),
+        },
+        at(0),
+    );
+    let stop = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stop, 1);
+    h.stream_data(stop, stop_connect(&target), at(10));
+    let promotion = drain_actions(&mut h.agent);
+    let circuit = ConnectionId::new(TEST_CIRCUIT_ID);
+    h.agent
+        .promote_result(promote_token(&promotion), Ok(circuit), at(11));
+
+    h.agent.handle_event_with_disposition_classified(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: target.clone(),
+            old: direct,
+            new: circuit,
+        },
+        true,
+        at(12),
+    );
+    assert!(
+        drain_events(&mut h.agent).iter().any(|event| matches!(
+            event,
+            NatEvent::InboundPathEstablished {
+                path: Path::Relayed { .. },
+                ..
+            }
+        )),
+        "the retired direct connection must not make the circuit look redundant"
+    );
+    assert!(matches!(h.agent.path(&target), Some(Path::Relayed { .. })));
 }

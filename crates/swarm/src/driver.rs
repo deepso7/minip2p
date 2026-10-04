@@ -311,6 +311,11 @@ impl<T: Transport> Swarm<T> {
         self.runtime.is_peer_ready(peer_id)
     }
 
+    /// See [`SwarmRuntime::peer_readiness`].
+    pub fn peer_readiness(&self, peer_id: &PeerId) -> Option<(ConnectionId, &IdentifyMessage)> {
+        self.runtime.peer_readiness(peer_id)
+    }
+
     /// See [`SwarmRuntime::local_peer_id`].
     pub fn local_peer_id(&self) -> &PeerId {
         self.runtime.local_peer_id()
@@ -847,7 +852,7 @@ mod tests {
 
     impl BlockingTransport for SupersessionTransport {}
 
-    fn supersession_swarm(
+    fn replacement_swarm(
         remote_peer: PeerId,
         original: ConnectionId,
         replacement: ConnectionId,
@@ -1188,11 +1193,11 @@ mod tests {
     }
 
     #[test]
-    fn superseded_connection_closes_after_public_event_is_returned() {
+    fn replaced_connection_closes_after_public_event_is_returned() {
         let remote_peer = Ed25519Keypair::generate().peer_id();
         let original = ConnectionId::new(41);
         let replacement = ConnectionId::new(42);
-        let mut swarm = supersession_swarm(remote_peer.clone(), original, replacement);
+        let mut swarm = replacement_swarm(remote_peer.clone(), original, replacement);
 
         let first = swarm.poll().expect("original connection poll");
         assert!(matches!(
@@ -1200,17 +1205,15 @@ mod tests {
             [SwarmEvent::ConnectionEstablished { conn_id, .. }] if *conn_id == original
         ));
 
-        let superseded = swarm.poll().expect("replacement connection poll");
+        let replaced = swarm.poll().expect("replacement connection poll");
         assert!(matches!(
-            superseded.as_slice(),
-            [
-                SwarmEvent::ConnectionClosed { conn_id: closed, .. },
-                SwarmEvent::ConnectionEstablished { conn_id: established, .. },
-            ] if *closed == original && *established == replacement
+            replaced.as_slice(),
+            [SwarmEvent::ConnectionReplaced { old, new, .. }]
+                if *old == original && *new == replacement
         ));
         assert!(
             swarm.transport().close_calls.is_empty(),
-            "the old transport must remain open until the close event is returned"
+            "the old transport must remain open until the event is returned"
         );
 
         let later = swarm.poll().expect("post-delivery poll");
@@ -1220,33 +1223,21 @@ mod tests {
     }
 
     #[test]
-    fn superseded_connection_close_waits_for_buffered_poll_next_events() {
+    fn replaced_connection_close_waits_for_poll_next_delivery() {
         let remote_peer = Ed25519Keypair::generate().peer_id();
         let original = ConnectionId::new(51);
         let replacement = ConnectionId::new(52);
-        let mut swarm = supersession_swarm(remote_peer, original, replacement);
+        let mut swarm = replacement_swarm(remote_peer, original, replacement);
 
         let _ = swarm.poll().expect("original connection poll");
-        let closed = swarm
+        let replaced = swarm
             .poll_next(Duration::ZERO)
             .expect("replacement connection poll")
-            .expect("eager close event");
+            .expect("replacement event");
         assert!(matches!(
-            closed,
-            SwarmEvent::ConnectionClosed { conn_id, .. } if conn_id == original
-        ));
-        assert!(swarm.transport().close_calls.is_empty());
-
-        // `poll_next` still owns the establishment event buffered from the
-        // same core turn, so it must return that event before dispatching the
-        // dependent close action.
-        let established = swarm
-            .poll_next(Duration::ZERO)
-            .expect("buffered replacement event")
-            .expect("replacement established event");
-        assert!(matches!(
-            established,
-            SwarmEvent::ConnectionEstablished { conn_id, .. } if conn_id == replacement
+            replaced,
+            SwarmEvent::ConnectionReplaced { old, new, .. }
+                if old == original && new == replacement
         ));
         assert!(swarm.transport().close_calls.is_empty());
 
@@ -1327,6 +1318,7 @@ mod tests {
             });
         swarm.runtime.event_buffer.push_back(SwarmEvent::PeerReady {
             peer_id: target_peer_id.clone(),
+            conn_id: ConnectionId::new(1),
             protocols: Vec::new(),
         });
 
@@ -1389,6 +1381,7 @@ mod tests {
             });
         swarm.runtime.event_buffer.push_back(SwarmEvent::PeerReady {
             peer_id,
+            conn_id: ConnectionId::new(1),
             protocols: Vec::new(),
         });
 
@@ -1431,6 +1424,7 @@ mod tests {
             });
         swarm.runtime.event_buffer.push_back(SwarmEvent::PeerReady {
             peer_id: peer_id.clone(),
+            conn_id: ConnectionId::new(1),
             protocols: Vec::new(),
         });
 
@@ -1873,6 +1867,7 @@ mod tests {
         }
         swarm.runtime.event_buffer.push_back(SwarmEvent::PeerReady {
             peer_id: peer_id.clone(),
+            conn_id: ConnectionId::new(1),
             protocols: Vec::new(),
         });
 
