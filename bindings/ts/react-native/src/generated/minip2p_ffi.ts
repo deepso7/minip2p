@@ -3010,7 +3010,7 @@ inner: {peerId: string; topic: string }): PeerSubscribed_ {
 Readonly<{peerId: string; topic: string}>
     };
     /**
-     * A peer withdrew a subscription.
+     * A peer's subscription ended: withdrawn, or its connection closed or was replaced.
      */
     class PeerUnsubscribed_ extends UniffiEnum implements PeerUnsubscribed__interface {
         /**

@@ -89,7 +89,10 @@ pub enum GossipsubEvent {
         /// The topic it subscribed to.
         topic: String,
     },
-    /// A peer withdrew a subscription.
+    /// A peer's subscription ended: it withdrew it, or the connection that
+    /// announced it closed or was replaced. Subscriptions are per connection,
+    /// so after a replacement the peer re-announces on the new one and a
+    /// fresh [`Self::PeerSubscribed`] follows; the two alternate per topic.
     PeerUnsubscribed {
         /// The unsubscribing peer.
         peer: PeerId,
