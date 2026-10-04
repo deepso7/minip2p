@@ -260,13 +260,13 @@ fn swarm_user_protocol_round_trip() {
             match event {
                 SwarmEvent::StreamData {
                     ref peer_id,
+                    conn_id,
                     stream_id,
                     ref data,
-                    ..
                 } if !server_echo_sent => {
                     // Echo the data back on the same stream.
                     server
-                        .send_stream(peer_id, stream_id, data.clone())
+                        .send_stream(peer_id, conn_id, stream_id, data.clone())
                         .expect("server echo");
                     server_echo_sent = true;
                 }
@@ -282,23 +282,23 @@ fn swarm_user_protocol_round_trip() {
                 SwarmEvent::PeerReady { ref peer_id, .. }
                     if *peer_id == server_peer_id && stream.is_none() =>
                 {
-                    let sid = client
+                    let (_, sid) = client
                         .open_stream(&server_peer_id, USER_PROTOCOL_ID)
                         .expect("open user stream");
                     stream = Some(sid);
                 }
                 SwarmEvent::StreamReady {
                     ref peer_id,
+                    conn_id,
                     stream_id,
                     ref protocol_id,
                     initiated_locally,
-                    ..
                 } => {
                     assert_eq!(peer_id, &server_peer_id);
                     assert_eq!(protocol_id, USER_PROTOCOL_ID);
                     assert!(initiated_locally);
                     client
-                        .send_stream(&server_peer_id, stream_id, payload.clone())
+                        .send_stream(&server_peer_id, conn_id, stream_id, payload.clone())
                         .expect("client send");
                 }
                 SwarmEvent::StreamData {

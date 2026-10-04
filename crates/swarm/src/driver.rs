@@ -409,61 +409,58 @@ impl<T: Transport> Swarm<T> {
         &mut self,
         peer_id: &PeerId,
         protocol_id: &str,
-    ) -> Result<StreamId, DriverError> {
-        let now_ms = self.now_ms();
-        self.runtime.open_stream(peer_id, protocol_id, now_ms)
-    }
-
-    /// Opens an application stream and returns its full transport identity.
-    pub fn open_stream_with_connection(
-        &mut self,
-        peer_id: &PeerId,
-        protocol_id: &str,
     ) -> Result<(ConnectionId, StreamId), DriverError> {
         let now_ms = self.now_ms();
-        self.runtime
-            .open_stream_with_connection(peer_id, protocol_id, now_ms)
+        self.runtime.open_stream(peer_id, protocol_id, now_ms)
     }
 
     /// See [`SwarmRuntime::send_stream`].
     pub fn send_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<(), DriverError> {
         let now_ms = self.now_ms();
-        self.runtime.send_stream(peer_id, stream_id, data, now_ms)
+        self.runtime
+            .send_stream(peer_id, conn_id, stream_id, data, now_ms)
     }
 
     /// See [`SwarmRuntime::close_stream_write`].
     pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
         let now_ms = self.now_ms();
-        self.runtime.close_stream_write(peer_id, stream_id, now_ms)
+        self.runtime
+            .close_stream_write(peer_id, conn_id, stream_id, now_ms)
     }
 
     /// See [`SwarmRuntime::reset_stream`].
     pub fn reset_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
         let now_ms = self.now_ms();
-        self.runtime.reset_stream(peer_id, stream_id, now_ms)
+        self.runtime
+            .reset_stream(peer_id, conn_id, stream_id, now_ms)
     }
 
     /// See [`SwarmRuntime::abandon_stream`].
     pub fn abandon_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
         let now_ms = self.now_ms();
-        self.runtime.abandon_stream(peer_id, stream_id, now_ms)
+        self.runtime
+            .abandon_stream(peer_id, conn_id, stream_id, now_ms)
     }
 
     /// Drives the swarm one iteration, sampling the clock for the caller.
@@ -1534,7 +1531,7 @@ mod tests {
             .open_stream(&remote_peer, PROTOCOL)
             .expect("queue stale open");
 
-        let stream_id = swarm
+        let (_, stream_id) = swarm
             .open_stream(&remote_peer, PROTOCOL)
             .expect("the caller's own open succeeds; the stale failure is not its error");
         assert_eq!(stream_id, StreamId::new(3), "caller gets its own stream id");
@@ -1683,7 +1680,9 @@ mod tests {
 
     impl BlockingTransport for FailingSendTransport {}
 
-    fn ready_user_swarm(protocol: &str) -> (Swarm<FailingSendTransport>, PeerId, StreamId) {
+    fn ready_user_swarm(
+        protocol: &str,
+    ) -> (Swarm<FailingSendTransport>, PeerId, ConnectionId, StreamId) {
         let remote_peer = Ed25519Keypair::generate().peer_id();
         let keypair = Ed25519Keypair::generate();
         let identify = IdentifyConfig {
@@ -1704,7 +1703,7 @@ mod tests {
             .expect("test protocol id is not reserved");
         swarm.poll().expect("process connected event");
 
-        let stream_id = swarm
+        let (conn_id, stream_id) = swarm
             .open_stream(&remote_peer, protocol)
             .expect("open user stream");
         let mut ready = false;
@@ -1723,20 +1722,20 @@ mod tests {
             }
         }
         assert!(ready, "user stream must finish multistream negotiation");
-        (swarm, remote_peer, stream_id)
+        (swarm, remote_peer, conn_id, stream_id)
     }
 
     #[test]
     fn send_stream_transport_failure_is_a_synchronous_error() {
         const PROTOCOL: &str = "/test/1.0.0";
-        let (mut swarm, remote_peer, stream_id) = ready_user_swarm(PROTOCOL);
+        let (mut swarm, remote_peer, conn_id, stream_id) = ready_user_swarm(PROTOCOL);
 
         // The transport rejects the payload write. Callers that commit
         // state once a stream closes (the pubsub one-shot sender) must see
         // this synchronously -- an Ok here would let a never-sent frame
         // commit on StreamClosed.
         let error = swarm
-            .send_stream(&remote_peer, stream_id, b"payload".to_vec())
+            .send_stream(&remote_peer, conn_id, stream_id, b"payload".to_vec())
             .expect_err("transport must reject the payload send");
         assert!(matches!(
             error,
@@ -1758,13 +1757,13 @@ mod tests {
     #[test]
     fn transport_reset_failure_remains_retryable() {
         const PROTOCOL: &str = "/test/1.0.0";
-        let (mut swarm, remote_peer, stream_id) = ready_user_swarm(PROTOCOL);
+        let (mut swarm, remote_peer, conn_id, stream_id) = ready_user_swarm(PROTOCOL);
 
         swarm
-            .reset_stream(&remote_peer, stream_id)
+            .reset_stream(&remote_peer, conn_id, stream_id)
             .expect("reset dispatch is asynchronous");
         swarm
-            .reset_stream(&remote_peer, stream_id)
+            .reset_stream(&remote_peer, conn_id, stream_id)
             .expect("failed reset must remain retryable");
 
         assert_eq!(swarm.transport().reset_calls, 2);
