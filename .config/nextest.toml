@@ -43,17 +43,19 @@ default-filter = '''
   )
 '''
 
-# Two tests wait on quiche's idle timer, whose effective value is
-# max(idle, 3×PTO). PTO follows the RTT quiche measures, and a descheduled
-# thread inflates that, so under load the timer these tests are waiting for
-# moves further away the more loaded the box is — a margin cannot be picked that
-# survives it. They take the box instead.
+# Two tests wait on quiche's idle timer — `stop_sending_drops_queued_writes_…`
+# and `quic_deadline_is_exposed_…`. Its effective value is max(idle, 3×PTO).
+# PTO follows the RTT quiche measures, and a descheduled thread inflates that,
+# so under load the timer these tests are waiting for moves further away the
+# more loaded the box is — a margin cannot be picked that survives it. They take
+# the box instead.
 #
-# Two more prove a quiet connection survives past its idle timeout, driving both
-# endpoints from one thread: a thread that stops polling for longer than the
-# timeout expires the connection their assertions require to still be up. Run
-# alone, PTO also stays at loopback scale, so their observation windows outlast
-# the effective timeout rather than only the configured one.
+# Two more prove a quiet connection survives past its idle timeout —
+# `quiet_pair_stays_up_…` and `idle_quic_relay_reservation_stays_live_…` —
+# driving both endpoints from one thread: a thread that stops polling for long
+# enough expires the connection their assertions require to still be up. Run
+# alone, PTO also stays at loopback scale, so the effective timeout they have to
+# outlast is the configured one.
 #
 # The close-drain tests assert on the events `Endpoint::close()` returns, and
 # `close()` drains for a fixed 500ms by design — shutdown stays bounded, so the
