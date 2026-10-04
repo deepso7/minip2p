@@ -1045,11 +1045,7 @@ impl Endpoint {
     /// Returns `true` when a driver claimed the event.
     #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn ingest_into_drivers(&mut self, event: &SwarmEvent) -> bool {
-        if let SwarmEvent::PeerReady {
-            peer_id, conn_id, ..
-        } = event
-            && self.swarm.connection_id(peer_id) != Some(*conn_id)
-        {
+        if self.swarm.core().is_stale_peer_ready(event) {
             return false;
         }
         #[cfg(any(feature = "discovery", feature = "mdns"))]

@@ -813,6 +813,21 @@ impl SwarmCore {
         self.peer_to_conn.get(peer_id).copied()
     }
 
+    /// Whether `event` is a `PeerReady` for a connection that is no longer
+    /// the peer's current one.
+    ///
+    /// A `PeerReady(old)` queued before `old` was replaced is still delivered
+    /// in order, but a host processing a batch sees the core's state after
+    /// it. Hosts pass such an event to the application only: protocol drivers
+    /// act peer-scoped and would start work on the not-yet-ready replacement.
+    pub fn is_stale_peer_ready(&self, event: &SwarmEvent) -> bool {
+        matches!(
+            event,
+            SwarmEvent::PeerReady { peer_id, conn_id, .. }
+                if self.connection_id(peer_id) != Some(*conn_id)
+        )
+    }
+
     /// Returns the remote transport address recorded for an exact connection.
     pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
         self.conn_to_remote_addr.get(&conn_id)
@@ -3572,6 +3587,32 @@ mod tests {
             )),
             "a hand-over is never a disconnect: {events:?}"
         );
+    }
+
+    #[test]
+    fn peer_ready_queued_before_a_replacement_is_stale() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"stale-ready-peer");
+        let original = ConnectionId::new(56);
+        let replacement = ConnectionId::new(57);
+        connect_again(&mut core, &peer_id, original, false);
+        identify_on(&mut core, original, StreamId::new(1), &[]);
+        connect_again(&mut core, &peer_id, replacement, false);
+
+        // Both events are still delivered; only the first is stale by the
+        // time a host sees the batch.
+        let events = drain_events(&mut core);
+        assert_eq!(ready_conns(&events), [original]);
+        let ready = events
+            .iter()
+            .find(|event| matches!(event, SwarmEvent::PeerReady { .. }))
+            .expect("PeerReady(original) stays queued");
+        assert!(core.is_stale_peer_ready(ready));
+        assert!(!core.is_stale_peer_ready(&SwarmEvent::PeerReady {
+            peer_id,
+            conn_id: replacement,
+            protocols: Vec::new(),
+        }));
     }
 
     #[test]

@@ -1094,11 +1094,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             // peer-scoped and would start work on the not-yet-ready
             // replacement.
             #[cfg(any(feature = "portable-autonat", feature = "pubsub"))]
-            let stale_ready = matches!(
-                &event,
-                SwarmEvent::PeerReady { peer_id, conn_id, .. }
-                    if self.endpoint.connection_id(peer_id) != Some(*conn_id)
-            );
+            let stale_ready = self.endpoint.runtime().core().is_stale_peer_ready(&event);
             #[cfg(feature = "portable-autonat")]
             let claimed = engine_consumed
                 || (!stale_ready
