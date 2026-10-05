@@ -284,6 +284,12 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         self.core.connection_id(peer_id)
     }
 
+    /// Whether a peer's current connection came from one of our dials; see
+    /// [`SwarmCore::is_outbound`].
+    pub fn is_outbound(&self, conn_id: ConnectionId) -> Option<bool> {
+        self.core.is_outbound(conn_id)
+    }
+
     /// Returns whether `peer_id` has been surfaced to the application as
     /// connected — pending dials do not count.
     pub fn is_peer_connected(&self, peer_id: &PeerId) -> bool {

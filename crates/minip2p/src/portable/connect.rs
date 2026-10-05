@@ -717,12 +717,17 @@ impl ConnectEngine {
         // A kept dial that took the slot leaves the race; the rest stay in
         // it, as one may still win at the peer. A direct connection taking
         // the slot restarts the swarm's window, so theirs restarts with it.
-        // It stays our dial even though the attempt that made it is gone.
-        let ours = self.owner(conn_id).is_some()
-            || self
-                .retained
-                .get(peer_id)
-                .is_some_and(|retained| retained.dials.contains(&conn_id));
+        // Whether it is our dial comes from the swarm, which records it for
+        // the slot holder: the attempt that made it, or its retained entry,
+        // may be gone by the time the engine sees it establish. Engine
+        // bookkeeping covers a slot already empty again.
+        let ours = runtime.is_outbound(conn_id).unwrap_or_else(|| {
+            self.owner(conn_id).is_some()
+                || self
+                    .retained
+                    .get(peer_id)
+                    .is_some_and(|retained| retained.dials.contains(&conn_id))
+        });
         self.forget_retained(conn_id);
         if !conn_id.is_circuit()
             && let Some(retained) = self.retained.get_mut(peer_id)
@@ -1977,6 +1982,46 @@ mod tests {
             .transport_mut()
             .push_connected_with_token(d2, peer.clone(), addr(&peer, 2), 9);
         let _ = drain(&mut engine, &mut runtime, 2);
+        assert!(!runtime.transport().closes.contains(&d3));
+    }
+
+    #[test]
+    fn a_kept_dial_seen_after_its_window_still_counts_as_ours() {
+        let peer = peer(b"low");
+        let (d1, d2, d3) = (
+            ConnectionId::new(1),
+            ConnectionId::new(2),
+            ConnectionId::new(3),
+        );
+        let mut runtime = runtime(FakeTransport::default());
+        assert!(
+            runtime.local_peer_id() > &peer,
+            "the peer's dials would lose"
+        );
+        let mut engine = ConnectEngine::new(30_000);
+        let _ = engine.connect(
+            ConnectTarget::try_from(vec![addr(&peer, 1), addr(&peer, 2)]).expect("same peer"),
+            &mut runtime,
+            0,
+        );
+        runtime
+            .transport_mut()
+            .push_connected_with_token(d1, peer.clone(), addr(&peer, 1), 5);
+        let _ = drain(&mut engine, &mut runtime, 0);
+        runtime.transport_mut().push_closed(d1);
+        let _ = drain(&mut engine, &mut runtime, 1);
+        let _ = engine.connect(ConnectTarget::from(addr(&peer, 3)), &mut runtime, 1);
+
+        // The swarm registers d2 at 4 s, but the host only hands its events
+        // to the engine after the retained window has lapsed.
+        runtime
+            .transport_mut()
+            .push_connected_with_token(d2, peer.clone(), addr(&peer, 2), 9);
+        let buffered = runtime.poll(Now::from_millis(4_000)).expect("poll");
+        engine.tick(&mut runtime, 6_000);
+        for event in &buffered {
+            let _ = engine.observe(event, &mut runtime, 6_000);
+        }
         assert!(!runtime.transport().closes.contains(&d3));
     }
 

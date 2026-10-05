@@ -848,6 +848,14 @@ impl SwarmCore {
         self.peer_to_conn.get(peer_id).copied()
     }
 
+    /// Whether `conn_id`, while it is some peer's current connection, came
+    /// from one of our dials. `None` once it no longer holds a slot.
+    pub fn is_outbound(&self, conn_id: ConnectionId) -> Option<bool> {
+        self.registrations
+            .get(&conn_id)
+            .map(|registration| registration.outbound)
+    }
+
     /// Whether `event` is a `PeerReady` for a connection that is no longer
     /// the peer's current one.
     ///
