@@ -9,7 +9,8 @@ We rejected a minimal `Arc<[u8]>` plus range type: building an `Arc<[u8]>` from 
 ## Consequences
 
 - Pubsub's `SharedFrame` (`Arc` under `std`, `Rc` otherwise) is replaced by `Bytes`, so the `no_std` build no longer uses `Rc` there.
-- The `Transport`, swarm and endpoint `send_stream` take `Bytes`; the application-facing endpoint method accepts `impl Into<Bytes>`, so `Vec<u8>` and static slices keep working. A write refused as `Full` under #234's contract hands the same `Bytes` back, which satisfies the exact-payload rule without a copy.
+- The `Transport`, swarm and endpoint `send_stream` take `Bytes`; the application-facing endpoint method accepts `impl Into<Bytes>`, so `Vec<u8>` and static slices keep working. A write that does not fully fit hands back its unsent tail as a slice of the same `Bytes`, without a copy (ADR 0012).
+- Slicing can pin the whole source allocation, so a layer that retains a slice shorter than half its payload's original length copies it (ADR 0012).
 - FFI types keep `Vec<u8>`; ffi-core converts at the boundary. The copies into and out of JavaScript, and QUIC's copy out of its reusable read buffer, remain.
 - Targets without atomic CAS (for example `thumbv6m`) would need `bytes`'s `extra-platforms` feature. None is supported today.
 - Wire decoders keep borrowing `&[u8]`; only stream payloads change type.
