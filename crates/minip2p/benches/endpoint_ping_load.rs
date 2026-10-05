@@ -26,7 +26,8 @@
 //! Each loaded case reads the load's progress (bytes or messages the far end
 //! received) when the first sample is sent and after every [`CHECKPOINT`]th
 //! sample through the last, and asserts it advanced between each pair of
-//! reads, so the load ran across the whole window.
+//! reads at no less than a floor rate ([`RELAY_MIN_BYTES_PER_S`], or half of
+//! [`MSGS_PER_S`]), so the load ran at strength across the whole window.
 //!
 //! Rows (`rtt_us_p50`, `rtt_us_p99`, nearest rank, informational) go to
 //! `target/bench-results/custom/endpoint_ping_load.json` for the `custom`
@@ -63,6 +64,9 @@ const PROTOCOL: &str = "/minip2p/bench/sink/1";
 const CHUNK: usize = 64 * 1024;
 /// Relay-load chunks the sender may have written ahead of the sink.
 const IN_FLIGHT: u64 = 8;
+/// Slowest relay forwarding accepted as load, far below what loopback
+/// sustains.
+const RELAY_MIN_BYTES_PER_S: u64 = 1 << 20;
 
 const TOPIC: &str = "bench-load";
 const MSGS_PER_S: u64 = 500;
@@ -91,6 +95,8 @@ struct Load {
     _peers: Vec<Driven>,
     progress: Option<Arc<AtomicU64>>,
     unit: &'static str,
+    /// Least progress per second the load must keep up while sampling.
+    min_per_s: u64,
 }
 
 impl Load {
@@ -182,6 +188,7 @@ fn relay_load() -> (Endpoint, Load) {
         _peers: vec![sender, sink],
         progress: Some(received),
         unit: "bytes",
+        min_per_s: RELAY_MIN_BYTES_PER_S,
     };
     load.wait_started(&mut m);
     (m, load)
@@ -256,6 +263,7 @@ fn pubsub_load() -> (Endpoint, Load) {
         _peers: vec![source, sink],
         progress: Some(received),
         unit: "messages",
+        min_per_s: MSGS_PER_S / 2,
     };
     // The first messages may predate the hub's mesh; wait for delivery.
     load.wait_started(&mut m);
@@ -292,6 +300,7 @@ fn case(kind: LoadKind, listen: &str) -> Vec<String> {
                 _peers: Vec::new(),
                 progress: None,
                 unit: "",
+                min_per_s: 0,
             },
         ),
         LoadKind::Relay => relay_load(),
@@ -318,6 +327,7 @@ fn case(kind: LoadKind, listen: &str) -> Vec<String> {
         sample(&mut m, &probe_peer);
     }
     let mut checkpoint = load.progress();
+    let mut checked_at = Instant::now();
     let mut advanced = 0;
     let mut rtts = Vec::with_capacity(SAMPLES);
     let mut sent_at = Instant::now();
@@ -333,9 +343,16 @@ fn case(kind: LoadKind, listen: &str) -> Vec<String> {
         if (index + 1) % CHECKPOINT == 0
             && let (Some(before), Some(now)) = (checkpoint, load.progress())
         {
-            assert!(now > before, "load stalled before sample {index}");
+            let floor = load.min_per_s as f64 * checked_at.elapsed().as_secs_f64();
+            assert!(
+                now > before && (now - before) as f64 >= floor,
+                "load fell to {} {} (floor {floor:.0}) before sample {index}",
+                now - before,
+                load.unit,
+            );
             advanced += now - before;
             checkpoint = Some(now);
+            checked_at = Instant::now();
         }
     }
     let advanced = match checkpoint {
