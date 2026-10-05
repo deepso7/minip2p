@@ -160,11 +160,12 @@ struct ReverseFirstTwo<T> {
 }
 
 impl<T> ReverseFirstTwo<T> {
-    fn new(inner: T) -> Self {
+    /// Without `reverse`, passes every event straight through.
+    fn new(inner: T, reverse: bool) -> Self {
         Self {
             inner,
             held: None,
-            done: false,
+            done: !reverse,
             swapped: false,
         }
     }
@@ -270,10 +271,13 @@ impl<T: Transport> Transport for ReverseFirstTwo<T> {
 }
 
 /// A dials B with B's address twice, so both candidate dials race to B and
-/// both complete. B sees them in the order opposite to the one its transport
-/// reports, which is also the dialer's, so newest-wins would leave each side
-/// closing the connection the other kept. Both must keep the same one (the
-/// lower connection token), and `connect` must settle without a `DialFailed`.
+/// both complete. It runs once with B seeing them in its transport's order and
+/// once reversed, so in one of the two runs B and A see them in opposite
+/// orders, whichever order A's transport reports. Newest-wins would then leave
+/// each side closing the connection the other kept. Both must keep the same
+/// one (the lower connection token): a split would close both connections, so
+/// both peers must still be connected, and answer pings, after the race has
+/// had time to settle. `connect` must settle without a `DialFailed`.
 ///
 /// `seamless` is whether A never loses its connection on the way. A QUIC
 /// dialer sees both connections before the listener does, so it is. A TCP
@@ -285,11 +289,22 @@ fn duplicate_candidates_keep_one_shared_connection<T: Transport>(
     listen: impl Fn(&T) -> Multiaddr,
     seamless: bool,
 ) {
+    for reverse in [false, true] {
+        duplicate_candidates_run(&transport, &listen, seamless, reverse);
+    }
+}
+
+fn duplicate_candidates_run<T: Transport>(
+    transport: &impl Fn(&Ed25519Keypair) -> T,
+    listen: &impl Fn(&T) -> Multiaddr,
+    seamless: bool,
+    reverse: bool,
+) {
     let (a_key, b_key) = (Ed25519Keypair::generate(), Ed25519Keypair::generate());
     let mut a = Endpoint::portable(&a_key, StdEntropy)
         .build(transport(&a_key))
         .expect("a builds");
-    let b_transport = ReverseFirstTwo::new(transport(&b_key));
+    let b_transport = ReverseFirstTwo::new(transport(&b_key), reverse);
     let b_listen = listen(&b_transport.inner);
     let mut b = Endpoint::portable(&b_key, StdEntropy)
         .build(b_transport)
@@ -338,8 +353,35 @@ fn duplicate_candidates_keep_one_shared_connection<T: Transport>(
         b_events.extend(b_new);
     }
 
-    assert!(
+    // A split shows only once each side has closed the connection the other
+    // kept: give the race time to settle, then both must still be connected
+    // and answer pings on whatever they kept.
+    let settle_until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle_until {
+        let (_, a_new, b_new) = drive(&mut a, &mut b);
+        a_events.extend(a_new);
+        b_events.extend(b_new);
+    }
+    let (now, a_new, b_new) = drive(&mut a, &mut b);
+    let (mut a_later, mut b_later) = (a_new, b_new);
+    a.ping(&b_peer, now).expect("a pings again");
+    b.ping(&a_peer, now).expect("b pings again");
+    while !pinged(&a_later, &b_peer) || !pinged(&b_later, &a_peer) {
+        assert!(
+            Instant::now() < deadline,
+            "peers split onto different connections: a={a_later:?} b={b_later:?}"
+        );
+        let (_, a_new, b_new) = drive(&mut a, &mut b);
+        a_later.extend(a_new);
+        b_later.extend(b_new);
+    }
+    a_events.extend(a_later);
+    b_events.extend(b_later);
+    assert!(a.connection_id(&b_peer).is_some() && b.connection_id(&a_peer).is_some());
+
+    assert_eq!(
         b.runtime().transport().swapped,
+        reverse,
         "B saw two connections race"
     );
     for events in [&a_events, &b_events] {

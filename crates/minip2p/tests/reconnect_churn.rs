@@ -22,8 +22,9 @@ const CHURN_ROUNDS: usize = 50;
 const RECLAIM_BACKSTOP: Duration = Duration::from_secs(5);
 /// Failure backstop for a driver thread whose stop signal never arrives.
 const DRIVER_BACKSTOP: Duration = Duration::from_secs(30);
-/// Comfortably past the swarm's 5 s `SIMULTANEOUS_DIAL_WINDOW_MS`.
-const PAST_RACE_WINDOW: Duration = Duration::from_millis(5_500);
+/// Comfortably past the swarm's race window.
+const PAST_RACE_WINDOW: Duration =
+    Duration::from_millis(minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS + 500);
 
 fn wait_peer_ready(
     listener: &mut Endpoint,

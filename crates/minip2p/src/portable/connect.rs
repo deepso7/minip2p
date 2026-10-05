@@ -729,12 +729,18 @@ impl ConnectEngine {
                     .is_some_and(|retained| retained.dials.contains(&conn_id))
         });
         self.forget_retained(conn_id);
-        if !conn_id.is_circuit()
-            && let Some(retained) = self.retained.get_mut(peer_id)
-        {
-            retained.expires_ms = retained
-                .expires_ms
-                .max(now_ms.saturating_add(SIMULTANEOUS_DIAL_WINDOW_MS));
+        let circuit = conn_id.is_circuit();
+        let keep_dials = !circuit && (ours || runtime.local_peer_id() < peer_id);
+        if keep_dials {
+            if let Some(retained) = self.retained.get_mut(peer_id) {
+                retained.expires_ms = retained
+                    .expires_ms
+                    .max(now_ms.saturating_add(SIMULTANEOUS_DIAL_WINDOW_MS));
+            }
+        } else if !circuit {
+            // The peer's dial won as the lower peer: every dial of ours now
+            // loses on both sides, including those kept from earlier.
+            self.abort_retained(peer_id, runtime);
         }
         let ids: Vec<ConnectId> = self
             .attempts
@@ -742,8 +748,6 @@ impl ConnectEngine {
             .filter(|(_, attempt)| &attempt.peer == peer_id)
             .map(|(id, _)| *id)
             .collect();
-        let circuit = conn_id.is_circuit();
-        let keep_dials = !circuit && (ours || runtime.local_peer_id() < peer_id);
         for id in ids {
             let Some(mut attempt) = self.attempts.remove(&id) else {
                 continue;
@@ -2023,6 +2027,39 @@ mod tests {
             let _ = engine.observe(event, &mut runtime, 6_000);
         }
         assert!(!runtime.transport().closes.contains(&d3));
+    }
+
+    #[test]
+    fn higher_peer_aborts_kept_dials_when_the_peers_dial_wins() {
+        let peer = peer(b"low");
+        let (d1, d2, inbound) = (
+            ConnectionId::new(1),
+            ConnectionId::new(2),
+            ConnectionId::new(99),
+        );
+        let mut runtime = runtime(FakeTransport::default());
+        assert!(runtime.local_peer_id() > &peer, "the peer's dial wins");
+        let mut engine = ConnectEngine::new(30_000);
+        let _ = engine.connect(
+            ConnectTarget::try_from(vec![addr(&peer, 1), addr(&peer, 2)]).expect("same peer"),
+            &mut runtime,
+            0,
+        );
+        runtime
+            .transport_mut()
+            .push_connected_with_token(d1, peer.clone(), addr(&peer, 1), 5);
+        let _ = drain(&mut engine, &mut runtime, 0);
+        assert!(runtime.transport().closes.is_empty(), "d2 is kept");
+
+        // The lower peer's dial replaces ours, so the kept d2 loses on both
+        // sides and goes now rather than when the window ends.
+        runtime
+            .transport_mut()
+            .push_connected(inbound, peer.clone(), addr(&peer, 9));
+        let _ = drain(&mut engine, &mut runtime, 1);
+        assert_eq!(runtime.connection_id(&peer), Some(inbound));
+        assert!(runtime.transport().closes.contains(&d2));
+        assert!(engine.suppressed.is_empty() && engine.retained.is_empty());
     }
 
     #[test]

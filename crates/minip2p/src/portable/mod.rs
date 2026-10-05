@@ -169,8 +169,8 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// peer, chosen the same way on both sides when candidates race (see
     /// [`SIMULTANEOUS_DIAL_WINDOW_MS`](minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS)):
     /// a candidate that finishes after the winner may still replace it
-    /// ([`EndpointEvent::ConnectionReplaced`]), so the other candidates stay
-    /// open until that window ends. The attempt is settled at the first
+    /// ([`EndpointEvent::ConnectionReplaced`]), so candidates that could still
+    /// win stay open until that window ends. The attempt is settled at the first
     /// established connection the swarm keeps (including a simultaneous
     /// inbound), and the app sees any later hand-over as an ordinary
     /// connection event.
