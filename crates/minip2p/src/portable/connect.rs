@@ -697,22 +697,34 @@ impl ConnectEngine {
         // The swarm registers a whole transport batch before the engine sees
         // any of it, so a later connection in the same batch (another of our
         // candidates winning the same-direction race) may already hold the
-        // slot. Its `ConnectionReplaced` is still queued: settle on that
-        // instead of on a connection the swarm has already let go. Retired
-        // without failing, `conn_id` leaves the race, so nothing aborts it.
-        if runtime
+        // slot. Settle on that now rather than on a connection the swarm has
+        // already let go: waiting for its queued `ConnectionReplaced` would let
+        // a `DialFailed` queued in between exhaust the attempt. Retired without
+        // failing, `conn_id` leaves the race, so nothing aborts it. (When the
+        // slot is already empty again, every connection of the batch is gone
+        // and settling on `conn_id` is as good as any; its close is queued.)
+        if let Some(current) = runtime
             .connection_id(peer_id)
-            .is_some_and(|current| current != conn_id)
+            .filter(|current| *current != conn_id)
         {
             self.forget_retained(conn_id);
             for attempt in self.attempts.values_mut() {
                 attempt.direct.remove(&conn_id);
             }
+            self.peer_connected(peer_id, current, runtime, now_ms);
             return;
         }
         // A kept dial that took the slot leaves the race; the rest stay in
-        // it, as one may still win at the peer.
+        // it, as one may still win at the peer. A direct connection taking
+        // the slot restarts the swarm's window, so theirs restarts with it.
         self.forget_retained(conn_id);
+        if !conn_id.is_circuit()
+            && let Some(retained) = self.retained.get_mut(peer_id)
+        {
+            retained.expires_ms = retained
+                .expires_ms
+                .max(now_ms.saturating_add(SIMULTANEOUS_DIAL_WINDOW_MS));
+        }
         let ids: Vec<ConnectId> = self
             .attempts
             .iter()
@@ -1845,6 +1857,86 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn a_failure_after_a_retired_establishment_does_not_fail_the_attempt() {
+        let peer = peer(b"retired-then-failed");
+        let (d1, d2, d3) = (
+            ConnectionId::new(1),
+            ConnectionId::new(2),
+            ConnectionId::new(3),
+        );
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let first = engine.connect(
+            ConnectTarget::try_from(vec![addr(&peer, 1), addr(&peer, 2)]).expect("same peer"),
+            &mut runtime,
+            0,
+        );
+        let second = engine.connect(ConnectTarget::from(addr(&peer, 3)), &mut runtime, 0);
+        // d3 has the lowest token, so it replaces d1 before the engine sees
+        // d1 establish, and d2's failure is queued in between.
+        let transport = runtime.transport_mut();
+        transport.push_connected_with_token(d1, peer.clone(), addr(&peer, 1), 3);
+        transport.push_closed(d2);
+        transport.push_connected_with_token(d3, peer.clone(), addr(&peer, 3), 1);
+        let events = drain(&mut engine, &mut runtime, 0);
+
+        for id in [first, second] {
+            assert!(
+                matches!(
+                    settled_for(&events, id),
+                    Some(ConnectOutcome::Connected { conn_id }) if *conn_id == d3
+                ),
+                "{events:?}"
+            );
+        }
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, EndpointEvent::DialFailed { .. })),
+            "{events:?}"
+        );
+        assert!(engine.suppressed.is_empty() && engine.retained.is_empty());
+    }
+
+    #[test]
+    fn a_kept_dial_taking_the_slot_restarts_the_window_for_the_rest() {
+        let peer = peer(b"restart-window");
+        let (d1, d2, d3) = (
+            ConnectionId::new(1),
+            ConnectionId::new(2),
+            ConnectionId::new(3),
+        );
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let _ = engine.connect(
+            ConnectTarget::try_from(vec![addr(&peer, 1), addr(&peer, 2), addr(&peer, 3)])
+                .expect("same peer"),
+            &mut runtime,
+            0,
+        );
+        runtime
+            .transport_mut()
+            .push_connected_with_token(d1, peer.clone(), addr(&peer, 1), 3);
+        let _ = drain(&mut engine, &mut runtime, 0);
+
+        // d2 wins the race at 4 s, so the swarm compares against it until
+        // 9 s; d3 may still win at the peer and replace it here before then.
+        runtime
+            .transport_mut()
+            .push_connected_with_token(d2, peer.clone(), addr(&peer, 2), 2);
+        let _ = drain(&mut engine, &mut runtime, 4_000);
+        let _ = drain(&mut engine, &mut runtime, SIMULTANEOUS_DIAL_WINDOW_MS);
+        assert!(!runtime.transport().closes.contains(&d3));
+        let _ = drain(
+            &mut engine,
+            &mut runtime,
+            4_000 + SIMULTANEOUS_DIAL_WINDOW_MS,
+        );
+        assert!(runtime.transport().closes.contains(&d3));
+        assert!(engine.suppressed.is_empty() && engine.retained.is_empty());
     }
 
     #[test]
