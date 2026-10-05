@@ -112,8 +112,13 @@ describe("@minip2p/node", () => {
   test("Connection targets settle through the native endpoint", async () => {
     const a = createDualStackEndpoint();
     const b = createDualStackEndpoint();
-    const established: number[] = [];
-    a.on("connectionEstablished", ({ connId }) => established.push(connId));
+    // Connections a's events have announced. A dual-stack race can settle
+    // `connect` on one transport and then hand the peer to the other via
+    // `connectionReplaced`, and events trail native state, so poll until the
+    // events catch up with `connectionInfo`.
+    const announced: number[] = [];
+    a.on("connectionEstablished", ({ connId }) => announced.push(connId));
+    a.on("connectionReplaced", ({ newConnId }) => announced.push(newConnId));
 
     try {
       const [first, ...rest] = b.listenAddrs();
@@ -122,7 +127,11 @@ describe("@minip2p/node", () => {
       }
       const result = await a.connect([first, ...rest], { timeoutMs: 10_000 });
       expect(result.peerId).toBe(b.peerId());
-      expect(established).toContain(a.connectionInfo(b.peerId())?.connId);
+      await expect
+        .poll(() =>
+          announced.includes(a.connectionInfo(b.peerId())?.connId ?? -1)
+        )
+        .toBe(true);
 
       // A Peer-ID target with no known route is admitted, then fails.
       const stranger = nodeSdk.peerIdFromSecretKey(nodeSdk.generateSecretKey());
