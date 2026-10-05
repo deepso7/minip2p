@@ -139,16 +139,17 @@ fn is_backpressure(error: &Error) -> bool {
 /// taken just before the first write and when the sink got the last byte.
 fn transfer(client: &mut Endpoint, peer: &PeerId, progress: &Progress) -> (Mark, Mark) {
     progress.received.store(0, Ordering::Release);
-    let stream = client.open_stream(peer, PROTOCOL).expect("open stream");
+    let (conn, stream) = client.open_stream(peer, PROTOCOL).expect("open stream");
     let deadline = Instant::now() + SETUP_TIMEOUT;
     loop {
         assert!(Instant::now() < deadline, "stream negotiation timed out");
         if let Some(EndpointEvent::StreamReady {
+            conn_id,
             stream_id,
             initiated_locally: true,
             ..
         }) = next_event(client, Duration::from_millis(10))
-            && stream_id == stream
+            && (conn_id, stream_id) == (conn, stream)
         {
             break;
         }
@@ -169,7 +170,7 @@ fn transfer(client: &mut Endpoint, peer: &PeerId, progress: &Progress) -> (Mark,
         while sent < TOTAL
             && sent - progress.received.load(Ordering::Acquire) < IN_FLIGHT * CHUNK as u64
         {
-            match client.send_stream(peer, stream, chunk.clone()) {
+            match client.send_stream(peer, conn, stream, chunk.clone()) {
                 Ok(()) => sent += CHUNK as u64,
                 Err(error) => {
                     assert!(is_backpressure(&error), "send failed: {error}");
@@ -184,7 +185,7 @@ fn transfer(client: &mut Endpoint, peer: &PeerId, progress: &Progress) -> (Mark,
         let _outcome = client.wait(Duration::from_millis(5)).expect("drive client");
     };
     client
-        .close_stream_write(peer, stream)
+        .close_stream_write(peer, conn, stream)
         .expect("close write");
     (start, end)
 }
