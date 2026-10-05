@@ -646,6 +646,16 @@ fn direct_replacement_of_the_provisional_circuit_upgrades_once() {
         }] if *connect_id == id
     ));
     assert_eq!(h.agent.path(&h.target), Some(&Path::DirectDialed));
+
+    // A late close of the replaced circuit leaves the peer connected.
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            peer_id: h.target.clone(),
+            conn_id: circuit,
+        },
+        at(410),
+    );
+    assert_eq!(h.agent.path(&h.target), Some(&Path::DirectDialed));
 }
 
 #[test]
@@ -711,6 +721,10 @@ fn circuit_replacing_the_promoted_circuit_keeps_the_attempt_alive() {
     assert!(
         !h.agent.is_idle(),
         "the attempt still owns the relayed path"
+    );
+    assert!(
+        matches!(h.agent.path(&h.target), Some(Path::Relayed { relay }) if *relay == h.relay),
+        "the adopted circuit carries the attempt's relayed path"
     );
 
     // A later direct connection still upgrades the attempt's path.

@@ -16,8 +16,8 @@ use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_platform::{Now, StdEntropy};
 use minip2p_tcp::{StdTcpProvider, TcpProvider, TcpTransport};
 use minip2p_transport::{
-    BlockingTransport, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
-    WaitOutcome,
+    BlockingTransport, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,
+    TransportEvent, WaitOutcome,
 };
 
 type Node = TcpTransport<StdTcpProvider, StdEntropy>;
@@ -88,6 +88,13 @@ fn settle(a: &mut Node, b: &mut Node) {
 fn connected_peer(events: &[TransportEvent]) -> Option<&PeerId> {
     events.iter().find_map(|event| match event {
         TransportEvent::Connected { endpoint, .. } => endpoint.peer_id(),
+        _ => None,
+    })
+}
+
+fn connected_token(events: &[TransportEvent]) -> Option<ConnectionToken> {
+    events.iter().find_map(|event| match event {
+        TransportEvent::Connected { endpoint, .. } => endpoint.token(),
         _ => None,
     })
 }
@@ -173,6 +180,9 @@ fn two_nodes_upgrade_over_loopback_and_authenticate_each_other() {
         connected_peer(&pair.listener_events),
         Some(&pair.dialer_peer)
     );
+    // Both ends carry the same token: the Noise handshake hash.
+    let token = connected_token(&pair.dialer_events).expect("dialer token");
+    assert_eq!(connected_token(&pair.listener_events), Some(token));
 
     // The listener learns the dialer's ephemeral source port from the kernel.
     let inbound = pair.listener.active_inbound_connection_sources();

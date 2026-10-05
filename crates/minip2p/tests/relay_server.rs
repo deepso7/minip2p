@@ -130,7 +130,7 @@ fn exercise_relay(
         "NAT-only client must not advertise HOP"
     );
 
-    let stream = initiator
+    let (conn, stream) = initiator
         .open_stream(&responder_peer, ECHO_PROTOCOL)
         .expect("open echo stream");
     let payload = b"bidirectional payload through Endpoint relay server".to_vec();
@@ -148,7 +148,7 @@ fn exercise_relay(
                     ..
                 } if peer_id == responder_peer && stream_id == stream => {
                     initiator
-                        .send_stream(&responder_peer, stream, payload.clone())
+                        .send_stream(&responder_peer, conn, stream, payload.clone())
                         .unwrap();
                 }
                 EndpointEvent::StreamData {
@@ -166,21 +166,23 @@ fn exercise_relay(
             match event {
                 EndpointEvent::StreamReady {
                     peer_id,
+                    conn_id,
                     stream_id,
                     initiated_locally: false,
                     protocol_id,
-                    ..
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
-                    responder_stream = Some(stream_id);
+                    responder_stream = Some((conn_id, stream_id));
                 }
                 EndpointEvent::StreamData {
                     peer_id,
+                    conn_id,
                     stream_id,
                     data,
-                    ..
-                } if peer_id == initiator_peer && Some(stream_id) == responder_stream => {
+                } if peer_id == initiator_peer
+                    && Some((conn_id, stream_id)) == responder_stream =>
+                {
                     responder
-                        .send_stream(&initiator_peer, stream_id, data)
+                        .send_stream(&initiator_peer, conn_id, stream_id, data)
                         .unwrap();
                 }
                 _ => {}

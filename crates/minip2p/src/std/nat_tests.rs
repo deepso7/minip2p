@@ -88,7 +88,7 @@ fn negotiated_bridge() -> BridgePair {
     }
     let inner_conn = inner_conn.expect("local connection id");
     let relay_conn = relay_conn.expect("relay connection id");
-    let stream = local
+    let (_, stream) = local
         .open_stream(relay_addr.peer_id(), HOP_PROTOCOL_ID)
         .expect("open bridge stream");
     let mut local_stream_ready = false;

@@ -393,11 +393,14 @@ impl Endpoint {
     ///
     /// Every `/ip4` and `/ip6` candidate is dialed immediately, and the relay
     /// leg (when there is one) starts at once. Candidate completion order is
-    /// not a public contract. The swarm still keeps a
-    /// single connection per peer: a race loser that finishes after the winner
-    /// may replace it ([`EndpointEvent::ConnectionReplaced`]). The attempt is
-    /// already settled at the first established connection (including a
-    /// simultaneous inbound), and the app sees the hand-over as an ordinary
+    /// not a public contract. The swarm still keeps a single connection per
+    /// peer, chosen the same way on both sides when candidates race (see
+    /// [`SIMULTANEOUS_DIAL_WINDOW_MS`](minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS)):
+    /// a candidate that finishes after the winner may still replace it
+    /// ([`EndpointEvent::ConnectionReplaced`]), so candidates that could still
+    /// win stay open until that window ends. The attempt is settled at the first
+    /// established connection the swarm keeps (including a simultaneous
+    /// inbound), and the app sees any later hand-over as an ordinary
     /// connection event.
     ///
     /// Candidates may name the IP family explicitly (`/ip4`, `/ip6`) or a
@@ -503,8 +506,11 @@ impl Endpoint {
         self.swarm.ping(peer_id)
     }
 
-    /// Closes the active connection to `peer_id`.
+    /// Closes the active connection to `peer_id`, aborting any dials still
+    /// kept open for its simultaneous dial so none of them reconnects it.
     pub fn disconnect(&mut self, peer_id: &PeerId) -> Result<(), Error> {
+        self.connect
+            .abort_retained(peer_id, self.swarm.runtime_mut());
         self.swarm.disconnect(peer_id)
     }
 
@@ -594,41 +600,52 @@ impl Endpoint {
     /// Allowed once the peer is connected. Identify (`PeerReady`) is not
     /// required first; after Identify completes, an unsupported protocol can
     /// fail early with [`SwarmError::RemoteDoesNotSupport`].
-    pub fn open_stream(&mut self, peer_id: &PeerId, protocol_id: &str) -> Result<StreamId, Error> {
-        self.swarm.open_stream(peer_id, protocol_id)
-    }
-
-    /// Opens an application stream and returns its connection and stream ids.
-    pub fn open_stream_with_connection(
+    ///
+    /// Returns the connection and stream ids. Stream ids are only unique per
+    /// connection, so every later stream operation takes both.
+    pub fn open_stream(
         &mut self,
         peer_id: &PeerId,
         protocol_id: &str,
     ) -> Result<(ConnectionId, StreamId), Error> {
-        self.swarm.open_stream_with_connection(peer_id, protocol_id)
+        self.swarm.open_stream(peer_id, protocol_id)
     }
 
     /// Sends bytes on a negotiated application stream.
+    ///
+    /// Fails with [`SwarmError::StreamNotFound`] if `conn_id` is no longer
+    /// the peer's connection holding the stream (for example after
+    /// `ConnectionReplaced`), so a write never reaches a same-numbered stream
+    /// on a newer connection. The other stream operations behave the same.
     pub fn send_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         data: impl Into<Vec<u8>>,
     ) -> Result<(), Error> {
-        self.swarm.send_stream(peer_id, stream_id, data.into())
+        self.swarm
+            .send_stream(peer_id, conn_id, stream_id, data.into())
     }
 
     /// Half-closes the local write side of an application stream.
     pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), Error> {
-        self.swarm.close_stream_write(peer_id, stream_id)
+        self.swarm.close_stream_write(peer_id, conn_id, stream_id)
     }
 
     /// Resets an application stream.
-    pub fn reset_stream(&mut self, peer_id: &PeerId, stream_id: StreamId) -> Result<(), Error> {
-        self.swarm.reset_stream(peer_id, stream_id)
+    pub fn reset_stream(
+        &mut self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), Error> {
+        self.swarm.reset_stream(peer_id, conn_id, stream_id)
     }
 
     /// Resets and forgets an application stream that will no longer be consumed.
@@ -636,10 +653,15 @@ impl Endpoint {
     /// Unlike [`Endpoint::reset_stream`], this also discards matching events
     /// already buffered by the endpoint and suppresses later data, EOF, and
     /// close events for the stream. Repeated calls are idempotent.
-    pub fn abandon_stream(&mut self, peer_id: &PeerId, stream_id: StreamId) -> Result<(), Error> {
-        self.swarm.abandon_stream(peer_id, stream_id)?;
+    pub fn abandon_stream(
+        &mut self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), Error> {
+        self.swarm.abandon_stream(peer_id, conn_id, stream_id)?;
         self.pending_events
-            .retain(|event| !event.matches_stream(peer_id, stream_id));
+            .retain(|event| !event.matches_stream(peer_id, conn_id, stream_id));
         Ok(())
     }
 
@@ -3262,7 +3284,7 @@ mod tests {
     #[test]
     fn a_peer_is_reached_over_the_transport_its_address_names() {
         // One peer per transport: the swarm keeps a single connection per
-        // peer, so two paths to one host would be the second superseding the
+        // peer, so two paths to one host would be the second replacing the
         // first rather than a test of which path each address took.
         let mut over_tcp = Endpoint::builder()
             .listen_on("/ip4/127.0.0.1/tcp/0")

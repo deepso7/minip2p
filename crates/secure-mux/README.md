@@ -36,7 +36,7 @@ loop {
     while let Some(output) = session.poll_output() {
         match output {
             SessionOutput::Write(bytes) => stream.write_all(&bytes)?,
-            SessionOutput::Established { peer } => { /* connection policy */ }
+            SessionOutput::Established { peer, .. } => { /* connection policy */ }
             SessionOutput::IncomingStream { stream } => { /* accept substream */ }
             SessionOutput::StreamData { stream, data } => { /* deliver */ }
             SessionOutput::StreamRemoteWriteClosed { stream } => { /* half close */ }
@@ -51,7 +51,7 @@ Substreams are driven with `open_stream`, `send`, `close_stream_write`, and `res
 
 ## Policy stays with the caller
 
-`SessionOutput::Established` reports that the upgrade finished and the remote identity is cryptographically verified. It deliberately does **not** decide whether the connection should be kept.
+`SessionOutput::Established` reports that the upgrade finished and the remote identity is cryptographically verified. It also carries the final Noise handshake hash, which both ends of the session share, so a host can name the connection identically on either side (the TCP transport uses it as its `ConnectionToken`). It deliberately does **not** decide whether the connection should be kept.
 
 That matters because hosts differ: one races a direct dial against a relayed one and drops the loser, another de-duplicates connections per peer, an embedded node may accept whatever arrives. The session reports the verified peer and lets the caller apply its own rule, tearing the session down if it loses. `Established` is ordered ahead of any substream output, so a caller always sees the peer before it has to decide anything about a stream.
 

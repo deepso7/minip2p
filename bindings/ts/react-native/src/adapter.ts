@@ -1,6 +1,6 @@
 /* oxlint-disable class-methods-use-this, complexity, func-style, max-classes-per-file, no-use-before-define -- The adapter keeps its contract-complete native endpoint and public SDK subclass together, and uses hoisted conversion helpers. */
 
-import { Minip2pBase } from "@minip2p/core";
+import { Minip2pBase, StreamClosedError } from "@minip2p/core";
 import type {
   Bytes,
   ConnectionInfo,
@@ -212,34 +212,49 @@ class ReactNativeBackend implements Minip2pBackend {
     };
   }
 
-  sendStream(peerId: string, streamId: number, data: Uint8Array): void {
+  sendStream(
+    peerId: string,
+    connId: number,
+    streamId: number,
+    data: Uint8Array
+  ): void {
     translateErrors(() => {
       this.#endpoint.sendStream(
         peerId,
+        this.#connectionIds.toNative(connId),
         numberToU64(streamId, "streamId"),
         toArrayBuffer(data)
       );
     });
   }
 
-  closeStreamWrite(peerId: string, streamId: number): void {
+  closeStreamWrite(peerId: string, connId: number, streamId: number): void {
     translateErrors(() => {
       this.#endpoint.closeStreamWrite(
         peerId,
+        this.#connectionIds.toNative(connId),
         numberToU64(streamId, "streamId")
       );
     });
   }
 
-  resetStream(peerId: string, streamId: number): void {
+  resetStream(peerId: string, connId: number, streamId: number): void {
     translateErrors(() => {
-      this.#endpoint.resetStream(peerId, numberToU64(streamId, "streamId"));
+      this.#endpoint.resetStream(
+        peerId,
+        this.#connectionIds.toNative(connId),
+        numberToU64(streamId, "streamId")
+      );
     });
   }
 
-  abandonStream(peerId: string, streamId: number): void {
+  abandonStream(peerId: string, connId: number, streamId: number): void {
     translateErrors(() => {
-      this.#endpoint.abandonStream(peerId, numberToU64(streamId, "streamId"));
+      this.#endpoint.abandonStream(
+        peerId,
+        this.#connectionIds.toNative(connId),
+        numberToU64(streamId, "streamId")
+      );
     });
   }
 
@@ -310,11 +325,12 @@ export function circuitAddress(relayAddress: string, peerId: string): string {
  * through a JavaScript `number`. Each endpoint owns one map so a native ID
  * resolves to the same public ID in events and synchronous results. An entry
  * is released once its `ConnectionClosed`, or the `ConnectionReplaced` that
- * retires it, is normalized, which bounds the map by live connections. Public numbers come from a counter that never
- * repeats, so an event arriving after the release gets a fresh number instead
- * of aliasing a live connection. Stream and connect-attempt IDs are not
- * mapped because they round-trip into native calls, and native allocates
- * them well inside the safe integer range.
+ * retires it, is normalized, which bounds the map by live connections. Public
+ * numbers come from a counter that never repeats, so an event arriving after
+ * the release gets a fresh number instead of aliasing a live connection.
+ * Stream operations map the public ID back to native. Stream and
+ * connect-attempt IDs are not mapped because native allocates them well
+ * inside the safe integer range.
  */
 class ConnectionIdMap {
   readonly #publicByNative = new Map<bigint, number>();
@@ -331,6 +347,20 @@ class ConnectionIdMap {
     this.#publicByNative.set(native, publicId);
     this.#nativeByPublic.set(publicId, native);
     return publicId;
+  }
+
+  /**
+   * The native ID behind a public one. Stream operations pass it back so
+   * native rejects a stream whose connection it already replaced. A released
+   * connection throws `StreamClosedError`: its stream operation can run after
+   * the release but before the SDK dispatches the ending event.
+   */
+  toNative(publicId: number): bigint {
+    const native = this.#nativeByPublic.get(publicId);
+    if (native === undefined) {
+      throw new StreamClosedError("The stream's connection ended");
+    }
+    return native;
   }
 
   release(publicId: number): void {

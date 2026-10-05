@@ -249,8 +249,7 @@ fn dial_failure_after_the_relay_became_ready_is_ignored() {
     assert!(has_hop_open(&drain_actions(&mut w.agent)));
 
     // The attempt's own dial to A fails afterwards.
-    w.agent
-        .dial_result(a_token, Err("superseded".into()), at(20));
+    w.agent.dial_result(a_token, Err("replaced".into()), at(20));
     assert_eq!(
         dial_count_for(&drain_actions(&mut w.agent), &w.b),
         0,
@@ -274,8 +273,7 @@ fn dial_failure_while_the_relay_is_connected_waits_for_peer_ready() {
         },
         at(10),
     );
-    w.agent
-        .dial_result(a_token, Err("superseded".into()), at(20));
+    w.agent.dial_result(a_token, Err("replaced".into()), at(20));
     assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.b), 0);
     assert!(drain_events(&mut w.agent).is_empty());
 

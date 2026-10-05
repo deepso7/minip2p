@@ -10,7 +10,7 @@
 | Identify readiness and snapshots | `isPeerReady`, `waitPeerReady` (follows the peer's current connection), `peerInfo`, `connectionInfo(peerId).readyProtocols`, Identify events |
 | Connection lifecycle | `connectionEstablished`, `connectionReplaced` (the peer stays connected; streams on the old connection end), and `connectionClosed` (the peer disconnected) events |
 | Custom protocol registration | `protocols` configuration, `addProtocol` |
-| Negotiated streams | Promise-returning `openStream` and `Stream` handles with `write`, `read`, `closeWrite`, `reset`, and `abandon` |
+| Negotiated streams | Promise-returning `openStream` and `Stream` handles with `write`, `read`, `closeWrite`, `reset`, and `abandon`; each operation names the stream's own connection, so it never reaches a stream on a newer connection. Before the endpoint processes a replacement or close, `write`, `closeWrite`, and `reset` on the old connection throw; afterwards the stream has ended: `write` throws, `closeWrite`, `reset`, and `abandon` do nothing, and reads reject (`StreamClosedError` after a replacement) |
 | Connection targets and Connect IDs | Promise-returning `connect(target)`, split-phase `startConnect(target)`/`waitConnectResult`/`cancelConnect`, and typed terminal events |
 | Relay, AutoNAT, DCUtR | Driven by `connect`; `path(peerId)` and typed path/reachability events |
 | State snapshots | `connectedPeers`, `path`, `connectionInfo`, `knownPeers`, `listenAddrs`, `activeReservation` |

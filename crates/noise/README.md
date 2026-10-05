@@ -7,3 +7,5 @@ The crate is Sans-I/O and supports `no_std + alloc`. Callers provide fresh X2551
 Handshake payload field framing uses the shared protobuf vocabulary in `minip2p-core`. Identity-binding rules, duplicate-field checks, field-number policy, and contextual `NoiseError` values stay in this crate.
 
 Transport plaintext is automatically segmented at 65,519 bytes so every encrypted message, including its 16-byte authentication tag, fits the 65,535 byte wire-frame limit. Each segment is copied once into its outbound frame and encrypted there; received frames are decrypted in place, and a received buffer holding exactly one frame is reused rather than reallocated.
+
+Once the handshake completes, `NoiseSession::handshake_hash` returns the final handshake hash `h`. Both ends compute the same value, so it names the session on either side (channel binding, in Noise terms).

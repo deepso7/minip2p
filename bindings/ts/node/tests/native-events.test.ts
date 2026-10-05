@@ -32,7 +32,12 @@ describe("native event payloads", () => {
       waitForEvent(a, "StreamReady"),
       waitForEvent(b, "StreamReady"),
     ]);
-    a.sendStream(b.peerId(), stream.streamId, Uint8Array.of(0, 127, 255));
+    a.sendStream(
+      b.peerId(),
+      stream.connId,
+      stream.streamId,
+      Uint8Array.of(0, 127, 255)
+    );
 
     const event = await waitForEvent(b, "StreamData");
     const data = Reflect.get(event.inner, "data");

@@ -24,6 +24,16 @@ mod portable;
 mod pubsub;
 #[cfg(feature = "std")]
 mod std;
+// The NAT and pubsub drivers' users; the `pubsub` arm repeats the
+// `mod pubsub` gate above — keep them in sync.
+#[cfg(any(
+    feature = "_nat-driver",
+    all(
+        feature = "pubsub",
+        any(feature = "std", feature = "smoltcp", feature = "portable-mdns")
+    )
+))]
+mod stream_conns;
 
 pub use portable::*;
 #[cfg(all(feature = "pubsub", any(feature = "std", feature = "smoltcp")))]

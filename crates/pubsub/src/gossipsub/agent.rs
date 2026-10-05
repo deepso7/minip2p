@@ -871,8 +871,11 @@ impl GossipsubAgent {
         });
     }
 
+    /// Drops everything known about `peer` except its backoff, reporting its
+    /// dropped queued work and one `PeerUnsubscribed` per topic it announced:
+    /// those subscriptions lapse with the connection that carried them.
     fn remove_peer(&mut self, peer: &PeerId, cause: &str) {
-        if let Some(state) = self.peers.get(peer) {
+        if let Some(state) = self.peers.remove(peer) {
             let dropped = state.queued_work();
             if dropped > 0 {
                 self.events.push_back(GossipsubEvent::OutboundFailure {
@@ -880,8 +883,13 @@ impl GossipsubAgent {
                     reason: format!("{cause}; dropped {dropped} queued items"),
                 });
             }
+            for topic in state.remote_topics {
+                self.events.push_back(GossipsubEvent::PeerUnsubscribed {
+                    peer: peer.clone(),
+                    topic,
+                });
+            }
         }
-        self.peers.remove(peer);
         self.roles.remove(peer);
         self.ihave_budget.remove(peer);
         self.iwant_served.remove(peer);

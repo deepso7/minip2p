@@ -284,6 +284,13 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         self.core.connection_id(peer_id)
     }
 
+    /// Whether `conn_id`, while it is some peer's current connection, came
+    /// from one of our dials. `None` once it no longer holds a slot (not
+    /// "inbound"); see [`SwarmCore::is_outbound`].
+    pub fn is_outbound(&self, conn_id: ConnectionId) -> Option<bool> {
+        self.core.is_outbound(conn_id)
+    }
+
     /// Returns whether `peer_id` has been surfaced to the application as
     /// connected — pending dials do not count.
     pub fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
@@ -447,18 +454,10 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     /// [`SwarmEvent::StreamReady`] event fires with the allocated
     /// stream id; subsequent stream data arrives as
     /// [`SwarmEvent::StreamData`].
+    ///
+    /// Returns the stream's full identity: stream ids are only unique per
+    /// connection, so later stream operations take both.
     pub fn open_stream(
-        &mut self,
-        peer_id: &PeerId,
-        protocol_id: &str,
-        now_ms: u64,
-    ) -> Result<StreamId, DriverError> {
-        self.open_stream_with_connection(peer_id, protocol_id, now_ms)
-            .map(|(_, stream_id)| stream_id)
-    }
-
-    /// Opens an application stream and returns its full transport identity.
-    pub fn open_stream_with_connection(
         &mut self,
         peer_id: &PeerId,
         protocol_id: &str,
@@ -534,6 +533,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     pub fn send_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         data: Vec<u8>,
         now_ms: u64,
@@ -543,7 +543,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         // `Swarm::open_stream`).
         self.flush_actions(now_ms);
 
-        self.core.send_stream(peer_id, stream_id, data)?;
+        self.core.send_stream(peer_id, conn_id, stream_id, data)?;
 
         // Dispatch this call's own actions synchronously, capturing a
         // transport rejection. Callers that commit state once a stream
@@ -582,10 +582,11 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         now_ms: u64,
     ) -> Result<(), DriverError> {
-        self.core.close_stream_write(peer_id, stream_id)?;
+        self.core.close_stream_write(peer_id, conn_id, stream_id)?;
         self.flush_actions(now_ms);
         Ok(())
     }
@@ -594,10 +595,11 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     pub fn reset_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         now_ms: u64,
     ) -> Result<(), DriverError> {
-        self.core.reset_stream(peer_id, stream_id)?;
+        self.core.reset_stream(peer_id, conn_id, stream_id)?;
         self.flush_actions(now_ms);
         Ok(())
     }
@@ -617,12 +619,13 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     pub fn abandon_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         now_ms: u64,
     ) -> Result<(), DriverError> {
-        let result = self.core.abandon_stream(peer_id, stream_id);
+        let result = self.core.abandon_stream(peer_id, conn_id, stream_id);
         self.event_buffer
-            .retain(|event| !event.matches_stream(peer_id, stream_id));
+            .retain(|event| !event.matches_stream(peer_id, conn_id, stream_id));
         result?;
         self.flush_actions(now_ms);
         Ok(())

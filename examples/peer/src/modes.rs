@@ -13,8 +13,8 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectId, ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, NatConfig, NatEvent,
-    Path, PeerAddr, PeerId, StreamId,
+    ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome,
+    NatConfig, NatEvent, Path, PeerAddr, PeerId, StreamId,
 };
 
 use minip2p_example_common::{
@@ -22,6 +22,9 @@ use minip2p_example_common::{
 };
 
 use crate::cli::{DialTarget, RunOptions, print_event};
+
+/// An echo stream: the peer it lives on, its connection, and its id.
+type EchoStream = (PeerId, ConnectionId, StreamId);
 
 const AGENT: &str = "minip2p-peer/0.1.0";
 /// Echo protocol: the listener returns every byte unchanged.
@@ -150,9 +153,9 @@ pub fn run_listen(relay: Option<PeerAddr>, options: RunOptions) -> Result<(), Bo
     }
     println!("[listen] us={}", endpoint.peer_id());
 
-    // Echo streams we own, keyed by the peer the stream lives on — the
-    // dialing peer for direct streams, the relay for bridged circuits.
-    let mut echo_streams: HashSet<(PeerId, StreamId)> = HashSet::new();
+    // Echo streams we own, keyed by the peer the stream lives on (the
+    // dialing peer for direct streams, the relay for bridged circuits).
+    let mut echo_streams: HashSet<EchoStream> = HashSet::new();
 
     if let Some(relay) = relays.first() {
         wait_for_reservation(&mut endpoint, relay, &mut echo_streams)?;
@@ -178,7 +181,7 @@ pub fn run_listen(relay: Option<PeerAddr>, options: RunOptions) -> Result<(), Bo
 fn wait_for_reservation(
     endpoint: &mut Endpoint,
     relay: &PeerAddr,
-    echo_streams: &mut HashSet<(PeerId, StreamId)>,
+    echo_streams: &mut HashSet<EchoStream>,
 ) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + RESERVATION_DEADLINE;
     loop {
@@ -210,7 +213,7 @@ fn dispatch_listen_event(
     endpoint: &mut Endpoint,
     event: &EndpointEvent,
     relay: Option<&PeerAddr>,
-    echo_streams: &mut HashSet<(PeerId, StreamId)>,
+    echo_streams: &mut HashSet<EchoStream>,
 ) {
     print_event("listen", event);
     if let EndpointEvent::Nat(NatEvent::RelayReserved { .. }) = event
@@ -227,38 +230,57 @@ fn dispatch_listen_event(
 fn handle_listen_event(
     endpoint: &mut Endpoint,
     event: &EndpointEvent,
-    echo_streams: &mut HashSet<(PeerId, StreamId)>,
+    echo_streams: &mut HashSet<EchoStream>,
 ) {
     match event {
         EndpointEvent::StreamReady {
             peer_id,
+            conn_id,
             stream_id,
             protocol_id,
             initiated_locally: false,
-            ..
         } if protocol_id == ECHO_PROTOCOL => {
-            echo_streams.insert((peer_id.clone(), *stream_id));
+            echo_streams.insert((peer_id.clone(), *conn_id, *stream_id));
         }
         EndpointEvent::StreamData {
             peer_id,
+            conn_id,
             stream_id,
             data,
-            ..
-        } if echo_streams.contains(&(peer_id.clone(), *stream_id)) => {
-            echo_bytes(endpoint, peer_id, *stream_id, data, echo_streams);
+        } => {
+            let key = (peer_id.clone(), *conn_id, *stream_id);
+            if echo_streams.contains(&key) {
+                echo_bytes(endpoint, key, data, echo_streams);
+            }
         }
         EndpointEvent::StreamRemoteWriteClosed {
-            peer_id, stream_id, ..
-        } if echo_streams.contains(&(peer_id.clone(), *stream_id)) => {
-            if let Err(error) = endpoint.close_stream_write(peer_id, *stream_id) {
+            peer_id,
+            conn_id,
+            stream_id,
+        } => {
+            let key = (peer_id.clone(), *conn_id, *stream_id);
+            if echo_streams.remove(&key)
+                && let Err(error) = endpoint.close_stream_write(peer_id, *conn_id, *stream_id)
+            {
                 eprintln!("[listen] echo close failed peer={peer_id} stream={stream_id}: {error}");
             }
-            echo_streams.remove(&(peer_id.clone(), *stream_id));
         }
         EndpointEvent::StreamClosed {
-            peer_id, stream_id, ..
+            peer_id,
+            conn_id,
+            stream_id,
         } => {
-            echo_streams.remove(&(peer_id.clone(), *stream_id));
+            echo_streams.remove(&(peer_id.clone(), *conn_id, *stream_id));
+        }
+        // A closed or replaced connection ends its streams without
+        // per-stream `StreamClosed` events, so untrack them all here.
+        EndpointEvent::ConnectionClosed { peer_id, conn_id }
+        | EndpointEvent::ConnectionReplaced {
+            peer_id,
+            old: conn_id,
+            ..
+        } => {
+            echo_streams.retain(|(peer, conn, _)| peer != peer_id || conn != conn_id);
         }
         _ => {}
     }
@@ -268,14 +290,14 @@ fn handle_listen_event(
 /// died under us, so it is just untracked.
 fn echo_bytes(
     endpoint: &mut Endpoint,
-    peer: &PeerId,
-    stream: StreamId,
+    key: EchoStream,
     data: &[u8],
-    echo_streams: &mut HashSet<(PeerId, StreamId)>,
+    echo_streams: &mut HashSet<EchoStream>,
 ) {
-    if let Err(e) = endpoint.send_stream(peer, stream, data.to_vec()) {
+    let (peer, conn, stream) = &key;
+    if let Err(e) = endpoint.send_stream(peer, *conn, *stream, data.to_vec()) {
         eprintln!("[listen] echo failed peer={peer} stream={stream}: {e}");
-        echo_streams.remove(&(peer.clone(), stream));
+        echo_streams.remove(&key);
     }
 }
 
@@ -286,6 +308,7 @@ struct Channel {
     /// Peer addressed in `send_stream`: the relay for a bridge, the target
     /// itself for a direct stream.
     send_peer: PeerId,
+    conn: ConnectionId,
     stream: StreamId,
     direct: bool,
 }
@@ -293,6 +316,11 @@ struct Channel {
 impl Channel {
     fn name(&self) -> &'static str {
         if self.direct { "direct" } else { "relayed" }
+    }
+
+    /// Whether a stream event names this channel's stream.
+    fn carries(&self, peer: &PeerId, conn: ConnectionId, stream: StreamId) -> bool {
+        *peer == self.send_peer && conn == self.conn && stream == self.stream
     }
 }
 
@@ -460,7 +488,7 @@ fn open_echo_stream(
     endpoint: &mut Endpoint,
     peer: &PeerId,
     deadline: Instant,
-) -> Result<StreamId, Box<dyn Error>> {
+) -> Result<(ConnectionId, StreamId), Box<dyn Error>> {
     while !endpoint.is_peer_ready(peer) {
         match endpoint
             .wait(deadline)
@@ -473,7 +501,7 @@ fn open_echo_stream(
             }
         }
     }
-    let stream = endpoint
+    let (conn, stream) = endpoint
         .open_stream(peer, ECHO_PROTOCOL)
         .map_err(|e| format!("open echo stream: {e}"))?;
     loop {
@@ -487,20 +515,21 @@ fn open_echo_stream(
         };
         match &event {
             EndpointEvent::StreamReady {
-                peer_id, stream_id, ..
-            } if peer_id == peer && *stream_id == stream => return Ok(stream),
-            EndpointEvent::ConnectionEstablished { peer_id, .. } if peer_id == peer => {
+                peer_id,
+                conn_id,
+                stream_id,
+                ..
+            } if peer_id == peer && *conn_id == conn && *stream_id == stream => {
+                return Ok((conn, stream));
+            }
+            EndpointEvent::ConnectionReplaced { peer_id, old, .. }
+                if peer_id == peer && *old == conn =>
+            {
                 print_event("dial", &event);
                 // A second punch connection just replaced the one this
-                // stream was opened on — the swarm keeps the newcomer and
-                // silently drops the stream, so its `StreamReady` will
-                // never arrive. Abandon it and let the caller retry on the
-                // settled connection. (The caller drained stale
-                // establishments before opening, so this only fires for a
-                // genuine replacement racing the setup.)
-                if let Err(error) = endpoint.reset_stream(peer, stream) {
-                    eprintln!("[dial] failed to reset replaced echo stream: {error}");
-                }
+                // stream was opened on; the stream ended with it, so its
+                // `StreamReady` will never arrive. Let the caller retry on
+                // the new connection right away.
                 return Err("connection replaced during echo stream setup".into());
             }
             _ => print_event("dial", &event),
@@ -546,33 +575,27 @@ fn open_direct_channel(
 ) -> Result<Channel, Box<dyn Error>> {
     let setup = Instant::now() + SETUP_DEADLINE;
     let deadline = drain_deadline.map_or(setup, |drain| drain.min(setup));
-    // `PathEstablished` and `PathUpgraded` can land before the connection's
-    // own `ConnectionEstablished` is taken from the Endpoint event stream.
-    // Drain what is already queued before opening the stream, so a stale
-    // establishment cannot masquerade as a superseding punch connection —
-    // that would burn the stream and force a needless retry on every plain
-    // direct dial.
-    for event in endpoint
-        .poll()
-        .map_err(|e| format!("draining queued events: {e}"))?
-    {
-        print_event("dial", &event);
-    }
-    let stream = open_echo_stream(endpoint, peer, deadline)?;
+    let (conn, stream) = open_echo_stream(endpoint, peer, deadline)?;
     let channel = Channel {
         send_peer: peer.clone(),
+        conn,
         stream,
         direct: true,
     };
     for &missing in outstanding {
         let frame = encode_frame(missing, millis_since(start));
         endpoint
-            .send_stream(&channel.send_peer, channel.stream, frame.to_vec())
+            .send_stream(
+                &channel.send_peer,
+                channel.conn,
+                channel.stream,
+                frame.to_vec(),
+            )
             .map_err(|e| format!("resend on direct channel: {e}"))?;
     }
     if drain_deadline.is_some() {
         endpoint
-            .close_stream_write(&channel.send_peer, channel.stream)
+            .close_stream_write(&channel.send_peer, channel.conn, channel.stream)
             .map_err(|e| format!("close after channel switch: {e}"))?;
     }
     Ok(channel)
@@ -622,13 +645,17 @@ fn ping_loop(
             seq += 1;
             outstanding.insert(seq);
             let frame = encode_frame(seq, millis_since(start));
-            if let Err(e) = endpoint.send_stream(&channel.send_peer, channel.stream, frame.to_vec())
-            {
+            if let Err(e) = endpoint.send_stream(
+                &channel.send_peer,
+                channel.conn,
+                channel.stream,
+                frame.to_vec(),
+            ) {
                 if !channel.direct || reopens_left == 0 {
                     stats.print_summary();
                     return Err(format!("ping send: {e}").into());
                 }
-                // A punch race can supersede the direct connection moments
+                // A punch race can replace the direct connection moments
                 // after the upgrade; the stream dies silently and this send
                 // is the first to notice. Reopen on the surviving connection
                 // — the reopen resends every outstanding seq, this one
@@ -664,7 +691,7 @@ fn ping_loop(
                 // Graceful teardown: half-close so the listener echoes
                 // everything already sent, then mirrors the close.
                 endpoint
-                    .close_stream_write(&channel.send_peer, channel.stream)
+                    .close_stream_write(&channel.send_peer, channel.conn, channel.stream)
                     .map_err(|e| format!("close after final ping: {e}"))?;
                 drain_deadline = Some(Instant::now() + DRAIN_DEADLINE);
             }
@@ -674,10 +701,10 @@ fn ping_loop(
         match &event {
             EndpointEvent::StreamData {
                 peer_id,
+                conn_id,
                 stream_id,
                 data,
-                ..
-            } if *peer_id == channel.send_peer && *stream_id == channel.stream => {
+            } if channel.carries(peer_id, *conn_id, *stream_id) => {
                 frames.push(data);
                 while let Some(frame) = frames.pop() {
                     let (pong_seq, sent_at_ms) = decode_frame(&frame);
@@ -703,11 +730,15 @@ fn ping_loop(
                 }
             }
             EndpointEvent::StreamRemoteWriteClosed {
-                peer_id, stream_id, ..
+                peer_id,
+                conn_id,
+                stream_id,
             }
             | EndpointEvent::StreamClosed {
-                peer_id, stream_id, ..
-            } if *peer_id == channel.send_peer && *stream_id == channel.stream => {
+                peer_id,
+                conn_id,
+                stream_id,
+            } if channel.carries(peer_id, *conn_id, *stream_id) => {
                 print_event("dial", &event);
                 if drain_deadline.is_some() {
                     stats.print_summary();
@@ -741,7 +772,7 @@ fn ping_loop(
                 return Err("ping channel closed".into());
             }
             // Connection lifecycle is connection-scoped, while this channel
-            // is peer-scoped. During QUIC supersession the old circuit can
+            // is peer-scoped. During a QUIC Connection replacement the old circuit can
             // close just before the replacement direct connection is
             // delivered. The matching StreamClosed event (or a failed send)
             // is the authoritative signal that this channel itself died.

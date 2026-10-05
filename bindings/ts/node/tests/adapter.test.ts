@@ -5,7 +5,8 @@ import { describeAdapterContract } from "@minip2p/test-fixtures/adapter-contract
 import type { NativeEventLiteral } from "@minip2p/test-fixtures/adapter-contract";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { Minip2p } from "../src/adapter";
+import { Minip2p } from "../src/adapter.js";
+import type { NativeEndpoint } from "../src/native.js";
 
 const native = vi.hoisted(() => {
   interface Event {
@@ -13,11 +14,17 @@ const native = vi.hoisted(() => {
     readonly tag?: string;
   }
 
-  class FakeNativeEndpoint {
+  class FakeNativeEndpoint implements NativeEndpoint {
     static latest: FakeNativeEndpoint | undefined;
 
     readonly config: Readonly<Record<string, unknown>>;
-    readonly abandonedStreams: { peerId: string; streamId: bigint }[] = [];
+    readonly abandonedStreams: {
+      peerId: string;
+      connId: bigint;
+      streamId: bigint;
+    }[] = [];
+    readonly writes: { connId: bigint; streamId: bigint }[] = [];
+    liveConnId: bigint | undefined;
     readonly cancelledConnects: bigint[] = [];
     readonly connectTargets: (string | string[])[] = [];
     connection: {
@@ -77,8 +84,8 @@ const native = vi.hoisted(() => {
 
     addProtocol(): void {}
 
-    abandonStream(peerId: string, streamId: bigint): void {
-      this.abandonedStreams.push({ peerId, streamId });
+    abandonStream(peerId: string, connId: bigint, streamId: bigint): void {
+      this.abandonedStreams.push({ connId, peerId, streamId });
       if (this.abandonError !== undefined) {
         throw this.abandonError;
       }
@@ -153,7 +160,19 @@ const native = vi.hoisted(() => {
 
     resetStream(): void {}
 
-    sendStream(): void {}
+    sendStream(
+      _peerId: string,
+      connId: bigint,
+      streamId: bigint,
+      _data: Uint8Array
+    ): void {
+      if (this.liveConnId !== undefined && connId !== this.liveConnId) {
+        throw new Error(
+          `stream ${streamId} on connection ${connId} is not active`
+        );
+      }
+      this.writes.push({ connId, streamId });
+    }
 
     setActive(): void {}
 
@@ -269,7 +288,10 @@ describe("Node adapter", () => {
     await settle();
 
     expect(received[0]).toBe(exact.buffer);
-    expect([...new Uint8Array(received[1])]).toEqual([4, 5]);
+    expect(received.map((data) => [...new Uint8Array(data)])).toEqual([
+      [1, 2, 3],
+      [4, 5],
+    ]);
     expect(received[1]).not.toBe(backing.buffer);
     endpoint.close();
   });
@@ -547,7 +569,7 @@ describe("Node adapter", () => {
     await settle();
 
     expect(fake.abandonedStreams).toEqual([
-      { peerId: "remote", streamId: 20n },
+      { connId: 10n, peerId: "remote", streamId: 20n },
     ]);
     expect(peers).toEqual(["after"]);
     endpoint.close();
@@ -586,9 +608,13 @@ describeAdapterContract("Node", {
       setConnectionInfo: (info) => {
         fake.connection = info;
       },
+      setLiveConnection: (connId) => {
+        fake.liveConnId = connId;
+      },
       setNextStream: (connId, streamId) => {
         fake.nextStream = { connId, streamId };
       },
+      writes: fake.writes,
     };
   },
 });

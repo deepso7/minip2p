@@ -166,10 +166,13 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     ///
     /// Every candidate is dialed immediately. Candidate completion order is
     /// not a public contract. The swarm still keeps a single connection per
-    /// peer: a race loser that finishes after the winner may replace it
-    /// ([`EndpointEvent::ConnectionReplaced`]). The attempt is already
-    /// settled at the first established connection (including a
-    /// simultaneous inbound), and the app sees the hand-over as an ordinary
+    /// peer, chosen the same way on both sides when candidates race (see
+    /// [`SIMULTANEOUS_DIAL_WINDOW_MS`](minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS)):
+    /// a candidate that finishes after the winner may still replace it
+    /// ([`EndpointEvent::ConnectionReplaced`]), so candidates that could still
+    /// win stay open until that window ends. The attempt is settled at the first
+    /// established connection the swarm keeps (including a simultaneous
+    /// inbound), and the app sees any later hand-over as an ordinary
     /// connection event.
     #[expect(
         clippy::result_large_err,
@@ -283,65 +286,76 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         self.runtime.ping(peer_id, now.monotonic_ms)
     }
 
-    /// Disconnects from a peer.
+    /// Disconnects from a peer, aborting any dials still kept open for its
+    /// simultaneous dial so none of them reconnects it.
     pub fn disconnect(&mut self, peer_id: &PeerId, now: Now) -> Result<(), DriverError> {
+        self.connect.abort_retained(peer_id, &mut self.runtime);
         self.runtime.disconnect(peer_id, now.monotonic_ms)
     }
 
-    /// Opens an outbound application stream.
+    /// Opens an outbound application stream and returns its connection and
+    /// stream ids; later stream operations take both.
     pub fn open_stream(
         &mut self,
         peer_id: &PeerId,
         protocol_id: &str,
         now: Now,
-    ) -> Result<StreamId, DriverError> {
+    ) -> Result<(ConnectionId, StreamId), DriverError> {
         self.runtime
             .open_stream(peer_id, protocol_id, now.monotonic_ms)
     }
 
     /// Sends bytes on an application stream.
+    ///
+    /// Fails with [`SwarmError::StreamNotFound`] if `conn_id` is no longer
+    /// the peer's connection holding the stream, as do the other stream
+    /// operations.
     pub fn send_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         data: Vec<u8>,
         now: Now,
     ) -> Result<(), DriverError> {
         self.runtime
-            .send_stream(peer_id, stream_id, data, now.monotonic_ms)
+            .send_stream(peer_id, conn_id, stream_id, data, now.monotonic_ms)
     }
 
     /// Half-closes the local write side of an application stream.
     pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
         self.runtime
-            .close_stream_write(peer_id, stream_id, now.monotonic_ms)
+            .close_stream_write(peer_id, conn_id, stream_id, now.monotonic_ms)
     }
 
     /// Abruptly resets an application stream.
     pub fn reset_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
         self.runtime
-            .reset_stream(peer_id, stream_id, now.monotonic_ms)
+            .reset_stream(peer_id, conn_id, stream_id, now.monotonic_ms)
     }
 
     /// Resets a stream and removes all swarm bookkeeping for it.
     pub fn abandon_stream(
         &mut self,
         peer_id: &PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
         self.runtime
-            .abandon_stream(peer_id, stream_id, now.monotonic_ms)
+            .abandon_stream(peer_id, conn_id, stream_id, now.monotonic_ms)
     }
 
     /// Returns a lightweight aggregate of durable state without driving the endpoint.

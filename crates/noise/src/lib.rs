@@ -175,6 +175,7 @@ pub struct NoiseSession {
     receive_cipher: Option<CipherState>,
     decoder: FrameDecoder,
     pending: VecDeque<NoiseOutput>,
+    handshake_hash: Option<[u8; 32]>,
     started: bool,
     failed: bool,
 }
@@ -194,6 +195,7 @@ impl NoiseSession {
             receive_cipher: None,
             decoder: FrameDecoder::new(),
             pending: VecDeque::new(),
+            handshake_hash: None,
             started: false,
             failed: false,
         }
@@ -202,6 +204,14 @@ impl NoiseSession {
     /// Returns whether the authenticated handshake has completed.
     pub fn is_handshake_complete(&self) -> bool {
         self.send_cipher.is_some() && self.receive_cipher.is_some()
+    }
+
+    /// Returns the final Noise handshake hash once the handshake completes.
+    ///
+    /// Both ends compute the same value, so it names this session on either
+    /// side (channel binding, in Noise terms).
+    pub fn handshake_hash(&self) -> Option<[u8; 32]> {
+        self.handshake_hash
     }
 
     fn start(&mut self) -> Result<(), NoiseError> {
@@ -255,6 +265,7 @@ impl NoiseSession {
     fn complete_handshake(&mut self, result: HandshakeResult) {
         self.send_cipher = Some(result.send);
         self.receive_cipher = Some(result.receive);
+        self.handshake_hash = Some(result.handshake_hash);
         self.handshake = None;
         self.pending.push_back(NoiseOutput::HandshakeComplete {
             peer: result.peer,
@@ -388,6 +399,16 @@ mod tests {
             NoiseOutput::HandshakeComplete { peer, .. } => peer,
             other => panic!("expected handshake completion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn both_ends_share_the_handshake_hash() {
+        let mut pair = Pair::new();
+        assert_eq!(pair.initiator.handshake_hash(), None);
+        pair.handshake();
+
+        let hash = pair.initiator.handshake_hash().expect("handshake complete");
+        assert_eq!(pair.responder.handshake_hash(), Some(hash));
     }
 
     #[test]

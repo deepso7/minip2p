@@ -51,6 +51,10 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
   publishError: Error | undefined = undefined;
   /** Value returned by `connectionInfo` for every peer. */
   connection: ConnectionInfo | undefined = undefined;
+  /** When set, `sendStream` rejects every other connection. */
+  liveConnId: bigint | undefined = undefined;
+  /** Writes `sendStream` accepted, in call order. */
+  readonly writes: { connId: bigint; streamId: bigint }[] = [];
   readonly #batches: FakeEvent[][] = [];
   #doorbell: P2pEventDoorbell | undefined;
 
@@ -183,8 +187,18 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     return notFaked("resetStream");
   }
 
-  sendStream(): never {
-    return notFaked("sendStream");
+  sendStream(
+    _peerId: string,
+    connId: bigint,
+    streamId: bigint,
+    _data: ArrayBuffer
+  ): void {
+    if (this.liveConnId !== undefined && connId !== this.liveConnId) {
+      throw new Error(
+        `stream ${streamId} on connection ${connId} is not active`
+      );
+    }
+    this.writes.push({ connId, streamId });
   }
 
   setActive(): never {

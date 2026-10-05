@@ -93,10 +93,21 @@ fn make_ready(
 }
 
 fn inbound_open(agent: &mut GossipsubAgent, peer: &PeerId, stream_id: StreamId, now_ms: u64) {
+    inbound_open_on(agent, peer, ConnectionId::new(1), stream_id, now_ms);
+}
+
+/// [`inbound_open`] on a specific connection, e.g. a replacement's `new`.
+fn inbound_open_on(
+    agent: &mut GossipsubAgent,
+    peer: &PeerId,
+    conn_id: ConnectionId,
+    stream_id: StreamId,
+    now_ms: u64,
+) {
     assert!(agent.handle_event(
         &SwarmEvent::StreamReady {
             peer_id: peer.clone(),
-            conn_id: ConnectionId::new(1),
+            conn_id,
             stream_id,
             protocol_id: MESHSUB_PROTOCOL_ID_V11.to_string(),
             initiated_locally: false,
@@ -112,10 +123,21 @@ fn inbound_rpc(
     rpc: Rpc,
     now_ms: u64,
 ) {
+    inbound_rpc_on(agent, peer, ConnectionId::new(1), stream_id, rpc, now_ms);
+}
+
+fn inbound_rpc_on(
+    agent: &mut GossipsubAgent,
+    peer: &PeerId,
+    conn_id: ConnectionId,
+    stream_id: StreamId,
+    rpc: Rpc,
+    now_ms: u64,
+) {
     assert!(agent.handle_event(
         &SwarmEvent::StreamData {
             peer_id: peer.clone(),
-            conn_id: ConnectionId::new(1),
+            conn_id,
             stream_id,
             data: encode_frame(&rpc.encode()),
         },
@@ -130,9 +152,21 @@ fn remote_subscribe(
     topic: &str,
     now_ms: u64,
 ) {
-    inbound_rpc(
+    remote_subscribe_on(agent, peer, ConnectionId::new(1), stream_id, topic, now_ms);
+}
+
+fn remote_subscribe_on(
+    agent: &mut GossipsubAgent,
+    peer: &PeerId,
+    conn_id: ConnectionId,
+    stream_id: StreamId,
+    topic: &str,
+    now_ms: u64,
+) {
+    inbound_rpc_on(
         agent,
         peer,
+        conn_id,
         stream_id,
         Rpc {
             subscriptions: vec![SubOpts {
@@ -948,7 +982,7 @@ fn write_stop_resets_the_outbound_stream_and_is_claimed_on_inbound() {
 }
 
 #[test]
-fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
+fn disconnect_preserves_backoff_and_replacement_reannounces_subscriptions() {
     let mut agent = agent();
     agent.subscribe("room", 0).unwrap();
     let remote = peer(2);
@@ -1037,7 +1071,7 @@ fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
         },
         6,
     );
-    let superseded = make_ready(
+    let replaced = make_ready(
         &mut agent,
         &remote,
         StreamId::new(12),
@@ -1045,14 +1079,14 @@ fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
         6,
     );
     let rpc = decode_rpc(
-        &sent(&superseded)
-            .expect("supersede subscription snapshot")
+        &sent(&replaced)
+            .expect("replacement subscription snapshot")
             .0,
     );
     assert_eq!(rpc.subscriptions.len(), 1);
     assert_eq!(rpc.subscriptions[0].subscribe, Some(true));
     assert_eq!(rpc.subscriptions[0].topic_id.as_deref(), Some("room"));
-    ack(&mut agent, &remote, &superseded, 6);
+    ack(&mut agent, &remote, &replaced, 6);
     drain_actions(&mut agent);
     inbound_open(&mut agent, &remote, StreamId::new(13), 6);
     remote_subscribe(&mut agent, &remote, StreamId::new(13), "room", 7);
@@ -1777,4 +1811,90 @@ fn replacement_drops_undrained_actions_for_the_old_connection() {
         "an open for the old connection must not run"
     );
     assert!(open_for(&other), "other peers' work is untouched");
+}
+
+/// `peer`'s subscription events among `events`, as `+topic` / `-topic`.
+fn subscription_events(events: &[GossipsubEvent], of: &PeerId) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            GossipsubEvent::PeerSubscribed { peer, topic } if peer == of => {
+                Some(format!("+{topic}"))
+            }
+            GossipsubEvent::PeerUnsubscribed { peer, topic } if peer == of => {
+                Some(format!("-{topic}"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn replace(agent: &mut GossipsubAgent, peer: &PeerId, now_ms: u64) {
+    agent.handle_event(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: peer.clone(),
+            old: ConnectionId::new(1),
+            new: ConnectionId::new(2),
+        },
+        now_ms,
+    );
+}
+
+#[test]
+fn subscription_events_stay_balanced_across_a_replacement() {
+    let mut agent = agent();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    inbound_open(&mut agent, &remote, StreamId::new(5), 0);
+    remote_subscribe(&mut agent, &remote, StreamId::new(5), "room", 1);
+
+    replace(&mut agent, &remote, 2);
+    agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(2),
+            protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
+        },
+        2,
+    );
+    let new_conn = ConnectionId::new(2);
+    inbound_open_on(&mut agent, &remote, new_conn, StreamId::new(9), 2);
+    remote_subscribe_on(&mut agent, &remote, new_conn, StreamId::new(9), "room", 3);
+
+    assert_eq!(
+        subscription_events(&drain_events(&mut agent), &remote),
+        ["+room", "-room", "+room"]
+    );
+}
+
+#[test]
+fn connection_close_unsubscribes_every_announced_topic() {
+    let mut agent = agent();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    inbound_open(&mut agent, &remote, StreamId::new(5), 0);
+    remote_subscribe(&mut agent, &remote, StreamId::new(5), "lobby", 1);
+    remote_subscribe(&mut agent, &remote, StreamId::new(5), "room", 1);
+    drain_events(&mut agent);
+
+    agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
+        },
+        2,
+    );
+    assert_eq!(
+        subscription_events(&drain_events(&mut agent), &remote),
+        ["-lobby", "-room"]
+    );
+}
+
+#[test]
+fn replacement_of_a_peer_without_topics_emits_no_subscription_events() {
+    let mut agent = agent();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    replace(&mut agent, &remote, 1);
+    assert!(subscription_events(&drain_events(&mut agent), &remote).is_empty());
 }

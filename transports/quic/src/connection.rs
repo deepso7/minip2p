@@ -11,8 +11,11 @@ use std::time::{Duration, Instant};
 use minip2p_core::PeerId;
 use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, ConnectionState, StreamId, TransportError, TransportEvent,
+    ConnectionEndpoint, ConnectionId, ConnectionState, ConnectionToken, StreamId, TransportError,
+    TransportEvent,
 };
+
+use sha2::{Digest, Sha256};
 
 use crate::PendingDatagram;
 
@@ -417,7 +420,10 @@ impl QuicConnection {
                 .unix_seconds
                 .map_or_else(crate::unix_time, Duration::from_secs);
             match self.verify_peer_identity(unix_now) {
-                Ok(verified_peer_id) => self.endpoint.set_peer_id(verified_peer_id),
+                Ok(verified_peer_id) => {
+                    self.endpoint.set_peer_id(verified_peer_id);
+                    self.endpoint.set_token(self.shared_token());
+                }
                 Err(rejection) => {
                     events.push(TransportEvent::Error {
                         id: self.id,
@@ -445,6 +451,33 @@ impl QuicConnection {
         }
 
         Ok(())
+    }
+
+    /// Derives the connection's token from its two connection IDs.
+    ///
+    /// Once the handshake completes, each end's source CID is the other's
+    /// destination CID: the listener takes the dialer's CID from its first
+    /// Initial, and quiche replaces the dialer's random initial destination
+    /// with the listener's CID from the listener's first Initial (or Retry).
+    /// Hashing the pair in sorted order therefore gives both ends the same
+    /// token. This transport never issues extra CIDs (`new_scid`) and nothing
+    /// migrates before establishment, so the pair is the one the handshake
+    /// set; the token is read once, here, and kept.
+    fn shared_token(&self) -> ConnectionToken {
+        let (source, destination) = (self.conn.source_id(), self.conn.destination_id());
+        let (low, high) = if source.as_ref() <= destination.as_ref() {
+            (source, destination)
+        } else {
+            (destination, source)
+        };
+        let mut hash = Sha256::new();
+        for cid in [low.as_ref(), high.as_ref()] {
+            // CIDs are at most 20 bytes, so one length byte keeps the
+            // encoding unambiguous.
+            hash.update([u8::try_from(cid.len()).unwrap_or(u8::MAX)]);
+            hash.update(cid);
+        }
+        ConnectionToken::new(hash.finalize().into())
     }
 
     /// Checks the handshaken peer's libp2p identity: exactly one certificate

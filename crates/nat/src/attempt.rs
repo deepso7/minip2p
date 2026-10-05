@@ -389,6 +389,14 @@ impl ConnectAttempt {
         }
         // `old` retires with the swarm; there is nothing left to close.
         self.promoted = (!new_owned).then_some(new);
+        // An adopted circuit carries the relayed path this attempt already
+        // reported, so it takes that origin without a new path event.
+        if !new_owned
+            && new.is_circuit()
+            && let Some(relay) = self.relay_peer().cloned()
+        {
+            shared.record_origin(new, Path::Relayed { relay }, Some(self.id));
+        }
         if let Some(stream) = self.dcutr_stream {
             self.finish_failed_dcutr(stream, "DCUtR circuit was replaced".into(), shared);
         } else if new_owned {

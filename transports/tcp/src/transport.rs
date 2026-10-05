@@ -11,7 +11,7 @@ use minip2p_secure_mux::{
 };
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, ConnectionState,
-    StreamId, Transport, TransportError, TransportEvent,
+    ConnectionToken, StreamId, Transport, TransportError, TransportEvent,
 };
 
 use crate::config::TcpConfig;
@@ -231,10 +231,17 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                     }
                     connection.outbound.extend(bytes);
                 }
-                SessionOutput::Established { peer } => {
+                SessionOutput::Established {
+                    peer,
+                    handshake_hash,
+                } => {
+                    // Both ends share the Noise handshake hash, so it serves
+                    // as the connection's token.
+                    let mut endpoint = connection.endpoint(Some(peer));
+                    endpoint.set_token(ConnectionToken::new(handshake_hash));
                     self.pending.push_back(TransportEvent::Connected {
                         id: connection.id,
-                        endpoint: connection.endpoint(Some(peer)),
+                        endpoint,
                     });
                 }
                 SessionOutput::IncomingStream { stream } => {

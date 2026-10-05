@@ -162,17 +162,23 @@ pub enum EndpointEvent {
 }
 
 impl EndpointEvent {
-    /// Returns `true` if this is a stream-scoped event for the given peer and
-    /// stream id.
-    pub fn matches_stream(&self, peer_id: &PeerId, stream_id: StreamId) -> bool {
+    /// Returns `true` if this is a stream-scoped event for the given peer,
+    /// connection, and stream id. Stream ids are per connection, so the
+    /// connection must match too.
+    pub fn matches_stream(
+        &self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) -> bool {
         matches!(
             self,
-            Self::StreamReady { peer_id: peer, stream_id: stream, .. }
-                | Self::StreamData { peer_id: peer, stream_id: stream, .. }
-                | Self::StreamRemoteWriteClosed { peer_id: peer, stream_id: stream, .. }
-                | Self::StreamWriteStopped { peer_id: peer, stream_id: stream, .. }
-                | Self::StreamClosed { peer_id: peer, stream_id: stream, .. }
-                if peer == peer_id && *stream == stream_id
+            Self::StreamReady { peer_id: peer, conn_id: conn, stream_id: stream, .. }
+                | Self::StreamData { peer_id: peer, conn_id: conn, stream_id: stream, .. }
+                | Self::StreamRemoteWriteClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
+                | Self::StreamWriteStopped { peer_id: peer, conn_id: conn, stream_id: stream, .. }
+                | Self::StreamClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
+                if peer == peer_id && *conn == conn_id && *stream == stream_id
         )
     }
 }

@@ -38,6 +38,13 @@ pub enum SwarmEvent {
     /// is connected but not ready. A ping pending or in flight on `old` is
     /// re-sent on `new`. The event is delivered before the transport is asked
     /// to close `old`.
+    ///
+    /// The newest connection wins, except in a simultaneous dial: a direct
+    /// connection in the opposite direction to a direct `old` that registered
+    /// less than [`SIMULTANEOUS_DIAL_WINDOW_MS`](crate::SIMULTANEOUS_DIAL_WINDOW_MS)
+    /// ago replaces it only if the lower peer id dialed it. Otherwise it is
+    /// closed unannounced (our own losing dial completes as
+    /// [`SwarmEvent::DialFailed`]), so both peers keep the same connection.
     ConnectionReplaced {
         peer_id: PeerId,
         old: ConnectionId,
@@ -148,19 +155,25 @@ impl SwarmEvent {
     /// ([`StreamReady`](Self::StreamReady), [`StreamData`](Self::StreamData),
     /// [`StreamRemoteWriteClosed`](Self::StreamRemoteWriteClosed),
     /// [`StreamWriteStopped`](Self::StreamWriteStopped), or
-    /// [`StreamClosed`](Self::StreamClosed)) for the given peer and stream id.
+    /// [`StreamClosed`](Self::StreamClosed)) for the given peer, connection,
+    /// and stream id.
     ///
     /// Useful for filtering queued events that belong to a stream being torn
-    /// down.
-    pub fn matches_stream(&self, peer_id: &PeerId, stream_id: StreamId) -> bool {
+    /// down. Stream ids are per connection, so the connection must match too.
+    pub fn matches_stream(
+        &self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) -> bool {
         matches!(
             self,
-            Self::StreamReady { peer_id: peer, stream_id: stream, .. }
-                | Self::StreamData { peer_id: peer, stream_id: stream, .. }
-                | Self::StreamRemoteWriteClosed { peer_id: peer, stream_id: stream, .. }
-                | Self::StreamWriteStopped { peer_id: peer, stream_id: stream, .. }
-                | Self::StreamClosed { peer_id: peer, stream_id: stream, .. }
-                if peer == peer_id && *stream == stream_id
+            Self::StreamReady { peer_id: peer, conn_id: conn, stream_id: stream, .. }
+                | Self::StreamData { peer_id: peer, conn_id: conn, stream_id: stream, .. }
+                | Self::StreamRemoteWriteClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
+                | Self::StreamWriteStopped { peer_id: peer, conn_id: conn, stream_id: stream, .. }
+                | Self::StreamClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
+                if peer == peer_id && *conn == conn_id && *stream == stream_id
         )
     }
 }
@@ -331,11 +344,14 @@ pub enum SwarmError {
         protocol_id: String,
     },
     /// A caller tried to use a user stream that is not currently negotiated
-    /// for the requested peer.
-    #[error("user stream {stream_id} for peer {peer_id} is not active")]
+    /// on the requested connection, or that connection is no longer the
+    /// peer's (it closed or was replaced).
+    #[error("user stream {stream_id} on connection {conn_id} for peer {peer_id} is not active")]
     StreamNotFound {
         /// Peer the caller expected the stream to belong to.
         peer_id: PeerId,
+        /// Connection the caller expected the stream to live on.
+        conn_id: ConnectionId,
         /// Stream id supplied by the caller.
         stream_id: StreamId,
     },

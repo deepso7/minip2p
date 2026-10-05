@@ -21,7 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind()?;
 
     let connect_id = node.connect(target)?;
-    let mut stream_id = None;
+    // Stream ids are per connection, so a stream is named by both.
+    let mut stream = None;
     let mut response = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
 
@@ -42,41 +43,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match outcome {
                     // A known protocol does not need to wait for Identify.
                     ConnectOutcome::Connected { .. } => {
-                        stream_id = Some(node.open_stream(&peer_id, ECHO_PROTOCOL)?);
+                        stream = Some(node.open_stream(&peer_id, ECHO_PROTOCOL)?);
                     }
                     other => return Err(format!("connect failed: {other:?}").into()),
                 }
             }
             EndpointEvent::StreamReady {
                 peer_id: peer,
+                conn_id,
                 stream_id: ready,
                 protocol_id,
                 ..
-            } if peer == peer_id && Some(ready) == stream_id && protocol_id == ECHO_PROTOCOL => {
-                node.send_stream(&peer_id, ready, b"hello".to_vec())?;
-                node.close_stream_write(&peer_id, ready)?;
+            } if peer == peer_id
+                && Some((conn_id, ready)) == stream
+                && protocol_id == ECHO_PROTOCOL =>
+            {
+                node.send_stream(&peer_id, conn_id, ready, b"hello".to_vec())?;
+                node.close_stream_write(&peer_id, conn_id, ready)?;
             }
             EndpointEvent::StreamData {
                 peer_id: peer,
+                conn_id,
                 stream_id: ready,
                 data,
                 ..
-            } if peer == peer_id && Some(ready) == stream_id => {
+            } if peer == peer_id && Some((conn_id, ready)) == stream => {
                 response.extend_from_slice(&data);
             }
             EndpointEvent::StreamRemoteWriteClosed {
                 peer_id: peer,
+                conn_id,
                 stream_id: ready,
                 ..
-            } if peer == peer_id && Some(ready) == stream_id => {
+            } if peer == peer_id && Some((conn_id, ready)) == stream => {
                 println!("{}", String::from_utf8_lossy(&response));
                 return Ok(());
             }
             EndpointEvent::StreamClosed {
                 peer_id: peer,
+                conn_id,
                 stream_id: ready,
                 ..
-            } if peer == peer_id && Some(ready) == stream_id => {
+            } if peer == peer_id && Some((conn_id, ready)) == stream => {
                 return Err("stream closed before the echo completed".into());
             }
             EndpointEvent::Error(error) => eprintln!("runtime error: {error:?}"),

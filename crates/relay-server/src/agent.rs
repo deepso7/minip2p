@@ -1,4 +1,4 @@
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -487,20 +487,6 @@ impl RelayServerAgent {
     /// Processes every deadline due at or before `now`.
     pub fn handle_tick(&mut self, now: Now) {
         self.last_event_tick_ms = Some(now.monotonic_ms);
-        let expired: Vec<_> = self
-            .reservations
-            .iter()
-            .filter_map(|(peer, reservation)| {
-                (reservation.deadline_ms <= now.monotonic_ms).then_some(peer.clone())
-            })
-            .collect();
-        for peer_id in expired {
-            self.reservations.remove(&peer_id);
-            self.events.push_back(RelayServerEvent::ReservationClosed {
-                peer_id,
-                reason: ReservationCloseReason::Expired,
-            });
-        }
         let duration_limited: Vec<_> = self
             .circuits
             .iter()
@@ -557,6 +543,24 @@ impl RelayServerAgent {
             .collect();
         for key in stop_timed_out {
             self.fail_pending_connect(key, Status::ConnectionFailed);
+        }
+        // After the timeouts above: one may have cancelled a pending renewal,
+        // and its reservation must not outlive this sweep.
+        let renewing = self.renewing_peers();
+        let expired: Vec<_> = self
+            .reservations
+            .iter()
+            .filter_map(|(peer, reservation)| {
+                (reservation.deadline_ms <= now.monotonic_ms && !renewing.contains(peer))
+                    .then_some(peer.clone())
+            })
+            .collect();
+        for peer_id in expired {
+            self.reservations.remove(&peer_id);
+            self.events.push_back(RelayServerEvent::ReservationClosed {
+                peer_id,
+                reason: ReservationCloseReason::Expired,
+            });
         }
         self.reservation_limiters.sweep(now.monotonic_ms);
         self.circuit_limiters.sweep(now.monotonic_ms);
@@ -664,7 +668,7 @@ impl RelayServerAgent {
         &mut self,
         token: RelayServerToken,
         result: Result<(), String>,
-        _now: Now,
+        now: Now,
     ) {
         let Some(PendingOperation::Send { peer_id, effect }) =
             self.pending_operations.remove(&token)
@@ -674,6 +678,8 @@ impl RelayServerAgent {
         match result {
             Ok(()) => match effect {
                 SendEffect::CommitReservation(pending) => {
+                    // A renewal's reservation cannot have lapsed meanwhile:
+                    // `handle_tick` keeps it alive while the renewal is pending.
                     if self
                         .connections
                         .get(&pending.conn_id)
@@ -698,7 +704,7 @@ impl RelayServerAgent {
                 }
                 SendEffect::CommitCircuit(source_stream) => {
                     self.complete_hop(source_stream);
-                    self.commit_circuit(source_stream, _now);
+                    self.commit_circuit(source_stream, now);
                 }
                 SendEffect::StopRequest(_) => {}
                 SendEffect::Forward {
@@ -822,10 +828,12 @@ impl RelayServerAgent {
 
     /// Returns milliseconds until the earliest timer, with zero meaning due.
     pub fn next_timeout(&self, now: Now) -> Option<u64> {
+        let renewing = self.renewing_peers();
         let reservation = self
             .reservations
-            .values()
-            .map(|value| value.deadline_ms)
+            .iter()
+            .filter(|(peer, _)| !renewing.contains(peer))
+            .map(|(_, value)| value.deadline_ms)
             .min();
         let hop = self
             .hop_workers
@@ -1542,19 +1550,6 @@ impl RelayServerAgent {
                 } if pending.peer_id == peer_id
             )
         });
-        let pending_initial = self
-            .pending_operations
-            .values()
-            .filter(|operation| {
-                matches!(
-                    operation,
-                    PendingOperation::Send {
-                        effect: SendEffect::CommitReservation(pending),
-                        ..
-                    } if !pending.renewed
-                )
-            })
-            .count();
         let deadline_ms = now
             .monotonic_ms
             .saturating_add(self.config.reservation_duration_secs.saturating_mul(1_000));
@@ -1568,16 +1563,12 @@ impl RelayServerAgent {
         let status = if wire.is_none() {
             Some(Status::ReservationRefused)
         // Renewals keep an admitted reservation alive and spend no token.
-        } else if !renewed
-            && !self.consume_reservation_limits(&peer_id, key.conn_id, now.monotonic_ms)
+        } else if !renewed && !self.admit_new_reservation(&peer_id, key.conn_id, now.monotonic_ms)
+            || pending_for_peer
         {
             Some(Status::ResourceLimitExceeded)
         } else {
-            (pending_for_peer
-                || (!renewed
-                    && self.reservations.len().saturating_add(pending_initial)
-                        >= self.config.max_reservations))
-                .then_some(Status::ResourceLimitExceeded)
+            None
         };
         if let Some(status) = status {
             self.events.push_back(RelayServerEvent::ReservationDenied {
@@ -1648,6 +1639,50 @@ impl RelayServerAgent {
             addrs.pop();
         }
         None
+    }
+
+    /// Peers whose renewal response is already on the wire. Their
+    /// reservation stays alive (and off the timer) until that renewal
+    /// commits or fails: the client was promised the extension. The pending
+    /// send is still bounded by its control stream's own timeout.
+    fn renewing_peers(&self) -> BTreeSet<&PeerId> {
+        self.pending_operations
+            .values()
+            .filter_map(|operation| match operation {
+                PendingOperation::Send {
+                    effect: SendEffect::CommitReservation(pending),
+                    ..
+                } if pending.renewed => Some(&pending.peer_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Admission for a new reservation: spends a rate-limit token, then
+    /// checks `max_reservations` against committed and pending new ones.
+    fn admit_new_reservation(
+        &mut self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        now_ms: u64,
+    ) -> bool {
+        if !self.consume_reservation_limits(peer_id, conn_id, now_ms) {
+            return false;
+        }
+        let pending_initial = self
+            .pending_operations
+            .values()
+            .filter(|operation| {
+                matches!(
+                    operation,
+                    PendingOperation::Send {
+                        effect: SendEffect::CommitReservation(pending),
+                        ..
+                    } if !pending.renewed
+                )
+            })
+            .count();
+        self.reservations.len().saturating_add(pending_initial) < self.config.max_reservations
     }
 
     fn consume_reservation_limits(
@@ -4208,8 +4243,50 @@ mod tests {
 
     #[test]
     fn replacing_a_leg_connection_closes_its_circuit() {
+        for leg in [CircuitLeg::Source, CircuitLeg::Destination] {
+            let (mut agent, source, destination, source_stream, stop_stream) =
+                connected_circuit(RelayServerConfig::default(), 0);
+            let (peer, old, other_stream) = match leg {
+                CircuitLeg::Source => (&source, source_stream.conn_id, stop_stream),
+                CircuitLeg::Destination => (&destination, stop_stream.conn_id, source_stream),
+            };
+            replace(&mut agent, peer, old, ConnectionId::new(62), false, 1);
+
+            assert!(
+                matches!(
+                    agent.poll_event(),
+                    Some(RelayServerEvent::CircuitClosed {
+                        reason: CircuitCloseReason::ConnectionClosed { leg: closed },
+                        ..
+                    }) if closed == leg
+                ),
+                "{leg:?}"
+            );
+            assert_eq!(agent.circuit_count(), 0, "{leg:?}");
+            assert!(
+                matches!(
+                    agent.poll_action(),
+                    Some(RelayServerAction::ResetStream { stream, .. }) if stream == other_stream
+                ),
+                "{leg:?}: the surviving leg's stream is reset"
+            );
+            // Only the destination's own reservation follows its connection.
+            let reservation_conn = match leg {
+                CircuitLeg::Source => stop_stream.conn_id,
+                CircuitLeg::Destination => ConnectionId::new(62),
+            };
+            assert_eq!(
+                agent.reservation_connection(&destination),
+                Some(reservation_conn),
+                "{leg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replacing_the_destination_fails_a_pending_connect() {
         let (mut agent, _, destination, source_stream, stop_stream) =
-            connected_circuit(RelayServerConfig::default(), 0);
+            pending_stop(RelayServerConfig::default(), 0);
         replace(
             &mut agent,
             &destination,
@@ -4221,22 +4298,22 @@ mod tests {
 
         assert!(matches!(
             agent.poll_event(),
-            Some(RelayServerEvent::CircuitClosed {
-                reason: CircuitCloseReason::ConnectionClosed {
-                    leg: CircuitLeg::Destination,
-                },
+            Some(RelayServerEvent::CircuitDenied {
+                status: Status::ConnectionFailed,
                 ..
             })
         ));
-        assert_eq!(agent.circuit_count(), 0);
-        assert!(matches!(
-            agent.poll_action(),
-            Some(RelayServerAction::ResetStream { stream, .. }) if stream == source_stream
-        ));
-        assert_eq!(
-            agent.reservation_connection(&destination),
-            Some(ConnectionId::new(62))
+        let actions: Vec<_> = core::iter::from_fn(|| agent.poll_action()).collect();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                RelayServerAction::SendStream { stream, .. } if *stream == source_stream
+            )),
+            "the source hears the failure: {actions:?}"
         );
+        assert!(agent.pending_circuits.is_empty());
+        assert!(agent.stop_to_source.is_empty());
+        assert!(!agent.owns_stream(stop_stream));
     }
 
     #[test]
@@ -4309,5 +4386,112 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// One-second reservations, so a tick reaches the deadline long before
+    /// the control-stream timeout.
+    fn short_reservations() -> RelayServerConfig {
+        RelayServerConfig {
+            reservation_duration_secs: 1,
+            ..RelayServerConfig::default()
+        }
+    }
+
+    /// Reserves for `peer`, decides a renewal, then ticks past the
+    /// reservation's deadline before the renewal's response is reported
+    /// sent. Returns the renewal's send token.
+    fn renew_past_deadline(
+        agent: &mut RelayServerAgent,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+    ) -> RelayServerToken {
+        let stream = |stream_id| StreamKey {
+            conn_id,
+            stream_id: StreamId::new(stream_id),
+        };
+        reserve(agent, peer, stream(1));
+        feed_hop(agent, peer, stream(2), reserve_request(), &[]);
+        let Some(RelayServerAction::SendStream { token, .. }) = agent.poll_action() else {
+            panic!("renewal response");
+        };
+        while agent.poll_action().is_some() {}
+        agent.handle_tick(Now::from_millis(1_000));
+        token
+    }
+
+    fn relay(config: RelayServerConfig) -> RelayServerAgent {
+        let mut agent =
+            RelayServerAgent::new(PeerId::from_public_key_protobuf(b"relay-lapse"), config)
+                .unwrap();
+        agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        agent
+    }
+
+    #[test]
+    fn a_renewal_on_the_wire_keeps_its_reservation_alive_until_it_commits() {
+        let mut agent = relay(short_reservations());
+        let peer = PeerId::from_public_key_protobuf(b"client-renewing");
+        let token = renew_past_deadline(&mut agent, &peer, ConnectionId::new(351));
+        assert!(
+            agent.poll_event().is_none(),
+            "the client was already sent SUCCESS for the renewal"
+        );
+        assert_ne!(
+            agent.next_timeout(Now::from_millis(1_000)),
+            Some(0),
+            "the kept-alive deadline must not spin the host's timer"
+        );
+
+        agent.send_stream_result(token, Ok(()), Now::from_millis(1_000));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::ReservationAccepted { renewed: true, .. })
+        ));
+        assert_eq!(agent.reservation_count(), 1);
+    }
+
+    #[test]
+    fn a_failed_renewal_lets_its_reservation_expire() {
+        let mut agent = relay(short_reservations());
+        let peer = PeerId::from_public_key_protobuf(b"client-renewal-failed");
+        let token = renew_past_deadline(&mut agent, &peer, ConnectionId::new(352));
+
+        agent.send_stream_result(token, Err("stream reset".into()), Now::from_millis(1_000));
+        while agent.poll_event().is_some() {}
+        agent.handle_tick(Now::from_millis(1_001));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::ReservationClosed {
+                reason: ReservationCloseReason::Expired,
+                ..
+            })
+        ));
+        assert_eq!(agent.reservation_expires_unix_secs(&peer), None);
+    }
+
+    #[test]
+    fn a_renewal_timing_out_with_its_reservation_expires_it_in_the_same_tick() {
+        let mut agent = relay(RelayServerConfig {
+            control_stream_timeout_ms: 1_000,
+            ..short_reservations()
+        });
+        let peer = PeerId::from_public_key_protobuf(b"client-renewal-timeout");
+        renew_past_deadline(&mut agent, &peer, ConnectionId::new(353));
+
+        let mut events = Vec::new();
+        while let Some(event) = agent.poll_event() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RelayServerEvent::ReservationClosed {
+                    reason: ReservationCloseReason::Expired,
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
+        assert_eq!(agent.reservation_count(), 0);
     }
 }

@@ -231,7 +231,6 @@ pub enum P2pEvent {
         /// Protocols advertised by the peer.
         protocols: Vec<String>,
     },
-
     /// A peer supplied a new Identify snapshot.
     IdentifyReceived {
         /// Remote peer.
@@ -418,7 +417,7 @@ pub enum P2pEvent {
         /// Subscribed topic.
         topic: String,
     },
-    /// A peer withdrew a subscription.
+    /// A peer's subscription ended: withdrawn, or its connection closed or was replaced.
     PeerUnsubscribed {
         /// Remote peer.
         peer_id: String,

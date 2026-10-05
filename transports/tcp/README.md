@@ -48,4 +48,4 @@ A ceiling alone would not hold, though — a peer that completes the TCP handsha
 
 ## Identity
 
-The upgrade authenticates both ends, so `Connected` always carries a verified peer id. A dial additionally pins the expected identity from its `PeerAddr`: a remote that proves a different one fails the handshake instead of connecting.
+The upgrade authenticates both ends, so `Connected` always carries a verified peer id, plus the Noise handshake hash as its `ConnectionToken` — the same value on both ends. A dial additionally pins the expected identity from its `PeerAddr`: a remote that proves a different one fails the handshake instead of connecting.

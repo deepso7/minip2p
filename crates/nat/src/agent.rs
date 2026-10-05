@@ -111,9 +111,9 @@ pub(crate) struct Shared {
     pub(crate) registry: BTreeMap<PeerId, BTreeMap<StreamId, StreamRole>>,
     pub(crate) tokens: BTreeMap<NatToken, TokenPurpose>,
     next_token: u64,
-    /// Established connections per peer. A Connection replacement swaps the
-    /// old id for the new one, so a connected peer holds its current one.
-    pub(crate) connected: BTreeMap<PeerId, BTreeSet<ConnectionId>>,
+    /// Each connected peer's current connection. The swarm keeps one per
+    /// peer, and a Connection replacement swaps the old id for the new one.
+    pub(crate) connected: BTreeMap<PeerId, ConnectionId>,
     /// Path origin of each established connection that carries one.
     pub(crate) origins: BTreeMap<ConnectionId, Origin>,
     /// Established connections classified as direct by the driver.
@@ -148,13 +148,13 @@ pub(crate) struct Shared {
 
 impl Shared {
     pub(crate) fn is_connected(&self, peer: &PeerId) -> bool {
-        self.connected.get(peer).is_some_and(|ids| !ids.is_empty())
+        self.connected.contains_key(peer)
     }
 
     pub(crate) fn is_directly_connected(&self, peer: &PeerId) -> bool {
         self.connected
             .get(peer)
-            .is_some_and(|ids| ids.iter().any(|id| self.direct_connections.contains(id)))
+            .is_some_and(|id| self.direct_connections.contains(id))
     }
 
     /// Records the path a connection carries for its peer.
@@ -510,13 +510,8 @@ impl NatAgent {
     /// The path the peer's current connection carries, when a NAT machine
     /// announced one for it (or for the connection it replaced).
     pub fn path(&self, peer: &PeerId) -> Option<&Path> {
-        self.shared
-            .connected
-            .get(peer)?
-            .iter()
-            .rev()
-            .find_map(|conn_id| self.shared.origins.get(conn_id))
-            .map(|origin| &origin.path)
+        let conn_id = self.shared.connected.get(peer)?;
+        self.shared.origins.get(conn_id).map(|origin| &origin.path)
     }
 
     /// Updates the validated addresses advertised during DCUtR exchanges.
@@ -567,7 +562,6 @@ impl NatAgent {
                 self.connection_down(peer_id, *conn_id, now);
                 let disconnected = !self.shared.is_connected(peer_id);
                 if disconnected {
-                    self.shared.connected.remove(peer_id);
                     self.shared.ready.remove(peer_id);
                     self.shared.observed_addrs.remove(peer_id);
                     self.housekeeping
@@ -1044,11 +1038,7 @@ impl NatAgent {
         self.shared
             .pending_session_dials
             .retain(|_, (dialed, _)| dialed != peer);
-        self.shared
-            .connected
-            .entry(peer.clone())
-            .or_default()
-            .insert(conn_id);
+        self.shared.connected.insert(peer.clone(), conn_id);
         if !is_circuit {
             self.shared.direct_connections.insert(conn_id);
         }
@@ -1074,8 +1064,9 @@ impl NatAgent {
         self.shared.dialed.remove(&conn_id);
         self.shared.direct_connections.remove(&conn_id);
         self.shared.origins.remove(&conn_id);
-        if let Some(ids) = self.shared.connected.get_mut(peer) {
-            ids.remove(&conn_id);
+        // A stale close for an already replaced id leaves the current one.
+        if self.shared.connected.get(peer) == Some(&conn_id) {
+            self.shared.connected.remove(peer);
         }
         let closed_streams: Vec<_> = self
             .shared

@@ -22,6 +22,9 @@ const CHURN_ROUNDS: usize = 50;
 const RECLAIM_BACKSTOP: Duration = Duration::from_secs(5);
 /// Failure backstop for a driver thread whose stop signal never arrives.
 const DRIVER_BACKSTOP: Duration = Duration::from_secs(30);
+/// Comfortably past the swarm's race window.
+const PAST_RACE_WINDOW: Duration =
+    Duration::from_millis(minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS + 500);
 
 fn wait_peer_ready(
     listener: &mut Endpoint,
@@ -38,6 +41,21 @@ fn wait_peer_ready(
         let _ = dialer
             .next_event(Duration::from_millis(10))
             .expect("drive dialer toward ready");
+    }
+}
+
+/// Keeps both endpoints driven until the first connection is older than the
+/// swarm's race window, so a second connection from the same identity
+/// replaces it rather than racing it by connection token.
+fn outlive_race_window(listener: &mut Endpoint, dialer: &mut Endpoint) {
+    let window_end = Instant::now() + PAST_RACE_WINDOW;
+    while Instant::now() < window_end {
+        let _ = listener
+            .next_event(Duration::from_millis(10))
+            .expect("drive listener past the race window");
+        let _ = dialer
+            .next_event(Duration::from_millis(10))
+            .expect("drive dialer past the race window");
     }
 }
 
@@ -234,6 +252,7 @@ fn close_drains_replacement_connection() {
     let dialer_peer = dialer.peer_id().clone();
     dialer.connect(&listener_addr).expect("connect to listener");
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
+    outlive_race_window(&mut listener, &mut dialer);
 
     // Queue a same-peer handshake without polling the listener, so close()
     // is the first drive that can establish the replacement.
@@ -290,6 +309,7 @@ fn close_drains_pending_replacement_handshake() {
     let dialer_peer = dialer.peer_id().clone();
     dialer.connect(&listener_addr).expect("connect to listener");
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
+    outlive_race_window(&mut listener, &mut dialer);
 
     let mut replacement = Endpoint::builder()
         .identity(dialer_key)

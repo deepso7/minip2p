@@ -55,6 +55,9 @@ pub enum SessionOutput {
     Established {
         /// The authenticated remote identity.
         peer: PeerId,
+        /// The final Noise handshake hash. Both ends of the session see the
+        /// same value, so it can name the connection on either side.
+        handshake_hash: [u8; 32],
     },
     /// The remote opened a substream.
     IncomingStream {
@@ -574,6 +577,9 @@ impl SecureMuxSession {
             self.yamux_config.clone(),
         )
         .map_err(|error| SessionError::protocol(format!("invalid Yamux configuration: {error}")))?;
+        let handshake_hash = noise
+            .handshake_hash()
+            .ok_or_else(|| SessionError::protocol("Noise handshake hash is unavailable"))?;
 
         // Handle the pipelined remainder first, then insert `Established`
         // ahead of whatever it produced. Announcing up front would leave a
@@ -600,7 +606,10 @@ impl SecureMuxSession {
         }
         self.outputs.insert(
             established_at,
-            SessionOutput::Established { peer: peer.clone() },
+            SessionOutput::Established {
+                peer: peer.clone(),
+                handshake_hash,
+            },
         );
         Ok(Phase::Ready { noise, yamux, peer })
     }

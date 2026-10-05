@@ -31,8 +31,10 @@
 # listener state.
 #
 # The filter names that one test rather than its binary. The other four tests in
-# reconnect_churn cost ~1s combined, and the variants do enable QUIC, so
-# excluding the whole binary would drop real coverage to save a second.
+# reconnect_churn are cheaper -- the two close-drain tests below each wait ~5.5s
+# for their first connection to outlive the swarm's race window, and since they
+# run alone that adds ~11s per variant -- and the variants do enable QUIC, so
+# excluding the whole binary would drop the replacement coverage they exist for.
 #
 # Feature variants run under this profile; the workspace run does not.
 [profile.variants]
@@ -61,7 +63,7 @@ default-filter = '''
 # The close-drain tests assert on the events `Endpoint::close()` returns, and
 # `close()` drains for a fixed 500ms by design — shutdown stays bounded, so the
 # events it returns are best effort. The assertions are not: they are what keeps
-# a superseded connection from being dropped silently. The only way to have both
+# a replaced connection from being dropped silently. The only way to have both
 # is to stop the box from stealing those 500ms, so these three run alone.
 #
 # `threads-required` is what does that. A `[test-groups]` entry with

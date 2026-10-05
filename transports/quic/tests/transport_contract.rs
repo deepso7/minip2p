@@ -8,8 +8,8 @@ use minip2p_core::{PeerAddr, Protocol};
 use minip2p_platform::{Deadline, Now};
 use minip2p_quic::{QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport};
 use minip2p_transport::{
-    BlockingTransport, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
-    WaitOutcome,
+    BlockingTransport, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,
+    TransportEvent, WaitOutcome,
 };
 
 mod common;
@@ -142,6 +142,32 @@ fn connected_is_emitted_exactly_once_after_dial() {
         .filter(|e| matches!(e, TransportEvent::Connected { .. }))
         .count();
     assert_eq!(connected_count, 1, "Connected must be emitted exactly once");
+}
+
+/// The token on `conn`'s `Connected` endpoint.
+fn connected_token(events: &[TransportEvent], conn: ConnectionId) -> Option<ConnectionToken> {
+    events.iter().find_map(|event| match event {
+        TransportEvent::Connected { id, endpoint } if *id == conn => endpoint.token(),
+        _ => None,
+    })
+}
+
+#[test]
+fn both_ends_of_a_connection_share_its_token() {
+    // The default config validates addresses with a Retry, so this also
+    // covers the dialer switching to the Retry's connection id.
+    let (mut server, mut client, peer_addr) = setup_pair();
+    let (server_conn, client_conn, server_events, client_events) =
+        connect_pair(&mut server, &mut client, &peer_addr);
+    let token = connected_token(&client_events, client_conn).expect("dialer token");
+    assert_eq!(connected_token(&server_events, server_conn), Some(token));
+
+    // A second connection between the same pair gets a token of its own.
+    let (second_server, second_client, server_events, client_events) =
+        connect_pair(&mut server, &mut client, &peer_addr);
+    let second = connected_token(&client_events, second_client).expect("second token");
+    assert_eq!(connected_token(&server_events, second_server), Some(second));
+    assert_ne!(second, token);
 }
 
 #[test]
