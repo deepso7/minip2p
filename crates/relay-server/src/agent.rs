@@ -84,7 +84,6 @@ struct Connection {
 struct ReservationRecord {
     conn_id: ConnectionId,
     deadline_ms: u64,
-    expires_unix_secs: Option<u64>,
 }
 
 struct PendingReservation {
@@ -300,11 +299,6 @@ impl RelayServerAgent {
         if let Some(connection) = self.connections.get_mut(&conn_id) {
             connection.address = Some(address);
         }
-    }
-
-    /// Returns the exact remote transport address known for a connection.
-    pub fn connection_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
-        self.connections.get(&conn_id)?.address.as_ref()
     }
 
     /// Feeds one Swarm event and returns whether the service claimed it.
@@ -690,7 +684,6 @@ impl RelayServerAgent {
                             ReservationRecord {
                                 conn_id: pending.conn_id,
                                 deadline_ms: pending.deadline_ms,
-                                expires_unix_secs: pending.expires_unix_secs,
                             },
                         );
                         self.events
@@ -873,18 +866,15 @@ impl RelayServerAgent {
     }
 
     /// Whether `peer_id` has a committed live reservation.
-    pub fn has_reservation(&self, peer_id: &PeerId) -> bool {
+    #[cfg(test)]
+    fn has_reservation(&self, peer_id: &PeerId) -> bool {
         self.reservations.contains_key(peer_id)
     }
 
     /// Returns the exact connection owning a committed reservation.
-    pub fn reservation_connection(&self, peer_id: &PeerId) -> Option<ConnectionId> {
+    #[cfg(test)]
+    fn reservation_connection(&self, peer_id: &PeerId) -> Option<ConnectionId> {
         self.reservations.get(peer_id).map(|record| record.conn_id)
-    }
-
-    /// Returns optional wall-clock expiry metadata for a reservation.
-    pub fn reservation_expires_unix_secs(&self, peer_id: &PeerId) -> Option<u64> {
-        self.reservations.get(peer_id)?.expires_unix_secs
     }
 
     /// Returns the number of committed reservations.
@@ -4466,7 +4456,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(agent.reservation_expires_unix_secs(&peer), None);
+        assert!(!agent.has_reservation(&peer));
     }
 
     #[test]

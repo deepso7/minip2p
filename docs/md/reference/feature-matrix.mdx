@@ -30,7 +30,7 @@ Available on the std `Endpoint`:
 - Streams: `add_protocol`, `open_stream` (returns the connection and stream IDs), `send_stream`, `close_stream_write`, `reset_stream`, `abandon_stream` (each addressed by peer, connection, and stream ID)
 - Ping: `ping` (RTT arrives as `EndpointEvent::PingRttMeasured`)
 - Driving: blocking `wait` (every event, including capability variants, or the deadline, or an interruption); non-blocking `poll`; `wait_handle` to interrupt a blocked `wait`
-- Raw Transport dials (no attempt policy): `swarm_mut().dial(..)`
+- Identify advertisement: `set_external_addresses`
 - Shutdown: `close`
 
 Available on `EndpointBuilder` with `quic`:

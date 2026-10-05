@@ -118,8 +118,8 @@ pub enum EndpointEvent {
     Error(SwarmRuntimeError),
     /// A raw swarm dial's connection closed before it was established.
     ///
-    /// Raw dials are made on the lower-level swarm runtime (for example
-    /// through `Endpoint::swarm_mut`), bypassing Connection-attempt policy.
+    /// Raw dials are made on a portable endpoint's swarm runtime (through
+    /// `PortableEndpoint::runtime_mut`), bypassing Connection-attempt policy.
     ///
     /// Attempt-owned dials never surface here; they become
     /// [`Self::ConnectSettled`] diagnostics.

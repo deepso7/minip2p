@@ -13,7 +13,7 @@ use minip2p_smoltcp::smoltcp::socket::udp::{self, PacketBuffer, PacketMetadata, 
 use minip2p_smoltcp::smoltcp::time::Instant;
 use minip2p_smoltcp::smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
-use crate::io::{MAX_DATAGRAM_BYTES, MdnsDatagram, MdnsError, MdnsIo};
+use crate::io::{MdnsDatagram, MdnsError, MdnsIo};
 use crate::{InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAction, MdnsTarget};
 
 /// The port mDNS runs on.
@@ -36,7 +36,9 @@ const IPV6_INTERFACE: InterfaceId = InterfaceId::new(2);
 /// among a handful of peers. A device with less to spare can shrink them: the
 /// cost of a payload buffer too small for a claim is that the claim is
 /// dropped -- on the way in by smoltcp, on the way out as
-/// [`MdnsError::Oversized`] -- not that anything breaks.
+/// [`MdnsError::Oversized`] -- not that anything breaks. The driver acts on
+/// datagrams up to [`MAX_DATAGRAM_BYTES`](crate::MAX_DATAGRAM_BYTES); a
+/// buffer smaller than that trades away the claims between the two sizes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SmoltcpMdnsConfig {
     /// Bytes held for datagrams waiting to be read.
@@ -516,10 +518,3 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
         self.poll_at_ms.map(|at| at.saturating_sub(now_ms))
     }
 }
-
-/// The largest datagram this can hand over, whatever the driver's buffer is.
-///
-/// Nothing enforces the relationship here -- a smaller receive buffer simply
-/// drops bigger claims inside smoltcp -- but a host sizing
-/// [`SmoltcpMdnsConfig`] against it knows what it is trading away.
-pub const MAX_USEFUL_PAYLOAD_BYTES: usize = MAX_DATAGRAM_BYTES;

@@ -55,7 +55,7 @@ pub use minip2p_pubsub::{
 // With `std`, the crate root re-exports these from the std module instead;
 // the embedded endpoint still names them here.
 #[cfg(all(feature = "pubsub", feature = "std", feature = "smoltcp"))]
-use minip2p_pubsub::{GossipsubConfig, GossipsubConfigError, GossipsubEvent, TopicError};
+use minip2p_pubsub::{GossipsubConfig, GossipsubConfigError, TopicError};
 #[cfg(feature = "smoltcp")]
 pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
 #[cfg(feature = "tcp")]
@@ -1168,18 +1168,6 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         )
     }
 
-    /// Queues a Gossipsub event as if the agent produced it and the driver has
-    /// not collected it yet.
-    ///
-    /// Shutdown tests use this. A terminal `shutdown` must still return it.
-    #[doc(hidden)]
-    #[cfg(feature = "pubsub")]
-    pub fn leave_uncollected_gossipsub_event(&mut self, event: GossipsubEvent) {
-        if let Some(driver) = self.gossipsub.as_mut() {
-            driver.agent.enqueue_event(event);
-        }
-    }
-
     /// Sends an mDNS goodbye when enabled, closes peers, and consumes the endpoint.
     ///
     /// Returns the final Endpoint events, including capability events that
@@ -1846,5 +1834,72 @@ mod tests {
             EndpointEvent::ConnectionClosed { peer_id, conn_id: closed_id, .. }
                 if peer_id == &remote && closed_id == &conn_id
         )));
+    }
+
+    #[cfg(all(feature = "smoltcp", feature = "pubsub"))]
+    #[test]
+    fn smoltcp_shutdown_returns_gossipsub_events_still_in_the_agent() {
+        use minip2p_pubsub::{GossipsubEvent, MESHSUB_PROTOCOL_ID_V11, Rpc, SubOpts, encode_frame};
+        use smoltcp::iface::{Config, Interface};
+        use smoltcp::phy::{Loopback, Medium};
+        use smoltcp::wire::HardwareAddress;
+
+        let identity = Ed25519Keypair::from_secret_key_bytes([70; 32]);
+        let mut device = Loopback::new(Medium::Ip);
+        let interface = Interface::new(
+            Config::new(HardwareAddress::Ip),
+            &mut device,
+            smoltcp::time::Instant::from_millis(0),
+        );
+        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
+            .smoltcp(SmoltcpStack::new(device, interface))
+            .gossipsub()
+            .build()
+            .expect("embedded endpoint builds");
+
+        // An inbound meshsub stream carrying a subscribe leaves
+        // `PeerSubscribed` in the agent; nothing has polled it out yet.
+        let peer = Ed25519Keypair::from_secret_key_bytes([71; 32]).peer_id();
+        let (conn_id, stream_id) = (ConnectionId::new(1), StreamId::new(1));
+        let agent = &mut endpoint.gossipsub.as_mut().expect("gossipsub").agent;
+        assert!(agent.handle_event(
+            &SwarmEvent::StreamReady {
+                peer_id: peer.clone(),
+                conn_id,
+                stream_id,
+                protocol_id: MESHSUB_PROTOCOL_ID_V11.into(),
+                initiated_locally: false,
+            },
+            0,
+        ));
+        let rpc = Rpc {
+            subscriptions: vec![SubOpts {
+                subscribe: Some(true),
+                topic_id: Some("still-in-agent".into()),
+            }],
+            publish: Vec::new(),
+            control: None,
+        };
+        assert!(agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: peer.clone(),
+                conn_id,
+                stream_id,
+                data: encode_frame(&rpc.encode()),
+            },
+            0,
+        ));
+
+        let events = endpoint.shutdown(Now::from_millis(0)).expect("shutdown");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed {
+                    peer: returned,
+                    topic,
+                }) if returned == &peer && topic == "still-in-agent"
+            )),
+            "shutdown dropped a Gossipsub event still in the agent: {events:?}"
+        );
     }
 }
