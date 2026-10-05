@@ -66,23 +66,18 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 ### Wire codecs
 
+**Protobuf wire vocabulary**: The shared field-framing helpers in `minip2p-core` (tags, varints, length-delimited reads, unknown-field skipping, `WireError`). Protocol crates wrap these failures in contextual errors and keep their own message semantics. Distinct from stream length-prefix framing (`encode_frame` / `decode_frame`).
+
 **Payload**: The bytes of one stream read or write, held as a shared handle so fan-out and forwarding clone the handle, not the bytes.
 
 ### Backpressure
 
-**Full**: A stream write that did not fit the stream's send capacity. It is retryable, not a fault; the caller keeps the unsent tail and retries.
-_Avoid_: send failure, buffer overflow
+**Full**: A stream write that did not fit the stream's send capacity. It is retryable, not a fault; the caller keeps the unsent tail and retries. _Avoid_: send failure, buffer overflow
 
-**Unsent tail**: The suffix of a payload a Full write did not accept, handed back to the caller. It is the whole payload when nothing fit.
-_Avoid_: rejected payload, remainder
+**Unsent tail**: The suffix of a payload a Full write did not accept, handed back to the caller. It is the whole payload when nothing fit. _Avoid_: rejected payload, remainder
 
-**Writable**: The one-shot notice that a stream which reported Full can again accept at least half of its smallest send limit. A Full arms it; it fires once, and never if the stream's write side ends first.
-_Avoid_: ready, drain event
+**Writable**: The one-shot notice that a stream which reported Full can again accept at least half of its smallest send limit. A Full arms it; it fires once, and never if the stream's write side ends first. _Avoid_: ready, drain event
 
-**Receive budget**: The most unacknowledged bytes a stream will deliver to its reader. Acknowledging consumed bytes replenishes it, which is what lets the sender continue.
-_Avoid_: read buffer, window (the transport's own term)
+**Receive budget**: The most unacknowledged bytes a stream will deliver to its reader. Acknowledging consumed bytes replenishes it, which is what lets the sender continue. _Avoid_: read buffer, window (the transport's own term)
 
-**Unsettled stream**: A stream whose delivered bytes are not yet all acknowledged or abandoned. It keeps its stream slot even after closing, so stream churn cannot grow retained receive data.
-_Avoid_: zombie stream, lingering stream
-
-**Protobuf wire vocabulary**: The shared field-framing helpers in `minip2p-core` (tags, varints, length-delimited reads, unknown-field skipping, `WireError`). Protocol crates wrap these failures in contextual errors and keep their own message semantics. Distinct from stream length-prefix framing (`encode_frame` / `decode_frame`).
+**Unsettled stream**: A stream whose delivered bytes are not yet all acknowledged or abandoned. It keeps its stream slot even after closing, so stream churn cannot grow retained receive data. _Avoid_: zombie stream, lingering stream
