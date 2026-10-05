@@ -82,6 +82,7 @@ cpu-time = "1.0.0"
 criterion = "0.8.2"
 minip2p-relay = { path = "../relay" }
 minip2p-test-support = { path = "../test-support" }
+stats_alloc = "0.1.10"
 
 [[bench]]
 name = "endpoint_e2e"
@@ -92,3 +93,8 @@ required-features = ["quic", "tcp"]
 name = "endpoint_idle"
 harness = false
 required-features = ["quic", "tcp", "relay-server", "pubsub", "mdns", "bench"]
+
+[[bench]]
+name = "endpoint_throughput"
+harness = false
+required-features = ["quic", "tcp", "nat", "relay-server"]

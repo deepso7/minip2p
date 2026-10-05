@@ -82,7 +82,8 @@ RUN cargo chef cook --release --package minip2p-nodejs --recipe-path recipe.json
     && cargo chef cook --release --package minip2p-quic --benches --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-tcp --benches --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-rs --features tcp --benches --recipe-path recipe.json \
-    && cargo chef cook --release --package minip2p-rs --features tcp,relay-server,pubsub,mdns,bench --benches --recipe-path recipe.json
+    && cargo chef cook --release --package minip2p-rs --features tcp,relay-server,pubsub,mdns,bench --benches --recipe-path recipe.json \
+    && cargo chef cook --release --package minip2p-rs --features tcp,nat,relay-server --benches --recipe-path recipe.json
 
 COPY . .
 
@@ -91,15 +92,19 @@ RUN pnpm --filter @minip2p/node native:build \
     && cargo bench -p minip2p-yamux --bench data_path --no-run \
     && cargo bench -p minip2p-discovery --bench peer_book --no-run \
     && cargo bench -p minip2p-pubsub --bench publish --no-run \
+    && cargo bench -p minip2p-pubsub --bench router --no-run \
+    && cargo bench -p minip2p-pubsub --bench router_allocs --no-run \
     && cargo bench -p minip2p-relay-server --bench relay_server_event --no-run \
     && cargo bench -p minip2p-quic --bench idle_poll --no-run \
     && cargo bench -p minip2p-tcp --bench readiness_poll --no-run \
     && cargo bench -p minip2p-rs --features tcp --bench endpoint_e2e --no-run \
     && cargo bench -p minip2p-rs --features tcp,relay-server,pubsub,mdns,bench --bench endpoint_idle --no-run \
+    && cargo bench -p minip2p-rs --features tcp,nat,relay-server --bench endpoint_throughput --no-run \
     && cargo bench -p minip2p-core --bench multiaddr_ir --no-run \
     && cargo bench -p minip2p-yamux --bench data_path_ir --no-run \
     && cargo bench -p minip2p-discovery --bench peer_book_ir --no-run \
     && cargo bench -p minip2p-pubsub --bench publish_ir --no-run \
+    && cargo bench -p minip2p-pubsub --bench router_ir --no-run \
     && cargo bench -p minip2p-relay-server --bench relay_server_event_ir --no-run
 
 ENTRYPOINT ["scripts/run-fargate-benches.sh"]
