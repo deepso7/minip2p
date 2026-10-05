@@ -24,9 +24,9 @@
 //!   messages of [`MSG_LEN`] bytes per second.
 //!
 //! Each loaded case reads the load's progress (bytes or messages the far end
-//! received) when the first sample is sent and when the last one completes,
-//! and asserts it advanced in between and again afterwards, so the load ran
-//! across the whole window.
+//! received) when the first sample is sent and after every [`CHECKPOINT`]th
+//! sample through the last, and asserts it advanced between each pair of
+//! reads, so the load ran across the whole window.
 //!
 //! Rows (`rtt_us_p50`, `rtt_us_p99`, nearest rank, informational) go to
 //! `target/bench-results/custom/endpoint_ping_load.json` for the `custom`
@@ -50,6 +50,9 @@ const TCP: &str = "/ip4/127.0.0.1/tcp/0";
 /// Pings before sampling, opening and settling the ping stream.
 const WARMUP: usize = 5;
 const SAMPLES: usize = 200;
+/// Samples between load progress checks; divides [`SAMPLES`], so the last
+/// sample is checked.
+const CHECKPOINT: usize = 10;
 /// Minimum spacing between consecutive pings.
 const INTERVAL: Duration = Duration::from_millis(50);
 /// Upper bound for one sample.
@@ -95,12 +98,12 @@ impl Load {
         self.progress.as_ref().map(|p| p.load(Ordering::Acquire))
     }
 
-    /// Drives `m` until the load's progress exceeds `from`, failing after
-    /// [`SETUP_TIMEOUT`]. Does nothing without a load.
-    fn wait_past(&self, m: &mut Endpoint, from: u64) {
+    /// Drives `m` until the far end has received something, failing after
+    /// [`SETUP_TIMEOUT`].
+    fn wait_started(&self, m: &mut Endpoint) {
         let deadline = Instant::now() + SETUP_TIMEOUT;
-        while self.progress().is_some_and(|progress| progress <= from) {
-            assert!(Instant::now() < deadline, "load stalled at {from}");
+        while self.progress() == Some(0) {
+            assert!(Instant::now() < deadline, "load did not start");
             next_event(m, Duration::from_millis(1));
         }
     }
@@ -180,7 +183,7 @@ fn relay_load() -> (Endpoint, Load) {
         progress: Some(received),
         unit: "bytes",
     };
-    load.wait_past(&mut m, 0);
+    load.wait_started(&mut m);
     (m, load)
 }
 
@@ -240,8 +243,13 @@ fn pubsub_load() -> (Endpoint, Load) {
             }
             published += 1;
         }
-        let due = (start + period * published).min(Instant::now() + Duration::from_millis(5));
-        next_event(publisher, due);
+        // Always a future deadline, so a wait after backpressure still polls
+        // and drains the queue.
+        let due = (start + period * published).saturating_duration_since(Instant::now());
+        next_event(
+            publisher,
+            due.clamp(Duration::from_micros(100), Duration::from_millis(5)),
+        );
     });
 
     let load = Load {
@@ -250,7 +258,7 @@ fn pubsub_load() -> (Endpoint, Load) {
         unit: "messages",
     };
     // The first messages may predate the hub's mesh; wait for delivery.
-    load.wait_past(&mut m, 0);
+    load.wait_started(&mut m);
     (m, load)
 }
 
@@ -262,7 +270,10 @@ fn sample(m: &mut Endpoint, peer: &PeerId) -> Duration {
         let event = next_event(m, start + SAMPLE_TIMEOUT).expect("ping sample timed out");
         match event {
             EndpointEvent::PingRttMeasured { peer_id, .. } if &peer_id == peer => {
-                return start.elapsed();
+                // A wait may hand over an event polled just past its deadline.
+                let rtt = start.elapsed();
+                assert!(rtt <= SAMPLE_TIMEOUT, "ping sample took {rtt:?}");
+                return rtt;
             }
             EndpointEvent::PingTimeout { peer_id } => {
                 assert!(&peer_id != peer, "ping timed out");
@@ -306,7 +317,8 @@ fn case(kind: LoadKind, listen: &str) -> Vec<String> {
     for _ in 0..WARMUP {
         sample(&mut m, &probe_peer);
     }
-    let first = load.progress();
+    let mut checkpoint = load.progress();
+    let mut advanced = 0;
     let mut rtts = Vec::with_capacity(SAMPLES);
     let mut sent_at = Instant::now();
     for index in 0..SAMPLES {
@@ -318,14 +330,18 @@ fn case(kind: LoadKind, listen: &str) -> Vec<String> {
             }
         }
         rtts.push(sample(&mut m, &probe_peer));
+        if (index + 1) % CHECKPOINT == 0
+            && let (Some(before), Some(now)) = (checkpoint, load.progress())
+        {
+            assert!(now > before, "load stalled before sample {index}");
+            advanced += now - before;
+            checkpoint = Some(now);
+        }
     }
-    let last = load.progress();
-    let mut advanced = String::new();
-    if let (Some(first), Some(last)) = (first, last) {
-        assert!(last > first, "load made no progress while sampling");
-        load.wait_past(&mut m, last);
-        advanced = format!(", load advanced {} {}", last - first, load.unit);
-    }
+    let advanced = match checkpoint {
+        Some(_) => format!(", load advanced {advanced} {}", load.unit),
+        None => String::new(),
+    };
     drop(load);
 
     rtts.sort_unstable();
