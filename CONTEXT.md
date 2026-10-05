@@ -66,4 +66,6 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 ### Wire codecs
 
+**Payload**: The bytes of one stream read or write, carried as a shared `Bytes` handle (`minip2p_core::Bytes`) through transport, swarm and endpoint events and `send_stream`. Cloning a payload clones the handle, not the bytes (ADR 0011).
+
 **Protobuf wire vocabulary**: The shared field-framing helpers in `minip2p-core` (tags, varints, length-delimited reads, unknown-field skipping, `WireError`). Protocol crates wrap these failures in contextual errors and keep their own message semantics. Distinct from stream length-prefix framing (`encode_frame` / `decode_frame`).
