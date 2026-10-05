@@ -717,6 +717,12 @@ impl ConnectEngine {
         // A kept dial that took the slot leaves the race; the rest stay in
         // it, as one may still win at the peer. A direct connection taking
         // the slot restarts the swarm's window, so theirs restarts with it.
+        // It stays our dial even though the attempt that made it is gone.
+        let ours = self.owner(conn_id).is_some()
+            || self
+                .retained
+                .get(peer_id)
+                .is_some_and(|retained| retained.dials.contains(&conn_id));
         self.forget_retained(conn_id);
         if !conn_id.is_circuit()
             && let Some(retained) = self.retained.get_mut(peer_id)
@@ -732,8 +738,7 @@ impl ConnectEngine {
             .map(|(id, _)| *id)
             .collect();
         let circuit = conn_id.is_circuit();
-        let keep_dials =
-            !circuit && (self.owner(conn_id).is_some() || runtime.local_peer_id() < peer_id);
+        let keep_dials = !circuit && (ours || runtime.local_peer_id() < peer_id);
         for id in ids {
             let Some(mut attempt) = self.attempts.remove(&id) else {
                 continue;
@@ -1937,6 +1942,42 @@ mod tests {
         );
         assert!(runtime.transport().closes.contains(&d3));
         assert!(engine.suppressed.is_empty() && engine.retained.is_empty());
+    }
+
+    #[test]
+    fn a_kept_dial_landing_after_its_attempt_keeps_the_later_attempts_dials() {
+        let peer = peer(b"low");
+        let (d1, d2, d3) = (
+            ConnectionId::new(1),
+            ConnectionId::new(2),
+            ConnectionId::new(3),
+        );
+        let mut runtime = runtime(FakeTransport::default());
+        assert!(
+            runtime.local_peer_id() > &peer,
+            "the peer's dials would lose"
+        );
+        let mut engine = ConnectEngine::new(30_000);
+        let _ = engine.connect(
+            ConnectTarget::try_from(vec![addr(&peer, 1), addr(&peer, 2)]).expect("same peer"),
+            &mut runtime,
+            0,
+        );
+        runtime
+            .transport_mut()
+            .push_connected_with_token(d1, peer.clone(), addr(&peer, 1), 5);
+        let _ = drain(&mut engine, &mut runtime, 0);
+        runtime.transport_mut().push_closed(d1);
+        let _ = drain(&mut engine, &mut runtime, 1);
+
+        // A new attempt dials d3; then the first attempt's kept d2 lands.
+        // Both are ours, and the peer may keep either, so d3 stays up.
+        let _ = engine.connect(ConnectTarget::from(addr(&peer, 3)), &mut runtime, 1);
+        runtime
+            .transport_mut()
+            .push_connected_with_token(d2, peer.clone(), addr(&peer, 2), 9);
+        let _ = drain(&mut engine, &mut runtime, 2);
+        assert!(!runtime.transport().closes.contains(&d3));
     }
 
     #[test]
