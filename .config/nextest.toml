@@ -31,8 +31,10 @@
 # listener state.
 #
 # The filter names that one test rather than its binary. The other four tests in
-# reconnect_churn cost ~1s combined, and the variants do enable QUIC, so
-# excluding the whole binary would drop real coverage to save a second.
+# reconnect_churn are cheap in wall time -- the two that let a connection outlive
+# the swarm's 5s race window before replacing it run in parallel, beside
+# simultaneous_dial's equally long waits -- and the variants do enable QUIC, so
+# excluding the whole binary would drop real coverage to save little.
 #
 # Feature variants run under this profile; the workspace run does not.
 [profile.variants]

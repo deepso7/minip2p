@@ -445,7 +445,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                             Teardown::fault(format!("relay bridge send failed: {error}"))
                         })?;
                 }
-                SessionOutput::Established { peer } => {
+                SessionOutput::Established { peer, .. } => {
                     // The session leaves this policy to its host, and here the
                     // host is this wrapper: a verified direct connection
                     // outranks a relayed one, so the circuit loses.

@@ -22,6 +22,10 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 /// - A dialed connection emits `Connected` exactly once after the handshake
 ///   completes. No stream events may precede `Connected`.
 /// - An incoming connection emits `IncomingConnection` before `Connected`.
+/// - A transport that can derive a [`ConnectionToken`](crate::ConnectionToken)
+///   sets it on the endpoint of `Connected` and `PeerIdentityVerified`, and
+///   both ends of the connection must set the same one. Leave it unset
+///   rather than set one the remote end could compute differently.
 /// - After `close()` is called, the connection eventually emits `Closed`.
 ///   No further events are emitted for that connection id after `Closed`.
 /// - `ConnectionNotFound` is returned for any operation on an unknown or

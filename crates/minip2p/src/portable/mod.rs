@@ -166,10 +166,13 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     ///
     /// Every candidate is dialed immediately. Candidate completion order is
     /// not a public contract. The swarm still keeps a single connection per
-    /// peer: a race loser that finishes after the winner may replace it
-    /// ([`EndpointEvent::ConnectionReplaced`]). The attempt is already
-    /// settled at the first established connection (including a
-    /// simultaneous inbound), and the app sees the hand-over as an ordinary
+    /// peer, chosen the same way on both sides when candidates race (see
+    /// [`SIMULTANEOUS_DIAL_WINDOW_MS`](minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS)):
+    /// a candidate that finishes after the winner may still replace it
+    /// ([`EndpointEvent::ConnectionReplaced`]), so the other candidates stay
+    /// open until that window ends. The attempt is settled at the first
+    /// established connection the swarm keeps (including a simultaneous
+    /// inbound), and the app sees any later hand-over as an ordinary
     /// connection event.
     #[expect(
         clippy::result_large_err,

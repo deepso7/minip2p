@@ -1,10 +1,15 @@
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 
-/// One side of a connection, combining a transport address with an optional peer identity.
+use crate::ConnectionToken;
+
+/// One side of a connection, combining a transport address with an optional
+/// peer identity and, once the handshake completes, the connection's
+/// [`ConnectionToken`].
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ConnectionEndpoint {
     transport: Multiaddr,
     peer_id: Option<PeerId>,
+    token: Option<ConnectionToken>,
 }
 
 impl ConnectionEndpoint {
@@ -13,6 +18,7 @@ impl ConnectionEndpoint {
         Self {
             transport,
             peer_id: None,
+            token: None,
         }
     }
 
@@ -21,6 +27,7 @@ impl ConnectionEndpoint {
         Self {
             transport,
             peer_id: Some(peer_id),
+            token: None,
         }
     }
 
@@ -42,6 +49,19 @@ impl ConnectionEndpoint {
     /// Sets the peer identity.
     pub fn set_peer_id(&mut self, peer_id: PeerId) {
         self.peer_id = Some(peer_id);
+    }
+
+    /// Returns the connection's shared token, if the transport provides one.
+    ///
+    /// Only set on the endpoints of `Connected` and `PeerIdentityVerified`,
+    /// and only by transports that can derive one; see [`ConnectionToken`].
+    pub fn token(&self) -> Option<ConnectionToken> {
+        self.token
+    }
+
+    /// Sets the connection's shared token.
+    pub fn set_token(&mut self, token: ConnectionToken) {
+        self.token = Some(token);
     }
 
     /// Converts to a [`PeerAddr`], returning `None` if no peer id is set.

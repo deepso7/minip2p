@@ -9,6 +9,7 @@ This crate defines the transport abstraction that concrete adapters implement â€
 - `Transport` trait with a `poll(now)`-based event model; the host supplies the time.
 - `ConnectionId` and `StreamId` identifiers, with `ConnectionNamespace` keeping each transport's id space disjoint.
 - Connection lifecycle events (`Connected`, `Closed`, `IncomingConnection`, `PeerIdentityVerified`, `Listening`).
+- `ConnectionToken`: a 32-byte value both ends of one connection compute identically, set on the `ConnectionEndpoint` of `Connected`/`PeerIdentityVerified` by transports that can derive one (QUIC from its connection IDs, TCP from the Noise handshake hash). The swarm uses it to settle two same-direction connections to one peer the same way on both sides; transports without one leave it `None`.
 - Stream lifecycle events (`StreamOpened`, `IncomingStream`, `StreamData`, `StreamRemoteWriteClosed`, `StreamWriteStopped`, `StreamClosed`). `StreamWriteStopped` is QUIC's STOP_SENDING; byte-stream transports never emit it.
 - Host intents via trait methods: `dial`, `listen`, `open_stream`, `send_stream`, `close_stream_write`, `reset_stream`, `close`.
 - Typed error model with transport, connection, and stream context.

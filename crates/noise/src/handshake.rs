@@ -17,6 +17,8 @@ pub(crate) struct HandshakeResult {
     pub(crate) receive: CipherState,
     pub(crate) peer: PeerId,
     pub(crate) identity_key: PublicKey,
+    /// Final handshake hash `h`, identical on both ends.
+    pub(crate) handshake_hash: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,6 +258,7 @@ impl HandshakeState {
             receive,
             peer,
             identity_key,
+            handshake_hash: self.symmetric.hash,
         }
     }
 }

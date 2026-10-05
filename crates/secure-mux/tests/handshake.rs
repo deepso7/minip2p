@@ -82,7 +82,14 @@ fn exchange(
 
 fn established_peer(events: &[SessionOutput]) -> Option<&PeerId> {
     events.iter().find_map(|event| match event {
-        SessionOutput::Established { peer } => Some(peer),
+        SessionOutput::Established { peer, .. } => Some(peer),
+        _ => None,
+    })
+}
+
+fn established_hash(events: &[SessionOutput]) -> Option<[u8; 32]> {
+    events.iter().find_map(|event| match event {
+        SessionOutput::Established { handshake_hash, .. } => Some(*handshake_hash),
         _ => None,
     })
 }
@@ -136,6 +143,12 @@ fn two_sessions_complete_the_upgrade_and_authenticate_each_other() {
     assert_eq!(established_peer(&listener_events), Some(&dialer_peer));
     assert_eq!(dialer.peer(), Some(&listener_peer));
     assert_eq!(listener.peer(), Some(&dialer_peer));
+    // Both ends name the session with the same handshake hash.
+    assert_eq!(
+        established_hash(&dialer_events),
+        established_hash(&listener_events)
+    );
+    assert!(established_hash(&dialer_events).is_some());
 }
 
 /// Feeds every write `from` has queued to `to` as one input, so `to` decrypts

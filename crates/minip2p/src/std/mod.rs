@@ -393,11 +393,14 @@ impl Endpoint {
     ///
     /// Every `/ip4` and `/ip6` candidate is dialed immediately, and the relay
     /// leg (when there is one) starts at once. Candidate completion order is
-    /// not a public contract. The swarm still keeps a
-    /// single connection per peer: a race loser that finishes after the winner
-    /// may replace it ([`EndpointEvent::ConnectionReplaced`]). The attempt is
-    /// already settled at the first established connection (including a
-    /// simultaneous inbound), and the app sees the hand-over as an ordinary
+    /// not a public contract. The swarm still keeps a single connection per
+    /// peer, chosen the same way on both sides when candidates race (see
+    /// [`SIMULTANEOUS_DIAL_WINDOW_MS`](minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS)):
+    /// a candidate that finishes after the winner may still replace it
+    /// ([`EndpointEvent::ConnectionReplaced`]), so the other candidates stay
+    /// open until that window ends. The attempt is settled at the first
+    /// established connection the swarm keeps (including a simultaneous
+    /// inbound), and the app sees any later hand-over as an ordinary
     /// connection event.
     ///
     /// Candidates may name the IP family explicitly (`/ip4`, `/ip6`) or a
