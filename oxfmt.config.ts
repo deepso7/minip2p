@@ -19,5 +19,6 @@ export default defineConfig({
     "examples/react-native/ios",
     "bindings/ts/react-native/src/NativeMinip2p.ts",
     "bindings/ts/react-native/src/native.tsx",
+    "bindings/ts/node/src/addon.d.ts",
   ],
 });

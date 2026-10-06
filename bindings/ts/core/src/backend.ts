@@ -110,6 +110,8 @@ export interface Minip2pBackend {
 }
 
 export { resolveEndpointConfig, type BackendEndpointConfig } from "./config.js";
+export { EventDrain } from "./event-drain.js";
+export { ConnectionIdMap, u64ToNumber } from "./native-ids.js";
 export {
   P2pEvent_Tags,
   PathKind_Tags,

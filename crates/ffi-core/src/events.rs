@@ -9,24 +9,44 @@ use minip2p_swarm::SwarmErrorKind;
 /// Foreign-friendly snapshot of a peer's Identify message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
 pub struct IdentifyInfo {
     /// Protobuf-encoded libp2p public key, when supplied.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "crate::js_shape::optional_bytes"
+        )
+    )]
     pub public_key: Option<Vec<u8>>,
     /// Listen addresses advertised by the peer.
     pub listen_addrs: Vec<String>,
     /// Protocol ids advertised by the peer.
     pub protocols: Vec<String>,
     /// Address the peer observed for this endpoint, when supplied.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub observed_addr: Option<String>,
     /// Remote libp2p protocol version, when supplied.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub protocol_version: Option<String>,
     /// Remote agent version, when supplied.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub agent_version: Option<String>,
 }
 
 /// Full identity allocated for an outbound application stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
 pub struct OpenStreamResult {
     /// Transport connection carrying the stream.
     pub conn_id: u64,
@@ -37,21 +57,29 @@ pub struct OpenStreamResult {
 /// State snapshot of the transport connection selected for a peer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
 pub struct ConnectionInfo {
     /// Endpoint-local transport connection id.
     pub conn_id: u64,
     /// Remote transport address, when recorded.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub remote_addr: Option<String>,
     /// Protocols this connection advertised through Identify, once it is
     /// ready (`PeerReady` for this `conn_id`); `None` until then. Readiness,
     /// connection and protocols come from one snapshot, so a ready wait can
     /// trust them together.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub ready_protocols: Option<Vec<String>>,
 }
 
 /// Coarse local reachability state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Reachability {
     /// Not enough evidence is available.
     Unknown,
@@ -64,6 +92,11 @@ pub enum Reachability {
 /// Kind of usable connection path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(tag = "tag", content = "inner", rename_all_fields = "camelCase")
+)]
 pub enum PathKind {
     /// A known address was dialed directly.
     DirectDialed,
@@ -79,6 +112,7 @@ pub enum PathKind {
 /// Source that contributed a discovery observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum DiscoverySource {
     /// Public-key-authenticated signed beacon.
     SignedBeacon,
@@ -89,6 +123,7 @@ pub enum DiscoverySource {
 /// Category of a non-fatal endpoint runtime error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum EndpointErrorKind {
     /// Underlying transport operation failed.
     Transport,
@@ -111,6 +146,7 @@ pub enum EndpointErrorKind {
 /// Category of a failed NAT connection attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum NatErrorKind {
     /// No usable direct or relayed path exists.
     NoPathAvailable,
@@ -127,6 +163,7 @@ pub enum NatErrorKind {
 /// Category of a fatal background-driver failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum DriverFailureKind {
     /// The transport driver failed.
     Transport,
@@ -141,6 +178,11 @@ pub enum DriverFailureKind {
 /// Event delivered by the native endpoint driver.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(tag = "tag", content = "inner", rename_all_fields = "camelCase")
+)]
 pub enum P2pEvent {
     /// Native event carry overflow discarded source events.
     EventsDropped {
@@ -240,6 +282,7 @@ pub enum P2pEvent {
         /// Opaque stream id.
         stream_id: u64,
         /// Received bytes.
+        #[cfg_attr(feature = "serde", serde(serialize_with = "crate::js_shape::bytes"))]
         data: Vec<u8>,
     },
     /// The remote peer half-closed its stream write side.
@@ -265,10 +308,13 @@ pub enum P2pEvent {
         /// Machine-readable category.
         kind: EndpointErrorKind,
         /// Remote peer, when known.
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         peer_id: Option<String>,
         /// Transport connection, when known.
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         conn_id: Option<u64>,
         /// Transport stream, when known.
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         stream_id: Option<u64>,
         /// Human-readable diagnostic detail.
         detail: String,
@@ -292,6 +338,7 @@ pub enum P2pEvent {
         /// Relay holding the reservation.
         relay_peer_id: String,
         /// Absolute relay-reported expiry, when present.
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         expires_unix_secs: Option<u64>,
     },
     /// A relay reservation was lost.
@@ -372,8 +419,10 @@ pub enum P2pEvent {
         /// Topics carried by the message.
         topics: Vec<String>,
         /// Application payload.
+        #[cfg_attr(feature = "serde", serde(serialize_with = "crate::js_shape::bytes"))]
         data: Vec<u8>,
         /// Opaque publisher sequence number.
+        #[cfg_attr(feature = "serde", serde(serialize_with = "crate::js_shape::bytes"))]
         seqno: Vec<u8>,
         /// Whether the message carried a verified signature.
         signed: bool,
@@ -439,6 +488,7 @@ pub enum P2pEvent {
     /// A discovery source supplied an invalid claim.
     DiscoveryProtocolViolation {
         /// Claimed peer, when identifiable.
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         peer_id: Option<String>,
         /// Observation source.
         source: DiscoverySource,

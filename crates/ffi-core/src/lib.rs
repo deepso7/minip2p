@@ -20,6 +20,8 @@ mod driver;
 mod endpoint;
 mod error;
 mod events;
+#[cfg(feature = "serde")]
+mod js_shape;
 
 pub use config::{
     DiscoveryOptions, EndpointConfig, KnownPeerInfo, MdnsOptions, RelayReservationInfo,

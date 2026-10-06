@@ -2,6 +2,8 @@
 
 import { createRequire } from "node:module";
 
+import type * as Addon from "./addon.js";
+
 const require = createRequire(import.meta.url);
 
 const supportedTargets = [
@@ -44,88 +46,11 @@ function unsupportedTarget(target: string, cause?: unknown): Error {
   );
 }
 
-interface NativeEndpointConfig {
-  readonly agentVersion?: string;
-  readonly allowUnsigned: boolean;
-  readonly autonatServers: string[];
-  readonly forceRelay: boolean;
-  readonly discovery?: {
-    readonly autoDial: boolean;
-    readonly beaconIntervalMs: bigint;
-    readonly peerTtlMs: bigint;
-    readonly topic: string;
-  };
-  readonly listen?: string[];
-  readonly mdns?: {
-    readonly autoDial: boolean;
-    readonly enableIpv6: boolean;
-    readonly interfaceRefreshMs: bigint;
-    readonly maxAnnouncedAddrs: number;
-    readonly maxPacketBytes: number;
-    readonly queryIntervalMs: bigint;
-    readonly socketPollIntervalMs: bigint;
-    readonly ttlMs: bigint;
-  };
-  readonly protocols: string[];
-  readonly relays: string[];
-}
+/** The addon's exports, typed by the `addon.d.ts` that `native:build` generates. */
+type NativeBinding = typeof Addon;
 
-export interface NativeEndpoint {
-  abandonStream: (peerId: string, connId: bigint, streamId: bigint) => void;
-  activeReservation: () => unknown;
-  addProtocol: (protocolId: string) => void;
-  cancelConnect: (id: bigint) => void;
-  close: () => void;
-  closeStreamWrite: (peerId: string, connId: bigint, streamId: bigint) => void;
-  connectedPeers: () => string[];
-  connectionInfo: (peerId: string) =>
-    | {
-        readonly connId: bigint;
-        readonly remoteAddr?: string | null;
-        readonly readyProtocols?: string[] | null;
-      }
-    | null
-    | undefined;
-  connect: (target: string | string[]) => bigint;
-  disconnect: (peerId: string) => void;
-  discoveryNowMs: () => bigint | null | undefined;
-  drainEvents: (limit: number) => unknown[];
-  isRunning: () => boolean;
-  isPeerReady: (peerId: string) => boolean;
-  knownPeers: () => unknown[];
-  listenAddrs: () => string[];
-  openStream: (
-    peerId: string,
-    protocolId: string
-  ) => { readonly connId: bigint; readonly streamId: bigint };
-  path: (peerId: string) => unknown;
-  peerId: () => string;
-  peerInfo: (peerId: string) => unknown;
-  ping: (peerId: string) => void;
-  publish: (topic: string, data: Uint8Array) => void;
-  reachability: () => number;
-  resetStream: (peerId: string, connId: bigint, streamId: bigint) => void;
-  sendStream: (
-    peerId: string,
-    connId: bigint,
-    streamId: bigint,
-    data: Uint8Array
-  ) => void;
-  setActive: (active: boolean) => void;
-  start: (doorbell: () => void) => void;
-  subscribe: (topic: string) => boolean;
-  unsubscribe: (topic: string) => boolean;
-}
-
-interface NativeBinding {
-  readonly NodeEndpoint: new (
-    secretKey: Uint8Array,
-    config: NativeEndpointConfig
-  ) => NativeEndpoint;
-  circuitAddress: (relayAddress: string, peerId: string) => string;
-  generateSecretKey: () => Uint8Array;
-  peerIdFromSecretKey: (secretKey: Uint8Array) => string;
-}
+/** A native endpoint instance. */
+export type NativeEndpoint = Addon.NodeEndpoint;
 
 function loadNativeBinding(target: string): NativeBinding {
   if (!supportedTargets.includes(target as SupportedTarget)) {

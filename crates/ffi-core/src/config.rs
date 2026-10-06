@@ -81,6 +81,11 @@ pub struct EndpointConfig {
 /// One peer in the shared discovery address book.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
 pub struct KnownPeerInfo {
     /// Discovered peer.
     pub peer_id: String,
@@ -91,8 +96,10 @@ pub struct KnownPeerInfo {
     /// Addresses learned from unauthenticated mDNS.
     pub mdns_addrs: Vec<String>,
     /// Age of the most recent signed beacon.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub beacon_last_seen_age_ms: Option<u64>,
     /// Age of the most recent mDNS observation.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub mdns_last_seen_age_ms: Option<u64>,
     /// Whether the endpoint currently has a connection to this peer.
     pub connected: bool,
@@ -101,10 +108,16 @@ pub struct KnownPeerInfo {
 /// Snapshot of the active inbound relay reservation.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
 pub struct RelayReservationInfo {
     /// Relay holding the reservation.
     pub relay_peer_id: String,
     /// Absolute relay-reported expiry, when present.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub expires_unix_secs: Option<u64>,
 }
 

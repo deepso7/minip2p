@@ -2,13 +2,20 @@
 
 const DEFAULT_BATCH_LIMIT = 256;
 
+/** Runs a task on a later event-loop turn. */
 type Scheduler = (task: () => void) => void;
 
 const scheduleOnNextTurn: Scheduler = (task) => {
   setTimeout(task, 0);
 };
 
-/** Coalesces native doorbells and drains bounded event batches off the callback stack. */
+/**
+ * Coalesces native doorbells and drains bounded event batches off the
+ * callback stack, yielding one scheduler turn between batches. Delivery
+ * errors are swallowed so an application callback or a malformed event cannot
+ * stop draining. The default scheduler is `setTimeout(task, 0)`; Node passes
+ * `setImmediate` to skip the timer granularity.
+ */
 export class EventDrain<Event> {
   readonly #drain: (limit: number) => Event[];
   readonly #deliver: (event: Event) => void;

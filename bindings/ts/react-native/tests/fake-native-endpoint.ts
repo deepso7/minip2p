@@ -10,6 +10,7 @@ import type {
   P2pEndpointLike,
   P2pEvent,
   P2pEventDoorbell,
+  Reachability,
 } from "../src/native";
 
 /**
@@ -39,6 +40,8 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
   readonly drainLimits: number[] = [];
   /** Native identities returned by the next `openStream` call. */
   nextStream = { connId: 1n, streamId: 1n };
+  /** Native verdict returned by `reachability`. */
+  nativeReachability: Reachability | undefined = undefined;
   /** Native discovery clock returned by `discoveryNowMs`. */
   discoveryNow: bigint | undefined = undefined;
   /** Targets passed to `connect`, in call order. */
@@ -179,8 +182,11 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     throw this.publishError ?? notFaked("publish");
   }
 
-  reachability(): never {
-    return notFaked("reachability");
+  reachability(): Reachability {
+    if (this.nativeReachability === undefined) {
+      return notFaked("reachability");
+    }
+    return this.nativeReachability;
   }
 
   resetStream(): never {
@@ -220,12 +226,16 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
 
 /** Factory for `vi.mock("../src/native", nativeModuleMock)`. */
 export const nativeModuleMock = async () => {
-  const { ConnectTarget, FfiError_Tags } =
-    await import("../src/generated/minip2p_ffi_core");
+  const generated = await import("../src/generated/minip2p_ffi_core");
   return {
-    ConnectTarget,
-    FfiError_Tags,
+    ConnectTarget: generated.ConnectTarget,
+    DiscoverySource: generated.DiscoverySource,
+    DriverFailureKind: generated.DriverFailureKind,
+    EndpointErrorKind: generated.EndpointErrorKind,
+    FfiError_Tags: generated.FfiError_Tags,
+    NatErrorKind: generated.NatErrorKind,
     P2pEndpoint: FakeNativeEndpoint,
+    Reachability: generated.Reachability,
     circuitAddress: vi.fn(),
     generateSecretKey: vi.fn(),
     peerIdFromSecretKey: vi.fn(),

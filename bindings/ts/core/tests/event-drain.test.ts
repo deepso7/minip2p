@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 
-import { EventDrain } from "../src/event-drain";
+import { EventDrain } from "../src/event-drain.js";
 
 const settle = async (): Promise<void> => {
   await vi.runAllTimersAsync();
