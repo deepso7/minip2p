@@ -3,7 +3,7 @@ import type { NativeEventLiteral } from "@minip2p/test-fixtures/adapter-contract
 import { afterEach, vi } from "vitest";
 
 import { Minip2p } from "../src/adapter";
-import { ConnectTarget_Tags } from "../src/generated/minip2p_ffi";
+import { ConnectTarget_Tags } from "../src/generated/minip2p_ffi_core";
 import { FakeNativeEndpoint } from "./fake-native-endpoint";
 
 vi.mock("../src/native", async () => {

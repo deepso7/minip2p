@@ -2,6 +2,7 @@
 
 /// An error returned by a synchronous FFI operation.
 #[derive(Debug, thiserror::Error)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
 pub enum FfiError {
     /// The endpoint's background driver was already started.
     #[error("endpoint driver already started")]

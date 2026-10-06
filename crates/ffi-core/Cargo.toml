@@ -21,6 +21,13 @@ minip2p = { package = "minip2p-rs", path = "../minip2p", features = [
 minip2p-swarm = { path = "../swarm" }
 minip2p-pubsub = { path = "../pubsub" }
 thiserror = "2.0.20"
+# Must remain paired with crates/ffi, ubrn and @ubjs/core 0.31.0-5.
+uniffi = { version = "=0.31.2", optional = true }
+
+[features]
+# Derives the UniFFI record, enum and error metadata for the UniFFI binding
+# shell (`crates/ffi`). Other shells leave it off.
+uniffi = ["dep:uniffi"]
 
 [dev-dependencies]
 minip2p-relay = { path = "../relay" }

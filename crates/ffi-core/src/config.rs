@@ -4,6 +4,7 @@ use std::fmt;
 
 /// Signed-discovery configuration.
 #[derive(Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DiscoveryOptions {
     /// Pubsub topic carrying signed discovery beacons.
     pub topic: String,
@@ -29,6 +30,7 @@ impl fmt::Debug for DiscoveryOptions {
 
 /// Local-link mDNS discovery configuration.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct MdnsOptions {
     /// Whether IPv6 interfaces and advertisements are enabled.
     pub enable_ipv6: bool,
@@ -50,6 +52,7 @@ pub struct MdnsOptions {
 
 /// Configuration used to construct an FFI endpoint.
 #[derive(Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct EndpointConfig {
     /// Identify agent version, or the crate-derived default when absent.
     pub agent_version: Option<String>,
@@ -77,6 +80,7 @@ pub struct EndpointConfig {
 
 /// One peer in the shared discovery address book.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct KnownPeerInfo {
     /// Discovered peer.
     pub peer_id: String,
@@ -96,6 +100,7 @@ pub struct KnownPeerInfo {
 
 /// Snapshot of the active inbound relay reservation.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RelayReservationInfo {
     /// Relay holding the reservation.
     pub relay_peer_id: String,

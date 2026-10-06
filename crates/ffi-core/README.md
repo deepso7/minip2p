@@ -6,6 +6,8 @@ Bindings register an [`EventDoorbell`](https://docs.rs/minip2p-ffi-core/latest/m
 
 Connection attempts follow one contract: `connect(target)` admits an attempt under a single Connect ID and the event stream carries exactly one terminal for it — `PathEstablished`, `ConnectFailed`, or `ConnectCancelled` after `cancel_connect`. If the carry drops a terminal, `EventsDropped::terminal_connect_ids` names its Connect ID so a foreign wait settles with a delivery-loss error and recovers through the State getters (`connected_peers`, `connection_info`, `path`, `known_peers`, `listen_addrs`). The detached driver owns the endpoint's wait outcomes — event, deadline, interrupted — and releases ownership on interruption so commands never deadlock. It sets no polling cadence of its own: the endpoint wait already wakes for every timer its transports, protocols, and agents report, and every command, query, and `stop` interrupts it, so an idle single-transport endpoint sleeps until something is due (a QUIC plus TCP endpoint still alternates short per-transport waits). `set_active` is accepted for compatibility and has no effect.
 
+The optional `uniffi` feature (off by default) derives the UniFFI record, enum and error metadata on the config, event and error types, making this crate its own UniFFI namespace for the `minip2p-ffi` shell. Other shells build without UniFFI.
+
 Listening is address-shaped: `EndpointConfig::listen` takes multiaddresses whose shape selects QUIC or TCP. Leaving it `None` binds the QUIC dual-stack defaults; an explicit empty list is rejected.
 
 The crate is an internal workspace component and is not published.

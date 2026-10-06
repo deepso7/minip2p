@@ -74,6 +74,7 @@ run(
     "turbo-module",
     "--config",
     "ubrn.config.yaml",
+    "minip2p_ffi_core",
     "minip2p_ffi",
   ],
   packageRoot,

@@ -1302,6 +1302,7 @@ dependencies = [
  "minip2p-test-support",
  "serde_json",
  "thiserror",
+ "uniffi",
 ]
 
 [[package]]

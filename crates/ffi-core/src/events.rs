@@ -8,6 +8,7 @@ use minip2p_swarm::SwarmErrorKind;
 
 /// Foreign-friendly snapshot of a peer's Identify message.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct IdentifyInfo {
     /// Protobuf-encoded libp2p public key, when supplied.
     pub public_key: Option<Vec<u8>>,
@@ -25,6 +26,7 @@ pub struct IdentifyInfo {
 
 /// Full identity allocated for an outbound application stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct OpenStreamResult {
     /// Transport connection carrying the stream.
     pub conn_id: u64,
@@ -34,6 +36,7 @@ pub struct OpenStreamResult {
 
 /// State snapshot of the transport connection selected for a peer.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ConnectionInfo {
     /// Endpoint-local transport connection id.
     pub conn_id: u64,
@@ -48,6 +51,7 @@ pub struct ConnectionInfo {
 
 /// Coarse local reachability state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum Reachability {
     /// Not enough evidence is available.
     Unknown,
@@ -59,6 +63,7 @@ pub enum Reachability {
 
 /// Kind of usable connection path.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum PathKind {
     /// A known address was dialed directly.
     DirectDialed,
@@ -73,6 +78,7 @@ pub enum PathKind {
 
 /// Source that contributed a discovery observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum DiscoverySource {
     /// Public-key-authenticated signed beacon.
     SignedBeacon,
@@ -82,6 +88,7 @@ pub enum DiscoverySource {
 
 /// Category of a non-fatal endpoint runtime error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum EndpointErrorKind {
     /// Underlying transport operation failed.
     Transport,
@@ -103,6 +110,7 @@ pub enum EndpointErrorKind {
 
 /// Category of a failed NAT connection attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum NatErrorKind {
     /// No usable direct or relayed path exists.
     NoPathAvailable,
@@ -118,6 +126,7 @@ pub enum NatErrorKind {
 
 /// Category of a fatal background-driver failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum DriverFailureKind {
     /// The transport driver failed.
     Transport,
@@ -131,6 +140,7 @@ pub enum DriverFailureKind {
 
 /// Event delivered by the native endpoint driver.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum P2pEvent {
     /// Native event carry overflow discarded source events.
     EventsDropped {
