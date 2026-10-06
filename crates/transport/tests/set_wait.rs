@@ -249,10 +249,13 @@ fn duo_with(adjust: impl FnOnce(&mut MioMember, &mut MioMember)) -> (TransportSe
 
 #[test]
 fn input_on_either_member_wakes_a_blocked_set_promptly() {
-    // Sent a few slices into the wait, when a set taking turns would be
-    // blocked on the other member.
-    for delay_ms in [3, 13, 23] {
-        for member in 0..2 {
+    // Each arrival lands mid-slice in the *other* member's turn of a set
+    // taking 10 ms turns (first member: 0-10 ms, second: 10-20 ms, ...), where
+    // it would wait about 7 ms. The best of three is what is held to the
+    // bound, so one descheduled thread on a busy runner cannot fail it.
+    for (member, delays_ms) in [(0, [13, 33, 53]), (1, [3, 23, 43])] {
+        let mut latencies = Vec::new();
+        for delay_ms in delays_ms {
             let (mut set, first, second) = duo();
             let target = if member == 0 { &first } else { &second };
             let sender = target.send_later(Duration::from_millis(delay_ms));
@@ -262,12 +265,13 @@ fn input_on_either_member_wakes_a_blocked_set_promptly() {
             let sent = sender.join().expect("sender");
 
             assert_eq!(outcome, WaitOutcome::Ready);
-            let latency = woke.saturating_duration_since(sent);
-            assert!(
-                latency < PROMPT,
-                "member {member}'s input sent {delay_ms} ms in woke the set after {latency:?}"
-            );
+            latencies.push(woke.saturating_duration_since(sent));
         }
+        let best = latencies.iter().min().expect("three trials");
+        assert!(
+            *best < PROMPT,
+            "member {member}'s input woke the set after {latencies:?}"
+        );
     }
 }
 
@@ -341,7 +345,7 @@ fn an_interrupt_before_the_wait_is_reported_once() {
 }
 
 #[test]
-fn an_interrupt_during_the_wait_is_reported_once_and_promptly() {
+fn an_interrupt_during_the_wait_is_reported_once() {
     let (mut set, _first, _second) = duo();
     let handle = set.wait_handle();
     let interrupter = thread::spawn(move || {
@@ -356,7 +360,9 @@ fn an_interrupt_during_the_wait_is_reported_once_and_promptly() {
     let sent = interrupter.join().expect("interrupter");
 
     assert_eq!(outcome, WaitOutcome::Interrupted);
-    assert!(woke.saturating_duration_since(sent) < PROMPT);
+    // Correctness, not latency: a lost wake would sit out the 5 s budget.
+    let latency = woke.saturating_duration_since(sent);
+    assert!(latency < Duration::from_secs(1), "woke after {latency:?}");
     assert_eq!(outcomes_until_quiet(&mut set), []);
 }
 

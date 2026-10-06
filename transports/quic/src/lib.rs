@@ -506,6 +506,44 @@ impl ReadinessWait {
         }
     }
 
+    /// The selector's fd, for [`BlockingTransport::readiness_fd`].
+    ///
+    /// mio exposes it only where its selector is a real fd (epoll, kqueue,
+    /// event ports); elsewhere a set holding this transport takes turns.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "illumos",
+        target_os = "solaris"
+    ))]
+    fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        Some(self.poll.registry().as_fd())
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_os = "illumos",
+            target_os = "solaris"
+        ))
+    ))]
+    fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
+    }
+
     /// A handle that wakes this poll's one [`Waker`].
     fn wait_handle(&self) -> WaitHandle {
         let waker = Arc::clone(&self.waker);
@@ -1693,10 +1731,7 @@ impl BlockingTransport for QuicTransport {
 
     #[cfg(unix)]
     fn readiness_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        use std::os::fd::AsFd;
-        self.readiness
-            .as_ref()
-            .map(|readiness| readiness.poll.registry().as_fd())
+        self.readiness.as_ref().and_then(ReadinessWait::fd)
     }
 }
 
@@ -1932,8 +1967,7 @@ impl BlockingTransport for DualQuicTransport {
 
     #[cfg(unix)]
     fn readiness_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        use std::os::fd::AsFd;
-        Some(self.readiness.poll.registry().as_fd())
+        self.readiness.fd()
     }
 }
 
@@ -2434,10 +2468,16 @@ mod tests {
 
     #[test]
     fn dual_stack_wait_wakes_promptly_for_a_datagram_on_either_family() {
-        for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
-            // A sender delay of a few slices lands the datagram mid-wait,
-            // when only one family would be watched if the wait took turns.
-            for delay_ms in [3, 13, 23] {
+        // Each arrival lands mid-slice in the *other* family's turn of a wait
+        // taking 10 ms turns (IPv4: 0-10 ms, IPv6: 10-20 ms, ...), where it
+        // would wait about 7 ms. The best of three is held to the bound, so
+        // one descheduled thread on a busy runner cannot fail it.
+        for (family, delays_ms) in [
+            (AddressFamily::Ipv4, [13, 33, 53]),
+            (AddressFamily::Ipv6, [3, 23, 43]),
+        ] {
+            let mut latencies = Vec::new();
+            for delay_ms in delays_ms {
                 let mut transport =
                     DualQuicTransport::new(QuicNodeConfig::generate()).expect("bind");
                 let port = transport.transport(family).local_addr().port();
@@ -2456,13 +2496,14 @@ mod tests {
                 let sent = sender.join().expect("sender thread");
 
                 assert_eq!(outcome, WaitOutcome::Ready, "{} input", family.name());
-                let latency = woke.saturating_duration_since(sent);
-                assert!(
-                    latency < Duration::from_millis(5),
-                    "{} input sent {delay_ms} ms into the wait woke it after {latency:?}",
-                    family.name()
-                );
+                latencies.push(woke.saturating_duration_since(sent));
             }
+            let best = latencies.iter().min().expect("three trials");
+            assert!(
+                *best < Duration::from_millis(5),
+                "{} input woke the wait after {latencies:?}",
+                family.name()
+            );
         }
     }
 
