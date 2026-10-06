@@ -11,9 +11,9 @@ const scheduleOnNextTurn: Scheduler = (task) => {
 
 /**
  * Coalesces native doorbells and drains bounded event batches off the
- * callback stack, yielding one scheduler turn between batches. Delivery
- * errors are swallowed so an application callback or a malformed event cannot
- * stop draining. The default scheduler is `setTimeout(task, 0)`; Node passes
+ * callback stack, yielding one scheduler turn between batches. Errors that
+ * `deliver` throws synchronously are swallowed so an application callback or
+ * a malformed event cannot stop draining. The default scheduler is `setTimeout(task, 0)`; Node passes
  * `setImmediate` to skip the timer granularity.
  */
 export class EventDrain<Event> {
