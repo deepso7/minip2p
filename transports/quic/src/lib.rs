@@ -2398,22 +2398,31 @@ mod tests {
         }
     }
 
-    /// Whether `fd` reads as ready right now, without consuming anything.
-    #[cfg(unix)]
-    fn fd_is_readable(fd: std::os::fd::BorrowedFd<'_>) -> bool {
-        use rustix::event::{PollFd, PollFlags, Timespec, poll};
-        let mut fds = [PollFd::from_borrowed_fd(fd, PollFlags::IN)];
-        poll(&mut fds, Some(&Timespec::default())).expect("poll readiness fd") > 0
-    }
-
     /// The drain-before-block invariant of `BlockingTransport::readiness_fd`:
     /// once `poll` has taken the input, a zero-timeout wait answers
     /// `TimedOut` and leaves the fd unreadable, so an enclosing `poll(2)` can
     /// block on it. Linux epoll re-checks a stale entry when its fd is polled,
     /// so this mainly guards kqueue, which does not.
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "illumos",
+        target_os = "solaris"
+    ))]
     #[test]
     fn a_zero_timeout_wait_that_times_out_leaves_the_readiness_fd_unreadable() {
+        /// Whether `fd` reads as ready right now, without consuming anything.
+        fn fd_is_readable(fd: std::os::fd::BorrowedFd<'_>) -> bool {
+            use rustix::event::{PollFd, PollFlags, Timespec, poll};
+            let mut fds = [PollFd::from_borrowed_fd(fd, PollFlags::IN)];
+            poll(&mut fds, Some(&Timespec::default())).expect("poll readiness fd") > 0
+        }
+
         fn check(transport: &mut dyn BlockingTransport, family: AddressFamily) {
             assert_eq!(transport.wait_for_input(Duration::ZERO), WaitOutcome::Ready);
             transport.poll(Now::from_millis(0)).expect("poll");

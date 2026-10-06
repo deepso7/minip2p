@@ -3,7 +3,24 @@
 //! The members are mio-backed fakes built the way the real adapters are: one
 //! edge-triggered selector over a UDP socket and a `Waker`, harvested by every
 //! zero-timeout probe and by `poll`, which reads the socket directly.
-#![cfg(all(unix, feature = "std"))]
+//!
+//! Gated to the targets where mio's selector is an fd (epoll, kqueue, event
+//! ports); elsewhere the set's turn-taking fallback is covered by the unit
+//! tests in `set.rs`.
+#![cfg(all(
+    feature = "std",
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "illumos",
+        target_os = "solaris"
+    )
+))]
 
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsFd, BorrowedFd};
