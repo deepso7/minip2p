@@ -34,6 +34,12 @@ minip2p-ping = { path = "../../crates/ping" }
 minip2p-swarm = { path = "../../crates/swarm" }
 minip2p-identity = { path = "../../crates/identity" }
 
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1.4", default-features = false, features = [
+  "std",
+  "event",
+] }
+
 [[bench]]
 name = "idle_poll"
 harness = false

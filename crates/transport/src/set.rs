@@ -466,11 +466,17 @@ mod blocking_set {
     use alloc::vec::Vec;
     use core::time::Duration;
 
-    /// How long one member may hold the wait before the next gets a turn.
+    /// How long one member may hold the wait before the next gets a turn, in
+    /// the fallback that takes turns.
     ///
     /// Short enough that a member with input waiting is not sat on for long,
     /// long enough that a set of quiet members is not a spin loop.
     const SLICE: Duration = Duration::from_millis(10);
+
+    /// The longest single `poll(2)`. Platforms without `ppoll` reject
+    /// timeouts past `c_int::MAX` milliseconds; a longer wait loops.
+    #[cfg(unix)]
+    const MAX_POLL: Duration = Duration::from_secs(3600);
 
     impl TransportSet {
         /// Answers one logical interrupt once.
@@ -507,7 +513,7 @@ mod blocking_set {
     fn member_wait(member: &mut super::BoxedTransport, timeout: Duration) -> WaitOutcome {
         let outcome = member.wait_for_input(timeout);
         #[cfg(feature = "bench")]
-        crate::bench::record_member_wait(timeout, outcome);
+        crate::bench::record_blocking_wait(timeout, outcome);
         outcome
     }
 
@@ -520,10 +526,10 @@ mod blocking_set {
         }
 
         fn wait_handle(&self) -> WaitHandle {
-            // The set blocks inside whichever member holds the current slice,
-            // and a caller cannot know which. Nudging all of them is what makes
-            // one handle interrupt the set rather than whichever member
-            // happened to be next.
+            // The set blocks in `poll(2)` on every member's fd, or inside
+            // whichever member holds the current slice, and a caller cannot
+            // know which. Nudging all of them makes any member's fd readable,
+            // and reaches whichever member is waiting.
             //
             // The list is the set's own and is read when the handle fires, not
             // when it is taken, so a member that joins later is woken by a
@@ -553,6 +559,12 @@ mod blocking_set {
     impl TransportSet {
         /// [`BlockingTransport::wait_for_input`] for the set, short of
         /// counting the outer call itself under `bench`.
+        ///
+        /// Probes every member without blocking, then blocks on all of them
+        /// at once in one `poll(2)` over their
+        /// `readiness_fd`s. Where that is
+        /// not possible -- a parking member without an fd, a failed
+        /// `poll(2)`, a non-unix target -- it falls back to taking short turns.
         fn wait_members(&mut self, timeout: Duration) -> WaitOutcome {
             // Events a failed poll held back are input the caller has not seen.
             if !self.pending.is_empty() {
@@ -570,16 +582,11 @@ mod blocking_set {
             // them: a budget spent waiting on a quiet member would report
             // `TimedOut` while another already had something to hand over.
             // The probe also says which members can park at all, and only
-            // those are worth a slice of the budget.
-            let mut waiters = Vec::new();
-            for (index, member) in self.members.iter_mut().enumerate() {
-                match member.transport.wait_for_input(Duration::ZERO) {
-                    WaitOutcome::Ready => return WaitOutcome::Ready,
-                    WaitOutcome::Interrupted => return self.settle_interrupt(index),
-                    WaitOutcome::TimedOut => waiters.push(index),
-                    WaitOutcome::Unsupported => {}
-                }
-            }
+            // those are worth waiting on.
+            let waiters = match self.probe() {
+                Ok(waiters) => waiters,
+                Err(outcome) => return outcome,
+            };
             if waiters.is_empty() {
                 // No member can park on readiness, so neither can the set. The
                 // caller has to sleep on its own clock instead of reading a
@@ -593,6 +600,118 @@ mod blocking_set {
             // A caller's timeout can exceed what `Instant` arithmetic
             // represents; an unrepresentable deadline means "no deadline".
             let deadline = std::time::Instant::now().checked_add(timeout);
+            #[cfg(unix)]
+            let waiters = match self.wait_on_fds(waiters, deadline) {
+                Ok(outcome) => return outcome,
+                Err(waiters) => waiters,
+            };
+            self.wait_in_turns(&waiters, deadline)
+        }
+
+        /// Asks every member, without blocking, whether it has input.
+        ///
+        /// `Err` is how the wait ends: a member is ready, or was interrupted
+        /// and its siblings are settled. `Ok` lists the members that can park.
+        fn probe(&mut self) -> Result<Vec<usize>, WaitOutcome> {
+            let mut waiters = Vec::new();
+            for (index, member) in self.members.iter_mut().enumerate() {
+                match member.transport.wait_for_input(Duration::ZERO) {
+                    WaitOutcome::Ready => return Err(WaitOutcome::Ready),
+                    WaitOutcome::Interrupted => return Err(self.settle_interrupt(index)),
+                    WaitOutcome::TimedOut => waiters.push(index),
+                    WaitOutcome::Unsupported => {}
+                }
+            }
+            Ok(waiters)
+        }
+
+        /// Blocks once on every waiter's readiness fd, until one is readable
+        /// and a fresh [`probe`](Self::probe) ends the wait, or `deadline`.
+        ///
+        /// Level-triggered `poll(2)` rather than an outer mio `Poll`: every
+        /// member drains its fd before a probe answers `TimedOut` (see
+        /// [`BlockingTransport::readiness_fd`]), and a member that breaks
+        /// that leaves a readable fd, which makes this spin -- visibly --
+        /// where an edge-triggered outer queue could lose the wakeup.
+        ///
+        /// `Err` hands the waiters back for the turn-taking fallback, when a
+        /// waiter has no fd or `poll(2)` fails.
+        #[cfg(unix)]
+        fn wait_on_fds(
+            &mut self,
+            waiters: Vec<usize>,
+            deadline: Option<std::time::Instant>,
+        ) -> Result<WaitOutcome, Vec<usize>> {
+            use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+            loop {
+                let remaining = match deadline {
+                    Some(deadline) => {
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            return Ok(WaitOutcome::TimedOut);
+                        }
+                        left.min(MAX_POLL)
+                    }
+                    None => MAX_POLL,
+                };
+                let Ok(timespec) = Timespec::try_from(remaining) else {
+                    return Err(waiters);
+                };
+                let polled = {
+                    let mut fds = Vec::with_capacity(waiters.len());
+                    for &index in &waiters {
+                        let fd = self
+                            .members
+                            .get(index)
+                            .and_then(|member| member.transport.readiness_fd());
+                        let Some(fd) = fd else {
+                            return Err(waiters);
+                        };
+                        fds.push(PollFd::from_borrowed_fd(fd, PollFlags::IN));
+                    }
+                    // An invalid, failed or hung-up fd never stops reporting,
+                    // so it would turn every `poll(2)` into a spin.
+                    let broken = PollFlags::NVAL | PollFlags::ERR | PollFlags::HUP;
+                    poll(&mut fds, Some(&timespec))
+                        .map(|count| (count, fds.iter().any(|fd| fd.revents().intersects(broken))))
+                };
+                let (outcome, done) = match polled {
+                    // Out of budget for this `poll(2)`; the deadline check
+                    // above decides whether that is the end.
+                    Ok((0, _)) => (WaitOutcome::TimedOut, false),
+                    // Some fd is readable: ask every member again.
+                    Ok((_, broken)) => match self.probe() {
+                        Err(outcome) => (outcome, true),
+                        // Nothing for anyone, and an fd that will keep
+                        // saying so: wait in turns instead.
+                        Ok(_) if broken => return Err(waiters),
+                        // Readable, yet no member has anything: a spurious
+                        // wakeup, still a wakeup.
+                        Ok(_) => (WaitOutcome::Ready, false),
+                    },
+                    // A signal cut the wait short; probing is cheap.
+                    Err(rustix::io::Errno::INTR) => match self.probe() {
+                        Err(outcome) => (outcome, true),
+                        Ok(_) => (WaitOutcome::Ready, false),
+                    },
+                    Err(_) => return Err(waiters),
+                };
+                #[cfg(feature = "bench")]
+                crate::bench::record_blocking_wait(remaining, outcome);
+                if done {
+                    return Ok(outcome);
+                }
+            }
+        }
+
+        /// The fallback: waits on each waiter in turn, a short slice at a
+        /// time, until one has input or `deadline` passes.
+        fn wait_in_turns(
+            &mut self,
+            waiters: &[usize],
+            deadline: Option<std::time::Instant>,
+        ) -> WaitOutcome {
             loop {
                 for (turn, &index) in waiters.iter().enumerate() {
                     let remaining = match deadline {

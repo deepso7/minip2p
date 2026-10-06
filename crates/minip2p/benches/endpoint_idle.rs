@@ -4,16 +4,20 @@
 //! [`Endpoint::wait`] for a fixed window, as an application event loop would.
 //! It reports two informational rows per variant:
 //!
-//! - `wakeups_per_s`: `TransportSet` member waits that blocked and then woke,
-//!   from the `bench` feature's counters in `minip2p_transport::bench`. With
-//!   QUIC and TCP bound the set takes turns waiting on each in short slices,
-//!   and every slice is counted; a counter at the driver would see one wait.
-//!   The output also breaks this down by outcome.
+//! - `wakeups_per_s`: waits that blocked and then woke, from the `bench`
+//!   feature's counters in `minip2p_transport::bench`: the `TransportSet`'s
+//!   one `poll(2)` over its members, or a lone member's own wait. A set that
+//!   cannot use `poll(2)` takes turns on its members in short slices, and
+//!   then every slice is counted. The output also breaks this down by outcome.
 //! - `cpu_ms_per_s`: process user+sys CPU over the window per wall second.
 //!
 //! Variants:
 //!
 //! - `quic_only`: QUIC alone, no extra services. The reference row.
+//! - `quic_dual_stack`: QUIC on IPv4 and IPv6 loopback: the same one-socket-
+//!   per-family `DualQuicTransport` that `EndpointBuilder::listen_default()`
+//!   binds on the wildcards. Skipped on a host without IPv6 loopback, where
+//!   the results collector then reports its rows missing.
 //! - `full`: QUIC and TCP bound, relay server, Gossipsub with one subscribed
 //!   topic, and mDNS, all started.
 //! - `full_no_mdns`: `full` without mDNS, so the rest is visible on its own.
@@ -22,11 +26,10 @@
 //! `MdnsConfig::socket_poll_interval_ms` (default 100 ms), which caps every
 //! outer wait at that: about 10 `set_waits` a second. It also re-enumerates
 //! interfaces every 10 s and may still be sending its exponentially spaced
-//! startup queries during the window. With QUIC and TCP both bound, the set's
-//! own short slices already wake far more often than mDNS does, so mDNS shows
-//! mostly in `set_waits` and CPU. Compare `full` with `full_no_mdns` for the
-//! mDNS share, and `full_no_mdns` with `quic_only` for the second transport
-//! and the other services.
+//! startup queries during the window, so `full` wakes about ten times a second
+//! more than `full_no_mdns`. Compare `full` with `full_no_mdns` for the mDNS
+//! share, and `full_no_mdns` with `quic_only` for the second transport and the
+//! other services.
 //!
 //! Rows go to `target/bench-results/custom/endpoint_idle.json` for the
 //! `custom` collector in `scripts/bench_results.py`.
@@ -45,26 +48,37 @@ const WINDOW: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy)]
 struct Variant {
     name: &'static str,
+    ipv6: bool,
     tcp: bool,
     services: bool,
     mdns: bool,
 }
 
-const VARIANTS: [Variant; 3] = [
+const VARIANTS: [Variant; 4] = [
     Variant {
         name: "quic_only",
+        ipv6: false,
+        tcp: false,
+        services: false,
+        mdns: false,
+    },
+    Variant {
+        name: "quic_dual_stack",
+        ipv6: true,
         tcp: false,
         services: false,
         mdns: false,
     },
     Variant {
         name: "full",
+        ipv6: false,
         tcp: true,
         services: true,
         mdns: true,
     },
     Variant {
         name: "full_no_mdns",
+        ipv6: false,
         tcp: true,
         services: true,
         mdns: false,
@@ -76,6 +90,11 @@ fn bind(variant: Variant) -> Endpoint {
         .agent_version("minip2p-bench")
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address");
+    if variant.ipv6 {
+        builder = builder
+            .listen_on("/ip6/::1/udp/0/quic-v1")
+            .expect("ipv6 quic listen address");
+    }
     if variant.tcp {
         builder = builder
             .listen_on("/ip4/127.0.0.1/tcp/0")
@@ -143,6 +162,17 @@ fn measure(variant: Variant) -> Measured {
 fn main() {
     let mut rows = Vec::new();
     for variant in VARIANTS {
+        if variant.ipv6
+            && let Err(error) = std::net::UdpSocket::bind("[::1]:0")
+        {
+            // The collector requires this variant's rows, so a skip still
+            // fails a results run loudly; the reason is printed for it.
+            println!(
+                "endpoint_idle/{}: skipped, cannot bind IPv6 loopback: {error}",
+                variant.name
+            );
+            continue;
+        }
         let Measured {
             counters,
             wall,

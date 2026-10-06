@@ -14,7 +14,7 @@ That split is the point: the same transport runs on hosted sockets and on an emb
 
 ## Providers
 
-`StdTcpProvider` is the hosted one: OS sockets driven by `mio` and a real readiness wait. It takes `/ip4` and `/ip6` addresses only and rejects `/dns*`, because a name lookup would block the driver thread; the std `minip2p` `Endpoint` resolves names off its driver, and direct users resolve them first. Implementing `BlockingTcpProvider` is what makes `TcpTransport` a `BlockingTransport`, so an idle driver parks on the sockets rather than polling on a timer. It disables Nagle's algorithm because delayed small writes add latency to the multiplexed protocol frames. It needs the `std` feature (on by default).
+`StdTcpProvider` is the hosted one: OS sockets driven by `mio` and a real readiness wait. It takes `/ip4` and `/ip6` addresses only and rejects `/dns*`, because a name lookup would block the driver thread; the std `minip2p` `Endpoint` resolves names off its driver, and direct users resolve them first. Implementing `BlockingTcpProvider` is what makes `TcpTransport` a `BlockingTransport`, so an idle driver parks on the sockets rather than polling on a timer. On unix it also exposes the `mio` selector as `readiness_fd()`, so a `TransportSet` blocks on TCP and its other members at once. It disables Nagle's algorithm because delayed small writes add latency to the multiplexed protocol frames. It needs the `std` feature (on by default).
 
 `SmoltcpTcpProvider` is the embedded one, over [smoltcp] — a TCP/IP stack, not an operating system. It needs the `smoltcp` feature and nothing else: the host builds the `Interface` and supplies the link, and this drives sockets on it. `/ip4` and `/ip6` only, since resolving a name is I/O it does not do.
 

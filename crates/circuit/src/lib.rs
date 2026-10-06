@@ -959,6 +959,14 @@ impl<T: minip2p_transport::BlockingTransport, E: EntropySource> minip2p_transpor
     fn wait_handle(&self) -> minip2p_transport::WaitHandle {
         self.inner.wait_handle()
     }
+
+    /// Forwards to the wrapped transport, for the same reason as
+    /// `wait_handle`: a circuit answers `TimedOut` only when the inner wait
+    /// did, so the inner fd's drain-before-block contract carries over.
+    #[cfg(unix)]
+    fn readiness_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.inner.readiness_fd()
+    }
 }
 
 /// Wraps a session failure as the stream error the transport contract expects.

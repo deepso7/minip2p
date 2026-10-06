@@ -32,6 +32,19 @@ pub trait BlockingTcpProvider: TcpProvider {
 
     /// Returns a handle that interrupts a wait in progress.
     fn wait_handle(&self) -> WaitHandle;
+
+    /// The fd [`wait_for_input`](Self::wait_for_input) blocks on, under the
+    /// contract of [`BlockingTransport::readiness_fd`]: stable for the
+    /// provider's lifetime, left unreadable by a zero-timeout wait that
+    /// answers `TimedOut`, and made readable by the
+    /// [`wait_handle`](Self::wait_handle). [`TcpTransport`] forwards it.
+    ///
+    /// The default is `None`, which keeps a `TransportSet` holding this
+    /// transport on its bounded fallback.
+    #[cfg(unix)]
+    fn readiness_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
+    }
 }
 
 impl<P: BlockingTcpProvider, E: EntropySource> BlockingTransport for TcpTransport<P, E> {
@@ -48,5 +61,11 @@ impl<P: BlockingTcpProvider, E: EntropySource> BlockingTransport for TcpTranspor
     /// does nothing while the wait still blocks inside the provider.
     fn wait_handle(&self) -> WaitHandle {
         self.provider().wait_handle()
+    }
+
+    /// Forwards to the provider, for the same reason as `wait_handle`.
+    #[cfg(unix)]
+    fn readiness_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.provider().readiness_fd()
     }
 }
