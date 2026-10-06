@@ -143,6 +143,4 @@ node.disconnect(&peer)?;
 
 Without NAT configuration, `connect` dials only the direct candidates. With the `nat` feature and a configured relay, the same call also races a relay leg and can later upgrade to a direct path. See [Traverse NAT](/rust/traverse-nat).
 
-Raw Transport dials, which bypass Connection-attempt policy entirely, live on the lower-level swarm: `node.swarm_mut().dial(&addr)`.
-
 Next: [Register a protocol](/rust/register-a-protocol) or [Identity](/rust/identity).

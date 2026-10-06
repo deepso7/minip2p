@@ -20,4 +20,4 @@
 | Shutdown | `close`, `onClose`, and `Symbol.dispose`; the low-level native export also provides `stop`/`waitStopped` |
 | One Endpoint event stream and its blocking wait (event, deadline, interrupted) | Driven by each platform backend; surfaced as typed events, State getters, and Promise waits such as `waitFor` and `waitConnectResult` |
 
-Rust-only escape hatches such as `swarm()`/`swarm_mut()` are implementation accessors rather than portable endpoint features and are intentionally not part of the cross-platform SDK. Resource-policy tuning remains native configuration until it has consistent semantics across every backend.
+Resource-policy tuning remains native configuration until it has consistent semantics across every backend.

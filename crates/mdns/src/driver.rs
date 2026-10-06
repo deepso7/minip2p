@@ -14,10 +14,10 @@ use crate::{MdnsAction, MdnsAgent, MdnsConfig, MdnsEvent};
 /// A cap rather than "until empty": a link that keeps talking would otherwise
 /// hold a caller inside one tick for as long as it kept talking, and the
 /// driver has other things to do -- timers, sends, the swarm above it.
-pub const MAX_DATAGRAMS_PER_TICK: usize = 128;
+pub(crate) const MAX_DATAGRAMS_PER_TICK: usize = 128;
 
 /// Datagrams sent in one [`tick`](MdnsDriver::tick), for the same reason.
-pub const MAX_ACTIONS_PER_TICK: usize = 128;
+pub(crate) const MAX_ACTIONS_PER_TICK: usize = 128;
 
 /// How many times a shutdown drains the carrier for a goodbye that did not
 /// fit.

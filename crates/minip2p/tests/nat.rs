@@ -243,10 +243,8 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
     while path.is_none() || settled.is_none() || !initiator_ready || !responder_ready {
         assert!(
             Instant::now() < deadline,
-            "circuit did not become ready:\npeers={trace:#?}\nrelay={:#?}\ninitiator circuits={:?}\nresponder circuits={:?}",
+            "circuit did not become ready:\npeers={trace:#?}\nrelay={:#?}",
             relay.trace(),
-            initiator.swarm().transport().circuit_ids(),
-            responder.swarm().transport().circuit_ids(),
         );
         if let Some(event) = initiator
             .next_event(Duration::from_millis(20))
@@ -700,83 +698,6 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         }
         relay.assert_healthy();
     }
-}
-
-#[test]
-fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
-    let relay = relay_support::RelayServer::spawn();
-    let relay_addr = relay.addr().clone();
-
-    let mut responder = Endpoint::builder()
-        .relay(relay_addr.clone())
-        .nat_config(NatConfig {
-            force_relay: true,
-            reservation_policy: ReservationPolicy::Always,
-            ..NatConfig::default()
-        })
-        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
-        .expect("quic listen address")
-        .bind()
-        .expect("bind responder");
-    responder.listen().expect("responder listens");
-    let responder_peer = responder.peer_id().clone();
-
-    let reservation_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(
-            Instant::now() < reservation_deadline,
-            "responder did not reserve on relay"
-        );
-        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) = responder
-            .next_event(Duration::from_millis(20))
-            .expect("drive responder reservation")
-            && &relay == relay_addr.peer_id()
-        {
-            break;
-        }
-        relay.assert_healthy();
-    }
-
-    let mut initiator = Endpoint::builder()
-        .relay(relay_addr)
-        .nat_config(NatConfig {
-            force_relay: true,
-            reservation_policy: ReservationPolicy::Never,
-            ..NatConfig::default()
-        })
-        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
-        .expect("quic listen address")
-        .bind()
-        .expect("bind initiator");
-    initiator.listen().expect("initiator listens");
-    let id = initiator
-        .connect(&responder_peer)
-        .expect("start relay-only connect");
-    initiator.cancel_connect(id);
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut cancelled = false;
-    while !cancelled {
-        assert!(Instant::now() < deadline, "cancel did not settle");
-        if let Some(EndpointEvent::ConnectSettled {
-            connect_id,
-            outcome: ConnectOutcome::Cancelled,
-            ..
-        }) = initiator
-            .next_event(Duration::from_millis(20))
-            .expect("drive initiator cancel")
-            && connect_id == id
-        {
-            cancelled = true;
-        }
-        let _ = responder
-            .next_event(Duration::from_millis(20))
-            .expect("drive responder");
-        relay.assert_healthy();
-    }
-
-    assert!(initiator.swarm().transport().circuit_ids().is_empty());
-    assert!(!initiator.connected_peers().contains(&responder_peer));
 }
 
 /// Records the first NAT path the Endpoint event stream reports for `id`.

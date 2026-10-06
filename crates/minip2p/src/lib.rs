@@ -11,6 +11,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
+// Lets crate-internal tests include the shared `tests/support` harnesses,
+// which are written against the public `minip2p::` paths.
+#[cfg(test)]
+extern crate self as minip2p;
 
 #[cfg(feature = "_discovery-driver")]
 mod discovery;

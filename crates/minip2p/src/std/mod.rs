@@ -84,8 +84,8 @@ pub use minip2p_nat::{
 use minip2p_platform::StdEntropy;
 #[cfg(feature = "pubsub")]
 pub use minip2p_pubsub::{
-    GOSSIPSUB_PROTOCOL_IDS, GossipsubConfig, GossipsubConfigError, GossipsubEvent,
-    MESHSUB_PROTOCOL_ID_V10, MESHSUB_PROTOCOL_ID_V11, PublishError, TopicError,
+    GOSSIPSUB_PROTOCOL_IDS, GossipsubConfig, GossipsubConfigError, GossipsubEvent, PublishError,
+    TopicError,
 };
 #[cfg(feature = "quic")]
 pub use minip2p_quic::QuicLimits;
@@ -100,8 +100,7 @@ pub use minip2p_relay_server::{
 };
 use minip2p_swarm::SwarmBuilder;
 pub use minip2p_swarm::{
-    Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, Swarm,
-    SwarmError, SwarmEvent,
+    Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, Swarm, SwarmError, SwarmEvent,
 };
 #[cfg(feature = "tcp")]
 use minip2p_tcp::{StdTcpProvider, TcpConfig, TcpTransport};
@@ -228,15 +227,15 @@ impl std::error::Error for RelayServerControlError {
 /// from the address itself, and adding a second transport changes nothing
 /// above this line.
 #[cfg(feature = "nat")]
-pub type EndpointTransport =
+pub(crate) type EndpointTransport =
     minip2p_circuit::CircuitTransport<TransportSet, minip2p_platform::StdEntropy>;
 
 /// Transport used by [`Endpoint`] when NAT traversal is not compiled in.
 #[cfg(not(feature = "nat"))]
-pub type EndpointTransport = TransportSet;
+pub(crate) type EndpointTransport = TransportSet;
 
 /// Concrete swarm type owned by [`Endpoint`].
-pub type EndpointSwarm = Swarm<EndpointTransport>;
+pub(crate) type EndpointSwarm = Swarm<EndpointTransport>;
 
 /// App-facing minip2p endpoint over the transports it was asked to bind.
 ///
@@ -253,10 +252,6 @@ pub type EndpointSwarm = Swarm<EndpointTransport>;
 /// Applications correlate events by the IDs they carry (a [`ConnectId`], a
 /// [`ConnectionId`], a [`StreamId`]) and dispatch unrelated events while they
 /// wait for a particular one; see [`wait`](Self::wait) for the canonical loop.
-///
-/// Raw Transport dials bypass Connection-attempt policy and belong to the
-/// lower-level swarm: borrow it with [`Endpoint::swarm_mut`] when that is
-/// really what you want.
 ///
 /// # State snapshots
 ///
@@ -309,10 +304,10 @@ pub struct Endpoint {
     /// Set by [`Endpoint::wait_handle`] interrupts, so [`Endpoint::wait`] can
     /// tell a caller's interrupt from a lookup thread waking the driver.
     caller_interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Addresses set by [`Endpoint::set_external_addresses`]; the NAT and
+    /// relay-server contributions are merged onto them before Identify.
     #[cfg(any(feature = "nat", feature = "relay-server"))]
     caller_external_addresses: Vec<Multiaddr>,
-    #[cfg(any(feature = "nat", feature = "relay-server"))]
-    external_addresses_revision: u64,
 }
 
 impl Endpoint {
@@ -1208,9 +1203,6 @@ impl Endpoint {
 
     #[cfg(any(feature = "nat", feature = "relay-server"))]
     fn refresh_external_address_contributions(&mut self) {
-        if self.swarm.external_addresses_revision() != self.external_addresses_revision {
-            self.caller_external_addresses = self.swarm.external_addresses().to_vec();
-        }
         #[cfg(feature = "relay-server")]
         {
             let listeners = concrete_relay_listener_addrs(self.swarm.transport().local_addresses());
@@ -1248,7 +1240,22 @@ impl Endpoint {
             }
         }
         self.swarm.set_external_addresses(addresses);
-        self.external_addresses_revision = self.swarm.external_addresses_revision();
+    }
+
+    /// Sets externally validated addresses to advertise through Identify.
+    ///
+    /// Replaces the previous caller-set addresses; pass an empty vector to
+    /// stop advertising them. Addresses the endpoint contributes itself (NAT
+    /// relay circuits and confirmed public addresses, relay-server announce
+    /// addresses) are kept and merged after these.
+    pub fn set_external_addresses(&mut self, addresses: Vec<Multiaddr>) {
+        #[cfg(any(feature = "nat", feature = "relay-server"))]
+        {
+            self.caller_external_addresses = addresses;
+            self.refresh_external_address_contributions();
+        }
+        #[cfg(not(any(feature = "nat", feature = "relay-server")))]
+        self.swarm.set_external_addresses(addresses);
     }
 
     /// Our current reachability verdict from AutoNAT probing
@@ -1352,16 +1359,6 @@ impl Endpoint {
     pub fn discovery_now_ms(&mut self) -> Option<u64> {
         self.discovery.as_ref()?;
         Some(self.swarm.now().monotonic_ms)
-    }
-
-    /// Borrows the underlying swarm.
-    pub fn swarm(&self) -> &EndpointSwarm {
-        &self.swarm
-    }
-
-    /// Mutably borrows the underlying swarm.
-    pub fn swarm_mut(&mut self) -> &mut EndpointSwarm {
-        &mut self.swarm
     }
 
     /// Sends mDNS goodbyes once and cancels discovery-owned dial attempts.
@@ -2392,8 +2389,6 @@ fn build_endpoint(
         caller_interrupt: std::sync::Arc::default(),
         #[cfg(any(feature = "nat", feature = "relay-server"))]
         caller_external_addresses: Vec::new(),
-        #[cfg(any(feature = "nat", feature = "relay-server"))]
-        external_addresses_revision: 0,
     })
 }
 
@@ -3253,7 +3248,7 @@ mod tests {
         // Read straight off the bound sockets, so nothing here arms anything:
         // `listen` below is the only call that does.
         let bound = listener
-            .swarm()
+            .swarm
             .transport()
             .local_addresses()
             .into_iter()
@@ -3355,7 +3350,7 @@ mod tests {
         // The id a raw swarm dial hands back is minted by the transport, so
         // its namespace is what the configuration actually reached -- whether
         // anything answers is beside the point.
-        let id = endpoint.swarm_mut().dial(&target).expect("the dial starts");
+        let id = endpoint.swarm.dial(&target).expect("the dial starts");
         assert_eq!(id.namespace(), ConnectionNamespace::TCP_IPV6);
     }
 
@@ -3716,7 +3711,7 @@ mod tests {
         let peer = Ed25519Keypair::generate().peer_id();
         let unreachable = PeerAddr::quic_v1(IpAddr::V4(Ipv4Addr::LOCALHOST), 9, peer.clone());
         let connect_id = endpoint.connect(&unreachable).expect("start connect");
-        endpoint.swarm_mut().preload_poll_events([
+        endpoint.swarm.preload_poll_events([
             SwarmEvent::ConnectionEstablished {
                 peer_id: peer.clone(),
                 conn_id: ConnectionId::new(1),
@@ -4282,9 +4277,7 @@ mod tests {
             .expect("bind relay endpoint");
         let caller_owned: Multiaddr = "/ip4/203.0.113.8/udp/4008/quic-v1".parse().unwrap();
         let relay_owned: Multiaddr = "/ip4/203.0.113.9/udp/4009/quic-v1".parse().unwrap();
-        endpoint
-            .swarm_mut()
-            .set_external_addresses(vec![caller_owned.clone()]);
+        endpoint.set_external_addresses(vec![caller_owned.clone()]);
         endpoint
             .set_relay_server_announce_addrs(vec![relay_owned.clone()])
             .expect("replace relay addresses");
@@ -4308,9 +4301,7 @@ mod tests {
         endpoint
             .set_relay_server_announce_addrs(vec![shared.clone()])
             .expect("set relay contribution");
-        endpoint
-            .swarm_mut()
-            .set_external_addresses(vec![shared.clone()]);
+        endpoint.set_external_addresses(vec![shared.clone()]);
 
         endpoint
             .set_relay_server_announce_addrs(Vec::new())

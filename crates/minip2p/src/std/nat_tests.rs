@@ -14,6 +14,12 @@ use crate::{Ed25519Keypair, Endpoint, EndpointEvent, NatConfig, ReachabilityStat
 use minip2p_nat::{NatToken, ReservationPolicy};
 use minip2p_relay::{HOP_PROTOCOL_ID, HopMessage, HopMessageType, Status, encode_frame};
 
+/// Shares the loopback relay application with the integration tests; it is
+/// written against the public `minip2p` API (see `extern crate self` in
+/// `lib.rs`).
+#[path = "../../../../tests/support/relay.rs"]
+mod relay_support;
+
 struct BridgePair {
     local: Endpoint,
     relay: Endpoint,
@@ -41,7 +47,7 @@ fn negotiated_bridge() -> BridgePair {
         .bind()
         .expect("bind local");
     let local_addr = local.listen().expect("local listens");
-    local.swarm_mut().dial(&relay_addr).expect("dial relay");
+    local.swarm.dial(&relay_addr).expect("dial relay");
 
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     let mut inner_conn = None;
@@ -633,7 +639,7 @@ fn promotion_uses_action_connection_after_same_batch_relay_replacement() {
     // ConnectionReplaced events have been delivered. At this seam the core
     // points at B while the transport close of A is still deferred.
     pair.relay
-        .swarm_mut()
+        .swarm
         .dial(&pair.local_addr)
         .expect("relay dials replacement");
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -867,4 +873,258 @@ fn remote_bridge_reset_closes_promoted_circuit() {
     );
     assert!(!driver.promoted().contains_key(&key));
     assert!(pair.local.swarm.transport().circuit_ids().is_empty());
+}
+
+#[test]
+fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
+    let relay = relay_support::RelayServer::spawn();
+    let relay_addr = relay.addr().clone();
+
+    let mut responder = Endpoint::builder()
+        .relay(relay_addr.clone())
+        .nat_config(NatConfig {
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Always,
+            ..NatConfig::default()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind responder");
+    responder.listen().expect("responder listens");
+    let responder_peer = responder.peer_id().clone();
+
+    let reservation_deadline = Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < reservation_deadline,
+            "responder did not reserve on relay"
+        );
+        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) = responder
+            .next_event(std::time::Duration::from_millis(20))
+            .expect("drive responder reservation")
+            && &relay == relay_addr.peer_id()
+        {
+            break;
+        }
+        relay.assert_healthy();
+    }
+
+    let mut initiator = Endpoint::builder()
+        .relay(relay_addr)
+        .nat_config(NatConfig {
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Never,
+            ..NatConfig::default()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind initiator");
+    initiator.listen().expect("initiator listens");
+    let id = initiator
+        .connect(&responder_peer)
+        .expect("start relay-only connect");
+    initiator.cancel_connect(id);
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    let mut cancelled = false;
+    while !cancelled {
+        assert!(Instant::now() < deadline, "cancel did not settle");
+        if let Some(EndpointEvent::ConnectSettled {
+            connect_id,
+            outcome: crate::ConnectOutcome::Cancelled,
+            ..
+        }) = initiator
+            .next_event(std::time::Duration::from_millis(20))
+            .expect("drive initiator cancel")
+            && connect_id == id
+        {
+            cancelled = true;
+        }
+        let _ = responder
+            .next_event(std::time::Duration::from_millis(20))
+            .expect("drive responder");
+        relay.assert_healthy();
+    }
+
+    assert!(initiator.swarm.transport().circuit_ids().is_empty());
+    assert!(!initiator.connected_peers().contains(&responder_peer));
+}
+
+/// Drives `endpoints` until `condition` holds over the Gossipsub events each
+/// one has delivered so far.
+#[cfg(feature = "pubsub")]
+fn drive_gossipsub_until(
+    endpoints: &mut [&mut Endpoint],
+    deadline: std::time::Duration,
+    mut condition: impl FnMut(&[Vec<crate::GossipsubEvent>]) -> bool,
+) {
+    let mut all = vec![Vec::new(); endpoints.len()];
+    let until = Instant::now() + deadline;
+    while !condition(&all) {
+        assert!(Instant::now() < until, "condition not met in time: {all:?}");
+        for (endpoint, events) in endpoints.iter_mut().zip(&mut all) {
+            if let Some(EndpointEvent::Gossipsub(event)) = endpoint
+                .next_event(std::time::Duration::from_millis(20))
+                .expect("endpoint drives")
+            {
+                events.push(event);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "pubsub")]
+fn saw_message(events: &[crate::GossipsubEvent], data: &[u8]) -> bool {
+    events.iter().any(
+        |e| matches!(e, crate::GossipsubEvent::Message { data: got, .. } if got.as_slice() == data),
+    )
+}
+
+#[cfg(feature = "pubsub")]
+fn saw_subscription(events: &[crate::GossipsubEvent], topic: &str) -> bool {
+    events.iter().any(
+        |e| matches!(e, crate::GossipsubEvent::PeerSubscribed { topic: got, .. } if got == topic),
+    )
+}
+
+#[cfg(feature = "pubsub")]
+#[test]
+fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
+    use crate::{GossipsubEvent, Path};
+    use std::time::Duration;
+    const TOPIC: &str = "loopback-chat";
+
+    let relay = relay_support::RelayServer::spawn();
+    let relay_addr = relay.addr().clone();
+    let mut b = Endpoint::builder()
+        .gossipsub()
+        .relay(relay_addr.clone())
+        .nat_config(NatConfig {
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Always,
+            ..NatConfig::default()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind responder");
+    let b_addr = b.listen().expect("responder listens");
+    let b_peer = b.peer_id().clone();
+    b.subscribe(TOPIC).expect("responder subscribes");
+
+    let reserve_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < reserve_deadline, "reservation timed out");
+        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) = b
+            .next_event(Duration::from_millis(20))
+            .expect("drive reservation")
+            && &relay == relay_addr.peer_id()
+        {
+            break;
+        }
+        relay.assert_healthy();
+    }
+
+    let mut a = Endpoint::builder()
+        .gossipsub()
+        .relay(relay_addr)
+        .nat_config(NatConfig {
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Never,
+            ..NatConfig::default()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind initiator");
+    a.listen().expect("initiator listens");
+    a.subscribe(TOPIC).expect("initiator subscribes");
+    a.connect(&b_peer).expect("relay-only connect");
+
+    drive_gossipsub_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
+        saw_subscription(&all[0], TOPIC) && saw_subscription(&all[1], TOPIC)
+    });
+    // `drive` consumed the NAT path event; the State snapshot keeps the truth.
+    assert!(matches!(
+        a.path(&b_peer),
+        Some(Path::Relayed { relay: found_relay }) if &found_relay == relay.addr().peer_id()
+    ));
+    let circuit_id = *a
+        .swarm
+        .transport()
+        .circuit_ids()
+        .first()
+        .expect("active circuit");
+
+    a.publish(TOPIC, b"over relay").expect("publish over relay");
+    drive_gossipsub_until(&mut [&mut a, &mut b], Duration::from_secs(10), |all| {
+        saw_message(&all[1], b"over relay")
+    });
+
+    // A direct connection replaces the ready circuit. The public sequence is
+    // one ConnectionReplaced (never a close or a second establishment), and
+    // the pubsub driver must re-open and re-announce subscriptions.
+    // A raw swarm dial forces the direct replacement; `connect` would
+    // settle against the existing relayed connection.
+    a.swarm.dial(&b_addr).expect("manual direct upgrade");
+    let upgrade_deadline = Instant::now() + Duration::from_secs(15);
+    let mut a_sequence = Vec::new();
+    let mut a_resubscribed = false;
+    let mut b_resubscribed = false;
+    while !a_resubscribed || !b_resubscribed {
+        assert!(
+            Instant::now() < upgrade_deadline,
+            "pubsub did not recover after replacement: {a_sequence:?}"
+        );
+        if let Some(event) = a
+            .next_event(Duration::from_millis(20))
+            .expect("drive initiator upgrade")
+        {
+            match event {
+                EndpointEvent::ConnectionClosed {
+                    peer_id, conn_id, ..
+                } if peer_id == b_peer => {
+                    a_sequence.push(("closed", conn_id, conn_id));
+                }
+                EndpointEvent::ConnectionEstablished { peer_id, conn_id } if peer_id == b_peer => {
+                    a_sequence.push(("established", conn_id, conn_id));
+                }
+                EndpointEvent::ConnectionReplaced { peer_id, old, new } if peer_id == b_peer => {
+                    a_sequence.push(("replaced", old, new));
+                }
+                EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed { topic, .. })
+                    if topic == TOPIC =>
+                {
+                    a_resubscribed = true;
+                }
+                _ => {}
+            }
+        }
+        if let Some(EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed { topic, .. })) = b
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder upgrade")
+            && topic == TOPIC
+        {
+            b_resubscribed = true;
+        }
+        relay.assert_healthy();
+    }
+    assert!(
+        matches!(
+            a_sequence.as_slice(),
+            [("replaced", old, direct)]
+                if *old == circuit_id && !direct.is_circuit()
+        ),
+        "replacement sequence: {a_sequence:?}"
+    );
+    assert!(a.swarm.transport().circuit_ids().is_empty());
+    assert_eq!(a.path(&b_peer), Some(Path::DirectDialed));
+
+    a.publish(TOPIC, b"after upgrade")
+        .expect("publish after upgrade");
+    drive_gossipsub_until(&mut [&mut a, &mut b], Duration::from_secs(10), |all| {
+        saw_message(&all[1], b"after upgrade")
+    });
 }
