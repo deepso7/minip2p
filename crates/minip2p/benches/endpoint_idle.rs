@@ -14,8 +14,10 @@
 //! Variants:
 //!
 //! - `quic_only`: QUIC alone, no extra services. The reference row.
-//! - `quic_dual_stack`: QUIC on IPv4 and IPv6 loopback, the dual-stack pair
-//!   `EndpointBuilder::listen_default()` binds. Skipped without IPv6 loopback.
+//! - `quic_dual_stack`: QUIC on IPv4 and IPv6 loopback: the same one-socket-
+//!   per-family `DualQuicTransport` that `EndpointBuilder::listen_default()`
+//!   binds on the wildcards. Skipped on a host without IPv6 loopback, where
+//!   the results collector then reports its rows missing.
 //! - `full`: QUIC and TCP bound, relay server, Gossipsub with one subscribed
 //!   topic, and mDNS, all started.
 //! - `full_no_mdns`: `full` without mDNS, so the rest is visible on its own.
@@ -160,8 +162,15 @@ fn measure(variant: Variant) -> Measured {
 fn main() {
     let mut rows = Vec::new();
     for variant in VARIANTS {
-        if variant.ipv6 && std::net::UdpSocket::bind("[::1]:0").is_err() {
-            println!("endpoint_idle/{}: skipped, no IPv6 loopback", variant.name);
+        if variant.ipv6
+            && let Err(error) = std::net::UdpSocket::bind("[::1]:0")
+        {
+            // The collector requires this variant's rows, so a skip still
+            // fails a results run loudly; the reason is printed for it.
+            println!(
+                "endpoint_idle/{}: skipped, cannot bind IPv6 loopback: {error}",
+                variant.name
+            );
             continue;
         }
         let Measured {

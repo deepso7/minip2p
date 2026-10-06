@@ -108,7 +108,7 @@ pub enum WaitOutcome {
 /// [`wait_handle`](Self::wait_handle): otherwise callers get an inert handle
 /// while the wait still blocks inside the inner transport, and interrupting
 /// silently does nothing. On unix it forwards
-/// [`readiness_fd`](Self::readiness_fd) too, or a
+/// `readiness_fd` too, or a
 /// [`TransportSet`](crate::TransportSet) holding it falls back to taking turns.
 pub trait BlockingTransport: Transport {
     /// Blocks until new transport input may be available or `timeout` elapses,

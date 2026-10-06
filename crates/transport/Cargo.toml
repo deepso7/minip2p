@@ -36,5 +36,6 @@ rustix = { version = "1.1.4", default-features = false, features = [
   "event",
 ], optional = true }
 
-[target.'cfg(unix)'.dev-dependencies]
+# Only `tests/set_wait.rs` uses it, on the targets where mio's selector is an fd.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly", target_os = "illumos", target_os = "solaris"))'.dev-dependencies]
 mio = { version = "1.2", features = ["net", "os-poll"] }

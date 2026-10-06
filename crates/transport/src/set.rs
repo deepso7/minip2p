@@ -562,7 +562,7 @@ mod blocking_set {
         ///
         /// Probes every member without blocking, then blocks on all of them
         /// at once in one `poll(2)` over their
-        /// [`readiness_fd`](BlockingTransport::readiness_fd)s. Where that is
+        /// `readiness_fd`s. Where that is
         /// not possible -- a parking member without an fd, a failed
         /// `poll(2)`, a non-unix target -- it falls back to taking short turns.
         fn wait_members(&mut self, timeout: Duration) -> WaitOutcome {
@@ -670,17 +670,29 @@ mod blocking_set {
                         };
                         fds.push(PollFd::from_borrowed_fd(fd, PollFlags::IN));
                     }
+                    // An invalid, failed or hung-up fd never stops reporting,
+                    // so it would turn every `poll(2)` into a spin.
+                    let broken = PollFlags::NVAL | PollFlags::ERR | PollFlags::HUP;
                     poll(&mut fds, Some(&timespec))
+                        .map(|count| (count, fds.iter().any(|fd| fd.revents().intersects(broken))))
                 };
                 let (outcome, done) = match polled {
                     // Out of budget for this `poll(2)`; the deadline check
                     // above decides whether that is the end.
-                    Ok(0) => (WaitOutcome::TimedOut, false),
-                    // A signal may have cut the wait short; probing is cheap.
-                    Ok(_) | Err(rustix::io::Errno::INTR) => match self.probe() {
+                    Ok((0, _)) => (WaitOutcome::TimedOut, false),
+                    // Some fd is readable: ask every member again.
+                    Ok((_, broken)) => match self.probe() {
                         Err(outcome) => (outcome, true),
+                        // Nothing for anyone, and an fd that will keep
+                        // saying so: wait in turns instead.
+                        Ok(_) if broken => return Err(waiters),
                         // Readable, yet no member has anything: a spurious
                         // wakeup, still a wakeup.
+                        Ok(_) => (WaitOutcome::Ready, false),
+                    },
+                    // A signal cut the wait short; probing is cheap.
+                    Err(rustix::io::Errno::INTR) => match self.probe() {
+                        Err(outcome) => (outcome, true),
                         Ok(_) => (WaitOutcome::Ready, false),
                     },
                     Err(_) => return Err(waiters),

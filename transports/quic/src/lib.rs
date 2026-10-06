@@ -488,22 +488,23 @@ impl ReadinessWait {
     }
 
     /// Waits up to `timeout`, harvesting whatever the poll has queued.
-    fn wait(&mut self, timeout: Duration) -> WaitOutcome {
+    /// `None` if the poll failed, which leaves what it holds unknown.
+    fn wait(&mut self, timeout: Duration) -> Option<WaitOutcome> {
         self.events.clear();
-        if self.poll.poll(&mut self.events, Some(timeout)).is_err() {
-            return WaitOutcome::Ready;
-        }
-        if self
-            .events
-            .iter()
-            .any(|event| event.token() == INTERRUPT_TOKEN)
-        {
-            WaitOutcome::Interrupted
-        } else if self.events.is_empty() {
-            WaitOutcome::TimedOut
-        } else {
-            WaitOutcome::Ready
-        }
+        self.poll.poll(&mut self.events, Some(timeout)).ok()?;
+        Some(
+            if self
+                .events
+                .iter()
+                .any(|event| event.token() == INTERRUPT_TOKEN)
+            {
+                WaitOutcome::Interrupted
+            } else if self.events.is_empty() {
+                WaitOutcome::TimedOut
+            } else {
+                WaitOutcome::Ready
+            },
+        )
     }
 
     /// The selector's fd, for [`BlockingTransport::readiness_fd`].
@@ -568,8 +569,13 @@ fn wait_for_sockets(
     has_input: impl Fn() -> bool,
     timeout: Duration,
 ) -> WaitOutcome {
-    if readiness.wait(Duration::ZERO) == WaitOutcome::Interrupted {
-        return WaitOutcome::Interrupted;
+    match readiness.wait(Duration::ZERO) {
+        Some(WaitOutcome::Interrupted) => return WaitOutcome::Interrupted,
+        // A failed harvest may have left readiness behind, so `TimedOut`
+        // could break the invariant; let the caller poll and ask again.
+        None => return WaitOutcome::Ready,
+        // Socket readiness is the sockets' to report, below.
+        Some(_) => {}
     }
     if has_input() {
         return WaitOutcome::Ready;
@@ -577,7 +583,8 @@ fn wait_for_sockets(
     if timeout.is_zero() {
         return WaitOutcome::TimedOut;
     }
-    readiness.wait(timeout)
+    // A failed wait is not a reason to sleep; let the caller poll.
+    readiness.wait(timeout).unwrap_or(WaitOutcome::Ready)
 }
 
 fn readiness_error(error: std::io::Error) -> TransportError {

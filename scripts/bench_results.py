@@ -83,7 +83,7 @@ EXPECTED_VITEST = {"sdk_drain_flood", "raw_drain_events", "connected_peers_sync"
 EXPECTED_CUSTOM: set[tuple[str, str, str]] = {
     *{
         ("rust-wall", f"endpoint_idle/{variant}", metric)
-        for variant in ("quic_only", "full", "full_no_mdns")
+        for variant in ("quic_only", "quic_dual_stack", "full", "full_no_mdns")
         for metric in ("wakeups_per_s", "cpu_ms_per_s")
     },
     *{

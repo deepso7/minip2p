@@ -58,6 +58,11 @@ struct MioMember {
     arrive_after_probe: bool,
     /// Keeps the fd to itself, like a member that cannot offer one.
     hides_fd: bool,
+    /// Offers this fd instead of its selector's: one that never stops
+    /// reporting, as an invalid or hung-up fd would.
+    broken_fd: Option<std::os::unix::net::UnixStream>,
+    /// Zero-timeout waits this member has answered.
+    probes: Arc<AtomicUsize>,
 }
 
 /// What a test keeps of a member once the set owns it.
@@ -116,6 +121,8 @@ impl MioMember {
             received,
             arrive_after_probe: false,
             hides_fd: false,
+            broken_fd: None,
+            probes: Arc::default(),
         };
         (member, remote)
     }
@@ -209,6 +216,7 @@ impl BlockingTransport for MioMember {
             return WaitOutcome::Ready;
         }
         if timeout.is_zero() {
+            self.probes.fetch_add(1, Ordering::SeqCst);
             if std::mem::take(&mut self.arrive_after_probe) {
                 let addr = self.socket.local_addr().expect("local addr");
                 UdpSocket::bind("127.0.0.1:0")
@@ -234,6 +242,9 @@ impl BlockingTransport for MioMember {
     }
 
     fn readiness_fd(&self) -> Option<BorrowedFd<'_>> {
+        if let Some(broken) = &self.broken_fd {
+            return Some(broken.as_fd());
+        }
         (!self.hides_fd).then(|| self.poll.registry().as_fd())
     }
 }
@@ -441,6 +452,28 @@ fn a_member_without_an_fd_is_still_heard_from_within_a_slice() {
         );
         drain(&mut set);
     }
+}
+
+#[test]
+fn a_member_fd_that_hung_up_does_not_spin_the_set() {
+    let mut probes = None;
+    let (mut set, _first, _second) = duo_with(|first, _| {
+        // A socket whose peer is gone reports hang-up on every `poll(2)`.
+        let (hung_up, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        drop(peer);
+        first.broken_fd = Some(hung_up);
+        probes = Some(Arc::clone(&first.probes));
+    });
+    let probes = probes.expect("probe counter");
+    let budget = Duration::from_millis(50);
+
+    let started = Instant::now();
+    assert_eq!(set.wait_for_input(budget), WaitOutcome::TimedOut);
+
+    assert!(started.elapsed() >= budget);
+    // Waiting in turns probes a handful of times; a spin, thousands.
+    let probed = probes.load(Ordering::SeqCst);
+    assert!(probed < 20, "the set spun: {probed} probes in {budget:?}");
 }
 
 #[test]
