@@ -1,6 +1,11 @@
 //! Endpoint setup shared by the Endpoint benches: event helpers, a driver
 //! thread, and the three-Endpoint forced relayed circuit.
 
+#![allow(
+    dead_code,
+    reason = "each bench compiles this module on its own and uses a subset of it"
+)]
+
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -9,8 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectOutcome, Deadline, Endpoint, EndpointBuilder, EndpointEvent, EndpointWaitOutcome,
-    NatConfig, PeerAddr, PeerId, RelayServerConfig, ReservationPolicy,
+    ConnectOutcome, Deadline, Endpoint, EndpointBuilder, EndpointEvent, EndpointWaitOutcome, Error,
+    NatConfig, PeerAddr, PeerId, RelayServerConfig, ReservationPolicy, TransportError,
 };
 
 /// Upper bound for every setup step.
@@ -38,25 +43,49 @@ pub fn bind_on(builder: EndpointBuilder, listen: &str) -> Endpoint {
         .expect("bind endpoint")
 }
 
-/// Drives an Endpoint on its own thread, handing every event to a callback,
-/// until dropped.
+/// Whether a refused write is backpressure (retry later) rather than failure:
+/// QUIC's full write queue, or a full Yamux send buffer (TCP and circuits),
+/// which reaches the Endpoint only as a `StreamSendFailed` reason.
+pub fn is_backpressure(error: &Error) -> bool {
+    match error {
+        Error::Transport(TransportError::ResourceExhausted { .. }) => true,
+        Error::Transport(TransportError::StreamSendFailed { reason, .. }) => {
+            reason.contains("send buffer is full")
+        }
+        _ => false,
+    }
+}
+
+/// Drives an Endpoint on its own thread until dropped.
 pub struct Driven {
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Driven {
+    /// Hands every event to `on_event`.
     pub fn spawn(
-        mut endpoint: Endpoint,
+        endpoint: Endpoint,
         mut on_event: impl FnMut(&mut Endpoint, EndpointEvent) + Send + 'static,
+    ) -> Self {
+        Self::run(endpoint, move |endpoint| {
+            if let Some(event) = next_event(endpoint, Duration::from_millis(10)) {
+                on_event(endpoint, event);
+            }
+        })
+    }
+
+    /// Calls `step` repeatedly; each call must drive the Endpoint itself and
+    /// return within a few milliseconds, so a drop is not held up.
+    pub fn run(
+        mut endpoint: Endpoint,
+        mut step: impl FnMut(&mut Endpoint) + Send + 'static,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
-                if let Some(event) = next_event(&mut endpoint, Duration::from_millis(10)) {
-                    on_event(&mut endpoint, event);
-                }
+                step(&mut endpoint);
             }
         });
         Self {
@@ -81,19 +110,21 @@ impl Drop for Driven {
 }
 
 /// A relay server with circuit byte and duration caps far above anything a
-/// bench forwards, listening on loopback QUIC.
-pub fn bind_relay() -> (Endpoint, PeerAddr) {
+/// bench forwards.
+pub fn relay_builder() -> EndpointBuilder {
     let config = RelayServerConfig {
         max_circuit_bytes: 1 << 40,
         max_circuit_duration_secs: 3600,
         ..RelayServerConfig::default()
     };
-    let mut relay = bind_on(
-        Endpoint::builder()
-            .relay_server_config(config)
-            .expect("relay server config"),
-        "/ip4/127.0.0.1/udp/0/quic-v1",
-    );
+    Endpoint::builder()
+        .relay_server_config(config)
+        .expect("relay server config")
+}
+
+/// A [`relay_builder`] relay listening on loopback QUIC.
+pub fn bind_relay() -> (Endpoint, PeerAddr) {
+    let mut relay = bind_on(relay_builder(), "/ip4/127.0.0.1/udp/0/quic-v1");
     let address = relay.listen().expect("relay listens");
     (relay, address)
 }

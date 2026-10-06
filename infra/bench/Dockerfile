@@ -83,7 +83,8 @@ RUN cargo chef cook --release --package minip2p-nodejs --recipe-path recipe.json
     && cargo chef cook --release --package minip2p-tcp --benches --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-rs --features tcp --benches --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-rs --features tcp,relay-server,pubsub,mdns,bench --benches --recipe-path recipe.json \
-    && cargo chef cook --release --package minip2p-rs --features tcp,nat,relay-server --benches --recipe-path recipe.json
+    && cargo chef cook --release --package minip2p-rs --features tcp,nat,relay-server --benches --recipe-path recipe.json \
+    && cargo chef cook --release --package minip2p-rs --features tcp,nat,relay-server,pubsub --benches --recipe-path recipe.json
 
 COPY . .
 
@@ -100,6 +101,7 @@ RUN pnpm --filter @minip2p/node native:build \
     && cargo bench -p minip2p-rs --features tcp --bench endpoint_e2e --no-run \
     && cargo bench -p minip2p-rs --features tcp,relay-server,pubsub,mdns,bench --bench endpoint_idle --no-run \
     && cargo bench -p minip2p-rs --features tcp,nat,relay-server --bench endpoint_throughput --no-run \
+    && cargo bench -p minip2p-rs --features tcp,nat,relay-server,pubsub --bench endpoint_ping_load --no-run \
     && cargo bench -p minip2p-core --bench multiaddr_ir --no-run \
     && cargo bench -p minip2p-yamux --bench data_path_ir --no-run \
     && cargo bench -p minip2p-discovery --bench peer_book_ir --no-run \

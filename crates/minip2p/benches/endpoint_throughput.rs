@@ -45,9 +45,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, EndpointEvent, Error, PeerId, RelayServerEvent, TransportError};
+use minip2p::{Endpoint, EndpointEvent, PeerId, RelayServerEvent};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Stats, StatsAlloc};
-use support::{Driven, Relayed, SETUP_TIMEOUT, bind_on, bind_relay, next_event};
+use support::{Driven, Relayed, SETUP_TIMEOUT, bind_on, bind_relay, is_backpressure, next_event};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
@@ -120,19 +120,6 @@ fn spawn_sink(target: Endpoint, client: &Endpoint) -> (Driven, Progress) {
         _ => {}
     });
     (driven, Progress { received, done })
-}
-
-/// Whether a refused write is backpressure (retry later) rather than failure:
-/// QUIC's full write queue, or a full Yamux send buffer (TCP and circuits),
-/// which reaches the Endpoint only as a `StreamSendFailed` reason.
-fn is_backpressure(error: &Error) -> bool {
-    match error {
-        Error::Transport(TransportError::ResourceExhausted { .. }) => true,
-        Error::Transport(TransportError::StreamSendFailed { reason, .. }) => {
-            reason.contains("send buffer is full")
-        }
-        _ => false,
-    }
 }
 
 /// Opens a stream and moves [`TOTAL`] bytes over it, returning the marks

@@ -230,3 +230,9 @@ cargo bench -p minip2p-rs --features tcp,relay-server,pubsub,mdns,bench --bench 
 ```bash
 cargo bench -p minip2p-rs --features tcp,nat,relay-server --bench endpoint_throughput
 ```
+
+`benches/endpoint_ping_load.rs` measures application-observed ping latency (`Instant` around `ping()` until the matching `PingRttMeasured` event, p50 and p99 over 200 samples) from an Endpoint with QUIC and TCP bound to a probe peer over each transport, while that Endpoint is idle, relays an unbounded transfer over a forced circuit, or forwards 500 1 KiB gossipsub messages per second between two peers. Each loaded case asserts the load advanced across the whole sampling window, and a sample slower than 2 s fails the run:
+
+```bash
+cargo bench -p minip2p-rs --features tcp,nat,relay-server,pubsub --bench endpoint_ping_load
+```

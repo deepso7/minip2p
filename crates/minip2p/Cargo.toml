@@ -98,3 +98,8 @@ required-features = ["quic", "tcp", "relay-server", "pubsub", "mdns", "bench"]
 name = "endpoint_throughput"
 harness = false
 required-features = ["quic", "tcp", "nat", "relay-server"]
+
+[[bench]]
+name = "endpoint_ping_load"
+harness = false
+required-features = ["quic", "tcp", "nat", "relay-server", "pubsub"]

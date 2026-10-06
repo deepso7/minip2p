@@ -92,6 +92,12 @@ EXPECTED_CUSTOM: set[tuple[str, str, str]] = {
         for metric in ("mb_per_s", "allocs_per_mb", "bytes_allocated_per_mb")
     },
     *{
+        ("rust-wall", f"endpoint_ping_load/{load}/{transport}", metric)
+        for load in ("idle", "relay", "pubsub")
+        for transport in ("tcp", "quic")
+        for metric in ("rtt_us_p50", "rtt_us_p99")
+    },
+    *{
         ("rust-micro", f"pubsub/gossipsub_forward_1KiB/{n}", metric)
         for n in (8, 32, 128)
         for metric in ("allocs_per_msg", "bytes_allocated_per_msg")
