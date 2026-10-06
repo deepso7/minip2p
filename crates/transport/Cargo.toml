@@ -15,7 +15,7 @@ workspace = true
 
 [features]
 default = ["std"]
-std = ["minip2p-core/std", "minip2p-platform/std", "thiserror/std"]
+std = ["dep:rustix", "minip2p-core/std", "minip2p-platform/std", "thiserror/std"]
 # Bench-only `TransportSet` wait counters; see `minip2p_transport::bench`.
 bench = ["std"]
 
@@ -23,3 +23,10 @@ bench = ["std"]
 minip2p-core = { path = "../core", version = "0.7.2", default-features = false }
 minip2p-platform = { path = "../platform", version = "0.7.2", default-features = false }
 thiserror = { version = "2.0.20", default-features = false }
+
+# `TransportSet`'s one `poll(2)` over its members' readiness fds.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "event"], optional = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+mio = { version = "1.2", features = ["net", "os-poll"] }

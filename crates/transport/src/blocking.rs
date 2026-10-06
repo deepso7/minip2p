@@ -100,14 +100,16 @@ pub enum WaitOutcome {
 /// [`WaitOutcome::Unsupported`], so `impl BlockingTransport for MyTransport {}`
 /// is enough to opt a transport into blocking drivers with a sleep fallback.
 ///
-/// # Decorators must forward both methods
+/// # Decorators must forward every method
 ///
 /// The defaults are only correct together, for a leaf transport with nothing
 /// to wake. A transport that wraps another and forwards
 /// [`wait_for_input`](Self::wait_for_input) must also forward
 /// [`wait_handle`](Self::wait_handle): otherwise callers get an inert handle
 /// while the wait still blocks inside the inner transport, and interrupting
-/// silently does nothing.
+/// silently does nothing. On unix it forwards
+/// [`readiness_fd`](Self::readiness_fd) too, or a
+/// [`TransportSet`](crate::TransportSet) holding it falls back to taking turns.
 pub trait BlockingTransport: Transport {
     /// Blocks until new transport input may be available or `timeout` elapses,
     /// whichever comes first.
@@ -128,6 +130,39 @@ pub trait BlockingTransport: Transport {
     /// whichever transport actually blocks.
     fn wait_handle(&self) -> WaitHandle {
         WaitHandle::noop()
+    }
+
+    /// The file descriptor this transport's waits block on, so a host
+    /// waiting on several transports can block on all of them at once.
+    ///
+    /// [`TransportSet`](crate::TransportSet) uses it to wait on every member
+    /// in one level-triggered `poll(2)` rather than in turns. The fd only has
+    /// to signal *maybe*: when it reads as ready, the set asks every member
+    /// again with a zero-timeout [`wait_for_input`](Self::wait_for_input).
+    /// For a mio-backed adapter it is the selector's own fd, from
+    /// `Registry::as_fd()`.
+    ///
+    /// # Contract
+    ///
+    /// - **Stable:** the same fd for the transport's whole lifetime.
+    /// - **Drain before block:** a zero-timeout `wait_for_input` that answers
+    ///   [`WaitOutcome::TimedOut`] must first have harvested everything
+    ///   pending on the fd, so it is not left readable by stale readiness.
+    ///   Harvesting must not lose state: readiness folded into socket flags,
+    ///   deferred work and pending interrupts must still be seen by the next
+    ///   [`Transport::poll`] or wait. Break this and a set's wait spins on a
+    ///   readable fd rather than blocking -- wasteful, but visible, and never a
+    ///   lost wakeup.
+    /// - **Interrupts:** [`wait_handle`](Self::wait_handle) must make the fd
+    ///   readable, so the set's one handle reaches a set blocked in `poll(2)`.
+    ///
+    /// The default is `None`, and a set with any parking member that has no
+    /// fd falls back to taking short turns between members, as it does on
+    /// non-unix targets and if `poll(2)` fails. A wrapper that forwards
+    /// [`wait_for_input`](Self::wait_for_input) must forward this too.
+    #[cfg(unix)]
+    fn readiness_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
     }
 }
 

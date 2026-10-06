@@ -1,10 +1,13 @@
 //! Bench-only wait counters (`bench` feature).
 //!
 //! A driver sees one return from [`TransportSet`]'s
-//! [`wait_for_input`](crate::BlockingTransport::wait_for_input), but with
-//! several members that one call takes turns waiting on each of them in short
-//! slices, and every slice that ends is a real wakeup. These counters are kept
-//! at that member-wait level so an idle bench can count them.
+//! [`wait_for_input`](crate::BlockingTransport::wait_for_input), but that one
+//! call may block more than once: in one `poll(2)` over every member's
+//! readiness fd, which a spurious wakeup repeats, or -- in the fallback --
+//! taking turns waiting on each member in short slices. Every blocking wait
+//! that ends is a real wakeup, so these counters are kept at that level: the
+//! set's `poll(2)` waits, and the member waits it makes (which, for a lone
+//! dual-stack QUIC member, is its one wait over both sockets).
 //!
 //! The counters are per thread: they count waits made on the calling thread,
 //! which is the thread that drives the endpoint. Read a snapshot with
@@ -24,11 +27,12 @@ use crate::WaitOutcome;
 /// counters.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WaitCounters {
-    /// Member waits with a non-zero timeout that found input ready.
+    /// Blocking waits that found input ready. A set `poll(2)` that woke
+    /// with nothing for any member, a spurious wakeup, counts here too.
     pub ready: u64,
-    /// Member waits with a non-zero timeout that ran out their timeout.
+    /// Blocking waits that ran out their timeout.
     pub timed_out: u64,
-    /// Member waits with a non-zero timeout ended by a [`WaitHandle`](crate::WaitHandle).
+    /// Blocking waits ended by a [`WaitHandle`](crate::WaitHandle).
     pub interrupted: u64,
     /// Set waits with a non-zero timeout that found no member able to park
     /// and returned [`WaitOutcome::Unsupported`], sending a blocking driver
@@ -41,8 +45,7 @@ pub struct WaitCounters {
 }
 
 impl WaitCounters {
-    /// Member waits with a non-zero timeout that returned, whatever ended
-    /// them. A `ready` wait may have found input at once, without blocking;
+    /// Blocking waits that returned, whatever ended them. A `ready` wait may have found input at once, without blocking;
     /// either way the driver wakes to poll.
     pub fn wakeups(&self) -> u64 {
         self.ready + self.timed_out + self.interrupted
@@ -80,8 +83,9 @@ fn update(change: impl FnOnce(&mut WaitCounters)) {
     });
 }
 
-/// Counts one member wait. Non-blocking probes are not wakeups.
-pub(crate) fn record_member_wait(timeout: Duration, outcome: WaitOutcome) {
+/// Counts one wait that may block: a member wait, or the set's `poll(2)`.
+/// Non-blocking probes are not wakeups.
+pub(crate) fn record_blocking_wait(timeout: Duration, outcome: WaitOutcome) {
     if timeout.is_zero() {
         return;
     }

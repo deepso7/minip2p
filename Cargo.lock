@@ -1441,6 +1441,7 @@ dependencies = [
  "minip2p-transport",
  "mio",
  "quiche",
+ "rustix",
  "sha2",
  "socket2",
 ]
@@ -1593,6 +1594,8 @@ version = "0.7.2"
 dependencies = [
  "minip2p-core",
  "minip2p-platform",
+ "mio",
+ "rustix",
  "thiserror",
 ]
 

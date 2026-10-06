@@ -786,6 +786,15 @@ impl BlockingTcpProvider for StdTcpProvider {
             }
         })
     }
+
+    /// The `mio` selector. A zero-timeout wait folds everything it harvests
+    /// into socket flags and `pending_interrupt` before answering `TimedOut`,
+    /// so nothing stale is left on it and nothing learned is lost.
+    #[cfg(unix)]
+    fn readiness_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        Some(self.poll.registry().as_fd())
+    }
 }
 
 #[cfg(test)]
