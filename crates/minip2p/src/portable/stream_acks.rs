@@ -29,15 +29,17 @@ impl StreamAcks {
     /// Leaves data on `protocol_id`'s streams for the application to
     /// acknowledge, for streams that become ready from now on. `already_ready`
     /// names the streams whose `StreamReady` was produced but not pulled yet:
-    /// they keep automatic acknowledgement.
+    /// they keep automatic acknowledgement. A protocol that is manual
+    /// already stays as it is, streams included.
     #[cfg(any(feature = "std", test))]
     pub(crate) fn set_manual(
         &mut self,
         protocol_id: String,
         already_ready: impl IntoIterator<Item = (ConnectionId, StreamId)>,
     ) {
-        self.pinned_auto.extend(already_ready);
-        self.manual_protocols.insert(protocol_id);
+        if self.manual_protocols.insert(protocol_id) {
+            self.pinned_auto.extend(already_ready);
+        }
     }
 
     /// Observes an event the application is pulling, and returns the
@@ -129,6 +131,14 @@ mod tests {
         );
         acks.pulled(&ready("/later/1", 2));
         assert_eq!(acks.pulled(&data(2, 3)), None);
+
+        // Registering it again changes nothing: stream 3 was manual already.
+        acks.set_manual(
+            "/later/1".into(),
+            [(ConnectionId::new(1), StreamId::new(3))],
+        );
+        acks.pulled(&ready("/later/1", 3));
+        assert_eq!(acks.pulled(&data(3, 3)), None);
     }
 
     #[test]
