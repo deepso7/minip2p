@@ -18,7 +18,7 @@ use minip2p_transport::{
 use sha2::{Digest, Sha256};
 
 use crate::PendingDatagram;
-use crate::diagnostics::{ConnectionCounters, DatagramTally};
+use crate::diagnostics::ConnectionCounters;
 
 const SEND_BUF_SIZE: usize = 1350;
 
@@ -170,7 +170,7 @@ impl QuicConnection {
         endpoint: ConnectionEndpoint,
         max_local_bidi_streams: u64,
         max_pending_write_bytes: usize,
-        tally: DatagramTally,
+        counters: ConnectionCounters,
     ) -> Self {
         let next_local_bidi_stream_id = if conn.is_server() { 1 } else { 0 };
 
@@ -192,7 +192,7 @@ impl QuicConnection {
             sent_keepalive_since_recv: false,
             paced: None,
             streams_dirty: false,
-            counters: ConnectionCounters::new(tally),
+            counters,
         }
     }
 
@@ -931,7 +931,6 @@ impl QuicConnection {
         pacing: Pacing,
     ) -> Result<(), TransportError> {
         let not_due = |at: Instant| pacing == Pacing::Honour && at > Instant::now();
-        self.counters.flush();
         if let Some(paced) = self.paced.take() {
             // Not due yet, or nowhere to retain it on `WouldBlock`.
             if not_due(paced.at) || pending_datagrams.len() >= max_pending_datagrams {
@@ -945,6 +944,9 @@ impl QuicConnection {
             self.counters.sent(bytes.len());
         }
 
+        // Counted here, past the held packet: a pass stopped behind it asks
+        // quiche for nothing.
+        self.counters.flush();
         let full_packet = self.conn.max_send_udp_payload_size();
         let mut out = [0u8; SEND_BUF_SIZE];
         loop {

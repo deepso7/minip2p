@@ -30,7 +30,8 @@ use minip2p_core::PeerId;
 pub struct ConnectionDiagnostics {
     /// Datagrams routed to this connection.
     pub datagrams_received: u64,
-    /// Flushes: passes that pulled packets from quiche, from any trigger.
+    /// Flushes: passes that asked quiche for packets, from any trigger. A
+    /// pass stopped behind a held paced packet is not one.
     pub flushes: u64,
     /// Flushes run while handling a received datagram. Once established, a
     /// connection leaves its output for the flush after the receive batch,
@@ -126,19 +127,20 @@ impl DatagramCounters {
 /// zeros once all of them are dropped, or if none was bound.
 #[cfg(feature = "diagnostics")]
 pub fn datagram_counters(peer: &PeerId) -> DatagramCounters {
-    let registry = REGISTRY
+    // Only the lookup holds the lock; the upgraded `Arc` keeps the counters
+    // alive for the loads.
+    let tally = REGISTRY
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    registry
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
         .find(|(id, _)| id == peer)
-        .and_then(|(_, tally)| tally.upgrade())
-        .map_or_else(DatagramCounters::default, |tally| DatagramCounters {
-            sent: tally.sent.load(Relaxed),
-            sent_bytes: tally.sent_bytes.load(Relaxed),
-            received: tally.received.load(Relaxed),
-            received_bytes: tally.received_bytes.load(Relaxed),
-        })
+        .and_then(|(_, tally)| tally.upgrade());
+    tally.map_or_else(DatagramCounters::default, |tally| DatagramCounters {
+        sent: tally.sent.load(Relaxed),
+        sent_bytes: tally.sent_bytes.load(Relaxed),
+        received: tally.received.load(Relaxed),
+        received_bytes: tally.received_bytes.load(Relaxed),
+    })
 }
 
 #[cfg(feature = "diagnostics")]

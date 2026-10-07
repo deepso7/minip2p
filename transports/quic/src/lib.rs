@@ -46,7 +46,7 @@ pub use config::{QuicLimits, QuicNodeConfig};
 pub use diagnostics::{ConnectionDiagnostics, DatagramCounters, datagram_counters};
 
 use connection::QuicConnection;
-use diagnostics::DatagramTally;
+use diagnostics::{ConnectionCounters, DatagramTally};
 
 const DEFAULT_IPV4_BIND: &str = "0.0.0.0:0";
 const DEFAULT_IPV6_BIND: &str = "[::]:0";
@@ -1257,7 +1257,7 @@ impl QuicTransport {
                     endpoint.clone(),
                     self.node_config.limits().max_streams_per_connection,
                     self.node_config.limits().max_pending_stream_bytes,
-                    self.tally.clone(),
+                    ConnectionCounters::new(self.tally.clone()),
                 );
                 for cid in conn.take_unindexed_source_cids() {
                     self.cid_to_connection.insert(cid, id);
@@ -1456,6 +1456,9 @@ impl Transport for QuicTransport {
             reason: format!("quiche connect error: {e}"),
         })?;
 
+        let mut counters = ConnectionCounters::new(self.tally.clone());
+        counters.flush();
+        let full_packet = quiche_conn.max_send_udp_payload_size();
         let mut out = [0u8; 1350];
         // A fresh connection's first flight is inside quiche's initial unpaced
         // burst, so `SendInfo::at` needs no honouring here; `flush` paces the
@@ -1475,8 +1478,9 @@ impl Transport for QuicTransport {
             let packet = out
                 .get(..written)
                 .expect("quiche reports packet lengths within the supplied buffer");
+            counters.packet(written, full_packet);
             match self.socket.send_to(packet, send_info.to) {
-                Ok(_) => self.tally.sent(written),
+                Ok(_) => counters.sent(written),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Transient backpressure must not fail the dial. Retain
                     // the packet best-effort -- like `flush` does for
@@ -1502,7 +1506,7 @@ impl Transport for QuicTransport {
             ConnectionEndpoint::from_peer_addr(addr),
             self.node_config.limits().max_streams_per_connection,
             self.node_config.limits().max_pending_stream_bytes,
-            self.tally.clone(),
+            counters,
         );
         for cid in conn.take_unindexed_source_cids() {
             self.cid_to_connection.insert(cid, id);
