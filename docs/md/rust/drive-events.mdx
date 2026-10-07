@@ -91,7 +91,8 @@ fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> 
     // relative Duration inside the loop would reset the timeout on every
     // unrelated event or interruption.
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
+    // Checked before each wait: unrelated events keep arriving past it.
+    while Instant::now() < deadline {
         match node.wait(deadline)? {
             EndpointWaitOutcome::Event(EndpointEvent::PeerReady { peer_id, .. })
                 if peer_id == peer =>
@@ -105,7 +106,7 @@ fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> 
             EndpointWaitOutcome::Event(_) => {
                 // Handle unrelated connection / stream / ping / capability events.
             }
-            EndpointWaitOutcome::Deadline => break,
+            EndpointWaitOutcome::Deadline => {}
             EndpointWaitOutcome::Interrupted => {
                 // Service external commands, then continue.
             }
