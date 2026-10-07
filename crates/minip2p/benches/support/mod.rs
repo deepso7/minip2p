@@ -59,13 +59,15 @@ pub fn send_chunk(
     let data = held.take().unwrap_or_else(|| chunk.clone());
     let len = data.len();
     match endpoint.send_stream(peer, stream.0, stream.1, data) {
-        Ok(()) => (len as u64, false),
         Err(Error::Full { unsent, .. }) => {
             let accepted = len - unsent.len();
             *held = Some(unsent);
             (accepted as u64, true)
         }
-        Err(error) => panic!("send failed: {error}"),
+        other => {
+            other.expect("send failed");
+            (len as u64, false)
+        }
     }
 }
 
