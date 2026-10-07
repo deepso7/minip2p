@@ -354,6 +354,7 @@ fn fuzz_circuit(data: &[u8]) {
             remote_peer: remote.clone(),
             role,
             pending_data: Bytes::copy_from_slice(&NOISE_SELECTION[..1]),
+            unsent_prefix: Bytes::new(),
             remote_write_closed: false,
         });
         for chunk in NOISE_SELECTION[1..].chunks(chunk_len) {
