@@ -81,3 +81,9 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 **Receive budget**: The most unacknowledged bytes a stream will deliver to its reader. Acknowledging consumed bytes replenishes it, which is what lets the sender continue. _Avoid_: read buffer, window (the transport's own term)
 
 **Unsettled stream**: A stream whose delivered bytes are not yet all acknowledged or abandoned. It keeps its stream slot even after closing, so stream churn cannot grow retained receive data. _Avoid_: zombie stream, lingering stream
+
+### Errors
+
+**Bind error**: A failure turning Endpoint options into a running Endpoint, before any event is polled. It names what failed (a transport, the relay server, gossipsub, mDNS, or the options themselves) and carries that part's typed cause. Never describes something that fails later. _Avoid_: config error, InvalidConfig
+
+**Capability failure event**: A runtime change in one capability's failure state, such as mDNS or a relay server address source, reported on the Endpoint event stream while the endpoint keeps running. A failure is reported once per change, and a recovery is reported if the capability later recovers; a failure while the capability is being shut down is final. Meanwhile the capability keeps its last accepted state. _Avoid_: poll error, runtime error
