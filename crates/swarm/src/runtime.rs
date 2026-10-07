@@ -667,6 +667,14 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         Ok(self.transport.ack_stream(conn_id, stream_id, bytes)?)
     }
 
+    /// Events already produced but not yet handed out, oldest first. Only
+    /// the std [`Swarm`](crate::Swarm) wrapper holds events here between
+    /// calls; a host that must act on events it has not seen yet (such as a
+    /// `StreamReady` still in flight) can inspect them.
+    pub fn buffered_events(&self) -> impl Iterator<Item = &SwarmEvent> {
+        self.event_buffer.iter()
+    }
+
     /// Forgets swarm bookkeeping for a stream without touching the transport.
     ///
     /// This is used when ownership of a negotiated stream moves to another

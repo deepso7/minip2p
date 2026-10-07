@@ -27,27 +27,16 @@ pub(crate) struct StreamAcks {
 
 impl StreamAcks {
     /// Leaves data on `protocol_id`'s streams for the application to
-    /// acknowledge, for streams that become ready from now on. `queued` are
-    /// the events produced but not yet pulled: streams already ready there
-    /// keep automatic acknowledgement.
+    /// acknowledge, for streams that become ready from now on. `already_ready`
+    /// names the streams whose `StreamReady` was produced but not pulled yet:
+    /// they keep automatic acknowledgement.
     #[cfg(any(feature = "std", test))]
-    pub(crate) fn set_manual<'a>(
+    pub(crate) fn set_manual(
         &mut self,
         protocol_id: String,
-        queued: impl Iterator<Item = &'a EndpointEvent>,
+        already_ready: impl IntoIterator<Item = (ConnectionId, StreamId)>,
     ) {
-        for event in queued {
-            if let EndpointEvent::StreamReady {
-                conn_id,
-                stream_id,
-                protocol_id: ready,
-                ..
-            } = event
-                && *ready == protocol_id
-            {
-                self.pinned_auto.insert((*conn_id, *stream_id));
-            }
-        }
+        self.pinned_auto.extend(already_ready);
         self.manual_protocols.insert(protocol_id);
     }
 
@@ -129,9 +118,11 @@ mod tests {
     fn streams_already_ready_keep_auto_acknowledgement() {
         let mut acks = StreamAcks::default();
         // Stream 1 became ready before the registration, but is pulled after.
-        let queued = [ready("/later/1", 1)];
-        acks.set_manual("/later/1".into(), queued.iter());
-        assert_eq!(acks.pulled(&queued[0]), None);
+        acks.set_manual(
+            "/later/1".into(),
+            [(ConnectionId::new(1), StreamId::new(1))],
+        );
+        assert_eq!(acks.pulled(&ready("/later/1", 1)), None);
         assert_eq!(
             acks.pulled(&data(1, 3)),
             Some((ConnectionId::new(1), StreamId::new(1), 3))
@@ -143,7 +134,7 @@ mod tests {
     #[test]
     fn pulled_data_is_acknowledged_unless_its_protocol_is_manual() {
         let mut acks = StreamAcks::default();
-        acks.set_manual("/manual/1".into(), [].iter());
+        acks.set_manual("/manual/1".into(), []);
         assert_eq!(acks.pulled(&ready("/auto/1", 1)), None);
         assert_eq!(acks.pulled(&ready("/manual/1", 2)), None);
 

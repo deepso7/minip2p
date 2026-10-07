@@ -600,8 +600,32 @@ impl Endpoint {
     pub fn add_manual_ack_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), Error> {
         let protocol_id = protocol_id.into();
         self.swarm.add_protocol(protocol_id.clone())?;
-        self.acks
-            .set_manual(protocol_id, self.pending_events.iter());
+        // Streams already ready keep their acknowledgement, whether their
+        // StreamReady waits in the Endpoint's queue or the swarm's.
+        let queued = self.pending_events.iter().filter_map(|event| match event {
+            EndpointEvent::StreamReady {
+                conn_id,
+                stream_id,
+                protocol_id: ready,
+                ..
+            } => (*ready == protocol_id).then_some((*conn_id, *stream_id)),
+            _ => None,
+        });
+        let buffered = self
+            .swarm
+            .runtime()
+            .buffered_events()
+            .filter_map(|event| match event {
+                SwarmEvent::StreamReady {
+                    conn_id,
+                    stream_id,
+                    protocol_id: ready,
+                    ..
+                } => (*ready == protocol_id).then_some((*conn_id, *stream_id)),
+                _ => None,
+            });
+        let already_ready: Vec<_> = queued.chain(buffered).collect();
+        self.acks.set_manual(protocol_id, already_ready);
         Ok(())
     }
 
@@ -2227,7 +2251,7 @@ fn build_endpoint(
     let mut builder = SwarmBuilder::new(&keypair).agent_version(options.agent_version);
     let mut acks = StreamAcks::default();
     for protocol in options.manual_ack_protocols {
-        acks.set_manual(protocol, core::iter::empty());
+        acks.set_manual(protocol, []);
     }
     #[cfg(any(feature = "nat", feature = "pubsub"))]
     let mut protocols = options.protocols;
