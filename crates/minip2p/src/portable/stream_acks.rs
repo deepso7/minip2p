@@ -20,13 +20,34 @@ pub(crate) struct StreamAcks {
     manual_protocols: BTreeSet<String>,
     /// Pulled streams of a manual protocol that have not ended yet.
     manual_streams: BTreeSet<(ConnectionId, StreamId)>,
+    /// Streams of a manual protocol that became ready before it was made
+    /// manual, whose `StreamReady` is not pulled yet: they stay automatic.
+    pinned_auto: BTreeSet<(ConnectionId, StreamId)>,
 }
 
 impl StreamAcks {
     /// Leaves data on `protocol_id`'s streams for the application to
-    /// acknowledge, from the next pulled `StreamReady` on.
+    /// acknowledge, for streams that become ready from now on. `queued` are
+    /// the events produced but not yet pulled: streams already ready there
+    /// keep automatic acknowledgement.
     #[cfg(any(feature = "std", test))]
-    pub(crate) fn set_manual(&mut self, protocol_id: String) {
+    pub(crate) fn set_manual<'a>(
+        &mut self,
+        protocol_id: String,
+        queued: impl Iterator<Item = &'a EndpointEvent>,
+    ) {
+        for event in queued {
+            if let EndpointEvent::StreamReady {
+                conn_id,
+                stream_id,
+                protocol_id: ready,
+                ..
+            } = event
+                && *ready == protocol_id
+            {
+                self.pinned_auto.insert((*conn_id, *stream_id));
+            }
+        }
         self.manual_protocols.insert(protocol_id);
     }
 
@@ -42,8 +63,11 @@ impl StreamAcks {
                 stream_id,
                 protocol_id,
                 ..
-            } if self.manual_protocols.contains(protocol_id) => {
-                self.manual_streams.insert((*conn_id, *stream_id));
+            } => {
+                let key = (*conn_id, *stream_id);
+                if !self.pinned_auto.remove(&key) && self.manual_protocols.contains(protocol_id) {
+                    self.manual_streams.insert(key);
+                }
             }
             EndpointEvent::StreamData {
                 conn_id,
@@ -69,6 +93,7 @@ impl StreamAcks {
     /// later events it never pulls.
     pub(crate) fn forget(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
         self.manual_streams.remove(&(conn_id, stream_id));
+        self.pinned_auto.remove(&(conn_id, stream_id));
     }
 }
 
@@ -101,9 +126,24 @@ mod tests {
     }
 
     #[test]
+    fn streams_already_ready_keep_auto_acknowledgement() {
+        let mut acks = StreamAcks::default();
+        // Stream 1 became ready before the registration, but is pulled after.
+        let queued = [ready("/later/1", 1)];
+        acks.set_manual("/later/1".into(), queued.iter());
+        assert_eq!(acks.pulled(&queued[0]), None);
+        assert_eq!(
+            acks.pulled(&data(1, 3)),
+            Some((ConnectionId::new(1), StreamId::new(1), 3))
+        );
+        acks.pulled(&ready("/later/1", 2));
+        assert_eq!(acks.pulled(&data(2, 3)), None);
+    }
+
+    #[test]
     fn pulled_data_is_acknowledged_unless_its_protocol_is_manual() {
         let mut acks = StreamAcks::default();
-        acks.set_manual("/manual/1".into());
+        acks.set_manual("/manual/1".into(), [].iter());
         assert_eq!(acks.pulled(&ready("/auto/1", 1)), None);
         assert_eq!(acks.pulled(&ready("/manual/1", 2)), None);
 

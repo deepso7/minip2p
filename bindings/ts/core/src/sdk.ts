@@ -794,8 +794,10 @@ export class Stream {
 
   /** Hands `chunk` to every `data` handler; it is consumed once they return. */
   #emitData(chunk: Uint8Array): void {
+    // Counted first: a handler may transfer the buffer, detaching it.
+    const bytes = chunk.byteLength;
     this.#emit("data", chunk);
-    this.#consumed(chunk.byteLength);
+    this.#consumed(bytes);
   }
 
   /** Takes the oldest buffered chunk for a reader, consuming it. */
@@ -846,6 +848,18 @@ const streamConsumer = (
     return backend.streamConsumer(meta.connId, meta.streamId);
   } catch {
     return () => {};
+  }
+};
+
+/** Acknowledges data that arrived for a stream the SDK no longer tracks. */
+const consumeUntracked = (
+  backend: Minip2pBackend,
+  inner: StreamDataEvent["inner"]
+): void => {
+  try {
+    backend.streamConsumer(inner.connId, inner.streamId)(inner.data.byteLength);
+  } catch {
+    // Settled already, or its connection is gone: nothing to release.
   }
 };
 
@@ -1800,10 +1814,14 @@ export class Minip2pBase {
         preserveRemoteEof: true,
       });
     } else if (event.tag === P2pEvent_Tags.StreamData) {
-      // Data for a stream the SDK no longer tracks needs no acknowledgement:
-      // it was reset or abandoned, which settled it natively, or its
-      // connection ended.
-      stream?.receive(event.inner.data);
+      if (stream === undefined) {
+        // Nothing will read it, so it is consumed now: an abandon that
+        // native refused (the stream had already closed there) leaves the
+        // bytes holding the native stream slot otherwise.
+        consumeUntracked(this.#backend, event.inner);
+      } else {
+        stream.receive(event.inner.data);
+      }
     } else if (event.tag === P2pEvent_Tags.StreamWriteAccepted) {
       stream?.writeAccepted();
     } else if (event.tag === P2pEvent_Tags.StreamWriteStopped) {

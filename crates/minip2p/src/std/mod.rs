@@ -600,7 +600,8 @@ impl Endpoint {
     pub fn add_manual_ack_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), Error> {
         let protocol_id = protocol_id.into();
         self.swarm.add_protocol(protocol_id.clone())?;
-        self.acks.set_manual(protocol_id);
+        self.acks
+            .set_manual(protocol_id, self.pending_events.iter());
         Ok(())
     }
 
@@ -2226,7 +2227,7 @@ fn build_endpoint(
     let mut builder = SwarmBuilder::new(&keypair).agent_version(options.agent_version);
     let mut acks = StreamAcks::default();
     for protocol in options.manual_ack_protocols {
-        acks.set_manual(protocol);
+        acks.set_manual(protocol, core::iter::empty());
     }
     #[cfg(any(feature = "nat", feature = "pubsub"))]
     let mut protocols = options.protocols;

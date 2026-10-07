@@ -989,6 +989,36 @@ test("a data listener attached after a clean close drains and consumes the unrea
   endpoint.close();
 });
 
+test("data for a stream the SDK no longer tracks is consumed", async () => {
+  const backend = new MockBackend();
+  // Native already closed the stream, so the unclaimed stream's abandon fails.
+  backend.abandonError = new Error("stream is not active");
+  const endpoint = new TestMinip2p(backend);
+  backend.emit(streamReady({ streamId: 9 }));
+  backend.emit(streamData(new Uint8Array(6), 9));
+  await tick();
+
+  assert.deepEqual(backend.consumed, [[2, 9, 6]]);
+  endpoint.close();
+});
+
+test("a data listener that transfers the chunk's buffer still consumes it", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  stream.on("data", (chunk) => {
+    structuredClone(chunk.buffer, { transfer: [chunk.buffer] });
+  });
+
+  backend.emit(streamData(new Uint8Array(5), 3));
+  await tick();
+
+  assert.deepEqual(backend.consumed, [[2, 3, 5]]);
+  endpoint.close();
+});
+
 test("a data listener consumes a chunk when it returns", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
