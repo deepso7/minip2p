@@ -416,6 +416,16 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                     unsent,
                 })
             }
+            Err(SessionError::Yamux(YamuxError::AckExceedsDelivered {
+                stream,
+                acked,
+                unacked,
+            })) => Err(TransportError::AckExceedsDelivered {
+                id,
+                stream_id: StreamId::new(u64::from(stream)),
+                acked,
+                unacked,
+            }),
             // Yamux refused the operation -- a closed write side, an unknown
             // substream -- but the session itself is still healthy.
             Err(SessionError::Yamux(error)) => Err(TransportError::PollError {
@@ -693,6 +703,20 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
             });
         drop_writable(&mut self.pending, id, stream_id);
         result
+    }
+
+    fn ack_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), TransportError> {
+        if !self.connections.contains_key(&id) {
+            return Ok(());
+        }
+        // Flushed at once, so the window update reaches the peer without
+        // waiting for another poll.
+        self.operate_session(id, |session| session.ack_stream(stream_id, bytes))
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {

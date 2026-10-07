@@ -26,12 +26,75 @@ fn agent() -> GossipsubAgent {
     agent_with(GossipsubConfig::default())
 }
 
+/// Every queued action except acknowledgements, which each inbound frame
+/// produces; `acks_of` checks those.
 fn drain_actions(agent: &mut GossipsubAgent) -> Vec<GossipsubAction> {
     let mut actions = Vec::new();
     while let Some(action) = agent.poll_action() {
-        actions.push(action);
+        if !matches!(action, GossipsubAction::AckStream { .. }) {
+            actions.push(action);
+        }
     }
     actions
+}
+
+/// Drains the queue, returning the bytes acknowledged per stream, in order.
+fn acks_of(agent: &mut GossipsubAgent) -> Vec<(StreamId, usize)> {
+    let mut acks = Vec::new();
+    while let Some(action) = agent.poll_action() {
+        if let GossipsubAction::AckStream {
+            stream_id, bytes, ..
+        } = action
+        {
+            acks.push((stream_id, bytes));
+        }
+    }
+    acks
+}
+
+#[test]
+fn inbound_bytes_are_acknowledged_once_their_frame_is_decoded() {
+    let mut agent = agent();
+    let remote = peer(2);
+    let stream = StreamId::new(5);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    inbound_open(&mut agent, &remote, stream, 0);
+    drain_actions(&mut agent);
+    let frame = encode_frame(
+        &Rpc {
+            subscriptions: vec![SubOpts {
+                subscribe: Some(true),
+                topic_id: Some("room".to_string()),
+            }],
+            ..Rpc::default()
+        }
+        .encode(),
+    );
+    let data = |bytes: &[u8]| SwarmEvent::StreamData {
+        peer_id: remote.clone(),
+        conn_id: ConnectionId::new(1),
+        stream_id: stream,
+        data: Bytes::copy_from_slice(bytes),
+    };
+
+    // Half a frame is held, unacknowledged; completing it acks it all.
+    let (head, tail) = frame.split_at(1);
+    assert!(agent.handle_event(&data(head), 0));
+    assert_eq!(acks_of(&mut agent), []);
+    assert!(agent.handle_event(&data(tail), 0));
+    assert_eq!(acks_of(&mut agent), [(stream, frame.len())]);
+
+    // A partial frame the stream closes on is discarded, which consumes it.
+    assert!(agent.handle_event(&data(head), 0));
+    assert!(agent.handle_event(
+        &SwarmEvent::StreamClosed {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
+            stream_id: stream,
+        },
+        0,
+    ));
+    assert_eq!(acks_of(&mut agent), [(stream, head.len())]);
 }
 
 fn drain_events(agent: &mut GossipsubAgent) -> Vec<GossipsubEvent> {

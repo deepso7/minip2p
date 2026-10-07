@@ -164,9 +164,15 @@ fn sustained_one_way_load_recovers_from_loss_and_reordering_with_batched_acks() 
         let mut read_data = false;
         for event in server.poll(now()).expect("poll") {
             match event {
-                TransportEvent::StreamData { data, .. } => {
+                TransportEvent::StreamData {
+                    id,
+                    stream_id,
+                    data,
+                } => {
                     read_data = true;
-                    received.extend(data);
+                    received.extend_from_slice(&data);
+                    // A reader that keeps up acknowledges what it read.
+                    server.ack_stream(id, stream_id, data.len()).expect("ack");
                 }
                 TransportEvent::StreamRemoteWriteClosed { .. } => fin_received = true,
                 _ => {}

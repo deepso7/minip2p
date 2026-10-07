@@ -187,6 +187,15 @@ impl FuzzTransport {
 }
 
 impl Transport for FuzzTransport {
+    fn ack_stream(
+        &mut self,
+        _id: ConnectionId,
+        _stream_id: StreamId,
+        _bytes: usize,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
+
     fn dial(&mut self, _addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
         Err(TransportError::InvalidConfig {
             reason: "fuzz transport does not dial".into(),

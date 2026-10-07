@@ -56,6 +56,19 @@ pub enum TransportError {
         stream_id: StreamId,
         unsent: Bytes,
     },
+    /// An acknowledgement named more bytes than the stream has delivered
+    /// and not yet had acknowledged. Nothing was acknowledged.
+    #[error(
+        "cannot acknowledge {acked} bytes on stream {stream_id} of connection {id}: only {unacked} are unacknowledged"
+    )]
+    AckExceedsDelivered {
+        id: ConnectionId,
+        stream_id: StreamId,
+        /// Bytes the call tried to acknowledge.
+        acked: usize,
+        /// Bytes the stream had delivered and not yet had acknowledged.
+        unacked: usize,
+    },
     #[error("stream send failed for {id}/{stream_id}: {reason}")]
     StreamSendFailed {
         id: ConnectionId,

@@ -112,6 +112,21 @@ impl RelayServerDriver {
         // The first event at this time sample runs the agent tick before
         // dispatch, preserving deadline-first ordering for the batch.
         let claimed = self.agent.handle_event(event, is_circuit, now);
+        // The agent consumes what it claims as it reads it: relay messages,
+        // and circuit bytes it forwards at once (pausing the source behind
+        // a full destination is #257's).
+        if claimed
+            && let SwarmEvent::StreamData {
+                conn_id,
+                stream_id,
+                data,
+                ..
+            } = event
+        {
+            match swarm.ack_stream(*conn_id, *stream_id, data.len()) {
+                Ok(()) | Err(_) => {}
+            }
+        }
         if let SwarmEvent::ConnectionEstablished { conn_id, .. }
         | SwarmEvent::ConnectionReplaced { new: conn_id, .. } = event
             && let Some(address) = swarm.connection_remote_addr(*conn_id).cloned()

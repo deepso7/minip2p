@@ -390,6 +390,20 @@ impl Transport for TransportSet {
         self.for_id(id)?.reset_stream(id, stream_id)
     }
 
+    fn ack_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), TransportError> {
+        // A connection no member owns is unknown, and acknowledging an
+        // unknown connection is a no-op.
+        match self.for_id(id) {
+            Ok(member) => member.ack_stream(id, stream_id, bytes),
+            Err(_) => Ok(()),
+        }
+    }
+
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
         self.for_id(id)?.close(id)
     }
@@ -902,6 +916,16 @@ mod tests {
             _stream_id: StreamId,
         ) -> Result<(), TransportError> {
             self.record("reset_stream");
+            Ok(())
+        }
+
+        fn ack_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _bytes: usize,
+        ) -> Result<(), TransportError> {
+            self.record("ack_stream");
             Ok(())
         }
 

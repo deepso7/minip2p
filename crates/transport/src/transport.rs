@@ -67,6 +67,23 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 ///   `StreamClosed`, or `Closed`); those tell the holder to drop its tail.
 /// - Temporary send pressure never tears down a connection.
 ///
+/// Reads follow the read-side contract:
+///
+/// - Each stream delivers at most its **receive budget** of unacknowledged
+///   `StreamData` bytes, equal to its per-stream receive window. Whoever
+///   consumes the bytes calls [`ack_stream`](Transport::ack_stream), which
+///   replenishes the budget and is what returns credit to the sender: a
+///   reader that never acknowledges stalls its sender, and nothing else.
+/// - An **unsettled stream** (delivered bytes not yet all acknowledged)
+///   keeps its stream slot after it closes, until they are acknowledged or
+///   abandoned by a local `reset_stream`. Inbound streams past the stream
+///   limit are refused, so received data per connection stays within the
+///   stream limit times the stream window.
+/// - Acknowledging more than a stream's unacknowledged bytes is
+///   [`TransportError::AckExceedsDelivered`]. Acknowledging a closed stream
+///   releases its bytes; acknowledging a settled or unknown stream (or
+///   connection) is a no-op.
+///
 /// ## Event ordering
 ///
 /// - Events for a single connection are returned in causal order within a
@@ -137,9 +154,26 @@ pub trait Transport {
 
     /// Abruptly reset a stream in both directions.
     ///
-    /// Emits `StreamClosed` if not already emitted. Pending writes are dropped.
+    /// Emits `StreamClosed` if not already emitted. Pending writes are
+    /// dropped, and the stream's unacknowledged bytes are abandoned: it
+    /// settles at once.
     fn reset_stream(&mut self, id: ConnectionId, stream_id: StreamId)
     -> Result<(), TransportError>;
+
+    /// Acknowledges `bytes` of the stream's delivered `StreamData` as
+    /// consumed, replenishing its receive budget (see
+    /// [Backpressure](#backpressure)).
+    ///
+    /// Fails with [`TransportError::AckExceedsDelivered`] when `bytes` is more
+    /// than the stream's unacknowledged bytes. On a closed stream this
+    /// releases the bytes, and the stream's slot once none are left; on a
+    /// settled or unknown stream or connection it does nothing.
+    fn ack_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), TransportError>;
 
     /// Gracefully close a connection.
     ///
@@ -275,6 +309,17 @@ mod tests {
         ) -> Result<(), TransportError> {
             Err(TransportError::Unsupported {
                 operation: "reset_stream",
+            })
+        }
+
+        fn ack_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _bytes: usize,
+        ) -> Result<(), TransportError> {
+            Err(TransportError::Unsupported {
+                operation: "ack_stream",
             })
         }
 

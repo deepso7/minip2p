@@ -347,6 +347,19 @@ pub enum SwarmAction {
     },
     /// Gracefully close a connection.
     CloseConnection { conn_id: ConnectionId },
+    /// Acknowledge `bytes` of a stream's delivered data as consumed
+    /// (`Transport::ack_stream`).
+    ///
+    /// The core acknowledges what it consumes itself: negotiation, ping, and
+    /// Identify bytes, and data for streams it no longer routes. Bytes it
+    /// hands to the application in [`SwarmEvent::StreamData`] are the
+    /// application's to acknowledge. Acks never wait behind events, so the
+    /// driver may dispatch this at once.
+    AckStream {
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    },
 }
 
 /// Errors returned by the sans-I/O core for application-driven operations.

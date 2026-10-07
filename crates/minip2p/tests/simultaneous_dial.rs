@@ -190,6 +190,15 @@ fn event_connection(event: &TransportEvent) -> Option<ConnectionId> {
 }
 
 impl<T: Transport> Transport for ReverseFirstTwo<T> {
+    fn ack_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), TransportError> {
+        self.inner.ack_stream(id, stream_id, bytes)
+    }
+
     fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
         self.inner.dial(addr)
     }

@@ -1272,6 +1272,15 @@ mod tests {
     }
 
     impl Transport for FakeTransport {
+        fn ack_stream(
+            &mut self,
+            _: minip2p_transport::ConnectionId,
+            _: minip2p_transport::StreamId,
+            _: usize,
+        ) -> Result<(), minip2p_transport::TransportError> {
+            Ok(())
+        }
+
         fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
             if self.refuse {
                 return Err(TransportError::InvalidAddress {

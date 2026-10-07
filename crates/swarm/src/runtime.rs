@@ -650,6 +650,23 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         Ok(())
     }
 
+    /// Acknowledges `bytes` of a stream's delivered data as consumed,
+    /// replenishing its receive budget so the sender can continue (ADR 0012).
+    ///
+    /// The application owns this for every [`SwarmEvent::StreamData`] it
+    /// receives; the core acknowledges what it consumes itself. Fails with
+    /// [`TransportError::AckExceedsDelivered`] for more than the stream's
+    /// unacknowledged bytes; a closed stream releases them, and a settled or
+    /// unknown stream is a no-op.
+    pub fn ack_stream(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), DriverError> {
+        Ok(self.transport.ack_stream(conn_id, stream_id, bytes)?)
+    }
+
     /// Forgets swarm bookkeeping for a stream without touching the transport.
     ///
     /// This is used when ownership of a negotiated stream moves to another
@@ -789,7 +806,11 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         let mut saw_event = false;
         while let Some(output) = self.core.poll_output() {
             match output {
-                SwarmOutput::Action(action) if saw_event => {
+                // An ack orders against nothing: the core already consumed
+                // the bytes, so their credit goes back at once.
+                SwarmOutput::Action(action)
+                    if saw_event && !matches!(action, SwarmAction::AckStream { .. }) =>
+                {
                     self.after_event_actions.push_back(action);
                 }
                 SwarmOutput::Action(action) => {
@@ -914,6 +935,23 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
                             "reset_stream on connection {conn_id} stream {stream_id} failed: {e}"
                         ),
                     )));
+                }
+            }
+            SwarmAction::AckStream {
+                conn_id,
+                stream_id,
+                bytes,
+            } => {
+                if let Err(e) = self.transport.ack_stream(conn_id, stream_id, bytes) {
+                    self.core
+                        .handle_input(SwarmInput::RuntimeError(runtime_error(
+                            SwarmErrorKind::Driver,
+                            Some(conn_id),
+                            Some(stream_id),
+                            format!(
+                                "ack_stream on connection {conn_id} stream {stream_id} failed: {e}"
+                            ),
+                        )));
                 }
             }
             SwarmAction::CloseConnection { conn_id } => match self.transport.close(conn_id) {
@@ -1044,6 +1082,15 @@ mod tests {
     }
 
     impl Transport for ScriptedTransport {
+        fn ack_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _bytes: usize,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
             self.next_conn_id += 1;
             Ok(ConnectionId::new(self.next_conn_id))

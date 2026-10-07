@@ -51,6 +51,14 @@ use diagnostics::{ConnectionCounters, DatagramTally};
 const DEFAULT_IPV4_BIND: &str = "0.0.0.0:0";
 const DEFAULT_IPV6_BIND: &str = "[::]:0";
 const STREAM_READ_BUFFER_SIZE: usize = 65_535;
+/// Per-stream receive window, and each stream's receive budget: the most
+/// delivered bytes it holds unacknowledged (ADR 0012).
+///
+/// Pinned: quiche's auto-tuning would otherwise grow it, and with it the data
+/// quiche buffers for a reader that is not acknowledging.
+pub const STREAM_RECEIVE_WINDOW: usize = 1_000_000;
+/// Per-connection receive window, pinned like [`STREAM_RECEIVE_WINDOW`].
+const CONNECTION_RECEIVE_WINDOW: u64 = 10_000_000;
 /// Maximum UDP datagrams drained from the socket per `poll()` call.
 ///
 /// Bounding the drain keeps a packet flood from starving the connection
@@ -395,9 +403,13 @@ fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, T
             reason: format!("failed to set alpn: {e}"),
         })?;
 
-    quiche_config.set_initial_max_data(10_000_000);
-    quiche_config.set_initial_max_stream_data_bidi_local(1_000_000);
-    quiche_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    let stream_window = STREAM_RECEIVE_WINDOW as u64;
+    quiche_config.set_initial_max_data(CONNECTION_RECEIVE_WINDOW);
+    quiche_config.set_initial_max_stream_data_bidi_local(stream_window);
+    quiche_config.set_initial_max_stream_data_bidi_remote(stream_window);
+    // Pinned windows bound what quiche buffers behind a read gate.
+    quiche_config.set_max_stream_window(stream_window);
+    quiche_config.set_max_connection_window(CONNECTION_RECEIVE_WINDOW);
     quiche_config.set_initial_max_streams_bidi(node_config.limits().max_streams_per_connection);
     quiche_config.set_max_idle_timeout(node_config.limits().idle_timeout_ms);
     quiche_config.set_max_recv_udp_payload_size(1350);
@@ -1615,6 +1627,30 @@ impl Transport for QuicTransport {
         result
     }
 
+    fn ack_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), TransportError> {
+        let Some(conn) = self.connections.get_mut(&id) else {
+            return Ok(());
+        };
+        conn.ack_stream(stream_id, bytes)?;
+        if !conn.has_unscanned_input() {
+            return Ok(());
+        }
+        // A stream that had spent its budget resumes now, not when the next
+        // packet happens to arrive: quiche already holds what it can read.
+        conn.poll_streams(
+            &mut self.pending_events,
+            &self.socket,
+            &mut self.stream_read_buffer,
+            &mut self.pending_datagrams,
+            self.node_config.limits().max_pending_datagrams,
+        )
+    }
+
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
         let conn = self
             .connections
@@ -1886,6 +1922,18 @@ impl Transport for QuicEndpoint {
         }
     }
 
+    fn ack_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), TransportError> {
+        match self {
+            Self::Single(transport) => transport.ack_stream(id, stream_id, bytes),
+            Self::Dual(transport) => transport.ack_stream(id, stream_id, bytes),
+        }
+    }
+
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
         match self {
             Self::Single(transport) => transport.close(id),
@@ -1992,6 +2040,19 @@ impl Transport for DualQuicTransport {
     ) -> Result<(), TransportError> {
         let family = Self::family_for_id(id)?;
         self.transport_mut(family).reset_stream(id, stream_id)
+    }
+
+    fn ack_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), TransportError> {
+        // An id neither family owns is an unknown connection: a no-op.
+        match Self::family_for_id(id) {
+            Ok(family) => self.transport_mut(family).ack_stream(id, stream_id, bytes),
+            Err(_) => Ok(()),
+        }
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {

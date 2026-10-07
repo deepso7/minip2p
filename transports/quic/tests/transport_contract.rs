@@ -6,7 +6,9 @@
 
 use minip2p_core::{PeerAddr, Protocol};
 use minip2p_platform::{Deadline, Now};
-use minip2p_quic::{QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport};
+use minip2p_quic::{
+    QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport, STREAM_RECEIVE_WINDOW,
+};
 use minip2p_transport::{
     BlockingTransport, Bytes, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,
     TransportEvent, WaitOutcome,
@@ -444,6 +446,204 @@ fn a_write_past_the_pending_cap_is_full_and_resumes_on_writable() {
     }
     assert!(remote_closed, "the whole write must eventually go out");
     assert_eq!(received, payload, "every byte, once, in order");
+}
+
+/// Resends `held` on the stream's Writable; closes the write side once it
+/// is all accepted.
+fn resend_on_writable(
+    client: &mut QuicTransport,
+    events: Vec<TransportEvent>,
+    conn: ConnectionId,
+    stream: StreamId,
+    held: &mut Option<Bytes>,
+) {
+    for event in events {
+        if event
+            == (TransportEvent::StreamWritable {
+                id: conn,
+                stream_id: stream,
+            })
+            && let Some(tail) = held.take()
+        {
+            match client.send_stream(conn, stream, tail) {
+                Ok(()) => client.close_stream_write(conn, stream).expect("close"),
+                Err(error) => *held = Some(error.into_unsent().expect("only Full")),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 64 * 1024,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let stream = client.open_stream(client_conn).expect("open stream");
+    let payload: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let mut held = client
+        .send_stream(client_conn, stream, Bytes::from(payload.clone()))
+        .err()
+        .and_then(TransportError::into_unsent);
+
+    // The reader takes what arrives and acknowledges none of it: one window
+    // is delivered, quiche buffers at most another, and the sender stalls.
+    let mut received = Vec::new();
+    let mut quiet_rounds = 0;
+    while quiet_rounds < 40 {
+        let (server_events, client_events) = drive_pair_once(&mut server, &mut client);
+        resend_on_writable(&mut client, client_events, client_conn, stream, &mut held);
+        let before = received.len();
+        for event in server_events {
+            if let TransportEvent::StreamData { data, .. } = event {
+                received.extend_from_slice(&data);
+            }
+        }
+        quiet_rounds = if received.len() == before {
+            quiet_rounds + 1
+        } else {
+            0
+        };
+    }
+    assert_eq!(received.len(), STREAM_RECEIVE_WINDOW, "exactly one budget");
+    assert!(held.is_some(), "the sender still holds its tail");
+
+    // One acknowledgement resumes delivery at once, without another packet.
+    server
+        .ack_stream(server_conn, stream, received.len())
+        .expect("ack");
+    let resumed = server.poll(common::now()).expect("poll");
+    assert!(
+        resumed
+            .iter()
+            .any(|event| matches!(event, TransportEvent::StreamData { .. })),
+        "quiche's buffered bytes are read on the ack"
+    );
+    let mut events = resumed;
+    let mut remote_closed = false;
+    for _ in 0..4000 {
+        for event in events {
+            match event {
+                TransportEvent::StreamData {
+                    id,
+                    stream_id,
+                    data,
+                } => {
+                    received.extend_from_slice(&data);
+                    server.ack_stream(id, stream_id, data.len()).expect("ack");
+                }
+                TransportEvent::StreamRemoteWriteClosed { .. } => remote_closed = true,
+                _ => {}
+            }
+        }
+        if remote_closed {
+            break;
+        }
+        let (server_events, client_events) = drive_pair_once(&mut server, &mut client);
+        resend_on_writable(&mut client, client_events, client_conn, stream, &mut held);
+        events = server_events;
+    }
+    assert!(remote_closed, "the transfer completes once the reader acks");
+    assert_eq!(received, payload, "every byte, once, in order");
+}
+
+#[test]
+fn an_unsettled_stream_holds_its_slot_and_over_acks_fail() {
+    let mut server = QuicTransport::new(
+        QuicNodeConfig::generate().with_limits(QuicLimits {
+            max_streams_per_connection: 1,
+            ..QuicLimits::default()
+        }),
+        "127.0.0.1:0",
+    )
+    .expect("server");
+    let mut client = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("client");
+    server.listen_on_bound_addr().expect("listen");
+    let peer_addr = server.local_peer_addr().expect("peer addr");
+    let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+
+    // A stream that delivers ten bytes and closes in both directions, unread.
+    let first = client.open_stream(client_conn).expect("open");
+    client
+        .send_stream(client_conn, first, Bytes::from_static(b"0123456789"))
+        .expect("send");
+    client.close_stream_write(client_conn, first).expect("fin");
+    let mut closed = false;
+    for _ in 0..200 {
+        let (server_events, _) = drive_pair_once(&mut server, &mut client);
+        for event in server_events {
+            match event {
+                TransportEvent::StreamRemoteWriteClosed { id, stream_id } => {
+                    server.close_stream_write(id, stream_id).expect("close");
+                }
+                TransportEvent::StreamClosed { .. } => closed = true,
+                _ => {}
+            }
+        }
+        if closed {
+            break;
+        }
+    }
+    assert!(closed, "the first stream closed on the server");
+    assert_eq!(
+        server.ack_stream(server_conn, first, 11),
+        Err(TransportError::AckExceedsDelivered {
+            id: server_conn,
+            stream_id: first,
+            acked: 11,
+            unacked: 10,
+        })
+    );
+
+    // Unsettled, it keeps the only slot: the next inbound stream is refused.
+    // quiche itself already freed the slot, so the client can open and write;
+    // it is the transport that refuses.
+    assert_eq!(
+        open_and_watch(&mut server, &mut client, client_conn),
+        (true, false),
+        "an unsettled stream holds its slot"
+    );
+
+    // Acknowledging the closed stream releases it, and the slot with it.
+    server.ack_stream(server_conn, first, 10).expect("ack");
+    server
+        .ack_stream(server_conn, first, 10)
+        .expect("settled: a no-op");
+    assert_eq!(
+        open_and_watch(&mut server, &mut client, client_conn),
+        (true, true),
+        "the settled stream's slot takes a new stream"
+    );
+}
+
+/// Opens a stream from `client` and writes to it; reports whether that
+/// worked, and whether the server announced the stream.
+fn open_and_watch(
+    server: &mut QuicTransport,
+    client: &mut QuicTransport,
+    client_conn: ConnectionId,
+) -> (bool, bool) {
+    let mut stream = None;
+    for _ in 0..100 {
+        if stream.is_none()
+            && let Ok(opened) = client.open_stream(client_conn)
+            && client
+                .send_stream(client_conn, opened, Bytes::from_static(b"hi"))
+                .is_ok()
+        {
+            stream = Some(opened);
+        }
+        let (server_events, _) = drive_pair_once(server, client);
+        if server_events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::IncomingStream { stream_id, .. } if Some(*stream_id) == stream))
+        {
+            return (true, true);
+        }
+    }
+    (stream.is_some(), false)
 }
 
 #[test]

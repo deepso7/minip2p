@@ -153,12 +153,21 @@ impl GossipsubDriver {
         swarm: &mut SwarmRuntime<T, R>,
         now_ms: u64,
     ) -> bool {
-        self.stream_conns.observe(event);
+        // A closing stream's mapping outlives this step: the agent
+        // acknowledges an unfinished frame it discards on close, and that
+        // ack needs the stream's connection.
+        let closing = matches!(event, SwarmEvent::StreamClosed { .. });
+        if !closing {
+            self.stream_conns.observe(event);
+        }
         let handled = self.agent.handle_event(event, now_ms);
         if !handled {
             self.stream_conns.unclaimed(event);
         }
         self.pump(swarm, now_ms);
+        if closing {
+            self.stream_conns.observe(event);
+        }
         handled
     }
 
@@ -261,6 +270,18 @@ impl GossipsubDriver {
             GossipsubAction::CloseStreamWrite { peer, stream_id } => {
                 if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
                     match swarm.close_stream_write(&peer, conn_id, stream_id, now_ms) {
+                        Ok(()) | Err(_) => {}
+                    }
+                }
+            }
+            // A stream already gone has nothing left to settle.
+            GossipsubAction::AckStream {
+                peer,
+                stream_id,
+                bytes,
+            } => {
+                if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
+                    match swarm.ack_stream(conn_id, stream_id, bytes) {
                         Ok(()) | Err(_) => {}
                     }
                 }

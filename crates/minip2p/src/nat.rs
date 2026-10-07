@@ -312,6 +312,22 @@ impl<E: EntropySource> NatDriver<E> {
         if !handled {
             self.stream_conns.unclaimed(event);
         }
+        // The agent consumes what it claims as it reads it, including bytes
+        // past a CONNECT response that a promoted bridge's circuit takes
+        // as adoption data: the circuit acknowledges only what it reads
+        // itself.
+        if handled
+            && let SwarmEvent::StreamData {
+                conn_id,
+                stream_id,
+                data,
+                ..
+            } = event
+        {
+            match swarm.ack_stream(*conn_id, *stream_id, data.len()) {
+                Ok(()) | Err(_) => {}
+            }
+        }
         // A gone carrier connection (closed, or replaced: its streams end
         // with it) closes the bridges it carried.
         if let SwarmEvent::ConnectionClosed { conn_id, .. }

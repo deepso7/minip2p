@@ -385,6 +385,17 @@ impl<T: Transport> Swarm<T> {
         self.runtime.abort_dial(conn_id)
     }
 
+    /// Acknowledges `bytes` of a stream's delivered data as consumed; see
+    /// [`SwarmRuntime::ack_stream`].
+    pub fn ack_stream(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), DriverError> {
+        self.runtime.ack_stream(conn_id, stream_id, bytes)
+    }
+
     /// See [`SwarmRuntime::forget_stream`].
     pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) -> VecDeque<Bytes> {
         self.runtime.forget_stream(conn_id, stream_id)
@@ -706,6 +717,15 @@ mod tests {
     }
 
     impl Transport for IdleTransport {
+        fn ack_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _bytes: usize,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
             Err(TransportError::Unsupported { operation: "dial" })
         }
@@ -800,6 +820,15 @@ mod tests {
     }
 
     impl Transport for ReplacementTransport {
+        fn ack_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _bytes: usize,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
             Err(TransportError::Unsupported { operation: "dial" })
         }
@@ -893,6 +922,15 @@ mod tests {
     }
 
     impl Transport for FailingUserOpenTransport {
+        fn ack_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _bytes: usize,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
             Err(TransportError::Unsupported { operation: "dial" })
         }
@@ -1099,6 +1137,15 @@ mod tests {
     }
 
     impl Transport for PartialListenTransport {
+        fn ack_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _bytes: usize,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
             Err(TransportError::Unsupported { operation: "dial" })
         }
@@ -1576,6 +1623,15 @@ mod tests {
     }
 
     impl Transport for FailingSendTransport {
+        fn ack_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _bytes: usize,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
             Err(TransportError::Unsupported { operation: "dial" })
         }
@@ -1964,6 +2020,15 @@ mod tests {
     }
 
     impl Transport for NeverRespondTransport {
+        fn ack_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _bytes: usize,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
             Err(TransportError::Unsupported { operation: "dial" })
         }

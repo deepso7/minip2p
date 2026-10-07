@@ -332,24 +332,41 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             self.fail_circuit(id, teardown.message, true);
             return Ok(id);
         }
+        // Whoever read these bytes past the CONNECT response already
+        // acknowledged them on the bridge.
         if !adoption.pending_data.is_empty() {
-            self.inject_bridge_data(
-                adoption.inner_conn,
-                adoption.bridge_stream,
-                adoption.pending_data,
-            );
+            self.feed_bridge(key, adoption.pending_data);
         }
         Ok(id)
     }
 
     /// Injects bytes read from a bridge outside the wrapped transport poll.
+    ///
+    /// The circuit consumes them and acknowledges them on the bridge stream,
+    /// as it does for bridge bytes it reads itself: end-to-end credit is the
+    /// circuit's own Yamux session's to give.
     pub fn inject_bridge_data(
         &mut self,
         inner_conn: ConnectionId,
         bridge_stream: StreamId,
         data: Bytes,
     ) {
-        let key = (inner_conn, bridge_stream);
+        let len = data.len();
+        self.feed_bridge((inner_conn, bridge_stream), data);
+        self.ack_bridge(inner_conn, bridge_stream, len);
+    }
+
+    /// Acknowledges consumed bridge bytes on the wrapped transport. A bridge
+    /// that has since closed or reset has nothing left to settle, which the
+    /// wrapped transport treats as a no-op; nothing else can fail here.
+    fn ack_bridge(&mut self, inner_conn: ConnectionId, bridge_stream: StreamId, bytes: usize) {
+        match self.inner.ack_stream(inner_conn, bridge_stream, bytes) {
+            Ok(()) | Err(_) => {}
+        }
+    }
+
+    /// Feeds bridge bytes to the circuit's session.
+    fn feed_bridge(&mut self, key: (ConnectionId, StreamId), data: Bytes) {
         let Some(id) = self.bridge_index.get(&key).copied() else {
             return;
         };
@@ -684,7 +701,11 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                 let key = (id, stream_id);
                 if self.bridge_index.contains_key(&key) {
                     self.inject_bridge_data(id, stream_id, data);
-                } else if !self.retired_bridges.contains(&key) {
+                } else if self.retired_bridges.contains(&key) {
+                    // A closed circuit's late bytes are discarded, which
+                    // consumes them.
+                    self.ack_bridge(id, stream_id, data.len());
+                } else {
                     self.pending.push_back(TransportEvent::StreamData {
                         id,
                         stream_id,
@@ -803,6 +824,16 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                     unsent,
                 })
             }
+            Err(SessionError::Yamux(YamuxError::AckExceedsDelivered {
+                stream,
+                acked,
+                unacked,
+            })) => Err(TransportError::AckExceedsDelivered {
+                id,
+                stream_id: StreamId::new(u64::from(stream)),
+                acked,
+                unacked,
+            }),
             // Yamux refused the operation — a closed write side, an unknown
             // substream — but the session itself is still healthy.
             Err(SessionError::Yamux(error)) => Err(TransportError::PollError {
@@ -920,6 +951,21 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         self.pending
             .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
         result
+    }
+
+    fn ack_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), TransportError> {
+        if !id.is_circuit() {
+            return self.inner.ack_stream(id, stream_id, bytes);
+        }
+        if !self.circuits.contains_key(&id) {
+            return Ok(());
+        }
+        self.operate_session(id, |session| session.ack_stream(stream_id, bytes))
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
@@ -1129,6 +1175,15 @@ mod tests {
     }
 
     impl Transport for WakeableTransport {
+        fn ack_stream(
+            &mut self,
+            id: ConnectionId,
+            stream_id: StreamId,
+            bytes: usize,
+        ) -> Result<(), TransportError> {
+            self.inner.ack_stream(id, stream_id, bytes)
+        }
+
         fn dial(&mut self, addr: &minip2p_core::PeerAddr) -> Result<ConnectionId, TransportError> {
             self.inner.dial(addr)
         }
@@ -1232,6 +1287,15 @@ mod tests {
     }
 
     impl<T: Transport> Transport for CloseObservingTransport<T> {
+        fn ack_stream(
+            &mut self,
+            id: ConnectionId,
+            stream_id: StreamId,
+            bytes: usize,
+        ) -> Result<(), TransportError> {
+            self.inner.ack_stream(id, stream_id, bytes)
+        }
+
         fn dial(
             &mut self,
             address: &minip2p_core::PeerAddr,
@@ -2630,6 +2694,67 @@ mod tests {
 
         let responder_stream = b.open_stream(circuit_id).expect("responder stream");
         assert_eq!(responder_stream.as_u64() % 2, 0);
+    }
+
+    #[test]
+    fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
+        let (mut a, mut b, circuit_id, bridge, a_peer, b_peer) = setup_pair();
+        complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+        let stream = a.open_stream(circuit_id).expect("stream");
+        let payload = Bytes::from(vec![7u8; 1024 * 1024]);
+        let mut held = a
+            .send_stream(circuit_id, stream, payload.clone())
+            .err()
+            .and_then(TransportError::into_unsent);
+
+        // Drives both ends; `b` acknowledges only while `ack` says so.
+        let drive = |a: &mut CircuitTransport<_, _>,
+                     b: &mut CircuitTransport<InMemoryTransport, _>,
+                     held: &mut Option<Bytes>,
+                     ack: bool| {
+            let mut delivered = 0;
+            for _ in 0..64 {
+                for event in a.poll(Now::from_millis(0)).expect("poll a") {
+                    if matches!(event, TransportEvent::StreamWritable { .. })
+                        && let Some(tail) = held.take()
+                    {
+                        *held = a
+                            .send_stream(circuit_id, stream, tail)
+                            .err()
+                            .and_then(TransportError::into_unsent);
+                    }
+                }
+                for event in b.poll(Now::from_millis(0)).expect("poll b") {
+                    if let TransportEvent::StreamData {
+                        id,
+                        stream_id,
+                        data,
+                    } = event
+                    {
+                        delivered += data.len();
+                        if ack {
+                            b.ack_stream(id, stream_id, data.len()).expect("ack");
+                        }
+                    }
+                }
+            }
+            delivered
+        };
+
+        let window = YamuxConfig::default().receive_window as usize;
+        let stalled = drive(&mut a, &mut b, &mut held, false);
+        assert_eq!(stalled, window, "a reader that never acks gets one window");
+        assert!(held.is_some(), "and the sender holds its tail");
+        assert_eq!(
+            b.inner().unacked(bridge),
+            0,
+            "the circuit acknowledges every bridge byte its session took"
+        );
+
+        b.ack_stream(circuit_id, stream, stalled).expect("ack");
+        let rest = drive(&mut a, &mut b, &mut held, true);
+        assert_eq!(stalled + rest, payload.len(), "acking resumes the sender");
+        assert!(held.is_none());
     }
 
     #[test]

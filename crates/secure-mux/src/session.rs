@@ -369,6 +369,22 @@ impl SecureMuxSession {
         self.with_yamux_stream(stream, move |yamux| yamux.reset(yamux_stream))
     }
 
+    /// Acknowledges `bytes` of a substream's delivered data as consumed,
+    /// returning Yamux credit to the peer as it accumulates (ADR 0012).
+    ///
+    /// Acknowledging a settled or unknown substream, or a session that is
+    /// not established, does nothing. More than the substream's
+    /// unacknowledged bytes is [`YamuxError::AckExceedsDelivered`].
+    pub fn ack_stream(&mut self, stream: StreamId, bytes: usize) -> Result<(), SessionError> {
+        let Ok(yamux_stream) = yamux_stream(stream) else {
+            return Ok(());
+        };
+        match self.with_yamux(move |yamux| yamux.ack(yamux_stream, bytes)) {
+            Err(SessionError::NotEstablished) => Ok(()),
+            result => result,
+        }
+    }
+
     /// Writable never follows the end of a write side.
     fn drop_writable(&mut self, stream: StreamId) {
         self.outputs
