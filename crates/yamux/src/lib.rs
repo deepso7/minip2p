@@ -4,6 +4,11 @@
 //! frames plus stream lifecycle events. It performs no I/O and never reads a
 //! clock: the host supplies [`minip2p_platform::Now`] samples so a quiet
 //! session can emit keepalive pings on a deadline.
+//!
+//! Writes follow ADR 0012's backpressure contract: [`YamuxSession::send`]
+//! accepts what fits the send caps and hands back the unsent tail as
+//! [`YamuxError::Full`], frames are built only when the host pulls them, and
+//! [`YamuxOutput::Writable`] says when a full stream can queue again.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
@@ -15,7 +20,7 @@ mod session;
 
 use alloc::vec::Vec;
 
-use minip2p_core::SansIoProtocol;
+use minip2p_core::{Bytes, SansIoProtocol};
 use thiserror::Error;
 
 pub use frame::{
@@ -42,11 +47,14 @@ const DEFAULT_MAX_FRAME_LEN: u32 = 1024 * 1024;
 /// Default maximum number of simultaneously tracked streams.
 const DEFAULT_MAX_STREAMS: usize = 256;
 
-/// Default per-stream cap for data queued behind the remote window.
+/// Default per-stream cap for accepted bytes not yet pulled as frames.
 const DEFAULT_MAX_BUFFERED_SEND: usize = 256 * 1024;
 
-/// Default aggregate cap for data queued behind remote windows.
+/// Default aggregate cap for accepted bytes not yet pulled as frames.
 const DEFAULT_MAX_TOTAL_BUFFERED_SEND: usize = 4 * 1024 * 1024;
+
+/// Default reserve for peer-provoked control frames awaiting a pull.
+const DEFAULT_MAX_PENDING_CONTROL: usize = 1024;
 
 /// Role of this side of a Yamux session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,15 +77,21 @@ pub struct YamuxConfig {
     pub max_frame_len: u32,
     /// Maximum number of simultaneously tracked inbound and outbound streams.
     pub max_streams: usize,
-    /// Per-stream cap for bytes queued after its remote send window is spent.
+    /// Per-stream cap for bytes [`YamuxSession::send`] accepted that have not
+    /// been pulled as frames yet, whether or not remote credit allows them.
     ///
-    /// The cap counts unsent bytes. A `send` buffer framed only in part is
-    /// kept, not copied, until its framed prefix outgrows the unsent tail;
-    /// the tail then moves to a right-sized buffer. Queued sends therefore
-    /// hold at most twice the bytes this cap and the total cap count.
+    /// A `send` payload framed only in part is sliced, not copied, until its
+    /// tail is shorter than half of what it was counted at; the tail then
+    /// moves to a right-sized buffer. Queued sends therefore hold at most
+    /// twice the bytes this cap and the total cap count.
     pub max_buffered_send: usize,
-    /// Aggregate cap for queued send bytes across all streams.
+    /// Aggregate cap for accepted, unpulled send bytes across all streams.
     pub max_total_buffered_send: usize,
+    /// How many control frames may wait to be pulled before a peer that
+    /// provokes another reply (a ping acknowledgement, a reset) fails the
+    /// session. Bounds what a peer that floods pings without reading can
+    /// make this side buffer.
+    pub max_pending_control: usize,
 }
 
 impl Default for YamuxConfig {
@@ -88,6 +102,7 @@ impl Default for YamuxConfig {
             max_streams: DEFAULT_MAX_STREAMS,
             max_buffered_send: DEFAULT_MAX_BUFFERED_SEND,
             max_total_buffered_send: DEFAULT_MAX_TOTAL_BUFFERED_SEND,
+            max_pending_control: DEFAULT_MAX_PENDING_CONTROL,
         }
     }
 }
@@ -124,6 +139,19 @@ pub enum YamuxOutput {
     /// A stream reached its terminal state or was reset.
     StreamClosed {
         /// Closed stream identifier.
+        stream: u32,
+    },
+    /// A stream whose `send` returned [`YamuxError::Full`] can queue again.
+    ///
+    /// One pending notification per armed stream: repeated Fulls before it
+    /// fires coalesce into one. It fires when the stream can queue at least
+    /// half of the smaller of [`YamuxConfig::max_buffered_send`] and
+    /// [`YamuxConfig::max_total_buffered_send`]. Bytes leaving another stream
+    /// free the shared cap, so this can fire for a stream that was blocked
+    /// only by the total. It never fires after the stream's write side ended
+    /// (`close_write`, reset, or close).
+    Writable {
+        /// Stream that can accept writes again.
         stream: u32,
     },
     /// The remote terminated the Yamux session.
@@ -199,17 +227,22 @@ pub enum YamuxError {
     /// More data was sent after the local write side was closed.
     #[error("Yamux stream {0} write side is closed")]
     StreamWriteClosed(u32),
-    /// A send would exceed a per-stream or aggregate queue cap.
-    #[error("Yamux send buffer is full for stream {stream}")]
-    SendBufferFull {
+    /// A send did not fit the stream's send caps. Retryable: the stream
+    /// accepted everything before `unsent`, and [`YamuxOutput::Writable`]
+    /// follows once it can queue again.
+    #[error("Yamux stream {stream} is full; {} bytes unsent", unsent.len())]
+    Full {
         /// Stream receiving the send.
         stream: u32,
-        /// Bytes that would need to be queued by this call.
-        attempted: usize,
-        /// Configured per-stream queue cap.
-        per_stream_limit: usize,
-        /// Configured aggregate queue cap.
-        total_limit: usize,
+        /// The exact suffix of the payload that was not accepted.
+        unsent: Bytes,
+    },
+    /// The peer provoked more control replies than the reserve holds
+    /// without reading them.
+    #[error("Yamux control reserve of {limit} frames exhausted; peer is not reading")]
+    ControlReserveExhausted {
+        /// Configured [`YamuxConfig::max_pending_control`].
+        limit: usize,
     },
     /// The local or remote side has sent GoAway.
     #[error("Yamux session is closed")]

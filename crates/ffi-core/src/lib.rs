@@ -22,6 +22,7 @@ mod error;
 mod events;
 #[cfg(feature = "serde")]
 mod js_shape;
+mod writes;
 
 pub use config::{
     DiscoveryOptions, EndpointConfig, KnownPeerInfo, MdnsOptions, RelayReservationInfo,

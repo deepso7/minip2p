@@ -234,15 +234,15 @@ class ReactNativeBackend implements Minip2pBackend {
     connId: number,
     streamId: number,
     data: Uint8Array
-  ): void {
-    translateErrors(() => {
+  ): boolean {
+    return translateErrors(() =>
       this.#endpoint.sendStream(
         peerId,
         this.#connectionIds.toNative(connId),
         numberToU64(streamId, "streamId"),
         toArrayBuffer(data)
-      );
-    });
+      )
+    );
   }
 
   closeStreamWrite(peerId: string, connId: number, streamId: number): void {
@@ -449,6 +449,10 @@ function normalizeBigInts(
   key?: string
 ): unknown {
   if (typeof value === "bigint") {
+    // A QUIC stop code is a 62-bit varint the remote picks: keep it whole.
+    if (key === "errorCode") {
+      return value;
+    }
     return key !== undefined &&
       CONNECTION_ID_KEYS.has(key) &&
       connectionIds !== undefined

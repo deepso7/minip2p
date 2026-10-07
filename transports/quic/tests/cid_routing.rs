@@ -234,7 +234,7 @@ fn unknown_cid_datagrams_from_a_shared_peer_address_leave_both_connections_intac
         server.pump();
         for event in client.poll(now()).expect("client poll") {
             if let TransportEvent::StreamData { id, data, .. } = event {
-                assert_eq!(data, b"still here");
+                assert_eq!(&data[..], b"still here");
                 delivered.insert(id);
             }
         }

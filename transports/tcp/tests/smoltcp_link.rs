@@ -26,7 +26,7 @@ use minip2p_tcp::smoltcp::wire::{HardwareAddress, IpCidr};
 use minip2p_tcp::{
     SmoltcpConfig, SmoltcpTcpProvider, SocketHandle, TcpConfig, TcpEvent, TcpProvider, TcpTransport,
 };
-use minip2p_transport::{ConnectionId, StreamId, Transport, TransportEvent};
+use minip2p_transport::{Bytes, ConnectionId, StreamId, Transport, TransportEvent};
 
 type Node = TcpTransport<SmoltcpTcpProvider<VirtualDevice>, CountingEntropy>;
 
@@ -409,7 +409,11 @@ fn a_stream_carries_bytes_both_ways_between_smoltcp_nodes() {
         .open_stream(pair.connection)
         .expect("dialer opens a stream");
     pair.dialer
-        .send_stream(pair.connection, stream, b"ping over smoltcp".to_vec())
+        .send_stream(
+            pair.connection,
+            stream,
+            Bytes::from_static(b"ping over smoltcp"),
+        )
         .expect("dialer writes");
 
     run_until(
@@ -426,7 +430,7 @@ fn a_stream_carries_bytes_both_ways_between_smoltcp_nodes() {
     );
 
     pair.listener
-        .send_stream(pair.connection, stream, b"pong".to_vec())
+        .send_stream(pair.connection, stream, Bytes::from_static(b"pong"))
         .expect("listener writes");
     run_until(
         &pair.wire,
@@ -451,7 +455,7 @@ fn a_payload_larger_than_one_segment_arrives_whole_and_in_order() {
     // has to survive segmentation, short writes, and the peer's window.
     let payload: Vec<u8> = (0..40_000u32).map(|index| index as u8).collect();
     pair.dialer
-        .send_stream(pair.connection, stream, payload.clone())
+        .send_stream(pair.connection, stream, Bytes::from(payload.clone()))
         .expect("dialer writes");
 
     run_until(

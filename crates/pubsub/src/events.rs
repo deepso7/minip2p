@@ -1,25 +1,15 @@
 //! Actions the host must execute, events for the application, and the
 //! caller-facing error types.
 
-#[cfg(not(feature = "std"))]
-use alloc::rc::Rc as Shared;
 use alloc::string::String;
-#[cfg(feature = "std")]
-use alloc::sync::Arc as Shared;
 use alloc::vec::Vec;
 
-use minip2p_core::PeerId;
+use minip2p_core::{Bytes, PeerId};
 use minip2p_transport::StreamId;
 
 /// Correlates an outbound open or write with its agent result echo.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct GossipsubToken(pub(crate) u64);
-
-/// Immutable framed RPC bytes shared by every recipient of one publish.
-///
-/// Pure `no_std` agents use `Rc`, while the `std` build uses `Arc` so an
-/// endpoint containing an agent remains safe to move into a driver thread.
-pub(crate) type SharedFrame = Shared<[u8]>;
 
 /// I/O the driver must perform on the agent's behalf.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,7 +26,8 @@ pub enum GossipsubAction {
         protocol_id: String,
     },
     /// Call `Swarm::send_stream(&peer, stream_id, data)` and synchronously
-    /// echo its result through `send_result`.
+    /// echo its result through `send_result`, or through `send_full` when the
+    /// stream accepted only part of it.
     SendStream {
         /// Token the host echoes through `send_result` after attempting the
         /// synchronous write.
@@ -45,8 +36,9 @@ pub enum GossipsubAction {
         peer: PeerId,
         /// The stream to write to.
         stream_id: StreamId,
-        /// The framed RPC bytes.
-        data: Vec<u8>,
+        /// The framed RPC bytes. One publish shares a single buffer across
+        /// every recipient.
+        data: Bytes,
     },
     /// Call `Swarm::close_stream_write(&peer, stream_id)`. Fire-and-forget.
     CloseStreamWrite {

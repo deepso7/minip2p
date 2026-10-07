@@ -4,7 +4,7 @@ extern crate alloc;
 use alloc::string::ToString;
 use alloc::{string::String, vec::Vec};
 
-pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
+pub use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
 pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_platform::{Deadline as PollDeadline, EntropySource, Now, SharedEntropy};
 pub use minip2p_swarm::{
@@ -307,19 +307,21 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
 
     /// Sends bytes on an application stream.
     ///
-    /// Fails with [`SwarmError::StreamNotFound`] if `conn_id` is no longer
-    /// the peer's connection holding the stream, as do the other stream
-    /// operations.
+    /// Accepts as much as the stream can queue; [`DriverError::Full`] hands
+    /// back the exact unsent suffix, which the caller resends after
+    /// [`EndpointEvent::StreamWritable`]. Fails with
+    /// [`SwarmError::StreamNotFound`] if `conn_id` is no longer the peer's
+    /// connection holding the stream, as do the other stream operations.
     pub fn send_stream(
         &mut self,
         peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
         now: Now,
     ) -> Result<(), DriverError> {
         self.runtime
-            .send_stream(peer_id, conn_id, stream_id, data, now.monotonic_ms)
+            .send_stream(peer_id, conn_id, stream_id, data.into(), now.monotonic_ms)
     }
 
     /// Half-closes the local write side of an application stream.
@@ -1585,7 +1587,7 @@ mod tests {
             &mut self,
             _: ConnectionId,
             _: StreamId,
-            _: Vec<u8>,
+            _: minip2p_core::Bytes,
         ) -> Result<(), TransportError> {
             Err(TransportError::Unsupported {
                 operation: "send stream",
@@ -1653,7 +1655,7 @@ mod tests {
             &mut self,
             _: ConnectionId,
             _: StreamId,
-            _: Vec<u8>,
+            _: minip2p_core::Bytes,
         ) -> Result<(), TransportError> {
             Ok(())
         }
@@ -1885,7 +1887,7 @@ mod tests {
                 peer_id: peer.clone(),
                 conn_id,
                 stream_id,
-                data: encode_frame(&rpc.encode()),
+                data: Bytes::from(encode_frame(&rpc.encode())),
             },
             0,
         ));

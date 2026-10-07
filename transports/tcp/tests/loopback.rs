@@ -16,7 +16,7 @@ use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_platform::{Now, StdEntropy};
 use minip2p_tcp::{StdTcpProvider, TcpProvider, TcpTransport};
 use minip2p_transport::{
-    BlockingTransport, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,
+    BlockingTransport, Bytes, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,
     TransportEvent, WaitOutcome,
 };
 
@@ -197,38 +197,84 @@ fn two_nodes_upgrade_over_loopback_and_authenticate_each_other() {
     );
 }
 
+/// Writes `data`, returning the unsent tail if the stream was Full.
+fn send_or_hold(node: &mut Node, id: ConnectionId, stream: StreamId, data: Bytes) -> Option<Bytes> {
+    let error = node.send_stream(id, stream, data).err()?;
+    assert!(
+        matches!(error, TransportError::Full { .. }),
+        "only Full is expected, got {error:?}"
+    );
+    error.into_unsent()
+}
+
 #[test]
-fn a_payload_larger_than_the_socket_buffer_arrives_intact() {
+fn a_payload_past_the_send_caps_arrives_intact_by_resending_on_writable() {
     let mut pair = upgraded_pair();
     let id = pair.dialer_connection;
     let stream = pair.dialer.open_stream(id).expect("open substream");
 
-    // Comfortably past a loopback send buffer, so the kernel refuses part of it
-    // and the transport has to carry the remainder across several polls.
-    let payload: Vec<u8> = (0..512 * 1024u32).map(|byte| byte as u8).collect();
-    pair.dialer
-        .send_stream(id, stream, payload.clone())
-        .expect("queue the payload");
+    // Past Yamux's window plus its send buffer, so the write is Full and the
+    // tail is resent each time the stream reports writable again.
+    let payload: Vec<u8> = (0..1024 * 1024u32).map(|byte| byte as u8).collect();
+    let mut held = send_or_hold(&mut pair.dialer, id, stream, Bytes::from(payload.clone()));
+    assert!(held.is_some(), "a write past the caps is Full");
 
     let mut received = Vec::new();
-    run_until(
-        &mut pair.dialer,
-        &mut pair.listener,
-        &mut pair.dialer_events,
-        &mut pair.listener_events,
-        |_, listener| {
-            received = listener
-                .iter()
-                .filter_map(|event| match event {
-                    TransportEvent::StreamData { data, .. } => Some(data.clone()),
-                    _ => None,
-                })
-                .flatten()
-                .collect();
-            received.len() >= payload.len()
-        },
-    );
+    let start = Instant::now();
+    while received.len() < payload.len() {
+        let now = Now::from_millis(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+        for event in pair.dialer.poll(now).expect("poll dialer") {
+            if matches!(event, TransportEvent::StreamWritable { stream_id, .. } if stream_id == stream)
+                && let Some(tail) = held.take()
+            {
+                held = send_or_hold(&mut pair.dialer, id, stream, tail);
+            }
+        }
+        for event in pair.listener.poll(now).expect("poll listener") {
+            if let TransportEvent::StreamData { data, .. } = event {
+                received.extend_from_slice(&data);
+            }
+        }
+        assert!(
+            start.elapsed() < PATIENCE,
+            "stalled at {} bytes",
+            received.len()
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(held.is_none(), "every byte was eventually accepted");
     assert_eq!(received, payload, "every byte, once, in order");
+}
+
+#[test]
+fn writable_never_follows_a_close_or_reset_after_full() {
+    let mut pair = upgraded_pair();
+    let id = pair.dialer_connection;
+    let closed = pair.dialer.open_stream(id).expect("open substream");
+    let reset = pair.dialer.open_stream(id).expect("open substream");
+    let payload = Bytes::from(vec![7u8; 1024 * 1024]);
+    for stream in [closed, reset] {
+        assert!(
+            send_or_hold(&mut pair.dialer, id, stream, payload.clone()).is_some(),
+            "a write past the caps is Full"
+        );
+    }
+    // Ended before any poll: a Writable the Full queued must not surface.
+    pair.dialer.close_stream_write(id, closed).expect("close");
+    pair.dialer.reset_stream(id, reset).expect("reset");
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(200) {
+        let now = Now::from_millis(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+        for event in pair.dialer.poll(now).expect("poll dialer") {
+            assert!(
+                !matches!(event, TransportEvent::StreamWritable { .. }),
+                "unexpected {event:?}"
+            );
+        }
+        pair.listener.poll(now).expect("poll listener");
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -238,7 +284,7 @@ fn substreams_carry_data_in_both_directions() {
     let listener_id = pair.listener_connection;
     let stream = pair.dialer.open_stream(dialer_id).expect("open substream");
     pair.dialer
-        .send_stream(dialer_id, stream, b"ping".to_vec())
+        .send_stream(dialer_id, stream, Bytes::from_static(b"ping"))
         .expect("send");
 
     run_until(
@@ -248,13 +294,13 @@ fn substreams_carry_data_in_both_directions() {
         &mut pair.listener_events,
         |_, listener| {
             listener.iter().any(
-                |event| matches!(event, TransportEvent::StreamData { data, .. } if data == b"ping"),
+                |event| matches!(event, TransportEvent::StreamData { data, .. } if &data[..] == b"ping"),
             )
         },
     );
 
     pair.listener
-        .send_stream(listener_id, stream, b"pong".to_vec())
+        .send_stream(listener_id, stream, Bytes::from_static(b"pong"))
         .expect("reply");
     run_until(
         &mut pair.dialer,
@@ -263,7 +309,7 @@ fn substreams_carry_data_in_both_directions() {
         &mut pair.listener_events,
         |dialer, _| {
             dialer.iter().any(
-                |event| matches!(event, TransportEvent::StreamData { data, .. } if data == b"pong"),
+                |event| matches!(event, TransportEvent::StreamData { data, .. } if &data[..] == b"pong"),
             )
         },
     );
@@ -472,7 +518,7 @@ fn an_idle_wait_times_out_and_input_wakes_it() {
 
     // Now the peer writes, and the same wait returns early with the data.
     pair.listener
-        .send_stream(listener_id, stream, b"wake up".to_vec())
+        .send_stream(listener_id, stream, Bytes::from_static(b"wake up"))
         .expect("send");
     let _ = pair.listener.poll(Now::from_millis(0)).expect("flush");
     assert_eq!(
@@ -487,7 +533,7 @@ fn an_idle_wait_times_out_and_input_wakes_it() {
             .iter()
             .any(|event| matches!(
                 event,
-                TransportEvent::StreamData { data, .. } if data == b"wake up"
+                TransportEvent::StreamData { data, .. } if &data[..] == b"wake up"
             )),
         "the wait must not have consumed the input"
     );
@@ -505,9 +551,10 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
     // loopback the kernel takes everything the window lets through; it is the
     // window, not the socket, that holds the rest back.
     let payload = vec![7u8; 512 * 1024];
-    pair.dialer
-        .send_stream(id, stream, payload)
-        .expect("queue more than the window allows");
+    let held = send_or_hold(&mut pair.dialer, id, stream, Bytes::from(payload));
+    assert!(held.is_some(), "past the window and send buffer is Full");
+    // The accepted prefix beyond the peer's window is the buffered write this
+    // test needs; the unsent tail plays no part, so it is not resent.
     // Drive until the dialer has nothing left to do. Parking is the state the
     // rest of the test needs, so wait for it rather than for a slice of time:
     // under load a fixed slice buys far fewer polls than it looks like it does.

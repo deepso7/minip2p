@@ -167,13 +167,14 @@ const native = vi.hoisted(() => {
       connId: bigint,
       streamId: bigint,
       _data: Uint8Array
-    ): void {
+    ): boolean {
       if (this.liveConnId !== undefined && connId !== this.liveConnId) {
         throw new Error(
           `stream ${streamId} on connection ${connId} is not active`
         );
       }
       this.writes.push({ connId, streamId });
+      return true;
     }
 
     setActive(): void {}

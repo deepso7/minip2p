@@ -195,14 +195,14 @@ class NodeBackend implements Minip2pBackend {
     connId: number,
     streamId: number,
     data: Uint8Array
-  ): void {
-    translateErrors(() => {
+  ): boolean {
+    return translateErrors(() =>
       this.#endpoint.sendStream(
         peerId,
         ...this.#nativeStream(connId, streamId),
         data
-      );
-    });
+      )
+    );
   }
 
   closeStreamWrite(peerId: string, connId: number, streamId: number): void {
@@ -397,6 +397,10 @@ function normalizeNativeValue(
   if (typeof value === "bigint" || typeof value === "number") {
     if (key !== undefined && CONNECTION_ID_KEYS.has(key)) {
       return maps.connectionIds.toPublic(BigInt(value));
+    }
+    // A QUIC stop code is a 62-bit varint the remote picks: keep it whole.
+    if (key === "errorCode") {
+      return BigInt(value);
     }
     return key === "streamId" ? value : u64ToNumber(value, key ?? "native u64");
   }

@@ -10,6 +10,13 @@
 //! allocated in [`ConnectionNamespace::CIRCUIT`], which keeps them disjoint
 //! from every base transport's ids.
 //!
+//! Ciphertext reaches the bridge through the wrapped transport's own
+//! `send_stream`, so a full bridge is ordinary backpressure (ADR 0012): the
+//! circuit keeps the one unsent tail, stops pulling from its session, and
+//! resumes on the bridge's `StreamWritable`. Its own stream writes then fill
+//! the circuit's Yamux send caps and report [`TransportError::Full`]; nothing
+//! tears down.
+//!
 //! Fresh Noise key material comes from a [`minip2p_platform::EntropySource`]
 //! the host injects — the same seam every other minip2p transport draws from,
 //! so one adapter over a board's RNG serves a circuit transport and a TCP
@@ -26,13 +33,14 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, Protocol};
+use minip2p_core::{Bytes, Multiaddr, Protocol, retain_slice};
 use minip2p_identity::{Ed25519Keypair, PeerId};
 #[cfg(feature = "std")]
 use minip2p_platform::StdEntropy;
 use minip2p_platform::{Deadline, EntropyError, EntropySource, Now};
 use minip2p_secure_mux::{
     SecureMuxSession, SessionConfig, SessionError, SessionOutput, SessionRole, YamuxConfig,
+    YamuxError,
 };
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, ConnectionState,
@@ -68,7 +76,11 @@ pub struct BridgeAdoption {
     /// Local role in the end-to-end circuit handshake.
     pub role: CircuitRole,
     /// Bytes already read beyond the relay CONNECT response.
-    pub pending_data: Vec<u8>,
+    pub pending_data: Bytes,
+    /// Relay-protocol bytes the bridge refused as Full before adoption (the
+    /// unsent tail of a STOP STATUS, say). They go out ahead of the circuit
+    /// handshake, retried on the bridge's Writable like any other tail.
+    pub unsent_prefix: Bytes,
     /// Whether the bridge's remote write side was already closed.
     pub remote_write_closed: bool,
 }
@@ -130,6 +142,10 @@ struct Circuit {
     remote_peer: PeerId,
     role: CircuitRole,
     session: SecureMuxSession,
+    /// Ciphertext the bridge refused as Full, with the length it was counted
+    /// at. While set, the session is not pulled; the bridge's
+    /// `StreamWritable` retries it.
+    bridge_tail: Option<(Bytes, usize)>,
 }
 
 impl Circuit {
@@ -288,6 +304,10 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             remote_peer: adoption.remote_peer,
             role: adoption.role,
             session,
+            bridge_tail: (!adoption.unsent_prefix.is_empty()).then(|| {
+                let len = adoption.unsent_prefix.len();
+                (adoption.unsent_prefix, len)
+            }),
         };
 
         // Consume the sequence only here: an adoption that failed above
@@ -327,7 +347,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         &mut self,
         inner_conn: ConnectionId,
         bridge_stream: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) {
         let key = (inner_conn, bridge_stream);
         let Some(id) = self.bridge_index.get(&key).copied() else {
@@ -339,7 +359,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         // misclassified as a pre-handshake protocol failure.
         let pre_ready = self.circuits.get(&id).is_some_and(|c| !c.is_ready());
         let result = self.with_circuit(id, |this, circuit| {
-            let fed = circuit.session.handle_input(data);
+            let fed = circuit.session.handle_input(data.into());
             // Pump either way: bytes the session queued before failing, and
             // events it already produced, are the caller's regardless.
             let pumped = this.pump(circuit);
@@ -430,21 +450,13 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         self.retired_bridge_order.retain(|(conn, _)| *conn != id);
     }
 
-    /// Drains session outputs, writing bytes to the bridge and turning
-    /// everything else into public transport events.
-    ///
-    /// The session queues both in one ordered stream, so a single pass keeps
-    /// the wire and the event feed in step.
+    /// Writes session bytes to the bridge while it accepts them, then turns
+    /// session events into public transport events.
     fn pump(&mut self, circuit: &mut Circuit) -> Result<(), Teardown> {
+        let written = self.write_bridge(circuit);
         while let Some(output) = circuit.session.poll_output() {
-            match output {
-                SessionOutput::Write(bytes) => {
-                    self.inner
-                        .send_stream(circuit.inner_conn, circuit.bridge_stream, bytes)
-                        .map_err(|error| {
-                            Teardown::fault(format!("relay bridge send failed: {error}"))
-                        })?;
-                }
+            let id = circuit.id;
+            let event = match output {
                 SessionOutput::Established { peer, .. } => {
                     // The session leaves this policy to its host, and here the
                     // host is this wrapper: a verified direct connection
@@ -456,40 +468,82 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                     {
                         return Err(Teardown::fault("direct connection won circuit arbitration"));
                     }
-                    self.pending.push_back(TransportEvent::Connected {
-                        id: circuit.id,
+                    TransportEvent::Connected {
+                        id,
                         endpoint: circuit.endpoint(Some(peer)),
-                    });
+                    }
                 }
-                SessionOutput::IncomingStream { stream } => {
-                    self.pending.push_back(TransportEvent::IncomingStream {
-                        id: circuit.id,
-                        stream_id: stream,
-                    });
-                }
-                SessionOutput::StreamData { stream, data } => {
-                    self.pending.push_back(TransportEvent::StreamData {
-                        id: circuit.id,
-                        stream_id: stream,
-                        data,
-                    });
-                }
+                SessionOutput::IncomingStream { stream } => TransportEvent::IncomingStream {
+                    id,
+                    stream_id: stream,
+                },
+                SessionOutput::StreamData { stream, data } => TransportEvent::StreamData {
+                    id,
+                    stream_id: stream,
+                    data,
+                },
                 SessionOutput::StreamRemoteWriteClosed { stream } => {
-                    self.pending
-                        .push_back(TransportEvent::StreamRemoteWriteClosed {
-                            id: circuit.id,
-                            stream_id: stream,
-                        });
-                }
-                SessionOutput::StreamClosed { stream } => {
-                    self.pending.push_back(TransportEvent::StreamClosed {
-                        id: circuit.id,
+                    TransportEvent::StreamRemoteWriteClosed {
+                        id,
                         stream_id: stream,
-                    });
+                    }
+                }
+                SessionOutput::StreamClosed { stream } => TransportEvent::StreamClosed {
+                    id,
+                    stream_id: stream,
+                },
+                SessionOutput::StreamWritable { stream } => TransportEvent::StreamWritable {
+                    id,
+                    stream_id: stream,
+                },
+            };
+            self.pending.push_back(event);
+        }
+        written
+    }
+
+    /// Sends the held tail, then session bytes, until the bridge is Full.
+    ///
+    /// The session is pulled only while nothing is held, so the circuit holds
+    /// at most one refused message beyond what the bridge accepted.
+    fn write_bridge(&mut self, circuit: &mut Circuit) -> Result<(), Teardown> {
+        loop {
+            let (bytes, counted) = match circuit.bridge_tail.take() {
+                Some(tail) => tail,
+                None => match circuit.session.poll_write()? {
+                    Some(bytes) => {
+                        let len = bytes.len();
+                        (Bytes::from(bytes), len)
+                    }
+                    None => return Ok(()),
+                },
+            };
+            match self
+                .inner
+                .send_stream(circuit.inner_conn, circuit.bridge_stream, bytes)
+            {
+                Ok(()) => {}
+                Err(TransportError::Full { mut unsent, .. }) => {
+                    let mut counted = counted;
+                    retain_slice(&mut unsent, &mut counted);
+                    circuit.bridge_tail = Some((unsent, counted));
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(Teardown::fault(format!(
+                        "relay bridge send failed: {error}"
+                    )));
                 }
             }
         }
-        Ok(())
+    }
+
+    /// Resumes a circuit whose bridge refused bytes as Full.
+    fn bridge_writable(&mut self, id: ConnectionId) {
+        let result = self.with_circuit(id, |this, circuit| this.pump(circuit));
+        if let Err(teardown) = result {
+            self.fail_circuit(id, teardown.message, !teardown.graceful);
+        }
     }
 
     fn fail_circuit(&mut self, id: ConnectionId, message: String, emit_error: bool) {
@@ -578,6 +632,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             | TransportEvent::StreamOpened { id, .. }
             | TransportEvent::IncomingStream { id, .. }
             | TransportEvent::StreamData { id, .. }
+            | TransportEvent::StreamWritable { id, .. }
             | TransportEvent::StreamRemoteWriteClosed { id, .. }
             | TransportEvent::StreamWriteStopped { id, .. }
             | TransportEvent::StreamClosed { id, .. }
@@ -635,6 +690,15 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                         stream_id,
                         data,
                     });
+                }
+            }
+            TransportEvent::StreamWritable { id, stream_id } => {
+                let key = (id, stream_id);
+                if let Some(circuit) = self.bridge_index.get(&key).copied() {
+                    self.bridge_writable(circuit);
+                } else if !self.retired_bridges.contains(&key) {
+                    self.pending
+                        .push_back(TransportEvent::StreamWritable { id, stream_id });
                 }
             }
             TransportEvent::StreamRemoteWriteClosed { id, stream_id } => {
@@ -731,14 +795,21 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                 id,
                 stream_id: stream,
             }),
-            // Yamux refused the operation — a full send buffer, an unknown
+            // Temporary send pressure: retryable, never a fault.
+            Err(SessionError::Yamux(YamuxError::Full { stream, unsent })) => {
+                Err(TransportError::Full {
+                    id,
+                    stream_id: StreamId::new(u64::from(stream)),
+                    unsent,
+                })
+            }
+            // Yamux refused the operation — a closed write side, an unknown
             // substream — but the session itself is still healthy.
             Err(SessionError::Yamux(error)) => Err(TransportError::PollError {
                 reason: error.to_string(),
             }),
-            // Defensive: today a session only fails fatally while handling
-            // input, so a local operation cannot land here. Dropping the arm
-            // would leave a dead session in the map if that ever changed.
+            // The session failed: a local reset of a peer-opened stream
+            // exhausted the control reserve (see `YamuxSession::reset`).
             Err(fatal) => {
                 let reason = fatal.to_string();
                 self.fail_circuit(id, reason.clone(), false);
@@ -788,7 +859,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
         if !id.is_circuit() {
             return self.inner.send_stream(id, stream_id, data);
@@ -811,14 +882,20 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !id.is_circuit() {
             return self.inner.close_stream_write(id, stream_id);
         }
-        self.operate_session(id, |session| session.close_stream_write(stream_id))
+        let result = self
+            .operate_session(id, |session| session.close_stream_write(stream_id))
             .map_err(|error| {
                 stream_error(error, |reason| TransportError::StreamCloseWriteFailed {
                     id,
                     stream_id,
                     reason,
                 })
-            })
+            });
+        // Writable never follows the end of a write side, even one a Full
+        // queued before its call returned.
+        self.pending
+            .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
+        result
     }
 
     fn reset_stream(
@@ -829,14 +906,20 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !id.is_circuit() {
             return self.inner.reset_stream(id, stream_id);
         }
-        self.operate_session(id, |session| session.reset_stream(stream_id))
+        let result = self
+            .operate_session(id, |session| session.reset_stream(stream_id))
             .map_err(|error| {
                 stream_error(error, |reason| TransportError::StreamResetFailed {
                     id,
                     stream_id,
                     reason,
                 })
-            })
+            });
+        // Writable never follows the end of a write side, even one a Full
+        // queued before its call returned.
+        self.pending
+            .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
+        result
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
@@ -853,7 +936,9 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         // A circuit still negotiating has no Yamux session to shut down, so
         // `go_away` refuses and the bridge is reset instead.
         let announced = circuit.session.go_away(0).is_ok();
-        let flushed = self.pump(&mut circuit).is_ok();
+        let flushed = self.pump(&mut circuit).is_ok()
+            && circuit.bridge_tail.is_none()
+            && !circuit.session.has_pending_write();
         let graceful = announced
             && flushed
             && self
@@ -870,6 +955,9 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
                 Ok(()) | Err(_) => {}
             }
         }
+        // Every write side ended with the connection.
+        self.pending
+            .retain(|event| !matches!(event, TransportEvent::StreamWritable { id: owner, .. } if *owner == id));
         self.pending.push_back(TransportEvent::Closed { id });
         Ok(())
     }
@@ -980,7 +1068,8 @@ fn stream_error(
     match error {
         error @ (TransportError::ConnectionNotFound { .. }
         | TransportError::StreamNotFound { .. }
-        | TransportError::InvalidState { .. }) => error,
+        | TransportError::InvalidState { .. }
+        | TransportError::Full { .. }) => error,
         error => wrap(error.to_string()),
     }
 }
@@ -1056,7 +1145,7 @@ mod tests {
             &mut self,
             id: ConnectionId,
             stream_id: StreamId,
-            data: Vec<u8>,
+            data: Bytes,
         ) -> Result<(), TransportError> {
             self.inner.send_stream(id, stream_id, data)
         }
@@ -1162,7 +1251,7 @@ mod tests {
             &mut self,
             id: ConnectionId,
             stream_id: StreamId,
-            data: Vec<u8>,
+            data: Bytes,
         ) -> Result<(), TransportError> {
             self.send_calls += 1;
             if self.fail_send {
@@ -1290,7 +1379,8 @@ mod tests {
                 relay: relay.clone(),
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
-                pending_data: Vec::new(),
+                pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("initiator adoption");
@@ -1301,7 +1391,8 @@ mod tests {
                 relay,
                 remote_peer: a_peer.clone(),
                 role: CircuitRole::Responder,
-                pending_data: Vec::new(),
+                pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("responder adoption");
@@ -1355,7 +1446,8 @@ mod tests {
                 relay: relay.clone(),
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
-                pending_data: Vec::new(),
+                pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("initiator adoption");
@@ -1366,7 +1458,8 @@ mod tests {
                 relay,
                 remote_peer: a_peer.clone(),
                 role: CircuitRole::Responder,
-                pending_data: Vec::new(),
+                pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("responder adoption");
@@ -1511,12 +1604,12 @@ mod tests {
                 if *id == circuit_id && *stream_id == stream
         )));
 
-        a.send_stream(circuit_id, stream, b"hello".to_vec())
+        a.send_stream(circuit_id, stream, Bytes::from_static(b"hello"))
             .expect("send");
         let data = b.poll(Now::from_millis(0)).expect("data");
         assert!(data.iter().any(|event| matches!(event,
             TransportEvent::StreamData { id, stream_id, data }
-                if *id == circuit_id && *stream_id == stream && data == b"hello"
+                if *id == circuit_id && *stream_id == stream && data[..] == b"hello"[..]
         )));
 
         a.close_stream_write(circuit_id, stream).expect("FIN");
@@ -1525,11 +1618,11 @@ mod tests {
             TransportEvent::StreamRemoteWriteClosed { id, stream_id }
                 if *id == circuit_id && *stream_id == stream
         )));
-        b.send_stream(circuit_id, stream, b"reply".to_vec())
+        b.send_stream(circuit_id, stream, Bytes::from_static(b"reply"))
             .expect("reverse send remains open");
         let reply = a.poll(Now::from_millis(0)).expect("reply");
         assert!(reply.iter().any(|event| matches!(event,
-            TransportEvent::StreamData { data, .. } if data == b"reply"
+            TransportEvent::StreamData { data, .. } if data[..] == b"reply"[..]
         )));
 
         b.reset_stream(circuit_id, stream).expect("reset");
@@ -1606,7 +1699,7 @@ mod tests {
         );
 
         let stream = a.open_stream(circuit_id).expect("open stream");
-        a.send_stream(circuit_id, stream, b"ordered".to_vec())
+        a.send_stream(circuit_id, stream, Bytes::from_static(b"ordered"))
             .expect("send immediately after open");
         assert_eq!(
             a.poll(Now::from_millis(0)).expect("local stream event"),
@@ -1632,7 +1725,7 @@ mod tests {
             .position(|event| {
                 matches!(event,
                     TransportEvent::StreamData { id, stream_id, data }
-                        if *id == circuit_id && *stream_id == stream && data == b"ordered"
+                        if *id == circuit_id && *stream_id == stream && data[..] == b"ordered"[..]
                 )
             })
             .expect("StreamData event");
@@ -1679,7 +1772,7 @@ mod tests {
             Err(TransportError::ConnectionNotFound { id }) if id == unknown_connection
         ));
         assert!(matches!(
-            a.send_stream(unknown_connection, stream, vec![1]),
+            a.send_stream(unknown_connection, stream, Bytes::from(vec![1])),
             Err(TransportError::ConnectionNotFound { id }) if id == unknown_connection
         ));
         assert!(matches!(
@@ -1699,7 +1792,7 @@ mod tests {
 
         let oversized_stream = StreamId::new(u64::from(u32::MAX) + 1);
         assert_eq!(
-            a.send_stream(unknown_connection, oversized_stream, vec![1]),
+            a.send_stream(unknown_connection, oversized_stream, Bytes::from(vec![1])),
             Err(TransportError::ConnectionNotFound {
                 id: unknown_connection,
             })
@@ -1722,7 +1815,7 @@ mod tests {
         let live = a.open_stream(circuit_id).expect("open a live substream");
         let aliased = StreamId::new(live.as_u64() + (1u64 << 32));
         for result in [
-            a.send_stream(circuit_id, aliased, vec![1]),
+            a.send_stream(circuit_id, aliased, Bytes::from(vec![1])),
             a.close_stream_write(circuit_id, aliased),
             a.reset_stream(circuit_id, aliased),
         ] {
@@ -1736,7 +1829,7 @@ mod tests {
         }
 
         for result in [
-            a.send_stream(circuit_id, stream, vec![1]),
+            a.send_stream(circuit_id, stream, Bytes::from(vec![1])),
             a.close_stream_write(circuit_id, stream),
             a.reset_stream(circuit_id, stream),
         ] {
@@ -1773,7 +1866,8 @@ mod tests {
                 relay: relay.clone(),
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
-                pending_data: Vec::new(),
+                pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("initiator adoption");
@@ -1794,7 +1888,8 @@ mod tests {
             relay,
             remote_peer: a_peer.clone(),
             role: CircuitRole::Responder,
-            pending_data: header[..split].to_vec(),
+            pending_data: Bytes::from(header[..split].to_vec()),
+            unsent_prefix: Bytes::new(),
             remote_write_closed: false,
         })
         .expect("responder adoption with partial pending data");
@@ -1804,7 +1899,67 @@ mod tests {
                 .as_slice(),
             [TransportEvent::IncomingConnection { .. }]
         ));
-        b.inject_bridge_data(inner_conn, bridge, header[split..].to_vec());
+        b.inject_bridge_data(inner_conn, bridge, Bytes::from(header[split..].to_vec()));
+        complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+    }
+
+    #[test]
+    fn an_unsent_prefix_reaches_the_peer_before_the_circuit_handshake() {
+        let relay = identity(9).peer_id();
+        let a_identity = identity(1);
+        let b_identity = identity(2);
+        let a_peer = a_identity.peer_id();
+        let b_peer = b_identity.peer_id();
+        let (inner_a, inner_b) = InMemoryTransport::pair(relay.clone(), relay.clone());
+        let inner_conn = inner_a.connection_id();
+        let mut a = CircuitTransport::new(inner_a, a_identity, CounterEntropy(10));
+        let mut b = CircuitTransport::new(inner_b, b_identity, CounterEntropy(20));
+        let _ = a.poll(Now::from_millis(0)).expect("initial A events");
+        let _ = b.poll(Now::from_millis(0)).expect("initial B events");
+        let bridge = a.inner_mut().open_stream(inner_conn).expect("bridge open");
+        let _ = a.poll(Now::from_millis(0)).expect("local bridge event");
+        let _ = b.poll(Now::from_millis(0)).expect("remote bridge event");
+        // The relay message tail the swarm held when the bridge was Full.
+        let prefix = Bytes::from_static(b"held STATUS tail");
+        let circuit_id = a
+            .adopt_bridge(BridgeAdoption {
+                inner_conn,
+                bridge_stream: bridge,
+                relay: relay.clone(),
+                remote_peer: b_peer.clone(),
+                role: CircuitRole::Initiator,
+                pending_data: Bytes::new(),
+                unsent_prefix: prefix.clone(),
+                remote_write_closed: false,
+            })
+            .expect("initiator adoption");
+        let received: Vec<u8> = b
+            .inner_mut()
+            .poll(Now::from_millis(0))
+            .expect("read the bridge")
+            .into_iter()
+            .filter_map(|event| match event {
+                TransportEvent::StreamData { data, .. } => Some(data),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let handshake = received
+            .strip_prefix(prefix.as_ref())
+            .expect("the prefix comes first");
+        assert!(!handshake.is_empty(), "the handshake follows the prefix");
+        b.adopt_bridge(BridgeAdoption {
+            inner_conn,
+            bridge_stream: bridge,
+            relay,
+            remote_peer: a_peer.clone(),
+            role: CircuitRole::Responder,
+            pending_data: Bytes::from(handshake.to_vec()),
+            unsent_prefix: Bytes::new(),
+            remote_write_closed: false,
+        })
+        .expect("responder adoption");
+        let _ = b.poll(Now::from_millis(0)).expect("incoming event");
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
     }
 
@@ -1876,7 +2031,8 @@ mod tests {
                 relay: relay.clone(),
                 remote_peer: a_peer.clone(),
                 role: CircuitRole::Responder,
-                pending_data,
+                pending_data: Bytes::from(pending_data),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("responder adopts pipelined selection and Noise msg1");
@@ -1898,7 +2054,8 @@ mod tests {
                 relay,
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
-                pending_data: Vec::new(),
+                pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("real initiator adoption");
@@ -2051,7 +2208,7 @@ mod tests {
                 .is_empty()
         );
 
-        a.inject_bridge_data(inner_conn, bridge, b"late".to_vec());
+        a.inject_bridge_data(inner_conn, bridge, Bytes::from_static(b"late"));
         a.inject_bridge_remote_write_closed(inner_conn, bridge);
         a.inject_bridge_closed(inner_conn, bridge);
         assert!(
@@ -2084,7 +2241,7 @@ mod tests {
                 .is_empty()
         );
 
-        a.inject_bridge_data(inner_conn, bridge, b"late".to_vec());
+        a.inject_bridge_data(inner_conn, bridge, Bytes::from_static(b"late"));
         assert!(
             a.poll(Now::from_millis(0))
                 .expect("post-close data is ignored")
@@ -2103,7 +2260,8 @@ mod tests {
                 relay: relay.clone(),
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
-                pending_data: Vec::new(),
+                pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("identical duplicate is idempotent");
@@ -2115,7 +2273,8 @@ mod tests {
                 relay: identity(8).peer_id(),
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
-                pending_data: Vec::new(),
+                pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             }),
             Err(AdoptError::ConflictingAdoption)
@@ -2127,7 +2286,8 @@ mod tests {
                 relay,
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
-                pending_data: Vec::new(),
+                pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: true,
             }),
             Err(AdoptError::ConflictingAdoption)
@@ -2140,7 +2300,7 @@ mod tests {
             a.open_stream(circuit_id),
             Err(TransportError::ConnectionNotFound { .. })
         ));
-        a.inject_bridge_data(ConnectionId::new(1), bridge, b"late".to_vec());
+        a.inject_bridge_data(ConnectionId::new(1), bridge, Bytes::from_static(b"late"));
         a.inject_bridge_remote_write_closed(ConnectionId::new(1), bridge);
         a.inject_bridge_closed(ConnectionId::new(1), bridge);
         assert!(
@@ -2158,8 +2318,12 @@ mod tests {
         let _ = a.poll(Now::from_millis(0)).expect("local stream open");
         let _ = b.poll(Now::from_millis(0)).expect("remote stream open");
         let _ = a.poll(Now::from_millis(0)).expect("stream acknowledgement");
-        a.send_stream(circuit_id, stream, b"queued-before-close".to_vec())
-            .expect("queue application data before close");
+        a.send_stream(
+            circuit_id,
+            stream,
+            Bytes::from_static(b"queued-before-close"),
+        )
+        .expect("queue application data before close");
 
         a.close(circuit_id).expect("graceful circuit close");
         assert_eq!(a.inner().close_write_calls, 1);
@@ -2223,7 +2387,7 @@ mod tests {
                     TransportEvent::Closed { id: closed_id },
                 ] if *id == circuit_id
                     && *stream_id == stream
-                    && data == b"queued-before-close"
+                    && data[..] == b"queued-before-close"[..]
                     && *stream_closed_id == circuit_id
                     && *closed_stream == stream
                     && *closed_id == circuit_id
@@ -2313,7 +2477,7 @@ mod tests {
         // session queued fails.
         a.inner_mut().fail_send = true;
         assert!(matches!(
-            a.send_stream(circuit_id, stream, b"lost".to_vec()),
+            a.send_stream(circuit_id, stream, Bytes::from_static(b"lost")),
             Err(TransportError::StreamSendFailed { id, stream_id, .. })
                 if id == circuit_id && stream_id == stream
         ));
@@ -2351,7 +2515,7 @@ mod tests {
                 .expect("consume reset acknowledgement")
                 .is_empty()
         );
-        a.inject_bridge_data(inner_conn, bridge, b"late".to_vec());
+        a.inject_bridge_data(inner_conn, bridge, Bytes::from_static(b"late"));
         assert!(
             a.poll(Now::from_millis(0))
                 .expect("post-close data is ignored")
@@ -2398,14 +2562,14 @@ mod tests {
 
     #[test]
     fn yamux_backpressure_is_stream_scoped_and_session_survives() {
-        let receive_window = 256 * 1024;
         let max_buffered_send = 64;
         let config = YamuxConfig {
-            receive_window,
+            receive_window: 256 * 1024,
             max_frame_len: 64 * 1024,
             max_streams: 8,
             max_buffered_send,
             max_total_buffered_send: 128,
+            ..YamuxConfig::default()
         };
         let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) =
             setup_pair_with_yamux_config(Some(config));
@@ -2416,28 +2580,85 @@ mod tests {
         let _ = a.poll(Now::from_millis(0)).expect("local open");
         let _ = b.poll(Now::from_millis(0)).expect("remote open");
 
-        let error = a
-            .send_stream(
-                circuit_id,
-                initiator_stream,
-                vec![0; receive_window as usize + max_buffered_send + 1],
-            )
-            .expect_err("send beyond the Yamux queue cap");
-        assert!(matches!(error, TransportError::StreamSendFailed { .. }));
-        a.send_stream(circuit_id, initiator_stream, b"still-alive".to_vec())
-            .expect("backpressure must not poison the stream");
+        // A send beyond the stream cap is Full with the exact unsent tail;
+        // the circuit stays up.
+        let payload = Bytes::from(vec![7u8; 4 * max_buffered_send]);
+        let Err(TransportError::Full {
+            id,
+            stream_id,
+            unsent,
+        }) = a.send_stream(circuit_id, initiator_stream, payload.clone())
+        else {
+            panic!("send beyond the Yamux stream cap must be Full");
+        };
+        assert_eq!((id, stream_id), (circuit_id, initiator_stream));
+        assert_eq!(unsent, payload.slice(max_buffered_send..));
+
+        // Flushing the accepted prefix makes the stream writable again.
+        let events = a.poll(Now::from_millis(0)).expect("flush accepted prefix");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TransportEvent::StreamWritable { id, stream_id }
+                if *id == circuit_id && *stream_id == initiator_stream
+        )));
         assert!(
-            b.poll(Now::from_millis(0))
-                .expect("small data")
+            !events
                 .iter()
-                .any(|event| matches!(
-                    event,
-                    TransportEvent::StreamData { data, .. } if data == b"still-alive"
-                ))
+                .any(|event| matches!(event, TransportEvent::Closed { .. })),
+            "Full must not tear the circuit down"
         );
+        a.send_stream(
+            circuit_id,
+            initiator_stream,
+            Bytes::from_static(b"still-alive"),
+        )
+        .expect("backpressure must not poison the stream");
+        let _ = a.poll(Now::from_millis(0)).expect("flush small data");
+        let received: Vec<u8> = b
+            .poll(Now::from_millis(0))
+            .expect("data")
+            .into_iter()
+            .filter_map(|event| match event {
+                TransportEvent::StreamData { data, .. } => Some(data),
+                _ => None,
+            })
+            .flat_map(|data| data.to_vec())
+            .collect();
+        let mut expected = payload[..max_buffered_send].to_vec();
+        expected.extend_from_slice(b"still-alive");
+        assert_eq!(received, expected);
 
         let responder_stream = b.open_stream(circuit_id).expect("responder stream");
         assert_eq!(responder_stream.as_u64() % 2, 0);
+    }
+
+    #[test]
+    fn closing_a_circuit_drops_its_queued_writable() {
+        let config = YamuxConfig {
+            max_buffered_send: 64,
+            max_total_buffered_send: 128,
+            ..YamuxConfig::default()
+        };
+        let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) =
+            setup_pair_with_yamux_config(Some(config));
+        complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+        let stream = a.open_stream(circuit_id).expect("stream");
+        let _ = a.poll(Now::from_millis(0)).expect("local open");
+        let _ = b.poll(Now::from_millis(0)).expect("remote open");
+
+        assert!(matches!(
+            a.send_stream(circuit_id, stream, Bytes::from(vec![7u8; 256])),
+            Err(TransportError::Full { .. })
+        ));
+        a.close(circuit_id).expect("close");
+        let events = a.poll(Now::from_millis(0)).expect("poll");
+        assert!(events.contains(&TransportEvent::Closed { id: circuit_id }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TransportEvent::StreamWritable { .. })),
+            "no Writable for a closed circuit: {events:?}"
+        );
     }
 
     #[test]
@@ -2454,7 +2675,8 @@ mod tests {
                 relay,
                 remote_peer: remote,
                 role: CircuitRole::Initiator,
-                pending_data: Vec::new(),
+                pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             }),
             Err(AdoptError::UnknownConnection)
@@ -2479,7 +2701,8 @@ mod tests {
                 relay: relay.clone(),
                 remote_peer: remote.clone(),
                 role: CircuitRole::Initiator,
-                pending_data: Vec::new(),
+                pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             }),
             Err(AdoptError::PeerAlreadyDirect)
@@ -2557,7 +2780,8 @@ mod tests {
             relay,
             remote_peer: remote,
             role: CircuitRole::Initiator,
-            pending_data: Vec::new(),
+            pending_data: Bytes::from(Vec::new()),
+            unsent_prefix: Bytes::new(),
             remote_write_closed: false,
         };
         // Adoption peeks the next id up front but must only consume it after

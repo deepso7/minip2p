@@ -185,7 +185,7 @@ fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
     );
     let stream = StreamId::new(0);
     server
-        .send_stream(stopper_id, stream, vec![7; 10_000])
+        .send_stream(stopper_id, stream, Bytes::from(vec![7; 10_000]))
         .expect("send");
     assert!(pending_write_bytes(&server, stopper_id) > 0);
 
@@ -225,7 +225,7 @@ fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
     assert!(events.contains(&TransportEvent::StreamData {
         id: stopper_id,
         stream_id: stream,
-        data: b"more".to_vec(),
+        data: Bytes::from_static(b"more"),
     }));
     assert!(events.contains(&TransportEvent::StreamRemoteWriteClosed {
         id: stopper_id,
@@ -292,7 +292,7 @@ fn stop_sending_is_reported_when_nothing_is_queued() {
         }]
     );
     assert!(matches!(
-        server.send_stream(id, stream, b"late".to_vec()),
+        server.send_stream(id, stream, Bytes::from_static(b"late")),
         Err(TransportError::StreamSendFailed { .. } | TransportError::StreamNotFound { .. })
     ));
     assert_eq!(pending_write_bytes(&server, id), 0);
@@ -322,7 +322,7 @@ fn stop_sending_is_reported_while_connection_credit_is_exhausted() {
     // Use up the connection's send credit: quiche now lists no stream as
     // writable, stopped or not.
     server
-        .send_stream(id, StreamId::new(0), vec![7; 10_000])
+        .send_stream(id, StreamId::new(0), Bytes::from(vec![7; 10_000]))
         .expect("send");
 
     peer.conn
@@ -391,7 +391,7 @@ fn stop_hidden_by_exhausted_credit_surfaces_after_a_local_reset() {
     let mut events = Vec::new();
     conn.send_stream(
         StreamId::new(0),
-        vec![7; 10_000],
+        Bytes::from(vec![7; 10_000]),
         socket,
         &mut events,
         &mut held,
@@ -476,7 +476,7 @@ fn data_beyond_one_read_buffer_arrives_once_and_idle_polls_stay_silent() {
     let received: Vec<u8> = events
         .iter()
         .filter_map(|event| match event {
-            TransportEvent::StreamData { data, .. } => Some(data.as_slice()),
+            TransportEvent::StreamData { data, .. } => Some(&data[..]),
             _ => None,
         })
         .flatten()
@@ -509,7 +509,9 @@ fn fin_waiting_for_stream_credit_stays_queued_until_granted() {
     });
 
     let first = server.open_stream(id).expect("first stream");
-    server.send_stream(id, first, b"x".to_vec()).expect("send");
+    server
+        .send_stream(id, first, Bytes::from_static(b"x"))
+        .expect("send");
     server.close_stream_write(id, first).expect("fin first");
     // The peer has granted one server stream; this FIN has to wait.
     let second = server.open_stream(id).expect("second stream");
@@ -597,7 +599,7 @@ fn connection_fatal_send_error_closes_only_that_connection() {
     assert!(events.contains(&TransportEvent::StreamData {
         id: healthy_id,
         stream_id: StreamId::new(0),
-        data: b"still here".to_vec(),
+        data: Bytes::from_static(b"still here"),
     }));
     assert!(!events.contains(&TransportEvent::Closed { id: healthy_id }));
     assert!(server.connections.contains_key(&healthy_id));
@@ -613,7 +615,7 @@ fn partially_written_queue_drains_once_the_stream_is_writable() {
 
     let stream = server.open_stream(id).expect("open");
     server
-        .send_stream(id, stream, vec![7; 10_000])
+        .send_stream(id, stream, Bytes::from(vec![7; 10_000]))
         .expect("send");
     server.close_stream_write(id, stream).expect("queue fin");
     let connection = server.connections.get(&id).expect("connection");
@@ -641,4 +643,200 @@ fn partially_written_queue_drains_once_the_stream_is_writable() {
     let connection = server.connections.get(&id).expect("connection");
     assert_eq!(connection.pending_write_bytes(), 0);
     assert_eq!(connection.queued_stream_count(), 0);
+}
+
+#[test]
+fn a_peer_reset_disarms_its_stream_while_the_queue_stays_full() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 4_000,
+        ..QuicLimits::default()
+    };
+    let mut server = QuicTransport::new(
+        QuicNodeConfig::generate().with_limits(limits),
+        "127.0.0.1:0",
+    )
+    .expect("bind server");
+    server.listen_on_bound_addr().expect("listen");
+    // A small window for server data keeps most of each write queued, and
+    // the peer never reads, so nothing drains the queue.
+    let (mut peer, id) = accept(&mut server, &mut [], |config| {
+        config.set_initial_max_stream_data_bidi_local(1_000);
+    });
+    peer.conn.stream_send(0, b"a", false).expect("open 0");
+    peer.conn.stream_send(4, b"b", false).expect("open 4");
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "inbound streams",
+        |events| {
+            events
+                .iter()
+                .filter(|event| matches!(event, TransportEvent::StreamData { .. }))
+                .count()
+                == 2
+        },
+    );
+    let (filler, reset) = (StreamId::new(0), StreamId::new(4));
+    // The filler takes the whole shared queue; the second write finds none.
+    for stream in [filler, reset] {
+        assert!(matches!(
+            server.send_stream(id, stream, Bytes::from(vec![7; 10_000])),
+            Err(TransportError::Full { .. })
+        ));
+    }
+    assert_eq!(server.connections[&id].writable_armed_count(), 2);
+
+    // Resetting a stream that queued nothing frees no room, so no wake runs:
+    // the reset itself must disarm it.
+    peer.conn
+        .stream_shutdown(4, quiche::Shutdown::Write, 5)
+        .expect("reset");
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "reset",
+        |events| {
+            events.contains(&TransportEvent::StreamClosed {
+                id,
+                stream_id: reset,
+            })
+        },
+    );
+    assert_eq!(server.connections[&id].writable_armed_count(), 1);
+}
+
+#[test]
+fn a_peer_reset_retracts_a_writable_queued_before_the_poll() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 4_000,
+        ..QuicLimits::default()
+    };
+    let mut server = QuicTransport::new(
+        QuicNodeConfig::generate().with_limits(limits),
+        "127.0.0.1:0",
+    )
+    .expect("bind server");
+    server.listen_on_bound_addr().expect("listen");
+    let (mut peer, id) = accept(&mut server, &mut [], |config| {
+        config.set_initial_max_stream_data_bidi_local(1_000);
+    });
+    peer.conn.stream_send(0, b"a", false).expect("open 0");
+    peer.conn.stream_send(4, b"b", false).expect("open 4");
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "inbound streams",
+        |events| {
+            events
+                .iter()
+                .filter(|event| matches!(event, TransportEvent::StreamData { .. }))
+                .count()
+                == 2
+        },
+    );
+    let (filler, reset) = (StreamId::new(0), StreamId::new(4));
+    for stream in [filler, reset] {
+        assert!(matches!(
+            server.send_stream(id, stream, Bytes::from(vec![7; 10_000])),
+            Err(TransportError::Full { .. })
+        ));
+    }
+
+    // The peer's reset is on the wire when the application resets the
+    // filler, which frees the shared queue and queues a Writable for the
+    // other stream before the next poll reads that reset.
+    peer.conn
+        .stream_shutdown(4, quiche::Shutdown::Write, 5)
+        .expect("reset");
+    peer.flush();
+    // Wait until the reset is waiting on the server's socket (peeking leaves
+    // it there), so the next poll is sure to read it.
+    let start = Instant::now();
+    while server.socket.peek_from(&mut [0u8; 1]).is_err() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "reset never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    server.reset_stream(id, filler).expect("local reset");
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "reset",
+        |events| {
+            events.contains(&TransportEvent::StreamClosed {
+                id,
+                stream_id: reset,
+            })
+        },
+    );
+    assert!(
+        !events.contains(&TransportEvent::StreamWritable {
+            id,
+            stream_id: reset,
+        }),
+        "no Writable for a reset stream: {events:?}"
+    );
+}
+
+#[test]
+fn a_local_close_retracts_queued_writables() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 4_000,
+        ..QuicLimits::default()
+    };
+    let mut server = QuicTransport::new(
+        QuicNodeConfig::generate().with_limits(limits),
+        "127.0.0.1:0",
+    )
+    .expect("bind server");
+    server.listen_on_bound_addr().expect("listen");
+    let (mut peer, id) = accept(&mut server, &mut [], |config| {
+        config.set_initial_max_stream_data_bidi_local(1_000);
+    });
+    peer.conn.stream_send(0, b"a", false).expect("open 0");
+    peer.conn.stream_send(4, b"b", false).expect("open 4");
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "inbound streams",
+        |events| {
+            events
+                .iter()
+                .filter(|event| matches!(event, TransportEvent::StreamData { .. }))
+                .count()
+                == 2
+        },
+    );
+    let (filler, waiting) = (StreamId::new(0), StreamId::new(4));
+    for stream in [filler, waiting] {
+        assert!(matches!(
+            server.send_stream(id, stream, Bytes::from(vec![7; 10_000])),
+            Err(TransportError::Full { .. })
+        ));
+    }
+
+    // Resetting the filler frees the shared queue and queues a Writable for
+    // the other stream; closing the connection before the poll retracts it.
+    server.reset_stream(id, filler).expect("local reset");
+    server.close(id).expect("close");
+    let events = server.poll(now()).expect("poll");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::StreamWritable { .. })),
+        "no Writable after a local close: {events:?}"
+    );
+    assert_eq!(server.connections[&id].writable_armed_count(), 0);
 }

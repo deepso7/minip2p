@@ -180,12 +180,12 @@ describe("@minip2p/node", () => {
       });
       const inbound = await inboundPromise;
 
-      outbound.write("hello from a");
+      await outbound.write("hello from a");
       expect(new TextDecoder().decode(await inbound.read())).toBe(
         "hello from a"
       );
 
-      inbound.write("hello from b");
+      await inbound.write("hello from b");
       expect(new TextDecoder().decode(await outbound.read())).toBe(
         "hello from b"
       );
@@ -219,7 +219,7 @@ describe("@minip2p/node", () => {
       });
       const inbound = await inboundPromise;
 
-      outbound.write("hello over tcp");
+      await outbound.write("hello over tcp");
       expect(new TextDecoder().decode(await inbound.read())).toBe(
         "hello over tcp"
       );
@@ -228,6 +228,45 @@ describe("@minip2p/node", () => {
       b.close();
     }
   }, 15_000);
+
+  test("a write past the native send caps completes in order before the FIN", async () => {
+    const protocol = "/minip2p/node-tcp-bulk/1";
+    const createEndpoint = () =>
+      nodeSdk.Minip2p.create({
+        listen: ["/ip4/127.0.0.1/tcp/0"],
+        protocols: [protocol],
+        secretKey: nodeSdk.generateSecretKey(),
+      });
+    const a = createEndpoint();
+    const b = createEndpoint();
+
+    try {
+      await a.connect(b.listenAddrs()[0], { timeoutMs: 10_000 });
+      await a.waitPeerReady(b.peerId(), { timeoutMs: 10_000 });
+      const inboundPromise = b.once("stream", { timeoutMs: 10_000 });
+      const outbound = await a.openStream(b.peerId(), protocol, {
+        timeoutMs: 10_000,
+      });
+      const inbound = await inboundPromise;
+
+      // Four Yamux stream caps, so native holds the tail and settles later.
+      const payload = Uint8Array.from(
+        { length: 1024 * 1024 },
+        (_, index) => index % 251
+      );
+      const written = outbound.write(payload);
+      outbound.closeWrite();
+      const received: Uint8Array[] = [];
+      for await (const chunk of inbound) {
+        received.push(chunk);
+      }
+      await written;
+      expect(Buffer.concat(received).equals(Buffer.from(payload))).toBe(true);
+    } finally {
+      a.close();
+      b.close();
+    }
+  }, 20_000);
 
   test("two endpoints establish a circuit-relay path", async () => {
     const relay = await startRelay();

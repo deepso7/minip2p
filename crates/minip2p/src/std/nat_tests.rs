@@ -4,7 +4,7 @@ use minip2p_nat::{NatAction, NatAgent, NatEvent, Now};
 use minip2p_platform::StdEntropy;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::Transport;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 use std::time::Instant;
 type NatDriver = crate::nat::NatDriver<StdEntropy>;
 use super::NextEvent;
@@ -474,7 +474,7 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
             peer_id: relay_peer.clone(),
             conn_id: pair.inner_conn,
             stream_id: pair.stream,
-            data: encode_frame(&status.encode()),
+            data: Bytes::from(encode_frame(&status.encode())),
         },
         Now::from_mono(6),
     );
@@ -593,7 +593,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
             peer_id: pair.relay_addr.peer_id().clone(),
             conn_id: pair.inner_conn,
             stream_id: pair.stream,
-            data: header,
+            data: Bytes::from(header),
         },
         pair.local.swarm.runtime_mut(),
         minip2p_platform::Now::from_millis(10),
@@ -604,7 +604,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
             peer_id: pair.relay_addr.peer_id().clone(),
             conn_id: ConnectionId::new(pair.inner_conn.as_u64() + 100),
             stream_id: pair.stream,
-            data: vec![1],
+            data: Bytes::from(vec![1]),
         },
         pair.local.swarm.runtime_mut(),
         minip2p_platform::Now::from_millis(10),
@@ -681,7 +681,7 @@ fn promotion_uses_action_connection_after_same_batch_relay_replacement() {
             peer_id: relay_peer,
             conn_id: replacement,
             stream_id: stream,
-            data: vec![1],
+            data: Bytes::from(vec![1]),
         },
         pair.local.swarm.runtime_mut(),
         minip2p_platform::Now::from_millis(10),

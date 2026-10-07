@@ -49,9 +49,13 @@ export declare class NodeEndpoint {
   openStream(peerId: string, protocolId: string): NativeOpenStream
   /**
    * Sends bytes on an application stream, named by its connection and
-   * stream ids.
+   * stream ids. Returns `true` once every byte is accepted, or `false`
+   * when the rest is held: `StreamWriteAccepted` follows once it is
+   * accepted, unless the write side ends first (`StreamWriteStopped`,
+   * `StreamClosed`, a reset, or the connection closing or being replaced),
+   * which drops the tail.
    */
-  sendStream(peerId: string, connId: bigint, streamId: bigint, data: Uint8Array): void
+  sendStream(peerId: string, connId: bigint, streamId: bigint, data: Uint8Array): boolean
   /** Half-closes the local stream write side. */
   closeStreamWrite(peerId: string, connId: bigint, streamId: bigint): void
   /** Resets an application stream. */

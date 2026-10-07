@@ -285,6 +285,28 @@ pub enum P2pEvent {
         #[cfg_attr(feature = "serde", serde(serialize_with = "crate::js_shape::bytes"))]
         data: Vec<u8>,
     },
+    /// A write that `send_stream` reported as pending has been fully
+    /// accepted; the stream takes the next write.
+    StreamWriteAccepted {
+        /// Remote peer.
+        peer_id: String,
+        /// Transport connection carrying the stream.
+        conn_id: u64,
+        /// Opaque stream id.
+        stream_id: u64,
+    },
+    /// The remote asked this side to stop sending on a stream. Writes now
+    /// fail, and a pending write's held bytes were dropped; reads continue.
+    StreamWriteStopped {
+        /// Remote peer.
+        peer_id: String,
+        /// Transport connection carrying the stream.
+        conn_id: u64,
+        /// Opaque stream id.
+        stream_id: u64,
+        /// Application error code the remote supplied.
+        error_code: u64,
+    },
     /// The remote peer half-closed its stream write side.
     StreamRemoteWriteClosed {
         /// Remote peer.
@@ -564,7 +586,20 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
             stream_id: stream_id.as_u64(),
-            data,
+            // Takes the allocation back without a copy when the handle is
+            // the only one, which it is for transport reads.
+            data: Vec::from(data),
+        },
+        EndpointEvent::StreamWriteStopped {
+            peer_id,
+            conn_id,
+            stream_id,
+            error_code,
+        } => P2pEvent::StreamWriteStopped {
+            peer_id: peer_id.to_base58(),
+            conn_id: conn_id.as_u64(),
+            stream_id: stream_id.as_u64(),
+            error_code,
         },
         EndpointEvent::StreamRemoteWriteClosed {
             peer_id,
@@ -593,7 +628,9 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
         },
         // Capability variants are dispatched by `convert_endpoint_event`;
         // raw dial failures and variants of capabilities this core does
-        // not surface (relay service) have no foreign event.
+        // not surface (relay service) have no foreign event. A Writable is
+        // consumed by the pending writes, which settle the binding's write
+        // with `StreamWriteAccepted` instead.
         _ => return None,
     })
 }
@@ -932,7 +969,7 @@ mod tests {
                 peer_id: remote.clone(),
                 conn_id: ConnectionId::new(8),
                 stream_id: StreamId::new(12),
-                data: vec![1, 2, 3],
+                data: minip2p::Bytes::from(vec![1, 2, 3]),
             }),
             Some(P2pEvent::StreamData {
                 peer_id: remote.to_base58(),

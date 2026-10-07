@@ -31,13 +31,14 @@ pub struct TcpConfig {
     /// that sees the connection, since a transport owns no clock and that is
     /// the first time it is told what the time is.
     pub handshake_timeout_ms: Option<u64>,
-    /// Ceiling on bytes held for one connection while its socket is not
-    /// accepting writes.
+    /// How many encrypted bytes one connection holds for its socket.
     ///
-    /// A peer that stops reading while the local side keeps sending would
-    /// otherwise grow this buffer without bound. Reaching the ceiling fails
-    /// that connection instead. Yamux applies its own per-substream limits
-    /// above this; this one backs the socket itself.
+    /// The session is pulled for more only while the buffer is below this,
+    /// so a peer that reads slowly or not at all fills Yamux's send caps
+    /// instead, and stream writes report
+    /// [`TransportError::Full`](minip2p_transport::TransportError::Full)
+    /// rather than tearing the connection down. A pull may overshoot by one
+    /// Noise-encrypted Yamux frame; zero holds one frame at a time.
     pub max_buffered_send: usize,
     /// How long a connection may hold bytes its socket refuses before it is
     /// failed, or `None` to wait indefinitely.
@@ -62,8 +63,8 @@ impl Default for TcpConfig {
             // Generous next to the handful of round trips an upgrade actually
             // takes, so only a peer that has stopped participating trips it.
             handshake_timeout_ms: Some(30_000),
-            // Comfortably above one Yamux frame plus a Noise transport frame,
-            // so an ordinary write never trips the ceiling on a healthy socket.
+            // Several Yamux windows' worth, so a healthy socket is never
+            // starved between polls.
             max_buffered_send: 1024 * 1024,
             // Long enough that a briefly wedged peer recovers, short enough
             // that a dead one does not hold a connection indefinitely.

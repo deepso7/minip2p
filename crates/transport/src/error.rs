@@ -2,6 +2,8 @@ use alloc::string::String;
 
 use thiserror::Error;
 
+use minip2p_core::Bytes;
+
 use crate::{ConnectionId, StreamId};
 
 /// Errors returned by [`Transport`](crate::Transport) operations.
@@ -43,6 +45,17 @@ pub enum TransportError {
         id: ConnectionId,
         stream_id: StreamId,
     },
+    /// The stream could not queue every byte of a write. Retryable, never a
+    /// fault: `unsent` is the exact suffix that was not accepted (the whole
+    /// payload when nothing fit), and a
+    /// [`TransportEvent::StreamWritable`](crate::TransportEvent::StreamWritable)
+    /// for the stream follows once it can queue again.
+    #[error("stream {stream_id} on connection {id} is full; {} bytes unsent", unsent.len())]
+    Full {
+        id: ConnectionId,
+        stream_id: StreamId,
+        unsent: Bytes,
+    },
     #[error("stream send failed for {id}/{stream_id}: {reason}")]
     StreamSendFailed {
         id: ConnectionId,
@@ -65,4 +78,15 @@ pub enum TransportError {
     CloseFailed { id: ConnectionId, reason: String },
     #[error("poll error: {reason}")]
     PollError { reason: String },
+}
+
+impl TransportError {
+    /// The unsent tail of a [`TransportError::Full`] write, or `None` for any
+    /// other error.
+    pub fn into_unsent(self) -> Option<Bytes> {
+        match self {
+            Self::Full { unsent, .. } => Some(unsent),
+            _ => None,
+        }
+    }
 }

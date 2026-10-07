@@ -13,8 +13,14 @@ pub struct QuicLimits {
     /// Maximum locally initiated bidirectional streams per connection.
     pub max_streams_per_connection: u64,
     /// Maximum application bytes queued per connection beyond what quiche
-    /// accepts immediately. A single write may exceed this limit as long as
-    /// the remainder quiche leaves unsent fits within it.
+    /// accepts immediately, shared by all its streams. Must be non-zero.
+    ///
+    /// A write takes what quiche accepts now plus what fits here, regardless
+    /// of the peer's flow-control credit, and returns
+    /// [`TransportError::Full`](minip2p_transport::TransportError::Full) with
+    /// the rest. Armed streams get a
+    /// [`StreamWritable`](minip2p_transport::TransportEvent::StreamWritable)
+    /// once at least half of this is free again.
     pub max_pending_stream_bytes: usize,
     /// Maximum UDP datagrams retained after the non-blocking socket reports
     /// `WouldBlock`.

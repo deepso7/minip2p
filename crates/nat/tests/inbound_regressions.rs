@@ -7,7 +7,7 @@ use common::*;
 use minip2p_core::PeerAddr;
 use minip2p_nat::{DCUTR_PROTOCOL_ID, NatAction, NatConfig, NatEvent, Path, STOP_PROTOCOL_ID};
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 const STOP_STREAM: u64 = 40;
 const CIRCUIT_STREAM: u64 = 41;
@@ -144,7 +144,7 @@ fn answer_dcutr_at(h: &mut Harness, conn: ConnectionId, stream: StreamId, addrs:
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: stream,
-            data: dcutr_connect_reply(&reply_addrs),
+            data: Bytes::from(dcutr_connect_reply(&reply_addrs)),
         },
         at(t),
     );
@@ -419,7 +419,7 @@ fn circuit_replacement_through_another_relay_updates_the_path_origin() {
             conn_id: ConnectionId::new(3),
             peer_id: relay_b.clone(),
             stream_id: stop,
-            data: stop_connect(&target),
+            data: Bytes::from(stop_connect(&target)),
         },
         at(21),
     );

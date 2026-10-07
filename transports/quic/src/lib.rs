@@ -16,7 +16,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{
-    BlockingTransport, ConnectionEndpoint, ConnectionId, ConnectionIdAllocator,
+    BlockingTransport, Bytes, ConnectionEndpoint, ConnectionId, ConnectionIdAllocator,
     ConnectionNamespace, StreamId, Transport, TransportError, TransportEvent, WaitHandle,
     WaitOutcome,
 };
@@ -318,6 +318,13 @@ fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, T
     if node_config.limits().max_pending_datagrams == 0 {
         return Err(TransportError::InvalidConfig {
             reason: "max_pending_datagrams must be greater than zero".into(),
+        });
+    }
+    // A zero queue could never free half of itself, so a Full write would
+    // never be told it can retry.
+    if node_config.limits().max_pending_stream_bytes == 0 {
+        return Err(TransportError::InvalidConfig {
+            reason: "max_pending_stream_bytes must be greater than zero".into(),
         });
     }
 
@@ -1549,7 +1556,7 @@ impl Transport for QuicTransport {
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
         let conn = self
             .connections
@@ -1578,15 +1585,18 @@ impl Transport for QuicTransport {
             .get_mut(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
 
-        conn.close_stream_write(
+        let result = conn.close_stream_write(
             stream_id,
             &self.socket,
             &mut self.pending_events,
             &mut self.pending_datagrams,
             self.node_config.limits().max_pending_datagrams,
-        )?;
-
-        Ok(())
+        );
+        // Writable never follows the end of a write side, even one a Full
+        // queued before its call returned.
+        self.pending_events
+            .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
+        result
     }
 
     fn reset_stream(
@@ -1599,9 +1609,10 @@ impl Transport for QuicTransport {
             .get_mut(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
 
-        conn.reset_stream(stream_id, &mut self.pending_events)?;
-
-        Ok(())
+        let result = conn.reset_stream(stream_id, &mut self.pending_events);
+        self.pending_events
+            .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
+        result
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
@@ -1610,13 +1621,20 @@ impl Transport for QuicTransport {
             .get_mut(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
 
-        conn.close(
+        let result = conn.close(
             &self.socket,
             &mut self.pending_datagrams,
             self.node_config.limits().max_pending_datagrams,
-        )?;
-
-        Ok(())
+        );
+        // Nor may one a Full queued before the close. A close that failed
+        // before it began leaves the connection open, so its Writables stand:
+        // their streams are no longer armed and would never wake again.
+        if conn.is_closing() {
+            self.pending_events.retain(
+                |event| !matches!(event, TransportEvent::StreamWritable { id: event_id, .. } if *event_id == id),
+            );
+        }
+        result
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {
@@ -1838,7 +1856,7 @@ impl Transport for QuicEndpoint {
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
         match self {
             Self::Single(transport) => transport.send_stream(id, stream_id, data),
@@ -1952,7 +1970,7 @@ impl Transport for DualQuicTransport {
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
         let family = Self::family_for_id(id)?;
         self.transport_mut(family).send_stream(id, stream_id, data)

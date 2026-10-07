@@ -29,7 +29,7 @@ console.log(result.connectId, result.path);
 
 A string that starts with `/` is an address; any other string is a peer ID. Transport and IP family come from the addresses, and every candidate races under one attempt. Malformed targets throw synchronously; a valid peer ID with no route is admitted and then rejects with `ConnectFailedError`.
 
-`connect` resolves with `{ connectId, peerId, path }`. The first path may be `directDialed`, `directPunched`, or `relayed`. Call `path(peerId)` when you need the current answer; a relayed connection can upgrade after the original Promise resolves. An upgrade arrives as `connectionReplaced` (`{ peerId, oldConnId, newConnId }`): the peer stays connected, Identify runs again on `newConnId`, and `waitPeerReady` waits for the new connection's `peerReady`. Streams on `oldConnId` end when the endpoint processes the replacement: pending and later reads reject with `StreamClosedError`. Until then `read()` can still return buffered data or a pending Promise, while `write`, `closeWrite`, and `reset` throw rather than reaching a stream on `newConnId`.
+`connect` resolves with `{ connectId, peerId, path }`. The first path may be `directDialed`, `directPunched`, or `relayed`. Call `path(peerId)` when you need the current answer; a relayed connection can upgrade after the original Promise resolves. An upgrade arrives as `connectionReplaced` (`{ peerId, oldConnId, newConnId }`): the peer stays connected, Identify runs again on `newConnId`, and `waitPeerReady` waits for the new connection's `peerReady`. Streams on `oldConnId` end when the endpoint processes the replacement: pending and later reads reject with `StreamClosedError`. Until then `read()` can still return buffered data or a pending Promise, while `write` rejects and `closeWrite` and `reset` throw rather than reaching a stream on `newConnId`. A `closeWrite` queued behind pending writes cannot throw; if native then refuses it, the stream's terminal event reports the end.
 
 ## Timeouts and cancellation
 
@@ -130,7 +130,7 @@ try {
   request += decoder.decode();
 
   console.log(`received: ${request}`);
-  stream.write(`echo: ${request}`);
+  await stream.write(`echo: ${request}`);
   stream.closeWrite();
 
   await new Promise((resolve) => stream.on("closed", resolve));
@@ -171,7 +171,7 @@ try {
   const stream = await endpoint.openStream(connected.peerId, protocol, {
     timeoutMs: 10_000,
   });
-  stream.write("hello");
+  await stream.write("hello");
   stream.closeWrite();
 
   let reply = "";
@@ -199,12 +199,14 @@ const stream = await endpoint.openStream(peerId, "/example/files/1", {
   timeoutMs: 10_000,
 });
 
-stream.write("header\n");
-stream.write(new Uint8Array([1, 2, 3]));
+await stream.write("header\n");
+await stream.write(new Uint8Array([1, 2, 3]));
 stream.closeWrite();
 ```
 
-`write` accepts UTF-8 text, `Uint8Array`, or `ArrayBuffer`. `closeWrite()` half-closes only the local write side; reads stay available until the remote half-closes or the stream terminates.
+`write` accepts UTF-8 text, `Uint8Array`, or `ArrayBuffer` and returns a Promise that resolves once the native endpoint has accepted every byte. A peer that reads slowly makes writes resolve later; nothing is dropped and nothing tears down. Writes go out in call order. Each stream buffers up to `stream.writeHighWaterMark` bytes (256 KiB by default, counting the write still in flight); a write past that rejects with `WriteBufferFullError`, so await earlier writes before queueing more. A write into an empty buffer is always admitted, whatever its size.
+
+`closeWrite()` half-closes only the local write side, after every earlier write has been accepted, so `write(); closeWrite()` delivers every byte before the FIN. Later writes reject. Reads stay available until the remote half-closes or the stream terminates. If the remote stops reading the stream, pending writes reject and the stream emits `writeStopped`.
 
 ## Claim inbound streams
 
@@ -282,7 +284,7 @@ Pull reads and flowing `data` handlers are mutually exclusive. Calling `read()` 
 
 | Operation | Result |
 | --- | --- |
-| `closeWrite()` | Graceful local half-close; reading remains possible. |
+| `closeWrite()` | Graceful local half-close after earlier writes; reading remains possible. |
 | `reset()` | Abruptly reset the stream and emit `closed`. |
 | `abandon()` | Reset, relinquish the handle, and suppress later events. |
 | `stream[Symbol.dispose]()` | Equivalent to `abandon()`. |

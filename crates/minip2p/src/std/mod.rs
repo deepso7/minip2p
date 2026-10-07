@@ -60,18 +60,16 @@ use minip2p_core::Protocol;
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_core::TransportKind;
 use minip2p_core::{PeerAddr, PeerId};
-#[cfg(all(any(feature = "discovery", feature = "mdns"), feature = "smoltcp"))]
-#[expect(
-    unused_imports,
-    reason = "The portable mDNS build re-exports this std API type without using it internally."
-)]
-pub use minip2p_discovery::DiscoverySource;
-#[cfg(all(any(feature = "discovery", feature = "mdns"), not(feature = "smoltcp")))]
-pub use minip2p_discovery::DiscoverySource;
 #[cfg(feature = "discovery")]
 pub use minip2p_discovery::{BeaconConfig, DISCOVERY_TOPIC};
 #[cfg(any(feature = "discovery", feature = "mdns"))]
-pub use minip2p_discovery::{DiscoveryConfigError, DiscoveryEvent, KnownPeer, PeerDiscoveryConfig};
+pub use minip2p_discovery::{DiscoveryConfigError, KnownPeer, PeerDiscoveryConfig};
+// `portable-mdns` already re-exports these from the portable module.
+#[cfg(all(
+    any(feature = "discovery", feature = "mdns"),
+    not(feature = "portable-mdns")
+))]
+pub use minip2p_discovery::{DiscoveryEvent, DiscoverySource};
 pub use minip2p_identify::IdentifyMessage;
 pub use minip2p_identity::Ed25519Keypair;
 #[cfg(feature = "mdns")]
@@ -112,7 +110,7 @@ pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet
 use std::str::FromStr;
 
 use crate::portable::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS};
-use crate::{ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
+use crate::{Bytes, ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
 
 /// Why one blocking [`Endpoint::wait`] returned.
 ///
@@ -608,6 +606,12 @@ impl Endpoint {
 
     /// Sends bytes on a negotiated application stream.
     ///
+    /// Accepts as much of `data` as the stream can queue (ADR 0012). When not
+    /// every byte fit, returns [`Error::Full`] carrying the exact unsent
+    /// suffix: hold it, wait for [`EndpointEvent::StreamWritable`] for the
+    /// stream, and send it again. Full is retryable, never a fault. Close the
+    /// write side only once every held tail has been accepted.
+    ///
     /// Fails with [`SwarmError::StreamNotFound`] if `conn_id` is no longer
     /// the peer's connection holding the stream (for example after
     /// `ConnectionReplaced`), so a write never reaches a same-numbered stream
@@ -617,7 +621,7 @@ impl Endpoint {
         peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        data: impl Into<Vec<u8>>,
+        data: impl Into<Bytes>,
     ) -> Result<(), Error> {
         self.swarm
             .send_stream(peer_id, conn_id, stream_id, data.into())

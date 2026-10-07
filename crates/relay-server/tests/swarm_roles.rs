@@ -7,13 +7,13 @@ use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_relay_server::RelayServerAgent;
 use minip2p_swarm::{DriverError, SwarmBuilder, SwarmError, SwarmEvent};
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
+    Bytes, ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
 };
 
 #[derive(Default)]
 struct ScriptedTransport {
     events: VecDeque<TransportEvent>,
-    sent: Vec<(StreamId, Vec<u8>)>,
+    sent: Vec<(StreamId, Bytes)>,
     next_stream: u64,
 }
 
@@ -37,7 +37,7 @@ impl Transport for ScriptedTransport {
         &mut self,
         _: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
         self.sent.push((stream_id, data));
         Ok(())
@@ -103,7 +103,7 @@ fn relay_server_registers_hop_and_stop_with_directional_swarm_roles() {
             TransportEvent::StreamData {
                 id: conn_id,
                 stream_id,
-                data,
+                data: Bytes::from(data),
             },
         ]
     };

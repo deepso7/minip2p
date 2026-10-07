@@ -509,6 +509,117 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
     clippy::panic_in_result_fn,
     reason = "The loopback integration test uses assertions to retain failure context."
 )]
+fn a_write_past_the_send_caps_is_held_settled_once_and_closed_after_every_byte()
+-> Result<(), FfiError> {
+    let _serial = LOOPBACK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let protocol = "/minip2p/ffi-backpressure/1";
+    let a = P2pEndpoint::new(vec![41; 32], config_on("/ip4/127.0.0.1/tcp/0"))?;
+    let b = P2pEndpoint::new(vec![42; 32], config_on("/ip4/127.0.0.1/tcp/0"))?;
+    let a_log = Arc::new(EventLog::new(Arc::clone(&a)));
+    let b_log = Arc::new(EventLog::new(Arc::clone(&b)));
+    let b_peer = b.peer_id();
+    a.add_protocol(protocol.into())?;
+    b.add_protocol(protocol.into())?;
+    a.start(Arc::clone(&a_log) as Arc<dyn P2pEventDoorbell>)?;
+    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
+    a.connect(ConnectTarget::Addresses {
+        addresses: vec![b.listen_addrs()[0].clone()],
+    })?;
+    assert!(
+        a_log
+            .wait_for(Duration::from_secs(5), |event| matches!(
+                event,
+                P2pEvent::PeerReady { peer_id, .. } if peer_id == &b_peer
+            ))
+            .is_some()
+    );
+    let opened = a.open_stream(b_peer.clone(), protocol.into())?;
+    assert!(
+        a_log
+            .wait_for(Duration::from_secs(5), |event| matches!(
+                event,
+                P2pEvent::StreamReady { stream_id, .. } if *stream_id == opened.stream_id
+            ))
+            .is_some()
+    );
+
+    // Far past Yamux's 256 KiB stream cap, so native must hold the tail.
+    let payload: Vec<u8> = (0..4 * 1024 * 1024_usize)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let (conn_id, stream_id) = (opened.conn_id, opened.stream_id);
+    assert!(!a.send_stream(b_peer.clone(), conn_id, stream_id, payload.clone())?);
+    assert!(matches!(
+        a.send_stream(b_peer.clone(), conn_id, stream_id, vec![0]),
+        Err(FfiError::Backpressure)
+    ));
+    // Calls naming another peer are refused and leave the held tail alone.
+    let stranger = a.peer_id();
+    assert!(
+        a.reset_stream(stranger.clone(), conn_id, stream_id)
+            .is_err()
+    );
+    assert!(
+        a.abandon_stream(stranger.clone(), conn_id, stream_id)
+            .is_err()
+    );
+    assert!(a.close_stream_write(stranger, conn_id, stream_id).is_err());
+    // Requested while the tail is held, the FIN must still follow it.
+    a.close_stream_write(b_peer, conn_id, stream_id)?;
+
+    assert!(
+        a_log
+            .wait_for(Duration::from_secs(20), |event| matches!(
+                event,
+                P2pEvent::StreamWriteAccepted { stream_id: id, .. } if *id == stream_id
+            ))
+            .is_some(),
+        "the held write settles once every byte is accepted"
+    );
+    assert!(
+        b_log
+            .wait_for(Duration::from_secs(20), |event| matches!(
+                event,
+                P2pEvent::StreamRemoteWriteClosed { .. }
+            ))
+            .is_some(),
+        "the deferred FIN arrives"
+    );
+    let events = b_log.events.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut received = Vec::new();
+    for event in events.iter() {
+        match event {
+            P2pEvent::StreamData { data, .. } => received.extend_from_slice(data),
+            P2pEvent::StreamRemoteWriteClosed { .. } => break,
+            _ => {}
+        }
+    }
+    drop(events);
+    assert!(
+        received == payload,
+        "every byte arrives, in order, before the FIN"
+    );
+    let accepted = a_log
+        .events
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter(|event| matches!(event, P2pEvent::StreamWriteAccepted { .. }))
+        .count();
+    assert_eq!(accepted, 1, "one settlement per held write");
+
+    stop(&a);
+    stop(&b);
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "The loopback integration test uses assertions to retain failure context."
+)]
 fn panicking_doorbell_does_not_kill_driver() -> Result<(), FfiError> {
     let _serial = LOOPBACK_TEST_LOCK
         .lock()

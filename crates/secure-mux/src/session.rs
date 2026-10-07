@@ -3,7 +3,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::SansIoProtocol;
+use minip2p_core::{Bytes, SansIoProtocol};
 use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
 use minip2p_noise::{
@@ -45,10 +45,12 @@ pub struct SessionConfig {
 }
 
 /// Something the caller must act on.
+///
+/// Bytes to write leave separately, through
+/// [`SecureMuxSession::poll_write`], so received data never waits behind
+/// them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionOutput {
-    /// Bytes to write to the underlying ordered byte stream, in order.
-    Write(Vec<u8>),
     /// The upgrade completed and `peer` is cryptographically verified.
     ///
     /// Emitted once, before any stream output.
@@ -69,7 +71,13 @@ pub enum SessionOutput {
         /// Substream the data belongs to.
         stream: StreamId,
         /// Payload.
-        data: Vec<u8>,
+        data: Bytes,
+    },
+    /// A substream whose [`send`](SecureMuxSession::send) was Full can queue
+    /// again. Fires once per Full and never after its write side ended.
+    StreamWritable {
+        /// Substream that can accept writes again.
+        stream: StreamId,
     },
     /// The remote half-closed its write side of a substream.
     StreamRemoteWriteClosed {
@@ -116,8 +124,8 @@ pub enum SessionError {
     },
     /// Yamux rejected the operation.
     ///
-    /// Kept distinct so callers can tell a full send buffer from a fatal
-    /// protocol failure.
+    /// Kept distinct so callers can tell a full stream
+    /// ([`YamuxError::Full`]) from a fatal protocol failure.
     #[error(transparent)]
     Yamux(#[from] YamuxError),
 }
@@ -157,6 +165,41 @@ pub struct SecureMuxSession {
     yamux_config: YamuxConfig,
     phase: Option<Phase>,
     outputs: VecDeque<SessionOutput>,
+    /// Bytes ready for the underlying stream: negotiation and handshake
+    /// messages, and encrypted Yamux frames already pulled.
+    writes: WriteQueue,
+}
+
+/// Unread negotiation and handshake bytes a session holds before it fails.
+///
+/// An honest upgrade queues well under a kilobyte at a time. Without a bound,
+/// a peer that keeps proposing protocols and never reads the replies would
+/// grow this queue for as long as it kept sending, since the downstream stops
+/// pulling once its own buffer is full (ADR 0012).
+const MAX_HANDSHAKE_BACKLOG: usize = 64 * 1024;
+
+/// Byte messages for the underlying stream, with their total length.
+#[derive(Default)]
+struct WriteQueue {
+    messages: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+impl WriteQueue {
+    fn push(&mut self, message: Vec<u8>) {
+        self.bytes = self.bytes.saturating_add(message.len());
+        self.messages.push_back(message);
+    }
+
+    fn pop(&mut self) -> Option<Vec<u8>> {
+        let message = self.messages.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(message.len());
+        Some(message)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
 }
 
 impl SecureMuxSession {
@@ -187,6 +230,7 @@ impl SecureMuxSession {
                 noise: Some(noise),
             }),
             outputs: VecDeque::new(),
+            writes: WriteQueue::default(),
         }
     }
 
@@ -225,6 +269,40 @@ impl SecureMuxSession {
         self.outputs.pop_front()
     }
 
+    /// Takes the next bytes to write to the underlying stream, if any.
+    ///
+    /// Call this only while the downstream (socket buffer or circuit bridge)
+    /// has room: once the session is up, each call pulls and encrypts the
+    /// next Yamux frame, and stream bytes count against Yamux's send caps
+    /// until they are pulled here. That is what keeps ciphertext bounded
+    /// (ADR 0012). Pulling may queue [`SessionOutput::StreamWritable`].
+    ///
+    /// An error is fatal: the session cannot continue.
+    pub fn poll_write(&mut self) -> Result<Option<Vec<u8>>, SessionError> {
+        if let Some(bytes) = self.writes.pop() {
+            return Ok(Some(bytes));
+        }
+        let Some(Phase::Ready { noise, yamux, .. }) = self.phase.as_mut() else {
+            return Ok(None);
+        };
+        let Some(frame) = yamux.poll_frame() else {
+            return Ok(None);
+        };
+        let encrypted = encrypt_into(noise, frame, &mut self.writes);
+        push_yamux_events(yamux, &mut self.outputs);
+        if let Err(error) = encrypted {
+            self.phase = None;
+            return Err(error);
+        }
+        Ok(self.writes.pop())
+    }
+
+    /// Whether [`poll_write`](Self::poll_write) has bytes to hand out now.
+    pub fn has_pending_write(&self) -> bool {
+        !self.writes.is_empty()
+            || matches!(&self.phase, Some(Phase::Ready { yamux, .. }) if yamux.has_frames())
+    }
+
     /// Returns whether the upgrade has completed.
     pub fn is_established(&self) -> bool {
         matches!(self.phase, Some(Phase::Ready { .. }))
@@ -233,8 +311,8 @@ impl SecureMuxSession {
     /// Advances Yamux keepalive using the host's time sample.
     ///
     /// A no-op until the upgrade has finished: there is no Yamux session to
-    /// ping during negotiation. After that, quiet sessions emit a ping as
-    /// [`SessionOutput::Write`].
+    /// ping during negotiation. After that, quiet sessions queue a ping for
+    /// [`poll_write`](Self::poll_write).
     pub fn poll(&mut self, now: Now) -> Result<(), SessionError> {
         match self.with_yamux(|yamux| yamux.poll(now)) {
             Ok(()) | Err(SessionError::NotEstablished) => Ok(()),
@@ -267,30 +345,43 @@ impl SecureMuxSession {
     }
 
     /// Writes to a substream.
-    pub fn send(&mut self, stream: StreamId, data: Vec<u8>) -> Result<(), SessionError> {
+    ///
+    /// Accepts as much as the substream's send caps allow; the rest comes
+    /// back as [`YamuxError::Full`] with the exact unsent suffix, and a
+    /// [`SessionOutput::StreamWritable`] follows once it can queue again.
+    pub fn send(&mut self, stream: StreamId, data: Bytes) -> Result<(), SessionError> {
         let yamux_stream = yamux_stream(stream)?;
         self.with_yamux_stream(stream, move |yamux| yamux.send(yamux_stream, data))
     }
 
-    /// Half-closes the local write side of a substream.
+    /// Half-closes the local write side of a substream. A
+    /// [`SessionOutput::StreamWritable`] not yet polled for it is dropped.
     pub fn close_stream_write(&mut self, stream: StreamId) -> Result<(), SessionError> {
         let yamux_stream = yamux_stream(stream)?;
+        self.drop_writable(stream);
         self.with_yamux_stream(stream, move |yamux| yamux.close_write(yamux_stream))
     }
 
     /// Abruptly closes a substream in both directions.
     pub fn reset_stream(&mut self, stream: StreamId) -> Result<(), SessionError> {
         let yamux_stream = yamux_stream(stream)?;
+        self.drop_writable(stream);
         self.with_yamux_stream(stream, move |yamux| yamux.reset(yamux_stream))
+    }
+
+    /// Writable never follows the end of a write side.
+    fn drop_writable(&mut self, stream: StreamId) {
+        self.outputs
+            .retain(|output| *output != SessionOutput::StreamWritable { stream });
     }
 
     /// Ends the session cleanly, queueing a Yamux `GoAway` with `code`.
     ///
     /// Every open substream closes, so expect a
-    /// [`SessionOutput::StreamClosed`] for each alongside the
-    /// [`SessionOutput::Write`] carrying the frame. Draining and writing that
-    /// output is the caller's job, as is closing the underlying stream
-    /// afterwards; the session neither owns it nor knows when the bytes land.
+    /// [`SessionOutput::StreamClosed`] for each, and the frame from
+    /// [`poll_write`](Self::poll_write). Writing it is the caller's job, as is
+    /// closing the underlying stream afterwards; the session neither owns it
+    /// nor knows when the bytes land.
     ///
     /// [`SessionError::NotEstablished`] means there is no Yamux session to
     /// shut down, so the caller should simply drop the underlying stream.
@@ -306,10 +397,8 @@ impl SecureMuxSession {
     // -----------------------------------------------------------------------
 
     /// Runs `operation` against the established Yamux session and drains
-    /// whatever it produced.
-    ///
-    /// The drain runs even when the operation failed, so bytes Yamux already
-    /// queued (a reset frame, say) still reach the wire.
+    /// the events it produced. Frames it queued wait for
+    /// [`poll_write`](Self::poll_write).
     fn with_yamux<R>(
         &mut self,
         operation: impl FnOnce(&mut YamuxSession) -> Result<R, YamuxError>,
@@ -326,9 +415,18 @@ impl SecureMuxSession {
         };
 
         let result = operation(&mut yamux);
+        // A local reset of a peer-opened stream can exhaust the control
+        // reserve, which fails Yamux like a protocol error on input: flush
+        // its GoAway and leave the phase taken.
+        if let Err(error @ YamuxError::ControlReserveExhausted { .. }) = result {
+            self.drain_yamux(&mut noise, &mut yamux, true)?;
+            return Err(SessionError::protocol(format!(
+                "Yamux protocol failed: {error}"
+            )));
+        }
         // A failed drain is fatal, exactly as in `handle_input`: leave the
         // phase taken so the session cannot be used again.
-        self.drain_yamux(&mut noise, &mut yamux)?;
+        self.drain_yamux(&mut noise, &mut yamux, false)?;
         self.phase = Some(Phase::Ready { noise, yamux, peer });
         result.map_err(SessionError::Yamux)
     }
@@ -366,7 +464,7 @@ impl SecureMuxSession {
                 let mut negotiated = false;
                 while let Some(output) = select.poll_output() {
                     match output {
-                        MultistreamOutput::OutboundData(bytes) => self.write(bytes),
+                        MultistreamOutput::OutboundData(bytes) => self.write(bytes)?,
                         MultistreamOutput::Negotiated { protocol }
                             if protocol == NOISE_PROTOCOL_ID =>
                         {
@@ -482,7 +580,7 @@ impl SecureMuxSession {
                 }
                 for plaintext in decrypted {
                     let result = yamux.handle_input(YamuxInput::Data(plaintext));
-                    self.drain_yamux(&mut noise, &mut yamux)?;
+                    self.drain_yamux(&mut noise, &mut yamux, result.is_err())?;
                     result.map_err(|error| {
                         SessionError::protocol(format!("Yamux protocol failed: {error}"))
                     })?;
@@ -509,7 +607,7 @@ impl SecureMuxSession {
                 peer,
             } => {
                 let result = yamux.handle_input(YamuxInput::Data(plaintext));
-                self.drain_yamux(&mut noise, &mut yamux)?;
+                self.drain_yamux(&mut noise, &mut yamux, result.is_err())?;
                 result.map_err(|error| {
                     SessionError::protocol(format!("Yamux protocol failed: {error}"))
                 })?;
@@ -588,7 +686,7 @@ impl SecureMuxSession {
         let established_at = self.outputs.len();
         if !remaining.is_empty() {
             let handled = yamux.handle_input(YamuxInput::Data(remaining));
-            let drained = self.drain_yamux(&mut noise, &mut yamux);
+            let drained = self.drain_yamux(&mut noise, &mut yamux, handled.is_err());
             let outcome = drained.and_then(|()| {
                 handled.map_err(|error| {
                     SessionError::protocol(format!("Yamux protocol failed: {error}"))
@@ -617,7 +715,7 @@ impl SecureMuxSession {
     fn drain_raw_select(&mut self, select: &mut MultistreamSelect) -> Result<(), SessionError> {
         while let Some(output) = select.poll_output() {
             if let MultistreamOutput::OutboundData(bytes) = output {
-                self.write(bytes);
+                self.write(bytes)?;
             }
         }
         Ok(())
@@ -644,7 +742,7 @@ impl SecureMuxSession {
         let mut decrypted = Vec::new();
         while let Some(output) = noise.poll_output() {
             match output {
-                NoiseOutput::Outbound(bytes) => self.write(bytes),
+                NoiseOutput::Outbound(bytes) => self.write(bytes)?,
                 NoiseOutput::HandshakeComplete {
                     peer: authenticated,
                     ..
@@ -655,76 +753,127 @@ impl SecureMuxSession {
         Ok((peer, decrypted))
     }
 
-    /// Publishes everything Yamux has queued, then reports a remote `GoAway`.
+    /// Publishes Yamux's queued events, then reports a remote `GoAway`.
     ///
     /// A `GoAway` is followed by the terminal events for the substreams it
     /// closed, so failing on sight would swallow them: the phase stays taken
     /// after the error, and nothing would ever drain the rest. The error is
     /// held back until the queue is empty instead, which both keeps the
     /// lifecycle notifications and still kills the session.
+    ///
+    /// Frames normally wait for [`poll_write`](Self::poll_write). When Yamux
+    /// just failed (`failed`), the session is about to be dropped, so its
+    /// final frames -- the protocol `GoAway` -- are encrypted now or they
+    /// would never reach the wire.
     fn drain_yamux(
         &mut self,
         noise: &mut NoiseSession,
         yamux: &mut YamuxSession,
+        failed: bool,
     ) -> Result<(), SessionError> {
-        let mut go_away = None;
-        while let Some(output) = yamux.poll_output() {
-            match output {
-                YamuxOutput::Outbound(bytes) => self.encrypt(noise, bytes)?,
-                YamuxOutput::IncomingStream { stream } => {
-                    self.outputs.push_back(SessionOutput::IncomingStream {
-                        stream: StreamId::new(u64::from(stream)),
-                    });
-                }
-                YamuxOutput::Data { stream, data } => {
-                    self.outputs.push_back(SessionOutput::StreamData {
-                        stream: StreamId::new(u64::from(stream)),
-                        data,
-                    });
-                }
-                YamuxOutput::RemoteWriteClosed { stream } => {
-                    self.outputs
-                        .push_back(SessionOutput::StreamRemoteWriteClosed {
-                            stream: StreamId::new(u64::from(stream)),
-                        });
-                }
-                YamuxOutput::StreamClosed { stream } => {
-                    self.outputs.push_back(SessionOutput::StreamClosed {
-                        stream: StreamId::new(u64::from(stream)),
-                    });
-                }
-                YamuxOutput::GoAwayReceived { code } => {
-                    // Keep the first code: it is the one that ended the session.
-                    go_away.get_or_insert(code);
-                }
+        if failed {
+            while let Some(frame) = yamux.poll_frame() {
+                encrypt_into(noise, frame, &mut self.writes)?;
             }
         }
-        match go_away {
+        match push_yamux_events(yamux, &mut self.outputs) {
             Some(code) => Err(SessionError::GoAway { code }),
             None => Ok(()),
         }
     }
 
+    /// Encrypts and queues one negotiation message (before Yamux is up).
     fn encrypt(
         &mut self,
         noise: &mut NoiseSession,
         plaintext: Vec<u8>,
     ) -> Result<(), SessionError> {
-        noise
-            .handle_input(NoiseInput::Encrypt(plaintext))
-            .map_err(|error| SessionError::protocol(format!("Noise encryption failed: {error}")))?;
-        let (peer, decrypted) = self.drain_noise(noise)?;
-        if peer.is_some() || !decrypted.is_empty() {
+        encrypt_into(noise, plaintext, &mut self.writes)?;
+        self.check_handshake_backlog()
+    }
+
+    /// Queues one plaintext negotiation or handshake message.
+    fn write(&mut self, bytes: Vec<u8>) -> Result<(), SessionError> {
+        self.writes.push(bytes);
+        self.check_handshake_backlog()
+    }
+
+    fn check_handshake_backlog(&self) -> Result<(), SessionError> {
+        if self.writes.bytes > MAX_HANDSHAKE_BACKLOG {
             return Err(SessionError::protocol(
-                "unexpected Noise output while encrypting",
+                "peer is not reading upgrade replies; handshake backlog exceeded",
             ));
         }
         Ok(())
     }
+}
 
-    fn write(&mut self, bytes: Vec<u8>) {
-        self.outputs.push_back(SessionOutput::Write(bytes));
+/// Encrypts one plaintext into Noise transport messages appended to
+/// `writes`.
+fn encrypt_into(
+    noise: &mut NoiseSession,
+    plaintext: Vec<u8>,
+    writes: &mut WriteQueue,
+) -> Result<(), SessionError> {
+    noise
+        .handle_input(NoiseInput::Encrypt(plaintext))
+        .map_err(|error| SessionError::protocol(format!("Noise encryption failed: {error}")))?;
+    while let Some(output) = noise.poll_output() {
+        match output {
+            NoiseOutput::Outbound(bytes) => writes.push(bytes),
+            NoiseOutput::HandshakeComplete { .. } | NoiseOutput::Decrypted(_) => {
+                return Err(SessionError::protocol(
+                    "unexpected Noise output while encrypting",
+                ));
+            }
+        }
     }
+    Ok(())
+}
+
+/// Moves Yamux's queued events into `outputs`, returning the first remote
+/// `GoAway` code seen.
+fn push_yamux_events(
+    yamux: &mut YamuxSession,
+    outputs: &mut VecDeque<SessionOutput>,
+) -> Option<u32> {
+    let mut go_away = None;
+    while let Some(output) = yamux.poll_event() {
+        let stream = |id: u32| StreamId::new(u64::from(id));
+        let output = match output {
+            YamuxOutput::IncomingStream { stream: id } => {
+                SessionOutput::IncomingStream { stream: stream(id) }
+            }
+            YamuxOutput::Data { stream: id, data } => SessionOutput::StreamData {
+                stream: stream(id),
+                data: Bytes::from(data),
+            },
+            YamuxOutput::RemoteWriteClosed { stream: id } => {
+                SessionOutput::StreamRemoteWriteClosed { stream: stream(id) }
+            }
+            YamuxOutput::StreamClosed { stream: id } => {
+                // A Writable an earlier pump moved here must not follow the
+                // close; a reset or GoAway can end the stream before the
+                // caller drains it.
+                let closed = stream(id);
+                outputs
+                    .retain(|output| *output != SessionOutput::StreamWritable { stream: closed });
+                SessionOutput::StreamClosed { stream: closed }
+            }
+            YamuxOutput::Writable { stream: id } => {
+                SessionOutput::StreamWritable { stream: stream(id) }
+            }
+            YamuxOutput::GoAwayReceived { code } => {
+                // Keep the first code: it is the one that ended the session.
+                go_away.get_or_insert(code);
+                continue;
+            }
+            // `poll_event` never yields frames.
+            YamuxOutput::Outbound(_) => continue,
+        };
+        outputs.push_back(output);
+    }
+    go_away
 }
 
 /// Narrows a transport stream id to Yamux's 32-bit stream id.
@@ -756,7 +905,7 @@ mod tests {
             yamux: YamuxConfig::default(),
         });
         responder.start().expect("start responder");
-        while responder.poll_output().is_some() {}
+        while responder.poll_write().expect("write").is_some() {}
 
         let mut proposals = b"\x13/multistream/1.0.0\n\x0b/tls/1.0.0\n\x07/noise\n".to_vec();
         responder
@@ -764,14 +913,35 @@ mod tests {
             .expect("reject TLS and accept Noise on the same negotiation");
 
         assert!(matches!(responder.phase, Some(Phase::Noise { .. })));
-        let writes = core::iter::from_fn(|| responder.poll_output())
-            .filter_map(|output| match output {
-                SessionOutput::Write(bytes) => Some(bytes),
-                _ => None,
-            })
+        let writes = core::iter::from_fn(|| responder.poll_write().expect("write"))
             .flatten()
             .collect::<Vec<_>>();
         assert_eq!(writes, b"\x03na\n\x07/noise\n");
+    }
+
+    #[test]
+    fn a_peer_that_never_reads_upgrade_replies_cannot_grow_the_backlog() {
+        let mut responder = SecureMuxSession::new(SessionConfig {
+            role: SessionRole::Responder,
+            identity: Ed25519Keypair::generate(),
+            static_secret: [1; 32],
+            ephemeral_secret: [2; 32],
+            expected_peer: None,
+            yamux: YamuxConfig::default(),
+        });
+        responder.start().expect("start responder");
+        responder
+            .handle_input(b"\x13/multistream/1.0.0\n".to_vec())
+            .expect("header");
+
+        // Each refused proposal queues an `na` that nobody pulls.
+        let failed = (0..MAX_HANDSHAKE_BACKLOG)
+            .find_map(|_| responder.handle_input(b"\x0b/tls/1.0.0\n".to_vec()).err());
+        assert!(
+            matches!(failed, Some(SessionError::Protocol(ref reason)) if reason.contains("backlog")),
+            "the session fails once the backlog passes its bound: {failed:?}"
+        );
+        assert!(responder.writes.bytes <= MAX_HANDSHAKE_BACKLOG + 64);
     }
 
     /// Runs two raw Noise sessions through their handshake, returning both in
@@ -861,6 +1031,7 @@ mod tests {
                 peer: initiator_peer,
             }),
             outputs: VecDeque::new(),
+            writes: WriteQueue::default(),
         };
         let proposals = b"\x13/multistream/1.0.0\n\x0d/mplex/6.7.0\n\x0d/yamux/1.0.0\n".to_vec();
         initiator_noise
@@ -879,14 +1050,7 @@ mod tests {
             .expect("reject mplex and accept Yamux on the same negotiation");
 
         assert!(matches!(responder.phase, Some(Phase::Ready { .. })));
-        assert!(matches!(
-            responder.poll_output(),
-            Some(SessionOutput::Write(_))
-        ));
-        assert!(matches!(
-            responder.poll_output(),
-            Some(SessionOutput::Write(_))
-        ));
+        assert!(responder.poll_write().expect("write").is_some());
         assert!(matches!(
             responder.poll_output(),
             Some(SessionOutput::Established { .. })
@@ -957,6 +1121,7 @@ mod tests {
                 peer: listener_peer,
             }),
             outputs: VecDeque::new(),
+            writes: WriteQueue::default(),
         };
 
         let mut packed = echo;
@@ -1029,10 +1194,79 @@ mod tests {
 
         let outputs: Vec<SessionOutput> = core::iter::from_fn(|| dialer.poll_output()).collect();
         assert!(
-            outputs
-                .iter()
-                .all(|output| matches!(output, SessionOutput::Write(_))),
+            outputs.is_empty(),
             "a failed upgrade may leave only queued writes behind: {outputs:?}"
+        );
+    }
+
+    #[test]
+    fn a_reset_that_exhausts_the_control_reserve_fails_the_session() {
+        let initiator_key = Ed25519Keypair::generate();
+        let responder_key = Ed25519Keypair::generate();
+        let peer = responder_key.peer_id();
+        let (noise, _) = noise_pair(initiator_key, responder_key);
+        let mut yamux = YamuxSession::with_config(
+            YamuxRole::Client,
+            YamuxConfig {
+                max_pending_control: 1,
+                ..YamuxConfig::default()
+            },
+        )
+        .unwrap();
+        for stream in [2, 4] {
+            let syn = Frame::window_update(stream, FLAG_SYN, 0).unwrap();
+            yamux.handle_data(&syn.encode()).unwrap();
+        }
+        let mut session = SecureMuxSession {
+            role: SessionRole::Initiator,
+            yamux_config: YamuxConfig::default(),
+            phase: Some(Phase::Ready { noise, yamux, peer }),
+            outputs: VecDeque::new(),
+            writes: WriteQueue::default(),
+        };
+
+        session
+            .reset_stream(StreamId::new(2))
+            .expect("fits the reserve");
+        let written = session.writes.bytes;
+        let failed = session.reset_stream(StreamId::new(4));
+        assert!(
+            matches!(failed, Err(SessionError::Protocol(ref reason)) if reason.contains("reserve")),
+            "a non-reading peer's resets fail the session: {failed:?}"
+        );
+        assert!(!session.is_established());
+        assert!(session.writes.bytes > written, "the GoAway is flushed");
+    }
+
+    #[test]
+    fn a_stream_that_ends_drops_its_pending_writable() {
+        let initiator_key = Ed25519Keypair::generate();
+        let responder_key = Ed25519Keypair::generate();
+        let peer = responder_key.peer_id();
+        let (noise, _) = noise_pair(initiator_key, responder_key);
+        let mut yamux = YamuxSession::new(YamuxRole::Client);
+        let syn = Frame::window_update(2, FLAG_SYN, 0).unwrap();
+        yamux.handle_data(&syn.encode()).unwrap();
+        let stream = StreamId::new(2);
+        let mut session = SecureMuxSession {
+            role: SessionRole::Initiator,
+            yamux_config: YamuxConfig::default(),
+            phase: Some(Phase::Ready { noise, yamux, peer }),
+            // An earlier pump already moved this stream's Writable here.
+            outputs: VecDeque::from([SessionOutput::StreamWritable { stream }]),
+            writes: WriteQueue::default(),
+        };
+
+        session.go_away(0).expect("go away");
+
+        let outputs: Vec<_> = core::iter::from_fn(|| session.poll_output()).collect();
+        assert!(
+            outputs.contains(&SessionOutput::StreamClosed { stream }),
+            "{outputs:?}"
+        );
+        assert!(
+            !outputs.contains(&SessionOutput::StreamWritable { stream }),
+            "no Writable for a stream that ended: {outputs:?}"
         );
     }
 
@@ -1051,11 +1285,12 @@ mod tests {
                 peer,
             }),
             outputs: VecDeque::new(),
+            writes: WriteQueue::default(),
         };
         let stream = StreamId::new(77);
 
         for result in [
-            session.send(stream, b"data".to_vec()),
+            session.send(stream, Bytes::from_static(b"data")),
             session.close_stream_write(stream),
             session.reset_stream(stream),
         ] {

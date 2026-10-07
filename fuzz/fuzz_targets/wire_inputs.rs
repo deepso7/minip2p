@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use minip2p_autonat::{AutoNatClient, AutoNatClientInput, AutoNatServer, AutoNatServerInput};
 use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport};
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, SansIoProtocol, TransportKind};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId, Protocol, SansIoProtocol, TransportKind};
 use minip2p_dcutr::{FrameDecode as DcutrFrame, HolePunch};
 use minip2p_discovery::{
     Beacon, BeaconAgent, BeaconConfig, BeaconEvent, DiscoverySource, Observation,
@@ -133,7 +133,7 @@ fn fuzz_pubsub(data: &[u8]) {
             peer_id: remote,
             conn_id: ConnectionId::new(1),
             stream_id,
-            data: data.to_vec(),
+            data: Bytes::copy_from_slice(data),
         },
         1,
     );
@@ -205,7 +205,7 @@ impl Transport for FuzzTransport {
         &mut self,
         _id: ConnectionId,
         _stream_id: StreamId,
-        _data: Vec<u8>,
+        _data: Bytes,
     ) -> Result<(), TransportError> {
         Ok(())
     }
@@ -317,6 +317,7 @@ fn fuzz_secure_mux(data: &[u8]) {
                     established = true;
                 }
             }
+            while let Ok(Some(_)) = session.poll_write() {}
         }
 
         // An unauthenticated peer must never reach the established state from
@@ -352,18 +353,31 @@ fn fuzz_circuit(data: &[u8]) {
             relay: relay.clone(),
             remote_peer: remote.clone(),
             role,
-            pending_data: NOISE_SELECTION[..1].to_vec(),
+            pending_data: Bytes::copy_from_slice(&NOISE_SELECTION[..1]),
+            unsent_prefix: Bytes::new(),
             remote_write_closed: false,
         });
         for chunk in NOISE_SELECTION[1..].chunks(chunk_len) {
-            transport.inject_bridge_data(ConnectionId::new(1), StreamId::new(1), chunk.to_vec());
+            transport.inject_bridge_data(
+                ConnectionId::new(1),
+                StreamId::new(1),
+                Bytes::copy_from_slice(chunk),
+            );
         }
         for chunk in data.chunks(chunk_len) {
-            transport.inject_bridge_data(ConnectionId::new(1), StreamId::new(1), chunk.to_vec());
+            transport.inject_bridge_data(
+                ConnectionId::new(1),
+                StreamId::new(1),
+                Bytes::copy_from_slice(chunk),
+            );
         }
         transport.inject_bridge_remote_write_closed(ConnectionId::new(1), StreamId::new(1));
         transport.inject_bridge_closed(ConnectionId::new(1), StreamId::new(1));
-        transport.inject_bridge_data(ConnectionId::new(1), StreamId::new(1), data.to_vec());
+        transport.inject_bridge_data(
+            ConnectionId::new(1),
+            StreamId::new(1),
+            Bytes::copy_from_slice(data),
+        );
         let _ = transport.poll(Now::from_millis(0));
     }
 }

@@ -12,7 +12,7 @@ use minip2p::{
 };
 use minip2p_platform::{Clock, StdClock, StdEntropy};
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
-use minip2p_transport::{ConnectionId, Transport, TransportError, TransportEvent};
+use minip2p_transport::{Bytes, ConnectionId, Transport, TransportError, TransportEvent};
 
 #[path = "../../../tests/support/endpoint.rs"]
 mod endpoint_support;
@@ -177,6 +177,7 @@ fn event_connection(event: &TransportEvent) -> Option<ConnectionId> {
         | TransportEvent::StreamOpened { id, .. }
         | TransportEvent::IncomingStream { id, .. }
         | TransportEvent::StreamData { id, .. }
+        | TransportEvent::StreamWritable { id, .. }
         | TransportEvent::StreamRemoteWriteClosed { id, .. }
         | TransportEvent::StreamWriteStopped { id, .. }
         | TransportEvent::StreamClosed { id, .. }
@@ -205,7 +206,7 @@ impl<T: Transport> Transport for ReverseFirstTwo<T> {
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
         self.inner.send_stream(id, stream_id, data)
     }

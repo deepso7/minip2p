@@ -14,6 +14,7 @@ import {
   PeerDisconnectedError,
   StreamClosedError,
   TimeoutError,
+  WriteBufferFullError,
 } from "./errors.js";
 import { P2pEvent_Tags, PathKind_Tags } from "./types.js";
 import type {
@@ -51,6 +52,29 @@ const EVENT_FLUSH_BATCH = 256;
 const CONNECT_TERMINAL_CAP = 1024;
 const STREAM_CHUNK_CAP = 64;
 const STREAM_BYTE_CAP = 1024 * 1024;
+/** Default per-stream write high-water mark: one Yamux stream send cap. */
+const DEFAULT_WRITE_HIGH_WATER_MARK = 256 * 1024;
+
+/** Native events routed to one {@link Stream} after it became ready. */
+const STREAM_EVENT_TAGS = [
+  P2pEvent_Tags.StreamData,
+  P2pEvent_Tags.StreamRemoteWriteClosed,
+  P2pEvent_Tags.StreamWriteAccepted,
+  P2pEvent_Tags.StreamWriteStopped,
+  P2pEvent_Tags.StreamClosed,
+] as const;
+type StreamP2pEvent = Extract<
+  P2pEvent,
+  { readonly tag: (typeof STREAM_EVENT_TAGS)[number] }
+>;
+const isStreamEvent = (event: P2pEvent): event is StreamP2pEvent =>
+  (STREAM_EVENT_TAGS as readonly string[]).includes(event.tag);
+
+interface PendingWrite {
+  readonly data: Uint8Array;
+  readonly resolve: () => void;
+  readonly reject: (error: unknown) => void;
+}
 
 type EventKind = keyof Minip2pNamedEventMap;
 type AnyPayload = Minip2pNamedEventMap[EventKind];
@@ -187,6 +211,21 @@ export class Stream {
   #mode: "pull" | "flowing" | undefined;
   #receiveState: StreamReceiveState = { kind: "receiving" };
   #closed = false;
+  /** Writes not yet accepted by native, oldest (possibly in flight) first. */
+  readonly #writes: PendingWrite[] = [];
+  #writeBytes = 0;
+  /** Native holds the head write's tail until `StreamWriteAccepted`. */
+  #writeInFlight = false;
+  /** Why later writes fail: `closeWrite`, a remote stop, or a terminal. */
+  #writeEnded: Error | undefined;
+  #closeWriteQueued = false;
+
+  /**
+   * Most bytes the stream buffers before {@link write} rejects with
+   * {@link WriteBufferFullError}, counting the write native is still taking.
+   * A write into an empty buffer is always admitted, whatever its size.
+   */
+  writeHighWaterMark = DEFAULT_WRITE_HIGH_WATER_MARK;
 
   constructor(
     backend: Minip2pBackend,
@@ -262,24 +301,62 @@ export class Stream {
     });
   }
 
-  /** Writes UTF-8 text or bytes to the stream. */
-  write(data: string | Bytes): void {
+  /**
+   * Writes UTF-8 text or bytes to the stream, resolving once native has
+   * accepted every byte. Writes are delivered in call order.
+   *
+   * Rejects with {@link WriteBufferFullError} when the stream already
+   * buffers {@link writeHighWaterMark} bytes (a first write is always
+   * admitted, so a payload larger than the mark can still be sent), and with
+   * a closed error after `closeWrite()`, a remote stop, or the stream
+   * closing. If event loss strands a write in flight, the stream is reset
+   * and the write rejects with {@link EventQueueOverflowError}.
+   *
+   * A write queued behind a pending one keeps a reference to `data`, and
+   * native reads it only when the write reaches the head of the queue: leave
+   * the buffer untouched until the Promise settles.
+   */
+  write(data: string | Bytes): Promise<void> {
     if (this.#closed) {
-      throw new ClosedError();
+      return Promise.reject(new ClosedError());
     }
-    this.#backend.sendStream(
-      this.peerId,
-      this.connId,
-      this.streamId,
-      toUint8Array(data)
-    );
+    if (this.#writeEnded !== undefined) {
+      return Promise.reject(this.#writeEnded);
+    }
+    const bytes = toUint8Array(data);
+    if (
+      this.#writeBytes > 0 &&
+      this.#writeBytes + bytes.byteLength > this.writeHighWaterMark
+    ) {
+      return Promise.reject(
+        new WriteBufferFullError(this.#writeBytes, this.writeHighWaterMark)
+      );
+    }
+    return new Promise((resolve, reject) => {
+      this.#writes.push({ data: bytes, reject, resolve });
+      this.#writeBytes += bytes.byteLength;
+      this.#pumpWrites();
+    });
   }
 
-  /** Half-closes the local write side while keeping reads available. */
+  /**
+   * Half-closes the local write side once every earlier write has been
+   * accepted, keeping reads available. Later writes reject.
+   *
+   * With no write pending the close goes to native now and throws if native
+   * refuses it. Behind pending writes it is queued, and a close native then
+   * refuses is reported by the stream's terminal event instead.
+   */
   closeWrite(): void {
-    if (!this.#closed) {
-      this.#backend.closeStreamWrite(this.peerId, this.connId, this.streamId);
+    if (this.#closed || this.#writeEnded !== undefined) {
+      return;
     }
+    this.#writeEnded = new StreamClosedError("The stream write side closed");
+    if (this.#writes.length === 0) {
+      this.#backend.closeStreamWrite(this.peerId, this.connId, this.streamId);
+      return;
+    }
+    this.#closeWriteQueued = true;
   }
 
   /** Abruptly resets the stream and emits `closed`. */
@@ -350,6 +427,55 @@ export class Stream {
     this.#fifoBytes += chunk.byteLength;
   }
 
+  /**
+   * Native accepted the whole in-flight write.
+   * @internal
+   */
+  writeAccepted(): void {
+    if (!this.#writeInFlight) {
+      return;
+    }
+    this.#writeInFlight = false;
+    this.#settleHead();
+    this.#pumpWrites();
+  }
+
+  /**
+   * Event loss may have taken this stream's write settlement or terminal
+   * with it, so an in-flight write can no longer complete. Resets the stream
+   * and fails its writes with `error`; a stream with no write in flight is
+   * untouched.
+   * @internal
+   */
+  writesLost(error: unknown): void {
+    if (this.#closed || !this.#writeInFlight) {
+      return;
+    }
+    try {
+      this.#backend.resetStream(this.peerId, this.connId, this.streamId);
+    } catch {
+      // The stream may already be gone natively; the outcome is the same.
+    }
+    this.terminal(error);
+  }
+
+  /**
+   * The remote asked this side to stop writing.
+   * @internal
+   */
+  writeStopped(errorCode: bigint): void {
+    if (this.#closed) {
+      return;
+    }
+    const error = new StreamClosedError(
+      `The remote stopped reading this stream (code ${errorCode})`
+    );
+    this.#writeEnded ??= error;
+    this.#closeWriteQueued = false;
+    this.#failWrites(error);
+    this.#emit("writeStopped", { errorCode });
+  }
+
   /** @internal */
   remoteWriteClosed(): void {
     if (this.#closed || this.#receiveState.kind !== "receiving") {
@@ -373,6 +499,7 @@ export class Stream {
       return;
     }
     this.#closed = true;
+    this.#failWrites(error);
     // StreamClosed carries no cause. Once the remote FIN establishes EOF,
     // later full closure cannot reinterpret that receive-side outcome.
     const hasRemoteEof =
@@ -392,6 +519,66 @@ export class Stream {
     this.#emit("closed");
     this.#listeners.clear();
     this.#onTerminal();
+  }
+
+  /**
+   * Hands queued writes to native one at a time. A write native accepts only
+   * in part stays at the head until `StreamWriteAccepted`, which keeps
+   * writes, and the queued close, in order.
+   */
+  #pumpWrites(): void {
+    while (!this.#writeInFlight && !this.#closed) {
+      const [head] = this.#writes;
+      if (head === undefined) {
+        if (this.#closeWriteQueued) {
+          this.#closeWriteQueued = false;
+          try {
+            this.#backend.closeStreamWrite(
+              this.peerId,
+              this.connId,
+              this.streamId
+            );
+          } catch {
+            // A deferred close has no caller left to throw to; the stream
+            // already ended, and its terminal event reports that.
+          }
+        }
+        return;
+      }
+      let accepted: boolean;
+      try {
+        accepted = this.#backend.sendStream(
+          this.peerId,
+          this.connId,
+          this.streamId,
+          head.data
+        );
+      } catch (error) {
+        this.#failWrites(error);
+        return;
+      }
+      if (!accepted) {
+        this.#writeInFlight = true;
+        return;
+      }
+      this.#settleHead();
+    }
+  }
+
+  #settleHead(): void {
+    const head = this.#writes.shift();
+    if (head !== undefined) {
+      this.#writeBytes -= head.data.byteLength;
+      head.resolve();
+    }
+  }
+
+  #failWrites(error: unknown): void {
+    this.#writeInFlight = false;
+    this.#writeBytes = 0;
+    for (const write of this.#writes.splice(0)) {
+      write.reject(error);
+    }
   }
 
   #flushFlowing(): void {
@@ -433,6 +620,8 @@ export interface StreamEventMap {
   remoteWriteClosed: void;
   /** The stream reached a terminal state. */
   closed: void;
+  /** The remote asked this side to stop writing; pending writes rejected. */
+  writeStopped: { readonly errorCode: bigint };
   /** Incoming data exceeded the bounded pull-read buffer. */
   dataOverflow: {
     readonly droppedChunks: number;
@@ -1085,6 +1274,7 @@ export class Minip2pBase {
       ping.cancel(error);
     }
     this.#pings.clear();
+    this.#writesLost(error);
     // Connection attempts correlate exactly: only a dropped terminal, or a
     // dropped native loss report naming it, settles its attempt.
     if (dropped.source === "native") {
@@ -1109,6 +1299,13 @@ export class Minip2pBase {
       }
     }
     this.#pendingOpens.clear();
+  }
+
+  /** Fails every stream whose in-flight write may have lost its settlement. */
+  #writesLost(error: EventQueueOverflowError): void {
+    for (const stream of [...this.#streams.values()]) {
+      stream.writesLost(error);
+    }
   }
 
   #enqueueNative(event: P2pEvent): void {
@@ -1204,11 +1401,7 @@ export class Minip2pBase {
       this.#streamReady(event.inner);
       return;
     }
-    if (
-      event.tag === P2pEvent_Tags.StreamData ||
-      event.tag === P2pEvent_Tags.StreamRemoteWriteClosed ||
-      event.tag === P2pEvent_Tags.StreamClosed
-    ) {
+    if (isStreamEvent(event)) {
       this.#streamEvent(event);
       return;
     }
@@ -1240,6 +1433,7 @@ export class Minip2pBase {
     }
     if (event.tag === P2pEvent_Tags.EventsDropped) {
       this.#connectResultsLost(event.inner.terminalConnectIds);
+      this.#writesLost(new EventQueueOverflowError());
     }
 
     const normalized = normalizeEvent(event);
@@ -1366,17 +1560,7 @@ export class Minip2pBase {
     }
   }
 
-  #streamEvent(
-    event: Extract<
-      P2pEvent,
-      {
-        readonly tag:
-          | typeof P2pEvent_Tags.StreamData
-          | typeof P2pEvent_Tags.StreamRemoteWriteClosed
-          | typeof P2pEvent_Tags.StreamClosed;
-      }
-    >
-  ): void {
+  #streamEvent(event: StreamP2pEvent): void {
     const { peerId, connId, streamId } = event.inner;
     const stream = this.#streams.get(streamKey(peerId, connId, streamId));
     if (event.tag === P2pEvent_Tags.StreamClosed) {
@@ -1392,6 +1576,10 @@ export class Minip2pBase {
       });
     } else if (event.tag === P2pEvent_Tags.StreamData) {
       stream?.receive(event.inner.data);
+    } else if (event.tag === P2pEvent_Tags.StreamWriteAccepted) {
+      stream?.writeAccepted();
+    } else if (event.tag === P2pEvent_Tags.StreamWriteStopped) {
+      stream?.writeStopped(event.inner.errorCode);
     } else {
       stream?.remoteWriteClosed();
     }
@@ -1677,14 +1865,12 @@ function toBackendTarget(target: ConnectTarget): BackendConnectTarget {
 function normalizeEvent(
   event: Exclude<
     P2pEvent,
-    {
-      readonly tag:
-        | typeof P2pEvent_Tags.DriverFailed
-        | typeof P2pEvent_Tags.StreamReady
-        | typeof P2pEvent_Tags.StreamData
-        | typeof P2pEvent_Tags.StreamRemoteWriteClosed
-        | typeof P2pEvent_Tags.StreamClosed;
-    }
+    | StreamP2pEvent
+    | {
+        readonly tag:
+          | typeof P2pEvent_Tags.DriverFailed
+          | typeof P2pEvent_Tags.StreamReady;
+      }
   >
 ):
   | {

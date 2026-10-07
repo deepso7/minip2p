@@ -14,6 +14,7 @@ export {
   PeerDisconnectedError,
   StreamClosedError,
   TimeoutError,
+  WriteBufferFullError,
 } from "./errors.js";
 export { Minip2pBase, Stream, type StreamEventMap } from "./sdk.js";
 export {

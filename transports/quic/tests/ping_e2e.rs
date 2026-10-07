@@ -7,7 +7,7 @@ use minip2p_ping::{
     PING_PAYLOAD_LEN, PING_PROTOCOL_ID, PingAction, PingEvent, PingInput, PingOutput, PingProtocol,
 };
 use minip2p_quic::QuicTransport;
-use minip2p_transport::{ConnectionId, StreamId, Transport, TransportEvent};
+use minip2p_transport::{Bytes, ConnectionId, StreamId, Transport, TransportEvent};
 
 mod common;
 use common::{drive_pair_once, setup_pair};
@@ -23,7 +23,7 @@ fn apply_ping_actions(
                 stream_id, data, ..
             } => {
                 transport
-                    .send_stream(connection_id, stream_id, data.to_vec())
+                    .send_stream(connection_id, stream_id, Bytes::copy_from_slice(&data))
                     .expect("send ping payload");
             }
             PingAction::CloseStreamWrite { stream_id, .. } => {
@@ -160,7 +160,7 @@ impl PingHarness {
         for output in multistream_start(&mut client_negotiator) {
             if let MultistreamOutput::OutboundData(bytes) = output {
                 client
-                    .send_stream(client_conn_id, client_stream, bytes)
+                    .send_stream(client_conn_id, client_stream, Bytes::from(bytes))
                     .expect("send dialer multistream header");
             }
         }
@@ -197,12 +197,16 @@ impl PingHarness {
                 {
                     assert_eq!(id, client_conn_id);
                     if !client_negotiated {
-                        let outputs = multistream_receive(&mut client_negotiator, data);
+                        let outputs = multistream_receive(&mut client_negotiator, data.to_vec());
                         for output in outputs {
                             match output {
                                 MultistreamOutput::OutboundData(bytes) => {
                                     client
-                                        .send_stream(client_conn_id, client_stream, bytes)
+                                        .send_stream(
+                                            client_conn_id,
+                                            client_stream,
+                                            Bytes::from(bytes),
+                                        )
                                         .expect("send dialer negotiation bytes");
                                 }
                                 MultistreamOutput::Negotiated { protocol } => {
@@ -323,7 +327,7 @@ impl PingHarness {
                     for output in start_outputs {
                         if let MultistreamOutput::OutboundData(bytes) = output {
                             server
-                                .send_stream(server_conn_id, *stream_id, bytes)
+                                .send_stream(server_conn_id, *stream_id, Bytes::from(bytes))
                                 .expect("send listener multistream header");
                         }
                     }
@@ -335,14 +339,14 @@ impl PingHarness {
                 } => {
                     assert_eq!(*id, server_conn_id);
                     if let Some(negotiator) = negotiators.get_mut(stream_id) {
-                        let outputs = multistream_receive(negotiator, data.clone());
+                        let outputs = multistream_receive(negotiator, data.to_vec());
                         let mut negotiated_ping = false;
 
                         for output in outputs {
                             match output {
                                 MultistreamOutput::OutboundData(bytes) => {
                                     server
-                                        .send_stream(server_conn_id, *stream_id, bytes)
+                                        .send_stream(server_conn_id, *stream_id, Bytes::from(bytes))
                                         .expect("send listener negotiation bytes");
                                 }
                                 MultistreamOutput::Negotiated { protocol } => {
@@ -378,7 +382,7 @@ impl PingHarness {
                             PingInput::StreamData {
                                 peer_id: peer_addr.peer_id().clone(),
                                 stream_id: *stream_id,
-                                data: data.clone(),
+                                data: data.to_vec(),
                                 now_ms: start.elapsed().as_millis() as u64,
                             },
                             server,
@@ -525,7 +529,7 @@ fn ping_roundtrip_after_identity_verification_and_multistream_negotiation() {
                         PingInput::StreamData {
                             peer_id: peer_id.clone(),
                             stream_id,
-                            data,
+                            data: data.to_vec(),
                             now_ms: now,
                         },
                         &mut h.client,
@@ -653,7 +657,7 @@ fn repeated_ping_on_same_stream_then_close_write_exits_listener_loop() {
                         PingInput::StreamData {
                             peer_id: peer_id.clone(),
                             stream_id,
-                            data,
+                            data: data.to_vec(),
                             now_ms: now,
                         },
                         &mut h.client,

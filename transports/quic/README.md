@@ -14,7 +14,8 @@ No async runtime required. The host drives the transport by calling `poll(now)` 
   - `send_stream`
   - `close_stream_write`
   - `reset_stream`
-- Stream events (`StreamOpened`, `IncomingStream`, `StreamData`, `StreamRemoteWriteClosed`, `StreamWriteStopped`, `StreamClosed`).
+- Stream events (`StreamOpened`, `IncomingStream`, `StreamData`, `StreamWritable`, `StreamRemoteWriteClosed`, `StreamWriteStopped`, `StreamClosed`).
+- Write backpressure (ADR 0012): `send_stream` takes what quiche accepts now plus what fits `QuicLimits::max_pending_stream_bytes`, whatever the peer's credit, and returns `TransportError::Full` with the exact unsent tail for the rest. `StreamWritable` fires for every armed stream once at least half of that queue is free again.
 - Stream errors stay stream-scoped: a peer's STOP_SENDING drops that stream's queued writes and emits `StreamWriteStopped` while the read half stays open; writes waiting on peer credit stay queued; any other quiche stream-send error hit while draining closes only its connection. A quiche packet-send failure can still fail `poll()`.
 - Mutual libp2p TLS peer authentication. Dialing and listening require a configured Ed25519 keypair.
 - Automatic peer-id verification from libp2p TLS certificates. `Connected` carries the verified endpoint; `PeerIdentityVerified` is also emitted when the peer index is bound or updated.
@@ -33,7 +34,7 @@ No async runtime required. The host drives the transport by calling `poll(now)` 
 ```rust
 use minip2p_identity::Ed25519Keypair;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
-use minip2p_transport::Transport;
+use minip2p_transport::{Bytes, Transport};
 
 let listener_key = Ed25519Keypair::generate();
 let listener_cfg = QuicNodeConfig::new(listener_key.clone());
@@ -49,7 +50,7 @@ let peer_addr = minip2p_core::PeerAddr::new(
 )?;
 let conn_id = dialer.dial(&peer_addr)?;
 let stream_id = dialer.open_stream(conn_id)?;
-dialer.send_stream(conn_id, stream_id, b"hello".to_vec())?;
+dialer.send_stream(conn_id, stream_id, Bytes::from_static(b"hello"))?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

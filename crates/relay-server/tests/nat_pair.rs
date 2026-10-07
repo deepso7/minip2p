@@ -14,7 +14,7 @@ use minip2p_relay_server::{
     RelayServerAction, RelayServerAgent, RelayServerConfig, RelayServerEvent, StreamKey,
 };
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 const CLIENT_RELAY_CONN: ConnectionId = ConnectionId::new(1);
 const SOURCE_RELAY_CONN: ConnectionId = ConnectionId::new(11);
@@ -94,7 +94,7 @@ fn relay_send(server: &mut RelayServerAgent, ms: u64) -> (StreamKey, Vec<u8>) {
         panic!("expected relay SendStream action")
     };
     server.send_stream_result(token, Ok(()), server_now(ms));
-    (stream, data)
+    (stream, data.to_vec())
 }
 
 fn finish_relay_stream_cleanup(server: &mut RelayServerAgent, ms: u64) {
@@ -219,7 +219,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
             peer_id: destination.clone(),
             conn_id: DESTINATION_RELAY_CONN,
             stream_id: reserve_hop,
-            data: reserve_request,
+            data: Bytes::from(reserve_request),
         },
         false,
         server_now(5),
@@ -230,7 +230,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
             peer_id: relay.clone(),
             conn_id: CLIENT_RELAY_CONN,
             stream_id: reserve_hop,
-            data: reserve_response,
+            data: Bytes::from(reserve_response),
         },
         nat_now(6),
     );
@@ -273,7 +273,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
             peer_id: source.clone(),
             conn_id: SOURCE_RELAY_CONN,
             stream_id: source_hop,
-            data: connect_request,
+            data: Bytes::from(connect_request),
         },
         false,
         server_now(15),
@@ -310,7 +310,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
             peer_id: relay.clone(),
             conn_id: CLIENT_RELAY_CONN,
             stream_id: StreamId::new(DESTINATION_STOP),
-            data: stop_request,
+            data: Bytes::from(stop_request),
         },
         nat_now(17),
     );
@@ -322,7 +322,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
             peer_id: destination.clone(),
             conn_id: DESTINATION_RELAY_CONN,
             stream_id: StreamId::new(DESTINATION_STOP),
-            data: stop_response,
+            data: Bytes::from(stop_response),
         },
         false,
         server_now(18),
@@ -333,7 +333,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
             peer_id: relay.clone(),
             conn_id: CLIENT_RELAY_CONN,
             stream_id: source_hop,
-            data: hop_response,
+            data: Bytes::from(hop_response),
         },
         nat_now(19),
     );
@@ -347,7 +347,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
             peer_id: source.clone(),
             conn_id: SOURCE_RELAY_CONN,
             stream_id: source_hop,
-            data: source_payload.clone(),
+            data: Bytes::from(source_payload.clone()),
         },
         false,
         server_now(20),
@@ -362,7 +362,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
             peer_id: destination.clone(),
             conn_id: DESTINATION_RELAY_CONN,
             stream_id: StreamId::new(DESTINATION_STOP),
-            data: destination_payload.clone(),
+            data: Bytes::from(destination_payload.clone()),
         },
         false,
         server_now(21),

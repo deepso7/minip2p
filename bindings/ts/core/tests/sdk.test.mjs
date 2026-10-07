@@ -24,6 +24,7 @@ import {
   Stream,
   StreamClosedError,
   TimeoutError,
+  WriteBufferFullError,
 } from "../src/index.ts";
 
 class TestMinip2p extends Minip2pBase {
@@ -900,7 +901,7 @@ test("stream FIFO counts only queued data and cleans up after terminal", async (
     tag: P2pEvent_Tags.StreamClosed,
   });
   await tick();
-  assert.throws(() => stream.write("late"), ClosedError);
+  await assert.rejects(stream.write("late"), ClosedError);
   stream.closeWrite();
   stream.reset();
   stream.abandon();
@@ -1116,9 +1117,10 @@ test("local stream reset and abandon emit closed exactly once", async () => {
     backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
     const stream = await opening;
     let closed = 0;
+    let lateWrite;
     stream.on("closed", () => {
       closed += 1;
-      assert.throws(() => stream.write("late"), ClosedError);
+      lateWrite = stream.write("late");
       stream.reset();
       stream.abandon();
     });
@@ -1128,6 +1130,7 @@ test("local stream reset and abandon emit closed exactly once", async () => {
     stream[operation]();
 
     assert.equal(closed, 1);
+    await assert.rejects(lateWrite, ClosedError);
     assert.deepEqual(backend.operations, [[operation, "peer", 2, 3]]);
     await assert.rejects(reading, ClosedError);
     await assert.rejects(stream.read(), ClosedError);
@@ -1171,7 +1174,7 @@ test("abandon tolerates a native close before its event is dispatched", async ()
   });
 
   assert.doesNotThrow(() => stream.abandon());
-  assert.throws(() => stream.write("closed"), ClosedError);
+  await assert.rejects(stream.write("closed"), ClosedError);
   endpoint.close();
 });
 
@@ -1574,4 +1577,127 @@ test("driver failure rejects work and reports a distinct close reason", async ()
   await assert.rejects(waiting, DriverFailedError);
   assert.equal(reason.reason, "driverFailed");
   assert.ok(reason.error instanceof DriverFailedError);
+});
+
+async function openedStream(backend) {
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  return { endpoint, stream: await opening };
+}
+
+function streamWriteEvent(tag, extra = {}) {
+  return { inner: { connId: 2, peerId: "peer", streamId: 3, ...extra }, tag };
+}
+
+test("a write native holds resolves on StreamWriteAccepted and keeps later writes and the close behind it", async () => {
+  const backend = new MockBackend();
+  const { endpoint, stream } = await openedStream(backend);
+  backend.sendResults = [false];
+
+  const first = stream.write("first");
+  const second = stream.write("second");
+  stream.closeWrite();
+  assert.equal(await remainsPending(first), true);
+  assert.deepEqual(
+    backend.operations.map(([kind]) => kind),
+    ["write"],
+    "nothing overtakes the pending write"
+  );
+  await assert.rejects(stream.write("late"), StreamClosedError);
+
+  backend.emit(streamWriteEvent(P2pEvent_Tags.StreamWriteAccepted));
+  await first;
+  await second;
+  assert.deepEqual(
+    backend.operations.map(([kind]) => kind),
+    ["write", "write", "closeWrite"],
+    "the FIN follows every accepted write"
+  );
+  endpoint.close();
+});
+
+test("closeWrite throws a native refusal when nothing is pending, and defers it otherwise", async () => {
+  const backend = new MockBackend();
+  const { endpoint, stream } = await openedStream(backend);
+  const refusal = new Error("stream gone");
+  backend.closeWriteError = refusal;
+  assert.throws(() => stream.closeWrite(), refusal);
+
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 4 }));
+  const queued = await opening;
+  backend.sendResults = [false];
+  const write = queued.write("held");
+  queued.closeWrite();
+  backend.emit(
+    streamWriteEvent(P2pEvent_Tags.StreamWriteAccepted, { streamId: 4 })
+  );
+  await write;
+  assert.equal(backend.operations.at(-1)[0], "closeWrite");
+  endpoint.close();
+});
+
+test("writes past the high-water mark reject with WriteBufferFullError", async () => {
+  const backend = new MockBackend();
+  const { endpoint, stream } = await openedStream(backend);
+  stream.writeHighWaterMark = 8;
+  backend.sendResults = [false];
+
+  // An empty buffer admits any write, so a large payload can still go out.
+  const big = stream.write(new Uint8Array(16));
+  const refused = stream.write(new Uint8Array(1));
+  await assert.rejects(refused, (error) => {
+    assert.ok(error instanceof WriteBufferFullError);
+    assert.equal(error.buffered, 16);
+    assert.equal(error.highWaterMark, 8);
+    return true;
+  });
+
+  backend.emit(streamWriteEvent(P2pEvent_Tags.StreamWriteAccepted));
+  await big;
+  await stream.write(new Uint8Array(8));
+  endpoint.close();
+});
+
+test("EventsDropped resets a stream whose write is still in flight", async () => {
+  const backend = new MockBackend();
+  const { endpoint, stream } = await openedStream(backend);
+  backend.sendResults = [false];
+  const pending = stream.write("held");
+  const queued = stream.write("queued");
+
+  // The lost batch may have held this stream's settlement or terminal.
+  backend.emit({
+    inner: { dropped: 1, terminalConnectIds: [], totalDropped: 1 },
+    tag: P2pEvent_Tags.EventsDropped,
+  });
+
+  await assert.rejects(pending, EventQueueOverflowError);
+  await assert.rejects(queued, EventQueueOverflowError);
+  assert.deepEqual(
+    backend.operations.map(([kind]) => kind),
+    ["write", "reset"]
+  );
+  endpoint.close();
+});
+
+test("a remote write stop or a stream close rejects pending writes", async () => {
+  for (const [tag, extra] of [
+    [P2pEvent_Tags.StreamWriteStopped, { errorCode: 7n }],
+    [P2pEvent_Tags.StreamClosed, {}],
+  ]) {
+    const backend = new MockBackend();
+    const { endpoint, stream } = await openedStream(backend);
+    backend.sendResults = [false];
+    const pending = stream.write("held");
+    const queued = stream.write("queued");
+
+    backend.emit(streamWriteEvent(tag, extra));
+
+    await assert.rejects(pending);
+    await assert.rejects(queued);
+    await assert.rejects(stream.write("later"));
+    endpoint.close();
+  }
 });

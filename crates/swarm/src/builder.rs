@@ -232,7 +232,7 @@ mod tests {
             &mut self,
             _: ConnectionId,
             _: StreamId,
-            _: Vec<u8>,
+            _: minip2p_core::Bytes,
         ) -> Result<(), TransportError> {
             Err(TransportError::Unsupported {
                 operation: "send_stream",

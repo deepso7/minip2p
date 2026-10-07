@@ -142,8 +142,9 @@ Promise operations use `{ timeoutMs?, signal? }`. Their default timeout is 65 se
 | `initiatedLocally` | Whether this endpoint opened the stream. |
 | `read()` | Next `Uint8Array`, or `undefined` after remote half-close. |
 | `on("data", handler)` | Flowing read mode; mutually exclusive with `read()`. |
-| `write(stringOrBytes)` | Send UTF-8 text or bytes. |
-| `closeWrite()` | Graceful local half-close. |
+| `write(stringOrBytes)` | Send UTF-8 text or bytes; resolves once every byte is accepted. Rejects with `WriteBufferFullError` when bytes are already buffered and the write would push them past `writeHighWaterMark`. A queued write reads its buffer only when it reaches native, so leave the buffer untouched until the Promise settles. |
+| `writeHighWaterMark` | Bytes a stream buffers before `write` rejects (default 256 KiB, counting the in-flight write). A write into an empty buffer is always admitted, whatever its size. |
+| `closeWrite()` | Graceful local half-close after every earlier write. Throws if native refuses it while no write is pending; a close queued behind writes reports failure through the stream's terminal event. |
 | `reset()` | Abrupt reset. |
 | `abandon()` | Reset and relinquish the handle. |
 
@@ -186,6 +187,7 @@ Use `instanceof` for control flow and the typed `kind` fields for telemetry.
 | `PeerDisconnectedError` | The peer disconnected during a pending operation. |
 | `OpenStreamError` | Opening or negotiation failed, with structured peer/stream context. |
 | `StreamClosedError` | A stream closed before outbound negotiation completed. |
+| `WriteBufferFullError` | A stream `write` would push buffered bytes past `writeHighWaterMark`; includes `buffered` and `highWaterMark`. Await earlier writes before writing more. |
 | `BackpressureError` | The outbound pubsub queue is full. |
 | `MessageTooLargeError` | A payload exceeds the protocol limit. |
 | `NotPermittedError` | Endpoint policy rejected the operation. |

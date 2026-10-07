@@ -1246,6 +1246,7 @@ dependencies = [
 name = "minip2p-core"
 version = "0.7.4"
 dependencies = [
+ "bytes",
  "criterion",
  "gungraun",
  "minip2p-identity",
@@ -1295,6 +1296,7 @@ dependencies = [
 name = "minip2p-ffi-core"
 version = "0.7.4"
 dependencies = [
+ "minip2p-core",
  "minip2p-pubsub",
  "minip2p-relay",
  "minip2p-rs",

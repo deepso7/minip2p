@@ -112,6 +112,43 @@ match event {
 }
 ```
 
+## Write backpressure
+
+`send_stream` accepts anything that converts into `Bytes` and queues as much as the stream can take. When not every byte fit it returns `Error::Full` with the exact unsent tail. That is backpressure, not a failure: keep the tail and send it again when `EndpointEvent::StreamWritable` arrives for the stream. While the stream stays open and the writer keeps resending on `StreamWritable`, a large write completes, and a slow reader slows the writer down instead of tearing the connection down.
+
+```rust
+use minip2p::{Bytes, EndpointEvent, Error};
+
+// The unsent tail of the last write, if the stream was full.
+let mut held: Option<Bytes> = None;
+
+// Writing: take the next chunk only while nothing is held, so no chunk is
+// pulled and lost while an earlier tail waits.
+if held.is_none()
+    && let Some(chunk) = next_chunk()
+{
+    match node.send_stream(&peer_id, conn_id, stream_id, chunk) {
+        Ok(()) => {}
+        Err(Error::Full { unsent, .. }) => held = Some(unsent),
+        Err(error) => return Err(error.into()),
+    }
+}
+
+// In the event loop: resend the tail once the stream is writable.
+if let EndpointEvent::StreamWritable { conn_id: c, stream_id: s, .. } = &event
+    && (*c, *s) == (conn_id, stream_id)
+    && let Some(tail) = held.take()
+{
+    match node.send_stream(&peer_id, conn_id, stream_id, tail) {
+        Ok(()) => {} // Fully accepted; the next chunk may go.
+        Err(Error::Full { unsent, .. }) => held = Some(unsent),
+        Err(error) => return Err(error.into()),
+    }
+}
+```
+
+Close the write side only once the held tail has gone out. `StreamWritable` never fires after the write side ended; `StreamWriteStopped`, `StreamClosed`, or the connection closing mean the tail should be dropped.
+
 ## Close, reset, or abandon
 
 | Operation | Meaning |

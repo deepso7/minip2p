@@ -8,7 +8,7 @@ use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
 use minip2p_nat::{NatAction, NatConfig, NatEvent, Path, PromoteError};
 use minip2p_relay::Status;
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 fn drive_to_bridged(h: &mut Harness) -> (ConnectId, StreamId, Vec<NatAction>) {
     let id = h.start(RACE, at(0));
@@ -86,12 +86,12 @@ fn circuit_dialer_filters_peer_supplied_punch_targets() {
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: stream,
-            data: dcutr_connect_reply(&[
+            data: Bytes::from(dcutr_connect_reply(&[
                 maddr("/ip4/10.0.0.7/udp/4002/quic-v1"),
                 maddr("/dns4/attacker.invalid/udp/4002/quic-v1"),
                 maddr("/ip4/192.0.2.7/udp/4002/quic-v1"),
                 global.clone(),
-            ]),
+            ])),
         },
         at(311),
     );
@@ -101,7 +101,7 @@ fn circuit_dialer_filters_peer_supplied_punch_targets() {
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: stream,
-            data: dcutr_sync(),
+            data: Bytes::from(dcutr_sync()),
         },
         at(312),
     );
@@ -130,7 +130,7 @@ fn punch_dial_failed_event_does_not_emit_connect_failed() {
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: stream,
-            data: dcutr_connect_reply(std::slice::from_ref(&punch)),
+            data: Bytes::from(dcutr_connect_reply(std::slice::from_ref(&punch))),
         },
         at(311),
     );
@@ -140,7 +140,7 @@ fn punch_dial_failed_event_does_not_emit_connect_failed() {
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: stream,
-            data: dcutr_sync(),
+            data: Bytes::from(dcutr_sync()),
         },
         at(312),
     );
@@ -181,7 +181,7 @@ fn foreign_streams_do_not_mutate_an_active_dcutr_exchange() {
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: foreign,
-            data: b"foreign".to_vec(),
+            data: Bytes::from_static(b"foreign"),
         },
         at(311),
     );
@@ -295,7 +295,9 @@ fn cancel_drops_queued_punch_dials() {
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: StreamId::new(90),
-            data: dcutr_connect_reply(&[maddr("/ip4/9.9.9.9/udp/4002/quic-v1")]),
+            data: Bytes::from(dcutr_connect_reply(&[maddr(
+                "/ip4/9.9.9.9/udp/4002/quic-v1",
+            )])),
         },
         at(311),
     );
@@ -305,7 +307,7 @@ fn cancel_drops_queued_punch_dials() {
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: StreamId::new(90),
-            data: dcutr_sync(),
+            data: Bytes::from(dcutr_sync()),
         },
         at(312),
     );
@@ -471,7 +473,9 @@ fn drive_dcutr_through_sync(
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: stream,
-            data: dcutr_connect_reply(&[maddr("/ip4/9.9.9.9/udp/4002/quic-v1")]),
+            data: Bytes::from(dcutr_connect_reply(&[maddr(
+                "/ip4/9.9.9.9/udp/4002/quic-v1",
+            )])),
         },
         at(311),
     );
@@ -481,7 +485,7 @@ fn drive_dcutr_through_sync(
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: stream,
-            data: dcutr_sync(),
+            data: Bytes::from(dcutr_sync()),
         },
         at(312),
     );
@@ -530,7 +534,9 @@ fn empty_filtered_dcutr_targets_fail_permanently() {
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: stream,
-            data: dcutr_connect_reply(&[maddr("/ip4/10.0.0.7/udp/4002/quic-v1")]),
+            data: Bytes::from(dcutr_connect_reply(&[maddr(
+                "/ip4/10.0.0.7/udp/4002/quic-v1",
+            )])),
         },
         at(311),
     );
@@ -541,7 +547,7 @@ fn empty_filtered_dcutr_targets_fail_permanently() {
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: stream,
-            data: dcutr_sync(),
+            data: Bytes::from(dcutr_sync()),
         },
         at(312),
     );

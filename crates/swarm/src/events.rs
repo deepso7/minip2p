@@ -6,7 +6,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{PeerAddr, PeerId};
+use minip2p_core::{Bytes, PeerAddr, PeerId};
 use minip2p_identify::IdentifyMessage;
 use minip2p_transport::{ConnectionId, StreamId, TransportEvent};
 
@@ -89,7 +89,18 @@ pub enum SwarmEvent {
         peer_id: PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
+    },
+    /// A user stream whose write came back Full can accept writes again.
+    ///
+    /// One-shot per Full: it never fires after the stream's write side
+    /// ended (`StreamWriteStopped`, a reset, `StreamClosed`, or the
+    /// connection closing), which instead tell the holder of the unsent tail
+    /// to drop it.
+    StreamWritable {
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
     },
     /// The remote closed its write side on a user stream.
     StreamRemoteWriteClosed {
@@ -143,6 +154,7 @@ impl SwarmEvent {
             | Self::PingTimeout { peer_id }
             | Self::StreamReady { peer_id, .. }
             | Self::StreamData { peer_id, .. }
+            | Self::StreamWritable { peer_id, .. }
             | Self::StreamRemoteWriteClosed { peer_id, .. }
             | Self::StreamWriteStopped { peer_id, .. }
             | Self::StreamClosed { peer_id, .. } => Some(peer_id),
@@ -153,6 +165,7 @@ impl SwarmEvent {
 
     /// Returns `true` if this is a stream-scoped event
     /// ([`StreamReady`](Self::StreamReady), [`StreamData`](Self::StreamData),
+    /// [`StreamWritable`](Self::StreamWritable),
     /// [`StreamRemoteWriteClosed`](Self::StreamRemoteWriteClosed),
     /// [`StreamWriteStopped`](Self::StreamWriteStopped), or
     /// [`StreamClosed`](Self::StreamClosed)) for the given peer, connection,
@@ -170,6 +183,7 @@ impl SwarmEvent {
             self,
             Self::StreamReady { peer_id: peer, conn_id: conn, stream_id: stream, .. }
                 | Self::StreamData { peer_id: peer, conn_id: conn, stream_id: stream, .. }
+                | Self::StreamWritable { peer_id: peer, conn_id: conn, stream_id: stream }
                 | Self::StreamRemoteWriteClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
                 | Self::StreamWriteStopped { peer_id: peer, conn_id: conn, stream_id: stream, .. }
                 | Self::StreamClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
@@ -268,6 +282,19 @@ pub enum SwarmInput {
     /// A non-fatal runtime error observed by the driver while executing a
     /// [`SwarmAction`].
     RuntimeError(SwarmRuntimeError),
+    /// The transport answered a [`SwarmAction::SendStream`] with
+    /// [`TransportError::Full`](minip2p_transport::TransportError::Full).
+    ///
+    /// The core holds `unsent` and resends it, ahead of any later write or
+    /// close for the stream, on the stream's
+    /// [`TransportEvent::StreamWritable`]. `counted` is the length of the
+    /// action's payload, so a short tail can be copied out of it.
+    SendFull {
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        unsent: Bytes,
+        counted: usize,
+    },
 }
 
 /// Outputs produced by the Sans-I/O swarm core.
@@ -285,7 +312,7 @@ pub enum SwarmOutput {
 /// `Listen` and `Dial` are handled by the driver directly (they need to
 /// allocate connection ids and interact with the transport synchronously)
 /// and do not appear here.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SwarmAction {
     /// Open a new outbound stream on the given connection.
     ///
@@ -299,10 +326,14 @@ pub enum SwarmAction {
         token: OpenStreamToken,
     },
     /// Send bytes on an existing stream.
+    ///
+    /// When the transport answers Full, the driver feeds the unsent tail back
+    /// as [`SwarmInput::SendFull`] before polling the next output. The core
+    /// owns the retry; any other failure is a [`SwarmInput::RuntimeError`].
     SendStream {
         conn_id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     },
     /// Half-close our write side on a stream.
     CloseStreamWrite {
@@ -359,4 +390,23 @@ pub enum SwarmError {
     /// in flight on the target peer).
     #[error("ping error: {reason}")]
     PingError { reason: String },
+    /// The stream's write side was closed while the swarm still held bytes
+    /// for it; the FIN goes out after them and no further write is taken.
+    #[error("user stream {stream_id} on connection {conn_id} is closing its write side")]
+    WriteClosed {
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    },
+    /// The stream cannot accept the write yet: the swarm core is holding
+    /// earlier bytes for it (its own negotiation bytes, or a tail a driver
+    /// reported through [`SwarmInput::SendFull`]). Retryable; `unsent` is the
+    /// whole payload, and [`SwarmEvent::StreamWritable`] follows once the held
+    /// bytes have been resent -- unless a write-side close is queued behind
+    /// them or the write side ends first, in which case no Writable comes.
+    #[error("user stream {stream_id} on connection {conn_id} is full; {} bytes unsent", unsent.len())]
+    Full {
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        unsent: Bytes,
+    },
 }

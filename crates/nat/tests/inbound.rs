@@ -11,7 +11,7 @@ use minip2p_nat::{
     STOP_PROTOCOL_ID,
 };
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::StreamId;
+use minip2p_transport::{Bytes, StreamId};
 
 const STOP_STREAM: u64 = 40;
 
@@ -289,7 +289,7 @@ fn inbound_unserved_nat_control_streams_are_reset_owned_and_consumed() {
                 conn_id,
                 peer_id: remote.clone(),
                 stream_id: stream,
-                data: b"rejected control data".to_vec(),
+                data: Bytes::from_static(b"rejected control data"),
             },
             at(10 + offset as u64),
         ));

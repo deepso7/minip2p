@@ -4,7 +4,7 @@ use alloc::format;
 use alloc::vec::Vec;
 use core::fmt;
 
-use minip2p_core::{Multiaddr, PeerAddr, TransportKind};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr, TransportKind};
 use minip2p_platform::{Deadline, Now};
 use thiserror::Error;
 
@@ -369,7 +369,7 @@ impl Transport for TransportSet {
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
         self.for_id(id)?.send_stream(id, stream_id, data)
     }
@@ -881,7 +881,7 @@ mod tests {
             &mut self,
             _id: ConnectionId,
             _stream_id: StreamId,
-            _data: Vec<u8>,
+            _data: Bytes,
         ) -> Result<(), TransportError> {
             self.record("send_stream");
             Ok(())
@@ -1070,7 +1070,8 @@ mod tests {
         let stream = StreamId::new(3);
 
         set.open_stream(id).expect("open");
-        set.send_stream(id, stream, vec![1]).expect("send");
+        set.send_stream(id, stream, Bytes::from_static(&[1]))
+            .expect("send");
         set.close_stream_write(id, stream).expect("close write");
         set.reset_stream(id, stream).expect("reset");
         set.close(id).expect("close");

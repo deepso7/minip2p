@@ -1,7 +1,6 @@
 use alloc::string::String;
-use alloc::vec::Vec;
 
-use minip2p_core::PeerId;
+use minip2p_core::{Bytes, PeerId};
 use minip2p_relay::Status;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -41,7 +40,7 @@ pub enum RelayServerAction {
         /// Exact destination stream.
         stream: StreamKey,
         /// Complete chunk whose acceptance is reported atomically.
-        data: Vec<u8>,
+        data: Bytes,
     },
     /// Half-close the local write side.
     CloseStreamWrite {

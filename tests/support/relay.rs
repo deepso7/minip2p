@@ -90,7 +90,7 @@ impl RelayMachine {
                 conn_id,
                 stream_id,
                 data,
-            } => self.on_data(endpoint, (peer_id, conn_id, stream_id), data)?,
+            } => self.on_data(endpoint, (peer_id, conn_id, stream_id), data.to_vec())?,
             EndpointEvent::StreamRemoteWriteClosed {
                 peer_id,
                 conn_id,

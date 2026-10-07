@@ -41,10 +41,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, EndpointEvent, GossipsubError, GossipsubEvent, PeerId, PublishError};
-use support::{
-    Driven, Relayed, SETUP_TIMEOUT, bind_on, is_backpressure, next_event, relay_builder,
+use minip2p::{
+    Bytes, Endpoint, EndpointEvent, GossipsubError, GossipsubEvent, PeerId, PublishError,
 };
+use support::{Driven, Relayed, SETUP_TIMEOUT, bind_on, next_event, relay_builder, send_chunk};
 
 const QUIC: &str = "/ip4/127.0.0.1/udp/0/quic-v1";
 const TCP: &str = "/ip4/127.0.0.1/tcp/0";
@@ -167,17 +167,17 @@ fn relay_load() -> (Endpoint, Load) {
         }
     }
 
-    let chunk = vec![0x5a; CHUNK];
+    let chunk = Bytes::from(vec![0x5a; CHUNK]);
+    let mut held = None;
     let acked = Arc::clone(&received);
     let mut sent = 0;
     let sender = Driven::run(client, move |client| {
         while sent - acked.load(Ordering::Acquire) < IN_FLIGHT * CHUNK as u64 {
-            match client.send_stream(&target_peer, conn, stream, chunk.clone()) {
-                Ok(()) => sent += CHUNK as u64,
-                Err(error) => {
-                    assert!(is_backpressure(&error), "send failed: {error}");
-                    break;
-                }
+            let (accepted, full) =
+                send_chunk(client, &target_peer, (conn, stream), &chunk, &mut held);
+            sent += accepted;
+            if full {
+                break;
             }
         }
         // Flushes queued bytes; the sink's progress interrupts the wait.

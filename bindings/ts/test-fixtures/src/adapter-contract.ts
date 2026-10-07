@@ -292,14 +292,12 @@ export function describeAdapterContract(
       await drained();
       const stream = await opening;
       native.setLiveConnection(CONN_ID);
-      stream.write("before");
+      await stream.write("before");
 
       // The new connection reuses stream id 4, and its ConnectionReplaced
       // is not drained yet, so the SDK still treats the stream as open.
       native.setLiveConnection(NEXT_CONN_ID);
-      expect(() => {
-        stream.write("after");
-      }).toThrow();
+      await expect(stream.write("after")).rejects.toThrow();
 
       expect(native.writes).toEqual([{ connId: CONN_ID, streamId: 4n }]);
       endpoint.close();
@@ -326,9 +324,9 @@ export function describeAdapterContract(
       await drained();
       const stream = await opening;
       const writeErrors: unknown[] = [];
-      stream.on("data", () => {
+      stream.on("data", async () => {
         try {
-          stream.write("reply");
+          await stream.write("reply");
         } catch (error) {
           writeErrors.push(error);
         }
@@ -356,6 +354,44 @@ export function describeAdapterContract(
       expect(writeErrors).toHaveLength(1);
       expect(writeErrors[0]).toBeInstanceOf(StreamClosedError);
       expect(native.writes).toEqual([]);
+      endpoint.close();
+    });
+
+    test("a remote stop code past the safe integer range reaches the stream whole", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      native.setNextStream(CONN_ID, 4n);
+      const opening = endpoint.openStream(PEER, "/test/1");
+      native.deliver([
+        {
+          inner: {
+            connId: CONN_ID,
+            initiatedLocally: true,
+            peerId: PEER,
+            protocolId: "/test/1",
+            streamId: 4n,
+          },
+          tag: "StreamReady",
+        },
+      ]);
+      await drained();
+      const stream = await opening;
+      const codes: bigint[] = [];
+      stream.on("writeStopped", ({ errorCode }) => codes.push(errorCode));
+
+      // QUIC stop codes are 62-bit varints.
+      const errorCode = 2n ** 62n - 1n;
+      native.deliver([
+        {
+          inner: { connId: CONN_ID, errorCode, peerId: PEER, streamId: 4n },
+          tag: "StreamWriteStopped",
+        },
+      ]);
+      await drained();
+
+      expect(codes).toEqual([errorCode]);
+      await expect(stream.write("late")).rejects.toThrow();
       endpoint.close();
     });
 

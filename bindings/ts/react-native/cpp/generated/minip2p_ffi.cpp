@@ -281,7 +281,7 @@ extern "C" {
         uint64_t stream_id,
         RustCallStatus *uniffi_out_err
     );
-    void uniffi_minip2p_ffi_fn_method_p2pendpoint_send_stream(
+    int8_t uniffi_minip2p_ffi_fn_method_p2pendpoint_send_stream(
         /*handle*/ uint64_t ptr,
         RustBuffer peer_id,
         uint64_t conn_id,
@@ -3608,13 +3608,13 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_reset_
 }
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_send_stream(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        uniffi_minip2p_ffi_fn_method_p2pendpoint_send_stream(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::minip2p_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging<uint64_t>::fromJs(rt, callInvoker, args[2]), uniffi_jsi::Bridging<uint64_t>::fromJs(rt, callInvoker, args[3]), uniffi::minip2p_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[4]),
+        auto value = uniffi_minip2p_ffi_fn_method_p2pendpoint_send_stream(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::minip2p_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging<uint64_t>::fromJs(rt, callInvoker, args[2]), uniffi_jsi::Bridging<uint64_t>::fromJs(rt, callInvoker, args[3]), uniffi::minip2p_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[4]),
             &status
         );
         uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
 
 
-        return jsi::Value::undefined();
+        return uniffi_jsi::Bridging<int8_t>::toJs(rt, callInvoker, value);
 }
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_set_active(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);

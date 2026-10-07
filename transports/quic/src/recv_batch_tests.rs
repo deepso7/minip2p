@@ -207,7 +207,7 @@ fn an_occasional_request_is_read_acknowledged_and_answered_within_one_poll() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            TransportEvent::StreamData { data, .. } if data == b"request"
+            TransportEvent::StreamData { data, .. } if data[..] == b"request"[..]
         )),
         "one poll reads the request: {events:?}"
     );
@@ -217,7 +217,7 @@ fn an_occasional_request_is_read_acknowledged_and_answered_within_one_poll() {
     );
 
     server
-        .send_stream(id, StreamId::new(0), b"reply".to_vec())
+        .send_stream(id, StreamId::new(0), Bytes::from_static(b"reply"))
         .expect("reply");
     std::thread::sleep(Duration::from_millis(2));
     peer.pump();

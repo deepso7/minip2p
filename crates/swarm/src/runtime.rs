@@ -9,7 +9,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::{IdentifyConfig, IdentifyMessage};
 use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
 use minip2p_platform::{Deadline, EntropySource, Now};
@@ -26,6 +26,16 @@ use crate::events::{
 /// callers no longer need to recover their meaning from a flattened string.
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
+    /// The stream could not accept the whole write. Retryable, never a
+    /// fault (ADR 0012): every byte before `unsent` was accepted, the caller
+    /// holds `unsent`, and [`SwarmEvent::StreamWritable`] follows for the
+    /// stream once it can queue again.
+    #[error("stream {stream_id} on connection {conn_id} is full; {} bytes unsent", unsent.len())]
+    Full {
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        unsent: Bytes,
+    },
     /// The underlying transport rejected the operation.
     #[error(transparent)]
     Transport(#[from] TransportError),
@@ -496,7 +506,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
                         now_ms,
                         &mut allocated_stream,
                         &mut open_error,
-                        &mut None,
+                        None,
                     );
                 }
                 SwarmOutput::Event(event) => self.event_buffer.push_back(event),
@@ -530,12 +540,16 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     }
 
     /// Sends raw bytes on a negotiated user stream.
+    ///
+    /// Accepts as much of `data` as the stream can queue. When not every byte
+    /// fit, returns [`DriverError::Full`] with the exact unsent suffix; the
+    /// caller holds it and sends it again on [`SwarmEvent::StreamWritable`].
     pub fn send_stream(
         &mut self,
         peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
         now_ms: u64,
     ) -> Result<(), DriverError> {
         // Flush anything already queued first, so the capture window below
@@ -543,7 +557,21 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         // `Swarm::open_stream`).
         self.flush_actions(now_ms);
 
-        self.core.send_stream(peer_id, conn_id, stream_id, data)?;
+        match self.core.send_stream(peer_id, conn_id, stream_id, data) {
+            Ok(()) => {}
+            Err(SwarmError::Full {
+                conn_id,
+                stream_id,
+                unsent,
+            }) => {
+                return Err(DriverError::Full {
+                    conn_id,
+                    stream_id,
+                    unsent,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
 
         // Dispatch this call's own actions synchronously, capturing a
         // transport rejection. Callers that commit state once a stream
@@ -555,13 +583,31 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         while let Some(output) = self.core.poll_output() {
             match output {
                 SwarmOutput::Action(action) => {
-                    self.dispatch_action(action, now_ms, &mut None, &mut None, &mut send_error);
+                    self.dispatch_action(
+                        action,
+                        now_ms,
+                        &mut None,
+                        &mut None,
+                        Some(&mut send_error),
+                    );
                 }
                 SwarmOutput::Event(event) => self.event_buffer.push_back(event),
             }
         }
         self.flush_actions(now_ms);
 
+        if let Some(TransportError::Full {
+            id,
+            stream_id,
+            unsent,
+        }) = send_error
+        {
+            return Err(DriverError::Full {
+                conn_id: id,
+                stream_id,
+                unsent,
+            });
+        }
         if let Some(error) = send_error {
             // Reported synchronously through Err: drop the duplicate
             // buffered runtime-error event this call produced.
@@ -608,8 +654,10 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     ///
     /// This is used when ownership of a negotiated stream moves to another
     /// protocol layer. Already-buffered events are intentionally preserved.
-    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
-        self.core.forget_stream(conn_id, stream_id);
+    /// Returns the bytes the core still owes the stream, oldest first; see
+    /// [`SwarmCore::forget_stream`].
+    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) -> VecDeque<Bytes> {
+        self.core.forget_stream(conn_id, stream_id)
     }
 
     /// Resets and forgets a stream whose consumer will never read it again.
@@ -725,7 +773,12 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         // into its return value; the next driver call may then dispatch them.
         if self.event_buffer.is_empty() {
             while let Some(action) = self.after_event_actions.pop_front() {
-                self.dispatch_action(action, now_ms, &mut allocated, &mut None, &mut None);
+                // Polled before an earlier write on its stream came back
+                // Full: it must queue behind the held tail, not overtake it.
+                let Some(action) = self.core.hold_action(action) else {
+                    continue;
+                };
+                self.dispatch_action(action, now_ms, &mut allocated, &mut None, None);
             }
         }
 
@@ -740,7 +793,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
                     self.after_event_actions.push_back(action);
                 }
                 SwarmOutput::Action(action) => {
-                    self.dispatch_action(action, now_ms, &mut allocated, &mut None, &mut None)
+                    self.dispatch_action(action, now_ms, &mut allocated, &mut None, None)
                 }
                 SwarmOutput::Event(event) => {
                     saw_event = true;
@@ -765,13 +818,18 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     /// remembers the **last** stream id allocated during the flush, which
     /// is accurate because `open_stream` triggers exactly one
     /// `OpenStream` action per call.
+    ///
+    /// `captured_send_error` is set only by [`SwarmRuntime::send_stream`],
+    /// whose cascade is the caller's own write: its failure, Full included,
+    /// goes back to the caller. Every other write is the core's, so a Full
+    /// is handed to the core, which holds the tail.
     fn dispatch_action(
         &mut self,
         action: SwarmAction,
         now_ms: u64,
         captured_stream_id: &mut Option<StreamId>,
         captured_open_error: &mut Option<TransportError>,
-        captured_send_error: &mut Option<TransportError>,
+        captured_send_error: Option<&mut Option<TransportError>>,
     ) {
         match action {
             SwarmAction::OpenStream { conn_id, token } => match self.transport.open_stream(conn_id)
@@ -800,18 +858,37 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
                 stream_id,
                 data,
             } => {
-                if let Err(e) = self.transport.send_stream(conn_id, stream_id, data) {
-                    let reason = format!(
-                        "send_stream to connection {conn_id} stream {stream_id} failed: {e}"
-                    );
-                    *captured_send_error = Some(e);
-                    self.core
-                        .handle_input(SwarmInput::RuntimeError(runtime_error(
-                            SwarmErrorKind::Transport,
-                            Some(conn_id),
-                            Some(stream_id),
-                            reason,
-                        )));
+                let counted = data.len();
+                match self.transport.send_stream(conn_id, stream_id, data) {
+                    Ok(()) => {}
+                    Err(TransportError::Full { unsent, .. }) if captured_send_error.is_none() => {
+                        self.core.handle_input(SwarmInput::SendFull {
+                            conn_id,
+                            stream_id,
+                            unsent,
+                            counted,
+                        });
+                    }
+                    Err(e @ TransportError::Full { .. }) => {
+                        if let Some(captured) = captured_send_error {
+                            *captured = Some(e);
+                        }
+                    }
+                    Err(e) => {
+                        let reason = format!(
+                            "send_stream to connection {conn_id} stream {stream_id} failed: {e}"
+                        );
+                        if let Some(captured) = captured_send_error {
+                            *captured = Some(e);
+                        }
+                        self.core
+                            .handle_input(SwarmInput::RuntimeError(runtime_error(
+                                SwarmErrorKind::Transport,
+                                Some(conn_id),
+                                Some(stream_id),
+                                reason,
+                            )));
+                    }
                 }
             }
             SwarmAction::CloseStreamWrite { conn_id, stream_id } => {
@@ -1001,17 +1078,17 @@ mod tests {
             &mut self,
             id: ConnectionId,
             stream_id: StreamId,
-            data: Vec<u8>,
+            data: Bytes,
         ) -> Result<(), TransportError> {
             let Some(negotiator) = self.negotiators.get_mut(&stream_id) else {
                 // Negotiation is done (or was never scripted): this is
                 // protocol payload, which is what tests assert on.
-                self.sent.push((stream_id, data));
+                self.sent.push((stream_id, data.to_vec()));
                 return Ok(());
             };
 
             negotiator
-                .handle_input(MultistreamInput::Data(data))
+                .handle_input(MultistreamInput::Data(data.to_vec()))
                 .map_err(|error| TransportError::PollError {
                     reason: alloc::format!("listener negotiation input failed: {error}"),
                 })?;
@@ -1037,7 +1114,7 @@ mod tests {
                 self.initial.push(TransportEvent::StreamData {
                     id,
                     stream_id,
-                    data,
+                    data: Bytes::from(data),
                 });
             }
             Ok(())
