@@ -25,6 +25,7 @@ No async runtime required. The host drives the transport by calling `poll(now)` 
 - QUIC deadlines are exposed through `Transport::next_deadline()` and processed by `poll()`; no async runtime or hidden timer thread is used. Idle drivers block on `BlockingTransport::wait_for_input()` (a mio readiness wait on the UDP socket, whose selector fd `readiness_fd()` exposes on unix targets where mio's selector is an fd -- epoll, kqueue, event ports -- so a `TransportSet` can wait on it alongside other members) instead of polling on a fixed cadence. Both report immediately-due work when events are already buffered, so calls made between polls -- `listen`, `open_stream`, and the stream operations -- never leave a host asleep on an undelivered event.
 - Quiet connections send an ack-eliciting packet at half `idle_timeout_ms` (15 s by default) so NAT bindings and the peer's idle timer stay warm without an application ping. Dead paths still idle-timeout: only one ping is sent per receive.
 - Datagrams route by destination connection ID only, never by source address, so peers sharing an address (e.g. behind one NAT) cannot receive each other's packets. The single exception is a stateless reset, which routes by the reset token the peer advertised in its transport parameters; other unknown-CID datagrams are dropped.
+- Output is batched per `poll`: once a connection is established, receiving a datagram queues its effects in quiche without flushing, and each connection drains its writes and flushes once after the whole receive batch. quiche has no delayed-ACK timer, so a flush per datagram would send an ACK per packet and squeeze packets into whatever sliver of congestion window was free. Handshake packets, writes, closes, timers, keepalives and pacing still flush at once.
 - Stateless Retry authenticates source addresses before inbound connection allocation. Configurable limits bound connections, streams, queued stream bytes, queued UDP datagrams, and idle time.
 
 ## Basic usage
@@ -68,6 +69,16 @@ What the adapter _does_ guarantee is that nothing quiche's clock touches leaks i
 - quiche's pacing send times (`SendInfo::at`) are honoured on its clock too: a packet due later is held on its connection, which generates nothing more until a later `poll` sends it, so packets never leave early or out of order. The held packet's send time joins `next_deadline()` under the same rounding. Dropping the transport sends anything still held at once, since no later `poll` would. quiche only paces under BBR2; with its default CUBIC, which this adapter uses, every packet is due immediately.
 
 `quiche 0.29` exposes its TLS builder using `boring` 4.x types, so this crate intentionally uses the newest compatible `boring` 4.x release rather than the incompatible 5.x major.
+
+## Diagnostics
+
+The off-by-default `diagnostics` feature compiles in counters for comparing fast and slow runs. Without it they do not exist and their recording hooks are empty.
+
+- `QuicTransport::connection_diagnostics(id)` (also on `DualQuicTransport` and `QuicEndpoint`) returns a live connection's `ConnectionDiagnostics`: datagrams received, flushes and the flushes a received datagram triggered (with per-datagram ratios), packets quiche generated with their total bytes and how many were underfilled, and `window_limited_packets`. That last one approximates packets whose size budget the free congestion window trimmed: an underfilled packet that ended a flush while stream writes were still queued. quiche does not expose its free window, so peer flow control can produce the same signature.
+- Each connection prints its totals to stderr when dropped, as `minip2p-quic diagnostics <id>: ...`, so a host can compare runs without reading them through the transport.
+- `datagram_counters(&peer_id)` returns the `DatagramCounters` of every live transport bound with that identity (a dual-stack pair counts as one): datagrams and bytes the sockets actually sent or received. A datagram retained on `WouldBlock` counts once it leaves. Any thread can read them; `DatagramCounters::since` subtracts an earlier snapshot.
+
+`minip2p-rs`'s `bench` feature enables this for the `endpoint_throughput` bench. An application enables it by naming the feature on its own `minip2p-quic` dependency.
 
 ## Authentication Notes
 

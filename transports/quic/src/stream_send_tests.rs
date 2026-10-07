@@ -17,14 +17,14 @@ pub(crate) fn now() -> Now {
 
 /// A quiche client on its own loopback socket, pumped by hand.
 pub(crate) struct RawPeer {
-    conn: quiche::Connection,
+    pub(crate) conn: quiche::Connection,
     pub(crate) socket: UdpSocket,
 }
 
 impl RawPeer {
     /// Starts a handshake to `server`; `tune` adjusts the credit the client
     /// grants.
-    fn connect(server: SocketAddr, tune: impl FnOnce(&mut quiche::Config)) -> Self {
+    pub(crate) fn connect(server: SocketAddr, tune: impl FnOnce(&mut quiche::Config)) -> Self {
         let mut config = build_quiche_config(&QuicNodeConfig::generate()).expect("client config");
         tune(&mut config);
         let socket = UdpSocket::bind("127.0.0.1:0").expect("bind client");
@@ -39,7 +39,7 @@ impl RawPeer {
 
     /// Receives everything queued on the socket, services timers, and sends
     /// whatever quiche has to say.
-    fn pump(&mut self) {
+    pub(crate) fn pump(&mut self) {
         let mut buf = [0u8; 65535];
         let local = self.socket.local_addr().expect("client addr");
         while let Ok((len, from)) = self.socket.recv_from(&mut buf) {
@@ -70,7 +70,7 @@ impl RawPeer {
     }
 
     /// Reads everything readable on `stream`, returning the bytes and FIN.
-    fn read(&mut self, stream: u64) -> (Vec<u8>, bool) {
+    pub(crate) fn read(&mut self, stream: u64) -> (Vec<u8>, bool) {
         let mut data = Vec::new();
         let mut buf = [0u8; 4096];
         while let Ok((read, fin)) = self.conn.stream_recv(stream, &mut buf) {
