@@ -1,6 +1,7 @@
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
+use minip2p_core::Bytes;
 use minip2p_platform::{Deadline, Now};
 
 use crate::{
@@ -14,34 +15,38 @@ enum OpenFlag {
     Ack,
 }
 
-/// Bytes accepted by [`YamuxSession::send`] but not yet framed. A chunk that
-/// only part of a window could take keeps its buffer; `sent` marks the resume
-/// point, so a partial window does not copy the unsent tail.
+/// Bytes accepted by [`YamuxSession::send`] but not yet framed.
+///
+/// Framing a chunk in part slices it, so the unsent tail shares the caller's
+/// allocation. `original_len` is the length that allocation was counted at:
+/// once the tail is shorter than half of it, the tail moves to a right-sized
+/// buffer (ADR 0012), so retained memory stays within twice the counted bytes.
 #[derive(Debug)]
 struct QueuedChunk {
-    bytes: Vec<u8>,
-    sent: usize,
+    bytes: Bytes,
+    original_len: usize,
 }
 
 impl QueuedChunk {
-    fn new(bytes: Vec<u8>, sent: usize) -> Self {
-        let mut chunk = Self { bytes, sent };
+    fn new(bytes: Bytes, original_len: usize) -> Self {
+        let mut chunk = Self {
+            bytes,
+            original_len,
+        };
         chunk.bound_retained();
         chunk
     }
 
-    fn unsent(&self) -> &[u8] {
-        self.bytes.get(self.sent..).unwrap_or_default()
+    /// Drops the first `len` bytes, which were just framed.
+    fn advance(&mut self, len: usize) {
+        self.bytes = self.bytes.slice(len..);
+        self.bound_retained();
     }
 
-    /// Keeps the allocation within twice the unsent (cap-counted) bytes, so a
-    /// peer withholding credit cannot pin already-framed bytes. Each move at
-    /// least halves the allocation, so a chunk's tail copies sum to less than
-    /// its original size.
     fn bound_retained(&mut self) {
-        if self.bytes.capacity() > self.unsent().len().saturating_mul(2) {
-            self.bytes = self.unsent().to_vec();
-            self.sent = 0;
+        if self.bytes.len().saturating_mul(2) < self.original_len {
+            self.bytes = Bytes::copy_from_slice(&self.bytes);
+            self.original_len = self.bytes.len();
         }
     }
 }
@@ -55,8 +60,12 @@ struct StreamState {
     receive_window: u32,
     delivered_since_update: u32,
     pending_credit: u64,
+    /// Accepted, unframed bytes. They count against the send caps until a
+    /// frame carrying them is pulled by [`YamuxSession::poll_frame`].
     send_buffer: VecDeque<QueuedChunk>,
     buffered_send: usize,
+    /// The local write side was closed; `FIN` goes out once `send_buffer`
+    /// has been framed.
     close_pending: bool,
     local_write_closed: bool,
     remote_write_closed: bool,
@@ -64,26 +73,22 @@ struct StreamState {
 
 impl StreamState {
     fn outbound(config: &YamuxConfig) -> Self {
-        Self {
-            locally_opened: true,
-            pending_open: Some(OpenFlag::Syn),
-            acknowledged: false,
-            send_window: DEFAULT_RECEIVE_WINDOW,
-            receive_window: DEFAULT_RECEIVE_WINDOW,
-            delivered_since_update: 0,
-            pending_credit: u64::from(config.receive_window - DEFAULT_RECEIVE_WINDOW),
-            send_buffer: VecDeque::new(),
-            buffered_send: 0,
-            close_pending: false,
-            local_write_closed: false,
-            remote_write_closed: false,
-        }
+        Self::new(config, true, Some(OpenFlag::Syn), DEFAULT_RECEIVE_WINDOW)
     }
 
     fn inbound(config: &YamuxConfig, send_window: u32) -> Self {
+        Self::new(config, false, Some(OpenFlag::Ack), send_window)
+    }
+
+    fn new(
+        config: &YamuxConfig,
+        locally_opened: bool,
+        pending_open: Option<OpenFlag>,
+        send_window: u32,
+    ) -> Self {
         Self {
-            locally_opened: false,
-            pending_open: Some(OpenFlag::Ack),
+            locally_opened,
+            pending_open,
             acknowledged: false,
             send_window,
             receive_window: DEFAULT_RECEIVE_WINDOW,
@@ -108,19 +113,64 @@ impl StreamState {
         }
     }
 
-    fn has_deferred_control(&self) -> bool {
-        self.pending_open.is_some() || self.pending_credit != 0
+    /// Whether this stream needs a standalone window update: returned credit,
+    /// or an open flag that no data frame is about to carry.
+    fn needs_control_frame(&self) -> bool {
+        self.pending_credit != 0 || (self.pending_open.is_some() && !self.has_sendable_data())
+    }
+
+    /// Whether a data or `FIN` frame can be pulled for this stream now.
+    fn has_sendable_data(&self) -> bool {
+        (self.send_window != 0 && !self.send_buffer.is_empty())
+            || (self.close_pending && self.send_buffer.is_empty())
     }
 }
 
 /// Caller-driven Yamux stream-multiplexing session.
+///
+/// # Output
+///
+/// Inbound stream events and outbound frames leave through separate queues,
+/// so received data never waits behind outbound frames:
+///
+/// - [`poll_event`](Self::poll_event) yields stream events.
+/// - [`poll_frame`](Self::poll_frame) yields encoded frames. Data frames are
+///   built only when pulled, so the caller should pull only while its
+///   downstream (socket or circuit bridge) has room; that is what bounds the
+///   bytes in flight below this session.
+///
+/// [`poll_output`](Self::poll_output) merges both, events first, for callers
+/// that do not care.
+///
+/// # Backpressure (ADR 0012)
+///
+/// [`send`](Self::send) accepts as much as the stream's caps allow and hands
+/// back the unsent tail in [`YamuxError::Full`]. Peer credit does not decide
+/// acceptance. Accepted bytes count against
+/// [`YamuxConfig::max_buffered_send`] and
+/// [`YamuxConfig::max_total_buffered_send`] until a frame carrying them is
+/// pulled. A Full arms [`YamuxOutput::Writable`] for the stream; see its docs
+/// for when it fires.
+///
+/// Control frames (pings, acknowledgements, resets) queue separately and are
+/// pulled first. Replies the peer provokes are bounded by
+/// [`YamuxConfig::max_pending_control`]: a peer that keeps provoking replies
+/// it never reads fails the session with
+/// [`YamuxError::ControlReserveExhausted`].
 pub struct YamuxSession {
     role: YamuxRole,
     config: YamuxConfig,
     decoder: FrameDecoder,
     streams: BTreeMap<u32, StreamState>,
     next_stream_id: Option<u32>,
-    pending: VecDeque<YamuxOutput>,
+    /// Stream events for [`poll_event`](Self::poll_event).
+    events: VecDeque<YamuxOutput>,
+    /// Encoded control frames, pulled ahead of data frames.
+    control: VecDeque<Vec<u8>>,
+    /// Streams whose last `send` was Full and that want a Writable.
+    writable_armed: BTreeSet<u32>,
+    /// Round-robin position for data frames: the last stream framed.
+    send_cursor: u32,
     total_buffered_send: usize,
     failed: bool,
     local_go_away: bool,
@@ -153,6 +203,11 @@ impl YamuxSession {
                 "max_frame_len must be greater than zero",
             ));
         }
+        if config.max_buffered_send == 0 || config.max_total_buffered_send == 0 {
+            return Err(YamuxError::InvalidConfig(
+                "send caps must be greater than zero",
+            ));
+        }
         Ok(Self::from_validated_config(role, config))
     }
 
@@ -169,7 +224,10 @@ impl YamuxSession {
             config,
             streams: BTreeMap::new(),
             next_stream_id,
-            pending: VecDeque::new(),
+            events: VecDeque::new(),
+            control: VecDeque::new(),
+            writable_armed: BTreeSet::new(),
+            send_cursor: 0,
             total_buffered_send: 0,
             failed: false,
             local_go_away: false,
@@ -195,7 +253,11 @@ impl YamuxSession {
         if now.monotonic_ms.saturating_sub(last) >= KEEPALIVE_INTERVAL_MS {
             let nonce = self.next_ping_nonce;
             self.next_ping_nonce = self.next_ping_nonce.wrapping_add(1);
-            self.queue_frame(Frame::ping(FLAG_SYN, nonce)?);
+            // A session with control frames still unpulled is not quiet on
+            // the wire, and the ping would only queue behind them.
+            if self.control.is_empty() {
+                self.push_control(Frame::ping(FLAG_SYN, nonce)?);
+            }
             self.last_activity_ms = Some(now.monotonic_ms);
             self.dirty = false;
         }
@@ -217,9 +279,9 @@ impl YamuxSession {
 
     /// Opens a local stream and returns its role-partitioned identifier.
     ///
-    /// The first data/control frame carries `SYN`; if the caller drains output
-    /// before sending, [`YamuxSession::poll_output`] emits a standalone
-    /// window-update frame carrying `SYN`.
+    /// The first data/control frame carries `SYN`; if nothing is sent before
+    /// the caller pulls frames, [`YamuxSession::poll_frame`] emits a
+    /// standalone window-update frame carrying `SYN`.
     pub fn open_stream(&mut self) -> Result<u32, YamuxError> {
         self.ensure_active()?;
         if self.streams.len() >= self.config.max_streams {
@@ -232,103 +294,80 @@ impl YamuxSession {
         Ok(stream)
     }
 
-    /// Sends bytes on a stream, queueing the portion beyond remote credit.
+    /// Accepts as much of `data` as the stream's send caps allow.
     ///
-    /// Queue-cap checks are atomic: on [`YamuxError::SendBufferFull`] no part
-    /// of this call was queued or framed, and the stream remains usable.
-    pub fn send(&mut self, stream: u32, data: Vec<u8>) -> Result<(), YamuxError> {
+    /// Returns [`YamuxError::Full`] carrying the exact unsent suffix when not
+    /// every byte fit, and arms [`YamuxOutput::Writable`] for the stream. The
+    /// accepted prefix is framed lazily by [`poll_frame`](Self::poll_frame),
+    /// as remote credit allows. Empty data is a no-op.
+    pub fn send(&mut self, stream: u32, data: Bytes) -> Result<(), YamuxError> {
         self.ensure_active()?;
-        let max_frame_len = self.config.max_frame_len as usize;
-        let total_before = self.total_buffered_send;
-        let mut frames = Vec::new();
-        let buffered_added;
-        {
-            let state = self
-                .streams
-                .get_mut(&stream)
-                .ok_or(YamuxError::UnknownStream(stream))?;
-            if state.local_write_closed || state.close_pending {
-                return Err(YamuxError::StreamWriteClosed(stream));
-            }
-
-            let immediate_len = data.len().min(state.send_window as usize);
-            let queued_len = data.len() - immediate_len;
-            let per_stream_after = state.buffered_send.checked_add(queued_len);
-            let total_after = total_before.checked_add(queued_len);
-            if per_stream_after.is_none_or(|value| value > self.config.max_buffered_send)
-                || total_after.is_none_or(|value| value > self.config.max_total_buffered_send)
-            {
-                return Err(YamuxError::SendBufferFull {
-                    stream,
-                    attempted: queued_len,
-                    per_stream_limit: self.config.max_buffered_send,
-                    total_limit: self.config.max_total_buffered_send,
-                });
-            }
-
-            state.send_window -= immediate_len as u32;
-            if data.is_empty() && state.pending_open.is_some() {
-                let flags = state.take_open_flag();
-                frames.push(Frame::encode_data(stream, flags, &[])?);
-            } else if immediate_len != 0 {
-                let immediate = data.get(..immediate_len).unwrap_or_default();
-                for segment in immediate.chunks(max_frame_len) {
-                    let flags = state.take_open_flag();
-                    frames.push(Frame::encode_data(stream, flags, segment)?);
-                }
-            }
-            if queued_len != 0 {
-                state
-                    .send_buffer
-                    .push_back(QueuedChunk::new(data, immediate_len));
-                state.buffered_send += queued_len;
-            }
-            buffered_added = queued_len;
+        let total_room = self
+            .config
+            .max_total_buffered_send
+            .saturating_sub(self.total_buffered_send);
+        let state = self
+            .streams
+            .get_mut(&stream)
+            .ok_or(YamuxError::UnknownStream(stream))?;
+        if state.local_write_closed || state.close_pending {
+            return Err(YamuxError::StreamWriteClosed(stream));
         }
-        self.total_buffered_send += buffered_added;
-        self.queue_encoded(frames);
-        Ok(())
+        if data.is_empty() {
+            return Ok(());
+        }
+        let room = self
+            .config
+            .max_buffered_send
+            .saturating_sub(state.buffered_send)
+            .min(total_room);
+        let accepted = data.len().min(room);
+        if accepted != 0 {
+            state
+                .send_buffer
+                .push_back(QueuedChunk::new(data.slice(..accepted), data.len()));
+            state.buffered_send += accepted;
+            self.total_buffered_send += accepted;
+        }
+        if accepted == data.len() {
+            return Ok(());
+        }
+        self.writable_armed.insert(stream);
+        Err(YamuxError::Full {
+            stream,
+            unsent: data.slice(accepted..),
+        })
     }
 
-    /// Gracefully half-closes a stream after all accepted buffered data.
+    /// Gracefully half-closes a stream after all accepted data.
+    ///
+    /// The `FIN` is framed once every accepted byte has been, and a pending
+    /// [`YamuxOutput::Writable`] is disarmed: the write side has ended.
     pub fn close_write(&mut self, stream: u32) -> Result<(), YamuxError> {
         self.ensure_active()?;
-        let frame;
-        let close_stream;
-        {
-            let state = self
-                .streams
-                .get_mut(&stream)
-                .ok_or(YamuxError::UnknownStream(stream))?;
-            if state.local_write_closed || state.close_pending {
-                return Ok(());
-            }
-            if state.buffered_send != 0 {
-                state.close_pending = true;
-                return Ok(());
-            }
-            let flags = state.take_open_flag() | FLAG_FIN;
-            frame = Frame::data(stream, flags, Vec::new())?;
-            state.local_write_closed = true;
-            close_stream = state.remote_write_closed;
+        let state = self
+            .streams
+            .get_mut(&stream)
+            .ok_or(YamuxError::UnknownStream(stream))?;
+        if !state.local_write_closed {
+            state.close_pending = true;
         }
-        self.queue_frame(frame);
-        if close_stream {
-            self.remove_stream(stream, true);
-        }
+        self.writable_armed.remove(&stream);
         Ok(())
     }
 
     /// Immediately resets a stream and emits [`YamuxOutput::StreamClosed`].
     pub fn reset(&mut self, stream: u32) -> Result<(), YamuxError> {
         self.ensure_active()?;
-        let state = self
-            .streams
-            .remove(&stream)
-            .ok_or(YamuxError::UnknownStream(stream))?;
-        self.total_buffered_send -= state.buffered_send;
-        self.queue_frame(Frame::data(stream, FLAG_RST, Vec::new())?);
-        self.pending.push_back(YamuxOutput::StreamClosed { stream });
+        let unannounced = match self.streams.get(&stream) {
+            Some(state) => state.pending_open == Some(OpenFlag::Syn),
+            None => return Err(YamuxError::UnknownStream(stream)),
+        };
+        self.remove_stream(stream, true);
+        // A stream whose SYN never went out is unknown to the peer.
+        if !unannounced {
+            self.push_control(Frame::data(stream, FLAG_RST, Vec::new())?);
+        }
         Ok(())
     }
 
@@ -338,17 +377,18 @@ impl YamuxSession {
             return;
         }
         self.local_go_away = true;
-        self.queue_frame(Frame::go_away(code));
         self.close_all_streams();
         self.decoder.clear();
+        self.push_control(Frame::go_away(code));
     }
 
     /// Feeds ordered bytes received from the underlying connection.
     ///
-    /// A protocol error fails the session closed: queued outputs are replaced
-    /// by a protocol GoAway followed by terminal events for tracked streams.
-    /// A caller must therefore tolerate [`YamuxOutput::StreamClosed`] for a
-    /// stream whose queued [`YamuxOutput::IncomingStream`] was discarded.
+    /// A protocol error fails the session closed: queued frames are replaced
+    /// by a protocol GoAway, queued events are dropped, and terminal events
+    /// follow for tracked streams. A caller must therefore tolerate
+    /// [`YamuxOutput::StreamClosed`] for a stream whose queued
+    /// [`YamuxOutput::IncomingStream`] was discarded.
     pub fn handle_data(&mut self, bytes: &[u8]) -> Result<(), YamuxError> {
         if self.failed {
             return Err(YamuxError::Failed);
@@ -374,24 +414,57 @@ impl YamuxSession {
         }
     }
 
-    /// Returns the next encoded frame or stream event.
-    pub fn poll_output(&mut self) -> Option<YamuxOutput> {
-        if let Some(output) = self.pending.pop_front() {
-            return Some(output);
-        }
-        if !self.failed && !self.local_go_away && !self.remote_go_away {
-            self.materialize_deferred_control();
-        }
-        self.pending.pop_front()
+    /// Returns the next stream event.
+    pub fn poll_event(&mut self) -> Option<YamuxOutput> {
+        self.events.pop_front()
     }
 
-    /// Returns true when no output or deferred control frame is pending.
+    /// Returns the next encoded frame to write, if any.
+    ///
+    /// Control frames come first, then deferred stream control (open flags,
+    /// window updates), then data frames round-robin across streams with
+    /// remote credit. Pulling a data frame releases its bytes from the send
+    /// caps, which may queue [`YamuxOutput::Writable`] events.
+    pub fn poll_frame(&mut self) -> Option<Vec<u8>> {
+        if let Some(frame) = self.control.pop_front() {
+            return Some(frame);
+        }
+        if self.failed || self.local_go_away || self.remote_go_away {
+            return None;
+        }
+        if let Some(frame) = self.deferred_control_frame() {
+            self.dirty = true;
+            return Some(frame);
+        }
+        let frame = self.data_frame()?;
+        self.dirty = true;
+        self.wake_writable();
+        Some(frame)
+    }
+
+    /// Returns the next event, or else the next frame as
+    /// [`YamuxOutput::Outbound`].
+    pub fn poll_output(&mut self) -> Option<YamuxOutput> {
+        self.poll_event()
+            .or_else(|| self.poll_frame().map(YamuxOutput::Outbound))
+    }
+
+    /// Whether [`poll_frame`](Self::poll_frame) would return a frame now.
+    pub fn has_frames(&self) -> bool {
+        if !self.control.is_empty() {
+            return true;
+        }
+        if self.failed || self.local_go_away || self.remote_go_away {
+            return false;
+        }
+        self.streams
+            .values()
+            .any(|state| state.needs_control_frame() || state.has_sendable_data())
+    }
+
+    /// Returns true when no event or frame is pending.
     pub fn is_idle(&self) -> bool {
-        self.pending.is_empty()
-            && self
-                .streams
-                .values()
-                .all(|stream| !stream.has_deferred_control())
+        self.events.is_empty() && !self.has_frames()
     }
 
     /// Returns the number of currently tracked streams.
@@ -400,7 +473,7 @@ impl YamuxSession {
         self.streams.len()
     }
 
-    /// Returns aggregate bytes queued behind remote flow-control windows.
+    /// Returns aggregate accepted bytes not yet pulled as frames.
     #[cfg(test)]
     pub fn total_buffered_send(&self) -> usize {
         self.total_buffered_send
@@ -432,7 +505,7 @@ impl YamuxSession {
             FrameType::Ping => self.on_ping(frame),
             FrameType::GoAway => {
                 self.remote_go_away = true;
-                self.pending.push_back(YamuxOutput::GoAwayReceived {
+                self.events.push_back(YamuxOutput::GoAwayReceived {
                     code: frame.value(),
                 });
                 self.close_all_streams();
@@ -457,18 +530,16 @@ impl YamuxSession {
                 return Err(YamuxError::Protocol("duplicate SYN for an existing stream"));
             }
             if self.streams.len() >= self.config.max_streams {
-                self.queue_reset_for_unknown(stream)?;
-                return Ok(());
+                return self.queue_reset_for_unknown(stream);
             }
             self.streams.insert(
                 stream,
                 StreamState::inbound(&self.config, DEFAULT_RECEIVE_WINDOW),
             );
-            self.pending
+            self.events
                 .push_back(YamuxOutput::IncomingStream { stream });
         } else if !self.streams.contains_key(&stream) {
-            self.queue_reset_for_unknown(stream)?;
-            return Ok(());
+            return self.queue_reset_for_unknown(stream);
         }
 
         let mut data_output = None;
@@ -509,10 +580,10 @@ impl YamuxSession {
             fully_closed = state.remote_write_closed && state.local_write_closed;
         }
         if let Some(data) = data_output {
-            self.pending.push_back(YamuxOutput::Data { stream, data });
+            self.events.push_back(YamuxOutput::Data { stream, data });
         }
         if remote_closed {
-            self.pending
+            self.events
                 .push_back(YamuxOutput::RemoteWriteClosed { stream });
         }
         if fully_closed {
@@ -537,19 +608,17 @@ impl YamuxSession {
                 return Err(YamuxError::Protocol("duplicate SYN for an existing stream"));
             }
             if self.streams.len() >= self.config.max_streams {
-                self.queue_reset_for_unknown(stream)?;
-                return Ok(());
+                return self.queue_reset_for_unknown(stream);
             }
             let send_window = DEFAULT_RECEIVE_WINDOW
                 .checked_add(frame.value())
                 .ok_or(YamuxError::WindowOverflow { stream })?;
             self.streams
                 .insert(stream, StreamState::inbound(&self.config, send_window));
-            self.pending
+            self.events
                 .push_back(YamuxOutput::IncomingStream { stream });
         } else if !self.streams.contains_key(&stream) {
-            self.queue_reset_for_unknown(stream)?;
-            return Ok(());
+            return self.queue_reset_for_unknown(stream);
         } else {
             let state = self
                 .streams
@@ -561,6 +630,8 @@ impl YamuxSession {
                 .ok_or(YamuxError::WindowOverflow { stream })?;
         }
 
+        let mut remote_closed = false;
+        let fully_closed;
         {
             let state = self
                 .streams
@@ -569,19 +640,6 @@ impl YamuxSession {
             if flags & FLAG_ACK != 0 && state.locally_opened {
                 state.acknowledged = true;
             }
-        }
-        self.flush_buffered(stream)?;
-        if !self.streams.contains_key(&stream) {
-            return Ok(());
-        }
-
-        let mut remote_closed = false;
-        let fully_closed;
-        {
-            let state = self
-                .streams
-                .get_mut(&stream)
-                .expect("stream remains after flushing");
             if flags & FLAG_FIN != 0 && !state.remote_write_closed {
                 state.remote_write_closed = true;
                 remote_closed = true;
@@ -589,7 +647,7 @@ impl YamuxSession {
             fully_closed = state.remote_write_closed && state.local_write_closed;
         }
         if remote_closed {
-            self.pending
+            self.events
                 .push_back(YamuxOutput::RemoteWriteClosed { stream });
         }
         if fully_closed {
@@ -600,109 +658,151 @@ impl YamuxSession {
 
     fn on_ping(&mut self, frame: Frame) -> Result<(), YamuxError> {
         if frame.flags() == FLAG_SYN {
-            self.queue_frame(Frame::ping(FLAG_ACK, frame.value())?);
+            self.queue_peer_control(Frame::ping(FLAG_ACK, frame.value())?)?;
         }
         Ok(())
     }
 
-    fn flush_buffered(&mut self, stream: u32) -> Result<(), YamuxError> {
+    /// The next stream's open flag or returned receive credit, as a
+    /// standalone window update.
+    fn deferred_control_frame(&mut self) -> Option<Vec<u8>> {
+        let (&stream, state) = self
+            .streams
+            .iter_mut()
+            .find(|(_, state)| state.needs_control_frame())?;
+        let flags = state.take_open_flag();
+        let credit = state.pending_credit.min(u64::from(u32::MAX)) as u32;
+        state.pending_credit -= u64::from(credit);
+        // Pending credit is only ever what the window gave up, so this never
+        // saturates.
+        state.receive_window = state.receive_window.saturating_add(credit);
+        Some(Frame::window_update(stream, flags, credit).ok()?.encode())
+    }
+
+    /// Frames the next stream's data, round-robin from `send_cursor`, or its
+    /// `FIN` once its accepted bytes have all gone.
+    fn data_frame(&mut self) -> Option<Vec<u8>> {
+        let after = self.send_cursor;
+        let stream = self
+            .streams
+            .range(after.saturating_add(1)..)
+            .chain(self.streams.range(..=after))
+            .find_map(|(id, state)| state.has_sendable_data().then_some(*id))?;
+        self.send_cursor = stream;
         let max_frame_len = self.config.max_frame_len as usize;
-        let mut frames = Vec::new();
-        let mut drained = 0usize;
-        let mut close_after_flush = false;
-        let fully_closed;
-        {
-            let state = self
-                .streams
-                .get_mut(&stream)
-                .ok_or(YamuxError::UnknownStream(stream))?;
-            while state.send_window != 0 && !state.send_buffer.is_empty() {
-                let flags = state.take_open_flag();
-                let Some(chunk) = state.send_buffer.front_mut() else {
-                    break;
-                };
-                let unsent = chunk.unsent();
-                let send_len = unsent
+        let state = self.streams.get_mut(&stream)?;
+        let mut flags = state.take_open_flag();
+        let last_chunk = state.send_buffer.len() == 1;
+        let frame = match state.send_buffer.front_mut() {
+            Some(chunk) if state.send_window != 0 => {
+                let sent = chunk
+                    .bytes
                     .len()
                     .min(state.send_window as usize)
                     .min(max_frame_len);
-                let payload = unsent.get(..send_len).unwrap_or_default();
-                frames.push(Frame::encode_data(stream, flags, payload)?);
-                chunk.sent += send_len;
-                if chunk.unsent().is_empty() {
+                let drained = sent == chunk.bytes.len();
+                if drained && last_chunk && state.close_pending {
+                    flags |= FLAG_FIN;
+                }
+                let payload = chunk.bytes.get(..sent).unwrap_or_default();
+                let frame = Frame::encode_data(stream, flags, payload)
+                    .expect("payload length is bounded by the u32 send window");
+                if drained {
                     state.send_buffer.pop_front();
                 } else {
-                    chunk.bound_retained();
+                    chunk.advance(sent);
                 }
-                state.send_window -= send_len as u32;
-                state.buffered_send -= send_len;
-                drained += send_len;
+                state.send_window -= sent as u32;
+                state.buffered_send -= sent;
+                self.total_buffered_send -= sent;
+                frame
             }
-            if state.send_buffer.is_empty() && state.close_pending {
-                state.close_pending = false;
-                state.local_write_closed = true;
-                let flags = state.take_open_flag() | FLAG_FIN;
-                frames.push(Frame::encode_data(stream, flags, &[])?);
-                close_after_flush = true;
+            // Only a pending close is sendable with nothing buffered.
+            _ => {
+                flags |= FLAG_FIN;
+                Frame::encode_data(stream, flags, &[]).expect("empty FIN frame is valid")
             }
-            fully_closed = close_after_flush && state.remote_write_closed;
+        };
+        if flags & FLAG_FIN != 0 {
+            state.close_pending = false;
+            state.local_write_closed = true;
+            if state.remote_write_closed {
+                self.remove_stream(stream, true);
+            }
         }
-        self.total_buffered_send -= drained;
-        self.queue_encoded(frames);
-        if fully_closed {
-            self.remove_stream(stream, true);
-        }
-        Ok(())
+        Some(frame)
     }
 
-    fn materialize_deferred_control(&mut self) {
-        let Some(stream) = self
-            .streams
-            .iter()
-            .find_map(|(id, state)| state.has_deferred_control().then_some(*id))
-        else {
+    /// Queues [`YamuxOutput::Writable`] for every armed stream that can now
+    /// queue at least half of the smaller send cap.
+    fn wake_writable(&mut self) {
+        if self.writable_armed.is_empty() {
             return;
-        };
-        let frame = {
-            let state = self
-                .streams
-                .get_mut(&stream)
-                .expect("selected stream exists");
-            let flags = state.take_open_flag();
-            let credit = state.pending_credit.min(u64::from(u32::MAX)) as u32;
-            state.pending_credit -= u64::from(credit);
-            state.receive_window = state
-                .receive_window
-                .checked_add(credit)
-                .expect("pending receive credit stays within the configured window");
-            Frame::window_update(stream, flags, credit)
-                .expect("deferred control frame has valid stream and flags")
-        };
-        self.queue_frame(frame);
+        }
+        let threshold = (self
+            .config
+            .max_buffered_send
+            .min(self.config.max_total_buffered_send)
+            / 2)
+        .max(1);
+        let total_room = self
+            .config
+            .max_total_buffered_send
+            .saturating_sub(self.total_buffered_send);
+        if total_room < threshold {
+            return;
+        }
+        let max_buffered_send = self.config.max_buffered_send;
+        let streams = &self.streams;
+        let events = &mut self.events;
+        self.writable_armed.retain(|stream| {
+            let Some(state) = streams.get(stream) else {
+                return false;
+            };
+            if max_buffered_send.saturating_sub(state.buffered_send) < threshold {
+                return true;
+            }
+            events.push_back(YamuxOutput::Writable { stream: *stream });
+            false
+        });
     }
 
     fn queue_reset_for_unknown(&mut self, stream: u32) -> Result<(), YamuxError> {
-        self.queue_frame(Frame::data(stream, FLAG_RST, Vec::new())?);
+        self.queue_peer_control(Frame::data(stream, FLAG_RST, Vec::new())?)
+    }
+
+    /// Queues a reply the peer provoked (a ping acknowledgement, a reset for
+    /// an unknown stream) within the control reserve. A peer that keeps
+    /// provoking replies without reading them exhausts it, which is a
+    /// protocol violation that fails the session.
+    fn queue_peer_control(&mut self, frame: Frame) -> Result<(), YamuxError> {
+        if self.control.len() >= self.config.max_pending_control {
+            return Err(YamuxError::ControlReserveExhausted {
+                limit: self.config.max_pending_control,
+            });
+        }
+        self.push_control(frame);
         Ok(())
     }
 
-    fn queue_frame(&mut self, frame: Frame) {
+    /// Queues a control frame this side decided to send. Local frames are
+    /// bounded by local behaviour, not by the reserve.
+    fn push_control(&mut self, frame: Frame) {
         self.dirty = true;
-        self.pending
-            .push_back(YamuxOutput::Outbound(frame.encode()));
-    }
-
-    fn queue_encoded(&mut self, frames: Vec<Vec<u8>>) {
-        self.dirty |= !frames.is_empty();
-        self.pending
-            .extend(frames.into_iter().map(YamuxOutput::Outbound));
+        self.control.push_back(frame.encode());
     }
 
     fn remove_stream(&mut self, stream: u32, emit: bool) {
+        self.writable_armed.remove(&stream);
         if let Some(state) = self.streams.remove(&stream) {
             self.total_buffered_send -= state.buffered_send;
             if emit {
-                self.pending.push_back(YamuxOutput::StreamClosed { stream });
+                self.events.push_back(YamuxOutput::StreamClosed { stream });
+            }
+            // Its unframed bytes left the shared cap without a frame being
+            // pulled, so streams blocked on that cap must hear about it here.
+            if state.buffered_send != 0 {
+                self.wake_writable();
             }
         }
     }
@@ -710,9 +810,10 @@ impl YamuxSession {
     fn close_all_streams(&mut self) {
         let streams = self.streams.keys().copied().collect::<Vec<_>>();
         self.streams.clear();
+        self.writable_armed.clear();
         self.total_buffered_send = 0;
         for stream in streams {
-            self.pending.push_back(YamuxOutput::StreamClosed { stream });
+            self.events.push_back(YamuxOutput::StreamClosed { stream });
         }
     }
 
@@ -728,12 +829,14 @@ impl YamuxSession {
         let streams = self.streams.keys().copied().collect::<Vec<_>>();
         self.failed = true;
         self.streams.clear();
+        self.writable_armed.clear();
         self.total_buffered_send = 0;
         self.decoder.clear();
-        self.pending.clear();
-        self.queue_frame(Frame::go_away(1));
+        self.events.clear();
+        self.control.clear();
+        self.push_control(Frame::go_away(1));
         for stream in streams {
-            self.pending.push_back(YamuxOutput::StreamClosed { stream });
+            self.events.push_back(YamuxOutput::StreamClosed { stream });
         }
         Err(error)
     }
@@ -746,10 +849,7 @@ mod tests {
     use minip2p_platform::{Deadline, Now};
 
     fn outbound(session: &mut YamuxSession) -> Vec<u8> {
-        match session.poll_output().expect("outbound Yamux frame") {
-            YamuxOutput::Outbound(bytes) => bytes,
-            output => panic!("expected outbound bytes, got {output:?}"),
-        }
+        session.poll_frame().expect("outbound Yamux frame")
     }
 
     fn decode(bytes: &[u8]) -> Frame {
@@ -795,7 +895,7 @@ mod tests {
         let mut client = YamuxSession::new(YamuxRole::Client);
         let mut server = YamuxSession::new(YamuxRole::Server);
         let stream = client.open_stream().unwrap();
-        client.send(stream, b"hello".to_vec()).unwrap();
+        client.send(stream, Bytes::from(b"hello".to_vec())).unwrap();
         let opening = outbound(&mut client);
         assert_eq!(decode(&opening).flags(), FLAG_SYN);
         server.handle_data(&opening).unwrap();
@@ -810,7 +910,7 @@ mod tests {
                 data: b"hello".to_vec()
             })
         );
-        server.send(stream, b"world".to_vec()).unwrap();
+        server.send(stream, Bytes::from(b"world".to_vec())).unwrap();
         let response = outbound(&mut server);
         assert_eq!(decode(&response).flags(), FLAG_ACK);
         client.handle_data(&response).unwrap();
@@ -829,7 +929,9 @@ mod tests {
         let mut client = YamuxSession::new(YamuxRole::Client);
         let mut server = YamuxSession::new(YamuxRole::Server);
         let stream = server.open_stream().unwrap();
-        server.send(stream, b"request".to_vec()).unwrap();
+        server
+            .send(stream, Bytes::from(b"request".to_vec()))
+            .unwrap();
         client.handle_data(&outbound(&mut server)).unwrap();
         assert_eq!(
             client.poll_output(),
@@ -843,7 +945,9 @@ mod tests {
             })
         );
 
-        client.send(stream, b"response".to_vec()).unwrap();
+        client
+            .send(stream, Bytes::from(b"response".to_vec()))
+            .unwrap();
         server.handle_data(&outbound(&mut client)).unwrap();
         assert!(server.is_acknowledged(stream).unwrap());
         assert_eq!(
@@ -897,22 +1001,30 @@ mod tests {
     }
 
     #[test]
-    fn window_exhaustion_buffers_then_drains() {
-        let mut client = YamuxSession::with_config(YamuxRole::Client, config()).unwrap();
+    fn accepted_bytes_count_until_pulled_and_queue_past_the_window() {
+        let mut limits = config();
+        limits.max_buffered_send *= 2;
+        let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
         let stream = client.open_stream().unwrap();
-        let data = alloc::vec![7; DEFAULT_RECEIVE_WINDOW as usize + 5];
+        let data = Bytes::from(alloc::vec![7; DEFAULT_RECEIVE_WINDOW as usize + 5]);
+        // Peer credit does not decide acceptance; only the caps do.
         client.send(stream, data).unwrap();
-        assert_eq!(client.total_buffered_send(), 5);
+        assert_eq!(
+            client.total_buffered_send(),
+            DEFAULT_RECEIVE_WINDOW as usize + 5
+        );
         let first = outbound(&mut client);
         assert_eq!(
             decode(&first).payload().len(),
             DEFAULT_RECEIVE_WINDOW as usize
         );
+        assert_eq!(client.total_buffered_send(), 5);
+        assert_eq!(client.poll_frame(), None, "no credit, no frame");
 
         let update = Frame::window_update(stream, FLAG_ACK, 5).unwrap().encode();
         client.handle_data(&update).unwrap();
-        assert_eq!(client.total_buffered_send(), 0);
         assert_eq!(decode(&outbound(&mut client)).payload(), &[7; 5]);
+        assert_eq!(client.total_buffered_send(), 0);
     }
 
     #[test]
@@ -922,8 +1034,12 @@ mod tests {
         let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
         let stream = client.open_stream().unwrap();
         client.streams.get_mut(&stream).unwrap().send_window = 10;
-        client.send(stream, b"abcdefghijkl".to_vec()).unwrap();
-        client.send(stream, b"mnopqrstu".to_vec()).unwrap();
+        client
+            .send(stream, Bytes::from(b"abcdefghijkl".to_vec()))
+            .unwrap();
+        client
+            .send(stream, Bytes::from(b"mnopqrstu".to_vec()))
+            .unwrap();
         let payloads = |client: &mut YamuxSession| {
             core::iter::from_fn(|| client.poll_output())
                 .map(|output| match output {
@@ -950,62 +1066,229 @@ mod tests {
     fn queued_chunks_retain_at_most_twice_their_unsent_bytes() {
         let mut client = YamuxSession::with_config(YamuxRole::Client, config()).unwrap();
         let stream = client.open_stream().unwrap();
-        let retained = |client: &YamuxSession| {
-            client.streams[&stream]
-                .send_buffer
-                .iter()
-                .map(|chunk| chunk.bytes.capacity())
-                .sum::<usize>()
+        let source = Bytes::from(alloc::vec![1; 100]);
+        let retains_source = |client: &YamuxSession| {
+            client.streams[&stream].send_buffer.iter().any(|chunk| {
+                chunk.bytes.as_ptr() >= source.as_ptr()
+                    && chunk.bytes.as_ptr() < source.as_ptr().wrapping_add(100)
+            })
         };
-        client.streams.get_mut(&stream).unwrap().send_window = 99;
-        client.send(stream, alloc::vec![1; 100]).unwrap();
-        assert_eq!(client.total_buffered_send(), 1);
-        assert!(
-            retained(&client) <= 2,
-            "a mostly framed send keeps only its tail"
-        );
+        client.streams.get_mut(&stream).unwrap().send_window = 40;
+        client.send(stream, source.clone()).unwrap();
+        while client.poll_frame().is_some() {}
+        assert_eq!(client.total_buffered_send(), 60);
+        assert!(retains_source(&client), "a tail of 60/100 stays a slice");
 
-        client.send(stream, alloc::vec![2; 100]).unwrap();
-        for credit in [30, 30, 25] {
-            let update = Frame::window_update(stream, 0, credit).unwrap().encode();
-            client.handle_data(&update).unwrap();
-            while client.poll_output().is_some() {}
-            assert!(retained(&client) <= 2 * client.total_buffered_send());
-        }
-        assert_eq!(client.total_buffered_send(), 16);
+        let update = Frame::window_update(stream, 0, 20).unwrap().encode();
+        client.handle_data(&update).unwrap();
+        while client.poll_frame().is_some() {}
+        assert_eq!(client.total_buffered_send(), 40);
+        assert!(
+            !retains_source(&client),
+            "a tail under half its counted length is copied out"
+        );
     }
 
     #[test]
-    fn buffer_caps_reject_atomically_and_session_survives() {
+    fn a_write_past_the_caps_returns_the_exact_unsent_suffix() {
         let mut limits = config();
         limits.max_buffered_send = 4;
         limits.max_total_buffered_send = 6;
         let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
         let first = session.open_stream().unwrap();
         let second = session.open_stream().unwrap();
-        session.streams.get_mut(&first).unwrap().send_window = 0;
-        session.streams.get_mut(&second).unwrap().send_window = 0;
 
-        assert!(matches!(
-            session.send(first, alloc::vec![1; 5]),
-            Err(YamuxError::SendBufferFull { .. })
-        ));
-        assert_eq!(session.total_buffered_send(), 0);
-        session.send(first, alloc::vec![1; 4]).unwrap();
-        assert!(matches!(
-            session.send(second, alloc::vec![2; 3]),
-            Err(YamuxError::SendBufferFull { .. })
-        ));
+        let unsent = |result| match result {
+            Err(YamuxError::Full { unsent, .. }) => unsent,
+            other => panic!("expected Full, got {other:?}"),
+        };
+        assert_eq!(
+            unsent(session.send(first, Bytes::from_static(b"abcde"))),
+            &b"e"[..]
+        );
         assert_eq!(session.total_buffered_send(), 4);
-        session.send(second, alloc::vec![2; 2]).unwrap();
+        // The shared cap leaves two bytes for the second stream.
+        assert_eq!(
+            unsent(session.send(second, Bytes::from_static(b"xyz"))),
+            &b"z"[..]
+        );
+        assert_eq!(
+            unsent(session.send(second, Bytes::from_static(b"!"))),
+            &b"!"[..],
+            "nothing fits: the whole payload comes back"
+        );
         assert_eq!(session.total_buffered_send(), 6);
+    }
 
-        session
-            .handle_data(&Frame::window_update(first, 0, 4).unwrap().encode())
+    #[test]
+    fn resending_tails_after_writable_reproduces_the_byte_stream() {
+        let mut limits = config();
+        limits.max_buffered_send = 8;
+        limits.max_frame_len = 3;
+        let mut client = YamuxSession::with_config(YamuxRole::Client, limits.clone()).unwrap();
+        let mut server = YamuxSession::with_config(YamuxRole::Server, limits).unwrap();
+        let stream = client.open_stream().unwrap();
+        let payload: Vec<u8> = (0..100).collect();
+        let mut pending = Some(Bytes::from(payload.clone()));
+        let mut received = Vec::new();
+        let mut writable_count = 0;
+        while pending.is_some() || client.has_frames() {
+            if let Some(data) = pending.take() {
+                match client.send(stream, data) {
+                    Ok(()) => {}
+                    Err(YamuxError::Full { unsent, .. }) => pending = Some(unsent),
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            while let Some(frame) = client.poll_frame() {
+                server.handle_data(&frame).unwrap();
+            }
+            while let Some(event) = client.poll_event() {
+                assert_eq!(event, YamuxOutput::Writable { stream });
+                writable_count += 1;
+            }
+            while let Some(output) = server.poll_output() {
+                match output {
+                    YamuxOutput::Data { data, .. } => received.extend(data),
+                    YamuxOutput::Outbound(frame) => client.handle_data(&frame).unwrap(),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(received, payload);
+        assert!(writable_count > 0);
+    }
+
+    #[test]
+    fn writable_fires_once_per_full_and_for_shared_cap_blocks() {
+        let mut limits = config();
+        limits.max_buffered_send = 8;
+        limits.max_total_buffered_send = 8;
+        let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        let busy = session.open_stream().unwrap();
+        let starved = session.open_stream().unwrap();
+        session.send(busy, Bytes::from(alloc::vec![1; 8])).unwrap();
+        // `starved` has nothing queued; only the shared cap blocks it.
+        assert!(matches!(
+            session.send(starved, Bytes::from_static(b"x")),
+            Err(YamuxError::Full { .. })
+        ));
+        assert!(matches!(
+            session.send(busy, Bytes::from_static(b"y")),
+            Err(YamuxError::Full { .. })
+        ));
+        while session.poll_frame().is_some() {}
+        let mut woken = Vec::new();
+        while let Some(event) = session.poll_event() {
+            if let YamuxOutput::Writable { stream } = event {
+                woken.push(stream);
+            }
+        }
+        woken.sort_unstable();
+        assert_eq!(woken, [busy, starved]);
+
+        session.send(busy, Bytes::from_static(b"z")).unwrap();
+        while session.poll_frame().is_some() {}
+        assert_eq!(
+            session.poll_event(),
+            None,
+            "no second Writable without a Full"
+        );
+    }
+
+    #[test]
+    fn a_reset_that_frees_the_shared_cap_wakes_blocked_streams() {
+        let mut limits = config();
+        limits.max_buffered_send = 8;
+        limits.max_total_buffered_send = 8;
+        let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        let hog = session.open_stream().unwrap();
+        let blocked = session.open_stream().unwrap();
+        // No remote credit, so nothing is ever framed from `hog`.
+        session.streams.get_mut(&hog).unwrap().send_window = 0;
+        session.send(hog, Bytes::from(alloc::vec![1; 8])).unwrap();
+        assert!(matches!(
+            session.send(blocked, Bytes::from_static(b"x")),
+            Err(YamuxError::Full { .. })
+        ));
+
+        session.reset(hog).unwrap();
+        let events: Vec<_> = core::iter::from_fn(|| session.poll_event()).collect();
+        assert!(
+            events.contains(&YamuxOutput::Writable { stream: blocked }),
+            "freeing the shared cap must wake the blocked stream: {events:?}"
+        );
+    }
+
+    #[test]
+    fn writable_never_fires_after_the_write_side_ends() {
+        let mut limits = config();
+        limits.max_buffered_send = 4;
+        let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        let closed = session.open_stream().unwrap();
+        let reset = session.open_stream().unwrap();
+        for stream in [closed, reset] {
+            assert!(matches!(
+                session.send(stream, Bytes::from_static(b"abcdef")),
+                Err(YamuxError::Full { .. })
+            ));
+        }
+        session.close_write(closed).unwrap();
+        assert!(matches!(
+            session.send(closed, Bytes::from_static(b"late")),
+            Err(YamuxError::StreamWriteClosed(_))
+        ));
+        session.reset(reset).unwrap();
+        while session.poll_frame().is_some() {}
+        while let Some(event) = session.poll_event() {
+            assert!(
+                !matches!(event, YamuxOutput::Writable { .. }),
+                "unexpected {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_peer_flooding_pings_cannot_grow_control_past_the_reserve() {
+        let mut limits = config();
+        limits.max_pending_control = 4;
+        let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        let ping = Frame::ping(FLAG_SYN, 1).unwrap().encode();
+        for _ in 0..4 {
+            session.handle_data(&ping).unwrap();
+        }
+        assert!(matches!(
+            session.handle_data(&ping),
+            Err(YamuxError::ControlReserveExhausted { limit: 4 })
+        ));
+        let frames: Vec<_> = core::iter::from_fn(|| session.poll_frame()).collect();
+        assert_eq!(frames.len(), 1, "only the protocol GoAway remains");
+        assert_eq!(decode(&frames[0]).frame_type(), FrameType::GoAway);
+    }
+
+    #[test]
+    fn inbound_events_do_not_wait_behind_unpulled_frames() {
+        let mut client = YamuxSession::new(YamuxRole::Client);
+        let mut server = YamuxSession::new(YamuxRole::Server);
+        let stream = client.open_stream().unwrap();
+        client.send(stream, Bytes::from_static(b"hi")).unwrap();
+        server.handle_data(&outbound(&mut client)).unwrap();
+        server
+            .send(stream, Bytes::from(alloc::vec![0; 1000]))
             .unwrap();
-        assert_eq!(session.total_buffered_send(), 2);
-        session.send(second, alloc::vec![3; 2]).unwrap();
-        assert_eq!(session.total_buffered_send(), 4);
+        server
+            .handle_data(&Frame::ping(FLAG_SYN, 7).unwrap().encode())
+            .unwrap();
+        // Frames are queued, yet events come out without pulling any.
+        assert_eq!(
+            server.poll_event(),
+            Some(YamuxOutput::IncomingStream { stream })
+        );
+        assert!(matches!(
+            server.poll_event(),
+            Some(YamuxOutput::Data { .. })
+        ));
+        assert!(server.has_frames());
     }
 
     #[test]
@@ -1013,26 +1296,29 @@ mod tests {
         let mut session = YamuxSession::with_config(YamuxRole::Client, config()).unwrap();
         let stream = session.open_stream().unwrap();
         session.streams.get_mut(&stream).unwrap().send_window = 0;
-        session.send(stream, b"queued".to_vec()).unwrap();
+        session.send(stream, Bytes::from_static(b"queued")).unwrap();
         session.close_write(stream).unwrap();
         assert!(session.streams[&stream].close_pending);
+        // Only the standalone SYN can go before credit arrives.
+        assert_eq!(decode(&outbound(&mut session)).flags(), FLAG_SYN);
+        assert_eq!(session.poll_frame(), None);
         session
             .handle_data(&Frame::window_update(stream, FLAG_ACK, 6).unwrap().encode())
             .unwrap();
         let data = decode(&outbound(&mut session));
         assert_eq!(data.payload(), b"queued");
-        let fin = decode(&outbound(&mut session));
-        assert_eq!(fin.flags(), FLAG_FIN);
+        assert_eq!(data.flags(), FLAG_FIN, "FIN rides on the last data frame");
 
         let reset_stream = session.open_stream().unwrap();
+        assert_eq!(decode(&outbound(&mut session)).flags(), FLAG_SYN);
         session.reset(reset_stream).unwrap();
-        assert_eq!(decode(&outbound(&mut session)).flags(), FLAG_RST);
         assert_eq!(
             session.poll_output(),
             Some(YamuxOutput::StreamClosed {
                 stream: reset_stream
             })
         );
+        assert_eq!(decode(&outbound(&mut session)).flags(), FLAG_RST);
     }
 
     #[test]
@@ -1240,7 +1526,9 @@ mod tests {
         let mut session = YamuxSession::new(YamuxRole::Client);
         session.poll(Now::from_millis(0)).unwrap();
         let stream = session.open_stream().unwrap();
-        session.send(stream, b"hello".to_vec()).unwrap();
+        session
+            .send(stream, Bytes::from(b"hello".to_vec()))
+            .unwrap();
         assert_eq!(decode(&outbound(&mut session)).payload(), b"hello");
 
         session

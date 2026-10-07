@@ -1,4 +1,5 @@
 use gungraun::prelude::*;
+use minip2p_core::Bytes;
 use minip2p_yamux::{
     FLAG_SYN, Frame, FrameDecoder, FrameType, YamuxOutput, YamuxRole, YamuxSession,
 };
@@ -16,7 +17,7 @@ fn sender() -> (YamuxSession, u32, Vec<u8>) {
 #[bench::session_send_and_drain(sender())]
 fn session_send_and_drain(input: (YamuxSession, u32, Vec<u8>)) {
     let (mut session, stream, data) = input;
-    session.send(stream, data).expect("send");
+    session.send(stream, Bytes::from(data)).expect("send");
     black_box(session.poll_output());
 }
 
@@ -44,7 +45,7 @@ fn window_exhausted_sender() -> (YamuxSession, u32) {
     let mut session = YamuxSession::new(YamuxRole::Client);
     let stream = session.open_stream().expect("open stream");
     session
-        .send(stream, vec![0; QUEUED_LEN])
+        .send(stream, Bytes::from(vec![0; QUEUED_LEN]))
         .expect("fill window");
     while session.poll_output().is_some() {}
     (session, stream)
@@ -79,7 +80,9 @@ fn queued_sender() -> (YamuxSession, u32, Vec<u8>, Vec<u8>) {
         })
         .collect();
     let queued = vec![0x5a; QUEUED_LEN];
-    session.send(stream, queued.clone()).expect("send");
+    session
+        .send(stream, Bytes::from(queued.clone()))
+        .expect("send");
     session.handle_data(&updates).expect("window updates");
     assert!(
         drained_data(&mut session) == queued,
@@ -94,7 +97,7 @@ fn queued_sender() -> (YamuxSession, u32, Vec<u8>, Vec<u8>) {
 #[bench::queued_send_16kib_window_updates(queued_sender())]
 fn queued_send_16kib_window_updates(input: (YamuxSession, u32, Vec<u8>, Vec<u8>)) {
     let (mut session, stream, data, updates) = input;
-    session.send(stream, data).expect("send");
+    session.send(stream, Bytes::from(data)).expect("send");
     session.handle_data(&updates).expect("window updates");
     while let Some(output) = session.poll_output() {
         black_box(output);

@@ -9,9 +9,9 @@ use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_platform::{Deadline, Now};
 use minip2p_secure_mux::{
     KEEPALIVE_INTERVAL_MS, SecureMuxSession, SessionConfig, SessionError, SessionOutput,
-    SessionRole, YamuxConfig,
+    SessionRole, YamuxConfig, YamuxError,
 };
-use minip2p_transport::StreamId;
+use minip2p_transport::{Bytes, StreamId};
 
 fn session(
     role: SessionRole,
@@ -53,24 +53,16 @@ fn exchange(
     for _ in 0..64 {
         let mut moved = false;
 
-        while let Some(output) = a.poll_output() {
-            match output {
-                SessionOutput::Write(bytes) => {
-                    moved = true;
-                    b.handle_input(bytes).expect("peer accepts bytes");
-                }
-                other => a_events.push(other),
-            }
+        while let Some(bytes) = a.poll_write().expect("a writes") {
+            moved = true;
+            b.handle_input(bytes).expect("peer accepts bytes");
         }
-        while let Some(output) = b.poll_output() {
-            match output {
-                SessionOutput::Write(bytes) => {
-                    moved = true;
-                    a.handle_input(bytes).expect("peer accepts bytes");
-                }
-                other => b_events.push(other),
-            }
+        a_events.extend(core::iter::from_fn(|| a.poll_output()));
+        while let Some(bytes) = b.poll_write().expect("b writes") {
+            moved = true;
+            a.handle_input(bytes).expect("peer accepts bytes");
         }
+        b_events.extend(core::iter::from_fn(|| b.poll_output()));
 
         if !moved {
             break;
@@ -98,7 +90,7 @@ fn stream_payloads(events: &[SessionOutput]) -> Vec<&[u8]> {
     events
         .iter()
         .filter_map(|event| match event {
-            SessionOutput::StreamData { data, .. } => Some(data.as_slice()),
+            SessionOutput::StreamData { data, .. } => Some(&data[..]),
             _ => None,
         })
         .collect()
@@ -156,12 +148,10 @@ fn two_sessions_complete_the_upgrade_and_authenticate_each_other() {
 fn flush_batched(from: &mut SecureMuxSession, to: &mut SecureMuxSession) -> Vec<SessionOutput> {
     let mut batch = Vec::new();
     let mut events = Vec::new();
-    while let Some(output) = from.poll_output() {
-        match output {
-            SessionOutput::Write(bytes) => batch.extend_from_slice(&bytes),
-            other => events.push(other),
-        }
+    while let Some(bytes) = from.poll_write().expect("write") {
+        batch.extend_from_slice(&bytes);
     }
+    events.extend(core::iter::from_fn(|| from.poll_output()));
     if !batch.is_empty() {
         to.handle_input(batch).expect("peer accepts the batch");
     }
@@ -172,11 +162,10 @@ fn flush_batched(from: &mut SecureMuxSession, to: &mut SecureMuxSession) -> Vec<
 /// and discarding the rest.
 fn take_writes(session: &mut SecureMuxSession) -> Vec<u8> {
     let mut batch = Vec::new();
-    while let Some(output) = session.poll_output() {
-        if let SessionOutput::Write(bytes) = output {
-            batch.extend_from_slice(&bytes);
-        }
+    while let Some(bytes) = session.poll_write().expect("write") {
+        batch.extend_from_slice(&bytes);
     }
+    while session.poll_output().is_some() {}
     batch
 }
 
@@ -221,20 +210,16 @@ fn established_is_reported_before_any_stream_output() {
     // its Yamux confirmation, so the dialer decrypts the confirmation and the
     // frames in one batch -- the pipelined path.
     let stream = listener.open_stream().expect("open substream");
-    listener.send(stream, b"pipelined".to_vec()).expect("send");
+    listener
+        .send(stream, Bytes::from_static(b"pipelined"))
+        .expect("send");
 
     let dialer_events = {
         let batch = take_writes(&mut listener);
         dialer
             .handle_input(batch)
             .expect("dialer accepts the batch");
-        let mut events = Vec::new();
-        while let Some(output) = dialer.poll_output() {
-            if !matches!(output, SessionOutput::Write(_)) {
-                events.push(output);
-            }
-        }
-        events
+        core::iter::from_fn(|| dialer.poll_output()).collect::<Vec<_>>()
     };
 
     // The batch really did carry both, or this test proves nothing.
@@ -270,7 +255,7 @@ fn substreams_carry_data_in_both_directions() {
 
     let stream = dialer.open_stream().expect("open substream");
     dialer
-        .send(stream, b"ping".to_vec())
+        .send(stream, Bytes::from_static(b"ping"))
         .expect("send on substream");
     let (_, listener_events) = exchange(&mut dialer, &mut listener);
 
@@ -286,7 +271,7 @@ fn substreams_carry_data_in_both_directions() {
 
     // ...and back the other way on the same substream.
     listener
-        .send(incoming[0], b"pong".to_vec())
+        .send(incoming[0], Bytes::from_static(b"pong"))
         .expect("reply on substream");
     let (dialer_events, _) = exchange(&mut dialer, &mut listener);
     assert_eq!(stream_payloads(&dialer_events), vec![b"pong".as_slice()]);
@@ -297,7 +282,9 @@ fn half_close_and_reset_reach_the_remote() {
     let (mut dialer, mut listener, _, _) = upgraded_pair();
 
     let stream = dialer.open_stream().expect("open substream");
-    dialer.send(stream, b"data".to_vec()).expect("send");
+    dialer
+        .send(stream, Bytes::from_static(b"data"))
+        .expect("send");
     dialer.close_stream_write(stream).expect("half close");
     let (_, listener_events) = exchange(&mut dialer, &mut listener);
 
@@ -309,6 +296,7 @@ fn half_close_and_reset_reach_the_remote() {
     );
 
     let second = dialer.open_stream().expect("open second substream");
+    let _ = exchange(&mut dialer, &mut listener);
     dialer.reset_stream(second).expect("reset");
     let (_, listener_events) = exchange(&mut dialer, &mut listener);
     assert!(
@@ -337,13 +325,10 @@ fn go_away_closes_local_substreams_and_ends_the_remote_session() {
         .expect("an established session shuts down");
 
     let mut wire = Vec::new();
-    let mut local = Vec::new();
-    while let Some(output) = dialer.poll_output() {
-        match output {
-            SessionOutput::Write(bytes) => wire.extend_from_slice(&bytes),
-            other => local.push(other),
-        }
+    while let Some(bytes) = dialer.poll_write().expect("write") {
+        wire.extend_from_slice(&bytes);
     }
+    let local: Vec<_> = core::iter::from_fn(|| dialer.poll_output()).collect();
     assert_eq!(
         local,
         vec![SessionOutput::StreamClosed { stream }],
@@ -386,12 +371,7 @@ fn a_remote_go_away_closes_the_substreams_it_takes_down() {
     // A remote shutdown ends the substreams exactly as a local one does, so a
     // caller draining outputs after the error still learns to forget them
     // rather than leaking a substream it will never hear about again.
-    let mut events = Vec::new();
-    while let Some(output) = listener.poll_output() {
-        if !matches!(output, SessionOutput::Write(_)) {
-            events.push(output);
-        }
-    }
+    let events: Vec<_> = core::iter::from_fn(|| listener.poll_output()).collect();
     assert_eq!(
         events,
         vec![SessionOutput::StreamClosed { stream: inbound }],
@@ -414,20 +394,16 @@ fn a_mismatched_expected_peer_fails_the_handshake() {
     let mut failed = false;
     for _ in 0..64 {
         let mut moved = false;
-        while let Some(output) = dialer.poll_output() {
-            if let SessionOutput::Write(bytes) = output {
-                moved = true;
-                listener
-                    .handle_input(bytes)
-                    .expect("responder accepts the initiator's first handshake message");
-            }
+        while let Some(bytes) = dialer.poll_write().expect("write") {
+            moved = true;
+            listener
+                .handle_input(bytes)
+                .expect("responder accepts the initiator's first handshake message");
         }
-        while let Some(output) = listener.poll_output() {
-            if let SessionOutput::Write(bytes) = output {
-                moved = true;
-                if dialer.handle_input(bytes).is_err() {
-                    failed = true;
-                }
+        while let Some(bytes) = listener.poll_write().expect("write") {
+            moved = true;
+            if dialer.handle_input(bytes).is_err() {
+                failed = true;
             }
         }
         if failed || !moved {
@@ -452,7 +428,7 @@ fn stream_operations_before_the_upgrade_are_rejected() {
         Err(SessionError::NotEstablished)
     ));
     assert!(matches!(
-        dialer.send(StreamId::new(1), b"x".to_vec()),
+        dialer.send(StreamId::new(1), Bytes::from_static(b"x")),
         Err(SessionError::NotEstablished)
     ));
     assert!(matches!(
@@ -491,7 +467,7 @@ fn out_of_range_stream_ids_are_rejected_rather_than_truncated() {
     // and operate on somebody else's substream.
     let aliased = StreamId::new(stream.as_u64() + (1u64 << 32));
     assert!(matches!(
-        dialer.send(aliased, b"x".to_vec()),
+        dialer.send(aliased, Bytes::from_static(b"x")),
         Err(SessionError::UnknownStream { .. })
     ));
     assert!(matches!(
@@ -500,7 +476,9 @@ fn out_of_range_stream_ids_are_rejected_rather_than_truncated() {
     ));
 
     // The real stream still works, so the rejection cost nothing.
-    dialer.send(stream, b"ok".to_vec()).expect("real stream");
+    dialer
+        .send(stream, Bytes::from_static(b"ok"))
+        .expect("real stream");
 }
 
 #[test]
@@ -532,7 +510,7 @@ fn a_session_that_fails_mid_batch_is_dead_and_stays_dead() {
 
     let stream = listener.open_stream().expect("open substream");
     listener
-        .send(stream, vec![0u8; 4096])
+        .send(stream, Bytes::from(vec![0u8; 4096]))
         .expect("queue an oversized frame");
 
     let result = dialer.handle_input(take_writes(&mut listener));
@@ -594,4 +572,49 @@ fn quiet_established_session_emits_a_keepalive_ping() {
         events.is_empty(),
         "a keepalive pong is session traffic, not a substream event: {events:?}"
     );
+}
+
+#[test]
+fn stream_bytes_are_encrypted_only_when_pulled_and_full_wakes_writable() {
+    let caps = YamuxConfig {
+        max_buffered_send: 64 * 1024,
+        max_total_buffered_send: 64 * 1024,
+        ..YamuxConfig::default()
+    };
+    let dialer_key = Ed25519Keypair::generate();
+    let listener_key = Ed25519Keypair::generate();
+    let mut dialer = session_with(
+        SessionRole::Initiator,
+        dialer_key,
+        Some(&listener_key),
+        caps,
+    );
+    let mut listener = session(SessionRole::Responder, listener_key, None);
+    dialer.start().expect("start");
+    listener.start().expect("start");
+    let _ = exchange(&mut dialer, &mut listener);
+    let stream = dialer.open_stream().expect("open substream");
+
+    let unsent = match dialer.send(stream, Bytes::from(vec![9u8; 100 * 1024])) {
+        Err(SessionError::Yamux(YamuxError::Full { unsent, .. })) => unsent,
+        other => panic!("expected Full, got {other:?}"),
+    };
+    assert_eq!(unsent.len(), 36 * 1024, "the exact suffix past the cap");
+    assert!(
+        dialer.poll_output().is_none(),
+        "nothing pulled, no Writable"
+    );
+
+    let mut written = 0;
+    while let Some(bytes) = dialer.poll_write().expect("write") {
+        written += bytes.len();
+    }
+    assert!(written >= 64 * 1024, "pulling frames the accepted bytes");
+    assert_eq!(
+        dialer.poll_output(),
+        Some(SessionOutput::StreamWritable { stream })
+    );
+    dialer
+        .send(stream, unsent)
+        .expect("the tail fits after Writable");
 }

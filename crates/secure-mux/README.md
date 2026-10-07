@@ -16,7 +16,7 @@ Relay circuits and TCP connections differ only in what the byte stream _is_ — 
 
 ## Usage
 
-The session owns no socket, no clock, and no executor. Feed it bytes read from the underlying stream, then drain outputs and write every `Write` back to that stream. After the upgrade, `poll(now)` / `next_deadline()` drive Yamux keepalive from the host's time sample:
+The session owns no socket, no clock, and no executor. Feed it bytes read from the underlying stream, drain its events with `poll_output`, and pull bytes to write with `poll_write` -- but only while the stream below has room. Once the session is up, each `poll_write` frames and encrypts the next Yamux frame on demand, so a downstream that stops taking bytes stops the session from producing them (ADR 0012). After the upgrade, `poll(now)` / `next_deadline()` drive Yamux keepalive from the host's time sample:
 
 ```rust
 use minip2p_secure_mux::{SecureMuxSession, SessionConfig, SessionOutput, SessionRole, YamuxConfig};
@@ -33,21 +33,25 @@ let mut session = SecureMuxSession::new(SessionConfig {
 session.start()?;
 
 loop {
+    while stream.has_room() {
+        let Some(bytes) = session.poll_write()? else { break };
+        stream.write(&bytes)?;
+    }
     while let Some(output) = session.poll_output() {
         match output {
-            SessionOutput::Write(bytes) => stream.write_all(&bytes)?,
             SessionOutput::Established { peer, .. } => { /* connection policy */ }
             SessionOutput::IncomingStream { stream } => { /* accept substream */ }
             SessionOutput::StreamData { stream, data } => { /* deliver */ }
             SessionOutput::StreamRemoteWriteClosed { stream } => { /* half close */ }
             SessionOutput::StreamClosed { stream } => { /* forget */ }
+            SessionOutput::StreamWritable { stream } => { /* resend a held tail */ }
         }
     }
     session.handle_input(stream.read()?)?;
 }
 ```
 
-Substreams are driven with `open_stream`, `send`, `close_stream_write`, and `reset_stream`; each queues outbound bytes as further `Write` outputs.
+Substreams are driven with `open_stream`, `send`, `close_stream_write`, and `reset_stream`; their frames come out of later `poll_write` calls. `send` takes a `Bytes` payload and accepts as much as the substream's Yamux send caps allow; the rest comes back as `YamuxError::Full` carrying the exact unsent suffix, and `StreamWritable` follows once the substream can queue again. Received data and events never wait behind outbound frames, and control replies a peer provokes without reading them are bounded by `YamuxConfig::max_pending_control`.
 
 ## Policy stays with the caller
 

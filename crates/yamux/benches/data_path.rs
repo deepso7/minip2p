@@ -1,3 +1,4 @@
+use minip2p_core::Bytes;
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
@@ -32,7 +33,7 @@ fn yamux_data_path(c: &mut Criterion) {
     let mut verified_sender = YamuxSession::new(YamuxRole::Client);
     let stream = verified_sender.open_stream().expect("open stream");
     verified_sender
-        .send(stream, payload.clone())
+        .send(stream, Bytes::from(payload.clone()))
         .expect("send payload");
     assert_payload_frame(
         verified_sender.poll_output().expect("outbound payload"),
@@ -61,7 +62,7 @@ fn yamux_data_path(c: &mut Criterion) {
                 (session, stream, payload.clone())
             },
             |(mut session, stream, data)| {
-                session.send(stream, data).expect("send");
+                session.send(stream, Bytes::from(data)).expect("send");
                 black_box(session.poll_output())
             },
             BatchSize::SmallInput,
@@ -91,7 +92,9 @@ fn yamux_data_path(c: &mut Criterion) {
         .collect::<Vec<u8>>();
     let queued = vec![0x5a; QUEUED_LEN];
     let (mut verified, stream) = window_exhausted_sender();
-    verified.send(stream, queued.clone()).expect("send");
+    verified
+        .send(stream, Bytes::from(queued.clone()))
+        .expect("send");
     verified.handle_data(&updates).expect("window updates");
     assert!(
         drained_data(&mut verified) == queued,
@@ -103,7 +106,7 @@ fn yamux_data_path(c: &mut Criterion) {
         b.iter_batched(
             || (window_exhausted_sender(), queued.clone()),
             |((mut session, stream), data)| {
-                session.send(stream, data).expect("send");
+                session.send(stream, Bytes::from(data)).expect("send");
                 session.handle_data(&updates).expect("window updates");
                 while let Some(output) = session.poll_output() {
                     black_box(output);
@@ -120,7 +123,7 @@ fn window_exhausted_sender() -> (YamuxSession, u32) {
     let mut session = YamuxSession::new(YamuxRole::Client);
     let stream = session.open_stream().expect("open stream");
     session
-        .send(stream, vec![0; QUEUED_LEN])
+        .send(stream, Bytes::from(vec![0; QUEUED_LEN]))
         .expect("fill window");
     while session.poll_output().is_some() {}
     (session, stream)
