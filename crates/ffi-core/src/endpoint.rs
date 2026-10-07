@@ -144,8 +144,10 @@ impl P2pEndpoint {
                     .unwrap_or_else(|| format!("minip2p/{}", env!("CARGO_PKG_VERSION"))),
             )
             .gossipsub_config(gossipsub);
+        // The binding acknowledges stream data as its reader consumes it
+        // (`stream_consumed`), not as this driver pulls the event.
         for protocol in config.protocols {
-            builder = builder.protocol(protocol);
+            builder = builder.manual_ack_protocol(protocol);
         }
 
         builder = builder.nat_config(NatConfig {
@@ -443,9 +445,39 @@ impl P2pEndpoint {
     }
 
     /// Registers an application protocol.
+    ///
+    /// Like every protocol registered through this crate, its stream data is
+    /// acknowledged by the binding with [`Self::stream_consumed`].
     pub fn add_protocol(&self, protocol_id: String) -> Result<(), FfiError> {
         self.with_endpoint_mut(|endpoint| {
-            endpoint.add_protocol(protocol_id).map_err(map_driver_error)
+            endpoint
+                .add_manual_ack_protocol(protocol_id)
+                .map_err(map_driver_error)
+        })
+    }
+
+    /// Acknowledges `bytes` of a stream's delivered `StreamData` as
+    /// consumed, replenishing its receive budget (ADR 0012).
+    ///
+    /// Every protocol registered through this crate is acknowledged this
+    /// way: a stream delivers at most one receive window that the binding
+    /// has not acknowledged, so a reader that stops consuming stalls its
+    /// sender instead of buffering without bound. More than the stream's
+    /// unacknowledged bytes fails with [`FfiError::Transport`], naming the
+    /// stream and both counts. A closed stream releases its bytes (and its
+    /// stream slot once none are left); a settled or unknown stream or
+    /// connection is a no-op.
+    pub fn stream_consumed(
+        &self,
+        conn_id: u64,
+        stream_id: u64,
+        bytes: u64,
+    ) -> Result<(), FfiError> {
+        let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+        self.with_endpoint_mut(|endpoint| {
+            endpoint
+                .stream_consumed(ConnectionId::new(conn_id), StreamId::new(stream_id), bytes)
+                .map_err(map_driver_error)
         })
     }
 

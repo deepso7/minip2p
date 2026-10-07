@@ -109,7 +109,7 @@ pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use std::str::FromStr;
 
-use crate::portable::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS};
+use crate::portable::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS, StreamAcks};
 use crate::{Bytes, ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
 
 /// Why one blocking [`Endpoint::wait`] returned.
@@ -294,6 +294,8 @@ pub struct Endpoint {
     /// The Endpoint event stream's queue: events produced by a step beyond
     /// the one returned.
     pending_events: std::collections::VecDeque<EndpointEvent>,
+    /// Acknowledges user-stream data as the application pulls it.
+    acks: StreamAcks,
     /// Name resolution for `/dns*` candidates, off the driver thread.
     resolver: dial::Resolver,
     /// NAT relay and AutoNAT dials waiting on Name resolution.
@@ -588,6 +590,41 @@ impl Endpoint {
         self.swarm.add_protocol(protocol_id)
     }
 
+    /// Registers an application protocol whose received data the
+    /// application acknowledges itself, with [`Self::stream_consumed`].
+    ///
+    /// Otherwise like [`Self::add_protocol`]. Use it when bytes outlive the
+    /// event that carried them (a reader that queues them for later), so the
+    /// sender is held back until they are really consumed (ADR 0012). Streams
+    /// that became ready before this call keep the acknowledgement they had.
+    pub fn add_manual_ack_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), Error> {
+        let protocol_id = protocol_id.into();
+        self.swarm.add_protocol(protocol_id.clone())?;
+        self.acks.set_manual(protocol_id);
+        Ok(())
+    }
+
+    /// Acknowledges `bytes` of a manual-acknowledgement stream's received
+    /// data as consumed, replenishing its receive budget so the sender can
+    /// continue (ADR 0012).
+    ///
+    /// A stream delivers at most one receive window of unacknowledged data,
+    /// so a reader that never acknowledges stalls its sender. Fails with
+    /// [`TransportError::AckExceedsDelivered`] when `bytes` exceeds the
+    /// stream's unacknowledged bytes. Acknowledging a closed stream releases
+    /// its bytes (and its stream slot, once none are left); a settled or
+    /// unknown stream or connection is a no-op. Streams of protocols
+    /// registered with [`Self::add_protocol`] are acknowledged as their data
+    /// is pulled, and must not be acknowledged here too.
+    pub fn stream_consumed(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), Error> {
+        self.swarm.ack_stream(conn_id, stream_id, bytes)
+    }
+
     /// Opens an application stream after negotiating `protocol_id`.
     ///
     /// Allowed once the peer is connected. Identify (`PeerReady`) is not
@@ -661,6 +698,7 @@ impl Endpoint {
         self.swarm.abandon_stream(peer_id, conn_id, stream_id)?;
         self.pending_events
             .retain(|event| !event.matches_stream(peer_id, conn_id, stream_id));
+        self.acks.forget(conn_id, stream_id);
         Ok(())
     }
 
@@ -684,7 +722,23 @@ impl Endpoint {
                 events.extend(self.step_events(event)?);
             }
         }
+        for event in &events {
+            self.ack_pulled(event);
+        }
         Ok(events)
+    }
+
+    /// Acknowledges the data of a user-stream event the application is
+    /// pulling, unless its protocol takes manual acknowledgement.
+    ///
+    /// It only fails for data the application also acknowledged by hand,
+    /// which leaves nothing for this acknowledgement to release.
+    fn ack_pulled(&mut self, event: &EndpointEvent) {
+        if let Some((conn_id, stream_id, bytes)) = self.acks.pulled(event) {
+            match self.swarm.ack_stream(conn_id, stream_id, bytes) {
+                Ok(()) | Err(_) => {}
+            }
+        }
     }
 
     /// Drives the endpoint until an Endpoint event, the caller's deadline, or
@@ -761,6 +815,7 @@ impl Endpoint {
             // ConnectSettled.
             self.tick_connect()?;
             if let Some(event) = self.pending_events.pop_front() {
+                self.ack_pulled(&event);
                 return Ok(EndpointWaitOutcome::Event(event));
             }
             if deadline.has_passed() {
@@ -1536,6 +1591,8 @@ pub struct EndpointBuilder {
     #[cfg(any(feature = "quic", feature = "tcp"))]
     listen_addrs: Vec<Multiaddr>,
     protocols: Vec<String>,
+    /// Registered protocols whose data the application acknowledges itself.
+    manual_ack_protocols: Vec<String>,
     #[cfg(feature = "relay-server")]
     relay_server_config: Option<RelayServerConfig>,
     #[cfg(feature = "relay-server")]
@@ -1570,6 +1627,7 @@ impl Default for EndpointBuilder {
             #[cfg(any(feature = "quic", feature = "tcp"))]
             listen_addrs: Vec::new(),
             protocols: Vec::new(),
+            manual_ack_protocols: Vec::new(),
             #[cfg(feature = "relay-server")]
             relay_server_config: None,
             #[cfg(feature = "relay-server")]
@@ -1688,6 +1746,17 @@ impl EndpointBuilder {
             self.protocols.push(id);
         }
         self
+    }
+
+    /// Registers an application protocol whose received data the
+    /// application acknowledges itself, with [`Endpoint::stream_consumed`]
+    /// (see [`Endpoint::add_manual_ack_protocol`]).
+    pub fn manual_ack_protocol(mut self, protocol_id: impl Into<String>) -> Self {
+        let id = protocol_id.into();
+        if !self.manual_ack_protocols.contains(&id) {
+            self.manual_ack_protocols.push(id.clone());
+        }
+        self.protocol(id)
     }
 
     /// Enables Circuit Relay v2 service with production-oriented defaults.
@@ -2155,6 +2224,10 @@ fn build_endpoint(
     #[cfg(feature = "nat")]
     let nat_config = options.take_nat_config();
     let mut builder = SwarmBuilder::new(&keypair).agent_version(options.agent_version);
+    let mut acks = StreamAcks::default();
+    for protocol in options.manual_ack_protocols {
+        acks.set_manual(protocol);
+    }
     #[cfg(any(feature = "nat", feature = "pubsub"))]
     let mut protocols = options.protocols;
     #[cfg(not(any(feature = "nat", feature = "pubsub")))]
@@ -2387,6 +2460,7 @@ fn build_endpoint(
         #[cfg(feature = "mdns")]
         mdns,
         pending_events: std::collections::VecDeque::new(),
+        acks,
         resolver,
         #[cfg(feature = "nat")]
         nat_dials: Vec::new(),

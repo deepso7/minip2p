@@ -141,6 +141,16 @@ impl P2pEndpoint {
     ) -> Result<(), FfiError> {
         self.0.abandon_stream(peer_id, conn_id, stream_id)
     }
+    /// Acknowledges `bytes` of a stream's received data as consumed,
+    /// letting its sender continue. Every registered protocol needs this.
+    pub fn stream_consumed(
+        &self,
+        conn_id: u64,
+        stream_id: u64,
+        bytes: u64,
+    ) -> Result<(), FfiError> {
+        self.0.stream_consumed(conn_id, stream_id, bytes)
+    }
     /// Starts one Connection attempt and returns its Connect ID.
     pub fn connect(&self, target: ConnectTarget) -> Result<u64, FfiError> {
         self.0.connect(target)

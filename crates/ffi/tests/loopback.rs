@@ -10,10 +10,13 @@ use minip2p_ffi::{
 
 static LOOPBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Records every drained event. While `consuming`, it also acknowledges
+/// stream data as it drains it, as a reader that keeps up does.
 struct EventLog {
     endpoint: Arc<P2pEndpoint>,
     events: Mutex<Vec<P2pEvent>>,
     changed: Condvar,
+    consuming: AtomicBool,
 }
 
 impl EventLog {
@@ -22,6 +25,7 @@ impl EventLog {
             endpoint,
             events: Mutex::new(Vec::new()),
             changed: Condvar::new(),
+            consuming: AtomicBool::new(true),
         }
     }
 
@@ -33,6 +37,25 @@ impl EventLog {
                 break;
             }
             drained.extend(batch);
+        }
+        if self.consuming.load(Ordering::SeqCst) {
+            for event in &drained {
+                if let P2pEvent::StreamData {
+                    conn_id,
+                    stream_id,
+                    data,
+                    ..
+                } = event
+                {
+                    let consumed =
+                        self.endpoint
+                            .stream_consumed(*conn_id, *stream_id, data.len() as u64);
+                    assert!(
+                        matches!(consumed, Ok(()) | Err(FfiError::Stopped)),
+                        "consuming drained data failed: {consumed:?}"
+                    );
+                }
+            }
         }
         self.events
             .lock()
@@ -609,6 +632,115 @@ fn a_write_past_the_send_caps_is_held_settled_once_and_closed_after_every_byte()
         .filter(|event| matches!(event, P2pEvent::StreamWriteAccepted { .. }))
         .count();
     assert_eq!(accepted, 1, "one settlement per held write");
+
+    stop(&a);
+    stop(&b);
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "The loopback integration test uses assertions to retain failure context."
+)]
+fn a_reader_that_does_not_consume_stalls_its_sender_until_it_does() -> Result<(), FfiError> {
+    let _serial = LOOPBACK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let protocol = "/minip2p/ffi-read-backpressure/1";
+    // Registered at build time on the reader, later on the writer: both
+    // take manual acknowledgement.
+    let mut reader_config = config_on("/ip4/127.0.0.1/tcp/0");
+    reader_config.protocols = vec![protocol.into()];
+    let a = P2pEndpoint::new(vec![43; 32], config_on("/ip4/127.0.0.1/tcp/0"))?;
+    let b = P2pEndpoint::new(vec![44; 32], reader_config)?;
+    let a_log = Arc::new(EventLog::new(Arc::clone(&a)));
+    let b_log = Arc::new(EventLog::new(Arc::clone(&b)));
+    b_log.consuming.store(false, Ordering::SeqCst);
+    let b_peer = b.peer_id();
+    a.add_protocol(protocol.into())?;
+    a.start(Arc::clone(&a_log) as Arc<dyn P2pEventDoorbell>)?;
+    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
+    a.connect(ConnectTarget::Addresses {
+        addresses: vec![b.listen_addrs()[0].clone()],
+    })?;
+    assert!(
+        a_log
+            .wait_for(Duration::from_secs(5), |event| matches!(
+                event,
+                P2pEvent::PeerReady { peer_id, .. } if peer_id == &b_peer
+            ))
+            .is_some()
+    );
+    let opened = a.open_stream(b_peer.clone(), protocol.into())?;
+    let payload: Vec<u8> = (0..1024 * 1024_usize).map(|i| (i % 251) as u8).collect();
+    assert!(!a.send_stream(
+        b_peer.clone(),
+        opened.conn_id,
+        opened.stream_id,
+        payload.clone()
+    )?);
+    a.close_stream_write(b_peer, opened.conn_id, opened.stream_id)?;
+
+    // Unconsumed, the reader is delivered one Yamux window and no more.
+    let received = || {
+        let events = b_log.events.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut received = Vec::new();
+        let mut stream = None;
+        for event in events.iter() {
+            if let P2pEvent::StreamData {
+                conn_id,
+                stream_id,
+                data,
+                ..
+            } = event
+            {
+                received.extend_from_slice(data);
+                stream = Some((*conn_id, *stream_id));
+            }
+        }
+        (received, stream)
+    };
+    let window = 256 * 1024;
+    let started = Instant::now();
+    while received().0.len() < window - 1024 {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the window never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let (stalled, stream) = received();
+    assert!(stalled.len() <= window, "the sender stalls at one window");
+    assert!(
+        a_log
+            .events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .all(|event| !matches!(event, P2pEvent::StreamWriteAccepted { .. })),
+        "the held write cannot settle"
+    );
+
+    // Consuming what arrived resumes the transfer, and it completes.
+    let (conn_id, stream_id) = stream.expect("data arrived");
+    assert!(matches!(
+        b.stream_consumed(conn_id, stream_id, stalled.len() as u64 + 1),
+        Err(FfiError::Transport { .. })
+    ));
+    b_log.consuming.store(true, Ordering::SeqCst);
+    b.stream_consumed(conn_id, stream_id, stalled.len() as u64)?;
+    assert!(
+        b_log
+            .wait_for(Duration::from_secs(20), |event| matches!(
+                event,
+                P2pEvent::StreamRemoteWriteClosed { .. }
+            ))
+            .is_some(),
+        "the transfer completes once the reader consumes"
+    );
+    assert!(received().0 == payload, "every byte, once, in order");
 
     stop(&a);
     stop(&b);

@@ -54,10 +54,23 @@ pub(crate) struct Delivery {
     pub(crate) batch: Vec<P2pEvent>,
 }
 
+/// Converted events waiting for the binding to drain them, in order.
+///
+/// Stream events (ready, data, write settlement, stop, remote close, close,
+/// and connection ends) are never dropped (ADR 0012): the receive budgets
+/// bound their data, and adjacent data for one stream coalesces into one
+/// event, so they do not count against the cap. Past
+/// [`MAX_CARRY_EVENTS`] other events, the oldest gossipsub message is
+/// dropped first, then the oldest other event.
 #[derive(Default)]
 pub(crate) struct Carry {
     events: BTreeMap<u64, P2pEvent>,
-    payload_ids: VecDeque<u64>,
+    /// Droppable gossipsub messages, oldest first. May name taken events.
+    message_ids: VecDeque<u64>,
+    /// Other droppable events, oldest first. May name taken events.
+    other_ids: VecDeque<u64>,
+    /// Droppable events currently held.
+    droppable: usize,
     dropped_terminal_connect_ids: BTreeSet<u64>,
     next_id: u64,
 }
@@ -71,28 +84,82 @@ impl Carry {
         self.events.is_empty()
     }
 
+    /// Appends `event`, returning whether the cap dropped an event for it.
     pub(crate) fn push(&mut self, event: P2pEvent) -> bool {
+        let event = match self.coalesce(event) {
+            Some(event) => event,
+            None => return false,
+        };
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        if is_payload_event(&event) {
-            self.payload_ids.push_back(id);
+        match event {
+            P2pEvent::Message { .. } => self.message_ids.push_back(id),
+            _ if is_stream_event(&event) => {}
+            _ => self.other_ids.push_back(id),
+        }
+        if !is_stream_event(&event) {
+            self.droppable += 1;
         }
         self.events.insert(id, event);
-        if self.events.len() <= MAX_CARRY_EVENTS {
+        if self.droppable <= MAX_CARRY_EVENTS {
             return false;
         }
-        let dropped = if let Some(payload_id) = self.payload_ids.pop_front() {
-            self.events.remove(&payload_id)
-        } else {
-            // A lost write settlement or stream terminal is covered by the
-            // `EventsDropped` that follows: the binding resets every stream
-            // with a write in flight rather than wait on it.
-            self.events.pop_first().map(|(_, event)| event)
-        };
+        // Both queues together name every droppable event, so one is found.
+        let dropped = self
+            .pop_live(Queue::Messages)
+            .or_else(|| self.pop_live(Queue::Others));
+        self.droppable -= 1;
+        // A lost stream terminal or write settlement can no longer happen,
+        // so only Connection-attempt terminals need naming.
         if let Some(connect_id) = dropped.as_ref().and_then(terminal_connect_id) {
             self.dropped_terminal_connect_ids.insert(connect_id);
         }
         true
+    }
+
+    /// Appends `event`'s bytes to the newest event when both are data for
+    /// the same stream; otherwise hands `event` back.
+    fn coalesce(&mut self, event: P2pEvent) -> Option<P2pEvent> {
+        let P2pEvent::StreamData {
+            conn_id,
+            stream_id,
+            data,
+            ..
+        } = &event
+        else {
+            return Some(event);
+        };
+        match self
+            .events
+            .last_entry()
+            .as_mut()
+            .map(|entry| entry.get_mut())
+        {
+            Some(P2pEvent::StreamData {
+                conn_id: last_conn,
+                stream_id: last_stream,
+                data: last_data,
+                ..
+            }) if last_conn == conn_id && last_stream == stream_id => {
+                last_data.extend_from_slice(data);
+                None
+            }
+            _ => Some(event),
+        }
+    }
+
+    /// Removes the oldest event still held from one droppable queue.
+    fn pop_live(&mut self, queue: Queue) -> Option<P2pEvent> {
+        let ids = match queue {
+            Queue::Messages => &mut self.message_ids,
+            Queue::Others => &mut self.other_ids,
+        };
+        while let Some(id) = ids.pop_front() {
+            if let Some(event) = self.events.remove(&id) {
+                return Some(event);
+            }
+        }
+        None
     }
 
     fn take(&mut self, limit: usize) -> Vec<P2pEvent> {
@@ -100,26 +167,41 @@ impl Carry {
         let mut batch = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(event) = self.events.remove(&id) {
+                if !is_stream_event(&event) {
+                    self.droppable -= 1;
+                }
                 batch.push(event);
             }
         }
-        self.prune_payload_ids();
+        self.message_ids.retain(|id| self.events.contains_key(id));
+        self.other_ids.retain(|id| self.events.contains_key(id));
         batch
     }
 
     fn take_dropped_terminal_connect_ids(&mut self) -> BTreeSet<u64> {
         core::mem::take(&mut self.dropped_terminal_connect_ids)
     }
-
-    fn prune_payload_ids(&mut self) {
-        self.payload_ids.retain(|id| self.events.contains_key(id));
-    }
 }
 
-fn is_payload_event(event: &P2pEvent) -> bool {
+#[derive(Clone, Copy)]
+enum Queue {
+    Messages,
+    Others,
+}
+
+/// Events the carry never drops: everything a binding's stream and
+/// connection state depends on (ADR 0012).
+fn is_stream_event(event: &P2pEvent) -> bool {
     matches!(
         event,
-        P2pEvent::Message { .. } | P2pEvent::StreamData { .. }
+        P2pEvent::StreamReady { .. }
+            | P2pEvent::StreamData { .. }
+            | P2pEvent::StreamWriteAccepted { .. }
+            | P2pEvent::StreamWriteStopped { .. }
+            | P2pEvent::StreamRemoteWriteClosed { .. }
+            | P2pEvent::StreamClosed { .. }
+            | P2pEvent::ConnectionClosed { .. }
+            | P2pEvent::ConnectionReplaced { .. }
     )
 }
 
@@ -465,19 +547,75 @@ mod tests {
         assert_eq!(retained.get(1), Some(&message(2)));
     }
 
+    fn data(stream_id: u64, bytes: &[u8]) -> P2pEvent {
+        P2pEvent::StreamData {
+            peer_id: "peer".into(),
+            conn_id: 1,
+            stream_id,
+            data: bytes.to_vec(),
+        }
+    }
+
     #[test]
-    fn stream_data_uses_the_payload_overflow_class() {
-        assert!(is_payload_event(&P2pEvent::StreamData {
+    fn stream_events_are_never_dropped_and_only_messages_overflow() {
+        let ready = P2pEvent::StreamReady {
             peer_id: "peer".into(),
             conn_id: 1,
-            stream_id: 2,
-            data: vec![3],
-        }));
-        assert!(!is_payload_event(&P2pEvent::StreamClosed {
-            peer_id: "peer".into(),
-            conn_id: 1,
-            stream_id: 2,
-        }));
+            stream_id: 7,
+            protocol_id: "/app/1".into(),
+            initiated_locally: false,
+        };
+        let mut carry = Carry::default();
+        let mut overflow = OverflowDiagnostic::default();
+        let mut stats = DriverStats::default();
+        // 5000 one-byte data events, each between two messages so none
+        // coalesce, far past the cap.
+        ingest(
+            [ready.clone()].into_iter().chain(
+                (0..5000_u32).flat_map(|index| [message(index as u8), data(7, &[index as u8])]),
+            ),
+            &mut carry,
+            &mut overflow,
+            &mut stats,
+        );
+
+        let mut events = Vec::new();
+        while !carry.is_empty() {
+            events.extend(take_delivery(&mut carry, &mut overflow, &mut stats, 512).batch);
+        }
+        assert_eq!(
+            events.first(),
+            Some(&ready),
+            "StreamReady precedes its data"
+        );
+        let received: Vec<u8> = events
+            .iter()
+            .filter_map(|event| match event {
+                P2pEvent::StreamData { data, .. } => Some(data[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            received,
+            (0..5000_u32).map(|index| index as u8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            stats.dropped,
+            5000 - MAX_CARRY_EVENTS as u64,
+            "only messages drop"
+        );
+    }
+
+    #[test]
+    fn adjacent_data_for_one_stream_coalesces() {
+        let mut carry = Carry::default();
+        for event in [data(1, b"ab"), data(1, b"c"), data(2, b"x"), data(1, b"d")] {
+            assert!(!carry.push(event));
+        }
+        assert_eq!(
+            carry.take(10),
+            [data(1, b"abc"), data(2, b"x"), data(1, b"d")]
+        );
     }
 
     #[test]

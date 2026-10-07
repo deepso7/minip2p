@@ -14,7 +14,7 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Platform package**: A binary-only npm package (`@minip2p/node-<target>`) carrying one prebuilt Node binding binary, selected at install time through `optionalDependencies`. Holds nothing but the binary and its manifest.
 
-**Carry buffer**: The FFI driver's single bounded event queue (4096 events, payload-first drops, `EventsDropped` diagnostic). The only place events wait or drop between the driver and a binding.
+**Carry buffer**: The FFI driver's single event queue. Stream and connection-end events never drop and adjacent stream data coalesces; past 4096 other events it drops gossipsub messages first, then the oldest (`EventsDropped` diagnostic). The only place events wait or drop between the driver and a binding.
 
 **Doorbell**: The coalesced, edge-triggered ready signal a binding registers with the FFI core; rung only when the carry buffer goes empty→non-empty. Replaces per-event push through the listener seam.
 
@@ -81,6 +81,8 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 **Receive budget**: The most unacknowledged bytes a stream will deliver to its reader. Acknowledging consumed bytes replenishes it, which is what lets the sender continue. _Avoid_: read buffer, window (the transport's own term)
 
 **Unsettled stream**: A stream whose delivered bytes are not yet all acknowledged or abandoned. It keeps its stream slot even after closing, so stream churn cannot grow retained receive data. _Avoid_: zombie stream, lingering stream
+
+**Manual acknowledgement**: A protocol registration whose stream data the application acknowledges itself (`stream_consumed`) once it has really consumed the bytes, instead of the Endpoint acknowledging data as its event is pulled. Every protocol registered through FFI uses it; the SDK acknowledges when `read()` returns a chunk or a `data` listener returns. _Avoid_: manual read, flow control mode
 
 ### Errors
 
