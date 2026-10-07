@@ -142,8 +142,9 @@ Promise operations use `{ timeoutMs?, signal? }`. Their default timeout is 65 se
 | `initiatedLocally` | Whether this endpoint opened the stream. |
 | `read()` | Next `Uint8Array`, or `undefined` after remote half-close. |
 | `on("data", handler)` | Flowing read mode; mutually exclusive with `read()`. |
-| `write(stringOrBytes)` | Send UTF-8 text or bytes. |
-| `closeWrite()` | Graceful local half-close. |
+| `write(stringOrBytes)` | Send UTF-8 text or bytes; resolves once every byte is accepted. Rejects with `WriteBufferFullError` past `writeHighWaterMark`. |
+| `writeHighWaterMark` | Bytes a stream buffers before `write` rejects (default 256 KiB, counting the in-flight write). |
+| `closeWrite()` | Graceful local half-close after every earlier write. |
 | `reset()` | Abrupt reset. |
 | `abandon()` | Reset and relinquish the handle. |
 
