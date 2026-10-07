@@ -755,7 +755,16 @@ fn a_peer_reset_retracts_a_writable_queued_before_the_poll() {
         .stream_shutdown(4, quiche::Shutdown::Write, 5)
         .expect("reset");
     peer.flush();
-    std::thread::sleep(Duration::from_millis(20));
+    // Wait until the reset is waiting on the server's socket (peeking leaves
+    // it there), so the next poll is sure to read it.
+    let start = Instant::now();
+    while server.socket.peek_from(&mut [0u8; 1]).is_err() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "reset never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     server.reset_stream(id, filler).expect("local reset");
     let mut events = Vec::new();
     drive_until(
