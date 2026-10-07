@@ -553,6 +553,8 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
     let payload = vec![7u8; 512 * 1024];
     let held = send_or_hold(&mut pair.dialer, id, stream, Bytes::from(payload));
     assert!(held.is_some(), "past the window and send buffer is Full");
+    // The accepted prefix beyond the peer's window is the buffered write this
+    // test needs; the unsent tail plays no part, so it is not resent.
     // Drive until the dialer has nothing left to do. Parking is the state the
     // rest of the test needs, so wait for it rather than for a slice of time:
     // under load a fixed slice buys far fewer polls than it looks like it does.

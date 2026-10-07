@@ -1083,7 +1083,7 @@ impl QuicConnection {
         let room = self
             .max_pending_write_bytes
             .saturating_sub(self.pending_write_bytes);
-        if room < (self.max_pending_write_bytes / 2).max(1) {
+        if room < self.max_pending_write_bytes.div_ceil(2) {
             return;
         }
         for raw_stream_id in mem::take(&mut self.writable_armed) {
@@ -1192,6 +1192,9 @@ impl QuicConnection {
     /// longer be delivered.
     fn note_stream_reset(&mut self, stream_id: StreamId, events: &mut Vec<TransportEvent>) {
         self.drop_send_queue(stream_id.as_u64());
+        self.writable_armed.remove(&stream_id.as_u64());
+        // The freed queue may unblock streams waiting on the shared cap.
+        self.wake_writable(events);
         let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) else {
             return;
         };

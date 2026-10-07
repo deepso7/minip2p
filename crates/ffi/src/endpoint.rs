@@ -102,7 +102,9 @@ impl P2pEndpoint {
     /// Sends bytes on a stream, named by its connection and stream ids.
     ///
     /// Returns `true` once every byte is accepted, or `false` when the rest is
-    /// held and `StreamWriteAccepted` will follow.
+    /// held: `StreamWriteAccepted` follows once it is accepted, unless the
+    /// write side ends first (`StreamWriteStopped`, `StreamClosed`, a reset,
+    /// or the connection closing or being replaced), which drops the tail.
     pub fn send_stream(
         &self,
         peer_id: String,

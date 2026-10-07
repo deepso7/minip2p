@@ -268,7 +268,8 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
     /// queue inside Yamux, against its send caps, and come back to the caller
     /// as Full instead of growing this buffer (ADR 0012).
     fn fill(&mut self, connection: &mut Connection) -> Result<(), Teardown> {
-        while connection.outbound.len() < self.config.max_buffered_send {
+        // Zero still pulls one frame at a time, or nothing would ever leave.
+        while connection.outbound.len() < self.config.max_buffered_send.max(1) {
             let Some(bytes) = connection.session.poll_write()? else {
                 break;
             };
@@ -714,6 +715,9 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         if !graceful {
             self.provider.abort(connection.socket);
         }
+        // Every write side ended with the connection.
+        self.pending
+            .retain(|event| !matches!(event, TransportEvent::StreamWritable { id: owner, .. } if *owner == id));
         self.pending.push_back(TransportEvent::Closed { id });
         Ok(())
     }

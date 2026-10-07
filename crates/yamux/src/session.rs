@@ -835,6 +835,9 @@ impl YamuxSession {
         let streams = self.streams.keys().copied().collect::<Vec<_>>();
         self.streams.clear();
         self.writable_armed.clear();
+        // Every write side ended: no Writable, not even one already queued.
+        self.events
+            .retain(|event| !matches!(event, YamuxOutput::Writable { .. }));
         self.total_buffered_send = 0;
         for stream in streams {
             self.events.push_back(YamuxOutput::StreamClosed { stream });
@@ -1258,6 +1261,22 @@ mod tests {
         while session.poll_frame().is_some() {}
         session.close_write(stream).unwrap();
         assert_eq!(session.poll_event(), None);
+    }
+
+    #[test]
+    fn a_writable_already_queued_is_dropped_when_the_session_goes_away() {
+        let mut limits = config();
+        limits.max_buffered_send = 4;
+        let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        let stream = session.open_stream().unwrap();
+        assert!(matches!(
+            session.send(stream, Bytes::from_static(b"abcdef")),
+            Err(YamuxError::Full { .. })
+        ));
+        while session.poll_frame().is_some() {}
+        session.go_away(0);
+        let events: Vec<_> = core::iter::from_fn(|| session.poll_event()).collect();
+        assert_eq!(events, [YamuxOutput::StreamClosed { stream }]);
     }
 
     #[test]

@@ -397,9 +397,12 @@ pub enum SwarmError {
         conn_id: ConnectionId,
         stream_id: StreamId,
     },
-    /// The stream cannot accept the write yet: the swarm is still holding
-    /// its own negotiation bytes for it. Retryable; `unsent` is the whole
-    /// payload, and [`SwarmEvent::StreamWritable`] follows.
+    /// The stream cannot accept the write yet: the swarm core is holding
+    /// earlier bytes for it (its own negotiation bytes, or a tail a driver
+    /// reported through [`SwarmInput::SendFull`]). Retryable; `unsent` is the
+    /// whole payload, and [`SwarmEvent::StreamWritable`] follows once the held
+    /// bytes have been resent -- unless a write-side close is queued behind
+    /// them or the write side ends first, in which case no Writable comes.
     #[error("user stream {stream_id} on connection {conn_id} is full; {} bytes unsent", unsent.len())]
     Full {
         conn_id: ConnectionId,

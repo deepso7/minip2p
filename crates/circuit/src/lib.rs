@@ -955,6 +955,9 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
                 Ok(()) | Err(_) => {}
             }
         }
+        // Every write side ended with the connection.
+        self.pending
+            .retain(|event| !matches!(event, TransportEvent::StreamWritable { id: owner, .. } if *owner == id));
         self.pending.push_back(TransportEvent::Closed { id });
         Ok(())
     }

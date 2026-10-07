@@ -35,7 +35,7 @@ session.start()?;
 loop {
     while stream.has_room() {
         let Some(bytes) = session.poll_write()? else { break };
-        stream.write(&bytes)?;
+        stream.write_all(&bytes)?;
     }
     while let Some(output) = session.poll_output() {
         match output {

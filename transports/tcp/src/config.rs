@@ -38,7 +38,7 @@ pub struct TcpConfig {
     /// instead, and stream writes report
     /// [`TransportError::Full`](minip2p_transport::TransportError::Full)
     /// rather than tearing the connection down. A pull may overshoot by one
-    /// Noise-encrypted Yamux frame.
+    /// Noise-encrypted Yamux frame; zero holds one frame at a time.
     pub max_buffered_send: usize,
     /// How long a connection may hold bytes its socket refuses before it is
     /// failed, or `None` to wait indefinitely.

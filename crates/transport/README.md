@@ -52,7 +52,7 @@ The registered namespaces (`QUIC_IPV4`, `QUIC_IPV6`, `TCP_IPV4`, `TCP_IPV6`, `CI
 Implement the `Transport` trait for your adapter:
 
 ```rust
-use minip2p_core::{Multiaddr, PeerAddr};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr};
 use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 
