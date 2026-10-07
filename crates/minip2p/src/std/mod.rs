@@ -112,7 +112,7 @@ pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet
 use std::str::FromStr;
 
 use crate::portable::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS};
-use crate::{ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
+use crate::{Bytes, ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
 
 /// Why one blocking [`Endpoint::wait`] returned.
 ///
@@ -608,6 +608,12 @@ impl Endpoint {
 
     /// Sends bytes on a negotiated application stream.
     ///
+    /// Accepts as much of `data` as the stream can queue (ADR 0012). When not
+    /// every byte fit, returns [`Error::Full`] carrying the exact unsent
+    /// suffix: hold it, wait for [`EndpointEvent::StreamWritable`] for the
+    /// stream, and send it again. Full is retryable, never a fault. Close the
+    /// write side only once every held tail has been accepted.
+    ///
     /// Fails with [`SwarmError::StreamNotFound`] if `conn_id` is no longer
     /// the peer's connection holding the stream (for example after
     /// `ConnectionReplaced`), so a write never reaches a same-numbered stream
@@ -617,7 +623,7 @@ impl Endpoint {
         peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        data: impl Into<Vec<u8>>,
+        data: impl Into<Bytes>,
     ) -> Result<(), Error> {
         self.swarm
             .send_stream(peer_id, conn_id, stream_id, data.into())

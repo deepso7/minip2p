@@ -4,7 +4,7 @@
 //! capability (NAT, Gossipsub, Discovery, relay-server) transitions all leave
 //! through [`EndpointEvent`].
 
-use minip2p_core::{PeerAddr, PeerId};
+use minip2p_core::{Bytes, PeerAddr, PeerId};
 use minip2p_swarm::{IdentifyMessage, SwarmEvent, SwarmRuntimeError};
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -90,7 +90,18 @@ pub enum EndpointEvent {
         peer_id: PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        data: alloc::vec::Vec<u8>,
+        data: Bytes,
+    },
+    /// A user stream whose `send_stream` returned Full can accept writes
+    /// again: resend the held tail now.
+    ///
+    /// Fires once per Full, and never after the stream's write side ended
+    /// ([`Self::StreamWriteStopped`], a reset, [`Self::StreamClosed`], or the
+    /// connection closing); those mean the tail should be dropped.
+    StreamWritable {
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
     },
     /// The remote closed its write side on a user stream.
     StreamRemoteWriteClosed {
@@ -175,6 +186,7 @@ impl EndpointEvent {
             self,
             Self::StreamReady { peer_id: peer, conn_id: conn, stream_id: stream, .. }
                 | Self::StreamData { peer_id: peer, conn_id: conn, stream_id: stream, .. }
+                | Self::StreamWritable { peer_id: peer, conn_id: conn, stream_id: stream }
                 | Self::StreamRemoteWriteClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
                 | Self::StreamWriteStopped { peer_id: peer, conn_id: conn, stream_id: stream, .. }
                 | Self::StreamClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
@@ -235,6 +247,15 @@ impl From<SwarmEvent> for EndpointEvent {
                 conn_id,
                 stream_id,
                 data,
+            },
+            SwarmEvent::StreamWritable {
+                peer_id,
+                conn_id,
+                stream_id,
+            } => Self::StreamWritable {
+                peer_id,
+                conn_id,
+                stream_id,
             },
             SwarmEvent::StreamRemoteWriteClosed {
                 peer_id,

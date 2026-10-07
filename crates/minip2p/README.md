@@ -205,6 +205,17 @@ Use `relay_server_config` for validated capacity, duration, byte, control, and r
 
 Relay-only endpoints accept and advertise inbound HOP and can open outbound STOP. NAT-only endpoints open outbound HOP and accept/advertise trusted STOP, without advertising HOP. Combined endpoints install both role sets. The Swarm keeps one live connection per peer; exact connection targeting by the relay driver relies on that invariant.
 
+`send_stream` takes anything that converts into `Bytes` and accepts as much as the stream can queue. When not every byte fit it returns `Error::Full` with the exact unsent tail: hold it and send it again on `EndpointEvent::StreamWritable` for that stream. Full is backpressure, never a fault, and a slow reader slows the writer instead of tearing the connection down. Close the write side only once every held tail has been accepted; `StreamWriteStopped`, `StreamClosed`, or the connection ending mean the tail should be dropped.
+
+```rust
+match endpoint.send_stream(&peer, conn_id, stream_id, chunk) {
+    Ok(()) => {}
+    // Resend `unsent` on EndpointEvent::StreamWritable for this stream.
+    Err(minip2p::Error::Full { unsent, .. }) => held = Some(unsent),
+    Err(error) => return Err(error.into()),
+}
+```
+
 When an application permanently relinquishes a stream, `Endpoint::abandon_stream` resets it, purges its already-buffered events (matched by connection as well as stream id), and suppresses later stream events. Use `Endpoint::reset_stream` when those terminal events should remain visible.
 
 Relay bridges are promoted through end-to-end Noise and Yamux before `NatEvent::PathEstablished` reports `Path::Relayed`, so application protocols use ordinary streams on direct and relayed paths alike. `Endpoint::path(peer)` returns the path origin of the peer's current connection independently of whether the corresponding event was delivered. It is updated before path events are queued for both outbound connects and accepted inbound circuits. A `ConnectionReplaced` moves it to the new connection's origin (leaving a relay for a direct connection is reported once, as `PathUpgraded` or `InboundDirectUpgrade`), and it is gone once the peer disconnects.

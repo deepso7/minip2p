@@ -189,7 +189,7 @@ fn exercise_relay(
             }
         }
     }
-    assert_eq!(echoed, Some(payload));
+    assert_eq!(echoed.as_deref(), Some(payload.as_slice()));
 
     drop(initiator);
     drop(responder);

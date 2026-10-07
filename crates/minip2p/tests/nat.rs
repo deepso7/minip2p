@@ -388,7 +388,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
         relay.assert_healthy();
     }
     assert!(initiator_stream_ready);
-    assert_eq!(echoed, Some(payload));
+    assert_eq!(echoed.as_deref(), Some(payload.as_slice()));
 
     relay.cut_all();
     let close_deadline = Instant::now() + Duration::from_secs(5);
@@ -661,7 +661,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         }
         relay.assert_healthy();
     }
-    assert_eq!(echoed, Some(payload));
+    assert_eq!(echoed.as_deref(), Some(payload.as_slice()));
 
     // A circuit is only as alive as the connection carrying it, and on a TCP
     // relay that connection is a TCP one. Cutting it has to close the circuit

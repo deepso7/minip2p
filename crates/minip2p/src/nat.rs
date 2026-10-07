@@ -11,13 +11,13 @@ use minip2p_platform::{EntropySource, Now as PlatformNow};
 
 #[cfg(feature = "_circuit-driver")]
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole, CircuitTransport};
-use minip2p_core::{ConnectId, Multiaddr, PeerId, Protocol, select_direct_addrs};
+use minip2p_core::{Bytes, ConnectId, Multiaddr, PeerId, Protocol, select_direct_addrs};
 #[cfg(feature = "_circuit-driver")]
 use minip2p_nat::BridgeRole;
 use minip2p_nat::{
     ConnectLegs, NatAction, NatAgent, NatEvent, Now, PromoteError, ReachabilityState,
 };
-use minip2p_swarm::{SwarmEvent, SwarmRuntime};
+use minip2p_swarm::{DriverError, HeldWrites, SwarmEvent, SwarmRuntime};
 use minip2p_transport::{ConnectionId, StreamId, Transport};
 
 use crate::EndpointEvent;
@@ -60,6 +60,9 @@ pub(crate) struct NatDriver<E> {
     promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
     /// Connection of each stream the agent addresses by peer and id.
     stream_conns: StreamConns,
+    /// Unsent tails of the agent's writes, resent on the stream's Writable
+    /// so a full stream delays control messages instead of losing them.
+    held: HeldWrites,
     /// How many queued events the Connection engine has already observed.
     observed: usize,
     /// The bound-address revision the agent's `listen_addrs` were seeded
@@ -92,6 +95,7 @@ impl<E: EntropySource> NatDriver<E> {
             public_addrs: Vec::new(),
             promoted: BTreeMap::new(),
             stream_conns: StreamConns::default(),
+            held: HeldWrites::new(),
             observed: 0,
             // Matches a fresh runtime: seed only after a real `listen*`
             // call bumped the revision. Some transports report bound-but-
@@ -266,9 +270,21 @@ impl<E: EntropySource> NatDriver<E> {
         sample: PlatformNow,
     ) -> bool {
         self.sync_listen_addrs(swarm);
+        self.forget_held(event);
         self.stream_conns.observe(event);
         let now = to_nat_now(sample);
         if self.inject_straggler(event, swarm) {
+            self.pump(swarm, sample);
+            return true;
+        }
+        if let SwarmEvent::StreamWritable {
+            peer_id,
+            conn_id,
+            stream_id,
+        } = event
+            && self.stream_conns.get(peer_id, *stream_id) == Some(*conn_id)
+        {
+            self.replay_held(peer_id, *conn_id, *stream_id, swarm, sample);
             self.pump(swarm, sample);
             return true;
         }
@@ -614,18 +630,14 @@ impl<E: EntropySource> NatDriver<E> {
                 // swarm's error events; nothing to echo synchronously. A
                 // stream whose connection is gone is skipped the same way.
                 if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
-                    match swarm.send_stream(&peer, conn_id, stream_id, data, now.mono_ms) {
-                        Ok(()) | Err(_) => {}
-                    }
+                    self.send_or_hold(&peer, conn_id, stream_id, Bytes::from(data), swarm, sample);
                 }
             }
             NatAction::CloseStreamWrite { peer, stream_id } => {
                 // A stale close must not replace the lifecycle event that
                 // triggered this action.
                 if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
-                    match swarm.close_stream_write(&peer, conn_id, stream_id, now.mono_ms) {
-                        Ok(()) | Err(_) => {}
-                    }
+                    self.close_or_hold(&peer, conn_id, stream_id, swarm, sample);
                 }
             }
             NatAction::ResetStream { peer, stream_id } => {
@@ -700,7 +712,7 @@ impl<E: EntropySource> NatDriver<E> {
                             BridgeRole::Initiator => CircuitRole::Initiator,
                             BridgeRole::Responder => CircuitRole::Responder,
                         },
-                        pending_data,
+                        pending_data: pending_data.into(),
                         remote_write_closed,
                     };
                     match swarm.transport_mut().adopt_bridge(adoption) {
@@ -739,6 +751,85 @@ impl<E: EntropySource> NatDriver<E> {
         }
     }
 
+    /// Writes `data`, or holds it behind the stream's unsent tail. A Full
+    /// holds what the stream did not take.
+    fn send_or_hold<T: NatTransport, R: EntropySource>(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        data: Bytes,
+        swarm: &mut SwarmRuntime<T, R>,
+        sample: PlatformNow,
+    ) {
+        let counted = data.len();
+        if self.held.is_held(conn_id, stream_id) {
+            self.held.push(conn_id, stream_id, data, counted);
+            return;
+        }
+        // Other failures surface through the agent's own timeouts and the
+        // swarm's error events, as for any NAT write.
+        if let Err(DriverError::Full { unsent, .. }) =
+            swarm.send_stream(peer, conn_id, stream_id, data, sample.monotonic_ms)
+        {
+            self.held.push(conn_id, stream_id, unsent, counted);
+        }
+    }
+
+    /// Closes the write side once nothing is held for the stream.
+    fn close_or_hold<T: NatTransport, R: EntropySource>(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        swarm: &mut SwarmRuntime<T, R>,
+        sample: PlatformNow,
+    ) {
+        if self.held.close_after(conn_id, stream_id) {
+            return;
+        }
+        match swarm.close_stream_write(peer, conn_id, stream_id, sample.monotonic_ms) {
+            Ok(()) | Err(_) => {}
+        }
+    }
+
+    /// Resends a writable stream's held tails, then its deferred close.
+    fn replay_held<T: NatTransport, R: EntropySource>(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        swarm: &mut SwarmRuntime<T, R>,
+        sample: PlatformNow,
+    ) {
+        let Some(held) = self.held.take(conn_id, stream_id) else {
+            return;
+        };
+        for data in held.tails {
+            self.send_or_hold(peer, conn_id, stream_id, data, swarm, sample);
+        }
+        if held.close {
+            self.close_or_hold(peer, conn_id, stream_id, swarm, sample);
+        }
+    }
+
+    /// Drops held writes whose stream or connection ended.
+    fn forget_held(&mut self, event: &SwarmEvent) {
+        match event {
+            SwarmEvent::StreamClosed {
+                conn_id, stream_id, ..
+            }
+            | SwarmEvent::StreamWriteStopped {
+                conn_id, stream_id, ..
+            } => self.held.forget_stream(*conn_id, *stream_id),
+            SwarmEvent::ConnectionClosed { conn_id, .. }
+            | SwarmEvent::ConnectionReplaced { old: conn_id, .. } => {
+                self.held.forget_connection(*conn_id);
+            }
+            _ => {}
+        }
+    }
+
     fn inject_straggler<T: NatTransport, R: EntropySource>(
         &mut self,
         event: &SwarmEvent,
@@ -746,6 +837,9 @@ impl<E: EntropySource> NatDriver<E> {
     ) -> bool {
         let key = match event {
             SwarmEvent::StreamData {
+                conn_id, stream_id, ..
+            }
+            | SwarmEvent::StreamWritable {
                 conn_id, stream_id, ..
             }
             | SwarmEvent::StreamRemoteWriteClosed {
@@ -768,6 +862,9 @@ impl<E: EntropySource> NatDriver<E> {
                     .transport_mut()
                     .inject_bridge_data(key.0, key.1, data.clone());
             }
+            // The circuit sees the bridge's Writable straight from the
+            // transport; the swarm's copy is a straggler with nothing to do.
+            SwarmEvent::StreamWritable { .. } => {}
             SwarmEvent::StreamRemoteWriteClosed { .. } => swarm
                 .transport_mut()
                 .inject_bridge_remote_write_closed(key.0, key.1),
@@ -830,7 +927,7 @@ pub(crate) trait NatTransport: Transport {
     fn inject_bridge_closed(&mut self, _conn: ConnectionId, _stream: StreamId) {}
     fn inject_bridge_remote_write_closed(&mut self, _conn: ConnectionId, _stream: StreamId) {}
     fn inject_bridge_write_stopped(&mut self, _conn: ConnectionId, _stream: StreamId) {}
-    fn inject_bridge_data(&mut self, _conn: ConnectionId, _stream: StreamId, _data: Vec<u8>) {}
+    fn inject_bridge_data(&mut self, _conn: ConnectionId, _stream: StreamId, _data: Bytes) {}
     #[cfg(feature = "_circuit-driver")]
     fn adopt_bridge(&mut self, _adoption: BridgeAdoption) -> Result<ConnectionId, AdoptError> {
         Err(AdoptError::UnknownConnection)
@@ -859,7 +956,7 @@ impl<T: Transport, E: EntropySource> NatTransport for CircuitTransport<T, E> {
     fn inject_bridge_write_stopped(&mut self, conn: ConnectionId, stream: StreamId) {
         self.inject_bridge_write_stopped(conn, stream);
     }
-    fn inject_bridge_data(&mut self, conn: ConnectionId, stream: StreamId, data: Vec<u8>) {
+    fn inject_bridge_data(&mut self, conn: ConnectionId, stream: StreamId, data: Bytes) {
         self.inject_bridge_data(conn, stream, data);
     }
     fn adopt_bridge(&mut self, adoption: BridgeAdoption) -> Result<ConnectionId, AdoptError> {

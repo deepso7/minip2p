@@ -238,11 +238,18 @@ impl GossipsubDriver {
             } => {
                 // A synchronously rejected write must reach the agent:
                 // otherwise the stream's eventual close would commit work
-                // whose frame was never accepted.
+                // whose frame was never accepted. A Full keeps the frame in
+                // flight with its tail; the stream's Writable resends it.
                 let result = match self.stream_conns.get(&peer, stream_id) {
-                    Some(conn_id) => swarm
-                        .send_stream(&peer, conn_id, stream_id, data, now_ms)
-                        .map_err(|e| e.to_string()),
+                    Some(conn_id) => {
+                        match swarm.send_stream(&peer, conn_id, stream_id, data, now_ms) {
+                            Err(DriverError::Full { unsent, .. }) => {
+                                self.agent.send_full(&peer, stream_id, token, unsent);
+                                return;
+                            }
+                            result => result.map_err(|e| e.to_string()),
+                        }
+                    }
                     None => Err(format!("stream {stream_id} to {peer} is no longer active")),
                 };
                 self.agent
