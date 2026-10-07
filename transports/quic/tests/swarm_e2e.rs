@@ -53,6 +53,7 @@ fn drive_three(
 fn listen_on_bound_addrs_returns_ipv4_and_ipv6_peer_addrs() {
     let mut swarm = make_dual_stack_swarm(Ed25519Keypair::generate());
     let addrs = swarm
+        .core_mut()
         .listen_on_bound_addrs()
         .expect("listen on bound addrs");
 
@@ -84,7 +85,7 @@ fn listen_on_bound_addr_keeps_first_address_contract() {
         .build(transport)
         .expect("build swarm");
 
-    let addr = swarm.listen_on_bound_addr().expect("listen");
+    let addr = swarm.core_mut().listen_on_bound_addr().expect("listen");
 
     assert_eq!(addr.transport(), &first_addr);
 }
@@ -93,12 +94,15 @@ fn listen_on_bound_addr_keeps_first_address_contract() {
 fn swarm_ping_roundtrip_with_auto_identify() {
     // Set up server.
     let mut server = make_swarm(Ed25519Keypair::generate());
-    let peer_addr = server.listen_on_bound_addr().expect("server listen");
+    let peer_addr = server
+        .core_mut()
+        .listen_on_bound_addr()
+        .expect("server listen");
     let server_peer_id = peer_addr.peer_id().clone();
 
     // Set up client and dial -- no ConnectionId ceremony, no `now_ms` plumbing.
     let mut client = make_swarm(Ed25519Keypair::generate());
-    let _conn = client.dial(&peer_addr).expect("dial");
+    let _conn = client.core_mut().dial(&peer_addr).expect("dial");
 
     let mut client_connected = false;
     let mut client_identified = false;
@@ -132,10 +136,11 @@ fn swarm_ping_roundtrip_with_auto_identify() {
                 } => {
                     assert_eq!(peer_id, &server_peer_id);
                     assert!(protocols.contains(&PING_PROTOCOL_ID.to_string()));
-                    assert!(client.is_peer_ready(&server_peer_id));
-                    assert!(client.connected_peers().contains(&server_peer_id));
+                    assert!(client.core().is_peer_ready(&server_peer_id));
+                    assert!(client.core().connected_peers().contains(&server_peer_id));
                     assert!(
                         client
+                            .core()
                             .peer_info(&server_peer_id)
                             .expect("peer info should exist")
                             .protocols
@@ -182,14 +187,21 @@ fn inbound_connection_does_not_collide_with_later_outbound_dial() {
     let mut middle = make_swarm(Ed25519Keypair::generate());
     let mut outbound_peer = make_swarm(Ed25519Keypair::generate());
 
-    let middle_addr = middle.listen_on_bound_addr().expect("middle listen");
+    let middle_addr = middle
+        .core_mut()
+        .listen_on_bound_addr()
+        .expect("middle listen");
     let middle_peer_id = middle_addr.peer_id().clone();
     let outbound_addr = outbound_peer
+        .core_mut()
         .listen_on_bound_addr()
         .expect("outbound listen");
     let outbound_peer_id = outbound_addr.peer_id().clone();
 
-    inbound_peer.dial(&middle_addr).expect("inbound dial");
+    inbound_peer
+        .core_mut()
+        .dial(&middle_addr)
+        .expect("inbound dial");
 
     let mut middle_saw_inbound = false;
     for _ in 0..500 {
@@ -214,6 +226,7 @@ fn inbound_connection_does_not_collide_with_later_outbound_dial() {
     );
 
     middle
+        .core_mut()
         .dial(&outbound_addr)
         .expect("later outbound dial must not collide with inbound connection id");
 
@@ -237,16 +250,21 @@ const USER_PROTOCOL_ID: &str = "/minip2p/test/echo/1.0.0";
 fn swarm_user_protocol_round_trip() {
     let mut server = make_swarm(Ed25519Keypair::generate());
     server
+        .core_mut()
         .add_protocol(USER_PROTOCOL_ID)
         .expect("register protocol");
-    let peer_addr = server.listen_on_bound_addr().expect("server listen");
+    let peer_addr = server
+        .core_mut()
+        .listen_on_bound_addr()
+        .expect("server listen");
     let server_peer_id = peer_addr.peer_id().clone();
 
     let mut client = make_swarm(Ed25519Keypair::generate());
     client
+        .core_mut()
         .add_protocol(USER_PROTOCOL_ID)
         .expect("register protocol");
-    client.dial(&peer_addr).expect("dial");
+    client.core_mut().dial(&peer_addr).expect("dial");
 
     let mut stream: Option<StreamId> = None;
     let mut server_echo_sent = false;
@@ -332,14 +350,18 @@ fn swarm_user_protocol_round_trip() {
 #[test]
 fn open_stream_fails_fast_when_peer_did_not_advertise_protocol() {
     let mut server = make_swarm(Ed25519Keypair::generate());
-    let peer_addr = server.listen_on_bound_addr().expect("server listen");
+    let peer_addr = server
+        .core_mut()
+        .listen_on_bound_addr()
+        .expect("server listen");
     let server_peer_id = peer_addr.peer_id().clone();
 
     let mut client = make_swarm(Ed25519Keypair::generate());
     client
+        .core_mut()
         .add_protocol(USER_PROTOCOL_ID)
         .expect("register protocol");
-    client.dial(&peer_addr).expect("dial");
+    client.core_mut().dial(&peer_addr).expect("dial");
 
     for _ in 0..500 {
         let (_server_events, client_events) = drive_pair(&mut server, &mut client);
@@ -351,7 +373,7 @@ fn open_stream_fails_fast_when_peer_did_not_advertise_protocol() {
         }
     }
 
-    assert!(client.is_peer_ready(&server_peer_id));
+    assert!(client.core().is_peer_ready(&server_peer_id));
     let err = client
         .open_stream(&server_peer_id, USER_PROTOCOL_ID)
         .expect_err("unsupported user protocol should fail synchronously");
@@ -383,11 +405,14 @@ fn open_stream_fails_fast_when_peer_did_not_advertise_protocol() {
 #[test]
 fn identify_exchange_carries_observed_addr() {
     let mut server = make_swarm(Ed25519Keypair::generate());
-    let peer_addr = server.listen_on_bound_addr().expect("server listen");
+    let peer_addr = server
+        .core_mut()
+        .listen_on_bound_addr()
+        .expect("server listen");
     let server_peer_id = peer_addr.peer_id().clone();
 
     let mut client = make_swarm(Ed25519Keypair::generate());
-    client.dial(&peer_addr).expect("dial");
+    client.core_mut().dial(&peer_addr).expect("dial");
 
     let mut client_observed: Option<Vec<u8>> = None;
 
@@ -429,11 +454,14 @@ fn identify_exchange_carries_observed_addr() {
 #[test]
 fn rapid_ping_calls_do_not_open_duplicate_streams() {
     let mut server = make_swarm(Ed25519Keypair::generate());
-    let peer_addr = server.listen_on_bound_addr().expect("server listen");
+    let peer_addr = server
+        .core_mut()
+        .listen_on_bound_addr()
+        .expect("server listen");
     let server_peer_id = peer_addr.peer_id().clone();
 
     let mut client = make_swarm(Ed25519Keypair::generate());
-    client.dial(&peer_addr).expect("dial");
+    client.core_mut().dial(&peer_addr).expect("dial");
 
     let mut client_identified = false;
     let mut ping_bursts_fired = false;

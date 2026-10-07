@@ -869,7 +869,6 @@ fn convert_swarm_error_kind(kind: SwarmErrorKind) -> EndpointErrorKind {
         SwarmErrorKind::IdentifyStreamRejected => EndpointErrorKind::IdentifyStreamRejected,
         SwarmErrorKind::OpenStreamFailed => EndpointErrorKind::OpenStreamFailed,
         SwarmErrorKind::UnsupportedProtocol => EndpointErrorKind::UnsupportedProtocol,
-        SwarmErrorKind::Driver => EndpointErrorKind::Driver,
     }
 }
 

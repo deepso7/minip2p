@@ -2,7 +2,7 @@
 //!
 //! One [`ConnectId`] covers every candidate Transport dial, relay fallback,
 //! and direct-path upgrade in an attempt. The engine races complete
-//! [`PeerAddr`]s through [`SwarmRuntime::dial`], observes the NAT relay leg
+//! [`PeerAddr`]s through [`SwarmCore::dial`], observes the NAT relay leg
 //! by reference, and emits exactly one [`EndpointEvent::ConnectSettled`] per
 //! admitted attempt.
 
@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 
 use minip2p_core::{PeerAddr, PeerId};
 use minip2p_platform::{Deadline, EntropySource};
-use minip2p_swarm::{SIMULTANEOUS_DIAL_WINDOW_MS, SwarmEvent, SwarmRuntime};
+use minip2p_swarm::{SIMULTANEOUS_DIAL_WINDOW_MS, SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, Transport};
 
 use super::event_stream::EndpointEvent;
@@ -417,7 +417,7 @@ impl ConnectEngine {
     pub(crate) fn connect<T: Transport, E: EntropySource>(
         &mut self,
         target: ConnectTarget,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
         now_ms: u64,
     ) -> ConnectId {
         self.connect_candidates(
@@ -436,7 +436,7 @@ impl ConnectEngine {
         peer: PeerId,
         candidates: Candidates,
         relay: RelayPolicy,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
         now_ms: u64,
     ) -> ConnectId {
         let Candidates {
@@ -505,7 +505,7 @@ impl ConnectEngine {
     pub(crate) fn resolved<T: Transport, E: EntropySource>(
         &mut self,
         answer: &mut dyn FnMut(&PeerAddr) -> Option<NameAnswer>,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
     ) {
         let ids: Vec<ConnectId> = self
             .attempts
@@ -581,7 +581,7 @@ impl ConnectEngine {
     pub(crate) fn cancel<T: Transport, E: EntropySource>(
         &mut self,
         id: ConnectId,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
     ) {
         let Some(attempt) = self.attempts.remove(&id) else {
             return;
@@ -600,7 +600,7 @@ impl ConnectEngine {
     pub(crate) fn observe<T: Transport, E: EntropySource>(
         &mut self,
         event: &SwarmEvent,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
         now_ms: u64,
     ) -> bool {
         match event {
@@ -688,7 +688,7 @@ impl ConnectEngine {
         &mut self,
         peer_id: &PeerId,
         conn_id: ConnectionId,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
         now_ms: u64,
     ) {
         // Abort Ok(false) tombstones may never see DialFailed once the
@@ -804,7 +804,7 @@ impl ConnectEngine {
     pub(crate) fn abort_retained<T: Transport, E: EntropySource>(
         &mut self,
         peer: &PeerId,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
     ) {
         if let Some(retained) = self.retained.remove(peer) {
             self.abort_pending(runtime, retained.dials);
@@ -813,7 +813,7 @@ impl ConnectEngine {
 
     pub(crate) fn tick<T: Transport, E: EntropySource>(
         &mut self,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
         now_ms: u64,
     ) {
         let lapsed: Vec<PeerId> = self
@@ -935,7 +935,7 @@ impl ConnectEngine {
     pub(crate) fn observe_nat<T: Transport, E: EntropySource>(
         &mut self,
         event: &minip2p_nat::NatEvent,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
         _now_ms: u64,
     ) {
         use minip2p_nat::{NatEvent, Path};
@@ -994,7 +994,7 @@ impl ConnectEngine {
 
     fn abort_pending<T: Transport, E: EntropySource>(
         &mut self,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
         ids: impl IntoIterator<Item = ConnectionId>,
     ) {
         for conn_id in ids {
@@ -1009,7 +1009,7 @@ impl ConnectEngine {
     /// connection.
     fn abort_one<T: Transport, E: EntropySource>(
         &mut self,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
         conn_id: ConnectionId,
     ) {
         match runtime.abort_dial(conn_id) {
@@ -1072,7 +1072,7 @@ pub(crate) enum Expansion {
 #[cfg(any(feature = "std", feature = "portable-mdns"))]
 pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
     connect: &mut ConnectEngine,
-    runtime: &mut SwarmRuntime<T, E>,
+    runtime: &mut SwarmCore<T, E>,
     #[cfg(feature = "_nat-driver")] nat: Option<&NatDriver<E>>,
     admission: ConnectAdmission,
     expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
@@ -1126,7 +1126,7 @@ pub(crate) fn cancel_attempt<T: Transport, E: EntropySource>(
     connect: &mut ConnectEngine,
     nat: Option<&mut NatDriver<E>>,
     id: ConnectId,
-    runtime: &mut SwarmRuntime<T, E>,
+    runtime: &mut SwarmCore<T, E>,
     now: minip2p_platform::Now,
 ) -> bool {
     match nat {
@@ -1146,7 +1146,7 @@ mod tests {
 
     use minip2p_identity::Ed25519Keypair;
     use minip2p_platform::{EntropyError, EntropySource, Now};
-    use minip2p_swarm::{SwarmBuilder, SwarmRuntime};
+    use minip2p_swarm::{SwarmBuilder, SwarmCore};
     use minip2p_transport::{
         ConnectionEndpoint, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,
         TransportEvent,
@@ -1343,17 +1343,17 @@ mod tests {
         }
     }
 
-    fn runtime(transport: FakeTransport) -> SwarmRuntime<FakeTransport, SeqEntropy> {
+    fn runtime(transport: FakeTransport) -> SwarmCore<FakeTransport, SeqEntropy> {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
         SwarmBuilder::new(&identity)
             .agent_version("minip2p-test/0.1.0")
-            .build_runtime(transport, SeqEntropy(1))
+            .build_core(transport, SeqEntropy(1))
             .expect("runtime")
     }
 
     fn drain(
         engine: &mut ConnectEngine,
-        runtime: &mut SwarmRuntime<FakeTransport, SeqEntropy>,
+        runtime: &mut SwarmCore<FakeTransport, SeqEntropy>,
         now_ms: u64,
     ) -> Vec<EndpointEvent> {
         engine.tick(runtime, now_ms);
@@ -1667,7 +1667,7 @@ mod tests {
     /// arrive first. Returns the runtime, engine, peer and that inbound
     /// connection; the attempt is settled and both dials are still open.
     fn lower_peer_settled_by_the_peers_dial() -> (
-        SwarmRuntime<FakeTransport, SeqEntropy>,
+        SwarmCore<FakeTransport, SeqEntropy>,
         ConnectEngine,
         PeerId,
         ConnectionId,
@@ -2225,7 +2225,7 @@ mod tests {
         peer: PeerId,
         candidates: Vec<PeerAddr>,
         relay: RelayPolicy,
-        runtime: &mut SwarmRuntime<FakeTransport, SeqEntropy>,
+        runtime: &mut SwarmCore<FakeTransport, SeqEntropy>,
         now_ms: u64,
     ) -> ConnectId {
         engine.connect_candidates(peer, Candidates::ready(candidates), relay, runtime, now_ms)

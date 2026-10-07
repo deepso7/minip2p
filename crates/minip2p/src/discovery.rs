@@ -1,7 +1,7 @@
 //! Caller-driven Discovery capability shared by standard and portable
 //! Endpoints: one bounded peer book fed by signed beacons and mDNS
 //! observations, with automatic dialing routed through the Connection-attempt
-//! engine. Time is supplied by the host; I/O runs through `SwarmRuntime`.
+//! engine. Time is supplied by the host; I/O runs through `SwarmCore`.
 
 use alloc::collections::BTreeMap;
 use alloc::string::ToString;
@@ -18,7 +18,7 @@ use minip2p_nat::NatEvent;
 use minip2p_platform::{EntropySource, Now};
 #[cfg(feature = "pubsub")]
 use minip2p_pubsub::GossipsubEvent;
-use minip2p_swarm::{SwarmCore, SwarmEvent, SwarmRuntime};
+use minip2p_swarm::{SwarmCore, SwarmEvent};
 
 #[cfg(feature = "_nat-driver")]
 use crate::nat::NatDriver;
@@ -173,12 +173,19 @@ impl DiscoveryDriver {
     /// only the peer-level transitions matter. Events trail the swarm's
     /// state, so a close is a disconnect only if the peer has not already
     /// reconnected.
-    pub(crate) fn observe(&mut self, event: &SwarmEvent, core: &SwarmCore, now_ms: u64) {
+    pub(crate) fn observe<T: Transport, E: EntropySource>(
+        &mut self,
+        event: &SwarmEvent,
+        core: &SwarmCore<T, E>,
+        now_ms: u64,
+    ) {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 self.book.peer_connected(peer_id, now_ms);
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } if core.conn_for(peer_id).is_none() => {
+            SwarmEvent::ConnectionClosed { peer_id, .. }
+                if core.connection_id(peer_id).is_none() =>
+            {
                 self.book.peer_disconnected(peer_id, now_ms);
             }
             _ => {}
@@ -237,7 +244,7 @@ impl DiscoveryDriver {
         &mut self,
         nat: &mut NatDriver<E>,
         connect: &mut ConnectEngine,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
         now_ms: u64,
     ) -> bool {
         let mut claimed = false;
@@ -272,7 +279,7 @@ impl DiscoveryDriver {
         #[cfg(feature = "pubsub")] mut pubsub: Option<&mut GossipsubDriver>,
         #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<E>>,
         connect: &mut ConnectEngine,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
         expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
         now: Now,
     ) -> DiscoveryNatWork {
@@ -283,7 +290,7 @@ impl DiscoveryDriver {
 
             #[cfg(feature = "pubsub")]
             if let Some(beacon) = self.beacon.as_mut() {
-                let local_addrs = runtime.core().local_addresses();
+                let local_addrs = runtime.local_addresses();
                 if self.last_local_addrs != local_addrs {
                     self.last_local_addrs = local_addrs.to_vec();
                     beacon.set_local_addrs(local_addrs, now_ms);
@@ -427,7 +434,7 @@ impl DiscoveryDriver {
         peer: &PeerId,
         connect: &mut ConnectEngine,
         #[cfg(feature = "_nat-driver")] nat: Option<&mut NatDriver<E>>,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
         now: Now,
         work: &mut DiscoveryNatWork,
     ) {
@@ -460,7 +467,7 @@ impl DiscoveryDriver {
         &mut self,
         connect: &mut ConnectEngine,
         #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<E>>,
-        runtime: &mut SwarmRuntime<T, E>,
+        runtime: &mut SwarmCore<T, E>,
         now: Now,
     ) -> DiscoveryNatWork {
         let mut work = DiscoveryNatWork::default();

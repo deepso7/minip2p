@@ -1,5 +1,5 @@
 //! Caller-driven NAT capability shared by standard and portable Endpoints.
-//! Time and entropy are supplied by the host; I/O runs through SwarmRuntime.
+//! Time and entropy are supplied by the host; I/O runs through `SwarmCore`.
 
 use alloc::{
     collections::{BTreeMap, VecDeque},
@@ -17,7 +17,7 @@ use minip2p_nat::BridgeRole;
 use minip2p_nat::{
     ConnectLegs, NatAction, NatAgent, NatEvent, Now, PromoteError, ReachabilityState,
 };
-use minip2p_swarm::{DriverError, HeldWrites, SwarmEvent, SwarmRuntime};
+use minip2p_swarm::{DriverError, HeldWrites, SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId, Transport};
 
 use crate::EndpointEvent;
@@ -160,7 +160,7 @@ impl<E: EntropySource> NatDriver<E> {
         &mut self,
         token: minip2p_nat::NatToken,
         resolved: crate::portable::connect::NameAnswer,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
         if !self.named_dial_wanted(token, sample) {
@@ -199,7 +199,7 @@ impl<E: EntropySource> NatDriver<E> {
         &mut self,
         connect: &mut ConnectEngine,
         id: ConnectId,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         now: PlatformNow,
     ) -> bool {
         let pending = connect.is_pending(id);
@@ -217,7 +217,7 @@ impl<E: EntropySource> NatDriver<E> {
         id: ConnectId,
         peer: PeerId,
         legs: ConnectLegs,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
         self.agent.connect(id, peer, legs, to_nat_now(sample));
@@ -260,7 +260,7 @@ impl<E: EntropySource> NatDriver<E> {
     /// unchanged set costs one integer compare and no transport read. Uses
     /// the runtime's recorded listen results rather than bound addresses —
     /// a transport can report sockets it never listened on.
-    fn sync_listen_addrs<T: NatTransport, R: EntropySource>(&mut self, swarm: &SwarmRuntime<T, R>) {
+    fn sync_listen_addrs<T: NatTransport, R: EntropySource>(&mut self, swarm: &SwarmCore<T, R>) {
         let revision = swarm.listened_addrs_revision();
         if revision == self.listen_addrs_revision {
             return;
@@ -278,7 +278,7 @@ impl<E: EntropySource> NatDriver<E> {
     pub(crate) fn ingest<T: NatTransport, R: EntropySource>(
         &mut self,
         event: &SwarmEvent,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) -> bool {
         self.sync_listen_addrs(swarm);
@@ -337,7 +337,7 @@ impl<E: EntropySource> NatDriver<E> {
     /// executes any resulting work.
     pub(crate) fn tick<T: NatTransport, R: EntropySource>(
         &mut self,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
         // A fresh listen must seed even when the agent has no due work —
@@ -356,7 +356,7 @@ impl<E: EntropySource> NatDriver<E> {
     /// back) and collects application-visible NAT events.
     pub(crate) fn pump<T: NatTransport, R: EntropySource>(
         &mut self,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
         self.sync_listen_addrs(swarm);
@@ -404,7 +404,7 @@ impl<E: EntropySource> NatDriver<E> {
         peer: PeerId,
         allow_relay: bool,
         target_addrs: Vec<Multiaddr>,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
         if connect.is_pending(id) {
@@ -436,7 +436,7 @@ impl<E: EntropySource> NatDriver<E> {
         &mut self,
         work: crate::discovery::DiscoveryNatWork,
         connect: &ConnectEngine,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
         for leg in work.legs {
@@ -460,7 +460,7 @@ impl<E: EntropySource> NatDriver<E> {
     pub(crate) fn feed_unobserved_to_connect<T: NatTransport, R: EntropySource>(
         &mut self,
         connect: &mut ConnectEngine,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
         let now_ms = sample.monotonic_ms;
@@ -476,7 +476,7 @@ impl<E: EntropySource> NatDriver<E> {
     pub(crate) fn cancel_leg_on_terminal<T: NatTransport, R: EntropySource>(
         &mut self,
         event: &EndpointEvent,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
         let EndpointEvent::ConnectSettled {
@@ -600,7 +600,7 @@ impl<E: EntropySource> NatDriver<E> {
     pub(crate) fn execute<T: NatTransport, R: EntropySource>(
         &mut self,
         action: NatAction,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
         let now = to_nat_now(sample);
@@ -780,7 +780,7 @@ impl<E: EntropySource> NatDriver<E> {
         conn_id: ConnectionId,
         stream_id: StreamId,
         data: Bytes,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
         let counted = data.len();
@@ -809,7 +809,7 @@ impl<E: EntropySource> NatDriver<E> {
         peer: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
         if self.held.close_after(conn_id, stream_id) {
@@ -826,7 +826,7 @@ impl<E: EntropySource> NatDriver<E> {
         peer: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
         let Some(held) = self.held.take(conn_id, stream_id) else {
@@ -843,7 +843,7 @@ impl<E: EntropySource> NatDriver<E> {
     fn inject_straggler<T: NatTransport, R: EntropySource>(
         &mut self,
         event: &SwarmEvent,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
     ) -> bool {
         let key = match event {
             SwarmEvent::StreamData {

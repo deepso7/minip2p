@@ -114,7 +114,7 @@ impl RelayServerDriver {
         let claimed = self.agent.handle_event(event, is_circuit, now);
         if let SwarmEvent::ConnectionEstablished { conn_id, .. }
         | SwarmEvent::ConnectionReplaced { new: conn_id, .. } = event
-            && let Some(address) = swarm.connection_remote_addr(*conn_id).cloned()
+            && let Some(address) = swarm.core().connection_remote_addr(*conn_id).cloned()
         {
             self.agent.set_connection_addr(*conn_id, address);
         }
@@ -156,7 +156,11 @@ impl RelayServerDriver {
                 expected_conn_id,
                 protocol_id,
             } => {
-                if swarm.connection_remote_addr(expected_conn_id).is_none() {
+                if swarm
+                    .core()
+                    .connection_remote_addr(expected_conn_id)
+                    .is_none()
+                {
                     self.agent.stream_open_result(
                         token,
                         Err(format!(

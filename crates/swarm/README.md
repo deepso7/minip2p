@@ -1,12 +1,11 @@
 # minip2p-swarm
 
-Orchestration layer that composes minip2p's protocol state machines into a single, DX-friendly `Swarm`. Split into a Sans-I/O core and a portable action pump (both `no_std + alloc`) plus an `std`-gated blocking wrapper.
+Orchestration layer that composes minip2p's protocol state machines into a single, DX-friendly swarm: one portable `no_std + alloc` type plus an `std`-gated blocking wrapper.
 
-## Three layers
+## Two layers
 
-- **`SwarmCore`** (`no_std + alloc`): pure state machine. Consumes `SwarmInput` values through `handle_input`, emits `SwarmOutput` values through `poll_output`, and reports quiescence with `is_idle`. Outputs wrap `SwarmAction` commands for the driver and `SwarmEvent` notifications for the application. No sockets, no async runtime, no clock reads. Composes `IdentifyProtocol`, `PingProtocol`, and `MultistreamSelect`; tracks connections, streams, and pending stream opens.
-- **`SwarmRuntime<T: Transport, E: EntropySource>`** (`no_std + alloc`): the action pump. Owns a concrete transport and shuttles events and actions between it and the core, but reads no clock and draws no randomness of its own — the caller passes a `Now` into `poll(now)` and injects an entropy source. `next_deadline(now)` folds the transport's timer together with the core's protocol timers so a host can idle rather than spin.
-- **`Swarm<T: Transport>`** (`std` feature, default): wraps the runtime with a monotonic clock and blocking drive loops (`poll_next`, `run_until`). Preserves the one-call DX (`swarm.dial`, `swarm.ping`, `swarm.open_stream`) without threading `now_ms` through every call.
+- **`SwarmCore<T: Transport, E: EntropySource>`** (`no_std + alloc`): the swarm. Owns a concrete transport, composes `IdentifyProtocol`, `PingProtocol`, and `MultistreamSelect`, and tracks connections and streams, but reads no clock and draws no randomness of its own — the caller passes a `Now` into `poll(now)` and every timed command, and injects an entropy source. `next_deadline(now)` folds the transport's timer together with the swarm's protocol timers so a host can idle rather than spin. Build one with `SwarmBuilder::build_core(transport, entropy)`.
+- **`Swarm<T: Transport>`** (`std` feature, default): a `SwarmCore` plus a monotonic clock and blocking drive loops (`poll_next`, `run_until`). It keeps only what needs its clock — `ping`, `disconnect`, `open_stream`, `send_stream`, `close_stream_write`, `reset_stream`, `abandon_stream`, `poll` — so those calls need no `now_ms`. Everything else (listening, dialing, protocol registration, peer and connection queries) is on `swarm.core()` / `swarm.core_mut()`; commands called through `core_mut()` take the caller's time, so pass `swarm.now()`.
 
 ## Features
 
@@ -21,14 +20,15 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
 - Auto-opens identify on every new connection and surfaces `SwarmEvent::IdentifyReceived`.
 - Emits `SwarmEvent::PeerReady { peer_id, conn_id, protocols }` once the peer id is stable and the connection's first Identify message has been processed. Readiness belongs to a connection: it fires once per connection, and a `PeerReady` whose `conn_id` is no longer the peer's current connection is stale.
 - `swarm.ping(peer_id)` opens / reuses a ping stream with no manual protocol negotiation.
-- `swarm.listen_on_bound_addrs()` starts listening on every bound transport address and returns the local `PeerAddr`s. `listen_on_bound_addr()` remains as a first-address convenience for single-socket transports.
-- `swarm.connected_peers()`, `swarm.peer_info(&peer_id)`, and `swarm.is_peer_ready(&peer_id)` expose read-only peer state. `swarm.peer_readiness(&peer_id)` returns the current connection and its Identify info together once that connection is ready, the coherent snapshot a ready wait should check before waiting for `PeerReady`. `SwarmCore::has_tracked_connections()` is also true for inbound handshakes that have not yet emitted `ConnectionEstablished`.
-- Every public `Swarm` method returns `DriverError`, keeping transport failures, Sans-I/O state rejections, and driver-invariant violations distinguishable; asynchronous action failures are emitted as `SwarmEvent::Error`.
+- `swarm.core_mut().listen_on_bound_addrs()` starts listening on every bound transport address and returns the local `PeerAddr`s. `listen_on_bound_addr()` remains as a first-address convenience for single-socket transports.
+- `connected_peers()`, `peer_info(&peer_id)`, and `is_peer_ready(&peer_id)` on `SwarmCore` expose read-only peer state. `peer_readiness(&peer_id)` returns the current connection and its Identify info together once that connection is ready, the coherent snapshot a ready wait should check before waiting for `PeerReady`. `has_tracked_connections()` is also true for inbound handshakes that have not yet emitted `ConnectionEstablished`.
+- Commands return `DriverError`, keeping transport failures and swarm state rejections distinguishable; protocol registration returns `SwarmError`. `open_stream` and `send_stream` return their own transport failure directly and emit no event for it; work the swarm does on its own (negotiation, Identify, ping, half-close and reset dispatch) reports failures as `SwarmEvent::Error`.
+- Ordering: each transport event's work runs to completion before the next event is read, and timers tick after the batch. Transport work runs before events are delivered; a replaced connection's close waits until the caller has drained every queued event, including across commands issued between deliveries.
 - Waits (`poll_next`, `run_until`) accept `impl Into<Deadline>`: an `Instant` (absolute), a `Duration` (relative), or `Deadline::NEVER` to block until an event arrives -- no far-future sentinel timestamps needed.
 - `run_until` preserves non-matching events in order, so convenience waits do not steal unrelated application events. Once the deadline expires it still scans everything already synchronously available (buffered events plus one final transport poll), so a buffered match is found regardless of position. Use a consuming `poll_next` loop instead when handling has side effects (logging, dispatch).
 - Generic user-protocol hook for anything else (relay, DCUtR, custom app protocols):
   ```rust
-  swarm.add_protocol("/myapp/1.0.0")?;
+  swarm.core_mut().add_protocol("/myapp/1.0.0")?;
   let (conn_id, stream_id) = swarm.open_stream(&peer_id, "/myapp/1.0.0")?;
   match swarm.send_stream(&peer_id, conn_id, stream_id, data) {
       Ok(()) => {}
@@ -46,44 +46,28 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
 - Identify lifecycle: `IdentifyReceived { peer_id, info }` with observed-addr populated from the transport endpoint.
 - Ping lifecycle: `PingRttMeasured`, `PingTimeout`.
 - User-stream lifecycle: `StreamReady`, `StreamData`, `StreamWritable`, `StreamRemoteWriteClosed`, `StreamWriteStopped`, `StreamClosed`. A write stop on an identify, ping, or still-negotiating stream resets it instead.
-- Synthetic-`PeerId` path for transports that don't authenticate the remote at handshake time; promotes the id to the verified one via `TransportEvent::PeerIdentityVerified`, migrating all per-peer state and buffered events atomically. A connection that closes before its identity is verified takes its placeholder's buffered events with it, including those already buffered in `SwarmRuntime`.
+- Synthetic-`PeerId` path for transports that don't authenticate the remote at handshake time; promotes the id to the verified one via `TransportEvent::PeerIdentityVerified`, migrating all per-peer state and queued events atomically. A connection that closes before its identity is verified takes its placeholder's undelivered events with it.
 
-## Sans-I/O usage
+## Portable usage
 
 ```rust
-use minip2p_swarm::{SwarmCore, SwarmInput, SwarmOutput};
-use minip2p_identify::IdentifyConfig;
-use minip2p_ping::PingConfig;
+use minip2p_swarm::{SwarmBuilder, Now};
 
-let mut core = SwarmCore::new(identify_config, PingConfig::default());
-core.add_protocol("/myapp/1.0.0")?;
+let mut core = SwarmBuilder::new(&keypair)
+    .protocol("/myapp/1.0.0")
+    .build_core(transport, entropy)?;
+core.listen_on_bound_addrs()?;
 
-// Drive it:
-// core.handle_input(SwarmInput::Transport { event, now_ms });
-// core.handle_input(SwarmInput::Tick { now_ms });
-// while let Some(output) = core.poll_output() {
-//     match output {
-//         SwarmOutput::Action(action) => execute(action),
-//         SwarmOutput::Event(event) => { /* hand to app */ }
-//     }
-// }
+loop {
+    let now: Now = clock_sample();
+    for event in core.poll(now)? {
+        // hand to app; commands take the same `now.monotonic_ms`
+    }
+    // Idle until `core.next_deadline(now)` or transport input, whichever is first.
+}
 ```
 
-### Driver loop contract
-
-The core is deterministic when callers use a simple mutate-then-drain loop:
-
-1. Feed exactly one external input into the core with `core.handle_input(...)`, or call one application intent such as `ping`, `open_stream`, or `send_stream`.
-2. Drain `core.poll_output()`.
-3. Execute each `SwarmOutput::Action` against your transport.
-4. Feed driver results back with `SwarmInput::StreamOpened`, `SwarmInput::OpenStreamFailed`, or `SwarmInput::RuntimeError`. If executing a `SwarmAction::ResetStream` fails, also call `core.reset_stream_failed(conn_id, stream_id)` so a later reset can be retried.
-
-   `SwarmRuntimeError` carries `peer_id`, `conn_id`, and `stream_id` whenever the corresponding identity is known. In particular, asynchronous outbound multistream and unsupported-protocol failures retain the stream id needed by hosts to correlate an open request.
-
-5. Hand each `SwarmOutput::Event` to the application.
-6. Before waiting on I/O again, `core.is_idle()` should be true.
-
-That shape mirrors the std `Swarm<T>` driver while keeping sockets, clocks, sleeps, async runtimes, and allocation policy outside the Sans-I/O core.
+`poll` drives one iteration: it reads the transport, runs the work each event causes, advances timers, and returns the events. Hosts sleep until `next_deadline`, which is immediate while undelivered events or deferred closes are waiting.
 
 ## Std driver usage
 
@@ -98,7 +82,7 @@ Disable default features:
 minip2p-swarm = { path = "crates/swarm", default-features = false }
 ```
 
-The `no_std` build omits only the blocking `Swarm<T>` wrapper. `SwarmBuilder` remains available: call `build_runtime(transport, entropy)` to construct a portable `SwarmRuntime`. `SwarmCore`, the event / action / error types, and the full caller-driven runtime all remain available without `std`.
+The `no_std` build omits only the blocking `Swarm<T>` wrapper. `SwarmBuilder` remains available: call `build_core(transport, entropy)` to construct a portable `SwarmCore`. `SwarmCore` and the event and error types all remain available without `std`.
 
 ## Scope
 
