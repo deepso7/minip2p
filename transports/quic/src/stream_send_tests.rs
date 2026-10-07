@@ -787,3 +787,56 @@ fn a_peer_reset_retracts_a_writable_queued_before_the_poll() {
         "no Writable for a reset stream: {events:?}"
     );
 }
+
+#[test]
+fn a_local_close_retracts_queued_writables() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 4_000,
+        ..QuicLimits::default()
+    };
+    let mut server = QuicTransport::new(
+        QuicNodeConfig::generate().with_limits(limits),
+        "127.0.0.1:0",
+    )
+    .expect("bind server");
+    server.listen_on_bound_addr().expect("listen");
+    let (mut peer, id) = accept(&mut server, &mut [], |config| {
+        config.set_initial_max_stream_data_bidi_local(1_000);
+    });
+    peer.conn.stream_send(0, b"a", false).expect("open 0");
+    peer.conn.stream_send(4, b"b", false).expect("open 4");
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "inbound streams",
+        |events| {
+            events
+                .iter()
+                .filter(|event| matches!(event, TransportEvent::StreamData { .. }))
+                .count()
+                == 2
+        },
+    );
+    let (filler, waiting) = (StreamId::new(0), StreamId::new(4));
+    for stream in [filler, waiting] {
+        assert!(matches!(
+            server.send_stream(id, stream, Bytes::from(vec![7; 10_000])),
+            Err(TransportError::Full { .. })
+        ));
+    }
+
+    // Resetting the filler frees the shared queue and queues a Writable for
+    // the other stream; closing the connection before the poll retracts it.
+    server.reset_stream(id, filler).expect("local reset");
+    server.close(id).expect("close");
+    let events = server.poll(now()).expect("poll");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::StreamWritable { .. })),
+        "no Writable after a local close: {events:?}"
+    );
+    assert_eq!(server.connections[&id].writable_armed_count(), 0);
+}

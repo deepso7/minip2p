@@ -654,8 +654,10 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     ///
     /// This is used when ownership of a negotiated stream moves to another
     /// protocol layer. Already-buffered events are intentionally preserved.
-    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
-        self.core.forget_stream(conn_id, stream_id);
+    /// Returns the bytes the core still owes the stream, oldest first; see
+    /// [`SwarmCore::forget_stream`].
+    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) -> VecDeque<Bytes> {
+        self.core.forget_stream(conn_id, stream_id)
     }
 
     /// Resets and forgets a stream whose consumer will never read it again.

@@ -1621,13 +1621,16 @@ impl Transport for QuicTransport {
             .get_mut(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
 
-        conn.close(
+        let result = conn.close(
             &self.socket,
             &mut self.pending_datagrams,
             self.node_config.limits().max_pending_datagrams,
-        )?;
-
-        Ok(())
+        );
+        // Nor may one a Full queued before the close.
+        self.pending_events.retain(
+            |event| !matches!(event, TransportEvent::StreamWritable { id: event_id, .. } if *event_id == id),
+        );
+        result
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {

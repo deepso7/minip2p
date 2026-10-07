@@ -714,15 +714,15 @@ impl<E: EntropySource> NatDriver<E> {
                 }
                 #[cfg(feature = "_circuit-driver")]
                 {
-                    swarm.forget_stream(inner_conn, stream_id);
-                    // A relay message the bridge refused as Full (a STOP
-                    // STATUS, say) is still owed to the peer: the circuit
-                    // takes Writable for the stream now, so it sends it first.
-                    let unsent_prefix = self
-                        .held
-                        .take(inner_conn, stream_id)
-                        .map(|held| concat(held.tails))
-                        .unwrap_or_default();
+                    // Bytes refused as Full are still owed to the peer: the
+                    // core's (a negotiation reply, say), then ours (a STOP
+                    // STATUS). The circuit takes Writable for the stream now,
+                    // so it sends them first, in that order.
+                    let mut owed = swarm.forget_stream(inner_conn, stream_id);
+                    if let Some(held) = self.held.take(inner_conn, stream_id) {
+                        owed.extend(held.tails);
+                    }
+                    let unsent_prefix = concat(owed);
                     let adoption = BridgeAdoption {
                         inner_conn,
                         bridge_stream: stream_id,

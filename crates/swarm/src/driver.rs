@@ -386,8 +386,8 @@ impl<T: Transport> Swarm<T> {
     }
 
     /// See [`SwarmRuntime::forget_stream`].
-    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
-        self.runtime.forget_stream(conn_id, stream_id);
+    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) -> VecDeque<Bytes> {
+        self.runtime.forget_stream(conn_id, stream_id)
     }
 
     // --- delegations that supply the clock sample -------------------------

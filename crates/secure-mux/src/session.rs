@@ -852,7 +852,13 @@ fn push_yamux_events(
                 SessionOutput::StreamRemoteWriteClosed { stream: stream(id) }
             }
             YamuxOutput::StreamClosed { stream: id } => {
-                SessionOutput::StreamClosed { stream: stream(id) }
+                // A Writable an earlier pump moved here must not follow the
+                // close; a reset or GoAway can end the stream before the
+                // caller drains it.
+                let closed = stream(id);
+                outputs
+                    .retain(|output| *output != SessionOutput::StreamWritable { stream: closed });
+                SessionOutput::StreamClosed { stream: closed }
             }
             YamuxOutput::Writable { stream: id } => {
                 SessionOutput::StreamWritable { stream: stream(id) }
@@ -1230,6 +1236,38 @@ mod tests {
         );
         assert!(!session.is_established());
         assert!(session.writes.bytes > written, "the GoAway is flushed");
+    }
+
+    #[test]
+    fn a_stream_that_ends_drops_its_pending_writable() {
+        let initiator_key = Ed25519Keypair::generate();
+        let responder_key = Ed25519Keypair::generate();
+        let peer = responder_key.peer_id();
+        let (noise, _) = noise_pair(initiator_key, responder_key);
+        let mut yamux = YamuxSession::new(YamuxRole::Client);
+        let syn = Frame::window_update(2, FLAG_SYN, 0).unwrap();
+        yamux.handle_data(&syn.encode()).unwrap();
+        let stream = StreamId::new(2);
+        let mut session = SecureMuxSession {
+            role: SessionRole::Initiator,
+            yamux_config: YamuxConfig::default(),
+            phase: Some(Phase::Ready { noise, yamux, peer }),
+            // An earlier pump already moved this stream's Writable here.
+            outputs: VecDeque::from([SessionOutput::StreamWritable { stream }]),
+            writes: WriteQueue::default(),
+        };
+
+        session.go_away(0).expect("go away");
+
+        let outputs: Vec<_> = core::iter::from_fn(|| session.poll_output()).collect();
+        assert!(
+            outputs.contains(&SessionOutput::StreamClosed { stream }),
+            "{outputs:?}"
+        );
+        assert!(
+            !outputs.contains(&SessionOutput::StreamWritable { stream }),
+            "no Writable for a stream that ended: {outputs:?}"
+        );
     }
 
     #[test]

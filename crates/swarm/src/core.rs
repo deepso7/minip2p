@@ -890,22 +890,41 @@ impl SwarmCore {
     ///
     /// Unlike [`abandon_stream`](Self::abandon_stream), this does not reset
     /// the stream and does not remove application events that are already
-    /// queued. Pending send, half-close, and reset actions for the stream are
-    /// discarded so ownership transfers without a later swarm-side mutation.
+    /// queued. Pending half-close and reset actions for the stream are
+    /// discarded, and pending sends are handed back, so ownership transfers
+    /// without a later swarm-side mutation.
     /// It is intended for callers that transfer ownership of a raw stream to
     /// another Sans-I/O protocol layer.
-    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+    ///
+    /// Returns the bytes the core still owes the stream, oldest first: tails
+    /// held after a Full (a negotiation reply, say), then queued sends. The
+    /// new owner must send them before anything of its own.
+    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) -> VecDeque<Bytes> {
         let key = (conn_id, stream_id);
         self.remove_stream_owner(conn_id, stream_id);
         self.inbound_negotiators.remove(&key);
         self.outbound_negotiators.remove(&key);
         self.reset_pending.remove(&key);
         self.abandoned_streams.remove(&key);
-        self.forget_held(conn_id, stream_id);
-        self.actions
-            .retain(|action| !stream_action_matches(action, conn_id, stream_id));
-        self.after_event_actions
-            .retain(|action| !stream_action_matches(action, conn_id, stream_id));
+        self.user_writable_wanted.remove(&key);
+        let mut owed = self
+            .held
+            .take(conn_id, stream_id)
+            .map(|held| held.tails)
+            .unwrap_or_default();
+        // Writes still queued here come after the held ones.
+        for queue in [&mut self.actions, &mut self.after_event_actions] {
+            queue.retain(|action| {
+                if !stream_action_matches(action, conn_id, stream_id) {
+                    return true;
+                }
+                if let SwarmAction::SendStream { data, .. } = action {
+                    owed.push_back(data.clone());
+                }
+                false
+            });
+        }
+        owed
     }
 
     /// Resets and forgets a stream whose consumer will never read it again.
@@ -3312,6 +3331,55 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_a_stream_hands_back_the_bytes_the_core_still_owes() {
+        const PROTOCOL: &str = "/test/1";
+        let mut core = test_core();
+        core.add_protocol(PROTOCOL).expect("register protocol");
+        let peer_id = PeerId::from_public_key_protobuf(b"bridge-relay");
+        let conn_id = ConnectionId::new(7);
+        let stream_id = StreamId::new(3);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id, conn_id);
+
+        // The negotiation header comes back Full, and the echo queues behind it.
+        feed(
+            &mut core,
+            TransportEvent::IncomingStream {
+                id: conn_id,
+                stream_id,
+            },
+        );
+        let header = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        drain_actions(&mut core);
+        core.handle_input(SwarmInput::SendFull {
+            conn_id,
+            stream_id,
+            unsent: Bytes::copy_from_slice(&header[3..]),
+            counted: header.len(),
+        });
+        let mut offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        offer.extend_from_slice(&multistream_frame(PROTOCOL));
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: Bytes::from(offer),
+            },
+        );
+
+        let owed: Vec<u8> = core
+            .forget_stream(conn_id, stream_id)
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut expected = header[3..].to_vec();
+        expected.extend_from_slice(&multistream_frame(PROTOCOL));
+        assert_eq!(owed, expected, "the held tail, then the queued echo");
+        assert!(!core.holds_writes(conn_id, stream_id));
+    }
+
+    #[test]
     fn a_writable_waits_while_the_replayed_tail_comes_back_full() {
         const PROTOCOL: &str = "/test/1";
         let mut core = test_core();
@@ -4546,7 +4614,11 @@ mod tests {
             data: Bytes::from(vec![1]),
         });
 
-        core.forget_stream(conn, stream);
+        assert_eq!(
+            core.forget_stream(conn, stream),
+            [Bytes::from(vec![2])],
+            "the queued send is handed back"
+        );
 
         assert!(core.stream_protocol(conn, stream).is_none());
         assert!(!core.inbound_negotiators.contains_key(&key));

@@ -806,6 +806,8 @@ impl QuicConnection {
         }
 
         self.state = ConnectionState::Closing;
+        // Every write side ends with the connection, so no Writable fires.
+        self.writable_armed.clear();
         let mut drain_events = Vec::new();
         self.drain_send_queue(&mut drain_events);
         self.flush(socket, pending_datagrams, max_pending_datagrams)?;
@@ -1091,7 +1093,12 @@ impl QuicConnection {
     /// the connection's queue is free. The queue is shared, so freeing it
     /// wakes every stream it blocked.
     fn wake_writable(&mut self, events: &mut Vec<TransportEvent>) {
-        if self.writable_armed.is_empty() {
+        if self.writable_armed.is_empty()
+            || matches!(
+                self.state,
+                ConnectionState::Closing | ConnectionState::Closed
+            )
+        {
             return;
         }
         let room = self
