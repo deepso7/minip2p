@@ -1384,3 +1384,51 @@ fn completing_an_upgrade_arms_the_keepalive_deadline() {
     }
     panic!("the upgrade did not complete");
 }
+
+#[test]
+fn a_zero_send_buffer_still_upgrades_and_carries_data() {
+    // Zero cannot mean "never pull": it holds one frame at a time instead.
+    let config = TcpConfig {
+        max_buffered_send: 0,
+        ..TcpConfig::default()
+    };
+    let mut pair = upgraded_pair_with(config, TcpConfig::default());
+    let id = pair.connection;
+    assert!(connected_peer(&pair.dialer_events, id).is_some());
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    pair.dialer
+        .send_stream(id, stream, Bytes::from_static(b"hello"))
+        .expect("send");
+    let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    assert!(listener_events.iter().any(|event| matches!(
+        event,
+        TransportEvent::StreamData { data, .. } if &data[..] == b"hello"
+    )));
+}
+
+#[test]
+fn closing_a_connection_drops_its_queued_writable() {
+    let mut config = TcpConfig::default();
+    config.yamux.max_buffered_send = 8 * 1024;
+    let mut pair = upgraded_pair_with(config, TcpConfig::default());
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // The send pulls frames into the socket buffer, freeing Yamux's cap, so a
+    // Writable may already be queued when the connection closes.
+    assert!(matches!(
+        pair.dialer
+            .send_stream(id, stream, Bytes::from(vec![3u8; 64 * 1024])),
+        Err(TransportError::Full { .. })
+    ));
+    pair.dialer.close(id).expect("close");
+    let events = pair.dialer.poll(Now::from_millis(0)).expect("poll");
+    assert!(events.contains(&TransportEvent::Closed { id }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::StreamWritable { .. })),
+        "no Writable for a closed connection: {events:?}"
+    );
+}

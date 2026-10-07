@@ -1617,6 +1617,27 @@ test("a write native holds resolves on StreamWriteAccepted and keeps later write
   endpoint.close();
 });
 
+test("closeWrite throws a native refusal when nothing is pending, and defers it otherwise", async () => {
+  const backend = new MockBackend();
+  const { endpoint, stream } = await openedStream(backend);
+  const refusal = new Error("stream gone");
+  backend.closeWriteError = refusal;
+  assert.throws(() => stream.closeWrite(), refusal);
+
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 4 }));
+  const queued = await opening;
+  backend.sendResults = [false];
+  const write = queued.write("held");
+  queued.closeWrite();
+  backend.emit(
+    streamWriteEvent(P2pEvent_Tags.StreamWriteAccepted, { streamId: 4 })
+  );
+  await write;
+  assert.equal(backend.operations.at(-1)[0], "closeWrite");
+  endpoint.close();
+});
+
 test("writes past the high-water mark reject with WriteBufferFullError", async () => {
   const backend = new MockBackend();
   const { endpoint, stream } = await openedStream(backend);

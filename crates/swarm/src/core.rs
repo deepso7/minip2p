@@ -527,7 +527,17 @@ impl SwarmCore {
                 return Some(SwarmOutput::Action(action));
             }
         }
-        if let Some(event) = self.events.pop_front() {
+        while let Some(event) = self.events.pop_front() {
+            // A replayed tail that came back Full while this Writable waited
+            // holds the stream again: wait for the next Writable instead.
+            if let SwarmEvent::StreamWritable {
+                conn_id, stream_id, ..
+            } = &event
+                && self.held.is_held(*conn_id, *stream_id)
+            {
+                self.user_writable_wanted.insert((*conn_id, *stream_id));
+                continue;
+            }
             return Some(SwarmOutput::Event(event));
         }
         while let Some(action) = self.after_event_actions.pop_front() {
@@ -3296,6 +3306,60 @@ mod tests {
             )),
             "no Writable after the write side closed"
         );
+    }
+
+    #[test]
+    fn a_writable_waits_while_the_replayed_tail_comes_back_full() {
+        const PROTOCOL: &str = "/test/1";
+        let mut core = test_core();
+        core.add_protocol(PROTOCOL).expect("register protocol");
+        let peer_id = PeerId::from_public_key_protobuf(b"slow-reader");
+        let conn_id = ConnectionId::new(7);
+        let stream_id = StreamId::new(3);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User(PROTOCOL.to_string()));
+        let tail = Bytes::from_static(b"tail");
+        core.handle_input(SwarmInput::SendFull {
+            conn_id,
+            stream_id,
+            unsent: tail.clone(),
+            counted: 4,
+        });
+        let payload = Bytes::from_static(b"app");
+        assert!(matches!(
+            core.send_stream(&peer_id, conn_id, stream_id, payload),
+            Err(SwarmError::Full { .. })
+        ));
+        let writable = TransportEvent::StreamWritable {
+            id: conn_id,
+            stream_id,
+        };
+
+        // The replay is Full again: the user is not woken yet.
+        feed(&mut core, writable.clone());
+        assert!(matches!(
+            core.poll_output(),
+            Some(SwarmOutput::Action(SwarmAction::SendStream { .. }))
+        ));
+        core.handle_input(SwarmInput::SendFull {
+            conn_id,
+            stream_id,
+            unsent: tail,
+            counted: 4,
+        });
+        assert!(core.poll_output().is_none());
+
+        // The next replay goes through, and then the user is woken.
+        feed(&mut core, writable);
+        let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+        assert!(matches!(
+            outputs.as_slice(),
+            [
+                SwarmOutput::Action(SwarmAction::SendStream { .. }),
+                SwarmOutput::Event(SwarmEvent::StreamWritable { .. }),
+            ]
+        ));
     }
 
     #[test]

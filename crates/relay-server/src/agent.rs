@@ -424,17 +424,10 @@ impl RelayServerAgent {
             // so they never reach the application.
             SwarmEvent::StreamWritable {
                 conn_id, stream_id, ..
-            } => {
-                let key = StreamKey {
-                    conn_id: *conn_id,
-                    stream_id: *stream_id,
-                };
-                self.circuits.contains_key(&key)
-                    || self.stop_to_source.contains_key(&key)
-                    || self.hop_workers.contains_key(&key)
-                    || self.pending_circuits.contains_key(&key)
-                    || self.rejected_hop_streams.contains_key(&key)
-            }
+            } => self.claims_stream(StreamKey {
+                conn_id: *conn_id,
+                stream_id: *stream_id,
+            }),
             SwarmEvent::StreamWriteStopped {
                 peer_id,
                 conn_id,
@@ -584,15 +577,25 @@ impl RelayServerAgent {
     #[cold]
     #[inline(never)]
     fn on_stream_write_stopped(&mut self, peer_id: &PeerId, key: StreamKey) -> bool {
-        let owned = self.circuits.contains_key(&key)
-            || self.stop_to_source.contains_key(&key)
-            || self.hop_workers.contains_key(&key)
-            || self.pending_circuits.contains_key(&key)
-            || self.rejected_hop_streams.contains_key(&key);
+        let owned = self.claims_stream(key);
         if owned {
             self.queue_reset(peer_id.clone(), key);
         }
         owned
+    }
+
+    /// Whether the relay claims `key` in any role, including a circuit still
+    /// connecting. Cold and out of line for the same reason as
+    /// [`Self::on_stream_write_stopped`]: inlined into `handle_event`, these
+    /// lookups slowed every event.
+    #[cold]
+    #[inline(never)]
+    fn claims_stream(&self, key: StreamKey) -> bool {
+        self.circuits.contains_key(&key)
+            || self.stop_to_source.contains_key(&key)
+            || self.hop_workers.contains_key(&key)
+            || self.pending_circuits.contains_key(&key)
+            || self.rejected_hop_streams.contains_key(&key)
     }
 
     /// Sweeps deadlines before the first event in a driver batch.

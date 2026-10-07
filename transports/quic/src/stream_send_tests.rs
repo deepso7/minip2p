@@ -644,3 +644,67 @@ fn partially_written_queue_drains_once_the_stream_is_writable() {
     assert_eq!(connection.pending_write_bytes(), 0);
     assert_eq!(connection.queued_stream_count(), 0);
 }
+
+#[test]
+fn a_peer_reset_disarms_its_stream_while_the_queue_stays_full() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 4_000,
+        ..QuicLimits::default()
+    };
+    let mut server = QuicTransport::new(
+        QuicNodeConfig::generate().with_limits(limits),
+        "127.0.0.1:0",
+    )
+    .expect("bind server");
+    server.listen_on_bound_addr().expect("listen");
+    // A small window for server data keeps most of each write queued, and
+    // the peer never reads, so nothing drains the queue.
+    let (mut peer, id) = accept(&mut server, &mut [], |config| {
+        config.set_initial_max_stream_data_bidi_local(1_000);
+    });
+    peer.conn.stream_send(0, b"a", false).expect("open 0");
+    peer.conn.stream_send(4, b"b", false).expect("open 4");
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "inbound streams",
+        |events| {
+            events
+                .iter()
+                .filter(|event| matches!(event, TransportEvent::StreamData { .. }))
+                .count()
+                == 2
+        },
+    );
+    let (filler, reset) = (StreamId::new(0), StreamId::new(4));
+    // The filler takes the whole shared queue; the second write finds none.
+    for stream in [filler, reset] {
+        assert!(matches!(
+            server.send_stream(id, stream, Bytes::from(vec![7; 10_000])),
+            Err(TransportError::Full { .. })
+        ));
+    }
+    assert_eq!(server.connections[&id].writable_armed_count(), 2);
+
+    // Resetting a stream that queued nothing frees no room, so no wake runs:
+    // the reset itself must disarm it.
+    peer.conn
+        .stream_shutdown(4, quiche::Shutdown::Write, 5)
+        .expect("reset");
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "reset",
+        |events| {
+            events.contains(&TransportEvent::StreamClosed {
+                id,
+                stream_id: reset,
+            })
+        },
+    );
+    assert_eq!(server.connections[&id].writable_armed_count(), 1);
+}

@@ -282,6 +282,12 @@ impl QuicConnection {
         self.pending_write_bytes
     }
 
+    /// Streams waiting for a `StreamWritable`.
+    #[cfg(test)]
+    pub(crate) fn writable_armed_count(&self) -> usize {
+        self.writable_armed.len()
+    }
+
     /// Number of streams with queued writes.
     #[cfg(test)]
     pub(crate) fn queued_stream_count(&self) -> usize {

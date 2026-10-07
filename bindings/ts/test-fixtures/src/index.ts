@@ -18,6 +18,7 @@ export type MockBackendOperation =
 /** Scriptable, contract-complete backend for package-level SDK tests. */
 export class MockBackend implements Minip2pBackend {
   abandonError: unknown;
+  closeWriteError: unknown;
   closed = false;
   connected: string[] = [];
   /** `connectionInfo` snapshots by peer ID. */
@@ -141,6 +142,9 @@ export class MockBackend implements Minip2pBackend {
 
   closeStreamWrite(peerId: string, connId: number, streamId: number): void {
     this.operations.push(["closeWrite", peerId, connId, streamId]);
+    if (this.closeWriteError !== undefined) {
+      throw this.closeWriteError;
+    }
   }
 
   resetStream(peerId: string, connId: number, streamId: number): void {

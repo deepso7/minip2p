@@ -2633,6 +2633,35 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_circuit_drops_its_queued_writable() {
+        let config = YamuxConfig {
+            max_buffered_send: 64,
+            max_total_buffered_send: 128,
+            ..YamuxConfig::default()
+        };
+        let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) =
+            setup_pair_with_yamux_config(Some(config));
+        complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+        let stream = a.open_stream(circuit_id).expect("stream");
+        let _ = a.poll(Now::from_millis(0)).expect("local open");
+        let _ = b.poll(Now::from_millis(0)).expect("remote open");
+
+        assert!(matches!(
+            a.send_stream(circuit_id, stream, Bytes::from(vec![7u8; 256])),
+            Err(TransportError::Full { .. })
+        ));
+        a.close(circuit_id).expect("close");
+        let events = a.poll(Now::from_millis(0)).expect("poll");
+        assert!(events.contains(&TransportEvent::Closed { id: circuit_id }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TransportEvent::StreamWritable { .. })),
+            "no Writable for a closed circuit: {events:?}"
+        );
+    }
+
+    #[test]
     fn adoption_rejects_invalid_preconditions_without_consuming_ids() {
         let relay = identity(9).peer_id();
         let local = identity(1);

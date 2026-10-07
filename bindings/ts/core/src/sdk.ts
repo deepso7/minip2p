@@ -311,6 +311,10 @@ export class Stream {
    * a closed error after `closeWrite()`, a remote stop, or the stream
    * closing. If event loss strands a write in flight, the stream is reset
    * and the write rejects with {@link EventQueueOverflowError}.
+   *
+   * A write queued behind a pending one keeps a reference to `data`, and
+   * native reads it only when the write reaches the head of the queue: leave
+   * the buffer untouched until the Promise settles.
    */
   write(data: string | Bytes): Promise<void> {
     if (this.#closed) {
@@ -338,14 +342,21 @@ export class Stream {
   /**
    * Half-closes the local write side once every earlier write has been
    * accepted, keeping reads available. Later writes reject.
+   *
+   * With no write pending the close goes to native now and throws if native
+   * refuses it. Behind pending writes it is queued, and a close native then
+   * refuses is reported by the stream's terminal event instead.
    */
   closeWrite(): void {
     if (this.#closed || this.#writeEnded !== undefined) {
       return;
     }
     this.#writeEnded = new StreamClosedError("The stream write side closed");
+    if (this.#writes.length === 0) {
+      this.#backend.closeStreamWrite(this.peerId, this.connId, this.streamId);
+      return;
+    }
     this.#closeWriteQueued = true;
-    this.#pumpWrites();
   }
 
   /** Abruptly resets the stream and emits `closed`. */
@@ -528,7 +539,8 @@ export class Stream {
               this.streamId
             );
           } catch {
-            // The stream already ended; its terminal event reports that.
+            // A deferred close has no caller left to throw to; the stream
+            // already ended, and its terminal event reports that.
           }
         }
         return;
