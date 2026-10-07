@@ -599,7 +599,7 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
-  test("handles an unclaimed ready stream closed in the same drain", async () => {
+  test("skips a peer stream that closed without data in the same drain", async () => {
     vi.useFakeTimers();
     const endpoint = createEndpoint();
     const fake = fakeEndpoint();
@@ -633,9 +633,8 @@ describe("Node adapter", () => {
     fake.ring();
     await settle();
 
-    expect(fake.abandonedStreams).toEqual([
-      { connId: 10n, peerId: "remote", streamId: 20n },
-    ]);
+    // Never surfaced, so there is nothing to abandon, and later events flow.
+    expect(fake.abandonedStreams).toEqual([]);
     expect(peers).toEqual(["after"]);
     endpoint.close();
   });

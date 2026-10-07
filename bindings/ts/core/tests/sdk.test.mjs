@@ -908,6 +908,64 @@ test("a pull reader consumes a chunk when read() returns it, and a terminal cons
   endpoint.close();
 });
 
+test("abandoning or resetting a cleanly closed stream consumes its unread bytes", async () => {
+  for (const discard of ["abandon", "reset", Symbol.dispose]) {
+    const backend = new MockBackend();
+    const endpoint = new TestMinip2p(backend);
+    const opening = endpoint.openStream("peer", "/test/1", {
+      timeoutMs: 1000,
+    });
+    backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+    const stream = await opening;
+    backend.emit(streamData(new Uint8Array(4), 3));
+    for (const tag of [
+      P2pEvent_Tags.StreamRemoteWriteClosed,
+      P2pEvent_Tags.StreamClosed,
+    ]) {
+      backend.emit({ inner: { connId: 2, peerId: "peer", streamId: 3 }, tag });
+    }
+    await tick();
+    assert.deepEqual(backend.consumed, [], "kept for a later read");
+
+    stream[discard]();
+
+    assert.deepEqual(backend.consumed, [[2, 3, 4]], String(discard));
+    assert.equal(await stream.read(), undefined);
+    endpoint.close();
+  }
+});
+
+function streamClosed(streamId) {
+  return {
+    inner: { connId: 2, peerId: "peer", streamId },
+    tag: P2pEvent_Tags.StreamClosed,
+  };
+}
+
+test("peer streams that close without data before dispatch leave the queue whole", async () => {
+  const backend = new MockBackend();
+  const handled = [];
+  backend.eventHandled = (event) => handled.push(event.tag);
+  const endpoint = new TestMinip2p(backend);
+  const streams = [];
+  endpoint.on("stream", (stream) => streams.push(stream.streamId));
+  // Queued before any dispatch: the data-less stream is never surfaced, and
+  // its events are still released to the adapter.
+  backend.emit(streamReady({ streamId: 5 }));
+  backend.emit(streamClosed(5));
+  backend.emit(streamReady({ streamId: 7 }));
+  backend.emit(streamData(new Uint8Array([1]), 7));
+  backend.emit(streamClosed(7));
+  await tick();
+
+  assert.deepEqual(streams, [7]);
+  assert.deepEqual(handled.slice(0, 2), [
+    P2pEvent_Tags.StreamReady,
+    P2pEvent_Tags.StreamClosed,
+  ]);
+  endpoint.close();
+});
+
 test("a data listener consumes a chunk when it returns", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);

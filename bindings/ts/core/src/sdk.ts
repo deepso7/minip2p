@@ -234,6 +234,18 @@ const coalesceData = (
   return { event, source: "native" };
 };
 
+/** The stream a native per-stream event belongs to. */
+const streamEventKey = (item: QueueItem): string | undefined => {
+  if (
+    item.source !== "native" ||
+    (item.event.tag !== P2pEvent_Tags.StreamReady && !isStreamEvent(item.event))
+  ) {
+    return undefined;
+  }
+  const { peerId, connId, streamId } = item.event.inner;
+  return streamKey(peerId, connId, streamId);
+};
+
 /**
  * The endpoint's shared event queue, in delivery order.
  *
@@ -241,18 +253,29 @@ const coalesceData = (
  * coalesces into one event, so native receive budgets bound them; they do
  * not count against the capacity. Past `capacity` other items, the oldest
  * gossipsub message is dropped first, then the oldest other item.
+ *
+ * A peer-opened stream that closes without data before its `StreamReady`
+ * is dispatched leaves the queue whole, so a peer opening and closing
+ * streams cannot grow it; its events still reach `release`.
  */
 class EventQueue {
   readonly #items = new Map<number, QueueItem>();
   /** Droppable messages, then other droppable items, oldest first. */
   readonly #messages = new Set<number>();
   readonly #others = new Set<number>();
+  /**
+   * Peer-opened streams whose `StreamReady` is still queued, with their
+   * queued item ids; `undefined` once one carried data.
+   */
+  readonly #unseen = new Map<string, number[] | undefined>();
   readonly #capacity: number;
+  readonly #release: (item: QueueItem) => void;
   #next = 0;
   #newest: number | undefined;
 
-  constructor(capacity: number) {
+  constructor(capacity: number, release: (item: QueueItem) => void) {
     this.#capacity = capacity;
+    this.#release = release;
   }
 
   get length(): number {
@@ -273,6 +296,9 @@ class EventQueue {
     }
     const id = this.#next;
     this.#next += 1;
+    if (this.#elideUnseen(item, id)) {
+      return undefined;
+    }
     this.#items.set(id, item);
     this.#newest = id;
     if (item.source === "native" && item.event.tag === P2pEvent_Tags.Message) {
@@ -289,7 +315,55 @@ class EventQueue {
 
   shift(): QueueItem | undefined {
     const [oldest] = this.#items.keys();
-    return oldest === undefined ? undefined : this.#remove(oldest);
+    if (oldest === undefined) {
+      return undefined;
+    }
+    const item = this.#remove(oldest);
+    if (
+      item?.source === "native" &&
+      item.event.tag === P2pEvent_Tags.StreamReady
+    ) {
+      this.#unseen.delete(streamEventKey(item) ?? "");
+    }
+    return item;
+  }
+
+  /**
+   * Records `item` (as `id`) against an unseen peer stream. Returns whether
+   * it closed one that carried no data, which leaves the queue whole.
+   */
+  #elideUnseen(item: QueueItem, id: number): boolean {
+    const key = streamEventKey(item);
+    if (key === undefined || item.source !== "native") {
+      return false;
+    }
+    const { event } = item;
+    if (event.tag === P2pEvent_Tags.StreamReady) {
+      if (!event.inner.initiatedLocally) {
+        this.#unseen.set(key, [id]);
+      }
+      return false;
+    }
+    if (!this.#unseen.has(key)) {
+      return false;
+    }
+    const ids = this.#unseen.get(key);
+    if (event.tag === P2pEvent_Tags.StreamData) {
+      this.#unseen.set(key, undefined);
+    } else if (ids !== undefined && event.tag === P2pEvent_Tags.StreamClosed) {
+      this.#unseen.delete(key);
+      for (const queued of ids) {
+        const removed = this.#remove(queued);
+        if (removed !== undefined) {
+          this.#release(removed);
+        }
+      }
+      this.#release(item);
+      return true;
+    } else {
+      ids?.push(id);
+    }
+    return false;
   }
 
   #remove(id: number): QueueItem | undefined {
@@ -488,24 +562,44 @@ export class Stream {
     this.#closeWriteQueued = true;
   }
 
-  /** Abruptly resets the stream and emits `closed`. */
+  /**
+   * Abruptly resets the stream and emits `closed`. On a stream that already
+   * closed, discards unread bytes instead.
+   */
   reset(): void {
-    if (!this.#closed) {
-      this.#backend.resetStream(this.peerId, this.connId, this.streamId);
-      this.terminal();
+    if (this.#closed) {
+      this.#discardUnread();
+      return;
     }
+    this.#backend.resetStream(this.peerId, this.connId, this.streamId);
+    this.terminal();
   }
 
-  /** Relinquishes the stream and requests a reset while it remains active. */
+  /**
+   * Relinquishes the stream and requests a reset while it remains active.
+   * On a stream that already closed, discards unread bytes instead.
+   */
   abandon(): void {
-    if (!this.#closed) {
-      try {
-        this.#backend.abandonStream(this.peerId, this.connId, this.streamId);
-      } catch {
-        // A native close can overtake its queued terminal event.
-      }
-      this.terminal();
+    if (this.#closed) {
+      this.#discardUnread();
+      return;
     }
+    try {
+      this.#backend.abandonStream(this.peerId, this.connId, this.streamId);
+    } catch {
+      // A native close can overtake its queued terminal event.
+    }
+    this.terminal();
+  }
+
+  /**
+   * A cleanly closed stream keeps unread bytes for later reads, and they
+   * hold its native stream slot until consumed; discarding them releases it.
+   */
+  #discardUnread(): void {
+    this.#consumed(this.#fifoBytes);
+    this.#fifo.length = 0;
+    this.#fifoBytes = 0;
   }
 
   [Symbol.dispose](): void {
@@ -609,10 +703,7 @@ export class Stream {
       options.preserveRemoteEof === true && this.#receiveState.kind === "eof";
     if (!hasRemoteEof) {
       this.#receiveState = { error, kind: "failed" };
-      // Discarded unread bytes are consumed, settling the native stream.
-      this.#consumed(this.#fifoBytes);
-      this.#fifo.length = 0;
-      this.#fifoBytes = 0;
+      this.#discardUnread();
     }
     for (const read of this.#reads.splice(0)) {
       if (hasRemoteEof) {
@@ -777,7 +868,9 @@ export class Minip2pBase {
   readonly #catchAll = new Set<CatchAllHandler>();
   readonly #closeHandlers = new Set<(reason: CloseReason) => void>();
   readonly #waiters = new Set<EventWaiter>();
-  readonly #queue = new EventQueue(EVENT_QUEUE_CAP);
+  readonly #queue = new EventQueue(EVENT_QUEUE_CAP, (item) => {
+    this.#releaseQueueItem(item);
+  });
   readonly #connects = new Map<number, ConnectAttempt>();
   readonly #terminalConnects = new Set<number>();
   readonly #streams = new Map<string, Stream>();

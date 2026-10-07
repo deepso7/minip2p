@@ -62,6 +62,12 @@ pub(crate) struct Delivery {
 /// event, so they do not count against the cap. Past
 /// [`MAX_CARRY_EVENTS`] other events, the oldest gossipsub message is
 /// dropped first, then the oldest other event.
+///
+/// A peer-opened stream that closes without carrying data before the binding
+/// drained its `StreamReady` leaves the carry whole: the binding never saw
+/// it, and nothing about it is left to settle. Without that, a peer opening
+/// and closing streams could grow an undrained carry without bound, since
+/// such a stream frees its transport slot at once.
 #[derive(Default)]
 pub(crate) struct Carry {
     events: BTreeMap<u64, P2pEvent>,
@@ -73,6 +79,10 @@ pub(crate) struct Carry {
     droppable: usize,
     dropped_terminal_connect_ids: BTreeSet<u64>,
     next_id: u64,
+    /// Peer-opened streams whose `StreamReady` is still in the carry, by
+    /// connection and stream id, with the ids of their events; `None` once
+    /// one carried data.
+    unseen_streams: BTreeMap<(u64, u64), Option<Vec<u64>>>,
 }
 
 impl Carry {
@@ -92,6 +102,9 @@ impl Carry {
         };
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
+        if self.track_unseen(&event, id) {
+            return false;
+        }
         match event {
             P2pEvent::Message { .. } => self.message_ids.push_back(id),
             _ if is_stream_event(&event) => {}
@@ -148,6 +161,46 @@ impl Carry {
         }
     }
 
+    /// Records `event` (taking `id`) against an unseen peer stream. Returns
+    /// whether it closed one that carried no data, which leaves the carry
+    /// with all its events instead.
+    fn track_unseen(&mut self, event: &P2pEvent, id: u64) -> bool {
+        if let P2pEvent::StreamReady {
+            conn_id,
+            stream_id,
+            initiated_locally: false,
+            ..
+        } = event
+        {
+            self.unseen_streams
+                .insert((*conn_id, *stream_id), Some(vec![id]));
+            return false;
+        }
+        let Some(key) = stream_key(event) else {
+            return false;
+        };
+        let Some(ids) = self.unseen_streams.get_mut(&key) else {
+            return false;
+        };
+        match (event, ids) {
+            (P2pEvent::StreamData { .. }, ids) => *ids = None,
+            (P2pEvent::StreamClosed { .. }, Some(_)) => {
+                for id in self
+                    .unseen_streams
+                    .remove(&key)
+                    .flatten()
+                    .unwrap_or_default()
+                {
+                    self.events.remove(&id);
+                }
+                return true;
+            }
+            (_, Some(ids)) => ids.push(id),
+            (_, None) => {}
+        }
+        false
+    }
+
     /// Removes the oldest event still held from one droppable queue.
     fn pop_live(&mut self, queue: Queue) -> Option<P2pEvent> {
         let ids = match queue {
@@ -170,6 +223,12 @@ impl Carry {
                 if !is_stream_event(&event) {
                     self.droppable -= 1;
                 }
+                if let P2pEvent::StreamReady {
+                    conn_id, stream_id, ..
+                } = &event
+                {
+                    self.unseen_streams.remove(&(*conn_id, *stream_id));
+                }
                 batch.push(event);
             }
         }
@@ -180,6 +239,31 @@ impl Carry {
 
     fn take_dropped_terminal_connect_ids(&mut self) -> BTreeSet<u64> {
         core::mem::take(&mut self.dropped_terminal_connect_ids)
+    }
+}
+
+/// The connection and stream an event belongs to, for per-stream events.
+fn stream_key(event: &P2pEvent) -> Option<(u64, u64)> {
+    match event {
+        P2pEvent::StreamReady {
+            conn_id, stream_id, ..
+        }
+        | P2pEvent::StreamData {
+            conn_id, stream_id, ..
+        }
+        | P2pEvent::StreamWriteAccepted {
+            conn_id, stream_id, ..
+        }
+        | P2pEvent::StreamWriteStopped {
+            conn_id, stream_id, ..
+        }
+        | P2pEvent::StreamRemoteWriteClosed {
+            conn_id, stream_id, ..
+        }
+        | P2pEvent::StreamClosed {
+            conn_id, stream_id, ..
+        } => Some((*conn_id, *stream_id)),
+        _ => None,
     }
 }
 
@@ -604,6 +688,55 @@ mod tests {
             5000 - MAX_CARRY_EVENTS as u64,
             "only messages drop"
         );
+    }
+
+    fn lifecycle(stream_id: u64, initiated_locally: bool) -> [P2pEvent; 2] {
+        [
+            P2pEvent::StreamReady {
+                peer_id: "peer".into(),
+                conn_id: 1,
+                stream_id,
+                protocol_id: "/app/1".into(),
+                initiated_locally,
+            },
+            P2pEvent::StreamClosed {
+                peer_id: "peer".into(),
+                conn_id: 1,
+                stream_id,
+            },
+        ]
+    }
+
+    #[test]
+    fn peer_stream_churn_without_data_does_not_grow_an_undrained_carry() {
+        let mut carry = Carry::default();
+        // A peer opens and closes streams without sending a byte while the
+        // binding drains nothing: each stream it never saw leaves no trace.
+        for stream_id in 0..10_000 {
+            for event in lifecycle(stream_id, false) {
+                assert!(!carry.push(event));
+            }
+        }
+        assert!(carry.is_empty());
+
+        // Streams the binding must hear about are kept: its own, one that
+        // carried data, and one whose StreamReady it already drained.
+        let [ready, closed] = lifecycle(1, true);
+        carry.push(ready.clone());
+        carry.push(closed.clone());
+        let [peer_ready, peer_closed] = lifecycle(2, false);
+        carry.push(peer_ready.clone());
+        carry.push(data(2, b"x"));
+        carry.push(peer_closed.clone());
+        assert_eq!(
+            carry.take(10),
+            [ready, closed, peer_ready, data(2, b"x"), peer_closed]
+        );
+        let [drained, closed] = lifecycle(3, false);
+        carry.push(drained.clone());
+        assert_eq!(carry.take(10), [drained]);
+        carry.push(closed.clone());
+        assert_eq!(carry.take(10), [closed]);
     }
 
     #[test]

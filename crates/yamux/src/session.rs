@@ -620,7 +620,9 @@ impl YamuxSession {
             if !self.valid_remote_stream_id(stream) {
                 return Err(YamuxError::Protocol("remote used a local-parity stream id"));
             }
-            if self.streams.contains_key(&stream) {
+            // An unsettled id is still in use: reopening it would replace
+            // its unacknowledged count.
+            if self.streams.contains_key(&stream) || self.unsettled.contains_key(&stream) {
                 return Err(YamuxError::Protocol("duplicate SYN for an existing stream"));
             }
             if self.slots_full() {
@@ -694,7 +696,9 @@ impl YamuxSession {
             if !self.valid_remote_stream_id(stream) {
                 return Err(YamuxError::Protocol("remote used a local-parity stream id"));
             }
-            if self.streams.contains_key(&stream) {
+            // An unsettled id is still in use: reopening it would replace
+            // its unacknowledged count.
+            if self.streams.contains_key(&stream) || self.unsettled.contains_key(&stream) {
                 return Err(YamuxError::Protocol("duplicate SYN for an existing stream"));
             }
             if self.slots_full() {
@@ -1623,6 +1627,29 @@ mod tests {
             }
         }
         assert_eq!(delivered, 4 * window, "refused streams deliver nothing");
+    }
+
+    #[test]
+    fn a_peer_cannot_reopen_an_unsettled_stream_id() {
+        let mut server = server_with_delivered(config(), 10, 0);
+        server
+            .handle_data(&Frame::data(1, FLAG_RST, Vec::new()).unwrap().encode())
+            .unwrap();
+        // Reopening stream 1 would replace its unacknowledged count.
+        let reopen = Frame::encode_data(1, FLAG_SYN, &[7; 10]).unwrap();
+        assert_eq!(
+            server.handle_data(&reopen),
+            Err(YamuxError::Protocol("duplicate SYN for an existing stream"))
+        );
+        let mut server = server_with_delivered(config(), 10, 0);
+        server
+            .handle_data(&Frame::data(1, FLAG_RST, Vec::new()).unwrap().encode())
+            .unwrap();
+        let reopen = Frame::window_update(1, FLAG_SYN, 0).unwrap().encode();
+        assert_eq!(
+            server.handle_data(&reopen),
+            Err(YamuxError::Protocol("duplicate SYN for an existing stream"))
+        );
     }
 
     #[test]
