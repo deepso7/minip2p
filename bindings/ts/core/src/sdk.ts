@@ -306,8 +306,11 @@ export class Stream {
    * accepted every byte. Writes are delivered in call order.
    *
    * Rejects with {@link WriteBufferFullError} when the stream already
-   * buffers {@link writeHighWaterMark} bytes, and with a closed error after
-   * `closeWrite()`, a remote stop, or the stream closing.
+   * buffers {@link writeHighWaterMark} bytes (a first write is always
+   * admitted, so a payload larger than the mark can still be sent), and with
+   * a closed error after `closeWrite()`, a remote stop, or the stream
+   * closing. If event loss strands a write in flight, the stream is reset
+   * and the write rejects with {@link EventQueueOverflowError}.
    */
   write(data: string | Bytes): Promise<void> {
     if (this.#closed) {
@@ -424,6 +427,25 @@ export class Stream {
     this.#writeInFlight = false;
     this.#settleHead();
     this.#pumpWrites();
+  }
+
+  /**
+   * Event loss may have taken this stream's write settlement or terminal
+   * with it, so an in-flight write can no longer complete. Resets the stream
+   * and fails its writes with `error`; a stream with no write in flight is
+   * untouched.
+   * @internal
+   */
+  writesLost(error: unknown): void {
+    if (this.#closed || !this.#writeInFlight) {
+      return;
+    }
+    try {
+      this.#backend.resetStream(this.peerId, this.connId, this.streamId);
+    } catch {
+      // The stream may already be gone natively; the outcome is the same.
+    }
+    this.terminal(error);
   }
 
   /**
@@ -1240,6 +1262,7 @@ export class Minip2pBase {
       ping.cancel(error);
     }
     this.#pings.clear();
+    this.#writesLost(error);
     // Connection attempts correlate exactly: only a dropped terminal, or a
     // dropped native loss report naming it, settles its attempt.
     if (dropped.source === "native") {
@@ -1264,6 +1287,13 @@ export class Minip2pBase {
       }
     }
     this.#pendingOpens.clear();
+  }
+
+  /** Fails every stream whose in-flight write may have lost its settlement. */
+  #writesLost(error: EventQueueOverflowError): void {
+    for (const stream of [...this.#streams.values()]) {
+      stream.writesLost(error);
+    }
   }
 
   #enqueueNative(event: P2pEvent): void {
@@ -1391,6 +1421,7 @@ export class Minip2pBase {
     }
     if (event.tag === P2pEvent_Tags.EventsDropped) {
       this.#connectResultsLost(event.inner.terminalConnectIds);
+      this.#writesLost(new EventQueueOverflowError());
     }
 
     const normalized = normalizeEvent(event);

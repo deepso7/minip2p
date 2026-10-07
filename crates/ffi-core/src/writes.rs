@@ -45,7 +45,7 @@ impl PendingWrites {
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<bool, FfiError> {
-        if let Some(pending) = self.streams.get(&(conn_id, stream_id)) {
+        if let Some(pending) = self.pending(&peer, conn_id, stream_id) {
             return Err(if pending.close_after {
                 FfiError::InvalidState {
                     detail: format!("stream {stream_id} write side is closing"),
@@ -82,7 +82,9 @@ impl PendingWrites {
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), FfiError> {
-        if let Some(pending) = self.streams.get_mut(&(conn_id, stream_id)) {
+        if self.pending(peer, conn_id, stream_id).is_some()
+            && let Some(pending) = self.streams.get_mut(&(conn_id, stream_id))
+        {
             pending.close_after = true;
             return Ok(());
         }
@@ -94,6 +96,20 @@ impl PendingWrites {
     /// Drops the stream's tail; the stream is being reset or abandoned.
     pub(crate) fn forget(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
         self.streams.remove(&(conn_id, stream_id));
+    }
+
+    /// The stream's pending write, if `peer` owns it. A call naming another
+    /// peer falls through to the Endpoint, which rejects it, so it can never
+    /// touch this peer's tail.
+    fn pending(
+        &self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Option<&Pending> {
+        self.streams
+            .get(&(conn_id, stream_id))
+            .filter(|pending| pending.peer == *peer)
     }
 
     /// Follows one endpoint event before it is converted for the binding.

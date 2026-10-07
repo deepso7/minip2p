@@ -84,14 +84,10 @@ impl Carry {
         let dropped = if let Some(payload_id) = self.payload_ids.pop_front() {
             self.events.remove(&payload_id)
         } else {
-            // A write settlement is the only completion a binding's pending
-            // write gets, so it outlives every other event.
-            let oldest = self
-                .events
-                .iter()
-                .find(|(_, event)| !is_write_settlement(event))
-                .map(|(id, _)| *id);
-            oldest.and_then(|id| self.events.remove(&id))
+            // A lost write settlement or stream terminal is covered by the
+            // `EventsDropped` that follows: the binding resets every stream
+            // with a write in flight rather than wait on it.
+            self.events.pop_first().map(|(_, event)| event)
         };
         if let Some(connect_id) = dropped.as_ref().and_then(terminal_connect_id) {
             self.dropped_terminal_connect_ids.insert(connect_id);
@@ -118,13 +114,6 @@ impl Carry {
     fn prune_payload_ids(&mut self) {
         self.payload_ids.retain(|id| self.events.contains_key(id));
     }
-}
-
-fn is_write_settlement(event: &P2pEvent) -> bool {
-    matches!(
-        event,
-        P2pEvent::StreamWriteAccepted { .. } | P2pEvent::StreamWriteStopped { .. }
-    )
 }
 
 fn is_payload_event(event: &P2pEvent) -> bool {

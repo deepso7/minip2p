@@ -370,6 +370,58 @@ fn join_promotes_known_peer_and_sender_stays_long_lived() {
 }
 
 #[test]
+fn a_full_send_holds_its_tail_until_writable_and_blocks_later_frames() {
+    let mut agent = agent();
+    let remote = peer(2);
+    let stream = StreamId::new(4);
+    let writable = SwarmEvent::StreamWritable {
+        peer_id: remote.clone(),
+        conn_id: ConnectionId::new(1),
+        stream_id: stream,
+    };
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    make_ready(&mut agent, &remote, stream, MESHSUB_PROTOCOL_ID_V11, 0);
+    inbound_open(&mut agent, &remote, StreamId::new(5), 0);
+    remote_subscribe(&mut agent, &remote, StreamId::new(5), "room", 0);
+    drain_events(&mut agent);
+
+    // The subscription frame is accepted only in part.
+    agent.subscribe("room", 1).unwrap();
+    let (frame, token, _) = sent(&drain_actions(&mut agent)).expect("subscription frame");
+    let tail = Bytes::from(frame.get(3..).expect("frame tail").to_vec());
+    // The host reports Full instead of a send result; the GRAFT queued
+    // behind the frame waits for it.
+    agent.send_full(&remote, stream, token, tail.clone());
+    agent.handle_tick(1);
+    assert!(sent(&drain_actions(&mut agent)).is_none());
+
+    // Writable resends exactly the held tail, under a fresh token.
+    assert!(agent.handle_event(&writable, 2));
+    let (resent, retry, resent_on) = sent(&drain_actions(&mut agent)).expect("tail resent");
+    assert_eq!((resent.as_slice(), resent_on), (tail.as_ref(), stream));
+    assert_ne!(retry, token);
+    // The retired token no longer settles anything.
+    agent.send_result(&remote, stream, token, Ok(()), 2);
+    assert!(sent(&drain_actions(&mut agent)).is_none());
+    // A second Writable has nothing left to resend.
+    assert!(agent.handle_event(&writable, 2));
+    assert!(sent(&drain_actions(&mut agent)).is_none());
+
+    // Once the tail is accepted, the queued GRAFT follows.
+    agent.send_result(&remote, stream, retry, Ok(()), 2);
+    let graft = drain_actions(&mut agent);
+    assert_eq!(
+        decode_rpc(&sent(&graft).expect("graft").0)
+            .control
+            .unwrap()
+            .graft[0]
+            .topic_id
+            .as_deref(),
+        Some("room")
+    );
+}
+
+#[test]
 fn unknown_graft_is_ignored_without_amplification() {
     let mut agent = agent();
     let remote = peer(2);

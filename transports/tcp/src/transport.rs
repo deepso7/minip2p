@@ -297,6 +297,8 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 break;
             }
             connection.outbound.drain(..accepted);
+            // Progress, even if the session refills the buffer right after.
+            connection.stalled_since = None;
         }
         Ok(())
     }
@@ -766,13 +768,12 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         // the sessions have framed since.
         let timeout = self.config.send_stall_timeout_ms;
         for id in self.connections.keys().copied().collect::<Vec<_>>() {
-            let Some(before) = self
-                .connections
-                .get(&id)
-                .map(|connection| connection.outbound.len())
-            else {
-                continue;
-            };
+            // Assume this poll stalls, keeping an older mark; `flush` clears
+            // it the moment the socket accepts a byte. Comparing buffer
+            // lengths instead would miss progress the session refilled.
+            if let Some(connection) = self.connections.get_mut(&id) {
+                connection.stalled_since.get_or_insert(now.monotonic_ms);
+            }
             if let Err(teardown) =
                 self.with_connection(id, |this, connection| this.pump_and_flush(connection))
             {
@@ -784,15 +785,17 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                 let Some(connection) = self.connections.get_mut(&id) else {
                     continue;
                 };
-                // Fully drained, or the socket took something: nothing is
-                // stalled. Leaving a stale mark would make the next socketful
-                // look like the tail of an old stall and fail the connection
-                // on the spot.
-                if connection.outbound.is_empty() || connection.outbound.len() < before {
+                // Fully drained: nothing is stalled. Leaving a stale mark
+                // would make the next socketful look like the tail of an old
+                // stall and fail the connection on the spot.
+                if connection.outbound.is_empty() {
                     connection.stalled_since = None;
                     continue;
                 }
-                let since = *connection.stalled_since.get_or_insert(now.monotonic_ms);
+                // Cleared by `flush`: the socket took something this poll.
+                let Some(since) = connection.stalled_since else {
+                    continue;
+                };
                 now.saturating_millis_since(Now::from_millis(since))
             };
             if timeout.is_some_and(|limit| stalled_for >= limit) {

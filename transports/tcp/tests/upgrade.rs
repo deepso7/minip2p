@@ -689,6 +689,52 @@ fn a_socket_that_never_recovers_fails_once_the_stall_timeout_passes() {
 }
 
 #[test]
+fn a_socket_that_takes_a_frame_every_poll_is_not_stalled() {
+    // One equal-sized frame buffered at a time: each poll the socket takes
+    // the buffered frame and the session refills it with the next, so the
+    // buffer never looks shorter, yet the connection is making progress.
+    let mut config = TcpConfig {
+        max_buffered_send: 1,
+        ..TcpConfig::default()
+    };
+    config.yamux.max_frame_len = 1000;
+    // Noise length prefix, Yamux header, payload, Noise tag.
+    let frame = 2 + 12 + 1000 + 16;
+    let mut pair = upgraded_pair_with(config, TcpConfig::default());
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    let base = pair.dialer.provider_mut().bytes_in_flight_to_peer();
+    pair.dialer
+        .provider_mut()
+        .set_in_flight_capacity(Some(base));
+    pair.dialer
+        .send_stream(id, stream, Bytes::from(vec![5u8; 128 * 1000]))
+        .expect("the stream queues the whole write");
+    for step in 1..=8u64 {
+        let allowed = base + frame * step as usize;
+        pair.dialer
+            .provider_mut()
+            .set_in_flight_capacity(Some(allowed));
+        let events = pair
+            .dialer
+            .poll(Now::from_millis(step * 10_000))
+            .expect("poll");
+        assert!(
+            events.is_empty(),
+            "a socket taking a frame every poll is not stalled: {events:?}"
+        );
+        assert_eq!(
+            pair.dialer.provider_mut().bytes_in_flight_to_peer(),
+            allowed,
+            "the socket took exactly one frame"
+        );
+    }
+    assert_eq!(pair.dialer.connection_ids(), vec![id]);
+}
+
+#[test]
 fn a_peer_that_stops_reading_fills_the_stream_instead_of_failing_the_connection() {
     let mut config = TcpConfig {
         max_buffered_send: 4096,

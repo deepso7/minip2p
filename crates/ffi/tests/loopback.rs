@@ -555,6 +555,17 @@ fn a_write_past_the_send_caps_is_held_settled_once_and_closed_after_every_byte()
         a.send_stream(b_peer.clone(), conn_id, stream_id, vec![0]),
         Err(FfiError::Backpressure)
     ));
+    // Calls naming another peer are refused and leave the held tail alone.
+    let stranger = a.peer_id();
+    assert!(
+        a.reset_stream(stranger.clone(), conn_id, stream_id)
+            .is_err()
+    );
+    assert!(
+        a.abandon_stream(stranger.clone(), conn_id, stream_id)
+            .is_err()
+    );
+    assert!(a.close_stream_write(stranger, conn_id, stream_id).is_err());
     // Requested while the tail is held, the FIN must still follow it.
     a.close_stream_write(b_peer, conn_id, stream_id)?;
 

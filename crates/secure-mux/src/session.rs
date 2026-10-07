@@ -167,7 +167,39 @@ pub struct SecureMuxSession {
     outputs: VecDeque<SessionOutput>,
     /// Bytes ready for the underlying stream: negotiation and handshake
     /// messages, and encrypted Yamux frames already pulled.
-    writes: VecDeque<Vec<u8>>,
+    writes: WriteQueue,
+}
+
+/// Unread negotiation and handshake bytes a session holds before it fails.
+///
+/// An honest upgrade queues well under a kilobyte at a time. Without a bound,
+/// a peer that keeps proposing protocols and never reads the replies would
+/// grow this queue for as long as it kept sending, since the downstream stops
+/// pulling once its own buffer is full (ADR 0012).
+const MAX_HANDSHAKE_BACKLOG: usize = 64 * 1024;
+
+/// Byte messages for the underlying stream, with their total length.
+#[derive(Default)]
+struct WriteQueue {
+    messages: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+impl WriteQueue {
+    fn push(&mut self, message: Vec<u8>) {
+        self.bytes = self.bytes.saturating_add(message.len());
+        self.messages.push_back(message);
+    }
+
+    fn pop(&mut self) -> Option<Vec<u8>> {
+        let message = self.messages.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(message.len());
+        Some(message)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
 }
 
 impl SecureMuxSession {
@@ -198,7 +230,7 @@ impl SecureMuxSession {
                 noise: Some(noise),
             }),
             outputs: VecDeque::new(),
-            writes: VecDeque::new(),
+            writes: WriteQueue::default(),
         }
     }
 
@@ -247,7 +279,7 @@ impl SecureMuxSession {
     ///
     /// An error is fatal: the session cannot continue.
     pub fn poll_write(&mut self) -> Result<Option<Vec<u8>>, SessionError> {
-        if let Some(bytes) = self.writes.pop_front() {
+        if let Some(bytes) = self.writes.pop() {
             return Ok(Some(bytes));
         }
         let Some(Phase::Ready { noise, yamux, .. }) = self.phase.as_mut() else {
@@ -262,7 +294,7 @@ impl SecureMuxSession {
             self.phase = None;
             return Err(error);
         }
-        Ok(self.writes.pop_front())
+        Ok(self.writes.pop())
     }
 
     /// Whether [`poll_write`](Self::poll_write) has bytes to hand out now.
@@ -423,7 +455,7 @@ impl SecureMuxSession {
                 let mut negotiated = false;
                 while let Some(output) = select.poll_output() {
                     match output {
-                        MultistreamOutput::OutboundData(bytes) => self.write(bytes),
+                        MultistreamOutput::OutboundData(bytes) => self.write(bytes)?,
                         MultistreamOutput::Negotiated { protocol }
                             if protocol == NOISE_PROTOCOL_ID =>
                         {
@@ -674,7 +706,7 @@ impl SecureMuxSession {
     fn drain_raw_select(&mut self, select: &mut MultistreamSelect) -> Result<(), SessionError> {
         while let Some(output) = select.poll_output() {
             if let MultistreamOutput::OutboundData(bytes) = output {
-                self.write(bytes);
+                self.write(bytes)?;
             }
         }
         Ok(())
@@ -701,7 +733,7 @@ impl SecureMuxSession {
         let mut decrypted = Vec::new();
         while let Some(output) = noise.poll_output() {
             match output {
-                NoiseOutput::Outbound(bytes) => self.write(bytes),
+                NoiseOutput::Outbound(bytes) => self.write(bytes)?,
                 NoiseOutput::HandshakeComplete {
                     peer: authenticated,
                     ..
@@ -741,16 +773,29 @@ impl SecureMuxSession {
         }
     }
 
+    /// Encrypts and queues one negotiation message (before Yamux is up).
     fn encrypt(
         &mut self,
         noise: &mut NoiseSession,
         plaintext: Vec<u8>,
     ) -> Result<(), SessionError> {
-        encrypt_into(noise, plaintext, &mut self.writes)
+        encrypt_into(noise, plaintext, &mut self.writes)?;
+        self.check_handshake_backlog()
     }
 
-    fn write(&mut self, bytes: Vec<u8>) {
-        self.writes.push_back(bytes);
+    /// Queues one plaintext negotiation or handshake message.
+    fn write(&mut self, bytes: Vec<u8>) -> Result<(), SessionError> {
+        self.writes.push(bytes);
+        self.check_handshake_backlog()
+    }
+
+    fn check_handshake_backlog(&self) -> Result<(), SessionError> {
+        if self.writes.bytes > MAX_HANDSHAKE_BACKLOG {
+            return Err(SessionError::protocol(
+                "peer is not reading upgrade replies; handshake backlog exceeded",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -759,14 +804,14 @@ impl SecureMuxSession {
 fn encrypt_into(
     noise: &mut NoiseSession,
     plaintext: Vec<u8>,
-    writes: &mut VecDeque<Vec<u8>>,
+    writes: &mut WriteQueue,
 ) -> Result<(), SessionError> {
     noise
         .handle_input(NoiseInput::Encrypt(plaintext))
         .map_err(|error| SessionError::protocol(format!("Noise encryption failed: {error}")))?;
     while let Some(output) = noise.poll_output() {
         match output {
-            NoiseOutput::Outbound(bytes) => writes.push_back(bytes),
+            NoiseOutput::Outbound(bytes) => writes.push(bytes),
             NoiseOutput::HandshakeComplete { .. } | NoiseOutput::Decrypted(_) => {
                 return Err(SessionError::protocol(
                     "unexpected Noise output while encrypting",
@@ -859,6 +904,31 @@ mod tests {
         assert_eq!(writes, b"\x03na\n\x07/noise\n");
     }
 
+    #[test]
+    fn a_peer_that_never_reads_upgrade_replies_cannot_grow_the_backlog() {
+        let mut responder = SecureMuxSession::new(SessionConfig {
+            role: SessionRole::Responder,
+            identity: Ed25519Keypair::generate(),
+            static_secret: [1; 32],
+            ephemeral_secret: [2; 32],
+            expected_peer: None,
+            yamux: YamuxConfig::default(),
+        });
+        responder.start().expect("start responder");
+        responder
+            .handle_input(b"\x13/multistream/1.0.0\n".to_vec())
+            .expect("header");
+
+        // Each refused proposal queues an `na` that nobody pulls.
+        let failed = (0..MAX_HANDSHAKE_BACKLOG)
+            .find_map(|_| responder.handle_input(b"\x0b/tls/1.0.0\n".to_vec()).err());
+        assert!(
+            matches!(failed, Some(SessionError::Protocol(ref reason)) if reason.contains("backlog")),
+            "the session fails once the backlog passes its bound: {failed:?}"
+        );
+        assert!(responder.writes.bytes <= MAX_HANDSHAKE_BACKLOG + 64);
+    }
+
     /// Runs two raw Noise sessions through their handshake, returning both in
     /// transport mode with their nonces in step.
     ///
@@ -946,7 +1016,7 @@ mod tests {
                 peer: initiator_peer,
             }),
             outputs: VecDeque::new(),
-            writes: VecDeque::new(),
+            writes: WriteQueue::default(),
         };
         let proposals = b"\x13/multistream/1.0.0\n\x0d/mplex/6.7.0\n\x0d/yamux/1.0.0\n".to_vec();
         initiator_noise
@@ -1036,7 +1106,7 @@ mod tests {
                 peer: listener_peer,
             }),
             outputs: VecDeque::new(),
-            writes: VecDeque::new(),
+            writes: WriteQueue::default(),
         };
 
         let mut packed = echo;
@@ -1129,7 +1199,7 @@ mod tests {
                 peer,
             }),
             outputs: VecDeque::new(),
-            writes: VecDeque::new(),
+            writes: WriteQueue::default(),
         };
         let stream = StreamId::new(77);
 

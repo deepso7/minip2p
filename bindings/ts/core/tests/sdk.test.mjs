@@ -1639,6 +1639,28 @@ test("writes past the high-water mark reject with WriteBufferFullError", async (
   endpoint.close();
 });
 
+test("EventsDropped resets a stream whose write is still in flight", async () => {
+  const backend = new MockBackend();
+  const { endpoint, stream } = await openedStream(backend);
+  backend.sendResults = [false];
+  const pending = stream.write("held");
+  const queued = stream.write("queued");
+
+  // The lost batch may have held this stream's settlement or terminal.
+  backend.emit({
+    inner: { dropped: 1, terminalConnectIds: [], totalDropped: 1 },
+    tag: P2pEvent_Tags.EventsDropped,
+  });
+
+  await assert.rejects(pending, EventQueueOverflowError);
+  await assert.rejects(queued, EventQueueOverflowError);
+  assert.deepEqual(
+    backend.operations.map(([kind]) => kind),
+    ["write", "reset"]
+  );
+  endpoint.close();
+});
+
 test("a remote write stop or a stream close rejects pending writes", async () => {
   for (const [tag, extra] of [
     [P2pEvent_Tags.StreamWriteStopped, { errorCode: 7 }],

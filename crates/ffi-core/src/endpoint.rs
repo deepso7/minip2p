@@ -519,11 +519,14 @@ impl P2pEndpoint {
     ) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
+        // Forget the tail only once the Endpoint accepted the request, so a
+        // rejected call (another peer's ids) cannot lose a pending write.
         self.with_state_mut(|endpoint, writes| {
-            writes.forget(conn_id, stream_id);
             endpoint
                 .reset_stream(&peer, conn_id, stream_id)
-                .map_err(map_driver_error)
+                .map_err(map_driver_error)?;
+            writes.forget(conn_id, stream_id);
+            Ok(())
         })
     }
 
@@ -536,11 +539,14 @@ impl P2pEndpoint {
     ) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
+        // Forget the tail only once the Endpoint accepted the request, so a
+        // rejected call (another peer's ids) cannot lose a pending write.
         self.with_state_mut(|endpoint, writes| {
-            writes.forget(conn_id, stream_id);
             endpoint
                 .abandon_stream(&peer, conn_id, stream_id)
-                .map_err(map_driver_error)
+                .map_err(map_driver_error)?;
+            writes.forget(conn_id, stream_id);
+            Ok(())
         })
     }
 

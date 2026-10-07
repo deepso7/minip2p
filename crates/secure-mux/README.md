@@ -51,7 +51,7 @@ loop {
 }
 ```
 
-Substreams are driven with `open_stream`, `send`, `close_stream_write`, and `reset_stream`; their frames come out of later `poll_write` calls. `send` takes a `Bytes` payload and accepts as much as the substream's Yamux send caps allow; the rest comes back as `YamuxError::Full` carrying the exact unsent suffix, and `StreamWritable` follows once the substream can queue again. Received data and events never wait behind outbound frames, and control replies a peer provokes without reading them are bounded by `YamuxConfig::max_pending_control`.
+Substreams are driven with `open_stream`, `send`, `close_stream_write`, and `reset_stream`; their frames come out of later `poll_write` calls. `send` takes a `Bytes` payload and accepts as much as the substream's Yamux send caps allow; the rest comes back as `YamuxError::Full` carrying the exact unsent suffix, and `StreamWritable` follows once the substream can queue again. Received data and events never wait behind outbound frames, and control replies a peer provokes without reading them are bounded by `YamuxConfig::max_pending_control`. Before Yamux is up, the same holds for negotiation and handshake replies: a session holding more than 64 KiB of them unread fails the upgrade.
 
 ## Policy stays with the caller
 
