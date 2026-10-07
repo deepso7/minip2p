@@ -45,6 +45,15 @@ fn nat_event_reaches_application(event: &NatEvent) -> bool {
 /// Most bytes the NAT host holds for one stream before resetting it.
 const MAX_HELD_PER_STREAM: usize = 64 * 1024;
 
+/// Joins held tails into one payload; a single tail is passed through.
+#[cfg(feature = "_circuit-driver")]
+fn concat(mut tails: VecDeque<Bytes>) -> Bytes {
+    if tails.len() <= 1 {
+        return tails.pop_front().unwrap_or_default();
+    }
+    Bytes::from(tails.into_iter().flatten().collect::<Vec<u8>>())
+}
+
 /// Drives a [`NatAgent`] against the endpoint's swarm.
 pub(crate) struct NatDriver<E> {
     agent: NatAgent,
@@ -706,6 +715,14 @@ impl<E: EntropySource> NatDriver<E> {
                 #[cfg(feature = "_circuit-driver")]
                 {
                     swarm.forget_stream(inner_conn, stream_id);
+                    // A relay message the bridge refused as Full (a STOP
+                    // STATUS, say) is still owed to the peer: the circuit
+                    // takes Writable for the stream now, so it sends it first.
+                    let unsent_prefix = self
+                        .held
+                        .take(inner_conn, stream_id)
+                        .map(|held| concat(held.tails))
+                        .unwrap_or_default();
                     let adoption = BridgeAdoption {
                         inner_conn,
                         bridge_stream: stream_id,
@@ -716,6 +733,7 @@ impl<E: EntropySource> NatDriver<E> {
                             BridgeRole::Responder => CircuitRole::Responder,
                         },
                         pending_data: pending_data.into(),
+                        unsent_prefix,
                         remote_write_closed,
                     };
                     match swarm.transport_mut().adopt_bridge(adoption) {

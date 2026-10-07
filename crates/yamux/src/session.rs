@@ -358,18 +358,30 @@ impl YamuxSession {
     }
 
     /// Immediately resets a stream and emits [`YamuxOutput::StreamClosed`].
+    ///
+    /// Resetting a stream the peer opened spends the control reserve: a peer
+    /// can open (and provoke the reset of) streams without bound, so a peer
+    /// that never reads the resets fails the session with
+    /// [`YamuxError::ControlReserveExhausted`].
     pub fn reset(&mut self, stream: u32) -> Result<(), YamuxError> {
         self.ensure_active()?;
         let unannounced = match self.streams.get(&stream) {
             Some(state) => state.pending_open == Some(OpenFlag::Syn),
             None => return Err(YamuxError::UnknownStream(stream)),
         };
+        let peer_opened = self.valid_remote_stream_id(stream);
         self.remove_stream(stream, true);
         // A stream whose SYN never went out is unknown to the peer.
-        if !unannounced {
-            self.push_control(Frame::data(stream, FLAG_RST, Vec::new())?);
+        if unannounced {
+            return Ok(());
         }
-        Ok(())
+        let rst = Frame::data(stream, FLAG_RST, Vec::new())?;
+        if !peer_opened {
+            self.push_control(rst);
+            return Ok(());
+        }
+        self.queue_peer_control(rst)
+            .or_else(|error| self.fail_protocol(error))
     }
 
     /// Gracefully terminates the whole Yamux session with `code`.
@@ -774,7 +786,7 @@ impl YamuxSession {
     }
 
     /// Queues a reply the peer provoked (a ping acknowledgement, a reset for
-    /// an unknown stream) within the control reserve. A peer that keeps
+    /// an unknown or peer-opened stream) within the control reserve. A peer that keeps
     /// provoking replies without reading them exhausts it, which is a
     /// protocol violation that fails the session.
     fn queue_peer_control(&mut self, frame: Frame) -> Result<(), YamuxError> {
@@ -1289,6 +1301,30 @@ mod tests {
                 "unexpected {event:?}"
             );
         }
+    }
+
+    #[test]
+    fn resets_of_peer_opened_streams_spend_the_control_reserve() {
+        let mut limits = config();
+        limits.max_pending_control = 2;
+        let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        // The peer opens a stream, we reset it, and the slot is free again:
+        // only the reserve bounds the RSTs a non-reading peer piles up.
+        let mut reset_inbound = |stream: u32| {
+            session
+                .handle_data(&Frame::window_update(stream, FLAG_SYN, 0).unwrap().encode())
+                .unwrap();
+            session.reset(stream)
+        };
+        reset_inbound(2).unwrap();
+        reset_inbound(4).unwrap();
+        assert!(matches!(
+            reset_inbound(6),
+            Err(YamuxError::ControlReserveExhausted { limit: 2 })
+        ));
+        let frames: Vec<_> = core::iter::from_fn(|| session.poll_frame()).collect();
+        assert_eq!(frames.len(), 1, "only the protocol GoAway remains");
+        assert_eq!(decode(&frames[0]).frame_type(), FrameType::GoAway);
     }
 
     #[test]

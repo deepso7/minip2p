@@ -420,9 +420,8 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             Err(SessionError::Yamux(error)) => Err(TransportError::PollError {
                 reason: error.to_string(),
             }),
-            // Defensive: today a session only fails fatally while handling
-            // input, so a local operation cannot land here. Dropping the arm
-            // would leave a dead session in the map if that ever changed.
+            // The session failed: a local reset of a peer-opened stream
+            // exhausted the control reserve (see `YamuxSession::reset`).
             Err(fatal) => {
                 let reason = fatal.to_string();
                 self.fail_connection(id, reason.clone(), false);

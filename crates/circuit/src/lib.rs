@@ -77,6 +77,10 @@ pub struct BridgeAdoption {
     pub role: CircuitRole,
     /// Bytes already read beyond the relay CONNECT response.
     pub pending_data: Bytes,
+    /// Relay-protocol bytes the bridge refused as Full before adoption (the
+    /// unsent tail of a STOP STATUS, say). They go out ahead of the circuit
+    /// handshake, retried on the bridge's Writable like any other tail.
+    pub unsent_prefix: Bytes,
     /// Whether the bridge's remote write side was already closed.
     pub remote_write_closed: bool,
 }
@@ -300,7 +304,10 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             remote_peer: adoption.remote_peer,
             role: adoption.role,
             session,
-            bridge_tail: None,
+            bridge_tail: (!adoption.unsent_prefix.is_empty()).then(|| {
+                let len = adoption.unsent_prefix.len();
+                (adoption.unsent_prefix, len)
+            }),
         };
 
         // Consume the sequence only here: an adoption that failed above
@@ -801,9 +808,8 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             Err(SessionError::Yamux(error)) => Err(TransportError::PollError {
                 reason: error.to_string(),
             }),
-            // Defensive: today a session only fails fatally while handling
-            // input, so a local operation cannot land here. Dropping the arm
-            // would leave a dead session in the map if that ever changed.
+            // The session failed: a local reset of a peer-opened stream
+            // exhausted the control reserve (see `YamuxSession::reset`).
             Err(fatal) => {
                 let reason = fatal.to_string();
                 self.fail_circuit(id, reason.clone(), false);
@@ -1359,6 +1365,7 @@ mod tests {
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("initiator adoption");
@@ -1370,6 +1377,7 @@ mod tests {
                 remote_peer: a_peer.clone(),
                 role: CircuitRole::Responder,
                 pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("responder adoption");
@@ -1424,6 +1432,7 @@ mod tests {
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("initiator adoption");
@@ -1435,6 +1444,7 @@ mod tests {
                 remote_peer: a_peer.clone(),
                 role: CircuitRole::Responder,
                 pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("responder adoption");
@@ -1842,6 +1852,7 @@ mod tests {
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("initiator adoption");
@@ -1863,6 +1874,7 @@ mod tests {
             remote_peer: a_peer.clone(),
             role: CircuitRole::Responder,
             pending_data: Bytes::from(header[..split].to_vec()),
+            unsent_prefix: Bytes::new(),
             remote_write_closed: false,
         })
         .expect("responder adoption with partial pending data");
@@ -1873,6 +1885,66 @@ mod tests {
             [TransportEvent::IncomingConnection { .. }]
         ));
         b.inject_bridge_data(inner_conn, bridge, Bytes::from(header[split..].to_vec()));
+        complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+    }
+
+    #[test]
+    fn an_unsent_prefix_reaches_the_peer_before_the_circuit_handshake() {
+        let relay = identity(9).peer_id();
+        let a_identity = identity(1);
+        let b_identity = identity(2);
+        let a_peer = a_identity.peer_id();
+        let b_peer = b_identity.peer_id();
+        let (inner_a, inner_b) = InMemoryTransport::pair(relay.clone(), relay.clone());
+        let inner_conn = inner_a.connection_id();
+        let mut a = CircuitTransport::new(inner_a, a_identity, CounterEntropy(10));
+        let mut b = CircuitTransport::new(inner_b, b_identity, CounterEntropy(20));
+        let _ = a.poll(Now::from_millis(0)).expect("initial A events");
+        let _ = b.poll(Now::from_millis(0)).expect("initial B events");
+        let bridge = a.inner_mut().open_stream(inner_conn).expect("bridge open");
+        let _ = a.poll(Now::from_millis(0)).expect("local bridge event");
+        let _ = b.poll(Now::from_millis(0)).expect("remote bridge event");
+        // The relay message tail the swarm held when the bridge was Full.
+        let prefix = Bytes::from_static(b"held STATUS tail");
+        let circuit_id = a
+            .adopt_bridge(BridgeAdoption {
+                inner_conn,
+                bridge_stream: bridge,
+                relay: relay.clone(),
+                remote_peer: b_peer.clone(),
+                role: CircuitRole::Initiator,
+                pending_data: Bytes::new(),
+                unsent_prefix: prefix.clone(),
+                remote_write_closed: false,
+            })
+            .expect("initiator adoption");
+        let received: Vec<u8> = b
+            .inner_mut()
+            .poll(Now::from_millis(0))
+            .expect("read the bridge")
+            .into_iter()
+            .filter_map(|event| match event {
+                TransportEvent::StreamData { data, .. } => Some(data),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let handshake = received
+            .strip_prefix(prefix.as_ref())
+            .expect("the prefix comes first");
+        assert!(!handshake.is_empty(), "the handshake follows the prefix");
+        b.adopt_bridge(BridgeAdoption {
+            inner_conn,
+            bridge_stream: bridge,
+            relay,
+            remote_peer: a_peer.clone(),
+            role: CircuitRole::Responder,
+            pending_data: Bytes::from(handshake.to_vec()),
+            unsent_prefix: Bytes::new(),
+            remote_write_closed: false,
+        })
+        .expect("responder adoption");
+        let _ = b.poll(Now::from_millis(0)).expect("incoming event");
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
     }
 
@@ -1945,6 +2017,7 @@ mod tests {
                 remote_peer: a_peer.clone(),
                 role: CircuitRole::Responder,
                 pending_data: Bytes::from(pending_data),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("responder adopts pipelined selection and Noise msg1");
@@ -1967,6 +2040,7 @@ mod tests {
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("real initiator adoption");
@@ -2172,6 +2246,7 @@ mod tests {
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             })
             .expect("identical duplicate is idempotent");
@@ -2184,6 +2259,7 @@ mod tests {
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             }),
             Err(AdoptError::ConflictingAdoption)
@@ -2196,6 +2272,7 @@ mod tests {
                 remote_peer: b_peer.clone(),
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: true,
             }),
             Err(AdoptError::ConflictingAdoption)
@@ -2555,6 +2632,7 @@ mod tests {
                 remote_peer: remote,
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             }),
             Err(AdoptError::UnknownConnection)
@@ -2580,6 +2658,7 @@ mod tests {
                 remote_peer: remote.clone(),
                 role: CircuitRole::Initiator,
                 pending_data: Bytes::from(Vec::new()),
+                unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
             }),
             Err(AdoptError::PeerAlreadyDirect)
@@ -2658,6 +2737,7 @@ mod tests {
             remote_peer: remote,
             role: CircuitRole::Initiator,
             pending_data: Bytes::from(Vec::new()),
+            unsent_prefix: Bytes::new(),
             remote_write_closed: false,
         };
         // Adoption peeks the next id up front but must only consume it after

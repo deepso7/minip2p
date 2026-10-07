@@ -415,6 +415,15 @@ impl SecureMuxSession {
         };
 
         let result = operation(&mut yamux);
+        // A local reset of a peer-opened stream can exhaust the control
+        // reserve, which fails Yamux like a protocol error on input: flush
+        // its GoAway and leave the phase taken.
+        if let Err(error @ YamuxError::ControlReserveExhausted { .. }) = result {
+            self.drain_yamux(&mut noise, &mut yamux, true)?;
+            return Err(SessionError::protocol(format!(
+                "Yamux protocol failed: {error}"
+            )));
+        }
         // A failed drain is fatal, exactly as in `handle_input`: leave the
         // phase taken so the session cannot be used again.
         self.drain_yamux(&mut noise, &mut yamux, false)?;
@@ -1182,6 +1191,45 @@ mod tests {
             outputs.is_empty(),
             "a failed upgrade may leave only queued writes behind: {outputs:?}"
         );
+    }
+
+    #[test]
+    fn a_reset_that_exhausts_the_control_reserve_fails_the_session() {
+        let initiator_key = Ed25519Keypair::generate();
+        let responder_key = Ed25519Keypair::generate();
+        let peer = responder_key.peer_id();
+        let (noise, _) = noise_pair(initiator_key, responder_key);
+        let mut yamux = YamuxSession::with_config(
+            YamuxRole::Client,
+            YamuxConfig {
+                max_pending_control: 1,
+                ..YamuxConfig::default()
+            },
+        )
+        .unwrap();
+        for stream in [2, 4] {
+            let syn = Frame::window_update(stream, FLAG_SYN, 0).unwrap();
+            yamux.handle_data(&syn.encode()).unwrap();
+        }
+        let mut session = SecureMuxSession {
+            role: SessionRole::Initiator,
+            yamux_config: YamuxConfig::default(),
+            phase: Some(Phase::Ready { noise, yamux, peer }),
+            outputs: VecDeque::new(),
+            writes: WriteQueue::default(),
+        };
+
+        session
+            .reset_stream(StreamId::new(2))
+            .expect("fits the reserve");
+        let written = session.writes.bytes;
+        let failed = session.reset_stream(StreamId::new(4));
+        assert!(
+            matches!(failed, Err(SessionError::Protocol(ref reason)) if reason.contains("reserve")),
+            "a non-reading peer's resets fail the session: {failed:?}"
+        );
+        assert!(!session.is_established());
+        assert!(session.writes.bytes > written, "the GoAway is flushed");
     }
 
     #[test]
