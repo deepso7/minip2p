@@ -21,7 +21,7 @@ fn paced_burst() -> (QuicTransport, RawPeer, ConnectionId, StreamId) {
 
     let stream = server.open_stream(id).expect("open stream");
     server
-        .send_stream(id, stream, vec![7; 64 * 1024])
+        .send_stream(id, stream, Bytes::from(vec![7; 64 * 1024]))
         .expect("send");
     let start = Instant::now();
     while server.connections[&id].paced_packet().is_none() {
@@ -92,7 +92,7 @@ fn held_packets_leave_in_order_and_never_early() {
 
     // More output while the packet is held must queue behind it.
     server
-        .send_stream(id, stream, vec![8; 16 * 1024])
+        .send_stream(id, stream, Bytes::from(vec![8; 16 * 1024]))
         .expect("send more");
     let start = Instant::now();
     let first = loop {
@@ -146,7 +146,7 @@ fn a_due_held_packet_never_overtakes_retained_datagrams() {
     server.queue_datagram_best_effort(b"earlier", destination);
     // `send_stream` flushes the connection without draining the retry queue.
     server
-        .send_stream(id, stream, vec![9; 1024])
+        .send_stream(id, stream, Bytes::from(vec![9; 1024]))
         .expect("send more");
     assert_eq!(
         recv_raw(&peer),

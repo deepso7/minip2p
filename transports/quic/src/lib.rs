@@ -16,7 +16,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{
-    BlockingTransport, ConnectionEndpoint, ConnectionId, ConnectionIdAllocator,
+    BlockingTransport, Bytes, ConnectionEndpoint, ConnectionId, ConnectionIdAllocator,
     ConnectionNamespace, StreamId, Transport, TransportError, TransportEvent, WaitHandle,
     WaitOutcome,
 };
@@ -318,6 +318,13 @@ fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, T
     if node_config.limits().max_pending_datagrams == 0 {
         return Err(TransportError::InvalidConfig {
             reason: "max_pending_datagrams must be greater than zero".into(),
+        });
+    }
+    // A zero queue could never free half of itself, so a Full write would
+    // never be told it can retry.
+    if node_config.limits().max_pending_stream_bytes == 0 {
+        return Err(TransportError::InvalidConfig {
+            reason: "max_pending_stream_bytes must be greater than zero".into(),
         });
     }
 
@@ -1549,7 +1556,7 @@ impl Transport for QuicTransport {
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
         let conn = self
             .connections
@@ -1838,7 +1845,7 @@ impl Transport for QuicEndpoint {
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
         match self {
             Self::Single(transport) => transport.send_stream(id, stream_id, data),
@@ -1952,7 +1959,7 @@ impl Transport for DualQuicTransport {
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
         let family = Self::family_for_id(id)?;
         self.transport_mut(family).send_stream(id, stream_id, data)

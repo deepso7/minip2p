@@ -3,11 +3,11 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerAddr};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr};
 use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_platform::{Deadline, EntropySource, Now};
 use minip2p_secure_mux::{
-    SecureMuxSession, SessionConfig, SessionError, SessionOutput, SessionRole,
+    SecureMuxSession, SessionConfig, SessionError, SessionOutput, SessionRole, YamuxError,
 };
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, ConnectionState,
@@ -62,7 +62,9 @@ struct Connection {
     /// then, so its session cannot start.
     linked: bool,
     session: SecureMuxSession,
-    /// Bytes the session has produced that the socket has not accepted yet.
+    /// Bytes pulled from the session that the socket has not accepted yet.
+    /// The session is pulled only while this is below
+    /// [`TcpConfig::max_buffered_send`].
     outbound: VecDeque<u8>,
     /// When the socket last refused everything, while bytes were still queued.
     ///
@@ -213,24 +215,14 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         }))
     }
 
-    /// Drains session outputs into buffered writes and public events.
+    /// Drains session events into public events.
     ///
-    /// The session queues both in one ordered stream, so a single pass keeps
-    /// the wire and the event feed in step. Bytes only reach the socket in
-    /// [`flush`](Self::flush), which is what absorbs a socket that is not
-    /// accepting writes right now.
-    fn pump(&mut self, connection: &mut Connection) -> Result<(), Teardown> {
+    /// Events leave the session separately from its bytes, so they are never
+    /// held back by a socket that is not taking writes.
+    fn pump(&mut self, connection: &mut Connection) {
         while let Some(output) = connection.session.poll_output() {
-            match output {
-                SessionOutput::Write(bytes) => {
-                    if connection.outbound.len() + bytes.len() > self.config.max_buffered_send {
-                        return Err(Teardown::fault(format!(
-                            "outbound buffer exceeded {} bytes; peer is not reading",
-                            self.config.max_buffered_send
-                        )));
-                    }
-                    connection.outbound.extend(bytes);
-                }
+            let id = connection.id;
+            let event = match output {
                 SessionOutput::Established {
                     peer,
                     handshake_hash,
@@ -239,38 +231,48 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                     // as the connection's token.
                     let mut endpoint = connection.endpoint(Some(peer));
                     endpoint.set_token(ConnectionToken::new(handshake_hash));
-                    self.pending.push_back(TransportEvent::Connected {
-                        id: connection.id,
-                        endpoint,
-                    });
+                    TransportEvent::Connected { id, endpoint }
                 }
-                SessionOutput::IncomingStream { stream } => {
-                    self.pending.push_back(TransportEvent::IncomingStream {
-                        id: connection.id,
-                        stream_id: stream,
-                    });
-                }
-                SessionOutput::StreamData { stream, data } => {
-                    self.pending.push_back(TransportEvent::StreamData {
-                        id: connection.id,
-                        stream_id: stream,
-                        data,
-                    });
-                }
+                SessionOutput::IncomingStream { stream } => TransportEvent::IncomingStream {
+                    id,
+                    stream_id: stream,
+                },
+                SessionOutput::StreamData { stream, data } => TransportEvent::StreamData {
+                    id,
+                    stream_id: stream,
+                    data,
+                },
                 SessionOutput::StreamRemoteWriteClosed { stream } => {
-                    self.pending
-                        .push_back(TransportEvent::StreamRemoteWriteClosed {
-                            id: connection.id,
-                            stream_id: stream,
-                        });
-                }
-                SessionOutput::StreamClosed { stream } => {
-                    self.pending.push_back(TransportEvent::StreamClosed {
-                        id: connection.id,
+                    TransportEvent::StreamRemoteWriteClosed {
+                        id,
                         stream_id: stream,
-                    });
+                    }
                 }
-            }
+                SessionOutput::StreamClosed { stream } => TransportEvent::StreamClosed {
+                    id,
+                    stream_id: stream,
+                },
+                SessionOutput::StreamWritable { stream } => TransportEvent::StreamWritable {
+                    id,
+                    stream_id: stream,
+                },
+            };
+            self.pending.push_back(event);
+        }
+    }
+
+    /// Pulls session bytes into the outbound buffer while it has room.
+    ///
+    /// This is the only place ciphertext is produced, so a socket that stops
+    /// taking bytes stops the session from framing more: stream writes then
+    /// queue inside Yamux, against its send caps, and come back to the caller
+    /// as Full instead of growing this buffer (ADR 0012).
+    fn fill(&mut self, connection: &mut Connection) -> Result<(), Teardown> {
+        while connection.outbound.len() < self.config.max_buffered_send {
+            let Some(bytes) = connection.session.poll_write()? else {
+                break;
+            };
+            connection.outbound.extend(bytes);
         }
         Ok(())
     }
@@ -299,16 +301,28 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         Ok(())
     }
 
-    /// Flushes old bytes, pumps new outputs, then flushes those too.
+    /// Moves bytes from the session to the socket until one of them stops,
+    /// then publishes the session's events.
     ///
-    /// Retrying the existing queue first matters for the buffer ceiling: a
-    /// socket may have recovered since the last poll, and newly produced bytes
-    /// must not fail a healthy connection merely because its now-writable
-    /// backlog had not yet been retried.
+    /// Flushing first frees buffer room for the session; filling may in turn
+    /// free Yamux send capacity, which is what queues `StreamWritable`, so
+    /// events are drained last.
     fn pump_and_flush(&mut self, connection: &mut Connection) -> Result<(), Teardown> {
-        self.flush(connection)?;
-        self.pump(connection)?;
-        self.flush(connection)
+        let result = loop {
+            if let Err(teardown) = self.flush(connection) {
+                break Err(teardown);
+            }
+            let before = connection.outbound.len();
+            if let Err(teardown) = self.fill(connection) {
+                break Err(teardown);
+            }
+            if connection.outbound.len() == before || !connection.linked {
+                break Ok(());
+            }
+        };
+        // Events the session already produced are the host's either way.
+        self.pump(connection);
+        result
     }
 
     /// Tears a connection down, emitting `Closed` and optionally `Error`.
@@ -391,7 +405,15 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 id,
                 stream_id: stream,
             }),
-            // Yamux refused the operation -- a full send buffer, an unknown
+            // Temporary send pressure: retryable, never a fault.
+            Err(SessionError::Yamux(YamuxError::Full { stream, unsent })) => {
+                Err(TransportError::Full {
+                    id,
+                    stream_id: StreamId::new(u64::from(stream)),
+                    unsent,
+                })
+            }
+            // Yamux refused the operation -- a closed write side, an unknown
             // substream -- but the session itself is still healthy.
             Err(SessionError::Yamux(error)) => Err(TransportError::PollError {
                 reason: error.to_string(),
@@ -613,7 +635,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
         if data.is_empty() {
             // The contract makes an empty write a no-op, but not a way to
@@ -680,6 +702,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         // fully drained socket can be closed gracefully.
         let graceful = flushed
             && connection.outbound.is_empty()
+            && !connection.session.has_pending_write()
             && self.provider.close_write(connection.socket).is_ok();
         if !graceful {
             self.provider.abort(connection.socket);
@@ -739,7 +762,8 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         }
 
         // Retry buffered writes even without a `Writable` event, so a provider
-        // that only reports readiness coarsely still drains.
+        // that only reports readiness coarsely still drains, and pull whatever
+        // the sessions have framed since.
         let timeout = self.config.send_stall_timeout_ms;
         for id in self.connections.keys().copied().collect::<Vec<_>>() {
             let Some(before) = self
@@ -749,17 +773,8 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
             else {
                 continue;
             };
-            if before == 0 {
-                // Fully drained, so nothing is stalled. Leaving a stale mark
-                // here would make the next socketful look like the tail of an
-                // old stall and fail the connection on the spot.
-                if let Some(connection) = self.connections.get_mut(&id) {
-                    connection.stalled_since = None;
-                }
-                continue;
-            }
             if let Err(teardown) =
-                self.with_connection(id, |this, connection| this.flush(connection))
+                self.with_connection(id, |this, connection| this.pump_and_flush(connection))
             {
                 self.fail_connection(id, teardown.message, true);
                 continue;
@@ -769,7 +784,11 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                 let Some(connection) = self.connections.get_mut(&id) else {
                     continue;
                 };
-                if connection.outbound.len() < before {
+                // Fully drained, or the socket took something: nothing is
+                // stalled. Leaving a stale mark would make the next socketful
+                // look like the tail of an old stall and fail the connection
+                // on the spot.
+                if connection.outbound.is_empty() || connection.outbound.len() < before {
                     connection.stalled_since = None;
                     continue;
                 }
@@ -815,6 +834,10 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                     Some(stall.map_or(deadline, |earliest| Deadline::earliest(earliest, deadline)));
             }
             if connection.outbound.is_empty() {
+                if connection.linked && connection.session.has_pending_write() {
+                    // Framed bytes with room to put them: come straight back.
+                    return Some(Deadline::IMMEDIATE);
+                }
                 if let Some(deadline) = connection.session.next_deadline() {
                     stall = Some(
                         stall.map_or(deadline, |earliest| Deadline::earliest(earliest, deadline)),
@@ -858,7 +881,8 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
 /// Wraps a session failure as the stream error the transport contract expects.
 ///
 /// Identifier and state errors pass through: they describe the request rather
-/// than the stream operation, and callers match on them.
+/// than the stream operation, and callers match on them. So does Full, which
+/// carries the caller's unsent tail.
 fn stream_error(
     error: TransportError,
     wrap: impl FnOnce(String) -> TransportError,
@@ -866,7 +890,8 @@ fn stream_error(
     match error {
         error @ (TransportError::ConnectionNotFound { .. }
         | TransportError::StreamNotFound { .. }
-        | TransportError::InvalidState { .. }) => error,
+        | TransportError::InvalidState { .. }
+        | TransportError::Full { .. }) => error,
         error => wrap(error.to_string()),
     }
 }

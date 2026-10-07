@@ -185,7 +185,7 @@ fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
     );
     let stream = StreamId::new(0);
     server
-        .send_stream(stopper_id, stream, vec![7; 10_000])
+        .send_stream(stopper_id, stream, Bytes::from(vec![7; 10_000]))
         .expect("send");
     assert!(pending_write_bytes(&server, stopper_id) > 0);
 
@@ -225,7 +225,7 @@ fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
     assert!(events.contains(&TransportEvent::StreamData {
         id: stopper_id,
         stream_id: stream,
-        data: b"more".to_vec(),
+        data: Bytes::from_static(b"more"),
     }));
     assert!(events.contains(&TransportEvent::StreamRemoteWriteClosed {
         id: stopper_id,
@@ -292,7 +292,7 @@ fn stop_sending_is_reported_when_nothing_is_queued() {
         }]
     );
     assert!(matches!(
-        server.send_stream(id, stream, b"late".to_vec()),
+        server.send_stream(id, stream, Bytes::from_static(b"late")),
         Err(TransportError::StreamSendFailed { .. } | TransportError::StreamNotFound { .. })
     ));
     assert_eq!(pending_write_bytes(&server, id), 0);
@@ -322,7 +322,7 @@ fn stop_sending_is_reported_while_connection_credit_is_exhausted() {
     // Use up the connection's send credit: quiche now lists no stream as
     // writable, stopped or not.
     server
-        .send_stream(id, StreamId::new(0), vec![7; 10_000])
+        .send_stream(id, StreamId::new(0), Bytes::from(vec![7; 10_000]))
         .expect("send");
 
     peer.conn
@@ -391,7 +391,7 @@ fn stop_hidden_by_exhausted_credit_surfaces_after_a_local_reset() {
     let mut events = Vec::new();
     conn.send_stream(
         StreamId::new(0),
-        vec![7; 10_000],
+        Bytes::from(vec![7; 10_000]),
         socket,
         &mut events,
         &mut held,
@@ -476,7 +476,7 @@ fn data_beyond_one_read_buffer_arrives_once_and_idle_polls_stay_silent() {
     let received: Vec<u8> = events
         .iter()
         .filter_map(|event| match event {
-            TransportEvent::StreamData { data, .. } => Some(data.as_slice()),
+            TransportEvent::StreamData { data, .. } => Some(&data[..]),
             _ => None,
         })
         .flatten()
@@ -509,7 +509,9 @@ fn fin_waiting_for_stream_credit_stays_queued_until_granted() {
     });
 
     let first = server.open_stream(id).expect("first stream");
-    server.send_stream(id, first, b"x".to_vec()).expect("send");
+    server
+        .send_stream(id, first, Bytes::from_static(b"x"))
+        .expect("send");
     server.close_stream_write(id, first).expect("fin first");
     // The peer has granted one server stream; this FIN has to wait.
     let second = server.open_stream(id).expect("second stream");
@@ -597,7 +599,7 @@ fn connection_fatal_send_error_closes_only_that_connection() {
     assert!(events.contains(&TransportEvent::StreamData {
         id: healthy_id,
         stream_id: StreamId::new(0),
-        data: b"still here".to_vec(),
+        data: Bytes::from_static(b"still here"),
     }));
     assert!(!events.contains(&TransportEvent::Closed { id: healthy_id }));
     assert!(server.connections.contains_key(&healthy_id));
@@ -613,7 +615,7 @@ fn partially_written_queue_drains_once_the_stream_is_writable() {
 
     let stream = server.open_stream(id).expect("open");
     server
-        .send_stream(id, stream, vec![7; 10_000])
+        .send_stream(id, stream, Bytes::from(vec![7; 10_000]))
         .expect("send");
     server.close_stream_write(id, stream).expect("queue fin");
     let connection = server.connections.get(&id).expect("connection");

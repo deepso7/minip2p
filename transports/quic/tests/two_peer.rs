@@ -2,7 +2,7 @@ use std::net::UdpSocket;
 
 use minip2p_core::PeerAddr;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
-use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
+use minip2p_transport::{Bytes, ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 use quiche::ConnectionId as QuicConnectionId;
 
 mod common;
@@ -63,7 +63,11 @@ fn two_peers_open_stream_and_exchange_data() {
 
     let client_stream = client.open_stream(client_conn_id).expect("open stream");
     client
-        .send_stream(client_conn_id, client_stream, b"hello from client".to_vec())
+        .send_stream(
+            client_conn_id,
+            client_stream,
+            Bytes::from_static(b"hello from client"),
+        )
         .expect("send stream data");
 
     let mut server_stream = None;
@@ -89,7 +93,7 @@ fn two_peers_open_stream_and_exchange_data() {
                     data,
                 } => {
                     assert_eq!(id, server_conn_id);
-                    assert_eq!(data, b"hello from client");
+                    assert_eq!(&data[..], b"hello from client");
                     server_stream = Some(stream_id);
                 }
                 _ => {}
@@ -103,7 +107,11 @@ fn two_peers_open_stream_and_exchange_data() {
 
     let server_stream = server_stream.expect("server should see stream and data");
     server
-        .send_stream(server_conn_id, server_stream, b"hello from server".to_vec())
+        .send_stream(
+            server_conn_id,
+            server_stream,
+            Bytes::from_static(b"hello from server"),
+        )
         .expect("server response");
 
     for _ in 0..250 {
@@ -117,7 +125,7 @@ fn two_peers_open_stream_and_exchange_data() {
                 && id == client_conn_id
                 && stream_id == client_stream
             {
-                assert_eq!(data, b"hello from server");
+                assert_eq!(&data[..], b"hello from server");
                 return;
             }
         }
@@ -175,7 +183,7 @@ fn stream_data_is_preserved_across_connections_and_streams() {
                 .send_stream(
                     connection,
                     stream,
-                    payloads[connection_index * 2 + stream_index].clone(),
+                    Bytes::from(payloads[connection_index * 2 + stream_index].clone()),
                 )
                 .expect("send stream data");
         }
@@ -213,7 +221,11 @@ fn close_stream_write_emits_remote_write_closed() {
 
     let client_stream = client.open_stream(client_conn_id).expect("open stream");
     client
-        .send_stream(client_conn_id, client_stream, b"payload".to_vec())
+        .send_stream(
+            client_conn_id,
+            client_stream,
+            Bytes::from_static(b"payload"),
+        )
         .expect("send payload");
     client
         .close_stream_write(client_conn_id, client_stream)

@@ -8,7 +8,7 @@ use minip2p_identity::Ed25519Keypair;
 use minip2p_ping::PING_PROTOCOL_ID;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig, QuicTransport};
 use minip2p_swarm::{DriverError, Swarm, SwarmBuilder, SwarmError, SwarmErrorKind, SwarmEvent};
-use minip2p_transport::{StreamId, Transport};
+use minip2p_transport::{Bytes, StreamId, Transport};
 
 fn make_swarm(keypair: Ed25519Keypair) -> Swarm<QuicTransport> {
     let transport =
@@ -298,7 +298,12 @@ fn swarm_user_protocol_round_trip() {
                     assert_eq!(protocol_id, USER_PROTOCOL_ID);
                     assert!(initiated_locally);
                     client
-                        .send_stream(&server_peer_id, conn_id, stream_id, payload.clone())
+                        .send_stream(
+                            &server_peer_id,
+                            conn_id,
+                            stream_id,
+                            Bytes::from(payload.clone()),
+                        )
                         .expect("client send");
                 }
                 SwarmEvent::StreamData {
@@ -307,7 +312,7 @@ fn swarm_user_protocol_round_trip() {
                     ..
                 } => {
                     assert_eq!(peer_id, &server_peer_id);
-                    echo_received = Some(data.clone());
+                    echo_received = Some(data.to_vec());
                 }
                 SwarmEvent::Error(ref error) => {
                     eprintln!("[client] {:?}: {}", error.kind, error.detail)

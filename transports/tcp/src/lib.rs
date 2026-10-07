@@ -43,8 +43,16 @@
 //! reports when the stall turns fatal instead: claiming urgency against a
 //! socket that takes nothing would spin a deadline-driven host for as long as
 //! the peer stayed silent. Two limits bound the damage --
-//! [`TcpConfig::max_buffered_send`] on how much may queue, and
+//! [`TcpConfig::max_buffered_send`] on how much ciphertext may queue, and
 //! [`TcpConfig::send_stall_timeout_ms`] on how long it may sit there.
+//!
+//! Ciphertext is produced only while that buffer has room, so a slow reader
+//! is backpressure, not a fault (ADR 0012): stream writes fill Yamux's send
+//! caps and then return
+//! [`TransportError::Full`](minip2p_transport::TransportError::Full) with the
+//! unsent tail, and
+//! [`TransportEvent::StreamWritable`](minip2p_transport::TransportEvent::StreamWritable)
+//! follows once the socket has drained enough.
 //! Established connections also fold in Yamux's 30 s keepalive deadline so a
 //! quiet TCP or relayed path stays up without an application ping.
 //!

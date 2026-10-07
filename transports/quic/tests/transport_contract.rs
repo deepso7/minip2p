@@ -8,7 +8,7 @@ use minip2p_core::{PeerAddr, Protocol};
 use minip2p_platform::{Deadline, Now};
 use minip2p_quic::{QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport};
 use minip2p_transport::{
-    BlockingTransport, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,
+    BlockingTransport, Bytes, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,
     TransportEvent, WaitOutcome,
 };
 
@@ -269,7 +269,7 @@ fn local_stream_limit_is_released_after_stream_gc() {
     let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     let first = client.open_stream(client_conn).expect("first stream");
     client
-        .send_stream(client_conn, first, b"data".to_vec())
+        .send_stream(client_conn, first, Bytes::from_static(b"data"))
         .expect("send first stream");
     for _ in 0..10 {
         drive_pair_once(&mut server, &mut client);
@@ -294,7 +294,7 @@ fn stream_operations_reject_ids_not_allocated_by_transport() {
     let forged = StreamId::new(0);
 
     let send_error = client
-        .send_stream(client_conn, forged, b"bypass".to_vec())
+        .send_stream(client_conn, forged, Bytes::from_static(b"bypass"))
         .expect_err("send must require open_stream");
     assert!(matches!(send_error, TransportError::StreamNotFound { .. }));
     let close_error = client
@@ -310,24 +310,32 @@ fn stream_operations_reject_ids_not_allocated_by_transport() {
 }
 
 #[test]
-fn zero_pending_datagram_limit_is_rejected() {
-    let limits = QuicLimits {
+fn zero_pending_limits_are_rejected() {
+    let zero_datagrams = QuicLimits {
         max_pending_datagrams: 0,
         ..QuicLimits::default()
     };
-    let result = QuicTransport::new(
-        QuicNodeConfig::generate().with_limits(limits),
-        "127.0.0.1:0",
-    );
-    let error = match result {
-        Ok(_) => panic!("zero datagram capacity must be rejected"),
-        Err(error) => error,
+    let zero_stream_bytes = QuicLimits {
+        max_pending_stream_bytes: 0,
+        ..QuicLimits::default()
     };
-    assert!(matches!(
-        error,
-        TransportError::InvalidConfig { ref reason }
-            if reason.contains("max_pending_datagrams")
-    ));
+    for (limits, field) in [
+        (zero_datagrams, "max_pending_datagrams"),
+        (zero_stream_bytes, "max_pending_stream_bytes"),
+    ] {
+        let result = QuicTransport::new(
+            QuicNodeConfig::generate().with_limits(limits),
+            "127.0.0.1:0",
+        );
+        let error = match result {
+            Ok(_) => panic!("zero {field} must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            TransportError::InvalidConfig { ref reason } if reason.contains(field)
+        ));
+    }
 }
 
 #[test]
@@ -343,7 +351,7 @@ fn write_larger_than_queue_cap_succeeds_when_quiche_accepts_it() {
     // 9 bytes exceed the queue cap but fit quiche's send capacity on an idle
     // connection, so the write goes straight to quiche instead of failing.
     client
-        .send_stream(client_conn, stream, vec![7; 9])
+        .send_stream(client_conn, stream, Bytes::from(vec![7; 9]))
         .expect("write above the queue cap must succeed via direct send");
 
     let mut received = 0;
@@ -366,26 +374,76 @@ fn write_larger_than_queue_cap_succeeds_when_quiche_accepts_it() {
 }
 
 #[test]
-fn pending_stream_byte_limit_rejects_unqueueable_remainder() {
+fn a_write_past_the_pending_cap_is_full_and_resumes_on_writable() {
     let limits = QuicLimits {
         max_pending_stream_bytes: 8,
         ..QuicLimits::default()
     };
     let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
-    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     let stream = client.open_stream(client_conn).expect("open stream");
 
-    // Far beyond both quiche's fresh-connection send capacity and the queue
-    // cap, so the unsendable remainder cannot be retained.
+    // Far beyond quiche's fresh-connection send capacity plus the queue cap:
+    // the transport keeps what fits and hands back exactly the rest.
+    let payload: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
     let error = client
-        .send_stream(client_conn, stream, vec![0; 4 * 1024 * 1024])
-        .expect_err("write whose remainder exceeds the queue cap must fail");
-    assert!(matches!(
-        error,
-        TransportError::ResourceExhausted {
-            resource: "queued QUIC stream bytes"
+        .send_stream(client_conn, stream, Bytes::from(payload.clone()))
+        .expect_err("a write past the queue cap is Full");
+    let TransportError::Full {
+        id,
+        stream_id,
+        unsent,
+    } = error
+    else {
+        panic!("expected Full, got {error:?}");
+    };
+    assert_eq!((id, stream_id), (client_conn, stream));
+    assert!(
+        !unsent.is_empty() && unsent.len() < payload.len(),
+        "part of the write was accepted, the rest handed back"
+    );
+    assert_eq!(&unsent[..], &payload[payload.len() - unsent.len()..]);
+
+    // Resend the tail each time the stream reports writable; the server must
+    // see the original byte stream exactly once.
+    let mut held = Some(unsent);
+    let mut received = Vec::new();
+    let mut remote_closed = false;
+    for _ in 0..2000 {
+        let (server_events, client_events) = drive_pair_once(&mut server, &mut client);
+        for event in client_events {
+            if event
+                == (TransportEvent::StreamWritable {
+                    id: client_conn,
+                    stream_id: stream,
+                })
+                && let Some(tail) = held.take()
+            {
+                match client.send_stream(client_conn, stream, tail) {
+                    Ok(()) => client
+                        .close_stream_write(client_conn, stream)
+                        .expect("close write"),
+                    Err(error) => held = Some(error.into_unsent().expect("only Full")),
+                }
+            }
         }
-    ));
+        for event in server_events {
+            match event {
+                TransportEvent::StreamData { id, data, .. } if id == server_conn => {
+                    received.extend_from_slice(&data);
+                }
+                TransportEvent::StreamRemoteWriteClosed { id, .. } if id == server_conn => {
+                    remote_closed = true;
+                }
+                _ => {}
+            }
+        }
+        if remote_closed {
+            break;
+        }
+    }
+    assert!(remote_closed, "the whole write must eventually go out");
+    assert_eq!(received, payload, "every byte, once, in order");
 }
 
 #[test]
@@ -399,10 +457,10 @@ fn queued_stream_writes_preserve_order_behind_direct_sends() {
     let first: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
     let second = vec![0xEEu8; 1_000];
     client
-        .send_stream(client_conn, stream, first.clone())
+        .send_stream(client_conn, stream, Bytes::from(first.clone()))
         .expect("first write");
     client
-        .send_stream(client_conn, stream, second.clone())
+        .send_stream(client_conn, stream, Bytes::from(second.clone()))
         .expect("second write");
     client
         .close_stream_write(client_conn, stream)
@@ -566,7 +624,7 @@ fn close_rejects_further_stream_operations() {
     // Open a stream first so we can test send after close.
     let stream_id = client.open_stream(client_conn).expect("open stream");
     client
-        .send_stream(client_conn, stream_id, b"data".to_vec())
+        .send_stream(client_conn, stream_id, Bytes::from_static(b"data"))
         .expect("send before close");
 
     client.close(client_conn).expect("close");
@@ -611,7 +669,7 @@ fn incoming_stream_precedes_stream_data() {
 
     let stream_id = client.open_stream(client_conn).expect("open stream");
     client
-        .send_stream(client_conn, stream_id, b"hello".to_vec())
+        .send_stream(client_conn, stream_id, Bytes::from_static(b"hello"))
         .expect("send");
 
     let mut server_events = Vec::new();
@@ -648,7 +706,7 @@ fn close_stream_write_produces_remote_write_closed() {
 
     let stream_id = client.open_stream(client_conn).expect("open stream");
     client
-        .send_stream(client_conn, stream_id, b"data".to_vec())
+        .send_stream(client_conn, stream_id, Bytes::from_static(b"data"))
         .expect("send");
     client
         .close_stream_write(client_conn, stream_id)
@@ -678,7 +736,7 @@ fn reset_stream_emits_stream_closed() {
     let stream_id = client.open_stream(client_conn).expect("open stream");
 
     client
-        .send_stream(client_conn, stream_id, b"hello".to_vec())
+        .send_stream(client_conn, stream_id, Bytes::from_static(b"hello"))
         .expect("send");
 
     for _ in 0..10 {
@@ -730,7 +788,11 @@ fn send_on_unknown_connection_returns_not_found() {
         QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
 
     let err = transport
-        .send_stream(ConnectionId::new(999), 0.into(), b"data".to_vec())
+        .send_stream(
+            ConnectionId::new(999),
+            0.into(),
+            Bytes::from_static(b"data"),
+        )
         .expect_err("must fail");
     assert!(matches!(err, TransportError::ConnectionNotFound { .. }));
 }

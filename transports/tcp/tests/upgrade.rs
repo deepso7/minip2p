@@ -12,7 +12,7 @@ use minip2p_platform::{Deadline, EntropySource, Now};
 use minip2p_secure_mux::KEEPALIVE_INTERVAL_MS;
 use minip2p_tcp::{TcpConfig, TcpTransport};
 use minip2p_transport::{
-    ConnectionId, ConnectionNamespace, StreamId, Transport, TransportError, TransportEvent,
+    Bytes, ConnectionId, ConnectionNamespace, StreamId, Transport, TransportError, TransportEvent,
 };
 use support::{BrokenEntropy, CountingEntropy, FlakyEntropy, VirtualNetwork, VirtualProvider};
 
@@ -235,7 +235,7 @@ fn connected_precedes_the_substream_a_peer_opens_immediately() {
         .next()
         .expect("listener connection id");
     listener
-        .send_stream(listener_id, StreamId::new(2), b"eager".to_vec())
+        .send_stream(listener_id, StreamId::new(2), Bytes::from_static(b"eager"))
         .expect("send on the fresh substream");
     let (dialer_events, _) = drive(&net, &mut dialer, &mut listener);
 
@@ -259,7 +259,7 @@ fn substreams_carry_data_half_close_and_reset() {
     let stream = pair.dialer.open_stream(id).expect("open substream");
     assert_eq!(stream.as_u64() % 2, 1, "dialer substreams are odd");
     pair.dialer
-        .send_stream(id, stream, b"hello".to_vec())
+        .send_stream(id, stream, Bytes::from_static(b"hello"))
         .expect("send");
     let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
@@ -269,7 +269,7 @@ fn substreams_carry_data_half_close_and_reset() {
     .expect("listener sees the substream");
     let data = position(
         &listener_events,
-        |event| matches!(event, TransportEvent::StreamData { data, .. } if data == b"hello"),
+        |event| matches!(event, TransportEvent::StreamData { data, .. } if &data[..] == b"hello"),
     )
     .expect("listener sees the payload");
     assert!(
@@ -288,13 +288,13 @@ fn substreams_carry_data_half_close_and_reset() {
         "half close must surface remotely: {listener_events:?}"
     );
     pair.listener
-        .send_stream(id, stream, b"reply".to_vec())
+        .send_stream(id, stream, Bytes::from_static(b"reply"))
         .expect("reverse direction stays open");
     let (dialer_events, _) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
     assert!(
         dialer_events.iter().any(|event| matches!(
             event,
-            TransportEvent::StreamData { data, .. } if data == b"reply"
+            TransportEvent::StreamData { data, .. } if &data[..] == b"reply"
         )),
         "reply must arrive: {dialer_events:?}"
     );
@@ -440,7 +440,7 @@ fn a_full_socket_buffers_and_drains_as_the_peer_reads() {
     let stream = dialer.open_stream(id).expect("open substream");
     let payload: Vec<u8> = (0..4096u32).map(|byte| byte as u8).collect();
     dialer
-        .send_stream(id, stream, payload.clone())
+        .send_stream(id, stream, Bytes::from(payload.clone()))
         .expect("queue a payload far larger than the peer's buffer");
 
     // Drain the queued `StreamOpened` first, so buffered bytes are the only
@@ -511,7 +511,7 @@ fn buffered_writes_drain_even_without_a_writable_event() {
     let stream = dialer.open_stream(id).expect("open substream");
     let payload: Vec<u8> = (0..2048u32).map(|byte| byte as u8).collect();
     dialer
-        .send_stream(id, stream, payload.clone())
+        .send_stream(id, stream, Bytes::from(payload.clone()))
         .expect("queue a payload far larger than the peer's buffer");
     let (_, listener_events) = drive(&net, &mut dialer, &mut listener);
 
@@ -539,7 +539,7 @@ fn closing_a_socket_that_cannot_flush_aborts_instead_of_truncating() {
     // socket has to be discarded instead.
     pair.dialer.provider_mut().set_in_flight_capacity(Some(64));
     pair.dialer
-        .send_stream(id, stream, vec![7u8; 8 * 1024])
+        .send_stream(id, stream, Bytes::from(vec![7u8; 8 * 1024]))
         .expect("queue more than the peer can take");
     let aborts_before = pair.dialer.provider().abort_calls();
 
@@ -569,7 +569,7 @@ fn a_stalled_socket_stops_claiming_urgency_and_recovers() {
     // straight back, which would spin for as long as the peer stays silent.
     pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
     pair.dialer
-        .send_stream(id, stream, vec![3u8; 1024])
+        .send_stream(id, stream, Bytes::from(vec![3u8; 1024]))
         .expect("queue bytes the socket will refuse");
     let _ = pair
         .dialer
@@ -615,7 +615,7 @@ fn a_stall_is_measured_from_when_it_started_not_from_an_older_one() {
     // Stall early.
     pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
     pair.dialer
-        .send_stream(id, stream, vec![1u8; 512])
+        .send_stream(id, stream, Bytes::from(vec![1u8; 512]))
         .expect("queue bytes");
     let _ = pair.dialer.poll(Now::from_millis(0)).expect("first stall");
 
@@ -624,7 +624,7 @@ fn a_stall_is_measured_from_when_it_started_not_from_an_older_one() {
     // the drained buffer itself clears the mark on this path.
     pair.dialer.provider_mut().set_in_flight_capacity(None);
     pair.dialer
-        .send_stream(id, stream, vec![9u8; 16])
+        .send_stream(id, stream, Bytes::from(vec![9u8; 16]))
         .expect("this send flushes the backlog too");
     let _ = pair
         .dialer
@@ -638,7 +638,7 @@ fn a_stall_is_measured_from_when_it_started_not_from_an_older_one() {
     let much_later = Now::from_millis(10 * 60 * 1000);
     pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
     pair.dialer
-        .send_stream(id, stream, vec![2u8; 512])
+        .send_stream(id, stream, Bytes::from(vec![2u8; 512]))
         .expect("queue more bytes");
     let events = pair.dialer.poll(much_later).expect("second stall");
 
@@ -662,7 +662,7 @@ fn a_socket_that_never_recovers_fails_once_the_stall_timeout_passes() {
 
     pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
     pair.dialer
-        .send_stream(id, stream, vec![4u8; 512])
+        .send_stream(id, stream, Bytes::from(vec![4u8; 512]))
         .expect("queue bytes");
     let _ = pair
         .dialer
@@ -689,37 +689,83 @@ fn a_socket_that_never_recovers_fails_once_the_stall_timeout_passes() {
 }
 
 #[test]
-fn a_peer_that_stops_reading_fails_the_connection() {
-    let config = TcpConfig {
+fn a_peer_that_stops_reading_fills_the_stream_instead_of_failing_the_connection() {
+    let mut config = TcpConfig {
         max_buffered_send: 4096,
         ..TcpConfig::default()
     };
+    config.yamux.max_buffered_send = 8 * 1024;
     let mut pair = upgraded_pair_with(config, TcpConfig::default());
     let id = pair.connection;
     let stream = pair.dialer.open_stream(id).expect("open substream");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
 
-    // The peer stops reading, so its buffer stays full and the socket takes
-    // nothing more.
+    // The peer stops reading, so the socket takes nothing more and the write
+    // backs up into Yamux, whose cap rejects the tail.
     pair.dialer.provider_mut().set_in_flight_capacity(Some(64));
-    // Yamux's own limits are far higher, so it is the socket buffer's ceiling
-    // that gives way here, not the session's.
+    let payload: Vec<u8> = (0..16 * 1024u32).map(|byte| byte as u8).collect();
     let error = pair
         .dialer
-        .send_stream(id, stream, vec![0u8; 16 * 1024])
-        .expect_err("the outbound ceiling must reject this");
-    assert!(matches!(
-        error,
-        TransportError::StreamSendFailed { id: failed, .. } if failed == id
-    ));
-
-    let events = pair.dialer.poll(Now::from_millis(0)).expect("teardown");
+        .send_stream(id, stream, Bytes::from(payload.clone()))
+        .expect_err("a write past the stream's cap is Full");
+    let TransportError::Full {
+        id: full_id,
+        stream_id,
+        unsent,
+    } = error
+    else {
+        panic!("expected Full, got {error:?}");
+    };
+    assert_eq!((full_id, stream_id), (id, stream));
     assert_eq!(
-        events,
-        [TransportEvent::Closed { id }],
-        "the caller already has the error, so only Closed goes out"
+        &unsent[..],
+        &payload[8 * 1024..],
+        "exactly the unsent suffix"
     );
-    assert!(pair.dialer.connection_ids().is_empty());
+
+    // Full is backpressure, not failure: the connection survives.
+    let mut dialer_events = pair.dialer.poll(Now::from_millis(0)).expect("poll");
+    assert!(
+        !dialer_events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Closed { .. })),
+        "Full must not tear the connection down: {dialer_events:?}"
+    );
+    assert_eq!(pair.dialer.connection_ids(), vec![id]);
+
+    // The peer reads again; the stream reports writable (once: possibly
+    // already on the poll above, which pulls into the socket buffer) and the
+    // tail goes out.
+    pair.dialer.provider_mut().set_in_flight_capacity(None);
+    let (drained, mut listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    dialer_events.extend(drained);
+    let writable = TransportEvent::StreamWritable {
+        id,
+        stream_id: stream,
+    };
+    assert_eq!(
+        dialer_events
+            .iter()
+            .filter(|event| **event == writable)
+            .count(),
+        1,
+        "a drained stream reports writable once: {dialer_events:?}"
+    );
+    pair.dialer
+        .send_stream(id, stream, unsent)
+        .expect("the tail fits once drained");
+    listener_events.extend(drive(&pair.net, &mut pair.dialer, &mut pair.listener).1);
+
+    let received: Vec<u8> = listener_events
+        .iter()
+        .filter_map(|event| match event {
+            TransportEvent::StreamData { data, .. } => Some(&data[..]),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(received, payload, "every byte, once, in order");
 }
 
 #[test]
@@ -735,14 +781,14 @@ fn a_recovered_socket_drains_old_bytes_before_applying_the_buffer_ceiling() {
 
     pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
     pair.dialer
-        .send_stream(id, stream, vec![1u8; 3000])
+        .send_stream(id, stream, Bytes::from(vec![1u8; 3000]))
         .expect("queue the first payload");
 
     // Recovery happens between polls. The second payload would cross the
     // ceiling if the transport counted the stale queue before retrying it.
     pair.dialer.provider_mut().set_in_flight_capacity(None);
     pair.dialer
-        .send_stream(id, stream, vec![2u8; 3000])
+        .send_stream(id, stream, Bytes::from(vec![2u8; 3000]))
         .expect("a recovered socket drains its backlog first");
 
     let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
@@ -937,7 +983,7 @@ fn unknown_connections_and_substreams_are_rejected() {
         Err(TransportError::ConnectionNotFound { id: missing }) if missing == unknown
     ));
     assert!(matches!(
-        pair.dialer.send_stream(unknown, stream, vec![1]),
+        pair.dialer.send_stream(unknown, stream, Bytes::from(vec![1])),
         Err(TransportError::ConnectionNotFound { id: missing }) if missing == unknown
     ));
     assert_eq!(
@@ -948,7 +994,7 @@ fn unknown_connections_and_substreams_are_rejected() {
     // An unknown substream on a live connection retains the transport's
     // explicit not-found classification.
     assert_eq!(
-        pair.dialer.send_stream(id, stream, vec![1]),
+        pair.dialer.send_stream(id, stream, Bytes::from(vec![1])),
         Err(TransportError::StreamNotFound {
             id,
             stream_id: stream,
@@ -960,7 +1006,7 @@ fn unknown_connections_and_substreams_are_rejected() {
     let live = pair.dialer.open_stream(id).expect("open substream");
     let aliased = StreamId::new(live.as_u64() + (1u64 << 32));
     assert_eq!(
-        pair.dialer.send_stream(id, aliased, vec![1]),
+        pair.dialer.send_stream(id, aliased, Bytes::from(vec![1])),
         Err(TransportError::StreamNotFound {
             id,
             stream_id: aliased
@@ -969,9 +1015,9 @@ fn unknown_connections_and_substreams_are_rejected() {
 
     // An empty write is a no-op on a live connection, but is not a way to
     // address one that does not exist.
-    assert_eq!(pair.dialer.send_stream(id, live, Vec::new()), Ok(()));
+    assert_eq!(pair.dialer.send_stream(id, live, Bytes::new()), Ok(()));
     assert_eq!(
-        pair.dialer.send_stream(unknown, live, Vec::new()),
+        pair.dialer.send_stream(unknown, live, Bytes::new()),
         Err(TransportError::ConnectionNotFound { id: unknown })
     );
 }
