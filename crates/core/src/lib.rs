@@ -17,6 +17,7 @@ mod error;
 mod exchange;
 mod frame;
 mod multiaddr;
+mod payload;
 mod peer_addr;
 mod protobuf;
 mod protocol;
@@ -35,6 +36,7 @@ pub use frame::{FrameDecode, decode_frame, encode_frame};
 pub use minip2p_identity::PeerId;
 pub use minip2p_identity::{VarintError, read_uvarint, uvarint_len, write_uvarint};
 pub use multiaddr::{Multiaddr, TransportKind};
+pub use payload::retain_slice;
 pub use peer_addr::PeerAddr;
 pub use protobuf::{
     WIRE_I32, WIRE_I64, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_varint_field,

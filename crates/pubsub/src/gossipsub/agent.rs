@@ -642,7 +642,7 @@ impl GossipsubAgent {
             }
             SwarmEvent::StreamWritable {
                 peer_id, stream_id, ..
-            } => self.stream_writable(peer_id, *stream_id, now_ms),
+            } => self.stream_writable(peer_id, *stream_id),
             SwarmEvent::StreamReady {
                 peer_id,
                 stream_id,
@@ -749,7 +749,7 @@ impl GossipsubAgent {
 
     /// Resends a held tail on the stream's Writable. Returns whether the
     /// stream is this agent's outbound stream to `peer`.
-    fn stream_writable(&mut self, peer: &PeerId, stream_id: StreamId, _now_ms: u64) -> bool {
+    fn stream_writable(&mut self, peer: &PeerId, stream_id: StreamId) -> bool {
         let token = self.allocate_token();
         let Some(state) = self.peers.get_mut(peer) else {
             return false;

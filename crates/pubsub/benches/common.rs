@@ -52,18 +52,17 @@ fn inbound_stream(index: u16) -> StreamId {
     StreamId::new(u64::from(index) * 2 + 1)
 }
 
-/// The `(token, peer, stream_id, data)` of a send, or the action itself.
-fn as_send(
-    action: GossipsubAction,
-) -> Result<(GossipsubToken, PeerId, StreamId, Bytes), GossipsubAction> {
+/// The `(token, peer, stream_id, data)` of a send, or `None` for any other
+/// action.
+fn as_send(action: GossipsubAction) -> Option<(GossipsubToken, PeerId, StreamId, Bytes)> {
     match action {
         GossipsubAction::SendStream {
             token,
             peer,
             stream_id,
             data,
-        } => Ok((token, peer, stream_id, data)),
-        other => Err(other),
+        } => Some((token, peer, stream_id, data)),
+        _ => None,
     }
 }
 

@@ -55,6 +55,21 @@ const STREAM_BYTE_CAP = 1024 * 1024;
 /** Default per-stream write high-water mark: one Yamux stream send cap. */
 const DEFAULT_WRITE_HIGH_WATER_MARK = 256 * 1024;
 
+/** Native events routed to one {@link Stream} after it became ready. */
+const STREAM_EVENT_TAGS = [
+  P2pEvent_Tags.StreamData,
+  P2pEvent_Tags.StreamRemoteWriteClosed,
+  P2pEvent_Tags.StreamWriteAccepted,
+  P2pEvent_Tags.StreamWriteStopped,
+  P2pEvent_Tags.StreamClosed,
+] as const;
+type StreamP2pEvent = Extract<
+  P2pEvent,
+  { readonly tag: (typeof STREAM_EVENT_TAGS)[number] }
+>;
+const isStreamEvent = (event: P2pEvent): event is StreamP2pEvent =>
+  (STREAM_EVENT_TAGS as readonly string[]).includes(event.tag);
+
 interface PendingWrite {
   readonly data: Uint8Array;
   readonly resolve: () => void;
@@ -1344,13 +1359,7 @@ export class Minip2pBase {
       this.#streamReady(event.inner);
       return;
     }
-    if (
-      event.tag === P2pEvent_Tags.StreamData ||
-      event.tag === P2pEvent_Tags.StreamRemoteWriteClosed ||
-      event.tag === P2pEvent_Tags.StreamWriteAccepted ||
-      event.tag === P2pEvent_Tags.StreamWriteStopped ||
-      event.tag === P2pEvent_Tags.StreamClosed
-    ) {
+    if (isStreamEvent(event)) {
       this.#streamEvent(event);
       return;
     }
@@ -1508,19 +1517,7 @@ export class Minip2pBase {
     }
   }
 
-  #streamEvent(
-    event: Extract<
-      P2pEvent,
-      {
-        readonly tag:
-          | typeof P2pEvent_Tags.StreamData
-          | typeof P2pEvent_Tags.StreamRemoteWriteClosed
-          | typeof P2pEvent_Tags.StreamWriteAccepted
-          | typeof P2pEvent_Tags.StreamWriteStopped
-          | typeof P2pEvent_Tags.StreamClosed;
-      }
-    >
-  ): void {
+  #streamEvent(event: StreamP2pEvent): void {
     const { peerId, connId, streamId } = event.inner;
     const stream = this.#streams.get(streamKey(peerId, connId, streamId));
     if (event.tag === P2pEvent_Tags.StreamClosed) {
@@ -1825,16 +1822,12 @@ function toBackendTarget(target: ConnectTarget): BackendConnectTarget {
 function normalizeEvent(
   event: Exclude<
     P2pEvent,
-    {
-      readonly tag:
-        | typeof P2pEvent_Tags.DriverFailed
-        | typeof P2pEvent_Tags.StreamReady
-        | typeof P2pEvent_Tags.StreamData
-        | typeof P2pEvent_Tags.StreamRemoteWriteClosed
-        | typeof P2pEvent_Tags.StreamWriteAccepted
-        | typeof P2pEvent_Tags.StreamWriteStopped
-        | typeof P2pEvent_Tags.StreamClosed;
-    }
+    | StreamP2pEvent
+    | {
+        readonly tag:
+          | typeof P2pEvent_Tags.DriverFailed
+          | typeof P2pEvent_Tags.StreamReady;
+      }
   >
 ):
   | {

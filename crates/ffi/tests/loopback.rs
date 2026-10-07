@@ -546,7 +546,9 @@ fn a_write_past_the_send_caps_is_held_settled_once_and_closed_after_every_byte()
     );
 
     // Far past Yamux's 256 KiB stream cap, so native must hold the tail.
-    let payload: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let payload: Vec<u8> = (0..4 * 1024 * 1024_usize)
+        .map(|i| (i % 251) as u8)
+        .collect();
     let (conn_id, stream_id) = (opened.conn_id, opened.stream_id);
     assert!(!a.send_stream(b_peer.clone(), conn_id, stream_id, payload.clone())?);
     assert!(matches!(

@@ -9,12 +9,16 @@
 use std::collections::BTreeMap;
 
 use minip2p::{Bytes, ConnectionId, Endpoint, EndpointEvent, Error, PeerId, StreamId};
+use minip2p_core::retain_slice;
 
 use crate::{FfiError, P2pEvent};
 
 struct Pending {
     peer: PeerId,
     tail: Bytes,
+    /// The length `tail`'s allocation was counted at: the binding's payload
+    /// at first, the tail's own length once it has been copied out.
+    counted: usize,
     /// A close-write requested while the tail was pending; the FIN follows
     /// once the tail has been accepted.
     close_after: bool,
@@ -50,15 +54,17 @@ impl PendingWrites {
                 FfiError::Backpressure
             });
         }
-        let counted = data.len();
+        let mut counted = data.len();
         match endpoint.send_stream(&peer, conn_id, stream_id, data) {
             Ok(()) => Ok(true),
-            Err(Error::Full { unsent, .. }) => {
+            Err(Error::Full { mut unsent, .. }) => {
+                retain_slice(&mut unsent, &mut counted);
                 self.streams.insert(
                     (conn_id, stream_id),
                     Pending {
                         peer,
-                        tail: retain(unsent, counted),
+                        tail: unsent,
+                        counted,
                         close_after: false,
                     },
                 );
@@ -131,11 +137,11 @@ impl PendingWrites {
     ) -> Option<P2pEvent> {
         let key = (conn_id, stream_id);
         let pending = self.streams.get_mut(&key)?;
-        let counted = pending.tail.len();
         match endpoint.send_stream(&pending.peer, conn_id, stream_id, pending.tail.clone()) {
             Ok(()) => {}
-            Err(Error::Full { unsent, .. }) => {
-                pending.tail = retain(unsent, counted);
+            Err(Error::Full { mut unsent, .. }) => {
+                retain_slice(&mut unsent, &mut pending.counted);
+                pending.tail = unsent;
                 return None;
             }
             // The stream is gone; its terminal event fails the write.
@@ -157,15 +163,5 @@ impl PendingWrites {
             conn_id: conn_id.as_u64(),
             stream_id: stream_id.as_u64(),
         })
-    }
-}
-
-/// Keeps a tail, copying it out once it is shorter than half of what it was
-/// counted at so it cannot pin the binding's whole payload (ADR 0012).
-fn retain(tail: Bytes, counted: usize) -> Bytes {
-    if tail.len().saturating_mul(2) < counted {
-        Bytes::copy_from_slice(&tail)
-    } else {
-        tail
     }
 }

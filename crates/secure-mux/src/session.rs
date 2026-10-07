@@ -322,16 +322,25 @@ impl SecureMuxSession {
         self.with_yamux_stream(stream, move |yamux| yamux.send(yamux_stream, data))
     }
 
-    /// Half-closes the local write side of a substream.
+    /// Half-closes the local write side of a substream. A
+    /// [`SessionOutput::StreamWritable`] not yet polled for it is dropped.
     pub fn close_stream_write(&mut self, stream: StreamId) -> Result<(), SessionError> {
         let yamux_stream = yamux_stream(stream)?;
+        self.drop_writable(stream);
         self.with_yamux_stream(stream, move |yamux| yamux.close_write(yamux_stream))
     }
 
     /// Abruptly closes a substream in both directions.
     pub fn reset_stream(&mut self, stream: StreamId) -> Result<(), SessionError> {
         let yamux_stream = yamux_stream(stream)?;
+        self.drop_writable(stream);
         self.with_yamux_stream(stream, move |yamux| yamux.reset(yamux_stream))
+    }
+
+    /// Writable never follows the end of a write side.
+    fn drop_writable(&mut self, stream: StreamId) {
+        self.outputs
+            .retain(|output| *output != SessionOutput::StreamWritable { stream });
     }
 
     /// Ends the session cleanly, queueing a Yamux `GoAway` with `code`.

@@ -11,6 +11,8 @@ use alloc::collections::{BTreeMap, VecDeque};
 use minip2p_core::Bytes;
 use minip2p_transport::{ConnectionId, StreamId};
 
+use crate::SwarmEvent;
+
 /// Writes waiting on one stream, in order.
 #[derive(Debug, Default)]
 pub struct HeldStream {
@@ -20,13 +22,12 @@ pub struct HeldStream {
     /// A write-side close requested after the held writes. It must follow
     /// them, so it waits too.
     pub close: bool,
-    bytes: usize,
 }
 
 impl HeldStream {
     /// Bytes held on this stream.
     pub fn bytes(&self) -> usize {
-        self.bytes
+        self.tails.iter().map(Bytes::len).sum()
     }
 }
 
@@ -61,6 +62,14 @@ impl HeldWrites {
         self.streams.contains_key(&(conn_id, stream_id))
     }
 
+    /// Whether a close is waiting behind the stream's held bytes; the write
+    /// side is over and takes no more writes.
+    pub fn is_closing(&self, conn_id: ConnectionId, stream_id: StreamId) -> bool {
+        self.streams
+            .get(&(conn_id, stream_id))
+            .is_some_and(|held| held.close)
+    }
+
     /// Bytes held on the stream, so a caller can bound what one stream may
     /// make it keep.
     pub fn held_bytes(&self, conn_id: ConnectionId, stream_id: StreamId) -> usize {
@@ -71,24 +80,26 @@ impl HeldWrites {
 
     /// Holds `data` behind whatever the stream already holds.
     ///
-    /// `counted` is the length of the payload `data` was cut from. A tail
-    /// shorter than half of it is copied, so a held slice never pins a much
-    /// larger allocation (ADR 0012). Pass `data.len()` for a whole payload.
+    /// `counted` is the length of the payload `data` was cut from. A shorter
+    /// slice is copied into its own buffer: held writes are rare and small,
+    /// and an owned tail stays within ADR 0012's retained-memory bound
+    /// however often it is resent and comes back Full. Pass `data.len()` for
+    /// a whole payload.
     pub fn push(
         &mut self,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        data: Bytes,
+        mut data: Bytes,
         counted: usize,
     ) {
-        let data = if data.len().saturating_mul(2) < counted {
-            Bytes::copy_from_slice(&data)
-        } else {
-            data
-        };
-        let held = self.streams.entry((conn_id, stream_id)).or_default();
-        held.bytes += data.len();
-        held.tails.push_back(data);
+        if data.len() < counted {
+            data = Bytes::copy_from_slice(&data);
+        }
+        self.streams
+            .entry((conn_id, stream_id))
+            .or_default()
+            .tails
+            .push_back(data);
     }
 
     /// Defers a write-side close until the held bytes have been accepted.
@@ -118,6 +129,24 @@ impl HeldWrites {
     /// Drops every held write on a connection that ended.
     pub fn forget_connection(&mut self, conn_id: ConnectionId) {
         self.streams.retain(|(conn, _), _| *conn != conn_id);
+    }
+
+    /// Drops the tails a swarm event ends: a stream's write stop or close,
+    /// or its connection closing or being replaced.
+    pub fn observe(&mut self, event: &SwarmEvent) {
+        match event {
+            SwarmEvent::StreamClosed {
+                conn_id, stream_id, ..
+            }
+            | SwarmEvent::StreamWriteStopped {
+                conn_id, stream_id, ..
+            } => self.forget_stream(*conn_id, *stream_id),
+            SwarmEvent::ConnectionClosed { conn_id, .. }
+            | SwarmEvent::ConnectionReplaced { old: conn_id, .. } => {
+                self.forget_connection(*conn_id);
+            }
+            _ => {}
+        }
     }
 }
 

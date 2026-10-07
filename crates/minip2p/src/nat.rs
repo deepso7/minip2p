@@ -42,6 +42,9 @@ fn nat_event_reaches_application(event: &NatEvent) -> bool {
     )
 }
 
+/// Most bytes the NAT host holds for one stream before resetting it.
+const MAX_HELD_PER_STREAM: usize = 64 * 1024;
+
 /// Drives a [`NatAgent`] against the endpoint's swarm.
 pub(crate) struct NatDriver<E> {
     agent: NatAgent,
@@ -270,7 +273,7 @@ impl<E: EntropySource> NatDriver<E> {
         sample: PlatformNow,
     ) -> bool {
         self.sync_listen_addrs(swarm);
-        self.forget_held(event);
+        self.held.observe(event);
         self.stream_conns.observe(event);
         let now = to_nat_now(sample);
         if self.inject_straggler(event, swarm) {
@@ -765,14 +768,20 @@ impl<E: EntropySource> NatDriver<E> {
         let counted = data.len();
         if self.held.is_held(conn_id, stream_id) {
             self.held.push(conn_id, stream_id, data, counted);
-            return;
-        }
-        // Other failures surface through the agent's own timeouts and the
-        // swarm's error events, as for any NAT write.
-        if let Err(DriverError::Full { unsent, .. }) =
+        } else if let Err(DriverError::Full { unsent, .. }) =
             swarm.send_stream(peer, conn_id, stream_id, data, sample.monotonic_ms)
         {
+            // Other failures surface through the agent's own timeouts and the
+            // swarm's error events, as for any NAT write.
             self.held.push(conn_id, stream_id, unsent, counted);
+        }
+        // NAT messages are a few hundred bytes; a peer that leaves this much
+        // unread is not completing the exchange, so the stream goes.
+        if self.held.held_bytes(conn_id, stream_id) > MAX_HELD_PER_STREAM {
+            self.held.forget_stream(conn_id, stream_id);
+            match swarm.reset_stream(peer, conn_id, stream_id, sample.monotonic_ms) {
+                Ok(()) | Err(_) => {}
+            }
         }
     }
 
@@ -810,23 +819,6 @@ impl<E: EntropySource> NatDriver<E> {
         }
         if held.close {
             self.close_or_hold(peer, conn_id, stream_id, swarm, sample);
-        }
-    }
-
-    /// Drops held writes whose stream or connection ended.
-    fn forget_held(&mut self, event: &SwarmEvent) {
-        match event {
-            SwarmEvent::StreamClosed {
-                conn_id, stream_id, ..
-            }
-            | SwarmEvent::StreamWriteStopped {
-                conn_id, stream_id, ..
-            } => self.held.forget_stream(*conn_id, *stream_id),
-            SwarmEvent::ConnectionClosed { conn_id, .. }
-            | SwarmEvent::ConnectionReplaced { old: conn_id, .. } => {
-                self.held.forget_connection(*conn_id);
-            }
-            _ => {}
         }
     }
 

@@ -523,7 +523,7 @@ impl SwarmCore {
     /// it (see [`SwarmInput::SendFull`]).
     pub fn poll_output(&mut self) -> Option<SwarmOutput> {
         while let Some(action) = self.actions.pop_front() {
-            if let Some(action) = self.unless_held(action) {
+            if let Some(action) = self.hold_action(action) {
                 return Some(SwarmOutput::Action(action));
             }
         }
@@ -531,7 +531,7 @@ impl SwarmCore {
             return Some(SwarmOutput::Event(event));
         }
         while let Some(action) = self.after_event_actions.pop_front() {
-            if let Some(action) = self.unless_held(action) {
+            if let Some(action) = self.hold_action(action) {
                 return Some(SwarmOutput::Action(action));
             }
         }
@@ -549,12 +549,8 @@ impl SwarmCore {
     }
 
     /// Queues a write or close behind the stream's held bytes. Returns the
-    /// action back when the stream holds nothing.
+    /// action back when it may be dispatched now.
     pub fn hold_action(&mut self, action: SwarmAction) -> Option<SwarmAction> {
-        self.unless_held(action)
-    }
-
-    fn unless_held(&mut self, action: SwarmAction) -> Option<SwarmAction> {
         let Some((conn_id, stream_id)) = stream_write_key(&action) else {
             return Some(action);
         };
@@ -568,7 +564,9 @@ impl SwarmCore {
                 self.bound_held(conn_id, stream_id);
             }
             _ => {
+                // Writes are over, so a pending Writable never fires.
                 self.held.close_after(conn_id, stream_id);
+                self.user_writable_wanted.remove(&(conn_id, stream_id));
             }
         }
         None
@@ -625,7 +623,7 @@ impl SwarmCore {
                 self.actions
                     .push_back(SwarmAction::CloseStreamWrite { conn_id, stream_id });
             }
-            if !self.user_writable_wanted.remove(&key) {
+            if held.close || !self.user_writable_wanted.remove(&key) {
                 return;
             }
         }
@@ -813,6 +811,9 @@ impl SwarmCore {
         data: Bytes,
     ) -> Result<(), SwarmError> {
         self.require_user_stream(peer_id, conn_id, stream_id)?;
+        if self.held.is_closing(conn_id, stream_id) {
+            return Err(SwarmError::WriteClosed { conn_id, stream_id });
+        }
         if self.held.is_held(conn_id, stream_id) {
             self.user_writable_wanted.insert((conn_id, stream_id));
             return Err(SwarmError::Full {
@@ -3258,6 +3259,11 @@ mod tests {
         core.close_stream_write(&peer_id, conn_id, stream_id)
             .expect("close is accepted");
         assert!(drain_actions(&mut core).is_empty());
+        assert_eq!(
+            core.send_stream(&peer_id, conn_id, stream_id, Bytes::from_static(b"late")),
+            Err(SwarmError::WriteClosed { conn_id, stream_id }),
+            "writes after the close request are rejected"
+        );
 
         feed(
             &mut core,
@@ -3283,10 +3289,13 @@ mod tests {
             ],
             "the tail, then the queued echo, then the FIN"
         );
-        assert!(outputs.iter().any(|output| matches!(
-            output,
-            SwarmOutput::Event(SwarmEvent::StreamWritable { stream_id: id, .. }) if *id == stream_id
-        )));
+        assert!(
+            !outputs.iter().any(|output| matches!(
+                output,
+                SwarmOutput::Event(SwarmEvent::StreamWritable { .. })
+            )),
+            "no Writable after the write side closed"
+        );
     }
 
     #[test]

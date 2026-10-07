@@ -12,9 +12,10 @@
 //!
 //! The session owns no socket, no clock, and no executor. Callers feed it
 //! bytes read from the underlying stream with [`SecureMuxSession::handle_input`]
-//! and drain [`SessionOutput`] values with
-//! [`SecureMuxSession::poll_output`], writing every
-//! [`SessionOutput::Write`] back to that stream. After the upgrade,
+//! drain [`SessionOutput`] events with [`SecureMuxSession::poll_output`],
+//! and pull bytes for that stream with [`SecureMuxSession::poll_write`] while
+//! it has room -- frames are encrypted only when pulled, so a full downstream
+//! is backpressure rather than growing buffers. After the upgrade,
 //! [`SecureMuxSession::poll`] / [`SecureMuxSession::next_deadline`] drive
 //! Yamux keepalive from the host's time sample. `no_std + alloc`.
 //!

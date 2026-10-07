@@ -33,7 +33,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::{Bytes, Multiaddr, Protocol};
+use minip2p_core::{Bytes, Multiaddr, Protocol, retain_slice};
 use minip2p_identity::{Ed25519Keypair, PeerId};
 #[cfg(feature = "std")]
 use minip2p_platform::StdEntropy;
@@ -516,8 +516,10 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                 .send_stream(circuit.inner_conn, circuit.bridge_stream, bytes)
             {
                 Ok(()) => {}
-                Err(TransportError::Full { unsent, .. }) => {
-                    circuit.bridge_tail = Some(retain_tail(unsent, counted));
+                Err(TransportError::Full { mut unsent, .. }) => {
+                    let mut counted = counted;
+                    retain_slice(&mut unsent, &mut counted);
+                    circuit.bridge_tail = Some((unsent, counted));
                     return Ok(());
                 }
                 Err(error) => {
@@ -1048,18 +1050,6 @@ fn stream_error(
         | TransportError::InvalidState { .. }
         | TransportError::Full { .. }) => error,
         error => wrap(error.to_string()),
-    }
-}
-
-/// Keeps a refused bridge tail, copying it once it is shorter than half of
-/// what it was counted at so a slice cannot pin a much larger message
-/// (ADR 0012).
-fn retain_tail(unsent: Bytes, counted: usize) -> (Bytes, usize) {
-    if unsent.len().saturating_mul(2) < counted {
-        let len = unsent.len();
-        (Bytes::copy_from_slice(&unsent), len)
-    } else {
-        (unsent, counted)
     }
 }
 

@@ -2,6 +2,8 @@
 //! (ADR 0012): the writer sees `Full`, holds the unsent tail, resends it on
 //! `StreamWritable`, and every byte arrives in order before the FIN.
 
+#![cfg(feature = "std")]
+
 use std::time::{Duration, Instant};
 
 use minip2p::{
@@ -115,7 +117,7 @@ fn bulk_transfer_to_slow_reader(listen: &str, total: usize) {
                         tail = Some(unsent);
                         writable = false;
                     }
-                    Err(error) => panic!("send failed: {error}"),
+                    other => other.expect("send failed"),
                 }
             } else if !closed_write {
                 // Every byte is accepted, so the FIN may follow.

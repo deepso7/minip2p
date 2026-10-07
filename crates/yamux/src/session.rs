@@ -1,7 +1,7 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-use minip2p_core::Bytes;
+use minip2p_core::{Bytes, retain_slice};
 use minip2p_platform::{Deadline, Now};
 
 use crate::{
@@ -44,10 +44,7 @@ impl QueuedChunk {
     }
 
     fn bound_retained(&mut self) {
-        if self.bytes.len().saturating_mul(2) < self.original_len {
-            self.bytes = Bytes::copy_from_slice(&self.bytes);
-            self.original_len = self.bytes.len();
-        }
+        retain_slice(&mut self.bytes, &mut self.original_len);
     }
 }
 
@@ -165,8 +162,11 @@ pub struct YamuxSession {
     next_stream_id: Option<u32>,
     /// Stream events for [`poll_event`](Self::poll_event).
     events: VecDeque<YamuxOutput>,
-    /// Encoded control frames, pulled ahead of data frames.
-    control: VecDeque<Vec<u8>>,
+    /// Encoded control frames, pulled ahead of data frames, each marked
+    /// whether the peer provoked it.
+    control: VecDeque<(Vec<u8>, bool)>,
+    /// Peer-provoked frames in `control`: what the reserve bounds.
+    peer_control: usize,
     /// Streams whose last `send` was Full and that want a Writable.
     writable_armed: BTreeSet<u32>,
     /// Round-robin position for data frames: the last stream framed.
@@ -226,6 +226,7 @@ impl YamuxSession {
             next_stream_id,
             events: VecDeque::new(),
             control: VecDeque::new(),
+            peer_control: 0,
             writable_armed: BTreeSet::new(),
             send_cursor: 0,
             total_buffered_send: 0,
@@ -352,7 +353,7 @@ impl YamuxSession {
         if !state.local_write_closed {
             state.close_pending = true;
         }
-        self.writable_armed.remove(&stream);
+        self.disarm_writable(stream);
         Ok(())
     }
 
@@ -426,7 +427,8 @@ impl YamuxSession {
     /// remote credit. Pulling a data frame releases its bytes from the send
     /// caps, which may queue [`YamuxOutput::Writable`] events.
     pub fn poll_frame(&mut self) -> Option<Vec<u8>> {
-        if let Some(frame) = self.control.pop_front() {
+        if let Some((frame, provoked)) = self.control.pop_front() {
+            self.peer_control -= usize::from(provoked);
             return Some(frame);
         }
         if self.failed || self.local_go_away || self.remote_go_away {
@@ -776,12 +778,14 @@ impl YamuxSession {
     /// provoking replies without reading them exhausts it, which is a
     /// protocol violation that fails the session.
     fn queue_peer_control(&mut self, frame: Frame) -> Result<(), YamuxError> {
-        if self.control.len() >= self.config.max_pending_control {
+        if self.peer_control >= self.config.max_pending_control {
             return Err(YamuxError::ControlReserveExhausted {
                 limit: self.config.max_pending_control,
             });
         }
-        self.push_control(frame);
+        self.peer_control += 1;
+        self.dirty = true;
+        self.control.push_back((frame.encode(), true));
         Ok(())
     }
 
@@ -789,11 +793,19 @@ impl YamuxSession {
     /// bounded by local behaviour, not by the reserve.
     fn push_control(&mut self, frame: Frame) {
         self.dirty = true;
-        self.control.push_back(frame.encode());
+        self.control.push_back((frame.encode(), false));
+    }
+
+    /// Ends the stream's claim to a Writable, including one already queued:
+    /// its write side is over.
+    fn disarm_writable(&mut self, stream: u32) {
+        self.writable_armed.remove(&stream);
+        self.events
+            .retain(|event| *event != YamuxOutput::Writable { stream });
     }
 
     fn remove_stream(&mut self, stream: u32, emit: bool) {
-        self.writable_armed.remove(&stream);
+        self.disarm_writable(stream);
         if let Some(state) = self.streams.remove(&stream) {
             self.total_buffered_send -= state.buffered_send;
             if emit {
@@ -834,6 +846,7 @@ impl YamuxSession {
         self.decoder.clear();
         self.events.clear();
         self.control.clear();
+        self.peer_control = 0;
         self.push_control(Frame::go_away(1));
         for stream in streams {
             self.events.push_back(YamuxOutput::StreamClosed { stream });
@@ -1218,6 +1231,36 @@ mod tests {
             events.contains(&YamuxOutput::Writable { stream: blocked }),
             "freeing the shared cap must wake the blocked stream: {events:?}"
         );
+    }
+
+    #[test]
+    fn a_writable_already_queued_is_dropped_when_the_write_side_closes() {
+        let mut limits = config();
+        limits.max_buffered_send = 4;
+        let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        let stream = session.open_stream().unwrap();
+        assert!(matches!(
+            session.send(stream, Bytes::from_static(b"abcdef")),
+            Err(YamuxError::Full { .. })
+        ));
+        while session.poll_frame().is_some() {}
+        session.close_write(stream).unwrap();
+        assert_eq!(session.poll_event(), None);
+    }
+
+    #[test]
+    fn local_resets_do_not_spend_the_peer_control_reserve() {
+        let mut limits = config();
+        limits.max_pending_control = 1;
+        let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        for _ in 0..3 {
+            let stream = session.open_stream().unwrap();
+            assert!(session.poll_frame().is_some(), "announce the stream");
+            session.reset(stream).unwrap();
+        }
+        session
+            .handle_data(&Frame::ping(FLAG_SYN, 1).unwrap().encode())
+            .expect("one peer ping fits the reserve");
     }
 
     #[test]

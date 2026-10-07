@@ -72,10 +72,7 @@ impl PendingStreamWrite {
     }
 
     fn bound_retained(&mut self) {
-        if self.bytes.len().saturating_mul(2) < self.counted {
-            self.bytes = Bytes::copy_from_slice(&self.bytes);
-            self.counted = self.bytes.len();
-        }
+        minip2p_core::retain_slice(&mut self.bytes, &mut self.counted);
     }
 }
 
@@ -737,6 +734,8 @@ impl QuicConnection {
         self.stream_state_mut(stream_id)?;
         self.drop_send_queue(stream_id.as_u64());
         self.writable_armed.remove(&stream_id.as_u64());
+        // The freed queue may unblock streams waiting on the shared cap.
+        self.wake_writable(events);
         self.streams_dirty = true;
 
         // `Done` means quiche already shut that half down or collected the
@@ -1122,6 +1121,8 @@ impl QuicConnection {
         state.write_stopped = true;
         state.local_write_closed = true;
         self.drop_send_queue(stream_id.as_u64());
+        self.writable_armed.remove(&stream_id.as_u64());
+        self.wake_writable(events);
         events.push(TransportEvent::StreamWriteStopped {
             id: self.id,
             stream_id,

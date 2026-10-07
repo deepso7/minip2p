@@ -390,6 +390,13 @@ pub enum SwarmError {
     /// in flight on the target peer).
     #[error("ping error: {reason}")]
     PingError { reason: String },
+    /// The stream's write side was closed while the swarm still held bytes
+    /// for it; the FIN goes out after them and no further write is taken.
+    #[error("user stream {stream_id} on connection {conn_id} is closing its write side")]
+    WriteClosed {
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    },
     /// The stream cannot accept the write yet: the swarm is still holding
     /// its own negotiation bytes for it. Retryable; `unsent` is the whole
     /// payload, and [`SwarmEvent::StreamWritable`] follows.
