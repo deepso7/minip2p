@@ -313,6 +313,14 @@ impl QuicConnection {
         self.conn.is_closed()
     }
 
+    /// Whether a local close has begun, ending every write side.
+    pub(crate) fn is_closing(&self) -> bool {
+        matches!(
+            self.state,
+            ConnectionState::Closing | ConnectionState::Closed
+        )
+    }
+
     /// Returns the duration until quiche next needs timer service.
     pub(crate) fn timeout(&self) -> Option<Duration> {
         self.conn.timeout()
@@ -1093,12 +1101,7 @@ impl QuicConnection {
     /// the connection's queue is free. The queue is shared, so freeing it
     /// wakes every stream it blocked.
     fn wake_writable(&mut self, events: &mut Vec<TransportEvent>) {
-        if self.writable_armed.is_empty()
-            || matches!(
-                self.state,
-                ConnectionState::Closing | ConnectionState::Closed
-            )
-        {
+        if self.writable_armed.is_empty() || self.is_closing() {
             return;
         }
         let room = self

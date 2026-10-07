@@ -1626,10 +1626,14 @@ impl Transport for QuicTransport {
             &mut self.pending_datagrams,
             self.node_config.limits().max_pending_datagrams,
         );
-        // Nor may one a Full queued before the close.
-        self.pending_events.retain(
-            |event| !matches!(event, TransportEvent::StreamWritable { id: event_id, .. } if *event_id == id),
-        );
+        // Nor may one a Full queued before the close. A close that failed
+        // before it began leaves the connection open, so its Writables stand:
+        // their streams are no longer armed and would never wake again.
+        if conn.is_closing() {
+            self.pending_events.retain(
+                |event| !matches!(event, TransportEvent::StreamWritable { id: event_id, .. } if *event_id == id),
+            );
+        }
         result
     }
 
