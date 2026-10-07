@@ -966,6 +966,29 @@ test("peer streams that close without data before dispatch leave the queue whole
   endpoint.close();
 });
 
+test("a data listener attached after a clean close drains and consumes the unread bytes", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  backend.emit(streamData(new Uint8Array([1, 2]), 3));
+  for (const tag of [
+    P2pEvent_Tags.StreamRemoteWriteClosed,
+    P2pEvent_Tags.StreamClosed,
+  ]) {
+    backend.emit({ inner: { connId: 2, peerId: "peer", streamId: 3 }, tag });
+  }
+  await tick();
+
+  const chunks = [];
+  stream.on("data", (chunk) => chunks.push([...chunk]));
+
+  assert.deepEqual(chunks, [[1, 2]]);
+  assert.deepEqual(backend.consumed, [[2, 3, 2]]);
+  endpoint.close();
+});
+
 test("a data listener consumes a chunk when it returns", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);

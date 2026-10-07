@@ -777,8 +777,13 @@ export class Stream {
     }
   }
 
+  /**
+   * Hands buffered chunks to `data` handlers. After a clean close the
+   * buffer still holds the bytes that arrived before EOF (a failed stream
+   * has already discarded them), so a late handler drains it too.
+   */
   #flushFlowing(): void {
-    while (this.#fifo.length > 0 && !this.#closed) {
+    while (this.#fifo.length > 0) {
       const chunk = this.#fifo.shift();
       if (chunk !== undefined) {
         this.#fifoBytes -= chunk.byteLength;
