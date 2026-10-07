@@ -529,13 +529,16 @@ impl SwarmCore {
         }
         while let Some(event) = self.events.pop_front() {
             // A replayed tail that came back Full while this Writable waited
-            // holds the stream again: wait for the next Writable instead.
+            // holds the stream again: wait for the next Writable instead, or
+            // for none once a close is queued behind the held bytes.
             if let SwarmEvent::StreamWritable {
                 conn_id, stream_id, ..
             } = &event
                 && self.held.is_held(*conn_id, *stream_id)
             {
-                self.user_writable_wanted.insert((*conn_id, *stream_id));
+                if !self.held.is_closing(*conn_id, *stream_id) {
+                    self.user_writable_wanted.insert((*conn_id, *stream_id));
+                }
                 continue;
             }
             return Some(SwarmOutput::Event(event));
@@ -3360,6 +3363,39 @@ mod tests {
                 SwarmOutput::Event(SwarmEvent::StreamWritable { .. }),
             ]
         ));
+    }
+
+    #[test]
+    fn a_stale_writable_behind_a_queued_close_wakes_no_one() {
+        const PROTOCOL: &str = "/test/1";
+        let mut core = test_core();
+        core.add_protocol(PROTOCOL).expect("register protocol");
+        let peer_id = PeerId::from_public_key_protobuf(b"slow-reader");
+        let conn_id = ConnectionId::new(7);
+        let stream_id = StreamId::new(3);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User(PROTOCOL.to_string()));
+        core.handle_input(SwarmInput::SendFull {
+            conn_id,
+            stream_id,
+            unsent: Bytes::from_static(b"tail"),
+            counted: 4,
+        });
+        core.close_stream_write(&peer_id, conn_id, stream_id)
+            .expect("close is accepted");
+        assert!(drain_actions(&mut core).is_empty());
+
+        core.events.push_back(SwarmEvent::StreamWritable {
+            peer_id,
+            conn_id,
+            stream_id,
+        });
+        assert!(core.poll_output().is_none());
+        assert!(
+            !core.user_writable_wanted.contains(&(conn_id, stream_id)),
+            "a closing stream never waits for a Writable"
+        );
     }
 
     #[test]

@@ -1079,6 +1079,14 @@ impl QuicConnection {
         self.wake_writable(events);
     }
 
+    /// The peer ended the stream's write side: no Writable for it, not even
+    /// one an earlier wake already queued in this poll's events.
+    fn disarm_writable(&mut self, stream_id: StreamId, events: &mut Vec<TransportEvent>) {
+        self.writable_armed.remove(&stream_id.as_u64());
+        let id = self.id;
+        events.retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
+    }
+
     /// Emits `StreamWritable` for every armed stream once at least half of
     /// the connection's queue is free. The queue is shared, so freeing it
     /// wakes every stream it blocked.
@@ -1127,7 +1135,7 @@ impl QuicConnection {
         state.write_stopped = true;
         state.local_write_closed = true;
         self.drop_send_queue(stream_id.as_u64());
-        self.writable_armed.remove(&stream_id.as_u64());
+        self.disarm_writable(stream_id, events);
         self.wake_writable(events);
         events.push(TransportEvent::StreamWriteStopped {
             id: self.id,
@@ -1198,7 +1206,7 @@ impl QuicConnection {
     /// longer be delivered.
     fn note_stream_reset(&mut self, stream_id: StreamId, events: &mut Vec<TransportEvent>) {
         self.drop_send_queue(stream_id.as_u64());
-        self.writable_armed.remove(&stream_id.as_u64());
+        self.disarm_writable(stream_id, events);
         // The freed queue may unblock streams waiting on the shared cap.
         self.wake_writable(events);
         let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) else {

@@ -708,3 +708,73 @@ fn a_peer_reset_disarms_its_stream_while_the_queue_stays_full() {
     );
     assert_eq!(server.connections[&id].writable_armed_count(), 1);
 }
+
+#[test]
+fn a_peer_reset_retracts_a_writable_queued_before_the_poll() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 4_000,
+        ..QuicLimits::default()
+    };
+    let mut server = QuicTransport::new(
+        QuicNodeConfig::generate().with_limits(limits),
+        "127.0.0.1:0",
+    )
+    .expect("bind server");
+    server.listen_on_bound_addr().expect("listen");
+    let (mut peer, id) = accept(&mut server, &mut [], |config| {
+        config.set_initial_max_stream_data_bidi_local(1_000);
+    });
+    peer.conn.stream_send(0, b"a", false).expect("open 0");
+    peer.conn.stream_send(4, b"b", false).expect("open 4");
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "inbound streams",
+        |events| {
+            events
+                .iter()
+                .filter(|event| matches!(event, TransportEvent::StreamData { .. }))
+                .count()
+                == 2
+        },
+    );
+    let (filler, reset) = (StreamId::new(0), StreamId::new(4));
+    for stream in [filler, reset] {
+        assert!(matches!(
+            server.send_stream(id, stream, Bytes::from(vec![7; 10_000])),
+            Err(TransportError::Full { .. })
+        ));
+    }
+
+    // The peer's reset is on the wire when the application resets the
+    // filler, which frees the shared queue and queues a Writable for the
+    // other stream before the next poll reads that reset.
+    peer.conn
+        .stream_shutdown(4, quiche::Shutdown::Write, 5)
+        .expect("reset");
+    peer.flush();
+    std::thread::sleep(Duration::from_millis(20));
+    server.reset_stream(id, filler).expect("local reset");
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "reset",
+        |events| {
+            events.contains(&TransportEvent::StreamClosed {
+                id,
+                stream_id: reset,
+            })
+        },
+    );
+    assert!(
+        !events.contains(&TransportEvent::StreamWritable {
+            id,
+            stream_id: reset,
+        }),
+        "no Writable for a reset stream: {events:?}"
+    );
+}

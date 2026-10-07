@@ -391,7 +391,9 @@ export interface P2pEndpointLike {
  * Sends bytes on a stream, named by its connection and stream ids.
  *
  * Returns `true` once every byte is accepted, or `false` when the rest is
- * held and `StreamWriteAccepted` will follow.
+ * held: `StreamWriteAccepted` follows once it is accepted, unless the
+ * write side ends first (`StreamWriteStopped`, `StreamClosed`, a reset,
+ * or the connection closing or being replaced), which drops the tail.
  */
     sendStream(peerId: string, connId: bigint, streamId: bigint, data: ArrayBuffer) /*throws*/: boolean;
 /**
@@ -868,7 +870,9 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
  * Sends bytes on a stream, named by its connection and stream ids.
  *
  * Returns `true` once every byte is accepted, or `false` when the rest is
- * held and `StreamWriteAccepted` will follow.
+ * held: `StreamWriteAccepted` follows once it is accepted, unless the
+ * write side ends first (`StreamWriteStopped`, `StreamClosed`, a reset,
+ * or the connection closing or being replaced), which drops the tail.
  */
     sendStream(peerId: string, connId: bigint, streamId: bigint, data: ArrayBuffer): boolean /*throws*/ {
     return FfiConverterBool.lift(uniffiCaller.rustCallWithError(
@@ -1166,7 +1170,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_reset_stream() !== 50205) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_reset_stream");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream() !== 16134) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream() !== 41451) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_set_active() !== 10522) {
