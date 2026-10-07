@@ -39,6 +39,7 @@ minip2p-rs|default|nat,portable-relay,pubsub
 minip2p-tcp|default|smoltcp
 minip2p-mdns|default|smoltcp
 minip2p-transport|default|bench
+minip2p-quic|default|diagnostics
 EOF
 )
 

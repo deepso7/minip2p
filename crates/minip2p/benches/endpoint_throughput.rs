@@ -17,6 +17,15 @@
 //!   target reaches the total. Setup, handshakes and the relayed circuit-close
 //!   check stay outside that interval.
 //!
+//! The QUIC-carried cases (`quic`, and `relayed`, whose circuit runs over two
+//! QUIC legs through the relay) also report, from the timing pass, each
+//! Endpoint's UDP datagrams per direction: `datagrams_per_mb` and
+//! `avg_datagram_bytes`, under `endpoint_throughput/{case}/{endpoint}/{sent,
+//! received}` for the client, the target and, in `relayed`, the relay (both
+//! of its legs together). They count datagrams the Endpoint's QUIC sockets
+//! actually sent or received, not packets quiche generated, from the
+//! `diagnostics` counters of `minip2p-quic` that the `bench` feature enables.
+//!
 //! Allocations come from `stats_alloc`, installed as this binary's global
 //! allocator, and cover every thread in the process (sender, target and, for
 //! `relayed`, relay). A reallocation counts as one allocation, and only its
@@ -46,6 +55,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use minip2p::{Endpoint, EndpointEvent, PeerId, RelayServerEvent};
+use minip2p_quic::{DatagramCounters, datagram_counters};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Stats, StatsAlloc};
 use support::{Driven, Relayed, SETUP_TIMEOUT, bind_on, bind_relay, is_backpressure, next_event};
 
@@ -63,16 +73,36 @@ const IN_FLIGHT: u64 = 8;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 const MB: u64 = 1 << 20;
 
-/// A point in a transfer: wall clock and process allocation counters.
+/// The Endpoints of a case whose datagrams are counted, by role: at most
+/// three, the capacity of a [`Mark`].
+#[derive(Clone)]
+struct Roles(Vec<(&'static str, PeerId)>);
+
+impl Roles {
+    fn new(roles: Vec<(&'static str, PeerId)>) -> Self {
+        assert!(roles.len() <= 3, "a mark counts at most three roles");
+        Self(roles)
+    }
+}
+
+/// A point in a transfer: wall clock, process allocation counters, and each
+/// role's datagram counters (in [`Roles`] order, at most three).
 struct Mark {
     at: Instant,
     allocs: Stats,
+    datagrams: [DatagramCounters; 3],
 }
 
 impl Mark {
-    fn now() -> Self {
+    fn now(roles: &Roles) -> Self {
+        // A fixed array, so taking the mark allocates nothing.
+        let mut datagrams = [DatagramCounters::default(); 3];
+        for (slot, (_, peer)) in datagrams.iter_mut().zip(&roles.0) {
+            *slot = datagram_counters(peer);
+        }
         Self {
             allocs: GLOBAL.stats(),
+            datagrams,
             at: Instant::now(),
         }
     }
@@ -87,7 +117,7 @@ struct Progress {
 /// Drives `target` on its own thread as the sink: it counts bytes on the
 /// newest inbound stream, publishes the count, wakes the client, and sends a
 /// [`Mark`] once [`TOTAL`] bytes arrived.
-fn spawn_sink(target: Endpoint, client: &Endpoint) -> (Driven, Progress) {
+fn spawn_sink(target: Endpoint, client: &Endpoint, roles: Roles) -> (Driven, Progress) {
     let received = Arc::new(AtomicU64::new(0));
     let (done_tx, done) = mpsc::channel();
     let wake = client.wait_handle();
@@ -113,7 +143,9 @@ fn spawn_sink(target: Endpoint, client: &Endpoint) -> (Driven, Progress) {
             // next transfer cannot be overwritten by this one's final count.
             shared.store(count, Ordering::Release);
             if count == TOTAL {
-                done_tx.send(Mark::now()).expect("report transfer end");
+                done_tx
+                    .send(Mark::now(&roles))
+                    .expect("report transfer end");
             }
             wake.interrupt();
         }
@@ -124,7 +156,12 @@ fn spawn_sink(target: Endpoint, client: &Endpoint) -> (Driven, Progress) {
 
 /// Opens a stream and moves [`TOTAL`] bytes over it, returning the marks
 /// taken just before the first write and when the sink got the last byte.
-fn transfer(client: &mut Endpoint, peer: &PeerId, progress: &Progress) -> (Mark, Mark) {
+fn transfer(
+    client: &mut Endpoint,
+    peer: &PeerId,
+    progress: &Progress,
+    roles: &Roles,
+) -> (Mark, Mark) {
     progress.received.store(0, Ordering::Release);
     let (conn, stream) = client.open_stream(peer, PROTOCOL).expect("open stream");
     let deadline = Instant::now() + SETUP_TIMEOUT;
@@ -143,7 +180,7 @@ fn transfer(client: &mut Endpoint, peer: &PeerId, progress: &Progress) -> (Mark,
     }
 
     let chunk = vec![0x5a; CHUNK];
-    let start = Mark::now();
+    let start = Mark::now(roles);
     let deadline = start.at + TRANSFER_TIMEOUT;
     let mut sent = 0;
     let end = loop {
@@ -177,9 +214,9 @@ fn transfer(client: &mut Endpoint, peer: &PeerId, progress: &Progress) -> (Mark,
     (start, end)
 }
 
-/// The rows for one case: throughput from the timing pass, allocations from
-/// the allocation pass.
-fn rows(case: &str, timing: (Mark, Mark), allocation: (Mark, Mark)) -> Vec<String> {
+/// The rows for one case: throughput and datagrams from the timing pass,
+/// allocations from the allocation pass.
+fn rows(case: &str, roles: &Roles, timing: (Mark, Mark), allocation: (Mark, Mark)) -> Vec<String> {
     let megabytes = (TOTAL / MB) as f64;
     let mb_per_s = megabytes / (timing.1.at - timing.0.at).as_secs_f64();
     let allocs = allocation.1.allocs - allocation.0.allocs;
@@ -190,18 +227,40 @@ fn rows(case: &str, timing: (Mark, Mark), allocation: (Mark, Mark)) -> Vec<Strin
          ({} allocations + {} reallocations), {bytes_allocated_per_mb:.0} bytes allocated/MB",
         allocs.allocations, allocs.reallocations,
     );
-    [
+    let mut rows: Vec<(String, &str, f64)> = [
         ("mb_per_s", mb_per_s),
         ("allocs_per_mb", allocs_per_mb),
         ("bytes_allocated_per_mb", bytes_allocated_per_mb),
     ]
     .into_iter()
-    .map(|(metric, value)| {
-        format!(
-            r#"{{"tier":"rust-wall","name":"endpoint_throughput/{case}","metric":"{metric}","value":{value}}}"#
-        )
-    })
-    .collect()
+    .map(|(metric, value)| (format!("endpoint_throughput/{case}"), metric, value))
+    .collect();
+
+    let marks = timing.0.datagrams.iter().zip(&timing.1.datagrams);
+    for ((role, _), (start, end)) in roles.0.iter().zip(marks) {
+        let counts = end.since(start);
+        for (direction, datagrams, bytes) in [
+            ("sent", counts.sent, counts.sent_bytes),
+            ("received", counts.received, counts.received_bytes),
+        ] {
+            assert!(datagrams > 0, "{case}: the {role} {direction} no datagrams");
+            let datagrams_per_mb = datagrams as f64 / megabytes;
+            let avg_datagram_bytes = bytes as f64 / datagrams as f64;
+            println!(
+                "endpoint_throughput/{case}/{role}/{direction}: {datagrams_per_mb:.1} datagrams/MB, \
+                 {avg_datagram_bytes:.0} bytes/datagram"
+            );
+            let name = format!("endpoint_throughput/{case}/{role}/{direction}");
+            rows.push((name.clone(), "datagrams_per_mb", datagrams_per_mb));
+            rows.push((name, "avg_datagram_bytes", avg_datagram_bytes));
+        }
+    }
+
+    rows.into_iter()
+        .map(|(name, metric, value)| {
+            format!(r#"{{"tier":"rust-wall","name":"{name}","metric":"{metric}","value":{value}}}"#)
+        })
+        .collect()
 }
 
 /// A client connected directly to a target over one transport.
@@ -222,15 +281,19 @@ fn direct(listen: &str) -> Vec<String> {
         );
     }
 
-    let (_sink, progress) = spawn_sink(target, &client);
-    let timing = transfer(&mut client, &peer, &progress);
-    let allocation = transfer(&mut client, &peer, &progress);
-    let case = if listen.contains("/tcp/") {
-        "tcp"
+    let (case, roles) = if listen.contains("/tcp/") {
+        ("tcp", Roles::new(Vec::new()))
     } else {
-        "quic"
+        let client_peer = client.peer_id().clone();
+        (
+            "quic",
+            Roles::new(vec![("client", client_peer), ("target", peer.clone())]),
+        )
     };
-    rows(case, timing, allocation)
+    let (_sink, progress) = spawn_sink(target, &client, roles.clone());
+    let timing = transfer(&mut client, &peer, &progress, &roles);
+    let allocation = transfer(&mut client, &peer, &progress, &roles);
+    rows(case, &roles, timing, allocation)
 }
 
 fn relayed() -> Vec<String> {
@@ -246,9 +309,14 @@ fn relayed() -> Vec<String> {
             closed_tx.send(bytes).expect("report circuit close");
         }
     });
-    let (_sink, progress) = spawn_sink(target, &client);
-    let timing = transfer(&mut client, &target_peer, &progress);
-    let allocation = transfer(&mut client, &target_peer, &progress);
+    let roles = Roles::new(vec![
+        ("client", client.peer_id().clone()),
+        ("target", target_peer.clone()),
+        ("relay", relay_addr.peer_id().clone()),
+    ]);
+    let (_sink, progress) = spawn_sink(target, &client, roles.clone());
+    let timing = transfer(&mut client, &target_peer, &progress, &roles);
+    let allocation = transfer(&mut client, &target_peer, &progress, &roles);
 
     client.disconnect(&target_peer).expect("close circuit");
     let deadline = Instant::now() + SETUP_TIMEOUT;
@@ -268,7 +336,7 @@ fn relayed() -> Vec<String> {
         bytes.source_to_destination,
         2 * TOTAL
     );
-    rows("relayed", timing, allocation)
+    rows("relayed", &roles, timing, allocation)
 }
 
 fn main() {

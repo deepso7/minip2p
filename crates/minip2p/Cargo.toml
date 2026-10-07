@@ -49,9 +49,11 @@ relay-server = ["std", "dep:minip2p-relay-server"]
 pubsub = ["dep:minip2p-pubsub"]
 discovery = ["nat", "pubsub", "_discovery-driver"]
 mdns = ["nat", "dep:minip2p-mdns", "_discovery-driver"]
-# Bench-only `TransportSet` wait counters (`minip2p_transport::bench`), read by
-# the `endpoint_idle` bench. Off by default and compiled out when off.
-bench = ["std", "minip2p-transport/bench"]
+# Bench-only counters, off by default and compiled out when off:
+# `TransportSet` wait counters (`minip2p_transport::bench`), read by the
+# `endpoint_idle` bench, and QUIC datagram counters (`minip2p-quic`'s
+# `diagnostics`), read by the `endpoint_throughput` bench.
+bench = ["std", "minip2p-transport/bench", "minip2p-quic?/diagnostics"]
 # Internal aliases for capability-driver dependencies, reached only through
 # the public features above; not a supported opt-in surface.
 _circuit-driver = ["dep:minip2p-circuit"]
@@ -97,7 +99,7 @@ required-features = ["quic", "tcp", "relay-server", "pubsub", "mdns", "bench"]
 [[bench]]
 name = "endpoint_throughput"
 harness = false
-required-features = ["quic", "tcp", "nat", "relay-server"]
+required-features = ["quic", "tcp", "nat", "relay-server", "bench"]
 
 [[bench]]
 name = "endpoint_ping_load"

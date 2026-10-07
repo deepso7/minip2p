@@ -33,14 +33,20 @@ pub(crate) struct PendingDatagram {
 
 mod config;
 mod connection;
+mod diagnostics;
 #[cfg(test)]
 mod pacing_tests;
+#[cfg(test)]
+mod recv_batch_tests;
 #[cfg(test)]
 mod stream_send_tests;
 
 pub use config::{QuicLimits, QuicNodeConfig};
+#[cfg(feature = "diagnostics")]
+pub use diagnostics::{ConnectionDiagnostics, DatagramCounters, datagram_counters};
 
 use connection::QuicConnection;
+use diagnostics::{ConnectionCounters, DatagramTally};
 
 const DEFAULT_IPV4_BIND: &str = "0.0.0.0:0";
 const DEFAULT_IPV6_BIND: &str = "[::]:0";
@@ -432,6 +438,8 @@ pub struct QuicTransport {
     /// Most recent host time sample, retained so `next_deadline` can answer on
     /// the host's timeline. `None` until the first `poll`.
     last_now: Option<Now>,
+    /// Socket datagram counts; empty unless the `diagnostics` feature is on.
+    tally: DatagramTally,
 }
 
 /// QUIC endpoint that can be backed by one socket or a dual-stack pair.
@@ -700,6 +708,15 @@ impl QuicEndpoint {
         }
     }
 
+    /// A live connection's diagnostic counters (`diagnostics` feature).
+    #[cfg(feature = "diagnostics")]
+    pub fn connection_diagnostics(&self, id: ConnectionId) -> Option<ConnectionDiagnostics> {
+        match self {
+            Self::Single(transport) => transport.connection_diagnostics(id),
+            Self::Dual(transport) => transport.connection_diagnostics(id),
+        }
+    }
+
     /// Returns a cloneable handle that can interrupt this endpoint's current
     /// readiness wait from another thread.
     pub fn wait_handle(&self) -> WaitHandle {
@@ -778,6 +795,13 @@ impl DualQuicTransport {
     pub fn send_raw_udp(&self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
         let family = family_for_socket_addr(dial_socket_addr(target, "raw udp target")?);
         self.transport(family).send_raw_udp(target, payload)
+    }
+
+    /// A live connection's diagnostic counters (`diagnostics` feature).
+    #[cfg(feature = "diagnostics")]
+    pub fn connection_diagnostics(&self, id: ConnectionId) -> Option<ConnectionDiagnostics> {
+        self.transport(Self::family_for_id(id).ok()?)
+            .connection_diagnostics(id)
     }
 
     fn transport(&self, family: AddressFamily) -> &QuicTransport {
@@ -910,6 +934,7 @@ impl QuicTransport {
             listen_addr: None,
             connection_ids: ConnectionIdAllocator::new(namespace),
             last_now: None,
+            tally: DatagramTally::register(&node_config.peer_id()),
             node_config,
             retry_secret,
         })
@@ -935,6 +960,7 @@ impl QuicTransport {
             .map_err(|e| TransportError::PollError {
                 reason: format!("raw udp send to {addr} failed: {e}"),
             })?;
+        self.tally.sent(payload.len());
         Ok(())
     }
 
@@ -952,6 +978,12 @@ impl QuicTransport {
     /// Returns this node's `PeerId`, derived from the configured keypair.
     pub fn local_peer_id(&self) -> PeerId {
         self.node_config.peer_id()
+    }
+
+    /// A live connection's diagnostic counters (`diagnostics` feature).
+    #[cfg(feature = "diagnostics")]
+    pub fn connection_diagnostics(&self, id: ConnectionId) -> Option<ConnectionDiagnostics> {
+        self.connections.get(&id).map(QuicConnection::diagnostics)
     }
 
     /// Returns a `PeerAddr` that other nodes can use to dial this transport.
@@ -1048,6 +1080,7 @@ impl QuicTransport {
         while let Some(datagram) = self.pending_datagrams.front() {
             match self.socket.send_to(&datagram.bytes, datagram.destination) {
                 Ok(_) => {
+                    self.tally.sent(datagram.bytes.len());
                     self.pending_datagrams.pop_front();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -1070,7 +1103,7 @@ impl QuicTransport {
     /// backpressure on a pre-connection packet must never abort `poll()`.
     fn send_stateless_datagram(&mut self, bytes: &[u8], destination: SocketAddr) {
         match self.socket.send_to(bytes, destination) {
-            Ok(_) => {}
+            Ok(_) => self.tally.sent(bytes.len()),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 self.queue_datagram_best_effort(bytes, destination);
             }
@@ -1090,6 +1123,291 @@ impl QuicTransport {
             bytes: bytes.to_vec(),
             destination,
         });
+    }
+
+    /// Reads up to [`MAX_DATAGRAMS_PER_POLL`] datagrams and routes each to its
+    /// connection, accepting new ones. Established connections only queue
+    /// output here; [`Self::sweep_connections`] flushes it.
+    fn recv_batch(&mut self, now: Now) -> Result<(), TransportError> {
+        let mut buf = [0u8; 65535];
+
+        for _ in 0..MAX_DATAGRAMS_PER_POLL {
+            let (len, from) = match self.socket.recv_from(&mut buf) {
+                Ok(v) => v,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    return Err(TransportError::PollError {
+                        reason: format!("udp recv error: {e}"),
+                    });
+                }
+            };
+
+            self.tally.received(len);
+            let local_addr = self.bound_addr;
+            let packet = buf
+                .get_mut(..len)
+                .expect("UDP receive lengths fit the supplied buffer");
+
+            let parsed_header = quiche::Header::from_slice(packet, quiche::MAX_CONN_ID_LEN).ok();
+            let mut target_conn_id = parsed_header
+                .as_ref()
+                .and_then(|header| self.cid_to_connection.get(header.dcid.as_ref()).copied());
+
+            let oversized_new_initial_token = parsed_header.as_ref().is_some_and(|header| {
+                target_conn_id.is_none()
+                    && self.listen_addr.is_some()
+                    && header.ty == quiche::Type::Initial
+                    && header.token.as_deref().is_some_and(|token| {
+                        reject_oversized_retry_token(
+                            self.node_config.limits().require_address_validation,
+                            token,
+                        )
+                    })
+            });
+            if oversized_new_initial_token {
+                continue;
+            }
+
+            // Only copy header fields for a genuinely new Initial. Established
+            // packet routing stays allocation-free.
+            let new_initial = parsed_header.as_ref().and_then(|header| {
+                (target_conn_id.is_none()
+                    && self.listen_addr.is_some()
+                    && header.ty == quiche::Type::Initial)
+                    .then(|| {
+                        (
+                            header.scid.as_ref().to_vec(),
+                            header.dcid.as_ref().to_vec(),
+                            header.token.as_deref().unwrap_or_default().to_vec(),
+                            header.version,
+                        )
+                    })
+            });
+            drop(parsed_header);
+
+            if let Some((client_scid, client_dcid, token, version)) = new_initial {
+                if self.connections.len() >= self.node_config.limits().max_connections {
+                    continue;
+                }
+
+                let (scid, odcid) = if self.node_config.limits().require_address_validation {
+                    if token.is_empty() {
+                        let retry_scid =
+                            Self::generate_scid().map_err(|e| TransportError::PollError {
+                                reason: format!("failed to generate Retry connection id: {e}"),
+                            })?;
+                        let retry_token = mint_retry_token(
+                            &self.retry_secret,
+                            from,
+                            &client_dcid,
+                            unix_time_secs(),
+                        );
+                        let mut out = [0u8; 1350];
+                        let written = quiche::retry(
+                            &QuicConnectionId::from_ref(&client_scid),
+                            &QuicConnectionId::from_ref(&client_dcid),
+                            &retry_scid,
+                            &retry_token,
+                            version,
+                            &mut out,
+                        )
+                        .map_err(|e| TransportError::PollError {
+                            reason: format!("failed to encode QUIC Retry: {e}"),
+                        })?;
+                        // Best-effort: a dropped Retry is regenerated when
+                        // the client retransmits its Initial.
+                        let retry_packet = out
+                            .get(..written)
+                            .expect("quiche writes Retry packets within the supplied buffer");
+                        self.send_stateless_datagram(retry_packet, from);
+                        continue;
+                    }
+
+                    let Some(odcid) =
+                        validate_retry_token(&self.retry_secret, from, &token, unix_time_secs())
+                    else {
+                        continue;
+                    };
+                    (QuicConnectionId::from_vec(client_dcid.clone()), Some(odcid))
+                } else {
+                    (
+                        Self::generate_scid().map_err(|e| TransportError::PollError {
+                            reason: format!("failed to generate server connection id: {e}"),
+                        })?,
+                        None,
+                    )
+                };
+
+                let quiche_conn = quiche::accept(
+                    &scid,
+                    odcid.as_ref(),
+                    local_addr,
+                    from,
+                    &mut self.quiche_config,
+                )
+                .map_err(|e| TransportError::PollError {
+                    reason: format!("quiche accept error: {e}"),
+                })?;
+
+                let id = self.allocate_connection_id()?;
+                let endpoint = ConnectionEndpoint::new(socket_addr_to_multiaddr(from));
+                let mut conn = QuicConnection::new(
+                    id,
+                    quiche_conn,
+                    endpoint.clone(),
+                    self.node_config.limits().max_streams_per_connection,
+                    self.node_config.limits().max_pending_stream_bytes,
+                    ConnectionCounters::new(self.tally.clone()),
+                );
+                for cid in conn.take_unindexed_source_cids() {
+                    self.cid_to_connection.insert(cid, id);
+                }
+                conn.note_indexed_cid(client_dcid.clone());
+
+                if self.connections.insert(id, conn).is_some() {
+                    return Err(TransportError::PollError {
+                        reason: format!("connection id collision for incoming connection {id}"),
+                    });
+                }
+
+                self.cid_to_connection.insert(client_dcid, id);
+                self.pending_events
+                    .push(TransportEvent::IncomingConnection { id, endpoint });
+                target_conn_id = Some(id);
+            }
+
+            // Never route an unknown CID by source address: peers behind one
+            // NAT share it. The one packet a live connection receives with an
+            // unknown CID is a stateless reset, which is routed by its token.
+            // Anything else is dropped.
+            if target_conn_id.is_none() {
+                target_conn_id = stateless_reset_token(packet)
+                    .and_then(|token| self.reset_token_to_connection.get(&token).copied());
+            }
+
+            if let Some(id) = target_conn_id {
+                let mut new_cids = Vec::new();
+                let mut retired_cids = Vec::new();
+                let mut reset_token = None;
+                let mut identity_update: Option<(Option<PeerId>, ConnectionEndpoint)> = None;
+                if let Some(conn) = self.connections.get_mut(&id) {
+                    let previous_peer_id = conn.endpoint().peer_id().cloned();
+                    conn.recv_packet(
+                        packet,
+                        from,
+                        local_addr,
+                        now,
+                        &self.socket,
+                        &mut self.pending_events,
+                        &mut self.pending_datagrams,
+                        self.node_config.limits().max_pending_datagrams,
+                    )?;
+                    // Source CIDs and the peer's reset token only change while
+                    // packets are processed, so indexing here keeps the routing
+                    // tables current without a per-poll sweep over every
+                    // connection.
+                    new_cids = conn.take_unindexed_source_cids();
+                    retired_cids = conn.take_retired_source_cids();
+                    reset_token = conn.take_unindexed_reset_token();
+                    if conn.endpoint().peer_id() != previous_peer_id.as_ref() {
+                        identity_update = Some((previous_peer_id, conn.endpoint().clone()));
+                    }
+                }
+
+                for cid in new_cids {
+                    self.cid_to_connection.insert(cid, id);
+                }
+                for cid in retired_cids {
+                    self.cid_to_connection.remove(&cid);
+                }
+                if let Some(token) = reset_token {
+                    // First claim wins, so a peer cannot hijack another
+                    // connection's resets by advertising the same token.
+                    self.reset_token_to_connection.entry(token).or_insert(id);
+                }
+
+                if let Some((previous_peer_id, endpoint)) = identity_update {
+                    if let Some(previous) = previous_peer_id.as_ref() {
+                        self.remove_peer_connection(previous, id);
+                    }
+
+                    if let Some(peer_id) = endpoint.peer_id() {
+                        self.index_peer_connection(peer_id.clone(), id);
+                    }
+
+                    self.pending_events
+                        .push(TransportEvent::PeerIdentityVerified {
+                            id,
+                            endpoint,
+                            previous_peer_id,
+                        });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Services timers, keepalives and stream I/O on every connection,
+    /// flushing each once, then retires the closed ones. A connection whose
+    /// service fails does not stop the sweep; the first error is returned.
+    fn sweep_connections(&mut self, now: Now) -> Result<(), TransportError> {
+        let mut to_remove = Vec::new();
+        let mut first_error = None;
+        let keepalive_interval_ms =
+            keepalive_interval_ms(self.node_config.limits().idle_timeout_ms);
+        let max_pending_datagrams = self.node_config.limits().max_pending_datagrams;
+        {
+            let (connections, pending_events, pending_datagrams, stream_read_buffer) = (
+                &mut self.connections,
+                &mut self.pending_events,
+                &mut self.pending_datagrams,
+                &mut self.stream_read_buffer,
+            );
+            for (&id, conn) in connections.iter_mut() {
+                let mut service = || {
+                    conn.handle_timeout(
+                        &self.socket,
+                        pending_events,
+                        pending_datagrams,
+                        max_pending_datagrams,
+                    )?;
+                    conn.maybe_keepalive(
+                        now,
+                        keepalive_interval_ms,
+                        &self.socket,
+                        pending_events,
+                        pending_datagrams,
+                        max_pending_datagrams,
+                    )?;
+                    conn.poll_streams(
+                        pending_events,
+                        &self.socket,
+                        stream_read_buffer,
+                        pending_datagrams,
+                        max_pending_datagrams,
+                    )
+                };
+                // One connection's failure must not strand the output the
+                // others deferred while receiving, so keep sweeping and
+                // report the first error.
+                if let Err(error) = service() {
+                    first_error.get_or_insert(error);
+                }
+
+                if conn.is_closed() {
+                    to_remove.push(id);
+                }
+            }
+        }
+
+        for id in to_remove {
+            if let Some(conn) = self.connections.remove(&id) {
+                self.unindex_connection(id, &conn);
+            }
+            self.pending_events.push(TransportEvent::Closed { id });
+        }
+
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -1138,6 +1456,9 @@ impl Transport for QuicTransport {
             reason: format!("quiche connect error: {e}"),
         })?;
 
+        let mut counters = ConnectionCounters::new(self.tally.clone());
+        counters.flush();
+        let full_packet = quiche_conn.max_send_udp_payload_size();
         let mut out = [0u8; 1350];
         // A fresh connection's first flight is inside quiche's initial unpaced
         // burst, so `SendInfo::at` needs no honouring here; `flush` paces the
@@ -1157,8 +1478,9 @@ impl Transport for QuicTransport {
             let packet = out
                 .get(..written)
                 .expect("quiche reports packet lengths within the supplied buffer");
+            counters.packet(written, full_packet);
             match self.socket.send_to(packet, send_info.to) {
-                Ok(_) => {}
+                Ok(_) => counters.sent(written),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Transient backpressure must not fail the dial. Retain
                     // the packet best-effort -- like `flush` does for
@@ -1184,6 +1506,7 @@ impl Transport for QuicTransport {
             ConnectionEndpoint::from_peer_addr(addr),
             self.node_config.limits().max_streams_per_connection,
             self.node_config.limits().max_pending_stream_bytes,
+            counters,
         );
         for cid in conn.take_unindexed_source_cids() {
             self.cid_to_connection.insert(cid, id);
@@ -1322,267 +1645,14 @@ impl Transport for QuicTransport {
         // are only taken at the very end, so any error path leaves the batch
         // queued for the next call instead of dropping it.
         self.flush_pending_datagrams()?;
-        let mut buf = [0u8; 65535];
-
-        for _ in 0..MAX_DATAGRAMS_PER_POLL {
-            let (len, from) = match self.socket.recv_from(&mut buf) {
-                Ok(v) => v,
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    return Err(TransportError::PollError {
-                        reason: format!("udp recv error: {e}"),
-                    });
-                }
-            };
-
-            let local_addr = self.bound_addr;
-            let packet = buf
-                .get_mut(..len)
-                .expect("UDP receive lengths fit the supplied buffer");
-
-            let parsed_header = quiche::Header::from_slice(packet, quiche::MAX_CONN_ID_LEN).ok();
-            let mut target_conn_id = parsed_header
-                .as_ref()
-                .and_then(|header| self.cid_to_connection.get(header.dcid.as_ref()).copied());
-
-            let oversized_new_initial_token = parsed_header.as_ref().is_some_and(|header| {
-                target_conn_id.is_none()
-                    && self.listen_addr.is_some()
-                    && header.ty == quiche::Type::Initial
-                    && header.token.as_deref().is_some_and(|token| {
-                        reject_oversized_retry_token(
-                            self.node_config.limits().require_address_validation,
-                            token,
-                        )
-                    })
-            });
-            if oversized_new_initial_token {
-                continue;
-            }
-
-            // Only copy header fields for a genuinely new Initial. Established
-            // packet routing stays allocation-free.
-            let new_initial = parsed_header.as_ref().and_then(|header| {
-                (target_conn_id.is_none()
-                    && self.listen_addr.is_some()
-                    && header.ty == quiche::Type::Initial)
-                    .then(|| {
-                        (
-                            header.scid.as_ref().to_vec(),
-                            header.dcid.as_ref().to_vec(),
-                            header.token.as_deref().unwrap_or_default().to_vec(),
-                            header.version,
-                        )
-                    })
-            });
-            drop(parsed_header);
-
-            if let Some((client_scid, client_dcid, token, version)) = new_initial {
-                if self.connections.len() >= self.node_config.limits().max_connections {
-                    continue;
-                }
-
-                let (scid, odcid) = if self.node_config.limits().require_address_validation {
-                    if token.is_empty() {
-                        let retry_scid =
-                            Self::generate_scid().map_err(|e| TransportError::PollError {
-                                reason: format!("failed to generate Retry connection id: {e}"),
-                            })?;
-                        let retry_token = mint_retry_token(
-                            &self.retry_secret,
-                            from,
-                            &client_dcid,
-                            unix_time_secs(),
-                        );
-                        let mut out = [0u8; 1350];
-                        let written = quiche::retry(
-                            &QuicConnectionId::from_ref(&client_scid),
-                            &QuicConnectionId::from_ref(&client_dcid),
-                            &retry_scid,
-                            &retry_token,
-                            version,
-                            &mut out,
-                        )
-                        .map_err(|e| TransportError::PollError {
-                            reason: format!("failed to encode QUIC Retry: {e}"),
-                        })?;
-                        // Best-effort: a dropped Retry is regenerated when
-                        // the client retransmits its Initial.
-                        let retry_packet = out
-                            .get(..written)
-                            .expect("quiche writes Retry packets within the supplied buffer");
-                        self.send_stateless_datagram(retry_packet, from);
-                        continue;
-                    }
-
-                    let Some(odcid) =
-                        validate_retry_token(&self.retry_secret, from, &token, unix_time_secs())
-                    else {
-                        continue;
-                    };
-                    (QuicConnectionId::from_vec(client_dcid.clone()), Some(odcid))
-                } else {
-                    (
-                        Self::generate_scid().map_err(|e| TransportError::PollError {
-                            reason: format!("failed to generate server connection id: {e}"),
-                        })?,
-                        None,
-                    )
-                };
-
-                let quiche_conn = quiche::accept(
-                    &scid,
-                    odcid.as_ref(),
-                    local_addr,
-                    from,
-                    &mut self.quiche_config,
-                )
-                .map_err(|e| TransportError::PollError {
-                    reason: format!("quiche accept error: {e}"),
-                })?;
-
-                let id = self.allocate_connection_id()?;
-                let endpoint = ConnectionEndpoint::new(socket_addr_to_multiaddr(from));
-                let mut conn = QuicConnection::new(
-                    id,
-                    quiche_conn,
-                    endpoint.clone(),
-                    self.node_config.limits().max_streams_per_connection,
-                    self.node_config.limits().max_pending_stream_bytes,
-                );
-                for cid in conn.take_unindexed_source_cids() {
-                    self.cid_to_connection.insert(cid, id);
-                }
-                conn.note_indexed_cid(client_dcid.clone());
-
-                if self.connections.insert(id, conn).is_some() {
-                    return Err(TransportError::PollError {
-                        reason: format!("connection id collision for incoming connection {id}"),
-                    });
-                }
-
-                self.cid_to_connection.insert(client_dcid, id);
-                self.pending_events
-                    .push(TransportEvent::IncomingConnection { id, endpoint });
-                target_conn_id = Some(id);
-            }
-
-            // Never route an unknown CID by source address: peers behind one
-            // NAT share it. The one packet a live connection receives with an
-            // unknown CID is a stateless reset, which is routed by its token.
-            // Anything else is dropped.
-            if target_conn_id.is_none() {
-                target_conn_id = stateless_reset_token(packet)
-                    .and_then(|token| self.reset_token_to_connection.get(&token).copied());
-            }
-
-            if let Some(id) = target_conn_id {
-                let mut new_cids = Vec::new();
-                let mut retired_cids = Vec::new();
-                let mut reset_token = None;
-                let mut identity_update: Option<(Option<PeerId>, ConnectionEndpoint)> = None;
-                if let Some(conn) = self.connections.get_mut(&id) {
-                    let previous_peer_id = conn.endpoint().peer_id().cloned();
-                    conn.recv_packet(
-                        packet,
-                        from,
-                        local_addr,
-                        now,
-                        &self.socket,
-                        &mut self.pending_events,
-                        &mut self.pending_datagrams,
-                        self.node_config.limits().max_pending_datagrams,
-                    )?;
-                    // Source CIDs and the peer's reset token only change while
-                    // packets are processed, so indexing here keeps the routing
-                    // tables current without a per-poll sweep over every
-                    // connection.
-                    new_cids = conn.take_unindexed_source_cids();
-                    retired_cids = conn.take_retired_source_cids();
-                    reset_token = conn.take_unindexed_reset_token();
-                    if conn.endpoint().peer_id() != previous_peer_id.as_ref() {
-                        identity_update = Some((previous_peer_id, conn.endpoint().clone()));
-                    }
-                }
-
-                for cid in new_cids {
-                    self.cid_to_connection.insert(cid, id);
-                }
-                for cid in retired_cids {
-                    self.cid_to_connection.remove(&cid);
-                }
-                if let Some(token) = reset_token {
-                    // First claim wins, so a peer cannot hijack another
-                    // connection's resets by advertising the same token.
-                    self.reset_token_to_connection.entry(token).or_insert(id);
-                }
-
-                if let Some((previous_peer_id, endpoint)) = identity_update {
-                    if let Some(previous) = previous_peer_id.as_ref() {
-                        self.remove_peer_connection(previous, id);
-                    }
-
-                    if let Some(peer_id) = endpoint.peer_id() {
-                        self.index_peer_connection(peer_id.clone(), id);
-                    }
-
-                    self.pending_events
-                        .push(TransportEvent::PeerIdentityVerified {
-                            id,
-                            endpoint,
-                            previous_peer_id,
-                        });
-                }
-            }
-        }
-
-        let mut to_remove = Vec::new();
-        let keepalive_interval_ms =
-            keepalive_interval_ms(self.node_config.limits().idle_timeout_ms);
-        let max_pending_datagrams = self.node_config.limits().max_pending_datagrams;
-        {
-            let (connections, pending_events, pending_datagrams, stream_read_buffer) = (
-                &mut self.connections,
-                &mut self.pending_events,
-                &mut self.pending_datagrams,
-                &mut self.stream_read_buffer,
-            );
-            for (&id, conn) in connections.iter_mut() {
-                conn.handle_timeout(
-                    &self.socket,
-                    pending_events,
-                    pending_datagrams,
-                    max_pending_datagrams,
-                )?;
-                conn.maybe_keepalive(
-                    now,
-                    keepalive_interval_ms,
-                    &self.socket,
-                    pending_events,
-                    pending_datagrams,
-                    max_pending_datagrams,
-                )?;
-                conn.poll_streams(
-                    pending_events,
-                    &self.socket,
-                    stream_read_buffer,
-                    pending_datagrams,
-                    max_pending_datagrams,
-                )?;
-
-                if conn.is_closed() {
-                    to_remove.push(id);
-                }
-            }
-        }
-
-        for id in to_remove {
-            if let Some(conn) = self.connections.remove(&id) {
-                self.unindex_connection(id, &conn);
-            }
-            self.pending_events.push(TransportEvent::Closed { id });
-        }
-
+        // The sweep runs whatever ended the batch: established connections
+        // defer their output to it (see `QuicConnection::recv_packet`), so a
+        // batch cut short by an error must not leave them unflushed.
+        // When both fail, the batch's error is the one reported.
+        let received = self.recv_batch(now);
+        let swept = self.sweep_connections(now);
+        received?;
+        swept?;
         Ok(std::mem::take(&mut self.pending_events))
     }
 

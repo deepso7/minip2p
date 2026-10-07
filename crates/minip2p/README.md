@@ -227,10 +227,10 @@ Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see `minip2p::RES
 cargo bench -p minip2p-rs --features tcp,relay-server,pubsub,mdns,bench --bench endpoint_idle
 ```
 
-`benches/endpoint_throughput.rs` measures one-way sustained throughput (64 MiB in 64 KiB writes, up to 8 ahead of the receiver) over TCP, QUIC, and a forced relayed circuit through a third Endpoint, plus allocations per MB in a separate pass. It installs `stats_alloc` as its global allocator, so native allocations such as BoringSSL's are not counted:
+`benches/endpoint_throughput.rs` measures one-way sustained throughput (64 MiB in 64 KiB writes, up to 8 ahead of the receiver) over TCP, QUIC, and a forced relayed circuit through a third Endpoint, plus allocations per MB in a separate pass. It installs `stats_alloc` as its global allocator, so native allocations such as BoringSSL's are not counted. For the QUIC-carried cases it also reports each Endpoint's UDP datagrams per MB and average datagram size in each direction, from the `diagnostics` counters of `minip2p-quic` that the `bench` feature enables:
 
 ```bash
-cargo bench -p minip2p-rs --features tcp,nat,relay-server --bench endpoint_throughput
+cargo bench -p minip2p-rs --features tcp,nat,relay-server,bench --bench endpoint_throughput
 ```
 
 `benches/endpoint_ping_load.rs` measures application-observed ping latency (`Instant` around `ping()` until the matching `PingRttMeasured` event, p50 and p99 over 200 samples) from an Endpoint with QUIC and TCP bound to a probe peer over each transport, while that Endpoint is idle, relays an unbounded transfer over a forced circuit, or forwards 500 1 KiB gossipsub messages per second between two peers. Each loaded case asserts the load advanced across the whole sampling window, and a sample slower than 2 s fails the run:

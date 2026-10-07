@@ -13,6 +13,12 @@ readme = "README.md"
 [lints]
 workspace = true
 
+[features]
+# Diagnostic counters for comparing runs: per-connection flush and packet-size
+# counters, and per-identity socket datagram counts. Off by default and
+# compiled out when off; see the README.
+diagnostics = []
+
 [dependencies]
 minip2p-platform = { path = "../../crates/platform", version = "0.7.4" }
 minip2p-transport = { path = "../../crates/transport", version = "0.7.4" }

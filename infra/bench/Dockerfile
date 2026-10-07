@@ -100,7 +100,7 @@ RUN pnpm --filter @minip2p/node native:build \
     && cargo bench -p minip2p-tcp --bench readiness_poll --no-run \
     && cargo bench -p minip2p-rs --features tcp --bench endpoint_e2e --no-run \
     && cargo bench -p minip2p-rs --features tcp,relay-server,pubsub,mdns,bench --bench endpoint_idle --no-run \
-    && cargo bench -p minip2p-rs --features tcp,nat,relay-server --bench endpoint_throughput --no-run \
+    && cargo bench -p minip2p-rs --features tcp,nat,relay-server,bench --bench endpoint_throughput --no-run \
     && cargo bench -p minip2p-rs --features tcp,nat,relay-server,pubsub --bench endpoint_ping_load --no-run \
     && cargo bench -p minip2p-core --bench multiaddr_ir --no-run \
     && cargo bench -p minip2p-yamux --bench data_path_ir --no-run \

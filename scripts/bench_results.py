@@ -32,6 +32,9 @@ METRICS = {
     # Allocations over real transports depend on scheduling and read chunking.
     "allocs_per_mb": Metric(higher_is_better=False, classified=False),
     "bytes_allocated_per_mb": Metric(higher_is_better=False, classified=False),
+    # UDP datagrams per transfer depend on scheduling and congestion control.
+    "datagrams_per_mb": Metric(higher_is_better=False, classified=False),
+    "avg_datagram_bytes": Metric(higher_is_better=True, classified=False),
     # Isolated agent operations with fixed inputs allocate deterministically.
     "allocs_per_msg": Metric(higher_is_better=False, classified=True),
     "bytes_allocated_per_msg": Metric(higher_is_better=False, classified=True),
@@ -90,6 +93,13 @@ EXPECTED_CUSTOM: set[tuple[str, str, str]] = {
         ("rust-wall", f"endpoint_throughput/{case}", metric)
         for case in ("tcp", "quic", "relayed")
         for metric in ("mb_per_s", "allocs_per_mb", "bytes_allocated_per_mb")
+    },
+    *{
+        ("rust-wall", f"endpoint_throughput/{case}/{endpoint}/{direction}", metric)
+        for case, endpoints in (("quic", ("client", "target")), ("relayed", ("client", "target", "relay")))
+        for endpoint in endpoints
+        for direction in ("sent", "received")
+        for metric in ("datagrams_per_mb", "avg_datagram_bytes")
     },
     *{
         ("rust-wall", f"endpoint_ping_load/{load}/{transport}", metric)

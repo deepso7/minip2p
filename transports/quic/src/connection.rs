@@ -18,6 +18,7 @@ use minip2p_transport::{
 use sha2::{Digest, Sha256};
 
 use crate::PendingDatagram;
+use crate::diagnostics::ConnectionCounters;
 
 const SEND_BUF_SIZE: usize = 1350;
 
@@ -144,6 +145,8 @@ pub struct QuicConnection {
     /// unsent credit and can re-list a stopped stream as writable while no
     /// packet arrives. Idle polls skip the scans while it is clear.
     streams_dirty: bool,
+    /// Diagnostic hooks; empty unless the `diagnostics` feature is on.
+    counters: ConnectionCounters,
 }
 
 /// Whether a flush waits for quiche's pacing send times.
@@ -167,6 +170,7 @@ impl QuicConnection {
         endpoint: ConnectionEndpoint,
         max_local_bidi_streams: u64,
         max_pending_write_bytes: usize,
+        counters: ConnectionCounters,
     ) -> Self {
         let next_local_bidi_stream_id = if conn.is_server() { 1 } else { 0 };
 
@@ -188,6 +192,7 @@ impl QuicConnection {
             sent_keepalive_since_recv: false,
             paced: None,
             streams_dirty: false,
+            counters,
         }
     }
 
@@ -249,6 +254,12 @@ impl QuicConnection {
     /// All CIDs the transport currently routes to this connection.
     pub fn indexed_cids(&self) -> &[Vec<u8>] {
         &self.indexed_cids
+    }
+
+    /// This connection's diagnostic counters so far.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn diagnostics(&self) -> crate::ConnectionDiagnostics {
+        self.counters.snapshot()
     }
 
     /// Application bytes queued but not yet accepted by quiche.
@@ -369,6 +380,13 @@ impl QuicConnection {
         self.flush(socket, pending_datagrams, max_pending_datagrams)
     }
 
+    /// Feeds one received datagram to quiche.
+    ///
+    /// Flushes only while the handshake is in progress, on the transition to
+    /// established, and on peer rejection. An established connection's
+    /// output is left for the caller's `poll_streams` after the receive
+    /// batch, which must run for every connection that received datagrams.
+    //
     // These arguments are the complete I/O context for a single datagram.
     // Keeping them explicit makes this adapter easy to embed and avoids a
     // second mutable runtime object on the packet hot path.
@@ -389,6 +407,7 @@ impl QuicConnection {
     ) -> Result<(), TransportError> {
         let recv_info = quiche::RecvInfo { from, to: local };
 
+        self.counters.datagram_received();
         self.streams_dirty = true;
         match self.conn.recv(buf, recv_info) {
             Ok(_) => {
@@ -411,6 +430,7 @@ impl QuicConnection {
         if self.state == ConnectionState::Connecting && self.conn.is_established() {
             self.state = ConnectionState::Connected;
             self.drain_send_queue(events);
+            self.counters.receive_flush();
             self.flush(socket, pending_datagrams, max_pending_datagrams)?;
 
             // Auto-verify the remote peer's identity from their TLS certificate.
@@ -436,6 +456,7 @@ impl QuicConnection {
                         });
                     }
                     self.state = ConnectionState::Closing;
+                    self.counters.receive_flush();
                     self.flush(socket, pending_datagrams, max_pending_datagrams)?;
                     return Ok(());
                 }
@@ -445,10 +466,16 @@ impl QuicConnection {
                 id: self.id,
                 endpoint: self.endpoint.clone(),
             });
-        } else {
+        } else if !self.conn.is_established() {
             self.drain_send_queue(events);
+            self.counters.receive_flush();
             self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         }
+        // Once established, output waits for the `poll_streams` that follows
+        // the receive batch: quiche has no delayed-ACK timer, so flushing per
+        // datagram sends an ACK per packet and squeezes packets into slivers
+        // of free congestion window. `poll_streams` flushes exactly when
+        // `is_established` holds, so nothing deferred here is stranded.
 
         Ok(())
     }
@@ -914,8 +941,13 @@ impl QuicConnection {
             if !send_or_retain(socket, bytes, *destination, pending_datagrams) {
                 return Ok(());
             }
+            self.counters.sent(bytes.len());
         }
 
+        // Counted here, past the held packet: a pass stopped behind it asks
+        // quiche for nothing.
+        self.counters.flush();
+        let full_packet = self.conn.max_send_udp_payload_size();
         let mut out = [0u8; SEND_BUF_SIZE];
         loop {
             // `quiche::Connection::send()` advances congestion and loss state.
@@ -926,7 +958,10 @@ impl QuicConnection {
             }
             let (written, send_info) = match self.conn.send(&mut out) {
                 Ok(v) => v,
-                Err(quiche::Error::Done) => break,
+                Err(quiche::Error::Done) => {
+                    self.counters.quiche_done(!self.send_queues.is_empty());
+                    break;
+                }
                 Err(e) => {
                     return Err(TransportError::CloseFailed {
                         id: self.id,
@@ -938,6 +973,7 @@ impl QuicConnection {
             let packet = out
                 .get(..written)
                 .expect("quiche reports packet lengths within the supplied buffer");
+            self.counters.packet(written, full_packet);
             if not_due(send_info.at) {
                 self.paced = Some(PacedPacket {
                     datagram: PendingDatagram {
@@ -951,6 +987,7 @@ impl QuicConnection {
             if !send_or_retain(socket, packet, send_info.to, pending_datagrams) {
                 break;
             }
+            self.counters.sent(written);
         }
         Ok(())
     }
@@ -1176,6 +1213,19 @@ impl QuicConnection {
     /// Checks if a stream id was initiated by the remote side.
     fn is_remote_initiated_stream(&self, stream_id: u64) -> bool {
         !self.is_local_initiated_stream(stream_id)
+    }
+}
+
+/// Reports the connection's diagnostic totals, so a host can compare runs
+/// without reading them through the transport.
+#[cfg(feature = "diagnostics")]
+impl Drop for QuicConnection {
+    fn drop(&mut self) {
+        std::eprintln!(
+            "minip2p-quic diagnostics {}: {}",
+            self.id,
+            self.counters.snapshot()
+        );
     }
 }
 

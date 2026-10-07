@@ -48,6 +48,8 @@ class BenchResultsTest(unittest.TestCase):
         self.assertEqual((faster.classification, faster.direction), ("informational", "improved"))
         slower = self.compare_one("mb_per_s", 100, 50)
         self.assertEqual(slower.direction, "regressed")
+        fuller = self.compare_one("avg_datagram_bytes", 1000, 1200)
+        self.assertEqual((fuller.classification, fuller.direction), ("informational", "improved"))
 
     def test_classified_allocation_metric_uses_bands(self):
         row = self.compare_one("allocs_per_msg", 100, 103)
@@ -55,7 +57,7 @@ class BenchResultsTest(unittest.TestCase):
         self.assertEqual(self.compare_one("bytes_allocated_per_msg", 1000, 985).classification, "changed")
 
     def test_informational_metrics_are_never_classified(self):
-        for metric in ("wakeups_per_s", "cpu_ms_per_s", "allocs_per_mb", "rtt_us_p99"):
+        for metric in ("wakeups_per_s", "cpu_ms_per_s", "allocs_per_mb", "rtt_us_p99", "datagrams_per_mb"):
             with self.subTest(metric=metric):
                 row = self.compare_one(metric, 100, 200)
                 self.assertEqual(row.classification, "informational")
