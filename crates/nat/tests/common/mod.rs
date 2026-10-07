@@ -22,7 +22,7 @@ use minip2p_relay::{
     StopMessageType, encode_frame as relay_encode_frame,
 };
 use minip2p_swarm::{IdentifyMessage, SwarmEvent};
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 pub const TEST_CIRCUIT_ID: u64 = (1 << 63) | 77;
 
@@ -444,7 +444,7 @@ impl Harness {
                 conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: self.relay.clone(),
                 stream_id: stream,
-                data,
+                data: Bytes::from(data),
             },
             now,
         );

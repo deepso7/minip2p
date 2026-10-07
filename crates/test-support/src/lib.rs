@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
 use minip2p_platform::{Deadline, Now};
 use minip2p_relay::{
     FrameDecode, HopMessage, HopMessageType, Peer, Reservation, Status, StopMessage,
@@ -221,7 +221,7 @@ impl Transport for InMemoryTransport {
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
         self.ensure_connection(id)?;
         let mut shared = self.shared.borrow_mut();
@@ -708,7 +708,7 @@ mod tests {
         let stream_id = StreamId::new(99);
 
         assert_eq!(
-            a.send_stream(id, stream_id, vec![1, 2, 3]),
+            a.send_stream(id, stream_id, Bytes::from(vec![1, 2, 3])),
             Err(TransportError::StreamNotFound { id, stream_id })
         );
         assert!(b.poll(Now::from_millis(0)).unwrap().is_empty());
@@ -730,7 +730,7 @@ mod tests {
             [TransportEvent::StreamRemoteWriteClosed { id, stream_id }]
         );
         assert!(matches!(
-            a.send_stream(id, stream_id, vec![1]),
+            a.send_stream(id, stream_id, Bytes::from(vec![1])),
             Err(TransportError::StreamSendFailed { .. })
         ));
 
@@ -748,7 +748,7 @@ mod tests {
         );
         assert!(a.shared.borrow().streams.is_empty());
         assert_eq!(
-            b.send_stream(id, stream_id, vec![1]),
+            b.send_stream(id, stream_id, Bytes::from(vec![1])),
             Err(TransportError::StreamNotFound { id, stream_id })
         );
     }
@@ -774,7 +774,7 @@ mod tests {
             [TransportEvent::StreamClosed { id, stream_id }]
         );
         assert_eq!(
-            a.send_stream(id, stream_id, vec![1]),
+            a.send_stream(id, stream_id, Bytes::from(vec![1])),
             Err(TransportError::StreamNotFound { id, stream_id })
         );
         assert_eq!(
@@ -829,7 +829,7 @@ mod tests {
             Err(TransportError::ConnectionNotFound { id })
         );
         assert_eq!(
-            b.send_stream(id, stream_id, vec![1]),
+            b.send_stream(id, stream_id, Bytes::from(vec![1])),
             Err(TransportError::ConnectionNotFound { id })
         );
         assert_eq!(b.close(id), Err(TransportError::ConnectionNotFound { id }));

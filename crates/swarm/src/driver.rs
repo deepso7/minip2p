@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::{IdentifyConfig, IdentifyMessage};
 use minip2p_ping::PingConfig;
 use minip2p_platform::{Clock, Now, StdClock, StdEntropy};
@@ -420,7 +420,7 @@ impl<T: Transport> Swarm<T> {
         peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), DriverError> {
         let now_ms = self.now_ms();
         self.runtime
@@ -726,7 +726,7 @@ mod tests {
             &mut self,
             _: ConnectionId,
             _: StreamId,
-            _: Vec<u8>,
+            _: Bytes,
         ) -> Result<(), TransportError> {
             Ok(())
         }
@@ -820,7 +820,7 @@ mod tests {
             &mut self,
             _: ConnectionId,
             _: StreamId,
-            _: Vec<u8>,
+            _: Bytes,
         ) -> Result<(), TransportError> {
             Ok(())
         }
@@ -918,7 +918,7 @@ mod tests {
             &mut self,
             _: ConnectionId,
             _: StreamId,
-            _: Vec<u8>,
+            _: Bytes,
         ) -> Result<(), TransportError> {
             Ok(())
         }
@@ -1131,7 +1131,7 @@ mod tests {
             &mut self,
             _: ConnectionId,
             _: StreamId,
-            _: Vec<u8>,
+            _: Bytes,
         ) -> Result<(), TransportError> {
             Ok(())
         }
@@ -1607,7 +1607,7 @@ mod tests {
             &mut self,
             id: ConnectionId,
             stream_id: StreamId,
-            data: Vec<u8>,
+            data: Bytes,
         ) -> Result<(), TransportError> {
             let Some(negotiator) = self.negotiators.get_mut(&stream_id) else {
                 if self.failing_stream == Some(stream_id) {
@@ -1619,7 +1619,7 @@ mod tests {
                 return Ok(());
             };
             negotiator
-                .handle_input(MultistreamInput::Data(data))
+                .handle_input(MultistreamInput::Data(data.to_vec()))
                 .map_err(|error| TransportError::PollError {
                     reason: format!("listener negotiation input failed: {error}"),
                 })?;
@@ -1648,7 +1648,7 @@ mod tests {
                 self.events.push_back(TransportEvent::StreamData {
                     id,
                     stream_id,
-                    data,
+                    data: Bytes::from(data),
                 });
             }
             Ok(())
@@ -1735,7 +1735,12 @@ mod tests {
         // this synchronously -- an Ok here would let a never-sent frame
         // commit on StreamClosed.
         let error = swarm
-            .send_stream(&remote_peer, conn_id, stream_id, b"payload".to_vec())
+            .send_stream(
+                &remote_peer,
+                conn_id,
+                stream_id,
+                Bytes::from_static(b"payload"),
+            )
             .expect_err("transport must reject the payload send");
         assert!(matches!(
             error,
@@ -1776,7 +1781,7 @@ mod tests {
             peer_id: peer_id.clone(),
             conn_id: ConnectionId::new(1),
             stream_id: StreamId::new(index),
-            data: vec![0u8; 8],
+            data: Bytes::from(vec![0u8; 8]),
         }
     }
 
@@ -1989,7 +1994,7 @@ mod tests {
             &mut self,
             id: ConnectionId,
             stream_id: StreamId,
-            data: Vec<u8>,
+            data: Bytes,
         ) -> Result<(), TransportError> {
             let Some(negotiator) = self.negotiators.get_mut(&stream_id) else {
                 // Stream already negotiated: swallow protocol payloads so
@@ -1997,7 +2002,7 @@ mod tests {
                 return Ok(());
             };
             negotiator
-                .handle_input(MultistreamInput::Data(data))
+                .handle_input(MultistreamInput::Data(data.to_vec()))
                 .map_err(|error| TransportError::PollError {
                     reason: format!("listener negotiation input failed: {error}"),
                 })?;
@@ -2021,7 +2026,7 @@ mod tests {
                 self.events.push_back(TransportEvent::StreamData {
                     id,
                     stream_id,
-                    data,
+                    data: Bytes::from(data),
                 });
             }
             Ok(())

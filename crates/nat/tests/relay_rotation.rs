@@ -12,7 +12,7 @@ use minip2p_nat::{
 };
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 struct World {
     agent: NatAgent,
@@ -92,7 +92,7 @@ fn hop_exchange(w: &mut World, relay: &PeerId, conn: u64, status: Status, now: u
             conn_id,
             peer_id: relay.clone(),
             stream_id: stream,
-            data: hop_status(status),
+            data: Bytes::from(hop_status(status)),
         },
         at(now),
     );

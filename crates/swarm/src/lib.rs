@@ -38,6 +38,7 @@ extern crate alloc;
 
 mod core;
 mod events;
+mod held;
 mod runtime;
 
 mod builder;
@@ -49,6 +50,7 @@ pub use crate::events::{
     OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
     SwarmRuntimeError,
 };
+pub use crate::held::{HeldStream, HeldWrites};
 pub use crate::runtime::{DriverError, SwarmRuntime};
 // Part of `SwarmEvent::IdentifyReceived`'s public shape; re-exported so
 // consumers can name the type without depending on `minip2p-identify`.

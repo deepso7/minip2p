@@ -9,7 +9,7 @@ use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
 use minip2p_nat::{NatAction, NatConfig, NatError, NatEvent, Path};
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 /// Drives a fresh connect attempt through the relay leg up to `Bridged`:
 /// stagger, relay dial, HOP open/negotiate/CONNECT, STATUS:OK at t0+300.
@@ -61,7 +61,7 @@ fn advertised_dcutr_addrs(h: &mut Harness, t0: u64) -> Vec<Multiaddr> {
             conn_id: ConnectionId::new(TEST_CIRCUIT_ID),
             peer_id: target,
             stream_id: stream,
-            data: dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]),
+            data: Bytes::from(dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)])),
         },
         at(t0 + 303),
     );
@@ -221,7 +221,7 @@ fn malformed_dcutr_keeps_the_established_relayed_path() {
             conn_id: ConnectionId::new(TEST_CIRCUIT_ID),
             peer_id: target,
             stream_id: stream,
-            data: b"\x13/multistream/1.0.0\n".to_vec(),
+            data: Bytes::from_static(b"\x13/multistream/1.0.0\n"),
         },
         at(303),
     );
@@ -335,7 +335,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: attacker.clone(),
             stream_id: stream,
-            data: stop_connect(&h.target),
+            data: Bytes::from(stop_connect(&h.target)),
         },
         at(1),
     ));

@@ -3,7 +3,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, Protocol, SansIoProtocol};
+use minip2p_core::{Bytes, Multiaddr, PeerId, Protocol, SansIoProtocol};
 use minip2p_platform::Now;
 use minip2p_relay::{
     HOP_PROTOCOL_ID, HopRequest, HopResponder, HopResponderInput, HopResponderOutput, Limit,
@@ -356,7 +356,7 @@ impl RelayServerAgent {
                     self.append_pending_payload(key, CircuitDirection::SourceToDestination, data);
                     true
                 } else if self.hop_workers.contains_key(&key) {
-                    if self.feed_hop(key, HopResponderInput::Data(data.clone())) {
+                    if self.feed_hop(key, HopResponderInput::Data(data.to_vec())) {
                         self.drain_hop(key, now);
                     }
                     true
@@ -366,7 +366,7 @@ impl RelayServerAgent {
                     self.queue_forward(key, CircuitDirection::SourceToDestination, data.clone());
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied() {
-                    if self.feed_stop(source_stream, StopInitiatorInput::Data(data.clone())) {
+                    if self.feed_stop(source_stream, StopInitiatorInput::Data(data.to_vec())) {
                         self.drain_stop(source_stream, now);
                     } else if self.circuits.contains_key(&source_stream) {
                         self.queue_forward(
@@ -418,6 +418,22 @@ impl RelayServerAgent {
                 } else {
                     self.rejected_hop_streams.contains_key(&key)
                 }
+            }
+            // The relay treats a Full write as a failure today (#257), so
+            // there is nothing to resume; only claim its own streams' wakeups
+            // so they never reach the application.
+            SwarmEvent::StreamWritable {
+                conn_id, stream_id, ..
+            } => {
+                let key = StreamKey {
+                    conn_id: *conn_id,
+                    stream_id: *stream_id,
+                };
+                self.circuits.contains_key(&key)
+                    || self.stop_to_source.contains_key(&key)
+                    || self.hop_workers.contains_key(&key)
+                    || self.pending_circuits.contains_key(&key)
+                    || self.rejected_hop_streams.contains_key(&key)
             }
             SwarmEvent::StreamWriteStopped {
                 peer_id,
@@ -1340,8 +1356,9 @@ impl RelayServerAgent {
         &mut self,
         source_stream: StreamKey,
         direction: CircuitDirection,
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
     ) {
+        let data: Bytes = data.into();
         if data.is_empty() {
             return;
         }
@@ -1947,9 +1964,10 @@ impl RelayServerAgent {
         &mut self,
         peer_id: PeerId,
         stream: StreamKey,
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
         effect: SendEffect,
     ) {
+        let data = data.into();
         let token = self.token();
         self.pending_operations.insert(
             token,
@@ -2141,7 +2159,7 @@ mod tests {
                 peer_id: peer_id.clone(),
                 conn_id: stream.conn_id,
                 stream_id: stream.stream_id,
-                data,
+                data: Bytes::from(data),
             },
             false,
             Now::from_millis(0),
@@ -2191,7 +2209,7 @@ mod tests {
                 peer_id: destination.clone(),
                 conn_id: stop_stream.conn_id,
                 stream_id: stop_stream.stream_id,
-                data: encode_stop_status(Status::Ok).unwrap(),
+                data: Bytes::from(encode_stop_status(Status::Ok).unwrap()),
             },
             false,
             Now::from_millis(commit_ms),
@@ -2326,7 +2344,7 @@ mod tests {
                 peer_id: remote.clone(),
                 conn_id,
                 stream_id,
-                data: request,
+                data: Bytes::from(request),
             },
             false,
             Now::new(10, 1_000),
@@ -2423,7 +2441,7 @@ mod tests {
                 peer_id: destination.clone(),
                 conn_id: stop_stream.conn_id,
                 stream_id: stop_stream.stream_id,
-                data: encode_stop_status(Status::Ok).unwrap(),
+                data: Bytes::from(encode_stop_status(Status::Ok).unwrap()),
             },
             false,
             Now::from_millis(2),
@@ -2451,7 +2469,7 @@ mod tests {
             panic!("pipelined source payload is released after commit");
         };
         assert_eq!(stream, stop_stream);
-        assert_eq!(data, b"pipelined-source");
+        assert_eq!(&data[..], b"pipelined-source");
         agent.send_stream_result(token, Ok(()), Now::from_millis(2));
         assert!(matches!(
             agent.poll_event(),
@@ -3125,7 +3143,7 @@ mod tests {
                 peer_id: remote.clone(),
                 conn_id,
                 stream_id: stream.stream_id,
-                data: request,
+                data: Bytes::from(request),
             },
             true,
             Now::from_millis(0),
@@ -3312,7 +3330,7 @@ mod tests {
                 peer_id: source,
                 conn_id: source_stream.conn_id,
                 stream_id: source_stream.stream_id,
-                data: b"abc".to_vec(),
+                data: Bytes::from_static(b"abc"),
             },
             false,
             Now::from_millis(11),
@@ -3330,7 +3348,7 @@ mod tests {
                 peer_id: destination,
                 conn_id: stop_stream.conn_id,
                 stream_id: stop_stream.stream_id,
-                data: b"not-counted".to_vec(),
+                data: Bytes::from_static(b"not-counted"),
             },
             false,
             Now::from_millis(12),
@@ -3518,7 +3536,7 @@ mod tests {
                     peer_id: destination,
                     conn_id: stop.conn_id,
                     stream_id: stop.stream_id,
-                    data: encode_stop_status(status).unwrap(),
+                    data: Bytes::from(encode_stop_status(status).unwrap()),
                 },
                 false,
                 Now::from_millis(1),
@@ -3864,7 +3882,7 @@ mod tests {
                     peer_id,
                     conn_id: stream.conn_id,
                     stream_id: stream.stream_id,
-                    data,
+                    data: Bytes::from(data),
                 },
                 false,
                 Now::from_millis(1),
@@ -3977,7 +3995,7 @@ mod tests {
                 peer_id: source,
                 conn_id: source_stream.conn_id,
                 stream_id: source_stream.stream_id,
-                data: b"during-stop-rtt".to_vec(),
+                data: Bytes::from_static(b"during-stop-rtt"),
             },
             false,
             Now::from_millis(1),
@@ -3987,7 +4005,7 @@ mod tests {
                 peer_id: destination,
                 conn_id: stop_stream.conn_id,
                 stream_id: stop_stream.stream_id,
-                data: encode_stop_status(Status::Ok).unwrap(),
+                data: Bytes::from(encode_stop_status(Status::Ok).unwrap()),
             },
             false,
             Now::from_millis(1),
@@ -4000,7 +4018,7 @@ mod tests {
         assert!(matches!(
             agent.poll_action(),
             Some(RelayServerAction::SendStream { stream, data, .. })
-                if stream == stop_stream && data == b"during-stop-rtt"
+                if stream == stop_stream && data[..] == b"during-stop-rtt"[..]
         ));
     }
 
@@ -4021,7 +4039,7 @@ mod tests {
                     peer_id,
                     conn_id: stream.conn_id,
                     stream_id: stream.stream_id,
-                    data: vec![0; MAX_PENDING_BRIDGE_SIZE + 1],
+                    data: Bytes::from(vec![0; MAX_PENDING_BRIDGE_SIZE + 1]),
                 },
                 false,
                 Now::from_millis(1),
@@ -4124,7 +4142,7 @@ mod tests {
                 peer_id: source.clone(),
                 conn_id: source_stream.conn_id,
                 stream_id: source_stream.stream_id,
-                data: b"buffered".to_vec(),
+                data: Bytes::from_static(b"buffered"),
             },
             false,
             Now::from_millis(1),
@@ -4157,7 +4175,7 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(stream, stop_stream);
-                    assert_eq!(data, b"buffered");
+                    assert_eq!(&data[..], b"buffered");
                     forward = Some(token);
                 }
                 RelayServerAction::CloseStreamWrite { token, stream, .. } => {
@@ -4316,7 +4334,7 @@ mod tests {
                     peer_id: source.clone(),
                     conn_id: source_stream.conn_id,
                     stream_id: source_stream.stream_id,
-                    data: data.to_vec(),
+                    data: Bytes::from(data.to_vec()),
                 },
                 false,
                 Now::from_millis(1),

@@ -35,7 +35,7 @@ use alloc::vec::Vec;
 use core::convert::Infallible;
 use core::ops::RangeInclusive;
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId, SansIoProtocol};
 use minip2p_identify::{
     IDENTIFY_PROTOCOL_ID, IdentifyAction, IdentifyConfig, IdentifyEvent, IdentifyInput,
     IdentifyMessage, IdentifyOutput, IdentifyProtocol,
@@ -51,6 +51,7 @@ use crate::events::{
     OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
     SwarmRuntimeError,
 };
+use crate::held::HeldWrites;
 
 // ---------------------------------------------------------------------------
 // Protocol identification
@@ -184,6 +185,22 @@ fn connection_action_matches(action: &SwarmAction, conn_id: ConnectionId) -> boo
     }
 }
 
+/// The stream a write or write-side close addresses.
+fn stream_write_key(action: &SwarmAction) -> Option<(ConnectionId, StreamId)> {
+    match action {
+        SwarmAction::SendStream {
+            conn_id, stream_id, ..
+        }
+        | SwarmAction::CloseStreamWrite { conn_id, stream_id } => Some((*conn_id, *stream_id)),
+        _ => None,
+    }
+}
+
+/// Most bytes the core holds for one stream of its own protocols before it
+/// resets the stream: a peer that keeps sending pings while reading none of
+/// the echoes cannot grow the hold without bound.
+const MAX_HELD_PER_STREAM: usize = 64 * 1024;
+
 /// Mutable form of [`SwarmEvent::peer_id`].
 fn event_peer_mut(event: &mut SwarmEvent) -> Option<&mut PeerId> {
     match event {
@@ -196,6 +213,7 @@ fn event_peer_mut(event: &mut SwarmEvent) -> Option<&mut PeerId> {
         | SwarmEvent::PingTimeout { peer_id }
         | SwarmEvent::StreamReady { peer_id, .. }
         | SwarmEvent::StreamData { peer_id, .. }
+        | SwarmEvent::StreamWritable { peer_id, .. }
         | SwarmEvent::StreamRemoteWriteClosed { peer_id, .. }
         | SwarmEvent::StreamWriteStopped { peer_id, .. }
         | SwarmEvent::StreamClosed { peer_id, .. } => Some(peer_id),
@@ -211,6 +229,7 @@ fn transport_event_connection(event: &TransportEvent) -> Option<ConnectionId> {
         | TransportEvent::StreamOpened { id, .. }
         | TransportEvent::IncomingStream { id, .. }
         | TransportEvent::StreamData { id, .. }
+        | TransportEvent::StreamWritable { id, .. }
         | TransportEvent::StreamRemoteWriteClosed { id, .. }
         | TransportEvent::StreamWriteStopped { id, .. }
         | TransportEvent::StreamClosed { id, .. }
@@ -332,6 +351,14 @@ pub struct SwarmCore {
     /// connection-race tie-break. Dropped when it leaves the slot.
     registrations: BTreeMap<ConnectionId, Registration>,
 
+    // --- Write backpressure (ADR 0012) ---
+    /// Unsent tails of the core's own writes (negotiation, ping, Identify),
+    /// and the writes and closes queued behind them.
+    held: HeldWrites,
+    /// User streams whose write the core refused because `held` had bytes for
+    /// them; they get a `StreamWritable` once `held` is replayed.
+    user_writable_wanted: BTreeSet<(ConnectionId, StreamId)>,
+
     // --- Output queues ---
     events: VecDeque<SwarmEvent>,
     actions: VecDeque<SwarmAction>,
@@ -399,6 +426,8 @@ impl SwarmCore {
             local_peer_id,
             registrations: BTreeMap::new(),
             events: VecDeque::new(),
+            held: HeldWrites::new(),
+            user_writable_wanted: BTreeSet::new(),
             actions: VecDeque::new(),
             after_event_actions: VecDeque::new(),
         }
@@ -488,16 +517,135 @@ impl SwarmCore {
     /// executing an action can feed more input back into the core. Connection
     /// replacement is the one exception: its transport close is deferred
     /// until the eager old-connection event has been yielded.
+    ///
+    /// A write or close for a stream whose earlier write came back Full is
+    /// never returned: it joins the held tail instead, so it cannot overtake
+    /// it (see [`SwarmInput::SendFull`]).
     pub fn poll_output(&mut self) -> Option<SwarmOutput> {
-        if let Some(action) = self.actions.pop_front() {
-            return Some(SwarmOutput::Action(action));
+        while let Some(action) = self.actions.pop_front() {
+            if let Some(action) = self.unless_held(action) {
+                return Some(SwarmOutput::Action(action));
+            }
         }
         if let Some(event) = self.events.pop_front() {
             return Some(SwarmOutput::Event(event));
         }
-        self.after_event_actions
-            .pop_front()
-            .map(SwarmOutput::Action)
+        while let Some(action) = self.after_event_actions.pop_front() {
+            if let Some(action) = self.unless_held(action) {
+                return Some(SwarmOutput::Action(action));
+            }
+        }
+        None
+    }
+
+    /// Whether writes on the stream wait behind bytes the core holds.
+    ///
+    /// A runtime that defers actions it already polled must check this
+    /// before dispatching a [`SwarmAction::SendStream`] or
+    /// [`SwarmAction::CloseStreamWrite`], and give such an action back with
+    /// [`hold_action`](Self::hold_action) instead.
+    pub fn holds_writes(&self, conn_id: ConnectionId, stream_id: StreamId) -> bool {
+        self.held.is_held(conn_id, stream_id)
+    }
+
+    /// Queues a write or close behind the stream's held bytes. Returns the
+    /// action back when the stream holds nothing.
+    pub fn hold_action(&mut self, action: SwarmAction) -> Option<SwarmAction> {
+        self.unless_held(action)
+    }
+
+    fn unless_held(&mut self, action: SwarmAction) -> Option<SwarmAction> {
+        let Some((conn_id, stream_id)) = stream_write_key(&action) else {
+            return Some(action);
+        };
+        if !self.held.is_held(conn_id, stream_id) {
+            return Some(action);
+        }
+        match action {
+            SwarmAction::SendStream { data, .. } => {
+                let len = data.len();
+                self.held.push(conn_id, stream_id, data, len);
+                self.bound_held(conn_id, stream_id);
+            }
+            _ => {
+                self.held.close_after(conn_id, stream_id);
+            }
+        }
+        None
+    }
+
+    /// Resets a stream whose peer makes the core hold more than
+    /// [`MAX_HELD_PER_STREAM`] without reading it.
+    fn bound_held(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        if self.held.held_bytes(conn_id, stream_id) <= MAX_HELD_PER_STREAM {
+            return;
+        }
+        self.held.forget_stream(conn_id, stream_id);
+        self.user_writable_wanted.remove(&(conn_id, stream_id));
+        // Writes still queued for the stream would otherwise go out ahead of
+        // the reset now that nothing holds them back.
+        let is_write =
+            |action: &SwarmAction| stream_write_key(action) == Some((conn_id, stream_id));
+        self.actions.retain(|action| !is_write(action));
+        self.after_event_actions.retain(|action| !is_write(action));
+        if self.reset_pending.insert((conn_id, stream_id)) {
+            self.actions
+                .push_back(SwarmAction::ResetStream { conn_id, stream_id });
+        }
+    }
+
+    /// Records a Full from the transport: the core keeps the tail.
+    fn handle_send_full(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        unsent: Bytes,
+        counted: usize,
+    ) {
+        if !self.conn_to_peer.contains_key(&conn_id) {
+            return;
+        }
+        self.held.push(conn_id, stream_id, unsent, counted);
+        self.bound_held(conn_id, stream_id);
+    }
+
+    /// Replays the stream's held writes and close, in order, then tells a
+    /// waiting user stream it may write.
+    fn handle_stream_writable(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        let key = (conn_id, stream_id);
+        if let Some(held) = self.held.take(conn_id, stream_id) {
+            for data in held.tails {
+                self.actions.push_back(SwarmAction::SendStream {
+                    conn_id,
+                    stream_id,
+                    data,
+                });
+            }
+            if held.close {
+                self.actions
+                    .push_back(SwarmAction::CloseStreamWrite { conn_id, stream_id });
+            }
+            if !self.user_writable_wanted.remove(&key) {
+                return;
+            }
+        }
+        if self.abandoned_streams.contains(&key) {
+            return;
+        }
+        if let Some(ProtocolKind::User(_)) = self.stream_protocol(conn_id, stream_id) {
+            let peer_id = self.ensure_peer_id_for_conn(conn_id);
+            self.events.push_back(SwarmEvent::StreamWritable {
+                peer_id,
+                conn_id,
+                stream_id,
+            });
+        }
+    }
+
+    /// The stream's write side ended: drop whatever it held.
+    fn forget_held(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        self.held.forget_stream(conn_id, stream_id);
+        self.user_writable_wanted.remove(&(conn_id, stream_id));
     }
 
     /// Returns true when the core has no pending driver actions or
@@ -546,6 +694,12 @@ impl SwarmCore {
                 now_ms,
             } => self.handle_open_stream_failed(token, reason, now_ms),
             SwarmInput::RuntimeError(error) => self.record_runtime_error(error),
+            SwarmInput::SendFull {
+                conn_id,
+                stream_id,
+                unsent,
+                counted,
+            } => self.handle_send_full(conn_id, stream_id, unsent, counted),
         }
     }
 
@@ -641,7 +795,11 @@ impl SwarmCore {
 
     /// Sends raw bytes on a negotiated user stream.
     ///
-    /// Emits a `SendStream` action; the driver executes it. Like every
+    /// Emits a `SendStream` action; the driver executes it, and a Full from
+    /// the transport goes back to the caller, who holds the tail. While the
+    /// core still holds its own negotiation bytes for the stream this
+    /// returns [`SwarmError::Full`] with the whole payload instead, and a
+    /// [`SwarmEvent::StreamWritable`] follows. Like every
     /// user-stream operation, the stream is addressed by connection as well
     /// as id, because stream ids are only unique per connection: an
     /// operation for a connection that is no longer `peer_id`'s fails with
@@ -652,9 +810,17 @@ impl SwarmCore {
         peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), SwarmError> {
         self.require_user_stream(peer_id, conn_id, stream_id)?;
+        if self.held.is_held(conn_id, stream_id) {
+            self.user_writable_wanted.insert((conn_id, stream_id));
+            return Err(SwarmError::Full {
+                conn_id,
+                stream_id,
+                unsent: data,
+            });
+        }
         self.actions.push_back(SwarmAction::SendStream {
             conn_id,
             stream_id,
@@ -664,6 +830,9 @@ impl SwarmCore {
     }
 
     /// Half-closes our write side of a user stream.
+    ///
+    /// The FIN follows every write the transport accepted. A caller holding
+    /// an unsent tail of its own must send it before closing.
     pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
@@ -718,6 +887,7 @@ impl SwarmCore {
         self.outbound_negotiators.remove(&key);
         self.reset_pending.remove(&key);
         self.abandoned_streams.remove(&key);
+        self.forget_held(conn_id, stream_id);
         self.actions
             .retain(|action| !stream_action_matches(action, conn_id, stream_id));
         self.after_event_actions
@@ -755,6 +925,7 @@ impl SwarmCore {
             return Ok(());
         }
         self.abandoned_streams.insert(key);
+        self.forget_held(conn_id, stream_id);
         self.remove_stream_owner(conn_id, stream_id);
         self.inbound_negotiators.remove(&key);
         self.outbound_negotiators.remove(&key);
@@ -1008,6 +1179,9 @@ impl SwarmCore {
                 data,
             } => {
                 self.handle_stream_data(id, stream_id, data, now_ms);
+            }
+            TransportEvent::StreamWritable { id, stream_id } => {
+                self.handle_stream_writable(id, stream_id);
             }
             TransportEvent::StreamRemoteWriteClosed { id, stream_id } => {
                 self.handle_stream_remote_write_closed(id, stream_id);
@@ -1808,7 +1982,7 @@ impl SwarmCore {
         &mut self,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
         now_ms: u64,
     ) {
         let key = (conn_id, stream_id);
@@ -1830,7 +2004,7 @@ impl SwarmCore {
         &mut self,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
         now_ms: u64,
     ) {
         let Some(protocol) = self.stream_protocol(conn_id, stream_id).cloned() else {
@@ -1843,7 +2017,7 @@ impl SwarmCore {
                 self.inform_ping(PingInput::StreamData {
                     peer_id,
                     stream_id,
-                    data,
+                    data: data.into(),
                     now_ms,
                 });
                 self.drain_ping_outputs();
@@ -1852,7 +2026,7 @@ impl SwarmCore {
                 self.inform_identify(IdentifyInput::StreamData {
                     peer_id,
                     stream_id,
-                    data,
+                    data: data.into(),
                 });
                 self.drain_identify_outputs();
             }
@@ -1906,6 +2080,7 @@ impl SwarmCore {
         error_code: u64,
     ) {
         let key = (conn_id, stream_id);
+        self.forget_held(conn_id, stream_id);
         if self.abandoned_streams.contains(&key) {
             return;
         }
@@ -1932,6 +2107,7 @@ impl SwarmCore {
         let key = (conn_id, stream_id);
 
         self.reset_pending.remove(&key);
+        self.forget_held(conn_id, stream_id);
         if self.abandoned_streams.remove(&key) {
             self.inbound_negotiators.remove(&key);
             self.outbound_negotiators.remove(&key);
@@ -2003,6 +2179,8 @@ impl SwarmCore {
     }
 
     fn forget_connection_streams(&mut self, conn_id: ConnectionId) {
+        self.held.forget_connection(conn_id);
+        self.user_writable_wanted.retain(|(cid, _)| *cid != conn_id);
         self.stream_owner.retain(|key, _| key.conn_id != conn_id);
         self.reset_pending.retain(|(cid, _)| *cid != conn_id);
         self.abandoned_streams.retain(|(cid, _)| *cid != conn_id);
@@ -2070,7 +2248,7 @@ impl SwarmCore {
             self.on_inbound_negotiated(conn_id, stream_id, &protocol);
 
             if !remaining.is_empty() {
-                self.dispatch_protocol_data(conn_id, stream_id, remaining, now_ms);
+                self.dispatch_protocol_data(conn_id, stream_id, Bytes::from(remaining), now_ms);
             }
         }
     }
@@ -2149,7 +2327,7 @@ impl SwarmCore {
             self.on_outbound_negotiated(conn_id, stream_id, target, now_ms);
 
             if !remaining.is_empty() {
-                self.dispatch_protocol_data(conn_id, stream_id, remaining, now_ms);
+                self.dispatch_protocol_data(conn_id, stream_id, Bytes::from(remaining), now_ms);
             }
         }
     }
@@ -2166,7 +2344,7 @@ impl SwarmCore {
                 self.actions.push_back(SwarmAction::SendStream {
                     conn_id,
                     stream_id,
-                    data: bytes,
+                    data: Bytes::from(bytes),
                 });
                 false
             }
@@ -2347,7 +2525,7 @@ impl SwarmCore {
                     self.actions.push_back(SwarmAction::SendStream {
                         conn_id,
                         stream_id,
-                        data: data.to_vec(),
+                        data: Bytes::copy_from_slice(&data),
                     });
                 }
             }
@@ -2387,7 +2565,7 @@ impl SwarmCore {
                     self.actions.push_back(SwarmAction::SendStream {
                         conn_id,
                         stream_id,
-                        data: data.clone(),
+                        data: Bytes::from(data.clone()),
                     });
                 }
             }
@@ -2656,7 +2834,7 @@ mod tests {
             TransportEvent::StreamData {
                 id: conn_id,
                 stream_id,
-                data: accept,
+                data: Bytes::from(accept),
             },
         );
         let _ = drain_actions(&mut core);
@@ -2674,7 +2852,7 @@ mod tests {
             TransportEvent::StreamData {
                 id: conn_id,
                 stream_id,
-                data: encode_frame(&info.encode()),
+                data: Bytes::from(encode_frame(&info.encode())),
             },
         );
         feed(
@@ -2801,7 +2979,7 @@ mod tests {
             TransportEvent::StreamData {
                 id: conn_id,
                 stream_id: inbound_stream,
-                data: offer,
+                data: Bytes::from(offer),
             },
         );
 
@@ -2844,7 +3022,7 @@ mod tests {
             TransportEvent::StreamData {
                 id: conn_id,
                 stream_id,
-                data: offer,
+                data: Bytes::from(offer),
             },
         );
 
@@ -2913,7 +3091,7 @@ mod tests {
             TransportEvent::StreamData {
                 id: conn_id,
                 stream_id: inbound_stream,
-                data: offer,
+                data: Bytes::from(offer),
             },
         );
 
@@ -2964,7 +3142,7 @@ mod tests {
             TransportEvent::StreamData {
                 id: conn_id,
                 stream_id,
-                data: first_offer,
+                data: Bytes::from(first_offer),
             },
         );
 
@@ -2986,7 +3164,7 @@ mod tests {
             TransportEvent::StreamData {
                 id: conn_id,
                 stream_id,
-                data: multistream_frame(MESHSUB_V1_1),
+                data: Bytes::from(multistream_frame(MESHSUB_V1_1)),
             },
         );
 
@@ -3019,6 +3197,125 @@ mod tests {
                 && ready_stream == stream_id
                 && protocol_id == MESHSUB_V1_1
         ));
+    }
+
+    #[test]
+    fn the_core_holds_its_own_full_writes_and_replays_them_in_order_on_writable() {
+        const PROTOCOL: &str = "/test/1";
+        let mut core = test_core();
+        core.add_protocol(PROTOCOL).expect("register protocol");
+        let peer_id = PeerId::from_public_key_protobuf(b"slow-reader");
+        let conn_id = ConnectionId::new(7);
+        let stream_id = StreamId::new(3);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        let send = |data: &[u8]| SwarmAction::SendStream {
+            conn_id,
+            stream_id,
+            data: Bytes::copy_from_slice(data),
+        };
+
+        // The listener's multistream header comes back Full after 3 bytes.
+        feed(
+            &mut core,
+            TransportEvent::IncomingStream {
+                id: conn_id,
+                stream_id,
+            },
+        );
+        let header = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        assert_eq!(drain_actions(&mut core), [send(&header)]);
+        core.handle_input(SwarmInput::SendFull {
+            conn_id,
+            stream_id,
+            unsent: Bytes::copy_from_slice(&header[3..]),
+            counted: header.len(),
+        });
+
+        // The protocol echo queues behind the held tail instead of going out.
+        let mut offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        offer.extend_from_slice(&multistream_frame(PROTOCOL));
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: Bytes::from(offer),
+            },
+        );
+        assert!(drain_actions(&mut core).is_empty());
+
+        // The application cannot overtake it either, and its close waits.
+        let payload = Bytes::from_static(b"app");
+        assert_eq!(
+            core.send_stream(&peer_id, conn_id, stream_id, payload.clone()),
+            Err(SwarmError::Full {
+                conn_id,
+                stream_id,
+                unsent: payload,
+            })
+        );
+        core.close_stream_write(&peer_id, conn_id, stream_id)
+            .expect("close is accepted");
+        assert!(drain_actions(&mut core).is_empty());
+
+        feed(
+            &mut core,
+            TransportEvent::StreamWritable {
+                id: conn_id,
+                stream_id,
+            },
+        );
+        let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+        let actions: Vec<_> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                SwarmOutput::Action(action) => Some(action.clone()),
+                SwarmOutput::Event(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                send(&header[3..]),
+                send(&multistream_frame(PROTOCOL)),
+                SwarmAction::CloseStreamWrite { conn_id, stream_id },
+            ],
+            "the tail, then the queued echo, then the FIN"
+        );
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            SwarmOutput::Event(SwarmEvent::StreamWritable { stream_id: id, .. }) if *id == stream_id
+        )));
+    }
+
+    #[test]
+    fn a_peer_that_never_reads_cannot_grow_the_core_hold_past_its_bound() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"flooder");
+        let conn_id = ConnectionId::new(7);
+        let stream_id = StreamId::new(3);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id, conn_id);
+        core.handle_input(SwarmInput::SendFull {
+            conn_id,
+            stream_id,
+            unsent: Bytes::from_static(b"x"),
+            counted: 1,
+        });
+        for _ in 0..=MAX_HELD_PER_STREAM / 32 {
+            core.actions.push_back(SwarmAction::SendStream {
+                conn_id,
+                stream_id,
+                data: Bytes::from(vec![0; 32]),
+            });
+        }
+        assert_eq!(
+            drain_actions(&mut core),
+            [SwarmAction::ResetStream { conn_id, stream_id }],
+            "past the bound the stream is reset and the hold dropped"
+        );
+        assert!(!core.holds_writes(conn_id, stream_id));
     }
 
     #[test]
@@ -3071,7 +3368,7 @@ mod tests {
             peer_id: peer.clone(),
             conn_id: conn,
             stream_id: stream,
-            data: vec![1],
+            data: Bytes::from(vec![1]),
         });
 
         core.reset_stream(&peer, conn, stream).unwrap();
@@ -3096,7 +3393,7 @@ mod tests {
             TransportEvent::StreamData {
                 id: conn,
                 stream_id: stream,
-                data: vec![2],
+                data: Bytes::from(vec![2]),
             },
         );
         feed(
@@ -3285,14 +3582,19 @@ mod tests {
             ProtocolKind::User("/minip2p/test/1.0.0".into()),
         );
 
-        core.send_stream(&peer_id, original_conn, stream_id, b"ok".to_vec())
-            .expect("user stream should be active on original connection");
+        core.send_stream(
+            &peer_id,
+            original_conn,
+            stream_id,
+            Bytes::from_static(b"ok"),
+        )
+        .expect("user stream should be active on original connection");
         let actions = drain_actions(&mut core);
 
         assert!(matches!(
             actions.as_slice(),
             [SwarmAction::SendStream { conn_id, stream_id: sid, data }]
-                if *conn_id == original_conn && *sid == stream_id && data == b"ok"
+                if *conn_id == original_conn && *sid == stream_id && data[..] == b"ok"[..]
         ));
     }
 
@@ -3359,7 +3661,7 @@ mod tests {
 
         feed(&mut core, TransportEvent::Closed { id: closed });
         drain_actions(&mut core);
-        core.send_stream(&peer_id, surviving, stream_id, b"ok".to_vec())
+        core.send_stream(&peer_id, surviving, stream_id, Bytes::from_static(b"ok"))
             .expect("stream on the surviving connection should remain");
         assert!(matches!(
             drain_actions(&mut core).as_slice(),
@@ -3427,7 +3729,7 @@ mod tests {
             stream,
             ProtocolKind::User("/minip2p/test/1.0.0".into()),
         );
-        core.send_stream(&peer_id, original, stream, b"stale".to_vec())
+        core.send_stream(&peer_id, original, stream, Bytes::from_static(b"stale"))
             .expect("old connection stream should initially be active");
         core.reset_stream(&peer_id, original, stream)
             .expect("old connection stream should initially be active");
@@ -3458,7 +3760,7 @@ mod tests {
             ([SwarmAction::CloseConnection { conn_id }], []) if *conn_id == original
         ));
         assert!(matches!(
-            core.send_stream(&peer_id, original, stream, b"lost".to_vec()),
+            core.send_stream(&peer_id, original, stream, Bytes::from_static(b"lost")),
             Err(SwarmError::StreamNotFound { .. })
         ));
 
@@ -3549,7 +3851,7 @@ mod tests {
         stream_id: StreamId,
     ) -> [Result<(), SwarmError>; 4] {
         [
-            core.send_stream(peer_id, conn_id, stream_id, b"x".to_vec()),
+            core.send_stream(peer_id, conn_id, stream_id, Bytes::from_static(b"x")),
             core.close_stream_write(peer_id, conn_id, stream_id),
             core.reset_stream(peer_id, conn_id, stream_id),
             core.abandon_stream(peer_id, conn_id, stream_id),
@@ -3598,7 +3900,7 @@ mod tests {
             peer_id: peer_id.clone(),
             conn_id,
             stream_id: stream,
-            data: vec![1],
+            data: Bytes::from(vec![1]),
         };
         core.events.push_back(data(old));
         core.events.push_back(data(new));
@@ -3742,7 +4044,7 @@ mod tests {
             TransportEvent::StreamData {
                 id: original,
                 stream_id: StreamId::new(3),
-                data: multistream_frame(MULTISTREAM_PROTOCOL_ID),
+                data: Bytes::from(multistream_frame(MULTISTREAM_PROTOCOL_ID)),
             },
         );
         assert!(core::iter::from_fn(|| core.poll_output()).next().is_none());
@@ -3785,7 +4087,7 @@ mod tests {
             TransportEvent::StreamData {
                 id: conn_id,
                 stream_id,
-                data: accept,
+                data: Bytes::from(accept),
             },
         );
         let info = IdentifyMessage {
@@ -3801,7 +4103,7 @@ mod tests {
             TransportEvent::StreamData {
                 id: conn_id,
                 stream_id,
-                data: encode_frame(&info.encode()),
+                data: Bytes::from(encode_frame(&info.encode())),
             },
         );
         feed(
@@ -3943,14 +4245,14 @@ mod tests {
             event: TransportEvent::StreamData {
                 id: replacement,
                 stream_id,
-                data: accept,
+                data: Bytes::from(accept),
             },
             now_ms: 20_000,
         });
         assert!(drain_actions(&mut core).iter().any(|action| matches!(
             action,
             SwarmAction::SendStream { conn_id, data, .. }
-                if *conn_id == replacement && data.as_slice() == payload.as_slice()
+                if *conn_id == replacement && data[..] == payload[..]
         )));
         assert_eq!(
             core.next_timeout(20_000),
@@ -4117,7 +4419,7 @@ mod tests {
         core.actions.push_back(SwarmAction::SendStream {
             conn_id: conn,
             stream_id: stream,
-            data: vec![2],
+            data: Bytes::from(vec![2]),
         });
         core.actions.push_back(SwarmAction::CloseStreamWrite {
             conn_id: conn,
@@ -4132,7 +4434,7 @@ mod tests {
             peer_id: peer.clone(),
             conn_id: conn,
             stream_id: stream,
-            data: vec![1],
+            data: Bytes::from(vec![1]),
         });
 
         core.forget_stream(conn, stream);
@@ -4285,7 +4587,7 @@ mod tests {
                 data
             }] if *conn_id == original_conn
                 && *stream_id == inbound_stream
-                && data == &[7; PING_PAYLOAD_LEN]
+                && data[..] == [7; PING_PAYLOAD_LEN][..]
         ));
     }
 
@@ -4386,7 +4688,7 @@ mod tests {
             event: TransportEvent::StreamData {
                 id: conn_id,
                 stream_id,
-                data: payload.to_vec(),
+                data: Bytes::from(payload.to_vec()),
             },
             now_ms: 1_500,
         });

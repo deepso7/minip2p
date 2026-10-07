@@ -8,7 +8,7 @@ use minip2p_pubsub::{
     MESHSUB_PROTOCOL_ID_V11, RawMessage, Rpc, SubOpts, decode_frame, encode_frame,
 };
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 fn keypair(seed: u8) -> Ed25519Keypair {
     Ed25519Keypair::from_secret_key_bytes([seed; 32])
@@ -139,7 +139,7 @@ fn inbound_rpc_on(
             peer_id: peer.clone(),
             conn_id,
             stream_id,
-            data: encode_frame(&rpc.encode()),
+            data: Bytes::from(encode_frame(&rpc.encode())),
         },
         now_ms,
     ));
@@ -189,7 +189,7 @@ fn sent(
             token,
             stream_id,
             ..
-        } => Some((data.clone(), *token, *stream_id)),
+        } => Some((data.to_vec(), *token, *stream_id)),
         _ => None,
     })
 }

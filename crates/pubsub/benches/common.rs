@@ -20,7 +20,7 @@ use minip2p_pubsub::{
     MESHSUB_PROTOCOL_ID_V11, RawMessage, Rpc, SubOpts, decode_frame, encode_frame,
 };
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 pub const PEER_COUNT: u16 = 32;
 const PAYLOAD_LEN: usize = 60 * 1024;
@@ -55,7 +55,7 @@ fn inbound_stream(index: u16) -> StreamId {
 /// The `(token, peer, stream_id, data)` of a send, or the action itself.
 fn as_send(
     action: GossipsubAction,
-) -> Result<(GossipsubToken, PeerId, StreamId, Vec<u8>), GossipsubAction> {
+) -> Result<(GossipsubToken, PeerId, StreamId, Bytes), GossipsubAction> {
     match action {
         GossipsubAction::SendStream {
             token,
@@ -160,14 +160,14 @@ fn join_peer(agent: &mut GossipsubAgent, index: u16, topics: &[String]) {
                 peer_id: remote,
                 conn_id,
                 stream_id: inbound,
-                data: encode_frame(
+                data: Bytes::from(encode_frame(
                     &Rpc {
                         subscriptions,
                         publish: Vec::new(),
                         control: None,
                     }
                     .encode(),
-                ),
+                )),
             },
             0,
         )
@@ -228,14 +228,14 @@ pub fn forward_fixture(n: u16) -> Forward {
         peer_id: source.peer_id(),
         conn_id: conn_id(FIRST_PEER),
         stream_id: inbound_stream(FIRST_PEER),
-        data: encode_frame(
+        data: Bytes::from(encode_frame(
             &Rpc {
                 subscriptions: Vec::new(),
                 publish: vec![message],
                 control: None,
             }
             .encode(),
-        ),
+        )),
     };
     let mut recipients: BTreeSet<PeerId> = agent.mesh_peers(TOPIC).into_iter().collect();
     assert!(

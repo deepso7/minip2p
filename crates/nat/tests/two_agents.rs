@@ -18,7 +18,7 @@ use minip2p_nat::{
 use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_swarm::SwarmEvent;
 use minip2p_test_support::{ConnectRequestOutcome, PendingConnectId, RelayEmulator};
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 const A_LISTEN: &str = "/ip4/198.51.100.10/udp/4100/quic-v1";
 const RELAY_ADDR: &str = "/ip4/203.0.113.1/udp/4001/quic-v1";
@@ -341,7 +341,7 @@ impl World {
                             conn_id,
                             peer_id: peer,
                             stream_id: remote_stream,
-                            data,
+                            data: Bytes::from(data),
                         },
                         now,
                     );
@@ -360,7 +360,7 @@ impl World {
                             conn_id,
                             peer_id: peer,
                             stream_id: local_stream,
-                            data,
+                            data: Bytes::from(data),
                         },
                         now,
                     );
@@ -511,7 +511,7 @@ impl World {
                 conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: relay,
                 stream_id: stream,
-                data,
+                data: Bytes::from(data),
             },
             now,
         );

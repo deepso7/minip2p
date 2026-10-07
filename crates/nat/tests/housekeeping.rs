@@ -12,7 +12,7 @@ use minip2p_nat::{
 };
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 const SERVER_ADDR: &str = "/ip4/203.0.113.50/udp/4001/quic-v1";
 const SERVER2_ADDR: &str = "/ip4/203.0.113.51/udp/4001/quic-v1";
@@ -132,7 +132,7 @@ impl Hk {
                 conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: peer.clone(),
                 stream_id: stream,
-                data,
+                data: Bytes::from(data),
             },
             now,
         );

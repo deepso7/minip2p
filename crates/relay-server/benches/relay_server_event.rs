@@ -6,7 +6,7 @@ use minip2p_platform::Now;
 use minip2p_relay::HOP_PROTOCOL_ID;
 use minip2p_relay_server::{RelayServerAgent, RelayServerConfig};
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 const PEERS: u64 = 128;
 const EVENTS_PER_BATCH: usize = 100;
@@ -46,7 +46,7 @@ fn populated_agent(now: Now) -> (RelayServerAgent, SwarmEvent) {
         peer_id: PeerId::from_public_key_protobuf(b"relay-server-bench-unrelated"),
         conn_id: ConnectionId::new(PEERS + 1),
         stream_id: StreamId::new(1),
-        data: Vec::new(),
+        data: Bytes::from(Vec::new()),
     };
     (agent, inert)
 }

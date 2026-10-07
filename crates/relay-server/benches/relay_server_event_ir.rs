@@ -11,7 +11,7 @@ use minip2p_relay_server::{
     RelayServerEvent, ReservationCloseReason, StreamKey,
 };
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId};
 use std::hint::black_box;
 
 const PEERS: u64 = 128;
@@ -53,7 +53,7 @@ fn populated_agent() -> (RelayServerAgent, SwarmEvent, Now) {
         peer_id: PeerId::from_public_key_protobuf(b"relay-server-bench-unrelated"),
         conn_id: ConnectionId::new(PEERS + 1),
         stream_id: StreamId::new(1),
-        data: Vec::new(),
+        data: Bytes::from(Vec::new()),
     };
     (agent, event, now)
 }
@@ -174,7 +174,7 @@ fn stream_data(peer_id: &PeerId, stream: StreamKey, data: Vec<u8>) -> SwarmEvent
         peer_id: peer_id.clone(),
         conn_id: stream.conn_id,
         stream_id: stream.stream_id,
-        data,
+        data: Bytes::from(data),
     }
 }
 

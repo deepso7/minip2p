@@ -5,16 +5,14 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{PeerId, uvarint_len};
+use minip2p_core::{Bytes, PeerId, uvarint_len};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::StreamId;
 
 use super::config::{GossipsubConfig, GossipsubConfigError};
 use super::mcache::MessageCache;
-use crate::events::{
-    GossipsubAction, GossipsubEvent, GossipsubToken, PublishError, SharedFrame, TopicError,
-};
+use crate::events::{GossipsubAction, GossipsubEvent, GossipsubToken, PublishError, TopicError};
 use crate::message::{
     ControlGraft, ControlIHave, ControlIWant, ControlMessage, ControlPrune, FrameDecode,
     MAX_RPC_SIZE, MAX_TOPIC_LEN, MESHSUB_PROTOCOL_ID_V10, MESHSUB_PROTOCOL_ID_V11, RawMessage, Rpc,
@@ -363,6 +361,10 @@ enum SendState {
     Ready {
         stream_id: StreamId,
         in_flight: Option<(GossipsubToken, FrameCommit)>,
+        /// The unsent tail of the in-flight frame after a Full write. It is
+        /// resent on `stream_writable`; the frame commits only once all of it
+        /// has been accepted.
+        blocked: Option<Bytes>,
     },
 }
 
@@ -378,7 +380,7 @@ impl SendState {
 #[derive(Debug, Default)]
 struct PeerState {
     sender: SendState,
-    pending_messages: VecDeque<SharedFrame>,
+    pending_messages: VecDeque<Bytes>,
     acknowledged_topics: BTreeSet<String>,
     /// Recently acknowledged unsubscriptions replayed after stream reopen.
     /// Bounded by `max_topics_per_peer`; active subscriptions are derived
@@ -597,7 +599,7 @@ impl GossipsubAgent {
         self.mcache
             .put(id, message, alloc::vec![String::from(topic)]);
 
-        let frame: SharedFrame = encode_frame(&body).into();
+        let frame: Bytes = encode_frame(&body).into();
         for peer in recipients {
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.pending_messages.push_back(frame.clone());
@@ -638,6 +640,9 @@ impl GossipsubAgent {
                 }
                 false
             }
+            SwarmEvent::StreamWritable {
+                peer_id, stream_id, ..
+            } => self.stream_writable(peer_id, *stream_id, now_ms),
             SwarmEvent::StreamReady {
                 peer_id,
                 stream_id,
@@ -679,6 +684,7 @@ impl GossipsubAgent {
                 SendState::Ready {
                     stream_id: expected,
                     in_flight: Some((expected_token, _)),
+                    ..
                 } if *expected == stream_id && *expected_token == token
             )
         });
@@ -714,6 +720,62 @@ impl GossipsubAgent {
                 });
             }
         }
+    }
+
+    /// Echoes a write the stream accepted only in part.
+    ///
+    /// The frame stays in flight with `unsent` held until the stream's
+    /// [`SwarmEvent::StreamWritable`] reaches [`handle_event`](Self::handle_event);
+    /// nothing else is sent to the peer meanwhile, so its queue limits apply.
+    pub fn send_full(
+        &mut self,
+        peer: &PeerId,
+        stream_id: StreamId,
+        token: GossipsubToken,
+        unsent: Bytes,
+    ) {
+        if let Some(state) = self.peers.get_mut(peer)
+            && let SendState::Ready {
+                stream_id: expected,
+                in_flight: Some((expected_token, _)),
+                blocked,
+            } = &mut state.sender
+            && *expected == stream_id
+            && *expected_token == token
+        {
+            *blocked = Some(unsent);
+        }
+    }
+
+    /// Resends a held tail on the stream's Writable. Returns whether the
+    /// stream is this agent's outbound stream to `peer`.
+    fn stream_writable(&mut self, peer: &PeerId, stream_id: StreamId, _now_ms: u64) -> bool {
+        let token = self.allocate_token();
+        let Some(state) = self.peers.get_mut(peer) else {
+            return false;
+        };
+        let SendState::Ready {
+            stream_id: expected,
+            in_flight,
+            blocked,
+        } = &mut state.sender
+        else {
+            return false;
+        };
+        if *expected != stream_id {
+            return false;
+        }
+        let (Some((in_flight_token, _)), Some(data)) = (in_flight.as_mut(), blocked.take()) else {
+            return true;
+        };
+        *in_flight_token = token;
+        self.actions.push_back(GossipsubAction::SendStream {
+            token,
+            peer: peer.clone(),
+            stream_id,
+            data,
+        });
+        true
     }
 
     /// Echoes an outbound open result.
@@ -935,6 +997,7 @@ impl GossipsubAgent {
                 state.sender = SendState::Ready {
                     stream_id,
                     in_flight: None,
+                    blocked: None,
                 };
             }
             self.drive_sender(peer, now_ms);
@@ -1111,6 +1174,7 @@ impl GossipsubAgent {
                             SendState::Ready {
                                 stream_id: expected,
                                 in_flight,
+                                ..
                             } if expected == stream_id => {
                                 (in_flight.map(|(_, commit)| commit), false)
                             }
@@ -1419,7 +1483,7 @@ impl GossipsubAgent {
             .filter(|peer| **peer != *arrival && **peer != from)
             .cloned()
             .collect();
-        let frame: SharedFrame = encode_frame(
+        let frame: Bytes = encode_frame(
             &Rpc {
                 subscriptions: Vec::new(),
                 publish: alloc::vec![message.clone()],
@@ -1625,6 +1689,7 @@ impl GossipsubAgent {
                     SendState::Ready {
                         stream_id,
                         in_flight: None,
+                        ..
                     },
                 outbound_version: Some(version),
                 ..
@@ -1705,7 +1770,7 @@ impl GossipsubAgent {
             token,
             peer: peer.clone(),
             stream_id,
-            data: frame.to_vec(),
+            data: frame,
         });
     }
 
@@ -1785,7 +1850,7 @@ impl GossipsubAgent {
         false
     }
 
-    fn queue_message(&mut self, peer: &PeerId, frame: SharedFrame) -> bool {
+    fn queue_message(&mut self, peer: &PeerId, frame: Bytes) -> bool {
         let Some(state) = self.peers.get_mut(peer) else {
             return false;
         };
