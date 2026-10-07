@@ -10,7 +10,9 @@ This crate defines the transport abstraction that concrete adapters implement â€
 - `ConnectionId` and `StreamId` identifiers, with `ConnectionNamespace` keeping each transport's id space disjoint.
 - Connection lifecycle events (`Connected`, `Closed`, `IncomingConnection`, `PeerIdentityVerified`, `Listening`).
 - `ConnectionToken`: a 32-byte value both ends of one connection compute identically, set on the `ConnectionEndpoint` of `Connected`/`PeerIdentityVerified` by transports that can derive one (QUIC from its connection IDs, TCP from the Noise handshake hash). The swarm uses it to settle two same-direction connections to one peer the same way on both sides; transports without one leave it `None`.
-- Stream lifecycle events (`StreamOpened`, `IncomingStream`, `StreamData`, `StreamRemoteWriteClosed`, `StreamWriteStopped`, `StreamClosed`). `StreamWriteStopped` is QUIC's STOP_SENDING; byte-stream transports never emit it.
+- Stream lifecycle events (`StreamOpened`, `IncomingStream`, `StreamData`, `StreamWritable`, `StreamRemoteWriteClosed`, `StreamWriteStopped`, `StreamClosed`). `StreamWriteStopped` is QUIC's STOP_SENDING; byte-stream transports never emit it.
+- Stream payloads are `Bytes` (`minip2p_core::Bytes`, re-exported here), so fan-out and forwarding clone a handle instead of the bytes.
+- Write backpressure (ADR 0012): `send_stream` accepts as much as the stream can queue and returns `TransportError::Full` carrying the exact unsent tail when not every byte fit. Full is retryable, never a fault: the caller holds the tail, and a one-shot `StreamWritable` fires once the stream can queue at least half of its smaller send cap again. It never fires after the write side ended (`StreamWriteStopped`, a reset, `close_stream_write`, `StreamClosed`, `Closed`). `close_stream_write` sends its FIN after every accepted byte.
 - Host intents via trait methods: `dial`, `listen`, `open_stream`, `send_stream`, `close_stream_write`, `reset_stream`, `close`.
 - Typed error model with transport, connection, and stream context.
 
@@ -73,9 +75,9 @@ impl Transport for MyTransport {
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError> {
-        todo!("write stream data")
+        todo!("queue what fits; return TransportError::Full with the unsent tail")
     }
 
     fn close_stream_write(

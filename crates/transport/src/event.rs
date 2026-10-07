@@ -1,7 +1,6 @@
 use alloc::string::String;
-use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId};
+use minip2p_core::{Bytes, Multiaddr, PeerId};
 
 use crate::{ConnectionEndpoint, ConnectionId, StreamId};
 
@@ -27,7 +26,17 @@ pub enum TransportEvent {
     StreamData {
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
+    },
+    /// A stream that reported [`TransportError::Full`](crate::TransportError::Full)
+    /// can queue again.
+    ///
+    /// One-shot per Full: it fires once the stream can queue at least half of
+    /// the smaller of its stream and connection send caps, and never after
+    /// the stream's write side has ended.
+    StreamWritable {
+        id: ConnectionId,
+        stream_id: StreamId,
     },
     /// The remote peer half-closed its write side (FIN received).
     StreamRemoteWriteClosed {

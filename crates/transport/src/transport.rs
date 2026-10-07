@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerAddr};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr};
 use minip2p_platform::{Deadline, Now};
 
 use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
@@ -45,6 +45,27 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 ///   No further events are emitted for that stream after `StreamClosed`.
 /// - `reset_stream()` immediately closes both directions and emits
 ///   `StreamClosed` (if not already emitted).
+///
+/// ## Backpressure
+///
+/// Writes follow ADR 0012's write-side contract:
+///
+/// - `send_stream` accepts as much of the payload as the stream can queue.
+///   It returns `Ok(())` when every byte was accepted, or
+///   [`TransportError::Full`] carrying the **unsent tail** (the whole payload
+///   when nothing fit). Full is retryable, never a fault; the caller holds the
+///   tail and sends it again later.
+/// - Peer flow-control credit does not decide acceptance: accepted bytes
+///   queue until credit drains them. They count against the stream and
+///   connection send caps until they reach the transport's output, including
+///   bytes already framed but not yet written.
+/// - A Full arms a one-shot `StreamWritable` for that stream in the same call,
+///   so no wakeup is lost. It fires once the stream can again queue at least
+///   half of the smaller of its stream and connection send caps; freeing a
+///   shared cap wakes every armed stream on it. It never fires once the write
+///   side has ended (`StreamWriteStopped`, a reset, `close_stream_write`,
+///   `StreamClosed`, or `Closed`); those tell the holder to drop its tail.
+/// - Temporary send pressure never tears down a connection.
 ///
 /// ## Event ordering
 ///
@@ -91,18 +112,22 @@ pub trait Transport {
 
     /// Write data to a stream.
     ///
-    /// Returns `StreamSendFailed` if the write side is already closed.
-    /// Empty data is a no-op.
+    /// Accepts as much of `data` as the stream can queue. Returns
+    /// [`TransportError::Full`] with the unsent tail when not every byte fit
+    /// (see [Backpressure](#backpressure)), and `StreamSendFailed` if the
+    /// write side is already closed. Empty data is a no-op.
     fn send_stream(
         &mut self,
         id: ConnectionId,
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), TransportError>;
 
     /// Half-close the write side of a stream (send FIN).
     ///
-    /// The remote will observe `StreamRemoteWriteClosed`. The stream remains
+    /// The FIN follows every byte already accepted by `send_stream`, and
+    /// disarms a pending `StreamWritable`. The remote will observe
+    /// `StreamRemoteWriteClosed`. The stream remains
     /// readable until the remote also closes or the stream is reset.
     fn close_stream_write(
         &mut self,
@@ -226,7 +251,7 @@ mod tests {
             &mut self,
             _id: ConnectionId,
             _stream_id: StreamId,
-            _data: Vec<u8>,
+            _data: Bytes,
         ) -> Result<(), TransportError> {
             Err(TransportError::Unsupported {
                 operation: "send_stream",

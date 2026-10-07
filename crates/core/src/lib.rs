@@ -3,7 +3,8 @@
 //! Provides [`Multiaddr`] parsing/formatting, [`PeerAddr`] for validated
 //! transport + peer id addresses, [`ConnectId`] for Connection-attempt
 //! correlation, the [`Protocol`] enum, the varint-length-prefixed frame
-//! codec, and the shared protobuf field codec used by protocol crates.
+//! codec, the shared protobuf field codec used by protocol crates, and the
+//! shared stream payload type [`Bytes`].
 //! `no_std` + `alloc` compatible.
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -21,6 +22,11 @@ mod protobuf;
 mod protocol;
 mod sans_io;
 
+/// Shared, cheaply cloneable stream payload (ADR 0011).
+///
+/// Every stream read and write carries one, so fan-out and forwarding clone a
+/// handle instead of the bytes. Wire decoders keep borrowing `&[u8]`.
+pub use bytes::Bytes;
 pub use candidates::select_direct_addrs;
 pub use connect_id::ConnectId;
 pub use error::{MultiaddrError, PeerAddrError};

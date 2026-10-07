@@ -27,6 +27,9 @@ pub use connection_state::ConnectionState;
 pub use connection_token::ConnectionToken;
 pub use error::TransportError;
 pub use event::TransportEvent;
+/// Stream payload type, re-exported from [`minip2p_core::Bytes`] so adapters
+/// need no extra dependency.
+pub use minip2p_core::Bytes;
 pub use set::{RejectedTransport, TransportSet, TransportSetError};
 pub use stream_id::StreamId;
 pub use transport::Transport;

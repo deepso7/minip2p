@@ -32,8 +32,8 @@ use std::time::{Duration, Instant};
 use minip2p_core::{Multiaddr, PeerAddr, TransportKind};
 use minip2p_platform::Now;
 use minip2p_transport::{
-    BlockingTransport, ConnectionId, ConnectionNamespace, StreamId, Transport, TransportError,
-    TransportEvent, TransportSet, WaitHandle, WaitOutcome,
+    BlockingTransport, Bytes, ConnectionId, ConnectionNamespace, StreamId, Transport,
+    TransportError, TransportEvent, TransportSet, WaitHandle, WaitOutcome,
 };
 use mio::{Events, Interest, Poll, Token, Waker};
 
@@ -170,7 +170,7 @@ impl Transport for MioMember {
         &mut self,
         _id: ConnectionId,
         _stream_id: StreamId,
-        _data: Vec<u8>,
+        _data: Bytes,
     ) -> Result<(), TransportError> {
         Ok(())
     }
