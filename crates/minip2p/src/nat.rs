@@ -789,8 +789,8 @@ impl<E: EntropySource> NatDriver<E> {
         } else if let Err(DriverError::Full { unsent, .. }) =
             swarm.send_stream(peer, conn_id, stream_id, data, sample.monotonic_ms)
         {
-            // Other failures surface through the agent's own timeouts and the
-            // swarm's error events, as for any NAT write.
+            // Other failures are returned here and not emitted as swarm
+            // events; the agent's own timeouts end the exchange.
             self.held.push(conn_id, stream_id, unsent, counted);
         }
         // NAT messages are a few hundred bytes; a peer that leaves this much

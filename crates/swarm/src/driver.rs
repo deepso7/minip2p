@@ -241,8 +241,9 @@ impl<T: Transport> Swarm<T> {
 
     /// Returns the swarm this driver wraps, mutably.
     ///
-    /// Commands called through it take the caller's time sample; pass
-    /// [`Swarm::now`] so they share this driver's timeline. The clock-taking
+    /// Commands called through it take the caller's time sample; sample
+    /// [`Swarm::now`] first and pass its `monotonic_ms`, so they share this
+    /// driver's timeline. The clock-taking
     /// commands on `Swarm` itself sample it for you.
     pub fn core_mut(&mut self) -> &mut SwarmCore<T, StdEntropy> {
         &mut self.core
