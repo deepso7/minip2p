@@ -32,8 +32,8 @@
 //! growth counts toward bytes allocated. Allocations made by native code
 //! outside the Rust allocator, such as BoringSSL's inside QUIC, are not seen.
 //! The figures are informational: over real transports they vary with
-//! scheduling and read chunking. The sender's own `CHUNK` buffer per write is
-//! included, since `send_stream` takes an owned `Vec`.
+//! scheduling and read chunking. The sender allocates its `CHUNK` once: each
+//! write passes a `Bytes` handle to it, and a Full resends the unsent tail.
 //!
 //! `relayed` uses three Endpoints (`support::Relayed`): the target and the
 //! client reach each other only through a relay server over QUIC, with
@@ -54,10 +54,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, EndpointEvent, PeerId, RelayServerEvent};
+use minip2p::{Bytes, Endpoint, EndpointEvent, PeerId, RelayServerEvent};
 use minip2p_quic::{DatagramCounters, datagram_counters};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Stats, StatsAlloc};
-use support::{Driven, Relayed, SETUP_TIMEOUT, bind_on, bind_relay, is_backpressure, next_event};
+use support::{Driven, Relayed, SETUP_TIMEOUT, bind_on, bind_relay, next_event, send_chunk};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
@@ -179,7 +179,8 @@ fn transfer(
         }
     }
 
-    let chunk = vec![0x5a; CHUNK];
+    let chunk = Bytes::from(vec![0x5a; CHUNK]);
+    let mut held = None;
     let start = Mark::now(roles);
     let deadline = start.at + TRANSFER_TIMEOUT;
     let mut sent = 0;
@@ -194,12 +195,10 @@ fn transfer(
         while sent < TOTAL
             && sent - progress.received.load(Ordering::Acquire) < IN_FLIGHT * CHUNK as u64
         {
-            match client.send_stream(peer, conn, stream, chunk.clone()) {
-                Ok(()) => sent += CHUNK as u64,
-                Err(error) => {
-                    assert!(is_backpressure(&error), "send failed: {error}");
-                    break;
-                }
+            let (accepted, full) = send_chunk(client, peer, (conn, stream), &chunk, &mut held);
+            sent += accepted;
+            if full {
+                break;
             }
         }
         // Flushes queued bytes. The sink's progress interrupts this wait,

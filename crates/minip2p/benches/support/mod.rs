@@ -14,8 +14,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectOutcome, Deadline, Endpoint, EndpointBuilder, EndpointEvent, EndpointWaitOutcome, Error,
-    NatConfig, PeerAddr, PeerId, RelayServerConfig, ReservationPolicy, TransportError,
+    Bytes, ConnectOutcome, ConnectionId, Deadline, Endpoint, EndpointBuilder, EndpointEvent,
+    EndpointWaitOutcome, Error, NatConfig, PeerAddr, PeerId, RelayServerConfig, ReservationPolicy,
+    StreamId,
 };
 
 /// Upper bound for every setup step.
@@ -43,16 +44,28 @@ pub fn bind_on(builder: EndpointBuilder, listen: &str) -> Endpoint {
         .expect("bind endpoint")
 }
 
-/// Whether a refused write is backpressure (retry later) rather than failure:
-/// QUIC's full write queue, or a full Yamux send buffer (TCP and circuits),
-/// which reaches the Endpoint only as a `StreamSendFailed` reason.
-pub fn is_backpressure(error: &Error) -> bool {
-    match error {
-        Error::Transport(TransportError::ResourceExhausted { .. }) => true,
-        Error::Transport(TransportError::StreamSendFailed { reason, .. }) => {
-            reason.contains("send buffer is full")
+/// One write of a bulk sender: resends the held unsent tail if there is one,
+/// otherwise a fresh `chunk` (a cheap `Bytes` handle clone). Returns the bytes
+/// accepted and whether the stream reported Full; on Full the exact unsent
+/// suffix is kept in `held` for the next call (ADR 0012). Any other error
+/// panics.
+pub fn send_chunk(
+    endpoint: &mut Endpoint,
+    peer: &PeerId,
+    stream: (ConnectionId, StreamId),
+    chunk: &Bytes,
+    held: &mut Option<Bytes>,
+) -> (u64, bool) {
+    let data = held.take().unwrap_or_else(|| chunk.clone());
+    let len = data.len();
+    match endpoint.send_stream(peer, stream.0, stream.1, data) {
+        Ok(()) => (len as u64, false),
+        Err(Error::Full { unsent, .. }) => {
+            let accepted = len - unsent.len();
+            *held = Some(unsent);
+            (accepted as u64, true)
         }
-        _ => false,
+        Err(error) => panic!("send failed: {error}"),
     }
 }
 
