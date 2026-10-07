@@ -180,12 +180,12 @@ describe("@minip2p/node", () => {
       });
       const inbound = await inboundPromise;
 
-      outbound.write("hello from a");
+      await outbound.write("hello from a");
       expect(new TextDecoder().decode(await inbound.read())).toBe(
         "hello from a"
       );
 
-      inbound.write("hello from b");
+      await inbound.write("hello from b");
       expect(new TextDecoder().decode(await outbound.read())).toBe(
         "hello from b"
       );
@@ -219,7 +219,7 @@ describe("@minip2p/node", () => {
       });
       const inbound = await inboundPromise;
 
-      outbound.write("hello over tcp");
+      await outbound.write("hello over tcp");
       expect(new TextDecoder().decode(await inbound.read())).toBe(
         "hello over tcp"
       );

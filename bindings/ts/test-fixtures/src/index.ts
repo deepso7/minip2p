@@ -27,6 +27,11 @@ export class MockBackend implements Minip2pBackend {
   openResults: BackendOpenStream[] = [];
   operations: MockBackendOperation[] = [];
   pingCalls = 0;
+  /**
+   * Scripted `sendStream` results, oldest first: `false` leaves the write
+   * pending until a `StreamWriteAccepted` event. Empty means accepted.
+   */
+  sendResults: boolean[] = [];
 
   private listener?: (event: P2pEvent) => void;
 
@@ -129,8 +134,9 @@ export class MockBackend implements Minip2pBackend {
     connId: number,
     streamId: number,
     data: Uint8Array
-  ): void {
+  ): boolean {
     this.operations.push(["write", peerId, connId, streamId, [...data]]);
+    return this.sendResults.shift() ?? true;
   }
 
   closeStreamWrite(peerId: string, connId: number, streamId: number): void {

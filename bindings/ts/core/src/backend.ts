@@ -85,17 +85,20 @@ export interface Minip2pBackend {
   /** Starts opening and negotiating an application stream. */
   openStream: (peerId: string, protocolId: string) => BackendOpenStream;
   /**
-   * Sends bytes on an application stream. Every stream operation names the
-   * stream by connection too; one whose connection is no longer the peer's
-   * throws instead of reaching a stream on a newer connection.
+   * Sends bytes on an application stream. Returns `true` once native
+   * accepted every byte, or `false` when native holds the rest and a
+   * `StreamWriteAccepted` event follows once it is accepted; until then the
+   * stream takes no other write. Every stream operation names the stream by
+   * connection too; one whose connection is no longer the peer's throws
+   * instead of reaching a stream on a newer connection.
    */
   sendStream: (
     peerId: string,
     connId: number,
     streamId: number,
     data: Uint8Array
-  ) => void;
-  /** Half-closes the local stream write side. */
+  ) => boolean;
+  /** Half-closes the local stream write side, after any pending write. */
   closeStreamWrite: (peerId: string, connId: number, streamId: number) => void;
   /** Abruptly resets a stream. */
   resetStream: (peerId: string, connId: number, streamId: number) => void;

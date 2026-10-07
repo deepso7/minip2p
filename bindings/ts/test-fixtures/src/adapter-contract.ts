@@ -292,14 +292,12 @@ export function describeAdapterContract(
       await drained();
       const stream = await opening;
       native.setLiveConnection(CONN_ID);
-      stream.write("before");
+      await stream.write("before");
 
       // The new connection reuses stream id 4, and its ConnectionReplaced
       // is not drained yet, so the SDK still treats the stream as open.
       native.setLiveConnection(NEXT_CONN_ID);
-      expect(() => {
-        stream.write("after");
-      }).toThrow();
+      await expect(stream.write("after")).rejects.toThrow();
 
       expect(native.writes).toEqual([{ connId: CONN_ID, streamId: 4n }]);
       endpoint.close();
@@ -326,9 +324,9 @@ export function describeAdapterContract(
       await drained();
       const stream = await opening;
       const writeErrors: unknown[] = [];
-      stream.on("data", () => {
+      stream.on("data", async () => {
         try {
-          stream.write("reply");
+          await stream.write("reply");
         } catch (error) {
           writeErrors.push(error);
         }

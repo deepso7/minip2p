@@ -197,6 +197,27 @@ export class StreamClosedError extends Error {
   }
 }
 
+/**
+ * A stream write was refused because the stream already buffers its
+ * high-water mark of unaccepted bytes. Await earlier writes before writing
+ * more.
+ */
+export class WriteBufferFullError extends Error {
+  /** Bytes already waiting on the stream, counting the in-flight write. */
+  readonly buffered: number;
+  /** The stream's `writeHighWaterMark`. */
+  readonly highWaterMark: number;
+
+  constructor(buffered: number, highWaterMark: number) {
+    super(
+      `The stream already buffers ${buffered} bytes (high-water mark ${highWaterMark})`
+    );
+    this.name = "WriteBufferFullError";
+    this.buffered = buffered;
+    this.highWaterMark = highWaterMark;
+  }
+}
+
 /** Native event loss made an in-flight operation's result unknowable. */
 export class EventQueueOverflowError extends Error {
   constructor() {

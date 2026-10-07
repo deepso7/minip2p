@@ -448,6 +448,8 @@ export const P2pEvent_Tags = {
   StreamData: "StreamData",
   StreamReady: "StreamReady",
   StreamRemoteWriteClosed: "StreamRemoteWriteClosed",
+  StreamWriteAccepted: "StreamWriteAccepted",
+  StreamWriteStopped: "StreamWriteStopped",
 } as const;
 export type P2pEventTag = (typeof P2pEvent_Tags)[keyof typeof P2pEvent_Tags];
 
@@ -499,6 +501,14 @@ export type P2pEvent =
   | RawEvent<
       typeof P2pEvent_Tags.StreamRemoteWriteClosed,
       { peerId: string; connId: number; streamId: number }
+    >
+  | RawEvent<
+      typeof P2pEvent_Tags.StreamWriteAccepted,
+      { peerId: string; connId: number; streamId: number }
+    >
+  | RawEvent<
+      typeof P2pEvent_Tags.StreamWriteStopped,
+      { peerId: string; connId: number; streamId: number; errorCode: number }
     >
   | RawEvent<
       typeof P2pEvent_Tags.StreamClosed,

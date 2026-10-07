@@ -13,7 +13,7 @@ await endpoint.waitPeerReady(path.peerId);
 const rttMs = await endpoint.ping(path.peerId);
 
 const stream = await endpoint.openStream(path.peerId, "/example/files/1");
-stream.write(new Uint8Array([1, 2, 3]));
+await stream.write(new Uint8Array([1, 2, 3]));
 stream.closeWrite();
 ```
 

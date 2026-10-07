@@ -234,15 +234,15 @@ class ReactNativeBackend implements Minip2pBackend {
     connId: number,
     streamId: number,
     data: Uint8Array
-  ): void {
-    translateErrors(() => {
+  ): boolean {
+    return translateErrors(() =>
       this.#endpoint.sendStream(
         peerId,
         this.#connectionIds.toNative(connId),
         numberToU64(streamId, "streamId"),
         toArrayBuffer(data)
-      );
-    });
+      )
+    );
   }
 
   closeStreamWrite(peerId: string, connId: number, streamId: number): void {
