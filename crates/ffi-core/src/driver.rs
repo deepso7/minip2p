@@ -84,7 +84,14 @@ impl Carry {
         let dropped = if let Some(payload_id) = self.payload_ids.pop_front() {
             self.events.remove(&payload_id)
         } else {
-            self.events.pop_first().map(|(_, event)| event)
+            // A write settlement is the only completion a binding's pending
+            // write gets, so it outlives every other event.
+            let oldest = self
+                .events
+                .iter()
+                .find(|(_, event)| !is_write_settlement(event))
+                .map(|(id, _)| *id);
+            oldest.and_then(|id| self.events.remove(&id))
         };
         if let Some(connect_id) = dropped.as_ref().and_then(terminal_connect_id) {
             self.dropped_terminal_connect_ids.insert(connect_id);
@@ -111,6 +118,13 @@ impl Carry {
     fn prune_payload_ids(&mut self) {
         self.payload_ids.retain(|id| self.events.contains_key(id));
     }
+}
+
+fn is_write_settlement(event: &P2pEvent) -> bool {
+    matches!(
+        event,
+        P2pEvent::StreamWriteAccepted { .. } | P2pEvent::StreamWriteStopped { .. }
+    )
 }
 
 fn is_payload_event(event: &P2pEvent) -> bool {
@@ -196,6 +210,7 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             carry,
             overflow,
             stats,
+            writes,
             ..
         } = &mut *state;
         let endpoint = endpoint.as_mut().expect("running endpoint exists");
@@ -233,14 +248,16 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             }
             continue;
         }
-        ingest(
-            batch
-                .into_iter()
-                .filter_map(|event| convert_endpoint_event(endpoint, event)),
-            carry,
-            overflow,
-            stats,
-        );
+        // Pending writes follow each event first: a Writable resends a held
+        // tail and, once it is all accepted, settles the binding's write
+        // right after the event that caused it.
+        let mut converted = Vec::with_capacity(batch.len());
+        for event in batch {
+            let settled = writes.observe(endpoint, &event);
+            converted.extend(convert_endpoint_event(endpoint, event));
+            converted.extend(settled);
+        }
+        ingest(converted, carry, overflow, stats);
         stats.carry_high_water = stats.carry_high_water.max(carry.len());
         stats.iterations = stats.iterations.saturating_add(1);
         let should_ring = was_empty && !carry.is_empty();
@@ -322,7 +339,7 @@ fn ring(doorbell: &Arc<dyn EventDoorbell>) {
 
 fn failure_kind(error: &Error) -> DriverFailureKind {
     match error {
-        Error::Transport(_) => DriverFailureKind::Transport,
+        Error::Transport(_) | Error::Full { .. } => DriverFailureKind::Transport,
         Error::Swarm(_) => DriverFailureKind::Swarm,
         Error::Invariant { .. } | Error::EventBacklogExceeded { .. } | Error::Entropy => {
             DriverFailureKind::Invariant

@@ -76,6 +76,8 @@ pub(crate) struct EndpointState {
     pub(crate) carry: crate::driver::Carry,
     pub(crate) overflow: crate::driver::OverflowDiagnostic,
     pub(crate) stats: DriverStats,
+    /// Unsent tails of the bindings' stream writes.
+    pub(crate) writes: crate::writes::PendingWrites,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,6 +214,7 @@ impl P2pEndpoint {
                     carry: crate::driver::Carry::default(),
                     overflow: crate::driver::OverflowDiagnostic::default(),
                     stats: DriverStats::default(),
+                    writes: crate::writes::PendingWrites::default(),
                 }),
                 stopped: Mutex::new(false),
                 stopped_cv: Condvar::new(),
@@ -457,6 +460,13 @@ impl P2pEndpoint {
 
     /// Sends one byte chunk on an application stream.
     ///
+    /// Returns `true` when the stream accepted every byte. Returns `false`
+    /// when it accepted only part: ffi-core holds the rest, resends it as the
+    /// stream drains, and emits [`P2pEvent::StreamWriteAccepted`] once all of
+    /// it has been accepted. Until then the stream takes no other write
+    /// ([`FfiError::Backpressure`]); a `StreamWriteStopped`, `StreamClosed`,
+    /// or connection end instead means the held bytes were dropped.
+    ///
     /// Like the other stream operations, the stream is named by connection
     /// as well as id; an operation for a connection the peer no longer uses
     /// fails instead of reaching a same-numbered stream on its replacement.
@@ -466,21 +476,23 @@ impl P2pEndpoint {
         conn_id: u64,
         stream_id: u64,
         data: Vec<u8>,
-    ) -> Result<(), FfiError> {
+    ) -> Result<bool, FfiError> {
         let peer = parse_peer_id(&peer_id)?;
-        self.with_endpoint_mut(|endpoint| {
-            endpoint
-                .send_stream(
-                    &peer,
-                    ConnectionId::new(conn_id),
-                    StreamId::new(stream_id),
-                    data,
-                )
-                .map_err(map_driver_error)
+        self.with_state_mut(|endpoint, writes| {
+            writes.send(
+                endpoint,
+                peer,
+                ConnectionId::new(conn_id),
+                StreamId::new(stream_id),
+                data,
+            )
         })
     }
 
     /// Half-closes the local write side of an application stream.
+    ///
+    /// The FIN follows a pending write's held bytes, and later writes are
+    /// refused.
     pub fn close_stream_write(
         &self,
         peer_id: String,
@@ -488,10 +500,13 @@ impl P2pEndpoint {
         stream_id: u64,
     ) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
-        self.with_endpoint_mut(|endpoint| {
-            endpoint
-                .close_stream_write(&peer, ConnectionId::new(conn_id), StreamId::new(stream_id))
-                .map_err(map_driver_error)
+        self.with_state_mut(|endpoint, writes| {
+            writes.close_write(
+                endpoint,
+                &peer,
+                ConnectionId::new(conn_id),
+                StreamId::new(stream_id),
+            )
         })
     }
 
@@ -503,9 +518,11 @@ impl P2pEndpoint {
         stream_id: u64,
     ) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
-        self.with_endpoint_mut(|endpoint| {
+        let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
+        self.with_state_mut(|endpoint, writes| {
+            writes.forget(conn_id, stream_id);
             endpoint
-                .reset_stream(&peer, ConnectionId::new(conn_id), StreamId::new(stream_id))
+                .reset_stream(&peer, conn_id, stream_id)
                 .map_err(map_driver_error)
         })
     }
@@ -518,9 +535,11 @@ impl P2pEndpoint {
         stream_id: u64,
     ) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
-        self.with_endpoint_mut(|endpoint| {
+        let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
+        self.with_state_mut(|endpoint, writes| {
+            writes.forget(conn_id, stream_id);
             endpoint
-                .abandon_stream(&peer, ConnectionId::new(conn_id), StreamId::new(stream_id))
+                .abandon_stream(&peer, conn_id, stream_id)
                 .map_err(map_driver_error)
         })
     }
@@ -736,10 +755,21 @@ impl P2pEndpoint {
         &self,
         operation: impl FnOnce(&mut Endpoint) -> Result<T, FfiError>,
     ) -> Result<T, FfiError> {
+        self.with_state_mut(|endpoint, _| operation(endpoint))
+    }
+
+    /// Like [`Self::with_endpoint_mut`], with the pending stream writes.
+    fn with_state_mut<T>(
+        &self,
+        operation: impl FnOnce(&mut Endpoint, &mut crate::writes::PendingWrites) -> Result<T, FfiError>,
+    ) -> Result<T, FfiError> {
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
         ensure_accepting_commands(&state)?;
-        operation(state.endpoint.as_mut().ok_or(FfiError::Stopped)?)
+        let EndpointState {
+            endpoint, writes, ..
+        } = &mut *state;
+        operation(endpoint.as_mut().ok_or(FfiError::Stopped)?, writes)
     }
 }
 
@@ -847,7 +877,7 @@ fn map_topic_error(error: TopicError) -> FfiError {
     }
 }
 
-fn map_driver_error(error: minip2p::Error) -> FfiError {
+pub(crate) fn map_driver_error(error: minip2p::Error) -> FfiError {
     match error {
         minip2p::Error::Transport(_) => FfiError::Transport {
             detail: error.to_string(),

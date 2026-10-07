@@ -264,7 +264,8 @@ impl NodeEndpoint {
     }
 
     /// Sends bytes on an application stream, named by its connection and
-    /// stream ids.
+    /// stream ids. Returns `true` once every byte is accepted, or `false`
+    /// when the rest is held and `StreamWriteAccepted` will follow.
     #[napi]
     pub fn send_stream(
         &self,
@@ -273,7 +274,7 @@ impl NodeEndpoint {
         conn_id: BigInt,
         stream_id: BigInt,
         data: Uint8Array,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.0
             .send_stream(
                 peer_id,

@@ -100,13 +100,16 @@ impl P2pEndpoint {
         self.0.open_stream(peer_id, protocol_id)
     }
     /// Sends bytes on a stream, named by its connection and stream ids.
+    ///
+    /// Returns `true` once every byte is accepted, or `false` when the rest is
+    /// held and `StreamWriteAccepted` will follow.
     pub fn send_stream(
         &self,
         peer_id: String,
         conn_id: u64,
         stream_id: u64,
         data: Vec<u8>,
-    ) -> Result<(), FfiError> {
+    ) -> Result<bool, FfiError> {
         self.0.send_stream(peer_id, conn_id, stream_id, data)
     }
     /// Half-closes a stream's write side.
