@@ -1,19 +1,28 @@
 /* oxlint-disable class-methods-use-this, complexity, func-style, max-classes-per-file, no-use-before-define -- The adapter keeps its contract-complete native endpoint and public SDK subclass together, and uses hoisted conversion helpers. */
 
-import { Minip2pBase, StreamClosedError } from "@minip2p/core";
+import {
+  DiscoverySource,
+  DriverFailureKind,
+  EndpointErrorKind,
+  Minip2pBase,
+  NatErrorKind,
+  Reachability,
+} from "@minip2p/core";
 import type {
   Bytes,
   ConnectionInfo,
   IdentifyInfo,
   KnownPeerInfo,
   Minip2pConfig,
-  Reachability,
   RelayReservationInfo,
 } from "@minip2p/core";
 import {
+  ConnectionIdMap,
+  EventDrain,
   P2pEvent_Tags,
   resolveEndpointConfig,
   typedFfiError,
+  u64ToNumber,
 } from "@minip2p/core/backend";
 import type {
   BackendConnectTarget,
@@ -24,10 +33,14 @@ import type {
   PathKind,
 } from "@minip2p/core/backend";
 
-import { EventDrain } from "./event-drain";
 import {
   ConnectTarget,
+  DiscoverySource as NativeDiscoverySource,
+  DriverFailureKind as NativeDriverFailureKind,
+  EndpointErrorKind as NativeEndpointErrorKind,
+  NatErrorKind as NativeNatErrorKind,
   P2pEndpoint,
+  Reachability as NativeReachability,
   circuitAddress as nativeCircuitAddress,
   generateSecretKey as nativeGenerateSecretKey,
   peerIdFromSecretKey as nativePeerIdFromSecretKey,
@@ -165,7 +178,11 @@ class ReactNativeBackend implements Minip2pBackend {
   }
 
   reachability(): Reachability {
-    return translateErrors(() => this.#endpoint.reachability()) as Reachability;
+    return sdkName(
+      Reachability,
+      NativeReachability,
+      translateErrors(() => this.#endpoint.reachability())
+    );
   }
 
   isRunning(): boolean {
@@ -319,70 +336,79 @@ export function circuitAddress(relayAddress: string, peerId: string): string {
 }
 
 /**
- * Maps native `u64` connection identities to small public numbers.
- *
- * Native connection IDs span the full `u64` range, so they cannot round-trip
- * through a JavaScript `number`. Each endpoint owns one map so a native ID
- * resolves to the same public ID in events and synchronous results. An entry
- * is released once its `ConnectionClosed`, or the `ConnectionReplaced` that
- * retires it, is normalized, which bounds the map by live connections. Public
- * numbers come from a counter that never repeats, so an event arriving after
- * the release gets a fresh number instead of aliasing a live connection.
- * Stream operations map the public ID back to native. Stream and
- * connect-attempt IDs are not mapped because native allocates them well
- * inside the safe integer range.
+ * A generated UniFFI enum: numeric members plus TypeScript's reverse mapping
+ * from each number to its variant name.
  */
-class ConnectionIdMap {
-  readonly #publicByNative = new Map<bigint, number>();
-  readonly #nativeByPublic = new Map<number, bigint>();
-  #next = 1;
+type NativeEnum = Readonly<Record<number, string>>;
 
-  toPublic(native: bigint): number {
-    const existing = this.#publicByNative.get(native);
-    if (existing !== undefined) {
-      return existing;
-    }
-    const publicId = this.#next;
-    this.#next += 1;
-    this.#publicByNative.set(native, publicId);
-    this.#nativeByPublic.set(publicId, native);
-    return publicId;
-  }
+/** An SDK enum: each variant name maps to itself. */
+type SdkEnum<Name extends string> = Readonly<Record<Name, Name>>;
 
-  /**
-   * The native ID behind a public one. Stream operations pass it back so
-   * native rejects a stream whose connection it already replaced. A released
-   * connection throws `StreamClosedError`: its stream operation can run after
-   * the release but before the SDK dispatches the ending event.
-   */
-  toNative(publicId: number): bigint {
-    const native = this.#nativeByPublic.get(publicId);
-    if (native === undefined) {
-      throw new StreamClosedError("The stream's connection ended");
-    }
-    return native;
+/**
+ * The SDK name of a generated enum value. UniFFI numbers flat enums while
+ * the SDK uses the Rust variant names, so this goes through the generated
+ * reverse mapping rather than a parallel numeric table.
+ */
+function sdkName<Name extends string>(
+  names: SdkEnum<Name>,
+  native: NativeEnum,
+  value: number
+): Name {
+  const name = native[value];
+  const isName = (candidate: string): candidate is Name =>
+    Object.hasOwn(names, candidate);
+  if (name === undefined || !isName(name)) {
+    throw new TypeError(
+      `The native endpoint returned an unknown enum ${value}`
+    );
   }
-
-  release(publicId: number): void {
-    const native = this.#nativeByPublic.get(publicId);
-    if (native !== undefined) {
-      this.#nativeByPublic.delete(publicId);
-      this.#publicByNative.delete(native);
-    }
-  }
+  return names[name];
 }
+
+/** Event fields carrying a generated enum, with its SDK counterpart. */
+const ENUM_FIELDS: Readonly<
+  Record<
+    string,
+    Readonly<Record<string, readonly [SdkEnum<string>, NativeEnum]>>
+  >
+> = {
+  ConnectFailed: { kind: [NatErrorKind, NativeNatErrorKind] },
+  DiscoveryProtocolViolation: {
+    source: [DiscoverySource, NativeDiscoverySource],
+  },
+  DriverFailed: { kind: [DriverFailureKind, NativeDriverFailureKind] },
+  EndpointError: { kind: [EndpointErrorKind, NativeEndpointErrorKind] },
+  PeerDiscovered: { source: [DiscoverySource, NativeDiscoverySource] },
+  PeerUpdated: { source: [DiscoverySource, NativeDiscoverySource] },
+  ReachabilityChanged: {
+    current: [Reachability, NativeReachability],
+    previous: [Reachability, NativeReachability],
+  },
+};
 
 function normalizeEvent(
   event: NativeP2pEvent,
   connectionIds: ConnectionIdMap
 ): P2pEvent {
-  const normalized = normalizeBigInts(
-    {
-      inner: event.inner,
-      tag: event.tag,
-    },
-    connectionIds
-  ) as P2pEvent;
+  const inner = normalizeBigInts(event.inner, connectionIds);
+  if (inner === null || typeof inner !== "object") {
+    throw new TypeError("The native endpoint returned an invalid event");
+  }
+  const enumFields = Object.entries(ENUM_FIELDS[event.tag] ?? {}).map(
+    ([field, [names, native]]) => {
+      const value: unknown = Reflect.get(inner, field);
+      if (typeof value !== "number") {
+        throw new TypeError(`The native ${event.tag} has an invalid ${field}`);
+      }
+      return [field, sdkName(names, native, value)] as const;
+    }
+  );
+  // The generated event and the SDK event share one shape (see the
+  // `minip2p-ffi-core` UniFFI derives) once integers and enums are converted.
+  const normalized = {
+    inner: { ...inner, ...Object.fromEntries(enumFields) },
+    tag: event.tag,
+  } as P2pEvent;
   if (normalized.tag === P2pEvent_Tags.ConnectionClosed) {
     connectionIds.release(normalized.inner.connId);
   } else if (normalized.tag === P2pEvent_Tags.ConnectionReplaced) {
@@ -456,14 +482,6 @@ function toArrayBuffer(value: Bytes): ArrayBuffer {
 function numberToU64(value: number, name: string): bigint {
   assertSafeUnsignedInteger(value, name);
   return BigInt(value);
-}
-
-function u64ToNumber(value: bigint, name: string): number {
-  const number = Number(value);
-  if (!Number.isSafeInteger(number) || number < 0) {
-    throw new RangeError(`${name} exceeds JavaScript's safe integer range`);
-  }
-  return number;
 }
 
 function assertSafeUnsignedInteger(value: number, name: string): void {

@@ -40,51 +40,51 @@ export interface Minip2pMdnsOptions {
 
 /** Coarse local reachability states. */
 export const Reachability = {
-  Private: 2,
-  Public: 1,
-  Unknown: 0,
+  Private: "Private",
+  Public: "Public",
+  Unknown: "Unknown",
 } as const;
 export type Reachability = (typeof Reachability)[keyof typeof Reachability];
 
 /** Sources contributing peer-discovery observations. */
 export const DiscoverySource = {
-  Mdns: 1,
-  SignedBeacon: 0,
+  Mdns: "Mdns",
+  SignedBeacon: "SignedBeacon",
 } as const;
 export type DiscoverySource =
   (typeof DiscoverySource)[keyof typeof DiscoverySource];
 
 /** Fatal native-driver failure categories. */
 export const DriverFailureKind = {
-  Invariant: 2,
-  Panic: 3,
-  Swarm: 1,
-  Transport: 0,
+  Invariant: "Invariant",
+  Panic: "Panic",
+  Swarm: "Swarm",
+  Transport: "Transport",
 } as const;
 export type DriverFailureKind =
   (typeof DriverFailureKind)[keyof typeof DriverFailureKind];
 
 /** Non-fatal endpoint runtime error categories. */
 export const EndpointErrorKind = {
-  Driver: 7,
-  Identify: 2,
-  IdentifyStreamRejected: 4,
-  Multistream: 1,
-  OpenStreamFailed: 5,
-  Ping: 3,
-  Transport: 0,
-  UnsupportedProtocol: 6,
+  Driver: "Driver",
+  Identify: "Identify",
+  IdentifyStreamRejected: "IdentifyStreamRejected",
+  Multistream: "Multistream",
+  OpenStreamFailed: "OpenStreamFailed",
+  Ping: "Ping",
+  Transport: "Transport",
+  UnsupportedProtocol: "UnsupportedProtocol",
 } as const;
 export type EndpointErrorKind =
   (typeof EndpointErrorKind)[keyof typeof EndpointErrorKind];
 
 /** Terminal NAT connection failure categories. */
 export const NatErrorKind = {
-  DialFailed: 2,
-  NoPathAvailable: 0,
-  Protocol: 3,
-  RelayRefused: 4,
-  Timeout: 1,
+  DialFailed: "DialFailed",
+  NoPathAvailable: "NoPathAvailable",
+  Protocol: "Protocol",
+  RelayRefused: "RelayRefused",
+  Timeout: "Timeout",
 } as const;
 export type NatErrorKind = (typeof NatErrorKind)[keyof typeof NatErrorKind];
 

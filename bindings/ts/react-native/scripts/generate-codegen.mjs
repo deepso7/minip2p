@@ -11,6 +11,11 @@ import {
 import path from "node:path";
 import process from "node:process";
 
+import {
+  customizeGenerated,
+  normalizeGenerated,
+} from "./normalize-generated.mjs";
+
 const packageRoot = path.resolve(import.meta.dirname, "..");
 const workspaceRoot = path.resolve(packageRoot, "../../..");
 const cli = path.join(
@@ -35,6 +40,8 @@ function run(command, args, cwd) {
   }
 }
 
+// Codegen reads the customized spec, so the mDNS hooks land first.
+customizeGenerated();
 run(process.execPath, [cli, "codegen", "--source", "library"], packageRoot);
 
 const generatedJavaRoot = path.join(packageRoot, "android/generated/java");
@@ -57,3 +64,4 @@ rmSync(path.join(generatedJavaRoot, "com/facebook"), {
   force: true,
   recursive: true,
 });
+normalizeGenerated();

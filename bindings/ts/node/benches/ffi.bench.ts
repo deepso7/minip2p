@@ -26,7 +26,7 @@ beforeAll(async () => {
     // Match the raw remote, which drains ready events without rejecting them.
     void stream;
   });
-  await sdkA.connect(sdkB.listenAddrs()[0], { timeoutMs: TIMEOUT_MS });
+  await sdkA.connect(firstAddr(sdkB.listenAddrs()), { timeoutMs: TIMEOUT_MS });
   await Promise.all([
     sdkA.waitPeerReady(sdkB.peerId(), { timeoutMs: TIMEOUT_MS }),
     sdkB.waitPeerReady(sdkA.peerId(), { timeoutMs: TIMEOUT_MS }),
@@ -35,7 +35,7 @@ beforeAll(async () => {
   cleanup.push(() => rawA.close());
   rawB = createRaw(true);
   cleanup.push(() => rawB.close());
-  rawA.connect([rawB.listenAddrs()[0]]);
+  rawA.connect([firstAddr(rawB.listenAddrs())]);
   await Promise.all([
     waitRawReady(rawA, rawB.peerId()),
     waitRawReady(rawB, rawA.peerId()),
@@ -83,7 +83,11 @@ describe("node-ffi", () => {
         throw new Error(`Timed out draining raw events: ${seen}/${BURST}`);
       }
       for (const stream of streams) {
-        rawA.abandonStream(rawB.peerId(), stream.connId, stream.streamId);
+        rawA.abandonStream(
+          rawB.peerId(),
+          BigInt(stream.connId),
+          BigInt(stream.streamId)
+        );
       }
     }).run();
   });
@@ -123,6 +127,14 @@ function createRaw(drainOnDoorbell = false): NativeEndpoint {
     }
   });
   return endpoint;
+}
+
+function firstAddr(addrs: readonly string[]): string {
+  const [addr] = addrs;
+  if (addr === undefined) {
+    throw new Error("Endpoint has no listen address");
+  }
+  return addr;
 }
 
 function drainAllEvents(endpoint: NativeEndpoint): void {

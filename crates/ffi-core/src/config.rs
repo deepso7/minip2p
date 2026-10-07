@@ -4,6 +4,7 @@ use std::fmt;
 
 /// Signed-discovery configuration.
 #[derive(Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DiscoveryOptions {
     /// Pubsub topic carrying signed discovery beacons.
     pub topic: String,
@@ -29,6 +30,7 @@ impl fmt::Debug for DiscoveryOptions {
 
 /// Local-link mDNS discovery configuration.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct MdnsOptions {
     /// Whether IPv6 interfaces and advertisements are enabled.
     pub enable_ipv6: bool,
@@ -50,6 +52,7 @@ pub struct MdnsOptions {
 
 /// Configuration used to construct an FFI endpoint.
 #[derive(Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct EndpointConfig {
     /// Identify agent version, or the crate-derived default when absent.
     pub agent_version: Option<String>,
@@ -77,6 +80,12 @@ pub struct EndpointConfig {
 
 /// One peer in the shared discovery address book.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
 pub struct KnownPeerInfo {
     /// Discovered peer.
     pub peer_id: String,
@@ -87,8 +96,10 @@ pub struct KnownPeerInfo {
     /// Addresses learned from unauthenticated mDNS.
     pub mdns_addrs: Vec<String>,
     /// Age of the most recent signed beacon.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub beacon_last_seen_age_ms: Option<u64>,
     /// Age of the most recent mDNS observation.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub mdns_last_seen_age_ms: Option<u64>,
     /// Whether the endpoint currently has a connection to this peer.
     pub connected: bool,
@@ -96,10 +107,17 @@ pub struct KnownPeerInfo {
 
 /// Snapshot of the active inbound relay reservation.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
 pub struct RelayReservationInfo {
     /// Relay holding the reservation.
     pub relay_peer_id: String,
     /// Absolute relay-reported expiry, when present.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub expires_unix_secs: Option<u64>,
 }
 

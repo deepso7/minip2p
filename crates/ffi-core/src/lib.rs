@@ -20,6 +20,8 @@ mod driver;
 mod endpoint;
 mod error;
 mod events;
+#[cfg(feature = "serde")]
+mod js_shape;
 
 pub use config::{
     DiscoveryOptions, EndpointConfig, KnownPeerInfo, MdnsOptions, RelayReservationInfo,
@@ -36,6 +38,11 @@ pub use events::{
 use std::str::FromStr;
 
 use minip2p::{Ed25519Keypair, Multiaddr, PeerAddr, PeerId, Protocol};
+
+// The `uniffi` feature makes this crate its own UniFFI namespace, so the
+// UniFFI shell exports these records, enums and errors without mirroring them.
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
 
 const SECRET_KEY_LENGTH: usize = 32;
 

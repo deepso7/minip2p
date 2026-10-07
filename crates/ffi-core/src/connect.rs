@@ -8,6 +8,7 @@ use crate::{FfiError, parse_direct_peer_addr};
 /// Validation for every form lives in this module, once; binding shells only
 /// adapt the shape to their toolchain.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ConnectTarget {
     /// Peer ID only: the endpoint applies its discovery-book and relay
     /// policy.

@@ -34,8 +34,8 @@ describe("native event payloads", () => {
     ]);
     a.sendStream(
       b.peerId(),
-      stream.connId,
-      stream.streamId,
+      BigInt(stream.connId),
+      BigInt(stream.streamId),
       Uint8Array.of(0, 127, 255)
     );
 

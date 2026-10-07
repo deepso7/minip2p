@@ -16,7 +16,7 @@ crate-type = ["lib", "staticlib", "cdylib"]
 workspace = true
 
 [dependencies]
-minip2p-ffi-core = { path = "../ffi-core" }
+minip2p-ffi-core = { path = "../ffi-core", features = ["uniffi"] }
 # Must remain paired with ubrn and @ubjs/core 0.31.0-5.
 uniffi = "=0.31.2"
 

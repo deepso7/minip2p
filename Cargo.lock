@@ -1300,8 +1300,10 @@ dependencies = [
  "minip2p-rs",
  "minip2p-swarm",
  "minip2p-test-support",
+ "serde",
  "serde_json",
  "thiserror",
+ "uniffi",
 ]
 
 [[package]]
@@ -1368,7 +1370,6 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "serde",
- "serde_json",
 ]
 
 [[package]]

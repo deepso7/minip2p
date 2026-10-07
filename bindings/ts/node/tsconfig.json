@@ -2,8 +2,8 @@
   "extends": "../core/tsconfig.json",
   "compilerOptions": {
     "customConditions": ["minip2p-source"],
-    "rootDir": "src",
+    "rootDir": ".",
     "types": ["node"]
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "benches/**/*.ts"]
 }

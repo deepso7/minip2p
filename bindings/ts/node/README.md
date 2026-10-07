@@ -28,3 +28,5 @@ Build the package from this repository and run its test suite with:
 pnpm native:build
 pnpm test
 ```
+
+`native:build` also regenerates `src/addon.d.ts`, the checked-in declarations of the native addon. Its header (`addon-header.d.ts.txt`) imports the value types from `src/native-shape.ts`, which derives each one from the SDK's backend types. Commit the regenerated file; CI fails when it is stale.

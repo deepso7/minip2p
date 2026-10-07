@@ -146,16 +146,18 @@ const native = vi.hoisted(() => {
       return "local";
     }
 
-    peerInfo(): null {
-      return null;
+    identify: Readonly<Record<string, unknown>> | null = null;
+
+    peerInfo(): typeof this.identify {
+      return this.identify;
     }
 
     ping(): void {}
 
     publish(): void {}
 
-    reachability(): number {
-      return 0;
+    reachability(): string {
+      return "Private";
     }
 
     resetStream(): void {}
@@ -368,6 +370,62 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
+  test("Identify public keys reach the SDK as ArrayBuffers", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const info = {
+      listenAddrs: [],
+      protocols: ["/ipfs/id/1.0.0"],
+      publicKey: Uint8Array.of(8, 1, 18),
+    };
+    fake.identify = info;
+    const received: unknown[] = [];
+    endpoint.on("identifyReceived", (event) => received.push(event.info));
+    fake.enqueue(
+      [{ inner: { info, peerId: "peer" }, tag: "IdentifyReceived" }],
+      []
+    );
+
+    fake.ring();
+    await settle();
+
+    for (const snapshot of [endpoint.peerInfo("peer"), ...received]) {
+      expect(snapshot).toEqual({
+        listenAddrs: [],
+        protocols: ["/ipfs/id/1.0.0"],
+        publicKey: Uint8Array.of(8, 1, 18).buffer,
+      });
+      expect(snapshot).toMatchObject({ publicKey: expect.any(ArrayBuffer) });
+    }
+    expect(received).toHaveLength(1);
+    endpoint.close();
+  });
+
+  test("native enum names pass through to the SDK", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const kinds: string[] = [];
+    endpoint.on("endpointError", ({ kind }) => kinds.push(kind));
+    fake.enqueue(
+      [
+        {
+          inner: { detail: "refused", kind: "OpenStreamFailed" },
+          tag: "EndpointError",
+        },
+      ],
+      []
+    );
+
+    fake.ring();
+    await settle();
+
+    expect(kinds).toEqual(["OpenStreamFailed"]);
+    expect(endpoint.reachability()).toBe("Private");
+    endpoint.close();
+  });
+
   test("returns no discovery clock when the native option is null", () => {
     const endpoint = createEndpoint();
 
@@ -384,7 +442,7 @@ describe("Node adapter", () => {
     fake.enqueue(
       [
         {
-          inner: { detail: "boom", kind: 0, streamId: 4n },
+          inner: { detail: "boom", kind: "Transport", streamId: 4n },
           tag: "EndpointError",
         },
       ],

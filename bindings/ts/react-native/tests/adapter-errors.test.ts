@@ -6,7 +6,7 @@ import {
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { Minip2p } from "../src/adapter";
-import { FfiError } from "../src/generated/minip2p_ffi";
+import { FfiError } from "../src/generated/minip2p_ffi_core";
 import { FakeNativeEndpoint } from "./fake-native-endpoint";
 
 vi.mock("../src/native", async () => {

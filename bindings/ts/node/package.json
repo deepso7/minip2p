@@ -39,10 +39,10 @@
   },
   "scripts": {
     "bench": "vitest bench --run --reporter=default --reporter=json --outputFile ../../../target/bench-node-vitest.json && python3 ../../../scripts/bench_results.py vitest --report ../../../target/bench-node-vitest.json --output ../../../target/bench-results/node-ffi.json --git-sha \"${BENCH_GIT_SHA:-$(git rev-parse HEAD)}\"",
-    "build": "del-cli dist && tsc -p tsconfig.build.json",
+    "build": "del-cli dist && tsc -p tsconfig.build.json && node -e \"require('node:fs').copyFileSync('src/addon.d.ts', 'dist/addon.d.ts')\"",
     "clean": "del-cli dist",
-    "native:build": "napi build --platform --no-js --dts ../../../target/minip2p-nodejs.d.ts --release --manifest-path ../../../crates/nodejs/Cargo.toml --output-dir . -- --locked",
-    "native:build:target": "napi build --platform --no-js --dts ../../../target/minip2p-nodejs.d.ts --release --manifest-path ../../../crates/nodejs/Cargo.toml --output-dir .",
+    "native:build": "napi build --platform --no-js --dts src/addon.d.ts --release --manifest-path ../../../crates/nodejs/Cargo.toml --output-dir . -- --locked",
+    "native:build:target": "napi build --platform --no-js --dts src/addon.d.ts --release --manifest-path ../../../crates/nodejs/Cargo.toml --output-dir .",
     "pretest": "cargo build --locked -p minip2p-relay-server-example",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -71,6 +71,7 @@
   },
   "napi": {
     "binaryName": "minip2p",
+    "dtsHeaderFile": "addon-header.d.ts.txt",
     "targets": [
       "x86_64-unknown-linux-gnu",
       "x86_64-unknown-linux-musl",

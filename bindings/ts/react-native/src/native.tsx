@@ -12,11 +12,13 @@ if (!rustInstalled) {
 
 // Export the generated bindings to the app.
 export * from './generated/minip2p_ffi';
+export * from './generated/minip2p_ffi_core';
 
 // Now import the bindings so we can:
 // - intialize them
 // - export them as namespaced objects as the default export.
 import * as minip2p_ffi from './generated/minip2p_ffi';
+import * as minip2p_ffi_core from './generated/minip2p_ffi_core';
 
 // Initialize the generated bindings: mostly checksums, but also callbacks.
 // - the boolean flag ensures this loads exactly once, even if the JS code
@@ -24,6 +26,7 @@ import * as minip2p_ffi from './generated/minip2p_ffi';
 let initialized = false;
 if (!initialized) {
   minip2p_ffi.default.initialize();
+  minip2p_ffi_core.default.initialize();
   initialized = true;
 }
 
@@ -37,4 +40,5 @@ export async function uniffiInitAsync() {
 // Export the crates as individually namespaced objects.
 export default {
   minip2p_ffi,
+  minip2p_ffi_core,
 };

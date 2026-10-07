@@ -20,7 +20,18 @@ minip2p = { package = "minip2p-rs", path = "../minip2p", features = [
 ] }
 minip2p-swarm = { path = "../swarm" }
 minip2p-pubsub = { path = "../pubsub" }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
 thiserror = "2.0.20"
+# Must remain paired with crates/ffi, ubrn and @ubjs/core 0.31.0-5.
+uniffi = { version = "=0.31.2", optional = true }
+
+[features]
+# Derives the UniFFI record, enum and error metadata for the UniFFI binding
+# shell (`crates/ffi`). Other shells leave it off.
+uniffi = ["dep:uniffi"]
+# Derives `serde::Serialize` with the JavaScript-facing shape documented in
+# `js_shape`, for the napi-rs shell (`crates/nodejs`).
+serde = ["dep:serde"]
 
 [dev-dependencies]
 minip2p-relay = { path = "../relay" }

@@ -23,6 +23,7 @@ include_directories(
 add_library(react-native-minip2p            SHARED
     ../cpp/react-native-minip2p.cpp
     ../cpp/generated/minip2p_ffi.cpp
+    ../cpp/generated/minip2p_ffi_core.cpp
     cpp-adapter.cpp
 )
 

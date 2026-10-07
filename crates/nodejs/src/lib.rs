@@ -5,9 +5,8 @@
 use std::sync::Arc;
 
 use minip2p_ffi_core::{
-    ConnectTarget, DiscoveryOptions, DiscoverySource, DriverFailureKind, EndpointConfig,
-    EndpointErrorKind, EventDoorbell, FfiError, IdentifyInfo, MdnsOptions, NatErrorKind,
-    P2pEndpoint, P2pEvent, PathKind, Reachability,
+    ConnectTarget, DiscoveryOptions, EndpointConfig, EventDoorbell, FfiError, MdnsOptions,
+    P2pEndpoint,
 };
 use napi::bindgen_prelude::{BigInt, Either, JsObjectValue, JsValue, Uint8Array};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -126,26 +125,6 @@ fn convert_mdns(options: NodeMdnsOptions) -> Result<MdnsOptions> {
     })
 }
 
-/// Native stream identity returned to Node.js.
-#[napi(object)]
-pub struct NodeOpenStream {
-    /// Transport connection carrying the stream.
-    pub conn_id: BigInt,
-    /// Opaque transport stream identifier.
-    pub stream_id: BigInt,
-}
-
-/// State snapshot of the transport connection selected for a peer.
-#[napi(object)]
-pub struct NodeConnectionInfo {
-    /// Transport connection selected for the peer.
-    pub conn_id: BigInt,
-    /// Remote transport address, when recorded.
-    pub remote_addr: Option<String>,
-    /// Protocols this connection advertised, once it is ready.
-    pub ready_protocols: Option<Vec<String>>,
-}
-
 /// A native minip2p endpoint owned by Node.js.
 #[napi]
 pub struct NodeEndpoint(Arc<P2pEndpoint>);
@@ -164,7 +143,7 @@ impl NodeEndpoint {
     }
 
     /// Starts the detached driver with a strong event-loop doorbell.
-    #[napi]
+    #[napi(ts_args_type = "doorbell: () => void")]
     pub fn start(&self, env: Env, doorbell: Arc<DoorbellFunction>) -> Result<()> {
         self.0
             .start(Arc::new(NodeDoorbell(doorbell)))
@@ -196,12 +175,12 @@ impl NodeEndpoint {
     }
 
     /// Pulls a bounded batch of native events.
-    #[napi]
+    #[napi(ts_return_type = "Array<NativeEvent>")]
     pub fn drain_events(&self, env: Env, limit: u32) -> Result<Vec<Unknown<'static>>> {
         self.0
             .drain_events(limit)
-            .into_iter()
-            .map(|event| event_js_value(&env, event))
+            .iter()
+            .map(|event| env.to_js_value(event))
             .collect()
     }
 
@@ -222,12 +201,9 @@ impl NodeEndpoint {
     }
 
     /// Returns the latest Identify snapshot.
-    #[napi]
-    pub fn peer_info(&self, env: Env, peer_id: String) -> Result<Option<serde_json::Value>> {
-        self.0
-            .peer_info(peer_id)
-            .map(|info| info.map(identify_value))
-            .map_err(|error| native_error(&env, error))
+    #[napi(ts_return_type = "NativeIdentifyInfo | null")]
+    pub fn peer_info(&self, env: Env, peer_id: String) -> Result<Unknown<'static>> {
+        js_value(&env, self.0.peer_info(peer_id))
     }
 
     /// Accepted for compatibility; has no effect, since the driver sleeps until the endpoint's next deadline.
@@ -277,20 +253,14 @@ impl NodeEndpoint {
     }
 
     /// Starts opening an application stream.
-    #[napi]
+    #[napi(ts_return_type = "NativeOpenStream")]
     pub fn open_stream(
         &self,
         env: Env,
         peer_id: String,
         protocol_id: String,
-    ) -> Result<NodeOpenStream> {
-        self.0
-            .open_stream(peer_id, protocol_id)
-            .map(|stream| NodeOpenStream {
-                conn_id: stream.conn_id.into(),
-                stream_id: stream.stream_id.into(),
-            })
-            .map_err(|error| native_error(&env, error))
+    ) -> Result<Unknown<'static>> {
+        js_value(&env, self.0.open_stream(peer_id, protocol_id))
     }
 
     /// Sends bytes on an application stream, named by its connection and
@@ -399,51 +369,21 @@ impl NodeEndpoint {
     }
 
     /// Returns the current path to a peer.
-    #[napi]
-    pub fn path(&self, env: Env, peer_id: String) -> Result<Option<serde_json::Value>> {
-        self.0
-            .path(peer_id)
-            .map(|path| path.map(path_value))
-            .map_err(|error| native_error(&env, error))
+    #[napi(ts_return_type = "NativePathKind | null")]
+    pub fn path(&self, env: Env, peer_id: String) -> Result<Unknown<'static>> {
+        js_value(&env, self.0.path(peer_id))
     }
 
     /// Returns the transport connection selected for a peer.
-    #[napi]
-    pub fn connection_info(&self, env: Env, peer_id: String) -> Result<Option<NodeConnectionInfo>> {
-        self.0
-            .connection_info(peer_id)
-            .map(|info| {
-                info.map(|info| NodeConnectionInfo {
-                    conn_id: info.conn_id.into(),
-                    remote_addr: info.remote_addr,
-                    ready_protocols: info.ready_protocols,
-                })
-            })
-            .map_err(|error| native_error(&env, error))
+    #[napi(ts_return_type = "NativeConnectionInfo | null")]
+    pub fn connection_info(&self, env: Env, peer_id: String) -> Result<Unknown<'static>> {
+        js_value(&env, self.0.connection_info(peer_id))
     }
 
     /// Returns the discovery address book.
-    #[napi]
-    pub fn known_peers(&self, env: Env) -> Result<Vec<serde_json::Value>> {
-        self.0
-            .known_peers()
-            .map(|peers| {
-                peers
-                    .into_iter()
-                    .map(|peer| {
-                        serde_json::json!({
-                            "peerId": peer.peer_id,
-                            "addrs": peer.addrs,
-                            "beaconAddrs": peer.beacon_addrs,
-                            "mdnsAddrs": peer.mdns_addrs,
-                            "beaconLastSeenAgeMs": peer.beacon_last_seen_age_ms,
-                            "mdnsLastSeenAgeMs": peer.mdns_last_seen_age_ms,
-                            "connected": peer.connected,
-                        })
-                    })
-                    .collect()
-            })
-            .map_err(|error| native_error(&env, error))
+    #[napi(ts_return_type = "Array<NativeKnownPeerInfo>")]
+    pub fn known_peers(&self, env: Env) -> Result<Unknown<'static>> {
+        js_value(&env, self.0.known_peers())
     }
 
     /// Returns the discovery clock.
@@ -456,28 +396,15 @@ impl NodeEndpoint {
     }
 
     /// Returns the current reachability verdict.
-    #[napi]
-    pub fn reachability(&self, env: Env) -> Result<u32> {
-        self.0
-            .reachability()
-            .map(reachability_value)
-            .map_err(|error| native_error(&env, error))
+    #[napi(ts_return_type = "Reachability")]
+    pub fn reachability(&self, env: Env) -> Result<Unknown<'static>> {
+        js_value(&env, self.0.reachability())
     }
 
     /// Returns the active relay reservation.
-    #[napi]
-    pub fn active_reservation(&self, env: Env) -> Result<Option<serde_json::Value>> {
-        self.0
-            .active_reservation()
-            .map(|reservation| {
-                reservation.map(|reservation| {
-                    serde_json::json!({
-                        "relayPeerId": reservation.relay_peer_id,
-                        "expiresUnixSecs": reservation.expires_unix_secs,
-                    })
-                })
-            })
-            .map_err(|error| native_error(&env, error))
+    #[napi(ts_return_type = "NativeRelayReservationInfo | null")]
+    pub fn active_reservation(&self, env: Env) -> Result<Unknown<'static>> {
+        js_value(&env, self.0.active_reservation())
     }
 }
 
@@ -539,452 +466,15 @@ fn native_error(env: &Env, error: FfiError) -> Error {
     tagged().unwrap_or_else(|_| Error::from_reason(error.to_string()))
 }
 
-fn event_js_value(env: &Env, event: P2pEvent) -> Result<Unknown<'static>> {
-    match event {
-        P2pEvent::StreamData {
-            peer_id,
-            conn_id,
-            stream_id,
-            data,
-        } => env.to_js_value(&EventEnvelope {
-            tag: "StreamData",
-            inner: StreamDataValue {
-                peer_id,
-                conn_id,
-                stream_id,
-                data: NodeBytes(data),
-            },
-        }),
-        P2pEvent::Message {
-            from_peer_id,
-            topics,
-            data,
-            seqno,
-            signed,
-        } => env.to_js_value(&EventEnvelope {
-            tag: "Message",
-            inner: MessageValue {
-                from_peer_id,
-                topics,
-                data: NodeBytes(data),
-                seqno: NodeBytes(seqno),
-                signed,
-            },
-        }),
-        event => env.to_js_value(&event_value(event)),
-    }
-}
-
-#[derive(serde::Serialize)]
-struct EventEnvelope<T> {
-    tag: &'static str,
-    inner: T,
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StreamDataValue {
-    peer_id: String,
-    conn_id: u64,
-    stream_id: u64,
-    data: NodeBytes,
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MessageValue {
-    from_peer_id: String,
-    topics: Vec<String>,
-    data: NodeBytes,
-    seqno: NodeBytes,
-    signed: bool,
-}
-
-struct NodeBytes(Vec<u8>);
-
-impl serde::Serialize for NodeBytes {
-    fn serialize<S>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_bytes(&self.0)
-    }
-}
-
-fn event_value(event: P2pEvent) -> serde_json::Value {
-    let (tag, inner) = match event {
-        P2pEvent::EventsDropped {
-            dropped,
-            total_dropped,
-            terminal_connect_ids,
-        } => (
-            "EventsDropped",
-            serde_json::json!({
-                "dropped": dropped,
-                "totalDropped": total_dropped,
-                "terminalConnectIds": terminal_connect_ids,
-            }),
-        ),
-        P2pEvent::DriverFailed { kind, detail } => (
-            "DriverFailed",
-            serde_json::json!({ "kind": driver_failure_value(kind), "detail": detail }),
-        ),
-        P2pEvent::ConnectionEstablished { peer_id, conn_id } => (
-            "ConnectionEstablished",
-            serde_json::json!({ "peerId": peer_id, "connId": conn_id }),
-        ),
-        P2pEvent::ConnectionClosed { peer_id, conn_id } => (
-            "ConnectionClosed",
-            serde_json::json!({ "peerId": peer_id, "connId": conn_id }),
-        ),
-        P2pEvent::ConnectionReplaced {
-            peer_id,
-            old_conn_id,
-            new_conn_id,
-        } => (
-            "ConnectionReplaced",
-            serde_json::json!({
-                "peerId": peer_id,
-                "oldConnId": old_conn_id,
-                "newConnId": new_conn_id,
-            }),
-        ),
-        P2pEvent::PeerReady {
-            peer_id,
-            conn_id,
-            protocols,
-        } => (
-            "PeerReady",
-            serde_json::json!({ "peerId": peer_id, "connId": conn_id, "protocols": protocols }),
-        ),
-        P2pEvent::IdentifyReceived { peer_id, info } => (
-            "IdentifyReceived",
-            serde_json::json!({ "peerId": peer_id, "info": identify_value(info) }),
-        ),
-        P2pEvent::PingRttMeasured { peer_id, rtt_ms } => (
-            "PingRttMeasured",
-            serde_json::json!({ "peerId": peer_id, "rttMs": rtt_ms }),
-        ),
-        P2pEvent::PingTimeout { peer_id } => {
-            ("PingTimeout", serde_json::json!({ "peerId": peer_id }))
-        }
-        P2pEvent::StreamReady {
-            peer_id,
-            conn_id,
-            stream_id,
-            protocol_id,
-            initiated_locally,
-        } => (
-            "StreamReady",
-            serde_json::json!({
-                "peerId": peer_id,
-                "connId": conn_id,
-                "streamId": stream_id,
-                "protocolId": protocol_id,
-                "initiatedLocally": initiated_locally,
-            }),
-        ),
-        P2pEvent::StreamData {
-            peer_id,
-            conn_id,
-            stream_id,
-            data,
-        } => (
-            "StreamData",
-            serde_json::json!({
-                "peerId": peer_id,
-                "connId": conn_id,
-                "streamId": stream_id,
-                "data": data,
-            }),
-        ),
-        P2pEvent::StreamRemoteWriteClosed {
-            peer_id,
-            conn_id,
-            stream_id,
-        } => (
-            "StreamRemoteWriteClosed",
-            serde_json::json!({
-                "peerId": peer_id,
-                "connId": conn_id,
-                "streamId": stream_id,
-            }),
-        ),
-        P2pEvent::StreamClosed {
-            peer_id,
-            conn_id,
-            stream_id,
-        } => (
-            "StreamClosed",
-            serde_json::json!({
-                "peerId": peer_id,
-                "connId": conn_id,
-                "streamId": stream_id,
-            }),
-        ),
-        P2pEvent::EndpointError {
-            kind,
-            peer_id,
-            conn_id,
-            stream_id,
-            detail,
-        } => (
-            "EndpointError",
-            serde_json::json!({
-                "kind": endpoint_error_value(kind),
-                "peerId": peer_id,
-                "connId": conn_id,
-                "streamId": stream_id,
-                "detail": detail,
-            }),
-        ),
-        P2pEvent::ReachabilityChanged {
-            previous,
-            current,
-            confirmed_addrs,
-        } => (
-            "ReachabilityChanged",
-            serde_json::json!({
-                "previous": reachability_value(previous),
-                "current": reachability_value(current),
-                "confirmedAddrs": confirmed_addrs,
-            }),
-        ),
-        P2pEvent::PublicAddressesChanged { addrs } => (
-            "PublicAddressesChanged",
-            serde_json::json!({ "addrs": addrs }),
-        ),
-        P2pEvent::RelayReserved {
-            relay_peer_id,
-            expires_unix_secs,
-        } => (
-            "RelayReserved",
-            serde_json::json!({
-                "relayPeerId": relay_peer_id,
-                "expiresUnixSecs": expires_unix_secs,
-            }),
-        ),
-        P2pEvent::RelayReservationLost { relay_peer_id } => (
-            "RelayReservationLost",
-            serde_json::json!({ "relayPeerId": relay_peer_id }),
-        ),
-        P2pEvent::PathEstablished {
-            connect_id,
-            peer_id,
-            conn_id,
-            path,
-        } => (
-            "PathEstablished",
-            serde_json::json!({
-                "connectId": connect_id,
-                "peerId": peer_id,
-                "connId": conn_id,
-                "path": path_value(path),
-            }),
-        ),
-        P2pEvent::InboundPathEstablished { peer_id, path } => (
-            "InboundPathEstablished",
-            serde_json::json!({ "peerId": peer_id, "path": path_value(path) }),
-        ),
-        P2pEvent::PathUpgraded {
-            connect_id,
-            peer_id,
-            from,
-            to,
-        } => (
-            "PathUpgraded",
-            serde_json::json!({
-                "connectId": connect_id,
-                "peerId": peer_id,
-                "from": path_value(from),
-                "to": path_value(to),
-            }),
-        ),
-        P2pEvent::HolePunchFailed {
-            connect_id,
-            attempt,
-            reason,
-        } => (
-            "HolePunchFailed",
-            serde_json::json!({
-                "connectId": connect_id,
-                "attempt": attempt,
-                "reason": reason,
-            }),
-        ),
-        P2pEvent::ConnectFailed {
-            connect_id,
-            peer_id,
-            kind,
-            detail,
-        } => (
-            "ConnectFailed",
-            serde_json::json!({
-                "connectId": connect_id,
-                "peerId": peer_id,
-                "kind": nat_error_value(kind),
-                "detail": detail,
-            }),
-        ),
-        P2pEvent::ConnectCancelled {
-            connect_id,
-            peer_id,
-        } => (
-            "ConnectCancelled",
-            serde_json::json!({ "connectId": connect_id, "peerId": peer_id }),
-        ),
-        P2pEvent::InboundDirectUpgrade { peer_id } => (
-            "InboundDirectUpgrade",
-            serde_json::json!({ "peerId": peer_id }),
-        ),
-        P2pEvent::Message {
-            from_peer_id,
-            topics,
-            data,
-            seqno,
-            signed,
-        } => (
-            "Message",
-            serde_json::json!({
-                "fromPeerId": from_peer_id,
-                "topics": topics,
-                "data": data,
-                "seqno": seqno,
-                "signed": signed,
-            }),
-        ),
-        P2pEvent::PeerSubscribed { peer_id, topic } => (
-            "PeerSubscribed",
-            serde_json::json!({ "peerId": peer_id, "topic": topic }),
-        ),
-        P2pEvent::PeerUnsubscribed { peer_id, topic } => (
-            "PeerUnsubscribed",
-            serde_json::json!({ "peerId": peer_id, "topic": topic }),
-        ),
-        P2pEvent::GossipsubOutboundFailure { peer_id, reason } => (
-            "GossipsubOutboundFailure",
-            serde_json::json!({ "peerId": peer_id, "reason": reason }),
-        ),
-        P2pEvent::GossipsubProtocolViolation { peer_id, reason } => (
-            "GossipsubProtocolViolation",
-            serde_json::json!({ "peerId": peer_id, "reason": reason }),
-        ),
-        P2pEvent::PeerDiscovered {
-            peer_id,
-            addrs,
-            source,
-        } => (
-            "PeerDiscovered",
-            serde_json::json!({
-                "peerId": peer_id,
-                "addrs": addrs,
-                "source": discovery_source_value(source),
-            }),
-        ),
-        P2pEvent::PeerUpdated {
-            peer_id,
-            addrs,
-            source,
-        } => (
-            "PeerUpdated",
-            serde_json::json!({
-                "peerId": peer_id,
-                "addrs": addrs,
-                "source": discovery_source_value(source),
-            }),
-        ),
-        P2pEvent::PeerExpired { peer_id } => {
-            ("PeerExpired", serde_json::json!({ "peerId": peer_id }))
-        }
-        P2pEvent::DiscoveryDialFailed { peer_id, reason } => (
-            "DiscoveryDialFailed",
-            serde_json::json!({ "peerId": peer_id, "reason": reason }),
-        ),
-        P2pEvent::DiscoveryProtocolViolation {
-            peer_id,
-            source,
-            reason,
-            suppressed,
-        } => (
-            "DiscoveryProtocolViolation",
-            serde_json::json!({
-                "peerId": peer_id,
-                "source": discovery_source_value(source),
-                "reason": reason,
-                "suppressed": suppressed,
-            }),
-        ),
-    };
-    serde_json::json!({ "tag": tag, "inner": inner })
-}
-
-fn identify_value(info: IdentifyInfo) -> serde_json::Value {
-    serde_json::json!({
-        "publicKey": info.public_key,
-        "listenAddrs": info.listen_addrs,
-        "protocols": info.protocols,
-        "observedAddr": info.observed_addr,
-        "protocolVersion": info.protocol_version,
-        "agentVersion": info.agent_version,
-    })
-}
-
-fn path_value(path: PathKind) -> serde_json::Value {
-    match path {
-        PathKind::DirectDialed => serde_json::json!({ "tag": "DirectDialed" }),
-        PathKind::DirectPunched => serde_json::json!({ "tag": "DirectPunched" }),
-        PathKind::Relayed { relay_peer_id } => serde_json::json!({
-            "tag": "Relayed",
-            "inner": { "relayPeerId": relay_peer_id },
-        }),
-    }
-}
-
-const fn reachability_value(value: Reachability) -> u32 {
-    match value {
-        Reachability::Unknown => 0,
-        Reachability::Public => 1,
-        Reachability::Private => 2,
-    }
-}
-
-const fn discovery_source_value(value: DiscoverySource) -> u32 {
-    match value {
-        DiscoverySource::SignedBeacon => 0,
-        DiscoverySource::Mdns => 1,
-    }
-}
-
-const fn endpoint_error_value(value: EndpointErrorKind) -> u32 {
-    match value {
-        EndpointErrorKind::Transport => 0,
-        EndpointErrorKind::Multistream => 1,
-        EndpointErrorKind::Identify => 2,
-        EndpointErrorKind::Ping => 3,
-        EndpointErrorKind::IdentifyStreamRejected => 4,
-        EndpointErrorKind::OpenStreamFailed => 5,
-        EndpointErrorKind::UnsupportedProtocol => 6,
-        EndpointErrorKind::Driver => 7,
-    }
-}
-
-const fn nat_error_value(value: NatErrorKind) -> u32 {
-    match value {
-        NatErrorKind::NoPathAvailable => 0,
-        NatErrorKind::Timeout => 1,
-        NatErrorKind::DialFailed => 2,
-        NatErrorKind::Protocol => 3,
-        NatErrorKind::RelayRefused => 4,
-    }
-}
-
-const fn driver_failure_value(value: DriverFailureKind) -> u32 {
-    match value {
-        DriverFailureKind::Transport => 0,
-        DriverFailureKind::Swarm => 1,
-        DriverFailureKind::Invariant => 2,
-        DriverFailureKind::Panic => 3,
-    }
+/// Converts a core result into its JS value through the serde shape that
+/// `minip2p-ffi-core` defines behind its `serde` feature; `None` becomes `null`.
+fn js_value<T: serde::Serialize>(
+    env: &Env,
+    value: core::result::Result<T, FfiError>,
+) -> Result<Unknown<'static>> {
+    value
+        .map_err(|error| native_error(env, error))
+        .and_then(|value| env.to_js_value(&value))
 }
 
 fn bigint_u64(value: BigInt, name: &str) -> Result<u64> {

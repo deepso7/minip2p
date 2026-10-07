@@ -2,19 +2,15 @@
 
 #![warn(missing_docs)]
 
-mod config;
 mod endpoint;
-mod error;
-mod events;
 
-pub use config::{
-    DiscoveryOptions, EndpointConfig, KnownPeerInfo, MdnsOptions, RelayReservationInfo,
-};
 pub use endpoint::P2pEndpoint;
-pub use error::FfiError;
-pub use events::{
-    ConnectTarget, ConnectionInfo, DiscoverySource, DriverFailureKind, EndpointErrorKind,
-    IdentifyInfo, NatErrorKind, OpenStreamResult, P2pEvent, PathKind, Reachability,
+// Records, enums and errors are UniFFI types of `minip2p-ffi-core` itself,
+// derived behind its `uniffi` feature.
+pub use minip2p_ffi_core::{
+    ConnectTarget, ConnectionInfo, DiscoveryOptions, DiscoverySource, DriverFailureKind,
+    EndpointConfig, EndpointErrorKind, FfiError, IdentifyInfo, KnownPeerInfo, MdnsOptions,
+    NatErrorKind, OpenStreamResult, P2pEvent, PathKind, Reachability, RelayReservationInfo,
 };
 
 /// Doorbell implemented by the embedding runtime.

@@ -1,5 +1,11 @@
 /* oxlint-disable func-style -- Use named function declarations for script helpers. */
 
+// Post-processes ubrn's generated TurboModule. `customizeGenerated` adds the
+// mDNS hooks, which must land before React Native codegen reads the spec;
+// `normalizeGenerated` trims whitespace once every generator has run.
+// `generate-codegen.mjs` runs both around codegen; running this file directly
+// (as `build` does) runs both back to back.
+
 import {
   existsSync,
   readdirSync,
@@ -54,7 +60,6 @@ function ensureAndroidMdnsPermissions() {
   );
 }
 
-ensureAndroidMdnsPermissions();
 function replaceOnce(relativePath, needle, replacement) {
   const target = path.join(packageRoot, relativePath);
   if (!existsSync(target)) {
@@ -145,7 +150,11 @@ import android.net.wifi.WifiManager
   );
 }
 
-customizeTurboModuleForMdns();
+/** Adds the Android multicast permissions and the `setMdnsEnabled` hooks. */
+export function customizeGenerated() {
+  ensureAndroidMdnsPermissions();
+  customizeTurboModuleForMdns();
+}
 
 function normalizePath(target) {
   if (!existsSync(target)) {
@@ -165,6 +174,14 @@ function normalizePath(target) {
   }
 }
 
-for (const relativePath of generatedPaths) {
-  normalizePath(path.join(packageRoot, relativePath));
+/** Strips trailing whitespace and ends every generated file with one newline. */
+export function normalizeGenerated() {
+  for (const relativePath of generatedPaths) {
+    normalizePath(path.join(packageRoot, relativePath));
+  }
+}
+
+if (import.meta.main) {
+  customizeGenerated();
+  normalizeGenerated();
 }

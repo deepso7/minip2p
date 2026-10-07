@@ -1,4 +1,4 @@
-/* oxlint-disable class-methods-use-this, func-style, max-classes-per-file, no-await-in-loop, no-use-before-define, prefer-destructuring, promise/avoid-new, unicorn/no-useless-undefined -- The adapter keeps the contract-complete native endpoint, value conversion, handle maps, and drain loop together at the binding boundary. */
+/* oxlint-disable class-methods-use-this, func-style, max-classes-per-file, no-use-before-define -- The adapter keeps the contract-complete native endpoint, value conversion, and handle maps together at the binding boundary. */
 
 import { Minip2pBase, StreamClosedError } from "@minip2p/core";
 import type {
@@ -11,9 +11,12 @@ import type {
   RelayReservationInfo,
 } from "@minip2p/core";
 import {
+  ConnectionIdMap,
+  EventDrain,
   P2pEvent_Tags,
   resolveEndpointConfig,
   typedFfiError,
+  u64ToNumber,
 } from "@minip2p/core/backend";
 import type {
   BackendConnectTarget,
@@ -23,13 +26,22 @@ import type {
   P2pEvent,
 } from "@minip2p/core/backend";
 
+import type {
+  NativeEvent,
+  NativeIdentifyInfo,
+  NativeKnownPeerInfo,
+  NativeRelayReservationInfo,
+} from "./native-shape.js";
 import { nativeBinding } from "./native.js";
 import type { NativeEndpoint } from "./native.js";
 
+/** Native drain batch size. */
+const DRAIN_LIMIT = 256;
+
 class NodeBackend implements Minip2pBackend {
-  readonly #connectionIds = new IdMap();
+  readonly #connectionIds = new ConnectionIdMap();
   readonly #endpoint: NativeEndpoint;
-  readonly #events: EventDrain;
+  #events: EventDrain<NativeEvent> | undefined;
   readonly #streamIds = new StreamIdMap();
 
   constructor(config: Minip2pConfig) {
@@ -40,17 +52,25 @@ class NodeBackend implements Minip2pBackend {
           resolveEndpointConfig(config)
         )
     );
-    this.#events = new EventDrain(
-      () => this.#endpoint.drainEvents(256),
-      (event) => normalizeEvent(event, this.#connectionIds, this.#streamIds)
-    );
   }
 
   start(listener: (event: P2pEvent) => void): void {
-    this.#events.start(listener);
+    const events = new EventDrain(
+      (limit) => this.#endpoint.drainEvents(limit),
+      (event: NativeEvent) => {
+        listener(normalizeEvent(event, this.#connectionIds, this.#streamIds));
+      },
+      DRAIN_LIMIT,
+      // One check-phase turn keeps native callbacks out of the caller's stack
+      // without paying the timer granularity for every bounded batch.
+      (task) => {
+        setImmediate(task);
+      }
+    );
+    this.#events = events;
     translateErrors(() => {
       this.#endpoint.start(() => {
-        this.#events.ring();
+        events.ring();
       });
     });
   }
@@ -61,7 +81,7 @@ class NodeBackend implements Minip2pBackend {
 
   close(): void {
     this.#endpoint.close();
-    this.#events.stop();
+    this.#events?.stop();
   }
 
   peerId(): string {
@@ -86,49 +106,38 @@ class NodeBackend implements Minip2pBackend {
 
   peerInfo(peerId: string): IdentifyInfo | undefined {
     const info = translateErrors(() => this.#endpoint.peerInfo(peerId));
-    return info === null || info === undefined
-      ? undefined
-      : normalizeIdentifyInfo(info);
+    return info === null ? undefined : identifyInfo(info);
   }
 
   knownPeers(): KnownPeerInfo[] {
-    return translateErrors(() => this.#endpoint.knownPeers()).map((peer) =>
-      normalizeRecord<KnownPeerInfo>(peer)
-    );
+    return translateErrors(() => this.#endpoint.knownPeers()).map(knownPeer);
   }
 
   discoveryNowMs(): number | undefined {
     const value = translateErrors(() => this.#endpoint.discoveryNowMs());
-    return value === null || value === undefined
-      ? undefined
-      : bigintToNumber(value, "clock");
+    return value === null ? undefined : u64ToNumber(value, "clock");
   }
 
   activeReservation(): RelayReservationInfo | undefined {
-    return normalizeOptional<RelayReservationInfo>(
-      translateErrors(() => this.#endpoint.activeReservation())
+    const reservation = translateErrors(() =>
+      this.#endpoint.activeReservation()
     );
+    return reservation === null ? undefined : relayReservation(reservation);
   }
 
   path(peerId: string): PathKind | undefined {
-    return normalizeOptional<PathKind>(
-      translateErrors(() => this.#endpoint.path(peerId))
-    );
+    return translateErrors(() => this.#endpoint.path(peerId)) ?? undefined;
   }
 
   connectionInfo(peerId: string): ConnectionInfo | undefined {
     const info = translateErrors(() => this.#endpoint.connectionInfo(peerId));
-    if (info === null || info === undefined) {
+    if (info === null) {
       return undefined;
     }
+    const { connId, ...rest } = info;
     return {
-      connId: this.#connectionIds.toPublic(info.connId),
-      ...(typeof info.remoteAddr === "string" && {
-        remoteAddr: info.remoteAddr,
-      }),
-      ...(Array.isArray(info.readyProtocols) && {
-        readyProtocols: info.readyProtocols,
-      }),
+      ...rest,
+      connId: this.#connectionIds.toPublic(BigInt(connId)),
     };
   }
 
@@ -137,7 +146,7 @@ class NodeBackend implements Minip2pBackend {
   }
 
   reachability(): Reachability {
-    return translateErrors(() => this.#endpoint.reachability()) as Reachability;
+    return translateErrors(() => this.#endpoint.reachability());
   }
 
   setActive(active: boolean): void {
@@ -174,10 +183,10 @@ class NodeBackend implements Minip2pBackend {
     const stream = translateErrors(() =>
       this.#endpoint.openStream(peerId, protocolId)
     );
-    const connId = this.#connectionIds.toPublic(stream.connId);
+    const connId = this.#connectionIds.toPublic(BigInt(stream.connId));
     return {
       connId,
-      streamId: this.#streamIds.toPublic(connId, stream.streamId),
+      streamId: this.#streamIds.toPublic(connId, BigInt(stream.streamId)),
     };
   }
 
@@ -240,7 +249,7 @@ class NodeBackend implements Minip2pBackend {
   // Connect IDs are not mapped because they round-trip into native calls,
   // and native allocates them well inside the safe integer range.
   connect(target: BackendConnectTarget): number {
-    return bigintToNumber(
+    return u64ToNumber(
       translateErrors(() =>
         this.#endpoint.connect(
           target.kind === "peer" ? target.peerId : [...target.addresses]
@@ -326,39 +335,46 @@ function toUint8Array(value: Bytes): Uint8Array {
     : new Uint8Array(value);
 }
 
-function bigintToNumber(value: bigint, name: string): number {
-  const number = Number(value);
-  if (!Number.isSafeInteger(number) || number < 0) {
-    throw new RangeError(`${name} exceeds JavaScript's safe integer range`);
-  }
-  return number;
+/** Converts an Identify snapshot, copying its public key into an `ArrayBuffer`. */
+function identifyInfo({
+  publicKey,
+  ...info
+}: NativeIdentifyInfo): IdentifyInfo {
+  return {
+    ...info,
+    ...(publicKey !== undefined && { publicKey: toArrayBuffer(publicKey) }),
+  };
 }
 
-function normalizeOptional<Value>(value: unknown): Value | undefined {
-  return value === null || value === undefined
-    ? undefined
-    : normalizeRecord<Value>(value);
+function knownPeer({
+  beaconLastSeenAgeMs,
+  mdnsLastSeenAgeMs,
+  ...peer
+}: NativeKnownPeerInfo): KnownPeerInfo {
+  return {
+    ...peer,
+    ...(beaconLastSeenAgeMs !== undefined && {
+      beaconLastSeenAgeMs: u64ToNumber(
+        beaconLastSeenAgeMs,
+        "beaconLastSeenAgeMs"
+      ),
+    }),
+    ...(mdnsLastSeenAgeMs !== undefined && {
+      mdnsLastSeenAgeMs: u64ToNumber(mdnsLastSeenAgeMs, "mdnsLastSeenAgeMs"),
+    }),
+  };
 }
 
-function normalizeRecord<Value>(value: unknown): Value {
-  return normalizeNativeValue(value) as Value;
-}
-
-function normalizeIdentifyInfo(value: unknown): IdentifyInfo {
-  const info = normalizeRecord<Record<string, unknown>>(value);
-  const publicKey = info.publicKey;
-  if (publicKey === undefined) {
-    return info as unknown as IdentifyInfo;
-  }
-  if (Array.isArray(publicKey) || publicKey instanceof Uint8Array) {
-    return {
-      ...info,
-      publicKey: nativeBytesToArrayBuffer(publicKey),
-    } as unknown as IdentifyInfo;
-  }
-  throw new TypeError(
-    "The native addon returned an invalid Identify public key"
-  );
+function relayReservation({
+  expiresUnixSecs,
+  relayPeerId,
+}: NativeRelayReservationInfo): RelayReservationInfo {
+  return {
+    relayPeerId,
+    ...(expiresUnixSecs !== undefined && {
+      expiresUnixSecs: u64ToNumber(expiresUnixSecs, "expiresUnixSecs"),
+    }),
+  };
 }
 
 /** Event fields carrying a native connection ID. */
@@ -368,80 +384,78 @@ const CONNECTION_ID_KEYS: ReadonlySet<string> = new Set([
   "newConnId",
 ]);
 
+/**
+ * Converts one value of a native event: integers to numbers, connection IDs
+ * through the connection map, and bytes to `ArrayBuffer`s. A stream ID is
+ * mapped together with the connection of the record that carries it.
+ */
 function normalizeNativeValue(
   value: unknown,
-  key?: string,
-  maps?: NativeIdMaps
+  maps: NativeIdMaps,
+  key?: string
 ): unknown {
-  const isId = typeof value === "bigint" || typeof value === "number";
-  if (isId && maps !== undefined && key !== undefined) {
-    if (CONNECTION_ID_KEYS.has(key)) {
+  if (typeof value === "bigint" || typeof value === "number") {
+    if (key !== undefined && CONNECTION_ID_KEYS.has(key)) {
       return maps.connectionIds.toPublic(BigInt(value));
     }
-    if (key === "streamId") {
-      // Mapped with its connection once the whole record is normalized.
-      return value;
-    }
-  }
-  if (typeof value === "bigint") {
-    return bigintToNumber(value, "native value");
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => normalizeNativeValue(item, undefined, maps));
+    return key === "streamId" ? value : u64ToNumber(value, key ?? "native u64");
   }
   if (value instanceof Uint8Array) {
+    return toArrayBuffer(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeNativeValue(item, maps));
+  }
+  if (value === null || typeof value !== "object") {
     return value;
   }
-  if (value !== null && typeof value === "object") {
-    const record: Record<string, unknown> = Object.fromEntries(
-      Object.entries(value)
-        .filter(([, item]) => item !== null)
-        .map(([itemKey, item]) => [
-          itemKey,
-          normalizeNativeValue(item, itemKey, maps),
-        ])
-    );
-    const { connId, streamId } = record;
-    if (maps !== undefined && streamId !== undefined) {
-      if (
-        (typeof streamId !== "bigint" && typeof streamId !== "number") ||
-        (connId !== undefined && typeof connId !== "number")
-      ) {
-        throw new TypeError("The native addon returned an invalid stream ID");
-      }
-      // Public stream IDs are allocated per connection. A record without a
-      // connection (an endpoint error, say) cannot name a public stream.
-      if (typeof connId === "number") {
-        record.streamId = maps.streamIds.toPublic(connId, BigInt(streamId));
-      } else {
-        delete record.streamId;
-      }
+  const record: Record<string, unknown> = Object.fromEntries(
+    Object.entries(value).map(([itemKey, item]) => [
+      itemKey,
+      normalizeNativeValue(item, maps, itemKey),
+    ])
+  );
+  const { connId, streamId } = record;
+  if (typeof streamId === "bigint" || typeof streamId === "number") {
+    // Public stream IDs are allocated per connection. A record without a
+    // connection (an endpoint error, say) cannot name a public stream.
+    if (typeof connId === "number") {
+      record.streamId = maps.streamIds.toPublic(connId, BigInt(streamId));
+    } else {
+      delete record.streamId;
     }
-    return record;
   }
-  return value;
+  return record;
 }
 
+/**
+ * Converts one native event to its SDK backend form. Identify snapshots go
+ * through the typed {@link identifyInfo}; every other event shares the
+ * generic integer, ID and byte conversion.
+ */
 function normalizeEvent(
-  value: unknown,
-  connectionIds: IdMap,
+  event: NativeEvent,
+  connectionIds: ConnectionIdMap,
   streamIds: StreamIdMap
 ): P2pEvent {
-  const event = normalizeNativeValue(value, undefined, {
-    connectionIds,
-    streamIds,
-  }) as { tag?: unknown; inner?: unknown };
-  if (typeof event.tag !== "string" || event.inner === undefined) {
-    throw new TypeError("The native addon returned an invalid event");
-  }
-  if (
-    event.tag === "StreamData" ||
-    event.tag === "Message" ||
-    event.tag === "IdentifyReceived"
-  ) {
-    event.inner = normalizeEventBytes(event.tag, event.inner);
-  }
-  const normalized = event as P2pEvent;
+  // Outside Identify, the addon's serde shape is the SDK shape with napi-rs
+  // integers and buffers (see `native-shape.ts`), which the walk converts.
+  const normalized: P2pEvent =
+    event.tag === P2pEvent_Tags.IdentifyReceived
+      ? {
+          inner: {
+            info: identifyInfo(event.inner.info),
+            peerId: event.inner.peerId,
+          },
+          tag: event.tag,
+        }
+      : ({
+          inner: normalizeNativeValue(event.inner, {
+            connectionIds,
+            streamIds,
+          }),
+          tag: event.tag,
+        } as P2pEvent);
   retireTerminalIds(normalized, connectionIds, streamIds);
   return normalized;
 }
@@ -455,12 +469,12 @@ function normalizeEvent(
  */
 function retireTerminalIds(
   event: P2pEvent,
-  connectionIds: IdMap,
+  connectionIds: ConnectionIdMap,
   streamIds: StreamIdMap
 ): void {
   const connId = endedConnection(event);
   if (connId !== undefined) {
-    connectionIds.deletePublic(connId);
+    connectionIds.release(connId);
     streamIds.retireConnection(connId);
   }
   if (event.tag === P2pEvent_Tags.StreamClosed) {
@@ -493,38 +507,8 @@ function endedConnection(event: P2pEvent): number | undefined {
   return undefined;
 }
 
-function normalizeEventBytes(tag: string, value: unknown): unknown {
-  if (value === null || typeof value !== "object") {
-    return value;
-  }
-  const inner = { ...value };
-  if (tag === "StreamData") {
-    const data = Reflect.get(inner, "data");
-    if (Array.isArray(data) || data instanceof Uint8Array) {
-      Reflect.set(inner, "data", nativeBytesToArrayBuffer(data));
-    }
-  }
-  if (tag === "Message") {
-    for (const key of ["data", "seqno"] as const) {
-      const bytes = Reflect.get(inner, key);
-      if (Array.isArray(bytes) || bytes instanceof Uint8Array) {
-        Reflect.set(inner, key, nativeBytesToArrayBuffer(bytes));
-      }
-    }
-  }
-  if (tag === "IdentifyReceived") {
-    const info = Reflect.get(inner, "info");
-    if (info !== null && typeof info === "object") {
-      Reflect.set(inner, "info", normalizeIdentifyInfo(info));
-    }
-  }
-  return inner;
-}
-
-function nativeBytesToArrayBuffer(bytes: number[] | Uint8Array): ArrayBuffer {
-  if (Array.isArray(bytes)) {
-    return Uint8Array.from(bytes).buffer;
-  }
+/** Copies native bytes unless they already own their whole `ArrayBuffer`. */
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   if (
     bytes.buffer instanceof ArrayBuffer &&
     bytes.byteOffset === 0 &&
@@ -535,113 +519,9 @@ function nativeBytesToArrayBuffer(bytes: number[] | Uint8Array): ArrayBuffer {
   return Uint8Array.from(bytes).buffer;
 }
 
-class EventDrain {
-  readonly #drain: () => unknown[];
-  readonly #normalize: (event: unknown) => P2pEvent;
-  #listener: ((event: P2pEvent) => void) | undefined;
-  #pending = false;
-  #running = false;
-  #stopped = false;
-
-  constructor(drain: () => unknown[], normalize: (event: unknown) => P2pEvent) {
-    this.#drain = drain;
-    this.#normalize = normalize;
-  }
-
-  start(listener: (event: P2pEvent) => void): void {
-    this.#listener = listener;
-  }
-
-  ring(): void {
-    if (this.#stopped) {
-      return;
-    }
-    this.#pending = true;
-    if (!this.#running) {
-      this.#running = true;
-      // One check-phase turn keeps native callbacks out of the caller's stack
-      // without paying the timer granularity for every bounded batch.
-      setImmediate(() => {
-        void this.#run();
-      });
-    }
-  }
-
-  stop(): void {
-    this.#stopped = true;
-    this.#pending = false;
-    this.#listener = undefined;
-  }
-
-  async #run(): Promise<void> {
-    try {
-      while (!this.#stopped && this.#pending) {
-        this.#pending = false;
-        let events = this.#drain();
-        while (!this.#stopped && events.length > 0) {
-          for (const event of events) {
-            try {
-              this.#listener?.(this.#normalize(event));
-            } catch {
-              // Application callbacks and malformed events cannot stop draining.
-            }
-          }
-          await new Promise<void>((resolve) => {
-            setImmediate(resolve);
-          });
-          if (this.#stopped) {
-            break;
-          }
-          events = this.#drain();
-        }
-      }
-    } finally {
-      this.#running = false;
-      if (this.#pending && !this.#stopped) {
-        this.ring();
-      }
-    }
-  }
-}
-
 interface NativeIdMaps {
-  readonly connectionIds: IdMap;
+  readonly connectionIds: ConnectionIdMap;
   readonly streamIds: StreamIdMap;
-}
-
-class IdMap {
-  readonly #nativeByPublic = new Map<number, bigint>();
-  readonly #publicByNative = new Map<bigint, number>();
-  #next = 1;
-
-  toPublic(native: bigint): number {
-    const existing = this.#publicByNative.get(native);
-    if (existing !== undefined) {
-      return existing;
-    }
-    const publicId = this.#next;
-    this.#next += 1;
-    this.#publicByNative.set(native, publicId);
-    this.#nativeByPublic.set(publicId, native);
-    return publicId;
-  }
-
-  /** The native ID of a live public connection; only stream ops ask. */
-  toNative(publicId: number): bigint {
-    const native = this.#nativeByPublic.get(publicId);
-    if (native === undefined) {
-      throw new StreamClosedError("The stream's connection ended");
-    }
-    return native;
-  }
-
-  deletePublic(publicId: number): void {
-    const native = this.#nativeByPublic.get(publicId);
-    if (native !== undefined) {
-      this.#nativeByPublic.delete(publicId);
-      this.#publicByNative.delete(native);
-    }
-  }
 }
 
 /**
