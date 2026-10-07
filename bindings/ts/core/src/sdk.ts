@@ -249,9 +249,9 @@ const streamEventKey = (item: QueueItem): string | undefined => {
 /**
  * The endpoint's shared event queue, in delivery order.
  *
- * Stream and connection events never drop, and adjacent data for one stream
- * coalesces into one event, so native receive budgets bound them; they do
- * not count against the capacity. Past `capacity` other items, the oldest
+ * Stream events and connection-end events (plus `DriverFailed`) never drop,
+ * and adjacent data for one stream coalesces into one event, so native
+ * receive budgets bound them; they do not count against the capacity. Past `capacity` other items, the oldest
  * gossipsub message is dropped first, then the oldest other item.
  *
  * A peer-opened stream that closes without data before its `StreamReady`
