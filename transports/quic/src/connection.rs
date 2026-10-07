@@ -937,15 +937,16 @@ impl QuicConnection {
                     .stream_states
                     .get(&raw_stream_id)
                     .map_or(0, StreamRuntimeState::receive_room);
-                // The budget is spent: the rest waits, in quiche, for an ack.
+                // With the budget spent, the read is zero-length: the data
+                // waits in quiche for an ack, but a FIN or reset right after
+                // the window still surfaces, as it would on Yamux.
                 let Some(buffer) = stream_read_buffer.get_mut(..room.min(stream_read_buffer.len()))
                 else {
                     break;
                 };
-                if buffer.is_empty() {
-                    break;
-                }
                 match self.conn.stream_recv(raw_stream_id, buffer) {
+                    // Gated, with data still waiting behind the budget.
+                    Ok((0, false)) => break,
                     Ok((read, fin)) => {
                         if let Some(state) = self.stream_states.get_mut(&raw_stream_id) {
                             state.unacked += read;

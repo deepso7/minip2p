@@ -549,6 +549,82 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
     assert_eq!(received, payload, "every byte, once, in order");
 }
 
+/// Delivers exactly one receive window on a new stream, unacknowledged, then
+/// ends it with `end` on the sender; returns the reader's later events.
+fn end_after_a_full_window(
+    end: impl Fn(&mut QuicTransport, ConnectionId, StreamId),
+) -> Vec<TransportEvent> {
+    let (mut server, mut client, peer_addr) = setup_pair();
+    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let stream = client.open_stream(client_conn).expect("open stream");
+    let mut held = client
+        .send_stream(
+            client_conn,
+            stream,
+            Bytes::from(vec![7u8; STREAM_RECEIVE_WINDOW]),
+        )
+        .err()
+        .and_then(TransportError::into_unsent);
+    let mut delivered = 0;
+    for _ in 0..4000 {
+        let (server_events, client_events) = drive_pair_once(&mut server, &mut client);
+        for event in client_events {
+            if matches!(event, TransportEvent::StreamWritable { .. })
+                && let Some(tail) = held.take()
+            {
+                held = client
+                    .send_stream(client_conn, stream, tail)
+                    .err()
+                    .and_then(TransportError::into_unsent);
+            }
+        }
+        for event in server_events {
+            if let TransportEvent::StreamData { data, .. } = event {
+                delivered += data.len();
+            }
+        }
+        if delivered == STREAM_RECEIVE_WINDOW {
+            break;
+        }
+    }
+    assert_eq!(
+        delivered, STREAM_RECEIVE_WINDOW,
+        "one whole window, unacknowledged"
+    );
+    end(&mut client, client_conn, stream);
+    let mut events = Vec::new();
+    for _ in 0..200 {
+        events.extend(drive_pair_once(&mut server, &mut client).0);
+    }
+    events
+}
+
+#[test]
+fn a_fin_after_a_full_unacknowledged_window_is_still_reported() {
+    let events = end_after_a_full_window(|client, conn, stream| {
+        client.close_stream_write(conn, stream).expect("fin");
+    });
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::StreamRemoteWriteClosed { .. })),
+        "the FIN needs no budget: {events:?}"
+    );
+}
+
+#[test]
+fn a_reset_after_a_full_unacknowledged_window_is_still_reported() {
+    let events = end_after_a_full_window(|client, conn, stream| {
+        client.reset_stream(conn, stream).expect("reset");
+    });
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::StreamClosed { .. })),
+        "the reset needs no budget: {events:?}"
+    );
+}
+
 #[test]
 fn an_unsettled_stream_holds_its_slot_and_over_acks_fail() {
     let mut server = QuicTransport::new(
