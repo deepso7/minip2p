@@ -409,6 +409,11 @@ export interface P2pEndpointLike {
  */
     stop(): void;
 /**
+ * Acknowledges `bytes` of a stream's received data as consumed,
+ * letting its sender continue. Every registered protocol needs this.
+ */
+    streamConsumed(connId: bigint, streamId: bigint, bytes: bigint) /*throws*/: void;
+/**
  * Subscribes to a pubsub topic.
  */
     subscribe(topic: string) /*throws*/: boolean;
@@ -930,6 +935,23 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
+ * Acknowledges `bytes` of a stream's received data as consumed,
+ * letting its sender continue. Every registered protocol needs this.
+ */
+    streamConsumed(connId: bigint, streamId: bigint, bytes: bigint): void /*throws*/ {uniffiCaller.rustCallWithError(
+            /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
+            /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_stream_consumed(
+                uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
+        FfiConverterUInt64.lower(connId, nativeModule().rustbuffer_alloc),
+        FfiConverterUInt64.lower(streamId, nativeModule().rustbuffer_alloc),
+        FfiConverterUInt64.lower(bytes, nativeModule().rustbuffer_alloc),
+                callStatus);
+            },
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+    );
+    }
+
+/**
  * Subscribes to a pubsub topic.
  */
     subscribe(topic: string): boolean /*throws*/ {
@@ -1181,6 +1203,9 @@ function uniffiEnsureInitialized() {
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_stop() !== 11062) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_stop");
+    }
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_stream_consumed() !== 61579) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_stream_consumed");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_subscribe() !== 41051) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_subscribe");

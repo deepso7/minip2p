@@ -32,6 +32,7 @@ describeAdapterContract("React Native", {
           ? { kind: "peer" as const, peerId: target.inner.peerId }
           : { addresses: target.inner.addresses, kind: "addresses" as const }
       ),
+      consumed: fake.consumed,
       deliver: (events: readonly NativeEventLiteral[]) => {
         fake.enqueue([...events], []);
         fake.ring();

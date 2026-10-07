@@ -59,7 +59,7 @@ Handler exceptions are isolated from event delivery and from other handlers. The
 
 <Callout type="warning">
 
-Events cross a bounded FIFO queue. If `queueOverflow` is emitted, some event history was lost. Refresh queryable state such as `connectedPeers()`, `knownPeers()`, `path(peerId)`, `reachability()`, and `activeReservation()`.
+Events cross a bounded FIFO queue. Stream and connection events are never dropped from it; past its bound it drops gossipsub messages first, then other events. If `queueOverflow` is emitted, some event history was lost. Refresh queryable state such as `connectedPeers()`, `knownPeers()`, `path(peerId)`, `reachability()`, and `activeReservation()`.
 
 </Callout>
 

@@ -63,6 +63,11 @@ export declare class NodeEndpoint {
   /** Resets and relinquishes an application stream. */
   abandonStream(peerId: string, connId: bigint, streamId: bigint): void
   /**
+   * Acknowledges `bytes` of a stream's received data as consumed,
+   * letting its sender continue. Every registered protocol needs this.
+   */
+  streamConsumed(connId: bigint, streamId: bigint, bytes: number): void
+  /**
    * Starts one Connection attempt: a peer ID string, or an array of
    * complete peer addresses naming one peer. Returns the Connect ID.
    */

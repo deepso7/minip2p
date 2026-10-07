@@ -28,6 +28,8 @@ export class MockBackend implements Minip2pBackend {
   openResults: BackendOpenStream[] = [];
   operations: MockBackendOperation[] = [];
   pingCalls = 0;
+  /** Acknowledged stream bytes, in call order. */
+  consumed: (readonly [connId: number, streamId: number, bytes: number])[] = [];
   /**
    * Scripted `sendStream` results, oldest first: `false` leaves the write
    * pending until a `StreamWriteAccepted` event. Empty means accepted.
@@ -156,6 +158,12 @@ export class MockBackend implements Minip2pBackend {
     if (this.abandonError !== undefined) {
       throw this.abandonError;
     }
+  }
+
+  streamConsumer(connId: number, streamId: number): (bytes: number) => void {
+    return (bytes) => {
+      this.consumed.push([connId, streamId, bytes]);
+    };
   }
 
   connect(target: BackendConnectTarget): number {

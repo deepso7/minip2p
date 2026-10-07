@@ -140,15 +140,15 @@ Promise operations use `{ timeoutMs?, signal? }`. Their default timeout is 65 se
 | `peerId`, `protocolId` | Remote identity and negotiated protocol. |
 | `streamId`, `connId` | Endpoint-local numeric identifiers. |
 | `initiatedLocally` | Whether this endpoint opened the stream. |
-| `read()` | Next `Uint8Array`, or `undefined` after remote half-close. |
-| `on("data", handler)` | Flowing read mode; mutually exclusive with `read()`. |
+| `read()` | Next `Uint8Array`, or `undefined` after remote half-close. Returning a chunk consumes it, which lets the sender continue. |
+| `on("data", handler)` | Flowing read mode; mutually exclusive with `read()`. A chunk is consumed once every handler returns, so an `async` handler is consumed when it returns its Promise, not when the Promise settles. |
 | `write(stringOrBytes)` | Send UTF-8 text or bytes; resolves once every byte is accepted. Rejects with `WriteBufferFullError` when bytes are already buffered and the write would push them past `writeHighWaterMark`. A queued write reads its buffer only when it reaches native, so leave the buffer untouched until the Promise settles. |
 | `writeHighWaterMark` | Bytes a stream buffers before `write` rejects (default 256 KiB, counting the in-flight write). A write into an empty buffer is always admitted, whatever its size. |
 | `closeWrite()` | Graceful local half-close after every earlier write. Throws if native refuses it while no write is pending; a close queued behind writes reports failure through the stream's terminal event. |
 | `reset()` | Abrupt reset. |
 | `abandon()` | Reset and relinquish the handle. |
 
-Stream events are `data`, `remoteWriteClosed`, `closed`, and `dataOverflow`.
+Stream events are `data`, `remoteWriteClosed`, `writeStopped`, and `closed`. Stream data is never dropped: each stream delivers at most one receive window that has not been consumed, so a reader that stops reading stalls its sender.
 
 ## Events
 

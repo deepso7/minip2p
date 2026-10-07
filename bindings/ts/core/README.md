@@ -17,6 +17,8 @@ await stream.write(new Uint8Array([1, 2, 3]));
 stream.closeWrite();
 ```
 
+Reading applies backpressure: a chunk counts as consumed when `read()` returns it or every `data` handler has returned from it, and each stream delivers at most one receive window that has not been consumed, so a reader that stops reading stalls its sender instead of losing data. An `async` `data` handler is consumed when it returns its Promise, not when the Promise settles; use `read()` to hold the sender back while asynchronous work runs.
+
 Streams are async iterables. Iteration preserves chunk order, drains bytes buffered before a remote write half-close, and then ends quietly. Local shutdown, reset, peer disconnect, connection replacement, or driver failure rejects the iterator with its terminal error:
 
 ```ts

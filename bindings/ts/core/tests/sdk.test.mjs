@@ -874,7 +874,7 @@ function streamData(data, streamId) {
   };
 }
 
-test("stream FIFO counts only queued data and cleans up after terminal", async () => {
+test("a pull reader consumes a chunk when read() returns it, and a terminal consumes what it discards", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
   const opened = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
@@ -884,27 +884,119 @@ test("stream FIFO counts only queued data and cleans up after terminal", async (
   const direct = stream.read();
   backend.emit(streamData(new Uint8Array(2 * 1024 * 1024), 3));
   assert.equal((await direct).byteLength, 2 * 1024 * 1024);
+  assert.deepEqual(backend.consumed, [[2, 3, 2 * 1024 * 1024]]);
 
-  let overflow;
-  stream.on("dataOverflow", (event) => {
-    overflow = event;
-  });
-  backend.emit(streamData(new Uint8Array(2 * 1024 * 1024), 3));
+  // Unread data is buffered whole and stays unconsumed, holding the sender.
+  backend.emit(streamData(new Uint8Array(3), 3));
   await tick();
-  assert.deepEqual(overflow, {
-    droppedBytes: 2 * 1024 * 1024,
-    droppedChunks: 1,
-  });
+  backend.emit(streamData(new Uint8Array(5), 3));
+  await tick();
+  assert.equal(backend.consumed.length, 1);
+  assert.equal((await stream.read()).byteLength, 3);
+  assert.deepEqual(backend.consumed.at(-1), [2, 3, 3]);
 
   backend.emit({
     inner: { connId: 2, peerId: "peer", streamId: 3 },
     tag: P2pEvent_Tags.StreamClosed,
   });
   await tick();
+  assert.deepEqual(backend.consumed.at(-1), [2, 3, 5], "discarded on close");
   await assert.rejects(stream.write("late"), ClosedError);
   stream.closeWrite();
   stream.reset();
   stream.abandon();
+  endpoint.close();
+});
+
+test("a data listener consumes a chunk when it returns", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  const seen = [];
+  stream.on("data", (chunk) => {
+    seen.push([...chunk]);
+    assert.deepEqual(backend.consumed, [], "not before the listener returns");
+  });
+
+  backend.emit(streamData(new Uint8Array([1, 2]), 3));
+  await tick();
+
+  assert.deepEqual(seen, [[1, 2]]);
+  assert.deepEqual(backend.consumed, [[2, 3, 2]]);
+  endpoint.close();
+});
+
+test("data in the same batch as StreamReady reaches a reader that attaches later", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const reads = [];
+  endpoint.on("stream", (stream) => {
+    // The reader attaches only after other work, past the whole batch.
+    void (async () => {
+      await tick();
+      await tick();
+      reads.push([...(await stream.read())]);
+    })();
+  });
+
+  backend.emit(streamReady());
+  backend.emit(streamData(new Uint8Array([7, 8]), 3));
+  for (let index = 0; index < 4; index += 1) {
+    await tick();
+  }
+
+  assert.deepEqual(reads, [[7, 8]]);
+  endpoint.close();
+});
+
+test("stream events are never dropped by queue overflow, and adjacent data coalesces", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  let dropped = 0;
+  endpoint.on("queueOverflow", (event) => {
+    dropped += event.dropped;
+  });
+  const { stream } = await (async () => {
+    const opening = endpoint.openStream("peer", "/test/1", {
+      timeoutMs: 1000,
+    });
+    backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+    return { stream: await opening };
+  })();
+  const received = [];
+  stream.on("data", (chunk) => received.push(...chunk));
+
+  // 5000 one-byte chunks, each between two gossip messages so none
+  // coalesce, all queued before the SDK dispatches any of them.
+  for (let index = 0; index < 5000; index += 1) {
+    backend.emit({
+      inner: {
+        data: new Uint8Array([index % 256]).buffer,
+        fromPeerId: "peer",
+        seqno: new ArrayBuffer(0),
+        signed: true,
+        topics: ["/chat"],
+      },
+      tag: P2pEvent_Tags.Message,
+    });
+    backend.emit(streamData(new Uint8Array([index % 256]), 3));
+  }
+  await vi.waitFor(() => assert.equal(received.length, 5000));
+  assert.deepEqual(
+    received,
+    Array.from({ length: 5000 }, (_, index) => index % 256)
+  );
+  assert.equal(dropped, 5000 - 4096, "only gossip messages drop");
+
+  // Back to back, data for one stream arrives as one chunk.
+  const chunks = [];
+  stream.on("data", (chunk) => chunks.push([...chunk]));
+  backend.emit(streamData(new Uint8Array([1]), 3));
+  backend.emit(streamData(new Uint8Array([2, 3]), 3));
+  await tick();
+  assert.deepEqual(chunks, [[1, 2, 3]]);
   endpoint.close();
 });
 
@@ -929,7 +1021,8 @@ test("stream async iteration yields chunks in order and ends on remote write clo
   });
 
   await reading;
-  assert.deepEqual(chunks, [[1, 2], [3]]);
+  // Queued back to back, the two chunks coalesced.
+  assert.deepEqual(chunks, [[1, 2, 3]]);
   endpoint.close();
 });
 
@@ -952,8 +1045,7 @@ test("stream reads buffered chunks before EOF when full closure follows remote w
   });
   await tick();
 
-  assert.deepEqual([...(await stream.read())], [1, 2]);
-  assert.deepEqual([...(await stream.read())], [3]);
+  assert.deepEqual([...(await stream.read())], [1, 2, 3]);
   assert.equal(await stream.read(), undefined);
   endpoint.close();
 });
@@ -1657,28 +1749,6 @@ test("writes past the high-water mark reject with WriteBufferFullError", async (
   backend.emit(streamWriteEvent(P2pEvent_Tags.StreamWriteAccepted));
   await big;
   await stream.write(new Uint8Array(8));
-  endpoint.close();
-});
-
-test("EventsDropped resets a stream whose write is still in flight", async () => {
-  const backend = new MockBackend();
-  const { endpoint, stream } = await openedStream(backend);
-  backend.sendResults = [false];
-  const pending = stream.write("held");
-  const queued = stream.write("queued");
-
-  // The lost batch may have held this stream's settlement or terminal.
-  backend.emit({
-    inner: { dropped: 1, terminalConnectIds: [], totalDropped: 1 },
-    tag: P2pEvent_Tags.EventsDropped,
-  });
-
-  await assert.rejects(pending, EventQueueOverflowError);
-  await assert.rejects(queued, EventQueueOverflowError);
-  assert.deepEqual(
-    backend.operations.map(([kind]) => kind),
-    ["write", "reset"]
-  );
   endpoint.close();
 });
 
