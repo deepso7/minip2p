@@ -692,12 +692,13 @@ impl Endpoint {
     ///
     /// This is the single Endpoint blocking wait. Deadline and interruption
     /// stay visible so a loop can service its own timers and commands (a
-    /// [`WaitHandle`] from another thread interrupts it). If an absolute
-    /// [`std::time::Instant`] deadline has already passed, this returns
-    /// [`EndpointWaitOutcome::Deadline`] before delivering another queued
-    /// event. Relative [`std::time::Duration`] deadlines (including
-    /// [`std::time::Duration::ZERO`] non-blocking drains) still inspect
-    /// buffered events and poll once. Enabled capabilities deliver their
+    /// [`WaitHandle`] from another thread interrupts it). A deadline that has
+    /// already passed -- a stale [`std::time::Instant`] or
+    /// [`std::time::Duration::ZERO`] alike -- never sleeps, but still returns
+    /// a queued event or drives the endpoint once, so a stale timer cannot
+    /// stall it. The deadline bounds blocking, not delivery: a caller with a
+    /// strict operation timeout checks its own clock before each `wait`, as
+    /// below. Enabled capabilities deliver their
     /// output here as [`EndpointEvent`] variants, so one `wait` loop sees
     /// every event exactly once. Each call drives only this endpoint.
     ///
@@ -719,6 +720,13 @@ impl Endpoint {
     ///     let connect_id = node.connect(target)?;
     ///     let deadline = Instant::now() + Duration::from_secs(10);
     ///     loop {
+    ///         // `wait` still serves events once the deadline has passed, so
+    ///         // enforce the timeout here. Giving up locally does not cancel
+    ///         // the attempt; do that explicitly.
+    ///         if Instant::now() >= deadline {
+    ///             node.cancel_connect(connect_id);
+    ///             return Err("connect did not settle before the deadline".into());
+    ///         }
     ///         match node.wait(deadline)? {
     ///             EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
     ///                 connect_id: settled,
@@ -735,25 +743,18 @@ impl Endpoint {
     ///             EndpointWaitOutcome::Event(event) => println!("{event:?}"),
     ///             // Another thread woke us; service its commands, then wait again.
     ///             EndpointWaitOutcome::Interrupted => {}
-    ///             // Giving up locally does not cancel the attempt; do that explicitly.
-    ///             EndpointWaitOutcome::Deadline => {
-    ///                 node.cancel_connect(connect_id);
-    ///                 return Err("connect did not settle before the deadline".into());
-    ///             }
+    ///             // The clock check above gives up.
+    ///             EndpointWaitOutcome::Deadline => {}
     ///         }
     ///     }
     /// }
     /// ```
     pub fn wait(&mut self, deadline: impl Into<Deadline>) -> Result<EndpointWaitOutcome, Error> {
         let deadline = deadline.into();
-        // Absolute Instant already past: Deadline wins over queued events.
-        // Relative Duration::ZERO still drains / polls once.
-        if deadline.prefers_deadline_over_queued() {
-            return Ok(EndpointWaitOutcome::Deadline);
-        }
         // `Swarm::poll_next_interruptible` performs one synchronous poll even
-        // for an expired deadline. Allow that once, so a continuous event
-        // stream cannot keep this wait running past its deadline.
+        // for an expired deadline, which is what lets a passed deadline still
+        // drive the endpoint. Allow that once, so a continuous event stream
+        // cannot keep this wait running past its deadline.
         let mut expired_poll_used = false;
         loop {
             // A shortened step deadline is an internal timer, not the
@@ -3395,35 +3396,130 @@ mod tests {
         ));
     }
 
+    /// An `Instant` that has already passed.
+    fn past_instant() -> std::time::Instant {
+        let now = std::time::Instant::now();
+        now.checked_sub(Duration::from_secs(1)).unwrap_or(now)
+    }
+
     #[test]
-    fn wait_prefers_deadline_over_queued_events_when_instant_has_passed() {
+    fn wait_with_a_passed_instant_delivers_a_queued_event() {
         let mut endpoint = Endpoint::builder()
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")
             .bind()
             .expect("bind loopback endpoint");
-        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-        {
+        let peer = Ed25519Keypair::generate().peer_id();
+        endpoint
+            .pending_events
+            .push_back(EndpointEvent::ConnectionClosed {
+                peer_id: peer.clone(),
+                conn_id: ConnectionId::new(1),
+            });
+        assert!(matches!(
+            endpoint.wait(past_instant()).expect("wait past deadline"),
+            EndpointWaitOutcome::Event(EndpointEvent::ConnectionClosed { peer_id, .. })
+                if peer_id == peer
+        ));
+    }
+
+    #[test]
+    fn wait_with_a_passed_instant_drives_a_connect_to_settlement() {
+        let mut listener = Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind listener");
+        let listen_addr = listener.listen().expect("listen");
+        let mut dialer = Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind dialer");
+        let _listener = Driven::new(listener);
+
+        // A loop whose own timer has gone stale: every call gets a past
+        // deadline, yet each call must still drive the endpoint.
+        let connect_id = dialer.connect(&listen_addr).expect("connect");
+        let stale = past_instant();
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        let outcome = loop {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "a stale deadline must not stop the connect from settling"
+            );
+            if let EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+                connect_id: settled,
+                outcome,
+                ..
+            }) = dialer.wait(stale).expect("wait past deadline")
+                && settled == connect_id
+            {
+                break outcome;
+            }
+        };
+        assert!(
+            matches!(outcome, ConnectOutcome::Connected { .. }),
+            "got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_caller_clock_check_ends_a_fixed_deadline_loop_while_events_keep_arriving() {
+        let mut endpoint = Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind loopback endpoint");
+        let peer = Ed25519Keypair::generate().peer_id();
+        let arrive = |endpoint: &mut Endpoint| {
             endpoint
                 .pending_events
                 .push_back(EndpointEvent::ConnectionClosed {
-                    peer_id: Ed25519Keypair::generate().peer_id(),
+                    peer_id: peer.clone(),
                     conn_id: ConnectionId::new(1),
                 });
+        };
+        let deadline = std::time::Instant::now() + Duration::from_millis(50);
+        loop {
+            // The documented guard: `wait` serves events past the deadline.
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            arrive(&mut endpoint);
+            assert!(matches!(
+                endpoint.wait(deadline).expect("wait"),
+                EndpointWaitOutcome::Event(_)
+            ));
         }
-        let past = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now);
+        assert!(std::time::Instant::now() < deadline + Duration::from_secs(1));
+        // Without the guard, a steady stream keeps the loop going.
+        arrive(&mut endpoint);
         assert!(matches!(
-            endpoint.wait(past).expect("wait past deadline"),
+            endpoint.wait(deadline).expect("wait past deadline"),
+            EndpointWaitOutcome::Event(_)
+        ));
+    }
+
+    #[test]
+    fn an_interrupt_survives_a_wait_with_a_passed_instant() {
+        let mut endpoint = Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind loopback endpoint");
+        endpoint.wait_handle().interrupt();
+
+        // An expired call never blocks, so it never reaches the readiness wait
+        // that reports the interrupt; the interrupt stays pending.
+        assert!(matches!(
+            endpoint.wait(past_instant()).expect("wait past deadline"),
             EndpointWaitOutcome::Deadline
         ));
-        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-        assert_eq!(
-            endpoint.pending_events.len(),
-            1,
-            "queued events stay queued when the Instant has already passed"
-        );
+        assert!(matches!(
+            endpoint.wait(Deadline::NEVER).expect("wait endpoint"),
+            EndpointWaitOutcome::Interrupted
+        ));
     }
 
     #[cfg(feature = "nat")]
