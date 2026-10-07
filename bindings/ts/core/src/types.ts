@@ -508,7 +508,7 @@ export type P2pEvent =
     >
   | RawEvent<
       typeof P2pEvent_Tags.StreamWriteStopped,
-      { peerId: string; connId: number; streamId: number; errorCode: number }
+      { peerId: string; connId: number; streamId: number; errorCode: bigint }
     >
   | RawEvent<
       typeof P2pEvent_Tags.StreamClosed,

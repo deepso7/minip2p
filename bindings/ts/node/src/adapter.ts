@@ -398,6 +398,10 @@ function normalizeNativeValue(
     if (key !== undefined && CONNECTION_ID_KEYS.has(key)) {
       return maps.connectionIds.toPublic(BigInt(value));
     }
+    // A QUIC stop code is a 62-bit varint the remote picks: keep it whole.
+    if (key === "errorCode") {
+      return BigInt(value);
+    }
     return key === "streamId" ? value : u64ToNumber(value, key ?? "native u64");
   }
   if (value instanceof Uint8Array) {

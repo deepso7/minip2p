@@ -247,6 +247,37 @@ fn a_payload_past_the_send_caps_arrives_intact_by_resending_on_writable() {
 }
 
 #[test]
+fn writable_never_follows_a_close_or_reset_after_full() {
+    let mut pair = upgraded_pair();
+    let id = pair.dialer_connection;
+    let closed = pair.dialer.open_stream(id).expect("open substream");
+    let reset = pair.dialer.open_stream(id).expect("open substream");
+    let payload = Bytes::from(vec![7u8; 1024 * 1024]);
+    for stream in [closed, reset] {
+        assert!(
+            send_or_hold(&mut pair.dialer, id, stream, payload.clone()).is_some(),
+            "a write past the caps is Full"
+        );
+    }
+    // Ended before any poll: a Writable the Full queued must not surface.
+    pair.dialer.close_stream_write(id, closed).expect("close");
+    pair.dialer.reset_stream(id, reset).expect("reset");
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(200) {
+        let now = Now::from_millis(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+        for event in pair.dialer.poll(now).expect("poll dialer") {
+            assert!(
+                !matches!(event, TransportEvent::StreamWritable { .. }),
+                "unexpected {event:?}"
+            );
+        }
+        pair.listener.poll(now).expect("poll listener");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
 fn substreams_carry_data_in_both_directions() {
     let mut pair = upgraded_pair();
     let dialer_id = pair.dialer_connection;

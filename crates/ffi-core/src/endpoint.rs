@@ -80,6 +80,15 @@ pub(crate) struct EndpointState {
     pub(crate) writes: crate::writes::PendingWrites,
 }
 
+impl EndpointState {
+    /// Releases the Endpoint together with the tails held for it, which can
+    /// be large and are owed to streams that no longer exist.
+    pub(crate) fn release_endpoint(&mut self) -> Option<Endpoint> {
+        self.writes = crate::writes::PendingWrites::default();
+        self.endpoint.take()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Lifecycle {
     Created,
@@ -339,7 +348,7 @@ impl P2pEndpoint {
             match state.lifecycle {
                 Lifecycle::Created => {
                     state.lifecycle = Lifecycle::Stopped;
-                    state.endpoint.take()
+                    state.release_endpoint()
                 }
                 Lifecycle::Running => {
                     state.lifecycle = Lifecycle::Stopping;
@@ -731,7 +740,7 @@ impl P2pEndpoint {
         self.shared.driver_running.store(true, Ordering::Release);
         let doorbell_thread_id = spawn(shared, doorbell).map_err(|error| {
             state.lifecycle = Lifecycle::Stopped;
-            state.endpoint.take();
+            state.release_endpoint();
             self.shared.driver_running.store(false, Ordering::Release);
             self.shared.latch_stopped();
             FfiError::Internal {

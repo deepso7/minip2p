@@ -132,7 +132,7 @@ impl Drop for ExitGuard {
     fn drop(&mut self) {
         drop(self.doorbell.take());
         let mut state = self.shared.lock_state();
-        state.endpoint.take();
+        state.release_endpoint();
         state.lifecycle = Lifecycle::Stopped;
         self.shared.driver_running.store(false, Ordering::Release);
         drop(state);

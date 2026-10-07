@@ -663,14 +663,17 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
-        self.operate_session(id, |session| session.close_stream_write(stream_id))
+        let result = self
+            .operate_session(id, |session| session.close_stream_write(stream_id))
             .map_err(|error| {
                 stream_error(error, |reason| TransportError::StreamCloseWriteFailed {
                     id,
                     stream_id,
                     reason,
                 })
-            })
+            });
+        drop_writable(&mut self.pending, id, stream_id);
+        result
     }
 
     fn reset_stream(
@@ -678,14 +681,17 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
-        self.operate_session(id, |session| session.reset_stream(stream_id))
+        let result = self
+            .operate_session(id, |session| session.reset_stream(stream_id))
             .map_err(|error| {
                 stream_error(error, |reason| TransportError::StreamResetFailed {
                     id,
                     stream_id,
                     reason,
                 })
-            })
+            });
+        drop_writable(&mut self.pending, id, stream_id);
+        result
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
@@ -885,6 +891,13 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
 /// Identifier and state errors pass through: they describe the request rather
 /// than the stream operation, and callers match on them. So does Full, which
 /// carries the caller's unsent tail.
+/// Drops a `StreamWritable` already queued for a stream whose write side
+/// just ended: a Full can queue one before its call returns, and Writable
+/// never follows the end of a write side.
+fn drop_writable(pending: &mut VecDeque<TransportEvent>, id: ConnectionId, stream_id: StreamId) {
+    pending.retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
+}
+
 fn stream_error(
     error: TransportError,
     wrap: impl FnOnce(String) -> TransportError,

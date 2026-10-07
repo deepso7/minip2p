@@ -357,6 +357,44 @@ export function describeAdapterContract(
       endpoint.close();
     });
 
+    test("a remote stop code past the safe integer range reaches the stream whole", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      native.setNextStream(CONN_ID, 4n);
+      const opening = endpoint.openStream(PEER, "/test/1");
+      native.deliver([
+        {
+          inner: {
+            connId: CONN_ID,
+            initiatedLocally: true,
+            peerId: PEER,
+            protocolId: "/test/1",
+            streamId: 4n,
+          },
+          tag: "StreamReady",
+        },
+      ]);
+      await drained();
+      const stream = await opening;
+      const codes: bigint[] = [];
+      stream.on("writeStopped", ({ errorCode }) => codes.push(errorCode));
+
+      // QUIC stop codes are 62-bit varints.
+      const errorCode = 2n ** 62n - 1n;
+      native.deliver([
+        {
+          inner: { connId: CONN_ID, errorCode, peerId: PEER, streamId: 4n },
+          tag: "StreamWriteStopped",
+        },
+      ]);
+      await drained();
+
+      expect(codes).toEqual([errorCode]);
+      await expect(stream.write("late")).rejects.toThrow();
+      endpoint.close();
+    });
+
     test("native config carries the shared defaults", () => {
       harness
         .create({

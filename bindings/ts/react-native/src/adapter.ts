@@ -449,6 +449,10 @@ function normalizeBigInts(
   key?: string
 ): unknown {
   if (typeof value === "bigint") {
+    // A QUIC stop code is a 62-bit varint the remote picks: keep it whole.
+    if (key === "errorCode") {
+      return value;
+    }
     return key !== undefined &&
       CONNECTION_ID_KEYS.has(key) &&
       connectionIds !== undefined

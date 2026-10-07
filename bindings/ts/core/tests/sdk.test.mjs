@@ -1663,7 +1663,7 @@ test("EventsDropped resets a stream whose write is still in flight", async () =>
 
 test("a remote write stop or a stream close rejects pending writes", async () => {
   for (const [tag, extra] of [
-    [P2pEvent_Tags.StreamWriteStopped, { errorCode: 7 }],
+    [P2pEvent_Tags.StreamWriteStopped, { errorCode: 7n }],
     [P2pEvent_Tags.StreamClosed, {}],
   ]) {
     const backend = new MockBackend();

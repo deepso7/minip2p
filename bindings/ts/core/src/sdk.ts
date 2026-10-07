@@ -452,7 +452,7 @@ export class Stream {
    * The remote asked this side to stop writing.
    * @internal
    */
-  writeStopped(errorCode: number): void {
+  writeStopped(errorCode: bigint): void {
     if (this.#closed) {
       return;
     }
@@ -609,7 +609,7 @@ export interface StreamEventMap {
   /** The stream reached a terminal state. */
   closed: void;
   /** The remote asked this side to stop writing; pending writes rejected. */
-  writeStopped: { readonly errorCode: number };
+  writeStopped: { readonly errorCode: bigint };
   /** Incoming data exceeded the bounded pull-read buffer. */
   dataOverflow: {
     readonly droppedChunks: number;

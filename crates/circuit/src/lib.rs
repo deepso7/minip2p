@@ -882,14 +882,20 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !id.is_circuit() {
             return self.inner.close_stream_write(id, stream_id);
         }
-        self.operate_session(id, |session| session.close_stream_write(stream_id))
+        let result = self
+            .operate_session(id, |session| session.close_stream_write(stream_id))
             .map_err(|error| {
                 stream_error(error, |reason| TransportError::StreamCloseWriteFailed {
                     id,
                     stream_id,
                     reason,
                 })
-            })
+            });
+        // Writable never follows the end of a write side, even one a Full
+        // queued before its call returned.
+        self.pending
+            .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
+        result
     }
 
     fn reset_stream(
@@ -900,14 +906,20 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !id.is_circuit() {
             return self.inner.reset_stream(id, stream_id);
         }
-        self.operate_session(id, |session| session.reset_stream(stream_id))
+        let result = self
+            .operate_session(id, |session| session.reset_stream(stream_id))
             .map_err(|error| {
                 stream_error(error, |reason| TransportError::StreamResetFailed {
                     id,
                     stream_id,
                     reason,
                 })
-            })
+            });
+        // Writable never follows the end of a write side, even one a Full
+        // queued before its call returned.
+        self.pending
+            .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
+        result
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {

@@ -1585,15 +1585,18 @@ impl Transport for QuicTransport {
             .get_mut(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
 
-        conn.close_stream_write(
+        let result = conn.close_stream_write(
             stream_id,
             &self.socket,
             &mut self.pending_events,
             &mut self.pending_datagrams,
             self.node_config.limits().max_pending_datagrams,
-        )?;
-
-        Ok(())
+        );
+        // Writable never follows the end of a write side, even one a Full
+        // queued before its call returned.
+        self.pending_events
+            .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
+        result
     }
 
     fn reset_stream(
@@ -1606,9 +1609,10 @@ impl Transport for QuicTransport {
             .get_mut(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
 
-        conn.reset_stream(stream_id, &mut self.pending_events)?;
-
-        Ok(())
+        let result = conn.reset_stream(stream_id, &mut self.pending_events);
+        self.pending_events
+            .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
+        result
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
