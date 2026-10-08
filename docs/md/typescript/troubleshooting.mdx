@@ -16,7 +16,7 @@ Errors are public classes exported by `@minip2p/node` and `@minip2p/react-native
 | `openStream` rejects with `OpenStreamError` | The peer is not ready, lacks the protocol, or negotiation failed | Wait for `peerReady` and register the same protocol version on both peers. |
 | An inbound stream closes immediately | No named `stream` handler or waiter claimed it | Subscribe with `endpoint.on("stream", ...)`. |
 | `read()` rejects after adding a `data` handler | Pull and flowing reads were mixed | Pick one read mode for the stream lifetime. |
-| `dataOverflow` fires | Pull-mode bytes arrived faster than the application consumed them | Reset or abandon the stream and recover at the application protocol layer. |
+| A peer's stream writes stop making progress | The reading side is not consuming: no `read()` call and no `data` handler, so its receive window is full | Read the stream (or attach a `data` handler) on the receiving side, or reset or abandon streams it will not read. |
 | `BackpressureError` is thrown by `publish` | The outbound pubsub queue is full | Slow or batch publishers and retry according to application delivery rules. |
 | AutoNAT reports state but `connect` cannot relay | `autonatServers` probe reachability but provide no relay path | Add a reachable relay address to `relays`. |
 | `queueOverflow` fires | JavaScript did not consume events quickly enough | Refresh queryable state and reduce slow event handlers. |

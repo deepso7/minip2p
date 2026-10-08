@@ -98,6 +98,18 @@ export interface Minip2pBackend {
     streamId: number,
     data: Uint8Array
   ) => boolean;
+  /**
+   * Returns the function that acknowledges a stream's received bytes as
+   * consumed, replenishing its receive budget so the sender can continue
+   * (ADR 0012). Every registered protocol takes manual acknowledgement, so
+   * a reader that stops consuming stalls its sender.
+   *
+   * Called once, when the stream becomes ready; the returned function keeps
+   * naming that stream after its terminal event retires the public IDs. It
+   * throws on an over-acknowledgement and is a no-op once the stream or its
+   * connection is gone.
+   */
+  streamConsumer: (connId: number, streamId: number) => (bytes: number) => void;
   /** Half-closes the local stream write side, after any pending write. */
   closeStreamWrite: (peerId: string, connId: number, streamId: number) => void;
   /** Abruptly resets a stream. */

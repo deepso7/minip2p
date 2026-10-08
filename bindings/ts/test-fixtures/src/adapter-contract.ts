@@ -39,6 +39,13 @@ export interface FakeNativeState {
   setLiveConnection: (connId: bigint) => void;
   /** Writes native `sendStream` accepted, in call order. */
   readonly writes: readonly NativeStreamRef[];
+  /** Native `streamConsumed` calls, in call order. */
+  readonly consumed: readonly NativeConsumed[];
+}
+
+/** One native `streamConsumed` call, in runtime-neutral form. */
+export interface NativeConsumed extends NativeStreamRef {
+  readonly bytes: number;
 }
 
 /** A native stream identity, in runtime-neutral form. */
@@ -354,6 +361,39 @@ export function describeAdapterContract(
       expect(writeErrors).toHaveLength(1);
       expect(writeErrors[0]).toBeInstanceOf(StreamClosedError);
       expect(native.writes).toEqual([]);
+      endpoint.close();
+    });
+
+    test("a pull reader acknowledges bytes it reads after the stream closed", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      native.setNextStream(CONN_ID, 4n);
+      const opening = endpoint.openStream(PEER, "/test/1");
+      const stream4 = { connId: CONN_ID, peerId: PEER, streamId: 4n };
+      native.deliver([
+        {
+          inner: { ...stream4, initiatedLocally: true, protocolId: "/test/1" },
+          tag: "StreamReady",
+        },
+        {
+          inner: { ...stream4, data: new Uint8Array([1, 2, 3]).buffer },
+          tag: "StreamData",
+        },
+        { inner: stream4, tag: "StreamRemoteWriteClosed" },
+        { inner: stream4, tag: "StreamClosed" },
+      ]);
+      await drained();
+      const stream = await opening;
+      expect(native.consumed).toEqual([]);
+
+      // The closed stream's IDs are retired, yet its unread bytes still
+      // hold a native stream slot until this read acknowledges them.
+      expect([...((await stream.read()) ?? [])]).toEqual([1, 2, 3]);
+      expect(native.consumed).toEqual([
+        { bytes: 3, connId: CONN_ID, streamId: 4n },
+      ]);
+      expect(await stream.read()).toBeUndefined();
       endpoint.close();
     });
 

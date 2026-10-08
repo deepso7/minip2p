@@ -51,6 +51,10 @@ impl Transport for ScriptedTransport {
         Ok(())
     }
 
+    fn ack_stream(&mut self, _: ConnectionId, _: StreamId, _: usize) -> Result<(), TransportError> {
+        Ok(())
+    }
+
     fn close(&mut self, _: ConnectionId) -> Result<(), TransportError> {
         Ok(())
     }

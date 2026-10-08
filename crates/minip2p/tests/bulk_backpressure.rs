@@ -176,3 +176,180 @@ fn a_bulk_transfer_to_a_slow_reader_over_tcp_completes_without_teardown() {
     // Past Yamux's 256 KiB stream cap and TCP's 1 MiB socket buffer.
     bulk_transfer_to_slow_reader("/ip4/127.0.0.1/tcp/0", 8 * 1024 * 1024);
 }
+
+/// Sends `payload` from `writer`, resending held tails on Writable, and
+/// closes the write side once every byte is accepted. Call once per turn.
+struct Sender {
+    payload: Bytes,
+    offset: usize,
+    tail: Option<Bytes>,
+    writable: bool,
+    closed_write: bool,
+}
+
+impl Sender {
+    fn new(payload: Bytes) -> Self {
+        Self {
+            payload,
+            offset: 0,
+            tail: None,
+            writable: true,
+            closed_write: false,
+        }
+    }
+
+    fn turn(
+        &mut self,
+        writer: &mut Endpoint,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) {
+        if self.writable {
+            let data = self.tail.take().or_else(|| {
+                (self.offset < self.payload.len()).then(|| {
+                    let end = (self.offset + CHUNK).min(self.payload.len());
+                    let chunk = self.payload.slice(self.offset..end);
+                    self.offset = end;
+                    chunk
+                })
+            });
+            match data {
+                Some(data) => match writer.send_stream(peer, conn_id, stream_id, data) {
+                    Ok(()) => {}
+                    Err(Error::Full { unsent, .. }) => {
+                        self.tail = Some(unsent);
+                        self.writable = false;
+                    }
+                    other => other.expect("send failed"),
+                },
+                None if !self.closed_write => {
+                    writer
+                        .close_stream_write(peer, conn_id, stream_id)
+                        .expect("close write");
+                    self.closed_write = true;
+                }
+                None => {}
+            }
+        }
+        while let Some(event) = next(writer, Duration::from_millis(1)) {
+            fail_on_teardown(&event);
+            if matches!(event, EndpointEvent::StreamWritable { stream_id: s, .. } if s == stream_id)
+            {
+                self.writable = true;
+            }
+        }
+    }
+}
+
+/// A reader whose protocol takes manual acknowledgement holds its sender to
+/// one receive window until it calls `stream_consumed`, which resumes it.
+fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window: usize) {
+    let mut reader = Endpoint::builder()
+        .listen_on(listen)
+        .expect("listen address")
+        .manual_ack_protocol(PROTOCOL)
+        .bind()
+        .expect("bind reader");
+    let mut writer = bind(listen);
+    let (reader_peer, conn_id, stream_id) = open(&mut writer, &mut reader);
+    let total = 3 * window;
+    let payload = Bytes::from((0..total).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+    let mut sender = Sender::new(payload.clone());
+    let mut received = Vec::with_capacity(total);
+    let mut reader_stream = None;
+    let deadline = Instant::now() + BACKSTOP;
+
+    // Never acknowledging: delivery stops at exactly one window.
+    let mut quiet_since = Instant::now();
+    while quiet_since.elapsed() < Duration::from_millis(500) {
+        assert!(Instant::now() < deadline, "the link never went quiet");
+        sender.turn(&mut writer, &reader_peer, conn_id, stream_id);
+        while let Some(event) = next(&mut reader, Duration::from_millis(1)) {
+            if let EndpointEvent::StreamData {
+                conn_id,
+                stream_id,
+                data,
+                ..
+            } = event
+            {
+                reader_stream = Some((conn_id, stream_id));
+                received.extend_from_slice(&data);
+                quiet_since = Instant::now();
+            } else {
+                fail_on_teardown(&event);
+            }
+        }
+    }
+    // The window also carried the negotiation, which the endpoint consumed
+    // itself; Yamux returns credit in half windows, so that is not back yet.
+    assert!(
+        received.len() <= window && window - received.len() < 1024,
+        "an unacknowledged reader gets one window, got {} of {window}",
+        received.len()
+    );
+
+    let (reader_conn, reader_stream) = reader_stream.expect("data arrived");
+    let over_ack = reader.stream_consumed(reader_conn, reader_stream, window + 1);
+    assert!(
+        matches!(
+            over_ack,
+            Err(Error::Transport(minip2p::TransportError::AckExceedsDelivered {
+                acked,
+                unacked,
+                ..
+            })) if (acked, unacked) == (window + 1, received.len())
+        ),
+        "an over-ack names both counts and fails: {over_ack:?}"
+    );
+
+    // Consuming resumes the sender, and the transfer completes.
+    reader
+        .stream_consumed(reader_conn, reader_stream, received.len())
+        .expect("consume the window");
+    let mut eof = false;
+    while !eof {
+        assert!(
+            Instant::now() < deadline,
+            "stalled at {} bytes",
+            received.len()
+        );
+        sender.turn(&mut writer, &reader_peer, conn_id, stream_id);
+        while let Some(event) = next(&mut reader, Duration::from_millis(1)) {
+            match event {
+                EndpointEvent::StreamData {
+                    conn_id,
+                    stream_id,
+                    data,
+                    ..
+                } => {
+                    received.extend_from_slice(&data);
+                    reader
+                        .stream_consumed(conn_id, stream_id, data.len())
+                        .expect("consume");
+                }
+                EndpointEvent::StreamRemoteWriteClosed { .. } => eof = true,
+                other => fail_on_teardown(&other),
+            }
+        }
+    }
+    assert!(received == payload, "every byte, once, in order");
+}
+
+#[cfg(feature = "quic")]
+#[test]
+fn a_manual_ack_reader_stalls_its_sender_until_it_consumes_over_quic() {
+    a_manual_ack_reader_stalls_its_sender_until_it_consumes(
+        "/ip4/127.0.0.1/udp/0/quic-v1",
+        minip2p_quic::STREAM_RECEIVE_WINDOW,
+    );
+}
+
+#[cfg(feature = "tcp")]
+#[test]
+fn a_manual_ack_reader_stalls_its_sender_until_it_consumes_over_tcp() {
+    a_manual_ack_reader_stalls_its_sender_until_it_consumes(
+        "/ip4/127.0.0.1/tcp/0",
+        minip2p::TcpConfig::default().yamux.receive_window as usize,
+    );
+}

@@ -921,7 +921,8 @@ impl GossipsubAgent {
             GossipsubAction::OpenStream { peer: p, .. }
             | GossipsubAction::SendStream { peer: p, .. }
             | GossipsubAction::CloseStreamWrite { peer: p, .. }
-            | GossipsubAction::ResetStream { peer: p, .. } => p != peer,
+            | GossipsubAction::ResetStream { peer: p, .. }
+            | GossipsubAction::AckStream { peer: p, .. } => p != peer,
         });
     }
 
@@ -1021,6 +1022,10 @@ impl GossipsubAgent {
         true
     }
 
+    /// Reads an inbound stream's bytes into whole frames and acknowledges
+    /// what it consumed: bytes of decoded frames, and anything discarded.
+    /// A partial frame stays unacknowledged until it completes; frames are
+    /// far smaller than a receive window, so that never stalls the peer.
     fn on_stream_data(
         &mut self,
         peer: &PeerId,
@@ -1030,9 +1035,40 @@ impl GossipsubAgent {
     ) -> bool {
         match self.role(peer, stream_id) {
             Some(StreamRole::Inbound) => {}
-            Some(_) => return true,
+            // Data on our outbound stream, or one we refused, is dropped.
+            Some(_) => {
+                self.ack(peer, stream_id, data.len());
+                return true;
+            }
             None => return false,
         }
+        let before = self.inbound_buffered(peer, stream_id);
+        self.read_frames(peer, stream_id, data, now_ms);
+        let after = self.inbound_buffered(peer, stream_id);
+        self.ack(peer, stream_id, (before + data.len()).saturating_sub(after));
+        true
+    }
+
+    /// Bytes of an unfinished frame held for an inbound stream.
+    fn inbound_buffered(&self, peer: &PeerId, stream_id: StreamId) -> usize {
+        self.peers
+            .get(peer)
+            .and_then(|state| state.inbound.get(&stream_id))
+            .map_or(0, Vec::len)
+    }
+
+    fn ack(&mut self, peer: &PeerId, stream_id: StreamId, bytes: usize) {
+        if bytes != 0 {
+            self.actions.push_back(GossipsubAction::AckStream {
+                peer: peer.clone(),
+                stream_id,
+                bytes,
+            });
+        }
+    }
+
+    /// Appends `data` to the stream's buffer and processes every whole frame.
+    fn read_frames(&mut self, peer: &PeerId, stream_id: StreamId, data: &[u8], now_ms: u64) {
         const CAP: usize = MAX_RPC_SIZE + MAX_PREFIX_LEN;
         let mut offset = 0;
         while offset < data.len() {
@@ -1041,17 +1077,17 @@ impl GossipsubAgent {
                 .get_mut(peer)
                 .and_then(|state| state.inbound.get_mut(&stream_id))
             else {
-                return true;
+                return;
             };
             let room = CAP.saturating_sub(buf.len());
             if room == 0 {
                 self.violation_reset(peer, stream_id, "inbound buffer overflow");
-                return true;
+                return;
             }
             let take = room.min(data.len() - offset);
             let end = offset + take;
             let Some(chunk) = data.get(offset..end) else {
-                return true;
+                return;
             };
             buf.extend_from_slice(chunk);
             offset = end;
@@ -1062,7 +1098,7 @@ impl GossipsubAgent {
                     Ok(payload) => match Rpc::decode(&payload) {
                         Ok(rpc) => {
                             if !self.process_rpc(peer, stream_id, rpc, now_ms) {
-                                return true;
+                                return;
                             }
                         }
                         Err(error) => {
@@ -1071,12 +1107,12 @@ impl GossipsubAgent {
                                 stream_id,
                                 &format!("malformed RPC: {error}"),
                             );
-                            return true;
+                            return;
                         }
                     },
                     Err(reason) => {
                         self.violation_reset(peer, stream_id, &reason);
-                        return true;
+                        return;
                     }
                 }
             }
@@ -1089,7 +1125,6 @@ impl GossipsubAgent {
                 buf.drain(..head);
             }
         }
-        true
     }
 
     fn take_frame(
@@ -1200,9 +1235,14 @@ impl GossipsubAgent {
                 }
             }
             StreamRole::Inbound => {
-                if let Some(state) = self.peers.get_mut(peer) {
-                    state.inbound.remove(&stream_id);
-                }
+                // An unfinished frame is discarded with the stream, which
+                // consumes it: the closed stream settles.
+                let unfinished = self
+                    .peers
+                    .get_mut(peer)
+                    .and_then(|state| state.inbound.remove(&stream_id))
+                    .map_or(0, |buffer| buffer.len());
+                self.ack(peer, stream_id, unfinished);
             }
             StreamRole::Rejected => {}
         }

@@ -207,6 +207,8 @@ Use `relay_server_config` for validated capacity, duration, byte, control, and r
 
 Relay-only endpoints accept and advertise inbound HOP and can open outbound STOP. NAT-only endpoints open outbound HOP and accept/advertise trusted STOP, without advertising HOP. Combined endpoints install both role sets. The Swarm keeps one live connection per peer; exact connection targeting by the relay driver relies on that invariant.
 
+Reading is backpressured too (ADR 0012): each stream delivers at most one receive window that has not been acknowledged. The Endpoint acknowledges `EndpointEvent::StreamData` when the application pulls it from `poll` or `wait`, so a reader that stops pulling slows its sender. A protocol registered with `EndpointBuilder::manual_ack_protocol` or `Endpoint::add_manual_ack_protocol` is acknowledged by the application instead, with `Endpoint::stream_consumed`, for readers whose bytes outlive the event. Over-acknowledging is `TransportError::AckExceedsDelivered`, naming the stream and both counts.
+
 `send_stream` takes anything that converts into `Bytes` and accepts as much as the stream can queue. When not every byte fit it returns `Error::Full` with the exact unsent tail: hold it and send it again on `EndpointEvent::StreamWritable` for that stream. Full is backpressure, never a fault, and a slow reader slows the writer instead of tearing the connection down. One exception remains: the relay server still treats a Full forwarded write as a failure and closes that relayed circuit ([#257](https://github.com/deepso7/minip2p/issues/257)). Close the write side only once every held tail has been accepted; `StreamWriteStopped`, `StreamClosed`, or the connection ending mean the tail should be dropped.
 
 ```rust

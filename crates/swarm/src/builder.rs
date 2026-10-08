@@ -198,6 +198,15 @@ mod tests {
     }
 
     impl Transport for NoopTransport {
+        fn ack_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _bytes: usize,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
             Err(TransportError::Unsupported { operation: "dial" })
         }

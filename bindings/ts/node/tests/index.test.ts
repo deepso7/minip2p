@@ -268,6 +268,62 @@ describe("@minip2p/node", () => {
     }
   }, 20_000);
 
+  test.each([
+    // Several Yamux windows plus TCP's socket buffers.
+    ["TCP", "/ip4/127.0.0.1/tcp/0", 4 * 1024 * 1024],
+    // Past QUIC's 8 MiB send queue plus both 1 MB stream windows.
+    ["QUIC", "/ip4/127.0.0.1/udp/0/quic-v1", 16 * 1024 * 1024],
+  ])(
+    "a bulk transfer to a slow reader over %s holds the writer back and loses nothing",
+    async (_transport, listen, size) => {
+      const protocol = "/minip2p/node-slow-reader/1";
+      const createEndpoint = () =>
+        nodeSdk.Minip2p.create({
+          listen: [listen],
+          protocols: [protocol],
+          secretKey: nodeSdk.generateSecretKey(),
+        });
+      const a = createEndpoint();
+      const b = createEndpoint();
+
+      try {
+        await a.connect(b.listenAddrs()[0], { timeoutMs: 10_000 });
+        await a.waitPeerReady(b.peerId(), { timeoutMs: 10_000 });
+        const inboundPromise = b.once("stream", { timeoutMs: 10_000 });
+        const outbound = await a.openStream(b.peerId(), protocol, {
+          timeoutMs: 10_000,
+        });
+        const inbound = await inboundPromise;
+        const payload = Uint8Array.from({ length: size }, (_, i) => i % 251);
+        let accepted = false;
+        const written = outbound.write(payload).then(() => {
+          accepted = true;
+        });
+        outbound.closeWrite();
+
+        // Nothing reads yet: the receive window fills and the writer waits.
+        await delay(500);
+        expect(accepted).toBe(false);
+
+        const received: Uint8Array[] = [];
+        let chunks = 0;
+        for await (const chunk of inbound) {
+          received.push(chunk);
+          chunks += 1;
+          if (chunks % 8 === 0) {
+            await delay(1);
+          }
+        }
+        await written;
+        expect(Buffer.concat(received).equals(Buffer.from(payload))).toBe(true);
+      } finally {
+        a.close();
+        b.close();
+      }
+    },
+    30_000
+  );
+
   test("two endpoints establish a circuit-relay path", async () => {
     const relay = await startRelay();
     const createEndpoint = () =>

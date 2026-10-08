@@ -24,6 +24,8 @@ const native = vi.hoisted(() => {
       streamId: bigint;
     }[] = [];
     readonly writes: { connId: bigint; streamId: bigint }[] = [];
+    readonly consumed: { bytes: number; connId: bigint; streamId: bigint }[] =
+      [];
     liveConnId: bigint | undefined;
     readonly cancelledConnects: bigint[] = [];
     readonly connectTargets: (string | string[])[] = [];
@@ -161,6 +163,10 @@ const native = vi.hoisted(() => {
     }
 
     resetStream(): void {}
+
+    streamConsumed(connId: bigint, streamId: bigint, bytes: number): void {
+      this.consumed.push({ bytes, connId, streamId });
+    }
 
     sendStream(
       _peerId: string,
@@ -593,7 +599,7 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
-  test("handles an unclaimed ready stream closed in the same drain", async () => {
+  test("skips a peer stream that closed without data in the same drain", async () => {
     vi.useFakeTimers();
     const endpoint = createEndpoint();
     const fake = fakeEndpoint();
@@ -627,9 +633,8 @@ describe("Node adapter", () => {
     fake.ring();
     await settle();
 
-    expect(fake.abandonedStreams).toEqual([
-      { connId: 10n, peerId: "remote", streamId: 20n },
-    ]);
+    // Never surfaced, so there is nothing to abandon, and later events flow.
+    expect(fake.abandonedStreams).toEqual([]);
     expect(peers).toEqual(["after"]);
     endpoint.close();
   });
@@ -660,8 +665,21 @@ describeAdapterContract("Node", {
           ? { kind: "peer" as const, peerId: target }
           : { addresses: target, kind: "addresses" as const }
       ),
+      consumed: fake.consumed,
       deliver: (events: readonly NativeEventLiteral[]) => {
-        fake.enqueue([...events], []);
+        // The addon hands bytes over as `Uint8Array`s, not `ArrayBuffer`s.
+        fake.enqueue(
+          events.map(({ inner, tag }) => ({
+            inner: Object.fromEntries(
+              Object.entries(inner).map(([key, value]) => [
+                key,
+                value instanceof ArrayBuffer ? new Uint8Array(value) : value,
+              ])
+            ),
+            tag,
+          })),
+          []
+        );
         fake.ring();
       },
       setConnectionInfo: (info) => {

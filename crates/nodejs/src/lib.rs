@@ -342,6 +342,25 @@ impl NodeEndpoint {
             .map_err(|error| native_error(&env, error))
     }
 
+    /// Acknowledges `bytes` of a stream's received data as consumed,
+    /// letting its sender continue. Every registered protocol needs this.
+    #[napi]
+    pub fn stream_consumed(
+        &self,
+        env: Env,
+        conn_id: BigInt,
+        stream_id: BigInt,
+        bytes: u32,
+    ) -> Result<()> {
+        self.0
+            .stream_consumed(
+                bigint_u64(conn_id, "connId")?,
+                bigint_u64(stream_id, "streamId")?,
+                u64::from(bytes),
+            )
+            .map_err(|error| native_error(&env, error))
+    }
+
     /// Starts one Connection attempt: a peer ID string, or an array of
     /// complete peer addresses naming one peer. Returns the Connect ID.
     #[napi]

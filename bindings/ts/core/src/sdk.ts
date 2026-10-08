@@ -50,8 +50,6 @@ const DEFAULT_TIMEOUT_MS = 65_000;
 const EVENT_QUEUE_CAP = 4096;
 const EVENT_FLUSH_BATCH = 256;
 const CONNECT_TERMINAL_CAP = 1024;
-const STREAM_CHUNK_CAP = 64;
-const STREAM_BYTE_CAP = 1024 * 1024;
 /** Default per-stream write high-water mark: one Yamux stream send cap. */
 const DEFAULT_WRITE_HIGH_WATER_MARK = 256 * 1024;
 
@@ -187,6 +185,199 @@ class BoundedQueue<Item> {
   }
 }
 
+/**
+ * Native events that are never dropped, because stream and connection state
+ * depends on each one (ADR 0012), plus the driver failure that ends them.
+ */
+const LOSSLESS_TAGS: ReadonlySet<string> = new Set<string>([
+  P2pEvent_Tags.StreamReady,
+  ...STREAM_EVENT_TAGS,
+  P2pEvent_Tags.ConnectionClosed,
+  P2pEvent_Tags.ConnectionReplaced,
+  P2pEvent_Tags.DriverFailed,
+]);
+
+type StreamDataEvent = Extract<
+  P2pEvent,
+  { readonly tag: typeof P2pEvent_Tags.StreamData }
+>;
+
+/** Returns `next` appended to `last` when both are data for one stream. */
+const coalesceData = (
+  last: QueueItem,
+  next: QueueItem
+): QueueItem | undefined => {
+  if (
+    last.source !== "native" ||
+    next.source !== "native" ||
+    last.event.tag !== P2pEvent_Tags.StreamData ||
+    next.event.tag !== P2pEvent_Tags.StreamData
+  ) {
+    return undefined;
+  }
+  const { inner } = last.event;
+  const { inner: added } = next.event;
+  if (
+    inner.peerId !== added.peerId ||
+    inner.connId !== added.connId ||
+    inner.streamId !== added.streamId
+  ) {
+    return undefined;
+  }
+  const data = new Uint8Array(inner.data.byteLength + added.data.byteLength);
+  data.set(new Uint8Array(inner.data));
+  data.set(new Uint8Array(added.data), inner.data.byteLength);
+  const event: StreamDataEvent = {
+    inner: { ...inner, data: data.buffer },
+    tag: P2pEvent_Tags.StreamData,
+  };
+  return { event, source: "native" };
+};
+
+/** The stream a native per-stream event belongs to. */
+const streamEventKey = (item: QueueItem): string | undefined => {
+  if (
+    item.source !== "native" ||
+    (item.event.tag !== P2pEvent_Tags.StreamReady && !isStreamEvent(item.event))
+  ) {
+    return undefined;
+  }
+  const { peerId, connId, streamId } = item.event.inner;
+  return streamKey(peerId, connId, streamId);
+};
+
+/**
+ * The endpoint's shared event queue, in delivery order.
+ *
+ * Stream events and connection-end events (plus `DriverFailed`) never drop,
+ * and adjacent data for one stream coalesces into one event, so native
+ * receive budgets bound them; they do not count against the capacity. Past `capacity` other items, the oldest
+ * gossipsub message is dropped first, then the oldest other item.
+ *
+ * A peer-opened stream that closes without data before its `StreamReady`
+ * is dispatched leaves the queue whole, so a peer opening and closing
+ * streams cannot grow it; its events still reach `release`.
+ */
+class EventQueue {
+  readonly #items = new Map<number, QueueItem>();
+  /** Droppable messages, then other droppable items, oldest first. */
+  readonly #messages = new Set<number>();
+  readonly #others = new Set<number>();
+  /**
+   * Peer-opened streams whose `StreamReady` is still queued, with their
+   * queued item ids; `undefined` once one carried data.
+   */
+  readonly #unseen = new Map<string, number[] | undefined>();
+  readonly #capacity: number;
+  readonly #release: (item: QueueItem) => void;
+  #next = 0;
+  #newest: number | undefined;
+
+  constructor(capacity: number, release: (item: QueueItem) => void) {
+    this.#capacity = capacity;
+    this.#release = release;
+  }
+
+  get length(): number {
+    return this.#items.size;
+  }
+
+  /** Appends `item`, returning the item dropped to make room, if any. */
+  push(item: QueueItem): QueueItem | undefined {
+    const newest =
+      this.#newest === undefined ? undefined : this.#items.get(this.#newest);
+    const merged =
+      newest === undefined ? undefined : coalesceData(newest, item);
+    if (merged !== undefined && this.#newest !== undefined) {
+      // A data event retires no adapter IDs, so the absorbed one needs no
+      // `eventHandled`.
+      this.#items.set(this.#newest, merged);
+      return undefined;
+    }
+    const id = this.#next;
+    this.#next += 1;
+    if (this.#elideUnseen(item, id)) {
+      return undefined;
+    }
+    this.#items.set(id, item);
+    this.#newest = id;
+    if (item.source === "native" && item.event.tag === P2pEvent_Tags.Message) {
+      this.#messages.add(id);
+    } else if (item.source !== "native" || !LOSSLESS_TAGS.has(item.event.tag)) {
+      this.#others.add(id);
+    }
+    if (this.#messages.size + this.#others.size <= this.#capacity) {
+      return undefined;
+    }
+    const [victim] = this.#messages.size > 0 ? this.#messages : this.#others;
+    return victim === undefined ? undefined : this.#remove(victim);
+  }
+
+  shift(): QueueItem | undefined {
+    const [oldest] = this.#items.keys();
+    if (oldest === undefined) {
+      return undefined;
+    }
+    const item = this.#remove(oldest);
+    if (
+      item?.source === "native" &&
+      item.event.tag === P2pEvent_Tags.StreamReady
+    ) {
+      this.#unseen.delete(streamEventKey(item) ?? "");
+    }
+    return item;
+  }
+
+  /**
+   * Records `item` (as `id`) against an unseen peer stream. Returns whether
+   * it closed one that carried no data, which leaves the queue whole.
+   */
+  #elideUnseen(item: QueueItem, id: number): boolean {
+    const key = streamEventKey(item);
+    if (key === undefined || item.source !== "native") {
+      return false;
+    }
+    const { event } = item;
+    if (event.tag === P2pEvent_Tags.StreamReady) {
+      if (!event.inner.initiatedLocally) {
+        this.#unseen.set(key, [id]);
+      }
+      return false;
+    }
+    if (!this.#unseen.has(key)) {
+      return false;
+    }
+    const ids = this.#unseen.get(key);
+    if (event.tag === P2pEvent_Tags.StreamData) {
+      this.#unseen.set(key, undefined);
+    } else if (ids !== undefined && event.tag === P2pEvent_Tags.StreamClosed) {
+      this.#unseen.delete(key);
+      for (const queued of ids) {
+        const removed = this.#remove(queued);
+        if (removed !== undefined) {
+          this.#release(removed);
+        }
+      }
+      this.#release(item);
+      return true;
+    } else {
+      ids?.push(id);
+    }
+    return false;
+  }
+
+  #remove(id: number): QueueItem | undefined {
+    const item = this.#items.get(id);
+    this.#items.delete(id);
+    this.#messages.delete(id);
+    this.#others.delete(id);
+    if (this.#newest === id) {
+      this.#newest = undefined;
+    }
+    return item;
+  }
+}
+
 /** A negotiated custom-protocol stream with exclusive pull or flowing reads. */
 export class Stream {
   /** Remote peer that owns the other end of this stream. */
@@ -201,6 +392,7 @@ export class Stream {
   readonly initiatedLocally: boolean;
   readonly #backend: Minip2pBackend;
   readonly #onTerminal: () => void;
+  readonly #consume: (bytes: number) => void;
   readonly #listeners = new Map<
     keyof StreamEventMap,
     Set<(payload: StreamEventMap[keyof StreamEventMap]) => void>
@@ -234,6 +426,7 @@ export class Stream {
   ) {
     this.#backend = backend;
     this.#onTerminal = onTerminal;
+    this.#consume = streamConsumer(backend, meta);
     this.peerId = meta.peerId;
     this.protocolId = meta.protocolId;
     this.streamId = meta.streamId;
@@ -241,7 +434,16 @@ export class Stream {
     this.initiatedLocally = meta.initiatedLocally;
   }
 
-  /** Subscribes to stream lifecycle or data events. */
+  /**
+   * Subscribes to stream lifecycle or data events.
+   *
+   * A chunk counts as consumed once every `data` handler has returned, and
+   * only consumed bytes let the sender continue: a stream delivers at most
+   * one receive window that has not been consumed. An `async` handler is
+   * consumed when it returns its Promise, not when that Promise settles; to
+   * hold the sender back while asynchronous work runs, use {@link read}
+   * instead.
+   */
   on<Kind extends keyof StreamEventMap>(
     type: Kind,
     handler: (payload: StreamEventMap[Kind]) => void
@@ -278,6 +480,11 @@ export class Stream {
   /**
    * Reads the next buffered chunk, or `undefined` after the remote write side
    * closes. Pull reads and flowing `data` handlers are mutually exclusive.
+   *
+   * Returning a chunk consumes it, which lets the sender continue: the
+   * stream delivers at most one receive window that has not been read, so a
+   * reader that stops calling `read()` stalls its sender rather than
+   * buffering without bound.
    */
   read(): Promise<Uint8Array | undefined> {
     if (this.#mode === "flowing") {
@@ -289,12 +496,9 @@ export class Stream {
     if (this.#receiveState.kind === "failed") {
       return Promise.reject(this.#receiveState.error);
     }
-    const buffered = this.#shift();
-    if (buffered !== undefined) {
+    const buffered = this.#take();
+    if (buffered !== undefined || this.#receiveState.kind === "eof") {
       return Promise.resolve(buffered);
-    }
-    if (this.#receiveState.kind === "eof") {
-      return Promise.resolve(this.#shift());
     }
     return new Promise((resolve, reject) => {
       this.#reads.push({ reject, resolve });
@@ -309,8 +513,7 @@ export class Stream {
    * buffers {@link writeHighWaterMark} bytes (a first write is always
    * admitted, so a payload larger than the mark can still be sent), and with
    * a closed error after `closeWrite()`, a remote stop, or the stream
-   * closing. If event loss strands a write in flight, the stream is reset
-   * and the write rejects with {@link EventQueueOverflowError}.
+   * closing.
    *
    * A write queued behind a pending one keeps a reference to `data`, and
    * native reads it only when the write reaches the head of the queue: leave
@@ -359,24 +562,44 @@ export class Stream {
     this.#closeWriteQueued = true;
   }
 
-  /** Abruptly resets the stream and emits `closed`. */
+  /**
+   * Abruptly resets the stream and emits `closed`. On a stream that already
+   * closed, discards unread bytes instead.
+   */
   reset(): void {
-    if (!this.#closed) {
-      this.#backend.resetStream(this.peerId, this.connId, this.streamId);
-      this.terminal();
+    if (this.#closed) {
+      this.#discardUnread();
+      return;
     }
+    this.#backend.resetStream(this.peerId, this.connId, this.streamId);
+    this.terminal();
   }
 
-  /** Relinquishes the stream and requests a reset while it remains active. */
+  /**
+   * Relinquishes the stream and requests a reset while it remains active.
+   * On a stream that already closed, discards unread bytes instead.
+   */
   abandon(): void {
-    if (!this.#closed) {
-      try {
-        this.#backend.abandonStream(this.peerId, this.connId, this.streamId);
-      } catch {
-        // A native close can overtake its queued terminal event.
-      }
-      this.terminal();
+    if (this.#closed) {
+      this.#discardUnread();
+      return;
     }
+    try {
+      this.#backend.abandonStream(this.peerId, this.connId, this.streamId);
+    } catch {
+      // A native close can overtake its queued terminal event.
+    }
+    this.terminal();
+  }
+
+  /**
+   * A cleanly closed stream keeps unread bytes for later reads, and they
+   * hold its native stream slot until consumed; discarding them releases it.
+   */
+  #discardUnread(): void {
+    this.#consumed(this.#fifoBytes);
+    this.#fifo.length = 0;
+    this.#fifoBytes = 0;
   }
 
   [Symbol.dispose](): void {
@@ -407,22 +630,15 @@ export class Stream {
     const read = this.#reads.shift();
     if (read !== undefined) {
       read.resolve(chunk);
+      this.#consumed(chunk.byteLength);
       return;
     }
     if (this.#mode === "flowing") {
-      this.#emit("data", chunk);
+      this.#emitData(chunk);
       return;
     }
-    if (
-      this.#fifo.length >= STREAM_CHUNK_CAP ||
-      this.#fifoBytes + chunk.byteLength > STREAM_BYTE_CAP
-    ) {
-      this.#emit("dataOverflow", {
-        droppedBytes: chunk.byteLength,
-        droppedChunks: 1,
-      });
-      return;
-    }
+    // Unbounded here, because native delivers at most one receive window
+    // that has not been consumed.
     this.#fifo.push(chunk);
     this.#fifoBytes += chunk.byteLength;
   }
@@ -438,25 +654,6 @@ export class Stream {
     this.#writeInFlight = false;
     this.#settleHead();
     this.#pumpWrites();
-  }
-
-  /**
-   * Event loss may have taken this stream's write settlement or terminal
-   * with it, so an in-flight write can no longer complete. Resets the stream
-   * and fails its writes with `error`; a stream with no write in flight is
-   * untouched.
-   * @internal
-   */
-  writesLost(error: unknown): void {
-    if (this.#closed || !this.#writeInFlight) {
-      return;
-    }
-    try {
-      this.#backend.resetStream(this.peerId, this.connId, this.streamId);
-    } catch {
-      // The stream may already be gone natively; the outcome is the same.
-    }
-    this.terminal(error);
   }
 
   /**
@@ -506,12 +703,11 @@ export class Stream {
       options.preserveRemoteEof === true && this.#receiveState.kind === "eof";
     if (!hasRemoteEof) {
       this.#receiveState = { error, kind: "failed" };
-      this.#fifo.length = 0;
-      this.#fifoBytes = 0;
+      this.#discardUnread();
     }
     for (const read of this.#reads.splice(0)) {
       if (hasRemoteEof) {
-        read.resolve(this.#shift());
+        read.resolve(this.#take());
       } else {
         read.reject(error);
       }
@@ -581,21 +777,49 @@ export class Stream {
     }
   }
 
+  /**
+   * Hands buffered chunks to `data` handlers. After a clean close the
+   * buffer still holds the bytes that arrived before EOF (a failed stream
+   * has already discarded them), so a late handler drains it too.
+   */
   #flushFlowing(): void {
-    while (this.#fifo.length > 0 && !this.#closed) {
-      const chunk = this.#shift();
+    while (this.#fifo.length > 0) {
+      const chunk = this.#fifo.shift();
       if (chunk !== undefined) {
-        this.#emit("data", chunk);
+        this.#fifoBytes -= chunk.byteLength;
+        this.#emitData(chunk);
       }
     }
   }
 
-  #shift(): Uint8Array | undefined {
+  /** Hands `chunk` to every `data` handler; it is consumed once they return. */
+  #emitData(chunk: Uint8Array): void {
+    // Counted first: a handler may transfer the buffer, detaching it.
+    const bytes = chunk.byteLength;
+    this.#emit("data", chunk);
+    this.#consumed(bytes);
+  }
+
+  /** Takes the oldest buffered chunk for a reader, consuming it. */
+  #take(): Uint8Array | undefined {
     const chunk = this.#fifo.shift();
     if (chunk !== undefined) {
       this.#fifoBytes -= chunk.byteLength;
+      this.#consumed(chunk.byteLength);
     }
     return chunk;
+  }
+
+  /** Acknowledges consumed bytes to native, letting the sender continue. */
+  #consumed(bytes: number): void {
+    if (bytes === 0) {
+      return;
+    }
+    try {
+      this.#consume(bytes);
+    } catch {
+      // The stream or its connection is already gone natively.
+    }
   }
 
   #emit<Kind extends keyof StreamEventMap>(
@@ -612,6 +836,33 @@ export class Stream {
   }
 }
 
+/**
+ * The backend's acknowledgement function for a stream. A connection whose
+ * end the adapter already saw has nothing left to settle.
+ */
+const streamConsumer = (
+  backend: Minip2pBackend,
+  meta: InboundStreamMeta
+): ((bytes: number) => void) => {
+  try {
+    return backend.streamConsumer(meta.connId, meta.streamId);
+  } catch {
+    return () => {};
+  }
+};
+
+/** Acknowledges data that arrived for a stream the SDK no longer tracks. */
+const consumeUntracked = (
+  backend: Minip2pBackend,
+  inner: StreamDataEvent["inner"]
+): void => {
+  try {
+    backend.streamConsumer(inner.connId, inner.streamId)(inner.data.byteLength);
+  } catch {
+    // Settled already, or its connection is gone: nothing to release.
+  }
+};
+
 /** Events emitted by a negotiated {@link Stream}. */
 export interface StreamEventMap {
   /** A received binary chunk. */
@@ -622,11 +873,6 @@ export interface StreamEventMap {
   closed: void;
   /** The remote asked this side to stop writing; pending writes rejected. */
   writeStopped: { readonly errorCode: bigint };
-  /** Incoming data exceeded the bounded pull-read buffer. */
-  dataOverflow: {
-    readonly droppedChunks: number;
-    readonly droppedBytes: number;
-  };
 }
 
 /**
@@ -641,7 +887,9 @@ export class Minip2pBase {
   readonly #catchAll = new Set<CatchAllHandler>();
   readonly #closeHandlers = new Set<(reason: CloseReason) => void>();
   readonly #waiters = new Set<EventWaiter>();
-  readonly #queue = new BoundedQueue<QueueItem>(EVENT_QUEUE_CAP);
+  readonly #queue = new EventQueue(EVENT_QUEUE_CAP, (item) => {
+    this.#releaseQueueItem(item);
+  });
   readonly #connects = new Map<number, ConnectAttempt>();
   readonly #terminalConnects = new Set<number>();
   readonly #streams = new Map<string, Stream>();
@@ -1274,7 +1522,6 @@ export class Minip2pBase {
       ping.cancel(error);
     }
     this.#pings.clear();
-    this.#writesLost(error);
     // Connection attempts correlate exactly: only a dropped terminal, or a
     // dropped native loss report naming it, settles its attempt.
     if (dropped.source === "native") {
@@ -1299,13 +1546,6 @@ export class Minip2pBase {
       }
     }
     this.#pendingOpens.clear();
-  }
-
-  /** Fails every stream whose in-flight write may have lost its settlement. */
-  #writesLost(error: EventQueueOverflowError): void {
-    for (const stream of [...this.#streams.values()]) {
-      stream.writesLost(error);
-    }
   }
 
   #enqueueNative(event: P2pEvent): void {
@@ -1433,7 +1673,6 @@ export class Minip2pBase {
     }
     if (event.tag === P2pEvent_Tags.EventsDropped) {
       this.#connectResultsLost(event.inner.terminalConnectIds);
-      this.#writesLost(new EventQueueOverflowError());
     }
 
     const normalized = normalizeEvent(event);
@@ -1575,7 +1814,14 @@ export class Minip2pBase {
         preserveRemoteEof: true,
       });
     } else if (event.tag === P2pEvent_Tags.StreamData) {
-      stream?.receive(event.inner.data);
+      if (stream === undefined) {
+        // Nothing will read it, so it is consumed now: an abandon that
+        // native refused (the stream had already closed there) leaves the
+        // bytes holding the native stream slot otherwise.
+        consumeUntracked(this.#backend, event.inner);
+      } else {
+        stream.receive(event.inner.data);
+      }
     } else if (event.tag === P2pEvent_Tags.StreamWriteAccepted) {
       stream?.writeAccepted();
     } else if (event.tag === P2pEvent_Tags.StreamWriteStopped) {

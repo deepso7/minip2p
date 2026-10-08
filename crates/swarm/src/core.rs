@@ -598,6 +598,31 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         Ok(())
     }
 
+    /// Acknowledges `bytes` of a stream's delivered data as consumed,
+    /// replenishing its receive budget so the sender can continue (ADR 0012).
+    ///
+    /// The application owns this for every [`SwarmEvent::StreamData`] it
+    /// receives; the swarm acknowledges what it consumes itself. Fails with
+    /// [`TransportError::AckExceedsDelivered`] for more than the stream's
+    /// unacknowledged bytes; a closed stream releases them, and a settled or
+    /// unknown stream is a no-op.
+    pub fn ack_stream(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), DriverError> {
+        Ok(self.transport.ack_stream(conn_id, stream_id, bytes)?)
+    }
+
+    /// Events already produced but not yet handed out, oldest first, such
+    /// as ones a blocking wait left undelivered. A host that must act on
+    /// events it has not seen yet (a `StreamReady` still in flight, say) can
+    /// inspect them.
+    pub fn buffered_events(&self) -> impl Iterator<Item = &SwarmEvent> {
+        self.state.events.iter()
+    }
+
     /// Forgets swarm bookkeeping for a stream without touching the transport.
     ///
     /// This is used when ownership of a negotiated stream moves to another
@@ -795,6 +820,21 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
                     ));
                 }
             }
+            Action::AckStream {
+                conn_id,
+                stream_id,
+                bytes,
+            } => {
+                if let Err(e) = self.transport.ack_stream(conn_id, stream_id, bytes) {
+                    self.state.record_runtime_error(transport_error(
+                        Some(conn_id),
+                        Some(stream_id),
+                        format!(
+                            "ack_stream on connection {conn_id} stream {stream_id} failed: {e}"
+                        ),
+                    ));
+                }
+            }
             Action::CloseConnection { conn_id } => match self.transport.close(conn_id) {
                 Ok(()) | Err(TransportError::ConnectionNotFound { .. }) => {}
                 Err(e) => self.state.record_runtime_error(transport_error(
@@ -918,6 +958,15 @@ mod tests {
     }
 
     impl Transport for ScriptedTransport {
+        fn ack_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _bytes: usize,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
             self.next_conn_id += 1;
             Ok(ConnectionId::new(self.next_conn_id))

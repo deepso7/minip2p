@@ -197,6 +197,23 @@ fn two_nodes_upgrade_over_loopback_and_authenticate_each_other() {
     );
 }
 
+/// Polls `node`, acknowledging every byte delivered, as a reader that keeps
+/// up does.
+fn poll_and_ack(node: &mut Node, now: Now) -> Vec<TransportEvent> {
+    let events = node.poll(now).expect("poll");
+    for event in &events {
+        if let TransportEvent::StreamData {
+            id,
+            stream_id,
+            data,
+        } = event
+        {
+            node.ack_stream(*id, *stream_id, data.len()).expect("ack");
+        }
+    }
+    events
+}
+
 /// Writes `data`, returning the unsent tail if the stream was Full.
 fn send_or_hold(node: &mut Node, id: ConnectionId, stream: StreamId, data: Bytes) -> Option<Bytes> {
     let error = node.send_stream(id, stream, data).err()?;
@@ -230,7 +247,7 @@ fn a_payload_past_the_send_caps_arrives_intact_by_resending_on_writable() {
                 held = send_or_hold(&mut pair.dialer, id, stream, tail);
             }
         }
-        for event in pair.listener.poll(now).expect("poll listener") {
+        for event in poll_and_ack(&mut pair.listener, now) {
             if let TransportEvent::StreamData { data, .. } = event {
                 received.extend_from_slice(&data);
             }
@@ -244,6 +261,73 @@ fn a_payload_past_the_send_caps_arrives_intact_by_resending_on_writable() {
     }
     assert!(held.is_none(), "every byte was eventually accepted");
     assert_eq!(received, payload, "every byte, once, in order");
+}
+
+#[test]
+fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
+    let mut pair = upgraded_pair();
+    let id = pair.dialer_connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    let payload = Bytes::from(vec![7u8; 1024 * 1024]);
+    let mut held = send_or_hold(&mut pair.dialer, id, stream, payload.clone());
+
+    // The reader takes what arrives but acknowledges nothing: the sender may
+    // deliver one receive window, and no more.
+    let window = minip2p_tcp::TcpConfig::default().yamux.receive_window as usize;
+    let mut unacked = 0;
+    let mut listener_stream = None;
+    let start = Instant::now();
+    let mut quiet_since = Instant::now();
+    while quiet_since.elapsed() < Duration::from_millis(300) {
+        let now = Now::from_millis(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+        for event in pair.dialer.poll(now).expect("poll dialer") {
+            if matches!(event, TransportEvent::StreamWritable { stream_id, .. } if stream_id == stream)
+                && let Some(tail) = held.take()
+            {
+                held = send_or_hold(&mut pair.dialer, id, stream, tail);
+            }
+        }
+        for event in pair.listener.poll(now).expect("poll listener") {
+            if let TransportEvent::StreamData {
+                stream_id, data, ..
+            } = event
+            {
+                listener_stream = Some(stream_id);
+                unacked += data.len();
+                quiet_since = Instant::now();
+            }
+        }
+        assert!(start.elapsed() < PATIENCE, "the link never went quiet");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(unacked, window, "a stalled reader holds exactly its budget");
+    assert!(held.is_some(), "the sender is still holding its tail");
+
+    // Acknowledging resumes the transfer, and it then completes.
+    let listener_stream = listener_stream.expect("data arrived");
+    let listener_id = pair.listener_connection;
+    pair.listener
+        .ack_stream(listener_id, listener_stream, unacked)
+        .expect("ack what was delivered");
+    let mut received = unacked;
+    while received < payload.len() {
+        let now = Now::from_millis(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+        for event in pair.dialer.poll(now).expect("poll dialer") {
+            if matches!(event, TransportEvent::StreamWritable { stream_id, .. } if stream_id == stream)
+                && let Some(tail) = held.take()
+            {
+                held = send_or_hold(&mut pair.dialer, id, stream, tail);
+            }
+        }
+        for event in poll_and_ack(&mut pair.listener, now) {
+            if let TransportEvent::StreamData { data, .. } = event {
+                received += data.len();
+            }
+        }
+        assert!(start.elapsed() < PATIENCE, "stalled at {received} bytes");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(received, payload.len());
 }
 
 #[test]
@@ -588,7 +672,7 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
             WaitOutcome::TimedOut => {}
             outcome => break outcome,
         }
-        let _ = pair.listener.poll(Now::from_millis(0)).expect("peer reads");
+        let _ = poll_and_ack(&mut pair.listener, Now::from_millis(0));
         assert!(
             draining.elapsed() < PATIENCE,
             "the peer never drained enough to wake the writer"

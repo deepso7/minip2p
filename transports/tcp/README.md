@@ -38,6 +38,8 @@ Three details are easy to get wrong, and the transport depends on all three:
 
 ## Backpressure
 
+Reading is backpressured through Yamux (ADR 0012): a substream's window update is sent only for bytes acknowledged with `ack_stream`, flushed at once, so a reader that never acknowledges stalls its sender at one receive window. A closed substream with unacknowledged bytes keeps its slot until it settles, so stream churn cannot grow retained data past the stream limit times the window.
+
 The transport pulls encrypted bytes from a connection's session only while that connection's outbound buffer is below `TcpConfig::max_buffered_send` (a soft limit: one pull may overshoot it by one encrypted frame), so a slow reader is backpressure, not a fault: stream writes fill Yamux's send caps and then return `TransportError::Full` with the unsent tail, and `StreamWritable` follows once Yamux has room again (ADR 0012). Pulling frames into the outbound buffer is what frees Yamux's caps, so it can fire while ciphertext still waits in that buffer for the socket. While the socket is still accepting, `next_deadline` reports immediate so a driver keeps coming back. Once it refuses everything, that becomes the point at which the stall turns fatal instead — claiming urgency against a socket taking nothing would spin a deadline-driven host for as long as the peer stayed silent. `TcpConfig::max_buffered_send` bounds how much may queue and `TcpConfig::send_stall_timeout_ms` how long the socket may accept nothing at all, so a peer that stops reading for good loses its connection rather than pinning memory.
 
 ## Limits

@@ -58,6 +58,8 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
   liveConnId: bigint | undefined = undefined;
   /** Writes `sendStream` accepted, in call order. */
   readonly writes: { connId: bigint; streamId: bigint }[] = [];
+  /** `streamConsumed` calls, in call order. */
+  readonly consumed: { bytes: number; connId: bigint; streamId: bigint }[] = [];
   readonly #batches: FakeEvent[][] = [];
   #doorbell: P2pEventDoorbell | undefined;
 
@@ -191,6 +193,10 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
 
   resetStream(): never {
     return notFaked("resetStream");
+  }
+
+  streamConsumed(connId: bigint, streamId: bigint, bytes: bigint): void {
+    this.consumed.push({ bytes: Number(bytes), connId, streamId });
   }
 
   sendStream(

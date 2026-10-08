@@ -9,6 +9,8 @@
 //! accepts what fits the send caps and hands back the unsent tail as
 //! [`YamuxError::Full`], frames are built only when the host pulls them, and
 //! [`YamuxOutput::Writable`] says when a full stream can queue again.
+//! Reads are credit-driven: a stream returns window credit only for bytes its
+//! reader acknowledged with [`YamuxSession::ack`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
@@ -68,14 +70,16 @@ pub enum YamuxRole {
 /// Resource limits and flow-control settings for one Yamux session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct YamuxConfig {
-    /// Receive window maintained for every stream.
+    /// Receive window maintained for every stream, and its receive budget:
+    /// the most delivered bytes it holds unacknowledged (ADR 0012).
     ///
     /// Values below [`DEFAULT_RECEIVE_WINDOW`] are rejected because the peer
     /// is entitled to the specification-defined initial credit.
     pub receive_window: u32,
     /// Largest accepted inbound data-frame payload.
     pub max_frame_len: u32,
-    /// Maximum number of simultaneously tracked inbound and outbound streams.
+    /// Maximum number of simultaneously tracked inbound and outbound streams,
+    /// counting closed streams that are still unsettled.
     pub max_streams: usize,
     /// Per-stream cap for bytes [`YamuxSession::send`] accepted that have not
     /// been pulled as frames yet, whether or not remote credit allows them.
@@ -214,6 +218,19 @@ pub enum YamuxError {
     WindowOverflow {
         /// Offending stream identifier.
         stream: u32,
+    },
+    /// An acknowledgement named more bytes than the stream delivered and has
+    /// not yet had acknowledged. Nothing was acknowledged.
+    #[error(
+        "cannot acknowledge {acked} bytes on Yamux stream {stream}: only {unacked} are unacknowledged"
+    )]
+    AckExceedsDelivered {
+        /// Stream being acknowledged.
+        stream: u32,
+        /// Bytes the call tried to acknowledge.
+        acked: usize,
+        /// Bytes delivered and not yet acknowledged.
+        unacked: usize,
     },
     /// The configured stream capacity is already in use.
     #[error("maximum Yamux stream count reached")]

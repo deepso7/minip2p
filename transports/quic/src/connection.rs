@@ -17,8 +17,8 @@ use minip2p_transport::{
 
 use sha2::{Digest, Sha256};
 
-use crate::PendingDatagram;
 use crate::diagnostics::ConnectionCounters;
+use crate::{PendingDatagram, STREAM_RECEIVE_WINDOW};
 
 const SEND_BUF_SIZE: usize = 1350;
 
@@ -97,9 +97,19 @@ struct StreamRuntimeState {
     closed_notified: bool,
     /// Whether a StreamWriteStopped event was emitted.
     write_stopped: bool,
+    /// Delivered bytes the reader has not acknowledged (ADR 0012). Reading
+    /// stops once they reach [`STREAM_RECEIVE_WINDOW`], and the state outlives
+    /// the stream's close until they are acknowledged: the stream holds its
+    /// slot until it settles.
+    unacked: usize,
 }
 
 impl StreamRuntimeState {
+    /// Bytes the stream may still deliver before its reader acknowledges.
+    fn receive_room(&self) -> usize {
+        STREAM_RECEIVE_WINDOW.saturating_sub(self.unacked)
+    }
+
     /// Returns true if both sides have closed their write side.
     fn is_fully_closed(&self) -> bool {
         self.local_write_closed && self.remote_write_closed
@@ -124,7 +134,9 @@ pub struct QuicConnection {
     next_local_bidi_stream_id: u64,
     /// Number of active locally initiated bidirectional streams.
     active_local_bidi_streams: u64,
-    /// Maximum local bidirectional streams allowed by configuration.
+    /// Maximum bidirectional streams per direction allowed by
+    /// configuration: it caps local opens, and the peer's open and
+    /// unsettled streams.
     max_local_bidi_streams: u64,
     /// Total application bytes queued but not yet accepted by quiche.
     pending_write_bytes: usize,
@@ -739,6 +751,45 @@ impl QuicConnection {
         Ok(())
     }
 
+    /// Acknowledges `bytes` of the stream's delivered data (ADR 0012).
+    ///
+    /// quiche returned their credit when they were read, so what this
+    /// releases is the read gate: a stream that had spent its budget is
+    /// marked for a rescan, which the transport runs at once. A settled or
+    /// unknown stream has nothing to acknowledge.
+    pub fn ack_stream(&mut self, stream_id: StreamId, bytes: usize) -> Result<(), TransportError> {
+        let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) else {
+            return Ok(());
+        };
+        if bytes > state.unacked {
+            return Err(TransportError::AckExceedsDelivered {
+                id: self.id,
+                stream_id,
+                acked: bytes,
+                unacked: state.unacked,
+            });
+        }
+        let gated = state.receive_room() == 0;
+        state.unacked -= bytes;
+        let settled = state.closed_notified && state.unacked == 0;
+        if gated && bytes != 0 {
+            self.streams_dirty = true;
+        }
+        // The last byte of a closed stream frees its slot now.
+        if settled {
+            self.gc_closed_streams();
+        }
+        Ok(())
+    }
+
+    /// Whether an acknowledgement has left readable stream input waiting for
+    /// a scan.
+    pub(crate) fn has_unscanned_input(&self) -> bool {
+        self.streams_dirty
+    }
+
+    /// Resets a stream, abandoning its unacknowledged bytes: it settles at
+    /// once.
     pub fn reset_stream(
         &mut self,
         stream_id: StreamId,
@@ -777,6 +828,7 @@ impl QuicConnection {
         let state = self.stream_state_mut(stream_id)?;
         state.local_write_closed = true;
         state.remote_write_closed = true;
+        state.unacked = 0;
 
         if !state.closed_notified {
             state.closed_notified = true;
@@ -844,8 +896,14 @@ impl QuicConnection {
         Ok(())
     }
 
-    /// Reports peer STOP_SENDINGs, then reads every readable stream to
-    /// exhaustion. Only runs while `streams_dirty` is set.
+    /// Reports peer STOP_SENDINGs, then reads every readable stream until it
+    /// is exhausted or has delivered its receive budget. Only runs while
+    /// `streams_dirty` is set.
+    ///
+    /// The budget is the read gate: quiche returns credit inside
+    /// `stream_recv`, so a stream whose reader has not acknowledged a whole
+    /// window is not read again until it does ([`Self::ack_stream`]). quiche
+    /// then buffers at most one more window, since the windows are pinned.
     fn scan_stream_input(
         &mut self,
         events: &mut Vec<TransportEvent>,
@@ -862,23 +920,42 @@ impl QuicConnection {
                 self.conn.stream_capacity(raw_stream_id)
             {
                 let stream_id = StreamId::new(raw_stream_id);
-                self.ensure_stream_discovered(stream_id, events);
-                self.note_write_stopped(stream_id, error_code, events);
+                if self.ensure_stream_discovered(stream_id, events) {
+                    self.note_write_stopped(stream_id, error_code, events);
+                }
             }
         }
 
         for raw_stream_id in self.conn.readable() {
             let stream_id = StreamId::new(raw_stream_id);
-            self.ensure_stream_discovered(stream_id, events);
+            if !self.ensure_stream_discovered(stream_id, events) {
+                continue;
+            }
 
             loop {
-                match self.conn.stream_recv(raw_stream_id, stream_read_buffer) {
+                let room = self
+                    .stream_states
+                    .get(&raw_stream_id)
+                    .map_or(0, StreamRuntimeState::receive_room);
+                // With the budget spent, the read is zero-length: the data
+                // waits in quiche for an ack, but a FIN or reset right after
+                // the window still surfaces, as it would on Yamux.
+                let Some(buffer) = stream_read_buffer.get_mut(..room.min(stream_read_buffer.len()))
+                else {
+                    break;
+                };
+                match self.conn.stream_recv(raw_stream_id, buffer) {
+                    // Gated, with data still waiting behind the budget.
+                    Ok((0, false)) => break,
                     Ok((read, fin)) => {
+                        if let Some(state) = self.stream_states.get_mut(&raw_stream_id) {
+                            state.unacked += read;
+                        }
                         if read > 0 {
                             events.push(TransportEvent::StreamData {
                                 id: self.id,
                                 stream_id,
-                                data: stream_read_buffer
+                                data: buffer
                                     .get(..read)
                                     .expect("quiche stream reads fit the supplied buffer")
                                     .to_vec()
@@ -1180,10 +1257,36 @@ impl QuicConnection {
         self.state = ConnectionState::Closing;
     }
 
-    /// Emits IncomingStream for remote-initiated streams not yet notified.
-    fn ensure_stream_discovered(&mut self, stream_id: StreamId, events: &mut Vec<TransportEvent>) {
-        let is_remote = self.is_remote_initiated_stream(stream_id.as_u64());
-        let state = self.stream_states.entry(stream_id.as_u64()).or_default();
+    /// Emits IncomingStream for remote-initiated streams not yet notified,
+    /// and returns whether the stream is one this side tracks.
+    ///
+    /// A new remote stream is refused (both halves shut down, no event) while
+    /// open and unsettled remote streams fill the stream limit: quiche frees
+    /// a closed stream's slot once it has read it, but its delivered bytes
+    /// are still the reader's until acknowledged (ADR 0012).
+    fn ensure_stream_discovered(
+        &mut self,
+        stream_id: StreamId,
+        events: &mut Vec<TransportEvent>,
+    ) -> bool {
+        let raw_stream_id = stream_id.as_u64();
+        let is_remote = self.is_remote_initiated_stream(raw_stream_id);
+        if is_remote && !self.stream_states.contains_key(&raw_stream_id) {
+            let held = self
+                .stream_states
+                .keys()
+                .filter(|id| self.is_remote_initiated_stream(**id))
+                .count() as u64;
+            if held >= self.max_local_bidi_streams {
+                for direction in [quiche::Shutdown::Read, quiche::Shutdown::Write] {
+                    match self.conn.stream_shutdown(raw_stream_id, direction, 0x00) {
+                        Ok(()) | Err(_) => {}
+                    }
+                }
+                return false;
+            }
+        }
+        let state = self.stream_states.entry(raw_stream_id).or_default();
 
         if is_remote && !state.incoming_notified {
             state.incoming_notified = true;
@@ -1192,6 +1295,7 @@ impl QuicConnection {
                 stream_id,
             });
         }
+        true
     }
 
     /// Emits StreamClosed if both sides are closed and not yet notified.
@@ -1233,13 +1337,17 @@ impl QuicConnection {
         }
     }
 
-    /// Removes stream state entries that are fully closed and drained.
+    /// Removes stream state entries that are fully closed, drained, and
+    /// settled.
     fn gc_closed_streams(&mut self) {
         let to_remove: Vec<u64> = self
             .stream_states
             .iter()
             .filter_map(|(stream_id, state)| {
-                if state.closed_notified && !self.send_queues.contains_key(stream_id) {
+                if state.closed_notified
+                    && state.unacked == 0
+                    && !self.send_queues.contains_key(stream_id)
+                {
                     Some(*stream_id)
                 } else {
                     None

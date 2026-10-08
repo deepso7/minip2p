@@ -275,6 +275,20 @@ class ReactNativeBackend implements Minip2pBackend {
     });
   }
 
+  streamConsumer(connId: number, streamId: number): (bytes: number) => void {
+    const nativeConn = this.#connectionIds.toNative(connId);
+    const nativeStream = numberToU64(streamId, "streamId");
+    return (bytes) => {
+      translateErrors(() => {
+        this.#endpoint.streamConsumed(
+          nativeConn,
+          nativeStream,
+          numberToU64(bytes, "bytes")
+        );
+      });
+    };
+  }
+
   connect(target: BackendConnectTarget): number {
     const native =
       target.kind === "peer"

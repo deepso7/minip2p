@@ -22,6 +22,11 @@ use minip2p_transport::{
 ///
 /// A pair transfers stream events directly into its partner's poll queue. It
 /// is intentionally single-threaded and is meant for protocol wrapper tests.
+///
+/// Sends never block, but each side counts the bytes it delivered and has not
+/// had acknowledged, so tests can check that every consumer acknowledges what
+/// it took ([`InMemoryTransport::unacked`]); an over-ack fails as the
+/// transport contract requires.
 pub struct InMemoryTransport {
     shared: Rc<RefCell<InMemoryLink>>,
     side: LinkSide,
@@ -35,6 +40,8 @@ struct InMemoryLink {
     next_stream: [u64; 2],
     active: bool,
     streams: HashMap<StreamId, InMemoryStream>,
+    /// Delivered, unacknowledged bytes per stream, for each receiving side.
+    unacked: [HashMap<StreamId, usize>; 2],
 }
 
 /// One endpoint of the fixed two-party in-memory link.
@@ -132,6 +139,7 @@ impl InMemoryTransport {
             next_stream: [1, 2],
             active: true,
             streams: HashMap::new(),
+            unacked: [HashMap::new(), HashMap::new()],
         }));
         (
             Self {
@@ -154,6 +162,14 @@ impl InMemoryTransport {
     /// Returns the sole local connection identifier.
     pub fn connection_id(&self) -> ConnectionId {
         self.connection
+    }
+
+    /// Bytes this side was delivered on `stream_id` and has not acknowledged.
+    pub fn unacked(&self, stream_id: StreamId) -> usize {
+        side_value(&self.shared.borrow().unacked, self.side)
+            .get(&stream_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Queues a synthetic local event for deterministic wrapper edge cases.
@@ -241,6 +257,9 @@ impl Transport for InMemoryTransport {
         if data.is_empty() {
             return Ok(());
         }
+        *side_value_mut(&mut shared.unacked, self.side.other())
+            .entry(stream_id)
+            .or_default() += data.len();
         shared
             .queue_mut(self.side.other())
             .push_back(TransportEvent::StreamData {
@@ -304,6 +323,8 @@ impl Transport for InMemoryTransport {
         self.ensure_connection(id)?;
         let other = self.side.other();
         let mut shared = self.shared.borrow_mut();
+        // A reset abandons whatever this side has not acknowledged.
+        side_value_mut(&mut shared.unacked, self.side).remove(&stream_id);
         let Some(stream) = shared.streams.get_mut(&stream_id) else {
             return Err(self.stream_not_found(stream_id));
         };
@@ -323,12 +344,42 @@ impl Transport for InMemoryTransport {
         Ok(())
     }
 
+    fn ack_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), TransportError> {
+        if id != self.connection {
+            return Ok(());
+        }
+        let mut shared = self.shared.borrow_mut();
+        let unacked = side_value_mut(&mut shared.unacked, self.side);
+        let Some(held) = unacked.get_mut(&stream_id) else {
+            return Ok(());
+        };
+        if bytes > *held {
+            return Err(TransportError::AckExceedsDelivered {
+                id,
+                stream_id,
+                acked: bytes,
+                unacked: *held,
+            });
+        }
+        *held -= bytes;
+        if *held == 0 {
+            unacked.remove(&stream_id);
+        }
+        Ok(())
+    }
+
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
         self.ensure_connection(id)?;
         let other = self.side.other();
         let mut shared = self.shared.borrow_mut();
         shared.active = false;
         shared.streams.clear();
+        shared.unacked = [HashMap::new(), HashMap::new()];
         shared
             .queue_mut(self.side)
             .push_back(TransportEvent::Closed { id });

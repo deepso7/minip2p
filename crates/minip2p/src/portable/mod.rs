@@ -34,6 +34,8 @@ use connect::{ConnectAdmission, Expansion, admit_connect};
 pub(crate) use connect::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS};
 mod event_stream;
 pub use event_stream::EndpointEvent;
+mod stream_acks;
+pub(crate) use stream_acks::StreamAcks;
 
 #[cfg(feature = "portable-mdns")]
 pub use minip2p_discovery::{
@@ -108,6 +110,7 @@ impl Endpoint {
 pub struct PortableEndpoint<T: Transport, E: EntropySource> {
     core: SwarmCore<T, E>,
     connect: connect::ConnectEngine,
+    acks: StreamAcks,
 }
 
 /// Lightweight snapshot of portable endpoint state.
@@ -356,8 +359,25 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
+        self.acks.forget(conn_id, stream_id);
         self.core
             .abandon_stream(peer_id, conn_id, stream_id, now.monotonic_ms)
+    }
+
+    /// Acknowledges the stream data in events the application is about to
+    /// pull (ADR 0012): pulling an event consumes its bytes, which returns
+    /// their receive credit to the sender.
+    ///
+    /// An acknowledgement only fails for a stream the application already
+    /// acknowledged by hand, which leaves nothing for this one to release.
+    pub(crate) fn ack_pulled(&mut self, events: &[EndpointEvent]) {
+        for event in events {
+            if let Some((conn_id, stream_id, bytes)) = self.acks.pulled(event) {
+                match self.core.ack_stream(conn_id, stream_id, bytes) {
+                    Ok(()) | Err(_) => {}
+                }
+            }
+        }
     }
 
     /// Returns a lightweight aggregate of durable state without driving the endpoint.
@@ -380,6 +400,9 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// Advances transport and protocol state using one host-supplied time sample.
     ///
     /// Returned values are [`EndpointEvent`]s from the Endpoint event stream.
+    /// Returning an [`EndpointEvent::StreamData`] acknowledges its bytes
+    /// (ADR 0012): a sender's receive budget is replenished as the
+    /// application pulls its data, so polling less often slows the sender.
     pub fn poll(&mut self, now: Now) -> Result<alloc::vec::Vec<EndpointEvent>, DriverError> {
         self.tick_connect(now);
         let mut events = alloc::vec::Vec::new();
@@ -393,6 +416,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
             }
             Self::drain_connect_events(&mut self.connect, &mut events);
         }
+        self.ack_pulled(&events);
         Ok(events)
     }
 
@@ -585,6 +609,7 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         // now so `claim_settled` clears `inflight` in the same poll.
         self.emit_connect_events(now, &mut events);
         self.discovery.drain_events(&mut events);
+        self.endpoint.ack_pulled(&events);
         Ok(events)
     }
 
@@ -715,6 +740,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
         Ok(PortableEndpoint {
             core: self.swarm.build_core(transport, self.entropy)?,
             connect: connect::ConnectEngine::new(self.connect_deadline_ms),
+            acks: StreamAcks::default(),
         })
     }
 
@@ -1086,6 +1112,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             discovery.drain_events(&mut output);
         }
         output.extend(settled);
+        self.endpoint.ack_pulled(&output);
         Ok(output)
     }
 
@@ -1407,6 +1434,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         let mut endpoint = PortableEndpoint {
             core: self.swarm.build_core(transport, self.entropy.clone())?,
             connect: connect::ConnectEngine::new(self.connect_deadline_ms),
+            acks: StreamAcks::default(),
         };
         #[cfg(feature = "portable-autonat")]
         if self
@@ -1559,6 +1587,15 @@ mod tests {
     struct NoopTransport;
 
     impl Transport for NoopTransport {
+        fn ack_stream(
+            &mut self,
+            _: minip2p_transport::ConnectionId,
+            _: minip2p_transport::StreamId,
+            _: usize,
+        ) -> Result<(), minip2p_transport::TransportError> {
+            Ok(())
+        }
+
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
             Err(TransportError::Unsupported { operation: "dial" })
         }
@@ -1630,6 +1667,15 @@ mod tests {
     }
 
     impl Transport for RecordingTransport {
+        fn ack_stream(
+            &mut self,
+            _: minip2p_transport::ConnectionId,
+            _: minip2p_transport::StreamId,
+            _: usize,
+        ) -> Result<(), minip2p_transport::TransportError> {
+            Ok(())
+        }
+
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
             Err(TransportError::Unsupported { operation: "dial" })
         }

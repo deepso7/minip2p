@@ -148,6 +148,18 @@ pub(crate) enum Action {
     },
     /// Gracefully close a connection.
     CloseConnection { conn_id: ConnectionId },
+    /// Acknowledge `bytes` of a stream's delivered data as consumed
+    /// (`Transport::ack_stream`).
+    ///
+    /// The state acknowledges what it consumes itself: negotiation, ping, and
+    /// Identify bytes, and data for streams it no longer routes. Bytes it
+    /// hands to the application in [`SwarmEvent::StreamData`] are the
+    /// application's to acknowledge.
+    AckStream {
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    },
 }
 
 fn stream_action_matches(action: &Action, conn_id: ConnectionId, stream_id: StreamId) -> bool {
@@ -190,6 +202,10 @@ fn connection_action_matches(action: &Action, conn_id: ConnectionId) -> bool {
         }
         | Action::CloseConnection {
             conn_id: action_conn,
+        }
+        | Action::AckStream {
+            conn_id: action_conn,
+            ..
         } => *action_conn == conn_id,
     }
 }
@@ -1891,6 +1907,9 @@ impl SwarmState {
         }
     }
 
+    /// Routes received bytes, and acknowledges every byte the core consumed
+    /// rather than handed to the application (ADR 0012): negotiation,
+    /// ping, Identify, and data for streams it no longer routes.
     fn handle_stream_data(
         &mut self,
         conn_id: ConnectionId,
@@ -1899,29 +1918,36 @@ impl SwarmState {
         now_ms: u64,
     ) {
         let key = (conn_id, stream_id);
+        let len = data.len();
 
-        if self.inbound_negotiators.contains_key(&key) {
-            self.feed_inbound_negotiator(conn_id, stream_id, &data, now_ms);
-            return;
+        let handed_out = if self.inbound_negotiators.contains_key(&key) {
+            self.feed_inbound_negotiator(conn_id, stream_id, &data, now_ms)
+        } else if self.outbound_negotiators.contains_key(&key) {
+            self.feed_outbound_negotiator(conn_id, stream_id, &data, now_ms)
+        } else {
+            self.dispatch_protocol_data(conn_id, stream_id, data, now_ms)
+        };
+
+        if len > handed_out {
+            self.actions.push_back(Action::AckStream {
+                conn_id,
+                stream_id,
+                bytes: len - handed_out,
+            });
         }
-
-        if self.outbound_negotiators.contains_key(&key) {
-            self.feed_outbound_negotiator(conn_id, stream_id, &data, now_ms);
-            return;
-        }
-
-        self.dispatch_protocol_data(conn_id, stream_id, data, now_ms);
     }
 
+    /// Delivers negotiated-stream bytes to their protocol. Returns how many
+    /// went to the application, which acknowledges them itself.
     fn dispatch_protocol_data(
         &mut self,
         conn_id: ConnectionId,
         stream_id: StreamId,
         data: Bytes,
         now_ms: u64,
-    ) {
+    ) -> usize {
         let Some(protocol) = self.stream_protocol(conn_id, stream_id).cloned() else {
-            return;
+            return 0;
         };
         let peer_id = self.ensure_peer_id_for_conn(conn_id);
 
@@ -1947,14 +1973,17 @@ impl SwarmState {
                 // Responder doesn't expect data; ignore.
             }
             ProtocolKind::User(_) => {
+                let len = data.len();
                 self.events.push_back(SwarmEvent::StreamData {
                     peer_id,
                     conn_id,
                     stream_id,
                     data,
                 });
+                return len;
             }
         }
+        0
     }
 
     fn handle_stream_remote_write_closed(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
@@ -2112,17 +2141,19 @@ impl SwarmState {
     // Internal: multistream-select negotiation
     // -----------------------------------------------------------------------
 
+    /// Feeds an inbound negotiation. Returns how many bytes past it went to
+    /// the application.
     fn feed_inbound_negotiator(
         &mut self,
         conn_id: ConnectionId,
         stream_id: StreamId,
         data: &[u8],
         now_ms: u64,
-    ) {
+    ) -> usize {
         let key = (conn_id, stream_id);
         let negotiator = match self.inbound_negotiators.get_mut(&key) {
             Some(n) => n,
-            None => return,
+            None => return 0,
         };
 
         let mut negotiated_protocol = None;
@@ -2137,7 +2168,7 @@ impl SwarmState {
             self.inbound_negotiators.remove(&key);
             self.actions
                 .push_back(Action::ResetStream { conn_id, stream_id });
-            return;
+            return 0;
         }
 
         while let Some(output) = self
@@ -2150,7 +2181,7 @@ impl SwarmState {
                 self.inbound_negotiators.remove(&key);
                 self.actions
                     .push_back(Action::ResetStream { conn_id, stream_id });
-                return;
+                return 0;
             }
         }
 
@@ -2165,22 +2196,30 @@ impl SwarmState {
             self.on_inbound_negotiated(conn_id, stream_id, &protocol);
 
             if !remaining.is_empty() {
-                self.dispatch_protocol_data(conn_id, stream_id, Bytes::from(remaining), now_ms);
+                return self.dispatch_protocol_data(
+                    conn_id,
+                    stream_id,
+                    Bytes::from(remaining),
+                    now_ms,
+                );
             }
         }
+        0
     }
 
+    /// Feeds an outbound negotiation. Returns how many bytes past it went to
+    /// the application.
     fn feed_outbound_negotiator(
         &mut self,
         conn_id: ConnectionId,
         stream_id: StreamId,
         data: &[u8],
         now_ms: u64,
-    ) {
+    ) -> usize {
         let key = (conn_id, stream_id);
         let pending = match self.outbound_negotiators.get_mut(&key) {
             Some(p) => p,
-            None => return,
+            None => return 0,
         };
 
         if let Err(error) = pending
@@ -2197,7 +2236,7 @@ impl SwarmState {
             self.outbound_negotiators.remove(&key);
             self.actions
                 .push_back(Action::ResetStream { conn_id, stream_id });
-            return;
+            return 0;
         }
         let target = pending.target.clone();
         let mut negotiated = false;
@@ -2220,14 +2259,14 @@ impl SwarmState {
                     self.outbound_negotiators.remove(&key);
                     self.actions
                         .push_back(Action::ResetStream { conn_id, stream_id });
-                    return;
+                    return 0;
                 }
                 other => {
                     if self.handle_multistream_output(conn_id, stream_id, other, &mut None) {
                         self.outbound_negotiators.remove(&key);
                         self.actions
                             .push_back(Action::ResetStream { conn_id, stream_id });
-                        return;
+                        return 0;
                     }
                 }
             }
@@ -2244,9 +2283,15 @@ impl SwarmState {
             self.on_outbound_negotiated(conn_id, stream_id, target, now_ms);
 
             if !remaining.is_empty() {
-                self.dispatch_protocol_data(conn_id, stream_id, Bytes::from(remaining), now_ms);
+                return self.dispatch_protocol_data(
+                    conn_id,
+                    stream_id,
+                    Bytes::from(remaining),
+                    now_ms,
+                );
             }
         }
+        0
     }
 
     fn handle_multistream_output(
@@ -3064,6 +3109,64 @@ mod tests {
     }
 
     #[test]
+    fn the_core_acks_what_it_consumes_and_leaves_application_bytes_unacked() {
+        const PROTOCOL: &str = "/test/1";
+        let mut core = test_core();
+        core.add_protocol(PROTOCOL).expect("register protocol");
+        let peer_id = PeerId::from_public_key_protobuf(b"ack-peer");
+        let conn_id = ConnectionId::new(7);
+        let stream_id = StreamId::new(3);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id, conn_id);
+        feed(
+            &mut core,
+            TransportEvent::IncomingStream {
+                id: conn_id,
+                stream_id,
+            },
+        );
+        drain_actions(&mut core);
+
+        // Negotiation and the first application bytes arrive in one chunk.
+        let mut chunk = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        chunk.extend_from_slice(&multistream_frame(PROTOCOL));
+        let negotiation = chunk.len();
+        chunk.extend_from_slice(b"app bytes");
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: Bytes::from(chunk),
+            },
+        );
+        let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            Output::Action(Action::AckStream { bytes, .. }) if *bytes == negotiation
+        )));
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            Output::Event(SwarmEvent::StreamData { data, .. }) if &data[..] == b"app bytes"
+        )));
+
+        // Later application bytes are the application's to acknowledge.
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: Bytes::from_static(b"more"),
+            },
+        );
+        assert!(
+            !drain_actions(&mut core)
+                .iter()
+                .any(|action| matches!(action, Action::AckStream { .. }))
+        );
+    }
+
+    #[test]
     fn inbound_multistream_accepts_fallback_after_na_on_same_stream() {
         const MESHSUB_V1_2: &str = "/meshsub/1.2.0";
         const MESHSUB_V1_1: &str = "/meshsub/1.1.0";
@@ -3088,6 +3191,7 @@ mod tests {
 
         let mut first_offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
         first_offer.extend_from_slice(&multistream_frame(MESHSUB_V1_2));
+        let first_offer_len = first_offer.len();
         feed(
             &mut core,
             TransportEvent::StreamData {
@@ -3108,6 +3212,15 @@ mod tests {
                 && action_stream == stream_id
                 && data == multistream_frame("na")
         ));
+        assert_eq!(
+            core.actions.pop_front(),
+            Some(Action::AckStream {
+                conn_id,
+                stream_id,
+                bytes: first_offer_len,
+            }),
+            "the core consumed the offer"
+        );
         assert!(core.actions.is_empty(), "unsupported offer must not reset");
 
         feed(
@@ -3133,6 +3246,10 @@ mod tests {
             }) if action_conn == conn_id
                 && action_stream == stream_id
                 && data == multistream_frame(MESHSUB_V1_1)
+        ));
+        assert!(matches!(
+            core.actions.pop_front(),
+            Some(Action::AckStream { .. })
         ));
         assert!(core.actions.is_empty());
         assert!(matches!(
@@ -3186,6 +3303,7 @@ mod tests {
         // The protocol echo queues behind the held tail instead of going out.
         let mut offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
         offer.extend_from_slice(&multistream_frame(PROTOCOL));
+        let offer_len = offer.len();
         feed(
             &mut core,
             TransportEvent::StreamData {
@@ -3194,7 +3312,15 @@ mod tests {
                 data: Bytes::from(offer),
             },
         );
-        assert!(drain_actions(&mut core).is_empty());
+        assert_eq!(
+            drain_actions(&mut core),
+            [Action::AckStream {
+                conn_id,
+                stream_id,
+                bytes: offer_len,
+            }],
+            "only the offer's ack goes out"
+        );
 
         // The application cannot overtake it either, and its close waits.
         let payload = Bytes::from_static(b"app");

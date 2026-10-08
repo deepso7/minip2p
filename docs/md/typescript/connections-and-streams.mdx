@@ -289,6 +289,14 @@ Pull reads and flowing `data` handlers are mutually exclusive. Calling `read()` 
 | `abandon()` | Reset, relinquish the handle, and suppress later events. |
 | `stream[Symbol.dispose]()` | Equivalent to `abandon()`. |
 
-`remoteWriteClosed` means no more inbound bytes will arrive. `closed` is the terminal lifecycle event. Pull reads use a bounded buffer; if the application does not keep up, `dataOverflow` reports dropped chunks and bytes. Treat that as a protocol-level recovery condition rather than silently continuing a framed transfer.
+`remoteWriteClosed` means no more inbound bytes will arrive. `closed` is the terminal lifecycle event.
+
+## Reading applies backpressure
+
+Received bytes are never dropped. A chunk counts as consumed when `read()` returns it, or when every `data` handler has returned from it, and each stream delivers at most one receive window of bytes that have not been consumed. A reader that stops reading therefore stalls its sender instead of buffering without bound, and the sender resumes as the reader catches up.
+
+An `async` `data` handler is consumed when it returns its Promise, not when that Promise settles. To hold the sender back while asynchronous work on a chunk runs, use `read()` (or `for await`) and await the work before reading the next chunk.
+
+An unread stream keeps its stream slot after it closes, until its bytes are read or the stream is reset or abandoned, so a peer cannot grow buffered data by opening and closing streams.
 
 Next: [Networking and events](/typescript/networking-and-events).

@@ -54,8 +54,14 @@ struct StreamState {
     pending_open: Option<OpenFlag>,
     acknowledged: bool,
     send_window: u32,
+    /// Credit the peer still has: the window less what it has sent us and
+    /// we have not returned.
     receive_window: u32,
-    delivered_since_update: u32,
+    /// Delivered bytes the reader has not acknowledged (ADR 0012). They
+    /// count against the stream's receive budget.
+    unacked: u32,
+    /// Acknowledged bytes not yet returned to the peer as credit.
+    acked_since_update: u32,
     pending_credit: u64,
     /// Accepted, unframed bytes. They count against the send caps until a
     /// frame carrying them is pulled by [`YamuxSession::poll_frame`].
@@ -89,7 +95,8 @@ impl StreamState {
             acknowledged: false,
             send_window,
             receive_window: DEFAULT_RECEIVE_WINDOW,
-            delivered_since_update: 0,
+            unacked: 0,
+            acked_since_update: 0,
             pending_credit: u64::from(config.receive_window - DEFAULT_RECEIVE_WINDOW),
             send_buffer: VecDeque::new(),
             buffered_send: 0,
@@ -154,11 +161,23 @@ impl StreamState {
 /// [`YamuxConfig::max_pending_control`]: a peer that keeps provoking replies
 /// it never reads fails the session with
 /// [`YamuxError::ControlReserveExhausted`].
+///
+/// Reading is credit-driven: a stream's window update goes out only for
+/// bytes the reader acknowledged with [`ack`](Self::ack), so a stream holds
+/// at most [`YamuxConfig::receive_window`] unacknowledged bytes and a reader
+/// that never acknowledges stalls its sender. A stream that closes with
+/// unacknowledged bytes stays **unsettled**: it keeps its slot against
+/// [`YamuxConfig::max_streams`] until they are acknowledged, or abandoned by
+/// a local [`reset`](Self::reset), so stream churn cannot grow retained data
+/// past the stream limit times the window. Input never has to stop.
 pub struct YamuxSession {
     role: YamuxRole,
     config: YamuxConfig,
     decoder: FrameDecoder,
     streams: BTreeMap<u32, StreamState>,
+    /// Closed streams still holding unacknowledged bytes, by stream id. Each
+    /// keeps a stream slot until those bytes are acknowledged.
+    unsettled: BTreeMap<u32, u32>,
     next_stream_id: Option<u32>,
     /// Stream events for [`poll_event`](Self::poll_event).
     events: VecDeque<YamuxOutput>,
@@ -223,6 +242,7 @@ impl YamuxSession {
             decoder: FrameDecoder::new(config.max_frame_len),
             config,
             streams: BTreeMap::new(),
+            unsettled: BTreeMap::new(),
             next_stream_id,
             events: VecDeque::new(),
             control: VecDeque::new(),
@@ -285,7 +305,7 @@ impl YamuxSession {
     /// standalone window-update frame carrying `SYN`.
     pub fn open_stream(&mut self) -> Result<u32, YamuxError> {
         self.ensure_active()?;
-        if self.streams.len() >= self.config.max_streams {
+        if self.slots_full() {
             return Err(YamuxError::TooManyStreams);
         }
         let stream = self.next_stream_id.ok_or(YamuxError::StreamsExhausted)?;
@@ -359,18 +379,26 @@ impl YamuxSession {
 
     /// Immediately resets a stream and emits [`YamuxOutput::StreamClosed`].
     ///
+    /// The reset abandons the stream's unacknowledged bytes, so it settles
+    /// at once. Resetting a stream that is closed but unsettled only settles
+    /// it.
+    ///
     /// Resetting a stream the peer opened spends the control reserve: a peer
     /// can open (and provoke the reset of) streams without bound, so a peer
     /// that never reads the resets fails the session with
     /// [`YamuxError::ControlReserveExhausted`].
     pub fn reset(&mut self, stream: u32) -> Result<(), YamuxError> {
         self.ensure_active()?;
+        if self.unsettled.remove(&stream).is_some() {
+            return Ok(());
+        }
         let unannounced = match self.streams.get(&stream) {
             Some(state) => state.pending_open == Some(OpenFlag::Syn),
             None => return Err(YamuxError::UnknownStream(stream)),
         };
         let peer_opened = self.valid_remote_stream_id(stream);
         self.remove_stream(stream, true);
+        self.unsettled.remove(&stream);
         // A stream whose SYN never went out is unknown to the peer.
         if unannounced {
             return Ok(());
@@ -382,6 +410,47 @@ impl YamuxSession {
         }
         self.queue_peer_control(rst)
             .or_else(|error| self.fail_protocol(error))
+    }
+
+    /// Acknowledges `bytes` of the stream's delivered data as consumed.
+    ///
+    /// Acknowledged bytes return to the peer as credit once more than half
+    /// the window has been acknowledged since the last update; the window
+    /// update is then pulled by [`poll_frame`](Self::poll_frame). On a closed,
+    /// unsettled stream the bytes are released, and its slot with the last
+    /// of them. Acknowledging a settled or unknown stream does nothing.
+    ///
+    /// Fails with [`YamuxError::AckExceedsDelivered`], acknowledging nothing,
+    /// when `bytes` exceeds the stream's unacknowledged bytes.
+    pub fn ack(&mut self, stream: u32, bytes: usize) -> Result<(), YamuxError> {
+        let unacked = match (self.streams.get(&stream), self.unsettled.get(&stream)) {
+            (Some(state), _) => state.unacked,
+            (None, Some(unacked)) => *unacked,
+            (None, None) => return Ok(()),
+        };
+        let acked = u32::try_from(bytes)
+            .ok()
+            .filter(|acked| *acked <= unacked)
+            .ok_or(YamuxError::AckExceedsDelivered {
+                stream,
+                acked: bytes,
+                unacked: unacked as usize,
+            })?;
+        let Some(state) = self.streams.get_mut(&stream) else {
+            if acked == unacked {
+                self.unsettled.remove(&stream);
+            } else if let Some(unacked) = self.unsettled.get_mut(&stream) {
+                *unacked -= acked;
+            }
+            return Ok(());
+        };
+        state.unacked -= acked;
+        state.acked_since_update += acked;
+        if state.acked_since_update > self.config.receive_window / 2 {
+            state.pending_credit += u64::from(state.acked_since_update);
+            state.acked_since_update = 0;
+        }
+        Ok(())
     }
 
     /// Gracefully terminates the whole Yamux session with `code`.
@@ -487,6 +556,17 @@ impl YamuxSession {
         self.streams.len()
     }
 
+    /// Drains every queued stream event.
+    #[cfg(test)]
+    pub fn poll_events(&mut self) -> Vec<YamuxOutput> {
+        core::iter::from_fn(|| self.poll_event()).collect()
+    }
+
+    /// Whether open and unsettled streams fill every stream slot.
+    fn slots_full(&self) -> bool {
+        self.streams.len() + self.unsettled.len() >= self.config.max_streams
+    }
+
     /// Returns aggregate accepted bytes not yet pulled as frames.
     #[cfg(test)]
     pub fn total_buffered_send(&self) -> usize {
@@ -540,10 +620,12 @@ impl YamuxSession {
             if !self.valid_remote_stream_id(stream) {
                 return Err(YamuxError::Protocol("remote used a local-parity stream id"));
             }
-            if self.streams.contains_key(&stream) {
+            // An unsettled id is still in use: reopening it would replace
+            // its unacknowledged count.
+            if self.streams.contains_key(&stream) || self.unsettled.contains_key(&stream) {
                 return Err(YamuxError::Protocol("duplicate SYN for an existing stream"));
             }
-            if self.streams.len() >= self.config.max_streams {
+            if self.slots_full() {
                 return self.queue_reset_for_unknown(stream);
             }
             self.streams.insert(
@@ -575,17 +657,13 @@ impl YamuxSession {
                 return Err(YamuxError::ReceiveWindowExceeded { stream });
             }
             state.receive_window -= payload_len;
-            state.delivered_since_update = state
-                .delivered_since_update
+            // Credit returns only as the reader acknowledges these bytes.
+            state.unacked = state
+                .unacked
                 .checked_add(payload_len)
                 .ok_or(YamuxError::Protocol("receive accounting overflow"))?;
             if !frame.payload().is_empty() {
                 data_output = Some(frame.into_payload());
-            }
-            if state.delivered_since_update > self.config.receive_window / 2 {
-                let credit = state.delivered_since_update;
-                state.pending_credit += u64::from(credit);
-                state.delivered_since_update = 0;
             }
             if flags & FLAG_FIN != 0 && !state.remote_write_closed {
                 state.remote_write_closed = true;
@@ -618,10 +696,12 @@ impl YamuxSession {
             if !self.valid_remote_stream_id(stream) {
                 return Err(YamuxError::Protocol("remote used a local-parity stream id"));
             }
-            if self.streams.contains_key(&stream) {
+            // An unsettled id is still in use: reopening it would replace
+            // its unacknowledged count.
+            if self.streams.contains_key(&stream) || self.unsettled.contains_key(&stream) {
                 return Err(YamuxError::Protocol("duplicate SYN for an existing stream"));
             }
-            if self.streams.len() >= self.config.max_streams {
+            if self.slots_full() {
                 return self.queue_reset_for_unknown(stream);
             }
             let send_window = DEFAULT_RECEIVE_WINDOW
@@ -816,9 +896,14 @@ impl YamuxSession {
             .retain(|event| *event != YamuxOutput::Writable { stream });
     }
 
+    /// Drops a stream's state. One still holding unacknowledged bytes stays
+    /// unsettled, keeping its slot; a local reset settles it afterwards.
     fn remove_stream(&mut self, stream: u32, emit: bool) {
         self.disarm_writable(stream);
         if let Some(state) = self.streams.remove(&stream) {
+            if state.unacked != 0 {
+                self.unsettled.insert(stream, state.unacked);
+            }
             self.total_buffered_send -= state.buffered_send;
             if emit {
                 self.events.push_back(YamuxOutput::StreamClosed { stream });
@@ -831,9 +916,11 @@ impl YamuxSession {
         }
     }
 
+    /// Ends every stream with the session; nothing is left to settle.
     fn close_all_streams(&mut self) {
         let streams = self.streams.keys().copied().collect::<Vec<_>>();
         self.streams.clear();
+        self.unsettled.clear();
         self.writable_armed.clear();
         // Every write side ended: no Writable, not even one already queued.
         self.events
@@ -856,6 +943,7 @@ impl YamuxSession {
         let streams = self.streams.keys().copied().collect::<Vec<_>>();
         self.failed = true;
         self.streams.clear();
+        self.unsettled.clear();
         self.writable_armed.clear();
         self.total_buffered_send = 0;
         self.decoder.clear();
@@ -1417,6 +1505,169 @@ mod tests {
             })
         );
         assert_eq!(decode(&outbound(&mut session)).flags(), FLAG_RST);
+    }
+
+    /// A server whose peer opened stream 1 and sent `len` bytes on it.
+    fn server_with_delivered(limits: YamuxConfig, len: usize, flags: u16) -> YamuxSession {
+        let mut server = YamuxSession::with_config(YamuxRole::Server, limits).unwrap();
+        let frame = Frame::encode_data(1, FLAG_SYN | flags, &alloc::vec![7; len]).unwrap();
+        server.handle_data(&frame).unwrap();
+        // The SYN's ACK is not credit; take it so only window updates remain.
+        assert_eq!(decode(&outbound(&mut server)).flags(), FLAG_ACK);
+        server
+    }
+
+    #[test]
+    fn window_credit_returns_only_for_acknowledged_bytes() {
+        let window = DEFAULT_RECEIVE_WINDOW as usize;
+        let mut server = server_with_delivered(config(), window, 0);
+        while server.poll_event().is_some() {}
+        assert_eq!(server.poll_frame(), None, "unread bytes return no credit");
+        // A peer past the budget is violating the window it was given.
+        let more = Frame::encode_data(1, 0, &[0]).unwrap();
+        assert_eq!(
+            server_with_delivered(config(), window, 0).handle_data(&more),
+            Err(YamuxError::ReceiveWindowExceeded { stream: 1 })
+        );
+
+        server.ack(1, window / 2).unwrap();
+        assert_eq!(server.poll_frame(), None, "credit returns in half windows");
+        server.ack(1, 1).unwrap();
+        let update = decode(&outbound(&mut server));
+        assert_eq!(update.frame_type(), FrameType::WindowUpdate);
+        assert_eq!(update.value() as usize, window / 2 + 1);
+        server.handle_data(&more).unwrap();
+    }
+
+    #[test]
+    fn an_over_ack_names_the_stream_and_both_counts_and_acks_nothing() {
+        let mut server = server_with_delivered(config(), 10, 0);
+        assert_eq!(
+            server.ack(1, 11),
+            Err(YamuxError::AckExceedsDelivered {
+                stream: 1,
+                acked: 11,
+                unacked: 10,
+            })
+        );
+        server.ack(1, 10).unwrap();
+        assert_eq!(
+            server.ack(1, 1),
+            Err(YamuxError::AckExceedsDelivered {
+                stream: 1,
+                acked: 1,
+                unacked: 0,
+            })
+        );
+        // Unknown streams have nothing to acknowledge.
+        server.ack(9, 1_000).unwrap();
+    }
+
+    #[test]
+    fn a_closed_stream_keeps_its_slot_until_its_bytes_are_acknowledged() {
+        let mut limits = config();
+        limits.max_streams = 1;
+        let mut server = server_with_delivered(limits, 10, FLAG_FIN);
+        server.close_write(1).unwrap();
+        while server.poll_frame().is_some() {}
+        assert!(
+            server
+                .poll_events()
+                .contains(&YamuxOutput::StreamClosed { stream: 1 })
+        );
+        let open = |stream| Frame::window_update(stream, FLAG_SYN, 0).unwrap().encode();
+
+        // Unsettled: the next stream is refused, locally and from the peer.
+        assert_eq!(server.open_stream(), Err(YamuxError::TooManyStreams));
+        server.handle_data(&open(3)).unwrap();
+        assert_eq!(decode(&outbound(&mut server)).flags(), FLAG_RST);
+
+        server.ack(1, 4).unwrap();
+        server.handle_data(&open(5)).unwrap();
+        assert_eq!(decode(&outbound(&mut server)).flags(), FLAG_RST);
+        assert_eq!(
+            server.ack(1, 7),
+            Err(YamuxError::AckExceedsDelivered {
+                stream: 1,
+                acked: 7,
+                unacked: 6,
+            })
+        );
+
+        // The last acknowledged byte frees the slot.
+        server.ack(1, 6).unwrap();
+        server.handle_data(&open(7)).unwrap();
+        assert_eq!(
+            server.poll_events(),
+            alloc::vec![YamuxOutput::IncomingStream { stream: 7 }]
+        );
+        server.ack(1, 1).unwrap();
+    }
+
+    #[test]
+    fn stream_churn_with_an_unread_reader_stays_within_max_streams_times_the_window() {
+        let mut limits = config();
+        limits.max_streams = 4;
+        let window = limits.receive_window as usize;
+        let mut server = YamuxSession::with_config(YamuxRole::Server, limits).unwrap();
+        let mut delivered = 0;
+        // The peer opens a stream, fills its window, and resets it, over and
+        // over; the reader never acknowledges anything.
+        for stream in (1..200).step_by(2) {
+            let frame = Frame::encode_data(stream, FLAG_SYN, &alloc::vec![7; window]).unwrap();
+            server.handle_data(&frame).unwrap();
+            server
+                .handle_data(&Frame::data(stream, FLAG_RST, Vec::new()).unwrap().encode())
+                .unwrap();
+            while server.poll_frame().is_some() {}
+            for event in server.poll_events() {
+                if let YamuxOutput::Data { data, .. } = event {
+                    delivered += data.len();
+                }
+            }
+        }
+        assert_eq!(delivered, 4 * window, "refused streams deliver nothing");
+    }
+
+    #[test]
+    fn a_peer_cannot_reopen_an_unsettled_stream_id() {
+        let mut server = server_with_delivered(config(), 10, 0);
+        server
+            .handle_data(&Frame::data(1, FLAG_RST, Vec::new()).unwrap().encode())
+            .unwrap();
+        // Reopening stream 1 would replace its unacknowledged count.
+        let reopen = Frame::encode_data(1, FLAG_SYN, &[7; 10]).unwrap();
+        assert_eq!(
+            server.handle_data(&reopen),
+            Err(YamuxError::Protocol("duplicate SYN for an existing stream"))
+        );
+        let mut server = server_with_delivered(config(), 10, 0);
+        server
+            .handle_data(&Frame::data(1, FLAG_RST, Vec::new()).unwrap().encode())
+            .unwrap();
+        let reopen = Frame::window_update(1, FLAG_SYN, 0).unwrap().encode();
+        assert_eq!(
+            server.handle_data(&reopen),
+            Err(YamuxError::Protocol("duplicate SYN for an existing stream"))
+        );
+    }
+
+    #[test]
+    fn a_local_reset_abandons_unacknowledged_bytes() {
+        let mut limits = config();
+        limits.max_streams = 1;
+        let mut server = server_with_delivered(limits.clone(), 10, 0);
+        server.reset(1).unwrap();
+        assert_eq!(server.open_stream(), Ok(2), "the reset settled stream 1");
+
+        // A stream the peer reset stays unsettled until our own reset.
+        let mut server = server_with_delivered(limits, 10, 0);
+        server
+            .handle_data(&Frame::data(1, FLAG_RST, Vec::new()).unwrap().encode())
+            .unwrap();
+        assert_eq!(server.open_stream(), Err(YamuxError::TooManyStreams));
+        server.reset(1).unwrap();
+        assert_eq!(server.open_stream(), Ok(2));
     }
 
     #[test]

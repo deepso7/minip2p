@@ -232,6 +232,15 @@ class NodeBackend implements Minip2pBackend {
     });
   }
 
+  streamConsumer(connId: number, streamId: number): (bytes: number) => void {
+    const [nativeConn, nativeStream] = this.#nativeStream(connId, streamId);
+    return (bytes) => {
+      translateErrors(() => {
+        this.#endpoint.streamConsumed(nativeConn, nativeStream, bytes);
+      });
+    };
+  }
+
   /**
    * Native connection and stream IDs for a public stream. Native names the
    * stream by both, so an operation for a connection that native already
