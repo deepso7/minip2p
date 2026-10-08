@@ -588,22 +588,12 @@ impl RelayServerAgent {
                     stream_id: *stream_id,
                 };
                 if self.circuits.contains_key(&key) {
-                    self.close_circuit(
-                        key,
-                        CircuitCloseReason::StreamReset {
-                            leg: CircuitLeg::Source,
-                        },
-                    );
+                    self.circuit_leg_closed(key, CircuitLeg::Source);
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
                     && self.circuits.contains_key(&source_stream)
                 {
-                    self.close_circuit(
-                        source_stream,
-                        CircuitCloseReason::StreamReset {
-                            leg: CircuitLeg::Destination,
-                        },
-                    );
+                    self.circuit_leg_closed(source_stream, CircuitLeg::Destination);
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
                     && self.feed_stop(source_stream, StopInitiatorInput::RemoteReset)
@@ -1682,6 +1672,23 @@ impl RelayServerAgent {
         if forward.fin == FinState::Open {
             forward.fin = FinState::Received;
             self.pump_forward(source_stream, direction);
+        }
+    }
+
+    /// Handles `leg`'s stream closing. A leg that finished both ways (its
+    /// half-close was read and the FIN forwarded to it accepted) closed
+    /// cleanly, and the other direction keeps draining; anything else is a
+    /// reset.
+    fn circuit_leg_closed(&mut self, source_stream: StreamKey, leg: CircuitLeg) {
+        let Some(circuit) = self.circuits.get(&source_stream) else {
+            return;
+        };
+        let (from_leg, to_leg) = match leg {
+            CircuitLeg::Source => (&circuit.to_destination, &circuit.to_source),
+            CircuitLeg::Destination => (&circuit.to_source, &circuit.to_destination),
+        };
+        if from_leg.fin == FinState::Open || to_leg.fin != FinState::Accepted {
+            self.close_circuit(source_stream, CircuitCloseReason::StreamReset { leg });
         }
     }
 
@@ -4641,6 +4648,71 @@ mod tests {
                 RelayServerAction::AckStream { .. },
                 RelayServerAction::CloseStreamWrite { stream, .. },
             ] if *stream == stop_stream
+        ));
+    }
+
+    #[test]
+    fn a_leg_that_closes_gracefully_keeps_the_other_direction_draining() {
+        let (mut agent, source, destination, source_stream, stop_stream) =
+            connected_circuit(RelayServerConfig::default(), 0);
+        let now = Now::from_millis(1);
+        let half_close =
+            |peer_id: &PeerId, stream: StreamKey| SwarmEvent::StreamRemoteWriteClosed {
+                peer_id: peer_id.clone(),
+                conn_id: stream.conn_id,
+                stream_id: stream.stream_id,
+            };
+        // The source finishes first; its FIN reaches the destination.
+        agent.handle_event(&half_close(&source, source_stream), false, now);
+        let Some(RelayServerAction::CloseStreamWrite { token, .. }) = io_action(&mut agent) else {
+            panic!("source FIN forwarded");
+        };
+        agent.close_stream_write_result(token, Ok(()), now);
+
+        // The destination answers, the source leg is full, then the
+        // destination finishes and its stream closes cleanly.
+        agent.handle_event(&data(&destination, stop_stream, b"reply"), false, now);
+        let token = sent(&actions(&mut agent), source_stream, b"reply");
+        agent.send_stream_result(token, full(b"ly"), now);
+        agent.handle_event(&half_close(&destination, stop_stream), false, now);
+        agent.handle_event(
+            &SwarmEvent::StreamClosed {
+                peer_id: destination,
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+            },
+            false,
+            now,
+        );
+        assert_eq!(agent.poll_event(), None, "the circuit stays open");
+        let closed = actions(&mut agent);
+        assert!(
+            !closed
+                .iter()
+                .any(|action| matches!(action, RelayServerAction::ResetStream { .. })),
+            "nothing is reset: {closed:?}"
+        );
+
+        // The held reply still reaches the source, then its FIN.
+        agent.handle_event(&writable(&source, source_stream), false, now);
+        let token = sent(&actions(&mut agent), source_stream, b"ly");
+        agent.send_stream_result(token, Ok(()), now);
+        let Some(RelayServerAction::CloseStreamWrite { token, stream, .. }) = io_action(&mut agent)
+        else {
+            panic!("destination FIN forwarded");
+        };
+        assert_eq!(stream, source_stream);
+        agent.close_stream_write_result(token, Ok(()), now);
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitClosed {
+                reason: CircuitCloseReason::Eof,
+                bytes: CircuitByteCounts {
+                    source_to_destination: 0,
+                    destination_to_source: 5,
+                },
+                ..
+            })
         ));
     }
 
