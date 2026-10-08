@@ -47,7 +47,11 @@ fn negotiated_bridge() -> BridgePair {
         .bind()
         .expect("bind local");
     let local_addr = local.listen().expect("local listens");
-    local.swarm.dial(&relay_addr).expect("dial relay");
+    local
+        .swarm
+        .core_mut()
+        .dial(&relay_addr)
+        .expect("dial relay");
 
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     let mut inner_conn = None;
@@ -499,7 +503,7 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
 
 fn execute(driver: &mut NatDriver, action: NatAction, endpoint: &mut Endpoint) {
     let now = endpoint.swarm.now();
-    driver.execute(action, endpoint.swarm.runtime_mut(), now);
+    driver.execute(action, endpoint.swarm.core_mut(), now);
 }
 
 fn circuit_id(driver: &NatDriver, key: (ConnectionId, StreamId)) -> ConnectionId {
@@ -579,11 +583,17 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
 
     execute(&mut driver, promotion, &mut pair.local);
     let promoted = circuit_id(&driver, key);
-    assert_eq!(pair.local.swarm.transport().circuit_ids(), vec![promoted]);
+    assert_eq!(
+        pair.local.swarm.core().transport().circuit_ids(),
+        vec![promoted]
+    );
 
     execute(&mut driver, duplicate, &mut pair.local);
     assert_eq!(driver.promoted().len(), 1);
-    assert_eq!(pair.local.swarm.transport().circuit_ids(), vec![promoted]);
+    assert_eq!(
+        pair.local.swarm.core().transport().circuit_ids(),
+        vec![promoted]
+    );
     assert!(driver.bridge_reset_attempts.is_empty());
 
     let mut header = vec![19];
@@ -595,7 +605,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
             stream_id: pair.stream,
             data: Bytes::from(header),
         },
-        pair.local.swarm.runtime_mut(),
+        pair.local.swarm.core_mut(),
         minip2p_platform::Now::from_millis(10),
     ));
     assert!(driver.promoted().contains_key(&key));
@@ -606,7 +616,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
             stream_id: pair.stream,
             data: Bytes::from(vec![1]),
         },
-        pair.local.swarm.runtime_mut(),
+        pair.local.swarm.core_mut(),
         minip2p_platform::Now::from_millis(10),
     ));
 
@@ -621,7 +631,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
         &mut pair.local,
     );
     assert!(driver.promoted().is_empty());
-    assert!(pair.local.swarm.transport().circuit_ids().is_empty());
+    assert!(pair.local.swarm.core().transport().circuit_ids().is_empty());
     match pair.relay.next_event(std::time::Duration::from_millis(10)) {
         Ok(_) | Err(_) => {}
     }
@@ -640,6 +650,7 @@ fn promotion_uses_action_connection_after_same_batch_relay_replacement() {
     // points at B while the transport close of A is still deferred.
     pair.relay
         .swarm
+        .core_mut()
         .dial(&pair.local_addr)
         .expect("relay dials replacement");
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -669,7 +680,7 @@ fn promotion_uses_action_connection_after_same_batch_relay_replacement() {
     }
     let replacement = replacement.expect("replacement connection id");
     assert_eq!(
-        pair.local.swarm.core().conn_for(&relay_peer),
+        pair.local.swarm.core().connection_id(&relay_peer),
         Some(replacement)
     );
 
@@ -683,7 +694,7 @@ fn promotion_uses_action_connection_after_same_batch_relay_replacement() {
             stream_id: stream,
             data: Bytes::from(vec![1]),
         },
-        pair.local.swarm.runtime_mut(),
+        pair.local.swarm.core_mut(),
         minip2p_platform::Now::from_millis(10),
     ));
 }
@@ -710,6 +721,7 @@ fn driver_resets_failed_adoptions_but_not_unknown_connections() {
         unknown_pair
             .local
             .swarm
+            .core()
             .transport()
             .circuit_ids()
             .is_empty()
@@ -729,7 +741,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
             conn_id: fin_pair.inner_conn,
             stream_id: fin_pair.stream,
         },
-        fin_pair.local.swarm.runtime_mut(),
+        fin_pair.local.swarm.core_mut(),
         minip2p_platform::Now::from_millis(10),
     ));
 
@@ -744,7 +756,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
             conn_id: closed_pair.inner_conn,
             stream_id: closed_pair.stream,
         },
-        closed_pair.local.swarm.runtime_mut(),
+        closed_pair.local.swarm.core_mut(),
         minip2p_platform::Now::from_millis(10),
     ));
     assert!(!closed.promoted().contains_key(&closed_key));
@@ -772,13 +784,14 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         };
         inner.ingest(
             &carrier_gone,
-            inner_pair.local.swarm.runtime_mut(),
+            inner_pair.local.swarm.core_mut(),
             minip2p_platform::Now::from_millis(10),
         );
         assert!(!inner.promoted().contains_key(&inner_key));
         let events = inner_pair
             .local
             .swarm
+            .core_mut()
             .transport_mut()
             .poll(minip2p_platform::Now::from_millis(0))
             .expect("promoted circuit closure");
@@ -802,7 +815,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
             peer_id: Ed25519Keypair::from_secret_key_bytes([73; 32]).peer_id(),
             conn_id: promoted,
         },
-        circuit_pair.local.swarm.runtime_mut(),
+        circuit_pair.local.swarm.core_mut(),
         minip2p_platform::Now::from_millis(10),
     );
     assert!(!circuit.promoted().contains_key(&circuit_key));
@@ -817,11 +830,12 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
     swept_pair
         .local
         .swarm
+        .core_mut()
         .transport_mut()
         .close(promoted)
         .expect("transport-side close");
     swept.pump(
-        swept_pair.local.swarm.runtime_mut(),
+        swept_pair.local.swarm.core_mut(),
         minip2p_platform::Now::from_millis(10),
     );
     assert!(swept.promoted().is_empty());
@@ -837,6 +851,7 @@ fn remote_bridge_reset_closes_promoted_circuit() {
 
     pair.relay
         .swarm
+        .core_mut()
         .transport_mut()
         .reset_stream(pair.relay_conn, pair.stream)
         .expect("reset bridge at relay");
@@ -863,7 +878,7 @@ fn remote_bridge_reset_closes_promoted_circuit() {
                 SwarmEvent::Error(error) if error.conn_id == Some(promoted)
             );
             let now = pair.local.swarm.now();
-            driver.ingest(&event, pair.local.swarm.runtime_mut(), now);
+            driver.ingest(&event, pair.local.swarm.core_mut(), now);
         }
     }
 
@@ -872,7 +887,7 @@ fn remote_bridge_reset_closes_promoted_circuit() {
         "remote RESET_STREAM did not fail the promoted circuit"
     );
     assert!(!driver.promoted().contains_key(&key));
-    assert!(pair.local.swarm.transport().circuit_ids().is_empty());
+    assert!(pair.local.swarm.core().transport().circuit_ids().is_empty());
 }
 
 #[test]
@@ -948,7 +963,7 @@ fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
         relay.assert_healthy();
     }
 
-    assert!(initiator.swarm.transport().circuit_ids().is_empty());
+    assert!(initiator.swarm.core().transport().circuit_ids().is_empty());
     assert!(!initiator.connected_peers().contains(&responder_peer));
 }
 
@@ -1053,6 +1068,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
     ));
     let circuit_id = *a
         .swarm
+        .core()
         .transport()
         .circuit_ids()
         .first()
@@ -1068,7 +1084,10 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
     // the pubsub driver must re-open and re-announce subscriptions.
     // A raw swarm dial forces the direct replacement; `connect` would
     // settle against the existing relayed connection.
-    a.swarm.dial(&b_addr).expect("manual direct upgrade");
+    a.swarm
+        .core_mut()
+        .dial(&b_addr)
+        .expect("manual direct upgrade");
     let upgrade_deadline = Instant::now() + Duration::from_secs(15);
     let mut a_sequence = Vec::new();
     let mut a_resubscribed = false;
@@ -1119,7 +1138,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
         ),
         "replacement sequence: {a_sequence:?}"
     );
-    assert!(a.swarm.transport().circuit_ids().is_empty());
+    assert!(a.swarm.core().transport().circuit_ids().is_empty());
     assert_eq!(a.path(&b_peer), Some(Path::DirectDialed));
 
     a.publish(TOPIC, b"after upgrade")

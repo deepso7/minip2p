@@ -14,9 +14,9 @@ pub use minip2p_swarm::{
     DriverError,
     IdentifyMessage,
     SwarmBuilder,
+    SwarmCore,
     SwarmError,
     SwarmEvent,
-    SwarmRuntime,
     SwarmRuntimeError,
 };
 pub use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
@@ -93,7 +93,7 @@ impl Endpoint {
 /// with [`poll`](Self::poll) and may inspect
 /// [`next_deadline`](Self::next_deadline) to decide how long their platform
 /// loop can idle. Call [`shutdown`](Self::shutdown) to notify peers; there
-/// is no `Drop` disconnect (`into_runtime` moves the runtime out).
+/// is no `Drop` disconnect (`into_core` moves the swarm out).
 ///
 /// # State snapshots
 ///
@@ -106,7 +106,7 @@ impl Endpoint {
 /// of the Endpoint event stream (state changes before its corresponding event
 /// is queued).
 pub struct PortableEndpoint<T: Transport, E: EntropySource> {
-    runtime: SwarmRuntime<T, E>,
+    core: SwarmCore<T, E>,
     connect: connect::ConnectEngine,
 }
 
@@ -128,32 +128,32 @@ pub struct PortableEndpointStats {
 impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// Returns this endpoint's peer ID.
     pub fn peer_id(&self) -> &PeerId {
-        self.runtime.local_peer_id()
+        self.core.local_peer_id()
     }
 
-    /// Returns the underlying caller-driven runtime.
-    pub fn runtime(&self) -> &SwarmRuntime<T, E> {
-        &self.runtime
+    /// Returns the underlying caller-driven swarm.
+    pub fn core(&self) -> &SwarmCore<T, E> {
+        &self.core
     }
 
-    /// Returns mutable access to the underlying caller-driven runtime.
-    pub fn runtime_mut(&mut self) -> &mut SwarmRuntime<T, E> {
-        &mut self.runtime
+    /// Returns mutable access to the underlying caller-driven swarm.
+    pub fn core_mut(&mut self) -> &mut SwarmCore<T, E> {
+        &mut self.core
     }
 
-    /// Consumes the endpoint and returns its underlying runtime.
-    pub fn into_runtime(self) -> SwarmRuntime<T, E> {
-        self.runtime
+    /// Consumes the endpoint and returns its underlying swarm.
+    pub fn into_core(self) -> SwarmCore<T, E> {
+        self.core
     }
 
     /// Starts listening on a transport address.
     pub fn listen(&mut self, address: &Multiaddr) -> Result<Multiaddr, DriverError> {
-        self.runtime.listen(address)
+        self.core.listen(address)
     }
 
     /// Starts listening on every address already bound by the transport.
     pub fn listen_all(&mut self) -> Result<Vec<PeerAddr>, DriverError> {
-        self.runtime.listen_on_bound_addrs()
+        self.core.listen_on_bound_addrs()
     }
 
     /// Admits one Connection attempt. Sync errors: malformed target only.
@@ -186,22 +186,22 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         let target = target.try_into().map_err(Into::into)?;
         Ok(self
             .connect
-            .connect(target, &mut self.runtime, now.monotonic_ms))
+            .connect(target, &mut self.core, now.monotonic_ms))
     }
 
     /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
     pub fn cancel_connect(&mut self, id: ConnectId) {
-        self.connect.cancel(id, &mut self.runtime);
+        self.connect.cancel(id, &mut self.core);
     }
 
     pub(crate) fn tick_connect(&mut self, now: Now) {
-        self.connect.tick(&mut self.runtime, now.monotonic_ms);
+        self.connect.tick(&mut self.core, now.monotonic_ms);
     }
 
     #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
     pub(crate) fn observe_connect(&mut self, event: &minip2p_swarm::SwarmEvent, now: Now) -> bool {
         self.connect
-            .observe(event, &mut self.runtime, now.monotonic_ms)
+            .observe(event, &mut self.core, now.monotonic_ms)
     }
 
     #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
@@ -209,19 +209,19 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         self.connect.pop_event()
     }
 
-    /// Splits the endpoint into its Connection engine and runtime so shared
+    /// Splits the endpoint into its Connection engine and swarm so shared
     /// drivers can borrow both at once.
     #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
-    pub(crate) fn parts_mut(&mut self) -> (&mut connect::ConnectEngine, &mut SwarmRuntime<T, E>) {
-        (&mut self.connect, &mut self.runtime)
+    pub(crate) fn parts_mut(&mut self) -> (&mut connect::ConnectEngine, &mut SwarmCore<T, E>) {
+        (&mut self.connect, &mut self.core)
     }
 
     #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
-    pub(crate) fn poll_runtime(
+    pub(crate) fn poll_core(
         &mut self,
         now: Now,
     ) -> Result<alloc::vec::Vec<minip2p_swarm::SwarmEvent>, DriverError> {
-        self.runtime.poll(now)
+        self.core.poll(now)
     }
 
     fn drain_connect_events(connect: &mut connect::ConnectEngine, events: &mut Vec<EndpointEvent>) {
@@ -234,35 +234,35 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn connected_peers(&self) -> Vec<PeerId> {
-        self.runtime.connected_peers()
+        self.core.connected_peers()
     }
 
     /// Returns whether a peer completed Identify and is ready for application protocols.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
-        self.runtime.is_peer_ready(peer_id)
+        self.core.is_peer_ready(peer_id)
     }
 
     /// Returns the latest Identify information received for a peer.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
-        self.runtime.peer_info(peer_id)
+        self.core.peer_info(peer_id)
     }
 
     /// Returns the active transport connection selected for `peer_id`.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
-        self.runtime.connection_id(peer_id)
+        self.core.connection_id(peer_id)
     }
 
     /// Returns the remote transport address recorded for an exact connection.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
-        self.runtime.connection_remote_addr(conn_id)
+        self.core.connection_remote_addr(conn_id)
     }
 
     /// Returns addresses currently bound on the local transport.
@@ -273,24 +273,24 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn bound_addresses(&self) -> Vec<Multiaddr> {
-        self.runtime.transport().local_addresses()
+        self.core.transport().local_addresses()
     }
 
     /// Sets externally validated addresses to advertise through Identify.
     pub fn set_external_addresses(&mut self, addresses: Vec<Multiaddr>) {
-        self.runtime.set_external_addresses(addresses);
+        self.core.set_external_addresses(addresses);
     }
 
     /// Requests a ping using the caller's time sample.
     pub fn ping(&mut self, peer_id: &PeerId, now: Now) -> Result<(), DriverError> {
-        self.runtime.ping(peer_id, now.monotonic_ms)
+        self.core.ping(peer_id, now.monotonic_ms)
     }
 
     /// Disconnects from a peer, aborting any dials still kept open for its
     /// simultaneous dial so none of them reconnects it.
     pub fn disconnect(&mut self, peer_id: &PeerId, now: Now) -> Result<(), DriverError> {
-        self.connect.abort_retained(peer_id, &mut self.runtime);
-        self.runtime.disconnect(peer_id, now.monotonic_ms)
+        self.connect.abort_retained(peer_id, &mut self.core);
+        self.core.disconnect(peer_id, now.monotonic_ms)
     }
 
     /// Opens an outbound application stream and returns its connection and
@@ -301,7 +301,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         protocol_id: &str,
         now: Now,
     ) -> Result<(ConnectionId, StreamId), DriverError> {
-        self.runtime
+        self.core
             .open_stream(peer_id, protocol_id, now.monotonic_ms)
     }
 
@@ -320,7 +320,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         data: impl Into<Bytes>,
         now: Now,
     ) -> Result<(), DriverError> {
-        self.runtime
+        self.core
             .send_stream(peer_id, conn_id, stream_id, data.into(), now.monotonic_ms)
     }
 
@@ -332,7 +332,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
-        self.runtime
+        self.core
             .close_stream_write(peer_id, conn_id, stream_id, now.monotonic_ms)
     }
 
@@ -344,7 +344,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
-        self.runtime
+        self.core
             .reset_stream(peer_id, conn_id, stream_id, now.monotonic_ms)
     }
 
@@ -356,7 +356,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
-        self.runtime
+        self.core
             .abandon_stream(peer_id, conn_id, stream_id, now.monotonic_ms)
     }
 
@@ -366,11 +366,11 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// connection detail. Aggregate counts here are not atomic with those getters
     /// and may be ahead of the Endpoint event stream.
     pub fn stats(&self) -> PortableEndpointStats {
-        let connected = self.runtime.connected_peers();
+        let connected = self.core.connected_peers();
         PortableEndpointStats {
             ready_peers: connected
                 .iter()
-                .filter(|peer_id| self.runtime.is_peer_ready(peer_id))
+                .filter(|peer_id| self.core.is_peer_ready(peer_id))
                 .count(),
             connected_peers: connected.len(),
             bound_addresses: self.bound_addresses(),
@@ -384,10 +384,10 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         self.tick_connect(now);
         let mut events = alloc::vec::Vec::new();
         Self::drain_connect_events(&mut self.connect, &mut events);
-        for event in self.runtime.poll(now)? {
+        for event in self.core.poll(now)? {
             let consumed = self
                 .connect
-                .observe(&event, &mut self.runtime, now.monotonic_ms);
+                .observe(&event, &mut self.core, now.monotonic_ms);
             if !consumed {
                 events.push(EndpointEvent::from(event));
             }
@@ -398,10 +398,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
 
     /// Returns when the endpoint next needs to be polled.
     pub fn next_deadline(&self, now: Now) -> Option<PollDeadline> {
-        PollDeadline::earliest_opt(
-            self.runtime.next_deadline(now),
-            self.connect.next_deadline(),
-        )
+        PollDeadline::earliest_opt(self.core.next_deadline(now), self.connect.next_deadline())
     }
 
     /// Gracefully closes established peers, drives the resulting actions once,
@@ -413,8 +410,8 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// earlier close fails. The first close error wins over a later poll error.
     pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, DriverError> {
         let mut first_error = None;
-        for peer_id in self.runtime.connected_peers() {
-            if let Err(error) = self.runtime.disconnect(&peer_id, now.monotonic_ms)
+        for peer_id in self.core.connected_peers() {
+            if let Err(error) = self.core.disconnect(&peer_id, now.monotonic_ms)
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -598,10 +595,10 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
     ) -> Result<(), DriverError> {
         self.endpoint.tick_connect(now);
         self.emit_connect_events(now, events);
-        for event in self.endpoint.poll_runtime(now)? {
+        for event in self.endpoint.poll_core(now)? {
             let consumed = self.endpoint.observe_connect(&event, now);
             self.discovery
-                .observe(&event, self.endpoint.runtime().core(), now.monotonic_ms);
+                .observe(&event, self.endpoint.core(), now.monotonic_ms);
             if !consumed {
                 events.push(event.into());
             }
@@ -716,7 +713,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     /// Builds the portable endpoint over a caller-provided transport.
     pub fn build<T: Transport>(self, transport: T) -> Result<PortableEndpoint<T, E>, SwarmError> {
         Ok(PortableEndpoint {
-            runtime: self.swarm.build_runtime(transport, self.entropy)?,
+            core: self.swarm.build_core(transport, self.entropy)?,
             connect: connect::ConnectEngine::new(self.connect_deadline_ms),
         })
     }
@@ -939,7 +936,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             .gossipsub
             .as_mut()
             .ok_or(crate::GossipsubError::NotEnabled)?;
-        Ok(pubsub.subscribe(topic, self.endpoint.runtime_mut(), now.monotonic_ms)?)
+        Ok(pubsub.subscribe(topic, self.endpoint.core_mut(), now.monotonic_ms)?)
     }
 
     /// Withdraws an application topic subscription. The configured
@@ -952,12 +949,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             .gossipsub
             .as_mut()
             .ok_or(crate::GossipsubError::NotEnabled)?;
-        pubsub.unsubscribe(
-            topic,
-            reserved,
-            self.endpoint.runtime_mut(),
-            now.monotonic_ms,
-        )
+        pubsub.unsubscribe(topic, reserved, self.endpoint.core_mut(), now.monotonic_ms)
     }
 
     /// Publishes one application message. The configured discovery topic is
@@ -979,7 +971,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             topic,
             data.into(),
             reserved,
-            self.endpoint.runtime_mut(),
+            self.endpoint.core_mut(),
             now.monotonic_ms,
         )?;
         Ok(())
@@ -1019,7 +1011,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     #[cfg(feature = "portable-autonat")]
     fn cancel_nat_leg_on_terminal(&mut self, event: &EndpointEvent, now: Now) {
         if let Some(nat) = self.nat.as_mut() {
-            nat.cancel_leg_on_terminal(event, self.endpoint.runtime_mut(), now);
+            nat.cancel_leg_on_terminal(event, self.endpoint.core_mut(), now);
         }
     }
 
@@ -1043,11 +1035,11 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         }
         #[cfg(feature = "pubsub")]
         if let Some(pubsub) = self.gossipsub.as_mut() {
-            pubsub.tick(self.endpoint.runtime_mut(), now.monotonic_ms);
+            pubsub.tick(self.endpoint.core_mut(), now.monotonic_ms);
         }
         #[cfg(feature = "portable-autonat")]
         if let Some(nat) = self.nat.as_mut() {
-            nat.tick(self.endpoint.runtime_mut(), now);
+            nat.tick(self.endpoint.core_mut(), now);
         }
         self.flush_nat_addresses();
         self.feed_nat_to_connect(now);
@@ -1100,31 +1092,31 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     fn poll_swarm(&mut self, now: Now, output: &mut Vec<EndpointEvent>) -> Result<(), DriverError> {
         self.endpoint.tick_connect(now);
         self.emit_connect_events(now, output);
-        for event in self.endpoint.poll_runtime(now)? {
+        for event in self.endpoint.poll_core(now)? {
             let engine_consumed = self.endpoint.observe_connect(&event, now);
             if let Some(discovery) = self.discovery.as_mut() {
-                discovery.observe(&event, self.endpoint.runtime().core(), now.monotonic_ms);
+                discovery.observe(&event, self.endpoint.core(), now.monotonic_ms);
             }
             // A stale `PeerReady` (its connection was replaced later in this
             // batch) reaches only the application: the drivers act
             // peer-scoped and would start work on the not-yet-ready
             // replacement.
             #[cfg(any(feature = "portable-autonat", feature = "pubsub"))]
-            let stale_ready = self.endpoint.runtime().core().is_stale_peer_ready(&event);
+            let stale_ready = self.endpoint.core().is_stale_peer_ready(&event);
             #[cfg(feature = "portable-autonat")]
             let claimed = engine_consumed
                 || (!stale_ready
                     && self
                         .nat
                         .as_mut()
-                        .is_some_and(|nat| nat.ingest(&event, self.endpoint.runtime_mut(), now)));
+                        .is_some_and(|nat| nat.ingest(&event, self.endpoint.core_mut(), now)));
             #[cfg(not(feature = "portable-autonat"))]
             let claimed = engine_consumed;
             #[cfg(feature = "pubsub")]
             let claimed = claimed
                 || (!stale_ready
                     && self.gossipsub.as_mut().is_some_and(|pubsub| {
-                        pubsub.ingest(&event, self.endpoint.runtime_mut(), now.monotonic_ms)
+                        pubsub.ingest(&event, self.endpoint.core_mut(), now.monotonic_ms)
                     }));
             if !claimed {
                 output.push(event.into());
@@ -1413,7 +1405,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             self.entropy.clone(),
         );
         let mut endpoint = PortableEndpoint {
-            runtime: self.swarm.build_runtime(transport, self.entropy.clone())?,
+            core: self.swarm.build_core(transport, self.entropy.clone())?,
             connect: connect::ConnectEngine::new(self.connect_deadline_ms),
         };
         #[cfg(feature = "portable-autonat")]
@@ -1423,13 +1415,13 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             .is_some_and(|config| !config.relays.is_empty())
         {
             endpoint
-                .runtime
+                .core
                 .add_outbound_protocol(minip2p_nat::HOP_PROTOCOL_ID)?;
             endpoint
-                .runtime
+                .core
                 .add_inbound_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
             endpoint
-                .runtime
+                .core
                 .add_advertised_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
         }
         for address in self.listens {
@@ -1699,13 +1691,13 @@ mod tests {
         assert_eq!(endpoint.peer_id(), &identity.peer_id());
         assert!(matches!(
             endpoint
-                .runtime_mut()
+                .core_mut()
                 .open_stream(&remote, "/example/1.0.0", 0),
             Err(DriverError::Swarm(SwarmError::NotConnected { .. }))
         ));
         assert!(matches!(
             endpoint
-                .runtime_mut()
+                .core_mut()
                 .open_stream(&remote, "/missing/1.0.0", 0),
             Err(DriverError::Swarm(SwarmError::ProtocolNotRegistered { .. }))
         ));

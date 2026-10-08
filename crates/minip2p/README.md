@@ -65,7 +65,7 @@ loop {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Every std `Endpoint` dial goes through `connect` and its attempt policy. Portable endpoints can still make a raw Transport dial, which bypasses that policy, with `endpoint.runtime_mut().dial(..)`.
+Every std `Endpoint` dial goes through `connect` and its attempt policy. Portable endpoints can still make a raw Transport dial, which bypasses that policy, with `endpoint.core_mut().dial(..)`.
 
 `set_external_addresses` replaces the externally validated addresses advertised through Identify alongside the bound ones; NAT and relay-server contributions are kept and merged after them.
 

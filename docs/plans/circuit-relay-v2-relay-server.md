@@ -239,7 +239,7 @@ pub enum RelayServerAction {
 
 ### Directional protocol roles
 
-Replace the internal single protocol registry with independent inbound, outbound, and Identify-advertised membership. Keep `SwarmBuilder::protocol`/`SwarmRuntime::add_protocol` behavior unchanged by registering application protocols in all three sets. Add crate-internal role registration for composed services.
+Replace the internal single protocol registry with independent inbound, outbound, and Identify-advertised membership. Keep `SwarmBuilder::protocol`/`SwarmCore::add_protocol` behavior unchanged by registering application protocols in all three sets. Add crate-internal role registration for composed services.
 
 | Owner        | Protocol     | Inbound | Outbound | Identify |
 | ------------ | ------------ | ------: | -------: | -------: |

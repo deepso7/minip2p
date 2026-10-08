@@ -69,7 +69,7 @@ loop {
     while let Some(action) = agent.poll_action() {
         match action {
             NatAction::Dial { token, addr } =>
-                agent.dial_result(token, swarm.dial(&addr).map_err(|e| e.to_string()), now()),
+                agent.dial_result(token, swarm.core_mut().dial(&addr).map_err(|e| e.to_string()), now()),
             NatAction::OpenStream { token, peer, protocol_id } =>
                 agent.stream_open_result(
                     token,

@@ -1,14 +1,11 @@
-//! Event, action, and error types exposed by the swarm.
-//!
-//! Kept in a dedicated module so both the Sans-I/O core and the std driver
-//! reference the same concrete types.
+//! Event and error types exposed by the swarm.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use minip2p_core::{Bytes, PeerAddr, PeerId};
 use minip2p_identify::IdentifyMessage;
-use minip2p_transport::{ConnectionId, StreamId, TransportEvent};
+use minip2p_transport::{ConnectionId, StreamId};
 
 /// Events emitted by the swarm to the application.
 #[derive(Clone, Debug)]
@@ -128,10 +125,10 @@ pub enum SwarmEvent {
     Error(SwarmRuntimeError),
     /// An outbound dial's connection closed before it was established.
     ///
-    /// Raw [`crate::SwarmRuntime::dial`] callers see this for a refused or
+    /// Raw [`crate::SwarmCore::dial`] callers see this for a refused or
     /// aborted-too-late handshake. Connection-attempt engines consume the
     /// events they own and never surface them as application diagnostics of
-    /// their own; [`crate::SwarmRuntime::abort_dial`] forgets the dial first
+    /// their own; [`crate::SwarmCore::abort_dial`] forgets the dial first
     /// so no `DialFailed` follows.
     DialFailed {
         conn_id: ConnectionId,
@@ -194,7 +191,7 @@ impl SwarmEvent {
 
 /// Structured runtime error emitted through [`SwarmEvent::Error`].
 ///
-/// This keeps the Sans-I/O core testable without string matching while still
+/// This keeps the swarm testable without string matching while still
 /// carrying a human-readable detail for logs and CLIs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SwarmRuntimeError {
@@ -230,126 +227,9 @@ pub enum SwarmErrorKind {
     OpenStreamFailed,
     /// The remote peer did not support the requested protocol.
     UnsupportedProtocol,
-    /// The swarm driver violated the core/driver contract.
-    Driver,
 }
 
-/// Opaque correlation handle for a pending outbound stream-open request.
-///
-/// The core emits it as part of [`SwarmAction::OpenStream`]; the driver
-/// echoes it back unchanged when reporting the stream id (or failure) via
-/// [`SwarmInput::StreamOpened`] / [`SwarmInput::OpenStreamFailed`].
-///
-/// The token's numeric value is an implementation detail and meaningless
-/// outside the core.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct OpenStreamToken(pub(crate) u64);
-
-/// Inputs accepted by the Sans-I/O swarm core.
-///
-/// A custom runtime feeds exactly one input, then drains [`SwarmOutput`] values
-/// through `SwarmCore::poll_output()` before feeding the next input.
-#[derive(Clone, Debug)]
-pub enum SwarmInput {
-    /// An event produced by the underlying transport.
-    Transport {
-        event: TransportEvent,
-        /// Monotonic milliseconds supplied by the driver.
-        now_ms: u64,
-    },
-    /// Time advanced; used for protocol timers such as ping timeouts.
-    Tick {
-        /// Monotonic milliseconds supplied by the driver.
-        now_ms: u64,
-    },
-    /// The driver successfully opened an outbound stream requested by
-    /// [`SwarmAction::OpenStream`].
-    StreamOpened {
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        token: OpenStreamToken,
-        /// Monotonic milliseconds supplied by the driver.
-        now_ms: u64,
-    },
-    /// The driver failed to open an outbound stream requested by
-    /// [`SwarmAction::OpenStream`].
-    OpenStreamFailed {
-        token: OpenStreamToken,
-        reason: String,
-        /// Monotonic milliseconds supplied by the driver.
-        now_ms: u64,
-    },
-    /// A non-fatal runtime error observed by the driver while executing a
-    /// [`SwarmAction`].
-    RuntimeError(SwarmRuntimeError),
-    /// The transport answered a [`SwarmAction::SendStream`] with
-    /// [`TransportError::Full`](minip2p_transport::TransportError::Full).
-    ///
-    /// The core holds `unsent` and resends it, ahead of any later write or
-    /// close for the stream, on the stream's
-    /// [`TransportEvent::StreamWritable`]. `counted` is the length of the
-    /// action's payload, so a short tail can be copied out of it.
-    SendFull {
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        unsent: Bytes,
-        counted: usize,
-    },
-}
-
-/// Outputs produced by the Sans-I/O swarm core.
-#[derive(Clone, Debug)]
-pub enum SwarmOutput {
-    /// A command the runtime must execute against its transport.
-    Action(SwarmAction),
-    /// An application-visible event.
-    Event(SwarmEvent),
-}
-
-/// Commands the swarm asks its driver to execute against the underlying
-/// transport.
-///
-/// `Listen` and `Dial` are handled by the driver directly (they need to
-/// allocate connection ids and interact with the transport synchronously)
-/// and do not appear here.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SwarmAction {
-    /// Open a new outbound stream on the given connection.
-    ///
-    /// The driver calls `transport.open_stream(conn_id)`. On success it
-    /// reports the allocated stream id back to the core via
-    /// [`SwarmInput::StreamOpened`]. On failure it reports the error via
-    /// [`SwarmInput::OpenStreamFailed`].
-    /// The driver must echo `token` unchanged.
-    OpenStream {
-        conn_id: ConnectionId,
-        token: OpenStreamToken,
-    },
-    /// Send bytes on an existing stream.
-    ///
-    /// When the transport answers Full, the driver feeds the unsent tail back
-    /// as [`SwarmInput::SendFull`] before polling the next output. The core
-    /// owns the retry; any other failure is a [`SwarmInput::RuntimeError`].
-    SendStream {
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        data: Bytes,
-    },
-    /// Half-close our write side on a stream.
-    CloseStreamWrite {
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-    },
-    /// Abruptly reset a stream in both directions.
-    ResetStream {
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-    },
-    /// Gracefully close a connection.
-    CloseConnection { conn_id: ConnectionId },
-}
-
-/// Errors returned by the sans-I/O core for application-driven operations.
+/// Errors returned by the swarm for application-driven operations.
 ///
 /// Transport-originated errors are surfaced as [`SwarmEvent::Error`]; this
 /// type covers the cases where an API call is rejected synchronously.
@@ -397,9 +277,9 @@ pub enum SwarmError {
         conn_id: ConnectionId,
         stream_id: StreamId,
     },
-    /// The stream cannot accept the write yet: the swarm core is holding
-    /// earlier bytes for it (its own negotiation bytes, or a tail a driver
-    /// reported through [`SwarmInput::SendFull`]). Retryable; `unsent` is the
+    /// The stream cannot accept the write yet: the swarm is holding earlier
+    /// bytes for it (its own negotiation bytes, or the unsent tail of one of
+    /// its own writes the transport answered Full). Retryable; `unsent` is the
     /// whole payload, and [`SwarmEvent::StreamWritable`] follows once the held
     /// bytes have been resent -- unless a write-side close is queued behind
     /// them or the write side ends first, in which case no Writable comes.
