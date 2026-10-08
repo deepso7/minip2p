@@ -20,7 +20,7 @@ std = ["minip2p-identity/std", "thiserror/std"]
 [dependencies]
 # Shared stream payload handle (ADR 0011); re-exported as `minip2p_core::Bytes`.
 bytes = { version = "1.12.1", default-features = false }
-minip2p-identity = { path = "../identity", version = "0.7.4", default-features = false }
+minip2p-identity = { path = "../identity", version = "0.7.5", default-features = false }
 thiserror = { version = "2.0.20", default-features = false }
 
 [dev-dependencies]
