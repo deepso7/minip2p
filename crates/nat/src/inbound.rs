@@ -19,9 +19,9 @@ use minip2p_dcutr::{DcutrInitiator, DcutrInitiatorInput, DcutrInitiatorOutput, I
 use minip2p_relay::{Status, StopResponder, StopResponderInput, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
 
-use crate::agent::TokenPurpose;
-use crate::agent::{Shared, StreamInput};
+use crate::agent::{Shared, StreamInput, StreamRole, TokenPurpose, reset, send};
 use crate::events::{BridgeRole, NatAction, NatEvent};
+use crate::swarm::NatSwarm;
 use crate::types::{Now, PromoteError};
 
 /// Responder-side UDP blast schedule during the punch window.
@@ -43,7 +43,8 @@ pub(crate) struct InboundCircuit {
     source: Option<PeerId>,
     stop: Option<StopResponder>,
     dcutr: Option<DcutrInitiator>,
-    dcutr_stream: Option<StreamId>,
+    /// The DCUtR stream this peer opened, on the promoted circuit.
+    dcutr_stream: Option<(ConnectionId, StreamId)>,
     /// Monotonic time when the initial DCUtR CONNECT was queued to the
     /// transport, used to synchronize the first QUIC blast at half the
     /// measured relay RTT.
@@ -139,7 +140,9 @@ impl InboundCircuit {
         conn_id: ConnectionId,
         stream: StreamId,
         input: StreamInput<'_>,
+        swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
+        now: Now,
     ) {
         if self.done || conn_id != self.inner_conn || stream != self.stream {
             return;
@@ -147,7 +150,8 @@ impl InboundCircuit {
         match input {
             StreamInput::Data(data) => {
                 if self.source.is_none() {
-                    self.on_stop_data(data, shared);
+                    let input = StopResponderInput::Data(data.to_vec());
+                    self.on_stop_input(input, swarm, shared, now);
                 }
             }
             StreamInput::RemoteWriteClosed => {
@@ -155,29 +159,32 @@ impl InboundCircuit {
                 // usable. Let the protocol parser consume that boundary and
                 // retain the circuit until its normal exchange deadline.
                 if self.source.is_none() {
-                    self.on_stop_input(StopResponderInput::RemoteWriteClosed, shared);
+                    let input = StopResponderInput::RemoteWriteClosed;
+                    self.on_stop_input(input, swarm, shared, now);
                 }
             }
             StreamInput::Closed => {
                 // The circuit died before the app took over.
-                self.abandon(shared, false);
+                self.abandon(false, swarm, shared, now);
             }
             StreamInput::Ready => {}
         }
     }
 
-    /// Feeds bytes into the STOP responder until the CONNECT request is
-    /// decoded, then auto-accepts and hands the bridge to circuit promotion.
-    fn on_stop_data(&mut self, data: &[u8], shared: &mut Shared) {
-        self.on_stop_input(StopResponderInput::Data(data.to_vec()), shared);
-    }
-
-    fn on_stop_input(&mut self, input: StopResponderInput, shared: &mut Shared) {
+    /// Feeds the STOP responder until the CONNECT request is decoded, then
+    /// auto-accepts and hands the bridge to circuit promotion.
+    fn on_stop_input(
+        &mut self,
+        input: StopResponderInput,
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) {
         let Some(stop) = self.stop.as_mut() else {
             return;
         };
         if stop.handle_input(input).is_err() {
-            self.abandon(shared, true);
+            self.abandon(true, swarm, shared, now);
             return;
         }
         let request = loop {
@@ -197,7 +204,7 @@ impl InboundCircuit {
                 .handle_input(StopResponderInput::Reject(Status::MalformedMessage))
                 .is_err()
             {
-                self.abandon(shared, true);
+                self.abandon(true, swarm, shared, now);
                 return;
             }
             let mut outbound = Vec::new();
@@ -207,18 +214,14 @@ impl InboundCircuit {
                 }
             }
             for bytes in outbound {
-                shared.push_action(NatAction::SendStream {
-                    peer: self.relay.clone(),
-                    stream_id: self.stream,
-                    data: bytes,
-                });
+                send(swarm, &self.relay, self.inner_conn, self.stream, bytes, now);
             }
-            self.abandon(shared, true);
+            self.abandon(true, swarm, shared, now);
             return;
         };
 
         if stop.handle_input(StopResponderInput::Accept).is_err() {
-            self.abandon(shared, true);
+            self.abandon(true, swarm, shared, now);
             return;
         }
         self.source = Some(source);
@@ -236,11 +239,7 @@ impl InboundCircuit {
         }
         self.stop = None;
         for bytes in outbound {
-            shared.push_action(NatAction::SendStream {
-                peer: self.relay.clone(),
-                stream_id: self.stream,
-                data: bytes,
-            });
+            send(swarm, &self.relay, self.inner_conn, self.stream, bytes, now);
         }
 
         // Bytes behind STOP STATUS belong to the circuit's secure-mux
@@ -273,7 +272,7 @@ impl InboundCircuit {
         }
     }
 
-    pub(crate) fn on_tick(&mut self, shared: &mut Shared, now: Now) {
+    pub(crate) fn on_tick(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         if self.done {
             return;
         }
@@ -284,7 +283,7 @@ impl InboundCircuit {
                 self.promote(shared);
             } else {
                 // The relay never even sent CONNECT.
-                self.abandon(shared, true);
+                self.abandon(true, swarm, shared, now);
                 return;
             }
         }
@@ -333,7 +332,7 @@ impl InboundCircuit {
         if let Some(deadline) = self.dcutr_deadline
             && now.mono_ms >= deadline
         {
-            self.finish_dcutr(shared);
+            self.finish_dcutr(swarm, shared, now);
             self.done = true;
         }
     }
@@ -343,8 +342,9 @@ impl InboundCircuit {
         peer: &PeerId,
         conn_id: ConnectionId,
         is_circuit: bool,
+        swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
-        _now: Now,
+        now: Now,
     ) {
         if self.done || self.source.as_ref() != Some(peer) {
             return;
@@ -359,8 +359,7 @@ impl InboundCircuit {
                     },
                     None,
                 );
-                let directly_connected = shared.is_directly_connected(peer);
-                if !self.path_announced && !directly_connected {
+                if !self.path_announced {
                     self.path_announced = true;
                     shared.push_event(NatEvent::InboundPathEstablished {
                         peer: peer.clone(),
@@ -369,22 +368,10 @@ impl InboundCircuit {
                         },
                     });
                     if !shared.config.force_relay {
-                        let token = shared
-                            .alloc_token(TokenPurpose::OpenDcutrInbound(self.id, peer.clone()));
-                        shared.push_action(NatAction::OpenStream {
-                            token,
-                            peer: peer.clone(),
-                            protocol_id: minip2p_dcutr::DCUTR_PROTOCOL_ID.into(),
-                        });
+                        self.open_dcutr(peer, conn_id, swarm, shared, now);
                     }
                 }
-                if directly_connected {
-                    self.blast = None;
-                    self.linger_until = None;
-                    self.done = true;
-                } else if shared.config.force_relay
-                    && self.blast.is_none()
-                    && self.linger_until.is_none()
+                if shared.config.force_relay && self.blast.is_none() && self.linger_until.is_none()
                 {
                     self.done = true;
                 }
@@ -407,12 +394,7 @@ impl InboundCircuit {
     /// The relay connection died. Before release the circuit is gone; after
     /// release the app owns the (now dead) stream and the initiator's punch
     /// dial may still land, so the circuit lingers.
-    pub(crate) fn on_connection_closed(
-        &mut self,
-        peer: &PeerId,
-        conn_id: ConnectionId,
-        _shared: &mut Shared,
-    ) {
+    pub(crate) fn on_connection_closed(&mut self, peer: &PeerId, conn_id: ConnectionId) {
         if self.done {
             return;
         }
@@ -430,14 +412,18 @@ impl InboundCircuit {
         }
     }
 
-    /// Drops the circuit before the app ever saw it.
-    fn abandon(&mut self, shared: &mut Shared, reset: bool) {
+    /// Drops the circuit before the app ever saw it, resetting the STOP
+    /// stream when its connection is still alive.
+    fn abandon(
+        &mut self,
+        reset_stream: bool,
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) {
         if !self.released {
-            if reset {
-                shared.push_action(NatAction::ResetStream {
-                    peer: self.relay.clone(),
-                    stream_id: self.stream,
-                });
+            if reset_stream {
+                reset(swarm, &self.relay, self.inner_conn, self.stream, now);
             }
             shared.release_stream(&self.relay, self.stream);
         }
@@ -460,23 +446,32 @@ impl InboundCircuit {
         }
     }
 
-    pub(crate) fn on_dcutr_open_result(
+    /// Opens `/libp2p/dcutr` on the promoted circuit `circuit`. Only the
+    /// stream allocation is shared with the other NAT exchanges: the
+    /// circuit is already ready.
+    fn open_dcutr(
         &mut self,
         peer: &PeerId,
-        result: Result<StreamId, alloc::string::String>,
+        circuit: ConnectionId,
+        swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
         now: Now,
     ) {
-        match result {
-            Ok(stream) => {
-                self.dcutr_stream = Some(stream);
+        match swarm.open_stream(peer, minip2p_dcutr::DCUTR_PROTOCOL_ID, now.mono_ms) {
+            Ok((conn, stream)) if conn == circuit => {
+                self.dcutr_stream = Some((conn, stream));
                 self.dcutr = Some(DcutrInitiator::new(&shared.punch_candidates()));
                 self.dcutr_deadline = Some(now.mono_ms + shared.config.relay_leg_deadline_ms);
-                shared.own_stream(
-                    peer,
-                    stream,
-                    crate::agent::StreamRole::DcutrInbound(self.id),
-                );
+                shared.own_stream(peer, conn, stream, StreamRole::DcutrInbound(self.id));
+            }
+            // The swarm is ahead of this event: the peer's current
+            // connection already replaced the circuit, so there is nothing
+            // to punch. Give the stream back at once; the replacement's own
+            // event reports the upgrade.
+            Ok((conn, stream)) => {
+                reset(swarm, peer, conn, stream, now);
+                self.linger_until = None;
+                self.done = true;
             }
             Err(_) => {
                 self.linger_until = None;
@@ -489,12 +484,13 @@ impl InboundCircuit {
         &mut self,
         stream: StreamId,
         input: StreamInput<'_>,
+        swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
         now: Now,
     ) {
-        if self.dcutr_stream != Some(stream) {
+        let Some((conn, _)) = self.dcutr_stream.filter(|(_, s)| *s == stream) else {
             return;
-        }
+        };
         let Some(dcutr) = self.dcutr.as_mut() else {
             return;
         };
@@ -512,7 +508,7 @@ impl InboundCircuit {
             }
         };
         if dcutr.handle_input(machine_input).is_err() {
-            self.finish_dcutr(shared);
+            self.finish_dcutr(swarm, shared, now);
             self.done = true;
             return;
         }
@@ -526,11 +522,7 @@ impl InboundCircuit {
                 DcutrInitiatorOutput::Outbound(data) => {
                     self.dcutr_connect_sent_at.get_or_insert(now.mono_ms);
                     if let Some(peer) = self.source.as_ref() {
-                        shared.push_action(NatAction::SendStream {
-                            peer: peer.clone(),
-                            stream_id: stream,
-                            data,
-                        });
+                        send(swarm, peer, conn, stream, data, now);
                     }
                 }
                 DcutrInitiatorOutput::Outcome(InitiatorOutcome::DialNow {
@@ -565,11 +557,7 @@ impl InboundCircuit {
                     if dcutr.handle_input(DcutrInitiatorInput::SendSync).is_ok() {
                         while let Some(DcutrInitiatorOutput::Outbound(data)) = dcutr.poll_output() {
                             if let Some(peer) = self.source.as_ref() {
-                                shared.push_action(NatAction::SendStream {
-                                    peer: peer.clone(),
-                                    stream_id: stream,
-                                    data,
-                                });
+                                send(swarm, peer, conn, stream, data, now);
                             }
                         }
                     }
@@ -585,23 +573,23 @@ impl InboundCircuit {
             }
         }
         if remote_closed && !completed {
-            self.finish_dcutr(shared);
+            self.finish_dcutr(swarm, shared, now);
             self.done = true;
             return;
         }
         if completed {
-            self.finish_dcutr(shared);
+            self.finish_dcutr(swarm, shared, now);
         }
     }
 
-    fn finish_dcutr(&mut self, shared: &mut Shared) {
+    fn finish_dcutr(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         self.dcutr = None;
         self.dcutr_deadline = None;
-        let Some(stream_id) = self.dcutr_stream.take() else {
+        let Some((_, stream_id)) = self.dcutr_stream.take() else {
             return;
         };
         if let Some(peer) = self.source.as_ref() {
-            shared.reset_owned_stream(peer, stream_id);
+            shared.reset_owned_stream(swarm, peer, stream_id, now);
         }
     }
 }

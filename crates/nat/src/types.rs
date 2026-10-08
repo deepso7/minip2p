@@ -25,15 +25,15 @@ impl Now {
     }
 }
 
-/// Opaque correlation token for a pending [`NatAction::Dial`] or
-/// [`NatAction::OpenStream`].
+/// Opaque correlation token the agent allocates for work whose result the
+/// host reports later: a dial the host parked to resolve its named address
+/// ([`DialStart::Deferred`](crate::DialStart::Deferred), reported through
+/// [`NatAgent::dial_result`](crate::NatAgent::dial_result)) and a
+/// [`NatAction::PromoteBridge`] (reported through
+/// [`NatAgent::promote_result`](crate::NatAgent::promote_result)). The host
+/// echoes it back unchanged.
 ///
-/// The driver executes the synchronous swarm call and echoes the token back
-/// unchanged via [`NatAgent::dial_result`](crate::NatAgent::dial_result) /
-/// [`NatAgent::stream_open_result`](crate::NatAgent::stream_open_result).
-///
-/// [`NatAction::Dial`]: crate::NatAction::Dial
-/// [`NatAction::OpenStream`]: crate::NatAction::OpenStream
+/// [`NatAction::PromoteBridge`]: crate::NatAction::PromoteBridge
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NatToken(pub(crate) u64);
 

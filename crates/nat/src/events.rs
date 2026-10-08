@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{ConnectId, Multiaddr, PeerId};
 use minip2p_transport::StreamId;
 
 use crate::types::{NatError, NatToken, Path, ReachabilityState};
@@ -15,40 +15,17 @@ pub enum BridgeRole {
     Responder,
 }
 
-/// Commands the agent asks its driver to execute against the swarm.
+/// Commands the agent asks its driver to execute beyond the swarm.
 ///
-/// `Dial` and `OpenStream` are synchronous swarm calls; the driver echoes
-/// their results back via [`NatAgent::dial_result`](crate::NatAgent::dial_result)
-/// and [`NatAgent::stream_open_result`](crate::NatAgent::stream_open_result)
-/// with the same token. The remaining actions are fire-and-forget.
+/// Swarm commands (dials, stream opens, writes, resets, pings) are not
+/// actions: the agent issues them directly through the
+/// [`NatSwarm`](crate::NatSwarm) passed into each call. What remains needs the
+/// transport underneath the swarm (raw UDP, circuit adoption and closing).
+/// `PromoteBridge` reports its result back through
+/// [`NatAgent::promote_result`](crate::NatAgent::promote_result) with its
+/// token; the others are fire-and-forget.
 #[derive(Clone, Debug)]
 pub enum NatAction {
-    /// Call `Swarm::dial(&addr)` and report the result with `token`.
-    Dial { token: NatToken, addr: PeerAddr },
-    /// Call `Swarm::open_stream(&peer, &protocol_id)` and report the result
-    /// with `token`.
-    OpenStream {
-        token: NatToken,
-        peer: PeerId,
-        protocol_id: String,
-    },
-    /// Call `Swarm::send_stream(&peer, stream_id, data)`.
-    SendStream {
-        peer: PeerId,
-        stream_id: StreamId,
-        data: Vec<u8>,
-    },
-    /// Call `Swarm::close_stream_write(&peer, stream_id)`.
-    CloseStreamWrite { peer: PeerId, stream_id: StreamId },
-    /// Call `Swarm::reset_stream(&peer, stream_id)`. Failures may be
-    /// ignored — the stream is being abandoned.
-    ResetStream { peer: PeerId, stream_id: StreamId },
-    /// Call `Swarm::disconnect(&peer)`.
-    Disconnect { peer: PeerId },
-    /// Call `Swarm::ping(&peer)` to keep a QUIC relay reservation's
-    /// connection active. Failures may be ignored because connection loss is
-    /// reported through the normal swarm lifecycle.
-    Ping { peer: PeerId },
     /// Send one datagram of `payload_len` random bytes to `target` to open
     /// our NAT mapping (responder-side hole punch). The wiring fills the
     /// random bytes and calls the transport's raw-UDP send; transports
@@ -69,8 +46,9 @@ pub enum NatAction {
         pending_data: Vec<u8>,
         remote_write_closed: bool,
     },
-    /// Close a promoted circuit connection. Closing an already-gone circuit
-    /// is successful cleanup.
+    /// Close a promoted circuit connection, or a NAT dial's handshake that
+    /// has not established, through the transport. Closing an already-gone
+    /// connection is successful cleanup.
     CloseCircuit {
         conn_id: minip2p_transport::ConnectionId,
     },

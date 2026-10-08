@@ -935,7 +935,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     /// connected.
     #[cfg(feature = "portable-relay")]
     pub fn path(&self, peer: &PeerId) -> Option<minip2p_nat::Path> {
-        self.nat.as_ref().and_then(|nat| nat.path(peer))
+        self.nat
+            .as_ref()
+            .and_then(|nat| nat.path(self.endpoint.core(), peer))
     }
 
     /// Returns the currently held relay reservation, when any.

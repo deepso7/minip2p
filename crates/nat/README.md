@@ -52,44 +52,41 @@ let legs = ConnectLegs {
     target_addrs: known_addrs_for_target, // circuit addresses steer relay choice
     deadline_ms: Some(attempt_expires_mono_ms), // relays split the time left
 };
-agent.connect(id, target_peer, legs, now());
+// `swarm` is any `NatSwarm`; `SwarmCore` implements it. It is passed into
+// each call, never stored, and the agent issues dials, stream opens,
+// writes, resets, and pings on it directly.
+agent.connect(&mut swarm, id, target_peer, legs, now());
 
 loop {
-    // 1. Feed swarm events by reference. The disposition stays true even
-    //    when handling claims or releases a control-plane stream, so only
-    //    forward events for which it returns false to the application.
+    // 1. Feed swarm events by reference, with the transport's circuit
+    //    classification of the connection they bring up. The disposition
+    //    stays true even when handling claims or releases a control-plane
+    //    stream, so only forward events for which it returns false.
     let is_circuit = transport.is_circuit_connection(swarm_event.connection_id());
-    let consumed = agent.handle_event_with_disposition_classified(
-        &swarm_event,
-        is_circuit,
-        now(),
-    );
+    let consumed = agent.handle_event(&mut swarm, &swarm_event, is_circuit, now());
     if !consumed { /* forward swarm_event to the application */ }
-    // 2. Execute actions, echoing synchronous results back.
+    // 2. Execute what needs the transport under the swarm.
     while let Some(action) = agent.poll_action() {
         match action {
-            NatAction::Dial { token, addr } =>
-                agent.dial_result(token, swarm.core_mut().dial(&addr).map_err(|e| e.to_string()), now()),
-            NatAction::OpenStream { token, peer, protocol_id } =>
-                agent.stream_open_result(
-                    token,
-                    swarm.open_stream(&peer, &protocol_id).map_err(|e| e.to_string()),
-                    now(),
-                ),
-            NatAction::PromoteBridge { token, .. } =>
-                agent.promote_result(token, promote_bridge(/* ... */), now()),
-            // SendStream / ResetStream / ... map 1:1 onto Swarm methods.
-            _ => { /* ... */ }
+            NatAction::PromoteBridge { token, .. } => {
+                let result = promote_bridge(/* ... */);
+                agent.promote_result(&mut swarm, token, result, now());
+            }
+            NatAction::SendRandomUdp { .. } | NatAction::CloseCircuit { .. } => { /* ... */ }
         }
     }
     // 3. Surface events to the application.
     while let Some(event) = agent.poll_event() { /* ... */ }
     // 4. Sleep at most `agent.next_timeout(now_ms)`, then tick.
-    agent.handle_tick(now());
+    agent.handle_tick(&mut swarm, now());
 }
 ```
 
-A driver may hold a `Dial` back instead of echoing it at once, for example to resolve a `/dns*` relay or AutoNAT server address off its event loop (transports accept only IP addresses). Before dialing and echoing such a deferred dial, it calls `agent.deferred_dial_wanted(token, now)` and drops the dial when that returns `false`: the owning flight has moved on, and a late result must not land on a newer one.
+### Reading the swarm
+
+The agent keeps no copy of connections or readiness; it reads both from the `NatSwarm` each call. That state may be ahead of the event being handled (a host hands over a batch the swarm already applied), so the agent follows two rules: what it owns (dials, streams, reservations, path origins) is keyed by the exact connection id an event carries, and live swarm state only decides whether new work may start. Cleanup for a closed or replaced connection ends only the work bound to that connection, never work already started on its replacement. Readiness-triggered work starts only when the `PeerReady` connection is still the peer's ready one.
+
+A dial to a concrete `/ip4`/`/ip6` address starts synchronously (`DialStart::Started`); its outcome arrives as `ConnectionEstablished` or `DialFailed`. The bare `SwarmCore` implementation rejects `/dns*` addresses with `NatSwarmError::NamedAddress`. A host that resolves names wraps the swarm in a small adapter that parks such a dial and returns `DialStart::Deferred(token)` with the token the agent passed in: the agent allocates and registers that token before the dial reaches the host, so the result can come back at any later point. Before dialing and reporting the parked dial through `agent.dial_result(&mut swarm, token, result, now)`, the host calls `agent.deferred_dial_wanted(token, now)` and drops the dial when that returns `false`: the owning flight has moved on, and a late result must not land on a newer one.
 
 The `minip2p` crate (cargo feature `nat`) wires exactly this loop into `Endpoint` so applications get `connect(target)`, `ConnectSettled`, and `EndpointEvent::Nat(..)` from `Endpoint::wait` without touching the pump. Attempt terminals (`ConnectFailed`, `FellBackToRelay`) are consumed by the Endpoint's Connection-attempt engine and surface only as `ConnectSettled`:
 
@@ -131,7 +128,7 @@ loop {
 Independent of connect attempts, the agent also runs:
 
 - **Reachability probing** (`NatConfig::autonat_servers`): single-shot AutoNAT probes aggregated through an M-sample window — the verdict flips only when N of the last M probes agree (defaults N=3, M=5), so one flaky probe never flaps `ReachabilityChanged`.
-- **Relay reservations** (`NatConfig::reservation_policy`): held per policy (`Always` / `WhenPrivate` / `Never`), renewed `reservation_renewal_margin_secs` before the relay-reported `expire` (default-TTL fallback when the relay omits it or the host has no wall clock), rotating relays with backoff on refusal, and reacquiring after a lost relay session. When the swarm replaces the connection carrying the reservation (`SwarmEvent::ConnectionReplaced`), the agent reports the reservation lost at once (withdrawing its circuit address), cancels any exchange on the old connection, and reserves again on the new one once it reports `PeerReady`: rust-libp2p relays drop a reservation with the connection that made it. While a QUIC reservation is held, the agent requests a ping every `reservation_keep_alive_interval_ms` (15 seconds by default) so an otherwise idle connection does not reach QUIC's idle timeout. Set it below the configured QUIC idle timeout; `0` disables these pings. TCP reservations do not schedule them. In the `minip2p` endpoint, successful automatic pings emit the same `EndpointEvent::PingRttMeasured` event as a caller-requested ping. `WhenPrivate` reserves while reachability is Unknown or Private and releases once probes settle on Public.
+- **Relay reservations** (`NatConfig::reservation_policy`): held per policy (`Always` / `WhenPrivate` / `Never`), renewed `reservation_renewal_margin_secs` before the relay-reported `expire` (default-TTL fallback when the relay omits it or the host has no wall clock), rotating relays with backoff on refusal, and reacquiring after a lost relay session. When the swarm replaces the connection carrying the reservation (`SwarmEvent::ConnectionReplaced`), the agent reports the reservation lost at once (withdrawing its circuit address), cancels any exchange on the old connection, and reserves again on the new one once it is ready: rust-libp2p relays drop a reservation with the connection that made it, so a reservation is bound to that exact connection. While a QUIC reservation is held, the agent pings the relay every `reservation_keep_alive_interval_ms` (15 seconds by default) so an otherwise idle connection does not reach QUIC's idle timeout. Set it below the configured QUIC idle timeout; `0` disables these pings. TCP reservations do not schedule them. In the `minip2p` endpoint, successful automatic pings emit the same `EndpointEvent::PingRttMeasured` event as a caller-requested ping. `WhenPrivate` reserves while reachability is Unknown or Private and releases once probes settle on Public.
 
 ## Responder side
 
@@ -148,3 +145,4 @@ Each connection records the path origin a NAT machine announced for it: Direct (
 - Dialer-side race (direct dials × relay leg × DCUtR punch): implemented, covered by scripted no-I/O tests in `tests/arbitration.rs`; relay rotation within one attempt in `tests/relay_rotation.rs`.
 - Housekeeping (AutoNAT confidence aggregation, relay reservation renewal): implemented, covered by `tests/housekeeping.rs`.
 - Responder side (inbound STOP circuits, punch-window UDP blasts): implemented, covered by `tests/inbound.rs` plus a two-agent end-to-end exchange over an in-memory relay emulator (`tests/two_agents.rs`).
+- Scripted tests run against one shared fake `NatSwarm` (`tests/common`); `tests/real_swarm.rs` checks command results and event ordering against a real `SwarmCore`.
