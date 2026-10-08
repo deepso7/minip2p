@@ -73,7 +73,7 @@ fn abandon_stream(
 ) {
     if let Some((conn, stream)) = stage.stream() {
         reset(swarm, peer, conn, stream, now);
-        shared.release_stream(peer, stream);
+        shared.release_stream(conn, stream);
     }
 }
 
@@ -87,7 +87,7 @@ fn finish_stream(
     now: Now,
 ) {
     close_write(swarm, peer, conn, stream, now);
-    shared.release_stream(peer, stream);
+    shared.release_stream(conn, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +253,7 @@ impl Prober {
             || (flight.stage == ExchangeStage::WaitPeerReady
                 && !acquire::can_become_ready(peer, swarm, shared, now));
         if lost {
-            self.lose_flight(peer, shared, now);
+            self.lose_flight(shared, now);
         }
     }
 
@@ -272,17 +272,17 @@ impl Prober {
             .as_ref()
             .is_some_and(|f| f.server.peer_id() == peer && f.stage.is_on(old))
         {
-            self.lose_flight(peer, shared, now);
+            self.lose_flight(shared, now);
         }
     }
 
     /// The flight's connection is gone. Releasing local bookkeeping is
     /// sufficient: there is no stream left to reset.
-    fn lose_flight(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
+    fn lose_flight(&mut self, shared: &mut Shared, now: Now) {
         if let Some(flight) = self.flight.take()
-            && let Some((_, stream)) = flight.stage.stream()
+            && let Some((conn, stream)) = flight.stage.stream()
         {
-            shared.release_stream(peer, stream);
+            shared.release_stream(conn, stream);
         }
         self.server_idx += 1;
         self.next_probe_at = Some(now.mono_ms + shared.config.probe_interval_unsettled_ms);
@@ -770,9 +770,9 @@ impl ReservationManager {
                         || (*stage == ExchangeStage::WaitPeerReady
                             && !acquire::can_become_ready(peer, swarm, shared, now))) =>
             {
-                if let Some((_, stream)) = stage.stream() {
+                if let Some((conn, stream)) = stage.stream() {
                     // The connection is terminal; nothing to reset.
-                    shared.release_stream(peer, stream);
+                    shared.release_stream(conn, stream);
                 }
                 self.emit_held_lost(shared);
                 self.back_off(shared, now);
@@ -806,10 +806,10 @@ impl ReservationManager {
             ResState::Acquiring { relay, stage, .. }
                 if relay.peer_id() == peer && stage.is_on(old) =>
             {
-                if let Some((_, stream)) = stage.stream() {
+                if let Some((conn, stream)) = stage.stream() {
                     // The stream lived on the retired connection: release
                     // it without a reset.
-                    shared.release_stream(peer, stream);
+                    shared.release_stream(conn, stream);
                 }
                 relay.clone()
             }

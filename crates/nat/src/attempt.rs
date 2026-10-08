@@ -475,7 +475,7 @@ impl ConnectAttempt {
             {
                 // The owning connection is terminal: release local state
                 // without a reset.
-                shared.release_stream(peer, stream);
+                shared.release_stream(conn, stream);
                 self.leg = RelayLeg::Failed;
                 self.fail_relay_leg(
                     NatError::DialFailed("relay connection closed".into()),
@@ -993,7 +993,7 @@ impl ConnectAttempt {
             && let Some(relay_peer) = self.relay_peer().cloned()
         {
             self.bridge_released = true;
-            shared.release_stream(&relay_peer, stream);
+            shared.release_stream(inner_conn, stream);
             let token = shared.alloc_token(TokenPurpose::PromoteAttempt(self.id));
             self.promotion_requested = true;
             shared.push_action(NatAction::PromoteBridge {
@@ -1057,11 +1057,10 @@ impl ConnectAttempt {
             return;
         }
         self.bridge_alive = false;
-        if let RelayLeg::Bridged { stream, .. } = self.leg
+        if let RelayLeg::Bridged { conn, stream } = self.leg
             && !self.bridge_released
-            && let Some(relay_peer) = self.relay_peer().cloned()
         {
-            shared.release_stream(&relay_peer, stream);
+            shared.release_stream(conn, stream);
             self.bridge_released = true;
         }
         let error = NatError::DialFailed("relay bridge lost before the attempt settled".into());
@@ -1136,10 +1135,8 @@ impl ConnectAttempt {
             self.untried.retain(|relay| relay.peer_id() != &relay_peer);
         }
         match self.leg {
-            RelayLeg::WaitHopReady { stream, .. } | RelayLeg::AwaitHopStatus { stream, .. } => {
-                if let Some(relay_peer) = self.relay_peer().cloned() {
-                    shared.reset_owned_stream(swarm, &relay_peer, stream, now);
-                }
+            RelayLeg::WaitHopReady { conn, stream } | RelayLeg::AwaitHopStatus { conn, stream } => {
+                shared.reset_owned_stream(swarm, conn, stream, now);
             }
             _ => {}
         }
@@ -1179,17 +1176,15 @@ impl ConnectAttempt {
         shared.abort_attempt_dials(self.id);
         self.teardown_dcutr_stream(swarm, shared, now);
         match self.leg {
-            RelayLeg::WaitHopReady { stream, .. } | RelayLeg::AwaitHopStatus { stream, .. } => {
-                if let Some(relay_peer) = self.relay_peer().cloned() {
-                    shared.reset_owned_stream(swarm, &relay_peer, stream, now);
-                }
+            RelayLeg::WaitHopReady { conn, stream } | RelayLeg::AwaitHopStatus { conn, stream } => {
+                shared.reset_owned_stream(swarm, conn, stream, now);
             }
             RelayLeg::Bridged { conn, stream } => {
                 if let Some(relay_peer) = self.relay_peer().cloned() {
                     if !self.bridge_released && self.bridge_alive {
                         reset(swarm, &relay_peer, conn, stream, now);
                     }
-                    shared.release_stream(&relay_peer, stream);
+                    shared.release_stream(conn, stream);
                 }
             }
             _ => {}
@@ -1205,8 +1200,8 @@ impl ConnectAttempt {
     }
 
     fn teardown_dcutr_stream(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
-        if let Some((_, stream_id)) = self.dcutr_stream.take() {
-            shared.reset_owned_stream(swarm, &self.peer, stream_id, now);
+        if let Some((conn, stream)) = self.dcutr_stream.take() {
+            shared.reset_owned_stream(swarm, conn, stream, now);
         }
         self.dcutr = None;
     }

@@ -486,6 +486,87 @@ fn hop_work_started_on_a_replacement_survives_the_replacement_event() {
 }
 
 #[test]
+fn a_stream_id_reused_on_a_replacement_belongs_to_its_own_attempt() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (old, new) = (ConnectionId::new(1), ConnectionId::new(2));
+    let relay = h.relay.clone();
+    h.relay_session_ready(at(0));
+    let first = h.start(RELAY_NOW, at(1));
+    let stream = opened_stream(&drain_actions(&mut h.agent));
+
+    // The swarm is ahead: `old` was already replaced by a ready `new`, whose
+    // first stream reuses the id the first attempt holds on `old`.
+    h.agent
+        .swarm
+        .make_ready(&relay, new, &[HOP_PROTOCOL_ID.into()]);
+    h.agent.swarm.next_stream_id = Some(stream);
+    h.start_peer(peer(b"second-target"), RELAY_NOW, at(2));
+    let actions = drain_actions(&mut h.agent);
+    assert!(matches!(
+        actions.as_slice(),
+        [Out::OpenStream { opened: Some((conn, s)), .. }] if *conn == new && *s == stream
+    ));
+
+    // Ending the first attempt resets its stream on `old` only.
+    h.agent.cancel(first, at(3));
+    let actions = drain_actions(&mut h.agent);
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Out::ResetStream { conn, .. } if *conn == new)),
+        "the second attempt's stream must survive: {actions:?}"
+    );
+    h.agent.deliver_late(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: relay.clone(),
+            old,
+            new,
+        },
+        false,
+        at(4),
+    );
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: new,
+            peer_id: relay,
+            stream_id: stream,
+            protocol_id: HOP_PROTOCOL_ID.into(),
+            initiated_locally: true,
+        },
+        false,
+        at(5),
+    );
+    assert!(matches!(
+        drain_actions(&mut h.agent).as_slice(),
+        [Out::SendStream { conn, stream_id, .. }] if *conn == new && *stream_id == stream
+    ));
+}
+
+#[test]
+fn a_stale_buffered_establishment_keeps_a_newer_relay_dial_gate() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    h.start(RELAY_NOW, at(0));
+    assert_eq!(dial_count_for(&drain_actions(&mut h.agent), &h.relay), 1);
+
+    // An establishment the swarm has since closed again is delivered late:
+    // the relay is not connected, and the dial above is still in flight.
+    h.agent.deliver_late(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: ConnectionId::new(7),
+            peer_id: h.relay.clone(),
+        },
+        false,
+        at(1),
+    );
+    h.start_peer(peer(b"second-target"), RELAY_NOW, at(2));
+    assert_eq!(
+        dial_count_for(&drain_actions(&mut h.agent), &h.relay),
+        0,
+        "the second attempt waits on the dial in flight"
+    );
+}
+
+#[test]
 fn bridge_close_before_dcutr_finishes_waits_for_live_direct_dials() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (id, stream) = drive_to_bridged(&mut h, 0);

@@ -594,6 +594,9 @@ pub struct FakeSwarm {
     pub refuse_dials: Option<String>,
     /// Refuse every stream open with this reason.
     pub refuse_opens: Option<String>,
+    /// The id the next stream open returns, as a transport that numbers
+    /// streams per connection reuses ids across connections.
+    pub next_stream_id: Option<StreamId>,
 }
 
 impl FakeSwarm {
@@ -689,7 +692,11 @@ impl NatSwarm for FakeSwarm {
         let opened = match (&self.refuse_opens, self.connections.get(peer)) {
             (None, Some(conn)) => {
                 self.next_stream += 1;
-                Some((*conn, StreamId::new(1_000 + self.next_stream)))
+                let stream = self
+                    .next_stream_id
+                    .take()
+                    .unwrap_or(StreamId::new(1_000 + self.next_stream));
+                Some((*conn, stream))
             }
             _ => None,
         };

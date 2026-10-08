@@ -254,7 +254,7 @@ impl InboundCircuit {
             return;
         }
         self.released = true;
-        shared.release_stream(&self.relay, self.stream);
+        shared.release_stream(self.inner_conn, self.stream);
         if let Some(source) = &self.source {
             let token = shared.alloc_token(TokenPurpose::PromoteInbound(self.id));
             shared.push_action(NatAction::PromoteBridge {
@@ -425,7 +425,7 @@ impl InboundCircuit {
             if reset_stream {
                 reset(swarm, &self.relay, self.inner_conn, self.stream, now);
             }
-            shared.release_stream(&self.relay, self.stream);
+            shared.release_stream(self.inner_conn, self.stream);
         }
         self.done = true;
     }
@@ -585,11 +585,8 @@ impl InboundCircuit {
     fn finish_dcutr(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         self.dcutr = None;
         self.dcutr_deadline = None;
-        let Some((_, stream_id)) = self.dcutr_stream.take() else {
-            return;
-        };
-        if let Some(peer) = self.source.as_ref() {
-            shared.reset_owned_stream(swarm, peer, stream_id, now);
+        if let Some((conn, stream)) = self.dcutr_stream.take() {
+            shared.reset_owned_stream(swarm, conn, stream, now);
         }
     }
 }

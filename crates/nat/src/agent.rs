@@ -106,17 +106,14 @@ pub(crate) struct Shared {
     pub(crate) config: NatConfig,
     pub(crate) actions: VecDeque<NatAction>,
     pub(crate) events: VecDeque<NatEvent>,
-    /// Streams the agent currently owns, per peer. Peer-scoped because
-    /// the driver's ownership query names streams by peer and id.
-    pub(crate) registry: BTreeMap<PeerId, BTreeMap<StreamId, StreamRole>>,
+    /// Streams the agent currently owns, by exact identity (stream ids are
+    /// only unique per connection), with their peer and role.
+    streams: BTreeMap<(ConnectionId, StreamId), (PeerId, StreamRole)>,
     /// Parked dials and bridge promotions awaiting their host result.
     pub(crate) tokens: BTreeMap<NatToken, TokenPurpose>,
     next_token: u64,
     /// Path origin of each established connection that carries one.
     pub(crate) origins: BTreeMap<ConnectionId, Origin>,
-    /// Exact connection of every agent-owned stream, recorded when the
-    /// stream is opened or claimed.
-    stream_connections: BTreeMap<(PeerId, StreamId), ConnectionId>,
     /// Our validated external/listen addresses, advertised in DCUtR CONNECT.
     pub(crate) listen_addrs: Vec<Multiaddr>,
     /// Our transport address as observed by trusted reporters (Identify's
@@ -273,12 +270,7 @@ impl Shared {
         stream: StreamId,
         role: StreamRole,
     ) {
-        self.registry
-            .entry(peer.clone())
-            .or_default()
-            .insert(stream, role);
-        self.stream_connections
-            .insert((peer.clone(), stream), conn_id);
+        self.streams.insert((conn_id, stream), (peer.clone(), role));
     }
 
     /// Resets and releases a stream the agent still owns. A stream already
@@ -286,55 +278,29 @@ impl Shared {
     pub(crate) fn reset_owned_stream(
         &mut self,
         swarm: &mut dyn NatSwarm,
-        peer: &PeerId,
+        conn_id: ConnectionId,
         stream: StreamId,
         now: Now,
     ) {
-        if let Some(conn_id) = self.stream_connection(peer, stream)
-            && self
-                .registry
-                .get(peer)
-                .is_some_and(|streams| streams.contains_key(&stream))
-        {
-            reset(swarm, peer, conn_id, stream, now);
-            self.release_stream(peer, stream);
+        if let Some((peer, _)) = self.streams.remove(&(conn_id, stream)) {
+            reset(swarm, &peer, conn_id, stream, now);
         }
     }
 
     /// Releases `stream` back to the application (or forgets it entirely).
-    pub(crate) fn release_stream(&mut self, peer: &PeerId, stream: StreamId) {
-        if let Some(streams) = self.registry.get_mut(peer) {
-            streams.remove(&stream);
-            if streams.is_empty() {
-                self.registry.remove(peer);
-            }
-        }
-        self.stream_connections.remove(&(peer.clone(), stream));
+    pub(crate) fn release_stream(&mut self, conn_id: ConnectionId, stream: StreamId) {
+        self.streams.remove(&(conn_id, stream));
     }
 
-    pub(crate) fn bind_stream(
-        &mut self,
-        peer: &PeerId,
-        stream: StreamId,
-        conn_id: ConnectionId,
-    ) -> bool {
-        match self.stream_connections.entry((peer.clone(), stream)) {
-            alloc::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(conn_id);
-                true
-            }
-            alloc::collections::btree_map::Entry::Occupied(entry) => *entry.get() == conn_id,
-        }
-    }
-
-    pub(crate) fn stream_connection(
+    /// The role of an agent-owned stream of `peer` on exactly `conn_id`.
+    fn owned_role(
         &self,
+        conn_id: ConnectionId,
         peer: &PeerId,
         stream: StreamId,
-    ) -> Option<ConnectionId> {
-        self.stream_connections
-            .get(&(peer.clone(), stream))
-            .copied()
+    ) -> Option<StreamRole> {
+        let (owner, role) = self.streams.get(&(conn_id, stream))?;
+        (owner == peer).then_some(*role)
     }
 
     /// Records `reporter`'s Identify claim of our transport address.
@@ -501,11 +467,10 @@ impl NatAgent {
                 config,
                 actions: VecDeque::new(),
                 events: VecDeque::new(),
-                registry: BTreeMap::new(),
+                streams: BTreeMap::new(),
                 tokens: BTreeMap::new(),
                 next_token: 0,
                 origins: BTreeMap::new(),
-                stream_connections: BTreeMap::new(),
                 listen_addrs: Vec::new(),
                 observed_addrs: BTreeMap::new(),
                 pending_session_dials: BTreeMap::new(),
@@ -675,13 +640,6 @@ impl NatAgent {
                             | AUTONAT_PROTOCOL_ID
                     )
                 {
-                    if !self.shared.bind_stream(peer_id, *stream_id, *conn_id) {
-                        // An old connection still owns this peer-scoped id.
-                        // Reject the colliding replacement stream without
-                        // overwriting the old stream's exact provenance.
-                        reset(swarm, peer_id, *conn_id, *stream_id, now);
-                        return true;
-                    }
                     let trusted_stop = protocol_id == STOP_PROTOCOL_ID
                         && self
                             .shared
@@ -746,9 +704,7 @@ impl NatAgent {
                         );
                         handled = true;
                     }
-                } else if self.owns_stream(peer_id, *stream_id)
-                    && self.shared.bind_stream(peer_id, *stream_id, *conn_id)
-                {
+                } else {
                     handled = self.route_stream(
                         *conn_id,
                         peer_id,
@@ -801,7 +757,11 @@ impl NatAgent {
             } => {
                 // Every NAT control stream has to write, so a stopped one is
                 // reset; its `StreamClosed` then retires the owning machine.
-                if self.owned_role(*conn_id, peer_id, *stream_id).is_some() {
+                if self
+                    .shared
+                    .owned_role(*conn_id, peer_id, *stream_id)
+                    .is_some()
+                {
                     handled = true;
                     reset(swarm, peer_id, *conn_id, *stream_id, now);
                 }
@@ -821,7 +781,7 @@ impl NatAgent {
                     now,
                 );
                 if handled {
-                    self.shared.release_stream(peer_id, *stream_id);
+                    self.shared.release_stream(*conn_id, *stream_id);
                 }
                 touched_state = handled;
             }
@@ -1021,14 +981,14 @@ impl NatAgent {
             .map(|due| due.saturating_sub(now_ms))
     }
 
-    /// Returns `true` if `stream_id` on `peer`'s connection currently
-    /// belongs to the agent. The driver uses this to decide whether to
-    /// consume or forward a stream event.
+    /// Returns `true` if `stream_id` on one of `peer`'s connections
+    /// currently belongs to the agent. Stream events are routed on their
+    /// exact connection; this is a query for drivers and tests.
     pub fn owns_stream(&self, peer: &PeerId, stream_id: StreamId) -> bool {
         self.shared
-            .registry
-            .get(peer)
-            .is_some_and(|streams| streams.contains_key(&stream_id))
+            .streams
+            .iter()
+            .any(|((_, stream), (owner, _))| *stream == stream_id && owner == peer)
     }
 
     /// Our current reachability verdict: majority-of-N confidence over the
@@ -1063,13 +1023,19 @@ impl NatAgent {
         swarm: &mut dyn NatSwarm,
         now: Now,
     ) {
-        self.shared.dialed.remove(&conn_id);
-        // Any session dial toward this peer has done its job (ours landed, or
-        // another machine's did — either way the peer is reachable now and
-        // further dials would replace this connection).
-        self.shared
-            .pending_session_dials
-            .retain(|_, (dialed, _)| dialed != peer);
+        // The dial that made this connection is done.
+        if let Some((token, _)) = self.shared.dialed.remove(&conn_id) {
+            self.shared.pending_session_dials.remove(&token);
+        }
+        // While the peer is still connected, every other session dial toward
+        // it has done its job too: further dials would replace the
+        // connection. A buffered establishment the swarm has already closed
+        // again leaves newer dials, started after that close, in flight.
+        if swarm.connection(peer).is_some() {
+            self.shared
+                .pending_session_dials
+                .retain(|_, (dialed, _)| dialed != peer);
+        }
         for attempt in self.attempts.values_mut() {
             attempt.on_connection_established(
                 peer,
@@ -1099,16 +1065,7 @@ impl NatAgent {
         self.shared.dialed.remove(&conn_id);
         self.shared.origins.remove(&conn_id);
         self.shared.observed_addrs.remove(peer);
-        let closed_streams: Vec<_> = self
-            .shared
-            .stream_connections
-            .iter()
-            .filter(|(_, owner)| **owner == conn_id)
-            .map(|((peer, stream), _)| (peer.clone(), *stream))
-            .collect();
-        for (peer, stream) in closed_streams {
-            self.shared.release_stream(&peer, stream);
-        }
+        self.shared.streams.retain(|(conn, _), _| *conn != conn_id);
     }
 
     /// Lets every attempt and inbound circuit end what it bound to `conn_id`.
@@ -1184,17 +1141,6 @@ impl NatAgent {
         });
     }
 
-    /// The role of an agent-owned stream on exactly this connection.
-    fn owned_role(
-        &self,
-        conn_id: ConnectionId,
-        peer: &PeerId,
-        stream: StreamId,
-    ) -> Option<StreamRole> {
-        let role = self.shared.registry.get(peer)?.get(&stream).copied()?;
-        (self.shared.stream_connection(peer, stream) == Some(conn_id)).then_some(role)
-    }
-
     fn route_stream(
         &mut self,
         conn_id: ConnectionId,
@@ -1205,7 +1151,7 @@ impl NatAgent {
         now: Now,
     ) -> bool {
         // Guardrail: streams we don't own are none of our business.
-        let Some(role) = self.owned_role(conn_id, peer, stream) else {
+        let Some(role) = self.shared.owned_role(conn_id, peer, stream) else {
             return false;
         };
         match role {
