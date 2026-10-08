@@ -55,8 +55,8 @@ pub enum DriverError {
         "run_until skipped {limit} events without a match; drain the event buffer with poll_next"
     )]
     EventBacklogExceeded { limit: usize },
-    /// The operating system's entropy source failed.
-    #[error("system entropy source failed")]
+    /// The injected [`EntropySource`] failed to supply bytes.
+    #[error("entropy source failed")]
     Entropy,
 }
 

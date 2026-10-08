@@ -641,10 +641,12 @@ mod tests {
     }
 
     /// Deterministic transport that surfaces two connections to the same
-    /// peer on consecutive polls and records when the driver closes one.
+    /// peer on consecutive polls and records which connections the driver
+    /// opens streams on and closes.
     struct ReplacementTransport {
         event_batches: VecDeque<Vec<TransportEvent>>,
         next_stream: u64,
+        open_calls: Vec<ConnectionId>,
         close_calls: Vec<ConnectionId>,
     }
 
@@ -663,6 +665,7 @@ mod tests {
                     }],
                 ]),
                 next_stream: 1,
+                open_calls: Vec::new(),
                 close_calls: Vec::new(),
             }
         }
@@ -679,7 +682,8 @@ mod tests {
             })
         }
 
-        fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
+        fn open_stream(&mut self, conn_id: ConnectionId) -> Result<StreamId, TransportError> {
+            self.open_calls.push(conn_id);
             let stream_id = StreamId::new(self.next_stream);
             self.next_stream += 1;
             Ok(stream_id)
@@ -1142,7 +1146,13 @@ mod tests {
 
         // A synchronous command between deliveries runs its own work, but
         // the close still waits for the rest of the buffer.
+        let opens_before = swarm.core().transport().open_calls.len();
         swarm.ping(&remote_peer).expect("ping the replacement");
+        assert_eq!(
+            swarm.core().transport().open_calls[opens_before..],
+            [replacement],
+            "the ping opens its stream on the replacement without waiting",
+        );
         assert!(swarm.core().transport().close_calls.is_empty());
 
         let established = swarm
