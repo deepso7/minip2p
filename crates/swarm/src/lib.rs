@@ -1,31 +1,24 @@
 //! Connection and protocol orchestration for minip2p.
 //!
-//! This crate provides three layers:
+//! This crate provides two layers:
 //!
-//! - [`SwarmCore`] -- pure Sans-I/O state machine. `no_std + alloc`
-//!   compatible. Callers feed it [`SwarmInput`] values through
-//!   [`SwarmCore::handle_input`], then drain [`SwarmOutput`] values through
-//!   [`SwarmCore::poll_output`] until [`SwarmCore::is_idle`] returns true.
-//!   Outputs wrap [`SwarmAction`]s for a driver to execute and [`SwarmEvent`]s
-//!   for the application to observe. No sockets, no async runtime, no clock
-//!   reads.
-//!
-//! - [`SwarmRuntime`] -- `no_std + alloc` action pump. It owns a concrete
-//!   [`Transport`](minip2p_transport::Transport) and shuttles events and
-//!   actions between it and the core, but reads no clock and draws no
+//! - [`SwarmCore`] -- the swarm itself. `no_std + alloc`. It owns a concrete
+//!   [`Transport`](minip2p_transport::Transport) and runs Identify, ping, and
+//!   user-protocol negotiation over it, but reads no clock and draws no
 //!   randomness: the caller passes a [`Now`] sample into
-//!   [`SwarmRuntime::poll`] and injects an
+//!   [`SwarmCore::poll`] and every timed command, and injects an
 //!   [`EntropySource`]. It reports its next timer through
-//!   [`SwarmRuntime::next_deadline`] so a host can idle instead of spinning.
+//!   [`SwarmCore::next_deadline`] so a host can idle instead of spinning.
 //!
 //! - `Swarm` -- `std` wrapper adding a monotonic clock and blocking drive
-//!   loops (`poll_next`, `run_until`) on top of the runtime, preserving the
-//!   one-call DX (`swarm.dial(addr)`, `swarm.ping(peer)`,
-//!   `swarm.open_stream`) without threading `now_ms` through every call.
+//!   loops (`poll_next`, `run_until`) on top of the core, preserving the
+//!   one-call DX (`swarm.ping(peer)`, `swarm.open_stream`) without threading
+//!   `now_ms` through every call. Everything that needs no clock is on
+//!   `swarm.core()` / `swarm.core_mut()`.
 //!
 //! Most `std` applications want `Swarm` and the [`SwarmBuilder`] convenience
 //! constructor. Hosts with no thread to block -- embedded boards,
-//! single-threaded event loops -- drive [`SwarmRuntime`] directly.
+//! single-threaded event loops -- drive [`SwarmCore`] directly.
 //!
 //! Protocols baked into the core:
 //! - `/ipfs/ping/1.0.0` (ping RTT measurement)
@@ -39,19 +32,16 @@ extern crate alloc;
 mod core;
 mod events;
 mod held;
-mod runtime;
+mod state;
 
 mod builder;
 #[cfg(feature = "std")]
 mod driver;
 
-pub use crate::core::{RESERVED_PROTOCOL_IDS, SIMULTANEOUS_DIAL_WINDOW_MS, SwarmCore};
-pub use crate::events::{
-    OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
-    SwarmRuntimeError,
-};
+pub use crate::core::{DriverError, SwarmCore};
+pub use crate::events::{SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
 pub use crate::held::{HeldStream, HeldWrites};
-pub use crate::runtime::{DriverError, SwarmRuntime};
+pub use crate::state::{RESERVED_PROTOCOL_IDS, SIMULTANEOUS_DIAL_WINDOW_MS};
 // Part of `SwarmEvent::IdentifyReceived`'s public shape; re-exported so
 // consumers can name the type without depending on `minip2p-identify`.
 pub use minip2p_identify::IdentifyMessage;

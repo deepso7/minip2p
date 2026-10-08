@@ -981,7 +981,8 @@ impl NatAgent {
     }
 
     /// Milliseconds until the earliest pending deadline, if any. Drivers
-    /// fold this into their poll budget, mirroring `SwarmCore::next_timeout`.
+    /// fold this into their poll budget, as `SwarmCore::next_deadline` folds
+    /// the swarm's protocol timers.
     pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
         self.attempts
             .values()

@@ -1,21 +1,20 @@
-//! Std driver that owns a [`Transport`] and drives [`SwarmCore`].
+//! Std [`Swarm`]: a [`SwarmCore`] plus a clock and blocking drive loops.
 //!
-//! This is the DX-friendly entrypoint for applications: it tracks wall
-//! time internally, auto-allocates connection ids, and translates between
-//! the Sans-I/O core's actions and concrete transport calls.
+//! This is the DX-friendly entrypoint for applications: it samples time
+//! itself, so callers need not thread `now_ms` through every call, and it can
+//! idle the calling thread between polls.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
-use minip2p_identify::{IdentifyConfig, IdentifyMessage};
+use minip2p_core::{Bytes, PeerId};
+use minip2p_identify::IdentifyConfig;
 use minip2p_ping::PingConfig;
 use minip2p_platform::{Clock, Now, StdClock, StdEntropy};
 use minip2p_transport::{BlockingTransport, ConnectionId, StreamId, Transport, WaitOutcome};
 
-use crate::core::SwarmCore;
+use crate::core::{DriverError, SwarmCore};
 use crate::events::SwarmEvent;
-use crate::runtime::{DriverError, SwarmRuntime};
 
 /// Fallback sleep cadence when [`Swarm::poll_next`] idles over a transport
 /// that cannot wait for socket readiness ([`WaitOutcome::Unsupported`]).
@@ -177,16 +176,18 @@ pub enum PollNext {
     Interrupted,
 }
 
-/// Std driver: a [`SwarmRuntime`] plus a clock and blocking drive loops.
+/// Std driver: a [`SwarmCore`] plus a clock and blocking drive loops.
 ///
 /// This is the DX-friendly entrypoint for applications. It samples the clock
-/// itself, so callers need not thread `now_ms` through every call, and it can
-/// idle the calling thread between polls.
+/// itself for the commands that take time, and it can idle the calling thread
+/// between polls. Everything that needs no clock -- listening, dialing,
+/// protocol registration, peer and connection queries -- is on
+/// [`core`](Self::core) / [`core_mut`](Self::core_mut).
 ///
 /// Hosts without a thread to block -- embedded boards, single-threaded event
-/// loops -- should drive [`SwarmRuntime`] directly instead.
+/// loops -- should drive [`SwarmCore`] directly instead.
 pub struct Swarm<T: Transport> {
-    runtime: SwarmRuntime<T, StdEntropy>,
+    core: SwarmCore<T, StdEntropy>,
     /// Logical clock used to drive Sans-I/O timers.
     clock: Box<dyn Clock + Send + Sync>,
 }
@@ -222,7 +223,7 @@ impl<T: Transport> Swarm<T> {
         clock: Box<dyn Clock + Send + Sync>,
     ) -> Self {
         Self {
-            runtime: SwarmRuntime::new(
+            core: SwarmCore::new(
                 transport,
                 identify_config,
                 ping_config,
@@ -233,14 +234,19 @@ impl<T: Transport> Swarm<T> {
         }
     }
 
-    /// Returns the portable runtime this driver wraps.
-    pub fn runtime(&self) -> &SwarmRuntime<T, StdEntropy> {
-        &self.runtime
+    /// Returns the swarm this driver wraps.
+    pub fn core(&self) -> &SwarmCore<T, StdEntropy> {
+        &self.core
     }
 
-    /// Returns the portable runtime this driver wraps.
-    pub fn runtime_mut(&mut self) -> &mut SwarmRuntime<T, StdEntropy> {
-        &mut self.runtime
+    /// Returns the swarm this driver wraps, mutably.
+    ///
+    /// Commands called through it take the caller's time sample; sample
+    /// [`Swarm::now`] first and pass its `monotonic_ms`, so they share this
+    /// driver's timeline. The clock-taking
+    /// commands on `Swarm` itself sample it for you.
+    pub fn core_mut(&mut self) -> &mut SwarmCore<T, StdEntropy> {
+        &mut self.core
     }
 
     /// Samples this swarm's clock.
@@ -252,169 +258,33 @@ impl<T: Transport> Swarm<T> {
         self.clock.now()
     }
 
-    fn sample_now(&mut self) -> Now {
-        self.now()
-    }
-
     fn now_ms(&mut self) -> u64 {
-        self.sample_now().monotonic_ms
+        self.now().monotonic_ms
     }
 
-    // --- clock-free delegations ------------------------------------------
-
-    /// See [`SwarmRuntime::set_external_addresses`].
-    pub fn set_external_addresses(&mut self, addrs: Vec<Multiaddr>) {
-        self.runtime.set_external_addresses(addrs);
-    }
-
-    /// See [`SwarmRuntime::external_addresses`].
-    pub fn external_addresses(&self) -> &[Multiaddr] {
-        self.runtime.external_addresses()
-    }
-
-    /// See [`SwarmRuntime::external_addresses_revision`].
-    pub fn external_addresses_revision(&self) -> u64 {
-        self.runtime.external_addresses_revision()
-    }
-
-    /// See [`SwarmRuntime::transport`].
-    pub fn transport(&self) -> &T {
-        self.runtime.transport()
-    }
-
-    /// See [`SwarmRuntime::transport_mut`].
-    pub fn transport_mut(&mut self) -> &mut T {
-        self.runtime.transport_mut()
-    }
-
-    /// See [`SwarmRuntime::core`].
-    pub fn core(&self) -> &SwarmCore {
-        self.runtime.core()
-    }
-
-    pub(crate) fn core_mut(&mut self) -> &mut SwarmCore {
-        self.runtime.core_mut()
-    }
-
-    /// See [`SwarmRuntime::connected_peers`].
-    pub fn connected_peers(&self) -> Vec<PeerId> {
-        self.runtime.connected_peers()
-    }
-
-    /// See [`SwarmRuntime::peer_info`].
-    pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
-        self.runtime.peer_info(peer_id)
-    }
-
-    /// See [`SwarmRuntime::is_peer_ready`].
-    pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
-        self.runtime.is_peer_ready(peer_id)
-    }
-
-    /// See [`SwarmRuntime::peer_readiness`].
-    pub fn peer_readiness(&self, peer_id: &PeerId) -> Option<(ConnectionId, &IdentifyMessage)> {
-        self.runtime.peer_readiness(peer_id)
-    }
-
-    /// See [`SwarmRuntime::local_peer_id`].
-    pub fn local_peer_id(&self) -> &PeerId {
-        self.runtime.local_peer_id()
-    }
-
-    /// See [`SwarmRuntime::add_protocol`].
-    pub fn add_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), DriverError> {
-        self.runtime.add_protocol(protocol_id)
-    }
-
-    /// Registers a protocol only for inbound negotiation by a composed service.
-    pub fn add_inbound_protocol(
-        &mut self,
-        protocol_id: impl Into<String>,
-    ) -> Result<(), DriverError> {
-        self.runtime.add_inbound_protocol(protocol_id)
-    }
-
-    /// Registers a protocol only for outbound opens by a composed service.
-    pub fn add_outbound_protocol(
-        &mut self,
-        protocol_id: impl Into<String>,
-    ) -> Result<(), DriverError> {
-        self.runtime.add_outbound_protocol(protocol_id)
-    }
-
-    /// Adds a protocol only to future Identify responses.
-    pub fn add_advertised_protocol(
-        &mut self,
-        protocol_id: impl Into<String>,
-    ) -> Result<(), DriverError> {
-        self.runtime.add_advertised_protocol(protocol_id)
-    }
-
-    /// Returns the remote transport address recorded for an exact connection.
-    pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
-        self.runtime.connection_remote_addr(conn_id)
-    }
-
-    /// Returns the active transport connection selected for `peer_id`.
-    pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
-        self.runtime.connection_id(peer_id)
-    }
-
-    /// See [`SwarmRuntime::listen`].
-    pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, DriverError> {
-        self.runtime.listen(addr)
-    }
-
-    /// See [`SwarmRuntime::listen_on_bound_addrs`].
-    pub fn listen_on_bound_addrs(&mut self) -> Result<Vec<PeerAddr>, DriverError> {
-        self.runtime.listen_on_bound_addrs()
-    }
-
-    /// See [`SwarmRuntime::listen_on_bound_addr`].
-    pub fn listen_on_bound_addr(&mut self) -> Result<PeerAddr, DriverError> {
-        self.runtime.listen_on_bound_addr()
-    }
-
-    /// See [`SwarmRuntime::dial`].
-    pub fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, DriverError> {
-        self.runtime.dial(addr)
-    }
-
-    /// See [`SwarmRuntime::abort_dial`].
-    pub fn abort_dial(&mut self, conn_id: ConnectionId) -> Result<bool, DriverError> {
-        self.runtime.abort_dial(conn_id)
-    }
-
-    /// See [`SwarmRuntime::forget_stream`].
-    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) -> VecDeque<Bytes> {
-        self.runtime.forget_stream(conn_id, stream_id)
-    }
-
-    // --- delegations that supply the clock sample -------------------------
-
-    /// See [`SwarmRuntime::ping`].
+    /// See [`SwarmCore::ping`].
     pub fn ping(&mut self, peer_id: &PeerId) -> Result<(), DriverError> {
         let now_ms = self.now_ms();
-        self.runtime.ping(peer_id, now_ms)
+        self.core.ping(peer_id, now_ms)
     }
 
-    /// See [`SwarmRuntime::disconnect`].
+    /// See [`SwarmCore::disconnect`].
     pub fn disconnect(&mut self, peer_id: &PeerId) -> Result<(), DriverError> {
         let now_ms = self.now_ms();
-        self.runtime.disconnect(peer_id, now_ms)
+        self.core.disconnect(peer_id, now_ms)
     }
 
-    /// See [`SwarmRuntime::open_stream`].
+    /// See [`SwarmCore::open_stream`].
     pub fn open_stream(
         &mut self,
         peer_id: &PeerId,
         protocol_id: &str,
     ) -> Result<(ConnectionId, StreamId), DriverError> {
         let now_ms = self.now_ms();
-        self.runtime.open_stream(peer_id, protocol_id, now_ms)
+        self.core.open_stream(peer_id, protocol_id, now_ms)
     }
 
-    /// See [`SwarmRuntime::send_stream`].
+    /// See [`SwarmCore::send_stream`].
     pub fn send_stream(
         &mut self,
         peer_id: &PeerId,
@@ -423,11 +293,11 @@ impl<T: Transport> Swarm<T> {
         data: Bytes,
     ) -> Result<(), DriverError> {
         let now_ms = self.now_ms();
-        self.runtime
+        self.core
             .send_stream(peer_id, conn_id, stream_id, data, now_ms)
     }
 
-    /// See [`SwarmRuntime::close_stream_write`].
+    /// See [`SwarmCore::close_stream_write`].
     pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
@@ -435,11 +305,11 @@ impl<T: Transport> Swarm<T> {
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
         let now_ms = self.now_ms();
-        self.runtime
+        self.core
             .close_stream_write(peer_id, conn_id, stream_id, now_ms)
     }
 
-    /// See [`SwarmRuntime::reset_stream`].
+    /// See [`SwarmCore::reset_stream`].
     pub fn reset_stream(
         &mut self,
         peer_id: &PeerId,
@@ -447,11 +317,10 @@ impl<T: Transport> Swarm<T> {
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
         let now_ms = self.now_ms();
-        self.runtime
-            .reset_stream(peer_id, conn_id, stream_id, now_ms)
+        self.core.reset_stream(peer_id, conn_id, stream_id, now_ms)
     }
 
-    /// See [`SwarmRuntime::abandon_stream`].
+    /// See [`SwarmCore::abandon_stream`].
     pub fn abandon_stream(
         &mut self,
         peer_id: &PeerId,
@@ -459,16 +328,17 @@ impl<T: Transport> Swarm<T> {
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
         let now_ms = self.now_ms();
-        self.runtime
+        self.core
             .abandon_stream(peer_id, conn_id, stream_id, now_ms)
     }
 
     /// Drives the swarm one iteration, sampling the clock for the caller.
     ///
-    /// See [`SwarmRuntime::poll`].
+    /// Returns every queued event, including ones a blocking wait left
+    /// undelivered. See [`SwarmCore::poll`].
     pub fn poll(&mut self) -> Result<Vec<SwarmEvent>, DriverError> {
-        let now = self.sample_now();
-        self.runtime.poll(now)
+        let now = self.now();
+        self.core.poll(now)
     }
 
     /// Queues `events` ahead of anything the next [`Self::poll`] reads from
@@ -478,7 +348,7 @@ impl<T: Transport> Swarm<T> {
     /// several swarm events.
     #[doc(hidden)]
     pub fn preload_poll_events(&mut self, events: impl IntoIterator<Item = SwarmEvent>) {
-        self.runtime.event_buffer.extend(events);
+        self.core.state.events.extend(events);
     }
 }
 
@@ -514,15 +384,15 @@ impl<T: BlockingTransport> Swarm<T> {
     ) -> Result<PollNext, DriverError> {
         let deadline = deadline.into();
         loop {
-            if let Some(ev) = self.runtime.event_buffer.pop_front() {
+            if let Some(ev) = self.core.next_event() {
                 return Ok(PollNext::Event(ev));
             }
             // Always poll at least once -- even if we're already past the
             // deadline -- so a caller using a short or elapsed deadline
             // still sees any events the transport has already produced.
-            let events = self.poll()?;
-            self.runtime.event_buffer.extend(events);
-            if let Some(ev) = self.runtime.event_buffer.pop_front() {
+            let now = self.now();
+            self.core.drive(now)?;
+            if let Some(ev) = self.core.next_event() {
                 return Ok(PollNext::Event(ev));
             }
             let now = Instant::now();
@@ -534,10 +404,10 @@ impl<T: BlockingTransport> Swarm<T> {
             // timer (e.g. a ping timeout, which only fires when a Tick is
             // fed into the core by `poll()`).
             let mut budget = deadline.remaining_at(now).unwrap_or(MAX_IDLE_WAIT);
-            // The runtime folds the transport's timer together with the
-            // core's protocol timers onto one timeline.
-            let now = self.sample_now();
-            if let Some(next) = self.runtime.next_deadline(now) {
+            // The core folds the transport's timer together with its
+            // protocol timers onto one timeline.
+            let now = self.now();
+            if let Some(next) = self.core.next_deadline(now) {
                 budget = budget.min(Duration::from_millis(next.millis_until(now)));
             }
             if budget.is_zero() {
@@ -546,7 +416,7 @@ impl<T: BlockingTransport> Swarm<T> {
             // Prefer a real readiness wait so idle loops don't burn CPU on a
             // fixed cadence; fall back to a short sleep for transports that
             // can't wait.
-            match self.runtime.transport_mut().wait_for_input(budget) {
+            match self.core.transport_mut().wait_for_input(budget) {
                 WaitOutcome::Interrupted => return Ok(PollNext::Interrupted),
                 WaitOutcome::Unsupported => std::thread::sleep(budget.min(POLL_IDLE_SLEEP)),
                 WaitOutcome::Ready | WaitOutcome::TimedOut => {}
@@ -626,20 +496,18 @@ impl<T: BlockingTransport> Swarm<T> {
         // transport poll.
         if matches!(result, Ok(None)) {
             loop {
-                let Some(ev) = self.runtime.event_buffer.pop_front() else {
+                let Some(ev) = self.core.next_event() else {
                     if polled_past_deadline {
                         break;
                     }
                     polled_past_deadline = true;
-                    match self.poll() {
+                    let now = self.now();
+                    match self.core.drive(now) {
                         Err(error) => {
                             result = Err(error);
                             break;
                         }
-                        Ok(events) => {
-                            self.runtime.event_buffer.extend(events);
-                            continue;
-                        }
+                        Ok(()) => continue,
                     }
                 };
                 if predicate(&ev) {
@@ -659,7 +527,7 @@ impl<T: BlockingTransport> Swarm<T> {
         // Restore skipped events in their original order -- on a match, on
         // deadline expiry, and on error alike.
         for event in skipped.into_iter().rev() {
-            self.runtime.event_buffer.push_front(event);
+            self.core.state.events.push_front(event);
         }
         result
     }
@@ -673,6 +541,7 @@ mod tests {
     use super::*;
     use crate::events::SwarmErrorKind;
     use minip2p_core::SansIoProtocol;
+    use minip2p_core::{Multiaddr, PeerAddr};
     use minip2p_identify::IDENTIFY_PROTOCOL_ID;
     use minip2p_identity::Ed25519Keypair;
     use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
@@ -772,10 +641,12 @@ mod tests {
     }
 
     /// Deterministic transport that surfaces two connections to the same
-    /// peer on consecutive polls and records when the driver closes one.
+    /// peer on consecutive polls and records which connections the driver
+    /// opens streams on and closes.
     struct ReplacementTransport {
         event_batches: VecDeque<Vec<TransportEvent>>,
         next_stream: u64,
+        open_calls: Vec<ConnectionId>,
         close_calls: Vec<ConnectionId>,
     }
 
@@ -794,6 +665,7 @@ mod tests {
                     }],
                 ]),
                 next_stream: 1,
+                open_calls: Vec::new(),
                 close_calls: Vec::new(),
             }
         }
@@ -810,7 +682,8 @@ mod tests {
             })
         }
 
-        fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
+        fn open_stream(&mut self, conn_id: ConnectionId) -> Result<StreamId, TransportError> {
+            self.open_calls.push(conn_id);
             let stream_id = StreamId::new(self.next_stream);
             self.next_stream += 1;
             Ok(stream_id)
@@ -1000,7 +873,7 @@ mod tests {
 
         swarm.poll().expect("poll");
         assert!(
-            swarm.transport().opened_streams > 0,
+            swarm.core().transport().opened_streams > 0,
             "fixture must dispatch an action for this test to mean anything"
         );
         assert_eq!(
@@ -1015,6 +888,7 @@ mod tests {
 
         // The transport saw exactly the instants the core was ticked with.
         let samples: Vec<u64> = swarm
+            .core()
             .transport()
             .samples
             .iter()
@@ -1062,7 +936,7 @@ mod tests {
         // Without the transport's deadline the driver would have slept on the
         // caller's 30s deadline instead.
         assert_eq!(
-            swarm.transport().wait_budgets,
+            swarm.core().transport().wait_budgets,
             vec![Duration::from_millis(DEADLINE_MS)]
         );
     }
@@ -1075,18 +949,22 @@ mod tests {
             .parse()
             .unwrap();
 
-        assert_eq!(swarm.external_addresses_revision(), 0);
-        swarm.set_external_addresses(vec![external.clone(), circuit.clone()]);
-        assert_eq!(swarm.external_addresses_revision(), 1);
-        swarm.set_external_addresses(vec![external.clone(), circuit.clone()]);
-        assert_eq!(swarm.external_addresses_revision(), 2);
+        assert_eq!(swarm.core().external_addresses_revision(), 0);
+        swarm
+            .core_mut()
+            .set_external_addresses(vec![external.clone(), circuit.clone()]);
+        assert_eq!(swarm.core().external_addresses_revision(), 1);
+        swarm
+            .core_mut()
+            .set_external_addresses(vec![external.clone(), circuit.clone()]);
+        assert_eq!(swarm.core().external_addresses_revision(), 2);
         swarm.poll().unwrap();
         // IdleTransport binds nothing, so the snapshot is exactly the
         // external set.
         assert_eq!(swarm.core().local_addresses(), &[external.clone(), circuit]);
 
         // Replacing the set (here: clearing it) stops advertising extras.
-        swarm.set_external_addresses(Vec::new());
+        swarm.core_mut().set_external_addresses(Vec::new());
         swarm.poll().unwrap();
         assert!(swarm.core().local_addresses().is_empty());
     }
@@ -1175,16 +1053,17 @@ mod tests {
             keypair.peer_id(),
         );
 
-        assert_eq!(swarm.runtime().listened_addrs_revision(), 0);
+        assert_eq!(swarm.core().listened_addrs_revision(), 0);
         // The first bound address listens; the second fails — the earlier
         // bind stays live, so the revision must reflect it, and the
         // listened set must contain only the address that accepted.
         swarm
+            .core_mut()
             .listen_on_bound_addrs()
             .expect_err("second bind fails");
-        assert_eq!(swarm.runtime().listened_addrs_revision(), 1);
+        assert_eq!(swarm.core().listened_addrs_revision(), 1);
         assert_eq!(
-            swarm.runtime().listened_addrs(),
+            swarm.core().listened_addrs(),
             ["/ip4/127.0.0.1/tcp/4001".parse().unwrap()]
         );
     }
@@ -1209,14 +1088,14 @@ mod tests {
                 if *old == original && *new == replacement
         ));
         assert!(
-            swarm.transport().close_calls.is_empty(),
+            swarm.core().transport().close_calls.is_empty(),
             "the old transport must remain open until the event is returned"
         );
 
         let later = swarm.poll().expect("post-delivery poll");
         assert!(later.is_empty());
-        assert_eq!(swarm.transport().close_calls, vec![original]);
-        assert_eq!(swarm.connected_peers(), vec![remote_peer]);
+        assert_eq!(swarm.core().transport().close_calls, vec![original]);
+        assert_eq!(swarm.core().connected_peers(), vec![remote_peer]);
     }
 
     #[test]
@@ -1236,11 +1115,59 @@ mod tests {
             SwarmEvent::ConnectionReplaced { old, new, .. }
                 if old == original && new == replacement
         ));
-        assert!(swarm.transport().close_calls.is_empty());
+        assert!(swarm.core().transport().close_calls.is_empty());
 
         let later = swarm.poll().expect("post-delivery poll");
         assert!(later.is_empty());
-        assert_eq!(swarm.transport().close_calls, vec![original]);
+        assert_eq!(swarm.core().transport().close_calls, vec![original]);
+    }
+
+    #[test]
+    fn replaced_connection_close_waits_for_the_buffer_to_drain_across_commands() {
+        let remote_peer = Ed25519Keypair::generate().peer_id();
+        let other_peer = Ed25519Keypair::generate().peer_id();
+        let original = ConnectionId::new(61);
+        let replacement = ConnectionId::new(62);
+        let other = ConnectionId::new(63);
+        let mut swarm = replacement_swarm(remote_peer.clone(), original, replacement);
+        // The replacement's batch also connects an unrelated peer, so two
+        // events are buffered when the first is delivered.
+        swarm.core_mut().transport_mut().event_batches[1].push(TransportEvent::Connected {
+            id: other,
+            endpoint: ConnectionEndpoint::with_peer_id(Multiaddr::new(), other_peer.clone()),
+        });
+
+        let _ = swarm.poll().expect("original connection poll");
+        let replaced = swarm
+            .poll_next(Duration::ZERO)
+            .expect("poll")
+            .expect("event");
+        assert!(matches!(replaced, SwarmEvent::ConnectionReplaced { old, .. } if old == original));
+
+        // A synchronous command between deliveries runs its own work, but
+        // the close still waits for the rest of the buffer.
+        let opens_before = swarm.core().transport().open_calls.len();
+        swarm.ping(&remote_peer).expect("ping the replacement");
+        assert_eq!(
+            swarm.core().transport().open_calls[opens_before..],
+            [replacement],
+            "the ping opens its stream on the replacement without waiting",
+        );
+        assert!(swarm.core().transport().close_calls.is_empty());
+
+        let established = swarm
+            .poll_next(Duration::ZERO)
+            .expect("poll")
+            .expect("event");
+        assert!(matches!(
+            established,
+            SwarmEvent::ConnectionEstablished { conn_id, .. } if conn_id == other
+        ));
+        assert!(swarm.core().transport().close_calls.is_empty());
+
+        // Drained: the next command dispatches the deferred close first.
+        swarm.ping(&other_peer).expect("ping the other peer");
+        assert_eq!(swarm.core().transport().close_calls, vec![original]);
     }
 
     #[test]
@@ -1285,8 +1212,9 @@ mod tests {
         let peer_id = Ed25519Keypair::generate().peer_id();
         let mut swarm = idle_swarm();
         swarm
-            .runtime
-            .event_buffer
+            .core
+            .state
+            .events
             .push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
                 conn_id: ConnectionId::new(1),
@@ -1307,13 +1235,14 @@ mod tests {
         let target_peer_id = Ed25519Keypair::generate().peer_id();
         let mut swarm = idle_swarm();
         swarm
-            .runtime
-            .event_buffer
+            .core
+            .state
+            .events
             .push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: target_peer_id.clone(),
                 conn_id: ConnectionId::new(1),
             });
-        swarm.runtime.event_buffer.push_back(SwarmEvent::PeerReady {
+        swarm.core.state.events.push_back(SwarmEvent::PeerReady {
             peer_id: target_peer_id.clone(),
             conn_id: ConnectionId::new(1),
             protocols: Vec::new(),
@@ -1341,6 +1270,7 @@ mod tests {
     fn run_until_does_not_treat_interrupt_as_deadline() {
         let mut swarm = idle_swarm();
         swarm
+            .core_mut()
             .transport_mut()
             .wait_outcomes
             .push_back(WaitOutcome::Interrupted);
@@ -1348,7 +1278,7 @@ mod tests {
         // Nothing here matches, so the loop runs to its deadline. Reporting
         // `Unsupported` once the script runs out makes the driver sleep
         // between polls instead of spinning for that whole time.
-        swarm.transport_mut().default_wait = Some(WaitOutcome::Unsupported);
+        swarm.core_mut().transport_mut().default_wait = Some(WaitOutcome::Unsupported);
 
         // The deadline has to outlast the interrupt by enough that the resume
         // is what is being observed. `run_until` re-reads the clock after
@@ -1360,7 +1290,7 @@ mod tests {
 
         assert!(found.is_none());
         assert!(
-            swarm.transport().wait_calls > 1,
+            swarm.core().transport().wait_calls > 1,
             "the wait must resume after consuming the interrupt"
         );
     }
@@ -1370,13 +1300,14 @@ mod tests {
         let peer_id = Ed25519Keypair::generate().peer_id();
         let mut swarm = idle_swarm();
         swarm
-            .runtime
-            .event_buffer
+            .core
+            .state
+            .events
             .push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
                 conn_id: ConnectionId::new(1),
             });
-        swarm.runtime.event_buffer.push_back(SwarmEvent::PeerReady {
+        swarm.core.state.events.push_back(SwarmEvent::PeerReady {
             peer_id,
             conn_id: ConnectionId::new(1),
             protocols: Vec::new(),
@@ -1389,21 +1320,17 @@ mod tests {
             .expect("wait");
         assert!(found.is_none(), "no buffered event matches the predicate");
         assert_eq!(
-            swarm.transport().poll_calls,
+            swarm.core().transport().poll_calls,
             1,
             "an expired wait must poll the transport at most once"
         );
-        assert_eq!(
-            swarm.runtime.event_buffer.len(),
-            2,
-            "events must be preserved"
-        );
+        assert_eq!(swarm.core.state.events.len(), 2, "events must be preserved");
         assert!(matches!(
-            swarm.runtime.event_buffer.front(),
+            swarm.core.state.events.front(),
             Some(SwarmEvent::ConnectionEstablished { .. })
         ));
         assert!(matches!(
-            swarm.runtime.event_buffer.back(),
+            swarm.core.state.events.back(),
             Some(SwarmEvent::PeerReady { .. })
         ));
     }
@@ -1413,13 +1340,14 @@ mod tests {
         let peer_id = Ed25519Keypair::generate().peer_id();
         let mut swarm = idle_swarm();
         swarm
-            .runtime
-            .event_buffer
+            .core
+            .state
+            .events
             .push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
                 conn_id: ConnectionId::new(1),
             });
-        swarm.runtime.event_buffer.push_back(SwarmEvent::PeerReady {
+        swarm.core.state.events.push_back(SwarmEvent::PeerReady {
             peer_id: peer_id.clone(),
             conn_id: ConnectionId::new(1),
             protocols: Vec::new(),
@@ -1438,9 +1366,9 @@ mod tests {
         assert!(matches!(found, SwarmEvent::PeerReady { .. }));
 
         // The skipped event is restored in order and no extra events appear.
-        assert_eq!(swarm.runtime.event_buffer.len(), 1);
+        assert_eq!(swarm.core.state.events.len(), 1);
         assert!(matches!(
-            swarm.runtime.event_buffer.front(),
+            swarm.core.state.events.front(),
             Some(SwarmEvent::ConnectionEstablished { peer_id: restored, .. }) if *restored == peer_id
         ));
     }
@@ -1468,6 +1396,7 @@ mod tests {
             keypair.peer_id(),
         );
         swarm
+            .core_mut()
             .add_protocol(protocol)
             .expect("test protocol id is not reserved");
         swarm.poll().expect("process connected event");
@@ -1476,8 +1405,9 @@ mod tests {
 
     fn buffered_open_failures(swarm: &Swarm<FailingUserOpenTransport>) -> usize {
         swarm
-            .runtime
-            .event_buffer
+            .core
+            .state
+            .events
             .iter()
             .filter(|event| {
                 matches!(
@@ -1504,7 +1434,10 @@ mod tests {
                 resource: "test stream capacity"
             })
         ));
-        assert!(swarm.core().is_idle(), "failed open must clear core state");
+        assert!(
+            swarm.core.state.is_idle(),
+            "failed open must clear core state"
+        );
         // The failure is reported synchronously via Err; it must not be
         // double-reported through a buffered SwarmEvent::Error.
         assert_eq!(
@@ -1522,13 +1455,13 @@ mod tests {
         // (fails), call 3 = the caller's own open (ok).
         let mut swarm = connected_swarm(&remote_peer, PROTOCOL, 2);
 
-        // Queue an unrelated open directly on the core, bypassing the
-        // driver's flush, so it is still pending when the application call
-        // arrives.
+        // Queue an unrelated open (a ping stream) directly on the state,
+        // bypassing the core's flush, so it is still pending when the
+        // application call arrives.
         swarm
-            .runtime
             .core
-            .open_stream(&remote_peer, PROTOCOL)
+            .state
+            .ping(&remote_peer, [0; minip2p_ping::PING_PAYLOAD_LEN], 0)
             .expect("queue stale open");
 
         let (_, stream_id) = swarm
@@ -1699,6 +1632,7 @@ mod tests {
             keypair.peer_id(),
         );
         swarm
+            .core_mut()
             .add_protocol(protocol)
             .expect("test protocol id is not reserved");
         swarm.poll().expect("process connected event");
@@ -1751,7 +1685,7 @@ mod tests {
         // Reported through Err; it must not also surface as a buffered
         // runtime-error event.
         assert!(
-            !swarm.runtime.event_buffer.iter().any(|event| matches!(
+            !swarm.core.state.events.iter().any(|event| matches!(
                 event,
                 SwarmEvent::Error(e) if e.kind == SwarmErrorKind::Transport
             )),
@@ -1771,7 +1705,7 @@ mod tests {
             .reset_stream(&remote_peer, conn_id, stream_id)
             .expect("failed reset must remain retryable");
 
-        assert_eq!(swarm.transport().reset_calls, 2);
+        assert_eq!(swarm.core().transport().reset_calls, 2);
     }
 
     /// A `StreamData` event whose stream id encodes its position, so tests
@@ -1787,11 +1721,11 @@ mod tests {
 
     fn assert_indexed_order(swarm: &Swarm<IdleTransport>, expected_len: usize) {
         assert_eq!(
-            swarm.runtime.event_buffer.len(),
+            swarm.core.state.events.len(),
             expected_len,
             "every skipped event must be restored"
         );
-        for (i, event) in swarm.runtime.event_buffer.iter().enumerate() {
+        for (i, event) in swarm.core.state.events.iter().enumerate() {
             assert!(
                 matches!(
                     event,
@@ -1809,8 +1743,9 @@ mod tests {
         let total = RUN_UNTIL_SKIP_LIMIT + 5;
         for i in 0..total {
             swarm
-                .runtime
-                .event_buffer
+                .core
+                .state
+                .events
                 .push_back(indexed_stream_data(&peer_id, i as u64));
         }
 
@@ -1836,8 +1771,9 @@ mod tests {
         let total = RUN_UNTIL_SKIP_LIMIT + 3;
         for i in 0..total {
             swarm
-                .runtime
-                .event_buffer
+                .core
+                .state
+                .events
                 .push_back(indexed_stream_data(&peer_id, i as u64));
         }
 
@@ -1865,11 +1801,12 @@ mod tests {
         let mut swarm = idle_swarm();
         for i in 0..RUN_UNTIL_SKIP_LIMIT - 1 {
             swarm
-                .runtime
-                .event_buffer
+                .core
+                .state
+                .events
                 .push_back(indexed_stream_data(&peer_id, i as u64));
         }
-        swarm.runtime.event_buffer.push_back(SwarmEvent::PeerReady {
+        swarm.core.state.events.push_back(SwarmEvent::PeerReady {
             peer_id: peer_id.clone(),
             conn_id: ConnectionId::new(1),
             protocols: Vec::new(),
@@ -2101,13 +2038,13 @@ mod tests {
             swarm.poll().expect("negotiate ping stream");
         }
         assert_eq!(
-            swarm.core().next_timeout(clock.now_ms()),
+            swarm.core.state.next_timeout(clock.now_ms()),
             Some(PING_TIMEOUT_MS + 1),
             "ping must be in flight with an armed core timer"
         );
 
         // Drop setup events (ConnectionEstablished, ...) so poll_next blocks.
-        swarm.runtime.event_buffer.clear();
+        swarm.core.state.events.clear();
         let event = swarm
             .poll_next(Deadline::NEVER)
             .expect("poll")
@@ -2117,7 +2054,7 @@ mod tests {
             SwarmEvent::PingTimeout { peer_id } if peer_id == remote_peer
         ));
 
-        let waits = &swarm.transport().waits;
+        let waits = &swarm.core().transport().waits;
         assert_eq!(waits.len(), 1, "one blocking wait resolves the timer");
         assert_eq!(
             waits[0],

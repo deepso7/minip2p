@@ -73,7 +73,7 @@ impl EntropySource for ZeroEntropy {
 fn relay_server_registers_hop_and_stop_with_directional_swarm_roles() {
     let keypair = Ed25519Keypair::generate();
     let mut swarm = SwarmBuilder::new(&keypair)
-        .build_runtime(ScriptedTransport::default(), ZeroEntropy)
+        .build_core(ScriptedTransport::default(), ZeroEntropy)
         .unwrap();
     RelayServerAgent::register_swarm_roles(&mut swarm).unwrap();
     let peer = PeerId::from_public_key_protobuf(b"unconnected-role-probe");

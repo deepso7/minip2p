@@ -10,7 +10,7 @@ use minip2p_relay::{
     MAX_PENDING_BRIDGE_SIZE, Reservation, STOP_PROTOCOL_ID, Status, StopInitiator,
     StopInitiatorInput, StopInitiatorOutcome, StopInitiatorOutput, encode_hop_status,
 };
-use minip2p_swarm::{DriverError, SwarmEvent, SwarmRuntime};
+use minip2p_swarm::{SwarmCore, SwarmError, SwarmEvent};
 use minip2p_transport::{ConnectionId, Transport};
 
 use crate::address::normalize_addrs;
@@ -191,7 +191,7 @@ impl RelayServerAgent {
     /// Installs the relay service's static directional Swarm roles.
     ///
     /// HOP is inbound and Identify-advertised; STOP is outbound only.
-    pub fn register_swarm_roles<T, E>(swarm: &mut SwarmRuntime<T, E>) -> Result<(), DriverError>
+    pub fn register_swarm_roles<T, E>(swarm: &mut SwarmCore<T, E>) -> Result<(), SwarmError>
     where
         T: Transport,
         E: minip2p_platform::EntropySource,
