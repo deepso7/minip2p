@@ -66,13 +66,20 @@ fn as_send(action: GossipsubAction) -> Option<(GossipsubToken, PeerId, StreamId,
     }
 }
 
+fn is_read_ack(action: &GossipsubAction) -> bool {
+    matches!(action, GossipsubAction::AckStream { .. })
+}
+
 /// Drains actions, acknowledging every send as successful, until the agent
-/// emits no more. Any other action fails: fixtures leave nothing pending.
+/// emits no more. Read acks need no answer; any other action fails: fixtures
+/// leave nothing pending.
 fn ack_sends(agent: &mut GossipsubAgent, now_ms: u64) {
     loop {
         let mut sends = Vec::new();
         while let Some(action) = agent.poll_action() {
-            sends.push(as_send(action).expect("only sends while acknowledging"));
+            if !is_read_ack(&action) {
+                sends.push(as_send(action).expect("only sends while acknowledging"));
+            }
         }
         if sends.is_empty() {
             return;
@@ -259,14 +266,17 @@ pub fn forward(agent: &mut GossipsubAgent, frame: &SwarmEvent) -> Vec<GossipsubA
     actions
 }
 
-/// Asserts `actions` are one send to each of `recipients` and nothing else.
+/// Asserts `actions` are the inbound frame's read ack plus one send to each
+/// of `recipients`, and nothing else.
 pub fn assert_forwarded(recipients: &BTreeSet<PeerId>, actions: Vec<GossipsubAction>) {
-    let sends = actions.len();
-    let sent: BTreeSet<PeerId> = actions
+    let (acks, sends): (Vec<_>, Vec<_>) = actions.into_iter().partition(is_read_ack);
+    assert_eq!(acks.len(), 1, "the inbound frame is acknowledged");
+    let send_count = sends.len();
+    let sent: BTreeSet<PeerId> = sends
         .into_iter()
         .map(|action| as_send(action).expect("forwarding only sends").1)
         .collect();
-    assert_eq!(sends, recipients.len(), "one send per recipient");
+    assert_eq!(send_count, recipients.len(), "one send per recipient");
     assert_eq!(&sent, recipients, "sent to the non-source mesh");
 }
 
