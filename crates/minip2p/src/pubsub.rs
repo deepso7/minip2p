@@ -1,5 +1,5 @@
 //! Caller-driven Gossipsub capability shared by standard and portable
-//! Endpoints. Time is supplied by the host; I/O runs through `SwarmRuntime`.
+//! Endpoints. Time is supplied by the host; I/O runs through `SwarmCore`.
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -10,7 +10,7 @@ use minip2p_platform::EntropySource;
 use minip2p_pubsub::{GossipsubAction, GossipsubAgent, GossipsubEvent, PublishError, TopicError};
 #[cfg(any(feature = "std", feature = "smoltcp"))]
 use minip2p_swarm::SwarmEvent;
-use minip2p_swarm::{DriverError, SwarmRuntime};
+use minip2p_swarm::{DriverError, SwarmCore};
 use minip2p_transport::Transport;
 
 use crate::stream_conns::StreamConns;
@@ -79,7 +79,7 @@ impl GossipsubDriver {
     pub(crate) fn subscribe<T: Transport, R: EntropySource>(
         &mut self,
         topic: &str,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         now_ms: u64,
     ) -> Result<bool, TopicError> {
         let newly = self.agent.subscribe(topic, now_ms)?;
@@ -95,7 +95,7 @@ impl GossipsubDriver {
         &mut self,
         topic: &str,
         reserved: Option<&str>,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         now_ms: u64,
     ) -> Result<bool, GossipsubError> {
         if reserved == Some(topic) {
@@ -113,7 +113,7 @@ impl GossipsubDriver {
         topic: &str,
         data: Vec<u8>,
         reserved: Option<&str>,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         now_ms: u64,
     ) -> Result<(), GossipsubError> {
         if reserved == Some(topic) {
@@ -150,7 +150,7 @@ impl GossipsubDriver {
     pub(crate) fn ingest<T: Transport, R: EntropySource>(
         &mut self,
         event: &SwarmEvent,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         now_ms: u64,
     ) -> bool {
         // A closing stream's mapping outlives this step: the agent
@@ -176,7 +176,7 @@ impl GossipsubDriver {
     #[cfg(any(feature = "std", feature = "smoltcp"))]
     pub(crate) fn tick<T: Transport, R: EntropySource>(
         &mut self,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         now_ms: u64,
     ) {
         if self.agent.next_timeout(now_ms) != Some(0) {
@@ -199,7 +199,7 @@ impl GossipsubDriver {
     /// back) and collects application-visible pubsub events.
     pub(crate) fn pump<T: Transport, R: EntropySource>(
         &mut self,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         now_ms: u64,
     ) {
         loop {
@@ -221,7 +221,7 @@ impl GossipsubDriver {
     fn execute<T: Transport, R: EntropySource>(
         &mut self,
         action: GossipsubAction,
-        swarm: &mut SwarmRuntime<T, R>,
+        swarm: &mut SwarmCore<T, R>,
         now_ms: u64,
     ) {
         match action {

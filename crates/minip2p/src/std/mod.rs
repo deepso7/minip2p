@@ -332,7 +332,8 @@ impl Endpoint {
     /// only this handle's interrupts surface as
     /// [`EndpointWaitOutcome::Interrupted`].
     pub fn wait_handle(&self) -> WaitHandle {
-        let transport = minip2p_transport::BlockingTransport::wait_handle(self.swarm.transport());
+        let transport =
+            minip2p_transport::BlockingTransport::wait_handle(self.swarm.core().transport());
         let caller_interrupt = std::sync::Arc::clone(&self.caller_interrupt);
         WaitHandle::new(move || {
             caller_interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -347,7 +348,7 @@ impl Endpoint {
 
     /// Returns this node's peer id.
     pub fn peer_id(&self) -> &PeerId {
-        self.swarm.local_peer_id()
+        self.swarm.core().local_peer_id()
     }
 
     /// Starts listening on every bound address and returns the first.
@@ -367,7 +368,7 @@ impl Endpoint {
 
     /// Starts listening on all transport-bound addresses.
     pub fn listen_all(&mut self) -> Result<Vec<PeerAddr>, Error> {
-        let addrs = self.swarm.listen_on_bound_addrs()?;
+        let addrs = self.swarm.core_mut().listen_on_bound_addrs()?;
         Ok(addrs)
     }
 
@@ -431,7 +432,7 @@ impl Endpoint {
         let now = self.swarm.now();
         let id = admit_connect(
             &mut self.connect,
-            self.swarm.runtime_mut(),
+            self.swarm.core_mut(),
             #[cfg(feature = "nat")]
             self.nat.as_ref(),
             #[cfg(all(feature = "_nat-driver", not(feature = "nat")))]
@@ -463,7 +464,7 @@ impl Endpoint {
                 peer,
                 allow_relay,
                 target_addrs,
-                self.swarm.runtime_mut(),
+                self.swarm.core_mut(),
                 now,
             );
         }
@@ -481,15 +482,15 @@ impl Endpoint {
                 &mut self.connect,
                 self.nat.as_mut(),
                 id,
-                self.swarm.runtime_mut(),
+                self.swarm.core_mut(),
                 now,
             );
             if needs_pump && let Some(nat) = self.nat.as_mut() {
-                nat.pump(self.swarm.runtime_mut(), now);
+                nat.pump(self.swarm.core_mut(), now);
             }
         }
         #[cfg(not(feature = "nat"))]
-        self.connect.cancel(id, self.swarm.runtime_mut());
+        self.connect.cancel(id, self.swarm.core_mut());
         self.feed_nat_to_connect();
         self.flush_step_events();
     }
@@ -504,8 +505,7 @@ impl Endpoint {
     /// Closes the active connection to `peer_id`, aborting any dials still
     /// kept open for its simultaneous dial so none of them reconnects it.
     pub fn disconnect(&mut self, peer_id: &PeerId) -> Result<(), Error> {
-        self.connect
-            .abort_retained(peer_id, self.swarm.runtime_mut());
+        self.connect.abort_retained(peer_id, self.swarm.core_mut());
         self.swarm.disconnect(peer_id)
     }
 
@@ -528,14 +528,14 @@ impl Endpoint {
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn connected_peers(&self) -> Vec<PeerId> {
-        self.swarm.connected_peers()
+        self.swarm.core().connected_peers()
     }
 
     /// Returns whether Identify has completed for `peer_id`.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
-        self.swarm.is_peer_ready(peer_id)
+        self.swarm.core().is_peer_ready(peer_id)
     }
 
     /// Returns the peer's current connection and its Identify info once that
@@ -546,28 +546,28 @@ impl Endpoint {
     /// connection's [`EndpointEvent::PeerReady`]. A ready wait checks this
     /// first, then accepts only a `PeerReady` for the current connection.
     pub fn peer_readiness(&self, peer_id: &PeerId) -> Option<(ConnectionId, &IdentifyMessage)> {
-        self.swarm.peer_readiness(peer_id)
+        self.swarm.core().peer_readiness(peer_id)
     }
 
     /// Returns the latest Identify information received for `peer_id`.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
-        self.swarm.peer_info(peer_id)
+        self.swarm.core().peer_info(peer_id)
     }
 
     /// Returns the active transport connection selected for `peer_id`.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
-        self.swarm.connection_id(peer_id)
+        self.swarm.core().connection_id(peer_id)
     }
 
     /// Returns the remote transport address recorded for an exact connection.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
-        self.swarm.connection_remote_addr(conn_id)
+        self.swarm.core().connection_remote_addr(conn_id)
     }
 
     /// Returns addresses currently bound on the local transport.
@@ -578,7 +578,7 @@ impl Endpoint {
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn bound_addresses(&self) -> Vec<Multiaddr> {
-        self.swarm.transport().local_addresses()
+        self.swarm.core().transport().local_addresses()
     }
 
     /// Registers an application protocol for inbound and outbound negotiation.
@@ -587,7 +587,7 @@ impl Endpoint {
     /// [`SwarmError::ReservedProtocol`]; the endpoint's own identify and
     /// ping handlers already own them.
     pub fn add_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), Error> {
-        self.swarm.add_protocol(protocol_id)
+        Ok(self.swarm.core_mut().add_protocol(protocol_id)?)
     }
 
     /// Registers an application protocol whose received data the
@@ -599,7 +599,7 @@ impl Endpoint {
     /// that became ready before this call keep the acknowledgement they had.
     pub fn add_manual_ack_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), Error> {
         let protocol_id = protocol_id.into();
-        self.swarm.add_protocol(protocol_id.clone())?;
+        self.swarm.core_mut().add_protocol(protocol_id.clone())?;
         // Streams already ready keep their acknowledgement, whether their
         // StreamReady waits in the Endpoint's queue or the swarm's.
         let queued = self.pending_events.iter().filter_map(|event| match event {
@@ -613,7 +613,7 @@ impl Endpoint {
         });
         let buffered = self
             .swarm
-            .runtime()
+            .core()
             .buffered_events()
             .filter_map(|event| match event {
                 SwarmEvent::StreamReady {
@@ -647,7 +647,7 @@ impl Endpoint {
         stream_id: StreamId,
         bytes: usize,
     ) -> Result<(), Error> {
-        self.swarm.ack_stream(conn_id, stream_id, bytes)
+        self.swarm.core_mut().ack_stream(conn_id, stream_id, bytes)
     }
 
     /// Opens an application stream after negotiating `protocol_id`.
@@ -760,7 +760,7 @@ impl Endpoint {
     /// which leaves nothing for this acknowledgement to release.
     fn ack_pulled(&mut self, event: &EndpointEvent) {
         if let Some((conn_id, stream_id, bytes)) = self.acks.pulled(event) {
-            match self.swarm.ack_stream(conn_id, stream_id, bytes) {
+            match self.swarm.core_mut().ack_stream(conn_id, stream_id, bytes) {
                 Ok(()) | Err(_) => {}
             }
         }
@@ -909,12 +909,12 @@ impl Endpoint {
         // Expire first: an answer that arrives after an attempt's deadline
         // must not turn its Timeout into another outcome.
         let now_ms = self.swarm.now().monotonic_ms;
-        self.connect.tick(self.swarm.runtime_mut(), now_ms);
+        self.connect.tick(self.swarm.core_mut(), now_ms);
         let answers = self.resolver.take_answers();
         if !answers.is_empty() {
             self.connect.resolved(
                 &mut |addr| dial::answer_for(addr, &answers),
-                self.swarm.runtime_mut(),
+                self.swarm.core_mut(),
             );
             #[cfg(feature = "nat")]
             self.nat_dials
@@ -932,7 +932,7 @@ impl Endpoint {
         {
             let now = self.swarm.now();
             for (token, result) in nat_answered {
-                nat.named_dial_resolved(token, result, self.swarm.runtime_mut(), now);
+                nat.named_dial_resolved(token, result, self.swarm.core_mut(), now);
             }
             // The agent reacted to its dials; run a full step so discovery
             // sweeps what that queued before anything is drained.
@@ -1045,7 +1045,7 @@ impl Endpoint {
     fn cancel_nat_leg_on_terminal(&mut self, event: &EndpointEvent) {
         if let Some(nat) = self.nat.as_mut() {
             let now = self.swarm.now();
-            nat.cancel_leg_on_terminal(event, self.swarm.runtime_mut(), now);
+            nat.cancel_leg_on_terminal(event, self.swarm.core_mut(), now);
         }
     }
 
@@ -1064,7 +1064,7 @@ impl Endpoint {
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_mut() {
             let now = self.swarm.now();
-            nat.feed_unobserved_to_connect(&mut self.connect, self.swarm.runtime_mut(), now);
+            nat.feed_unobserved_to_connect(&mut self.connect, self.swarm.core_mut(), now);
         }
     }
 
@@ -1074,9 +1074,7 @@ impl Endpoint {
     /// Connection-attempt output follows via [`Self::finish_step`].
     fn ingest(&mut self, event: SwarmEvent) -> Option<EndpointEvent> {
         let now_ms = self.swarm.now().monotonic_ms;
-        let engine_consumed = self
-            .connect
-            .observe(&event, self.swarm.runtime_mut(), now_ms);
+        let engine_consumed = self.connect.observe(&event, self.swarm.core_mut(), now_ms);
         #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         let driver_consumed = !engine_consumed && self.ingest_into_drivers(&event);
         #[cfg(not(any(feature = "nat", feature = "pubsub", feature = "relay-server")))]
@@ -1162,12 +1160,12 @@ impl Endpoint {
         #[cfg(feature = "nat")]
         if !claimed && let Some(nat) = self.nat.as_mut() {
             let now = self.swarm.now();
-            claimed = nat.ingest(event, self.swarm.runtime_mut(), now);
+            claimed = nat.ingest(event, self.swarm.core_mut(), now);
         }
         #[cfg(feature = "pubsub")]
         if !claimed && let Some(pubsub) = self.gossipsub.as_mut() {
             let now_ms = self.swarm.now().monotonic_ms;
-            claimed = pubsub.ingest(event, self.swarm.runtime_mut(), now_ms);
+            claimed = pubsub.ingest(event, self.swarm.core_mut(), now_ms);
         }
         #[cfg(any(feature = "nat", feature = "relay-server"))]
         self.refresh_external_address_contributions();
@@ -1184,12 +1182,12 @@ impl Endpoint {
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_mut() {
             let now = self.swarm.now();
-            nat.tick(self.swarm.runtime_mut(), now);
+            nat.tick(self.swarm.core_mut(), now);
         }
         #[cfg(feature = "pubsub")]
         if let Some(pubsub) = self.gossipsub.as_mut() {
             let now_ms = self.swarm.now().monotonic_ms;
-            pubsub.tick(self.swarm.runtime_mut(), now_ms);
+            pubsub.tick(self.swarm.core_mut(), now_ms);
         }
         #[cfg(feature = "mdns")]
         if let Some(mdns) = self.mdns.as_mut() {
@@ -1212,20 +1210,20 @@ impl Endpoint {
                 self.gossipsub.as_mut(),
                 self.nat.as_mut(),
                 &mut self.connect,
-                self.swarm.runtime_mut(),
+                self.swarm.core_mut(),
                 &mut |addr| self.resolver.expand(addr),
                 now,
             );
             // Both discovery features imply `nat`.
             if let Some(nat) = self.nat.as_mut() {
-                nat.apply_sweep_work(work, &self.connect, self.swarm.runtime_mut(), now);
+                nat.apply_sweep_work(work, &self.connect, self.swarm.core_mut(), now);
                 // Attaching a leg can queue a synchronous terminal the
                 // sweep's claim pass already ran past; the engine must
                 // observe it before the capability drain filters it out.
                 discovery.claim_nat_events(
                     nat,
                     &mut self.connect,
-                    self.swarm.runtime_mut(),
+                    self.swarm.core_mut(),
                     now.monotonic_ms,
                 );
             }
@@ -1289,7 +1287,8 @@ impl Endpoint {
     fn refresh_external_address_contributions(&mut self) {
         #[cfg(feature = "relay-server")]
         {
-            let listeners = concrete_relay_listener_addrs(self.swarm.transport().local_addresses());
+            let listeners =
+                concrete_relay_listener_addrs(self.swarm.core().transport().local_addresses());
             #[cfg(feature = "nat")]
             let confirmed = self
                 .nat
@@ -1323,7 +1322,7 @@ impl Endpoint {
                 }
             }
         }
-        self.swarm.set_external_addresses(addresses);
+        self.swarm.core_mut().set_external_addresses(addresses);
     }
 
     /// Sets externally validated addresses to advertise through Identify.
@@ -1339,7 +1338,7 @@ impl Endpoint {
             self.refresh_external_address_contributions();
         }
         #[cfg(not(any(feature = "nat", feature = "relay-server")))]
-        self.swarm.set_external_addresses(addresses);
+        self.swarm.core_mut().set_external_addresses(addresses);
     }
 
     /// Our current reachability verdict from AutoNAT probing
@@ -1372,7 +1371,7 @@ impl Endpoint {
             return Err(GossipsubError::NotEnabled);
         };
         let now_ms = self.swarm.now().monotonic_ms;
-        Ok(pubsub.subscribe(topic, self.swarm.runtime_mut(), now_ms)?)
+        Ok(pubsub.subscribe(topic, self.swarm.core_mut(), now_ms)?)
     }
 
     /// Withdraws a pubsub subscription. Returns `Ok(false)` when not
@@ -1389,7 +1388,7 @@ impl Endpoint {
             return Err(GossipsubError::NotEnabled);
         };
         let now_ms = self.swarm.now().monotonic_ms;
-        pubsub.unsubscribe(topic, reserved, self.swarm.runtime_mut(), now_ms)
+        pubsub.unsubscribe(topic, reserved, self.swarm.core_mut(), now_ms)
     }
 
     /// Publishes `data` on `topic`, signed with this endpoint's identity and
@@ -1413,13 +1412,7 @@ impl Endpoint {
             return Err(GossipsubError::NotEnabled);
         };
         let now_ms = self.swarm.now().monotonic_ms;
-        pubsub.publish(
-            topic,
-            data.into(),
-            reserved,
-            self.swarm.runtime_mut(),
-            now_ms,
-        )?;
+        pubsub.publish(topic, data.into(), reserved, self.swarm.core_mut(), now_ms)?;
         Ok(())
     }
 
@@ -1466,14 +1459,14 @@ impl Endpoint {
             let work = discovery.shutdown(
                 &mut self.connect,
                 self.nat.as_mut(),
-                self.swarm.runtime_mut(),
+                self.swarm.core_mut(),
                 now,
             );
             // `mdns` implies `nat`. Shutdown already cleared `inflight`, so
             // its queued events are not discovery-owned anymore; the next
             // poll feeds them to the engine and the app like any NAT event.
             if let Some(nat) = self.nat.as_mut() {
-                nat.apply_sweep_work(work, &self.connect, self.swarm.runtime_mut(), now);
+                nat.apply_sweep_work(work, &self.connect, self.swarm.core_mut(), now);
             }
         }
         result
@@ -1536,12 +1529,13 @@ impl Endpoint {
     }
 
     fn close_drain_busy(&self) -> bool {
-        !self.swarm.connected_peers().is_empty() || self.swarm.core().has_tracked_connections()
+        !self.swarm.core().connected_peers().is_empty()
+            || self.swarm.core().has_tracked_connections()
     }
 
     fn disconnect_established(&mut self) -> Option<Error> {
         let mut first_error = None;
-        for peer in self.swarm.connected_peers() {
+        for peer in self.swarm.core().connected_peers() {
             if let Err(error) = self.swarm.disconnect(&peer)
                 && first_error.is_none()
             {
@@ -2289,15 +2283,17 @@ fn build_endpoint(
     let swarm = builder.build(transport)?;
     #[cfg(feature = "relay-server")]
     if options.relay_server_config.is_some() {
-        swarm.add_inbound_protocol(RELAY_HOP_PROTOCOL_ID)?;
-        swarm.add_advertised_protocol(RELAY_HOP_PROTOCOL_ID)?;
-        swarm.add_outbound_protocol(RELAY_STOP_PROTOCOL_ID)?;
+        let core = swarm.core_mut();
+        core.add_inbound_protocol(RELAY_HOP_PROTOCOL_ID)?;
+        core.add_advertised_protocol(RELAY_HOP_PROTOCOL_ID)?;
+        core.add_outbound_protocol(RELAY_STOP_PROTOCOL_ID)?;
     }
     #[cfg(feature = "nat")]
     if nat_config.is_some() {
-        swarm.add_outbound_protocol(minip2p_nat::HOP_PROTOCOL_ID)?;
-        swarm.add_inbound_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
-        swarm.add_advertised_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
+        let core = swarm.core_mut();
+        core.add_outbound_protocol(minip2p_nat::HOP_PROTOCOL_ID)?;
+        core.add_inbound_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
+        core.add_advertised_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
     }
     #[cfg(feature = "nat")]
     let nat = nat_config.map(|config| {
@@ -2306,7 +2302,7 @@ fn build_endpoint(
             .iter()
             .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
             .collect();
-        let agent = minip2p_nat::NatAgent::new(swarm.local_peer_id().clone(), config);
+        let agent = minip2p_nat::NatAgent::new(swarm.core().local_peer_id().clone(), config);
         // Relay and AutoNAT server addresses may name a host; the endpoint
         // resolves those off the driver, like Connection-attempt candidates.
         NatDriver::new(agent, relay_addrs, minip2p_platform::StdEntropy).park_named_dials()
@@ -2315,11 +2311,13 @@ fn build_endpoint(
     let relay_server = options
         .relay_server_config
         .map(|config| -> Result<relay_server::RelayServerDriver, Error> {
-            let mut agent =
-                minip2p_relay_server::RelayServerAgent::new(swarm.local_peer_id().clone(), config)
-                    .map_err(|error| TransportError::InvalidConfig {
-                        reason: error.to_string(),
-                    })?;
+            let mut agent = minip2p_relay_server::RelayServerAgent::new(
+                swarm.core().local_peer_id().clone(),
+                config,
+            )
+            .map_err(|error| TransportError::InvalidConfig {
+                reason: error.to_string(),
+            })?;
             agent
                 .replace_announce_addrs(options.relay_server_announce_addrs)
                 .map_err(|error| TransportError::InvalidConfig {
@@ -2327,7 +2325,7 @@ fn build_endpoint(
                 })?;
             agent
                 .set_listener_addrs(concrete_relay_listener_addrs(
-                    swarm.transport().local_addresses(),
+                    swarm.core().transport().local_addresses(),
                 ))
                 .map_err(|error| TransportError::InvalidConfig {
                     reason: error.to_string(),
@@ -2467,7 +2465,7 @@ fn build_endpoint(
         None
     };
     let resolver = dial::Resolver::new(minip2p_transport::BlockingTransport::wait_handle(
-        swarm.transport(),
+        swarm.core().transport(),
     ));
     Ok(Endpoint {
         swarm,
@@ -2745,7 +2743,8 @@ mod tests {
     }
 
     fn with_lookup(endpoint: &mut Endpoint, lookup: dial::Lookup) {
-        let wake = minip2p_transport::BlockingTransport::wait_handle(endpoint.swarm.transport());
+        let wake =
+            minip2p_transport::BlockingTransport::wait_handle(endpoint.swarm.core().transport());
         endpoint.resolver = dial::Resolver::with_lookup(wake, lookup);
     }
 
@@ -3352,6 +3351,7 @@ mod tests {
         // `listen` below is the only call that does.
         let bound = listener
             .swarm
+            .core()
             .transport()
             .local_addresses()
             .into_iter()
@@ -3453,7 +3453,11 @@ mod tests {
         // The id a raw swarm dial hands back is minted by the transport, so
         // its namespace is what the configuration actually reached -- whether
         // anything answers is beside the point.
-        let id = endpoint.swarm.dial(&target).expect("the dial starts");
+        let id = endpoint
+            .swarm
+            .core_mut()
+            .dial(&target)
+            .expect("the dial starts");
         assert_eq!(id.namespace(), ConnectionNamespace::TCP_IPV6);
     }
 

@@ -390,7 +390,7 @@ fn duplicate_candidates_run<T: Transport>(
     assert!(a.connection_id(&b_peer).is_some() && b.connection_id(&a_peer).is_some());
 
     assert_eq!(
-        b.runtime().transport().swapped,
+        b.core().transport().swapped,
         reverse,
         "B saw two connections race"
     );

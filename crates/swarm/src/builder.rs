@@ -1,4 +1,4 @@
-//! Builder with sensible defaults for constructing a [`SwarmRuntime`].
+//! Builder with sensible defaults for constructing a [`SwarmCore`].
 //!
 //! The builder removes per-field boilerplate (Identify metadata, ping
 //! configuration) so the common case takes a keypair and returns a ready-to-use
@@ -19,14 +19,14 @@ use minip2p_platform::EntropySource;
 
 #[cfg(feature = "std")]
 use crate::Swarm;
-use crate::{SwarmError, SwarmRuntime};
+use crate::{SwarmCore, SwarmError};
 
 /// Default protocol-version string advertised to peers on Identify.
 const DEFAULT_PROTOCOL_VERSION: &str = "minip2p/0.1.0";
 /// Default agent-version string advertised to peers on Identify.
 const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 
-/// Fluent builder for the portable [`SwarmRuntime`] and the std blocking
+/// Fluent builder for the portable [`SwarmCore`] and the std blocking
 /// `Swarm` wrapper.
 ///
 /// Defaults:
@@ -36,7 +36,7 @@ const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 /// - Ping timeout: 10 seconds (the ping default)
 ///
 /// Use the setter methods to override. Call
-/// [`SwarmBuilder::build_runtime`] with a caller-provided transport and
+/// [`SwarmBuilder::build_core`] with a caller-provided transport and
 /// entropy source. Under `std`, `SwarmBuilder::build` constructs the
 /// blocking convenience wrapper instead.
 ///
@@ -50,7 +50,7 @@ pub struct SwarmBuilder {
     protocols: Vec<String>,
     user_protocols: Vec<String>,
     public_key: Vec<u8>,
-    /// Derived once from the keypair and cached so the runtime's
+    /// Derived once from the keypair and cached so the swarm's
     /// `local_peer_id` accessor is infallible.
     local_peer_id: PeerId,
     ping_config: PingConfig,
@@ -96,9 +96,9 @@ impl SwarmBuilder {
     ///
     /// Built-in protocols (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0`) are always
     /// included and reserved for the swarm's own handlers; registering one
-    /// here makes [`SwarmBuilder::build_runtime`] (or the std-only
+    /// here makes [`SwarmBuilder::build_core`] (or the std-only
     /// `SwarmBuilder::build`) fail with [`SwarmError::ReservedProtocol`].
-    /// Equivalent to calling [`SwarmRuntime::add_protocol`] after building.
+    /// Equivalent to calling [`SwarmCore::add_protocol`] after building.
     pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {
         let id = protocol_id.into();
         if !self.protocols.iter().any(|protocol| protocol == &id) {
@@ -116,15 +116,11 @@ impl SwarmBuilder {
         self
     }
 
-    /// Consumes the builder and returns a portable caller-driven runtime.
+    /// Consumes the builder and returns a portable caller-driven swarm.
     ///
     /// The caller supplies entropy explicitly, keeping construction usable in
     /// `no_std + alloc` environments without assuming an operating-system RNG.
-    pub fn build_runtime<T, E>(
-        self,
-        transport: T,
-        entropy: E,
-    ) -> Result<SwarmRuntime<T, E>, SwarmError>
+    pub fn build_core<T, E>(self, transport: T, entropy: E) -> Result<SwarmCore<T, E>, SwarmError>
     where
         T: Transport,
         E: EntropySource,
@@ -136,15 +132,17 @@ impl SwarmBuilder {
             protocols: self.protocols,
             public_key: self.public_key,
         };
-        let mut runtime = SwarmRuntime::new(
+        let mut core = SwarmCore::new(
             transport,
             identify,
             self.ping_config,
             self.local_peer_id,
             entropy,
         );
-        register_user_protocols(&mut runtime, user_protocols)?;
-        Ok(runtime)
+        for protocol in user_protocols {
+            core.add_protocol(protocol)?;
+        }
+        Ok(core)
     }
 
     /// Consumes the builder and returns a ready-to-use std [`Swarm`] over the
@@ -178,18 +176,6 @@ impl SwarmBuilder {
             public_key: self.public_key,
         }
     }
-}
-
-/// Registers the builder's user protocols on the freshly built swarm; the
-/// core is the single validation point for reserved built-in ids.
-fn register_user_protocols<T: Transport, E: EntropySource>(
-    swarm: &mut SwarmRuntime<T, E>,
-    user_protocols: Vec<String>,
-) -> Result<(), SwarmError> {
-    for protocol in user_protocols {
-        swarm.core_mut().add_protocol(protocol)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -276,22 +262,22 @@ mod tests {
     const PROTOCOL: &str = "/myapp/1.0.0";
 
     #[test]
-    fn build_runtime_registers_protocol_for_stream_routing() {
+    fn build_core_registers_protocol_for_stream_routing() {
         let keypair = Ed25519Keypair::generate();
         let peer_id = keypair.peer_id();
-        let mut runtime = SwarmBuilder::new(&keypair)
+        let mut core = SwarmBuilder::new(&keypair)
             .protocol(PROTOCOL)
-            .build_runtime(NoopTransport, ZeroEntropy)
-            .expect("portable runtime configuration is valid");
+            .build_core(NoopTransport, ZeroEntropy)
+            .expect("portable swarm configuration is valid");
 
-        assert_eq!(runtime.local_peer_id(), &peer_id);
+        assert_eq!(core.local_peer_id(), &peer_id);
         let remote = Ed25519Keypair::generate().peer_id();
         assert!(matches!(
-            runtime.open_stream(&remote, PROTOCOL, 0),
+            core.open_stream(&remote, PROTOCOL, 0),
             Err(DriverError::Swarm(SwarmError::NotConnected { .. }))
         ));
         assert!(matches!(
-            runtime.open_stream(&remote, "/other/1.0.0", 0),
+            core.open_stream(&remote, "/other/1.0.0", 0),
             Err(DriverError::Swarm(SwarmError::ProtocolNotRegistered { .. }))
         ));
     }
@@ -331,12 +317,12 @@ mod tests {
     }
 
     #[test]
-    fn build_runtime_rejects_reserved_protocol_ids() {
+    fn build_core_rejects_reserved_protocol_ids() {
         for reserved in RESERVED_PROTOCOL_IDS {
             let keypair = Ed25519Keypair::generate();
             let error = SwarmBuilder::new(&keypair)
                 .protocol(reserved)
-                .build_runtime(NoopTransport, ZeroEntropy)
+                .build_core(NoopTransport, ZeroEntropy)
                 .err()
                 .expect("reserved ids must fail the build");
             assert_eq!(
@@ -349,17 +335,14 @@ mod tests {
     }
 
     #[test]
-    fn runtime_add_protocol_rejects_reserved_protocol_ids_after_build() {
+    fn core_add_protocol_rejects_reserved_protocol_ids_after_build() {
         let keypair = Ed25519Keypair::generate();
         let mut swarm = SwarmBuilder::new(&keypair)
-            .build_runtime(NoopTransport, ZeroEntropy)
+            .build_core(NoopTransport, ZeroEntropy)
             .expect("no user protocols registered");
         let error = swarm
             .add_protocol(IDENTIFY_PROTOCOL_ID)
             .expect_err("reserved ids must be rejected");
-        assert!(matches!(
-            error,
-            DriverError::Swarm(SwarmError::ReservedProtocol { .. })
-        ));
+        assert!(matches!(error, SwarmError::ReservedProtocol { .. }));
     }
 }

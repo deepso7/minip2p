@@ -107,7 +107,7 @@ The base `Endpoint` includes whatever you bind — QUIC, TCP, or both — plus m
 | `discovery` | Signed pubsub presence beacons and coordinated dialing; implies `nat` and `pubsub` |
 | `mdns` | Local-link discovery and coordinated direct dialing; implies `nat` |
 
-Features layer onto the same API. Lower-level users can instead drive `SwarmCore` and individual protocol crates directly with explicit inputs, outputs, timestamps, and deadlines.
+Features layer onto the same API. Lower-level users can instead drive `SwarmCore` and individual protocol crates directly with explicit timestamps, entropy, and deadlines.
 
 Host a relay on QUIC and TCP with production defaults:
 
@@ -122,7 +122,7 @@ The [relay-server example](examples/relay-server/README.md) adds optional persis
 The workspace has four strictly separated layers:
 
 1. **Sans-I/O protocols** — identity, TLS, Noise, Yamux, multistream-select, ping, identify, relay, AutoNAT, DCUtR, pubsub, and mDNS. These crates contain state machines and wire codecs, not sockets or clocks.
-2. **Sans-I/O orchestration** — `SwarmCore`, `NatAgent`, `RelayServerAgent`, `BeaconAgent`, and `PeerDiscoveryAgent` compose protocols and policy while remaining deterministic and I/O-free.
+2. **Orchestration** — `SwarmCore` drives the transport it owns with caller-supplied time and entropy, reading no clock itself; `NatAgent`, `RelayServerAgent`, `BeaconAgent`, and `PeerDiscoveryAgent` compose protocols and policy while remaining deterministic and I/O-free. Transport adapters perform the socket I/O.
 3. **Transport adapters** — `minip2p-tcp` over a pluggable `TcpProvider` byte-stream seam (`no_std + alloc`), and the quiche-based `minip2p-quic` over UDP (`std`-only). `TransportSet` puts several behind one contract and routes by address.
 4. **`std` adapters** — the mDNS socket driver, the application-facing `Endpoint`, and the UniFFI adapter: the hosted end of the I/O seams.
 

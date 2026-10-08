@@ -54,7 +54,7 @@ pub enum GossipsubAction {
         /// The stream to reset.
         stream_id: StreamId,
     },
-    /// Call `Swarm::ack_stream` for the stream: the agent consumed `bytes`
+    /// Call `SwarmCore::ack_stream` for the stream: the agent consumed `bytes`
     /// it was delivered (whole frames, or bytes it discarded), returning
     /// receive credit to the peer. Fire-and-forget.
     AckStream {
