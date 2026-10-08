@@ -288,10 +288,10 @@ pub struct RelayServerAgent {
     last_event_tick_ms: Option<u64>,
     reservation_limiters: AdmissionLimiters,
     circuit_limiters: AdmissionLimiters,
-    /// Payload a HOP or STOP read passed to a pending circuit's buffer, so
-    /// the read acknowledges only its control bytes; that payload stays
-    /// unacknowledged until it is forwarded or released.
-    bridged: usize,
+    /// Destination payload a STOP read passed to its pending circuit's
+    /// buffer, so the read acknowledges only its control bytes; that payload
+    /// stays unacknowledged until it is forwarded or released.
+    stop_bridged: usize,
 }
 
 impl RelayServerAgent {
@@ -342,7 +342,7 @@ impl RelayServerAgent {
             pending_operations: BTreeMap::new(),
             next_token: 1,
             last_event_tick_ms: None,
-            bridged: 0,
+            stop_bridged: 0,
         })
     }
 
@@ -472,11 +472,14 @@ impl RelayServerAgent {
                     self.append_pending_payload(key, CircuitDirection::SourceToDestination, data);
                     true
                 } else if self.hop_workers.contains_key(&key) {
-                    self.bridged = 0;
+                    // Payload coalesced with CONNECT stays in the responder
+                    // until the decision, unacknowledged.
+                    let held = self.hop_bridge_len(key);
                     if self.feed_hop(key, HopResponderInput::Data(data.to_vec())) {
                         self.drain_hop(key, now);
                     }
-                    self.queue_ack(key, data.len().saturating_sub(self.bridged));
+                    let payload = self.hop_bridge_len(key).saturating_sub(held);
+                    self.queue_ack(key, data.len().saturating_sub(payload));
                     true
                 } else if self.rejected_hop_streams.contains_key(&key) {
                     self.queue_ack(key, data.len());
@@ -489,11 +492,11 @@ impl RelayServerAgent {
                             data.clone(),
                         );
                     } else {
-                        self.bridged = 0;
+                        self.stop_bridged = 0;
                         if self.feed_stop(source_stream, StopInitiatorInput::Data(data.to_vec())) {
                             self.drain_stop(source_stream, now);
                         }
-                        self.queue_ack(key, data.len().saturating_sub(self.bridged));
+                        self.queue_ack(key, data.len().saturating_sub(self.stop_bridged));
                     }
                     true
                 } else {
@@ -1458,10 +1461,19 @@ impl RelayServerAgent {
         }
     }
 
-    /// Releases the credit of a dropped pending circuit's buffered payload
-    /// (a no-op on a leg reset with it).
+    /// Payload the HOP worker on `stream` holds behind its CONNECT.
+    fn hop_bridge_len(&self, stream: StreamKey) -> usize {
+        self.hop_workers
+            .get(&stream)
+            .map_or(0, |worker| worker.responder.pending_bridge_len())
+    }
+
+    /// Releases the credit of a dropped pending circuit's buffered payload,
+    /// including what its HOP worker still holds (a no-op on a leg reset
+    /// with it).
     fn release_pipelined(&mut self, source_stream: StreamKey, circuit: &PendingCircuit) {
-        self.queue_ack(source_stream, circuit.source_pipelined.len());
+        let held = self.hop_bridge_len(source_stream);
+        self.queue_ack(source_stream, circuit.source_pipelined.len() + held);
         if let Some(stop_stream) = circuit.stop_stream {
             self.queue_ack(stop_stream, circuit.destination_pipelined.len());
         }
@@ -1486,7 +1498,9 @@ impl RelayServerAgent {
             .is_some_and(|len| len <= MAX_PENDING_BRIDGE_SIZE)
         {
             buffer.extend_from_slice(data);
-            self.bridged = self.bridged.saturating_add(data.len());
+            if direction == CircuitDirection::DestinationToSource {
+                self.stop_bridged = self.stop_bridged.saturating_add(data.len());
+            }
             return;
         }
         let peer_id = match direction {
@@ -2253,11 +2267,14 @@ mod tests {
     use super::*;
     use crate::{RateLimit, RelayServerAction, RelayServerConfig, RelayServerEvent, StreamKey};
 
-    /// The next I/O action, skipping acknowledgements, which only the
-    /// backpressure tests inspect.
+    /// The next I/O action, leaving acknowledgements queued for the
+    /// backpressure tests that inspect them.
     fn io_action(agent: &mut RelayServerAgent) -> Option<RelayServerAction> {
-        core::iter::from_fn(|| agent.poll_action())
-            .find(|action| !matches!(action, RelayServerAction::AckStream { .. }))
+        let index = agent
+            .actions
+            .iter()
+            .position(|action| !matches!(action, RelayServerAction::AckStream { .. }))?;
+        agent.actions.remove(index)
     }
 
     fn direct_addr() -> Multiaddr {
@@ -2387,6 +2404,7 @@ mod tests {
         let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap() else {
             panic!("HOP success");
         };
+        drop_acks(&mut agent);
         (
             agent,
             source,
@@ -2398,8 +2416,17 @@ mod tests {
     }
 
     fn pending_stop(
+        config: RelayServerConfig,
+        now_ms: u64,
+    ) -> (RelayServerAgent, PeerId, PeerId, StreamKey, StreamKey) {
+        pending_stop_with_payload(config, now_ms, &[])
+    }
+
+    /// [`pending_stop`] with `pipelined` payload in the CONNECT's read.
+    fn pending_stop_with_payload(
         mut config: RelayServerConfig,
         now_ms: u64,
+        pipelined: &[u8],
     ) -> (RelayServerAgent, PeerId, PeerId, StreamKey, StreamKey) {
         config.reservation_rate_limit_per_peer = None;
         config.reservation_rate_limit_per_ip = None;
@@ -2437,7 +2464,7 @@ mod tests {
                 limit: None,
                 status: None,
             },
-            &[],
+            pipelined,
         );
         let RelayServerAction::OpenStream { token, .. } = io_action(&mut agent).unwrap() else {
             panic!("STOP open");
@@ -2465,7 +2492,15 @@ mod tests {
             agent.poll_event(),
             Some(RelayServerEvent::CircuitOpened { .. })
         ));
+        drop_acks(&mut agent);
         (agent, source, destination, source_stream, stop_stream)
+    }
+
+    /// Forgets queued acknowledgements of setup reads.
+    fn drop_acks(agent: &mut RelayServerAgent) {
+        agent
+            .actions
+            .retain(|action| !matches!(action, RelayServerAction::AckStream { .. }));
     }
 
     #[test]
@@ -4764,6 +4799,67 @@ mod tests {
                 _ => None,
             })
             .expect("HOP success")
+    }
+
+    #[test]
+    fn payload_coalesced_with_connect_is_acknowledged_only_once_forwarded() {
+        let config = RelayServerConfig::default();
+        let (mut agent, _, destination, source_stream, stop_stream) =
+            pending_stop_with_payload(config, 0, b"abcd");
+        let now = Now::from_millis(1);
+        // The CONNECT read acknowledged only its own frame.
+        let connect = encode_frame(
+            &HopMessage {
+                kind: HopMessageType::Connect,
+                peer: Some(Peer {
+                    id: destination.to_bytes(),
+                    addrs: Vec::new(),
+                }),
+                reservation: None,
+                limit: None,
+                status: None,
+            }
+            .encode(),
+        );
+        assert_eq!(acked(&actions(&mut agent), source_stream), connect.len());
+
+        let status = encode_stop_status(Status::Ok).unwrap();
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: destination,
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+                data: Bytes::from(status.clone()),
+            },
+            false,
+            now,
+        );
+        let accepted = actions(&mut agent);
+        assert_eq!(acked(&accepted, stop_stream), status.len());
+        assert_eq!(acked(&accepted, source_stream), 0);
+        let hop_success = sent(&accepted, source_stream, &accepted_hop_success(&accepted));
+        agent.send_stream_result(hop_success, Ok(()), now);
+        let token = sent(&actions(&mut agent), stop_stream, b"abcd");
+        agent.send_stream_result(token, full(b"cd"), now);
+        assert_eq!(acked(&actions(&mut agent), source_stream), 2);
+    }
+
+    #[test]
+    fn a_failed_connect_releases_payload_held_with_the_connect() {
+        let (mut agent, _, destination, source_stream, stop_stream) =
+            pending_stop_with_payload(RelayServerConfig::default(), 0, b"abcd");
+        let _ = actions(&mut agent);
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: destination,
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+                data: Bytes::from(encode_stop_status(Status::PermissionDenied).unwrap()),
+            },
+            false,
+            Now::from_millis(1),
+        );
+        assert_eq!(acked(&actions(&mut agent), source_stream), 4);
     }
 
     #[test]

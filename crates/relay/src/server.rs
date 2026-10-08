@@ -290,6 +290,13 @@ impl HopResponder {
     pub fn is_done(&self) -> bool {
         self.done
     }
+    /// Payload coalesced with a pending CONNECT, held until the decision: it
+    /// follows acceptance as [`HopResponderOutput::BridgeData`] and is
+    /// dropped by a rejection, so a host tracking read credit can tell it
+    /// from the request's own bytes.
+    pub fn pending_bridge_len(&self) -> usize {
+        self.pending_bridge.len()
+    }
 }
 
 impl SansIoProtocol for HopResponder {
