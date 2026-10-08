@@ -5,7 +5,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use minip2p_platform::Now;
 use minip2p_relay_server::{
-    RelayServerAction, RelayServerAgent, RelayServerEvent, RelayServerToken, StreamKey,
+    RelayServerAction, RelayServerAgent, RelayServerEvent, RelayServerSendError, RelayServerToken,
+    StreamKey,
 };
 use minip2p_swarm::{DriverError, SwarmError, SwarmEvent};
 use minip2p_transport::ConnectionId;
@@ -111,25 +112,10 @@ impl RelayServerDriver {
         };
         // The first event at this time sample runs the agent tick before
         // dispatch, preserving deadline-first ordering for the batch.
+        // The agent acknowledges the data it claims itself, through
+        // `AckStream` actions: circuit payload only once the other leg
+        // accepts it, which is what pauses a sender behind a full leg.
         let claimed = self.agent.handle_event(event, is_circuit, now);
-        // The agent consumes what it claims as it reads it: relay messages,
-        // and circuit bytes it forwards at once (pausing the source behind
-        // a full destination is #257's).
-        if claimed
-            && let SwarmEvent::StreamData {
-                conn_id,
-                stream_id,
-                data,
-                ..
-            } = event
-        {
-            match swarm
-                .core_mut()
-                .ack_stream(*conn_id, *stream_id, data.len())
-            {
-                Ok(()) | Err(_) => {}
-            }
-        }
         if let SwarmEvent::ConnectionEstablished { conn_id, .. }
         | SwarmEvent::ConnectionReplaced { new: conn_id, .. } = event
             && let Some(address) = swarm.core().connection_remote_addr(*conn_id).cloned()
@@ -207,8 +193,21 @@ impl RelayServerDriver {
             } => {
                 let result = swarm
                     .send_stream(&peer_id, stream.conn_id, stream.stream_id, data)
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| match error {
+                        DriverError::Full { unsent, .. } => RelayServerSendError::Full { unsent },
+                        error => RelayServerSendError::Failed(error.to_string()),
+                    });
                 self.agent.send_stream_result(token, result, now);
+            }
+            RelayServerAction::AckStream { stream, bytes } => {
+                // Only a stream or connection that is already gone can
+                // refuse; its bytes were released with it.
+                match swarm
+                    .core_mut()
+                    .ack_stream(stream.conn_id, stream.stream_id, bytes)
+                {
+                    Ok(()) | Err(_) => {}
+                }
             }
             RelayServerAction::CloseStreamWrite {
                 token,
