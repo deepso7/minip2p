@@ -178,7 +178,8 @@ fn stream_data(peer_id: &PeerId, stream: StreamKey, data: Vec<u8>) -> SwarmEvent
     }
 }
 
-/// Acknowledges every queued send, half-close, and reset as accepted.
+/// Reports every queued send, half-close, and reset as accepted. Read
+/// acknowledgements echo no result.
 ///
 /// An unexpected STOP open stays pending, which fails the callers'
 /// `is_idle` assertions.
@@ -194,7 +195,7 @@ fn ack_all(agent: &mut RelayServerAgent, now: Now) {
             RelayServerAction::ResetStream { token, .. } => {
                 agent.reset_stream_result(token, Ok(()), now);
             }
-            RelayServerAction::OpenStream { .. } => {}
+            RelayServerAction::OpenStream { .. } | RelayServerAction::AckStream { .. } => {}
         }
     }
 }

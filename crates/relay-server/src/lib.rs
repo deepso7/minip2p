@@ -6,8 +6,17 @@
 //! sample, feeds Swarm events, drains [`RelayServerAction`] values, and echoes
 //! every result with its opaque [`RelayServerToken`]. After every claimed
 //! input, actions and synchronous results must be drained to quiescence before
-//! another transport event is delivered. Transport queues then provide the
-//! payload backpressure instead of an unbounded agent queue.
+//! another transport event is delivered.
+//!
+//! Forwarding follows ADR 0012's backpressure contract. Each circuit direction
+//! queues what it reads, in order, and the agent acknowledges those bytes to
+//! their sender (through [`RelayServerAction::AckStream`]) only once the other
+//! leg accepts them. A send that comes back [`RelayServerSendError::Full`]
+//! keeps its unsent tail at the head of the queue until that leg's
+//! `StreamWritable`, so a full destination pauses the source through withheld
+//! receive credit instead of closing the circuit, and the queue stays within
+//! the receive budget the source was granted. A half-close is forwarded after
+//! the last queued byte.
 //!
 //! The first [`RelayServerAgent::handle_event`] for a time sample processes
 //! deadlines before it dispatches the event. Call [`RelayServerAgent::handle_tick`]
@@ -35,6 +44,6 @@ pub use config::{
 pub use minip2p_relay::Status;
 pub use types::{
     CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RelayServerAction,
-    RelayServerEvent, RelayServerRuntimeError, RelayServerRuntimeErrorKind, RelayServerToken,
-    ReservationCloseReason, StreamKey,
+    RelayServerEvent, RelayServerRuntimeError, RelayServerRuntimeErrorKind, RelayServerSendError,
+    RelayServerToken, ReservationCloseReason, StreamKey,
 };

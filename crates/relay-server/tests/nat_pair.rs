@@ -83,13 +83,19 @@ fn nat_promote(actions: &[NatAction]) -> minip2p_nat::NatToken {
         .expect("NAT agent promotes the bridged stream")
 }
 
+/// The relay's next I/O action, skipping its read acknowledgements.
+fn relay_action(server: &mut RelayServerAgent) -> Option<RelayServerAction> {
+    core::iter::from_fn(|| server.poll_action())
+        .find(|action| !matches!(action, RelayServerAction::AckStream { .. }))
+}
+
 fn relay_send(server: &mut RelayServerAgent, ms: u64) -> (StreamKey, Vec<u8>) {
     let RelayServerAction::SendStream {
         token,
         stream,
         data,
         ..
-    } = server.poll_action().expect("relay sends control bytes")
+    } = relay_action(server).expect("relay sends control bytes")
     else {
         panic!("expected relay SendStream action")
     };
@@ -98,7 +104,7 @@ fn relay_send(server: &mut RelayServerAgent, ms: u64) -> (StreamKey, Vec<u8>) {
 }
 
 fn finish_relay_stream_cleanup(server: &mut RelayServerAgent, ms: u64) {
-    while let Some(action) = server.poll_action() {
+    while let Some(action) = relay_action(server) {
         match action {
             RelayServerAction::CloseStreamWrite { token, .. } => {
                 server.close_stream_write_result(token, Ok(()), server_now(ms));
@@ -279,7 +285,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         server_now(15),
     );
 
-    let action = server.poll_action().expect("relay opens STOP");
+    let action = relay_action(&mut server).expect("relay opens STOP");
     let RelayServerAction::OpenStream {
         token,
         expected_conn_id,
