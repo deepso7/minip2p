@@ -42,6 +42,11 @@ let target: PeerAddr =
 let connect_id = endpoint.connect(target)?;
 let deadline = Instant::now() + Duration::from_secs(10);
 loop {
+    // `wait` still serves events once the deadline has passed: enforce it here.
+    if Instant::now() >= deadline {
+        endpoint.cancel_connect(connect_id); // explicit: the deadline is only local
+        break;
+    }
     match endpoint.wait(deadline)? {
         EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled { connect_id: id, outcome, .. })
             if id == connect_id =>
@@ -54,10 +59,7 @@ loop {
         }
         EndpointWaitOutcome::Event(other) => println!("{other:?}"), // dispatch as usual
         EndpointWaitOutcome::Interrupted => {} // a WaitHandle woke us; service commands
-        EndpointWaitOutcome::Deadline => {
-            endpoint.cancel_connect(connect_id); // explicit: the deadline is only local
-            break;
-        }
+        EndpointWaitOutcome::Deadline => {} // the clock check above gives up
     }
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -179,7 +181,7 @@ loop {
 }
 ```
 
-State snapshot getters (`path`, `connected_peers`, `is_peer_ready`, `peer_readiness`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`, `reachability`, `active_reservation`, `known_peers`) expose durable state without driving the endpoint; they are not one cross-getter atomic snapshot and may be ahead of the event stream, never behind their own emitted transition. Prefer `connect` plus `ConnectSettled` for a Connection attempt. `wait` and `poll` use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. Deadlines accept an `Instant` (absolute), a `Duration` (relative), or `minip2p::Deadline::NEVER`. For `wait`, an already-passed absolute Instant returns `Deadline` before delivering another queued event; relative `Duration::ZERO` still drains / polls once.
+State snapshot getters (`path`, `connected_peers`, `is_peer_ready`, `peer_readiness`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`, `reachability`, `active_reservation`, `known_peers`) expose durable state without driving the endpoint; they are not one cross-getter atomic snapshot and may be ahead of the event stream, never behind their own emitted transition. Prefer `connect` plus `ConnectSettled` for a Connection attempt. `wait` and `poll` use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. Deadlines accept an `Instant` (absolute), a `Duration` (relative), or `minip2p::Deadline::NEVER`. A deadline that has already passed, whether a stale `Instant` or `Duration::ZERO`, makes `wait` return a queued event or drive the endpoint once without sleeping, so a stale timer never stalls it. The deadline bounds blocking, not delivery: with a strict operation timeout, check the clock before each `wait`, as in the loop above.
 
 Background drivers can clone `Endpoint::wait_handle()` — a transport-neutral `WaitHandle` — and interrupt a blocked `wait` from another thread. The wake is reported as `EndpointWaitOutcome::Interrupted`.
 

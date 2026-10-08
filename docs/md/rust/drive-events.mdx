@@ -28,7 +28,7 @@ let absolute = Instant::now() + Duration::from_secs(5);
 let forever = Deadline::NEVER;
 ```
 
-An already-passed absolute `Instant` deadline returns `Deadline` from `wait` before delivering another queued event. Relative `Duration` deadlines — including `Duration::ZERO` non-blocking drains — still inspect buffered events and poll once. The endpoint does not sleep or poll repeatedly past the deadline.
+A deadline that has already passed — a stale `Instant` or `Duration::ZERO` alike — still lets `wait` return a queued event or drive the endpoint once, so a stale timer never stalls it. The endpoint does not sleep or poll repeatedly past the deadline. The deadline bounds blocking, not delivery: with a strict operation timeout, check the clock before each `wait`, as in the loop below.
 
 ## Wait for a correlated outcome
 
@@ -46,6 +46,11 @@ fn connect_to(
     let connect_id = node.connect(target)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
+        // `wait` still serves events once the deadline has passed: enforce it here.
+        if std::time::Instant::now() >= deadline {
+            node.cancel_connect(connect_id);
+            return Err("connect did not settle".into());
+        }
         match node.wait(deadline)? {
             EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
                 connect_id: settled,
@@ -61,11 +66,8 @@ fn connect_to(
             }
             // Unrelated events keep flowing: dispatch them as usual.
             EndpointWaitOutcome::Event(event) => println!("{event:?}"),
-            EndpointWaitOutcome::Interrupted => {}
-            EndpointWaitOutcome::Deadline => {
-                node.cancel_connect(connect_id);
-                return Err("connect did not settle".into());
-            }
+            // The clock check above gives up.
+            EndpointWaitOutcome::Interrupted | EndpointWaitOutcome::Deadline => {}
         }
     }
 }
@@ -89,7 +91,8 @@ fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> 
     // relative Duration inside the loop would reset the timeout on every
     // unrelated event or interruption.
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
+    // Checked before each wait: unrelated events keep arriving past it.
+    while Instant::now() < deadline {
         match node.wait(deadline)? {
             EndpointWaitOutcome::Event(EndpointEvent::PeerReady { peer_id, .. })
                 if peer_id == peer =>
@@ -103,7 +106,7 @@ fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> 
             EndpointWaitOutcome::Event(_) => {
                 // Handle unrelated connection / stream / ping / capability events.
             }
-            EndpointWaitOutcome::Deadline => break,
+            EndpointWaitOutcome::Deadline => {}
             EndpointWaitOutcome::Interrupted => {
                 // Service external commands, then continue.
             }
