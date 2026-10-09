@@ -239,8 +239,8 @@ enum FinState {
     Accepted,
 }
 
-/// Reads shorter than this are coalesced into one queue entry of at least
-/// this many bytes.
+/// Reads shorter than this are coalesced into one queue entry, flushed once
+/// it reaches this size or sooner when forwarding or ordering needs it.
 const COALESCE_BELOW: usize = 4096;
 
 impl Forward {
