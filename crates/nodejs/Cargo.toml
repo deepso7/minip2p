@@ -68,7 +68,7 @@ napi = { version = "=3.12.2", default-features = false, features = [
   "napi8",
   "serde-json",
 ] }
-napi-derive = "=3.6.3"
+napi-derive = "=3.6.12"
 serde = "1.0.229"
 
 [build-dependencies]
