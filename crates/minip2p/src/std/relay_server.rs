@@ -9,7 +9,7 @@ use minip2p_relay_server::{
     StreamKey,
 };
 use minip2p_swarm::{DriverError, SwarmError, SwarmEvent};
-use minip2p_transport::ConnectionId;
+use minip2p_transport::{ConnectionId, TransportError};
 
 use crate::EndpointSwarm;
 
@@ -200,13 +200,21 @@ impl RelayServerDriver {
                 self.agent.send_stream_result(token, result, now);
             }
             RelayServerAction::AckStream { stream, bytes } => {
-                // Only a stream or connection that is already gone can
-                // refuse; its bytes were released with it.
                 match swarm
                     .core_mut()
                     .ack_stream(stream.conn_id, stream.stream_id, bytes)
                 {
-                    Ok(()) | Err(_) => {}
+                    // A stream or connection that is gone (or torn down by
+                    // this ack's flush) released its bytes with it.
+                    Ok(())
+                    | Err(DriverError::Transport(
+                        TransportError::StreamNotFound { .. }
+                        | TransportError::ConnectionNotFound { .. }
+                        | TransportError::PollError { .. },
+                    )) => {}
+                    // Anything else (an ack past what was delivered, say)
+                    // breaks the agent's accounting.
+                    Err(error) => debug_assert!(false, "relay ack refused: {error}"),
                 }
             }
             RelayServerAction::CloseStreamWrite {
