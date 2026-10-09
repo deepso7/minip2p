@@ -72,4 +72,4 @@ napi-derive = "=3.6.3"
 serde = "1.0.229"
 
 [build-dependencies]
-napi-build = "=2.4.1"
+napi-build = "=2.6.0"
