@@ -51,17 +51,19 @@ pub(crate) enum DialPurpose {
     Relay(ConnectId, PeerAddr),
     /// Simultaneous-open dial of a DCUtR observed address.
     Punch(ConnectId),
-    /// Dial of an AutoNAT server for a reachability probe.
-    Probe,
-    /// Dial of the relay for a reservation.
-    Reserve,
+    /// Dial of an AutoNAT server for a reachability probe. The server is
+    /// kept so a late failure is only applied to a probe still waiting on
+    /// it.
+    Probe(PeerId),
+    /// Dial of the relay for a reservation, keyed like [`Self::Probe`].
+    Reserve(PeerId),
 }
 
 impl DialPurpose {
     fn connect_id(&self) -> Option<ConnectId> {
         match self {
             Self::Relay(id, _) | Self::Punch(id) => Some(*id),
-            Self::Probe | Self::Reserve => None,
+            Self::Probe(_) | Self::Reserve(_) => None,
         }
     }
 }
@@ -909,13 +911,13 @@ impl NatAgent {
             }
         }
         match &purpose {
-            DialPurpose::Probe => {
+            DialPurpose::Probe(peer) => {
                 self.housekeeping
-                    .on_probe_dial_failed(swarm, &mut self.shared, now);
+                    .on_probe_dial_failed(peer, swarm, &mut self.shared, now);
             }
-            DialPurpose::Reserve => {
+            DialPurpose::Reserve(peer) => {
                 self.housekeeping
-                    .on_reserve_dial_failed(swarm, &mut self.shared, now);
+                    .on_reserve_dial_failed(peer, swarm, &mut self.shared, now);
             }
             DialPurpose::Relay(..) | DialPurpose::Punch(_) => {
                 if let Some(id) = purpose.connect_id()

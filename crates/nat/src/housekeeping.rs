@@ -167,7 +167,7 @@ impl Prober {
         let result = acquire::start(
             &server,
             AUTONAT_PROTOCOL_ID,
-            DialPurpose::Probe,
+            DialPurpose::Probe(server.peer_id().clone()),
             deadline_ms,
             swarm,
             shared,
@@ -288,12 +288,21 @@ impl Prober {
         self.next_probe_at = Some(now.mono_ms + shared.config.probe_interval_unsettled_ms);
     }
 
-    fn on_dial_failed(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
-        if self
-            .flight
-            .as_ref()
-            .is_some_and(|f| f.stage == ExchangeStage::WaitPeerReady)
-        {
+    /// A probe dial toward `peer` failed. Only a probe still waiting on
+    /// that server, with no other way to become ready, is aborted: the
+    /// failure may belong to an earlier flight's dial after a rotation.
+    fn on_dial_failed(
+        &mut self,
+        peer: &PeerId,
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) {
+        if self.flight.as_ref().is_some_and(|f| {
+            f.stage == ExchangeStage::WaitPeerReady
+                && f.server.peer_id() == peer
+                && !acquire::can_become_ready(peer, swarm, shared, now)
+        }) {
             self.abort_flight(swarm, shared, now);
         }
     }
@@ -650,7 +659,7 @@ impl ReservationManager {
         let result = acquire::start(
             &relay,
             HOP_PROTOCOL_ID,
-            DialPurpose::Reserve,
+            DialPurpose::Reserve(relay.peer_id().clone()),
             deadline_ms,
             swarm,
             shared,
@@ -818,16 +827,25 @@ impl ReservationManager {
         self.acquire_from(relay, swarm, shared, now);
     }
 
-    fn on_dial_failed(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
-        // A failed extra dial is moot while the relay is connected anyway
-        // (say, over the connection that replaced the one we reserved on).
+    /// A reservation dial toward `peer` failed. It is moot for an
+    /// acquisition from another relay (an earlier flight's dial, after a
+    /// rotation), and while the relay is connected or another dial toward
+    /// it is in flight (say, the connection that replaced the one we
+    /// reserved on).
+    fn on_dial_failed(
+        &mut self,
+        peer: &PeerId,
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) {
         if matches!(
             &self.state,
             ResState::Acquiring {
                 relay,
                 stage: ExchangeStage::WaitPeerReady,
                 ..
-            } if swarm.connection(relay.peer_id()).is_none()
+            } if relay.peer_id() == peer && !acquire::can_become_ready(peer, swarm, shared, now)
         ) {
             self.fail_acquire(swarm, shared, now);
         }
@@ -1070,20 +1088,22 @@ impl Housekeeping {
 
     pub(crate) fn on_probe_dial_failed(
         &mut self,
+        peer: &PeerId,
         swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
         now: Now,
     ) {
-        self.prober.on_dial_failed(swarm, shared, now);
+        self.prober.on_dial_failed(peer, swarm, shared, now);
     }
 
     pub(crate) fn on_reserve_dial_failed(
         &mut self,
+        peer: &PeerId,
         swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
         now: Now,
     ) {
-        self.reservations.on_dial_failed(swarm, shared, now);
+        self.reservations.on_dial_failed(peer, swarm, shared, now);
     }
 
     pub(crate) fn on_stream_input(

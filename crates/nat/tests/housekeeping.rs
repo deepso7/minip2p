@@ -1089,3 +1089,75 @@ fn stalled_session_dial_expires_and_the_retry_redials() {
         "the retry must redial the relay: {actions:?}"
     );
 }
+
+/// Announces `conn` to `peer` as established and ready for `protocol`.
+fn ready_on(hk: &mut Hk, peer: &PeerId, conn: ConnectionId, protocol: &str, now: Now) {
+    hk.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: conn,
+            peer_id: peer.clone(),
+        },
+        false,
+        now,
+    );
+    hk.agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: peer.clone(),
+            conn_id: conn,
+            protocols: vec![protocol.to_string()],
+        },
+        false,
+        now,
+    );
+}
+
+#[test]
+fn late_probe_dial_failure_after_rotation_keeps_the_new_flight() {
+    let mut hk = build(ReservationPolicy::Never, 0, 2);
+    let (server, server2) = (hk.server.clone(), hk.server2.clone());
+    let deadline = NatConfig::default().probe_deadline_ms;
+
+    hk.agent.handle_tick(at(0));
+    let old = dial_conn_for(&drain_actions(&mut hk.agent), &server);
+    // The first server never answers; the retry dials the second.
+    hk.agent.handle_tick(at(deadline));
+    hk.agent.handle_tick(at(deadline + 5_000));
+    let new = dial_conn_for(&drain_actions(&mut hk.agent), &server2);
+
+    let addr = PeerAddr::new(maddr(SERVER_ADDR), server.clone()).expect("server addr");
+    let late = SwarmEvent::DialFailed {
+        conn_id: old,
+        addr,
+        reason: "timed out".into(),
+    };
+    assert!(hk.agent.handle_event(&late, false, at(deadline + 5_001)));
+
+    ready_on(
+        &mut hk,
+        &server2,
+        new,
+        AUTONAT_PROTOCOL_ID,
+        at(deadline + 5_002),
+    );
+    opened_stream_for(&drain_actions(&mut hk.agent), &server2);
+}
+
+#[test]
+fn late_reserve_dial_failure_after_rotation_keeps_the_new_acquisition() {
+    let mut hk = build(ReservationPolicy::Always, 2, 0);
+    let (relay, relay2) = (hk.relay.clone(), hk.relay2.clone());
+    let config = NatConfig::default();
+    let retry_at = config.relay_leg_deadline_ms + config.reservation_retry_backoff_ms;
+
+    hk.agent.handle_tick(at(0));
+    let old = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
+    // The first relay never connects; after the backoff the second is dialed.
+    hk.agent.handle_tick(at(config.relay_leg_deadline_ms));
+    hk.agent.handle_tick(at(retry_at));
+    let new = dial_conn_for(&drain_actions(&mut hk.agent), &relay2);
+
+    assert!(dial_failed(&mut hk, old, "timed out", at(retry_at + 1)));
+
+    ready_on(&mut hk, &relay2, new, HOP_PROTOCOL_ID, at(retry_at + 2));
+    assert_eq!(hop_open_count(&drain_actions(&mut hk.agent), &relay2), 1);
+}
