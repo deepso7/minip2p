@@ -2183,8 +2183,13 @@ type UnnamedEventTag =
   | typeof P2pEvent_Tags.StreamReady;
 type NamedEventTag = Exclude<P2pEventTag, UnnamedEventTag>;
 
-/** SDK event names for every native event that dispatches by name. */
-const SDK_EVENT_NAMES: Readonly<Record<NamedEventTag, EventKind>> = {
+/**
+ * SDK event names for every native event that dispatches by name. Each name
+ * is its tag uncapitalized, so a wrong mapping fails to compile.
+ */
+const SDK_EVENT_NAMES: {
+  readonly [Tag in NamedEventTag]: Uncapitalize<Tag>;
+} = {
   [P2pEvent_Tags.EventsDropped]: "eventsDropped",
   [P2pEvent_Tags.ConnectionEstablished]: "connectionEstablished",
   [P2pEvent_Tags.ConnectionClosed]: "connectionClosed",
@@ -2247,7 +2252,7 @@ function normalizeEvent(
       to: normalizePath(event.inner.to),
     };
   }
-  return { payload: payload as AnyPayload, type: type as never };
+  return { payload: payload as AnyPayload, type };
 }
 
 function normalizePath(path: PathKind): Path {
