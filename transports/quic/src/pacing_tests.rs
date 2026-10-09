@@ -4,6 +4,7 @@
 //! BBR2, whose packets past its unpaced initial burst come back from `send`
 //! with a send time in the future.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -157,4 +158,46 @@ fn a_due_held_packet_never_overtakes_retained_datagrams() {
     server.poll(now()).expect("poll");
     assert_eq!(recv_raw(&peer).as_deref(), Some(&b"earlier"[..]));
     assert_eq!(recv_raw(&peer), Some(held), "the held packet follows it");
+}
+
+#[test]
+fn a_due_held_packet_waits_for_retry_room_then_queues_behind_earlier_datagrams() {
+    let (mut server, peer, id, stream) = paced_burst();
+    let destination = peer.socket.local_addr().expect("peer addr");
+    let socket = &server.socket;
+    let conn = server.connections.get_mut(&id).expect("connection");
+    conn.repace_held_packet(Instant::now());
+    let held = conn.paced_packet().expect("held packet").0.to_vec();
+    let mut retained = VecDeque::from([PendingDatagram {
+        bytes: b"earlier".to_vec(),
+        destination,
+    }]);
+    let mut events = Vec::new();
+
+    // A full retry queue: the held packet stays held rather than overflow it.
+    conn.send_stream(
+        stream,
+        Bytes::from_static(b"more"),
+        socket,
+        &mut events,
+        &mut retained,
+        1,
+    )
+    .expect("send");
+    assert_eq!(retained.len(), 1, "a full retry queue takes nothing more");
+    assert_eq!(conn.paced_packet().map(|(bytes, _)| bytes), Some(&held[..]));
+
+    // One free slot: the held packet takes it, behind the earlier datagram.
+    conn.send_stream(
+        stream,
+        Bytes::from_static(b"more"),
+        socket,
+        &mut events,
+        &mut retained,
+        2,
+    )
+    .expect("send");
+    let queued: Vec<&[u8]> = retained.iter().map(|d| d.bytes.as_slice()).collect();
+    assert_eq!(queued, [&b"earlier"[..], &held[..]]);
+    assert!(conn.paced_packet().is_none(), "the held packet moved out");
 }
