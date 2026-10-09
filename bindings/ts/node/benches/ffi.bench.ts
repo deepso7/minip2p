@@ -1,20 +1,27 @@
-/* oxlint-disable func-style, no-await-in-loop, no-use-before-define, unicorn/no-useless-undefined -- Benchmark fixtures use bounded polling to keep the measured native event path explicit. */
+/* oxlint-disable func-style, no-await-in-loop, no-use-before-define, promise/avoid-new, unicorn/no-useless-undefined -- Benchmark fixtures use bounded polling and hand-rolled waiters to keep the measured native event path explicit. */
 
 import { setTimeout as delay } from "node:timers/promises";
 
 import { afterAll, beforeAll, describe, test } from "vitest";
 
 import { Minip2p, generateSecretKey } from "../src/index.js";
+import type { Stream } from "../src/index.js";
 import { nativeBinding } from "../src/native.js";
 import type { NativeEndpoint } from "../src/native.js";
 
 const BURST = 64;
 const TIMEOUT_MS = 10_000;
 const PROTOCOL = "/minip2p/node-bench/1";
+const TRANSFER_PROTOCOL = "/minip2p/node-bench-transfer/1";
+const TRANSFER_CHUNK = new Uint8Array(16 * 1024);
+const TRANSFER_CHUNKS = 64;
 let sdkA: Minip2p;
 let sdkB: Minip2p;
 let rawA: NativeEndpoint;
 let rawB: NativeEndpoint;
+let transfer: Stream;
+/** Resolves once `bytes` more transfer bytes reached `sdkB`. */
+let awaitTransferred: (bytes: number) => Promise<void>;
 const cleanup: (() => void)[] = [];
 
 beforeAll(async () => {
@@ -22,6 +29,7 @@ beforeAll(async () => {
   cleanup.push(() => sdkA.close());
   sdkB = createSdk();
   cleanup.push(() => sdkB.close());
+  awaitTransferred = receiveTransfers(sdkB);
   sdkB.on("stream", (stream) => {
     // Match the raw remote, which drains ready events without rejecting them.
     void stream;
@@ -31,6 +39,9 @@ beforeAll(async () => {
     sdkA.waitPeerReady(sdkB.peerId(), { timeoutMs: TIMEOUT_MS }),
     sdkB.waitPeerReady(sdkA.peerId(), { timeoutMs: TIMEOUT_MS }),
   ]);
+  transfer = await sdkA.openStream(sdkB.peerId(), TRANSFER_PROTOCOL, {
+    timeoutMs: TIMEOUT_MS,
+  });
   rawA = createRaw();
   cleanup.push(() => rawA.close());
   rawB = createRaw(true);
@@ -59,6 +70,20 @@ describe("node-ffi", () => {
       for (const stream of streams) {
         stream.abandon();
       }
+    }).run();
+  });
+
+  // Per-write and per-chunk cost: 1 MiB in 16 KiB writes, read by a flowing
+  // `data` handler on the remote.
+  test("sdk_stream_transfer", async ({ bench }) => {
+    await bench("sdk_stream_transfer", async () => {
+      const received = awaitTransferred(
+        TRANSFER_CHUNK.byteLength * TRANSFER_CHUNKS
+      );
+      for (let index = 0; index < TRANSFER_CHUNKS; index += 1) {
+        await transfer.write(TRANSFER_CHUNK);
+      }
+      await received;
     }).run();
   });
 
@@ -104,7 +129,7 @@ describe("node-ffi", () => {
 function createSdk(): Minip2p {
   return Minip2p.create({
     listen: ["/ip4/127.0.0.1/tcp/0"],
-    protocols: [PROTOCOL],
+    protocols: [PROTOCOL, TRANSFER_PROTOCOL],
     secretKey: generateSecretKey(),
   });
 }
@@ -127,6 +152,52 @@ function createRaw(drainOnDoorbell = false): NativeEndpoint {
     }
   });
   return endpoint;
+}
+
+/**
+ * Reads every transfer stream `sdk` accepts, and returns a waiter for the
+ * next `bytes` received.
+ */
+function receiveTransfers(sdk: Minip2p): (bytes: number) => Promise<void> {
+  let received = 0;
+  let target = 0;
+  let done: (() => void) | undefined;
+  sdk.on("stream", (stream) => {
+    if (stream.protocolId !== TRANSFER_PROTOCOL) {
+      return;
+    }
+    stream.on("data", (chunk) => {
+      received += chunk.byteLength;
+      if (done !== undefined && received >= target) {
+        done();
+        done = undefined;
+      }
+    });
+  });
+  return (bytes) => {
+    target = received + bytes;
+    const promise = new Promise<void>((resolve) => {
+      done = resolve;
+    });
+    return withTimeout(promise, "transfer");
+  };
+}
+
+async function withTimeout<Value>(
+  promise: Promise<Value>,
+  what: string
+): Promise<Value> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`Timed out waiting for ${what}`));
+    }, TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function firstAddr(addrs: readonly string[]): string {
