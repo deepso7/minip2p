@@ -697,7 +697,7 @@ fn replacement_during_a_refresh_starts_exactly_one_exchange_on_new() {
     let actions = replace_relay_connection(&mut hk, at_unix(renew_at + 1, 1_790));
     assert_eq!(hop_open_count(&actions, &relay), 1);
     assert!(
-        !hk.agent.owns_stream(&relay, stream),
+        !hk.agent.owns_stream(ConnectionId::new(1), stream),
         "the old exchange is gone"
     );
 }
@@ -749,7 +749,7 @@ fn reservation_work_started_on_a_replacement_survives_the_replacement_event() {
         "no reset and no second exchange: {actions:?}"
     );
     assert!(drain_events(&mut hk.agent).is_empty());
-    assert!(hk.agent.owns_stream(&relay, stream));
+    assert!(hk.agent.owns_stream(new, stream));
 
     hk.agent.handle_event(
         &SwarmEvent::StreamReady {

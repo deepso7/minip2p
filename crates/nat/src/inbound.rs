@@ -449,6 +449,10 @@ impl InboundCircuit {
     /// Opens `/libp2p/dcutr` on the promoted circuit `circuit`. Only the
     /// stream allocation is shared with the other NAT exchanges: the
     /// circuit is already ready.
+    ///
+    /// The swarm may be ahead of this event: when the peer's current
+    /// connection already replaced the circuit there is nothing to punch, so
+    /// nothing is opened; the replacement's own event reports the upgrade.
     fn open_dcutr(
         &mut self,
         peer: &PeerId,
@@ -457,27 +461,24 @@ impl InboundCircuit {
         shared: &mut Shared,
         now: Now,
     ) {
-        match swarm.open_stream(peer, minip2p_dcutr::DCUTR_PROTOCOL_ID, now.mono_ms) {
-            Ok((conn, stream)) if conn == circuit => {
-                self.dcutr_stream = Some((conn, stream));
-                self.dcutr = Some(DcutrInitiator::new(&shared.punch_candidates()));
-                self.dcutr_deadline = Some(now.mono_ms + shared.config.relay_leg_deadline_ms);
-                shared.own_stream(peer, conn, stream, StreamRole::DcutrInbound(self.id));
-            }
-            // The swarm is ahead of this event: the peer's current
-            // connection already replaced the circuit, so there is nothing
-            // to punch. Give the stream back at once; the replacement's own
-            // event reports the upgrade.
-            Ok((conn, stream)) => {
-                reset(swarm, peer, conn, stream, now);
-                self.linger_until = None;
-                self.done = true;
-            }
-            Err(_) => {
-                self.linger_until = None;
-                self.done = true;
-            }
-        }
+        // `open_stream` opens on the current connection, just checked to be
+        // the circuit.
+        let opened = if swarm.connection(peer) == Some(circuit) {
+            swarm
+                .open_stream(peer, minip2p_dcutr::DCUTR_PROTOCOL_ID, now.mono_ms)
+                .ok()
+        } else {
+            None
+        };
+        let Some((conn, stream)) = opened else {
+            self.linger_until = None;
+            self.done = true;
+            return;
+        };
+        self.dcutr_stream = Some((conn, stream));
+        self.dcutr = Some(DcutrInitiator::new(&shared.punch_candidates()));
+        self.dcutr_deadline = Some(now.mono_ms + shared.config.relay_leg_deadline_ms);
+        shared.own_stream(peer, conn, stream, StreamRole::DcutrInbound(self.id));
     }
 
     pub(crate) fn on_dcutr_stream_input(

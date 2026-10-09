@@ -667,7 +667,7 @@ impl NatSwarm for FakeSwarm {
             if !self.park_named {
                 return Err(NatSwarmError::NamedAddress(addr.clone()));
             }
-            DialStart::Deferred(token)
+            DialStart::Deferred
         } else {
             self.next_conn += 1;
             DialStart::Started(ConnectionId::new(1_000 + self.next_conn))
@@ -677,7 +677,7 @@ impl NatSwarm for FakeSwarm {
             addr: addr.clone(),
             conn: match start {
                 DialStart::Started(conn) => Some(conn),
-                DialStart::Deferred(_) => None,
+                DialStart::Deferred => None,
             },
         });
         Ok(start)

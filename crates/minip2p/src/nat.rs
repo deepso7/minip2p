@@ -936,7 +936,7 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
             && minip2p_nat::is_named(addr)
         {
             parked.push((token, addr.clone()));
-            return Ok(DialStart::Deferred(token));
+            return Ok(DialStart::Deferred);
         }
         NatSwarm::dial(&mut *self.swarm, addr, token)
     }

@@ -81,7 +81,7 @@ fn silent_inbound_dcutr_exchange_times_out_and_resets_the_stream() {
     h.agent.handle_tick(at(18));
 
     assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
-    assert!(!h.agent.owns_stream(&h.target, stream));
+    assert!(!h.agent.owns_stream(conn, stream));
     assert!(h.agent.is_idle());
 }
 
@@ -118,7 +118,7 @@ fn early_closed_inbound_dcutr_exchange_resets_the_stream() {
     );
 
     assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
-    assert!(!h.agent.owns_stream(&h.target, stream));
+    assert!(!h.agent.owns_stream(conn, stream));
     assert!(h.agent.is_idle());
 }
 
@@ -134,7 +134,7 @@ fn oversized_inbound_dcutr_connect_keeps_the_relayed_path() {
 
     assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
     assert!(drain_events(&mut h.agent).is_empty());
-    assert!(!h.agent.owns_stream(&h.target, stream));
+    assert!(!h.agent.owns_stream(conn, stream));
     assert!(h.agent.is_idle());
 }
 
@@ -295,7 +295,7 @@ fn peer_supplied_punch_targets_must_be_global_unicast_quic_ips() {
     );
     let sync = drain_actions(&mut h.agent);
     assert!(has_reset_for(&sync, stream));
-    assert!(!h.agent.owns_stream(&h.target, stream));
+    assert!(!h.agent.owns_stream(conn, stream));
     h.agent.handle_tick(at(24));
     let targets: Vec<_> = drain_actions(&mut h.agent)
         .into_iter()
@@ -338,7 +338,7 @@ fn relay_disconnect_before_stop_acceptance_drops_the_circuit() {
         at(1),
     );
 
-    assert!(!h.agent.owns_stream(&h.relay, stop));
+    assert!(!h.agent.owns_stream(ConnectionId::new(1), stop));
     assert!(drain_events(&mut h.agent).is_empty());
 }
 
@@ -492,4 +492,42 @@ fn inbound_circuit_replacing_a_direct_connection_announces_its_path() {
         "the retired direct connection must not make the circuit look redundant"
     );
     assert!(matches!(h.agent.path(&target), Some(Path::Relayed { .. })));
+}
+
+#[test]
+fn inbound_dcutr_is_not_opened_once_a_direct_connection_replaced_the_circuit() {
+    let mut h = inbound_harness(NatConfig::default());
+    let stop = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stop, 0);
+    let target = h.target.clone();
+    h.stream_data(stop, stop_connect(&target), at(10));
+    let promotion = drain_actions(&mut h.agent);
+    let circuit = ConnectionId::new(TEST_CIRCUIT_ID);
+    h.agent
+        .promote_result(promote_token(&promotion), Ok(circuit), at(11));
+    // The swarm is ahead: a direct connection already replaced the circuit
+    // when its establishment reaches the agent.
+    h.agent.swarm.connect(&target, ConnectionId::new(7));
+    h.agent.deliver_late(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: target.clone(),
+            conn_id: circuit,
+        },
+        true,
+        at(11),
+    );
+
+    let actions = drain_actions(&mut h.agent);
+    assert!(
+        !actions.iter().any(|a| matches!(a, Out::OpenStream { .. })),
+        "no DCUtR stream on the replacement: {actions:?}"
+    );
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::InboundPathEstablished {
+            path: Path::Relayed { .. },
+            ..
+        }]
+    ));
+    assert!(h.agent.is_idle());
 }

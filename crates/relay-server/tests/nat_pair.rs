@@ -277,7 +277,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     destination_swarm.next_stream = reserve_hop;
     destination_nat.handle_tick(&mut destination_swarm, nat_now(0));
     establish_relay_session(&mut destination_nat, &mut destination_swarm, &relay, 2);
-    assert!(destination_nat.owns_stream(&relay, reserve_hop));
+    assert!(destination_nat.owns_stream(CLIENT_RELAY_CONN, reserve_hop));
     ready_client_hop(
         &mut destination_nat,
         &mut destination_swarm,
@@ -345,7 +345,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         nat_now(10),
     );
     establish_relay_session(&mut source_nat, &mut source_swarm, &relay, 12);
-    assert!(source_nat.owns_stream(&relay, source_hop));
+    assert!(source_nat.owns_stream(CLIENT_RELAY_CONN, source_hop));
     ready_client_hop(&mut source_nat, &mut source_swarm, &relay, source_hop, 14);
     ready_server_hop(&mut server, &source, SOURCE_RELAY_CONN, source_hop, 14);
     let connect_request = source_swarm.take_sent();

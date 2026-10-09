@@ -49,7 +49,7 @@ fn open_inbound_dcutr(h: &mut Harness, conn: ConnectionId, stream: StreamId) {
         false,
         at(310),
     );
-    assert!(h.agent.owns_stream(&h.target, stream));
+    assert!(h.agent.owns_stream(conn, stream));
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn foreign_streams_do_not_mutate_an_active_dcutr_exchange() {
 
     assert!(drain_actions(&mut h.agent).is_empty());
     assert!(drain_events(&mut h.agent).is_empty());
-    assert!(h.agent.owns_stream(&h.target, owned));
+    assert!(h.agent.owns_stream(conn, owned));
 }
 
 #[test]
@@ -205,7 +205,7 @@ fn cancelling_an_active_dcutr_resets_it_and_closes_the_circuit() {
             .iter()
             .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == conn))
     );
-    assert!(!h.agent.owns_stream(&h.target, stream));
+    assert!(!h.agent.owns_stream(conn, stream));
     assert!(drain_events(&mut h.agent).is_empty());
 }
 
@@ -659,7 +659,7 @@ fn direct_replacement_during_dcutr_never_resets_the_retired_stream_by_peer() {
         )),
         "the DCUtR stream ended with the circuit; a reset by peer could hit the new connection"
     );
-    assert!(!h.agent.owns_stream(&h.target, dcutr));
+    assert!(!h.agent.owns_stream(circuit, dcutr));
 }
 
 #[test]

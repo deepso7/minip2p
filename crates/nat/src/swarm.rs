@@ -21,12 +21,12 @@ pub enum DialStart {
     /// established: the outcome arrives later as
     /// `SwarmEvent::ConnectionEstablished` or `SwarmEvent::DialFailed`.
     Started(ConnectionId),
-    /// The host parked a dial to a named (`/dns*`) address under this token,
-    /// which must be the one passed to [`NatSwarm::dial`]. The host reports
-    /// the outcome later through
+    /// The host parked a dial to a named (`/dns*`) address under the token
+    /// passed to [`NatSwarm::dial`]. The host reports the outcome later
+    /// through
     /// [`NatAgent::dial_result`](crate::NatAgent::dial_result), after
     /// checking [`NatAgent::deferred_dial_wanted`](crate::NatAgent::deferred_dial_wanted).
-    Deferred(NatToken),
+    Deferred,
 }
 
 /// Why a [`NatSwarm`] command was refused.
@@ -63,8 +63,8 @@ pub trait NatSwarm {
     fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[String])>;
 
     /// Starts a dial. `token` is already registered by the agent, so a host
-    /// that parks the dial can return [`DialStart::Deferred`] with it and
-    /// report the outcome at any later point.
+    /// that parks the dial can return [`DialStart::Deferred`] and report the
+    /// outcome under that token at any later point.
     fn dial(&mut self, addr: &PeerAddr, token: NatToken) -> Result<DialStart, NatSwarmError>;
 
     /// Opens an outbound stream on `peer`'s current connection and returns

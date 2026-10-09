@@ -205,7 +205,10 @@ fn malformed_stop_connect_tears_the_circuit_down() {
     let actions = drain_actions(&mut h.agent);
     assert!(has_reset_for(&actions, stream));
     assert!(drain_events(&mut h.agent).is_empty());
-    assert!(!h.agent.owns_stream(&h.relay, stream));
+    assert!(
+        !h.agent
+            .owns_stream(minip2p_transport::ConnectionId::new(1), stream)
+    );
     assert!(h.agent.is_idle());
 }
 
@@ -242,7 +245,10 @@ fn inbound_application_streams_are_never_claimed() {
         false,
         at(0),
     );
-    assert!(!h.agent.owns_stream(&h.relay, stream));
+    assert!(
+        !h.agent
+            .owns_stream(minip2p_transport::ConnectionId::new(1), stream)
+    );
     assert!(drain_actions(&mut h.agent).is_empty());
     assert!(h.agent.is_idle());
 }
@@ -280,7 +286,7 @@ fn inbound_unserved_nat_control_streams_are_reset_owned_and_consumed() {
             false,
             at(offset as u64)
         ));
-        assert!(h.agent.owns_stream(&remote, stream));
+        assert!(h.agent.owns_stream(conn_id, stream));
         let actions = drain_actions(&mut h.agent);
         assert!(
             has_reset_for(&actions, stream),
@@ -307,7 +313,7 @@ fn inbound_unserved_nat_control_streams_are_reset_owned_and_consumed() {
             false,
             at(20 + offset as u64)
         ));
-        assert!(!h.agent.owns_stream(&remote, stream));
+        assert!(!h.agent.owns_stream(conn_id, stream));
     }
 
     assert!(drain_events(&mut h.agent).is_empty());

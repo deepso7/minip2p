@@ -22,7 +22,7 @@ fn drive_to_bridged(h: &mut Harness, t0: u64) -> (ConnectId, StreamId) {
     h.relay_session_ready(at(t0 + 210));
 
     let stream = opened_stream(&drain_actions(&mut h.agent));
-    assert!(h.agent.owns_stream(&h.relay, stream));
+    assert!(h.agent.owns_stream(ConnectionId::new(1), stream));
 
     h.stream_ready(stream, at(t0 + 220));
     let actions = drain_actions(&mut h.agent);
@@ -308,7 +308,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
 
     assert!(handled, "rejected NAT control streams stay internal");
     assert!(
-        h.agent.owns_stream(&attacker, stream),
+        h.agent.owns_stream(ConnectionId::new(1), stream),
         "rejected stream remains owned until terminal close"
     );
     assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
@@ -341,7 +341,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
         false,
         at(3)
     ));
-    assert!(!h.agent.owns_stream(&attacker, stream));
+    assert!(!h.agent.owns_stream(ConnectionId::new(1), stream));
     assert!(drain_actions(&mut h.agent).is_empty());
     assert!(drain_events(&mut h.agent).is_empty());
 }
@@ -466,7 +466,7 @@ fn hop_work_started_on_a_replacement_survives_the_replacement_event() {
         "no reset and no second open: {actions:?}"
     );
     assert!(drain_events(&mut h.agent).is_empty());
-    assert!(h.agent.owns_stream(&relay, stream));
+    assert!(h.agent.owns_stream(new, stream));
 
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
@@ -671,7 +671,7 @@ fn malformed_hop_response_fails_with_protocol_error() {
         has_reset_for(&actions, stream),
         "the dead HOP stream is reset"
     );
-    assert!(!h.agent.owns_stream(&h.relay, stream));
+    assert!(!h.agent.owns_stream(ConnectionId::new(1), stream));
     assert!(h.agent.is_idle());
 }
 

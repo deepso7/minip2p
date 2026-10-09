@@ -183,10 +183,7 @@ impl Shared {
                 self.dialed.insert(conn_id, (token, purpose));
                 Ok((token, Some(conn_id)))
             }
-            Ok(DialStart::Deferred(parked)) => {
-                debug_assert_eq!(parked, token, "a parked dial keeps its token");
-                Ok((token, None))
-            }
+            Ok(DialStart::Deferred) => Ok((token, None)),
             Err(error) => {
                 self.tokens.remove(&token);
                 Err(error.to_string())
@@ -462,9 +459,10 @@ pub struct ConnectLegs {
 /// input, then sleep at most [`next_timeout`](Self::next_timeout) before the
 /// next tick.
 ///
-/// The driver must route stream events the agent owns
-/// ([`owns_stream`](Self::owns_stream)) into the agent *only* — application
-/// code must not see them — and forward everything else untouched.
+/// The driver offers every swarm event to the agent first. When
+/// [`handle_event`](Self::handle_event) returns `true` the event belongs to
+/// the NAT control plane and must not reach application code; everything
+/// else is forwarded untouched.
 pub struct NatAgent {
     shared: Shared,
     attempts: BTreeMap<ConnectId, ConnectAttempt>,
@@ -997,14 +995,12 @@ impl NatAgent {
             .map(|due| due.saturating_sub(now_ms))
     }
 
-    /// Returns `true` if `stream_id` on one of `peer`'s connections
-    /// currently belongs to the agent. Stream events are routed on their
-    /// exact connection; this is a query for drivers and tests.
-    pub fn owns_stream(&self, peer: &PeerId, stream_id: StreamId) -> bool {
-        self.shared
-            .streams
-            .iter()
-            .any(|((_, stream), (owner, _))| *stream == stream_id && owner == peer)
+    /// Returns `true` if `stream_id` on connection `conn_id` currently
+    /// belongs to the agent. Routing does not need it (that is
+    /// [`handle_event`](Self::handle_event)'s return value); it is a query
+    /// for diagnostics and tests.
+    pub fn owns_stream(&self, conn_id: ConnectionId, stream_id: StreamId) -> bool {
+        self.shared.streams.contains_key(&(conn_id, stream_id))
     }
 
     /// Our current reachability verdict: majority-of-N confidence over the

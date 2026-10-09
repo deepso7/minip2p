@@ -490,7 +490,7 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
         },
         Now::from_mono(0),
     );
-    assert!(agent.owns_stream(&relay_peer, pair.stream));
+    assert!(agent.owns_stream(pair.inner_conn, pair.stream));
     agent.handle_event(
         &mut swarm,
         &SwarmEvent::StreamReady {
