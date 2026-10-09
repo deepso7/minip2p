@@ -55,12 +55,12 @@ pub struct P2pEndpoint {
     listen_addrs: Vec<String>,
 }
 
-/// How long an interrupted driver stays off `state` after the last command.
-/// This and [`MAX_COMMAND_LINGER`] were tuned on Linux x64; sleep granularity
-/// is coarser on macOS, Windows and mobile, so lingers run longer there.
+/// How long an interrupted driver sleeps, once pending commands clear, before
+/// checking for further commands. See [`Shared::wait_for_commands`].
 const COMMAND_LINGER: Duration = Duration::from_micros(50);
-/// Longest an interrupted driver lingers in total, so a steady stream of
-/// calls cannot starve it: past this it retakes `state` once commands clear.
+/// Lingering budget for an interrupted driver, counted from entering
+/// [`Shared::wait_for_commands`], so a steady stream of calls cannot starve
+/// it: once spent, it retakes `state` as soon as pending commands clear.
 const MAX_COMMAND_LINGER: Duration = Duration::from_millis(1);
 
 pub(crate) struct Shared {
@@ -81,9 +81,7 @@ pub(crate) struct Shared {
     /// Set while an interrupted driver waits on `commands_idle_cv` for
     /// `pending_commands` to reach zero, so only then do commands notify.
     driver_waiting: AtomicBool,
-    /// Guards `commands_idle_cv`, and holds when the driver last resumed
-    /// from `wait_for_commands`.
-    commands_idle: Mutex<Option<Instant>>,
+    commands_idle: Mutex<()>,
     commands_idle_cv: Condvar,
     pub(crate) driver_running: AtomicBool,
     doorbell_running: AtomicBool,
@@ -249,7 +247,7 @@ impl P2pEndpoint {
                 pending_commands: AtomicUsize::new(0),
                 commands_started: AtomicUsize::new(0),
                 driver_waiting: AtomicBool::new(false),
-                commands_idle: Mutex::new(None),
+                commands_idle: Mutex::new(()),
                 commands_idle_cv: Condvar::new(),
                 driver_running: AtomicBool::new(false),
                 doorbell_running: AtomicBool::new(false),
@@ -858,48 +856,44 @@ impl Shared {
     /// `state`. Without it the driver could retake `state` first and park
     /// again in a wait whose interrupt was already spent.
     ///
-    /// Once pending commands clear, it returns at once unless a command
-    /// started since it last looked, or the driver was interrupted within
-    /// [`COMMAND_LINGER`] of last resuming, which marks a burst. Otherwise it
-    /// lingers another [`COMMAND_LINGER`] and checks again, up to
-    /// [`MAX_COMMAND_LINGER`] in all. An isolated command thus costs the
-    /// driver no sleep, and a burst of synchronous calls runs without the
-    /// driver retaking `state` between each. Measured with the Node FFI
+    /// After pending commands clear it sleeps for [`COMMAND_LINGER`] before
+    /// checking for further commands, unless the [`MAX_COMMAND_LINGER`]
+    /// budget has already elapsed, and repeats while commands keep starting:
+    /// a burst of synchronous calls then runs without the driver retaking
+    /// `state` between each. The budget starts on entry; pending-command
+    /// waits and sleep granularity can exceed it. Measured with the Node FFI
     /// benches, this beats a fixed 1 ms sleep, which stalls the driver after
-    /// every write or read acknowledgement, and waking per command, which
-    /// contends with bursts.
+    /// every write or read acknowledgement, waking per command, which
+    /// contends with bursts, and skipping the sleep after an isolated
+    /// command, which on slow hosts lets the driver retake `state` between
+    /// every synchronous call.
     pub(crate) fn wait_for_commands(&self) {
-        let entered = Instant::now();
-        let linger_until = entered + MAX_COMMAND_LINGER;
-        let mut started = self.commands_started.load(Ordering::Acquire);
-        let mut idle = self
-            .commands_idle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut burst =
-            idle.is_some_and(|resumed| entered.saturating_duration_since(resumed) < COMMAND_LINGER);
+        let linger_until = Instant::now() + MAX_COMMAND_LINGER;
         loop {
-            self.driver_waiting.store(true, Ordering::SeqCst);
-            while self.pending_commands.load(Ordering::SeqCst) != 0 {
-                idle = self
-                    .commands_idle_cv
-                    .wait(idle)
+            {
+                let mut idle = self
+                    .commands_idle
+                    .lock()
                     .unwrap_or_else(PoisonError::into_inner);
+                self.driver_waiting.store(true, Ordering::SeqCst);
+                while self.pending_commands.load(Ordering::SeqCst) != 0 {
+                    idle = self
+                        .commands_idle_cv
+                        .wait(idle)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                self.driver_waiting.store(false, Ordering::SeqCst);
             }
-            self.driver_waiting.store(false, Ordering::SeqCst);
-            let now_started = self.commands_started.load(Ordering::Acquire);
-            if (now_started == started && !burst) || Instant::now() >= linger_until {
-                *idle = Some(Instant::now());
+            if Instant::now() >= linger_until {
                 return;
             }
-            burst = false;
-            started = now_started;
-            drop(idle);
+            let started = self.commands_started.load(Ordering::Acquire);
             std::thread::sleep(COMMAND_LINGER);
-            idle = self
-                .commands_idle
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            if self.commands_started.load(Ordering::Acquire) == started
+                && self.pending_commands.load(Ordering::SeqCst) == 0
+            {
+                return;
+            }
         }
     }
 
