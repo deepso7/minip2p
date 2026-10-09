@@ -47,6 +47,7 @@ describeAdapterContract("React Native", {
         fake.nextStream = { connId, streamId };
       },
       writes: fake.writes,
+      writtenData: fake.writtenData,
     };
   },
 });

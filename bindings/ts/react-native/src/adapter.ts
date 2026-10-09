@@ -400,7 +400,56 @@ const ENUM_FIELDS: Readonly<
   },
 };
 
+/**
+ * Converts one native event to its SDK form. Per-chunk and per-write
+ * events, and pubsub messages, convert field by field; the rest share the
+ * generic walk, plus their enum fields.
+ */
 function normalizeEvent(
+  event: NativeP2pEvent,
+  connectionIds: ConnectionIdMap
+): P2pEvent {
+  switch (event.tag) {
+    case P2pEvent_Tags.StreamData: {
+      return {
+        inner: {
+          ...streamRef(event.inner, connectionIds),
+          data: event.inner.data,
+        },
+        tag: event.tag,
+      };
+    }
+    case P2pEvent_Tags.StreamWriteAccepted:
+    case P2pEvent_Tags.StreamRemoteWriteClosed:
+    case P2pEvent_Tags.StreamClosed: {
+      return { inner: streamRef(event.inner, connectionIds), tag: event.tag };
+    }
+    case P2pEvent_Tags.Message: {
+      return { inner: event.inner, tag: event.tag };
+    }
+    default: {
+      return normalizeGenericEvent(event, connectionIds);
+    }
+  }
+}
+
+/** The public identity of the stream a native stream event names. */
+function streamRef(
+  inner: {
+    readonly peerId: string;
+    readonly connId: bigint;
+    readonly streamId: bigint;
+  },
+  connectionIds: ConnectionIdMap
+): { peerId: string; connId: number; streamId: number } {
+  return {
+    connId: connectionIds.toPublic(inner.connId),
+    peerId: inner.peerId,
+    streamId: u64ToNumber(inner.streamId, "streamId"),
+  };
+}
+
+function normalizeGenericEvent(
   event: NativeP2pEvent,
   connectionIds: ConnectionIdMap
 ): P2pEvent {
@@ -490,11 +539,23 @@ function normalizeBigInts(
   return value;
 }
 
+/**
+ * The `ArrayBuffer` UniFFI lowers. Lowering copies the bytes into a Rust
+ * buffer before the call returns, so a view covering its whole
+ * `ArrayBuffer` is passed as is; any other view is copied once.
+ */
 function toArrayBuffer(value: Bytes): ArrayBuffer {
   if (value instanceof ArrayBuffer) {
     return value;
   }
-  return Uint8Array.from(value).buffer;
+  if (
+    value.buffer instanceof ArrayBuffer &&
+    value.byteOffset === 0 &&
+    value.byteLength === value.buffer.byteLength
+  ) {
+    return value.buffer;
+  }
+  return new Uint8Array(value).buffer;
 }
 
 function numberToU64(value: number, name: string): bigint {

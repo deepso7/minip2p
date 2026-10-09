@@ -39,6 +39,8 @@ export interface FakeNativeState {
   setLiveConnection: (connId: bigint) => void;
   /** Writes native `sendStream` accepted, in call order. */
   readonly writes: readonly NativeStreamRef[];
+  /** The bytes native `sendStream` received, viewing native's own buffer. */
+  readonly writtenData: readonly Uint8Array[];
   /** Native `streamConsumed` calls, in call order. */
   readonly consumed: readonly NativeConsumed[];
 }
@@ -307,6 +309,37 @@ export function describeAdapterContract(
       await expect(stream.write("after")).rejects.toThrow();
 
       expect(native.writes).toEqual([{ connId: CONN_ID, streamId: 4n }]);
+      endpoint.close();
+    });
+
+    test("a Uint8Array write reaches native without a JavaScript copy", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      native.setNextStream(CONN_ID, 4n);
+      const opening = endpoint.openStream(PEER, "/test/1");
+      native.deliver([
+        {
+          inner: {
+            connId: CONN_ID,
+            initiatedLocally: true,
+            peerId: PEER,
+            protocolId: "/test/1",
+            streamId: 4n,
+          },
+          tag: "StreamReady",
+        },
+      ]);
+      await drained();
+      const stream = await opening;
+      const whole = new Uint8Array([1, 2, 3, 4]);
+      await stream.write(whole);
+      // A view of part of a buffer reaches native as exactly its bytes.
+      await stream.write(whole.subarray(1, 3));
+
+      const [first, second] = native.writtenData;
+      expect(first?.buffer).toBe(whole.buffer);
+      expect([...(second ?? [])]).toEqual([2, 3]);
       endpoint.close();
     });
 

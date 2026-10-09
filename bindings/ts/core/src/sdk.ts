@@ -34,6 +34,7 @@ import type {
   OnceOptions,
   OpOptions,
   P2pEvent,
+  P2pEventTag,
   Path,
   PathKind,
   Reachability,
@@ -185,6 +186,40 @@ class BoundedQueue<Item> {
   }
 }
 
+/** An unbounded queue whose `shift` is O(1), unlike `Array#shift`. */
+class Fifo<Item> {
+  #items: (Item | undefined)[] = [];
+  #head = 0;
+
+  get length(): number {
+    return this.#items.length - this.#head;
+  }
+
+  push(item: Item): void {
+    this.#items.push(item);
+  }
+
+  shift(): Item | undefined {
+    if (this.#head === this.#items.length) {
+      return undefined;
+    }
+    const item = this.#items[this.#head];
+    this.#items[this.#head] = undefined;
+    this.#head += 1;
+    // Drop the consumed prefix once it is at least half the array.
+    if (this.#head * 2 >= this.#items.length) {
+      this.#items = this.#items.slice(this.#head);
+      this.#head = 0;
+    }
+    return item;
+  }
+
+  clear(): void {
+    this.#items = [];
+    this.#head = 0;
+  }
+}
+
 /**
  * Native events that are never dropped, because stream and connection state
  * depends on each one (ADR 0012), plus the driver failure that ends them.
@@ -196,6 +231,11 @@ const LOSSLESS_TAGS: ReadonlySet<string> = new Set<string>([
   P2pEvent_Tags.ConnectionReplaced,
   P2pEvent_Tags.DriverFailed,
 ]);
+
+type StreamReadyEvent = Extract<
+  P2pEvent,
+  { readonly tag: typeof P2pEvent_Tags.StreamReady }
+>;
 
 type StreamDataEvent = Extract<
   P2pEvent,
@@ -234,17 +274,68 @@ const coalesceData = (
   return { event, source: "native" };
 };
 
-/** The stream a native per-stream event belongs to. */
-const streamEventKey = (item: QueueItem): string | undefined => {
-  if (
-    item.source !== "native" ||
-    (item.event.tag !== P2pEvent_Tags.StreamReady && !isStreamEvent(item.event))
-  ) {
-    return undefined;
+/**
+ * Values keyed by a stream's public connection and stream IDs, without
+ * building a key per lookup. Public connection IDs never repeat and each
+ * names one peer's connection, so the pair names the stream.
+ */
+class StreamTable<Value> {
+  readonly #byConnection = new Map<number, Map<number, Value>>();
+
+  get(connId: number, streamId: number): Value | undefined {
+    return this.#byConnection.get(connId)?.get(streamId);
   }
-  const { peerId, connId, streamId } = item.event.inner;
-  return streamKey(peerId, connId, streamId);
-};
+
+  has(connId: number, streamId: number): boolean {
+    return this.#byConnection.get(connId)?.has(streamId) ?? false;
+  }
+
+  set(connId: number, streamId: number, value: Value): void {
+    let streams = this.#byConnection.get(connId);
+    if (streams === undefined) {
+      streams = new Map();
+      this.#byConnection.set(connId, streams);
+    }
+    streams.set(streamId, value);
+  }
+
+  delete(connId: number, streamId: number): void {
+    const streams = this.#byConnection.get(connId);
+    if (streams?.delete(streamId) === true && streams.size === 0) {
+      this.#byConnection.delete(connId);
+    }
+  }
+
+  /** Removes and returns every value on `connId`. */
+  takeConnection(connId: number): Value[] {
+    const streams = this.#byConnection.get(connId);
+    this.#byConnection.delete(connId);
+    return streams === undefined ? [] : [...streams.values()];
+  }
+
+  /** A snapshot of every value. */
+  values(): Value[] {
+    return [...this.#byConnection.values()].flatMap((streams) => [
+      ...streams.values(),
+    ]);
+  }
+
+  /** Removes and returns every value. */
+  takeAll(): Value[] {
+    const values = this.values();
+    this.#byConnection.clear();
+    return values;
+  }
+}
+
+/** The native per-stream event an item carries, if any. */
+const streamEventOf = (
+  item: QueueItem
+): StreamP2pEvent | StreamReadyEvent | undefined =>
+  item.source === "native" &&
+  (item.event.tag === P2pEvent_Tags.StreamReady || isStreamEvent(item.event))
+    ? item.event
+    : undefined;
 
 /**
  * The endpoint's shared event queue, in delivery order.
@@ -267,7 +358,7 @@ class EventQueue {
    * Peer-opened streams whose `StreamReady` is still queued, with their
    * queued item ids; `undefined` once one carried data.
    */
-  readonly #unseen = new Map<string, number[] | undefined>();
+  readonly #unseen = new StreamTable<number[] | undefined>();
   readonly #capacity: number;
   readonly #release: (item: QueueItem) => void;
   #next = 0;
@@ -323,7 +414,7 @@ class EventQueue {
       item?.source === "native" &&
       item.event.tag === P2pEvent_Tags.StreamReady
     ) {
-      this.#unseen.delete(streamEventKey(item) ?? "");
+      this.#unseen.delete(item.event.inner.connId, item.event.inner.streamId);
     }
     return item;
   }
@@ -333,25 +424,25 @@ class EventQueue {
    * it closed one that carried no data, which leaves the queue whole.
    */
   #elideUnseen(item: QueueItem, id: number): boolean {
-    const key = streamEventKey(item);
-    if (key === undefined || item.source !== "native") {
+    const event = streamEventOf(item);
+    if (event === undefined) {
       return false;
     }
-    const { event } = item;
+    const { connId, streamId } = event.inner;
     if (event.tag === P2pEvent_Tags.StreamReady) {
       if (!event.inner.initiatedLocally) {
-        this.#unseen.set(key, [id]);
+        this.#unseen.set(connId, streamId, [id]);
       }
       return false;
     }
-    if (!this.#unseen.has(key)) {
+    if (!this.#unseen.has(connId, streamId)) {
       return false;
     }
-    const ids = this.#unseen.get(key);
+    const ids = this.#unseen.get(connId, streamId);
     if (event.tag === P2pEvent_Tags.StreamData) {
-      this.#unseen.set(key, undefined);
+      this.#unseen.set(connId, streamId, undefined);
     } else if (ids !== undefined && event.tag === P2pEvent_Tags.StreamClosed) {
-      this.#unseen.delete(key);
+      this.#unseen.delete(connId, streamId);
       for (const queued of ids) {
         const removed = this.#remove(queued);
         if (removed !== undefined) {
@@ -397,7 +488,7 @@ export class Stream {
     keyof StreamEventMap,
     Set<(payload: StreamEventMap[keyof StreamEventMap]) => void>
   >();
-  readonly #fifo: Uint8Array[] = [];
+  readonly #fifo = new Fifo<Uint8Array>();
   readonly #reads: PendingRead[] = [];
   #fifoBytes = 0;
   #mode: "pull" | "flowing" | undefined;
@@ -598,7 +689,7 @@ export class Stream {
    */
   #discardUnread(): void {
     this.#consumed(this.#fifoBytes);
-    this.#fifo.length = 0;
+    this.#fifo.clear();
     this.#fifoBytes = 0;
   }
 
@@ -892,8 +983,8 @@ export class Minip2pBase {
   });
   readonly #connects = new Map<number, ConnectAttempt>();
   readonly #terminalConnects = new Set<number>();
-  readonly #streams = new Map<string, Stream>();
-  readonly #pendingOpens = new Map<string, PendingOpen>();
+  readonly #streams = new StreamTable<Stream>();
+  readonly #pendingOpens = new StreamTable<PendingOpen>();
   readonly #pings = new Map<string, PingOperation>();
   #dropped = 0;
   #flushScheduled = false;
@@ -1316,8 +1407,10 @@ export class Minip2pBase {
       pending.removeAbort = listenAbort(options.signal, () => {
         this.#expireOpen(pending, new AbortError());
       });
-      const key = pendingOpenKey(peerId, identity.connId, identity.streamId);
-      const overwritten = this.#pendingOpens.get(key);
+      const overwritten = this.#pendingOpens.get(
+        identity.connId,
+        identity.streamId
+      );
       if (overwritten !== undefined) {
         clearPendingOpen(overwritten);
         overwritten.reject(
@@ -1330,7 +1423,7 @@ export class Minip2pBase {
           })
         );
       }
-      this.#pendingOpens.set(key, pending);
+      this.#pendingOpens.set(identity.connId, identity.streamId, pending);
     });
   }
 
@@ -1532,7 +1625,7 @@ export class Minip2pBase {
         this.#connectResultsLost(event.inner.terminalConnectIds);
       }
     }
-    for (const pending of this.#pendingOpens.values()) {
+    for (const pending of this.#pendingOpens.takeAll()) {
       clearPendingOpen(pending);
       pending.reject(error);
       try {
@@ -1545,7 +1638,6 @@ export class Minip2pBase {
         // The operation is already failed; native cleanup is best effort.
       }
     }
-    this.#pendingOpens.clear();
   }
 
   #enqueueNative(event: P2pEvent): void {
@@ -1650,7 +1742,6 @@ export class Minip2pBase {
     }
     if (event.tag === P2pEvent_Tags.ConnectionClosed) {
       this.#connectionEnded(
-        event.inner.peerId,
         event.inner.connId,
         new PeerDisconnectedError(event.inner.peerId, "stream"),
         new PeerDisconnectedError(event.inner.peerId, "openStream")
@@ -1660,7 +1751,6 @@ export class Minip2pBase {
       // Native ends the replaced connection's streams without per-stream
       // terminal events, so they end here.
       this.#connectionEnded(
-        event.inner.peerId,
         event.inner.oldConnId,
         new StreamClosedError("The stream's connection was replaced"),
         new StreamClosedError(
@@ -1676,13 +1766,11 @@ export class Minip2pBase {
     }
 
     const normalized = normalizeEvent(event);
-    if (normalized !== undefined) {
-      this.#dispatch(
-        normalized.type as never,
-        normalized.payload as never,
-        normalized.payload as never
-      );
-    }
+    this.#dispatch(
+      normalized.type as never,
+      normalized.payload as never,
+      normalized.payload as never
+    );
   }
 
   #dispatch<Kind extends EventKind>(
@@ -1693,11 +1781,13 @@ export class Minip2pBase {
       : never
   ): boolean {
     let claimed = false;
-    const result = eventResult(type, payload);
-    for (const waiter of [...this.#waiters]) {
+    // Built only once a waiter of this type is found.
+    let result: ({ readonly type: Kind } & typeof payload) | undefined;
+    for (const waiter of this.#waiters.size > 0 ? [...this.#waiters] : []) {
       if (waiter.type !== type) {
         continue;
       }
+      result ??= eventResult(type, payload);
       let matched = false;
       try {
         matched = waiter.predicate(result as never);
@@ -1725,7 +1815,8 @@ export class Minip2pBase {
         this.#handlerFailed(type, payload, error);
       }
     }
-    if (type !== "stream") {
+    if (type !== "stream" && this.#catchAll.size > 0) {
+      // Its own object: a waiter's resolved event is never a catch-all's.
       const catchEvent = eventResult(
         type as keyof Minip2pCatchAllEventMap,
         catchPayload as Minip2pCatchAllEventMap[keyof Minip2pCatchAllEventMap]
@@ -1756,15 +1847,13 @@ export class Minip2pBase {
   }
 
   #streamReady(meta: InboundStreamMeta): void {
-    const key = streamKey(meta.peerId, meta.connId, meta.streamId);
     const stream = new Stream(this.#backend, meta, () => {
-      this.#streams.delete(key);
+      this.#streams.delete(meta.connId, meta.streamId);
     });
-    this.#streams.set(key, stream);
-    const pendingKey = pendingOpenKey(meta.peerId, meta.connId, meta.streamId);
-    const pending = this.#pendingOpens.get(pendingKey);
+    this.#streams.set(meta.connId, meta.streamId, stream);
+    const pending = this.#pendingOpens.get(meta.connId, meta.streamId);
     if (pending !== undefined && meta.initiatedLocally) {
-      this.#pendingOpens.delete(pendingKey);
+      this.#pendingOpens.delete(meta.connId, meta.streamId);
       clearPendingOpen(pending);
       pending.resolve(stream);
       return;
@@ -1800,13 +1889,12 @@ export class Minip2pBase {
   }
 
   #streamEvent(event: StreamP2pEvent): void {
-    const { peerId, connId, streamId } = event.inner;
-    const stream = this.#streams.get(streamKey(peerId, connId, streamId));
+    const { connId, streamId } = event.inner;
+    const stream = this.#streams.get(connId, streamId);
     if (event.tag === P2pEvent_Tags.StreamClosed) {
-      const pendingKey = pendingOpenKey(peerId, connId, streamId);
-      const pending = this.#pendingOpens.get(pendingKey);
+      const pending = this.#pendingOpens.get(connId, streamId);
       if (pending !== undefined) {
-        this.#pendingOpens.delete(pendingKey);
+        this.#pendingOpens.delete(connId, streamId);
         clearPendingOpen(pending);
         pending.reject(new StreamClosedError());
       }
@@ -1840,12 +1928,14 @@ export class Minip2pBase {
     if (error.streamId === undefined) {
       return;
     }
-    const candidates = [...this.#pendingOpens.values()].filter(
-      (pending) =>
-        pending.streamId === error.streamId &&
-        (error.peerId === undefined || error.peerId === pending.peerId) &&
-        (error.connId === undefined || error.connId === pending.connId)
-    );
+    const candidates = this.#pendingOpens
+      .values()
+      .filter(
+        (pending) =>
+          pending.streamId === error.streamId &&
+          (error.peerId === undefined || error.peerId === pending.peerId) &&
+          (error.connId === undefined || error.connId === pending.connId)
+      );
     if (candidates.length !== 1) {
       return;
     }
@@ -1853,9 +1943,7 @@ export class Minip2pBase {
     if (pending === undefined) {
       return;
     }
-    this.#pendingOpens.delete(
-      pendingOpenKey(pending.peerId, pending.connId, pending.streamId)
-    );
+    this.#pendingOpens.delete(pending.connId, pending.streamId);
     clearPendingOpen(pending);
     pending.reject(
       new OpenStreamError({
@@ -1869,26 +1957,13 @@ export class Minip2pBase {
   }
 
   /** Ends every stream and pending open on a closed or replaced connection. */
-  #connectionEnded(
-    peerId: string,
-    connId: number,
-    streamError: Error,
-    openError: Error
-  ): void {
-    for (const [key, stream] of [...this.#streams]) {
-      if (stream.peerId === peerId && stream.connId === connId) {
-        stream.terminal(streamError);
-        this.#streams.delete(key);
-      }
+  #connectionEnded(connId: number, streamError: Error, openError: Error): void {
+    for (const stream of this.#streams.takeConnection(connId)) {
+      stream.terminal(streamError);
     }
-    for (const pending of [...this.#pendingOpens.values()]) {
-      if (pending.peerId === peerId && pending.connId === connId) {
-        this.#pendingOpens.delete(
-          pendingOpenKey(pending.peerId, pending.connId, pending.streamId)
-        );
-        clearPendingOpen(pending);
-        pending.reject(openError);
-      }
+    for (const pending of this.#pendingOpens.takeConnection(connId)) {
+      clearPendingOpen(pending);
+      pending.reject(openError);
     }
   }
 
@@ -1985,15 +2060,10 @@ export class Minip2pBase {
   }
 
   #expireOpen(pending: PendingOpen, error: unknown): void {
-    const key = pendingOpenKey(
-      pending.peerId,
-      pending.connId,
-      pending.streamId
-    );
-    if (this.#pendingOpens.get(key) !== pending) {
+    if (this.#pendingOpens.get(pending.connId, pending.streamId) !== pending) {
       return;
     }
-    this.#pendingOpens.delete(key);
+    this.#pendingOpens.delete(pending.connId, pending.streamId);
     clearPendingOpen(pending);
     pending.reject(error);
     try {
@@ -2047,15 +2117,13 @@ export class Minip2pBase {
     }
     this.#connects.clear();
     this.#terminalConnects.clear();
-    for (const pending of this.#pendingOpens.values()) {
+    for (const pending of this.#pendingOpens.takeAll()) {
       clearPendingOpen(pending);
       pending.reject(error);
     }
-    this.#pendingOpens.clear();
-    for (const stream of this.#streams.values()) {
+    for (const stream of this.#streams.takeAll()) {
       stream.terminal(error);
     }
-    this.#streams.clear();
     for (const ping of this.#pings.values()) {
       ping.cancel(error);
     }
@@ -2108,6 +2176,47 @@ function toBackendTarget(target: ConnectTarget): BackendConnectTarget {
     : { kind: "peer", peerId: target };
 }
 
+/** Native events the SDK handles itself rather than dispatching by name. */
+type UnnamedEventTag =
+  | StreamP2pEvent["tag"]
+  | typeof P2pEvent_Tags.DriverFailed
+  | typeof P2pEvent_Tags.StreamReady;
+type NamedEventTag = Exclude<P2pEventTag, UnnamedEventTag>;
+
+/** SDK event names for every native event that dispatches by name. */
+const SDK_EVENT_NAMES: Readonly<Record<NamedEventTag, EventKind>> = {
+  [P2pEvent_Tags.EventsDropped]: "eventsDropped",
+  [P2pEvent_Tags.ConnectionEstablished]: "connectionEstablished",
+  [P2pEvent_Tags.ConnectionClosed]: "connectionClosed",
+  [P2pEvent_Tags.ConnectionReplaced]: "connectionReplaced",
+  [P2pEvent_Tags.PeerReady]: "peerReady",
+  [P2pEvent_Tags.IdentifyReceived]: "identifyReceived",
+  [P2pEvent_Tags.PingRttMeasured]: "pingRttMeasured",
+  [P2pEvent_Tags.PingTimeout]: "pingTimeout",
+  [P2pEvent_Tags.EndpointError]: "endpointError",
+  [P2pEvent_Tags.ReachabilityChanged]: "reachabilityChanged",
+  [P2pEvent_Tags.PublicAddressesChanged]: "publicAddressesChanged",
+  [P2pEvent_Tags.RelayReserved]: "relayReserved",
+  [P2pEvent_Tags.RelayReservationLost]: "relayReservationLost",
+  [P2pEvent_Tags.PathEstablished]: "pathEstablished",
+  [P2pEvent_Tags.InboundPathEstablished]: "inboundPathEstablished",
+  [P2pEvent_Tags.PathUpgraded]: "pathUpgraded",
+  [P2pEvent_Tags.HolePunchFailed]: "holePunchFailed",
+  [P2pEvent_Tags.ConnectFailed]: "connectFailed",
+  [P2pEvent_Tags.ConnectCancelled]: "connectCancelled",
+  [P2pEvent_Tags.InboundDirectUpgrade]: "inboundDirectUpgrade",
+  [P2pEvent_Tags.Message]: "message",
+  [P2pEvent_Tags.PeerSubscribed]: "peerSubscribed",
+  [P2pEvent_Tags.PeerUnsubscribed]: "peerUnsubscribed",
+  [P2pEvent_Tags.GossipsubOutboundFailure]: "gossipsubOutboundFailure",
+  [P2pEvent_Tags.GossipsubProtocolViolation]: "gossipsubProtocolViolation",
+  [P2pEvent_Tags.PeerDiscovered]: "peerDiscovered",
+  [P2pEvent_Tags.PeerUpdated]: "peerUpdated",
+  [P2pEvent_Tags.PeerExpired]: "peerExpired",
+  [P2pEvent_Tags.DiscoveryDialFailed]: "discoveryDialFailed",
+  [P2pEvent_Tags.DiscoveryProtocolViolation]: "discoveryProtocolViolation",
+};
+
 function normalizeEvent(
   event: Exclude<
     P2pEvent,
@@ -2118,51 +2227,14 @@ function normalizeEvent(
           | typeof P2pEvent_Tags.StreamReady;
       }
   >
-):
-  | {
-      type: Exclude<
-        EventKind,
-        "stream" | "queueOverflow" | "handlerError" | "driverFailed"
-      >;
-      payload: AnyPayload;
-    }
-  | undefined {
-  const names: Partial<Record<string, EventKind>> = {
-    [P2pEvent_Tags.EventsDropped]: "eventsDropped",
-    [P2pEvent_Tags.ConnectionEstablished]: "connectionEstablished",
-    [P2pEvent_Tags.ConnectionClosed]: "connectionClosed",
-    [P2pEvent_Tags.ConnectionReplaced]: "connectionReplaced",
-    [P2pEvent_Tags.PeerReady]: "peerReady",
-    [P2pEvent_Tags.IdentifyReceived]: "identifyReceived",
-    [P2pEvent_Tags.PingRttMeasured]: "pingRttMeasured",
-    [P2pEvent_Tags.PingTimeout]: "pingTimeout",
-    [P2pEvent_Tags.EndpointError]: "endpointError",
-    [P2pEvent_Tags.ReachabilityChanged]: "reachabilityChanged",
-    [P2pEvent_Tags.PublicAddressesChanged]: "publicAddressesChanged",
-    [P2pEvent_Tags.RelayReserved]: "relayReserved",
-    [P2pEvent_Tags.RelayReservationLost]: "relayReservationLost",
-    [P2pEvent_Tags.PathEstablished]: "pathEstablished",
-    [P2pEvent_Tags.InboundPathEstablished]: "inboundPathEstablished",
-    [P2pEvent_Tags.PathUpgraded]: "pathUpgraded",
-    [P2pEvent_Tags.HolePunchFailed]: "holePunchFailed",
-    [P2pEvent_Tags.ConnectFailed]: "connectFailed",
-    [P2pEvent_Tags.ConnectCancelled]: "connectCancelled",
-    [P2pEvent_Tags.InboundDirectUpgrade]: "inboundDirectUpgrade",
-    [P2pEvent_Tags.Message]: "message",
-    [P2pEvent_Tags.PeerSubscribed]: "peerSubscribed",
-    [P2pEvent_Tags.PeerUnsubscribed]: "peerUnsubscribed",
-    [P2pEvent_Tags.GossipsubOutboundFailure]: "gossipsubOutboundFailure",
-    [P2pEvent_Tags.GossipsubProtocolViolation]: "gossipsubProtocolViolation",
-    [P2pEvent_Tags.PeerDiscovered]: "peerDiscovered",
-    [P2pEvent_Tags.PeerUpdated]: "peerUpdated",
-    [P2pEvent_Tags.PeerExpired]: "peerExpired",
-    [P2pEvent_Tags.DiscoveryDialFailed]: "discoveryDialFailed",
-    [P2pEvent_Tags.DiscoveryProtocolViolation]: "discoveryProtocolViolation",
-  };
-  const type = names[event.tag];
-  if (type === undefined) {
-    return undefined;
-  }
+): {
+  type: Exclude<
+    EventKind,
+    "stream" | "queueOverflow" | "handlerError" | "driverFailed"
+  >;
+  payload: AnyPayload;
+} {
+  const type = SDK_EVENT_NAMES[event.tag];
   let payload: unknown = event.inner;
   if (event.tag === P2pEvent_Tags.PathEstablished) {
     payload = { ...event.inner, path: normalizePath(event.inner.path) };
@@ -2190,18 +2262,6 @@ function normalizePath(path: PathKind): Path {
       return { kind: "relayed", relayPeerId: path.inner.relayPeerId };
     }
   }
-}
-
-function streamKey(peerId: string, connId: number, streamId: number): string {
-  return `${peerId}\u0000${connId}\u0000${streamId}`;
-}
-
-function pendingOpenKey(
-  peerId: string,
-  connId: number,
-  streamId: number
-): string {
-  return streamKey(peerId, connId, streamId);
 }
 
 function streamMeta(stream: Stream): InboundStreamMeta {

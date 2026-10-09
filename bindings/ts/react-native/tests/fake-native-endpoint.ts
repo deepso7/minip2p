@@ -58,6 +58,8 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
   liveConnId: bigint | undefined = undefined;
   /** Writes `sendStream` accepted, in call order. */
   readonly writes: { connId: bigint; streamId: bigint }[] = [];
+  /** Bytes `sendStream` received, in call order. */
+  readonly writtenData: Uint8Array[] = [];
   /** `streamConsumed` calls, in call order. */
   readonly consumed: { bytes: number; connId: bigint; streamId: bigint }[] = [];
   readonly #batches: FakeEvent[][] = [];
@@ -203,7 +205,7 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     _peerId: string,
     connId: bigint,
     streamId: bigint,
-    _data: ArrayBuffer
+    data: ArrayBuffer
   ): boolean {
     if (this.liveConnId !== undefined && connId !== this.liveConnId) {
       throw new Error(
@@ -211,6 +213,7 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
       );
     }
     this.writes.push({ connId, streamId });
+    this.writtenData.push(new Uint8Array(data));
     return true;
   }
 
