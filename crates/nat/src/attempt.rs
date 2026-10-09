@@ -426,7 +426,7 @@ impl ConnectAttempt {
         if self.dcutr_stream.is_some() {
             self.finish_failed_dcutr("DCUtR circuit was replaced".into(), swarm, shared, now);
         } else if new_owned {
-            shared.abort_attempt_dials(self.id);
+            shared.abort_attempt_dials(self.id, &self.peer, swarm);
             shared.push_event(NatEvent::FellBackToRelay {
                 connect_id: self.id,
                 peer: self.peer.clone(),
@@ -615,32 +615,39 @@ impl ConnectAttempt {
         shared: &mut Shared,
         now: Now,
     ) {
+        if let Err(error) = self.take_acquired(result, shared) {
+            self.fail_relay_leg(error, swarm, shared, now);
+        }
+    }
+
+    /// Records an acquisition step, returning the leg's error if it failed.
+    fn take_acquired(
+        &mut self,
+        result: Result<Acquired, AcquireError>,
+        shared: &mut Shared,
+    ) -> Result<(), NatError> {
         match result {
             Ok(Acquired::Waiting) => self.leg = RelayLeg::WaitRelayReady,
             Ok(Acquired::Opened(conn, stream)) => {
-                let Some(relay_peer) = self.relay_peer().cloned() else {
-                    return;
-                };
-                self.hop = Some(HopConnect::new(self.peer.to_bytes()));
-                shared.own_stream(&relay_peer, conn, stream, StreamRole::HopConnect(self.id));
-                self.leg = RelayLeg::WaitHopReady { conn, stream };
+                if let Some(relay_peer) = self.relay_peer().cloned() {
+                    self.hop = Some(HopConnect::new(self.peer.to_bytes()));
+                    shared.own_stream(&relay_peer, conn, stream, StreamRole::HopConnect(self.id));
+                    self.leg = RelayLeg::WaitHopReady { conn, stream };
+                }
             }
-            Err(AcquireError::Dial(reason)) => {
-                self.fail_relay_leg(NatError::DialFailed(reason), swarm, shared, now);
+            Err(AcquireError::Dial(reason)) => return Err(NatError::DialFailed(reason)),
+            Err(AcquireError::Unsupported) => {
+                return Err(NatError::Protocol(
+                    "relay does not advertise the HOP protocol".into(),
+                ));
             }
-            Err(AcquireError::Unsupported) => self.fail_relay_leg(
-                NatError::Protocol("relay does not advertise the HOP protocol".into()),
-                swarm,
-                shared,
-                now,
-            ),
-            Err(AcquireError::Open(reason)) => self.fail_relay_leg(
-                NatError::Protocol(format!("opening HOP stream failed: {reason}")),
-                swarm,
-                shared,
-                now,
-            ),
+            Err(AcquireError::Open(reason)) => {
+                return Err(NatError::Protocol(format!(
+                    "opening HOP stream failed: {reason}"
+                )));
+            }
         }
+        Ok(())
     }
 
     pub(crate) fn on_stream_input(
@@ -734,49 +741,61 @@ impl ConnectAttempt {
     /// Starts on the next untried relay entry. A relay reached for the first
     /// time gets an even share of the leg's remaining time; its addresses
     /// split what is left of that share. Callers check that one is left.
+    ///
+    /// Entries that fail at once (a refused dial or open) move straight on
+    /// to the next one in this loop, so stack use stays flat however many
+    /// relay addresses the host configured.
     fn try_next_relay(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
-        let Some(relay) = self.untried.pop_front() else {
-            return;
-        };
-        let relay_peer = relay.peer_id().clone();
-        if !self.is_relay_peer(&relay_peer) {
-            // `relay_order` keeps a relay's addresses together, so each
-            // remaining peer appears once as a run.
-            let mut peers_left = 1;
-            let mut last = &relay_peer;
-            for entry in &self.untried {
-                if entry.peer_id() != last {
-                    peers_left += 1;
-                    last = entry.peer_id();
+        loop {
+            let Some(relay) = self.untried.pop_front() else {
+                return;
+            };
+            let relay_peer = relay.peer_id().clone();
+            if !self.is_relay_peer(&relay_peer) {
+                // `relay_order` keeps a relay's addresses together, so each
+                // remaining peer appears once as a run.
+                let mut peers_left = 1;
+                let mut last = &relay_peer;
+                for entry in &self.untried {
+                    if entry.peer_id() != last {
+                        peers_left += 1;
+                        last = entry.peer_id();
+                    }
                 }
+                let remaining = self.leg_deadline.saturating_sub(now.mono_ms);
+                self.share_deadline = now.mono_ms + remaining / peers_left;
             }
-            let remaining = self.leg_deadline.saturating_sub(now.mono_ms);
-            self.share_deadline = now.mono_ms + remaining / peers_left;
-        }
-        let addrs_left = 1 + self
-            .untried
-            .iter()
-            .take_while(|entry| entry.peer_id() == &relay_peer)
-            .count() as u64;
-        let share_left = self.share_deadline.saturating_sub(now.mono_ms);
-        self.relay_deadline = Some(now.mono_ms + share_left / addrs_left);
-        self.relay = Some(relay.clone());
+            let addrs_left = 1 + self
+                .untried
+                .iter()
+                .take_while(|entry| entry.peer_id() == &relay_peer)
+                .count() as u64;
+            let share_left = self.share_deadline.saturating_sub(now.mono_ms);
+            self.relay_deadline = Some(now.mono_ms + share_left / addrs_left);
+            self.relay = Some(relay.clone());
 
-        // Connected, or another machine (reservation, probe) is already
-        // dialing this relay: the acquisition waits for `PeerReady` on that
-        // connection instead of dialing again.
-        let purpose = DialPurpose::Relay(self.id, relay.clone());
-        let deadline_ms = shared.config.relay_leg_deadline_ms;
-        let result = acquire::start(
-            &relay,
-            HOP_PROTOCOL_ID,
-            purpose,
-            deadline_ms,
-            swarm,
-            shared,
-            now,
-        );
-        self.on_acquired(result, swarm, shared, now);
+            // Connected, or another machine (reservation, probe) is already
+            // dialing this relay: the acquisition waits for `PeerReady` on that
+            // connection instead of dialing again.
+            let purpose = DialPurpose::Relay(self.id, relay.clone());
+            let deadline_ms = shared.config.relay_leg_deadline_ms;
+            let result = acquire::start(
+                &relay,
+                HOP_PROTOCOL_ID,
+                purpose,
+                deadline_ms,
+                swarm,
+                shared,
+                now,
+            );
+            let Err(error) = self.take_acquired(result, shared) else {
+                return;
+            };
+            if !self.retire_relay(error, swarm, shared, now) {
+                self.fail_if_no_legs_remain(swarm, shared, now);
+                return;
+            }
+        }
     }
 
     /// The HOP stream finished multistream negotiation: send CONNECT.
@@ -957,7 +976,7 @@ impl ConnectAttempt {
                     });
                     // Keep the provisional circuit; drop punch dials so a
                     // late handshake cannot land after this attempt is reaped.
-                    shared.abort_attempt_dials(self.id);
+                    shared.abort_attempt_dials(self.id, &self.peer, swarm);
                     self.done = true;
                 }
             }
@@ -1118,10 +1137,6 @@ impl ConnectAttempt {
 
     /// The current relay failed: move on to the next one while the leg has
     /// time left, otherwise fail the leg with `error`.
-    ///
-    /// Other addresses of the same relay stay eligible only while the relay
-    /// is unreached: once connected, every entry for it would reuse that
-    /// connection and repeat the same failure.
     fn fail_relay_leg(
         &mut self,
         error: NatError,
@@ -1129,6 +1144,26 @@ impl ConnectAttempt {
         shared: &mut Shared,
         now: Now,
     ) {
+        if self.retire_relay(error, swarm, shared, now) {
+            self.try_next_relay(swarm, shared, now);
+        } else {
+            self.fail_if_no_legs_remain(swarm, shared, now);
+        }
+    }
+
+    /// Ends the current relay entry with `error`. `true` when another entry
+    /// is left to try within the leg's deadline.
+    ///
+    /// Other addresses of the same relay stay eligible only while the relay
+    /// is unreached: once connected, every entry for it would reuse that
+    /// connection and repeat the same failure.
+    fn retire_relay(
+        &mut self,
+        error: NatError,
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) -> bool {
         if let Some(relay_peer) = self.relay_peer().cloned()
             && swarm.connection(&relay_peer).is_some()
         {
@@ -1144,11 +1179,7 @@ impl ConnectAttempt {
         self.relay_deadline = None;
         self.hop = None;
         self.last_error = Some(error);
-        if !self.untried.is_empty() && now.mono_ms < self.leg_deadline {
-            self.try_next_relay(swarm, shared, now);
-        } else {
-            self.fail_if_no_legs_remain(swarm, shared, now);
-        }
+        !self.untried.is_empty() && now.mono_ms < self.leg_deadline
     }
 
     fn fail_if_no_legs_remain(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
@@ -1173,7 +1204,7 @@ impl ConnectAttempt {
     /// still holds (including a bridge the application was told about — the
     /// caller emits the explaining event first).
     fn teardown_relay_leg(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
-        shared.abort_attempt_dials(self.id);
+        shared.abort_attempt_dials(self.id, &self.peer, swarm);
         self.teardown_dcutr_stream(swarm, shared, now);
         match self.leg {
             RelayLeg::WaitHopReady { conn, stream } | RelayLeg::AwaitHopStatus { conn, stream } => {

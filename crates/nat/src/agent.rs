@@ -222,10 +222,18 @@ impl Shared {
         Ok(())
     }
 
-    /// Forgets parked relay/punch dials for `id` and closes handshakes that
-    /// already have a connection but have not established. Established
-    /// punch or relay sessions stay up — those are no longer in flight.
-    pub(crate) fn abort_attempt_dials(&mut self, id: ConnectId) {
+    /// Forgets parked relay/punch dials for attempt `id` (connecting to
+    /// `target`) and closes handshakes that already have a connection but
+    /// have not established. Established punch or relay sessions stay up —
+    /// those are no longer in flight. That includes a connection the swarm
+    /// already reports established while its event is still buffered:
+    /// another attempt may have started work on it.
+    pub(crate) fn abort_attempt_dials(
+        &mut self,
+        id: ConnectId,
+        target: &PeerId,
+        swarm: &dyn NatSwarm,
+    ) {
         let owned = |purpose: &DialPurpose| purpose.connect_id() == Some(id);
         let mut retired = BTreeSet::new();
         self.tokens.retain(|token, purpose| match purpose {
@@ -238,7 +246,13 @@ impl Shared {
         let mut close = Vec::new();
         self.dialed.retain(|conn_id, (token, purpose)| {
             if owned(purpose) {
-                close.push(*conn_id);
+                let peer = match purpose {
+                    DialPurpose::Relay(_, addr) => addr.peer_id(),
+                    _ => target,
+                };
+                if swarm.connection(peer) != Some(*conn_id) {
+                    close.push(*conn_id);
+                }
                 retired.insert(*token);
                 false
             } else {

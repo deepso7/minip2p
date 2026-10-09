@@ -567,6 +567,30 @@ fn a_stale_buffered_establishment_keeps_a_newer_relay_dial_gate() {
 }
 
 #[test]
+fn cancelling_keeps_a_dialed_relay_session_another_attempt_already_uses() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let first = h.start(RELAY_NOW, at(0));
+    let dialed = dial_conn_for(&drain_actions(&mut h.agent), &h.relay);
+
+    // The swarm is ready on the dialed connection before NAT handles its
+    // buffered events, so a second attempt opens HOP on it at once.
+    let relay = h.relay.clone();
+    h.agent
+        .swarm
+        .make_ready(&relay, dialed, &[HOP_PROTOCOL_ID.to_string()]);
+    h.start_peer(peer(b"second-target"), RELAY_NOW, at(1));
+    assert!(has_hop_open(&drain_actions(&mut h.agent)));
+
+    h.agent.cancel(first, at(2));
+    assert!(
+        !drain_actions(&mut h.agent)
+            .iter()
+            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == dialed)),
+        "an established relay session outlives the attempt that dialed it"
+    );
+}
+
+#[test]
 fn bridge_close_before_dcutr_finishes_waits_for_live_direct_dials() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (id, stream) = drive_to_bridged(&mut h, 0);
