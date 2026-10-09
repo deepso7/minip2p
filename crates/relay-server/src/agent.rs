@@ -2158,6 +2158,10 @@ impl RelayServerAgent {
     }
 
     fn cancel_operations(&mut self, tokens: &[RelayServerToken]) {
+        // Skip the action-queue scan: nothing to cancel.
+        if tokens.is_empty() {
+            return;
+        }
         for token in tokens {
             self.pending_operations.remove(token);
         }
