@@ -203,6 +203,9 @@ impl Circuit {
 #[derive(Default)]
 struct Forward {
     queue: VecDeque<Bytes>,
+    /// Small reads copied together behind `queue`, so a peer sending tiny
+    /// frames costs memory in proportion to its bytes, not its reads.
+    small: Vec<u8>,
     /// Length of the payload the head was cut from, while the head is the
     /// unsent tail of a Full; zero while the head is a whole payload.
     head_counted: usize,
@@ -236,10 +239,43 @@ enum FinState {
     Accepted,
 }
 
+/// Reads shorter than this are coalesced into one queue entry of at least
+/// this many bytes.
+const COALESCE_BELOW: usize = 4096;
+
 impl Forward {
     /// Queued bytes the origin is still owed acknowledgement for.
     fn unacked(&self) -> usize {
-        self.queue.iter().map(Bytes::len).sum()
+        self.queue.iter().map(Bytes::len).sum::<usize>() + self.small.len()
+    }
+
+    /// Appends a read behind everything already queued.
+    fn push(&mut self, data: Bytes) {
+        if data.len() < COALESCE_BELOW {
+            self.small.extend_from_slice(&data);
+            if self.small.len() >= COALESCE_BELOW {
+                self.flush_small();
+            }
+        } else {
+            self.flush_small();
+            self.queue.push_back(data);
+        }
+    }
+
+    /// Moves the coalesced small reads into the queue as one entry.
+    fn flush_small(&mut self) {
+        if !self.small.is_empty() {
+            self.queue.push_back(Bytes::copy_from_slice(&self.small));
+            self.small.clear();
+        }
+    }
+
+    /// The next payload to send, if any.
+    fn head(&mut self) -> Option<Bytes> {
+        if self.queue.is_empty() {
+            self.flush_small();
+        }
+        self.queue.front().cloned()
     }
 
     /// Records that the target accepted the head up to an `unsent` tail.
@@ -288,10 +324,6 @@ pub struct RelayServerAgent {
     last_event_tick_ms: Option<u64>,
     reservation_limiters: AdmissionLimiters,
     circuit_limiters: AdmissionLimiters,
-    /// Destination payload a STOP read passed to its pending circuit's
-    /// buffer, so the read acknowledges only its control bytes; that payload
-    /// stays unacknowledged until it is forwarded or released.
-    stop_bridged: usize,
 }
 
 impl RelayServerAgent {
@@ -342,7 +374,6 @@ impl RelayServerAgent {
             pending_operations: BTreeMap::new(),
             next_token: 1,
             last_event_tick_ms: None,
-            stop_bridged: 0,
         })
     }
 
@@ -492,11 +523,14 @@ impl RelayServerAgent {
                             data.clone(),
                         );
                     } else {
-                        self.stop_bridged = 0;
-                        if self.feed_stop(source_stream, StopInitiatorInput::Data(data.to_vec())) {
-                            self.drain_stop(source_stream, now);
-                        }
-                        self.queue_ack(key, data.len().saturating_sub(self.stop_bridged));
+                        let bridged = if self
+                            .feed_stop(source_stream, StopInitiatorInput::Data(data.to_vec()))
+                        {
+                            self.drain_stop(source_stream, now)
+                        } else {
+                            0
+                        };
+                        self.queue_ack(key, data.len().saturating_sub(bridged));
                     }
                     true
                 } else {
@@ -1317,16 +1351,26 @@ impl RelayServerAgent {
                     };
                     self.queue_reset(peer_id, key);
                 }
-                // A committed circuit reads its source leg itself, so only
-                // payload pipelined behind CONNECT arrives here.
+                // A committed circuit reads its source leg itself, and a
+                // pending one buffers later reads directly, so only payload
+                // coalesced with CONNECT arrives here, on acceptance. It
+                // precedes everything buffered since.
                 HopResponderOutput::BridgeData(data) => {
-                    self.append_pending_payload(key, CircuitDirection::SourceToDestination, &data);
+                    let Some(circuit) = self.pending_circuits.get_mut(&key) else {
+                        continue;
+                    };
+                    let later = core::mem::replace(&mut circuit.source_pipelined, data);
+                    self.append_pending_payload(key, CircuitDirection::SourceToDestination, &later);
                 }
             }
         }
     }
 
-    fn drain_stop(&mut self, source_stream: StreamKey, now: Now) {
+    /// Drives a pending circuit's STOP initiator and returns how many
+    /// destination payload bytes it moved into the pending circuit's buffer;
+    /// those stay unacknowledged until forwarded or released.
+    fn drain_stop(&mut self, source_stream: StreamKey, now: Now) -> usize {
+        let mut bridged = 0;
         loop {
             let output = self
                 .pending_circuits
@@ -1349,16 +1393,16 @@ impl RelayServerAgent {
                         },
                     ) {
                         self.fail_pending_connect(source_stream, Status::ConnectionFailed);
-                        return;
+                        return bridged;
                     }
                     let Some(worker) = self.hop_workers.get_mut(&source_stream) else {
                         self.fail_pending_connect(source_stream, Status::ConnectionFailed);
-                        return;
+                        return bridged;
                     };
                     let Some(HopResponderOutput::Outbound(data)) = worker.responder.poll_output()
                     else {
                         self.fail_pending_connect(source_stream, Status::ConnectionFailed);
-                        return;
+                        return bridged;
                     };
                     let peer_id = worker.peer_id.clone();
                     self.queue_send(
@@ -1371,14 +1415,16 @@ impl RelayServerAgent {
                 }
                 StopInitiatorOutput::Outcome(outcome) => {
                     self.fail_pending_connect(source_stream, outcome.hop_status());
-                    return;
+                    return bridged;
                 }
                 StopInitiatorOutput::BridgeData(data) => {
-                    self.append_pending_payload(
+                    if self.append_pending_payload(
                         source_stream,
                         CircuitDirection::DestinationToSource,
                         &data,
-                    );
+                    ) {
+                        bridged += data.len();
+                    }
                 }
                 StopInitiatorOutput::Outbound(data) => {
                     if let Some(circuit) = self.pending_circuits.get(&source_stream) {
@@ -1409,6 +1455,7 @@ impl RelayServerAgent {
                 }
             }
         }
+        bridged
     }
 
     fn commit_circuit(&mut self, source_stream: StreamKey, now: Now) {
@@ -1479,14 +1526,16 @@ impl RelayServerAgent {
         }
     }
 
+    /// Buffers `data` on a pending circuit, returning whether it was kept;
+    /// payload past the bound aborts the circuit.
     fn append_pending_payload(
         &mut self,
         source_stream: StreamKey,
         direction: CircuitDirection,
         data: &[u8],
-    ) {
+    ) -> bool {
         let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
-            return;
+            return false;
         };
         let buffer = match direction {
             CircuitDirection::SourceToDestination => &mut circuit.source_pipelined,
@@ -1498,10 +1547,7 @@ impl RelayServerAgent {
             .is_some_and(|len| len <= MAX_PENDING_BRIDGE_SIZE)
         {
             buffer.extend_from_slice(data);
-            if direction == CircuitDirection::DestinationToSource {
-                self.stop_bridged = self.stop_bridged.saturating_add(data.len());
-            }
-            return;
+            return true;
         }
         let peer_id = match direction {
             CircuitDirection::SourceToDestination => circuit.source_peer_id.clone(),
@@ -1513,6 +1559,7 @@ impl RelayServerAgent {
             Some(peer_id),
             "pending circuit payload exceeded the 64 KiB directional bound".into(),
         );
+        false
     }
 
     /// Queues `data` read from `direction`'s origin behind what it already
@@ -1530,7 +1577,7 @@ impl RelayServerAgent {
         let Some(circuit) = self.circuits.get_mut(&source_stream) else {
             return;
         };
-        circuit.forward(direction).queue.push_back(data);
+        circuit.forward(direction).push(data);
         self.pump_forward(source_stream, direction);
     }
 
@@ -1545,7 +1592,7 @@ impl RelayServerAgent {
         if forward.send != SendState::Idle {
             return;
         }
-        if let Some(data) = forward.queue.front().cloned() {
+        if let Some(data) = forward.head() {
             forward.send = SendState::Sending;
             let chunk_len = data.len();
             self.queue_send(
@@ -4842,6 +4889,82 @@ mod tests {
         let token = sent(&actions(&mut agent), stop_stream, b"abcd");
         agent.send_stream_result(token, full(b"cd"), now);
         assert_eq!(acked(&actions(&mut agent), source_stream), 2);
+    }
+
+    #[test]
+    fn payload_held_with_connect_precedes_later_pipelined_reads() {
+        let (mut agent, source, destination, source_stream, stop_stream) =
+            pending_stop_with_payload(RelayServerConfig::default(), 0, b"ab");
+        let now = Now::from_millis(1);
+        let _ = actions(&mut agent);
+        agent.handle_event(&data(&source, source_stream, b"cd"), false, now);
+        let status = encode_stop_status(Status::Ok).unwrap();
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: destination,
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+                data: Bytes::from(status),
+            },
+            false,
+            now,
+        );
+        let accepted = actions(&mut agent);
+        let hop_success = sent(&accepted, source_stream, &accepted_hop_success(&accepted));
+        agent.send_stream_result(hop_success, Ok(()), now);
+        let token = sent(&actions(&mut agent), stop_stream, b"abcd");
+        agent.send_stream_result(token, Ok(()), now);
+        assert_eq!(acked(&actions(&mut agent), source_stream), 4);
+    }
+
+    #[test]
+    fn tiny_reads_to_a_paused_destination_are_coalesced_in_order() {
+        let (mut agent, source, destination, source_stream, stop_stream) =
+            connected_circuit(RelayServerConfig::default(), 0);
+        let now = Now::from_millis(1);
+        agent.handle_event(&data(&source, source_stream, b"\xff"), false, now);
+        let token = sent(&actions(&mut agent), stop_stream, b"\xff");
+        agent.send_stream_result(token, full(b"\xff"), now);
+        let _ = actions(&mut agent);
+
+        // One-byte reads while the destination is full cost one queue entry
+        // per coalesced run, not one per read.
+        let expected: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        for byte in &expected {
+            agent.handle_event(
+                &SwarmEvent::StreamData {
+                    peer_id: source.clone(),
+                    conn_id: source_stream.conn_id,
+                    stream_id: source_stream.stream_id,
+                    data: Bytes::copy_from_slice(&[*byte]),
+                },
+                false,
+                now,
+            );
+        }
+        assert!(actions(&mut agent).is_empty());
+        assert!(agent.circuits[&source_stream].to_destination.queue.len() <= 4);
+
+        // Resuming delivers every byte in order and acknowledges each once.
+        agent.handle_event(&writable(&destination, stop_stream), false, now);
+        let (mut delivered, mut acks) = (Vec::new(), 0);
+        let mut pending = actions(&mut agent);
+        while !pending.is_empty() {
+            acks += acked(&pending, source_stream);
+            let Some((token, data)) = pending.iter().find_map(|action| match action {
+                RelayServerAction::SendStream { token, data, .. } => Some((*token, data.clone())),
+                _ => None,
+            }) else {
+                break;
+            };
+            delivered.extend_from_slice(&data);
+            agent.send_stream_result(token, Ok(()), now);
+            pending = actions(&mut agent);
+        }
+        assert_eq!(delivered[0], 0xff);
+        assert_eq!(&delivered[1..], &expected[..]);
+        assert_eq!(acks, 1 + expected.len());
+        assert_eq!(agent.circuits[&source_stream].to_destination.unacked(), 0);
     }
 
     #[test]

@@ -15,8 +15,9 @@
 //! keeps its unsent tail at the head of the queue until that leg's
 //! `StreamWritable`, so a full destination pauses the source through withheld
 //! receive credit instead of closing the circuit, and the queue stays within
-//! the receive budget the source was granted. A half-close is forwarded after
-//! the last queued byte.
+//! the receive budget the source was granted. Small reads are coalesced, so
+//! the queue's memory stays proportional to its bytes rather than its reads.
+//! A half-close is forwarded after the last queued byte.
 //!
 //! The first [`RelayServerAgent::handle_event`] for a time sample processes
 //! deadlines before it dispatches the event. Call [`RelayServerAgent::handle_tick`]
