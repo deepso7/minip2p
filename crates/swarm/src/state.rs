@@ -903,13 +903,17 @@ impl SwarmState {
 
     /// Resets and forgets a stream whose consumer will never read it again.
     ///
-    /// A reset is queued at most once. Already-buffered events and all later
-    /// data, EOF, and close events for the stream are suppressed. Buffered
-    /// data the consumer will now never acknowledge is acknowledged here when
-    /// no reset will settle it, so the transport does not keep the stream.
+    /// A reset is queued at most once, and it settles the buffered data this
+    /// drops. Already-buffered events and all later data, EOF, and close
+    /// events for the stream are suppressed.
     ///
-    /// A stream the transport has already closed succeeds with nothing left to
-    /// reset; only a stream this connection never owned is
+    /// A stream the transport has already closed has nothing left to reset, so
+    /// its dropped data is acknowledged instead and the transport does not
+    /// keep the stream. That case succeeds only while the stream's
+    /// [`SwarmEvent::StreamClosed`] is still queued, since that event is what
+    /// identifies the stream as one this connection owned. Once it has been
+    /// delivered, or dropped by an earlier call, the stream is
+    /// indistinguishable from one that never existed and both are
     /// [`SwarmError::StreamNotFound`].
     pub fn abandon_stream(
         &mut self,
@@ -3696,6 +3700,14 @@ mod tests {
             })
             .sum();
         assert_eq!(acked, 3);
+
+        // The queued terminal was this stream's only remaining trace, so a
+        // second call cannot tell it from a stream that never existed. The
+        // documented success is scoped to the first call for that reason.
+        assert!(matches!(
+            core.abandon_stream(&peer, conn, stream),
+            Err(SwarmError::StreamNotFound { .. })
+        ));
     }
 
     #[test]
