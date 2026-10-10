@@ -29,6 +29,14 @@ use crate::events::NatEvent;
 use crate::swarm::NatSwarm;
 use crate::types::{Now, ReachabilityState, ReservationInfo};
 
+/// Never schedule a reservation renewal sooner than this.
+///
+/// A relay-reported lifetime at or below
+/// [`NatConfig::reservation_renewal_margin_secs`](crate::NatConfig::reservation_renewal_margin_secs)
+/// leaves no room for the margin, and renewing "right away" on every accepted
+/// reservation is a RESERVE per second for as long as the reservation is held.
+const MIN_RENEWAL_INTERVAL_SECS: u64 = 30;
+
 /// Progress of one outbound single-stream exchange (probe or reservation).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExchangeStage {
@@ -952,12 +960,23 @@ impl ReservationManager {
         // Renew `margin` seconds before the reported expiry when both the
         // expiry and a wall clock exist; otherwise assume the default TTL.
         // Clockless renewal is approximate by design.
+        //
+        // The relay owns `expire` and is not trusted to report it sanely.
+        // Clamping to the default TTL keeps a value far in the future from
+        // pushing renewal past the lifetime the relay actually enforces, which
+        // would drop the reservation with the connection still up -- so no
+        // `RelayReservationLost` -- while we keep advertising a ticket that
+        // dialers get NO_RESERVATION on. An expiry already past (a stale value,
+        // or clock skew wider than the margin) is treated as no expiry at all
+        // rather than renewed against once a second.
         let renew_in_secs = match (expire_unix_secs, now.unix_secs) {
-            (Some(expire), Some(unix_now)) => {
-                let remaining = expire.saturating_sub(unix_now);
-                remaining.saturating_sub(margin).max(1)
-            }
-            _ => default_ttl.saturating_sub(margin).max(1),
+            (Some(expire), Some(unix_now)) if expire > unix_now => (expire - unix_now)
+                .min(default_ttl)
+                .saturating_sub(margin)
+                .max(MIN_RENEWAL_INTERVAL_SECS),
+            _ => default_ttl
+                .saturating_sub(margin)
+                .max(MIN_RENEWAL_INTERVAL_SECS),
         };
         let info = ReservationInfo {
             relay: relay_peer.clone(),
