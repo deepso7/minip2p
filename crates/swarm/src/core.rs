@@ -639,7 +639,12 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// Resets and forgets a stream whose consumer will never read it again.
     ///
     /// A reset is sent at most once. Already-queued events and all later
-    /// data, EOF, and close events for the stream are suppressed.
+    /// data, EOF, and close events for the stream are suppressed, and queued
+    /// data the consumer will now never acknowledge is acknowledged for it.
+    ///
+    /// A stream the transport has already closed succeeds with nothing left to
+    /// reset; only a stream this connection never owned is
+    /// [`SwarmError::StreamNotFound`].
     pub fn abandon_stream(
         &mut self,
         peer_id: &PeerId,
