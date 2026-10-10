@@ -29,13 +29,21 @@ use crate::events::NatEvent;
 use crate::swarm::NatSwarm;
 use crate::types::{Now, ReachabilityState, ReservationInfo};
 
-/// Never schedule a reservation renewal sooner than this.
+/// Seconds to wait before renewing a reservation with `lifetime` seconds left,
+/// renewing `margin` ahead of expiry.
 ///
-/// A relay-reported lifetime at or below
-/// [`NatConfig::reservation_renewal_margin_secs`](crate::NatConfig::reservation_renewal_margin_secs)
-/// leaves no room for the margin, and renewing "right away" on every accepted
-/// reservation is a RESERVE per second for as long as the reservation is held.
-const MIN_RENEWAL_INTERVAL_SECS: u64 = 30;
+/// A lifetime with no room for the margin renews at half of it instead: that
+/// still lands before expiry however short the lifetime is, while a fixed
+/// floor would schedule renewal after a short reservation was already gone,
+/// and renewing "right away" would be a RESERVE per second for as long as the
+/// reservation is held.
+fn renewal_delay_secs(lifetime: u64, margin: u64) -> u64 {
+    if lifetime > margin {
+        lifetime - margin
+    } else {
+        (lifetime / 2).max(1)
+    }
+}
 
 /// Progress of one outbound single-stream exchange (probe or reservation).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -970,13 +978,10 @@ impl ReservationManager {
         // or clock skew wider than the margin) is treated as no expiry at all
         // rather than renewed against once a second.
         let renew_in_secs = match (expire_unix_secs, now.unix_secs) {
-            (Some(expire), Some(unix_now)) if expire > unix_now => (expire - unix_now)
-                .min(default_ttl)
-                .saturating_sub(margin)
-                .max(MIN_RENEWAL_INTERVAL_SECS),
-            _ => default_ttl
-                .saturating_sub(margin)
-                .max(MIN_RENEWAL_INTERVAL_SECS),
+            (Some(expire), Some(unix_now)) if expire > unix_now => {
+                renewal_delay_secs((expire - unix_now).min(default_ttl), margin)
+            }
+            _ => renewal_delay_secs(default_ttl, margin),
         };
         let info = ReservationInfo {
             relay: relay_peer.clone(),

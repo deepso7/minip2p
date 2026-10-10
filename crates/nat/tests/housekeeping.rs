@@ -442,7 +442,31 @@ fn an_expiry_already_past_falls_back_to_the_default_ttl() {
 }
 
 #[test]
-fn a_reported_lifetime_shorter_than_the_margin_keeps_the_renewal_floor() {
+fn a_short_positive_expiry_renews_before_it_expires() {
+    let mut hk = build_with_config(ReservationPolicy::Always, 1, 0, |config| {
+        config.reservation_keep_alive_interval_ms = 0;
+    });
+
+    // The relay grants 10s. A fixed renewal floor would land after the
+    // reservation is already gone: the relay drops it at expiry without
+    // closing the connection, so the holder keeps advertising a relay address
+    // that dials get NO_RESERVATION on until renewal finally fires.
+    let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_010)), at_unix(10, 1_000));
+
+    let expected_renew = 10 + 5 * 1_000;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::RelayReserved {
+                renew_at_mono_ms, ..
+            }] if *renew_at_mono_ms == expected_renew
+        ),
+        "expected renewal inside the 10s lifetime, got {events:?}"
+    );
+}
+
+#[test]
+fn a_lifetime_with_no_room_for_the_margin_renews_at_half_of_it() {
     let mut hk = build_with_config(ReservationPolicy::Always, 1, 0, |config| {
         config.reservation_keep_alive_interval_ms = 0;
     });
@@ -450,8 +474,8 @@ fn a_reported_lifetime_shorter_than_the_margin_keeps_the_renewal_floor() {
     // 60s of lifetime against a 120s margin: the margin cannot be honoured.
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_060)), at_unix(10, 1_000));
 
-    // Renewing "immediately" here means a RESERVE every second. Hold the
-    // floor instead.
+    // Renewing "immediately" here would be a RESERVE every second; half the
+    // lifetime is still comfortably inside it.
     let expected_renew = 10 + 30 * 1_000;
     assert!(
         matches!(
@@ -460,7 +484,7 @@ fn a_reported_lifetime_shorter_than_the_margin_keeps_the_renewal_floor() {
                 renew_at_mono_ms, ..
             }] if *renew_at_mono_ms == expected_renew
         ),
-        "expected the renewal floor, got {events:?}"
+        "expected half the lifetime, got {events:?}"
     );
 }
 
