@@ -3,6 +3,7 @@
 //! Handles the QUIC connection lifecycle, stream multiplexing, send queue
 //! draining, and event emission.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::mem;
 use std::net::{SocketAddr, UdpSocket};
@@ -130,6 +131,10 @@ pub struct QuicConnection {
     /// Outbound write queues keyed by raw QUIC stream id. Only streams with
     /// pending output have an entry, so a drain visits nothing else.
     send_queues: HashMap<u64, SendQueue>,
+    /// Scratch copy of the `send_queues` keys for `drain_send_queue`. Kept
+    /// so its capacity is reused: draining a busy connection allocates
+    /// nothing.
+    drain_stream_ids: Vec<u64>,
     /// Next stream id to allocate (increments by 4 per QUIC spec).
     next_local_bidi_stream_id: u64,
     /// Number of active locally initiated bidirectional streams.
@@ -206,6 +211,7 @@ impl QuicConnection {
             state: ConnectionState::Connecting,
             stream_states: HashMap::new(),
             send_queues: HashMap::new(),
+            drain_stream_ids: Vec::new(),
             next_local_bidi_stream_id,
             active_local_bidi_streams: 0,
             max_local_bidi_streams,
@@ -1048,11 +1054,13 @@ impl QuicConnection {
                 self.paced = Some(paced);
                 return Ok(());
             }
-            let PendingDatagram { bytes, destination } = &paced.datagram;
-            if !send_or_retain(socket, bytes, *destination, pending_datagrams) {
+            // Moved, not copied, into the retry queue if it cannot leave now.
+            let PendingDatagram { bytes, destination } = paced.datagram;
+            let len = bytes.len();
+            if !send_or_retain(socket, Cow::Owned(bytes), destination, pending_datagrams) {
                 return Ok(());
             }
-            self.counters.sent(bytes.len());
+            self.counters.sent(len);
         }
 
         // Counted here, past the held packet: a pass stopped behind it asks
@@ -1095,7 +1103,12 @@ impl QuicConnection {
                 });
                 break;
             }
-            if !send_or_retain(socket, packet, send_info.to, pending_datagrams) {
+            if !send_or_retain(
+                socket,
+                Cow::Borrowed(packet),
+                send_info.to,
+                pending_datagrams,
+            ) {
                 break;
             }
             self.counters.sent(written);
@@ -1109,10 +1122,13 @@ impl QuicConnection {
     /// write still waiting on peer credit stays queued for a later drain, and
     /// any other quiche error closes only this connection.
     fn drain_send_queue(&mut self, events: &mut Vec<TransportEvent>) {
-        // Only streams with pending output; collecting none allocates nothing.
-        let stream_ids: Vec<u64> = self.send_queues.keys().copied().collect();
+        // A copy of the keys, since a drain can drop queues mid-loop. Map
+        // order is arbitrary anyway, so popping from the end is fine.
+        self.drain_stream_ids.clear();
+        self.drain_stream_ids
+            .extend(self.send_queues.keys().copied());
 
-        for raw_stream_id in stream_ids {
+        'streams: while let Some(raw_stream_id) = self.drain_stream_ids.pop() {
             let stream_id = StreamId::new(raw_stream_id);
             while let Some(front) = self
                 .send_queues
@@ -1134,7 +1150,8 @@ impl QuicConnection {
                             format!("stream_send error on {stream_id}: {e}"),
                             events,
                         );
-                        return;
+                        // `wake_writable` below is a no-op once closing.
+                        break 'streams;
                     }
                 };
 
@@ -1413,25 +1430,28 @@ impl Drop for QuicConnection {
 /// Sends one packet, retaining it on `WouldBlock` or behind datagrams already
 /// retained, so it never overtakes them. Returns whether the caller should
 /// keep flushing.
+///
+/// A packet already owned (a held paced one) moves into the retry queue; a
+/// borrowed one is copied only if it has to be retained.
 fn send_or_retain(
     socket: &UdpSocket,
-    packet: &[u8],
+    packet: Cow<'_, [u8]>,
     destination: SocketAddr,
     pending_datagrams: &mut VecDeque<PendingDatagram>,
 ) -> bool {
-    let retain = |pending_datagrams: &mut VecDeque<PendingDatagram>| {
+    let retain = |pending_datagrams: &mut VecDeque<PendingDatagram>, packet: Cow<'_, [u8]>| {
         pending_datagrams.push_back(PendingDatagram {
-            bytes: packet.to_vec(),
+            bytes: packet.into_owned(),
             destination,
         });
         false
     };
     if !pending_datagrams.is_empty() {
-        return retain(pending_datagrams);
+        return retain(pending_datagrams, packet);
     }
-    match socket.send_to(packet, destination) {
+    match socket.send_to(&packet, destination) {
         Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => retain(pending_datagrams),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => retain(pending_datagrams, packet),
         // Any other send error (EHOSTUNREACH after a route flap,
         // ICMP-driven ECONNREFUSED, ...) affects only this connection's path,
         // so it must not abort the whole endpoint's poll. Treat the packet as
