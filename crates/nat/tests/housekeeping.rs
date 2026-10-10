@@ -372,16 +372,44 @@ fn reserve_via_relay(hk: &mut Hk, response: Vec<u8>, now: Now) -> (Vec<NatEvent>
     hk.finish_reserve(response, now)
 }
 
+/// The `renew_at_mono_ms` of the single `RelayReserved` event in `events`.
+fn reserved_renew_at(events: &[NatEvent]) -> u64 {
+    assert_eq!(
+        events.len(),
+        1,
+        "expected one RelayReserved, got {events:?}"
+    );
+    events
+        .iter()
+        .find_map(|event| match event {
+            NatEvent::RelayReserved {
+                renew_at_mono_ms, ..
+            } => Some(*renew_at_mono_ms),
+            _ => None,
+        })
+        .expect("a RelayReserved event")
+}
+
+/// Reserves with the relay reporting `expire` while our clock reads unix 1000
+/// at mono 10, returning the scheduled renewal.
+fn renew_at_for_expire(expire: Option<u64>) -> u64 {
+    let mut hk = build_with_config(ReservationPolicy::Always, 1, 0, |config| {
+        config.reservation_keep_alive_interval_ms = 0;
+    });
+    let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(expire), at_unix(10, 1_000));
+    reserved_renew_at(&events)
+}
+
 #[test]
-fn reservation_renews_at_expire_minus_margin() {
+fn reservation_renews_at_half_the_reported_lifetime() {
     let mut hk = build_with_config(ReservationPolicy::Always, 1, 0, |config| {
         config.reservation_keep_alive_interval_ms = 0;
     });
 
     // Relay reports expiry at unix 1900; the clock says unix 1000 at mono 10.
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_900)), at_unix(10, 1_000));
-    // remaining 900s − margin 120s = 780s after mono 10.
-    let expected_renew = 10 + 780 * 1_000;
+    // Half of the remaining 900s after mono 10.
+    let expected_renew = 10 + 450 * 1_000;
     assert!(matches!(
         events.as_slice(),
         [NatEvent::RelayReserved {
@@ -397,42 +425,77 @@ fn reservation_renews_at_expire_minus_margin() {
     drain_actions(&mut hk.agent);
 
     // Too early: nothing happens.
-    hk.agent.handle_tick(at_unix(700_000, 1_700));
+    hk.agent.handle_tick(at_unix(expected_renew - 1, 1_449));
     assert!(drain_actions(&mut hk.agent).is_empty());
 
     // At renew time a fresh RESERVE goes out on the still-ready session.
-    hk.agent.handle_tick(at_unix(expected_renew, 1_790));
+    hk.agent.handle_tick(at_unix(expected_renew, 1_450));
     let (events, _) = hk.finish_reserve(
-        hop_reserve_ok(Some(2_700)),
-        at_unix(expected_renew + 5, 1_790),
+        hop_reserve_ok(Some(2_350)),
+        at_unix(expected_renew + 5, 1_450),
     );
     assert!(matches!(
         events.as_slice(),
         [NatEvent::RelayReserved {
-            expires_unix_secs: Some(2_700),
+            expires_unix_secs: Some(2_350),
             ..
         }]
     ));
 }
 
 #[test]
-fn enormous_relay_expiry_saturates_the_renewal_deadline() {
+fn an_expiry_already_past_falls_back_to_the_default_ttl() {
+    // The relay reports an expiry 500s in the past: a stale value, or a clock
+    // skewed far enough that the remaining lifetime reads as gone. Taken at
+    // face value, renewal would fire at once and report the same stale expiry
+    // again, for as long as the reservation is held.
+    assert_eq!(renew_at_for_expire(Some(500)), 10 + 1_800 * 1_000);
+    // An expiry of exactly now leaves no lifetime either.
+    assert_eq!(renew_at_for_expire(Some(1_000)), 10 + 1_800 * 1_000);
+}
+
+#[test]
+fn a_one_second_reservation_renews_before_it_expires() {
+    // Relays may grant a 1s TTL. Renewal must land strictly inside it, and a
+    // second apart would be at expiry, after the relay already dropped it.
+    assert_eq!(renew_at_for_expire(Some(1_001)), 10 + 500);
+    assert_eq!(renew_at_for_expire(Some(1_003)), 10 + 1_500);
+}
+
+#[test]
+fn a_lifetime_just_past_the_old_margin_does_not_renew_every_second() {
+    // 121s against the former fixed 120s margin renewed after 1s, and each
+    // renewal was granted 121s again: a RESERVE per second, indefinitely.
+    assert_eq!(renew_at_for_expire(Some(1_121)), 10 + 60_500);
+}
+
+#[test]
+fn renewal_lands_before_expiry_despite_a_relay_clock_ahead_of_ours() {
+    // The relay grants 600s, but its clock runs 200s ahead, so its absolute
+    // `expire` reads as 800s from our now. Renewing a fixed 120s before the
+    // reported expiry would fire at 680s, 80s after the reservation is gone.
+    let renew_at = renew_at_for_expire(Some(1_800));
+    assert_eq!(renew_at, 10 + 400 * 1_000);
+    assert!(renew_at < 10 + 600 * 1_000);
+}
+
+#[test]
+fn an_expiry_beyond_the_default_ttl_is_clamped_to_it() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(u64::MAX)), at_unix(10, 0));
 
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::RelayReserved {
-            renew_at_mono_ms: u64::MAX,
-            ..
-        }]
-    ));
+    // Trusting the relay's expiry saturates the deadline, so renewal never
+    // fires: the relay drops the reservation on its own TTL while the
+    // connection stays up, no `RelayReservationLost` is emitted, and the
+    // holder keeps advertising a ticket dialers get NO_RESERVATION on.
+    let expected_renew = 10 + 1_800 * 1_000;
+    assert_eq!(reserved_renew_at(&events), expected_renew);
     assert_eq!(
         hk.agent
             .active_reservation()
             .expect("reservation held")
             .renew_at_mono_ms,
-        u64::MAX
+        expected_renew
     );
 }
 
@@ -440,8 +503,8 @@ fn enormous_relay_expiry_saturates_the_renewal_deadline() {
 fn reservation_without_expire_uses_default_ttl() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(None), at_unix(10, 1_000));
-    // default TTL 3600s − margin 120s = 3480s.
-    let expected_renew = 10 + 3_480 * 1_000;
+    // Half the 3600s default TTL.
+    let expected_renew = 10 + 1_800 * 1_000;
     assert!(matches!(
         events.as_slice(),
         [NatEvent::RelayReserved {
@@ -457,7 +520,7 @@ fn reservation_on_clockless_host_uses_default_ttl() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     // The relay reports an expiry, but we have no wall clock to compare.
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_900)), at(10));
-    let expected_renew = 10 + 3_480 * 1_000;
+    let expected_renew = 10 + 1_800 * 1_000;
     assert!(matches!(
         events.as_slice(),
         [NatEvent::RelayReserved {
