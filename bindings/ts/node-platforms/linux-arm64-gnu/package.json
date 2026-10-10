@@ -1,6 +1,6 @@
 {
   "name": "@minip2p/node-linux-arm64-gnu",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "description": "Node.js bindings for minip2p",
   "keywords": [
     "libp2p",
