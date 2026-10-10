@@ -5,12 +5,11 @@ mod common;
 use common::*;
 
 use minip2p_core::PeerAddr;
-use minip2p_nat::{DCUTR_PROTOCOL_ID, NatAction, NatConfig, NatEvent, Path, STOP_PROTOCOL_ID};
+use minip2p_nat::{DCUTR_PROTOCOL_ID, NatConfig, NatEvent, Path, STOP_PROTOCOL_ID};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 const STOP_STREAM: u64 = 40;
-const CIRCUIT_STREAM: u64 = 41;
 
 fn inbound_harness(mut config: NatConfig) -> Harness {
     config.reservation_policy = minip2p_nat::ReservationPolicy::Never;
@@ -30,11 +29,12 @@ fn inbound_stop_stream(h: &mut Harness, stream: StreamId, t: u64) {
             protocol_id: STOP_PROTOCOL_ID.into(),
             initiated_locally: false,
         },
+        false,
         at(t),
     );
 }
 
-fn drive_to_relayed(h: &mut Harness) -> (ConnectionId, Vec<NatAction>) {
+fn drive_to_relayed(h: &mut Harness) -> (ConnectionId, Vec<Out>) {
     let stop = StreamId::new(STOP_STREAM);
     inbound_stop_stream(h, stop, 0);
     let target = h.target.clone();
@@ -52,10 +52,8 @@ fn drive_to_relayed(h: &mut Harness) -> (ConnectionId, Vec<NatAction>) {
     (conn, drain_actions(&mut h.agent))
 }
 
-fn open_dcutr(h: &mut Harness, conn: ConnectionId, actions: &[NatAction]) -> StreamId {
-    let token = open_stream_token(actions);
-    let stream = StreamId::new(CIRCUIT_STREAM);
-    h.agent.stream_open_result(token, Ok(stream), at(12));
+fn open_dcutr(h: &mut Harness, conn: ConnectionId, actions: &[Out]) -> StreamId {
+    let stream = opened_stream(actions);
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: conn,
@@ -64,6 +62,7 @@ fn open_dcutr(h: &mut Harness, conn: ConnectionId, actions: &[NatAction]) -> Str
             protocol_id: DCUTR_PROTOCOL_ID.into(),
             initiated_locally: true,
         },
+        false,
         at(13),
     );
     stream
@@ -82,19 +81,20 @@ fn silent_inbound_dcutr_exchange_times_out_and_resets_the_stream() {
     h.agent.handle_tick(at(18));
 
     assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
-    assert!(!h.agent.owns_stream(&h.target, stream));
+    assert!(!h.agent.owns_stream(conn, stream));
     assert!(h.agent.is_idle());
 }
 
 #[test]
 fn failed_inbound_dcutr_open_ends_coordination_without_losing_the_relayed_path() {
     let mut h = inbound_harness(NatConfig::default());
+    h.agent.swarm.refuse_opens = Some("DCUtR unavailable".into());
     let (_, actions) = drive_to_relayed(&mut h);
-    let token = open_stream_token(&actions);
 
-    h.agent
-        .stream_open_result(token, Err("DCUtR unavailable".into()), at(13));
-
+    assert!(matches!(
+        actions.as_slice(),
+        [Out::OpenStream { protocol_id, opened: None, .. }] if protocol_id == DCUTR_PROTOCOL_ID
+    ));
     assert!(drain_actions(&mut h.agent).is_empty());
     assert!(drain_events(&mut h.agent).is_empty());
     assert!(h.agent.is_idle());
@@ -113,11 +113,12 @@ fn early_closed_inbound_dcutr_exchange_resets_the_stream() {
             peer_id: h.target.clone(),
             stream_id: stream,
         },
+        false,
         at(14),
     );
 
     assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
-    assert!(!h.agent.owns_stream(&h.target, stream));
+    assert!(!h.agent.owns_stream(conn, stream));
     assert!(h.agent.is_idle());
 }
 
@@ -133,7 +134,7 @@ fn oversized_inbound_dcutr_connect_keeps_the_relayed_path() {
 
     assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
     assert!(drain_events(&mut h.agent).is_empty());
-    assert!(!h.agent.owns_stream(&h.target, stream));
+    assert!(!h.agent.owns_stream(conn, stream));
     assert!(h.agent.is_idle());
 }
 
@@ -146,6 +147,7 @@ fn answer_dcutr_at(h: &mut Harness, conn: ConnectionId, stream: StreamId, addrs:
             stream_id: stream,
             data: Bytes::from(dcutr_connect_reply(&reply_addrs)),
         },
+        false,
         at(t),
     );
 }
@@ -163,7 +165,7 @@ fn direct_connection_before_circuit_handshake_does_not_downgrade_the_path() {
         .promote_result(promote_token(&promotion), Ok(conn), at(11));
 
     h.target_connected(at(12));
-    h.agent.handle_event_with_disposition_classified(
+    h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             conn_id: conn,
             peer_id: target,
@@ -220,15 +222,13 @@ fn zero_rtt_opens_udp_mapping_before_notifying_dialer() {
     drain_actions(&mut h.agent);
 
     // CONNECT was queued at t=13 and its reply arrived in the same clock
-    // sample. Open the UDP mapping before SYNC can make the remote dial.
+    // sample. The first blast leaves in the same cascade as SYNC, so the
+    // mapping is open before SYNC can reach the remote and make it dial.
     answer_dcutr_at(&mut h, conn, stream, &["/ip4/8.8.8.8/udp/4001/quic-v1"], 13);
     let actions = drain_actions(&mut h.agent);
 
-    assert!(matches!(
-        actions.first(),
-        Some(NatAction::SendRandomUdp { .. })
-    ));
-    assert!(matches!(actions.get(1), Some(NatAction::SendStream { .. })));
+    assert_eq!(blast_count(&actions), 1);
+    assert_eq!(send_stream_count(&actions), 1, "SYNC");
     h.agent.handle_tick(at(13));
     assert_eq!(blast_count(&drain_actions(&mut h.agent)), 0);
 }
@@ -295,12 +295,12 @@ fn peer_supplied_punch_targets_must_be_global_unicast_quic_ips() {
     );
     let sync = drain_actions(&mut h.agent);
     assert!(has_reset_for(&sync, stream));
-    assert!(!h.agent.owns_stream(&h.target, stream));
+    assert!(!h.agent.owns_stream(conn, stream));
     h.agent.handle_tick(at(24));
     let targets: Vec<_> = drain_actions(&mut h.agent)
         .into_iter()
         .filter_map(|action| match action {
-            NatAction::SendRandomUdp { target, .. } => Some(target),
+            Out::SendRandomUdp { target, .. } => Some(target),
             _ => None,
         })
         .collect();
@@ -334,10 +334,11 @@ fn relay_disconnect_before_stop_acceptance_drops_the_circuit() {
             conn_id: ConnectionId::new(1),
             peer_id: h.relay.clone(),
         },
+        false,
         at(1),
     );
 
-    assert!(!h.agent.owns_stream(&h.relay, stop));
+    assert!(!h.agent.owns_stream(ConnectionId::new(1), stop));
     assert!(drain_events(&mut h.agent).is_empty());
 }
 
@@ -351,7 +352,7 @@ fn tcp_only_source_still_gets_the_relayed_path() {
 
     assert!(actions.iter().any(|action| matches!(
         action,
-        NatAction::OpenStream { protocol_id, .. } if protocol_id == DCUTR_PROTOCOL_ID
+        Out::OpenStream { protocol_id, .. } if protocol_id == DCUTR_PROTOCOL_ID
     )));
 }
 
@@ -365,7 +366,7 @@ fn inbound_direct_replacement_after_the_circuit_finished_reports_the_upgrade() {
     assert!(h.agent.is_idle(), "inbound handling finished at Relayed");
 
     let target = h.target.clone();
-    h.agent.handle_event_with_disposition_classified(
+    h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
             peer_id: target.clone(),
             old: circuit,
@@ -412,6 +413,7 @@ fn circuit_replacement_through_another_relay_updates_the_path_origin() {
             protocol_id: STOP_PROTOCOL_ID.into(),
             initiated_locally: false,
         },
+        false,
         at(20),
     );
     h.agent.handle_event(
@@ -421,12 +423,13 @@ fn circuit_replacement_through_another_relay_updates_the_path_origin() {
             stream_id: stop,
             data: Bytes::from(stop_connect(&target)),
         },
+        false,
         at(21),
     );
     let circuit_b = ConnectionId::new(TEST_CIRCUIT_ID + 1);
     let promotion = promote_token(&drain_actions(&mut h.agent));
     h.agent.promote_result(promotion, Ok(circuit_b), at(22));
-    h.agent.handle_event_with_disposition_classified(
+    h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
             peer_id: target.clone(),
             old: circuit_a,
@@ -458,6 +461,7 @@ fn inbound_circuit_replacing_a_direct_connection_announces_its_path() {
             conn_id: direct,
             peer_id: target.clone(),
         },
+        false,
         at(0),
     );
     let stop = StreamId::new(STOP_STREAM);
@@ -468,7 +472,7 @@ fn inbound_circuit_replacing_a_direct_connection_announces_its_path() {
     h.agent
         .promote_result(promote_token(&promotion), Ok(circuit), at(11));
 
-    h.agent.handle_event_with_disposition_classified(
+    h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
             peer_id: target.clone(),
             old: direct,
@@ -488,4 +492,42 @@ fn inbound_circuit_replacing_a_direct_connection_announces_its_path() {
         "the retired direct connection must not make the circuit look redundant"
     );
     assert!(matches!(h.agent.path(&target), Some(Path::Relayed { .. })));
+}
+
+#[test]
+fn inbound_dcutr_is_not_opened_once_a_direct_connection_replaced_the_circuit() {
+    let mut h = inbound_harness(NatConfig::default());
+    let stop = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stop, 0);
+    let target = h.target.clone();
+    h.stream_data(stop, stop_connect(&target), at(10));
+    let promotion = drain_actions(&mut h.agent);
+    let circuit = ConnectionId::new(TEST_CIRCUIT_ID);
+    h.agent
+        .promote_result(promote_token(&promotion), Ok(circuit), at(11));
+    // The swarm is ahead: a direct connection already replaced the circuit
+    // when its establishment reaches the agent.
+    h.agent.swarm.connect(&target, ConnectionId::new(7));
+    h.agent.deliver_late(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: target.clone(),
+            conn_id: circuit,
+        },
+        true,
+        at(11),
+    );
+
+    let actions = drain_actions(&mut h.agent);
+    assert!(
+        !actions.iter().any(|a| matches!(a, Out::OpenStream { .. })),
+        "no DCUtR stream on the replacement: {actions:?}"
+    );
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::InboundPathEstablished {
+            path: Path::Relayed { .. },
+            ..
+        }]
+    ));
+    assert!(h.agent.is_idle());
 }

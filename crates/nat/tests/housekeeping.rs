@@ -7,9 +7,7 @@ use common::*;
 
 use minip2p_autonat::AUTONAT_PROTOCOL_ID;
 use minip2p_core::{PeerAddr, PeerId};
-use minip2p_nat::{
-    NatAction, NatAgent, NatConfig, NatEvent, Now, ReachabilityState, ReservationPolicy,
-};
+use minip2p_nat::{NatConfig, NatEvent, Now, ReachabilityState, ReservationPolicy};
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
@@ -19,12 +17,11 @@ const SERVER2_ADDR: &str = "/ip4/203.0.113.51/udp/4001/quic-v1";
 const RELAY2_TRANSPORT_ADDR: &str = "/ip4/203.0.113.2/udp/4001/quic-v1";
 
 struct Hk {
-    agent: NatAgent,
+    agent: Node,
     relay: PeerId,
     relay2: PeerId,
     server: PeerId,
     server2: PeerId,
-    next_stream: u64,
 }
 
 fn build(policy: ReservationPolicy, relay_count: usize, server_count: usize) -> Hk {
@@ -76,7 +73,7 @@ fn build_with_config(
         ..NatConfig::default()
     };
     configure(&mut config);
-    let mut agent = NatAgent::new(peer(b"local-peer"), config);
+    let mut agent = Node::new(peer(b"local-peer"), config);
     agent.set_listen_addrs(&[maddr(LISTEN_ADDR)]);
     Hk {
         agent,
@@ -84,16 +81,10 @@ fn build_with_config(
         relay2,
         server,
         server2,
-        next_stream: 100,
     }
 }
 
 impl Hk {
-    fn fresh_stream(&mut self) -> StreamId {
-        self.next_stream += 1;
-        StreamId::new(self.next_stream)
-    }
-
     /// Connection established + PeerReady advertising `protocols`.
     fn session_ready(&mut self, peer: &PeerId, protocols: &[&str], now: Now) {
         self.agent.handle_event(
@@ -101,6 +92,7 @@ impl Hk {
                 conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: peer.clone(),
             },
+            false,
             now,
         );
         self.agent.handle_event(
@@ -109,6 +101,7 @@ impl Hk {
                 conn_id: ConnectionId::new(1),
                 protocols: protocols.iter().map(|p| p.to_string()).collect(),
             },
+            false,
             now,
         );
     }
@@ -122,6 +115,7 @@ impl Hk {
                 protocol_id: protocol.to_string(),
                 initiated_locally: true,
             },
+            false,
             now,
         );
     }
@@ -134,6 +128,7 @@ impl Hk {
                 stream_id: stream,
                 data: Bytes::from(data),
             },
+            false,
             now,
         );
     }
@@ -146,10 +141,7 @@ impl Hk {
         t: u64,
     ) -> Vec<NatEvent> {
         let server = self.server.clone();
-        let actions = drain_actions(&mut self.agent);
-        let token = open_stream_token_for(&actions, &server);
-        let stream = self.fresh_stream();
-        self.agent.stream_open_result(token, Ok(stream), at(t));
+        let stream = opened_stream_for(&drain_actions(&mut self.agent), &server);
         self.stream_ready(&server.clone(), stream, AUTONAT_PROTOCOL_ID, at(t + 1));
         let actions = drain_actions(&mut self.agent);
         let request = sent_data_on(&actions, stream);
@@ -174,10 +166,7 @@ impl Hk {
     /// queued, feeding `response`. Returns (events, stream id).
     fn finish_reserve(&mut self, response: Vec<u8>, now: Now) -> (Vec<NatEvent>, StreamId) {
         let relay = self.relay_for_current();
-        let actions = drain_actions(&mut self.agent);
-        let token = open_stream_token_for(&actions, &relay);
-        let stream = self.fresh_stream();
-        self.agent.stream_open_result(token, Ok(stream), now);
+        let stream = opened_stream_for(&drain_actions(&mut self.agent), &relay);
         self.stream_ready(&relay.clone(), stream, HOP_PROTOCOL_ID, now);
         let actions = drain_actions(&mut self.agent);
         let _request = sent_data_on(&actions, stream);
@@ -215,9 +204,7 @@ fn confidence_window_flips_once_and_never_flaps_on_one_probe() {
 
     // First probe bootstraps the server session.
     hk.agent.handle_tick(at(0));
-    let actions = drain_actions(&mut hk.agent);
-    let dial = dial_token_for(&actions, &hk.server);
-    hk.agent.dial_result(dial, Ok(ConnectionId::new(50)), at(1));
+    drain_actions(&mut hk.agent);
     let server = hk.server.clone();
     hk.session_ready(&server, &[AUTONAT_PROTOCOL_ID], at(2));
     assert!(hk.finish_probe(true, 3).is_empty(), "1 vote of 3: no flip");
@@ -274,9 +261,7 @@ fn confidence_threshold_above_window_clamps_to_unanimity() {
     // Bootstrap the AutoNAT session, then collect a full (three-vote)
     // unanimous window. An unclamped threshold could never settle here.
     hk.agent.handle_tick(at(0));
-    let actions = drain_actions(&mut hk.agent);
-    let dial = dial_token_for(&actions, &hk.server);
-    hk.agent.dial_result(dial, Ok(ConnectionId::new(50)), at(1));
+    drain_actions(&mut hk.agent);
     let server = hk.server.clone();
     hk.session_ready(&server, &[AUTONAT_PROTOCOL_ID], at(2));
     assert!(hk.finish_probe(true, 3).is_empty());
@@ -304,12 +289,8 @@ fn public_probe_without_a_usable_quic_addr_is_inconclusive() {
     // while reachability is still Unknown.
     hk.agent.handle_tick(at(0));
     let actions = drain_actions(&mut hk.agent);
-    let relay_dial = dial_token_for(&actions, &hk.relay);
-    let server_dial = dial_token_for(&actions, &hk.server);
-    hk.agent
-        .dial_result(relay_dial, Ok(ConnectionId::new(60)), at(1));
-    hk.agent
-        .dial_result(server_dial, Ok(ConnectionId::new(61)), at(1));
+    assert_eq!(dial_count_for(&actions, &hk.relay), 1);
+    assert_eq!(dial_count_for(&actions, &hk.server), 1);
     let relay = hk.relay.clone();
     hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
     let (events, _) = hk.finish_reserve(hop_reserve_ok(None), at(3));
@@ -340,15 +321,10 @@ fn probe_timeout_rotates_to_the_next_server() {
     let mut hk = build(ReservationPolicy::Never, 0, 2);
 
     hk.agent.handle_tick(at(0));
-    let actions = drain_actions(&mut hk.agent);
-    let dial = dial_token_for(&actions, &hk.server);
-    hk.agent.dial_result(dial, Ok(ConnectionId::new(50)), at(1));
+    drain_actions(&mut hk.agent);
     let server = hk.server.clone();
     hk.session_ready(&server, &[AUTONAT_PROTOCOL_ID], at(2));
-    let actions = drain_actions(&mut hk.agent);
-    let token = open_stream_token_for(&actions, &server);
-    let stream = hk.fresh_stream();
-    hk.agent.stream_open_result(token, Ok(stream), at(3));
+    let stream = opened_stream_for(&drain_actions(&mut hk.agent), &server);
     hk.stream_ready(&server.clone(), stream, AUTONAT_PROTOCOL_ID, at(4));
     drain_actions(&mut hk.agent);
 
@@ -372,12 +348,25 @@ fn probe_timeout_rotates_to_the_next_server() {
 // Reservation lifecycle
 // ---------------------------------------------------------------------------
 
+/// Feeds an asynchronous `DialFailed` for the relay dial on `conn_id`.
+fn dial_failed(hk: &mut Hk, conn_id: ConnectionId, reason: &str, now: Now) -> bool {
+    let addr = PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), hk.relay.clone()).expect("relay addr");
+    hk.agent.handle_event(
+        &SwarmEvent::DialFailed {
+            conn_id,
+            addr,
+            reason: reason.into(),
+        },
+        false,
+        now,
+    )
+}
+
 /// Bootstraps the relay session and completes the first reservation.
 fn reserve_via_relay(hk: &mut Hk, response: Vec<u8>, now: Now) -> (Vec<NatEvent>, StreamId) {
     hk.agent.handle_tick(now);
     let actions = drain_actions(&mut hk.agent);
-    let dial = dial_token_for(&actions, &hk.relay);
-    hk.agent.dial_result(dial, Ok(ConnectionId::new(60)), now);
+    assert_eq!(dial_count_for(&actions, &hk.relay), 1);
     let relay = hk.relay.clone();
     hk.session_ready(&relay, &[HOP_PROTOCOL_ID], now);
     hk.finish_reserve(response, now)
@@ -493,7 +482,7 @@ fn reservation_keep_alive_uses_synthetic_time_only_for_quic() {
     quic.agent.handle_tick(at(110));
     assert!(matches!(
         drain_actions(&mut quic.agent).as_slice(),
-        [NatAction::Ping { peer }] if peer == &quic.relay
+        [Out::Ping { peer }] if peer == &quic.relay
     ));
 
     let mut tcp = build_with_config(ReservationPolicy::Always, 1, 0, |config| {
@@ -535,13 +524,13 @@ fn refused_reservation_rotates_relay_after_backoff() {
 }
 
 /// Counts HOP `OpenStream` actions targeting `peer`.
-fn hop_open_count(actions: &[NatAction], peer: &PeerId) -> usize {
+fn hop_open_count(actions: &[Out], peer: &PeerId) -> usize {
     actions
         .iter()
         .filter(|action| {
             matches!(
                 action,
-                NatAction::OpenStream { peer: p, protocol_id, .. }
+                Out::OpenStream { peer: p, protocol_id, .. }
                     if p == peer && protocol_id == HOP_PROTOCOL_ID
             )
         })
@@ -581,6 +570,7 @@ fn lost_relay_connection_emits_lost_and_reacquires() {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay.clone(),
         },
+        false,
         at(5_000),
     );
     let events = drain_events(&mut hk.agent);
@@ -597,7 +587,7 @@ fn lost_relay_connection_emits_lost_and_reacquires() {
 }
 
 #[test]
-fn retiring_one_relay_connection_keeps_reservation_on_live_replacement() {
+fn retiring_another_relay_connection_keeps_the_reservation() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(None), at_unix(10, 1_000));
     assert!(matches!(
@@ -606,22 +596,25 @@ fn retiring_one_relay_connection_keeps_reservation_on_live_replacement() {
     ));
     drain_actions(&mut hk.agent); // completed exchange's close-write
 
-    // The replacement is already known before the retired connection's
-    // terminal event arrives. Losing one connection id must not be treated
-    // as losing the relay peer itself.
+    // A second connection to the relay comes and goes while the swarm keeps
+    // the reservation's connection (1) current. Losing one connection id
+    // must not be treated as losing the relay peer, or the reservation made
+    // on another connection.
     let relay = hk.relay.clone();
-    hk.agent.handle_event(
+    hk.agent.deliver_late(
         &SwarmEvent::ConnectionEstablished {
             conn_id: ConnectionId::new(2),
             peer_id: relay.clone(),
         },
+        false,
         at(20),
     );
     hk.agent.handle_event(
         &SwarmEvent::ConnectionClosed {
-            conn_id: ConnectionId::new(1),
+            conn_id: ConnectionId::new(2),
             peer_id: relay,
         },
+        false,
         at(21),
     );
 
@@ -631,13 +624,13 @@ fn retiring_one_relay_connection_keeps_reservation_on_live_replacement() {
     assert_eq!(
         dial_count_for(&drain_actions(&mut hk.agent), &hk.relay),
         0,
-        "a live replacement must not trigger reservation reacquisition"
+        "a retired duplicate must not trigger reservation reacquisition"
     );
 }
 
 /// Replaces the relay connection 1 with 2 and returns the actions the agent
 /// queues once the new connection is ready.
-fn replace_relay_connection(hk: &mut Hk, now: Now) -> Vec<NatAction> {
+fn replace_relay_connection(hk: &mut Hk, now: Now) -> Vec<Out> {
     let relay = hk.relay.clone();
     hk.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
@@ -645,6 +638,7 @@ fn replace_relay_connection(hk: &mut Hk, now: Now) -> Vec<NatAction> {
             old: ConnectionId::new(1),
             new: ConnectionId::new(2),
         },
+        false,
         now,
     );
     // The relay dropped the reservation with its connection: withdraw it now.
@@ -656,7 +650,7 @@ fn replace_relay_connection(hk: &mut Hk, now: Now) -> Vec<NatAction> {
     assert!(
         !actions
             .iter()
-            .any(|action| matches!(action, NatAction::ResetStream { .. })),
+            .any(|action| matches!(action, Out::ResetStream { .. })),
         "the old exchange must not reset a stream id on the new connection"
     );
     assert_eq!(
@@ -670,6 +664,7 @@ fn replace_relay_connection(hk: &mut Hk, now: Now) -> Vec<NatAction> {
             conn_id: ConnectionId::new(2),
             protocols: vec![HOP_PROTOCOL_ID.to_string()],
         },
+        false,
         now,
     );
     drain_actions(&mut hk.agent)
@@ -697,17 +692,80 @@ fn replacement_during_a_refresh_starts_exactly_one_exchange_on_new() {
     let renew_at = 10 + 780 * 1_000;
     hk.agent.handle_tick(at_unix(renew_at, 1_790));
     let relay = hk.relay.clone();
-    let token = open_stream_token_for(&drain_actions(&mut hk.agent), &relay);
-    let stream = hk.fresh_stream();
-    hk.agent
-        .stream_open_result(token, Ok(stream), at_unix(renew_at, 1_790));
+    let stream = opened_stream_for(&drain_actions(&mut hk.agent), &relay);
 
     let actions = replace_relay_connection(&mut hk, at_unix(renew_at + 1, 1_790));
     assert_eq!(hop_open_count(&actions, &relay), 1);
     assert!(
-        !hk.agent.owns_stream(&relay, stream),
+        !hk.agent.owns_stream(ConnectionId::new(1), stream),
         "the old exchange is gone"
     );
+}
+
+#[test]
+fn reservation_work_started_on_a_replacement_survives_the_replacement_event() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    let relay = hk.relay.clone();
+    let (old, new) = (ConnectionId::new(1), ConnectionId::new(2));
+    // The swarm is ahead of the events NAT has handled: the relay's first
+    // connection was already replaced, and the replacement is ready.
+    hk.agent
+        .swarm
+        .make_ready(&relay, new, &[HOP_PROTOCOL_ID.to_string()]);
+    hk.agent.handle_tick(at(0));
+    let actions = drain_actions(&mut hk.agent);
+    assert_eq!(dial_count_for(&actions, &relay), 0);
+    let stream = opened_stream_for(&actions, &relay);
+
+    // The buffered lifecycle of the retired connection catches up. Cleanup
+    // is scoped to `old`: the exchange on `new` keeps going.
+    let hop = || vec![HOP_PROTOCOL_ID.to_string()];
+    for event in [
+        SwarmEvent::ConnectionEstablished {
+            peer_id: relay.clone(),
+            conn_id: old,
+        },
+        SwarmEvent::PeerReady {
+            peer_id: relay.clone(),
+            conn_id: old,
+            protocols: hop(),
+        },
+        SwarmEvent::ConnectionReplaced {
+            peer_id: relay.clone(),
+            old,
+            new,
+        },
+        SwarmEvent::PeerReady {
+            peer_id: relay.clone(),
+            conn_id: new,
+            protocols: hop(),
+        },
+    ] {
+        hk.agent.deliver_late(&event, false, at(1));
+    }
+    let actions = drain_actions(&mut hk.agent);
+    assert!(
+        actions.is_empty(),
+        "no reset and no second exchange: {actions:?}"
+    );
+    assert!(drain_events(&mut hk.agent).is_empty());
+    assert!(hk.agent.owns_stream(new, stream));
+
+    hk.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: new,
+            peer_id: relay.clone(),
+            stream_id: stream,
+            protocol_id: HOP_PROTOCOL_ID.to_string(),
+            initiated_locally: true,
+        },
+        false,
+        at(2),
+    );
+    assert!(matches!(
+        drain_actions(&mut hk.agent).as_slice(),
+        [Out::SendStream { conn, stream_id, .. }] if *conn == new && *stream_id == stream
+    ));
 }
 
 #[test]
@@ -718,12 +776,8 @@ fn when_private_policy_follows_the_reachability_verdict() {
     // reservation (dialable now) and a probe (gather evidence).
     hk.agent.handle_tick(at(0));
     let actions = drain_actions(&mut hk.agent);
-    let relay_dial = dial_token_for(&actions, &hk.relay);
-    let server_dial = dial_token_for(&actions, &hk.server);
-    hk.agent
-        .dial_result(relay_dial, Ok(ConnectionId::new(60)), at(1));
-    hk.agent
-        .dial_result(server_dial, Ok(ConnectionId::new(61)), at(1));
+    assert_eq!(dial_count_for(&actions, &hk.relay), 1);
+    assert_eq!(dial_count_for(&actions, &hk.server), 1);
     let relay = hk.relay.clone();
     let server = hk.server.clone();
     hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
@@ -777,9 +831,9 @@ fn when_private_policy_follows_the_reachability_verdict() {
     ));
     let actions = drain_actions(&mut hk.agent);
     assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, NatAction::OpenStream { protocol_id, .. } if protocol_id == HOP_PROTOCOL_ID)),
+        actions.iter().any(
+            |a| matches!(a, Out::OpenStream { protocol_id, .. } if protocol_id == HOP_PROTOCOL_ID)
+        ),
         "reservation reacquired once private: {actions:?}"
     );
 }
@@ -801,7 +855,7 @@ fn concurrent_reservation_and_connect_share_one_relay_dial() {
     // The reservation manager dials the relay first.
     hk.agent.handle_tick(at(0));
     let actions = drain_actions(&mut hk.agent);
-    let reserve_dial = dial_token_for(&actions, &relay);
+    assert_eq!(dial_count_for(&actions, &relay), 1);
 
     // A connect starts while that dial is still handshaking; its relay leg
     // must wait on the pending connection instead of dialing again.
@@ -816,15 +870,13 @@ fn concurrent_reservation_and_connect_share_one_relay_dial() {
 
     // The shared connection comes up: both machines proceed, each opening
     // its own HOP stream on it.
-    hk.agent
-        .dial_result(reserve_dial, Ok(ConnectionId::new(9)), at(400));
     hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(410));
     let actions = drain_actions(&mut hk.agent);
     let hop_opens = actions
         .iter()
-        .filter(|a| {
-            matches!(a, NatAction::OpenStream { protocol_id, .. } if protocol_id == HOP_PROTOCOL_ID)
-        })
+        .filter(
+            |a| matches!(a, Out::OpenStream { protocol_id, .. } if protocol_id == HOP_PROTOCOL_ID),
+        )
         .count();
     assert_eq!(
         hop_opens, 2,
@@ -884,8 +936,7 @@ fn waiting_attempt_redials_when_the_shared_dial_fails() {
 
     // The reservation manager owns the relay dial.
     hk.agent.handle_tick(at(0));
-    let actions = drain_actions(&mut hk.agent);
-    let reserve_dial = dial_token_for(&actions, &relay);
+    let reserve_dial = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
 
     // A connect attempt joins the pending dial.
     start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(10));
@@ -893,8 +944,7 @@ fn waiting_attempt_redials_when_the_shared_dial_fails() {
     assert_eq!(dial_count_for(&actions, &relay), 0, "{actions:?}");
 
     // The shared dial fails: the waiting attempt re-dials at once.
-    hk.agent
-        .dial_result(reserve_dial, Err("connection refused".into()), at(500));
+    dial_failed(&mut hk, reserve_dial, "connection refused", at(500));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(
         dial_count_for(&actions, &relay),
@@ -908,7 +958,12 @@ fn waiting_attempt_redials_when_the_shared_dial_fails() {
 /// late result has nowhere to land.
 #[test]
 fn a_deferred_dial_past_its_flight_is_retired_and_its_late_result_ignored() {
-    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    let mut hk = build_with_config(ReservationPolicy::Always, 1, 0, |config| {
+        let relay = config.relays[0].peer_id().clone();
+        config.relays[0] = PeerAddr::new(maddr("/dns4/relay.example/udp/4001/quic-v1"), relay)
+            .expect("named relay address");
+    });
+    hk.agent.swarm.park_named = true;
     let relay = hk.relay.clone();
     hk.agent.handle_tick(at(0));
     let actions = drain_actions(&mut hk.agent);
@@ -934,19 +989,8 @@ fn reserve_dial_failed_event_schedules_backoff() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     let relay = hk.relay.clone();
     hk.agent.handle_tick(at(0));
-    let actions = drain_actions(&mut hk.agent);
-    let reserve_dial = dial_token_for(&actions, &relay);
-    let conn_id = ConnectionId::new(3);
-    let relay_addr = PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), relay.clone()).expect("relay addr");
-    hk.agent.dial_result(reserve_dial, Ok(conn_id), at(5));
-    assert!(hk.agent.handle_event_with_disposition(
-        &SwarmEvent::DialFailed {
-            conn_id,
-            addr: relay_addr,
-            reason: "connection refused".into(),
-        },
-        at(6),
-    ));
+    let conn_id = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
+    assert!(dial_failed(&mut hk, conn_id, "connection refused", at(6)));
     assert_eq!(
         hk.agent.next_timeout(6),
         Some(NatConfig::default().reservation_retry_backoff_ms),
@@ -1004,15 +1048,13 @@ fn late_shared_dial_failure_does_not_redial_a_dead_leg() {
     let relay = hk.relay.clone();
 
     hk.agent.handle_tick(at(0));
-    let actions = drain_actions(&mut hk.agent);
-    let reserve_dial = dial_token_for(&actions, &relay);
+    let reserve_dial = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
 
     start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(10));
     drain_actions(&mut hk.agent);
 
     // The failure lands past the attempt's relay-leg deadline (10 + 12s).
-    hk.agent
-        .dial_result(reserve_dial, Err("timed out".into()), at(12_500));
+    dial_failed(&mut hk, reserve_dial, "timed out", at(12_500));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(
         dial_count_for(&actions, &relay),
@@ -1046,4 +1088,76 @@ fn stalled_session_dial_expires_and_the_retry_redials() {
         1,
         "the retry must redial the relay: {actions:?}"
     );
+}
+
+/// Announces `conn` to `peer` as established and ready for `protocol`.
+fn ready_on(hk: &mut Hk, peer: &PeerId, conn: ConnectionId, protocol: &str, now: Now) {
+    hk.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: conn,
+            peer_id: peer.clone(),
+        },
+        false,
+        now,
+    );
+    hk.agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: peer.clone(),
+            conn_id: conn,
+            protocols: vec![protocol.to_string()],
+        },
+        false,
+        now,
+    );
+}
+
+#[test]
+fn late_probe_dial_failure_after_rotation_keeps_the_new_flight() {
+    let mut hk = build(ReservationPolicy::Never, 0, 2);
+    let (server, server2) = (hk.server.clone(), hk.server2.clone());
+    let deadline = NatConfig::default().probe_deadline_ms;
+
+    hk.agent.handle_tick(at(0));
+    let old = dial_conn_for(&drain_actions(&mut hk.agent), &server);
+    // The first server never answers; the retry dials the second.
+    hk.agent.handle_tick(at(deadline));
+    hk.agent.handle_tick(at(deadline + 5_000));
+    let new = dial_conn_for(&drain_actions(&mut hk.agent), &server2);
+
+    let addr = PeerAddr::new(maddr(SERVER_ADDR), server.clone()).expect("server addr");
+    let late = SwarmEvent::DialFailed {
+        conn_id: old,
+        addr,
+        reason: "timed out".into(),
+    };
+    assert!(hk.agent.handle_event(&late, false, at(deadline + 5_001)));
+
+    ready_on(
+        &mut hk,
+        &server2,
+        new,
+        AUTONAT_PROTOCOL_ID,
+        at(deadline + 5_002),
+    );
+    opened_stream_for(&drain_actions(&mut hk.agent), &server2);
+}
+
+#[test]
+fn late_reserve_dial_failure_after_rotation_keeps_the_new_acquisition() {
+    let mut hk = build(ReservationPolicy::Always, 2, 0);
+    let (relay, relay2) = (hk.relay.clone(), hk.relay2.clone());
+    let config = NatConfig::default();
+    let retry_at = config.relay_leg_deadline_ms + config.reservation_retry_backoff_ms;
+
+    hk.agent.handle_tick(at(0));
+    let old = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
+    // The first relay never connects; after the backoff the second is dialed.
+    hk.agent.handle_tick(at(config.relay_leg_deadline_ms));
+    hk.agent.handle_tick(at(retry_at));
+    let new = dial_conn_for(&drain_actions(&mut hk.agent), &relay2);
+
+    assert!(dial_failed(&mut hk, old, "timed out", at(retry_at + 1)));
+
+    ready_on(&mut hk, &relay2, new, HOP_PROTOCOL_ID, at(retry_at + 2));
+    assert_eq!(hop_open_count(&drain_actions(&mut hk.agent), &relay2), 1);
 }

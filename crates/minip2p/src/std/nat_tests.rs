@@ -11,7 +11,7 @@ use super::NextEvent;
 #[cfg(all(feature = "quic", feature = "relay-server"))]
 use crate::QuicLimits;
 use crate::{Ed25519Keypair, Endpoint, EndpointEvent, NatConfig, ReachabilityState};
-use minip2p_nat::{NatToken, ReservationPolicy};
+use minip2p_nat::{DialStart, NatSwarm, NatSwarmError, NatToken, ReservationPolicy};
 use minip2p_relay::{HOP_PROTOCOL_ID, HopMessage, HopMessageType, Status, encode_frame};
 
 /// Shares the loopback relay application with the integration tests; it is
@@ -391,24 +391,75 @@ fn drain_actions(agent: &mut NatAgent) -> Vec<NatAction> {
     core::iter::from_fn(|| agent.poll_action()).collect()
 }
 
-fn only_dial_token(actions: &[NatAction]) -> NatToken {
-    actions
-        .iter()
-        .find_map(|action| match action {
-            NatAction::Dial { token, .. } => Some(*token),
-            _ => None,
-        })
-        .expect("dial token")
+/// A swarm already holding the negotiated bridge: the relay is ready on
+/// the pair's inner connection, and the one stream it opens is the pair's.
+struct BridgeSwarm {
+    relay: minip2p_core::PeerId,
+    conn: ConnectionId,
+    stream: StreamId,
+    protocols: Vec<String>,
 }
 
-fn only_open_token(actions: &[NatAction]) -> NatToken {
-    actions
-        .iter()
-        .find_map(|action| match action {
-            NatAction::OpenStream { token, .. } => Some(*token),
-            _ => None,
-        })
-        .expect("open token")
+impl NatSwarm for BridgeSwarm {
+    fn connection(&self, peer: &minip2p_core::PeerId) -> Option<ConnectionId> {
+        (*peer == self.relay).then_some(self.conn)
+    }
+
+    fn readiness(&self, peer: &minip2p_core::PeerId) -> Option<(ConnectionId, &[String])> {
+        (*peer == self.relay).then_some((self.conn, self.protocols.as_slice()))
+    }
+
+    fn dial(
+        &mut self,
+        addr: &minip2p_core::PeerAddr,
+        _token: NatToken,
+    ) -> Result<DialStart, NatSwarmError> {
+        Err(NatSwarmError::NamedAddress(addr.clone()))
+    }
+
+    fn open_stream(
+        &mut self,
+        _peer: &minip2p_core::PeerId,
+        _protocol_id: &str,
+        _now_ms: u64,
+    ) -> Result<(ConnectionId, StreamId), NatSwarmError> {
+        Ok((self.conn, self.stream))
+    }
+
+    fn send_stream(
+        &mut self,
+        _peer: &minip2p_core::PeerId,
+        _conn_id: ConnectionId,
+        _stream_id: StreamId,
+        _data: Bytes,
+        _now_ms: u64,
+    ) -> Result<(), NatSwarmError> {
+        Ok(())
+    }
+
+    fn close_stream_write(
+        &mut self,
+        _peer: &minip2p_core::PeerId,
+        _conn_id: ConnectionId,
+        _stream_id: StreamId,
+        _now_ms: u64,
+    ) -> Result<(), NatSwarmError> {
+        Ok(())
+    }
+
+    fn reset_stream(
+        &mut self,
+        _peer: &minip2p_core::PeerId,
+        _conn_id: ConnectionId,
+        _stream_id: StreamId,
+        _now_ms: u64,
+    ) -> Result<(), NatSwarmError> {
+        Ok(())
+    }
+
+    fn ping(&mut self, _peer: &minip2p_core::PeerId, _now_ms: u64) -> Result<(), NatSwarmError> {
+        Ok(())
+    }
 }
 
 fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver, NatAction) {
@@ -420,8 +471,15 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
         reservation_policy: ReservationPolicy::Never,
         ..NatConfig::default()
     };
+    let mut swarm = BridgeSwarm {
+        relay: relay_peer.clone(),
+        conn: pair.inner_conn,
+        stream: pair.stream,
+        protocols: vec![HOP_PROTOCOL_ID.to_string()],
+    };
     let mut agent = NatAgent::new(pair.local.peer_id().clone(), config);
     agent.connect(
+        &mut swarm,
         minip2p_core::ConnectId::from_u64(1),
         target,
         minip2p_nat::ConnectLegs {
@@ -432,30 +490,9 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
         },
         Now::from_mono(0),
     );
-    let dial = drain_actions(&mut agent);
-    agent.dial_result(
-        only_dial_token(&dial),
-        Ok(pair.inner_conn),
-        Now::from_mono(1),
-    );
+    assert!(agent.owns_stream(pair.inner_conn, pair.stream));
     agent.handle_event(
-        &SwarmEvent::ConnectionEstablished {
-            peer_id: relay_peer.clone(),
-            conn_id: pair.inner_conn,
-        },
-        Now::from_mono(2),
-    );
-    agent.handle_event(
-        &SwarmEvent::PeerReady {
-            peer_id: relay_peer.clone(),
-            conn_id: pair.inner_conn,
-            protocols: vec![HOP_PROTOCOL_ID.to_string()],
-        },
-        Now::from_mono(3),
-    );
-    let open = drain_actions(&mut agent);
-    agent.stream_open_result(only_open_token(&open), Ok(pair.stream), Now::from_mono(4));
-    agent.handle_event(
+        &mut swarm,
         &SwarmEvent::StreamReady {
             peer_id: relay_peer.clone(),
             conn_id: pair.inner_conn,
@@ -463,9 +500,9 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
             protocol_id: HOP_PROTOCOL_ID.to_string(),
             initiated_locally: true,
         },
+        false,
         Now::from_mono(5),
     );
-    drain_actions(&mut agent); // HOP CONNECT
     let status = HopMessage {
         kind: HopMessageType::Status,
         peer: None,
@@ -474,12 +511,14 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
         status: Some(Status::Ok),
     };
     agent.handle_event(
+        &mut swarm,
         &SwarmEvent::StreamData {
             peer_id: relay_peer.clone(),
             conn_id: pair.inner_conn,
             stream_id: pair.stream,
             data: Bytes::from(encode_frame(&status.encode())),
         },
+        false,
         Now::from_mono(6),
     );
     let mut promotion = drain_actions(&mut agent)

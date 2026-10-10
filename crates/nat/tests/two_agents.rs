@@ -9,12 +9,13 @@
 
 mod common;
 
-use common::{LISTEN_ADDR, RELAY_NOW, at, drain_events, identify_observed, maddr, peer, start};
+use common::{
+    LISTEN_ADDR, Node, Out, RELAY_NOW, at, drain_actions, drain_events, identify_observed, maddr,
+    peer, start,
+};
 
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
-use minip2p_nat::{
-    DCUTR_PROTOCOL_ID, NatAction, NatAgent, NatConfig, NatEvent, Path, ReservationPolicy,
-};
+use minip2p_nat::{DCUTR_PROTOCOL_ID, NatConfig, NatEvent, Path, ReservationPolicy};
 use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_swarm::SwarmEvent;
 use minip2p_test_support::{ConnectRequestOutcome, PendingConnectId, RelayEmulator};
@@ -25,6 +26,8 @@ const RELAY_ADDR: &str = "/ip4/203.0.113.1/udp/4001/quic-v1";
 /// Each side's public NAT mapping, as the relay's identify reports it.
 const A_PUBLIC: &str = "/ip4/8.8.4.4/udp/40001/quic-v1";
 const B_PUBLIC: &str = "/ip4/1.1.1.1/udp/40002/quic-v1";
+/// Base of the stream ids the world allocates for remotely opened streams.
+const INBOUND_STREAM_BASE: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Side {
@@ -44,8 +47,8 @@ enum EmuStream {
 }
 
 struct World {
-    a: NatAgent,
-    b: NatAgent,
+    a: Node,
+    b: Node,
     a_id: PeerId,
     b_id: PeerId,
     relay_id: PeerId,
@@ -71,6 +74,8 @@ struct World {
     punch_conn_a: Option<ConnectionId>,
     punch_conn_b: Option<ConnectionId>,
     circuit_conns: [Option<ConnectionId>; 2],
+    /// Each side's connection to the relay, once dialed.
+    relay_conns: [Option<ConnectionId>; 2],
     dcutr_streams: Vec<(Side, StreamId, Side, StreamId)>,
 }
 
@@ -86,7 +91,7 @@ impl World {
         let relay_addr =
             PeerAddr::new(maddr(RELAY_ADDR), relay_id.clone()).expect("valid relay peer address");
 
-        let mut a = NatAgent::new(
+        let mut a = Node::new(
             a_id.clone(),
             NatConfig {
                 relays: vec![relay_addr.clone()],
@@ -97,7 +102,7 @@ impl World {
         );
         a.set_listen_addrs(&[maddr(A_LISTEN)]);
 
-        let mut b = NatAgent::new(
+        let mut b = Node::new(
             b_id.clone(),
             NatConfig {
                 relays: vec![relay_addr],
@@ -131,6 +136,7 @@ impl World {
             punch_conn_a: None,
             punch_conn_b: None,
             circuit_conns: [None, None],
+            relay_conns: [None, None],
             dcutr_streams: Vec::new(),
         }
     }
@@ -142,7 +148,7 @@ impl World {
         }
     }
 
-    fn agent(&mut self, side: Side) -> &mut NatAgent {
+    fn agent(&mut self, side: Side) -> &mut Node {
         match side {
             Side::A => &mut self.a,
             Side::B => &mut self.b,
@@ -164,6 +170,14 @@ impl World {
             .expect("circuit connection must be promoted before DCUtR traffic")
     }
 
+    fn relay_conn(&self, side: Side) -> ConnectionId {
+        self.relay_conns
+            .get(Self::side_index(side))
+            .copied()
+            .flatten()
+            .expect("the side dialed the relay before relay traffic")
+    }
+
     fn set_circuit_conn(&mut self, side: Side, conn_id: ConnectionId) {
         *self
             .circuit_conns
@@ -171,12 +185,12 @@ impl World {
             .expect("every side index selects one circuit connection slot") = Some(conn_id);
     }
 
-    /// Runs both agents until neither has pending actions.
+    /// Runs both agents until neither has pending commands or actions.
     fn pump(&mut self) {
         loop {
             let mut progressed = false;
             for side in [Side::A, Side::B] {
-                if let Some(action) = self.agent(side).poll_action() {
+                for action in drain_actions(self.agent(side)) {
                     self.process(side, action);
                     progressed = true;
                 }
@@ -196,34 +210,51 @@ impl World {
         self.pump();
     }
 
-    fn process(&mut self, side: Side, action: NatAction) {
+    /// A fresh id for a stream the remote (relay or other agent) opened.
+    /// Kept clear of the fake swarm's outbound ids, which start at 1001.
+    fn next_inbound_stream(&mut self) -> StreamId {
+        self.next_stream += 1;
+        StreamId::new(INBOUND_STREAM_BASE + self.next_stream)
+    }
+
+    /// Executes one swarm command or agent action `side` issued.
+    #[expect(
+        clippy::panic,
+        reason = "the scripted world must stop on a command it cannot emulate"
+    )]
+    fn process(&mut self, side: Side, action: Out) {
         let now = at(self.now);
         match action {
-            NatAction::Dial { token, addr } => {
+            Out::Dial { addr, conn, .. } => {
+                let conn = conn.expect("the fake swarm starts every concrete dial");
                 if addr.peer_id() == &self.relay_id {
-                    self.next_conn += 1;
-                    let conn = ConnectionId::new(self.next_conn);
-                    self.agent(side).dial_result(token, Ok(conn), now);
                     if !self.relay_sessions.contains(&side) {
                         self.relay_sessions.push(side);
+                        *self
+                            .relay_conns
+                            .get_mut(Self::side_index(side))
+                            .expect("every side index selects one relay connection slot") =
+                            Some(conn);
                         let relay = self.relay_id.clone();
                         let agent = self.agent(side);
                         agent.handle_event(
                             &SwarmEvent::ConnectionEstablished {
-                                conn_id: minip2p_transport::ConnectionId::new(1),
+                                conn_id: conn,
                                 peer_id: relay.clone(),
                             },
+                            false,
                             now,
                         );
                         agent.handle_event(
                             &SwarmEvent::PeerReady {
                                 peer_id: relay.clone(),
-                                conn_id: ConnectionId::new(1),
+                                conn_id: conn,
                                 protocols: vec![
                                     HOP_PROTOCOL_ID.to_string(),
                                     STOP_PROTOCOL_ID.to_string(),
                                 ],
                             },
+                            false,
                             now,
                         );
                         // Identify over the relay connection reports the
@@ -241,29 +272,27 @@ impl World {
                         Side::A => {
                             self.punch_dials_from_a += 1;
                             self.punch_dial_addrs_from_a.push(addr.transport().clone());
+                            self.punch_conn_a = Some(conn);
                         }
                         Side::B => {
                             self.punch_dials_from_b += 1;
                             self.punch_dial_addrs_from_b.push(addr.transport().clone());
+                            self.punch_conn_b = Some(conn);
                         }
-                    }
-                    self.next_conn += 1;
-                    let conn = ConnectionId::new(self.next_conn);
-                    self.agent(side).dial_result(token, Ok(conn), now);
-                    match side {
-                        Side::A => self.punch_conn_a = Some(conn),
-                        Side::B => self.punch_conn_b = Some(conn),
                     }
                     if self.deliver_direct {
                         self.establish_direct();
                     }
                 }
             }
-            NatAction::OpenStream {
-                token,
+            Out::OpenStream {
                 peer,
                 protocol_id,
+                opened,
             } => {
+                let Some((local_conn, local_stream)) = opened else {
+                    panic!("the fake swarm refused {protocol_id} toward {peer}");
+                };
                 if peer != self.relay_id {
                     assert_eq!(protocol_id, DCUTR_PROTOCOL_ID);
                     let remote = match side {
@@ -271,25 +300,20 @@ impl World {
                         Side::B => Side::A,
                     };
                     assert_eq!(peer, self.peer_of(remote));
-                    self.next_stream += 1;
-                    let local_stream = StreamId::new(self.next_stream);
-                    self.next_stream += 1;
-                    let remote_stream = StreamId::new(self.next_stream);
+                    assert_eq!(local_conn, self.circuit_conn(side));
+                    let remote_stream = self.next_inbound_stream();
                     self.dcutr_streams
                         .push((side, local_stream, remote, remote_stream));
-                    let local_conn = self.circuit_conn(side);
                     let remote_conn = self.circuit_conn(remote);
-                    let local_peer = self.peer_of(remote);
-                    self.agent(side)
-                        .stream_open_result(token, Ok(local_stream), now);
                     self.agent(side).handle_event(
                         &SwarmEvent::StreamReady {
                             conn_id: local_conn,
-                            peer_id: local_peer,
+                            peer_id: peer,
                             stream_id: local_stream,
                             protocol_id: protocol_id.clone(),
                             initiated_locally: true,
                         },
+                        false,
                         now,
                     );
                     let remote_peer = self.peer_of(side);
@@ -301,29 +325,26 @@ impl World {
                             protocol_id,
                             initiated_locally: false,
                         },
+                        false,
                         now,
                     );
                     return;
                 }
                 assert_eq!(protocol_id, HOP_PROTOCOL_ID);
-                self.next_stream += 1;
-                let stream = StreamId::new(self.next_stream);
-                self.streams.push((side, stream, EmuStream::Hop));
-                let relay = self.relay_id.clone();
-                let agent = self.agent(side);
-                agent.stream_open_result(token, Ok(stream), now);
-                agent.handle_event(
+                self.streams.push((side, local_stream, EmuStream::Hop));
+                self.agent(side).handle_event(
                     &SwarmEvent::StreamReady {
-                        conn_id: minip2p_transport::ConnectionId::new(1),
-                        peer_id: relay,
-                        stream_id: stream,
+                        conn_id: local_conn,
+                        peer_id: peer,
+                        stream_id: local_stream,
                         protocol_id,
                         initiated_locally: true,
                     },
+                    false,
                     now,
                 );
             }
-            NatAction::SendStream {
+            Out::SendStream {
                 stream_id, data, ..
             } => {
                 if let Some((_, _, remote, remote_stream)) = self
@@ -343,6 +364,7 @@ impl World {
                             stream_id: remote_stream,
                             data: Bytes::from(data),
                         },
+                        false,
                         now,
                     );
                 } else if let Some((local, local_stream, _, _)) = self
@@ -362,18 +384,19 @@ impl World {
                             stream_id: local_stream,
                             data: Bytes::from(data),
                         },
+                        false,
                         now,
                     );
                 } else {
                     self.on_relay_bytes(side, stream_id, data);
                 }
             }
-            NatAction::SendRandomUdp { .. } => {
+            Out::SendRandomUdp { .. } => {
                 if side == Side::B {
                     self.blasts_from_b += 1;
                 }
             }
-            NatAction::PromoteBridge {
+            Out::PromoteBridge {
                 token, remote_peer, ..
             } => {
                 self.next_conn += 1;
@@ -381,7 +404,7 @@ impl World {
                 self.set_circuit_conn(side, conn_id);
                 let agent = self.agent(side);
                 agent.promote_result(token, Ok(conn_id), now);
-                agent.handle_event_with_disposition_classified(
+                agent.handle_event(
                     &SwarmEvent::ConnectionEstablished {
                         peer_id: remote_peer,
                         conn_id,
@@ -390,11 +413,10 @@ impl World {
                     now,
                 );
             }
-            NatAction::CloseCircuit { .. } => {}
-            NatAction::CloseStreamWrite { .. }
-            | NatAction::ResetStream { .. }
-            | NatAction::Disconnect { .. }
-            | NatAction::Ping { .. } => {}
+            Out::CloseCircuit { .. }
+            | Out::CloseStreamWrite { .. }
+            | Out::ResetStream { .. }
+            | Out::Ping { .. } => {}
         }
     }
 
@@ -443,20 +465,21 @@ impl World {
                     // Mark A's stream as the relay side of the bridge and
                     // open the queued STOP stream toward B.
                     self.set_role(side, stream, EmuStream::HopBridge);
-                    self.next_stream += 1;
-                    let stop_stream = StreamId::new(self.next_stream);
+                    let stop_stream = self.next_inbound_stream();
                     self.streams.push((Side::B, stop_stream, EmuStream::Stop));
                     self.bridge = Some((stream, stop_stream, pending_id));
 
                     let relay = self.relay_id.clone();
+                    let conn_id = self.relay_conn(Side::B);
                     self.b.handle_event(
                         &SwarmEvent::StreamReady {
-                            conn_id: minip2p_transport::ConnectionId::new(1),
+                            conn_id,
                             peer_id: relay,
                             stream_id: stop_stream,
                             protocol_id: STOP_PROTOCOL_ID.to_string(),
                             initiated_locally: false,
                         },
+                        false,
                         at(self.now),
                     );
                     let stop_connect = self.relay_emulator.drain_stop_bytes_for(&target);
@@ -506,13 +529,15 @@ impl World {
     fn deliver(&mut self, side: Side, stream: StreamId, data: Vec<u8>) {
         let relay = self.relay_id.clone();
         let now = at(self.now);
+        let conn_id = self.relay_conn(side);
         self.agent(side).handle_event(
             &SwarmEvent::StreamData {
-                conn_id: minip2p_transport::ConnectionId::new(1),
+                conn_id,
                 peer_id: relay,
                 stream_id: stream,
                 data: Bytes::from(data),
             },
+            false,
             now,
         );
     }
@@ -528,6 +553,7 @@ impl World {
                 conn_id: a_conn,
                 peer_id: b_id,
             },
+            false,
             now,
         );
         self.b.handle_event(
@@ -535,6 +561,7 @@ impl World {
                 conn_id: b_conn,
                 peer_id: a_id,
             },
+            false,
             now,
         );
     }

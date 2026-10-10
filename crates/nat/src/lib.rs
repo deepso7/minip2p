@@ -23,11 +23,13 @@
 //! relay leg dead ⇒ ConnectFailed (engine decides the attempt)
 //! ```
 //!
-//! The agent performs no I/O and reads no clocks: feed it swarm events by
-//! reference via [`NatAgent::handle_event`], time via [`NatAgent::handle_tick`],
-//! and execute the [`NatAction`]s it emits against a [`minip2p_swarm::Swarm`]
-//! (or any equivalent runtime). Events for streams the agent does not own
-//! cost one map lookup and zero clones.
+//! The agent performs no I/O and reads no clocks: pass it the swarm as a
+//! [`NatSwarm`] (implemented for [`minip2p_swarm::SwarmCore`]), feed it swarm
+//! events by reference via [`NatAgent::handle_event`] and time via
+//! [`NatAgent::handle_tick`]. It reads connection and readiness facts from
+//! that swarm and issues dials, stream opens, and writes on it directly;
+//! the few [`NatAction`]s it emits need the transport underneath. Events for
+//! streams the agent does not own cost one map lookup and zero clones.
 //!
 //! The driver executes [`NatAction::PromoteBridge`] against a circuit
 //! transport. Relayed paths are therefore ordinary identity-verified swarm
@@ -40,17 +42,20 @@
 
 extern crate alloc;
 
+mod acquire;
 mod agent;
 mod attempt;
 mod config;
 mod events;
 mod housekeeping;
 mod inbound;
+mod swarm;
 mod types;
 
 pub use agent::{ConnectLegs, NatAgent};
 pub use config::{NatConfig, ReservationPolicy};
 pub use events::{BridgeRole, NatAction, NatEvent};
+pub use swarm::{DialStart, NatSwarm, NatSwarmError, is_named};
 pub use types::{NatError, NatToken, Now, Path, PromoteError, ReachabilityState, ReservationInfo};
 
 // Protocol ids for everything the agent drives, so a driver can register

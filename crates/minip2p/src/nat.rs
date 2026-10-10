@@ -1,9 +1,10 @@
 //! Caller-driven NAT capability shared by standard and portable Endpoints.
 //! Time and entropy are supplied by the host; I/O runs through `SwarmCore`.
 
+#[cfg(feature = "_circuit-driver")]
+use alloc::string::ToString;
 use alloc::{
     collections::{BTreeMap, VecDeque},
-    string::ToString,
     vec,
     vec::Vec,
 };
@@ -11,11 +12,12 @@ use minip2p_platform::{EntropySource, Now as PlatformNow};
 
 #[cfg(feature = "_circuit-driver")]
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole, CircuitTransport};
-use minip2p_core::{Bytes, ConnectId, Multiaddr, PeerId, Protocol, select_direct_addrs};
+use minip2p_core::{Bytes, ConnectId, Multiaddr, PeerAddr, PeerId, Protocol, select_direct_addrs};
 #[cfg(feature = "_circuit-driver")]
 use minip2p_nat::BridgeRole;
 use minip2p_nat::{
-    ConnectLegs, NatAction, NatAgent, NatEvent, Now, PromoteError, ReachabilityState,
+    ConnectLegs, DialStart, NatAction, NatAgent, NatEvent, NatSwarm, NatSwarmError, NatToken, Now,
+    PromoteError, ReachabilityState,
 };
 use minip2p_swarm::{DriverError, HeldWrites, SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId, Transport};
@@ -70,24 +72,13 @@ pub(crate) struct NatDriver<E> {
     public_addrs: Vec<Multiaddr>,
     /// Exact adopted bridge keys mapped to their promoted circuit ids.
     promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
-    /// Connection of each stream the agent addresses by peer and id.
-    stream_conns: StreamConns,
-    /// Unsent tails of the agent's writes, resent on the stream's Writable
-    /// so a full stream delays control messages instead of losing them.
-    held: HeldWrites,
+    /// What the driver keeps around the swarm for the agent's commands.
+    io: HostIo,
     /// How many queued events the Connection engine has already observed.
     observed: usize,
     /// The bound-address revision the agent's `listen_addrs` were seeded
     /// from; callers can bind through any swarm path between driver turns.
     listen_addrs_revision: u64,
-    /// Whether `Dial` actions to a `/dns*` host are parked for the
-    /// composition to resolve instead of handed to a transport that would
-    /// refuse them. Only the std Endpoint, which owns Name resolution, sets it.
-    #[cfg(feature = "nat")]
-    park_named_dials: bool,
-    /// `Dial` actions to a `/dns*` host awaiting [`Self::take_named_dials`].
-    #[cfg(feature = "nat")]
-    named_dials: Vec<(minip2p_nat::NatToken, minip2p_core::PeerAddr)>,
     #[cfg(all(test, feature = "nat", feature = "quic"))]
     pub(crate) bridge_reset_attempts: Vec<(ConnectionId, StreamId)>,
 }
@@ -106,8 +97,7 @@ impl<E: EntropySource> NatDriver<E> {
             relay_addrs,
             public_addrs: Vec::new(),
             promoted: BTreeMap::new(),
-            stream_conns: StreamConns::default(),
-            held: HeldWrites::new(),
+            io: HostIo::default(),
             observed: 0,
             // Matches a fresh runtime: seed only after a real `listen*`
             // call bumped the revision. Some transports report bound-but-
@@ -115,10 +105,6 @@ impl<E: EntropySource> NatDriver<E> {
             // an untouched revision would advertise a dial-back address
             // that drops packets.
             listen_addrs_revision: 0,
-            #[cfg(feature = "nat")]
-            park_named_dials: false,
-            #[cfg(feature = "nat")]
-            named_dials: Vec::new(),
             #[cfg(all(test, feature = "nat", feature = "quic"))]
             bridge_reset_attempts: Vec::new(),
         }
@@ -128,27 +114,25 @@ impl<E: EntropySource> NatDriver<E> {
     /// resolve off the driver; see [`Self::take_named_dials`].
     #[cfg(feature = "nat")]
     pub(crate) fn park_named_dials(mut self) -> Self {
-        self.park_named_dials = true;
+        self.io.parked = Some(Vec::new());
         self
     }
 
     /// Moves out the parked `/dns*` dials. Each must come back through
     /// [`Self::named_dial_resolved`] once its name has an answer.
     #[cfg(feature = "nat")]
-    pub(crate) fn take_named_dials(
-        &mut self,
-    ) -> Vec<(minip2p_nat::NatToken, minip2p_core::PeerAddr)> {
-        core::mem::take(&mut self.named_dials)
+    pub(crate) fn take_named_dials(&mut self) -> Vec<(NatToken, PeerAddr)> {
+        self.io
+            .parked
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
     }
 
     /// Whether the agent still waits on a parked dial; retires it when not.
     /// See [`NatAgent::deferred_dial_wanted`].
     #[cfg(feature = "nat")]
-    pub(crate) fn named_dial_wanted(
-        &mut self,
-        token: minip2p_nat::NatToken,
-        sample: PlatformNow,
-    ) -> bool {
+    pub(crate) fn named_dial_wanted(&mut self, token: NatToken, sample: PlatformNow) -> bool {
         self.agent.deferred_dial_wanted(token, to_nat_now(sample))
     }
 
@@ -158,7 +142,7 @@ impl<E: EntropySource> NatDriver<E> {
     #[cfg(feature = "nat")]
     pub(crate) fn named_dial_resolved<T: NatTransport, R: EntropySource>(
         &mut self,
-        token: minip2p_nat::NatToken,
+        token: NatToken,
         resolved: crate::portable::connect::NameAnswer,
         swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
@@ -176,14 +160,22 @@ impl<E: EntropySource> NatDriver<E> {
             }
             Err(last)
         });
-        self.agent.dial_result(token, result, to_nat_now(sample));
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        self.agent
+            .dial_result(&mut io, token, result, to_nat_now(sample));
         self.pump(swarm, sample);
     }
 
     /// Cancels a pending connect's NAT leg; settled or unknown ids are a
     /// no-op.
-    pub(crate) fn cancel(&mut self, id: ConnectId, now: PlatformNow) {
-        self.agent.cancel(id, to_nat_now(now));
+    pub(crate) fn cancel<T: Transport, R: EntropySource>(
+        &mut self,
+        id: ConnectId,
+        swarm: &mut SwarmCore<T, R>,
+        now: PlatformNow,
+    ) {
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        self.agent.cancel(&mut io, id, to_nat_now(now));
     }
 
     /// Cancels `id` in the Connection-attempt engine and, while the attempt
@@ -205,7 +197,7 @@ impl<E: EntropySource> NatDriver<E> {
         let pending = connect.is_pending(id);
         connect.cancel(id, swarm);
         if pending {
-            self.cancel(id, now);
+            self.cancel(id, swarm, now);
         }
         pending
     }
@@ -220,7 +212,9 @@ impl<E: EntropySource> NatDriver<E> {
         swarm: &mut SwarmCore<T, R>,
         sample: PlatformNow,
     ) {
-        self.agent.connect(id, peer, legs, to_nat_now(sample));
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        self.agent
+            .connect(&mut io, id, peer, legs, to_nat_now(sample));
         self.pump(swarm, sample);
     }
 
@@ -282,8 +276,8 @@ impl<E: EntropySource> NatDriver<E> {
         sample: PlatformNow,
     ) -> bool {
         self.sync_listen_addrs(swarm);
-        self.held.observe(event);
-        self.stream_conns.observe(event);
+        self.io.held.observe(event);
+        self.io.stream_conns.observe(event);
         let now = to_nat_now(sample);
         if self.inject_straggler(event, swarm) {
             self.pump(swarm, sample);
@@ -294,9 +288,14 @@ impl<E: EntropySource> NatDriver<E> {
             conn_id,
             stream_id,
         } = event
-            && self.stream_conns.get(peer_id, *stream_id) == Some(*conn_id)
+            && self.io.stream_conns.get(peer_id, *stream_id) == Some(*conn_id)
         {
-            self.replay_held(peer_id, *conn_id, *stream_id, swarm, sample);
+            EndpointSwarm::new(swarm, &mut self.io).replay_held(
+                peer_id,
+                *conn_id,
+                *stream_id,
+                sample.monotonic_ms,
+            );
             self.pump(swarm, sample);
             return true;
         }
@@ -306,11 +305,10 @@ impl<E: EntropySource> NatDriver<E> {
             | SwarmEvent::ConnectionReplaced { new: conn_id, .. } => conn_id.is_circuit(),
             _ => false,
         };
-        let handled = self
-            .agent
-            .handle_event_with_disposition_classified(event, is_circuit, now);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        let handled = self.agent.handle_event(&mut io, event, is_circuit, now);
         if !handled {
-            self.stream_conns.unclaimed(event);
+            self.io.stream_conns.unclaimed(event);
         }
         // The agent consumes what it claims as it reads it, including bytes
         // past a CONNECT response that a promoted bridge's circuit takes
@@ -364,12 +362,13 @@ impl<E: EntropySource> NatDriver<E> {
         if self.agent.next_timeout(now.mono_ms) != Some(0) {
             return;
         }
-        self.agent.handle_tick(now);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        self.agent.handle_tick(&mut io, now);
         self.pump(swarm, sample);
     }
 
-    /// Drains agent actions into swarm calls (echoing synchronous results
-    /// back) and collects application-visible NAT events.
+    /// Executes queued agent actions (echoing promotion results back) and
+    /// collects application-visible NAT events.
     pub(crate) fn pump<T: NatTransport, R: EntropySource>(
         &mut self,
         swarm: &mut SwarmCore<T, R>,
@@ -503,7 +502,7 @@ impl<E: EntropySource> NatDriver<E> {
         else {
             return;
         };
-        self.cancel(*connect_id, sample);
+        self.cancel(*connect_id, swarm, sample);
         self.pump(swarm, sample);
     }
 
@@ -570,8 +569,12 @@ impl<E: EntropySource> NatDriver<E> {
     /// Returns the NAT-orchestrated path of `peer`'s current connection; see
     /// [`NatAgent::path`].
     #[cfg(feature = "_circuit-driver")]
-    pub(crate) fn path(&self, peer: &PeerId) -> Option<minip2p_nat::Path> {
-        self.agent.path(peer).cloned()
+    pub(crate) fn path<T: Transport, R: EntropySource>(
+        &self,
+        swarm: &SwarmCore<T, R>,
+        peer: &PeerId,
+    ) -> Option<minip2p_nat::Path> {
+        self.agent.path(swarm, peer).cloned()
     }
 
     /// Confirmed public addresses plus circuit addresses for every held
@@ -610,9 +613,10 @@ impl<E: EntropySource> NatDriver<E> {
         &self.promoted
     }
 
-    /// Executes one agent action against the swarm and echoes synchronous
-    /// results back to the agent. Best-effort actions swallow errors; the
-    /// agent's timeouts and the swarm's lifecycle events surface failures.
+    /// Executes one agent action and echoes a promotion result back. These
+    /// need the transport underneath the swarm; the agent issues swarm
+    /// commands itself. Best-effort actions swallow errors; the agent's
+    /// timeouts and the swarm's lifecycle events surface failures.
     pub(crate) fn execute<T: NatTransport, R: EntropySource>(
         &mut self,
         action: NatAction,
@@ -621,76 +625,6 @@ impl<E: EntropySource> NatDriver<E> {
     ) {
         let now = to_nat_now(sample);
         match action {
-            #[cfg(feature = "nat")]
-            NatAction::Dial { token, addr }
-                if self.park_named_dials
-                    && matches!(
-                        addr.transport().protocols().first(),
-                        Some(Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_))
-                    ) =>
-            {
-                self.named_dials.push((token, addr));
-            }
-            NatAction::Dial { token, addr } => {
-                let result = swarm.dial(&addr).map_err(|e| e.to_string());
-                self.agent.dial_result(token, result, now);
-            }
-            NatAction::OpenStream {
-                token,
-                peer,
-                protocol_id,
-            } => {
-                let result = swarm
-                    .open_stream(&peer, &protocol_id, now.mono_ms)
-                    .map(|(conn_id, stream_id)| {
-                        self.stream_conns.opened(&peer, conn_id, stream_id);
-                        stream_id
-                    })
-                    .map_err(|e| e.to_string());
-                self.agent.stream_open_result(token, result, now);
-            }
-            NatAction::SendStream {
-                peer,
-                stream_id,
-                data,
-            } => {
-                // Failures surface through the agent's own timeouts and the
-                // swarm's error events; nothing to echo synchronously. A
-                // stream whose connection is gone is skipped the same way.
-                if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
-                    self.send_or_hold(&peer, conn_id, stream_id, Bytes::from(data), swarm, sample);
-                }
-            }
-            NatAction::CloseStreamWrite { peer, stream_id } => {
-                // A stale close must not replace the lifecycle event that
-                // triggered this action.
-                if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
-                    self.close_or_hold(&peer, conn_id, stream_id, swarm, sample);
-                }
-            }
-            NatAction::ResetStream { peer, stream_id } => {
-                // Reset is cleanup, so a stream already gone is equivalent
-                // to a successful reset.
-                if let Some(conn_id) = self.stream_conns.get(&peer, stream_id) {
-                    match swarm.reset_stream(&peer, conn_id, stream_id, now.mono_ms) {
-                        Ok(()) | Err(_) => {}
-                    }
-                }
-            }
-            NatAction::Disconnect { peer } => {
-                // Connection loss remains visible through the normal swarm
-                // lifecycle; a stale disconnect adds no second outcome.
-                match swarm.disconnect(&peer, now.mono_ms) {
-                    Ok(()) | Err(_) => {}
-                }
-            }
-            NatAction::Ping { peer } => {
-                // Relay liveness is re-established from lifecycle events;
-                // a stale ping is not an application-visible failure.
-                match swarm.ping(&peer, now.mono_ms) {
-                    Ok(()) | Err(_) => {}
-                }
-            }
             NatAction::SendRandomUdp {
                 target,
                 payload_len,
@@ -716,13 +650,16 @@ impl<E: EntropySource> NatDriver<E> {
             } => {
                 let key = (inner_conn, stream_id);
                 if let Some(existing) = self.promoted.get(&key).copied() {
-                    self.agent.promote_result(token, Ok(existing), now);
+                    let mut io = EndpointSwarm::new(swarm, &mut self.io);
+                    self.agent.promote_result(&mut io, token, Ok(existing), now);
                     return;
                 }
                 #[cfg(not(feature = "_circuit-driver"))]
                 {
                     let _ = (relay, remote_peer, role, pending_data, remote_write_closed);
+                    let mut io = EndpointSwarm::new(swarm, &mut self.io);
                     self.agent.promote_result(
+                        &mut io,
                         token,
                         Err(PromoteError::Failed("portable relay is not enabled".into())),
                         now,
@@ -735,7 +672,7 @@ impl<E: EntropySource> NatDriver<E> {
                     // STATUS). The circuit takes Writable for the stream now,
                     // so it sends them first, in that order.
                     let mut owed = swarm.forget_stream(inner_conn, stream_id);
-                    if let Some(held) = self.held.take(inner_conn, stream_id) {
+                    if let Some(held) = self.io.held.take(inner_conn, stream_id) {
                         owed.extend(held.tails);
                     }
                     let unsent_prefix = concat(owed);
@@ -755,7 +692,8 @@ impl<E: EntropySource> NatDriver<E> {
                     match swarm.transport_mut().adopt_bridge(adoption) {
                         Ok(conn_id) => {
                             self.promoted.insert(key, conn_id);
-                            self.agent.promote_result(token, Ok(conn_id), now);
+                            let mut io = EndpointSwarm::new(swarm, &mut self.io);
+                            self.agent.promote_result(&mut io, token, Ok(conn_id), now);
                         }
                         Err(error) => {
                             let promote_error = match &error {
@@ -763,7 +701,9 @@ impl<E: EntropySource> NatDriver<E> {
                                 AdoptError::UnknownConnection => PromoteError::UnknownConnection,
                                 _ => PromoteError::Failed(error.to_string()),
                             };
-                            self.agent.promote_result(token, Err(promote_error), now);
+                            let mut io = EndpointSwarm::new(swarm, &mut self.io);
+                            self.agent
+                                .promote_result(&mut io, token, Err(promote_error), now);
                             if !matches!(error, AdoptError::UnknownConnection) {
                                 #[cfg(all(test, feature = "nat", feature = "quic"))]
                                 self.bridge_reset_attempts.push((inner_conn, stream_id));
@@ -785,74 +725,6 @@ impl<E: EntropySource> NatDriver<E> {
                     Err(_) => {}
                 }
             }
-        }
-    }
-
-    /// Writes `data`, or holds it behind the stream's unsent tail. A Full
-    /// holds what the stream did not take.
-    fn send_or_hold<T: NatTransport, R: EntropySource>(
-        &mut self,
-        peer: &PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        data: Bytes,
-        swarm: &mut SwarmCore<T, R>,
-        sample: PlatformNow,
-    ) {
-        let counted = data.len();
-        if self.held.is_held(conn_id, stream_id) {
-            self.held.push(conn_id, stream_id, data, counted);
-        } else if let Err(DriverError::Full { unsent, .. }) =
-            swarm.send_stream(peer, conn_id, stream_id, data, sample.monotonic_ms)
-        {
-            // Other failures are returned here and not emitted as swarm
-            // events; the agent's own timeouts end the exchange.
-            self.held.push(conn_id, stream_id, unsent, counted);
-        }
-        // NAT messages are a few hundred bytes; a peer that leaves this much
-        // unread is not completing the exchange, so the stream goes.
-        if self.held.held_bytes(conn_id, stream_id) > MAX_HELD_PER_STREAM {
-            self.held.forget_stream(conn_id, stream_id);
-            match swarm.reset_stream(peer, conn_id, stream_id, sample.monotonic_ms) {
-                Ok(()) | Err(_) => {}
-            }
-        }
-    }
-
-    /// Closes the write side once nothing is held for the stream.
-    fn close_or_hold<T: NatTransport, R: EntropySource>(
-        &mut self,
-        peer: &PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        swarm: &mut SwarmCore<T, R>,
-        sample: PlatformNow,
-    ) {
-        if self.held.close_after(conn_id, stream_id) {
-            return;
-        }
-        match swarm.close_stream_write(peer, conn_id, stream_id, sample.monotonic_ms) {
-            Ok(()) | Err(_) => {}
-        }
-    }
-
-    /// Resends a writable stream's held tails, then its deferred close.
-    fn replay_held<T: NatTransport, R: EntropySource>(
-        &mut self,
-        peer: &PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        swarm: &mut SwarmCore<T, R>,
-        sample: PlatformNow,
-    ) {
-        let Some(held) = self.held.take(conn_id, stream_id) else {
-            return;
-        };
-        for data in held.tails {
-            self.send_or_hold(peer, conn_id, stream_id, data, swarm, sample);
-        }
-        if held.close {
-            self.close_or_hold(peer, conn_id, stream_id, swarm, sample);
         }
     }
 
@@ -941,6 +813,178 @@ impl<E: EntropySource> NatDriver<E> {
             }
             _ => {}
         }
+    }
+}
+
+/// What the NAT driver keeps around the swarm for the agent's commands.
+#[derive(Default)]
+struct HostIo {
+    /// Connection of each stream the agent opened or claimed, so the
+    /// driver can tell the agent's `StreamWritable` events apart.
+    stream_conns: StreamConns,
+    /// Unsent tails of the agent's writes, resent on the stream's Writable
+    /// so a full stream delays control messages instead of losing them.
+    held: HeldWrites,
+    /// Dials to `/dns*` hosts parked for the composition to resolve, when it
+    /// owns Name resolution (the std Endpoint); `None` rejects them.
+    parked: Option<Vec<(NatToken, PeerAddr)>>,
+}
+
+/// The [`NatSwarm`] the driver hands the agent: the swarm, plus parking for
+/// named dials and held write tails. Borrowed for one agent call.
+struct EndpointSwarm<'a, T: Transport, R: EntropySource> {
+    swarm: &'a mut SwarmCore<T, R>,
+    io: &'a mut HostIo,
+}
+
+impl<'a, T: Transport, R: EntropySource> EndpointSwarm<'a, T, R> {
+    fn new(swarm: &'a mut SwarmCore<T, R>, io: &'a mut HostIo) -> Self {
+        Self { swarm, io }
+    }
+
+    /// Writes `data`, or holds it behind the stream's unsent tail. A Full
+    /// holds what the stream did not take.
+    fn send_or_hold(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        data: Bytes,
+        now_ms: u64,
+    ) -> Result<(), DriverError> {
+        let counted = data.len();
+        let held = &mut self.io.held;
+        if held.is_held(conn_id, stream_id) {
+            held.push(conn_id, stream_id, data, counted);
+        } else {
+            match self
+                .swarm
+                .send_stream(peer, conn_id, stream_id, data, now_ms)
+            {
+                Ok(()) => {}
+                Err(DriverError::Full { unsent, .. }) => {
+                    held.push(conn_id, stream_id, unsent, counted);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // NAT messages are a few hundred bytes; a peer that leaves this much
+        // unread is not completing the exchange, so the stream goes.
+        if held.held_bytes(conn_id, stream_id) > MAX_HELD_PER_STREAM {
+            held.forget_stream(conn_id, stream_id);
+            match self.swarm.reset_stream(peer, conn_id, stream_id, now_ms) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Closes the write side once nothing is held for the stream.
+    fn close_or_hold(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now_ms: u64,
+    ) -> Result<(), DriverError> {
+        if self.io.held.close_after(conn_id, stream_id) {
+            return Ok(());
+        }
+        self.swarm
+            .close_stream_write(peer, conn_id, stream_id, now_ms)
+    }
+
+    /// Resends a writable stream's held tails, then its deferred close.
+    fn replay_held(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now_ms: u64,
+    ) {
+        let Some(held) = self.io.held.take(conn_id, stream_id) else {
+            return;
+        };
+        // Failures surface through the agent's own timeouts and the swarm's
+        // events, as for the first write.
+        for data in held.tails {
+            match self.send_or_hold(peer, conn_id, stream_id, data, now_ms) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        if held.close {
+            match self.close_or_hold(peer, conn_id, stream_id, now_ms) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    }
+}
+
+impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
+    fn connection(&self, peer: &PeerId) -> Option<ConnectionId> {
+        NatSwarm::connection(&*self.swarm, peer)
+    }
+
+    fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[alloc::string::String])> {
+        NatSwarm::readiness(&*self.swarm, peer)
+    }
+
+    /// Parks a dial to a named host for the composition's resolver, so the
+    /// agent's token is already registered when the answer comes back.
+    fn dial(&mut self, addr: &PeerAddr, token: NatToken) -> Result<DialStart, NatSwarmError> {
+        if let Some(parked) = self.io.parked.as_mut()
+            && minip2p_nat::is_named(addr)
+        {
+            parked.push((token, addr.clone()));
+            return Ok(DialStart::Deferred);
+        }
+        NatSwarm::dial(&mut *self.swarm, addr, token)
+    }
+
+    fn open_stream(
+        &mut self,
+        peer: &PeerId,
+        protocol_id: &str,
+        now_ms: u64,
+    ) -> Result<(ConnectionId, StreamId), NatSwarmError> {
+        let (conn_id, stream_id) = self.swarm.open_stream(peer, protocol_id, now_ms)?;
+        self.io.stream_conns.opened(peer, conn_id, stream_id);
+        Ok((conn_id, stream_id))
+    }
+
+    fn send_stream(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        data: Bytes,
+        now_ms: u64,
+    ) -> Result<(), NatSwarmError> {
+        Ok(self.send_or_hold(peer, conn_id, stream_id, data, now_ms)?)
+    }
+
+    fn close_stream_write(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now_ms: u64,
+    ) -> Result<(), NatSwarmError> {
+        Ok(self.close_or_hold(peer, conn_id, stream_id, now_ms)?)
+    }
+
+    fn reset_stream(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now_ms: u64,
+    ) -> Result<(), NatSwarmError> {
+        Ok(self.swarm.reset_stream(peer, conn_id, stream_id, now_ms)?)
+    }
+
+    fn ping(&mut self, peer: &PeerId, now_ms: u64) -> Result<(), NatSwarmError> {
+        Ok(self.swarm.ping(peer, now_ms)?)
     }
 }
 

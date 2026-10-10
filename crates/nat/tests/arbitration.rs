@@ -6,7 +6,7 @@ mod common;
 use common::*;
 
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
-use minip2p_nat::{NatAction, NatConfig, NatError, NatEvent, Path};
+use minip2p_nat::{NatConfig, NatError, NatEvent, Path};
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
@@ -18,18 +18,11 @@ fn drive_to_bridged(h: &mut Harness, t0: u64) -> (ConnectId, StreamId) {
     drain_actions(&mut h.agent);
 
     h.agent.handle_tick(at(t0 + 200));
-    let actions = drain_actions(&mut h.agent);
-    let relay_token = dial_token_for(&actions, &h.relay);
-    h.agent
-        .dial_result(relay_token, Ok(ConnectionId::new(2)), at(t0 + 205));
+    drain_actions(&mut h.agent);
     h.relay_session_ready(at(t0 + 210));
 
-    let actions = drain_actions(&mut h.agent);
-    let open_token = open_stream_token(&actions);
-    let stream = StreamId::new(7);
-    h.agent
-        .stream_open_result(open_token, Ok(stream), at(t0 + 215));
-    assert!(h.agent.owns_stream(&h.relay, stream));
+    let stream = opened_stream(&drain_actions(&mut h.agent));
+    assert!(h.agent.owns_stream(ConnectionId::new(1), stream));
 
     h.stream_ready(stream, at(t0 + 220));
     let actions = drain_actions(&mut h.agent);
@@ -54,6 +47,7 @@ fn advertised_dcutr_addrs(h: &mut Harness, t0: u64) -> Vec<Multiaddr> {
             protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
             initiated_locally: false,
         },
+        false,
         at(t0 + 302),
     );
     h.agent.handle_event(
@@ -63,6 +57,7 @@ fn advertised_dcutr_addrs(h: &mut Harness, t0: u64) -> Vec<Multiaddr> {
             stream_id: stream,
             data: Bytes::from(dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)])),
         },
+        false,
         at(t0 + 303),
     );
     dcutr_obs_addrs(&sent_data_on(&drain_actions(&mut h.agent), stream))
@@ -138,14 +133,9 @@ fn force_relay_skips_direct_dials_and_dcutr() {
     assert_eq!(dial_count_for(&actions, &h.target), 0);
     assert_eq!(dial_count_for(&actions, &h.relay), 1);
 
-    let relay_token = dial_token_for(&actions, &h.relay);
-    h.agent
-        .dial_result(relay_token, Ok(ConnectionId::new(2)), at(5));
     h.relay_session_ready(at(10));
     let open = drain_actions(&mut h.agent);
-    let open_token = open_stream_token(&open);
-    let stream = StreamId::new(41);
-    h.agent.stream_open_result(open_token, Ok(stream), at(15));
+    let stream = opened_stream(&open);
     h.stream_ready(stream, at(20));
     drain_actions(&mut h.agent); // HOP CONNECT
     h.stream_data(stream, hop_status(Status::Ok), at(30));
@@ -154,7 +144,7 @@ fn force_relay_skips_direct_dials_and_dcutr() {
     assert_eq!(send_stream_count(&promotion), 0, "DCUtR was skipped");
     assert!(promotion.iter().any(|action| matches!(
         action,
-        NatAction::PromoteBridge {
+        Out::PromoteBridge {
             role: minip2p_nat::BridgeRole::Initiator,
             ..
         }
@@ -179,7 +169,7 @@ fn default_connect_promotes_the_bridge_before_dcutr() {
     let actions = drain_actions(&mut h.agent);
     assert!(actions.iter().any(|action| matches!(
         action,
-        NatAction::PromoteBridge {
+        Out::PromoteBridge {
             role: minip2p_nat::BridgeRole::Initiator,
             stream_id,
             ..
@@ -214,6 +204,7 @@ fn malformed_dcutr_keeps_the_established_relayed_path() {
             protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
             initiated_locally: false,
         },
+        false,
         at(302),
     );
     h.agent.handle_event(
@@ -223,6 +214,7 @@ fn malformed_dcutr_keeps_the_established_relayed_path() {
             stream_id: stream,
             data: Bytes::from_static(b"\x13/multistream/1.0.0\n"),
         },
+        false,
         at(303),
     );
 
@@ -250,15 +242,10 @@ fn force_relay_preserves_bytes_coalesced_behind_hop_success() {
         ..NatConfig::default()
     });
     h.start(RACE, at(0));
-    let actions = drain_actions(&mut h.agent);
-    let relay_token = dial_token_for(&actions, &h.relay);
-    h.agent
-        .dial_result(relay_token, Ok(ConnectionId::new(2)), at(5));
+    drain_actions(&mut h.agent);
     h.relay_session_ready(at(10));
     let open = drain_actions(&mut h.agent);
-    let open_token = open_stream_token(&open);
-    let stream = StreamId::new(41);
-    h.agent.stream_open_result(open_token, Ok(stream), at(15));
+    let stream = opened_stream(&open);
     h.stream_ready(stream, at(20));
     drain_actions(&mut h.agent);
 
@@ -275,15 +262,10 @@ fn force_relay_preserves_bytes_coalesced_behind_hop_success() {
 fn default_connect_preserves_noise_bytes_coalesced_behind_hop_success() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.start(RELAY_NOW, at(0));
-    let actions = drain_actions(&mut h.agent);
-    let relay_token = dial_token_for(&actions, &h.relay);
-    h.agent
-        .dial_result(relay_token, Ok(ConnectionId::new(2)), at(5));
+    drain_actions(&mut h.agent);
     h.relay_session_ready(at(10));
     let open = drain_actions(&mut h.agent);
-    let stream = StreamId::new(42);
-    h.agent
-        .stream_open_result(open_stream_token(&open), Ok(stream), at(15));
+    let stream = opened_stream(&open);
     h.stream_ready(stream, at(20));
     drain_actions(&mut h.agent);
 
@@ -312,7 +294,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
     let mut h = Harness::without_relay(NatConfig::default());
     let attacker = peer(b"untrusted-peer");
     let stream = StreamId::new(88);
-    let handled = h.agent.handle_event_with_disposition(
+    let handled = h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: attacker.clone(),
@@ -320,42 +302,46 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
             protocol_id: minip2p_relay::STOP_PROTOCOL_ID.to_string(),
             initiated_locally: false,
         },
+        false,
         at(0),
     );
 
     assert!(handled, "rejected NAT control streams stay internal");
     assert!(
-        h.agent.owns_stream(&attacker, stream),
+        h.agent.owns_stream(ConnectionId::new(1), stream),
         "rejected stream remains owned until terminal close"
     );
     assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
 
-    assert!(h.agent.handle_event_with_disposition(
+    assert!(h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: attacker.clone(),
             stream_id: stream,
             data: Bytes::from(stop_connect(&h.target)),
         },
-        at(1),
+        false,
+        at(1)
     ));
-    assert!(h.agent.handle_event_with_disposition(
+    assert!(h.agent.handle_event(
         &SwarmEvent::StreamRemoteWriteClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: attacker.clone(),
             stream_id: stream,
         },
-        at(2),
+        false,
+        at(2)
     ));
-    assert!(h.agent.handle_event_with_disposition(
+    assert!(h.agent.handle_event(
         &SwarmEvent::StreamClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: attacker.clone(),
             stream_id: stream,
         },
-        at(3),
+        false,
+        at(3)
     ));
-    assert!(!h.agent.owns_stream(&attacker, stream));
+    assert!(!h.agent.owns_stream(ConnectionId::new(1), stream));
     assert!(drain_actions(&mut h.agent).is_empty());
     assert!(drain_events(&mut h.agent).is_empty());
 }
@@ -366,7 +352,7 @@ fn write_stop_resets_only_nat_owned_streams() {
     let remote = peer(b"write-stop-peer");
     let conn_id = ConnectionId::new(1);
     let owned = StreamId::new(88);
-    assert!(h.agent.handle_event_with_disposition(
+    assert!(h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id,
             peer_id: remote.clone(),
@@ -374,7 +360,8 @@ fn write_stop_resets_only_nat_owned_streams() {
             protocol_id: minip2p_relay::STOP_PROTOCOL_ID.to_string(),
             initiated_locally: false,
         },
-        at(0),
+        false,
+        at(0)
     ));
     drain_actions(&mut h.agent);
 
@@ -386,13 +373,10 @@ fn write_stop_resets_only_nat_owned_streams() {
     };
     assert!(
         !h.agent
-            .handle_event_with_disposition(&stopped(StreamId::new(92)), at(1)),
+            .handle_event(&stopped(StreamId::new(92)), false, at(1)),
         "application streams stay application-visible"
     );
-    assert!(
-        h.agent
-            .handle_event_with_disposition(&stopped(owned), at(1))
-    );
+    assert!(h.agent.handle_event(&stopped(owned), false, at(1)));
     assert!(has_reset_for(&drain_actions(&mut h.agent), owned));
 }
 
@@ -407,6 +391,7 @@ fn relay_replacement_does_not_abort_waiting_for_peer_ready() {
             conn_id: ConnectionId::new(1),
             peer_id: h.relay.clone(),
         },
+        false,
         at(10),
     );
     h.agent.handle_event(
@@ -415,6 +400,7 @@ fn relay_replacement_does_not_abort_waiting_for_peer_ready() {
             old: ConnectionId::new(1),
             new: ConnectionId::new(2),
         },
+        false,
         at(11),
     );
     assert!(drain_events(&mut h.agent).is_empty());
@@ -425,6 +411,7 @@ fn relay_replacement_does_not_abort_waiting_for_peer_ready() {
             conn_id: ConnectionId::new(2),
             protocols: vec![HOP_PROTOCOL_ID.into()],
         },
+        false,
         at(13),
     );
     assert!(
@@ -434,29 +421,172 @@ fn relay_replacement_does_not_abort_waiting_for_peer_ready() {
 }
 
 #[test]
-fn relay_replacement_does_not_abort_an_open_hop_request() {
+fn hop_work_started_on_a_replacement_survives_the_replacement_event() {
     let mut h = Harness::with_relay(NatConfig::default());
+    let (old, new) = (ConnectionId::new(1), ConnectionId::new(2));
+    // The swarm is ahead of the events NAT has handled: the relay's first
+    // connection was already replaced, and the replacement is ready.
+    h.agent
+        .swarm
+        .make_ready(&h.relay, new, &[HOP_PROTOCOL_ID.into()]);
     h.start(RELAY_NOW, at(0));
-    drain_actions(&mut h.agent); // relay dial
-    h.relay_session_ready(at(10));
-    let open = drain_actions(&mut h.agent);
-    let open_token = open_stream_token(&open);
+    let actions = drain_actions(&mut h.agent);
+    assert_eq!(dial_count_for(&actions, &h.relay), 0);
+    let stream = opened_stream(&actions);
 
-    h.agent.handle_event(
-        &SwarmEvent::ConnectionReplaced {
-            peer_id: h.relay.clone(),
-            old: ConnectionId::new(1),
-            new: ConnectionId::new(2),
+    // The buffered lifecycle catches up; none of it may end the work on
+    // `new` or start a second exchange.
+    let relay = h.relay.clone();
+    for event in [
+        SwarmEvent::ConnectionEstablished {
+            peer_id: relay.clone(),
+            conn_id: old,
         },
-        at(11),
+        SwarmEvent::PeerReady {
+            peer_id: relay.clone(),
+            conn_id: old,
+            protocols: vec![HOP_PROTOCOL_ID.into()],
+        },
+        SwarmEvent::ConnectionReplaced {
+            peer_id: relay.clone(),
+            old,
+            new,
+        },
+        SwarmEvent::PeerReady {
+            peer_id: relay.clone(),
+            conn_id: new,
+            protocols: vec![HOP_PROTOCOL_ID.into()],
+        },
+    ] {
+        h.agent.deliver_late(&event, false, at(1));
+    }
+    let actions = drain_actions(&mut h.agent);
+    assert!(
+        actions.is_empty(),
+        "no reset and no second open: {actions:?}"
     );
     assert!(drain_events(&mut h.agent).is_empty());
+    assert!(h.agent.owns_stream(new, stream));
 
-    let stream = StreamId::new(19);
-    h.agent.stream_open_result(open_token, Ok(stream), at(13));
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: new,
+            peer_id: relay.clone(),
+            stream_id: stream,
+            protocol_id: HOP_PROTOCOL_ID.into(),
+            initiated_locally: true,
+        },
+        false,
+        at(2),
+    );
+    assert!(matches!(
+        drain_actions(&mut h.agent).as_slice(),
+        [Out::SendStream { conn, stream_id, .. }] if *conn == new && *stream_id == stream
+    ));
+}
+
+#[test]
+fn a_stream_id_reused_on_a_replacement_belongs_to_its_own_attempt() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (old, new) = (ConnectionId::new(1), ConnectionId::new(2));
+    let relay = h.relay.clone();
+    h.relay_session_ready(at(0));
+    let first = h.start(RELAY_NOW, at(1));
+    let stream = opened_stream(&drain_actions(&mut h.agent));
+
+    // The swarm is ahead: `old` was already replaced by a ready `new`, whose
+    // first stream reuses the id the first attempt holds on `old`.
+    h.agent
+        .swarm
+        .make_ready(&relay, new, &[HOP_PROTOCOL_ID.into()]);
+    h.agent.swarm.next_stream_id = Some(stream);
+    h.start_peer(peer(b"second-target"), RELAY_NOW, at(2));
+    let actions = drain_actions(&mut h.agent);
+    assert!(matches!(
+        actions.as_slice(),
+        [Out::OpenStream { opened: Some((conn, s)), .. }] if *conn == new && *s == stream
+    ));
+
+    // Ending the first attempt resets its stream on `old` only.
+    h.agent.cancel(first, at(3));
+    let actions = drain_actions(&mut h.agent);
     assert!(
-        h.agent.owns_stream(&h.relay, stream),
-        "the HOP open result must remain owned after relay replacement"
+        !actions
+            .iter()
+            .any(|action| matches!(action, Out::ResetStream { conn, .. } if *conn == new)),
+        "the second attempt's stream must survive: {actions:?}"
+    );
+    h.agent.deliver_late(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: relay.clone(),
+            old,
+            new,
+        },
+        false,
+        at(4),
+    );
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: new,
+            peer_id: relay,
+            stream_id: stream,
+            protocol_id: HOP_PROTOCOL_ID.into(),
+            initiated_locally: true,
+        },
+        false,
+        at(5),
+    );
+    assert!(matches!(
+        drain_actions(&mut h.agent).as_slice(),
+        [Out::SendStream { conn, stream_id, .. }] if *conn == new && *stream_id == stream
+    ));
+}
+
+#[test]
+fn a_stale_buffered_establishment_keeps_a_newer_relay_dial_gate() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    h.start(RELAY_NOW, at(0));
+    assert_eq!(dial_count_for(&drain_actions(&mut h.agent), &h.relay), 1);
+
+    // An establishment the swarm has since closed again is delivered late:
+    // the relay is not connected, and the dial above is still in flight.
+    h.agent.deliver_late(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: ConnectionId::new(7),
+            peer_id: h.relay.clone(),
+        },
+        false,
+        at(1),
+    );
+    h.start_peer(peer(b"second-target"), RELAY_NOW, at(2));
+    assert_eq!(
+        dial_count_for(&drain_actions(&mut h.agent), &h.relay),
+        0,
+        "the second attempt waits on the dial in flight"
+    );
+}
+
+#[test]
+fn cancelling_keeps_a_dialed_relay_session_another_attempt_already_uses() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let first = h.start(RELAY_NOW, at(0));
+    let dialed = dial_conn_for(&drain_actions(&mut h.agent), &h.relay);
+
+    // The swarm is ready on the dialed connection before NAT handles its
+    // buffered events, so a second attempt opens HOP on it at once.
+    let relay = h.relay.clone();
+    h.agent
+        .swarm
+        .make_ready(&relay, dialed, &[HOP_PROTOCOL_ID.to_string()]);
+    h.start_peer(peer(b"second-target"), RELAY_NOW, at(1));
+    assert!(has_hop_open(&drain_actions(&mut h.agent)));
+
+    h.agent.cancel(first, at(2));
+    assert!(
+        !drain_actions(&mut h.agent)
+            .iter()
+            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == dialed)),
+        "an established relay session outlives the attempt that dialed it"
     );
 }
 
@@ -472,6 +602,7 @@ fn bridge_close_before_dcutr_finishes_waits_for_live_direct_dials() {
             peer_id: h.relay.clone(),
             stream_id: stream,
         },
+        false,
         at(310),
     );
     assert!(drain_events(&mut h.agent).is_empty());
@@ -493,9 +624,13 @@ fn relay_leg_failing_reports_connect_failed() {
 
     h.agent.handle_tick(at(200));
     let actions = drain_actions(&mut h.agent);
-    let relay_token = dial_token_for(&actions, &h.relay);
-    h.agent
-        .dial_result(relay_token, Err("relay unreachable".into()), at(210));
+    let conn_id = dial_conn_for(&actions, &h.relay);
+    let relay_addr = h.relay_addr.clone();
+    h.agent.handle_event(
+        &dial_failed(conn_id, relay_addr, "relay unreachable"),
+        false,
+        at(210),
+    );
 
     let events = drain_events(&mut h.agent);
     assert!(matches!(
@@ -512,16 +647,11 @@ fn relay_leg_failing_reports_connect_failed() {
 fn malformed_hop_response_fails_with_protocol_error() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.start(RELAY_NOW, at(0));
-    let actions = drain_actions(&mut h.agent);
-    let relay_token = dial_token_for(&actions, &h.relay);
-    h.agent
-        .dial_result(relay_token, Ok(ConnectionId::new(2)), at(5));
+    drain_actions(&mut h.agent);
     h.relay_session_ready(at(10));
 
     let actions = drain_actions(&mut h.agent);
-    let open_token = open_stream_token(&actions);
-    let stream = StreamId::new(3);
-    h.agent.stream_open_result(open_token, Ok(stream), at(15));
+    let stream = opened_stream(&actions);
     h.stream_ready(stream, at(20));
     drain_actions(&mut h.agent);
 
@@ -541,7 +671,7 @@ fn malformed_hop_response_fails_with_protocol_error() {
         has_reset_for(&actions, stream),
         "the dead HOP stream is reset"
     );
-    assert!(!h.agent.owns_stream(&h.relay, stream));
+    assert!(!h.agent.owns_stream(ConnectionId::new(1), stream));
     assert!(h.agent.is_idle());
 }
 
@@ -549,16 +679,11 @@ fn malformed_hop_response_fails_with_protocol_error() {
 fn relay_refusal_fails_when_no_direct_leg_remains() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.start(RELAY_NOW, at(0));
-    let actions = drain_actions(&mut h.agent);
-    let relay_token = dial_token_for(&actions, &h.relay);
-    h.agent
-        .dial_result(relay_token, Ok(ConnectionId::new(2)), at(5));
+    drain_actions(&mut h.agent);
     h.relay_session_ready(at(10));
 
     let actions = drain_actions(&mut h.agent);
-    let open_token = open_stream_token(&actions);
-    let stream = StreamId::new(3);
-    h.agent.stream_open_result(open_token, Ok(stream), at(15));
+    let stream = opened_stream(&actions);
     h.stream_ready(stream, at(20));
     drain_actions(&mut h.agent);
 
@@ -599,7 +724,7 @@ fn relay_leg_deadline_fails_a_stalled_leg() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.start(RELAY_NOW, at(0));
     let actions = drain_actions(&mut h.agent);
-    assert_eq!(dial_count_for(&actions, &h.relay), 1);
+    let dialed = dial_conn_for(&actions, &h.relay);
 
     // The relay never answers.
     h.agent.handle_tick(at(11_999));
@@ -613,6 +738,12 @@ fn relay_leg_deadline_fails_a_stalled_leg() {
             ..
         }]
     ));
+    assert!(
+        drain_actions(&mut h.agent)
+            .iter()
+            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == dialed)),
+        "the leg closes its own handshake when it gives up"
+    );
     assert!(h.agent.is_idle());
 }
 
@@ -696,6 +827,7 @@ fn reporter_disconnect_drops_its_observation() {
             conn_id: ConnectionId::new(1),
             peer_id: relay.clone(),
         },
+        false,
         at(0),
     );
     identify_observed(&mut h.agent, &relay, &maddr(departed), at(0));
@@ -704,6 +836,7 @@ fn reporter_disconnect_drops_its_observation() {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay,
         },
+        false,
         at(1),
     );
 
@@ -723,6 +856,7 @@ fn untracked_connection_close_is_ignored() {
             conn_id: ConnectionId::new(999),
             peer_id: peer(b"untracked-peer"),
         },
+        false,
         at(1),
     );
 
@@ -801,6 +935,7 @@ fn undecodable_observed_addr_bytes_are_ignored() {
                 ..minip2p_swarm::IdentifyMessage::default()
             },
         },
+        false,
         at(0),
     );
 
@@ -844,12 +979,11 @@ fn relay_session_dial_failed_event_fails_the_leg_immediately() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.start(RELAY_NOW, at(0));
     let actions = drain_actions(&mut h.agent);
-    let relay_token = dial_token_for(&actions, &h.relay);
-    let conn_id = ConnectionId::new(2);
-    h.agent.dial_result(relay_token, Ok(conn_id), at(5));
+    let conn_id = dial_conn_for(&actions, &h.relay);
 
-    let handled = h.agent.handle_event_with_disposition(
+    let handled = h.agent.handle_event(
         &dial_failed(conn_id, h.relay_addr.clone(), "relay unreachable"),
+        false,
         at(6),
     );
     assert!(handled, "owned DialFailed must be consumed");
@@ -867,7 +1001,7 @@ fn waiting_connect_redials_when_the_shared_relay_dial_fails() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.start(RELAY_NOW, at(0));
     let actions = drain_actions(&mut h.agent);
-    let relay_token = dial_token_for(&actions, &h.relay);
+    let conn_id = dial_conn_for(&actions, &h.relay);
     let other = peer(b"other-target");
     h.start_peer(other, RELAY_NOW, at(1));
     assert_eq!(
@@ -876,11 +1010,10 @@ fn waiting_connect_redials_when_the_shared_relay_dial_fails() {
         "second attempt waits on the in-flight relay dial"
     );
 
-    let conn_id = ConnectionId::new(2);
-    h.agent.dial_result(relay_token, Ok(conn_id), at(5));
-    assert!(h.agent.handle_event_with_disposition(
+    assert!(h.agent.handle_event(
         &dial_failed(conn_id, h.relay_addr.clone(), "relay unreachable"),
-        at(6),
+        false,
+        at(6)
     ));
     drain_events(&mut h.agent);
     assert_eq!(
@@ -893,8 +1026,9 @@ fn waiting_connect_redials_when_the_shared_relay_dial_fails() {
 #[test]
 fn foreign_dial_failed_is_not_handled() {
     let mut h = Harness::with_relay(NatConfig::default());
-    let handled = h.agent.handle_event_with_disposition(
+    let handled = h.agent.handle_event(
         &dial_failed(ConnectionId::new(99), h.relay_addr.clone(), "foreign"),
+        false,
         at(0),
     );
     assert!(!handled);

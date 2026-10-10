@@ -521,7 +521,9 @@ impl Endpoint {
     /// `None` while the peer is connected.
     #[cfg(feature = "nat")]
     pub fn path(&self, peer_id: &PeerId) -> Option<Path> {
-        self.nat.as_ref().and_then(|nat| nat.path(peer_id))
+        self.nat
+            .as_ref()
+            .and_then(|nat| nat.path(self.swarm.core(), peer_id))
     }
 
     /// Returns peers with an established connection.

@@ -35,4 +35,6 @@ minip2p-transport = { path = "../transport", version = "0.7.5", default-features
 thiserror = { version = "2.0.20", default-features = false }
 
 [dev-dependencies]
+minip2p-identity = { path = "../identity" }
+minip2p-platform = { path = "../platform" }
 minip2p-test-support = { path = "../test-support" }
