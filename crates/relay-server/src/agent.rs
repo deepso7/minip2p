@@ -3534,6 +3534,114 @@ mod tests {
         ));
     }
 
+    /// Opens an inbound HOP stream and reports whether it was admitted (a
+    /// capped stream is rejected with a reset).
+    fn hop_stream_admitted(
+        agent: &mut RelayServerAgent,
+        peer_id: &PeerId,
+        stream: StreamKey,
+        now: Now,
+    ) -> bool {
+        agent.handle_event(
+            &SwarmEvent::StreamReady {
+                peer_id: peer_id.clone(),
+                conn_id: stream.conn_id,
+                stream_id: stream.stream_id,
+                protocol_id: HOP_PROTOCOL_ID.into(),
+                initiated_locally: false,
+            },
+            false,
+            now,
+        );
+        !agent
+            .actions
+            .iter()
+            .any(|action| matches!(action, RelayServerAction::ResetStream { stream: s, .. } if *s == stream))
+    }
+
+    #[test]
+    fn a_circuit_leg_is_excluded_from_the_hop_cap_while_a_failed_one_counts_again() {
+        let config = RelayServerConfig {
+            max_pending_hop_requests_per_connection: 1,
+            ..RelayServerConfig::default()
+        };
+        // The CONNECT occupies the source connection's only HOP slot, and its
+        // worker is now a pending circuit leg.
+        let (mut agent, source, _destination, source_stream, _stop_stream) =
+            pending_stop(config, 0);
+        let conn_id = source_stream.conn_id;
+        agent.actions.clear();
+
+        // Excluded while pending: the slot is free for another request.
+        assert!(
+            hop_stream_admitted(
+                &mut agent,
+                &source,
+                StreamKey {
+                    conn_id,
+                    stream_id: StreamId::new(3),
+                },
+                Now::from_millis(0),
+            ),
+            "a pending circuit leg must not hold a HOP slot"
+        );
+
+        // That second stream is an ordinary HOP worker, so it fills the slot:
+        // the exclusion is for circuit legs, not a blanket opt-out.
+        agent.actions.clear();
+        assert!(
+            !hop_stream_admitted(
+                &mut agent,
+                &source,
+                StreamKey {
+                    conn_id,
+                    stream_id: StreamId::new(4),
+                },
+                Now::from_millis(0),
+            ),
+            "an ordinary HOP worker still holds the slot"
+        );
+    }
+
+    #[test]
+    fn a_failed_pending_circuit_releases_its_exclusion_while_its_stream_stays_open() {
+        let config = RelayServerConfig {
+            max_pending_hop_requests_per_connection: 1,
+            ..RelayServerConfig::default()
+        };
+        let (mut agent, source, _destination, source_stream, stop_stream) = pending_stop(config, 0);
+        let conn_id = source_stream.conn_id;
+
+        // The destination refuses, so the circuit never commits. The HOP
+        // worker stays until the source closes its stream, and with no circuit
+        // to exclude it, it must count again.
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: _destination.clone(),
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+                data: Bytes::from(encode_stop_status(Status::PermissionDenied).unwrap()),
+            },
+            false,
+            Now::from_millis(0),
+        );
+        assert!(agent.owns_stream(source_stream));
+        agent.actions.clear();
+
+        assert!(
+            !hop_stream_admitted(
+                &mut agent,
+                &source,
+                StreamKey {
+                    conn_id,
+                    stream_id: StreamId::new(3),
+                },
+                Now::from_millis(0),
+            ),
+            "a failed circuit's HOP worker must count again"
+        );
+    }
+
     #[test]
     fn hop_cap_stream_is_owned_until_its_terminal_event() {
         let local = PeerId::from_public_key_protobuf(b"relay-hop-cap");
