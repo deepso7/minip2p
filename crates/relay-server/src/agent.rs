@@ -11,7 +11,7 @@ use minip2p_relay::{
     StopInitiatorInput, StopInitiatorOutcome, StopInitiatorOutput, encode_hop_status,
 };
 use minip2p_swarm::{SwarmCore, SwarmError, SwarmEvent};
-use minip2p_transport::{ConnectionId, Transport};
+use minip2p_transport::{ConnectionId, StreamId, Transport};
 
 use crate::address::normalize_addrs;
 use crate::limiter::TokenBuckets;
@@ -1210,11 +1210,26 @@ impl RelayServerAgent {
             return;
         }
         let is_circuit = is_circuit || connection.is_circuit;
+        // Every HOP worker on the connection holds a slot, not only the ones
+        // still waiting on a reply. A finished worker stays to claim its
+        // stream's events until the peer closes the stream, so counting only
+        // the waiting ones would let a peer that never closes open one HOP
+        // stream per muxer slot, on every connection it holds. Circuit legs
+        // keep their worker too, and are bounded by `max_circuits` and
+        // `max_circuits_per_peer` instead. `StreamKey` orders by connection
+        // first, so the range visits only this connection's workers.
+        let connection_streams = StreamKey {
+            conn_id: key.conn_id,
+            stream_id: StreamId::new(0),
+        }..=StreamKey {
+            conn_id: key.conn_id,
+            stream_id: StreamId::new(u64::MAX),
+        };
         let count = self
             .hop_workers
-            .iter()
-            .filter(|(stream, worker)| {
-                stream.conn_id == key.conn_id && worker.deadline_ms.is_some()
+            .range(connection_streams)
+            .filter(|(stream, _)| {
+                !self.circuits.contains_key(stream) && !self.pending_circuits.contains_key(stream)
             })
             .count();
         if count >= self.config.max_pending_hop_requests_per_connection {
@@ -3468,6 +3483,189 @@ mod tests {
             })
         ));
         assert_eq!(agent.reservation_count(), 0);
+    }
+
+    #[test]
+    fn finished_hop_streams_left_open_still_count_against_the_connection_cap() {
+        let local = PeerId::from_public_key_protobuf(b"relay-hop-leak");
+        let remote = PeerId::from_public_key_protobuf(b"client-hop-leak");
+        let conn_id = ConnectionId::new(39);
+        let config = RelayServerConfig {
+            max_pending_hop_requests_per_connection: 2,
+            ..RelayServerConfig::default()
+        };
+        let mut agent = RelayServerAgent::new(local, config).unwrap();
+        establish(&mut agent, &remote, conn_id);
+
+        // Two HOP exchanges run to completion, and the peer never closes
+        // either stream, so both workers stay to claim their streams' events.
+        for stream_id in [1u64, 2] {
+            let stream = StreamKey {
+                conn_id,
+                stream_id: StreamId::new(stream_id),
+            };
+            feed_hop(&mut agent, &remote, stream, reserve_request(), &[]);
+            let Some(RelayServerAction::SendStream { token, .. }) = io_action(&mut agent) else {
+                panic!("reservation response");
+            };
+            agent.send_stream_result(token, Ok(()), Now::from_millis(0));
+            let _ = agent.poll_event();
+            if let Some(RelayServerAction::CloseStreamWrite { token, .. }) = io_action(&mut agent) {
+                agent.close_stream_write_result(token, Ok(()), Now::from_millis(0));
+            }
+            assert!(agent.owns_stream(stream));
+        }
+
+        // A third must be refused. Counting only the workers still waiting on
+        // a reply would let a peer that never closes its streams open one per
+        // muxer slot, on every connection it holds.
+        let third = StreamKey {
+            conn_id,
+            stream_id: StreamId::new(3),
+        };
+        assert!(agent.handle_event(
+            &SwarmEvent::StreamReady {
+                peer_id: remote.clone(),
+                conn_id,
+                stream_id: third.stream_id,
+                protocol_id: HOP_PROTOCOL_ID.into(),
+                initiated_locally: false,
+            },
+            false,
+            Now::from_millis(0),
+        ));
+        assert!(matches!(
+            io_action(&mut agent),
+            Some(RelayServerAction::ResetStream { .. })
+        ));
+    }
+
+    /// Opens an inbound HOP stream and reports whether it was admitted (a
+    /// capped stream is rejected with a reset).
+    fn hop_stream_admitted(
+        agent: &mut RelayServerAgent,
+        peer_id: &PeerId,
+        stream: StreamKey,
+        now: Now,
+    ) -> bool {
+        agent.handle_event(
+            &SwarmEvent::StreamReady {
+                peer_id: peer_id.clone(),
+                conn_id: stream.conn_id,
+                stream_id: stream.stream_id,
+                protocol_id: HOP_PROTOCOL_ID.into(),
+                initiated_locally: false,
+            },
+            false,
+            now,
+        );
+        !agent
+            .actions
+            .iter()
+            .any(|action| matches!(action, RelayServerAction::ResetStream { stream: s, .. } if *s == stream))
+    }
+
+    #[test]
+    fn a_pending_circuit_leg_does_not_hold_a_hop_slot() {
+        let config = RelayServerConfig {
+            max_pending_hop_requests_per_connection: 1,
+            ..RelayServerConfig::default()
+        };
+        // The CONNECT took the source connection's only HOP slot, and its
+        // worker is now a pending circuit leg.
+        let (mut agent, source, _, source_stream, _) = pending_stop(config, 0);
+        let conn_id = source_stream.conn_id;
+        agent.actions.clear();
+
+        let second = StreamKey {
+            conn_id,
+            stream_id: StreamId::new(3),
+        };
+        assert!(
+            hop_stream_admitted(&mut agent, &source, second, Now::from_millis(0)),
+            "a pending circuit leg must not hold a HOP slot"
+        );
+
+        // That second stream is an ordinary HOP worker, so it fills the slot:
+        // the exclusion is for circuit legs, not a blanket opt-out.
+        agent.actions.clear();
+        let third = StreamKey {
+            conn_id,
+            stream_id: StreamId::new(4),
+        };
+        assert!(
+            !hop_stream_admitted(&mut agent, &source, third, Now::from_millis(0)),
+            "an ordinary HOP worker still holds the slot"
+        );
+    }
+
+    #[test]
+    fn a_committed_circuit_leg_does_not_hold_a_hop_slot() {
+        let config = RelayServerConfig {
+            max_pending_hop_requests_per_connection: 1,
+            ..RelayServerConfig::default()
+        };
+        let (mut agent, source, _, source_stream, _) = connected_circuit(config, 0);
+        assert!(agent.circuits.contains_key(&source_stream));
+        assert!(agent.owns_stream(source_stream));
+        agent.actions.clear();
+
+        let next = StreamKey {
+            conn_id: source_stream.conn_id,
+            stream_id: StreamId::new(3),
+        };
+        assert!(
+            hop_stream_admitted(&mut agent, &source, next, Now::from_millis(0)),
+            "a committed circuit leg must not hold a HOP slot"
+        );
+    }
+
+    #[test]
+    fn a_failed_circuit_leg_holds_a_hop_slot_while_its_stream_stays_open() {
+        let config = RelayServerConfig {
+            max_pending_hop_requests_per_connection: 1,
+            ..RelayServerConfig::default()
+        };
+        let (mut agent, source, destination, source_stream, stop_stream) = pending_stop(config, 0);
+
+        // The destination refuses, so the circuit never commits. The HOP
+        // denial completes, but the worker stays until the source closes its
+        // stream, and with no circuit to exclude it, it must count again.
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: destination.clone(),
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+                data: Bytes::from(encode_stop_status(Status::PermissionDenied).unwrap()),
+            },
+            false,
+            Now::from_millis(0),
+        );
+        while let Some(action) = io_action(&mut agent) {
+            match action {
+                RelayServerAction::SendStream { token, stream, .. } if stream == source_stream => {
+                    agent.send_stream_result(token, Ok(()), Now::from_millis(0));
+                }
+                RelayServerAction::CloseStreamWrite { token, stream, .. }
+                    if stream == source_stream =>
+                {
+                    agent.close_stream_write_result(token, Ok(()), Now::from_millis(0));
+                }
+                _ => {}
+            }
+        }
+        assert!(agent.owns_stream(source_stream));
+        assert_eq!(agent.hop_workers[&source_stream].deadline_ms, None);
+        agent.actions.clear();
+
+        let next = StreamKey {
+            conn_id: source_stream.conn_id,
+            stream_id: StreamId::new(3),
+        };
+        assert!(
+            !hop_stream_admitted(&mut agent, &source, next, Now::from_millis(0)),
+            "a failed circuit's finished HOP worker must count again"
+        );
     }
 
     #[test]
