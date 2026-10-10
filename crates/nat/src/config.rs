@@ -75,6 +75,13 @@ pub struct NatConfig {
     /// Deadline for a single AutoNAT probe exchange.
     pub probe_deadline_ms: u64,
     /// Renew a reservation this many seconds before its `expire` timestamp.
+    ///
+    /// The relay-reported lifetime is clamped to
+    /// [`Self::reservation_default_ttl_secs`] first, and an `expire` already
+    /// past counts as none at all, so a relay cannot push renewal beyond the
+    /// lifetime it enforces or pull it into a once-a-second loop. A lifetime
+    /// too short to honour this margin renews at half of it instead, which
+    /// still lands before expiry.
     pub reservation_renewal_margin_secs: u64,
     /// Assumed reservation lifetime when the relay returns no `expire` or
     /// the host has no wall clock.

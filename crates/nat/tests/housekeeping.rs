@@ -416,23 +416,103 @@ fn reservation_renews_at_expire_minus_margin() {
 }
 
 #[test]
-fn enormous_relay_expiry_saturates_the_renewal_deadline() {
+fn an_expiry_already_past_falls_back_to_the_default_ttl() {
+    let mut hk = build_with_config(ReservationPolicy::Always, 1, 0, |config| {
+        config.reservation_keep_alive_interval_ms = 0;
+    });
+
+    // The relay reports an expiry 500s in the past: a stale value, or a clock
+    // skewed far enough that the remaining lifetime reads as gone.
+    let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(500)), at_unix(10, 1_000));
+
+    // Taking it at face value leaves no remaining lifetime at all, and
+    // renewing on that schedules a fresh RESERVE a second out -- which reports
+    // the same stale expiry, once a second, for as long as the reservation is
+    // held. Treat it as no expiry instead.
+    let expected_renew = 10 + (3_600 - 120) * 1_000;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::RelayReserved {
+                renew_at_mono_ms, ..
+            }] if *renew_at_mono_ms == expected_renew
+        ),
+        "expected the default-TTL schedule, got {events:?}"
+    );
+}
+
+#[test]
+fn a_short_positive_expiry_renews_before_it_expires() {
+    let mut hk = build_with_config(ReservationPolicy::Always, 1, 0, |config| {
+        config.reservation_keep_alive_interval_ms = 0;
+    });
+
+    // The relay grants 10s. A fixed renewal floor would land after the
+    // reservation is already gone: the relay drops it at expiry without
+    // closing the connection, so the holder keeps advertising a relay address
+    // that dials get NO_RESERVATION on until renewal finally fires.
+    let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_010)), at_unix(10, 1_000));
+
+    let expected_renew = 10 + 5 * 1_000;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::RelayReserved {
+                renew_at_mono_ms, ..
+            }] if *renew_at_mono_ms == expected_renew
+        ),
+        "expected renewal inside the 10s lifetime, got {events:?}"
+    );
+}
+
+#[test]
+fn a_lifetime_with_no_room_for_the_margin_renews_at_half_of_it() {
+    let mut hk = build_with_config(ReservationPolicy::Always, 1, 0, |config| {
+        config.reservation_keep_alive_interval_ms = 0;
+    });
+
+    // 60s of lifetime against a 120s margin: the margin cannot be honoured.
+    let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_060)), at_unix(10, 1_000));
+
+    // Renewing "immediately" here would be a RESERVE every second; half the
+    // lifetime is still comfortably inside it.
+    let expected_renew = 10 + 30 * 1_000;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::RelayReserved {
+                renew_at_mono_ms, ..
+            }] if *renew_at_mono_ms == expected_renew
+        ),
+        "expected half the lifetime, got {events:?}"
+    );
+}
+
+#[test]
+fn an_expiry_beyond_the_default_ttl_is_clamped_to_it() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(u64::MAX)), at_unix(10, 0));
 
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::RelayReserved {
-            renew_at_mono_ms: u64::MAX,
-            ..
-        }]
-    ));
+    // Trusting the relay's expiry saturates the deadline, so renewal never
+    // fires: the relay drops the reservation on its own TTL while the
+    // connection stays up, no `RelayReservationLost` is emitted, and the
+    // holder keeps advertising a ticket dialers get NO_RESERVATION on.
+    let expected_renew = 10 + (3_600 - 120) * 1_000;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::RelayReserved {
+                renew_at_mono_ms, ..
+            }] if *renew_at_mono_ms == expected_renew
+        ),
+        "expected the default-TTL clamp, got {events:?}"
+    );
     assert_eq!(
         hk.agent
             .active_reservation()
             .expect("reservation held")
             .renew_at_mono_ms,
-        u64::MAX
+        expected_renew
     );
 }
 
