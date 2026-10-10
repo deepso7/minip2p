@@ -903,8 +903,18 @@ impl SwarmState {
 
     /// Resets and forgets a stream whose consumer will never read it again.
     ///
-    /// A reset is queued at most once. Already-buffered events and all later
-    /// data, EOF, and close events for the stream are suppressed.
+    /// A reset is queued at most once, and it settles the buffered data this
+    /// drops. Already-buffered events and all later data, EOF, and close
+    /// events for the stream are suppressed.
+    ///
+    /// A stream the transport has already closed has nothing left to reset, so
+    /// its dropped data is acknowledged instead and the transport does not
+    /// keep the stream. That case succeeds only while the stream's
+    /// [`SwarmEvent::StreamClosed`] is still queued, since that event is what
+    /// identifies the stream as one this connection owned. Once it has been
+    /// delivered, or dropped by an earlier call, the stream is
+    /// indistinguishable from one that never existed and both are
+    /// [`SwarmError::StreamNotFound`].
     pub fn abandon_stream(
         &mut self,
         peer_id: &PeerId,
@@ -914,15 +924,46 @@ impl SwarmState {
         // Ownership is relinquished even if the transport has already closed
         // and forgotten the stream. In that case there is nothing left to
         // reset, but a terminal event may still be queued for the consumer.
-        self.events
-            .retain(|event| !event.matches_stream(peer_id, conn_id, stream_id));
+        let mut dropped_data = 0usize;
+        let mut dropped_terminal = false;
+        self.events.retain(|event| {
+            if !event.matches_stream(peer_id, conn_id, stream_id) {
+                return true;
+            }
+            match event {
+                SwarmEvent::StreamData { data, .. } => dropped_data += data.len(),
+                SwarmEvent::StreamClosed { .. } => dropped_terminal = true,
+                _ => {}
+            }
+            false
+        });
         let key = (conn_id, stream_id);
         let peer_conn = self.conn_to_peer.get(&conn_id) == Some(peer_id);
         let abandoned = peer_conn && self.abandoned_streams.contains(&key);
         // A stream still negotiating outbound can be abandoned too: its id
         // was handed out by `open_stream` before `StreamReady`.
-        if !abandoned && !(peer_conn && self.outbound_negotiators.contains_key(&key)) {
-            self.require_user_stream(peer_id, conn_id, stream_id)?;
+        if !abandoned
+            && !(peer_conn && self.outbound_negotiators.contains_key(&key))
+            && let Err(unknown) = self.require_user_stream(peer_id, conn_id, stream_id)
+        {
+            // A queued terminal proves the stream was ours and that the
+            // transport has already closed and forgotten it; without one it is
+            // genuinely unknown.
+            if !dropped_terminal {
+                return Err(unknown);
+            }
+            // No reset is coming to settle the data just dropped, and the
+            // consumer will never acknowledge it either, so the state owes the
+            // acknowledgement. Left undone, the muxer holds the stream's slot
+            // against its stream limit for good.
+            if dropped_data > 0 {
+                self.actions.push_back(Action::AckStream {
+                    conn_id,
+                    stream_id,
+                    bytes: dropped_data,
+                });
+            }
+            return Ok(());
         }
         if self.reset_pending.insert(key) {
             self.actions
@@ -3615,6 +3656,61 @@ mod tests {
     }
 
     #[test]
+    fn abandoning_a_peer_closed_stream_acknowledges_the_data_it_drops() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"closed-abandon-peer");
+        let conn = ConnectionId::new(61);
+        let stream = StreamId::new(7);
+        core.conn_to_peer.insert(conn, peer.clone());
+        core.peer_to_conn.insert(peer.clone(), conn);
+        core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
+
+        // The peer sends, then closes. Both events queue undelivered, and the
+        // data counts against the stream's receive budget until acknowledged.
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn,
+                stream_id: stream,
+                data: Bytes::from(vec![1, 2, 3]),
+            },
+        );
+        feed(
+            &mut core,
+            TransportEvent::StreamClosed {
+                id: conn,
+                stream_id: stream,
+            },
+        );
+
+        // The consumer gives up before pulling either event.
+        core.abandon_stream(&peer, conn, stream).unwrap();
+
+        // Those bytes are gone, so nobody will ever acknowledge them: the
+        // state owes the acknowledgement itself, or the muxer holds the
+        // stream's slot against `max_streams` for good.
+        let acked: usize = core::iter::from_fn(|| core.poll_output())
+            .filter_map(|output| match output {
+                Output::Action(Action::AckStream {
+                    conn_id,
+                    stream_id,
+                    bytes,
+                }) if conn_id == conn && stream_id == stream => Some(bytes),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(acked, 3);
+
+        // The queued terminal was this stream's only remaining trace, so a
+        // second call cannot tell it from a stream that never existed. The
+        // documented success is scoped to the first call for that reason.
+        assert!(matches!(
+            core.abandon_stream(&peer, conn, stream),
+            Err(SwarmError::StreamNotFound { .. })
+        ));
+    }
+
+    #[test]
     fn abandon_stream_reclaims_an_outbound_negotiator_before_ready() {
         let mut core = test_core();
         let peer = PeerId::from_public_key_protobuf(b"pending-outbound-peer");
@@ -3696,7 +3792,9 @@ mod tests {
                 stream_id: stream,
             },
         );
-        assert!(core.abandon_stream(&peer, conn, stream).is_err());
+        // Abandoning a stream the transport already closed succeeds: the
+        // consumer's intent is met, and there is nothing left to reset.
+        core.abandon_stream(&peer, conn, stream).unwrap();
         assert!(core.poll_output().is_none());
     }
 
