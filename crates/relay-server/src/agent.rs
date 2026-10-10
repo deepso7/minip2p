@@ -18,8 +18,8 @@ use crate::limiter::TokenBuckets;
 use crate::{
     CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
     RelayServerAction, RelayServerAddressError, RelayServerConfig, RelayServerConfigError,
-    RelayServerEvent, RelayServerRuntimeError, RelayServerRuntimeErrorKind, RelayServerToken,
-    ReservationCloseReason, StreamKey,
+    RelayServerEvent, RelayServerRuntimeError, RelayServerRuntimeErrorKind, RelayServerSendError,
+    RelayServerToken, ReservationCloseReason, StreamKey,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -103,7 +103,9 @@ enum SendEffect {
     Forward {
         source_stream: StreamKey,
         direction: CircuitDirection,
-        bytes: u64,
+        /// Length of the chunk sent, so a Full's unsent tail tells how much
+        /// was accepted.
+        chunk_len: usize,
     },
 }
 
@@ -155,12 +157,149 @@ struct Circuit {
     destination_stream: StreamKey,
     deadline_ms: Option<u64>,
     bytes: CircuitByteCounts,
-    source_eof: bool,
-    destination_eof: bool,
-    source_write_closed: bool,
-    destination_write_closed: bool,
-    source_to_destination_in_flight: bool,
-    destination_to_source_in_flight: bool,
+    to_destination: Forward,
+    to_source: Forward,
+}
+
+impl Circuit {
+    fn forward(&mut self, direction: CircuitDirection) -> &mut Forward {
+        match direction {
+            CircuitDirection::SourceToDestination => &mut self.to_destination,
+            CircuitDirection::DestinationToSource => &mut self.to_source,
+        }
+    }
+
+    /// The leg a direction reads from.
+    fn origin(&self, direction: CircuitDirection) -> StreamKey {
+        match direction {
+            CircuitDirection::SourceToDestination => self.source_stream,
+            CircuitDirection::DestinationToSource => self.destination_stream,
+        }
+    }
+
+    /// The leg a direction writes to, with its peer and role.
+    fn target(&self, direction: CircuitDirection) -> (PeerId, StreamKey, CircuitLeg) {
+        match direction {
+            CircuitDirection::SourceToDestination => (
+                self.destination_peer_id.clone(),
+                self.destination_stream,
+                CircuitLeg::Destination,
+            ),
+            CircuitDirection::DestinationToSource => (
+                self.source_peer_id.clone(),
+                self.source_stream,
+                CircuitLeg::Source,
+            ),
+        }
+    }
+}
+
+/// One direction of a circuit: bytes read from the origin leg, in order,
+/// until the target leg accepts them (ADR 0012).
+///
+/// Queued bytes stay unacknowledged until the target accepts them, so the
+/// queue is bounded by the receive budget the origin was granted, and a full
+/// target pauses the origin through withheld credit.
+#[derive(Default)]
+struct Forward {
+    queue: VecDeque<Bytes>,
+    /// Small reads copied together behind `queue`, so a peer sending tiny
+    /// frames costs memory in proportion to its bytes, not its reads.
+    small: Vec<u8>,
+    /// Length of the payload the head was cut from, while the head is the
+    /// unsent tail of a Full; zero while the head is a whole payload.
+    head_counted: usize,
+    send: SendState,
+    fin: FinState,
+}
+
+/// Whether a direction may send its queue's head now.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum SendState {
+    /// Nothing is outstanding.
+    #[default]
+    Idle,
+    /// A send of the head awaits its result.
+    Sending,
+    /// The target answered Full; the head waits for its Writable.
+    Blocked,
+}
+
+/// How far a direction's half-close has travelled.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum FinState {
+    /// The origin has not half-closed.
+    #[default]
+    Open,
+    /// The origin half-closed; the target's FIN follows the last byte.
+    Received,
+    /// The target's FIN has been requested.
+    Requested,
+    /// The target accepted its FIN.
+    Accepted,
+}
+
+/// Reads shorter than this are coalesced into one queue entry, flushed once
+/// it reaches this size or sooner when forwarding or ordering needs it.
+const COALESCE_BELOW: usize = 4096;
+
+impl Forward {
+    /// Queued bytes the origin is still owed acknowledgement for.
+    fn unacked(&self) -> usize {
+        self.queue.iter().map(Bytes::len).sum::<usize>() + self.small.len()
+    }
+
+    /// Appends a read behind everything already queued.
+    fn push(&mut self, data: Bytes) {
+        if data.len() < COALESCE_BELOW {
+            self.small.extend_from_slice(&data);
+            if self.small.len() >= COALESCE_BELOW {
+                self.flush_small();
+            }
+        } else {
+            self.flush_small();
+            self.queue.push_back(data);
+        }
+    }
+
+    /// Moves the coalesced small reads into the queue as one entry.
+    fn flush_small(&mut self) {
+        if !self.small.is_empty() {
+            self.queue.push_back(Bytes::copy_from_slice(&self.small));
+            self.small.clear();
+        }
+    }
+
+    /// The next payload to send, if any.
+    fn head(&mut self) -> Option<Bytes> {
+        if self.queue.is_empty() {
+            self.flush_small();
+        }
+        self.queue.front().cloned()
+    }
+
+    /// Records that the target accepted the head up to an `unsent` tail.
+    fn accept(&mut self, unsent: Option<Bytes>) {
+        self.send = SendState::Idle;
+        let head = self.queue.pop_front().unwrap_or_default();
+        let counted = if self.head_counted == 0 {
+            head.len()
+        } else {
+            self.head_counted
+        };
+        self.head_counted = 0;
+        if let Some(mut unsent) = unsent.filter(|unsent| !unsent.is_empty()) {
+            // A tail shorter than half its original payload is copied, so
+            // what it pins stays within twice the bytes it holds (ADR 0012).
+            if unsent.len() < counted / 2 {
+                unsent = Bytes::copy_from_slice(&unsent);
+            } else if unsent.len() < counted {
+                self.head_counted = counted;
+            }
+            self.queue.push_front(unsent);
+            self.send = SendState::Blocked;
+        }
+    }
 }
 
 /// Whole-service deterministic relay policy and forwarding state.
@@ -352,28 +491,46 @@ impl RelayServerAgent {
                     conn_id: *conn_id,
                     stream_id: *stream_id,
                 };
-                if self.pending_circuits.contains_key(&key) {
+                // Control messages are consumed as they are read. Circuit
+                // payload, including payload pipelined before the circuit
+                // commits, is acknowledged only once the other leg accepts
+                // it. A committed source leg keeps its HOP worker, so the
+                // circuit is checked first.
+                if self.circuits.contains_key(&key) {
+                    self.queue_forward(key, CircuitDirection::SourceToDestination, data.clone());
+                    true
+                } else if self.pending_circuits.contains_key(&key) {
                     self.append_pending_payload(key, CircuitDirection::SourceToDestination, data);
                     true
                 } else if self.hop_workers.contains_key(&key) {
+                    // Payload coalesced with CONNECT stays in the responder
+                    // until the decision, unacknowledged.
+                    let held = self.hop_bridge_len(key);
                     if self.feed_hop(key, HopResponderInput::Data(data.to_vec())) {
                         self.drain_hop(key, now);
                     }
+                    let payload = self.hop_bridge_len(key).saturating_sub(held);
+                    self.queue_ack(key, data.len().saturating_sub(payload));
                     true
                 } else if self.rejected_hop_streams.contains_key(&key) {
-                    true
-                } else if self.circuits.contains_key(&key) {
-                    self.queue_forward(key, CircuitDirection::SourceToDestination, data.clone());
+                    self.queue_ack(key, data.len());
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied() {
-                    if self.feed_stop(source_stream, StopInitiatorInput::Data(data.to_vec())) {
-                        self.drain_stop(source_stream, now);
-                    } else if self.circuits.contains_key(&source_stream) {
+                    if self.circuits.contains_key(&source_stream) {
                         self.queue_forward(
                             source_stream,
                             CircuitDirection::DestinationToSource,
                             data.clone(),
                         );
+                    } else {
+                        let bridged = if self
+                            .feed_stop(source_stream, StopInitiatorInput::Data(data.to_vec()))
+                        {
+                            self.drain_stop(source_stream, now)
+                        } else {
+                            0
+                        };
+                        self.queue_ack(key, data.len().saturating_sub(bridged));
                     }
                     true
                 } else {
@@ -419,15 +576,24 @@ impl RelayServerAgent {
                     self.rejected_hop_streams.contains_key(&key)
                 }
             }
-            // The relay treats a Full write as a failure today (#257), so
-            // there is nothing to resume; only claim its own streams' wakeups
-            // so they never reach the application.
+            // Resumes a circuit direction paused on this leg. Other relay
+            // streams never hold a tail (a Full control send fails), but
+            // their wakeups are still claimed so they never reach the
+            // application.
             SwarmEvent::StreamWritable {
                 conn_id, stream_id, ..
-            } => self.claims_stream(StreamKey {
-                conn_id: *conn_id,
-                stream_id: *stream_id,
-            }),
+            } => {
+                let key = StreamKey {
+                    conn_id: *conn_id,
+                    stream_id: *stream_id,
+                };
+                if self.circuits.contains_key(&key) {
+                    self.resume_forward(key, CircuitDirection::DestinationToSource);
+                } else if let Some(source_stream) = self.stop_to_source.get(&key).copied() {
+                    self.resume_forward(source_stream, CircuitDirection::SourceToDestination);
+                }
+                self.claims_stream(key)
+            }
             SwarmEvent::StreamWriteStopped {
                 peer_id,
                 conn_id,
@@ -448,22 +614,12 @@ impl RelayServerAgent {
                     stream_id: *stream_id,
                 };
                 if self.circuits.contains_key(&key) {
-                    self.close_circuit(
-                        key,
-                        CircuitCloseReason::StreamReset {
-                            leg: CircuitLeg::Source,
-                        },
-                    );
+                    self.circuit_leg_closed(key, CircuitLeg::Source);
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
                     && self.circuits.contains_key(&source_stream)
                 {
-                    self.close_circuit(
-                        source_stream,
-                        CircuitCloseReason::StreamReset {
-                            leg: CircuitLeg::Destination,
-                        },
-                    );
+                    self.circuit_leg_closed(source_stream, CircuitLeg::Destination);
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
                     && self.feed_stop(source_stream, StopInitiatorInput::RemoteReset)
@@ -676,11 +832,17 @@ impl RelayServerAgent {
         }
     }
 
-    /// Reports whether a queued send entered the transport's outbound queue.
+    /// Reports how much of a queued send entered the transport's outbound
+    /// queue.
+    ///
+    /// A forwarding chunk that comes back [`RelayServerSendError::Full`] is
+    /// not a failure: the relay holds its unsent tail and resends it on the
+    /// stream's [`SwarmEvent::StreamWritable`]. A Full control message fails
+    /// like any other rejected send.
     pub fn send_stream_result(
         &mut self,
         token: RelayServerToken,
-        result: Result<(), String>,
+        result: Result<(), RelayServerSendError>,
         now: Now,
     ) {
         let Some(PendingOperation::Send { peer_id, effect }) =
@@ -688,6 +850,27 @@ impl RelayServerAgent {
         else {
             return;
         };
+        if let (
+            Err(RelayServerSendError::Full { unsent }),
+            SendEffect::Forward {
+                source_stream,
+                direction,
+                chunk_len,
+            },
+        ) = (&result, &effect)
+            && unsent.len() <= *chunk_len
+        {
+            let accepted = chunk_len - unsent.len();
+            self.forward_accepted(*source_stream, *direction, accepted, Some(unsent.clone()));
+            return;
+        }
+        let result = result.map_err(|error| match error {
+            RelayServerSendError::Full { unsent } => format!(
+                "{} of the message's bytes did not fit the stream's send queue",
+                unsent.len()
+            ),
+            RelayServerSendError::Failed(detail) => detail,
+        });
         match result {
             Ok(()) => match effect {
                 SendEffect::CommitReservation(pending) => {
@@ -722,8 +905,8 @@ impl RelayServerAgent {
                 SendEffect::Forward {
                     source_stream,
                     direction,
-                    bytes,
-                } => self.forward_accepted(source_stream, direction, bytes),
+                    chunk_len,
+                } => self.forward_accepted(source_stream, direction, chunk_len, None),
                 SendEffect::CompleteHop(stream) => self.complete_hop(stream),
             },
             Err(detail) => {
@@ -1168,22 +1351,26 @@ impl RelayServerAgent {
                     };
                     self.queue_reset(peer_id, key);
                 }
+                // A committed circuit reads its source leg itself, and a
+                // pending one buffers later reads directly, so only payload
+                // coalesced with CONNECT arrives here, on acceptance. It
+                // precedes everything buffered since.
                 HopResponderOutput::BridgeData(data) => {
-                    if self.pending_circuits.contains_key(&key) {
-                        self.append_pending_payload(
-                            key,
-                            CircuitDirection::SourceToDestination,
-                            &data,
-                        );
-                    } else if self.circuits.contains_key(&key) {
-                        self.queue_forward(key, CircuitDirection::SourceToDestination, data);
-                    }
+                    let Some(circuit) = self.pending_circuits.get_mut(&key) else {
+                        continue;
+                    };
+                    let later = core::mem::replace(&mut circuit.source_pipelined, data);
+                    self.append_pending_payload(key, CircuitDirection::SourceToDestination, &later);
                 }
             }
         }
     }
 
-    fn drain_stop(&mut self, source_stream: StreamKey, now: Now) {
+    /// Drives a pending circuit's STOP initiator and returns how many
+    /// destination payload bytes it moved into the pending circuit's buffer;
+    /// those stay unacknowledged until forwarded or released.
+    fn drain_stop(&mut self, source_stream: StreamKey, now: Now) -> usize {
+        let mut bridged = 0;
         loop {
             let output = self
                 .pending_circuits
@@ -1206,16 +1393,16 @@ impl RelayServerAgent {
                         },
                     ) {
                         self.fail_pending_connect(source_stream, Status::ConnectionFailed);
-                        return;
+                        return bridged;
                     }
                     let Some(worker) = self.hop_workers.get_mut(&source_stream) else {
                         self.fail_pending_connect(source_stream, Status::ConnectionFailed);
-                        return;
+                        return bridged;
                     };
                     let Some(HopResponderOutput::Outbound(data)) = worker.responder.poll_output()
                     else {
                         self.fail_pending_connect(source_stream, Status::ConnectionFailed);
-                        return;
+                        return bridged;
                     };
                     let peer_id = worker.peer_id.clone();
                     self.queue_send(
@@ -1228,14 +1415,16 @@ impl RelayServerAgent {
                 }
                 StopInitiatorOutput::Outcome(outcome) => {
                     self.fail_pending_connect(source_stream, outcome.hop_status());
-                    return;
+                    return bridged;
                 }
                 StopInitiatorOutput::BridgeData(data) => {
-                    self.append_pending_payload(
+                    if self.append_pending_payload(
                         source_stream,
                         CircuitDirection::DestinationToSource,
                         &data,
-                    );
+                    ) {
+                        bridged += data.len();
+                    }
                 }
                 StopInitiatorOutput::Outbound(data) => {
                     if let Some(circuit) = self.pending_circuits.get(&source_stream) {
@@ -1266,6 +1455,7 @@ impl RelayServerAgent {
                 }
             }
         }
+        bridged
     }
 
     fn commit_circuit(&mut self, source_stream: StreamKey, now: Now) {
@@ -1288,12 +1478,8 @@ impl RelayServerAgent {
                 destination_stream,
                 deadline_ms,
                 bytes: CircuitByteCounts::default(),
-                source_eof: false,
-                destination_eof: false,
-                source_write_closed: false,
-                destination_write_closed: false,
-                source_to_destination_in_flight: false,
-                destination_to_source_in_flight: false,
+                to_destination: Forward::default(),
+                to_source: Forward::default(),
             },
         );
         self.events.push_back(RelayServerEvent::CircuitOpened {
@@ -1322,14 +1508,34 @@ impl RelayServerAgent {
         }
     }
 
+    /// Payload the HOP worker on `stream` holds behind its CONNECT.
+    fn hop_bridge_len(&self, stream: StreamKey) -> usize {
+        self.hop_workers
+            .get(&stream)
+            .map_or(0, |worker| worker.responder.pending_bridge_len())
+    }
+
+    /// Releases the credit of a dropped pending circuit's buffered payload,
+    /// including what its HOP worker still holds (a no-op on a leg reset
+    /// with it).
+    fn release_pipelined(&mut self, source_stream: StreamKey, circuit: &PendingCircuit) {
+        let held = self.hop_bridge_len(source_stream);
+        self.queue_ack(source_stream, circuit.source_pipelined.len() + held);
+        if let Some(stop_stream) = circuit.stop_stream {
+            self.queue_ack(stop_stream, circuit.destination_pipelined.len());
+        }
+    }
+
+    /// Buffers `data` on a pending circuit, returning whether it was kept;
+    /// payload past the bound aborts the circuit.
     fn append_pending_payload(
         &mut self,
         source_stream: StreamKey,
         direction: CircuitDirection,
         data: &[u8],
-    ) {
+    ) -> bool {
         let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
-            return;
+            return false;
         };
         let buffer = match direction {
             CircuitDirection::SourceToDestination => &mut circuit.source_pipelined,
@@ -1341,7 +1547,7 @@ impl RelayServerAgent {
             .is_some_and(|len| len <= MAX_PENDING_BRIDGE_SIZE)
         {
             buffer.extend_from_slice(data);
-            return;
+            return true;
         }
         let peer_id = match direction {
             CircuitDirection::SourceToDestination => circuit.source_peer_id.clone(),
@@ -1353,8 +1559,11 @@ impl RelayServerAgent {
             Some(peer_id),
             "pending circuit payload exceeded the 64 KiB directional bound".into(),
         );
+        false
     }
 
+    /// Queues `data` read from `direction`'s origin behind what it already
+    /// holds, and sends it when that direction is idle.
     fn queue_forward(
         &mut self,
         source_stream: StreamKey,
@@ -1368,82 +1577,83 @@ impl RelayServerAgent {
         let Some(circuit) = self.circuits.get_mut(&source_stream) else {
             return;
         };
-        let in_flight = match direction {
-            CircuitDirection::SourceToDestination => &mut circuit.source_to_destination_in_flight,
-            CircuitDirection::DestinationToSource => &mut circuit.destination_to_source_in_flight,
-        };
-        if *in_flight {
-            self.close_circuit(source_stream, CircuitCloseReason::InternalFailure);
-            self.runtime_error(
-                RelayServerRuntimeErrorKind::InternalInvariant,
-                None,
-                "same-direction forwarding send was not echoed before new input".into(),
-            );
-            return;
-        }
-        *in_flight = true;
-        let (peer_id, stream) = match direction {
-            CircuitDirection::SourceToDestination => (
-                circuit.destination_peer_id.clone(),
-                circuit.destination_stream,
-            ),
-            CircuitDirection::DestinationToSource => {
-                (circuit.source_peer_id.clone(), circuit.source_stream)
-            }
-        };
-        let bytes = data.len().min(u64::MAX as usize) as u64;
-        let token = self.token();
-        self.pending_operations.insert(
-            token,
-            PendingOperation::Send {
-                peer_id: peer_id.clone(),
-                effect: SendEffect::Forward {
-                    source_stream,
-                    direction,
-                    bytes,
-                },
-            },
-        );
-        self.actions.push_back(RelayServerAction::SendStream {
-            token,
-            peer_id,
-            stream,
-            data,
-        });
+        circuit.forward(direction).push(data);
+        self.pump_forward(source_stream, direction);
     }
 
+    /// Sends the head of an idle direction's queue, or its FIN once the
+    /// origin half-closed and every byte was accepted.
+    fn pump_forward(&mut self, source_stream: StreamKey, direction: CircuitDirection) {
+        let Some(circuit) = self.circuits.get_mut(&source_stream) else {
+            return;
+        };
+        let (peer_id, stream, leg) = circuit.target(direction);
+        let forward = circuit.forward(direction);
+        if forward.send != SendState::Idle {
+            return;
+        }
+        if let Some(data) = forward.head() {
+            forward.send = SendState::Sending;
+            let chunk_len = data.len();
+            self.queue_send(
+                peer_id,
+                stream,
+                data,
+                SendEffect::Forward {
+                    source_stream,
+                    direction,
+                    chunk_len,
+                },
+            );
+        } else if forward.fin == FinState::Received {
+            forward.fin = FinState::Requested;
+            self.queue_circuit_close(peer_id, stream, source_stream, leg);
+        }
+    }
+
+    /// Resumes a direction paused by a Full on its target leg.
+    fn resume_forward(&mut self, source_stream: StreamKey, direction: CircuitDirection) {
+        if let Some(circuit) = self.circuits.get_mut(&source_stream) {
+            let forward = circuit.forward(direction);
+            if forward.send == SendState::Blocked {
+                forward.send = SendState::Idle;
+                self.pump_forward(source_stream, direction);
+            }
+        }
+    }
+
+    /// Applies a forwarding send's result: `accepted` bytes of the head went
+    /// out, and an `unsent` tail (after a Full) waits for the target's
+    /// Writable. Accepted bytes are acknowledged to the origin and count
+    /// toward the circuit's byte limit.
     fn forward_accepted(
         &mut self,
         source_stream: StreamKey,
         direction: CircuitDirection,
-        bytes: u64,
+        accepted: usize,
+        unsent: Option<Bytes>,
     ) {
         let Some(circuit) = self.circuits.get_mut(&source_stream) else {
             return;
         };
+        let origin = circuit.origin(direction);
+        circuit.forward(direction).accept(unsent);
         let total = match direction {
-            CircuitDirection::SourceToDestination => {
-                circuit.source_to_destination_in_flight = false;
-                circuit.bytes.source_to_destination =
-                    circuit.bytes.source_to_destination.saturating_add(bytes);
-                circuit.bytes.source_to_destination
-            }
-            CircuitDirection::DestinationToSource => {
-                circuit.destination_to_source_in_flight = false;
-                circuit.bytes.destination_to_source =
-                    circuit.bytes.destination_to_source.saturating_add(bytes);
-                circuit.bytes.destination_to_source
-            }
+            CircuitDirection::SourceToDestination => &mut circuit.bytes.source_to_destination,
+            CircuitDirection::DestinationToSource => &mut circuit.bytes.destination_to_source,
         };
+        *total = total.saturating_add(accepted as u64);
+        let total = *total;
+        self.queue_ack(origin, accepted);
         if self.config.max_circuit_bytes != 0 && total > self.config.max_circuit_bytes {
             self.close_circuit(source_stream, CircuitCloseReason::ByteLimit { direction });
         } else {
-            self.finish_eof_if_drained(source_stream);
+            self.pump_forward(source_stream, direction);
         }
     }
 
     fn close_circuit(&mut self, source_stream: StreamKey, reason: CircuitCloseReason) {
-        let Some(circuit) = self.circuits.remove(&source_stream) else {
+        let Some(mut circuit) = self.circuits.remove(&source_stream) else {
             return;
         };
         self.hop_workers.remove(&source_stream);
@@ -1474,6 +1684,16 @@ impl RelayServerAgent {
                 circuit.destination_stream,
             );
         }
+        // Bytes still queued were never forwarded; release the origins'
+        // credit for them (a no-op on a leg reset above).
+        for direction in [
+            CircuitDirection::SourceToDestination,
+            CircuitDirection::DestinationToSource,
+        ] {
+            let origin = circuit.origin(direction);
+            let unacked = circuit.forward(direction).unacked();
+            self.queue_ack(origin, unacked);
+        }
         self.events.push_back(RelayServerEvent::CircuitClosed {
             source_peer_id: circuit.source_peer_id,
             destination_peer_id: circuit.destination_peer_id,
@@ -1482,59 +1702,52 @@ impl RelayServerAgent {
         });
     }
 
+    /// Records `leg`'s half-close; its FIN reaches the other leg after the
+    /// last byte queued for it.
     fn circuit_eof(&mut self, source_stream: StreamKey, leg: CircuitLeg) {
+        let direction = match leg {
+            CircuitLeg::Source => CircuitDirection::SourceToDestination,
+            CircuitLeg::Destination => CircuitDirection::DestinationToSource,
+        };
         let Some(circuit) = self.circuits.get_mut(&source_stream) else {
             return;
         };
-        let (peer_id, stream, target_leg) = match leg {
-            CircuitLeg::Source => {
-                if circuit.source_eof {
-                    return;
-                }
-                circuit.source_eof = true;
-                (
-                    circuit.destination_peer_id.clone(),
-                    circuit.destination_stream,
-                    CircuitLeg::Destination,
-                )
-            }
-            CircuitLeg::Destination => {
-                if circuit.destination_eof {
-                    return;
-                }
-                circuit.destination_eof = true;
-                (
-                    circuit.source_peer_id.clone(),
-                    circuit.source_stream,
-                    CircuitLeg::Source,
-                )
-            }
-        };
-        self.queue_circuit_close(peer_id, stream, source_stream, target_leg);
-        self.finish_eof_if_drained(source_stream);
+        let forward = circuit.forward(direction);
+        if forward.fin == FinState::Open {
+            forward.fin = FinState::Received;
+            self.pump_forward(source_stream, direction);
+        }
     }
 
+    /// Handles `leg`'s stream closing. A leg that finished both ways (its
+    /// half-close was read and the FIN forwarded to it accepted) closed
+    /// cleanly, and the other direction keeps draining; anything else is a
+    /// reset.
+    fn circuit_leg_closed(&mut self, source_stream: StreamKey, leg: CircuitLeg) {
+        let Some(circuit) = self.circuits.get(&source_stream) else {
+            return;
+        };
+        let (from_leg, to_leg) = match leg {
+            CircuitLeg::Source => (&circuit.to_destination, &circuit.to_source),
+            CircuitLeg::Destination => (&circuit.to_source, &circuit.to_destination),
+        };
+        if from_leg.fin == FinState::Open || to_leg.fin != FinState::Accepted {
+            self.close_circuit(source_stream, CircuitCloseReason::StreamReset { leg });
+        }
+    }
+
+    /// Records that `leg` accepted the FIN forwarded to it.
     fn circuit_close_accepted(&mut self, source_stream: StreamKey, leg: CircuitLeg) {
         let Some(circuit) = self.circuits.get_mut(&source_stream) else {
             return;
         };
         match leg {
-            CircuitLeg::Source => circuit.source_write_closed = true,
-            CircuitLeg::Destination => circuit.destination_write_closed = true,
+            CircuitLeg::Source => circuit.to_source.fin = FinState::Accepted,
+            CircuitLeg::Destination => circuit.to_destination.fin = FinState::Accepted,
         }
-        self.finish_eof_if_drained(source_stream);
-    }
-
-    fn finish_eof_if_drained(&mut self, source_stream: StreamKey) {
-        let finished = self.circuits.get(&source_stream).is_some_and(|circuit| {
-            circuit.source_eof
-                && circuit.destination_eof
-                && circuit.source_write_closed
-                && circuit.destination_write_closed
-                && !circuit.source_to_destination_in_flight
-                && !circuit.destination_to_source_in_flight
-        });
-        if finished {
+        if circuit.to_source.fin == FinState::Accepted
+            && circuit.to_destination.fin == FinState::Accepted
+        {
             self.close_circuit(source_stream, CircuitCloseReason::Eof);
         }
     }
@@ -1849,6 +2062,7 @@ impl RelayServerAgent {
         let Some(circuit) = self.pending_circuits.remove(&source_stream) else {
             return;
         };
+        self.release_pipelined(source_stream, &circuit);
         self.cancel_pending_control_ops(source_stream);
         if let Some(stop_stream) = circuit.stop_stream {
             self.stop_to_source.remove(&stop_stream);
@@ -1862,6 +2076,7 @@ impl RelayServerAgent {
         let Some(circuit) = self.pending_circuits.remove(&source_stream) else {
             return;
         };
+        self.release_pipelined(source_stream, &circuit);
         self.cancel_pending_control_ops(source_stream);
         if let Some(stop_stream) = circuit.stop_stream {
             self.stop_to_source.remove(&stop_stream);
@@ -1943,17 +2158,19 @@ impl RelayServerAgent {
     }
 
     fn cancel_operations(&mut self, tokens: &[RelayServerToken]) {
+        // Skip the action-queue scan: nothing to cancel.
+        if tokens.is_empty() {
+            return;
+        }
         for token in tokens {
             self.pending_operations.remove(token);
         }
-        self.actions.retain(|action| {
-            let token = match action {
-                RelayServerAction::OpenStream { token, .. }
-                | RelayServerAction::SendStream { token, .. }
-                | RelayServerAction::CloseStreamWrite { token, .. }
-                | RelayServerAction::ResetStream { token, .. } => token,
-            };
-            !tokens.contains(token)
+        self.actions.retain(|action| match action {
+            RelayServerAction::OpenStream { token, .. }
+            | RelayServerAction::SendStream { token, .. }
+            | RelayServerAction::CloseStreamWrite { token, .. }
+            | RelayServerAction::ResetStream { token, .. } => !tokens.contains(token),
+            RelayServerAction::AckStream { .. } => true,
         });
     }
 
@@ -1985,6 +2202,14 @@ impl RelayServerAgent {
             stream,
             data,
         });
+    }
+
+    /// Acknowledges `bytes` of `stream`'s delivered data as consumed.
+    fn queue_ack(&mut self, stream: StreamKey, bytes: usize) {
+        if bytes != 0 {
+            self.actions
+                .push_back(RelayServerAction::AckStream { stream, bytes });
+        }
     }
 
     fn queue_close(&mut self, peer_id: PeerId, stream: StreamKey) {
@@ -2093,6 +2318,16 @@ mod tests {
     use super::*;
     use crate::{RateLimit, RelayServerAction, RelayServerConfig, RelayServerEvent, StreamKey};
 
+    /// The next I/O action, leaving acknowledgements queued for the
+    /// backpressure tests that inspect them.
+    fn io_action(agent: &mut RelayServerAgent) -> Option<RelayServerAction> {
+        let index = agent
+            .actions
+            .iter()
+            .position(|action| !matches!(action, RelayServerAction::AckStream { .. }))?;
+        agent.actions.remove(index)
+    }
+
     fn direct_addr() -> Multiaddr {
         Multiaddr::from_str("/ip4/192.0.2.1/tcp/4001").unwrap()
     }
@@ -2184,12 +2419,12 @@ mod tests {
             },
             &[],
         );
-        let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+        let RelayServerAction::SendStream { token, .. } = io_action(agent).unwrap() else {
             panic!("reservation response");
         };
         agent.send_stream_result(token, Ok(()), Now::from_millis(0));
         let _ = agent.poll_event();
-        if let Some(RelayServerAction::CloseStreamWrite { token, .. }) = agent.poll_action() {
+        if let Some(RelayServerAction::CloseStreamWrite { token, .. }) = io_action(agent) {
             agent.close_stream_write_result(token, Ok(()), Now::from_millis(0));
         }
     }
@@ -2217,9 +2452,10 @@ mod tests {
             false,
             Now::from_millis(commit_ms),
         );
-        let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+        let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap() else {
             panic!("HOP success");
         };
+        drop_acks(&mut agent);
         (
             agent,
             source,
@@ -2231,8 +2467,17 @@ mod tests {
     }
 
     fn pending_stop(
+        config: RelayServerConfig,
+        now_ms: u64,
+    ) -> (RelayServerAgent, PeerId, PeerId, StreamKey, StreamKey) {
+        pending_stop_with_payload(config, now_ms, &[])
+    }
+
+    /// [`pending_stop`] with `pipelined` payload in the CONNECT's read.
+    fn pending_stop_with_payload(
         mut config: RelayServerConfig,
         now_ms: u64,
+        pipelined: &[u8],
     ) -> (RelayServerAgent, PeerId, PeerId, StreamKey, StreamKey) {
         config.reservation_rate_limit_per_peer = None;
         config.reservation_rate_limit_per_ip = None;
@@ -2270,9 +2515,9 @@ mod tests {
                 limit: None,
                 status: None,
             },
-            &[],
+            pipelined,
         );
-        let RelayServerAction::OpenStream { token, .. } = agent.poll_action().unwrap() else {
+        let RelayServerAction::OpenStream { token, .. } = io_action(&mut agent).unwrap() else {
             panic!("STOP open");
         };
         let stop_stream = StreamKey {
@@ -2280,7 +2525,7 @@ mod tests {
             stream_id: StreamId::new(3),
         };
         agent.stream_open_result(token, Ok(stop_stream), Now::from_millis(now_ms));
-        let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+        let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap() else {
             panic!("STOP request");
         };
         agent.send_stream_result(token, Ok(()), Now::from_millis(now_ms));
@@ -2298,7 +2543,15 @@ mod tests {
             agent.poll_event(),
             Some(RelayServerEvent::CircuitOpened { .. })
         ));
+        drop_acks(&mut agent);
         (agent, source, destination, source_stream, stop_stream)
+    }
+
+    /// Forgets queued acknowledgements of setup reads.
+    fn drop_acks(agent: &mut RelayServerAgent) {
+        agent
+            .actions
+            .retain(|action| !matches!(action, RelayServerAction::AckStream { .. }));
     }
 
     #[test]
@@ -2354,7 +2607,7 @@ mod tests {
         );
 
         assert_eq!(agent.poll_event(), None);
-        let RelayServerAction::SendStream { token, stream, .. } = agent.poll_action().unwrap()
+        let RelayServerAction::SendStream { token, stream, .. } = io_action(&mut agent).unwrap()
         else {
             panic!("reservation decision sends its response");
         };
@@ -2419,7 +2672,7 @@ mod tests {
             peer_id,
             expected_conn_id,
             protocol_id,
-        }) = agent.poll_action()
+        }) = io_action(&mut agent)
         else {
             panic!("admitted CONNECT opens STOP");
         };
@@ -2433,7 +2686,7 @@ mod tests {
             stream_id: StreamId::new(9),
         };
         agent.stream_open_result(token, Ok(stop_stream), Now::from_millis(1));
-        let RelayServerAction::SendStream { token, stream, .. } = agent.poll_action().unwrap()
+        let RelayServerAction::SendStream { token, stream, .. } = io_action(&mut agent).unwrap()
         else {
             panic!("STOP CONNECT request");
         };
@@ -2449,7 +2702,7 @@ mod tests {
             false,
             Now::from_millis(2),
         );
-        let RelayServerAction::SendStream { token, stream, .. } = agent.poll_action().unwrap()
+        let RelayServerAction::SendStream { token, stream, .. } = io_action(&mut agent).unwrap()
         else {
             panic!("HOP success response");
         };
@@ -2467,7 +2720,7 @@ mod tests {
             stream,
             data,
             ..
-        } = agent.poll_action().unwrap()
+        } = io_action(&mut agent).unwrap()
         else {
             panic!("pipelined source payload is released after commit");
         };
@@ -2516,11 +2769,15 @@ mod tests {
             },
             &[],
         );
-        let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+        let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap() else {
             panic!("reservation response");
         };
 
-        agent.send_stream_result(token, Err("queue full".into()), Now::from_millis(0));
+        agent.send_stream_result(
+            token,
+            Err(RelayServerSendError::Failed("queue full".into())),
+            Now::from_millis(0),
+        );
 
         assert!(!agent.has_reservation(&remote));
         assert!(matches!(
@@ -2606,10 +2863,10 @@ mod tests {
         agent.handle_event(&second, false, Now::from_millis(5));
 
         assert!(matches!(
-            agent.poll_action(),
+            io_action(&mut agent),
             Some(RelayServerAction::ResetStream { stream: reset, .. }) if reset == stream
         ));
-        assert_eq!(agent.poll_action(), None);
+        assert_eq!(io_action(&mut agent), None);
     }
 
     #[test]
@@ -2696,7 +2953,7 @@ mod tests {
         ));
         assert_eq!(agent.circuit_count(), 0);
         assert!(!matches!(
-            agent.poll_action(),
+            io_action(&mut agent),
             Some(RelayServerAction::OpenStream { .. })
         ));
     }
@@ -2738,10 +2995,14 @@ mod tests {
             },
             &[],
         );
-        let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+        let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap() else {
             panic!("renewal response");
         };
-        agent.send_stream_result(token, Err("backpressure".into()), Now::from_millis(10));
+        agent.send_stream_result(
+            token,
+            Err(RelayServerSendError::Failed("backpressure".into())),
+            Now::from_millis(10),
+        );
         assert_eq!(agent.reservation_connection(&remote), Some(renewal.conn_id));
         assert_eq!(agent.reservation_count(), 1);
     }
@@ -2778,7 +3039,7 @@ mod tests {
                 stream_id: StreamId::new(stream_id),
             };
             feed_hop(&mut agent, &remote, stream, reserve_request(), &[]);
-            let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+            let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap() else {
                 panic!("renewal response");
             };
             agent.send_stream_result(token, Ok(()), Now::from_millis(0));
@@ -2786,7 +3047,7 @@ mod tests {
                 agent.poll_event(),
                 Some(RelayServerEvent::ReservationAccepted { renewed: true, .. })
             ));
-            while agent.poll_action().is_some() {}
+            while io_action(&mut agent).is_some() {}
         }
     }
 
@@ -2826,7 +3087,7 @@ mod tests {
         );
         let RelayServerAction::SendStream {
             token: first_token, ..
-        } = agent.poll_action().unwrap()
+        } = io_action(&mut agent).unwrap()
         else {
             panic!("first reservation response");
         };
@@ -2858,7 +3119,7 @@ mod tests {
                     ..
                 })
             ));
-            let _ = agent.poll_action();
+            let _ = io_action(&mut agent);
         }
 
         agent.send_stream_result(first_token, Ok(()), Now::from_millis(1));
@@ -2902,7 +3163,7 @@ mod tests {
             },
             &[],
         );
-        let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+        let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap() else {
             panic!("reservation response");
         };
 
@@ -2950,7 +3211,7 @@ mod tests {
                 },
                 &[],
             );
-            let _ = agent.poll_action();
+            let _ = io_action(&mut agent);
 
             let terminal = if close_connection {
                 SwarmEvent::ConnectionClosed {
@@ -2965,7 +3226,7 @@ mod tests {
                 }
             };
             agent.handle_event(&terminal, false, Now::from_millis(1));
-            while agent.poll_action().is_some() {}
+            while io_action(&mut agent).is_some() {}
 
             let second = PeerId::from_public_key_protobuf(b"second-terminal-reservation");
             let second_stream = StreamKey {
@@ -2992,7 +3253,7 @@ mod tests {
                 Some(RelayServerEvent::ReservationDenied { .. })
             ));
             assert!(matches!(
-                agent.poll_action(),
+                io_action(&mut agent),
                 Some(RelayServerAction::SendStream {
                     peer_id,
                     stream,
@@ -3160,7 +3421,7 @@ mod tests {
             }) if peer_id == remote
         ));
         assert!(matches!(
-            agent.poll_action(),
+            io_action(&mut agent),
             Some(RelayServerAction::SendStream { .. })
         ));
     }
@@ -3237,7 +3498,7 @@ mod tests {
             Now::from_millis(0),
         ));
         assert!(agent.owns_stream(stream));
-        let RelayServerAction::ResetStream { token, .. } = agent.poll_action().unwrap() else {
+        let RelayServerAction::ResetStream { token, .. } = io_action(&mut agent).unwrap() else {
             panic!("capped stream is reset");
         };
         agent.reset_stream_result(token, Ok(()), Now::from_millis(0));
@@ -3279,7 +3540,7 @@ mod tests {
         agent.handle_tick(Now::from_millis(5));
 
         assert!(agent.has_reservation(&remote));
-        assert_eq!(agent.poll_action(), None);
+        assert_eq!(io_action(&mut agent), None);
         assert_eq!(agent.poll_event(), None);
     }
 
@@ -3301,7 +3562,7 @@ mod tests {
         agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
         establish(&mut agent, &remote, old_stream.conn_id);
         feed_hop(&mut agent, &remote, old_stream, reserve_request(), &[]);
-        let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+        let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap() else {
             panic!("reservation response");
         };
 
@@ -3338,7 +3599,7 @@ mod tests {
             false,
             Now::from_millis(11),
         );
-        let RelayServerAction::SendStream { token, stream, .. } = agent.poll_action().unwrap()
+        let RelayServerAction::SendStream { token, stream, .. } = io_action(&mut agent).unwrap()
         else {
             panic!("source payload forward");
         };
@@ -3356,12 +3617,16 @@ mod tests {
             false,
             Now::from_millis(12),
         );
-        let RelayServerAction::SendStream { token, stream, .. } = agent.poll_action().unwrap()
+        let RelayServerAction::SendStream { token, stream, .. } = io_action(&mut agent).unwrap()
         else {
             panic!("destination payload forward");
         };
         assert_eq!(stream, source_stream);
-        agent.send_stream_result(token, Err("queue rejected".into()), Now::from_millis(12));
+        agent.send_stream_result(
+            token,
+            Err(RelayServerSendError::Failed("queue rejected".into())),
+            Now::from_millis(12),
+        );
         assert!(matches!(
             agent.poll_event(),
             Some(RelayServerEvent::CircuitClosed {
@@ -3430,7 +3695,7 @@ mod tests {
         );
         assert!(claimed);
         assert!(matches!(
-            agent.poll_action(),
+            io_action(&mut agent),
             Some(RelayServerAction::ResetStream { stream, .. }) if stream == stop_stream
         ));
     }
@@ -3449,7 +3714,7 @@ mod tests {
             Now::from_millis(1),
         );
         let RelayServerAction::CloseStreamWrite { token, stream, .. } =
-            agent.poll_action().unwrap()
+            io_action(&mut agent).unwrap()
         else {
             panic!("source EOF propagates");
         };
@@ -3467,7 +3732,7 @@ mod tests {
             Now::from_millis(2),
         );
         let RelayServerAction::CloseStreamWrite { token, stream, .. } =
-            agent.poll_action().unwrap()
+            io_action(&mut agent).unwrap()
         else {
             panic!("destination EOF propagates");
         };
@@ -3512,7 +3777,7 @@ mod tests {
         agent.handle_tick(Now::from_millis(5));
         assert!(!agent.owns_stream(hop));
         assert!(matches!(
-            agent.poll_action(),
+            io_action(&mut agent),
             Some(RelayServerAction::ResetStream { stream, .. }) if stream == hop
         ));
 
@@ -3598,13 +3863,13 @@ mod tests {
                 &[],
             );
             if index == 0 {
-                let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap()
+                let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap()
                 else {
                     panic!("first IP token admits");
                 };
                 agent.send_stream_result(token, Ok(()), Now::from_millis(0));
                 let _ = agent.poll_event();
-                let _ = agent.poll_action();
+                let _ = io_action(&mut agent);
             } else {
                 assert!(matches!(
                     agent.poll_event(),
@@ -3660,13 +3925,13 @@ mod tests {
                 &[],
             );
             if index == 0 {
-                let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap()
+                let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap()
                 else {
                     panic!("IPv4 request admitted");
                 };
                 agent.send_stream_result(token, Ok(()), Now::from_millis(0));
                 let _ = agent.poll_event();
-                let _ = agent.poll_action();
+                let _ = io_action(&mut agent);
             } else {
                 assert!(matches!(
                     agent.poll_event(),
@@ -3790,7 +4055,7 @@ mod tests {
             );
             if stream_id <= 3 {
                 assert!(matches!(
-                    agent.poll_action(),
+                    io_action(&mut agent),
                     Some(RelayServerAction::OpenStream { .. })
                 ));
             } else {
@@ -3890,7 +4155,7 @@ mod tests {
                 false,
                 Now::from_millis(1),
             );
-            let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+            let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap() else {
                 panic!("unlimited forwarding");
             };
             agent.send_stream_result(token, Ok(()), Now::from_millis(1));
@@ -3953,7 +4218,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            agent.poll_action(),
+            io_action(&mut agent),
             Some(RelayServerAction::SendStream { .. })
         ));
     }
@@ -3965,13 +4230,13 @@ mod tests {
 
         agent.send_stream_result(
             token,
-            Err("source queue failed".into()),
+            Err(RelayServerSendError::Failed("source queue failed".into())),
             Now::from_millis(0),
         );
 
         assert!(!agent.owns_stream(source_stream));
         assert!(!agent.owns_stream(stop_stream));
-        let reset_streams: Vec<_> = core::iter::from_fn(|| agent.poll_action())
+        let reset_streams: Vec<_> = core::iter::from_fn(|| io_action(&mut agent))
             .filter_map(|action| match action {
                 RelayServerAction::ResetStream { stream, .. } => Some(stream),
                 _ => None,
@@ -4013,13 +4278,13 @@ mod tests {
             false,
             Now::from_millis(1),
         );
-        let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+        let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap() else {
             panic!("HOP success");
         };
         agent.send_stream_result(token, Ok(()), Now::from_millis(1));
         let _ = agent.poll_event();
         assert!(matches!(
-            agent.poll_action(),
+            io_action(&mut agent),
             Some(RelayServerAction::SendStream { stream, data, .. })
                 if stream == stop_stream && data[..] == b"during-stop-rtt"[..]
         ));
@@ -4077,10 +4342,10 @@ mod tests {
         assert!(!agent.owns_stream(source_stream));
         assert!(!agent.owns_stream(stop_stream));
         assert!(matches!(
-            agent.poll_action(),
+            io_action(&mut agent),
             Some(RelayServerAction::ResetStream { stream, .. }) if stream == stop_stream
         ));
-        assert_eq!(agent.poll_action(), None);
+        assert_eq!(io_action(&mut agent), None);
         assert_eq!(agent.poll_event(), None, "no uncommitted lifecycle");
     }
 
@@ -4105,7 +4370,7 @@ mod tests {
             Some(RelayServerEvent::CircuitOpened { .. })
         ));
         assert!(matches!(
-            agent.poll_action(),
+            io_action(&mut agent),
             Some(RelayServerAction::CloseStreamWrite { stream, .. }) if stream == stop_stream
         ));
     }
@@ -4131,7 +4396,7 @@ mod tests {
             Some(RelayServerEvent::CircuitOpened { .. })
         ));
         assert!(matches!(
-            agent.poll_action(),
+            io_action(&mut agent),
             Some(RelayServerAction::CloseStreamWrite { stream, .. }) if stream == source_stream
         ));
     }
@@ -4161,45 +4426,51 @@ mod tests {
                 Now::from_millis(1),
             );
         }
+        let buffered = actions(&mut agent);
+        assert_eq!(
+            acked(&buffered, source_stream),
+            0,
+            "pre-commit payload waits to be forwarded"
+        );
         agent.send_stream_result(token, Ok(()), Now::from_millis(1));
         assert!(matches!(
             agent.poll_event(),
             Some(RelayServerEvent::CircuitOpened { .. })
         ));
 
-        let mut forward = None;
-        let mut closes = Vec::new();
-        while let Some(action) = agent.poll_action() {
-            match action {
-                RelayServerAction::SendStream {
-                    token,
-                    stream,
-                    data,
-                    ..
-                } => {
-                    assert_eq!(stream, stop_stream);
-                    assert_eq!(&data[..], b"buffered");
-                    forward = Some(token);
-                }
-                RelayServerAction::CloseStreamWrite { token, stream, .. } => {
-                    closes.push((token, stream));
-                }
-                action => panic!("unexpected action: {action:?}"),
-            }
-        }
-        assert!(closes.iter().any(|(_, stream)| *stream == source_stream));
-        assert!(closes.iter().any(|(_, stream)| *stream == stop_stream));
-        assert_eq!(agent.poll_event(), None, "payload remains in flight");
+        // The destination's FIN waits behind the buffered payload; the
+        // source's goes at once.
+        let committed = actions(&mut agent);
+        let forward = sent(&committed, stop_stream, b"buffered");
+        let close_tokens = |actions: &[RelayServerAction]| -> Vec<_> {
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    RelayServerAction::CloseStreamWrite { token, stream, .. } => {
+                        Some((*token, *stream))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let source_close = close_tokens(&committed);
+        assert_eq!(source_close.len(), 1, "{committed:?}");
+        assert_eq!(source_close[0].1, source_stream);
 
-        agent.send_stream_result(forward.unwrap(), Ok(()), Now::from_millis(1));
-        assert_eq!(agent.poll_event(), None, "half closes remain in flight");
-        let close_count = closes.len();
-        for (index, (token, _)) in closes.into_iter().enumerate() {
-            agent.close_stream_write_result(token, Ok(()), Now::from_millis(1));
-            if index + 1 != close_count {
-                assert_eq!(agent.poll_event(), None, "one half close remains in flight");
-            }
-        }
+        agent.send_stream_result(forward, Ok(()), Now::from_millis(1));
+        let drained = actions(&mut agent);
+        let destination_close = close_tokens(&drained);
+        assert_eq!(destination_close.len(), 1, "{drained:?}");
+        assert_eq!(destination_close[0].1, stop_stream);
+        assert_eq!(
+            acked(&drained, source_stream),
+            8,
+            "acknowledged once forwarded"
+        );
+
+        agent.close_stream_write_result(source_close[0].0, Ok(()), Now::from_millis(1));
+        assert_eq!(agent.poll_event(), None, "one half close remains in flight");
+        agent.close_stream_write_result(destination_close[0].0, Ok(()), Now::from_millis(1));
         assert!(matches!(
             agent.poll_event(),
             Some(RelayServerEvent::CircuitClosed {
@@ -4230,7 +4501,8 @@ mod tests {
         }
         agent.send_stream_result(token, Ok(()), Now::from_millis(1));
         let _ = agent.poll_event();
-        let RelayServerAction::CloseStreamWrite { token, .. } = agent.poll_action().unwrap() else {
+        let RelayServerAction::CloseStreamWrite { token, .. } = io_action(&mut agent).unwrap()
+        else {
             panic!("first propagated half close");
         };
 
@@ -4276,7 +4548,7 @@ mod tests {
             assert_eq!(agent.circuit_count(), 0, "{leg:?}");
             assert!(
                 matches!(
-                    agent.poll_action(),
+                    io_action(&mut agent),
                     Some(RelayServerAction::ResetStream { stream, .. }) if stream == other_stream
                 ),
                 "{leg:?}: the surviving leg's stream is reset"
@@ -4314,7 +4586,7 @@ mod tests {
                 ..
             })
         ));
-        let actions: Vec<_> = core::iter::from_fn(|| agent.poll_action()).collect();
+        let actions: Vec<_> = core::iter::from_fn(|| io_action(&mut agent)).collect();
         assert!(
             actions.iter().any(|action| matches!(
                 action,
@@ -4327,37 +4599,493 @@ mod tests {
         assert!(!agent.owns_stream(stop_stream));
     }
 
+    fn data(peer_id: &PeerId, stream: StreamKey, data: &'static [u8]) -> SwarmEvent {
+        SwarmEvent::StreamData {
+            peer_id: peer_id.clone(),
+            conn_id: stream.conn_id,
+            stream_id: stream.stream_id,
+            data: Bytes::from_static(data),
+        }
+    }
+
+    fn writable(peer_id: &PeerId, stream: StreamKey) -> SwarmEvent {
+        SwarmEvent::StreamWritable {
+            peer_id: peer_id.clone(),
+            conn_id: stream.conn_id,
+            stream_id: stream.stream_id,
+        }
+    }
+
+    fn actions(agent: &mut RelayServerAgent) -> Vec<RelayServerAction> {
+        core::iter::from_fn(|| agent.poll_action()).collect()
+    }
+
+    /// The token of the only send in `actions`, after checking its target
+    /// and bytes.
+    fn sent(actions: &[RelayServerAction], to: StreamKey, bytes: &[u8]) -> RelayServerToken {
+        let sends: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                RelayServerAction::SendStream {
+                    token,
+                    stream,
+                    data,
+                    ..
+                } => Some((*token, *stream, data.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sends.len(), 1, "one send: {actions:?}");
+        assert_eq!((sends[0].1, &sends[0].2[..]), (to, bytes), "{actions:?}");
+        sends[0].0
+    }
+
+    fn acked(actions: &[RelayServerAction], stream: StreamKey) -> usize {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                RelayServerAction::AckStream { stream: s, bytes } if *s == stream => Some(*bytes),
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn full(unsent: &'static [u8]) -> Result<(), RelayServerSendError> {
+        Err(RelayServerSendError::Full {
+            unsent: Bytes::from_static(unsent),
+        })
+    }
+
     #[test]
-    fn a_second_same_direction_send_before_echo_fails_boundedly() {
-        let (mut agent, source, _, source_stream, _) =
+    fn a_full_destination_pauses_the_source_until_writable() {
+        let (mut agent, source, destination, source_stream, stop_stream) =
             connected_circuit(RelayServerConfig::default(), 0);
-        for data in [b"first".as_slice(), b"second".as_slice()] {
+        let now = Now::from_millis(1);
+        agent.handle_event(&data(&source, source_stream, b"abcdef"), false, now);
+        let first = actions(&mut agent);
+        assert_eq!(acked(&first, source_stream), 0, "nothing accepted yet");
+        let token = sent(&first, stop_stream, b"abcdef");
+
+        // The destination takes three bytes: only those are acknowledged,
+        // so the source's credit stays withheld for the rest.
+        agent.send_stream_result(token, full(b"def"), now);
+        let paused = actions(&mut agent);
+        assert_eq!(paused.len(), 1, "{paused:?}");
+        assert_eq!(acked(&paused, source_stream), 3);
+        assert_eq!(agent.poll_event(), None, "the circuit stays open");
+
+        // More source bytes queue behind the held tail.
+        agent.handle_event(&data(&source, source_stream, b"gh"), false, now);
+        assert_eq!(actions(&mut agent), Vec::new());
+
+        // The destination's Writable resumes forwarding, in order.
+        assert!(agent.handle_event(&writable(&destination, stop_stream), false, now));
+        let token = sent(&actions(&mut agent), stop_stream, b"def");
+        agent.send_stream_result(token, Ok(()), now);
+        let resumed = actions(&mut agent);
+        assert_eq!(acked(&resumed, source_stream), 3);
+        let token = sent(&resumed, stop_stream, b"gh");
+        agent.send_stream_result(token, Ok(()), now);
+        assert_eq!(acked(&actions(&mut agent), source_stream), 2);
+        assert_eq!(agent.poll_event(), None);
+    }
+
+    #[test]
+    fn a_source_fin_follows_the_last_held_byte() {
+        let (mut agent, source, destination, source_stream, stop_stream) =
+            connected_circuit(RelayServerConfig::default(), 0);
+        let now = Now::from_millis(1);
+        agent.handle_event(&data(&source, source_stream, b"abcd"), false, now);
+        let token = sent(&actions(&mut agent), stop_stream, b"abcd");
+        agent.send_stream_result(token, full(b"cd"), now);
+        agent.handle_event(
+            &SwarmEvent::StreamRemoteWriteClosed {
+                peer_id: source.clone(),
+                conn_id: source_stream.conn_id,
+                stream_id: source_stream.stream_id,
+            },
+            false,
+            now,
+        );
+        assert!(
+            !actions(&mut agent)
+                .iter()
+                .any(|action| matches!(action, RelayServerAction::CloseStreamWrite { .. })),
+            "no FIN while bytes are held"
+        );
+
+        agent.handle_event(&writable(&destination, stop_stream), false, now);
+        let token = sent(&actions(&mut agent), stop_stream, b"cd");
+        agent.send_stream_result(token, Ok(()), now);
+        assert!(matches!(
+            &actions(&mut agent)[..],
+            [
+                RelayServerAction::AckStream { .. },
+                RelayServerAction::CloseStreamWrite { stream, .. },
+            ] if *stream == stop_stream
+        ));
+    }
+
+    #[test]
+    fn a_leg_that_closes_gracefully_keeps_the_other_direction_draining() {
+        let (mut agent, source, destination, source_stream, stop_stream) =
+            connected_circuit(RelayServerConfig::default(), 0);
+        let now = Now::from_millis(1);
+        let half_close =
+            |peer_id: &PeerId, stream: StreamKey| SwarmEvent::StreamRemoteWriteClosed {
+                peer_id: peer_id.clone(),
+                conn_id: stream.conn_id,
+                stream_id: stream.stream_id,
+            };
+        // The source finishes first; its FIN reaches the destination.
+        agent.handle_event(&half_close(&source, source_stream), false, now);
+        let Some(RelayServerAction::CloseStreamWrite { token, .. }) = io_action(&mut agent) else {
+            panic!("source FIN forwarded");
+        };
+        agent.close_stream_write_result(token, Ok(()), now);
+
+        // The destination answers, the source leg is full, then the
+        // destination finishes and its stream closes cleanly.
+        agent.handle_event(&data(&destination, stop_stream, b"reply"), false, now);
+        let token = sent(&actions(&mut agent), source_stream, b"reply");
+        agent.send_stream_result(token, full(b"ly"), now);
+        agent.handle_event(&half_close(&destination, stop_stream), false, now);
+        agent.handle_event(
+            &SwarmEvent::StreamClosed {
+                peer_id: destination,
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+            },
+            false,
+            now,
+        );
+        assert_eq!(agent.poll_event(), None, "the circuit stays open");
+        let closed = actions(&mut agent);
+        assert!(
+            !closed
+                .iter()
+                .any(|action| matches!(action, RelayServerAction::ResetStream { .. })),
+            "nothing is reset: {closed:?}"
+        );
+
+        // The held reply still reaches the source, then its FIN.
+        agent.handle_event(&writable(&source, source_stream), false, now);
+        let token = sent(&actions(&mut agent), source_stream, b"ly");
+        agent.send_stream_result(token, Ok(()), now);
+        let Some(RelayServerAction::CloseStreamWrite { token, stream, .. }) = io_action(&mut agent)
+        else {
+            panic!("destination FIN forwarded");
+        };
+        assert_eq!(stream, source_stream);
+        agent.close_stream_write_result(token, Ok(()), now);
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitClosed {
+                reason: CircuitCloseReason::Eof,
+                bytes: CircuitByteCounts {
+                    source_to_destination: 0,
+                    destination_to_source: 5,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn pipelined_payload_is_acknowledged_only_once_forwarded() {
+        let (mut agent, source, destination, source_stream, stop_stream) =
+            pending_stop(RelayServerConfig::default(), 0);
+        let now = Now::from_millis(1);
+        let _ = actions(&mut agent);
+        agent.handle_event(&data(&source, source_stream, b"abcd"), false, now);
+        assert_eq!(acked(&actions(&mut agent), source_stream), 0);
+
+        // The STOP response carries destination payload behind it: only the
+        // response itself is consumed now.
+        let status = encode_stop_status(Status::Ok).unwrap();
+        let mut response = status.clone();
+        response.extend_from_slice(b"xy");
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: destination.clone(),
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+                data: Bytes::from(response),
+            },
+            false,
+            now,
+        );
+        let accepted = actions(&mut agent);
+        assert_eq!(acked(&accepted, stop_stream), status.len());
+        let hop_success = sent(&accepted, source_stream, &accepted_hop_success(&accepted));
+        agent.send_stream_result(hop_success, Ok(()), now);
+        let _ = agent.poll_event();
+
+        // Both buffers are forwarded on commit and acknowledged as accepted.
+        let forwards = actions(&mut agent);
+        let to_destination = forwards.iter().find_map(|action| match action {
+            RelayServerAction::SendStream { token, stream, .. } if *stream == stop_stream => {
+                Some(*token)
+            }
+            _ => None,
+        });
+        let to_source = forwards.iter().find_map(|action| match action {
+            RelayServerAction::SendStream { token, stream, .. } if *stream == source_stream => {
+                Some(*token)
+            }
+            _ => None,
+        });
+        agent.send_stream_result(to_destination.unwrap(), full(b"cd"), now);
+        assert_eq!(acked(&actions(&mut agent), source_stream), 2);
+        agent.send_stream_result(to_source.unwrap(), Ok(()), now);
+        assert_eq!(acked(&actions(&mut agent), stop_stream), 2);
+    }
+
+    /// The bytes of the one HOP success send in `actions`.
+    fn accepted_hop_success(actions: &[RelayServerAction]) -> Vec<u8> {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                RelayServerAction::SendStream { data, .. } => Some(data.to_vec()),
+                _ => None,
+            })
+            .expect("HOP success")
+    }
+
+    #[test]
+    fn payload_coalesced_with_connect_is_acknowledged_only_once_forwarded() {
+        let config = RelayServerConfig::default();
+        let (mut agent, _, destination, source_stream, stop_stream) =
+            pending_stop_with_payload(config, 0, b"abcd");
+        let now = Now::from_millis(1);
+        // The CONNECT read acknowledged only its own frame.
+        let connect = encode_frame(
+            &HopMessage {
+                kind: HopMessageType::Connect,
+                peer: Some(Peer {
+                    id: destination.to_bytes(),
+                    addrs: Vec::new(),
+                }),
+                reservation: None,
+                limit: None,
+                status: None,
+            }
+            .encode(),
+        );
+        assert_eq!(acked(&actions(&mut agent), source_stream), connect.len());
+
+        let status = encode_stop_status(Status::Ok).unwrap();
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: destination,
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+                data: Bytes::from(status.clone()),
+            },
+            false,
+            now,
+        );
+        let accepted = actions(&mut agent);
+        assert_eq!(acked(&accepted, stop_stream), status.len());
+        assert_eq!(acked(&accepted, source_stream), 0);
+        let hop_success = sent(&accepted, source_stream, &accepted_hop_success(&accepted));
+        agent.send_stream_result(hop_success, Ok(()), now);
+        let token = sent(&actions(&mut agent), stop_stream, b"abcd");
+        agent.send_stream_result(token, full(b"cd"), now);
+        assert_eq!(acked(&actions(&mut agent), source_stream), 2);
+    }
+
+    #[test]
+    fn payload_held_with_connect_precedes_later_pipelined_reads() {
+        let (mut agent, source, destination, source_stream, stop_stream) =
+            pending_stop_with_payload(RelayServerConfig::default(), 0, b"ab");
+        let now = Now::from_millis(1);
+        let _ = actions(&mut agent);
+        agent.handle_event(&data(&source, source_stream, b"cd"), false, now);
+        let status = encode_stop_status(Status::Ok).unwrap();
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: destination,
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+                data: Bytes::from(status),
+            },
+            false,
+            now,
+        );
+        let accepted = actions(&mut agent);
+        let hop_success = sent(&accepted, source_stream, &accepted_hop_success(&accepted));
+        agent.send_stream_result(hop_success, Ok(()), now);
+        let token = sent(&actions(&mut agent), stop_stream, b"abcd");
+        agent.send_stream_result(token, Ok(()), now);
+        assert_eq!(acked(&actions(&mut agent), source_stream), 4);
+    }
+
+    #[test]
+    fn tiny_reads_to_a_paused_destination_are_coalesced_in_order() {
+        let (mut agent, source, destination, source_stream, stop_stream) =
+            connected_circuit(RelayServerConfig::default(), 0);
+        let now = Now::from_millis(1);
+        agent.handle_event(&data(&source, source_stream, b"\xff"), false, now);
+        let token = sent(&actions(&mut agent), stop_stream, b"\xff");
+        agent.send_stream_result(token, full(b"\xff"), now);
+        let _ = actions(&mut agent);
+
+        // One-byte reads while the destination is full cost one queue entry
+        // per coalesced run, not one per read.
+        let expected: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        for byte in &expected {
             agent.handle_event(
                 &SwarmEvent::StreamData {
                     peer_id: source.clone(),
                     conn_id: source_stream.conn_id,
                     stream_id: source_stream.stream_id,
-                    data: Bytes::from(data.to_vec()),
+                    data: Bytes::copy_from_slice(&[*byte]),
                 },
                 false,
-                Now::from_millis(1),
+                now,
             );
         }
+        assert!(actions(&mut agent).is_empty());
+        assert!(agent.circuits[&source_stream].to_destination.queue.len() <= 4);
 
+        // Resuming delivers every byte in order and acknowledges each once.
+        agent.handle_event(&writable(&destination, stop_stream), false, now);
+        let (mut delivered, mut acks) = (Vec::new(), 0);
+        let mut pending = actions(&mut agent);
+        while !pending.is_empty() {
+            acks += acked(&pending, source_stream);
+            let Some((token, data)) = pending.iter().find_map(|action| match action {
+                RelayServerAction::SendStream { token, data, .. } => Some((*token, data.clone())),
+                _ => None,
+            }) else {
+                break;
+            };
+            delivered.extend_from_slice(&data);
+            agent.send_stream_result(token, Ok(()), now);
+            pending = actions(&mut agent);
+        }
+        assert_eq!(delivered[0], 0xff);
+        assert_eq!(&delivered[1..], &expected[..]);
+        assert_eq!(acks, 1 + expected.len());
+        assert_eq!(agent.circuits[&source_stream].to_destination.unacked(), 0);
+    }
+
+    #[test]
+    fn a_failed_connect_releases_payload_held_with_the_connect() {
+        let (mut agent, _, destination, source_stream, stop_stream) =
+            pending_stop_with_payload(RelayServerConfig::default(), 0, b"abcd");
+        let _ = actions(&mut agent);
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: destination,
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+                data: Bytes::from(encode_stop_status(Status::PermissionDenied).unwrap()),
+            },
+            false,
+            Now::from_millis(1),
+        );
+        assert_eq!(acked(&actions(&mut agent), source_stream), 4);
+    }
+
+    #[test]
+    fn a_failed_connect_releases_the_credit_of_pipelined_payload() {
+        let (mut agent, source, destination, source_stream, stop_stream) =
+            pending_stop(RelayServerConfig::default(), 0);
+        let now = Now::from_millis(1);
+        let _ = actions(&mut agent);
+        agent.handle_event(&data(&source, source_stream, b"abcd"), false, now);
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: destination,
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+                data: Bytes::from(encode_stop_status(Status::PermissionDenied).unwrap()),
+            },
+            false,
+            now,
+        );
+        assert_eq!(acked(&actions(&mut agent), source_stream), 4);
+    }
+
+    #[test]
+    fn an_accepted_prefix_counts_toward_the_byte_limit() {
+        let config = RelayServerConfig {
+            max_circuit_bytes: 3,
+            ..RelayServerConfig::default()
+        };
+        let (mut agent, source, _, source_stream, stop_stream) = connected_circuit(config, 0);
+        let now = Now::from_millis(1);
+        agent.handle_event(&data(&source, source_stream, b"abcdef"), false, now);
+        let token = sent(&actions(&mut agent), stop_stream, b"abcdef");
+        agent.send_stream_result(token, full(b"ef"), now);
         assert!(matches!(
             agent.poll_event(),
             Some(RelayServerEvent::CircuitClosed {
-                reason: CircuitCloseReason::InternalFailure,
+                bytes: CircuitByteCounts {
+                    source_to_destination: 4,
+                    destination_to_source: 0,
+                },
+                reason: CircuitCloseReason::ByteLimit {
+                    direction: CircuitDirection::SourceToDestination,
+                },
                 ..
             })
         ));
+        let closed = actions(&mut agent);
+        let resets = closed
+            .iter()
+            .filter(|action| matches!(action, RelayServerAction::ResetStream { .. }))
+            .count();
+        assert_eq!(resets, 2, "both legs reset: {closed:?}");
+    }
+
+    #[test]
+    fn the_duration_limit_closes_a_paused_circuit() {
+        let config = RelayServerConfig {
+            max_circuit_duration_secs: 1,
+            ..RelayServerConfig::default()
+        };
+        let (mut agent, source, _, source_stream, stop_stream) = connected_circuit(config, 0);
+        let now = Now::from_millis(1);
+        agent.handle_event(&data(&source, source_stream, b"abcd"), false, now);
+        let token = sent(&actions(&mut agent), stop_stream, b"abcd");
+        agent.send_stream_result(token, full(b"abcd"), now);
+
+        agent.handle_tick(Now::from_millis(1_000));
         assert!(matches!(
             agent.poll_event(),
-            Some(RelayServerEvent::Error(RelayServerRuntimeError {
-                kind: RelayServerRuntimeErrorKind::InternalInvariant,
+            Some(RelayServerEvent::CircuitClosed {
+                reason: CircuitCloseReason::DurationLimit,
                 ..
-            }))
+            })
         ));
+    }
+
+    #[test]
+    fn closing_releases_the_credit_of_bytes_never_forwarded() {
+        let (mut agent, source, _, source_stream, stop_stream) =
+            connected_circuit(RelayServerConfig::default(), 0);
+        let now = Now::from_millis(1);
+        agent.handle_event(&data(&source, source_stream, b"abcd"), false, now);
+        let token = sent(&actions(&mut agent), stop_stream, b"abcd");
+        agent.send_stream_result(token, full(b"cd"), now);
+        agent.handle_event(&data(&source, source_stream, b"ef"), false, now);
+        assert_eq!(acked(&actions(&mut agent), source_stream), 2);
+
+        // The source resets: its stream is not reset by the relay, so it
+        // stays unsettled until the four held bytes are acknowledged.
+        agent.handle_event(
+            &SwarmEvent::StreamClosed {
+                peer_id: source,
+                conn_id: source_stream.conn_id,
+                stream_id: source_stream.stream_id,
+            },
+            false,
+            now,
+        );
+        assert_eq!(acked(&actions(&mut agent), source_stream), 4);
     }
 
     #[test]
@@ -4373,7 +5101,8 @@ mod tests {
             false,
             Now::from_millis(1),
         );
-        let RelayServerAction::CloseStreamWrite { token, .. } = agent.poll_action().unwrap() else {
+        let RelayServerAction::CloseStreamWrite { token, .. } = io_action(&mut agent).unwrap()
+        else {
             panic!("half close action");
         };
 
@@ -4422,10 +5151,10 @@ mod tests {
         };
         reserve(agent, peer, stream(1));
         feed_hop(agent, peer, stream(2), reserve_request(), &[]);
-        let Some(RelayServerAction::SendStream { token, .. }) = agent.poll_action() else {
+        let Some(RelayServerAction::SendStream { token, .. }) = io_action(agent) else {
             panic!("renewal response");
         };
-        while agent.poll_action().is_some() {}
+        while io_action(agent).is_some() {}
         agent.handle_tick(Now::from_millis(1_000));
         token
     }
@@ -4467,7 +5196,11 @@ mod tests {
         let peer = PeerId::from_public_key_protobuf(b"client-renewal-failed");
         let token = renew_past_deadline(&mut agent, &peer, ConnectionId::new(352));
 
-        agent.send_stream_result(token, Err("stream reset".into()), Now::from_millis(1_000));
+        agent.send_stream_result(
+            token,
+            Err(RelayServerSendError::Failed("stream reset".into())),
+            Now::from_millis(1_000),
+        );
         while agent.poll_event().is_some() {}
         agent.handle_tick(Now::from_millis(1_001));
         assert!(matches!(

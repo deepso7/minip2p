@@ -31,7 +31,7 @@ pub enum RelayServerAction {
         /// Multistream-select protocol id to negotiate.
         protocol_id: String,
     },
-    /// Queue a complete byte chunk on a stream.
+    /// Queue a byte chunk on a stream.
     SendStream {
         /// Correlation token echoed to `send_stream_result`.
         token: RelayServerToken,
@@ -39,8 +39,22 @@ pub enum RelayServerAction {
         peer_id: PeerId,
         /// Exact destination stream.
         stream: StreamKey,
-        /// Complete chunk whose acceptance is reported atomically.
+        /// Chunk to queue; report a partial write as
+        /// [`RelayServerSendError::Full`] with the unsent tail.
         data: Bytes,
+    },
+    /// Acknowledge `bytes` of a stream's delivered data as consumed, which
+    /// returns receive credit to its sender (ADR 0012). Untokenized: no
+    /// result is echoed.
+    ///
+    /// The relay acknowledges control messages as it reads them and circuit
+    /// payload only once the other leg accepts it, so a full leg pauses its
+    /// sender. The host must not acknowledge claimed data itself.
+    AckStream {
+        /// Exact stream whose data was consumed.
+        stream: StreamKey,
+        /// Bytes consumed.
+        bytes: usize,
     },
     /// Half-close the local write side.
     CloseStreamWrite {
@@ -60,6 +74,21 @@ pub enum RelayServerAction {
         /// Exact stream to reset.
         stream: StreamKey,
     },
+}
+
+/// Why a [`RelayServerAction::SendStream`] did not queue every byte.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RelayServerSendError {
+    /// The stream queued a prefix and refused `unsent`, the rest (the whole
+    /// chunk when nothing fit). Retryable, never a fault (ADR 0012): the
+    /// relay holds the tail and resends it on the stream's
+    /// `SwarmEvent::StreamWritable`.
+    Full {
+        /// Exact unsent suffix of the chunk.
+        unsent: Bytes,
+    },
+    /// The transport rejected the send.
+    Failed(String),
 }
 
 /// Exactly-once terminal reason for a committed reservation.
@@ -106,7 +135,7 @@ pub struct CircuitByteCounts {
 pub enum CircuitCloseReason {
     /// Both directions reached EOF after half-close propagation.
     Eof,
-    /// A successfully accepted full chunk crossed a directional limit.
+    /// Accepted bytes crossed a directional limit.
     ByteLimit {
         /// Direction whose accepted total crossed the limit.
         direction: CircuitDirection,
@@ -118,7 +147,8 @@ pub enum CircuitCloseReason {
         /// Leg which reset.
         leg: CircuitLeg,
     },
-    /// The destination transport rejected a forwarding chunk.
+    /// The destination transport rejected a forwarding chunk. A Full is
+    /// backpressure, not a rejection: it pauses the direction instead.
     ForwardFailed {
         /// Direction whose destination rejected the chunk.
         direction: CircuitDirection,
