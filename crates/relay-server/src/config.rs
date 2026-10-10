@@ -22,7 +22,9 @@ pub struct RelayServerConfig {
     pub max_circuit_duration_secs: u64,
     /// Accepted application bytes allowed per direction; zero is unlimited.
     pub max_circuit_bytes: u64,
-    /// Post-negotiation inbound HOP workers allowed per connection.
+    /// Post-negotiation inbound HOP workers allowed per connection,
+    /// excluding the legs of a pending or committed circuit. A worker whose
+    /// exchange has finished holds its slot until the peer closes the stream.
     pub max_pending_hop_requests_per_connection: usize,
     /// Post-negotiation outbound STOP workers allowed per connection.
     pub max_pending_stop_requests_per_connection: usize,

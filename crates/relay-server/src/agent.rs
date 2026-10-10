@@ -1210,11 +1210,20 @@ impl RelayServerAgent {
             return;
         }
         let is_circuit = is_circuit || connection.is_circuit;
+        // Every HOP worker on the connection holds a slot, not only the ones
+        // still waiting on a reply. A finished worker stays to claim its
+        // stream's events until the peer closes the stream, so counting only
+        // the waiting ones would let a peer that never closes open one HOP
+        // stream per muxer slot, on every connection it holds. Circuit legs
+        // keep their worker too, and are bounded by `max_circuits` and
+        // `max_circuits_per_peer` instead.
         let count = self
             .hop_workers
-            .iter()
-            .filter(|(stream, worker)| {
-                stream.conn_id == key.conn_id && worker.deadline_ms.is_some()
+            .keys()
+            .filter(|stream| {
+                stream.conn_id == key.conn_id
+                    && !self.circuits.contains_key(stream)
+                    && !self.pending_circuits.contains_key(stream)
             })
             .count();
         if count >= self.config.max_pending_hop_requests_per_connection {
@@ -3468,6 +3477,61 @@ mod tests {
             })
         ));
         assert_eq!(agent.reservation_count(), 0);
+    }
+
+    #[test]
+    fn finished_hop_streams_left_open_still_count_against_the_connection_cap() {
+        let local = PeerId::from_public_key_protobuf(b"relay-hop-leak");
+        let remote = PeerId::from_public_key_protobuf(b"client-hop-leak");
+        let conn_id = ConnectionId::new(39);
+        let config = RelayServerConfig {
+            max_pending_hop_requests_per_connection: 2,
+            ..RelayServerConfig::default()
+        };
+        let mut agent = RelayServerAgent::new(local, config).unwrap();
+        establish(&mut agent, &remote, conn_id);
+
+        // Two HOP exchanges run to completion, and the peer never closes
+        // either stream, so both workers stay to claim their streams' events.
+        for stream_id in [1u64, 2] {
+            let stream = StreamKey {
+                conn_id,
+                stream_id: StreamId::new(stream_id),
+            };
+            feed_hop(&mut agent, &remote, stream, reserve_request(), &[]);
+            let Some(RelayServerAction::SendStream { token, .. }) = io_action(&mut agent) else {
+                panic!("reservation response");
+            };
+            agent.send_stream_result(token, Ok(()), Now::from_millis(0));
+            let _ = agent.poll_event();
+            if let Some(RelayServerAction::CloseStreamWrite { token, .. }) = io_action(&mut agent) {
+                agent.close_stream_write_result(token, Ok(()), Now::from_millis(0));
+            }
+            assert!(agent.owns_stream(stream));
+        }
+
+        // A third must be refused. Counting only the workers still waiting on
+        // a reply would let a peer that never closes its streams open one per
+        // muxer slot, on every connection it holds.
+        let third = StreamKey {
+            conn_id,
+            stream_id: StreamId::new(3),
+        };
+        assert!(agent.handle_event(
+            &SwarmEvent::StreamReady {
+                peer_id: remote.clone(),
+                conn_id,
+                stream_id: third.stream_id,
+                protocol_id: HOP_PROTOCOL_ID.into(),
+                initiated_locally: false,
+            },
+            false,
+            Now::from_millis(0),
+        ));
+        assert!(matches!(
+            io_action(&mut agent),
+            Some(RelayServerAction::ResetStream { .. })
+        ));
     }
 
     #[test]
