@@ -55,8 +55,20 @@ pub struct P2pEndpoint {
     listen_addrs: Vec<String>,
 }
 
+/// How long an interrupted driver sleeps, once pending commands clear, before
+/// checking for further commands. See [`Shared::wait_for_commands`].
+const COMMAND_LINGER: Duration = Duration::from_micros(50);
+/// Lingering budget for an interrupted driver, counted from entering
+/// [`Shared::wait_for_commands`], so a steady stream of calls cannot starve
+/// it: once spent, it retakes `state` as soon as pending commands clear.
+const MAX_COMMAND_LINGER: Duration = Duration::from_millis(1);
+
 pub(crate) struct Shared {
     state: Mutex<EndpointState>,
+    /// Converted events awaiting `drain_events`. Locked apart from `state`,
+    /// which the driver holds across its wait, so draining neither waits for
+    /// nor interrupts the driver. Lock order: `state`, then `events`.
+    events: Mutex<crate::driver::EventState>,
     /// Latched once the lifecycle reaches `Stopped`. `wait_stopped` sleeps on
     /// this rather than on `state`, which the driver holds for as long as the
     /// endpoint has nothing due.
@@ -64,6 +76,13 @@ pub(crate) struct Shared {
     stopped_cv: Condvar,
     wait_handle: WaitHandle,
     pub(crate) pending_commands: AtomicUsize,
+    /// Commands ever started; the lingering driver watches it for a burst.
+    commands_started: AtomicUsize,
+    /// Set while an interrupted driver waits on `commands_idle_cv` for
+    /// `pending_commands` to reach zero, so only then do commands notify.
+    driver_waiting: AtomicBool,
+    commands_idle: Mutex<()>,
+    commands_idle_cv: Condvar,
     pub(crate) driver_running: AtomicBool,
     doorbell_running: AtomicBool,
 }
@@ -73,9 +92,6 @@ pub(crate) struct EndpointState {
     pub(crate) endpoint: Option<Endpoint>,
     pub(crate) driver_thread_id: Option<std::thread::ThreadId>,
     doorbell_thread_id: Option<std::thread::ThreadId>,
-    pub(crate) carry: crate::driver::Carry,
-    pub(crate) overflow: crate::driver::OverflowDiagnostic,
-    pub(crate) stats: DriverStats,
     /// Unsent tails of the bindings' stream writes.
     pub(crate) writes: crate::writes::PendingWrites,
 }
@@ -222,15 +238,17 @@ impl P2pEndpoint {
                     endpoint: Some(endpoint),
                     driver_thread_id: None,
                     doorbell_thread_id: None,
-                    carry: crate::driver::Carry::default(),
-                    overflow: crate::driver::OverflowDiagnostic::default(),
-                    stats: DriverStats::default(),
                     writes: crate::writes::PendingWrites::default(),
                 }),
+                events: Mutex::default(),
                 stopped: Mutex::new(false),
                 stopped_cv: Condvar::new(),
                 wait_handle,
                 pending_commands: AtomicUsize::new(0),
+                commands_started: AtomicUsize::new(0),
+                driver_waiting: AtomicBool::new(false),
+                commands_idle: Mutex::new(()),
+                commands_idle_cv: Condvar::new(),
                 driver_running: AtomicBool::new(false),
                 doorbell_running: AtomicBool::new(false),
             }),
@@ -318,14 +336,12 @@ impl P2pEndpoint {
         if limit == 0 {
             return Vec::new();
         }
-        let _pending = PendingCommand::new(&self.shared);
-        let mut state = self.shared.lock_state();
-        let EndpointState {
+        let mut events = self.shared.lock_events();
+        let crate::driver::EventState {
             carry,
             overflow,
             stats,
-            ..
-        } = &mut *state;
+        } = &mut *events;
         let mut delivery = crate::driver::take_delivery(carry, overflow, stats, limit as usize);
         stats.dispatch_attempted = stats
             .dispatch_attempted
@@ -786,8 +802,7 @@ impl P2pEndpoint {
     ///
     /// This method is intentionally outside the UniFFI export block.
     pub fn driver_stats(&self) -> DriverStats {
-        let _pending = PendingCommand::new(&self.shared);
-        self.shared.lock_state().stats
+        self.shared.lock_events().stats
     }
 
     fn with_endpoint<T>(&self, operation: impl FnOnce(&Endpoint) -> T) -> Result<T, FfiError> {
@@ -833,6 +848,55 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    pub(crate) fn lock_events(&self) -> MutexGuard<'_, crate::driver::EventState> {
+        self.events.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Holds an interrupted driver back until no caller is waiting for
+    /// `state`. Without it the driver could retake `state` first and park
+    /// again in a wait whose interrupt was already spent.
+    ///
+    /// After pending commands clear it sleeps for [`COMMAND_LINGER`] before
+    /// checking for further commands, unless the [`MAX_COMMAND_LINGER`]
+    /// budget has already elapsed, and repeats while commands keep starting:
+    /// a burst of synchronous calls then runs without the driver retaking
+    /// `state` between each. The budget starts on entry; pending-command
+    /// waits and sleep granularity can exceed it. Measured with the Node FFI
+    /// benches, this beats a fixed 1 ms sleep, which stalls the driver after
+    /// every write or read acknowledgement, waking per command, which
+    /// contends with bursts, and skipping the sleep after an isolated
+    /// command, which on slow hosts lets the driver retake `state` between
+    /// every synchronous call.
+    pub(crate) fn wait_for_commands(&self) {
+        let linger_until = Instant::now() + MAX_COMMAND_LINGER;
+        loop {
+            {
+                let mut idle = self
+                    .commands_idle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                self.driver_waiting.store(true, Ordering::SeqCst);
+                while self.pending_commands.load(Ordering::SeqCst) != 0 {
+                    idle = self
+                        .commands_idle_cv
+                        .wait(idle)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                self.driver_waiting.store(false, Ordering::SeqCst);
+            }
+            if Instant::now() >= linger_until {
+                return;
+            }
+            let started = self.commands_started.load(Ordering::Acquire);
+            std::thread::sleep(COMMAND_LINGER);
+            if self.commands_started.load(Ordering::Acquire) == started
+                && self.pending_commands.load(Ordering::SeqCst) == 0
+            {
+                return;
+            }
+        }
+    }
+
     fn lock_stopped(&self) -> MutexGuard<'_, bool> {
         self.stopped.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -863,7 +927,8 @@ struct PendingCommand<'a> {
 
 impl<'a> PendingCommand<'a> {
     fn new(shared: &'a Shared) -> Self {
-        shared.pending_commands.fetch_add(1, Ordering::AcqRel);
+        shared.commands_started.fetch_add(1, Ordering::AcqRel);
+        shared.pending_commands.fetch_add(1, Ordering::SeqCst);
         shared.wait_handle.interrupt();
         Self { shared }
     }
@@ -871,7 +936,20 @@ impl<'a> PendingCommand<'a> {
 
 impl Drop for PendingCommand<'_> {
     fn drop(&mut self) {
-        self.shared.pending_commands.fetch_sub(1, Ordering::AcqRel);
+        // SeqCst pairs with `wait_for_commands`: either the driver sees this
+        // decrement before waiting, or this sees it waiting and notifies.
+        if self.shared.pending_commands.fetch_sub(1, Ordering::SeqCst) == 1
+            && self.shared.driver_waiting.load(Ordering::SeqCst)
+        {
+            // Taken so the notify cannot fall between the driver's check
+            // and its wait.
+            let _idle = self
+                .shared
+                .commands_idle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.shared.commands_idle_cv.notify_all();
+        }
     }
 }
 
@@ -1050,11 +1128,11 @@ mod tests {
     fn drain_is_bounded_and_preserves_order() {
         let endpoint = endpoint(config()).expect("endpoint");
         {
-            let mut state = endpoint.shared.lock_state();
-            state.carry.push(P2pEvent::PingTimeout {
+            let mut events = endpoint.shared.lock_events();
+            events.carry.push(P2pEvent::PingTimeout {
                 peer_id: "a".into(),
             });
-            state.carry.push(P2pEvent::PingTimeout {
+            events.carry.push(P2pEvent::PingTimeout {
                 peer_id: "b".into(),
             });
         }
@@ -1073,6 +1151,55 @@ mod tests {
         );
         assert!(endpoint.drain_events(1).is_empty());
         assert!(endpoint.drain_events(u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn an_interrupted_driver_resumes_once_commands_end() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        let pending = PendingCommand::new(&endpoint.shared);
+        let shared = Arc::clone(&endpoint.shared);
+        let (resumed_tx, resumed_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            shared.wait_for_commands();
+            resumed_tx.send(()).expect("signal resume");
+        });
+        assert!(
+            resumed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "held back while a command is pending"
+        );
+        drop(pending);
+        resumed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("resumes after the last command ends");
+    }
+
+    #[test]
+    fn draining_neither_waits_for_nor_interrupts_the_driver() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        let ping = P2pEvent::PingTimeout {
+            peer_id: "a".into(),
+        };
+        endpoint.shared.lock_events().carry.push(ping.clone());
+        // A driver parked in `wait` holds the state lock.
+        let mut parked = endpoint.shared.lock_state();
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let drainer = Arc::clone(&endpoint);
+        std::thread::spawn(move || drained_tx.send(drainer.drain_events(8)));
+        assert_eq!(
+            drained_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(vec![ping]),
+            "drain completes while the driver holds the state lock"
+        );
+        let outcome = parked
+            .endpoint
+            .as_mut()
+            .expect("endpoint")
+            .wait(Duration::from_millis(20))
+            .expect("wait");
+        assert!(
+            !matches!(outcome, minip2p::EndpointWaitOutcome::Interrupted),
+            "drain latched no interrupt"
+        );
     }
 
     #[test]

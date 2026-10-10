@@ -79,7 +79,7 @@ GUNGRAUN_NAMES = {
     "relay_1k_reserve_new_peer": "relay_server_1k/reserve_new_peer",
     "relay_1k_close_connection_100_circuits": "relay_server_1k/close_connection_100_circuits",
 }
-EXPECTED_VITEST = {"sdk_drain_flood", "raw_drain_events", "connected_peers_sync"}
+EXPECTED_VITEST = {"sdk_drain_flood", "sdk_stream_transfer", "raw_drain_events", "connected_peers_sync"}
 # Rows a bench measures itself (for example throughput or allocations), keyed by
 # (tier, name, metric). Each such bench writes a JSON array of rows into the
 # `custom` collector's root; list every row it emits here.

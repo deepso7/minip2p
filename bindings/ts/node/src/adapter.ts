@@ -338,10 +338,9 @@ function stringProperty(value: unknown, key: string): string | undefined {
   return typeof property === "string" ? property : undefined;
 }
 
+/** A view napi-rs can read; the addon copies it before the call returns. */
 function toUint8Array(value: Bytes): Uint8Array {
-  return value instanceof Uint8Array
-    ? Uint8Array.from(value)
-    : new Uint8Array(value);
+  return value instanceof Uint8Array ? value : new Uint8Array(value);
 }
 
 /** Converts an Identify snapshot, copying its public key into an `ArrayBuffer`. */
@@ -442,35 +441,87 @@ function normalizeNativeValue(
 }
 
 /**
- * Converts one native event to its SDK backend form. Identify snapshots go
- * through the typed {@link identifyInfo}; every other event shares the
- * generic integer, ID and byte conversion.
+ * Converts one native event to its SDK backend form, then retires the IDs it
+ * ends.
  */
 function normalizeEvent(
   event: NativeEvent,
   connectionIds: ConnectionIdMap,
   streamIds: StreamIdMap
 ): P2pEvent {
-  // Outside Identify, the addon's serde shape is the SDK shape with napi-rs
-  // integers and buffers (see `native-shape.ts`), which the walk converts.
-  const normalized: P2pEvent =
-    event.tag === P2pEvent_Tags.IdentifyReceived
-      ? {
-          inner: {
-            info: identifyInfo(event.inner.info),
-            peerId: event.inner.peerId,
-          },
-          tag: event.tag,
-        }
-      : ({
-          inner: normalizeNativeValue(event.inner, {
-            connectionIds,
-            streamIds,
-          }),
-          tag: event.tag,
-        } as P2pEvent);
+  const normalized = convertEvent(event, { connectionIds, streamIds });
   retireTerminalIds(normalized, connectionIds, streamIds);
   return normalized;
+}
+
+/**
+ * Per-chunk and per-write events, and pubsub messages, convert field by
+ * field. Identify snapshots go through the typed {@link identifyInfo}. The
+ * rest share the generic walk: the addon's serde shape is the SDK shape with
+ * napi-rs integers and buffers (see `native-shape.ts`).
+ */
+function convertEvent(event: NativeEvent, maps: NativeIdMaps): P2pEvent {
+  switch (event.tag) {
+    case P2pEvent_Tags.StreamData: {
+      return {
+        inner: {
+          ...streamRef(event.inner, maps),
+          data: toArrayBuffer(event.inner.data),
+        },
+        tag: event.tag,
+      };
+    }
+    case P2pEvent_Tags.StreamWriteAccepted:
+    case P2pEvent_Tags.StreamRemoteWriteClosed:
+    case P2pEvent_Tags.StreamClosed: {
+      return { inner: streamRef(event.inner, maps), tag: event.tag };
+    }
+    case P2pEvent_Tags.Message: {
+      const { data, fromPeerId, seqno, signed, topics } = event.inner;
+      return {
+        inner: {
+          data: toArrayBuffer(data),
+          fromPeerId,
+          seqno: toArrayBuffer(seqno),
+          signed,
+          topics,
+        },
+        tag: event.tag,
+      };
+    }
+    case P2pEvent_Tags.IdentifyReceived: {
+      return {
+        inner: {
+          info: identifyInfo(event.inner.info),
+          peerId: event.inner.peerId,
+        },
+        tag: event.tag,
+      };
+    }
+    default: {
+      return {
+        inner: normalizeNativeValue(event.inner, maps),
+        tag: event.tag,
+      } as P2pEvent;
+    }
+  }
+}
+
+/** The public identity of the stream a native stream event names. */
+function streamRef(
+  inner: {
+    readonly peerId: string;
+    readonly connId: number | bigint;
+    readonly streamId: number | bigint;
+  },
+  maps: NativeIdMaps
+): { peerId: string; connId: number; streamId: number } {
+  const connId = maps.connectionIds.toPublic(BigInt(inner.connId));
+  return {
+    connId,
+    peerId: inner.peerId,
+    streamId: maps.streamIds.toPublic(connId, BigInt(inner.streamId)),
+  };
 }
 
 /**
@@ -543,23 +594,28 @@ interface NativeIdMaps {
  * connection, so a closed or replaced connection frees every stream on it.
  */
 class StreamIdMap {
-  readonly #publicByKey = new Map<string, number>();
+  /** Live public IDs by public connection, then native stream ID. */
+  readonly #publicByNative = new Map<number, Map<bigint, number>>();
   readonly #streams = new Map<
     number,
-    { readonly connId: number; readonly key: string; readonly native: bigint }
+    { readonly connId: number; readonly native: bigint }
   >();
   #next = 1;
 
   toPublic(connId: number, native: bigint): number {
-    const key = `${connId}:${native}`;
-    const existing = this.#publicByKey.get(key);
+    let byNative = this.#publicByNative.get(connId);
+    const existing = byNative?.get(native);
     if (existing !== undefined) {
       return existing;
     }
+    if (byNative === undefined) {
+      byNative = new Map();
+      this.#publicByNative.set(connId, byNative);
+    }
     const publicId = this.#next;
     this.#next += 1;
-    this.#publicByKey.set(key, publicId);
-    this.#streams.set(publicId, { connId, key, native });
+    byNative.set(native, publicId);
+    this.#streams.set(publicId, { connId, native });
     return publicId;
   }
 
@@ -578,11 +634,15 @@ class StreamIdMap {
 
   retirePublic(publicId: number): void {
     const stream = this.#streams.get(publicId);
-    if (
-      stream !== undefined &&
-      this.#publicByKey.get(stream.key) === publicId
-    ) {
-      this.#publicByKey.delete(stream.key);
+    if (stream === undefined) {
+      return;
+    }
+    const byNative = this.#publicByNative.get(stream.connId);
+    if (byNative?.get(stream.native) === publicId) {
+      byNative.delete(stream.native);
+      if (byNative.size === 0) {
+        this.#publicByNative.delete(stream.connId);
+      }
     }
   }
 

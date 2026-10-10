@@ -49,6 +49,26 @@ pub(crate) struct OverflowDiagnostic {
     total: u64,
 }
 
+/// The carry with its drop accounting and stats, behind the endpoint's
+/// event lock.
+#[derive(Default)]
+pub(crate) struct EventState {
+    pub(crate) carry: Carry,
+    pub(crate) overflow: OverflowDiagnostic,
+    pub(crate) stats: DriverStats,
+}
+
+impl EventState {
+    /// Ingests one driver batch, returning whether the carry went from empty
+    /// to non-empty, which is when the doorbell rings.
+    fn ingest(&mut self, events: impl IntoIterator<Item = P2pEvent>) -> bool {
+        let was_empty = self.carry.is_empty();
+        ingest(events, &mut self.carry, &mut self.overflow, &mut self.stats);
+        self.stats.carry_high_water = self.stats.carry_high_water.max(self.carry.len());
+        was_empty && !self.carry.is_empty()
+    }
+}
+
 pub(crate) struct Delivery {
     pub(crate) diagnostic: Option<P2pEvent>,
     pub(crate) batch: Vec<P2pEvent>,
@@ -232,8 +252,13 @@ impl Carry {
                 batch.push(event);
             }
         }
-        self.message_ids.retain(|id| self.events.contains_key(id));
-        self.other_ids.retain(|id| self.events.contains_key(id));
+        // `take` removes the oldest events and the queues are in id order,
+        // so their stale ids form a prefix: prune only that.
+        for ids in [&mut self.message_ids, &mut self.other_ids] {
+            while ids.front().is_some_and(|id| !self.events.contains_key(id)) {
+                ids.pop_front();
+            }
+        }
         batch
     }
 
@@ -334,20 +359,7 @@ pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
             },
             Ok(Ok(())) => return,
         };
-        let should_ring = {
-            let mut state = guard.shared.lock_state();
-            let should_ring = state.carry.is_empty();
-            let crate::endpoint::EndpointState {
-                carry,
-                overflow,
-                stats,
-                ..
-            } = &mut *state;
-            ingest([event], carry, overflow, stats);
-            state.stats.carry_high_water = state.stats.carry_high_water.max(state.carry.len());
-            should_ring
-        };
-        if should_ring {
+        if guard.shared.lock_events().ingest([event]) {
             ring(doorbell);
         }
     }
@@ -359,14 +371,8 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         if state.lifecycle != Lifecycle::Running {
             return Ok(());
         }
-        let was_empty = state.carry.is_empty();
         let crate::endpoint::EndpointState {
-            endpoint,
-            carry,
-            overflow,
-            stats,
-            writes,
-            ..
+            endpoint, writes, ..
         } = &mut *state;
         let endpoint = endpoint.as_mut().expect("running endpoint exists");
         // Only `Endpoint::wait`, so the carry stays in Endpoint emission
@@ -398,9 +404,7 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         }
         if interrupted && batch.is_empty() {
             drop(state);
-            while guard.shared.pending_commands.load(Ordering::Acquire) != 0 {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            guard.shared.wait_for_commands();
             continue;
         }
         // Pending writes follow each event first: a Writable resends a held
@@ -412,18 +416,19 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             converted.extend(convert_endpoint_event(endpoint, event));
             converted.extend(settled);
         }
-        ingest(converted, carry, overflow, stats);
-        stats.carry_high_water = stats.carry_high_water.max(carry.len());
-        stats.iterations = stats.iterations.saturating_add(1);
-        let should_ring = was_empty && !carry.is_empty();
+        // Ingested before `state` is released, so no command runs between
+        // the endpoint emitting these events and the carry holding them.
+        let should_ring = {
+            let mut events = guard.shared.lock_events();
+            events.stats.iterations = events.stats.iterations.saturating_add(1);
+            events.ingest(converted)
+        };
         drop(state);
         if should_ring {
             ring(guard.doorbell.as_ref().expect("doorbell exists"));
         }
         if interrupted {
-            while guard.shared.pending_commands.load(Ordering::Acquire) != 0 {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            guard.shared.wait_for_commands();
         }
     }
 }

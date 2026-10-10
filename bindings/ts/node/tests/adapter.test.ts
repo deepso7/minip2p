@@ -24,6 +24,8 @@ const native = vi.hoisted(() => {
       streamId: bigint;
     }[] = [];
     readonly writes: { connId: bigint; streamId: bigint }[] = [];
+    /** Bytes `sendStream` received, in call order. */
+    readonly writtenData: Uint8Array[] = [];
     readonly consumed: { bytes: number; connId: bigint; streamId: bigint }[] =
       [];
     liveConnId: bigint | undefined;
@@ -172,7 +174,7 @@ const native = vi.hoisted(() => {
       _peerId: string,
       connId: bigint,
       streamId: bigint,
-      _data: Uint8Array
+      data: Uint8Array
     ): boolean {
       if (this.liveConnId !== undefined && connId !== this.liveConnId) {
         throw new Error(
@@ -180,6 +182,7 @@ const native = vi.hoisted(() => {
         );
       }
       this.writes.push({ connId, streamId });
+      this.writtenData.push(data);
       return true;
     }
 
@@ -692,6 +695,7 @@ describeAdapterContract("Node", {
         fake.nextStream = { connId, streamId };
       },
       writes: fake.writes,
+      writtenData: fake.writtenData,
     };
   },
 });
