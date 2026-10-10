@@ -272,7 +272,7 @@ pub(crate) type EndpointSwarm = Swarm<EndpointTransport>;
 /// With the `nat` cargo feature and a NAT configuration
 /// (`EndpointBuilder::relay` / `EndpointBuilder::nat_config`), `connect`
 /// races direct candidates against a relay leg. Path transitions arrive as
-/// [`EndpointEvent::Nat`]; the attempt's outcome is its
+/// `EndpointEvent::Nat`; the attempt's outcome is its
 /// [`EndpointEvent::ConnectSettled`].
 ///
 /// [`close`](Self::close) or drop disconnects established peers so a listener
@@ -715,7 +715,12 @@ impl Endpoint {
     ///
     /// Unlike [`Endpoint::reset_stream`], this also discards matching events
     /// already buffered by the endpoint and suppresses later data, EOF, and
-    /// close events for the stream. Repeated calls are idempotent.
+    /// close events for the stream. Abandoning a live stream again is a
+    /// no-op. A stream the peer has already closed has nothing left to reset:
+    /// it is abandoned (and its undelivered data acknowledged) only while its
+    /// [`EndpointEvent::StreamClosed`] is undelivered and still in the swarm,
+    /// and fails with [`SwarmError::StreamNotFound`] after that, including on
+    /// a second call.
     pub fn abandon_stream(
         &mut self,
         peer_id: &PeerId,
@@ -723,8 +728,29 @@ impl Endpoint {
         stream_id: StreamId,
     ) -> Result<(), Error> {
         self.swarm.abandon_stream(peer_id, conn_id, stream_id)?;
-        self.pending_events
-            .retain(|event| !event.matches_stream(peer_id, conn_id, stream_id));
+        let mut dropped_data = 0usize;
+        self.pending_events.retain(|event| {
+            if !event.matches_stream(peer_id, conn_id, stream_id) {
+                return true;
+            }
+            if let EndpointEvent::StreamData { data, .. } = event {
+                dropped_data += data.len();
+            }
+            false
+        });
+        // The swarm settled only the data still in its own queue. Data that
+        // already moved here was never pulled, so nobody else will
+        // acknowledge it; a closed stream would hold its slot for good. After
+        // a reset the acknowledgement is moot, so its error is ignored.
+        if dropped_data > 0 {
+            match self
+                .swarm
+                .core_mut()
+                .ack_stream(conn_id, stream_id, dropped_data)
+            {
+                Ok(()) | Err(_) => {}
+            }
+        }
         self.acks.forget(conn_id, stream_id);
         Ok(())
     }
@@ -4514,5 +4540,94 @@ mod tests {
         endpoint.swarm.poll().expect("refresh identify snapshot");
 
         assert!(endpoint.swarm.core().local_addresses().contains(&shared));
+    }
+
+    #[test]
+    fn abandoning_a_closed_stream_acks_data_left_in_the_endpoint_queue() {
+        const PROTOCOL: &str = "/test/abandon-split/1";
+        let bind = || {
+            Endpoint::builder()
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+                .expect("quic listen address")
+                .protocol(PROTOCOL)
+                .bind()
+                .expect("bind endpoint")
+        };
+        let (mut writer, mut reader) = (bind(), bind());
+        let (writer_peer, reader_peer) = (writer.peer_id().clone(), reader.peer_id().clone());
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        let tick = Duration::from_millis(5);
+        writer
+            .connect(reader.listen().expect("listen"))
+            .expect("connect");
+        while !writer.is_peer_ready(&reader_peer) || !reader.is_peer_ready(&writer_peer) {
+            assert!(std::time::Instant::now() < give_up, "never ready");
+            writer.next_event(tick).expect("drive writer");
+            reader.next_event(tick).expect("drive reader");
+        }
+        let (_, out_stream) = writer.open_stream(&reader_peer, PROTOCOL).expect("open");
+        let (conn, stream) = loop {
+            assert!(std::time::Instant::now() < give_up, "never negotiated");
+            writer.next_event(tick).expect("drive writer");
+            if let Some(EndpointEvent::StreamReady {
+                conn_id, stream_id, ..
+            }) = reader.next_event(tick).expect("drive reader")
+            {
+                break (conn_id, stream_id);
+            }
+        };
+        // The reader closes first, so the writer's FIN closes the stream.
+        reader
+            .close_stream_write(&writer_peer, conn, stream)
+            .expect("reader close");
+        loop {
+            assert!(std::time::Instant::now() < give_up, "reader FIN lost");
+            reader.next_event(tick).expect("drive reader");
+            if let Some(EndpointEvent::StreamRemoteWriteClosed { stream_id, .. }) =
+                writer.next_event(tick).expect("drive writer")
+                && stream_id == out_stream
+            {
+                break;
+            }
+        }
+        let conn_out = writer
+            .swarm
+            .core()
+            .connection_id(&reader_peer)
+            .expect("conn");
+        writer
+            .send_stream(&reader_peer, conn_out, out_stream, vec![1, 2, 3])
+            .expect("send");
+        writer
+            .close_stream_write(&reader_peer, conn_out, out_stream)
+            .expect("writer close");
+        writer.next_event(tick).expect("flush writer");
+
+        // Stage what a `wait` cut short leaves behind: the step's data in the
+        // Endpoint queue, its close still in the swarm's. Data and FIN may
+        // arrive separately, so pull until the close and then queue it back.
+        loop {
+            assert!(std::time::Instant::now() < give_up, "stream never closed");
+            writer.next_event(tick).expect("drive writer");
+            match reader.swarm.poll_next(tick).expect("poll reader") {
+                Some(event @ SwarmEvent::StreamData { stream_id, .. }) if stream_id == stream => {
+                    reader.pending_events.push_back(event.into());
+                }
+                Some(event @ SwarmEvent::StreamClosed { stream_id, .. }) if stream_id == stream => {
+                    reader.swarm.preload_poll_events([event]);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        reader
+            .abandon_stream(&writer_peer, conn, stream)
+            .expect("abandon");
+        // Its three bytes were acknowledged, so the stream settled and an
+        // over-acknowledgement is a no-op rather than `AckExceedsDelivered`.
+        reader
+            .stream_consumed(conn, stream, 4)
+            .expect("stream settled");
     }
 }
