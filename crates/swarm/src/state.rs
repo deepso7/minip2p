@@ -69,6 +69,10 @@ pub const RESERVED_PROTOCOL_IDS: [&str; 2] = [IDENTIFY_PROTOCOL_ID, PING_PROTOCO
 /// the newest connection wins as usual, so a peer reconnecting after its old
 /// connection died silently still gets through. Kept well under the
 /// transports' idle timeouts.
+///
+/// This is the default; [`crate::SwarmBuilder::simultaneous_dial_window_ms`]
+/// overrides it. Both peers settle the race on their own clocks, so they
+/// should use the same window.
 pub const SIMULTANEOUS_DIAL_WINDOW_MS: u64 = 5_000;
 
 /// How long an outbound stream may spend in multistream-select negotiation.
@@ -373,6 +377,9 @@ pub(crate) struct SwarmState {
     /// How and when each peer's current connection took its slot, for the
     /// connection-race tie-break. Dropped when it leaves the slot.
     registrations: BTreeMap<ConnectionId, Registration>,
+    /// How long a new connection can lose a race to the current one;
+    /// defaults to [`SIMULTANEOUS_DIAL_WINDOW_MS`].
+    pub(crate) simultaneous_dial_window_ms: u64,
 
     // --- Write backpressure (ADR 0012) ---
     /// Unsent tails of the core's own writes (negotiation, ping, Identify),
@@ -447,6 +454,7 @@ impl SwarmState {
             retired_connections: BTreeSet::new(),
             local_peer_id,
             registrations: BTreeMap::new(),
+            simultaneous_dial_window_ms: SIMULTANEOUS_DIAL_WINDOW_MS,
             events: VecDeque::new(),
             held: HeldWrites::new(),
             user_writable_wanted: BTreeSet::new(),
@@ -1654,7 +1662,7 @@ impl SwarmState {
 
     /// Whether `new` (carrying `new_token`) loses a connection race to
     /// `current`, `peer_id`'s current connection: both are direct, `current`
-    /// registered within [`SIMULTANEOUS_DIAL_WINDOW_MS`], and `current` is
+    /// registered within the simultaneous-dial window, and `current` is
     /// the one both peers keep -- the lower peer id's dial when they go in
     /// opposite directions, the lower token when they go the same way.
     fn loses_connection_race(
@@ -1671,7 +1679,7 @@ impl SwarmState {
         let Some(current) = self.registrations.get(&current) else {
             return false;
         };
-        if now_ms.saturating_sub(current.at_ms) >= SIMULTANEOUS_DIAL_WINDOW_MS {
+        if now_ms.saturating_sub(current.at_ms) >= self.simultaneous_dial_window_ms {
             return false;
         }
         let new_outbound = self.pending_dials.contains_key(&new);
@@ -5841,6 +5849,28 @@ mod tests {
                 );
                 assert_eq!(core.connection_id(&peer), Some(new), "{case}");
             }
+        }
+    }
+
+    #[test]
+    fn a_configured_window_bounds_the_race() {
+        let current = ConnectionId::new(1);
+        let new = ConnectionId::new(2);
+        // Our dial to the higher peer is the one both sides keep, until the
+        // window ends.
+        for (new_at_ms, expected) in [
+            (199, ["close 2"].as_slice()),
+            (200, &["replaced 1->2", "close 1"]),
+        ] {
+            let mut core = tie_break_core();
+            core.simultaneous_dial_window_ms = 200;
+            let peer = PeerId::from_public_key_protobuf(HIGHER_PEER);
+            register(&mut core, &peer, current, true, false, 0);
+            let _ = drain_events(&mut core);
+
+            register(&mut core, &peer, new, false, false, new_at_ms);
+            let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+            assert_eq!(lifecycle(&outputs), expected, "new at {new_at_ms}ms");
         }
     }
 }

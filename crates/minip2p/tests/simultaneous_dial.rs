@@ -7,8 +7,8 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectOutcome, Ed25519Keypair, Endpoint, EndpointEvent, Multiaddr, Now, PeerAddr, PeerId,
-    PollDeadline, PortableEndpoint, StreamId,
+    ConnectOutcome, Ed25519Keypair, Endpoint, EndpointBuilder, EndpointEvent, Multiaddr, Now,
+    PeerAddr, PeerId, PollDeadline, PortableEndpoint, StreamId,
 };
 use minip2p_platform::{Clock, StdClock, StdEntropy};
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
@@ -21,16 +21,32 @@ use endpoint_support::NextEvent;
 const QUIC: &str = "/ip4/127.0.0.1/udp/0/quic-v1";
 /// Failure backstop, not a budget the test has to fit in.
 const BACKSTOP: Duration = Duration::from_secs(10);
-/// Comfortably past the swarm's 5 s `SIMULTANEOUS_DIAL_WINDOW_MS`.
-const PAST_TIE_BREAK_WINDOW: Duration = Duration::from_millis(5_500);
+/// The tie-break window for tests that wait it out rather than race inside
+/// it; the default 5 s would only add wall-clock time.
+const TIE_BREAK_WINDOW: Duration = Duration::from_millis(250);
+/// Comfortably past [`TIE_BREAK_WINDOW`].
+const PAST_TIE_BREAK_WINDOW: Duration = Duration::from_millis(500);
 
 fn bind(listen: &str, key: Ed25519Keypair) -> Endpoint {
-    Endpoint::builder()
+    bind_with(Endpoint::builder(), listen, key)
+}
+
+fn bind_with(builder: EndpointBuilder, listen: &str, key: Ed25519Keypair) -> Endpoint {
+    builder
         .identity(key)
         .listen_on(listen)
         .expect("listen address")
         .bind()
         .expect("bind loopback")
+}
+
+/// [`bind`] on QUIC with the short [`TIE_BREAK_WINDOW`].
+fn bind_short_window(key: Ed25519Keypair) -> Endpoint {
+    bind_with(
+        Endpoint::builder().simultaneous_dial_window(TIE_BREAK_WINDOW),
+        QUIC,
+        key,
+    )
 }
 
 /// Polls `endpoint` once and appends what it surfaced to `events`.
@@ -468,9 +484,9 @@ fn reconnect_after_silent_death(a_is_lower: bool) {
             break (a_key, b_key);
         }
     };
-    let mut a = bind(QUIC, a_key);
+    let mut a = bind_short_window(a_key);
     let a_addr = a.listen().expect("a listens");
-    let mut b = bind(QUIC, b_key.clone());
+    let mut b = bind_short_window(b_key.clone());
     let b_addr = b.listen().expect("b listens");
     let (a_peer, b_peer) = (a.peer_id().clone(), b.peer_id().clone());
 
@@ -500,7 +516,7 @@ fn reconnect_after_silent_death(a_is_lower: bool) {
         "still holds the dead one"
     );
 
-    let mut b = bind(QUIC, b_key);
+    let mut b = bind_short_window(b_key);
     b.connect(&a_addr).expect("new b connects");
     let mut a_events = Vec::new();
     let deadline = Instant::now() + BACKSTOP;

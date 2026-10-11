@@ -31,10 +31,11 @@
 # listener state.
 #
 # The filter names that one test rather than its binary. The other four tests in
-# reconnect_churn are cheaper -- the two close-drain tests below each wait ~5.5s
-# for their first connection to outlive the swarm's race window, and since they
-# run alone that adds ~11s per variant -- and the variants do enable QUIC, so
-# excluding the whole binary would drop the replacement coverage they exist for.
+# reconnect_churn are cheap -- the two close-drain tests below wait out a
+# shortened race window (`EndpointBuilder::simultaneous_dial_window`), about
+# half a second each even though they run alone -- and the variants do enable
+# QUIC, so excluding the whole binary would drop the replacement coverage they
+# exist for.
 #
 # Feature variants run under this profile; the workspace run does not.
 [profile.variants]

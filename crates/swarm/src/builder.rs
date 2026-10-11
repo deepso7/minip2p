@@ -34,6 +34,7 @@ const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 /// - `agentVersion = "minip2p/0.1.0"`
 /// - Supported protocols: `/ipfs/id/1.0.0` and `/ipfs/ping/1.0.0`
 /// - Ping timeout: 10 seconds (the ping default)
+/// - Simultaneous-dial window: [`crate::SIMULTANEOUS_DIAL_WINDOW_MS`]
 ///
 /// Use the setter methods to override. Call
 /// [`SwarmBuilder::build_core`] with a caller-provided transport and
@@ -54,6 +55,7 @@ pub struct SwarmBuilder {
     /// `local_peer_id` accessor is infallible.
     local_peer_id: PeerId,
     ping_config: PingConfig,
+    simultaneous_dial_window_ms: u64,
 }
 
 impl SwarmBuilder {
@@ -74,6 +76,7 @@ impl SwarmBuilder {
             public_key: keypair.public_key().encode_protobuf(),
             local_peer_id: keypair.peer_id(),
             ping_config: PingConfig::default(),
+            simultaneous_dial_window_ms: crate::SIMULTANEOUS_DIAL_WINDOW_MS,
         }
     }
 
@@ -116,6 +119,19 @@ impl SwarmBuilder {
         self
     }
 
+    /// Overrides how long, in milliseconds, a peer's new connection can lose a
+    /// race to its current one (see [`crate::SIMULTANEOUS_DIAL_WINDOW_MS`],
+    /// the default).
+    ///
+    /// Both peers settle a race on their own, so they should use the same
+    /// window. A shorter window lets a peer that reconnects after a silent
+    /// death replace its old connection sooner, at the cost of settling
+    /// slow candidate races less reliably.
+    pub fn simultaneous_dial_window_ms(mut self, ms: u64) -> Self {
+        self.simultaneous_dial_window_ms = ms;
+        self
+    }
+
     /// Consumes the builder and returns a portable caller-driven swarm.
     ///
     /// The caller supplies entropy explicitly, keeping construction usable in
@@ -139,6 +155,7 @@ impl SwarmBuilder {
             self.local_peer_id,
             entropy,
         );
+        core.state.simultaneous_dial_window_ms = self.simultaneous_dial_window_ms;
         for protocol in user_protocols {
             core.add_protocol(protocol)?;
         }
@@ -160,6 +177,7 @@ impl SwarmBuilder {
             public_key: self.public_key,
         };
         let mut swarm = Swarm::new(transport, identify, self.ping_config, self.local_peer_id);
+        swarm.core_mut().state.simultaneous_dial_window_ms = self.simultaneous_dial_window_ms;
         for protocol in user_protocols {
             swarm.core_mut().add_protocol(protocol)?;
         }
@@ -292,6 +310,21 @@ mod tests {
         // Built-ins stay advertised alongside the user protocol.
         assert!(identify.protocols.iter().any(|p| p == IDENTIFY_PROTOCOL_ID));
         assert!(identify.protocols.iter().any(|p| p == PING_PROTOCOL_ID));
+    }
+
+    #[test]
+    fn both_builds_apply_the_simultaneous_dial_window() {
+        let keypair = Ed25519Keypair::generate();
+        let builder = || SwarmBuilder::new(&keypair).simultaneous_dial_window_ms(200);
+        let core = builder()
+            .build_core(NoopTransport, ZeroEntropy)
+            .expect("portable swarm configuration is valid");
+        assert_eq!(core.simultaneous_dial_window_ms(), 200);
+        #[cfg(feature = "std")]
+        {
+            let mut swarm = builder().build(NoopTransport).expect("std swarm builds");
+            assert_eq!(swarm.core_mut().simultaneous_dial_window_ms(), 200);
+        }
     }
 
     #[test]

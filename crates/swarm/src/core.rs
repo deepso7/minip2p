@@ -209,6 +209,14 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         &self.local_peer_id
     }
 
+    /// How long after a peer's connection takes its slot a racing connection
+    /// can still lose to it, in milliseconds. Set with
+    /// [`crate::SwarmBuilder::simultaneous_dial_window_ms`]; defaults to
+    /// [`crate::SIMULTANEOUS_DIAL_WINDOW_MS`].
+    pub fn simultaneous_dial_window_ms(&self) -> u64 {
+        self.state.simultaneous_dial_window_ms
+    }
+
     // -----------------------------------------------------------------------
     // Peers and connections
     // -----------------------------------------------------------------------

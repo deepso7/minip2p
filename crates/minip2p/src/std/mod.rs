@@ -1685,6 +1685,7 @@ pub struct EndpointBuilder {
     #[cfg(any(feature = "discovery", feature = "mdns"))]
     peer_discovery_config: PeerDiscoveryConfig,
     connect_deadline: std::time::Duration,
+    simultaneous_dial_window: std::time::Duration,
 }
 
 impl Default for EndpointBuilder {
@@ -1693,6 +1694,9 @@ impl Default for EndpointBuilder {
             keypair: None,
             agent_version: DEFAULT_AGENT_VERSION.to_string(),
             connect_deadline: std::time::Duration::from_millis(DEFAULT_CONNECT_DEADLINE_MS),
+            simultaneous_dial_window: std::time::Duration::from_millis(
+                minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS,
+            ),
             #[cfg(feature = "quic")]
             quic_limits: QuicLimits::default(),
             #[cfg(feature = "tcp")]
@@ -1739,6 +1743,19 @@ impl EndpointBuilder {
     /// Sets the Connection-attempt deadline. Default is 30 seconds.
     pub fn connect_deadline(mut self, deadline: std::time::Duration) -> Self {
         self.connect_deadline = deadline;
+        self
+    }
+
+    /// Sets how long a peer's new connection can lose a race to its current
+    /// one. Default is 5 seconds
+    /// ([`SIMULTANEOUS_DIAL_WINDOW_MS`](minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS)).
+    ///
+    /// Both peers settle a race on their own, so they should use the same
+    /// window. A shorter one lets a peer that reconnects after its old
+    /// connection died silently get back in sooner, at the cost of settling
+    /// slow candidate races less reliably.
+    pub fn simultaneous_dial_window(mut self, window: std::time::Duration) -> Self {
+        self.simultaneous_dial_window = window;
         self
     }
 
@@ -2297,7 +2314,11 @@ fn build_endpoint(
     let mut options = options;
     #[cfg(feature = "nat")]
     let nat_config = options.take_nat_config();
-    let mut builder = SwarmBuilder::new(&keypair).agent_version(options.agent_version);
+    let mut builder = SwarmBuilder::new(&keypair)
+        .agent_version(options.agent_version)
+        .simultaneous_dial_window_ms(
+            u64::try_from(options.simultaneous_dial_window.as_millis()).unwrap_or(u64::MAX),
+        );
     let mut acks = StreamAcks::default();
     for protocol in options.manual_ack_protocols {
         acks.set_manual(protocol, []);
