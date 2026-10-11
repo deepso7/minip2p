@@ -81,6 +81,20 @@ pub fn verify_libp2p_certificate(cert_der: &[u8], now: Duration) -> Result<PeerI
     Ok(PeerId::from_public_key(&libp2p_public_key))
 }
 
+/// Returns the DER-encoded SubjectPublicKeyInfo of a DER-encoded X.509
+/// certificate.
+///
+/// A TLS 1.3 handshake proves possession of this key in CertificateVerify, so
+/// a transport checks that signature against it. It does not verify the
+/// certificate; [`verify_libp2p_certificate`] does.
+pub fn certificate_spki(cert_der: &[u8]) -> Result<Vec<u8>, TlsError> {
+    let cert = Certificate::from_der(cert_der).map_err(|e| TlsError::Der(format!("{e}")))?;
+    cert.tbs_certificate()
+        .subject_public_key_info()
+        .to_der()
+        .map_err(|e| TlsError::Der(format!("{e}")))
+}
+
 /// Rejects a certificate whose validity period does not contain `now`.
 /// Both bounds are inclusive, per RFC 5280 Section 4.1.2.5.
 fn check_validity(cert: &Certificate, now: Duration) -> Result<(), TlsError> {
@@ -394,13 +408,21 @@ mod tests {
     /// `NOT_AFTER` (Unix seconds), with `extra` extensions appended.
     fn test_certificate(extra: &[Extension]) -> (Vec<u8>, PeerId) {
         let keypair = Ed25519Keypair::from_secret_key_bytes([9u8; 32]);
-        let validity = Validity::new(
+        let (cert_der, _key_der) = build_certificate(
+            &keypair,
+            test_certificate_validity(),
+            &mut TestRng(3),
+            extra,
+        )
+        .expect("must generate");
+        (cert_der, keypair.peer_id())
+    }
+
+    fn test_certificate_validity() -> Validity {
+        Validity::new(
             Time::from(der::DateTime::from_unix_duration(Duration::from_secs(NOT_BEFORE)).unwrap()),
             Time::from(der::DateTime::from_unix_duration(Duration::from_secs(NOT_AFTER)).unwrap()),
-        );
-        let (cert_der, _key_der) =
-            build_certificate(&keypair, validity, &mut TestRng(3), extra).expect("must generate");
-        (cert_der, keypair.peer_id())
+        )
     }
 
     #[test]
@@ -477,6 +499,32 @@ mod tests {
             verify_libp2p_certificate(&cert_der, Duration::from_secs(NOT_BEFORE)),
             Err(TlsError::DuplicateExtension)
         );
+    }
+
+    #[test]
+    fn certificate_spki_is_the_key_the_extension_signs() {
+        let keypair = Ed25519Keypair::from_secret_key_bytes([9u8; 32]);
+        let (cert_der, key_der) =
+            build_certificate(&keypair, test_certificate_validity(), &mut TestRng(3), &[])
+                .expect("must generate");
+        let spki = certificate_spki(&cert_der).expect("spki");
+
+        let signing_key = {
+            use p256::pkcs8::DecodePrivateKey;
+            p256::ecdsa::SigningKey::from_pkcs8_der(&key_der).expect("pkcs8 key")
+        };
+        let expected = {
+            use spki::EncodePublicKey;
+            signing_key
+                .verifying_key()
+                .to_public_key_der()
+                .expect("public key der")
+        };
+        assert_eq!(spki, expected.as_bytes());
+        assert!(matches!(
+            certificate_spki(&[0x30, 0x00]),
+            Err(TlsError::Der(_))
+        ));
     }
 
     #[test]
