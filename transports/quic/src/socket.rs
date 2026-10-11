@@ -17,6 +17,12 @@ use crate::diagnostics::DatagramTally;
 /// Largest UDP payload a single datagram can carry.
 const MAX_DATAGRAM_SIZE: usize = 65_535;
 
+/// Most datagrams one transmit carries, whatever the platform could segment.
+///
+/// Larger GSO trains arrive as bursts a receiver's socket buffer drops;
+/// quinn itself caps a transmit at the same 10.
+const MAX_TRANSMIT_SEGMENTS: usize = 10;
+
 /// A transmit retained after the non-blocking socket reported `WouldBlock`.
 struct PendingTransmit {
     contents: Vec<u8>,
@@ -162,7 +168,7 @@ impl Socket {
     /// the socket pushed back. Zero means stop asking the engine for output:
     /// it advances congestion and loss state for every packet it hands out.
     pub(crate) fn allowance(&self) -> usize {
-        let segments = self.state.max_gso_segments();
+        let segments = self.state.max_gso_segments().min(MAX_TRANSMIT_SEGMENTS);
         #[cfg(test)]
         let segments = segments.min(self.max_segments);
         self.max_pending.saturating_sub(self.retained).min(segments)
