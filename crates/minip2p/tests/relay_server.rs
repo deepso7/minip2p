@@ -247,16 +247,19 @@ fn exercise_relay(
     assert!(relay_events.iter().any(|event| matches!(event, RelayServerEvent::CircuitOpened { source_peer_id, destination_peer_id } if source_peer_id == &initiator_peer && destination_peer_id == &responder_peer)));
 }
 
+/// Built exactly as the README hosts a relay: `bind()` alone, no `listen()`.
+/// The relay must accept clients all the same.
 #[cfg(feature = "quic")]
 #[test]
 fn quic_clients_exchange_payload_through_quic_relay_endpoint() {
-    let mut relay = Endpoint::builder()
+    let relay = Endpoint::builder()
         .relay_server()
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")
         .bind()
         .expect("bind relay");
-    let relay_addr = relay.listen().expect("relay listens");
+    let bound = relay.bound_addresses().pop().expect("bound address");
+    let relay_addr = PeerAddr::new(bound, relay.peer_id().clone()).unwrap();
     exercise_relay(relay, relay_addr, |builder| {
         builder
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")

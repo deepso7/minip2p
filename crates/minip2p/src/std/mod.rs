@@ -351,12 +351,10 @@ impl Endpoint {
         self.swarm.core().local_peer_id()
     }
 
-    /// Starts listening on every bound address and returns the first.
+    /// Returns the first listen address.
     ///
-    /// Every one of them, not only the address returned: an endpoint that
-    /// bound two transports would otherwise report a listen success while one
-    /// of them accepted nothing, and which one that was would depend on the
-    /// order the sockets happened to be asked for. Use
+    /// [`EndpointBuilder::bind`] already listens on every bound address, so
+    /// this only reports; calling it again is harmless. Use
     /// [`listen_all`](Self::listen_all) to see them all.
     pub fn listen(&mut self) -> Result<PeerAddr, Error> {
         let mut addrs = self.listen_all()?;
@@ -366,7 +364,11 @@ impl Endpoint {
         })
     }
 
-    /// Starts listening on all transport-bound addresses.
+    /// Returns every listen address, as complete peer addresses.
+    ///
+    /// [`EndpointBuilder::bind`] already started listening on them; this
+    /// re-confirms each with its transport, which is a no-op for an address
+    /// already listening.
     pub fn listen_all(&mut self) -> Result<Vec<PeerAddr>, Error> {
         let addrs = self.swarm.core_mut().listen_on_bound_addrs()?;
         Ok(addrs)
@@ -574,9 +576,8 @@ impl Endpoint {
 
     /// Returns addresses currently bound on the local transport.
     ///
-    /// These are what the sockets were given, not a signal that
-    /// [`Self::listen`] / [`Self::listen_all`] has started accepting. The set
-    /// can be non-empty before listening begins.
+    /// These are what the sockets were given. A bound endpoint is already
+    /// accepting on each (see [`EndpointBuilder::bind`]).
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn bound_addresses(&self) -> Vec<Multiaddr> {
@@ -1988,11 +1989,17 @@ impl EndpointBuilder {
     /// endpoint with nothing to bind is refused: it could neither dial nor be
     /// reached, and failing here says so more clearly than every later call
     /// would.
+    ///
+    /// Every transport starts accepting at once, QUIC and TCP alike, so the
+    /// returned endpoint is reachable on each listen address without a
+    /// further call. [`Endpoint::listen_all`] reports those addresses.
     pub fn bind(mut self) -> Result<Endpoint, Error> {
         self.validate()?;
         let keypair = self.keypair.take().unwrap_or_else(Ed25519Keypair::generate);
         let transport = bind_transports(&self, &keypair)?;
-        build_endpoint(self, keypair, transport)
+        let mut endpoint = build_endpoint(self, keypair, transport)?;
+        endpoint.listen_all()?;
+        Ok(endpoint)
     }
 
     /// Validates the static configuration.

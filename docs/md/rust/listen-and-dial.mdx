@@ -39,7 +39,7 @@ fn local_dialable(address: &PeerAddr) -> String {
 }
 ```
 
-`listen()` publishes the first already-bound address. `listen_all()` publishes every bound address, which is normally the right choice for a dual-stack endpoint.
+`bind` starts accepting on every listen address, QUIC and TCP alike, so a bound endpoint is already reachable. `listen()` then reports the first address and `listen_all()` every one, which is normally the right choice for a dual-stack endpoint.
 
 To listen on both QUIC and TCP:
 

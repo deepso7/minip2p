@@ -1544,10 +1544,14 @@ impl Transport for QuicTransport {
         ensure_listen_matches_bound_socket(socket_addr, local_addr)?;
 
         let listen_addr = socket_addr_to_multiaddr(local_addr);
-        self.listen_addr = Some(local_addr);
-        self.pending_events.push(TransportEvent::Listening {
-            addr: listen_addr.clone(),
-        });
+        // Listening again is the same listener: report the address without
+        // announcing it twice (the endpoint listens at bind, and callers may
+        // still ask `listen` for the address afterwards).
+        if self.listen_addr.replace(local_addr).is_none() {
+            self.pending_events.push(TransportEvent::Listening {
+                addr: listen_addr.clone(),
+            });
+        }
 
         Ok(listen_addr)
     }

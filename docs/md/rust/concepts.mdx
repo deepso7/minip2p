@@ -80,6 +80,6 @@ Every event leaves through the Endpoint event stream, read with `Endpoint::wait`
 - `EndpointEvent::Discovery(DiscoveryEvent)` (`discovery` / `mdns`);
 - `EndpointEvent::RelayServer(RelayServerEvent)` (`relay-server`).
 
-Durable state is available through State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`, and with capabilities `path`, `reachability`, `active_reservation`, `known_peers`). `bound_addresses` reports transport-bound local addresses and can be non-empty before `listen` starts accepting. Those getters do not drive the endpoint, are not one cross-getter atomic snapshot, and may be ahead of the event stream, never behind their own emitted transition.
+Durable state is available through State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`, and with capabilities `path`, `reachability`, `active_reservation`, `known_peers`). `bound_addresses` reports transport-bound local addresses; `bind` already accepts on each. Those getters do not drive the endpoint, are not one cross-getter atomic snapshot, and may be ahead of the event stream, never behind their own emitted transition.
 
 Continue with [Listen and connect](/rust/listen-and-dial) or the [glossary](/reference/glossary).

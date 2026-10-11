@@ -23,7 +23,7 @@ for address in endpoint.listen_all()? {
 # Ok::<(), minip2p::Error>(())
 ```
 
-Listening is address-shaped: pass complete multiaddresses to `EndpointBuilder::listen_on` (or `listen_on_multiaddr`), or use `listen_default` for dual-stack QUIC wildcards. The transport is inferred from each address.
+Listening is address-shaped: pass complete multiaddresses to `EndpointBuilder::listen_on` (or `listen_on_multiaddr`), or use `listen_default` for dual-stack QUIC wildcards. The transport is inferred from each address. `bind` starts accepting on every listen address, QUIC and TCP alike; `listen_all` reports them.
 
 ## Connecting and the event loop
 
