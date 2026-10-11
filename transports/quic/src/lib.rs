@@ -7,7 +7,7 @@
 //! adapter feeds it datagrams and a time sample, and sends what it produces.
 //! No async runtime required.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -295,8 +295,20 @@ pub struct QuicTransport {
     recv_buf: Vec<u8>,
     /// Reused by every transmit and stateless reply.
     send_buf: Vec<u8>,
-    /// Reused for the connection sweep.
-    sweep_ids: Vec<ConnectionId>,
+    /// Connections the current poll routed datagrams to, or accepted.
+    received: BTreeSet<ConnectionId>,
+    /// Every connection's cached engine timeout, earliest first, so a poll
+    /// finds the due ones and `next_deadline` the next one without visiting
+    /// every connection.
+    timers: BTreeSet<(Instant, ConnectionId)>,
+    /// Connections whose last service left work that no packet or timer
+    /// will prompt, such as output the socket pushed back on.
+    unfinished: BTreeSet<ConnectionId>,
+    /// Reused for the connections one poll services.
+    due: Vec<ConnectionId>,
+    /// Connection services run, for tests that check idle polls do none.
+    #[cfg(test)]
+    services: usize,
     /// Retained node configuration.
     node_config: QuicNodeConfig,
     /// The last poll's host sample and the engine instant taken with it, so
@@ -628,7 +640,12 @@ impl QuicTransport {
             pending_events: Vec::new(),
             recv_buf: vec![0; recv_buf_len],
             send_buf: Vec::new(),
-            sweep_ids: Vec::new(),
+            received: BTreeSet::new(),
+            timers: BTreeSet::new(),
+            unfinished: BTreeSet::new(),
+            due: Vec::new(),
+            #[cfg(test)]
+            services: 0,
             node_config,
             clock: None,
         })
@@ -784,12 +801,13 @@ impl QuicTransport {
             &mut buf,
         ) {
             Some(DatagramEvent::ConnectionEvent(handle, event)) => {
-                if let Some(conn) = self
+                if let Some((&id, conn)) = self
                     .handles
-                    .get(&handle)
-                    .and_then(|id| self.connections.get_mut(id))
+                    .get_key_value(&handle)
+                    .and_then(|(_, id)| self.connections.get_mut(id).map(|conn| (id, conn)))
                 {
                     conn.handle_event(event);
+                    self.received.insert(id);
                 }
             }
             Some(DatagramEvent::NewConnection(incoming)) => {
@@ -849,6 +867,7 @@ impl QuicTransport {
                 );
                 self.connections.insert(id, conn);
                 self.handles.insert(handle, id);
+                self.received.insert(id);
                 self.pending_events
                     .push(TransportEvent::IncomingConnection { id, endpoint });
             }
@@ -860,22 +879,34 @@ impl QuicTransport {
         }
     }
 
-    /// Services every connection.
-    fn sweep(&mut self, now: Instant) {
-        let mut ids = std::mem::take(&mut self.sweep_ids);
-        ids.clear();
-        ids.extend(self.connections.keys().copied());
-        for &id in &ids {
+    /// Services the connections with work: those this poll routed datagrams
+    /// to, those whose timer is due, and those a previous service left
+    /// unfinished. Idle connections are not visited.
+    fn service_due(&mut self, now: Instant) {
+        let mut due = std::mem::take(&mut self.due);
+        due.clear();
+        due.extend(std::mem::take(&mut self.received));
+        due.extend(self.unfinished.iter().copied());
+        due.extend(
+            self.timers
+                .iter()
+                .take_while(|(timeout, _)| *timeout <= now)
+                .map(|&(_, id)| id),
+        );
+        due.sort_unstable();
+        due.dedup();
+        for &id in &due {
             self.service(id, now);
         }
-        self.sweep_ids = ids;
+        self.due = due;
     }
 
-    /// Runs one connection's engine and sends its output, then retires the
-    /// connection once it drained. Returns the first hard socket error its
-    /// output hit.
+    /// Runs one connection's engine and sends its output, keeps the timer
+    /// index current, and retires the connection once it drained. Returns
+    /// the first hard socket error its output hit.
     fn service(&mut self, id: ConnectionId, now: Instant) -> Option<std::io::Error> {
         let conn = self.connections.get_mut(&id)?;
+        let before = conn.timeout();
         let mut cx = Cx {
             endpoint: &mut self.endpoint,
             sockets: &mut self.sockets,
@@ -884,7 +915,26 @@ impl QuicTransport {
             unix_now: self.host_time.now(),
         };
         let failure = conn.service(now, &mut cx);
-        if conn.is_drained() {
+        let (after, unfinished, drained) =
+            (conn.timeout(), conn.is_unfinished(), conn.is_drained());
+        #[cfg(test)]
+        {
+            self.services += 1;
+        }
+        if before != after {
+            if let Some(timeout) = before {
+                self.timers.remove(&(timeout, id));
+            }
+            if let Some(timeout) = after {
+                self.timers.insert((timeout, id));
+            }
+        }
+        if unfinished {
+            self.unfinished.insert(id);
+        } else {
+            self.unfinished.remove(&id);
+        }
+        if drained {
             self.remove_connection(id);
         }
         failure
@@ -906,6 +956,11 @@ impl QuicTransport {
             return;
         };
         self.handles.remove(&conn.handle());
+        if let Some(timeout) = conn.timeout() {
+            self.timers.remove(&(timeout, id));
+        }
+        self.unfinished.remove(&id);
+        self.received.remove(&id);
         if let Some(socket) = self.socket_of(id) {
             socket.connections = socket.connections.saturating_sub(1);
         }
@@ -1153,8 +1208,8 @@ impl Transport for QuicTransport {
             socket.flush();
         }
         // Each socket gets its own receive bound, so one family's traffic
-        // cannot starve the other. The sweep runs whatever ended a batch:
-        // connections defer their output to it.
+        // cannot starve the other. The service below runs whatever ended a
+        // batch: connections defer their output to it.
         let mut received = Ok(());
         for index in 0..self.sockets.len() {
             let batch = self.recv_batch(instant, index);
@@ -1162,7 +1217,7 @@ impl Transport for QuicTransport {
                 received = batch;
             }
         }
-        self.sweep(instant);
+        self.service_due(instant);
         received?;
         Ok(std::mem::take(&mut self.pending_events))
     }
@@ -1183,7 +1238,9 @@ impl Transport for QuicTransport {
         // Checked before the retained sample: `dial` queues datagrams before
         // the first `poll`, and a host that idled on `None` there would never
         // come back to flush them. `IMMEDIATE` is due on any timeline.
-        if self.sockets.iter().any(Socket::has_pending) {
+        // Connections a service left unfinished (most often behind those
+        // datagrams) need another the same way.
+        if self.sockets.iter().any(Socket::has_pending) || !self.unfinished.is_empty() {
             return Some(
                 self.clock
                     .map_or(Deadline::IMMEDIATE, |(now, _)| now.deadline_after(1)),
@@ -1192,11 +1249,9 @@ impl Transport for QuicTransport {
 
         // No sample yet means no timeline to answer on.
         let (now, instant) = self.clock?;
-        self.connections
-            .values()
-            .filter_map(QuicConnection::timeout)
-            .min()
-            .map(|timeout| deadline_for_timeout(now, timeout.saturating_duration_since(instant)))
+        self.timers.first().map(|&(timeout, _)| {
+            deadline_for_timeout(now, timeout.saturating_duration_since(instant))
+        })
     }
 }
 

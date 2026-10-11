@@ -188,6 +188,9 @@ pub(crate) struct QuicConnection {
     read_chunks: Vec<Bytes>,
     /// The engine's next timeout, cached after every service.
     timeout: Option<Instant>,
+    /// The last service stopped with work left: output the socket pushed
+    /// back on, or engine passes still producing events.
+    unfinished: bool,
     /// Diagnostic hooks; empty unless the `diagnostics` feature is on.
     counters: ConnectionCounters,
 }
@@ -229,6 +232,7 @@ impl QuicConnection {
             gated: BTreeSet::new(),
             read_chunks: Vec::new(),
             timeout: None,
+            unfinished: false,
             counters,
         }
     }
@@ -272,6 +276,12 @@ impl QuicConnection {
     /// The engine's next timeout, as of the last service.
     pub(crate) fn timeout(&self) -> Option<Instant> {
         self.timeout
+    }
+
+    /// Whether the last service left work that needs another without any
+    /// packet or timer to prompt it.
+    pub(crate) fn is_unfinished(&self) -> bool {
+        self.unfinished
     }
 
     /// Feeds a datagram (or new connection ids) the endpoint routed here.
@@ -322,6 +332,7 @@ impl QuicConnection {
     /// pending opens, endpoint events, then output. Returns the first hard
     /// socket error the output hit, whose datagram was dropped as lost.
     pub(crate) fn service(&mut self, now: Instant, cx: &mut Cx<'_>) -> Option<io::Error> {
+        self.unfinished = true;
         for _ in 0..MAX_SERVICE_PASSES {
             if self
                 .conn
@@ -347,6 +358,7 @@ impl QuicConnection {
                 }
             }
             if !progressed {
+                self.unfinished = false;
                 break;
             }
         }
@@ -367,6 +379,7 @@ impl QuicConnection {
                 .for_addr(self.conn.remote_address())
                 .map_or(0, |socket| socket.allowance());
             if allowance == 0 {
+                self.unfinished = true;
                 break;
             }
             cx.send_buf.clear();
@@ -382,7 +395,10 @@ impl QuicConnection {
             };
             match socket.send(&transmit, contents) {
                 Ok(true) => {}
-                Ok(false) => break,
+                Ok(false) => {
+                    self.unfinished = true;
+                    break;
+                }
                 // Stop rather than hammer a dead route within one service.
                 Err(error) => return Some(error),
             }

@@ -679,3 +679,44 @@ fn keepalive_holds_a_live_idle_pair_and_a_dead_peer_still_times_out() {
             .contains(&TransportEvent::Closed { id: client_id });
     }
 }
+
+#[test]
+fn idle_polls_service_no_connection_and_traffic_services_only_its_own() {
+    let mut server = listening_server(QuicLimits {
+        idle_timeout_ms: 3_600_000,
+        ..QuicLimits::default()
+    });
+    let mut peers: Vec<RawPeer> = Vec::new();
+    for _ in 0..4 {
+        let (peer, _) = accept(&mut server, &mut [], |_| {});
+        peers.push(peer);
+    }
+    // Let every handshake's trailing packets and acknowledgements settle.
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(10));
+        for peer in &mut peers {
+            peer.pump();
+        }
+        server.poll(now()).expect("poll");
+    }
+
+    server.services = 0;
+    for _ in 0..5 {
+        assert!(server.poll(now()).expect("idle poll").is_empty());
+    }
+    assert_eq!(server.services, 0, "idle connections are not visited");
+    assert!(
+        server.next_deadline().is_some(),
+        "the earliest timer still comes from the index"
+    );
+
+    let peer = &mut peers[0];
+    let stream = peer.open();
+    peer.write(stream, b"wake one");
+    peer.service();
+    await_input(&mut server);
+    server.services = 0;
+    let events = server.poll(now()).expect("poll");
+    assert_eq!(stream_bytes(&events, stream), b"wake one");
+    assert_eq!(server.services, 1, "only the connection with traffic");
+}
