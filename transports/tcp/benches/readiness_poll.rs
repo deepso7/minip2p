@@ -17,6 +17,9 @@ type Node = TcpTransport<StdTcpProvider, StdEntropy>;
 // descriptors, and the transport sweeps, which hold both ends, about 1,040.
 const COUNTS: &[usize] = &[1, 64, 256, 512];
 const CONNECT_BATCH: usize = 32;
+/// Failure backstop for one measured delivery, so a regression reports which
+/// iteration stalled instead of hanging the bench.
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn setup_timeout() -> Duration {
     std::env::var("MINIP2P_BENCH_SETUP_TIMEOUT_SECS")
@@ -190,6 +193,10 @@ fn poll_ready(ready: &mut ReadySet, count: usize) {
     black_box(received);
 }
 
+#[expect(
+    clippy::panic,
+    reason = "a lost delivery is a bench invariant failure, reported where it happened"
+)]
 fn poll_one_ready(ready: &mut ReadySet, index: usize) {
     ready
         .peers
@@ -197,18 +204,29 @@ fn poll_one_ready(ready: &mut ReadySet, index: usize) {
         .expect("peer index in range")
         .write_all(&[1])
         .expect("write readiness byte");
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
     loop {
         for event in ready
             .provider
             .poll(Now::from_millis(0))
             .expect("poll ready sockets")
         {
-            if let TcpEvent::Received { data, .. } = event {
-                assert_eq!(data, [1], "unexpected payload");
-                black_box(data);
-                return;
+            match event {
+                TcpEvent::Received { data, .. } => {
+                    assert_eq!(data, [1], "unexpected payload");
+                    black_box(data);
+                    return;
+                }
+                TcpEvent::Closed { socket, reason } => {
+                    panic!("{socket} closed while waiting on peer {index}: {reason:?}")
+                }
+                _ => {}
             }
         }
+        assert!(
+            Instant::now() < deadline,
+            "byte from peer {index} never arrived"
+        );
     }
 }
 
@@ -282,29 +300,46 @@ fn upgraded(count: usize) -> UpgradedSet {
     }
 }
 
+#[expect(
+    clippy::panic,
+    reason = "a lost delivery is a bench invariant failure, reported where it happened"
+)]
 fn deliver_one(pair: &mut UpgradedSet, index: usize) {
     let (id, stream) = *pair.streams.get(index).expect("stream index in range");
     pair.server
         .send_stream(id, stream, Bytes::from_static(&[1]))
         .expect("send");
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
     loop {
         for event in pair.client.poll(Now::from_millis(0)).expect("poll client") {
-            if let TransportEvent::StreamData {
-                id,
-                stream_id,
-                data,
-                ..
-            } = event
-            {
-                assert_eq!(&data[..], [1], "unexpected payload");
-                pair.client
-                    .ack_stream(id, stream_id, data.len())
-                    .expect("ack");
-                // Lets the server take the window update back.
-                pair.server.poll(Now::from_millis(0)).expect("poll server");
-                return;
+            match event {
+                TransportEvent::StreamData {
+                    id,
+                    stream_id,
+                    data,
+                    ..
+                } => {
+                    assert_eq!(&data[..], [1], "unexpected payload");
+                    pair.client
+                        .ack_stream(id, stream_id, data.len())
+                        .expect("ack");
+                    // Lets the server take the window update back.
+                    pair.server.poll(Now::from_millis(0)).expect("poll server");
+                    return;
+                }
+                TransportEvent::Error { id, message } => {
+                    panic!("connection {id} failed while waiting on stream {index}: {message}")
+                }
+                TransportEvent::Closed { id } => {
+                    panic!("connection {id} closed while waiting on stream {index}")
+                }
+                _ => {}
             }
         }
+        assert!(
+            Instant::now() < deadline,
+            "byte on stream {index} never arrived"
+        );
     }
 }
 
