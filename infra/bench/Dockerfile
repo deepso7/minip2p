@@ -19,12 +19,9 @@ RUN apt-get update \
       build-essential \
       bzip2 \
       ca-certificates \
-      clang \
-      cmake \
       curl \
       git \
       jq \
-      libclang-dev \
       pkg-config \
       python3 \
     && rm -rf /var/lib/apt/lists/* \

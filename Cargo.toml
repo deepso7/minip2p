@@ -49,12 +49,6 @@ keywords = ["libp2p", "peer-to-peer", "p2p", "networking", "sans-io"]
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
-# Temporary Android allocator-hook fix. Remove when cloudflare/boring#518 is
-# released on crates.io.
-[patch.crates-io]
-boring = { git = "https://github.com/deepso7/boring", rev = "de6ec29406df54911ea50dec47f40d6b6e4d6ef7" }
-boring-sys = { git = "https://github.com/deepso7/boring", rev = "de6ec29406df54911ea50dec47f40d6b6e4d6ef7" }
-
 [workspace.lints.clippy]
 # Don't Panic - prevent panics from unwraps and unsafe slicing or indexing
 string_slice = "warn"

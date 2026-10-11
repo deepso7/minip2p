@@ -12,10 +12,11 @@ pub struct QuicLimits {
     pub max_connections: usize,
     /// Maximum locally initiated bidirectional streams per connection.
     pub max_streams_per_connection: u64,
-    /// Maximum application bytes queued per connection beyond what quiche
-    /// accepts immediately, shared by all its streams. Must be non-zero.
+    /// Maximum application bytes queued per connection beyond what the QUIC
+    /// engine accepts immediately, shared by all its streams. Must be
+    /// non-zero.
     ///
-    /// A write takes what quiche accepts now plus what fits here, regardless
+    /// A write takes what the engine accepts now plus what fits here, regardless
     /// of the peer's flow-control credit, and returns
     /// [`TransportError::Full`](minip2p_transport::TransportError::Full) with
     /// the rest. Armed streams get a
@@ -26,11 +27,11 @@ pub struct QuicLimits {
     /// `WouldBlock`.
     pub max_pending_datagrams: usize,
     /// QUIC idle timeout advertised to peers, in milliseconds. Must be
-    /// greater than zero: quiche interprets zero as "no timeout", so
-    /// transport construction rejects it.
+    /// greater than zero: QUIC interprets zero as "no timeout", so transport
+    /// construction rejects it.
     ///
-    /// Quiet connections send an ack-eliciting packet at half this value so
-    /// the idle timer does not fire on a live but silent path.
+    /// Quiet connections send an ack-eliciting keepalive at half this value
+    /// so the idle timer does not fire on a live but silent path.
     pub idle_timeout_ms: u64,
     /// Require a stateless Retry before allocating an inbound connection.
     pub require_address_validation: bool,
@@ -53,7 +54,7 @@ impl Default for QuicLimits {
 ///
 /// QUIC always uses mutual libp2p TLS in minip2p, so a node identity is
 /// mandatory. A TLS certificate is auto-generated from the keypair, and the
-/// remote peer's identity is verified automatically after each QUIC handshake.
+/// remote peer's identity is verified inside each QUIC handshake.
 #[derive(Clone, Debug)]
 pub struct QuicNodeConfig {
     /// Ed25519 host keypair for libp2p TLS identity.
@@ -66,8 +67,8 @@ impl QuicNodeConfig {
     /// Creates a configuration from an Ed25519 host keypair.
     ///
     /// A libp2p-spec TLS certificate is auto-generated from the keypair. Both
-    /// dialing and listening are enabled. Peer identity is verified
-    /// automatically after each QUIC handshake.
+    /// dialing and listening are enabled. Peer identity is verified inside
+    /// each QUIC handshake.
     pub fn new(keypair: Ed25519Keypair) -> Self {
         Self {
             keypair,

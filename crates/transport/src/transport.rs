@@ -67,9 +67,9 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 ///   `StreamClosed`, or `Closed`); those tell the holder to drop its tail.
 /// - Temporary send pressure never tears down a connection.
 /// - Any error other than `Full` says nothing about how much was accepted:
-///   a transport may queue a prefix and then fail to flush it (QUIC reports a
-///   socket error that way). Treat such a stream as broken rather than
-///   retrying the whole payload, which could repeat that prefix.
+///   a transport may queue a prefix and then fail. Treat such a stream as
+///   broken rather than retrying the whole payload, which could repeat that
+///   prefix.
 ///
 /// Reads follow the read-side contract:
 ///
@@ -103,12 +103,12 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 /// sample they were given and report the resulting [`Deadline`] from
 /// [`next_deadline`](Transport::next_deadline).
 ///
-/// A portable adapter should read no clock of its own. An adapter wrapping a
-/// library that keeps its own internal clock (minip2p's QUIC adapter wraps
-/// quiche, which does) may still do so, but everything it reports to the host
-/// -- deadlines above all -- must be expressed on the timeline of the samples
-/// it was given, never on the wrapped library's. Such an adapter is
-/// inherently `std`-only.
+/// A portable adapter should read no clock of its own. An adapter that needs
+/// finer time than the host's millisecond samples may still keep a clock
+/// (minip2p's QUIC adapter samples an `Instant` once per poll and runs its
+/// engine's timers on it), but everything it reports to the host -- deadlines
+/// above all -- must be expressed on the timeline of the samples it was given,
+/// never on its own. Such an adapter is inherently `std`-only.
 pub trait Transport {
     /// Initiate an outbound connection and return its allocated connection id.
     ///

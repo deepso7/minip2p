@@ -6,33 +6,27 @@
 
 use minip2p_core::{PeerAddr, Protocol};
 use minip2p_platform::{Deadline, Now};
-use minip2p_quic::{
-    QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport, STREAM_RECEIVE_WINDOW,
-};
+use minip2p_quic::{QuicLimits, QuicNodeConfig, QuicTransport, STREAM_RECEIVE_WINDOW};
 use minip2p_transport::{
     BlockingTransport, Bytes, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,
     TransportEvent, WaitOutcome,
 };
 
 mod common;
-use common::{drive_pair_once, setup_pair};
+use common::{drive_pair_once, loopback, peer_addr, setup_pair};
 
 fn setup_pair_with_client_limits(limits: QuicLimits) -> (QuicTransport, QuicTransport, PeerAddr) {
-    let mut server = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server");
-    let client = QuicTransport::new(
-        QuicNodeConfig::generate().with_limits(limits),
-        "127.0.0.1:0",
-    )
-    .expect("client");
+    let mut server = loopback(QuicNodeConfig::generate());
+    let client = loopback(QuicNodeConfig::generate().with_limits(limits));
 
-    server.listen_on_bound_addr().expect("listen");
-    let peer_addr = server.local_peer_addr().expect("peer addr");
+    server.listen_on_bound_addrs().expect("listen");
+    let peer_addr = peer_addr(&server);
     (server, client, peer_addr)
 }
 
 #[test]
 fn dual_stack_endpoint_exposes_ipv4_and_ipv6_local_addresses() {
-    let endpoint = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("dual stack bind");
+    let endpoint = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("dual stack bind");
     let addrs = endpoint.local_addresses();
 
     assert!(
@@ -119,9 +113,8 @@ fn connect_pair(
 
 #[test]
 fn listen_returns_the_resolved_listen_address_and_event_matches() {
-    let mut listener =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener");
-    let requested = listener.local_multiaddr();
+    let mut listener = loopback(QuicNodeConfig::generate());
+    let requested = listener.local_addresses().remove(0);
 
     let resolved = listener.listen(&requested).expect("listen");
     assert_eq!(resolved, requested);
@@ -157,7 +150,7 @@ fn connected_token(events: &[TransportEvent], conn: ConnectionId) -> Option<Conn
 #[test]
 fn both_ends_of_a_connection_share_its_token() {
     // The default config validates addresses with a Retry, so this also
-    // covers the dialer switching to the Retry's connection id.
+    // covers a handshake through Retry. The token is a TLS exporter value.
     let (mut server, mut client, peer_addr) = setup_pair();
     let (server_conn, client_conn, server_events, client_events) =
         connect_pair(&mut server, &mut client, &peer_addr);
@@ -325,9 +318,9 @@ fn zero_pending_limits_are_rejected() {
         (zero_datagrams, "max_pending_datagrams"),
         (zero_stream_bytes, "max_pending_stream_bytes"),
     ] {
-        let result = QuicTransport::new(
+        let result = QuicTransport::bind(
             QuicNodeConfig::generate().with_limits(limits),
-            "127.0.0.1:0",
+            &["/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr")],
         );
         let error = match result {
             Ok(_) => panic!("zero {field} must be rejected"),
@@ -341,7 +334,7 @@ fn zero_pending_limits_are_rejected() {
 }
 
 #[test]
-fn write_larger_than_queue_cap_succeeds_when_quiche_accepts_it() {
+fn write_larger_than_queue_cap_succeeds_when_the_engine_accepts_it() {
     let limits = QuicLimits {
         max_pending_stream_bytes: 8,
         ..QuicLimits::default()
@@ -350,8 +343,9 @@ fn write_larger_than_queue_cap_succeeds_when_quiche_accepts_it() {
     let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     let stream = client.open_stream(client_conn).expect("open stream");
 
-    // 9 bytes exceed the queue cap but fit quiche's send capacity on an idle
-    // connection, so the write goes straight to quiche instead of failing.
+    // 9 bytes exceed the queue cap but fit the engine's send capacity on an
+    // idle connection, so the write goes straight to the engine instead of
+    // failing.
     client
         .send_stream(client_conn, stream, Bytes::from(vec![7; 9]))
         .expect("write above the queue cap must succeed via direct send");
@@ -375,6 +369,30 @@ fn write_larger_than_queue_cap_succeeds_when_quiche_accepts_it() {
     assert_eq!(received, 9, "server must receive the full direct write");
 }
 
+/// The engine copies what it accepts: a large write cut short by the queue
+/// cap leaves the caller's allocation owned by the caller alone, not pinned
+/// behind the few bytes the engine took.
+#[test]
+fn a_partially_accepted_write_does_not_pin_the_callers_buffer() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 1024,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let stream = client.open_stream(client_conn).expect("open stream");
+
+    let payload = Bytes::from(vec![7; 8 * STREAM_RECEIVE_WINDOW]);
+    match client.send_stream(client_conn, stream, payload.clone()) {
+        Err(TransportError::Full { unsent, .. }) => drop(unsent),
+        other => panic!("expected Full, got {other:?}"),
+    }
+    assert!(
+        payload.is_unique(),
+        "neither the engine nor the queue may hold a slice of the payload"
+    );
+}
+
 #[test]
 fn a_write_past_the_pending_cap_is_full_and_resumes_on_writable() {
     let limits = QuicLimits {
@@ -385,9 +403,11 @@ fn a_write_past_the_pending_cap_is_full_and_resumes_on_writable() {
     let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     let stream = client.open_stream(client_conn).expect("open stream");
 
-    // Far beyond quiche's fresh-connection send capacity plus the queue cap:
-    // the transport keeps what fits and hands back exactly the rest.
-    let payload: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
+    // Beyond the peer's stream credit plus the queue cap: the transport
+    // keeps what fits and hands back exactly the rest.
+    let payload: Vec<u8> = (0..2 * STREAM_RECEIVE_WINDOW as u32)
+        .map(|i| (i % 251) as u8)
+        .collect();
     let error = client
         .send_stream(client_conn, stream, Bytes::from(payload.clone()))
         .expect_err("a write past the queue cap is Full");
@@ -431,8 +451,13 @@ fn a_write_past_the_pending_cap_is_full_and_resumes_on_writable() {
         }
         for event in server_events {
             match event {
-                TransportEvent::StreamData { id, data, .. } if id == server_conn => {
+                TransportEvent::StreamData {
+                    id,
+                    stream_id,
+                    data,
+                } if id == server_conn => {
                     received.extend_from_slice(&data);
+                    server.ack_stream(id, stream_id, data.len()).expect("ack");
                 }
                 TransportEvent::StreamRemoteWriteClosed { id, .. } if id == server_conn => {
                     remote_closed = true;
@@ -489,7 +514,8 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
         .and_then(TransportError::into_unsent);
 
     // The reader takes what arrives and acknowledges none of it: one window
-    // is delivered, quiche buffers at most another, and the sender stalls.
+    // is delivered, the engine buffers at most another, and the sender
+    // stalls.
     let mut received = Vec::new();
     let mut quiet_rounds = 0;
     while quiet_rounds < 40 {
@@ -519,7 +545,7 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
         resumed
             .iter()
             .any(|event| matches!(event, TransportEvent::StreamData { .. })),
-        "quiche's buffered bytes are read on the ack"
+        "the engine's buffered bytes are read on the ack"
     );
     let mut events = resumed;
     let mut remote_closed = false;
@@ -627,17 +653,13 @@ fn a_reset_after_a_full_unacknowledged_window_is_still_reported() {
 
 #[test]
 fn an_unsettled_stream_holds_its_slot_and_over_acks_fail() {
-    let mut server = QuicTransport::new(
-        QuicNodeConfig::generate().with_limits(QuicLimits {
-            max_streams_per_connection: 1,
-            ..QuicLimits::default()
-        }),
-        "127.0.0.1:0",
-    )
-    .expect("server");
-    let mut client = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("client");
-    server.listen_on_bound_addr().expect("listen");
-    let peer_addr = server.local_peer_addr().expect("peer addr");
+    let mut server = loopback(QuicNodeConfig::generate().with_limits(QuicLimits {
+        max_streams_per_connection: 1,
+        ..QuicLimits::default()
+    }));
+    let mut client = loopback(QuicNodeConfig::generate());
+    server.listen_on_bound_addrs().expect("listen");
+    let peer_addr = peer_addr(&server);
     let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
 
     // A stream that delivers ten bytes and closes in both directions, unread.
@@ -674,8 +696,8 @@ fn an_unsettled_stream_holds_its_slot_and_over_acks_fail() {
     );
 
     // Unsettled, it keeps the only slot: the next inbound stream is refused.
-    // quiche itself already freed the slot, so the client can open and write;
-    // it is the transport that refuses.
+    // The engine itself already freed the slot, so the client can open and
+    // write; it is the transport that refuses.
     assert_eq!(
         open_and_watch(&mut server, &mut client, client_conn),
         (true, false),
@@ -832,7 +854,7 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
 
 #[test]
 fn quiet_pair_stays_up_past_idle_timeout() {
-    // The window has to outlast quiche's effective idle timeout,
+    // The window has to outlast the engine's effective idle timeout,
     // max(idle, 3×PTO), for the test to prove anything. This test runs alone
     // (see `.config/nextest.toml`), which keeps PTO near loopback scale and so
     // the effective timeout near the configured one, and keeps a descheduled
@@ -1044,7 +1066,8 @@ fn reset_stream_emits_stream_closed() {
 }
 
 /// Acking the bytes of a stream reset locally is a no-op: the reset settled
-/// it, so there is nothing left to over-acknowledge.
+/// it, so there is nothing left to over-acknowledge. The transport collects
+/// the settled stream as part of the reset, so no later ack can see it.
 #[test]
 fn acking_a_locally_reset_stream_is_a_no_op() {
     let (mut server, mut client, peer_addr) = setup_pair();
@@ -1085,8 +1108,7 @@ fn acking_a_locally_reset_stream_is_a_no_op() {
 
 #[test]
 fn open_stream_on_unknown_connection_returns_not_found() {
-    let mut transport =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+    let mut transport = loopback(QuicNodeConfig::generate());
 
     let err = transport
         .open_stream(ConnectionId::new(999))
@@ -1096,8 +1118,7 @@ fn open_stream_on_unknown_connection_returns_not_found() {
 
 #[test]
 fn send_on_unknown_connection_returns_not_found() {
-    let mut transport =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+    let mut transport = loopback(QuicNodeConfig::generate());
 
     let err = transport
         .send_stream(
@@ -1115,9 +1136,8 @@ fn send_on_unknown_connection_returns_not_found() {
 /// unrelated packet happens to wake the driver.
 #[test]
 fn events_buffered_outside_poll_report_as_due_work() {
-    let mut transport =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
-    transport.listen_on_bound_addr().expect("listen");
+    let mut transport = loopback(QuicNodeConfig::generate());
+    transport.listen_on_bound_addrs().expect("listen");
 
     // No time sample has been taken (no `poll` yet) and no datagram is
     // queued, so the buffered event is the only thing that can answer here.
@@ -1156,7 +1176,7 @@ fn events_buffered_outside_poll_report_as_due_work() {
 #[test]
 fn dual_stack_endpoint_reports_buffered_events_as_due_work() {
     let mut endpoint =
-        QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("dual stack bind");
+        QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("dual stack bind");
     let listen_addr = endpoint
         .local_addresses()
         .into_iter()
@@ -1180,8 +1200,7 @@ fn dual_stack_endpoint_reports_buffered_events_as_due_work() {
 
 #[test]
 fn poll_returns_empty_when_idle() {
-    let mut transport =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+    let mut transport = loopback(QuicNodeConfig::generate());
 
     let events = transport.poll(common::now()).expect("poll");
     assert!(events.is_empty(), "idle poll must return empty vec");

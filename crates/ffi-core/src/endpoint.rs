@@ -94,6 +94,8 @@ pub(crate) struct EndpointState {
     doorbell_thread_id: Option<std::thread::ThreadId>,
     /// Unsent tails of the bindings' stream writes.
     pub(crate) writes: crate::writes::PendingWrites,
+    /// The peer table last published to `connected_peers`.
+    pub(crate) published_peers: Vec<PeerId>,
 }
 
 impl EndpointState {
@@ -239,6 +241,7 @@ impl P2pEndpoint {
                     driver_thread_id: None,
                     doorbell_thread_id: None,
                     writes: crate::writes::PendingWrites::default(),
+                    published_peers: Vec::new(),
                 }),
                 events: Mutex::default(),
                 stopped: Mutex::new(false),
@@ -268,23 +271,18 @@ impl P2pEndpoint {
     }
 
     /// Returns peers with an established QUIC, TCP, or circuit connection.
+    ///
+    /// Served from a snapshot the driver publishes, so it neither
+    /// interrupts nor waits for the driver. Like the endpoint's peer table,
+    /// it can run ahead of the event stream: it may list a peer whose events
+    /// are not drained yet, or a reconnected peer while an older close is
+    /// still queued.
     pub fn connected_peers(&self) -> Result<Vec<String>, FfiError> {
-        let _pending = PendingCommand::new(&self.shared);
-        let state = self.shared.lock_state();
-        if matches!(state.lifecycle, Lifecycle::Stopping | Lifecycle::Stopped) {
+        let events = self.shared.lock_events();
+        if events.stopped {
             return Err(FfiError::Stopped);
         }
-        state
-            .endpoint
-            .as_ref()
-            .map(|endpoint| {
-                endpoint
-                    .connected_peers()
-                    .into_iter()
-                    .map(|peer| peer.to_base58())
-                    .collect()
-            })
-            .ok_or(FfiError::Stopped)
+        Ok(events.connected_peers.clone())
     }
 
     /// Returns whether Identify has completed for `peer_id`.
@@ -341,6 +339,7 @@ impl P2pEndpoint {
             carry,
             overflow,
             stats,
+            ..
         } = &mut *events;
         let mut delivery = crate::driver::take_delivery(carry, overflow, stats, limit as usize);
         stats.dispatch_attempted = stats
@@ -365,11 +364,11 @@ impl P2pEndpoint {
             let mut state = self.shared.lock_state();
             match state.lifecycle {
                 Lifecycle::Created => {
-                    state.lifecycle = Lifecycle::Stopped;
+                    self.shared.set_lifecycle(&mut state, Lifecycle::Stopped);
                     state.release_endpoint()
                 }
                 Lifecycle::Running => {
-                    state.lifecycle = Lifecycle::Stopping;
+                    self.shared.set_lifecycle(&mut state, Lifecycle::Stopping);
                     None
                 }
                 Lifecycle::Stopping | Lifecycle::Stopped => None,
@@ -617,18 +616,14 @@ impl P2pEndpoint {
     /// Synchronous errors cover malformed targets only.
     pub fn connect(&self, target: crate::ConnectTarget) -> Result<u64, FfiError> {
         let target = crate::connect::parse_connect_target(target)?;
-        let _pending = PendingCommand::new(&self.shared);
-        let mut state = self.shared.lock_state();
-        ensure_accepting_commands(&state)?;
-        let id = state
-            .endpoint
-            .as_mut()
-            .ok_or(FfiError::Stopped)?
-            .connect(target)
-            .map_err(|error| FfiError::InvalidAddress {
-                detail: error.to_string(),
-            })?;
-        Ok(id.as_u64())
+        self.with_endpoint_mut(|endpoint| {
+            endpoint
+                .connect(target)
+                .map(|id| id.as_u64())
+                .map_err(|error| FfiError::InvalidAddress {
+                    detail: error.to_string(),
+                })
+        })
     }
 
     /// Cancels a connection attempt by Connect ID.
@@ -787,7 +782,7 @@ impl P2pEndpoint {
         state.lifecycle = Lifecycle::Running;
         self.shared.driver_running.store(true, Ordering::Release);
         let doorbell_thread_id = spawn(shared, doorbell).map_err(|error| {
-            state.lifecycle = Lifecycle::Stopped;
+            self.shared.set_lifecycle(&mut state, Lifecycle::Stopped);
             state.release_endpoint();
             self.shared.driver_running.store(false, Ordering::Release);
             self.shared.latch_stopped();
@@ -850,6 +845,29 @@ impl Shared {
 
     pub(crate) fn lock_events(&self) -> MutexGuard<'_, crate::driver::EventState> {
         self.events.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Moves `state` to `lifecycle`, and `connected_peers` to `Stopped` with
+    /// it once shutdown begins.
+    pub(crate) fn set_lifecycle(&self, state: &mut EndpointState, lifecycle: Lifecycle) {
+        state.lifecycle = lifecycle;
+        if matches!(lifecycle, Lifecycle::Stopping | Lifecycle::Stopped) {
+            self.lock_events().stopped = true;
+        }
+    }
+
+    /// Publishes `endpoint`'s peer table to `connected_peers` when it differs
+    /// from `published`, the last one published. Called by the driver while
+    /// it holds `state`: membership only changes as the endpoint processes
+    /// transport events in `wait`, so commands (even `disconnect`, which
+    /// queues the close) never need to publish.
+    pub(crate) fn publish_peers(&self, endpoint: &Endpoint, published: &mut Vec<PeerId>) {
+        let peers = endpoint.connected_peers();
+        if peers == *published {
+            return;
+        }
+        self.lock_events().connected_peers = peers.iter().map(PeerId::to_base58).collect();
+        *published = peers;
     }
 
     /// Holds an interrupted driver back until no caller is waiting for
@@ -1626,6 +1644,65 @@ mod tests {
     }
 
     #[test]
+    fn connected_peers_follows_connect_and_disconnect() {
+        let a = P2pEndpoint::new(vec![1; 32], config()).expect("endpoint a");
+        let b = P2pEndpoint::new(vec![2; 32], config()).expect("endpoint b");
+        a.start(Arc::new(NoopDoorbell)).expect("start a");
+        b.start(Arc::new(NoopDoorbell)).expect("start b");
+        let reaches = |expected: &[String]| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if a.connected_peers().expect("running endpoint") == expected {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        };
+
+        a.connect(crate::ConnectTarget::Addresses {
+            addresses: vec![b.listen_addrs()[0].clone()],
+        })
+        .expect("connect");
+        assert!(reaches(&[b.peer_id()]), "lists the peer once connected");
+        a.disconnect(b.peer_id()).expect("disconnect");
+        assert!(reaches(&[]), "drops the peer once closed");
+
+        a.stop();
+        assert!(
+            matches!(a.connected_peers(), Err(FfiError::Stopped)),
+            "reports stopped as soon as stop returns"
+        );
+        b.stop();
+        assert!(a.wait_stopped(5_000));
+        assert!(b.wait_stopped(5_000));
+    }
+
+    #[test]
+    fn connected_peers_neither_waits_for_nor_interrupts_the_driver() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        // A driver parked in `wait` holds the state lock.
+        let mut parked = endpoint.shared.lock_state();
+        let (peers_tx, peers_rx) = std::sync::mpsc::channel();
+        let querier = Arc::clone(&endpoint);
+        std::thread::spawn(move || peers_tx.send(querier.connected_peers()));
+        let peers = peers_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("query completes while the driver holds the state lock");
+        assert!(peers.expect("created endpoint").is_empty());
+        let outcome = parked
+            .endpoint
+            .as_mut()
+            .expect("endpoint")
+            .wait(Duration::from_millis(20))
+            .expect("wait");
+        assert!(!matches!(
+            outcome,
+            minip2p::EndpointWaitOutcome::Interrupted
+        ));
+    }
+
+    #[test]
     fn connected_peers_reports_a_stopped_endpoint() {
         let endpoint = endpoint(config()).expect("endpoint");
         endpoint.stop();
@@ -1792,6 +1869,7 @@ mod tests {
 
         assert!(matches!(error, FfiError::Internal { .. }));
         assert!(endpoint.wait_stopped(0));
+        assert!(matches!(endpoint.connected_peers(), Err(FfiError::Stopped)));
         let state = endpoint.shared.lock_state();
         assert_eq!(state.lifecycle, Lifecycle::Stopped);
         assert!(state.endpoint.is_none());
@@ -1898,6 +1976,7 @@ mod tests {
                 ..
             }]
         ));
+        assert!(matches!(endpoint.connected_peers(), Err(FfiError::Stopped)));
         assert!(endpoint.wait_stopped(0));
     }
 

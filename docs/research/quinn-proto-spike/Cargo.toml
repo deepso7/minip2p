@@ -1,0 +1,38 @@
+[package]
+name = "probe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# minip2p is pinned to the commit the research measured: its quiche-based
+# QuicTransport is the comparison baseline.
+quinn-proto = { version = "0.11.19", default-features = false, features = [
+  "rustls-ring",
+] }
+quinn-udp = { version = "0.6.3", default-features = false }
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+] }
+bytes = "1"
+boring = "4.22.0"
+quiche = { version = "0.29.3", features = ["boringssl-boring-crate"] }
+mio = { version = "1.2", features = ["net", "os-poll", "os-ext"] }
+x509-cert = { version = "0.3.0", default-features = false }
+der = { version = "0.8.2", default-features = false, features = ["alloc"] }
+minip2p-tls = { git = "https://github.com/deepso7/minip2p", rev = "1f53757b946ec844a2e1e771ee8a41cfe38714e6" }
+minip2p-identity = { git = "https://github.com/deepso7/minip2p", rev = "1f53757b946ec844a2e1e771ee8a41cfe38714e6" }
+minip2p-quic = { git = "https://github.com/deepso7/minip2p", rev = "1f53757b946ec844a2e1e771ee8a41cfe38714e6" }
+minip2p-transport = { git = "https://github.com/deepso7/minip2p", rev = "1f53757b946ec844a2e1e771ee8a41cfe38714e6" }
+minip2p-core = { git = "https://github.com/deepso7/minip2p", rev = "1f53757b946ec844a2e1e771ee8a41cfe38714e6" }
+minip2p-platform = { git = "https://github.com/deepso7/minip2p", rev = "1f53757b946ec844a2e1e771ee8a41cfe38714e6" }
+
+[patch.crates-io]
+boring = { git = "https://github.com/deepso7/boring", rev = "de6ec29406df54911ea50dec47f40d6b6e4d6ef7" }
+boring-sys = { git = "https://github.com/deepso7/boring", rev = "de6ec29406df54911ea50dec47f40d6b6e4d6ef7" }
+
+[profile.release]
+debug = 1
+
+# Standalone: not a workspace member.
+[workspace]

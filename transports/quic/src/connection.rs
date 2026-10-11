@@ -1,52 +1,59 @@
-//! Per-connection state management for the QUIC transport.
-//!
-//! Handles the QUIC connection lifecycle, stream multiplexing, send queue
-//! draining, and event emission.
+//! One QUIC connection: the quinn-proto engine plus the adapter's stream
+//! bookkeeping (half-close tracking, write queues, the read gate of ADR 0012,
+//! and stream-slot accounting).
 
-use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::io;
 use std::mem;
-use std::net::{SocketAddr, UdpSocket};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use minip2p_core::PeerId;
-use minip2p_platform::{Deadline, Now};
+use bytes::Bytes;
 use minip2p_transport::{
-    Bytes, ConnectionEndpoint, ConnectionId, ConnectionState, ConnectionToken, StreamId,
-    TransportError, TransportEvent,
+    ConnectionEndpoint, ConnectionId, ConnectionState, ConnectionToken, StreamId, TransportError,
+    TransportEvent,
+};
+use quinn_proto::{
+    ConnectionError, ConnectionHandle, Dir, Event, FinishError, ReadError, StreamEvent, VarInt,
+    WriteError,
 };
 
-use sha2::{Digest, Sha256};
-
+use crate::STREAM_RECEIVE_WINDOW;
 use crate::diagnostics::ConnectionCounters;
-use crate::{PendingDatagram, STREAM_RECEIVE_WINDOW};
+use crate::socket::Sockets;
 
-const SEND_BUF_SIZE: usize = 1350;
+/// TLS exporter label for the connection token both ends derive.
+const TOKEN_LABEL: &[u8] = b"minip2p quic connection token";
 
-/// Why a handshaken peer's identity was rejected: the QUIC close code and
-/// reason sent to the peer, and the message reported to the local caller.
-struct PeerRejection {
-    code: u64,
-    reason: &'static [u8],
-    message: String,
+/// Upper bound on engine passes per service: each pass handles what the
+/// previous one's events and endpoint events produced.
+const MAX_SERVICE_PASSES: usize = 4;
+
+/// What servicing a connection needs from its transport.
+pub(crate) struct Cx<'a> {
+    pub(crate) endpoint: &'a mut quinn_proto::Endpoint,
+    /// Each transmit leaves from the socket of its destination's family.
+    pub(crate) sockets: &'a mut Sockets,
+    /// Reused for every transmit.
+    pub(crate) send_buf: &'a mut Vec<u8>,
+    pub(crate) events: &'a mut Vec<TransportEvent>,
 }
 
 /// A queued write operation for a QUIC stream.
 #[derive(Debug)]
 struct PendingStreamWrite {
-    /// Payload bytes quiche has not accepted yet.
+    /// Payload bytes the engine has not accepted yet.
     bytes: Bytes,
     /// The length `bytes` was counted at. Once the unsent tail is shorter
     /// than half of it, the tail moves to its own buffer so a slice cannot
     /// pin a much larger allocation (ADR 0012).
     counted: usize,
-    /// If true, this write closes the stream's write side.
+    /// If true, this entry is the stream's FIN.
     fin: bool,
 }
 
 impl PendingStreamWrite {
-    /// Creates a data write retaining `bytes`, sliced from a payload counted
-    /// at `counted` bytes.
+    /// A data write retaining `bytes`, sliced from a payload counted at
+    /// `counted` bytes.
     fn data(bytes: Bytes, counted: usize) -> Self {
         let mut write = Self {
             bytes,
@@ -57,7 +64,7 @@ impl PendingStreamWrite {
         write
     }
 
-    /// Creates a FIN-only write (empty payload, closes write side).
+    /// A FIN-only entry (empty payload, closes the write side).
     fn fin() -> Self {
         Self {
             bytes: Bytes::new(),
@@ -66,7 +73,7 @@ impl PendingStreamWrite {
         }
     }
 
-    /// Drops the first `len` bytes, which quiche accepted.
+    /// Drops the first `len` bytes, which the engine accepted.
     fn advance(&mut self, len: usize) {
         self.bytes = self.bytes.slice(len..);
         self.bound_retained();
@@ -92,8 +99,6 @@ struct StreamRuntimeState {
     local_write_closed: bool,
     /// Whether the remote has closed their write side.
     remote_write_closed: bool,
-    /// Whether an IncomingStream event was emitted for this stream.
-    incoming_notified: bool,
     /// Whether a StreamClosed event was emitted.
     closed_notified: bool,
     /// Whether a StreamWriteStopped event was emitted.
@@ -117,98 +122,98 @@ impl StreamRuntimeState {
     }
 }
 
-pub struct QuicConnection {
+/// A local stream handed out by `open_stream` but not yet opened in the
+/// engine, which opens streams only within the peer's credit.
+#[derive(Debug)]
+struct PendingOpen {
+    /// The id it was given; the engine assigns the same one when it opens.
+    id: u64,
+    /// Reset before it was opened: reset and stop it on the wire once it is.
+    reset_on_bind: bool,
+}
+
+/// How one stream scan ended, beyond the data it read.
+enum ScanEnd {
+    /// No more contiguous data for now.
+    Waiting,
+    /// The budget is spent with data (or a gap) still waiting behind it.
+    Gated,
+    /// The peer's FIN was read.
+    Finished,
+    /// The peer reset the stream.
+    Reset,
+}
+
+pub(crate) struct QuicConnection {
     /// Logical connection id assigned by the transport.
     id: ConnectionId,
-    /// The underlying quiche QUIC connection.
-    conn: quiche::Connection,
+    /// The engine's handle, for routing endpoint events.
+    handle: ConnectionHandle,
+    conn: quinn_proto::Connection,
     /// Connection endpoint metadata (transport address + optional peer id).
     endpoint: ConnectionEndpoint,
-    /// Current connection lifecycle state.
     state: ConnectionState,
     /// Per-stream runtime state keyed by raw QUIC stream id.
     stream_states: HashMap<u64, StreamRuntimeState>,
     /// Outbound write queues keyed by raw QUIC stream id. Only streams with
     /// pending output have an entry, so a drain visits nothing else.
     send_queues: HashMap<u64, SendQueue>,
-    /// Scratch copy of the `send_queues` keys for `drain_send_queue`. Kept
-    /// so its capacity is reused: draining a busy connection allocates
-    /// nothing.
+    /// Scratch copy of the `send_queues` keys for `drain_send_queues`. Kept
+    /// so its capacity is reused.
     drain_stream_ids: Vec<u64>,
-    /// Next stream id to allocate (increments by 4 per QUIC spec).
+    /// Next local bidirectional stream id `open_stream` hands out.
     next_local_bidi_stream_id: u64,
-    /// Number of active locally initiated bidirectional streams.
-    active_local_bidi_streams: u64,
-    /// Maximum bidirectional streams per direction allowed by
-    /// configuration: it caps local opens, and the peer's open and
-    /// unsettled streams.
-    max_local_bidi_streams: u64,
-    /// Total application bytes queued but not yet accepted by quiche.
+    /// Streams handed out but not yet opened in the engine, in id order.
+    /// Each holds one reservation against the local stream limit.
+    pending_opens: VecDeque<PendingOpen>,
+    /// Local bidirectional streams opened in the engine whose state the
+    /// adapter still holds.
+    bound_local_bidi_streams: u64,
+    /// Stream limit per direction: it caps local opens, and the peer's open
+    /// and unsettled streams.
+    max_streams: u64,
+    /// Total application bytes queued but not yet accepted by the engine.
     pending_write_bytes: usize,
     /// Maximum queued application bytes for this connection.
     max_pending_write_bytes: usize,
     /// Streams whose last write was Full and that want a `StreamWritable`.
     writable_armed: BTreeSet<u64>,
-    /// Source CIDs the transport has entered into its routing table, so
-    /// reindexing and unindexing never scan the whole table.
-    indexed_cids: Vec<Vec<u8>>,
-    /// Peer's stateless reset token, once entered into the transport's reset
-    /// routing table.
-    indexed_reset_token: Option<u128>,
-    /// Host time of the last packet this connection received.
-    last_recv_ms: Option<u64>,
-    /// An ack-eliciting keepalive has been sent since `last_recv_ms`.
-    ///
-    /// Further pings would restart the idle timer without evidence the peer
-    /// is still there, so one unanswered ping is enough; idle timeout then
-    /// closes a dead path.
-    sent_keepalive_since_recv: bool,
-    /// Makes the next keepalive's scheduling fail, as quiche can.
-    #[cfg(test)]
-    fail_keepalive: bool,
-    /// A packet quiche paced into the future (`SendInfo::at`), held until its
-    /// send time. While one is held, `flush` generates nothing further for
-    /// this connection, so packets leave in order and never early.
-    paced: Option<PacedPacket>,
-    /// Something may have left stream input for `poll_streams` to find:
-    /// readable data, or a peer's STOP_SENDING.
-    ///
-    /// Set before every `conn.recv` (even a failing one: quiche may apply
-    /// some frames before erroring) and before a local reset, which returns
-    /// unsent credit and can re-list a stopped stream as writable while no
-    /// packet arrives. Idle polls skip the scans while it is clear.
-    streams_dirty: bool,
+    /// Streams that spent their receive budget with input still waiting in
+    /// the engine. The engine raises `Readable` only when data arrives, so
+    /// `ack_stream` rescans these.
+    gated: BTreeSet<u64>,
+    /// Scratch for one scan's chunks before they are copied out.
+    read_chunks: Vec<Bytes>,
+    /// The engine's next timeout, cached after every service.
+    timeout: Option<Instant>,
+    /// The last service stopped with work left: output the socket pushed
+    /// back on, or engine passes still producing events.
+    unfinished: bool,
     /// Diagnostic hooks; empty unless the `diagnostics` feature is on.
     counters: ConnectionCounters,
 }
 
-/// Whether a flush waits for quiche's pacing send times.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Pacing {
-    Honour,
-    Ignore,
-}
-
-/// An encoded packet waiting for its pacing send time.
-struct PacedPacket {
-    datagram: PendingDatagram,
-    /// quiche's intended send time, on its own `Instant` clock.
-    at: Instant,
+/// The engine's id for a raw stream id the adapter tracks.
+fn engine_stream(raw: u64) -> quinn_proto::StreamId {
+    VarInt::from_u64(raw)
+        .expect("tracked stream ids come from the engine or follow its sequence")
+        .into()
 }
 
 impl QuicConnection {
-    pub fn new(
+    pub(crate) fn new(
         id: ConnectionId,
-        conn: quiche::Connection,
+        handle: ConnectionHandle,
+        conn: quinn_proto::Connection,
         endpoint: ConnectionEndpoint,
-        max_local_bidi_streams: u64,
+        max_streams: u64,
         max_pending_write_bytes: usize,
         counters: ConnectionCounters,
     ) -> Self {
-        let next_local_bidi_stream_id = if conn.is_server() { 1 } else { 0 };
-
+        let next_local_bidi_stream_id = u64::from(conn.side().is_server());
         Self {
             id,
+            handle,
             conn,
             endpoint,
             state: ConnectionState::Connecting,
@@ -216,127 +221,49 @@ impl QuicConnection {
             send_queues: HashMap::new(),
             drain_stream_ids: Vec::new(),
             next_local_bidi_stream_id,
-            active_local_bidi_streams: 0,
-            max_local_bidi_streams,
+            pending_opens: VecDeque::new(),
+            bound_local_bidi_streams: 0,
+            max_streams,
             pending_write_bytes: 0,
             max_pending_write_bytes,
             writable_armed: BTreeSet::new(),
-            indexed_cids: Vec::new(),
-            indexed_reset_token: None,
-            last_recv_ms: None,
-            sent_keepalive_since_recv: false,
-            #[cfg(test)]
-            fail_keepalive: false,
-            paced: None,
-            streams_dirty: false,
+            gated: BTreeSet::new(),
+            read_chunks: Vec::new(),
+            timeout: None,
+            unfinished: false,
             counters,
         }
     }
 
-    /// Returns quiche source CIDs not yet in the transport's routing table,
-    /// recording them as indexed.
-    pub fn take_unindexed_source_cids(&mut self) -> Vec<Vec<u8>> {
-        let mut new_cids: Vec<Vec<u8>> = Vec::new();
-        for cid in self.conn.source_ids() {
-            let cid = cid.as_ref();
-            if !self.indexed_cids.iter().any(|known| known == cid) {
-                new_cids.push(cid.to_vec());
-            }
-        }
-        self.indexed_cids.extend(new_cids.iter().cloned());
-        new_cids
-    }
-
-    /// Returns source CIDs quiche has retired since the last call, dropping
-    /// them from the indexed set so the transport can unroute them.
-    ///
-    /// The transport never issues extra source CIDs (`new_scid`), so peers
-    /// have nothing to rotate onto today; this keeps the table exact if it
-    /// ever does.
-    pub fn take_retired_source_cids(&mut self) -> Vec<Vec<u8>> {
-        let mut retired = Vec::new();
-        while let Some(cid) = self.conn.retired_scid_next() {
-            self.indexed_cids.retain(|known| known != cid.as_ref());
-            retired.push(cid.to_vec());
-        }
-        retired
-    }
-
-    /// Returns the peer's stateless reset token the first time it is known
-    /// (after the peer's transport parameters arrive), recording it as indexed.
-    ///
-    /// Only servers advertise one, and it is the only token quiche checks when
-    /// deciding whether an undecryptable packet is a reset.
-    pub fn take_unindexed_reset_token(&mut self) -> Option<u128> {
-        if self.indexed_reset_token.is_some() {
-            return None;
-        }
-        self.indexed_reset_token = self.conn.peer_transport_params()?.stateless_reset_token;
-        self.indexed_reset_token
-    }
-
-    /// The reset token the transport routes to this connection, if any.
-    pub fn indexed_reset_token(&self) -> Option<u128> {
-        self.indexed_reset_token
-    }
-
-    /// Records a CID the transport indexed outside of quiche's source-id set
-    /// (e.g. the client-chosen destination CID on an accepted connection).
-    pub fn note_indexed_cid(&mut self, cid: Vec<u8>) {
-        if !self.indexed_cids.contains(&cid) {
-            self.indexed_cids.push(cid);
-        }
-    }
-
-    /// All CIDs the transport currently routes to this connection.
-    pub fn indexed_cids(&self) -> &[Vec<u8>] {
-        &self.indexed_cids
-    }
-
-    /// This connection's diagnostic counters so far.
-    #[cfg(feature = "diagnostics")]
-    pub(crate) fn diagnostics(&self) -> crate::ConnectionDiagnostics {
-        self.counters.snapshot()
-    }
-
-    /// Application bytes queued but not yet accepted by quiche.
-    #[cfg(test)]
-    pub(crate) fn pending_write_bytes(&self) -> usize {
-        self.pending_write_bytes
-    }
-
-    /// Streams waiting for a `StreamWritable`.
-    #[cfg(test)]
-    pub(crate) fn writable_armed_count(&self) -> usize {
-        self.writable_armed.len()
-    }
-
-    /// Number of streams with queued writes.
-    #[cfg(test)]
-    pub(crate) fn queued_stream_count(&self) -> usize {
-        self.send_queues.len()
-    }
-
-    /// Drops `raw_stream_id`'s queued writes and their byte accounting.
-    fn drop_send_queue(&mut self, raw_stream_id: u64) {
-        if let Some(queue) = self.send_queues.remove(&raw_stream_id) {
-            self.pending_write_bytes = self.pending_write_bytes.saturating_sub(unsent_bytes(queue));
-        }
-    }
-
-    pub fn endpoint(&self) -> &ConnectionEndpoint {
+    pub(crate) fn endpoint(&self) -> &ConnectionEndpoint {
         &self.endpoint
     }
 
-    pub fn is_server(&self) -> bool {
-        self.conn.is_server()
+    pub(crate) fn is_server(&self) -> bool {
+        self.conn.side().is_server()
     }
 
-    pub fn is_closed(&self) -> bool {
-        self.conn.is_closed()
+    /// Whether the engine is done with this connection, which the transport
+    /// then removes and reports `Closed`.
+    pub(crate) fn is_drained(&self) -> bool {
+        self.conn.is_drained()
     }
 
-    /// Whether a local close has begun, ending every write side.
+    /// The engine's handle for this connection.
+    pub(crate) fn handle(&self) -> ConnectionHandle {
+        self.handle
+    }
+
+    /// Runs a closed connection's close period out at once, so the engine
+    /// drains it without waiting.
+    pub(crate) fn expire(&mut self) {
+        // Closing stops every other timer, so the one left is the close.
+        if let Some(close) = self.conn.poll_timeout() {
+            self.conn.handle_timeout(close);
+        }
+    }
+
+    /// Whether a close has begun, ending every write side.
     pub(crate) fn is_closing(&self) -> bool {
         matches!(
             self.state,
@@ -344,291 +271,428 @@ impl QuicConnection {
         )
     }
 
-    /// Returns the duration until quiche next needs timer service.
-    pub(crate) fn timeout(&self) -> Option<Duration> {
-        self.conn.timeout()
+    /// The engine's next timeout, as of the last service.
+    pub(crate) fn timeout(&self) -> Option<Instant> {
+        self.timeout
     }
 
-    /// Time until a held paced packet is due, if one is held.
-    pub(crate) fn pacing_delay(&self) -> Option<Duration> {
-        self.paced
-            .as_ref()
-            .map(|paced| paced.at.saturating_duration_since(Instant::now()))
+    /// Whether the last service left work that needs another without any
+    /// packet or timer to prompt it.
+    pub(crate) fn is_unfinished(&self) -> bool {
+        self.unfinished
     }
 
-    /// The held paced packet's bytes and send time.
-    #[cfg(test)]
-    pub(crate) fn paced_packet(&self) -> Option<(&[u8], Instant)> {
-        self.paced
-            .as_ref()
-            .map(|paced| (paced.datagram.bytes.as_slice(), paced.at))
-    }
-
-    /// Makes the next keepalive fail to schedule.
-    #[cfg(test)]
-    pub(crate) fn fail_next_keepalive(&mut self) {
-        self.fail_keepalive = true;
-    }
-
-    /// Moves the held paced packet's send time to `at`.
-    #[cfg(test)]
-    pub(crate) fn repace_held_packet(&mut self, at: Instant) {
-        self.paced.as_mut().expect("a held packet").at = at;
-    }
-
-    /// When this connection next wants a keepalive poll, if it is quiet.
-    pub(crate) fn keepalive_deadline(&self, interval_ms: u64) -> Option<Deadline> {
-        if self.state != ConnectionState::Connected || self.sent_keepalive_since_recv {
-            return None;
-        }
-        Some(Deadline::from_millis(
-            self.last_recv_ms?.saturating_add(interval_ms),
-        ))
-    }
-
-    /// Sends an ack-eliciting packet if the connection has been quiet long
-    /// enough. One attempt per receive, whether or not it is sent; a dead
-    /// peer is then left to idle-timeout.
-    pub fn maybe_keepalive(
-        &mut self,
-        now: Now,
-        interval_ms: u64,
-        socket: &UdpSocket,
-        events: &mut Vec<TransportEvent>,
-        pending_datagrams: &mut VecDeque<PendingDatagram>,
-        max_pending_datagrams: usize,
-    ) -> Result<(), TransportError> {
-        if self.state != ConnectionState::Connected || self.sent_keepalive_since_recv {
-            return Ok(());
-        }
-        let Some(last) = self.last_recv_ms else {
-            return Ok(());
-        };
-        if now.monotonic_ms.saturating_sub(last) < interval_ms {
-            return Ok(());
-        }
-        #[cfg(test)]
-        let scheduled = if core::mem::take(&mut self.fail_keepalive) {
-            Err(quiche::Error::InvalidState)
-        } else {
-            self.conn.send_ack_eliciting()
-        };
-        #[cfg(not(test))]
-        let scheduled = self.conn.send_ack_eliciting();
-        // Spent even when quiche refuses it: otherwise the deadline stays in
-        // the past and the driver spins retrying. Idle timeout still closes a
-        // dead path, as after any unanswered keepalive.
-        self.sent_keepalive_since_recv = true;
-        match scheduled {
-            Ok(()) | Err(_) => {}
-        }
-        self.drain_send_queue(events);
-        self.flush(socket, pending_datagrams, max_pending_datagrams)
-    }
-
-    /// Advances quiche's loss-recovery and idle timers when they are due.
-    pub fn handle_timeout(
-        &mut self,
-        socket: &UdpSocket,
-        events: &mut Vec<TransportEvent>,
-        pending_datagrams: &mut VecDeque<PendingDatagram>,
-        max_pending_datagrams: usize,
-    ) -> Result<(), TransportError> {
-        let timer_due = self.timeout().is_some_and(|timeout| timeout.is_zero());
-        // A due paced packet counts too: before the handshake completes no
-        // other per-poll path flushes, and `next_deadline` would report it due
-        // on every poll.
-        let paced_due = self.pacing_delay().is_some_and(|delay| delay.is_zero());
-        if !timer_due && !paced_due {
-            return Ok(());
-        }
-
-        if timer_due {
-            self.conn.on_timeout();
-            self.drain_send_queue(events);
-        }
-        self.flush(socket, pending_datagrams, max_pending_datagrams)
-    }
-
-    /// Feeds one received datagram to quiche.
-    ///
-    /// Flushes only while the handshake is in progress, on the transition to
-    /// established, and on peer rejection. An established connection's
-    /// output is left for the caller's `poll_streams` after the receive
-    /// batch, which must run for every connection that received datagrams.
-    //
-    // These arguments are the complete I/O context for a single datagram.
-    // Keeping them explicit makes this adapter easy to embed and avoids a
-    // second mutable runtime object on the packet hot path.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a packet needs the complete explicit I/O context in this sans-runtime adapter"
-    )]
-    pub fn recv_packet(
-        &mut self,
-        buf: &mut [u8],
-        from: SocketAddr,
-        local: SocketAddr,
-        now: Now,
-        socket: &UdpSocket,
-        events: &mut Vec<TransportEvent>,
-        pending_datagrams: &mut VecDeque<PendingDatagram>,
-        max_pending_datagrams: usize,
-    ) -> Result<(), TransportError> {
-        let recv_info = quiche::RecvInfo { from, to: local };
-
+    /// Feeds a datagram (or new connection ids) the endpoint routed here.
+    pub(crate) fn handle_event(&mut self, event: quinn_proto::ConnectionEvent) {
         self.counters.datagram_received();
-        self.streams_dirty = true;
-        match self.conn.recv(buf, recv_info) {
-            Ok(_) => {
-                self.last_recv_ms = Some(now.monotonic_ms);
-                self.sent_keepalive_since_recv = false;
+        self.conn.handle_event(event);
+    }
+
+    /// This connection's diagnostic counters so far.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn diagnostics(&self) -> crate::ConnectionDiagnostics {
+        self.counters.snapshot(&self.conn.stats())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_write_bytes(&self) -> usize {
+        self.pending_write_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn writable_armed_count(&self) -> usize {
+        self.writable_armed.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_stream_count(&self) -> usize {
+        self.send_queues.len()
+    }
+
+    /// Local stream slots in use: opened streams still held plus pending
+    /// opens.
+    #[cfg(test)]
+    pub(crate) fn local_slots_used(&self) -> u64 {
+        self.bound_local_bidi_streams + self.pending_opens.len() as u64
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_gated(&self, stream_id: StreamId) -> bool {
+        self.gated.contains(&stream_id.as_u64())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn engine(&mut self) -> &mut quinn_proto::Connection {
+        &mut self.conn
+    }
+
+    /// Runs the engine: due timers, application events, queued writes and
+    /// pending opens, endpoint events, then output. Returns the first hard
+    /// socket error the output hit, whose datagram was dropped as lost.
+    pub(crate) fn service(&mut self, now: Instant, cx: &mut Cx<'_>) -> Option<io::Error> {
+        self.unfinished = true;
+        for _ in 0..MAX_SERVICE_PASSES {
+            if self
+                .conn
+                .poll_timeout()
+                .is_some_and(|timeout| timeout <= now)
+            {
+                self.conn.handle_timeout(now);
             }
-            Err(quiche::Error::Done) => {
-                self.last_recv_ms = Some(now.monotonic_ms);
-                self.sent_keepalive_since_recv = false;
+            let mut progressed = false;
+            while let Some(event) = self.conn.poll() {
+                progressed = true;
+                self.on_event(event, now, cx);
             }
-            Err(e) => {
-                events.push(TransportEvent::Error {
-                    id: self.id,
-                    message: format!("recv error: {e}"),
-                });
-                return Ok(());
+            self.bind_pending_opens(now, cx.events);
+            self.drain_send_queues(now, cx.events);
+            // Endpoint events (new connection ids, retirements, the final
+            // `Drained`) go out before the transmit below, so their output
+            // leaves in this service.
+            while let Some(event) = self.conn.poll_endpoint_events() {
+                progressed = true;
+                if let Some(event) = cx.endpoint.handle_event(self.handle, event) {
+                    self.conn.handle_event(event);
+                }
+            }
+            if !progressed {
+                self.unfinished = false;
+                break;
             }
         }
+        let failure = self.transmit(now, cx);
+        self.timeout = self.conn.poll_timeout();
+        self.gc_closed_streams();
+        failure
+    }
 
-        if self.state == ConnectionState::Connecting && self.conn.is_established() {
-            self.state = ConnectionState::Connected;
-            self.drain_send_queue(events);
-            self.counters.receive_flush();
-            self.flush(socket, pending_datagrams, max_pending_datagrams)?;
-
-            // Auto-verify the remote peer's identity from their TLS certificate.
-            // Prefer the caller's wall-clock sample; fall back to the system
-            // clock when the caller's platform supplied none.
-            let unix_now = now
-                .unix_seconds
-                .map_or_else(crate::unix_time, Duration::from_secs);
-            match self.verify_peer_identity(unix_now) {
-                Ok(verified_peer_id) => {
-                    self.endpoint.set_peer_id(verified_peer_id);
-                    self.endpoint.set_token(self.shared_token());
-                }
-                Err(rejection) => {
-                    events.push(TransportEvent::Error {
-                        id: self.id,
-                        message: rejection.message,
-                    });
-                    if let Err(error) = self.conn.close(true, rejection.code, rejection.reason) {
-                        events.push(TransportEvent::Error {
-                            id: self.id,
-                            message: format!("failed to close rejected peer connection: {error}"),
-                        });
-                    }
-                    self.state = ConnectionState::Closing;
-                    self.counters.receive_flush();
-                    self.flush(socket, pending_datagrams, max_pending_datagrams)?;
-                    return Ok(());
-                }
+    /// Sends the engine's output until it has none, the socket pushes back,
+    /// or the retry queue has no room left for another datagram.
+    fn transmit(&mut self, now: Instant, cx: &mut Cx<'_>) -> Option<io::Error> {
+        self.counters.flush();
+        loop {
+            // Recomputed for every transmit: retained datagrams shrink it.
+            let allowance = cx
+                .sockets
+                .for_addr(self.conn.remote_address())
+                .map_or(0, |socket| socket.allowance());
+            if allowance == 0 {
+                self.unfinished = true;
+                break;
             }
+            cx.send_buf.clear();
+            let Some(transmit) = self.conn.poll_transmit(now, allowance, cx.send_buf) else {
+                break;
+            };
+            let (Some(contents), Some(socket)) = (
+                cx.send_buf.get(..transmit.size),
+                cx.sockets.for_addr(transmit.destination),
+            ) else {
+                // No socket of that family: lost, like any unroutable packet.
+                continue;
+            };
+            match socket.send(&transmit, contents) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.unfinished = true;
+                    break;
+                }
+                // Stop rather than hammer a dead route within one service.
+                Err(error) => return Some(error),
+            }
+        }
+        None
+    }
 
-            events.push(TransportEvent::Connected {
+    fn on_event(&mut self, event: Event, now: Instant, cx: &mut Cx<'_>) {
+        match event {
+            Event::Connected => self.on_connected(now, cx),
+            Event::ConnectionLost { reason } => self.on_lost(&reason, cx.events),
+            Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => self.accept_streams(cx.events),
+            Event::Stream(StreamEvent::Readable { id }) => self.scan(u64::from(id), cx.events),
+            Event::Stream(StreamEvent::Writable { id }) => {
+                self.drain_stream(u64::from(id), now, cx.events);
+            }
+            Event::Stream(StreamEvent::Stopped { id, error_code }) => {
+                self.on_stopped(u64::from(id), error_code, cx.events);
+            }
+            Event::Stream(StreamEvent::Available { dir: Dir::Bi }) => {
+                self.bind_pending_opens(now, cx.events);
+            }
+            // Unidirectional streams are never granted, half-close is the
+            // adapter's own bookkeeping, and DATAGRAM is not advertised.
+            Event::Stream(_)
+            | Event::HandshakeDataReady
+            | Event::DatagramReceived
+            | Event::DatagramsUnblocked => {}
+        }
+    }
+
+    /// The handshake verified the peer inside TLS; record who it is and the
+    /// token both ends derive, then report the connection.
+    fn on_connected(&mut self, now: Instant, cx: &mut Cx<'_>) {
+        let identity = self.conn.crypto_session().peer_identity();
+        let Some(peer_id) = crate::tls::peer_id_from_identity(identity) else {
+            self.fail_connection(
+                now,
+                "peer identity unavailable after the handshake".into(),
+                cx.events,
+            );
+            return;
+        };
+        let mut token = [0u8; 32];
+        // Left unset rather than guessed if the exporter fails, as the
+        // transport contract asks.
+        if self
+            .conn
+            .crypto_session()
+            .export_keying_material(&mut token, TOKEN_LABEL, b"")
+            .is_ok()
+        {
+            self.endpoint.set_token(ConnectionToken::new(token));
+        }
+        let previous = self.endpoint.peer_id().cloned();
+        let changed = previous.as_ref() != Some(&peer_id);
+        self.endpoint.set_peer_id(peer_id);
+        self.state = ConnectionState::Connected;
+        cx.events.push(TransportEvent::Connected {
+            id: self.id,
+            endpoint: self.endpoint.clone(),
+        });
+        if changed {
+            cx.events.push(TransportEvent::PeerIdentityVerified {
                 id: self.id,
                 endpoint: self.endpoint.clone(),
+                previous_peer_id: previous,
             });
-        } else if !self.conn.is_established() {
-            self.drain_send_queue(events);
-            self.counters.receive_flush();
-            self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         }
-        // Once established, output waits for the `poll_streams` that follows
-        // the receive batch: quiche has no delayed-ACK timer, so flushing per
-        // datagram sends an ACK per packet and squeezes packets into slivers
-        // of free congestion window. `poll_streams` flushes exactly when
-        // `is_established` holds, so nothing deferred here is stranded.
-
-        Ok(())
     }
 
-    /// Derives the connection's token from its two connection IDs.
+    /// The engine lost the connection; `Closed` follows once it drains.
     ///
-    /// Once the handshake completes, each end's source CID is the other's
-    /// destination CID: the listener takes the dialer's CID from its first
-    /// Initial, and quiche replaces the dialer's random initial destination
-    /// with the listener's CID from the listener's first Initial (or Retry).
-    /// Hashing the pair in sorted order therefore gives both ends the same
-    /// token. This transport never issues extra CIDs (`new_scid`) and nothing
-    /// migrates before establishment, so the pair is the one the handshake
-    /// set; the token is read once, here, and kept.
-    fn shared_token(&self) -> ConnectionToken {
-        let (source, destination) = (self.conn.source_id(), self.conn.destination_id());
-        let (low, high) = if source.as_ref() <= destination.as_ref() {
-            (source, destination)
-        } else {
-            (destination, source)
+    /// Orderly closes report no `Error`, and neither do an idle timeout or a
+    /// stateless reset of an established connection: those are routine ends
+    /// that the swarm would otherwise surface as errors. While handshaking
+    /// every reason is reported, so a failed dial carries it.
+    fn on_lost(&mut self, reason: &ConnectionError, events: &mut Vec<TransportEvent>) {
+        let established = self.state == ConnectionState::Connected;
+        let orderly = match reason {
+            ConnectionError::LocallyClosed => true,
+            ConnectionError::ApplicationClosed(close) => close.error_code == VarInt::from_u32(0),
+            ConnectionError::ConnectionClosed(close) => u64::from(close.error_code) == 0,
+            ConnectionError::TimedOut | ConnectionError::Reset => established,
+            _ => false,
         };
-        let mut hash = Sha256::new();
-        for cid in [low.as_ref(), high.as_ref()] {
-            // CIDs are at most 20 bytes, so one length byte keeps the
-            // encoding unambiguous.
-            hash.update([u8::try_from(cid.len()).unwrap_or(u8::MAX)]);
-            hash.update(cid);
-        }
-        ConnectionToken::new(hash.finalize().into())
-    }
-
-    /// Checks the handshaken peer's libp2p identity: exactly one certificate
-    /// (the libp2p TLS spec forbids chains), a valid libp2p certificate at
-    /// `now` (wall-clock time since the Unix epoch), and the expected
-    /// `PeerId` when the dialer named one.
-    fn verify_peer_identity(&self, now: Duration) -> Result<PeerId, PeerRejection> {
-        // quiche lists the leaf first on both the dialer and listener sides.
-        let chain = self.conn.peer_cert_chain().unwrap_or_default();
-        let leaf = match chain.as_slice() {
-            [] => {
-                return Err(PeerRejection {
-                    code: 0x03,
-                    reason: b"peer certificate missing",
-                    message: "peer TLS certificate missing".into(),
-                });
-            }
-            [leaf] => *leaf,
-            certs => {
-                return Err(PeerRejection {
-                    code: 0x04,
-                    reason: b"peer certificate chain rejected",
-                    message: format!(
-                        "peer presented {} certificates; libp2p TLS requires exactly one",
-                        certs.len()
-                    ),
-                });
-            }
-        };
-
-        let verified =
-            minip2p_tls::verify_libp2p_certificate(leaf, now).map_err(|e| PeerRejection {
-                code: 0x02,
-                reason: b"certificate verification failed",
-                message: format!("peer TLS certificate verification failed: {e}"),
-            })?;
-
-        // If the dialer specified an expected PeerId (via PeerAddr), the
-        // peer must be exactly that identity.
-        if let Some(expected) = self.endpoint.peer_id()
-            && *expected != verified
-        {
-            return Err(PeerRejection {
-                code: 0x01,
-                reason: b"peer id mismatch",
-                message: format!(
-                    "peer id mismatch: dialed {expected} but server certificate proves {verified}"
-                ),
+        if !orderly {
+            events.push(TransportEvent::Error {
+                id: self.id,
+                message: reason.to_string(),
             });
         }
-        Ok(verified)
+        self.end_writes();
+        self.state = ConnectionState::Closed;
     }
 
-    pub fn open_stream(&mut self) -> Result<StreamId, TransportError> {
+    /// Accepts every stream the peer opened, scanning each at once: a new
+    /// stream's first frame raises only `Opened`, never `Readable`.
+    fn accept_streams(&mut self, events: &mut Vec<TransportEvent>) {
+        while let Some(stream) = self.conn.streams().accept(Dir::Bi) {
+            let raw = u64::from(stream);
+            if self.admit_remote_stream(raw, events) {
+                self.scan(raw, events);
+            }
+        }
+    }
+
+    /// Emits `IncomingStream` for a new peer stream, or refuses it (both
+    /// halves shut down, no event) while open and unsettled peer streams fill
+    /// the stream limit: the engine frees a closed stream's slot once it is
+    /// read, but its delivered bytes are the reader's until acknowledged
+    /// (ADR 0012).
+    fn admit_remote_stream(&mut self, raw: u64, events: &mut Vec<TransportEvent>) -> bool {
+        let held = self
+            .stream_states
+            .keys()
+            .filter(|id| !self.is_local(**id))
+            .count() as u64;
+        if held >= self.max_streams {
+            let stream = engine_stream(raw);
+            match self.conn.recv_stream(stream).stop(VarInt::from_u32(0)) {
+                Ok(()) | Err(_) => {}
+            }
+            match self.conn.send_stream(stream).reset(VarInt::from_u32(0)) {
+                Ok(()) | Err(_) => {}
+            }
+            return false;
+        }
+        self.stream_states
+            .insert(raw, StreamRuntimeState::default());
+        events.push(TransportEvent::IncomingStream {
+            id: self.id,
+            stream_id: StreamId::new(raw),
+        });
+        true
+    }
+
+    /// Reads a stream until it is exhausted or has delivered its receive
+    /// budget, then emits the copied data followed by any FIN or reset.
+    ///
+    /// The budget is the read gate: the engine returns credit as bytes are
+    /// read, so a stream whose reader has not acknowledged a whole window is
+    /// not read again until it does ([`Self::ack_stream`]). The engine then
+    /// buffers at most one more window, since the windows are fixed.
+    fn scan(&mut self, raw: u64, events: &mut Vec<TransportEvent>) {
+        // Nothing follows a stream's StreamClosed.
+        let Some(room) = self
+            .stream_states
+            .get(&raw)
+            .filter(|state| !state.closed_notified)
+            .map(StreamRuntimeState::receive_room)
+        else {
+            return;
+        };
+        let stream = engine_stream(raw);
+        // The engine delivers `Opened` ahead of queued stream events, so a
+        // scan can meet a reset before the `Stopped` for the same stream.
+        if let Ok(Some(error_code)) = self.conn.send_stream(stream).stopped() {
+            self.on_stopped(raw, error_code, events);
+            if self
+                .stream_states
+                .get(&raw)
+                .is_none_or(|state| state.closed_notified)
+            {
+                return;
+            }
+        }
+
+        let (read, end) = {
+            let mut recv = self.conn.recv_stream(stream);
+            let Ok(mut chunks) = recv.read(true) else {
+                return;
+            };
+            let mut room = room;
+            let mut read = 0;
+            let end = loop {
+                if room == 0 {
+                    // One terminal probe: a FIN or reset right behind the
+                    // window still surfaces, and data waiting keeps the
+                    // stream gated. Nothing is read.
+                    break match chunks.next(0) {
+                        Ok(Some(_)) | Err(ReadError::Blocked) => ScanEnd::Gated,
+                        Ok(None) => ScanEnd::Finished,
+                        Err(ReadError::Reset(_)) => ScanEnd::Reset,
+                    };
+                }
+                match chunks.next(room) {
+                    Ok(Some(chunk)) => {
+                        room -= chunk.bytes.len();
+                        read += chunk.bytes.len();
+                        self.read_chunks.push(chunk.bytes);
+                    }
+                    Ok(None) => break ScanEnd::Finished,
+                    Err(ReadError::Reset(_)) => break ScanEnd::Reset,
+                    Err(ReadError::Blocked) => break ScanEnd::Waiting,
+                }
+            };
+            // Credit for what was read goes out with the service that
+            // follows every scan.
+            let _credit_follows = chunks.finalize();
+            (read, end)
+        };
+
+        if matches!(end, ScanEnd::Gated) {
+            self.gated.insert(raw);
+        } else {
+            self.gated.remove(&raw);
+        }
+        if read > 0 {
+            if let Some(state) = self.stream_states.get_mut(&raw) {
+                state.unacked += read;
+            }
+            events.push(TransportEvent::StreamData {
+                id: self.id,
+                stream_id: StreamId::new(raw),
+                data: copy_chunks(&mut self.read_chunks, read),
+            });
+        }
+        match end {
+            ScanEnd::Waiting | ScanEnd::Gated => {}
+            ScanEnd::Finished => {
+                if let Some(state) = self.stream_states.get_mut(&raw) {
+                    state.remote_write_closed = true;
+                }
+                events.push(TransportEvent::StreamRemoteWriteClosed {
+                    id: self.id,
+                    stream_id: StreamId::new(raw),
+                });
+                self.note_stream_closed_if_finished(raw, events);
+            }
+            ScanEnd::Reset => {
+                // Reading the reset frees only the receive half; the peer's
+                // stream credit needs the send half freed too.
+                match self.conn.send_stream(stream).reset(VarInt::from_u32(0)) {
+                    Ok(()) | Err(_) => {}
+                }
+                self.note_stream_reset(raw, events);
+            }
+        }
+    }
+
+    /// The peer sent STOP_SENDING. The engine only records it, so reset the
+    /// send half here, which discards buffered sends and sends RESET_STREAM;
+    /// then report the stop.
+    fn on_stopped(&mut self, raw: u64, error_code: VarInt, events: &mut Vec<TransportEvent>) {
+        match self.conn.send_stream(engine_stream(raw)).reset(error_code) {
+            Ok(()) | Err(_) => {}
+        }
+        self.note_write_stopped(raw, error_code.into_inner(), events);
+    }
+
+    /// Opens pending streams in the engine, in order, as peer credit allows.
+    fn bind_pending_opens(&mut self, now: Instant, events: &mut Vec<TransportEvent>) {
+        while !self.pending_opens.is_empty() {
+            let Some(stream) = self.conn.streams().open(Dir::Bi) else {
+                return;
+            };
+            let Some(open) = self.pending_opens.pop_front() else {
+                return;
+            };
+            let raw = u64::from(stream);
+            if raw != open.id {
+                // The adapter is the only opener, so ids follow its sequence.
+                self.fail_connection(
+                    now,
+                    format!("engine opened stream {raw} where {} was expected", open.id),
+                    events,
+                );
+                return;
+            }
+            if open.reset_on_bind {
+                match self.conn.send_stream(stream).reset(VarInt::from_u32(0)) {
+                    Ok(()) | Err(_) => {}
+                }
+                match self.conn.recv_stream(stream).stop(VarInt::from_u32(0)) {
+                    Ok(()) | Err(_) => {}
+                }
+            } else {
+                self.bound_local_bidi_streams += 1;
+            }
+        }
+    }
+
+    /// The first local stream id the engine has not opened yet.
+    fn first_unbound(&self) -> u64 {
+        self.pending_opens
+            .front()
+            .map_or(self.next_local_bidi_stream_id, |open| open.id)
+    }
+
+    /// Whether `raw` is a local stream still waiting for peer credit.
+    fn is_unbound(&self, raw: u64) -> bool {
+        self.is_local(raw) && raw >= self.first_unbound()
+    }
+
+    pub(crate) fn open_stream(&mut self) -> Result<StreamId, TransportError> {
         if self.state != ConnectionState::Connected {
             return Err(TransportError::InvalidState {
                 id: self.id,
@@ -636,68 +700,78 @@ impl QuicConnection {
                 expected: ConnectionState::Connected,
             });
         }
-
-        if self.active_local_bidi_streams >= self.max_local_bidi_streams {
+        if self.bound_local_bidi_streams + self.pending_opens.len() as u64 >= self.max_streams {
             return Err(TransportError::ResourceExhausted {
                 resource: "local QUIC bidirectional streams",
             });
         }
-
-        let raw_stream_id = self.next_local_bidi_stream_id;
-        self.next_local_bidi_stream_id = self.next_local_bidi_stream_id.wrapping_add(4);
-
-        if self.stream_states.contains_key(&raw_stream_id) {
-            return Err(TransportError::StreamExists {
-                id: self.id,
-                stream_id: StreamId::new(raw_stream_id),
-            });
-        }
-
+        // Handed out now, opened in the engine by the next service once the
+        // peer grants credit; writes and FIN queue until then.
+        let raw = self.next_local_bidi_stream_id;
+        self.next_local_bidi_stream_id += 4;
         self.stream_states
-            .insert(raw_stream_id, StreamRuntimeState::default());
-        self.active_local_bidi_streams += 1;
-        Ok(StreamId::new(raw_stream_id))
+            .insert(raw, StreamRuntimeState::default());
+        self.pending_opens.push_back(PendingOpen {
+            id: raw,
+            reset_on_bind: false,
+        });
+        Ok(StreamId::new(raw))
     }
 
-    /// Accepts as much of `data` as quiche takes now plus what fits the
+    /// Accepts as much of `data` as the engine takes now plus what fits the
     /// connection's queue, whatever the peer's credit (ADR 0012).
     ///
     /// Returns [`TransportError::Full`] with the exact unsent suffix when the
     /// queue cannot hold the rest, and arms a `StreamWritable` that fires
     /// once at least half the queue is free again.
-    pub fn send_stream(
+    pub(crate) fn send_stream(
         &mut self,
         stream_id: StreamId,
         data: Bytes,
-        socket: &UdpSocket,
         events: &mut Vec<TransportEvent>,
-        pending_datagrams: &mut VecDeque<PendingDatagram>,
-        max_pending_datagrams: usize,
     ) -> Result<(), TransportError> {
         if data.is_empty() {
             return Ok(());
         }
-
-        let raw_stream_id = stream_id.as_u64();
-        if self.stream_state_mut(stream_id)?.local_write_closed {
+        let raw = stream_id.as_u64();
+        let closing = self.is_closing();
+        if closing || self.stream_state_mut(stream_id)?.local_write_closed {
             return Err(TransportError::StreamSendFailed {
                 id: self.id,
                 stream_id,
-                reason: "local stream write side is already closed".into(),
+                reason: if closing {
+                    "connection is closing".into()
+                } else {
+                    "local stream write side is already closed".into()
+                },
             });
         }
 
-        // Earlier bytes still queued go first, so the direct send below
-        // cannot reorder the stream. Otherwise quiche takes what its stream
-        // capacity allows now; `StreamLimit` means the peer has not granted
-        // this stream yet, so everything queues until it does.
-        let direct = if self.send_queues.contains_key(&raw_stream_id) {
+        // Earlier bytes still queued go first, so the direct write below
+        // cannot reorder the stream; a stream not opened yet queues it all.
+        let direct = if self.send_queues.contains_key(&raw) || self.is_unbound(raw) {
             0
         } else {
-            match self.conn.stream_send(raw_stream_id, &data, false) {
+            // `write` copies only what the engine accepts: handing it a slice
+            // would pin the caller's whole allocation behind a small prefix.
+            match self.conn.send_stream(engine_stream(raw)).write(&data) {
                 Ok(written) => written,
-                Err(quiche::Error::Done | quiche::Error::StreamLimit) => 0,
-                Err(e) => return Err(self.direct_send_failed(stream_id, e, events)),
+                Err(WriteError::Blocked) => 0,
+                Err(WriteError::Stopped(error_code)) => {
+                    self.on_stopped(raw, error_code, events);
+                    return Err(TransportError::StreamSendFailed {
+                        id: self.id,
+                        stream_id,
+                        reason: format!("stream stopped by peer: code {error_code}"),
+                    });
+                }
+                Err(WriteError::ClosedStream) => {
+                    return Err(TransportError::StreamSendFailed {
+                        id: self.id,
+                        stream_id,
+                        reason: "stream is closed".into(),
+                    });
+                }
             }
         };
 
@@ -709,7 +783,7 @@ impl QuicConnection {
         if queued != 0 {
             self.pending_write_bytes += queued;
             self.send_queues
-                .entry(raw_stream_id)
+                .entry(raw)
                 .or_default()
                 .push_back(PendingStreamWrite::data(
                     data.slice(direct..accepted),
@@ -717,12 +791,7 @@ impl QuicConnection {
                 ));
         }
         if accepted < data.len() {
-            self.writable_armed.insert(raw_stream_id);
-        }
-
-        self.drain_send_queue(events);
-        self.flush(socket, pending_datagrams, max_pending_datagrams)?;
-        if accepted < data.len() {
+            self.writable_armed.insert(raw);
             return Err(TransportError::Full {
                 id: self.id,
                 stream_id,
@@ -732,35 +801,9 @@ impl QuicConnection {
         Ok(())
     }
 
-    /// Maps a quiche error from `send_stream`'s direct write to the caller's
-    /// error. A STOP_SENDING seen here is also recorded like one seen by the
-    /// drain, so the stream still reports `StreamWriteStopped`.
-    fn direct_send_failed(
-        &mut self,
-        stream_id: StreamId,
-        error: quiche::Error,
-        events: &mut Vec<TransportEvent>,
-    ) -> TransportError {
-        if let quiche::Error::StreamStopped(error_code) = error {
-            self.note_write_stopped(stream_id, error_code, events);
-        }
-        TransportError::StreamSendFailed {
-            id: self.id,
-            stream_id,
-            reason: format!("stream_send error: {error}"),
-        }
-    }
-
-    pub fn close_stream_write(
-        &mut self,
-        stream_id: StreamId,
-        socket: &UdpSocket,
-        events: &mut Vec<TransportEvent>,
-        pending_datagrams: &mut VecDeque<PendingDatagram>,
-        max_pending_datagrams: usize,
-    ) -> Result<(), TransportError> {
+    /// Queues the stream's FIN behind its queued writes.
+    pub(crate) fn close_stream_write(&mut self, stream_id: StreamId) -> Result<(), TransportError> {
         let state = self.stream_state_mut(stream_id)?;
-
         if state.local_write_closed {
             return Err(TransportError::StreamCloseWriteFailed {
                 id: self.id,
@@ -768,33 +811,31 @@ impl QuicConnection {
                 reason: "local stream write side is already closed".into(),
             });
         }
-
         state.local_write_closed = true;
         self.writable_armed.remove(&stream_id.as_u64());
         self.send_queues
             .entry(stream_id.as_u64())
             .or_default()
             .push_back(PendingStreamWrite::fin());
-
-        self.drain_send_queue(events);
-        self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         Ok(())
     }
 
     /// Acknowledges `bytes` of the stream's delivered data (ADR 0012).
     ///
-    /// quiche returned their credit when they were read, so what this
+    /// The engine returned their credit when they were read, so what this
     /// releases is the read gate: a stream that had spent its budget is
-    /// marked for a rescan, which the transport runs at once. A settled or
-    /// unknown stream has nothing to acknowledge: that includes one reset
-    /// locally, which settles at once but is collected on the next poll.
-    pub fn ack_stream(&mut self, stream_id: StreamId, bytes: usize) -> Result<(), TransportError> {
-        let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) else {
+    /// rescanned at once, with no packet and no event. A settled or unknown
+    /// stream has nothing to acknowledge.
+    pub(crate) fn ack_stream(
+        &mut self,
+        stream_id: StreamId,
+        bytes: usize,
+        events: &mut Vec<TransportEvent>,
+    ) -> Result<(), TransportError> {
+        let raw = stream_id.as_u64();
+        let Some(state) = self.stream_states.get_mut(&raw) else {
             return Ok(());
         };
-        if state.closed_notified && state.unacked == 0 {
-            return Ok(());
-        }
         if bytes > state.unacked {
             return Err(TransportError::AckExceedsDelivered {
                 id: self.id,
@@ -803,67 +844,58 @@ impl QuicConnection {
                 unacked: state.unacked,
             });
         }
-        let gated = state.receive_room() == 0;
         state.unacked -= bytes;
-        let settled = state.closed_notified && state.unacked == 0;
-        if gated && bytes != 0 {
-            self.streams_dirty = true;
-        }
-        // The last byte of a closed stream frees its slot now.
-        if settled {
-            self.gc_closed_streams();
+        if bytes != 0 && self.gated.contains(&raw) {
+            self.scan(raw, events);
         }
         Ok(())
     }
 
-    /// Whether an acknowledgement has left readable stream input waiting for
-    /// a scan.
-    pub(crate) fn has_unscanned_input(&self) -> bool {
-        self.streams_dirty
-    }
-
     /// Resets a stream, abandoning its unacknowledged bytes: it settles at
     /// once.
-    pub fn reset_stream(
+    pub(crate) fn reset_stream(
         &mut self,
         stream_id: StreamId,
         events: &mut Vec<TransportEvent>,
     ) -> Result<(), TransportError> {
-        // Fail with `StreamNotFound` before touching quiche.
+        let raw = stream_id.as_u64();
         self.stream_state_mut(stream_id)?;
-        self.drop_send_queue(stream_id.as_u64());
-        self.writable_armed.remove(&stream_id.as_u64());
+        self.drop_send_queue(raw);
+        self.writable_armed.remove(&raw);
+        self.gated.remove(&raw);
         // The freed queue may unblock streams waiting on the shared cap.
         self.wake_writable(events);
-        self.streams_dirty = true;
 
-        // `Done` means quiche already shut that half down or collected the
-        // stream (e.g. after the peer's STOP_SENDING and FIN), so there is
-        // nothing left to reset.
-        for (direction, side) in [
-            (quiche::Shutdown::Write, "write"),
-            (quiche::Shutdown::Read, "read"),
-        ] {
-            match self
-                .conn
-                .stream_shutdown(stream_id.as_u64(), direction, 0x00)
-            {
-                Ok(()) | Err(quiche::Error::Done) => {}
-                Err(e) => {
-                    return Err(TransportError::StreamResetFailed {
-                        id: self.id,
-                        stream_id,
-                        reason: format!("failed to shutdown stream {side} side: {e}"),
-                    });
-                }
+        if self.is_unbound(raw) {
+            // Not on the wire yet: done for the caller now, and reset in the
+            // engine when it opens, so the id sequence never diverges.
+            if let Some(open) = self.pending_opens.iter_mut().find(|open| open.id == raw) {
+                open.reset_on_bind = true;
             }
+            if let Some(state) = self.stream_states.remove(&raw)
+                && !state.closed_notified
+            {
+                events.push(TransportEvent::StreamClosed {
+                    id: self.id,
+                    stream_id,
+                });
+            }
+            return Ok(());
+        }
+
+        // A closed half is already done.
+        let stream = engine_stream(raw);
+        match self.conn.send_stream(stream).reset(VarInt::from_u32(0)) {
+            Ok(()) | Err(_) => {}
+        }
+        match self.conn.recv_stream(stream).stop(VarInt::from_u32(0)) {
+            Ok(()) | Err(_) => {}
         }
 
         let state = self.stream_state_mut(stream_id)?;
         state.local_write_closed = true;
         state.remote_write_closed = true;
         state.unacked = 0;
-
         if !state.closed_notified {
             state.closed_notified = true;
             events.push(TransportEvent::StreamClosed {
@@ -871,351 +903,117 @@ impl QuicConnection {
                 stream_id,
             });
         }
-
         Ok(())
     }
 
-    pub fn close(
-        &mut self,
-        socket: &UdpSocket,
-        pending_datagrams: &mut VecDeque<PendingDatagram>,
-        max_pending_datagrams: usize,
-    ) -> Result<(), TransportError> {
-        if matches!(
-            self.state,
-            ConnectionState::Closing | ConnectionState::Closed
-        ) {
-            self.flush(socket, pending_datagrams, max_pending_datagrams)?;
-            return Ok(());
+    /// Starts an orderly close; `Closed` follows once the engine drains.
+    pub(crate) fn close(&mut self, now: Instant) {
+        if self.is_closing() {
+            return;
         }
-
-        match self.conn.close(true, 0x00, b"bye") {
-            Ok(()) | Err(quiche::Error::Done) => {}
-            Err(e) => {
-                return Err(TransportError::CloseFailed {
-                    id: self.id,
-                    reason: format!("close error: {e}"),
-                });
-            }
-        }
-
+        self.conn
+            .close(now, VarInt::from_u32(0), Bytes::from_static(b"bye"));
         self.state = ConnectionState::Closing;
-        // Every write side ends with the connection, so no Writable fires.
+        self.end_writes();
+    }
+
+    /// Every write side ends with the connection: queued writes go and no
+    /// Writable fires.
+    fn end_writes(&mut self) {
+        self.send_queues.clear();
+        self.pending_write_bytes = 0;
         self.writable_armed.clear();
-        let mut drain_events = Vec::new();
-        self.drain_send_queue(&mut drain_events);
-        self.flush(socket, pending_datagrams, max_pending_datagrams)?;
-        Ok(())
     }
 
-    pub fn poll_streams(
-        &mut self,
-        events: &mut Vec<TransportEvent>,
-        socket: &UdpSocket,
-        stream_read_buffer: &mut [u8],
-        pending_datagrams: &mut VecDeque<PendingDatagram>,
-        max_pending_datagrams: usize,
-    ) -> Result<(), TransportError> {
-        if !self.conn.is_established() {
-            return Ok(());
-        }
-
-        if mem::take(&mut self.streams_dirty) {
-            self.scan_stream_input(events, stream_read_buffer);
-        }
-
-        self.drain_send_queue(events);
-        self.flush(socket, pending_datagrams, max_pending_datagrams)?;
-        self.gc_closed_streams();
-        Ok(())
-    }
-
-    /// Reports peer STOP_SENDINGs, then reads every readable stream until it
-    /// is exhausted or has delivered its receive budget. Only runs while
-    /// `streams_dirty` is set.
-    ///
-    /// The budget is the read gate: quiche returns credit inside
-    /// `stream_recv`, so a stream whose reader has not acknowledged a whole
-    /// window is not read again until it does ([`Self::ack_stream`]). quiche
-    /// then buffers at most one more window, since the windows are pinned.
-    fn scan_stream_input(
-        &mut self,
-        events: &mut Vec<TransportEvent>,
-        stream_read_buffer: &mut [u8],
-    ) {
-        // Catch STOP_SENDING before reading: once the peer's FIN is read,
-        // quiche may collect the stream and every later write would only
-        // report `Done`. quiche marks a stopped stream writable, but lists no
-        // writable streams while connection credit is exhausted, so readable
-        // streams (the ones a FIN could collect) are checked as well.
-        // Both iterators own a snapshot of ids, so the loop may mutate `conn`.
-        for raw_stream_id in self.conn.writable().chain(self.conn.readable()) {
-            if let Err(quiche::Error::StreamStopped(error_code)) =
-                self.conn.stream_capacity(raw_stream_id)
-            {
-                let stream_id = StreamId::new(raw_stream_id);
-                if self.ensure_stream_discovered(stream_id, events) {
-                    self.note_write_stopped(stream_id, error_code, events);
-                }
-            }
-        }
-
-        for raw_stream_id in self.conn.readable() {
-            let stream_id = StreamId::new(raw_stream_id);
-            if !self.ensure_stream_discovered(stream_id, events) {
-                continue;
-            }
-
-            loop {
-                let room = self
-                    .stream_states
-                    .get(&raw_stream_id)
-                    .map_or(0, StreamRuntimeState::receive_room);
-                // With the budget spent, the read is zero-length: the data
-                // waits in quiche for an ack, but a FIN or reset right after
-                // the window still surfaces, as it would on Yamux.
-                let Some(buffer) = stream_read_buffer.get_mut(..room.min(stream_read_buffer.len()))
-                else {
-                    break;
-                };
-                match self.conn.stream_recv(raw_stream_id, buffer) {
-                    // Gated, with data still waiting behind the budget.
-                    Ok((0, false)) => break,
-                    Ok((read, fin)) => {
-                        if let Some(state) = self.stream_states.get_mut(&raw_stream_id) {
-                            state.unacked += read;
-                        }
-                        if read > 0 {
-                            events.push(TransportEvent::StreamData {
-                                id: self.id,
-                                stream_id,
-                                data: buffer
-                                    .get(..read)
-                                    .expect("quiche stream reads fit the supplied buffer")
-                                    .to_vec()
-                                    .into(),
-                            });
-                        }
-
-                        if fin {
-                            if let Some(state) = self.stream_states.get_mut(&raw_stream_id) {
-                                state.remote_write_closed = true;
-                            }
-
-                            events.push(TransportEvent::StreamRemoteWriteClosed {
-                                id: self.id,
-                                stream_id,
-                            });
-
-                            self.note_stream_closed_if_finished(stream_id, events);
-                            break;
-                        }
-                    }
-                    Err(quiche::Error::Done) => break,
-                    Err(quiche::Error::StreamReset(_)) => {
-                        self.note_stream_reset(stream_id, events);
-                        break;
-                    }
-                    Err(e) => {
-                        events.push(TransportEvent::Error {
-                            id: self.id,
-                            message: format!("stream_recv error on {stream_id}: {e}"),
-                        });
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Sends quiche's output packets via the UDP socket, honouring pacing.
-    ///
-    /// A packet whose `SendInfo::at` is still in the future is held rather
-    /// than sent, and flushing stops there; a later flush sends it first once
-    /// it is due. quiche's clock is `Instant`, so due-ness is judged on it.
-    fn flush(
-        &mut self,
-        socket: &UdpSocket,
-        pending_datagrams: &mut VecDeque<PendingDatagram>,
-        max_pending_datagrams: usize,
-    ) -> Result<(), TransportError> {
-        self.send_output(
-            socket,
-            pending_datagrams,
-            max_pending_datagrams,
-            Pacing::Honour,
-        )
-    }
-
-    /// Sends everything left, held packet first, ignoring pacing.
-    ///
-    /// For a transport being dropped: no later poll would send held packets,
-    /// and a `close` stopped behind one would never tell the peer.
-    pub(crate) fn flush_ignoring_pacing(
-        &mut self,
-        socket: &UdpSocket,
-        pending_datagrams: &mut VecDeque<PendingDatagram>,
-        max_pending_datagrams: usize,
-    ) -> Result<(), TransportError> {
-        self.send_output(
-            socket,
-            pending_datagrams,
-            max_pending_datagrams,
-            Pacing::Ignore,
-        )
-    }
-
-    /// Shared body of `flush` and `flush_ignoring_pacing`: sends any held
-    /// packet, then pulls from quiche until it is done, a packet must wait for
-    /// its send time (under `Pacing::Honour`), or the socket pushes back.
-    fn send_output(
-        &mut self,
-        socket: &UdpSocket,
-        pending_datagrams: &mut VecDeque<PendingDatagram>,
-        max_pending_datagrams: usize,
-        pacing: Pacing,
-    ) -> Result<(), TransportError> {
-        let not_due = |at: Instant| pacing == Pacing::Honour && at > Instant::now();
-        if let Some(paced) = self.paced.take() {
-            // Not due yet, or nowhere to retain it on `WouldBlock`.
-            if not_due(paced.at) || pending_datagrams.len() >= max_pending_datagrams {
-                self.paced = Some(paced);
-                return Ok(());
-            }
-            // Moved, not copied, into the retry queue if it cannot leave now.
-            let PendingDatagram { bytes, destination } = paced.datagram;
-            let len = bytes.len();
-            if !send_or_retain(socket, Cow::Owned(bytes), destination, pending_datagrams) {
-                return Ok(());
-            }
-            self.counters.sent(len);
-        }
-
-        // Counted here, past the held packet: a pass stopped behind it asks
-        // quiche for nothing.
-        self.counters.flush();
-        let full_packet = self.conn.max_send_udp_payload_size();
-        let mut out = [0u8; SEND_BUF_SIZE];
-        loop {
-            // `quiche::Connection::send()` advances congestion and loss state.
-            // Do not consume another packet unless we can retain it if the
-            // non-blocking UDP socket reports `WouldBlock`.
-            if pending_datagrams.len() >= max_pending_datagrams {
-                break;
-            }
-            let (written, send_info) = match self.conn.send(&mut out) {
-                Ok(v) => v,
-                Err(quiche::Error::Done) => {
-                    self.counters.quiche_done(!self.send_queues.is_empty());
-                    break;
-                }
-                Err(e) => {
-                    return Err(TransportError::CloseFailed {
-                        id: self.id,
-                        reason: format!("quiche send error: {e}"),
-                    });
-                }
-            };
-
-            let packet = out
-                .get(..written)
-                .expect("quiche reports packet lengths within the supplied buffer");
-            self.counters.packet(written, full_packet);
-            if not_due(send_info.at) {
-                self.paced = Some(PacedPacket {
-                    datagram: PendingDatagram {
-                        bytes: packet.to_vec(),
-                        destination: send_info.to,
-                    },
-                    at: send_info.at,
-                });
-                break;
-            }
-            if !send_or_retain(
-                socket,
-                Cow::Borrowed(packet),
-                send_info.to,
-                pending_datagrams,
-            ) {
-                break;
-            }
-            self.counters.sent(written);
-        }
-        Ok(())
-    }
-
-    /// Pushes queued stream writes into quiche, handling partial writes.
-    ///
-    /// Never fails the caller: a stopped stream loses only its own queue, a
-    /// write still waiting on peer credit stays queued for a later drain, and
-    /// any other quiche error closes only this connection.
-    fn drain_send_queue(&mut self, events: &mut Vec<TransportEvent>) {
-        // A copy of the keys, since a drain can drop queues mid-loop. Map
-        // order is arbitrary anyway, so popping from the end is fine.
+    /// Pushes queued writes into the engine.
+    fn drain_send_queues(&mut self, now: Instant, events: &mut Vec<TransportEvent>) {
         self.drain_stream_ids.clear();
         self.drain_stream_ids
             .extend(self.send_queues.keys().copied());
-
-        'streams: while let Some(raw_stream_id) = self.drain_stream_ids.pop() {
-            let stream_id = StreamId::new(raw_stream_id);
-            while let Some(front) = self
-                .send_queues
-                .get(&raw_stream_id)
-                .and_then(VecDeque::front)
-            {
-                let fin = front.fin && front.bytes.is_empty();
-                let written = match self.conn.stream_send(raw_stream_id, &front.bytes, fin) {
-                    Ok(written) => written,
-                    // Out of flow-control or stream-count credit: the peer's
-                    // next MAX_* frame lets a later drain continue.
-                    Err(quiche::Error::Done | quiche::Error::StreamLimit) => break,
-                    Err(quiche::Error::StreamStopped(error_code)) => {
-                        self.note_write_stopped(stream_id, error_code, events);
-                        break;
-                    }
-                    Err(e) => {
-                        self.fail_connection(
-                            format!("stream_send error on {stream_id}: {e}"),
-                            events,
-                        );
-                        // `wake_writable` below is a no-op once closing.
-                        break 'streams;
-                    }
-                };
-
-                // Only the error arms above drop a queue, and they leave the loop.
-                let queue = self
-                    .send_queues
-                    .get_mut(&raw_stream_id)
-                    .expect("a successful send leaves the stream's queue in place");
-                let front = queue
-                    .front_mut()
-                    .expect("stored send queues are never empty");
-                if !front.fin || !front.bytes.is_empty() {
-                    if written == 0 {
-                        break;
-                    }
-                    front.advance(written);
-                    self.pending_write_bytes = self.pending_write_bytes.saturating_sub(written);
-                }
-                if front.bytes.is_empty() {
-                    queue.pop_front();
-                    if queue.is_empty() {
-                        self.send_queues.remove(&raw_stream_id);
-                    }
-                }
-
-                self.note_stream_closed_if_finished(stream_id, events);
-            }
+        while let Some(raw) = self.drain_stream_ids.pop() {
+            self.drain_stream(raw, now, events);
         }
         self.wake_writable(events);
     }
 
-    /// The peer ended the stream's write side: no Writable for it, not even
-    /// one an earlier wake already queued in this poll's events.
-    fn disarm_writable(&mut self, stream_id: StreamId, events: &mut Vec<TransportEvent>) {
-        self.writable_armed.remove(&stream_id.as_u64());
-        let id = self.id;
+    /// Pushes one stream's queued writes into the engine, handling partial
+    /// writes.
+    ///
+    /// Never fails the caller: a stopped stream loses only its own queue, a
+    /// write still waiting on peer credit stays queued, and any other engine
+    /// error closes only this connection.
+    fn drain_stream(&mut self, raw: u64, now: Instant, events: &mut Vec<TransportEvent>) {
+        if self.is_unbound(raw) {
+            return;
+        }
+        let stream = engine_stream(raw);
+        while let Some(front) = self.send_queues.get_mut(&raw).and_then(VecDeque::front_mut) {
+            if front.fin {
+                match self.conn.send_stream(stream).finish() {
+                    Ok(()) => {}
+                    Err(FinishError::Stopped(error_code)) => {
+                        self.on_stopped(raw, error_code, events);
+                        return;
+                    }
+                    Err(FinishError::ClosedStream) => {
+                        self.fail_connection(
+                            now,
+                            format!("finish failed on {}: closed stream", StreamId::new(raw)),
+                            events,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                // Copies the accepted prefix, as in `send_stream`.
+                match self.conn.send_stream(stream).write(&front.bytes) {
+                    Ok(0) => return,
+                    Ok(written) => {
+                        front.advance(written);
+                        self.pending_write_bytes = self.pending_write_bytes.saturating_sub(written);
+                        if !front.bytes.is_empty() {
+                            return;
+                        }
+                    }
+                    // Out of flow-control credit or send window: the peer's
+                    // next MAX_* frame raises `Writable`.
+                    Err(WriteError::Blocked) => return,
+                    Err(WriteError::Stopped(error_code)) => {
+                        self.on_stopped(raw, error_code, events);
+                        return;
+                    }
+                    Err(WriteError::ClosedStream) => {
+                        self.fail_connection(
+                            now,
+                            format!("write failed on {}: closed stream", StreamId::new(raw)),
+                            events,
+                        );
+                        return;
+                    }
+                }
+            }
+            if let Some(queue) = self.send_queues.get_mut(&raw) {
+                queue.pop_front();
+                if queue.is_empty() {
+                    self.send_queues.remove(&raw);
+                }
+            }
+            self.note_stream_closed_if_finished(raw, events);
+        }
+    }
+
+    /// Drops a stream's queued writes and their byte accounting.
+    fn drop_send_queue(&mut self, raw: u64) {
+        if let Some(queue) = self.send_queues.remove(&raw) {
+            self.pending_write_bytes = self.pending_write_bytes.saturating_sub(unsent_bytes(queue));
+        }
+    }
+
+    /// The write side ended: no Writable for it, not even one an earlier wake
+    /// already queued in these events.
+    fn disarm_writable(&mut self, raw: u64, events: &mut Vec<TransportEvent>) {
+        self.writable_armed.remove(&raw);
+        let (id, stream_id) = (self.id, StreamId::new(raw));
         events.retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
     }
 
@@ -1232,33 +1030,28 @@ impl QuicConnection {
         if room < self.max_pending_write_bytes.div_ceil(2) {
             return;
         }
-        for raw_stream_id in mem::take(&mut self.writable_armed) {
+        for raw in mem::take(&mut self.writable_armed) {
             // A write side that ended since never gets a Writable.
             if self
                 .stream_states
-                .get(&raw_stream_id)
+                .get(&raw)
                 .is_some_and(|state| !state.local_write_closed)
             {
                 events.push(TransportEvent::StreamWritable {
                     id: self.id,
-                    stream_id: StreamId::new(raw_stream_id),
+                    stream_id: StreamId::new(raw),
                 });
             }
         }
     }
 
-    /// The peer sent STOP_SENDING: our write half is gone for good, so queued
-    /// writes are dropped. The read half stays open until the peer finishes.
-    ///
-    /// The stop can surface from the drain, from `send_stream`, or from the
-    /// stream scan in `poll_streams`; `StreamWriteStopped` is emitted once.
-    fn note_write_stopped(
-        &mut self,
-        stream_id: StreamId,
-        error_code: u64,
-        events: &mut Vec<TransportEvent>,
-    ) {
-        let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) else {
+    /// Our write half is gone for good, so queued writes are dropped. The
+    /// read half stays open until the peer finishes. The event is emitted
+    /// once, and never after the stream's StreamClosed; the queue is dropped
+    /// either way, since a stream closed with writes still queued (FIN read,
+    /// write side closed locally) would otherwise keep retrying a reset half.
+    fn note_write_stopped(&mut self, raw: u64, error_code: u64, events: &mut Vec<TransportEvent>) {
+        let Some(state) = self.stream_states.get_mut(&raw) else {
             return;
         };
         if state.write_stopped {
@@ -1266,109 +1059,64 @@ impl QuicConnection {
         }
         state.write_stopped = true;
         state.local_write_closed = true;
-        self.drop_send_queue(stream_id.as_u64());
-        self.disarm_writable(stream_id, events);
+        let closed = state.closed_notified;
+        self.drop_send_queue(raw);
+        self.disarm_writable(raw, events);
         self.wake_writable(events);
+        if closed {
+            return;
+        }
         events.push(TransportEvent::StreamWriteStopped {
             id: self.id,
-            stream_id,
+            stream_id: StreamId::new(raw),
             error_code,
         });
-        self.note_stream_closed_if_finished(stream_id, events);
+        self.note_stream_closed_if_finished(raw, events);
     }
 
-    /// Closes this connection after an error quiche did not scope to a single
-    /// stream. The transport reports `Closed` once quiche finishes draining.
+    /// Closes this connection after an error the engine did not scope to a
+    /// single stream. `Closed` follows once the engine drains.
     ///
-    /// Every queued write is dropped so later drains cannot hit the same error
-    /// again while quiche drains the connection.
-    fn fail_connection(&mut self, message: String, events: &mut Vec<TransportEvent>) {
-        self.send_queues.clear();
-        self.pending_write_bytes = 0;
-        self.writable_armed.clear();
+    /// Every queued write is dropped so later drains cannot hit the same
+    /// error again.
+    fn fail_connection(&mut self, now: Instant, message: String, events: &mut Vec<TransportEvent>) {
+        self.end_writes();
         events.push(TransportEvent::Error {
             id: self.id,
             message,
         });
-        // 0x1 is QUIC's INTERNAL_ERROR. `Done` means quiche is already closing.
-        if let Err(error) = self.conn.close(false, 0x1, b"stream send failed")
-            && error != quiche::Error::Done
-        {
-            events.push(TransportEvent::Error {
-                id: self.id,
-                message: format!("failed to close after stream send error: {error}"),
-            });
-        }
+        // 1 is QUIC's INTERNAL_ERROR.
+        self.conn.close(
+            now,
+            VarInt::from_u32(1),
+            Bytes::from_static(b"stream send failed"),
+        );
         self.state = ConnectionState::Closing;
     }
 
-    /// Emits IncomingStream for remote-initiated streams not yet notified,
-    /// and returns whether the stream is one this side tracks.
-    ///
-    /// A new remote stream is refused (both halves shut down, no event) while
-    /// open and unsettled remote streams fill the stream limit: quiche frees
-    /// a closed stream's slot once it has read it, but its delivered bytes
-    /// are still the reader's until acknowledged (ADR 0012).
-    fn ensure_stream_discovered(
-        &mut self,
-        stream_id: StreamId,
-        events: &mut Vec<TransportEvent>,
-    ) -> bool {
-        let raw_stream_id = stream_id.as_u64();
-        let is_remote = self.is_remote_initiated_stream(raw_stream_id);
-        if is_remote && !self.stream_states.contains_key(&raw_stream_id) {
-            let held = self
-                .stream_states
-                .keys()
-                .filter(|id| self.is_remote_initiated_stream(**id))
-                .count() as u64;
-            if held >= self.max_local_bidi_streams {
-                for direction in [quiche::Shutdown::Read, quiche::Shutdown::Write] {
-                    match self.conn.stream_shutdown(raw_stream_id, direction, 0x00) {
-                        Ok(()) | Err(_) => {}
-                    }
-                }
-                return false;
-            }
-        }
-        let state = self.stream_states.entry(raw_stream_id).or_default();
-
-        if is_remote && !state.incoming_notified {
-            state.incoming_notified = true;
-            events.push(TransportEvent::IncomingStream {
-                id: self.id,
-                stream_id,
-            });
-        }
-        true
-    }
-
     /// Emits StreamClosed if both sides are closed and not yet notified.
-    fn note_stream_closed_if_finished(
-        &mut self,
-        stream_id: StreamId,
-        events: &mut Vec<TransportEvent>,
-    ) {
-        if let Some(state) = self.stream_states.get_mut(&stream_id.as_u64())
+    fn note_stream_closed_if_finished(&mut self, raw: u64, events: &mut Vec<TransportEvent>) {
+        if let Some(state) = self.stream_states.get_mut(&raw)
             && state.is_fully_closed()
             && !state.closed_notified
         {
             state.closed_notified = true;
             events.push(TransportEvent::StreamClosed {
                 id: self.id,
-                stream_id,
+                stream_id: StreamId::new(raw),
             });
         }
     }
 
     /// A peer reset terminates both halves and discards writes that can no
     /// longer be delivered.
-    fn note_stream_reset(&mut self, stream_id: StreamId, events: &mut Vec<TransportEvent>) {
-        self.drop_send_queue(stream_id.as_u64());
-        self.disarm_writable(stream_id, events);
+    fn note_stream_reset(&mut self, raw: u64, events: &mut Vec<TransportEvent>) {
+        self.drop_send_queue(raw);
+        self.disarm_writable(raw, events);
+        self.gated.remove(&raw);
         // The freed queue may unblock streams waiting on the shared cap.
         self.wake_writable(events);
-        let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) else {
+        let Some(state) = self.stream_states.get_mut(&raw) else {
             return;
         };
         state.local_write_closed = true;
@@ -1377,42 +1125,33 @@ impl QuicConnection {
             state.closed_notified = true;
             events.push(TransportEvent::StreamClosed {
                 id: self.id,
-                stream_id,
+                stream_id: StreamId::new(raw),
             });
         }
     }
 
-    /// Removes stream state entries that are fully closed, drained, and
-    /// settled.
+    /// Removes closed, drained and settled streams, releasing their slots.
     fn gc_closed_streams(&mut self) {
-        let to_remove: Vec<u64> = self
-            .stream_states
-            .iter()
-            .filter_map(|(stream_id, state)| {
-                if state.closed_notified
-                    && state.unacked == 0
-                    && !self.send_queues.contains_key(stream_id)
-                {
-                    Some(*stream_id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let removed_local_bidi = to_remove
-            .iter()
-            .filter(|stream_id| self.is_local_bidi_stream(**stream_id))
-            .count() as u64;
-        for stream_id in to_remove {
-            self.stream_states.remove(&stream_id);
-        }
-        self.active_local_bidi_streams = self
-            .active_local_bidi_streams
-            .saturating_sub(removed_local_bidi);
+        let first_unbound = self.first_unbound();
+        let side_bit = u64::from(self.is_server());
+        let mut freed_local = 0;
+        let (send_queues, gated) = (&self.send_queues, &mut self.gated);
+        self.stream_states.retain(|&raw, state| {
+            let local = raw & 1 == side_bit;
+            let settled = state.closed_notified
+                && state.unacked == 0
+                && !send_queues.contains_key(&raw)
+                && !(local && raw >= first_unbound);
+            if settled {
+                gated.remove(&raw);
+                freed_local += u64::from(local);
+            }
+            !settled
+        });
+        self.bound_local_bidi_streams = self.bound_local_bidi_streams.saturating_sub(freed_local);
     }
 
-    /// Returns state for a stream previously opened or discovered by the transport.
+    /// Returns state for a stream previously opened or discovered.
     fn stream_state_mut(
         &mut self,
         stream_id: StreamId,
@@ -1425,21 +1164,22 @@ impl QuicConnection {
             })
     }
 
-    /// Checks if a stream id was initiated by this side (QUIC parity bit check).
-    fn is_local_initiated_stream(&self, stream_id: u64) -> bool {
-        let local_initiator_bit = if self.conn.is_server() { 1 } else { 0 };
-        (stream_id & 0x1) == local_initiator_bit
+    /// Whether this side initiated the stream (QUIC's initiator bit).
+    fn is_local(&self, raw: u64) -> bool {
+        raw & 1 == u64::from(self.is_server())
     }
+}
 
-    /// Checks if a stream is bidirectional and was initiated by this side.
-    fn is_local_bidi_stream(&self, stream_id: u64) -> bool {
-        self.is_local_initiated_stream(stream_id) && (stream_id & 0x2) == 0
+/// Copies one scan's chunks into a buffer of exactly `len` bytes.
+///
+/// Chunks may be slices of larger packet allocations; handing them on would
+/// pin memory ADR 0012's receive budget does not count.
+fn copy_chunks(chunks: &mut Vec<Bytes>, len: usize) -> Bytes {
+    let mut data = Vec::with_capacity(len);
+    for chunk in chunks.drain(..) {
+        data.extend_from_slice(&chunk);
     }
-
-    /// Checks if a stream id was initiated by the remote side.
-    fn is_remote_initiated_stream(&self, stream_id: u64) -> bool {
-        !self.is_local_initiated_stream(stream_id)
-    }
+    Bytes::from(data)
 }
 
 /// Reports the connection's diagnostic totals, so a host can compare runs
@@ -1450,42 +1190,7 @@ impl Drop for QuicConnection {
         std::eprintln!(
             "minip2p-quic diagnostics {}: {}",
             self.id,
-            self.counters.snapshot()
+            self.diagnostics()
         );
-    }
-}
-
-/// Sends one packet, retaining it on `WouldBlock` or behind datagrams already
-/// retained, so it never overtakes them. Returns whether the caller should
-/// keep flushing.
-///
-/// A packet already owned (a held paced one) moves into the retry queue; a
-/// borrowed one is copied only if it has to be retained.
-fn send_or_retain(
-    socket: &UdpSocket,
-    packet: Cow<'_, [u8]>,
-    destination: SocketAddr,
-    pending_datagrams: &mut VecDeque<PendingDatagram>,
-) -> bool {
-    let retain = |pending_datagrams: &mut VecDeque<PendingDatagram>, packet: Cow<'_, [u8]>| {
-        pending_datagrams.push_back(PendingDatagram {
-            bytes: packet.into_owned(),
-            destination,
-        });
-        false
-    };
-    if !pending_datagrams.is_empty() {
-        return retain(pending_datagrams, packet);
-    }
-    match socket.send_to(&packet, destination) {
-        Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => retain(pending_datagrams, packet),
-        // Any other send error (EHOSTUNREACH after a route flap,
-        // ICMP-driven ECONNREFUSED, ...) affects only this connection's path,
-        // so it must not abort the whole endpoint's poll. Treat the packet as
-        // lost -- quiche's loss recovery retransmits it, and a path that stays
-        // dead ends in this connection's idle timeout. Stop draining so a dead
-        // route is not hammered within one flush.
-        Err(_) => false,
     }
 }

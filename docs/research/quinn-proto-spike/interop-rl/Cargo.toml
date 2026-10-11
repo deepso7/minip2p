@@ -1,0 +1,17 @@
+[package]
+name = "interop-rl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3.34"
+libp2p = { version = "0.57.0", features = [
+  "quic",
+  "tokio",
+  "ping",
+  "macros",
+  "identify",
+] }
+tokio = { version = "1.53.2", features = ["full"] }
+
+[workspace]

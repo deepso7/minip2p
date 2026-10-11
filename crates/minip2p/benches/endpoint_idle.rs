@@ -15,7 +15,7 @@
 //!
 //! - `quic_only`: QUIC alone, no extra services. The reference row.
 //! - `quic_dual_stack`: QUIC on IPv4 and IPv6 loopback: the same one-socket-
-//!   per-family `DualQuicTransport` that `EndpointBuilder::listen_default()`
+//!   per-family `QuicTransport` that `EndpointBuilder::listen_default()`
 //!   binds on the wildcards. Skipped on a host without IPv6 loopback, where
 //!   the results collector then reports its rows missing.
 //! - `full`: QUIC and TCP bound, relay server, Gossipsub with one subscribed
