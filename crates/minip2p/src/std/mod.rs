@@ -663,6 +663,9 @@ impl Endpoint {
         let now = self.now();
         self.resolve_names(now);
         self.drive(now)?;
+        // Start lookups for NAT dials the batch parked, so they run between
+        // polls rather than from the next one.
+        self.resolve_names(now);
         Ok(self.engine.take_events())
     }
 
@@ -757,6 +760,11 @@ impl Endpoint {
             if deadline.has_passed() {
                 return Ok(EndpointWaitOutcome::Deadline);
             }
+            // The batch may have parked NAT dials to named hosts; their
+            // lookups must be under way before this sleeps, or nothing
+            // would wake it for them.
+            let now = self.now();
+            self.resolve_names(now);
             if self.block(deadline) {
                 return Ok(EndpointWaitOutcome::Interrupted);
             }

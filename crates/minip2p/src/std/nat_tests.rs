@@ -301,6 +301,58 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
     assert!(lost, "genuine relay loss must remain observable");
 }
 
+/// A batch's NAT tick parks a dial to a relay named by host. Its lookup has
+/// to start before `wait` sleeps: nothing else would wake an idle endpoint
+/// for it before the reservation attempt's own deadline.
+#[test]
+fn a_named_relay_lookup_starts_before_wait_sleeps() {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let begun = Instant::now();
+    let lookup: super::dial::Lookup = std::sync::Arc::new(move |_: &str| {
+        drop(started_tx.send(begun.elapsed()));
+        Err("test resolver".to_string())
+    });
+    let relay_peer = Ed25519Keypair::from_secret_key_bytes([88; 32]).peer_id();
+    let named = minip2p_core::PeerAddr::new(
+        "/dns4/relay.test/udp/4001/quic-v1"
+            .parse()
+            .expect("named relay"),
+        relay_peer,
+    )
+    .expect("named relay addr");
+    let mut client = Endpoint::builder()
+        .nat_config(NatConfig {
+            relays: vec![named],
+            reservation_policy: ReservationPolicy::Always,
+            ..NatConfig::default()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind client");
+    let wake = minip2p_transport::BlockingTransport::wait_handle(client.core().transport());
+    client.resolver = super::dial::Resolver::with_lookup(wake, lookup);
+
+    // One long wait on an idle endpoint: without an early start, the
+    // lookup would begin only once the sleep ended at this deadline.
+    let wait = std::time::Duration::from_millis(500);
+    while begun.elapsed() < wait {
+        if !matches!(
+            client.wait(begun + wait).expect("wait"),
+            crate::EndpointWaitOutcome::Event(_)
+        ) {
+            break;
+        }
+    }
+    let started = started_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("the relay lookup started");
+    assert!(
+        started < wait / 2,
+        "the lookup started only after the sleep, at {started:?}"
+    );
+}
+
 #[cfg(feature = "relay-server")]
 #[test]
 fn a_relay_configured_by_name_is_resolved_off_the_driver_and_reserved() {
