@@ -30,13 +30,17 @@ pub struct RelayServerConfig {
     pub max_pending_stop_requests_per_connection: usize,
     /// End-to-end HOP/STOP control timeout in milliseconds.
     pub control_stream_timeout_ms: u64,
-    /// Optional reservation-attempt bucket keyed by peer.
+    /// Optional bucket keyed by peer; an admitted new reservation spends a
+    /// token.
     pub reservation_rate_limit_per_peer: Option<RateLimit>,
-    /// Optional reservation-attempt bucket keyed by the first remote IP.
+    /// Optional bucket keyed by the first remote IP; an admitted new
+    /// reservation spends a token.
     pub reservation_rate_limit_per_ip: Option<RateLimit>,
-    /// Optional CONNECT-attempt bucket keyed by source peer.
+    /// Optional bucket keyed by source peer; an admitted CONNECT spends a
+    /// token.
     pub circuit_rate_limit_per_peer: Option<RateLimit>,
-    /// Optional CONNECT-attempt bucket keyed by the source's first remote IP.
+    /// Optional bucket keyed by the source's first remote IP; an admitted
+    /// CONNECT spends a token.
     pub circuit_rate_limit_per_ip: Option<RateLimit>,
 }
 

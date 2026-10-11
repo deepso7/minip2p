@@ -87,7 +87,16 @@ impl<E: EntropySource> NatDriver<E> {
     /// Creates a driver over `agent`. `relay_addrs` are the transport
     /// addresses of configured relays, retained so reservations can be
     /// advertised as circuit addresses.
-    pub(crate) fn new(agent: NatAgent, relay_addrs: Vec<(PeerId, Multiaddr)>, entropy: E) -> Self {
+    pub(crate) fn new(
+        mut agent: NatAgent,
+        relay_addrs: Vec<(PeerId, Multiaddr)>,
+        mut entropy: E,
+    ) -> Self {
+        // A failed draw keeps the agent's peer-id seed.
+        let mut seed = [0u8; 8];
+        if entropy.fill_bytes(&mut seed).is_ok() {
+            agent.seed_jitter(u64::from_le_bytes(seed));
+        }
         Self {
             agent,
             events: VecDeque::new(),

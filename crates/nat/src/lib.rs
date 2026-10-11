@@ -55,6 +55,7 @@ mod types;
 pub use agent::{ConnectLegs, NatAgent};
 pub use config::{NatConfig, ReservationPolicy};
 pub use events::{BridgeRole, NatAction, NatEvent};
+pub use housekeeping::MAX_RESERVATION_RETRY_BACKOFF_MS;
 pub use swarm::{DialStart, NatSwarm, NatSwarmError, is_named};
 pub use types::{NatError, NatToken, Now, Path, PromoteError, ReachabilityState, ReservationInfo};
 

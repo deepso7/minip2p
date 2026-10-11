@@ -41,18 +41,29 @@ impl AdmissionLimiters {
         }
     }
 
-    fn consume(&mut self, peer_id: &PeerId, ip: Option<IpKey>, now_ms: u64) -> bool {
-        if self
+    /// Whether every applicable bucket holds a token, spending none.
+    fn allows(&self, peer_id: &PeerId, ip: Option<&IpKey>, now_ms: u64) -> bool {
+        let peer = self
             .peer
-            .as_mut()
-            .is_some_and(|limiter| !limiter.consume(peer_id.clone(), now_ms))
-        {
-            return false;
+            .as_ref()
+            .is_none_or(|limiter| limiter.allows(peer_id, now_ms));
+        let ip = match (&self.ip, ip) {
+            (Some(limiter), Some(ip)) => limiter.allows(ip, now_ms),
+            _ => true,
+        };
+        peer && ip
+    }
+
+    /// Spends one token from every applicable bucket. Call only after
+    /// [`Self::allows`] and every other admission check passed, so a refused
+    /// request never costs a token.
+    fn consume(&mut self, peer_id: &PeerId, ip: Option<IpKey>, now_ms: u64) {
+        if let Some(limiter) = &mut self.peer {
+            limiter.consume(peer_id.clone(), now_ms);
         }
         if let (Some(limiter), Some(ip)) = (&mut self.ip, ip) {
-            return limiter.consume(ip, now_ms);
+            limiter.consume(ip, now_ms);
         }
-        true
     }
 
     fn sweep(&mut self, now_ms: u64) {
@@ -1801,8 +1812,8 @@ impl RelayServerAgent {
         let status = if wire.is_none() {
             Some(Status::ReservationRefused)
         // Renewals keep an admitted reservation alive and spend no token.
-        } else if !renewed && !self.admit_new_reservation(&peer_id, key.conn_id, now.monotonic_ms)
-            || pending_for_peer
+        } else if pending_for_peer
+            || !renewed && !self.admit_new_reservation(&peer_id, key.conn_id, now.monotonic_ms)
         {
             Some(Status::ResourceLimitExceeded)
         } else {
@@ -1896,15 +1907,20 @@ impl RelayServerAgent {
             .collect()
     }
 
-    /// Admission for a new reservation: spends a rate-limit token, then
-    /// checks `max_reservations` against committed and pending new ones.
+    /// Admission for a new reservation: needs a rate-limit token and room
+    /// under `max_reservations` (committed plus pending new ones), and spends
+    /// the token only when both hold.
     fn admit_new_reservation(
         &mut self,
         peer_id: &PeerId,
         conn_id: ConnectionId,
         now_ms: u64,
     ) -> bool {
-        if !self.consume_reservation_limits(peer_id, conn_id, now_ms) {
+        let ip = self.connection_ip(conn_id);
+        if !self
+            .reservation_limiters
+            .allows(peer_id, ip.as_ref(), now_ms)
+        {
             return false;
         }
         let pending_initial = self
@@ -1920,21 +1936,19 @@ impl RelayServerAgent {
                 )
             })
             .count();
-        self.reservations.len().saturating_add(pending_initial) < self.config.max_reservations
+        if self.reservations.len().saturating_add(pending_initial) >= self.config.max_reservations {
+            return false;
+        }
+        self.reservation_limiters.consume(peer_id, ip, now_ms);
+        true
     }
 
-    fn consume_reservation_limits(
-        &mut self,
-        peer_id: &PeerId,
-        conn_id: ConnectionId,
-        now_ms: u64,
-    ) -> bool {
-        let ip = self
-            .connections
+    /// The first IP of `conn_id`'s remote address, the per-IP limit key.
+    fn connection_ip(&self, conn_id: ConnectionId) -> Option<IpKey> {
+        self.connections
             .get(&conn_id)
             .and_then(|connection| connection.address.as_ref())
-            .and_then(first_ip);
-        self.reservation_limiters.consume(peer_id, ip, now_ms)
+            .and_then(first_ip)
     }
 
     fn decide_connect(&mut self, key: StreamKey, destination_peer_id: PeerId, now: Now) {
@@ -1956,8 +1970,11 @@ impl RelayServerAgent {
                 .is_some_and(|connection| connection.is_circuit)
         {
             Some(Status::PermissionDenied)
-        } else if !self.consume_circuit_limits(&source_peer_id, key.conn_id, now.monotonic_ms)
-            || self.peer_circuit_count(&source_peer_id) >= self.config.max_circuits_per_peer
+        } else if !self.circuit_limiters.allows(
+            &source_peer_id,
+            self.connection_ip(key.conn_id).as_ref(),
+            now.monotonic_ms,
+        ) || self.peer_circuit_count(&source_peer_id) >= self.config.max_circuits_per_peer
             || (source_peer_id != destination_peer_id
                 && self.peer_circuit_count(&destination_peer_id)
                     >= self.config.max_circuits_per_peer)
@@ -1994,6 +2011,10 @@ impl RelayServerAgent {
             self.deny_connect(key, destination_peer_id, status);
             return;
         }
+        // Admitted: only now does the request cost a token.
+        let ip = self.connection_ip(key.conn_id);
+        self.circuit_limiters
+            .consume(&source_peer_id, ip, now.monotonic_ms);
         let destination_conn_id = destination_conn.expect("checked above");
         self.pending_circuits.insert(
             key,
@@ -2028,20 +2049,6 @@ impl RelayServerAgent {
             expected_conn_id: destination_conn_id,
             protocol_id: STOP_PROTOCOL_ID.into(),
         });
-    }
-
-    fn consume_circuit_limits(
-        &mut self,
-        peer_id: &PeerId,
-        conn_id: ConnectionId,
-        now_ms: u64,
-    ) -> bool {
-        let ip = self
-            .connections
-            .get(&conn_id)
-            .and_then(|connection| connection.address.as_ref())
-            .and_then(first_ip);
-        self.circuit_limiters.consume(peer_id, ip, now_ms)
     }
 
     fn peer_circuit_count(&self, peer_id: &PeerId) -> usize {
@@ -3064,6 +3071,152 @@ mod tests {
             ));
             while io_action(&mut agent).is_some() {}
         }
+    }
+
+    /// A RESERVE refused because the relay is full spends no rate-limit
+    /// token: once there is room, the same peer is admitted.
+    #[test]
+    fn a_reservation_refused_for_capacity_spends_no_rate_token() {
+        let config = RelayServerConfig {
+            max_reservations: 1,
+            reservation_rate_limit_per_peer: Some(RateLimit {
+                capacity: 1,
+                refill_interval_ms: 1_000_000,
+            }),
+            reservation_rate_limit_per_ip: None,
+            ..RelayServerConfig::default()
+        };
+        let mut agent = RelayServerAgent::new(
+            PeerId::from_public_key_protobuf(b"relay-full-token"),
+            config,
+        )
+        .unwrap();
+        agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        let holder = PeerId::from_public_key_protobuf(b"holder-full-token");
+        let holder_conn = ConnectionId::new(350);
+        reserve(
+            &mut agent,
+            &holder,
+            StreamKey {
+                conn_id: holder_conn,
+                stream_id: StreamId::new(1),
+            },
+        );
+
+        let waiter = PeerId::from_public_key_protobuf(b"waiter-full-token");
+        let waiter_conn = ConnectionId::new(351);
+        establish(&mut agent, &waiter, waiter_conn);
+        let first = StreamKey {
+            conn_id: waiter_conn,
+            stream_id: StreamId::new(1),
+        };
+        feed_hop(&mut agent, &waiter, first, reserve_request(), &[]);
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::ReservationDenied {
+                status: Status::ResourceLimitExceeded,
+                ..
+            })
+        ));
+        while io_action(&mut agent).is_some() {}
+
+        // The holder leaves, freeing the only slot.
+        agent.handle_event(
+            &SwarmEvent::ConnectionClosed {
+                peer_id: holder.clone(),
+                conn_id: holder_conn,
+            },
+            false,
+            Now::from_millis(0),
+        );
+        while agent.poll_event().is_some() {}
+        while io_action(&mut agent).is_some() {}
+
+        let second = StreamKey {
+            conn_id: waiter_conn,
+            stream_id: StreamId::new(2),
+        };
+        feed_hop(&mut agent, &waiter, second, reserve_request(), &[]);
+        if let Some(RelayServerAction::SendStream { token, .. }) = io_action(&mut agent) {
+            agent.send_stream_result(token, Ok(()), Now::from_millis(0));
+        }
+        let event = agent.poll_event();
+        assert!(
+            matches!(event, Some(RelayServerEvent::ReservationAccepted { .. })),
+            "the waiter still holds its token: {event:?}"
+        );
+    }
+
+    /// A CONNECT refused for a reason other than its rate limit spends no
+    /// token: the source is admitted once the destination has reserved.
+    #[test]
+    fn a_refused_connect_spends_no_rate_token() {
+        let config = RelayServerConfig {
+            circuit_rate_limit_per_peer: Some(RateLimit {
+                capacity: 1,
+                refill_interval_ms: 1_000_000,
+            }),
+            circuit_rate_limit_per_ip: None,
+            reservation_rate_limit_per_peer: None,
+            reservation_rate_limit_per_ip: None,
+            ..RelayServerConfig::default()
+        };
+        let mut agent = RelayServerAgent::new(
+            PeerId::from_public_key_protobuf(b"relay-connect-token"),
+            config,
+        )
+        .unwrap();
+        agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        let source = PeerId::from_public_key_protobuf(b"source-connect-token");
+        let destination = PeerId::from_public_key_protobuf(b"destination-connect-token");
+        let source_conn = ConnectionId::new(361);
+        establish(&mut agent, &source, source_conn);
+        let connect = HopMessage {
+            kind: HopMessageType::Connect,
+            peer: Some(Peer {
+                id: destination.to_bytes(),
+                addrs: Vec::new(),
+            }),
+            reservation: None,
+            limit: None,
+            status: None,
+        };
+
+        let first = StreamKey {
+            conn_id: source_conn,
+            stream_id: StreamId::new(1),
+        };
+        feed_hop(&mut agent, &source, first, connect.clone(), &[]);
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitDenied {
+                status: Status::NoReservation,
+                ..
+            })
+        ));
+        while io_action(&mut agent).is_some() {}
+
+        reserve(
+            &mut agent,
+            &destination,
+            StreamKey {
+                conn_id: ConnectionId::new(360),
+                stream_id: StreamId::new(1),
+            },
+        );
+        let second = StreamKey {
+            conn_id: source_conn,
+            stream_id: StreamId::new(2),
+        };
+        feed_hop(&mut agent, &source, second, connect, &[]);
+        assert!(
+            matches!(
+                io_action(&mut agent),
+                Some(RelayServerAction::OpenStream { .. })
+            ),
+            "the source still holds its token: {:?}",
+            agent.poll_event()
+        );
     }
 
     #[test]
