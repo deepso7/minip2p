@@ -309,7 +309,10 @@ fn a_named_relay_lookup_starts_before_wait_sleeps() {
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let begun = Instant::now();
     let lookup: super::dial::Lookup = std::sync::Arc::new(move |_: &str| {
-        drop(started_tx.send(begun.elapsed()));
+        // The test may have ended and dropped its receiver.
+        match started_tx.send(begun.elapsed()) {
+            Ok(()) | Err(_) => {}
+        }
         Err("test resolver".to_string())
     });
     let relay_peer = Ed25519Keypair::from_secret_key_bytes([88; 32]).peer_id();
