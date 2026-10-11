@@ -260,11 +260,27 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
     let mut reader_stream = None;
     let deadline = Instant::now() + BACKSTOP;
 
-    // Never acknowledging: delivery stops at exactly one window.
+    // Never acknowledging: delivery stops at one window, give or take the
+    // negotiation bytes. Over TCP, Yamux spent part of the initial window on
+    // the negotiation the endpoint consumed itself and returns credit in half
+    // windows, so delivery stops just short of `window`. Over QUIC, the gate
+    // is a delivery budget the endpoint restores for the bytes it consumed
+    // itself, so delivery reaches the full window.
+    //
+    // Progress drives the exit: keep delivering until the lower bound holds
+    // (only BACKSTOP bounds that), then require a quiet window to confirm
+    // nothing past one window arrives. The quiet check is best effort.
     let mut quiet_since = Instant::now();
-    while quiet_since.elapsed() < Duration::from_millis(500) {
-        assert!(Instant::now() < deadline, "the link never went quiet");
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "an unacknowledged reader should get one window, got {} of {window}",
+            received.len()
+        );
         sender.turn(&mut writer, &reader_peer, conn_id, stream_id);
+        // Sampled before the drain, so a closed window gets one more poll.
+        let quiet_closed = quiet_since.elapsed() >= Duration::from_millis(500);
+        let mut arrived = false;
         while let Some(event) = next(&mut reader, Duration::from_millis(1)) {
             if let EndpointEvent::StreamData {
                 conn_id,
@@ -275,19 +291,22 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
             {
                 reader_stream = Some((conn_id, stream_id));
                 received.extend_from_slice(&data);
-                quiet_since = Instant::now();
+                arrived = true;
             } else {
                 fail_on_teardown(&event);
             }
         }
+        assert!(
+            received.len() <= window,
+            "an unacknowledged reader gets at most one window, got {} of {window}",
+            received.len()
+        );
+        if arrived {
+            quiet_since = Instant::now();
+        } else if quiet_closed && window - received.len() < 1024 {
+            break;
+        }
     }
-    // The window also carried the negotiation, which the endpoint consumed
-    // itself; Yamux returns credit in half windows, so that is not back yet.
-    assert!(
-        received.len() <= window && window - received.len() < 1024,
-        "an unacknowledged reader gets one window, got {} of {window}",
-        received.len()
-    );
 
     let (reader_conn, reader_stream) = reader_stream.expect("data arrived");
     let over_ack = reader.stream_consumed(reader_conn, reader_stream, window + 1);
