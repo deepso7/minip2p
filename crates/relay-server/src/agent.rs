@@ -332,10 +332,11 @@ impl<K: Ord + Clone> Deadlines<K> {
         self.by_key.insert(key, deadline_ms);
     }
 
-    fn remove(&mut self, key: &K) {
-        if let Some(deadline_ms) = self.by_key.remove(key) {
-            self.by_due.remove(&(deadline_ms, key.clone()));
-        }
+    /// Removes `key`'s deadline, returning it.
+    fn remove(&mut self, key: &K) -> Option<u64> {
+        let deadline_ms = self.by_key.remove(key)?;
+        self.by_due.remove(&(deadline_ms, key.clone()));
+        Some(deadline_ms)
     }
 
     fn contains(&self, key: &K) -> bool {
@@ -486,11 +487,12 @@ pub struct RelayServerAgent {
     operations_by_stream: BTreeSet<(OperationScope, StreamKey, RelayServerToken)>,
     /// Peers whose new reservation's response is pending.
     reserving_peers: BTreeSet<PeerId>,
-    /// Peers whose renewal response is pending. Their reservation stays
-    /// alive (and off the timer) until that renewal commits or fails: the
-    /// client was promised the extension. The pending send is still bounded
-    /// by its control stream's own timeout.
-    renewing_peers: BTreeSet<PeerId>,
+    /// Peers whose renewal response is pending, with their reservation's
+    /// parked deadline. The reservation stays alive (and off the timer)
+    /// until that renewal commits or fails: the client was promised the
+    /// extension. The pending send is still bounded by its control stream's
+    /// own timeout.
+    renewing_peers: BTreeMap<PeerId, Option<u64>>,
     next_token: u64,
     last_event_tick_ms: Option<u64>,
     reservation_limiters: AdmissionLimiters,
@@ -551,7 +553,7 @@ impl RelayServerAgent {
             pending_operations: BTreeMap::new(),
             operations_by_stream: BTreeSet::new(),
             reserving_peers: BTreeSet::new(),
-            renewing_peers: BTreeSet::new(),
+            renewing_peers: BTreeMap::new(),
             next_token: 1,
             last_event_tick_ms: None,
         })
@@ -854,9 +856,6 @@ impl RelayServerAgent {
         // After the timeouts above: one may have cancelled a pending renewal,
         // and its reservation must not outlive this sweep.
         for peer_id in self.reservation_deadlines.due(now.monotonic_ms) {
-            if self.renewing_peers.contains(&peer_id) {
-                continue;
-            }
             self.remove_reservation(&peer_id);
             self.events.push_back(RelayServerEvent::ReservationClosed {
                 peer_id,
@@ -1161,13 +1160,7 @@ impl RelayServerAgent {
 
     /// Returns milliseconds until the earliest timer, with zero meaning due.
     pub fn next_timeout(&self, now: Now) -> Option<u64> {
-        // Renewing reservations are off the timer; at most one per pending
-        // renewal is skipped.
-        let reservation = self
-            .reservation_deadlines
-            .iter()
-            .find(|(_, peer)| !self.renewing_peers.contains(*peer))
-            .map(|(deadline_ms, _)| deadline_ms);
+        let reservation = self.reservation_deadlines.earliest();
         let hop = self.hop_deadlines.earliest();
         let stop = self.stop_deadlines.earliest();
         let circuit = self.circuit_deadlines.earliest();
@@ -1911,7 +1904,7 @@ impl RelayServerAgent {
             .get(&peer_id)
             .is_some_and(|reservation| reservation.conn_id == key.conn_id);
         let pending_for_peer =
-            self.reserving_peers.contains(&peer_id) || self.renewing_peers.contains(&peer_id);
+            self.reserving_peers.contains(&peer_id) || self.renewing_peers.contains_key(&peer_id);
         let deadline_ms = now
             .monotonic_ms
             .saturating_add(self.config.reservation_duration_secs.saturating_mul(1_000));
@@ -2322,13 +2315,14 @@ impl RelayServerAgent {
             self.operations_by_stream.insert((scope, stream, token));
         }
         if let Some(pending) = operation.pending_reservation() {
-            // `decide_reservation` admits one pending response per peer.
-            let peers = if pending.renewed {
-                &mut self.renewing_peers
+            // `decide_reservation` admits one pending response per peer. A
+            // renewing reservation's deadline is parked until it resolves.
+            if pending.renewed {
+                let parked = self.reservation_deadlines.remove(&pending.peer_id);
+                self.renewing_peers.insert(pending.peer_id.clone(), parked);
             } else {
-                &mut self.reserving_peers
-            };
-            peers.insert(pending.peer_id.clone());
+                self.reserving_peers.insert(pending.peer_id.clone());
+            }
         }
         self.pending_operations.insert(token, operation);
     }
@@ -2340,7 +2334,13 @@ impl RelayServerAgent {
         }
         if let Some(pending) = operation.pending_reservation() {
             if pending.renewed {
-                self.renewing_peers.remove(&pending.peer_id);
+                // Back on the timer at its old deadline; a commit replaces it.
+                if let Some(Some(deadline_ms)) = self.renewing_peers.remove(&pending.peer_id)
+                    && self.reservations.contains_key(&pending.peer_id)
+                {
+                    self.reservation_deadlines
+                        .set(pending.peer_id.clone(), deadline_ms);
+                }
             } else {
                 self.reserving_peers.remove(&pending.peer_id);
             }
@@ -2433,14 +2433,14 @@ impl RelayServerAgent {
         if self.config.max_circuit_duration_secs != 0 {
             assert_eq!(self.circuit_deadlines.by_key.len(), self.circuits.len());
         }
-        assert_deadlines(
-            &self.reservation_deadlines,
-            self.reservations.keys().collect(),
-        );
-        assert_eq!(
-            self.reservation_deadlines.by_key.len(),
-            self.reservations.len()
-        );
+        // Every reservation is on the timer unless its renewal is pending.
+        let timed: BTreeSet<_> = self
+            .reservations
+            .keys()
+            .filter(|peer| !self.renewing_peers.contains_key(*peer))
+            .collect();
+        assert_deadlines(&self.reservation_deadlines, timed.clone());
+        assert_eq!(self.reservation_deadlines.by_key.len(), timed.len());
 
         let pending_by_destination: BTreeSet<_> = self
             .pending_circuits
@@ -2448,12 +2448,17 @@ impl RelayServerAgent {
             .map(|(key, circuit)| (circuit.destination_conn_id, *key))
             .collect();
         assert_eq!(pending_by_destination, self.pending_by_destination);
-        for (key, circuit) in &self.circuits {
-            assert_eq!(
-                self.stop_to_source.get(&circuit.destination_stream),
-                Some(key)
-            );
-        }
+        let stop_to_source: BTreeMap<_, _> = self
+            .pending_circuits
+            .iter()
+            .filter_map(|(key, circuit)| circuit.stop_stream.map(|stop| (stop, *key)))
+            .chain(
+                self.circuits
+                    .iter()
+                    .map(|(key, circuit)| (circuit.destination_stream, *key)),
+            )
+            .collect();
+        assert_eq!(stop_to_source, self.stop_to_source);
         let mut peer_circuits = BTreeMap::new();
         let endpoints = self
             .pending_circuits
@@ -2493,7 +2498,10 @@ impl RelayServerAgent {
                 .map(|pending| pending.peer_id.clone())
                 .collect()
         };
-        assert_eq!(peers(true), self.renewing_peers);
+        assert_eq!(
+            peers(true),
+            self.renewing_peers.keys().cloned().collect::<BTreeSet<_>>()
+        );
         assert_eq!(peers(false), self.reserving_peers);
         assert_eq!(
             pending_reservations.len(),
