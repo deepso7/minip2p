@@ -13,9 +13,12 @@ pub use minip2p_swarm::{
     // dependency.
     DriverError,
     IdentifyMessage,
+    // How long an `open_stream` may negotiate before it fails.
+    OUTBOUND_NEGOTIATION_TIMEOUT_MS,
     SwarmBuilder,
     SwarmCore,
     SwarmError,
+    SwarmErrorKind,
     SwarmEvent,
     SwarmRuntimeError,
 };

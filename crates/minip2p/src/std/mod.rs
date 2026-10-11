@@ -660,7 +660,12 @@ impl Endpoint {
     /// fail early with [`SwarmError::RemoteDoesNotSupport`].
     ///
     /// Returns the connection and stream ids. Stream ids are only unique per
-    /// connection, so every later stream operation takes both.
+    /// connection, so every later stream operation takes both. The open ends
+    /// in exactly one terminal: [`EndpointEvent::StreamReady`], or an error
+    /// event naming the stream (see [`crate::SwarmErrorKind`]) when negotiation
+    /// fails, the peer closes the stream first, or
+    /// [`crate::OUTBOUND_NEGOTIATION_TIMEOUT_MS`]
+    /// passes; a closed or replaced connection ends it with its own event.
     pub fn open_stream(
         &mut self,
         peer_id: &PeerId,

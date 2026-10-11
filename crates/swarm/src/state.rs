@@ -71,6 +71,13 @@ pub const RESERVED_PROTOCOL_IDS: [&str; 2] = [IDENTIFY_PROTOCOL_ID, PING_PROTOCO
 /// transports' idle timeouts.
 pub const SIMULTANEOUS_DIAL_WINDOW_MS: u64 = 5_000;
 
+/// How long an outbound stream may spend in multistream-select negotiation.
+///
+/// A stream the peer has not agreed to by then is reset and reported as a
+/// [`SwarmErrorKind::OpenStreamFailed`] error naming it, timed by the `now`
+/// samples the host passes in.
+pub const OUTBOUND_NEGOTIATION_TIMEOUT_MS: u64 = 10_000;
+
 /// Identifies which protocol owns a negotiated stream.
 ///
 /// Kept private; callers refer to protocols by their string ids via
@@ -114,6 +121,9 @@ impl OwnedStream {
 struct PendingOutbound {
     negotiator: MultistreamSelect,
     target: ProtocolKind,
+    /// When the negotiation is given up; see
+    /// [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`].
+    deadline_ms: u64,
 }
 
 /// Transport work the state queues for [`crate::SwarmCore`] to dispatch.
@@ -684,12 +694,19 @@ impl SwarmState {
     /// Returns the milliseconds from `now_ms` until the earliest internal
     /// protocol timer is due, or `None` when no timer is armed.
     ///
-    /// Today the only internal timers are ping request timeouts: one is
-    /// armed whenever a ping payload is in flight to a peer. `Some(0)` means
-    /// a timer is already due and [`Self::handle_tick`] should run now.
+    /// The internal timers are ping request timeouts, armed whenever a ping
+    /// payload is in flight to a peer, and outbound negotiation deadlines.
+    /// `Some(0)` means a timer is already due and [`Self::handle_tick`]
+    /// should run now.
     pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
+        let negotiations = self
+            .outbound_negotiators
+            .values()
+            .map(|pending| pending.deadline_ms);
         self.ping_deadlines
             .values()
+            .copied()
+            .chain(negotiations)
             .min()
             .map(|due| due.saturating_sub(now_ms))
     }
@@ -1260,6 +1277,34 @@ impl SwarmState {
         // deadline, so a past-due entry can never be load-bearing anymore.
         // Dropping it keeps `next_timeout` from reporting a stale timer.
         self.ping_deadlines.retain(|_, due| *due > now_ms);
+        self.expire_outbound_negotiations(now_ms);
+    }
+
+    /// Gives up the outbound negotiations past their deadline: each is
+    /// reported once and its stream reset, whose close then adds nothing.
+    fn expire_outbound_negotiations(&mut self, now_ms: u64) {
+        let expired: Vec<(ConnectionId, StreamId)> = self
+            .outbound_negotiators
+            .iter()
+            .filter(|(_, pending)| pending.deadline_ms <= now_ms)
+            .map(|(key, _)| *key)
+            .collect();
+        for (conn_id, stream_id) in expired {
+            self.outbound_negotiators.remove(&(conn_id, stream_id));
+            self.emit_error_for_stream(
+                SwarmErrorKind::OpenStreamFailed,
+                self.established_peer_for_conn(conn_id),
+                Some(conn_id),
+                Some(stream_id),
+                format!(
+                    "outbound stream {stream_id} did not finish negotiating within {OUTBOUND_NEGOTIATION_TIMEOUT_MS} ms"
+                ),
+            );
+            if self.reset_pending.insert((conn_id, stream_id)) {
+                self.actions
+                    .push_back(Action::ResetStream { conn_id, stream_id });
+            }
+        }
     }
 
     /// Delivers a core-generated event to Ping.
@@ -1281,13 +1326,14 @@ impl SwarmState {
     }
 
     /// Starts multistream-select negotiation of `protocol` on an outbound
-    /// stream the core just opened on `conn_id`.
+    /// stream the core just opened on `conn_id` at `now_ms`.
     pub fn start_outbound(
         &mut self,
         conn_id: ConnectionId,
         stream_id: StreamId,
         protocol: &str,
         target: ProtocolKind,
+        now_ms: u64,
     ) {
         let mut negotiator = MultistreamSelect::dialer(protocol);
         if let Err(error) = negotiator.handle_input(MultistreamInput::Start) {
@@ -1303,8 +1349,14 @@ impl SwarmState {
             self.handle_multistream_output(conn_id, stream_id, output, &mut None);
         }
 
-        self.outbound_negotiators
-            .insert((conn_id, stream_id), PendingOutbound { negotiator, target });
+        self.outbound_negotiators.insert(
+            (conn_id, stream_id),
+            PendingOutbound {
+                negotiator,
+                target,
+                deadline_ms: now_ms.saturating_add(OUTBOUND_NEGOTIATION_TIMEOUT_MS),
+            },
+        );
     }
 
     /// Reports that the transport refused to open a stream for one of the
@@ -2121,7 +2173,16 @@ impl SwarmState {
         }
 
         self.inbound_negotiators.remove(&key);
-        self.outbound_negotiators.remove(&key);
+        // An open that never negotiated still gets its one terminal event.
+        if self.outbound_negotiators.remove(&key).is_some() {
+            self.emit_error_for_stream(
+                SwarmErrorKind::OpenStreamFailed,
+                self.established_peer_for_conn(conn_id),
+                Some(conn_id),
+                Some(stream_id),
+                format!("outbound stream {stream_id} closed before negotiation finished"),
+            );
+        }
     }
 
     fn handle_connection_closed(&mut self, conn_id: ConnectionId) {
@@ -2777,7 +2838,7 @@ mod tests {
                     _ => None,
                 })
                 .expect("an OpenStream for the protocol on the connection");
-            self.start_outbound(conn_id, stream_id, protocol_id, target);
+            self.start_outbound(conn_id, stream_id, protocol_id, target, 0);
         }
     }
 
@@ -2927,6 +2988,115 @@ mod tests {
         );
     }
 
+    /// A connected peer with a user stream for `/app/1` opened on stream 7,
+    /// still negotiating, opened at `now_ms`.
+    fn negotiating_user_stream(now_ms: u64) -> (SwarmState, ConnectionId, StreamId) {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"negotiating-peer");
+        let conn = ConnectionId::new(61);
+        let stream = StreamId::new(7);
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: conn,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+            },
+        );
+        drain_actions(&mut core);
+        drain_events(&mut core);
+        core.add_protocol("/app/1").expect("register");
+        core.open_stream(&peer, "/app/1").expect("admit open");
+        let actions = drain_actions(&mut core);
+        let target = actions
+            .into_iter()
+            .find_map(|action| match action {
+                Action::OpenStream { target, .. } => Some(target),
+                _ => None,
+            })
+            .expect("an open");
+        core.start_outbound(conn, stream, "/app/1", target, now_ms);
+        drain_actions(&mut core);
+        (core, conn, stream)
+    }
+
+    /// The terminal events (`StreamReady`, `StreamClosed`, or an error naming
+    /// the stream) for `stream` among `events`.
+    fn stream_terminals(events: &[SwarmEvent], stream: StreamId) -> usize {
+        events
+            .iter()
+            .filter(|event| match event {
+                SwarmEvent::StreamReady { stream_id, .. }
+                | SwarmEvent::StreamClosed { stream_id, .. } => *stream_id == stream,
+                SwarmEvent::Error(error) => error.stream_id == Some(stream),
+                _ => false,
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_peer_reset_during_outbound_negotiation_is_one_terminal_event() {
+        let (mut core, conn, stream) = negotiating_user_stream(0);
+        feed(
+            &mut core,
+            TransportEvent::StreamClosed {
+                id: conn,
+                stream_id: stream,
+            },
+        );
+        let events = drain_events(&mut core);
+        assert_eq!(stream_terminals(&events, stream), 1, "{events:?}");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SwarmEvent::Error(SwarmRuntimeError {
+                kind: SwarmErrorKind::OpenStreamFailed,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn an_unanswered_outbound_negotiation_fails_at_its_deadline() {
+        let start = 1_000;
+        let (mut core, conn, stream) = negotiating_user_stream(start);
+        let due = start + OUTBOUND_NEGOTIATION_TIMEOUT_MS;
+        assert_eq!(
+            core.next_timeout(start),
+            Some(OUTBOUND_NEGOTIATION_TIMEOUT_MS)
+        );
+
+        core.handle_tick(due - 1);
+        assert_eq!(stream_terminals(&drain_events(&mut core), stream), 0);
+
+        core.handle_tick(due);
+        let mut events = Vec::new();
+        let mut actions = Vec::new();
+        while let Some(output) = core.poll_output() {
+            match output {
+                Output::Action(action) => actions.push(action),
+                Output::Event(event) => events.push(event),
+            }
+        }
+        assert_eq!(stream_terminals(&events, stream), 1, "{events:?}");
+        assert!(
+            actions.contains(&Action::ResetStream {
+                conn_id: conn,
+                stream_id: stream
+            }),
+            "the abandoned negotiation's stream is reset: {actions:?}"
+        );
+        assert_eq!(core.next_timeout(due), None);
+
+        // The reset's own close adds nothing.
+        feed(
+            &mut core,
+            TransportEvent::StreamClosed {
+                id: conn,
+                stream_id: stream,
+            },
+        );
+        assert_eq!(stream_terminals(&drain_events(&mut core), stream), 0);
+    }
+
     #[test]
     fn outbound_not_available_error_preserves_stream_id() {
         let mut core = test_core();
@@ -2945,6 +3115,7 @@ mod tests {
             PendingOutbound {
                 negotiator,
                 target: ProtocolKind::User("/test/1".into()),
+                deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
             },
         );
 
@@ -3724,6 +3895,7 @@ mod tests {
             PendingOutbound {
                 negotiator: MultistreamSelect::dialer("/test/1"),
                 target: ProtocolKind::User("/test/1".into()),
+                deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
             },
         );
 
@@ -4672,6 +4844,7 @@ mod tests {
             PendingOutbound {
                 negotiator: MultistreamSelect::dialer("/test/1"),
                 target: ProtocolKind::User("/test/1".into()),
+                deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
             },
         );
         core.reset_stream(&peer, conn, stream)

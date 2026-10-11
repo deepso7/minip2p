@@ -497,8 +497,12 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// Returns the stream's full identity: stream ids are only unique per
     /// connection, so later stream operations take both. A transport that
     /// refuses the stream fails this call with [`DriverError::Transport`] and
-    /// emits no event; a later negotiation failure arrives as
-    /// [`SwarmEvent::Error`].
+    /// emits no event. Otherwise the open ends in exactly one terminal:
+    /// `StreamReady`, or a [`SwarmEvent::Error`] naming the stream when
+    /// negotiation fails, the peer closes or resets the stream first, or
+    /// [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`](crate::OUTBOUND_NEGOTIATION_TIMEOUT_MS)
+    /// passes without an answer. A closed or replaced connection ends it
+    /// with the connection's own event.
     pub fn open_stream(
         &mut self,
         peer_id: &PeerId,
@@ -513,6 +517,7 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             conn_id,
             protocol_id,
             ProtocolKind::User(protocol_id.to_string()),
+            now_ms,
         )?;
         self.flush(now_ms);
         Ok((conn_id, stream_id))
@@ -745,12 +750,11 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// Dispatches queued transport work until none is due, feeding each
     /// result back into the state (which may queue more).
     ///
-    /// `_now_ms` is the caller's sample for this step. Every command takes
-    /// one so timed work never needs an API change; no dispatched action
-    /// reads time today.
-    fn flush(&mut self, _now_ms: u64) {
+    /// `now_ms` is the caller's sample for this step; an outbound open
+    /// starts its negotiation deadline from it.
+    fn flush(&mut self, now_ms: u64) {
         while let Some(action) = self.state.next_action() {
-            self.dispatch(action);
+            self.dispatch(action, now_ms);
         }
     }
 
@@ -763,23 +767,24 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         conn_id: ConnectionId,
         protocol: &str,
         target: ProtocolKind,
+        now_ms: u64,
     ) -> Result<StreamId, TransportError> {
         let stream_id = self.transport.open_stream(conn_id)?;
         self.state
-            .start_outbound(conn_id, stream_id, protocol, target);
+            .start_outbound(conn_id, stream_id, protocol, target, now_ms);
         Ok(stream_id)
     }
 
     /// Executes one action against the transport and feeds any result back
     /// into the state.
-    fn dispatch(&mut self, action: Action) {
+    fn dispatch(&mut self, action: Action, now_ms: u64) {
         match action {
             Action::OpenStream {
                 conn_id,
                 protocol,
                 target,
             } => {
-                if let Err(error) = self.open(conn_id, &protocol, target) {
+                if let Err(error) = self.open(conn_id, &protocol, target, now_ms) {
                     self.state
                         .open_failed(conn_id, &protocol, &error.to_string());
                 }
