@@ -38,8 +38,10 @@ pub enum SwarmEvent {
     ///
     /// The newest connection wins, except in a simultaneous dial: a direct
     /// connection in the opposite direction to a direct `old` that registered
-    /// less than [`SIMULTANEOUS_DIAL_WINDOW_MS`](crate::SIMULTANEOUS_DIAL_WINDOW_MS)
-    /// ago replaces it only if the lower peer id dialed it. Otherwise it is
+    /// within the simultaneous-dial window (default
+    /// [`SIMULTANEOUS_DIAL_WINDOW_MS`](crate::SIMULTANEOUS_DIAL_WINDOW_MS),
+    /// set with [`SwarmBuilder::simultaneous_dial_window_ms`](crate::SwarmBuilder::simultaneous_dial_window_ms))
+    /// replaces it only if the lower peer id dialed it. Otherwise it is
     /// closed unannounced (our own losing dial completes as
     /// [`SwarmEvent::DialFailed`]), so both peers keep the same connection.
     ConnectionReplaced {
