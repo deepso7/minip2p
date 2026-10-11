@@ -369,6 +369,30 @@ fn write_larger_than_queue_cap_succeeds_when_the_engine_accepts_it() {
     assert_eq!(received, 9, "server must receive the full direct write");
 }
 
+/// The engine copies what it accepts: a large write cut short by the queue
+/// cap leaves the caller's allocation owned by the caller alone, not pinned
+/// behind the few bytes the engine took.
+#[test]
+fn a_partially_accepted_write_does_not_pin_the_callers_buffer() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 1024,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let stream = client.open_stream(client_conn).expect("open stream");
+
+    let payload = Bytes::from(vec![7; 8 * STREAM_RECEIVE_WINDOW]);
+    match client.send_stream(client_conn, stream, payload.clone()) {
+        Err(TransportError::Full { unsent, .. }) => drop(unsent),
+        other => panic!("expected Full, got {other:?}"),
+    }
+    assert!(
+        payload.is_unique(),
+        "neither the engine nor the queue may hold a slice of the payload"
+    );
+}
+
 #[test]
 fn a_write_past_the_pending_cap_is_full_and_resumes_on_writable() {
     let limits = QuicLimits {

@@ -42,19 +42,29 @@ pub(crate) fn system_time() -> Duration {
 ///
 /// The transport stores each poll's `Now::unix_seconds` here; while the host
 /// has supplied none, the system clock answers instead.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct HostTime(AtomicU64);
+
+/// Stored while the host has supplied no sample. Zero can't be the marker:
+/// the Unix epoch is a valid (if unlikely) sample.
+const NO_SAMPLE: u64 = u64::MAX;
+
+impl Default for HostTime {
+    fn default() -> Self {
+        Self(AtomicU64::new(NO_SAMPLE))
+    }
+}
 
 impl HostTime {
     /// Records the host's latest sample; `None` falls back to the system clock.
     pub(crate) fn set(&self, unix_seconds: Option<u64>) {
-        self.0.store(unix_seconds.unwrap_or(0), Relaxed);
+        self.0.store(unix_seconds.unwrap_or(NO_SAMPLE), Relaxed);
     }
 
     /// The current wall-clock time on the host's timeline.
     pub(crate) fn now(&self) -> Duration {
         match self.0.load(Relaxed) {
-            0 => system_time(),
+            NO_SAMPLE => system_time(),
             seconds => Duration::from_secs(seconds),
         }
     }
@@ -297,6 +307,19 @@ pub(crate) fn peer_id_from_identity(
 mod tests {
     use super::*;
     use rustls::{ClientConnection, ServerConnection};
+
+    #[test]
+    fn host_time_distinguishes_the_epoch_from_no_sample() {
+        let time = HostTime::default();
+        assert!(
+            time.now() > Duration::from_secs(1),
+            "no sample: system clock"
+        );
+        time.set(Some(0));
+        assert_eq!(time.now(), Duration::ZERO, "the epoch is a real sample");
+        time.set(None);
+        assert!(time.now() > Duration::from_secs(1));
+    }
 
     /// A certificate and key that are not a valid libp2p identity pair.
     fn certified(cert: Vec<u8>, key: Vec<u8>) -> Arc<CertifiedKey> {

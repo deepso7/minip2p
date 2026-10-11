@@ -754,13 +754,10 @@ impl QuicConnection {
         let direct = if self.send_queues.contains_key(&raw) || self.is_unbound(raw) {
             0
         } else {
-            let mut chunk = [data.clone()];
-            match self
-                .conn
-                .send_stream(engine_stream(raw))
-                .write_chunks(&mut chunk)
-            {
-                Ok(written) => written.bytes,
+            // `write` copies only what the engine accepts: handing it a slice
+            // would pin the caller's whole allocation behind a small prefix.
+            match self.conn.send_stream(engine_stream(raw)).write(&data) {
+                Ok(written) => written,
                 Err(WriteError::Blocked) => 0,
                 Err(WriteError::Stopped(error_code)) => {
                     self.on_stopped(raw, error_code, events);
@@ -970,13 +967,12 @@ impl QuicConnection {
                     }
                 }
             } else {
-                let mut chunk = [front.bytes.clone()];
-                match self.conn.send_stream(stream).write_chunks(&mut chunk) {
-                    Ok(written) if written.bytes == 0 => return,
+                // Copies the accepted prefix, as in `send_stream`.
+                match self.conn.send_stream(stream).write(&front.bytes) {
+                    Ok(0) => return,
                     Ok(written) => {
-                        front.advance(written.bytes);
-                        self.pending_write_bytes =
-                            self.pending_write_bytes.saturating_sub(written.bytes);
+                        front.advance(written);
+                        self.pending_write_bytes = self.pending_write_bytes.saturating_sub(written);
                         if !front.bytes.is_empty() {
                             return;
                         }
