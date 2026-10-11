@@ -44,7 +44,7 @@ METRICS = {
 EXPECTED_CRITERION = {
     "multiaddr/parse_text", "multiaddr/encode_binary", "multiaddr/decode_binary",
     "yamux/64KiB/session_send_and_drain", "yamux/64KiB/session_receive_and_drain",
-    "yamux/256KiB/queued_send_16KiB_window_updates",
+    "yamux/256KiB/queued_send_16KiB_window_updates", "yamux/1024_streams/sparse_send_8_streams",
     "peer_book_128_peers_16_addrs/tick_active", "peer_book_128_peers_16_addrs/tick_expire",
     "peer_book_128_peers_16_addrs/next_timeout",
     "pubsub/gossipsub_publish_32x60KiB",
@@ -52,7 +52,11 @@ EXPECTED_CRITERION = {
     "pubsub/gossipsub_forward_1KiB/128", "pubsub/gossipsub_heartbeat_1000_peers_100_topics",
     "relay_handle_event_same_now_128_pending_hops",
     "quic/idle_poll/1", "quic/idle_poll/64", "quic/idle_poll/256", "quic/idle_poll/512",
-    "tcp/readiness_poll/1", "tcp/readiness_poll/64", "tcp/readiness_poll/256", "tcp/readiness_poll/512",
+    *{
+        f"tcp/{group}/{count}"
+        for group in ("readiness_poll", "readiness_poll_sparse", "transport_poll_idle", "transport_poll_sparse")
+        for count in (1, 64, 256, 512)
+    },
     "e2e/tcp/setup", "e2e/tcp/ping", "e2e/tcp/echo_64b", "e2e/tcp/echo_64b_crossed_4x4",
     "e2e/tcp/transfer_1mib", "e2e/quic/setup", "e2e/quic/ping", "e2e/quic/echo_64b",
     "e2e/quic/echo_64b_crossed_4x4", "e2e/quic/transfer_1mib",
@@ -64,6 +68,7 @@ GUNGRAUN_NAMES = {
     "session_send_and_drain": "yamux/64KiB/session_send_and_drain",
     "session_receive_and_drain": "yamux/64KiB/session_receive_and_drain",
     "queued_send_16kib_window_updates": "yamux/256KiB/queued_send_16KiB_window_updates",
+    "sparse_send_8_of_1024_streams": "yamux/1024_streams/sparse_send_8_streams",
     "tick_active": "peer_book_128_peers_16_addrs/tick_active",
     "tick_expire": "peer_book_128_peers_16_addrs/tick_expire",
     "next_timeout": "peer_book_128_peers_16_addrs/next_timeout",
