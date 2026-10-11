@@ -550,25 +550,15 @@ fn circuit_id(driver: &NatDriver, key: (ConnectionId, StreamId)) -> ConnectionId
 }
 
 #[test]
-fn autonat_listen_addrs_stay_empty_until_a_listener_is_bound() {
+fn autonat_listen_addrs_are_seeded_by_bind() {
     let mut endpoint = Endpoint::builder()
         .nat_config(NatConfig::default())
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")
         .bind()
         .expect("bind endpoint");
-    // QUIC reports its bound socket from `local_addresses` even before
-    // `listen` runs, and the socket drops Initials until then — AutoNAT
-    // must not offer it for dial-back or it would be judged Private.
-    endpoint
-        .next_event(std::time::Duration::from_millis(10))
-        .expect("drive endpoint");
-    assert!(
-        endpoint.nat.as_ref().unwrap().listen_addrs().is_empty(),
-        "bound-but-not-listening socket must not seed AutoNAT"
-    );
-
-    endpoint.listen().expect("listen");
+    // `bind` already accepts on the QUIC socket, so AutoNAT may offer it
+    // for dial-back without a separate `listen` call.
     endpoint
         .next_event(std::time::Duration::from_millis(10))
         .expect("drive endpoint");

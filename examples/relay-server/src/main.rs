@@ -82,7 +82,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         match endpoint.wait(Duration::from_millis(250))? {
             EndpointWaitOutcome::Event(EndpointEvent::RelayServer(event)) => print_event(event),
             EndpointWaitOutcome::Event(event) => println!("[endpoint] {event:?}"),
-            EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
+            _ => {}
         }
     }
 }

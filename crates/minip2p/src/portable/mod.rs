@@ -13,9 +13,12 @@ pub use minip2p_swarm::{
     // dependency.
     DriverError,
     IdentifyMessage,
+    // How long an `open_stream` may negotiate before it fails.
+    OUTBOUND_NEGOTIATION_TIMEOUT_MS,
     SwarmBuilder,
     SwarmCore,
     SwarmError,
+    SwarmErrorKind,
     SwarmEvent,
     SwarmRuntimeError,
 };
@@ -364,6 +367,51 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
             .abandon_stream(peer_id, conn_id, stream_id, now.monotonic_ms)
     }
 
+    /// Abandons a stream and drops its events from `held`, the events a
+    /// composed endpoint's failed poll still holds.
+    ///
+    /// A held `StreamClosed` proves the stream existed even though the swarm,
+    /// having already delivered that close, no longer knows it; its held
+    /// events are dropped all the same. Their data was never pulled, so it
+    /// is acknowledged here, as the swarm does for data still in its own
+    /// queue; after a reset that acknowledgement is moot, so its error is
+    /// ignored.
+    #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
+    fn abandon_stream_holding(
+        &mut self,
+        held: &mut Vec<EndpointEvent>,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now: Now,
+    ) -> Result<(), DriverError> {
+        let held_close = held.iter().any(|event| {
+            matches!(event, EndpointEvent::StreamClosed { .. })
+                && event.matches_stream(peer_id, conn_id, stream_id)
+        });
+        match self.abandon_stream(peer_id, conn_id, stream_id, now) {
+            Ok(()) => {}
+            Err(_) if held_close => {}
+            Err(error) => return Err(error),
+        }
+        let mut dropped_data = 0usize;
+        held.retain(|event| {
+            if !event.matches_stream(peer_id, conn_id, stream_id) {
+                return true;
+            }
+            if let EndpointEvent::StreamData { data, .. } = event {
+                dropped_data += data.len();
+            }
+            false
+        });
+        if dropped_data > 0 {
+            match self.core.ack_stream(conn_id, stream_id, dropped_data) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Acknowledges the stream data in events the application is about to
     /// pull (ADR 0012): pulling an event consumes its bytes, which returns
     /// their receive credit to the sender.
@@ -403,11 +451,17 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// Returning an [`EndpointEvent::StreamData`] acknowledges its bytes
     /// (ADR 0012): a sender's receive budget is replenished as the
     /// application pulls its data, so polling less often slows the sender.
+    ///
+    /// An error discards nothing: Connection-attempt events stay queued for
+    /// the next call.
     pub fn poll(&mut self, now: Now) -> Result<alloc::vec::Vec<EndpointEvent>, DriverError> {
         self.tick_connect(now);
+        // Poll the core before taking any queued event, so its error leaves
+        // them for next time.
+        let polled = self.core.poll(now)?;
         let mut events = alloc::vec::Vec::new();
         Self::drain_connect_events(&mut self.connect, &mut events);
-        for event in self.core.poll(now)? {
+        for event in polled {
             let consumed = self
                 .connect
                 .observe(&event, &mut self.core, now.monotonic_ms);
@@ -480,6 +534,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
                 #[cfg(feature = "pubsub")]
                 None,
             ),
+            unreturned: Vec::new(),
         })
     }
 }
@@ -502,6 +557,8 @@ pub struct PortableMdnsEndpoint<T: Transport, E: EntropySource, I: MdnsIo> {
     endpoint: PortableEndpoint<T, E>,
     mdns: minip2p_mdns::MdnsDriver<I>,
     discovery: DiscoveryDriver,
+    /// Events a failed [`Self::poll`] collected; the next call returns them.
+    unreturned: Vec<EndpointEvent>,
 }
 
 #[cfg(feature = "portable-mdns")]
@@ -565,6 +622,21 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         ))
     }
 
+    /// Abandons a stream as [`PortableEndpoint::abandon_stream`] does, also
+    /// dropping its events a failed [`Self::poll`] still holds.
+    ///
+    /// Shadows the inner endpoint's method, which cannot see those events.
+    pub fn abandon_stream(
+        &mut self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now: Now,
+    ) -> Result<(), DriverError> {
+        self.endpoint
+            .abandon_stream_holding(&mut self.unreturned, peer_id, conn_id, stream_id, now)
+    }
+
     /// Borrows the mDNS carrier, or `None` after it has stopped.
     pub fn mdns_io(&self) -> Option<&I> {
         self.mdns.io()
@@ -579,16 +651,31 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
     ///
     /// Returns Endpoint events, with peer-book changes as
     /// [`EndpointEvent::Discovery`] after the step's connection events.
+    /// An error discards nothing: events already collected come out of the
+    /// next call.
     pub fn poll(&mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
-        let mut events = Vec::new();
-        self.poll_endpoint(now, &mut events)?;
+        let mut events = core::mem::take(&mut self.unreturned);
+        if let Err(error) = self.poll_into(now, &mut events) {
+            self.unreturned = events;
+            return Err(error);
+        }
+        self.endpoint.ack_pulled(&events);
+        Ok(events)
+    }
+
+    fn poll_into(
+        &mut self,
+        now: Now,
+        events: &mut Vec<EndpointEvent>,
+    ) -> Result<(), PortableDriveError> {
+        self.poll_endpoint(now, events)?;
 
         let local_addrs = self.endpoint.bound_addresses();
         self.mdns.tick(now.monotonic_ms, &local_addrs)?;
         // The mDNS carrier drives the shared interface. That may place TCP
         // bytes into a socket after the transport was serviced above, so run
         // the endpoint once more before computing a sleep deadline.
-        self.poll_endpoint(now, &mut events)?;
+        self.poll_endpoint(now, events)?;
         while let Some(event) = self.mdns.poll_event() {
             self.discovery.handle_mdns_event(event, now.monotonic_ms);
         }
@@ -607,10 +694,9 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         ));
         // The sweep can admit attempts that settle immediately; surface them
         // now so `claim_settled` clears `inflight` in the same poll.
-        self.emit_connect_events(now, &mut events);
-        self.discovery.drain_events(&mut events);
-        self.endpoint.ack_pulled(&events);
-        Ok(events)
+        self.emit_connect_events(now, events);
+        self.discovery.drain_events(events);
+        Ok(())
     }
 
     fn poll_endpoint(
@@ -641,8 +727,12 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         }
     }
 
-    /// Returns the earliest endpoint or mDNS deadline.
+    /// Returns the earliest endpoint or mDNS deadline; immediate while a
+    /// failed poll's events wait to be returned.
     pub fn next_deadline(&self, now: Now) -> Option<PollDeadline> {
+        if !self.unreturned.is_empty() {
+            return Some(PollDeadline::IMMEDIATE);
+        }
         let mdns = self
             .mdns
             .next_timeout(now.monotonic_ms)
@@ -659,8 +749,12 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
 
     /// Sends mDNS goodbyes, closes peers, and consumes the composed endpoint.
     ///
-    /// Returns the final Endpoint events, including queued peer-book changes.
+    /// Returns the final Endpoint events, including queued peer-book changes
+    /// and any a failed [`Self::poll`] still held.
     pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
+        let mut events = core::mem::take(&mut self.unreturned);
+        // Pulled now, so acknowledged like any other returned event.
+        self.endpoint.ack_pulled(&events);
         self.mdns.shutdown(now.monotonic_ms)?;
         let (connect, runtime) = self.endpoint.parts_mut();
         // Same as the sweep above: no NAT driver means no work to apply.
@@ -671,7 +765,7 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
             runtime,
             now,
         ));
-        let mut events = self.endpoint.shutdown(now)?;
+        events.extend(self.endpoint.shutdown(now)?);
         self.discovery.drain_events(&mut events);
         Ok(events)
     }
@@ -819,6 +913,9 @@ pub struct SmoltcpEndpoint<D: smoltcp::phy::Device, E: EntropySource> {
     #[cfg(feature = "portable-autonat")]
     nat: Option<NatDriver<SharedEntropy<E>>>,
     discovery: Option<DiscoveryDriver>,
+    /// Events a failed [`Self::poll`] collected; the next call (or
+    /// [`Self::shutdown`]) returns them.
+    unreturned: Vec<EndpointEvent>,
 }
 
 #[cfg(feature = "smoltcp")]
@@ -839,6 +936,21 @@ impl<D: smoltcp::phy::Device, E: EntropySource> core::ops::DerefMut for SmoltcpE
 
 #[cfg(feature = "smoltcp")]
 impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
+    /// Abandons a stream as [`PortableEndpoint::abandon_stream`] does, also
+    /// dropping its events a failed [`Self::poll`] still holds.
+    ///
+    /// Shadows the inner endpoint's method, which cannot see those events.
+    pub fn abandon_stream(
+        &mut self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now: Now,
+    ) -> Result<(), DriverError> {
+        self.endpoint
+            .abandon_stream_holding(&mut self.unreturned, peer_id, conn_id, stream_id, now)
+    }
+
     /// Pushes NAT-advertised address changes into Identify. Called once per
     /// poll: the external address set only propagates when Identify runs,
     /// so changes queued between polls flush on the next one. No-op when
@@ -1046,15 +1158,29 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     /// Advances TCP and every configured embedded service once.
     ///
     /// Returns Endpoint events; enabled capabilities report through their
-    /// [`EndpointEvent`] variants.
+    /// [`EndpointEvent`] variants. An error discards nothing: events already
+    /// collected come out of the next call.
     pub fn poll(&mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
-        let mut output = Vec::new();
-        self.poll_swarm(now, &mut output)?;
+        let mut output = core::mem::take(&mut self.unreturned);
+        if let Err(error) = self.poll_into(now, &mut output) {
+            self.unreturned = output;
+            return Err(error);
+        }
+        self.endpoint.ack_pulled(&output);
+        Ok(output)
+    }
+
+    fn poll_into(
+        &mut self,
+        now: Now,
+        output: &mut Vec<EndpointEvent>,
+    ) -> Result<(), PortableDriveError> {
+        self.poll_swarm(now, output)?;
         if let Some(mdns) = self.mdns.as_mut() {
             mdns.tick(now.monotonic_ms, &self.endpoint.bound_addresses())?;
         }
         if self.mdns.is_some() {
-            self.poll_swarm(now, &mut output)?;
+            self.poll_swarm(now, output)?;
         }
         if let (Some(mdns), Some(discovery)) = (self.mdns.as_mut(), self.discovery.as_mut()) {
             while let Some(event) = mdns.poll_event() {
@@ -1111,11 +1237,10 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         let mut settled = Vec::new();
         self.emit_connect_events(now, &mut settled);
         if let Some(discovery) = self.discovery.as_mut() {
-            discovery.drain_events(&mut output);
+            discovery.drain_events(output);
         }
         output.extend(settled);
-        self.endpoint.ack_pulled(&output);
-        Ok(output)
+        Ok(())
     }
 
     fn poll_swarm(&mut self, now: Now, output: &mut Vec<EndpointEvent>) -> Result<(), DriverError> {
@@ -1156,8 +1281,12 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         Ok(())
     }
 
-    /// Returns the earliest deadline across TCP and configured services.
+    /// Returns the earliest deadline across TCP and configured services;
+    /// immediate while a failed poll's events wait to be returned.
     pub fn next_deadline(&self, now: Now) -> Option<PollDeadline> {
+        if !self.unreturned.is_empty() {
+            return Some(PollDeadline::IMMEDIATE);
+        }
         // Agents report milliseconds-until-due; the endpoint reports absolute.
         let at = |timeout: u64| PollDeadline::from_millis(now.monotonic_ms.saturating_add(timeout));
         let mut deadline = self.endpoint.next_deadline(now);
@@ -1195,7 +1324,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     ///
     /// Returns the final Endpoint events, including capability events that
     /// were still queued and Gossipsub events still held by the agent.
-    /// Connection-close events come first; queued capability events follow.
+    /// Events a failed [`Self::poll`] still held come first, then
+    /// connection-close events, then queued capability events.
     pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
         if let Some(mdns) = self.mdns.as_mut() {
             mdns.shutdown(now.monotonic_ms)?;
@@ -1240,7 +1370,10 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             .as_mut()
             .map(|nat| nat.drain_application_events().collect())
             .unwrap_or_default();
-        let mut events = self.endpoint.shutdown(now)?;
+        let mut events = core::mem::take(&mut self.unreturned);
+        // Pulled now, so acknowledged like any other returned event.
+        self.endpoint.ack_pulled(&events);
+        events.extend(self.endpoint.shutdown(now)?);
         #[cfg(feature = "portable-autonat")]
         events.extend(nat.into_iter().map(EndpointEvent::Nat));
         #[cfg(feature = "pubsub")]
@@ -1533,6 +1666,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             #[cfg(feature = "portable-autonat")]
             nat,
             discovery,
+            unreturned: Vec::new(),
         })
     }
 }
@@ -1725,6 +1859,121 @@ mod tests {
         fn local_addresses(&self) -> Vec<Multiaddr> {
             vec![self.local_address.clone()]
         }
+    }
+
+    /// An mDNS carrier with no interfaces whose driving fails, as a stack
+    /// that has gone away does.
+    #[cfg(feature = "portable-mdns")]
+    struct BrokenMdns;
+
+    #[cfg(feature = "portable-mdns")]
+    impl MdnsIo for BrokenMdns {
+        fn interfaces(&self) -> &[minip2p_mdns::InterfaceSnapshot] {
+            &[]
+        }
+        fn refresh(&mut self) -> Result<bool, MdnsError> {
+            Ok(false)
+        }
+        fn receive(
+            &mut self,
+            _: &mut [u8],
+        ) -> Result<Option<minip2p_mdns::MdnsDatagram>, MdnsError> {
+            Ok(None)
+        }
+        fn send(&mut self, _: &minip2p_mdns::MdnsAction) -> Result<(), MdnsError> {
+            Ok(())
+        }
+        fn poll(&mut self, _: u64) -> Result<(), MdnsError> {
+            Err(MdnsError::Io {
+                operation: "poll",
+                reason: "stack gone".into(),
+            })
+        }
+    }
+
+    /// A stream whose close a failed poll still holds is gone from the
+    /// swarm, yet abandoning it drops every held event for it.
+    #[cfg(feature = "portable-mdns")]
+    #[test]
+    fn abandoning_a_stream_closed_in_held_events_drops_them() {
+        let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
+        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
+            .build(NoopTransport)
+            .expect("portable endpoint")
+            .with_mdns(BrokenMdns, MdnsConfig::default(), [0; 32])
+            .expect("mdns endpoint");
+        let peer = Ed25519Keypair::from_secret_key_bytes([8; 32]).peer_id();
+        let (conn_id, stream_id) = (ConnectionId::new(1), StreamId::new(3));
+        let other = EndpointEvent::ConnectionClosed {
+            peer_id: peer.clone(),
+            conn_id: ConnectionId::new(2),
+        };
+        endpoint.unreturned.extend([
+            EndpointEvent::StreamData {
+                peer_id: peer.clone(),
+                conn_id,
+                stream_id,
+                data: minip2p_core::Bytes::from_static(b"late"),
+            },
+            EndpointEvent::StreamClosed {
+                peer_id: peer.clone(),
+                conn_id,
+                stream_id,
+            },
+            other,
+        ]);
+        endpoint
+            .abandon_stream(&peer, conn_id, stream_id, Now::from_millis(0))
+            .expect("a held close proves the stream");
+        assert!(
+            matches!(
+                endpoint.unreturned.as_slice(),
+                [EndpointEvent::ConnectionClosed { conn_id, .. }] if *conn_id == ConnectionId::new(2)
+            ),
+            "{:?}",
+            endpoint.unreturned
+        );
+    }
+
+    /// A failed mDNS tick keeps the events the endpoint pass already
+    /// collected: the deadline turns immediate, and the next poll returns
+    /// them.
+    #[cfg(feature = "portable-mdns")]
+    #[test]
+    fn a_failed_mdns_poll_keeps_its_collected_events_for_the_next() {
+        let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
+        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
+            .build(NoopTransport)
+            .expect("portable endpoint")
+            .with_mdns(BrokenMdns, MdnsConfig::default(), [0; 32])
+            .expect("mdns endpoint");
+        let peer = Ed25519Keypair::from_secret_key_bytes([8; 32]).peer_id();
+        let target = PeerAddr::new(
+            <Multiaddr as core::str::FromStr>::from_str("/ip4/192.0.2.1/tcp/4001").expect("addr"),
+            peer,
+        )
+        .expect("peer addr");
+        // The transport refuses the dial, so the attempt settles on the
+        // endpoint pass that runs before the mDNS tick fails.
+        let id = endpoint
+            .connect(target, Now::from_millis(0))
+            .expect("admitted");
+
+        endpoint
+            .poll(Now::from_millis(1))
+            .expect_err("the carrier fails");
+        assert_eq!(
+            endpoint.next_deadline(Now::from_millis(1)),
+            Some(PollDeadline::IMMEDIATE)
+        );
+        let events = endpoint.poll(Now::from_millis(2)).expect("poll");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EndpointEvent::ConnectSettled { connect_id, .. } if *connect_id == id
+            )),
+            "{events:?}"
+        );
     }
 
     #[test]

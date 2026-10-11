@@ -302,14 +302,18 @@ impl<T: Transport> Swarm<T> {
         self.core.poll(now)
     }
 
-    /// Queues `events` ahead of anything the next [`Self::poll`] reads from
-    /// the transport.
+    /// Queues `events`, in order, ahead of every event already buffered and
+    /// anything the next [`Self::poll`] reads from the transport.
     ///
-    /// Endpoint tests use this to pin step order when one poll returns
-    /// several swarm events.
+    /// The Endpoint uses this to hand back swarm events a failed step did not
+    /// reach, and its tests to pin step order when one poll returns several
+    /// swarm events.
     #[doc(hidden)]
     pub fn preload_poll_events(&mut self, events: impl IntoIterator<Item = SwarmEvent>) {
-        self.core.state.events.extend(events);
+        let events: Vec<SwarmEvent> = events.into_iter().collect();
+        for event in events.into_iter().rev() {
+            self.core.state.events.push_front(event);
+        }
     }
 }
 

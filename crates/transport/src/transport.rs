@@ -66,6 +66,10 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 ///   side has ended (`StreamWriteStopped`, a reset, `close_stream_write`,
 ///   `StreamClosed`, or `Closed`); those tell the holder to drop its tail.
 /// - Temporary send pressure never tears down a connection.
+/// - Any error other than `Full` says nothing about how much was accepted:
+///   a transport may queue a prefix and then fail. Treat such a stream as
+///   broken rather than retrying the whole payload, which could repeat that
+///   prefix.
 ///
 /// Reads follow the read-side contract:
 ///
@@ -132,7 +136,8 @@ pub trait Transport {
     /// Accepts as much of `data` as the stream can queue. Returns
     /// [`TransportError::Full`] with the unsent tail when not every byte fit
     /// (see [Backpressure](#backpressure)), and `StreamSendFailed` if the
-    /// write side is already closed. Empty data is a no-op.
+    /// write side is already closed. Empty data is a no-op. Any other error
+    /// may follow a partially queued payload, so it is not safe to resend.
     fn send_stream(
         &mut self,
         id: ConnectionId,

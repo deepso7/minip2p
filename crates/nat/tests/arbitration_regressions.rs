@@ -5,7 +5,7 @@ mod common;
 use common::*;
 
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
-use minip2p_nat::{NatConfig, NatEvent, Path, PromoteError};
+use minip2p_nat::{MAX_PUNCH_CANDIDATES, NatConfig, NatEvent, Path, PromoteError};
 use minip2p_relay::Status;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
@@ -112,6 +112,56 @@ fn circuit_dialer_filters_peer_supplied_punch_targets() {
         })
         .collect();
     assert_eq!(dials, vec![global]);
+}
+
+/// A CONNECT naming hundreds of global addresses produces at most the cap's
+/// worth of punch dials.
+#[test]
+fn circuit_dialer_caps_peer_supplied_punch_targets() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (_, conn) = drive_to_relayed(&mut h);
+    let stream = StreamId::new(90);
+    open_inbound_dcutr(&mut h, conn, stream);
+    let addrs: Vec<Multiaddr> = (0..250)
+        .map(|i| {
+            maddr(&format!(
+                "/ip4/9.9.{}.{}/udp/{}/quic-v1",
+                i / 200,
+                i % 200 + 1,
+                4000 + i
+            ))
+        })
+        .collect();
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            conn_id: conn,
+            peer_id: h.target.clone(),
+            stream_id: stream,
+            data: Bytes::from(dcutr_connect_reply(&addrs)),
+        },
+        false,
+        at(311),
+    );
+    drain_actions(&mut h.agent);
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            conn_id: conn,
+            peer_id: h.target.clone(),
+            stream_id: stream,
+            data: Bytes::from(dcutr_sync()),
+        },
+        false,
+        at(312),
+    );
+
+    let dials = drain_actions(&mut h.agent)
+        .into_iter()
+        .filter(|action| matches!(action, Out::Dial { addr, .. } if addr.peer_id() == &h.target))
+        .count();
+    assert!(
+        (1..=MAX_PUNCH_CANDIDATES).contains(&dials),
+        "{dials} punch dials"
+    );
 }
 
 #[test]

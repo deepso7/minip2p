@@ -56,6 +56,7 @@ pub enum NatAction {
 
 /// Events the agent surfaces to the application.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum NatEvent {
     /// The reachability verdict flipped (majority-of-window confidence, so
     /// this never flaps on a single probe).

@@ -5,7 +5,10 @@ mod common;
 use common::*;
 
 use minip2p_core::PeerAddr;
-use minip2p_nat::{DCUTR_PROTOCOL_ID, NatConfig, NatEvent, Path, STOP_PROTOCOL_ID};
+use minip2p_core::{Multiaddr, Protocol};
+use minip2p_nat::{
+    DCUTR_PROTOCOL_ID, MAX_PUNCH_CANDIDATES, NatConfig, NatEvent, Path, STOP_PROTOCOL_ID,
+};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
@@ -118,22 +121,6 @@ fn early_closed_inbound_dcutr_exchange_resets_the_stream() {
     );
 
     assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
-    assert!(!h.agent.owns_stream(conn, stream));
-    assert!(h.agent.is_idle());
-}
-
-#[test]
-fn oversized_inbound_dcutr_connect_keeps_the_relayed_path() {
-    let mut h = inbound_harness(NatConfig::default());
-    let addrs: Vec<_> = (1u16..=400)
-        .map(|port| maddr(&format!("/ip4/198.51.100.5/udp/{port}/quic-v1")))
-        .collect();
-    h.agent.set_listen_addrs(&addrs);
-    let (conn, actions) = drive_to_relayed(&mut h);
-    let stream = open_dcutr(&mut h, conn, &actions);
-
-    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
-    assert!(drain_events(&mut h.agent).is_empty());
     assert!(!h.agent.owns_stream(conn, stream));
     assert!(h.agent.is_idle());
 }
@@ -530,4 +517,125 @@ fn inbound_dcutr_is_not_opened_once_a_direct_connection_replaced_the_circuit() {
         }]
     ));
     assert!(h.agent.is_idle());
+}
+
+/// The UDP port of a punch target.
+fn udp_port(addr: &Multiaddr) -> Option<u16> {
+    addr.protocols().iter().find_map(|protocol| match protocol {
+        Protocol::Udp(port) => Some(*port),
+        _ => None,
+    })
+}
+
+/// A CONNECT naming hundreds of global addresses (some on port 0 or a
+/// privileged port) gets at most the cap's worth of blasts, never at
+/// those ports.
+#[test]
+fn a_flood_of_peer_punch_targets_is_capped() {
+    let mut h = inbound_harness(NatConfig::default());
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+    let mut addrs = vec![
+        "/ip4/9.9.9.9/udp/0/quic-v1".to_string(),
+        "/ip4/9.9.9.10/udp/443/quic-v1".to_string(),
+    ];
+    addrs.extend((0..250).map(|i| {
+        format!(
+            "/ip4/8.8.{}.{}/udp/{}/quic-v1",
+            i / 200,
+            i % 200 + 1,
+            4000 + i
+        )
+    }));
+    let addrs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+    answer_dcutr_at(&mut h, conn, stream, &addrs, 20);
+    drain_actions(&mut h.agent);
+    h.agent.handle_tick(at(24));
+    let mut targets: Vec<Multiaddr> = drain_actions(&mut h.agent)
+        .into_iter()
+        .filter_map(|action| match action {
+            Out::SendRandomUdp { target, .. } => Some(target),
+            _ => None,
+        })
+        .collect();
+    targets.sort();
+    targets.dedup();
+    assert!(!targets.is_empty());
+    assert!(targets.len() <= MAX_PUNCH_CANDIDATES, "{targets:?}");
+    assert!(
+        targets
+            .iter()
+            .all(|target| udp_port(target).is_some_and(|port| port >= 1024)),
+        "{targets:?}"
+    );
+}
+
+/// What we advertise in a CONNECT is capped the same way.
+#[test]
+fn our_advertised_punch_candidates_are_capped() {
+    let mut h = inbound_harness(NatConfig::default());
+    let mut listen: Vec<Multiaddr> = (0..20)
+        .map(|i| {
+            maddr(&format!(
+                "/ip4/203.0.113.{}/udp/{}/quic-v1",
+                i + 1,
+                5000 + i
+            ))
+        })
+        .collect();
+    listen.push(maddr("/ip4/203.0.113.99/udp/80/quic-v1"));
+    h.agent.set_listen_addrs(&listen);
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    let connect = sent_data_on(&drain_actions(&mut h.agent), stream);
+    let addrs = dcutr_obs_addrs(&connect);
+    assert!(!addrs.is_empty());
+    assert!(addrs.len() <= MAX_PUNCH_CANDIDATES, "{addrs:?}");
+    assert!(
+        addrs
+            .iter()
+            .all(|addr| udp_port(addr).is_some_and(|port| port >= 1024)),
+        "{addrs:?}"
+    );
+}
+
+/// LAN listeners filling the cap do not crowd out our observed public
+/// mapping, the one address a peer behind another NAT can reach.
+#[test]
+fn observed_mappings_survive_the_punch_candidate_cap() {
+    let mut h = inbound_harness(NatConfig::default());
+    let listen: Vec<Multiaddr> = (0..10)
+        .map(|i| {
+            maddr(&format!(
+                "/ip4/192.168.1.{}/udp/{}/quic-v1",
+                i + 1,
+                5000 + i
+            ))
+        })
+        .collect();
+    h.agent.set_listen_addrs(&listen);
+    let relay = h.relay.clone();
+    identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    let addrs = dcutr_obs_addrs(&sent_data_on(&drain_actions(&mut h.agent), stream));
+    assert!(addrs.contains(&maddr(OUR_OBSERVED_ADDR)), "{addrs:?}");
+}
+
+/// Names do not count against an IP family's quota: a concrete IPv6
+/// listener listed after several DNS ones is still advertised.
+#[test]
+fn named_listen_addresses_do_not_crowd_out_concrete_punch_candidates() {
+    let mut h = inbound_harness(NatConfig::default());
+    let mut listen: Vec<Multiaddr> = (0..6)
+        .map(|i| maddr(&format!("/dns6/host{i}.example/udp/{}/quic-v1", 5000 + i)))
+        .collect();
+    let concrete = maddr("/ip6/2001:4860:4860::8888/udp/4001/quic-v1");
+    listen.push(concrete.clone());
+    h.agent.set_listen_addrs(&listen);
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    let addrs = dcutr_obs_addrs(&sent_data_on(&drain_actions(&mut h.agent), stream));
+    assert!(addrs.contains(&concrete), "{addrs:?}");
 }

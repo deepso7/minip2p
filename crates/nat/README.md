@@ -114,11 +114,11 @@ loop {
             break;
         }
         EndpointWaitOutcome::Event(other) => { /* dispatch unrelated events */ }
-        EndpointWaitOutcome::Interrupted => {}
         EndpointWaitOutcome::Deadline => {
             node.cancel_connect(id); // the deadline is local; cancel explicitly
             break;
         }
+        _ => {} // interrupted by a WaitHandle
     }
 }
 ```
@@ -128,11 +128,13 @@ loop {
 Independent of connect attempts, the agent also runs:
 
 - **Reachability probing** (`NatConfig::autonat_servers`): single-shot AutoNAT probes aggregated through an M-sample window — the verdict flips only when N of the last M probes agree (defaults N=3, M=5), so one flaky probe never flaps `ReachabilityChanged`.
-- **Relay reservations** (`NatConfig::reservation_policy`): held per policy (`Always` / `WhenPrivate` / `Never`), renewed at half the relay-reported lifetime, capped at `reservation_default_ttl_secs` (which is also the fallback when the relay omits `expire`, reports one already past, or the host has no wall clock), so renewal still lands before the actual expiry while the relay's clock runs less than half the reported lifetime ahead of ours, rotating relays with backoff on refusal, and reacquiring after a lost relay session. When the swarm replaces the connection carrying the reservation (`SwarmEvent::ConnectionReplaced`), the agent reports the reservation lost at once (withdrawing its circuit address), cancels any exchange on the old connection, and reserves again on the new one once it is ready: rust-libp2p relays drop a reservation with the connection that made it, so a reservation is bound to that exact connection. While a QUIC reservation is held, the agent pings the relay every `reservation_keep_alive_interval_ms` (15 seconds by default) so an otherwise idle connection does not reach QUIC's idle timeout. Set it below the configured QUIC idle timeout; `0` disables these pings. TCP reservations do not schedule them. In the `minip2p` endpoint, successful automatic pings emit the same `EndpointEvent::PingRttMeasured` event as a caller-requested ping. `WhenPrivate` reserves while reachability is Unknown or Private and releases once probes settle on Public.
+- **Relay reservations** (`NatConfig::reservation_policy`): held per policy (`Always` / `WhenPrivate` / `Never`), renewed at half the relay-reported lifetime, capped at `reservation_default_ttl_secs` (which is also the fallback when the relay omits `expire`, reports one already past, or the host has no wall clock), so renewal still lands before the actual expiry while the relay's clock runs less than half the reported lifetime ahead of ours, rotating relays with backoff on refusal (`reservation_retry_backoff_ms`, doubled per consecutive failure with up to a fifth more as jitter, capped at `MAX_RESERVATION_RETRY_BACKOFF_MS`, and reset once a reservation is held; hosts seed the jitter from their entropy source with `NatAgent::seed_jitter`), and reacquiring after a lost relay session. When the swarm replaces the connection carrying the reservation (`SwarmEvent::ConnectionReplaced`), the agent reports the reservation lost at once (withdrawing its circuit address), cancels any exchange on the old connection, and reserves again on the new one once it is ready: rust-libp2p relays drop a reservation with the connection that made it, so a reservation is bound to that exact connection. While a QUIC reservation is held, the agent pings the relay every `reservation_keep_alive_interval_ms` (15 seconds by default) so an otherwise idle connection does not reach QUIC's idle timeout. Set it below the configured QUIC idle timeout; `0` disables these pings. TCP reservations do not schedule them. In the `minip2p` endpoint, successful automatic pings emit the same `EndpointEvent::PingRttMeasured` event as a caller-requested ping. `WhenPrivate` reserves while reachability is Unknown or Private and releases once probes settle on Public.
 
 ## Responder side
 
 A NAT'd listener holding a reservation handles inbound circuits automatically: the relay's STOP CONNECT is auto-accepted and the bridge is promoted into a normal circuit connection. The agent announces that Relayed path, opens `/libp2p/dcutr`, and sends CONNECT followed by SYNC. It emits `SendRandomUdp` blasts at the original circuit dialer's observed addresses to open its own NAT mapping (first after half the measured relay RTT, then every `blast_interval_ms` until `punch_deadline_ms`). The original circuit dialer makes the QUIC simultaneous-open dial. A landed punch is announced with `InboundDirectUpgrade` and replaces the circuit.
+
+Punch candidates are bounded both ways: a peer's CONNECT is filtered to globally routable QUIC addresses, and that list and our own advertised one keep at most `MAX_PUNCH_CANDIDATES` (8) addresses, at most 4 per IP family and 2 per IP, skipping port 0 and privileged ports (below 1024).
 
 ## Connection replacement and paths
 

@@ -135,6 +135,7 @@ impl From<core::convert::Infallible> for ConnectTargetError {
 
 /// Terminal outcome; exactly one per admitted attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ConnectOutcome {
     /// A transport connection to the target peer is established.
     Connected { conn_id: ConnectionId },
@@ -147,6 +148,7 @@ pub enum ConnectOutcome {
 
 /// Why a Connection attempt failed.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConnectFailure {
     /// Every candidate was refused before a Transport dial started.
     #[error("no usable route: {}{}", no_usable_route_detail(.candidates, .relay), relay_suffix(.relay))]

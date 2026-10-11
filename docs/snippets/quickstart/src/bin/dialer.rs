@@ -22,10 +22,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let event = match node.wait(deadline)? {
             EndpointWaitOutcome::Event(event) => event,
             // Another thread woke the wait; nothing to service here.
-            EndpointWaitOutcome::Interrupted => continue,
             EndpointWaitOutcome::Deadline => {
                 return Err("peer did not answer in time".into());
             }
+            _ => continue, // interrupted by a WaitHandle
         };
         match event {
             EndpointEvent::ConnectSettled {

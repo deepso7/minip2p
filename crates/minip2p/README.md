@@ -23,7 +23,7 @@ for address in endpoint.listen_all()? {
 # Ok::<(), minip2p::Error>(())
 ```
 
-Listening is address-shaped: pass complete multiaddresses to `EndpointBuilder::listen_on` (or `listen_on_multiaddr`), or use `listen_default` for dual-stack QUIC wildcards. The transport is inferred from each address.
+Listening is address-shaped: pass complete multiaddresses to `EndpointBuilder::listen_on` (or `listen_on_multiaddr`), or use `listen_default` for dual-stack QUIC wildcards. The transport is inferred from each address. `bind` starts accepting on every listen address, QUIC and TCP alike; `listen_all` reports them.
 
 ## Connecting and the event loop
 
@@ -58,8 +58,8 @@ loop {
             break;
         }
         EndpointWaitOutcome::Event(other) => println!("{other:?}"), // dispatch as usual
-        EndpointWaitOutcome::Interrupted => {} // a WaitHandle woke us; service commands
         EndpointWaitOutcome::Deadline => {} // the clock check above gives up
+        _ => {} // a WaitHandle woke us; service commands
     }
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -176,7 +176,7 @@ loop {
         EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) => { /* ... */ }
         EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled { connect_id, outcome, .. }) => { /* ... */ }
         EndpointWaitOutcome::Event(_) => {} // EndpointEvent is non-exhaustive
-        EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
+        _ => {}
     }
 }
 ```
@@ -185,7 +185,7 @@ State snapshot getters (`path`, `connected_peers`, `is_peer_ready`, `peer_readin
 
 Background drivers can clone `Endpoint::wait_handle()` — a transport-neutral `WaitHandle` — and interrupt a blocked `wait` from another thread. The wake is reported as `EndpointWaitOutcome::Interrupted`.
 
-`open_stream` is allowed once the peer is connected. Identify (`PeerReady`) supplies advertised protocols and enables early `RemoteDoesNotSupport` rejects; waiting for it before opening a known application protocol is optional policy, not a stack requirement.
+`open_stream` is allowed once the peer is connected. Identify (`PeerReady`) supplies advertised protocols and enables early `RemoteDoesNotSupport` rejects; waiting for it before opening a known application protocol is optional policy, not a stack requirement. Every open ends in exactly one terminal: `StreamReady`, or an `Error` event naming the stream (a `SwarmErrorKind`) when negotiation fails, the peer closes the stream first, or `OUTBOUND_NEGOTIATION_TIMEOUT_MS` passes; a closed or replaced connection ends it with its own event.
 
 The swarm keeps one connection per peer. Two direct connections to one peer that register within `SIMULTANEOUS_DIAL_WINDOW_MS` (5 s) race, and both peers keep the same one whatever order each sees them in: the one the lower peer ID dialed when the peers `connect` to each other at once, and the one with the lower connection token (shared by both ends: QUIC derives it from the connection IDs, TCP from the Noise handshake hash) when both are one peer's candidate dials. A transport without a token falls back to newest-wins for that case, so its peers can still end up on different connections. Past that window the newest connection wins. Within it, a winner arriving second replaces the other (`ConnectionReplaced`, below), while a loser arriving second closes unannounced; a losing dial of our own completes as `DialFailed` (a `connect` the winner already settled absorbs it), and `connect` settles on the connection the swarm kept. Because the peers agree only once each has seen both, a settled `connect` keeps its other candidate dials open until the window ends whenever one of them could still win; a higher-ID peer settled by the lower peer's dial aborts them at once, as they lose on both sides. Over TCP the listener sees both first; if it closes the dialer's only connection before the winning dial lands there, the dialer sees `ConnectionClosed` and then `ConnectionEstablished` on the winner. When a newer connection takes over, the stream carries a single `ConnectionReplaced { peer_id, old, new }` instead of a close and a second establishment, and the peer stays connected throughout. Streams and pending opens on `old` end with it without their own terminal events, so release whatever you keyed by `old`. Stream ids are unique only per connection, so `open_stream` returns `(ConnectionId, StreamId)` and every stream operation takes both; one aimed at `old` fails with `SwarmError::StreamNotFound` rather than reaching a stream on `new` that reuses its id. Readiness belongs to a connection: `PeerReady { conn_id, .. }` fires again for `new` once it is identified, and a ready wait should check `peer_readiness(peer)` (current connection plus Identify info, one snapshot) and then accept only a `PeerReady` whose `conn_id` is the current connection.
 

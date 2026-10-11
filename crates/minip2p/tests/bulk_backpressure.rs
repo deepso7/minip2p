@@ -31,7 +31,7 @@ fn bind(listen: &str) -> Endpoint {
 fn next(endpoint: &mut Endpoint, timeout: Duration) -> Option<EndpointEvent> {
     match endpoint.wait(timeout).expect("drive endpoint") {
         EndpointWaitOutcome::Event(event) => Some(event),
-        EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => None,
+        _ => None,
     }
 }
 

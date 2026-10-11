@@ -212,6 +212,7 @@ pub struct SwarmRuntimeError {
 
 /// Machine-testable runtime error category.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SwarmErrorKind {
     /// Underlying transport operation or event failed.
     Transport,
@@ -234,6 +235,7 @@ pub enum SwarmErrorKind {
 /// Transport-originated errors are surfaced as [`SwarmEvent::Error`]; this
 /// type covers the cases where an API call is rejected synchronously.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SwarmError {
     /// The peer is not currently connected.
     #[error("peer {peer_id} is not connected")]

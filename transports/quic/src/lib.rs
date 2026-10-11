@@ -1053,8 +1053,13 @@ impl Transport for QuicTransport {
             .for_addr(requested)
             .ok_or_else(|| missing_family("listen address", requested))?;
         ensure_listen_matches_bound_socket(requested, socket.local_addr)?;
-        socket.listening = true;
         let listen_addr = socket_addr_to_multiaddr(socket.local_addr);
+        // Listening again is the same listener: report the address without
+        // announcing it twice (the endpoint listens at bind, and callers may
+        // still ask `listen` for the address afterwards).
+        if std::mem::replace(&mut socket.listening, true) {
+            return Ok(listen_addr);
+        }
         // One endpoint serves both sockets; admission checks that the socket
         // an Initial arrived on is listening.
         self.endpoint

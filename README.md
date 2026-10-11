@@ -58,11 +58,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Every other event is dispatched as usual while we wait.
             EndpointWaitOutcome::Event(event) => println!("{event:?}"),
-            EndpointWaitOutcome::Interrupted => {}
             EndpointWaitOutcome::Deadline => {
                 endpoint.cancel_connect(connect_id);
                 break;
             }
+            _ => {} // interrupted by a WaitHandle
         }
     }
     Ok(())

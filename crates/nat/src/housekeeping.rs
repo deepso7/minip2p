@@ -29,6 +29,41 @@ use crate::events::NatEvent;
 use crate::swarm::NatSwarm;
 use crate::types::{Now, ReachabilityState, ReservationInfo};
 
+/// The longest reservation retry backoff, unless the configured base
+/// [`reservation_retry_backoff_ms`](crate::NatConfig::reservation_retry_backoff_ms)
+/// is longer still.
+pub const MAX_RESERVATION_RETRY_BACKOFF_MS: u64 = 60_000;
+
+/// The delay before retrying after `failures` earlier consecutive failures:
+/// `base` doubled per failure, plus up to a fifth more as jitter, capped at
+/// [`MAX_RESERVATION_RETRY_BACKOFF_MS`] (or `base`, if larger). Once the
+/// doubling reaches the cap, the delay is drawn from the cap's top fifth,
+/// never below `base`.
+///
+/// The jitter keeps clients that failed together from retrying together,
+/// including during a long outage at the cap, and staying under the next
+/// doubling keeps the delays strictly growing until the cap.
+fn retry_backoff_ms(base: u64, failures: u32, jitter: u64) -> u64 {
+    let cap = MAX_RESERVATION_RETRY_BACKOFF_MS.max(base);
+    let exp = base.saturating_mul(1u64.checked_shl(failures).unwrap_or(u64::MAX));
+    let draw = |spread: u64| if spread == 0 { 0 } else { jitter % spread };
+    let delay = exp.saturating_add(draw(exp / 5));
+    if delay < cap {
+        delay
+    } else {
+        (cap - draw(cap / 5)).max(base)
+    }
+}
+
+/// Advances SplitMix64 `state` and returns its next value.
+fn next_jitter(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
 /// Milliseconds to wait before renewing a reservation with `lifetime_secs`
 /// left: half of it, DHCP-T1 style.
 ///
@@ -555,16 +590,22 @@ pub(crate) struct ReservationManager {
     /// The reservation being renewed and the connection it was made on, so
     /// its loss emits [`NatEvent::RelayReservationLost`] exactly once.
     held: Option<(PeerId, ConnectionId)>,
+    /// Backoffs since the last held reservation; each doubles the next.
+    failures: u32,
+    /// SplitMix64 state for backoff jitter, seeded by the host.
+    jitter: u64,
 }
 
 impl ReservationManager {
-    fn new(config: &crate::NatConfig) -> Self {
+    fn new(config: &crate::NatConfig, jitter_seed: u64) -> Self {
         Self {
             state: ResState::Idle,
             relay_idx: 0,
             needs_sync: !config.relays.is_empty()
                 && config.reservation_policy != ReservationPolicy::Never,
             held: None,
+            failures: 0,
+            jitter: jitter_seed,
         }
     }
 
@@ -742,11 +783,17 @@ impl ReservationManager {
         self.back_off(shared, now);
     }
 
-    /// Rotates to the next relay after the configured backoff.
+    /// Rotates to the next relay after an exponential, jittered backoff.
     fn back_off(&mut self, shared: &Shared, now: Now) {
         self.relay_idx += 1;
+        let delay = retry_backoff_ms(
+            shared.config.reservation_retry_backoff_ms,
+            self.failures,
+            next_jitter(&mut self.jitter),
+        );
+        self.failures = self.failures.saturating_add(1);
         self.state = ResState::Backoff {
-            until: now.mono_ms + shared.config.reservation_retry_backoff_ms,
+            until: now.mono_ms.saturating_add(delay),
         };
     }
 
@@ -1004,6 +1051,7 @@ impl ReservationManager {
                 now.mono_ms
                     .saturating_add(shared.config.reservation_keep_alive_interval_ms)
             });
+        self.failures = 0;
         self.state = ResState::Reserved {
             relay,
             conn,
@@ -1050,11 +1098,16 @@ pub(crate) struct Housekeeping {
 }
 
 impl Housekeeping {
-    pub(crate) fn new(config: &crate::NatConfig) -> Self {
+    pub(crate) fn new(config: &crate::NatConfig, jitter_seed: u64) -> Self {
         Self {
             prober: Prober::new(!config.autonat_servers.is_empty()),
-            reservations: ReservationManager::new(config),
+            reservations: ReservationManager::new(config, jitter_seed),
         }
+    }
+
+    /// Reseeds the reservation backoff jitter.
+    pub(crate) fn seed_jitter(&mut self, seed: u64) {
+        self.reservations.jitter = seed;
     }
 
     pub(crate) fn reachability(&self) -> ReachabilityState {
@@ -1182,5 +1235,20 @@ impl Housekeeping {
                 self.reservations.state,
                 ResState::Idle | ResState::Reserved { .. }
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A configured base at or above the cap is honoured in full, whatever
+    /// the jitter draws.
+    #[test]
+    fn a_base_above_the_cap_is_never_shortened() {
+        for jitter in [0, 1, 7_919, u64::MAX] {
+            assert_eq!(retry_backoff_ms(120_000, 0, jitter), 120_000);
+            assert_eq!(retry_backoff_ms(120_000, 5, jitter), 120_000);
+        }
     }
 }

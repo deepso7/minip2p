@@ -156,7 +156,6 @@ fn wait_for_reservation(endpoint: &mut Endpoint, relay: &PeerAddr) -> Result<(),
                     return Ok(());
                 }
             }
-            EndpointWaitOutcome::Interrupted => {}
             EndpointWaitOutcome::Deadline => {
                 eprintln!(
                     "[host] warning: no relay reservation within {}s; still retrying",
@@ -164,6 +163,7 @@ fn wait_for_reservation(endpoint: &mut Endpoint, relay: &PeerAddr) -> Result<(),
                 );
                 return Ok(());
             }
+            _ => {}
         }
     }
 }
@@ -236,10 +236,10 @@ pub fn run_join(
                 host_subscribed |= is_topic_subscription(&event, &host_peer, &topic);
                 handle_event(&endpoint, "join", None, event);
             }
-            EndpointWaitOutcome::Interrupted => {}
             EndpointWaitOutcome::Deadline => {
                 return Err("identify never completed on the selected connection".into());
             }
+            _ => {}
         }
     }
 
@@ -295,8 +295,8 @@ fn wait_for_path(
                 *host_subscribed |= is_topic_subscription(&event, host_peer, topic);
                 handle_event(endpoint, "join", None, event);
             }
-            EndpointWaitOutcome::Interrupted => {}
             EndpointWaitOutcome::Deadline => return Err("no path to the host".into()),
+            _ => {}
         }
     }
 }
@@ -318,13 +318,13 @@ fn wait_for_topic_peer(
             .map_err(|e| format!("waiting for pubsub readiness: {e}"))?
         {
             EndpointWaitOutcome::Event(event) => event,
-            EndpointWaitOutcome::Interrupted => continue,
             EndpointWaitOutcome::Deadline => {
                 return Err(format!(
                     "peer {expected_peer} did not announce topic {expected_topic}"
                 )
                 .into());
             }
+            _ => continue,
         };
         let ready = is_topic_subscription(&event, expected_peer, expected_topic);
         handle_event(endpoint, role, None, event);
@@ -408,9 +408,8 @@ fn run_chat(
             }
         }
 
-        match endpoint.wait(Duration::from_millis(100))? {
-            EndpointWaitOutcome::Event(event) => handle_event(endpoint, role, relay, event),
-            EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
+        if let EndpointWaitOutcome::Event(event) = endpoint.wait(Duration::from_millis(100))? {
+            handle_event(endpoint, role, relay, event);
         }
     }
 }

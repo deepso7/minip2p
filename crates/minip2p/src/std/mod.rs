@@ -123,6 +123,9 @@ use crate::{Bytes, ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
     reason = "EndpointEvent ownership avoids a heap allocation on the ready path."
 )]
 #[must_use = "handle the wait outcome; an EndpointEvent has been removed from the endpoint"]
+// Non-exhaustive, so a later outcome is not a breaking change: match
+// `Event` and `Deadline`, and treat the rest (today, `Interrupted`) with `_`.
+#[non_exhaustive]
 pub enum EndpointWaitOutcome {
     /// An application event from the Endpoint event stream.
     ///
@@ -351,12 +354,10 @@ impl Endpoint {
         self.swarm.core().local_peer_id()
     }
 
-    /// Starts listening on every bound address and returns the first.
+    /// Returns the first listen address.
     ///
-    /// Every one of them, not only the address returned: an endpoint that
-    /// bound two transports would otherwise report a listen success while one
-    /// of them accepted nothing, and which one that was would depend on the
-    /// order the sockets happened to be asked for. Use
+    /// [`EndpointBuilder::bind`] already listens on every bound address, so
+    /// this only reports; calling it again is harmless. Use
     /// [`listen_all`](Self::listen_all) to see them all.
     pub fn listen(&mut self) -> Result<PeerAddr, Error> {
         let mut addrs = self.listen_all()?;
@@ -366,7 +367,11 @@ impl Endpoint {
         })
     }
 
-    /// Starts listening on all transport-bound addresses.
+    /// Returns every listen address, as complete peer addresses.
+    ///
+    /// [`EndpointBuilder::bind`] already started listening on them; this
+    /// re-confirms each with its transport, which is a no-op for an address
+    /// already listening.
     pub fn listen_all(&mut self) -> Result<Vec<PeerAddr>, Error> {
         let addrs = self.swarm.core_mut().listen_on_bound_addrs()?;
         Ok(addrs)
@@ -574,9 +579,8 @@ impl Endpoint {
 
     /// Returns addresses currently bound on the local transport.
     ///
-    /// These are what the sockets were given, not a signal that
-    /// [`Self::listen`] / [`Self::listen_all`] has started accepting. The set
-    /// can be non-empty before listening begins.
+    /// These are what the sockets were given. A bound endpoint is already
+    /// accepting on each (see [`EndpointBuilder::bind`]).
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn bound_addresses(&self) -> Vec<Multiaddr> {
@@ -659,7 +663,12 @@ impl Endpoint {
     /// fail early with [`SwarmError::RemoteDoesNotSupport`].
     ///
     /// Returns the connection and stream ids. Stream ids are only unique per
-    /// connection, so every later stream operation takes both.
+    /// connection, so every later stream operation takes both. The open ends
+    /// in exactly one terminal: [`EndpointEvent::StreamReady`], or an error
+    /// event naming the stream (see [`crate::SwarmErrorKind`]) when negotiation
+    /// fails, the peer closes the stream first, or
+    /// [`crate::OUTBOUND_NEGOTIATION_TIMEOUT_MS`]
+    /// passes; a closed or replaced connection ends it with its own event.
     pub fn open_stream(
         &mut self,
         peer_id: &PeerId,
@@ -763,18 +772,28 @@ impl Endpoint {
     /// events, then Connection-attempt terminals. Streams owned by an agent
     /// (NAT, relay service, Gossipsub) are consumed here and never surface as
     /// application stream events.
+    ///
+    /// An error discards nothing: events already collected stay queued and
+    /// come out of the next `poll` or `wait`.
     pub fn poll(&mut self) -> Result<Vec<EndpointEvent>, Error> {
         self.tick_connect()?;
-        let mut events: Vec<EndpointEvent> = self.pending_events.drain(..).collect();
-        let polled = self.swarm.poll()?;
-        if polled.is_empty() {
+        // Everything is queued before anything is handed out, so a failing
+        // step leaves earlier output in `pending_events`.
+        let mut polled = self.swarm.poll()?.into_iter();
+        if polled.len() == 0 {
             // A quiet poll still ticks drivers and drains anything they queued.
-            self.finish_step(&mut events)?;
-        } else {
-            for event in polled {
-                events.extend(self.step_events(event)?);
+            let mut produced = Vec::new();
+            self.finish_step(&mut produced)?;
+            self.pending_events.extend(produced);
+        }
+        while let Some(event) = polled.next() {
+            if let Err(error) = self.step(event) {
+                // The swarm events not reached yet go back for next time.
+                self.swarm.preload_poll_events(polled);
+                return Err(error);
             }
         }
+        let events: Vec<EndpointEvent> = self.pending_events.drain(..).collect();
         for event in &events {
             self.ack_pulled(event);
         }
@@ -848,10 +867,11 @@ impl Endpoint {
     ///             },
     ///             // Unrelated events keep flowing: dispatch them as usual.
     ///             EndpointWaitOutcome::Event(event) => println!("{event:?}"),
-    ///             // Another thread woke us; service its commands, then wait again.
-    ///             EndpointWaitOutcome::Interrupted => {}
     ///             // The clock check above gives up.
     ///             EndpointWaitOutcome::Deadline => {}
+    ///             // `Interrupted`: another thread woke us; service its
+    ///             // commands, then wait again.
+    ///             _ => {}
     ///         }
     ///     }
     /// }
@@ -885,8 +905,7 @@ impl Endpoint {
             }
             match polled {
                 PollNext::Event(event) => {
-                    let produced = self.step_events(event)?;
-                    self.pending_events.extend(produced);
+                    self.step(event)?;
                 }
                 PollNext::Deadline => {
                     // An agent timer may have ended this step; let it act.
@@ -983,12 +1002,18 @@ impl Endpoint {
         self.pending_events.extend(out);
     }
 
-    /// Runs one Endpoint step for a swarm event and returns everything it
+    /// Runs one Endpoint step for a swarm event and queues everything it
     /// produced, in Endpoint emission order.
-    fn step_events(&mut self, event: SwarmEvent) -> Result<Vec<EndpointEvent>, Error> {
-        let mut produced: Vec<EndpointEvent> = self.ingest(event).into_iter().collect();
+    ///
+    /// The event's own output is queued before the drivers tick, so a
+    /// failing tick cannot discard it.
+    fn step(&mut self, event: SwarmEvent) -> Result<(), Error> {
+        let ingested = self.ingest(event);
+        self.pending_events.extend(ingested);
+        let mut produced = Vec::new();
         self.finish_step(&mut produced)?;
-        Ok(produced)
+        self.pending_events.extend(produced);
+        Ok(())
     }
 
     /// Ends one Endpoint step: ticks the agents, then appends capability
@@ -1988,11 +2013,17 @@ impl EndpointBuilder {
     /// endpoint with nothing to bind is refused: it could neither dial nor be
     /// reached, and failing here says so more clearly than every later call
     /// would.
+    ///
+    /// Every transport starts accepting at once, QUIC and TCP alike, so the
+    /// returned endpoint is reachable on each listen address without a
+    /// further call. [`Endpoint::listen_all`] reports those addresses.
     pub fn bind(mut self) -> Result<Endpoint, Error> {
         self.validate()?;
         let keypair = self.keypair.take().unwrap_or_else(Ed25519Keypair::generate);
         let transport = bind_transports(&self, &keypair)?;
-        build_endpoint(self, keypair, transport)
+        let mut endpoint = build_endpoint(self, keypair, transport)?;
+        endpoint.listen_all()?;
+        Ok(endpoint)
     }
 
     /// Validates the static configuration.
@@ -3919,6 +3950,116 @@ mod tests {
         // FellBackToRelay is an attempt terminal the engine reports as
         // ConnectSettled; it is not repeated as a NAT event.
         assert_eq!(order, ["relay-server", "nat", "gossipsub", "settled"]);
+    }
+
+    /// A transport with nothing to do whose `poll` fails while `fail` is set.
+    struct FlakyPollTransport {
+        fail: Arc<AtomicBool>,
+    }
+
+    impl Transport for FlakyPollTransport {
+        fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
+            Err(TransportError::Unsupported { operation: "dial" })
+        }
+        fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
+            Err(TransportError::Unsupported {
+                operation: "listen",
+            })
+        }
+        fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
+            Err(TransportError::Unsupported {
+                operation: "open stream",
+            })
+        }
+        fn send_stream(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+            _: Bytes,
+        ) -> Result<(), TransportError> {
+            Err(TransportError::Unsupported {
+                operation: "send stream",
+            })
+        }
+        fn close_stream_write(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+        ) -> Result<(), TransportError> {
+            Err(TransportError::Unsupported {
+                operation: "close stream write",
+            })
+        }
+        fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
+            Err(TransportError::Unsupported {
+                operation: "reset stream",
+            })
+        }
+        fn ack_stream(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+            _: usize,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn close(&mut self, _: ConnectionId) -> Result<(), TransportError> {
+            Err(TransportError::Unsupported {
+                operation: "close connection",
+            })
+        }
+        fn poll(
+            &mut self,
+            _: minip2p_platform::Now,
+        ) -> Result<Vec<minip2p_transport::TransportEvent>, TransportError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(TransportError::PollError {
+                    reason: "injected".into(),
+                });
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    impl minip2p_transport::BlockingTransport for FlakyPollTransport {}
+
+    /// Events already queued survive a `poll` that fails, and come out of the
+    /// next one.
+    #[test]
+    fn a_failed_poll_keeps_queued_events_for_the_next() {
+        let fail = Arc::new(AtomicBool::new(false));
+        let mut set = TransportSet::new();
+        insert_member(
+            &mut set,
+            TransportKind::Tcp,
+            [ConnectionNamespace::TCP_IPV4],
+            FlakyPollTransport {
+                fail: Arc::clone(&fail),
+            },
+        )
+        .expect("insert transport");
+        let mut endpoint =
+            build_endpoint(Endpoint::builder(), Ed25519Keypair::generate(), set).expect("build");
+        let peer = Ed25519Keypair::generate().peer_id();
+        endpoint
+            .pending_events
+            .push_back(EndpointEvent::ConnectionClosed {
+                peer_id: peer.clone(),
+                conn_id: ConnectionId::new(1),
+            });
+
+        fail.store(true, Ordering::SeqCst);
+        endpoint.poll().expect_err("injected poll failure");
+        fail.store(false, Ordering::SeqCst);
+
+        let events = endpoint.poll().expect("poll");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EndpointEvent::ConnectionClosed { peer_id, .. } if peer_id == &peer
+            )),
+            "the queued event must survive the failed poll: {events:?}"
+        );
     }
 
     /// One transport poll can return several swarm events. `poll` must finish

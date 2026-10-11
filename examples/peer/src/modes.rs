@@ -163,14 +163,11 @@ pub fn run_listen(relay: Option<PeerAddr>, options: RunOptions) -> Result<(), Bo
     eprintln!("[listen] echoing on {ECHO_PROTOCOL} (Ctrl-C to stop)");
 
     loop {
-        match endpoint
+        if let EndpointWaitOutcome::Event(event) = endpoint
             .wait(Duration::from_millis(200))
             .map_err(|e| format!("swarm poll: {e}"))?
         {
-            EndpointWaitOutcome::Event(event) => {
-                dispatch_listen_event(&mut endpoint, &event, relays.first(), &mut echo_streams);
-            }
-            EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
+            dispatch_listen_event(&mut endpoint, &event, relays.first(), &mut echo_streams);
         }
     }
 }
@@ -195,7 +192,6 @@ fn wait_for_reservation(
                     return Ok(());
                 }
             }
-            EndpointWaitOutcome::Interrupted => {}
             EndpointWaitOutcome::Deadline => {
                 eprintln!(
                     "[listen] warning: no relay reservation within {}s; still retrying",
@@ -203,6 +199,7 @@ fn wait_for_reservation(
                 );
                 return Ok(());
             }
+            _ => {}
         }
     }
 }
@@ -474,8 +471,8 @@ fn wait_for_path(
                     .ok_or_else(|| "no path to the target".into());
             }
             EndpointWaitOutcome::Event(event) => print_event("dial", &event),
-            EndpointWaitOutcome::Interrupted => {}
             EndpointWaitOutcome::Deadline => return Err("no path to the target".into()),
+            _ => {}
         }
     }
 }
@@ -495,10 +492,10 @@ fn open_echo_stream(
             .map_err(|e| format!("waiting for identify: {e}"))?
         {
             EndpointWaitOutcome::Event(event) => print_event("dial", &event),
-            EndpointWaitOutcome::Interrupted => {}
             EndpointWaitOutcome::Deadline => {
                 return Err("identify never completed on the direct connection".into());
             }
+            _ => {}
         }
     }
     let (conn, stream) = endpoint
@@ -510,8 +507,8 @@ fn open_echo_stream(
             .map_err(|e| format!("waiting for echo stream: {e}"))?
         {
             EndpointWaitOutcome::Event(event) => event,
-            EndpointWaitOutcome::Interrupted => continue,
             EndpointWaitOutcome::Deadline => return Err("echo stream never became ready".into()),
+            _ => continue,
         };
         match &event {
             EndpointEvent::StreamReady {
@@ -630,8 +627,8 @@ fn ping_loop(
             .map_err(|e| format!("swarm poll: {e}"))?
         {
             EndpointWaitOutcome::Event(event) => Some(event),
-            EndpointWaitOutcome::Interrupted => continue,
             EndpointWaitOutcome::Deadline => None,
+            _ => continue,
         };
         let Some(event) = event else {
             // Deadline tick.

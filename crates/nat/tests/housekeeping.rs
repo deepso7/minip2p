@@ -7,7 +7,10 @@ use common::*;
 
 use minip2p_autonat::AUTONAT_PROTOCOL_ID;
 use minip2p_core::{PeerAddr, PeerId};
-use minip2p_nat::{NatConfig, NatEvent, Now, ReachabilityState, ReservationPolicy};
+use minip2p_nat::{
+    MAX_RESERVATION_RETRY_BACKOFF_MS, NatConfig, NatEvent, NatSwarm, Now, ReachabilityState,
+    ReservationPolicy,
+};
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
@@ -579,8 +582,9 @@ fn refused_reservation_rotates_relay_after_backoff() {
     hk.agent.handle_tick(at(400));
     assert!(drain_actions(&mut hk.agent).is_empty());
 
-    // After the backoff the manager tries the *other* relay.
-    hk.agent.handle_tick(at(600));
+    // After the backoff (500ms plus under a fifth of jitter) the manager
+    // tries the *other* relay.
+    hk.agent.handle_tick(at(610));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &hk.relay2), 1);
     assert_eq!(dial_count_for(&actions, &hk.relay), 0);
@@ -1054,11 +1058,62 @@ fn reserve_dial_failed_event_schedules_backoff() {
     hk.agent.handle_tick(at(0));
     let conn_id = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
     assert!(dial_failed(&mut hk, conn_id, "connection refused", at(6)));
-    assert_eq!(
-        hk.agent.next_timeout(6),
-        Some(NatConfig::default().reservation_retry_backoff_ms),
-        "refused reservation dial must back off immediately"
+    let base = NatConfig::default().reservation_retry_backoff_ms;
+    let delay = hk.agent.next_timeout(6).expect("a backoff");
+    assert!(
+        (base..base + base / 5).contains(&delay),
+        "refused reservation dial must back off by the base plus jitter: {delay}"
     );
+}
+
+/// Consecutive failures back off exponentially up to the cap, and a held
+/// reservation starts the next failure from the base again.
+#[test]
+fn reservation_retries_back_off_exponentially_and_reset_on_success() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    let relay = hk.relay.clone();
+    let base = NatConfig::default().reservation_retry_backoff_ms;
+    let mut now = 0;
+    let mut delays = Vec::new();
+    for _ in 0..12 {
+        hk.agent.handle_tick(at(now));
+        let conn_id = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
+        assert!(dial_failed(&mut hk, conn_id, "connection refused", at(now)));
+        let delay = hk.agent.next_timeout(now).expect("a backoff");
+        delays.push(delay);
+        now += delay;
+    }
+    assert!((base..base + base / 5).contains(&delays[0]), "{delays:?}");
+    let capped = |delay: u64| delay >= MAX_RESERVATION_RETRY_BACKOFF_MS * 4 / 5;
+    for pair in delays.windows(2) {
+        assert!(
+            pair[1] > pair[0] || capped(pair[1]),
+            "delays grow strictly until the cap: {delays:?}"
+        );
+    }
+    assert!(
+        delays
+            .iter()
+            .all(|delay| *delay <= MAX_RESERVATION_RETRY_BACKOFF_MS)
+    );
+    // At the cap the delays keep a random spread instead of all landing on it.
+    let tail = &delays[delays.len() - 4..];
+    assert!(tail.iter().all(|delay| capped(*delay)), "{delays:?}");
+    assert!(tail.windows(2).any(|pair| pair[0] != pair[1]), "{delays:?}");
+
+    // A held reservation, then its loss: the retry is back at the base.
+    let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(None), at(now));
+    assert_eq!(events.len(), 1, "{events:?}");
+    hk.agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            conn_id: hk.agent.swarm.connection(&relay).expect("relay session"),
+            peer_id: relay.clone(),
+        },
+        false,
+        at(now + 1),
+    );
+    let delay = hk.agent.next_timeout(now + 1).expect("a backoff");
+    assert!((base..base + base / 5).contains(&delay), "{delay}");
 }
 
 /// When the owner of a shared dial stalls (no result ever arrives), its
@@ -1210,7 +1265,8 @@ fn late_reserve_dial_failure_after_rotation_keeps_the_new_acquisition() {
     let mut hk = build(ReservationPolicy::Always, 2, 0);
     let (relay, relay2) = (hk.relay.clone(), hk.relay2.clone());
     let config = NatConfig::default();
-    let retry_at = config.relay_leg_deadline_ms + config.reservation_retry_backoff_ms;
+    // The base backoff plus its most jitter, a fifth.
+    let retry_at = config.relay_leg_deadline_ms + config.reservation_retry_backoff_ms * 6 / 5;
 
     hk.agent.handle_tick(at(0));
     let old = dial_conn_for(&drain_actions(&mut hk.agent), &relay);

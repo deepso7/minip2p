@@ -67,7 +67,7 @@ fn connect_to(
             // Unrelated events keep flowing: dispatch them as usual.
             EndpointWaitOutcome::Event(event) => println!("{event:?}"),
             // The clock check above gives up.
-            EndpointWaitOutcome::Interrupted | EndpointWaitOutcome::Deadline => {}
+            _ => {}
         }
     }
 }
@@ -107,7 +107,8 @@ fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> 
                 // Handle unrelated connection / stream / ping / capability events.
             }
             EndpointWaitOutcome::Deadline => {}
-            EndpointWaitOutcome::Interrupted => {
+            // `Interrupted` (EndpointWaitOutcome is non-exhaustive).
+            _ => {
                 // Service external commands, then continue.
             }
         }
@@ -146,7 +147,7 @@ loop {
         EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) => { /* ... */ }
         EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled { connect_id, outcome, .. }) => { /* ... */ }
         EndpointWaitOutcome::Event(_) => {} // EndpointEvent is non-exhaustive
-        EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
+        _ => {}
     }
 }
 ```

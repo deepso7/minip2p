@@ -253,6 +253,7 @@ pub fn path_name(path: &Path) -> &'static str {
         Path::DirectDialed => "direct-dialed",
         Path::DirectPunched => "direct-punched",
         Path::Relayed { .. } => "relayed",
+        _ => "other",
     }
 }
 
@@ -316,6 +317,7 @@ pub fn print_nat_event(role: &str, event: &NatEvent) {
         NatEvent::InboundDirectUpgrade { peer } => {
             println!("[{role}] nat-inbound-direct-upgrade peer={peer}");
         }
+        other => println!("[{role}] nat-event {other:?}"),
     }
 }
 

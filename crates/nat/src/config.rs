@@ -86,7 +86,10 @@ pub struct NatConfig {
     /// misconfiguration: every reservation then renews every 500ms.
     pub reservation_default_ttl_secs: u64,
     /// Backoff before retrying (or rotating relays) after a refused or
-    /// failed reservation.
+    /// failed reservation. Each consecutive failure doubles it, plus up to a
+    /// fifth more as jitter, up to
+    /// [`MAX_RESERVATION_RETRY_BACKOFF_MS`](crate::MAX_RESERVATION_RETRY_BACKOFF_MS);
+    /// a held reservation resets it.
     pub reservation_retry_backoff_ms: u64,
     /// Interval between liveness pings while holding a QUIC relay
     /// reservation. Keep this below the QUIC idle timeout. `0` disables

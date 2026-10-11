@@ -355,20 +355,21 @@ impl Shared {
     /// Unlike the peer's, these are not required to be globally routable: a
     /// LAN address of ours is a perfectly good punch target for a peer on the
     /// same LAN, and it is the receiver that decides what it is willing to
-    /// aim at.
+    /// aim at. They are bounded the same way, though: see
+    /// [`MAX_PUNCH_CANDIDATES`](crate::MAX_PUNCH_CANDIDATES).
+    ///
+    /// Peer-observed mappings come first: they are what a peer behind
+    /// another NAT can actually reach, so a pile of LAN listeners must not
+    /// crowd them out of the cap.
     pub(crate) fn punch_candidates(&self) -> Vec<Multiaddr> {
-        let mut addrs: Vec<Multiaddr> = self
-            .listen_addrs
-            .iter()
-            .filter(|addr| addr.is_quic_transport())
-            .cloned()
-            .collect();
-        for addr in self.observed_addrs.values() {
+        let mut addrs: Vec<Multiaddr> = Vec::new();
+        let observed = self.observed_addrs.values();
+        for addr in observed.chain(&self.listen_addrs) {
             if addr.is_quic_transport() && !addrs.contains(addr) {
                 addrs.push(addr.clone());
             }
         }
-        addrs
+        crate::inbound::bound_punch_candidates(addrs)
     }
 }
 
@@ -473,8 +474,18 @@ pub struct NatAgent {
 
 impl NatAgent {
     /// Creates an agent for the node identified by `local_peer_id`.
+    ///
+    /// Reservation retry jitter starts seeded from the peer id, so peers
+    /// already spread their retries; hosts with an entropy source reseed it
+    /// with [`Self::seed_jitter`].
     pub fn new(local_peer_id: PeerId, config: NatConfig) -> Self {
-        let housekeeping = Housekeeping::new(&config);
+        let seed = local_peer_id
+            .to_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+            });
+        let housekeeping = Housekeeping::new(&config, seed);
         Self {
             shared: Shared {
                 local_peer_id,
@@ -495,6 +506,12 @@ impl NatAgent {
             inbound: BTreeMap::new(),
             next_inbound_id: 0,
         }
+    }
+
+    /// Seeds the jitter on reservation retry backoffs from the host's
+    /// entropy source.
+    pub fn seed_jitter(&mut self, seed: u64) {
+        self.housekeeping.seed_jitter(seed);
     }
 
     /// Registers Connection attempt `id` (allocated by the caller) toward

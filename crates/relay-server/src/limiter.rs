@@ -46,6 +46,16 @@ impl<K: Clone + Ord> TokenBuckets<K> {
         true
     }
 
+    /// Whether `key` holds a token at `now_ms`, without spending it.
+    pub(crate) fn allows(&self, key: &K, now_ms: u64) -> bool {
+        let Some(bucket) = self.buckets.get(key) else {
+            return self.config.capacity > 0;
+        };
+        let mut bucket = *bucket;
+        refill(&mut bucket, self.config, now_ms);
+        bucket.tokens > 0
+    }
+
     pub(crate) fn sweep(&mut self, now_ms: u64) {
         while let Some((&deadline, _)) = self.due.first_key_value() {
             if deadline > now_ms {

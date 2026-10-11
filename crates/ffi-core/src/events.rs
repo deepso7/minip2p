@@ -675,6 +675,13 @@ pub(crate) fn convert_settled(
             connect_id: connect_id.as_u64(),
             peer_id: peer_id.to_base58(),
         }),
+        // An outcome this binding predates still settles the attempt once.
+        other => Some(P2pEvent::ConnectFailed {
+            connect_id: connect_id.as_u64(),
+            peer_id: peer_id.to_base58(),
+            kind: NatErrorKind::Protocol,
+            detail: format!("{other:?}"),
+        }),
     }
 }
 
@@ -755,6 +762,8 @@ pub(crate) fn convert_nat(event: NatEvent) -> Option<P2pEvent> {
         NatEvent::InboundDirectUpgrade { peer } => P2pEvent::InboundDirectUpgrade {
             peer_id: peer.to_base58(),
         },
+        // An event this binding predates has no binding shape yet.
+        _ => return None,
     })
 }
 
@@ -850,6 +859,9 @@ pub(crate) fn convert_path(path: Path) -> PathKind {
         Path::Relayed { relay } => PathKind::Relayed {
             relay_peer_id: relay.to_base58(),
         },
+        // A path this binding predates; every current non-relayed path is
+        // direct.
+        _ => PathKind::DirectDialed,
     }
 }
 
@@ -869,6 +881,8 @@ fn convert_swarm_error_kind(kind: SwarmErrorKind) -> EndpointErrorKind {
         SwarmErrorKind::IdentifyStreamRejected => EndpointErrorKind::IdentifyStreamRejected,
         SwarmErrorKind::OpenStreamFailed => EndpointErrorKind::OpenStreamFailed,
         SwarmErrorKind::UnsupportedProtocol => EndpointErrorKind::UnsupportedProtocol,
+        // A category this binding predates.
+        _ => EndpointErrorKind::Driver,
     }
 }
 
@@ -877,6 +891,8 @@ fn convert_connect_failure_kind(failure: &ConnectFailure) -> NatErrorKind {
         ConnectFailure::NoUsableRoute { .. } => NatErrorKind::NoPathAvailable,
         ConnectFailure::Timeout { .. } => NatErrorKind::Timeout,
         ConnectFailure::AllCandidatesFailed { .. } => NatErrorKind::DialFailed,
+        // A failure this binding predates.
+        _ => NatErrorKind::Protocol,
     }
 }
 

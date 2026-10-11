@@ -29,7 +29,7 @@ pub fn next_event(endpoint: &mut Endpoint, deadline: impl Into<Deadline>) -> Opt
         match endpoint.wait(deadline).expect("endpoint wait") {
             EndpointWaitOutcome::Event(event) => return Some(event),
             EndpointWaitOutcome::Deadline => return None,
-            EndpointWaitOutcome::Interrupted => {}
+            _ => {}
         }
     }
 }
