@@ -3,11 +3,10 @@
 //! Two views, both for comparing fast and slow runs rather than for
 //! production use:
 //!
-//! - [`ConnectionDiagnostics`], per connection: datagrams received, flushes
-//!   (and how many a received datagram triggered), packet sizes, and packets
-//!   cut short while stream data was waiting. Read one with
-//!   `QuicTransport::connection_diagnostics`; each connection also prints its
-//!   totals to stderr when dropped.
+//! - [`ConnectionDiagnostics`], per connection: datagrams routed to it,
+//!   flushes, and the engine's own transmit, loss and congestion figures.
+//!   Read one with `QuicTransport::connection_diagnostics`; each connection
+//!   also prints its totals to stderr when dropped.
 //! - [`DatagramCounters`], per local identity: datagrams actually handed to
 //!   or read from the UDP sockets of every transport bound with that
 //!   identity, both address families included. Read them from any thread with
@@ -21,6 +20,8 @@ use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicU64, Ordering::Relaxed},
 };
+#[cfg(feature = "diagnostics")]
+use std::time::Duration;
 
 use minip2p_core::PeerId;
 
@@ -30,43 +31,31 @@ use minip2p_core::PeerId;
 pub struct ConnectionDiagnostics {
     /// Datagrams routed to this connection.
     pub datagrams_received: u64,
-    /// Flushes: passes that asked quiche for packets, from any trigger. A
-    /// pass stopped behind a held paced packet is not one.
+    /// UDP datagrams the engine produced for this connection (sent, or
+    /// retained for a writable socket).
+    pub datagrams_sent: u64,
+    /// Total bytes of those datagrams.
+    pub bytes_sent: u64,
+    /// Flushes: passes that asked the engine for output, from any trigger.
     pub flushes: u64,
-    /// Flushes run while handling a received datagram. Once established, a
-    /// connection leaves its output for the flush after the receive batch,
-    /// so this stays near the handshake's few.
-    pub receive_flushes: u64,
-    /// Packets quiche generated (sent, retained for a writable socket, or
-    /// held for pacing).
-    pub packets: u64,
-    /// Total bytes of those packets.
-    pub packet_bytes: u64,
-    /// Packets smaller than the path's maximum UDP payload.
-    pub underfilled_packets: u64,
-    /// Underfilled packets that ended a flush while stream writes were still
-    /// queued: quiche stopped with data waiting, which on an established
-    /// connection means the free congestion window (or peer flow control)
-    /// cut the packet's size budget. quiche does not expose its free window,
-    /// so this approximates "trimmed by the window".
-    pub window_limited_packets: u64,
+    /// Packets the engine declared lost.
+    pub lost_packets: u64,
+    /// Current congestion window, in bytes.
+    pub cwnd: u64,
+    /// Current smoothed round-trip time.
+    pub rtt: Duration,
 }
 
 #[cfg(feature = "diagnostics")]
 impl ConnectionDiagnostics {
-    /// Mean packet size in bytes, or 0 before any packet.
-    pub fn average_packet_bytes(&self) -> f64 {
-        ratio(self.packet_bytes, self.packets)
+    /// Mean sent datagram size in bytes, or 0 before any datagram.
+    pub fn average_datagram_bytes(&self) -> f64 {
+        ratio(self.bytes_sent, self.datagrams_sent)
     }
 
     /// Flushes per received datagram, from any trigger.
     pub fn flushes_per_datagram(&self) -> f64 {
         ratio(self.flushes, self.datagrams_received)
-    }
-
-    /// Flushes run while handling a received datagram, per received datagram.
-    pub fn receive_flushes_per_datagram(&self) -> f64 {
-        ratio(self.receive_flushes, self.datagrams_received)
     }
 }
 
@@ -75,18 +64,16 @@ impl core::fmt::Display for ConnectionDiagnostics {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "datagrams_received={} flushes={} ({:.3}/datagram) receive_flushes={} \
-             ({:.3}/datagram) packets={} avg_packet_bytes={:.0} underfilled={} \
-             window_limited={}",
+            "datagrams_received={} flushes={} ({:.3}/datagram) datagrams_sent={} \
+             avg_datagram_bytes={:.0} lost_packets={} cwnd={} rtt={:?}",
             self.datagrams_received,
             self.flushes,
             self.flushes_per_datagram(),
-            self.receive_flushes,
-            self.receive_flushes_per_datagram(),
-            self.packets,
-            self.average_packet_bytes(),
-            self.underfilled_packets,
-            self.window_limited_packets,
+            self.datagrams_sent,
+            self.average_datagram_bytes(),
+            self.lost_packets,
+            self.cwnd,
+            self.rtt,
         )
     }
 }
@@ -94,7 +81,7 @@ impl core::fmt::Display for ConnectionDiagnostics {
 /// Datagrams one local identity's QUIC sockets moved, since the first
 /// transport with that identity was bound.
 ///
-/// `sent` counts datagrams the socket accepted, not packets quiche generated:
+/// `sent` counts datagrams the socket accepted, not packets the engine generated:
 /// a datagram retained on `WouldBlock` counts once it actually leaves, and
 /// one the socket refused outright never does.
 #[cfg(feature = "diagnostics")]
@@ -240,92 +227,45 @@ impl DatagramTally {
     }
 }
 
-/// A connection's recording hooks: its own [`ConnectionDiagnostics`] plus
-/// its transport's [`DatagramTally`].
+/// A connection's recording hooks: the counts the engine does not keep.
+#[derive(Default)]
 pub(crate) struct ConnectionCounters {
-    tally: DatagramTally,
     #[cfg(feature = "diagnostics")]
-    counts: ConnectionDiagnostics,
-    /// The flush's latest packet was underfilled.
+    datagrams_received: u64,
     #[cfg(feature = "diagnostics")]
-    last_underfilled: bool,
+    flushes: u64,
 }
 
-#[cfg_attr(
-    not(feature = "diagnostics"),
-    expect(
-        unused_variables,
-        reason = "the hooks record nothing without the feature"
-    )
-)]
 impl ConnectionCounters {
-    pub(crate) fn new(tally: DatagramTally) -> Self {
-        Self {
-            tally,
-            #[cfg(feature = "diagnostics")]
-            counts: ConnectionDiagnostics::default(),
-            #[cfg(feature = "diagnostics")]
-            last_underfilled: false,
+    /// These counts plus the engine's `stats`.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn snapshot(&self, stats: &quinn_proto::ConnectionStats) -> ConnectionDiagnostics {
+        ConnectionDiagnostics {
+            datagrams_received: self.datagrams_received,
+            datagrams_sent: stats.udp_tx.datagrams,
+            bytes_sent: stats.udp_tx.bytes,
+            flushes: self.flushes,
+            lost_packets: stats.path.lost_packets,
+            cwnd: stats.path.cwnd,
+            rtt: stats.path.rtt,
         }
     }
 
-    #[cfg(feature = "diagnostics")]
-    pub(crate) fn snapshot(&self) -> ConnectionDiagnostics {
-        self.counts
-    }
-
-    /// The socket accepted one of this connection's datagrams.
-    #[inline]
-    pub(crate) fn sent(&self, len: usize) {
-        self.tally.sent(len);
-    }
-
+    /// The endpoint routed a datagram to this connection.
     #[inline]
     pub(crate) fn datagram_received(&mut self) {
         #[cfg(feature = "diagnostics")]
         {
-            self.counts.datagrams_received += 1;
+            self.datagrams_received += 1;
         }
     }
 
-    /// A received datagram is about to trigger a flush.
-    #[inline]
-    pub(crate) fn receive_flush(&mut self) {
-        #[cfg(feature = "diagnostics")]
-        {
-            self.counts.receive_flushes += 1;
-        }
-    }
-
-    /// A flush starts pulling packets from quiche.
+    /// A flush starts asking the engine for output.
     #[inline]
     pub(crate) fn flush(&mut self) {
         #[cfg(feature = "diagnostics")]
         {
-            self.counts.flushes += 1;
-            self.last_underfilled = false;
-        }
-    }
-
-    /// quiche generated a `len`-byte packet; `full` is the path's maximum.
-    #[inline]
-    pub(crate) fn packet(&mut self, len: usize, full: usize) {
-        #[cfg(feature = "diagnostics")]
-        {
-            self.counts.packets += 1;
-            self.counts.packet_bytes += len as u64;
-            self.last_underfilled = len < full;
-            self.counts.underfilled_packets += u64::from(self.last_underfilled);
-        }
-    }
-
-    /// quiche had nothing more to send this flush.
-    #[inline]
-    pub(crate) fn quiche_done(&mut self, stream_writes_queued: bool) {
-        #[cfg(feature = "diagnostics")]
-        {
-            self.counts.window_limited_packets +=
-                u64::from(self.last_underfilled && stream_writes_queued);
+            self.flushes += 1;
         }
     }
 }

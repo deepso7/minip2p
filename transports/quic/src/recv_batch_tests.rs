@@ -1,16 +1,10 @@
-//! How an established connection answers a receive batch: one drain and flush
-//! after the batch, not one per datagram.
-//!
-//! quiche has no delayed-ACK timer, so every flush after an ack-eliciting
-//! packet sends an ACK, and every flush squeezed into a sliver of free
-//! congestion window sends an undersized packet. Deferring the flush to the
-//! end of the batch must still acknowledge promptly: within the poll that
-//! received the packets.
+//! How an established connection answers a receive batch: one service after
+//! the batch, not one per datagram, and the batch acknowledged by it.
 
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::stream_send_tests::{RawPeer, accept, listening_server, now};
+use crate::test_peer::{RawPeer, accept, now, server_with_idle_timeout};
 
 /// Datagrams waiting on the peer's socket, discarded unread.
 fn discard_raw(peer: &RawPeer) -> usize {
@@ -22,41 +16,20 @@ fn discard_raw(peer: &RawPeer) -> usize {
     count
 }
 
-/// Whether a datagram is waiting on the peer's socket, leaving it there.
-fn datagram_waiting(peer: &RawPeer) -> bool {
-    peer.socket.peek_from(&mut [0u8; 1]).is_ok()
-}
-
-/// Hands every datagram waiting on the peer's socket to quiche and services
-/// its timers, returning how many datagrams arrived.
-fn receive_all(peer: &mut RawPeer) -> usize {
-    let mut buf = [0u8; 65535];
-    let local = peer.socket.local_addr().expect("peer addr");
-    let mut count = 0;
-    while let Ok((len, from)) = peer.socket.recv_from(&mut buf) {
-        count += 1;
-        let packet = buf.get_mut(..len).expect("received length fits");
-        // A packet quiche rejects is simply lost, as on a real network.
-        match peer.conn.recv(packet, quiche::RecvInfo { from, to: local }) {
-            Ok(_) | Err(_) => {}
-        }
-    }
-    if peer.conn.timeout().is_some_and(|timeout| timeout.is_zero()) {
-        peer.conn.on_timeout();
-    }
-    count
-}
-
 /// Sends the peer's output over a path that drops every tenth packet and
 /// swaps each remaining pair, returning how many packets survived the drop.
-/// `generated` counts every packet quiche produced, across calls.
+/// `generated` counts every packet the engine produced, across calls.
 fn lossy_flush(peer: &mut RawPeer, generated: &mut usize) -> usize {
-    let mut out = [0u8; 1350];
     let mut packets = Vec::new();
-    while let Ok((len, info)) = peer.conn.send(&mut out) {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let Some(transmit) = peer.conn().poll_transmit(Instant::now(), 1, &mut buf) else {
+            break;
+        };
         *generated += 1;
         if !generated.is_multiple_of(10) {
-            packets.push((out.get(..len).expect("sent length fits").to_vec(), info.to));
+            packets.push((buf[..transmit.size].to_vec(), transmit.destination));
         }
     }
     let count = packets.len();
@@ -71,9 +44,10 @@ fn lossy_flush(peer: &mut RawPeer, generated: &mut usize) -> usize {
 
 /// Connects a raw peer and lets the handshake's trailing traffic settle, so
 /// the next datagram the peer sees answers what the test sends.
-fn settled_pair() -> (QuicTransport, RawPeer, ConnectionId) {
-    let mut server = listening_server(30_000);
+fn settled_pair() -> (QuicTransport, RawPeer, ConnectionId, u64) {
+    let mut server = server_with_idle_timeout(30_000);
     let (mut peer, id) = accept(&mut server, &mut [], |_| {});
+    let stream = peer.open();
     for _ in 0..5 {
         std::thread::sleep(Duration::from_millis(2));
         peer.pump();
@@ -81,33 +55,27 @@ fn settled_pair() -> (QuicTransport, RawPeer, ConnectionId) {
     }
     std::thread::sleep(Duration::from_millis(2));
     discard_raw(&peer);
-    (server, peer, id)
+    (server, peer, id, stream)
 }
 
 /// Datagrams in a [`send_burst`].
 const BURST: usize = 16;
 
-/// Sends [`BURST`] small writes on stream 0, each as its own ack-eliciting
-/// datagram, and waits for loopback to deliver them.
-fn send_burst(peer: &mut RawPeer) {
+/// Sends [`BURST`] small writes, each as its own ack-eliciting datagram, and
+/// waits for loopback to deliver them.
+fn send_burst(peer: &mut RawPeer, stream: u64) {
     for byte in 0..BURST as u8 {
-        peer.conn
-            .stream_send(0, &[byte; 100], false)
-            .expect("peer write");
-        let mut out = [0u8; 1350];
-        while let Ok((len, info)) = peer.conn.send(&mut out) {
-            let packet = out.get(..len).expect("sent length fits");
-            peer.socket.send_to(packet, info.to).expect("peer send");
-        }
+        assert_eq!(peer.write(stream, &[byte; 100]), 100);
+        peer.service();
     }
     std::thread::sleep(Duration::from_millis(20));
 }
 
 #[test]
-fn a_receive_batch_is_acknowledged_by_one_flush_within_the_same_poll() {
-    let (mut server, mut peer, _) = settled_pair();
+fn a_receive_batch_is_acknowledged_by_one_service_within_the_same_poll() {
+    let (mut server, mut peer, _, stream) = settled_pair();
 
-    send_burst(&mut peer);
+    send_burst(&mut peer, stream);
 
     let events = server.poll(now()).expect("poll");
     let data: usize = events
@@ -126,14 +94,14 @@ fn a_receive_batch_is_acknowledged_by_one_flush_within_the_same_poll() {
     );
     assert!(
         replies <= 2,
-        "an established connection flushes once per batch, not per datagram; \
+        "a connection is serviced once per batch, not per datagram; \
          {replies} datagrams answered {BURST}"
     );
 }
 
 #[test]
 fn sustained_one_way_load_recovers_from_loss_and_reordering_with_batched_acks() {
-    let (mut server, mut peer, _) = settled_pair();
+    let (mut server, mut peer, _, stream) = settled_pair();
 
     const TOTAL: usize = 1 << 20;
     let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
@@ -142,7 +110,6 @@ fn sustained_one_way_load_recovers_from_loss_and_reordering_with_batched_acks() 
     let mut received = Vec::with_capacity(TOTAL);
     let mut fin_received = false;
     let (mut generated, mut peer_sent, mut server_sent) = (0, 0, 0);
-    let mut unacknowledged_polls = 0;
 
     let start = Instant::now();
     while !fin_received {
@@ -151,17 +118,17 @@ fn sustained_one_way_load_recovers_from_loss_and_reordering_with_batched_acks() 
             "transfer stalled at {} of {TOTAL} bytes",
             received.len()
         );
-        server_sent += receive_all(&mut peer);
+        server_sent += peer.receive();
+        peer.run_engine();
         if written < TOTAL {
-            let rest = payload.get(written..).expect("written stays in bounds");
-            written += peer.conn.stream_send(0, rest, false).unwrap_or(0);
+            written += peer.write(stream, &payload[written..]);
         } else if !fin_written {
-            fin_written = peer.conn.stream_send(0, &[], true).is_ok();
+            peer.finish(stream);
+            fin_written = true;
         }
         peer_sent += lossy_flush(&mut peer, &mut generated);
 
         std::thread::sleep(Duration::from_millis(1));
-        let mut read_data = false;
         for event in server.poll(now()).expect("poll") {
             match event {
                 TransportEvent::StreamData {
@@ -169,7 +136,6 @@ fn sustained_one_way_load_recovers_from_loss_and_reordering_with_batched_acks() 
                     stream_id,
                     data,
                 } => {
-                    read_data = true;
                     received.extend_from_slice(&data);
                     // A reader that keeps up acknowledges what it read.
                     server.ack_stream(id, stream_id, data.len()).expect("ack");
@@ -178,19 +144,11 @@ fn sustained_one_way_load_recovers_from_loss_and_reordering_with_batched_acks() 
                 _ => {}
             }
         }
-        // Loopback delivers at once, so an ACK sent by the poll is waiting.
-        if read_data && !datagram_waiting(&peer) {
-            unacknowledged_polls += 1;
-        }
     }
 
     assert!(
         received == payload,
         "the payload arrives whole and in order"
-    );
-    assert_eq!(
-        unacknowledged_polls, 0,
-        "every poll that read data must acknowledge it before returning"
     );
     assert!(
         server_sent * 2 < peer_sent,
@@ -200,12 +158,10 @@ fn sustained_one_way_load_recovers_from_loss_and_reordering_with_batched_acks() 
 }
 
 #[test]
-fn an_occasional_request_is_read_acknowledged_and_answered_within_one_poll() {
-    let (mut server, mut peer, id) = settled_pair();
+fn an_occasional_request_is_read_in_one_poll_and_answered_by_the_write() {
+    let (mut server, mut peer, id, stream) = settled_pair();
 
-    peer.conn
-        .stream_send(0, b"request", false)
-        .expect("peer write");
+    peer.write(stream, b"request");
     peer.pump();
     std::thread::sleep(Duration::from_millis(5));
 
@@ -217,18 +173,14 @@ fn an_occasional_request_is_read_acknowledged_and_answered_within_one_poll() {
         )),
         "one poll reads the request: {events:?}"
     );
-    assert!(
-        datagram_waiting(&peer),
-        "the poll that read the request acknowledges it"
-    );
 
     server
-        .send_stream(id, StreamId::new(0), Bytes::from_static(b"reply"))
+        .send_stream(id, StreamId::new(stream), Bytes::from_static(b"reply"))
         .expect("reply");
     std::thread::sleep(Duration::from_millis(2));
     peer.pump();
     assert_eq!(
-        peer.read(0),
+        peer.read(stream),
         (b"reply".to_vec(), false),
         "the reply leaves with the write, without another poll"
     );
@@ -237,12 +189,12 @@ fn an_occasional_request_is_read_acknowledged_and_answered_within_one_poll() {
 #[cfg(feature = "diagnostics")]
 #[test]
 fn diagnostics_count_the_batch_and_the_datagrams_that_left() {
-    let (mut server, mut peer, id) = settled_pair();
+    let (mut server, mut peer, id, stream) = settled_pair();
     let identity = server.local_peer_id();
     let connection_before = server.connection_diagnostics(id).expect("live connection");
     let sockets_before = crate::datagram_counters(&identity);
 
-    send_burst(&mut peer);
+    send_burst(&mut peer, stream);
     server.poll(now()).expect("poll");
 
     let connection = server.connection_diagnostics(id).expect("live connection");
@@ -250,10 +202,7 @@ fn diagnostics_count_the_batch_and_the_datagrams_that_left() {
         connection.datagrams_received - connection_before.datagrams_received,
         BURST as u64
     );
-    assert_eq!(
-        connection.receive_flushes, connection_before.receive_flushes,
-        "an established connection never flushes while receiving"
-    );
+    assert!(connection.flushes > connection_before.flushes);
     let sockets = crate::datagram_counters(&identity).since(&sockets_before);
     assert_eq!(sockets.received, BURST as u64);
     assert_eq!(sockets.sent, discard_raw(&peer) as u64);

@@ -14,9 +14,9 @@ readme = "README.md"
 workspace = true
 
 [features]
-# Diagnostic counters for comparing runs: per-connection flush and packet-size
-# counters, and per-identity socket datagram counts. Off by default and
-# compiled out when off; see the README.
+# Diagnostic counters for comparing runs: per-connection flush, datagram,
+# loss and congestion counters, and per-identity socket datagram counts. Off
+# by default and compiled out when off; see the README.
 diagnostics = []
 
 [dependencies]
@@ -25,11 +25,14 @@ minip2p-transport = { path = "../../crates/transport", version = "0.7.7" }
 minip2p-identity = { path = "../../crates/identity", version = "0.7.7" }
 minip2p-core = { path = "../../crates/core", version = "0.7.7" }
 minip2p-tls = { path = "../../crates/tls", version = "0.7.7" }
-boring = "4.22.0"
-quiche = { version = "0.29.3", features = ["boringssl-boring-crate"] }
-getrandom = "0.4.3"
-hmac = "0.13.0"
-sha2 = "0.11.0"
+quinn-proto = { version = "0.11.19", default-features = false, features = [
+  "rustls-ring",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+] }
+bytes = "1.12.1"
 mio = { version = "1.2", features = ["net", "os-poll"] }
 socket2 = "0.6.5"
 

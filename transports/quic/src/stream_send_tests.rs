@@ -1,156 +1,17 @@
-//! How queued stream writes survive quiche's `stream_send` errors.
+//! How queued stream writes survive the engine's write errors and the peer's
+//! stops and resets.
 //!
-//! The remote side is a bare quiche client rather than a second
+//! The remote side is a bare quinn-proto peer rather than a second
 //! `QuicTransport`, so a test can send STOP_SENDING without resetting the read
 //! half and can shape the flow-control and stream credit it grants.
 
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use super::*;
-
-static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-pub(crate) fn now() -> Now {
-    Now::from_millis(EPOCH.elapsed().as_millis() as u64)
-}
-
-/// A quiche client on its own loopback socket, pumped by hand.
-pub(crate) struct RawPeer {
-    pub(crate) conn: quiche::Connection,
-    pub(crate) socket: UdpSocket,
-}
-
-impl RawPeer {
-    /// Starts a handshake to `server`; `tune` adjusts the credit the client
-    /// grants.
-    pub(crate) fn connect(server: SocketAddr, tune: impl FnOnce(&mut quiche::Config)) -> Self {
-        let mut config = build_quiche_config(&QuicNodeConfig::generate()).expect("client config");
-        tune(&mut config);
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind client");
-        socket.set_nonblocking(true).expect("nonblocking");
-        let scid = QuicTransport::generate_scid().expect("scid");
-        let local = socket.local_addr().expect("client addr");
-        let conn = quiche::connect(None, &scid, local, server, &mut config).expect("connect");
-        let mut peer = Self { conn, socket };
-        peer.pump();
-        peer
-    }
-
-    /// Receives everything queued on the socket, services timers, and sends
-    /// whatever quiche has to say.
-    pub(crate) fn pump(&mut self) {
-        let mut buf = [0u8; 65535];
-        let local = self.socket.local_addr().expect("client addr");
-        while let Ok((len, from)) = self.socket.recv_from(&mut buf) {
-            let packet = buf.get_mut(..len).expect("received length fits");
-            // A packet quiche rejects is simply lost, as on a real network.
-            if self
-                .conn
-                .recv(packet, quiche::RecvInfo { from, to: local })
-                .is_err()
-            {
-                continue;
-            }
-        }
-        if self.conn.timeout().is_some_and(|timeout| timeout.is_zero()) {
-            self.conn.on_timeout();
-        }
-        self.flush();
-    }
-
-    /// Sends whatever quiche has to say without receiving anything, so the
-    /// server sees no acknowledgement of what it sent since the last pump.
-    fn flush(&mut self) {
-        let mut out = [0u8; 1350];
-        while let Ok((len, info)) = self.conn.send(&mut out) {
-            let packet = out.get(..len).expect("sent length fits");
-            self.socket.send_to(packet, info.to).expect("client send");
-        }
-    }
-
-    /// Reads everything readable on `stream`, returning the bytes and FIN.
-    pub(crate) fn read(&mut self, stream: u64) -> (Vec<u8>, bool) {
-        let mut data = Vec::new();
-        let mut buf = [0u8; 4096];
-        while let Ok((read, fin)) = self.conn.stream_recv(stream, &mut buf) {
-            data.extend_from_slice(buf.get(..read).expect("read fits"));
-            if fin {
-                return (data, true);
-            }
-        }
-        (data, false)
-    }
-}
-
-pub(crate) fn listening_server(idle_timeout_ms: u64) -> QuicTransport {
-    let limits = QuicLimits {
-        idle_timeout_ms,
-        ..QuicLimits::default()
-    };
-    let mut server = QuicTransport::new(
-        QuicNodeConfig::generate().with_limits(limits),
-        "127.0.0.1:0",
-    )
-    .expect("bind server");
-    server.listen_on_bound_addr().expect("listen");
-    server
-}
-
-/// Polls the server and pumps the peers until `done` accepts the events seen
-/// so far. Every poll must succeed.
-fn drive_until(
-    server: &mut QuicTransport,
-    peers: &mut [&mut RawPeer],
-    events: &mut Vec<TransportEvent>,
-    what: &str,
-    mut done: impl FnMut(&[TransportEvent]) -> bool,
-) {
-    // Failure backstop, not a budget. Some of these waits are on quiche's idle
-    // timer, whose effective value is max(idle, 3×PTO) — and PTO follows the
-    // RTT quiche measures, which a descheduled thread inflates. The cap has to
-    // sit well clear of that.
-    let start = Instant::now();
-    while !done(events) {
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "timed out waiting for {what}; events: {events:?}"
-        );
-        std::thread::sleep(Duration::from_millis(2));
-        for peer in peers.iter_mut() {
-            peer.pump();
-        }
-        events.extend(server.poll(now()).expect("poll must not fail"));
-        for peer in peers.iter_mut() {
-            peer.pump();
-        }
-    }
-}
-
-/// Connects a raw peer and returns the server-side connection id.
-pub(crate) fn accept(
-    server: &mut QuicTransport,
-    others: &mut [&mut RawPeer],
-    tune: impl FnOnce(&mut quiche::Config),
-) -> (RawPeer, ConnectionId) {
-    let mut peer = RawPeer::connect(server.local_addr(), tune);
-    let mut events = Vec::new();
-    let mut peers: Vec<&mut RawPeer> = others.iter_mut().map(|p| &mut **p).collect();
-    peers.push(&mut peer);
-    drive_until(server, &mut peers, &mut events, "handshake", |events| {
-        events
-            .iter()
-            .any(|event| matches!(event, TransportEvent::Connected { .. }))
-    });
-    let id = events
-        .iter()
-        .find_map(|event| match event {
-            TransportEvent::Connected { id, .. } => Some(*id),
-            _ => None,
-        })
-        .expect("connected");
-    (peer, id)
-}
+use crate::test_peer::{
+    RawPeer, accept, drive_until, listening_server, now, server_with_idle_timeout, sid,
+    stream_bytes,
+};
 
 fn pending_write_bytes(server: &QuicTransport, id: ConnectionId) -> usize {
     server
@@ -160,40 +21,63 @@ fn pending_write_bytes(server: &QuicTransport, id: ConnectionId) -> usize {
         .pending_write_bytes()
 }
 
-#[test]
-fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
-    let mut server = listening_server(1_000);
-    // A small window for server data on client-opened streams makes most of
-    // the server's write queue in the transport.
-    let (mut stopper, stopper_id) = accept(&mut server, &mut [], |config| {
-        config.set_initial_max_stream_data_bidi_local(1_000);
-    });
-    let (mut silent, silent_id) = accept(&mut server, &mut [&mut stopper], |_| {});
+/// A server whose write queue holds at most `bytes`.
+fn server_with_queue(bytes: usize) -> QuicTransport {
+    listening_server(QuicLimits {
+        max_pending_stream_bytes: bytes,
+        ..QuicLimits::default()
+    })
+}
 
-    stopper.conn.stream_send(0, b"hi", false).expect("open");
+/// Grants the server 1,000 bytes per stream, so most of a larger write queues.
+fn small_stream_window(config: &mut quinn_proto::TransportConfig) {
+    config.stream_receive_window(VarInt::from_u32(1_000));
+}
+
+/// Opens one stream from `peer` per payload and waits until the server has
+/// read each.
+fn open_streams(server: &mut QuicTransport, peer: &mut RawPeer, payloads: &[&[u8]]) -> Vec<u64> {
+    let streams: Vec<u64> = payloads
+        .iter()
+        .map(|payload| {
+            let stream = peer.open();
+            assert_eq!(peer.write(stream, payload), payload.len());
+            stream
+        })
+        .collect();
     let mut events = Vec::new();
     drive_until(
-        &mut server,
-        &mut [&mut stopper, &mut silent],
+        server,
+        &mut [peer],
         &mut events,
-        "inbound stream",
+        "inbound streams",
         |events| {
             events
                 .iter()
-                .any(|event| matches!(event, TransportEvent::StreamData { .. }))
+                .filter(|event| matches!(event, TransportEvent::StreamData { .. }))
+                .count()
+                >= payloads.len()
         },
     );
-    let stream = StreamId::new(0);
+    streams
+}
+
+#[test]
+fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
+    let mut server = server_with_idle_timeout(1_000);
+    let (mut stopper, stopper_id) = accept(&mut server, &mut [], small_stream_window);
+    let (mut silent, silent_id) = accept(&mut server, &mut [&mut stopper], |_| {});
+
+    let raw = open_streams(&mut server, &mut stopper, &[b"hi"])[0];
+    let stream = StreamId::new(raw);
     server
         .send_stream(stopper_id, stream, Bytes::from(vec![7; 10_000]))
         .expect("send");
     assert!(pending_write_bytes(&server, stopper_id) > 0);
 
-    stopper
-        .conn
-        .stream_shutdown(0, quiche::Shutdown::Read, 42)
-        .expect("stop sending");
+    stopper.stop(raw, 42);
     // The silent peer stops answering, so only its idle timer can close it.
+    silent.mute = true;
     let mut events = Vec::new();
     drive_until(
         &mut server,
@@ -209,24 +93,21 @@ fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
     assert_eq!(pending_write_bytes(&server, stopper_id), 0);
 
     // The read half is still open.
-    stopper.conn.stream_send(0, b"more", true).expect("finish");
+    assert_eq!(stopper.write(raw, b"more"), 4);
+    stopper.finish(raw);
     drive_until(
         &mut server,
         &mut [&mut stopper],
         &mut events,
         "remote FIN",
         |events| {
-            events.iter().any(|event| {
-                matches!(event, TransportEvent::StreamClosed { id, stream_id }
-                    if *id == stopper_id && *stream_id == stream)
+            events.contains(&TransportEvent::StreamClosed {
+                id: stopper_id,
+                stream_id: stream,
             })
         },
     );
-    assert!(events.contains(&TransportEvent::StreamData {
-        id: stopper_id,
-        stream_id: stream,
-        data: Bytes::from_static(b"more"),
-    }));
+    assert_eq!(stream_bytes(&events, raw), b"more");
     assert!(events.contains(&TransportEvent::StreamRemoteWriteClosed {
         id: stopper_id,
         stream_id: stream,
@@ -255,19 +136,15 @@ fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
 
 #[test]
 fn stop_sending_is_reported_when_nothing_is_queued() {
-    let mut server = listening_server(30_000);
+    let mut server = server_with_idle_timeout(30_000);
     let (mut peer, id) = accept(&mut server, &mut [], |_| {});
 
-    // STOP_SENDING and FIN land together, before the server ever writes:
-    // reading the FIN lets quiche forget the stream, so the stop must be
-    // caught first.
-    peer.conn
-        .stream_send(0, b"hi", true)
-        .expect("open and finish");
-    peer.conn
-        .stream_shutdown(0, quiche::Shutdown::Read, 9)
-        .expect("stop sending");
-    let stream = StreamId::new(0);
+    // STOP_SENDING and FIN leave together, before the server ever writes.
+    let raw = peer.open();
+    peer.write(raw, b"hi");
+    peer.finish(raw);
+    peer.stop(raw, 9);
+    let stream = StreamId::new(raw);
     let mut events = Vec::new();
     drive_until(
         &mut server,
@@ -300,38 +177,24 @@ fn stop_sending_is_reported_when_nothing_is_queued() {
 
 #[test]
 fn stop_sending_is_reported_while_connection_credit_is_exhausted() {
-    let mut server = listening_server(30_000);
+    let mut server = server_with_idle_timeout(30_000);
     // The peer never reads, so it never raises this connection-level limit.
     let (mut peer, id) = accept(&mut server, &mut [], |config| {
-        config.set_initial_max_data(2_000);
+        config.receive_window(VarInt::from_u32(2_000));
     });
 
-    peer.conn.stream_send(0, b"hi", false).expect("open");
-    let mut events = Vec::new();
-    drive_until(
-        &mut server,
-        &mut [&mut peer],
-        &mut events,
-        "inbound stream",
-        |events| {
-            events
-                .iter()
-                .any(|event| matches!(event, TransportEvent::StreamData { .. }))
-        },
-    );
-    // Use up the connection's send credit: quiche now lists no stream as
-    // writable, stopped or not.
+    let first = open_streams(&mut server, &mut peer, &[b"hi"])[0];
+    // Use up the connection's send credit.
     server
-        .send_stream(id, StreamId::new(0), Bytes::from(vec![7; 10_000]))
+        .send_stream(id, StreamId::new(first), Bytes::from(vec![7; 10_000]))
         .expect("send");
 
-    peer.conn
-        .stream_send(4, b"hi", true)
-        .expect("open and finish");
-    peer.conn
-        .stream_shutdown(4, quiche::Shutdown::Read, 5)
-        .expect("stop sending");
-    let stream = StreamId::new(4);
+    let raw = peer.open();
+    peer.write(raw, b"hi");
+    peer.finish(raw);
+    peer.stop(raw, 5);
+    let stream = StreamId::new(raw);
+    let mut events = Vec::new();
     drive_until(
         &mut server,
         &mut [&mut peer],
@@ -350,109 +213,17 @@ fn stop_sending_is_reported_while_connection_credit_is_exhausted() {
     }));
 }
 
-/// With no send credit quiche lists no writable stream, so a stop on a stream
-/// with nothing to read stays hidden. Resetting another stream hands back its
-/// unsent credit and re-lists the stopped one, with no packet arriving to
-/// prompt a scan.
+/// Data spanning many packets must arrive whole and once, with nothing left
+/// for idle polls to find.
 #[test]
-fn stop_hidden_by_exhausted_credit_surfaces_after_a_local_reset() {
-    let mut server = listening_server(30_000);
-    let (mut peer, id) = accept(&mut server, &mut [], |config| {
-        config.set_initial_max_data(2_000);
-    });
-    peer.conn.stream_send(0, b"hi", false).expect("open 0");
-    peer.conn.stream_send(4, b"hi", false).expect("open 4");
-    let mut events = Vec::new();
-    drive_until(
-        &mut server,
-        &mut [&mut peer],
-        &mut events,
-        "both inbound streams",
-        |events| {
-            [0, 4].iter().all(|&raw| {
-                events.iter().any(|event| {
-                    matches!(event, TransportEvent::StreamData { stream_id, .. }
-                        if *stream_id == StreamId::new(raw))
-                })
-            })
-        },
-    );
-
-    // Drive the connection by hand behind a full datagram queue, so nothing
-    // leaves: quiche takes the write up to the credit and holds it unsent.
-    let local = server.local_addr();
-    let socket = &server.socket;
-    let conn = server.connections.get_mut(&id).expect("connection");
-    let mut held = VecDeque::from([PendingDatagram {
-        bytes: Vec::new(),
-        destination: local,
-    }]);
-    let mut read_buffer = vec![0; STREAM_READ_BUFFER_SIZE];
-    let mut events = Vec::new();
-    conn.send_stream(
-        StreamId::new(0),
-        Bytes::from(vec![7; 10_000]),
-        socket,
-        &mut events,
-        &mut held,
-        1,
-    )
-    .expect("send");
-
-    peer.conn
-        .stream_shutdown(4, quiche::Shutdown::Read, 7)
-        .expect("stop sending");
-    peer.flush();
-    std::thread::sleep(Duration::from_millis(20));
-    let mut buf = [0u8; 65535];
-    let mut received = 0;
-    while let Ok((len, from)) = socket.recv_from(&mut buf) {
-        let packet = buf.get_mut(..len).expect("received length fits");
-        conn.recv_packet(
-            packet,
-            from,
-            local,
-            now(),
-            socket,
-            &mut events,
-            &mut held,
-            1,
-        )
-        .expect("recv");
-        received += 1;
-    }
-    assert!(received > 0, "the stop never reached the server");
-    conn.poll_streams(&mut events, socket, &mut read_buffer, &mut held, 1)
-        .expect("poll");
-    let stopped = |events: &[TransportEvent]| {
-        events
-            .iter()
-            .any(|event| matches!(event, TransportEvent::StreamWriteStopped { .. }))
-    };
-    assert!(!stopped(&events), "the stop should be hidden: {events:?}");
-
-    conn.reset_stream(StreamId::new(0), &mut events)
-        .expect("reset");
-    conn.poll_streams(&mut events, socket, &mut read_buffer, &mut held, 1)
-        .expect("poll");
-    assert!(events.contains(&TransportEvent::StreamWriteStopped {
-        id,
-        stream_id: StreamId::new(4),
-        error_code: 7,
-    }));
-}
-
-/// Idle polls skip the stream scans; data spanning several read-buffer fills
-/// must still arrive whole and once, with nothing left for idle polls to find.
-#[test]
-fn data_beyond_one_read_buffer_arrives_once_and_idle_polls_stay_silent() {
-    let mut server = listening_server(30_000);
+fn data_beyond_one_receive_buffer_arrives_once_and_idle_polls_stay_silent() {
+    let mut server = server_with_idle_timeout(30_000);
     let (mut peer, id) = accept(&mut server, &mut [], |_| {});
-    let payload: Vec<u8> = (0..3 * STREAM_READ_BUFFER_SIZE + 7)
-        .map(|i| i as u8)
-        .collect();
+    let payload: Vec<u8> = (0..3 * RECV_BUFFER_SIZE + 7).map(|i| i as u8).collect();
+    let raw = peer.open();
 
     let mut sent = 0;
+    let mut finished = false;
     let mut events = Vec::new();
     let start = Instant::now();
     while !events
@@ -463,26 +234,16 @@ fn data_beyond_one_read_buffer_arrives_once_and_idle_polls_stay_silent() {
             start.elapsed() < Duration::from_secs(10),
             "timed out after {sent} bytes sent"
         );
-        let rest = payload.get(sent..).expect("sent within payload");
-        if !rest.is_empty()
-            && let Ok(written) = peer.conn.stream_send(0, rest, true)
-        {
-            sent += written;
+        sent += peer.write(raw, &payload[sent..]);
+        if sent == payload.len() && !finished {
+            peer.finish(raw);
+            finished = true;
         }
         peer.pump();
         events.extend(server.poll(now()).expect("poll"));
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(1));
     }
-    let received: Vec<u8> = events
-        .iter()
-        .filter_map(|event| match event {
-            TransportEvent::StreamData { data, .. } => Some(&data[..]),
-            _ => None,
-        })
-        .flatten()
-        .copied()
-        .collect();
-    assert_eq!(received, payload);
+    assert_eq!(stream_bytes(&events, raw), payload);
 
     // Let the final acknowledgements settle, then go quiet.
     peer.pump();
@@ -503,9 +264,9 @@ fn data_beyond_one_read_buffer_arrives_once_and_idle_polls_stay_silent() {
 
 #[test]
 fn fin_waiting_for_stream_credit_stays_queued_until_granted() {
-    let mut server = listening_server(30_000);
+    let mut server = server_with_idle_timeout(30_000);
     let (mut peer, id) = accept(&mut server, &mut [], |config| {
-        config.set_initial_max_streams_bidi(1);
+        config.max_concurrent_bidi_streams(VarInt::from_u32(1));
     });
 
     let first = server.open_stream(id).expect("first stream");
@@ -527,17 +288,17 @@ fn fin_waiting_for_stream_credit_stays_queued_until_granted() {
             start.elapsed() < Duration::from_secs(10),
             "queued FIN never arrived; events: {events:?}"
         );
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(1));
         peer.pump();
         events.extend(server.poll(now()).expect("poll must not fail"));
         peer.pump();
         if !first_done && peer.read(first.as_u64()).1 {
-            peer.conn
-                .stream_send(first.as_u64(), &[], true)
-                .expect("peer fin");
+            peer.finish(first.as_u64());
             first_done = true;
         }
-        second_fin = peer.read(second.as_u64()).1;
+        if first_done {
+            second_fin = peer.read(second.as_u64()).1;
+        }
     }
     assert!(
         !events.iter().any(|event| matches!(
@@ -550,43 +311,40 @@ fn fin_waiting_for_stream_credit_stays_queued_until_granted() {
 
 #[test]
 fn connection_fatal_send_error_closes_only_that_connection() {
-    let mut server = listening_server(30_000);
-    // libp2p never grants unidirectional streams; allow one so the peer can
-    // open a stream the server may read but never write.
-    server.quiche_config.set_initial_max_streams_uni(1);
-    server.quiche_config.set_initial_max_stream_data_uni(1_000);
-    let (mut faulty, faulty_id) = accept(&mut server, &mut [], |_| {});
+    let mut server = server_with_idle_timeout(30_000);
+    let (mut faulty, faulty_id) = accept(&mut server, &mut [], small_stream_window);
     let (mut healthy, healthy_id) = accept(&mut server, &mut [&mut faulty], |_| {});
 
-    // Stream 2 is the client's first unidirectional stream: quiche refuses
-    // any server write to it, FIN included.
-    faulty.conn.stream_send(2, b"uni", false).expect("uni");
+    let raw = open_streams(&mut server, &mut faulty, &[b"hi"])[0];
+    server
+        .send_stream(faulty_id, StreamId::new(raw), Bytes::from(vec![7; 10_000]))
+        .expect("most of the write queues");
+    // The engine forgets the stream behind the adapter's back, so the next
+    // drain of its queue meets a closed stream.
+    server
+        .connections
+        .get_mut(&faulty_id)
+        .expect("connection")
+        .engine()
+        .send_stream(sid(raw))
+        .reset(VarInt::from_u32(0))
+        .expect("reset");
+
+    let stream = healthy.open();
+    healthy.write(stream, b"still here");
+    healthy.finish(stream);
     let mut events = Vec::new();
     drive_until(
         &mut server,
         &mut [&mut faulty, &mut healthy],
         &mut events,
-        "uni stream",
-        |events| {
-            events
-                .iter()
-                .any(|event| matches!(event, TransportEvent::StreamData { .. }))
-        },
-    );
-    server
-        .close_stream_write(faulty_id, StreamId::new(2))
-        .expect("the FIN is queued; quiche rejects it in the drain");
-
-    healthy
-        .conn
-        .stream_send(0, b"still here", true)
-        .expect("send");
-    drive_until(
-        &mut server,
-        &mut [&mut faulty, &mut healthy],
-        &mut events,
         "faulty connection close",
-        |events| events.contains(&TransportEvent::Closed { id: faulty_id }),
+        |events| {
+            events.contains(&TransportEvent::Closed { id: faulty_id })
+                && events
+                    .iter()
+                    .any(|event| matches!(event, TransportEvent::StreamRemoteWriteClosed { id, .. } if *id == healthy_id))
+        },
     );
     assert_eq!(
         events
@@ -596,22 +354,15 @@ fn connection_fatal_send_error_closes_only_that_connection() {
         1,
         "the failed write is dropped, not retried on every drain: {events:?}"
     );
-    assert!(events.contains(&TransportEvent::StreamData {
-        id: healthy_id,
-        stream_id: StreamId::new(0),
-        data: Bytes::from_static(b"still here"),
-    }));
+    assert_eq!(stream_bytes(&events, stream), b"still here");
     assert!(!events.contains(&TransportEvent::Closed { id: healthy_id }));
     assert!(server.connections.contains_key(&healthy_id));
 }
 
 #[test]
 fn partially_written_queue_drains_once_the_stream_is_writable() {
-    let mut server = listening_server(30_000);
-    // The peer grants 1,000 bytes per server stream until it reads.
-    let (mut peer, id) = accept(&mut server, &mut [], |config| {
-        config.set_initial_max_stream_data_bidi_remote(1_000);
-    });
+    let mut server = server_with_idle_timeout(30_000);
+    let (mut peer, id) = accept(&mut server, &mut [], small_stream_window);
 
     let stream = server.open_stream(id).expect("open");
     server
@@ -631,7 +382,7 @@ fn partially_written_queue_drains_once_the_stream_is_writable() {
             "queued bytes never arrived; got {} bytes",
             received.len()
         );
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(1));
         peer.pump();
         server.poll(now()).expect("poll must not fail");
         peer.pump();
@@ -645,54 +396,31 @@ fn partially_written_queue_drains_once_the_stream_is_writable() {
     assert_eq!(connection.queued_stream_count(), 0);
 }
 
-#[test]
-fn a_peer_reset_disarms_its_stream_while_the_queue_stays_full() {
-    let limits = QuicLimits {
-        max_pending_stream_bytes: 4_000,
-        ..QuicLimits::default()
-    };
-    let mut server = QuicTransport::new(
-        QuicNodeConfig::generate().with_limits(limits),
-        "127.0.0.1:0",
-    )
-    .expect("bind server");
-    server.listen_on_bound_addr().expect("listen");
-    // A small window for server data keeps most of each write queued, and
-    // the peer never reads, so nothing drains the queue.
-    let (mut peer, id) = accept(&mut server, &mut [], |config| {
-        config.set_initial_max_stream_data_bidi_local(1_000);
-    });
-    peer.conn.stream_send(0, b"a", false).expect("open 0");
-    peer.conn.stream_send(4, b"b", false).expect("open 4");
-    let mut events = Vec::new();
-    drive_until(
-        &mut server,
-        &mut [&mut peer],
-        &mut events,
-        "inbound streams",
-        |events| {
-            events
-                .iter()
-                .filter(|event| matches!(event, TransportEvent::StreamData { .. }))
-                .count()
-                == 2
-        },
-    );
-    let (filler, reset) = (StreamId::new(0), StreamId::new(4));
-    // The filler takes the whole shared queue; the second write finds none.
-    for stream in [filler, reset] {
+/// Fills the server's whole 4,000-byte queue from stream `filler` and arms
+/// the second stream too, neither able to drain: the peer grants 1,000 bytes
+/// per stream and never reads.
+fn two_full_streams() -> (QuicTransport, RawPeer, ConnectionId, StreamId, StreamId) {
+    let mut server = server_with_queue(4_000);
+    let (mut peer, id) = accept(&mut server, &mut [], small_stream_window);
+    let streams = open_streams(&mut server, &mut peer, &[b"a", b"b"]);
+    let (filler, other) = (StreamId::new(streams[0]), StreamId::new(streams[1]));
+    for stream in [filler, other] {
         assert!(matches!(
             server.send_stream(id, stream, Bytes::from(vec![7; 10_000])),
             Err(TransportError::Full { .. })
         ));
     }
+    (server, peer, id, filler, other)
+}
+
+#[test]
+fn a_peer_reset_disarms_its_stream_while_the_queue_stays_full() {
+    let (mut server, mut peer, id, _, reset) = two_full_streams();
     assert_eq!(server.connections[&id].writable_armed_count(), 2);
 
     // Resetting a stream that queued nothing frees no room, so no wake runs:
     // the reset itself must disarm it.
-    peer.conn
-        .stream_shutdown(4, quiche::Shutdown::Write, 5)
-        .expect("reset");
+    peer.reset(reset.as_u64(), 5);
     let mut events = Vec::new();
     drive_until(
         &mut server,
@@ -711,54 +439,17 @@ fn a_peer_reset_disarms_its_stream_while_the_queue_stays_full() {
 
 #[test]
 fn a_peer_reset_retracts_a_writable_queued_before_the_poll() {
-    let limits = QuicLimits {
-        max_pending_stream_bytes: 4_000,
-        ..QuicLimits::default()
-    };
-    let mut server = QuicTransport::new(
-        QuicNodeConfig::generate().with_limits(limits),
-        "127.0.0.1:0",
-    )
-    .expect("bind server");
-    server.listen_on_bound_addr().expect("listen");
-    let (mut peer, id) = accept(&mut server, &mut [], |config| {
-        config.set_initial_max_stream_data_bidi_local(1_000);
-    });
-    peer.conn.stream_send(0, b"a", false).expect("open 0");
-    peer.conn.stream_send(4, b"b", false).expect("open 4");
-    let mut events = Vec::new();
-    drive_until(
-        &mut server,
-        &mut [&mut peer],
-        &mut events,
-        "inbound streams",
-        |events| {
-            events
-                .iter()
-                .filter(|event| matches!(event, TransportEvent::StreamData { .. }))
-                .count()
-                == 2
-        },
-    );
-    let (filler, reset) = (StreamId::new(0), StreamId::new(4));
-    for stream in [filler, reset] {
-        assert!(matches!(
-            server.send_stream(id, stream, Bytes::from(vec![7; 10_000])),
-            Err(TransportError::Full { .. })
-        ));
-    }
+    let (mut server, mut peer, id, filler, reset) = two_full_streams();
 
     // The peer's reset is on the wire when the application resets the
     // filler, which frees the shared queue and queues a Writable for the
     // other stream before the next poll reads that reset.
-    peer.conn
-        .stream_shutdown(4, quiche::Shutdown::Write, 5)
-        .expect("reset");
-    peer.flush();
+    peer.reset(reset.as_u64(), 5);
+    peer.service();
     // Wait until the reset is waiting on the server's socket (peeking leaves
     // it there), so the next poll is sure to read it.
     let start = Instant::now();
-    while server.socket.peek_from(&mut [0u8; 1]).is_err() {
+    while !socket::has_queued_input(&server.socket.udp) {
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "reset never arrived"
@@ -790,42 +481,7 @@ fn a_peer_reset_retracts_a_writable_queued_before_the_poll() {
 
 #[test]
 fn a_local_close_retracts_queued_writables() {
-    let limits = QuicLimits {
-        max_pending_stream_bytes: 4_000,
-        ..QuicLimits::default()
-    };
-    let mut server = QuicTransport::new(
-        QuicNodeConfig::generate().with_limits(limits),
-        "127.0.0.1:0",
-    )
-    .expect("bind server");
-    server.listen_on_bound_addr().expect("listen");
-    let (mut peer, id) = accept(&mut server, &mut [], |config| {
-        config.set_initial_max_stream_data_bidi_local(1_000);
-    });
-    peer.conn.stream_send(0, b"a", false).expect("open 0");
-    peer.conn.stream_send(4, b"b", false).expect("open 4");
-    let mut events = Vec::new();
-    drive_until(
-        &mut server,
-        &mut [&mut peer],
-        &mut events,
-        "inbound streams",
-        |events| {
-            events
-                .iter()
-                .filter(|event| matches!(event, TransportEvent::StreamData { .. }))
-                .count()
-                == 2
-        },
-    );
-    let (filler, waiting) = (StreamId::new(0), StreamId::new(4));
-    for stream in [filler, waiting] {
-        assert!(matches!(
-            server.send_stream(id, stream, Bytes::from(vec![7; 10_000])),
-            Err(TransportError::Full { .. })
-        ));
-    }
+    let (mut server, _peer, id, filler, _) = two_full_streams();
 
     // Resetting the filler frees the shared queue and queues a Writable for
     // the other stream; closing the connection before the poll retracts it.

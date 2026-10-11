@@ -157,7 +157,7 @@ fn connected_token(events: &[TransportEvent], conn: ConnectionId) -> Option<Conn
 #[test]
 fn both_ends_of_a_connection_share_its_token() {
     // The default config validates addresses with a Retry, so this also
-    // covers the dialer switching to the Retry's connection id.
+    // covers a handshake through Retry. The token is a TLS exporter value.
     let (mut server, mut client, peer_addr) = setup_pair();
     let (server_conn, client_conn, server_events, client_events) =
         connect_pair(&mut server, &mut client, &peer_addr);
@@ -341,7 +341,7 @@ fn zero_pending_limits_are_rejected() {
 }
 
 #[test]
-fn write_larger_than_queue_cap_succeeds_when_quiche_accepts_it() {
+fn write_larger_than_queue_cap_succeeds_when_the_engine_accepts_it() {
     let limits = QuicLimits {
         max_pending_stream_bytes: 8,
         ..QuicLimits::default()
@@ -350,8 +350,9 @@ fn write_larger_than_queue_cap_succeeds_when_quiche_accepts_it() {
     let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     let stream = client.open_stream(client_conn).expect("open stream");
 
-    // 9 bytes exceed the queue cap but fit quiche's send capacity on an idle
-    // connection, so the write goes straight to quiche instead of failing.
+    // 9 bytes exceed the queue cap but fit the engine's send capacity on an
+    // idle connection, so the write goes straight to the engine instead of
+    // failing.
     client
         .send_stream(client_conn, stream, Bytes::from(vec![7; 9]))
         .expect("write above the queue cap must succeed via direct send");
@@ -385,9 +386,11 @@ fn a_write_past_the_pending_cap_is_full_and_resumes_on_writable() {
     let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     let stream = client.open_stream(client_conn).expect("open stream");
 
-    // Far beyond quiche's fresh-connection send capacity plus the queue cap:
-    // the transport keeps what fits and hands back exactly the rest.
-    let payload: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
+    // Beyond the peer's stream credit plus the queue cap: the transport
+    // keeps what fits and hands back exactly the rest.
+    let payload: Vec<u8> = (0..2 * STREAM_RECEIVE_WINDOW as u32)
+        .map(|i| (i % 251) as u8)
+        .collect();
     let error = client
         .send_stream(client_conn, stream, Bytes::from(payload.clone()))
         .expect_err("a write past the queue cap is Full");
@@ -431,8 +434,13 @@ fn a_write_past_the_pending_cap_is_full_and_resumes_on_writable() {
         }
         for event in server_events {
             match event {
-                TransportEvent::StreamData { id, data, .. } if id == server_conn => {
+                TransportEvent::StreamData {
+                    id,
+                    stream_id,
+                    data,
+                } if id == server_conn => {
                     received.extend_from_slice(&data);
+                    server.ack_stream(id, stream_id, data.len()).expect("ack");
                 }
                 TransportEvent::StreamRemoteWriteClosed { id, .. } if id == server_conn => {
                     remote_closed = true;
@@ -489,7 +497,8 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
         .and_then(TransportError::into_unsent);
 
     // The reader takes what arrives and acknowledges none of it: one window
-    // is delivered, quiche buffers at most another, and the sender stalls.
+    // is delivered, the engine buffers at most another, and the sender
+    // stalls.
     let mut received = Vec::new();
     let mut quiet_rounds = 0;
     while quiet_rounds < 40 {
@@ -519,7 +528,7 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
         resumed
             .iter()
             .any(|event| matches!(event, TransportEvent::StreamData { .. })),
-        "quiche's buffered bytes are read on the ack"
+        "the engine's buffered bytes are read on the ack"
     );
     let mut events = resumed;
     let mut remote_closed = false;
@@ -674,8 +683,8 @@ fn an_unsettled_stream_holds_its_slot_and_over_acks_fail() {
     );
 
     // Unsettled, it keeps the only slot: the next inbound stream is refused.
-    // quiche itself already freed the slot, so the client can open and write;
-    // it is the transport that refuses.
+    // The engine itself already freed the slot, so the client can open and
+    // write; it is the transport that refuses.
     assert_eq!(
         open_and_watch(&mut server, &mut client, client_conn),
         (true, false),
@@ -832,7 +841,7 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
 
 #[test]
 fn quiet_pair_stays_up_past_idle_timeout() {
-    // The window has to outlast quiche's effective idle timeout,
+    // The window has to outlast the engine's effective idle timeout,
     // max(idle, 3×PTO), for the test to prove anything. This test runs alone
     // (see `.config/nextest.toml`), which keeps PTO near loopback scale and so
     // the effective timeout near the configured one, and keeps a descheduled
