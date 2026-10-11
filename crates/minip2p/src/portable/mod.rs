@@ -370,9 +370,12 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// Abandons a stream and drops its events from `held`, the events a
     /// composed endpoint's failed poll still holds.
     ///
-    /// Their data was never pulled, so it is acknowledged here, as the swarm
-    /// does for data still in its own queue; after the reset that
-    /// acknowledgement is moot, so its error is ignored.
+    /// A held `StreamClosed` proves the stream existed even though the swarm,
+    /// having already delivered that close, no longer knows it; its held
+    /// events are dropped all the same. Their data was never pulled, so it
+    /// is acknowledged here, as the swarm does for data still in its own
+    /// queue; after a reset that acknowledgement is moot, so its error is
+    /// ignored.
     #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
     fn abandon_stream_holding(
         &mut self,
@@ -382,7 +385,15 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
-        self.abandon_stream(peer_id, conn_id, stream_id, now)?;
+        let held_close = held.iter().any(|event| {
+            matches!(event, EndpointEvent::StreamClosed { .. })
+                && event.matches_stream(peer_id, conn_id, stream_id)
+        });
+        match self.abandon_stream(peer_id, conn_id, stream_id, now) {
+            Ok(()) => {}
+            Err(_) if held_close => {}
+            Err(error) => return Err(error),
+        }
         let mut dropped_data = 0usize;
         held.retain(|event| {
             if !event.matches_stream(peer_id, conn_id, stream_id) {
@@ -1878,6 +1889,50 @@ mod tests {
                 reason: "stack gone".into(),
             })
         }
+    }
+
+    /// A stream whose close a failed poll still holds is gone from the
+    /// swarm, yet abandoning it drops every held event for it.
+    #[cfg(feature = "portable-mdns")]
+    #[test]
+    fn abandoning_a_stream_closed_in_held_events_drops_them() {
+        let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
+        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
+            .build(NoopTransport)
+            .expect("portable endpoint")
+            .with_mdns(BrokenMdns, MdnsConfig::default(), [0; 32])
+            .expect("mdns endpoint");
+        let peer = Ed25519Keypair::from_secret_key_bytes([8; 32]).peer_id();
+        let (conn_id, stream_id) = (ConnectionId::new(1), StreamId::new(3));
+        let other = EndpointEvent::ConnectionClosed {
+            peer_id: peer.clone(),
+            conn_id: ConnectionId::new(2),
+        };
+        endpoint.unreturned.extend([
+            EndpointEvent::StreamData {
+                peer_id: peer.clone(),
+                conn_id,
+                stream_id,
+                data: minip2p_core::Bytes::from_static(b"late"),
+            },
+            EndpointEvent::StreamClosed {
+                peer_id: peer.clone(),
+                conn_id,
+                stream_id,
+            },
+            other,
+        ]);
+        endpoint
+            .abandon_stream(&peer, conn_id, stream_id, Now::from_millis(0))
+            .expect("a held close proves the stream");
+        assert!(
+            matches!(
+                endpoint.unreturned.as_slice(),
+                [EndpointEvent::ConnectionClosed { conn_id, .. }] if *conn_id == ConnectionId::new(2)
+            ),
+            "{:?}",
+            endpoint.unreturned
+        );
     }
 
     /// A failed mDNS tick keeps the events the endpoint pass already

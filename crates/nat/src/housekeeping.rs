@@ -37,7 +37,8 @@ pub const MAX_RESERVATION_RETRY_BACKOFF_MS: u64 = 60_000;
 /// The delay before retrying after `failures` earlier consecutive failures:
 /// `base` doubled per failure, plus up to a fifth more as jitter, capped at
 /// [`MAX_RESERVATION_RETRY_BACKOFF_MS`] (or `base`, if larger). Once the
-/// doubling reaches the cap, the delay is drawn from the cap's top fifth.
+/// doubling reaches the cap, the delay is drawn from the cap's top fifth,
+/// never below `base`.
 ///
 /// The jitter keeps clients that failed together from retrying together,
 /// including during a long outage at the cap, and staying under the next
@@ -50,7 +51,7 @@ fn retry_backoff_ms(base: u64, failures: u32, jitter: u64) -> u64 {
     if delay < cap {
         delay
     } else {
-        cap - draw(cap / 5)
+        (cap - draw(cap / 5)).max(base)
     }
 }
 
@@ -1234,5 +1235,20 @@ impl Housekeeping {
                 self.reservations.state,
                 ResState::Idle | ResState::Reserved { .. }
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A configured base at or above the cap is honoured in full, whatever
+    /// the jitter draws.
+    #[test]
+    fn a_base_above_the_cap_is_never_shortened() {
+        for jitter in [0, 1, 7_919, u64::MAX] {
+            assert_eq!(retry_backoff_ms(120_000, 0, jitter), 120_000);
+            assert_eq!(retry_backoff_ms(120_000, 5, jitter), 120_000);
+        }
     }
 }
