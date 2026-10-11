@@ -355,7 +355,8 @@ impl Shared {
     /// Unlike the peer's, these are not required to be globally routable: a
     /// LAN address of ours is a perfectly good punch target for a peer on the
     /// same LAN, and it is the receiver that decides what it is willing to
-    /// aim at.
+    /// aim at. They are bounded the same way, though: see
+    /// [`MAX_PUNCH_CANDIDATES`](crate::MAX_PUNCH_CANDIDATES).
     pub(crate) fn punch_candidates(&self) -> Vec<Multiaddr> {
         let mut addrs: Vec<Multiaddr> = self
             .listen_addrs
@@ -368,7 +369,7 @@ impl Shared {
                 addrs.push(addr.clone());
             }
         }
-        addrs
+        crate::inbound::bound_punch_candidates(addrs)
     }
 }
 

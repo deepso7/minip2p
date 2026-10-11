@@ -134,6 +134,8 @@ Independent of connect attempts, the agent also runs:
 
 A NAT'd listener holding a reservation handles inbound circuits automatically: the relay's STOP CONNECT is auto-accepted and the bridge is promoted into a normal circuit connection. The agent announces that Relayed path, opens `/libp2p/dcutr`, and sends CONNECT followed by SYNC. It emits `SendRandomUdp` blasts at the original circuit dialer's observed addresses to open its own NAT mapping (first after half the measured relay RTT, then every `blast_interval_ms` until `punch_deadline_ms`). The original circuit dialer makes the QUIC simultaneous-open dial. A landed punch is announced with `InboundDirectUpgrade` and replaces the circuit.
 
+Punch candidates are bounded both ways: a peer's CONNECT is filtered to globally routable QUIC addresses, and that list and our own advertised one keep at most `MAX_PUNCH_CANDIDATES` (8) addresses, at most 4 per IP family and 2 per IP, skipping port 0 and privileged ports (below 1024).
+
 ## Connection replacement and paths
 
 The swarm keeps one connection per peer. When a newer connection takes the slot (`SwarmEvent::ConnectionReplaced { peer_id, old, new }`), the agent applies `new` before retiring `old`, so the peer never counts as disconnected and no relay leg or inbound flow fails just because `old` went away. Everything bound to `old` ends: its streams, its observed address, and the peer's readiness (`PeerReady` for `new` restarts what waits on it). A connection-level disconnect (`ConnectionClosed`) is acted on immediately.

@@ -592,6 +592,49 @@ impl InboundCircuit {
     }
 }
 
+/// The most DCUtR punch candidates kept, whether accepted from a peer's
+/// CONNECT or advertised in ours. Every one is dialed or blasted in each punch
+/// window, so the peer's 4 KiB message (room for some 300) must not set it.
+pub const MAX_PUNCH_CANDIDATES: usize = 8;
+/// The most punch candidates kept per IP family, so neither crowds out the
+/// other.
+const MAX_PUNCH_CANDIDATES_PER_FAMILY: usize = MAX_PUNCH_CANDIDATES / 2;
+/// The most punch candidates kept per IP address: a host has a mapping or two
+/// worth trying, not a port range.
+const MAX_PUNCH_CANDIDATES_PER_IP: usize = 2;
+
+/// Bounds a punch candidate list, keeping the first that fit: drops port 0
+/// and privileged ports (below 1024, never a NAT mapping worth punching),
+/// then applies the per-IP, per-family, and total caps.
+pub(crate) fn bound_punch_candidates(addrs: impl IntoIterator<Item = Multiaddr>) -> Vec<Multiaddr> {
+    let mut kept: Vec<Multiaddr> = Vec::new();
+    for addr in addrs {
+        if kept.len() == MAX_PUNCH_CANDIDATES {
+            break;
+        }
+        let protocols = addr.protocols();
+        let (Some(ip), Some(Protocol::Udp(port))) = (protocols.first(), protocols.get(1)) else {
+            continue;
+        };
+        if *port < 1024 {
+            continue;
+        }
+        let v4 = matches!(ip, Protocol::Ip4(_));
+        let same_family = kept
+            .iter()
+            .filter(|other| matches!(other.protocols().first(), Some(Protocol::Ip4(_))) == v4)
+            .count();
+        let same_ip = kept
+            .iter()
+            .filter(|other| other.protocols().first() == Some(ip))
+            .count();
+        if same_family < MAX_PUNCH_CANDIDATES_PER_FAMILY && same_ip < MAX_PUNCH_CANDIDATES_PER_IP {
+            kept.push(addr);
+        }
+    }
+    kept
+}
+
 /// Selects peer-supplied DCUtR targets that are safe to dial or blast.
 ///
 /// The general direct-candidate selector accepts DNS and LAN addresses,
@@ -603,12 +646,14 @@ impl InboundCircuit {
 /// private/special-use targets would turn the NAT agent into an SSRF
 /// primitive, and a hole punch aimed at a `/tcp` address would put UDP on a
 /// port whose owner never consented to receive it. Keep only strict QUIC-v1
-/// addresses whose first component is a globally routable unicast IP.
+/// addresses whose first component is a globally routable unicast IP, then
+/// bound them with [`bound_punch_candidates`].
 pub(crate) fn select_global_punch_candidates(addrs: &[Multiaddr]) -> Vec<Multiaddr> {
-    select_direct_addrs(addrs, None, None)
-        .into_iter()
-        .filter(is_global_unicast_quic)
-        .collect()
+    bound_punch_candidates(
+        select_direct_addrs(addrs, None, None)
+            .into_iter()
+            .filter(is_global_unicast_quic),
+    )
 }
 
 fn is_global_unicast_quic(addr: &Multiaddr) -> bool {
