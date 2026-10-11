@@ -4,8 +4,9 @@
 //! field encode/decode, unknown-field skipping, and [`WireError`] — so migrated
 //! protocols share one framing implementation. Protocol crates keep their own
 //! message structs, semantic validation, and contextual public errors; they
-//! wrap [`WireError`] rather than exposing it bare. Field-number policy (for
-//! example rejecting field 0) stays with the caller. This module is
+//! wrap [`WireError`] rather than exposing it bare. [`read_tag`] rejects field
+//! numbers outside the protobuf range `1..=2^29-1` for every caller, so no
+//! protocol carries its own field-number check (ADR 0016). This module is
 //! `no_std` + `alloc` and introduces no I/O, clock, or async dependency.
 //!
 //! Stream-level length-prefix framing remains in [`crate::frame`]. Relay,
@@ -27,6 +28,9 @@ pub const WIRE_LEN: u8 = 2;
 /// Protobuf wire type: 32-bit fixed.
 pub const WIRE_I32: u8 = 5;
 
+/// Largest field number protobuf allows (`2^29 - 1`); `0` is also invalid.
+const MAX_FIELD_NUMBER: u64 = (1 << 29) - 1;
+
 /// Errors from shared protobuf framing helpers.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum WireError {
@@ -43,6 +47,12 @@ pub enum WireError {
     /// An unknown wire type was encountered and cannot be safely skipped.
     #[error("unsupported wire type {wire_type} at offset {offset}")]
     UnsupportedWireType { wire_type: u8, offset: usize },
+    /// A tag carries a field number outside protobuf's valid `1..=2^29-1`.
+    /// `offset` is where the tag starts.
+    #[error(
+        "invalid protobuf field number {field} in tag at offset {offset}; field numbers must be in 1..=536870911"
+    )]
+    InvalidFieldNumber { field: u64, offset: usize },
     /// A length-delimited string field is not valid UTF-8.
     #[error("invalid UTF-8 in length-delimited field at offset {offset}")]
     InvalidUtf8 { offset: usize },
@@ -63,9 +73,14 @@ pub const fn tag_byte(field: u8, wire_type: u8) -> Option<u8> {
 
 /// Writes a protobuf field tag as a canonical uvarint.
 ///
+/// `field` must be in `1..=2^29-1`; [`read_tag`] rejects anything else.
 /// `wire_type` must be in `0..=7`. Values above 7 would shift bits into the
 /// field number (same constraint as [`tag_byte`]).
 pub fn write_tag(out: &mut Vec<u8>, field: u64, wire_type: u8) {
+    debug_assert!(
+        (1..=MAX_FIELD_NUMBER).contains(&field),
+        "protobuf field number must be in 1..={MAX_FIELD_NUMBER} (got {field})"
+    );
     debug_assert!(
         wire_type <= 7,
         "protobuf wire_type must be <= 7 (got {wire_type}); higher values bleed into the field number"
@@ -90,16 +105,24 @@ pub fn encode_bytes_field(out: &mut Vec<u8>, field: u64, data: &[u8]) {
 
 /// Reads the next `(field_number, wire_type)` pair from the buffer.
 ///
-/// Returns `Ok(None)` when the buffer is exhausted. Does not reject field
-/// number 0; callers that need that policy apply it themselves.
+/// Returns `Ok(None)` when the buffer is exhausted. A field number of `0` or
+/// above `2^29-1` is [`WireError::InvalidFieldNumber`], reported before the
+/// wire type is looked at. The returned field number is always valid.
 pub fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, WireError> {
     if *idx >= input.len() {
         return Ok(None);
     }
+    let offset = *idx;
     let (tag_value, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
-    advance(input, idx, used)?;
     let wire_type = (tag_value & 0x07) as u8;
     let field_number = tag_value >> 3;
+    if !(1..=MAX_FIELD_NUMBER).contains(&field_number) {
+        return Err(WireError::InvalidFieldNumber {
+            field: field_number,
+            offset,
+        });
+    }
+    advance(input, idx, used)?;
     Ok(Some((field_number, wire_type)))
 }
 
@@ -273,11 +296,105 @@ mod tests {
     }
 
     #[test]
-    fn read_tag_allows_field_number_zero() {
-        // Shared helpers do not enforce field-number policy; callers may.
+    fn read_tag_rejects_field_number_zero() {
         let input = [0x02, 0x00]; // field 0, LEN, empty
         let mut idx = 0;
-        assert_eq!(read_tag(&input, &mut idx).unwrap(), Some((0, WIRE_LEN)));
+        assert_eq!(
+            read_tag(&input, &mut idx),
+            Err(WireError::InvalidFieldNumber {
+                field: 0,
+                offset: 0
+            })
+        );
+    }
+
+    #[test]
+    fn read_tag_rejects_field_zero_before_group_wire_types() {
+        for wire_type in [3, 4] {
+            let mut idx = 0;
+            assert_eq!(
+                read_tag(&[wire_type], &mut idx),
+                Err(WireError::InvalidFieldNumber {
+                    field: 0,
+                    offset: 0
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn read_tag_accepts_max_field_number() {
+        let mut buf = Vec::new();
+        write_tag(&mut buf, MAX_FIELD_NUMBER, WIRE_VARINT);
+        let mut idx = 0;
+        assert_eq!(
+            read_tag(&buf, &mut idx).unwrap(),
+            Some((MAX_FIELD_NUMBER, WIRE_VARINT))
+        );
+        assert_eq!(idx, buf.len());
+    }
+
+    #[test]
+    fn read_tag_rejects_field_numbers_above_max() {
+        let mut buf = Vec::new();
+        write_uvarint((MAX_FIELD_NUMBER + 1) << 3, &mut buf);
+        let mut idx = 0;
+        assert_eq!(
+            read_tag(&buf, &mut idx),
+            Err(WireError::InvalidFieldNumber {
+                field: MAX_FIELD_NUMBER + 1,
+                offset: 0
+            })
+        );
+
+        // The largest tag that still decodes as a u64 varint.
+        let mut buf = Vec::new();
+        write_uvarint(u64::MAX, &mut buf);
+        let mut idx = 0;
+        assert_eq!(
+            read_tag(&buf, &mut idx),
+            Err(WireError::InvalidFieldNumber {
+                field: u64::MAX >> 3,
+                offset: 0
+            })
+        );
+    }
+
+    #[test]
+    fn read_tag_reports_offset_of_the_invalid_tag() {
+        let mut buf = Vec::new();
+        encode_varint_field(&mut buf, 1, 300);
+        let bad_offset = buf.len();
+        write_uvarint((MAX_FIELD_NUMBER + 1) << 3, &mut buf);
+
+        let mut idx = 0;
+        read_tag(&buf, &mut idx).unwrap();
+        read_varint_value(&buf, &mut idx).unwrap();
+        assert_eq!(
+            read_tag(&buf, &mut idx),
+            Err(WireError::InvalidFieldNumber {
+                field: MAX_FIELD_NUMBER + 1,
+                offset: bad_offset
+            })
+        );
+    }
+
+    #[test]
+    fn read_tag_reports_varint_overflow_for_tags_wider_than_u64() {
+        let input = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f];
+        let mut idx = 0;
+        assert_eq!(
+            read_tag(&input, &mut idx),
+            Err(WireError::Varint(VarintError::Overflow))
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "field number must be in 1..=")]
+    fn write_tag_debug_asserts_field_number_range() {
+        let mut out = Vec::new();
+        write_tag(&mut out, 0, WIRE_VARINT);
     }
 
     #[test]

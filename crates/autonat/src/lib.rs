@@ -566,7 +566,7 @@ impl Message {
         let mut kind = None;
         let mut dial = None;
         let mut dial_response = None;
-        while let Some((field, wire)) = read_autonat_tag(input, &mut idx)? {
+        while let Some((field, wire)) = read_tag(input, &mut idx)? {
             match (field, wire) {
                 (1, WIRE_VARINT) => {
                     let value = read_varint_value(input, &mut idx)?;
@@ -603,7 +603,7 @@ impl Dial {
     fn decode(input: &[u8]) -> Result<Self, AutoNatError> {
         let mut idx = 0;
         let mut peer = None;
-        while let Some((field, wire)) = read_autonat_tag(input, &mut idx)? {
+        while let Some((field, wire)) = read_tag(input, &mut idx)? {
             match (field, wire) {
                 (1, WIRE_LEN) => {
                     peer = Some(PeerInfo::decode(read_len_delimited(input, &mut idx)?)?)
@@ -629,7 +629,7 @@ impl PeerInfo {
         let mut idx = 0;
         let mut id = Vec::new();
         let mut addrs = Vec::new();
-        while let Some((field, wire)) = read_autonat_tag(input, &mut idx)? {
+        while let Some((field, wire)) = read_tag(input, &mut idx)? {
             match (field, wire) {
                 (1, WIRE_LEN) => id = read_len_delimited(input, &mut idx)?.to_vec(),
                 (2, WIRE_LEN) => addrs.push(read_len_delimited(input, &mut idx)?.to_vec()),
@@ -658,7 +658,7 @@ impl DialResponse {
         let mut status = ResponseStatus::InternalError;
         let mut status_text = None;
         let mut addrs = Vec::new();
-        while let Some((field, wire)) = read_autonat_tag(input, &mut idx)? {
+        while let Some((field, wire)) = read_tag(input, &mut idx)? {
             match (field, wire) {
                 (1, WIRE_VARINT) => {
                     status = ResponseStatus::from_u64(read_varint_value(input, &mut idx)?)
@@ -724,15 +724,6 @@ fn decode_addrs(raw: &[Vec<u8>]) -> Vec<Multiaddr> {
     raw.iter()
         .filter_map(|bytes| Multiaddr::from_bytes(bytes).ok())
         .collect()
-}
-
-/// AutoNAT rejects protobuf field number 0; shared `read_tag` leaves that policy to callers.
-fn read_autonat_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, AutoNatError> {
-    let offset = *idx;
-    match read_tag(input, idx)? {
-        Some((0, wire_type)) => Err(WireError::UnsupportedWireType { wire_type, offset }.into()),
-        other => Ok(other),
-    }
 }
 
 #[cfg(test)]
@@ -1083,15 +1074,35 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_field_number_zero() {
-        let err = Message::decode(&[0x02, 0x00]).unwrap_err();
-        assert!(matches!(
-            err,
-            AutoNatError::Wire(WireError::UnsupportedWireType {
-                wire_type: WIRE_LEN,
+    fn decode_rejects_invalid_field_numbers() {
+        assert_eq!(
+            Message::decode(&[0x02, 0x00]).unwrap_err(),
+            AutoNatError::Wire(WireError::InvalidFieldNumber {
+                field: 0,
                 offset: 0
             })
-        ));
+        );
+        // Field 2^29 after a valid `type` field.
+        assert_eq!(
+            Message::decode(&[0x08, 0x00, 0x80, 0x80, 0x80, 0x80, 0x10, 0x00]).unwrap_err(),
+            AutoNatError::Wire(WireError::InvalidFieldNumber {
+                field: 1 << 29,
+                offset: 2
+            })
+        );
+    }
+
+    #[test]
+    fn decode_rejects_invalid_field_numbers_in_nested_peer_info() {
+        // type = DIAL, dial { peer { field 0 } }: offset is relative to PeerInfo.
+        let input = [0x08, 0x00, 0x12, 0x04, 0x0a, 0x02, 0x00, 0x00];
+        assert_eq!(
+            Message::decode(&input).unwrap_err(),
+            AutoNatError::Wire(WireError::InvalidFieldNumber {
+                field: 0,
+                offset: 0
+            })
+        );
     }
 
     #[test]

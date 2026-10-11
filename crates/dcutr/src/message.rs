@@ -279,6 +279,27 @@ mod tests {
         assert_eq!(decoded.kind, HolePunchType::Connect);
     }
 
+    #[test]
+    fn decode_rejects_invalid_field_numbers() {
+        // type = CONNECT, then field 0 / field 2^29.
+        let cases: [(&[u8], u64); 2] = [
+            (&[TAG_TYPE, 100, 0x00, 0x00], 0),
+            (
+                &[TAG_TYPE, 100, 0x80, 0x80, 0x80, 0x80, 0x10, 0x00],
+                1 << 29,
+            ),
+        ];
+        for (buf, field) in cases {
+            assert_eq!(
+                HolePunch::decode(buf),
+                Err(DcutrMessageError::Wire(WireError::InvalidFieldNumber {
+                    field,
+                    offset: 2
+                }))
+            );
+        }
+    }
+
     /// Regression: multi-byte tags must not alias known single-byte fields.
     #[test]
     fn decode_does_not_alias_high_field_numbers_to_known_fields() {
