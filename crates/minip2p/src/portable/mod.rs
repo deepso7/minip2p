@@ -685,8 +685,12 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
 
     /// Sends mDNS goodbyes, closes peers, and consumes the composed endpoint.
     ///
-    /// Returns the final Endpoint events, including queued peer-book changes.
+    /// Returns the final Endpoint events, including queued peer-book changes
+    /// and any a failed [`Self::poll`] still held.
     pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
+        let mut events = core::mem::take(&mut self.unreturned);
+        // Pulled now, so acknowledged like any other returned event.
+        self.endpoint.ack_pulled(&events);
         self.mdns.shutdown(now.monotonic_ms)?;
         let (connect, runtime) = self.endpoint.parts_mut();
         // Same as the sweep above: no NAT driver means no work to apply.
@@ -697,7 +701,7 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
             runtime,
             now,
         ));
-        let mut events = self.endpoint.shutdown(now)?;
+        events.extend(self.endpoint.shutdown(now)?);
         self.discovery.drain_events(&mut events);
         Ok(events)
     }
@@ -1751,6 +1755,51 @@ mod tests {
         fn local_addresses(&self) -> Vec<Multiaddr> {
             vec![self.local_address.clone()]
         }
+    }
+
+    /// An mDNS carrier with no interfaces, so it never sends or fails.
+    #[cfg(feature = "portable-mdns")]
+    struct NoMdns;
+
+    #[cfg(feature = "portable-mdns")]
+    impl MdnsIo for NoMdns {
+        fn interfaces(&self) -> &[minip2p_mdns::InterfaceSnapshot] {
+            &[]
+        }
+        fn refresh(&mut self) -> Result<bool, MdnsError> {
+            Ok(false)
+        }
+        fn receive(
+            &mut self,
+            _: &mut [u8],
+        ) -> Result<Option<minip2p_mdns::MdnsDatagram>, MdnsError> {
+            Ok(None)
+        }
+        fn send(&mut self, _: &minip2p_mdns::MdnsAction) -> Result<(), MdnsError> {
+            Ok(())
+        }
+    }
+
+    /// Events a failed poll held back come out of `shutdown` too.
+    #[cfg(feature = "portable-mdns")]
+    #[test]
+    fn mdns_shutdown_returns_events_a_failed_poll_held() {
+        let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
+        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
+            .build(NoopTransport)
+            .expect("portable endpoint")
+            .with_mdns(NoMdns, MdnsConfig::default(), [0; 32])
+            .expect("mdns endpoint");
+        let peer = Ed25519Keypair::from_secret_key_bytes([8; 32]).peer_id();
+        endpoint.unreturned.push(EndpointEvent::ConnectionClosed {
+            peer_id: peer.clone(),
+            conn_id: ConnectionId::new(1),
+        });
+        let events = endpoint.shutdown(Now::from_millis(0)).expect("shutdown");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EndpointEvent::ConnectionClosed { peer_id, .. } if *peer_id == peer
+        )));
     }
 
     #[test]

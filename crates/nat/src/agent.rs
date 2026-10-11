@@ -357,14 +357,14 @@ impl Shared {
     /// same LAN, and it is the receiver that decides what it is willing to
     /// aim at. They are bounded the same way, though: see
     /// [`MAX_PUNCH_CANDIDATES`](crate::MAX_PUNCH_CANDIDATES).
+    ///
+    /// Peer-observed mappings come first: they are what a peer behind
+    /// another NAT can actually reach, so a pile of LAN listeners must not
+    /// crowd them out of the cap.
     pub(crate) fn punch_candidates(&self) -> Vec<Multiaddr> {
-        let mut addrs: Vec<Multiaddr> = self
-            .listen_addrs
-            .iter()
-            .filter(|addr| addr.is_quic_transport())
-            .cloned()
-            .collect();
-        for addr in self.observed_addrs.values() {
+        let mut addrs: Vec<Multiaddr> = Vec::new();
+        let observed = self.observed_addrs.values();
+        for addr in observed.chain(&self.listen_addrs) {
             if addr.is_quic_transport() && !addrs.contains(addr) {
                 addrs.push(addr.clone());
             }

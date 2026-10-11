@@ -599,3 +599,26 @@ fn our_advertised_punch_candidates_are_capped() {
         "{addrs:?}"
     );
 }
+
+/// LAN listeners filling the cap do not crowd out our observed public
+/// mapping, the one address a peer behind another NAT can reach.
+#[test]
+fn observed_mappings_survive_the_punch_candidate_cap() {
+    let mut h = inbound_harness(NatConfig::default());
+    let listen: Vec<Multiaddr> = (0..10)
+        .map(|i| {
+            maddr(&format!(
+                "/ip4/192.168.1.{}/udp/{}/quic-v1",
+                i + 1,
+                5000 + i
+            ))
+        })
+        .collect();
+    h.agent.set_listen_addrs(&listen);
+    let relay = h.relay.clone();
+    identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    let addrs = dcutr_obs_addrs(&sent_data_on(&drain_actions(&mut h.agent), stream));
+    assert!(addrs.contains(&maddr(OUR_OBSERVED_ADDR)), "{addrs:?}");
+}
