@@ -23,14 +23,15 @@
 //! `avg_datagram_bytes`, under `endpoint_throughput/{case}/{endpoint}/{sent,
 //! received}` for the client, the target and, in `relayed`, the relay (both
 //! of its legs together). They count datagrams the Endpoint's QUIC sockets
-//! actually sent or received, not packets quiche generated, from the
+//! actually sent or received, not packets the QUIC engine generated, from the
 //! `diagnostics` counters of `minip2p-quic` that the `bench` feature enables.
 //!
 //! Allocations come from `stats_alloc`, installed as this binary's global
 //! allocator, and cover every thread in the process (sender, target and, for
 //! `relayed`, relay). A reallocation counts as one allocation, and only its
 //! growth counts toward bytes allocated. Allocations made by native code
-//! outside the Rust allocator, such as BoringSSL's inside QUIC, are not seen.
+//! outside the Rust allocator are not seen; QUIC's TLS runs on rustls, so its
+//! allocations are counted.
 //! The figures are informational: over real transports they vary with
 //! scheduling and read chunking. The sender allocates its `CHUNK` once: each
 //! write passes a `Bytes` handle to it, and a Full resends the unsent tail.

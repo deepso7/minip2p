@@ -117,7 +117,7 @@ impl Transport for MyTransport {
 
 The host samples time once per drive iteration and passes that `Now` to `poll()`, so every transport, agent, and runtime in one iteration observes the same instant. An adapter that schedules work retains the last sample it was given and reports the resulting absolute `Deadline` from `next_deadline()`, which the host uses to decide how long it may idle.
 
-A portable adapter should read no clock of its own. An adapter wrapping a library that keeps its own internal clock may still do so — `minip2p-quic` wraps quiche, which reads `Instant::now()` internally — but everything it reports back to the host, deadlines above all, must be expressed on the timeline of the samples it was given. An adapter with its own clock is inherently `std`-only.
+A portable adapter should read no clock of its own. An adapter that needs finer time than the host's millisecond samples may still keep a clock — `minip2p-quic` samples `Instant::now()` once per poll and runs its QUIC engine's timers on that — but everything it reports back to the host, deadlines above all, must be expressed on the timeline of the samples it was given. An adapter with its own clock is inherently `std`-only.
 
 ## Blocking waits (`std` only)
 
@@ -157,4 +157,4 @@ minip2p-transport = { path = "crates/transport", default-features = false }
 
 ## Scope
 
-This crate defines the transport contract only. Concrete adapters live in separate crates: `minip2p-tcp` (`no_std + alloc`, over a pluggable byte-stream provider) and `minip2p-quic` (`std`-only, quiche-based).
+This crate defines the transport contract only. Concrete adapters live in separate crates: `minip2p-tcp` (`no_std + alloc`, over a pluggable byte-stream provider) and `minip2p-quic` (`std`-only, quinn-proto-based).
