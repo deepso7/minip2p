@@ -823,6 +823,15 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
         self
     }
 
+    /// Sets how long, in milliseconds, a peer's new connection can lose a race
+    /// to its current one. Default
+    /// [`SIMULTANEOUS_DIAL_WINDOW_MS`](minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS);
+    /// both peers should use the same window.
+    pub fn simultaneous_dial_window_ms(mut self, ms: u64) -> Self {
+        self.swarm = self.swarm.simultaneous_dial_window_ms(ms);
+        self
+    }
+
     /// Sets the Connection-attempt deadline in milliseconds. Default 30_000.
     pub fn connect_deadline_ms(mut self, ms: u64) -> Self {
         self.connect_deadline_ms = ms;

@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use minip2p::{ConnectionId, Ed25519Keypair, Endpoint, EndpointEvent, PeerId};
+use minip2p::{ConnectionId, Ed25519Keypair, Endpoint, EndpointBuilder, EndpointEvent, PeerId};
 
 #[path = "../../../tests/support/endpoint.rs"]
 mod endpoint_support;
@@ -22,9 +22,11 @@ const CHURN_ROUNDS: usize = 50;
 const RECLAIM_BACKSTOP: Duration = Duration::from_secs(5);
 /// Failure backstop for a driver thread whose stop signal never arrives.
 const DRIVER_BACKSTOP: Duration = Duration::from_secs(30);
-/// Comfortably past the swarm's race window.
-const PAST_RACE_WINDOW: Duration =
-    Duration::from_millis(minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS + 500);
+/// The race window for the close-drain tests, which wait it out rather than
+/// race inside it; the default 5 s would only add wall-clock time.
+const RACE_WINDOW: Duration = Duration::from_millis(250);
+/// Comfortably past [`RACE_WINDOW`].
+const PAST_RACE_WINDOW: Duration = Duration::from_millis(500);
 
 fn wait_peer_ready(
     listener: &mut Endpoint,
@@ -157,7 +159,16 @@ fn spawn_driver(mut endpoint: Endpoint, what: &'static str) -> Driver {
 }
 
 fn bind_loopback() -> Endpoint {
-    Endpoint::builder()
+    bind_from(Endpoint::builder())
+}
+
+/// An endpoint builder with the short [`RACE_WINDOW`].
+fn short_window() -> EndpointBuilder {
+    Endpoint::builder().simultaneous_dial_window(RACE_WINDOW)
+}
+
+fn bind_from(builder: EndpointBuilder) -> Endpoint {
+    builder
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")
         .bind()
@@ -238,12 +249,12 @@ fn listener_reclaims_state_after_dialer_drop_during_handshake() {
 
 #[test]
 fn close_drains_replacement_connection() {
-    let mut listener = bind_loopback();
+    let mut listener = bind_from(short_window());
     let listener_addr = listener.listen().expect("listener listens");
     let listener_peer = listener.peer_id().clone();
 
     let dialer_key = Ed25519Keypair::generate();
-    let mut dialer = Endpoint::builder()
+    let mut dialer = short_window()
         .identity(dialer_key.clone())
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")
@@ -256,7 +267,7 @@ fn close_drains_replacement_connection() {
 
     // Queue a same-peer handshake without polling the listener, so close()
     // is the first drive that can establish the replacement.
-    let mut replacement = Endpoint::builder()
+    let mut replacement = short_window()
         .identity(dialer_key)
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")
@@ -295,12 +306,12 @@ fn close_drains_replacement_connection() {
 
 #[test]
 fn close_drains_pending_replacement_handshake() {
-    let mut listener = bind_loopback();
+    let mut listener = bind_from(short_window());
     let listener_addr = listener.listen().expect("listener listens");
     let listener_peer = listener.peer_id().clone();
 
     let dialer_key = Ed25519Keypair::generate();
-    let mut dialer = Endpoint::builder()
+    let mut dialer = short_window()
         .identity(dialer_key.clone())
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")
@@ -311,7 +322,7 @@ fn close_drains_pending_replacement_handshake() {
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
     outlive_race_window(&mut listener, &mut dialer);
 
-    let mut replacement = Endpoint::builder()
+    let mut replacement = short_window()
         .identity(dialer_key)
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")

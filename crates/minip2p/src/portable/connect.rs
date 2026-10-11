@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 
 use minip2p_core::{PeerAddr, PeerId};
 use minip2p_platform::{Deadline, EntropySource};
-use minip2p_swarm::{SIMULTANEOUS_DIAL_WINDOW_MS, SwarmCore, SwarmEvent};
+use minip2p_swarm::{SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, Transport};
 
 use super::event_stream::EndpointEvent;
@@ -679,7 +679,7 @@ impl ConnectEngine {
     /// Settling on a direct connection keeps the attempt's other direct dials
     /// open rather than aborting them: the peer may already have accepted
     /// one, and the swarm settles such races the same way on both sides
-    /// (`SIMULTANEOUS_DIAL_WINDOW_MS`) only if both sides see both
+    /// (within its simultaneous-dial window) only if both sides see both
     /// connections. Against our own dial they race by connection token;
     /// against the peer's dial, when we are the lower peer, ours can only
     /// replace it. Their failures stay inside the engine, and they stay
@@ -737,7 +737,7 @@ impl ConnectEngine {
             if let Some(retained) = self.retained.get_mut(peer_id) {
                 retained.expires_ms = retained
                     .expires_ms
-                    .max(now_ms.saturating_add(SIMULTANEOUS_DIAL_WINDOW_MS));
+                    .max(now_ms.saturating_add(runtime.simultaneous_dial_window_ms()));
             }
         } else if !circuit {
             // The peer's dial won as the lower peer: every dial of ours now
@@ -769,7 +769,7 @@ impl ConnectEngine {
                     let pending: Vec<ConnectionId> = pending.collect();
                     self.suppressed.extend(pending.iter().copied());
                     // A later settle opens a new window for every kept dial.
-                    let expires_ms = now_ms.saturating_add(SIMULTANEOUS_DIAL_WINDOW_MS);
+                    let expires_ms = now_ms.saturating_add(runtime.simultaneous_dial_window_ms());
                     if let Some(retained) = self.retained.get_mut(peer_id) {
                         retained.expires_ms = retained.expires_ms.max(expires_ms);
                         retained.dials.extend(pending);
@@ -1155,6 +1155,7 @@ mod tests {
     };
 
     use super::*;
+    use minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS;
 
     fn peer(label: &[u8]) -> PeerId {
         PeerId::from_public_key_protobuf(label)
@@ -1572,30 +1573,43 @@ mod tests {
 
     #[test]
     fn winner_keeps_losers_until_the_window_ends() {
-        let peer = peer(b"winner");
-        let first = addr(&peer, 1);
-        let second = addr(&peer, 2);
-        let mut runtime = runtime(FakeTransport::default());
-        let mut engine = ConnectEngine::new(30_000);
-        let _id = engine.connect(
-            ConnectTarget::try_from(vec![first, second.clone()]).expect("same peer"),
-            &mut runtime,
-            0,
-        );
-        runtime
-            .transport_mut()
-            .push_connected(ConnectionId::new(1), peer, second);
-        let _ = drain(&mut engine, &mut runtime, 0);
-        // The peer may already have accepted the loser and kept it, so it
-        // stays up for the swarm's race to settle on both sides.
-        assert!(runtime.transport().closes.is_empty());
-        assert_eq!(
-            engine.next_deadline(),
-            Some(Deadline::from_millis(SIMULTANEOUS_DIAL_WINDOW_MS))
-        );
-        let _ = drain(&mut engine, &mut runtime, SIMULTANEOUS_DIAL_WINDOW_MS);
-        assert_eq!(runtime.transport().closes, vec![ConnectionId::new(2)]);
-        assert!(engine.suppressed.is_empty() && engine.retained.is_empty());
+        let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
+        // The default window, and one the swarm was configured with.
+        let configured = SwarmBuilder::new(&identity)
+            .simultaneous_dial_window_ms(200)
+            .build_core(FakeTransport::default(), SeqEntropy(1))
+            .expect("runtime");
+        for (mut runtime, window_ms) in [
+            (
+                runtime(FakeTransport::default()),
+                SIMULTANEOUS_DIAL_WINDOW_MS,
+            ),
+            (configured, 200),
+        ] {
+            let peer = peer(b"winner");
+            let first = addr(&peer, 1);
+            let second = addr(&peer, 2);
+            let mut engine = ConnectEngine::new(30_000);
+            let _id = engine.connect(
+                ConnectTarget::try_from(vec![first, second.clone()]).expect("same peer"),
+                &mut runtime,
+                0,
+            );
+            runtime
+                .transport_mut()
+                .push_connected(ConnectionId::new(1), peer, second);
+            let _ = drain(&mut engine, &mut runtime, 0);
+            // The peer may already have accepted the loser and kept it, so it
+            // stays up for the swarm's race to settle on both sides.
+            assert!(runtime.transport().closes.is_empty());
+            assert_eq!(
+                engine.next_deadline(),
+                Some(Deadline::from_millis(window_ms))
+            );
+            let _ = drain(&mut engine, &mut runtime, window_ms);
+            assert_eq!(runtime.transport().closes, vec![ConnectionId::new(2)]);
+            assert!(engine.suppressed.is_empty() && engine.retained.is_empty());
+        }
     }
 
     #[test]

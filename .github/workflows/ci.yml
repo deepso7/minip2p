@@ -16,6 +16,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Backtraces keep file and line, but builds skip full debuginfo: a cold
+  # workspace test build is about a third faster and its target dir about half
+  # the size, which keeps the shared Actions cache under its quota.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   # Pinned so a nextest release can't change test selection under us. Bump
   # deliberately, like the other pinned tools below.
   NEXTEST_VERSION: 0.9.143
