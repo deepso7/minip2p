@@ -1048,20 +1048,26 @@ impl QuicConnection {
     }
 
     /// Our write half is gone for good, so queued writes are dropped. The
-    /// read half stays open until the peer finishes. Emitted once, and never
-    /// after the stream's StreamClosed.
+    /// read half stays open until the peer finishes. The event is emitted
+    /// once, and never after the stream's StreamClosed; the queue is dropped
+    /// either way, since a stream closed with writes still queued (FIN read,
+    /// write side closed locally) would otherwise keep retrying a reset half.
     fn note_write_stopped(&mut self, raw: u64, error_code: u64, events: &mut Vec<TransportEvent>) {
         let Some(state) = self.stream_states.get_mut(&raw) else {
             return;
         };
-        if state.write_stopped || state.closed_notified {
+        if state.write_stopped {
             return;
         }
         state.write_stopped = true;
         state.local_write_closed = true;
+        let closed = state.closed_notified;
         self.drop_send_queue(raw);
         self.disarm_writable(raw, events);
         self.wake_writable(events);
+        if closed {
+            return;
+        }
         events.push(TransportEvent::StreamWriteStopped {
             id: self.id,
             stream_id: StreamId::new(raw),

@@ -418,6 +418,55 @@ fn a_peer_reset_releases_the_send_half_and_returns_stream_credit() {
     reuse_the_slot(&mut server, &mut peer);
 }
 
+/// A stream can report StreamClosed with writes still queued: our side
+/// closed its write half behind queued bytes and the peer's FIN arrived. A
+/// later STOP_SENDING must still drop that queue (no event follows the close)
+/// rather than leave it retrying a send half the engine has reset.
+#[test]
+fn a_stop_after_stream_closed_still_drops_its_queued_writes() {
+    let (mut server, mut peer, id, raw) = one_slot_with_buffered_output();
+    let stream = StreamId::new(raw);
+    server.close_stream_write(id, stream).expect("close write");
+    peer.finish(raw);
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "close",
+        |events| {
+            events.contains(&TransportEvent::StreamClosed {
+                id,
+                stream_id: stream,
+            })
+        },
+    );
+    assert!(
+        server.connections[&id].pending_write_bytes() > 0,
+        "still queued"
+    );
+
+    peer.stop(raw, 3);
+    await_peer_reset(&mut server, &mut peer);
+    events.extend(server.poll(now()).expect("poll"));
+    assert_eq!(server.connections[&id].pending_write_bytes(), 0);
+    let after_close: Vec<_> = stream_events(&events, raw)
+        .into_iter()
+        .skip_while(|event| !matches!(event, TransportEvent::StreamClosed { .. }))
+        .skip(1)
+        .collect();
+    assert!(
+        after_close.is_empty(),
+        "nothing after StreamClosed: {after_close:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Error { .. })),
+        "the connection must not fail: {events:?}"
+    );
+}
+
 #[test]
 fn stop_sending_resets_the_send_half_keeps_the_read_half_and_frees_the_slot() {
     let (mut server, mut peer, id, raw) = one_slot_with_buffered_output();

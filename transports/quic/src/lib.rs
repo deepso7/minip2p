@@ -854,6 +854,9 @@ impl QuicTransport {
         match self.endpoint.accept(incoming, now, buf, None) {
             Ok((handle, conn)) => {
                 socket.connections += 1;
+                // The accepted Initial never passes through `handle_event`.
+                let mut counters = ConnectionCounters::default();
+                counters.datagram_received();
                 let endpoint =
                     ConnectionEndpoint::new(socket_addr_to_multiaddr(conn.remote_address()));
                 let conn = QuicConnection::new(
@@ -863,7 +866,7 @@ impl QuicTransport {
                     endpoint.clone(),
                     limits.max_streams_per_connection,
                     limits.max_pending_stream_bytes,
-                    ConnectionCounters::default(),
+                    counters,
                 );
                 self.connections.insert(id, conn);
                 self.handles.insert(handle, id);
