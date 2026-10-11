@@ -1,5 +1,6 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
+use core::ops::Bound;
 
 use minip2p_core::{Bytes, retain_slice};
 use minip2p_platform::{Deadline, Now};
@@ -791,9 +792,10 @@ impl YamuxSession {
     /// `FIN` once its accepted bytes have all gone.
     fn data_frame(&mut self) -> Option<Vec<u8>> {
         let after = self.send_cursor;
+        // Exclusive, so a sendable `u32::MAX` cannot keep the turn.
         let stream = *self
             .sendable
-            .range(after.saturating_add(1)..)
+            .range((Bound::Excluded(after), Bound::Unbounded))
             .chain(self.sendable.range(..=after))
             .next()?;
         self.send_cursor = stream;
@@ -1254,6 +1256,22 @@ mod tests {
         assert_eq!(next(&mut client), (b, b"b2".to_vec()));
         assert_eq!(next(&mut client), (a, b"a3".to_vec()));
         assert_eq!(client.poll_frame(), None);
+    }
+
+    #[test]
+    fn the_highest_stream_id_does_not_starve_the_rotation() {
+        let mut limits = config();
+        limits.max_frame_len = 2;
+        let mut server = YamuxSession::with_config(YamuxRole::Server, limits).unwrap();
+        for stream in [1, u32::MAX] {
+            let syn = Frame::window_update(stream, FLAG_SYN, 0).unwrap().encode();
+            server.handle_data(&syn).unwrap();
+            server.send(stream, Bytes::from(b"xxxx".to_vec())).unwrap();
+        }
+        let order: Vec<_> = core::iter::from_fn(|| server.poll_frame())
+            .map(|frame| decode(&frame).stream_id())
+            .collect();
+        assert_eq!(order, [1, u32::MAX, 1, u32::MAX]);
     }
 
     #[test]
