@@ -26,6 +26,8 @@ use quinn_proto::{
 };
 use socket2::{Domain, Protocol as SocketProtocol, Socket as RawSocket, Type};
 
+#[cfg(test)]
+mod admission_tests;
 mod config;
 mod connection;
 mod diagnostics;
@@ -34,6 +36,8 @@ mod recv_batch_tests;
 mod socket;
 #[cfg(test)]
 mod stream_send_tests;
+#[cfg(test)]
+mod stream_tests;
 #[cfg(test)]
 mod test_peer;
 mod tls;
@@ -1086,6 +1090,16 @@ impl QuicTransport {
             self.remove_connection(id);
         }
         failure
+    }
+
+    /// Replaces the server config, also on the endpoint once listening.
+    #[cfg(test)]
+    fn update_server_config(&mut self, update: impl FnOnce(&mut ServerConfig)) {
+        update(Arc::make_mut(&mut self.server_config));
+        if self.listening {
+            self.endpoint
+                .set_server_config(Some(Arc::clone(&self.server_config)));
+        }
     }
 
     /// Forgets a drained connection and reports it closed.

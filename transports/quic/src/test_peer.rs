@@ -9,11 +9,11 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_platform::Now;
 use minip2p_transport::{ConnectionId, Transport, TransportEvent};
-use quinn_proto::crypto::rustls::QuicClientConfig;
+use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn_proto::{
     ClientConfig, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig,
     Event, ServerConfig, StreamId, TransportConfig, VarInt,
@@ -72,15 +72,7 @@ impl RawPeer {
     /// Starts a handshake to `server` with a libp2p identity; `tune` adjusts
     /// the credit and limits the peer grants.
     pub(crate) fn connect(server: SocketAddr, tune: impl FnOnce(&mut TransportConfig)) -> Self {
-        let tls = TlsIdentity::new(&Ed25519Keypair::generate(), Arc::new(HostTime::default()))
-            .expect("identity");
-        let crypto = QuicClientConfig::try_from(tls.client_config(None).expect("client tls"))
-            .expect("quic client tls");
-        let mut transport = default_transport();
-        tune(&mut transport);
-        let mut config = ClientConfig::new(Arc::new(crypto));
-        config.transport_config(Arc::new(transport));
-        Self::connect_with(server, config)
+        Self::connect_with(server, client_config(tune))
     }
 
     /// Starts a handshake to `server` with an arbitrary client config.
@@ -94,6 +86,20 @@ impl RawPeer {
         peer.conn = Some(conn);
         peer.pump();
         peer
+    }
+
+    /// A listener with a libp2p identity that accepts one connection.
+    pub(crate) fn listen(keypair: &Ed25519Keypair) -> Self {
+        let tls = TlsIdentity::new(keypair, Arc::new(HostTime::default())).expect("identity");
+        let crypto = QuicServerConfig::try_from(tls.server_config().expect("server tls"))
+            .expect("quic server tls");
+        let mut config = ServerConfig::with_crypto(Arc::new(crypto));
+        config.transport_config(Arc::new(default_transport()));
+        Self::bind(Some(Arc::new(config)))
+    }
+
+    pub(crate) fn local_addr(&self) -> SocketAddr {
+        self.socket.local_addr().expect("peer addr")
     }
 
     pub(crate) fn conn(&mut self) -> &mut Connection {
@@ -252,6 +258,35 @@ impl RawPeer {
         let _credit = chunks.finalize();
         (data, fin)
     }
+
+    /// Whether the connection is closed or gone.
+    pub(crate) fn is_closed(&mut self) -> bool {
+        self.conn.as_mut().is_none_or(|conn| conn.is_closed())
+    }
+}
+
+/// A client config with a fresh libp2p identity; `tune` adjusts the credit
+/// and limits the peer grants.
+pub(crate) fn client_config(tune: impl FnOnce(&mut TransportConfig)) -> ClientConfig {
+    let tls = TlsIdentity::new(&Ed25519Keypair::generate(), Arc::new(HostTime::default()))
+        .expect("identity");
+    let crypto = QuicClientConfig::try_from(tls.client_config(None).expect("client tls"))
+        .expect("quic client tls");
+    let mut transport = default_transport();
+    tune(&mut transport);
+    let mut config = ClientConfig::new(Arc::new(crypto));
+    config.transport_config(Arc::new(transport));
+    config
+}
+
+/// Datagrams waiting on `socket`, taken.
+pub(crate) fn take_datagrams(socket: &UdpSocket) -> Vec<Vec<u8>> {
+    let mut buf = [0u8; 65_535];
+    let mut datagrams = Vec::new();
+    while let Ok((len, _)) = socket.recv_from(&mut buf) {
+        datagrams.push(buf[..len].to_vec());
+    }
+    datagrams
 }
 
 /// A listening transport on loopback with `limits`.
@@ -343,4 +378,11 @@ pub(crate) fn stream_bytes(events: &[TransportEvent], stream: u64) -> Vec<u8> {
         .flatten()
         .copied()
         .collect()
+}
+
+/// The size of the allocation behind `data`, which must own it alone.
+pub(crate) fn allocation_len(data: Bytes) -> usize {
+    data.try_into_mut()
+        .map(|unique| unique.capacity())
+        .expect("copied stream data owns its allocation")
 }

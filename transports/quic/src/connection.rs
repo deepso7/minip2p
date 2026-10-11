@@ -310,6 +310,18 @@ impl QuicConnection {
         self.send_queues.len()
     }
 
+    /// Local stream slots in use: opened streams still held plus pending
+    /// opens.
+    #[cfg(test)]
+    pub(crate) fn local_slots_used(&self) -> u64 {
+        self.bound_local_bidi_streams + self.pending_opens.len() as u64
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_gated(&self, stream_id: StreamId) -> bool {
+        self.gated.contains(&stream_id.as_u64())
+    }
+
     #[cfg(test)]
     pub(crate) fn engine(&mut self) -> &mut quinn_proto::Connection {
         &mut self.conn
