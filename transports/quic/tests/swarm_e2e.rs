@@ -400,7 +400,7 @@ fn open_stream_fails_fast_when_peer_did_not_advertise_protocol() {
 /// This covers the prior behavior where `SwarmCore` passed an empty
 /// `observed_addr` byte vector into the Identify responder. The fix plumbs
 /// the transport endpoint cached on `TransportEvent::Connected` /
-/// `IncomingConnection` into `IdentifyInput::RegisterOutboundStream`.
+/// `IncomingConnection` into `IdentifyProtocol::register_outbound_stream`.
 ///
 /// Note: we intentionally only assert the client-observed direction. The
 /// symmetric server-observed case (the server learning the client's PeerId

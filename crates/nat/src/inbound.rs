@@ -14,9 +14,9 @@
 
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, Protocol, SansIoProtocol, select_direct_addrs};
-use minip2p_dcutr::{DcutrInitiator, DcutrInitiatorInput, DcutrInitiatorOutput, InitiatorOutcome};
-use minip2p_relay::{Status, StopResponder, StopResponderInput, StopResponderOutput};
+use minip2p_core::{Multiaddr, PeerId, Protocol, select_direct_addrs};
+use minip2p_dcutr::{DcutrError, DcutrInitiator, DcutrInitiatorOutput, InitiatorOutcome};
+use minip2p_relay::{RelayError, Status, StopResponder, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
 
 use crate::agent::{Shared, StreamInput, StreamRole, TokenPurpose, reset, send};
@@ -42,7 +42,9 @@ pub(crate) struct InboundCircuit {
     /// The initiating peer, once the STOP CONNECT names it.
     source: Option<PeerId>,
     stop: Option<StopResponder>,
-    dcutr: Option<DcutrInitiator>,
+    /// The initiator for the opened DCUtR stream, or the error that kept it
+    /// from being built, reported once the stream is ready.
+    dcutr: Option<Result<DcutrInitiator, DcutrError>>,
     /// The DCUtR stream this peer opened, on the promoted circuit.
     dcutr_stream: Option<(ConnectionId, StreamId)>,
     /// Monotonic time when the initial DCUtR CONNECT was queued to the
@@ -150,8 +152,7 @@ impl InboundCircuit {
         match input {
             StreamInput::Data(data) => {
                 if self.source.is_none() {
-                    let input = StopResponderInput::Data(data.to_vec());
-                    self.on_stop_input(input, swarm, shared, now);
+                    self.on_stop_input(|stop| stop.on_data(data), swarm, shared, now);
                 }
             }
             StreamInput::RemoteWriteClosed => {
@@ -159,8 +160,7 @@ impl InboundCircuit {
                 // usable. Let the protocol parser consume that boundary and
                 // retain the circuit until its normal exchange deadline.
                 if self.source.is_none() {
-                    let input = StopResponderInput::RemoteWriteClosed;
-                    self.on_stop_input(input, swarm, shared, now);
+                    self.on_stop_input(StopResponder::on_remote_write_closed, swarm, shared, now);
                 }
             }
             StreamInput::Closed => {
@@ -175,7 +175,7 @@ impl InboundCircuit {
     /// auto-accepts and hands the bridge to circuit promotion.
     fn on_stop_input(
         &mut self,
-        input: StopResponderInput,
+        feed: impl FnOnce(&mut StopResponder) -> Result<(), RelayError>,
         swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
         now: Now,
@@ -183,7 +183,7 @@ impl InboundCircuit {
         let Some(stop) = self.stop.as_mut() else {
             return;
         };
-        if stop.handle_input(input).is_err() {
+        if feed(stop).is_err() {
             self.abandon(true, swarm, shared, now);
             return;
         }
@@ -200,10 +200,7 @@ impl InboundCircuit {
 
         let Ok(source) = PeerId::from_bytes(&request.source_peer_id) else {
             // Unusable source identity: reject and drop the circuit.
-            if stop
-                .handle_input(StopResponderInput::Reject(Status::MalformedMessage))
-                .is_err()
-            {
+            if stop.reject(Status::MalformedMessage).is_err() {
                 self.abandon(true, swarm, shared, now);
                 return;
             }
@@ -220,7 +217,7 @@ impl InboundCircuit {
             return;
         };
 
-        if stop.handle_input(StopResponderInput::Accept).is_err() {
+        if stop.accept().is_err() {
             self.abandon(true, swarm, shared, now);
             return;
         }
@@ -492,23 +489,24 @@ impl InboundCircuit {
         let Some((conn, _)) = self.dcutr_stream.filter(|(_, s)| *s == stream) else {
             return;
         };
-        let Some(dcutr) = self.dcutr.as_mut() else {
-            return;
-        };
+        let rtt_ms = self
+            .dcutr_connect_sent_at
+            .map_or(0, |sent_at| now.mono_ms.saturating_sub(sent_at));
         let remote_closed = matches!(&input, StreamInput::RemoteWriteClosed | StreamInput::Closed);
-        let machine_input = match input {
-            StreamInput::Ready => DcutrInitiatorInput::Flush,
-            StreamInput::Data(bytes) => DcutrInitiatorInput::Data {
-                bytes: bytes.to_vec(),
-                rtt_ms: self
-                    .dcutr_connect_sent_at
-                    .map_or(0, |sent_at| now.mono_ms.saturating_sub(sent_at)),
-            },
-            StreamInput::RemoteWriteClosed | StreamInput::Closed => {
-                DcutrInitiatorInput::RemoteWriteClosed
+        let dcutr = match self.dcutr.as_mut() {
+            Some(Ok(dcutr)) => dcutr,
+            Some(Err(_)) => {
+                self.finish_dcutr(swarm, shared, now);
+                self.done = true;
+                return;
             }
+            None => return,
         };
-        if dcutr.handle_input(machine_input).is_err() {
+        // CONNECT is queued at construction and drained below on any input;
+        // a remote close is judged by whether the exchange completed.
+        if let StreamInput::Data(bytes) = input
+            && dcutr.on_data(bytes, rtt_ms).is_err()
+        {
             self.finish_dcutr(swarm, shared, now);
             self.done = true;
             return;
@@ -555,7 +553,7 @@ impl InboundCircuit {
                             until: blast_until,
                         });
                     }
-                    if dcutr.handle_input(DcutrInitiatorInput::SendSync).is_ok() {
+                    if dcutr.send_sync().is_ok() {
                         while let Some(DcutrInitiatorOutput::Outbound(data)) = dcutr.poll_output() {
                             if let Some(peer) = self.source.as_ref() {
                                 send(swarm, peer, conn, stream, data, now);

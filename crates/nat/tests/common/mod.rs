@@ -8,8 +8,8 @@
     reason = "each integration test imports only the shared helpers it needs"
 )]
 
-use minip2p_autonat::{AutoNatServer, AutoNatServerInput, AutoNatServerOutput, ResponseStatus};
-use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, SansIoProtocol};
+use minip2p_autonat::{AutoNatServer, AutoNatServerOutput, ResponseStatus};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
 use minip2p_dcutr::{
     FrameDecode, HolePunch, HolePunchType, decode_frame as dcutr_decode_frame,
     encode_frame as dcutr_encode_frame,
@@ -163,22 +163,16 @@ pub fn hop_reserve_ok(expire_unix_secs: Option<u64>) -> Vec<u8> {
 pub fn autonat_response(request_bytes: &[u8], public_addrs: Option<&[Multiaddr]>) -> Vec<u8> {
     let mut server = AutoNatServer::new();
     server
-        .handle_input(AutoNatServerInput::Data(request_bytes.to_vec()))
+        .on_data(request_bytes)
         .expect("well-formed AutoNAT request");
     assert!(matches!(
         server.poll_output(),
         Some(AutoNatServerOutput::Request(_))
     ));
-    let response = match public_addrs {
-        Some(addrs) => AutoNatServerInput::RespondPublic {
-            addrs: addrs.to_vec(),
-        },
-        None => AutoNatServerInput::RespondError {
-            status: ResponseStatus::DialError,
-            reason: "dial-back failed".into(),
-        },
-    };
-    server.handle_input(response).expect("respond");
+    match public_addrs {
+        Some(addrs) => server.respond_public(addrs),
+        None => server.respond_error(ResponseStatus::DialError, "dial-back failed"),
+    }
     match server.poll_output() {
         Some(AutoNatServerOutput::Outbound(bytes)) => bytes,
         other => panic!("expected outbound response, got {other:?}"),

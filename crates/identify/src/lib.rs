@@ -14,12 +14,11 @@ mod message;
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use minip2p_core::{
-    FrameDecode, FrameExchange, FrameFault, Multiaddr, PeerId, SansIoProtocol, decode_frame,
-    encode_frame, uvarint_len,
+    FrameDecode, FrameExchange, FrameFault, Multiaddr, PeerId, decode_frame, encode_frame,
+    uvarint_len,
 };
 use minip2p_transport::StreamId;
 use thiserror::Error;
@@ -48,7 +47,7 @@ const MAX_MESSAGE_PARTS: usize = 2;
 /// auto-populates it from the underlying transport's `local_addresses()`
 /// at send time, so the advertised set always reflects what the peer
 /// is actually listening on. See
-/// [`IdentifyInput::RegisterOutboundStream`].
+/// [`IdentifyProtocol::register_outbound_stream`].
 #[derive(Clone, Debug)]
 pub struct IdentifyConfig {
     /// Protocol version string (e.g. `"ipfs/0.1.0"`).
@@ -106,49 +105,7 @@ pub enum IdentifyEvent {
     },
 }
 
-/// Inputs accepted by [`IdentifyProtocol`] when driven through
-/// [`SansIoProtocol`].
-#[derive(Clone, Debug)]
-pub enum IdentifyInput {
-    /// Register a stream where we send our identify info.
-    RegisterOutboundStream {
-        peer_id: PeerId,
-        stream_id: StreamId,
-        observed_addr: Option<Multiaddr>,
-        listen_addrs: Vec<Multiaddr>,
-    },
-    /// Register a stream where we receive identify info.
-    RegisterInboundStream {
-        peer_id: PeerId,
-        stream_id: StreamId,
-    },
-    /// Received stream data.
-    StreamData {
-        peer_id: PeerId,
-        stream_id: StreamId,
-        data: Vec<u8>,
-    },
-    /// The remote closed its write side.
-    StreamRemoteWriteClosed {
-        peer_id: PeerId,
-        stream_id: StreamId,
-    },
-    /// The stream fully closed.
-    StreamClosed {
-        peer_id: PeerId,
-        stream_id: StreamId,
-    },
-    /// Remove all state for a peer.
-    RemovePeer { peer_id: PeerId },
-    /// Move all peer-scoped state from an old id to a verified id.
-    MigratePeer {
-        old_peer_id: PeerId,
-        new_peer_id: PeerId,
-    },
-}
-
-/// Outputs produced by [`IdentifyProtocol`] when driven through
-/// [`SansIoProtocol`].
+/// Outputs produced by [`IdentifyProtocol::poll_output`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IdentifyOutput {
     /// Command the host must execute.
@@ -191,17 +148,16 @@ struct PeerIdentifyState {
 
 /// Sans-IO state machine for the identify protocol.
 ///
-/// Drive this through [`SansIoProtocol`]: feed [`IdentifyInput`] values with
-/// [`SansIoProtocol::handle_input`], execute [`IdentifyOutput::Action`]
-/// commands against the transport, surface [`IdentifyOutput::Event`]
-/// notifications to the application, and keep draining
-/// [`SansIoProtocol::poll_output`] until [`SansIoProtocol::is_idle`] is true.
+/// Feed stream lifecycle and data through its methods, then drain
+/// [`IdentifyProtocol::poll_output`] until it returns `None`: execute
+/// [`IdentifyOutput::Action`] commands against the transport and surface
+/// [`IdentifyOutput::Event`] notifications to the application.
 pub struct IdentifyProtocol {
     /// Per-peer identify state.
     peers: BTreeMap<PeerId, PeerIdentifyState>,
     /// Buffered events for the host to poll.
     events: VecDeque<IdentifyEvent>,
-    /// Actions buffered for [`SansIoProtocol::poll_output`].
+    /// Actions buffered for [`IdentifyProtocol::poll_output`].
     actions: VecDeque<IdentifyAction>,
     /// Local identify info used when responding.
     config: IdentifyConfig,
@@ -236,15 +192,15 @@ impl IdentifyProtocol {
     /// set, typically snapshotted from the transport by the swarm
     /// driver so it stays in sync with what we're actually bound to.
     ///
-    /// The returned actions send our identify message and close the write
+    /// Queues actions that send our identify message and close the write
     /// side.
-    fn register_outbound_stream(
+    pub fn register_outbound_stream(
         &mut self,
         peer_id: PeerId,
         stream_id: StreamId,
         observed_addr: Option<Multiaddr>,
         listen_addrs: &[Multiaddr],
-    ) -> Result<Vec<IdentifyAction>, IdentifyError> {
+    ) -> Result<(), IdentifyError> {
         if self
             .peers
             .get(&peer_id)
@@ -293,14 +249,14 @@ impl IdentifyProtocol {
             .or_default()
             .outbound_stream = Some(stream_id);
 
-        Ok(vec![
-            IdentifyAction::Send {
-                peer_id: peer_id.clone(),
-                stream_id,
-                data,
-            },
-            IdentifyAction::CloseStreamWrite { peer_id, stream_id },
-        ])
+        self.actions.push_back(IdentifyAction::Send {
+            peer_id: peer_id.clone(),
+            stream_id,
+            data,
+        });
+        self.actions
+            .push_back(IdentifyAction::CloseStreamWrite { peer_id, stream_id });
+        Ok(())
     }
 
     /// Registers a stream where we are the **initiator** (receiving their info).
@@ -308,7 +264,7 @@ impl IdentifyProtocol {
     /// Call this after multistream-select negotiates `/ipfs/id/1.0.0` on an
     /// outbound stream. The protocol will buffer incoming data until the
     /// remote closes its write side.
-    fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) {
+    pub fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) {
         let state = self.peers.entry(peer_id).or_default();
         state.inbound_streams.entry(stream_id).or_insert_with(|| {
             // Room for every part at its maximum: the first frame is covered by
@@ -320,20 +276,15 @@ impl IdentifyProtocol {
 
     /// Feed received stream data into the protocol.
     ///
-    /// Returns actions the host must execute: none while a message is still
-    /// arriving, and a reset if the bytes are refused.
-    fn on_stream_data(
-        &mut self,
-        peer_id: PeerId,
-        stream_id: StreamId,
-        data: Vec<u8>,
-    ) -> Vec<IdentifyAction> {
+    /// Queues nothing while a message is still arriving, and a reset if the
+    /// bytes are refused.
+    pub fn on_stream_data(&mut self, peer_id: PeerId, stream_id: StreamId, data: &[u8]) {
         let Some(state) = self.peers.get_mut(&peer_id) else {
-            return Vec::new();
+            return;
         };
 
         if let Some(frames) = state.inbound_streams.get_mut(&stream_id)
-            && let Err(fault) = frames.push(&data)
+            && let Err(fault) = frames.push(data)
         {
             // The bytes are refused before they are buffered: nothing legal
             // can still be growing towards one identify message.
@@ -348,10 +299,9 @@ impl IdentifyProtocol {
             // that never sends one would otherwise keep the stream — and its
             // swarm and transport state — allocated for the life of the
             // connection.
-            return vec![IdentifyAction::ResetStream { peer_id, stream_id }];
+            self.actions
+                .push_back(IdentifyAction::ResetStream { peer_id, stream_id });
         }
-
-        Vec::new()
     }
 
     /// Notify that the remote peer closed its write side on a stream.
@@ -361,17 +311,13 @@ impl IdentifyProtocol {
     /// one [`IdentifyEvent::Received`]. The initiator closes its own write
     /// side in response so that the stream can reach the `Closed` state and
     /// have its transport-level and protocol-level state reclaimed.
-    fn on_stream_remote_write_closed(
-        &mut self,
-        peer_id: PeerId,
-        stream_id: StreamId,
-    ) -> Vec<IdentifyAction> {
+    pub fn on_stream_remote_write_closed(&mut self, peer_id: PeerId, stream_id: StreamId) {
         let Some(state) = self.peers.get_mut(&peer_id) else {
-            return Vec::new();
+            return;
         };
 
         let Some(mut frames) = state.inbound_streams.remove(&stream_id) else {
-            return Vec::new();
+            return;
         };
 
         self.events.push_back(match merge_parts(&mut frames) {
@@ -392,11 +338,12 @@ impl IdentifyProtocol {
         // stream never transitions to `Closed` and both the swarm's
         // stream_owner entry and the transport's per-stream state leak for
         // the lifetime of the connection.
-        vec![IdentifyAction::CloseStreamWrite { peer_id, stream_id }]
+        self.actions
+            .push_back(IdentifyAction::CloseStreamWrite { peer_id, stream_id });
     }
 
     /// Notify that a stream was fully closed.
-    fn on_stream_closed(&mut self, peer_id: PeerId, stream_id: StreamId) {
+    pub fn on_stream_closed(&mut self, peer_id: PeerId, stream_id: StreamId) {
         let Some(state) = self.peers.get_mut(&peer_id) else {
             return;
         };
@@ -413,7 +360,7 @@ impl IdentifyProtocol {
     }
 
     /// Remove all state for a peer.
-    fn remove_peer(&mut self, peer_id: &PeerId) {
+    pub fn remove_peer(&mut self, peer_id: &PeerId) {
         self.peers.remove(peer_id);
     }
 
@@ -423,7 +370,7 @@ impl IdentifyProtocol {
     /// initially registering the connection under a placeholder. Any buffered
     /// events referencing `old_peer_id` are rewritten to `new_peer_id` so the
     /// application only ever sees events under the real peer identity.
-    fn migrate_peer(&mut self, old_peer_id: &PeerId, new_peer_id: &PeerId) {
+    pub fn migrate_peer(&mut self, old_peer_id: &PeerId, new_peer_id: &PeerId) {
         if old_peer_id == new_peer_id {
             return;
         }
@@ -490,63 +437,16 @@ fn merge_parts(frames: &mut FrameExchange) -> Result<IdentifyMessage, String> {
     decode(&body)
 }
 
-impl SansIoProtocol for IdentifyProtocol {
-    type Input = IdentifyInput;
-    type Output = IdentifyOutput;
-    type Error = IdentifyError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        match input {
-            IdentifyInput::RegisterOutboundStream {
-                peer_id,
-                stream_id,
-                observed_addr,
-                listen_addrs,
-            } => {
-                let actions = self.register_outbound_stream(
-                    peer_id,
-                    stream_id,
-                    observed_addr,
-                    &listen_addrs,
-                )?;
-                self.actions.extend(actions);
-            }
-            IdentifyInput::RegisterInboundStream { peer_id, stream_id } => {
-                self.register_inbound_stream(peer_id, stream_id);
-            }
-            IdentifyInput::StreamData {
-                peer_id,
-                stream_id,
-                data,
-            } => {
-                let actions = self.on_stream_data(peer_id, stream_id, data);
-                self.actions.extend(actions);
-            }
-            IdentifyInput::StreamRemoteWriteClosed { peer_id, stream_id } => {
-                let actions = self.on_stream_remote_write_closed(peer_id, stream_id);
-                self.actions.extend(actions);
-            }
-            IdentifyInput::StreamClosed { peer_id, stream_id } => {
-                self.on_stream_closed(peer_id, stream_id);
-            }
-            IdentifyInput::RemovePeer { peer_id } => self.remove_peer(&peer_id),
-            IdentifyInput::MigratePeer {
-                old_peer_id,
-                new_peer_id,
-            } => self.migrate_peer(&old_peer_id, &new_peer_id),
-        }
-        Ok(())
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
+impl IdentifyProtocol {
+    /// Returns the next pending output, if any: actions first, then events.
+    ///
+    /// Drain until `None` after every input, before waiting on the
+    /// transport again.
+    pub fn poll_output(&mut self) -> Option<IdentifyOutput> {
         if let Some(action) = self.actions.pop_front() {
             return Some(IdentifyOutput::Action(action));
         }
         self.events.pop_front().map(IdentifyOutput::Event)
-    }
-
-    fn is_idle(&self) -> bool {
-        self.actions.is_empty() && self.events.is_empty()
     }
 }
 
@@ -559,6 +459,11 @@ mod tests {
         /// Drain buffered events (test helper).
         fn poll_events(&mut self) -> Vec<IdentifyEvent> {
             self.events.drain(..).collect()
+        }
+
+        /// Drain buffered actions (test helper).
+        fn poll_actions(&mut self) -> Vec<IdentifyAction> {
+            self.actions.drain(..).collect()
         }
     }
 
@@ -577,18 +482,13 @@ mod tests {
     }
 
     #[test]
-    fn identify_protocol_implements_sans_io_protocol() {
+    fn outbound_identify_is_drained_through_poll_output() {
         let mut identify = IdentifyProtocol::new(sample_config());
         let peer = sample_peer();
         let stream_id = StreamId::new(1);
 
         identify
-            .handle_input(IdentifyInput::RegisterOutboundStream {
-                peer_id: peer.clone(),
-                stream_id,
-                observed_addr: None,
-                listen_addrs: Vec::new(),
-            })
+            .register_outbound_stream(peer.clone(), stream_id, None, &[])
             .expect("register outbound");
 
         assert!(matches!(
@@ -606,7 +506,7 @@ mod tests {
                 stream_id: sid,
             })) if p == peer && sid == stream_id
         ));
-        assert!(identify.is_idle());
+        assert!(identify.poll_output().is_none());
     }
 
     /// Feeds `data` to an initiator stream and returns what the protocol
@@ -617,8 +517,8 @@ mod tests {
         let stream = StreamId::new(3);
 
         initiator.register_inbound_stream(peer.clone(), stream);
-        let _ = initiator.on_stream_data(peer.clone(), stream, data.to_vec());
-        let _ = initiator.on_stream_remote_write_closed(peer, stream);
+        initiator.on_stream_data(peer.clone(), stream, data);
+        initiator.on_stream_remote_write_closed(peer, stream);
         initiator.poll_events()
     }
 
@@ -682,7 +582,8 @@ mod tests {
         let stream = StreamId::new(4);
         identify.register_inbound_stream(peer.clone(), stream);
 
-        let actions = identify.on_stream_data(peer.clone(), stream, more_than_every_part());
+        identify.on_stream_data(peer.clone(), stream, &more_than_every_part());
+        let actions = identify.poll_actions();
 
         assert_eq!(
             actions,
@@ -697,11 +598,8 @@ mod tests {
         ));
         // A half-close racing the reset finds the stream already gone; it
         // must not produce a close.
-        assert!(
-            identify
-                .on_stream_remote_write_closed(peer, stream)
-                .is_empty()
-        );
+        identify.on_stream_remote_write_closed(peer, stream);
+        assert!(identify.poll_actions().is_empty());
     }
 
     #[test]
@@ -864,9 +762,10 @@ mod tests {
                 <Multiaddr as core::str::FromStr>::from_str("/ip4/127.0.0.1/udp/4001/quic-v1")
                     .unwrap(),
             ];
-        let actions = identify
+        identify
             .register_outbound_stream(peer.clone(), stream, None, &listen_addrs)
             .unwrap();
+        let actions = identify.poll_actions();
 
         let data = actions
             .iter()
@@ -913,9 +812,10 @@ mod tests {
         let stream = StreamId::new(7);
 
         // Responder emits the framed bytes.
-        let actions = responder
+        responder
             .register_outbound_stream(i_peer.clone(), stream, None, &[])
             .unwrap();
+        let actions = responder.poll_actions();
         let mut framed = Vec::new();
         for action in actions {
             if let IdentifyAction::Send { data, .. } = action {
@@ -926,8 +826,8 @@ mod tests {
         // Initiator receives byte-for-byte and decodes after the remote
         // half-close.
         initiator.register_inbound_stream(r_peer.clone(), stream);
-        let _ = initiator.on_stream_data(r_peer.clone(), stream, framed);
-        let _ = initiator.on_stream_remote_write_closed(r_peer.clone(), stream);
+        initiator.on_stream_data(r_peer.clone(), stream, &framed);
+        initiator.on_stream_remote_write_closed(r_peer.clone(), stream);
 
         let events = initiator.poll_events();
         assert_eq!(events.len(), 1);

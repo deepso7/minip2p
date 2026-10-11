@@ -1,12 +1,12 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use minip2p_core::{PeerId, SansIoProtocol};
+use minip2p_core::{FrameExchange, FrameFault, PeerId};
 
 use crate::{
-    FrameDecode, HopMessage, HopMessageType, Limit, MAX_PENDING_BRIDGE_SIZE, Peer, RelayError,
-    Reservation, Status, StopMessage, StopMessageType, decode_frame, encode_frame,
-    encode_hop_status, encode_stop_status,
+    HopMessage, HopMessageType, Limit, MAX_PENDING_BRIDGE_SIZE, Peer, RelayError, Reservation,
+    Status, StopMessage, StopMessageType, encode_frame, encode_hop_status, encode_stop_status,
+    handshake_frames,
 };
 
 /// A syntactically valid request received on an inbound HOP stream.
@@ -21,37 +21,7 @@ pub enum HopRequest {
     },
 }
 
-/// Inputs accepted by [`HopResponder`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HopResponderInput {
-    /// Bytes received on the inbound HOP stream.
-    Data(Vec<u8>),
-    /// The remote closed its write side.
-    ///
-    /// A complete request and queued response remain drainable; only an
-    /// incomplete request terminates without a decision.
-    RemoteWriteClosed,
-    /// The remote reset the stream, discarding pending decisions and outputs.
-    RemoteReset,
-    /// Accept a pending RESERVE request.
-    AcceptReservation {
-        /// Reservation metadata returned to the requester.
-        reservation: Reservation,
-        /// Circuit limit advertised with the reservation.
-        limit: Option<Limit>,
-    },
-    /// Accept a pending CONNECT with the advertised circuit limit.
-    AcceptConnect {
-        /// Limit applied to the circuit, or none when unrestricted.
-        limit: Option<Limit>,
-    },
-    /// Reject the pending request with an exact wire status.
-    ///
-    /// `OK` and `UNUSED` are not valid denials and request a stream reset.
-    Reject(Status),
-}
-
-/// Outputs produced by [`HopResponder`].
+/// Outputs produced by [`HopResponder::poll_output`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HopResponderOutput {
     /// A request requiring a service decision.
@@ -87,7 +57,7 @@ enum PendingRequest {
 /// a terminal error are ignored. A remote write close preserves a complete
 /// request and all causally preceding outputs, while a reset discards them.
 pub struct HopResponder {
-    recv_buf: Vec<u8>,
+    frames: FrameExchange,
     outputs: VecDeque<HopResponderOutput>,
     pending_request: Option<PendingRequest>,
     pending_bridge: Vec<u8>,
@@ -100,7 +70,7 @@ impl HopResponder {
     /// Creates a responder waiting for a single HOP request.
     pub fn new() -> Self {
         Self {
-            recv_buf: Vec::new(),
+            frames: handshake_frames(),
             outputs: VecDeque::new(),
             pending_request: None,
             pending_bridge: Vec::new(),
@@ -110,13 +80,18 @@ impl HopResponder {
         }
     }
 
-    fn on_data(&mut self, mut data: Vec<u8>) -> Result<(), RelayError> {
+    /// Feeds bytes received on the inbound HOP stream.
+    ///
+    /// Returns [`RelayError::DecisionPending`] while a request awaits its
+    /// decision; wire failures are reported as outputs, not errors.
+    pub fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
         if self.remote_write_closed {
             return Ok(());
         }
         if self.bridged {
             if !data.is_empty() {
-                self.outputs.push_back(HopResponderOutput::BridgeData(data));
+                self.outputs
+                    .push_back(HopResponderOutput::BridgeData(data.to_vec()));
             }
             return Ok(());
         }
@@ -126,24 +101,24 @@ impl HopResponder {
         if self.pending_request.is_some() {
             return Err(RelayError::DecisionPending);
         }
-        if self.recv_buf.is_empty() {
-            self.recv_buf = data;
-        } else {
-            self.recv_buf.append(&mut data);
-        }
-        let (payload, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (payload, consumed),
-            FrameDecode::Incomplete => return Ok(()),
-            FrameDecode::TooLarge { .. } | FrameDecode::Error(_) => {
+        // Framing faults reset; a well-framed message that fails to decode
+        // gets a status, so the decode result is carried out separately.
+        let decoded = match self.frames.push(data).and_then(|()| {
+            self.frames
+                .next_frame(|payload| Ok::<_, FrameFault>(HopMessage::decode(payload)))
+        }) {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) => return Ok(()),
+            Err(_) => {
                 self.queue_reset();
                 return Ok(());
             }
         };
-        if self.recv_buf.len() - consumed > MAX_PENDING_BRIDGE_SIZE {
+        if self.frames.buffered().len() > MAX_PENDING_BRIDGE_SIZE {
             self.queue_reset();
             return Ok(());
         }
-        let message = match HopMessage::decode(payload) {
+        let message = match decoded {
             Ok(message) => message,
             Err(_) => {
                 self.queue_status_and_close(Status::MalformedMessage);
@@ -173,16 +148,18 @@ impl HopResponder {
                 return Ok(());
             }
         };
+        let pipelined = self.frames.take_buffered();
         if pending_request == PendingRequest::Connect {
-            self.pending_bridge = self.recv_buf.split_off(consumed);
+            self.pending_bridge = pipelined;
         }
-        self.recv_buf = Vec::new();
         self.pending_request = Some(pending_request);
         self.outputs.push_back(HopResponderOutput::Request(request));
         Ok(())
     }
 
-    fn accept_reservation(
+    /// Accepts a pending RESERVE request, returning `reservation` and
+    /// `limit` to the requester.
+    pub fn accept_reservation(
         &mut self,
         mut reservation: Reservation,
         limit: Option<Limit>,
@@ -200,7 +177,9 @@ impl HopResponder {
         Ok(())
     }
 
-    fn accept_connect(&mut self, limit: Option<Limit>) -> Result<(), RelayError> {
+    /// Accepts a pending CONNECT with the advertised circuit limit (none
+    /// when unrestricted).
+    pub fn accept_connect(&mut self, limit: Option<Limit>) -> Result<(), RelayError> {
         if self.pending_request != Some(PendingRequest::Connect) {
             return Err(RelayError::UnexpectedMessage(
                 "cannot accept HOP CONNECT without a pending CONNECT request".into(),
@@ -223,7 +202,10 @@ impl HopResponder {
         Ok(())
     }
 
-    fn reject(&mut self, status: Status) -> Result<(), RelayError> {
+    /// Rejects the pending request with an exact wire status.
+    ///
+    /// `OK` and `UNUSED` are not valid denials and request a stream reset.
+    pub fn reject(&mut self, status: Status) -> Result<(), RelayError> {
         if self.pending_request.is_none() {
             return Err(RelayError::UnexpectedMessage(
                 "cannot reject without a pending HOP request".into(),
@@ -251,21 +233,25 @@ impl HopResponder {
         }
         self.pending_request = None;
         self.pending_bridge = Vec::new();
-        self.recv_buf = Vec::new();
+        self.frames.take_buffered();
         self.done = true;
     }
 
     fn queue_reset(&mut self) {
-        self.recv_buf = Vec::new();
+        self.frames.take_buffered();
         self.pending_request = None;
         self.pending_bridge = Vec::new();
         self.outputs.push_back(HopResponderOutput::Reset);
         self.done = true;
     }
 
-    fn remote_write_closed(&mut self) {
+    /// The remote closed its write side.
+    ///
+    /// A complete request and queued response remain drainable; only an
+    /// incomplete request terminates without a decision.
+    pub fn on_remote_write_closed(&mut self) {
         self.remote_write_closed = true;
-        self.recv_buf = Vec::new();
+        self.frames.take_buffered();
         if self.pending_request.is_none() && !self.done {
             self.pending_bridge = Vec::new();
             self.done = true;
@@ -273,8 +259,9 @@ impl HopResponder {
         self.bridged = false;
     }
 
-    fn remote_reset(&mut self) {
-        self.recv_buf = Vec::new();
+    /// The remote reset the stream, discarding pending decisions and outputs.
+    pub fn on_remote_reset(&mut self) {
+        self.frames.take_buffered();
         self.pending_request = None;
         self.pending_bridge = Vec::new();
         self.outputs.clear();
@@ -299,36 +286,13 @@ impl HopResponder {
     }
 }
 
-impl SansIoProtocol for HopResponder {
-    type Input = HopResponderInput;
-    type Output = HopResponderOutput;
-    type Error = RelayError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        match input {
-            HopResponderInput::Data(data) => self.on_data(data),
-            HopResponderInput::RemoteWriteClosed => {
-                self.remote_write_closed();
-                Ok(())
-            }
-            HopResponderInput::RemoteReset => {
-                self.remote_reset();
-                Ok(())
-            }
-            HopResponderInput::AcceptReservation { reservation, limit } => {
-                self.accept_reservation(reservation, limit)
-            }
-            HopResponderInput::AcceptConnect { limit } => self.accept_connect(limit),
-            HopResponderInput::Reject(status) => self.reject(status),
-        }
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
+impl HopResponder {
+    /// Returns the next pending output, if any.
+    ///
+    /// Drain until `None` after every input, before waiting on the stream or
+    /// the service decision again.
+    pub fn poll_output(&mut self) -> Option<HopResponderOutput> {
         self.outputs.pop_front()
-    }
-
-    fn is_idle(&self) -> bool {
-        self.outputs.is_empty()
     }
 }
 
@@ -382,23 +346,7 @@ impl StopInitiatorOutcome {
     }
 }
 
-/// Inputs accepted by [`StopInitiator`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StopInitiatorInput {
-    /// Bytes received on the outbound STOP stream.
-    Data(Vec<u8>),
-    /// The remote closed its write side.
-    ///
-    /// Outputs from a complete response remain drainable.
-    RemoteWriteClosed,
-    /// The remote reset the stream.
-    ///
-    /// Semantic outputs from a response decoded before the reset remain
-    /// drainable; unsent transport actions are discarded.
-    RemoteReset,
-}
-
-/// Outputs produced by [`StopInitiator`].
+/// Outputs produced by [`StopInitiator::poll_output`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StopInitiatorOutput {
     /// Bytes to write to the STOP stream.
@@ -424,7 +372,7 @@ pub enum StopInitiatorOutput {
 /// [`StopInitiatorOutcome::hop_status`]. Once a response is complete, a later
 /// close/reset does not erase its queued outcome or bridge data.
 pub struct StopInitiator {
-    recv_buf: Vec<u8>,
+    frames: FrameExchange,
     outputs: VecDeque<StopInitiatorOutput>,
     bridged: bool,
     done: bool,
@@ -447,50 +395,55 @@ impl StopInitiator {
             &request.encode(),
         )));
         Self {
-            recv_buf: Vec::new(),
+            frames: handshake_frames(),
             outputs,
             bridged: false,
             done: false,
         }
     }
 
-    fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
+    /// Feeds bytes received on the outbound STOP stream.
+    ///
+    /// Wire failures are reported as outputs.
+    pub fn on_data(&mut self, data: &[u8]) {
         if self.bridged {
             if !data.is_empty() {
                 self.outputs
                     .push_back(StopInitiatorOutput::BridgeData(data.to_vec()));
             }
-            return Ok(());
+            return;
         }
         if self.done {
-            return Ok(());
+            return;
         }
-        self.recv_buf.extend_from_slice(data);
-        let (message, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => {
-                let decoded = StopMessage::decode(payload);
-                (decoded, consumed)
-            }
-            FrameDecode::Incomplete => return Ok(()),
-            FrameDecode::TooLarge { .. } | FrameDecode::Error(_) => {
+        // Framing faults reset; a well-framed message that fails to decode
+        // gets a corrective status, so the decode result is carried out
+        // separately.
+        let decoded = match self.frames.push(data).and_then(|()| {
+            self.frames
+                .next_frame(|payload| Ok::<_, FrameFault>(StopMessage::decode(payload)))
+        }) {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) => return,
+            Err(_) => {
                 self.queue_reset(Status::MalformedMessage);
-                return Ok(());
+                return;
             }
         };
-        let message = match message {
+        let message = match decoded {
             Ok(message) => message,
             Err(_) => {
                 self.queue_protocol_error(Status::MalformedMessage);
-                return Ok(());
+                return;
             }
         };
         if message.kind != StopMessageType::Status {
             self.queue_protocol_error(Status::UnexpectedMessage);
-            return Ok(());
+            return;
         }
         let Some(status) = message.status else {
             self.queue_protocol_error(Status::MalformedMessage);
-            return Ok(());
+            return;
         };
         let outcome = if status == Status::Ok {
             self.bridged = true;
@@ -500,17 +453,12 @@ impl StopInitiator {
         };
         self.outputs
             .push_back(StopInitiatorOutput::Outcome(outcome));
-        if self.bridged && consumed < self.recv_buf.len() {
-            self.outputs.push_back(StopInitiatorOutput::BridgeData(
-                self.recv_buf
-                    .get(consumed..)
-                    .expect("a complete frame consumes no more than the receive buffer")
-                    .to_vec(),
-            ));
+        let pipelined = self.frames.take_buffered();
+        if self.bridged && !pipelined.is_empty() {
+            self.outputs
+                .push_back(StopInitiatorOutput::BridgeData(pipelined));
         }
-        self.recv_buf.clear();
         self.done = true;
-        Ok(())
     }
 
     fn queue_protocol_error(&mut self, status: Status) {
@@ -524,7 +472,7 @@ impl StopInitiator {
         self.outputs.push_back(StopInitiatorOutput::Outcome(
             StopInitiatorOutcome::ProtocolError { status },
         ));
-        self.recv_buf.clear();
+        self.frames.take_buffered();
         self.done = true;
     }
 
@@ -533,11 +481,14 @@ impl StopInitiator {
         self.outputs.push_back(StopInitiatorOutput::Outcome(
             StopInitiatorOutcome::ProtocolError { status },
         ));
-        self.recv_buf.clear();
+        self.frames.take_buffered();
         self.done = true;
     }
 
-    fn remote_write_closed(&mut self) {
+    /// The remote closed its write side.
+    ///
+    /// Outputs from a complete response remain drainable.
+    pub fn on_remote_write_closed(&mut self) {
         if !self.done {
             self.outputs.clear();
             self.outputs.push_back(StopInitiatorOutput::Outcome(
@@ -547,7 +498,11 @@ impl StopInitiator {
         self.finish_remote_terminal();
     }
 
-    fn remote_reset(&mut self) {
+    /// The remote reset the stream.
+    ///
+    /// Semantic outputs from a response decoded before the reset remain
+    /// drainable; unsent transport actions are discarded.
+    pub fn on_remote_reset(&mut self) {
         if self.done {
             self.outputs.retain(|output| {
                 matches!(
@@ -565,7 +520,7 @@ impl StopInitiator {
     }
 
     fn finish_remote_terminal(&mut self) {
-        self.recv_buf = Vec::new();
+        self.frames.take_buffered();
         self.bridged = false;
         self.done = true;
     }
@@ -578,30 +533,12 @@ impl StopInitiator {
     }
 }
 
-impl SansIoProtocol for StopInitiator {
-    type Input = StopInitiatorInput;
-    type Output = StopInitiatorOutput;
-    type Error = RelayError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        match input {
-            StopInitiatorInput::Data(data) => self.on_data(&data),
-            StopInitiatorInput::RemoteWriteClosed => {
-                self.remote_write_closed();
-                Ok(())
-            }
-            StopInitiatorInput::RemoteReset => {
-                self.remote_reset();
-                Ok(())
-            }
-        }
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
+impl StopInitiator {
+    /// Returns the next pending output, if any.
+    ///
+    /// Drain until `None` after construction and after every input, before
+    /// waiting on the stream again.
+    pub fn poll_output(&mut self) -> Option<StopInitiatorOutput> {
         self.outputs.pop_front()
-    }
-
-    fn is_idle(&self) -> bool {
-        self.outputs.is_empty()
     }
 }

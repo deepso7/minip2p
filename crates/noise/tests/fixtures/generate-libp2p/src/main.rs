@@ -7,9 +7,8 @@ use std::task::{Context, Poll, Waker};
 use futures::io::{AsyncRead, AsyncWrite};
 use futures::task::noop_waker;
 use libp2p_core::upgrade::OutboundConnectionUpgrade;
-use minip2p_core::SansIoProtocol;
 use minip2p_identity::Ed25519Keypair;
-use minip2p_noise::{NoiseConfig, NoiseInput, NoiseOutput, NoiseRole, NoiseSession};
+use minip2p_noise::{NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
 
 // This utility is deliberately a standalone workspace. It is run only when a
 // maintainer explicitly regenerates the checked-in transcript; its producer
@@ -95,9 +94,9 @@ fn main() {
         ephemeral_secret: [23; 32],
         expected_peer: None,
     });
-    responder.handle_input(NoiseInput::Start).unwrap();
+    responder.start().unwrap();
     responder
-        .handle_input(NoiseInput::Data(message1.clone()))
+        .on_data(message1.clone())
         .unwrap();
     let message2 = take_outbound(&mut responder);
 
@@ -131,7 +130,7 @@ fn main() {
     let message3 = io.take_outgoing();
 
     responder
-        .handle_input(NoiseInput::Data(message3.clone()))
+        .on_data(message3.clone())
         .unwrap();
     let verified_peer = match responder.poll_output().unwrap() {
         NoiseOutput::HandshakeComplete { peer, .. } => peer,

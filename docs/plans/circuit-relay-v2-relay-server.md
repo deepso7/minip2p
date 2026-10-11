@@ -316,7 +316,7 @@ Existing circuits survive pause, address changes, and unrelated connection closu
 
 ### Wire roles and malformed input
 
-Add `HopResponder` and `StopInitiator` to `crates/relay`, beside the existing client machines and re-export them. Both implement `SansIoProtocol` and retain payload pipelined with their handshake as directional bridge data.
+Add `HopResponder` and `StopInitiator` to `crates/relay`, beside the existing client machines and re-export them. Both are poll-driven machines (inputs through methods, outputs drained from `poll_output`) and retain payload pipelined with their handshake as directional bridge data.
 
 - A well-framed message with a wrong kind or missing required field receives the appropriate malformed/unexpected `Status`, then the write side closes.
 - Invalid framing, oversized declarations, or inputs for which no valid status can be encoded reset the stream.

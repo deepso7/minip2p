@@ -543,6 +543,9 @@ impl YamuxSession {
 
     /// Returns the next event, or else the next frame as
     /// [`YamuxOutput::Outbound`].
+    ///
+    /// Drain until `None` after every input, before waiting on the
+    /// connection, the clock, or the application again.
     pub fn poll_output(&mut self) -> Option<YamuxOutput> {
         self.poll_event()
             .or_else(|| self.poll_frame().map(YamuxOutput::Outbound))
@@ -557,11 +560,6 @@ impl YamuxSession {
             return false;
         }
         !self.control_due.is_empty() || !self.sendable.is_empty()
-    }
-
-    /// Returns true when no event or frame is pending.
-    pub fn is_idle(&self) -> bool {
-        self.events.is_empty() && !self.has_frames()
     }
 
     /// Returns the number of currently tracked streams.

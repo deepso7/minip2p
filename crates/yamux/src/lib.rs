@@ -22,7 +22,7 @@ mod session;
 
 use alloc::vec::Vec;
 
-use minip2p_core::{Bytes, SansIoProtocol};
+use minip2p_core::Bytes;
 use thiserror::Error;
 
 pub use frame::{
@@ -109,13 +109,6 @@ impl Default for YamuxConfig {
             max_pending_control: DEFAULT_MAX_PENDING_CONTROL,
         }
     }
-}
-
-/// Input accepted through [`SansIoProtocol`] by [`YamuxSession`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum YamuxInput {
-    /// Bytes received from the underlying ordered connection.
-    Data(Vec<u8>),
 }
 
 /// Output produced by a [`YamuxSession`].
@@ -267,24 +260,4 @@ pub enum YamuxError {
     /// A prior protocol error permanently failed this session.
     #[error("Yamux session has failed")]
     Failed,
-}
-
-impl SansIoProtocol for YamuxSession {
-    type Input = YamuxInput;
-    type Output = YamuxOutput;
-    type Error = YamuxError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        match input {
-            YamuxInput::Data(bytes) => self.handle_data(&bytes),
-        }
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
-        YamuxSession::poll_output(self)
-    }
-
-    fn is_idle(&self) -> bool {
-        YamuxSession::is_idle(self)
-    }
 }

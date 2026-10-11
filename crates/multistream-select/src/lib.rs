@@ -11,7 +11,7 @@ use alloc::collections::{BTreeSet, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use minip2p_core::{SansIoProtocol, VarintError, read_uvarint, uvarint_len, write_uvarint};
+use minip2p_core::{VarintError, read_uvarint, uvarint_len, write_uvarint};
 use thiserror::Error;
 
 /// The multistream-select protocol identifier.
@@ -33,15 +33,6 @@ pub enum MultistreamOutput {
     NotAvailable,
     /// A protocol-level error occurred; negotiation is terminated.
     ProtocolError { reason: String },
-}
-
-/// Input accepted by [`MultistreamSelect`] through [`SansIoProtocol`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MultistreamInput {
-    /// Begin negotiation by emitting the multistream header.
-    Start,
-    /// Bytes received from the remote peer.
-    Data(Vec<u8>),
 }
 
 /// Errors encountered during multistream-select framing or negotiation.
@@ -121,16 +112,17 @@ impl MultistreamSelect {
         }
     }
 
-    /// Produces the initial multistream header to send. Idempotent.
-    fn start(&mut self) -> Vec<MultistreamOutput> {
+    /// Queues the initial multistream header to send. Idempotent.
+    pub fn start(&mut self) {
         if self.started {
-            return Vec::new();
+            return;
         }
 
         self.started = true;
-        vec![MultistreamOutput::OutboundData(encode_message(
-            MULTISTREAM_PROTOCOL_ID,
-        ))]
+        self.pending_outputs
+            .push_back(MultistreamOutput::OutboundData(encode_message(
+                MULTISTREAM_PROTOCOL_ID,
+            )));
     }
 
     /// Returns `true` if negotiation has completed (successfully or with an error).
@@ -150,14 +142,14 @@ impl MultistreamSelect {
         core::mem::take(&mut self.recv_buf)
     }
 
-    /// Feeds received bytes into the state machine and returns any outputs.
-    fn receive(&mut self, bytes: &[u8]) -> Vec<MultistreamOutput> {
+    /// Feeds received bytes into the state machine, queuing any outputs.
+    pub fn on_data(&mut self, bytes: &[u8]) {
         if self.state == State::Done {
-            return Vec::new();
+            return;
         }
 
         self.recv_buf.extend_from_slice(bytes);
-        let mut outputs = Vec::new();
+        let outputs = &mut self.pending_outputs;
 
         loop {
             if self.state == State::Done {
@@ -178,7 +170,7 @@ impl MultistreamSelect {
                 DecodeResult::Incomplete => break,
                 DecodeResult::Error(err) => {
                     self.state = State::Done;
-                    outputs.push(MultistreamOutput::ProtocolError {
+                    outputs.push_back(MultistreamOutput::ProtocolError {
                         reason: err.to_string(),
                     });
                     break;
@@ -188,31 +180,14 @@ impl MultistreamSelect {
             self.state = next_state;
             outputs.extend(produced);
         }
-
-        outputs
-    }
-}
-
-impl SansIoProtocol for MultistreamSelect {
-    type Input = MultistreamInput;
-    type Output = MultistreamOutput;
-    type Error = MultistreamError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        let outputs = match input {
-            MultistreamInput::Start => self.start(),
-            MultistreamInput::Data(data) => self.receive(&data),
-        };
-        self.pending_outputs.extend(outputs);
-        Ok(())
     }
 
-    fn poll_output(&mut self) -> Option<Self::Output> {
+    /// Returns the next pending output, if any.
+    ///
+    /// Drain until `None` after every input, before waiting on the stream
+    /// again.
+    pub fn poll_output(&mut self) -> Option<MultistreamOutput> {
         self.pending_outputs.pop_front()
-    }
-
-    fn is_idle(&self) -> bool {
-        self.pending_outputs.is_empty()
     }
 }
 
@@ -380,13 +355,27 @@ mod tests {
 
     const PING: &str = "/ipfs/ping/1.0.0";
 
+    impl MultistreamSelect {
+        /// Starts and returns what the start queued (test helper).
+        fn start_drained(&mut self) -> Vec<MultistreamOutput> {
+            self.start();
+            self.pending_outputs.drain(..).collect()
+        }
+
+        /// Feeds `bytes` and returns what they queued (test helper).
+        fn receive(&mut self, bytes: &[u8]) -> Vec<MultistreamOutput> {
+            self.on_data(bytes);
+            self.pending_outputs.drain(..).collect()
+        }
+    }
+
     #[test]
     fn dialer_and_listener_negotiate_ping() {
         let mut dialer = MultistreamSelect::dialer(PING);
         let mut listener = MultistreamSelect::listener([PING.to_string()]);
 
-        let listener_start = listener.start();
-        let dialer_start = dialer.start();
+        let listener_start = listener.start_drained();
+        let dialer_start = dialer.start_drained();
 
         assert_eq!(
             listener_start,
@@ -433,7 +422,7 @@ mod tests {
     #[test]
     fn listener_rejects_unsupported_protocol() {
         let mut listener = MultistreamSelect::listener(["/ipfs/identify/1.0.0".to_string()]);
-        let _ = listener.start();
+        let _ = listener.start_drained();
         let _ = listener.receive(&encode_message(MULTISTREAM_PROTOCOL_ID));
 
         let out = listener.receive(&encode_message(PING));
@@ -453,7 +442,7 @@ mod tests {
         const MESHSUB_V1_1: &str = "/meshsub/1.1.0";
 
         let mut listener = MultistreamSelect::listener([MESHSUB_V1_1.to_string()]);
-        let _ = listener.start();
+        let _ = listener.start_drained();
 
         let mut pipelined = encode_message(MULTISTREAM_PROTOCOL_ID);
         pipelined.extend_from_slice(&encode_message(MESHSUB_V1_2));
@@ -476,7 +465,7 @@ mod tests {
     #[test]
     fn parses_chunked_input() {
         let mut dialer = MultistreamSelect::dialer(PING);
-        let _ = dialer.start();
+        let _ = dialer.start_drained();
 
         let full = encode_message(MULTISTREAM_PROTOCOL_ID);
         let (a, b) = full.split_at(full.len() / 2);
@@ -494,7 +483,7 @@ mod tests {
     #[test]
     fn errors_on_unexpected_header() {
         let mut dialer = MultistreamSelect::dialer(PING);
-        let _ = dialer.start();
+        let _ = dialer.start_drained();
 
         let out = dialer.receive(&encode_message("/wrong/1.0.0"));
         assert!(matches!(
@@ -532,7 +521,7 @@ mod tests {
         msg.push(b'\n');
 
         let mut dialer = MultistreamSelect::dialer(PING);
-        let _ = dialer.start();
+        let _ = dialer.start_drained();
         let out = dialer.receive(&msg);
         assert!(matches!(
             out.as_slice(),
@@ -546,7 +535,7 @@ mod tests {
         let encoded = encode_message(&long_protocol);
 
         let mut dialer = MultistreamSelect::dialer(PING);
-        let _ = dialer.start();
+        let _ = dialer.start_drained();
         let out = dialer.receive(&encoded);
         assert!(matches!(
             out.as_slice(),
@@ -557,7 +546,7 @@ mod tests {
     #[test]
     fn multiple_messages_in_one_receive() {
         let mut dialer = MultistreamSelect::dialer(PING);
-        let _ = dialer.start();
+        let _ = dialer.start_drained();
 
         // Send header + protocol confirmation in a single buffer
         let mut combined = encode_message(MULTISTREAM_PROTOCOL_ID);
@@ -578,7 +567,7 @@ mod tests {
     #[test]
     fn dialer_receives_na() {
         let mut dialer = MultistreamSelect::dialer(PING);
-        let _ = dialer.start();
+        let _ = dialer.start_drained();
         let _ = dialer.receive(&encode_message(MULTISTREAM_PROTOCOL_ID));
 
         let out = dialer.receive(&encode_message("na"));
@@ -586,21 +575,18 @@ mod tests {
     }
 
     #[test]
-    fn multistream_select_implements_sans_io_protocol() {
+    fn outputs_are_drained_through_poll_output() {
         let mut dialer = MultistreamSelect::dialer(PING);
 
-        dialer.handle_input(MultistreamInput::Start).unwrap();
+        dialer.start();
+        dialer.start();
         assert!(matches!(
             dialer.poll_output(),
             Some(MultistreamOutput::OutboundData(_))
         ));
-        assert!(dialer.is_idle());
+        assert!(dialer.poll_output().is_none(), "start is idempotent");
 
-        dialer
-            .handle_input(MultistreamInput::Data(encode_message(
-                MULTISTREAM_PROTOCOL_ID,
-            )))
-            .unwrap();
+        dialer.on_data(&encode_message(MULTISTREAM_PROTOCOL_ID));
         assert_eq!(
             dialer.poll_output(),
             Some(MultistreamOutput::OutboundData(encode_message(PING)))

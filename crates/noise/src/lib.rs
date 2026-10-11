@@ -3,7 +3,9 @@
 //! The crate implements `Noise_XX_25519_ChaChaPoly_SHA256` with libp2p's
 //! identity-key payload and two-byte big-endian message framing. It performs
 //! end-to-end identity verification and exposes encrypted transport bytes as a
-//! caller-driven [`SansIoProtocol`] state machine.
+//! caller-driven state machine: feed it through [`NoiseSession::start`],
+//! [`NoiseSession::on_data`] and [`NoiseSession::encrypt`], then drain
+//! [`NoiseSession::poll_output`] until it returns `None`.
 //!
 //! Randomness deliberately lives outside this crate: callers must provide
 //! fresh X25519 static and ephemeral secret bytes for each [`NoiseSession`].
@@ -25,7 +27,6 @@ use core::fmt;
 
 use cipher::CipherState;
 use handshake::{HandshakeResult, HandshakeState};
-use minip2p_core::SansIoProtocol;
 use minip2p_identity::{Ed25519Keypair, PeerId, PublicKey};
 use thiserror::Error;
 
@@ -75,18 +76,7 @@ impl fmt::Debug for NoiseConfig {
     }
 }
 
-/// Input accepted by [`NoiseSession`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum NoiseInput {
-    /// Starts the handshake. The initiator emits message one; the responder waits.
-    Start,
-    /// Bytes received from the underlying ordered stream.
-    Data(Vec<u8>),
-    /// Plaintext to encrypt after the handshake completes.
-    Encrypt(Vec<u8>),
-}
-
-/// Output produced by [`NoiseSession`].
+/// Output produced by [`NoiseSession::poll_output`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NoiseOutput {
     /// Framed bytes that the caller must write to the underlying stream.
@@ -214,7 +204,55 @@ impl NoiseSession {
         self.handshake_hash
     }
 
-    fn start(&mut self) -> Result<(), NoiseError> {
+    /// Starts the handshake. The initiator queues message one; the responder
+    /// waits for it.
+    pub fn start(&mut self) -> Result<(), NoiseError> {
+        let result = self.check_live().and_then(|()| self.begin_handshake());
+        self.settle(result)
+    }
+
+    /// Feeds bytes received from the underlying ordered stream: handshake
+    /// messages before completion, encrypted transport frames after.
+    pub fn on_data(&mut self, bytes: Vec<u8>) -> Result<(), NoiseError> {
+        let result = self.check_live().and_then(|()| self.receive(bytes));
+        self.settle(result)
+    }
+
+    /// Frames and encrypts `plaintext` once the handshake has completed,
+    /// queuing the frames as [`NoiseOutput::Outbound`].
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<(), NoiseError> {
+        let result = self
+            .check_live()
+            .and_then(|()| self.encrypt_frames(plaintext));
+        self.settle(result)
+    }
+
+    /// Returns the next pending output, if any.
+    ///
+    /// Drain until `None` after every input, before waiting on the stream or
+    /// the application again.
+    pub fn poll_output(&mut self) -> Option<NoiseOutput> {
+        self.pending.pop_front()
+    }
+
+    /// Refuses input once a terminal error has failed the session.
+    fn check_live(&self) -> Result<(), NoiseError> {
+        if self.failed {
+            return Err(NoiseError::Failed);
+        }
+        Ok(())
+    }
+
+    /// Fails the session, dropping queued output, on a terminal error.
+    fn settle(&mut self, result: Result<(), NoiseError>) -> Result<(), NoiseError> {
+        if result.as_ref().is_err_and(NoiseError::is_terminal) {
+            self.failed = true;
+            self.pending.clear();
+        }
+        result
+    }
+
+    fn begin_handshake(&mut self) -> Result<(), NoiseError> {
         if self.started {
             return Err(NoiseError::AlreadyStarted);
         }
@@ -275,7 +313,7 @@ impl NoiseSession {
 
     /// Frames and encrypts `plaintext` in `MAX_TRANSPORT_PLAINTEXT` segments.
     /// Each segment is copied once into its outbound frame and encrypted there.
-    fn encrypt(&mut self, plaintext: &[u8]) -> Result<(), NoiseError> {
+    fn encrypt_frames(&mut self, plaintext: &[u8]) -> Result<(), NoiseError> {
         let cipher = self
             .send_cipher
             .as_mut()
@@ -296,36 +334,6 @@ impl NoiseSession {
             self.pending.push_back(NoiseOutput::Outbound(frame));
         }
         Ok(())
-    }
-}
-
-impl SansIoProtocol for NoiseSession {
-    type Input = NoiseInput;
-    type Output = NoiseOutput;
-    type Error = NoiseError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        if self.failed {
-            return Err(NoiseError::Failed);
-        }
-        let result = match input {
-            NoiseInput::Start => self.start(),
-            NoiseInput::Data(bytes) => self.receive(bytes),
-            NoiseInput::Encrypt(plaintext) => self.encrypt(&plaintext),
-        };
-        if result.as_ref().is_err_and(NoiseError::is_terminal) {
-            self.failed = true;
-            self.pending.clear();
-        }
-        result
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
-        self.pending.pop_front()
-    }
-
-    fn is_idle(&self) -> bool {
-        self.pending.is_empty()
     }
 }
 
@@ -367,22 +375,16 @@ mod tests {
         }
 
         fn handshake(&mut self) {
-            self.initiator.handle_input(NoiseInput::Start).unwrap();
-            self.responder.handle_input(NoiseInput::Start).unwrap();
+            self.initiator.start().unwrap();
+            self.responder.start().unwrap();
 
             let message1 = outbound(&mut self.initiator);
-            self.responder
-                .handle_input(NoiseInput::Data(message1))
-                .unwrap();
+            self.responder.on_data(message1).unwrap();
             let message2 = outbound(&mut self.responder);
-            self.initiator
-                .handle_input(NoiseInput::Data(message2))
-                .unwrap();
+            self.initiator.on_data(message2).unwrap();
             let message3 = outbound(&mut self.initiator);
             assert_eq!(handshake_peer(&mut self.initiator), self.responder_peer);
-            self.responder
-                .handle_input(NoiseInput::Data(message3))
-                .unwrap();
+            self.responder.on_data(message3).unwrap();
             assert_eq!(handshake_peer(&mut self.responder), self.initiator_peer);
         }
     }
@@ -416,22 +418,18 @@ mod tests {
         let mut pair = Pair::new();
         pair.handshake();
 
-        pair.initiator
-            .handle_input(NoiseInput::Encrypt(b"hello responder".to_vec()))
-            .unwrap();
+        pair.initiator.encrypt(b"hello responder").unwrap();
         pair.responder
-            .handle_input(NoiseInput::Data(outbound(&mut pair.initiator)))
+            .on_data(outbound(&mut pair.initiator))
             .unwrap();
         assert_eq!(
             pair.responder.poll_output(),
             Some(NoiseOutput::Decrypted(b"hello responder".to_vec()))
         );
 
-        pair.responder
-            .handle_input(NoiseInput::Encrypt(b"hello initiator".to_vec()))
-            .unwrap();
+        pair.responder.encrypt(b"hello initiator").unwrap();
         pair.initiator
-            .handle_input(NoiseInput::Data(outbound(&mut pair.responder)))
+            .on_data(outbound(&mut pair.responder))
             .unwrap();
         assert_eq!(
             pair.initiator.poll_output(),
@@ -444,61 +442,45 @@ mod tests {
         let mut pair = Pair::new();
 
         assert_eq!(
-            pair.initiator
-                .handle_input(NoiseInput::Encrypt(b"too early".to_vec())),
+            pair.initiator.encrypt(b"too early"),
             Err(NoiseError::InvalidInput("handshake is not complete"))
         );
         assert_eq!(
-            pair.responder.handle_input(NoiseInput::Data(Vec::new())),
+            pair.responder.on_data(Vec::new()),
             Err(NoiseError::InvalidInput("session has not been started"))
         );
 
-        pair.initiator.handle_input(NoiseInput::Start).unwrap();
-        assert_eq!(
-            pair.initiator.handle_input(NoiseInput::Start),
-            Err(NoiseError::AlreadyStarted)
-        );
+        pair.initiator.start().unwrap();
+        assert_eq!(pair.initiator.start(), Err(NoiseError::AlreadyStarted));
         let message1 = outbound(&mut pair.initiator);
 
-        pair.responder.handle_input(NoiseInput::Start).unwrap();
-        pair.responder
-            .handle_input(NoiseInput::Data(message1))
-            .unwrap();
+        pair.responder.start().unwrap();
+        pair.responder.on_data(message1).unwrap();
         let message2 = outbound(&mut pair.responder);
-        pair.initiator
-            .handle_input(NoiseInput::Data(message2))
-            .unwrap();
+        pair.initiator.on_data(message2).unwrap();
         let message3 = outbound(&mut pair.initiator);
         assert_eq!(handshake_peer(&mut pair.initiator), pair.responder_peer);
-        pair.responder
-            .handle_input(NoiseInput::Data(message3))
-            .unwrap();
+        pair.responder.on_data(message3).unwrap();
         assert_eq!(handshake_peer(&mut pair.responder), pair.initiator_peer);
     }
 
     #[test]
     fn accepts_one_byte_drip_fragmentation() {
         let mut pair = Pair::new();
-        pair.initiator.handle_input(NoiseInput::Start).unwrap();
-        pair.responder.handle_input(NoiseInput::Start).unwrap();
+        pair.initiator.start().unwrap();
+        pair.responder.start().unwrap();
         let message1 = outbound(&mut pair.initiator);
         for byte in message1 {
-            pair.responder
-                .handle_input(NoiseInput::Data(alloc::vec![byte]))
-                .unwrap();
+            pair.responder.on_data(alloc::vec![byte]).unwrap();
         }
         let message2 = outbound(&mut pair.responder);
         for byte in message2 {
-            pair.initiator
-                .handle_input(NoiseInput::Data(alloc::vec![byte]))
-                .unwrap();
+            pair.initiator.on_data(alloc::vec![byte]).unwrap();
         }
         let message3 = outbound(&mut pair.initiator);
         let _ = handshake_peer(&mut pair.initiator);
         for byte in message3 {
-            pair.responder
-                .handle_input(NoiseInput::Data(alloc::vec![byte]))
-                .unwrap();
+            pair.responder.on_data(alloc::vec![byte]).unwrap();
         }
         let _ = handshake_peer(&mut pair.responder);
     }
@@ -513,15 +495,13 @@ mod tests {
             [4; 32],
             Some(Ed25519Keypair::from_secret_key_bytes([99; 32]).peer_id()),
         ));
-        pair.initiator.handle_input(NoiseInput::Start).unwrap();
-        pair.responder.handle_input(NoiseInput::Start).unwrap();
+        pair.initiator.start().unwrap();
+        pair.responder.start().unwrap();
         let message1 = outbound(&mut pair.initiator);
-        pair.responder
-            .handle_input(NoiseInput::Data(message1))
-            .unwrap();
+        pair.responder.on_data(message1).unwrap();
         let message2 = outbound(&mut pair.responder);
         assert_eq!(
-            pair.initiator.handle_input(NoiseInput::Data(message2)),
+            pair.initiator.on_data(message2),
             Err(NoiseError::IdentityMismatch)
         );
         assert!(pair.initiator.poll_output().is_none());
@@ -530,17 +510,14 @@ mod tests {
     #[test]
     fn rejects_non_contributory_remote_key() {
         let mut responder = Pair::new().responder;
-        responder.handle_input(NoiseInput::Start).unwrap();
+        responder.start().unwrap();
         let zero_message = encode_frame(&[0; 32]).unwrap();
         assert_eq!(
-            responder.handle_input(NoiseInput::Data(zero_message)),
+            responder.on_data(zero_message),
             Err(NoiseError::NonContributory)
         );
         assert!(responder.poll_output().is_none());
-        assert_eq!(
-            responder.handle_input(NoiseInput::Start),
-            Err(NoiseError::Failed)
-        );
+        assert_eq!(responder.start(), Err(NoiseError::Failed));
     }
 
     #[test]
@@ -548,21 +525,15 @@ mod tests {
         let mut pair = Pair::new();
         pair.handshake();
         let plaintext = alloc::vec![9; MAX_TRANSPORT_PLAINTEXT + 1];
-        pair.initiator
-            .handle_input(NoiseInput::Encrypt(plaintext.clone()))
-            .unwrap();
+        pair.initiator.encrypt(&plaintext).unwrap();
         let first = outbound(&mut pair.initiator);
         let second = outbound(&mut pair.initiator);
         assert_eq!(
             u16::from_be_bytes([first[0], first[1]]) as usize,
             MAX_FRAME_LEN
         );
-        pair.responder
-            .handle_input(NoiseInput::Data(first))
-            .unwrap();
-        pair.responder
-            .handle_input(NoiseInput::Data(second))
-            .unwrap();
+        pair.responder.on_data(first).unwrap();
+        pair.responder.on_data(second).unwrap();
         assert_eq!(
             pair.responder.poll_output(),
             Some(NoiseOutput::Decrypted(
@@ -582,18 +553,14 @@ mod tests {
         let mut pair = Pair::new();
         pair.handshake();
         let plaintext = alloc::vec![8; MAX_TRANSPORT_PLAINTEXT];
-        pair.initiator
-            .handle_input(NoiseInput::Encrypt(plaintext.clone()))
-            .unwrap();
+        pair.initiator.encrypt(&plaintext).unwrap();
         let frame = outbound(&mut pair.initiator);
         assert_eq!(
             u16::from_be_bytes([frame[0], frame[1]]) as usize,
             MAX_FRAME_LEN
         );
         assert!(pair.initiator.poll_output().is_none());
-        pair.responder
-            .handle_input(NoiseInput::Data(frame))
-            .unwrap();
+        pair.responder.on_data(frame).unwrap();
         assert_eq!(
             pair.responder.poll_output(),
             Some(NoiseOutput::Decrypted(plaintext))
@@ -604,15 +571,11 @@ mod tests {
     fn empty_write_emits_one_tag_only_frame() {
         let mut pair = Pair::new();
         pair.handshake();
-        pair.initiator
-            .handle_input(NoiseInput::Encrypt(Vec::new()))
-            .unwrap();
+        pair.initiator.encrypt(&[]).unwrap();
         let frame = outbound(&mut pair.initiator);
         assert_eq!(frame.len(), 2 + cipher::TAG_LEN);
         assert!(pair.initiator.poll_output().is_none());
-        pair.responder
-            .handle_input(NoiseInput::Data(frame))
-            .unwrap();
+        pair.responder.on_data(frame).unwrap();
         assert_eq!(
             pair.responder.poll_output(),
             Some(NoiseOutput::Decrypted(Vec::new()))

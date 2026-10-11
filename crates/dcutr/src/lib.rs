@@ -32,7 +32,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, SansIoProtocol, WireError};
+use minip2p_core::{FrameExchange, FrameFault, Multiaddr};
 
 pub use message::{
     DcutrMessageError, FrameDecode, HolePunch, HolePunchType, decode_frame, encode_frame,
@@ -67,6 +67,16 @@ pub enum DcutrError {
     UnexpectedMessage(String),
 }
 
+impl From<FrameFault> for DcutrError {
+    fn from(fault: FrameFault) -> Self {
+        match fault {
+            FrameFault::TooLarge { len, .. } => Self::FrameTooLarge { len },
+            FrameFault::Overflow { len, .. } => Self::MessageTooLarge { len },
+            FrameFault::Wire(e) => Self::Malformed(e.into()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DcutrInitiator: we initiate the hole punch
 // ---------------------------------------------------------------------------
@@ -92,20 +102,7 @@ pub enum InitiatorOutcome {
     },
 }
 
-/// Input accepted by [`DcutrInitiator`] through [`SansIoProtocol`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DcutrInitiatorInput {
-    /// Drain queued CONNECT or SYNC bytes into an output.
-    Flush,
-    /// Bytes received from the relay stream, with measured relay RTT.
-    Data { bytes: Vec<u8>, rtt_ms: u64 },
-    /// Remote write side closed.
-    RemoteWriteClosed,
-    /// Queue the SYNC frame after the caller has started direct dialing.
-    SendSync,
-}
-
-/// Output produced by [`DcutrInitiator`] through [`SansIoProtocol`].
+/// Output produced by [`DcutrInitiator::poll_output`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DcutrInitiatorOutput {
     /// Bytes to write to the DCUtR stream.
@@ -119,22 +116,21 @@ pub enum DcutrInitiatorOutput {
 /// Usage:
 /// 1. Construct with [`DcutrInitiator::new`], passing our observed addresses.
 /// 2. Drain [`DcutrInitiatorOutput::Outbound`] from
-///    [`SansIoProtocol::poll_output`] and send the bytes.
+///    [`DcutrInitiator::poll_output`] and send the bytes.
 /// 3. Record the send time; feed stream data with
-///    [`DcutrInitiatorInput::Data`].
+///    [`DcutrInitiator::on_data`].
 /// 4. When [`DcutrInitiatorOutput::Outcome`] returns `DialNow`, the caller:
 ///    - dials the returned addresses immediately,
-///    - feeds [`DcutrInitiatorInput::SendSync`] to queue the SYNC frame,
+///    - calls [`DcutrInitiator::send_sync`] to queue the SYNC frame,
 ///    - flushes the outbound bytes.
+///
+/// Bytes coalesced behind the CONNECT reply belong to the application and
+/// are kept for [`DcutrInitiator::take_trailing_data`].
 pub struct DcutrInitiator {
-    outbound: Vec<u8>,
-    recv_buf: Vec<u8>,
+    frames: FrameExchange,
     state: InitiatorState,
     outcome: Option<InitiatorOutcome>,
     emitted_outcome: bool,
-    /// Deferred construction error (oversized CONNECT), surfaced by the
-    /// first [`SansIoProtocol::handle_input`] call.
-    pending_error: Option<DcutrError>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,60 +143,42 @@ enum InitiatorState {
     ReadyToSync,
     /// SYNC queued; awaiting caller to flush.
     SyncPending,
-    /// SYNC sent; flow complete.
+    /// SYNC sent, or the exchange failed; flow complete.
     Done,
 }
 
 impl DcutrInitiator {
     /// Creates a new initiator, queuing the outbound CONNECT message.
     ///
-    /// `own_addrs` are our observed (and possibly predicted) multiaddrs.
-    /// They are serialized via [`Multiaddr`]'s `Display` for the wire
-    /// (see the crate-level note on binary vs string encoding).
+    /// `own_addrs` are our observed (and possibly predicted) multiaddrs,
+    /// sent in their binary multiaddr encoding.
     ///
-    /// If the encoded CONNECT would exceed [`MAX_MESSAGE_SIZE`] -- a frame
-    /// any spec-compliant peer (including this crate's own decoder) would
-    /// reject -- no bytes are queued and the first
-    /// [`SansIoProtocol::handle_input`] call fails with
-    /// [`DcutrError::MessageTooLarge`].
-    pub fn new(own_addrs: &[Multiaddr]) -> Self {
-        let obs_addrs = own_addrs.iter().map(encode_multiaddr).collect();
+    /// Fails with [`DcutrError::MessageTooLarge`] if the encoded CONNECT
+    /// would exceed [`MAX_MESSAGE_SIZE`] -- a frame any spec-compliant peer
+    /// (including this crate's own decoder) would reject.
+    pub fn new(own_addrs: &[Multiaddr]) -> Result<Self, DcutrError> {
         let msg = HolePunch {
             kind: HolePunchType::Connect,
-            obs_addrs,
+            obs_addrs: own_addrs.iter().map(encode_multiaddr).collect(),
         };
-        let (outbound, state, pending_error) = match checked_outbound_frame(&msg.encode()) {
-            Ok(frame) => (frame, InitiatorState::Pending, None),
-            Err(err) => (Vec::new(), InitiatorState::Done, Some(err)),
-        };
+        let mut frames = hole_punch_frames();
+        queue_message(&mut frames, &msg.encode())?;
 
-        Self {
-            outbound,
-            recv_buf: Vec::new(),
-            state,
+        Ok(Self {
+            frames,
+            state: InitiatorState::Pending,
             outcome: None,
             emitted_outcome: false,
-            pending_error,
-        }
-    }
-
-    /// Drains and returns any pending outbound bytes.
-    fn take_outbound(&mut self) -> Vec<u8> {
-        let bytes = core::mem::take(&mut self.outbound);
-        self.state = match self.state {
-            InitiatorState::Pending => InitiatorState::AwaitingConnectReply,
-            InitiatorState::SyncPending => InitiatorState::Done,
-            other => other,
-        };
-        bytes
+        })
     }
 
     /// Feeds incoming stream bytes.
     ///
     /// `rtt_ms` is the caller's measured RTT from when they sent CONNECT
-    /// (via `take_outbound`) to now. It is passed through into the
-    /// `DialNow` outcome so the caller can use it for SYNC timing.
-    fn on_data(&mut self, data: &[u8], rtt_ms: u64) -> Result<(), DcutrError> {
+    /// (drained from [`poll_output`](Self::poll_output)) to now. It is passed
+    /// through into the `DialNow` outcome so the caller can use it for SYNC
+    /// timing. Any error ends the flow.
+    pub fn on_data(&mut self, data: &[u8], rtt_ms: u64) -> Result<(), DcutrError> {
         // Once the CONNECT reply has been consumed the stream carries no
         // further DCUtR frames toward the initiator, so later bytes are
         // dropped rather than buffered -- including in `ReadyToSync`,
@@ -209,15 +187,60 @@ impl DcutrInitiator {
         if self.state != InitiatorState::AwaitingConnectReply {
             return Ok(());
         }
-
-        self.recv_buf.extend_from_slice(data);
-        self.try_decode_reply(rtt_ms)
+        let result = self
+            .frames
+            .push(data)
+            .map_err(DcutrError::from)
+            .and_then(|()| self.try_decode_reply(rtt_ms));
+        if result.is_err() {
+            // Terminate without retaining attacker-controlled protocol input
+            // or its backing allocation.
+            self.state = InitiatorState::Done;
+            self.frames.take_buffered();
+        }
+        result
     }
 
-    /// Notifies the state machine that the remote closed its write side.
-    fn on_remote_write_closed(&mut self) -> Result<(), DcutrError> {
-        // No-op: the outcome is already resolved by the time we'd care.
+    /// Queues the SYNC message to be sent.
+    ///
+    /// Call this after you have initiated your simultaneous dial, per the
+    /// spec, then drain [`DcutrInitiatorOutput::Outbound`] to the stream.
+    pub fn send_sync(&mut self) -> Result<(), DcutrError> {
+        if self.state != InitiatorState::ReadyToSync {
+            return Err(DcutrError::UnexpectedMessage(alloc::format!(
+                "cannot send SYNC from state {:?}",
+                self.state
+            )));
+        }
+        let msg = HolePunch {
+            kind: HolePunchType::Sync,
+            obs_addrs: Vec::new(),
+        };
+        queue_message(&mut self.frames, &msg.encode())?;
+        self.state = InitiatorState::SyncPending;
         Ok(())
+    }
+
+    /// Returns the next pending output, if any.
+    ///
+    /// Drain until `None` after construction and after every input, before
+    /// waiting on the stream again.
+    pub fn poll_output(&mut self) -> Option<DcutrInitiatorOutput> {
+        if self.frames.has_outbound() {
+            self.state = match self.state {
+                InitiatorState::Pending => InitiatorState::AwaitingConnectReply,
+                InitiatorState::SyncPending => InitiatorState::Done,
+                other => other,
+            };
+            return Some(DcutrInitiatorOutput::Outbound(self.frames.take_outbound()));
+        }
+        if !self.emitted_outcome
+            && let Some(outcome) = self.outcome.clone()
+        {
+            self.emitted_outcome = true;
+            return Some(DcutrInitiatorOutput::Outcome(outcome));
+        }
+        None
     }
 
     /// Returns the current outcome, if available.
@@ -226,7 +249,7 @@ impl DcutrInitiator {
         self.outcome.as_ref()
     }
 
-    /// Returns `true` if the flow has completed (SYNC was sent).
+    /// Returns `true` if the flow has completed (SYNC was sent) or failed.
     pub fn is_done(&self) -> bool {
         self.state == InitiatorState::Done
     }
@@ -244,71 +267,18 @@ impl DcutrInitiator {
     /// data.
     pub fn take_trailing_data(&mut self) -> Option<Vec<u8>> {
         (self.state == InitiatorState::Done && self.outcome.is_some())
-            .then(|| core::mem::take(&mut self.recv_buf))
-    }
-
-    /// Queues the SYNC message to be sent.
-    ///
-    /// Call this after you have initiated your simultaneous dial, per the
-    /// spec. After feeding [`DcutrInitiatorInput::SendSync`], drain
-    /// [`DcutrInitiatorOutput::Outbound`] to the stream.
-    fn send_sync(&mut self) -> Result<(), DcutrError> {
-        if self.state != InitiatorState::ReadyToSync {
-            return Err(DcutrError::UnexpectedMessage(alloc::format!(
-                "cannot send SYNC from state {:?}",
-                self.state
-            )));
-        }
-
-        let msg = HolePunch {
-            kind: HolePunchType::Sync,
-            obs_addrs: Vec::new(),
-        };
-        // SYNC carries no addresses and is structurally tiny; the size check
-        // is kept for uniformity across all outbound frame constructions.
-        self.outbound.extend(checked_outbound_frame(&msg.encode())?);
-        self.state = InitiatorState::SyncPending;
-        Ok(())
+            .then(|| self.frames.take_buffered())
     }
 
     fn try_decode_reply(&mut self, rtt_ms: u64) -> Result<(), DcutrError> {
-        if self.state != InitiatorState::AwaitingConnectReply {
+        let Some(reply) = self.frames.next_frame(decode_hole_punch)? else {
             return Ok(());
-        }
-
-        let (reply, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => {
-                let reply = HolePunch::decode(payload)
-                    .map_err(DcutrError::Malformed)
-                    .map_err(|e| self.fail_reply(e))?;
-                (reply, consumed)
-            }
-            // Only the incomplete remainder is bounded: a complete frame
-            // decodes (and drains) regardless of what is coalesced behind
-            // it, so the backstop can never reject a frame the decoder
-            // would accept.
-            FrameDecode::Incomplete => {
-                if let Err(e) = enforce_max_size(&self.recv_buf) {
-                    return Err(self.fail_reply(e));
-                }
-                return Ok(());
-            }
-            FrameDecode::TooLarge { len } => {
-                return Err(self.fail_reply(DcutrError::FrameTooLarge { len }));
-            }
-            FrameDecode::Error(e) => {
-                return Err(self.fail_reply(DcutrError::Malformed(WireError::from(e).into())));
-            }
         };
-        self.recv_buf.drain(..consumed);
-
         if reply.kind != HolePunchType::Connect {
-            return Err(
-                self.fail_reply(DcutrError::UnexpectedMessage(alloc::format!(
-                    "expected HolePunch CONNECT but got {:?}",
-                    reply.kind
-                ))),
-            );
+            return Err(DcutrError::UnexpectedMessage(alloc::format!(
+                "expected HolePunch CONNECT but got {:?}",
+                reply.kind
+            )));
         }
 
         self.state = InitiatorState::ReadyToSync;
@@ -322,16 +292,7 @@ impl DcutrInitiator {
             rtt_ms,
         });
         self.emitted_outcome = false;
-
         Ok(())
-    }
-
-    /// Terminates a failed reply exchange without retaining attacker-controlled
-    /// protocol input or its backing allocation.
-    fn fail_reply(&mut self, error: DcutrError) -> DcutrError {
-        self.state = InitiatorState::Done;
-        self.recv_buf = Vec::new();
-        error
     }
 }
 
@@ -344,8 +305,8 @@ impl DcutrInitiator {
 pub enum ResponderEvent {
     /// The initiator has provided their observed addresses.
     ///
-    /// We have already queued our own CONNECT reply via the constructor, but
-    /// the caller now knows which addresses to NAT-punch towards.
+    /// Our own CONNECT reply has been queued alongside this event, and the
+    /// caller now knows which addresses to NAT-punch towards.
     ConnectReceived {
         /// Decoded remote observed addresses. Malformed entries are
         /// dropped silently; the raw bytes remain in `remote_addr_bytes`
@@ -360,18 +321,7 @@ pub enum ResponderEvent {
     SyncReceived,
 }
 
-/// Input accepted by [`DcutrResponder`] through [`SansIoProtocol`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DcutrResponderInput {
-    /// Drain queued CONNECT reply bytes into an output.
-    Flush,
-    /// Bytes received from the relay stream.
-    Data(Vec<u8>),
-    /// Remote write side closed.
-    RemoteWriteClosed,
-}
-
-/// Output produced by [`DcutrResponder`] through [`SansIoProtocol`].
+/// Output produced by [`DcutrResponder::poll_output`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DcutrResponderOutput {
     /// Bytes to write to the DCUtR stream.
@@ -384,25 +334,24 @@ pub enum DcutrResponderOutput {
 ///
 /// Usage:
 /// 1. Construct with [`DcutrResponder::new`], passing our observed addresses.
-///    Our CONNECT reply is queued automatically.
-/// 2. Feed incoming bytes with [`DcutrResponderInput::Data`].
+/// 2. Feed incoming bytes with [`DcutrResponder::on_data`].
 /// 3. Drain [`DcutrResponderOutput`] values from
-///    [`SansIoProtocol::poll_output`].
+///    [`DcutrResponder::poll_output`].
 /// 4. Send [`DcutrResponderOutput::Outbound`] bytes back on the relay stream.
 /// 5. On [`DcutrResponderOutput::Event`] with
 ///    [`ResponderEvent::SyncReceived`], start the responder-side dial timing /
 ///    UDP bombardment strategy.
+///
+/// The initiator may pipeline SYNC behind its CONNECT. Bytes coalesced
+/// behind SYNC belong to the application and are kept for
+/// [`DcutrResponder::take_trailing_data`].
 pub struct DcutrResponder {
-    /// Pre-encoded, size-validated CONNECT reply frame; queued (taken)
-    /// when the initiator's CONNECT arrives.
+    /// Encoded, size-validated CONNECT reply payload; queued (taken) when
+    /// the initiator's CONNECT arrives.
     connect_reply: Vec<u8>,
-    outbound: Vec<u8>,
-    recv_buf: Vec<u8>,
+    frames: FrameExchange,
     state: ResponderState,
     events: VecDeque<ResponderEvent>,
-    /// Deferred construction error (oversized CONNECT reply), surfaced by
-    /// the first [`SansIoProtocol::handle_input`] call.
-    pending_error: Option<DcutrError>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -413,7 +362,7 @@ enum ResponderState {
     AwaitingSync,
     /// SYNC received; flow complete.
     Done,
-    /// The exchange terminated with a protocol or construction error.
+    /// The exchange terminated with a protocol error.
     Failed,
 }
 
@@ -424,48 +373,67 @@ impl DcutrResponder {
     /// on. The CONNECT reply is encoded (and size-validated) here, but only
     /// queued once we actually receive the initiator's CONNECT.
     ///
-    /// If the encoded reply would exceed [`MAX_MESSAGE_SIZE`] -- a frame any
-    /// spec-compliant peer (including this crate's own decoder) would
-    /// reject -- the first [`SansIoProtocol::handle_input`] call fails with
-    /// [`DcutrError::MessageTooLarge`].
-    pub fn new(own_addrs: &[Multiaddr]) -> Self {
-        let reply = HolePunch {
+    /// Fails with [`DcutrError::MessageTooLarge`] if the encoded reply would
+    /// exceed [`MAX_MESSAGE_SIZE`] -- a frame any spec-compliant peer
+    /// (including this crate's own decoder) would reject.
+    pub fn new(own_addrs: &[Multiaddr]) -> Result<Self, DcutrError> {
+        let connect_reply = HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: own_addrs.iter().map(encode_multiaddr).collect(),
-        };
-        let (connect_reply, state, pending_error) = match checked_outbound_frame(&reply.encode()) {
-            Ok(frame) => (frame, ResponderState::AwaitingConnect, None),
-            Err(err) => (Vec::new(), ResponderState::Failed, Some(err)),
-        };
-
-        Self {
-            connect_reply,
-            outbound: Vec::new(),
-            recv_buf: Vec::new(),
-            state,
-            events: VecDeque::new(),
-            pending_error,
         }
+        .encode();
+        if connect_reply.len() > MAX_MESSAGE_SIZE {
+            return Err(DcutrError::MessageTooLarge {
+                len: connect_reply.len(),
+            });
+        }
+
+        Ok(Self {
+            connect_reply,
+            frames: hole_punch_frames(),
+            state: ResponderState::AwaitingConnect,
+            events: VecDeque::new(),
+        })
     }
 
-    /// Drains and returns any pending outbound bytes.
-    fn take_outbound(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.outbound)
-    }
-
-    /// Feeds incoming stream bytes.
-    fn on_data(&mut self, data: &[u8]) -> Result<(), DcutrError> {
-        if matches!(self.state, ResponderState::Done | ResponderState::Failed) {
+    /// Feeds incoming stream bytes. Any error ends the flow.
+    pub fn on_data(&mut self, data: &[u8]) -> Result<(), DcutrError> {
+        if self.is_done() {
             return Ok(());
         }
-
-        self.recv_buf.extend_from_slice(data);
-        self.try_decode()
+        let result = self
+            .frames
+            .push(data)
+            .map_err(DcutrError::from)
+            .and_then(|()| self.try_decode());
+        if result.is_err() {
+            self.state = ResponderState::Failed;
+        }
+        result
     }
 
-    /// Notifies the state machine that the remote closed its write side.
-    fn on_remote_write_closed(&mut self) -> Result<(), DcutrError> {
-        self.try_decode()
+    /// Notifies the state machine that the remote closed its write side,
+    /// decoding whatever whole frames are already buffered.
+    pub fn on_remote_write_closed(&mut self) -> Result<(), DcutrError> {
+        if self.is_done() {
+            return Ok(());
+        }
+        let result = self.try_decode();
+        if result.is_err() {
+            self.state = ResponderState::Failed;
+        }
+        result
+    }
+
+    /// Returns the next pending output, if any.
+    ///
+    /// Drain until `None` after every input, before waiting on the stream
+    /// again.
+    pub fn poll_output(&mut self) -> Option<DcutrResponderOutput> {
+        if self.frames.has_outbound() {
+            return Some(DcutrResponderOutput::Outbound(self.frames.take_outbound()));
+        }
+        self.events.pop_front().map(DcutrResponderOutput::Event)
     }
 
     /// Drains buffered events.
@@ -489,57 +457,20 @@ impl DcutrResponder {
     /// decode buffer untouched. After completion, the trailing bytes are
     /// returned (and drained) exactly once.
     pub fn take_trailing_data(&mut self) -> Option<Vec<u8>> {
-        (self.state == ResponderState::Done).then(|| core::mem::take(&mut self.recv_buf))
+        (self.state == ResponderState::Done).then(|| self.frames.take_buffered())
     }
 
     fn try_decode(&mut self) -> Result<(), DcutrError> {
-        loop {
-            if self.state == ResponderState::Done {
-                // The flow is complete. Any bytes coalesced behind SYNC
-                // belong to the application; the caller can drain them with
-                // `take_trailing_data` before handing over the raw stream.
+        // Stop at SYNC: any bytes coalesced behind it belong to the
+        // application, which drains them with `take_trailing_data`.
+        while !self.is_done() {
+            let Some(msg) = self.frames.next_frame(decode_hole_punch)? else {
                 return Ok(());
-            }
-            if self.state == ResponderState::Failed {
-                return Ok(());
-            }
-
-            let (msg, consumed) = match decode_frame(&self.recv_buf) {
-                FrameDecode::Complete { payload, consumed } => {
-                    let msg = HolePunch::decode(payload).map_err(|e| {
-                        self.state = ResponderState::Failed;
-                        DcutrError::Malformed(e)
-                    })?;
-                    (msg, consumed)
-                }
-                // Only the incomplete remainder is bounded: a complete
-                // frame decodes (and drains) regardless of what is
-                // coalesced behind it -- e.g. a maximal CONNECT pipelined
-                // with SYNC -- so the backstop can never reject a frame
-                // the decoder would accept.
-                FrameDecode::Incomplete => {
-                    enforce_max_size(&self.recv_buf).inspect_err(|_| {
-                        self.state = ResponderState::Failed;
-                    })?;
-                    return Ok(());
-                }
-                FrameDecode::TooLarge { len } => {
-                    self.state = ResponderState::Failed;
-                    return Err(DcutrError::FrameTooLarge { len });
-                }
-                FrameDecode::Error(e) => {
-                    self.state = ResponderState::Failed;
-                    return Err(DcutrError::Malformed(WireError::from(e).into()));
-                }
             };
-            self.recv_buf.drain(..consumed);
-
             match (self.state, msg.kind) {
                 (ResponderState::AwaitingConnect, HolePunchType::Connect) => {
-                    // Queue our pre-encoded CONNECT reply (size-validated in
-                    // `new`) and transition state.
-                    self.outbound
-                        .extend(core::mem::take(&mut self.connect_reply));
+                    // Queue our CONNECT reply (size-validated in `new`).
+                    queue_message(&mut self.frames, &core::mem::take(&mut self.connect_reply))?;
 
                     let remote_addr_bytes = msg.obs_addrs;
                     let remote_addrs = decode_remote_addrs(&remote_addr_bytes);
@@ -554,7 +485,6 @@ impl DcutrResponder {
                     self.state = ResponderState::Done;
                 }
                 (current_state, actual_kind) => {
-                    self.state = ResponderState::Failed;
                     return Err(DcutrError::UnexpectedMessage(alloc::format!(
                         "unexpected {:?} in state {:?}",
                         actual_kind,
@@ -563,75 +493,7 @@ impl DcutrResponder {
                 }
             }
         }
-    }
-}
-
-impl SansIoProtocol for DcutrInitiator {
-    type Input = DcutrInitiatorInput;
-    type Output = DcutrInitiatorOutput;
-    type Error = DcutrError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        if let Some(err) = self.pending_error.take() {
-            return Err(err);
-        }
-        match input {
-            DcutrInitiatorInput::Flush => {}
-            DcutrInitiatorInput::Data { bytes, rtt_ms } => self.on_data(&bytes, rtt_ms)?,
-            DcutrInitiatorInput::RemoteWriteClosed => self.on_remote_write_closed()?,
-            DcutrInitiatorInput::SendSync => self.send_sync()?,
-        }
         Ok(())
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
-        let outbound = self.take_outbound();
-        if !outbound.is_empty() {
-            return Some(DcutrInitiatorOutput::Outbound(outbound));
-        }
-        if !self.emitted_outcome
-            && let Some(outcome) = self.outcome.clone()
-        {
-            self.emitted_outcome = true;
-            return Some(DcutrInitiatorOutput::Outcome(outcome));
-        }
-        None
-    }
-
-    fn is_idle(&self) -> bool {
-        self.pending_error.is_none()
-            && self.outbound.is_empty()
-            && (self.emitted_outcome || self.outcome.is_none())
-    }
-}
-
-impl SansIoProtocol for DcutrResponder {
-    type Input = DcutrResponderInput;
-    type Output = DcutrResponderOutput;
-    type Error = DcutrError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        if let Some(err) = self.pending_error.take() {
-            return Err(err);
-        }
-        match input {
-            DcutrResponderInput::Flush => {}
-            DcutrResponderInput::Data(data) => self.on_data(&data)?,
-            DcutrResponderInput::RemoteWriteClosed => self.on_remote_write_closed()?,
-        }
-        Ok(())
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
-        let outbound = self.take_outbound();
-        if !outbound.is_empty() {
-            return Some(DcutrResponderOutput::Outbound(outbound));
-        }
-        self.events.pop_front().map(DcutrResponderOutput::Event)
-    }
-
-    fn is_idle(&self) -> bool {
-        self.pending_error.is_none() && self.outbound.is_empty() && self.events.is_empty()
     }
 }
 
@@ -639,36 +501,28 @@ impl SansIoProtocol for DcutrResponder {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Longest length prefix a legal frame can carry: [`MAX_MESSAGE_SIZE`] is
-/// below 2^14, so its uvarint prefix encodes in at most two bytes.
-const MAX_FRAME_PREFIX_LEN: usize = 2;
-
-/// Backstop bound on the receive buffer once decoding has stalled on an
-/// incomplete frame.
+/// The frame exchange both roles read through.
 ///
-/// Called only on [`FrameDecode::Incomplete`], after any complete frame
-/// has been drained: a stalled buffer can legally hold at most one
-/// partial frame (the payload bound is [`decode_frame`]'s `TooLarge`), so
-/// this can never reject traffic the decoder would accept -- including a
-/// maximal frame coalesced with pipelined trailing bytes.
-fn enforce_max_size(buf: &[u8]) -> Result<(), DcutrError> {
-    if buf.len() > MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN {
-        return Err(DcutrError::MessageTooLarge { len: buf.len() });
-    }
-    Ok(())
+/// Bytes behind the final frame belong to the application, so the exchange
+/// does not bound them: they arrive in the read that completes the frame,
+/// and every later read is dropped once the exchange is over.
+fn hole_punch_frames() -> FrameExchange {
+    FrameExchange::with_trailing(MAX_MESSAGE_SIZE, usize::MAX)
 }
 
-/// Encodes an outbound message payload as a length-prefixed frame,
-/// rejecting payloads that exceed [`MAX_MESSAGE_SIZE`].
-///
-/// This mirrors the inbound limit enforced by [`decode_frame`]: the state
-/// machines must never put a frame on the wire that a spec-compliant
-/// receiver (including this crate's own decoder) would reject as oversized.
-fn checked_outbound_frame(payload: &[u8]) -> Result<Vec<u8>, DcutrError> {
-    if payload.len() > MAX_MESSAGE_SIZE {
-        return Err(DcutrError::MessageTooLarge { len: payload.len() });
-    }
-    Ok(encode_frame(payload))
+fn decode_hole_punch(payload: &[u8]) -> Result<HolePunch, DcutrError> {
+    HolePunch::decode(payload).map_err(DcutrError::Malformed)
+}
+
+/// Queues an outbound message, rejecting payloads that exceed
+/// [`MAX_MESSAGE_SIZE`]: the state machines must never put a frame on the
+/// wire that a spec-compliant receiver (including this crate's own decoder)
+/// would reject as oversized.
+fn queue_message(frames: &mut FrameExchange, payload: &[u8]) -> Result<(), DcutrError> {
+    frames.queue(payload).map_err(|fault| match fault {
+        FrameFault::TooLarge { .. } => DcutrError::MessageTooLarge { len: payload.len() },
+        other => other.into(),
+    })
 }
 
 /// Encodes a [`Multiaddr`] for transmission in a `HolePunch` `obs_addrs`
@@ -701,6 +555,38 @@ mod tests {
         encode_frame(&msg.encode())
     }
 
+    fn initiator_outbound(init: &mut DcutrInitiator) -> Vec<u8> {
+        let Some(DcutrInitiatorOutput::Outbound(bytes)) = init.poll_output() else {
+            panic!("expected queued bytes");
+        };
+        bytes
+    }
+
+    fn responder_outbound(resp: &mut DcutrResponder) -> Vec<u8> {
+        let Some(DcutrResponderOutput::Outbound(bytes)) = resp.poll_output() else {
+            panic!("expected queued bytes");
+        };
+        bytes
+    }
+
+    fn over_declared_header() -> Vec<u8> {
+        let mut header = Vec::new();
+        minip2p_core::write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut header);
+        header
+    }
+
+    /// A CONNECT whose payload is exactly [`MAX_MESSAGE_SIZE`]: 2 bytes type
+    /// field + 1 tag + 2-byte length varint + 4091 address bytes.
+    fn max_size_connect() -> Vec<u8> {
+        let at_max = HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: vec![vec![0u8; 4091]],
+        }
+        .encode();
+        assert_eq!(at_max.len(), MAX_MESSAGE_SIZE);
+        encode_frame(&at_max)
+    }
+
     fn addr(s: &str) -> Multiaddr {
         <Multiaddr as core::str::FromStr>::from_str(s).expect("test multiaddr")
     }
@@ -708,10 +594,10 @@ mod tests {
     #[test]
     fn initiator_sends_connect_then_dials_on_reply() {
         let own = [addr("/ip4/1.2.3.4/udp/1111/quic-v1")];
-        let mut init = DcutrInitiator::new(&own);
+        let mut init = DcutrInitiator::new(&own).unwrap();
 
         // Take the initial CONNECT.
-        let outbound = init.take_outbound();
+        let outbound = initiator_outbound(&mut init);
         let FrameDecode::Complete { payload, .. } = decode_frame(&outbound) else {
             panic!();
         };
@@ -746,8 +632,8 @@ mod tests {
 
     #[test]
     fn initiator_exposes_bytes_coalesced_after_reply_once_complete() {
-        let mut init = DcutrInitiator::new(&[]);
-        let _ = init.take_outbound();
+        let mut init = DcutrInitiator::new(&[]).unwrap();
+        let _ = initiator_outbound(&mut init);
 
         // Reply arrives coalesced with application bytes. They cannot be
         // handed over before the protocol finishes.
@@ -769,7 +655,7 @@ mod tests {
         assert_eq!(init.take_trailing_data(), None);
 
         init.send_sync().unwrap();
-        let _ = init.take_outbound();
+        let _ = initiator_outbound(&mut init);
         assert!(init.is_done());
         assert_eq!(init.take_trailing_data(), Some(vec![0xaa; 512]));
         assert_eq!(init.take_trailing_data(), Some(Vec::new()));
@@ -777,8 +663,8 @@ mod tests {
 
     #[test]
     fn initiator_does_not_expose_malformed_protocol_bytes_as_trailing_data() {
-        let mut init = DcutrInitiator::new(&[]);
-        let _ = init.take_outbound();
+        let mut init = DcutrInitiator::new(&[]).unwrap();
+        let _ = initiator_outbound(&mut init);
 
         let mut malformed = encode_frame(&[0xff]);
         malformed.extend_from_slice(&vec![0xaa; MAX_MESSAGE_SIZE * 2]);
@@ -786,13 +672,13 @@ mod tests {
         assert!(matches!(err, DcutrError::Malformed(_)));
         assert!(init.is_done());
         assert_eq!(init.take_trailing_data(), None);
-        assert_eq!(init.recv_buf.capacity(), 0);
+        assert_eq!(init.frames.buffered().len(), 0);
     }
 
     #[test]
     fn initiator_does_not_expose_oversized_frame_as_trailing_data() {
-        let mut init = DcutrInitiator::new(&[]);
-        let _ = init.take_outbound();
+        let mut init = DcutrInitiator::new(&[]).unwrap();
+        let _ = initiator_outbound(&mut init);
 
         let mut header = Vec::new();
         minip2p_core::write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut header);
@@ -800,12 +686,12 @@ mod tests {
         assert!(matches!(err, DcutrError::FrameTooLarge { .. }));
         assert!(init.is_done());
         assert_eq!(init.take_trailing_data(), None);
-        assert_eq!(init.recv_buf.capacity(), 0);
+        assert_eq!(init.frames.buffered().len(), 0);
     }
 
     #[test]
     fn responder_exposes_trailing_bytes_after_flow_completes() {
-        let mut resp = DcutrResponder::new(&[]);
+        let mut resp = DcutrResponder::new(&[]).unwrap();
 
         // CONNECT + SYNC + application bytes in one coalesced input: the
         // flow completes, but the caller must be able to hand those bytes to
@@ -827,7 +713,7 @@ mod tests {
 
     #[test]
     fn responder_cannot_drain_protocol_bytes_before_completion() {
-        let mut resp = DcutrResponder::new(&[]);
+        let mut resp = DcutrResponder::new(&[]).unwrap();
         let connect = frame(HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: Vec::new(),
@@ -845,8 +731,8 @@ mod tests {
 
     #[test]
     fn initiator_send_sync_after_reply() {
-        let mut init = DcutrInitiator::new(&[]);
-        let _ = init.take_outbound();
+        let mut init = DcutrInitiator::new(&[]).unwrap();
+        let _ = initiator_outbound(&mut init);
 
         let reply = frame(HolePunch {
             kind: HolePunchType::Connect,
@@ -855,7 +741,7 @@ mod tests {
         init.on_data(&reply, 50).unwrap();
 
         init.send_sync().unwrap();
-        let sync_bytes = init.take_outbound();
+        let sync_bytes = initiator_outbound(&mut init);
         let FrameDecode::Complete { payload, .. } = decode_frame(&sync_bytes) else {
             panic!();
         };
@@ -866,8 +752,8 @@ mod tests {
 
     #[test]
     fn initiator_send_sync_before_reply_fails() {
-        let mut init = DcutrInitiator::new(&[]);
-        let _ = init.take_outbound();
+        let mut init = DcutrInitiator::new(&[]).unwrap();
+        let _ = initiator_outbound(&mut init);
 
         let err = init.send_sync().unwrap_err();
         assert!(matches!(err, DcutrError::UnexpectedMessage(_)));
@@ -875,8 +761,8 @@ mod tests {
 
     #[test]
     fn initiator_rejects_sync_as_reply() {
-        let mut init = DcutrInitiator::new(&[]);
-        let _ = init.take_outbound();
+        let mut init = DcutrInitiator::new(&[]).unwrap();
+        let _ = initiator_outbound(&mut init);
 
         let wrong = frame(HolePunch {
             kind: HolePunchType::Sync,
@@ -888,8 +774,8 @@ mod tests {
 
     #[test]
     fn initiator_handles_fragmented_reply() {
-        let mut init = DcutrInitiator::new(&[]);
-        let _ = init.take_outbound();
+        let mut init = DcutrInitiator::new(&[]).unwrap();
+        let _ = initiator_outbound(&mut init);
 
         let reply = frame(HolePunch {
             kind: HolePunchType::Connect,
@@ -907,8 +793,8 @@ mod tests {
 
     #[test]
     fn initiator_drops_malformed_remote_addrs_but_keeps_bytes() {
-        let mut init = DcutrInitiator::new(&[]);
-        let _ = init.take_outbound();
+        let mut init = DcutrInitiator::new(&[]).unwrap();
+        let _ = initiator_outbound(&mut init);
 
         let reply = frame(HolePunch {
             kind: HolePunchType::Connect,
@@ -936,7 +822,7 @@ mod tests {
     #[test]
     fn responder_replies_on_connect_then_surfaces_sync() {
         let own = [addr("/ip4/10.0.0.1/udp/1234/quic-v1")];
-        let mut resp = DcutrResponder::new(&own);
+        let mut resp = DcutrResponder::new(&own).unwrap();
 
         // Feed initiator's CONNECT.
         let remote_str = "/ip4/5.5.5.5/udp/7000/quic-v1";
@@ -949,7 +835,7 @@ mod tests {
         resp.on_data(&connect).unwrap();
 
         // Reply should be queued with our own addr (binary-encoded).
-        let outbound = resp.take_outbound();
+        let outbound = responder_outbound(&mut resp);
         let FrameDecode::Complete { payload, .. } = decode_frame(&outbound) else {
             panic!();
         };
@@ -986,7 +872,7 @@ mod tests {
 
     #[test]
     fn responder_handles_pipelined_connect_and_sync() {
-        let mut resp = DcutrResponder::new(&[]);
+        let mut resp = DcutrResponder::new(&[]).unwrap();
 
         // Send CONNECT and SYNC in one packet (unusual but possible).
         let mut packet = frame(HolePunch {
@@ -1012,7 +898,7 @@ mod tests {
 
     #[test]
     fn responder_rejects_sync_before_connect() {
-        let mut resp = DcutrResponder::new(&[]);
+        let mut resp = DcutrResponder::new(&[]).unwrap();
         let sync = frame(HolePunch {
             kind: HolePunchType::Sync,
             obs_addrs: Vec::new(),
@@ -1024,7 +910,7 @@ mod tests {
 
     #[test]
     fn responder_rejects_duplicate_connect() {
-        let mut resp = DcutrResponder::new(&[]);
+        let mut resp = DcutrResponder::new(&[]).unwrap();
 
         let connect = frame(HolePunch {
             kind: HolePunchType::Connect,
@@ -1037,27 +923,11 @@ mod tests {
     }
 
     #[test]
-    fn receive_buffer_backstop_bounds_partial_frames() {
-        // The backstop allows one maximal legal frame (payload + 2-byte
-        // prefix) and rejects anything beyond it. It runs only on stalled
-        // (incomplete) buffers, where `decode_frame`'s own bounds make it
-        // unreachable from wire input -- a pure defense-in-depth check.
-        enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN])
-            .expect("the maximum legal partial frame must be accepted");
-        assert!(matches!(
-            enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN + 1]),
-            Err(DcutrError::MessageTooLarge { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_oversized_declared_frame_length() {
+    fn responder_rejects_oversized_declared_frame_length() {
         // A tiny header declaring an impossible payload length must fail
         // immediately instead of stalling while waiting for more bytes.
-        let mut resp = DcutrResponder::new(&[]);
-        let mut header = Vec::new();
-        minip2p_core::write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut header);
-        let err = resp.on_data(&header).unwrap_err();
+        let mut resp = DcutrResponder::new(&[]).unwrap();
+        let err = resp.on_data(&over_declared_header()).unwrap_err();
         assert!(matches!(err, DcutrError::FrameTooLarge { .. }));
         assert!(resp.is_done());
     }
@@ -1069,101 +939,79 @@ mod tests {
     }
 
     #[test]
-    fn initiator_rejects_oversized_outbound_connect() {
-        let mut init = DcutrInitiator::new(&oversized_own_addrs());
-
-        // The oversized frame must never be emitted...
-        assert!(!init.is_idle());
-        assert!(init.poll_output().is_none());
-        // ...and the error surfaces on the first input.
-        let err = init.handle_input(DcutrInitiatorInput::Flush).unwrap_err();
-        assert!(matches!(err, DcutrError::MessageTooLarge { .. }));
-        assert!(init.is_done());
-        assert!(init.is_idle());
-    }
-
-    #[test]
-    fn responder_rejects_oversized_outbound_connect_reply() {
-        let mut resp = DcutrResponder::new(&oversized_own_addrs());
-
-        assert!(!resp.is_idle());
-        let connect = frame(HolePunch {
-            kind: HolePunchType::Connect,
-            obs_addrs: Vec::new(),
-        });
-        let err = resp
-            .handle_input(DcutrResponderInput::Data(connect))
-            .unwrap_err();
-        assert!(matches!(err, DcutrError::MessageTooLarge { .. }));
-        // No reply frame may leak out after the failure.
-        assert!(resp.poll_output().is_none());
-        assert!(resp.is_done());
-    }
-
-    #[test]
-    fn outbound_frame_at_exact_max_size_still_encodes() {
-        // Payload layout: 2 bytes type field + 1 tag + 2-byte length varint
-        // + 4091 addr bytes = exactly MAX_MESSAGE_SIZE.
-        let at_max = HolePunch {
-            kind: HolePunchType::Connect,
-            obs_addrs: vec![vec![0u8; 4091]],
-        }
-        .encode();
-        assert_eq!(at_max.len(), MAX_MESSAGE_SIZE);
-
-        let framed = checked_outbound_frame(&at_max).expect("exactly-max payload must encode");
+    fn constructors_refuse_an_oversized_outbound_connect() {
+        // The oversized frame is never built: the caller learns at
+        // construction, with no input needed to surface the error.
         assert!(matches!(
-            decode_frame(&framed),
-            FrameDecode::Complete { .. }
+            DcutrInitiator::new(&oversized_own_addrs()),
+            Err(DcutrError::MessageTooLarge { len }) if len > MAX_MESSAGE_SIZE
+        ));
+        assert!(matches!(
+            DcutrResponder::new(&oversized_own_addrs()),
+            Err(DcutrError::MessageTooLarge { len }) if len > MAX_MESSAGE_SIZE
+        ));
+    }
+
+    #[test]
+    fn outbound_message_at_exact_max_size_still_encodes() {
+        let mut frames = hole_punch_frames();
+        let at_max = vec![0u8; MAX_MESSAGE_SIZE];
+        queue_message(&mut frames, &at_max).expect("exactly-max payload must encode");
+        assert!(matches!(
+            decode_frame(&frames.take_outbound()),
+            FrameDecode::Complete { payload, .. } if payload.len() == MAX_MESSAGE_SIZE
         ));
 
-        // The framed bytes (payload + 2-byte prefix) must also survive the
-        // state machine's own receive path, not just decode_frame -- even
-        // when a coalesced read pipelines the SYNC frame behind the
-        // maximal CONNECT in the same input.
+        // One more byte and the payload must be refused.
+        assert_eq!(
+            queue_message(&mut frames, &[0u8; MAX_MESSAGE_SIZE + 1]),
+            Err(DcutrError::MessageTooLarge {
+                len: MAX_MESSAGE_SIZE + 1
+            })
+        );
+        assert!(!frames.has_outbound());
+    }
+
+    #[test]
+    fn initiator_accepts_an_exactly_max_reply() {
+        let mut init = DcutrInitiator::new(&[]).unwrap();
+        let _ = initiator_outbound(&mut init);
+
+        init.on_data(&max_size_connect(), 1).unwrap();
+        assert!(matches!(
+            init.outcome(),
+            Some(InitiatorOutcome::DialNow { .. })
+        ));
+    }
+
+    #[test]
+    fn responder_accepts_an_exactly_max_connect_with_pipelined_sync() {
+        // A coalesced read can pipeline SYNC behind a maximal CONNECT.
         let own = [addr("/ip4/10.0.0.1/udp/1234/quic-v1")];
-        let mut resp = DcutrResponder::new(&own);
-        let mut coalesced = framed;
+        let mut resp = DcutrResponder::new(&own).unwrap();
+        let mut coalesced = max_size_connect();
         coalesced.extend(frame(HolePunch {
             kind: HolePunchType::Sync,
             obs_addrs: Vec::new(),
         }));
-        resp.handle_input(DcutrResponderInput::Data(coalesced))
+        resp.on_data(&coalesced)
             .expect("exactly-max CONNECT + pipelined SYNC must be accepted");
         assert!(matches!(
             resp.poll_output(),
             Some(DcutrResponderOutput::Outbound(_))
         ));
-
-        // One more byte and the frame must be refused.
-        let over_max = HolePunch {
-            kind: HolePunchType::Connect,
-            obs_addrs: vec![vec![0u8; 4092]],
-        }
-        .encode();
-        assert_eq!(over_max.len(), MAX_MESSAGE_SIZE + 1);
-        assert!(matches!(
-            checked_outbound_frame(&over_max),
-            Err(DcutrError::MessageTooLarge { len }) if len == MAX_MESSAGE_SIZE + 1
-        ));
+        assert!(resp.is_done());
     }
 
     #[test]
-    fn initiator_and_responder_implement_sans_io_protocol() {
+    fn initiator_and_responder_drive_each_other() {
         let own = [addr("/ip4/10.0.0.1/udp/1234/quic-v1")];
-        let mut init = DcutrInitiator::new(&own);
-        let mut resp = DcutrResponder::new(&own);
+        let mut init = DcutrInitiator::new(&own).unwrap();
+        let mut resp = DcutrResponder::new(&own).unwrap();
 
-        init.handle_input(DcutrInitiatorInput::Flush).unwrap();
-        let Some(DcutrInitiatorOutput::Outbound(connect)) = init.poll_output() else {
-            panic!("initiator should emit CONNECT");
-        };
-
-        resp.handle_input(DcutrResponderInput::Data(connect))
-            .unwrap();
-        let Some(DcutrResponderOutput::Outbound(reply)) = resp.poll_output() else {
-            panic!("responder should emit CONNECT reply");
-        };
+        let connect = initiator_outbound(&mut init);
+        resp.on_data(&connect).unwrap();
+        let reply = responder_outbound(&mut resp);
         assert!(matches!(
             resp.poll_output(),
             Some(DcutrResponderOutput::Event(
@@ -1171,11 +1019,7 @@ mod tests {
             ))
         ));
 
-        init.handle_input(DcutrInitiatorInput::Data {
-            bytes: reply,
-            rtt_ms: 42,
-        })
-        .unwrap();
+        init.on_data(&reply, 42).unwrap();
         assert!(matches!(
             init.poll_output(),
             Some(DcutrInitiatorOutput::Outcome(InitiatorOutcome::DialNow {
@@ -1183,5 +1027,12 @@ mod tests {
                 ..
             }))
         ));
+        init.send_sync().unwrap();
+        resp.on_data(&initiator_outbound(&mut init)).unwrap();
+        assert_eq!(
+            resp.poll_output(),
+            Some(DcutrResponderOutput::Event(ResponderEvent::SyncReceived))
+        );
+        assert!(init.is_done() && resp.is_done());
     }
 }

@@ -615,7 +615,6 @@ dependencies = [
  "libp2p-core",
  "libp2p-identity",
  "libp2p-noise",
- "minip2p-core",
  "minip2p-identity",
  "minip2p-noise",
  "rand",
