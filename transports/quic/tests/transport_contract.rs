@@ -1043,6 +1043,42 @@ fn reset_stream_emits_stream_closed() {
     assert!(saw_closed, "reset_stream must emit StreamClosed");
 }
 
+/// Acking the bytes of a stream reset locally is a no-op: the reset settled
+/// it, so there is nothing left to over-acknowledge.
+#[test]
+fn acking_a_locally_reset_stream_is_a_no_op() {
+    let (mut server, mut client, peer_addr) = setup_pair();
+    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let stream_id = client.open_stream(client_conn).expect("open stream");
+    client
+        .send_stream(client_conn, stream_id, Bytes::from_static(b"hello"))
+        .expect("send");
+
+    let mut delivered = None;
+    for _ in 0..50 {
+        let (server_events, _) = drive_pair_once(&mut server, &mut client);
+        delivered = server_events.into_iter().find_map(|event| match event {
+            TransportEvent::StreamData {
+                id,
+                stream_id,
+                data,
+            } => Some((id, stream_id, data.len())),
+            _ => None,
+        });
+        if delivered.is_some() {
+            break;
+        }
+    }
+    let (server_conn, server_stream, len) = delivered.expect("server receives data");
+
+    server
+        .reset_stream(server_conn, server_stream)
+        .expect("local reset");
+    server
+        .ack_stream(server_conn, server_stream, len)
+        .expect("acking a reset stream is a no-op");
+}
+
 // ---------------------------------------------------------------------------
 // Error conditions
 // ---------------------------------------------------------------------------

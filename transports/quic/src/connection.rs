@@ -762,11 +762,15 @@ impl QuicConnection {
     /// quiche returned their credit when they were read, so what this
     /// releases is the read gate: a stream that had spent its budget is
     /// marked for a rescan, which the transport runs at once. A settled or
-    /// unknown stream has nothing to acknowledge.
+    /// unknown stream has nothing to acknowledge: that includes one reset
+    /// locally, which settles at once but is collected on the next poll.
     pub fn ack_stream(&mut self, stream_id: StreamId, bytes: usize) -> Result<(), TransportError> {
         let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) else {
             return Ok(());
         };
+        if state.closed_notified && state.unacked == 0 {
+            return Ok(());
+        }
         if bytes > state.unacked {
             return Err(TransportError::AckExceedsDelivered {
                 id: self.id,
