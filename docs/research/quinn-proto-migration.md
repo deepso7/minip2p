@@ -26,12 +26,12 @@ All on one Linux host (8 vCPU), loopback, one 256 MiB one-way stream, client and
 The engine comparison uses matched conditions: both drivers keep polling without waiting while their receive batch hit its cap (mio is edge-triggered), and quinn runs with a fixed 1350-byte payload and no PMTU discovery (`QMTU=1350`), which matches the quiche configuration.
 
 | Stack | MB/s | Rust allocs/MB |
-| --- | ---: | ---: |
+| --- | --: | --: |
 | raw quiche, std UDP (no minip2p adapter) | 173–177 | — |
 | quinn-proto, std UDP, MTU 1350 | 181–184 | — |
 | raw quiche + quinn-udp GSO/GRO | 617–629 | — |
 | quinn-proto + quinn-udp, MTU 1350 | 710–756 | — |
-| *Other configurations* | | |
+| _Other configurations_ |  |  |
 | minip2p `QuicTransport` (quiche adapter today) | 146–173 | ~7,000 |
 | quinn-proto, std UDP, PMTU discovery (1452 on loopback) | 195–198 | ~2,500 |
 | quinn-proto + quinn-udp, PMTU discovery | 746–806 | ~330 |
@@ -50,7 +50,7 @@ Reading the table:
 
 ### Build and portability
 
-| | quiche + boring | quinn-proto + rustls/ring + quinn-udp |
+|  | quiche + boring | quinn-proto + rustls/ring + quinn-udp |
 | --- | --- | --- |
 | Cold release build of a minimal binary | 37.6 s wall, 127 s CPU | 15.7 s wall, 54 s CPU |
 | Stripped minimal binary | 2.53 MB | 2.14 MB |
@@ -68,13 +68,13 @@ MSRVs: quinn-proto 1.85, quinn-udp 1.88, rustls 1.71, all below the workspace's 
 
 Every handshake verified the remote `PeerId` from its libp2p certificate.
 
-| Dialer → Listener | Result |
-| --- | --- |
-| quinn spike → rust-libp2p 0.57 | connected both sides |
-| rust-libp2p 0.57 → quinn spike (Retry on) | connected both sides |
-| quinn spike → minip2p `QuicTransport` (quiche) | connected both sides |
+| Dialer → Listener                                | Result               |
+| ------------------------------------------------ | -------------------- |
+| quinn spike → rust-libp2p 0.57                   | connected both sides |
+| rust-libp2p 0.57 → quinn spike (Retry on)        | connected both sides |
+| quinn spike → minip2p `QuicTransport` (quiche)   | connected both sides |
 | minip2p `QuicTransport` → quinn spike (Retry on) | connected both sides |
-| rust-libp2p → minip2p `QuicTransport` (control) | connected |
+| rust-libp2p → minip2p `QuicTransport` (control)  | connected            |
 
 A mixed fleet (for example, relays still on quiche) therefore keeps working.
 
@@ -121,8 +121,7 @@ libp2p TLS on rustls takes about 120 lines (`src/tls.rs`). Custom `ServerCertVer
 
 1. **Rewrite cost.** The adapter core (`lib.rs` + `connection.rs`, ~3.5k lines) is rewritten. About 3.5k lines of tests reference quiche in places: `two_peer.rs` and `cid_routing.rs` build raw quiche peers, and `stream_send_tests.rs` and `transport_contract.rs` mention quiche capacity behaviour. The public API (`QuicEndpoint`, `QuicNodeConfig`, `QuicLimits`, `STREAM_RECEIVE_WINDOW`) can stay.
 2. **The Connection token changes.** quinn-proto doesn't expose connection IDs, so the token moves to a TLS exporter (`export_keying_material`, a minip2p label). That is cryptographically bound and matches how TCP derives it from the Noise hash. But a quinn-based peer and a quiche-based peer compute different tokens for the same connection. The effect is limited to a **same-direction connection race between mixed versions**. The two sides may keep opposite connections and close both. Nothing restarts a settled direct dial (`crates/minip2p/src/portable/connect.rs`), so recovery needs the application or discovery to redial, and a repeat race can fail the same way. A coordinated upgrade avoids it. Keeping the CID scheme is possible by sniffing long headers during the handshake, but it is fragile and not recommended pre-1.0.
-3. **Edge-triggered stream events.** quinn emits `Readable` when data arrives, not as a level, and a new remote stream's first frame raises only `Opened`, not `Readable`. The adapter must therefore scan every newly accepted stream, and must remember gated streams (receive budget spent) so it can re-read them on `ack_stream` without an event.
-3a. **Semantics quinn leaves to the application.** On STOP_SENDING quinn only records the code and raises an event, so the adapter must `reset` the send half itself, as quiche did internally. quinn's default `TransportConfig` advertises DATAGRAM support, which has to be turned off. Data returned by `Chunks::next` may be a slice of a larger packet allocation, so passing it on zero-copy can pin more memory than ADR 0012's receive budget accounts for.
+3. **Edge-triggered stream events.** quinn emits `Readable` when data arrives, not as a level, and a new remote stream's first frame raises only `Opened`, not `Readable`. The adapter must therefore scan every newly accepted stream, and must remember gated streams (receive budget spent) so it can re-read them on `ack_stream` without an event. 3a. **Semantics quinn leaves to the application.** On STOP_SENDING quinn only records the code and raises an event, so the adapter must `reset` the send half itself, as quiche did internally. quinn's default `TransportConfig` advertises DATAGRAM support, which has to be turned off. Data returned by `Chunks::next` may be a slice of a larger packet allocation, so passing it on zero-copy can pin more memory than ADR 0012's receive budget accounts for.
 4. **Stream-count credit.** quinn-proto returns MAX_STREAMS credit when a stream is fully closed and read, which can be before minip2p's reader has acknowledged the delivered bytes. The adapter keeps today's rule of refusing new peer streams beyond `max_streams_per_connection` while slots are held by unsettled streams, by stopping and resetting the extra stream.
 5. **Dependency maturity.** quinn-proto is 0.x and has broken its API between minors (0.10→0.11). quiche is also 0.x with frequent breaks, so this is a wash, but plan to pin the version and absorb upgrades deliberately.
 6. **`unsafe` in dependencies.** quinn-udp uses `libc` and `unsafe` internally, as `boring` does today. `forbid(unsafe_code)` still holds for minip2p crates.

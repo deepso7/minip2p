@@ -41,9 +41,11 @@ Non-goals:
    A dialer builds a per-dial rustls `ClientConfig` whose verifier carries the expected `PeerId`. It shares one `Arc<CertifiedKey>` and the provider, so the per-dial cost is a few `Arc` clones. A wrong identity aborts the handshake with a TLS alert. The local caller gets `TransportEvent::Error { message }`, which carries the rustls error text, then `Closed`, and never `Connected`.
 
    **Behaviour change:** the peer sees a TLS alert instead of today's application close codes `0x01`–`0x04`. After `Connected`, the verified `PeerId` is read once from `crypto_session().peer_identity()`.
+
 6. **Connection token = TLS exporter.** `export_keying_material(32 bytes, label "minip2p quic connection token", context empty)`. quinn-proto doesn't expose connection IDs. The exporter is bound to the session, as TCP's Noise hash is.
 
    **Accepted rollout limitation:** a quiche-based peer computes a different token. In a same-direction connection race between mixed versions, the two sides can keep opposite connections and close both. Nothing restarts a settled direct dial, so recovery needs an application or discovery redial, and a repeat race can fail the same way. Release notes recommend upgrading every node that dials, including relays, together. Keeping CID-derived tokens would mean parsing handshake headers that quinn-proto owns, which was rejected (see research).
+
 7. **Inbound admission and Retry.** In this order, for each `Incoming`:
    1. Before `listen()`, the endpoint has no server config, so quinn never reports `NewConnection`. It does generate a stateless reply (a reset) for an unknown Initial, so the adapter **drops every `DatagramEvent::Response` while not listening**. `ConnectionEvent`s for its own outbound connections are still delivered. The result is no state and no response, as today, where the adapter accepts only after `listen()`.
    2. At `QuicLimits::max_connections` → `endpoint.ignore`. As today, the capacity check comes before Retry.
@@ -51,6 +53,7 @@ Non-goals:
    4. Otherwise → `endpoint.accept`.
 
    Config: `retry_token_lifetime(10 s)`, today's value, and `validation_token_config(.. sent(0))`, so no NEW_TOKEN is issued and Retry stays the only validation path. quinn's random per-process token key replaces `retry_secret`, and the hand-rolled HMAC token code and its tests are deleted. `dial` checks `max_connections` as today.
+
 8. **Keepalive.** `keep_alive_interval(keepalive_interval_ms(idle_timeout_ms))`, keeping today's clamp `idle_timeout_ms.max(2) / 2`, so a 1 ms idle timeout never yields a zero interval. The custom keepalive code is deleted. A keepalive restarts the idle timer once per receive (RFC 9000 §10.1), as with quiche today, so a dead path closes after roughly the keepalive interval plus the idle timeout.
 9. **Defaults, all set explicitly and recorded in the crate README.**
    - stream receive window `STREAM_RECEIVE_WINDOW` (1,000,000) and connection receive window 10,000,000, fixed (quinn doesn't autotune);
@@ -71,6 +74,7 @@ Non-goals:
 Organized as reviewable commits.
 
 **1a. TLS module.**
+
 - `transports/quic/src/tls.rs` holds the verifiers from the spike, plus the `TimeProvider` and per-dial expected-`PeerId` support from Decision 5.
 - Add `minip2p_tls::certificate_spki(cert_der) -> Result<Vec<u8>, TlsError>`. minip2p-tls already parses with x509-cert, so the QUIC crate doesn't take on `x509-cert`/`der`.
 - Unit tests:
@@ -85,6 +89,7 @@ Organized as reviewable commits.
 **Endpoint.** One per socket, created with `server_config: None`. `listen()` installs the server config with `set_server_config`. Until then, `Response` events are dropped (Decision 7).
 
 **Receive.** Same bounded batch as today: at most `MAX_DATAGRAMS_PER_POLL` datagrams, `recv_from` into a reused buffer, `BytesMut::from(&buf[..len])`, then `endpoint.handle(now, from, None, None, data, &mut buf)`.
+
 - `ConnectionEvent(ch, ev)` → `conn.handle_event(ev)`, and mark `ch` for service.
 - `NewConnection(incoming)` → Decision 7. An accepted connection allocates a minip2p `ConnectionId`, maps it to and from the `ConnectionHandle`, and emits `IncomingConnection` (pre-auth, as today).
 - `Response(transmit)` → best-effort stateless send, as today's `send_stateless_datagram`.
@@ -92,6 +97,7 @@ Organized as reviewable commits.
 - The batch records whether it hit its cap (`recv_saturated`) for `next_deadline`.
 
 **Servicing one connection.** Today's sweep runs this for every connection; #328 narrows it later. Repeat until a pass produces nothing new, capped at a small fixed number of passes:
+
 1. `handle_timeout(now)` if `poll_timeout() <= now`.
 2. Drain `poll()` app events into the stream logic below.
 3. Drain the adapter's send queues and any deferred opens.
@@ -103,11 +109,13 @@ Then cache `poll_timeout()` (quinn needs `&mut self`, while `next_deadline` take
 Every `Transport` call that mutates a connection (`send_stream`, `close_stream_write`, `reset_stream`, `ack_stream`, `open_stream`, `close`) ends by servicing that one connection, so the cached timeout and any output stay current.
 
 **Connection events.**
+
 - `Connected` → read the verified `PeerId` from `peer_identity`, set the token (Decision 6), update the peer index, and emit `Connected`, plus `PeerIdentityVerified` when the peer id changed, as today.
 - `ConnectionLost { reason }` → `TransportEvent::Error { message: reason }`, **except** for a local close (`LocallyClosed`) and an orderly peer close (`ApplicationClosed` or `ConnectionClosed` with error code 0). Those emit only `Closed`, matching quiche, whose orderly peer close drains and then reports `Closed` without an error. `Closed` follows on drain in every case.
 - `HandshakeDataReady` → ignored.
 
 **Stream events.**
+
 - `Opened { dir: Bi }` → `accept(Bi)` loop. For each accepted stream:
   - run `ensure_stream_discovered`, keeping today's refusal rule: while held remote streams are at `max_streams_per_connection`, call `stop(0)` and `reset(0)` and emit nothing;
   - if the stream is admitted, **scan it once immediately**: a new stream's first frame raises `Opened` only, never `Readable`, so a one-packet request with FIN would otherwise stall.
@@ -119,6 +127,7 @@ Every `Transport` call that mutates a connection (`send_stream`, `close_stream_w
 - `Finished` → ignored; half-close bookkeeping is the adapter's, as today.
 
 **Reads (ADR 0012).** A scan calls `recv_stream(id).read(true)` and then loops:
+
 - **With budget left** (`room > 0`), call `chunks.next(room)`:
   - `Some(chunk)` → append its bytes to the stream's read buffer and charge `unacked`;
   - `None` → record FIN;
@@ -133,6 +142,7 @@ Every `Transport` call that mutates a connection (`send_stream`, `close_stream_w
   The probe runs at most once per scan and never emits empty `StreamData`. This keeps today's rule that a FIN or reset right behind the window still surfaces.
 
 After the loop, `finalize()`, then emit in this order:
+
 1. the copied `StreamData`, if any;
 2. the recorded terminal outcome:
    - FIN → `StreamRemoteWriteClosed` and the close check;
@@ -145,12 +155,14 @@ Data therefore always precedes FIN, `StreamClosed` and reset, as today. Finally,
 **Gated streams.** A stream with its budget spent is kept in a `gated: BTreeSet<StreamId>`. `ack_stream` re-scans exactly those streams, with no packet and no event. This replaces `streams_dirty` plus scanning all readable streams.
 
 **Writes.**
+
 - Keep the adapter queue, `max_pending_stream_bytes`, `Full { unsent }`, and the half-free `StreamWritable` rule unchanged.
 - The direct write uses `send_stream(id).write_chunks(&mut [bytes])`; a partial write leaves the unsent tail in place.
 - `Blocked` queues the rest. `Stopped(code)` follows the same path as the `Stopped` event. `ClosedStream` → `StreamSendFailed`.
 - FIN is `finish()`. `reset_stream` is `send_stream.reset(0)` plus `recv_stream.stop(0)`, and a `ClosedStream` error there counts as already done, like quiche's `Done`.
 
 **Opens past peer credit.** quinn's `streams().open(Bi)` returns `None` without peer stream credit and only advances its ids on success. Today `open_stream` succeeds below the local cap and writes queue until credit arrives. The plan keeps that with a pending-open queue whose ids are never cancelled:
+
 - `open_stream` hands out the next sequential local bidi id and pushes it onto `pending_opens` (FIFO). Writes and FIN for it queue in the adapter.
 - Whenever service runs (and on `Available`), the pending opens are bound in FIFO order with `open()`. quinn returns ids in the same sequence because the adapter is the only opener. A mismatch fails the connection with an internal error (`fail_connection`), not just a `debug_assert`.
 - `reset_stream` on a pending stream behaves like any local reset towards the caller, immediately:
@@ -159,6 +171,7 @@ Data therefore always precedes FIN, `StreamClosed` and reset, as today. Finally,
   - exactly one `StreamClosed` is emitted, and its stream state is dropped.
 
   Only its id, marked `reset_on_bind`, stays in `pending_opens`, so the id sequence never diverges.
+
 - Binding a `reset_on_bind` entry calls `open()`, then `send_stream.reset(0)` and `recv_stream.stop(0)`, before any queue drain.
 - **Slot accounting.** Each `pending_opens` entry holds one reservation against `max_streams_per_connection`, separate from stream state. Stream-state GC therefore can't release it early. A live pending stream's reservation becomes its open stream's slot when it binds. A `reset_on_bind` entry releases its reservation exactly once, when it binds. The queue is therefore bounded by the local cap.
 
@@ -167,17 +180,20 @@ Data therefore always precedes FIN, `StreamClosed` and reset, as today. Finally,
 **Dropping the transport** keeps today's order (`lib.rs` `Drop`): retry retained datagrams, close every connection, service each once, and retry retained datagrams again. A close on drop ignores pacing, as today; there is no paced-packet hold left to flush.
 
 **`next_deadline`.**
+
 - Pending events or a saturated receive batch → `IMMEDIATE`.
 - Pending retained datagrams → `+1 ms`.
 - Otherwise, the earliest cached connection timeout mapped through the poll anchor with millisecond round-up. The keepalive deadline is now part of quinn's timeout.
 
 **`diagnostics` feature**, rebuilt on `Connection::stats()`:
+
 - received datagrams, `udp_tx` datagrams and bytes, flushes, lost packets, cwnd, rtt;
 - `DatagramTally` socket counters stay;
 - fields that only made sense for quiche (`quiche_done`, `window_limited_packets`) are removed and the bench docs updated;
 - the `ConnectionDiagnostics` field changes are a breaking change to a feature-gated API, which is acceptable pre-1.0.
 
 **1c. Tests.**
+
 - **Keep and adapt:** `transport_contract.rs` (wording only where it names quiche), `ping_e2e.rs`, `swarm_e2e.rs`, `stream_send_tests.rs`, `recv_batch_tests.rs` (bounded batch, a poisoned queued datagram, sub-millisecond deadlines), plus the dual-stack and wait tests in `lib.rs`.
 - **Rewrite** `two_peer.rs`'s raw-quiche peers as raw quinn-proto peers with hand-built rustls configs: no client certificate, a two-certificate chain, an invalid libp2p certificate, the wrong peer id. Assert `Error` then `Closed` and no `Connected`.
 - **Rewrite** `cid_routing.rs`: two quinn-proto clients sharing one UDP socket connect to one `QuicTransport`, and each connection gets only its own data. This guards the "never route by source address" rule at the adapter level.
@@ -206,6 +222,7 @@ Data therefore always precedes FIN, `StreamClosed` and reset, as today. Finally,
 - `crates/minip2p` tests (`bulk_backpressure`, `simultaneous_dial`, `nat_tests`) must pass unchanged.
 
 **1d. Build, CI and docs cleanup.**
+
 - **Root `Cargo.toml`:** drop `[patch.crates-io]` for boring. In `transports/quic/Cargo.toml`, replace `boring` and `quiche` with `quinn-proto`, `rustls`, `bytes` (already in the lockfile), and drop `hmac` if nothing else uses it.
 - **Lockfiles:** regenerate the workspace lockfile and every standalone one CI checks with `--locked`, including `fuzz/Cargo.lock` and `bindings/` lockfiles.
 - **Native-build workarounds:**
@@ -224,6 +241,7 @@ Data therefore always precedes FIN, `StreamClosed` and reset, as today. Finally,
 - **Release notes for the next minor version:** the token change and the coordinated-upgrade recommendation, rejection signalling, stateless-reset replies, PMTU discovery, and the CID length (8 bytes, down from 20).
 
 **Exit criteria for PR 1:**
+
 - `just test`, `just clippy`, `just fmt` and `just check-nostd` are green.
 - `cargo tree -i boring` and `cargo tree -i quiche` print nothing.
 - `endpoint_throughput/quic` is no worse than `main` measured on the same host in the same session; both numbers go in the PR.
@@ -238,6 +256,7 @@ Wrap each socket in a `quinn_udp::UdpSocketState`.
 **Limits stay in logical datagrams.** `max_pending_datagrams` keeps counting individual UDP datagrams, not GSO transmits, so retained memory doesn't grow by the segment count.
 
 **Sending.**
+
 - Before every `poll_transmit`, recompute the allowance: `max_pending_datagrams` minus the retained datagrams. When it is **zero**, stop polling output; this is today's guard, and quinn panics on `max_datagrams == 0`. Otherwise call `poll_transmit(now, min(state.max_gso_segments(), allowance), ..)`. A retained transmit keeps its `segment_size` and counts as `contents.len().div_ceil(segment_size)` datagrams.
 - Test: a small `max_pending_datagrams` with forced `WouldBlock`. No panic, and logical-datagram accounting stays within the cap.
 - Sending uses `try_send`, and `enable_segmentation_offload` stays on.
@@ -245,6 +264,7 @@ Wrap each socket in a `quinn_udp::UdpSocketState`.
 - Add a test that forces `max_gso_segments == 1`.
 
 **Receiving.**
+
 - `recv` with GRO into one buffer sized `gro_segments() × 64 KiB`, split by `meta.stride`. `meta.ecn` and `meta.dst_ip` are passed to `endpoint.handle`, and transmits pass `ecn` and `src_ip`.
 - `MAX_DATAGRAMS_PER_POLL` counts **logical datagrams**: the batch stops issuing `recv` calls once the count reaches the cap. It always finishes splitting the GRO buffer it already read, so it overshoots by fewer than one GRO batch (Linux GRO allows up to 64 segments). That bound is documented, and needs no remainder state.
 - A saturated batch reports `IMMEDIATE` through `next_deadline`, as in PR 1.
@@ -252,6 +272,7 @@ Wrap each socket in a `quinn_udp::UdpSocketState`.
 **Unchanged:** `send_raw_udp` stays a plain `send_to`, since it isn't QUIC traffic, and the readiness wait still works by peeking.
 
 **Exit:**
+
 - `endpoint_throughput/quic` and `relayed` before and after numbers in the PR;
 - a `bindings-native.yml` dispatch with mobile enabled, plus macOS and Windows builds;
 - a test that a burst larger than the cap is fully consumed without a second readiness edge.
