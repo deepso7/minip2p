@@ -2,6 +2,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::ops::RangeInclusive;
 
 use minip2p_core::{Bytes, Multiaddr, PeerId, Protocol, SansIoProtocol};
 use minip2p_platform::Now;
@@ -94,7 +95,6 @@ struct Connection {
 
 struct ReservationRecord {
     conn_id: ConnectionId,
-    deadline_ms: u64,
 }
 
 struct PendingReservation {
@@ -143,7 +143,6 @@ enum PendingOperation {
 struct HopWorker {
     peer_id: PeerId,
     responder: HopResponder,
-    deadline_ms: Option<u64>,
     request_known: bool,
     is_circuit: bool,
 }
@@ -154,7 +153,6 @@ struct PendingCircuit {
     destination_conn_id: ConnectionId,
     stop_stream: Option<StreamKey>,
     stop: Option<StopInitiator>,
-    stop_deadline_ms: Option<u64>,
     source_pipelined: Vec<u8>,
     destination_pipelined: Vec<u8>,
     source_eof: bool,
@@ -166,7 +164,6 @@ struct Circuit {
     destination_peer_id: PeerId,
     source_stream: StreamKey,
     destination_stream: StreamKey,
-    deadline_ms: Option<u64>,
     bytes: CircuitByteCounts,
     to_destination: Forward,
     to_source: Forward,
@@ -313,7 +310,147 @@ impl Forward {
     }
 }
 
+/// Deadlines keyed by their owner and ordered by due time, so the earliest
+/// and the due ones are found without visiting every owner.
+struct Deadlines<K> {
+    by_key: BTreeMap<K, u64>,
+    by_due: BTreeSet<(u64, K)>,
+}
+
+impl<K: Ord + Clone> Deadlines<K> {
+    fn new() -> Self {
+        Self {
+            by_key: BTreeMap::new(),
+            by_due: BTreeSet::new(),
+        }
+    }
+
+    /// Sets or replaces `key`'s deadline.
+    fn set(&mut self, key: K, deadline_ms: u64) {
+        self.remove(&key);
+        self.by_due.insert((deadline_ms, key.clone()));
+        self.by_key.insert(key, deadline_ms);
+    }
+
+    fn remove(&mut self, key: &K) {
+        if let Some(deadline_ms) = self.by_key.remove(key) {
+            self.by_due.remove(&(deadline_ms, key.clone()));
+        }
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        self.by_key.contains_key(key)
+    }
+
+    /// Deadlines in due order.
+    fn iter(&self) -> impl Iterator<Item = (u64, &K)> {
+        self.by_due
+            .iter()
+            .map(|(deadline_ms, key)| (*deadline_ms, key))
+    }
+
+    fn earliest(&self) -> Option<u64> {
+        self.by_due.first().map(|(deadline_ms, _)| *deadline_ms)
+    }
+
+    /// Owners due at or before `now_ms`, in key order so a sweep handles
+    /// them in the same order however their deadlines fall.
+    fn due(&self, now_ms: u64) -> Vec<K> {
+        let mut due: Vec<K> = self
+            .iter()
+            .take_while(|(deadline_ms, _)| *deadline_ms <= now_ms)
+            .map(|(_, key)| key.clone())
+            .collect();
+        due.sort_unstable();
+        due
+    }
+}
+
+/// Which cancellation path a pending operation belongs to, indexed with
+/// the stream it is cancelled by.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum OperationScope {
+    /// A pending circuit's STOP open, STOP request, or HOP success,
+    /// keyed by the circuit's source stream.
+    Control,
+    /// A HOP worker's response or half-close, or any half-close, keyed by
+    /// the stream it writes.
+    Hop,
+    /// A circuit's forwarding send, keyed by the circuit's source stream.
+    Forward,
+}
+
+impl PendingOperation {
+    /// The scope and stream that cancel this operation; resets are never
+    /// cancelled.
+    fn scope(&self) -> Option<(OperationScope, StreamKey)> {
+        match self {
+            Self::OpenStop { source_stream, .. }
+            | Self::Send {
+                effect:
+                    SendEffect::StopRequest(source_stream) | SendEffect::CommitCircuit(source_stream),
+                ..
+            } => Some((OperationScope::Control, *source_stream)),
+            Self::Send {
+                effect: SendEffect::CommitReservation(PendingReservation { stream, .. }),
+                ..
+            }
+            | Self::Send {
+                effect: SendEffect::CompleteHop(stream),
+                ..
+            }
+            | Self::Close { stream, .. } => Some((OperationScope::Hop, *stream)),
+            Self::Send {
+                effect: SendEffect::Forward { source_stream, .. },
+                ..
+            } => Some((OperationScope::Forward, *source_stream)),
+            Self::Reset { .. } => None,
+        }
+    }
+
+    /// The reservation this operation's response would commit, if any.
+    fn pending_reservation(&self) -> Option<&PendingReservation> {
+        match self {
+            Self::Send {
+                effect: SendEffect::CommitReservation(pending),
+                ..
+            } => Some(pending),
+            _ => None,
+        }
+    }
+}
+
+/// Every stream key on `conn_id`. `StreamKey` orders by connection first,
+/// so a range over it visits only that connection's streams.
+fn connection_streams(conn_id: ConnectionId) -> RangeInclusive<StreamKey> {
+    StreamKey {
+        conn_id,
+        stream_id: StreamId::new(0),
+    }..=StreamKey {
+        conn_id,
+        stream_id: StreamId::new(u64::MAX),
+    }
+}
+
+/// Every `pending_by_destination` entry for destination `conn_id`.
+fn pending_to(conn_id: ConnectionId) -> RangeInclusive<(ConnectionId, StreamKey)> {
+    let first = StreamKey {
+        conn_id: ConnectionId::new(0),
+        stream_id: StreamId::new(0),
+    };
+    let last = StreamKey {
+        conn_id: ConnectionId::new(u64::MAX),
+        stream_id: StreamId::new(u64::MAX),
+    };
+    (conn_id, first)..=(conn_id, last)
+}
+
 /// Whole-service deterministic relay policy and forwarding state.
+///
+/// Lookups by connection, peer, stream, and due time go through indexes
+/// kept beside the primary maps, so per-event and per-tick cost does not
+/// grow with unrelated reservations, circuits, or pending operations. Every
+/// insert and removal goes through the helpers that keep them in step.
 pub struct RelayServerAgent {
     local_peer_id: PeerId,
     config: RelayServerConfig,
@@ -323,14 +460,37 @@ pub struct RelayServerAgent {
     listener_addrs: Vec<Multiaddr>,
     connections: BTreeMap<ConnectionId, Connection>,
     reservations: BTreeMap<PeerId, ReservationRecord>,
+    reservation_deadlines: Deadlines<PeerId>,
     hop_workers: BTreeMap<StreamKey, HopWorker>,
+    /// HOP workers whose control exchange is still bounded by a deadline.
+    hop_deadlines: Deadlines<StreamKey>,
     rejected_hop_streams: BTreeMap<StreamKey, PeerId>,
     pending_circuits: BTreeMap<StreamKey, PendingCircuit>,
+    /// Pending circuits, by source stream, whose STOP exchange has not
+    /// been accepted yet.
+    stop_deadlines: Deadlines<StreamKey>,
+    /// Pending circuits by destination connection, then source stream.
+    pending_by_destination: BTreeSet<(ConnectionId, StreamKey)>,
+    /// Destination (STOP) stream to source stream, for pending circuits
+    /// with an open STOP stream and every committed circuit.
     stop_to_source: BTreeMap<StreamKey, StreamKey>,
     circuits: BTreeMap<StreamKey, Circuit>,
+    circuit_deadlines: Deadlines<StreamKey>,
+    /// Pending plus committed circuits per endpoint peer, a self-circuit
+    /// counted once.
+    peer_circuits: BTreeMap<PeerId, usize>,
     actions: VecDeque<RelayServerAction>,
     events: VecDeque<RelayServerEvent>,
     pending_operations: BTreeMap<RelayServerToken, PendingOperation>,
+    /// `pending_operations` by cancellation scope and stream.
+    operations_by_stream: BTreeSet<(OperationScope, StreamKey, RelayServerToken)>,
+    /// Peers whose new reservation's response is pending.
+    reserving_peers: BTreeSet<PeerId>,
+    /// Peers whose renewal response is pending. Their reservation stays
+    /// alive (and off the timer) until that renewal commits or fails: the
+    /// client was promised the extension. The pending send is still bounded
+    /// by its control stream's own timeout.
+    renewing_peers: BTreeSet<PeerId>,
     next_token: u64,
     last_event_tick_ms: Option<u64>,
     reservation_limiters: AdmissionLimiters,
@@ -375,14 +535,23 @@ impl RelayServerAgent {
             listener_addrs: Vec::new(),
             connections: BTreeMap::new(),
             reservations: BTreeMap::new(),
+            reservation_deadlines: Deadlines::new(),
             hop_workers: BTreeMap::new(),
+            hop_deadlines: Deadlines::new(),
             rejected_hop_streams: BTreeMap::new(),
             pending_circuits: BTreeMap::new(),
+            stop_deadlines: Deadlines::new(),
+            pending_by_destination: BTreeSet::new(),
             stop_to_source: BTreeMap::new(),
             circuits: BTreeMap::new(),
+            circuit_deadlines: Deadlines::new(),
+            peer_circuits: BTreeMap::new(),
             actions: VecDeque::new(),
             events: VecDeque::new(),
             pending_operations: BTreeMap::new(),
+            operations_by_stream: BTreeSet::new(),
+            reserving_peers: BTreeSet::new(),
+            renewing_peers: BTreeSet::new(),
             next_token: 1,
             last_event_tick_ms: None,
         })
@@ -581,7 +750,7 @@ impl RelayServerAgent {
                     true
                 } else if self.pending_circuits.contains_key(&key) {
                     self.abort_pending_connect(key);
-                    self.hop_workers.remove(&key);
+                    self.remove_hop_worker(key);
                     true
                 } else {
                     self.rejected_hop_streams.contains_key(&key)
@@ -639,13 +808,13 @@ impl RelayServerAgent {
                     true
                 } else if self.pending_circuits.contains_key(&key) {
                     self.abort_pending_connect(key);
-                    self.hop_workers.remove(&key);
+                    self.remove_hop_worker(key);
                     true
                 } else {
                     let owned = self.hop_workers.contains_key(&key);
                     if owned {
                         self.cancel_pending_hop_ops(key);
-                        self.hop_workers.remove(&key);
+                        self.remove_hop_worker(key);
                     }
                     owned || self.rejected_hop_streams.remove(&key).is_some()
                 }
@@ -657,38 +826,16 @@ impl RelayServerAgent {
     /// Processes every deadline due at or before `now`.
     pub fn handle_tick(&mut self, now: Now) {
         self.last_event_tick_ms = Some(now.monotonic_ms);
-        let duration_limited: Vec<_> = self
-            .circuits
-            .iter()
-            .filter_map(|(key, circuit)| {
-                circuit
-                    .deadline_ms
-                    .is_some_and(|deadline| deadline <= now.monotonic_ms)
-                    .then_some(*key)
-            })
-            .collect();
-        for key in duration_limited {
+        for key in self.circuit_deadlines.due(now.monotonic_ms) {
             self.close_circuit(key, CircuitCloseReason::DurationLimit);
         }
-        let timed_out: Vec<_> = self
-            .hop_workers
-            .iter()
-            .filter_map(|(key, worker)| {
-                worker
-                    .deadline_ms
-                    .is_some_and(|deadline| deadline <= now.monotonic_ms)
-                    .then_some(*key)
-            })
-            .collect();
-        for key in timed_out {
+        for key in self.hop_deadlines.due(now.monotonic_ms) {
             if self.pending_circuits.contains_key(&key) {
-                if let Some(worker) = self.hop_workers.get_mut(&key) {
-                    worker.deadline_ms = None;
-                }
+                self.hop_deadlines.remove(&key);
                 self.fail_pending_connect(key, Status::ConnectionFailed);
                 continue;
             }
-            if let Some(worker) = self.hop_workers.remove(&key) {
+            if let Some(worker) = self.remove_hop_worker(key) {
                 self.cancel_pending_hop_ops(key);
                 self.abort_pending_connect(key);
                 self.queue_reset(worker.peer_id.clone(), key);
@@ -701,32 +848,16 @@ impl RelayServerAgent {
                 }
             }
         }
-        let stop_timed_out: Vec<_> = self
-            .pending_circuits
-            .iter()
-            .filter_map(|(key, circuit)| {
-                circuit
-                    .stop_deadline_ms
-                    .is_some_and(|deadline| deadline <= now.monotonic_ms)
-                    .then_some(*key)
-            })
-            .collect();
-        for key in stop_timed_out {
+        for key in self.stop_deadlines.due(now.monotonic_ms) {
             self.fail_pending_connect(key, Status::ConnectionFailed);
         }
         // After the timeouts above: one may have cancelled a pending renewal,
         // and its reservation must not outlive this sweep.
-        let renewing = self.renewing_peers();
-        let expired: Vec<_> = self
-            .reservations
-            .iter()
-            .filter_map(|(peer, reservation)| {
-                (reservation.deadline_ms <= now.monotonic_ms && !renewing.contains(peer))
-                    .then_some(peer.clone())
-            })
-            .collect();
-        for peer_id in expired {
-            self.reservations.remove(&peer_id);
+        for peer_id in self.reservation_deadlines.due(now.monotonic_ms) {
+            if self.renewing_peers.contains(&peer_id) {
+                continue;
+            }
+            self.remove_reservation(&peer_id);
             self.events.push_back(RelayServerEvent::ReservationClosed {
                 peer_id,
                 reason: ReservationCloseReason::Expired,
@@ -788,7 +919,7 @@ impl RelayServerAgent {
             source_stream,
             peer_id,
             expected_conn_id,
-        }) = self.pending_operations.remove(&token)
+        }) = self.take_operation(token)
         else {
             if let Ok(stream) = result
                 && let Some(connection) = self.connections.get(&stream.conn_id)
@@ -856,9 +987,7 @@ impl RelayServerAgent {
         result: Result<(), RelayServerSendError>,
         now: Now,
     ) {
-        let Some(PendingOperation::Send { peer_id, effect }) =
-            self.pending_operations.remove(&token)
-        else {
+        let Some(PendingOperation::Send { peer_id, effect }) = self.take_operation(token) else {
             return;
         };
         if let (
@@ -892,12 +1021,10 @@ impl RelayServerAgent {
                         .get(&pending.conn_id)
                         .is_some_and(|connection| connection.peer_id == pending.peer_id)
                     {
-                        self.reservations.insert(
+                        self.insert_reservation(
                             pending.peer_id.clone(),
-                            ReservationRecord {
-                                conn_id: pending.conn_id,
-                                deadline_ms: pending.deadline_ms,
-                            },
+                            pending.conn_id,
+                            pending.deadline_ms,
                         );
                         self.events
                             .push_back(RelayServerEvent::ReservationAccepted {
@@ -976,7 +1103,7 @@ impl RelayServerAgent {
     ) {
         let Some(PendingOperation::Close {
             peer_id, circuit, ..
-        }) = self.pending_operations.remove(&token)
+        }) = self.take_operation(token)
         else {
             return;
         };
@@ -1009,7 +1136,7 @@ impl RelayServerAgent {
         result: Result<(), String>,
         _now: Now,
     ) {
-        let peer_id = match self.pending_operations.remove(&token) {
+        let peer_id = match self.take_operation(token) {
             Some(PendingOperation::Reset { peer_id }) => peer_id,
             _ => return,
         };
@@ -1034,28 +1161,16 @@ impl RelayServerAgent {
 
     /// Returns milliseconds until the earliest timer, with zero meaning due.
     pub fn next_timeout(&self, now: Now) -> Option<u64> {
-        let renewing = self.renewing_peers();
+        // Renewing reservations are off the timer; at most one per pending
+        // renewal is skipped.
         let reservation = self
-            .reservations
+            .reservation_deadlines
             .iter()
-            .filter(|(peer, _)| !renewing.contains(peer))
-            .map(|(_, value)| value.deadline_ms)
-            .min();
-        let hop = self
-            .hop_workers
-            .values()
-            .filter_map(|value| value.deadline_ms)
-            .min();
-        let stop = self
-            .pending_circuits
-            .values()
-            .filter_map(|value| value.stop_deadline_ms)
-            .min();
-        let circuit = self
-            .circuits
-            .values()
-            .filter_map(|value| value.deadline_ms)
-            .min();
+            .find(|(_, peer)| !self.renewing_peers.contains(*peer))
+            .map(|(deadline_ms, _)| deadline_ms);
+        let hop = self.hop_deadlines.earliest();
+        let stop = self.stop_deadlines.earliest();
+        let circuit = self.circuit_deadlines.earliest();
         let limiter = [
             self.reservation_limiters.next_due(),
             self.circuit_limiters.next_due(),
@@ -1146,31 +1261,36 @@ impl RelayServerAgent {
     }
 
     fn on_connection_closed(&mut self, peer_id: &PeerId, conn_id: ConnectionId) {
-        let affected: Vec<_> = self
-            .circuits
-            .iter()
-            .filter_map(|(key, circuit)| {
-                let leg = if circuit.source_stream.conn_id == conn_id {
-                    Some(CircuitLeg::Source)
-                } else if circuit.destination_stream.conn_id == conn_id {
-                    Some(CircuitLeg::Destination)
-                } else {
-                    None
-                }?;
-                Some((*key, leg))
-            })
+        // Circuits are keyed by their source stream, so source legs are a
+        // range; destination legs come through `stop_to_source`, keyed by
+        // the destination stream. Collected by circuit so they close in
+        // circuit order, a circuit with both legs here as its source.
+        let mut affected: BTreeMap<StreamKey, CircuitLeg> = self
+            .stop_to_source
+            .range(connection_streams(conn_id))
+            .map(|(_, source_stream)| *source_stream)
+            .filter(|source_stream| self.circuits.contains_key(source_stream))
+            .map(|source_stream| (source_stream, CircuitLeg::Destination))
             .collect();
+        affected.extend(
+            self.circuits
+                .range(connection_streams(conn_id))
+                .map(|(source_stream, _)| (*source_stream, CircuitLeg::Source)),
+        );
         for (key, leg) in affected {
             self.close_circuit(key, CircuitCloseReason::ConnectionClosed { leg });
         }
-        let pending: Vec<_> = self
-            .pending_circuits
-            .iter()
-            .filter_map(|(source_stream, circuit)| {
-                (source_stream.conn_id == conn_id || circuit.destination_conn_id == conn_id)
-                    .then_some((*source_stream, source_stream.conn_id == conn_id))
-            })
+        // Likewise for pending circuits: whether the source leg closed.
+        let mut pending: BTreeMap<StreamKey, bool> = self
+            .pending_by_destination
+            .range(pending_to(conn_id))
+            .map(|(_, source_stream)| (*source_stream, false))
             .collect();
+        pending.extend(
+            self.pending_circuits
+                .range(connection_streams(conn_id))
+                .map(|(source_stream, _)| (*source_stream, true)),
+        );
         for (source_stream, source_closed) in pending {
             if source_closed {
                 self.abort_pending_connect(source_stream);
@@ -1189,7 +1309,7 @@ impl RelayServerAgent {
             .get(peer_id)
             .is_some_and(|reservation| reservation.conn_id == conn_id)
         {
-            self.reservations.remove(peer_id);
+            self.remove_reservation(peer_id);
             self.events.push_back(RelayServerEvent::ReservationClosed {
                 peer_id: peer_id.clone(),
                 reason: ReservationCloseReason::ConnectionClosed,
@@ -1197,16 +1317,21 @@ impl RelayServerAgent {
         }
         let closed_hop_streams: Vec<_> = self
             .hop_workers
-            .keys()
-            .filter(|key| key.conn_id == conn_id)
-            .copied()
+            .range(connection_streams(conn_id))
+            .map(|(stream, _)| *stream)
             .collect();
         for stream in closed_hop_streams {
             self.cancel_pending_hop_ops(stream);
-            self.hop_workers.remove(&stream);
+            self.remove_hop_worker(stream);
         }
-        self.rejected_hop_streams
-            .retain(|key, _| key.conn_id != conn_id);
+        let rejected: Vec<_> = self
+            .rejected_hop_streams
+            .range(connection_streams(conn_id))
+            .map(|(stream, _)| *stream)
+            .collect();
+        for stream in rejected {
+            self.rejected_hop_streams.remove(&stream);
+        }
     }
 
     fn on_hop_ready(&mut self, peer_id: PeerId, key: StreamKey, is_circuit: bool, now: Now) {
@@ -1227,18 +1352,11 @@ impl RelayServerAgent {
         // the waiting ones would let a peer that never closes open one HOP
         // stream per muxer slot, on every connection it holds. Circuit legs
         // keep their worker too, and are bounded by `max_circuits` and
-        // `max_circuits_per_peer` instead. `StreamKey` orders by connection
-        // first, so the range visits only this connection's workers.
-        let connection_streams = StreamKey {
-            conn_id: key.conn_id,
-            stream_id: StreamId::new(0),
-        }..=StreamKey {
-            conn_id: key.conn_id,
-            stream_id: StreamId::new(u64::MAX),
-        };
+        // `max_circuits_per_peer` instead. The range visits only this
+        // connection's workers.
         let count = self
             .hop_workers
-            .range(connection_streams)
+            .range(connection_streams(key.conn_id))
             .filter(|(stream, _)| {
                 !self.circuits.contains_key(stream) && !self.pending_circuits.contains_key(stream)
             })
@@ -1251,14 +1369,15 @@ impl RelayServerAgent {
         let worker = HopWorker {
             peer_id: peer_id.clone(),
             responder: HopResponder::new(),
-            deadline_ms: Some(
-                now.monotonic_ms
-                    .saturating_add(self.config.control_stream_timeout_ms),
-            ),
             request_known: false,
             is_circuit,
         };
         self.hop_workers.insert(key, worker);
+        self.hop_deadlines.set(
+            key,
+            now.monotonic_ms
+                .saturating_add(self.config.control_stream_timeout_ms),
+        );
     }
 
     /// Delivers an input to a live HOP responder.
@@ -1406,9 +1525,7 @@ impl RelayServerAgent {
             let Some(output) = output else { break };
             match output {
                 StopInitiatorOutput::Outcome(StopInitiatorOutcome::Accepted) => {
-                    if let Some(circuit) = self.pending_circuits.get_mut(&source_stream) {
-                        circuit.stop_deadline_ms = None;
-                    }
+                    self.stop_deadlines.remove(&source_stream);
                     if !self.feed_hop(
                         source_stream,
                         HopResponderInput::AcceptConnect {
@@ -1485,16 +1602,20 @@ impl RelayServerAgent {
     }
 
     fn commit_circuit(&mut self, source_stream: StreamKey, now: Now) {
-        let Some(pending) = self.pending_circuits.remove(&source_stream) else {
+        let Some(pending) = self.remove_pending_circuit(source_stream) else {
             return;
         };
         let Some(destination_stream) = pending.stop_stream else {
             return;
         };
-        let deadline_ms = (self.config.max_circuit_duration_secs != 0).then(|| {
-            now.monotonic_ms
-                .saturating_add(self.config.max_circuit_duration_secs.saturating_mul(1_000))
-        });
+        if self.config.max_circuit_duration_secs != 0 {
+            self.circuit_deadlines.set(
+                source_stream,
+                now.monotonic_ms
+                    .saturating_add(self.config.max_circuit_duration_secs.saturating_mul(1_000)),
+            );
+        }
+        self.hold_peer_circuit(&pending.source_peer_id, &pending.destination_peer_id);
         self.circuits.insert(
             source_stream,
             Circuit {
@@ -1502,7 +1623,6 @@ impl RelayServerAgent {
                 destination_peer_id: pending.destination_peer_id.clone(),
                 source_stream,
                 destination_stream,
-                deadline_ms,
                 bytes: CircuitByteCounts::default(),
                 to_destination: Forward::default(),
                 to_source: Forward::default(),
@@ -1679,10 +1799,10 @@ impl RelayServerAgent {
     }
 
     fn close_circuit(&mut self, source_stream: StreamKey, reason: CircuitCloseReason) {
-        let Some(mut circuit) = self.circuits.remove(&source_stream) else {
+        let Some(mut circuit) = self.remove_circuit(source_stream) else {
             return;
         };
-        self.hop_workers.remove(&source_stream);
+        self.remove_hop_worker(source_stream);
         self.stop_to_source.remove(&circuit.destination_stream);
         self.cancel_forward_ops(source_stream);
         let (reset_source, reset_destination) = match reason {
@@ -1790,15 +1910,8 @@ impl RelayServerAgent {
             .reservations
             .get(&peer_id)
             .is_some_and(|reservation| reservation.conn_id == key.conn_id);
-        let pending_for_peer = self.pending_operations.values().any(|operation| {
-            matches!(
-                operation,
-                PendingOperation::Send {
-                    effect: SendEffect::CommitReservation(pending),
-                    ..
-                } if pending.peer_id == peer_id
-            )
-        });
+        let pending_for_peer =
+            self.reserving_peers.contains(&peer_id) || self.renewing_peers.contains(&peer_id);
         let deadline_ms = now
             .monotonic_ms
             .saturating_add(self.config.reservation_duration_secs.saturating_mul(1_000));
@@ -1890,23 +2003,6 @@ impl RelayServerAgent {
         None
     }
 
-    /// Peers whose renewal response is already on the wire. Their
-    /// reservation stays alive (and off the timer) until that renewal
-    /// commits or fails: the client was promised the extension. The pending
-    /// send is still bounded by its control stream's own timeout.
-    fn renewing_peers(&self) -> BTreeSet<&PeerId> {
-        self.pending_operations
-            .values()
-            .filter_map(|operation| match operation {
-                PendingOperation::Send {
-                    effect: SendEffect::CommitReservation(pending),
-                    ..
-                } if pending.renewed => Some(&pending.peer_id),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// Admission for a new reservation: needs a rate-limit token and room
     /// under `max_reservations` (committed plus pending new ones), and spends
     /// the token only when both hold.
@@ -1923,19 +2019,7 @@ impl RelayServerAgent {
         {
             return false;
         }
-        let pending_initial = self
-            .pending_operations
-            .values()
-            .filter(|operation| {
-                matches!(
-                    operation,
-                    PendingOperation::Send {
-                        effect: SendEffect::CommitReservation(pending),
-                        ..
-                    } if !pending.renewed
-                )
-            })
-            .count();
+        let pending_initial = self.reserving_peers.len();
         if self.reservations.len().saturating_add(pending_initial) >= self.config.max_reservations {
             return false;
         }
@@ -1993,16 +2077,9 @@ impl RelayServerAgent {
             })
         {
             Some(Status::NoReservation)
-        } else if self
-            .pending_circuits
-            .values()
-            .filter(|circuit| {
-                Some(circuit.destination_conn_id) == destination_conn
-                    && circuit.stop_deadline_ms.is_some()
-            })
-            .count()
-            >= self.config.max_pending_stop_requests_per_connection
-        {
+        } else if destination_conn.is_some_and(|conn_id| {
+            self.pending_stop_count(conn_id) >= self.config.max_pending_stop_requests_per_connection
+        }) {
             Some(Status::ResourceLimitExceeded)
         } else {
             None
@@ -2016,7 +2093,7 @@ impl RelayServerAgent {
         self.circuit_limiters
             .consume(&source_peer_id, ip, now.monotonic_ms);
         let destination_conn_id = destination_conn.expect("checked above");
-        self.pending_circuits.insert(
+        self.insert_pending_circuit(
             key,
             PendingCircuit {
                 source_peer_id: source_peer_id.clone(),
@@ -2024,18 +2101,16 @@ impl RelayServerAgent {
                 destination_conn_id,
                 stop_stream: None,
                 stop: None,
-                stop_deadline_ms: Some(
-                    now.monotonic_ms
-                        .saturating_add(self.config.control_stream_timeout_ms),
-                ),
                 source_pipelined: Vec::new(),
                 destination_pipelined: Vec::new(),
                 source_eof: false,
                 destination_eof: false,
             },
+            now.monotonic_ms
+                .saturating_add(self.config.control_stream_timeout_ms),
         );
         let token = self.token();
-        self.pending_operations.insert(
+        self.insert_operation(
             token,
             PendingOperation::OpenStop {
                 source_stream: key,
@@ -2052,15 +2127,14 @@ impl RelayServerAgent {
     }
 
     fn peer_circuit_count(&self, peer_id: &PeerId) -> usize {
-        self.pending_circuits
-            .values()
-            .map(|circuit| (&circuit.source_peer_id, &circuit.destination_peer_id))
-            .chain(
-                self.circuits
-                    .values()
-                    .map(|circuit| (&circuit.source_peer_id, &circuit.destination_peer_id)),
-            )
-            .filter(|(source, destination)| *source == peer_id || *destination == peer_id)
+        self.peer_circuits.get(peer_id).copied().unwrap_or(0)
+    }
+
+    /// Pending circuits to `conn_id` whose STOP exchange is outstanding.
+    fn pending_stop_count(&self, conn_id: ConnectionId) -> usize {
+        self.pending_by_destination
+            .range(pending_to(conn_id))
+            .filter(|(_, source_stream)| self.stop_deadlines.contains(source_stream))
             .count()
     }
 
@@ -2081,7 +2155,7 @@ impl RelayServerAgent {
     }
 
     fn fail_pending_connect(&mut self, source_stream: StreamKey, status: Status) {
-        let Some(circuit) = self.pending_circuits.remove(&source_stream) else {
+        let Some(circuit) = self.remove_pending_circuit(source_stream) else {
             return;
         };
         self.release_pipelined(source_stream, &circuit);
@@ -2095,7 +2169,7 @@ impl RelayServerAgent {
     }
 
     fn abort_pending_connect(&mut self, source_stream: StreamKey) {
-        let Some(circuit) = self.pending_circuits.remove(&source_stream) else {
+        let Some(circuit) = self.remove_pending_circuit(source_stream) else {
             return;
         };
         self.release_pipelined(source_stream, &circuit);
@@ -2108,73 +2182,31 @@ impl RelayServerAgent {
 
     fn abort_pending_connect_both(&mut self, source_stream: StreamKey) {
         self.abort_pending_connect(source_stream);
-        if let Some(worker) = self.hop_workers.remove(&source_stream) {
+        if let Some(worker) = self.remove_hop_worker(source_stream) {
             self.queue_reset(worker.peer_id, source_stream);
         }
     }
 
     fn cancel_pending_control_ops(&mut self, source_stream: StreamKey) {
-        let tokens: Vec<_> = self
-            .pending_operations
-            .iter()
-            .filter_map(|(token, operation)| {
-                let matches = match operation {
-                    PendingOperation::OpenStop {
-                        source_stream: stream,
-                        ..
-                    } => *stream == source_stream,
-                    PendingOperation::Send {
-                        effect: SendEffect::StopRequest(stream) | SendEffect::CommitCircuit(stream),
-                        ..
-                    } => *stream == source_stream,
-                    _ => false,
-                };
-                matches.then_some(*token)
-            })
-            .collect();
-        self.cancel_operations(&tokens);
+        self.cancel_scope(OperationScope::Control, source_stream);
     }
 
     fn cancel_pending_hop_ops(&mut self, stream: StreamKey) {
-        let tokens: Vec<_> = self
-            .pending_operations
-            .iter()
-            .filter_map(|(token, operation)| {
-                let matches = match operation {
-                    PendingOperation::Send {
-                        effect: SendEffect::CommitReservation(pending),
-                        ..
-                    } => pending.stream == stream,
-                    PendingOperation::Send {
-                        effect: SendEffect::CompleteHop(operation_stream),
-                        ..
-                    } => *operation_stream == stream,
-                    PendingOperation::Close {
-                        stream: operation_stream,
-                        ..
-                    } => *operation_stream == stream,
-                    _ => false,
-                };
-                matches.then_some(*token)
-            })
-            .collect();
-        self.cancel_operations(&tokens);
+        self.cancel_scope(OperationScope::Hop, stream);
     }
 
     fn cancel_forward_ops(&mut self, source_stream: StreamKey) {
+        self.cancel_scope(OperationScope::Forward, source_stream);
+    }
+
+    /// Cancels the pending operations `scope` keys to `stream`.
+    fn cancel_scope(&mut self, scope: OperationScope, stream: StreamKey) {
         let tokens: Vec<_> = self
-            .pending_operations
-            .iter()
-            .filter_map(|(token, operation)| {
-                matches!(
-                    operation,
-                    PendingOperation::Send {
-                        effect: SendEffect::Forward { source_stream: stream, .. },
-                        ..
-                    } if *stream == source_stream
-                )
-                .then_some(*token)
-            })
+            .operations_by_stream
+            .range(
+                (scope, stream, RelayServerToken(0))..=(scope, stream, RelayServerToken(u64::MAX)),
+            )
+            .map(|(_, _, token)| *token)
             .collect();
         self.cancel_operations(&tokens);
     }
@@ -2185,7 +2217,7 @@ impl RelayServerAgent {
             return;
         }
         for token in tokens {
-            self.pending_operations.remove(token);
+            self.take_operation(*token);
         }
         self.actions.retain(|action| match action {
             RelayServerAction::OpenStream { token, .. }
@@ -2197,9 +2229,7 @@ impl RelayServerAgent {
     }
 
     fn complete_hop(&mut self, stream: StreamKey) {
-        if let Some(worker) = self.hop_workers.get_mut(&stream) {
-            worker.deadline_ms = None;
-        }
+        self.hop_deadlines.remove(&stream);
     }
 
     fn queue_send(
@@ -2211,7 +2241,7 @@ impl RelayServerAgent {
     ) {
         let data = data.into();
         let token = self.token();
-        self.pending_operations.insert(
+        self.insert_operation(
             token,
             PendingOperation::Send {
                 peer_id: peer_id.clone(),
@@ -2255,7 +2285,7 @@ impl RelayServerAgent {
         circuit: Option<(StreamKey, CircuitLeg)>,
     ) {
         let token = self.token();
-        self.pending_operations.insert(
+        self.insert_operation(
             token,
             PendingOperation::Close {
                 peer_id: peer_id.clone(),
@@ -2272,7 +2302,7 @@ impl RelayServerAgent {
 
     fn queue_reset(&mut self, peer_id: PeerId, stream: StreamKey) {
         let token = self.token();
-        self.pending_operations.insert(
+        self.insert_operation(
             token,
             PendingOperation::Reset {
                 peer_id: peer_id.clone(),
@@ -2283,6 +2313,193 @@ impl RelayServerAgent {
             peer_id,
             stream,
         });
+    }
+
+    // Inserts and removals that keep the indexes in step with their maps.
+
+    fn insert_operation(&mut self, token: RelayServerToken, operation: PendingOperation) {
+        if let Some((scope, stream)) = operation.scope() {
+            self.operations_by_stream.insert((scope, stream, token));
+        }
+        if let Some(pending) = operation.pending_reservation() {
+            // `decide_reservation` admits one pending response per peer.
+            let peers = if pending.renewed {
+                &mut self.renewing_peers
+            } else {
+                &mut self.reserving_peers
+            };
+            peers.insert(pending.peer_id.clone());
+        }
+        self.pending_operations.insert(token, operation);
+    }
+
+    fn take_operation(&mut self, token: RelayServerToken) -> Option<PendingOperation> {
+        let operation = self.pending_operations.remove(&token)?;
+        if let Some((scope, stream)) = operation.scope() {
+            self.operations_by_stream.remove(&(scope, stream, token));
+        }
+        if let Some(pending) = operation.pending_reservation() {
+            if pending.renewed {
+                self.renewing_peers.remove(&pending.peer_id);
+            } else {
+                self.reserving_peers.remove(&pending.peer_id);
+            }
+        }
+        Some(operation)
+    }
+
+    fn insert_reservation(&mut self, peer_id: PeerId, conn_id: ConnectionId, deadline_ms: u64) {
+        self.reservation_deadlines.set(peer_id.clone(), deadline_ms);
+        self.reservations
+            .insert(peer_id, ReservationRecord { conn_id });
+    }
+
+    fn remove_reservation(&mut self, peer_id: &PeerId) {
+        self.reservation_deadlines.remove(peer_id);
+        self.reservations.remove(peer_id);
+    }
+
+    fn remove_hop_worker(&mut self, stream: StreamKey) -> Option<HopWorker> {
+        self.hop_deadlines.remove(&stream);
+        self.hop_workers.remove(&stream)
+    }
+
+    fn insert_pending_circuit(
+        &mut self,
+        source_stream: StreamKey,
+        circuit: PendingCircuit,
+        stop_deadline_ms: u64,
+    ) {
+        self.hold_peer_circuit(&circuit.source_peer_id, &circuit.destination_peer_id);
+        self.pending_by_destination
+            .insert((circuit.destination_conn_id, source_stream));
+        self.stop_deadlines.set(source_stream, stop_deadline_ms);
+        self.pending_circuits.insert(source_stream, circuit);
+    }
+
+    fn remove_pending_circuit(&mut self, source_stream: StreamKey) -> Option<PendingCircuit> {
+        let circuit = self.pending_circuits.remove(&source_stream)?;
+        self.stop_deadlines.remove(&source_stream);
+        self.pending_by_destination
+            .remove(&(circuit.destination_conn_id, source_stream));
+        self.release_peer_circuit(&circuit.source_peer_id, &circuit.destination_peer_id);
+        Some(circuit)
+    }
+
+    fn remove_circuit(&mut self, source_stream: StreamKey) -> Option<Circuit> {
+        let circuit = self.circuits.remove(&source_stream)?;
+        self.circuit_deadlines.remove(&source_stream);
+        self.release_peer_circuit(&circuit.source_peer_id, &circuit.destination_peer_id);
+        Some(circuit)
+    }
+
+    /// Counts one more circuit against each endpoint, a self-circuit once.
+    fn hold_peer_circuit(&mut self, source: &PeerId, destination: &PeerId) {
+        for peer in circuit_endpoints(source, destination) {
+            *self.peer_circuits.entry(peer.clone()).or_default() += 1;
+        }
+    }
+
+    fn release_peer_circuit(&mut self, source: &PeerId, destination: &PeerId) {
+        for peer in circuit_endpoints(source, destination) {
+            if let Some(count) = self.peer_circuits.get_mut(peer) {
+                *count -= 1;
+                if *count == 0 {
+                    self.peer_circuits.remove(peer);
+                }
+            }
+        }
+    }
+
+    /// Asserts every index matches a rebuild from the primary maps.
+    #[cfg(test)]
+    fn assert_indexes_consistent(&self) {
+        fn assert_deadlines<K: Ord + Clone + core::fmt::Debug>(
+            deadlines: &Deadlines<K>,
+            owners: BTreeSet<&K>,
+        ) {
+            let by_due: BTreeSet<_> = deadlines
+                .by_key
+                .iter()
+                .map(|(key, deadline_ms)| (*deadline_ms, key.clone()))
+                .collect();
+            assert_eq!(by_due, deadlines.by_due);
+            let keys: BTreeSet<_> = deadlines.by_key.keys().collect();
+            assert!(keys.is_subset(&owners), "deadline without an owner");
+        }
+        assert_deadlines(&self.hop_deadlines, self.hop_workers.keys().collect());
+        assert_deadlines(&self.stop_deadlines, self.pending_circuits.keys().collect());
+        assert_deadlines(&self.circuit_deadlines, self.circuits.keys().collect());
+        if self.config.max_circuit_duration_secs != 0 {
+            assert_eq!(self.circuit_deadlines.by_key.len(), self.circuits.len());
+        }
+        assert_deadlines(
+            &self.reservation_deadlines,
+            self.reservations.keys().collect(),
+        );
+        assert_eq!(
+            self.reservation_deadlines.by_key.len(),
+            self.reservations.len()
+        );
+
+        let pending_by_destination: BTreeSet<_> = self
+            .pending_circuits
+            .iter()
+            .map(|(key, circuit)| (circuit.destination_conn_id, *key))
+            .collect();
+        assert_eq!(pending_by_destination, self.pending_by_destination);
+        for (key, circuit) in &self.circuits {
+            assert_eq!(
+                self.stop_to_source.get(&circuit.destination_stream),
+                Some(key)
+            );
+        }
+        let mut peer_circuits = BTreeMap::new();
+        let endpoints = self
+            .pending_circuits
+            .values()
+            .map(|circuit| (&circuit.source_peer_id, &circuit.destination_peer_id))
+            .chain(
+                self.circuits
+                    .values()
+                    .map(|circuit| (&circuit.source_peer_id, &circuit.destination_peer_id)),
+            );
+        for (source, destination) in endpoints {
+            for peer in circuit_endpoints(source, destination) {
+                *peer_circuits.entry(peer.clone()).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(peer_circuits, self.peer_circuits);
+
+        let operations_by_stream: BTreeSet<_> = self
+            .pending_operations
+            .iter()
+            .filter_map(|(token, operation)| {
+                operation
+                    .scope()
+                    .map(|(scope, stream)| (scope, stream, *token))
+            })
+            .collect();
+        assert_eq!(operations_by_stream, self.operations_by_stream);
+        let pending_reservations: Vec<_> = self
+            .pending_operations
+            .values()
+            .filter_map(PendingOperation::pending_reservation)
+            .collect();
+        let peers = |renewed: bool| -> BTreeSet<PeerId> {
+            pending_reservations
+                .iter()
+                .filter(|pending| pending.renewed == renewed)
+                .map(|pending| pending.peer_id.clone())
+                .collect()
+        };
+        assert_eq!(peers(true), self.renewing_peers);
+        assert_eq!(peers(false), self.reserving_peers);
+        assert_eq!(
+            pending_reservations.len(),
+            self.renewing_peers.len() + self.reserving_peers.len(),
+            "one pending reservation per peer"
+        );
     }
 
     fn token(&mut self) -> RelayServerToken {
@@ -2308,6 +2525,14 @@ impl RelayServerAgent {
                 detail,
             }));
     }
+}
+
+/// A circuit's distinct endpoint peers.
+fn circuit_endpoints<'a>(
+    source: &'a PeerId,
+    destination: &'a PeerId,
+) -> impl Iterator<Item = &'a PeerId> {
+    core::iter::once(source).chain((destination != source).then_some(destination))
 }
 
 fn first_ip(address: &Multiaddr) -> Option<IpKey> {
@@ -2343,6 +2568,7 @@ mod tests {
     /// The next I/O action, leaving acknowledgements queued for the
     /// backpressure tests that inspect them.
     fn io_action(agent: &mut RelayServerAgent) -> Option<RelayServerAction> {
+        agent.assert_indexes_consistent();
         let index = agent
             .actions
             .iter()
@@ -3808,7 +4034,7 @@ mod tests {
             }
         }
         assert!(agent.owns_stream(source_stream));
-        assert_eq!(agent.hop_workers[&source_stream].deadline_ms, None);
+        assert!(!agent.hop_deadlines.contains(&source_stream));
         agent.actions.clear();
 
         let next = StreamKey {
@@ -4948,6 +5174,144 @@ mod tests {
         assert!(agent.pending_circuits.is_empty());
         assert!(agent.stop_to_source.is_empty());
         assert!(!agent.owns_stream(stop_stream));
+    }
+
+    fn connect_request(destination: &PeerId) -> HopMessage {
+        HopMessage {
+            kind: HopMessageType::Connect,
+            peer: Some(Peer {
+                id: destination.to_bytes(),
+                addrs: Vec::new(),
+            }),
+            reservation: None,
+            limit: None,
+            status: None,
+        }
+    }
+
+    /// Closing a connection that carries one circuit's source leg, another's
+    /// destination leg, and a pending circuit's destination tears each down
+    /// through the indexes, leaving none of them pointing at it.
+    #[test]
+    fn closing_a_connection_with_both_circuit_legs_keeps_indexes_consistent() {
+        // `relay` (conn 60) is the destination of a committed circuit from
+        // `source` (conn 61).
+        let (mut agent, source, relay, _, _) = connected_circuit(RelayServerConfig::default(), 0);
+        let relay_conn = ConnectionId::new(60);
+        let now = Now::from_millis(0);
+
+        // `relay` is also the source of a committed circuit to `far`.
+        let far = PeerId::from_public_key_protobuf(b"far-both-legs");
+        reserve(
+            &mut agent,
+            &far,
+            StreamKey {
+                conn_id: ConnectionId::new(70),
+                stream_id: StreamId::new(1),
+            },
+        );
+        let outbound = StreamKey {
+            conn_id: relay_conn,
+            stream_id: StreamId::new(5),
+        };
+        feed_hop(&mut agent, &relay, outbound, connect_request(&far), &[]);
+        let RelayServerAction::OpenStream { token, .. } = io_action(&mut agent).unwrap() else {
+            panic!("STOP open");
+        };
+        let far_stop = StreamKey {
+            conn_id: ConnectionId::new(70),
+            stream_id: StreamId::new(6),
+        };
+        agent.stream_open_result(token, Ok(far_stop), now);
+        let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap() else {
+            panic!("STOP request");
+        };
+        agent.send_stream_result(token, Ok(()), now);
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: far.clone(),
+                conn_id: far_stop.conn_id,
+                stream_id: far_stop.stream_id,
+                data: Bytes::from(encode_stop_status(Status::Ok).unwrap()),
+            },
+            false,
+            now,
+        );
+        let RelayServerAction::SendStream { token, .. } = io_action(&mut agent).unwrap() else {
+            panic!("HOP success");
+        };
+        agent.send_stream_result(token, Ok(()), now);
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitOpened { .. })
+        ));
+
+        // A third peer's CONNECT to `relay` is still opening its STOP stream.
+        let late = PeerId::from_public_key_protobuf(b"late-both-legs");
+        establish(&mut agent, &late, ConnectionId::new(71));
+        let late_stream = StreamKey {
+            conn_id: ConnectionId::new(71),
+            stream_id: StreamId::new(7),
+        };
+        feed_hop(&mut agent, &late, late_stream, connect_request(&relay), &[]);
+        assert!(matches!(
+            io_action(&mut agent),
+            Some(RelayServerAction::OpenStream { .. })
+        ));
+        assert_eq!(agent.peer_circuit_count(&relay), 3);
+        assert_eq!(agent.pending_stop_count(relay_conn), 1);
+
+        agent.handle_event(
+            &SwarmEvent::ConnectionClosed {
+                peer_id: relay.clone(),
+                conn_id: relay_conn,
+            },
+            false,
+            now,
+        );
+
+        // Circuits close in source-stream order: the outbound one on conn 60
+        // first, then the inbound one from conn 61.
+        let mut closed = Vec::new();
+        let mut denied = 0;
+        let mut reservation_closed = false;
+        while let Some(event) = agent.poll_event() {
+            match event {
+                RelayServerEvent::CircuitClosed {
+                    reason: CircuitCloseReason::ConnectionClosed { leg },
+                    ..
+                } => closed.push(leg),
+                RelayServerEvent::CircuitDenied {
+                    source_peer_id,
+                    status: Status::ConnectionFailed,
+                    ..
+                } if source_peer_id == late => denied += 1,
+                RelayServerEvent::ReservationClosed {
+                    peer_id,
+                    reason: ReservationCloseReason::ConnectionClosed,
+                } if peer_id == relay => reservation_closed = true,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(closed, [CircuitLeg::Source, CircuitLeg::Destination]);
+        assert_eq!(denied, 1);
+        assert!(reservation_closed);
+
+        agent.assert_indexes_consistent();
+        assert_eq!(agent.circuit_count(), 0);
+        for peer in [&source, &relay, &far, &late] {
+            assert_eq!(agent.peer_circuit_count(peer), 0);
+        }
+        assert_eq!(agent.pending_stop_count(relay_conn), 0);
+        assert!(agent.stop_to_source.is_empty());
+        assert!(
+            agent
+                .hop_workers
+                .range(connection_streams(relay_conn))
+                .next()
+                .is_none()
+        );
+        assert!(!agent.reservation_deadlines.contains(&relay));
     }
 
     fn data(peer_id: &PeerId, stream: StreamKey, data: &'static [u8]) -> SwarmEvent {

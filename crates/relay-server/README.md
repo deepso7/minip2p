@@ -4,6 +4,8 @@
 
 The host supplies a `Now`, feeds Swarm events, drains actions, and echoes every open/send/close/reset result with its token. `AckStream` actions carry no token: the agent acknowledges the stream data it claims itself, so the host must not. Drain a claimed input and all of its synchronous results to quiescence before delivering another transport event. The first `handle_event` at each `Now` sample processes due deadlines before dispatching that event, so deadlines win at equality. Call `handle_tick(now)` to force that sweep without an event. The service assumes Swarm's single live connection per peer but keeps exact connection and stream identities so stale inputs from a replaced connection cannot mutate replacement state. Pass `is_circuit` for the event's connection (for `ConnectionReplaced`, the `new` one) and record each new connection's remote address with `set_connection_addr`, including `new` after a replacement.
 
+Admission, cancellation, connection close, `next_timeout`, and a tick with nothing due are indexed by connection, peer, stream, and deadline, so their cost does not grow with unrelated reservations, circuits, or pending operations. The `relay_server_event_ir` bench runs each case at 100, 1k, and 10k reservations and circuits to show it.
+
 ## Compatibility contract
 
 | Area | Behavior | Classification |
