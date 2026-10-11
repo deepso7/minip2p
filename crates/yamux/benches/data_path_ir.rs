@@ -1,7 +1,7 @@
 use gungraun::prelude::*;
 use minip2p_core::Bytes;
 use minip2p_yamux::{
-    FLAG_SYN, Frame, FrameDecoder, FrameType, YamuxOutput, YamuxRole, YamuxSession,
+    FLAG_SYN, Frame, FrameDecoder, FrameType, YamuxConfig, YamuxOutput, YamuxRole, YamuxSession,
 };
 use std::hint::black_box;
 
@@ -104,8 +104,50 @@ fn queued_send_16kib_window_updates(input: (YamuxSession, u32, Vec<u8>, Vec<u8>)
     }
 }
 
+const IDLE_STREAMS: usize = 1024;
+const ACTIVE_STREAMS: usize = 8;
+const SPARSE_LEN: usize = 64;
+
+/// A client with `IDLE_STREAMS` opened, announced, idle streams, the
+/// `ACTIVE_STREAMS` of them spread evenly across the ids to send on, and the
+/// payload to send.
+fn idle_streams_sender() -> (YamuxSession, Vec<u32>, Vec<u8>) {
+    let config = YamuxConfig {
+        max_streams: IDLE_STREAMS,
+        ..YamuxConfig::default()
+    };
+    let mut session = YamuxSession::with_config(YamuxRole::Client, config).expect("config");
+    let streams: Vec<u32> = (0..IDLE_STREAMS)
+        .map(|_| session.open_stream().expect("open stream"))
+        .collect();
+    while session.poll_output().is_some() {}
+    let active = streams
+        .iter()
+        .copied()
+        .step_by(IDLE_STREAMS / ACTIVE_STREAMS)
+        .collect();
+    (session, active, vec![0x5a; SPARSE_LEN])
+}
+
+// Many open, idle streams with a few doing work: the per-poll cost of
+// finding the streams that owe a frame.
+#[library_benchmark]
+#[bench::sparse_send_8_of_1024_streams(idle_streams_sender())]
+fn sparse_send_8_of_1024_streams(input: (YamuxSession, Vec<u32>, Vec<u8>)) {
+    let (mut session, active, data) = input;
+    for stream in active {
+        session
+            .send(stream, Bytes::from(data.clone()))
+            .expect("send");
+    }
+    while let Some(frame) = session.poll_frame() {
+        black_box(frame);
+    }
+}
+
 library_benchmark_group!(
     name = benches;
-    benchmarks = session_send_and_drain, session_receive_and_drain, queued_send_16kib_window_updates
+    benchmarks = session_send_and_drain, session_receive_and_drain, queued_send_16kib_window_updates,
+        sparse_send_8_of_1024_streams
 );
 gungraun::main!(library_benchmark_groups = benches);

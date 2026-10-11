@@ -1,5 +1,6 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
+use core::ops::Bound;
 
 use minip2p_core::{Bytes, retain_slice};
 use minip2p_platform::{Deadline, Now};
@@ -188,6 +189,14 @@ pub struct YamuxSession {
     peer_control: usize,
     /// Streams whose last `send` was Full and that want a Writable.
     writable_armed: BTreeSet<u32>,
+    /// Streams that owe a standalone window update
+    /// ([`StreamState::needs_control_frame`]), so output polling never scans
+    /// idle streams. Kept in sync by [`Self::index_work`].
+    control_due: BTreeSet<u32>,
+    /// Streams with a data or `FIN` frame to pull
+    /// ([`StreamState::has_sendable_data`]). Kept in sync by
+    /// [`Self::index_work`].
+    sendable: BTreeSet<u32>,
     /// Round-robin position for data frames: the last stream framed.
     send_cursor: u32,
     total_buffered_send: usize,
@@ -248,6 +257,8 @@ impl YamuxSession {
             control: VecDeque::new(),
             peer_control: 0,
             writable_armed: BTreeSet::new(),
+            control_due: BTreeSet::new(),
+            sendable: BTreeSet::new(),
             send_cursor: 0,
             total_buffered_send: 0,
             failed: false,
@@ -312,6 +323,7 @@ impl YamuxSession {
         self.next_stream_id = stream.checked_add(2);
         self.streams
             .insert(stream, StreamState::outbound(&self.config));
+        self.index_work(stream);
         Ok(stream)
     }
 
@@ -349,6 +361,7 @@ impl YamuxSession {
                 .push_back(QueuedChunk::new(data.slice(..accepted), data.len()));
             state.buffered_send += accepted;
             self.total_buffered_send += accepted;
+            self.index_work(stream);
         }
         if accepted == data.len() {
             return Ok(());
@@ -373,6 +386,7 @@ impl YamuxSession {
         if !state.local_write_closed {
             state.close_pending = true;
         }
+        self.index_work(stream);
         self.disarm_writable(stream);
         Ok(())
     }
@@ -449,6 +463,7 @@ impl YamuxSession {
         if state.acked_since_update > self.config.receive_window / 2 {
             state.pending_credit += u64::from(state.acked_since_update);
             state.acked_since_update = 0;
+            self.index_work(stream);
         }
         Ok(())
     }
@@ -515,6 +530,7 @@ impl YamuxSession {
         if self.failed || self.local_go_away || self.remote_go_away {
             return None;
         }
+        debug_assert!(self.work_indexed(), "stream work index out of sync");
         if let Some(frame) = self.deferred_control_frame() {
             self.dirty = true;
             return Some(frame);
@@ -540,9 +556,7 @@ impl YamuxSession {
         if self.failed || self.local_go_away || self.remote_go_away {
             return false;
         }
-        self.streams
-            .values()
-            .any(|state| state.needs_control_frame() || state.has_sendable_data())
+        !self.control_due.is_empty() || !self.sendable.is_empty()
     }
 
     /// Returns true when no event or frame is pending.
@@ -632,6 +646,7 @@ impl YamuxSession {
                 stream,
                 StreamState::inbound(&self.config, DEFAULT_RECEIVE_WINDOW),
             );
+            self.index_work(stream);
             self.events
                 .push_back(YamuxOutput::IncomingStream { stream });
         } else if !self.streams.contains_key(&stream) {
@@ -723,6 +738,7 @@ impl YamuxSession {
                 .checked_add(frame.value())
                 .ok_or(YamuxError::WindowOverflow { stream })?;
         }
+        self.index_work(stream);
 
         let mut remote_closed = false;
         let fully_closed;
@@ -760,16 +776,15 @@ impl YamuxSession {
     /// The next stream's open flag or returned receive credit, as a
     /// standalone window update.
     fn deferred_control_frame(&mut self) -> Option<Vec<u8>> {
-        let (&stream, state) = self
-            .streams
-            .iter_mut()
-            .find(|(_, state)| state.needs_control_frame())?;
+        let stream = *self.control_due.first()?;
+        let state = self.streams.get_mut(&stream)?;
         let flags = state.take_open_flag();
         let credit = state.pending_credit.min(u64::from(u32::MAX)) as u32;
         state.pending_credit -= u64::from(credit);
         // Pending credit is only ever what the window gave up, so this never
         // saturates.
         state.receive_window = state.receive_window.saturating_add(credit);
+        self.index_work(stream);
         Some(Frame::window_update(stream, flags, credit).ok()?.encode())
     }
 
@@ -777,11 +792,12 @@ impl YamuxSession {
     /// `FIN` once its accepted bytes have all gone.
     fn data_frame(&mut self) -> Option<Vec<u8>> {
         let after = self.send_cursor;
-        let stream = self
-            .streams
-            .range(after.saturating_add(1)..)
-            .chain(self.streams.range(..=after))
-            .find_map(|(id, state)| state.has_sendable_data().then_some(*id))?;
+        // Exclusive, so a sendable `u32::MAX` cannot keep the turn.
+        let stream = *self
+            .sendable
+            .range((Bound::Excluded(after), Bound::Unbounded))
+            .chain(self.sendable.range(..=after))
+            .next()?;
         self.send_cursor = stream;
         let max_frame_len = self.config.max_frame_len as usize;
         let state = self.streams.get_mut(&stream)?;
@@ -824,6 +840,7 @@ impl YamuxSession {
                 self.remove_stream(stream, true);
             }
         }
+        self.index_work(stream);
         Some(frame)
     }
 
@@ -859,6 +876,37 @@ impl YamuxSession {
             events.push_back(YamuxOutput::Writable { stream: *stream });
             false
         });
+    }
+
+    /// Files `stream` in the work indexes by its current state. Every change
+    /// that can flip [`StreamState::needs_control_frame`] or
+    /// [`StreamState::has_sendable_data`] calls this; a removed stream leaves
+    /// both.
+    fn index_work(&mut self, stream: u32) {
+        let (control, data) = self.streams.get(&stream).map_or((false, false), |state| {
+            (state.needs_control_frame(), state.has_sendable_data())
+        });
+        for (index, member) in [(&mut self.control_due, control), (&mut self.sendable, data)] {
+            if member {
+                index.insert(stream);
+            } else {
+                index.remove(&stream);
+            }
+        }
+    }
+
+    /// Whether the work indexes match a scan of every stream; checked by
+    /// debug builds (tests and fuzzing) on each output poll.
+    fn work_indexed(&self) -> bool {
+        let scanned = |test: fn(&StreamState) -> bool| {
+            self.streams
+                .iter()
+                .filter(|(_, state)| test(state))
+                .map(|(id, _)| *id)
+                .collect::<BTreeSet<_>>()
+        };
+        scanned(StreamState::needs_control_frame) == self.control_due
+            && scanned(StreamState::has_sendable_data) == self.sendable
     }
 
     fn queue_reset_for_unknown(&mut self, stream: u32) -> Result<(), YamuxError> {
@@ -900,6 +948,8 @@ impl YamuxSession {
     /// unsettled, keeping its slot; a local reset settles it afterwards.
     fn remove_stream(&mut self, stream: u32, emit: bool) {
         self.disarm_writable(stream);
+        self.control_due.remove(&stream);
+        self.sendable.remove(&stream);
         if let Some(state) = self.streams.remove(&stream) {
             if state.unacked != 0 {
                 self.unsettled.insert(stream, state.unacked);
@@ -922,6 +972,8 @@ impl YamuxSession {
         self.streams.clear();
         self.unsettled.clear();
         self.writable_armed.clear();
+        self.control_due.clear();
+        self.sendable.clear();
         // Every write side ended: no Writable, not even one already queued.
         self.events
             .retain(|event| !matches!(event, YamuxOutput::Writable { .. }));
@@ -945,6 +997,8 @@ impl YamuxSession {
         self.streams.clear();
         self.unsettled.clear();
         self.writable_armed.clear();
+        self.control_due.clear();
+        self.sendable.clear();
         self.total_buffered_send = 0;
         self.decoder.clear();
         self.events.clear();
@@ -1176,6 +1230,48 @@ mod tests {
             assert_eq!(payloads(&mut client), expected);
         }
         assert_eq!(client.total_buffered_send(), 0);
+    }
+
+    #[test]
+    fn data_frames_rotate_across_sendable_streams() {
+        let mut limits = config();
+        limits.max_frame_len = 2;
+        let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        let [a, b, c, idle] = [(); 4].map(|_| client.open_stream().unwrap());
+        // Streams with nothing to send open with standalone SYNs first.
+        client.send(a, Bytes::from(b"a1a2a3".to_vec())).unwrap();
+        client.send(c, Bytes::from(b"c1".to_vec())).unwrap();
+        let next = |client: &mut YamuxSession| {
+            let frame = decode(&outbound(client));
+            (frame.stream_id(), frame.payload().to_vec())
+        };
+        assert_eq!(next(&mut client), (b, Vec::new()));
+        assert_eq!(next(&mut client), (idle, Vec::new()));
+        assert_eq!(next(&mut client), (a, b"a1".to_vec()));
+        // A stream that becomes sendable joins the rotation in id order.
+        client.send(b, Bytes::from(b"b1b2".to_vec())).unwrap();
+        assert_eq!(next(&mut client), (b, b"b1".to_vec()));
+        assert_eq!(next(&mut client), (c, b"c1".to_vec()));
+        assert_eq!(next(&mut client), (a, b"a2".to_vec()));
+        assert_eq!(next(&mut client), (b, b"b2".to_vec()));
+        assert_eq!(next(&mut client), (a, b"a3".to_vec()));
+        assert_eq!(client.poll_frame(), None);
+    }
+
+    #[test]
+    fn the_highest_stream_id_does_not_starve_the_rotation() {
+        let mut limits = config();
+        limits.max_frame_len = 2;
+        let mut server = YamuxSession::with_config(YamuxRole::Server, limits).unwrap();
+        for stream in [1, u32::MAX] {
+            let syn = Frame::window_update(stream, FLAG_SYN, 0).unwrap().encode();
+            server.handle_data(&syn).unwrap();
+            server.send(stream, Bytes::from(b"xxxx".to_vec())).unwrap();
+        }
+        let order: Vec<_> = core::iter::from_fn(|| server.poll_frame())
+            .map(|frame| decode(&frame).stream_id())
+            .collect();
+        assert_eq!(order, [1, u32::MAX, 1, u32::MAX]);
     }
 
     #[test]

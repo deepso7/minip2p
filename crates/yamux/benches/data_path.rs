@@ -3,12 +3,16 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use minip2p_yamux::{
-    FLAG_SYN, Frame, FrameDecoder, FrameType, HEADER_LEN, YamuxOutput, YamuxRole, YamuxSession,
+    FLAG_SYN, Frame, FrameDecoder, FrameType, HEADER_LEN, YamuxConfig, YamuxOutput, YamuxRole,
+    YamuxSession,
 };
 
 const PAYLOAD_LEN: usize = 64 * 1024;
 const QUEUED_LEN: usize = 256 * 1024;
 const WINDOW_STEP: u32 = 16 * 1024;
+const IDLE_STREAMS: usize = 1024;
+const ACTIVE_STREAMS: usize = 8;
+const SPARSE_LEN: usize = 64;
 
 fn assert_payload_frame(output: YamuxOutput, payload: &[u8]) {
     match output {
@@ -116,6 +120,56 @@ fn yamux_data_path(c: &mut Criterion) {
         );
     });
     group.finish();
+
+    // Many open, idle streams with a few doing work: the per-poll cost of
+    // finding the streams that owe a frame. The window updates return the
+    // spent credit so the session stays in a steady state.
+    let (mut session, active) = idle_streams_sender();
+    let sparse = vec![0x5a; SPARSE_LEN];
+    let refills = active
+        .iter()
+        .flat_map(|&stream| {
+            Frame::window_update(stream, 0, SPARSE_LEN as u32)
+                .expect("valid frame")
+                .encode()
+        })
+        .collect::<Vec<u8>>();
+    let mut group = c.benchmark_group("yamux/1024_streams");
+    group.bench_function("sparse_send_8_streams", |b| {
+        b.iter(|| {
+            for &stream in &active {
+                session
+                    .send(stream, Bytes::from(sparse.clone()))
+                    .expect("send");
+            }
+            while let Some(frame) = session.poll_frame() {
+                black_box(frame);
+            }
+            session.handle_data(&refills).expect("window updates");
+        });
+    });
+    group.finish();
+}
+
+/// A client with `IDLE_STREAMS` opened, announced, idle streams, and the
+/// `ACTIVE_STREAMS` of them spread evenly across the ids that the sparse
+/// bench sends on.
+fn idle_streams_sender() -> (YamuxSession, Vec<u32>) {
+    let config = YamuxConfig {
+        max_streams: IDLE_STREAMS,
+        ..YamuxConfig::default()
+    };
+    let mut session = YamuxSession::with_config(YamuxRole::Client, config).expect("config");
+    let streams = (0..IDLE_STREAMS)
+        .map(|_| session.open_stream().expect("open stream"))
+        .collect::<Vec<_>>();
+    while session.poll_output().is_some() {}
+    let active = streams
+        .iter()
+        .copied()
+        .step_by(IDLE_STREAMS / ACTIVE_STREAMS)
+        .collect();
+    (session, active)
 }
 
 /// A client stream that has spent its whole initial send window.
