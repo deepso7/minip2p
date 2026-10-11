@@ -45,9 +45,9 @@ default-filter = '''
   )
 '''
 
-# Two tests wait on quiche's idle timer — `stop_sending_drops_queued_writes_…`
+# Two tests wait on the QUIC engine's idle timer — `stop_sending_drops_queued_writes_…`
 # and `quic_deadline_is_exposed_…`. Its effective value is max(idle, 3×PTO).
-# PTO follows the RTT quiche measures, and a descheduled thread inflates that,
+# PTO follows the RTT the engine measures, and a descheduled thread inflates that,
 # so under load the timer these tests are waiting for moves further away the
 # more loaded the box is — a margin cannot be picked that survives it. They take
 # the box instead.

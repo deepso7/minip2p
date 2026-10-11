@@ -2,9 +2,9 @@ use core::fmt;
 
 /// A value both ends of one established connection compute identically.
 ///
-/// Adapters derive it from handshake state the two ends share -- QUIC from
-/// the connection's two connection IDs, Noise-secured byte streams from the
-/// Noise handshake hash -- and attach it to the [`ConnectionEndpoint`] of
+/// Adapters derive it from handshake state the two ends share -- QUIC from a
+/// TLS exporter value, Noise-secured byte streams from the Noise handshake
+/// hash -- and attach it to the [`ConnectionEndpoint`] of
 /// `Connected` and `PeerIdentityVerified`. It is not secret and identifies
 /// nothing on its own; its use is to let both peers make the same choice
 /// between two connections without talking to each other, which is how the

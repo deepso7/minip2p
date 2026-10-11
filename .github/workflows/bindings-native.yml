@@ -105,7 +105,6 @@ jobs:
               set -euo pipefail
               apk add --no-cache --upgrade \
                 --repository https://dl-cdn.alpinelinux.org/alpine/v3.23/main \
-                clang20-libclang=20.1.8-r1 \
                 nodejs npm
               export PATH=/usr/bin:$PATH
               npm install --global --prefix /opt/pnpm pnpm@12.5.1
@@ -114,7 +113,6 @@ jobs:
               rustup default 1.91
               export CC=gcc
               export CXX=g++
-              export LIBCLANG_PATH=/usr/lib/llvm20/lib
               export RUSTFLAGS="-C target-feature=-crt-static"
               cargo build --release --locked --manifest-path ../../crates/nodejs/Cargo.toml
               case "$TARGET" in

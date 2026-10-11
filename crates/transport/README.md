@@ -9,7 +9,7 @@ This crate defines the transport abstraction that concrete adapters implement �
 - `Transport` trait with a `poll(now)`-based event model; the host supplies the time.
 - `ConnectionId` and `StreamId` identifiers, with `ConnectionNamespace` keeping each transport's id space disjoint.
 - Connection lifecycle events (`Connected`, `Closed`, `IncomingConnection`, `PeerIdentityVerified`, `Listening`).
-- `ConnectionToken`: a 32-byte value both ends of one connection compute identically, set on the `ConnectionEndpoint` of `Connected`/`PeerIdentityVerified` by transports that can derive one (QUIC from its connection IDs, TCP from the Noise handshake hash). The swarm uses it to settle two same-direction connections to one peer the same way on both sides; transports without one leave it `None`.
+- `ConnectionToken`: a 32-byte value both ends of one connection compute identically, set on the `ConnectionEndpoint` of `Connected`/`PeerIdentityVerified` by transports that can derive one (QUIC from a TLS exporter value, TCP from the Noise handshake hash). The swarm uses it to settle two same-direction connections to one peer the same way on both sides; transports without one leave it `None`.
 - Stream lifecycle events (`StreamOpened`, `IncomingStream`, `StreamData`, `StreamWritable`, `StreamRemoteWriteClosed`, `StreamWriteStopped`, `StreamClosed`). `StreamWriteStopped` is QUIC's STOP_SENDING; byte-stream transports never emit it.
 - Stream payloads are `Bytes` (`minip2p_core::Bytes`, re-exported here), so fan-out and forwarding clone a handle instead of the bytes.
 - Read backpressure (ADR 0012): each stream delivers at most its receive budget (its per-stream receive window) of `StreamData` bytes that were not acknowledged with `ack_stream`. Whoever consumes the bytes acknowledges them, which is what returns credit to the sender, so a reader that never acknowledges stalls its sender. A closed stream with unacknowledged bytes keeps its slot until they are acknowledged or a local `reset_stream` abandons them, and inbound streams past the limit are refused. Over-acknowledging is `TransportError::AckExceedsDelivered`, naming the stream and both counts; acknowledging a settled or unknown stream is a no-op.
@@ -117,7 +117,7 @@ impl Transport for MyTransport {
 
 The host samples time once per drive iteration and passes that `Now` to `poll()`, so every transport, agent, and runtime in one iteration observes the same instant. An adapter that schedules work retains the last sample it was given and reports the resulting absolute `Deadline` from `next_deadline()`, which the host uses to decide how long it may idle.
 
-A portable adapter should read no clock of its own. An adapter wrapping a library that keeps its own internal clock may still do so — `minip2p-quic` wraps quiche, which reads `Instant::now()` internally — but everything it reports back to the host, deadlines above all, must be expressed on the timeline of the samples it was given. An adapter with its own clock is inherently `std`-only.
+A portable adapter should read no clock of its own. An adapter that needs finer time than the host's millisecond samples may still keep a clock — `minip2p-quic` samples `Instant::now()` once per poll and runs its QUIC engine's timers on that — but everything it reports back to the host, deadlines above all, must be expressed on the timeline of the samples it was given. An adapter with its own clock is inherently `std`-only.
 
 ## Blocking waits (`std` only)
 
@@ -157,4 +157,4 @@ minip2p-transport = { path = "crates/transport", default-features = false }
 
 ## Scope
 
-This crate defines the transport contract only. Concrete adapters live in separate crates: `minip2p-tcp` (`no_std + alloc`, over a pluggable byte-stream provider) and `minip2p-quic` (`std`-only, quiche-based).
+This crate defines the transport contract only. Concrete adapters live in separate crates: `minip2p-tcp` (`no_std + alloc`, over a pluggable byte-stream provider) and `minip2p-quic` (`std`-only, quinn-proto-based).

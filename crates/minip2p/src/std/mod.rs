@@ -88,7 +88,7 @@ pub use minip2p_pubsub::{
 #[cfg(feature = "quic")]
 pub use minip2p_quic::QuicLimits;
 #[cfg(feature = "quic")]
-use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
+use minip2p_quic::{QuicNodeConfig, QuicTransport};
 #[cfg(feature = "relay-server")]
 pub use minip2p_relay_server::{
     CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
@@ -2175,16 +2175,11 @@ fn bind_transports(
             if want_quic && !quic_addrs.is_empty() {
                 let config =
                     QuicNodeConfig::new(_keypair.clone()).with_limits(_options.quic_limits.clone());
-                let transport = match quic_addrs.as_slice() {
-                    [address] => QuicEndpoint::bind_multiaddr(config, address)?,
-                    [first, second] => QuicEndpoint::bind_dual_multiaddr(config, first, second)?,
-                    // `listen_on` allows at most one QUIC address per family.
-                    _ => {
-                        return Err(Error::Invariant {
-                            reason: "more than one QUIC listen address per IP family",
-                        });
-                    }
-                };
+                // `listen_on` allows at most one QUIC address per family, which
+                // is what the transport binds: one socket per family.
+                let addresses: Vec<Multiaddr> =
+                    quic_addrs.iter().map(|&address| address.clone()).collect();
+                let transport = QuicTransport::bind(config, &addresses)?;
                 let namespaces = transport.namespaces();
                 insert_member(&mut set, TransportKind::Quic, namespaces, transport)?;
             }

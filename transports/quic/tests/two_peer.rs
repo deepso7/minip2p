@@ -1,12 +1,14 @@
-use std::net::UdpSocket;
-
 use minip2p_core::PeerAddr;
+use minip2p_identity::Ed25519Keypair;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_transport::{Bytes, ConnectionId, StreamId, Transport, TransportError, TransportEvent};
-use quiche::ConnectionId as QuicConnectionId;
 
 mod common;
-use common::{drive_pair_once, setup_pair};
+#[path = "common/raw.rs"]
+#[expect(dead_code, reason = "stream helpers serve the routing tests")]
+mod raw;
+use common::{drive_pair_once, loopback, peer_addr, setup_pair};
+use raw::{Identity, RawPeer};
 
 fn wait_for_connection(
     server: &mut QuicTransport,
@@ -292,333 +294,161 @@ fn close_connection_is_idempotent_after_close_started() {
     client.close(client_conn_id).expect("first close");
     client
         .close(client_conn_id)
-        .expect("second close should ignore quiche Done");
+        .expect("a second close is a no-op");
+}
+
+/// Polls `transport` and pumps `raw` until the transport reports `Closed`,
+/// returning every event it saw.
+fn events_until_closed(transport: &mut QuicTransport, raw: &mut RawPeer) -> Vec<TransportEvent> {
+    let mut events = Vec::new();
+    for _ in 0..1_000 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        raw.pump();
+        events.extend(transport.poll(common::now()).expect("poll"));
+        raw.pump();
+        if events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Closed { .. }))
+        {
+            break;
+        }
+    }
+    events
+}
+
+/// The handshake failed inside TLS: the local caller saw `Error` carrying
+/// `reason`, then `Closed`, and never `Connected` or an identity.
+fn assert_rejected(events: &[TransportEvent], reason: &str) {
+    let error = events.iter().position(
+        |event| matches!(event, TransportEvent::Error { message, .. } if message.contains(reason)),
+    );
+    let closed = events
+        .iter()
+        .position(|event| matches!(event, TransportEvent::Closed { .. }));
+    assert!(
+        matches!((error, closed), (Some(error), Some(closed)) if error < closed),
+        "expected Error({reason}) then Closed: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            TransportEvent::Connected { .. } | TransportEvent::PeerIdentityVerified { .. }
+        )),
+        "a rejected peer must never connect: {events:?}"
+    );
+}
+
+/// A listener, and a raw client dialing it as `identity`.
+fn listener_and_raw_client(identity: Option<Identity>) -> (QuicTransport, RawPeer) {
+    let mut server = loopback(QuicNodeConfig::generate());
+    server.listen_on_bound_addrs().expect("server listen");
+    let mut client = RawPeer::bind(None);
+    client.connect(
+        server.local_socket_addrs().remove(0),
+        raw::client_config(identity),
+    );
+    (server, client)
 }
 
 #[test]
 fn listener_rejects_dialer_without_mtls_identity() {
-    let mut server =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");
-    server.listen_on_bound_addr().expect("server listen");
-    let server_addr = server.local_addr();
-
-    let client_socket = UdpSocket::bind("127.0.0.1:0").expect("client socket");
-    client_socket
-        .set_nonblocking(true)
-        .expect("client socket nonblocking");
-    let client_addr = client_socket.local_addr().expect("client local addr");
-
-    let mut config = raw_quiche_config(None, &[]);
-    let scid = QuicConnectionId::from_vec(vec![0x24; quiche::MAX_CONN_ID_LEN]);
-    let mut conn = quiche::connect(None, &scid, client_addr, server_addr, &mut config)
-        .expect("raw quiche connect");
-
-    flush_raw_quiche_client(&mut conn, &client_socket);
-
-    let mut saw_connected = false;
-    let mut saw_verified = false;
-
-    for _ in 0..100 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        for event in server.poll(common::now()).expect("server poll") {
-            saw_connected |= matches!(event, TransportEvent::Connected { .. });
-            saw_verified |= matches!(event, TransportEvent::PeerIdentityVerified { .. });
-        }
-
-        drain_raw_quiche_client(&mut conn, &client_socket, client_addr);
-        flush_raw_quiche_client(&mut conn, &client_socket);
-
-        if conn.is_closed() {
-            break;
-        }
-    }
-
-    assert!(
-        !saw_connected,
-        "listener must not connect anonymous clients"
-    );
-    assert!(!saw_verified, "anonymous clients must not verify identity");
+    let (mut server, mut client) = listener_and_raw_client(None);
+    let events = events_until_closed(&mut server, &mut client);
+    assert_rejected(&events, "peer sent no certificates");
 }
 
 #[test]
 fn dialer_rejects_listener_with_unexpected_peer_id() {
-    let mut listener_a =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener a");
-    let mut listener_b =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener b");
-    let mut dialer = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("dialer");
+    let mut listener_a = loopback(QuicNodeConfig::generate());
+    let listener_b = loopback(QuicNodeConfig::generate());
+    let mut dialer = loopback(QuicNodeConfig::generate());
+    listener_a.listen_on_bound_addrs().expect("listen a");
 
-    listener_a.listen_on_bound_addr().expect("listen a");
-    listener_b.listen_on_bound_addr().expect("listen b");
+    let listener_a_addr = peer_addr(&listener_a);
+    let wrong_peer_addr = PeerAddr::new(
+        listener_a_addr.transport().clone(),
+        listener_b.local_peer_id(),
+    )
+    .expect("peer addr");
+    dialer.dial(&wrong_peer_addr).expect("dial starts");
 
-    let listener_a_addr = listener_a.local_peer_addr().expect("listener a addr");
-    let listener_b_peer = listener_b.local_peer_id();
-    let wrong_peer_addr =
-        PeerAddr::new(listener_a_addr.transport().clone(), listener_b_peer).expect("peer addr");
-
-    let _conn_id = dialer.dial(&wrong_peer_addr).expect("dial starts");
-
-    let mut saw_mismatch = false;
-    let mut saw_connected = false;
-
-    for _ in 0..100 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let _ = listener_a.poll(common::now()).expect("listener a poll");
-        let events = dialer.poll(common::now()).expect("dialer poll");
-
-        saw_mismatch |= events.iter().any(|event| {
-            matches!(event, TransportEvent::Error { message, .. } if message.contains("peer id mismatch"))
-        });
-        saw_connected |= events
+    let mut events = Vec::new();
+    for _ in 0..1_000 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        listener_a.poll(common::now()).expect("listener a poll");
+        events.extend(dialer.poll(common::now()).expect("dialer poll"));
+        if events
             .iter()
-            .any(|event| matches!(event, TransportEvent::Connected { .. }));
-
-        if saw_mismatch {
+            .any(|event| matches!(event, TransportEvent::Closed { .. }))
+        {
             break;
         }
     }
-
-    assert!(saw_mismatch, "dialer must report peer id mismatch");
-    assert!(!saw_connected, "dialer must not connect wrong peer id");
+    assert_rejected(&events, "peer id mismatch");
 }
 
 #[test]
 fn listener_rejects_dialer_with_invalid_libp2p_cert() {
-    let mut server =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");
-    server.listen_on_bound_addr().expect("server listen");
-    let server_addr = server.local_addr();
-
-    let client_socket = UdpSocket::bind("127.0.0.1:0").expect("client socket");
-    client_socket
-        .set_nonblocking(true)
-        .expect("client socket nonblocking");
-    let client_addr = client_socket.local_addr().expect("client local addr");
-
-    let (cert, key) = vanilla_tls_identity();
-    let mut config = raw_quiche_config(Some((&cert, &key)), &[]);
-    let scid = QuicConnectionId::from_vec(vec![0x42; quiche::MAX_CONN_ID_LEN]);
-    let mut conn = quiche::connect(None, &scid, client_addr, server_addr, &mut config)
-        .expect("raw quiche connect");
-
-    flush_raw_quiche_client(&mut conn, &client_socket);
-
-    let mut saw_incoming = false;
-    let mut saw_cert_error = false;
-    let mut saw_connected = false;
-    let mut saw_verified = false;
-
-    for _ in 0..100 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        for event in server.poll(common::now()).expect("server poll") {
-            saw_incoming |= matches!(event, TransportEvent::IncomingConnection { .. });
-            saw_cert_error |= matches!(
-                event,
-                TransportEvent::Error { ref message, .. }
-                    if message.contains("peer TLS certificate verification failed")
-            );
-            saw_connected |= matches!(event, TransportEvent::Connected { .. });
-            saw_verified |= matches!(event, TransportEvent::PeerIdentityVerified { .. });
-        }
-
-        drain_raw_quiche_client(&mut conn, &client_socket, client_addr);
-        flush_raw_quiche_client(&mut conn, &client_socket);
-
-        if saw_cert_error || conn.is_closed() {
-            break;
-        }
-    }
-
+    let (mut server, mut client) = listener_and_raw_client(Some(Identity::invalid()));
+    let events = events_until_closed(&mut server, &mut client);
     assert!(
-        saw_incoming,
-        "listener may surface pre-auth incoming connection"
+        events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::IncomingConnection { .. })),
+        "the listener may surface the pre-auth incoming connection: {events:?}"
     );
-    assert!(saw_cert_error, "listener must reject invalid libp2p cert");
-    assert!(
-        !saw_connected,
-        "listener must not connect invalid libp2p cert"
-    );
-    assert!(
-        !saw_verified,
-        "listener must not verify invalid libp2p cert"
-    );
+    assert_rejected(&events, "peer TLS certificate verification failed");
 }
 
 #[test]
 fn listener_rejects_dialer_presenting_certificate_chain() {
-    use boring::pkey::PKey;
-    use boring::x509::X509;
-    use minip2p_identity::Ed25519Keypair;
-
-    let mut server =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");
-    server.listen_on_bound_addr().expect("server listen");
-    let server_addr = server.local_addr();
-
-    let client_socket = UdpSocket::bind("127.0.0.1:0").expect("client socket");
-    client_socket
-        .set_nonblocking(true)
-        .expect("client socket nonblocking");
-    let client_addr = client_socket.local_addr().expect("client local addr");
-
-    // A valid libp2p leaf certificate, followed by a second certificate.
-    let (leaf_der, key_der) =
-        minip2p_tls::generate_certificate(&Ed25519Keypair::generate()).expect("leaf cert");
-    let (extra_der, _) =
-        minip2p_tls::generate_certificate(&Ed25519Keypair::generate()).expect("extra cert");
-    let leaf = X509::from_der(&leaf_der).expect("leaf");
-    let key = PKey::private_key_from_der(&key_der).expect("key");
-    let extra = X509::from_der(&extra_der).expect("extra");
-    let mut config = raw_quiche_config(Some((&leaf, &key)), &[extra]);
-    let scid = QuicConnectionId::from_vec(vec![0x43; quiche::MAX_CONN_ID_LEN]);
-    let mut conn = quiche::connect(None, &scid, client_addr, server_addr, &mut config)
-        .expect("raw quiche connect");
-
-    flush_raw_quiche_client(&mut conn, &client_socket);
-
-    let mut saw_chain_error = false;
-    let mut saw_connected = false;
-
-    for _ in 0..100 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        for event in server.poll(common::now()).expect("server poll") {
-            saw_chain_error |= matches!(
-                event,
-                TransportEvent::Error { ref message, .. }
-                    if message.contains("presented 2 certificates")
-            );
-            saw_connected |= matches!(event, TransportEvent::Connected { .. });
-        }
-
-        drain_raw_quiche_client(&mut conn, &client_socket, client_addr);
-        flush_raw_quiche_client(&mut conn, &client_socket);
-
-        if conn.peer_error().is_some() {
-            break;
-        }
-    }
-
-    assert!(saw_chain_error, "listener must reject a certificate chain");
-    assert!(
-        !saw_connected,
-        "listener must not connect a certificate chain"
-    );
-    assert!(
-        conn.peer_error().is_some(),
-        "listener must close the connection"
-    );
+    let (mut server, mut client) =
+        listener_and_raw_client(Some(Identity::chain(&Ed25519Keypair::generate())));
+    let events = events_until_closed(&mut server, &mut client);
+    assert_rejected(&events, "presented 2 certificates");
+    client.pump();
+    assert!(client.closed(0), "the listener must close the connection");
 }
 
 #[test]
 fn dialer_rejects_listener_presenting_certificate_chain() {
-    use boring::pkey::PKey;
-    use boring::x509::X509;
-    use minip2p_identity::Ed25519Keypair;
-
-    let server_socket = UdpSocket::bind("127.0.0.1:0").expect("server socket");
-    server_socket
-        .set_nonblocking(true)
-        .expect("server socket nonblocking");
-    let server_addr = server_socket.local_addr().expect("server local addr");
-
-    // A valid libp2p leaf certificate, followed by a second certificate.
     let keypair = Ed25519Keypair::generate();
-    let (leaf_der, key_der) = minip2p_tls::generate_certificate(&keypair).expect("leaf cert");
-    let (extra_der, _) =
-        minip2p_tls::generate_certificate(&Ed25519Keypair::generate()).expect("extra cert");
-    let leaf = X509::from_der(&leaf_der).expect("leaf");
-    let key = PKey::private_key_from_der(&key_der).expect("key");
-    let extra = X509::from_der(&extra_der).expect("extra");
-    let mut config = raw_quiche_config(Some((&leaf, &key)), &[extra]);
+    let mut server = RawPeer::bind(Some(raw::server_config(Identity::chain(&keypair))));
+    let mut dialer = loopback(QuicNodeConfig::generate());
+    dialer
+        .dial(&server.peer_addr(&keypair))
+        .expect("dial starts");
 
-    let mut dialer = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("dialer");
-    let peer_addr: PeerAddr = format!(
-        "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
-        server_addr.port(),
-        keypair.peer_id()
-    )
-    .parse()
-    .expect("peer addr");
-    dialer.dial(&peer_addr).expect("dial starts");
-
-    let mut server_conn: Option<quiche::Connection> = None;
-    let mut saw_chain_error = false;
-    let mut saw_connected = false;
-
-    for _ in 0..100 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        for event in dialer.poll(common::now()).expect("dialer poll") {
-            saw_chain_error |= matches!(
-                event,
-                TransportEvent::Error { ref message, .. }
-                    if message.contains("presented 2 certificates")
-            );
-            saw_connected |= matches!(event, TransportEvent::Connected { .. });
-        }
-
-        // Accept the dialer's first Initial, then drive the raw server.
-        if server_conn.is_none() {
-            let mut buf = [0u8; 65535];
-            if let Ok((len, from)) = server_socket.recv_from(&mut buf) {
-                let packet = buf.get_mut(..len).expect("received packet");
-                let scid = QuicConnectionId::from_vec(vec![0x44; quiche::MAX_CONN_ID_LEN]);
-                let mut conn = quiche::accept(&scid, None, server_addr, from, &mut config)
-                    .expect("raw quiche accept");
-                conn.recv(
-                    packet,
-                    quiche::RecvInfo {
-                        from,
-                        to: server_addr,
-                    },
-                )
-                .expect("raw server recv initial");
-                server_conn = Some(conn);
-            }
-        }
-        if let Some(conn) = server_conn.as_mut() {
-            drain_raw_quiche_client(conn, &server_socket, server_addr);
-            flush_raw_quiche_client(conn, &server_socket);
-            if conn.peer_error().is_some() {
-                break;
-            }
-        }
-    }
-
-    assert!(saw_chain_error, "dialer must reject a certificate chain");
-    assert!(
-        !saw_connected,
-        "dialer must not connect a certificate chain"
-    );
-    assert!(
-        server_conn.is_some_and(|conn| conn.peer_error().is_some()),
-        "dialer must close the connection"
-    );
+    let events = events_until_closed(&mut dialer, &mut server);
+    assert_rejected(&events, "presented 2 certificates");
+    server.pump();
+    assert!(server.closed(0), "the dialer must close the connection");
 }
 
 #[test]
-fn mtls_verifies_listener_side_client_identity_and_updates_peer_index() {
+fn mtls_verifies_listener_side_client_identity() {
     let (mut server, mut client, peer_addr) = setup_pair();
     let client_peer_id = client.local_peer_id();
 
     let client_conn_id = client.dial(&peer_addr).expect("client dial");
 
     let mut verified_event = None;
+    let mut server_connected = None;
 
     for _ in 0..250 {
         let (server_events, client_events) = drive_pair_once(&mut server, &mut client);
 
         for event in server_events {
-            if let TransportEvent::PeerIdentityVerified {
-                id,
-                endpoint,
-                previous_peer_id,
-            } = event
-            {
-                verified_event = Some((id, endpoint, previous_peer_id));
+            match event {
+                TransportEvent::PeerIdentityVerified {
+                    id,
+                    endpoint,
+                    previous_peer_id,
+                } => verified_event = Some((id, endpoint, previous_peer_id)),
+                TransportEvent::Connected { id, endpoint } => {
+                    server_connected = Some((id, endpoint));
+                }
+                _ => {}
             }
         }
 
@@ -636,16 +466,18 @@ fn mtls_verifies_listener_side_client_identity_and_updates_peer_index() {
     assert_eq!(verified_event.1.peer_id(), Some(&client_peer_id));
     assert!(verified_event.2.is_none());
 
-    let indexed = server.connection_ids_for_peer(&client_peer_id);
-    assert_eq!(indexed, vec![verified_event.0]);
+    // `Connected` already carries the verified identity.
+    let (connected_id, endpoint) = server_connected.expect("server connected");
+    assert_eq!(connected_id, verified_event.0);
+    assert_eq!(endpoint.peer_id(), Some(&client_peer_id));
 }
 
 #[test]
 fn listen_rejects_address_mismatch_with_bound_socket() {
     let config = QuicNodeConfig::generate();
-    let mut transport = QuicTransport::new(config, "127.0.0.1:0").expect("bind");
+    let mut transport = loopback(config);
 
-    let local = transport.local_addr();
+    let local = transport.local_socket_addrs().remove(0);
     let mismatched_port = if local.port() == u16::MAX {
         local.port() - 1
     } else {
@@ -682,12 +514,11 @@ fn listen_rejects_address_mismatch_with_bound_socket() {
 
 #[test]
 fn open_stream_before_connected_returns_invalid_state() {
-    let mut listener =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener");
-    listener.listen_on_bound_addr().expect("listen");
-    let peer_addr = listener.local_peer_addr().expect("peer addr");
+    let mut listener = loopback(QuicNodeConfig::generate());
+    listener.listen_on_bound_addrs().expect("listen");
+    let peer_addr = peer_addr(&listener);
 
-    let mut dialer = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("dialer");
+    let mut dialer = loopback(QuicNodeConfig::generate());
 
     let conn_id = dialer.dial(&peer_addr).expect("dial");
 
@@ -701,128 +532,4 @@ fn open_stream_before_connected_returns_invalid_state() {
 fn stream_id_round_trips_as_u64() {
     let id = StreamId::new(1234);
     assert_eq!(id.as_u64(), 1234);
-}
-
-fn vanilla_tls_identity() -> (
-    boring::x509::X509,
-    boring::pkey::PKey<boring::pkey::Private>,
-) {
-    use boring::asn1::Asn1Time;
-    use boring::hash::MessageDigest;
-    use boring::nid::Nid;
-    use boring::pkey::PKey;
-    use boring::rsa::Rsa;
-    use boring::x509::{X509, X509Name};
-
-    let rsa = Rsa::generate(2048).expect("rsa key");
-    let pkey = PKey::from_rsa(rsa).expect("pkey");
-
-    let mut name = X509Name::builder().expect("name builder");
-    name.append_entry_by_nid(Nid::COMMONNAME, "invalid-libp2p-cert")
-        .expect("common name");
-    let name = name.build();
-
-    let mut cert = X509::builder().expect("x509 builder");
-    cert.set_version(2).expect("version");
-    cert.set_subject_name(&name).expect("subject");
-    cert.set_issuer_name(&name).expect("issuer");
-    cert.set_not_before(&Asn1Time::days_from_now(0).expect("not before"))
-        .expect("set not before");
-    cert.set_not_after(&Asn1Time::days_from_now(365).expect("not after"))
-        .expect("set not after");
-    cert.set_pubkey(&pkey).expect("pubkey");
-    cert.sign(&pkey, MessageDigest::sha256())
-        .expect("sign cert");
-    let cert = cert.build();
-
-    (cert, pkey)
-}
-
-/// A bare quiche config presenting `identity` (if any) followed by
-/// `extra_chain` certificates.
-fn raw_quiche_config(
-    identity: Option<(
-        &boring::x509::X509,
-        &boring::pkey::PKey<boring::pkey::Private>,
-    )>,
-    extra_chain: &[boring::x509::X509],
-) -> quiche::Config {
-    use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
-
-    let mut tls = SslContextBuilder::new(SslMethod::tls()).expect("tls context");
-    tls.set_verify_callback(
-        SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
-        |_preverify_ok, _ctx| true,
-    );
-    if let Some((cert, pkey)) = identity {
-        tls.set_certificate(cert).expect("set cert");
-        tls.set_private_key(pkey).expect("set key");
-        tls.check_private_key().expect("check key");
-    }
-    for cert in extra_chain {
-        tls.add_extra_chain_cert(cert.clone())
-            .expect("add chain cert");
-    }
-
-    let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls)
-        .expect("quiche config");
-    config.set_application_protos(&[b"libp2p"]).expect("alpn");
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    config.set_initial_max_streams_bidi(100);
-    config.set_max_recv_udp_payload_size(1350);
-    config.set_max_send_udp_payload_size(1350);
-    config
-}
-
-#[expect(
-    clippy::panic,
-    reason = "the raw QUIC test helper must stop immediately on socket or quiche failures"
-)]
-fn flush_raw_quiche_client(conn: &mut quiche::Connection, socket: &UdpSocket) {
-    let mut out = [0u8; 1350];
-    loop {
-        match conn.send(&mut out) {
-            Ok((written, send_info)) => {
-                socket
-                    .send_to(
-                        out.get(..written)
-                            .expect("quiche writes packets within the supplied test buffer"),
-                        send_info.to,
-                    )
-                    .expect("raw client send");
-            }
-            Err(quiche::Error::Done) => break,
-            Err(e) => panic!("raw client send failed: {e}"),
-        }
-    }
-}
-
-#[expect(
-    clippy::panic,
-    reason = "the raw QUIC test helper must stop immediately on socket or quiche failures"
-)]
-fn drain_raw_quiche_client(
-    conn: &mut quiche::Connection,
-    socket: &UdpSocket,
-    local: std::net::SocketAddr,
-) {
-    let mut buf = [0u8; 65535];
-    loop {
-        let (len, from) = match socket.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => panic!("raw client recv failed: {e}"),
-        };
-        let recv_info = quiche::RecvInfo { from, to: local };
-        match conn.recv(
-            buf.get_mut(..len)
-                .expect("UDP receive lengths fit the supplied test buffer"),
-            recv_info,
-        ) {
-            Ok(_) | Err(quiche::Error::Done) => {}
-            Err(e) => panic!("raw client quiche recv failed: {e}"),
-        }
-    }
 }
