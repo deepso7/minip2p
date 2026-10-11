@@ -32,7 +32,7 @@ pnpm rn:android
 
 Generated files under `src/generated`, `cpp/generated`, `android`, and `ios` are committed and must not be edited directly. Android `.so` files and the iOS XCFramework are ignored build products.
 
-The Android build expects SDK 36 and NDK `28.2.13676358`. The generation script clears an unrelated `LIBCLANG_PATH`, so a host toolchain (such as an Xtensa one) cannot leak into the Android native build. The iOS script sets the deployment target before Rust and C compilation.
+The Android build expects SDK 36 and NDK `28.2.13676358`. The iOS script sets the deployment target before Rust and C compilation.
 
 ## Checks
 

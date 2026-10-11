@@ -68,7 +68,7 @@ Secure-mux handshake and wire-codec decode benches are deliberate follow-ups, no
 - `minip2p-quic` `idle_poll`
 - `minip2p-tcp` `readiness_poll`
 
-**Endpoint e2e (new).** Public `Endpoint` API, two endpoints in one process on loopback. TCP and QUIC are separate rows. TCP exercises secure-mux (Noise + Yamux). QUIC exercises TLS + quiche streams, not Noise + Yamux.
+**Endpoint e2e (new).** Public `Endpoint` API, two endpoints in one process on loopback. TCP and QUIC are separate rows. TCP exercises secure-mux (Noise + Yamux). QUIC exercises TLS + quinn-proto streams, not Noise + Yamux.
 
 | Scenario | Measurement | Connection state | Scale |
 | --- | --- | --- | --- |

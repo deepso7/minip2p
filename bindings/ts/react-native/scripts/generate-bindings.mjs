@@ -24,13 +24,10 @@ const ubrn = path.join(
   ".bin",
   process.platform === "win32" ? "ubrn.cmd" : "ubrn"
 );
-const environment = { ...process.env };
-delete environment.LIBCLANG_PATH;
 
-function run(command, args, cwd, env) {
+function run(command, args, cwd) {
   const result = spawnSync(command, args, {
     cwd,
-    env,
     stdio: "inherit",
   });
   if (result.error !== undefined) {
@@ -44,8 +41,7 @@ function run(command, args, cwd, env) {
 run(
   "cargo",
   ["build", "--manifest-path", path.join(rustRoot, "crates/ffi/Cargo.toml")],
-  rustRoot,
-  environment
+  rustRoot
 );
 run(
   ubrn,
@@ -63,8 +59,7 @@ run(
     path.join(packageRoot, "cpp/generated"),
     library,
   ],
-  rustRoot,
-  environment
+  rustRoot
 );
 run(
   ubrn,
@@ -77,12 +72,10 @@ run(
     "minip2p_ffi_core",
     "minip2p_ffi",
   ],
-  packageRoot,
-  environment
+  packageRoot
 );
 run(
   process.execPath,
   [path.join(packageRoot, "scripts/generate-codegen.mjs")],
-  packageRoot,
-  environment
+  packageRoot
 );
