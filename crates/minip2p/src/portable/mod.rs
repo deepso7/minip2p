@@ -667,8 +667,12 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         }
     }
 
-    /// Returns the earliest endpoint or mDNS deadline.
+    /// Returns the earliest endpoint or mDNS deadline; immediate while a
+    /// failed poll's events wait to be returned.
     pub fn next_deadline(&self, now: Now) -> Option<PollDeadline> {
+        if !self.unreturned.is_empty() {
+            return Some(PollDeadline::IMMEDIATE);
+        }
         let mdns = self
             .mdns
             .next_timeout(now.monotonic_ms)
@@ -1202,8 +1206,12 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         Ok(())
     }
 
-    /// Returns the earliest deadline across TCP and configured services.
+    /// Returns the earliest deadline across TCP and configured services;
+    /// immediate while a failed poll's events wait to be returned.
     pub fn next_deadline(&self, now: Now) -> Option<PollDeadline> {
+        if !self.unreturned.is_empty() {
+            return Some(PollDeadline::IMMEDIATE);
+        }
         // Agents report milliseconds-until-due; the endpoint reports absolute.
         let at = |timeout: u64| PollDeadline::from_millis(now.monotonic_ms.saturating_add(timeout));
         let mut deadline = self.endpoint.next_deadline(now);
@@ -1803,7 +1811,7 @@ mod tests {
     /// Events a failed poll held back come out of `shutdown` too.
     #[cfg(feature = "portable-mdns")]
     #[test]
-    fn mdns_shutdown_returns_events_a_failed_poll_held() {
+    fn mdns_events_a_failed_poll_held_are_due_and_returned_by_shutdown() {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
         let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
             .build(NoopTransport)
@@ -1815,6 +1823,11 @@ mod tests {
             peer_id: peer.clone(),
             conn_id: ConnectionId::new(1),
         });
+        // A host idling on the deadline wakes at once to collect them.
+        assert_eq!(
+            endpoint.next_deadline(Now::from_millis(5)),
+            Some(PollDeadline::IMMEDIATE)
+        );
         let events = endpoint.shutdown(Now::from_millis(0)).expect("shutdown");
         assert!(events.iter().any(|event| matches!(
             event,
