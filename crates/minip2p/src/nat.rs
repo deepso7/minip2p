@@ -100,13 +100,12 @@ impl<I: Transport, R: EntropySource> CircuitOps<CircuitTransport<I, R>> {
 }
 
 /// Drives a [`NatAgent`] against the endpoint's swarm.
-pub(crate) struct NatDriver<T, E> {
+pub(crate) struct NatDriver<T> {
     agent: NatAgent,
     /// Agent output not yet routed; see [`Self::route`].
     unrouted: VecDeque<NatEvent>,
     /// Routed events bound for the Endpoint event stream.
     staged: VecDeque<NatEvent>,
-    entropy: E,
     addresses_changed: bool,
     /// Relays we hold a reservation on, for circuit-address advertising.
     reserved_relays: Vec<(PeerId, Multiaddr)>,
@@ -131,14 +130,15 @@ pub(crate) struct NatDriver<T, E> {
     pub(crate) bridge_reset_attempts: Vec<(ConnectionId, StreamId)>,
 }
 
-impl<T: Transport, E: EntropySource> NatDriver<T, E> {
+impl<T: Transport> NatDriver<T> {
     /// Creates a driver over `agent`. `relay_addrs` are the transport
     /// addresses of configured relays, retained so reservations can be
-    /// advertised as circuit addresses.
+    /// advertised as circuit addresses. `entropy` seeds the agent's jitter;
+    /// later random bytes come from the swarm's own source.
     pub(crate) fn new(
         mut agent: NatAgent,
         relay_addrs: Vec<(PeerId, Multiaddr)>,
-        mut entropy: E,
+        entropy: &mut impl EntropySource,
     ) -> Self {
         // A failed draw keeps the agent's peer-id seed.
         let mut seed = [0u8; 8];
@@ -149,7 +149,6 @@ impl<T: Transport, E: EntropySource> NatDriver<T, E> {
             agent,
             unrouted: VecDeque::new(),
             staged: VecDeque::new(),
-            entropy,
             addresses_changed: false,
             reserved_relays: Vec::new(),
             relay_addrs,
@@ -662,7 +661,7 @@ impl<T: Transport, E: EntropySource> NatDriver<T, E> {
                 let mut payload = vec![0u8; payload_len];
                 // A failed entropy sample simply skips this one best-effort
                 // hole-punch datagram.
-                if let Ok(()) = self.entropy.fill_bytes(&mut payload) {
+                if let Ok(()) = swarm.entropy_mut().fill_bytes(&mut payload) {
                     match swarm.transport_mut().send_datagram(&target, &payload) {
                         Ok(()) | Err(_) => {}
                     }

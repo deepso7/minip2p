@@ -95,7 +95,7 @@ pub(crate) struct Engine<T: Transport, E: EntropySource, M: Carrier> {
     /// are merged after them.
     caller_external_addresses: Vec<Multiaddr>,
     #[cfg(feature = "_nat-driver")]
-    pub(crate) nat: Option<NatDriver<T, E>>,
+    pub(crate) nat: Option<NatDriver<T>>,
     #[cfg(feature = "pubsub")]
     pub(crate) gossipsub: Option<GossipsubDriver>,
     #[cfg(feature = "_discovery-driver")]

@@ -154,8 +154,9 @@ pub enum EndpointEvent {
     /// The one terminal event of a Connection attempt.
     ///
     /// On success, [`Self::ConnectionEstablished`] for the peer is delivered
-    /// before this Settled event (snapshot getters are true
-    /// at both points).
+    /// before this event. The connection may already have closed or been
+    /// replaced within the same batch; check the current connection before
+    /// using the reported `conn_id`.
     ConnectSettled {
         connect_id: ConnectId,
         peer_id: PeerId,

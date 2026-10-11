@@ -198,7 +198,7 @@ impl RelayService {
         &mut self,
         endpoint: &mut minip2p::PortableEndpoint<
             minip2p::SmoltcpTransport<BusDevice, CountingEntropy>,
-            CountingEntropy,
+            minip2p::SharedEntropy<CountingEntropy>,
         >,
         event: EndpointEvent,
         now: Now,

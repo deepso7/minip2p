@@ -6,7 +6,7 @@ use minip2p_swarm::SwarmEvent;
 use minip2p_transport::Transport;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
 use std::time::Instant;
-type NatDriver = crate::nat::NatDriver<super::EndpointTransport, StdEntropy>;
+type NatDriver = crate::nat::NatDriver<super::EndpointTransport>;
 use super::NextEvent;
 #[cfg(all(feature = "quic", feature = "relay-server"))]
 use crate::QuicLimits;
@@ -586,7 +586,7 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
     let driver = NatDriver::new(
         agent,
         vec![(relay_peer, pair.relay_addr.transport().clone())],
-        StdEntropy,
+        &mut StdEntropy,
     )
     .with_circuits(crate::nat::CircuitOps::circuit_transport());
     (driver, promotion)

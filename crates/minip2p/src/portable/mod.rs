@@ -104,6 +104,10 @@ fn expand_concrete(addr: &PeerAddr) -> Expansion {
 
 /// Caller-driven endpoint over an injected transport and entropy source.
 ///
+/// It is `Send` whenever its transport and entropy source are, unless mDNS
+/// is compiled in (`portable-mdns`): the carrier is held as a
+/// `Box<dyn MdnsIo>`, which embedded carriers on a shared stack are not.
+///
 /// Portable entry point for embedded systems and deterministic event loops.
 /// It performs no blocking and never reads a system clock. Callers drive it
 /// with [`poll`](Self::poll) and may inspect
@@ -128,7 +132,7 @@ fn expand_concrete(addr: &PeerAddr) -> Expansion {
 /// of the Endpoint event stream (state changes before its corresponding event
 /// is queued).
 pub struct PortableEndpoint<T: Transport, E: EntropySource> {
-    pub(crate) engine: Engine<T, SharedEntropy<E>, PortableCarrier>,
+    pub(crate) engine: Engine<T, E, PortableCarrier>,
 }
 
 /// Lightweight snapshot of portable endpoint state.
@@ -554,7 +558,7 @@ pub struct PortableEndpointBuilder<E> {
         )
     )]
     identity: Ed25519Keypair,
-    entropy: SharedEntropy<E>,
+    entropy: E,
     connect_deadline_ms: u64,
     #[cfg(feature = "portable-autonat")]
     nat_config: Option<NatConfig>,
@@ -574,7 +578,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
         Self {
             swarm: SwarmBuilder::new(identity),
             identity: identity.clone(),
-            entropy: SharedEntropy::new(entropy),
+            entropy,
             connect_deadline_ms: DEFAULT_CONNECT_DEADLINE_MS,
             #[cfg(feature = "portable-autonat")]
             nat_config: None,
@@ -736,14 +740,10 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     }
 
     #[cfg_attr(
-        not(any(
-            feature = "portable-autonat",
-            feature = "pubsub",
-            feature = "_mdns-driver"
-        )),
+        not(any(feature = "portable-autonat", feature = "pubsub")),
         expect(
             unused_mut,
-            reason = "only capabilities change the builder while assembling"
+            reason = "only capabilities add protocols while assembling"
         )
     )]
     fn assemble<T: Transport>(
@@ -771,7 +771,8 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
         }
         #[cfg(feature = "_discovery-driver")]
         self.peer_discovery.validate()?;
-        let core = self.swarm.build_core(transport, self.entropy.clone())?;
+        // The swarm owns the entropy from here on; capabilities draw from it.
+        let core = self.swarm.build_core(transport, self.entropy)?;
         #[cfg_attr(
             not(any(
                 feature = "portable-autonat",
@@ -802,7 +803,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
                 .collect();
             // The driver seeds the agent's listen addresses on its first turn.
             let agent = minip2p_nat::NatAgent::new(engine.core.local_peer_id().clone(), config);
-            let driver = NatDriver::new(agent, relay_addrs, self.entropy.clone());
+            let driver = NatDriver::new(agent, relay_addrs, engine.core.entropy_mut());
             #[cfg(feature = "_circuit-driver")]
             let driver = match circuits {
                 Some(circuits) => driver.with_circuits(circuits),
@@ -824,8 +825,8 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
                 minip2p_pubsub::GossipsubAgent::new(
                     self.identity.clone(),
                     config,
-                    self.entropy.next_u64()?,
-                    self.entropy.next_u64()?,
+                    engine.core.entropy_mut().next_u64()?,
+                    engine.core.entropy_mut().next_u64()?,
                 )
                 .map_err(PortableBuildError::Gossipsub)?,
             ),
@@ -848,7 +849,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
         #[cfg(feature = "_mdns-driver")]
         if let Some((io, config)) = self.mdns {
             let mut seed = [0; 32];
-            self.entropy.fill_bytes(&mut seed)?;
+            engine.core.entropy_mut().fill_bytes(&mut seed)?;
             let agent = minip2p_mdns::MdnsAgent::new(
                 engine.core.local_peer_id().clone(),
                 config.clone(),
@@ -883,13 +884,32 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     }
 
     /// Selects the embedded smoltcp TCP backend over a host-configured stack.
+    ///
+    /// The TCP transport and the swarm share the entropy source, so the
+    /// built endpoint holds it as a single-threaded [`SharedEntropy`], like
+    /// the stack itself.
     #[cfg(feature = "smoltcp")]
     pub fn smoltcp<D: smoltcp::phy::Device>(
         self,
         stack: SmoltcpStack<D>,
     ) -> SmoltcpEndpointBuilder<D, E> {
+        let entropy = SharedEntropy::new(self.entropy);
         SmoltcpEndpointBuilder {
-            portable: self,
+            portable: PortableEndpointBuilder {
+                swarm: self.swarm,
+                identity: self.identity,
+                entropy: entropy.clone(),
+                connect_deadline_ms: self.connect_deadline_ms,
+                #[cfg(feature = "portable-autonat")]
+                nat_config: self.nat_config,
+                #[cfg(feature = "pubsub")]
+                gossipsub: self.gossipsub,
+                #[cfg(feature = "pubsub")]
+                beacon: self.beacon,
+                peer_discovery: self.peer_discovery,
+                mdns: self.mdns,
+            },
+            entropy,
             stack,
             tcp_config: TcpConfig::default(),
             provider_config: SmoltcpConfig::default(),
@@ -944,7 +964,9 @@ struct EmbeddedMdnsConfig {
 /// interface later.
 #[cfg(feature = "smoltcp")]
 pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource> {
-    portable: PortableEndpointBuilder<E>,
+    portable: PortableEndpointBuilder<SharedEntropy<E>>,
+    /// Shared with the swarm, for the TCP (and circuit) transport.
+    entropy: SharedEntropy<E>,
     stack: SmoltcpStack<D>,
     tcp_config: TcpConfig,
     provider_config: SmoltcpConfig,
@@ -1070,12 +1092,15 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
 
     /// Builds the endpoint: TCP (and mDNS) installed on the shared stack,
     /// every configured capability driven by one `poll`.
-    pub fn build(self) -> Result<PortableEndpoint<SmoltcpTransport<D, E>, E>, PortableBuildError>
+    pub fn build(
+        self,
+    ) -> Result<PortableEndpoint<SmoltcpTransport<D, E>, SharedEntropy<E>>, PortableBuildError>
     where
         D: 'static,
     {
         let Self {
             mut portable,
+            entropy,
             stack,
             tcp_config,
             provider_config,
@@ -1087,7 +1112,6 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             portable = portable.mdns(io, config.mdns);
         }
         let identity = portable.identity.clone();
-        let entropy = portable.entropy.clone();
         let transport = TcpTransport::with_config(
             SmoltcpTcpProvider::on_stack(stack, provider_config),
             identity.clone(),

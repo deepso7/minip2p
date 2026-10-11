@@ -478,6 +478,12 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     // Commands
     // -----------------------------------------------------------------------
 
+    /// The swarm's entropy source, for composed drivers that need random
+    /// bytes of their own without holding a second source.
+    pub fn entropy_mut(&mut self) -> &mut E {
+        &mut self.entropy
+    }
+
     /// Pings a peer, sending a random 32-byte payload and measuring RTT.
     ///
     /// If a ping stream isn't yet negotiated the payload is queued and

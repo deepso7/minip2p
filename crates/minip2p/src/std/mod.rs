@@ -1880,7 +1880,7 @@ pub(crate) fn build_endpoint(
         // Relay and AutoNAT server addresses may name a host; the endpoint
         // resolves those off the driver, like Connection-attempt candidates.
         engine.nat = Some(
-            NatDriver::new(agent, relay_addrs, StdEntropy)
+            NatDriver::new(agent, relay_addrs, &mut StdEntropy)
                 .with_circuits(CircuitOps::circuit_transport())
                 .park_named_dials(),
         );

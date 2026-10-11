@@ -1073,7 +1073,7 @@ pub(crate) enum Expansion {
 pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
     connect: &mut ConnectEngine,
     runtime: &mut SwarmCore<T, E>,
-    #[cfg(feature = "_nat-driver")] nat: Option<&NatDriver<T, E>>,
+    #[cfg(feature = "_nat-driver")] nat: Option<&NatDriver<T>>,
     admission: ConnectAdmission,
     expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
     now_ms: u64,
@@ -1124,7 +1124,7 @@ pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
 #[cfg(feature = "_nat-driver")]
 pub(crate) fn cancel_attempt<T: Transport, E: EntropySource>(
     connect: &mut ConnectEngine,
-    nat: Option<&mut NatDriver<T, E>>,
+    nat: Option<&mut NatDriver<T>>,
     id: ConnectId,
     runtime: &mut SwarmCore<T, E>,
     now: minip2p_platform::Now,

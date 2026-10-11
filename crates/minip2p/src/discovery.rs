@@ -238,7 +238,7 @@ impl DiscoveryDriver {
     pub(crate) fn sweep<T: Transport, E: EntropySource>(
         &mut self,
         #[cfg(feature = "pubsub")] mut pubsub: Option<&mut GossipsubDriver>,
-        #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<T, E>>,
+        #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<T>>,
         connect: &mut ConnectEngine,
         runtime: &mut SwarmCore<T, E>,
         expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
@@ -385,7 +385,7 @@ impl DiscoveryDriver {
         &mut self,
         peer: &PeerId,
         connect: &mut ConnectEngine,
-        #[cfg(feature = "_nat-driver")] nat: Option<&mut NatDriver<T, E>>,
+        #[cfg(feature = "_nat-driver")] nat: Option<&mut NatDriver<T>>,
         runtime: &mut SwarmCore<T, E>,
         now: Now,
         work: &mut DiscoveryNatWork,
@@ -418,7 +418,7 @@ impl DiscoveryDriver {
     pub(crate) fn shutdown<T: Transport, E: EntropySource>(
         &mut self,
         connect: &mut ConnectEngine,
-        #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<T, E>>,
+        #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<T>>,
         runtime: &mut SwarmCore<T, E>,
         now: Now,
     ) -> DiscoveryNatWork {

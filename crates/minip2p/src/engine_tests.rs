@@ -445,3 +445,12 @@ fn portable_capabilities_compose_over_a_plain_transport() {
     ));
     assert!(endpoint.known_peers().is_empty());
 }
+
+/// A plain portable endpoint over `Send` parts can move to another thread:
+/// only capabilities that need it (an mDNS carrier, smoltcp's shared
+/// entropy) make it single-threaded.
+#[cfg(not(feature = "_mdns-driver"))]
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<crate::PortableEndpoint<FlashTransport, CountingEntropy>>();
+};
