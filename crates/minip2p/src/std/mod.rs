@@ -3957,10 +3957,6 @@ mod tests {
         assert_eq!(order, ["relay-server", "nat", "gossipsub", "settled"]);
     }
 
-    /// One transport poll can return several swarm events. `poll` must finish
-    /// each one before the next, the same way `wait` does. Batching the whole
-    /// poll and calling `finish_step` once puts `ConnectSettled` after the
-    /// later swarm event.
     /// A transport with nothing to do whose `poll` fails while `fail` is set.
     struct FlakyPollTransport {
         fail: Arc<AtomicBool>,
@@ -4071,6 +4067,10 @@ mod tests {
         );
     }
 
+    /// One transport poll can return several swarm events. `poll` must finish
+    /// each one before the next, the same way `wait` does. Batching the whole
+    /// poll and calling `finish_step` once puts `ConnectSettled` after the
+    /// later swarm event.
     #[test]
     fn poll_finishes_each_swarm_event_before_the_next() {
         use std::net::{IpAddr, Ipv4Addr};
