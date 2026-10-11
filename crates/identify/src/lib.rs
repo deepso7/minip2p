@@ -452,6 +452,8 @@ impl IdentifyProtocol {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use minip2p_core::{encode_bytes_field, write_uvarint};
 

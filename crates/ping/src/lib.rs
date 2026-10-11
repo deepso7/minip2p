@@ -613,6 +613,8 @@ impl PingProtocol {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use core::str::FromStr;
 
     use super::*;
