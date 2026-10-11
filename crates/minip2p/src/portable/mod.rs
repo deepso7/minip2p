@@ -849,6 +849,9 @@ pub struct SmoltcpEndpoint<D: smoltcp::phy::Device, E: EntropySource> {
     #[cfg(feature = "portable-autonat")]
     nat: Option<NatDriver<SharedEntropy<E>>>,
     discovery: Option<DiscoveryDriver>,
+    /// Events a failed [`Self::poll`] collected; the next call (or
+    /// [`Self::shutdown`]) returns them.
+    unreturned: Vec<EndpointEvent>,
 }
 
 #[cfg(feature = "smoltcp")]
@@ -1076,15 +1079,29 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     /// Advances TCP and every configured embedded service once.
     ///
     /// Returns Endpoint events; enabled capabilities report through their
-    /// [`EndpointEvent`] variants.
+    /// [`EndpointEvent`] variants. An error discards nothing: events already
+    /// collected come out of the next call.
     pub fn poll(&mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
-        let mut output = Vec::new();
-        self.poll_swarm(now, &mut output)?;
+        let mut output = core::mem::take(&mut self.unreturned);
+        if let Err(error) = self.poll_into(now, &mut output) {
+            self.unreturned = output;
+            return Err(error);
+        }
+        self.endpoint.ack_pulled(&output);
+        Ok(output)
+    }
+
+    fn poll_into(
+        &mut self,
+        now: Now,
+        output: &mut Vec<EndpointEvent>,
+    ) -> Result<(), PortableDriveError> {
+        self.poll_swarm(now, output)?;
         if let Some(mdns) = self.mdns.as_mut() {
             mdns.tick(now.monotonic_ms, &self.endpoint.bound_addresses())?;
         }
         if self.mdns.is_some() {
-            self.poll_swarm(now, &mut output)?;
+            self.poll_swarm(now, output)?;
         }
         if let (Some(mdns), Some(discovery)) = (self.mdns.as_mut(), self.discovery.as_mut()) {
             while let Some(event) = mdns.poll_event() {
@@ -1141,11 +1158,10 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         let mut settled = Vec::new();
         self.emit_connect_events(now, &mut settled);
         if let Some(discovery) = self.discovery.as_mut() {
-            discovery.drain_events(&mut output);
+            discovery.drain_events(output);
         }
         output.extend(settled);
-        self.endpoint.ack_pulled(&output);
-        Ok(output)
+        Ok(())
     }
 
     fn poll_swarm(&mut self, now: Now, output: &mut Vec<EndpointEvent>) -> Result<(), DriverError> {
@@ -1270,7 +1286,10 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             .as_mut()
             .map(|nat| nat.drain_application_events().collect())
             .unwrap_or_default();
-        let mut events = self.endpoint.shutdown(now)?;
+        let mut events = core::mem::take(&mut self.unreturned);
+        // Pulled now, so acknowledged like any other returned event.
+        self.endpoint.ack_pulled(&events);
+        events.extend(self.endpoint.shutdown(now)?);
         #[cfg(feature = "portable-autonat")]
         events.extend(nat.into_iter().map(EndpointEvent::Nat));
         #[cfg(feature = "pubsub")]
@@ -1563,6 +1582,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             #[cfg(feature = "portable-autonat")]
             nat,
             discovery,
+            unreturned: Vec::new(),
         })
     }
 }
