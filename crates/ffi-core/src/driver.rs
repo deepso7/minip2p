@@ -57,7 +57,7 @@ pub(crate) struct EventState {
     pub(crate) overflow: OverflowDiagnostic,
     pub(crate) stats: DriverStats,
     /// What `connected_peers` returns, published from the endpoint's peer
-    /// table by whoever holds `state` (see `Shared::publish_peers`), so the
+    /// table by the driver (see `Shared::publish_peers`), so the
     /// query neither interrupts nor waits for the driver.
     pub(crate) connected_peers: Vec<String>,
     /// Set with the lifecycle once it reaches `Stopping` or `Stopped`.

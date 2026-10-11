@@ -272,7 +272,7 @@ impl P2pEndpoint {
 
     /// Returns peers with an established QUIC, TCP, or circuit connection.
     ///
-    /// Served from a snapshot the driver and commands publish, so it neither
+    /// Served from a snapshot the driver publishes, so it neither
     /// interrupts nor waits for the driver. Like the endpoint's peer table,
     /// it can run ahead of the event stream: it may list a peer whose events
     /// are not drained yet, or a reconnected peer while an older close is
@@ -824,16 +824,9 @@ impl P2pEndpoint {
         let mut state = self.shared.lock_state();
         ensure_accepting_commands(&state)?;
         let EndpointState {
-            endpoint,
-            writes,
-            published_peers,
-            ..
+            endpoint, writes, ..
         } = &mut *state;
-        let endpoint = endpoint.as_mut().ok_or(FfiError::Stopped)?;
-        let result = operation(endpoint, writes);
-        // A command can change membership (`disconnect`), even when it fails.
-        self.shared.publish_peers(endpoint, published_peers);
-        result
+        operation(endpoint.as_mut().ok_or(FfiError::Stopped)?, writes)
     }
 }
 
@@ -864,7 +857,10 @@ impl Shared {
     }
 
     /// Publishes `endpoint`'s peer table to `connected_peers` when it differs
-    /// from `published`, the last one published. Callers hold `state`.
+    /// from `published`, the last one published. Called by the driver while
+    /// it holds `state`: membership only changes as the endpoint processes
+    /// transport events in `wait`, so commands (even `disconnect`, which
+    /// queues the close) never need to publish.
     pub(crate) fn publish_peers(&self, endpoint: &Endpoint, published: &mut Vec<PeerId>) {
         let peers = endpoint.connected_peers();
         if peers == *published {
