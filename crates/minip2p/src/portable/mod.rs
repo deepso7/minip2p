@@ -367,6 +367,40 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
             .abandon_stream(peer_id, conn_id, stream_id, now.monotonic_ms)
     }
 
+    /// Abandons a stream and drops its events from `held`, the events a
+    /// composed endpoint's failed poll still holds.
+    ///
+    /// Their data was never pulled, so it is acknowledged here, as the swarm
+    /// does for data still in its own queue; after the reset that
+    /// acknowledgement is moot, so its error is ignored.
+    #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
+    fn abandon_stream_holding(
+        &mut self,
+        held: &mut Vec<EndpointEvent>,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now: Now,
+    ) -> Result<(), DriverError> {
+        self.abandon_stream(peer_id, conn_id, stream_id, now)?;
+        let mut dropped_data = 0usize;
+        held.retain(|event| {
+            if !event.matches_stream(peer_id, conn_id, stream_id) {
+                return true;
+            }
+            if let EndpointEvent::StreamData { data, .. } = event {
+                dropped_data += data.len();
+            }
+            false
+        });
+        if dropped_data > 0 {
+            match self.core.ack_stream(conn_id, stream_id, dropped_data) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Acknowledges the stream data in events the application is about to
     /// pull (ADR 0012): pulling an event consumes its bytes, which returns
     /// their receive credit to the sender.
@@ -575,6 +609,21 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
             &mut expand_concrete,
             now.monotonic_ms,
         ))
+    }
+
+    /// Abandons a stream as [`PortableEndpoint::abandon_stream`] does, also
+    /// dropping its events a failed [`Self::poll`] still holds.
+    ///
+    /// Shadows the inner endpoint's method, which cannot see those events.
+    pub fn abandon_stream(
+        &mut self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now: Now,
+    ) -> Result<(), DriverError> {
+        self.endpoint
+            .abandon_stream_holding(&mut self.unreturned, peer_id, conn_id, stream_id, now)
     }
 
     /// Borrows the mDNS carrier, or `None` after it has stopped.
@@ -876,6 +925,21 @@ impl<D: smoltcp::phy::Device, E: EntropySource> core::ops::DerefMut for SmoltcpE
 
 #[cfg(feature = "smoltcp")]
 impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
+    /// Abandons a stream as [`PortableEndpoint::abandon_stream`] does, also
+    /// dropping its events a failed [`Self::poll`] still holds.
+    ///
+    /// Shadows the inner endpoint's method, which cannot see those events.
+    pub fn abandon_stream(
+        &mut self,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now: Now,
+    ) -> Result<(), DriverError> {
+        self.endpoint
+            .abandon_stream_holding(&mut self.unreturned, peer_id, conn_id, stream_id, now)
+    }
+
     /// Pushes NAT-advertised address changes into Identify. Called once per
     /// poll: the external address set only propagates when Identify runs,
     /// so changes queued between polls flush on the next one. No-op when
@@ -1249,7 +1313,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     ///
     /// Returns the final Endpoint events, including capability events that
     /// were still queued and Gossipsub events still held by the agent.
-    /// Connection-close events come first; queued capability events follow.
+    /// Events a failed [`Self::poll`] still held come first, then
+    /// connection-close events, then queued capability events.
     pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
         if let Some(mdns) = self.mdns.as_mut() {
             mdns.shutdown(now.monotonic_ms)?;
@@ -1785,12 +1850,13 @@ mod tests {
         }
     }
 
-    /// An mDNS carrier with no interfaces, so it never sends or fails.
+    /// An mDNS carrier with no interfaces whose driving fails, as a stack
+    /// that has gone away does.
     #[cfg(feature = "portable-mdns")]
-    struct NoMdns;
+    struct BrokenMdns;
 
     #[cfg(feature = "portable-mdns")]
-    impl MdnsIo for NoMdns {
+    impl MdnsIo for BrokenMdns {
         fn interfaces(&self) -> &[minip2p_mdns::InterfaceSnapshot] {
             &[]
         }
@@ -1806,33 +1872,53 @@ mod tests {
         fn send(&mut self, _: &minip2p_mdns::MdnsAction) -> Result<(), MdnsError> {
             Ok(())
         }
+        fn poll(&mut self, _: u64) -> Result<(), MdnsError> {
+            Err(MdnsError::Io {
+                operation: "poll",
+                reason: "stack gone".into(),
+            })
+        }
     }
 
-    /// Events a failed poll held back come out of `shutdown` too.
+    /// A failed mDNS tick keeps the events the endpoint pass already
+    /// collected: the deadline turns immediate, and the next poll returns
+    /// them.
     #[cfg(feature = "portable-mdns")]
     #[test]
-    fn mdns_events_a_failed_poll_held_are_due_and_returned_by_shutdown() {
+    fn a_failed_mdns_poll_keeps_its_collected_events_for_the_next() {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
         let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
             .build(NoopTransport)
             .expect("portable endpoint")
-            .with_mdns(NoMdns, MdnsConfig::default(), [0; 32])
+            .with_mdns(BrokenMdns, MdnsConfig::default(), [0; 32])
             .expect("mdns endpoint");
         let peer = Ed25519Keypair::from_secret_key_bytes([8; 32]).peer_id();
-        endpoint.unreturned.push(EndpointEvent::ConnectionClosed {
-            peer_id: peer.clone(),
-            conn_id: ConnectionId::new(1),
-        });
-        // A host idling on the deadline wakes at once to collect them.
+        let target = PeerAddr::new(
+            <Multiaddr as core::str::FromStr>::from_str("/ip4/192.0.2.1/tcp/4001").expect("addr"),
+            peer,
+        )
+        .expect("peer addr");
+        // The transport refuses the dial, so the attempt settles on the
+        // endpoint pass that runs before the mDNS tick fails.
+        let id = endpoint
+            .connect(target, Now::from_millis(0))
+            .expect("admitted");
+
+        endpoint
+            .poll(Now::from_millis(1))
+            .expect_err("the carrier fails");
         assert_eq!(
-            endpoint.next_deadline(Now::from_millis(5)),
+            endpoint.next_deadline(Now::from_millis(1)),
             Some(PollDeadline::IMMEDIATE)
         );
-        let events = endpoint.shutdown(Now::from_millis(0)).expect("shutdown");
-        assert!(events.iter().any(|event| matches!(
-            event,
-            EndpointEvent::ConnectionClosed { peer_id, .. } if *peer_id == peer
-        )));
+        let events = endpoint.poll(Now::from_millis(2)).expect("poll");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EndpointEvent::ConnectSettled { connect_id, .. } if *connect_id == id
+            )),
+            "{events:?}"
+        );
     }
 
     #[test]

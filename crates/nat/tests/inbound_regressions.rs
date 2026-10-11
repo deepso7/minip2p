@@ -622,3 +622,20 @@ fn observed_mappings_survive_the_punch_candidate_cap() {
     let addrs = dcutr_obs_addrs(&sent_data_on(&drain_actions(&mut h.agent), stream));
     assert!(addrs.contains(&maddr(OUR_OBSERVED_ADDR)), "{addrs:?}");
 }
+
+/// Names do not count against an IP family's quota: a concrete IPv6
+/// listener listed after several DNS ones is still advertised.
+#[test]
+fn named_listen_addresses_do_not_crowd_out_concrete_punch_candidates() {
+    let mut h = inbound_harness(NatConfig::default());
+    let mut listen: Vec<Multiaddr> = (0..6)
+        .map(|i| maddr(&format!("/dns6/host{i}.example/udp/{}/quic-v1", 5000 + i)))
+        .collect();
+    let concrete = maddr("/ip6/2001:4860:4860::8888/udp/4001/quic-v1");
+    listen.push(concrete.clone());
+    h.agent.set_listen_addrs(&listen);
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    let addrs = dcutr_obs_addrs(&sent_data_on(&drain_actions(&mut h.agent), stream));
+    assert!(addrs.contains(&concrete), "{addrs:?}");
+}

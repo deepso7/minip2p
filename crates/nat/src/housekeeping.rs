@@ -36,17 +36,22 @@ pub const MAX_RESERVATION_RETRY_BACKOFF_MS: u64 = 60_000;
 
 /// The delay before retrying after `failures` earlier consecutive failures:
 /// `base` doubled per failure, plus up to a fifth more as jitter, capped at
-/// [`MAX_RESERVATION_RETRY_BACKOFF_MS`] (or `base`, if larger).
+/// [`MAX_RESERVATION_RETRY_BACKOFF_MS`] (or `base`, if larger). Once the
+/// doubling reaches the cap, the delay is drawn from the cap's top fifth.
 ///
 /// The jitter keeps clients that failed together from retrying together,
-/// and staying under the next doubling keeps the delays strictly growing
-/// until the cap.
+/// including during a long outage at the cap, and staying under the next
+/// doubling keeps the delays strictly growing until the cap.
 fn retry_backoff_ms(base: u64, failures: u32, jitter: u64) -> u64 {
     let cap = MAX_RESERVATION_RETRY_BACKOFF_MS.max(base);
     let exp = base.saturating_mul(1u64.checked_shl(failures).unwrap_or(u64::MAX));
-    let spread = exp / 5;
-    let jitter = if spread == 0 { 0 } else { jitter % spread };
-    exp.saturating_add(jitter).min(cap)
+    let draw = |spread: u64| if spread == 0 { 0 } else { jitter % spread };
+    let delay = exp.saturating_add(draw(exp / 5));
+    if delay < cap {
+        delay
+    } else {
+        cap - draw(cap / 5)
+    }
 }
 
 /// Advances SplitMix64 `state` and returns its next value.

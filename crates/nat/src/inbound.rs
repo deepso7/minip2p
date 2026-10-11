@@ -603,8 +603,9 @@ const MAX_PUNCH_CANDIDATES_PER_FAMILY: usize = MAX_PUNCH_CANDIDATES / 2;
 /// worth trying, not a port range.
 const MAX_PUNCH_CANDIDATES_PER_IP: usize = 2;
 
-/// Bounds a punch candidate list, keeping the first that fit: drops port 0
-/// and privileged ports (below 1024, never a NAT mapping worth punching),
+/// Bounds a punch candidate list, keeping the first that fit: drops
+/// non-IP hosts, port 0, and privileged ports (below 1024, never a NAT
+/// mapping worth punching),
 /// then applies the per-IP, per-family, and total caps.
 pub(crate) fn bound_punch_candidates(addrs: impl IntoIterator<Item = Multiaddr>) -> Vec<Multiaddr> {
     let mut kept: Vec<Multiaddr> = Vec::new();
@@ -613,7 +614,11 @@ pub(crate) fn bound_punch_candidates(addrs: impl IntoIterator<Item = Multiaddr>)
             break;
         }
         let protocols = addr.protocols();
-        let (Some(ip), Some(Protocol::Udp(port))) = (protocols.first(), protocols.get(1)) else {
+        // Only concrete IPs are punched; a name must not take an IP
+        // family's quota, and the receiver drops it anyway.
+        let (Some(ip @ (Protocol::Ip4(_) | Protocol::Ip6(_))), Some(Protocol::Udp(port))) =
+            (protocols.first(), protocols.get(1))
+        else {
             continue;
         };
         if *port < 1024 {

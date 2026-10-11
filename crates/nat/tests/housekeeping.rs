@@ -1084,9 +1084,10 @@ fn reservation_retries_back_off_exponentially_and_reset_on_success() {
         now += delay;
     }
     assert!((base..base + base / 5).contains(&delays[0]), "{delays:?}");
+    let capped = |delay: u64| delay >= MAX_RESERVATION_RETRY_BACKOFF_MS * 4 / 5;
     for pair in delays.windows(2) {
         assert!(
-            pair[1] > pair[0] || pair[1] == MAX_RESERVATION_RETRY_BACKOFF_MS,
+            pair[1] > pair[0] || capped(pair[1]),
             "delays grow strictly until the cap: {delays:?}"
         );
     }
@@ -1095,7 +1096,10 @@ fn reservation_retries_back_off_exponentially_and_reset_on_success() {
             .iter()
             .all(|delay| *delay <= MAX_RESERVATION_RETRY_BACKOFF_MS)
     );
-    assert_eq!(delays.last(), Some(&MAX_RESERVATION_RETRY_BACKOFF_MS));
+    // At the cap the delays keep a random spread instead of all landing on it.
+    let tail = &delays[delays.len() - 4..];
+    assert!(tail.iter().all(|delay| capped(*delay)), "{delays:?}");
+    assert!(tail.windows(2).any(|pair| pair[0] != pair[1]), "{delays:?}");
 
     // A held reservation, then its loss: the retry is back at the base.
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(None), at(now));
