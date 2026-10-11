@@ -172,7 +172,8 @@ struct ReverseFirstTwo<T> {
     /// Holding is over, whether or not a second connection came.
     done: bool,
     /// A second connection came and was delivered ahead of the first.
-    swapped: bool,
+    /// Shared, so the test can read it after the endpoint owns the transport.
+    swapped: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl<T> ReverseFirstTwo<T> {
@@ -182,7 +183,7 @@ impl<T> ReverseFirstTwo<T> {
             inner,
             held: None,
             done: !reverse,
-            swapped: false,
+            swapped: std::rc::Rc::default(),
         }
     }
 }
@@ -276,7 +277,7 @@ impl<T: Transport> Transport for ReverseFirstTwo<T> {
                         out.extend(buffered);
                     }
                     self.done = true;
-                    self.swapped = true;
+                    self.swapped.set(true);
                 }
                 None if !self.done && matches!(event, TransportEvent::Connected { .. }) => {
                     self.held = conn.map(|id| (id, vec![event]));
@@ -332,6 +333,7 @@ fn duplicate_candidates_run<T: Transport>(
         .expect("a builds");
     let b_transport = ReverseFirstTwo::new(transport(&b_key), reverse);
     let b_listen = listen(&b_transport.inner);
+    let swapped = std::rc::Rc::clone(&b_transport.swapped);
     let mut b = Endpoint::portable(&b_key, StdEntropy)
         .build(b_transport)
         .expect("b builds");
@@ -405,11 +407,7 @@ fn duplicate_candidates_run<T: Transport>(
     b_events.extend(b_later);
     assert!(a.connection_id(&b_peer).is_some() && b.connection_id(&a_peer).is_some());
 
-    assert_eq!(
-        b.core().transport().swapped,
-        reverse,
-        "B saw two connections race"
-    );
+    assert_eq!(swapped.get(), reverse, "B saw two connections race");
     for events in [&a_events, &b_events] {
         assert!(
             !events

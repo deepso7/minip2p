@@ -271,6 +271,7 @@ pub(crate) struct Candidates {
 
 impl Candidates {
     /// Concrete addresses only.
+    #[cfg(test)]
     pub(crate) fn ready(ready: Vec<PeerAddr>) -> Self {
         Self {
             ready,
@@ -416,6 +417,7 @@ impl ConnectEngine {
     }
 
     /// Admits one attempt. Terminal events are queued, not returned.
+    #[cfg(test)]
     pub(crate) fn connect<T: Transport, E: EntropySource>(
         &mut self,
         target: ConnectTarget,
@@ -1033,7 +1035,6 @@ impl ConnectEngine {
 
 /// What one Connection attempt should dial: the peer, its candidate
 /// addresses, and whether a relay leg may race them.
-#[cfg(any(feature = "std", feature = "portable-mdns"))]
 pub(crate) struct ConnectAdmission {
     pub(crate) peer: PeerId,
     pub(crate) candidates: Vec<PeerAddr>,
@@ -1041,7 +1042,6 @@ pub(crate) struct ConnectAdmission {
 }
 
 /// What admission's `expand` step made of one candidate address.
-#[cfg(any(feature = "std", feature = "portable-mdns"))]
 pub(crate) enum Expansion {
     /// Concrete addresses to dial now.
     Ready(Vec<PeerAddr>),
@@ -1064,18 +1064,16 @@ pub(crate) enum Expansion {
 /// Admits one Connection attempt for `peer`: selects the relay policy from
 /// the NAT driver, expands each candidate through `expand` (Name resolution
 /// on std, identity on portable), and starts direct dials. Both Endpoint
-/// compositions run this; only the injected `expand` differs. Under
-/// `force_relay` direct candidates are discarded unexpanded, so no name is
-/// looked up for them.
+/// types run this; only the injected `expand` differs. Under `force_relay`
+/// direct candidates are discarded unexpanded, so no name is looked up for
+/// them.
 ///
 /// When the attempt stays pending, the caller attaches its NAT leg with
-/// [`NatDriver::attach_leg`]: the leg needs the composition's concrete
-/// transport while admission works over any [`Transport`].
-#[cfg(any(feature = "std", feature = "portable-mdns"))]
+/// [`NatDriver::attach_leg`].
 pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
     connect: &mut ConnectEngine,
     runtime: &mut SwarmCore<T, E>,
-    #[cfg(feature = "_nat-driver")] nat: Option<&NatDriver<E>>,
+    #[cfg(feature = "_nat-driver")] nat: Option<&NatDriver<T, E>>,
     admission: ConnectAdmission,
     expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
     now_ms: u64,
@@ -1126,7 +1124,7 @@ pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
 #[cfg(feature = "_nat-driver")]
 pub(crate) fn cancel_attempt<T: Transport, E: EntropySource>(
     connect: &mut ConnectEngine,
-    nat: Option<&mut NatDriver<E>>,
+    nat: Option<&mut NatDriver<T, E>>,
     id: ConnectId,
     runtime: &mut SwarmCore<T, E>,
     now: minip2p_platform::Now,

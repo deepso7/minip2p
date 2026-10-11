@@ -12,20 +12,34 @@ use super::connect::{ConnectId, ConnectOutcome};
 
 /// Ordered application event from the Endpoint's single public stream.
 ///
-/// Connection, Identify, ping, stream, raw-dial, Connection-attempt, and
+/// Connection, Identify, ping, stream, dial, Connection-attempt, and
 /// enabled capability transitions leave through this enum.
 ///
 /// Each event is emitted once. The order is fixed when the Endpoint queues
 /// the event, and `poll` and `wait` preserve that queue order.
-/// A Connection attempt's [`Self::ConnectSettled`] follows the
-/// `ConnectionEstablished` it reports. No order is promised between
-/// concurrently racing Transport candidates.
 ///
-/// On the std endpoint, `poll` and `wait` finish each swarm event before
-/// the next one: that swarm event, then capability events (relay-server,
-/// NAT, Gossipsub, Discovery), then Connection-attempt terminals. Embedded
-/// endpoints emit the same variants from their smoltcp loop and do not use
-/// that step order.
+/// # Per-batch order
+///
+/// Both endpoint types (std and portable, smoltcp and mDNS compositions
+/// included) produce events in drive batches: one bounded batch of swarm
+/// events, one capability pass, then Connection-attempt terminals. Within a
+/// batch the order is:
+///
+/// 1. the batch's swarm events (connection, Identify, ping, and stream
+///    events), in swarm order;
+/// 2. capability events: relay-server, NAT, Gossipsub, Discovery;
+/// 3. Connection-attempt terminals ([`Self::ConnectSettled`]).
+///
+/// Std `wait` runs one batch and hands its events out one per call; std and
+/// portable `poll` return the whole batch. Events a command produces
+/// immediately (a `connect` that settles at once, say) are queued in the
+/// same capability-then-terminal order. A `ConnectSettled` therefore follows
+/// the `ConnectionEstablished` it reports, but other lifecycle events of the
+/// same batch -- a [`Self::PeerReady`], [`Self::ConnectionReplaced`], or
+/// [`Self::ConnectionClosed`] -- may come before it as well. No order is
+/// promised between concurrently racing Transport candidates. A stale
+/// [`Self::PeerReady`] is still delivered in order, and stream events keep
+/// their per-stream order.
 ///
 /// Payloads move by value across the Endpoint boundary; callers own each
 /// delivered event. Swarm variants keep the same names and fields as
@@ -127,10 +141,8 @@ pub enum EndpointEvent {
     },
     /// A non-fatal runtime error occurred.
     Error(SwarmRuntimeError),
-    /// A raw swarm dial's connection closed before it was established.
-    ///
-    /// Raw dials are made on a portable endpoint's swarm (through
-    /// `PortableEndpoint::core_mut`), bypassing Connection-attempt policy.
+    /// A dial no Connection attempt owns (one a capability made, such as a
+    /// relay or AutoNAT server dial) closed before it was established.
     ///
     /// Attempt-owned dials never surface here; they become
     /// [`Self::ConnectSettled`] diagnostics.
@@ -142,7 +154,7 @@ pub enum EndpointEvent {
     /// The one terminal event of a Connection attempt.
     ///
     /// On success, [`Self::ConnectionEstablished`] for the peer is delivered
-    /// in the same drain before this Settled event (snapshot getters are true
+    /// before this Settled event (snapshot getters are true
     /// at both points).
     ConnectSettled {
         connect_id: ConnectId,
