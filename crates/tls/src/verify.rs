@@ -95,6 +95,25 @@ pub fn certificate_spki(cert_der: &[u8]) -> Result<Vec<u8>, TlsError> {
         .map_err(|e| TlsError::Der(format!("{e}")))
 }
 
+/// Returns the `PeerId` a libp2p certificate's extension names, **without
+/// verifying anything**: no self-signature, validity or host-key signature
+/// check.
+///
+/// Only for a certificate that [`verify_libp2p_certificate`] already
+/// accepted, such as the one a completed TLS handshake's verifier checked;
+/// verifying costs a few hundred microseconds, reading the extension does
+/// not. Never use it to authenticate a peer.
+pub fn certificate_peer_id(cert_der: &[u8]) -> Result<PeerId, TlsError> {
+    let cert = Certificate::from_der(cert_der).map_err(|e| TlsError::Der(format!("{e}")))?;
+    let tbs = cert.tbs_certificate();
+    let libp2p_ext = find_libp2p_extension(tbs.extensions().map_or(&[], |exts| exts))?;
+    let (public_key_bytes, _) = decode_signed_key(libp2p_ext.extn_value.as_bytes())
+        .map_err(|e| TlsError::InvalidExtension(format!("{e}")))?;
+    let public_key = PublicKey::decode_protobuf(&public_key_bytes)
+        .map_err(|e| TlsError::InvalidPublicKey(format!("{e}")))?;
+    Ok(PeerId::from_public_key(&public_key))
+}
+
 /// Rejects a certificate whose validity period does not contain `now`.
 /// Both bounds are inclusive, per RFC 5280 Section 4.1.2.5.
 fn check_validity(cert: &Certificate, now: Duration) -> Result<(), TlsError> {
@@ -523,6 +542,22 @@ mod tests {
         assert_eq!(spki, expected.as_bytes());
         assert!(matches!(
             certificate_spki(&[0x30, 0x00]),
+            Err(TlsError::Der(_))
+        ));
+    }
+
+    #[test]
+    fn certificate_peer_id_reads_the_extension_verify_accepts() {
+        let keypair = Ed25519Keypair::from_secret_key_bytes([9u8; 32]);
+        let (cert_der, _) =
+            build_certificate(&keypair, test_certificate_validity(), &mut TestRng(3), &[])
+                .expect("must generate");
+        let verified =
+            verify_libp2p_certificate(&cert_der, Duration::from_secs(NOT_BEFORE)).expect("valid");
+        assert_eq!(certificate_peer_id(&cert_der), Ok(verified.clone()));
+        assert_eq!(verified, keypair.peer_id());
+        assert!(matches!(
+            certificate_peer_id(&[0x30, 0x00]),
             Err(TlsError::Der(_))
         ));
     }

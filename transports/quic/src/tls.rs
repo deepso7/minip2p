@@ -290,17 +290,17 @@ impl TlsIdentity {
     }
 }
 
-/// The `PeerId` a handshake's peer certificate proves, if it presented
-/// exactly one valid libp2p certificate at `now`.
-pub(crate) fn peer_id_from_identity(
-    identity: Option<Box<dyn std::any::Any>>,
-    now: Duration,
-) -> Option<PeerId> {
+/// The `PeerId` a completed handshake's peer certificate proves.
+///
+/// The handshake only completed because [`Libp2pVerifier`] accepted exactly
+/// this certificate, so the peer id is read from it rather than verified a
+/// second time (a full verification costs a few hundred microseconds).
+pub(crate) fn peer_id_from_identity(identity: Option<Box<dyn std::any::Any>>) -> Option<PeerId> {
     let certs = identity?.downcast::<Vec<CertificateDer<'static>>>().ok()?;
     let [leaf] = certs.as_slice() else {
         return None;
     };
-    minip2p_tls::verify_libp2p_certificate(leaf, now).ok()
+    minip2p_tls::certificate_peer_id(leaf).ok()
 }
 
 #[cfg(test)]

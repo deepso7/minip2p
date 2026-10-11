@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::mem;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use minip2p_transport::{
@@ -36,8 +36,6 @@ pub(crate) struct Cx<'a> {
     /// Reused for every transmit.
     pub(crate) send_buf: &'a mut Vec<u8>,
     pub(crate) events: &'a mut Vec<TransportEvent>,
-    /// The host's wall-clock time, for reading the verified peer id.
-    pub(crate) unix_now: Duration,
 }
 
 /// A queued write operation for a QUIC stream.
@@ -434,7 +432,7 @@ impl QuicConnection {
     /// token both ends derive, then report the connection.
     fn on_connected(&mut self, now: Instant, cx: &mut Cx<'_>) {
         let identity = self.conn.crypto_session().peer_identity();
-        let Some(peer_id) = crate::tls::peer_id_from_identity(identity, cx.unix_now) else {
+        let Some(peer_id) = crate::tls::peer_id_from_identity(identity) else {
             self.fail_connection(
                 now,
                 "peer identity unavailable after the handshake".into(),

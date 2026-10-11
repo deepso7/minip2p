@@ -915,7 +915,6 @@ impl QuicTransport {
             sockets: &mut self.sockets,
             send_buf: &mut self.send_buf,
             events: &mut self.pending_events,
-            unix_now: self.host_time.now(),
         };
         let failure = conn.service(now, &mut cx);
         let (after, unfinished, drained) =
