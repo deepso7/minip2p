@@ -137,9 +137,14 @@ impl RelayMachine {
                 data.len(),
                 key
             ));
-            endpoint
-                .send_stream(&other_peer, other_conn, other_stream, data)
-                .map_err(|e| format!("forward bridge data: {e}"))?;
+            // Like a FIN, data can race teardown of the other half: its
+            // connection may already be closing before its `ConnectionClosed`
+            // arrives. A transport rejects writes there, so the bridge ends.
+            if let Err(error) = endpoint.send_stream(&other_peer, other_conn, other_stream, data) {
+                self.trace
+                    .push(format!("forward to closing half failed: {error}"));
+                self.drop_stream(endpoint, &key);
+            }
             return Ok(());
         }
 
