@@ -1,4 +1,4 @@
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -79,9 +79,73 @@ struct Connection {
     /// long ago. Dating a dial from it would start it already expired. `None`
     /// once the session is established, or if the host set no timeout.
     authenticate_by: Option<u64>,
+    /// This connection's entry in [`TcpTransport::timers`], so it can be
+    /// found again to move or drop.
+    wake_at: Option<u64>,
 }
 
 impl Connection {
+    fn new(
+        id: ConnectionId,
+        socket: SocketHandle,
+        remote: Multiaddr,
+        inbound: bool,
+        session: SecureMuxSession,
+    ) -> Self {
+        Self {
+            id,
+            socket,
+            remote,
+            inbound,
+            // Accepted sockets are already up; nothing may be written to a
+            // dialed one until the provider reports the link.
+            linked: inbound,
+            session,
+            outbound: VecDeque::new(),
+            stalled_since: None,
+            authenticate_by: None,
+            wake_at: None,
+        }
+    }
+
+    /// Bytes still to move from the session to the socket.
+    ///
+    /// Such a connection is retried on every poll, so a provider that only
+    /// reports writability coarsely still drains it.
+    fn has_backlog(&self) -> bool {
+        !self.outbound.is_empty() || (self.linked && self.session.has_pending_write())
+    }
+
+    /// When this connection next needs a poll, [`Deadline::IMMEDIATE`] as 0.
+    fn wake_at(&self, stall_timeout: Option<u64>) -> Option<u64> {
+        // An unauthenticated connection has to be revisited when its patience
+        // runs out, whether or not it has anything queued.
+        let mut at = self.authenticate_by;
+        let mut fold = |deadline: u64| at = Some(at.map_or(deadline, |at| at.min(deadline)));
+        if self.outbound.is_empty() {
+            if self.linked && self.session.has_pending_write() {
+                // Framed bytes with room to put them: come straight back.
+                return Some(0);
+            }
+            if let Some(keepalive) = self.session.next_deadline() {
+                fold(keepalive.as_millis());
+            }
+        } else if let Some(since) = self.stalled_since {
+            // The socket is refusing bytes, and spinning would not change
+            // that. Sleep until the stall becomes fatal; the provider's own
+            // readiness reporting is what wakes us sooner if the peer starts
+            // reading again.
+            if let Some(timeout) = stall_timeout {
+                fold(since.saturating_add(timeout));
+            }
+        } else {
+            // The socket is still taking bytes, so coming straight back makes
+            // progress.
+            return Some(0);
+        }
+        at
+    }
+
     fn endpoint(&self, peer: Option<PeerId>) -> ConnectionEndpoint {
         match peer {
             Some(peer) => ConnectionEndpoint::with_peer_id(self.remote.clone(), peer),
@@ -103,6 +167,16 @@ pub struct TcpTransport<P, E> {
     connections: BTreeMap<ConnectionId, Connection>,
     by_socket: BTreeMap<SocketHandle, ConnectionId>,
     pending: VecDeque<TransportEvent>,
+    /// Connections the next poll services regardless of time: new ones, which
+    /// the poll stamps with an authentication deadline; ones whose session
+    /// was driven since, whose keepalive the poll restarts; and ones with a
+    /// backlog to retry. Everything else waits for a provider event or its
+    /// entry in `timers`, so a poll costs what has work rather than every
+    /// connection.
+    work: BTreeSet<ConnectionId>,
+    /// Each connection's next wake-up -- authentication, keepalive, or stall
+    /// deadline, or 0 for straight away -- ordered so the earliest is first.
+    timers: BTreeSet<(u64, ConnectionId)>,
 }
 
 impl<P, E> TcpTransport<P, E> {
@@ -122,6 +196,8 @@ impl<P, E> TcpTransport<P, E> {
             connections: BTreeMap::new(),
             by_socket: BTreeMap::new(),
             pending: VecDeque::new(),
+            work: BTreeSet::new(),
+            timers: BTreeSet::new(),
         }
     }
 
@@ -184,7 +260,41 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             .ok_or_else(|| Teardown::fault(format!("connection {id} is unknown")))?;
         let result = operation(self, &mut connection);
         self.connections.insert(id, connection);
+        self.touch(id);
         result
+    }
+
+    /// Re-files a connection after its session was driven: it joins the next
+    /// poll's work, and its wake-up moves to whatever it now waits for.
+    fn touch(&mut self, id: ConnectionId) {
+        self.work.insert(id);
+        self.reschedule(id);
+    }
+
+    /// Moves a connection's `timers` entry to its current wake-up.
+    fn reschedule(&mut self, id: ConnectionId) {
+        let timeout = self.config.send_stall_timeout_ms;
+        let Some(connection) = self.connections.get_mut(&id) else {
+            return;
+        };
+        let wake_at = connection.wake_at(timeout);
+        if connection.wake_at == wake_at {
+            return;
+        }
+        if let Some(old) = core::mem::replace(&mut connection.wake_at, wake_at) {
+            self.timers.remove(&(old, id));
+        }
+        if let Some(new) = wake_at {
+            self.timers.insert((new, id));
+        }
+    }
+
+    /// Drops a connection that is leaving the map from the scheduling sets.
+    fn forget(&mut self, connection: &Connection) {
+        self.work.remove(&connection.id);
+        if let Some(at) = connection.wake_at {
+            self.timers.remove(&(at, connection.id));
+        }
     }
 
     /// Builds a session for one connection.
@@ -336,6 +446,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         let Some(connection) = self.connections.remove(&id) else {
             return;
         };
+        self.forget(&connection);
         self.by_socket.remove(&connection.socket);
         self.provider.abort(connection.socket);
         if emit_error {
@@ -390,6 +501,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         let result = operation(&mut connection.session);
         let pumped = self.pump_and_flush(&mut connection);
         self.connections.insert(id, connection);
+        self.touch(id);
 
         if let Err(teardown) = pumped {
             self.fail_connection(id, teardown.message.clone(), false);
@@ -509,24 +621,100 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         self.by_socket.insert(socket, id);
         self.connections.insert(
             id,
-            Connection {
-                id,
-                socket,
-                remote: remote.clone(),
-                inbound: true,
-                // Accepted sockets are already up.
-                linked: true,
-                session,
-                outbound: VecDeque::new(),
-                stalled_since: None,
-                authenticate_by: None,
-            },
+            Connection::new(id, socket, remote.clone(), true, session),
         );
         self.pending.push_back(TransportEvent::IncomingConnection {
             id,
             endpoint: ConnectionEndpoint::new(remote),
         });
         self.drive_connection(id, SecureMuxSession::start);
+    }
+
+    /// One poll's worth of work for one connection: enforce its
+    /// authentication deadline, retry its buffered writes, and advance its
+    /// keepalive, then file it under whatever it waits for next.
+    fn service(&mut self, id: ConnectionId, now: Now) {
+        let Some(connection) = self.connections.get_mut(&id) else {
+            return;
+        };
+
+        // A connection that has not authenticated is on a clock. The ceiling
+        // alone would not hold: a peer that opens a byte stream and then says
+        // nothing keeps its slot for as long as the socket lives, so a few
+        // silent peers could fill the ceiling and keep it full.
+        if connection.session.is_established() {
+            // Authenticated, so there is nothing left to time.
+            connection.authenticate_by = None;
+        } else if let Some(limit) = self.config.handshake_timeout_ms {
+            // Stamped here, from this poll's sample, rather than when the
+            // connection was made: between polls a transport holds no current
+            // time, only the last one it was given.
+            let deadline = *connection
+                .authenticate_by
+                .get_or_insert(now.monotonic_ms.saturating_add(limit));
+            if now.monotonic_ms >= deadline {
+                self.fail_connection(
+                    id,
+                    format!("the upgrade did not complete within {limit}ms"),
+                    true,
+                );
+                return;
+            }
+        }
+
+        // Retry buffered writes even without a `Writable` event, so a provider
+        // that only reports readiness coarsely still drains, and pull whatever
+        // the session has framed since. Assume this poll stalls, keeping an
+        // older mark; `flush` clears it the moment the socket accepts a byte.
+        // Comparing buffer lengths instead would miss progress the session
+        // refilled.
+        connection.stalled_since.get_or_insert(now.monotonic_ms);
+        if let Err(teardown) =
+            self.with_connection(id, |this, connection| this.pump_and_flush(connection))
+        {
+            self.fail_connection(id, teardown.message, true);
+            return;
+        }
+        let Some(connection) = self.connections.get_mut(&id) else {
+            return;
+        };
+        if connection.outbound.is_empty() {
+            // Fully drained: nothing is stalled. Leaving a stale mark would
+            // make the next socketful look like the tail of an old stall and
+            // fail the connection on the spot.
+            connection.stalled_since = None;
+            // Yamux keepalive, only when the socket can take the ping. This
+            // runs after the retry so an established session whose final
+            // upgrade bytes just drained gets its first keepalive deadline in
+            // this poll.
+            if connection.session.is_established() {
+                self.drive_connection(id, |session| session.poll(now));
+            }
+        } else if let Some(since) = connection.stalled_since {
+            // Still set: the socket took nothing this poll.
+            let stalled_for = now.saturating_millis_since(Now::from_millis(since));
+            if let Some(limit) = self.config.send_stall_timeout_ms
+                && stalled_for >= limit
+            {
+                self.fail_connection(
+                    id,
+                    format!("socket accepted nothing for {stalled_for}ms; peer is not reading"),
+                    true,
+                );
+                return;
+            }
+        }
+
+        // Driving the session above queued it as work; only a backlog keeps it
+        // there, or every serviced connection would be serviced forever.
+        if !self
+            .connections
+            .get(&id)
+            .is_some_and(Connection::has_backlog)
+        {
+            self.work.remove(&id);
+        }
+        self.reschedule(id);
     }
 
     fn close_from_provider(&mut self, socket: SocketHandle, message: String, graceful: bool) {
@@ -588,19 +776,10 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         self.by_socket.insert(socket, id);
         self.connections.insert(
             id,
-            Connection {
-                id,
-                socket,
-                remote: target.clone(),
-                inbound: false,
-                // Nothing may be written until the provider reports the link.
-                linked: false,
-                session,
-                outbound: VecDeque::new(),
-                stalled_since: None,
-                authenticate_by: None,
-            },
+            Connection::new(id, socket, target.clone(), false, session),
         );
+        // The next poll stamps its authentication deadline.
+        self.work.insert(id);
         Ok(id)
     }
 
@@ -724,6 +903,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
             .connections
             .remove(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
+        self.forget(&connection);
         self.by_socket.remove(&connection.socket);
 
         // A connection still negotiating has no Yamux session to shut down, so
@@ -762,94 +942,22 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         for event in events {
             self.handle_provider_event(event);
         }
-        // A connection that has not authenticated is on a clock. The ceiling
-        // alone would not hold: a peer that opens a byte stream and then says
-        // nothing keeps its slot for as long as the socket lives, so a few
-        // silent peers could fill the ceiling and keep it full.
-        for id in self.connections.keys().copied().collect::<Vec<_>>() {
-            let overdue = {
-                let Some(connection) = self.connections.get_mut(&id) else {
-                    continue;
-                };
-                if connection.session.is_established() {
-                    // Authenticated, so there is nothing left to time.
-                    connection.authenticate_by = None;
-                    continue;
-                }
-                let Some(limit) = self.config.handshake_timeout_ms else {
-                    continue;
-                };
-                // Stamped here, from this poll's sample, rather than when the
-                // connection was made: between polls a transport holds no
-                // current time, only the last one it was given.
-                let deadline = *connection
-                    .authenticate_by
-                    .get_or_insert(now.monotonic_ms.saturating_add(limit));
-                (now.monotonic_ms >= deadline).then_some(limit)
-            };
-            if let Some(limit) = overdue {
-                self.fail_connection(
-                    id,
-                    format!("the upgrade did not complete within {limit}ms"),
-                    true,
-                );
+        // Only connections with work: those queued since the last poll --
+        // including every one a provider event above just drove -- and those
+        // whose wake-up has come.
+        let mut due = core::mem::take(&mut self.work);
+        while let Some(&(at, id)) = self.timers.first() {
+            if at > now.monotonic_ms {
+                break;
             }
-        }
-
-        // Retry buffered writes even without a `Writable` event, so a provider
-        // that only reports readiness coarsely still drains, and pull whatever
-        // the sessions have framed since.
-        let timeout = self.config.send_stall_timeout_ms;
-        for id in self.connections.keys().copied().collect::<Vec<_>>() {
-            // Assume this poll stalls, keeping an older mark; `flush` clears
-            // it the moment the socket accepts a byte. Comparing buffer
-            // lengths instead would miss progress the session refilled.
+            self.timers.pop_first();
             if let Some(connection) = self.connections.get_mut(&id) {
-                connection.stalled_since.get_or_insert(now.monotonic_ms);
+                connection.wake_at = None;
             }
-            if let Err(teardown) =
-                self.with_connection(id, |this, connection| this.pump_and_flush(connection))
-            {
-                self.fail_connection(id, teardown.message, true);
-                continue;
-            }
-
-            let stalled_for = {
-                let Some(connection) = self.connections.get_mut(&id) else {
-                    continue;
-                };
-                // Fully drained: nothing is stalled. Leaving a stale mark
-                // would make the next socketful look like the tail of an old
-                // stall and fail the connection on the spot.
-                if connection.outbound.is_empty() {
-                    connection.stalled_since = None;
-                    continue;
-                }
-                // Cleared by `flush`: the socket took something this poll.
-                let Some(since) = connection.stalled_since else {
-                    continue;
-                };
-                now.saturating_millis_since(Now::from_millis(since))
-            };
-            if timeout.is_some_and(|limit| stalled_for >= limit) {
-                self.fail_connection(
-                    id,
-                    format!("socket accepted nothing for {stalled_for}ms; peer is not reading"),
-                    true,
-                );
-            }
+            due.insert(id);
         }
-
-        // Yamux keepalive: only when the socket can take the ping. Run this
-        // after retrying writes so an established session whose final upgrade
-        // bytes drained above gets its first keepalive deadline in this poll.
-        for id in self.connections.keys().copied().collect::<Vec<_>>() {
-            let should_keepalive = self.connections.get(&id).is_some_and(|connection| {
-                connection.session.is_established() && connection.outbound.is_empty()
-            });
-            if should_keepalive {
-                self.drive_connection(id, |session| session.poll(now));
-            }
+        for id in due {
+            self.service(id, now);
         }
         Ok(self.drain_pending_events())
     }
@@ -860,45 +968,11 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
             // reads, so this needs no retained time sample.
             return Some(Deadline::IMMEDIATE);
         }
-        let mut stall = None;
-        for connection in self.connections.values() {
-            // An unauthenticated connection has to be revisited when its
-            // patience runs out, whether or not it has anything queued.
-            if let Some(deadline) = connection.authenticate_by {
-                let deadline = Deadline::from_millis(deadline);
-                stall =
-                    Some(stall.map_or(deadline, |earliest| Deadline::earliest(earliest, deadline)));
-            }
-            if connection.outbound.is_empty() {
-                if connection.linked && connection.session.has_pending_write() {
-                    // Framed bytes with room to put them: come straight back.
-                    return Some(Deadline::IMMEDIATE);
-                }
-                if let Some(deadline) = connection.session.next_deadline() {
-                    stall = Some(
-                        stall.map_or(deadline, |earliest| Deadline::earliest(earliest, deadline)),
-                    );
-                }
-                continue;
-            }
-            let Some(since) = connection.stalled_since else {
-                // The socket is still taking bytes, so coming straight back
-                // makes progress.
-                return Some(Deadline::IMMEDIATE);
-            };
-            // It is not, and spinning would not change that. Sleep until the
-            // stall becomes fatal; the provider's own readiness reporting is
-            // what wakes us sooner if the peer starts reading again.
-            let Some(timeout) = self.config.send_stall_timeout_ms else {
-                continue;
-            };
-            let deadline = Deadline::from_millis(since.saturating_add(timeout));
-            stall = Some(match stall {
-                Some(earliest) => Deadline::earliest(earliest, deadline),
-                None => deadline,
-            });
-        }
-        Deadline::earliest_opt(stall, self.provider.next_deadline())
+        let own = self
+            .timers
+            .first()
+            .map(|&(at, _)| Deadline::from_millis(at));
+        Deadline::earliest_opt(own, self.provider.next_deadline())
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {

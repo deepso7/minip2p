@@ -1432,3 +1432,75 @@ fn closing_a_connection_drops_its_queued_writable() {
         "no Writable for a closed connection: {events:?}"
     );
 }
+
+#[test]
+fn traffic_between_polls_restarts_the_keepalive_clock() {
+    const LATER: u64 = 10_000;
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
+    );
+
+    // A write made between polls is traffic, so the next poll -- whenever it
+    // comes -- restarts the quiet interval from its own time sample rather
+    // than leaving the old keepalive deadline standing.
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    pair.dialer
+        .send_stream(id, stream, Bytes::from_static(b"hello"))
+        .expect("send");
+    // The first poll only hands back the queued `StreamOpened`.
+    pair.dialer
+        .poll(Now::from_millis(LATER))
+        .expect("drain events");
+    pair.dialer.poll(Now::from_millis(LATER)).expect("poll");
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(LATER + KEEPALIVE_INTERVAL_MS))
+    );
+}
+
+#[test]
+fn each_connection_is_woken_for_its_own_deadline() {
+    const PATIENCE: u64 = 5_000;
+    let config = TcpConfig {
+        handshake_timeout_ms: Some(PATIENCE),
+        ..TcpConfig::default()
+    };
+    let mut pair = upgraded_pair_with(config, TcpConfig::default());
+    let established = pair.connection;
+
+    // A second listener that takes the byte stream and never answers.
+    let silent_addr = addr("/ip4/127.0.0.1/tcp/4002");
+    let mut silent = node(&pair.net, identity(3), 30);
+    silent.listen(&silent_addr).expect("silent listener binds");
+    let stuck = pair
+        .dialer
+        .dial(&PeerAddr::new(silent_addr, identity(3).peer_id()).expect("target"))
+        .expect("dial starts");
+    let _ = pair
+        .dialer
+        .poll(Now::from_millis(0))
+        .expect("stamp the dial");
+
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(PATIENCE)),
+        "the earliest of the two connections' deadlines"
+    );
+    let events = pair
+        .dialer
+        .poll(Now::from_millis(PATIENCE))
+        .expect("poll on the handshake deadline");
+    assert!(
+        events.contains(&TransportEvent::Closed { id: stuck }),
+        "{events:?}"
+    );
+    assert_eq!(pair.dialer.connection_ids(), vec![established]);
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
+        "the evicted connection's deadline goes with it"
+    );
+}
