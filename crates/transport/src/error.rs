@@ -7,6 +7,10 @@ use minip2p_core::Bytes;
 use crate::{ConnectionId, StreamId};
 
 /// Errors returned by [`Transport`](crate::Transport) operations.
+///
+/// From [`send_stream`](crate::Transport::send_stream), only
+/// [`Full`](Self::Full) says exactly what was accepted. Any other error may
+/// follow a partial queue: a prefix of the payload can already be on its way.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum TransportError {
     #[error("invalid address for {context}: {reason}")]
