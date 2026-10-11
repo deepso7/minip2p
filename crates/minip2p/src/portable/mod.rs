@@ -403,11 +403,17 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// Returning an [`EndpointEvent::StreamData`] acknowledges its bytes
     /// (ADR 0012): a sender's receive budget is replenished as the
     /// application pulls its data, so polling less often slows the sender.
+    ///
+    /// An error discards nothing: Connection-attempt events stay queued for
+    /// the next call.
     pub fn poll(&mut self, now: Now) -> Result<alloc::vec::Vec<EndpointEvent>, DriverError> {
         self.tick_connect(now);
+        // Poll the core before taking any queued event, so its error leaves
+        // them for next time.
+        let polled = self.core.poll(now)?;
         let mut events = alloc::vec::Vec::new();
         Self::drain_connect_events(&mut self.connect, &mut events);
-        for event in self.core.poll(now)? {
+        for event in polled {
             let consumed = self
                 .connect
                 .observe(&event, &mut self.core, now.monotonic_ms);
@@ -480,6 +486,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
                 #[cfg(feature = "pubsub")]
                 None,
             ),
+            unreturned: Vec::new(),
         })
     }
 }
@@ -502,6 +509,8 @@ pub struct PortableMdnsEndpoint<T: Transport, E: EntropySource, I: MdnsIo> {
     endpoint: PortableEndpoint<T, E>,
     mdns: minip2p_mdns::MdnsDriver<I>,
     discovery: DiscoveryDriver,
+    /// Events a failed [`Self::poll`] collected; the next call returns them.
+    unreturned: Vec<EndpointEvent>,
 }
 
 #[cfg(feature = "portable-mdns")]
@@ -579,16 +588,31 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
     ///
     /// Returns Endpoint events, with peer-book changes as
     /// [`EndpointEvent::Discovery`] after the step's connection events.
+    /// An error discards nothing: events already collected come out of the
+    /// next call.
     pub fn poll(&mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
-        let mut events = Vec::new();
-        self.poll_endpoint(now, &mut events)?;
+        let mut events = core::mem::take(&mut self.unreturned);
+        if let Err(error) = self.poll_into(now, &mut events) {
+            self.unreturned = events;
+            return Err(error);
+        }
+        self.endpoint.ack_pulled(&events);
+        Ok(events)
+    }
+
+    fn poll_into(
+        &mut self,
+        now: Now,
+        events: &mut Vec<EndpointEvent>,
+    ) -> Result<(), PortableDriveError> {
+        self.poll_endpoint(now, events)?;
 
         let local_addrs = self.endpoint.bound_addresses();
         self.mdns.tick(now.monotonic_ms, &local_addrs)?;
         // The mDNS carrier drives the shared interface. That may place TCP
         // bytes into a socket after the transport was serviced above, so run
         // the endpoint once more before computing a sleep deadline.
-        self.poll_endpoint(now, &mut events)?;
+        self.poll_endpoint(now, events)?;
         while let Some(event) = self.mdns.poll_event() {
             self.discovery.handle_mdns_event(event, now.monotonic_ms);
         }
@@ -607,10 +631,9 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         ));
         // The sweep can admit attempts that settle immediately; surface them
         // now so `claim_settled` clears `inflight` in the same poll.
-        self.emit_connect_events(now, &mut events);
-        self.discovery.drain_events(&mut events);
-        self.endpoint.ack_pulled(&events);
-        Ok(events)
+        self.emit_connect_events(now, events);
+        self.discovery.drain_events(events);
+        Ok(())
     }
 
     fn poll_endpoint(
