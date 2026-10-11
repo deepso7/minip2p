@@ -163,6 +163,9 @@ pub struct QuicConnection {
     /// is still there, so one unanswered ping is enough; idle timeout then
     /// closes a dead path.
     sent_keepalive_since_recv: bool,
+    /// Makes the next keepalive's scheduling fail, as quiche can.
+    #[cfg(test)]
+    fail_keepalive: bool,
     /// A packet quiche paced into the future (`SendInfo::at`), held until its
     /// send time. While one is held, `flush` generates nothing further for
     /// this connection, so packets leave in order and never early.
@@ -222,6 +225,8 @@ impl QuicConnection {
             indexed_reset_token: None,
             last_recv_ms: None,
             sent_keepalive_since_recv: false,
+            #[cfg(test)]
+            fail_keepalive: false,
             paced: None,
             streams_dirty: false,
             counters,
@@ -359,6 +364,12 @@ impl QuicConnection {
             .map(|paced| (paced.datagram.bytes.as_slice(), paced.at))
     }
 
+    /// Makes the next keepalive fail to schedule.
+    #[cfg(test)]
+    pub(crate) fn fail_next_keepalive(&mut self) {
+        self.fail_keepalive = true;
+    }
+
     /// Moves the held paced packet's send time to `at`.
     #[cfg(test)]
     pub(crate) fn repace_held_packet(&mut self, at: Instant) {
@@ -376,7 +387,8 @@ impl QuicConnection {
     }
 
     /// Sends an ack-eliciting packet if the connection has been quiet long
-    /// enough. One ping per receive; a dead peer is then left to idle-timeout.
+    /// enough. One attempt per receive, whether or not it is sent; a dead
+    /// peer is then left to idle-timeout.
     pub fn maybe_keepalive(
         &mut self,
         now: Now,
@@ -395,8 +407,20 @@ impl QuicConnection {
         if now.monotonic_ms.saturating_sub(last) < interval_ms {
             return Ok(());
         }
-        if self.conn.send_ack_eliciting().is_ok() {
-            self.sent_keepalive_since_recv = true;
+        #[cfg(test)]
+        let scheduled = if core::mem::take(&mut self.fail_keepalive) {
+            Err(quiche::Error::InvalidState)
+        } else {
+            self.conn.send_ack_eliciting()
+        };
+        #[cfg(not(test))]
+        let scheduled = self.conn.send_ack_eliciting();
+        // Spent even when quiche refuses it: otherwise the deadline stays in
+        // the past and the driver spins retrying. Idle timeout still closes a
+        // dead path, as after any unanswered keepalive.
+        self.sent_keepalive_since_recv = true;
+        match scheduled {
+            Ok(()) | Err(_) => {}
         }
         self.drain_send_queue(events);
         self.flush(socket, pending_datagrams, max_pending_datagrams)

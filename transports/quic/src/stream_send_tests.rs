@@ -840,3 +840,32 @@ fn a_local_close_retracts_queued_writables() {
     );
     assert_eq!(server.connections[&id].writable_armed_count(), 0);
 }
+
+/// A keepalive quiche refuses to schedule still spends this receive's
+/// keepalive, so its deadline does not stay in the past and spin the driver.
+#[test]
+fn a_failed_keepalive_does_not_leave_its_deadline_due() {
+    let idle_timeout_ms = 30_000;
+    let mut server = listening_server(idle_timeout_ms);
+    let (_peer, id) = accept(&mut server, &mut [], |_| {});
+    let interval = keepalive_interval_ms(idle_timeout_ms);
+    // Take in whatever the handshake left in flight, so the late poll below
+    // receives nothing that would restart the keepalive interval.
+    std::thread::sleep(Duration::from_millis(20));
+    server.poll(now()).expect("poll");
+    server
+        .connections
+        .get_mut(&id)
+        .expect("connection")
+        .fail_next_keepalive();
+
+    let late = Now::from_millis(now().monotonic_ms + interval + 1);
+    // The failure need not surface as a poll error; only the deadline matters.
+    drop(server.poll(late));
+
+    let deadline = server.connections[&id].keepalive_deadline(interval);
+    assert!(
+        deadline.is_none_or(|deadline| !deadline.is_expired_at(late)),
+        "keepalive deadline must not stay due after a failed send: {deadline:?}"
+    );
+}
