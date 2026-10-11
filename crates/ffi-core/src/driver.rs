@@ -56,6 +56,12 @@ pub(crate) struct EventState {
     pub(crate) carry: Carry,
     pub(crate) overflow: OverflowDiagnostic,
     pub(crate) stats: DriverStats,
+    /// What `connected_peers` returns, published from the endpoint's peer
+    /// table by whoever holds `state` (see `Shared::publish_peers`), so the
+    /// query neither interrupts nor waits for the driver.
+    pub(crate) connected_peers: Vec<String>,
+    /// Set with the lifecycle once it reaches `Stopping` or `Stopped`.
+    pub(crate) stopped: bool,
 }
 
 impl EventState {
@@ -324,7 +330,7 @@ impl Drop for ExitGuard {
         drop(self.doorbell.take());
         let mut state = self.shared.lock_state();
         state.release_endpoint();
-        state.lifecycle = Lifecycle::Stopped;
+        self.shared.set_lifecycle(&mut state, Lifecycle::Stopped);
         self.shared.driver_running.store(false, Ordering::Release);
         drop(state);
         self.shared.latch_stopped();
@@ -341,7 +347,7 @@ pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
     let report_failure = {
         let mut state = guard.shared.lock_state();
         if state.lifecycle == Lifecycle::Running && matches!(&result, Err(_) | Ok(Err(_))) {
-            state.lifecycle = Lifecycle::Stopping;
+            guard.shared.set_lifecycle(&mut state, Lifecycle::Stopping);
             true
         } else {
             false
@@ -372,7 +378,10 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             return Ok(());
         }
         let crate::endpoint::EndpointState {
-            endpoint, writes, ..
+            endpoint,
+            writes,
+            published_peers,
+            ..
         } = &mut *state;
         let endpoint = endpoint.as_mut().expect("running endpoint exists");
         // Only `Endpoint::wait`, so the carry stays in Endpoint emission
@@ -403,6 +412,7 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             }
         }
         if interrupted && batch.is_empty() {
+            guard.shared.publish_peers(endpoint, published_peers);
             drop(state);
             guard.shared.wait_for_commands();
             continue;
@@ -416,8 +426,10 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             converted.extend(convert_endpoint_event(endpoint, event));
             converted.extend(settled);
         }
-        // Ingested before `state` is released, so no command runs between
-        // the endpoint emitting these events and the carry holding them.
+        // Published and ingested before `state` is released, so no command
+        // runs between the endpoint emitting these events and the carry
+        // holding them, and the doorbell never rings ahead of the peers.
+        guard.shared.publish_peers(endpoint, published_peers);
         let should_ring = {
             let mut events = guard.shared.lock_events();
             events.stats.iterations = events.stats.iterations.saturating_add(1);
