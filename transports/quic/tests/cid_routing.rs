@@ -24,25 +24,26 @@ fn now() -> Now {
     StdClock::with_epoch(*EPOCH).now()
 }
 
+fn loopback(config: QuicNodeConfig) -> QuicTransport {
+    let addr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr");
+    QuicTransport::bind(config, &[addr]).expect("bind loopback")
+}
+
 /// A listening transport and one raw endpoint with two established
 /// connections to it, both from the endpoint's single socket. Returns the
 /// transport's id for each raw connection, in order.
 fn connect_twice() -> (QuicTransport, RawPeer, [ConnectionId; 2]) {
-    let mut server = QuicTransport::new(
-        QuicNodeConfig::generate().with_limits(QuicLimits {
-            // Accept each Initial directly, so connection order is creation
-            // order.
-            require_address_validation: false,
-            ..QuicLimits::default()
-        }),
-        "127.0.0.1:0",
-    )
-    .expect("server bind");
-    server.listen_on_bound_addr().expect("listen");
+    let mut server = loopback(QuicNodeConfig::generate().with_limits(QuicLimits {
+        // Accept each Initial directly, so connection order is creation
+        // order.
+        require_address_validation: false,
+        ..QuicLimits::default()
+    }));
+    server.listen_on_bound_addrs().expect("listen");
     let mut client = RawPeer::bind(None);
     for _ in 0..2 {
         client.connect(
-            server.local_addr(),
+            server.local_socket_addrs().remove(0),
             raw::client_config(Some(Identity::libp2p(&Ed25519Keypair::generate()))),
         );
     }
@@ -127,7 +128,7 @@ fn each_connection_from_a_shared_address_gets_only_its_own_data() {
 #[test]
 fn unknown_cid_datagrams_from_a_shared_address_leave_both_connections_intact() {
     let (mut server, mut client, ids) = connect_twice();
-    let server_addr = server.local_addr();
+    let server_addr = server.local_socket_addrs().remove(0);
 
     // Short header with an unknown DCID (answered with a stateless reset at
     // most), unparseable bytes, and a runt, all from the shared address.

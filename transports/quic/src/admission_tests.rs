@@ -9,7 +9,7 @@ use quinn_proto::{TimeSource, TokenStore};
 
 use super::*;
 use crate::test_peer::{
-    RawPeer, accept, client_config, drive_until, listening_server, now, take_datagrams,
+    RawPeer, accept, client_config, drive_until, listening_server, loopback, now, take_datagrams,
 };
 
 /// Whether `datagram` is a QUIC v1 Retry packet.
@@ -35,7 +35,7 @@ fn no_incoming(events: &[TransportEvent]) -> bool {
 
 #[test]
 fn before_listen_an_initial_gets_no_reply_while_dials_still_work() {
-    let mut node = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+    let mut node = loopback(QuicNodeConfig::generate());
     // The endpoint has no server config yet, so it would answer this Initial
     // with a stateless reset; a node that is not listening sends nothing.
     let client = RawPeer::connect(node.local_addr(), |_| {});

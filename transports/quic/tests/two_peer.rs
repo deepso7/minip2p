@@ -7,7 +7,7 @@ mod common;
 #[path = "common/raw.rs"]
 #[expect(dead_code, reason = "stream helpers serve the routing tests")]
 mod raw;
-use common::{drive_pair_once, setup_pair};
+use common::{drive_pair_once, loopback, peer_addr, setup_pair};
 use raw::{Identity, RawPeer};
 
 fn wait_for_connection(
@@ -340,11 +340,13 @@ fn assert_rejected(events: &[TransportEvent], reason: &str) {
 
 /// A listener, and a raw client dialing it as `identity`.
 fn listener_and_raw_client(identity: Option<Identity>) -> (QuicTransport, RawPeer) {
-    let mut server =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");
-    server.listen_on_bound_addr().expect("server listen");
+    let mut server = loopback(QuicNodeConfig::generate());
+    server.listen_on_bound_addrs().expect("server listen");
     let mut client = RawPeer::bind(None);
-    client.connect(server.local_addr(), raw::client_config(identity));
+    client.connect(
+        server.local_socket_addrs().remove(0),
+        raw::client_config(identity),
+    );
     (server, client)
 }
 
@@ -357,14 +359,12 @@ fn listener_rejects_dialer_without_mtls_identity() {
 
 #[test]
 fn dialer_rejects_listener_with_unexpected_peer_id() {
-    let mut listener_a =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener a");
-    let listener_b =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener b");
-    let mut dialer = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("dialer");
-    listener_a.listen_on_bound_addr().expect("listen a");
+    let mut listener_a = loopback(QuicNodeConfig::generate());
+    let listener_b = loopback(QuicNodeConfig::generate());
+    let mut dialer = loopback(QuicNodeConfig::generate());
+    listener_a.listen_on_bound_addrs().expect("listen a");
 
-    let listener_a_addr = listener_a.local_peer_addr().expect("listener a addr");
+    let listener_a_addr = peer_addr(&listener_a);
     let wrong_peer_addr = PeerAddr::new(
         listener_a_addr.transport().clone(),
         listener_b.local_peer_id(),
@@ -414,7 +414,7 @@ fn listener_rejects_dialer_presenting_certificate_chain() {
 fn dialer_rejects_listener_presenting_certificate_chain() {
     let keypair = Ed25519Keypair::generate();
     let mut server = RawPeer::bind(Some(raw::server_config(Identity::chain(&keypair))));
-    let mut dialer = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("dialer");
+    let mut dialer = loopback(QuicNodeConfig::generate());
     dialer
         .dial(&server.peer_addr(&keypair))
         .expect("dial starts");
@@ -426,25 +426,29 @@ fn dialer_rejects_listener_presenting_certificate_chain() {
 }
 
 #[test]
-fn mtls_verifies_listener_side_client_identity_and_updates_peer_index() {
+fn mtls_verifies_listener_side_client_identity() {
     let (mut server, mut client, peer_addr) = setup_pair();
     let client_peer_id = client.local_peer_id();
 
     let client_conn_id = client.dial(&peer_addr).expect("client dial");
 
     let mut verified_event = None;
+    let mut server_connected = None;
 
     for _ in 0..250 {
         let (server_events, client_events) = drive_pair_once(&mut server, &mut client);
 
         for event in server_events {
-            if let TransportEvent::PeerIdentityVerified {
-                id,
-                endpoint,
-                previous_peer_id,
-            } = event
-            {
-                verified_event = Some((id, endpoint, previous_peer_id));
+            match event {
+                TransportEvent::PeerIdentityVerified {
+                    id,
+                    endpoint,
+                    previous_peer_id,
+                } => verified_event = Some((id, endpoint, previous_peer_id)),
+                TransportEvent::Connected { id, endpoint } => {
+                    server_connected = Some((id, endpoint));
+                }
+                _ => {}
             }
         }
 
@@ -462,16 +466,18 @@ fn mtls_verifies_listener_side_client_identity_and_updates_peer_index() {
     assert_eq!(verified_event.1.peer_id(), Some(&client_peer_id));
     assert!(verified_event.2.is_none());
 
-    let indexed = server.connection_ids_for_peer(&client_peer_id);
-    assert_eq!(indexed, vec![verified_event.0]);
+    // `Connected` already carries the verified identity.
+    let (connected_id, endpoint) = server_connected.expect("server connected");
+    assert_eq!(connected_id, verified_event.0);
+    assert_eq!(endpoint.peer_id(), Some(&client_peer_id));
 }
 
 #[test]
 fn listen_rejects_address_mismatch_with_bound_socket() {
     let config = QuicNodeConfig::generate();
-    let mut transport = QuicTransport::new(config, "127.0.0.1:0").expect("bind");
+    let mut transport = loopback(config);
 
-    let local = transport.local_addr();
+    let local = transport.local_socket_addrs().remove(0);
     let mismatched_port = if local.port() == u16::MAX {
         local.port() - 1
     } else {
@@ -508,12 +514,11 @@ fn listen_rejects_address_mismatch_with_bound_socket() {
 
 #[test]
 fn open_stream_before_connected_returns_invalid_state() {
-    let mut listener =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener");
-    listener.listen_on_bound_addr().expect("listen");
-    let peer_addr = listener.local_peer_addr().expect("peer addr");
+    let mut listener = loopback(QuicNodeConfig::generate());
+    listener.listen_on_bound_addrs().expect("listen");
+    let peer_addr = peer_addr(&listener);
 
-    let mut dialer = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("dialer");
+    let mut dialer = loopback(QuicNodeConfig::generate());
 
     let conn_id = dialer.dial(&peer_addr).expect("dial");
 

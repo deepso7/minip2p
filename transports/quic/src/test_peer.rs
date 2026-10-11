@@ -10,6 +10,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
+use minip2p_core::PeerAddr;
 use minip2p_identity::Ed25519Keypair;
 use minip2p_platform::Now;
 use minip2p_transport::{ConnectionId, Transport, TransportEvent};
@@ -289,14 +290,26 @@ pub(crate) fn take_datagrams(socket: &UdpSocket) -> Vec<Vec<u8>> {
     datagrams
 }
 
+/// A transport bound to one IPv4 loopback socket.
+pub(crate) fn loopback(config: QuicNodeConfig) -> QuicTransport {
+    let addr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr");
+    QuicTransport::bind(config, &[addr]).expect("bind loopback")
+}
+
+/// The first address other nodes can dial `transport` at.
+pub(crate) fn peer_addr(transport: &QuicTransport) -> PeerAddr {
+    transport
+        .local_peer_addrs()
+        .expect("peer addrs")
+        .into_iter()
+        .next()
+        .expect("a bound socket")
+}
+
 /// A listening transport on loopback with `limits`.
 pub(crate) fn listening_server(limits: QuicLimits) -> QuicTransport {
-    let mut server = QuicTransport::new(
-        QuicNodeConfig::generate().with_limits(limits),
-        "127.0.0.1:0",
-    )
-    .expect("bind server");
-    server.listen_on_bound_addr().expect("listen");
+    let mut server = loopback(QuicNodeConfig::generate().with_limits(limits));
+    server.listen_on_bound_addrs().expect("listen");
     server
 }
 

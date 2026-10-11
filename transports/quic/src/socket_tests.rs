@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::test_peer::{RawPeer, accept, listening_server, now};
+use crate::test_peer::{RawPeer, accept, listening_server, loopback, now};
 
 /// Sends `len` bytes on a new server stream and reads them on the peer.
 fn transfer(server: &mut QuicTransport, peer: &mut RawPeer, id: ConnectionId, len: usize) {
@@ -41,22 +41,22 @@ fn transfer(server: &mut QuicTransport, peer: &mut RawPeer, id: ConnectionId, le
 fn a_single_segment_cap_sends_one_datagram_per_transmit() {
     let mut server = listening_server(QuicLimits::default());
     let (mut peer, id) = accept(&mut server, &mut [], |_| {});
-    server.socket.max_segments = 1;
-    server.socket.largest_transmit = 0;
+    server.socket().max_segments = 1;
+    server.socket().largest_transmit = 0;
     transfer(&mut server, &mut peer, id, 400_000);
-    assert_eq!(server.socket.largest_transmit, 1);
+    assert_eq!(server.socket().largest_transmit, 1);
 }
 
 #[test]
 fn segmentation_offload_batches_transmits_where_the_platform_has_it() {
     let mut server = listening_server(QuicLimits::default());
-    if server.socket.platform_gso_segments() == 1 {
+    if server.socket().platform_gso_segments() == 1 {
         return;
     }
     let (mut peer, id) = accept(&mut server, &mut [], |_| {});
-    server.socket.largest_transmit = 0;
+    server.socket().largest_transmit = 0;
     transfer(&mut server, &mut peer, id, 400_000);
-    assert!(server.socket.largest_transmit > 1);
+    assert!(server.socket().largest_transmit > 1);
 }
 
 #[test]
@@ -67,13 +67,13 @@ fn a_small_retry_queue_holds_whole_transmits_within_its_bound() {
     });
     let (mut peer, id) = accept(&mut server, &mut [], |_| {});
 
-    server.socket.blocked = true;
+    server.socket().blocked = true;
     let stream = server.open_stream(id).expect("open");
     server
         .send_stream(id, stream, Bytes::from(vec![5u8; 100_000]))
         .expect("send");
     for _ in 0..5 {
-        let retained = server.socket.retained();
+        let retained = server.socket().retained();
         assert!(
             (1..=3).contains(&retained),
             "{retained} logical datagrams retained"
@@ -83,7 +83,7 @@ fn a_small_retry_queue_holds_whole_transmits_within_its_bound() {
     }
 
     // Once the socket takes datagrams again, everything goes out.
-    server.socket.blocked = false;
+    server.socket().blocked = false;
     let mut received = 0;
     let start = Instant::now();
     while received < 100_000 {
@@ -91,7 +91,7 @@ fn a_small_retry_queue_holds_whole_transmits_within_its_bound() {
         peer.pump();
         std::thread::sleep(Duration::from_millis(1));
         server.poll(now()).expect("poll");
-        assert!(server.socket.retained() <= 3);
+        assert!(server.socket().retained() <= 3);
         peer.pump();
         received += peer.read(stream.as_u64()).0.len();
     }
@@ -99,8 +99,7 @@ fn a_small_retry_queue_holds_whole_transmits_within_its_bound() {
 
 #[test]
 fn a_burst_past_the_receive_bound_drains_without_another_readiness_edge() {
-    let mut transport =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+    let mut transport = loopback(QuicNodeConfig::generate());
     let destination = transport.local_addr();
 
     // Junk the endpoint drops, sent as segmented trains where the platform
@@ -133,7 +132,7 @@ fn a_burst_past_the_receive_bound_drains_without_another_readiness_edge() {
 
     transport.poll(now()).expect("poll");
     // A batch here holds at most one train.
-    let first = transport.socket.received;
+    let first = transport.socket().received;
     assert!(
         (MAX_DATAGRAMS_PER_POLL..MAX_DATAGRAMS_PER_POLL + SEGMENTS).contains(&first),
         "the bound is reached and overshot by less than one batch: {first}"
@@ -146,6 +145,6 @@ fn a_burst_past_the_receive_bound_drains_without_another_readiness_edge() {
         transport.poll(now()).expect("poll");
         polls += 1;
     }
-    assert_eq!(transport.socket.received, TRAINS * SEGMENTS);
-    assert!(!socket::has_queued_input(&transport.socket.udp));
+    assert_eq!(transport.socket().received, TRAINS * SEGMENTS);
+    assert!(!socket::has_queued_input(&transport.socket().udp));
 }

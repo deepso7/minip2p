@@ -6,33 +6,27 @@
 
 use minip2p_core::{PeerAddr, Protocol};
 use minip2p_platform::{Deadline, Now};
-use minip2p_quic::{
-    QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport, STREAM_RECEIVE_WINDOW,
-};
+use minip2p_quic::{QuicLimits, QuicNodeConfig, QuicTransport, STREAM_RECEIVE_WINDOW};
 use minip2p_transport::{
     BlockingTransport, Bytes, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,
     TransportEvent, WaitOutcome,
 };
 
 mod common;
-use common::{drive_pair_once, setup_pair};
+use common::{drive_pair_once, loopback, peer_addr, setup_pair};
 
 fn setup_pair_with_client_limits(limits: QuicLimits) -> (QuicTransport, QuicTransport, PeerAddr) {
-    let mut server = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server");
-    let client = QuicTransport::new(
-        QuicNodeConfig::generate().with_limits(limits),
-        "127.0.0.1:0",
-    )
-    .expect("client");
+    let mut server = loopback(QuicNodeConfig::generate());
+    let client = loopback(QuicNodeConfig::generate().with_limits(limits));
 
-    server.listen_on_bound_addr().expect("listen");
-    let peer_addr = server.local_peer_addr().expect("peer addr");
+    server.listen_on_bound_addrs().expect("listen");
+    let peer_addr = peer_addr(&server);
     (server, client, peer_addr)
 }
 
 #[test]
 fn dual_stack_endpoint_exposes_ipv4_and_ipv6_local_addresses() {
-    let endpoint = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("dual stack bind");
+    let endpoint = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("dual stack bind");
     let addrs = endpoint.local_addresses();
 
     assert!(
@@ -119,9 +113,8 @@ fn connect_pair(
 
 #[test]
 fn listen_returns_the_resolved_listen_address_and_event_matches() {
-    let mut listener =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener");
-    let requested = listener.local_multiaddr();
+    let mut listener = loopback(QuicNodeConfig::generate());
+    let requested = listener.local_addresses().remove(0);
 
     let resolved = listener.listen(&requested).expect("listen");
     assert_eq!(resolved, requested);
@@ -325,9 +318,9 @@ fn zero_pending_limits_are_rejected() {
         (zero_datagrams, "max_pending_datagrams"),
         (zero_stream_bytes, "max_pending_stream_bytes"),
     ] {
-        let result = QuicTransport::new(
+        let result = QuicTransport::bind(
             QuicNodeConfig::generate().with_limits(limits),
-            "127.0.0.1:0",
+            &["/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr")],
         );
         let error = match result {
             Ok(_) => panic!("zero {field} must be rejected"),
@@ -636,17 +629,13 @@ fn a_reset_after_a_full_unacknowledged_window_is_still_reported() {
 
 #[test]
 fn an_unsettled_stream_holds_its_slot_and_over_acks_fail() {
-    let mut server = QuicTransport::new(
-        QuicNodeConfig::generate().with_limits(QuicLimits {
-            max_streams_per_connection: 1,
-            ..QuicLimits::default()
-        }),
-        "127.0.0.1:0",
-    )
-    .expect("server");
-    let mut client = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("client");
-    server.listen_on_bound_addr().expect("listen");
-    let peer_addr = server.local_peer_addr().expect("peer addr");
+    let mut server = loopback(QuicNodeConfig::generate().with_limits(QuicLimits {
+        max_streams_per_connection: 1,
+        ..QuicLimits::default()
+    }));
+    let mut client = loopback(QuicNodeConfig::generate());
+    server.listen_on_bound_addrs().expect("listen");
+    let peer_addr = peer_addr(&server);
     let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
 
     // A stream that delivers ten bytes and closes in both directions, unread.
@@ -1058,8 +1047,7 @@ fn reset_stream_emits_stream_closed() {
 
 #[test]
 fn open_stream_on_unknown_connection_returns_not_found() {
-    let mut transport =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+    let mut transport = loopback(QuicNodeConfig::generate());
 
     let err = transport
         .open_stream(ConnectionId::new(999))
@@ -1069,8 +1057,7 @@ fn open_stream_on_unknown_connection_returns_not_found() {
 
 #[test]
 fn send_on_unknown_connection_returns_not_found() {
-    let mut transport =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+    let mut transport = loopback(QuicNodeConfig::generate());
 
     let err = transport
         .send_stream(
@@ -1088,9 +1075,8 @@ fn send_on_unknown_connection_returns_not_found() {
 /// unrelated packet happens to wake the driver.
 #[test]
 fn events_buffered_outside_poll_report_as_due_work() {
-    let mut transport =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
-    transport.listen_on_bound_addr().expect("listen");
+    let mut transport = loopback(QuicNodeConfig::generate());
+    transport.listen_on_bound_addrs().expect("listen");
 
     // No time sample has been taken (no `poll` yet) and no datagram is
     // queued, so the buffered event is the only thing that can answer here.
@@ -1129,7 +1115,7 @@ fn events_buffered_outside_poll_report_as_due_work() {
 #[test]
 fn dual_stack_endpoint_reports_buffered_events_as_due_work() {
     let mut endpoint =
-        QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("dual stack bind");
+        QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("dual stack bind");
     let listen_addr = endpoint
         .local_addresses()
         .into_iter()
@@ -1153,8 +1139,7 @@ fn dual_stack_endpoint_reports_buffered_events_as_due_work() {
 
 #[test]
 fn poll_returns_empty_when_idle() {
-    let mut transport =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+    let mut transport = loopback(QuicNodeConfig::generate());
 
     let events = transport.poll(common::now()).expect("poll");
     assert!(events.is_empty(), "idle poll must return empty vec");

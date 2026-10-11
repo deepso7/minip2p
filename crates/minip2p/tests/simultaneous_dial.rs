@@ -436,8 +436,11 @@ type Portable<T> = PortableEndpoint<T, StdEntropy>;
 #[test]
 fn duplicate_quic_candidates_keep_one_shared_connection() {
     duplicate_candidates_keep_one_shared_connection(
-        |key| QuicTransport::new(QuicNodeConfig::new(key.clone()), "127.0.0.1:0").expect("bind"),
-        QuicTransport::local_multiaddr,
+        |key| {
+            let addr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr");
+            QuicTransport::bind(QuicNodeConfig::new(key.clone()), &[addr]).expect("bind")
+        },
+        |transport: &QuicTransport| transport.local_addresses().remove(0),
         true,
     );
 }

@@ -8,7 +8,6 @@ use std::mem;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use minip2p_core::PeerId;
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionState, ConnectionToken, StreamId, TransportError,
     TransportEvent,
@@ -20,7 +19,7 @@ use quinn_proto::{
 
 use crate::STREAM_RECEIVE_WINDOW;
 use crate::diagnostics::ConnectionCounters;
-use crate::socket::Socket;
+use crate::socket::Sockets;
 
 /// TLS exporter label for the connection token both ends derive.
 const TOKEN_LABEL: &[u8] = b"minip2p quic connection token";
@@ -32,7 +31,8 @@ const MAX_SERVICE_PASSES: usize = 4;
 /// What servicing a connection needs from its transport.
 pub(crate) struct Cx<'a> {
     pub(crate) endpoint: &'a mut quinn_proto::Endpoint,
-    pub(crate) socket: &'a mut Socket,
+    /// Each transmit leaves from the socket of its destination's family.
+    pub(crate) sockets: &'a mut Sockets,
     /// Reused for every transmit.
     pub(crate) send_buf: &'a mut Vec<u8>,
     pub(crate) events: &'a mut Vec<TransportEvent>,
@@ -188,9 +188,6 @@ pub(crate) struct QuicConnection {
     read_chunks: Vec<Bytes>,
     /// The engine's next timeout, cached after every service.
     timeout: Option<Instant>,
-    /// The peer id before the handshake verified one, when it changed; taken
-    /// by the transport to update its peer index.
-    identity_change: Option<Option<PeerId>>,
     /// Diagnostic hooks; empty unless the `diagnostics` feature is on.
     counters: ConnectionCounters,
 }
@@ -232,7 +229,6 @@ impl QuicConnection {
             gated: BTreeSet::new(),
             read_chunks: Vec::new(),
             timeout: None,
-            identity_change: None,
             counters,
         }
     }
@@ -276,11 +272,6 @@ impl QuicConnection {
     /// The engine's next timeout, as of the last service.
     pub(crate) fn timeout(&self) -> Option<Instant> {
         self.timeout
-    }
-
-    /// The previous peer id, if the handshake changed it since the last call.
-    pub(crate) fn take_identity_change(&mut self) -> Option<Option<PeerId>> {
-        self.identity_change.take()
     }
 
     /// Feeds a datagram (or new connection ids) the endpoint routed here.
@@ -371,7 +362,10 @@ impl QuicConnection {
         self.counters.flush();
         loop {
             // Recomputed for every transmit: retained datagrams shrink it.
-            let allowance = cx.socket.allowance();
+            let allowance = cx
+                .sockets
+                .for_addr(self.conn.remote_address())
+                .map_or(0, |socket| socket.allowance());
             if allowance == 0 {
                 break;
             }
@@ -379,10 +373,14 @@ impl QuicConnection {
             let Some(transmit) = self.conn.poll_transmit(now, allowance, cx.send_buf) else {
                 break;
             };
-            let Some(contents) = cx.send_buf.get(..transmit.size) else {
-                break;
+            let (Some(contents), Some(socket)) = (
+                cx.send_buf.get(..transmit.size),
+                cx.sockets.for_addr(transmit.destination),
+            ) else {
+                // No socket of that family: lost, like any unroutable packet.
+                continue;
             };
-            match cx.socket.send(&transmit, contents) {
+            match socket.send(&transmit, contents) {
                 Ok(true) => {}
                 Ok(false) => break,
                 // Stop rather than hammer a dead route within one service.
@@ -451,9 +449,8 @@ impl QuicConnection {
             cx.events.push(TransportEvent::PeerIdentityVerified {
                 id: self.id,
                 endpoint: self.endpoint.clone(),
-                previous_peer_id: previous.clone(),
+                previous_peer_id: previous,
             });
-            self.identity_change = Some(previous);
         }
     }
 

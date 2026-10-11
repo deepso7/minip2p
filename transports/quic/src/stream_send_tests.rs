@@ -449,7 +449,7 @@ fn a_peer_reset_retracts_a_writable_queued_before_the_poll() {
     // Wait until the reset is waiting on the server's socket (peeking leaves
     // it there), so the next poll is sure to read it.
     let start = Instant::now();
-    while !socket::has_queued_input(&server.socket.udp) {
+    while !socket::has_queued_input(&server.socket().udp) {
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "reset never arrived"

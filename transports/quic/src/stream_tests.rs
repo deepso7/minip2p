@@ -9,7 +9,8 @@ use quinn_proto::{Dir, ReadError};
 
 use super::*;
 use crate::test_peer::{
-    RawPeer, accept, allocation_len, drive_until, listening_server, now, sid, stream_bytes,
+    RawPeer, accept, allocation_len, drive_until, listening_server, loopback, now, peer_addr, sid,
+    stream_bytes,
 };
 
 /// Events about `stream`, in order.
@@ -31,9 +32,9 @@ fn stream_events(events: &[TransportEvent], stream: u64) -> Vec<TransportEvent> 
 
 /// Waits until a datagram is queued on the server's socket, then a moment
 /// more for the rest of a flight.
-fn await_input(server: &QuicTransport) {
+fn await_input(server: &mut QuicTransport) {
     let start = Instant::now();
-    while !socket::has_queued_input(&server.socket.udp) {
+    while !socket::has_queued_input(&server.socket().udp) {
         assert!(start.elapsed() < Duration::from_secs(5), "nothing arrived");
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -116,7 +117,7 @@ fn a_one_packet_request_with_fin_is_delivered_without_further_traffic() {
     peer.write(raw, b"request");
     peer.finish(raw);
     peer.service();
-    await_input(&server);
+    await_input(&mut server);
     let events = server.poll(now()).expect("poll");
 
     let stream = StreamId::new(raw);
@@ -590,14 +591,8 @@ fn connected_pair(
     limits: QuicLimits,
 ) -> (QuicTransport, QuicTransport, ConnectionId, ConnectionId) {
     let mut server = listening_server(limits.clone());
-    let mut client = QuicTransport::new(
-        QuicNodeConfig::generate().with_limits(limits),
-        "127.0.0.1:0",
-    )
-    .expect("client");
-    let client_id = client
-        .dial(&server.local_peer_addr().expect("peer addr"))
-        .expect("dial");
+    let mut client = loopback(QuicNodeConfig::generate().with_limits(limits));
+    let client_id = client.dial(&peer_addr(&server)).expect("dial");
     let mut server_id = None;
     let mut client_connected = false;
     let start = Instant::now();

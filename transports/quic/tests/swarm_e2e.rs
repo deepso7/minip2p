@@ -6,21 +6,25 @@
 use minip2p_core::{Multiaddr, Protocol};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_ping::PING_PROTOCOL_ID;
-use minip2p_quic::{QuicEndpoint, QuicNodeConfig, QuicTransport};
+use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_swarm::{DriverError, Swarm, SwarmBuilder, SwarmError, SwarmErrorKind, SwarmEvent};
 use minip2p_transport::{Bytes, StreamId, Transport};
 
+fn loopback() -> Multiaddr {
+    "/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr")
+}
+
 fn make_swarm(keypair: Ed25519Keypair) -> Swarm<QuicTransport> {
     let transport =
-        QuicTransport::new(QuicNodeConfig::new(keypair.clone()), "127.0.0.1:0").expect("bind");
+        QuicTransport::bind(QuicNodeConfig::new(keypair.clone()), &[loopback()]).expect("bind");
     SwarmBuilder::new(&keypair)
         .agent_version("minip2p-test/0.1.0")
         .build(transport)
         .expect("build swarm")
 }
 
-fn make_dual_stack_swarm(keypair: Ed25519Keypair) -> Swarm<QuicEndpoint> {
-    let transport = QuicEndpoint::dual_stack(QuicNodeConfig::new(keypair.clone())).expect("bind");
+fn make_dual_stack_swarm(keypair: Ed25519Keypair) -> Swarm<QuicTransport> {
+    let transport = QuicTransport::dual_stack(QuicNodeConfig::new(keypair.clone())).expect("bind");
     SwarmBuilder::new(&keypair)
         .agent_version("minip2p-test/0.1.0")
         .build(transport)
@@ -74,7 +78,7 @@ fn listen_on_bound_addrs_returns_ipv4_and_ipv6_peer_addrs() {
 #[test]
 fn listen_on_bound_addr_keeps_first_address_contract() {
     let keypair = Ed25519Keypair::generate();
-    let transport = QuicEndpoint::dual_stack(QuicNodeConfig::new(keypair.clone())).expect("bind");
+    let transport = QuicTransport::dual_stack(QuicNodeConfig::new(keypair.clone())).expect("bind");
     let first_addr = transport
         .local_addresses()
         .into_iter()

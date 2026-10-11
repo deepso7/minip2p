@@ -7,7 +7,7 @@
 //! adapter feeds it datagrams and a time sample, and sends what it produces.
 //! No async runtime required.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,9 +16,8 @@ use bytes::BytesMut;
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{
-    BlockingTransport, Bytes, ConnectionEndpoint, ConnectionId, ConnectionIdAllocator,
-    ConnectionNamespace, StreamId, Transport, TransportError, TransportEvent, WaitHandle,
-    WaitOutcome,
+    BlockingTransport, Bytes, ConnectionEndpoint, ConnectionId, ConnectionNamespace, StreamId,
+    Transport, TransportError, TransportEvent, WaitHandle, WaitOutcome,
 };
 use mio::{Events, Interest, Poll, Token, Waker};
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -52,11 +51,9 @@ pub use diagnostics::{ConnectionDiagnostics, DatagramCounters, datagram_counters
 
 use connection::{Cx, QuicConnection};
 use diagnostics::{ConnectionCounters, DatagramTally};
-use socket::{Received, Socket};
+use socket::{Received, Socket, Sockets};
 use tls::{HostTime, TlsIdentity};
 
-const DEFAULT_IPV4_BIND: &str = "0.0.0.0:0";
-const DEFAULT_IPV6_BIND: &str = "[::]:0";
 /// Per-stream receive window, and each stream's receive budget: the most
 /// delivered bytes it holds unacknowledged (ADR 0012).
 ///
@@ -263,18 +260,26 @@ fn tls_config_error(error: impl std::fmt::Display) -> TransportError {
     }
 }
 
-/// QUIC transport backed by a non-blocking UDP socket and quinn-proto.
+/// QUIC transport over one or two non-blocking UDP sockets -- at most one per
+/// IP family -- and one quinn-proto endpoint serving both.
+///
+/// Bind one family with [`bind`](Self::bind) and one address, both with two
+/// addresses (one `/ip4`, one `/ip6`), or both on wildcard addresses with
+/// [`dual_stack`](Self::dual_stack). Each transmit leaves from the socket of
+/// its destination's family. Connections are counted against
+/// [`QuicLimits::max_connections`], given ids, and queue retained datagrams
+/// per socket.
 pub struct QuicTransport {
-    /// Non-blocking UDP socket for all QUIC traffic, with its retry queue.
-    socket: Socket,
-    /// Poll registration used to wait for socket readability or an external
-    /// driver interrupt without consuming a datagram. `None` for a half of a
-    /// [`DualQuicTransport`], which waits on both sockets with one poll.
-    readiness: Option<ReadinessWait>,
+    /// The sockets, IPv4 first, with their per-socket state.
+    sockets: Sockets,
+    /// One poll over every socket and a waker, so a wait blocks on either
+    /// family at once without consuming a datagram.
+    readiness: ReadinessWait,
     /// The engine's endpoint: routes datagrams to connections by connection
     /// id and answers what no connection owns.
     endpoint: quinn_proto::Endpoint,
-    /// Installed on the endpoint by `listen`; until then it accepts nothing.
+    /// Installed on the endpoint by the first `listen`; until then it
+    /// accepts nothing.
     server_config: Arc<ServerConfig>,
     transport_config: Arc<TransportConfig>,
     tls: TlsIdentity,
@@ -284,8 +289,6 @@ pub struct QuicTransport {
     connections: HashMap<ConnectionId, QuicConnection>,
     /// The engine's handle for each connection.
     handles: HashMap<ConnectionHandle, ConnectionId>,
-    /// Maps peer ids to their set of connection ids.
-    peer_connections: HashMap<PeerId, BTreeSet<ConnectionId>>,
     /// Events queued between poll() calls.
     pending_events: Vec<TransportEvent>,
     /// Reused by every receive.
@@ -294,40 +297,12 @@ pub struct QuicTransport {
     send_buf: Vec<u8>,
     /// Reused for the connection sweep.
     sweep_ids: Vec<ConnectionId>,
-    /// Whether `listen` installed the server config.
-    listening: bool,
-    /// The last receive batch hit [`MAX_DATAGRAMS_PER_POLL`], so input may be
-    /// waiting with no fresh readiness edge to report it.
-    recv_saturated: bool,
-    /// Connection ids for this socket, namespaced by the family it is bound to
-    /// so a dual-stack pair's two id spaces stay disjoint.
-    connection_ids: ConnectionIdAllocator,
     /// Retained node configuration.
     node_config: QuicNodeConfig,
     /// The last poll's host sample and the engine instant taken with it, so
     /// `next_deadline` maps engine timeouts onto the host's timeline. `None`
     /// until the first `poll`.
     clock: Option<(Now, Instant)>,
-}
-
-/// QUIC endpoint that can be backed by one socket or a dual-stack pair.
-///
-/// This is the DX-oriented transport entrypoint. Use [`QuicEndpoint::bind`]
-/// when an application wants one explicit bind address, or
-/// [`QuicEndpoint::dual_stack`] to listen and dial over both IPv4 and IPv6.
-pub enum QuicEndpoint {
-    Single(Box<QuicTransport>),
-    Dual(Box<DualQuicTransport>),
-}
-
-/// QUIC transport backed by separate IPv4 and IPv6 sockets.
-///
-/// Both sockets share one readiness [`Poll`], so a wait blocks on either
-/// family at once and a datagram on either wakes it straight away.
-pub struct DualQuicTransport {
-    ipv4: QuicTransport,
-    ipv6: QuicTransport,
-    readiness: ReadinessWait,
 }
 
 /// One mio [`Poll`] watching one or more UDP sockets and a [`Waker`].
@@ -342,6 +317,9 @@ struct ReadinessWait {
     events: Events,
     _sockets: Vec<mio::net::UdpSocket>,
     waker: Arc<Waker>,
+    /// Polls that could block (a non-zero timeout).
+    #[cfg(test)]
+    blocking_waits: usize,
 }
 
 impl ReadinessWait {
@@ -360,12 +338,18 @@ impl ReadinessWait {
             events: Events::with_capacity(sockets.len() + 1),
             _sockets: registered,
             waker,
+            #[cfg(test)]
+            blocking_waits: 0,
         })
     }
 
     /// Waits up to `timeout`, harvesting whatever the poll has queued.
     /// `None` if the poll failed, which leaves what it holds unknown.
     fn wait(&mut self, timeout: Duration) -> Option<WaitOutcome> {
+        #[cfg(test)]
+        {
+            self.blocking_waits += usize::from(!timeout.is_zero());
+        }
         self.events.clear();
         self.poll.poll(&mut self.events, Some(timeout)).ok()?;
         Some(
@@ -492,296 +476,113 @@ fn family_for_socket_addr(addr: SocketAddr) -> AddressFamily {
     }
 }
 
-/// `addr` itself when its host is in `family`; an address error otherwise.
-fn peer_addr_for_family(
-    addr: &PeerAddr,
-    family: AddressFamily,
-) -> Result<PeerAddr, TransportError> {
-    let socket_addr = dial_socket_addr(addr.transport(), "dial target")?;
-    if family_for_socket_addr(socket_addr) != family {
-        return Err(TransportError::InvalidAddress {
-            context: "dial target",
-            reason: format!("{} is not an {} target", addr.transport(), family.name()),
-        });
-    }
-    Ok(addr.clone())
-}
-
-impl QuicEndpoint {
-    /// Binds one QUIC socket to `bind_addr`.
-    pub fn bind(node_config: QuicNodeConfig, bind_addr: &str) -> Result<Self, TransportError> {
-        QuicTransport::new(node_config, bind_addr)
-            .map(|transport| Self::Single(Box::new(transport)))
-    }
-
-    /// Binds one QUIC socket to the IP/UDP address represented by `addr`.
-    pub fn bind_multiaddr(
-        node_config: QuicNodeConfig,
-        addr: &Multiaddr,
-    ) -> Result<Self, TransportError> {
-        let bind = extract_listen_socket_addr(addr, "bind address")?;
-        Self::bind(node_config, &bind.to_string())
-    }
-
-    /// Binds one IPv4 and one IPv6 QUIC socket to exact multiaddresses.
-    pub fn bind_dual_multiaddr(
-        node_config: QuicNodeConfig,
-        first: &Multiaddr,
-        second: &Multiaddr,
-    ) -> Result<Self, TransportError> {
-        let first = extract_listen_socket_addr(first, "first dual-stack bind address")?;
-        let second = extract_listen_socket_addr(second, "second dual-stack bind address")?;
-        let (ipv4, ipv6) = match (
-            family_for_socket_addr(first),
-            family_for_socket_addr(second),
-        ) {
-            (AddressFamily::Ipv4, AddressFamily::Ipv6) => (first, second),
-            (AddressFamily::Ipv6, AddressFamily::Ipv4) => (second, first),
-            _ => {
-                return Err(TransportError::InvalidConfig {
-                    reason: "dual-stack QUIC requires one IPv4 and one IPv6 bind address".into(),
-                });
-            }
-        };
-        DualQuicTransport::bind(node_config, &ipv4.to_string(), &ipv6.to_string())
-            .map(|transport| Self::Dual(Box::new(transport)))
-    }
-
-    /// Binds IPv4 and IPv6 wildcard UDP sockets.
-    pub fn dual_stack(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
-        DualQuicTransport::new(node_config).map(|transport| Self::Dual(Box::new(transport)))
-    }
-
-    /// Dials `addr` with the IPv4 socket.
-    pub fn dial_ip4(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        match self {
-            Self::Single(transport) => single_dial_family(transport, addr, AddressFamily::Ipv4),
-            Self::Dual(transport) => transport.dial_family(addr, AddressFamily::Ipv4),
-        }
-    }
-
-    /// Dials `addr` with the IPv6 socket.
-    pub fn dial_ip6(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        match self {
-            Self::Single(transport) => single_dial_family(transport, addr, AddressFamily::Ipv6),
-            Self::Dual(transport) => transport.dial_family(addr, AddressFamily::Ipv6),
-        }
-    }
-
-    /// Sends a raw UDP packet to `target`, bypassing QUIC.
-    pub fn send_raw_udp(&self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
-        match self {
-            Self::Single(transport) => transport.send_raw_udp(target, payload),
-            Self::Dual(transport) => transport.send_raw_udp(target, payload),
-        }
-    }
-
-    /// A live connection's diagnostic counters (`diagnostics` feature).
-    #[cfg(feature = "diagnostics")]
-    pub fn connection_diagnostics(&self, id: ConnectionId) -> Option<ConnectionDiagnostics> {
-        match self {
-            Self::Single(transport) => transport.connection_diagnostics(id),
-            Self::Dual(transport) => transport.connection_diagnostics(id),
-        }
-    }
-
-    /// Returns a cloneable handle that can interrupt this endpoint's current
-    /// readiness wait from another thread.
-    pub fn wait_handle(&self) -> WaitHandle {
-        BlockingTransport::wait_handle(self)
-    }
-
-    /// The [`ConnectionNamespace`]s this endpoint allocates connection ids in.
-    ///
-    /// One socket mints ids in the namespace of the family it is bound to; a
-    /// dual-stack pair mints in both and keeps the split to itself. A host
-    /// routing several transports needs this to say which ids are QUIC's --
-    /// see `minip2p_transport::TransportSet`.
-    pub fn namespaces(&self) -> Vec<ConnectionNamespace> {
-        match self {
-            Self::Single(transport) => vec![transport.namespace()],
-            Self::Dual(_) => vec![
-                ConnectionNamespace::QUIC_IPV4,
-                ConnectionNamespace::QUIC_IPV6,
-            ],
-        }
-    }
-}
-
-fn single_dial_family(
-    transport: &mut QuicTransport,
-    addr: &PeerAddr,
-    family: AddressFamily,
-) -> Result<ConnectionId, TransportError> {
-    let local_family = family_for_socket_addr(transport.local_addr());
-    if local_family != family {
-        return Err(TransportError::InvalidAddress {
-            context: "dial target",
-            reason: format!(
-                "endpoint is bound to {}, cannot dial {} target",
-                local_family.name(),
-                family.name()
-            ),
-        });
-    }
-
-    let addr = peer_addr_for_family(addr, family)?;
-    transport.dial(&addr)
-}
-
-impl DualQuicTransport {
-    /// Binds IPv4 and IPv6 wildcard UDP sockets.
-    pub fn new(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
-        Self::bind(node_config, DEFAULT_IPV4_BIND, DEFAULT_IPV6_BIND)
-    }
-
-    /// Binds exact IPv4 and IPv6 socket addresses as one dual transport.
-    pub fn bind(
-        node_config: QuicNodeConfig,
-        ipv4_bind: &str,
-        ipv6_bind: &str,
-    ) -> Result<Self, TransportError> {
-        let ipv4 = QuicTransport::from_socket(node_config.clone(), bind_udp(ipv4_bind)?)?;
-        let ipv6 = QuicTransport::from_socket(node_config, bind_ipv6_only_udp(ipv6_bind)?)?;
-        if ipv4.namespace() != ConnectionNamespace::QUIC_IPV4
-            || ipv6.namespace() != ConnectionNamespace::QUIC_IPV6
-        {
-            return Err(TransportError::InvalidConfig {
-                reason: "dual-stack QUIC requires IPv4 then IPv6 bind addresses".into(),
-            });
-        }
-        let readiness =
-            ReadinessWait::new(&[&ipv4.socket.udp, &ipv6.socket.udp]).map_err(readiness_error)?;
-        Ok(Self {
-            ipv4,
-            ipv6,
-            readiness,
-        })
-    }
-
-    /// Sends a raw UDP packet to `target`, bypassing QUIC.
-    pub fn send_raw_udp(&self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
-        let family = family_for_socket_addr(dial_socket_addr(target, "raw udp target")?);
-        self.transport(family).send_raw_udp(target, payload)
-    }
-
-    /// A live connection's diagnostic counters (`diagnostics` feature).
-    #[cfg(feature = "diagnostics")]
-    pub fn connection_diagnostics(&self, id: ConnectionId) -> Option<ConnectionDiagnostics> {
-        self.transport(Self::family_for_id(id).ok()?)
-            .connection_diagnostics(id)
-    }
-
-    fn transport(&self, family: AddressFamily) -> &QuicTransport {
-        match family {
-            AddressFamily::Ipv4 => &self.ipv4,
-            AddressFamily::Ipv6 => &self.ipv6,
-        }
-    }
-
-    fn transport_mut(&mut self, family: AddressFamily) -> &mut QuicTransport {
-        match family {
-            AddressFamily::Ipv4 => &mut self.ipv4,
-            AddressFamily::Ipv6 => &mut self.ipv6,
-        }
-    }
-
-    fn dial_family(
-        &mut self,
-        addr: &PeerAddr,
-        family: AddressFamily,
-    ) -> Result<ConnectionId, TransportError> {
-        let addr = peer_addr_for_family(addr, family)?;
-        self.transport_mut(family).dial(&addr)
-    }
-
-    fn family_for_addr(addr: &Multiaddr) -> AddressFamily {
-        match addr.protocols().first() {
-            Some(Protocol::Ip6(_) | Protocol::Dns6(_)) => AddressFamily::Ipv6,
-            _ => AddressFamily::Ipv4,
-        }
-    }
-
-    /// Routes an id back to the socket that minted it.
-    ///
-    /// Each half allocates in its own [`ConnectionNamespace`], so the id needs
-    /// no rewriting on the way in or out.
-    fn family_for_id(id: ConnectionId) -> Result<AddressFamily, TransportError> {
-        let namespace = id.namespace();
-        if namespace == ConnectionNamespace::QUIC_IPV4 {
-            Ok(AddressFamily::Ipv4)
-        } else if namespace == ConnectionNamespace::QUIC_IPV6 {
-            Ok(AddressFamily::Ipv6)
-        } else {
-            Err(TransportError::ConnectionNotFound { id })
-        }
-    }
-}
-
-/// Binds a UDP socket to `bind_addr`.
-fn bind_udp(bind_addr: &str) -> Result<UdpSocket, TransportError> {
-    UdpSocket::bind(bind_addr).map_err(|e| TransportError::ListenFailed {
-        reason: format!("failed to bind udp socket: {e}"),
+/// Binds an IPv4 UDP socket to `addr`.
+fn bind_ipv4_udp(addr: SocketAddr) -> Result<UdpSocket, TransportError> {
+    UdpSocket::bind(addr).map_err(|e| TransportError::ListenFailed {
+        reason: format!("failed to bind udp socket {addr}: {e}"),
     })
 }
 
 /// Binds an IPv6-only UDP socket, so an IPv4 wildcard can share its port.
-fn bind_ipv6_only_udp(bind_addr: &str) -> Result<UdpSocket, TransportError> {
-    let bind_addr =
-        bind_addr
-            .parse::<SocketAddr>()
-            .map_err(|e| TransportError::InvalidAddress {
-                context: "ipv6 bind address",
-                reason: e.to_string(),
-            })?;
-    if !bind_addr.is_ipv6() {
-        return Err(TransportError::InvalidAddress {
-            context: "ipv6 bind address",
-            reason: "expected an IPv6 socket address".into(),
-        });
-    }
+fn bind_ipv6_only_udp(addr: SocketAddr) -> Result<UdpSocket, TransportError> {
     RawSocket::new(Domain::IPV6, Type::DGRAM, Some(SocketProtocol::UDP))
         .and_then(|socket| {
             socket.set_only_v6(true)?;
-            socket.bind(&bind_addr.into())?;
+            socket.bind(&addr.into())?;
             Ok(socket.into())
         })
         .map_err(|e| TransportError::ListenFailed {
-            reason: format!("failed to bind ipv6-only udp socket: {e}"),
+            reason: format!("failed to bind ipv6-only udp socket {addr}: {e}"),
         })
 }
 
+/// The address error for a target whose family has no bound socket.
+fn missing_family(context: &'static str, addr: SocketAddr) -> TransportError {
+    TransportError::InvalidAddress {
+        context,
+        reason: format!(
+            "{addr} is an {} address, but no {} socket is bound",
+            family_for_socket_addr(addr).name(),
+            family_for_socket_addr(addr).name()
+        ),
+    }
+}
+
 impl QuicTransport {
-    /// Creates a new QUIC transport bound to the given address.
-    pub fn new(node_config: QuicNodeConfig, bind_addr: &str) -> Result<Self, TransportError> {
-        let mut transport = Self::from_socket(node_config, bind_udp(bind_addr)?)?;
-        transport.readiness =
-            Some(ReadinessWait::new(&[&transport.socket.udp]).map_err(readiness_error)?);
-        Ok(transport)
+    /// Binds one UDP socket per address: one `/ip4/<ip>/udp/<port>/quic-v1`,
+    /// one `/ip6/...`, or one of each. Hosts must be numeric; port 0 picks an
+    /// ephemeral port. An IPv6 socket is IPv6-only.
+    pub fn bind(node_config: QuicNodeConfig, addrs: &[Multiaddr]) -> Result<Self, TransportError> {
+        let mut binds = addrs
+            .iter()
+            .map(|addr| extract_listen_socket_addr(addr, "bind address"))
+            .collect::<Result<Vec<_>, _>>()?;
+        binds.sort_by_key(|addr| addr.is_ipv6());
+        match binds.as_slice() {
+            [_] => {}
+            [first, second] if first.is_ipv6() != second.is_ipv6() => {}
+            _ => {
+                return Err(TransportError::InvalidConfig {
+                    reason: format!(
+                        "QUIC binds one /ip4 address, one /ip6 address, or one of each; got {} \
+                         address(es)",
+                        addrs.len()
+                    ),
+                });
+            }
+        }
+        // Checked before any socket is bound.
+        let transport_config = transport_config(node_config.limits())?;
+        let sockets = binds
+            .into_iter()
+            .map(|addr| {
+                if addr.is_ipv6() {
+                    bind_ipv6_only_udp(addr)
+                } else {
+                    bind_ipv4_udp(addr)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::from_sockets(node_config, transport_config, sockets)
     }
 
-    /// A transport over `socket` with no readiness wait of its own: a
-    /// standalone one gets it from [`new`](Self::new), a dual-stack half from
-    /// its pair.
-    fn from_socket(node_config: QuicNodeConfig, socket: UdpSocket) -> Result<Self, TransportError> {
-        let transport_config = Arc::new(transport_config(node_config.limits())?);
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| TransportError::ListenFailed {
-                reason: format!("failed to set nonblocking: {e}"),
-            })?;
+    /// Binds an IPv4 and an IPv6 wildcard socket, each on its own ephemeral
+    /// port.
+    pub fn dual_stack(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
+        let wildcards = [
+            socket_addr_to_multiaddr(SocketAddr::from(([0, 0, 0, 0], 0))),
+            socket_addr_to_multiaddr(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))),
+        ];
+        Self::bind(node_config, &wildcards)
+    }
 
-        // The bound family fixes this socket's id namespace, so the two halves
-        // of a dual-stack pair mint disjoint ids without any remapping.
-        let local_addr = socket
-            .local_addr()
-            .map_err(|e| TransportError::ListenFailed {
-                reason: format!("failed to get local addr: {e}"),
-            })?;
-        let namespace = match family_for_socket_addr(local_addr) {
-            AddressFamily::Ipv4 => ConnectionNamespace::QUIC_IPV4,
-            AddressFamily::Ipv6 => ConnectionNamespace::QUIC_IPV6,
-        };
+    fn from_sockets(
+        node_config: QuicNodeConfig,
+        transport_config: TransportConfig,
+        udps: Vec<UdpSocket>,
+    ) -> Result<Self, TransportError> {
+        let transport_config = Arc::new(transport_config);
+        let tally = DatagramTally::register(&node_config.peer_id());
+        let max_pending_datagrams = node_config.limits().max_pending_datagrams;
+        let sockets = udps
+            .into_iter()
+            .map(|udp| {
+                udp.set_nonblocking(true)
+                    .map_err(|e| TransportError::ListenFailed {
+                        reason: format!("failed to set nonblocking: {e}"),
+                    })?;
+                let local_addr = udp.local_addr().map_err(|e| TransportError::ListenFailed {
+                    reason: format!("failed to get local addr: {e}"),
+                })?;
+                Socket::new(udp, local_addr, max_pending_datagrams, tally.clone()).map_err(|e| {
+                    TransportError::ListenFailed {
+                        reason: format!("failed to configure udp socket: {e}"),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let readiness = ReadinessWait::new(&sockets.iter().map(|s| &s.udp).collect::<Vec<_>>())
+            .map_err(readiness_error)?;
 
         let host_time = Arc::new(HostTime::default());
         let tls = TlsIdentity::new(node_config.keypair(), Arc::clone(&host_time))
@@ -797,28 +598,20 @@ impl QuicTransport {
             .retry_token_lifetime(RETRY_TOKEN_LIFETIME)
             .validation_token_config(validation_tokens);
 
-        let tally = DatagramTally::register(&node_config.peer_id());
-        let max_pending_datagrams = node_config.limits().max_pending_datagrams;
-        let socket =
-            Socket::new(socket, local_addr, max_pending_datagrams, tally).map_err(|e| {
-                TransportError::ListenFailed {
-                    reason: format!("failed to configure udp socket: {e}"),
-                }
-            })?;
         let endpoint_config = EndpointConfig::default();
-        let recv_buf = vec![
-            0;
-            socket.recv_buffer_len(
-                usize::try_from(endpoint_config.get_max_udp_payload_size())
-                    .unwrap_or(RECV_BUFFER_SIZE)
-            )
-        ];
+        let max_payload =
+            usize::try_from(endpoint_config.get_max_udp_payload_size()).unwrap_or(RECV_BUFFER_SIZE);
+        let recv_buf_len = sockets
+            .iter()
+            .map(|socket| socket.recv_buffer_len(max_payload))
+            .max()
+            .unwrap_or(RECV_BUFFER_SIZE);
         // Path MTU discovery needs datagrams the network drops rather than
         // fragments when they are too large.
-        let allow_mtu_discovery = !socket.may_fragment();
+        let allow_mtu_discovery = sockets.iter().all(|socket| !socket.may_fragment());
         Ok(Self {
-            socket,
-            readiness: None,
+            sockets: Sockets::new(sockets),
+            readiness,
             // No server config until `listen`: the endpoint accepts nothing.
             endpoint: quinn_proto::Endpoint::new(
                 Arc::new(endpoint_config),
@@ -832,53 +625,31 @@ impl QuicTransport {
             host_time,
             connections: HashMap::new(),
             handles: HashMap::new(),
-            peer_connections: HashMap::new(),
             pending_events: Vec::new(),
-            recv_buf,
+            recv_buf: vec![0; recv_buf_len],
             send_buf: Vec::new(),
             sweep_ids: Vec::new(),
-            listening: false,
-            recv_saturated: false,
-            connection_ids: ConnectionIdAllocator::new(namespace),
             node_config,
             clock: None,
         })
     }
 
-    /// Returns the local socket address this transport is bound to.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.socket.local_addr
+    /// The bound socket addresses, IPv4 first.
+    pub fn local_socket_addrs(&self) -> Vec<SocketAddr> {
+        self.sockets
+            .iter()
+            .map(|socket| socket.local_addr)
+            .collect()
     }
 
-    /// Sends a raw UDP packet to the given multiaddr, bypassing QUIC.
-    ///
-    /// This is intended for NAT hole-punch signaling (e.g. DCUtR), where a
-    /// peer needs to send stray UDP bytes to open a NAT binding for inbound
-    /// QUIC packets from a remote peer.
-    ///
-    /// The multiaddr must be of the form `/ip4|ip6/<addr>/udp/<port>/quic-v1`;
-    /// `/dns*` hosts are rejected, so resolve names before calling this.
-    pub fn send_raw_udp(&self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
-        let addr = dial_socket_addr(target, "raw udp target")?;
-        self.socket
-            .udp
-            .send_to(payload, addr)
-            .map_err(|e| TransportError::PollError {
-                reason: format!("raw udp send to {addr} failed: {e}"),
-            })?;
-        self.socket.tally.sent(1, payload.len());
-        Ok(())
-    }
-
-    /// The namespace this socket's connection ids carry, fixed by the family
-    /// it is bound to.
-    pub fn namespace(&self) -> ConnectionNamespace {
-        self.connection_ids.namespace()
-    }
-
-    /// Exposes the bound local socket address as a multiaddr for external use.
-    pub fn local_multiaddr(&self) -> Multiaddr {
-        socket_addr_to_multiaddr(self.local_addr())
+    /// The [`ConnectionNamespace`]s this transport allocates connection ids
+    /// in: one per bound family. A host routing several transports needs this
+    /// to say which ids are QUIC's -- see `minip2p_transport::TransportSet`.
+    pub fn namespaces(&self) -> Vec<ConnectionNamespace> {
+        self.sockets
+            .iter()
+            .map(|socket| socket.ids.namespace())
+            .collect()
     }
 
     /// Returns this node's `PeerId`, derived from the configured keypair.
@@ -892,67 +663,47 @@ impl QuicTransport {
         self.connections.get(&id).map(QuicConnection::diagnostics)
     }
 
-    /// Returns a `PeerAddr` that other nodes can use to dial this transport.
-    ///
-    /// Combines the bound socket address with this node's `PeerId`.
-    pub fn local_peer_addr(&self) -> Result<PeerAddr, TransportError> {
-        let addr = self.local_addr();
+    /// A `PeerAddr` other nodes can dial for each bound socket.
+    pub fn local_peer_addrs(&self) -> Result<Vec<PeerAddr>, TransportError> {
         let peer_id = self.local_peer_id();
-        let multiaddr = socket_addr_to_multiaddr(addr);
-        PeerAddr::new(multiaddr, peer_id).map_err(|e| TransportError::InvalidConfig {
-            reason: format!("failed to build local PeerAddr: {e}"),
-        })
+        self.sockets
+            .iter()
+            .map(|socket| {
+                PeerAddr::new(socket_addr_to_multiaddr(socket.local_addr), peer_id.clone()).map_err(
+                    |e| TransportError::InvalidConfig {
+                        reason: format!("failed to build local PeerAddr: {e}"),
+                    },
+                )
+            })
+            .collect()
     }
 
-    /// Starts listening on the already-bound socket address.
+    /// Listens on every bound socket's address; returns them.
     ///
-    /// Convenience wrapper around [`listen`](Transport::listen) that uses the
-    /// address the UDP socket is bound to, avoiding manual `Multiaddr`
-    /// construction.
-    pub fn listen_on_bound_addr(&mut self) -> Result<Multiaddr, TransportError> {
-        let addr = self.local_addr();
-        let multiaddr = socket_addr_to_multiaddr(addr);
-        self.listen(&multiaddr)
+    /// Convenience wrapper around [`listen`](Transport::listen), avoiding
+    /// manual `Multiaddr` construction.
+    pub fn listen_on_bound_addrs(&mut self) -> Result<Vec<Multiaddr>, TransportError> {
+        self.local_addresses()
+            .iter()
+            .map(|addr| self.listen(addr))
+            .collect()
     }
 
-    /// Returns all active connection ids for the given peer.
-    pub fn connection_ids_for_peer(&self, peer_id: &PeerId) -> Vec<ConnectionId> {
-        self.peer_connections
-            .get(peer_id)
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default()
+    /// The first bound socket's address, for tests on one socket.
+    #[cfg(test)]
+    pub(crate) fn local_addr(&self) -> SocketAddr {
+        self.local_socket_addrs()[0]
     }
 
-    /// Allocates the next connection id in this socket's namespace.
-    ///
-    /// Sequence numbers are never reused, so there is no need to check the
-    /// live connection table for a collision.
-    fn allocate_connection_id(&mut self) -> Result<ConnectionId, TransportError> {
-        let id = self.connection_ids.allocate()?;
-        debug_assert!(
-            !self.connections.contains_key(&id),
-            "allocator handed out a live connection id"
-        );
-        Ok(id)
+    /// The first bound socket, for tests on one socket.
+    #[cfg(test)]
+    pub(crate) fn socket(&mut self) -> &mut Socket {
+        self.sockets.get_mut(0).expect("a bound socket")
     }
 
-    /// Adds a connection to the peer-to-connections index.
-    fn index_peer_connection(&mut self, peer_id: PeerId, id: ConnectionId) {
-        self.peer_connections.entry(peer_id).or_default().insert(id);
-    }
-
-    /// Removes a connection from the peer-to-connections index, cleaning up empty entries.
-    fn remove_peer_connection(&mut self, peer_id: &PeerId, id: ConnectionId) {
-        let mut remove_entry = false;
-
-        if let Some(ids) = self.peer_connections.get_mut(peer_id) {
-            ids.remove(&id);
-            remove_entry = ids.is_empty();
-        }
-
-        if remove_entry {
-            self.peer_connections.remove(peer_id);
-        }
+    /// The socket that owns connection `id`.
+    fn socket_of(&mut self, id: ConnectionId) -> Option<&mut Socket> {
+        self.sockets.for_namespace(id.namespace())
     }
 
     /// A dial's engine config: this node's identity, and a verifier that
@@ -968,20 +719,27 @@ impl QuicTransport {
         Ok(config)
     }
 
-    /// Reads datagrams until [`MAX_DATAGRAMS_PER_POLL`] logical datagrams
-    /// have arrived, and hands each to the engine. Connections only queue
-    /// output here; the sweep sends it.
+    /// Reads from socket `index` until [`MAX_DATAGRAMS_PER_POLL`] logical
+    /// datagrams have arrived, and hands each to the engine. Connections only
+    /// queue output here; the sweep sends it.
     ///
     /// A GRO batch already read is always split to the end, so the bound can
     /// be overshot by less than one batch.
-    fn recv_batch(&mut self, now: Instant) -> Result<(), TransportError> {
-        self.recv_saturated = false;
+    fn recv_batch(&mut self, now: Instant, index: usize) -> Result<(), TransportError> {
         let mut datagrams = 0;
+        let mut saturated = true;
         while datagrams < MAX_DATAGRAMS_PER_POLL {
-            let received = match self.socket.recv(&mut self.recv_buf) {
+            let Some(socket) = self.sockets.get_mut(index) else {
+                return Ok(());
+            };
+            let received = match socket.recv(&mut self.recv_buf) {
                 Ok(Some(received)) => received,
-                Ok(None) => return Ok(()),
+                Ok(None) => {
+                    saturated = false;
+                    break;
+                }
                 Err(e) => {
+                    socket.saturated = false;
                     return Err(TransportError::PollError {
                         reason: format!("udp recv error: {e}"),
                     });
@@ -996,16 +754,25 @@ impl QuicTransport {
             );
             while !batch.is_empty() {
                 let datagram = batch.split_to(received.stride.min(batch.len()));
-                self.handle_datagram(now, &received, datagram);
+                self.handle_datagram(now, index, &received, datagram);
             }
         }
-        self.recv_saturated = true;
+        if let Some(socket) = self.sockets.get_mut(index) {
+            socket.saturated = saturated;
+        }
         Ok(())
     }
 
-    /// Routes one datagram. The endpoint routes by connection id, never by
-    /// source address, and drops what it cannot parse.
-    fn handle_datagram(&mut self, now: Instant, received: &Received, datagram: BytesMut) {
+    /// Routes one datagram that arrived on socket `index`. The endpoint
+    /// routes by connection id, never by source address, and drops what it
+    /// cannot parse.
+    fn handle_datagram(
+        &mut self,
+        now: Instant,
+        index: usize,
+        received: &Received,
+        datagram: BytesMut,
+    ) {
         let mut buf = std::mem::take(&mut self.send_buf);
         buf.clear();
         match self.endpoint.handle(
@@ -1025,40 +792,50 @@ impl QuicTransport {
                     conn.handle_event(event);
                 }
             }
-            Some(DatagramEvent::NewConnection(incoming)) => self.admit(now, incoming, &mut buf),
-            // A reply to a datagram no connection owns. Before `listen` the
-            // endpoint still answers an unknown Initial with a stateless
-            // reset; a node that is not listening sends nothing at all.
-            Some(DatagramEvent::Response(transmit)) if self.listening => {
-                send_stateless(&mut self.socket, &buf, &transmit);
+            Some(DatagramEvent::NewConnection(incoming)) => {
+                self.admit(now, index, incoming, &mut buf);
             }
-            Some(DatagramEvent::Response(_)) | None => {}
+            // A reply to a datagram no connection owns. The endpoint answers
+            // an unknown Initial with a stateless reset even before `listen`;
+            // a socket that is not listening sends nothing at all.
+            Some(DatagramEvent::Response(transmit)) => {
+                if let Some(socket) = self.sockets.get_mut(index).filter(|s| s.listening) {
+                    send_stateless(socket, &buf, &transmit);
+                }
+            }
+            None => {}
         }
         self.send_buf = buf;
     }
 
-    /// Admits a new inbound connection: refused silently at the connection
-    /// limit (before any Retry), sent a Retry while its address is
-    /// unvalidated and validation is required, accepted otherwise.
-    fn admit(&mut self, now: Instant, incoming: Incoming, buf: &mut Vec<u8>) {
+    /// Admits a new inbound connection on socket `index`: ignored unless the
+    /// socket listens, refused silently at its connection limit (before any
+    /// Retry), sent a Retry while its address is unvalidated and validation
+    /// is required, accepted otherwise.
+    fn admit(&mut self, now: Instant, index: usize, incoming: Incoming, buf: &mut Vec<u8>) {
         let limits = self.node_config.limits().clone();
-        if !self.listening || self.connections.len() >= limits.max_connections {
+        let Some(socket) = self
+            .sockets
+            .get_mut(index)
+            .filter(|socket| socket.listening && socket.connections < limits.max_connections)
+        else {
             self.endpoint.ignore(incoming);
             return;
-        }
+        };
         if limits.require_address_validation && !incoming.remote_address_validated() {
             match self.endpoint.retry(incoming, buf) {
-                Ok(transmit) => send_stateless(&mut self.socket, buf, &transmit),
+                Ok(transmit) => send_stateless(socket, buf, &transmit),
                 Err(error) => self.endpoint.ignore(error.into_incoming()),
             }
             return;
         }
-        let Ok(id) = self.allocate_connection_id() else {
+        let Ok(id) = socket.ids.allocate() else {
             self.endpoint.ignore(incoming);
             return;
         };
         match self.endpoint.accept(incoming, now, buf, None) {
             Ok((handle, conn)) => {
+                socket.connections += 1;
                 let endpoint =
                     ConnectionEndpoint::new(socket_addr_to_multiaddr(conn.remote_address()));
                 let conn = QuicConnection::new(
@@ -1077,7 +854,7 @@ impl QuicTransport {
             }
             Err(error) => {
                 if let Some(transmit) = error.response {
-                    send_stateless(&mut self.socket, buf, &transmit);
+                    send_stateless(socket, buf, &transmit);
                 }
             }
         }
@@ -1094,33 +871,20 @@ impl QuicTransport {
         self.sweep_ids = ids;
     }
 
-    /// Runs one connection's engine and sends its output; then keeps the
-    /// peer index current and retires the connection once it drained.
-    /// Returns the first hard socket error its output hit.
+    /// Runs one connection's engine and sends its output, then retires the
+    /// connection once it drained. Returns the first hard socket error its
+    /// output hit.
     fn service(&mut self, id: ConnectionId, now: Instant) -> Option<std::io::Error> {
         let conn = self.connections.get_mut(&id)?;
         let mut cx = Cx {
             endpoint: &mut self.endpoint,
-            socket: &mut self.socket,
+            sockets: &mut self.sockets,
             send_buf: &mut self.send_buf,
             events: &mut self.pending_events,
             unix_now: self.host_time.now(),
         };
         let failure = conn.service(now, &mut cx);
-        if let Some(previous) = conn.take_identity_change() {
-            let current = conn.endpoint().peer_id().cloned();
-            if let Some(previous) = previous {
-                self.remove_peer_connection(&previous, id);
-            }
-            if let Some(current) = current {
-                self.index_peer_connection(current, id);
-            }
-        }
-        if self
-            .connections
-            .get(&id)
-            .is_some_and(QuicConnection::is_drained)
-        {
+        if conn.is_drained() {
             self.remove_connection(id);
         }
         failure
@@ -1130,7 +894,7 @@ impl QuicTransport {
     #[cfg(test)]
     fn update_server_config(&mut self, update: impl FnOnce(&mut ServerConfig)) {
         update(Arc::make_mut(&mut self.server_config));
-        if self.listening {
+        if self.sockets.iter().any(|socket| socket.listening) {
             self.endpoint
                 .set_server_config(Some(Arc::clone(&self.server_config)));
         }
@@ -1142,10 +906,26 @@ impl QuicTransport {
             return;
         };
         self.handles.remove(&conn.handle());
-        if let Some(peer_id) = conn.endpoint().peer_id() {
-            self.remove_peer_connection(peer_id, id);
+        if let Some(socket) = self.socket_of(id) {
+            socket.connections = socket.connections.saturating_sub(1);
         }
         self.pending_events.push(TransportEvent::Closed { id });
+    }
+
+    /// Discards a connection that never got going: closed, with its close
+    /// period run out at once, so the engine forgets it without a packet.
+    fn abandon(&mut self, id: ConnectionId, now: Instant) {
+        if let Some(conn) = self.connections.get_mut(&id) {
+            conn.close(now);
+            conn.expire();
+        }
+        self.service(id, now);
+        // Nothing was reported for it; the caller learns from the error.
+        self.pending_events.retain(|event| match event {
+            TransportEvent::Error { id: event_id, .. }
+            | TransportEvent::Closed { id: event_id } => *event_id != id,
+            _ => true,
+        });
     }
 }
 
@@ -1158,16 +938,20 @@ fn send_stateless(socket: &mut Socket, buf: &[u8], transmit: &quinn_proto::Trans
 
 impl Transport for QuicTransport {
     fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        // The connection limit counts inbound and outbound alike; admission
-        // enforces the same bound for incoming Initials.
-        if self.connections.len() >= self.node_config.limits().max_connections {
+        let peer_socket = dial_socket_addr(addr.transport(), "dial target")?;
+        let max_connections = self.node_config.limits().max_connections;
+        let socket = self
+            .sockets
+            .for_addr(peer_socket)
+            .ok_or_else(|| missing_family("dial target", peer_socket))?;
+        // The connection limit counts inbound and outbound alike, per socket;
+        // admission enforces the same bound for incoming Initials.
+        if socket.connections >= max_connections {
             return Err(TransportError::ResourceExhausted {
                 resource: "QUIC connections",
             });
         }
-
-        let id = self.allocate_connection_id()?;
-        let peer_socket = dial_socket_addr(addr.transport(), "dial target")?;
+        let id = socket.ids.allocate()?;
         let config = self.client_config(addr.peer_id())?;
         let now = Instant::now();
         let (handle, conn) = self
@@ -1177,6 +961,9 @@ impl Transport for QuicTransport {
                 id,
                 reason: format!("QUIC connect error: {e}"),
             })?;
+        if let Some(socket) = self.sockets.for_addr(peer_socket) {
+            socket.connections += 1;
+        }
         let limits = self.node_config.limits().clone();
         let conn = QuicConnection::new(
             id,
@@ -1189,10 +976,9 @@ impl Transport for QuicTransport {
         );
         self.connections.insert(id, conn);
         self.handles.insert(handle, id);
-        self.index_peer_connection(addr.peer_id().clone(), id);
 
-        // A first flight the socket refuses outright (no route, wrong family)
-        // fails the dial now rather than at the handshake timeout.
+        // A first flight the socket refuses outright (no route) fails the
+        // dial now rather than at the handshake timeout.
         if let Some(error) = self.service(id, now) {
             self.abandon(id, now);
             return Err(TransportError::DialFailed {
@@ -1204,19 +990,21 @@ impl Transport for QuicTransport {
     }
 
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
-        let socket_addr = extract_listen_socket_addr(addr, "listen address")?;
-
-        let local_addr = self.local_addr();
-        ensure_listen_matches_bound_socket(socket_addr, local_addr)?;
-
-        let listen_addr = socket_addr_to_multiaddr(local_addr);
+        let requested = extract_listen_socket_addr(addr, "listen address")?;
+        let socket = self
+            .sockets
+            .for_addr(requested)
+            .ok_or_else(|| missing_family("listen address", requested))?;
+        ensure_listen_matches_bound_socket(requested, socket.local_addr)?;
+        socket.listening = true;
+        let listen_addr = socket_addr_to_multiaddr(socket.local_addr);
+        // One endpoint serves both sockets; admission checks that the socket
+        // an Initial arrived on is listening.
         self.endpoint
             .set_server_config(Some(Arc::clone(&self.server_config)));
-        self.listening = true;
         self.pending_events.push(TransportEvent::Listening {
             addr: listen_addr.clone(),
         });
-
         Ok(listen_addr)
     }
 
@@ -1317,7 +1105,10 @@ impl Transport for QuicTransport {
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {
-        vec![self.local_multiaddr()]
+        self.sockets
+            .iter()
+            .map(|socket| socket_addr_to_multiaddr(socket.local_addr))
+            .collect()
     }
 
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
@@ -1328,10 +1119,24 @@ impl Transport for QuicTransport {
             .collect()
     }
 
+    /// Sends one raw UDP datagram to an `/ip4|ip6/<addr>/udp/<port>/quic-v1`
+    /// target, for NAT hole punching (e.g. DCUtR): it leaves from the socket
+    /// later QUIC packets will arrive on. `/dns*` hosts are rejected, so
+    /// resolve names first.
     fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
-        // The socket a hole punch has to leave from is this one: the binding it
-        // opens is only useful for QUIC packets arriving back on it.
-        self.send_raw_udp(target, payload)
+        let addr = dial_socket_addr(target, "raw udp target")?;
+        let socket = self
+            .sockets
+            .for_addr(addr)
+            .ok_or_else(|| missing_family("raw udp target", addr))?;
+        socket
+            .udp
+            .send_to(payload, addr)
+            .map_err(|e| TransportError::PollError {
+                reason: format!("raw udp send to {addr} failed: {e}"),
+            })?;
+        socket.tally.sent(1, payload.len());
+        Ok(())
     }
 
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
@@ -1344,11 +1149,19 @@ impl Transport for QuicTransport {
         // Events accumulate in `self.pending_events` for the whole poll and
         // are only taken at the very end, so an error path leaves the batch
         // queued for the next call instead of dropping it.
-        self.socket.flush();
-        // The sweep runs whatever ended the batch: connections defer their
-        // output to it, so a batch cut short by an error must not leave them
-        // unsent.
-        let received = self.recv_batch(instant);
+        for socket in self.sockets.iter_mut() {
+            socket.flush();
+        }
+        // Each socket gets its own receive bound, so one family's traffic
+        // cannot starve the other. The sweep runs whatever ended a batch:
+        // connections defer their output to it.
+        let mut received = Ok(());
+        for index in 0..self.sockets.len() {
+            let batch = self.recv_batch(instant, index);
+            if received.is_ok() {
+                received = batch;
+            }
+        }
         self.sweep(instant);
         received?;
         Ok(std::mem::take(&mut self.pending_events))
@@ -1361,7 +1174,7 @@ impl Transport for QuicTransport {
         // and nothing else would wake a host idling on `None`. A receive
         // batch cut off by its bound may have left input with no fresh
         // readiness edge to report it.
-        if !self.pending_events.is_empty() || self.recv_saturated {
+        if !self.pending_events.is_empty() || self.sockets.iter().any(|socket| socket.saturated) {
             return Some(Deadline::IMMEDIATE);
         }
 
@@ -1370,7 +1183,7 @@ impl Transport for QuicTransport {
         // Checked before the retained sample: `dial` queues datagrams before
         // the first `poll`, and a host that idled on `None` there would never
         // come back to flush them. `IMMEDIATE` is due on any timeline.
-        if self.socket.has_pending() {
+        if self.sockets.iter().any(Socket::has_pending) {
             return Some(
                 self.clock
                     .map_or(Deadline::IMMEDIATE, |(now, _)| now.deadline_after(1)),
@@ -1384,25 +1197,6 @@ impl Transport for QuicTransport {
             .filter_map(QuicConnection::timeout)
             .min()
             .map(|timeout| deadline_for_timeout(now, timeout.saturating_duration_since(instant)))
-    }
-}
-
-impl QuicTransport {
-    /// Discards a connection that never got going: closed, with its close
-    /// period run out at once, so the engine forgets it without a packet.
-    fn abandon(&mut self, id: ConnectionId, now: Instant) {
-        if let Some(conn) = self.connections.get_mut(&id) {
-            conn.close(now);
-            conn.expire();
-        }
-        self.service(id, now);
-        // Nothing was reported for it; the caller learns from the error.
-        self.pending_events.retain(|event| match event {
-            TransportEvent::StreamOpened { id: event_id, .. }
-            | TransportEvent::Error { id: event_id, .. }
-            | TransportEvent::Closed { id: event_id } => *event_id != id,
-            _ => true,
-        });
     }
 }
 
@@ -1437,300 +1231,43 @@ fn deadline_for_timeout(now: Now, timeout: Duration) -> Deadline {
 impl Drop for QuicTransport {
     fn drop(&mut self) {
         // Nothing polls after this, so every connection's CONNECTION_CLOSE
-        // leaves now. Drain the retry queue first so a full one has room to
+        // leaves now. Drain the retry queues first so a full one has room to
         // retain them; closing an already-closed connection is a no-op.
-        self.socket.flush();
+        for socket in self.sockets.iter_mut() {
+            socket.flush();
+        }
         let ids: Vec<ConnectionId> = self.connections.keys().copied().collect();
         for id in ids {
             match self.close(id) {
                 Ok(()) | Err(_) => {}
             }
         }
-        self.socket.flush();
-        self.socket.clear();
+        for socket in self.sockets.iter_mut() {
+            socket.flush();
+            socket.clear();
+        }
     }
 }
 
 impl BlockingTransport for QuicTransport {
     fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        let Some(readiness) = self.readiness.as_mut() else {
-            return WaitOutcome::Unsupported;
-        };
         // Buffered events are work the host has yet to see; parking on socket
         // readiness would sleep on them until an unrelated packet arrived.
-        let (events, socket) = (&self.pending_events, &self.socket.udp);
-        wait_for_sockets(
-            readiness,
-            || !events.is_empty() || socket::has_queued_input(socket),
-            timeout,
-        )
-    }
-
-    fn wait_handle(&self) -> WaitHandle {
-        self.readiness
-            .as_ref()
-            .map_or_else(WaitHandle::noop, ReadinessWait::wait_handle)
-    }
-
-    #[cfg(unix)]
-    fn readiness_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        self.readiness.as_ref().and_then(ReadinessWait::fd)
-    }
-}
-
-impl Transport for QuicEndpoint {
-    fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        match self {
-            Self::Single(transport) => transport.dial(addr),
-            Self::Dual(transport) => transport.dial(addr),
-        }
-    }
-
-    fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
-        match self {
-            Self::Single(transport) => transport.listen(addr),
-            Self::Dual(transport) => transport.listen(addr),
-        }
-    }
-
-    fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
-        match self {
-            Self::Single(transport) => transport.open_stream(id),
-            Self::Dual(transport) => transport.open_stream(id),
-        }
-    }
-
-    fn send_stream(
-        &mut self,
-        id: ConnectionId,
-        stream_id: StreamId,
-        data: Bytes,
-    ) -> Result<(), TransportError> {
-        match self {
-            Self::Single(transport) => transport.send_stream(id, stream_id, data),
-            Self::Dual(transport) => transport.send_stream(id, stream_id, data),
-        }
-    }
-
-    fn close_stream_write(
-        &mut self,
-        id: ConnectionId,
-        stream_id: StreamId,
-    ) -> Result<(), TransportError> {
-        match self {
-            Self::Single(transport) => transport.close_stream_write(id, stream_id),
-            Self::Dual(transport) => transport.close_stream_write(id, stream_id),
-        }
-    }
-
-    fn reset_stream(
-        &mut self,
-        id: ConnectionId,
-        stream_id: StreamId,
-    ) -> Result<(), TransportError> {
-        match self {
-            Self::Single(transport) => transport.reset_stream(id, stream_id),
-            Self::Dual(transport) => transport.reset_stream(id, stream_id),
-        }
-    }
-
-    fn ack_stream(
-        &mut self,
-        id: ConnectionId,
-        stream_id: StreamId,
-        bytes: usize,
-    ) -> Result<(), TransportError> {
-        match self {
-            Self::Single(transport) => transport.ack_stream(id, stream_id, bytes),
-            Self::Dual(transport) => transport.ack_stream(id, stream_id, bytes),
-        }
-    }
-
-    fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
-        match self {
-            Self::Single(transport) => transport.close(id),
-            Self::Dual(transport) => transport.close(id),
-        }
-    }
-
-    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
-        match self {
-            Self::Single(transport) => transport.poll(now),
-            Self::Dual(transport) => transport.poll(now),
-        }
-    }
-
-    fn next_deadline(&self) -> Option<Deadline> {
-        match self {
-            Self::Single(transport) => transport.next_deadline(),
-            Self::Dual(transport) => transport.next_deadline(),
-        }
-    }
-
-    fn local_addresses(&self) -> Vec<Multiaddr> {
-        match self {
-            Self::Single(transport) => transport.local_addresses(),
-            Self::Dual(transport) => transport.local_addresses(),
-        }
-    }
-
-    fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
-        match self {
-            Self::Single(transport) => transport.active_inbound_connection_sources(),
-            Self::Dual(transport) => transport.active_inbound_connection_sources(),
-        }
-    }
-
-    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
-        self.send_raw_udp(target, payload)
-    }
-}
-
-impl BlockingTransport for QuicEndpoint {
-    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        match self {
-            Self::Single(transport) => transport.wait_for_input(timeout),
-            Self::Dual(transport) => transport.wait_for_input(timeout),
-        }
-    }
-
-    fn wait_handle(&self) -> WaitHandle {
-        match self {
-            Self::Single(transport) => BlockingTransport::wait_handle(&**transport),
-            Self::Dual(transport) => BlockingTransport::wait_handle(&**transport),
-        }
-    }
-
-    #[cfg(unix)]
-    fn readiness_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        match self {
-            Self::Single(transport) => transport.readiness_fd(),
-            Self::Dual(transport) => transport.readiness_fd(),
-        }
-    }
-}
-
-impl Transport for DualQuicTransport {
-    fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        let family = family_for_socket_addr(dial_socket_addr(addr.transport(), "dial target")?);
-        self.transport_mut(family).dial(addr)
-    }
-
-    fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
-        let family = Self::family_for_addr(addr);
-        self.transport_mut(family).listen(addr)
-    }
-
-    fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
-        let family = Self::family_for_id(id)?;
-        self.transport_mut(family).open_stream(id)
-    }
-
-    fn send_stream(
-        &mut self,
-        id: ConnectionId,
-        stream_id: StreamId,
-        data: Bytes,
-    ) -> Result<(), TransportError> {
-        let family = Self::family_for_id(id)?;
-        self.transport_mut(family).send_stream(id, stream_id, data)
-    }
-
-    fn close_stream_write(
-        &mut self,
-        id: ConnectionId,
-        stream_id: StreamId,
-    ) -> Result<(), TransportError> {
-        let family = Self::family_for_id(id)?;
-        self.transport_mut(family).close_stream_write(id, stream_id)
-    }
-
-    fn reset_stream(
-        &mut self,
-        id: ConnectionId,
-        stream_id: StreamId,
-    ) -> Result<(), TransportError> {
-        let family = Self::family_for_id(id)?;
-        self.transport_mut(family).reset_stream(id, stream_id)
-    }
-
-    fn ack_stream(
-        &mut self,
-        id: ConnectionId,
-        stream_id: StreamId,
-        bytes: usize,
-    ) -> Result<(), TransportError> {
-        // An id neither family owns is an unknown connection: a no-op.
-        match Self::family_for_id(id) {
-            Ok(family) => self.transport_mut(family).ack_stream(id, stream_id, bytes),
-            Err(_) => Ok(()),
-        }
-    }
-
-    fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
-        let family = Self::family_for_id(id)?;
-        self.transport_mut(family).close(id)
-    }
-
-    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
-        let ipv4_events = self.ipv4.poll(now)?;
-        let ipv6_events = match self.ipv6.poll(now) {
-            Ok(events) => events,
-            Err(e) => {
-                // Requeue the already-taken IPv4 batch (ahead of anything
-                // newer) so the IPv6 error doesn't drop it.
-                let mut requeued = ipv4_events;
-                requeued.append(&mut self.ipv4.pending_events);
-                self.ipv4.pending_events = requeued;
-                return Err(e);
-            }
-        };
-
-        let mut events = ipv4_events;
-        events.extend(ipv6_events);
-        Ok(events)
-    }
-
-    fn next_deadline(&self) -> Option<Deadline> {
-        Deadline::earliest_opt(self.ipv4.next_deadline(), self.ipv6.next_deadline())
-    }
-
-    fn local_addresses(&self) -> Vec<Multiaddr> {
-        let mut addrs = self.ipv4.local_addresses();
-        addrs.extend(self.ipv6.local_addresses());
-        addrs
-    }
-
-    fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
-        let mut addrs = self.ipv4.active_inbound_connection_sources();
-        addrs.extend(self.ipv6.active_inbound_connection_sources());
-        addrs
-    }
-
-    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
-        self.send_raw_udp(target, payload)
-    }
-}
-
-impl BlockingTransport for DualQuicTransport {
-    fn wait_handle(&self) -> WaitHandle {
-        self.readiness.wait_handle()
-    }
-
-    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        // One poll watches both sockets, so the wait blocks on either family
-        // at once. Events either half buffered outside a poll count as input
-        // too: this does not go through the halves' own waits.
-        let (ipv4, ipv6) = (&self.ipv4, &self.ipv6);
+        let (events, sockets) = (&self.pending_events, &self.sockets);
         wait_for_sockets(
             &mut self.readiness,
             || {
-                [ipv4, ipv6].into_iter().any(|half| {
-                    !half.pending_events.is_empty() || socket::has_queued_input(&half.socket.udp)
-                })
+                !events.is_empty()
+                    || sockets
+                        .iter()
+                        .any(|socket| socket::has_queued_input(&socket.udp))
             },
             timeout,
         )
+    }
+
+    fn wait_handle(&self) -> WaitHandle {
+        self.readiness.wait_handle()
     }
 
     #[cfg(unix)]
@@ -1742,29 +1279,77 @@ impl BlockingTransport for DualQuicTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_peer::loopback;
     use minip2p_identity::Ed25519Keypair;
 
-    #[test]
-    fn bound_socket_address_is_exposed_as_transport_multiaddr() {
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind socket");
-        let bound = socket.local_addr().expect("bound address");
-        let transport = QuicTransport::from_socket(QuicNodeConfig::generate(), socket)
-            .expect("construct transport");
-        let expected = Multiaddr::from_protocols(vec![
-            Protocol::Ip4([127, 0, 0, 1]),
-            Protocol::Udp(bound.port()),
-            Protocol::QuicV1,
-        ]);
-
-        assert_ne!(bound.port(), 0, "the OS must resolve the ephemeral port");
-        assert_eq!(transport.local_multiaddr(), expected);
-        assert_eq!(Transport::local_addresses(&transport), vec![expected]);
+    fn quic_addr(addr: &str) -> Multiaddr {
+        socket_addr_to_multiaddr(addr.parse().expect("socket addr"))
     }
 
-    fn loopback_peer_addr(host: Protocol) -> PeerAddr {
-        let keypair = Ed25519Keypair::generate();
-        let transport = Multiaddr::from_protocols(vec![host, Protocol::Udp(9), Protocol::QuicV1]);
-        PeerAddr::new(transport, keypair.peer_id()).expect("peer addr")
+    fn target(addr: &str) -> PeerAddr {
+        PeerAddr::new(quic_addr(addr), Ed25519Keypair::generate().peer_id()).expect("peer addr")
+    }
+
+    fn socket(transport: &mut QuicTransport, ipv6: bool) -> &mut Socket {
+        let addr = if ipv6 { "[::1]:1" } else { "127.0.0.1:1" };
+        transport
+            .sockets
+            .for_addr(addr.parse().expect("addr"))
+            .expect("a socket of that family")
+    }
+
+    #[test]
+    fn the_bound_address_is_exposed_as_a_transport_multiaddr() {
+        let transport = loopback(QuicNodeConfig::generate());
+        let bound = transport.local_addr();
+        assert_ne!(bound.port(), 0, "the OS must resolve the ephemeral port");
+        assert_eq!(
+            Transport::local_addresses(&transport),
+            vec![Multiaddr::from_protocols(vec![
+                Protocol::Ip4([127, 0, 0, 1]),
+                Protocol::Udp(bound.port()),
+                Protocol::QuicV1,
+            ])]
+        );
+    }
+
+    #[test]
+    fn one_socket_per_family_binds_and_anything_else_is_refused() {
+        let ipv4 = quic_addr("127.0.0.1:0");
+        let ipv6 = quic_addr("[::1]:0");
+        for (addrs, namespaces) in [
+            (vec![ipv4.clone()], vec![ConnectionNamespace::QUIC_IPV4]),
+            (vec![ipv6.clone()], vec![ConnectionNamespace::QUIC_IPV6]),
+            (
+                vec![ipv6.clone(), ipv4.clone()],
+                vec![
+                    ConnectionNamespace::QUIC_IPV4,
+                    ConnectionNamespace::QUIC_IPV6,
+                ],
+            ),
+        ] {
+            let transport = QuicTransport::bind(QuicNodeConfig::generate(), &addrs)
+                .unwrap_or_else(|e| panic!("{addrs:?}: {e}"));
+            assert_eq!(transport.namespaces(), namespaces, "{addrs:?}");
+            assert_eq!(transport.local_addresses().len(), addrs.len());
+        }
+
+        let named: Multiaddr = "/dns4/localhost/udp/0/quic-v1".parse().expect("dns addr");
+        for addrs in [
+            vec![],
+            vec![ipv4.clone(), quic_addr("127.0.0.2:0")],
+            vec![ipv4.clone(), ipv6.clone(), quic_addr("127.0.0.2:0")],
+            vec![named],
+        ] {
+            assert!(
+                matches!(
+                    QuicTransport::bind(QuicNodeConfig::generate(), &addrs),
+                    Err(TransportError::InvalidConfig { .. }
+                        | TransportError::InvalidAddress { .. })
+                ),
+                "{addrs:?} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -1773,19 +1358,14 @@ mod tests {
             max_pending_datagrams: 2,
             ..QuicLimits::default()
         };
-        let mut transport = QuicTransport::new(
-            QuicNodeConfig::generate().with_limits(limits),
-            "127.0.0.1:0",
-        )
-        .expect("bind");
+        let mut transport = loopback(QuicNodeConfig::generate().with_limits(limits));
         let destination = transport.local_addr();
-
+        let socket = socket(&mut transport, false);
         for payload in [&[1u8][..], &[2u8][..], &[3u8][..]] {
-            transport.socket.retain_datagram(payload, destination);
+            socket.retain_datagram(payload, destination);
         }
-
         assert_eq!(
-            transport.socket.retained(),
+            socket.retained(),
             2,
             "queue must cap at the limit and silently drop the overflow"
         );
@@ -1806,20 +1386,17 @@ mod tests {
                 ..QuicLimits::default()
             },
         ] {
-            let Err(error) = QuicTransport::new(
+            let result = QuicTransport::bind(
                 QuicNodeConfig::generate().with_limits(limits),
-                "127.0.0.1:0",
-            ) else {
-                panic!("zero limit must be rejected");
-            };
-            assert!(matches!(error, TransportError::InvalidConfig { .. }));
+                &[quic_addr("127.0.0.1:0")],
+            );
+            assert!(matches!(result, Err(TransportError::InvalidConfig { .. })));
         }
     }
 
     #[test]
     fn poll_drains_a_bounded_number_of_datagrams_per_call() {
-        let mut transport =
-            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+        let mut transport = loopback(QuicNodeConfig::generate());
         let destination = transport.local_addr();
 
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
@@ -1829,8 +1406,12 @@ mod tests {
 
         // Wait for the kernel to queue the first datagram, then give the
         // rest a moment to land before polling.
+        let udp = socket(&mut transport, false)
+            .udp
+            .try_clone()
+            .expect("clone");
         let start = std::time::Instant::now();
-        while !socket::has_queued_input(&transport.socket.udp) {
+        while !socket::has_queued_input(&udp) {
             assert!(
                 start.elapsed() < Duration::from_secs(1),
                 "datagrams never arrived"
@@ -1841,7 +1422,7 @@ mod tests {
 
         transport.poll(Now::from_millis(0)).expect("poll");
         assert!(
-            socket::has_queued_input(&transport.socket.udp),
+            socket::has_queued_input(&udp),
             "one poll must leave datagrams beyond the per-poll bound in the kernel buffer"
         );
         assert_eq!(
@@ -1852,7 +1433,7 @@ mod tests {
 
         // Follow-up polls drain the remainder.
         let start = std::time::Instant::now();
-        while socket::has_queued_input(&transport.socket.udp) {
+        while socket::has_queued_input(&udp) {
             assert!(
                 start.elapsed() < Duration::from_secs(1),
                 "overflow never drained"
@@ -1863,9 +1444,8 @@ mod tests {
 
     #[test]
     fn poisoned_queued_datagram_is_dropped_without_failing_the_poll() {
-        let mut transport =
-            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
-        let addr = transport.local_multiaddr();
+        let mut transport = loopback(QuicNodeConfig::generate());
+        let addr = transport.local_addresses().remove(0);
         transport
             .pending_events
             .push(TransportEvent::Listening { addr: addr.clone() });
@@ -1874,12 +1454,10 @@ mod tests {
         // with a hard error. A dead route affects only that packet's
         // destination, so the poll must drop it and carry on rather than
         // abort the whole endpoint.
-        let bad_destination: SocketAddr = "[::1]:9".parse().expect("socket addr");
-        transport.socket.retain_datagram(&[0u8; 4], bad_destination);
         let good_destination = transport.local_addr();
-        transport
-            .socket
-            .retain_datagram(&[0u8; 4], good_destination);
+        let socket = socket(&mut transport, false);
+        socket.retain_datagram(&[0u8; 4], "[::1]:9".parse().expect("socket addr"));
+        socket.retain_datagram(&[0u8; 4], good_destination);
 
         let events = transport.poll(Now::from_millis(0)).expect("poll");
         assert!(
@@ -1889,7 +1467,7 @@ mod tests {
             "events queued before the poisoned datagram must still be delivered"
         );
         assert!(
-            !transport.socket.has_pending(),
+            !transport.sockets.iter().any(Socket::has_pending),
             "the poisoned datagram must be dropped and the one behind it sent"
         );
     }
@@ -1936,14 +1514,13 @@ mod tests {
 
     #[test]
     fn queued_datagrams_are_reported_before_the_first_poll() {
-        let mut transport =
-            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+        let mut transport = loopback(QuicNodeConfig::generate());
         assert_eq!(transport.next_deadline(), None, "idle and never polled");
 
         // `dial` can queue a datagram before any poll has taken a sample. A
         // host that idled on `None` here would never flush it.
         let destination = transport.local_addr();
-        transport.socket.retain_datagram(&[0u8; 4], destination);
+        socket(&mut transport, false).retain_datagram(&[0u8; 4], destination);
 
         let deadline = transport.next_deadline().expect("queued work must be due");
         assert!(
@@ -1954,8 +1531,7 @@ mod tests {
 
     #[test]
     fn next_deadline_is_near_while_outbound_work_is_queued() {
-        let mut transport =
-            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+        let mut transport = loopback(QuicNodeConfig::generate());
         // Never polled, so there is no host timeline to answer on yet.
         assert_eq!(transport.next_deadline(), None);
 
@@ -1968,7 +1544,7 @@ mod tests {
         );
 
         let destination = transport.local_addr();
-        transport.socket.retain_datagram(&[0u8; 4], destination);
+        socket(&mut transport, false).retain_datagram(&[0u8; 4], destination);
         assert_eq!(
             transport.next_deadline(),
             Some(now.deadline_after(1)),
@@ -1978,8 +1554,7 @@ mod tests {
 
     #[test]
     fn wait_for_input_reports_readiness_without_consuming_input() {
-        let mut transport =
-            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+        let mut transport = loopback(QuicNodeConfig::generate());
 
         assert_eq!(
             transport.wait_for_input(Duration::ZERO),
@@ -2005,26 +1580,20 @@ mod tests {
 
         // Readiness polling must not consume the datagram.
         let mut buf = [0u8; 16];
-        let (len, _) = transport
-            .socket
+        let (len, _) = socket(&mut transport, false)
             .udp
             .recv_from(&mut buf)
             .expect("datagram must still be queued");
-        assert_eq!(
-            buf.get(..len)
-                .expect("UDP receive lengths fit the supplied test buffer"),
-            &[1, 2, 3]
-        );
+        assert_eq!(&buf[..len], &[1, 2, 3]);
     }
 
     #[test]
     fn wait_handle_interrupts_a_blocking_wait() {
-        let mut endpoint =
-            QuicEndpoint::bind(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
-        let handle = endpoint.wait_handle();
+        let mut transport = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
+        let handle = transport.wait_handle();
         let waiter = std::thread::spawn(move || {
             let started = std::time::Instant::now();
-            let outcome = endpoint.wait_for_input(Duration::from_secs(5));
+            let outcome = transport.wait_for_input(Duration::from_secs(5));
             (outcome, started.elapsed())
         });
 
@@ -2041,12 +1610,11 @@ mod tests {
 
     #[test]
     fn dual_stack_wait_consumes_one_interrupt_once() {
-        let mut endpoint =
-            QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("dual-stack bind");
-        let handle = endpoint.wait_handle();
+        let mut transport = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
+        let handle = transport.wait_handle();
         let waiter = std::thread::spawn(move || {
-            let interrupted = endpoint.wait_for_input(Duration::from_secs(1));
-            let next = endpoint.wait_for_input(Duration::from_millis(10));
+            let interrupted = transport.wait_for_input(Duration::from_secs(1));
+            let next = transport.wait_for_input(Duration::from_millis(10));
             (interrupted, next)
         });
 
@@ -2054,15 +1622,24 @@ mod tests {
         handle.interrupt();
 
         let (interrupted, next) = waiter.join().expect("waiter");
-        assert_eq!(
-            interrupted,
-            WaitOutcome::Interrupted,
-            "the active dual-stack wait must observe the interrupt"
-        );
+        assert_eq!(interrupted, WaitOutcome::Interrupted);
         assert_eq!(
             next,
             WaitOutcome::TimedOut,
-            "one logical interrupt must not leak from the sibling family poll"
+            "one logical interrupt must be consumed once"
+        );
+    }
+
+    #[test]
+    fn an_idle_dual_stack_wait_is_one_blocking_poll() {
+        let mut transport = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
+        assert_eq!(
+            transport.wait_for_input(Duration::from_millis(30)),
+            WaitOutcome::TimedOut
+        );
+        assert_eq!(
+            transport.readiness.blocking_waits, 1,
+            "both families wait in one poll, not in slices"
         );
     }
 
@@ -2071,55 +1648,54 @@ mod tests {
         let reservation = UdpSocket::bind("0.0.0.0:0").expect("reserve port");
         let port = reservation.local_addr().expect("reserved addr").port();
         drop(reservation);
-        let ipv4 = format!("/ip4/0.0.0.0/udp/{port}/quic-v1")
-            .parse::<Multiaddr>()
-            .expect("ipv4 multiaddr");
-        let ipv6 = format!("/ip6/::/udp/{port}/quic-v1")
-            .parse::<Multiaddr>()
-            .expect("ipv6 multiaddr");
-
-        let endpoint = QuicEndpoint::bind_dual_multiaddr(QuicNodeConfig::generate(), &ipv4, &ipv6)
-            .expect("same-port wildcard pair");
-
-        assert_eq!(endpoint.local_addresses().len(), 2);
+        let transport = QuicTransport::bind(
+            QuicNodeConfig::generate(),
+            &[
+                quic_addr(&format!("0.0.0.0:{port}")),
+                quic_addr(&format!("[::]:{port}")),
+            ],
+        )
+        .expect("same-port wildcard pair");
+        assert_eq!(transport.local_addresses().len(), 2);
     }
 
-    /// Sends one datagram to `family`'s loopback `port` and returns once the
-    /// kernel has queued it on `socket`.
-    fn deliver(socket: &UdpSocket, family: AddressFamily) {
-        let (from, port) = (
-            match family {
-                AddressFamily::Ipv4 => "127.0.0.1:0",
-                AddressFamily::Ipv6 => "[::1]:0",
-            },
-            socket.local_addr().expect("local addr").port(),
-        );
-        let sender = UdpSocket::bind(from).expect("sender");
+    /// Sends one datagram to `transport`'s socket of `family` from loopback
+    /// and returns once the kernel has queued it.
+    fn deliver(transport: &mut QuicTransport, ipv6: bool) {
+        let socket = socket(transport, ipv6);
+        let port = socket.local_addr.port();
+        let sender = UdpSocket::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }).expect("sender");
         sender
-            .send_to(&[1u8; 4], loopback(family, port))
+            .send_to(&[1u8; 4], loopback_addr(ipv6, port))
             .expect("send datagram");
         let start = std::time::Instant::now();
-        while !socket::has_queued_input(socket) {
+        while !socket::has_queued_input(&socket.udp) {
             assert!(
                 start.elapsed() < Duration::from_secs(1),
-                "datagram never arrived on the {} socket",
-                family.name()
+                "datagram never arrived"
             );
             std::thread::sleep(Duration::from_millis(1));
         }
     }
 
+    fn loopback_addr(ipv6: bool, port: u16) -> SocketAddr {
+        if ipv6 {
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))
+        } else {
+            SocketAddr::from(([127, 0, 0, 1], port))
+        }
+    }
+
     #[test]
     fn dual_stack_zero_timeout_wait_reports_queued_input_on_either_family() {
-        for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
-            let mut transport = DualQuicTransport::new(QuicNodeConfig::generate()).expect("bind");
-            deliver(&transport.transport(family).socket.udp, family);
-
+        for ipv6 in [false, true] {
+            let mut transport =
+                QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
+            deliver(&mut transport, ipv6);
             assert_eq!(
                 transport.wait_for_input(Duration::ZERO),
                 WaitOutcome::Ready,
-                "{} input",
-                family.name()
+                "ipv6: {ipv6}"
             );
         }
     }
@@ -2149,95 +1725,61 @@ mod tests {
             poll(&mut fds, Some(&Timespec::default())).expect("poll readiness fd") > 0
         }
 
-        fn check(transport: &mut dyn BlockingTransport, family: AddressFamily) {
+        let cases = [
+            (loopback(QuicNodeConfig::generate()), false),
+            (
+                QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind"),
+                false,
+            ),
+            (
+                QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind"),
+                true,
+            ),
+        ];
+        for (mut transport, ipv6) in cases {
+            deliver(&mut transport, ipv6);
             assert_eq!(transport.wait_for_input(Duration::ZERO), WaitOutcome::Ready);
             transport.poll(Now::from_millis(0)).expect("poll");
             assert_eq!(
                 transport.wait_for_input(Duration::ZERO),
                 WaitOutcome::TimedOut,
-                "{} input was consumed",
-                family.name()
+                "ipv6 {ipv6}: input was consumed"
             );
             let fd = transport.readiness_fd().expect("quic exposes its selector");
-            assert!(
-                !fd_is_readable(fd),
-                "{} readiness was left on the fd",
-                family.name()
-            );
-        }
-
-        let mut single =
-            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
-        deliver(&single.socket.udp, AddressFamily::Ipv4);
-        check(&mut single, AddressFamily::Ipv4);
-
-        for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
-            let mut dual = DualQuicTransport::new(QuicNodeConfig::generate()).expect("bind");
-            deliver(&dual.transport(family).socket.udp, family);
-            check(&mut dual, family);
-        }
-    }
-
-    /// Sends one datagram to `target` after `delay` from another thread, and
-    /// returns when it was sent.
-    fn send_later(
-        from: &'static str,
-        target: SocketAddr,
-        delay: Duration,
-    ) -> std::thread::JoinHandle<std::time::Instant> {
-        std::thread::spawn(move || {
-            let sender = UdpSocket::bind(from).expect("sender");
-            std::thread::sleep(delay);
-            let sent = std::time::Instant::now();
-            sender.send_to(&[7u8; 4], target).expect("send datagram");
-            sent
-        })
-    }
-
-    fn loopback(family: AddressFamily, port: u16) -> SocketAddr {
-        match family {
-            AddressFamily::Ipv4 => SocketAddr::from(([127, 0, 0, 1], port)),
-            AddressFamily::Ipv6 => SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+            assert!(!fd_is_readable(fd), "ipv6 {ipv6}: readiness left on the fd");
         }
     }
 
     #[test]
     fn dual_stack_wait_wakes_promptly_for_a_datagram_on_either_family() {
-        // Each arrival lands mid-slice in the *other* family's turn of a wait
-        // taking 10 ms turns (IPv4: 0-10 ms, IPv6: 10-20 ms, ...), where it
-        // would wait about 7 ms. The best of three is held to the bound, so
-        // one descheduled thread on a busy runner cannot fail it.
-        for (family, delays_ms) in [
-            (AddressFamily::Ipv4, [13, 33, 53]),
-            (AddressFamily::Ipv6, [3, 23, 43]),
-        ] {
+        // The best of three is held to the bound, so one descheduled thread
+        // on a busy runner cannot fail it.
+        for ipv6 in [false, true] {
             let mut latencies = Vec::new();
-            for delay_ms in delays_ms {
+            for delay_ms in [3, 13, 23] {
                 let mut transport =
-                    DualQuicTransport::new(QuicNodeConfig::generate()).expect("bind");
-                let port = transport.transport(family).local_addr().port();
-                let from = match family {
-                    AddressFamily::Ipv4 => "127.0.0.1:0",
-                    AddressFamily::Ipv6 => "[::1]:0",
-                };
-                let sender = send_later(
-                    from,
-                    loopback(family, port),
-                    Duration::from_millis(delay_ms),
-                );
+                    QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
+                let target = loopback_addr(ipv6, socket(&mut transport, ipv6).local_addr.port());
+                let sender = std::thread::spawn(move || {
+                    let sender = UdpSocket::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })
+                        .expect("sender");
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    let sent = std::time::Instant::now();
+                    sender.send_to(&[7u8; 4], target).expect("send datagram");
+                    sent
+                });
 
                 let outcome = transport.wait_for_input(Duration::from_secs(5));
                 let woke = std::time::Instant::now();
                 let sent = sender.join().expect("sender thread");
 
-                assert_eq!(outcome, WaitOutcome::Ready, "{} input", family.name());
+                assert_eq!(outcome, WaitOutcome::Ready, "ipv6: {ipv6}");
                 latencies.push(woke.saturating_duration_since(sent));
             }
             let best = latencies.iter().min().expect("three trials");
             assert!(
                 *best < Duration::from_millis(5),
-                "{} input woke the wait after {latencies:?}",
-                family.name()
+                "ipv6 {ipv6}: woke after {latencies:?}"
             );
         }
     }
@@ -2246,7 +1788,11 @@ mod tests {
     fn dns_hosts_are_refused_with_a_resolve_first_error() {
         // A lookup here would block the driver thread for the resolver's
         // timeout, so a name is an address error that says what to do.
-        let named = loopback_peer_addr(Protocol::Dns4("localhost".to_string()));
+        let named = PeerAddr::new(
+            "/dns4/localhost/udp/9/quic-v1".parse().expect("dns addr"),
+            Ed25519Keypair::generate().peer_id(),
+        )
+        .expect("peer addr");
         let assert_resolve_first = |result: Result<(), TransportError>| {
             assert!(
                 matches!(&result, Err(TransportError::InvalidAddress { reason, .. })
@@ -2255,89 +1801,89 @@ mod tests {
             );
         };
 
-        let mut single =
-            QuicEndpoint::bind(QuicNodeConfig::generate(), DEFAULT_IPV4_BIND).expect("bind ipv4");
-        assert_resolve_first(Transport::dial(&mut single, &named).map(drop));
-        assert_resolve_first(single.dial_ip4(&named).map(drop));
-        assert_resolve_first(single.send_raw_udp(named.transport(), b"x"));
-
-        let mut dual = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("bind");
-        assert_resolve_first(Transport::dial(&mut dual, &named).map(drop));
-        assert_resolve_first(dual.dial_ip4(&named).map(drop));
-        assert_resolve_first(dual.send_raw_udp(named.transport(), b"x"));
+        let mut transport = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
+        assert_resolve_first(transport.dial(&named).map(drop));
+        assert_resolve_first(transport.send_datagram(named.transport(), b"x"));
     }
 
     #[test]
-    fn dual_stack_halves_allocate_disjoint_ids_from_the_same_sequence() {
-        // Both halves start their sequence at 1. Before namespacing, keeping
-        // them apart needed an odd/even rewrite on every id and event.
-        let mut ipv4 =
-            QuicTransport::new(QuicNodeConfig::generate(), DEFAULT_IPV4_BIND).expect("bind ipv4");
-        let mut ipv6 =
-            QuicTransport::new(QuicNodeConfig::generate(), DEFAULT_IPV6_BIND).expect("bind ipv6");
+    fn dual_stack_dials_and_datagrams_leave_from_the_matching_family() {
+        let mut transport = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
+        for (ipv6, namespace) in [
+            (false, ConnectionNamespace::QUIC_IPV4),
+            (true, ConnectionNamespace::QUIC_IPV6),
+        ] {
+            let receiver =
+                UdpSocket::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }).expect("receiver");
+            let target_addr = receiver.local_addr().expect("receiver addr");
+            let id = transport
+                .dial(&target(&target_addr.to_string()))
+                .expect("dial");
+            assert_eq!(id.namespace(), namespace);
+            transport
+                .send_datagram(&quic_addr(&target_addr.to_string()), b"punch")
+                .expect("datagram");
 
-        let from_ipv4 = ipv4.allocate_connection_id().expect("ipv4 id");
-        let from_ipv6 = ipv6.allocate_connection_id().expect("ipv6 id");
-
-        assert_eq!(from_ipv4.sequence(), from_ipv6.sequence());
-        assert_ne!(from_ipv4, from_ipv6);
-        assert_eq!(from_ipv4.namespace(), ConnectionNamespace::QUIC_IPV4);
-        assert_eq!(from_ipv6.namespace(), ConnectionNamespace::QUIC_IPV6);
+            // Both the Initial and the datagram left from that family's socket.
+            let port = socket(&mut transport, ipv6).local_addr.port();
+            let mut buf = [0u8; 2048];
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("timeout");
+            for _ in 0..2 {
+                let (_, from) = receiver.recv_from(&mut buf).expect("a datagram");
+                assert_eq!(from.port(), port, "ipv6 {ipv6}");
+            }
+        }
     }
 
     #[test]
-    fn dual_stack_rejects_ids_from_another_transport() {
-        let mut endpoint = DualQuicTransport::new(QuicNodeConfig::generate()).expect("bind");
+    fn a_single_family_transport_names_the_missing_family() {
+        let mut transport = loopback(QuicNodeConfig::generate());
+        for result in [
+            transport.dial(&target("[::1]:9")).map(drop),
+            transport.send_datagram(&quic_addr("[::1]:9"), b"x"),
+            transport.listen(&quic_addr("[::1]:9")).map(drop),
+        ] {
+            assert!(
+                matches!(&result, Err(TransportError::InvalidAddress { reason, .. })
+                    if reason.contains("no ipv6 socket")),
+                "got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_connection_limit_holds_per_socket() {
+        let limits = QuicLimits {
+            max_connections: 1,
+            ..QuicLimits::default()
+        };
+        let mut transport =
+            QuicTransport::dual_stack(QuicNodeConfig::generate().with_limits(limits))
+                .expect("bind");
+        transport.dial(&target("127.0.0.1:9")).expect("first ipv4");
+        assert!(matches!(
+            transport.dial(&target("127.0.0.1:9")),
+            Err(TransportError::ResourceExhausted { .. })
+        ));
+        transport
+            .dial(&target("[::1]:9"))
+            .expect("the ipv6 socket has its own limit");
+    }
+
+    #[test]
+    fn ids_from_another_transport_are_unknown() {
+        let mut transport = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
         let foreign =
             ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("id in range");
-
         assert_eq!(
-            endpoint.open_stream(foreign),
+            transport.open_stream(foreign),
             Err(TransportError::ConnectionNotFound { id: foreign })
         );
         assert_eq!(
-            endpoint.close(foreign),
+            transport.close(foreign),
             Err(TransportError::ConnectionNotFound { id: foreign })
         );
-    }
-
-    #[test]
-    fn dual_stack_explicit_family_dials_only_that_family() {
-        let mut endpoint = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("bind");
-        let id = endpoint
-            .dial_ip4(&loopback_peer_addr(Protocol::Ip4([127, 0, 0, 1])))
-            .expect("dial ipv4");
-        assert_eq!(id.namespace(), ConnectionNamespace::QUIC_IPV4);
-
-        let mut ipv6 = [0; 16];
-        ipv6[15] = 1;
-        let id = endpoint
-            .dial_ip6(&loopback_peer_addr(Protocol::Ip6(ipv6)))
-            .expect("dial ipv6");
-        assert_eq!(id.namespace(), ConnectionNamespace::QUIC_IPV6);
-
-        assert!(matches!(
-            endpoint.dial_ip6(&loopback_peer_addr(Protocol::Ip4([127, 0, 0, 1]))),
-            Err(TransportError::InvalidAddress { .. })
-        ));
-    }
-
-    #[test]
-    fn single_endpoint_explicit_family_rejects_mismatched_socket() {
-        let mut ipv6 = [0; 16];
-        ipv6[15] = 1;
-        let mut endpoint =
-            QuicEndpoint::bind(QuicNodeConfig::generate(), DEFAULT_IPV4_BIND).expect("bind ipv4");
-        let err = endpoint
-            .dial_ip6(&loopback_peer_addr(Protocol::Ip6(ipv6)))
-            .expect_err("ipv4 endpoint must not dial ipv6");
-
-        assert!(matches!(
-            err,
-            TransportError::InvalidAddress {
-                context: "dial target",
-                ..
-            }
-        ));
     }
 }

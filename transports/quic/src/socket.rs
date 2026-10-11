@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 
+use minip2p_transport::{ConnectionIdAllocator, ConnectionNamespace};
 use quinn_udp::{RecvMeta, UdpSocketState};
 
 use crate::diagnostics::DatagramTally;
@@ -67,12 +68,23 @@ impl Received {
     }
 }
 
-/// A non-blocking UDP socket plus its bounded retry queue.
+/// A non-blocking UDP socket plus its bounded retry queue, and the state the
+/// transport keeps per socket: connections are counted, limited and given ids
+/// per socket, so one family's traffic cannot starve the other's.
 pub(crate) struct Socket {
     pub(crate) udp: UdpSocket,
     state: UdpSocketState,
     /// Fixed when the socket was bound.
     pub(crate) local_addr: SocketAddr,
+    /// Whether `listen` accepted this socket's address.
+    pub(crate) listening: bool,
+    /// Connections owned by this socket.
+    pub(crate) connections: usize,
+    /// Ids for this socket's connections, in its family's namespace.
+    pub(crate) ids: ConnectionIdAllocator,
+    /// The last receive batch hit its bound, so input may be waiting with no
+    /// fresh readiness edge to report it.
+    pub(crate) saturated: bool,
     /// Transmits waiting for the socket to become writable, oldest first.
     pending: VecDeque<PendingTransmit>,
     /// Logical datagrams in `pending`.
@@ -105,10 +117,19 @@ impl Socket {
         tally: DatagramTally,
     ) -> io::Result<Self> {
         let state = UdpSocketState::new((&udp).into())?;
+        let namespace = if local_addr.is_ipv6() {
+            ConnectionNamespace::QUIC_IPV6
+        } else {
+            ConnectionNamespace::QUIC_IPV4
+        };
         Ok(Self {
             udp,
             state,
             local_addr,
+            listening: false,
+            connections: 0,
+            ids: ConnectionIdAllocator::new(namespace),
+            saturated: false,
             pending: VecDeque::new(),
             retained: 0,
             max_pending,
@@ -313,6 +334,45 @@ impl Socket {
             segment_size: None,
             src_ip: None,
         });
+    }
+}
+
+/// A transport's sockets: one or two, at most one per address family.
+pub(crate) struct Sockets(Vec<Socket>);
+
+impl Sockets {
+    pub(crate) fn new(sockets: Vec<Socket>) -> Self {
+        Self(sockets)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Socket> {
+        self.0.iter()
+    }
+
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Socket> {
+        self.0.iter_mut()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut Socket> {
+        self.0.get_mut(index)
+    }
+
+    /// The socket of `addr`'s family.
+    pub(crate) fn for_addr(&mut self, addr: SocketAddr) -> Option<&mut Socket> {
+        self.0
+            .iter_mut()
+            .find(|socket| socket.local_addr.is_ipv6() == addr.is_ipv6())
+    }
+
+    /// The socket that allocates ids in `namespace`.
+    pub(crate) fn for_namespace(&mut self, namespace: ConnectionNamespace) -> Option<&mut Socket> {
+        self.0
+            .iter_mut()
+            .find(|socket| socket.ids.namespace() == namespace)
     }
 }
 

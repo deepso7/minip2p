@@ -20,17 +20,29 @@ pub fn now() -> Now {
     StdClock::with_epoch(*EPOCH).now()
 }
 
+/// A transport bound to one IPv4 loopback socket.
+pub fn loopback(config: QuicNodeConfig) -> QuicTransport {
+    let addr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr");
+    QuicTransport::bind(config, &[addr]).expect("bind loopback")
+}
+
+/// The first address other nodes can dial `transport` at.
+pub fn peer_addr(transport: &QuicTransport) -> PeerAddr {
+    transport
+        .local_peer_addrs()
+        .expect("peer addrs")
+        .into_iter()
+        .next()
+        .expect("a bound socket")
+}
+
 /// Binds a listening server and an unconnected client on loopback and
 /// returns them together with the server's peer-addr.
 pub fn setup_pair() -> (QuicTransport, QuicTransport, PeerAddr) {
-    let mut server =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");
-    let client =
-        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("client bind");
-
-    server.listen_on_bound_addr().expect("server listen");
-    let peer_addr = server.local_peer_addr().expect("peer addr");
-
+    let mut server = loopback(QuicNodeConfig::generate());
+    let client = loopback(QuicNodeConfig::generate());
+    server.listen_on_bound_addrs().expect("server listen");
+    let peer_addr = peer_addr(&server);
     (server, client, peer_addr)
 }
 
