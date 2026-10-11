@@ -32,6 +32,7 @@ rustls = { version = "0.23", default-features = false, features = [
   "ring",
   "std",
 ] }
+quinn-udp = { version = "0.6.3", default-features = false }
 bytes = "1.12.1"
 mio = { version = "1.2", features = ["net", "os-poll"] }
 socket2 = "0.6.5"

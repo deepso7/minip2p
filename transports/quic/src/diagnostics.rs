@@ -192,7 +192,7 @@ impl DatagramTally {
         Self {}
     }
 
-    /// The socket accepted a datagram of `len` bytes.
+    /// The socket accepted `datagrams` datagrams totalling `bytes` bytes.
     #[inline]
     #[cfg_attr(
         not(feature = "diagnostics"),
@@ -201,15 +201,15 @@ impl DatagramTally {
             reason = "the hooks record nothing without the feature"
         )
     )]
-    pub(crate) fn sent(&self, len: usize) {
+    pub(crate) fn sent(&self, datagrams: usize, bytes: usize) {
         #[cfg(feature = "diagnostics")]
         {
-            self.atomics.sent.fetch_add(1, Relaxed);
-            self.atomics.sent_bytes.fetch_add(len as u64, Relaxed);
+            self.atomics.sent.fetch_add(datagrams as u64, Relaxed);
+            self.atomics.sent_bytes.fetch_add(bytes as u64, Relaxed);
         }
     }
 
-    /// The socket delivered a datagram of `len` bytes.
+    /// The socket delivered `datagrams` datagrams totalling `bytes` bytes.
     #[inline]
     #[cfg_attr(
         not(feature = "diagnostics"),
@@ -218,11 +218,11 @@ impl DatagramTally {
             reason = "the hooks record nothing without the feature"
         )
     )]
-    pub(crate) fn received(&self, len: usize) {
+    pub(crate) fn received(&self, datagrams: usize, bytes: usize) {
         #[cfg(feature = "diagnostics")]
         {
-            self.atomics.received.fetch_add(1, Relaxed);
-            self.atomics.received_bytes.fetch_add(len as u64, Relaxed);
+            self.atomics.received.fetch_add(datagrams as u64, Relaxed);
+            self.atomics.received_bytes.fetch_add(bytes as u64, Relaxed);
         }
     }
 }

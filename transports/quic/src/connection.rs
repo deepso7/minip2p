@@ -366,18 +366,23 @@ impl QuicConnection {
     }
 
     /// Sends the engine's output until it has none, the socket pushes back,
-    /// or the retry queue has no room for another datagram.
+    /// or the retry queue has no room left for another datagram.
     fn transmit(&mut self, now: Instant, cx: &mut Cx<'_>) -> Option<io::Error> {
         self.counters.flush();
-        while cx.socket.has_room() {
+        loop {
+            // Recomputed for every transmit: retained datagrams shrink it.
+            let allowance = cx.socket.allowance();
+            if allowance == 0 {
+                break;
+            }
             cx.send_buf.clear();
-            let Some(transmit) = self.conn.poll_transmit(now, 1, cx.send_buf) else {
+            let Some(transmit) = self.conn.poll_transmit(now, allowance, cx.send_buf) else {
                 break;
             };
-            let Some(datagram) = cx.send_buf.get(..transmit.size) else {
+            let Some(contents) = cx.send_buf.get(..transmit.size) else {
                 break;
             };
-            match cx.socket.send(datagram, transmit.destination) {
+            match cx.socket.send(&transmit, contents) {
                 Ok(true) => {}
                 Ok(false) => break,
                 // Stop rather than hammer a dead route within one service.

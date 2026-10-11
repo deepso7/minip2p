@@ -1,9 +1,11 @@
 //! Synchronous QUIC transport adapter for minip2p, on the quinn-proto engine
 //! with rustls (ring) for libp2p TLS.
 //!
-//! Implements [`Transport`] with a poll-driven, non-blocking UDP socket. The
-//! engine owns no I/O: the adapter feeds it datagrams and a time sample, and
-//! sends what it produces. No async runtime required.
+//! Implements [`Transport`] with a poll-driven, non-blocking UDP socket,
+//! driven through quinn-udp for segmentation and receive offload, ECN and
+//! packet info where the platform has them. The engine owns no I/O: the
+//! adapter feeds it datagrams and a time sample, and sends what it produces.
+//! No async runtime required.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -35,6 +37,8 @@ mod diagnostics;
 mod recv_batch_tests;
 mod socket;
 #[cfg(test)]
+mod socket_tests;
+#[cfg(test)]
 mod stream_send_tests;
 #[cfg(test)]
 mod stream_tests;
@@ -48,7 +52,7 @@ pub use diagnostics::{ConnectionDiagnostics, DatagramCounters, datagram_counters
 
 use connection::{Cx, QuicConnection};
 use diagnostics::{ConnectionCounters, DatagramTally};
-use socket::Socket;
+use socket::{Received, Socket};
 use tls::{HostTime, TlsIdentity};
 
 const DEFAULT_IPV4_BIND: &str = "0.0.0.0:0";
@@ -76,7 +80,7 @@ const SERVER_NAME: &str = "l";
 /// `wait_for_input` reports leftover packets as ready, so the driver polls
 /// again at once.
 const MAX_DATAGRAMS_PER_POLL: usize = 128;
-/// Largest UDP payload a receive accepts.
+/// Largest UDP payload a single datagram can carry.
 const RECV_BUFFER_SIZE: usize = 65_535;
 /// The [`Waker`]'s token; sockets are registered from `Token(1)` up.
 const INTERRUPT_TOKEN: Token = Token(0);
@@ -795,14 +799,31 @@ impl QuicTransport {
 
         let tally = DatagramTally::register(&node_config.peer_id());
         let max_pending_datagrams = node_config.limits().max_pending_datagrams;
+        let socket =
+            Socket::new(socket, local_addr, max_pending_datagrams, tally).map_err(|e| {
+                TransportError::ListenFailed {
+                    reason: format!("failed to configure udp socket: {e}"),
+                }
+            })?;
+        let endpoint_config = EndpointConfig::default();
+        let recv_buf = vec![
+            0;
+            socket.recv_buffer_len(
+                usize::try_from(endpoint_config.get_max_udp_payload_size())
+                    .unwrap_or(RECV_BUFFER_SIZE)
+            )
+        ];
+        // Path MTU discovery needs datagrams the network drops rather than
+        // fragments when they are too large.
+        let allow_mtu_discovery = !socket.may_fragment();
         Ok(Self {
-            socket: Socket::new(socket, local_addr, max_pending_datagrams, tally),
+            socket,
             readiness: None,
             // No server config until `listen`: the endpoint accepts nothing.
             endpoint: quinn_proto::Endpoint::new(
-                Arc::new(EndpointConfig::default()),
+                Arc::new(endpoint_config),
                 None,
-                true,
+                allow_mtu_discovery,
                 None,
             ),
             server_config: Arc::new(server_config),
@@ -813,7 +834,7 @@ impl QuicTransport {
             handles: HashMap::new(),
             peer_connections: HashMap::new(),
             pending_events: Vec::new(),
-            recv_buf: vec![0; RECV_BUFFER_SIZE],
+            recv_buf,
             send_buf: Vec::new(),
             sweep_ids: Vec::new(),
             listening: false,
@@ -845,7 +866,7 @@ impl QuicTransport {
             .map_err(|e| TransportError::PollError {
                 reason: format!("raw udp send to {addr} failed: {e}"),
             })?;
-        self.socket.tally.sent(payload.len());
+        self.socket.tally.sent(1, payload.len());
         Ok(())
     }
 
@@ -947,27 +968,36 @@ impl QuicTransport {
         Ok(config)
     }
 
-    /// Reads up to [`MAX_DATAGRAMS_PER_POLL`] datagrams and hands each to the
-    /// engine. Connections only queue output here; the sweep sends it.
+    /// Reads datagrams until [`MAX_DATAGRAMS_PER_POLL`] logical datagrams
+    /// have arrived, and hands each to the engine. Connections only queue
+    /// output here; the sweep sends it.
+    ///
+    /// A GRO batch already read is always split to the end, so the bound can
+    /// be overshot by less than one batch.
     fn recv_batch(&mut self, now: Instant) -> Result<(), TransportError> {
         self.recv_saturated = false;
-        for _ in 0..MAX_DATAGRAMS_PER_POLL {
-            let (len, from) = match self.socket.udp.recv_from(&mut self.recv_buf) {
-                Ok(received) => received,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+        let mut datagrams = 0;
+        while datagrams < MAX_DATAGRAMS_PER_POLL {
+            let received = match self.socket.recv(&mut self.recv_buf) {
+                Ok(Some(received)) => received,
+                Ok(None) => return Ok(()),
                 Err(e) => {
                     return Err(TransportError::PollError {
                         reason: format!("udp recv error: {e}"),
                     });
                 }
             };
-            self.socket.tally.received(len);
-            let datagram = BytesMut::from(
+            datagrams += received.datagrams();
+            // One allocation per batch; each datagram is a slice of it.
+            let mut batch = BytesMut::from(
                 self.recv_buf
-                    .get(..len)
+                    .get(..received.len)
                     .expect("UDP receive lengths fit the supplied buffer"),
             );
-            self.handle_datagram(now, from, datagram);
+            while !batch.is_empty() {
+                let datagram = batch.split_to(received.stride.min(batch.len()));
+                self.handle_datagram(now, &received, datagram);
+            }
         }
         self.recv_saturated = true;
         Ok(())
@@ -975,13 +1005,17 @@ impl QuicTransport {
 
     /// Routes one datagram. The endpoint routes by connection id, never by
     /// source address, and drops what it cannot parse.
-    fn handle_datagram(&mut self, now: Instant, from: SocketAddr, datagram: BytesMut) {
+    fn handle_datagram(&mut self, now: Instant, received: &Received, datagram: BytesMut) {
         let mut buf = std::mem::take(&mut self.send_buf);
         buf.clear();
-        match self
-            .endpoint
-            .handle(now, from, None, None, datagram, &mut buf)
-        {
+        match self.endpoint.handle(
+            now,
+            received.from,
+            received.dst_ip,
+            received.ecn,
+            datagram,
+            &mut buf,
+        ) {
             Some(DatagramEvent::ConnectionEvent(handle, event)) => {
                 if let Some(conn) = self
                     .handles
@@ -1117,8 +1151,8 @@ impl QuicTransport {
 
 /// Sends a stateless reply the endpoint wrote into `buf`.
 fn send_stateless(socket: &mut Socket, buf: &[u8], transmit: &quinn_proto::Transmit) {
-    if let Some(datagram) = buf.get(..transmit.size) {
-        socket.send_stateless(datagram, transmit.destination);
+    if let Some(contents) = buf.get(..transmit.size) {
+        socket.send_stateless(transmit, contents);
     }
 }
 
@@ -1747,11 +1781,11 @@ mod tests {
         let destination = transport.local_addr();
 
         for payload in [&[1u8][..], &[2u8][..], &[3u8][..]] {
-            transport.socket.retain(payload, destination);
+            transport.socket.retain_datagram(payload, destination);
         }
 
         assert_eq!(
-            transport.socket.pending_len(),
+            transport.socket.retained(),
             2,
             "queue must cap at the limit and silently drop the overflow"
         );
@@ -1841,9 +1875,11 @@ mod tests {
         // destination, so the poll must drop it and carry on rather than
         // abort the whole endpoint.
         let bad_destination: SocketAddr = "[::1]:9".parse().expect("socket addr");
-        transport.socket.retain(&[0u8; 4], bad_destination);
+        transport.socket.retain_datagram(&[0u8; 4], bad_destination);
         let good_destination = transport.local_addr();
-        transport.socket.retain(&[0u8; 4], good_destination);
+        transport
+            .socket
+            .retain_datagram(&[0u8; 4], good_destination);
 
         let events = transport.poll(Now::from_millis(0)).expect("poll");
         assert!(
@@ -1907,7 +1943,7 @@ mod tests {
         // `dial` can queue a datagram before any poll has taken a sample. A
         // host that idled on `None` here would never flush it.
         let destination = transport.local_addr();
-        transport.socket.retain(&[0u8; 4], destination);
+        transport.socket.retain_datagram(&[0u8; 4], destination);
 
         let deadline = transport.next_deadline().expect("queued work must be due");
         assert!(
@@ -1932,7 +1968,7 @@ mod tests {
         );
 
         let destination = transport.local_addr();
-        transport.socket.retain(&[0u8; 4], destination);
+        transport.socket.retain_datagram(&[0u8; 4], destination);
         assert_eq!(
             transport.next_deadline(),
             Some(now.deadline_after(1)),
