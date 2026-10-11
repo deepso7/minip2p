@@ -24,6 +24,7 @@ use crate::state::{Action, ProtocolKind, SwarmState};
 /// Protocol-state rejections remain distinguishable from transport failures;
 /// callers no longer need to recover their meaning from a flattened string.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DriverError {
     /// The stream could not accept the whole write. Retryable, never a
     /// fault (ADR 0012): every byte before `unsent` was accepted, the caller

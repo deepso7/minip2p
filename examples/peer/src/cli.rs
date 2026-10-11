@@ -394,6 +394,10 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
                     connect_id.as_u64()
                 );
             }
+            other => println!(
+                "[{role}] connect-settled id={} peer={peer_id} outcome={other:?}",
+                connect_id.as_u64()
+            ),
         },
         EndpointEvent::Nat(event) => print_nat_event(role, event),
         other => println!("[{role}] event {other:?}"),

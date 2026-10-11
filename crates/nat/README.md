@@ -114,11 +114,11 @@ loop {
             break;
         }
         EndpointWaitOutcome::Event(other) => { /* dispatch unrelated events */ }
-        EndpointWaitOutcome::Interrupted => {}
         EndpointWaitOutcome::Deadline => {
             node.cancel_connect(id); // the deadline is local; cancel explicitly
             break;
         }
+        _ => {} // interrupted by a WaitHandle
     }
 }
 ```

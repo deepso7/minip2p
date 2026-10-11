@@ -130,8 +130,8 @@ fn drive(endpoint: &mut Endpoint, until: Instant) {
                 !matches!(event, EndpointEvent::ConnectionEstablished { .. }),
                 "an idle endpoint connected: {event:?}"
             ),
-            EndpointWaitOutcome::Interrupted => {}
             EndpointWaitOutcome::Deadline => return,
+            _ => {} // interrupted by a WaitHandle
         }
     }
 }

@@ -12,6 +12,7 @@ use crate::{ConnectionId, StreamId};
 /// [`Full`](Self::Full) says exactly what was accepted. Any other error may
 /// follow a partial queue: a prefix of the payload can already be on its way.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[non_exhaustive]
 pub enum TransportError {
     #[error("invalid address for {context}: {reason}")]
     InvalidAddress {

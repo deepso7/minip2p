@@ -58,8 +58,8 @@ loop {
             break;
         }
         EndpointWaitOutcome::Event(other) => println!("{other:?}"), // dispatch as usual
-        EndpointWaitOutcome::Interrupted => {} // a WaitHandle woke us; service commands
         EndpointWaitOutcome::Deadline => {} // the clock check above gives up
+        _ => {} // a WaitHandle woke us; service commands
     }
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -176,7 +176,7 @@ loop {
         EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) => { /* ... */ }
         EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled { connect_id, outcome, .. }) => { /* ... */ }
         EndpointWaitOutcome::Event(_) => {} // EndpointEvent is non-exhaustive
-        EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
+        _ => {}
     }
 }
 ```

@@ -412,7 +412,7 @@ impl RelayServer {
                             trace.push_back(entry);
                         }
                     }
-                    Ok(EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted) => {}
+                    Ok(_) => {}
                     Err(error) => {
                         *failure_sink.lock().expect("relay failure lock") =
                             Some(format!("relay endpoint: {error}"));

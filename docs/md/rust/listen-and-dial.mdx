@@ -102,12 +102,12 @@ loop {
             break;
         }
         EndpointWaitOutcome::Event(event) => println!("{event:?}"), // dispatch as usual
-        EndpointWaitOutcome::Interrupted => {}
         EndpointWaitOutcome::Deadline => {
             // The deadline only bounds this wait; cancel the attempt explicitly.
             node.cancel_connect(connect_id);
             break;
         }
+        _ => {} // interrupted by a WaitHandle
     }
 }
 ```

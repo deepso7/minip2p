@@ -123,6 +123,9 @@ use crate::{Bytes, ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
     reason = "EndpointEvent ownership avoids a heap allocation on the ready path."
 )]
 #[must_use = "handle the wait outcome; an EndpointEvent has been removed from the endpoint"]
+// Non-exhaustive, so a later outcome is not a breaking change: match
+// `Event` and `Deadline`, and treat the rest (today, `Interrupted`) with `_`.
+#[non_exhaustive]
 pub enum EndpointWaitOutcome {
     /// An application event from the Endpoint event stream.
     ///
@@ -864,10 +867,11 @@ impl Endpoint {
     ///             },
     ///             // Unrelated events keep flowing: dispatch them as usual.
     ///             EndpointWaitOutcome::Event(event) => println!("{event:?}"),
-    ///             // Another thread woke us; service its commands, then wait again.
-    ///             EndpointWaitOutcome::Interrupted => {}
     ///             // The clock check above gives up.
     ///             EndpointWaitOutcome::Deadline => {}
+    ///             // `Interrupted`: another thread woke us; service its
+    ///             // commands, then wait again.
+    ///             _ => {}
     ///         }
     ///     }
     /// }

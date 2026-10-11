@@ -388,17 +388,19 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         match endpoint.wait(Deadline::NEVER)? {
             EndpointWaitOutcome::Interrupted => interrupted = true,
             EndpointWaitOutcome::Event(event) => batch.push(event),
-            EndpointWaitOutcome::Deadline => {}
+            // Deadline, or an outcome this driver predates: nothing to carry.
+            _ => {}
         }
         if !interrupted {
             for _ in 0..PUMP_DRAIN_LIMIT {
                 match endpoint.wait(Duration::ZERO)? {
                     EndpointWaitOutcome::Event(event) => batch.push(event),
-                    EndpointWaitOutcome::Deadline => break,
                     EndpointWaitOutcome::Interrupted => {
                         interrupted = true;
                         break;
                     }
+                    // Deadline, or an outcome this driver predates.
+                    _ => break,
                 }
             }
         }
@@ -501,9 +503,8 @@ fn failure_kind(error: &Error) -> DriverFailureKind {
     match error {
         Error::Transport(_) | Error::Full { .. } => DriverFailureKind::Transport,
         Error::Swarm(_) => DriverFailureKind::Swarm,
-        Error::Invariant { .. } | Error::EventBacklogExceeded { .. } | Error::Entropy => {
-            DriverFailureKind::Invariant
-        }
+        // Includes failures this binding predates.
+        _ => DriverFailureKind::Invariant,
     }
 }
 

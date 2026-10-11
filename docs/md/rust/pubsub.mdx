@@ -41,7 +41,7 @@ loop {
             break;
         }
         EndpointWaitOutcome::Deadline => break,
-        EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted => {}
+        _ => {}
     }
 }
 ```
@@ -80,7 +80,7 @@ loop {
             eprintln!("peer={peer} violated pubsub: {reason}");
         }
         EndpointWaitOutcome::Event(_) => {} // EndpointEvent is non-exhaustive
-        EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
+        _ => {}
     }
 }
 ```

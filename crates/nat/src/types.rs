@@ -45,6 +45,7 @@ pub struct NatToken(pub(crate) u64);
 /// [`NatEvent::PathUpgraded`](crate::NatEvent::PathUpgraded) — never a silent
 /// switch.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Path {
     /// A direct QUIC connection established by dialing a known candidate
     /// address. Use the ordinary swarm APIs with the peer id.

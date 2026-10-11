@@ -34,7 +34,7 @@ impl NextEvent for Endpoint {
             match self.wait(deadline)? {
                 EndpointWaitOutcome::Event(event) => return Ok(Some(event)),
                 EndpointWaitOutcome::Deadline => return Ok(None),
-                EndpointWaitOutcome::Interrupted => {}
+                _ => {}
             }
         }
     }
