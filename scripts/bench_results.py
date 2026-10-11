@@ -73,11 +73,21 @@ GUNGRAUN_NAMES = {
     "gossipsub_forward_1_kib_128": "pubsub/gossipsub_forward_1KiB/128",
     "gossipsub_heartbeat_1000_peers_100_topics": "pubsub/gossipsub_heartbeat_1000_peers_100_topics",
     "relay_handle_event_same_now_128_pending_hops": "relay_handle_event_same_now_128_pending_hops",
-    "relay_1k_next_timeout": "relay_server_1k/next_timeout",
-    "relay_1k_tick_idle": "relay_server_1k/tick_idle",
-    "relay_1k_tick_expire_100": "relay_server_1k/tick_expire_100",
-    "relay_1k_reserve_new_peer": "relay_server_1k/reserve_new_peer",
-    "relay_1k_close_connection_100_circuits": "relay_server_1k/close_connection_100_circuits",
+    **{
+        f"relay_{size}_{case}": f"relay_server_{size}/{case}"
+        for size in ("100", "1k", "10k")
+        for case in (
+            "next_timeout",
+            "tick_idle",
+            "tick_expire_100",
+            "reserve_new_peer",
+            "connect_new_peer",
+            "hop_admission",
+            "close_connection_100_circuits",
+            "close_destination_connection",
+            "cancel_inflight_send",
+        )
+    },
 }
 EXPECTED_VITEST = {"sdk_drain_flood", "sdk_stream_transfer", "raw_drain_events", "connected_peers_sync"}
 # Rows a bench measures itself (for example throughput or allocations), keyed by
