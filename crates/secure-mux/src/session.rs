@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -149,9 +150,11 @@ enum Phase {
         select: MultistreamSelect,
         peer: PeerId,
     },
+    /// Boxed: the established session is far larger than the handshake
+    /// phases, and a connection lives here once.
     Ready {
         noise: NoiseSession,
-        yamux: YamuxSession,
+        yamux: Box<YamuxSession>,
         peer: PeerId,
     },
 }
@@ -725,7 +728,11 @@ impl SecureMuxSession {
                 handshake_hash,
             },
         );
-        Ok(Phase::Ready { noise, yamux, peer })
+        Ok(Phase::Ready {
+            noise,
+            yamux: Box::new(yamux),
+            peer,
+        })
     }
 
     fn drain_raw_select(&mut self, select: &mut MultistreamSelect) -> Result<(), SessionError> {
@@ -1236,7 +1243,11 @@ mod tests {
         let mut session = SecureMuxSession {
             role: SessionRole::Initiator,
             yamux_config: YamuxConfig::default(),
-            phase: Some(Phase::Ready { noise, yamux, peer }),
+            phase: Some(Phase::Ready {
+                noise,
+                yamux: Box::new(yamux),
+                peer,
+            }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
         };
@@ -1267,7 +1278,11 @@ mod tests {
         let mut session = SecureMuxSession {
             role: SessionRole::Initiator,
             yamux_config: YamuxConfig::default(),
-            phase: Some(Phase::Ready { noise, yamux, peer }),
+            phase: Some(Phase::Ready {
+                noise,
+                yamux: Box::new(yamux),
+                peer,
+            }),
             // An earlier pump already moved this stream's Writable here.
             outputs: VecDeque::from([SessionOutput::StreamWritable { stream }]),
             writes: WriteQueue::default(),
@@ -1297,7 +1312,7 @@ mod tests {
             yamux_config: YamuxConfig::default(),
             phase: Some(Phase::Ready {
                 noise,
-                yamux: YamuxSession::new(YamuxRole::Client),
+                yamux: Box::new(YamuxSession::new(YamuxRole::Client)),
                 peer,
             }),
             outputs: VecDeque::new(),
