@@ -260,4 +260,13 @@ pub trait TcpProvider {
     fn local_addresses(&self) -> Vec<Multiaddr> {
         Vec::new()
     }
+
+    /// A counter that advances whenever [`local_addresses`](Self::local_addresses)
+    /// may report something different, or `None` (the default) when the
+    /// provider cannot tell. See `Transport::local_addresses_revision`: a
+    /// provider whose wildcard listener follows interface addresses must
+    /// advance it when those move, not only on a new `listen`.
+    fn local_addresses_revision(&self) -> Option<u64> {
+        None
+    }
 }

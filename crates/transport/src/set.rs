@@ -465,6 +465,17 @@ impl Transport for TransportSet {
             .collect()
     }
 
+    /// The members' counters added up, plus the member count: members are
+    /// only ever added and each counter only advances, so the sum moves
+    /// whenever any member's addresses may have. `None` as soon as one
+    /// member cannot tell.
+    fn local_addresses_revision(&self) -> Option<u64> {
+        self.members.iter().try_fold(
+            u64::try_from(self.members.len()).unwrap_or(u64::MAX),
+            |sum, member| Some(sum.wrapping_add(member.transport.local_addresses_revision()?)),
+        )
+    }
+
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         self.members
             .iter()

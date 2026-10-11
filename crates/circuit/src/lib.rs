@@ -1062,6 +1062,10 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         self.inner.local_addresses()
     }
 
+    fn local_addresses_revision(&self) -> Option<u64> {
+        self.inner.local_addresses_revision()
+    }
+
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         self.inner.active_inbound_connection_sources()
     }

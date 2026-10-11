@@ -778,6 +778,47 @@ mod provider {
         );
     }
 
+    /// The host reconfigures the shared interface directly, so the
+    /// provider has to notice a moved address itself: a wildcard listener's
+    /// revision moves with the interface, and nothing else moves it.
+    #[test]
+    fn a_wildcard_listener_revision_follows_the_interface() {
+        let wire = Wire::new();
+        let mut device = wire.dialer_device();
+        let mut iface = Interface::new(
+            Config::new(HardwareAddress::Ip),
+            &mut device,
+            Instant::from_millis(0),
+        );
+        iface.update_ip_addrs(|addrs| addrs.push("192.168.1.1/24".parse().unwrap()).unwrap());
+        let mut provider = SmoltcpTcpProvider::new(device, iface, SmoltcpConfig::default());
+        let stack = provider.stack();
+
+        let unbound = provider.local_addresses_revision();
+        provider
+            .listen(&addr("/ip4/0.0.0.0/tcp/4001"))
+            .expect("binds the wildcard");
+        let listening = provider.local_addresses_revision();
+        assert_ne!(listening, unbound, "a new listener moves the revision");
+        assert_eq!(
+            provider.local_addresses_revision(),
+            listening,
+            "an unchanged interface leaves it alone"
+        );
+
+        stack.borrow_mut().interface.update_ip_addrs(|addrs| {
+            addrs.push("10.0.0.1/8".parse().unwrap()).unwrap();
+        });
+        let moved = provider.local_addresses_revision();
+        assert_ne!(moved, listening, "a new interface address moves it");
+        assert!(
+            provider
+                .local_addresses()
+                .contains(&addr("/ip4/10.0.0.1/tcp/4001"))
+        );
+        assert_eq!(provider.local_addresses_revision(), moved);
+    }
+
     #[test]
     fn listening_twice_on_one_port_is_refused() {
         let mut provider = lone_provider(SmoltcpConfig::default());
