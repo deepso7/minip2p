@@ -471,11 +471,18 @@ impl QuicConnection {
     }
 
     /// The engine lost the connection; `Closed` follows once it drains.
+    ///
+    /// Orderly closes report no `Error`, and neither do an idle timeout or a
+    /// stateless reset of an established connection: those are routine ends
+    /// that the swarm would otherwise surface as errors. While handshaking
+    /// every reason is reported, so a failed dial carries it.
     fn on_lost(&mut self, reason: &ConnectionError, events: &mut Vec<TransportEvent>) {
+        let established = self.state == ConnectionState::Connected;
         let orderly = match reason {
             ConnectionError::LocallyClosed => true,
             ConnectionError::ApplicationClosed(close) => close.error_code == VarInt::from_u32(0),
             ConnectionError::ConnectionClosed(close) => u64::from(close.error_code) == 0,
+            ConnectionError::TimedOut | ConnectionError::Reset => established,
             _ => false,
         };
         if !orderly {
