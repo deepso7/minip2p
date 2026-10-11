@@ -447,7 +447,17 @@ fn a_stop_after_stream_closed_still_drops_its_queued_writes() {
     );
 
     peer.stop(raw, 3);
-    await_peer_reset(&mut server, &mut peer);
+    // Like `await_peer_reset`, but keeping every event the stop produces.
+    let start = Instant::now();
+    while peer.conn().stats().frame_rx.reset_stream == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the peer never saw RESET_STREAM"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        events.extend(server.poll(now()).expect("poll"));
+        peer.pump();
+    }
     events.extend(server.poll(now()).expect("poll"));
     assert_eq!(server.connections[&id].pending_write_bytes(), 0);
     let after_close: Vec<_> = stream_events(&events, raw)
