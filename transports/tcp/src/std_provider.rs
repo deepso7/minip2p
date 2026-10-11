@@ -1,4 +1,4 @@
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -142,8 +142,6 @@ struct Socket {
     token: Token,
     remote: Multiaddr,
     phase: Phase,
-    /// Set by a readiness event, cleared by reading to `WouldBlock`.
-    readable: bool,
     /// Set by a readiness event, cleared by a write the socket did not take
     /// whole.
     writable: bool,
@@ -205,6 +203,12 @@ pub struct StdTcpProvider {
     waker: Arc<Waker>,
     listeners: BTreeMap<usize, Listener>,
     sockets: BTreeMap<SocketHandle, Socket>,
+    /// Sockets a readiness event marked readable, until reading reaches
+    /// `WouldBlock`. Kept apart from `sockets` so a poll and a wait visit only
+    /// these rather than every socket.
+    readable: BTreeSet<SocketHandle>,
+    /// Sockets still in [`Phase::Connecting`], which every poll re-checks.
+    connecting: BTreeSet<SocketHandle>,
     /// Produced by servicing sockets, drained by the next `poll`.
     ready: VecDeque<TcpEvent>,
     /// Shared between listener tokens and socket handles, so one registration
@@ -243,6 +247,8 @@ impl StdTcpProvider {
             waker,
             listeners: BTreeMap::new(),
             sockets: BTreeMap::new(),
+            readable: BTreeSet::new(),
+            connecting: BTreeSet::new(),
             ready: VecDeque::new(),
             next_id: 1,
             read_buffer: vec![0; READ_CHUNK],
@@ -335,7 +341,9 @@ impl StdTcpProvider {
                 // every poll regardless.
                 continue;
             };
-            socket.readable |= readable;
+            if readable {
+                self.readable.insert(handle);
+            }
             if writable {
                 socket.writable = true;
                 if matches!(socket.phase, Phase::Open) {
@@ -423,6 +431,9 @@ impl StdTcpProvider {
             .register(&mut stream, token, Interest::READABLE)
             .map_err(|error| io_error("registering an accepted stream", &error))?;
         let handle = SocketHandle::new(token.0 as u64);
+        // Data may have arrived with the connection, before any edge this
+        // registration could report.
+        self.readable.insert(handle);
         self.sockets.insert(
             handle,
             Socket {
@@ -430,7 +441,6 @@ impl StdTcpProvider {
                 token,
                 remote: remote.clone(),
                 phase: Phase::Open,
-                readable: true,
                 // Optimistic: the first write that is refused is what turns the
                 // interest on, and until then there is nothing to wait for.
                 writable: true,
@@ -478,6 +488,7 @@ impl StdTcpProvider {
         };
 
         socket.phase = Phase::Open;
+        self.connecting.remove(&handle);
         socket.remote = socket_addr_to_multiaddr(peer);
         let remote = socket.remote.clone();
         // Connect completion was the only reason to watch writability.
@@ -495,7 +506,13 @@ impl StdTcpProvider {
             let Some(socket) = self.sockets.get_mut(&handle) else {
                 return;
             };
-            if !socket.readable || socket.read_closed || !matches!(socket.phase, Phase::Open) {
+            if !self.readable.contains(&handle) || !matches!(socket.phase, Phase::Open) {
+                // A connecting socket keeps its mark for once it is open.
+                return;
+            }
+            if socket.read_closed {
+                // Nothing more will be read, whatever readiness says.
+                self.readable.remove(&handle);
                 return;
             }
             if budget == 0 {
@@ -509,7 +526,7 @@ impl StdTcpProvider {
             match socket.stream.read(&mut self.read_buffer) {
                 Ok(0) => {
                     socket.read_closed = true;
-                    socket.readable = false;
+                    self.readable.remove(&handle);
                     self.ready
                         .push_back(TcpEvent::RemoteWriteClosed { socket: handle });
                     self.retire_if_finished(handle);
@@ -517,7 +534,7 @@ impl StdTcpProvider {
                 }
                 Ok(read) => {
                     let Some(data) = self.read_buffer.get(..read).map(ToOwned::to_owned) else {
-                        socket.readable = false;
+                        self.readable.remove(&handle);
                         return;
                     };
                     self.ready.push_back(TcpEvent::Received {
@@ -526,7 +543,7 @@ impl StdTcpProvider {
                     });
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    socket.readable = false;
+                    self.readable.remove(&handle);
                     return;
                 }
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
@@ -564,6 +581,8 @@ impl StdTcpProvider {
         let Some(mut socket) = self.sockets.remove(&handle) else {
             return;
         };
+        self.readable.remove(&handle);
+        self.connecting.remove(&handle);
         if let Err(error) = self.poll.registry().deregister(&mut socket.stream) {
             // The stream is about to drop, which releases the registration too.
             drop(error);
@@ -627,6 +646,7 @@ impl TcpProvider for StdTcpProvider {
             .map_err(|error| io_error("registering a stream", &error))?;
 
         let handle = SocketHandle::new(token.0 as u64);
+        self.connecting.insert(handle);
         self.sockets.insert(
             handle,
             Socket {
@@ -634,7 +654,6 @@ impl TcpProvider for StdTcpProvider {
                 token,
                 remote: socket_addr_to_multiaddr(target),
                 phase: Phase::Connecting,
-                readable: false,
                 writable: false,
                 // Writability is how a connect reports that it finished, so
                 // this one starts watching and stops once it has.
@@ -706,6 +725,8 @@ impl TcpProvider for StdTcpProvider {
     }
 
     fn abort(&mut self, socket: SocketHandle) {
+        self.readable.remove(&socket);
+        self.connecting.remove(&socket);
         if let Some(mut entry) = self.sockets.remove(&socket) {
             match self.poll.registry().deregister(&mut entry.stream) {
                 Ok(()) => {}
@@ -728,8 +749,12 @@ impl TcpProvider for StdTcpProvider {
         self.absorb_readiness(Duration::ZERO)?;
         self.accept_all();
 
-        for handle in self.sockets.keys().copied().collect::<Vec<_>>() {
+        // Only sockets with something to do. Connects settle first, so a
+        // stream's `Connected` still precedes the bytes read behind it.
+        for handle in self.connecting.iter().copied().collect::<Vec<_>>() {
             self.settle_connect(handle);
+        }
+        for handle in self.readable.iter().copied().collect::<Vec<_>>() {
             self.read_all(handle);
         }
         Ok(self.ready.drain(..).collect())
@@ -751,10 +776,7 @@ impl BlockingTcpProvider for StdTcpProvider {
             // the race against the waiter.
             return WaitOutcome::Interrupted;
         }
-        if !self.ready.is_empty()
-            || self.deferred_work
-            || self.sockets.values().any(|socket| socket.readable)
-        {
+        if !self.ready.is_empty() || self.deferred_work || !self.readable.is_empty() {
             // Sockets still hold bytes this provider has not handed over.
             // Readiness will not mention them again, so parking would strand
             // them.
