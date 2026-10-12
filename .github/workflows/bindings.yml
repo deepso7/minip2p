@@ -23,8 +23,6 @@ jobs:
         with:
           node-version: "24.20.0"
       - uses: pnpm/action-setup@v6
-        with:
-          version: "12.11.2"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
