@@ -516,14 +516,22 @@ impl Prober {
             .values()
             .filter(|vote| vote.public_addrs.is_empty())
             .count();
-        let (new, addrs) = if !confirmed.is_empty() {
-            (ReachabilityState::Public, confirmed)
+        let (new, addrs) = if self.votes.len() < threshold {
+            (ReachabilityState::Unknown, Vec::new())
+        } else if !confirmed.is_empty() {
+            // Addresses already confirmed stay unless a quorum drops them,
+            // then come the newly confirmed ones.
+            let mut addrs = self.held_addrs(threshold);
+            for addr in confirmed {
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+            }
+            (ReachabilityState::Public, addrs)
         } else if private_votes >= threshold {
             (ReachabilityState::Private, Vec::new())
-        } else if self.votes.len() < threshold {
-            (ReachabilityState::Unknown, Vec::new())
         } else {
-            self.held_verdict(private_votes)
+            self.held_verdict(threshold, private_votes)
         };
         if new == self.verdict {
             if new == ReachabilityState::Public && addrs != self.public_addrs {
@@ -542,23 +550,35 @@ impl Prober {
         true
     }
 
-    /// The verdict, and its addresses, held without a quorum either way: only
-    /// what some live vote still supports. A public verdict keeps the
-    /// confirmed addresses a live vote still names, a private one needs a
-    /// live private vote; with nothing left it lapses to Unknown.
-    fn held_verdict(&self, private_votes: usize) -> (ReachabilityState, Vec<Multiaddr>) {
+    /// The confirmed addresses no quorum of live votes has since left out.
+    /// Like the verdict, an address needs a quorum to drop, so one server
+    /// changing its answer cannot withdraw it.
+    fn held_addrs(&self, threshold: usize) -> Vec<Multiaddr> {
+        self.public_addrs
+            .iter()
+            .filter(|addr| {
+                self.votes
+                    .values()
+                    .filter(|vote| !vote.public_addrs.contains(addr))
+                    .count()
+                    < threshold
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The verdict, and its addresses, held without a quorum either way. A
+    /// public verdict keeps its [held](Self::held_addrs) addresses and a
+    /// private one needs a live private vote; with nothing left it lapses
+    /// to Unknown.
+    fn held_verdict(
+        &self,
+        threshold: usize,
+        private_votes: usize,
+    ) -> (ReachabilityState, Vec<Multiaddr>) {
         match self.verdict {
             ReachabilityState::Public => {
-                let held: Vec<Multiaddr> = self
-                    .public_addrs
-                    .iter()
-                    .filter(|addr| {
-                        self.votes
-                            .values()
-                            .any(|vote| vote.public_addrs.contains(addr))
-                    })
-                    .cloned()
-                    .collect();
+                let held = self.held_addrs(threshold);
                 if held.is_empty() {
                     (ReachabilityState::Unknown, held)
                 } else {

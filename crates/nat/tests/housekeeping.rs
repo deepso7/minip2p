@@ -494,46 +494,48 @@ fn a_settled_verdict_lapses_to_unknown_once_its_votes_expire() {
 }
 
 #[test]
-fn a_confirmed_address_is_dropped_once_no_live_vote_names_it() {
-    let mut hk = build(ReservationPolicy::Never, 0, 4);
-    let (x, y, z) = (
-        maddr(LISTEN_ADDR),
-        maddr(OUR_OBSERVED_ADDR),
-        maddr("/ip4/203.0.113.78/udp/4001/quic-v1"),
+fn a_confirmed_address_needs_a_quorum_to_be_withdrawn() {
+    let mut hk = build(ReservationPolicy::Never, 0, 3);
+    let (a, b) = (maddr(LISTEN_ADDR), maddr(OUR_OBSERVED_ADDR));
+    hk.agent.set_listen_addrs(&[a.clone(), b.clone()]);
+    let both = [a.clone(), b.clone()];
+    assert!(hk.probe(Answer::Public(&both), 0).1.is_empty());
+    assert!(hk.probe(Answer::Public(&both), 6_000).1.is_empty());
+    let (_, events) = hk.probe(Answer::Public(&both), 12_000);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::ReachabilityChanged { confirmed_addrs, .. }]
+                if *confirmed_addrs == both
+        ),
+        "{events:?}"
     );
-    hk.agent
-        .set_listen_addrs(&[x.clone(), y.clone(), z.clone()]);
-    let only = |addr: &minip2p_core::Multiaddr| std::slice::from_ref(addr).to_vec();
-    assert!(hk.probe(Answer::Public(&only(&x)), 0).1.is_empty());
-    assert!(hk.probe(Answer::Public(&only(&x)), 6_000).1.is_empty());
-    assert_eq!(hk.probe(Answer::Public(&only(&x)), 12_000).1.len(), 1);
 
-    // Three live votes, none a quorum, and the last vote for `x` (cast at
-    // 12_002ms) expires at 912_002ms. Three votes stay live past it (the
-    // oldest, for `y`, until 1_002_102ms), so only the lost support for `x`
-    // can end the verdict.
-    let mut events = Vec::new();
-    events.extend(hk.probe(Answer::Public(&only(&y)), 102_100).1);
-    events.extend(hk.probe(Answer::Public(&only(&z)), 192_200).1);
-    events.extend(hk.probe(Answer::DialError, 282_300).1);
-    assert!(events.is_empty(), "{events:?}");
-    assert_eq!(hk.agent.reachability(), ReachabilityState::Public);
-    assert_eq!(
-        hk.agent.next_deadline(at(282_400)),
-        Some(Deadline::from_millis(372_302)),
-        "the next probe comes before the vote expiry"
+    // One, then two servers leave `b` out: it stays advertised.
+    let only_a = std::slice::from_ref(&a);
+    assert!(hk.probe(Answer::Public(only_a), 17_100).1.is_empty());
+    assert!(hk.probe(Answer::Public(only_a), 107_200).1.is_empty());
+    // The third makes a quorum without it.
+    let (_, events) = hk.probe(Answer::Public(only_a), 197_300);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::PublicAddressesChanged { addrs }] if *addrs == vec![a.clone()]
+        ),
+        "{events:?}"
     );
-    for round in 0..7 {
-        events.extend(hk.probe(Answer::DialRefused, 372_400 + round * 90_100).1);
-    }
+
+    // Likewise a quorum of private votes, not one, ends the verdict.
+    assert!(hk.probe(Answer::DialError, 287_400).1.is_empty());
+    assert!(hk.probe(Answer::DialError, 377_500).1.is_empty());
+    let (_, events) = hk.probe(Answer::DialError, 467_600);
     assert!(
         matches!(
             events.as_slice(),
             [NatEvent::ReachabilityChanged {
-                old: ReachabilityState::Public,
-                new: ReachabilityState::Unknown,
-                confirmed_addrs,
-            }] if confirmed_addrs.is_empty()
+                new: ReachabilityState::Private,
+                ..
+            }]
         ),
         "{events:?}"
     );
