@@ -8,8 +8,7 @@ use minip2p_core::{PeerAddr, Protocol};
 use minip2p_platform::{Deadline, Now};
 use minip2p_quic::{QuicLimits, QuicNodeConfig, QuicTransport, STREAM_RECEIVE_WINDOW};
 use minip2p_transport::{
-    BlockingTransport, Bytes, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,
-    TransportEvent, WaitOutcome,
+    Bytes, ConnectionId, ConnectionToken, StreamId, Transport, TransportError, TransportEvent,
 };
 
 mod common;
@@ -1148,11 +1147,6 @@ fn events_buffered_outside_poll_report_as_due_work() {
         deadline.is_expired_at(Now::from_millis(0)),
         "a buffered event is due on any timeline, got {deadline:?}"
     );
-    assert_eq!(
-        transport.wait_for_input(std::time::Duration::ZERO),
-        WaitOutcome::Ready,
-        "wait_for_input must not park while an event is buffered"
-    );
 
     // And the event really is there to collect.
     let events = transport.poll(common::now()).expect("poll");
@@ -1164,15 +1158,15 @@ fn events_buffered_outside_poll_report_as_due_work() {
     );
 
     // Once drained, the idle transport goes back to reporting no work.
-    assert_eq!(
-        transport.wait_for_input(std::time::Duration::ZERO),
-        WaitOutcome::TimedOut,
+    assert!(
+        transport
+            .next_deadline()
+            .is_none_or(|deadline| !deadline.is_expired_at(common::now())),
         "a drained, idle transport must be free to park"
     );
 }
 
-/// The dual-stack endpoint does not delegate to the per-family
-/// `wait_for_input`, so it needs the same guarantee wired up separately.
+/// The same guarantee with an event buffered on either family's socket.
 #[test]
 fn dual_stack_endpoint_reports_buffered_events_as_due_work() {
     let mut endpoint =
@@ -1190,11 +1184,6 @@ fn dual_stack_endpoint_reports_buffered_events_as_due_work() {
     assert!(
         deadline.is_expired_at(Now::from_millis(0)),
         "a buffered event is due on any timeline, got {deadline:?}"
-    );
-    assert_eq!(
-        endpoint.wait_for_input(std::time::Duration::ZERO),
-        WaitOutcome::Ready,
-        "wait_for_input must not park while either family has an event buffered"
     );
 }
 

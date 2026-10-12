@@ -15,11 +15,11 @@ use std::time::{Duration, Instant};
 use bytes::BytesMut;
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_platform::{Deadline, Now};
+use minip2p_transport::mio::{self, Interest, Registry, Waker, event::Event};
 use minip2p_transport::{
-    BlockingTransport, Bytes, ConnectionEndpoint, ConnectionId, ConnectionNamespace, StreamId,
-    Transport, TransportError, TransportEvent, WaitHandle, WaitOutcome,
+    Bytes, ConnectionEndpoint, ConnectionId, ConnectionNamespace, PollSource, StreamId,
+    TokenSpace, Transport, TransportError, TransportEvent,
 };
-use mio::{Events, Interest, Poll, Token, Waker};
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn_proto::{
     ClientConfig, ConnectionHandle, DatagramEvent, EndpointConfig, IdleTimeout, Incoming,
@@ -73,14 +73,11 @@ const SERVER_NAME: &str = "l";
 ///
 /// Bounding the drain keeps a packet flood from starving the connection
 /// timers (loss recovery, idle timeouts) that only run after the recv loop.
-/// A batch that hits the bound reports `Deadline::IMMEDIATE`, and
-/// `wait_for_input` reports leftover packets as ready, so the driver polls
-/// again at once.
+/// A batch that hits the bound reports `Deadline::IMMEDIATE`, so the driver
+/// polls again at once: no fresh readiness edge will announce the leftovers.
 const MAX_DATAGRAMS_PER_POLL: usize = 128;
 /// Largest UDP payload a single datagram can carry.
 const RECV_BUFFER_SIZE: usize = 65_535;
-/// The [`Waker`]'s token; sockets are registered from `Token(1)` up.
-const INTERRUPT_TOKEN: Token = Token(0);
 
 /// Parses a QUIC multiaddr into (host protocol, port), validating the /host/udp/port/quic-v1 shape.
 fn extract_quic_host_and_port(
@@ -272,9 +269,11 @@ fn tls_config_error(error: impl std::fmt::Display) -> TransportError {
 pub struct QuicTransport {
     /// The sockets, IPv4 first, with their per-socket state.
     sockets: Sockets,
-    /// One poll over every socket and a waker, so a wait blocks on either
-    /// family at once without consuming a datagram.
-    readiness: ReadinessWait,
+    /// Clones of the sockets registered with the host's shared poll, once
+    /// attached. Every poll reads every socket until `WouldBlock` (or its
+    /// receive bound, which reports itself as due now), so readiness only
+    /// has to wake the host.
+    registered: Vec<mio::net::UdpSocket>,
     /// The engine's endpoint: routes datagrams to connections by connection
     /// id and answers what no connection owns.
     endpoint: quinn_proto::Endpoint,
@@ -315,154 +314,6 @@ pub struct QuicTransport {
     /// `next_deadline` maps engine timeouts onto the host's timeline. `None`
     /// until the first `poll`.
     clock: Option<(Now, Instant)>,
-}
-
-/// One mio [`Poll`] watching one or more UDP sockets and a [`Waker`].
-///
-/// Every registration is edge-triggered, so a harvest that finds nothing
-/// leaves the poll's own fd unreadable: that is what lets an enclosing
-/// level-triggered `poll(2)` block on it (see
-/// [`BlockingTransport::readiness_fd`]). Socket readiness itself is not kept
-/// here; [`wait_for_sockets`] asks the sockets instead.
-struct ReadinessWait {
-    poll: Poll,
-    events: Events,
-    _sockets: Vec<mio::net::UdpSocket>,
-    waker: Arc<Waker>,
-    /// Polls that could block (a non-zero timeout).
-    #[cfg(test)]
-    blocking_waits: usize,
-}
-
-impl ReadinessWait {
-    fn new(sockets: &[&UdpSocket]) -> std::io::Result<Self> {
-        let poll = Poll::new()?;
-        let mut registered = Vec::with_capacity(sockets.len());
-        for (index, socket) in sockets.iter().enumerate() {
-            let mut clone = mio::net::UdpSocket::from_std(socket.try_clone()?);
-            poll.registry()
-                .register(&mut clone, Token(index + 1), Interest::READABLE)?;
-            registered.push(clone);
-        }
-        let waker = Arc::new(Waker::new(poll.registry(), INTERRUPT_TOKEN)?);
-        Ok(Self {
-            poll,
-            events: Events::with_capacity(sockets.len() + 1),
-            _sockets: registered,
-            waker,
-            #[cfg(test)]
-            blocking_waits: 0,
-        })
-    }
-
-    /// Waits up to `timeout`, harvesting whatever the poll has queued.
-    /// `None` if the poll failed, which leaves what it holds unknown.
-    fn wait(&mut self, timeout: Duration) -> Option<WaitOutcome> {
-        #[cfg(test)]
-        {
-            self.blocking_waits += usize::from(!timeout.is_zero());
-        }
-        self.events.clear();
-        self.poll.poll(&mut self.events, Some(timeout)).ok()?;
-        Some(
-            if self
-                .events
-                .iter()
-                .any(|event| event.token() == INTERRUPT_TOKEN)
-            {
-                WaitOutcome::Interrupted
-            } else if self.events.is_empty() {
-                WaitOutcome::TimedOut
-            } else {
-                WaitOutcome::Ready
-            },
-        )
-    }
-
-    /// The selector's fd, for [`BlockingTransport::readiness_fd`].
-    ///
-    /// mio exposes it only where its selector is a real fd (epoll, kqueue,
-    /// event ports); elsewhere a set holding this transport takes turns.
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_vendor = "apple",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-        target_os = "illumos",
-        target_os = "solaris"
-    ))]
-    fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        use std::os::fd::AsFd;
-        Some(self.poll.registry().as_fd())
-    }
-
-    #[cfg(all(
-        unix,
-        not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_vendor = "apple",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly",
-            target_os = "illumos",
-            target_os = "solaris"
-        ))
-    ))]
-    fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        None
-    }
-
-    /// A handle that wakes this poll's one [`Waker`].
-    fn wait_handle(&self) -> WaitHandle {
-        let waker = Arc::clone(&self.waker);
-        WaitHandle::new(move || {
-            if let Err(error) = waker.wake() {
-                // A closed readiness source needs no further interrupt.
-                drop(error);
-            }
-        })
-    }
-}
-
-/// [`BlockingTransport::wait_for_input`] over sockets watched by `readiness`.
-///
-/// `has_input` reports buffered events or queued datagrams. The poll is
-/// harvested before it is asked, so a `TimedOut` answer never leaves stale
-/// readiness behind (the drain-before-block invariant of
-/// [`BlockingTransport::readiness_fd`]); anything that arrives after the
-/// harvest is fresh readiness, which a later wait sees.
-fn wait_for_sockets(
-    readiness: &mut ReadinessWait,
-    has_input: impl Fn() -> bool,
-    timeout: Duration,
-) -> WaitOutcome {
-    match readiness.wait(Duration::ZERO) {
-        Some(WaitOutcome::Interrupted) => return WaitOutcome::Interrupted,
-        // A failed harvest may have left readiness behind, so `TimedOut`
-        // could break the invariant; let the caller poll and ask again.
-        None => return WaitOutcome::Ready,
-        // Socket readiness is the sockets' to report, below.
-        Some(_) => {}
-    }
-    if has_input() {
-        return WaitOutcome::Ready;
-    }
-    if timeout.is_zero() {
-        return WaitOutcome::TimedOut;
-    }
-    // A failed wait is not a reason to sleep; let the caller poll.
-    readiness.wait(timeout).unwrap_or(WaitOutcome::Ready)
-}
-
-fn readiness_error(error: std::io::Error) -> TransportError {
-    TransportError::ListenFailed {
-        reason: format!("failed to create readiness poll: {error}"),
-    }
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -593,8 +444,6 @@ impl QuicTransport {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let readiness = ReadinessWait::new(&sockets.iter().map(|s| &s.udp).collect::<Vec<_>>())
-            .map_err(readiness_error)?;
 
         let host_time = Arc::new(HostTime::default());
         let tls = TlsIdentity::new(node_config.keypair(), Arc::clone(&host_time))
@@ -623,7 +472,7 @@ impl QuicTransport {
         let allow_mtu_discovery = sockets.iter().all(|socket| !socket.may_fragment());
         Ok(Self {
             sockets: Sockets::new(sockets),
-            readiness,
+            registered: Vec::new(),
             // No server config until `listen`: the endpoint accepts nothing.
             endpoint: quinn_proto::Endpoint::new(
                 Arc::new(endpoint_config),
@@ -1311,31 +1160,29 @@ impl Drop for QuicTransport {
     }
 }
 
-impl BlockingTransport for QuicTransport {
-    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        // Buffered events are work the host has yet to see; parking on socket
-        // readiness would sleep on them until an unrelated packet arrived.
-        let (events, sockets) = (&self.pending_events, &self.sockets);
-        wait_for_sockets(
-            &mut self.readiness,
-            || {
-                !events.is_empty()
-                    || sockets
-                        .iter()
-                        .any(|socket| socket::has_queued_input(&socket.udp))
-            },
-            timeout,
-        )
+/// Registers a clone of every socket, one token each. Nothing to dispatch:
+/// every poll reads every socket until `WouldBlock`, and a receive batch cut
+/// off by its bound reports itself through `next_deadline`, so an edge is
+/// never needed twice.
+impl PollSource for QuicTransport {
+    fn attach(
+        &mut self,
+        registry: Registry,
+        tokens: TokenSpace,
+        _waker: Arc<Waker>,
+    ) -> std::io::Result<()> {
+        for (index, socket) in self.sockets.iter().enumerate() {
+            let token = tokens
+                .token(index)
+                .ok_or_else(|| std::io::Error::other("no token left for a QUIC socket"))?;
+            let mut clone = mio::net::UdpSocket::from_std(socket.udp.try_clone()?);
+            registry.register(&mut clone, token, Interest::READABLE)?;
+            self.registered.push(clone);
+        }
+        Ok(())
     }
 
-    fn wait_handle(&self) -> WaitHandle {
-        self.readiness.wait_handle()
-    }
-
-    #[cfg(unix)]
-    fn readiness_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        self.readiness.fd()
-    }
+    fn dispatch(&mut self, _event: &Event) {}
 }
 
 #[cfg(test)]
@@ -1615,97 +1462,6 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_input_reports_readiness_without_consuming_input() {
-        let mut transport = loopback(QuicNodeConfig::generate());
-
-        assert_eq!(
-            transport.wait_for_input(Duration::ZERO),
-            WaitOutcome::TimedOut
-        );
-        assert_eq!(
-            transport.wait_for_input(Duration::from_millis(10)),
-            WaitOutcome::TimedOut,
-            "an idle socket must time out"
-        );
-
-        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
-        sender
-            .send_to(&[1, 2, 3], transport.local_addr())
-            .expect("send probe");
-        assert_eq!(
-            transport.wait_for_input(Duration::from_secs(2)),
-            WaitOutcome::Ready
-        );
-        // A zero budget is an accurate non-blocking probe: queued input
-        // still reports Ready.
-        assert_eq!(transport.wait_for_input(Duration::ZERO), WaitOutcome::Ready);
-
-        // Readiness polling must not consume the datagram.
-        let mut buf = [0u8; 16];
-        let (len, _) = socket(&mut transport, false)
-            .udp
-            .recv_from(&mut buf)
-            .expect("datagram must still be queued");
-        assert_eq!(&buf[..len], &[1, 2, 3]);
-    }
-
-    #[test]
-    fn wait_handle_interrupts_a_blocking_wait() {
-        let mut transport = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
-        let handle = transport.wait_handle();
-        let waiter = std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            let outcome = transport.wait_for_input(Duration::from_secs(5));
-            (outcome, started.elapsed())
-        });
-
-        std::thread::sleep(Duration::from_millis(25));
-        handle.interrupt();
-
-        let (outcome, elapsed) = waiter.join().expect("waiter");
-        assert_eq!(outcome, WaitOutcome::Interrupted);
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "interrupt took {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn dual_stack_wait_consumes_one_interrupt_once() {
-        let mut transport = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
-        let handle = transport.wait_handle();
-        let waiter = std::thread::spawn(move || {
-            let interrupted = transport.wait_for_input(Duration::from_secs(1));
-            let next = transport.wait_for_input(Duration::from_millis(10));
-            (interrupted, next)
-        });
-
-        std::thread::sleep(Duration::from_millis(25));
-        handle.interrupt();
-
-        let (interrupted, next) = waiter.join().expect("waiter");
-        assert_eq!(interrupted, WaitOutcome::Interrupted);
-        assert_eq!(
-            next,
-            WaitOutcome::TimedOut,
-            "one logical interrupt must be consumed once"
-        );
-    }
-
-    #[test]
-    fn an_idle_dual_stack_wait_is_one_blocking_poll() {
-        let mut transport = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
-        assert_eq!(
-            transport.wait_for_input(Duration::from_millis(30)),
-            WaitOutcome::TimedOut
-        );
-        assert_eq!(
-            transport.readiness.blocking_waits, 1,
-            "both families wait in one poll, not in slices"
-        );
-    }
-
-    #[test]
     fn explicit_dual_stack_wildcards_can_share_one_port() {
         let reservation = UdpSocket::bind("0.0.0.0:0").expect("reserve port");
         let port = reservation.local_addr().expect("reserved addr").port();
@@ -1749,71 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn dual_stack_zero_timeout_wait_reports_queued_input_on_either_family() {
-        for ipv6 in [false, true] {
-            let mut transport =
-                QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
-            deliver(&mut transport, ipv6);
-            assert_eq!(
-                transport.wait_for_input(Duration::ZERO),
-                WaitOutcome::Ready,
-                "ipv6: {ipv6}"
-            );
-        }
-    }
-
-    /// The drain-before-block invariant of `BlockingTransport::readiness_fd`:
-    /// once `poll` has taken the input, a zero-timeout wait answers
-    /// `TimedOut` and leaves the fd unreadable, so an enclosing `poll(2)` can
-    /// block on it. Linux epoll re-checks a stale entry when its fd is polled,
-    /// so this mainly guards kqueue, which does not.
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_vendor = "apple",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-        target_os = "illumos",
-        target_os = "solaris"
-    ))]
-    #[test]
-    fn a_zero_timeout_wait_that_times_out_leaves_the_readiness_fd_unreadable() {
-        /// Whether `fd` reads as ready right now, without consuming anything.
-        fn fd_is_readable(fd: std::os::fd::BorrowedFd<'_>) -> bool {
-            use rustix::event::{PollFd, PollFlags, Timespec, poll};
-            let mut fds = [PollFd::from_borrowed_fd(fd, PollFlags::IN)];
-            poll(&mut fds, Some(&Timespec::default())).expect("poll readiness fd") > 0
-        }
-
-        let cases = [
-            (loopback(QuicNodeConfig::generate()), false),
-            (
-                QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind"),
-                false,
-            ),
-            (
-                QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind"),
-                true,
-            ),
-        ];
-        for (mut transport, ipv6) in cases {
-            deliver(&mut transport, ipv6);
-            assert_eq!(transport.wait_for_input(Duration::ZERO), WaitOutcome::Ready);
-            transport.poll(Now::from_millis(0)).expect("poll");
-            assert_eq!(
-                transport.wait_for_input(Duration::ZERO),
-                WaitOutcome::TimedOut,
-                "ipv6 {ipv6}: input was consumed"
-            );
-            let fd = transport.readiness_fd().expect("quic exposes its selector");
-            assert!(!fd_is_readable(fd), "ipv6 {ipv6}: readiness left on the fd");
-        }
-    }
-
-    #[test]
-    fn dual_stack_wait_wakes_promptly_for_a_datagram_on_either_family() {
+    fn an_attached_dual_stack_transport_wakes_a_shared_poll_for_either_family() {
         // The best of three is held to the bound, so one descheduled thread
         // on a busy runner cannot fail it.
         for ipv6 in [false, true] {
@@ -1821,6 +1513,8 @@ mod tests {
             for delay_ms in [3, 13, 23] {
                 let mut transport =
                     QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
+                let mut poll = minip2p_transport::SharedPoll::new().expect("poll");
+                poll.attach(&mut transport).expect("attach");
                 let target = loopback_addr(ipv6, socket(&mut transport, ipv6).local_addr.port());
                 let sender = std::thread::spawn(move || {
                     let sender = UdpSocket::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })
@@ -1831,17 +1525,38 @@ mod tests {
                     sent
                 });
 
-                let outcome = transport.wait_for_input(Duration::from_secs(5));
+                let events = poll
+                    .harvest(&mut transport, Duration::from_secs(5))
+                    .expect("harvest");
                 let woke = std::time::Instant::now();
                 let sent = sender.join().expect("sender thread");
 
-                assert_eq!(outcome, WaitOutcome::Ready, "ipv6: {ipv6}");
+                assert!(events > 0, "ipv6 {ipv6}: woke without readiness");
                 latencies.push(woke.saturating_duration_since(sent));
+                // Readiness consumed nothing: the datagram is still there.
+                assert!(socket::has_queued_input(&socket(&mut transport, ipv6).udp));
             }
             let best = latencies.iter().min().expect("three trials");
             assert!(
                 *best < Duration::from_millis(5),
                 "ipv6 {ipv6}: woke after {latencies:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unattached_transport_reads_every_socket_when_polled() {
+        // A `SwarmCore` host never attaches; polling alone must still drain
+        // both families.
+        let mut transport = QuicTransport::dual_stack(QuicNodeConfig::generate()).expect("bind");
+        for ipv6 in [false, true] {
+            deliver(&mut transport, ipv6);
+        }
+        transport.poll(Now::from_millis(0)).expect("poll");
+        for ipv6 in [false, true] {
+            assert!(
+                !socket::has_queued_input(&socket(&mut transport, ipv6).udp),
+                "ipv6 {ipv6}: left unread"
             );
         }
     }

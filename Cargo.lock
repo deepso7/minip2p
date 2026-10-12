@@ -1421,6 +1421,7 @@ dependencies = [
  "minip2p-platform",
  "minip2p-secure-mux",
  "minip2p-smoltcp",
+ "minip2p-swarm",
  "minip2p-transport",
  "mio",
  "socket2",
