@@ -178,8 +178,9 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         self.external_addresses_revision
     }
 
-    /// The addresses Identify advertised at the last [`poll`](Self::poll):
-    /// the transport's bound set plus the external addresses.
+    /// The address snapshot from the last [`poll`](Self::poll): the
+    /// transport's bound set plus the external addresses. Identify
+    /// advertises it without wildcard hosts, which stay here.
     pub fn local_addresses(&self) -> &[Multiaddr] {
         self.state.local_addresses()
     }
