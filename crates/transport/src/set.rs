@@ -515,6 +515,13 @@ mod polling {
     /// of the set's own space, so an event's token says which member it is
     /// for without a lookup table. Members inserted after the set is
     /// attached are attached as they join.
+    ///
+    /// # Errors
+    ///
+    /// A member that fails to attach rolls back its own registrations, but
+    /// members attached before it stay registered, and the set records no
+    /// attachment. Drop a set whose attach failed rather than attach it
+    /// again: a retry would find those members already registered.
     impl PollSource for TransportSet {
         fn attach(
             &mut self,
