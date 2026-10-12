@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 
 use minip2p_core::{Bytes, PeerId, uvarint_len};
 use minip2p_identity::Ed25519Keypair;
+use minip2p_platform::{Deadline, Now};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::StreamId;
 
@@ -875,8 +876,9 @@ impl GossipsubAgent {
         self.events.pop_front()
     }
 
-    /// Milliseconds until the next due timer.
-    pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
+    /// When the next timer is due, as an absolute monotonic deadline; `None`
+    /// when nothing is armed. Overdue timers keep their past value.
+    pub fn next_deadline(&self, _now: Now) -> Option<Deadline> {
         let mut due = self.next_heartbeat_ms;
         if let Some(expiry) = self.seen.next_expiry() {
             due = Some(due.map_or(expiry, |current| current.min(expiry)));
@@ -887,7 +889,7 @@ impl GossipsubAgent {
                 due = Some(due.map_or(expiry, |current| current.min(expiry)));
             }
         }
-        due.map(|deadline| deadline.saturating_sub(now_ms))
+        due.map(Deadline::from_millis)
     }
 
     /// Whether this agent owns a stream lifecycle.

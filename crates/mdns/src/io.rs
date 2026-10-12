@@ -3,6 +3,8 @@
 use alloc::string::String;
 use core::net::{IpAddr, SocketAddr};
 
+use minip2p_platform::{Deadline, Now};
+
 use crate::{InterfaceId, InterfaceSnapshot, IpNet, MdnsAction};
 
 /// The largest datagram mDNS will accept.
@@ -182,12 +184,15 @@ pub trait MdnsIo {
         Ok(())
     }
 
-    /// How long the host may idle before this needs [`poll`](Self::poll)
-    /// again, in milliseconds from `now_ms`.
+    /// When this next needs [`poll`](Self::poll), as an absolute deadline on
+    /// the host's monotonic timeline -- the same one `now` and every `poll`
+    /// reading come from.
     ///
     /// A stack of its own has timers -- retransmits, group memberships to
     /// renew -- that no amount of mDNS quiet makes unnecessary, and a
-    /// datagram it already holds in a socket is owed a tick now. `None`, the
+    /// datagram it already holds in a socket is owed a tick now (a deadline
+    /// of `now`). A carrier whose timers count relative delays converts them
+    /// itself, with [`Now::deadline_after`], which saturates. `None`, the
     /// default, means the carrier needs nothing on a timer, which is the
     /// truth for a socket the operating system services: its readiness is the
     /// host's poll's business.
@@ -195,8 +200,8 @@ pub trait MdnsIo {
     /// What no carrier deadline can cover is input still in a device the
     /// stack has not polled. A host driving an in-process stack wakes on
     /// device ingress as well as on these deadlines.
-    fn next_deadline(&self, now_ms: u64) -> Option<u64> {
-        let _ = now_ms;
+    fn next_deadline(&self, now: Now) -> Option<Deadline> {
+        let _ = now;
         None
     }
 }
@@ -228,8 +233,8 @@ impl<I: MdnsIo + ?Sized> MdnsIo for alloc::boxed::Box<I> {
         (**self).poll(now_ms)
     }
 
-    fn next_deadline(&self, now_ms: u64) -> Option<u64> {
-        (**self).next_deadline(now_ms)
+    fn next_deadline(&self, now: Now) -> Option<Deadline> {
+        (**self).next_deadline(now)
     }
 }
 
@@ -323,8 +328,8 @@ mod tests {
             self.polled_at.push(now_ms);
             Ok(())
         }
-        fn next_deadline(&self, now_ms: u64) -> Option<u64> {
-            Some(now_ms + 7)
+        fn next_deadline(&self, now: Now) -> Option<Deadline> {
+            Some(now.deadline_after(7))
         }
     }
 
@@ -333,7 +338,10 @@ mod tests {
         let mut boxed: alloc::boxed::Box<dyn MdnsIo> =
             alloc::boxed::Box::new(TimedCarrier::default());
         boxed.poll(42).expect("poll");
-        assert_eq!(boxed.next_deadline(10), Some(17));
+        assert_eq!(
+            boxed.next_deadline(Now::from_millis(10)),
+            Some(Deadline::from_millis(17))
+        );
 
         let mut boxed = alloc::boxed::Box::new(TimedCarrier::default());
         MdnsIo::poll(&mut boxed, 5).expect("poll");

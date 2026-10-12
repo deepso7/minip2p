@@ -20,11 +20,11 @@ workspace = true
 diagnostics = []
 
 [dependencies]
-minip2p-platform = { path = "../../crates/platform", version = "0.8.0" }
-minip2p-transport = { path = "../../crates/transport", version = "0.8.0" }
-minip2p-identity = { path = "../../crates/identity", version = "0.8.0" }
-minip2p-core = { path = "../../crates/core", version = "0.8.0" }
-minip2p-tls = { path = "../../crates/tls", version = "0.8.0" }
+minip2p-platform = { path = "../../crates/platform", version = "0.8.2" }
+minip2p-transport = { path = "../../crates/transport", version = "0.8.2" }
+minip2p-identity = { path = "../../crates/identity", version = "0.8.2" }
+minip2p-core = { path = "../../crates/core", version = "0.8.2" }
+minip2p-tls = { path = "../../crates/tls", version = "0.8.2" }
 quinn-proto = { version = "0.11.19", default-features = false, features = [
   "rustls-ring",
 ] }

@@ -789,10 +789,9 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         if self.state.has_pending_work() {
             return Some(Deadline::IMMEDIATE);
         }
-        fold_deadlines(
-            now,
+        Deadline::earliest_opt(
             self.transport.next_deadline(),
-            self.state.next_timeout(now.monotonic_ms),
+            self.state.next_deadline(now),
         )
     }
 
@@ -935,25 +934,6 @@ fn transport_error(
     }
 }
 
-/// Folds a transport deadline together with the swarm's next protocol timer.
-///
-/// The state's next timer is reported as milliseconds *remaining*, while
-/// [`Deadline`] is an absolute point on the host's timeline, so it has to be
-/// anchored to `now` rather than used directly. Getting that wrong makes
-/// timers read as long expired once uptime exceeds the timeout, which
-/// busy-spins a blocking driver and can hang a host that sleeps for
-/// `millis_until`.
-///
-/// Split out so the unit conversion is testable without arming a real timer.
-fn fold_deadlines(
-    now: Now,
-    transport: Option<Deadline>,
-    core_remaining_ms: Option<u64>,
-) -> Option<Deadline> {
-    let core = core_remaining_ms.map(|remaining| now.deadline_after(remaining));
-    Deadline::earliest_opt(transport, core)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,6 +941,7 @@ mod tests {
     use alloc::string::ToString;
     use alloc::vec;
 
+    use crate::state::OUTBOUND_NEGOTIATION_TIMEOUT_MS;
     use minip2p_identify::IDENTIFY_PROTOCOL_ID;
     use minip2p_identity::Ed25519Keypair;
     use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
@@ -1268,56 +1249,58 @@ mod tests {
         );
     }
 
+    /// Arms a core outbound-negotiation timer due at
+    /// `now + OUTBOUND_NEGOTIATION_TIMEOUT_MS`.
+    fn arm_negotiation_timer(swarm: &mut SwarmCore<ScriptedTransport, SeqEntropy>, now: Now) {
+        swarm.state.start_outbound(
+            ConnectionId::new(1),
+            StreamId::new(1),
+            "/app/1",
+            ProtocolKind::User("/app/1".to_string()),
+            now.monotonic_ms,
+        );
+    }
+
     #[test]
-    fn core_timers_are_anchored_to_now_not_used_as_absolute() {
-        // `SwarmCore::next_timeout` reports remaining milliseconds. Using it
-        // as an absolute deadline reads as long expired once uptime exceeds
-        // the timeout, so pin the conversion at a realistic uptime where the
-        // two interpretations differ wildly.
+    fn core_timers_are_reported_at_their_absolute_due_time() {
+        // At a realistic uptime a timer armed now must be reported at
+        // now + timeout, not as an already expired small value.
         let now = Now::from_millis(3_600_000);
+        let mut swarm = swarm(Vec::new());
+        swarm.poll(now).expect("poll");
+        let due = Deadline::from_millis(3_600_000 + OUTBOUND_NEGOTIATION_TIMEOUT_MS);
+        arm_negotiation_timer(&mut swarm, now);
 
-        assert_eq!(
-            fold_deadlines(now, None, Some(500)),
-            Some(Deadline::from_millis(3_600_500)),
-            "core timers must be anchored to now"
-        );
-        assert_eq!(
-            fold_deadlines(now, None, Some(500))
-                .expect("armed")
-                .millis_until(now),
-            500,
-            "a timer 500ms out must not read as already due"
-        );
-
-        // A past-due core timer reports zero remaining, which really is due.
-        assert_eq!(fold_deadlines(now, None, Some(0)), Some(now.as_deadline()));
+        let deadline = swarm.next_deadline(now).expect("armed");
+        assert_eq!(deadline, due);
+        assert!(!deadline.is_expired_at(now), "must not read as already due");
     }
 
     #[test]
     fn next_deadline_folds_transport_and_core_timers() {
         let now = Now::from_millis(1_000);
-        let transport = Deadline::from_millis(1_400);
-
-        // Whichever needs attention first wins.
-        assert_eq!(fold_deadlines(now, Some(transport), None), Some(transport));
-        assert_eq!(
-            fold_deadlines(now, Some(transport), Some(100)),
-            Some(Deadline::from_millis(1_100)),
-            "the nearer core timer must win"
-        );
-        assert_eq!(
-            fold_deadlines(now, Some(transport), Some(900)),
-            Some(transport),
-            "the nearer transport timer must win"
-        );
-        assert_eq!(fold_deadlines(now, None, None), None);
-
-        // And the swarm reports its transport's deadline through the fold.
+        let core_due = Deadline::from_millis(1_000 + OUTBOUND_NEGOTIATION_TIMEOUT_MS);
         let mut swarm = swarm(Vec::new());
         swarm.poll(now).expect("poll");
-        assert_eq!(swarm.next_deadline(now), None);
+        assert_eq!(swarm.next_deadline(now), None, "nothing armed");
+
+        let transport = Deadline::from_millis(1_400);
         swarm.transport_mut().deadline = Some(transport);
         assert_eq!(swarm.next_deadline(now), Some(transport));
+
+        arm_negotiation_timer(&mut swarm, now);
+        assert_eq!(
+            swarm.next_deadline(now),
+            Some(transport),
+            "the nearer transport timer wins"
+        );
+
+        swarm.transport_mut().deadline = Some(Deadline::NEVER);
+        assert_eq!(
+            swarm.next_deadline(now),
+            Some(core_due),
+            "the nearer core timer wins"
+        );
     }
 
     #[test]

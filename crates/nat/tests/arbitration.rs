@@ -6,7 +6,7 @@ mod common;
 use common::*;
 
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
-use minip2p_nat::{NatConfig, NatError, NatEvent, Path};
+use minip2p_nat::{Deadline, NatConfig, NatError, NatEvent, Path};
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
@@ -99,8 +99,12 @@ fn stagger_delays_the_relay_leg() {
     assert_eq!(dial_count_for(&actions, &h.target), 0);
     assert_eq!(dial_count_for(&actions, &h.relay), 0);
 
-    // The stagger is the earliest pending deadline.
-    assert_eq!(h.agent.next_timeout(0), Some(200));
+    // The stagger is the earliest pending deadline: absolute, so it is due
+    // exactly at 200 and an overdue read reports the same past value.
+    let stagger = Some(Deadline::from_millis(200));
+    assert_eq!(h.agent.next_deadline(at(0)), stagger);
+    assert_eq!(h.agent.next_deadline(at(500)), stagger);
+    assert!(Deadline::from_millis(200).is_expired_at(at(200)));
 
     h.agent.handle_tick(at(199));
     assert!(drain_actions(&mut h.agent).is_empty());

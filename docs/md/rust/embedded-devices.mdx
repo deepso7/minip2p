@@ -109,7 +109,7 @@ loop {
 }
 ```
 
-Wake early when the network stack gets a frame or transmit capacity frees up. `PollDeadline::IMMEDIATE` means poll again without sleeping; `None` means minip2p has no timer armed, but a network interrupt must still wake the loop.
+Wake early when the network stack gets a frame or transmit capacity frees up. `Deadline::IMMEDIATE` means poll again without sleeping; `None` means minip2p has no timer armed, but a network interrupt must still wake the loop.
 
 ## Budget memory explicitly
 

@@ -14,7 +14,7 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Platform package**: A binary-only npm package (`@minip2p/node-<target>`) carrying one prebuilt Node binding binary, selected at install time through `optionalDependencies`. Holds nothing but the binary and its manifest.
 
-**Carry buffer**: The FFI driver's single event queue. Stream and connection-end events never drop and adjacent stream data coalesces; past 4096 other events it drops gossipsub messages first, then the oldest (`EventsDropped` diagnostic). The only place events wait or drop between the driver and a binding.
+**Carry buffer**: The FFI driver's single event queue. Stream and connection-end events never drop and adjacent stream data coalesces, except that a peer-opened stream, or any connection, that ends without carrying data before the binding took any of its events leaves the carry whole (an unseen connection that is replaced folds into its successor); past 4096 other events it drops gossipsub messages first, then the oldest (`EventsDropped` diagnostic). The only place events wait or drop between the driver and a binding.
 
 **Doorbell**: The coalesced, edge-triggered ready signal a binding registers with the FFI core; rung only when the carry buffer goes empty→non-empty. Replaces per-event push through the listener seam.
 
@@ -84,7 +84,13 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Receive budget**: The most unacknowledged bytes a stream will deliver to its reader. Acknowledging consumed bytes replenishes it, which is what lets the sender continue. _Avoid_: read buffer, window (the transport's own term)
 
-**Unsettled stream**: A stream whose delivered bytes are not yet all acknowledged or abandoned. It keeps its stream slot even after closing, so stream churn cannot grow retained receive data. _Avoid_: zombie stream, lingering stream
+**Unsettled stream**: A stream whose delivered bytes are not yet all acknowledged or abandoned. It keeps its stream slot even after closing, and after its connection ends, so stream churn cannot grow retained receive data. Acknowledging or abandoning its bytes still settles it after the connection is gone. _Avoid_: zombie stream, lingering stream
+
+**Unsettled connection**: A connection that has ended while some of its streams are still unsettled. It keeps its connection slot (a circuit keeps its circuit slot) until every one of those streams settles, so close-and-reconnect churn cannot grow retained receive data either; a transport whose slots are all held refuses new connections rather than forgetting what was delivered. Only its accounting and ownership survive. _Avoid_: closing connection, draining connection (draining is QUIC's own close phase)
+
+**QUIC memory budget**: The bytes one QUIC transport may commit to its connections and streams, across all its sockets. Every connection and stream holds a memory reservation against it, so the budget caps the transport's worst-case queued memory. _Avoid_: send budget, memory limit, quota
+
+**Memory reservation**: The share of a QUIC memory budget that a connection or stream holds from admission until its bytes are released, which for delivered data means acknowledged or abandoned. A connection or stream whose reservation does not fit is refused, not queued. Distinct from a relay reservation. _Avoid_: reservation (unqualified), allocation, quota
 
 **Manual acknowledgement**: A protocol registration whose stream data the application acknowledges itself (`stream_consumed`) once it has really consumed the bytes, instead of the Endpoint acknowledging data as its event is pulled. Every protocol registered through FFI uses it; the SDK acknowledges when `read()` returns a chunk or a `data` listener returns. _Avoid_: manual read, flow control mode
 

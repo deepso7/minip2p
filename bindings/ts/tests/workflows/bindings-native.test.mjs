@@ -50,8 +50,7 @@ test("weekly workflow executes the suite on native runners and musl containers",
   assert.ok(
     nativeJob.steps.some(
       ({ run, shell }) =>
-        shell === "bash" &&
-        run === "pnpm --workspace-root install --frozen-lockfile"
+        shell === "bash" && run === "pnpm install --frozen-lockfile"
     )
   );
   assert.ok(nativeJob.steps.some(({ name }) => name === "Build relay fixture"));

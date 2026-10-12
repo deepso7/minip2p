@@ -7,6 +7,7 @@ use alloc::{
 };
 
 use minip2p_core::{Multiaddr, PeerId};
+use minip2p_platform::{Deadline, Now};
 
 use crate::beacon::normalize_addr;
 use crate::{
@@ -518,8 +519,10 @@ impl PeerDiscoveryAgent {
             })
     }
 
-    /// Returns milliseconds until the next source expiry, if the book is non-empty.
-    pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
+    /// Returns when the next source expires, as an absolute monotonic
+    /// deadline; `None` when the book is empty. Overdue expiries keep their
+    /// past value.
+    pub fn next_deadline(&self, _now: Now) -> Option<Deadline> {
         self.book
             .values()
             .flat_map(|entry| {
@@ -533,7 +536,7 @@ impl PeerDiscoveryAgent {
                     .chain(entry.mdns.values().map(|record| record.expires_at_ms))
             })
             .min()
-            .map(|deadline| deadline.saturating_sub(now_ms))
+            .map(Deadline::from_millis)
     }
 
     /// Returns a deterministic peer-id-ordered snapshot of the address book.
@@ -920,13 +923,31 @@ mod tests {
         while agent.poll_event().is_some() {}
 
         let before = agent.known_peers();
-        let before_timeout = agent.next_timeout(1);
+        let before_deadline = agent.next_deadline(Now::from_millis(1));
         agent.handle_tick(1);
 
         assert_eq!(agent.known_peers(), before);
-        assert_eq!(agent.next_timeout(1), before_timeout);
+        assert_eq!(agent.next_deadline(Now::from_millis(1)), before_deadline);
         assert!(agent.poll_event().is_none());
         assert!(agent.poll_action().is_none());
+    }
+
+    #[test]
+    fn next_deadline_is_absolute_source_expiry() {
+        let config = PeerDiscoveryConfig {
+            auto_dial: false,
+            beacon_peer_ttl_ms: 100,
+            ..PeerDiscoveryConfig::default()
+        };
+        let mut agent = agent(config);
+        assert_eq!(agent.next_deadline(Now::from_millis(5)), None);
+
+        agent.observe_beacon(beacon(peer(2), vec![addr(1)]), 10);
+        let due = Deadline::from_millis(110);
+        assert_eq!(agent.next_deadline(Now::from_millis(10)), Some(due));
+        assert!(due.is_expired_at(Now::from_millis(110)));
+        // Overdue but not yet ticked: still the past expiry, not pushed out.
+        assert_eq!(agent.next_deadline(Now::from_millis(500)), Some(due));
     }
 
     #[test]

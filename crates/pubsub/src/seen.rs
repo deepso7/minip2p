@@ -36,7 +36,7 @@ pub(crate) fn seen_message_id_from_wire(id: &[u8], signed: bool) -> MessageId {
 ///
 /// `order` is append-ordered by expiry because `now_ms` is monotonic, so
 /// both GC and capacity eviction pop from the front. The cache is the
-/// agent's only timer: [`SeenCache::next_expiry`] feeds `next_timeout`.
+/// agent's only timer: [`SeenCache::next_expiry`] feeds `next_deadline`.
 #[derive(Debug, Default)]
 pub(crate) struct SeenCache {
     ids: BTreeSet<MessageId>,
