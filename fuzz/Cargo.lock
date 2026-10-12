@@ -440,6 +440,7 @@ version = "0.8.0"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
+ "minip2p-platform",
  "thiserror",
 ]
 
@@ -495,6 +496,7 @@ version = "0.8.0"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
+ "minip2p-platform",
  "thiserror",
 ]
 
@@ -542,6 +544,7 @@ version = "0.8.0"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
+ "minip2p-platform",
  "minip2p-swarm",
  "minip2p-transport",
  "thiserror",

@@ -450,7 +450,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     #[cfg(feature = "_mdns-driver")]
     pub(crate) fn shutdown_mdns(&mut self, now: Now) -> Result<(), DriverError> {
         let result = match self.mdns.as_mut() {
-            Some(mdns) => mdns.shutdown(now.monotonic_ms).map_err(mdns_error),
+            Some(mdns) => mdns.shutdown(now).map_err(mdns_error),
             None => Ok(()),
         };
         if let Some(discovery) = self.discovery.as_mut() {
@@ -524,7 +524,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         let Some(mdns) = self.mdns.as_mut() else {
             return Ok(());
         };
-        mdns.tick(now.monotonic_ms, self.core.local_addresses())
+        mdns.tick(now, self.core.local_addresses())
             .map_err(mdns_error)?;
         if self.mdns_shares_transport {
             // The carrier drives the shared interface, which may have put
@@ -618,7 +618,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         }
         #[cfg(feature = "pubsub")]
         if let Some(pubsub) = self.gossipsub.as_mut() {
-            pubsub.tick(&mut self.core, now.monotonic_ms);
+            pubsub.tick(&mut self.core, now);
         }
         self.route_nat(now);
         #[cfg(feature = "_discovery-driver")]
@@ -792,47 +792,47 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         self.core.set_external_addresses(addresses);
     }
 
-    /// Milliseconds until the Connection engine or a capability driver
-    /// next has work, if either has a timer.
-    pub(crate) fn timer_ms(&self, now: Now) -> Option<u64> {
-        let mut earliest: Option<u64> = None;
-        let mut fold = |ms: Option<u64>| {
-            if let Some(ms) = ms {
-                earliest = Some(earliest.map_or(ms, |current| current.min(ms)));
-            }
-        };
-        fold(
-            self.connect
-                .next_deadline()
-                .map(|deadline| deadline.millis_until(now)),
-        );
-        #[cfg(feature = "relay-server")]
-        fold(
+    /// When the Connection engine or a capability driver next has work, if
+    /// either has a timer.
+    pub(crate) fn driver_deadline(
+        &self,
+        #[cfg_attr(
+            not(any(
+                feature = "relay-server",
+                feature = "_nat-driver",
+                feature = "pubsub",
+                feature = "_discovery-driver",
+                feature = "_mdns-driver"
+            )),
+            expect(
+                unused_variables,
+                reason = "the connect engine's timer is already absolute"
+            )
+        )]
+        now: Now,
+    ) -> Option<Deadline> {
+        [
+            self.connect.next_deadline(),
+            #[cfg(feature = "relay-server")]
             self.relay_server
                 .as_ref()
-                .and_then(|relay_server| relay_server.agent.next_timeout(now)),
-        );
-        #[cfg(feature = "_nat-driver")]
-        fold(self.nat.as_ref().and_then(|nat| nat.next_timeout(now)));
-        #[cfg(feature = "pubsub")]
-        fold(
+                .and_then(|relay_server| relay_server.agent.next_deadline(now)),
+            #[cfg(feature = "_nat-driver")]
+            self.nat.as_ref().and_then(|nat| nat.next_deadline(now)),
+            #[cfg(feature = "pubsub")]
             self.gossipsub
                 .as_ref()
-                .and_then(|pubsub| pubsub.next_timeout(now.monotonic_ms)),
-        );
-        #[cfg(feature = "_discovery-driver")]
-        fold(
+                .and_then(|pubsub| pubsub.next_deadline(now)),
+            #[cfg(feature = "_discovery-driver")]
             self.discovery
                 .as_ref()
-                .and_then(|discovery| discovery.next_timeout(now.monotonic_ms)),
-        );
-        #[cfg(feature = "_mdns-driver")]
-        fold(
-            self.mdns
-                .as_ref()
-                .and_then(|mdns| mdns.next_timeout(now.monotonic_ms)),
-        );
-        earliest
+                .and_then(|discovery| discovery.next_deadline(now)),
+            #[cfg(feature = "_mdns-driver")]
+            self.mdns.as_ref().and_then(|mdns| mdns.next_deadline(now)),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// When the engine next needs a batch: immediately while events wait to
@@ -841,11 +841,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         if !self.events.is_empty() {
             return Some(Deadline::IMMEDIATE);
         }
-        Deadline::earliest_opt(
-            self.core.next_deadline(now),
-            self.timer_ms(now)
-                .map(|ms| Deadline::from_millis(now.monotonic_ms.saturating_add(ms))),
-        )
+        Deadline::earliest_opt(self.core.next_deadline(now), self.driver_deadline(now))
     }
 }
 

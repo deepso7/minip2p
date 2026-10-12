@@ -30,6 +30,7 @@ use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
 use minip2p_ping::{
     PING_PAYLOAD_LEN, PING_PROTOCOL_ID, PingAction, PingConfig, PingEvent, PingOutput, PingProtocol,
 };
+use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{ConnectionId, ConnectionToken, StreamId, TransportEvent};
 
 use crate::events::{SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
@@ -337,7 +338,7 @@ pub(crate) struct SwarmState {
     /// Absolute `now_ms` at which the in-flight ping to each peer becomes
     /// overdue. The ping protocol keeps its deadline bookkeeping private,
     /// so the core records its own copy whenever it forwards a successful
-    /// `SendPing`; [`SwarmState::next_timeout`] derives the earliest internal
+    /// `SendPing`; [`SwarmState::next_deadline`] derives the earliest internal
     /// timer from this map. Entries are cleared when the ping resolves
     /// (RTT measured, timeout fired, outbound stream closed, peer removed)
     /// and pruned on every tick once their deadline has passed.
@@ -698,14 +699,15 @@ impl SwarmState {
         self.actions.is_empty() && self.events.is_empty() && self.deferred_closes.is_empty()
     }
 
-    /// Returns the milliseconds from `now_ms` until the earliest internal
-    /// protocol timer is due, or `None` when no timer is armed.
+    /// Returns when the earliest internal protocol timer is due, or `None`
+    /// when no timer is armed.
     ///
     /// The internal timers are ping request timeouts, armed whenever a ping
     /// payload is in flight to a peer, and outbound negotiation deadlines.
-    /// `Some(0)` means a timer is already due and [`Self::handle_tick`]
-    /// should run now.
-    pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
+    /// Both are stored as absolute due times, so `now` is unused; an overdue
+    /// timer reports its past due time, which tells the host to run
+    /// [`Self::handle_tick`] now.
+    pub fn next_deadline(&self, _now: Now) -> Option<Deadline> {
         let negotiations = self
             .outbound_negotiators
             .values()
@@ -715,7 +717,7 @@ impl SwarmState {
             .copied()
             .chain(negotiations)
             .min()
-            .map(|due| due.saturating_sub(now_ms))
+            .map(Deadline::from_millis)
     }
 
     // -----------------------------------------------------------------------
@@ -1278,7 +1280,7 @@ impl SwarmState {
         // corresponding ping event (e.g. the stream fully closed): the tick
         // above has fired the Timeout for anything still pending at its
         // deadline, so a past-due entry can never be load-bearing anymore.
-        // Dropping it keeps `next_timeout` from reporting a stale timer.
+        // Dropping it keeps `next_deadline` from reporting a stale timer.
         self.ping_deadlines.retain(|_, due| *due > now_ms);
         self.expire_outbound_negotiations(now_ms);
     }
@@ -2974,13 +2976,31 @@ mod tests {
     }
 
     #[test]
+    fn timers_armed_near_the_end_of_time_saturate() {
+        let start = u64::MAX - 5;
+        let (mut core, _, _) = negotiating_user_stream(start);
+        let now = Now::from_millis(start);
+        assert_eq!(core.next_deadline(now), Some(Deadline::NEVER));
+
+        let peer = PeerId::from_public_key_protobuf(b"late-ping-peer");
+        setup_outbound_ping_stream(&mut core, &peer, ConnectionId::new(90), StreamId::new(4));
+        core.ping(&peer, [7; PING_PAYLOAD_LEN], start)
+            .expect("ping in flight");
+        assert_eq!(
+            core.next_deadline(now),
+            Some(Deadline::NEVER),
+            "a saturated ping deadline must not wrap to the past"
+        );
+    }
+
+    #[test]
     fn an_unanswered_outbound_negotiation_fails_at_its_deadline() {
         let start = 1_000;
         let (mut core, conn, stream) = negotiating_user_stream(start);
         let due = start + OUTBOUND_NEGOTIATION_TIMEOUT_MS;
         assert_eq!(
-            core.next_timeout(start),
-            Some(OUTBOUND_NEGOTIATION_TIMEOUT_MS)
+            core.next_deadline(Now::from_millis(start)),
+            Some(Deadline::from_millis(due))
         );
 
         core.handle_tick(due - 1);
@@ -3003,7 +3023,7 @@ mod tests {
             }),
             "the abandoned negotiation's stream is reset: {actions:?}"
         );
-        assert_eq!(core.next_timeout(due), None);
+        assert_eq!(core.next_deadline(Now::from_millis(due)), None);
 
         // The reset's own close adds nothing.
         feed(
@@ -4576,7 +4596,11 @@ mod tests {
 
         connect_again(&mut core, &peer_id, replacement, false);
         let actions = drain_actions(&mut core);
-        assert_eq!(core.next_timeout(5_000), None, "the old timer is gone");
+        assert_eq!(
+            core.next_deadline(Now::from_millis(5_000)),
+            None,
+            "the old timer is gone"
+        );
 
         // Well past the original deadline: still no timeout for the hand-over.
         core.handle_tick(20_000);
@@ -4605,8 +4629,8 @@ mod tests {
                 if *conn_id == replacement && data[..] == payload[..]
         )));
         assert_eq!(
-            core.next_timeout(20_000),
-            Some(10_001),
+            core.next_deadline(Now::from_millis(20_000)),
+            Some(Deadline::from_millis(30_001)),
             "the timeout restarts at the re-send"
         );
     }
@@ -4662,7 +4686,7 @@ mod tests {
             "only Identify opens; a timed-out ping is not re-sent"
         );
         assert!(
-            core.next_timeout(12_000).is_some(),
+            core.next_deadline(Now::from_millis(12_000)).is_some(),
             "the other peer's timer is still armed"
         );
     }
@@ -4986,7 +5010,7 @@ mod tests {
     }
 
     #[test]
-    fn next_timeout_arms_on_ping_and_clears_on_rtt() {
+    fn next_deadline_arms_on_ping_and_clears_on_rtt() {
         let mut core = test_core(); // default request_timeout_ms = 10_000
         let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
         let conn_id = ConnectionId::new(1);
@@ -4994,7 +5018,7 @@ mod tests {
         setup_outbound_ping_stream(&mut core, &peer_id, conn_id, stream_id);
 
         assert_eq!(
-            core.next_timeout(0),
+            core.next_deadline(Now::from_millis(0)),
             None,
             "no timer armed before a ping is in flight"
         );
@@ -5004,12 +5028,22 @@ mod tests {
 
         // The ping protocol times out strictly past request_timeout_ms, so
         // the timer is due one millisecond after sent_at + timeout.
-        assert_eq!(core.next_timeout(1_000), Some(10_001));
-        assert_eq!(core.next_timeout(5_000), Some(6_001));
+        let due = Deadline::from_millis(11_001);
+        assert_eq!(core.next_deadline(Now::from_millis(1_000)), Some(due));
         assert_eq!(
-            core.next_timeout(11_001),
-            Some(0),
-            "past-due timer reports zero"
+            core.next_deadline(Now::from_millis(5_000)),
+            Some(due),
+            "the deadline is absolute, not relative to now"
+        );
+        assert!(!due.is_expired_at(Now::from_millis(11_000)));
+        assert!(
+            due.is_expired_at(Now::from_millis(11_001)),
+            "due exactly now"
+        );
+        assert_eq!(
+            core.next_deadline(Now::from_millis(20_000)),
+            Some(due),
+            "an overdue timer keeps its past due time"
         );
 
         // The echoed payload resolves the ping and disarms the timer.
@@ -5021,7 +5055,7 @@ mod tests {
             },
             1_500,
         );
-        assert_eq!(core.next_timeout(1_500), None);
+        assert_eq!(core.next_deadline(Now::from_millis(1_500)), None);
         let events = drain_events(&mut core);
         assert!(
             events
@@ -5031,7 +5065,7 @@ mod tests {
     }
 
     #[test]
-    fn next_timeout_disarms_after_timeout_tick() {
+    fn next_deadline_disarms_after_timeout_tick() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
         let conn_id = ConnectionId::new(1);
@@ -5043,7 +5077,10 @@ mod tests {
 
         // An early tick must not disarm the timer.
         core.handle_tick(5_000);
-        assert_eq!(core.next_timeout(5_000), Some(6_001));
+        assert_eq!(
+            core.next_deadline(Now::from_millis(5_000)),
+            Some(Deadline::from_millis(11_001))
+        );
 
         // A tick past the deadline fires the timeout and disarms the timer.
         core.handle_tick(11_001);
@@ -5053,11 +5090,11 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, SwarmEvent::PingTimeout { .. }))
         );
-        assert_eq!(core.next_timeout(11_001), None);
+        assert_eq!(core.next_deadline(Now::from_millis(11_001)), None);
     }
 
     #[test]
-    fn next_timeout_prunes_stale_deadline_after_silent_stream_close() {
+    fn next_deadline_prunes_stale_deadline_after_silent_stream_close() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
         let conn_id = ConnectionId::new(1);
@@ -5077,10 +5114,13 @@ mod tests {
                 stream_id,
             },
         );
-        assert_eq!(core.next_timeout(0), Some(10_001));
+        assert_eq!(
+            core.next_deadline(Now::from_millis(0)),
+            Some(Deadline::from_millis(10_001))
+        );
 
         core.handle_tick(10_001);
-        assert_eq!(core.next_timeout(10_001), None);
+        assert_eq!(core.next_deadline(Now::from_millis(10_001)), None);
         let events = drain_events(&mut core);
         assert!(
             !events
@@ -5091,7 +5131,7 @@ mod tests {
     }
 
     #[test]
-    fn next_timeout_cleared_when_connection_closes() {
+    fn next_deadline_cleared_when_connection_closes() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
         let conn_id = ConnectionId::new(1);
@@ -5100,10 +5140,13 @@ mod tests {
 
         core.ping(&peer_id, [7u8; PING_PAYLOAD_LEN], 0)
             .expect("send ping");
-        assert_eq!(core.next_timeout(0), Some(10_001));
+        assert_eq!(
+            core.next_deadline(Now::from_millis(0)),
+            Some(Deadline::from_millis(10_001))
+        );
 
         feed(&mut core, TransportEvent::Closed { id: conn_id });
-        assert_eq!(core.next_timeout(0), None);
+        assert_eq!(core.next_deadline(Now::from_millis(0)), None);
     }
 
     fn noted_dial_addr(label: &[u8]) -> (PeerId, PeerAddr, ConnectionId) {
@@ -5386,7 +5429,7 @@ mod tests {
     }
 
     #[test]
-    fn next_timeout_armed_by_deferred_ping_send() {
+    fn next_deadline_armed_by_deferred_ping_send() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
         let conn_id = ConnectionId::new(2);
@@ -5400,8 +5443,10 @@ mod tests {
         // Negotiation completing at 2_000 fires the queued payload and must
         // arm the timer from that send time.
         core.on_outbound_negotiated(conn_id, stream_id, ProtocolKind::Ping, 2_000);
-        assert_eq!(core.next_timeout(2_000), Some(10_001));
-        assert_eq!(core.next_timeout(4_000), Some(8_001));
+        assert_eq!(
+            core.next_deadline(Now::from_millis(4_000)),
+            Some(Deadline::from_millis(12_001))
+        );
     }
 
     #[test]

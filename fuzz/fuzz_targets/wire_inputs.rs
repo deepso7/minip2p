@@ -517,7 +517,7 @@ fn fuzz_discovery(data: &[u8]) {
         book.peer_disconnected(&remote_peer, 5);
     }
     book.handle_tick(2_u64.saturating_add(ttl_ms));
-    let _ = book.next_timeout(6);
+    let _ = book.next_deadline(Now::from_millis(6));
     let _ = book.known_peers();
     while book.poll_action().is_some() {}
     while book.poll_event().is_some() {}

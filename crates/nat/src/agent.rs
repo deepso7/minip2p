@@ -3,7 +3,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use minip2p_core::{Bytes, ConnectId, Multiaddr, PeerAddr, PeerId, select_direct_addrs};
-use minip2p_platform::Now;
+use minip2p_platform::{Deadline, Now};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -458,8 +458,8 @@ pub struct ConnectLegs {
 /// remaining commands, which need more than the swarm, drain through
 /// [`poll_action`](Self::poll_action), and application events through
 /// [`poll_event`](Self::poll_event); drain both until `None` after every
-/// input, then sleep at most [`next_timeout`](Self::next_timeout) before the
-/// next tick.
+/// input, then sleep until at most [`next_deadline`](Self::next_deadline)
+/// before the next tick.
 ///
 /// The driver offers every swarm event to the agent first. When
 /// [`handle_event`](Self::handle_event) returns `true` the event belongs to
@@ -996,10 +996,13 @@ impl NatAgent {
         self.shared.events.pop_front()
     }
 
-    /// Milliseconds until the earliest pending deadline, if any. Drivers
-    /// fold this into their poll budget, as `SwarmCore::next_deadline` folds
-    /// the swarm's protocol timers.
-    pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
+    /// The earliest pending deadline on the monotonic timeline, or `None`
+    /// when no timer is armed. An overdue timer reports its past due time,
+    /// so it is already expired at `now`. Drivers fold this into their poll
+    /// budget, as `SwarmCore::next_deadline` folds the swarm's protocol
+    /// timers. `now` is accepted for a uniform component signature; every
+    /// agent timer is stored as an absolute due time.
+    pub fn next_deadline(&self, _now: Now) -> Option<Deadline> {
         self.attempts
             .values()
             .filter_map(ConnectAttempt::next_deadline)
@@ -1010,7 +1013,7 @@ impl NatAgent {
                     .filter_map(InboundCircuit::next_deadline),
             )
             .min()
-            .map(|due| due.saturating_sub(now_ms))
+            .map(Deadline::from_millis)
     }
 
     /// Returns `true` if `stream_id` on connection `conn_id` currently

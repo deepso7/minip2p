@@ -809,8 +809,8 @@ impl Endpoint {
         if let Some(next) = self.engine.core.next_deadline(now) {
             budget = budget.min(Duration::from_millis(next.millis_until(now)));
         }
-        if let Some(ms) = self.engine.timer_ms(now) {
-            budget = budget.min(Duration::from_millis(ms.max(1)));
+        if let Some(next) = self.engine.driver_deadline(now) {
+            budget = budget.min(Duration::from_millis(next.millis_until(now).max(1)));
         }
         if budget.is_zero() {
             return Ok(false);

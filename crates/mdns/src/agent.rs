@@ -12,6 +12,7 @@ use core::{
 };
 
 use minip2p_core::{Multiaddr, PeerId, Protocol};
+use minip2p_platform::{Deadline, Now};
 
 use crate::dns::{
     CLASS_IN, DnsMessage, DnsQuestion, DnsRecordData, META_QUERY_NAME, ResponseSpec, SERVICE_NAME,
@@ -276,8 +277,12 @@ impl MdnsAgent {
         self.events.pop_front()
     }
 
-    /// Returns milliseconds until the next query or delayed response.
-    pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
+    /// When the next query or delayed response is due, on the caller's
+    /// monotonic timeline. Overdue work reports its past due time, so it reads
+    /// as due rather than being pushed out.
+    ///
+    /// `None` once the agent has shut down.
+    pub fn next_deadline(&self, _now: Now) -> Option<Deadline> {
         if self.closed {
             return None;
         }
@@ -289,7 +294,7 @@ impl MdnsAgent {
         let deadline = response
             .map(|due| due.min(self.next_query_at_ms))
             .unwrap_or(self.next_query_at_ms);
-        Some(deadline.saturating_sub(now_ms))
+        Some(Deadline::from_millis(deadline))
     }
 
     fn restart_fast_phase(&mut self, now_ms: u64) {
@@ -689,9 +694,18 @@ mod tests {
                 ..
             }
         )));
-        assert_eq!(agent.next_timeout(5), Some(1_000));
+        let next_query = Deadline::from_millis(1_005);
+        assert_eq!(agent.next_deadline(Now::from_millis(5)), Some(next_query));
+        // The same interfaces again are not a change, so nothing restarts.
         agent.set_interfaces(&[iface(1), iface(2)], 6);
-        assert_eq!(agent.next_timeout(6), Some(999));
+        assert_eq!(agent.next_deadline(Now::from_millis(6)), Some(next_query));
+        // Due exactly at its millisecond, and still reported at its own past
+        // value when the host runs late, so it reads as due, not pushed out.
+        assert!(next_query.is_expired_at(Now::from_millis(1_005)));
+        assert_eq!(
+            agent.next_deadline(Now::from_millis(9_000)),
+            Some(next_query)
+        );
     }
 
     #[test]
@@ -740,9 +754,12 @@ mod tests {
         let query = encode_query();
         let from = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 2), MDNS_PORT).into();
         agent.handle_packet(InterfaceId::new(1), from, &query, 1);
-        let wait = agent.next_timeout(1).unwrap();
-        assert!((20..=120).contains(&wait));
-        agent.handle_tick(1 + wait);
+        let due = agent
+            .next_deadline(Now::from_millis(1))
+            .unwrap()
+            .as_millis();
+        assert!((21..=121).contains(&due));
+        agent.handle_tick(due);
         let Some(MdnsAction::Send {
             payload, target, ..
         }) = agent.poll_action()
@@ -777,8 +794,11 @@ mod tests {
         let query = encode_query();
         let from = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 2), MDNS_PORT).into();
         agent.handle_packet(InterfaceId::new(1), from, &query, 1);
-        let wait = agent.next_timeout(1).unwrap();
-        agent.handle_tick(1 + wait);
+        let due = agent
+            .next_deadline(Now::from_millis(1))
+            .unwrap()
+            .as_millis();
+        agent.handle_tick(due);
         let Some(MdnsAction::Send { payload, .. }) = agent.poll_action() else {
             panic!("response not emitted");
         };
@@ -809,7 +829,10 @@ mod tests {
         qu[31..33].copy_from_slice(&0x8001u16.to_be_bytes());
         let requester = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 2), MDNS_PORT).into();
         agent.handle_packet(InterfaceId::new(1), requester, &qu, 1);
-        let due = 1 + agent.next_timeout(1).unwrap();
+        let due = agent
+            .next_deadline(Now::from_millis(1))
+            .unwrap()
+            .as_millis();
         agent.handle_tick(due);
         let Some(MdnsAction::Send {
             target, payload, ..
@@ -832,7 +855,10 @@ mod tests {
         legacy[0..2].copy_from_slice(&91u16.to_be_bytes());
         let requester = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 2), 9_999).into();
         agent.handle_packet(InterfaceId::new(1), requester, &legacy, due + 1);
-        let due = due + 1 + agent.next_timeout(due + 1).unwrap();
+        let due = agent
+            .next_deadline(Now::from_millis(due + 1))
+            .unwrap()
+            .as_millis();
         agent.handle_tick(due);
         let Some(MdnsAction::Send {
             target, payload, ..
@@ -912,7 +938,7 @@ mod tests {
         agent.shutdown(2);
         agent.handle_tick(2);
         assert!(agent.poll_action().is_none());
-        assert_eq!(agent.next_timeout(2), None);
+        assert_eq!(agent.next_deadline(Now::from_millis(2)), None);
     }
 
     #[test]

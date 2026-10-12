@@ -2404,8 +2404,13 @@ mod tests {
             swarm.poll().expect("negotiate ping stream");
         }
         assert_eq!(
-            swarm.core.state.next_timeout(clock.now_ms()),
-            Some(PING_TIMEOUT_MS + 1),
+            swarm
+                .core
+                .state
+                .next_deadline(Now::from_millis(clock.now_ms())),
+            Some(minip2p_platform::Deadline::from_millis(
+                clock.now_ms() + PING_TIMEOUT_MS + 1
+            )),
             "ping must be in flight with an armed core timer"
         );
 

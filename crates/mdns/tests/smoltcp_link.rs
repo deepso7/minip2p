@@ -21,12 +21,14 @@ use minip2p_core::{Multiaddr, PeerId};
 use minip2p_identity::{KeyType, PublicKey};
 use minip2p_mdns::smoltcp::iface::{Config, Interface};
 use minip2p_mdns::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use minip2p_mdns::smoltcp::socket::tcp;
 use minip2p_mdns::smoltcp::time::Instant;
 use minip2p_mdns::smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
 use minip2p_mdns::{
     InterfaceId, MdnsAction, MdnsAgent, MdnsConfig, MdnsDriver, MdnsError, MdnsEvent, MdnsIo,
     MdnsTarget, SmoltcpMdnsConfig, SmoltcpMdnsIo, SmoltcpStack,
 };
+use minip2p_platform::{Deadline, Now};
 
 /// Enough ticks for several announcement rounds; short enough that a livelock
 /// fails rather than hangs.
@@ -286,7 +288,9 @@ impl Node {
     }
 
     fn tick(&mut self, now_ms: u64) {
-        self.driver.tick(now_ms, &self.addrs).expect("tick");
+        self.driver
+            .tick(Now::from_millis(now_ms), &self.addrs)
+            .expect("tick");
         while let Some(event) = self.driver.poll_event() {
             self.events.push(event);
         }
@@ -363,7 +367,10 @@ fn a_node_that_leaves_says_so_on_the_wire() {
     // unsent one costs it a full TTL of pointing at a host that has gone.
     // The carrier is dropped as the shutdown ends, so anything still queued
     // in it then is lost.
-    second.driver.shutdown(1_000).expect("goodbye");
+    second
+        .driver
+        .shutdown(Now::from_millis(1_000))
+        .expect("goodbye");
     first.events.clear();
     for step in 0..200u64 {
         first.tick(1_000 + step * STEP_MS);
@@ -408,20 +415,25 @@ fn an_idle_link_lets_the_host_sleep() {
     // zero" is what makes this a bound; a driver that ignored the carrier's
     // deadlines would not be caught here at all, which is what the next test
     // is for.
-    let config = MdnsConfig::default();
-    let mut expected = config.interface_refresh_ms - now;
-    if let Some(agent) = first.driver.agent().next_timeout(now) {
-        expected = expected.min(agent);
-    }
-    if let Some(carrier) = first
-        .driver
-        .io()
-        .and_then(|carrier| carrier.next_deadline(now))
-    {
-        expected = expected.min(carrier);
-    }
-    assert!(expected > 0, "an idle host has something to sleep on");
-    assert_eq!(first.driver.next_timeout(now), Some(expected));
+    // The refresh is armed by the first tick, which was at zero.
+    let now = Now::from_millis(now);
+    let refresh = Deadline::from_millis(MdnsConfig::default().interface_refresh_ms);
+    let expected = [
+        first.driver.agent().next_deadline(now),
+        first
+            .driver
+            .io()
+            .and_then(|carrier| carrier.next_deadline(now)),
+    ]
+    .into_iter()
+    .fold(refresh, |soonest, deadline| {
+        deadline.map_or(soonest, |deadline| soonest.earliest(deadline))
+    });
+    assert!(
+        !expected.is_expired_at(now),
+        "an idle host has something to sleep on"
+    );
+    assert_eq!(first.driver.next_deadline(now), Some(expected));
 }
 
 #[test]
@@ -435,18 +447,21 @@ fn a_carrier_that_still_owes_work_keeps_the_host_awake() {
     only.link.set(true);
     only.tick(0);
     assert_eq!(
-        only.driver.next_timeout(0),
-        Some(0),
+        only.driver.next_deadline(Now::from_millis(0)),
+        Some(Deadline::IMMEDIATE),
         "a datagram stuck in the carrier is owed a poll now"
     );
 
     // And once it drains, the host is back to sleeping on mDNS's own schedule
-    // -- so the zero above came from the carrier and not from something the
+    // -- so the "now" above came from the carrier and not from something the
     // driver always says.
     only.link.set(false);
     only.tick(1);
+    let now = Now::from_millis(1);
     assert!(
-        only.driver.next_timeout(1).unwrap_or(0) > 0,
+        only.driver
+            .next_deadline(now)
+            .is_some_and(|deadline| !deadline.is_expired_at(now)),
         "with nothing left in the carrier there is something to sleep on"
     );
 }
@@ -467,8 +482,8 @@ fn a_datagram_queued_but_not_yet_on_the_wire_is_owed_now() {
     // Queued is not sent: nothing leaves a stack like this until it is
     // driven, so a host told it could sleep would sleep on an unsent packet.
     assert_eq!(
-        io.next_deadline(0),
-        Some(0),
+        io.next_deadline(Now::from_millis(0)),
+        Some(Deadline::IMMEDIATE),
         "a queued datagram is owed a poll now, whatever smoltcp's own timers say"
     );
     assert!(bus.is_quiet(), "and it has not gone anywhere yet");
@@ -504,8 +519,8 @@ fn an_ingress_flood_is_bounded_and_keeps_the_carrier_due() {
         "one mDNS poll must not drain an unbounded link"
     );
     assert_eq!(
-        receiver.next_deadline(1),
-        Some(0),
+        receiver.next_deadline(Now::from_millis(1)),
+        Some(Deadline::from_millis(1)),
         "work left by the ingress budget must be resumed immediately"
     );
 }
@@ -682,9 +697,14 @@ fn a_send_buffer_below_this_hosts_own_claim_does_not_spin_the_driver() {
     for step in 0..200u64 {
         let now = step * STEP_MS;
         driver
-            .tick(now, &addrs)
+            .tick(Now::from_millis(now), &addrs)
             .expect("a claim that will never fit is not a fault");
-        if bus.is_quiet() && driver.next_timeout(now).unwrap_or(0) > 0 {
+        let at = Now::from_millis(now);
+        if bus.is_quiet()
+            && driver
+                .next_deadline(at)
+                .is_some_and(|deadline| !deadline.is_expired_at(at))
+        {
             return;
         }
     }
@@ -754,15 +774,19 @@ fn an_address_that_arrives_later_reaches_the_agent() {
 /// or mDNS says something is due now. Anything this misses would sit until
 /// the next timer.
 fn host_wakes(driver: &Driver, inbox: &Frames, now: u64) -> bool {
-    !inbox.borrow().is_empty() || driver.next_timeout(now) == Some(0)
+    let now = Now::from_millis(now);
+    !inbox.borrow().is_empty()
+        || driver
+            .next_deadline(now)
+            .is_some_and(|deadline| deadline.is_expired_at(now))
 }
 
 /// Whether a datagram is still waiting in the receiver's carrier.
 fn carrier_owes(driver: &Driver, now: u64) -> bool {
     driver
         .io()
-        .and_then(|io| io.next_deadline(now))
-        .is_some_and(|due| due == 0)
+        .and_then(|io| io.next_deadline(Now::from_millis(now)))
+        .is_some_and(|due| due == Deadline::from_millis(now))
 }
 
 /// A receiver on its own shared stack, ticked until it has nothing due.
@@ -795,7 +819,7 @@ fn idle_receiver(bus: &Bus) -> (Driver, SmoltcpStack<BusDevice>, Frames, Rc<Cell
         if !host_wakes(&driver, &inbox, 0) {
             break;
         }
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         inbox.borrow_mut().clear();
     }
     assert!(!host_wakes(&driver, &inbox, 0), "the receiver went idle");
@@ -831,7 +855,7 @@ fn an_ingress_driven_host_hears_datagrams_its_device_no_longer_shows() {
         host_wakes(&driver, &inbox, 0),
         "a datagram in mDNS's socket is a carrier deadline of now"
     );
-    driver.tick(0, &[]).expect("tick");
+    driver.tick(Now::from_millis(0), &[]).expect("tick");
     assert!(!carrier_owes(&driver, 0), "and that tick read it");
 
     // A frame that lands between a tick's two carrier polls is taken in by
@@ -839,7 +863,7 @@ fn an_ingress_driven_host_hears_datagrams_its_device_no_longer_shows() {
     sender.send(&datagram()).expect("queue");
     sender.poll(0).expect("put it on the bus");
     defer.set(1);
-    driver.tick(0, &[]).expect("tick");
+    driver.tick(Now::from_millis(0), &[]).expect("tick");
     assert!(
         inbox.borrow().is_empty(),
         "the final poll took the frame in"
@@ -848,6 +872,54 @@ fn an_ingress_driven_host_hears_datagrams_its_device_no_longer_shows() {
         host_wakes(&driver, &inbox, 0),
         "what the final poll delivered is owed a tick now"
     );
-    driver.tick(0, &[]).expect("tick");
+    driver.tick(Now::from_millis(0), &[]).expect("tick");
     assert!(!carrier_owes(&driver, 0));
+}
+
+#[test]
+fn smoltcps_own_timers_are_reported_on_the_callers_timeline() {
+    let bus = Bus::default();
+    let mut io = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 1)]);
+    io.poll(0).expect("poll");
+    bus.drain();
+
+    // Another user of the shared stack with a timer of its own: a TCP
+    // connect that nobody answers, so smoltcp owes it a retransmit.
+    let stack = io.stack().clone();
+    {
+        let mut shared = stack.borrow_mut();
+        let state = &mut *shared;
+        let socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; 64]),
+            tcp::SocketBuffer::new(vec![0; 64]),
+        );
+        let handle = state.sockets.add(socket);
+        state
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .connect(
+                state.interface.context(),
+                (Ipv4Address::new(192, 168, 1, 9), 80),
+                49_152,
+            )
+            .expect("connect");
+    }
+
+    // smoltcp says how long; the carrier says when, on the caller's clock.
+    let now = Now::from_millis(1_000);
+    io.poll(now.monotonic_ms).expect("poll");
+    bus.drain();
+    let delay = {
+        let mut shared = stack.borrow_mut();
+        let state = &mut *shared;
+        state
+            .interface
+            .poll_delay(Instant::from_millis(1_000), &state.sockets)
+            .expect("a retransmit is armed")
+            .total_millis()
+    };
+    assert!(delay > 0);
+    assert_eq!(io.next_deadline(now), Some(now.deadline_after(delay)));
+    // Saturation near the end of the caller's clock is pinned by the
+    // carrier's unit tests: smoltcp's own TCP timers overflow out there.
 }

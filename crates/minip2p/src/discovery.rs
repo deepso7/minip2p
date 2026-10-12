@@ -15,7 +15,7 @@ use minip2p_discovery::{DiscoveryAction, DiscoverySource, PeerDiscoveryAgent};
 use minip2p_mdns::MdnsEvent;
 #[cfg(feature = "_nat-driver")]
 use minip2p_nat::NatEvent;
-use minip2p_platform::{EntropySource, Now};
+use minip2p_platform::{Deadline, EntropySource, Now};
 #[cfg(feature = "pubsub")]
 use minip2p_pubsub::GossipsubEvent;
 use minip2p_swarm::{SwarmCore, SwarmEvent};
@@ -132,24 +132,16 @@ impl DiscoveryDriver {
         out.extend(core::iter::from_fn(|| self.book.poll_event()).map(EndpointEvent::Discovery));
     }
 
-    /// The earliest timeout across book and beacon at `now_ms`.
-    pub(crate) fn next_timeout(&self, now_ms: u64) -> Option<u64> {
-        #[cfg_attr(
-            not(feature = "pubsub"),
-            expect(unused_mut, reason = "the beacon timeout is the only mutation")
-        )]
-        let mut timeout = self.book.next_timeout(now_ms);
+    /// The earliest deadline across book and beacon.
+    pub(crate) fn next_deadline(&self, now: Now) -> Option<Deadline> {
         #[cfg(feature = "pubsub")]
-        if let Some(beacon) = self.beacon.as_ref()
-            && let Some(beacon_timeout) = beacon.next_timeout(now_ms)
-        {
-            timeout = Some(
-                timeout
-                    .map(|book_timeout| book_timeout.min(beacon_timeout))
-                    .unwrap_or(beacon_timeout),
-            );
-        }
-        timeout
+        let beacon = self
+            .beacon
+            .as_ref()
+            .and_then(|beacon| beacon.next_deadline(now));
+        #[cfg(not(feature = "pubsub"))]
+        let beacon = None;
+        Deadline::earliest_opt(self.book.next_deadline(now), beacon)
     }
 
     /// Whether `event` belongs to an attempt automatic dialing owns: NAT
@@ -282,12 +274,18 @@ impl DiscoveryDriver {
 
             #[cfg(feature = "pubsub")]
             if let Some(beacon) = self.beacon.as_mut()
-                && beacon.next_timeout(now_ms) == Some(0)
+                && beacon
+                    .next_deadline(now)
+                    .is_some_and(|due| due.is_expired_at(now))
             {
                 beacon.handle_tick(now_ms);
                 progressed = true;
             }
-            if self.book.next_timeout(now_ms) == Some(0) {
+            if self
+                .book
+                .next_deadline(now)
+                .is_some_and(|due| due.is_expired_at(now))
+            {
                 self.book.handle_tick(now_ms);
                 progressed = true;
             }

@@ -5,6 +5,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use minip2p_core::Multiaddr;
+use minip2p_platform::{Deadline, Now};
 
 use crate::io::{MAX_DATAGRAM_BYTES, MdnsError, MdnsIo, source_is_on_link};
 use crate::{MdnsAction, MdnsAgent, MdnsConfig, MdnsEvent};
@@ -39,9 +40,13 @@ const SHUTDOWN_DRAIN_ATTEMPTS: usize = 4;
 /// # Time
 ///
 /// Caller-driven, like everything else here: each call is given the host's
-/// current millisecond reading and none is taken from a clock this owns. The
-/// last one given is retained, so a shutdown that arrives without one -- a
-/// drop -- still has a timeline to date its goodbye on.
+/// current [`Now`] and none is taken from a clock this owns, so every deadline
+/// this reports is on the host's own timeline and folds directly with the
+/// host's other deadlines. There is no epoch here either: the first interface
+/// refresh is armed one interval after the first tick, whatever reading that
+/// tick carries. The last reading given is retained, so a shutdown that
+/// arrives without one -- a drop -- still has a timeline to date its goodbye
+/// on.
 ///
 /// # Failure
 ///
@@ -61,14 +66,17 @@ const SHUTDOWN_DRAIN_ATTEMPTS: usize = 4;
 pub struct MdnsDriver<I: MdnsIo> {
     agent: MdnsAgent,
     io: Option<I>,
-    next_interface_refresh_ms: u64,
+    /// When the interfaces are next re-read. `None` until the first tick
+    /// arms it: construction just read them, and has no reading to date that
+    /// by.
+    next_interface_refresh_ms: Option<u64>,
     interface_refresh_ms: u64,
     backlog: bool,
     /// An action the previous tick's budget did not cover. Held rather than
     /// dropped so a burst is delayed instead of lost.
     pending_action: Option<MdnsAction>,
     /// The last reading a caller gave, so a drop can date its goodbye.
-    last_now_ms: u64,
+    last_now: Now,
     /// Reused across ticks: one datagram's worth of buffer is too much to put
     /// on an embedded stack frame every time it is needed.
     buffer: Vec<u8>,
@@ -82,11 +90,11 @@ impl<I: MdnsIo> MdnsDriver<I> {
         Self {
             agent,
             io: Some(io),
-            next_interface_refresh_ms: config.interface_refresh_ms,
+            next_interface_refresh_ms: None,
             interface_refresh_ms: config.interface_refresh_ms,
             backlog: false,
             pending_action: None,
-            last_now_ms: 0,
+            last_now: Now::from_millis(0),
             // One byte past the limit, so a datagram that fills it is
             // recognisably too big rather than silently truncated.
             buffer: vec![0; MAX_DATAGRAM_BYTES + 1],
@@ -135,8 +143,9 @@ impl<I: MdnsIo> MdnsDriver<I> {
     ///
     /// `local_addrs` is what this host currently listens on, which is what
     /// mDNS advertises. A change to it invalidates anything already encoded.
-    pub fn tick(&mut self, now_ms: u64, local_addrs: &[Multiaddr]) -> Result<(), MdnsError> {
-        self.last_now_ms = now_ms;
+    pub fn tick(&mut self, now: Now, local_addrs: &[Multiaddr]) -> Result<(), MdnsError> {
+        self.last_now = now;
+        let now_ms = now.monotonic_ms;
         if self.io.is_none() {
             return Ok(());
         }
@@ -145,7 +154,16 @@ impl<I: MdnsIo> MdnsDriver<I> {
         if let Err(error) = self.io.as_mut().expect("checked above").poll(now_ms) {
             return Err(self.fail(error, now_ms));
         }
-        if now_ms >= self.next_interface_refresh_ms {
+        let refresh_due = match self.next_interface_refresh_ms {
+            Some(due) => now_ms >= due,
+            // Construction just read the interfaces; the schedule starts here.
+            None => {
+                self.next_interface_refresh_ms =
+                    Some(now_ms.saturating_add(self.interface_refresh_ms));
+                false
+            }
+        };
+        if refresh_due {
             let changed = match self.io.as_mut().expect("checked above").refresh() {
                 Ok(changed) => changed,
                 Err(error) => return Err(self.fail(error, now_ms)),
@@ -157,7 +175,7 @@ impl<I: MdnsIo> MdnsDriver<I> {
                 // snapshot even when its stable interface id still exists.
                 self.pending_action = None;
             }
-            self.next_interface_refresh_ms = now_ms.saturating_add(self.interface_refresh_ms);
+            self.next_interface_refresh_ms = Some(now_ms.saturating_add(self.interface_refresh_ms));
         }
         if self.agent.set_local_addrs(local_addrs, now_ms) {
             // A parked packet was encoded from the previous listen-address
@@ -209,34 +227,35 @@ impl<I: MdnsIo> MdnsDriver<I> {
         Ok(())
     }
 
-    /// How long the host may idle before this needs another tick.
+    /// When this next needs a tick, as an absolute deadline on the host's
+    /// monotonic timeline.
     ///
     /// Covers timers only: the next interface refresh, the agent's next word,
     /// and the carrier's own deadlines. A datagram arriving is not a timer --
     /// a hosted carrier's sockets wake the host through its readiness poll,
     /// and an in-process stack reports a datagram it holds as a carrier
     /// deadline of now -- so an idle mDNS host sleeps until something is due.
+    /// Work the last tick's budget left over is due now. An overdue timer
+    /// reports its past due time.
     ///
-    /// `None` once mDNS has stopped, so a host can drop it from its timeline
-    /// rather than wake for something that will do nothing.
-    pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
+    /// `None` once mDNS has stopped -- shut down, or ended by an I/O failure,
+    /// whatever was overdue at the time -- so a host can drop it from its
+    /// timeline rather than wake for something that will do nothing.
+    pub fn next_deadline(&self, now: Now) -> Option<Deadline> {
         let io = self.io.as_ref()?;
         if self.backlog {
             // Work was left on the floor by this tick's budget, so the next
             // one is due regardless of what any timer says.
-            return Some(0);
+            return Some(now.as_deadline());
         }
-        let mut timeout = self.next_interface_refresh_ms.saturating_sub(now_ms);
-        if let Some(agent) = self.agent.next_timeout(now_ms) {
-            timeout = timeout.min(agent);
-        }
+        let refresh = self.next_interface_refresh_ms.map(Deadline::from_millis);
         // The carrier's own timers count too: a stack running in this process
         // gets nothing done between ticks, so a host that slept past one of
         // its deadlines would stall it.
-        if let Some(carrier) = io.next_deadline(now_ms) {
-            timeout = timeout.min(carrier);
-        }
-        Some(timeout)
+        Deadline::earliest_opt(
+            Deadline::earliest_opt(refresh, self.agent.next_deadline(now)),
+            io.next_deadline(now),
+        )
     }
 
     /// Says goodbye and stops.
@@ -244,8 +263,9 @@ impl<I: MdnsIo> MdnsDriver<I> {
     /// Peers are told to drop this host's records now rather than wait out a
     /// TTL. Idempotent; the drop does the same thing for a host that does not
     /// get the chance to call it.
-    pub fn shutdown(&mut self, now_ms: u64) -> Result<(), MdnsError> {
-        self.last_now_ms = now_ms;
+    pub fn shutdown(&mut self, now: Now) -> Result<(), MdnsError> {
+        self.last_now = now;
+        let now_ms = now.monotonic_ms;
         // Taking the io is what makes this idempotent, and it is the same
         // thing that makes a stopped driver inert: there is one way to be
         // finished here, not two that have to agree.
@@ -391,7 +411,7 @@ impl<I: MdnsIo> Drop for MdnsDriver<I> {
         // A host that drops its driver said goodbye by doing so. Dated with
         // the last reading a caller gave, since a drop brings no clock with
         // it and a stale-but-real timestamp beats inventing one.
-        let now = self.last_now_ms;
+        let now = self.last_now;
         if let Err(error) = self.shutdown(now) {
             // `Drop` cannot return the I/O failure after attempting a goodbye.
             drop(error);
@@ -441,7 +461,7 @@ mod tests {
         /// `sent` is: a shutdown drops the io before a test can read it.
         ops: Ops,
         /// What `next_deadline` reports.
-        carrier_deadline: Option<u64>,
+        carrier_deadline: Option<Deadline>,
     }
 
     type Sent = alloc::rc::Rc<core::cell::RefCell<Vec<MdnsAction>>>;
@@ -490,7 +510,7 @@ mod tests {
             Ok(())
         }
 
-        fn next_deadline(&self, _now_ms: u64) -> Option<u64> {
+        fn next_deadline(&self, _now: Now) -> Option<Deadline> {
             self.carrier_deadline
         }
 
@@ -584,7 +604,7 @@ mod tests {
         let sent = io.sent.clone();
         let mut driver = driver(io);
 
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         let sent = sent.borrow();
         assert_eq!(sent.len(), 2, "one announcement per interface: {sent:?}");
         assert!(
@@ -604,7 +624,7 @@ mod tests {
         io.queue_from(1, Ipv4Addr::new(203, 0, 113, 7), CLAIM, CLAIM.len());
         let mut driver = driver(io);
 
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         assert!(
             driver.poll_event().is_none(),
             "an off-link datagram must not reach the agent at all"
@@ -613,7 +633,7 @@ mod tests {
         // The same bytes from the link do reach it, so the drop above was
         // about where it came from and not about what it said.
         driver.io.as_mut().expect("still running").queue(1, CLAIM);
-        driver.tick(1, &[]).expect("tick");
+        driver.tick(Now::from_millis(1), &[]).expect("tick");
         assert!(
             matches!(
                 driver.poll_event(),
@@ -637,7 +657,7 @@ mod tests {
         );
         let mut driver = driver(io);
 
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         assert!(
             driver.poll_event().is_none(),
             "a truncated claim is not a claim; reading it would judge bytes that never arrived"
@@ -653,15 +673,15 @@ mod tests {
         }
         let mut driver = driver(io);
 
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         assert_eq!(
             driver.io.as_ref().expect("still running").inbound.len(),
             5,
             "a link that keeps talking must not hold the caller inside one tick"
         );
         assert_eq!(
-            driver.next_timeout(0),
-            Some(0),
+            driver.next_deadline(Now::from_millis(0)),
+            Some(Deadline::IMMEDIATE),
             "what was left over is due now, whatever the timers say"
         );
     }
@@ -676,7 +696,7 @@ mod tests {
         }
         let mut driver = driver(io);
 
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         assert_eq!(driver.io.as_ref().expect("still running").inbound.len(), 5);
     }
 
@@ -686,16 +706,19 @@ mod tests {
         let sent = io.sent.clone();
         let mut driver = driver(io);
 
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         assert_eq!(sent.borrow().len(), MAX_ACTIONS_PER_TICK);
         assert!(
             driver.pending_action.is_some(),
             "the next one is held, not dropped: a burst is delayed, never lost"
         );
-        assert_eq!(driver.next_timeout(0), Some(0));
+        assert_eq!(
+            driver.next_deadline(Now::from_millis(0)),
+            Some(Deadline::IMMEDIATE)
+        );
 
         // The parked one goes first on the next turn, before anything new.
-        driver.tick(1, &[]).expect("second tick");
+        driver.tick(Now::from_millis(1), &[]).expect("second tick");
         assert_eq!(sent.borrow().len(), MAX_ACTIONS_PER_TICK + 2);
         assert!(driver.pending_action.is_none());
     }
@@ -711,7 +734,7 @@ mod tests {
         let mut driver = driver(io);
 
         driver
-            .tick(0, &[])
+            .tick(Now::from_millis(0), &[])
             .expect("a full send buffer is a moment, not a fault");
         assert!(
             driver.is_active(),
@@ -723,8 +746,8 @@ mod tests {
             .clone()
             .expect("what did not fit is held, not dropped");
         assert_eq!(
-            driver.next_timeout(0),
-            Some(0),
+            driver.next_deadline(Now::from_millis(0)),
+            Some(Deadline::IMMEDIATE),
             "and it is due as soon as the carrier can take it"
         );
 
@@ -732,7 +755,7 @@ mod tests {
         // first thing said on the next one -- so a burst is delayed, never
         // lost.
         driver.io.as_mut().expect("still running").room = None;
-        driver.tick(1, &[]).expect("tick");
+        driver.tick(Now::from_millis(1), &[]).expect("tick");
         assert_eq!(sent.borrow().get(1), Some(&parked));
         assert_eq!(sent.borrow().len(), 3, "and the rest follow it");
         assert!(driver.pending_action.is_none());
@@ -745,10 +768,10 @@ mod tests {
         let sent = io.sent.clone();
         let mut driver = driver(io);
 
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         let parked = driver.pending_action.clone().expect("nothing fit");
         driver
-            .tick(1, &[])
+            .tick(Now::from_millis(1), &[])
             .expect("a link that is still full is not a fault");
 
         assert!(driver.is_active());
@@ -758,7 +781,10 @@ mod tests {
             Some(&parked),
             "the same datagram is still first in line"
         );
-        assert_eq!(driver.next_timeout(1), Some(0));
+        assert_eq!(
+            driver.next_deadline(Now::from_millis(1)),
+            Some(Deadline::from_millis(1))
+        );
     }
 
     #[test]
@@ -772,7 +798,7 @@ mod tests {
         let mut driver = driver(io);
 
         driver
-            .tick(0, &[])
+            .tick(Now::from_millis(0), &[])
             .expect("a datagram that will never fit is not a fault either");
         assert!(driver.is_active());
         assert!(sent.borrow().is_empty(), "nothing could go");
@@ -780,8 +806,11 @@ mod tests {
             driver.pending_action.is_none(),
             "an impossible send is dropped, not queued for a drain that cannot help"
         );
+        let now = Now::from_millis(0);
         assert!(
-            driver.next_timeout(0).unwrap_or(0) > 0,
+            driver
+                .next_deadline(now)
+                .is_some_and(|deadline| !deadline.is_expired_at(now)),
             "and the tick that dropped it is owed nothing now: holding it would \
              spin on one datagram instead of sleeping until the next word"
         );
@@ -797,7 +826,7 @@ mod tests {
         // Not a failure: interfaces come and go, and there is nowhere to send
         // a packet encoded for one that left.
         driver
-            .tick(0, &[])
+            .tick(Now::from_millis(0), &[])
             .expect("a vanished interface is not a fault");
         assert!(driver.is_active());
         assert_eq!(
@@ -812,20 +841,27 @@ mod tests {
         let mut io = FakeIo::with_interfaces(1);
         io.queue(1, CLAIM);
         io.send_fails = true;
+        // An overdue carrier timer, which must not outlive the failure either.
+        io.carrier_deadline = Some(Deadline::IMMEDIATE);
         let mut driver = driver(io);
 
-        let error = driver.tick(0, &[]).expect_err("the send failed");
+        let error = driver
+            .tick(Now::from_millis(0), &[])
+            .expect_err("the send failed");
         assert!(matches!(error, MdnsError::Io { .. }), "got {error:?}");
         assert!(
             !driver.is_active(),
             "a stack that cannot send cannot participate; retrying would only repeat this"
         );
         assert_eq!(
-            driver.next_timeout(0),
+            driver.next_deadline(Now::from_millis(5)),
             None,
-            "a host must not keep waking for something that will do nothing"
+            "a host must not keep waking for something that will do nothing, \
+             whatever was overdue when it failed"
         );
-        driver.tick(1, &[]).expect("a stopped driver does nothing");
+        driver
+            .tick(Now::from_millis(1), &[])
+            .expect("a stopped driver does nothing");
 
         // The claim was observed before the send failed, and losing it would
         // lose something the host had already learned.
@@ -844,7 +880,9 @@ mod tests {
         io.receive_fails = true;
         let mut driver = driver(io);
 
-        let error = driver.tick(0, &[]).expect_err("the receive failed");
+        let error = driver
+            .tick(Now::from_millis(0), &[])
+            .expect_err("the receive failed");
         assert_eq!(error.to_string(), "receive failed: socket is gone");
         assert!(!driver.is_active());
     }
@@ -857,9 +895,11 @@ mod tests {
 
         // The refresh is due at the configured interval, not immediately.
         let refresh_at = MdnsConfig::default().interface_refresh_ms;
-        driver.tick(0, &[]).expect("nothing is due yet");
+        driver
+            .tick(Now::from_millis(0), &[])
+            .expect("nothing is due yet");
         let error = driver
-            .tick(refresh_at, &[])
+            .tick(Now::from_millis(refresh_at), &[])
             .expect_err("the refresh failed");
         assert!(matches!(error, MdnsError::Io { .. }), "got {error:?}");
         assert!(!driver.is_active());
@@ -870,7 +910,7 @@ mod tests {
         let io = FakeIo::with_interfaces(u32::try_from(MAX_ACTIONS_PER_TICK).expect("fits") + 2);
         let sent = io.sent.clone();
         let mut driver = driver(io);
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         assert!(driver.pending_action.is_some());
 
         let announced = sent.borrow().len();
@@ -878,7 +918,9 @@ mod tests {
         let io = driver.io.as_mut().expect("still running");
         io.refresh_changes = true;
         io.interfaces.clear();
-        driver.tick(refresh_at, &[]).expect("tick");
+        driver
+            .tick(Now::from_millis(refresh_at), &[])
+            .expect("tick");
 
         // The parked packet was encoded against the interface set that just
         // changed -- every interface went away -- so sending it now would
@@ -896,7 +938,7 @@ mod tests {
         let io = FakeIo::with_interfaces(u32::try_from(MAX_ACTIONS_PER_TICK).expect("fits") + 2);
         let sent = io.sent.clone();
         let mut driver = driver(io);
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         let stale = driver
             .pending_action
             .clone()
@@ -910,7 +952,7 @@ mod tests {
         let addr: Multiaddr = "/ip4/192.168.1.1/udp/4001/quic-v1"
             .parse()
             .expect("test address");
-        driver.tick(1, &[addr]).expect("tick");
+        driver.tick(Now::from_millis(1), &[addr]).expect("tick");
         assert_ne!(
             sent.borrow().get(announced),
             Some(&stale),
@@ -925,7 +967,7 @@ mod tests {
         let ops = io.ops.clone();
         let mut driver = driver(io);
 
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         let ops = ops.borrow();
 
         // A stack running in this process moves nothing on its own. Reading
@@ -942,18 +984,50 @@ mod tests {
     #[test]
     fn a_carrier_with_its_own_timers_is_on_the_hosts_timeline() {
         let mut io = FakeIo::with_interfaces(1);
-        io.carrier_deadline = Some(5);
+        io.carrier_deadline = Some(Deadline::from_millis(5));
         let mut driver = driver(io);
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
 
         // A stack of its own gets nothing done between ticks, so a host that
         // slept through one of its deadlines would stall it -- retransmits
         // included.
         assert_eq!(
-            driver.next_timeout(0),
-            Some(5),
+            driver.next_deadline(Now::from_millis(0)),
+            Some(Deadline::from_millis(5)),
             "the soonest of everything on the timeline, not just mDNS's own"
         );
+    }
+
+    #[test]
+    fn deadlines_are_on_the_hosts_timeline_from_the_first_tick() {
+        let io = FakeIo::with_interfaces(1);
+        let mut driver = driver(io);
+        // A host whose clock has been running a while before mDNS starts.
+        let start = Now::from_millis(50_000);
+        driver.tick(start, &[]).expect("tick");
+
+        let refresh_ms = MdnsConfig::default().interface_refresh_ms;
+        let first_query = driver.agent.next_deadline(start).expect("armed");
+        assert!(first_query < Deadline::from_millis(50_000 + refresh_ms));
+        assert_eq!(driver.next_deadline(start), Some(first_query));
+
+        // A host that ran late still sees the query at its own past due time,
+        // so it reads as due rather than being pushed out.
+        let late = Now::from_millis(first_query.as_millis() + 7_000);
+        assert_eq!(driver.next_deadline(late), Some(first_query));
+
+        // The interface refresh is an interval after the first tick, not after
+        // some epoch of the driver's own: a host started late is not owed one
+        // straight away, and is owed one exactly when the interval is up.
+        let refresh_at = 50_000 + refresh_ms;
+        driver
+            .tick(Now::from_millis(refresh_at - 1), &[])
+            .expect("tick");
+        assert_eq!(driver.io.as_ref().expect("running").refreshes, 0);
+        driver
+            .tick(Now::from_millis(refresh_at), &[])
+            .expect("tick");
+        assert_eq!(driver.io.as_ref().expect("running").refreshes, 1);
     }
 
     #[test]
@@ -961,13 +1035,13 @@ mod tests {
         let io = FakeIo::with_interfaces(3);
         let sent = io.sent.clone();
         let mut driver = driver(io);
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         let announced = sent.borrow().len();
 
         // Every interface, not a budget's worth: this is the last thing that
         // will be said, and an unsent goodbye costs a peer a full TTL of
         // pointing at a host that has gone.
-        driver.shutdown(10).expect("goodbye");
+        driver.shutdown(Now::from_millis(10)).expect("goodbye");
         let after_goodbye = sent.borrow().len();
         assert_eq!(
             after_goodbye - announced,
@@ -977,7 +1051,9 @@ mod tests {
         );
         assert!(!driver.is_active());
 
-        driver.shutdown(20).expect("a second shutdown is a no-op");
+        driver
+            .shutdown(Now::from_millis(20))
+            .expect("a second shutdown is a no-op");
         assert_eq!(
             sent.borrow().len(),
             after_goodbye,
@@ -990,7 +1066,7 @@ mod tests {
         let io = FakeIo::with_interfaces(2);
         let ops = io.ops.clone();
         let mut driver = driver(io);
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         ops.borrow_mut().clear();
 
         // The carrier is dropped at the end of a shutdown, so this is its
@@ -998,7 +1074,7 @@ mod tests {
         // bytes only when driven would take every one of them with it --
         // and a goodbye that never left is the exact thing it exists to
         // prevent.
-        driver.shutdown(10).expect("goodbye");
+        driver.shutdown(Now::from_millis(10)).expect("goodbye");
         let ops = ops.borrow();
         assert!(ops.contains(&"send"), "{ops:?}");
         assert_eq!(
@@ -1017,14 +1093,14 @@ mod tests {
         io.room_per_poll = 1;
         let sent = io.sent.clone();
         let mut driver = driver(io);
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         let announced = sent.borrow().len();
 
         // A tick would park a congested datagram and come back for it. A
         // shutdown has no next turn, so it drains here instead -- and an
         // unsent goodbye costs a peer a full TTL of pointing at a host that
         // has gone, which is the whole reason a shutdown says one.
-        driver.shutdown(10).expect("goodbye");
+        driver.shutdown(Now::from_millis(10)).expect("goodbye");
         assert_eq!(
             sent.borrow().len() - announced,
             3,
@@ -1040,7 +1116,7 @@ mod tests {
         let mut driver = driver(io);
 
         driver
-            .shutdown(10)
+            .shutdown(Now::from_millis(10))
             .expect("an unsendable goodbye is a dropped datagram, not a shutdown failure");
         assert!(!driver.is_active());
     }
@@ -1056,7 +1132,9 @@ mod tests {
 
         // Reported rather than retried forever: a host that wants to exit
         // gets to, and it is told the goodbye did not make it.
-        let error = driver.shutdown(10).expect_err("the goodbye never got out");
+        let error = driver
+            .shutdown(Now::from_millis(10))
+            .expect_err("the goodbye never got out");
         assert!(matches!(error, MdnsError::Congested { .. }), "{error:?}");
         assert!(!driver.is_active());
         let polls = ops.borrow().iter().filter(|op| **op == "poll").count();
@@ -1071,7 +1149,7 @@ mod tests {
         let io = FakeIo::with_interfaces(2);
         let sent = io.sent.clone();
         let mut driver = driver(io);
-        driver.tick(0, &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]).expect("tick");
         let announced = sent.borrow().len();
 
         // A host that drops its driver has left the link. Peers that are not

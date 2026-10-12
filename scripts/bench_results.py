@@ -46,7 +46,7 @@ EXPECTED_CRITERION = {
     "yamux/64KiB/session_send_and_drain", "yamux/64KiB/session_receive_and_drain",
     "yamux/256KiB/queued_send_16KiB_window_updates", "yamux/1024_streams/sparse_send_8_streams",
     "peer_book_128_peers_16_addrs/tick_active", "peer_book_128_peers_16_addrs/tick_expire",
-    "peer_book_128_peers_16_addrs/next_timeout",
+    "peer_book_128_peers_16_addrs/next_deadline",
     "pubsub/gossipsub_publish_32x60KiB",
     "pubsub/gossipsub_forward_1KiB/8", "pubsub/gossipsub_forward_1KiB/32",
     "pubsub/gossipsub_forward_1KiB/128", "pubsub/gossipsub_heartbeat_1000_peers_100_topics",
@@ -71,7 +71,7 @@ GUNGRAUN_NAMES = {
     "sparse_send_8_of_1024_streams": "yamux/1024_streams/sparse_send_8_streams",
     "tick_active": "peer_book_128_peers_16_addrs/tick_active",
     "tick_expire": "peer_book_128_peers_16_addrs/tick_expire",
-    "next_timeout": "peer_book_128_peers_16_addrs/next_timeout",
+    "next_deadline": "peer_book_128_peers_16_addrs/next_deadline",
     "gossipsub_publish_32x60_kib": "pubsub/gossipsub_publish_32x60KiB",
     "gossipsub_forward_1_kib_8": "pubsub/gossipsub_forward_1KiB/8",
     "gossipsub_forward_1_kib_32": "pubsub/gossipsub_forward_1KiB/32",
@@ -82,7 +82,7 @@ GUNGRAUN_NAMES = {
         f"relay_{size}_{case}": f"relay_server_{size}/{case}"
         for size in ("100", "1k", "10k")
         for case in (
-            "next_timeout",
+            "next_deadline",
             "tick_idle",
             "tick_expire_100",
             "reserve_new_peer",

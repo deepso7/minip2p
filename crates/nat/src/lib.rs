@@ -65,9 +65,9 @@ pub use housekeeping::MAX_RESERVATION_RETRY_BACKOFF_MS;
 pub use inbound::MAX_PUNCH_CANDIDATES;
 pub use swarm::{DialStart, NatSwarm, NatSwarmError, is_named};
 pub use types::{NatError, NatToken, Path, PromoteError, ReachabilityState, ReservationInfo};
-// The one component time sample, re-exported so callers need not depend on
-// the platform crate to name it.
-pub use minip2p_platform::Now;
+// The component time sample and deadline, re-exported so callers need not
+// depend on the platform crate to name them.
+pub use minip2p_platform::{Deadline, Now};
 
 // Protocol ids for everything the agent drives, so a driver can register
 // them without depending on each protocol crate.

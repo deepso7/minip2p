@@ -6,7 +6,7 @@ use alloc::{collections::BTreeMap, string::ToString};
 use alloc::{collections::VecDeque, vec, vec::Vec};
 #[cfg(not(feature = "_circuit-driver"))]
 use core::marker::PhantomData;
-use minip2p_platform::{EntropySource, Now};
+use minip2p_platform::{Deadline, EntropySource, Now};
 
 #[cfg(feature = "_circuit-driver")]
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole, CircuitTransport};
@@ -274,13 +274,13 @@ impl<T: Transport> NatDriver<T> {
         self.pump(swarm, sample);
     }
 
-    /// How long the caller may idle before [`NatDriver::tick`] has work: `0`
-    /// when queued events or agent timers are due, `None` when nothing is.
-    pub(crate) fn next_timeout(&self, now: Now) -> Option<u64> {
+    /// When [`NatDriver::tick`] next has work: immediately while events are
+    /// queued, else the agent's next timer, `None` when nothing is armed.
+    pub(crate) fn next_deadline(&self, now: Now) -> Option<Deadline> {
         if !self.unrouted.is_empty() || !self.staged.is_empty() {
-            Some(0)
+            Some(Deadline::IMMEDIATE)
         } else {
-            self.agent.next_timeout(now.monotonic_ms)
+            self.agent.next_deadline(now)
         }
     }
 
@@ -416,7 +416,11 @@ impl<T: Transport> NatDriver<T> {
         // the seed is what arms the probe timers that would otherwise
         // keep this tick early-returning forever.
         self.sync_listen_addrs(swarm);
-        if self.agent.next_timeout(now.monotonic_ms) != Some(0) {
+        if !self
+            .agent
+            .next_deadline(now)
+            .is_some_and(|due| due.is_expired_at(now))
+        {
             return;
         }
         let mut io = EndpointSwarm::new(swarm, &mut self.io);
