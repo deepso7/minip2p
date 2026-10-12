@@ -613,6 +613,9 @@ impl P2pEndpoint {
     /// event: [`P2pEvent::PathEstablished`], [`P2pEvent::ConnectFailed`], or
     /// [`P2pEvent::ConnectCancelled`] after [`Self::cancel_connect`].
     /// Synchronous errors cover malformed targets only.
+    ///
+    /// A peer that is already connected keeps its connection: the attempt
+    /// settles on it and the addresses passed are not dialed.
     pub fn connect(&self, target: crate::ConnectTarget) -> Result<u64, FfiError> {
         let target = crate::connect::parse_connect_target(target)?;
         self.with_endpoint_mut(|endpoint| {

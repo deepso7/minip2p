@@ -219,6 +219,10 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// established connection the swarm keeps (including a simultaneous
     /// inbound), and the app sees any later hand-over as an ordinary
     /// connection event.
+    ///
+    /// Connecting to a peer that is already connected reuses that
+    /// connection: the attempt settles at once with the current connection,
+    /// and the addresses passed are not dialed.
     #[expect(
         clippy::result_large_err,
         reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."

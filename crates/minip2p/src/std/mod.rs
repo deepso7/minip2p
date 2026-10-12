@@ -408,6 +408,10 @@ impl Endpoint {
     /// including names still resolving, has failed and no relay leg remains.
     /// There is no separate DNS timeout: the attempt deadline covers the
     /// lookup. Under `force_relay` names are not looked up at all.
+    ///
+    /// Connecting to a peer that is already connected reuses that
+    /// connection: the attempt settles at once with the current connection,
+    /// and the addresses passed are not dialed.
     #[expect(
         clippy::result_large_err,
         reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."

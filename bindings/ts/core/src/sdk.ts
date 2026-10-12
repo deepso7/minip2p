@@ -1433,6 +1433,9 @@ export class Minip2pBase {
    * Every internal dial, relay fallback, and path upgrade belongs to that ID,
    * and the attempt ends with exactly one terminal event: `pathEstablished`,
    * `connectFailed`, or `connectCancelled`. Only malformed targets throw.
+   *
+   * A peer that is already connected keeps its connection: the attempt
+   * settles on it and the addresses passed are not dialed.
    */
   startConnect(target: ConnectTarget): number {
     this.#assertOpen();
