@@ -206,8 +206,7 @@ const MAX_HELD_PER_STREAM: usize = 64 * 1024;
 ///
 /// A held stream's later writes and its write-side close queue behind the
 /// tail, and [`replay`](Self::replay) resends them on the stream's
-/// Writable. Hosts whose adapter already holds tails never return Full, so
-/// for them this only forwards.
+/// Writable.
 pub(crate) struct HoldingSwarm<'a> {
     pub(crate) inner: &'a mut dyn NatSwarm,
     pub(crate) held: &'a mut HeldWrites,

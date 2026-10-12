@@ -1298,3 +1298,37 @@ fn late_reserve_dial_failure_after_rotation_keeps_the_new_acquisition() {
     ready_on(&mut hk, &relay2, new, HOP_PROTOCOL_ID, at(retry_at + 2));
     assert_eq!(hop_open_count(&drain_actions(&mut hk.agent), &relay2), 1);
 }
+
+#[test]
+fn a_held_request_is_resent_and_closed_after_its_exchange_finishes() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    hk.agent.handle_tick(at(0));
+    let relay = hk.relay.clone();
+    hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
+
+    // The RESERVE is refused as Full; a relay that answers anyway finishes
+    // the exchange, which releases the stream with the tail still held.
+    hk.agent.swarm.full_sends = true;
+    let (events, stream) = hk.finish_reserve(hop_reserve_ok(None), at(3));
+    assert!(matches!(
+        events.as_slice(),
+        [NatEvent::RelayReserved { .. }]
+    ));
+    hk.agent.swarm.full_sends = false;
+
+    hk.agent.handle_event(
+        &SwarmEvent::StreamWritable {
+            peer_id: relay.clone(),
+            conn_id: hk.agent.swarm.connection(&relay).expect("relay session"),
+            stream_id: stream,
+        },
+        false,
+        at(4),
+    );
+    let actions = drain_actions(&mut hk.agent);
+    assert!(!sent_data_on(&actions, stream).is_empty());
+    assert!(matches!(
+        actions.last(),
+        Some(Out::CloseStreamWrite { stream_id, .. }) if *stream_id == stream
+    ));
+}

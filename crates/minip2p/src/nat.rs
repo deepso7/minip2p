@@ -35,7 +35,8 @@ fn nat_event_reaches_application(event: &NatEvent) -> bool {
     )
 }
 
-/// Joins held tails into one payload; a single tail is passed through.
+/// Joins the bytes a promoted bridge still owes into one payload; a single
+/// chunk is passed through.
 #[cfg(feature = "_circuit-driver")]
 fn concat(mut tails: VecDeque<Bytes>) -> Bytes {
     if tails.len() <= 1 {

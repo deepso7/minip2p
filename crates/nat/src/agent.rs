@@ -374,8 +374,9 @@ impl Shared {
     }
 }
 
-/// Writes NAT control bytes on an exact stream. Every agent call wraps the
-/// host's swarm in a [`HoldingSwarm`], so a write refused as Full is held
+/// Writes NAT control bytes on an exact stream. Every agent entry point that
+/// writes wraps the host's swarm in a [`HoldingSwarm`], so a write refused as
+/// Full is held
 /// and resent on the stream's Writable; any other refusal is left to the
 /// exchange's own deadline.
 pub(crate) fn send(
@@ -638,10 +639,13 @@ impl NatAgent {
                 conn_id,
                 stream_id,
             } = event
-                && agent
-                    .shared
-                    .owned_role(*conn_id, peer_id, *stream_id)
-                    .is_some()
+                // A finished exchange releases its stream at once, so a tail
+                // and FIN still held for it are replayed without ownership.
+                && (swarm.held.is_held(*conn_id, *stream_id)
+                    || agent
+                        .shared
+                        .owned_role(*conn_id, peer_id, *stream_id)
+                        .is_some())
             {
                 swarm.replay(peer_id, *conn_id, *stream_id, now.monotonic_ms);
                 return true;
