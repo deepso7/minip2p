@@ -502,6 +502,9 @@ impl StdTcpProvider {
         // said so (an unattached provider gets none).
         socket.writable = true;
         self.connecting.remove(&handle);
+        // Readable edges while connecting were not recorded, so probe once:
+        // the peer may already have written.
+        self.readable.insert(handle);
         socket.remote = socket_addr_to_multiaddr(peer);
         let remote = socket.remote.clone();
         // Connect completion was the only reason to watch writability.
@@ -519,8 +522,14 @@ impl StdTcpProvider {
             let Some(socket) = self.sockets.get_mut(&handle) else {
                 return;
             };
-            if !self.readable.contains(&handle) || !matches!(socket.phase, Phase::Open) {
-                // A connecting socket keeps its mark for once it is open.
+            if !self.readable.contains(&handle) {
+                return;
+            }
+            if !matches!(socket.phase, Phase::Open) {
+                // Never left marked while connecting: the mark would keep the
+                // provider due, spinning a host until the connect settles.
+                // Settling probes a read instead.
+                self.readable.remove(&handle);
                 return;
             }
             if socket.read_closed {
@@ -757,7 +766,13 @@ impl TcpProvider for StdTcpProvider {
         if self.registration.is_none() {
             // Nothing reports readiness yet, so every open socket may have
             // something; reading one that does not costs a `WouldBlock`.
-            self.readable.extend(self.sockets.keys().copied());
+            // Connecting ones are probed when they settle.
+            self.readable.extend(
+                self.sockets
+                    .iter()
+                    .filter(|(_, socket)| matches!(socket.phase, Phase::Open))
+                    .map(|(handle, _)| *handle),
+            );
         }
         self.accept_all();
 
@@ -833,11 +848,22 @@ impl PollSource for StdTcpProvider {
     }
 
     fn dispatch(&mut self, event: &Event) {
+        self.record_readiness(
+            event.token(),
+            event.is_readable() || event.is_read_closed() || event.is_error(),
+            event.is_writable(),
+        );
+    }
+}
+
+impl StdTcpProvider {
+    /// What [`dispatch`](PollSource::dispatch) records for one event.
+    fn record_readiness(&mut self, token: Token, readable: bool, writable: bool) {
         self.dispatched = true;
         let Some(slot) = self
             .registration
             .as_ref()
-            .and_then(|registration| registration.slot(event.token()))
+            .and_then(|registration| registration.slot(token))
         else {
             // A token freed since: a stale event, and nothing to do.
             return;
@@ -850,10 +876,14 @@ impl PollSource for StdTcpProvider {
         let Some(socket) = self.sockets.get_mut(&handle) else {
             return;
         };
-        if event.is_readable() || event.is_read_closed() || event.is_error() {
+        // A connecting socket is not marked: the connect settles on the next
+        // poll regardless and then probes a read, while a mark (from a stale
+        // event for a recycled token, say) would keep the provider due until
+        // then.
+        if readable && matches!(socket.phase, Phase::Open) {
             self.readable.insert(handle);
         }
-        if event.is_writable() {
+        if writable {
             socket.writable = true;
             if matches!(socket.phase, Phase::Open) && socket.watching_writable {
                 // The socket has room again, so stop watching for it.
@@ -925,6 +955,35 @@ mod tests {
                 .all(|event| !matches!(event, TcpEvent::Closed { .. } | TcpEvent::Received { .. })),
             "a spurious wake is harmless: {events:?}"
         );
+    }
+
+    #[test]
+    fn a_stale_readable_event_does_not_keep_a_connecting_replacement_due() {
+        let (_server, bound) = loopback_listener();
+        let mut client = StdTcpProvider::new().expect("client");
+        let mut poll = SharedPoll::new().expect("poll");
+        poll.attach(&mut client).expect("attach");
+
+        let old = client.connect(&bound).expect("first connect");
+        let token = token_of(&client, old).expect("registered");
+        client.abort(old);
+        let new = client.connect(&bound).expect("second connect");
+        assert_eq!(token_of(&client, new), Some(token), "token recycled");
+        assert!(matches!(client.sockets[&new].phase, Phase::Connecting));
+
+        // The old socket's readable edge lands on the replacement while its
+        // connect is still pending.
+        client.record_readiness(token, true, false);
+        assert!(
+            !client.readable.contains(&new),
+            "a connecting socket is never left marked readable"
+        );
+
+        // Due once, for the dispatch; after the poll nothing keeps it due,
+        // whether or not the connect has settled yet (it probes a read when
+        // it does).
+        client.poll(Now::from_millis(0)).expect("poll");
+        assert_eq!(TcpProvider::next_deadline(&client), None, "no spin");
     }
 
     #[test]
