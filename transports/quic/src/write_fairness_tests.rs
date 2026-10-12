@@ -137,3 +137,36 @@ fn control_streams_write_through_the_reserve_when_application_streams_fill_the_q
         .send_stream(id, control, Bytes::from(vec![1; 3_000]))
         .expect("the reserve holds a control write");
 }
+
+#[test]
+fn a_full_control_stream_wakes_once_a_small_reserve_frees() {
+    let mut server = listening_server(QuicLimits {
+        max_pending_bytes_per_stream: 4_000,
+        max_pending_connection_bytes: 12_000,
+        control_stream_reserve_bytes: 1_000,
+        ..QuicLimits::default()
+    });
+    let (mut peer, id) = accept(&mut server, &mut [], small_stream_window);
+    let apps: Vec<StreamId> = (0..3)
+        .map(|_| server.open_stream(id).expect("open"))
+        .collect();
+    let control = server.open_stream(id).expect("open");
+    server.set_control_stream(id, control, true);
+    let payload = Bytes::from(vec![7; 10_000]);
+    for &stream in &apps {
+        while accepted(&payload, server.send_stream(id, stream, payload.clone())) > 0 {}
+    }
+
+    // Only the reserve is left. Once the engine takes the queued part, the
+    // reserve is free again, which must be enough to wake the stream.
+    assert!(matches!(
+        server.send_stream(id, control, Bytes::from(vec![1; 3_000])),
+        Err(TransportError::Full { .. })
+    ));
+    drive_reading(&mut server, &mut peer, &[], "Writable", |events, _| {
+        events.contains(&TransportEvent::StreamWritable {
+            id,
+            stream_id: control,
+        })
+    });
+}

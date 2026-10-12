@@ -63,9 +63,15 @@ impl SendCaps {
     }
 
     /// Room a Full stream needs on both caps before its Writable fires:
-    /// half the smaller one it may fill.
+    /// half the smaller one it may fill. A control stream may be left only
+    /// the reserve once application streams fill their share, so a non-zero
+    /// reserve bounds its threshold too.
     fn writable_threshold(&self, control: bool) -> usize {
-        (self.stream.min(self.connection_for(control)) / 2).max(1)
+        let mut smallest = self.stream.min(self.connection_for(control));
+        if control && self.control_reserve != 0 {
+            smallest = smallest.min(self.control_reserve);
+        }
+        (smallest / 2).max(1)
     }
 }
 

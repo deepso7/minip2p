@@ -407,6 +407,10 @@ pub(crate) struct SwarmState {
     /// User streams whose write the core refused because `held` had bytes for
     /// them; they get a `StreamWritable` once `held` is replayed.
     user_writable_wanted: BTreeSet<(ConnectionId, StreamId)>,
+    /// Streams negotiated for an application protocol while `held` had
+    /// negotiation bytes for them. They stay control streams, so those bytes
+    /// keep the reserve, until the held tail is replayed.
+    pending_demotions: BTreeSet<(ConnectionId, StreamId)>,
 
     // --- Queues ---
     /// The application event queue. An event here has not been delivered:
@@ -477,6 +481,7 @@ impl SwarmState {
             events: VecDeque::new(),
             held: HeldWrites::new(),
             user_writable_wanted: BTreeSet::new(),
+            pending_demotions: BTreeSet::new(),
             actions: VecDeque::new(),
             deferred_closes: VecDeque::new(),
         }
@@ -614,6 +619,18 @@ impl SwarmState {
     /// Queues a write or close behind the stream's held bytes. Returns the
     /// action back when it may be dispatched now.
     fn hold_action(&mut self, action: Action) -> Option<Action> {
+        // Demoting a stream before its held negotiation bytes are accepted
+        // would take the control reserve away from them.
+        if let Action::SetControlStream {
+            conn_id,
+            stream_id,
+            control: false,
+        } = action
+            && self.held.is_held(conn_id, stream_id)
+        {
+            self.pending_demotions.insert((conn_id, stream_id));
+            return None;
+        }
         let Some((conn_id, stream_id)) = stream_write_key(&action) else {
             return Some(action);
         };
@@ -643,6 +660,7 @@ impl SwarmState {
         }
         self.held.forget_stream(conn_id, stream_id);
         self.user_writable_wanted.remove(&(conn_id, stream_id));
+        self.pending_demotions.remove(&(conn_id, stream_id));
         // Writes still queued for the stream would otherwise go out ahead of
         // the reset now that nothing holds them back.
         let is_write = |action: &Action| stream_write_key(action) == Some((conn_id, stream_id));
@@ -685,6 +703,10 @@ impl SwarmState {
                     data,
                 });
             }
+            // Behind the tails, and held again if one comes back Full.
+            if self.pending_demotions.remove(&key) {
+                self.mark_control(conn_id, stream_id, false);
+            }
             if held.close {
                 self.actions
                     .push_back(Action::CloseStreamWrite { conn_id, stream_id });
@@ -710,6 +732,7 @@ impl SwarmState {
     fn forget_held(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
         self.held.forget_stream(conn_id, stream_id);
         self.user_writable_wanted.remove(&(conn_id, stream_id));
+        self.pending_demotions.remove(&(conn_id, stream_id));
     }
 
     /// Whether no action, event, or deferred close is queued.
@@ -924,6 +947,10 @@ impl SwarmState {
         self.reset_pending.remove(&key);
         self.abandoned_streams.remove(&key);
         self.user_writable_wanted.remove(&key);
+        // The new owner sends the owed bytes as application writes.
+        if self.pending_demotions.remove(&key) {
+            self.mark_control(conn_id, stream_id, false);
+        }
         let mut owed = self
             .held
             .take(conn_id, stream_id)
@@ -2210,6 +2237,7 @@ impl SwarmState {
     fn forget_connection_streams(&mut self, conn_id: ConnectionId) {
         self.held.forget_connection(conn_id);
         self.user_writable_wanted.retain(|(cid, _)| *cid != conn_id);
+        self.pending_demotions.retain(|(cid, _)| *cid != conn_id);
         self.stream_owner.retain(|key, _| key.conn_id != conn_id);
         self.reset_pending.retain(|(cid, _)| *cid != conn_id);
         self.abandoned_streams.retain(|(cid, _)| *cid != conn_id);
@@ -3607,20 +3635,15 @@ mod tests {
                 data: Bytes::from(offer),
             },
         );
+        // The stream stays a control stream while the core holds its reply,
+        // so the held bytes keep the control reserve.
         assert_eq!(
             drain_actions(&mut core),
-            [
-                Action::SetControlStream {
-                    conn_id,
-                    stream_id,
-                    control: false,
-                },
-                Action::AckStream {
-                    conn_id,
-                    stream_id,
-                    bytes: offer_len,
-                }
-            ],
+            [Action::AckStream {
+                conn_id,
+                stream_id,
+                bytes: offer_len,
+            }],
             "only the offer's ack goes out"
         );
 
@@ -3663,9 +3686,14 @@ mod tests {
             [
                 send(&header[3..]),
                 send(&multistream_frame(PROTOCOL)),
+                Action::SetControlStream {
+                    conn_id,
+                    stream_id,
+                    control: false,
+                },
                 Action::CloseStreamWrite { conn_id, stream_id },
             ],
-            "the tail, then the queued echo, then the FIN"
+            "the tail, then the queued echo, then the demotion, then the FIN"
         );
         assert!(
             !outputs

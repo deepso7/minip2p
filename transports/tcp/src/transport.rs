@@ -890,13 +890,10 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
     }
 
     fn set_control_stream(&mut self, id: ConnectionId, stream_id: StreamId, control: bool) {
+        // Nothing returns to the caller, so a session the mark's flush fails
+        // is torn down with an `Error` carrying the reason.
         if self.connections.contains_key(&id) {
-            // A session the mark fails is torn down by `operate_session`;
-            // the caller has nothing to retry.
-            match self.operate_session(id, |session| session.set_control_stream(stream_id, control))
-            {
-                Ok(()) | Err(_) => {}
-            }
+            self.drive_connection(id, |session| session.set_control_stream(stream_id, control));
         }
     }
 

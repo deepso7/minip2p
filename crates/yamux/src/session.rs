@@ -144,6 +144,18 @@ fn total_cap_for(config: &YamuxConfig, control: bool) -> usize {
     }
 }
 
+/// Room a Full stream needs on both caps before its Writable fires: half the
+/// smaller of its stream cap and the total cap it may fill. A control stream
+/// may be left only the reserve once application streams fill their share,
+/// so a non-zero reserve bounds its threshold too.
+fn writable_threshold(config: &YamuxConfig, control: bool) -> usize {
+    let mut smallest = config.max_buffered_send.min(total_cap_for(config, control));
+    if control && config.control_stream_reserve != 0 {
+        smallest = smallest.min(config.control_stream_reserve);
+    }
+    (smallest / 2).max(1)
+}
+
 /// Caller-driven Yamux stream-multiplexing session.
 ///
 /// # Output
@@ -872,8 +884,8 @@ impl YamuxSession {
     }
 
     /// Queues [`YamuxOutput::Writable`] for every armed stream that can now
-    /// queue at least half of the smaller of its stream cap and the total
-    /// cap it may fill ([`total_cap_for`]).
+    /// queue at least [`writable_threshold`] on both its stream cap and the
+    /// total cap it may fill ([`total_cap_for`]).
     fn wake_writable(&mut self) {
         if self.writable_armed.is_empty() {
             return;
@@ -886,10 +898,10 @@ impl YamuxSession {
             let Some(state) = streams.get(stream) else {
                 return false;
             };
-            let total_cap = total_cap_for(config, state.control);
-            let threshold = (config.max_buffered_send.min(total_cap) / 2).max(1);
+            let threshold = writable_threshold(config, state.control);
             if config.max_buffered_send.saturating_sub(state.buffered_send) < threshold
-                || total_cap.saturating_sub(total_buffered_send) < threshold
+                || total_cap_for(config, state.control).saturating_sub(total_buffered_send)
+                    < threshold
             {
                 return true;
             }
@@ -1460,6 +1472,43 @@ mod tests {
             session.send(control, Bytes::from(alloc::vec![2; 9])),
             Err(YamuxError::Full { unsent, .. }) if unsent.len() == 1
         ));
+    }
+
+    #[test]
+    fn a_full_control_stream_wakes_once_the_reserve_frees_even_when_it_is_small() {
+        let mut limits = config();
+        limits.max_buffered_send = 8;
+        limits.max_total_buffered_send = 12;
+        limits.control_stream_reserve = 2;
+        let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        let apps = [
+            session.open_stream().unwrap(),
+            session.open_stream().unwrap(),
+        ];
+        let control = session.open_stream().unwrap();
+        session.set_control(control, true);
+
+        // Stalled application streams hold their whole share for good.
+        for app in apps {
+            session.streams.get_mut(&app).unwrap().send_window = 0;
+            match session.send(app, Bytes::from(alloc::vec![1; 8])) {
+                Ok(()) | Err(YamuxError::Full { .. }) => {}
+                Err(error) => panic!("{error}"),
+            }
+        }
+        assert_eq!(session.total_buffered_send(), 10);
+        assert!(matches!(
+            session.send(control, Bytes::from_static(b"ping")),
+            Err(YamuxError::Full { unsent, .. }) if unsent.len() == 2
+        ));
+
+        // Only the reserve can free, and that must be enough to wake it.
+        while session.poll_frame().is_some() {}
+        let events: Vec<_> = core::iter::from_fn(|| session.poll_event()).collect();
+        assert!(
+            events.contains(&YamuxOutput::Writable { stream: control }),
+            "{events:?}"
+        );
     }
 
     #[test]

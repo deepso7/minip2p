@@ -972,13 +972,17 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !id.is_circuit() {
             return self.inner.set_control_stream(id, stream_id, control);
         }
-        if self.circuits.contains_key(&id) {
-            // A session the mark fails is torn down by `operate_session`;
-            // the caller has nothing to retry.
-            match self.operate_session(id, |session| session.set_control_stream(stream_id, control))
-            {
-                Ok(()) | Err(_) => {}
-            }
+        // Nothing returns to the caller, so a circuit the mark's flush fails
+        // is torn down with an `Error` carrying the reason.
+        if !self.circuits.contains_key(&id) {
+            return;
+        }
+        let result = self.with_circuit(id, |this, circuit| {
+            circuit.session.set_control_stream(stream_id, control)?;
+            this.pump(circuit)
+        });
+        if let Err(teardown) = result {
+            self.fail_circuit(id, teardown.message, !teardown.graceful);
         }
     }
 
