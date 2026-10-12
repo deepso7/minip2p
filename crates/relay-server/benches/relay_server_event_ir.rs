@@ -105,14 +105,17 @@ fn scale_config(size: u64) -> RelayServerConfig {
     let headroom = 2 * size as usize + 16;
     RelayServerConfig {
         max_reservations: headroom,
+        max_reservations_per_ip: headroom,
         reservation_duration_secs: RESERVATION_SECS,
         max_circuits: headroom,
         max_circuits_per_peer: headroom,
+        max_circuits_per_ip: headroom,
         max_circuit_duration_secs: 2 * RESERVATION_SECS,
         reservation_rate_limit_per_peer: limit,
         reservation_rate_limit_per_ip: limit,
         circuit_rate_limit_per_peer: limit,
         circuit_rate_limit_per_ip: limit,
+        max_rate_limit_entries: headroom,
         ..RelayServerConfig::default()
     }
 }

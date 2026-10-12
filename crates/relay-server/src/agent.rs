@@ -23,10 +23,42 @@ use crate::{
     RelayServerToken, ReservationCloseReason, StreamKey,
 };
 
+/// The key per-IP admission limits share: an IPv4 address (IPv4-mapped
+/// IPv6 included) or an IPv6 /64, since one host commonly holds a whole /64.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum IpKey {
     V4([u8; 4]),
-    V6([u8; 16]),
+    V6Prefix([u8; 8]),
+}
+
+/// Live reservations or circuits per admission key.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct IpTally(BTreeMap<IpKey, usize>);
+
+impl IpTally {
+    /// Whether `key` already holds `max` entries. A connection without an IP
+    /// has no key and is never at the cap.
+    fn is_full(&self, key: Option<&IpKey>, max: usize) -> bool {
+        key.is_some_and(|key| self.0.get(key).copied().unwrap_or(0) >= max)
+    }
+
+    fn add(&mut self, key: Option<&IpKey>) {
+        if let Some(key) = key {
+            *self.0.entry(key.clone()).or_default() += 1;
+        }
+    }
+
+    fn remove(&mut self, key: Option<&IpKey>) {
+        let Some(key) = key else {
+            return;
+        };
+        if let Some(count) = self.0.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                self.0.remove(key);
+            }
+        }
+    }
 }
 
 struct AdmissionLimiters {
@@ -35,20 +67,21 @@ struct AdmissionLimiters {
 }
 
 impl AdmissionLimiters {
-    fn new(peer: Option<RateLimit>, ip: Option<RateLimit>) -> Self {
+    fn new(peer: Option<RateLimit>, ip: Option<RateLimit>, max_entries: usize) -> Self {
         Self {
-            peer: peer.map(TokenBuckets::new),
-            ip: ip.map(TokenBuckets::new),
+            peer: peer.map(|limit| TokenBuckets::new(limit, max_entries)),
+            ip: ip.map(|limit| TokenBuckets::new(limit, max_entries)),
         }
     }
 
-    /// Whether every applicable bucket holds a token, spending none.
-    fn allows(&self, peer_id: &PeerId, ip: Option<&IpKey>, now_ms: u64) -> bool {
+    /// Whether every applicable bucket holds a token, spending none. A key
+    /// new to a full limiter map has no token.
+    fn allows(&mut self, peer_id: &PeerId, ip: Option<&IpKey>, now_ms: u64) -> bool {
         let peer = self
             .peer
-            .as_ref()
+            .as_mut()
             .is_none_or(|limiter| limiter.allows(peer_id, now_ms));
-        let ip = match (&self.ip, ip) {
+        let ip = match (&mut self.ip, ip) {
             (Some(limiter), Some(ip)) => limiter.allows(ip, now_ms),
             _ => true,
         };
@@ -95,12 +128,15 @@ struct Connection {
 
 struct ReservationRecord {
     conn_id: ConnectionId,
+    /// The admission key it counts against, fixed when first admitted.
+    ip: Option<IpKey>,
 }
 
 struct PendingReservation {
     stream: StreamKey,
     peer_id: PeerId,
     conn_id: ConnectionId,
+    ip: Option<IpKey>,
     renewed: bool,
     deadline_ms: u64,
     expires_unix_secs: Option<u64>,
@@ -150,6 +186,8 @@ struct HopWorker {
 struct PendingCircuit {
     source_peer_id: PeerId,
     destination_peer_id: PeerId,
+    source_ip: Option<IpKey>,
+    destination_ip: Option<IpKey>,
     destination_conn_id: ConnectionId,
     stop_stream: Option<StreamKey>,
     stop: Option<StopInitiator>,
@@ -162,6 +200,8 @@ struct PendingCircuit {
 struct Circuit {
     source_peer_id: PeerId,
     destination_peer_id: PeerId,
+    source_ip: Option<IpKey>,
+    destination_ip: Option<IpKey>,
     source_stream: StreamKey,
     destination_stream: StreamKey,
     bytes: CircuitByteCounts,
@@ -497,6 +537,11 @@ pub struct RelayServerAgent {
     last_event_tick_ms: Option<u64>,
     reservation_limiters: AdmissionLimiters,
     circuit_limiters: AdmissionLimiters,
+    /// Pending plus committed reservations per admission key.
+    ip_reservations: IpTally,
+    /// Pending plus committed circuits per admission key, a circuit whose
+    /// ends share a key counted once.
+    ip_circuits: IpTally,
 }
 
 impl RelayServerAgent {
@@ -525,11 +570,15 @@ impl RelayServerAgent {
             reservation_limiters: AdmissionLimiters::new(
                 config.reservation_rate_limit_per_peer,
                 config.reservation_rate_limit_per_ip,
+                config.max_rate_limit_entries,
             ),
             circuit_limiters: AdmissionLimiters::new(
                 config.circuit_rate_limit_per_peer,
                 config.circuit_rate_limit_per_ip,
+                config.max_rate_limit_entries,
             ),
+            ip_reservations: IpTally::default(),
+            ip_circuits: IpTally::default(),
             config,
             accepting: true,
             explicit_addrs: None,
@@ -1024,6 +1073,7 @@ impl RelayServerAgent {
                         self.insert_reservation(
                             pending.peer_id.clone(),
                             pending.conn_id,
+                            pending.ip.clone(),
                             pending.deadline_ms,
                         );
                         self.events
@@ -1610,12 +1660,19 @@ impl RelayServerAgent {
                     .saturating_add(self.config.max_circuit_duration_secs.saturating_mul(1_000)),
             );
         }
-        self.hold_peer_circuit(&pending.source_peer_id, &pending.destination_peer_id);
+        self.hold_circuit(
+            &pending.source_peer_id,
+            &pending.destination_peer_id,
+            pending.source_ip.as_ref(),
+            pending.destination_ip.as_ref(),
+        );
         self.circuits.insert(
             source_stream,
             Circuit {
                 source_peer_id: pending.source_peer_id.clone(),
                 destination_peer_id: pending.destination_peer_id.clone(),
+                source_ip: pending.source_ip.clone(),
+                destination_ip: pending.destination_ip.clone(),
                 source_stream,
                 destination_stream,
                 bytes: CircuitByteCounts::default(),
@@ -1901,10 +1958,16 @@ impl RelayServerAgent {
         else {
             return;
         };
-        let renewed = self
+        let renewal = self
             .reservations
             .get(&peer_id)
-            .is_some_and(|reservation| reservation.conn_id == key.conn_id);
+            .filter(|reservation| reservation.conn_id == key.conn_id);
+        let renewed = renewal.is_some();
+        // A renewal keeps the key it was admitted under.
+        let ip = match renewal {
+            Some(reservation) => reservation.ip.clone(),
+            None => self.connection_ip(key.conn_id),
+        };
         let pending_for_peer =
             self.reserving_peers.contains(&peer_id) || self.renewing_peers.contains_key(&peer_id);
         let deadline_ms = now
@@ -1921,7 +1984,7 @@ impl RelayServerAgent {
             Some(Status::ReservationRefused)
         // Renewals keep an admitted reservation alive and spend no token.
         } else if pending_for_peer
-            || !renewed && !self.admit_new_reservation(&peer_id, key.conn_id, now.monotonic_ms)
+            || !renewed && !self.admit_new_reservation(&peer_id, ip.as_ref(), now.monotonic_ms)
         {
             Some(Status::ResourceLimitExceeded)
         } else {
@@ -1959,6 +2022,7 @@ impl RelayServerAgent {
                 stream: key,
                 peer_id,
                 conn_id: key.conn_id,
+                ip,
                 renewed,
                 deadline_ms,
                 expires_unix_secs,
@@ -1993,30 +2057,26 @@ impl RelayServerAgent {
     }
 
     /// Admission for a new reservation: needs a rate-limit token and room
-    /// under `max_reservations` (committed plus pending new ones), and spends
-    /// the token only when both hold.
-    fn admit_new_reservation(
-        &mut self,
-        peer_id: &PeerId,
-        conn_id: ConnectionId,
-        now_ms: u64,
-    ) -> bool {
-        let ip = self.connection_ip(conn_id);
-        if !self
-            .reservation_limiters
-            .allows(peer_id, ip.as_ref(), now_ms)
-        {
+    /// under `max_reservations` and `max_reservations_per_ip` (committed plus
+    /// pending new ones), and spends the token only when all hold.
+    fn admit_new_reservation(&mut self, peer_id: &PeerId, ip: Option<&IpKey>, now_ms: u64) -> bool {
+        if !self.reservation_limiters.allows(peer_id, ip, now_ms) {
             return false;
         }
         let pending_initial = self.reserving_peers.len();
-        if self.reservations.len().saturating_add(pending_initial) >= self.config.max_reservations {
+        if self.reservations.len().saturating_add(pending_initial) >= self.config.max_reservations
+            || self
+                .ip_reservations
+                .is_full(ip, self.config.max_reservations_per_ip)
+        {
             return false;
         }
-        self.reservation_limiters.consume(peer_id, ip, now_ms);
+        self.reservation_limiters
+            .consume(peer_id, ip.cloned(), now_ms);
         true
     }
 
-    /// The first IP of `conn_id`'s remote address, the per-IP limit key.
+    /// The admission key of `conn_id`'s remote address's first IP.
     fn connection_ip(&self, conn_id: ConnectionId) -> Option<IpKey> {
         self.connections
             .get(&conn_id)
@@ -2036,6 +2096,9 @@ impl RelayServerAgent {
             .reservations
             .get(&destination_peer_id)
             .map(|reservation| reservation.conn_id);
+        let source_ip = self.connection_ip(key.conn_id);
+        let destination_ip = destination_conn.and_then(|conn_id| self.connection_ip(conn_id));
+        let max_per_ip = self.config.max_circuits_per_ip;
         let status = if !self.accepting
             || self
                 .connections
@@ -2045,12 +2108,14 @@ impl RelayServerAgent {
             Some(Status::PermissionDenied)
         } else if !self.circuit_limiters.allows(
             &source_peer_id,
-            self.connection_ip(key.conn_id).as_ref(),
+            source_ip.as_ref(),
             now.monotonic_ms,
         ) || self.peer_circuit_count(&source_peer_id) >= self.config.max_circuits_per_peer
             || (source_peer_id != destination_peer_id
                 && self.peer_circuit_count(&destination_peer_id)
                     >= self.config.max_circuits_per_peer)
+            || circuit_ip_keys(source_ip.as_ref(), destination_ip.as_ref())
+                .any(|ip| self.ip_circuits.is_full(Some(ip), max_per_ip))
             || self
                 .pending_circuits
                 .len()
@@ -2078,15 +2143,16 @@ impl RelayServerAgent {
             return;
         }
         // Admitted: only now does the request cost a token.
-        let ip = self.connection_ip(key.conn_id);
         self.circuit_limiters
-            .consume(&source_peer_id, ip, now.monotonic_ms);
+            .consume(&source_peer_id, source_ip.clone(), now.monotonic_ms);
         let destination_conn_id = destination_conn.expect("checked above");
         self.insert_pending_circuit(
             key,
             PendingCircuit {
                 source_peer_id: source_peer_id.clone(),
                 destination_peer_id: destination_peer_id.clone(),
+                source_ip,
+                destination_ip,
                 destination_conn_id,
                 stop_stream: None,
                 stop: None,
@@ -2318,6 +2384,7 @@ impl RelayServerAgent {
                 self.renewing_peers.insert(pending.peer_id.clone(), parked);
             } else {
                 self.reserving_peers.insert(pending.peer_id.clone());
+                self.ip_reservations.add(pending.ip.as_ref());
             }
         }
         self.pending_operations.insert(token, operation);
@@ -2339,20 +2406,34 @@ impl RelayServerAgent {
                 }
             } else {
                 self.reserving_peers.remove(&pending.peer_id);
+                self.ip_reservations.remove(pending.ip.as_ref());
             }
         }
         Some(operation)
     }
 
-    fn insert_reservation(&mut self, peer_id: PeerId, conn_id: ConnectionId, deadline_ms: u64) {
+    fn insert_reservation(
+        &mut self,
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+        ip: Option<IpKey>,
+        deadline_ms: u64,
+    ) {
         self.reservation_deadlines.set(peer_id.clone(), deadline_ms);
-        self.reservations
-            .insert(peer_id, ReservationRecord { conn_id });
+        self.ip_reservations.add(ip.as_ref());
+        if let Some(replaced) = self
+            .reservations
+            .insert(peer_id, ReservationRecord { conn_id, ip })
+        {
+            self.ip_reservations.remove(replaced.ip.as_ref());
+        }
     }
 
     fn remove_reservation(&mut self, peer_id: &PeerId) {
         self.reservation_deadlines.remove(peer_id);
-        self.reservations.remove(peer_id);
+        if let Some(removed) = self.reservations.remove(peer_id) {
+            self.ip_reservations.remove(removed.ip.as_ref());
+        }
     }
 
     fn remove_hop_worker(&mut self, stream: StreamKey) -> Option<HopWorker> {
@@ -2366,7 +2447,12 @@ impl RelayServerAgent {
         circuit: PendingCircuit,
         stop_deadline_ms: u64,
     ) {
-        self.hold_peer_circuit(&circuit.source_peer_id, &circuit.destination_peer_id);
+        self.hold_circuit(
+            &circuit.source_peer_id,
+            &circuit.destination_peer_id,
+            circuit.source_ip.as_ref(),
+            circuit.destination_ip.as_ref(),
+        );
         self.pending_by_destination
             .insert((circuit.destination_conn_id, source_stream));
         self.stop_deadlines.set(source_stream, stop_deadline_ms);
@@ -2378,25 +2464,54 @@ impl RelayServerAgent {
         self.stop_deadlines.remove(&source_stream);
         self.pending_by_destination
             .remove(&(circuit.destination_conn_id, source_stream));
-        self.release_peer_circuit(&circuit.source_peer_id, &circuit.destination_peer_id);
+        self.release_circuit(
+            &circuit.source_peer_id,
+            &circuit.destination_peer_id,
+            circuit.source_ip.as_ref(),
+            circuit.destination_ip.as_ref(),
+        );
         Some(circuit)
     }
 
     fn remove_circuit(&mut self, source_stream: StreamKey) -> Option<Circuit> {
         let circuit = self.circuits.remove(&source_stream)?;
         self.circuit_deadlines.remove(&source_stream);
-        self.release_peer_circuit(&circuit.source_peer_id, &circuit.destination_peer_id);
+        self.release_circuit(
+            &circuit.source_peer_id,
+            &circuit.destination_peer_id,
+            circuit.source_ip.as_ref(),
+            circuit.destination_ip.as_ref(),
+        );
         Some(circuit)
     }
 
-    /// Counts one more circuit against each endpoint, a self-circuit once.
-    fn hold_peer_circuit(&mut self, source: &PeerId, destination: &PeerId) {
+    /// Counts one more circuit against each endpoint peer and admission key,
+    /// one shared by both ends once.
+    fn hold_circuit(
+        &mut self,
+        source: &PeerId,
+        destination: &PeerId,
+        source_ip: Option<&IpKey>,
+        destination_ip: Option<&IpKey>,
+    ) {
         for peer in circuit_endpoints(source, destination) {
             *self.peer_circuits.entry(peer.clone()).or_default() += 1;
         }
+        for ip in circuit_ip_keys(source_ip, destination_ip) {
+            self.ip_circuits.add(Some(ip));
+        }
     }
 
-    fn release_peer_circuit(&mut self, source: &PeerId, destination: &PeerId) {
+    fn release_circuit(
+        &mut self,
+        source: &PeerId,
+        destination: &PeerId,
+        source_ip: Option<&IpKey>,
+        destination_ip: Option<&IpKey>,
+    ) {
+        for ip in circuit_ip_keys(source_ip, destination_ip) {
+            self.ip_circuits.remove(Some(ip));
+        }
         for peer in circuit_endpoints(source, destination) {
             if let Some(count) = self.peer_circuits.get_mut(peer) {
                 *count -= 1;
@@ -2471,6 +2586,34 @@ impl RelayServerAgent {
             }
         }
         assert_eq!(peer_circuits, self.peer_circuits);
+        let mut ip_circuits = IpTally::default();
+        let ends = self
+            .pending_circuits
+            .values()
+            .map(|circuit| (&circuit.source_ip, &circuit.destination_ip))
+            .chain(
+                self.circuits
+                    .values()
+                    .map(|circuit| (&circuit.source_ip, &circuit.destination_ip)),
+            );
+        for (source, destination) in ends {
+            for ip in circuit_ip_keys(source.as_ref(), destination.as_ref()) {
+                ip_circuits.add(Some(ip));
+            }
+        }
+        assert_eq!(ip_circuits, self.ip_circuits);
+        let mut ip_reservations = IpTally::default();
+        for reservation in self.reservations.values() {
+            ip_reservations.add(reservation.ip.as_ref());
+        }
+        for pending in self.pending_operations.values() {
+            if let Some(pending) = pending.pending_reservation()
+                && !pending.renewed
+            {
+                ip_reservations.add(pending.ip.as_ref());
+            }
+        }
+        assert_eq!(ip_reservations, self.ip_reservations);
 
         let operations_by_stream: BTreeSet<_> = self
             .pending_operations
@@ -2539,6 +2682,16 @@ fn circuit_endpoints<'a>(
     core::iter::once(source).chain((destination != source).then_some(destination))
 }
 
+/// A circuit's distinct admission keys; ends without an IP have none.
+fn circuit_ip_keys<'a>(
+    source: Option<&'a IpKey>,
+    destination: Option<&'a IpKey>,
+) -> impl Iterator<Item = &'a IpKey> {
+    source
+        .into_iter()
+        .chain(destination.filter(|destination| Some(*destination) != source))
+}
+
 fn first_ip(address: &Multiaddr) -> Option<IpKey> {
     address
         .protocols()
@@ -2548,7 +2701,11 @@ fn first_ip(address: &Multiaddr) -> Option<IpKey> {
             Protocol::Ip6(ip) if ip[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] => {
                 Some(IpKey::V4([ip[12], ip[13], ip[14], ip[15]]))
             }
-            Protocol::Ip6(ip) => Some(IpKey::V6(*ip)),
+            Protocol::Ip6(ip) => {
+                let mut prefix = [0; 8];
+                prefix.copy_from_slice(&ip[..8]);
+                Some(IpKey::V6Prefix(prefix))
+            }
             _ => None,
         })
 }
@@ -5983,5 +6140,184 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(agent.reservation_count(), 0);
+    }
+
+    /// Connects `peer` on `conn_id` from `address` and sends RESERVE. Returns
+    /// the queued success response's token, or the denial status.
+    #[expect(
+        clippy::panic_in_result_fn,
+        clippy::unwrap_in_result,
+        reason = "a test helper whose Err is the relay's denial, not a failure"
+    )]
+    fn request_reservation(
+        agent: &mut RelayServerAgent,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        address: &str,
+    ) -> Result<RelayServerToken, Status> {
+        establish(agent, peer, conn_id);
+        agent.set_connection_addr(conn_id, Multiaddr::from_str(address).unwrap());
+        let stream = StreamKey {
+            conn_id,
+            stream_id: StreamId::new(1),
+        };
+        feed_hop(agent, peer, stream, reserve_request(), &[]);
+        agent.assert_indexes_consistent();
+        // The response's send (and the close queued behind it) are left
+        // unanswered: the reservation stays pending until the caller echoes
+        // the send.
+        let sent = agent.actions.drain(..).find_map(|action| match action {
+            RelayServerAction::SendStream { token, .. } => Some(token),
+            _ => None,
+        });
+        match (agent.poll_event(), sent) {
+            (Some(RelayServerEvent::ReservationDenied { status, .. }), _) => Err(status),
+            (None, Some(token)) => Ok(token),
+            (other, _) => panic!("expected a decision for {address}, got {other:?}"),
+        }
+    }
+
+    fn unlimited_rates() -> RelayServerConfig {
+        RelayServerConfig {
+            reservation_rate_limit_per_peer: None,
+            reservation_rate_limit_per_ip: None,
+            circuit_rate_limit_per_peer: None,
+            circuit_rate_limit_per_ip: None,
+            ..RelayServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn ninth_reservation_from_one_ipv4_address_or_ipv6_slash_64_is_refused() {
+        let cases = [
+            ("/ip4/198.51.100.7/tcp/{}", "/ip4/198.51.100.8/tcp/1"),
+            ("/ip6/2001:db8:1:2::{}/tcp/1", "/ip6/2001:db8:1:3::1/tcp/1"),
+        ];
+        for (shared, other) in cases {
+            let mut agent = RelayServerAgent::new(
+                PeerId::from_public_key_protobuf(b"relay-per-ip-reservations"),
+                unlimited_rates(),
+            )
+            .unwrap();
+            agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+            for index in 0..8u8 {
+                let peer = PeerId::from_public_key_protobuf(&[b'r', index]);
+                let address = shared.replace("{}", &(index + 1).to_string());
+                let conn_id = ConnectionId::new(index.into());
+                let token = request_reservation(&mut agent, &peer, conn_id, &address)
+                    .expect("within the per-IP cap");
+                // Half commit; the rest stay pending and still hold a slot.
+                if index < 4 {
+                    agent.send_stream_result(token, Ok(()), Now::from_millis(0));
+                    let _ = agent.poll_event();
+                }
+            }
+            let ninth = PeerId::from_public_key_protobuf(b"ninth");
+            let address = shared.replace("{}", "9");
+            assert_eq!(
+                request_reservation(&mut agent, &ninth, ConnectionId::new(9), &address),
+                Err(Status::ResourceLimitExceeded),
+                "{shared}"
+            );
+            let elsewhere = PeerId::from_public_key_protobuf(b"elsewhere");
+            request_reservation(&mut agent, &elsewhere, ConnectionId::new(10), other)
+                .expect("another key keeps its own slots");
+        }
+    }
+
+    #[test]
+    fn a_full_rate_limiter_map_refuses_a_new_peer() {
+        let config = RelayServerConfig {
+            max_rate_limit_entries: 1,
+            ..RelayServerConfig::default()
+        };
+        let mut agent = RelayServerAgent::new(
+            PeerId::from_public_key_protobuf(b"relay-full-limiter"),
+            config,
+        )
+        .unwrap();
+        agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        let first = PeerId::from_public_key_protobuf(b"first");
+        let second = PeerId::from_public_key_protobuf(b"second");
+        let address = "/ip4/198.51.100.7/tcp/1";
+        request_reservation(&mut agent, &first, ConnectionId::new(1), address).expect("admitted");
+        assert_eq!(
+            request_reservation(&mut agent, &second, ConnectionId::new(2), address),
+            Err(Status::ResourceLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn circuits_per_ip_count_either_end_and_a_shared_key_once() {
+        let config = RelayServerConfig {
+            max_circuits_per_ip: 2,
+            ..unlimited_rates()
+        };
+        let mut agent = RelayServerAgent::new(
+            PeerId::from_public_key_protobuf(b"relay-per-ip-circuits"),
+            config,
+        )
+        .unwrap();
+        agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        let mut next_conn: u64 = 0;
+        let mut destination = |agent: &mut RelayServerAgent, name: &[u8], address: &str| {
+            let peer = PeerId::from_public_key_protobuf(name);
+            next_conn += 1;
+            let token = request_reservation(agent, &peer, ConnectionId::new(next_conn), address)
+                .expect("reservation admitted");
+            agent.send_stream_result(token, Ok(()), Now::from_millis(0));
+            let _ = agent.poll_event();
+            peer
+        };
+        let d1 = destination(&mut agent, b"d1", "/ip4/198.51.100.1/tcp/1");
+        let d2 = destination(&mut agent, b"d2", "/ip4/198.51.100.2/tcp/1");
+        let d3 = destination(&mut agent, b"d3", "/ip4/198.51.100.3/tcp/1");
+        let shared = destination(&mut agent, b"d4", "/ip4/192.0.2.50/tcp/1");
+
+        let mut next_conn: u64 = 100;
+        let mut connect = |agent: &mut RelayServerAgent, address: &str, to: &PeerId| {
+            next_conn += 1;
+            let source = PeerId::from_public_key_protobuf(&next_conn.to_be_bytes());
+            let conn_id = ConnectionId::new(next_conn);
+            establish(agent, &source, conn_id);
+            agent.set_connection_addr(conn_id, Multiaddr::from_str(address).unwrap());
+            let request = HopMessage {
+                kind: HopMessageType::Connect,
+                peer: Some(Peer {
+                    id: to.to_bytes(),
+                    addrs: Vec::new(),
+                }),
+                reservation: None,
+                limit: None,
+                status: None,
+            };
+            let stream = StreamKey {
+                conn_id,
+                stream_id: StreamId::new(1),
+            };
+            feed_hop(agent, &source, stream, request, &[]);
+            agent.assert_indexes_consistent();
+            agent.actions.clear();
+            match agent.poll_event() {
+                Some(RelayServerEvent::CircuitDenied { status, .. }) => Err(status),
+                None => Ok(()),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        let denied = Err(Status::ResourceLimitExceeded);
+
+        // Two sources on one key fill it; their pending circuits count.
+        let source_key = "/ip4/203.0.113.9/tcp/1";
+        assert_eq!(connect(&mut agent, source_key, &d1), Ok(()));
+        assert_eq!(connect(&mut agent, source_key, &d2), Ok(()));
+        assert_eq!(connect(&mut agent, source_key, &d3), denied);
+        // The destination end counts too: d1's key holds one circuit.
+        assert_eq!(connect(&mut agent, "/ip4/203.0.113.10/tcp/1", &d1), Ok(()));
+        assert_eq!(connect(&mut agent, "/ip4/203.0.113.11/tcp/1", &d1), denied);
+        // Both ends on one key count once, so two such circuits fit.
+        let shared_key = "/ip4/192.0.2.50/tcp/2";
+        assert_eq!(connect(&mut agent, shared_key, &shared), Ok(()));
+        assert_eq!(connect(&mut agent, shared_key, &shared), Ok(()));
+        assert_eq!(connect(&mut agent, shared_key, &shared), denied);
     }
 }

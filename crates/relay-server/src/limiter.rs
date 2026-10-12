@@ -10,30 +10,43 @@ struct Bucket {
     generation: u64,
 }
 
+/// Token buckets by key, holding at most `max_entries` of them.
+///
+/// A bucket that refills to capacity is dropped (a missing bucket is full),
+/// so the map holds only depleted ones. When it is full, a new key is
+/// refused: evicting a depleted bucket would hand its burst back. Each bucket
+/// has at most one refill entry scheduled, so the schedule is bounded too.
 pub(crate) struct TokenBuckets<K> {
     config: RateLimit,
+    max_entries: usize,
     buckets: BTreeMap<K, Bucket>,
     due: BTreeMap<u64, Vec<(K, u64)>>,
     next_generation: u64,
 }
 
 impl<K: Clone + Ord> TokenBuckets<K> {
-    pub(crate) fn new(config: RateLimit) -> Self {
+    pub(crate) fn new(config: RateLimit, max_entries: usize) -> Self {
         Self {
             config,
+            max_entries,
             buckets: BTreeMap::new(),
             due: BTreeMap::new(),
             next_generation: 1,
         }
     }
 
+    /// Spends a token from `key`'s bucket, returning whether one was there.
     pub(crate) fn consume(&mut self, key: K, now_ms: u64) -> bool {
         self.sweep(now_ms);
-        let mut bucket = self.buckets.remove(&key).unwrap_or(Bucket {
-            tokens: self.config.capacity,
-            last_refill_ms: now_ms,
-            generation: 0,
-        });
+        let mut bucket = match self.buckets.remove(&key) {
+            Some(bucket) => bucket,
+            None if self.buckets.len() >= self.max_entries => return false,
+            None => Bucket {
+                tokens: self.config.capacity,
+                last_refill_ms: now_ms,
+                generation: 0,
+            },
+        };
         refill(&mut bucket, self.config, now_ms);
         if bucket.tokens == 0 {
             self.schedule(key.clone(), &mut bucket);
@@ -46,10 +59,13 @@ impl<K: Clone + Ord> TokenBuckets<K> {
         true
     }
 
-    /// Whether `key` holds a token at `now_ms`, without spending it.
-    pub(crate) fn allows(&self, key: &K, now_ms: u64) -> bool {
+    /// Whether `key` holds a token at `now_ms`, without spending it. Drops
+    /// refilled buckets first, so a full map refuses only while every entry
+    /// is still depleted.
+    pub(crate) fn allows(&mut self, key: &K, now_ms: u64) -> bool {
+        self.sweep(now_ms);
         let Some(bucket) = self.buckets.get(key) else {
-            return self.config.capacity > 0;
+            return self.config.capacity > 0 && self.buckets.len() < self.max_entries;
         };
         let mut bucket = *bucket;
         refill(&mut bucket, self.config, now_ms);
@@ -129,10 +145,13 @@ mod tests {
 
     #[test]
     fn token_bucket_starts_full_refills_one_per_interval_and_allows_equality() {
-        let mut limiter = TokenBuckets::new(RateLimit {
-            capacity: 2,
-            refill_interval_ms: 10,
-        });
+        let mut limiter = TokenBuckets::new(
+            RateLimit {
+                capacity: 2,
+                refill_interval_ms: 10,
+            },
+            usize::MAX,
+        );
         assert!(limiter.consume("peer", 0));
         assert!(limiter.consume("peer", 0));
         assert!(!limiter.consume("peer", 9));
@@ -142,11 +161,43 @@ mod tests {
     }
 
     #[test]
+    fn a_full_map_refuses_new_keys_without_restoring_any_burst() {
+        let mut limiter = TokenBuckets::new(
+            RateLimit {
+                capacity: 2,
+                refill_interval_ms: 100,
+            },
+            2,
+        );
+        assert!(limiter.consume("a", 0));
+        assert!(limiter.consume("a", 0));
+        assert!(limiter.consume("b", 0));
+
+        // Full of depleted buckets: a new key is refused, and no existing
+        // bucket is evicted to make room.
+        assert!(!limiter.allows(&"c", 50));
+        assert!(!limiter.consume("c", 50));
+        assert!(!limiter.allows(&"a", 50));
+        assert_eq!(limiter.len(), 2);
+        assert!(limiter.due.values().map(Vec::len).sum::<usize>() <= 2);
+
+        // At 100 `b` is full again and dropped, freeing a slot; `a` has only
+        // its one refilled token.
+        assert!(limiter.allows(&"c", 100));
+        assert!(limiter.consume("c", 100));
+        assert!(limiter.consume("a", 100));
+        assert!(!limiter.consume("a", 100));
+    }
+
+    #[test]
     fn sweep_processes_every_simultaneously_due_bucket_and_removes_full_entries() {
-        let mut limiter = TokenBuckets::new(RateLimit {
-            capacity: 1,
-            refill_interval_ms: 10,
-        });
+        let mut limiter = TokenBuckets::new(
+            RateLimit {
+                capacity: 1,
+                refill_interval_ms: 10,
+            },
+            usize::MAX,
+        );
         for key in 0..1_000 {
             assert!(limiter.consume(key, 5));
         }
@@ -157,10 +208,13 @@ mod tests {
 
     #[test]
     fn refill_arithmetic_saturates_at_capacity_and_timeline_end() {
-        let mut limiter = TokenBuckets::new(RateLimit {
-            capacity: 3,
-            refill_interval_ms: 1,
-        });
+        let mut limiter = TokenBuckets::new(
+            RateLimit {
+                capacity: 3,
+                refill_interval_ms: 1,
+            },
+            usize::MAX,
+        );
 
         for _ in 0..3 {
             assert!(limiter.consume(1, u64::MAX - 10));

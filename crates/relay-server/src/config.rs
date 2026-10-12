@@ -12,12 +12,20 @@ pub struct RateLimit {
 pub struct RelayServerConfig {
     /// Maximum committed reservations; zero denies new reservations.
     pub max_reservations: usize,
+    /// Maximum pending plus committed reservations from one admission key
+    /// (an IPv4 address or IPv6 /64); zero denies new reservations from any
+    /// connection with an IP.
+    pub max_reservations_per_ip: usize,
     /// Monotonic reservation lifetime in seconds; must be positive.
     pub reservation_duration_secs: u64,
     /// Maximum pending plus committed circuits; zero denies CONNECT.
     pub max_circuits: usize,
     /// Maximum circuits involving one peer, counting a self-circuit once.
     pub max_circuits_per_peer: usize,
+    /// Maximum pending plus committed circuits with either end on one
+    /// admission key (an IPv4 address or IPv6 /64), counting a circuit once
+    /// when both ends share it.
+    pub max_circuits_per_ip: usize,
     /// Committed circuit lifetime in seconds; zero is unlimited.
     pub max_circuit_duration_secs: u64,
     /// Accepted application bytes allowed per direction; zero is unlimited.
@@ -33,15 +41,21 @@ pub struct RelayServerConfig {
     /// Optional bucket keyed by peer; an admitted new reservation spends a
     /// token.
     pub reservation_rate_limit_per_peer: Option<RateLimit>,
-    /// Optional bucket keyed by the first remote IP; an admitted new
-    /// reservation spends a token.
+    /// Optional bucket keyed by the first remote IP's admission key (an
+    /// IPv4 address or IPv6 /64); an admitted new reservation spends a token.
     pub reservation_rate_limit_per_ip: Option<RateLimit>,
     /// Optional bucket keyed by source peer; an admitted CONNECT spends a
     /// token.
     pub circuit_rate_limit_per_peer: Option<RateLimit>,
-    /// Optional bucket keyed by the source's first remote IP; an admitted
+    /// Optional bucket keyed by the source's admission key; an admitted
     /// CONNECT spends a token.
     pub circuit_rate_limit_per_ip: Option<RateLimit>,
+    /// Most keys each enabled rate limiter tracks at once. Fully refilled
+    /// buckets are dropped first; when the map is still full, a request with
+    /// a new key is refused rather than evicting a depleted bucket, which
+    /// would hand its burst back. Zero refuses every request an enabled
+    /// limiter sees.
+    pub max_rate_limit_entries: usize,
 }
 
 impl Default for RelayServerConfig {
@@ -56,9 +70,11 @@ impl Default for RelayServerConfig {
         });
         Self {
             max_reservations: 128,
+            max_reservations_per_ip: 8,
             reservation_duration_secs: 3_600,
             max_circuits: 16,
             max_circuits_per_peer: 4,
+            max_circuits_per_ip: 8,
             max_circuit_duration_secs: 120,
             max_circuit_bytes: 131_072,
             max_pending_hop_requests_per_connection: 10,
@@ -68,6 +84,7 @@ impl Default for RelayServerConfig {
             reservation_rate_limit_per_ip: per_ip,
             circuit_rate_limit_per_peer: per_peer,
             circuit_rate_limit_per_ip: per_ip,
+            max_rate_limit_entries: 1_024,
         }
     }
 }
@@ -183,9 +200,12 @@ mod tests {
     fn defaults_match_the_canonical_contract() {
         let config = RelayServerConfig::default();
         assert_eq!(config.max_reservations, 128);
+        assert_eq!(config.max_reservations_per_ip, 8);
         assert_eq!(config.reservation_duration_secs, 3_600);
         assert_eq!(config.max_circuits, 16);
         assert_eq!(config.max_circuits_per_peer, 4);
+        assert_eq!(config.max_circuits_per_ip, 8);
+        assert_eq!(config.max_rate_limit_entries, 1_024);
         assert_eq!(config.max_circuit_duration_secs, 120);
         assert_eq!(config.max_circuit_bytes, 131_072);
         assert_eq!(config.max_pending_hop_requests_per_connection, 10);
