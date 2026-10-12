@@ -312,20 +312,39 @@ fn relay_over_a_transport_without_circuit_operations_is_refused() {
 }
 
 /// After the first batch warms the caches, one batch carrying many stream
-/// chunks runs exactly one capability pass and recomputes no addresses.
+/// chunks runs exactly one capability pass and recomputes no addresses,
+/// with every capability compiled into this build configured on both
+/// sides (NAT, Gossipsub, signed discovery), so their drivers are live.
 #[test]
 fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
     const PROTOCOL: &str = "/engine/bulk/1";
+    // Each side names the other as its AutoNAT server; neither serves
+    // AutoNAT, so the NAT agent is live but its probes go nowhere.
+    let configure = |builder: crate::PortableEndpointBuilder<CountingEntropy>, server: PeerAddr| {
+        let builder = builder.protocol(PROTOCOL);
+        #[cfg(all(feature = "pubsub", feature = "_discovery-driver"))]
+        let builder = builder.discovery();
+        #[cfg(all(feature = "pubsub", not(feature = "_discovery-driver")))]
+        let builder = builder.gossipsub();
+        #[cfg(feature = "portable-autonat")]
+        let builder = builder.autonat(server);
+        #[cfg(not(feature = "portable-autonat"))]
+        drop(server);
+        builder
+    };
     let a_identity = Ed25519Keypair::from_secret_key_bytes([42; 32]);
     let b_identity = Ed25519Keypair::from_secret_key_bytes([43; 32]);
     let (a_transport, b_transport) =
         InMemoryTransport::pair(a_identity.peer_id(), b_identity.peer_id());
-    let mut a = Endpoint::portable(&a_identity, CountingEntropy(0))
-        .protocol(PROTOCOL)
+    let address = |addr: &str, peer: &Ed25519Keypair| {
+        PeerAddr::new(addr.parse().expect("address"), peer.peer_id()).expect("peer address")
+    };
+    let a_addr = address("/ip4/192.0.2.1/udp/4001/quic-v1", &a_identity);
+    let b_addr = address("/ip4/192.0.2.2/udp/4002/quic-v1", &b_identity);
+    let mut a = configure(Endpoint::portable(&a_identity, CountingEntropy(0)), b_addr)
         .build(a_transport)
         .expect("a");
-    let mut b = Endpoint::portable(&b_identity, CountingEntropy(1))
-        .protocol(PROTOCOL)
+    let mut b = configure(Endpoint::portable(&b_identity, CountingEntropy(1)), a_addr)
         .build(b_transport)
         .expect("b");
     let b_peer = b_identity.peer_id();
@@ -358,6 +377,12 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
             .expect("send");
     }
 
+    #[cfg(feature = "portable-autonat")]
+    assert!(b.engine.nat.is_some(), "NAT driver is live");
+    #[cfg(feature = "pubsub")]
+    assert!(b.engine.gossipsub.is_some(), "Gossipsub driver is live");
+    #[cfg(all(feature = "pubsub", feature = "_discovery-driver"))]
+    assert!(b.engine.discovery.is_some(), "discovery driver is live");
     let passes = b.engine.stats.capability_passes;
     let refreshes = b.engine.stats.address_refreshes;
     let events = b.poll(now).expect("b receives");
