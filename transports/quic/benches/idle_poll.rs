@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use minip2p_platform::{Clock, StdClock};
 use minip2p_quic::{QuicLimits, QuicNodeConfig, QuicTransport};
-use minip2p_transport::{Transport, TransportEvent};
+use minip2p_transport::{SharedPoll, Transport, TransportEvent};
 
 const COUNTS: &[usize] = &[1, 64, 256, 512];
 const CONNECT_BATCH: usize = 32;
@@ -18,10 +18,18 @@ fn idle_poll(c: &mut Criterion) {
 
     for &count in COUNTS {
         let (mut server, _client) = establish(count);
+        // Measured as a std host drives it (ADR 0013): attached to a shared
+        // poll, with a zero-timeout harvest before each poll. Unattached, the
+        // transport would treat its socket as always possibly ready.
+        let mut readiness = SharedPoll::new().expect("open readiness poll");
+        readiness.attach(&mut server).expect("attach server");
 
         let mut clock = StdClock::with_epoch(Instant::now());
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, move |b, _| {
             b.iter(|| {
+                readiness
+                    .harvest(&mut server, Duration::ZERO)
+                    .expect("harvest readiness");
                 let events = server.poll(clock.now()).expect("idle poll");
                 assert!(events.is_empty(), "idle benchmark must not emit events");
                 black_box(events);
