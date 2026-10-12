@@ -1200,6 +1200,7 @@ dependencies = [
  "minip2p-core",
  "minip2p-identity",
  "minip2p-smoltcp",
+ "minip2p-transport",
  "socket2",
  "thiserror",
 ]
@@ -1308,7 +1309,6 @@ dependencies = [
  "mio",
  "quinn-proto",
  "quinn-udp",
- "rustix",
  "rustls",
  "socket2",
 ]
@@ -1421,6 +1421,7 @@ dependencies = [
  "minip2p-platform",
  "minip2p-secure-mux",
  "minip2p-smoltcp",
+ "minip2p-swarm",
  "minip2p-transport",
  "mio",
  "socket2",
@@ -1462,7 +1463,6 @@ dependencies = [
  "minip2p-core",
  "minip2p-platform",
  "mio",
- "rustix",
  "thiserror",
 ]
 

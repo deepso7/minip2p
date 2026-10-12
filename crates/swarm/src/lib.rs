@@ -10,8 +10,9 @@
 //!   [`EntropySource`]. It reports its next timer through
 //!   [`SwarmCore::next_deadline`] so a host can idle instead of spinning.
 //!
-//! - `Swarm` -- `std` wrapper adding a monotonic clock and blocking drive
-//!   loops (`poll_next`, `run_until`) on top of the core, preserving the
+//! - `Swarm` -- `std` wrapper adding a monotonic clock, one shared
+//!   readiness poll its transport is attached to, and blocking drive loops
+//!   (`poll_next`, `run_until`) on top of the core, preserving the
 //!   one-call DX (`swarm.ping(peer)`, `swarm.open_stream`) without threading
 //!   `now_ms` through every call. Everything that needs no clock is on
 //!   `swarm.core()` / `swarm.core_mut()`.
@@ -54,4 +55,8 @@ pub use crate::driver::{Deadline, PollNext, RUN_UNTIL_SKIP_LIMIT, Swarm};
 // Re-exported so callers need not depend on the platform crate directly.
 #[cfg(feature = "std")]
 pub use minip2p_platform::{Clock, StdClock};
+// The handles `Swarm` hands out, re-exported so callers need not depend on
+// the transport crate to name them.
 pub use minip2p_platform::{Deadline as PollDeadline, EntropySource, Now};
+#[cfg(feature = "std")]
+pub use minip2p_transport::{WaitHandle, WakeHandle};

@@ -15,8 +15,6 @@ pub struct MdnsConfig {
     pub max_announced_addrs: usize,
     /// Interface re-enumeration interval used by the `std` adapter.
     pub interface_refresh_ms: u64,
-    /// Maximum blocking wait before the endpoint polls mDNS sockets again.
-    pub socket_poll_interval_ms: u64,
 }
 
 impl Default for MdnsConfig {
@@ -28,7 +26,6 @@ impl Default for MdnsConfig {
             max_packet_bytes: 1_400,
             max_announced_addrs: 16,
             interface_refresh_ms: 10_000,
-            socket_poll_interval_ms: 100,
         }
     }
 }
@@ -50,9 +47,6 @@ impl MdnsConfig {
         }
         if self.interface_refresh_ms == 0 {
             return Err(MdnsConfigError::ZeroInterfaceRefresh);
-        }
-        if self.socket_poll_interval_ms == 0 {
-            return Err(MdnsConfigError::ZeroSocketPollInterval);
         }
         Ok(())
     }
@@ -76,9 +70,6 @@ pub enum MdnsConfigError {
     /// Interface polling must use a non-zero interval.
     #[error("mDNS interface refresh interval must be non-zero")]
     ZeroInterfaceRefresh,
-    /// Socket polling must use a non-zero interval.
-    #[error("mDNS socket poll interval must be non-zero")]
-    ZeroSocketPollInterval,
 }
 
 #[cfg(test)]

@@ -17,9 +17,9 @@
 //! # Providers
 //!
 //! `StdTcpProvider` is the hosted one: operating-system sockets driven by
-//! `mio`, with a real readiness wait, which makes
-//! [`TcpTransport`] a `BlockingTransport` so an idle driver sleeps instead of
-//! spinning. It disables Nagle's algorithm because delayed small writes add
+//! `mio`. It is a `PollSource` that registers its sockets with the host's one
+//! shared readiness poll, which makes [`TcpTransport`] a `BlockingTransport`
+//! so an idle std swarm sleeps instead of spinning. It disables Nagle's algorithm because delayed small writes add
 //! latency to the multiplexed protocol frames. It needs the `std` feature.
 //!
 //! `SmoltcpTcpProvider` is the embedded one, over a [smoltcp] interface the
@@ -79,9 +79,9 @@
 
 extern crate alloc;
 
-#[cfg(feature = "std")]
-mod blocking;
 mod config;
+#[cfg(feature = "std")]
+mod poll;
 mod provider;
 #[cfg(feature = "smoltcp")]
 mod smoltcp_provider;
@@ -92,8 +92,6 @@ mod transport;
 #[cfg(feature = "smoltcp")]
 pub use minip2p_smoltcp::{SmoltcpStack, smoltcp};
 
-#[cfg(feature = "std")]
-pub use blocking::BlockingTcpProvider;
 pub use config::TcpConfig;
 pub use provider::{SocketHandle, TcpError, TcpEvent, TcpProvider};
 #[cfg(feature = "smoltcp")]

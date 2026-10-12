@@ -5,10 +5,10 @@
 //! It reports two informational rows per variant:
 //!
 //! - `wakeups_per_s`: waits that blocked and then woke, from the `bench`
-//!   feature's counters in `minip2p_transport::bench`: the `TransportSet`'s
-//!   one `poll(2)` over its members, or a lone member's own wait. A set that
-//!   cannot use `poll(2)` takes turns on its members in short slices, and
-//!   then every slice is counted. The output also breaks this down by outcome.
+//!   feature's counters in `minip2p_transport::bench`: the swarm's one wait on
+//!   its shared readiness poll, which every transport and mDNS socket is
+//!   registered with. The output also breaks this down by whether readiness
+//!   or the timeout ended it.
 //! - `cpu_ms_per_s`: process user+sys CPU over the window per wall second.
 //!
 //! Variants:
@@ -22,14 +22,14 @@
 //!   topic, and mDNS, all started.
 //! - `full_no_mdns`: `full` without mDNS, so the rest is visible on its own.
 //!
-//! Expected periodic work: mDNS polls its sockets every
-//! `MdnsConfig::socket_poll_interval_ms` (default 100 ms), which caps every
-//! outer wait at that: about 10 `set_waits` a second. It also re-enumerates
-//! interfaces every 10 s and may still be sending its exponentially spaced
-//! startup queries during the window, so `full` wakes about ten times a second
-//! more than `full_no_mdns`. Compare `full` with `full_no_mdns` for the mDNS
-//! share, and `full_no_mdns` with `quic_only` for the second transport and the
-//! other services.
+//! Expected periodic work: none from the transports, which only wake the
+//! endpoint for input, so an idle `full_no_mdns` should sit near
+//! `quic_only`, both close to zero. mDNS registers its sockets for readiness
+//! too, so `full` adds only real mDNS timers: an interface re-enumeration
+//! every 10 s, and any exponentially spaced startup queries still running in
+//! the window. Compare `full` with `full_no_mdns` for the mDNS share, and
+//! `full_no_mdns` with `quic_only` for the second transport and the other
+//! services.
 //!
 //! Rows go to `target/bench-results/custom/endpoint_idle.json` for the
 //! `custom` collector in `scripts/bench_results.py`.
@@ -182,15 +182,9 @@ fn main() {
         let wakeups_per_s = counters.wakeups() as f64 / seconds;
         let cpu_ms_per_s = cpu.as_secs_f64() * 1e3 / seconds;
         println!(
-            "endpoint_idle/{}: {wakeups_per_s:.1} wakeups/s (ready {}, timed out {}, \
-             interrupted {}; {} set waits, {} fallback sleeps over {seconds:.1} s), \
-             {cpu_ms_per_s:.2} cpu ms/s",
-            variant.name,
-            counters.ready,
-            counters.timed_out,
-            counters.interrupted,
-            counters.set_waits,
-            counters.fallback_sleeps,
+            "endpoint_idle/{}: {wakeups_per_s:.1} wakeups/s (ready {}, timed out {} \
+             over {seconds:.1} s), {cpu_ms_per_s:.2} cpu ms/s",
+            variant.name, counters.ready, counters.timed_out,
         );
         for (metric, value) in [
             ("wakeups_per_s", wakeups_per_s),

@@ -102,6 +102,12 @@ struct Family {
 /// [`next_deadline`](MdnsIo::next_deadline) is what lets it sleep in between
 /// rather than poll to find out nothing happened.
 ///
+/// That deadline is now while a datagram is already waiting in one of its UDP
+/// sockets -- whether the driver's own last poll put it there or another user
+/// of a shared stack did. What it cannot see is a frame still sitting in the
+/// device: a host must also wake whenever its device receives input, as it
+/// already must for TCP on the same stack, and then tick mDNS.
+///
 /// That is also why the send rings fill: a burst is queued long before
 /// anything drains them. A [`send`](MdnsIo::send) with no room left drives the
 /// stack itself and tries once more, and only reports
@@ -513,6 +519,19 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
                 .gt(&0)
         });
         if queued {
+            return Some(0);
+        }
+        // A datagram already delivered to a socket -- by the driver's last
+        // poll, or by another user of a shared stack polling the interface --
+        // is read on the next tick, and no device input will announce it.
+        let waiting = self.families.iter().any(|family| {
+            self.stack
+                .borrow()
+                .sockets
+                .get::<udp::Socket>(family.socket)
+                .can_recv()
+        });
+        if waiting {
             return Some(0);
         }
         self.poll_at_ms.map(|at| at.saturating_sub(now_ms))

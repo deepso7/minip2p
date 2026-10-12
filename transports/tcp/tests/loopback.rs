@@ -16,11 +16,108 @@ use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_platform::{Now, StdEntropy};
 use minip2p_tcp::{StdTcpProvider, TcpProvider, TcpTransport};
 use minip2p_transport::{
-    BlockingTransport, Bytes, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,
-    TransportEvent, WaitOutcome,
+    Bytes, ConnectionId, ConnectionToken, PollSource, SharedPoll, StreamId, Transport,
+    TransportError, TransportEvent, WaitHandle,
 };
 
 type Node = TcpTransport<StdTcpProvider, StdEntropy>;
+
+/// What one blocking wait on a source's shared poll saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    /// Something is due: input arrived, or work was already pending.
+    Ready,
+    /// Nothing arrived within the budget.
+    TimedOut,
+    /// The poll's wait handle interrupted it.
+    Interrupted,
+}
+
+/// Whether a source reports work due now, on these tests' zero timeline.
+trait Due {
+    fn due(&self) -> bool;
+}
+
+impl Due for Node {
+    fn due(&self) -> bool {
+        Transport::next_deadline(self).is_some_and(|at| at.is_expired_at(Now::from_millis(0)))
+    }
+}
+
+impl Due for StdTcpProvider {
+    fn due(&self) -> bool {
+        TcpProvider::next_deadline(self).is_some_and(|at| at.is_expired_at(Now::from_millis(0)))
+    }
+}
+
+/// A source attached to a shared poll of its own, as a std swarm would hold
+/// it, with a blocking wait over the two.
+///
+/// Starts detached, so the helpers that drive a source by polling alone keep
+/// working; a test attaches it once it wants to wait. From then on readiness
+/// reaches it only through [`wait_for_input`](Self::wait_for_input), as it
+/// would through a swarm.
+struct Attached<S> {
+    inner: S,
+    poll: SharedPoll,
+}
+
+impl<S: PollSource + Due> Attached<S> {
+    fn detached(inner: S) -> Self {
+        let poll = SharedPoll::new().expect("shared poll");
+        Self { inner, poll }
+    }
+
+    fn new(inner: S) -> Self {
+        let mut attached = Self::detached(inner);
+        attached.attach();
+        attached
+    }
+
+    fn attach(&mut self) {
+        self.poll.attach(&mut self.inner).expect("attach");
+    }
+
+    /// Blocks until something is due, an interrupt, or `timeout`. Readiness
+    /// is dispatched to the source and nothing is consumed.
+    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
+        if self.poll.take_interrupt() {
+            return WaitOutcome::Interrupted;
+        }
+        if self.inner.due() {
+            return WaitOutcome::Ready;
+        }
+        let events = self
+            .poll
+            .harvest(&mut self.inner, timeout)
+            .expect("harvest");
+        if self.poll.take_interrupt() {
+            WaitOutcome::Interrupted
+        } else if events > 0 || self.inner.due() {
+            WaitOutcome::Ready
+        } else {
+            WaitOutcome::TimedOut
+        }
+    }
+
+    fn wait_handle(&self) -> WaitHandle {
+        self.poll.wait_handle()
+    }
+}
+
+impl<S> std::ops::Deref for Attached<S> {
+    type Target = S;
+
+    fn deref(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S> std::ops::DerefMut for Attached<S> {
+    fn deref_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+}
 
 /// Long enough to absorb a loaded CI machine, short enough to fail a hang.
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -114,8 +211,8 @@ fn is_connected(events: &[TransportEvent]) -> bool {
 
 /// A listener bound to an ephemeral loopback port, and a dialer aimed at it.
 struct Pair {
-    dialer: Node,
-    listener: Node,
+    dialer: Attached<Node>,
+    listener: Attached<Node>,
     dialer_peer: PeerId,
     listener_peer: PeerId,
     dialer_events: Vec<TransportEvent>,
@@ -157,8 +254,8 @@ fn upgraded_pair() -> Pair {
     let listener_connection = connection_id(&listener_events).expect("listener connected");
 
     Pair {
-        dialer,
-        listener,
+        dialer: Attached::detached(dialer),
+        listener: Attached::detached(listener),
         dialer_peer,
         listener_peer,
         dialer_events,
@@ -590,7 +687,8 @@ fn an_idle_wait_times_out_and_input_wakes_it() {
     settle(&mut pair.dialer, &mut pair.listener);
 
     // Nothing is in flight now, so the dialer's wait must run its full budget
-    // rather than return spuriously.
+    // rather than return spuriously. Attaching registers what is already open.
+    pair.dialer.attach();
     let started = Instant::now();
     let outcome = pair.dialer.wait_for_input(Duration::from_millis(150));
     assert_eq!(outcome, WaitOutcome::TimedOut);
@@ -643,6 +741,7 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
     // rest of the test needs, so wait for it rather than for a slice of time:
     // under load a fixed slice buys far fewer polls than it looks like it does.
     // A timeout means parked: nothing arrived, and nothing is left to send.
+    pair.dialer.attach();
     let parking = Instant::now();
     while pair.dialer.wait_for_input(Duration::from_millis(10)) != WaitOutcome::TimedOut {
         let _ = pair.dialer.poll(Now::from_millis(0)).expect("poll dialer");
@@ -688,11 +787,8 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
 #[test]
 fn a_wait_handle_interrupts_a_blocked_wait() {
     let mut pair = upgraded_pair();
+    pair.dialer.attach();
     let handle = pair.dialer.wait_handle();
-    assert!(
-        !handle.is_noop(),
-        "a socket-backed transport must offer a real handle"
-    );
 
     let (started, wait_started) = mpsc::channel();
     thread::spawn(move || {
@@ -716,6 +812,7 @@ fn a_wait_handle_interrupts_a_blocked_wait() {
 #[test]
 fn queued_events_are_never_slept_through() {
     let mut pair = upgraded_pair();
+    pair.dialer.attach();
     let id = pair.dialer_connection;
     // `open_stream` queues `StreamOpened`, which a driver must see before it
     // parks on the socket.
@@ -744,7 +841,7 @@ fn queued_events_are_never_slept_through() {
 /// between waits, and the shape of the addresses it will accept.
 mod provider {
     use super::*;
-    use minip2p_tcp::{BlockingTcpProvider, SocketHandle, TcpError, TcpEvent, TcpProvider};
+    use minip2p_tcp::{SocketHandle, TcpError, TcpEvent, TcpProvider};
     use std::io::Read;
 
     /// Polls both providers until `found` matches, collecting everything seen.
@@ -865,6 +962,7 @@ mod provider {
         // queues Closed synchronously. A blocking driver must poll it rather
         // than park waiting for readiness that will never come.
         client.close_write(client_socket).expect("client FIN");
+        let mut client = Attached::new(client);
         assert_eq!(
             client.wait_for_input(PATIENCE),
             WaitOutcome::Ready,
@@ -925,14 +1023,19 @@ mod provider {
     }
 
     #[test]
-    fn an_interrupt_absorbed_by_a_poll_is_not_lost() {
-        let (mut server, _server_socket, mut client, _client_socket) = linked();
+    fn an_interrupt_absorbed_by_a_harvest_is_not_lost() {
+        let (mut server, _server_socket, client, _client_socket) = linked();
+        let mut client = Attached::new(client);
 
-        // Nudge the client while nobody is waiting, then poll -- which is what
-        // absorbs the wake. The next wait still has to honour it, or a handle
-        // could lose its wakeup to that race.
+        // Nudge the client while nobody is waiting, then harvest -- which is
+        // what absorbs the wake. The next wait still has to honour it, or a
+        // handle could lose its wakeup to that race.
         client.wait_handle().interrupt();
-        let _ = client.poll(Now::from_millis(0)).expect("poll absorbs it");
+        client
+            .poll
+            .harvest(&mut client.inner, Duration::ZERO)
+            .expect("harvest absorbs it");
+        let _ = client.poll(Now::from_millis(0)).expect("poll");
         let _ = server
             .poll(Now::from_millis(0))
             .expect("keep the peer quiet");
@@ -1087,10 +1190,9 @@ mod provider {
 
         // Readiness has nothing left to say, so a driver that parked here would
         // strand the remainder.
-        assert_eq!(
-            server.wait_for_input(Duration::from_secs(5)),
-            WaitOutcome::Ready,
-            "work held back by the budget must not be slept through"
+        assert!(
+            server.due(),
+            "work held back by the budget must be reported due, not slept through"
         );
 
         // And the rest arrives on the polls that follow.
@@ -1141,10 +1243,9 @@ mod provider {
             accepted <= 32,
             "one poll accepted {accepted} connections, past its budget"
         );
-        assert_eq!(
-            server.wait_for_input(Duration::from_secs(5)),
-            WaitOutcome::Ready,
-            "a backlog held back by the budget must not be slept through"
+        assert!(
+            server.due(),
+            "a backlog held back by the budget must be reported due, not slept through"
         );
         drop(peers);
     }
@@ -1409,5 +1510,40 @@ mod provider {
             provider.connect(&"/ip4/127.0.0.1".parse().expect("addr")),
             Err(TcpError::Address { .. })
         ));
+    }
+}
+
+/// A std swarm attaches its transport and, polled without ever blocking,
+/// harvests readiness on every poll: TCP still connects and identifies.
+#[test]
+fn tcp_makes_progress_through_a_swarm_that_never_blocks() {
+    use minip2p_swarm::{SwarmBuilder, SwarmEvent};
+
+    let (listener_key, dialer_key) = (identity(3), identity(4));
+    let mut listener = SwarmBuilder::new(&listener_key)
+        .build(node(listener_key.clone()))
+        .expect("listener swarm");
+    let mut dialer = SwarmBuilder::new(&dialer_key)
+        .build(node(dialer_key.clone()))
+        .expect("dialer swarm");
+    let bound = listener
+        .core_mut()
+        .listen(&"/ip4/127.0.0.1/tcp/0".parse::<Multiaddr>().expect("addr"))
+        .expect("listen");
+    let target = PeerAddr::new(bound, listener_key.peer_id()).expect("target");
+    dialer.core_mut().dial(&target).expect("dial");
+
+    let ready = |events: &[SwarmEvent]| {
+        events
+            .iter()
+            .any(|event| matches!(event, SwarmEvent::PeerReady { .. }))
+    };
+    let (mut dialer_ready, mut listener_ready) = (false, false);
+    let started = Instant::now();
+    while !(dialer_ready && listener_ready) {
+        assert!(started.elapsed() < PATIENCE, "never became ready");
+        dialer_ready |= ready(&dialer.poll().expect("poll dialer"));
+        listener_ready |= ready(&listener.poll().expect("poll listener"));
+        thread::sleep(Duration::from_millis(1));
     }
 }

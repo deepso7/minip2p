@@ -134,9 +134,7 @@ function createEndpoint(
   const config: Minip2pConfig = {
     agentVersion: "minip2p-react-native-smoke",
     listen,
-    mdns: mdns
-      ? { autoDial: false, queryIntervalMs: 1000, socketPollIntervalMs: 50 }
-      : undefined,
+    mdns: mdns ? { autoDial: false, queryIntervalMs: 1000 } : undefined,
     protocols: [STREAM_PROTOCOL],
     secretKey: generateSecretKey(),
   };

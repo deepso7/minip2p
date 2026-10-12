@@ -9,7 +9,7 @@ use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_platform::{Now, StdEntropy};
 use minip2p_tcp::{StdTcpProvider, TcpEvent, TcpProvider, TcpTransport};
-use minip2p_transport::{Bytes, ConnectionId, StreamId, Transport, TransportEvent};
+use minip2p_transport::{Bytes, ConnectionId, SharedPoll, StreamId, Transport, TransportEvent};
 
 type Node = TcpTransport<StdTcpProvider, StdEntropy>;
 
@@ -29,9 +29,22 @@ fn setup_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(20))
 }
 
+// Every measured poll is driven as a std host drives it (ADR 0013): the
+// polled side is attached to a shared poll once setup is done, and each poll
+// follows a zero-timeout harvest. Unattached, a provider treats every open
+// socket as possibly ready and reads each one on every poll.
+
 struct ReadySet {
     provider: StdTcpProvider,
+    readiness: SharedPoll,
     peers: Vec<TcpStream>,
+}
+
+/// A shared poll with `source` attached.
+fn attached<S: minip2p_transport::PollSource>(source: &mut S) -> SharedPoll {
+    let mut readiness = SharedPoll::new().expect("open readiness poll");
+    readiness.attach(source).expect("attach to readiness poll");
+    readiness
 }
 
 fn readiness_poll(c: &mut Criterion) {
@@ -76,7 +89,12 @@ fn transport_poll(c: &mut Criterion) {
     for &count in COUNTS {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
             let mut pair = upgraded(count);
-            b.iter(|| black_box(pair.client.poll(Now::from_millis(0)).expect("idle poll")));
+            b.iter(|| {
+                pair.client_readiness
+                    .harvest(&mut pair.client, Duration::ZERO)
+                    .expect("harvest readiness");
+                black_box(pair.client.poll(Now::from_millis(0)).expect("idle poll"))
+            });
         });
     }
     group.finish();
@@ -142,7 +160,12 @@ fn establish(count: usize) -> ReadySet {
         );
         thread::sleep(Duration::from_micros(100));
     }
-    ReadySet { provider, peers }
+    let readiness = attached(&mut provider);
+    ReadySet {
+        provider,
+        readiness,
+        peers,
+    }
 }
 
 fn accept_and_poll(
@@ -178,6 +201,10 @@ fn poll_ready(ready: &mut ReadySet, count: usize) {
 
     let mut received = 0;
     while received != count {
+        ready
+            .readiness
+            .harvest(&mut ready.provider, Duration::ZERO)
+            .expect("harvest readiness");
         for event in ready
             .provider
             .poll(Now::from_millis(0))
@@ -206,6 +233,10 @@ fn poll_one_ready(ready: &mut ReadySet, index: usize) {
         .expect("write readiness byte");
     let deadline = Instant::now() + DELIVERY_TIMEOUT;
     loop {
+        ready
+            .readiness
+            .harvest(&mut ready.provider, Duration::ZERO)
+            .expect("harvest readiness");
         for event in ready
             .provider
             .poll(Now::from_millis(0))
@@ -235,6 +266,8 @@ fn poll_one_ready(ready: &mut ReadySet, index: usize) {
 struct UpgradedSet {
     client: Node,
     server: Node,
+    client_readiness: SharedPoll,
+    server_readiness: SharedPoll,
     /// The server's (connection, stream) for each connection.
     streams: Vec<(ConnectionId, StreamId)>,
 }
@@ -288,14 +321,24 @@ fn upgraded(count: usize) -> UpgradedSet {
             "only upgraded {connected}/{count} connections with {incoming}/{count} streams"
         );
     }
+    let mut client_readiness = attached(&mut client);
+    let mut server_readiness = attached(&mut server);
     // Settle both sides so the first measured poll starts idle.
     for _ in 0..4 {
+        client_readiness
+            .harvest(&mut client, Duration::ZERO)
+            .expect("harvest readiness");
         client.poll(Now::from_millis(0)).expect("settle client");
+        server_readiness
+            .harvest(&mut server, Duration::ZERO)
+            .expect("harvest readiness");
         server.poll(Now::from_millis(0)).expect("settle server");
     }
     UpgradedSet {
         client,
         server,
+        client_readiness,
+        server_readiness,
         streams,
     }
 }
@@ -311,6 +354,9 @@ fn deliver_one(pair: &mut UpgradedSet, index: usize) {
         .expect("send");
     let deadline = Instant::now() + DELIVERY_TIMEOUT;
     loop {
+        pair.client_readiness
+            .harvest(&mut pair.client, Duration::ZERO)
+            .expect("harvest readiness");
         for event in pair.client.poll(Now::from_millis(0)).expect("poll client") {
             match event {
                 TransportEvent::StreamData {
@@ -324,6 +370,9 @@ fn deliver_one(pair: &mut UpgradedSet, index: usize) {
                         .ack_stream(id, stream_id, data.len())
                         .expect("ack");
                     // Lets the server take the window update back.
+                    pair.server_readiness
+                        .harvest(&mut pair.server, Duration::ZERO)
+                        .expect("harvest readiness");
                     pair.server.poll(Now::from_millis(0)).expect("poll server");
                     return;
                 }

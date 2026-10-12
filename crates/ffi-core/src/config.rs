@@ -44,8 +44,6 @@ pub struct MdnsOptions {
     pub max_announced_addrs: u32,
     /// Interface re-enumeration interval, in milliseconds.
     pub interface_refresh_ms: u64,
-    /// Maximum blocking wait before polling mDNS sockets again.
-    pub socket_poll_interval_ms: u64,
     /// Whether accepted mDNS observations may trigger automatic dials.
     pub auto_dial: bool,
 }

@@ -9,14 +9,14 @@ extern crate alloc;
 
 #[cfg(feature = "bench")]
 pub mod bench;
-#[cfg(feature = "std")]
-mod blocking;
 mod connection_endpoint;
 mod connection_id;
 mod connection_state;
 mod connection_token;
 mod error;
 mod event;
+#[cfg(feature = "std")]
+mod poll;
 mod set;
 mod stream_id;
 mod transport;
@@ -34,5 +34,11 @@ pub use set::{RejectedTransport, TransportSet, TransportSetError};
 pub use stream_id::StreamId;
 pub use transport::Transport;
 
+/// The readiness crate std sources register with, re-exported so a
+/// [`PollSource`] needs no extra dependency to name its types.
 #[cfg(feature = "std")]
-pub use blocking::{BlockingTransport, WaitHandle, WaitOutcome};
+pub use mio;
+#[cfg(feature = "std")]
+pub use poll::{
+    BlockingTransport, PollSource, SharedPoll, TokenSpace, TokenSpaceError, WaitHandle, WakeHandle,
+};

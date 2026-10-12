@@ -28,7 +28,7 @@ Both claims are checked when a member joins, so neither question can have two an
 
 A member that fails a `poll` does not cost its siblings the events they produced in the same round — those are delivered by the next `poll`, before any member is driven again, so a transport that stays broken cannot bury a healthy one's events or grow a queue behind itself.
 
-Under `std` a member must also implement `BlockingTransport` and be `Send`, so the set can park a driver instead of spinning and a host can move an endpoint onto the thread that drives it; since every method of that trait has a default, `impl BlockingTransport for MyTransport {}` is the whole of the first part. A lone member is handed the caller's whole timeout in one wait, so an idle single-transport host sleeps until its next deadline. With several, the set first probes every member without blocking, then — on unix, when every member that can park exposes a `readiness_fd` — blocks once in a level-triggered `poll(2)` over all of their fds, re-probing every member when one becomes readable. Input on any member wakes it straight away. Where that is not possible (a parking member without an fd, a failed `poll(2)`, a non-unix target) it falls back to short readiness waits taken in turns, so a member is heard from within one 10 ms slice. A member that reports `Unsupported` is probed once and then left out of the budget. The set's `WaitHandle` wakes all of them, reading the member list when it fires rather than when it was taken, so a handle survives a member joining later — including one taken while the set was still empty, which is when a host composing an endpoint wires its wakeup path. One `interrupt` is worth one `Interrupted`: the members that lost the race are drained before the set answers, so a single wake cannot come back several times over.
+Under `std` a member must also be a `BlockingTransport` — a `Transport` that is also a `PollSource` — and be `Send`, so the set can register every member with the host's one shared readiness poll and a host can move an endpoint onto the thread that drives it. Attaching the set gives each member its own `TokenSpace` under an 8-bit prefix of the set's space, so an event's token says which member it is for and routing needs no table; a member inserted after the set is attached is attached as it joins, and `insert` reports `TransportSetError::AttachFailed` (handing the transport back) if that fails. There is no wait of the set's own: the host blocks once on the shared poll for every member, so input on any of them wakes it at once, on every platform mio supports.
 
 ## Connection id namespaces
 
@@ -121,32 +121,39 @@ The host samples time once per drive iteration and passes that `Now` to `poll()`
 
 A portable adapter should read no clock of its own. An adapter that needs finer time than the host's millisecond samples may still keep a clock — `minip2p-quic` samples `Instant::now()` once per poll and runs its QUIC engine's timers on that — but everything it reports back to the host, deadlines above all, must be expressed on the timeline of the samples it was given. An adapter with its own clock is inherently `std`-only.
 
-## Blocking waits (`std` only)
+## Waiting on readiness (`std` only)
 
-Blocking a thread needs an OS to block on, so it is not part of the portable contract. Adapters that own a socket implement the `std`-gated `BlockingTransport` extension with a real readiness wait (e.g. a blocking peek with a read timeout) so idle drivers sleep for the whole timer budget instead of spinning on a fixed cadence:
+Blocking a thread needs an OS to block on, so it is not part of the portable contract. Under `std` a host -- the swarm's `Swarm<T>` -- owns one `SharedPoll`: one edge-triggered `mio::Poll` and its one `Waker`. Every source of input registers with it (ADR 0013), so a wait blocks once, for everything, until the earliest `next_deadline()` or the caller's timeout. A `no_std` host skips all of this and idles however its platform allows, using `next_deadline()` to decide for how long.
+
+A std adapter implements `PollSource`, which makes it a `BlockingTransport` automatically:
 
 ```rust
-use std::time::Duration;
-use minip2p_transport::{BlockingTransport, WaitOutcome};
+use std::sync::Arc;
+use minip2p_transport::mio::{Registry, Waker, event::Event};
+use minip2p_transport::{PollSource, TokenSpace};
 
-impl BlockingTransport for MyTransport {
-    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        todo!("wait for socket readiness without consuming input")
+impl PollSource for MyTransport {
+    fn attach(&mut self, registry: Registry, tokens: TokenSpace, waker: Arc<Waker>) -> std::io::Result<()> {
+        todo!("register sockets with tokens from `tokens`; keep `registry` for sockets opened later")
+    }
+
+    fn dispatch(&mut self, event: &Event) {
+        todo!("record readiness for one of this source's tokens; the next poll consumes it")
     }
 }
 ```
 
-The default implementation returns `WaitOutcome::Unsupported`, so `impl BlockingTransport for MyTransport {}` is enough to opt a transport into blocking drivers with a sleep fallback. A `no_std` host skips this entirely and idles however its platform allows, using `next_deadline()` to decide for how long.
+- **`attach`** is called once. The source keeps the registry clone to register sockets it opens later and takes tokens only from its `TokenSpace` (`token(index)`, `index_of(token)`). It may reuse a token after deregistering its socket; a stale event for the old socket is then a spurious wake on the new one, which is harmless because sources read until `WouldBlock`. Splitting a space (`subspace`) is checked and fails with a typed `TokenSpaceError` rather than overflowing into a sibling. mio allows one `Waker` per poll, so a source never creates its own: one with no socket (an in-memory transport) keeps the host's and calls it when input arrives.
+- **`dispatch`** hands over readiness for a token the source registered.
+- **Edge-triggered rule:** after `dispatch`, a source reads each ready socket until `WouldBlock`, or remembers what it has not read yet and reports `next_deadline()` as due now until a poll has consumed it. The edge will not come again, so readiness must never be lost when a source is dispatched to but not polled before the next wait.
+- **Before attach** (a `SwarmCore` host driving a std transport directly), a source treats every socket as possibly ready on each poll, so it still makes progress.
+- **Wrappers** (`CircuitTransport`) forward both methods to the transport they wrap.
 
-`BlockingTransport::wait_handle()` returns a cloneable, transport-neutral `WaitHandle` that interrupts a wait from another thread — a background task nudging a blocked drive loop after queueing work. Interrupting when no wait is active makes the _next_ wait return immediately, so a handle cannot lose a wakeup to a race. `WaitHandle::combined` folds several into one for hosts driving more than one transport, and the default `WaitHandle::noop()` is inert for adapters with nothing to wake (that costs latency, never correctness).
-
-The two defaults are only correct together, for a leaf transport. A transport that wraps another and forwards `wait_for_input` **must** also forward `wait_handle`, or callers get an inert handle while the wait still blocks inside the inner transport.
-
-On unix, `BlockingTransport::readiness_fd()` exposes the fd a transport's wait blocks on (for a mio adapter, its selector's `Registry::as_fd()`), so a `TransportSet` can wait on every member at once. The fd must stay the same for the transport's lifetime, and its `wait_handle` must make it readable. The contract that makes it safe is **drain before block**: a zero-timeout `wait_for_input` that answers `TimedOut` must already have harvested its selector, keeping whatever it learned (readiness folded into socket state, deferred work, pending interrupts) for the next `poll` or wait. Break it and the set spins on a readable fd rather than losing a wakeup. The default is `None`, which keeps a set holding the transport on the turn-taking fallback; a wrapper forwards it along with the other two. The QUIC adapters and `StdTcpProvider` (through `BlockingTcpProvider`) implement it.
+`SharedPoll::harvest` collects one bounded batch, dispatching the transport's share, and records the rest: readiness in a space handed to a host-owned source (`attach_host_source`, used for mDNS sockets) and `Waker` events become a pending host wake, read with `take_wake`. `SharedPoll::wait_handle()` returns a cloneable `WaitHandle` that sets an interrupt flag, then wakes; interrupts sent before one is taken coalesce, and `take_interrupt` is the only thing that clears the flag. `wake_handle()` returns a `WakeHandle` that only wakes. `EINTR` is retried against the original deadline; any other poll error is returned.
 
 ## Bench counters (`bench` feature)
 
-A driver sees one return from the set's `wait_for_input`, but that one call may block more than once: a spurious wakeup repeats its `poll(2)`, and the fallback waits on each member in turn, in short slices. Every blocking wait that ends is a real wakeup. The `bench` feature (off by default, implies `std`) counts waits at that level: blocking waits — the set's `poll(2)`s and the member waits it makes — by outcome (ready, timed out, interrupted), set waits that sent the driver to its fallback sleep because no member could park, and the outer set waits a driver-level counter would see. `minip2p_transport::bench::wait_counters()` returns the calling thread's counts; subtract two snapshots with `WaitCounters::since`. It exists for idle benchmarks such as `minip2p-rs`'s `endpoint_idle`; without the feature none of it is compiled.
+The `bench` feature (off by default, implies `std`) counts the blocking waits a `SharedPoll` makes -- every harvest with a non-zero timeout -- by whether readiness ended it (`ready`) or it ran out its timeout (`timed_out`). That is the std swarm's wait, so these are an idle endpoint's wakeups. `minip2p_transport::bench::wait_counters()` returns the calling thread's counts; subtract two snapshots with `WaitCounters::since`. It exists for idle benchmarks such as `minip2p-rs`'s `endpoint_idle`; without the feature none of it is compiled.
 
 ## no_std
 

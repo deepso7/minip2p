@@ -49,6 +49,7 @@ minip2p-identity = { path = "../../crates/identity", features = [
   "std",
 ] }
 minip2p-secure-mux = { path = "../../crates/secure-mux" }
+minip2p-swarm = { path = "../../crates/swarm" }
 
 [[bench]]
 name = "readiness_poll"

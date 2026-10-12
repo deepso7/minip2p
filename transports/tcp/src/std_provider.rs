@@ -4,22 +4,18 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::time::Duration;
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr};
 
 use minip2p_core::{Multiaddr, Protocol};
-use minip2p_platform::Now;
-use minip2p_transport::{WaitHandle, WaitOutcome};
-use mio::{Events, Interest, Poll, Token, Waker};
+use minip2p_platform::{Deadline, Now};
+use minip2p_transport::{PollSource, TokenSpace};
+use mio::event::Event;
+use mio::{Interest, Registry, Token, Waker};
 use socket2::{Domain, Protocol as SocketProtocol, Socket as Socket2, Type};
 
-use crate::blocking::BlockingTcpProvider;
 use crate::provider::{SocketHandle, TcpError, TcpEvent, TcpProvider, host_and_port};
-
-/// Reserved for the interrupt waker, so no registration may use it.
-const WAKER_TOKEN: Token = Token(0);
 
 /// Read size per syscall. Large enough that a busy stream is not dominated by
 /// syscall overhead, small enough not to hold a big buffer per provider.
@@ -127,7 +123,81 @@ fn dial_addr(addr: &Multiaddr) -> Result<SocketAddr, TcpError> {
 
 struct Listener {
     listener: mio::net::TcpListener,
+    /// Its registration token, once attached.
+    token: Option<Token>,
     bound: Multiaddr,
+}
+
+/// What a registration token currently stands for.
+#[derive(Clone, Copy)]
+enum Slot {
+    Listener,
+    Socket(SocketHandle),
+}
+
+/// The host's shared poll, once attached, and the tokens handed out in it.
+///
+/// Tokens are reused once their socket is deregistered, and are deliberately
+/// not [`SocketHandle`]s: a handle is never reused, so a stale event for a
+/// recycled token can at most mark the replacement possibly ready, never
+/// touch the retired socket's lifecycle.
+struct Registration {
+    registry: Registry,
+    tokens: TokenSpace,
+    /// Token index to what holds it now.
+    slots: Vec<Option<Slot>>,
+    /// Indexes free for reuse.
+    free: Vec<usize>,
+}
+
+impl Registration {
+    /// Registers `source` for `slot` under a fresh or recycled token.
+    fn register(
+        &mut self,
+        source: &mut impl mio::event::Source,
+        slot: Slot,
+        interest: Interest,
+    ) -> Result<Token, TcpError> {
+        let index = self.free.pop().unwrap_or(self.slots.len());
+        let Some(token) = self.tokens.token(index) else {
+            return Err(TcpError::Exhausted {
+                resource: "readiness tokens",
+            });
+        };
+        if let Err(error) = self.registry.register(source, token, interest) {
+            self.release_index(index);
+            return Err(io_error("registering a socket", &error));
+        }
+        if index == self.slots.len() {
+            self.slots.push(Some(slot));
+        } else if let Some(entry) = self.slots.get_mut(index) {
+            *entry = Some(slot);
+        }
+        Ok(token)
+    }
+
+    /// Deregisters `source` and frees its token for reuse.
+    fn deregister(&mut self, source: &mut impl mio::event::Source, token: Token) {
+        // The source is about to drop, which releases the registration too.
+        drop(self.registry.deregister(source));
+        if let Some(index) = self.tokens.index_of(token) {
+            self.release_index(index);
+        }
+    }
+
+    fn release_index(&mut self, index: usize) {
+        if let Some(entry) = self.slots.get_mut(index) {
+            *entry = None;
+        }
+        if index < self.slots.len() {
+            self.free.push(index);
+        }
+    }
+
+    fn slot(&self, token: Token) -> Option<Slot> {
+        let index = self.tokens.index_of(token)?;
+        self.slots.get(index).copied().flatten()
+    }
 }
 
 enum Phase {
@@ -139,7 +209,8 @@ enum Phase {
 
 struct Socket {
     stream: mio::net::TcpStream,
-    token: Token,
+    /// Its registration token, once attached.
+    token: Option<Token>,
     remote: Multiaddr,
     phase: Phase,
     /// Set by a readiness event, cleared by a write the socket did not take
@@ -168,13 +239,20 @@ struct Socket {
 
 /// A [`TcpProvider`] over operating-system sockets, driven by `mio`.
 ///
-/// Non-blocking on the drive path: [`poll`](TcpProvider::poll),
+/// Non-blocking throughout: [`poll`](TcpProvider::poll),
 /// [`send`](TcpProvider::send), [`close_write`](TcpProvider::close_write), and
-/// [`abort`](TcpProvider::abort) service whatever is ready and return, so
-/// [`BlockingTcpProvider::wait_for_input`] is the only call a driven loop makes
-/// that ever blocks. Readiness is edge-triggered, so every socket is read and
-/// written until it reports `WouldBlock` -- anything less would leave bytes
-/// sitting in a kernel buffer with no further notification coming.
+/// [`abort`](TcpProvider::abort) service whatever is ready and return. It owns
+/// no poll of its own: as a [`PollSource`] it registers its sockets with the
+/// host's shared one and records what [`dispatch`](PollSource::dispatch)
+/// reports. Readiness is edge-triggered, so every ready socket is read until
+/// it reports `WouldBlock`, and work a per-poll budget left behind keeps
+/// [`next_deadline`](TcpProvider::next_deadline) due now -- anything less
+/// would leave bytes sitting in a kernel buffer with no further notification
+/// coming.
+///
+/// Before it is attached, every poll treats every socket as possibly ready,
+/// so a host that never attaches it (a `SwarmCore` polling on its own
+/// cadence) still makes progress.
 ///
 /// [`connect`](TcpProvider::connect) never blocks either: the connect
 /// completes on a later [`poll`](TcpProvider::poll) as
@@ -195,81 +273,76 @@ struct Socket {
 /// peer is the host's decision, not a socket's. mDNS makes that substitution
 /// from its own interface list, and address selection drops what is left.
 pub struct StdTcpProvider {
-    poll: Poll,
-    events: Events,
-    /// Snapshot of one `mio` event batch. Reused because `Events` borrows
-    /// itself while iterating but changing socket flags needs `&mut self`.
-    observed: Vec<(Token, bool, bool)>,
-    waker: Arc<Waker>,
+    /// The host's shared poll, once attached.
+    registration: Option<Registration>,
     listeners: BTreeMap<usize, Listener>,
     sockets: BTreeMap<SocketHandle, Socket>,
-    /// Sockets a readiness event marked readable, until reading reaches
-    /// `WouldBlock`. Kept apart from `sockets` so a poll and a wait visit only
-    /// these rather than every socket.
+    /// Sockets readiness marked readable, until reading reaches
+    /// `WouldBlock`. Kept apart from `sockets` so a poll visits only these
+    /// rather than every socket.
     readable: BTreeSet<SocketHandle>,
     /// Sockets still in [`Phase::Connecting`], which every poll re-checks.
     connecting: BTreeSet<SocketHandle>,
     /// Produced by servicing sockets, drained by the next `poll`.
     ready: VecDeque<TcpEvent>,
-    /// Shared between listener tokens and socket handles, so one registration
-    /// can never be mistaken for another.
-    next_id: u64,
+    /// The next socket handle. Monotonic: a handle is never reused.
+    next_handle: u64,
+    /// The next listener key.
+    next_listener: usize,
     read_buffer: Vec<u8>,
-    /// A wake that arrived while nobody was waiting.
-    ///
-    /// `poll` absorbs readiness too, so an interrupt can land there instead of
-    /// in a wait. Remembering it is what stops a handle losing the wakeup to
-    /// that race, which is what [`WaitHandle`] promises.
-    pending_interrupt: bool,
     /// A per-poll cap was reached, so sockets still have work the caller has
-    /// not seen. Readiness alone will not report it again, so a wait must not
-    /// park on it.
+    /// not seen. Readiness alone will not report it again, so the provider
+    /// reports itself due until a poll takes it.
     deferred_work: bool,
     /// Which listener leads the next round of accepts.
     ///
     /// Rotating the start is what keeps a flooded listener from starving the
     /// ones after it; see [`accept_all`](Self::accept_all).
     accept_cursor: usize,
+    /// Readiness was dispatched since the last poll. A listener's or a
+    /// connecting socket's edge is serviced only by that poll, so until it
+    /// runs the provider reports itself due: a host that skips it for a turn
+    /// must not park on an edge that will not come again.
+    dispatched: bool,
 }
 
 impl StdTcpProvider {
-    /// Creates a provider with its own readiness registry.
+    /// Creates a provider. Its sockets register with a host's shared poll
+    /// once it is attached as a [`PollSource`].
     pub fn new() -> Result<Self, TcpError> {
-        let poll = Poll::new().map_err(|error| io_error("creating a poll registry", &error))?;
-        let waker = Arc::new(
-            Waker::new(poll.registry(), WAKER_TOKEN)
-                .map_err(|error| io_error("creating a waker", &error))?,
-        );
         Ok(Self {
-            poll,
-            events: Events::with_capacity(64),
-            observed: Vec::with_capacity(64),
-            waker,
+            registration: None,
             listeners: BTreeMap::new(),
             sockets: BTreeMap::new(),
             readable: BTreeSet::new(),
             connecting: BTreeSet::new(),
             ready: VecDeque::new(),
-            next_id: 1,
+            next_handle: 1,
+            next_listener: 0,
             read_buffer: vec![0; READ_CHUNK],
-            pending_interrupt: false,
             deferred_work: false,
             accept_cursor: 0,
+            dispatched: false,
         })
     }
 
-    fn allocate_token(&mut self) -> Result<Token, TcpError> {
-        let id = self.next_id;
-        let token = match usize::try_from(id) {
-            Ok(token) => Token(token),
-            Err(_) => {
-                return Err(TcpError::Exhausted {
-                    resource: "readiness tokens",
-                });
-            }
-        };
-        self.next_id += 1;
-        Ok(token)
+    fn allocate_handle(&mut self) -> SocketHandle {
+        let handle = SocketHandle::new(self.next_handle);
+        self.next_handle += 1;
+        handle
+    }
+
+    /// Registers `source` if attached; `None` until then.
+    fn register(
+        &mut self,
+        source: &mut impl mio::event::Source,
+        slot: Slot,
+        interest: Interest,
+    ) -> Result<Option<Token>, TcpError> {
+        match self.registration.as_mut() {
+            Some(registration) => registration.register(source, slot, interest).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Turns `WRITABLE` interest on or off for one socket.
@@ -289,77 +362,18 @@ impl StdTcpProvider {
         } else {
             Interest::READABLE
         };
-        if self
-            .poll
-            .registry()
-            .reregister(&mut socket.stream, socket.token, interest)
+        // Unattached, the flag alone is kept for when it is registered.
+        let (Some(registration), Some(token)) = (self.registration.as_ref(), socket.token) else {
+            socket.watching_writable = wanted;
+            return;
+        };
+        if registration
+            .registry
+            .reregister(&mut socket.stream, token, interest)
             .is_ok()
         {
             socket.watching_writable = wanted;
         }
-    }
-
-    /// Folds a `mio` poll into the per-socket readiness flags.
-    ///
-    /// Returns whether anything other than the waker fired. A wake is recorded
-    /// in `pending_interrupt` instead of returned, because it has to survive
-    /// being absorbed by a `poll` that nobody was waiting on.
-    fn absorb_readiness(&mut self, timeout: Duration) -> Result<bool, TcpError> {
-        self.events.clear();
-        match self.poll.poll(&mut self.events, Some(timeout)) {
-            Ok(()) => {}
-            // A signal cut the wait short; the caller polls regardless.
-            Err(error) if error.kind() == ErrorKind::Interrupted => return Ok(true),
-            Err(error) => return Err(io_error("waiting for readiness", &error)),
-        }
-
-        // Collect first: the flags live behind `&mut self`, which `events`
-        // borrows for the duration of the iteration.
-        self.observed.clear();
-        self.observed.extend(
-            self.events
-                .iter()
-                .map(|event| (event.token(), event.is_readable(), event.is_writable())),
-        );
-        let observed = core::mem::take(&mut self.observed);
-
-        let mut ready = false;
-        let mut drained = Vec::new();
-        for &(token, readable, writable) in &observed {
-            if token == WAKER_TOKEN {
-                self.pending_interrupt = true;
-                continue;
-            }
-            ready = true;
-            // Socket handles deliberately reuse the registration token. The
-            // token allocator is shared with listeners, so a listener token
-            // simply misses this map; scanning every socket here turns a
-            // readiness batch into O(events × sockets).
-            let handle = SocketHandle::new(token.0 as u64);
-            let Some(socket) = self.sockets.get_mut(&handle) else {
-                // Listeners need no flag: `accept` runs to `WouldBlock` on
-                // every poll regardless.
-                continue;
-            };
-            if readable {
-                self.readable.insert(handle);
-            }
-            if writable {
-                socket.writable = true;
-                if matches!(socket.phase, Phase::Open) {
-                    drained.push(handle);
-                }
-            }
-        }
-
-        for handle in drained {
-            // The socket has room again, so stop watching for it -- otherwise
-            // the next wait returns instantly on the same standing readiness.
-            self.watch_writable(handle, false);
-            self.ready.push_back(TcpEvent::Writable { socket: handle });
-        }
-        self.observed = observed;
-        Ok(ready)
     }
 
     /// Accepts what each listener has queued, up to this poll's budget.
@@ -425,12 +439,8 @@ impl StdTcpProvider {
         remote: Multiaddr,
     ) -> Result<(), TcpError> {
         disable_nagle(&stream)?;
-        let token = self.allocate_token()?;
-        self.poll
-            .registry()
-            .register(&mut stream, token, Interest::READABLE)
-            .map_err(|error| io_error("registering an accepted stream", &error))?;
-        let handle = SocketHandle::new(token.0 as u64);
+        let handle = self.allocate_handle();
+        let token = self.register(&mut stream, Slot::Socket(handle), Interest::READABLE)?;
         // Data may have arrived with the connection, before any edge this
         // registration could report.
         self.readable.insert(handle);
@@ -488,7 +498,13 @@ impl StdTcpProvider {
         };
 
         socket.phase = Phase::Open;
+        // A finished connect is a writable socket, whether or not an event
+        // said so (an unattached provider gets none).
+        socket.writable = true;
         self.connecting.remove(&handle);
+        // Readable edges while connecting were not recorded, so probe once:
+        // the peer may already have written.
+        self.readable.insert(handle);
         socket.remote = socket_addr_to_multiaddr(peer);
         let remote = socket.remote.clone();
         // Connect completion was the only reason to watch writability.
@@ -506,8 +522,14 @@ impl StdTcpProvider {
             let Some(socket) = self.sockets.get_mut(&handle) else {
                 return;
             };
-            if !self.readable.contains(&handle) || !matches!(socket.phase, Phase::Open) {
-                // A connecting socket keeps its mark for once it is open.
+            if !self.readable.contains(&handle) {
+                return;
+            }
+            if !matches!(socket.phase, Phase::Open) {
+                // Never left marked while connecting: the mark would keep the
+                // provider due, spinning a host until the connect settles.
+                // Settling probes a read instead.
+                self.readable.remove(&handle);
                 return;
             }
             if socket.read_closed {
@@ -583,9 +605,8 @@ impl StdTcpProvider {
         };
         self.readable.remove(&handle);
         self.connecting.remove(&handle);
-        if let Err(error) = self.poll.registry().deregister(&mut socket.stream) {
-            // The stream is about to drop, which releases the registration too.
-            drop(error);
+        if let (Some(registration), Some(token)) = (self.registration.as_mut(), socket.token) {
+            registration.deregister(&mut socket.stream, token);
         }
         self.ready.push_back(TcpEvent::Closed {
             socket: handle,
@@ -617,17 +638,16 @@ impl TcpProvider for StdTcpProvider {
         let bound = listener
             .local_addr()
             .map_err(|error| io_error("reading the bound address", &error))?;
-        let token = self.allocate_token()?;
-        self.poll
-            .registry()
-            .register(&mut listener, token, Interest::READABLE)
-            .map_err(|error| io_error("registering a listener", &error))?;
+        let key = self.next_listener;
+        let token = self.register(&mut listener, Slot::Listener, Interest::READABLE)?;
+        self.next_listener += 1;
 
         let bound = socket_addr_to_multiaddr(bound);
         self.listeners.insert(
-            token.0,
+            key,
             Listener {
                 listener,
+                token,
                 bound: bound.clone(),
             },
         );
@@ -639,13 +659,13 @@ impl TcpProvider for StdTcpProvider {
         let mut stream = mio::net::TcpStream::connect(target)
             .map_err(|error| io_error("starting a connect", &error))?;
         disable_nagle(&stream)?;
-        let token = self.allocate_token()?;
-        self.poll
-            .registry()
-            .register(&mut stream, token, Interest::READABLE | Interest::WRITABLE)
-            .map_err(|error| io_error("registering a stream", &error))?;
+        let handle = self.allocate_handle();
+        let token = self.register(
+            &mut stream,
+            Slot::Socket(handle),
+            Interest::READABLE | Interest::WRITABLE,
+        )?;
 
-        let handle = SocketHandle::new(token.0 as u64);
         self.connecting.insert(handle);
         self.sockets.insert(
             handle,
@@ -727,18 +747,14 @@ impl TcpProvider for StdTcpProvider {
     fn abort(&mut self, socket: SocketHandle) {
         self.readable.remove(&socket);
         self.connecting.remove(&socket);
-        if let Some(mut entry) = self.sockets.remove(&socket) {
-            match self.poll.registry().deregister(&mut entry.stream) {
-                Ok(()) => {}
-                Err(error) => {
-                    // Dropping the stream releases the registration after an abort.
-                    drop(error);
-                }
-            }
-            // Dropping the stream closes it. The kernel still flushes whatever
-            // it already accepted, so this is a close rather than a reset --
-            // the peer sees the stream end either way, which is what the
-            // contract promises.
+        // Dropping the stream closes it. The kernel still flushes whatever it
+        // already accepted, so this is a close rather than a reset -- the
+        // peer sees the stream end either way, which is what the contract
+        // promises.
+        if let Some(mut entry) = self.sockets.remove(&socket)
+            && let (Some(registration), Some(token)) = (self.registration.as_mut(), entry.token)
+        {
+            registration.deregister(&mut entry.stream, token);
         }
         // The caller asked for this, so it is owed no further events.
         self.discard_queued(socket);
@@ -746,7 +762,18 @@ impl TcpProvider for StdTcpProvider {
 
     fn poll(&mut self, _now: Now) -> Result<Vec<TcpEvent>, TcpError> {
         self.deferred_work = false;
-        self.absorb_readiness(Duration::ZERO)?;
+        self.dispatched = false;
+        if self.registration.is_none() {
+            // Nothing reports readiness yet, so every open socket may have
+            // something; reading one that does not costs a `WouldBlock`.
+            // Connecting ones are probed when they settle.
+            self.readable.extend(
+                self.sockets
+                    .iter()
+                    .filter(|(_, socket)| matches!(socket.phase, Phase::Open))
+                    .map(|(handle, _)| *handle),
+            );
+        }
         self.accept_all();
 
         // Only sockets with something to do. Connects settle first, so a
@@ -758,6 +785,18 @@ impl TcpProvider for StdTcpProvider {
             self.read_all(handle);
         }
         Ok(self.ready.drain(..).collect())
+    }
+
+    /// Due now while anything learned from readiness is still unserviced:
+    /// readiness dispatched since the last poll, events not yet handed over, a
+    /// socket marked readable, or work a budget deferred. No edge will
+    /// announce those again.
+    fn next_deadline(&self) -> Option<Deadline> {
+        (self.dispatched
+            || !self.ready.is_empty()
+            || self.deferred_work
+            || !self.readable.is_empty())
+        .then_some(Deadline::IMMEDIATE)
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {
@@ -774,83 +813,109 @@ impl TcpProvider for StdTcpProvider {
     }
 }
 
-impl BlockingTcpProvider for StdTcpProvider {
-    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        if core::mem::take(&mut self.pending_interrupt) {
-            // A wake that landed while nobody was waiting, possibly absorbed by
-            // a `poll`. Honouring it here is what keeps a handle from losing
-            // the race against the waiter.
-            return WaitOutcome::Interrupted;
-        }
-        if !self.ready.is_empty() || self.deferred_work || !self.readable.is_empty() {
-            // Sockets still hold bytes this provider has not handed over.
-            // Readiness will not mention them again, so parking would strand
-            // them.
-            return WaitOutcome::Ready;
-        }
-
-        // Readiness is folded into the sockets rather than discarded, so the
-        // `poll` that follows still sees what this wait learned.
-        let ready = match self.absorb_readiness(timeout) {
-            // A failed wait is not a reason to sleep; let the caller poll.
-            Err(_) => return WaitOutcome::Ready,
-            Ok(ready) => ready,
+impl PollSource for StdTcpProvider {
+    /// Registers every listener and socket opened so far; later ones register
+    /// as they open. Registering reports a socket's current readiness, so
+    /// bytes that arrived before attach still raise an event.
+    fn attach(
+        &mut self,
+        registry: Registry,
+        tokens: TokenSpace,
+        _waker: Arc<Waker>,
+    ) -> std::io::Result<()> {
+        let mut registration = Registration {
+            registry,
+            tokens,
+            slots: Vec::new(),
+            free: Vec::new(),
         };
-        if core::mem::take(&mut self.pending_interrupt) {
-            WaitOutcome::Interrupted
-        } else if ready {
-            WaitOutcome::Ready
-        } else {
-            WaitOutcome::TimedOut
+        if let Err(error) = self.register_all(&mut registration) {
+            // All or nothing, so a later attach can try again from scratch.
+            self.deregister_all(&mut registration);
+            return Err(std::io::Error::other(error.to_string()));
         }
+        self.registration = Some(registration);
+        Ok(())
     }
 
-    fn wait_handle(&self) -> WaitHandle {
-        let waker = Arc::clone(&self.waker);
-        WaitHandle::new(move || {
-            if let Err(error) = waker.wake() {
-                // A destroyed poller cannot be woken; the handle has no error channel.
-                drop(error);
+    fn dispatch(&mut self, event: &Event) {
+        self.record_readiness(
+            event.token(),
+            event.is_readable() || event.is_read_closed() || event.is_error(),
+            event.is_writable(),
+        );
+    }
+}
+
+impl StdTcpProvider {
+    /// Registers every listener and socket, recording each token.
+    fn register_all(&mut self, registration: &mut Registration) -> Result<(), TcpError> {
+        for listener in self.listeners.values_mut() {
+            listener.token = Some(registration.register(
+                &mut listener.listener,
+                Slot::Listener,
+                Interest::READABLE,
+            )?);
+        }
+        for (&handle, socket) in &mut self.sockets {
+            let interest = if socket.watching_writable {
+                Interest::READABLE | Interest::WRITABLE
+            } else {
+                Interest::READABLE
+            };
+            socket.token =
+                Some(registration.register(&mut socket.stream, Slot::Socket(handle), interest)?);
+        }
+        Ok(())
+    }
+
+    /// Undoes a partial [`register_all`](Self::register_all).
+    fn deregister_all(&mut self, registration: &mut Registration) {
+        for listener in self.listeners.values_mut() {
+            if let Some(token) = listener.token.take() {
+                registration.deregister(&mut listener.listener, token);
             }
-        })
+        }
+        for socket in self.sockets.values_mut() {
+            if let Some(token) = socket.token.take() {
+                registration.deregister(&mut socket.stream, token);
+            }
+        }
     }
 
-    /// The `mio` selector. A zero-timeout wait folds everything it harvests
-    /// into socket flags and `pending_interrupt` before answering `TimedOut`,
-    /// so nothing stale is left on it and nothing learned is lost.
-    ///
-    /// mio exposes it only where its selector is a real fd (epoll, kqueue,
-    /// event ports); elsewhere this is `None` and a set takes turns.
-    #[cfg(unix)]
-    fn readiness_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        #[cfg(any(
-            target_os = "linux",
-            target_os = "android",
-            target_vendor = "apple",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly",
-            target_os = "illumos",
-            target_os = "solaris"
-        ))]
-        {
-            use std::os::fd::AsFd;
-            Some(self.poll.registry().as_fd())
+    /// What [`dispatch`](PollSource::dispatch) records for one event.
+    fn record_readiness(&mut self, token: Token, readable: bool, writable: bool) {
+        self.dispatched = true;
+        let Some(slot) = self
+            .registration
+            .as_ref()
+            .and_then(|registration| registration.slot(token))
+        else {
+            // A token freed since: a stale event, and nothing to do.
+            return;
+        };
+        // Listeners need no flag: `accept` runs to `WouldBlock` on every poll
+        // regardless.
+        let Slot::Socket(handle) = slot else {
+            return;
+        };
+        let Some(socket) = self.sockets.get_mut(&handle) else {
+            return;
+        };
+        // A connecting socket is not marked: the connect settles on the next
+        // poll regardless and then probes a read, while a mark (from a stale
+        // event for a recycled token, say) would keep the provider due until
+        // then.
+        if readable && matches!(socket.phase, Phase::Open) {
+            self.readable.insert(handle);
         }
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_vendor = "apple",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly",
-            target_os = "illumos",
-            target_os = "solaris"
-        )))]
-        {
-            None
+        if writable {
+            socket.writable = true;
+            if matches!(socket.phase, Phase::Open) && socket.watching_writable {
+                // The socket has room again, so stop watching for it.
+                self.watch_writable(handle, false);
+                self.ready.push_back(TcpEvent::Writable { socket: handle });
+            }
         }
     }
 }
@@ -858,8 +923,192 @@ impl BlockingTcpProvider for StdTcpProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::time::Duration;
+    use minip2p_transport::SharedPoll;
     use std::thread;
     use std::time::Instant;
+
+    fn loopback_listener() -> (StdTcpProvider, Multiaddr) {
+        let mut server = StdTcpProvider::new().expect("server");
+        let bound = server
+            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("address"))
+            .expect("listen");
+        (server, bound)
+    }
+
+    fn token_of(provider: &StdTcpProvider, handle: SocketHandle) -> Option<Token> {
+        provider
+            .sockets
+            .get(&handle)
+            .and_then(|socket| socket.token)
+    }
+
+    #[test]
+    fn a_recycled_token_never_carries_the_old_handles_lifecycle() {
+        let (_server, bound) = loopback_listener();
+        let mut client = StdTcpProvider::new().expect("client");
+        let mut poll = SharedPoll::new().expect("poll");
+        poll.attach(&mut client).expect("attach");
+
+        let old = client.connect(&bound).expect("first connect");
+        let old_token = token_of(&client, old).expect("registered");
+        client.abort(old);
+        let new = client.connect(&bound).expect("second connect");
+        assert_ne!(old, new, "handles are never reused");
+        assert_eq!(
+            token_of(&client, new),
+            Some(old_token),
+            "the freed token is reused"
+        );
+
+        // Retiring the old handle again must not touch the socket that now
+        // holds its token.
+        client.abort(old);
+        assert!(client.sockets.contains_key(&new));
+        let registration = client.registration.as_ref().expect("attached");
+        assert!(matches!(
+            registration.slot(old_token),
+            Some(Slot::Socket(holder)) if holder == new
+        ));
+
+        // A stale event for the old socket only marks the new one possibly
+        // ready, which a poll answers with nothing at all.
+        client.readable.insert(new);
+        let events = client.poll(Now::from_millis(0)).expect("poll");
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, TcpEvent::Closed { .. } | TcpEvent::Received { .. })),
+            "a spurious wake is harmless: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_attach_rolls_back_so_a_later_one_succeeds() {
+        let mut provider = StdTcpProvider::new().expect("provider");
+        for _ in 0..3 {
+            provider
+                .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("address"))
+                .expect("listen");
+        }
+        let poll = mio::Poll::new().expect("poll");
+        let waker = Arc::new(Waker::new(poll.registry(), Token(usize::MAX)).expect("waker"));
+        // Two tokens for three listeners: the third registration fails.
+        let tiny = TokenSpace::full()
+            .subspace(usize::BITS - 1, 0)
+            .expect("a one-bit space");
+        let registry = || poll.registry().try_clone().expect("registry");
+        assert!(
+            provider
+                .attach(registry(), tiny, Arc::clone(&waker))
+                .is_err()
+        );
+        assert!(provider.registration.is_none());
+        assert!(
+            provider
+                .listeners
+                .values()
+                .all(|listener| listener.token.is_none()),
+            "the listeners registered before the failure were rolled back"
+        );
+
+        let roomy = TokenSpace::full().subspace(4, 0).expect("space");
+        provider
+            .attach(registry(), roomy, waker)
+            .expect("a retry registers everything afresh");
+        assert!(
+            provider
+                .listeners
+                .values()
+                .all(|listener| listener.token.is_some())
+        );
+    }
+
+    #[test]
+    fn a_stale_readable_event_does_not_keep_a_connecting_replacement_due() {
+        let (_server, bound) = loopback_listener();
+        let mut client = StdTcpProvider::new().expect("client");
+        let mut poll = SharedPoll::new().expect("poll");
+        poll.attach(&mut client).expect("attach");
+
+        let old = client.connect(&bound).expect("first connect");
+        let token = token_of(&client, old).expect("registered");
+        client.abort(old);
+        let new = client.connect(&bound).expect("second connect");
+        assert_eq!(token_of(&client, new), Some(token), "token recycled");
+        assert!(matches!(client.sockets[&new].phase, Phase::Connecting));
+
+        // The old socket's readable edge lands on the replacement while its
+        // connect is still pending.
+        client.record_readiness(token, true, false);
+        assert!(
+            !client.readable.contains(&new),
+            "a connecting socket is never left marked readable"
+        );
+
+        // Due once, for the dispatch; after the poll nothing keeps it due,
+        // whether or not the connect has settled yet (it probes a read when
+        // it does).
+        client.poll(Now::from_millis(0)).expect("poll");
+        assert_eq!(TcpProvider::next_deadline(&client), None, "no spin");
+    }
+
+    #[test]
+    fn an_attached_provider_is_woken_by_input_and_reads_it_all() {
+        let (mut server, bound) = loopback_listener();
+        let mut poll = SharedPoll::new().expect("poll");
+        poll.attach(&mut server).expect("attach");
+        let mut peer = std::net::TcpStream::connect(
+            bound.to_string().replace("/ip4/", "").replace("/tcp/", ":"),
+        )
+        .expect("peer connects");
+
+        // The accept is announced by readiness, then the bytes behind it.
+        let started = Instant::now();
+        let mut accepted = None;
+        while accepted.is_none() {
+            assert!(started.elapsed() < Duration::from_secs(5), "never accepted");
+            let events = poll
+                .harvest(&mut server, Duration::from_secs(5))
+                .expect("harvest");
+            // A listener's edge is serviced only by the poll; until then a
+            // host that skipped this provider for a turn must not park.
+            assert!(
+                events == 0 || TcpProvider::next_deadline(&server).is_some(),
+                "dispatched listener readiness is due until polled"
+            );
+            accepted = server
+                .poll(Now::from_millis(0))
+                .expect("poll")
+                .into_iter()
+                .find_map(|event| match event {
+                    TcpEvent::Accepted { socket, .. } => Some(socket),
+                    _ => None,
+                });
+        }
+        std::io::Write::write_all(&mut peer, b"edge").expect("write");
+        let mut received = Vec::new();
+        while received.len() < 4 {
+            assert!(started.elapsed() < Duration::from_secs(5), "never read");
+            poll.harvest(&mut server, Duration::from_secs(5))
+                .expect("harvest");
+            assert!(
+                TcpProvider::next_deadline(&server).is_some(),
+                "dispatched readiness is due until polled"
+            );
+            for event in server.poll(Now::from_millis(0)).expect("poll") {
+                if let TcpEvent::Received { data, .. } = event {
+                    received.extend(data);
+                }
+            }
+        }
+        assert_eq!(received, b"edge");
+        assert_eq!(
+            TcpProvider::next_deadline(&server),
+            None,
+            "read to WouldBlock, nothing left owed"
+        );
+    }
 
     #[test]
     fn accepted_and_dialed_streams_disable_nagle() {

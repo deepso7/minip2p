@@ -1077,33 +1077,23 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
     }
 }
 
+/// Forwards to the wrapped transport, which owns the sockets. A circuit's own
+/// buffered events need no readiness: `next_deadline` reports them as due now.
 #[cfg(feature = "std")]
-impl<T: minip2p_transport::BlockingTransport, E: EntropySource> minip2p_transport::BlockingTransport
+impl<T: minip2p_transport::PollSource, E: EntropySource> minip2p_transport::PollSource
     for CircuitTransport<T, E>
 {
-    fn wait_for_input(&mut self, timeout: core::time::Duration) -> minip2p_transport::WaitOutcome {
-        if self.pending.is_empty() {
-            self.inner.wait_for_input(timeout)
-        } else {
-            minip2p_transport::WaitOutcome::Ready
-        }
+    fn attach(
+        &mut self,
+        registry: minip2p_transport::mio::Registry,
+        tokens: minip2p_transport::TokenSpace,
+        waker: alloc::sync::Arc<minip2p_transport::mio::Waker>,
+    ) -> std::io::Result<()> {
+        self.inner.attach(registry, tokens, waker)
     }
 
-    /// Forwards to the wrapped transport, which owns the socket that
-    /// `wait_for_input` actually blocks on.
-    ///
-    /// Inheriting the inert default would hand callers a handle that silently
-    /// does nothing while the wait still blocks inside the inner transport.
-    fn wait_handle(&self) -> minip2p_transport::WaitHandle {
-        self.inner.wait_handle()
-    }
-
-    /// Forwards to the wrapped transport, for the same reason as
-    /// `wait_handle`: a circuit answers `TimedOut` only when the inner wait
-    /// did, so the inner fd's drain-before-block contract carries over.
-    #[cfg(unix)]
-    fn readiness_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        self.inner.readiness_fd()
+    fn dispatch(&mut self, event: &minip2p_transport::mio::event::Event) {
+        self.inner.dispatch(event);
     }
 }
 
@@ -1168,11 +1158,11 @@ mod tests {
         reset_calls: usize,
     }
 
-    /// Leaf transport whose wait handle records interrupts, so a test can
-    /// prove one reached the bottom of a decorator stack.
+    /// Leaf transport that counts how often it was attached, so a test can
+    /// prove an attach reached the bottom of a decorator stack.
     struct WakeableTransport {
         inner: InMemoryTransport,
-        interrupts: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+        attaches: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
     }
 
     impl Transport for WakeableTransport {
@@ -1231,47 +1221,42 @@ mod tests {
         }
     }
 
-    impl minip2p_transport::BlockingTransport for WakeableTransport {
-        fn wait_handle(&self) -> minip2p_transport::WaitHandle {
-            let interrupts = alloc::sync::Arc::clone(&self.interrupts);
-            minip2p_transport::WaitHandle::new(move || {
-                interrupts.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-            })
+    impl minip2p_transport::PollSource for WakeableTransport {
+        fn attach(
+            &mut self,
+            _: minip2p_transport::mio::Registry,
+            _: minip2p_transport::TokenSpace,
+            _: alloc::sync::Arc<minip2p_transport::mio::Waker>,
+        ) -> std::io::Result<()> {
+            self.attaches
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
+
+        fn dispatch(&mut self, _: &minip2p_transport::mio::event::Event) {}
     }
 
-    /// A decorator that forwards `wait_for_input` but inherits the inert
-    /// default `wait_handle` hands callers a handle that does nothing while
-    /// the wait still blocks in the transport underneath.
+    /// The circuit wrapper owns no socket, so attaching it has to reach the
+    /// transport underneath, or a host would never hear that transport's
+    /// input.
     #[test]
-    fn wait_handle_reaches_through_the_circuit_wrapper() {
-        use minip2p_transport::BlockingTransport;
-
+    fn attaching_reaches_through_the_circuit_wrapper() {
         let local = identity(1);
         let relay = identity(9).peer_id();
         let (inner, _) = InMemoryTransport::pair(local.peer_id(), relay);
-        let interrupts = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
-        let transport = CircuitTransport::new(
+        let attaches = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let mut transport = CircuitTransport::new(
             WakeableTransport {
                 inner,
-                interrupts: alloc::sync::Arc::clone(&interrupts),
+                attaches: alloc::sync::Arc::clone(&attaches),
             },
             local,
             CounterEntropy(1),
         );
 
-        let handle = BlockingTransport::wait_handle(&transport);
-        assert!(
-            !handle.is_noop(),
-            "the wrapper must not report an inert handle over a wakeable transport"
-        );
-
-        handle.interrupt();
-        assert_eq!(
-            interrupts.load(core::sync::atomic::Ordering::SeqCst),
-            1,
-            "interrupt must reach the transport that owns the wait"
-        );
+        let mut poll = minip2p_transport::SharedPoll::new().expect("poll");
+        poll.attach(&mut transport).expect("attach");
+        assert_eq!(attaches.load(core::sync::atomic::Ordering::SeqCst), 1);
     }
 
     impl<T> CloseObservingTransport<T> {

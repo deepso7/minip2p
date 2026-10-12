@@ -4,9 +4,12 @@ use std::{
     collections::BTreeMap,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
+    sync::Arc,
 };
 
 use if_addrs::IfAddr;
+use minip2p_transport::mio::{self, Interest, Registry, Waker, event::Event};
+use minip2p_transport::{PollSource, TokenSpace};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 
 use crate::io::{MdnsDatagram, MdnsError, MdnsIo};
@@ -62,8 +65,41 @@ impl InterfaceRegistry {
 #[derive(Debug)]
 struct SocketPair {
     snapshot: InterfaceSnapshot,
-    receive: UdpSocket,
+    /// Registered with the host's shared poll, once attached.
+    receive: mio::net::UdpSocket,
     send: UdpSocket,
+}
+
+/// The host's shared poll, once attached.
+struct Registration {
+    registry: Registry,
+    tokens: TokenSpace,
+}
+
+impl core::fmt::Debug for Registration {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Registration")
+            .field("tokens", &self.tokens)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Registration {
+    /// Registers (or, for a socket kept across a refresh, re-registers) the
+    /// receive socket of pair `index`.
+    fn register(&self, index: usize, pair: &mut SocketPair, fresh: bool) -> io::Result<()> {
+        let token = self
+            .tokens
+            .token(index)
+            .ok_or_else(|| io::Error::other("no readiness token left for an mDNS socket"))?;
+        if fresh {
+            self.registry
+                .register(&mut pair.receive, token, Interest::READABLE)
+        } else {
+            self.registry
+                .reregister(&mut pair.receive, token, Interest::READABLE)
+        }
+    }
 }
 
 /// Per-interface mDNS receive/send socket collection.
@@ -71,8 +107,20 @@ struct SocketPair {
 /// The sockets are a list rather than a map: there are a handful of them, a
 /// receive happens up to a full budget's worth per tick, and walking a short
 /// list beats allocating anything at all on that path.
+///
+/// # Waking a host
+///
+/// As a [`PollSource`] attached to a std host's shared poll (the `Endpoint`
+/// attaches it to its swarm as a host source), the receive sockets are
+/// registered for readiness, and re-registered when an interface refresh
+/// rebuilds them. Readiness only wakes the host: the driver's next tick reads
+/// every socket until it has nothing more (or its budget runs out, which it
+/// reports as due now), so nothing is dispatched to this. Without a poll the
+/// host has to tick it on a cadence of its own to hear anything.
 #[derive(Debug)]
 pub struct MdnsSockets {
+    /// The host's shared poll, once attached.
+    registration: Option<Registration>,
     enable_ipv6: bool,
     registry: InterfaceRegistry,
     snapshots: Vec<InterfaceSnapshot>,
@@ -93,6 +141,7 @@ impl MdnsSockets {
         #[cfg(any(unix, windows))]
         {
             let mut sockets = Self {
+                registration: None,
                 enable_ipv6: config.enable_ipv6,
                 registry: InterfaceRegistry::default(),
                 snapshots: Vec::new(),
@@ -113,7 +162,7 @@ impl MdnsSockets {
 
         let mut old = core::mem::take(&mut self.pairs);
         let mut pairs = Vec::with_capacity(snapshots.len());
-        for snapshot in &snapshots {
+        for (index, snapshot) in snapshots.iter().enumerate() {
             // An interface that is still here with the same addresses keeps
             // its sockets: rebuilding one would drop the multicast membership
             // and lose whatever had arrived on it.
@@ -121,11 +170,24 @@ impl MdnsSockets {
                 .iter()
                 .position(|pair| pair.snapshot == *snapshot)
                 .map(|index| old.swap_remove(index));
-            let pair = match existing {
+            let fresh = existing.is_none();
+            let mut pair = match existing {
                 Some(pair) => pair,
                 None => SocketPair::new(snapshot.clone())?,
             };
+            // Kept sockets may have moved to another index, so another token.
+            if let Some(registration) = &self.registration {
+                registration
+                    .register(index, &mut pair, fresh)
+                    .map_err(|error| MdnsError::io("registering an mDNS socket", error))?;
+            }
             pairs.push(pair);
+        }
+        if let Some(registration) = &self.registration {
+            for mut gone in old {
+                // About to drop, which releases the registration too.
+                drop(registration.registry.deregister(&mut gone.receive));
+            }
         }
         self.snapshots = snapshots;
         self.pairs = pairs;
@@ -204,9 +266,29 @@ impl MdnsIo for MdnsSockets {
     }
 }
 
+impl PollSource for MdnsSockets {
+    fn attach(&mut self, registry: Registry, tokens: TokenSpace, _: Arc<Waker>) -> io::Result<()> {
+        let registration = Registration { registry, tokens };
+        for (index, pair) in self.pairs.iter_mut().enumerate() {
+            if let Err(error) = registration.register(index, pair, true) {
+                // All or nothing, so a later attach starts from scratch.
+                for registered in self.pairs.iter_mut().take(index) {
+                    drop(registration.registry.deregister(&mut registered.receive));
+                }
+                return Err(error);
+            }
+        }
+        self.registration = Some(registration);
+        Ok(())
+    }
+
+    /// Nothing to record: the driver reads every socket on its tick.
+    fn dispatch(&mut self, _: &Event) {}
+}
+
 impl SocketPair {
     fn new(snapshot: InterfaceSnapshot) -> Result<Self, MdnsError> {
-        let receive = create_receive_socket(&snapshot)?;
+        let receive = mio::net::UdpSocket::from_std(create_receive_socket(&snapshot)?);
         let send = create_send_socket(&snapshot)?;
         Ok(Self {
             snapshot,
@@ -386,6 +468,7 @@ impl MdnsSockets {
     /// ordinary logic that plain loopback sockets exercise just as well.
     fn from_pairs(pairs: Vec<SocketPair>) -> Self {
         Self {
+            registration: None,
             enable_ipv6: false,
             registry: InterfaceRegistry::default(),
             snapshots: pairs.iter().map(|pair| pair.snapshot.clone()).collect(),
@@ -408,6 +491,7 @@ mod tests {
         let receive = UdpSocket::bind("127.0.0.1:0").expect("a loopback socket");
         receive.set_nonblocking(true).expect("nonblocking");
         let addr = receive.local_addr().expect("bound address");
+        let receive = mio::net::UdpSocket::from_std(receive);
         let send = UdpSocket::bind("127.0.0.1:0").expect("a loopback socket");
         let snapshot = InterfaceSnapshot {
             id: InterfaceId::new(id),
@@ -451,6 +535,32 @@ mod tests {
             }
             assert!(ready, "a datagram sent on loopback never arrived");
         }
+    }
+
+    #[test]
+    fn a_datagram_on_an_attached_socket_wakes_the_host_without_being_read() {
+        let (first, _) = loopback_pair(1);
+        let (second, addr) = loopback_pair(2);
+        let mut sockets = MdnsSockets::from_pairs(vec![first, second]);
+        let mut poll = minip2p_transport::SharedPoll::new().expect("poll");
+        poll.attach_host_source(&mut sockets).expect("attach");
+
+        UdpSocket::bind("127.0.0.1:0")
+            .expect("sender")
+            .send_to(b"query", addr)
+            .expect("send");
+        // A host source is never dispatched to, so any transport will do.
+        let mut transport = MdnsSockets::from_pairs(Vec::new());
+        let events = poll
+            .harvest(&mut transport, std::time::Duration::from_secs(5))
+            .expect("harvest");
+        assert!(events > 0, "the datagram woke the poll");
+        assert!(poll.take_wake(), "and surfaces as a host wake");
+        assert_eq!(
+            next_interface(&mut sockets),
+            InterfaceId::new(2),
+            "readiness consumed nothing"
+        );
     }
 
     #[test]

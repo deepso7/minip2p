@@ -231,15 +231,6 @@ impl<P, E> TcpTransport<P, E> {
         self.ids.namespace()
     }
 
-    /// Whether events are already queued for the next
-    /// [`poll`](Transport::poll).
-    ///
-    /// A blocking driver must not sleep while these are waiting.
-    #[cfg(feature = "std")]
-    pub(crate) fn has_pending_events(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
     /// The active connection identifiers.
     pub fn connection_ids(&self) -> Vec<ConnectionId> {
         self.connections.keys().copied().collect()

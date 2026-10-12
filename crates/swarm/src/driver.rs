@@ -1,8 +1,10 @@
-//! Std [`Swarm`]: a [`SwarmCore`] plus a clock and blocking drive loops.
+//! Std [`Swarm`]: a [`SwarmCore`] plus a clock, one shared readiness poll, and
+//! blocking drive loops.
 //!
 //! This is the DX-friendly entrypoint for applications: it samples time
-//! itself, so callers need not thread `now_ms` through every call, and it can
-//! idle the calling thread between polls.
+//! itself, so callers need not thread `now_ms` through every call, and it
+//! idles the calling thread between polls on one edge-triggered `mio::Poll`
+//! that every source of input registers with (ADR 0013).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -11,20 +13,13 @@ use minip2p_core::{Bytes, PeerId};
 use minip2p_identify::IdentifyConfig;
 use minip2p_ping::PingConfig;
 use minip2p_platform::{Clock, Now, StdClock, StdEntropy};
-use minip2p_transport::{BlockingTransport, ConnectionId, StreamId, Transport, WaitOutcome};
+use minip2p_transport::{
+    BlockingTransport, ConnectionId, PollSource, SharedPoll, StreamId, TransportError, WaitHandle,
+    WakeHandle,
+};
 
 use crate::core::{DriverError, SwarmCore};
 use crate::events::SwarmEvent;
-
-/// Fallback sleep cadence when [`Swarm::poll_next`] idles over a transport
-/// that cannot wait for socket readiness ([`WaitOutcome::Unsupported`]).
-///
-/// 1ms is short enough that single-digit-millisecond RTTs are
-/// observable on loopback (two wakeups bound RTT, so ~2ms floor)
-/// without noticeably burning CPU on idle. Transports that implement
-/// [`BlockingTransport::wait_for_input`] skip this entirely and block until
-/// input arrives or the timer budget elapses.
-const POLL_IDLE_SLEEP: Duration = Duration::from_millis(1);
 
 /// Cap on a single readiness wait when the caller has no deadline
 /// ([`Deadline::NEVER`]). Re-arming the wait occasionally is harmless (one
@@ -64,7 +59,8 @@ pub const RUN_UNTIL_SKIP_LIMIT: usize = 1024;
 /// freezes the clock to exercise protocol timers still wants its own waits to
 /// end. The platform type is when a *component* next needs attention, on the
 /// monotonic timeline of the samples the driver hands out, and is what
-/// [`Transport::next_deadline`] reports.
+/// [`Transport::next_deadline`](minip2p_transport::Transport::next_deadline)
+/// reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadline {
     at: Option<Instant>,
@@ -140,11 +136,18 @@ pub enum PollNext {
     Event(SwarmEvent),
     /// The caller's deadline elapsed.
     Deadline,
-    /// The transport wait was interrupted externally.
+    /// A [`WaitHandle`] interrupted the wait. Interrupts sent before one is
+    /// reported coalesce into this one.
     Interrupted,
+    /// Host work may be ready: a [`WakeHandle`] woke the wait, input arrived
+    /// on a source attached with [`Swarm::attach_host_source`], or a
+    /// socket-less transport woke the shared `Waker`. Kept pending across
+    /// competing returns until reported, so the host services it once.
+    Woken,
 }
 
-/// Std driver: a [`SwarmCore`] plus a clock and blocking drive loops.
+/// Std driver: a [`SwarmCore`] plus a clock, one shared readiness poll, and
+/// blocking drive loops.
 ///
 /// This is the DX-friendly entrypoint for applications. It samples the clock
 /// itself for the commands that take time, and it can idle the calling thread
@@ -152,23 +155,52 @@ pub enum PollNext {
 /// protocol registration, peer and connection queries -- is on
 /// [`core`](Self::core) / [`core_mut`](Self::core_mut).
 ///
+/// # Waiting
+///
+/// The swarm owns one `mio::Poll` and its one `Waker`, and attaches the
+/// transport to them when it is built. A wait blocks once, for every source,
+/// until input arrives, the earliest timer is due, or the caller's deadline
+/// passes. [`wait_handle`](Self::wait_handle) interrupts it from another
+/// thread; [`wake_handle`](Self::wake_handle) wakes it for host work without
+/// interrupting. Every drive path, blocking or not, first collects one bounded
+/// batch of readiness without blocking.
+///
 /// Hosts without a thread to block -- embedded boards, single-threaded event
 /// loops -- should drive [`SwarmCore`] directly instead.
-pub struct Swarm<T: Transport> {
+pub struct Swarm<T: BlockingTransport> {
     core: SwarmCore<T, StdEntropy>,
     /// Logical clock used to drive Sans-I/O timers.
     clock: Box<dyn Clock + Send + Sync>,
+    /// The readiness every source registers with.
+    poll: SharedPoll,
+    /// Every blocking budget handed to the poll, for budget tests.
+    #[cfg(test)]
+    wait_budgets: Vec<Duration>,
+    /// Stands in for a blocking wait, so tests can move a fake clock across
+    /// one without sleeping.
+    #[cfg(test)]
+    simulated_wait: Option<Box<dyn FnMut(Duration) + Send + Sync>>,
 }
 
-impl<T: Transport> Swarm<T> {
+/// A failed poll operation, as the transport error the drive paths report.
+fn poll_error(context: &str, error: &std::io::Error) -> DriverError {
+    DriverError::Transport(TransportError::PollError {
+        reason: format!("{context}: {error}"),
+    })
+}
+
+impl<T: BlockingTransport> Swarm<T> {
     /// Creates a swarm driver around the given transport, identify config,
-    /// and ping config.
+    /// and ping config, and attaches the transport to its readiness poll.
+    ///
+    /// Fails if the poll cannot be opened or the transport's sockets cannot
+    /// be registered with it.
     pub fn new(
         transport: T,
         identify_config: IdentifyConfig,
         ping_config: PingConfig,
         local_peer_id: PeerId,
-    ) -> Self {
+    ) -> Result<Self, DriverError> {
         Self::with_clock(
             transport,
             identify_config,
@@ -182,15 +214,19 @@ impl<T: Transport> Swarm<T> {
     ///
     /// This is primarily for deterministic tests around protocol timeouts. The
     /// default [`Swarm::new`] constructor remains the right choice for normal
-    /// applications.
+    /// applications. Fails as [`Swarm::new`] does.
     pub fn with_clock(
-        transport: T,
+        mut transport: T,
         identify_config: IdentifyConfig,
         ping_config: PingConfig,
         local_peer_id: PeerId,
         clock: Box<dyn Clock + Send + Sync>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DriverError> {
+        let mut poll =
+            SharedPoll::new().map_err(|error| poll_error("opening the readiness poll", &error))?;
+        poll.attach(&mut transport)
+            .map_err(|error| poll_error("attaching the transport", &error))?;
+        Ok(Self {
             core: SwarmCore::new(
                 transport,
                 identify_config,
@@ -199,7 +235,64 @@ impl<T: Transport> Swarm<T> {
                 StdEntropy::new(),
             ),
             clock,
-        }
+            poll,
+            #[cfg(test)]
+            wait_budgets: Vec::new(),
+            #[cfg(test)]
+            simulated_wait: None,
+        })
+    }
+
+    /// A handle that interrupts this swarm's waits from another thread.
+    ///
+    /// The interrupted wait returns [`PollNext::Interrupted`]; interrupts sent
+    /// before one is reported coalesce into one, and one sent with no wait in
+    /// progress is kept for the next.
+    pub fn wait_handle(&self) -> WaitHandle {
+        self.poll.wait_handle()
+    }
+
+    /// A handle that wakes this swarm's waits for host work, without
+    /// interrupting them: the wait returns [`PollNext::Woken`].
+    pub fn wake_handle(&self) -> WakeHandle {
+        self.poll.wake_handle()
+    }
+
+    /// Registers a source the host services itself -- mDNS sockets, say --
+    /// with this swarm's poll, in a spare token space.
+    ///
+    /// The swarm never dispatches to it: readiness in its space ends a wait
+    /// with [`PollNext::Woken`], and the host then services the source. At
+    /// most 14 such sources can be attached.
+    pub fn attach_host_source<S: PollSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+    ) -> Result<(), DriverError> {
+        self.poll
+            .attach_host_source(source)
+            .map_err(|error| poll_error("attaching a host source", &error))
+    }
+
+    /// Collects one bounded batch of readiness, blocking up to `timeout`, and
+    /// dispatches the transport's share.
+    fn harvest(&mut self, timeout: Duration) -> Result<(), DriverError> {
+        #[cfg(test)]
+        let timeout = if timeout.is_zero() {
+            timeout
+        } else {
+            self.wait_budgets.push(timeout);
+            match self.simulated_wait.as_mut() {
+                Some(simulate) => {
+                    simulate(timeout);
+                    Duration::ZERO
+                }
+                None => timeout,
+            }
+        };
+        self.poll
+            .harvest(self.core.transport_mut(), timeout)
+            .map(drop)
+            .map_err(|error| poll_error("waiting for readiness", &error))
     }
 
     /// Returns the swarm this driver wraps.
@@ -305,6 +398,7 @@ impl<T: Transport> Swarm<T> {
     /// Returns every queued event, including ones a blocking wait left
     /// undelivered. See [`SwarmCore::poll`].
     pub fn poll(&mut self) -> Result<Vec<SwarmEvent>, DriverError> {
+        self.harvest(Duration::ZERO)?;
         let now = self.now();
         self.core.poll(now)
     }
@@ -322,9 +416,6 @@ impl<T: Transport> Swarm<T> {
             self.core.state.events.push_front(event);
         }
     }
-}
-
-impl<T: BlockingTransport> Swarm<T> {
     /// Returns the next swarm event, sleeping internally until one arrives
     /// or `deadline` is reached.
     ///
@@ -343,29 +434,52 @@ impl<T: BlockingTransport> Swarm<T> {
             match self.poll_next_interruptible(deadline)? {
                 PollNext::Event(event) => return Ok(Some(event)),
                 PollNext::Deadline => return Ok(None),
-                PollNext::Interrupted => {}
+                // No host source to service here: a host that owns one uses
+                // `poll_next_interruptible`.
+                PollNext::Interrupted | PollNext::Woken => {}
             }
         }
     }
 
-    /// Returns the next event while preserving an external wait interruption
-    /// as distinct from the caller's deadline.
+    /// Returns the next event while preserving interrupts and host wakeups as
+    /// distinct from the caller's deadline.
+    ///
+    /// In priority order: a buffered or freshly driven [`PollNext::Event`],
+    /// a pending [`PollNext::Interrupted`], a pending [`PollNext::Woken`],
+    /// then [`PollNext::Deadline`]. A pending interrupt or wake is only
+    /// cleared by the return that reports it, so an earlier event or an
+    /// expired deadline never loses one. An expired deadline still drives the
+    /// swarm once.
     pub fn poll_next_interruptible(
         &mut self,
         deadline: impl Into<Deadline>,
     ) -> Result<PollNext, DriverError> {
         let deadline = deadline.into();
+        // A blocking harvest already collected this batch; another
+        // zero-timeout one right behind it would only cost a syscall.
+        let mut harvested = false;
         loop {
             if let Some(ev) = self.core.next_event() {
                 return Ok(PollNext::Event(ev));
             }
-            // Always poll at least once -- even if we're already past the
+            if !harvested {
+                self.harvest(Duration::ZERO)?;
+            }
+            // Always drive at least once -- even if we're already past the
             // deadline -- so a caller using a short or elapsed deadline
             // still sees any events the transport has already produced.
             let now = self.now();
             self.core.drive(now)?;
             if let Some(ev) = self.core.next_event() {
                 return Ok(PollNext::Event(ev));
+            }
+            // Checked before parking even when the `Waker` event was already
+            // harvested, so an interrupt is never slept through.
+            if self.poll.take_interrupt() {
+                return Ok(PollNext::Interrupted);
+            }
+            if self.poll.take_wake() {
+                return Ok(PollNext::Woken);
             }
             let now = Instant::now();
             if deadline.is_expired_at(now) {
@@ -382,16 +496,9 @@ impl<T: BlockingTransport> Swarm<T> {
             if let Some(next) = self.core.next_deadline(now) {
                 budget = budget.min(Duration::from_millis(next.millis_until(now)));
             }
-            if budget.is_zero() {
-                continue;
-            }
-            // Prefer a real readiness wait so idle loops don't burn CPU on a
-            // fixed cadence; fall back to a short sleep for transports that
-            // can't wait.
-            match self.core.transport_mut().wait_for_input(budget) {
-                WaitOutcome::Interrupted => return Ok(PollNext::Interrupted),
-                WaitOutcome::Unsupported => std::thread::sleep(budget.min(POLL_IDLE_SLEEP)),
-                WaitOutcome::Ready | WaitOutcome::TimedOut => {}
+            harvested = !budget.is_zero();
+            if harvested {
+                self.harvest(budget)?;
             }
         }
     }
@@ -446,7 +553,7 @@ impl<T: BlockingTransport> Swarm<T> {
                     polled_past_deadline = true;
                     break;
                 }
-                Ok(PollNext::Interrupted) => continue,
+                Ok(PollNext::Interrupted | PollNext::Woken) => continue,
                 Ok(PollNext::Event(ev)) => {
                     if predicate(&ev) {
                         result = Ok(Some(ev));
@@ -473,6 +580,10 @@ impl<T: BlockingTransport> Swarm<T> {
                         break;
                     }
                     polled_past_deadline = true;
+                    if let Err(error) = self.harvest(Duration::ZERO) {
+                        result = Err(error);
+                        break;
+                    }
                     let now = self.now();
                     match self.core.drive(now) {
                         Err(error) => {
@@ -517,25 +628,43 @@ mod tests {
     use minip2p_identity::Ed25519Keypair;
     use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
     use minip2p_ping::PING_PROTOCOL_ID;
-    use minip2p_transport::{ConnectionEndpoint, TransportError, TransportEvent};
+    use minip2p_transport::mio::{self, Registry, Waker, event::Event};
+    use minip2p_transport::{
+        ConnectionEndpoint, TokenSpace, Transport, TransportError, TransportEvent,
+    };
     use std::sync::Arc;
+
+    /// A fixture with no socket: attaching and dispatching do nothing.
+    macro_rules! socketless {
+        ($transport:ty) => {
+            impl PollSource for $transport {
+                fn attach(
+                    &mut self,
+                    _: Registry,
+                    _: TokenSpace,
+                    _: Arc<Waker>,
+                ) -> std::io::Result<()> {
+                    Ok(())
+                }
+
+                fn dispatch(&mut self, _: &Event) {}
+            }
+        };
+    }
 
     /// Transport that never produces events; counts `poll()` calls so tests
     /// can assert how often an expired wait touches the transport.
     #[derive(Default)]
     struct IdleTransport {
         poll_calls: usize,
-        wait_outcomes: VecDeque<WaitOutcome>,
-        /// Reported once `wait_outcomes` runs out. `TimedOut` returns at once,
-        /// which spins; `Unsupported` makes the driver sleep between polls.
-        default_wait: Option<WaitOutcome>,
-        wait_calls: usize,
         /// Every time sample the driver handed to `poll`.
         samples: Vec<Now>,
         /// Reported verbatim from `next_deadline`.
         deadline: Option<minip2p_platform::Deadline>,
-        /// Every budget the driver handed to `wait_for_input`.
-        wait_budgets: Vec<Duration>,
+        /// Socket-less input from other threads, announced on the shared
+        /// `Waker` this keeps from `attach`.
+        inbox: Option<std::sync::mpsc::Receiver<TransportEvent>>,
+        waker: Option<Arc<Waker>>,
         /// Events returned by the first `poll`, so a test can make the core
         /// emit actions during the polls it is counting.
         initial_events: Vec<TransportEvent>,
@@ -603,7 +732,11 @@ mod tests {
         fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
             self.poll_calls += 1;
             self.samples.push(now);
-            Ok(std::mem::take(&mut self.initial_events))
+            let mut events = std::mem::take(&mut self.initial_events);
+            if let Some(inbox) = &self.inbox {
+                events.extend(inbox.try_iter());
+            }
+            Ok(events)
         }
 
         fn local_addresses_revision(&self) -> Option<u64> {
@@ -615,15 +748,13 @@ mod tests {
         }
     }
 
-    impl BlockingTransport for IdleTransport {
-        fn wait_for_input(&mut self, budget: Duration) -> WaitOutcome {
-            self.wait_calls += 1;
-            self.wait_budgets.push(budget);
-            self.wait_outcomes
-                .pop_front()
-                .or(self.default_wait)
-                .unwrap_or(WaitOutcome::TimedOut)
+    impl PollSource for IdleTransport {
+        fn attach(&mut self, _: Registry, _: TokenSpace, waker: Arc<Waker>) -> std::io::Result<()> {
+            self.waker = Some(waker);
+            Ok(())
         }
+
+        fn dispatch(&mut self, _: &Event) {}
     }
 
     /// Deterministic transport that surfaces two connections to the same
@@ -715,7 +846,7 @@ mod tests {
         }
     }
 
-    impl BlockingTransport for ReplacementTransport {}
+    socketless!(ReplacementTransport);
 
     fn replacement_swarm(
         remote_peer: PeerId,
@@ -736,6 +867,7 @@ mod tests {
             PingConfig::default(),
             keypair.peer_id(),
         )
+        .expect("swarm attaches its transport")
     }
 
     /// Transport whose `open_stream` fails on exactly one (1-based) call and
@@ -821,7 +953,7 @@ mod tests {
         }
     }
 
-    impl BlockingTransport for FailingUserOpenTransport {}
+    socketless!(FailingUserOpenTransport);
 
     /// Swarm over an [`IdleTransport`] with throwaway identity and defaults.
     fn idle_swarm() -> Swarm<IdleTransport> {
@@ -838,6 +970,7 @@ mod tests {
             PingConfig::default(),
             keypair.peer_id(),
         )
+        .expect("swarm attaches its transport")
     }
 
     #[test]
@@ -873,7 +1006,8 @@ mod tests {
             PingConfig::default(),
             keypair.peer_id(),
             Box::new(clock),
-        );
+        )
+        .expect("swarm attaches its transport");
 
         swarm.poll().expect("poll");
         assert!(
@@ -918,7 +1052,6 @@ mod tests {
         let transport = IdleTransport {
             // Absolute, on the driver's timeline: 40ms past the current sample.
             deadline: Some(minip2p_platform::Deadline::from_millis(1_000 + DEADLINE_MS)),
-            wait_outcomes: VecDeque::from([WaitOutcome::Interrupted]),
             ..IdleTransport::default()
         };
 
@@ -928,7 +1061,13 @@ mod tests {
             PingConfig::default(),
             keypair.peer_id(),
             Box::new(SharedClock(clock.clone())),
-        );
+        )
+        .expect("swarm attaches its transport");
+
+        // The simulated wait ends in an interrupt, so the loop stops after
+        // one budget.
+        let interrupt = swarm.wait_handle();
+        swarm.simulated_wait = Some(Box::new(move |_| interrupt.interrupt()));
 
         // A far-off caller deadline must not stop the transport's nearer
         // timer from bounding the sleep.
@@ -939,10 +1078,7 @@ mod tests {
 
         // Without the transport's deadline the driver would have slept on the
         // caller's 30s deadline instead.
-        assert_eq!(
-            swarm.core().transport().wait_budgets,
-            vec![Duration::from_millis(DEADLINE_MS)]
-        );
+        assert_eq!(swarm.wait_budgets, vec![Duration::from_millis(DEADLINE_MS)]);
     }
 
     #[test]
@@ -1096,6 +1232,8 @@ mod tests {
         }
     }
 
+    socketless!(PartialListenTransport);
+
     #[test]
     fn listened_addrs_revision_counts_each_successful_listen() {
         let keypair = Ed25519Keypair::generate();
@@ -1110,7 +1248,8 @@ mod tests {
             identify,
             PingConfig::default(),
             keypair.peer_id(),
-        );
+        )
+        .expect("swarm attaches its transport");
 
         assert_eq!(swarm.core().listened_addrs_revision(), 0);
         // The first bound address listens; the second fails — the earlier
@@ -1322,30 +1461,216 @@ mod tests {
     #[test]
     fn run_until_does_not_treat_interrupt_as_deadline() {
         let mut swarm = idle_swarm();
-        swarm
-            .core_mut()
-            .transport_mut()
-            .wait_outcomes
-            .push_back(WaitOutcome::Interrupted);
+        swarm.wait_handle().interrupt();
+        swarm.wake_handle().wake();
 
-        // Nothing here matches, so the loop runs to its deadline. Reporting
-        // `Unsupported` once the script runs out makes the driver sleep
-        // between polls instead of spinning for that whole time.
-        swarm.core_mut().transport_mut().default_wait = Some(WaitOutcome::Unsupported);
-
-        // The deadline has to outlast the interrupt by enough that the resume
-        // is what is being observed. `run_until` re-reads the clock after
-        // consuming an interrupt, so a deadline measured in milliseconds is
-        // really asserting that this thread was not descheduled in between.
+        // Nothing here matches, so the loop runs to its deadline: neither the
+        // interrupt nor the wake satisfies the predicate or ends the wait.
+        let started = Instant::now();
         let found = swarm
-            .run_until(Duration::from_millis(500), |_| false)
+            .run_until(Duration::from_millis(100), |_| false)
             .expect("wait");
 
         assert!(found.is_none());
+        assert!(started.elapsed() >= Duration::from_millis(100));
         assert!(
-            swarm.core().transport().wait_calls > 1,
-            "the wait must resume after consuming the interrupt"
+            !swarm.wait_budgets.is_empty(),
+            "the wait must resume, and block, after consuming the interrupt"
         );
+    }
+
+    /// A buffered event the next wait returns before anything else.
+    fn buffer_event(swarm: &mut Swarm<IdleTransport>) {
+        swarm
+            .core
+            .state
+            .events
+            .push_back(SwarmEvent::ConnectionEstablished {
+                peer_id: Ed25519Keypair::generate().peer_id(),
+                conn_id: ConnectionId::new(1),
+            });
+    }
+
+    #[test]
+    fn interrupts_coalesce_and_survive_events_and_harvests() {
+        let mut swarm = idle_swarm();
+        // Pending before parking, across a buffered event and a non-blocking
+        // harvest: neither clears it.
+        swarm.wait_handle().interrupt();
+        swarm.wait_handle().interrupt();
+        swarm.poll().expect("non-blocking poll harvests");
+        buffer_event(&mut swarm);
+        assert!(matches!(
+            swarm.poll_next_interruptible(Deadline::NEVER),
+            Ok(PollNext::Event(_))
+        ));
+        assert!(matches!(
+            swarm.poll_next_interruptible(Deadline::NEVER),
+            Ok(PollNext::Interrupted)
+        ));
+        // Reported once: the two calls were one interrupt. The `Waker` event
+        // they share may surface as one conservative wake.
+        let mut outcome = swarm.poll_next_interruptible(Duration::from_millis(20));
+        if matches!(outcome, Ok(PollNext::Woken)) {
+            outcome = swarm.poll_next_interruptible(Duration::from_millis(20));
+        }
+        assert!(matches!(outcome, Ok(PollNext::Deadline)), "{outcome:?}");
+
+        // Another call after consumption is another interrupt, and an
+        // expired deadline does not swallow it.
+        swarm.wait_handle().interrupt();
+        assert!(matches!(
+            swarm.poll_next_interruptible(Instant::now()),
+            Ok(PollNext::Interrupted)
+        ));
+        let mut outcome = swarm.poll_next_interruptible(Instant::now());
+        if matches!(outcome, Ok(PollNext::Woken)) {
+            outcome = swarm.poll_next_interruptible(Instant::now());
+        }
+        assert!(matches!(outcome, Ok(PollNext::Deadline)), "{outcome:?}");
+    }
+
+    #[test]
+    fn an_interrupt_wakes_a_blocked_wait_promptly() {
+        let mut swarm = idle_swarm();
+        let handle = swarm.wait_handle();
+        let interrupter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            handle.interrupt();
+        });
+        let started = Instant::now();
+        let outcome = swarm.poll_next_interruptible(Duration::from_secs(10));
+        interrupter.join().expect("interrupter");
+        assert!(matches!(outcome, Ok(PollNext::Interrupted)), "{outcome:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_wake_is_woken_not_interrupted_and_survives_a_competing_event() {
+        let mut swarm = idle_swarm();
+        swarm.wake_handle().wake();
+        swarm.poll().expect("the harvest records the wake");
+        buffer_event(&mut swarm);
+        assert!(matches!(
+            swarm.poll_next_interruptible(Deadline::NEVER),
+            Ok(PollNext::Event(_))
+        ));
+        assert!(matches!(
+            swarm.poll_next_interruptible(Deadline::NEVER),
+            Ok(PollNext::Woken)
+        ));
+        assert!(matches!(
+            swarm.poll_next_interruptible(Duration::from_millis(20)),
+            Ok(PollNext::Deadline)
+        ));
+    }
+
+    /// A host-owned source: one UDP socket the swarm only wakes for.
+    struct HostSocket(mio::net::UdpSocket);
+
+    impl PollSource for HostSocket {
+        fn attach(
+            &mut self,
+            registry: Registry,
+            tokens: TokenSpace,
+            _: Arc<Waker>,
+        ) -> std::io::Result<()> {
+            let token = tokens.token(0).expect("a token");
+            registry.register(&mut self.0, token, mio::Interest::READABLE)
+        }
+
+        fn dispatch(&mut self, _: &Event) {
+            panic!("a host source is serviced by its host, never dispatched to");
+        }
+    }
+
+    #[test]
+    fn readiness_on_a_host_source_ends_a_long_wait_as_woken() {
+        let mut swarm = idle_swarm();
+        let mut source = HostSocket(
+            mio::net::UdpSocket::bind("127.0.0.1:0".parse().expect("addr")).expect("bind"),
+        );
+        swarm.attach_host_source(&mut source).expect("attach");
+        let to = source.0.local_addr().expect("addr");
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .expect("bind")
+                .send_to(b"mdns", to)
+                .expect("send");
+        });
+        let started = Instant::now();
+        let outcome = swarm.poll_next_interruptible(Duration::from_secs(10));
+        sender.join().expect("sender");
+        assert!(matches!(outcome, Ok(PollNext::Woken)), "{outcome:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn socketless_input_a_wake_and_an_interrupt_share_one_waker_without_loss() {
+        let (input, inbox) = std::sync::mpsc::channel();
+        let mut swarm = idle_swarm();
+        swarm.core_mut().transport_mut().inbox = Some(inbox);
+        let waker = swarm
+            .core()
+            .transport()
+            .waker
+            .clone()
+            .expect("attached on construction");
+
+        // Input and a host wake alone never read as an interrupt.
+        let wake = swarm.wake_handle();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            input.send(event(9)).expect("send");
+            waker.wake().expect("wake");
+            wake.wake();
+        });
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            match swarm.poll_next_interruptible(Duration::from_secs(5)) {
+                Ok(PollNext::Event(_)) => seen.push("event"),
+                Ok(PollNext::Woken) => seen.push("woken"),
+                other => panic!("unexpected {other:?} after {seen:?}"),
+            }
+        }
+        assert_eq!(seen, ["event", "woken"]);
+
+        // All three at once: none of them is lost.
+        let (input, inbox) = std::sync::mpsc::channel();
+        swarm.core_mut().transport_mut().inbox = Some(inbox);
+        input.send(event(10)).expect("send");
+        swarm
+            .core()
+            .transport()
+            .waker
+            .as_ref()
+            .expect("waker")
+            .wake()
+            .expect("wake");
+        swarm.wake_handle().wake();
+        swarm.wait_handle().interrupt();
+        let mut seen = Vec::new();
+        loop {
+            match swarm.poll_next_interruptible(Duration::from_millis(50)) {
+                Ok(PollNext::Event(_)) => seen.push("event"),
+                Ok(PollNext::Interrupted) => seen.push("interrupted"),
+                Ok(PollNext::Woken) => seen.push("woken"),
+                Ok(PollNext::Deadline) => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        assert_eq!(seen, ["event", "interrupted", "woken"]);
+
+        fn event(id: u64) -> TransportEvent {
+            TransportEvent::Connected {
+                id: ConnectionId::new(id),
+                endpoint: ConnectionEndpoint::with_peer_id(
+                    Multiaddr::new(),
+                    Ed25519Keypair::generate().peer_id(),
+                ),
+            }
+        }
     }
 
     #[test]
@@ -1447,7 +1772,8 @@ mod tests {
             identify,
             PingConfig::default(),
             keypair.peer_id(),
-        );
+        )
+        .expect("swarm attaches its transport");
         swarm
             .core_mut()
             .add_protocol(protocol)
@@ -1665,7 +1991,7 @@ mod tests {
         }
     }
 
-    impl BlockingTransport for FailingSendTransport {}
+    socketless!(FailingSendTransport);
 
     fn ready_user_swarm(
         protocol: &str,
@@ -1684,7 +2010,8 @@ mod tests {
             identify,
             PingConfig::default(),
             keypair.peer_id(),
-        );
+        )
+        .expect("swarm attaches its transport");
         swarm
             .core_mut()
             .add_protocol(protocol)
@@ -1925,31 +2252,23 @@ mod tests {
 
     /// Readiness-capable transport simulating a remote peer that accepts any
     /// multistream-select negotiation but never sends protocol data, so an
-    /// outbound ping dangles until its timeout. `wait_for_input` records each
-    /// budget it is handed and jumps the shared clock, standing in for a
-    /// transport that blocks for the full budget on an idle connection.
+    /// outbound ping dangles until its timeout.
     struct NeverRespondTransport {
-        clock: Arc<TestClock>,
         events: VecDeque<TransportEvent>,
         negotiators: BTreeMap<StreamId, MultistreamSelect>,
         next_stream: u64,
-        waits: Vec<Duration>,
-        advance_per_wait_ms: u64,
     }
 
     impl NeverRespondTransport {
-        fn connected(clock: Arc<TestClock>, peer_id: PeerId, advance_per_wait_ms: u64) -> Self {
+        fn connected(peer_id: PeerId) -> Self {
             let endpoint = ConnectionEndpoint::with_peer_id(Multiaddr::new(), peer_id);
             Self {
-                clock,
                 events: VecDeque::from([TransportEvent::Connected {
                     id: ConnectionId::new(1),
                     endpoint,
                 }]),
                 negotiators: BTreeMap::new(),
                 next_stream: 1,
-                waits: Vec::new(),
-                advance_per_wait_ms,
             }
         }
     }
@@ -2045,13 +2364,7 @@ mod tests {
         }
     }
 
-    impl BlockingTransport for NeverRespondTransport {
-        fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-            self.waits.push(timeout);
-            self.clock.advance(self.advance_per_wait_ms);
-            WaitOutcome::TimedOut
-        }
-    }
+    socketless!(NeverRespondTransport);
 
     #[test]
     fn poll_next_budget_respects_core_ping_timer() {
@@ -2066,13 +2379,7 @@ mod tests {
             public_key: keypair.public_key().encode_protobuf(),
         };
         let clock = Arc::new(TestClock::default());
-        // Each blocking wait pretends the transport slept its full budget
-        // and jumps the clock past the ping deadline.
-        let transport = NeverRespondTransport::connected(
-            clock.clone(),
-            remote_peer.clone(),
-            PING_TIMEOUT_MS + 1_000,
-        );
+        let transport = NeverRespondTransport::connected(remote_peer.clone());
         let mut swarm = Swarm::with_clock(
             transport,
             identify,
@@ -2081,7 +2388,8 @@ mod tests {
             },
             keypair.peer_id(),
             Box::new(SharedClock(clock.clone())),
-        );
+        )
+        .expect("swarm attaches its transport");
 
         // Settle connection setup and identify stream negotiation, then get
         // a real ping in flight over the negotiated ping stream.
@@ -2099,7 +2407,11 @@ mod tests {
         );
 
         // Drop setup events (ConnectionEstablished, ...) so poll_next blocks.
+        // Each blocking wait pretends it slept its full budget and jumps the
+        // clock past the ping deadline.
         swarm.core.state.events.clear();
+        let jumped = clock.clone();
+        swarm.simulated_wait = Some(Box::new(move |_| jumped.advance(PING_TIMEOUT_MS + 1_000)));
         let event = swarm
             .poll_next(Deadline::NEVER)
             .expect("poll")
@@ -2109,7 +2421,7 @@ mod tests {
             SwarmEvent::PingTimeout { peer_id } if peer_id == remote_peer
         ));
 
-        let waits = &swarm.core().transport().waits;
+        let waits = &swarm.wait_budgets;
         assert_eq!(waits.len(), 1, "one blocking wait resolves the timer");
         assert_eq!(
             waits[0],

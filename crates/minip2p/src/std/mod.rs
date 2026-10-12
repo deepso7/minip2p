@@ -92,17 +92,13 @@ pub use minip2p_swarm::{
 use minip2p_tcp::{StdTcpProvider, TcpConfig, TcpTransport};
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_transport::ConnectionNamespace;
-use minip2p_transport::{BlockingTransport, Transport, WaitOutcome};
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet, WaitHandle};
+use minip2p_transport::{SharedPoll, Transport};
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use std::str::FromStr;
 
 use crate::portable::{DEFAULT_CONNECT_DEADLINE_MS, StreamAcks};
 use crate::{Bytes, ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
-
-/// Fallback sleep when [`Endpoint::wait`] idles over a transport that cannot
-/// wait for socket readiness.
-const POLL_IDLE_SLEEP: Duration = Duration::from_millis(1);
 
 /// Cap on one readiness wait when the caller has no deadline; re-arming it
 /// occasionally keeps unbounded durations out of OS interfaces.
@@ -289,9 +285,10 @@ pub struct Endpoint {
     /// NAT relay and AutoNAT dials waiting on Name resolution.
     #[cfg(feature = "nat")]
     nat_dials: Vec<(minip2p_nat::NatToken, PeerAddr)>,
-    /// Set by [`Endpoint::wait_handle`] interrupts, so [`Endpoint::wait`] can
-    /// tell a caller's interrupt from a lookup thread waking the driver.
-    caller_interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The one readiness poll the transport and mDNS sockets are registered
+    /// with (ADR 0013). Its `Waker` carries caller interrupts and the
+    /// endpoint's own wakeups (a finished name lookup) apart.
+    poll: SharedPoll,
     /// Swarm events a test's raw poll read but has not handed out yet.
     #[cfg(all(test, feature = "quic"))]
     raw_events: std::collections::VecDeque<crate::SwarmEvent>,
@@ -318,19 +315,13 @@ impl Endpoint {
     /// Returns a cloneable handle that can interrupt a blocking endpoint wait
     /// from another thread.
     ///
-    /// Taken through the transport trait rather than the concrete QUIC
-    /// endpoint, so it stays correct once the endpoint drives more than one
-    /// transport. Use this handle rather than the transport's own: the
-    /// endpoint also wakes its wait internally (a finished name lookup), and
-    /// only this handle's interrupts surface as
-    /// [`EndpointWaitOutcome::Interrupted`].
+    /// The interrupt handle of the one readiness poll every transport and
+    /// mDNS socket is registered with. Its interrupts surface as
+    /// [`EndpointWaitOutcome::Interrupted`]; interrupts sent before one is
+    /// reported coalesce into one. The endpoint's own wakeups (a finished
+    /// name lookup, mDNS input) use the poll's wake-only handle and never do.
     pub fn wait_handle(&self) -> WaitHandle {
-        let transport = BlockingTransport::wait_handle(self.engine.core.transport());
-        let caller_interrupt = std::sync::Arc::clone(&self.caller_interrupt);
-        WaitHandle::new(move || {
-            caller_interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
-            transport.interrupt();
-        })
+        self.poll.wait_handle()
     }
 
     /// Starts building an endpoint.
@@ -660,6 +651,7 @@ impl Endpoint {
     /// An error discards nothing: events already queued come out of the next
     /// `poll` or `wait`.
     pub fn poll(&mut self) -> Result<Vec<EndpointEvent>, Error> {
+        self.harvest(Duration::ZERO)?;
         let now = self.now();
         self.resolve_names(now);
         self.drive(now)?;
@@ -740,12 +732,25 @@ impl Endpoint {
         // lets a stale timer make progress. Only once, so a continuous event
         // stream cannot keep this wait running past its deadline.
         let mut drove_past_deadline = false;
+        // A blocking harvest already collected this batch's readiness; a
+        // zero-timeout one right behind it would only cost a syscall.
+        let mut harvested = false;
+        // A taken host wake owes one more batch, which is what reads the
+        // edge-triggered mDNS sockets; a passed deadline must not skip it.
+        let mut woken = false;
+        // Past the deadline only one such batch runs: a steady stream of
+        // wakes (packets mDNS reads and drops) must not hold the caller.
+        // Newer wakes stay pending for the next call.
+        let mut woke_past_deadline = false;
         loop {
             if let Some(event) = self.engine.pop_event() {
                 return Ok(EndpointWaitOutcome::Event(event));
             }
-            if drove_past_deadline && deadline.has_passed() {
+            if drove_past_deadline && deadline.has_passed() && !woken {
                 return Ok(EndpointWaitOutcome::Deadline);
+            }
+            if !harvested {
+                self.harvest(Duration::ZERO)?;
             }
             // Lookups start before any sleep; finished ones (a lookup thread
             // is what woke the last sleep, unless the caller did) are applied
@@ -753,8 +758,21 @@ impl Endpoint {
             let now = self.now();
             self.resolve_names(now);
             drove_past_deadline |= deadline.has_passed();
+            woke_past_deadline |= woken && deadline.has_passed();
+            woken = false;
             self.drive(now)?;
             if !self.engine.events.is_empty() {
+                harvested = false;
+                continue;
+            }
+            // A pending interrupt outranks an expired deadline, so a host's
+            // non-blocking pump still notices it. Checked before sleeping
+            // even when its `Waker` event was already harvested.
+            if self.poll.take_interrupt() {
+                return Ok(EndpointWaitOutcome::Interrupted);
+            }
+            if !(woke_past_deadline && deadline.has_passed()) && self.poll.take_wake() {
+                (harvested, woken) = (false, true);
                 continue;
             }
             if deadline.has_passed() {
@@ -765,9 +783,7 @@ impl Endpoint {
             // would wake it for them.
             let now = self.now();
             self.resolve_names(now);
-            if self.block(deadline) {
-                return Ok(EndpointWaitOutcome::Interrupted);
-            }
+            harvested = self.block(deadline)?;
         }
     }
 
@@ -777,13 +793,14 @@ impl Endpoint {
         self.engine.drive(now, &mut |addr| resolver.expand(addr))
     }
 
-    /// Sleeps until transport input, the caller's deadline, or the engine's
-    /// next timer. Returns `true` only for a caller's interrupt.
+    /// Sleeps until input on any registered source, a `Waker` wake, the
+    /// caller's deadline, or the engine's next timer, and dispatches the
+    /// transport's share of the readiness. Returns whether it harvested.
     ///
     /// The engine's own timers (attempt deadlines, capability drivers) are
     /// floored at 1 ms, so a driver reporting "due now" without new input
     /// cannot spin the thread; the swarm's own due work is not.
-    fn block(&mut self, deadline: Deadline) -> bool {
+    fn block(&mut self, deadline: Deadline) -> Result<bool, Error> {
         let now = self.now();
         let mut budget = deadline.remaining().unwrap_or(MAX_IDLE_WAIT);
         if let Some(next) = self.engine.core.next_deadline(now) {
@@ -793,18 +810,25 @@ impl Endpoint {
             budget = budget.min(Duration::from_millis(ms.max(1)));
         }
         if budget.is_zero() {
-            return false;
+            return Ok(false);
         }
-        match self.engine.core.transport_mut().wait_for_input(budget) {
-            WaitOutcome::Interrupted => self
-                .caller_interrupt
-                .swap(false, std::sync::atomic::Ordering::SeqCst),
-            WaitOutcome::Unsupported => {
-                std::thread::sleep(budget.min(POLL_IDLE_SLEEP));
-                false
-            }
-            WaitOutcome::Ready | WaitOutcome::TimedOut => false,
-        }
+        self.harvest(budget)?;
+        Ok(true)
+    }
+
+    /// Collects one bounded batch of readiness, blocking up to `timeout`,
+    /// and dispatches the transport's share. Every drive path harvests
+    /// first: an edge-triggered transport reads only what was dispatched.
+    fn harvest(&mut self, timeout: Duration) -> Result<(), Error> {
+        self.poll
+            .harvest(self.engine.core.transport_mut(), timeout)
+            .map(drop)
+            .map_err(|error| {
+                TransportError::PollError {
+                    reason: format!("waiting for readiness: {error}"),
+                }
+                .into()
+            })
     }
 
     /// Starts lookups for NAT dials to named hosts, expires due attempts,
@@ -1027,9 +1051,19 @@ impl Endpoint {
             if std::time::Instant::now() >= drain_by {
                 break;
             }
-            if self.close_drain_busy() {
+            let harvested = if self.close_drain_busy() {
                 // Interrupts only end this sleep early.
-                self.block(Deadline::from(drain_by));
+                self.block(Deadline::from(drain_by))
+            } else {
+                Ok(false)
+            };
+            let harvested = match harvested {
+                Ok(true) => Ok(()),
+                Ok(false) => self.harvest(Duration::ZERO),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = harvested {
+                return Err(first_error.unwrap_or(error));
             }
             let now = self.now();
             let polled = match self.engine.core.poll(now) {
@@ -1826,8 +1860,17 @@ pub(crate) fn build_endpoint(
         }
     }
     #[cfg(feature = "nat")]
-    let transport = minip2p_circuit::CircuitTransport::new_os(transport, keypair.clone());
-    let resolver = dial::Resolver::new(BlockingTransport::wait_handle(&transport));
+    let mut transport = minip2p_circuit::CircuitTransport::new_os(transport, keypair.clone());
+    #[cfg(not(feature = "nat"))]
+    let mut transport = transport;
+    let mut poll = SharedPoll::new().map_err(|error| TransportError::PollError {
+        reason: format!("opening the readiness poll: {error}"),
+    })?;
+    poll.attach(&mut transport)
+        .map_err(|error| TransportError::PollError {
+            reason: format!("attaching the transport: {error}"),
+        })?;
+    let resolver = dial::Resolver::new(poll.wake_handle());
     let core = builder.build_core(transport, StdEntropy::new())?;
     #[cfg_attr(
         not(any(
@@ -1950,11 +1993,17 @@ pub(crate) fn build_endpoint(
                 .map_err(|error| TransportError::InvalidConfig {
                     reason: error.to_string(),
                 })?;
-        let sockets = minip2p_mdns::MdnsSockets::new(&config).map_err(|error| {
+        let mut sockets = minip2p_mdns::MdnsSockets::new(&config).map_err(|error| {
             TransportError::ListenFailed {
                 reason: error.to_string(),
             }
         })?;
+        // The sockets only wake the endpoint's wait; the next batch's mDNS
+        // tick reads them, and a refresh re-registers what it rebuilds.
+        poll.attach_host_source(&mut sockets)
+            .map_err(|error| TransportError::PollError {
+                reason: format!("attaching the mDNS sockets: {error}"),
+            })?;
         // OS sockets are not the transport's: no second transport poll.
         engine.set_mdns(
             minip2p_mdns::MdnsDriver::new(agent, sockets, &config),
@@ -1996,7 +2045,7 @@ pub(crate) fn build_endpoint(
         resolver,
         #[cfg(feature = "nat")]
         nat_dials: Vec::new(),
-        caller_interrupt: std::sync::Arc::default(),
+        poll,
         #[cfg(all(test, feature = "quic"))]
         raw_events: std::collections::VecDeque::new(),
     })
@@ -2018,6 +2067,7 @@ impl Endpoint {
 
     /// One swarm poll whose events skip the engine.
     pub(crate) fn raw_poll(&mut self) -> Result<Vec<crate::SwarmEvent>, Error> {
+        self.harvest(Duration::ZERO)?;
         let now = self.now();
         self.engine.core.poll(now)
     }
@@ -2036,10 +2086,12 @@ impl Endpoint {
             let polled = self.raw_poll()?;
             self.raw_events.extend(polled);
             if self.raw_events.is_empty() {
-                if std::time::Instant::now() >= deadline {
+                let now = std::time::Instant::now();
+                if now >= deadline {
                     return Ok(None);
                 }
-                std::thread::sleep(POLL_IDLE_SLEEP);
+                let budget = (deadline - now).min(Duration::from_millis(10));
+                self.harvest(budget)?;
             }
         }
     }
@@ -2289,8 +2341,8 @@ mod tests {
     }
 
     fn with_lookup(endpoint: &mut Endpoint, lookup: dial::Lookup) {
-        let wake = minip2p_transport::BlockingTransport::wait_handle(endpoint.core().transport());
-        endpoint.resolver = dial::Resolver::with_lookup(wake, lookup);
+        let wake = endpoint.poll.wake_handle();
+        endpoint.resolver = dial::Resolver::with_lookup(move || wake.wake(), lookup);
     }
 
     /// `addr` with its host swapped for the name `host`.
@@ -2403,6 +2455,52 @@ mod tests {
                 }
                 EndpointWaitOutcome::Event(_) => {}
                 other => panic!("expected both attempts to settle, got {other:?}"),
+            }
+        }
+    }
+
+    /// A lookup's wake and an event queued in the same batch both arrive:
+    /// the event is returned first, the wake stays pending behind it, and
+    /// neither is lost or reported as the caller's interrupt.
+    #[test]
+    fn a_resolver_wake_and_a_queued_event_in_one_batch_both_arrive() {
+        let mut dialer = quic_endpoint();
+        let (lookup, started, answer) = stalling_lookup();
+        with_lookup(&mut dialer, lookup);
+        let peer = Ed25519Keypair::generate().peer_id();
+        let named_target = PeerAddr::new(
+            "/dns/gone.invalid/udp/4001/quic-v1".parse().expect("addr"),
+            peer.clone(),
+        )
+        .expect("peer addr");
+        let connect_id = dialer.connect(named_target).expect("connect");
+        assert_eq!(started.recv().expect("lookup started"), "gone.invalid");
+
+        answer
+            .send(Err("NXDOMAIN".to_string()))
+            .expect("lookup waiting");
+        // Let the lookup thread queue its answer and wake the poll.
+        std::thread::sleep(Duration::from_millis(100));
+        let other = Ed25519Keypair::generate().peer_id();
+        dialer.engine.events.push_back(EndpointEvent::PingTimeout {
+            peer_id: other.clone(),
+        });
+
+        let (mut settled, mut queued) = (false, false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !(settled && queued) {
+            match dialer.wait(deadline).expect("wait") {
+                EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+                    connect_id: id,
+                    ..
+                }) if id == connect_id => settled = true,
+                EndpointWaitOutcome::Event(EndpointEvent::PingTimeout { peer_id })
+                    if peer_id == other =>
+                {
+                    queued = true;
+                }
+                EndpointWaitOutcome::Event(_) => {}
+                other => panic!("lost something: settled {settled}, queued {queued}: {other:?}"),
             }
         }
     }
@@ -3146,24 +3244,60 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupt_survives_a_wait_with_a_passed_instant() {
+    fn a_pending_interrupt_is_reported_once_even_past_the_deadline() {
         let mut endpoint = Endpoint::builder()
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")
             .bind()
             .expect("bind loopback endpoint");
         endpoint.wait_handle().interrupt();
+        endpoint.wait_handle().interrupt();
 
-        // An expired call never blocks, so it never reaches the readiness wait
-        // that reports the interrupt; the interrupt stays pending.
+        // A pending interrupt outranks an expired deadline, so a host's
+        // non-blocking pump still notices it; the two calls are one.
+        assert!(matches!(
+            endpoint.wait(past_instant()).expect("wait past deadline"),
+            EndpointWaitOutcome::Interrupted
+        ));
         assert!(matches!(
             endpoint.wait(past_instant()).expect("wait past deadline"),
             EndpointWaitOutcome::Deadline
         ));
-        assert!(matches!(
-            endpoint.wait(Deadline::NEVER).expect("wait endpoint"),
-            EndpointWaitOutcome::Interrupted
-        ));
+    }
+
+    /// A steady stream of host wakes cannot hold a wait past its deadline:
+    /// it runs at most one batch for them, and newer wakes stay pending.
+    #[test]
+    fn a_stream_of_wakes_does_not_hold_a_wait_past_its_deadline() {
+        let mut endpoint = quic_endpoint();
+        let wake = endpoint.poll.wake_handle();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waker = {
+            let (stop, sent) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&sent));
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    wake.wake();
+                    sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::yield_now();
+                }
+            })
+        };
+        // The stream is flowing before the wait starts.
+        while sent.load(std::sync::atomic::Ordering::Relaxed) < 100 {
+            std::thread::yield_now();
+        }
+        let passes = endpoint.engine.stats.capability_passes;
+        let outcome = endpoint.wait(past_instant()).expect("wait past deadline");
+        let batches = endpoint.engine.stats.capability_passes - passes;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        waker.join().expect("waker thread");
+        assert!(
+            matches!(outcome, EndpointWaitOutcome::Deadline),
+            "{outcome:?}"
+        );
+        // The one drive every wait makes, plus at most one for a wake.
+        assert!(batches <= 2, "ran {batches} batches past the deadline");
     }
 
     #[cfg(feature = "nat")]
@@ -3513,7 +3647,18 @@ mod tests {
         }
     }
 
-    impl minip2p_transport::BlockingTransport for FlakyPollTransport {}
+    impl minip2p_transport::PollSource for FlakyPollTransport {
+        fn attach(
+            &mut self,
+            _: minip2p_transport::mio::Registry,
+            _: minip2p_transport::TokenSpace,
+            _: std::sync::Arc<minip2p_transport::mio::Waker>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn dispatch(&mut self, _: &minip2p_transport::mio::event::Event) {}
+    }
 
     /// Events already queued survive a `poll` that fails, and come out of the
     /// next one.

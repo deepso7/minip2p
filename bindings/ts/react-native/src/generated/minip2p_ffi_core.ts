@@ -228,10 +228,6 @@ export type MdnsOptions = {
      */
     interfaceRefreshMs: bigint,
     /**
-     * Maximum blocking wait before polling mDNS sockets again.
-     */
-    socketPollIntervalMs: bigint,
-    /**
      * Whether accepted mDNS observations may trigger automatic dials.
      */
     autoDial: boolean
@@ -264,7 +260,6 @@ const FfiConverterTypeMdnsOptions = (() => {
                 maxPacketBytes: FfiConverterUInt32.readFromCursor(c),
                 maxAnnouncedAddrs: FfiConverterUInt32.readFromCursor(c),
                 interfaceRefreshMs: FfiConverterUInt64.readFromCursor(c),
-                socketPollIntervalMs: FfiConverterUInt64.readFromCursor(c),
                 autoDial: FfiConverterBool.readFromCursor(c)
             };
         }
@@ -275,7 +270,6 @@ const FfiConverterTypeMdnsOptions = (() => {
             FfiConverterUInt32.writeIntoCursor(value.maxPacketBytes, c);
             FfiConverterUInt32.writeIntoCursor(value.maxAnnouncedAddrs, c);
             FfiConverterUInt64.writeIntoCursor(value.interfaceRefreshMs, c);
-            FfiConverterUInt64.writeIntoCursor(value.socketPollIntervalMs, c);
             FfiConverterBool.writeIntoCursor(value.autoDial, c);
         }
         allocationSize(value: TypeName): number {
@@ -285,7 +279,6 @@ const FfiConverterTypeMdnsOptions = (() => {
              FfiConverterUInt32.allocationSize(value.maxPacketBytes) +
              FfiConverterUInt32.allocationSize(value.maxAnnouncedAddrs) +
              FfiConverterUInt64.allocationSize(value.interfaceRefreshMs) +
-             FfiConverterUInt64.allocationSize(value.socketPollIntervalMs) +
              FfiConverterBool.allocationSize(value.autoDial);
 
         }

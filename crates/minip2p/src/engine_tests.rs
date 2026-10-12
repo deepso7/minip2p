@@ -104,7 +104,18 @@ impl Transport for FlashTransport {
 }
 
 #[cfg(feature = "std")]
-impl minip2p_transport::BlockingTransport for FlashTransport {}
+impl minip2p_transport::PollSource for FlashTransport {
+    fn attach(
+        &mut self,
+        _: minip2p_transport::mio::Registry,
+        _: minip2p_transport::TokenSpace,
+        _: Arc<minip2p_transport::mio::Waker>,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn dispatch(&mut self, _: &minip2p_transport::mio::event::Event) {}
+}
 
 fn target(peer: &PeerId) -> PeerAddr {
     PeerAddr::new(

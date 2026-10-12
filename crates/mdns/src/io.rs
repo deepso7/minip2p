@@ -186,9 +186,15 @@ pub trait MdnsIo {
     /// again, in milliseconds from `now_ms`.
     ///
     /// A stack of its own has timers -- retransmits, group memberships to
-    /// renew -- that no amount of mDNS quiet makes unnecessary. `None`, the
+    /// renew -- that no amount of mDNS quiet makes unnecessary, and a
+    /// datagram it already holds in a socket is owed a tick now. `None`, the
     /// default, means the carrier needs nothing on a timer, which is the
-    /// truth for a socket the operating system services.
+    /// truth for a socket the operating system services: its readiness is the
+    /// host's poll's business.
+    ///
+    /// What no carrier deadline can cover is input still in a device the
+    /// stack has not polled. A host driving an in-process stack wakes on
+    /// device ingress as well as on these deadlines.
     fn next_deadline(&self, now_ms: u64) -> Option<u64> {
         let _ = now_ms;
         None

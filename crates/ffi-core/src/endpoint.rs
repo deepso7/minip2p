@@ -208,7 +208,6 @@ impl P2pEndpoint {
                 max_packet_bytes: mdns.max_packet_bytes as usize,
                 max_announced_addrs: mdns.max_announced_addrs as usize,
                 interface_refresh_ms: mdns.interface_refresh_ms,
-                socket_poll_interval_ms: mdns.socket_poll_interval_ms,
             };
             mdns_config.validate().map_err(invalid_config)?;
             builder = builder.mdns_config(mdns_config).map_err(invalid_config)?;
@@ -1598,7 +1597,6 @@ mod tests {
             max_packet_bytes: 1_400,
             max_announced_addrs: 16,
             interface_refresh_ms: 10_000,
-            socket_poll_interval_ms: 100,
             auto_dial: true,
         });
 
@@ -1615,7 +1613,6 @@ mod tests {
             max_packet_bytes: 1_400,
             max_announced_addrs: 16,
             interface_refresh_ms: 10_000,
-            socket_poll_interval_ms: 100,
             auto_dial: true,
         });
 

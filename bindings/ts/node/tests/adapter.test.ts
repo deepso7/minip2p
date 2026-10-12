@@ -353,7 +353,6 @@ describe("Node adapter", () => {
         maxAnnouncedAddrs: 12,
         maxPacketBytes: 1300,
         queryIntervalMs: 222,
-        socketPollIntervalMs: 333,
         ttlMs: 444,
       },
       secretKey: new Uint8Array(32),
@@ -373,7 +372,6 @@ describe("Node adapter", () => {
         maxAnnouncedAddrs: 12,
         maxPacketBytes: 1300,
         queryIntervalMs: 222n,
-        socketPollIntervalMs: 333n,
         ttlMs: 444n,
       },
     });

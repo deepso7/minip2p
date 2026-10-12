@@ -387,6 +387,7 @@ impl Sockets {
 /// The socket must be in its usual non-blocking mode. Peeks one byte, so no
 /// input is consumed. Errors other than `WouldBlock` count as ready so the
 /// next `poll()` can surface them.
+#[cfg(test)]
 pub(crate) fn has_queued_input(socket: &UdpSocket) -> bool {
     let mut probe = [0u8; 1];
     match socket.peek_from(&mut probe) {
