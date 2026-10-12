@@ -245,10 +245,11 @@ let mut writer = StreamWriter::new(8 * 1024 * 1024);
 if writer.write(&mut endpoint, conn_id, stream_id, payload)? == WriteProgress::Pending {
     // A WriteAccepted for this stream follows from `observe`.
 }
-writer.close_write(&mut endpoint, conn_id, stream_id)?; // FIN after the tail
+// After the last chunk only: later writes are refused. The FIN follows the tail.
+writer.close_write(&mut endpoint, conn_id, stream_id)?;
 
 // In the event loop:
-if let Some(done) = writer.observe(&mut endpoint, &event) { /* next write on done.stream_id */ }
+if let Some(done) = writer.observe(&mut endpoint, &event) { /* done.stream_id's write was accepted */ }
 ```
 
 `Error::is_retryable()` is true for `Full`, and `Error::is_stream_gone()` for a stream or connection that no longer exists (`SwarmError::StreamNotFound`, `NotConnected`, or the transport's stream or connection not found). Neither covers a write side that is closing.

@@ -142,7 +142,10 @@ if writer.write(&mut node, conn_id, stream_id, chunk)? == WriteProgress::Pending
     // Wait for its `WriteAccepted` before the next chunk; a second write
     // meanwhile is refused with `StreamWriteError::Busy`.
 }
-writer.close_write(&mut node, conn_id, stream_id)?; // the FIN follows the tail
+
+// After the last chunk: half-close. The FIN follows the held tail, and any
+// later write on the stream is refused.
+writer.close_write(&mut node, conn_id, stream_id)?;
 
 // In the event loop: feed every event to the writer.
 if let Some(done) = writer.observe(&mut node, &event) {
