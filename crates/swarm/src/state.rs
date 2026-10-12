@@ -1034,6 +1034,14 @@ impl SwarmState {
             .map(|(conn_id, peer)| (*conn_id, peer))
     }
 
+    /// The peer whose established connection `conn_id` is; `None` for a
+    /// pending, replaced, or closed connection.
+    pub fn connection_peer(&self, conn_id: ConnectionId) -> Option<&PeerId> {
+        self.conn_to_peer.get(&conn_id).filter(|peer| {
+            self.established_peers.contains(*peer) && self.peer_to_conn.get(*peer) == Some(&conn_id)
+        })
+    }
+
     /// Returns whether a transport connection is still tracked, including
     /// inbound handshakes that have not yet emitted [`SwarmEvent::ConnectionEstablished`].
     pub fn has_tracked_connections(&self) -> bool {
@@ -5448,9 +5456,13 @@ mod tests {
             core.established_connections().collect::<Vec<_>>(),
             vec![(direct, &peer)]
         );
+        assert_eq!(core.connection_peer(direct), Some(&peer));
+        assert_eq!(core.connection_peer(circuit), None, "replaced");
+        assert_eq!(core.connection_peer(unverified), None, "not established");
 
         feed(&mut core, TransportEvent::Closed { id: direct });
         assert_eq!(core.established_connections().count(), 0);
+        assert_eq!(core.connection_peer(direct), None);
     }
 
     /// Peer ids that sort below and above [`tie_break_core`]'s own.
