@@ -568,8 +568,10 @@ impl NatAgent {
     ///
     /// `kept` is the connection the attempt settled on, which stays open
     /// even when this attempt promoted it; `None` (a failed or cancelled
-    /// attempt) closes the attempt's circuit like [`Self::cancel`]. Unknown
-    /// or already finished ids are a no-op.
+    /// attempt) closes the attempt's circuit like [`Self::cancel`]. Attempt
+    /// outcomes for `id` still queued and undrained (`ConnectFailed`,
+    /// `FellBackToRelay`, `HolePunchFailed`) are dropped, even when the
+    /// attempt had already finished.
     pub fn settled<S: NatSwarm>(
         &mut self,
         swarm: &mut S,
@@ -577,6 +579,15 @@ impl NatAgent {
         kept: Option<ConnectionId>,
         now: Now,
     ) {
+        self.shared.events.retain(|event| {
+            !(event.connect_id() == Some(id)
+                && matches!(
+                    event,
+                    NatEvent::ConnectFailed { .. }
+                        | NatEvent::FellBackToRelay { .. }
+                        | NatEvent::HolePunchFailed { .. }
+                ))
+        });
         let Some(mut attempt) = self.attempts.remove(&id) else {
             return;
         };

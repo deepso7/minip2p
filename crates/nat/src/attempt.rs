@@ -232,10 +232,15 @@ impl ConnectAttempt {
         &mut self,
         conn: ConnectionId,
         stream: StreamId,
-        swarm: &dyn NatSwarm,
+        swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
         now: Now,
     ) {
+        // Transport input can arrive before the tick that expires a budget.
+        self.dcutr_stream = Some((conn, stream));
+        if self.settle_if_budget_spent(swarm, shared, now) {
+            return;
+        }
         if self.punch_deadline.take().is_some() {
             shared.abort_attempt_dials(self.id, &self.peer, swarm);
             shared.push_event(NatEvent::HolePunchFailed {
@@ -249,7 +254,6 @@ impl ConnectAttempt {
         self.exchange_started_at = now.monotonic_ms;
         self.exchange_deadline =
             Some(self.clip(now.monotonic_ms + shared.config.dcutr_exchange_timeout_ms));
-        self.dcutr_stream = Some((conn, stream));
         self.dcutr = Some(DcutrResponder::new(&shared.punch_candidates()));
     }
 
@@ -264,6 +268,9 @@ impl ConnectAttempt {
         let Some((conn, _)) = self.dcutr_stream.filter(|(_, s)| *s == stream) else {
             return;
         };
+        if self.settle_if_budget_spent(swarm, shared, now) {
+            return;
+        }
         let exchange_closed = matches!(input, StreamInput::RemoteWriteClosed | StreamInput::Closed);
         if matches!(input, StreamInput::Ready) {
             return;
@@ -868,8 +875,7 @@ impl ConnectAttempt {
         // waiting names why. It is checked before the punch window, so a
         // window the upgrade budget cut short is not reported as a failed
         // round.
-        if let Some(stop) = self.upgrade_stop(now) {
-            self.settle_relayed(stop, swarm, shared, now);
+        if self.settle_if_budget_spent(swarm, shared, now) {
             return;
         }
 
@@ -884,6 +890,20 @@ impl ConnectAttempt {
                 now,
             );
         }
+    }
+
+    /// Settles on the Relayed path when an upgrade budget ran out by `now`.
+    fn settle_if_budget_spent(
+        &mut self,
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) -> bool {
+        let Some(stop) = self.upgrade_stop(now) else {
+            return false;
+        };
+        self.settle_relayed(stop, swarm, shared, now);
+        true
     }
 
     /// The upgrade budget that ran out at `now`, while the circuit still

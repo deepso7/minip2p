@@ -969,6 +969,91 @@ fn an_exchange_finishing_near_its_deadline_keeps_its_punch_window() {
 }
 
 #[test]
+fn a_dcutr_stream_arriving_after_the_start_budget_settles_relayed() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+
+    // The stream reaches the agent before the tick that would expire the
+    // start budget (t=10_301).
+    let stream = StreamId::new(90);
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: conn,
+            peer_id: h.target.clone(),
+            stream_id: stream,
+            protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
+            initiated_locally: false,
+        },
+        false,
+        at(10_400),
+    );
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::FellBackToRelay {
+            connect_id,
+            reason: UpgradeStop::StartTimeout { .. },
+            ..
+        }] if *connect_id == id
+    ));
+    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
+}
+
+#[test]
+fn a_sync_arriving_after_the_exchange_budget_dials_nothing() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    let actions = drive_round_at(&mut h, conn, StreamId::new(90), 1_000);
+    drain_events(&mut h.agent);
+    assert_eq!(dial_count_for(&actions, &h.target), 1);
+
+    let stream = StreamId::new(91);
+    open_inbound_dcutr_at(&mut h, conn, stream, 2_000);
+    drain_events(&mut h.agent);
+    for (data, t) in [
+        (
+            dcutr_connect_reply(&[maddr("/ip4/9.9.9.9/udp/4002/quic-v1")]),
+            2_001,
+        ),
+        // The exchange budget ended at t=12_000.
+        (dcutr_sync(), 12_100),
+    ] {
+        h.agent.handle_event(
+            &SwarmEvent::StreamData {
+                conn_id: conn,
+                peer_id: h.target.clone(),
+                stream_id: stream,
+                data: Bytes::from(data),
+            },
+            false,
+            at(t),
+        );
+    }
+    assert_eq!(dial_count_for(&drain_actions(&mut h.agent), &h.target), 0);
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::FellBackToRelay {
+            connect_id,
+            reason: UpgradeStop::ExchangeTimeout { round: 2, .. },
+            ..
+        }] if *connect_id == id
+    ));
+}
+
+#[test]
+fn settling_drops_the_attempts_undrained_outcomes() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    h.agent.handle_tick(at(10_301));
+    // FellBackToRelay is queued but the host settles before draining it.
+    h.agent.settled(id, Some(conn), at(10_302));
+    assert!(
+        drain_events(&mut h.agent)
+            .iter()
+            .all(|event| event.connect_id() != Some(id))
+    );
+}
+
+#[test]
 fn the_whole_upgrade_is_bounded() {
     let mut h = Harness::with_relay(NatConfig {
         upgrade_timeout_ms: 5_000,
