@@ -165,10 +165,15 @@ impl SwarmBuilder {
     /// Consumes the builder and returns a ready-to-use std [`Swarm`] over the
     /// given transport.
     ///
-    /// Fails with [`SwarmError::ReservedProtocol`] if a built-in protocol id
-    /// was registered via [`SwarmBuilder::protocol`].
+    /// The swarm attaches the transport to its readiness poll here (see
+    /// [`Swarm::new`]), and fails with a transport error if that does. Fails
+    /// with [`SwarmError::ReservedProtocol`] if a built-in protocol id was
+    /// registered via [`SwarmBuilder::protocol`].
     #[cfg(feature = "std")]
-    pub fn build<T: Transport>(self, transport: T) -> Result<Swarm<T>, SwarmError> {
+    pub fn build<T: minip2p_transport::BlockingTransport>(
+        self,
+        transport: T,
+    ) -> Result<Swarm<T>, crate::DriverError> {
         let user_protocols = self.user_protocols;
         let identify = IdentifyConfig {
             protocol_version: self.protocol_version,
@@ -176,7 +181,7 @@ impl SwarmBuilder {
             protocols: self.protocols,
             public_key: self.public_key,
         };
-        let mut swarm = Swarm::new(transport, identify, self.ping_config, self.local_peer_id);
+        let mut swarm = Swarm::new(transport, identify, self.ping_config, self.local_peer_id)?;
         swarm.core_mut().state.simultaneous_dial_window_ms = self.simultaneous_dial_window_ms;
         for protocol in user_protocols {
             swarm.core_mut().add_protocol(protocol)?;
@@ -213,6 +218,20 @@ mod tests {
             output.fill(0);
             Ok(())
         }
+    }
+
+    #[cfg(feature = "std")]
+    impl minip2p_transport::PollSource for NoopTransport {
+        fn attach(
+            &mut self,
+            _: minip2p_transport::mio::Registry,
+            _: minip2p_transport::TokenSpace,
+            _: std::sync::Arc<minip2p_transport::mio::Waker>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn dispatch(&mut self, _: &minip2p_transport::mio::event::Event) {}
     }
 
     impl Transport for NoopTransport {

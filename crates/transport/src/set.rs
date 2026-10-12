@@ -15,10 +15,9 @@ use crate::{
 /// How a member is held.
 ///
 /// Under `std` a member must also be a
-/// [`BlockingTransport`](crate::BlockingTransport), so the set as a whole can
-/// park a driver rather than spin. That costs a member nothing it was not
-/// already paying: every method of that trait has a default, so
-/// `impl BlockingTransport for MyTransport {}` is the whole of it.
+/// [`BlockingTransport`](crate::BlockingTransport) -- a transport that is a
+/// [`PollSource`](crate::PollSource) -- so the set can register every member
+/// with the host's one shared poll and route readiness back to it.
 ///
 /// `Send` comes with it, for the same reason blocking does: a hosted driver
 /// lives on a thread, and an endpoint that could not be moved onto one would
@@ -48,6 +47,14 @@ pub enum TransportSetError {
     /// back to it.
     #[error("a member must claim at least one connection namespace")]
     NoNamespace,
+    /// The set is already attached to a host's shared poll, and the member
+    /// could not be attached to it: its sockets failed to register, or the
+    /// set's token space has no subspace left for it.
+    #[error("could not attach the member to the shared poll: {reason}")]
+    AttachFailed {
+        /// What the registration reported.
+        reason: alloc::string::String,
+    },
 }
 
 /// A transport a [`TransportSet`] refused, handed back with the reason.
@@ -109,15 +116,10 @@ struct Member {
     transport: BoxedTransport,
 }
 
+/// Bits of a set's token space that name a member: up to 256 members, each
+/// with its own subspace.
 #[cfg(feature = "std")]
-#[derive(Default)]
-struct WakeState {
-    handles: Vec<crate::WaitHandle>,
-    /// An interrupt sent before any wakeable member joined. The first member
-    /// that can park inherits it, preserving [`WaitHandle`]'s next-wait
-    /// guarantee across set composition.
-    pending: bool,
-}
+const MEMBER_PREFIX_BITS: u32 = 8;
 
 /// Several transports behind one [`Transport`].
 ///
@@ -172,12 +174,10 @@ pub struct TransportSet {
     /// Additional member failures from a round whose first failure has
     /// already been returned to the caller.
     failures: VecDeque<TransportError>,
-    /// Every member's interrupt handle, shared with the handles this set hands
-    /// out so a member joining later is still reachable through one taken
-    /// earlier. Also the lock that makes an interrupt atomic with respect to
-    /// the waits it has to wake.
+    /// The shared poll this set was attached to, for members that join
+    /// afterwards.
     #[cfg(feature = "std")]
-    wakers: alloc::sync::Arc<std::sync::Mutex<WakeState>>,
+    attachment: Option<polling::Attachment>,
 }
 
 impl TransportSet {
@@ -212,16 +212,17 @@ impl TransportSet {
             return Err(RejectedTransport { error, transport });
         }
         #[cfg(feature = "std")]
+        let mut transport = transport;
+        #[cfg(feature = "std")]
+        if let Some(attachment) = &self.attachment
+            && let Err(error) = attachment.attach_member(self.members.len(), &mut transport)
         {
-            let handle = transport.wait_handle();
-            if !handle.is_noop() {
-                let mut wake = self.wakers();
-                if wake.pending {
-                    handle.interrupt();
-                    wake.pending = false;
-                }
-                wake.handles.push(handle);
-            }
+            return Err(RejectedTransport {
+                error: TransportSetError::AttachFailed {
+                    reason: error.to_string(),
+                },
+                transport,
+            });
         }
         self.members.push(Member {
             kind,
@@ -253,16 +254,6 @@ impl TransportSet {
             .map(|namespace| TransportSetError::DuplicateNamespace {
                 namespace: *namespace,
             })
-    }
-
-    /// The shared handle list, past a poisoned lock: a panic while pushing a
-    /// handle leaves the list usable, and refusing to wake anything would be
-    /// worse than waking one member twice.
-    #[cfg(feature = "std")]
-    fn wakers(&self) -> std::sync::MutexGuard<'_, WakeState> {
-        self.wakers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether the set can dial anything at all.
@@ -474,289 +465,75 @@ impl Transport for TransportSet {
 }
 
 #[cfg(feature = "std")]
-mod blocking_set {
-    use super::TransportSet;
-    use crate::{BlockingTransport, WaitHandle, WaitOutcome};
-    use alloc::vec::Vec;
-    use core::time::Duration;
+mod polling {
+    use alloc::sync::Arc;
+    use std::io;
 
-    /// How long one member may hold the wait before the next gets a turn, in
-    /// the fallback that takes turns.
+    use mio::event::Event;
+    use mio::{Registry, Waker};
+
+    use super::{BoxedTransport, MEMBER_PREFIX_BITS, TransportSet};
+    use crate::{PollSource, TokenSpace};
+
+    /// What [`PollSource::attach`] handed the set, kept for members that join
+    /// later.
+    pub(super) struct Attachment {
+        registry: Registry,
+        tokens: TokenSpace,
+        waker: Arc<Waker>,
+    }
+
+    impl Attachment {
+        /// Attaches member `index` in its own subspace.
+        pub(super) fn attach_member(
+            &self,
+            index: usize,
+            member: &mut BoxedTransport,
+        ) -> io::Result<()> {
+            let tokens = self
+                .tokens
+                .subspace(MEMBER_PREFIX_BITS, index)
+                .map_err(io::Error::other)?;
+            member.attach(self.registry.try_clone()?, tokens, Arc::clone(&self.waker))
+        }
+    }
+
+    /// Routes readiness to members by token prefix.
     ///
-    /// Short enough that a member with input waiting is not sat on for long,
-    /// long enough that a set of quiet members is not a spin loop.
-    const SLICE: Duration = Duration::from_millis(10);
-
-    /// The longest single `poll(2)`. Platforms without `ppoll` reject
-    /// timeouts past `c_int::MAX` milliseconds; a longer wait loops.
-    #[cfg(unix)]
-    const MAX_POLL: Duration = Duration::from_secs(3600);
-
-    impl TransportSet {
-        /// Answers one logical interrupt once.
-        ///
-        /// The handle wakes every member, so the members that did not win the
-        /// race are each left holding a token of the same interrupt. Consuming
-        /// them here is what keeps one call to
-        /// [`WaitHandle::interrupt`](crate::WaitHandle::interrupt) worth one
-        /// `Interrupted`: left behind, each would surface as another wake, and
-        /// would do it from the non-blocking probe at the top of the next
-        /// wait, ahead of a member with real input to hand over.
-        ///
-        /// A sibling that reports `Ready` while being drained loses nothing:
-        /// readiness outlives this call, and a driver polls the transport after
-        /// an interrupt anyway.
-        fn settle_interrupt(&mut self, woken: usize) -> WaitOutcome {
-            // Taken while draining so an interrupt still fanning out cannot
-            // land on a member this loop has already passed. The handle holds
-            // the same lock for the whole of its fan-out.
-            let wakers = alloc::sync::Arc::clone(&self.wakers);
-            let _fanout = wakers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (index, member) in self.members.iter_mut().enumerate() {
-                if index != woken {
-                    member.transport.wait_for_input(Duration::ZERO);
-                }
-            }
-            WaitOutcome::Interrupted
-        }
-    }
-
-    /// One member wait that may block, counted under the `bench` feature.
-    fn member_wait(member: &mut super::BoxedTransport, timeout: Duration) -> WaitOutcome {
-        let outcome = member.wait_for_input(timeout);
-        #[cfg(feature = "bench")]
-        crate::bench::record_blocking_wait(timeout, outcome);
-        outcome
-    }
-
-    impl BlockingTransport for TransportSet {
-        fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-            let outcome = self.wait_members(timeout);
-            #[cfg(feature = "bench")]
-            crate::bench::record_set_wait(timeout, outcome);
-            outcome
-        }
-
-        fn wait_handle(&self) -> WaitHandle {
-            // The set blocks in `poll(2)` on every member's fd, or inside
-            // whichever member holds the current slice, and a caller cannot
-            // know which. Nudging all of them makes any member's fd readable,
-            // and reaches whichever member is waiting.
-            //
-            // The list is the set's own and is read when the handle fires, not
-            // when it is taken, so a member that joins later is woken by a
-            // handle a host already holds. That is why nothing wakeable in the
-            // list yet is not grounds for an inert handle either: a host wires
-            // its wakeup path while composing the set, and a handle that had
-            // answered "inert" then would leave the set asleep inside every
-            // member that filled it afterwards. An empty list simply reaches
-            // nobody, for as long as it stays empty.
-            let wakers = alloc::sync::Arc::clone(&self.wakers);
-            WaitHandle::new(move || {
-                // Held across the whole fan-out so a wait draining its
-                // siblings sees either all of this interrupt or none of it.
-                let mut handles = wakers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if handles.handles.is_empty() {
-                    handles.pending = true;
-                }
-                for handle in &handles.handles {
-                    handle.interrupt();
-                }
-            })
-        }
-    }
-
-    impl TransportSet {
-        /// [`BlockingTransport::wait_for_input`] for the set, short of
-        /// counting the outer call itself under `bench`.
-        ///
-        /// Probes every member without blocking, then blocks on all of them
-        /// at once in one `poll(2)` over their
-        /// `readiness_fd`s. Where that is
-        /// not possible -- a parking member without an fd, a failed
-        /// `poll(2)`, a non-unix target -- it falls back to taking short turns.
-        fn wait_members(&mut self, timeout: Duration) -> WaitOutcome {
-            // Events a failed poll held back are input the caller has not seen.
-            if !self.pending.is_empty() {
-                return WaitOutcome::Ready;
-            }
-            // A lone member has nobody to take turns with, so it gets the
-            // whole budget in one wait: probing and slicing would only turn
-            // one idle wait into a wakeup every slice. Its own handle, which
-            // the set's reaches, still wakes it at once.
-            if let [member] = &mut self.members[..] {
-                return member_wait(&mut member.transport, timeout);
-            }
-
-            // Probe every member without blocking before blocking on any of
-            // them: a budget spent waiting on a quiet member would report
-            // `TimedOut` while another already had something to hand over.
-            // The probe also says which members can park at all, and only
-            // those are worth waiting on.
-            let waiters = match self.probe() {
-                Ok(waiters) => waiters,
-                Err(outcome) => return outcome,
-            };
-            if waiters.is_empty() {
-                // No member can park on readiness, so neither can the set. The
-                // caller has to sleep on its own clock instead of reading a
-                // prompt return as "nothing happened yet".
-                return WaitOutcome::Unsupported;
-            }
-            if timeout.is_zero() {
-                return WaitOutcome::TimedOut;
-            }
-
-            // A caller's timeout can exceed what `Instant` arithmetic
-            // represents; an unrepresentable deadline means "no deadline".
-            let deadline = std::time::Instant::now().checked_add(timeout);
-            #[cfg(unix)]
-            let waiters = match self.wait_on_fds(waiters, deadline) {
-                Ok(outcome) => return outcome,
-                Err(waiters) => waiters,
-            };
-            self.wait_in_turns(&waiters, deadline)
-        }
-
-        /// Asks every member, without blocking, whether it has input.
-        ///
-        /// `Err` is how the wait ends: a member is ready, or was interrupted
-        /// and its siblings are settled. `Ok` lists the members that can park.
-        fn probe(&mut self) -> Result<Vec<usize>, WaitOutcome> {
-            let mut waiters = Vec::new();
-            for (index, member) in self.members.iter_mut().enumerate() {
-                match member.transport.wait_for_input(Duration::ZERO) {
-                    WaitOutcome::Ready => return Err(WaitOutcome::Ready),
-                    WaitOutcome::Interrupted => return Err(self.settle_interrupt(index)),
-                    WaitOutcome::TimedOut => waiters.push(index),
-                    WaitOutcome::Unsupported => {}
-                }
-            }
-            Ok(waiters)
-        }
-
-        /// Blocks once on every waiter's readiness fd, until one is readable
-        /// and a fresh [`probe`](Self::probe) ends the wait, or `deadline`.
-        ///
-        /// Level-triggered `poll(2)` rather than an outer mio `Poll`: every
-        /// member drains its fd before a probe answers `TimedOut` (see
-        /// [`BlockingTransport::readiness_fd`]), and a member that breaks
-        /// that leaves a readable fd, which makes this spin -- visibly --
-        /// where an edge-triggered outer queue could lose the wakeup.
-        ///
-        /// `Err` hands the waiters back for the turn-taking fallback, when a
-        /// waiter has no fd or `poll(2)` fails.
-        #[cfg(unix)]
-        fn wait_on_fds(
+    /// Each member gets the subspace its index names, under an 8-bit prefix
+    /// of the set's own space, so an event's token says which member it is
+    /// for without a lookup table. Members inserted after the set is
+    /// attached are attached as they join.
+    impl PollSource for TransportSet {
+        fn attach(
             &mut self,
-            waiters: Vec<usize>,
-            deadline: Option<std::time::Instant>,
-        ) -> Result<WaitOutcome, Vec<usize>> {
-            use rustix::event::{PollFd, PollFlags, Timespec, poll};
-
-            loop {
-                let remaining = match deadline {
-                    Some(deadline) => {
-                        let left = deadline.saturating_duration_since(std::time::Instant::now());
-                        if left.is_zero() {
-                            return Ok(WaitOutcome::TimedOut);
-                        }
-                        left.min(MAX_POLL)
-                    }
-                    None => MAX_POLL,
-                };
-                let Ok(timespec) = Timespec::try_from(remaining) else {
-                    return Err(waiters);
-                };
-                let polled = {
-                    let mut fds = Vec::with_capacity(waiters.len());
-                    for &index in &waiters {
-                        let fd = self
-                            .members
-                            .get(index)
-                            .and_then(|member| member.transport.readiness_fd());
-                        let Some(fd) = fd else {
-                            return Err(waiters);
-                        };
-                        fds.push(PollFd::from_borrowed_fd(fd, PollFlags::IN));
-                    }
-                    // An invalid, failed or hung-up fd never stops reporting,
-                    // so it would turn every `poll(2)` into a spin.
-                    let broken = PollFlags::NVAL | PollFlags::ERR | PollFlags::HUP;
-                    poll(&mut fds, Some(&timespec))
-                        .map(|count| (count, fds.iter().any(|fd| fd.revents().intersects(broken))))
-                };
-                let (outcome, done) = match polled {
-                    // Out of budget for this `poll(2)`; the deadline check
-                    // above decides whether that is the end.
-                    Ok((0, _)) => (WaitOutcome::TimedOut, false),
-                    // Some fd is readable: ask every member again.
-                    Ok((_, broken)) => match self.probe() {
-                        Err(outcome) => (outcome, true),
-                        // Nothing for anyone, and an fd that will keep
-                        // saying so: wait in turns instead.
-                        Ok(_) if broken => return Err(waiters),
-                        // Readable, yet no member has anything: a spurious
-                        // wakeup, still a wakeup.
-                        Ok(_) => (WaitOutcome::Ready, false),
-                    },
-                    // A signal cut the wait short; probing is cheap.
-                    Err(rustix::io::Errno::INTR) => match self.probe() {
-                        Err(outcome) => (outcome, true),
-                        Ok(_) => (WaitOutcome::Ready, false),
-                    },
-                    Err(_) => return Err(waiters),
-                };
-                #[cfg(feature = "bench")]
-                crate::bench::record_blocking_wait(remaining, outcome);
-                if done {
-                    return Ok(outcome);
-                }
+            registry: Registry,
+            tokens: TokenSpace,
+            waker: Arc<Waker>,
+        ) -> io::Result<()> {
+            let attachment = Attachment {
+                registry,
+                tokens,
+                waker,
+            };
+            for (index, member) in self.members.iter_mut().enumerate() {
+                attachment.attach_member(index, &mut member.transport)?;
             }
+            self.attachment = Some(attachment);
+            Ok(())
         }
 
-        /// The fallback: waits on each waiter in turn, a short slice at a
-        /// time, until one has input or `deadline` passes.
-        fn wait_in_turns(
-            &mut self,
-            waiters: &[usize],
-            deadline: Option<std::time::Instant>,
-        ) -> WaitOutcome {
-            loop {
-                for (turn, &index) in waiters.iter().enumerate() {
-                    let remaining = match deadline {
-                        Some(deadline) => {
-                            let left =
-                                deadline.saturating_duration_since(std::time::Instant::now());
-                            if left.is_zero() {
-                                return WaitOutcome::TimedOut;
-                            }
-                            left
-                        }
-                        None => SLICE,
-                    };
-                    // Every member that can park has to get a turn within this
-                    // call, so what is left is divided among those still to
-                    // come -- and only those: counting a member that answers
-                    // instantly would hand the budget to nobody and shorten
-                    // every real wait. A share too small to divide degrades to
-                    // a non-blocking probe, which is still a turn.
-                    let share = u32::try_from(waiters.len() - turn)
-                        .map_or(remaining, |left| remaining / left);
-                    let slice = SLICE.min(remaining).min(share);
-                    let Some(member) = self.members.get_mut(index) else {
-                        return WaitOutcome::Unsupported;
-                    };
-                    match member_wait(&mut member.transport, slice) {
-                        WaitOutcome::Ready => return WaitOutcome::Ready,
-                        WaitOutcome::Interrupted => return self.settle_interrupt(index),
-                        WaitOutcome::TimedOut | WaitOutcome::Unsupported => {}
-                    }
-                }
+        fn dispatch(&mut self, event: &Event) {
+            let Some(attachment) = &self.attachment else {
+                return;
+            };
+            let member = attachment
+                .tokens
+                .subspace_of(MEMBER_PREFIX_BITS, event.token())
+                .and_then(|index| self.members.get_mut(index));
+            // A token no member holds is stale: harmless, and dropped.
+            if let Some(member) = member {
+                member.transport.dispatch(event);
             }
         }
     }
@@ -789,21 +566,16 @@ mod tests {
         /// that did the same.
         inbound: Vec<Multiaddr>,
         fails_poll: bool,
-        /// Every timeout this member was asked to wait for, in order, so a
-        /// test can see what share of a budget it was given.
+        /// The space this member was attached in, if it was.
         #[cfg(feature = "std")]
-        waits: Vec<core::time::Duration>,
-        /// Whether a wait finds input ready.
+        attached: Option<crate::TokenSpace>,
+        /// A socket the member registers when attached, so readiness can be
+        /// routed to it for real.
         #[cfg(feature = "std")]
-        ready: bool,
-        /// Input arrives once this many blocking waits have run out, so a
-        /// test can end a set's wait after a known number of turns.
+        socket: Option<mio::net::UdpSocket>,
+        /// Tokens dispatched to this member.
         #[cfg(feature = "std")]
-        ready_after: Option<usize>,
-        /// Whether this member can park at all. Set before joining a set: a
-        /// member's handle is taken when it joins.
-        #[cfg(feature = "std")]
-        can_wait: bool,
+        dispatched: Vec<mio::Token>,
     }
 
     #[derive(Clone)]
@@ -813,10 +585,6 @@ mod tests {
         /// of step with what the member claimed.
         namespace: ConnectionNamespace,
         shared: Shared,
-        /// Interrupts this member has been handed and not yet reported. Held
-        /// apart from the log because its [`WaitHandle`] outlives any borrow.
-        #[cfg(feature = "std")]
-        interrupts: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
     }
 
     impl Fake {
@@ -825,8 +593,6 @@ mod tests {
                 name,
                 namespace,
                 shared: Shared::new(Log::default().into()),
-                #[cfg(feature = "std")]
-                interrupts: alloc::sync::Arc::default(),
             }
         }
 
@@ -843,31 +609,12 @@ mod tests {
             self.shared.borrow_mut()
         }
 
-        /// A member that can park on readiness, and so hands out a real
-        /// handle. Set before joining, since joining is when the set takes it.
-        #[cfg(feature = "std")]
-        fn waking(self) -> Self {
-            self.log().can_wait = true;
-            self
-        }
-
         fn record(&self, call: &str) {
             self.log().calls.push(call.to_string());
         }
 
         fn calls(&self) -> Vec<String> {
             self.log().calls.clone()
-        }
-
-        #[cfg(feature = "std")]
-        fn waits(&self) -> Vec<core::time::Duration> {
-            self.log().waits.clone()
-        }
-
-        /// Interrupts handed to this member and not yet reported.
-        #[cfg(feature = "std")]
-        fn pending_interrupts(&self) -> usize {
-            self.interrupts.load(core::sync::atomic::Ordering::SeqCst)
         }
 
         fn boxed(&self) -> BoxedTransport {
@@ -966,52 +713,26 @@ mod tests {
         }
     }
 
+    /// Registers a loopback UDP socket at the first token of its space.
     #[cfg(feature = "std")]
-    impl crate::BlockingTransport for Fake {
-        fn wait_for_input(&mut self, timeout: core::time::Duration) -> crate::WaitOutcome {
-            use core::sync::atomic::Ordering;
-
-            self.log().waits.push(timeout);
-            // An interrupt outranks everything else, as it does in the mio
-            // waits the real adapters are built on, and consumes its token.
-            if self.interrupts.load(Ordering::SeqCst) > 0 {
-                self.interrupts.fetch_sub(1, Ordering::SeqCst);
-                return crate::WaitOutcome::Interrupted;
-            }
-            let (can_wait, ready) = {
-                let log = self.log();
-                let blocking = log.waits.iter().filter(|wait| !wait.is_zero()).count();
-                let arrived = log.ready_after.is_some_and(|after| blocking > after);
-                (log.can_wait, log.ready || arrived)
-            };
-            if !can_wait {
-                return crate::WaitOutcome::Unsupported;
-            }
-            if ready {
-                return crate::WaitOutcome::Ready;
-            }
-            // Spend the budget, as a real readiness wait would: a fake that
-            // returned instantly would make a slice's length unobservable.
-            // An interrupt still ends it early, as it ends a real one.
-            let deadline = std::time::Instant::now().checked_add(timeout);
-            while deadline.is_none_or(|deadline| std::time::Instant::now() < deadline) {
-                if self.interrupts.load(Ordering::SeqCst) > 0 {
-                    self.interrupts.fetch_sub(1, Ordering::SeqCst);
-                    return crate::WaitOutcome::Interrupted;
-                }
-                std::thread::sleep(core::time::Duration::from_millis(1));
-            }
-            crate::WaitOutcome::TimedOut
+    impl crate::PollSource for Fake {
+        fn attach(
+            &mut self,
+            registry: mio::Registry,
+            tokens: crate::TokenSpace,
+            _waker: alloc::sync::Arc<mio::Waker>,
+        ) -> std::io::Result<()> {
+            let mut socket = mio::net::UdpSocket::bind("127.0.0.1:0".parse().expect("addr"))?;
+            let token = tokens.token(0).ok_or_else(|| std::io::Error::other("no token"))?;
+            registry.register(&mut socket, token, mio::Interest::READABLE)?;
+            let mut log = self.log();
+            log.attached = Some(tokens);
+            log.socket = Some(socket);
+            Ok(())
         }
 
-        fn wait_handle(&self) -> crate::WaitHandle {
-            if !self.log().can_wait {
-                return crate::WaitHandle::noop();
-            }
-            let interrupts = alloc::sync::Arc::clone(&self.interrupts);
-            crate::WaitHandle::new(move || {
-                interrupts.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-            })
+        fn dispatch(&mut self, event: &mio::event::Event) {
+            self.log().dispatched.push(event.token());
         }
     }
 
@@ -1477,282 +1198,115 @@ mod tests {
     }
 
     #[cfg(feature = "std")]
-    mod waiting {
+    mod polling {
         use super::*;
-        use crate::{BlockingTransport, WaitOutcome};
+        use crate::{SharedPoll, TokenSpace, TokenSpaceError};
         use core::time::Duration;
 
-        /// A set of two members that can both park.
-        fn waking_duo() -> (TransportSet, Fake, Fake) {
-            let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4).waking();
-            let quic = Fake::new("quic", ConnectionNamespace::QUIC_IPV4).waking();
-            (set_of(&[&tcp, &quic]), tcp, quic)
+        impl Fake {
+            /// Sends one datagram to this member's registered socket.
+            fn poke(&self) {
+                let to = self
+                    .log()
+                    .socket
+                    .as_ref()
+                    .expect("attached")
+                    .local_addr()
+                    .expect("addr");
+                std::net::UdpSocket::bind("127.0.0.1:0")
+                    .expect("bind")
+                    .send_to(b"x", to)
+                    .expect("send");
+            }
+
+            fn dispatched(&self) -> usize {
+                self.log().dispatched.len()
+            }
         }
 
-        #[test]
-        fn input_on_any_member_is_reported_before_blocking_on_another() {
-            let (mut set, tcp, quic) = waking_duo();
-            quic.log().ready = true;
-
+        /// Waits until `member` has been dispatched to, failing after a long
+        /// budget; returns how long it took.
+        fn wait_for(poll: &mut SharedPoll, set: &mut TransportSet, member: &Fake) -> Duration {
             let started = std::time::Instant::now();
-            assert_eq!(
-                set.wait_for_input(Duration::from_secs(30)),
-                WaitOutcome::Ready
-            );
-            assert!(
-                started.elapsed() < Duration::from_secs(1),
-                "a budget must not be spent on a quiet member while another has input"
-            );
-            assert_eq!(
-                tcp.waits(),
-                vec![Duration::ZERO],
-                "the quiet member is probed, never blocked on"
-            );
+            while member.dispatched() == 0 {
+                assert!(started.elapsed() < Duration::from_secs(5), "never routed");
+                poll.harvest(set, Duration::from_secs(5)).expect("harvest");
+            }
+            started.elapsed()
         }
 
         #[test]
-        fn one_interrupt_wakes_the_set_once() {
-            let (mut set, ..) = waking_duo();
-            let handle = set.wait_handle();
-            assert!(!handle.is_noop(), "a set of wakeable members is wakeable");
-
-            handle.interrupt();
-            assert_eq!(
-                set.wait_for_input(Duration::from_millis(50)),
-                WaitOutcome::Interrupted
-            );
-            // The handle woke every member, so every member is holding a token
-            // of the same interrupt. A second `Interrupted` would be a wake
-            // nobody asked for -- and, coming from the probe at the top, would
-            // arrive ahead of a member with real input.
-            assert_eq!(
-                set.wait_for_input(Duration::ZERO),
-                WaitOutcome::TimedOut,
-                "one interrupt is worth one wake"
-            );
-        }
-
-        #[test]
-        fn a_handle_taken_early_wakes_a_member_that_joined_later() {
-            let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4).waking();
-            let quic = Fake::new("quic", ConnectionNamespace::QUIC_IPV4).waking();
-            let mut set = set_of(&[&tcp]);
-            // Taken while the set was still being composed, which is exactly
-            // when a host wires its wakeup path.
-            let handle = set.wait_handle();
-            set.insert(
-                TransportKind::Quic,
-                [ConnectionNamespace::QUIC_IPV4],
-                quic.boxed(),
-            )
-            .expect("quic joins");
-
-            handle.interrupt();
-            // The wait parks inside whichever member has the slice, so a
-            // handle that missed one of them can leave the set asleep in it.
-            assert_eq!(
-                quic.pending_interrupts(),
-                1,
-                "a handle the host already holds has to reach a member that joined after it"
-            );
-            assert_eq!(
-                set.wait_for_input(Duration::from_millis(50)),
-                WaitOutcome::Interrupted
-            );
-            assert_eq!(
-                quic.pending_interrupts(),
-                0,
-                "and the set still answers that interrupt exactly once"
-            );
-        }
-
-        #[test]
-        fn a_handle_taken_before_anything_wakeable_wakes_what_joins_after_it() {
-            let mut set = TransportSet::new();
-            // Nothing in the set can be woken yet -- and a host wires its
-            // wakeup path here, while composing, before it binds a thing.
-            let handle = set.wait_handle();
-            let unwakeable = Fake::new("smoltcp", ConnectionNamespace::TCP_IPV6);
-            set.insert(
-                TransportKind::Tcp,
-                [ConnectionNamespace::TCP_IPV6],
-                unwakeable.boxed(),
-            )
-            .expect("the unwakeable member joins");
-            let quic = Fake::new("quic", ConnectionNamespace::QUIC_IPV4).waking();
-            set.insert(
-                TransportKind::Quic,
-                [ConnectionNamespace::QUIC_IPV4],
-                quic.boxed(),
-            )
-            .expect("quic joins");
-
-            handle.interrupt();
-            assert_eq!(
-                quic.pending_interrupts(),
-                1,
-                "a handle taken before there was anything to wake still has to \
-                 reach the members that arrived after it"
-            );
-            // Otherwise the set parks inside that member for the whole budget
-            // with a host holding a handle it believes wakes it.
-            assert_eq!(
-                set.wait_for_input(Duration::from_secs(30)),
-                WaitOutcome::Interrupted
-            );
-        }
-
-        #[test]
-        fn an_interrupt_before_the_first_wakeable_member_reaches_its_next_wait() {
-            let mut set = TransportSet::new();
-            let handle = set.wait_handle();
-            handle.interrupt();
-
-            let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4).waking();
-            set.insert(
-                TransportKind::Tcp,
-                [ConnectionNamespace::TCP_IPV4],
-                tcp.boxed(),
-            )
-            .expect("tcp joins");
-
-            assert_eq!(
-                set.wait_for_input(Duration::from_secs(30)),
-                WaitOutcome::Interrupted,
-                "an early interrupt is retained until a member can receive it"
-            );
-            assert_eq!(
-                set.wait_for_input(Duration::ZERO),
-                WaitOutcome::TimedOut,
-                "the retained interrupt is consumed exactly once"
-            );
-        }
-
-        #[test]
-        fn a_set_goes_where_its_driver_goes() {
-            let (set, ..) = waking_duo();
-
-            // A hosted driver runs on a thread, and applications move an
-            // endpoint onto one. A member that could not come along would make
-            // the whole set unusable there -- which is a compile error here,
-            // not a runtime one.
-            std::thread::spawn(move || drop(set)).join().expect("moved");
-        }
-
-        #[test]
-        fn a_set_that_cannot_park_says_so() {
+        fn input_on_either_member_ends_one_wait_and_reaches_only_that_member() {
             let (mut set, tcp, quic) = duo();
-
-            // Neither member can wait, so a prompt return here means "I cannot
-            // do this", not "nothing happened yet" -- the caller has to sleep
-            // on its own clock rather than spin.
-            assert_eq!(
-                set.wait_for_input(Duration::from_secs(30)),
-                WaitOutcome::Unsupported
-            );
-            // The handle is still live, though, and interrupting it reaches
-            // nobody rather than panicking: membership can grow, and a wakeable
-            // member joining later has to be reachable through a handle the
-            // host already holds. `Unsupported` is what says the set cannot
-            // park -- that is the answer a driver acts on.
-            set.wait_handle().interrupt();
-            assert_eq!(tcp.waits(), vec![Duration::ZERO]);
-            assert_eq!(quic.waits(), vec![Duration::ZERO]);
-        }
-
-        #[test]
-        fn a_lone_member_parks_for_the_whole_budget_and_still_wakes_on_interrupt() {
-            let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4).waking();
-            let mut set = set_of(&[&tcp]);
-            let handle = set.wait_handle();
-            let budget = Duration::from_secs(30);
-
-            // Interrupt from another thread once the set is parked.
-            let waker = {
-                let tcp = tcp.clone();
-                std::thread::spawn(move || {
-                    while tcp.waits().is_empty() {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    handle.interrupt();
-                })
+            let mut poll = SharedPoll::new().expect("poll");
+            poll.attach(&mut set).expect("attach");
+            let (Some(tcp_space), Some(quic_space)) = (tcp.log().attached, quic.log().attached)
+            else {
+                panic!("both members attached");
             };
-            assert_eq!(set.wait_for_input(budget), WaitOutcome::Interrupted);
-            waker.join().expect("waker");
-            // With nobody to take turns with, slicing would only turn one
-            // idle wait into a wakeup every slice.
-            assert_eq!(
-                tcp.waits(),
-                vec![budget],
-                "a lone member is handed the caller's whole budget in one wait"
-            );
+            assert_ne!(tcp_space, quic_space, "each member has its own space");
+
+            quic.poke();
+            let took = wait_for(&mut poll, &mut set, &quic);
+            assert!(took < Duration::from_secs(1), "no turn-taking: {took:?}");
+            assert_eq!(tcp.dispatched(), 0, "routed by prefix, not broadcast");
+
+            tcp.poke();
+            wait_for(&mut poll, &mut set, &tcp);
+            assert_eq!(quic.dispatched(), 1);
         }
 
         #[test]
-        fn only_members_that_can_park_are_given_a_share_of_the_budget() {
+        fn a_member_inserted_after_attach_receives_its_events() {
             let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4);
-            let quic = Fake::new("quic", ConnectionNamespace::QUIC_IPV4).waking();
-            let mut set = set_of(&[&tcp, &quic]);
+            let mut set = set_of(&[&tcp]);
+            let mut poll = SharedPoll::new().expect("poll");
+            poll.attach(&mut set).expect("attach");
 
-            assert_eq!(
-                set.wait_for_input(Duration::from_millis(8)),
-                WaitOutcome::TimedOut
-            );
-            assert_eq!(
-                tcp.waits(),
-                vec![Duration::ZERO],
-                "a member that cannot park is probed once and left alone"
-            );
-            let blocking = quic.waits();
-            assert_eq!(blocking.first(), Some(&Duration::ZERO), "probed first");
-            assert!(
-                blocking[1] >= Duration::from_millis(6),
-                "the only member that can park gets the whole budget, not a \
-                 share of it split with one that cannot: {blocking:?}"
-            );
+            let quic = Fake::new("quic", ConnectionNamespace::QUIC_IPV4);
+            set.insert(TransportKind::Quic, [quic.namespace], quic.boxed())
+                .expect("late insert attaches");
+            assert!(quic.log().attached.is_some(), "attached on insert");
+            quic.poke();
+            wait_for(&mut poll, &mut set, &quic);
+            assert_eq!(tcp.dispatched(), 0);
         }
 
-        #[cfg(feature = "bench")]
         #[test]
-        fn bench_counters_see_every_slice_a_driver_level_counter_would_miss() {
-            let (mut set, tcp, quic) = waking_duo();
-            quic.log().ready_after = Some(2);
-            let before = crate::bench::wait_counters();
-
-            // A budget that cannot run out: QUIC's input ends the wait, after
-            // three turns each.
-            assert_eq!(
-                set.wait_for_input(Duration::from_secs(30)),
-                WaitOutcome::Ready
-            );
-            let seen = crate::bench::wait_counters().since(&before);
-            // Probes are non-blocking and not wakeups; every slice is one.
-            let slices = tcp
-                .waits()
-                .into_iter()
-                .chain(quic.waits())
-                .filter(|wait| !wait.is_zero())
-                .count();
-            assert_eq!(slices, 6, "two members, three turns each");
-            assert_eq!(seen.set_waits, 1, "the driver made one wait");
-            assert_eq!(seen.timed_out, 5, "every turn that ran out is counted");
-            assert_eq!(seen.ready, 1, "and so is the one that found input");
-            assert_eq!(seen.wakeups(), 6);
+        fn a_member_inserted_before_attach_is_only_stored() {
+            let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4);
+            let _set = set_of(&[&tcp]);
+            assert!(tcp.log().attached.is_none());
         }
 
-        #[cfg(feature = "bench")]
         #[test]
-        fn bench_counters_see_the_fallback_sleep_of_a_set_that_cannot_park() {
+        fn a_set_nested_too_deep_fails_to_attach_with_a_typed_error() {
             let (mut set, ..) = duo();
-            let before = crate::bench::wait_counters();
-
-            assert_eq!(
-                set.wait_for_input(Duration::from_secs(30)),
-                WaitOutcome::Unsupported
+            // A space with no more than a member prefix's worth of bits.
+            let mut tokens = TokenSpace::full();
+            while tokens.bits() > MEMBER_PREFIX_BITS {
+                tokens = tokens
+                    .subspace(tokens.bits() - MEMBER_PREFIX_BITS, 0)
+                    .expect("shrink");
+            }
+            let poll = mio::Poll::new().expect("poll");
+            let waker = alloc::sync::Arc::new(
+                mio::Waker::new(poll.registry(), mio::Token(usize::MAX)).expect("waker"),
             );
-            let seen = crate::bench::wait_counters().since(&before);
-            assert_eq!(seen.fallback_sleeps, 1);
-            assert_eq!(seen.wakeups(), 0, "nothing parked, so nothing woke");
+            let error = crate::PollSource::attach(
+                &mut set,
+                poll.registry().try_clone().expect("registry"),
+                tokens,
+                waker,
+            )
+            .expect_err("no bits left for members");
+            let inner = error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<TokenSpaceError>());
+            assert!(
+                matches!(inner, Some(TokenSpaceError::Exhausted { .. })),
+                "{error:?}"
+            );
         }
     }
 }

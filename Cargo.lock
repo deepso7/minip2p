@@ -1462,7 +1462,6 @@ dependencies = [
  "minip2p-core",
  "minip2p-platform",
  "mio",
- "rustix",
  "thiserror",
 ]
 

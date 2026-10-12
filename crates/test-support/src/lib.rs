@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::Arc;
 
 use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
 use minip2p_platform::{Deadline, Now};
@@ -13,9 +13,10 @@ use minip2p_relay::{
     FrameDecode, HopMessage, HopMessageType, Peer, Reservation, Status, StopMessage,
     StopMessageType, decode_frame, encode_frame,
 };
+use minip2p_transport::mio::{Registry, Waker, event::Event};
 use minip2p_transport::{
-    BlockingTransport, ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError,
-    TransportEvent, WaitOutcome,
+    ConnectionEndpoint, ConnectionId, PollSource, StreamId, TokenSpace, Transport,
+    TransportError, TransportEvent,
 };
 
 /// Deterministic, connected, in-memory implementation of the transport contract.
@@ -42,6 +43,9 @@ struct InMemoryLink {
     streams: HashMap<StreamId, InMemoryStream>,
     /// Delivered, unacknowledged bytes per stream, for each receiving side.
     unacked: [HashMap<StreamId, usize>; 2],
+    /// Each side's shared-poll `Waker`, once attached: a socket-less
+    /// transport wakes its host itself when input is queued for it.
+    wakers: [Option<Arc<Waker>>; 2],
 }
 
 /// One endpoint of the fixed two-party in-memory link.
@@ -65,7 +69,13 @@ impl InMemoryLink {
         side_value(&self.queues, side)
     }
 
+    /// The queue to push input for `side` onto; wakes that side's host,
+    /// since a push is new input.
     fn queue_mut(&mut self, side: LinkSide) -> &mut VecDeque<TransportEvent> {
+        if let Some(waker) = side_value(&self.wakers, side) {
+            // A host that is gone has nobody left to wake.
+            drop(waker.wake());
+        }
         side_value_mut(&mut self.queues, side)
     }
 
@@ -140,6 +150,7 @@ impl InMemoryTransport {
             active: true,
             streams: HashMap::new(),
             unacked: [HashMap::new(), HashMap::new()],
+            wakers: [None, None],
         }));
         (
             Self {
@@ -391,7 +402,9 @@ impl Transport for InMemoryTransport {
 
     fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
         let mut shared = self.shared.borrow_mut();
-        let events = shared.queue_mut(self.side).drain(..).collect::<Vec<_>>();
+        let events = side_value_mut(&mut shared.queues, self.side)
+            .drain(..)
+            .collect::<Vec<_>>();
         let mut fully_delivered = Vec::new();
         for event in &events {
             let stream_id = match event {
@@ -435,16 +448,15 @@ impl Transport for InMemoryTransport {
     }
 }
 
-impl BlockingTransport for InMemoryTransport {
-    fn wait_for_input(&mut self, _timeout: Duration) -> WaitOutcome {
-        // No socket to wait on: report queued input, otherwise let the driver
-        // fall back to its sleep cadence.
-        if self.shared.borrow().queue(self.side).is_empty() {
-            WaitOutcome::Unsupported
-        } else {
-            WaitOutcome::Ready
-        }
+/// No socket: keeps the shared `Waker` and calls it when the partner queues
+/// input. Queued input is also reported as due through `next_deadline`.
+impl PollSource for InMemoryTransport {
+    fn attach(&mut self, _: Registry, _: TokenSpace, waker: Arc<Waker>) -> std::io::Result<()> {
+        *side_value_mut(&mut self.shared.borrow_mut().wakers, self.side) = Some(waker);
+        Ok(())
     }
+
+    fn dispatch(&mut self, _: &Event) {}
 }
 
 /// Result of handling one HOP CONNECT request.
