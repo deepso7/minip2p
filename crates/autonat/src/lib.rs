@@ -366,15 +366,14 @@ impl AutoNatClient {
     /// address matches a requested one exactly, or with a trailing
     /// `/p2p/<our peer id>`; malformed or unrelated addresses match nothing.
     fn confirmed(&self, raw: &[Vec<u8>]) -> Vec<Multiaddr> {
+        let ours = Protocol::P2p(self.peer_id.clone());
         let returned: Vec<Multiaddr> = decode_addrs(raw)
             .into_iter()
-            .map(|mut addr| {
-                if addr.protocols().last() == Some(&Protocol::P2p(self.peer_id.clone())) {
-                    addr = Multiaddr::from_protocols(
-                        addr.protocols()[..addr.len() - 1].to_vec(),
-                    );
+            .map(|addr| match addr.protocols().split_last() {
+                Some((last, transport)) if *last == ours => {
+                    Multiaddr::from_protocols(transport.to_vec())
                 }
-                addr
+                _ => addr,
             })
             .collect();
         self.requested
@@ -957,7 +956,9 @@ mod tests {
         let other = Multiaddr::from_str("/ip4/198.51.100.1/udp/4001/quic-v1").unwrap();
         let asked_addr = Multiaddr::from_str(asked).unwrap();
         let mut with_peer = asked_addr.clone();
-        with_peer.push(minip2p_core::Protocol::P2p(PeerId::from_str(PEER_ID).unwrap()));
+        with_peer.push(minip2p_core::Protocol::P2p(
+            PeerId::from_str(PEER_ID).unwrap(),
+        ));
 
         // Unrelated addresses are dropped, and a /p2p suffix naming us
         // still matches what we asked about.

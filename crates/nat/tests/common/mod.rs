@@ -176,6 +176,28 @@ pub fn autonat_response(request_bytes: &[u8], public_addrs: Option<&[Multiaddr]>
     }
 }
 
+/// Runs `request_bytes` through a real [`AutoNatServer`] and returns the
+/// wire bytes of an error response with `status`.
+#[expect(
+    clippy::panic,
+    reason = "the shared test helper must fail at the unexpected AutoNAT response"
+)]
+pub fn autonat_error_response(request_bytes: &[u8], status: ResponseStatus) -> Vec<u8> {
+    let mut server = AutoNatServer::new();
+    server
+        .on_data(request_bytes)
+        .expect("well-formed AutoNAT request");
+    assert!(matches!(
+        server.poll_output(),
+        Some(AutoNatServerOutput::Request(_))
+    ));
+    server.respond_error(status, "refused");
+    match server.poll_output() {
+        Some(AutoNatServerOutput::Outbound(bytes)) => bytes,
+        other => panic!("expected outbound response, got {other:?}"),
+    }
+}
+
 /// Feeds an `IdentifyReceived` event whose `observed_addr` is `addr`'s
 /// binary encoding, as if `reporter` told us where it sees us from.
 pub fn identify_observed(node: &mut Node, reporter: &PeerId, addr: &Multiaddr, now: Now) {

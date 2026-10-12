@@ -1,8 +1,9 @@
 //! Own-side housekeeping, independent of any connect attempt:
 //!
-//! - [`Prober`] — AutoNAT reachability probing with majority-of-N confidence
-//!   over a sliding window of M verdicts. `AutoNatClient` is single-shot;
-//!   the aggregation (and the never-flap-on-one-probe guarantee) lives here.
+//! - [`Prober`] — AutoNAT reachability probing that trusts a quorum of
+//!   distinct servers: N of the latest votes of the last M servers to
+//!   answer. `AutoNatClient` is single-shot; the aggregation (and the
+//!   never-flap-on-one-server guarantee) lives here.
 //! - [`ReservationManager`] — holds a relay reservation per the configured
 //!   [`ReservationPolicy`], renewing at half the relay-reported lifetime
 //!   and rotating relays (with backoff) on refusal or loss.
@@ -11,6 +12,7 @@
 //! ([`crate::acquire`]) and end only work bound to the exact connection a
 //! close or replacement retires.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use minip2p_autonat::{
@@ -32,6 +34,9 @@ use crate::types::{ReachabilityState, ReservationInfo};
 /// [`reservation_retry_backoff_ms`](crate::NatConfig::reservation_retry_backoff_ms)
 /// is longer still.
 pub const MAX_RESERVATION_RETRY_BACKOFF_MS: u64 = 60_000;
+
+/// How long an AutoNAT server's vote counts toward reachability: 15 minutes.
+pub const AUTONAT_VOTE_TTL_MS: u64 = 15 * 60 * 1_000;
 
 /// The delay before retrying after `failures` earlier consecutive failures:
 /// `base` doubled per failure, plus up to a fifth more as jitter, capped at
@@ -156,13 +161,25 @@ struct ProbeFlight {
     deadline: u64,
 }
 
-/// AutoNAT probing with an M-sample confidence window: the verdict flips
-/// only when at least N of the last M samples agree, and each flip emits
-/// exactly one [`NatEvent::ReachabilityChanged`].
+/// One server's latest conclusive probe verdict.
+struct Vote {
+    /// The dialable addresses it confirmed; empty for a private vote.
+    public_addrs: Vec<Multiaddr>,
+    cast_at_ms: u64,
+}
+
+/// AutoNAT probing that trusts a quorum of distinct servers.
+///
+/// Each server holds at most one vote, its latest, for
+/// [`AUTONAT_VOTE_TTL_MS`]; only the last M servers to vote count. The
+/// verdict turns Public once N of them confirm the same address (and only
+/// addresses N of them confirm are reported), or Private once N report a
+/// failed dial-back. Each flip emits exactly one
+/// [`NatEvent::ReachabilityChanged`].
 pub(crate) struct Prober {
     verdict: ReachabilityState,
-    /// Sliding window of recent samples (`true` = public).
-    window: Vec<bool>,
+    /// The latest vote of each recent server.
+    votes: BTreeMap<PeerId, Vote>,
     /// Most recently confirmed, directly dialable public addresses.
     public_addrs: Vec<Multiaddr>,
     flight: Option<ProbeFlight>,
@@ -174,7 +191,7 @@ impl Prober {
     fn new(has_servers: bool) -> Self {
         Self {
             verdict: ReachabilityState::Unknown,
-            window: Vec::new(),
+            votes: BTreeMap::new(),
             public_addrs: Vec::new(),
             flight: None,
             // Without configured servers there is nothing to schedule, and
@@ -424,22 +441,24 @@ impl Prober {
                 false
             }
             Ok(Some(reachability)) => {
+                let server = flight.server.peer_id().clone();
                 self.finish_flight(swarm, shared, now);
-                self.record_sample(&reachability, shared, now)
+                self.record_sample(server, &reachability, shared, now)
             }
             Ok(None) => false,
         }
     }
 
-    /// Records one probe verdict and applies the N-of-M confidence rule.
-    /// Returns whether the verdict flipped.
+    /// Records `server`'s probe verdict as its only vote and applies the
+    /// quorum rule. Returns whether the verdict flipped.
     fn record_sample(
         &mut self,
+        server: PeerId,
         reachability: &Reachability,
         shared: &mut Shared,
-        _now: Now,
+        now: Now,
     ) -> bool {
-        let (sample, sample_addrs) = match reachability {
+        let public_addrs = match reachability {
             Reachability::Public { addrs, .. } => {
                 let selected = select_direct_addrs(addrs, None, None);
                 // A successful dial-back is useful public evidence only when
@@ -450,25 +469,44 @@ impl Prober {
                 if selected.is_empty() {
                     return false;
                 }
-                (true, selected)
+                selected
             }
-            Reachability::Private { .. } => (false, Vec::new()),
-            // No signal: never move the window on an inconclusive probe.
+            Reachability::Private { .. } => Vec::new(),
+            // No signal: an inconclusive probe never casts a vote.
             Reachability::Unknown { .. } => return false,
         };
+        let now_ms = now.monotonic_ms;
+        self.votes.insert(
+            server,
+            Vote {
+                public_addrs,
+                cast_at_ms: now_ms,
+            },
+        );
+        self.votes
+            .retain(|_, vote| now_ms.saturating_sub(vote.cast_at_ms) < AUTONAT_VOTE_TTL_MS);
         let window = usize::from(shared.config.confidence_window.max(1));
-        self.window.push(sample);
-        if self.window.len() > window {
-            self.window.remove(0);
+        while self.votes.len() > window {
+            let oldest = self
+                .votes
+                .iter()
+                .min_by_key(|(_, vote)| vote.cast_at_ms)
+                .map(|(server, _)| server.clone())
+                .expect("the window is over a positive size");
+            self.votes.remove(&oldest);
         }
 
         // A threshold above the bounded window can never be reached. Treat
         // it as unanimity for the configured window instead of leaving
         // reachability permanently Unknown.
         let threshold = usize::from(shared.config.confidence_threshold.max(1)).min(window);
-        let public_votes = self.window.iter().filter(|s| **s).count();
-        let private_votes = self.window.len() - public_votes;
-        let new = if public_votes >= threshold {
+        let confirmed = self.quorum_addrs(threshold);
+        let private_votes = self
+            .votes
+            .values()
+            .filter(|vote| vote.public_addrs.is_empty())
+            .count();
+        let new = if !confirmed.is_empty() {
             ReachabilityState::Public
         } else if private_votes >= threshold {
             ReachabilityState::Private
@@ -476,20 +514,17 @@ impl Prober {
             self.verdict
         };
         if new == self.verdict {
-            if new == ReachabilityState::Public && sample && sample_addrs != self.public_addrs {
-                self.public_addrs = sample_addrs.clone();
-                shared.push_event(NatEvent::PublicAddressesChanged {
-                    addrs: sample_addrs,
-                });
+            if new == ReachabilityState::Public
+                && !confirmed.is_empty()
+                && confirmed != self.public_addrs
+            {
+                self.public_addrs = confirmed.clone();
+                shared.push_event(NatEvent::PublicAddressesChanged { addrs: confirmed });
             }
             return false;
         }
         let old = core::mem::replace(&mut self.verdict, new);
-        self.public_addrs = if new == ReachabilityState::Public && sample {
-            sample_addrs
-        } else {
-            Vec::new()
-        };
+        self.public_addrs = confirmed;
         shared.push_event(NatEvent::ReachabilityChanged {
             old,
             new,
@@ -498,14 +533,34 @@ impl Prober {
         true
     }
 
-    /// Ends the current flight cleanly (response consumed) and schedules
-    /// the next probe.
+    /// The addresses at least `threshold` live votes confirm, newest vote
+    /// first, each in its server's order.
+    fn quorum_addrs(&self, threshold: usize) -> Vec<Multiaddr> {
+        let mut newest_first: Vec<&Vote> = self.votes.values().collect();
+        newest_first.sort_by_key(|vote| core::cmp::Reverse(vote.cast_at_ms));
+        let mut confirmed = Vec::new();
+        for addr in newest_first.iter().flat_map(|vote| &vote.public_addrs) {
+            let votes = newest_first
+                .iter()
+                .filter(|vote| vote.public_addrs.contains(addr))
+                .count();
+            if votes >= threshold && !confirmed.contains(addr) {
+                confirmed.push(addr.clone());
+            }
+        }
+        confirmed
+    }
+
+    /// Ends the current flight cleanly (response consumed), rotates to the
+    /// next server so no single server answers twice in a row, and
+    /// schedules the next probe.
     fn finish_flight(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         if let Some(flight) = self.flight.take()
             && let Some((conn, stream)) = flight.stage.stream()
         {
             finish_stream(flight.server.peer_id(), conn, stream, swarm, shared, now);
         }
+        self.server_idx += 1;
         self.schedule_next(shared, now);
     }
 
