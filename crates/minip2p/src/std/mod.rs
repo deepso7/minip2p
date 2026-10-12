@@ -236,6 +236,17 @@ type StdCarrier = ();
 /// The engine the std [`Endpoint`] drives.
 type StdEngine = Engine<EndpointTransport, StdEntropy, StdCarrier>;
 
+/// What [`Endpoint::close`] collected: every event, in order, and every
+/// error, in the order they were hit. An empty `errors` means a clean close.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct CloseReport {
+    /// Events queued before the close and those its drain produced.
+    pub events: Vec<EndpointEvent>,
+    /// Every failure: the mDNS goodbye, each disconnect, and a failed drain.
+    pub errors: Vec<Error>,
+}
+
 /// App-facing minip2p endpoint over the transports it was asked to bind.
 ///
 /// `Endpoint` owns identity, transports, a clock, and the same engine as
@@ -1037,20 +1048,20 @@ impl Endpoint {
     /// notifies a peer after `kill -9` or a hard partition. A replacement
     /// that lands while draining is disconnected too, including a handshake
     /// still pending when the replaced connection closes.
-    pub fn close(mut self) -> Result<Vec<EndpointEvent>, Error> {
-        let mut first_error = None;
+    ///
+    /// Close never stops at the first failure: the [`CloseReport`] carries
+    /// every event collected, starting with those already queued, and every
+    /// error hit. A failed drain ends the drain early.
+    pub fn close(mut self) -> CloseReport {
+        let mut report = CloseReport::default();
+        report.events.extend(self.engine.events.drain(..));
         #[cfg(feature = "mdns")]
         if let Err(error) = self.shutdown() {
-            first_error = Some(error);
+            report.errors.push(error);
         }
         let drain_by = std::time::Instant::now() + Duration::from_millis(500);
-        let mut events = Vec::new();
         loop {
-            if let Some(error) = self.disconnect_established()
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
+            report.errors.extend(self.disconnect_established());
             if std::time::Instant::now() >= drain_by {
                 break;
             }
@@ -1066,12 +1077,16 @@ impl Endpoint {
                 Err(error) => Err(error),
             };
             if let Err(error) = harvested {
-                return Err(first_error.unwrap_or(error));
+                report.errors.push(error);
+                break;
             }
             let now = self.now();
             let polled = match self.engine.core.poll(now) {
                 Ok(polled) => polled,
-                Err(error) => return Err(first_error.unwrap_or(error)),
+                Err(error) => {
+                    report.errors.push(error);
+                    break;
+                }
             };
             let quiet = polled.is_empty();
             // No agent tick or discovery sweep runs while closing, so only
@@ -1079,33 +1094,28 @@ impl Endpoint {
             for event in polled {
                 self.engine.ingest(event, now);
             }
-            events.extend(self.engine.events.drain(..));
-            events.extend(self.engine.collect_terminals(now));
+            report.events.extend(self.engine.events.drain(..));
+            report.events.extend(self.engine.collect_terminals(now));
             if quiet && (!self.close_drain_busy() || std::time::Instant::now() >= drain_by) {
                 break;
             }
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(events),
-        }
+        report
     }
 
     fn close_drain_busy(&self) -> bool {
         !self.engine.core.connected_peers().is_empty() || self.engine.core.has_tracked_connections()
     }
 
-    fn disconnect_established(&mut self) -> Option<Error> {
+    /// Disconnects every established peer, returning each failure.
+    fn disconnect_established(&mut self) -> Vec<Error> {
         let now = self.now();
-        let mut first_error = None;
-        for peer in self.engine.core.connected_peers() {
-            if let Err(error) = self.engine.core.disconnect(&peer, now.monotonic_ms)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-        }
-        first_error
+        self.engine
+            .core
+            .connected_peers()
+            .iter()
+            .filter_map(|peer| self.engine.core.disconnect(peer, now.monotonic_ms).err())
+            .collect()
     }
 }
 
@@ -3703,6 +3713,42 @@ mod tests {
             )),
             "the queued event must survive the failed poll: {events:?}"
         );
+    }
+
+    /// A close whose drain fails still returns the events queued before it,
+    /// alongside the error.
+    #[test]
+    fn close_reports_queued_events_with_a_drain_failure() {
+        let fail = Arc::new(AtomicBool::new(true));
+        let mut set = TransportSet::new();
+        insert_member(
+            &mut set,
+            TransportKind::Tcp,
+            [ConnectionNamespace::TCP_IPV4],
+            FlakyPollTransport { fail },
+        )
+        .expect("insert transport");
+        let mut endpoint =
+            build_endpoint(Endpoint::builder(), Ed25519Keypair::generate(), set).expect("build");
+        let peer = Ed25519Keypair::generate().peer_id();
+        endpoint
+            .engine
+            .events
+            .push_back(EndpointEvent::ConnectionClosed {
+                peer_id: peer.clone(),
+                conn_id: ConnectionId::new(1),
+            });
+
+        let report = endpoint.close();
+        assert!(
+            matches!(
+                report.events.as_slice(),
+                [EndpointEvent::ConnectionClosed { peer_id, .. }] if peer_id == &peer
+            ),
+            "{:?}",
+            report.events
+        );
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     }
 
     #[cfg(feature = "nat")]

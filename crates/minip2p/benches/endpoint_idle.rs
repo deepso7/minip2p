@@ -155,7 +155,12 @@ fn measure(variant: Variant) -> Measured {
         wall: started.elapsed(),
         cpu: cpu.elapsed(),
     };
-    endpoint.close().expect("close endpoint");
+    let closed = endpoint.close();
+    assert!(
+        closed.errors.is_empty(),
+        "close endpoint: {:?}",
+        closed.errors
+    );
     measured
 }
 
