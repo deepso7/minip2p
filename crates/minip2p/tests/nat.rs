@@ -755,7 +755,7 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
     // The 30 s connect deadline is far off; the start timeout settles it.
     let deadline = started + Duration::from_secs(10);
     let mut relayed_at = None;
-    let outcome = loop {
+    let (outcome, settled_at) = loop {
         assert!(Instant::now() < deadline, "connect did not settle");
         if let Some(event) = initiator
             .next_event(Duration::from_millis(20))
@@ -771,7 +771,7 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
                     connect_id: id,
                     outcome,
                     ..
-                } if id == connect_id => break outcome,
+                } if id == connect_id => break (outcome, Instant::now()),
                 _ => {}
             }
         }
@@ -786,8 +786,10 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
         other => panic!("expected Connected on the circuit, got {other:?}"),
     }
     let relayed_at = relayed_at.expect("the Relayed path was reported first");
+    // The budget starts when the path becomes usable, a little before the
+    // test sees `PathEstablished`; allow for that and millisecond rounding.
     assert!(
-        relayed_at.elapsed() >= Duration::from_millis(start_timeout_ms),
+        settled_at - relayed_at >= Duration::from_millis(start_timeout_ms - 100),
         "the attempt waited for the remote to start DCUtR"
     );
     assert_eq!(
