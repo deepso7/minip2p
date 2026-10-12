@@ -837,6 +837,21 @@ pub fn drain_actions(node: &mut Node) -> Vec<Out> {
     out
 }
 
-pub fn drain_events(node: &mut Node) -> Vec<NatEvent> {
+/// Every event the agent emitted, relay-leg progress included.
+pub fn drain_all_events(node: &mut Node) -> Vec<NatEvent> {
     core::iter::from_fn(|| node.agent.poll_event()).collect()
+}
+
+/// The events tests usually assert on: everything but the per-relay
+/// `RelayStarted`/`RelayFailed` diagnostics.
+pub fn drain_events(node: &mut Node) -> Vec<NatEvent> {
+    drain_all_events(node)
+        .into_iter()
+        .filter(|event| {
+            !matches!(
+                event,
+                NatEvent::RelayStarted { .. } | NatEvent::RelayFailed { .. }
+            )
+        })
+        .collect()
 }

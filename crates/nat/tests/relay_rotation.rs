@@ -195,7 +195,7 @@ fn shares_fit_a_caller_deadline_shorter_than_the_leg_deadline() {
     assert!(matches!(
         drain_events(&mut w.agent).as_slice(),
         [NatEvent::ConnectFailed {
-            error: NatError::Timeout,
+            error: NatError::Timeout { .. },
             ..
         }]
     ));

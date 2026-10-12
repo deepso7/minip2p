@@ -564,6 +564,44 @@ impl NatAgent {
         }
     }
 
+    /// The host's Connection-attempt engine settled attempt `id`: drop what
+    /// the agent still holds for it (relay-leg streams, the DCUtR exchange,
+    /// punch dials, timers) and emit no further attempt event for it.
+    ///
+    /// `kept` is the connection the attempt settled on, which stays open
+    /// even when this attempt promoted it; `None` (a failed or cancelled
+    /// attempt) closes the attempt's circuit like [`Self::cancel`]. Unknown
+    /// or already finished ids are a no-op.
+    pub fn settled<S: NatSwarm>(
+        &mut self,
+        swarm: &mut S,
+        id: ConnectId,
+        kept: Option<ConnectionId>,
+        now: Now,
+    ) {
+        let Some(mut attempt) = self.attempts.remove(&id) else {
+            return;
+        };
+        match kept {
+            Some(kept) => attempt.settled(kept, swarm, &mut self.shared, now),
+            None => attempt.cancel(swarm, &mut self.shared, now),
+        }
+    }
+
+    /// Reports that the bytes the agent wrote on `stream_id` of `conn_id`,
+    /// which the host held behind a full stream (see
+    /// [`NatSwarm::write_pending`]), are now fully written. `now` is when
+    /// the last held byte left. A DCUtR round times its RTT from here.
+    /// Streams the agent no longer waits on are ignored.
+    pub fn write_completed(&mut self, conn_id: ConnectionId, stream_id: StreamId, now: Now) {
+        if let Some((_, StreamRole::DcutrInbound(id))) =
+            self.shared.streams.get(&(conn_id, stream_id))
+            && let Some(circuit) = self.inbound.get_mut(id)
+        {
+            circuit.on_write_completed(conn_id, stream_id, now);
+        }
+    }
+
     /// The path `peer`'s current connection carries, when a NAT machine
     /// announced one for it (or for the connection it replaced).
     pub fn path<S: NatSwarm>(&self, swarm: &S, peer: &PeerId) -> Option<&Path> {
@@ -682,7 +720,9 @@ impl NatAgent {
                     let dcutr_attempt = (protocol_id == DCUTR_PROTOCOL_ID)
                         .then(|| {
                             self.attempts.iter().find_map(|(id, attempt)| {
-                                attempt.accepts_dcutr(peer_id, *conn_id).then_some(*id)
+                                attempt
+                                    .accepts_dcutr(peer_id, *conn_id, &self.shared)
+                                    .then_some(*id)
                             })
                         })
                         .flatten();
@@ -694,7 +734,12 @@ impl NatAgent {
                             StreamRole::DcutrAttempt(id),
                         );
                         if let Some(attempt) = self.attempts.get_mut(&id) {
-                            attempt.on_dcutr_stream_opened(*conn_id, *stream_id, &self.shared);
+                            attempt.on_dcutr_stream_opened(
+                                *conn_id,
+                                *stream_id,
+                                &mut self.shared,
+                                now,
+                            );
                         }
                         handled = true;
                     } else if !trusted_stop {
@@ -1169,8 +1214,14 @@ impl NatAgent {
                 peer: peer.clone(),
                 from: old_origin.path,
                 to,
+                old_conn_id: old,
+                new_conn_id: new,
             },
-            None => NatEvent::InboundDirectUpgrade { peer: peer.clone() },
+            None => NatEvent::InboundDirectUpgrade {
+                peer: peer.clone(),
+                old_conn_id: old,
+                new_conn_id: new,
+            },
         });
     }
 

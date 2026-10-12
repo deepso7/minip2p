@@ -6,7 +6,7 @@ mod common;
 use common::*;
 
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
-use minip2p_nat::{Deadline, NatConfig, NatError, NatEvent, Path};
+use minip2p_nat::{Deadline, NatConfig, NatError, NatEvent, Path, RelayStage};
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
@@ -222,20 +222,16 @@ fn malformed_dcutr_keeps_the_established_relayed_path() {
         at(303),
     );
 
+    // One failed round; the holder may still start the next one, so the
+    // attempt keeps its Relayed path and waits.
     let events = drain_events(&mut h.agent);
     assert!(matches!(
         events.as_slice(),
-        [
-            NatEvent::HolePunchFailed {
-                connect_id,
-                attempt: 1,
-                ..
-            },
-            NatEvent::FellBackToRelay {
-                connect_id: fallback_id,
-                peer,
-            }
-        ] if *connect_id == id && *fallback_id == id && peer == &h.target
+        [NatEvent::HolePunchFailed {
+            connect_id,
+            attempt: 1,
+            ..
+        }] if *connect_id == id
     ));
 }
 
@@ -738,9 +734,14 @@ fn relay_leg_deadline_fails_a_stalled_leg() {
     assert!(matches!(
         events.as_slice(),
         [NatEvent::ConnectFailed {
-            error: NatError::Timeout,
-            ..
-        }]
+                error: NatError::Timeout {
+                    stage: RelayStage::RelayDial,
+                    elapsed_ms: 12_000,
+                    budget_ms: 12_000,
+                    ..
+                },
+                ..
+            }]
     ));
     assert!(
         drain_actions(&mut h.agent)

@@ -8,9 +8,14 @@
 //! relay opens STOP stream ──▶ CONNECT ──▶ auto-Accept (STATUS:OK)
 //!   ──▶ promote bridge ──▶ circuit Connected
 //!   ──▶ InboundPathEstablished(Relayed)
-//!   ──▶ open DCUtR ──▶ send CONNECT, then SYNC
+//!   ──▶ round: open DCUtR ──▶ send CONNECT, then SYNC ──▶ punch window
+//!   ──▶ no direct connection: next round, up to MAX_DCUTR_ROUNDS
 //! circuit dialer's punch lands ──▶ InboundDirectUpgrade
 //! ```
+//!
+//! Each round is a fresh exchange on a fresh stream with its own RTT, timed
+//! from when CONNECT is fully written. Rounds are bounded by
+//! `dcutr_exchange_timeout_ms` each and `upgrade_timeout_ms` overall.
 
 use alloc::vec::Vec;
 
@@ -21,6 +26,7 @@ use minip2p_relay::{RelayError, Status, StopResponder, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
 
 use crate::agent::{Shared, StreamInput, StreamRole, TokenPurpose, reset, send};
+use crate::config::MAX_DCUTR_ROUNDS;
 use crate::events::{BridgeRole, NatAction, NatEvent};
 use crate::swarm::NatSwarm;
 use crate::types::PromoteError;
@@ -48,11 +54,18 @@ pub(crate) struct InboundCircuit {
     dcutr: Option<Result<DcutrInitiator, DcutrError>>,
     /// The DCUtR stream this peer opened, on the promoted circuit.
     dcutr_stream: Option<(ConnectionId, StreamId)>,
-    /// Monotonic time when the initial DCUtR CONNECT was queued to the
-    /// transport, used to synchronize the first QUIC blast at half the
-    /// measured relay RTT.
+    /// The current round's CONNECT was handed to the swarm.
+    dcutr_connect_queued: bool,
+    /// Monotonic time when the current round's CONNECT was fully written
+    /// (held tail included), used to synchronize the first QUIC blast at
+    /// half the measured relay RTT.
     dcutr_connect_sent_at: Option<u64>,
+    /// The current round's exchange must reach the remote's CONNECT by then.
     dcutr_deadline: Option<u64>,
+    /// DCUtR rounds started on this circuit.
+    rounds: u32,
+    /// The whole upgrade ends then; armed once the Relayed path is usable.
+    upgrade_deadline: Option<u64>,
     remote_addrs: Vec<Multiaddr>,
     /// Secure-mux bytes coalesced behind the STOP success response. These
     /// must accompany circuit promotion.
@@ -60,9 +73,8 @@ pub(crate) struct InboundCircuit {
     /// Deadline for STOP acceptance and handing the bridge to circuit promotion.
     exchange_deadline: u64,
     blast: Option<BlastSchedule>,
-    /// Keep the circuit alive for upgrade detection until this instant
-    /// (covers the initiator's full retry window, not just our blasts).
-    linger_until: Option<u64>,
+    /// End of the current round's punch window; the next round starts then.
+    round_until: Option<u64>,
     /// The bridge stream has been handed to the circuit transport.
     released: bool,
     promoted: Option<ConnectionId>,
@@ -91,13 +103,16 @@ impl InboundCircuit {
             stop: Some(StopResponder::new()),
             dcutr: None,
             dcutr_stream: None,
+            dcutr_connect_queued: false,
             dcutr_connect_sent_at: None,
             dcutr_deadline: None,
+            rounds: 0,
+            upgrade_deadline: None,
             remote_addrs: Vec::new(),
             pending_data: Vec::new(),
-            exchange_deadline: now.monotonic_ms + shared.config.relay_leg_deadline_ms,
+            exchange_deadline: now.monotonic_ms + shared.config.relay_timeout_ms,
             blast: None,
-            linger_until: None,
+            round_until: None,
             released: false,
             promoted: None,
             handshake_deadline: None,
@@ -126,16 +141,16 @@ impl InboundCircuit {
             let next = blast.next_at.min(blast.until);
             due = Some(due.map_or(next, |d| d.min(next)));
         }
-        if let Some(linger) = self.linger_until {
-            due = Some(due.map_or(linger, |d| d.min(linger)));
-        }
-        if let Some(handshake) = self.handshake_deadline {
-            due = Some(due.map_or(handshake, |d| d.min(handshake)));
-        }
-        if let Some(deadline) = self.dcutr_deadline {
-            due = Some(due.map_or(deadline, |d| d.min(deadline)));
-        }
-        due
+        [
+            due,
+            self.round_until,
+            self.handshake_deadline,
+            self.dcutr_deadline,
+            self.upgrade_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub(crate) fn on_stream_input(
@@ -307,16 +322,22 @@ impl InboundCircuit {
                 self.blast = None;
             }
         }
-        if let Some(linger) = self.linger_until
-            && now.monotonic_ms >= linger
+        if let Some(deadline) = self.upgrade_deadline
+            && now.monotonic_ms >= deadline
         {
-            self.linger_until = None;
+            // The whole upgrade is over; the Relayed path stays.
+            self.finish_dcutr(swarm, shared, now);
             self.blast = None;
-            // A promoted circuit awaiting ConnectionEstablished remains
-            // correlated until its separate handshake deadline.
-            if self.released && (self.path_announced || self.handshake_deadline.is_none()) {
-                self.done = true;
-            }
+            self.done = true;
+            return;
+        }
+        if let Some(until) = self.round_until
+            && now.monotonic_ms >= until
+        {
+            // The round's punch window passed without a direct connection.
+            self.round_until = None;
+            self.blast = None;
+            self.start_round(swarm, shared, now);
         }
         if let Some(deadline) = self.handshake_deadline
             && now.monotonic_ms >= deadline
@@ -331,7 +352,7 @@ impl InboundCircuit {
             && now.monotonic_ms >= deadline
         {
             self.finish_dcutr(swarm, shared, now);
-            self.done = true;
+            self.start_round(swarm, shared, now);
         }
     }
 
@@ -364,27 +385,35 @@ impl InboundCircuit {
                         path: crate::Path::Relayed {
                             relay: self.relay.clone(),
                         },
+                        conn_id,
                     });
-                    if !shared.config.force_relay {
-                        self.open_dcutr(peer, conn_id, swarm, shared, now);
+                    if shared.config.force_relay {
+                        self.done = true;
+                    } else {
+                        self.upgrade_deadline =
+                            Some(now.monotonic_ms + shared.config.upgrade_timeout_ms);
+                        self.start_round(swarm, shared, now);
                     }
-                }
-                if shared.config.force_relay && self.blast.is_none() && self.linger_until.is_none()
-                {
-                    self.done = true;
                 }
             }
             return;
         }
         self.blast = None;
-        self.linger_until = None;
+        self.round_until = None;
         // An attempt that dialed this connection already recorded where it
         // came from; only an otherwise unexplained one is the punch.
         if !shared.origins.contains_key(&conn_id) {
             shared.record_origin(conn_id, crate::Path::DirectPunched, None);
         }
-        shared.push_event(NatEvent::InboundDirectUpgrade { peer: peer.clone() });
+        if let Some(old_conn_id) = self.promoted {
+            shared.push_event(NatEvent::InboundDirectUpgrade {
+                peer: peer.clone(),
+                old_conn_id,
+                new_conn_id: conn_id,
+            });
+        }
         if self.released {
+            self.finish_dcutr(swarm, shared, now);
             self.done = true;
         }
     }
@@ -444,39 +473,59 @@ impl InboundCircuit {
         }
     }
 
-    /// Opens `/libp2p/dcutr` on the promoted circuit `circuit`. Only the
-    /// stream allocation is shared with the other NAT exchanges: the
-    /// circuit is already ready.
+    /// Starts the next DCUtR round: opens `/libp2p/dcutr` on the promoted
+    /// circuit and queues CONNECT. Only the stream allocation is shared with
+    /// the other NAT exchanges: the circuit is already ready.
     ///
-    /// The swarm may be ahead of this event: when the peer's current
-    /// connection already replaced the circuit there is nothing to punch, so
-    /// nothing is opened; the replacement's own event reports the upgrade.
-    fn open_dcutr(
-        &mut self,
-        peer: &PeerId,
-        circuit: ConnectionId,
-        swarm: &mut dyn NatSwarm,
-        shared: &mut Shared,
-        now: Now,
-    ) {
+    /// Ends coordination instead when every round ran, the upgrade budget is
+    /// spent, or the peer's current connection is no longer the circuit (a
+    /// replacement's own event reports any upgrade).
+    fn start_round(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
+        let (Some(peer), Some(circuit)) = (self.source.clone(), self.promoted) else {
+            self.done = true;
+            return;
+        };
+        let budget_left = self
+            .upgrade_deadline
+            .is_some_and(|deadline| now.monotonic_ms < deadline);
         // `open_stream` opens on the current connection, just checked to be
         // the circuit.
-        let opened = if swarm.connection(peer) == Some(circuit) {
+        let opened = if self.rounds < MAX_DCUTR_ROUNDS
+            && budget_left
+            && swarm.connection(&peer) == Some(circuit)
+        {
             swarm
-                .open_stream(peer, minip2p_dcutr::DCUTR_PROTOCOL_ID, now.monotonic_ms)
+                .open_stream(&peer, minip2p_dcutr::DCUTR_PROTOCOL_ID, now.monotonic_ms)
                 .ok()
         } else {
             None
         };
         let Some((conn, stream)) = opened else {
-            self.linger_until = None;
             self.done = true;
             return;
         };
+        self.rounds += 1;
         self.dcutr_stream = Some((conn, stream));
         self.dcutr = Some(DcutrInitiator::new(&shared.punch_candidates()));
-        self.dcutr_deadline = Some(now.monotonic_ms + shared.config.relay_leg_deadline_ms);
-        shared.own_stream(peer, conn, stream, StreamRole::DcutrInbound(self.id));
+        self.dcutr_connect_queued = false;
+        self.dcutr_connect_sent_at = None;
+        let exchange_end = now.monotonic_ms + shared.config.dcutr_exchange_timeout_ms;
+        self.dcutr_deadline = Some(
+            self.upgrade_deadline
+                .map_or(exchange_end, |deadline| deadline.min(exchange_end)),
+        );
+        shared.own_stream(&peer, conn, stream, StreamRole::DcutrInbound(self.id));
+    }
+
+    /// The host finished writing what it held on `stream`: a CONNECT
+    /// waiting on that starts its RTT clock now.
+    pub(crate) fn on_write_completed(&mut self, conn: ConnectionId, stream: StreamId, now: Now) {
+        if self.dcutr_stream == Some((conn, stream))
+            && self.dcutr_connect_queued
+            && self.dcutr_connect_sent_at.is_none()
+        {
+            self.dcutr_connect_sent_at = Some(now.monotonic_ms);
+        }
     }
 
     pub(crate) fn on_dcutr_stream_input(
@@ -497,8 +546,7 @@ impl InboundCircuit {
         let dcutr = match self.dcutr.as_mut() {
             Some(Ok(dcutr)) => dcutr,
             Some(Err(_)) => {
-                self.finish_dcutr(swarm, shared, now);
-                self.done = true;
+                self.fail_round(swarm, shared, now);
                 return;
             }
             None => return,
@@ -508,8 +556,7 @@ impl InboundCircuit {
         if let StreamInput::Data(bytes) = input
             && dcutr.on_data(bytes, rtt_ms).is_err()
         {
-            self.finish_dcutr(swarm, shared, now);
-            self.done = true;
+            self.fail_round(swarm, shared, now);
             return;
         }
         let mut outputs = Vec::new();
@@ -520,9 +567,16 @@ impl InboundCircuit {
         for output in outputs {
             match output {
                 DcutrInitiatorOutput::Outbound(data) => {
-                    self.dcutr_connect_sent_at.get_or_insert(now.monotonic_ms);
                     if let Some(peer) = self.source.as_ref() {
                         send(swarm, peer, conn, stream, data, now);
+                    }
+                    if !self.dcutr_connect_queued {
+                        self.dcutr_connect_queued = true;
+                        // A held tail starts the clock once the host reports
+                        // it written (`on_write_completed`).
+                        if !swarm.write_pending(conn, stream) {
+                            self.dcutr_connect_sent_at = Some(now.monotonic_ms);
+                        }
                     }
                 }
                 DcutrInitiatorOutput::Outcome(InitiatorOutcome::DialNow {
@@ -561,30 +615,27 @@ impl InboundCircuit {
                             }
                         }
                     }
-                    self.linger_until = Some(
-                        blast_start.saturating_add(
-                            shared
-                                .config
-                                .punch_deadline_ms
-                                .saturating_mul(1 + u64::from(shared.config.punch_max_retries)),
-                        ),
-                    );
+                    self.round_until = Some(blast_until);
                 }
             }
         }
-        if remote_closed && !completed {
-            self.finish_dcutr(swarm, shared, now);
-            self.done = true;
-            return;
-        }
         if completed {
             self.finish_dcutr(swarm, shared, now);
+        } else if remote_closed {
+            self.fail_round(swarm, shared, now);
         }
+    }
+
+    /// The round's exchange failed: the next round starts at once.
+    fn fail_round(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
+        self.finish_dcutr(swarm, shared, now);
+        self.start_round(swarm, shared, now);
     }
 
     fn finish_dcutr(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         self.dcutr = None;
         self.dcutr_deadline = None;
+        self.dcutr_connect_queued = false;
         if let Some((conn, stream)) = self.dcutr_stream.take() {
             shared.reset_owned_stream(swarm, conn, stream, now);
         }

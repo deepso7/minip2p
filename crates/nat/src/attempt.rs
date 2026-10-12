@@ -16,7 +16,8 @@ use crate::agent::{
 use crate::events::{BridgeRole, NatAction, NatEvent};
 use crate::inbound::select_global_punch_candidates;
 use crate::swarm::NatSwarm;
-use crate::types::{NatError, Path, PromoteError};
+use crate::config::MAX_DCUTR_ROUNDS;
+use crate::types::{NatError, Path, PromoteError, RelayStage, UpgradeStop};
 
 /// Progress of the relay leg of a connect attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,13 +52,19 @@ enum RelayLeg {
 /// engine; this machine only tracks a direct establishment so
 /// [`Path::DirectDialed`] snapshots keep working.
 ///
-/// The relay leg tries eligible relays one at a time. Each relay gets an
-/// even share of the leg's remaining time (`remaining / relays left`), so
-/// time a relay leaves unused by failing fast rolls over to the rest, and
-/// the last relay runs out the leg deadline. A relay listed under several
-/// addresses splits its share across them. Any relay-scoped failure before
-/// the circuit carries a path, including a bridge that fails to promote,
-/// moves on to the next relay; the leg fails with the last relay's error.
+/// The relay leg tries eligible relays one at a time. Each relay gets
+/// [`NatConfig::relay_timeout_ms`](crate::NatConfig::relay_timeout_ms),
+/// clipped by the attempt's deadline, to carry a usable Relayed path; a
+/// relay listed under several addresses splits that across them. Any
+/// relay-scoped failure before the circuit carries a path, including a
+/// bridge that fails to promote, is reported as
+/// [`NatEvent::RelayFailed`] and moves on to the next relay at once; the leg
+/// fails with the last relay's error.
+///
+/// On the Relayed path the reservation holder drives DCUtR. This side
+/// answers each round, dials the holder's addresses for one punch window,
+/// and settles on the Relayed path once [`MAX_DCUTR_ROUNDS`] rounds failed
+/// or an upgrade budget ran out.
 pub(crate) struct ConnectAttempt {
     id: ConnectId,
     peer: PeerId,
@@ -66,15 +73,15 @@ pub(crate) struct ConnectAttempt {
     /// Relays still to try after `relay`, in order.
     untried: VecDeque<PeerAddr>,
     leg: RelayLeg,
-    /// Absolute deadline for the whole relay leg to reach `Bridged`.
-    leg_deadline: u64,
-    /// The caller's deadline for the attempt, which caps `leg_deadline`.
+    /// The caller's deadline for the attempt, which clips every budget.
     attempt_deadline: Option<u64>,
-    /// Absolute end of the current relay's share, across all its addresses.
+    /// Absolute end of the current relay's budget, across all its addresses.
     share_deadline: u64,
     /// Absolute deadline for the current relay address: the end of its part
-    /// of the relay's share.
+    /// of the relay's budget. Armed until the circuit carries a path.
     relay_deadline: Option<u64>,
+    /// When the current relay address was started, for timeout diagnostics.
+    relay_started_at: u64,
     hop: Option<HopConnect>,
     /// The responder for an opened DCUtR stream, or the error that kept it
     /// from being built, reported once the stream carries input.
@@ -95,17 +102,25 @@ pub(crate) struct ConnectAttempt {
     /// the circuit transport with `PromoteBridge`.
     bridge_pending_data: Vec<u8>,
     punch_addrs: Vec<Multiaddr>,
-    punch_dials_issued: bool,
-    /// Connections started by punch dials.
+    /// Connections started by punch dials, in any round.
     punch_conns: BTreeSet<ConnectionId>,
-    /// Absolute deadline of the current punch window.
+    /// Absolute deadline of the current round's punch window.
     punch_deadline: Option<u64>,
-    /// 1-based index of the current punch window.
-    punch_window: u32,
+    /// DCUtR rounds the holder started on this attempt's circuit.
+    rounds: u32,
+    /// When the Relayed path became usable; upgrade budgets count from it.
+    relayed_at: u64,
+    /// Waiting for the holder to start its first DCUtR round.
+    start_deadline: Option<u64>,
+    /// When the current DCUtR exchange started.
+    exchange_started_at: u64,
+    /// The current DCUtR exchange must reach SYNC by then.
+    exchange_deadline: Option<u64>,
+    /// The whole upgrade must finish by then.
+    upgrade_deadline: Option<u64>,
     best: Option<Path>,
-    /// All direct punch windows have settled; once the circuit establishes,
-    /// it is the final path and `FellBackToRelay` may be emitted.
-    punch_settled: bool,
+    /// The connection carrying `best`.
+    path_conn: Option<ConnectionId>,
     last_error: Option<NatError>,
     done: bool,
 }
@@ -134,10 +149,10 @@ impl ConnectAttempt {
             relay: None,
             untried,
             leg: RelayLeg::Inactive,
-            leg_deadline: 0,
             attempt_deadline: legs.deadline_ms,
             share_deadline: 0,
             relay_deadline: None,
+            relay_started_at: 0,
             hop: None,
             dcutr: None,
             dcutr_stream: None,
@@ -148,12 +163,16 @@ impl ConnectAttempt {
             bridge_remote_write_closed: false,
             bridge_pending_data: Vec::new(),
             punch_addrs: Vec::new(),
-            punch_dials_issued: false,
             punch_conns: BTreeSet::new(),
             punch_deadline: None,
-            punch_window: 0,
+            rounds: 0,
+            relayed_at: 0,
+            start_deadline: None,
+            exchange_started_at: 0,
+            exchange_deadline: None,
+            upgrade_deadline: None,
             best: None,
-            punch_settled: false,
+            path_conn: None,
             last_error: None,
             done: false,
         };
@@ -165,7 +184,7 @@ impl ConnectAttempt {
                 shared.config.relay_stagger_ms
             };
             if stagger == 0 {
-                attempt.begin_relay_leg(swarm, shared, now);
+                attempt.try_next_relay(swarm, shared, now);
             } else {
                 attempt.leg = RelayLeg::WaitStagger {
                     until: now.monotonic_ms + stagger,
@@ -188,25 +207,45 @@ impl ConnectAttempt {
         self.done
     }
 
-    pub(crate) fn accepts_dcutr(&self, peer: &PeerId, conn_id: ConnectionId) -> bool {
+    /// Whether an inbound DCUtR stream on `conn_id` starts this attempt's
+    /// next round: the holder may run up to [`MAX_DCUTR_ROUNDS`] on the
+    /// circuit this attempt promoted, one at a time.
+    pub(crate) fn accepts_dcutr(
+        &self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        shared: &Shared,
+    ) -> bool {
         !self.done
-            && !self.punch_settled
-            && !self.punch_dials_issued
+            && !shared.config.force_relay
             && &self.peer == peer
             && self.promoted == Some(conn_id)
-            && self
-                .best
-                .as_ref()
-                .is_some_and(|path| matches!(path, Path::Relayed { .. }))
+            && self.upgrade_deadline.is_some()
             && self.dcutr_stream.is_none()
+            && self.rounds < MAX_DCUTR_ROUNDS
     }
 
+    /// The holder opened a DCUtR stream: a new round starts. A punch window
+    /// still open from the previous round ends here, failed.
     pub(crate) fn on_dcutr_stream_opened(
         &mut self,
         conn: ConnectionId,
         stream: StreamId,
-        shared: &Shared,
+        shared: &mut Shared,
+        now: Now,
     ) {
+        if self.punch_deadline.take().is_some() {
+            shared.push_event(NatEvent::HolePunchFailed {
+                connect_id: self.id,
+                attempt: self.rounds,
+                reason: "the remote started the next round".into(),
+            });
+        }
+        self.rounds += 1;
+        self.start_deadline = None;
+        self.exchange_started_at = now.monotonic_ms;
+        self.exchange_deadline =
+            Some(self.clip(now.monotonic_ms + shared.config.dcutr_exchange_timeout_ms));
         self.dcutr_stream = Some((conn, stream));
         self.dcutr = Some(DcutrResponder::new(&shared.punch_candidates()));
     }
@@ -230,7 +269,7 @@ impl ConnectAttempt {
             Some(Ok(dcutr)) => dcutr,
             Some(Err(error)) => {
                 let reason = error.to_string();
-                self.finish_failed_dcutr(reason, swarm, shared, now);
+                self.fail_round(reason, swarm, shared, now);
                 return;
             }
             None => return,
@@ -241,7 +280,7 @@ impl ConnectAttempt {
             StreamInput::Ready => return,
         };
         if let Err(error) = fed {
-            self.finish_failed_dcutr(error.to_string(), swarm, shared, now);
+            self.fail_round(error.to_string(), swarm, shared, now);
             return;
         }
         let mut outputs = Vec::new();
@@ -262,45 +301,94 @@ impl ConnectAttempt {
                 DcutrResponderOutput::Event(ResponderEvent::SyncReceived) => {
                     self.teardown_dcutr_stream(swarm, shared, now);
                     if self.punch_addrs.is_empty() {
-                        self.punch_failed_permanently(
+                        self.round_failed(
                             "no dialable remote addresses in DCUtR CONNECT".into(),
                             swarm,
                             shared,
                             now,
                         );
                     } else {
+                        // The previous round's unfinished dials make way for
+                        // this round's.
+                        shared.abort_attempt_dials(self.id, &self.peer, swarm);
                         self.issue_punch_dials(swarm, shared);
-                        self.punch_window = 1;
                         self.punch_deadline =
-                            Some(now.monotonic_ms + shared.config.punch_deadline_ms);
+                            Some(self.clip_upgrade(now.monotonic_ms + shared.config.punch_deadline_ms));
                     }
                 }
             }
         }
         if exchange_closed && self.dcutr_stream == Some((conn, stream)) {
-            self.finish_failed_dcutr("DCUtR stream closed before SYNC".into(), swarm, shared, now);
+            self.fail_round("DCUtR stream closed before SYNC".into(), swarm, shared, now);
         }
     }
 
-    fn finish_failed_dcutr(
+    /// The current round's exchange failed before SYNC.
+    fn fail_round(&mut self, reason: String, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
+        self.teardown_dcutr_stream(swarm, shared, now);
+        self.round_failed(reason, swarm, shared, now);
+    }
+
+    /// The current round ended without a direct connection. The holder
+    /// starts the next one; once it has run them all, or the circuit that
+    /// carried them is gone, the attempt settles.
+    fn round_failed(
         &mut self,
         reason: String,
         swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
         now: Now,
     ) {
-        self.teardown_dcutr_stream(swarm, shared, now);
+        self.exchange_deadline = None;
+        self.punch_deadline = None;
         shared.push_event(NatEvent::HolePunchFailed {
             connect_id: self.id,
-            attempt: 1,
+            attempt: self.rounds,
             reason,
         });
-        self.punch_settled = true;
+        if self.promoted.is_none() {
+            let error = self
+                .last_error
+                .take()
+                .unwrap_or(NatError::DialFailed("promoted circuit closed".into()));
+            self.fail(error, swarm, shared, now);
+        } else if self.rounds >= MAX_DCUTR_ROUNDS {
+            self.settle_relayed(
+                UpgradeStop::PunchFailed {
+                    rounds: self.rounds,
+                },
+                swarm,
+                shared,
+                now,
+            );
+        }
+    }
+
+    /// Ends the attempt on its Relayed path: the circuit stays, the
+    /// upgrade work goes.
+    fn settle_relayed(
+        &mut self,
+        reason: UpgradeStop,
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) {
         shared.push_event(NatEvent::FellBackToRelay {
             connect_id: self.id,
             peer: self.peer.clone(),
+            reason,
         });
-        self.done = true;
+        self.release(swarm, shared, now);
+    }
+
+    /// `at`, clipped to the attempt's deadline.
+    fn clip(&self, at: u64) -> u64 {
+        self.attempt_deadline.map_or(at, |deadline| deadline.min(at))
+    }
+
+    /// `at`, clipped to the whole-upgrade budget.
+    fn clip_upgrade(&self, at: u64) -> u64 {
+        self.upgrade_deadline.map_or(at, |deadline| deadline.min(at))
     }
 
     /// Earliest pending absolute deadline, for the driver's timer fold-in.
@@ -308,21 +396,50 @@ impl ConnectAttempt {
         if self.done {
             return None;
         }
-        let mut due = None;
-        if let RelayLeg::WaitStagger { until } = self.leg {
-            due = Some(until);
-        }
-        for deadline in [self.relay_deadline, self.punch_deadline]
-            .into_iter()
-            .flatten()
-        {
-            due = Some(due.map_or(deadline, |current| current.min(deadline)));
-        }
-        due
+        let stagger = match self.leg {
+            RelayLeg::WaitStagger { until } => Some(until),
+            _ => None,
+        };
+        [
+            stagger,
+            self.relay_deadline,
+            self.punch_deadline,
+            self.start_deadline,
+            self.exchange_deadline,
+            self.upgrade_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
-    /// Abandons the attempt silently, cleaning up any held streams.
+    /// Abandons the attempt silently, cleaning up any held streams and
+    /// closing its circuit.
     pub(crate) fn cancel(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
+        self.teardown_relay_leg(swarm, shared, now);
+        self.done = true;
+    }
+
+    /// The host's engine settled the attempt on `kept`: drop everything the
+    /// attempt still owns without closing that connection, and emit nothing
+    /// more for it. A circuit the attempt promoted that is not `kept` closes.
+    pub(crate) fn settled(
+        &mut self,
+        kept: ConnectionId,
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) {
+        if self.promoted == Some(kept) {
+            self.promoted = None;
+        }
+        self.cancel(swarm, shared, now);
+    }
+
+    /// Ends the attempt keeping its circuit: aborts punch dials, resets the
+    /// DCUtR stream, and disarms every timer.
+    fn release(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
+        self.promoted = None;
         self.teardown_relay_leg(swarm, shared, now);
         self.done = true;
     }
@@ -348,14 +465,9 @@ impl ConnectAttempt {
                 if let Some(relay) = self.relay_peer().cloned() {
                     shared.record_origin(conn_id, Path::Relayed { relay }, Some(self.id));
                 }
-                self.announce_relay_path(shared);
+                self.relay_deadline = None;
+                self.announce_relay_path(conn_id, shared, now);
                 if shared.config.force_relay {
-                    self.done = true;
-                } else if self.punch_settled {
-                    shared.push_event(NatEvent::FellBackToRelay {
-                        connect_id: self.id,
-                        peer: self.peer.clone(),
-                    });
                     self.done = true;
                 }
             }
@@ -371,6 +483,7 @@ impl ConnectAttempt {
             None => {
                 shared.record_origin(conn_id, path.clone(), Some(self.id));
                 self.best = Some(path.clone());
+                self.path_conn = Some(conn_id);
                 shared.push_event(NatEvent::PathEstablished {
                     connect_id: self.id,
                     peer: self.peer.clone(),
@@ -380,12 +493,16 @@ impl ConnectAttempt {
             Some(Path::Relayed { .. }) => {
                 shared.record_origin(conn_id, path.clone(), Some(self.id));
                 let from = self.best.replace(path.clone()).expect("checked Some above");
-                shared.push_event(NatEvent::PathUpgraded {
-                    connect_id: self.id,
-                    peer: self.peer.clone(),
-                    from,
-                    to: path,
-                });
+                if let Some(old_conn_id) = self.path_conn.replace(conn_id) {
+                    shared.push_event(NatEvent::PathUpgraded {
+                        connect_id: self.id,
+                        peer: self.peer.clone(),
+                        from,
+                        to: path,
+                        old_conn_id,
+                        new_conn_id: conn_id,
+                    });
+                }
             }
             // A second direct connection replacing the first — nothing new.
             Some(_) => return,
@@ -424,6 +541,9 @@ impl ConnectAttempt {
         }
         // `old` retires with the swarm; there is nothing left to close.
         self.promoted = (!new_owned).then_some(new);
+        if !new_owned {
+            self.path_conn = Some(new);
+        }
         // An adopted circuit carries the relayed path this attempt already
         // reported, so it takes that origin without a new path event.
         if !new_owned
@@ -432,15 +552,12 @@ impl ConnectAttempt {
         {
             shared.record_origin(new, Path::Relayed { relay }, Some(self.id));
         }
-        if self.dcutr_stream.is_some() {
-            self.finish_failed_dcutr("DCUtR circuit was replaced".into(), swarm, shared, now);
-        } else if new_owned {
-            shared.abort_attempt_dials(self.id, &self.peer, swarm);
-            shared.push_event(NatEvent::FellBackToRelay {
-                connect_id: self.id,
-                peer: self.peer.clone(),
-            });
-            self.done = true;
+        if new_owned {
+            let reason = "another attempt's circuit took over the peer's connection".into();
+            self.settle_relayed(UpgradeStop::Aborted { reason }, swarm, shared, now);
+        } else if self.dcutr_stream.is_some() {
+            // The round's exchange lived on `old`.
+            self.fail_round("DCUtR circuit was replaced".into(), swarm, shared, now);
         }
     }
 
@@ -464,6 +581,8 @@ impl ConnectAttempt {
             }
             self.promoted = None;
             self.bridge_alive = false;
+            // An open punch window may still land a direct connection; its
+            // end fails the attempt otherwise.
             if self.punch_deadline.is_some() {
                 self.last_error = Some(error);
                 return;
@@ -567,7 +686,7 @@ impl ConnectAttempt {
         // up still lifts the gate (`ConnectionEstablished` clears the
         // peer's entries), whereas a shorter lifetime would re-open the
         // duplicate-dial window while the handshake is still under way.
-        let deadline_ms = shared.config.relay_leg_deadline_ms;
+        let deadline_ms = shared.config.relay_timeout_ms;
         let purpose = DialPurpose::Relay(self.id, relay.clone());
         if let Err(reason) = shared.session_dial(swarm, purpose, relay, now, deadline_ms) {
             self.fail_relay_leg(NatError::DialFailed(reason), swarm, shared, now);
@@ -715,13 +834,13 @@ impl ConnectAttempt {
         if let RelayLeg::WaitStagger { until } = self.leg
             && now.monotonic_ms >= until
         {
-            self.begin_relay_leg(swarm, shared, now);
+            self.try_next_relay(swarm, shared, now);
         }
 
         if let Some(deadline) = self.relay_deadline
             && now.monotonic_ms >= deadline
         {
-            self.fail_relay_leg(NatError::Timeout, swarm, shared, now);
+            self.on_relay_timeout(deadline, swarm, shared, now);
         }
 
         // A shared dial the leg was waiting on can vanish without a result
@@ -733,7 +852,76 @@ impl ConnectAttempt {
         if let Some(deadline) = self.punch_deadline
             && now.monotonic_ms >= deadline
         {
-            self.on_punch_window_elapsed(swarm, shared, now);
+            self.punch_deadline = None;
+            self.round_failed(
+                "hole punch window elapsed without a direct connection".into(),
+                swarm,
+                shared,
+                now,
+            );
+        }
+
+        // A budget that ran out keeps the Relayed path; the stage that was
+        // waiting names why.
+        let due = |deadline: Option<u64>| deadline.is_some_and(|at| now.monotonic_ms >= at);
+        if self.done {
+            return;
+        }
+        let elapsed = |at: Option<u64>| at.unwrap_or(0).saturating_sub(self.relayed_at);
+        let stop = if due(self.start_deadline) {
+            Some(UpgradeStop::StartTimeout {
+                budget_ms: elapsed(self.start_deadline),
+            })
+        } else if due(self.exchange_deadline) {
+            Some(UpgradeStop::ExchangeTimeout {
+                round: self.rounds,
+                budget_ms: self
+                    .exchange_deadline
+                    .unwrap_or(0)
+                    .saturating_sub(self.exchange_started_at),
+            })
+        } else if due(self.upgrade_deadline) {
+            Some(UpgradeStop::UpgradeTimeout {
+                budget_ms: elapsed(self.upgrade_deadline),
+            })
+        } else {
+            None
+        };
+        if let Some(stop) = stop {
+            self.settle_relayed(stop, swarm, shared, now);
+        }
+    }
+
+    /// The current relay address ran out its budget in whatever step it
+    /// was in.
+    fn on_relay_timeout(
+        &mut self,
+        deadline: u64,
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) {
+        let stage = match self.leg {
+            RelayLeg::WaitHopReady { .. } => RelayStage::HopNegotiation,
+            RelayLeg::AwaitHopStatus { .. } => RelayStage::HopStatus,
+            RelayLeg::Bridged { .. } => RelayStage::CircuitHandshake,
+            _ => RelayStage::RelayDial,
+        };
+        let error = NatError::Timeout {
+            stage,
+            relay: self.relay_peer().cloned(),
+            elapsed_ms: now.monotonic_ms.saturating_sub(self.relay_started_at),
+            budget_ms: deadline.saturating_sub(self.relay_started_at),
+        };
+        if let RelayLeg::Bridged { .. } = self.leg {
+            // The circuit never finished its handshake: close it and move
+            // on like any other bridge failure.
+            if let Some(conn_id) = self.promoted.take() {
+                shared.push_action(NatAction::CloseCircuit { conn_id });
+            }
+            self.fail_bridge(error, swarm, shared, now);
+        } else {
+            self.fail_relay_leg(error, swarm, shared, now);
         }
     }
 
@@ -741,17 +929,10 @@ impl ConnectAttempt {
     // Relay leg
     // -----------------------------------------------------------------------
 
-    fn begin_relay_leg(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
-        let leg_deadline = now.monotonic_ms + shared.config.relay_leg_deadline_ms;
-        self.leg_deadline = self
-            .attempt_deadline
-            .map_or(leg_deadline, |attempt| attempt.min(leg_deadline));
-        self.try_next_relay(swarm, shared, now);
-    }
-
     /// Starts on the next untried relay entry. A relay reached for the first
-    /// time gets an even share of the leg's remaining time; its addresses
-    /// split what is left of that share. Callers check that one is left.
+    /// time gets [`NatConfig::relay_timeout_ms`](crate::NatConfig::relay_timeout_ms)
+    /// (clipped by the attempt's deadline); its addresses split what is left
+    /// of that. Callers check that one is left.
     ///
     /// Entries that fail at once (a refused dial or open) move straight on
     /// to the next one in this loop, so stack use stays flat however many
@@ -763,18 +944,7 @@ impl ConnectAttempt {
             };
             let relay_peer = relay.peer_id().clone();
             if !self.is_relay_peer(&relay_peer) {
-                // `relay_order` keeps a relay's addresses together, so each
-                // remaining peer appears once as a run.
-                let mut peers_left = 1;
-                let mut last = &relay_peer;
-                for entry in &self.untried {
-                    if entry.peer_id() != last {
-                        peers_left += 1;
-                        last = entry.peer_id();
-                    }
-                }
-                let remaining = self.leg_deadline.saturating_sub(now.monotonic_ms);
-                self.share_deadline = now.monotonic_ms + remaining / peers_left;
+                self.share_deadline = self.clip(now.monotonic_ms + shared.config.relay_timeout_ms);
             }
             let addrs_left = 1 + self
                 .untried
@@ -783,13 +953,18 @@ impl ConnectAttempt {
                 .count() as u64;
             let share_left = self.share_deadline.saturating_sub(now.monotonic_ms);
             self.relay_deadline = Some(now.monotonic_ms + share_left / addrs_left);
+            self.relay_started_at = now.monotonic_ms;
             self.relay = Some(relay.clone());
+            shared.push_event(NatEvent::RelayStarted {
+                connect_id: self.id,
+                relay: relay.clone(),
+            });
 
             // Connected, or another machine (reservation, probe) is already
             // dialing this relay: the acquisition waits for `PeerReady` on that
             // connection instead of dialing again.
             let purpose = DialPurpose::Relay(self.id, relay.clone());
-            let deadline_ms = shared.config.relay_leg_deadline_ms;
+            let deadline_ms = shared.config.relay_timeout_ms;
             let result = acquire::start(
                 &relay,
                 HOP_PROTOCOL_ID,
@@ -891,14 +1066,10 @@ impl ConnectAttempt {
         if self.relay_peer().is_none() {
             return;
         }
+        // The relay's budget stays armed through the circuit handshake.
         self.leg = RelayLeg::Bridged { conn, stream };
-        self.relay_deadline = None;
         self.bridge_alive = true;
         self.hop = None;
-
-        if shared.config.force_relay {
-            self.punch_settled = true;
-        }
         self.promote_bridge(shared);
     }
 
@@ -923,85 +1094,6 @@ impl ConnectAttempt {
             {
                 self.punch_conns.insert(conn_id);
             }
-        }
-        self.punch_dials_issued = true;
-    }
-
-    fn on_punch_window_elapsed(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
-        shared.push_event(NatEvent::HolePunchFailed {
-            connect_id: self.id,
-            attempt: self.punch_window,
-            reason: "hole punch window elapsed without a direct connection".into(),
-        });
-        let total_windows = 1 + shared.config.punch_max_retries;
-        if self.punch_window < total_windows {
-            self.punch_window += 1;
-            self.issue_punch_dials(swarm, shared);
-            self.punch_deadline = Some(now.monotonic_ms + shared.config.punch_deadline_ms);
-        } else {
-            self.punch_deadline = None;
-            self.settle_after_punch(swarm, shared, now);
-        }
-    }
-
-    /// The punch can never succeed (protocol error, no addresses): emit one
-    /// failure and settle immediately.
-    fn punch_failed_permanently(
-        &mut self,
-        reason: String,
-        swarm: &mut dyn NatSwarm,
-        shared: &mut Shared,
-        now: Now,
-    ) {
-        shared.push_event(NatEvent::HolePunchFailed {
-            connect_id: self.id,
-            attempt: self.punch_window.max(1),
-            reason,
-        });
-        self.punch_deadline = None;
-        self.settle_after_punch(swarm, shared, now);
-    }
-
-    /// The punch is over without a direct connection. If the bridge is
-    /// still standing, the relayed path is the final result; otherwise the
-    /// attempt has nothing left.
-    fn settle_after_punch(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
-        if self.done {
-            return;
-        }
-        self.teardown_dcutr_stream(swarm, shared, now);
-        if self.bridge_alive {
-            self.punch_settled = true;
-            if let RelayLeg::Bridged { .. } = self.leg {
-                self.promote_bridge(shared);
-                if self.best.is_some() {
-                    shared.push_event(NatEvent::FellBackToRelay {
-                        connect_id: self.id,
-                        peer: self.peer.clone(),
-                    });
-                    // Keep the provisional circuit; drop punch dials so a
-                    // late handshake cannot land after this attempt is reaped.
-                    shared.abort_attempt_dials(self.id, &self.peer, swarm);
-                    self.done = true;
-                }
-            }
-        } else if self.best.is_some() {
-            if self.punch_deadline.is_none() {
-                let error = self
-                    .last_error
-                    .take()
-                    .unwrap_or(NatError::DialFailed("promoted circuit closed".into()));
-                self.fail(error, swarm, shared, now);
-            }
-        } else if self.punch_deadline.is_some() {
-            // The relay leg is gone, but an active punch window can still
-            // establish the first usable path.
-        } else {
-            let error = self
-                .last_error
-                .take()
-                .unwrap_or(NatError::DialFailed("relay bridge lost".into()));
-            self.fail(error, swarm, shared, now);
         }
     }
 
@@ -1033,7 +1125,9 @@ impl ConnectAttempt {
         }
     }
 
-    fn announce_relay_path(&mut self, shared: &mut Shared) {
+    /// The circuit `conn_id` carries the attempt's first path; the upgrade
+    /// budgets start counting.
+    fn announce_relay_path(&mut self, conn_id: ConnectionId, shared: &mut Shared, now: Now) {
         if self.best.is_some() {
             return;
         }
@@ -1042,6 +1136,14 @@ impl ConnectAttempt {
         };
         let path = Path::Relayed { relay };
         self.best = Some(path.clone());
+        self.path_conn = Some(conn_id);
+        if !shared.config.force_relay {
+            self.relayed_at = now.monotonic_ms;
+            self.upgrade_deadline =
+                Some(self.clip(now.monotonic_ms + shared.config.upgrade_timeout_ms));
+            self.start_deadline =
+                Some(self.clip_upgrade(now.monotonic_ms + shared.config.dcutr_start_timeout_ms));
+        }
         shared.push_event(NatEvent::PathEstablished {
             connect_id: self.id,
             peer: self.peer.clone(),
@@ -1110,6 +1212,11 @@ impl ConnectAttempt {
         now: Now,
     ) {
         match result {
+            // The leg gave up on this bridge while the promotion was in
+            // flight: the circuit it produced has no owner.
+            Ok(conn_id) if !self.promotion_requested || self.done => {
+                shared.push_action(NatAction::CloseCircuit { conn_id });
+            }
             Ok(conn_id) => self.promoted = Some(conn_id),
             Err(PromoteError::PeerAlreadyDirect) => {
                 self.bridge_alive = false;
@@ -1140,8 +1247,8 @@ impl ConnectAttempt {
         self.fail_relay_leg(error, swarm, shared, now);
     }
 
-    /// The current relay failed: move on to the next one while the leg has
-    /// time left, otherwise fail the leg with `error`.
+    /// The current relay failed: move on to the next one while the attempt
+    /// has time left, otherwise fail the leg with `error`.
     fn fail_relay_leg(
         &mut self,
         error: NatError,
@@ -1156,8 +1263,9 @@ impl ConnectAttempt {
         }
     }
 
-    /// Ends the current relay entry with `error`. `true` when another entry
-    /// is left to try within the leg's deadline.
+    /// Ends the current relay entry with `error`, reporting it as
+    /// [`NatEvent::RelayFailed`]. `true` when another entry is left to try
+    /// within the attempt's deadline.
     ///
     /// Other addresses of the same relay stay eligible only while the relay
     /// is unreached: once connected, every entry for it would reuse that
@@ -1183,8 +1291,18 @@ impl ConnectAttempt {
         self.leg = RelayLeg::Failed;
         self.relay_deadline = None;
         self.hop = None;
+        if let Some(relay) = self.relay.clone() {
+            shared.push_event(NatEvent::RelayFailed {
+                connect_id: self.id,
+                relay,
+                error: error.clone(),
+            });
+        }
         self.last_error = Some(error);
-        !self.untried.is_empty() && now.monotonic_ms < self.leg_deadline
+        !self.untried.is_empty()
+            && self
+                .attempt_deadline
+                .is_none_or(|deadline| now.monotonic_ms < deadline)
     }
 
     fn fail_if_no_legs_remain(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {

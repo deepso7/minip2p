@@ -86,6 +86,17 @@ pub trait NatSwarm {
         now_ms: u64,
     ) -> Result<(), NatSwarmError>;
 
+    /// Whether bytes the agent wrote on this stream are still held by the
+    /// host, waiting for the stream to become writable again. A host that
+    /// holds write tails reports when one has fully drained through
+    /// [`NatAgent::write_completed`](crate::NatAgent::write_completed); the
+    /// agent times DCUtR's RTT from then rather than from when the bytes
+    /// were queued. The bare swarm never holds a tail.
+    fn write_pending(&self, conn_id: ConnectionId, stream_id: StreamId) -> bool {
+        let _ = (conn_id, stream_id);
+        false
+    }
+
     /// Half-closes a stream's write side. Transport failures arrive later
     /// as swarm events.
     fn close_stream_write(

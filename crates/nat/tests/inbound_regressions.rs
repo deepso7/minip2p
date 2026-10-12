@@ -74,7 +74,7 @@ fn open_dcutr(h: &mut Harness, conn: ConnectionId, actions: &[Out]) -> StreamId 
 #[test]
 fn silent_inbound_dcutr_exchange_times_out_and_resets_the_stream() {
     let mut h = inbound_harness(NatConfig {
-        relay_leg_deadline_ms: 5,
+        relay_timeout_ms: 5,
         ..NatConfig::default()
     });
     let (conn, actions) = drive_to_relayed(&mut h);
@@ -364,7 +364,7 @@ fn inbound_direct_replacement_after_the_circuit_finished_reports_the_upgrade() {
     );
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
-        [NatEvent::InboundDirectUpgrade { peer }] if *peer == target
+        [NatEvent::InboundDirectUpgrade { peer, .. }] if *peer == target
     ));
     assert_eq!(h.agent.path(&target), Some(&Path::DirectDialed));
 }
