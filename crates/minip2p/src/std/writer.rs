@@ -56,6 +56,10 @@ pub enum StreamWriteError {
     /// Retryable once held writes complete; `unsent` is the whole payload.
     #[error("stream writer budget exceeded: {} bytes, {available} available", unsent.len())]
     OverBudget { unsent: Bytes, available: usize },
+    /// The payload is larger than the writer's whole budget, so it can never
+    /// be admitted; split it. `unsent` is the whole payload.
+    #[error("{} bytes exceed the stream writer's {budget}-byte budget", unsent.len())]
+    TooLarge { unsent: Bytes, budget: usize },
     /// The write side is closing behind a pending write and takes no more.
     #[error("stream {stream_id} on connection {conn_id} is closing its write side")]
     Closing {
@@ -74,7 +78,7 @@ impl StreamWriteError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Busy { .. } | Self::OverBudget { .. } => true,
-            Self::Closing { .. } => false,
+            Self::TooLarge { .. } | Self::Closing { .. } => false,
             Self::Endpoint(error) => error.is_retryable(),
         }
     }
@@ -160,9 +164,10 @@ impl StreamWriter {
     ///
     /// Fails with [`StreamWriteError::Busy`] while the stream has a pending
     /// write, [`StreamWriteError::Closing`] after a deferred
-    /// [`close_write`](Self::close_write), and
-    /// [`StreamWriteError::OverBudget`] when the payload does not fit the
-    /// budget; none of them sends anything.
+    /// [`close_write`](Self::close_write), [`StreamWriteError::OverBudget`]
+    /// when the payload does not fit what is left of the budget, and
+    /// [`StreamWriteError::TooLarge`] when it exceeds the whole budget; none
+    /// of them sends anything.
     pub fn write(
         &mut self,
         endpoint: &mut Endpoint,
@@ -180,6 +185,12 @@ impl StreamWriter {
                     stream_id,
                     unsent: data,
                 }
+            });
+        }
+        if data.len() > self.budget {
+            return Err(StreamWriteError::TooLarge {
+                unsent: data,
+                budget: self.budget,
             });
         }
         let available = self.budget - self.held;

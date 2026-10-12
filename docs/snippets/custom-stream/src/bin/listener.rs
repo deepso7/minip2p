@@ -45,14 +45,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 data,
                 ..
             } if echo_streams.remove(&(conn_id, stream_id)) => {
-                // The FIN waits for every byte of the echo.
-                writer.write(&mut node, conn_id, stream_id, data)?;
-                writer.close_write(&mut node, conn_id, stream_id)?;
+                // The FIN waits for every byte of the echo. A failure ends
+                // this stream, not the listener.
+                let echoed = writer
+                    .write(&mut node, conn_id, stream_id, data)
+                    .and_then(|_| writer.close_write(&mut node, conn_id, stream_id));
+                if let Err(error) = echoed {
+                    eprintln!("echo on stream {stream_id} failed: {error}");
+                    writer.forget(conn_id, stream_id);
+                    let _ = node.reset_stream(conn_id, stream_id);
+                }
             }
             EndpointEvent::StreamRemoteWriteClosed {
                 conn_id, stream_id, ..
             } if echo_streams.remove(&(conn_id, stream_id)) => {
-                writer.close_write(&mut node, conn_id, stream_id)?;
+                if let Err(error) = writer.close_write(&mut node, conn_id, stream_id) {
+                    eprintln!("closing stream {stream_id} failed: {error}");
+                }
             }
             EndpointEvent::StreamClosed {
                 conn_id, stream_id, ..

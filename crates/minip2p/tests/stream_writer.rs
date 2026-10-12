@@ -150,6 +150,15 @@ fn a_held_tail_is_dropped_when_its_stream_or_connection_ends() {
             .expect("write"),
         WriteProgress::Pending
     );
+    // The held tail is charged against the budget, so a write that only
+    // fits the whole budget must wait for it (checked before any send).
+    let waiting = streams
+        .write(&mut writer, conn_id, StreamId::new(u64::MAX), payload())
+        .expect_err("the held tail uses part of the budget");
+    assert!(
+        matches!(waiting, StreamWriteError::OverBudget { .. }) && waiting.is_retryable(),
+        "{waiting:?}"
+    );
     let replaced = EndpointEvent::ConnectionReplaced {
         peer_id: reader.peer_id().clone(),
         old: conn_id,
@@ -196,11 +205,12 @@ fn a_write_past_the_budget_is_refused_before_anything_is_sent() {
 
     let refused = streams
         .write(&mut writer, conn_id, stream_id, vec![0; 17])
-        .expect_err("over budget");
+        .expect_err("larger than the whole budget");
     assert!(
-        matches!(refused, StreamWriteError::OverBudget { ref unsent, available: 16 } if unsent.len() == 17),
+        matches!(refused, StreamWriteError::TooLarge { ref unsent, budget: 16 } if unsent.len() == 17),
         "{refused:?}"
     );
+    assert!(!refused.is_retryable(), "it can never be admitted");
     assert_eq!(
         streams
             .write(&mut writer, conn_id, stream_id, vec![0; 16])

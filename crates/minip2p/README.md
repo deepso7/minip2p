@@ -236,7 +236,7 @@ A `?` on `send_stream` drops the tail:
 endpoint.send_stream(conn_id, stream_id, chunk)?; // a Full here loses `unsent`
 ```
 
-`StreamWriter` does the holding for you: one pending write per stream within an explicit byte budget, the tail resent on `StreamWritable`, and a `close_write` that sends the FIN only once the tail is accepted. Feed it every event; it drops its state when the stream ends or the connection closes or is replaced. Its `WriteAccepted` means the whole payload was accepted locally, never delivered.
+On the std `Endpoint`, `StreamWriter` does the holding for you (`PortableEndpoint` callers hold the tail themselves): one pending write per stream within an explicit byte budget, the tail resent on `StreamWritable`, and a `close_write` that sends the FIN only once the tail is accepted. Feed it every event; it drops its state when the stream ends or the connection closes or is replaced. Its `WriteAccepted` means the whole payload was accepted locally, never delivered.
 
 ```rust,ignore
 use minip2p::{StreamWriter, WriteProgress};

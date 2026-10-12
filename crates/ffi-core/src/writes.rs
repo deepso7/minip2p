@@ -25,12 +25,18 @@ pub(crate) fn writer() -> StreamWriter {
 /// [`FfiError::InvalidState`].
 pub(crate) fn map_write_error(error: StreamWriteError) -> FfiError {
     match error {
+        // The unbounded budget never refuses for size; mapped all the same.
+        StreamWriteError::Busy { .. }
+        | StreamWriteError::OverBudget { .. }
+        | StreamWriteError::TooLarge { .. } => FfiError::Backpressure,
         StreamWriteError::Closing { stream_id, .. } => FfiError::InvalidState {
             detail: format!("stream {stream_id} write side is closing"),
         },
         StreamWriteError::Endpoint(error) => crate::endpoint::map_driver_error(error),
-        // Busy and OverBudget; the writer has no other refusal.
-        _ => FfiError::Backpressure,
+        // A refusal this core predates.
+        error => FfiError::InvalidState {
+            detail: error.to_string(),
+        },
     }
 }
 

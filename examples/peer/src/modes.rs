@@ -45,7 +45,6 @@ impl Default for Echoes {
     fn default() -> Self {
         Self {
             streams: HashMap::new(),
-            // Echo traffic is small; this caps what one slow peer can park.
             writer: StreamWriter::new(ECHO_WRITE_BUDGET),
         }
     }
@@ -56,8 +55,13 @@ const AGENT: &str = "minip2p-peer/0.1.0";
 const ECHO_PROTOCOL: &str = "/minip2p/echo/1";
 /// One ping frame: 8-byte seq (BE) ++ 8-byte send-timestamp millis (BE).
 const FRAME_LEN: usize = 16;
-/// The most echo bytes the listener holds for slow readers.
-const ECHO_WRITE_BUDGET: usize = 1024 * 1024;
+/// The most bytes one echo stream may queue behind its pending write (so it
+/// owes its peer at most twice this); a peer that sends more without reading
+/// is reset.
+const ECHO_STREAM_LIMIT: usize = 64 * 1024;
+/// The most echo bytes the writer holds across every stream; a stream it
+/// cannot admit is reset like an overflowing one.
+const ECHO_WRITE_BUDGET: usize = 16 * 1024 * 1024;
 /// The most ping bytes a channel holds while its stream is full: room for
 /// every outstanding frame of a long run.
 const PING_WRITE_BUDGET: usize = 1024 * 1024;
@@ -280,8 +284,12 @@ fn handle_listen_event(endpoint: &mut Endpoint, event: &EndpointEvent, echoes: &
         } => {
             let key = (*conn_id, *stream_id);
             if let Some(echo) = echoes.streams.get_mut(&key) {
-                echo.backlog.extend_from_slice(data);
-                flush_echo(endpoint, key, echoes);
+                if echo.backlog.len() + data.len() > ECHO_STREAM_LIMIT {
+                    drop_echo(endpoint, key, echoes, "the peer is not reading its echo");
+                } else {
+                    echo.backlog.extend_from_slice(data);
+                    flush_echo(endpoint, key, echoes);
+                }
             }
         }
         EndpointEvent::StreamRemoteWriteClosed {
@@ -310,8 +318,7 @@ fn handle_listen_event(endpoint: &mut Endpoint, event: &EndpointEvent, echoes: &
 
 /// Sends an echo stream's backlog once its previous write is accepted, then
 /// mirrors the peer's FIN behind it. A full stream is not a dead one: the
-/// writer holds the unsent tail and this runs again on its acceptance. A
-/// failed send means the stream died under us, so it is just untracked.
+/// writer holds the unsent tail and this runs again on its acceptance.
 fn flush_echo(endpoint: &mut Endpoint, key: EchoStream, echoes: &mut Echoes) {
     let (conn, stream) = key;
     if echoes.writer.is_pending(conn, stream) {
@@ -332,8 +339,20 @@ fn flush_echo(endpoint: &mut Endpoint, key: EchoStream, echoes: &mut Echoes) {
         echoes.streams.remove(&key);
     }
     if let Err(e) = result {
-        eprintln!("[listen] echo failed conn={conn} stream={stream}: {e}");
-        echoes.streams.remove(&key);
+        drop_echo(endpoint, key, echoes, &e.to_string());
+    }
+}
+
+/// Gives up on an echo stream: resets it, so the peer learns the echo
+/// stopped, and forgets what it still owed.
+fn drop_echo(endpoint: &mut Endpoint, key: EchoStream, echoes: &mut Echoes, why: &str) {
+    let (conn, stream) = key;
+    eprintln!("[listen] echo failed conn={conn} stream={stream}: {why}");
+    echoes.streams.remove(&key);
+    echoes.writer.forget(conn, stream);
+    // A stream that is already gone has nothing left to reset.
+    match endpoint.reset_stream(conn, stream) {
+        Ok(()) | Err(_) => {}
     }
 }
 
@@ -365,6 +384,11 @@ impl Channel {
         self.writer
             .write(endpoint, self.conn, self.stream, data)
             .map(drop)
+    }
+
+    /// Half-closes the channel, after any frame the writer still holds.
+    fn close_write(&mut self, endpoint: &mut Endpoint) -> Result<(), StreamWriteError> {
+        self.writer.close_write(endpoint, self.conn, self.stream)
     }
 }
 
@@ -638,8 +662,7 @@ fn open_direct_channel(
     }
     if drain_deadline.is_some() {
         channel
-            .writer
-            .close_write(endpoint, channel.conn, channel.stream)
+            .close_write(endpoint)
             .map_err(|e| format!("close after channel switch: {e}"))?;
     }
     Ok(channel)
@@ -736,8 +759,7 @@ fn ping_loop(
                 // Graceful teardown: half-close so the listener echoes
                 // everything already sent, then mirrors the close.
                 channel
-                    .writer
-                    .close_write(endpoint, channel.conn, channel.stream)
+                    .close_write(endpoint)
                     .map_err(|e| format!("close after final ping: {e}"))?;
                 drain_deadline = Some(Instant::now() + DRAIN_DEADLINE);
             }

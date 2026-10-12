@@ -107,9 +107,16 @@ match event {
         data,
         ..
     } if echo_streams.remove(&(conn_id, stream_id)) => {
-        // The FIN waits for every byte of the echo.
-        writer.write(&mut node, conn_id, stream_id, data)?;
-        writer.close_write(&mut node, conn_id, stream_id)?;
+        // The FIN waits for every byte of the echo. A failure ends this
+        // stream, not the listener.
+        let echoed = writer
+            .write(&mut node, conn_id, stream_id, data)
+            .and_then(|_| writer.close_write(&mut node, conn_id, stream_id));
+        if let Err(error) = echoed {
+            eprintln!("echo on stream {stream_id} failed: {error}");
+            writer.forget(conn_id, stream_id);
+            let _ = node.reset_stream(conn_id, stream_id);
+        }
     }
     _ => {}
 }
@@ -123,7 +130,7 @@ match event {
 node.send_stream(conn_id, stream_id, payload)?; // a Full here loses `unsent`
 ```
 
-Most applications want `StreamWriter` instead. It holds one pending write per stream within a byte budget you choose, resends the tail on `StreamWritable`, and makes `close_write` send the FIN only after the tail is accepted:
+Most applications on the std `Endpoint` want `StreamWriter` instead (`PortableEndpoint` callers hold the tail themselves). It holds one pending write per stream within a byte budget you choose, resends the tail on `StreamWritable`, and makes `close_write` send the FIN only after the tail is accepted:
 
 ```rust
 use minip2p::{StreamWriter, WriteProgress};
