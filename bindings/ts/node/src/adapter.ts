@@ -403,6 +403,9 @@ function normalizeNativeValue(
   key?: string
 ): unknown {
   if (typeof value === "bigint" || typeof value === "number") {
+    if (key === "oldConnId") {
+      return maps.connectionIds.toPublicOrRetired(BigInt(value));
+    }
     if (key !== undefined && CONNECTION_ID_KEYS.has(key)) {
       return maps.connectionIds.toPublic(BigInt(value));
     }

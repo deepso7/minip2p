@@ -968,7 +968,8 @@ impl<'a, T: Transport, R: EntropySource> EndpointSwarm<'a, T, R> {
     }
 
     /// Resends a writable stream's held tails, then its deferred close.
-    /// `true` when bytes were held and the stream took all of them.
+    /// `true` when bytes were held and the stream took all of them; a
+    /// rejected resend is not a completed write.
     fn replay_held(
         &mut self,
         peer: &PeerId,
@@ -982,17 +983,18 @@ impl<'a, T: Transport, R: EntropySource> EndpointSwarm<'a, T, R> {
         let had_bytes = !held.tails.is_empty();
         // Failures surface through the agent's own timeouts and the swarm's
         // events, as for the first write.
+        let mut all_sent = true;
         for data in held.tails {
-            match self.send_or_hold(peer, conn_id, stream_id, data, now_ms) {
-                Ok(()) | Err(_) => {}
-            }
+            all_sent &= self
+                .send_or_hold(peer, conn_id, stream_id, data, now_ms)
+                .is_ok();
         }
         if held.close {
             match self.close_or_hold(peer, conn_id, stream_id, now_ms) {
                 Ok(()) | Err(_) => {}
             }
         }
-        had_bytes && self.io.held.held_bytes(conn_id, stream_id) == 0
+        had_bytes && all_sent && self.io.held.held_bytes(conn_id, stream_id) == 0
     }
 }
 

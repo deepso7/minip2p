@@ -516,11 +516,12 @@ function normalizeBigInts(
     if (key === "errorCode") {
       return value;
     }
-    return key !== undefined &&
-      CONNECTION_ID_KEYS.has(key) &&
-      connectionIds !== undefined
-      ? connectionIds.toPublic(value)
-      : u64ToNumber(value, "native u64");
+    if (key === undefined || !CONNECTION_ID_KEYS.has(key) || !connectionIds) {
+      return u64ToNumber(value, "native u64");
+    }
+    return key === "oldConnId"
+      ? connectionIds.toPublicOrRetired(value)
+      : connectionIds.toPublic(value);
   }
   if (value instanceof ArrayBuffer) {
     return value;

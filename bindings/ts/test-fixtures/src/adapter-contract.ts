@@ -280,6 +280,44 @@ export function describeAdapterContract(
       endpoint.close();
     });
 
+    test("an upgrade event after ConnectionReplaced names the replaced connection's public ID", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      const established: number[] = [];
+      const upgrades: {
+        readonly oldConnId: number;
+        readonly newConnId: number;
+      }[] = [];
+      endpoint.on("connectionEstablished", ({ connId }) =>
+        established.push(connId)
+      );
+      endpoint.on("inboundDirectUpgrade", (event) => upgrades.push(event));
+      native.deliver([
+        {
+          inner: { connId: CONN_ID, peerId: PEER },
+          tag: "ConnectionEstablished",
+        },
+      ]);
+      await drained();
+      native.deliver([
+        {
+          inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
+          tag: "ConnectionReplaced",
+        },
+        {
+          inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
+          tag: "InboundDirectUpgrade",
+        },
+      ]);
+      await drained();
+
+      expect(upgrades).toHaveLength(1);
+      expect(upgrades[0]?.oldConnId).toBe(established[0]);
+      expect(upgrades[0]?.newConnId).not.toBe(established[0]);
+      endpoint.close();
+    });
+
     test("a write on a connection native already replaced throws instead of reaching the new one", async () => {
       vi.useFakeTimers();
       const endpoint = harness.create();
