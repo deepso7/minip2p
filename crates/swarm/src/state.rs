@@ -388,6 +388,10 @@ pub(crate) struct SwarmState {
     /// User streams whose write the core refused because `held` had bytes for
     /// them; they get a `StreamWritable` once `held` is replayed.
     user_writable_wanted: BTreeSet<(ConnectionId, StreamId)>,
+    /// User streams whose write side the application closed or reset: no
+    /// `StreamWritable` reaches them, even one the transport had already
+    /// queued. Cleared when the stream closes.
+    user_write_ended: BTreeSet<(ConnectionId, StreamId)>,
 
     // --- Queues ---
     /// The application event queue. An event here has not been delivered:
@@ -458,6 +462,7 @@ impl SwarmState {
             events: VecDeque::new(),
             held: HeldWrites::new(),
             user_writable_wanted: BTreeSet::new(),
+            user_write_ended: BTreeSet::new(),
             actions: VecDeque::new(),
             deferred_closes: VecDeque::new(),
         }
@@ -674,7 +679,7 @@ impl SwarmState {
                 return;
             }
         }
-        if self.abandoned_streams.contains(&key) {
+        if self.abandoned_streams.contains(&key) || self.user_write_ended.contains(&key) {
             return;
         }
         if let Some(ProtocolKind::User(_)) = self.stream_protocol(conn_id, stream_id) {
@@ -852,6 +857,7 @@ impl SwarmState {
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
         self.require_user_stream(peer_id, conn_id, stream_id)?;
+        self.end_user_writes(conn_id, stream_id);
         self.actions
             .push_back(Action::CloseStreamWrite { conn_id, stream_id });
         Ok(())
@@ -865,11 +871,27 @@ impl SwarmState {
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
         self.require_user_stream(peer_id, conn_id, stream_id)?;
+        self.end_user_writes(conn_id, stream_id);
         if self.reset_pending.insert((conn_id, stream_id)) {
             self.actions
                 .push_back(Action::ResetStream { conn_id, stream_id });
         }
         Ok(())
+    }
+
+    /// The application closed or reset the stream's write side: drop its
+    /// queued `StreamWritable` notices and disarm later ones.
+    fn end_user_writes(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        let key = (conn_id, stream_id);
+        self.user_writable_wanted.remove(&key);
+        self.user_write_ended.insert(key);
+        self.events.retain(|event| {
+            !matches!(
+                event,
+                SwarmEvent::StreamWritable { conn_id: c, stream_id: s, .. }
+                    if (*c, *s) == key
+            )
+        });
     }
 
     /// Reports that the transport rejected a queued stream reset.
@@ -905,6 +927,7 @@ impl SwarmState {
         self.reset_pending.remove(&key);
         self.abandoned_streams.remove(&key);
         self.user_writable_wanted.remove(&key);
+        self.user_write_ended.remove(&key);
         let mut owed = self
             .held
             .take(conn_id, stream_id)
@@ -2096,6 +2119,7 @@ impl SwarmState {
         let key = (conn_id, stream_id);
 
         self.reset_pending.remove(&key);
+        self.user_write_ended.remove(&key);
         self.forget_held(conn_id, stream_id);
         if self.abandoned_streams.remove(&key) {
             self.inbound_negotiators.remove(&key);
@@ -2179,6 +2203,7 @@ impl SwarmState {
     fn forget_connection_streams(&mut self, conn_id: ConnectionId) {
         self.held.forget_connection(conn_id);
         self.user_writable_wanted.retain(|(cid, _)| *cid != conn_id);
+        self.user_write_ended.retain(|(cid, _)| *cid != conn_id);
         self.stream_owner.retain(|key, _| key.conn_id != conn_id);
         self.reset_pending.retain(|(cid, _)| *cid != conn_id);
         self.abandoned_streams.retain(|(cid, _)| *cid != conn_id);
@@ -3640,6 +3665,49 @@ mod tests {
         assert!(
             !core.user_writable_wanted.contains(&(conn_id, stream_id)),
             "a closing stream never waits for a Writable"
+        );
+    }
+
+    #[test]
+    fn closing_or_resetting_a_stream_ends_its_writable_notices() {
+        const PROTOCOL: &str = "/test/1";
+        let mut core = test_core();
+        core.add_protocol(PROTOCOL).expect("register protocol");
+        let peer_id = PeerId::from_public_key_protobuf(b"slow-reader");
+        let conn_id = ConnectionId::new(7);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        let closed = StreamId::new(3);
+        let reset = StreamId::new(5);
+        for stream_id in [closed, reset] {
+            core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User(PROTOCOL.to_string()));
+            // One notice already queued, and one still in the transport.
+            feed(
+                &mut core,
+                TransportEvent::StreamWritable {
+                    id: conn_id,
+                    stream_id,
+                },
+            );
+        }
+
+        core.close_stream_write(&peer_id, conn_id, closed)
+            .expect("close is accepted");
+        core.reset_stream(&peer_id, conn_id, reset)
+            .expect("reset is accepted");
+        for stream_id in [closed, reset] {
+            feed(
+                &mut core,
+                TransportEvent::StreamWritable {
+                    id: conn_id,
+                    stream_id,
+                },
+            );
+        }
+
+        assert!(
+            drain_events(&mut core).is_empty(),
+            "no Writable reaches a stream the app closed or reset"
         );
     }
 

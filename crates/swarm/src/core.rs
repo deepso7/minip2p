@@ -604,8 +604,9 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// Half-closes the write side of a user stream.
     ///
     /// The FIN follows every write the transport accepted. A caller holding
-    /// an unsent tail of its own must send it before closing. A transport
-    /// failure arrives as [`SwarmEvent::Error`].
+    /// an unsent tail of its own must send it before closing. No
+    /// [`SwarmEvent::StreamWritable`] for the stream follows, including one
+    /// already queued. A transport failure arrives as [`SwarmEvent::Error`].
     pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
@@ -620,7 +621,8 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
 
     /// Resets (abruptly closes) a user stream.
     ///
-    /// A transport failure arrives as [`SwarmEvent::Error`], and the reset
+    /// No [`SwarmEvent::StreamWritable`] for the stream follows, including
+    /// one already queued. A transport failure arrives as [`SwarmEvent::Error`], and the reset
     /// may be retried.
     pub fn reset_stream(
         &mut self,
