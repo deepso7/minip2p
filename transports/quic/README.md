@@ -57,7 +57,7 @@ let peer_addr = PeerAddr::new(listen_addrs[0].clone(), listener_key.peer_id())?;
 let conn_id = dialer.dial(&peer_addr)?;
 
 // Drive both ends until the handshake completes; a real host waits on
-// on its shared readiness poll and `next_deadline()` between polls.
+// its shared readiness poll and `next_deadline()` between polls.
 let mut clock = StdClock::new();
 let mut connected = false;
 while !connected {

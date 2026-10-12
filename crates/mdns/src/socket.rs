@@ -270,7 +270,13 @@ impl PollSource for MdnsSockets {
     fn attach(&mut self, registry: Registry, tokens: TokenSpace, _: Arc<Waker>) -> io::Result<()> {
         let registration = Registration { registry, tokens };
         for (index, pair) in self.pairs.iter_mut().enumerate() {
-            registration.register(index, pair, true)?;
+            if let Err(error) = registration.register(index, pair, true) {
+                // All or nothing, so a later attach starts from scratch.
+                for registered in self.pairs.iter_mut().take(index) {
+                    drop(registration.registry.deregister(&mut registered.receive));
+                }
+                return Err(error);
+            }
         }
         self.registration = Some(registration);
         Ok(())

@@ -738,6 +738,10 @@ impl Endpoint {
         // A taken host wake owes one more batch, which is what reads the
         // edge-triggered mDNS sockets; a passed deadline must not skip it.
         let mut woken = false;
+        // Past the deadline only one such batch runs: a steady stream of
+        // wakes (packets mDNS reads and drops) must not hold the caller.
+        // Newer wakes stay pending for the next call.
+        let mut woke_past_deadline = false;
         loop {
             if let Some(event) = self.engine.pop_event() {
                 return Ok(EndpointWaitOutcome::Event(event));
@@ -754,6 +758,7 @@ impl Endpoint {
             let now = self.now();
             self.resolve_names(now);
             drove_past_deadline |= deadline.has_passed();
+            woke_past_deadline |= woken && deadline.has_passed();
             woken = false;
             self.drive(now)?;
             if !self.engine.events.is_empty() {
@@ -766,7 +771,7 @@ impl Endpoint {
             if self.poll.take_interrupt() {
                 return Ok(EndpointWaitOutcome::Interrupted);
             }
-            if self.poll.take_wake() {
+            if !(woke_past_deadline && deadline.has_passed()) && self.poll.take_wake() {
                 (harvested, woken) = (false, true);
                 continue;
             }
@@ -3258,6 +3263,41 @@ mod tests {
             endpoint.wait(past_instant()).expect("wait past deadline"),
             EndpointWaitOutcome::Deadline
         ));
+    }
+
+    /// A steady stream of host wakes cannot hold a wait past its deadline:
+    /// it runs at most one batch for them, and newer wakes stay pending.
+    #[test]
+    fn a_stream_of_wakes_does_not_hold_a_wait_past_its_deadline() {
+        let mut endpoint = quic_endpoint();
+        let wake = endpoint.poll.wake_handle();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waker = {
+            let (stop, sent) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&sent));
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    wake.wake();
+                    sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::yield_now();
+                }
+            })
+        };
+        // The stream is flowing before the wait starts.
+        while sent.load(std::sync::atomic::Ordering::Relaxed) < 100 {
+            std::thread::yield_now();
+        }
+        let passes = endpoint.engine.stats.capability_passes;
+        let outcome = endpoint.wait(past_instant()).expect("wait past deadline");
+        let batches = endpoint.engine.stats.capability_passes - passes;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        waker.join().expect("waker thread");
+        assert!(
+            matches!(outcome, EndpointWaitOutcome::Deadline),
+            "{outcome:?}"
+        );
+        // The one drive every wait makes, plus at most one for a wake.
+        assert!(batches <= 2, "ran {batches} batches past the deadline");
     }
 
     #[cfg(feature = "nat")]
