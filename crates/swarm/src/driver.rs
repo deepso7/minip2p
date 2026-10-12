@@ -59,7 +59,8 @@ pub const RUN_UNTIL_SKIP_LIMIT: usize = 1024;
 /// freezes the clock to exercise protocol timers still wants its own waits to
 /// end. The platform type is when a *component* next needs attention, on the
 /// monotonic timeline of the samples the driver hands out, and is what
-/// [`Transport::next_deadline`] reports.
+/// [`Transport::next_deadline`](minip2p_transport::Transport::next_deadline)
+/// reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadline {
     at: Option<Instant>,

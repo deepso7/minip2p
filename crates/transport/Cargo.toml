@@ -15,12 +15,7 @@ workspace = true
 
 [features]
 default = ["std"]
-std = [
-  "dep:mio",
-  "minip2p-core/std",
-  "minip2p-platform/std",
-  "thiserror/std",
-]
+std = ["dep:mio", "minip2p-core/std", "minip2p-platform/std", "thiserror/std"]
 # Bench-only `SharedPoll` wait counters; see `minip2p_transport::bench`.
 bench = ["std"]
 
