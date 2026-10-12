@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_dcutr::{DcutrError, DcutrResponder, DcutrResponderOutput, ResponderEvent};
+use minip2p_platform::Now;
 use minip2p_relay::{ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectOutput, RelayError};
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -15,7 +16,7 @@ use crate::agent::{
 use crate::events::{BridgeRole, NatAction, NatEvent};
 use crate::inbound::select_global_punch_candidates;
 use crate::swarm::NatSwarm;
-use crate::types::{NatError, Now, Path, PromoteError};
+use crate::types::{NatError, Path, PromoteError};
 
 /// Progress of the relay leg of a connect attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,7 +168,7 @@ impl ConnectAttempt {
                 attempt.begin_relay_leg(swarm, shared, now);
             } else {
                 attempt.leg = RelayLeg::WaitStagger {
-                    until: now.mono_ms + stagger,
+                    until: now.monotonic_ms + stagger,
                 };
             }
         }
@@ -270,7 +271,8 @@ impl ConnectAttempt {
                     } else {
                         self.issue_punch_dials(swarm, shared);
                         self.punch_window = 1;
-                        self.punch_deadline = Some(now.mono_ms + shared.config.punch_deadline_ms);
+                        self.punch_deadline =
+                            Some(now.monotonic_ms + shared.config.punch_deadline_ms);
                     }
                 }
             }
@@ -547,7 +549,7 @@ impl ConnectAttempt {
         }
         if self
             .relay_deadline
-            .is_none_or(|deadline| now.mono_ms >= deadline)
+            .is_none_or(|deadline| now.monotonic_ms >= deadline)
         {
             return;
         }
@@ -711,13 +713,13 @@ impl ConnectAttempt {
         }
 
         if let RelayLeg::WaitStagger { until } = self.leg
-            && now.mono_ms >= until
+            && now.monotonic_ms >= until
         {
             self.begin_relay_leg(swarm, shared, now);
         }
 
         if let Some(deadline) = self.relay_deadline
-            && now.mono_ms >= deadline
+            && now.monotonic_ms >= deadline
         {
             self.fail_relay_leg(NatError::Timeout, swarm, shared, now);
         }
@@ -729,7 +731,7 @@ impl ConnectAttempt {
         self.redrive_relay_leg(swarm, shared, now);
 
         if let Some(deadline) = self.punch_deadline
-            && now.mono_ms >= deadline
+            && now.monotonic_ms >= deadline
         {
             self.on_punch_window_elapsed(swarm, shared, now);
         }
@@ -740,7 +742,7 @@ impl ConnectAttempt {
     // -----------------------------------------------------------------------
 
     fn begin_relay_leg(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
-        let leg_deadline = now.mono_ms + shared.config.relay_leg_deadline_ms;
+        let leg_deadline = now.monotonic_ms + shared.config.relay_leg_deadline_ms;
         self.leg_deadline = self
             .attempt_deadline
             .map_or(leg_deadline, |attempt| attempt.min(leg_deadline));
@@ -771,16 +773,16 @@ impl ConnectAttempt {
                         last = entry.peer_id();
                     }
                 }
-                let remaining = self.leg_deadline.saturating_sub(now.mono_ms);
-                self.share_deadline = now.mono_ms + remaining / peers_left;
+                let remaining = self.leg_deadline.saturating_sub(now.monotonic_ms);
+                self.share_deadline = now.monotonic_ms + remaining / peers_left;
             }
             let addrs_left = 1 + self
                 .untried
                 .iter()
                 .take_while(|entry| entry.peer_id() == &relay_peer)
                 .count() as u64;
-            let share_left = self.share_deadline.saturating_sub(now.mono_ms);
-            self.relay_deadline = Some(now.mono_ms + share_left / addrs_left);
+            let share_left = self.share_deadline.saturating_sub(now.monotonic_ms);
+            self.relay_deadline = Some(now.monotonic_ms + share_left / addrs_left);
             self.relay = Some(relay.clone());
 
             // Connected, or another machine (reservation, probe) is already
@@ -935,7 +937,7 @@ impl ConnectAttempt {
         if self.punch_window < total_windows {
             self.punch_window += 1;
             self.issue_punch_dials(swarm, shared);
-            self.punch_deadline = Some(now.mono_ms + shared.config.punch_deadline_ms);
+            self.punch_deadline = Some(now.monotonic_ms + shared.config.punch_deadline_ms);
         } else {
             self.punch_deadline = None;
             self.settle_after_punch(swarm, shared, now);
@@ -1182,7 +1184,7 @@ impl ConnectAttempt {
         self.relay_deadline = None;
         self.hop = None;
         self.last_error = Some(error);
-        !self.untried.is_empty() && now.mono_ms < self.leg_deadline
+        !self.untried.is_empty() && now.monotonic_ms < self.leg_deadline
     }
 
     fn fail_if_no_legs_remain(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {

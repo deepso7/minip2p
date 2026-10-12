@@ -34,7 +34,7 @@ test("generated-file validation ignores downloaded Node artifacts", () => {
 test("release native setup is portable across Windows and Android", () => {
   const nativeSteps = workflow.jobs["node-native"].steps;
   const install = workflow.jobs["node-native"].steps.find(
-    ({ run }) => run === "pnpm --workspace-root install --frozen-lockfile"
+    ({ run }) => run === "pnpm install --frozen-lockfile"
   );
   assert.equal(install.shell, "bash");
 

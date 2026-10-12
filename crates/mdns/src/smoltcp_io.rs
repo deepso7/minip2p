@@ -4,13 +4,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use minip2p_platform::{Deadline, Now};
 use minip2p_smoltcp::SmoltcpStack;
 use minip2p_smoltcp::smoltcp::iface::{
     Interface, PollIngressSingleResult, PollResult, SocketHandle,
 };
 use minip2p_smoltcp::smoltcp::phy::Device;
 use minip2p_smoltcp::smoltcp::socket::udp::{self, PacketBuffer, PacketMetadata, UdpMetadata};
-use minip2p_smoltcp::smoltcp::time::Instant;
+use minip2p_smoltcp::smoltcp::time::{Duration, Instant};
 use minip2p_smoltcp::smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use crate::io::{MdnsDatagram, MdnsError, MdnsIo};
@@ -134,9 +135,10 @@ pub struct SmoltcpMdnsIo<D: Device> {
     /// The last reading a caller gave, so a send between polls can be
     /// timestamped without reading a clock.
     now_ms: u64,
-    /// smoltcp's own answer to when it next needs driving, captured during
-    /// `poll` because computing it needs the interface mutably.
-    poll_at_ms: Option<u64>,
+    /// smoltcp's own answer to when it next needs driving, on the caller's
+    /// timeline. Captured during `poll` because computing it needs the
+    /// interface mutably.
+    poll_at: Option<Deadline>,
     /// The last drive exhausted its ingress budget and must be resumed now.
     ingress_pending: bool,
 }
@@ -209,7 +211,7 @@ impl<D: Device> SmoltcpMdnsIo<D> {
             snapshots: Vec::new(),
             next_receive: 0,
             now_ms: 0,
-            poll_at_ms: None,
+            poll_at: None,
             ingress_pending: false,
         };
         io.snapshots = io.read_snapshots();
@@ -291,11 +293,21 @@ impl<D: Device> SmoltcpMdnsIo<D> {
                 break;
             }
         }
-        self.poll_at_ms = state
-            .interface
-            .poll_at(timestamp, &state.sockets)
-            .map(|at| u64::try_from(at.total_millis()).unwrap_or(0));
+        self.poll_at = poll_deadline(
+            now_ms,
+            state.interface.poll_delay(timestamp, &state.sockets),
+        );
     }
+}
+
+/// When smoltcp next wants driving, on the caller's timeline.
+///
+/// Taken as a delay and added to the caller's reading rather than read off
+/// smoltcp's own clock, which tops out far below the caller's: an absolute
+/// smoltcp instant near that ceiling would land in the past and keep the host
+/// awake for nothing. The sum saturates at [`Deadline::NEVER`].
+fn poll_deadline(now_ms: u64, delay: Option<Duration>) -> Option<Deadline> {
+    delay.map(|delay| Now::from_millis(now_ms).deadline_after(delay.total_millis()))
 }
 
 fn rollback_families<D: Device>(
@@ -504,9 +516,9 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
         Ok(())
     }
 
-    fn next_deadline(&self, now_ms: u64) -> Option<u64> {
+    fn next_deadline(&self, now: Now) -> Option<Deadline> {
         if self.ingress_pending {
-            return Some(0);
+            return Some(now.as_deadline());
         }
         // A datagram already queued leaves on the next poll, so that poll is
         // due now rather than whenever smoltcp's own timers say.
@@ -519,7 +531,7 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
                 .gt(&0)
         });
         if queued {
-            return Some(0);
+            return Some(now.as_deadline());
         }
         // A datagram already delivered to a socket -- by the driver's last
         // poll, or by another user of a shared stack polling the interface --
@@ -532,8 +544,33 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
                 .can_recv()
         });
         if waiting {
-            return Some(0);
+            return Some(now.as_deadline());
         }
-        self.poll_at_ms.map(|at| at.saturating_sub(now_ms))
+        self.poll_at
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoltcps_delay_becomes_a_deadline_on_the_callers_timeline() {
+        assert_eq!(poll_deadline(1_000, None), None);
+        assert_eq!(
+            poll_deadline(1_000, Some(Duration::from_millis(250))),
+            Some(Deadline::from_millis(1_250))
+        );
+        // Due now is due now, not "never".
+        assert_eq!(
+            poll_deadline(1_000, Some(Duration::ZERO)),
+            Some(Deadline::from_millis(1_000))
+        );
+        // Past the end of smoltcp's own clock, the sum saturates rather than
+        // wrapping into the past.
+        assert_eq!(
+            poll_deadline(Now::MAX_MONOTONIC_MS, Some(Duration::from_millis(250))),
+            Some(Deadline::NEVER)
+        );
     }
 }

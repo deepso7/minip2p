@@ -55,7 +55,7 @@ jobs:
         shell: bash
         run: sed -i 's/\r$//' react-native/patches/*.patch
       - shell: bash
-        run: pnpm --workspace-root install --frozen-lockfile
+        run: pnpm install --frozen-lockfile
       - name: Build addon
         shell: bash
         run: pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
@@ -122,7 +122,7 @@ jobs:
               cargo build --release --locked -p minip2p-relay-server-example
               mkdir -p ../../target/debug
               cp ../../target/release/minip2p-relay ../../target/debug/minip2p-relay
-              pnpm --workspace-root install --frozen-lockfile
+              pnpm install --frozen-lockfile
               pnpm --filter @minip2p/node exec vitest run
             '
 
@@ -160,7 +160,7 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version 4.1.2 --locked
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: pnpm --workspace-root install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile
       - run: pnpm --workspace-root rn:android
       - name: Validate Android ELF alignment and allocator hooks
         run: node react-native/scripts/check-android-elf.mjs
@@ -199,7 +199,7 @@ jobs:
           toolchain: stable
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: pnpm --workspace-root install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile
       - run: pnpm --workspace-root rn:ios
       - name: Validate XCFramework slices
         run: |

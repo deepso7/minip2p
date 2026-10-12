@@ -17,6 +17,7 @@ use minip2p_autonat::{
     AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatClientOutput, AutoNatError, Reachability,
 };
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, select_direct_addrs};
+use minip2p_platform::Now;
 use minip2p_relay::{HOP_PROTOCOL_ID, HopReservation, HopReservationOutput, ReservationOutcome};
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -25,7 +26,7 @@ use crate::acquire::{self, AcquireError, Acquired};
 use crate::agent::{DialPurpose, Shared, StreamInput, StreamRole, close_write, reset, send};
 use crate::events::NatEvent;
 use crate::swarm::NatSwarm;
-use crate::types::{Now, ReachabilityState, ReservationInfo};
+use crate::types::{ReachabilityState, ReservationInfo};
 
 /// The longest reservation retry backoff, unless the configured base
 /// [`reservation_retry_backoff_ms`](crate::NatConfig::reservation_retry_backoff_ms)
@@ -185,13 +186,13 @@ impl Prober {
 
     fn on_tick(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         if let Some(flight) = &self.flight
-            && now.mono_ms >= flight.deadline
+            && now.monotonic_ms >= flight.deadline
         {
             self.abort_flight(swarm, shared, now);
         }
         if self.flight.is_none()
             && let Some(due) = self.next_probe_at
-            && now.mono_ms >= due
+            && now.monotonic_ms >= due
         {
             self.start_probe(swarm, shared, now);
         }
@@ -201,7 +202,7 @@ impl Prober {
     fn start_probe(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         if shared.config.autonat_servers.is_empty() || shared.listen_addrs.is_empty() {
             // Nothing to probe (yet); check again at the unsettled cadence.
-            self.next_probe_at = Some(now.mono_ms + shared.config.probe_interval_unsettled_ms);
+            self.next_probe_at = Some(now.monotonic_ms + shared.config.probe_interval_unsettled_ms);
             return;
         }
         let servers = &shared.config.autonat_servers;
@@ -230,7 +231,7 @@ impl Prober {
             server,
             stage: ExchangeStage::WaitPeerReady,
             machine: None,
-            deadline: now.mono_ms + deadline_ms,
+            deadline: now.monotonic_ms + deadline_ms,
         });
         self.next_probe_at = None;
         self.on_acquired(result, swarm, shared, now);
@@ -338,7 +339,7 @@ impl Prober {
             shared.release_stream(conn, stream);
         }
         self.server_idx += 1;
-        self.next_probe_at = Some(now.mono_ms + shared.config.probe_interval_unsettled_ms);
+        self.next_probe_at = Some(now.monotonic_ms + shared.config.probe_interval_unsettled_ms);
     }
 
     /// A probe dial toward `peer` failed. Only a probe still waiting on
@@ -515,7 +516,7 @@ impl Prober {
             abandon_stream(flight.server.peer_id(), flight.stage, swarm, shared, now);
         }
         self.server_idx += 1;
-        self.next_probe_at = Some(now.mono_ms + shared.config.probe_interval_unsettled_ms);
+        self.next_probe_at = Some(now.monotonic_ms + shared.config.probe_interval_unsettled_ms);
     }
 
     fn schedule_next(&mut self, shared: &mut Shared, now: Now) {
@@ -524,7 +525,7 @@ impl Prober {
         } else {
             shared.config.probe_interval_settled_ms
         };
-        self.next_probe_at = Some(now.mono_ms + interval);
+        self.next_probe_at = Some(now.monotonic_ms + interval);
     }
 
     fn next_deadline(&self) -> Option<u64> {
@@ -627,10 +628,10 @@ impl ReservationManager {
         }
         match &self.state {
             ResState::Idle => self.begin_acquire(swarm, shared, now),
-            ResState::Backoff { until } if now.mono_ms >= *until => {
+            ResState::Backoff { until } if now.monotonic_ms >= *until => {
                 self.begin_acquire(swarm, shared, now);
             }
-            ResState::Reserved { info, conn, .. } if now.mono_ms >= info.renew_at_mono_ms => {
+            ResState::Reserved { info, conn, .. } if now.monotonic_ms >= info.renew_at_mono_ms => {
                 self.held = Some((info.relay.clone(), *conn));
                 self.begin_acquire(swarm, shared, now);
             }
@@ -638,10 +639,10 @@ impl ReservationManager {
                 relay,
                 keep_alive_at_mono_ms: Some(due),
                 ..
-            } if now.mono_ms >= *due => {
+            } if now.monotonic_ms >= *due => {
                 // Relay liveness is re-established from lifecycle events; a
                 // refused ping changes nothing here.
-                match swarm.ping(relay.peer_id(), now.mono_ms) {
+                match swarm.ping(relay.peer_id(), now.monotonic_ms) {
                     Ok(()) | Err(_) => {}
                 }
                 if let ResState::Reserved {
@@ -650,12 +651,12 @@ impl ReservationManager {
                 } = &mut self.state
                 {
                     *keep_alive_at_mono_ms = Some(
-                        now.mono_ms
+                        now.monotonic_ms
                             .saturating_add(shared.config.reservation_keep_alive_interval_ms),
                     );
                 }
             }
-            ResState::Acquiring { deadline, .. } if now.mono_ms >= *deadline => {
+            ResState::Acquiring { deadline, .. } if now.monotonic_ms >= *deadline => {
                 self.fail_acquire(swarm, shared, now);
             }
             _ => {}
@@ -719,7 +720,7 @@ impl ReservationManager {
             relay,
             stage: ExchangeStage::WaitPeerReady,
             machine: None,
-            deadline: now.mono_ms + deadline_ms,
+            deadline: now.monotonic_ms + deadline_ms,
         };
         self.on_acquired(result, swarm, shared, now);
     }
@@ -782,7 +783,7 @@ impl ReservationManager {
         );
         self.failures = self.failures.saturating_add(1);
         self.state = ResState::Backoff {
-            until: now.mono_ms.saturating_add(delay),
+            until: now.monotonic_ms.saturating_add(delay),
         };
     }
 
@@ -1007,7 +1008,7 @@ impl ReservationManager {
         // -- so no `RelayReservationLost` -- while we keep advertising a
         // ticket that dialers get NO_RESERVATION on. An expiry at or before now (a stale
         // value, or clock skew) is treated as no expiry at all.
-        let lifetime_secs = match (expire_unix_secs, now.unix_secs) {
+        let lifetime_secs = match (expire_unix_secs, now.unix_seconds) {
             (Some(expire), Some(unix_now)) if expire > unix_now => {
                 (expire - unix_now).min(default_ttl)
             }
@@ -1018,7 +1019,9 @@ impl ReservationManager {
             expires_unix_secs: expire_unix_secs,
             // The relay controls `expire`, so this conversion must not let a
             // large value wrap the monotonic renewal deadline.
-            renew_at_mono_ms: now.mono_ms.saturating_add(renewal_delay_ms(lifetime_secs)),
+            renew_at_mono_ms: now
+                .monotonic_ms
+                .saturating_add(renewal_delay_ms(lifetime_secs)),
         };
         shared.push_event(NatEvent::RelayReserved {
             relay: relay_peer,
@@ -1028,7 +1031,7 @@ impl ReservationManager {
         let keep_alive_at_mono_ms = (relay.transport().is_quic_transport()
             && shared.config.reservation_keep_alive_interval_ms > 0)
             .then(|| {
-                now.mono_ms
+                now.monotonic_ms
                     .saturating_add(shared.config.reservation_keep_alive_interval_ms)
             });
         self.failures = 0;

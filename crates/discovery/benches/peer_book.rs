@@ -2,6 +2,7 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use minip2p_core::{Multiaddr, PeerId};
 use minip2p_discovery::{Observation, PeerDiscoveryAgent, PeerDiscoveryConfig};
 use minip2p_identity::{KeyType, PublicKey};
+use minip2p_platform::Now;
 use std::hint::black_box;
 
 const PEERS: usize = 128;
@@ -57,8 +58,8 @@ fn peer_book(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
-    group.bench_function("next_timeout", |b| {
-        b.iter(|| black_box(active.next_timeout(black_box(1))));
+    group.bench_function("next_deadline", |b| {
+        b.iter(|| black_box(active.next_deadline(black_box(Now::from_millis(1)))));
     });
     group.finish();
 }

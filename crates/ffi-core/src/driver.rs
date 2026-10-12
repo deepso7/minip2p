@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use minip2p::{Deadline, EndpointWaitOutcome, Error};
+use minip2p::{EndpointWaitOutcome, Error, WaitDeadline};
 
 use crate::endpoint::{Lifecycle, Shared};
 use crate::events::convert_endpoint_event;
@@ -397,7 +397,7 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         // therefore sleeps until something is due.
         let mut batch = Vec::new();
         let mut interrupted = false;
-        match endpoint.wait(Deadline::NEVER)? {
+        match endpoint.wait(WaitDeadline::NEVER)? {
             EndpointWaitOutcome::Interrupted => interrupted = true,
             EndpointWaitOutcome::Event(event) => batch.push(event),
             // Deadline, or an outcome this driver predates: nothing to carry.

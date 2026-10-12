@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use minip2p::{
-    ConnectionId, Deadline, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId,
-    StreamId,
+    ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId, StreamId,
+    WaitDeadline,
 };
 
 const ECHO: &str = "/minip2p/bench/echo/1";
@@ -39,7 +39,7 @@ fn bind(kind: Kind) -> Endpoint {
 }
 
 /// The next Endpoint event, or `None` once `deadline` passes.
-fn next_event(endpoint: &mut Endpoint, deadline: impl Into<Deadline>) -> Option<EndpointEvent> {
+fn next_event(endpoint: &mut Endpoint, deadline: impl Into<WaitDeadline>) -> Option<EndpointEvent> {
     let deadline = deadline.into();
     loop {
         match endpoint.wait(deadline).expect("endpoint wait") {
@@ -53,7 +53,7 @@ fn next_event(endpoint: &mut Endpoint, deadline: impl Into<Deadline>) -> Option<
 /// Drives `endpoint` until `wanted` accepts an event, dispatching (here:
 /// dropping) everything else, as an application event loop would.
 fn wait_for(endpoint: &mut Endpoint, what: &str, wanted: impl Fn(&EndpointEvent) -> bool) {
-    let deadline = Deadline::from(Instant::now() + TIMEOUT);
+    let deadline = WaitDeadline::from(Instant::now() + TIMEOUT);
     loop {
         let event = next_event(endpoint, deadline).expect(what);
         if wanted(&event) {
@@ -285,7 +285,7 @@ impl Pair {
                 .expect("open stream");
             pending.insert(stream, (0usize, Vec::with_capacity(payload.len())));
         }
-        let deadline = Deadline::from(Instant::now() + TIMEOUT);
+        let deadline = WaitDeadline::from(Instant::now() + TIMEOUT);
         while !pending.is_empty() {
             match next_event(&mut self.client, deadline).expect("echo timeout") {
                 EndpointEvent::StreamReady {

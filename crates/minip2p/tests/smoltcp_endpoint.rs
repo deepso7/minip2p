@@ -18,8 +18,8 @@ use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 #[cfg(feature = "pubsub")]
 use minip2p::{BeaconConfig, GossipsubError, GossipsubEvent};
 use minip2p::{
-    ConnectOutcome, ConnectionId, DiscoveryEvent, Ed25519Keypair, Endpoint, EndpointEvent,
-    EntropySource, Multiaddr, Now, PeerAddr, PeerId, PollDeadline, SmoltcpConfig,
+    ConnectOutcome, ConnectionId, Deadline, DiscoveryEvent, Ed25519Keypair, Endpoint,
+    EndpointEvent, EntropySource, Multiaddr, Now, PeerAddr, PeerId, SmoltcpConfig,
     SmoltcpMdnsConfig, SmoltcpStack, SmoltcpTcpProvider, StreamId, TcpConfig, TcpTransport,
 };
 use minip2p_platform::EntropyError;
@@ -448,7 +448,7 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
         }
 
         if wire.is_quiet() {
-            let deadline = PollDeadline::earliest_opt(
+            let deadline = Deadline::earliest_opt(
                 dialer.next_deadline(now),
                 listener.next_deadline(now),
             )
@@ -515,7 +515,7 @@ fn portable_connect_settles_over_smoltcp_tcp() {
         }
         if wire.is_quiet() {
             let deadline =
-                PollDeadline::earliest_opt(dialer.next_deadline(now), listener.next_deadline(now))
+                Deadline::earliest_opt(dialer.next_deadline(now), listener.next_deadline(now))
                     .unwrap_or_else(|| {
                         panic!("embedded connect wedged\n  dialer: {dialer_events:?}")
                     });
@@ -592,7 +592,7 @@ fn identify_follows_an_interface_address_change_under_a_wildcard_listener() {
         }
         if wire.is_quiet() {
             let deadline =
-                PollDeadline::earliest_opt(dialer.next_deadline(now), listener.next_deadline(now))
+                Deadline::earliest_opt(dialer.next_deadline(now), listener.next_deadline(now))
                     .expect("connect wedged");
             now_ms = now_ms.max(deadline.as_millis());
         }
@@ -700,7 +700,7 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
         }
 
         if wire.is_quiet() {
-            let deadline = PollDeadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
+            let deadline = Deadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
                 .unwrap_or_else(|| panic!("mDNS endpoints wedged"));
             now_ms = now_ms.max(deadline.as_millis());
         }
@@ -764,7 +764,7 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
             return;
         }
         if wire.is_quiet() {
-            let deadline = PollDeadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
+            let deadline = Deadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
                 .unwrap_or_else(|| panic!("pubsub endpoints wedged"));
             now_ms = now_ms.max(deadline.as_millis());
         }
@@ -864,7 +864,7 @@ fn signed_beacons_populate_discovery_without_mdns() {
             return;
         }
         if wire.is_quiet() {
-            let deadline = PollDeadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
+            let deadline = Deadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
                 .unwrap_or_else(|| panic!("discovery endpoints wedged"));
             now_ms = now_ms.max(deadline.as_millis());
         }

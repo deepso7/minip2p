@@ -70,14 +70,11 @@ pub fn maddr(s: &str) -> Multiaddr {
 }
 
 pub fn at(ms: u64) -> Now {
-    Now::from_mono(ms)
+    Now::from_millis(ms)
 }
 
 pub fn at_unix(ms: u64, secs: u64) -> Now {
-    Now {
-        mono_ms: ms,
-        unix_secs: Some(secs),
-    }
+    Now::new(ms, secs)
 }
 
 /// A framed HOP STATUS response carrying `status`.

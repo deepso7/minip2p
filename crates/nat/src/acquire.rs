@@ -10,7 +10,7 @@ use minip2p_transport::{ConnectionId, StreamId};
 
 use crate::agent::{DialPurpose, Shared};
 use crate::swarm::NatSwarm;
-use crate::types::Now;
+use minip2p_platform::Now;
 
 /// Where an acquisition stands after a step.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +101,6 @@ fn open(
         return Err(AcquireError::Unsupported);
     }
     swarm
-        .open_stream(peer, protocol, now.mono_ms)
+        .open_stream(peer, protocol, now.monotonic_ms)
         .map_err(|error| AcquireError::Open(error.to_string()))
 }

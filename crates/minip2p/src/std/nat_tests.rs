@@ -539,7 +539,7 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
             target_addrs: Vec::new(),
             deadline_ms: None,
         },
-        Now::from_mono(0),
+        Now::from_millis(0),
     );
     assert!(agent.owns_stream(pair.inner_conn, pair.stream));
     agent.handle_event(
@@ -552,7 +552,7 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
             initiated_locally: true,
         },
         false,
-        Now::from_mono(5),
+        Now::from_millis(5),
     );
     let status = HopMessage {
         kind: HopMessageType::Status,
@@ -570,7 +570,7 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
             data: Bytes::from(encode_frame(&status.encode())),
         },
         false,
-        Now::from_mono(6),
+        Now::from_millis(6),
     );
     let mut promotion = drain_actions(&mut agent)
         .into_iter()

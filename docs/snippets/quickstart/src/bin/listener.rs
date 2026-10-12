@@ -1,4 +1,4 @@
-use minip2p::{Deadline, Endpoint, EndpointWaitOutcome, PeerAddr};
+use minip2p::{Endpoint, EndpointWaitOutcome, PeerAddr, WaitDeadline};
 
 fn main() -> Result<(), minip2p::Error> {
     let mut node = Endpoint::builder()
@@ -12,7 +12,7 @@ fn main() -> Result<(), minip2p::Error> {
     }
 
     loop {
-        if let EndpointWaitOutcome::Event(event) = node.wait(Deadline::NEVER)? {
+        if let EndpointWaitOutcome::Event(event) = node.wait(WaitDeadline::NEVER)? {
             println!("{event:?}");
         }
     }

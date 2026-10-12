@@ -46,7 +46,7 @@ EXPECTED_CRITERION = {
     "yamux/64KiB/session_send_and_drain", "yamux/64KiB/session_receive_and_drain",
     "yamux/256KiB/queued_send_16KiB_window_updates", "yamux/1024_streams/sparse_send_8_streams",
     "peer_book_128_peers_16_addrs/tick_active", "peer_book_128_peers_16_addrs/tick_expire",
-    "peer_book_128_peers_16_addrs/next_timeout",
+    "peer_book_128_peers_16_addrs/next_deadline",
     "pubsub/gossipsub_publish_32x60KiB",
     "pubsub/gossipsub_forward_1KiB/8", "pubsub/gossipsub_forward_1KiB/32",
     "pubsub/gossipsub_forward_1KiB/128", "pubsub/gossipsub_heartbeat_1000_peers_100_topics",
@@ -71,7 +71,7 @@ GUNGRAUN_NAMES = {
     "sparse_send_8_of_1024_streams": "yamux/1024_streams/sparse_send_8_streams",
     "tick_active": "peer_book_128_peers_16_addrs/tick_active",
     "tick_expire": "peer_book_128_peers_16_addrs/tick_expire",
-    "next_timeout": "peer_book_128_peers_16_addrs/next_timeout",
+    "next_deadline": "peer_book_128_peers_16_addrs/next_deadline",
     "gossipsub_publish_32x60_kib": "pubsub/gossipsub_publish_32x60KiB",
     "gossipsub_forward_1_kib_8": "pubsub/gossipsub_forward_1KiB/8",
     "gossipsub_forward_1_kib_32": "pubsub/gossipsub_forward_1KiB/32",
@@ -82,7 +82,7 @@ GUNGRAUN_NAMES = {
         f"relay_{size}_{case}": f"relay_server_{size}/{case}"
         for size in ("100", "1k", "10k")
         for case in (
-            "next_timeout",
+            "next_deadline",
             "tick_idle",
             "tick_expire_100",
             "reserve_new_peer",
@@ -94,6 +94,10 @@ GUNGRAUN_NAMES = {
         )
     },
 }
+# Benchmarks renamed since the last release, old name suffix -> new, so a
+# release baseline still lines up with the current rows. Drop entries once a
+# release carries the new names.
+RENAMED_SUFFIXES = {"/next_timeout": "/next_deadline"}
 EXPECTED_VITEST = {"sdk_drain_flood", "sdk_stream_transfer", "raw_drain_events", "connected_peers_sync"}
 # Rows a bench measures itself (for example throughput or allocations), keyed by
 # (tier, name, metric). Each such bench writes a JSON array of rows into the
@@ -343,11 +347,20 @@ class ComparedRow:
     reason: str | None = None
 
 
+def current_name(name: str) -> str:
+    """A baseline benchmark name under its current name (see `RENAMED_SUFFIXES`)."""
+    for old, new in RENAMED_SUFFIXES.items():
+        if name.endswith(old):
+            return name[: -len(old)] + new
+    return name
+
+
 def compare_rows(
     current: dict[str, Any], baseline: dict[str, Any] | None, ir_reason: str | None
 ) -> list[ComparedRow]:
     old = {} if baseline is None else {
-        (row["tier"], row["name"], row["metric"]): row["value"] for row in baseline["rows"]
+        (row["tier"], current_name(row["name"]), row["metric"]): row["value"]
+        for row in baseline["rows"]
     }
     compared = []
     for row in current["rows"]:

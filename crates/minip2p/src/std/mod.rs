@@ -89,7 +89,7 @@ pub use minip2p_relay_server::{
 };
 use minip2p_swarm::SwarmBuilder;
 pub use minip2p_swarm::{
-    Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, Swarm, SwarmError,
+    DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, Swarm, SwarmError, WaitDeadline,
 };
 #[cfg(feature = "tcp")]
 use minip2p_tcp::{StdTcpProvider, TcpConfig, TcpTransport};
@@ -741,7 +741,10 @@ impl Endpoint {
     ///     }
     /// }
     /// ```
-    pub fn wait(&mut self, deadline: impl Into<Deadline>) -> Result<EndpointWaitOutcome, Error> {
+    pub fn wait(
+        &mut self,
+        deadline: impl Into<WaitDeadline>,
+    ) -> Result<EndpointWaitOutcome, Error> {
         let deadline = deadline.into();
         // A passed deadline still drives the endpoint once, which is what
         // lets a stale timer make progress. Only once, so a continuous event
@@ -815,14 +818,14 @@ impl Endpoint {
     /// The engine's own timers (attempt deadlines, capability drivers) are
     /// floored at 1 ms, so a driver reporting "due now" without new input
     /// cannot spin the thread; the swarm's own due work is not.
-    fn block(&mut self, deadline: Deadline) -> Result<bool, Error> {
+    fn block(&mut self, deadline: WaitDeadline) -> Result<bool, Error> {
         let now = self.now();
         let mut budget = deadline.remaining().unwrap_or(MAX_IDLE_WAIT);
         if let Some(next) = self.engine.core.next_deadline(now) {
             budget = budget.min(Duration::from_millis(next.millis_until(now)));
         }
-        if let Some(ms) = self.engine.timer_ms(now) {
-            budget = budget.min(Duration::from_millis(ms.max(1)));
+        if let Some(next) = self.engine.driver_deadline(now) {
+            budget = budget.min(Duration::from_millis(next.millis_until(now).max(1)));
         }
         if budget.is_zero() {
             return Ok(false);
@@ -1068,7 +1071,7 @@ impl Endpoint {
             }
             let harvested = if self.close_drain_busy() {
                 // Interrupts only end this sleep early.
-                self.block(Deadline::from(drain_by))
+                self.block(WaitDeadline::from(drain_by))
             } else {
                 Ok(false)
             };
@@ -2116,15 +2119,17 @@ impl Endpoint {
 /// once the deadline passes. Interruptions are retried.
 #[cfg(all(test, feature = "quic"))]
 pub(crate) trait NextEvent {
-    fn next_event(&mut self, deadline: impl Into<Deadline>)
-    -> Result<Option<EndpointEvent>, Error>;
+    fn next_event(
+        &mut self,
+        deadline: impl Into<WaitDeadline>,
+    ) -> Result<Option<EndpointEvent>, Error>;
 }
 
 #[cfg(all(test, feature = "quic"))]
 impl NextEvent for Endpoint {
     fn next_event(
         &mut self,
-        deadline: impl Into<Deadline>,
+        deadline: impl Into<WaitDeadline>,
     ) -> Result<Option<EndpointEvent>, Error> {
         let deadline = deadline.into();
         loop {
@@ -3353,7 +3358,7 @@ mod tests {
         endpoint.wait_handle().interrupt();
 
         assert!(matches!(
-            endpoint.wait(Deadline::NEVER).expect("wait endpoint"),
+            endpoint.wait(WaitDeadline::NEVER).expect("wait endpoint"),
             EndpointWaitOutcome::Interrupted
         ));
     }

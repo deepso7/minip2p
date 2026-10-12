@@ -13,21 +13,23 @@
 //! keep time limits as failure backstops. The full convention, and the tests
 //! that run alone because they cannot follow it, live in `.config/nextest.toml`.
 
-use minip2p::{Deadline, Endpoint, EndpointEvent, EndpointWaitOutcome, Error};
+use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome, Error, WaitDeadline};
 
 /// Returns the next Endpoint event, or `None` once `deadline` passes.
 ///
 /// Interruptions are retried. Applications should match on
 /// [`EndpointWaitOutcome`] directly; tests mostly just want the next event.
 pub trait NextEvent {
-    fn next_event(&mut self, deadline: impl Into<Deadline>)
-    -> Result<Option<EndpointEvent>, Error>;
+    fn next_event(
+        &mut self,
+        deadline: impl Into<WaitDeadline>,
+    ) -> Result<Option<EndpointEvent>, Error>;
 }
 
 impl NextEvent for Endpoint {
     fn next_event(
         &mut self,
-        deadline: impl Into<Deadline>,
+        deadline: impl Into<WaitDeadline>,
     ) -> Result<Option<EndpointEvent>, Error> {
         let deadline = deadline.into();
         loop {

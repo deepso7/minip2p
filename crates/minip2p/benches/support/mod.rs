@@ -14,16 +14,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    Bytes, ConnectOutcome, ConnectionId, Deadline, Endpoint, EndpointBuilder, EndpointEvent,
+    Bytes, ConnectOutcome, ConnectionId, Endpoint, EndpointBuilder, EndpointEvent,
     EndpointWaitOutcome, Error, NatConfig, PeerAddr, PeerId, RelayServerConfig, ReservationPolicy,
-    StreamId,
+    StreamId, WaitDeadline,
 };
 
 /// Upper bound for every setup step.
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The next Endpoint event, or `None` once `deadline` passes.
-pub fn next_event(endpoint: &mut Endpoint, deadline: impl Into<Deadline>) -> Option<EndpointEvent> {
+pub fn next_event(
+    endpoint: &mut Endpoint,
+    deadline: impl Into<WaitDeadline>,
+) -> Option<EndpointEvent> {
     let deadline = deadline.into();
     loop {
         match endpoint.wait(deadline).expect("endpoint wait") {

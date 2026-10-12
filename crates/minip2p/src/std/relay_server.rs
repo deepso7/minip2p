@@ -104,7 +104,11 @@ impl RelayServerDriver {
         swarm: &mut SwarmCore<T, E>,
         now: Now,
     ) {
-        if self.agent.next_timeout(now) == Some(0) {
+        if self
+            .agent
+            .next_deadline(now)
+            .is_some_and(|due| due.is_expired_at(now))
+        {
             self.agent.handle_tick(now);
             self.pump(swarm, now);
         }

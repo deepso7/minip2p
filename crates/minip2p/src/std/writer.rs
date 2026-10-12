@@ -123,7 +123,7 @@ struct Pending {
 /// // The FIN goes out after the whole payload, however long that takes.
 /// writer.close_write(endpoint, conn_id, stream_id)?;
 /// while progress == WriteProgress::Pending && writer.is_pending(conn_id, stream_id) {
-///     if let EndpointWaitOutcome::Event(event) = endpoint.wait(minip2p::Deadline::NEVER)? {
+///     if let EndpointWaitOutcome::Event(event) = endpoint.wait(minip2p::WaitDeadline::NEVER)? {
 ///         if let Some(done) = writer.observe(endpoint, &event) {
 ///             println!("stream {} accepted every byte", done.stream_id);
 ///         }
