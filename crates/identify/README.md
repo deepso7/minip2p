@@ -10,7 +10,7 @@ Identify is the libp2p handshake that lets two peers exchange their supported pr
   - **Responder** (listener side): sends our identify message and closes the write half.
   - **Initiator** (dialer side): reads the remote's identify message and surfaces it as an event.
 - Per-peer state tracking with multi-stream support.
-- Protobuf encode/decode for `IdentifyMessage` (field-number order on encode, any-order accept on decode; unknown fields with known wire types are silently skipped). Field framing uses the shared vocabulary in `minip2p-core`; semantic validation and contextual `IdentifyMessageError` values stay here.
+- Protobuf encode/decode for `IdentifyMessage` (field-number order on encode, any-order accept on decode; unknown fields with known wire types are silently skipped; invalid field numbers such as 0 are rejected). Field framing uses the shared vocabulary in `minip2p-core`; semantic validation and contextual `IdentifyMessageError` values stay here.
 - 8 KiB frame size cap; a message may arrive in up to two frames, which are merged.
 - Peer-id migration support for swarms that discover the real `PeerId` after connection establishment.
 - `IdentifyInput` values for stream lifecycle, peer migration, and received bytes.
