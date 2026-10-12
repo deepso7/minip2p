@@ -2987,8 +2987,8 @@ mod tests {
         core.ping(&peer, [7; PING_PAYLOAD_LEN], start)
             .expect("ping in flight");
         assert_eq!(
-            core.next_deadline(now),
-            Some(Deadline::NEVER),
+            core.ping_deadlines.get(&peer).copied(),
+            Some(u64::MAX),
             "a saturated ping deadline must not wrap to the past"
         );
     }

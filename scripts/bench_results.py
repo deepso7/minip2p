@@ -94,6 +94,10 @@ GUNGRAUN_NAMES = {
         )
     },
 }
+# Benchmarks renamed since the last release, old name suffix -> new, so a
+# release baseline still lines up with the current rows. Drop entries once a
+# release carries the new names.
+RENAMED_SUFFIXES = {"/next_timeout": "/next_deadline"}
 EXPECTED_VITEST = {"sdk_drain_flood", "sdk_stream_transfer", "raw_drain_events", "connected_peers_sync"}
 # Rows a bench measures itself (for example throughput or allocations), keyed by
 # (tier, name, metric). Each such bench writes a JSON array of rows into the
@@ -343,11 +347,20 @@ class ComparedRow:
     reason: str | None = None
 
 
+def current_name(name: str) -> str:
+    """A baseline benchmark name under its current name (see `RENAMED_SUFFIXES`)."""
+    for old, new in RENAMED_SUFFIXES.items():
+        if name.endswith(old):
+            return name[: -len(old)] + new
+    return name
+
+
 def compare_rows(
     current: dict[str, Any], baseline: dict[str, Any] | None, ir_reason: str | None
 ) -> list[ComparedRow]:
     old = {} if baseline is None else {
-        (row["tier"], row["name"], row["metric"]): row["value"] for row in baseline["rows"]
+        (row["tier"], current_name(row["name"]), row["metric"]): row["value"]
+        for row in baseline["rows"]
     }
     compared = []
     for row in current["rows"]:
