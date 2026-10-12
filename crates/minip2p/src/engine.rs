@@ -39,7 +39,7 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
-use minip2p_platform::{Deadline as PollDeadline, EntropySource, Now};
+use minip2p_platform::{Deadline, EntropySource, Now};
 use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId, Transport};
 
@@ -837,14 +837,14 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
 
     /// When the engine next needs a batch: immediately while events wait to
     /// be pulled, else the earliest swarm, attempt, or driver timer.
-    pub(crate) fn next_deadline(&self, now: Now) -> Option<PollDeadline> {
+    pub(crate) fn next_deadline(&self, now: Now) -> Option<Deadline> {
         if !self.events.is_empty() {
-            return Some(PollDeadline::IMMEDIATE);
+            return Some(Deadline::IMMEDIATE);
         }
-        PollDeadline::earliest_opt(
+        Deadline::earliest_opt(
             self.core.next_deadline(now),
             self.timer_ms(now)
-                .map(|ms| PollDeadline::from_millis(now.monotonic_ms.saturating_add(ms))),
+                .map(|ms| Deadline::from_millis(now.monotonic_ms.saturating_add(ms))),
         )
     }
 }

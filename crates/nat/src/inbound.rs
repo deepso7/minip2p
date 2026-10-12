@@ -16,13 +16,14 @@ use alloc::vec::Vec;
 
 use minip2p_core::{Multiaddr, PeerId, Protocol, select_direct_addrs};
 use minip2p_dcutr::{DcutrError, DcutrInitiator, DcutrInitiatorOutput, InitiatorOutcome};
+use minip2p_platform::Now;
 use minip2p_relay::{RelayError, Status, StopResponder, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
 
 use crate::agent::{Shared, StreamInput, StreamRole, TokenPurpose, reset, send};
 use crate::events::{BridgeRole, NatAction, NatEvent};
 use crate::swarm::NatSwarm;
-use crate::types::{Now, PromoteError};
+use crate::types::PromoteError;
 
 /// Responder-side UDP blast schedule during the punch window.
 struct BlastSchedule {
@@ -94,7 +95,7 @@ impl InboundCircuit {
             dcutr_deadline: None,
             remote_addrs: Vec::new(),
             pending_data: Vec::new(),
-            exchange_deadline: now.mono_ms + shared.config.relay_leg_deadline_ms,
+            exchange_deadline: now.monotonic_ms + shared.config.relay_leg_deadline_ms,
             blast: None,
             linger_until: None,
             released: false,
@@ -273,7 +274,7 @@ impl InboundCircuit {
         if self.done {
             return;
         }
-        if !self.released && now.mono_ms >= self.exchange_deadline {
+        if !self.released && now.monotonic_ms >= self.exchange_deadline {
             if self.source.is_some() {
                 // STOP completed but promotion did not run. Preserve the
                 // accepted bridge rather than abandoning it.
@@ -287,7 +288,7 @@ impl InboundCircuit {
         if let Some(blast) = &mut self.blast {
             let interval = shared.config.blast_interval_ms.max(1);
             let mut exhausted = false;
-            while now.mono_ms >= blast.next_at && blast.next_at <= blast.until {
+            while now.monotonic_ms >= blast.next_at && blast.next_at <= blast.until {
                 for addr in &blast.addrs {
                     shared.push_action(NatAction::SendRandomUdp {
                         target: addr.clone(),
@@ -302,12 +303,12 @@ impl InboundCircuit {
                     }
                 }
             }
-            if now.mono_ms >= blast.until || exhausted {
+            if now.monotonic_ms >= blast.until || exhausted {
                 self.blast = None;
             }
         }
         if let Some(linger) = self.linger_until
-            && now.mono_ms >= linger
+            && now.monotonic_ms >= linger
         {
             self.linger_until = None;
             self.blast = None;
@@ -318,7 +319,7 @@ impl InboundCircuit {
             }
         }
         if let Some(deadline) = self.handshake_deadline
-            && now.mono_ms >= deadline
+            && now.monotonic_ms >= deadline
         {
             self.handshake_deadline = None;
             if let Some(conn_id) = self.promoted.take() {
@@ -327,7 +328,7 @@ impl InboundCircuit {
             self.done = true;
         }
         if let Some(deadline) = self.dcutr_deadline
-            && now.mono_ms >= deadline
+            && now.monotonic_ms >= deadline
         {
             self.finish_dcutr(swarm, shared, now);
             self.done = true;
@@ -437,7 +438,7 @@ impl InboundCircuit {
             Ok(conn_id) => {
                 self.promoted = Some(conn_id);
                 self.handshake_deadline =
-                    Some(now.mono_ms + shared.config.circuit_handshake_timeout_ms);
+                    Some(now.monotonic_ms + shared.config.circuit_handshake_timeout_ms);
             }
             Err(_) => self.done = true,
         }
@@ -462,7 +463,7 @@ impl InboundCircuit {
         // the circuit.
         let opened = if swarm.connection(peer) == Some(circuit) {
             swarm
-                .open_stream(peer, minip2p_dcutr::DCUTR_PROTOCOL_ID, now.mono_ms)
+                .open_stream(peer, minip2p_dcutr::DCUTR_PROTOCOL_ID, now.monotonic_ms)
                 .ok()
         } else {
             None
@@ -474,7 +475,7 @@ impl InboundCircuit {
         };
         self.dcutr_stream = Some((conn, stream));
         self.dcutr = Some(DcutrInitiator::new(&shared.punch_candidates()));
-        self.dcutr_deadline = Some(now.mono_ms + shared.config.relay_leg_deadline_ms);
+        self.dcutr_deadline = Some(now.monotonic_ms + shared.config.relay_leg_deadline_ms);
         shared.own_stream(peer, conn, stream, StreamRole::DcutrInbound(self.id));
     }
 
@@ -491,7 +492,7 @@ impl InboundCircuit {
         };
         let rtt_ms = self
             .dcutr_connect_sent_at
-            .map_or(0, |sent_at| now.mono_ms.saturating_sub(sent_at));
+            .map_or(0, |sent_at| now.monotonic_ms.saturating_sub(sent_at));
         let remote_closed = matches!(&input, StreamInput::RemoteWriteClosed | StreamInput::Closed);
         let dcutr = match self.dcutr.as_mut() {
             Some(Ok(dcutr)) => dcutr,
@@ -519,7 +520,7 @@ impl InboundCircuit {
         for output in outputs {
             match output {
                 DcutrInitiatorOutput::Outbound(data) => {
-                    self.dcutr_connect_sent_at.get_or_insert(now.mono_ms);
+                    self.dcutr_connect_sent_at.get_or_insert(now.monotonic_ms);
                     if let Some(peer) = self.source.as_ref() {
                         send(swarm, peer, conn, stream, data, now);
                     }
@@ -531,7 +532,7 @@ impl InboundCircuit {
                 }) => {
                     self.remote_addrs = select_global_punch_candidates(&remote_addrs);
                     completed = true;
-                    let blast_start = now.mono_ms.saturating_add(rtt_ms.div_ceil(2));
+                    let blast_start = now.monotonic_ms.saturating_add(rtt_ms.div_ceil(2));
                     let blast_until = blast_start.saturating_add(shared.config.punch_deadline_ms);
                     if !self.remote_addrs.is_empty() {
                         let next_at = if rtt_ms == 0 {

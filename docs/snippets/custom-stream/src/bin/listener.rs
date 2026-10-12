@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use minip2p::{
-    ConnectionId, Deadline, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId,
-    StreamId,
+    ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId, StreamId,
+    WaitDeadline,
 };
 
 const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";
@@ -22,7 +22,7 @@ fn main() -> Result<(), minip2p::Error> {
     let mut echo_streams: HashSet<(PeerId, ConnectionId, StreamId)> = HashSet::new();
 
     loop {
-        let EndpointWaitOutcome::Event(event) = node.wait(Deadline::NEVER)? else {
+        let EndpointWaitOutcome::Event(event) = node.wait(WaitDeadline::NEVER)? else {
             continue;
         };
         match event {

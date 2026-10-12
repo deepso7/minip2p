@@ -1,30 +1,5 @@
 use minip2p_core::PeerId;
 
-/// Clock sample supplied by the driver with every input.
-///
-/// The agent never reads clocks itself. `mono_ms` orders all internal
-/// deadlines; `unix_secs` is only needed to schedule relay-reservation
-/// renewal from the absolute `expire` timestamp a relay returns, and may be
-/// `None` on hosts without a real-time clock (renewal then falls back to a
-/// configured default TTL).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Now {
-    /// Monotonic milliseconds. Any epoch, as long as it never goes backward.
-    pub mono_ms: u64,
-    /// Wall-clock seconds since the unix epoch, if available.
-    pub unix_secs: Option<u64>,
-}
-
-impl Now {
-    /// A `Now` carrying only a monotonic reading.
-    pub fn from_mono(mono_ms: u64) -> Self {
-        Self {
-            mono_ms,
-            unix_secs: None,
-        }
-    }
-}
-
 /// Opaque correlation token the agent allocates for work whose result the
 /// host reports later: a dial the host parked to resolve its named address
 /// ([`DialStart::Deferred`](crate::DialStart::Deferred), reported through

@@ -29,6 +29,7 @@ std = [
 minip2p-autonat = { path = "../autonat", version = "0.8.0", default-features = false }
 minip2p-core = { path = "../core", version = "0.8.0", default-features = false }
 minip2p-dcutr = { path = "../dcutr", version = "0.8.0", default-features = false }
+minip2p-platform = { path = "../platform", version = "0.8.0", default-features = false }
 minip2p-relay = { path = "../relay", version = "0.8.0", default-features = false }
 minip2p-swarm = { path = "../swarm", version = "0.8.0", default-features = false }
 minip2p-transport = { path = "../transport", version = "0.8.0", default-features = false }
@@ -36,5 +37,4 @@ thiserror = { version = "2.0.20", default-features = false }
 
 [dev-dependencies]
 minip2p-identity = { path = "../identity" }
-minip2p-platform = { path = "../platform" }
 minip2p-test-support = { path = "../test-support" }

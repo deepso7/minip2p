@@ -8,7 +8,7 @@ use alloc::{string::String, vec::Vec};
 
 pub use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
 pub use minip2p_identity::Ed25519Keypair;
-pub use minip2p_platform::{Deadline as PollDeadline, EntropySource, Now, SharedEntropy};
+pub use minip2p_platform::{Deadline, EntropySource, Now, SharedEntropy};
 pub use minip2p_swarm::{
     // Part of `EndpointEvent` / `SwarmEvent` public shapes (`Error`);
     // re-exported so portable callers can name them without a direct swarm
@@ -417,7 +417,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// Returns when the endpoint next needs to be polled: immediately while
     /// events wait to be returned, else the earliest transport, swarm,
     /// Connection-attempt, or capability timer.
-    pub fn next_deadline(&self, now: Now) -> Option<PollDeadline> {
+    pub fn next_deadline(&self, now: Now) -> Option<Deadline> {
         self.engine.next_deadline(now)
     }
 
@@ -1419,7 +1419,7 @@ mod tests {
             .expect_err("the carrier fails");
         assert_eq!(
             endpoint.next_deadline(Now::from_millis(1)),
-            Some(PollDeadline::IMMEDIATE)
+            Some(Deadline::IMMEDIATE)
         );
         let events = endpoint.poll(Now::from_millis(2)).expect("poll");
         assert!(

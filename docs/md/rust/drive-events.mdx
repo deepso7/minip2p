@@ -16,16 +16,16 @@ The endpoint has one ordered event stream and two ways to read it. `Endpoint::wa
 
 ## Deadline forms
 
-Every endpoint wait accepts `impl Into<Deadline>`:
+Every endpoint wait accepts `impl Into<WaitDeadline>`:
 
 ```rust
 use std::time::{Duration, Instant};
 
-use minip2p::Deadline;
+use minip2p::WaitDeadline;
 
 let relative = Duration::from_secs(5);
 let absolute = Instant::now() + Duration::from_secs(5);
-let forever = Deadline::NEVER;
+let forever = WaitDeadline::NEVER;
 ```
 
 A deadline that has already passed — a stale `Instant` or `Duration::ZERO` alike — still lets `wait` return a queued event or drive the endpoint once, so a stale timer never stalls it. The endpoint does not sleep or poll repeatedly past the deadline. The deadline bounds blocking, not delivery: with a strict operation timeout, check the clock before each `wait`, as in the loop below.

@@ -22,7 +22,7 @@ use crate::core::{DriverError, SwarmCore};
 use crate::events::SwarmEvent;
 
 /// Cap on a single readiness wait when the caller has no deadline
-/// ([`Deadline::NEVER`]). Re-arming the wait occasionally is harmless (one
+/// ([`WaitDeadline::NEVER`]). Re-arming the wait occasionally is harmless (one
 /// syscall a minute) and keeps unbounded durations out of OS interfaces.
 const MAX_IDLE_WAIT: Duration = Duration::from_secs(60);
 
@@ -39,11 +39,11 @@ pub const RUN_UNTIL_SKIP_LIMIT: usize = 1024;
 /// When a blocking wait should give up.
 ///
 /// Everywhere the driver can wait ([`Swarm::poll_next`], [`Swarm::run_until`])
-/// accepts `impl Into<Deadline>`, so callers pass whichever is natural:
+/// accepts `impl Into<WaitDeadline>`, so callers pass whichever is natural:
 ///
 /// - an [`Instant`] -- absolute deadline,
 /// - a [`Duration`] -- relative timeout from now,
-/// - [`Deadline::NEVER`] -- wait indefinitely.
+/// - [`WaitDeadline::NEVER`] -- wait indefinitely.
 ///
 /// An [`Instant`] that has already passed is the same deadline as
 /// [`Duration::ZERO`]: the wait still returns what is already ready and polls
@@ -53,7 +53,7 @@ pub const RUN_UNTIL_SKIP_LIMIT: usize = 1024;
 ///
 /// # Not [`minip2p_platform::Deadline`]
 ///
-/// The two are deliberately distinct despite the shared name. This one is how
+/// The two are deliberately distinct types. This one is how
 /// long a *caller* is prepared to block, so it is measured in real time and
 /// deliberately independent of the driver's injected [`Clock`]: a test that
 /// freezes the clock to exercise protocol timers still wants its own waits to
@@ -62,35 +62,35 @@ pub const RUN_UNTIL_SKIP_LIMIT: usize = 1024;
 /// [`Transport::next_deadline`](minip2p_transport::Transport::next_deadline)
 /// reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Deadline {
+pub struct WaitDeadline {
     at: Option<Instant>,
 }
 
-impl Deadline {
+impl WaitDeadline {
     /// Wait indefinitely; the call returns only when an event arrives (or,
     /// for `run_until`, when the predicate matches).
-    pub const NEVER: Deadline = Deadline { at: None };
+    pub const NEVER: WaitDeadline = WaitDeadline { at: None };
 
-    /// Whether the deadline has already passed. [`Deadline::NEVER`] never
+    /// Whether the deadline has already passed. [`WaitDeadline::NEVER`] never
     /// passes.
     pub fn has_passed(self) -> bool {
         self.is_expired_at(Instant::now())
     }
 
-    /// The earlier of two deadlines ([`Deadline::NEVER`] is latest).
+    /// The earlier of two deadlines ([`WaitDeadline::NEVER`] is latest).
     ///
     /// Lets callers fold an extra timer source into a wait without access
     /// to the deadline's internals, mirroring how [`Swarm::poll_next`]
     /// folds the core's protocol timers into its budget.
-    pub fn earliest(self, other: Deadline) -> Deadline {
+    pub fn earliest(self, other: WaitDeadline) -> WaitDeadline {
         let at = match (self.at, other.at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        Deadline { at }
+        WaitDeadline { at }
     }
 
-    /// Time left until the deadline; `None` for [`Deadline::NEVER`], and
+    /// Time left until the deadline; `None` for [`WaitDeadline::NEVER`], and
     /// zero once it has passed. Lets a host that blocks on its own budget
     /// (the Endpoint's wait) fold the caller's deadline in.
     pub fn remaining(self) -> Option<Duration> {
@@ -109,17 +109,17 @@ impl Deadline {
     }
 }
 
-impl From<Instant> for Deadline {
+impl From<Instant> for WaitDeadline {
     fn from(instant: Instant) -> Self {
-        Deadline { at: Some(instant) }
+        WaitDeadline { at: Some(instant) }
     }
 }
 
-impl From<Duration> for Deadline {
+impl From<Duration> for WaitDeadline {
     /// Relative timeout starting now. A duration too large for `Instant`
-    /// arithmetic means [`Deadline::NEVER`].
+    /// arithmetic means [`WaitDeadline::NEVER`].
     fn from(timeout: Duration) -> Self {
-        Deadline {
+        WaitDeadline {
             at: Instant::now().checked_add(timeout),
         }
     }
@@ -427,7 +427,7 @@ impl<T: BlockingTransport> Swarm<T> {
     /// boilerplate.
     pub fn poll_next(
         &mut self,
-        deadline: impl Into<Deadline>,
+        deadline: impl Into<WaitDeadline>,
     ) -> Result<Option<SwarmEvent>, DriverError> {
         let deadline = deadline.into();
         loop {
@@ -452,7 +452,7 @@ impl<T: BlockingTransport> Swarm<T> {
     /// swarm once.
     pub fn poll_next_interruptible(
         &mut self,
-        deadline: impl Into<Deadline>,
+        deadline: impl Into<WaitDeadline>,
     ) -> Result<PollNext, DriverError> {
         let deadline = deadline.into();
         // A blocking harvest already collected this batch; another
@@ -512,7 +512,7 @@ impl<T: BlockingTransport> Swarm<T> {
     /// returns, preserving their original order for later consumers.
     ///
     /// At most [`RUN_UNTIL_SKIP_LIMIT`] non-matching events are set aside
-    /// this way; an unbounded wait (e.g. [`Deadline::NEVER`]) must not buffer
+    /// this way; an unbounded wait (e.g. [`WaitDeadline::NEVER`]) must not buffer
     /// arbitrary amounts of event data while a peer floods us with, say,
     /// [`SwarmEvent::StreamData`]. When the cap is hit, every skipped event
     /// is restored in order and [`DriverError::EventBacklogExceeded`] is
@@ -526,7 +526,7 @@ impl<T: BlockingTransport> Swarm<T> {
     /// cannot livelock an expired wait.
     pub fn run_until<F>(
         &mut self,
-        deadline: impl Into<Deadline>,
+        deadline: impl Into<WaitDeadline>,
         mut predicate: F,
     ) -> Result<Option<SwarmEvent>, DriverError>
     where
@@ -546,7 +546,7 @@ impl<T: BlockingTransport> Swarm<T> {
                     result = Err(error);
                     break;
                 }
-                // Deadline expired while idle. `poll_next` has already done
+                // WaitDeadline expired while idle. `poll_next` has already done
                 // its final "at least once" transport poll and found the
                 // buffer empty, so the drain below must not poll again.
                 Ok(PollNext::Deadline) => {
@@ -1370,32 +1370,35 @@ mod tests {
 
     #[test]
     fn deadline_earliest_picks_the_sooner_deadline() {
-        let soon = Deadline::from(Duration::from_millis(10));
-        let later = Deadline::from(Duration::from_secs(60));
+        let soon = WaitDeadline::from(Duration::from_millis(10));
+        let later = WaitDeadline::from(Duration::from_secs(60));
         assert_eq!(soon.earliest(later), soon);
         assert_eq!(later.earliest(soon), soon);
-        assert_eq!(Deadline::NEVER.earliest(soon), soon);
-        assert_eq!(soon.earliest(Deadline::NEVER), soon);
-        assert_eq!(Deadline::NEVER.earliest(Deadline::NEVER), Deadline::NEVER);
+        assert_eq!(WaitDeadline::NEVER.earliest(soon), soon);
+        assert_eq!(soon.earliest(WaitDeadline::NEVER), soon);
+        assert_eq!(
+            WaitDeadline::NEVER.earliest(WaitDeadline::NEVER),
+            WaitDeadline::NEVER
+        );
     }
 
     #[test]
     fn deadline_conversions_cover_instant_duration_and_never() {
         // A relative Duration lands in the future.
-        let relative: Deadline = Duration::from_secs(1).into();
+        let relative: WaitDeadline = Duration::from_secs(1).into();
         assert!(!relative.is_expired_at(Instant::now()));
         assert!(relative.remaining_at(Instant::now()).is_some());
 
         // A Duration too large for Instant arithmetic degrades to NEVER.
-        let unbounded: Deadline = Duration::MAX.into();
-        assert_eq!(unbounded, Deadline::NEVER);
+        let unbounded: WaitDeadline = Duration::MAX.into();
+        assert_eq!(unbounded, WaitDeadline::NEVER);
 
         // NEVER neither expires nor bounds the wait budget.
-        assert!(!Deadline::NEVER.is_expired_at(Instant::now()));
-        assert_eq!(Deadline::NEVER.remaining_at(Instant::now()), None);
+        assert!(!WaitDeadline::NEVER.is_expired_at(Instant::now()));
+        assert_eq!(WaitDeadline::NEVER.remaining_at(Instant::now()), None);
 
         // An Instant is an absolute deadline.
-        let past = Deadline::from(Instant::now());
+        let past = WaitDeadline::from(Instant::now());
         assert!(past.is_expired_at(Instant::now() + Duration::from_millis(1)));
     }
 
@@ -1413,7 +1416,7 @@ mod tests {
             });
 
         let event = swarm
-            .poll_next(Deadline::NEVER)
+            .poll_next(WaitDeadline::NEVER)
             .expect("poll")
             .expect("buffered event");
         assert!(matches!(
@@ -1501,11 +1504,11 @@ mod tests {
         swarm.poll().expect("non-blocking poll harvests");
         buffer_event(&mut swarm);
         assert!(matches!(
-            swarm.poll_next_interruptible(Deadline::NEVER),
+            swarm.poll_next_interruptible(WaitDeadline::NEVER),
             Ok(PollNext::Event(_))
         ));
         assert!(matches!(
-            swarm.poll_next_interruptible(Deadline::NEVER),
+            swarm.poll_next_interruptible(WaitDeadline::NEVER),
             Ok(PollNext::Interrupted)
         ));
         // Reported once: the two calls were one interrupt. The `Waker` event
@@ -1552,11 +1555,11 @@ mod tests {
         swarm.poll().expect("the harvest records the wake");
         buffer_event(&mut swarm);
         assert!(matches!(
-            swarm.poll_next_interruptible(Deadline::NEVER),
+            swarm.poll_next_interruptible(WaitDeadline::NEVER),
             Ok(PollNext::Event(_))
         ));
         assert!(matches!(
-            swarm.poll_next_interruptible(Deadline::NEVER),
+            swarm.poll_next_interruptible(WaitDeadline::NEVER),
             Ok(PollNext::Woken)
         ));
         assert!(matches!(
@@ -2133,7 +2136,7 @@ mod tests {
         // An unbounded wait over a flood of non-matching events must abort
         // at the cap instead of buffering them forever.
         let error = swarm
-            .run_until(Deadline::NEVER, |event| {
+            .run_until(WaitDeadline::NEVER, |event| {
                 matches!(event, SwarmEvent::PingTimeout { .. })
             })
             .expect_err("skip cap must abort an unbounded wait");
@@ -2196,7 +2199,7 @@ mod tests {
         // Exactly RUN_UNTIL_SKIP_LIMIT - 1 events are skipped: one below the
         // cap, so the match right behind them must still be found.
         let found = swarm
-            .run_until(Deadline::NEVER, |event| {
+            .run_until(WaitDeadline::NEVER, |event| {
                 matches!(event, SwarmEvent::PeerReady { .. })
             })
             .expect("wait")
@@ -2413,7 +2416,7 @@ mod tests {
         let jumped = clock.clone();
         swarm.simulated_wait = Some(Box::new(move |_| jumped.advance(PING_TIMEOUT_MS + 1_000)));
         let event = swarm
-            .poll_next(Deadline::NEVER)
+            .poll_next(WaitDeadline::NEVER)
             .expect("poll")
             .expect("ping timeout event");
         assert!(matches!(

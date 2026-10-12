@@ -3,6 +3,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use minip2p_core::{Bytes, ConnectId, Multiaddr, PeerAddr, PeerId, select_direct_addrs};
+use minip2p_platform::Now;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -16,7 +17,7 @@ use crate::events::{NatAction, NatEvent};
 use crate::housekeeping::Housekeeping;
 use crate::inbound::InboundCircuit;
 use crate::swarm::{DialStart, NatSwarm};
-use crate::types::{NatToken, Now, Path, PromoteError, ReachabilityState, ReservationInfo};
+use crate::types::{NatToken, Path, PromoteError, ReachabilityState, ReservationInfo};
 
 /// Roles a stream owned by the agent can play. Streams not in the registry
 /// belong to the application (`Released` is modeled as removal).
@@ -132,7 +133,7 @@ pub(crate) struct Shared {
     /// machines targeting the same infrastructure peer wait on the first
     /// dial instead of issuing their own — a second connection to the same
     /// peer replaces the first, and the replacement ends the winner's
-    /// streams. Values carry the dialed peer and an expiry (`mono_ms`) so a
+    /// streams. Values carry the dialed peer and an expiry (monotonic ms) so a
     /// handshake that never completes cannot suppress dialing forever.
     pending_session_dials: BTreeMap<NatToken, (PeerId, u64)>,
     /// Started dials still awaiting establishment or
@@ -211,9 +212,9 @@ impl Shared {
         // Expired entries only accumulate when handshakes silently die;
         // prune them here so the map stays bounded without a timer.
         self.pending_session_dials
-            .retain(|_, (_, expires)| *expires > now.mono_ms);
+            .retain(|_, (_, expires)| *expires > now.monotonic_ms);
         let (token, _) = self.start_dial(swarm, purpose, &addr)?;
-        let expires = now.mono_ms + deadline_ms;
+        let expires = now.monotonic_ms + deadline_ms;
         self.pending_session_dials
             .insert(token, (addr.peer_id().clone(), expires));
         Ok(())
@@ -268,7 +269,7 @@ impl Shared {
     pub(crate) fn session_dial_pending(&self, peer: &PeerId, now: Now) -> bool {
         self.pending_session_dials
             .values()
-            .any(|(dialed, expires)| dialed == peer && *expires > now.mono_ms)
+            .any(|(dialed, expires)| dialed == peer && *expires > now.monotonic_ms)
     }
 
     pub(crate) fn push_event(&mut self, event: NatEvent) {
@@ -385,7 +386,7 @@ pub(crate) fn send(
     data: Vec<u8>,
     now: Now,
 ) {
-    match swarm.send_stream(peer, conn_id, stream, Bytes::from(data), now.mono_ms) {
+    match swarm.send_stream(peer, conn_id, stream, Bytes::from(data), now.monotonic_ms) {
         Ok(()) | Err(_) => {}
     }
 }
@@ -399,7 +400,7 @@ pub(crate) fn close_write(
     stream: StreamId,
     now: Now,
 ) {
-    match swarm.close_stream_write(peer, conn_id, stream, now.mono_ms) {
+    match swarm.close_stream_write(peer, conn_id, stream, now.monotonic_ms) {
         Ok(()) | Err(_) => {}
     }
 }
@@ -413,7 +414,7 @@ pub(crate) fn reset(
     stream: StreamId,
     now: Now,
 ) {
-    match swarm.reset_stream(peer, conn_id, stream, now.mono_ms) {
+    match swarm.reset_stream(peer, conn_id, stream, now.monotonic_ms) {
         Ok(()) | Err(_) => {}
     }
 }
@@ -437,7 +438,7 @@ pub struct ConnectLegs {
     /// before the others. Everything else is ignored, including circuits
     /// through relays that are not configured. Empty keeps config order.
     pub target_addrs: Vec<Multiaddr>,
-    /// When the caller gives up on the attempt, on the [`Now::mono_ms`]
+    /// When the caller gives up on the attempt, on the [`Now::monotonic_ms`]
     /// clock. The relay leg ends at the earlier of this and
     /// [`NatConfig::relay_leg_deadline_ms`] after it starts, so its relays
     /// split time the attempt actually has. `None` when the caller has no
@@ -869,7 +870,7 @@ impl NatAgent {
             .shared
             .pending_session_dials
             .get(&token)
-            .is_some_and(|(_, expires)| *expires > now.mono_ms);
+            .is_some_and(|(_, expires)| *expires > now.monotonic_ms);
         if !wanted {
             self.shared.tokens.remove(&token);
             self.shared.pending_session_dials.remove(&token);
