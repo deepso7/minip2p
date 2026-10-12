@@ -44,7 +44,7 @@ loop {
     let event = match node.wait(deadline)? {
         EndpointWaitOutcome::Event(event) => event,
         // Another thread woke the wait; nothing to service here.
-        EndpointWaitOutcome::Deadline => return Err("stream negotiation timed out".into()),
+        EndpointWaitOutcome::Deadline => return Err("stream exchange timed out".into()),
         _ => continue, // interrupted by a WaitHandle
     };
     // The writer sees every event: it resends a held tail on StreamWritable
@@ -73,6 +73,13 @@ loop {
             writer.close_write(&mut node, conn_id, ready)?;
             // Keep dispatching: a held tail and the FIN finish from `observe`.
         }
+        // The peer half-closed after its reply (delivered as StreamData):
+        // the exchange is done, and our FIN went out before it was echoed.
+        EndpointEvent::StreamRemoteWriteClosed {
+            conn_id,
+            stream_id: done,
+            ..
+        } if Some((conn_id, done)) == stream => break,
         other => handle_other_event(other),
     }
 }
