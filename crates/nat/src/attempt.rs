@@ -996,10 +996,6 @@ impl ConnectAttempt {
             self.relay_deadline = Some(now.monotonic_ms + budget_left / addrs_left);
             self.relay_started_at = now.monotonic_ms;
             self.relay = Some(relay.clone());
-            shared.push_event(NatEvent::RelayStarted {
-                connect_id: self.id,
-                relay: relay.clone(),
-            });
 
             // Connected, or another machine (reservation, probe) is already
             // dialing this relay: the acquisition waits for `PeerReady` on that
@@ -1015,7 +1011,13 @@ impl ConnectAttempt {
                 shared,
                 now,
             );
+            // A relay refused at once never started a route: it reports
+            // `RelayFailed` only, like a refused direct candidate.
             let Err(error) = self.take_acquired(result, shared) else {
+                shared.push_event(NatEvent::RelayStarted {
+                    connect_id: self.id,
+                    relay,
+                });
                 return;
             };
             if !self.retire_relay(error, swarm, shared, now) {

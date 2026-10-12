@@ -613,3 +613,26 @@ fn late_failure_of_a_relays_first_address_dials_its_next() {
         "the leg is still live"
     );
 }
+
+#[test]
+fn a_relay_refused_at_once_never_reports_started() {
+    let mut w = two_relays();
+    w.agent.swarm.refuse_dials = Some("no transport".into());
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let events = drain_all_events(&mut w.agent);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, NatEvent::RelayStarted { .. })),
+        "{events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, NatEvent::RelayFailed { .. }))
+            .count(),
+        2,
+        "{events:?}"
+    );
+}

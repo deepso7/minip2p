@@ -963,6 +963,9 @@ impl ConnectEngine {
                 error,
             } => {
                 if let Some(attempt) = self.attempts.get_mut(connect_id) {
+                    // Track the relay even when it was refused before it
+                    // started, so `ConnectFailed` for it is not recorded twice.
+                    attempt.relay.set_relay(relay.clone());
                     attempt.relay_failures.push(RelayFailure {
                         relay: Some(relay.clone()),
                         reason: error.to_string(),
@@ -2710,6 +2713,54 @@ mod tests {
                 assert!(relays[0].reason.contains("refused"), "{relays:?}");
             }
             other => panic!("expected AllRoutesFailed, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
+    fn a_relay_refused_before_it_started_is_no_usable_route() {
+        use minip2p_nat::{NatError, NatEvent};
+        let peer = peer(b"relay-refused");
+        let relay = addr(&super::tests::peer(b"relay-a"), 7);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let id = admit(
+            &mut engine,
+            peer.clone(),
+            Vec::new(),
+            RelayPolicy::Forced,
+            &mut runtime,
+            0,
+        );
+        // The agent refused the relay at once: no `RelayStarted`.
+        let error = NatError::DialFailed("refused".into());
+        engine.observe_nat(
+            &NatEvent::RelayFailed {
+                connect_id: id,
+                relay: relay.clone(),
+                error: error.clone(),
+            },
+            &mut runtime,
+            0,
+        );
+        engine.observe_nat(
+            &NatEvent::ConnectFailed {
+                connect_id: id,
+                peer: peer.clone(),
+                error,
+            },
+            &mut runtime,
+            0,
+        );
+        match engine.pop_event() {
+            Some(EndpointEvent::ConnectSettled {
+                outcome: ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { relays, .. }),
+                ..
+            }) => {
+                assert_eq!(relays.len(), 1, "{relays:?}");
+                assert_eq!(relays[0].relay, Some(relay));
+            }
+            other => panic!("expected NoUsableRoute, got {other:?}"),
         }
     }
 
