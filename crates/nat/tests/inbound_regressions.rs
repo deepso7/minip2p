@@ -72,9 +72,9 @@ fn open_dcutr(h: &mut Harness, conn: ConnectionId, actions: &[Out]) -> StreamId 
 }
 
 #[test]
-fn silent_inbound_dcutr_exchange_times_out_and_resets_the_stream() {
+fn silent_inbound_dcutr_exchange_times_out_and_starts_the_next_round() {
     let mut h = inbound_harness(NatConfig {
-        relay_timeout_ms: 5,
+        dcutr_exchange_timeout_ms: 5,
         ..NatConfig::default()
     });
     let (conn, actions) = drive_to_relayed(&mut h);
@@ -83,9 +83,10 @@ fn silent_inbound_dcutr_exchange_times_out_and_resets_the_stream() {
 
     h.agent.handle_tick(at(18));
 
-    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
+    let actions = drain_actions(&mut h.agent);
+    assert!(has_reset_for(&actions, stream));
     assert!(!h.agent.owns_stream(conn, stream));
-    assert!(h.agent.is_idle());
+    assert_ne!(opened_stream(&actions), stream, "a fresh round opens a fresh stream");
 }
 
 #[test]
@@ -104,7 +105,7 @@ fn failed_inbound_dcutr_open_ends_coordination_without_losing_the_relayed_path()
 }
 
 #[test]
-fn early_closed_inbound_dcutr_exchange_resets_the_stream() {
+fn early_closed_inbound_dcutr_exchange_resets_the_stream_and_starts_the_next_round() {
     let mut h = inbound_harness(NatConfig::default());
     let (conn, actions) = drive_to_relayed(&mut h);
     let stream = open_dcutr(&mut h, conn, &actions);
@@ -120,9 +121,10 @@ fn early_closed_inbound_dcutr_exchange_resets_the_stream() {
         at(14),
     );
 
-    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
+    let actions = drain_actions(&mut h.agent);
+    assert!(has_reset_for(&actions, stream));
     assert!(!h.agent.owns_stream(conn, stream));
-    assert!(h.agent.is_idle());
+    assert_ne!(opened_stream(&actions), stream, "a fresh round opens a fresh stream");
 }
 
 fn answer_dcutr_at(h: &mut Harness, conn: ConnectionId, stream: StreamId, addrs: &[&str], t: u64) {
