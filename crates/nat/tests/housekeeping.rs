@@ -1332,3 +1332,59 @@ fn a_held_request_is_resent_and_closed_after_its_exchange_finishes() {
         Some(Out::CloseStreamWrite { stream_id, .. }) if *stream_id == stream
     ));
 }
+
+#[test]
+fn a_partly_accepted_request_is_finished_in_order_before_its_close() {
+    // The RESERVE an unconstrained stream carries, for reference.
+    let mut reference = build(ReservationPolicy::Always, 1, 0);
+    reference.agent.handle_tick(at(0));
+    let relay = reference.relay.clone();
+    reference.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
+    let stream = opened_stream_for(&drain_actions(&mut reference.agent), &relay);
+    reference.stream_ready(&relay, stream, HOP_PROTOCOL_ID, at(3));
+    let request = sent_data_on(&drain_actions(&mut reference.agent), stream);
+    assert!(request.len() > 2, "the request must span several writes");
+
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    hk.agent.handle_tick(at(0));
+    hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
+    let stream = opened_stream_for(&drain_actions(&mut hk.agent), &relay);
+    let writable = |hk: &mut Hk, t| {
+        hk.agent.handle_event(
+            &SwarmEvent::StreamWritable {
+                peer_id: relay.clone(),
+                conn_id: ConnectionId::new(1),
+                stream_id: stream,
+            },
+            false,
+            at(t),
+        );
+    };
+
+    // One byte per write: the first write and its replay each leave a tail.
+    hk.agent.swarm.accept_at_most = Some(1);
+    hk.stream_ready(&relay, stream, HOP_PROTOCOL_ID, at(3));
+    writable(&mut hk, 4);
+    // The relay answers early; the finished exchange queues its close behind
+    // the tail.
+    hk.stream_data(&relay, stream, hop_reserve_ok(None), at(5));
+    hk.agent.swarm.accept_at_most = None;
+    writable(&mut hk, 6);
+
+    let actions = drain_actions(&mut hk.agent);
+    let sent: Vec<u8> = actions
+        .iter()
+        .filter_map(|action| match action {
+            Out::SendStream {
+                stream_id, data, ..
+            } if *stream_id == stream => Some(data.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(sent, request);
+    assert!(matches!(
+        actions.last(),
+        Some(Out::CloseStreamWrite { stream_id, .. }) if *stream_id == stream
+    ));
+}

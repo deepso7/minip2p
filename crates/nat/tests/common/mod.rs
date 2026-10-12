@@ -595,6 +595,9 @@ pub struct FakeSwarm {
     /// Refuse every write as Full with nothing accepted; the attempt is
     /// still logged.
     pub full_sends: bool,
+    /// Accept at most this many bytes of each write and refuse the rest as
+    /// Full; only the accepted bytes are logged.
+    pub accept_at_most: Option<usize>,
 }
 
 impl FakeSwarm {
@@ -718,6 +721,21 @@ impl NatSwarm for FakeSwarm {
         data: Bytes,
         _now_ms: u64,
     ) -> Result<(), NatSwarmError> {
+        if let Some(limit) = self.accept_at_most
+            && limit < data.len()
+        {
+            self.calls.push(Out::SendStream {
+                peer: peer.clone(),
+                conn: conn_id,
+                stream_id,
+                data: data.slice(..limit).to_vec(),
+            });
+            return Err(NatSwarmError::Swarm(DriverError::Full {
+                conn_id,
+                stream_id,
+                unsent: data.slice(limit..),
+            }));
+        }
         self.calls.push(Out::SendStream {
             peer: peer.clone(),
             conn: conn_id,

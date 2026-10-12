@@ -237,8 +237,13 @@ type StdCarrier = ();
 type StdEngine = Engine<EndpointTransport, StdEntropy, StdCarrier>;
 
 /// What [`Endpoint::close`] collected: every event, in order, and every
-/// error, in the order they were hit. An empty `errors` means a clean close.
+/// error close's own calls hit, in order.
+///
+/// A failure the swarm reports as it happens (a transport refusing to close
+/// a connection, say) arrives as [`EndpointEvent::Error`] in `events`, as it
+/// would from [`Endpoint::wait`]; a clean close has no such event either.
 #[derive(Debug, Default)]
+#[must_use = "a close report carries the close's events and errors"]
 #[non_exhaustive]
 pub struct CloseReport {
     /// Events queued before the close and those its drain produced.
