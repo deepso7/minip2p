@@ -1429,6 +1429,10 @@ impl EndpointBuilder {
     }
 
     /// Adds an AutoNAT server used for reachability probing.
+    ///
+    /// Call once per server: a reachability verdict needs a quorum of
+    /// distinct servers ([`NatConfig::confidence_threshold`], 3 by default),
+    /// so with fewer reachable servers reachability stays Unknown.
     #[cfg(feature = "nat")]
     pub fn autonat_server(mut self, server: PeerAddr) -> Self {
         self.autonat_servers.push(server);

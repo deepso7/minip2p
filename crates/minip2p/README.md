@@ -122,17 +122,19 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
 
 Use `tcp_config`, `smoltcp_config`, `mdns_config`, `mdns_carrier_config`, `gossipsub_config`, `beacon_config`, and `peer_discovery_config` only when overriding defaults. Keep a cloned `SmoltcpStack` to reconfigure the interface later: a wildcard listener follows the interface's addresses, and Identify advertises a changed address without another `listen`. `poll(now)` advances every enabled service and `next_deadline(now)` folds their timelines.
 
-Portable AutoNAT is opt-in, and does not pull circuit transport state into an AutoNAT-only binary. Enable `portable-autonat`, configure one or more trusted servers, and read the latest verdict from the same caller-driven endpoint:
+Portable AutoNAT is opt-in, and does not pull circuit transport state into an AutoNAT-only binary. Enable `portable-autonat`, configure trusted servers, and read the latest verdict from the same caller-driven endpoint. A verdict needs a quorum of distinct servers (3 of the last 5 by default), and a public one reports only addresses that quorum confirms, so with fewer than three reachable servers reachability stays Unknown:
 
 ```rust,ignore
 let mut endpoint = Endpoint::portable(&identity, entropy)
     .smoltcp(stack)
     .listen("/ip4/0.0.0.0/tcp/4001")
-    .autonat(autonat_server)
+    .autonat(server_a)
+    .autonat(server_b)
+    .autonat(server_c)
     .build()?;
 
 for event in endpoint.poll(now)? {
-    // ReachabilityChanged is emitted after enough server verdicts agree.
+    // ReachabilityChanged is emitted once enough distinct servers agree.
     // Handle that and ordinary endpoint events here.
 }
 let reachability = endpoint.reachability();
@@ -218,7 +220,7 @@ let mut endpoint = minip2p::Endpoint::builder()
 # Ok::<(), minip2p::Error>(())
 ```
 
-Use `relay_server_config` for validated capacity, duration, byte, control, and rate limits. `relay_server_announce_addrs` supplies explicit public TCP/QUIC addresses; it does not enable the service, and invalid shapes fail before binding. Runtime replacement is atomic, with an empty list returning to AutoNAT-confirmed addresses and then concrete listeners. Raw Identify-observed addresses are never promoted.
+Use `relay_server_config` for validated capacity, duration, byte, control, and rate limits, including the per-IP caps (8 reservations and 8 circuits per IPv4 address or IPv6 /64 by default). `relay_server_announce_addrs` supplies explicit public TCP/QUIC addresses; it does not enable the service, and invalid shapes fail before binding. Runtime replacement is atomic, with an empty list returning to AutoNAT-confirmed addresses and then concrete listeners. Raw Identify-observed addresses are never promoted.
 
 `set_relay_server_accepting(false)` pauses only new reservations and circuits; HOP stays advertised and existing lifecycles remain active. Typed output arrives as `EndpointEvent::RelayServer` from `wait`. Synchronous controls return `RelayServerControlError`; failed asynchronous open/send/close/reset operations arrive as `RelayServerEvent::Error`.
 

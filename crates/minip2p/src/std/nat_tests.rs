@@ -1223,3 +1223,113 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
         saw_message(&all[1], b"after upgrade")
     });
 }
+
+/// Confirmed AutoNAT addresses feed `PublicAddressesChanged` and the relay
+/// server's advertised addresses, so one server, however often it answers
+/// and whatever it vouches for, must not move them (ADR 0018).
+#[cfg(all(feature = "quic", feature = "relay-server"))]
+#[test]
+fn a_single_autonat_server_cannot_confirm_addresses() {
+    use minip2p_autonat::{AUTONAT_PROTOCOL_ID, AutoNatServer, AutoNatServerOutput};
+
+    let mut server = Endpoint::builder()
+        .identity(Ed25519Keypair::from_secret_key_bytes([91; 32]))
+        .protocol(AUTONAT_PROTOCOL_ID)
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind server");
+    let server_addr = server.listen().expect("server listens");
+    let mut client = Endpoint::builder()
+        .identity(Ed25519Keypair::from_secret_key_bytes([92; 32]))
+        .nat_config(NatConfig {
+            autonat_servers: vec![server_addr],
+            probe_interval_unsettled_ms: 10,
+            probe_interval_settled_ms: 10,
+            reservation_policy: ReservationPolicy::Never,
+            ..NatConfig::default()
+        })
+        .relay_server()
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind client");
+
+    // The server vouches for every address it is asked about, five times.
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    let mut answered = 0;
+    let mut machines = std::collections::BTreeMap::new();
+    let mut client_events = Vec::new();
+    while answered < 5 {
+        assert!(Instant::now() < deadline, "only {answered} probes answered");
+        if let Some(event) = client
+            .next_event(std::time::Duration::from_millis(5))
+            .expect("drive client")
+        {
+            client_events.push(event);
+        }
+        match server
+            .next_event(std::time::Duration::from_millis(5))
+            .expect("drive server")
+        {
+            Some(EndpointEvent::StreamReady {
+                conn_id,
+                stream_id,
+                protocol_id,
+                ..
+            }) if protocol_id == AUTONAT_PROTOCOL_ID => {
+                machines.insert((conn_id, stream_id), AutoNatServer::new());
+            }
+            Some(EndpointEvent::StreamData {
+                peer_id,
+                conn_id,
+                stream_id,
+                data,
+            }) => {
+                let Some(machine) = machines.get_mut(&(conn_id, stream_id)) else {
+                    continue;
+                };
+                machine.on_data(&data).expect("well-formed request");
+                while let Some(output) = machine.poll_output() {
+                    match output {
+                        AutoNatServerOutput::Request(request) => {
+                            machine.respond_public(&request.addrs);
+                        }
+                        AutoNatServerOutput::Outbound(bytes) => {
+                            server
+                                .send_stream(&peer_id, conn_id, stream_id, bytes)
+                                .expect("send response");
+                            answered += 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Let the client take in the last answer.
+    for _ in 0..20 {
+        if let Some(event) = client
+            .next_event(std::time::Duration::from_millis(5))
+            .expect("drive client")
+        {
+            client_events.push(event);
+        }
+    }
+
+    assert!(
+        !client_events.iter().any(|event| matches!(
+            event,
+            EndpointEvent::Nat(
+                NatEvent::ReachabilityChanged { .. } | NatEvent::PublicAddressesChanged { .. }
+            )
+        )),
+        "{client_events:?}"
+    );
+    assert_eq!(client.reachability(), ReachabilityState::Unknown);
+    let nat = client.engine.nat.as_ref().expect("NAT configured");
+    assert!(
+        nat.confirmed_public_addrs().is_empty(),
+        "nothing for the relay server to advertise as confirmed"
+    );
+}
