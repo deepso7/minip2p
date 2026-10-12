@@ -1024,8 +1024,8 @@ impl NatAgent {
         self.shared.streams.contains_key(&(conn_id, stream_id))
     }
 
-    /// Our current reachability verdict: majority-of-N confidence over the
-    /// last M probe results, so it never flips on a single probe.
+    /// Our current reachability verdict: a quorum of distinct AutoNAT
+    /// servers' latest votes, so it never flips on a single server.
     pub fn reachability(&self) -> ReachabilityState {
         self.housekeeping.reachability()
     }

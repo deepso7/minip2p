@@ -956,9 +956,7 @@ mod tests {
         let other = Multiaddr::from_str("/ip4/198.51.100.1/udp/4001/quic-v1").unwrap();
         let asked_addr = Multiaddr::from_str(asked).unwrap();
         let mut with_peer = asked_addr.clone();
-        with_peer.push(minip2p_core::Protocol::P2p(
-            PeerId::from_str(PEER_ID).unwrap(),
-        ));
+        with_peer.push(Protocol::P2p(PeerId::from_str(PEER_ID).unwrap()));
 
         // Unrelated addresses are dropped, and a /p2p suffix naming us
         // still matches what we asked about.

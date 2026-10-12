@@ -466,6 +466,34 @@ fn votes_expire_after_fifteen_minutes() {
 }
 
 #[test]
+fn a_settled_verdict_lapses_to_unknown_once_its_votes_expire() {
+    let mut hk = build(ReservationPolicy::Never, 0, 3);
+    let public = [maddr(LISTEN_ADDR)];
+    assert!(hk.probe(Answer::Public(&public), 0).1.is_empty());
+    assert!(hk.probe(Answer::Public(&public), 6_000).1.is_empty());
+    assert_eq!(hk.probe(Answer::Public(&public), 12_000).1.len(), 1);
+    assert_eq!(hk.agent.reachability(), ReachabilityState::Public);
+
+    // Every server only refuses from now on. Once the first vote (cast at
+    // 2ms) is 15 minutes old, two live votes are too few to stand on.
+    let mut changes = Vec::new();
+    for round in 1..=10 {
+        changes.extend(hk.probe(Answer::DialRefused, 12_000 + round * 90_100).1);
+    }
+    assert!(
+        matches!(
+            changes.as_slice(),
+            [NatEvent::ReachabilityChanged {
+                old: ReachabilityState::Public,
+                new: ReachabilityState::Unknown,
+                confirmed_addrs,
+            }] if confirmed_addrs.is_empty()
+        ),
+        "{changes:?}"
+    );
+}
+
+#[test]
 fn probe_timeout_rotates_to_the_next_server() {
     let mut hk = build(ReservationPolicy::Never, 0, 2);
 

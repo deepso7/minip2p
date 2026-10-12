@@ -202,6 +202,7 @@ impl Prober {
     }
 
     fn on_tick(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
+        self.settle_verdict(shared, now);
         if let Some(flight) = &self.flight
             && now.monotonic_ms >= flight.deadline
         {
@@ -443,7 +444,7 @@ impl Prober {
             Ok(Some(reachability)) => {
                 let server = flight.server.peer_id().clone();
                 self.finish_flight(swarm, shared, now);
-                self.record_sample(server, &reachability, shared, now)
+                self.record_vote(server, &reachability, shared, now)
             }
             Ok(None) => false,
         }
@@ -451,7 +452,7 @@ impl Prober {
 
     /// Records `server`'s probe verdict as its only vote and applies the
     /// quorum rule. Returns whether the verdict flipped.
-    fn record_sample(
+    fn record_vote(
         &mut self,
         server: PeerId,
         reachability: &Reachability,
@@ -475,14 +476,23 @@ impl Prober {
             // No signal: an inconclusive probe never casts a vote.
             Reachability::Unknown { .. } => return false,
         };
-        let now_ms = now.monotonic_ms;
         self.votes.insert(
             server,
             Vote {
                 public_addrs,
-                cast_at_ms: now_ms,
+                cast_at_ms: now.monotonic_ms,
             },
         );
+        self.settle_verdict(shared, now)
+    }
+
+    /// Drops expired votes and votes beyond the window, then re-derives the
+    /// verdict. A quorum flips it; disagreement short of a quorum keeps it,
+    /// so one server cannot flap it. Once fewer than a quorum of votes are
+    /// live, the evidence for any verdict is gone and it lapses to Unknown.
+    /// Returns whether the verdict flipped.
+    fn settle_verdict(&mut self, shared: &mut Shared, now: Now) -> bool {
+        let now_ms = now.monotonic_ms;
         self.votes
             .retain(|_, vote| now_ms.saturating_sub(vote.cast_at_ms) < AUTONAT_VOTE_TTL_MS);
         let window = usize::from(shared.config.confidence_window.max(1));
@@ -510,6 +520,8 @@ impl Prober {
             ReachabilityState::Public
         } else if private_votes >= threshold {
             ReachabilityState::Private
+        } else if self.votes.len() < threshold {
+            ReachabilityState::Unknown
         } else {
             self.verdict
         };
