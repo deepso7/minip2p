@@ -1309,7 +1309,6 @@ dependencies = [
  "mio",
  "quinn-proto",
  "quinn-udp",
- "rustix",
  "rustls",
  "socket2",
 ]
