@@ -343,6 +343,37 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_invalid_field_numbers() {
+        assert_eq!(
+            IdentifyMessage::decode(&[0x02, 0x00]),
+            Err(IdentifyMessageError::Wire(WireError::InvalidFieldNumber {
+                field: 0,
+                offset: 0
+            }))
+        );
+        // agentVersion = "hi", then field 2^29.
+        let data = [
+            TAG_AGENT_VERSION,
+            2,
+            b'h',
+            b'i',
+            0x80,
+            0x80,
+            0x80,
+            0x80,
+            0x10,
+            0,
+        ];
+        assert_eq!(
+            IdentifyMessage::decode(&data),
+            Err(IdentifyMessageError::Wire(WireError::InvalidFieldNumber {
+                field: 1 << 29,
+                offset: 4
+            }))
+        );
+    }
+
+    #[test]
     fn decode_rejects_unsupported_wire_type_mid_message() {
         // Field 1 wire type 3 appears AFTER a known field; without the fix
         // this would silently return a partial message with only the first

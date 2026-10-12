@@ -8,12 +8,7 @@ const workflowPath = new URL(
   "../../../../.github/workflows/bindings-native.yml",
   import.meta.url
 );
-const packageJsonPath = new URL("../../../../package.json", import.meta.url);
 const workflow = parse(await readFile(workflowPath, "utf-8"));
-const { packageManager } = JSON.parse(await readFile(packageJsonPath, "utf-8"));
-const pnpmVersion = packageManager?.match(/^pnpm@(?<version>[^+]+)/u)?.groups
-  ?.version;
-assert.ok(pnpmVersion, `expected packageManager pnpm@…, got ${packageManager}`);
 
 test("native workflow runs weekly and on manual dispatch", () => {
   assert.ok(workflow.on.workflow_dispatch !== undefined);
@@ -72,12 +67,10 @@ test("weekly workflow executes the suite on native runners and musl containers",
     ({ name }) => name === "Build addon"
   ).run;
   assert.match(muslBuild, /PATH=\/opt\/pnpm\/bin:\/usr\/bin:/u);
+  // The container installs the pnpm pinned by the root packageManager field.
   assert.match(
     muslBuild,
-    new RegExp(
-      `--prefix /opt/pnpm pnpm@${pnpmVersion.replaceAll(".", "\\.")}`,
-      "u"
-    )
+    /--prefix \/opt\/pnpm "\$\(node -p "require\(\\"\/work\/package\.json\\"\)\.packageManager/u
   );
   assert.match(
     muslBuild,

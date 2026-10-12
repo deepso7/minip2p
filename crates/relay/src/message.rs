@@ -658,6 +658,44 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_invalid_field_numbers() {
+        let invalid = |field, offset| {
+            RelayMessageError::Wire(WireError::InvalidFieldNumber { field, offset })
+        };
+        assert_eq!(
+            HopMessage::decode(&[0x00, 0x00]).unwrap_err(),
+            invalid(0, 0)
+        );
+        // type = RESERVE, then field 2^29.
+        assert_eq!(
+            HopMessage::decode(&[0x08, 0x00, 0x80, 0x80, 0x80, 0x80, 0x10, 0x00]).unwrap_err(),
+            invalid(1 << 29, 2)
+        );
+        assert_eq!(
+            StopMessage::decode(&[0x00, 0x00]).unwrap_err(),
+            invalid(0, 0)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_invalid_field_numbers_in_nested_peer() {
+        // type = CONNECT, peer { id = [7], field 0 }: offset is relative to Peer.
+        let mut peer = Vec::new();
+        encode_bytes_field(&mut peer, 1, &[7]);
+        peer.extend_from_slice(&[0x00, 0x00]);
+        let mut buf = Vec::new();
+        encode_varint_field(&mut buf, 1, 1);
+        encode_bytes_field(&mut buf, 2, &peer);
+        assert_eq!(
+            HopMessage::decode(&buf),
+            Err(RelayMessageError::Wire(WireError::InvalidFieldNumber {
+                field: 0,
+                offset: 3
+            }))
+        );
+    }
+
+    #[test]
     fn decoder_skips_unknown_fields() {
         // RESERVE message with unknown field 99 before and after the type.
         let mut buf = Vec::new();
