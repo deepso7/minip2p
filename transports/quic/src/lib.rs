@@ -274,6 +274,11 @@ pub struct QuicTransport {
     /// receive bound, which reports itself as due now), so readiness only
     /// has to wake the host.
     registered: Vec<mio::net::UdpSocket>,
+    /// Readiness was dispatched since the last poll. Reported as due now, so
+    /// a host that skips this transport's poll for a turn (a `TransportSet`
+    /// handing over held-back events first) cannot park on an edge that will
+    /// not come again.
+    dispatched: bool,
     /// The engine's endpoint: routes datagrams to connections by connection
     /// id and answers what no connection owns.
     endpoint: quinn_proto::Endpoint,
@@ -473,6 +478,7 @@ impl QuicTransport {
         Ok(Self {
             sockets: Sockets::new(sockets),
             registered: Vec::new(),
+            dispatched: false,
             // No server config until `listen`: the endpoint accepts nothing.
             endpoint: quinn_proto::Endpoint::new(
                 Arc::new(endpoint_config),
@@ -598,7 +604,29 @@ impl QuicTransport {
             let Some(socket) = self.sockets.get_mut(index) else {
                 return Ok(());
             };
-            let received = match socket.recv(&mut self.recv_buf) {
+            // Through the registered clone's `try_io` once attached: on
+            // Windows mio only re-arms readiness when it sees the
+            // `WouldBlock` itself, and a receive on the original socket would
+            // hide it, leaving later datagrams with no wakeup.
+            let recv_buf = &mut self.recv_buf;
+            let received = match self.registered.get(index) {
+                Some(registered) => registered
+                    .try_io(|| {
+                        socket
+                            .recv(recv_buf)?
+                            .ok_or_else(|| std::io::ErrorKind::WouldBlock.into())
+                    })
+                    .map(Some)
+                    .or_else(|error| {
+                        if error.kind() == std::io::ErrorKind::WouldBlock {
+                            Ok(None)
+                        } else {
+                            Err(error)
+                        }
+                    }),
+                None => socket.recv(recv_buf),
+            };
+            let received = match received {
                 Ok(Some(received)) => received,
                 Ok(None) => {
                     saturated = false;
@@ -1057,6 +1085,7 @@ impl Transport for QuicTransport {
         let instant = Instant::now();
         self.clock = Some((now, instant));
         self.host_time.set(now.unix_seconds);
+        self.dispatched = false;
         // Events accumulate in `self.pending_events` for the whole poll and
         // are only taken at the very end, so an error path leaves the batch
         // queued for the next call instead of dropping it.
@@ -1085,7 +1114,10 @@ impl Transport for QuicTransport {
         // and nothing else would wake a host idling on `None`. A receive
         // batch cut off by its bound may have left input with no fresh
         // readiness edge to report it.
-        if !self.pending_events.is_empty() || self.sockets.iter().any(|socket| socket.saturated) {
+        if self.dispatched
+            || !self.pending_events.is_empty()
+            || self.sockets.iter().any(|socket| socket.saturated)
+        {
             return Some(Deadline::IMMEDIATE);
         }
 
@@ -1160,10 +1192,11 @@ impl Drop for QuicTransport {
     }
 }
 
-/// Registers a clone of every socket, one token each. Nothing to dispatch:
-/// every poll reads every socket until `WouldBlock`, and a receive batch cut
-/// off by its bound reports itself through `next_deadline`, so an edge is
-/// never needed twice.
+/// Registers a clone of every socket, one token each, and receives through
+/// it. Dispatch only records that something arrived: every poll reads every
+/// socket until `WouldBlock`, and until that poll runs `next_deadline` reports
+/// due now, as does a receive batch cut off by its bound, so an edge is never
+/// needed twice.
 impl PollSource for QuicTransport {
     fn attach(
         &mut self,
@@ -1182,7 +1215,9 @@ impl PollSource for QuicTransport {
         Ok(())
     }
 
-    fn dispatch(&mut self, _event: &Event) {}
+    fn dispatch(&mut self, _event: &Event) {
+        self.dispatched = true;
+    }
 }
 
 #[cfg(test)]
@@ -1540,6 +1575,39 @@ mod tests {
             assert!(
                 *best < Duration::from_millis(5),
                 "ipv6 {ipv6}: woke after {latencies:?}"
+            );
+        }
+    }
+
+    /// Each datagram after a full drain raises a fresh edge (on Windows that
+    /// needs the drain's `WouldBlock` to reach mio), and readiness that has
+    /// been dispatched but not polled yet keeps the transport due.
+    #[test]
+    fn every_arrival_after_a_drain_wakes_the_poll_and_stays_due_until_polled() {
+        let mut transport = loopback(QuicNodeConfig::generate());
+        let mut poll = minip2p_transport::SharedPoll::new().expect("poll");
+        poll.attach(&mut transport).expect("attach");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        let now = Now::from_millis(0);
+        for round in 0..3 {
+            sender
+                .send_to(&[round; 4], transport.local_addr())
+                .expect("send");
+            let events = poll
+                .harvest(&mut transport, Duration::from_secs(5))
+                .expect("harvest");
+            assert!(events > 0, "round {round}: no wakeup after the drain");
+            assert_eq!(
+                transport.next_deadline(),
+                Some(Deadline::IMMEDIATE),
+                "round {round}: dispatched readiness is due until polled"
+            );
+            transport.poll(now).expect("poll drains");
+            assert!(
+                transport
+                    .next_deadline()
+                    .is_none_or(|deadline| !deadline.is_expired_at(now)),
+                "round {round}: nothing left owed once polled"
             );
         }
     }

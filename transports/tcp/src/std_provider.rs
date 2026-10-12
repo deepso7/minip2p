@@ -299,6 +299,11 @@ pub struct StdTcpProvider {
     /// Rotating the start is what keeps a flooded listener from starving the
     /// ones after it; see [`accept_all`](Self::accept_all).
     accept_cursor: usize,
+    /// Readiness was dispatched since the last poll. A listener's or a
+    /// connecting socket's edge is serviced only by that poll, so until it
+    /// runs the provider reports itself due: a host that skips it for a turn
+    /// must not park on an edge that will not come again.
+    dispatched: bool,
 }
 
 impl StdTcpProvider {
@@ -317,6 +322,7 @@ impl StdTcpProvider {
             read_buffer: vec![0; READ_CHUNK],
             deferred_work: false,
             accept_cursor: 0,
+            dispatched: false,
         })
     }
 
@@ -747,6 +753,7 @@ impl TcpProvider for StdTcpProvider {
 
     fn poll(&mut self, _now: Now) -> Result<Vec<TcpEvent>, TcpError> {
         self.deferred_work = false;
+        self.dispatched = false;
         if self.registration.is_none() {
             // Nothing reports readiness yet, so every open socket may have
             // something; reading one that does not costs a `WouldBlock`.
@@ -766,11 +773,15 @@ impl TcpProvider for StdTcpProvider {
     }
 
     /// Due now while anything learned from readiness is still unserviced:
-    /// events not yet handed over, a socket marked readable, or work a
-    /// budget deferred. No edge will announce those again.
+    /// readiness dispatched since the last poll, events not yet handed over, a
+    /// socket marked readable, or work a budget deferred. No edge will
+    /// announce those again.
     fn next_deadline(&self) -> Option<Deadline> {
-        (!self.ready.is_empty() || self.deferred_work || !self.readable.is_empty())
-            .then_some(Deadline::IMMEDIATE)
+        (self.dispatched
+            || !self.ready.is_empty()
+            || self.deferred_work
+            || !self.readable.is_empty())
+        .then_some(Deadline::IMMEDIATE)
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {
@@ -822,6 +833,7 @@ impl PollSource for StdTcpProvider {
     }
 
     fn dispatch(&mut self, event: &Event) {
+        self.dispatched = true;
         let Some(slot) = self
             .registration
             .as_ref()
@@ -930,8 +942,15 @@ mod tests {
         let mut accepted = None;
         while accepted.is_none() {
             assert!(started.elapsed() < Duration::from_secs(5), "never accepted");
-            poll.harvest(&mut server, Duration::from_secs(5))
+            let events = poll
+                .harvest(&mut server, Duration::from_secs(5))
                 .expect("harvest");
+            // A listener's edge is serviced only by the poll; until then a
+            // host that skipped this provider for a turn must not park.
+            assert!(
+                events == 0 || TcpProvider::next_deadline(&server).is_some(),
+                "dispatched listener readiness is due until polled"
+            );
             accepted = server
                 .poll(Now::from_millis(0))
                 .expect("poll")
