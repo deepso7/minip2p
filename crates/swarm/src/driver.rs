@@ -2203,17 +2203,15 @@ mod tests {
     /// multistream-select negotiation but never sends protocol data, so an
     /// outbound ping dangles until its timeout.
     struct NeverRespondTransport {
-        clock: Arc<TestClock>,
         events: VecDeque<TransportEvent>,
         negotiators: BTreeMap<StreamId, MultistreamSelect>,
         next_stream: u64,
     }
 
     impl NeverRespondTransport {
-        fn connected(clock: Arc<TestClock>, peer_id: PeerId) -> Self {
+        fn connected(peer_id: PeerId) -> Self {
             let endpoint = ConnectionEndpoint::with_peer_id(Multiaddr::new(), peer_id);
             Self {
-                clock,
                 events: VecDeque::from([TransportEvent::Connected {
                     id: ConnectionId::new(1),
                     endpoint,
@@ -2338,7 +2336,7 @@ mod tests {
             public_key: keypair.public_key().encode_protobuf(),
         };
         let clock = Arc::new(TestClock::default());
-        let transport = NeverRespondTransport::connected(clock.clone(), remote_peer.clone());
+        let transport = NeverRespondTransport::connected(remote_peer.clone());
         let mut swarm = Swarm::with_clock(
             transport,
             identify,

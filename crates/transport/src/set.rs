@@ -722,8 +722,11 @@ mod tests {
             tokens: crate::TokenSpace,
             _waker: alloc::sync::Arc<mio::Waker>,
         ) -> std::io::Result<()> {
-            let mut socket = mio::net::UdpSocket::bind("127.0.0.1:0".parse().expect("addr"))?;
-            let token = tokens.token(0).ok_or_else(|| std::io::Error::other("no token"))?;
+            let mut socket =
+                mio::net::UdpSocket::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?;
+            let token = tokens
+                .token(0)
+                .ok_or_else(|| std::io::Error::other("no token"))?;
             registry.register(&mut socket, token, mio::Interest::READABLE)?;
             let mut log = self.log();
             log.attached = Some(tokens);

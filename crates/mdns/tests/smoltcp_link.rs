@@ -817,11 +817,16 @@ fn an_ingress_driven_host_hears_datagrams_its_device_no_longer_shows() {
     {
         let mut shared = stack.borrow_mut();
         let state = &mut *shared;
-        state
-            .interface
-            .poll(Instant::from_millis(0), &mut state.device, &mut state.sockets);
+        state.interface.poll(
+            Instant::from_millis(0),
+            &mut state.device,
+            &mut state.sockets,
+        );
     }
-    assert!(inbox.borrow().is_empty(), "the other user took the frame in");
+    assert!(
+        inbox.borrow().is_empty(),
+        "the other user took the frame in"
+    );
     assert!(
         host_wakes(&driver, &inbox, 0),
         "a datagram in mDNS's socket is a carrier deadline of now"
@@ -835,7 +840,10 @@ fn an_ingress_driven_host_hears_datagrams_its_device_no_longer_shows() {
     sender.poll(0).expect("put it on the bus");
     defer.set(1);
     driver.tick(0, &[]).expect("tick");
-    assert!(inbox.borrow().is_empty(), "the final poll took the frame in");
+    assert!(
+        inbox.borrow().is_empty(),
+        "the final poll took the frame in"
+    );
     assert!(
         host_wakes(&driver, &inbox, 0),
         "what the final poll delivered is owed a tick now"

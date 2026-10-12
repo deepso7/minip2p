@@ -34,12 +34,11 @@ pub use set::{RejectedTransport, TransportSet, TransportSetError};
 pub use stream_id::StreamId;
 pub use transport::Transport;
 
-#[cfg(feature = "std")]
-pub use poll::{
-    BlockingTransport, PollSource, SharedPoll, TokenSpace, TokenSpaceError, WaitHandle,
-    WakeHandle,
-};
 /// The readiness crate std sources register with, re-exported so a
 /// [`PollSource`] needs no extra dependency to name its types.
 #[cfg(feature = "std")]
 pub use mio;
+#[cfg(feature = "std")]
+pub use poll::{
+    BlockingTransport, PollSource, SharedPoll, TokenSpace, TokenSpaceError, WaitHandle, WakeHandle,
+};

@@ -15,8 +15,8 @@ use minip2p_relay::{
 };
 use minip2p_transport::mio::{Registry, Waker, event::Event};
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, PollSource, StreamId, TokenSpace, Transport,
-    TransportError, TransportEvent,
+    ConnectionEndpoint, ConnectionId, PollSource, StreamId, TokenSpace, Transport, TransportError,
+    TransportEvent,
 };
 
 /// Deterministic, connected, in-memory implementation of the transport contract.

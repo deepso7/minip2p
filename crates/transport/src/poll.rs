@@ -171,8 +171,12 @@ fn mask(bits: u32) -> usize {
 /// again.
 pub trait PollSource {
     /// Registers this source's sockets with the host's shared poll.
-    fn attach(&mut self, registry: Registry, tokens: TokenSpace, waker: Arc<Waker>)
-    -> io::Result<()>;
+    fn attach(
+        &mut self,
+        registry: Registry,
+        tokens: TokenSpace,
+        waker: Arc<Waker>,
+    ) -> io::Result<()>;
 
     /// Records readiness for one of this source's tokens.
     fn dispatch(&mut self, event: &Event);
@@ -457,7 +461,10 @@ mod tests {
             }
         }
         assert!(
-            matches!(error, Some(TokenSpaceError::Exhausted { prefix_bits: 8, .. })),
+            matches!(
+                error,
+                Some(TokenSpaceError::Exhausted { prefix_bits: 8, .. })
+            ),
             "{error:?}"
         );
         assert_eq!(
@@ -481,7 +488,7 @@ mod tests {
                 Ok(())
             }
         });
-        assert!(result.is_ok());
+        result.expect("the third poll succeeds");
         assert_eq!(timeouts.len(), 3);
         assert!(
             timeouts[2] <= Duration::from_millis(31),
@@ -533,7 +540,8 @@ mod tests {
         // Input and a host wake alone never read as an interrupt.
         first.waker.as_ref().expect("waker").wake().expect("wake");
         poll.wake_handle().wake();
-        poll.harvest(&mut first, Duration::from_secs(5)).expect("harvest");
+        poll.harvest(&mut first, Duration::from_secs(5))
+            .expect("harvest");
         assert!(!poll.take_interrupt());
         assert!(poll.take_wake());
 
@@ -541,8 +549,12 @@ mod tests {
         second.waker.as_ref().expect("waker").wake().expect("wake");
         poll.wait_handle().interrupt();
         poll.wait_handle().interrupt();
-        poll.harvest(&mut first, Duration::from_secs(5)).expect("harvest");
-        assert!(poll.take_interrupt(), "pending interrupts coalesce into one");
+        poll.harvest(&mut first, Duration::from_secs(5))
+            .expect("harvest");
+        assert!(
+            poll.take_interrupt(),
+            "pending interrupts coalesce into one"
+        );
         assert!(!poll.take_interrupt());
         assert!(poll.take_wake());
         assert_eq!(first.dispatched, 0, "the waker is nobody's socket");
@@ -557,9 +569,6 @@ mod tests {
             poll.attach_host_source(&mut source).expect("spare space");
             sources.push(source);
         }
-        assert!(
-            poll.attach_host_source(&mut Socketless::default())
-                .is_err()
-        );
+        assert!(poll.attach_host_source(&mut Socketless::default()).is_err());
     }
 }

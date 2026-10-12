@@ -732,14 +732,14 @@ impl TcpProvider for StdTcpProvider {
     fn abort(&mut self, socket: SocketHandle) {
         self.readable.remove(&socket);
         self.connecting.remove(&socket);
-        if let Some(mut entry) = self.sockets.remove(&socket) {
-            if let (Some(registration), Some(token)) = (self.registration.as_mut(), entry.token) {
-                registration.deregister(&mut entry.stream, token);
-            }
-            // Dropping the stream closes it. The kernel still flushes whatever
-            // it already accepted, so this is a close rather than a reset --
-            // the peer sees the stream end either way, which is what the
-            // contract promises.
+        // Dropping the stream closes it. The kernel still flushes whatever it
+        // already accepted, so this is a close rather than a reset -- the
+        // peer sees the stream end either way, which is what the contract
+        // promises.
+        if let Some(mut entry) = self.sockets.remove(&socket)
+            && let (Some(registration), Some(token)) = (self.registration.as_mut(), entry.token)
+        {
+            registration.deregister(&mut entry.stream, token);
         }
         // The caller asked for this, so it is owed no further events.
         self.discard_queued(socket);
@@ -869,7 +869,10 @@ mod tests {
     }
 
     fn token_of(provider: &StdTcpProvider, handle: SocketHandle) -> Option<Token> {
-        provider.sockets.get(&handle).and_then(|socket| socket.token)
+        provider
+            .sockets
+            .get(&handle)
+            .and_then(|socket| socket.token)
     }
 
     #[test]

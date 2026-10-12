@@ -97,6 +97,7 @@ pub use minip2p_relay_server::{
     RelayServerRuntimeErrorKind, ReservationCloseReason, Status,
 };
 use minip2p_swarm::SwarmBuilder;
+pub use minip2p_swarm::WaitHandle;
 pub use minip2p_swarm::{
     Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, Swarm, SwarmError, SwarmEvent,
 };
@@ -105,7 +106,6 @@ use minip2p_tcp::{StdTcpProvider, TcpConfig, TcpTransport};
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_transport::ConnectionNamespace;
 use minip2p_transport::Transport;
-pub use minip2p_swarm::WaitHandle;
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet};
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use std::str::FromStr;
@@ -2961,7 +2961,8 @@ mod tests {
         while !(settled && input) {
             match dialer.wait(deadline).expect("wait") {
                 EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
-                    connect_id: id, ..
+                    connect_id: id,
+                    ..
                 }) if id == connect_id => settled = true,
                 EndpointWaitOutcome::Event(EndpointEvent::PingTimeout { peer_id })
                     if peer_id == other =>
