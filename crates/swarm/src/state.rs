@@ -173,6 +173,16 @@ pub(crate) enum Action {
         stream_id: StreamId,
         bytes: usize,
     },
+    /// Mark a stream as one of the swarm's control streams, or back as an
+    /// application stream (`Transport::set_control_stream`). Every stream is
+    /// control while multistream negotiates it, and ping and Identify
+    /// streams stay so; a stream negotiated for an application protocol
+    /// becomes an application stream before the application sees it.
+    SetControlStream {
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        control: bool,
+    },
 }
 
 fn stream_action_matches(action: &Action, conn_id: ConnectionId, stream_id: StreamId) -> bool {
@@ -190,6 +200,11 @@ fn stream_action_matches(action: &Action, conn_id: ConnectionId, stream_id: Stre
             | Action::ResetStream {
                 conn_id: action_conn,
                 stream_id: action_stream,
+            }
+            | Action::SetControlStream {
+                conn_id: action_conn,
+                stream_id: action_stream,
+                ..
             }
             if *action_conn == conn_id && *action_stream == stream_id
     )
@@ -217,6 +232,10 @@ fn connection_action_matches(action: &Action, conn_id: ConnectionId) -> bool {
             conn_id: action_conn,
         }
         | Action::AckStream {
+            conn_id: action_conn,
+            ..
+        }
+        | Action::SetControlStream {
             conn_id: action_conn,
             ..
         } => *action_conn == conn_id,
@@ -1320,6 +1339,7 @@ impl SwarmState {
         target: ProtocolKind,
         now_ms: u64,
     ) {
+        self.mark_control(conn_id, stream_id, true);
         let mut negotiator = MultistreamSelect::dialer(protocol);
         negotiator.start();
         while let Some(output) = negotiator.poll_output() {
@@ -1945,7 +1965,18 @@ impl SwarmState {
     // Internal: stream event handling
     // -----------------------------------------------------------------------
 
+    /// Queues the mark that lets a stream write into the transport's control
+    /// reserve, or takes it away ([`Action::SetControlStream`]).
+    fn mark_control(&mut self, conn_id: ConnectionId, stream_id: StreamId, control: bool) {
+        self.actions.push_back(Action::SetControlStream {
+            conn_id,
+            stream_id,
+            control,
+        });
+    }
+
     fn handle_incoming_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        self.mark_control(conn_id, stream_id, true);
         let mut listener = MultistreamSelect::listener(self.inbound_protocols.clone());
         listener.start();
         self.inbound_negotiators
@@ -2420,6 +2451,7 @@ impl SwarmState {
 
         if self.inbound_protocols.iter().any(|p| p == protocol) {
             self.insert_stream_owner(conn_id, stream_id, ProtocolKind::User(protocol.to_string()));
+            self.mark_control(conn_id, stream_id, false);
             self.events.push_back(SwarmEvent::StreamReady {
                 peer_id,
                 conn_id,
@@ -2480,6 +2512,7 @@ impl SwarmState {
             }
             ProtocolKind::IdentifyResponder => {}
             ProtocolKind::User(protocol_id) => {
+                self.mark_control(conn_id, stream_id, false);
                 self.events.push_back(SwarmEvent::StreamReady {
                     peer_id,
                     conn_id,
@@ -3295,6 +3328,104 @@ mod tests {
         );
     }
 
+    /// The `control` values of the control-stream marks in `actions` for
+    /// `stream_id`, in order.
+    fn control_marks(actions: &[Action], stream_id: StreamId) -> Vec<bool> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::SetControlStream {
+                    stream_id: marked,
+                    control,
+                    ..
+                } if *marked == stream_id => Some(*control),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inbound_streams_are_control_until_they_negotiate_an_application_protocol() {
+        const PROTOCOL: &str = "/test/1";
+        let mut core = test_core();
+        core.add_protocol(PROTOCOL).expect("register protocol");
+        let peer_id = PeerId::from_public_key_protobuf(b"control-peer");
+        let conn_id = ConnectionId::new(7);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id, conn_id);
+
+        for (stream_id, protocol, marks) in [
+            (StreamId::new(3), PROTOCOL, [true, false].as_slice()),
+            (StreamId::new(7), PING_PROTOCOL_ID, [true].as_slice()),
+        ] {
+            feed(
+                &mut core,
+                TransportEvent::IncomingStream {
+                    id: conn_id,
+                    stream_id,
+                },
+            );
+            // Marked before negotiation writes anything on it.
+            let actions = drain_actions(&mut core);
+            assert!(matches!(
+                actions.first(),
+                Some(Action::SetControlStream { control: true, .. })
+            ));
+            let mut chunk = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+            chunk.extend_from_slice(&multistream_frame(protocol));
+            feed(
+                &mut core,
+                TransportEvent::StreamData {
+                    id: conn_id,
+                    stream_id,
+                    data: Bytes::from(chunk),
+                },
+            );
+            let mut all = actions;
+            all.extend(drain_actions(&mut core));
+            assert_eq!(control_marks(&all, stream_id), marks, "{protocol}");
+        }
+    }
+
+    #[test]
+    fn an_outbound_application_stream_is_control_only_while_it_negotiates() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"outbound-control-peer");
+        let (conn_id, stream_id) = (ConnectionId::new(61), StreamId::new(7));
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+            },
+        );
+        drain_actions(&mut core);
+        core.add_protocol("/app/1").expect("register");
+        core.open_stream(&peer, "/app/1").expect("admit open");
+        let opens = drain_actions(&mut core);
+        core.opened(opens, conn_id, "/app/1", stream_id);
+        let mut actions = drain_actions(&mut core);
+        // Marked before the negotiation's first write.
+        assert!(matches!(
+            actions.first(),
+            Some(Action::SetControlStream { control: true, .. })
+        ));
+        assert_eq!(control_marks(&actions, stream_id), [true]);
+
+        let mut answer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        answer.extend_from_slice(&multistream_frame("/app/1"));
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: Bytes::from(answer),
+            },
+        );
+        actions.extend(drain_actions(&mut core));
+        assert_eq!(control_marks(&actions, stream_id), [true, false]);
+    }
+
     #[test]
     fn inbound_multistream_accepts_fallback_after_na_on_same_stream() {
         const MESHSUB_V1_2: &str = "/meshsub/1.2.0";
@@ -3378,6 +3509,10 @@ mod tests {
         ));
         assert!(matches!(
             core.actions.pop_front(),
+            Some(Action::SetControlStream { control: false, .. })
+        ));
+        assert!(matches!(
+            core.actions.pop_front(),
             Some(Action::AckStream { .. })
         ));
         assert!(core.actions.is_empty());
@@ -3421,7 +3556,17 @@ mod tests {
             },
         );
         let header = multistream_frame(MULTISTREAM_PROTOCOL_ID);
-        assert_eq!(drain_actions(&mut core), [send(&header)]);
+        assert_eq!(
+            drain_actions(&mut core),
+            [
+                Action::SetControlStream {
+                    conn_id,
+                    stream_id,
+                    control: true,
+                },
+                send(&header),
+            ]
+        );
         core.handle_send_full(
             conn_id,
             stream_id,
@@ -3443,11 +3588,18 @@ mod tests {
         );
         assert_eq!(
             drain_actions(&mut core),
-            [Action::AckStream {
-                conn_id,
-                stream_id,
-                bytes: offer_len,
-            }],
+            [
+                Action::SetControlStream {
+                    conn_id,
+                    stream_id,
+                    control: false,
+                },
+                Action::AckStream {
+                    conn_id,
+                    stream_id,
+                    bytes: offer_len,
+                }
+            ],
             "only the offer's ack goes out"
         );
 
