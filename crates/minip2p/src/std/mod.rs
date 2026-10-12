@@ -1066,28 +1066,31 @@ impl Endpoint {
         let drain_by = std::time::Instant::now() + Duration::from_millis(500);
         loop {
             report.errors.extend(self.disconnect_established());
-            if std::time::Instant::now() >= drain_by {
-                break;
-            }
-            let harvested = if self.close_drain_busy() {
-                // Interrupts only end this sleep early.
-                self.block(WaitDeadline::from(drain_by))
+            // Out of time or failed: hand over what the swarm already queued
+            // (a disconnect's close failure, say) without polling again.
+            let (polled, last, now) = if std::time::Instant::now() >= drain_by {
+                (self.engine.core.take_buffered_events(), true, self.now())
             } else {
-                Ok(false)
+                let harvested = if self.close_drain_busy() {
+                    // Interrupts only end this sleep early.
+                    self.block(WaitDeadline::from(drain_by))
+                } else {
+                    Ok(false)
+                };
+                let harvested = match harvested {
+                    Ok(true) => Ok(()),
+                    Ok(false) => self.harvest(Duration::ZERO),
+                    Err(error) => Err(error),
+                };
+                let now = self.now();
+                match harvested.and_then(|()| self.engine.core.poll(now)) {
+                    Ok(polled) => (polled, false, now),
+                    Err(error) => {
+                        report.errors.push(error);
+                        (self.engine.core.take_buffered_events(), true, now)
+                    }
+                }
             };
-            let harvested = match harvested {
-                Ok(true) => Ok(()),
-                Ok(false) => self.harvest(Duration::ZERO),
-                Err(error) => Err(error),
-            };
-            let now = self.now();
-            let polled = harvested.and_then(|()| self.engine.core.poll(now));
-            let failed = polled.is_err();
-            let polled = polled.unwrap_or_else(|error| {
-                report.errors.push(error);
-                // What the swarm queued before the failure is still owed.
-                self.engine.core.take_buffered_events()
-            });
             let quiet = polled.is_empty();
             // No agent tick or discovery sweep runs while closing, so only
             // connection, attempt and capability events (a relay
@@ -1097,7 +1100,7 @@ impl Endpoint {
             }
             self.engine.settle(now);
             report.events.extend(self.engine.events.drain(..));
-            if failed
+            if last
                 || (quiet && (!self.close_drain_busy() || std::time::Instant::now() >= drain_by))
             {
                 break;
