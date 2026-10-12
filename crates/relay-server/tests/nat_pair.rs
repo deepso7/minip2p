@@ -493,8 +493,10 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         at(20),
     );
 
+    // Per-relay progress (`RelayStarted`) comes first.
     assert!(matches!(
-        source_nat.poll_event(),
+        core::iter::from_fn(|| source_nat.poll_event())
+            .find(|event| !matches!(event, NatEvent::RelayStarted { .. })),
         Some(NatEvent::PathEstablished {
             connect_id: id,
             peer: _,

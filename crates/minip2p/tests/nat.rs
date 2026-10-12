@@ -700,6 +700,104 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
     }
 }
 
+#[test]
+fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
+    let relay = relay_support::RelayServer::spawn();
+    let relay_addr = relay.addr().clone();
+
+    // A `force_relay` holder never starts DCUtR on its inbound circuits.
+    let mut responder = Endpoint::builder()
+        .relay(relay_addr.clone())
+        .nat_config(NatConfig {
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Always,
+            ..NatConfig::default()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind responder");
+    responder.listen().expect("responder listens");
+    let responder_peer = responder.peer_id().clone();
+    let reservation_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < reservation_deadline,
+            "responder did not reserve on relay"
+        );
+        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { .. })) = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder reservation")
+        {
+            break;
+        }
+        relay.assert_healthy();
+    }
+
+    let start_timeout_ms = 1_500;
+    let mut initiator = Endpoint::builder()
+        .relay(relay_addr)
+        .nat_config(NatConfig {
+            reservation_policy: ReservationPolicy::Never,
+            dcutr_start_timeout_ms: start_timeout_ms,
+            ..NatConfig::default()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind initiator");
+    initiator.listen().expect("initiator listens");
+    let started = Instant::now();
+    let connect_id = initiator
+        .connect(&responder_peer)
+        .expect("start relayed connect");
+
+    // The 30 s connect deadline is far off; the start timeout settles it.
+    let deadline = started + Duration::from_secs(10);
+    let mut relayed_at = None;
+    let outcome = loop {
+        assert!(Instant::now() < deadline, "connect did not settle");
+        if let Some(event) = initiator
+            .next_event(Duration::from_millis(20))
+            .expect("drive initiator")
+        {
+            match event {
+                EndpointEvent::Nat(NatEvent::PathEstablished { connect_id: id, .. })
+                    if id == connect_id =>
+                {
+                    relayed_at = Some(Instant::now());
+                }
+                EndpointEvent::ConnectSettled {
+                    connect_id: id,
+                    outcome,
+                    ..
+                } if id == connect_id => break outcome,
+                _ => {}
+            }
+        }
+        let _ = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder");
+        relay.assert_healthy();
+    };
+
+    match outcome {
+        ConnectOutcome::Connected { conn_id } => assert!(conn_id.is_circuit()),
+        other => panic!("expected Connected on the circuit, got {other:?}"),
+    }
+    let relayed_at = relayed_at.expect("the Relayed path was reported first");
+    assert!(
+        relayed_at.elapsed() >= Duration::from_millis(start_timeout_ms),
+        "the attempt waited for the remote to start DCUtR"
+    );
+    assert_eq!(
+        initiator.path(&responder_peer),
+        Some(Path::Relayed {
+            relay: relay.addr().peer_id().clone()
+        })
+    );
+}
+
 /// Records the first NAT path the Endpoint event stream reports for `id`.
 fn observe_path_event(
     event: &EndpointEvent,
