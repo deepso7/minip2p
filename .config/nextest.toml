@@ -65,7 +65,9 @@ default-filter = '''
 # `close()` drains for a fixed 500ms by design — shutdown stays bounded, so the
 # events it returns are best effort. The assertions are not: they are what keeps
 # a replaced connection from being dropped silently. The only way to have both
-# is to stop the box from stealing those 500ms, so these three run alone.
+# is to stop the box from stealing those 500ms, so these three run alone, as
+# does `relay_close_reports_the_reservations_it_ends`, which asserts that the
+# drain reports the reservations a relay's close ends.
 #
 # `threads-required` is what does that. A `[test-groups]` entry with
 # `max-threads = 1` would only keep the group's own members apart, leaving the
@@ -85,5 +87,6 @@ filter = '''
   or test(=quic_deadline_is_exposed_and_driven_without_socket_input)
   or test(=quiet_pair_stays_up_past_idle_timeout)
   or test(=std::nat_tests::idle_quic_relay_reservation_stays_live_past_transport_timeout)
+  or test(=std::nat_tests::relay_close_reports_the_reservations_it_ends)
 '''
 threads-required = "num-test-threads"

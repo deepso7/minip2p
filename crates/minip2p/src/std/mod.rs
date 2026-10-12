@@ -1080,27 +1080,26 @@ impl Endpoint {
                 Ok(false) => self.harvest(Duration::ZERO),
                 Err(error) => Err(error),
             };
-            if let Err(error) = harvested {
-                report.errors.push(error);
-                break;
-            }
             let now = self.now();
-            let polled = match self.engine.core.poll(now) {
-                Ok(polled) => polled,
-                Err(error) => {
-                    report.errors.push(error);
-                    break;
-                }
-            };
+            let polled = harvested.and_then(|()| self.engine.core.poll(now));
+            let failed = polled.is_err();
+            let polled = polled.unwrap_or_else(|error| {
+                report.errors.push(error);
+                // What the swarm queued before the failure is still owed.
+                self.engine.core.take_buffered_events()
+            });
             let quiet = polled.is_empty();
             // No agent tick or discovery sweep runs while closing, so only
-            // connection and attempt events are returned.
+            // connection, attempt and capability events (a relay
+            // reservation closing, say) are returned.
             for event in polled {
                 self.engine.ingest(event, now);
             }
+            self.engine.settle(now);
             report.events.extend(self.engine.events.drain(..));
-            report.events.extend(self.engine.collect_terminals(now));
-            if quiet && (!self.close_drain_busy() || std::time::Instant::now() >= drain_by) {
+            if failed
+                || (quiet && (!self.close_drain_busy() || std::time::Instant::now() >= drain_by))
+            {
                 break;
             }
         }

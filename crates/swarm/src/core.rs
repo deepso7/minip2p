@@ -713,7 +713,14 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// event at a time.
     pub fn poll(&mut self, now: Now) -> Result<Vec<SwarmEvent>, DriverError> {
         self.drive(now)?;
-        Ok(core::iter::from_fn(|| self.state.next_event()).collect())
+        Ok(self.take_buffered_events())
+    }
+
+    /// Hands out the events already produced without driving the transport,
+    /// so a host whose [`poll`](Self::poll) failed can still deliver what
+    /// was queued before it (a disconnect's close failure, say).
+    pub fn take_buffered_events(&mut self) -> Vec<SwarmEvent> {
+        core::iter::from_fn(|| self.state.next_event()).collect()
     }
 
     /// One drive iteration, leaving its events queued for delivery.
