@@ -21,7 +21,6 @@ mod payload;
 mod peer_addr;
 mod protobuf;
 mod protocol;
-mod sans_io;
 
 /// Shared, cheaply cloneable stream payload (ADR 0011).
 ///
@@ -43,4 +42,3 @@ pub use protobuf::{
     read_len_delimited, read_string, read_tag, read_varint_value, skip_field, tag_byte, write_tag,
 };
 pub use protocol::Protocol;
-pub use sans_io::SansIoProtocol;

@@ -14,12 +14,10 @@
 use alloc::vec::Vec;
 
 use minip2p_autonat::{
-    AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatClientInput, AutoNatClientOutput, Reachability,
+    AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatClientOutput, AutoNatError, Reachability,
 };
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol, select_direct_addrs};
-use minip2p_relay::{
-    HOP_PROTOCOL_ID, HopReservation, HopReservationInput, HopReservationOutput, ReservationOutcome,
-};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, select_direct_addrs};
+use minip2p_relay::{HOP_PROTOCOL_ID, HopReservation, HopReservationOutput, ReservationOutcome};
 use minip2p_transport::{ConnectionId, StreamId};
 
 use crate::ReservationPolicy;
@@ -362,13 +360,13 @@ impl Prober {
         }
     }
 
-    /// Feeds the AutoNAT client and returns the probe's verdict, if it
-    /// reached one; `Err` when the machine rejected the input.
-    fn feed(
+    /// Drains the AutoNAT client after an input and returns the probe's
+    /// verdict, if it reached one; `Err` when the machine rejected the input.
+    fn settle(
         machine: &mut AutoNatClient,
-        input: AutoNatClientInput,
+        fed: Result<(), AutoNatError>,
     ) -> Result<Option<Reachability>, ()> {
-        if machine.handle_input(input).is_err() {
+        if fed.is_err() {
             return Err(());
         }
         let mut sample = None;
@@ -395,16 +393,12 @@ impl Prober {
         let Some((conn, _)) = flight.stage.stream().filter(|(_, s)| *s == stream) else {
             return false;
         };
-        let machine_input = match (flight.stage, input) {
+        let Some(machine) = flight.machine.as_mut() else {
+            return false;
+        };
+        let fed = match (flight.stage, input) {
             (ExchangeStage::WaitStreamReady { .. }, StreamInput::Ready) => {
                 let server_peer = flight.server.peer_id().clone();
-                let Some(machine) = flight.machine.as_mut() else {
-                    return false;
-                };
-                if machine.handle_input(AutoNatClientInput::Flush).is_err() {
-                    self.abort_flight(swarm, shared, now);
-                    return false;
-                }
                 while let Some(output) = machine.poll_output() {
                     if let AutoNatClientOutput::Outbound(data) = output {
                         send(swarm, &server_peer, conn, stream, data, now);
@@ -413,11 +407,9 @@ impl Prober {
                 flight.stage = ExchangeStage::AwaitResponse { conn, stream };
                 return false;
             }
-            (ExchangeStage::AwaitResponse { .. }, StreamInput::Data(data)) => {
-                AutoNatClientInput::Data(data.to_vec())
-            }
+            (ExchangeStage::AwaitResponse { .. }, StreamInput::Data(data)) => machine.on_data(data),
             (ExchangeStage::AwaitResponse { .. }, StreamInput::RemoteWriteClosed) => {
-                AutoNatClientInput::RemoteWriteClosed
+                machine.on_remote_write_closed()
             }
             (_, StreamInput::Closed) => {
                 self.abort_flight(swarm, shared, now);
@@ -425,10 +417,7 @@ impl Prober {
             }
             _ => return false,
         };
-        let Some(machine) = flight.machine.as_mut() else {
-            return false;
-        };
-        match Self::feed(machine, machine_input) {
+        match Self::settle(machine, fed) {
             Err(()) => {
                 self.abort_flight(swarm, shared, now);
                 false
@@ -938,17 +927,13 @@ impl ReservationManager {
         let Some((conn, _)) = stage.stream().filter(|(_, s)| *s == stream) else {
             return;
         };
-        let machine_input = match (*stage, input) {
+        let Some(m) = machine.as_mut() else {
+            return;
+        };
+        let fed = match (*stage, input) {
             (ExchangeStage::WaitStreamReady { .. }, StreamInput::Ready) => {
                 let relay_peer = relay.peer_id().clone();
-                let Some(machine) = machine.as_mut() else {
-                    return;
-                };
-                if machine.handle_input(HopReservationInput::Flush).is_err() {
-                    self.fail_acquire(swarm, shared, now);
-                    return;
-                }
-                while let Some(output) = machine.poll_output() {
+                while let Some(output) = m.poll_output() {
                     if let HopReservationOutput::Outbound(data) = output {
                         send(swarm, &relay_peer, conn, stream, data, now);
                     }
@@ -956,11 +941,9 @@ impl ReservationManager {
                 *stage = ExchangeStage::AwaitResponse { conn, stream };
                 return;
             }
-            (ExchangeStage::AwaitResponse { .. }, StreamInput::Data(data)) => {
-                HopReservationInput::Data(data.to_vec())
-            }
+            (ExchangeStage::AwaitResponse { .. }, StreamInput::Data(data)) => m.on_data(data),
             (ExchangeStage::AwaitResponse { .. }, StreamInput::RemoteWriteClosed) => {
-                HopReservationInput::RemoteWriteClosed
+                m.on_remote_write_closed()
             }
             (_, StreamInput::Closed) => {
                 self.fail_acquire(swarm, shared, now);
@@ -968,10 +951,7 @@ impl ReservationManager {
             }
             _ => return,
         };
-        let Some(m) = machine.as_mut() else {
-            return;
-        };
-        if m.handle_input(machine_input).is_err() {
+        if fed.is_err() {
             self.fail_acquire(swarm, shared, now);
             return;
         }

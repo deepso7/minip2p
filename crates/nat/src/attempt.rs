@@ -3,11 +3,9 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, Protocol, SansIoProtocol};
-use minip2p_dcutr::{DcutrResponder, DcutrResponderInput, DcutrResponderOutput, ResponderEvent};
-use minip2p_relay::{
-    ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectInput, HopConnectOutput,
-};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, Protocol};
+use minip2p_dcutr::{DcutrError, DcutrResponder, DcutrResponderOutput, ResponderEvent};
+use minip2p_relay::{ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectOutput, RelayError};
 use minip2p_transport::{ConnectionId, StreamId};
 
 use crate::acquire::{self, AcquireError, Acquired};
@@ -77,7 +75,9 @@ pub(crate) struct ConnectAttempt {
     /// of the relay's share.
     relay_deadline: Option<u64>,
     hop: Option<HopConnect>,
-    dcutr: Option<DcutrResponder>,
+    /// The responder for an opened DCUtR stream, or the error that kept it
+    /// from being built, reported once the stream carries input.
+    dcutr: Option<Result<DcutrResponder, DcutrError>>,
     /// The inbound DCUtR stream, on the promoted circuit.
     dcutr_stream: Option<(ConnectionId, StreamId)>,
     /// The bridge exists and has not been torn down by a close/disconnect.
@@ -222,17 +222,24 @@ impl ConnectAttempt {
             return;
         };
         let exchange_closed = matches!(input, StreamInput::RemoteWriteClosed | StreamInput::Closed);
-        let machine_input = match input {
-            StreamInput::Data(data) => DcutrResponderInput::Data(data.to_vec()),
-            StreamInput::RemoteWriteClosed | StreamInput::Closed => {
-                DcutrResponderInput::RemoteWriteClosed
+        if matches!(input, StreamInput::Ready) {
+            return;
+        }
+        let dcutr = match self.dcutr.as_mut() {
+            Some(Ok(dcutr)) => dcutr,
+            Some(Err(error)) => {
+                let reason = error.to_string();
+                self.finish_failed_dcutr(reason, swarm, shared, now);
+                return;
             }
+            None => return,
+        };
+        let fed = match input {
+            StreamInput::Data(data) => dcutr.on_data(data),
+            StreamInput::RemoteWriteClosed | StreamInput::Closed => dcutr.on_remote_write_closed(),
             StreamInput::Ready => return,
         };
-        let Some(dcutr) = self.dcutr.as_mut() else {
-            return;
-        };
-        if let Err(error) = dcutr.handle_input(machine_input) {
+        if let Err(error) = fed {
             self.finish_failed_dcutr(error.to_string(), swarm, shared, now);
             return;
         }
@@ -630,9 +637,11 @@ impl ConnectAttempt {
             Ok(Acquired::Waiting) => self.leg = RelayLeg::WaitRelayReady,
             Ok(Acquired::Opened(conn, stream)) => {
                 if let Some(relay_peer) = self.relay_peer().cloned() {
-                    self.hop = Some(HopConnect::new(self.peer.to_bytes()));
                     shared.own_stream(&relay_peer, conn, stream, StreamRole::HopConnect(self.id));
                     self.leg = RelayLeg::WaitHopReady { conn, stream };
+                    let hop = HopConnect::new(self.peer.to_bytes())
+                        .map_err(|e| NatError::Protocol(e.to_string()))?;
+                    self.hop = Some(hop);
                 }
             }
             Err(AcquireError::Dial(reason)) => return Err(NatError::DialFailed(reason)),
@@ -663,12 +672,12 @@ impl ConnectAttempt {
         }
         match (self.leg, input) {
             (RelayLeg::WaitHopReady { conn, stream: s }, StreamInput::Ready) if s == stream => {
-                self.flush_hop_connect(conn, stream, swarm, shared, now);
+                self.flush_hop_connect(conn, stream, swarm, now);
             }
             (RelayLeg::AwaitHopStatus { stream: s, .. }, StreamInput::Data(data))
                 if s == stream =>
             {
-                self.on_hop_input(HopConnectInput::Data(data.to_vec()), swarm, shared, now);
+                self.on_hop_input(|hop| hop.on_data(data), swarm, shared, now);
             }
             (RelayLeg::Bridged { stream: s, .. }, StreamInput::Data(data)) if s == stream => {
                 self.bridge_pending_data.extend_from_slice(data);
@@ -682,7 +691,7 @@ impl ConnectAttempt {
                 // Let the sans-I/O machine consume it rather than treating
                 // it as a full circuit teardown; it may have a complete
                 // frame buffered already.
-                self.on_hop_input(HopConnectInput::RemoteWriteClosed, swarm, shared, now);
+                self.on_hop_input(HopConnect::on_remote_write_closed, swarm, shared, now);
             }
             (RelayLeg::Bridged { stream: s, .. }, StreamInput::RemoteWriteClosed)
                 if s == stream =>
@@ -804,7 +813,6 @@ impl ConnectAttempt {
         conn: ConnectionId,
         stream: StreamId,
         swarm: &mut dyn NatSwarm,
-        shared: &mut Shared,
         now: Now,
     ) {
         let Some(relay_peer) = self.relay_peer().cloned() else {
@@ -813,11 +821,6 @@ impl ConnectAttempt {
         let Some(hop) = self.hop.as_mut() else {
             return;
         };
-        if let Err(e) = hop.handle_input(HopConnectInput::Flush) {
-            let reason = e.to_string();
-            self.fail_relay_leg(NatError::Protocol(reason), swarm, shared, now);
-            return;
-        }
         while let Some(output) = hop.poll_output() {
             if let HopConnectOutput::Outbound(data) = output {
                 send(swarm, &relay_peer, conn, stream, data, now);
@@ -830,7 +833,7 @@ impl ConnectAttempt {
     /// half-close) and applies what it decides.
     fn on_hop_input(
         &mut self,
-        input: HopConnectInput,
+        feed: impl FnOnce(&mut HopConnect) -> Result<(), RelayError>,
         swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
         now: Now,
@@ -843,7 +846,7 @@ impl ConnectAttempt {
         let Some(hop) = self.hop.as_mut() else {
             return;
         };
-        if let Err(e) = hop.handle_input(input) {
+        if let Err(e) = feed(hop) {
             let reason = e.to_string();
             self.fail_relay_leg(NatError::Protocol(reason), swarm, shared, now);
             return;

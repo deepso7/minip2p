@@ -8,7 +8,7 @@ This crate implements the [multistream-select](https://github.com/multiformats/m
 
 - Varint-length-prefixed wire format (spec-compliant framing).
 - Dialer and listener roles.
-- Incremental `MultistreamInput::Data` handling for chunked/partial input.
+- Incremental `on_data` handling for chunked/partial input.
 - `MultistreamOutput` events for outbound data, negotiation result, and errors.
 - Typed `MultistreamError` with actionable context.
 - Zero-copy decoding where possible.
@@ -26,24 +26,21 @@ Each message is framed as:
 Negotiate a protocol between a dialer and listener:
 
 ```rust
-use minip2p_core::SansIoProtocol;
-use minip2p_multistream_select::{
-    MultistreamInput, MultistreamOutput, MultistreamSelect, MULTISTREAM_PROTOCOL_ID,
-};
+use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect, MULTISTREAM_PROTOCOL_ID};
 
 // Dialer side
 let mut dialer = MultistreamSelect::dialer("/ipfs/ping/1.0.0");
-dialer.handle_input(MultistreamInput::Start)?; // queues multistream header
+dialer.start(); // queues multistream header
 
 // Listener side
 let mut listener = MultistreamSelect::listener(["/ipfs/ping/1.0.0".to_string()]);
-listener.handle_input(MultistreamInput::Start)?; // queues multistream header
+listener.start(); // queues multistream header
 
 // Feed received bytes into each side:
-// dialer.handle_input(MultistreamInput::Data(bytes_from_listener))?;
-// listener.handle_input(MultistreamInput::Data(bytes_from_dialer))?;
+// dialer.on_data(&bytes_from_listener);
+// listener.on_data(&bytes_from_dialer);
 //
-// Drain outputs and check for MultistreamOutput::Negotiated { protocol }
+// After every input, drain outputs until `None` and check for MultistreamOutput::Negotiated { protocol }
 // to know when negotiation succeeds, or MultistreamOutput::NotAvailable
 // if the listener does not support the requested protocol.
 // while let Some(output) = dialer.poll_output() {

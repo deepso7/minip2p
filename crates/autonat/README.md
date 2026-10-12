@@ -6,7 +6,7 @@ AutoNAT answers whether a peer's advertised addresses are actually dialable by a
 
 ## Scope
 
-This crate implements message framing, encoding/decoding, and the client/server probe state machines. Protobuf field framing uses the shared vocabulary in `minip2p-core`; semantic validation, field-number 0 rejection, and contextual `AutoNatError` values stay here. It does **not**:
+This crate implements message framing, encoding/decoding, and the client/server probe state machines. Protobuf field framing uses the shared vocabulary in `minip2p-core`; invalid field numbers surface as `AutoNatError::Wire`; semantic validation and contextual `AutoNatError` values stay here. It does **not**:
 
 - Open streams.
 - Dial candidate addresses.
@@ -21,11 +21,10 @@ Runtime adapters or applications perform dial-back attempts and feed the result 
 
 ## Usage Sketch
 
+Each machine takes inputs through methods named for what they do (`on_data`, `on_remote_write_closed`, `respond_public`, `respond_error`) and exposes `poll_output`. After construction and after every input, drain `poll_output` until it returns `None` before waiting on the stream again.
+
 ```rust
-use minip2p_autonat::{
-    AutoNatClient, AutoNatClientOutput, AutoNatServer, AutoNatServerInput, AutoNatServerOutput,
-};
-use minip2p_core::SansIoProtocol;
+use minip2p_autonat::{AutoNatClient, AutoNatClientOutput, AutoNatServer, AutoNatServerOutput};
 
 let mut client = AutoNatClient::new(&our_peer_id, &candidate_addrs);
 let mut server = AutoNatServer::new();
@@ -34,18 +33,16 @@ while let Some(AutoNatClientOutput::Outbound(bytes)) = client.poll_output() {
     send_to_server(bytes);
 }
 
-server.handle_input(AutoNatServerInput::Data(bytes_from_client))?;
+server.on_data(&bytes_from_client)?;
 while let Some(output) = server.poll_output() {
     match output {
         AutoNatServerOutput::Request(request) => {
             // Runtime dials request.addrs for request.peer_id, then responds:
-            server.handle_input(AutoNatServerInput::RespondPublic { addrs: request.addrs })?;
+            server.respond_public(&request.addrs);
         }
         AutoNatServerOutput::Outbound(bytes) => send_to_client(bytes),
     }
 }
-
-server.handle_input(AutoNatServerInput::Flush)?;
 ```
 
 ## Size limits

@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use minip2p_core::write_uvarint;
 use minip2p_core::{
-    FrameExchange, FrameFault, Multiaddr, PeerId, SansIoProtocol, WIRE_LEN, WIRE_VARINT, WireError,
+    FrameExchange, FrameFault, Multiaddr, PeerId, WIRE_LEN, WIRE_VARINT, WireError,
     encode_bytes_field, encode_varint_field, read_len_delimited, read_tag, read_varint_value,
     skip_field, uvarint_len,
 };
@@ -118,19 +118,7 @@ pub struct AutoNatRequest {
     pub raw_addrs: Vec<Vec<u8>>,
 }
 
-/// Input accepted by [`AutoNatClient`] through [`SansIoProtocol`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AutoNatClientInput {
-    /// Drain any queued request bytes into an output.
-    Flush,
-    /// Bytes received from the AutoNAT service stream.
-    Data(Vec<u8>),
-    /// Remote write side closed. The local side remains usable; this lets the
-    /// client finish decoding any buffered response bytes.
-    RemoteWriteClosed,
-}
-
-/// Output produced by [`AutoNatClient`] through [`SansIoProtocol`].
+/// Output produced by [`AutoNatClient::poll_output`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AutoNatClientOutput {
     /// Bytes to write to the AutoNAT service stream.
@@ -139,25 +127,7 @@ pub enum AutoNatClientOutput {
     Outcome(Reachability),
 }
 
-/// Input accepted by [`AutoNatServer`] through [`SansIoProtocol`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AutoNatServerInput {
-    /// Bytes received from the requester stream.
-    Data(Vec<u8>),
-    /// Queue a successful DIAL_RESPONSE with dialable addresses.
-    RespondPublic { addrs: Vec<Multiaddr> },
-    /// Queue an unsuccessful DIAL_RESPONSE.
-    RespondError {
-        /// Response status.
-        status: ResponseStatus,
-        /// Human-readable reason.
-        reason: String,
-    },
-    /// Drain any queued response bytes into an output.
-    Flush,
-}
-
-/// Output produced by [`AutoNatServer`] through [`SansIoProtocol`].
+/// Output produced by [`AutoNatServer::poll_output`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AutoNatServerOutput {
     /// Dial-back request decoded from the requester.
@@ -313,7 +283,7 @@ impl AutoNatClient {
     }
 
     /// Feeds incoming bytes from the AutoNAT service stream.
-    fn on_data(&mut self, data: &[u8]) -> Result<(), AutoNatError> {
+    pub fn on_data(&mut self, data: &[u8]) -> Result<(), AutoNatError> {
         if self.state == FlowState::Done {
             return Ok(());
         }
@@ -321,8 +291,9 @@ impl AutoNatClient {
         self.try_decode_response()
     }
 
-    /// Notifies the client that the remote write half has closed.
-    fn on_remote_write_closed(&mut self) -> Result<(), AutoNatError> {
+    /// Notifies the client that the remote write half has closed, so it can
+    /// finish decoding any buffered response bytes.
+    pub fn on_remote_write_closed(&mut self) -> Result<(), AutoNatError> {
         self.try_decode_response()
     }
 
@@ -380,7 +351,7 @@ impl AutoNatServer {
     }
 
     /// Feeds incoming bytes from a requester.
-    fn on_data(&mut self, data: &[u8]) -> Result<(), AutoNatError> {
+    pub fn on_data(&mut self, data: &[u8]) -> Result<(), AutoNatError> {
         if self.state != ServerState::AwaitingRequest {
             return Ok(());
         }
@@ -395,12 +366,12 @@ impl AutoNatServer {
     }
 
     /// Queues a successful DIAL_RESPONSE with dialable addresses.
-    fn respond_public(&mut self, addrs: &[Multiaddr]) {
+    pub fn respond_public(&mut self, addrs: &[Multiaddr]) {
         self.respond(ResponseStatus::Ok, None, addrs);
     }
 
     /// Queues an unsuccessful DIAL_RESPONSE.
-    fn respond_error(&mut self, status: ResponseStatus, reason: impl Into<String>) {
+    pub fn respond_error(&mut self, status: ResponseStatus, reason: impl Into<String>) {
         self.respond(status, Some(reason.into()), &[]);
     }
 
@@ -463,21 +434,12 @@ impl AutoNatServer {
     }
 }
 
-impl SansIoProtocol for AutoNatClient {
-    type Input = AutoNatClientInput;
-    type Output = AutoNatClientOutput;
-    type Error = AutoNatError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        match input {
-            AutoNatClientInput::Flush => {}
-            AutoNatClientInput::Data(data) => self.on_data(&data)?,
-            AutoNatClientInput::RemoteWriteClosed => self.on_remote_write_closed()?,
-        }
-        Ok(())
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
+impl AutoNatClient {
+    /// Returns the next pending output, if any.
+    ///
+    /// Drain until `None` after construction and after every input, before
+    /// waiting on the stream again.
+    pub fn poll_output(&mut self) -> Option<AutoNatClientOutput> {
         let outbound = self.take_outbound();
         if !outbound.is_empty() {
             return Some(AutoNatClientOutput::Outbound(outbound));
@@ -490,30 +452,14 @@ impl SansIoProtocol for AutoNatClient {
         }
         None
     }
-
-    fn is_idle(&self) -> bool {
-        !self.frames.has_outbound() && (self.emitted_outcome || self.outcome.is_none())
-    }
 }
 
-impl SansIoProtocol for AutoNatServer {
-    type Input = AutoNatServerInput;
-    type Output = AutoNatServerOutput;
-    type Error = AutoNatError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        match input {
-            AutoNatServerInput::Data(data) => self.on_data(&data)?,
-            AutoNatServerInput::RespondPublic { addrs } => self.respond_public(&addrs),
-            AutoNatServerInput::RespondError { status, reason } => {
-                self.respond_error(status, reason);
-            }
-            AutoNatServerInput::Flush => {}
-        }
-        Ok(())
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
+impl AutoNatServer {
+    /// Returns the next pending output, if any.
+    ///
+    /// Drain until `None` after every input, before waiting on the stream or
+    /// the dial-back result again.
+    pub fn poll_output(&mut self) -> Option<AutoNatServerOutput> {
         if !self.emitted_request
             && let Some(request) = self.request.clone()
         {
@@ -525,10 +471,6 @@ impl SansIoProtocol for AutoNatServer {
             return Some(AutoNatServerOutput::Outbound(outbound));
         }
         None
-    }
-
-    fn is_idle(&self) -> bool {
-        !self.frames.has_outbound() && (self.emitted_request || self.request.is_none())
     }
 }
 
@@ -566,7 +508,7 @@ impl Message {
         let mut kind = None;
         let mut dial = None;
         let mut dial_response = None;
-        while let Some((field, wire)) = read_autonat_tag(input, &mut idx)? {
+        while let Some((field, wire)) = read_tag(input, &mut idx)? {
             match (field, wire) {
                 (1, WIRE_VARINT) => {
                     let value = read_varint_value(input, &mut idx)?;
@@ -603,7 +545,7 @@ impl Dial {
     fn decode(input: &[u8]) -> Result<Self, AutoNatError> {
         let mut idx = 0;
         let mut peer = None;
-        while let Some((field, wire)) = read_autonat_tag(input, &mut idx)? {
+        while let Some((field, wire)) = read_tag(input, &mut idx)? {
             match (field, wire) {
                 (1, WIRE_LEN) => {
                     peer = Some(PeerInfo::decode(read_len_delimited(input, &mut idx)?)?)
@@ -629,7 +571,7 @@ impl PeerInfo {
         let mut idx = 0;
         let mut id = Vec::new();
         let mut addrs = Vec::new();
-        while let Some((field, wire)) = read_autonat_tag(input, &mut idx)? {
+        while let Some((field, wire)) = read_tag(input, &mut idx)? {
             match (field, wire) {
                 (1, WIRE_LEN) => id = read_len_delimited(input, &mut idx)?.to_vec(),
                 (2, WIRE_LEN) => addrs.push(read_len_delimited(input, &mut idx)?.to_vec()),
@@ -658,7 +600,7 @@ impl DialResponse {
         let mut status = ResponseStatus::InternalError;
         let mut status_text = None;
         let mut addrs = Vec::new();
-        while let Some((field, wire)) = read_autonat_tag(input, &mut idx)? {
+        while let Some((field, wire)) = read_tag(input, &mut idx)? {
             match (field, wire) {
                 (1, WIRE_VARINT) => {
                     status = ResponseStatus::from_u64(read_varint_value(input, &mut idx)?)
@@ -724,15 +666,6 @@ fn decode_addrs(raw: &[Vec<u8>]) -> Vec<Multiaddr> {
     raw.iter()
         .filter_map(|bytes| Multiaddr::from_bytes(bytes).ok())
         .collect()
-}
-
-/// AutoNAT rejects protobuf field number 0; shared `read_tag` leaves that policy to callers.
-fn read_autonat_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, AutoNatError> {
-    let offset = *idx;
-    match read_tag(input, idx)? {
-        Some((0, wire_type)) => Err(WireError::UnsupportedWireType { wire_type, offset }.into()),
-        other => Ok(other),
-    }
 }
 
 #[cfg(test)]
@@ -1083,15 +1016,35 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_field_number_zero() {
-        let err = Message::decode(&[0x02, 0x00]).unwrap_err();
-        assert!(matches!(
-            err,
-            AutoNatError::Wire(WireError::UnsupportedWireType {
-                wire_type: WIRE_LEN,
+    fn decode_rejects_invalid_field_numbers() {
+        assert_eq!(
+            Message::decode(&[0x02, 0x00]).unwrap_err(),
+            AutoNatError::Wire(WireError::InvalidFieldNumber {
+                field: 0,
                 offset: 0
             })
-        ));
+        );
+        // Field 2^29 after a valid `type` field.
+        assert_eq!(
+            Message::decode(&[0x08, 0x00, 0x80, 0x80, 0x80, 0x80, 0x10, 0x00]).unwrap_err(),
+            AutoNatError::Wire(WireError::InvalidFieldNumber {
+                field: 1 << 29,
+                offset: 2
+            })
+        );
+    }
+
+    #[test]
+    fn decode_rejects_invalid_field_numbers_in_nested_peer_info() {
+        // type = DIAL, dial { peer { field 0 } }: offset is relative to PeerInfo.
+        let input = [0x08, 0x00, 0x12, 0x04, 0x0a, 0x02, 0x00, 0x00];
+        assert_eq!(
+            Message::decode(&input).unwrap_err(),
+            AutoNatError::Wire(WireError::InvalidFieldNumber {
+                field: 0,
+                offset: 0
+            })
+        );
     }
 
     #[test]
@@ -1113,42 +1066,34 @@ mod tests {
     }
 
     #[test]
-    fn client_and_server_implement_sans_io_protocol() {
+    fn client_and_server_drive_each_other_through_poll_output() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
         let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
         let mut client = AutoNatClient::new(&peer_id, core::slice::from_ref(&addr));
         let mut server = AutoNatServer::new();
 
-        client.handle_input(AutoNatClientInput::Flush).unwrap();
         let Some(AutoNatClientOutput::Outbound(request_bytes)) = client.poll_output() else {
             panic!("client should emit request bytes");
         };
 
-        server
-            .handle_input(AutoNatServerInput::Data(request_bytes))
-            .unwrap();
+        server.on_data(&request_bytes).unwrap();
         let Some(AutoNatServerOutput::Request(request)) = server.poll_output() else {
             panic!("server should emit request");
         };
         assert_eq!(request.peer_id, peer_id);
 
-        server
-            .handle_input(AutoNatServerInput::RespondPublic {
-                addrs: request.addrs,
-            })
-            .unwrap();
+        server.respond_public(&request.addrs);
         let Some(AutoNatServerOutput::Outbound(response_bytes)) = server.poll_output() else {
             panic!("server should emit response bytes");
         };
+        assert!(server.poll_output().is_none());
 
-        client
-            .handle_input(AutoNatClientInput::Data(response_bytes))
-            .unwrap();
+        client.on_data(&response_bytes).unwrap();
         assert!(matches!(
             client.poll_output(),
             Some(AutoNatClientOutput::Outcome(Reachability::Public { addrs, .. }))
                 if addrs == vec![addr]
         ));
-        assert!(client.is_idle());
+        assert!(client.poll_output().is_none());
     }
 }

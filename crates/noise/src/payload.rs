@@ -48,10 +48,6 @@ impl NoiseHandshakePayload {
         let mut extensions = None;
 
         while let Some((field, wire_type)) = read_tag(input, &mut cursor)? {
-            if field == 0 {
-                return Err(NoiseError::InvalidPayload("invalid field number zero"));
-            }
-
             match (field, wire_type) {
                 (FIELD_IDENTITY_KEY, WIRE_LEN) => {
                     set_unique_field(
@@ -107,6 +103,7 @@ fn set_unique_field<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minip2p_core::WireError;
     use minip2p_identity::{Ed25519Keypair, KeyType};
 
     #[test]
@@ -139,16 +136,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_field_number_zero() {
+    fn rejects_invalid_field_numbers() {
         let key = Ed25519Keypair::from_secret_key_bytes([3; 32]).public_key();
         let encoded = NoiseHandshakePayload::new(key, [7; 64]).encode();
 
-        for invalid_field in [[0x00, 0x00], [0x02, 0x00]] {
+        // Field 0 (varint and LEN), then field 2^29, each ahead of a valid payload.
+        let cases: [(&[u8], u64); 3] = [
+            (&[0x00, 0x00], 0),
+            (&[0x02, 0x00], 0),
+            (&[0x80, 0x80, 0x80, 0x80, 0x10, 0x00], 1 << 29),
+        ];
+        for (invalid_field, field) in cases {
             let mut payload = invalid_field.to_vec();
             payload.extend_from_slice(&encoded);
             assert_eq!(
                 NoiseHandshakePayload::decode(&payload),
-                Err(NoiseError::InvalidPayload("invalid field number zero"))
+                Err(NoiseError::Wire(WireError::InvalidFieldNumber {
+                    field,
+                    offset: 0
+                }))
             );
         }
     }

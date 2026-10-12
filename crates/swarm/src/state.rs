@@ -21,15 +21,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
 
-use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId, SansIoProtocol};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::{
-    IDENTIFY_PROTOCOL_ID, IdentifyAction, IdentifyConfig, IdentifyEvent, IdentifyInput,
-    IdentifyMessage, IdentifyOutput, IdentifyProtocol,
+    IDENTIFY_PROTOCOL_ID, IdentifyAction, IdentifyConfig, IdentifyEvent, IdentifyMessage,
+    IdentifyOutput, IdentifyProtocol,
 };
-use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
+use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
 use minip2p_ping::{
-    PING_PAYLOAD_LEN, PING_PROTOCOL_ID, PingAction, PingConfig, PingEvent, PingInput, PingOutput,
-    PingProtocol,
+    PING_PAYLOAD_LEN, PING_PROTOCOL_ID, PingAction, PingConfig, PingEvent, PingOutput, PingProtocol,
 };
 use minip2p_transport::{ConnectionId, ConnectionToken, StreamId, TransportEvent};
 
@@ -749,11 +748,7 @@ impl SwarmState {
         // Case 1: a ping stream is already negotiated -- fire now.
         if self.find_negotiated_ping_stream(peer_id).is_some() {
             self.ping
-                .handle_input(PingInput::SendPing {
-                    peer_id: peer_id.clone(),
-                    payload,
-                    now_ms,
-                })
+                .send_ping(peer_id, &payload, now_ms)
                 .map_err(|e| SwarmError::PingError {
                     reason: format!("{e}"),
                 })?;
@@ -1277,7 +1272,7 @@ impl SwarmState {
 
     /// Advances protocol timers to `now_ms`.
     pub fn handle_tick(&mut self, now_ms: u64) {
-        self.inform_ping(PingInput::Tick { now_ms });
+        self.ping.on_tick(now_ms);
         self.collect_protocol_events();
         // Safety net for deadlines whose ping was resolved without a
         // corresponding ping event (e.g. the stream fully closed): the tick
@@ -1315,24 +1310,6 @@ impl SwarmState {
         }
     }
 
-    /// Delivers a core-generated event to Ping.
-    ///
-    /// A rejected input can only be a late event for a stream or peer the
-    /// core has already torn down. There is no separate recovery action: the
-    /// core continues draining Ping's outputs so it can finish any cleanup it
-    /// did accept.
-    fn inform_ping(&mut self, input: PingInput) {
-        drop(self.ping.handle_input(input));
-    }
-
-    /// Delivers a core-generated event to Identify.
-    ///
-    /// As with Ping, a rejection identifies a late event after core state was
-    /// removed. The only useful follow-up is still to drain accepted output.
-    fn inform_identify(&mut self, input: IdentifyInput) {
-        drop(self.identify.handle_input(input));
-    }
-
     /// Starts multistream-select negotiation of `protocol` on an outbound
     /// stream the core just opened on `conn_id` at `now_ms`.
     pub fn start_outbound(
@@ -1344,15 +1321,7 @@ impl SwarmState {
         now_ms: u64,
     ) {
         let mut negotiator = MultistreamSelect::dialer(protocol);
-        if let Err(error) = negotiator.handle_input(MultistreamInput::Start) {
-            self.emit_error_for_stream(
-                SwarmErrorKind::Multistream,
-                self.established_peer_for_conn(conn_id),
-                Some(conn_id),
-                Some(stream_id),
-                format!("multistream start failed on outbound stream {stream_id}: {error}"),
-            );
-        }
+        negotiator.start();
         while let Some(output) = negotiator.poll_output() {
             self.handle_multistream_output(conn_id, stream_id, output, &mut None);
         }
@@ -1731,12 +1700,8 @@ impl SwarmState {
     /// Clears Ping and Identify state for `peer_id`, including a pending
     /// ping and its timer.
     fn reset_peer_protocols(&mut self, peer_id: &PeerId) {
-        self.inform_ping(PingInput::RemovePeer {
-            peer_id: peer_id.clone(),
-        });
-        self.inform_identify(IdentifyInput::RemovePeer {
-            peer_id: peer_id.clone(),
-        });
+        self.ping.remove_peer(peer_id);
+        self.identify.remove_peer(peer_id);
         self.drain_ping_outputs();
         self.drain_identify_outputs();
         self.pending_pings.remove(peer_id);
@@ -1943,14 +1908,8 @@ impl SwarmState {
             // State gathered under the placeholder belongs to this
             // connection, so it moves to the verified peer.
             self.peer_to_conn.remove(&stale);
-            self.inform_ping(PingInput::MigratePeer {
-                old_peer_id: stale.clone(),
-                new_peer_id: new_peer_id.clone(),
-            });
-            self.inform_identify(IdentifyInput::MigratePeer {
-                old_peer_id: stale.clone(),
-                new_peer_id: new_peer_id.clone(),
-            });
+            self.ping.migrate_peer(&stale, &new_peer_id);
+            self.identify.migrate_peer(&stale, &new_peer_id);
             self.drain_ping_outputs();
             self.drain_identify_outputs();
             if let Some(payload) = self.pending_pings.remove(&stale) {
@@ -1988,21 +1947,14 @@ impl SwarmState {
 
     fn handle_incoming_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
         let mut listener = MultistreamSelect::listener(self.inbound_protocols.clone());
-        if let Err(error) = listener.handle_input(MultistreamInput::Start) {
-            self.emit_error(
-                SwarmErrorKind::Multistream,
-                self.established_peer_for_conn(conn_id),
-                Some(conn_id),
-                format!("multistream start failed on inbound stream {stream_id}: {error}"),
-            );
-        }
+        listener.start();
         self.inbound_negotiators
             .insert((conn_id, stream_id), listener);
 
         while let Some(output) = self
             .inbound_negotiators
             .get_mut(&(conn_id, stream_id))
-            .and_then(SansIoProtocol::poll_output)
+            .and_then(MultistreamSelect::poll_output)
         {
             self.handle_multistream_output(conn_id, stream_id, output, &mut None);
         }
@@ -2054,20 +2006,11 @@ impl SwarmState {
 
         match protocol {
             ProtocolKind::Ping => {
-                self.inform_ping(PingInput::StreamData {
-                    peer_id,
-                    stream_id,
-                    data: data.into(),
-                    now_ms,
-                });
+                self.ping.on_stream_data(&peer_id, stream_id, &data, now_ms);
                 self.drain_ping_outputs();
             }
             ProtocolKind::IdentifyInitiator => {
-                self.inform_identify(IdentifyInput::StreamData {
-                    peer_id,
-                    stream_id,
-                    data: data.into(),
-                });
+                self.identify.on_stream_data(peer_id, stream_id, &data);
                 self.drain_identify_outputs();
             }
             ProtocolKind::IdentifyResponder => {
@@ -2095,11 +2038,12 @@ impl SwarmState {
 
         match protocol {
             ProtocolKind::Ping => {
-                self.inform_ping(PingInput::StreamRemoteWriteClosed { peer_id, stream_id });
+                self.ping.on_stream_remote_write_closed(&peer_id, stream_id);
                 self.drain_ping_outputs();
             }
             ProtocolKind::IdentifyInitiator => {
-                self.inform_identify(IdentifyInput::StreamRemoteWriteClosed { peer_id, stream_id });
+                self.identify
+                    .on_stream_remote_write_closed(peer_id, stream_id);
                 self.drain_identify_outputs();
             }
             ProtocolKind::IdentifyResponder => {}
@@ -2163,11 +2107,11 @@ impl SwarmState {
             let peer_id = key.peer_id;
             match protocol {
                 ProtocolKind::Ping => {
-                    self.inform_ping(PingInput::StreamClosed { peer_id, stream_id });
+                    self.ping.on_stream_closed(&peer_id, stream_id);
                     self.drain_ping_outputs();
                 }
                 ProtocolKind::IdentifyInitiator | ProtocolKind::IdentifyResponder => {
-                    self.inform_identify(IdentifyInput::StreamClosed { peer_id, stream_id });
+                    self.identify.on_stream_closed(peer_id, stream_id);
                     self.drain_identify_outputs();
                 }
                 ProtocolKind::User(_) => {
@@ -2267,24 +2211,12 @@ impl SwarmState {
         };
 
         let mut negotiated_protocol = None;
-        if let Err(error) = negotiator.handle_input(MultistreamInput::Data(data.to_vec())) {
-            self.emit_error_for_stream(
-                SwarmErrorKind::Multistream,
-                self.established_peer_for_conn(conn_id),
-                Some(conn_id),
-                Some(stream_id),
-                format!("multistream input failed on inbound stream {stream_id}: {error}"),
-            );
-            self.inbound_negotiators.remove(&key);
-            self.actions
-                .push_back(Action::ResetStream { conn_id, stream_id });
-            return 0;
-        }
+        negotiator.on_data(data);
 
         while let Some(output) = self
             .inbound_negotiators
             .get_mut(&key)
-            .and_then(SansIoProtocol::poll_output)
+            .and_then(MultistreamSelect::poll_output)
         {
             if self.handle_multistream_output(conn_id, stream_id, output, &mut negotiated_protocol)
             {
@@ -2332,22 +2264,7 @@ impl SwarmState {
             None => return 0,
         };
 
-        if let Err(error) = pending
-            .negotiator
-            .handle_input(MultistreamInput::Data(data.to_vec()))
-        {
-            self.emit_error_for_stream(
-                SwarmErrorKind::Multistream,
-                self.established_peer_for_conn(conn_id),
-                Some(conn_id),
-                Some(stream_id),
-                format!("multistream input failed on outbound stream {stream_id}: {error}"),
-            );
-            self.outbound_negotiators.remove(&key);
-            self.actions
-                .push_back(Action::ResetStream { conn_id, stream_id });
-            return 0;
-        }
+        pending.negotiator.on_data(data);
         let target = pending.target.clone();
         let mut negotiated = false;
 
@@ -2452,7 +2369,7 @@ impl SwarmState {
 
         if protocol == PING_PROTOCOL_ID {
             self.insert_stream_owner(conn_id, stream_id, ProtocolKind::Ping);
-            self.inform_ping(PingInput::RegisterInboundStream { peer_id, stream_id });
+            self.ping.register_inbound_stream(peer_id, stream_id);
             self.drain_ping_outputs();
             return;
         }
@@ -2470,14 +2387,12 @@ impl SwarmState {
             // moment; the core keeps `local_addresses` refreshed.
             let listen_addrs = self.local_addresses.clone();
             let responder_peer_id = peer_id.clone();
-            match self
-                .identify
-                .handle_input(IdentifyInput::RegisterOutboundStream {
-                    peer_id,
-                    stream_id,
-                    observed_addr,
-                    listen_addrs,
-                }) {
+            match self.identify.register_outbound_stream(
+                peer_id,
+                stream_id,
+                observed_addr,
+                &listen_addrs,
+            ) {
                 Ok(()) => {
                     // Only record ownership on success, so a rejected
                     // registration doesn't leave the stream tracked here
@@ -2527,10 +2442,10 @@ impl SwarmState {
 
         match target {
             ProtocolKind::Ping => {
-                if let Err(e) = self.ping.handle_input(PingInput::RegisterOutboundStream {
-                    peer_id: peer_id.clone(),
-                    stream_id,
-                }) {
+                if let Err(e) = self
+                    .ping
+                    .register_outbound_stream(peer_id.clone(), stream_id)
+                {
                     self.emit_error(
                         SwarmErrorKind::Ping,
                         Some(peer_id.clone()),
@@ -2545,11 +2460,7 @@ impl SwarmState {
                 self.drain_ping_outputs();
 
                 if let Some(payload) = self.pending_pings.remove(&peer_id) {
-                    match self.ping.handle_input(PingInput::SendPing {
-                        peer_id: peer_id.clone(),
-                        payload,
-                        now_ms,
-                    }) {
+                    match self.ping.send_ping(&peer_id, &payload, now_ms) {
                         Ok(()) => {
                             self.record_ping_deadline(&peer_id, now_ms);
                             self.drain_ping_outputs();
@@ -2564,7 +2475,7 @@ impl SwarmState {
                 }
             }
             ProtocolKind::IdentifyInitiator => {
-                self.inform_identify(IdentifyInput::RegisterInboundStream { peer_id, stream_id });
+                self.identify.register_inbound_stream(peer_id, stream_id);
                 self.drain_identify_outputs();
             }
             ProtocolKind::IdentifyResponder => {}
@@ -3114,9 +3025,7 @@ mod tests {
         core.conn_to_peer.insert(conn, peer.clone());
         core.peer_to_conn.insert(peer.clone(), conn);
         let mut negotiator = MultistreamSelect::dialer("/test/1");
-        negotiator
-            .handle_input(MultistreamInput::Start)
-            .expect("dialer starts");
+        negotiator.start();
         while negotiator.poll_output().is_some() {}
         core.outbound_negotiators.insert(
             (conn, stream),
@@ -3771,7 +3680,7 @@ mod tests {
 
         core.on_outbound_negotiated(conn_id, stream_id, ProtocolKind::Ping, 0);
 
-        assert!(core.ping.is_idle());
+        assert!(core.ping.poll_output().is_none());
         assert!(core.poll_output().is_none());
     }
 
@@ -4920,10 +4829,7 @@ mod tests {
         );
         core.insert_stream_owner(original_conn, stale_stream, ProtocolKind::Ping);
         core.ping
-            .handle_input(PingInput::RegisterOutboundStream {
-                peer_id: peer_id.clone(),
-                stream_id: stale_stream,
-            })
+            .register_outbound_stream(peer_id.clone(), stale_stream)
             .expect("register ping stream");
         while core.ping.poll_output().is_some() {}
 
@@ -5007,21 +4913,11 @@ mod tests {
         core.peer_to_conn.insert(peer_id.clone(), newer_conn);
         core.insert_stream_owner(original_conn, inbound_stream, ProtocolKind::Ping);
         core.ping
-            .handle_input(PingInput::RegisterInboundStream {
-                peer_id: peer_id.clone(),
-                stream_id: inbound_stream,
-            })
-            .expect("register inbound ping stream");
+            .register_inbound_stream(peer_id.clone(), inbound_stream);
         while core.ping.poll_output().is_some() {}
 
         core.ping
-            .handle_input(PingInput::StreamData {
-                peer_id,
-                stream_id: inbound_stream,
-                data: [7; PING_PAYLOAD_LEN].to_vec(),
-                now_ms: 42,
-            })
-            .expect("receive inbound ping");
+            .on_stream_data(&peer_id, inbound_stream, &[7; PING_PAYLOAD_LEN], 42);
         core.drain_ping_outputs();
         let actions = drain_actions(&mut core);
 
@@ -5051,22 +4947,12 @@ mod tests {
         core.peer_to_conn.insert(peer_id.clone(), newer_conn);
         core.insert_stream_owner(original_conn, stream_id, ProtocolKind::IdentifyInitiator);
         core.identify
-            .handle_input(IdentifyInput::RegisterInboundStream {
-                peer_id: peer_id.clone(),
-                stream_id,
-            })
-            .expect("register inbound identify stream");
+            .register_inbound_stream(peer_id.clone(), stream_id);
 
         // A header declaring a frame far beyond identify's limit.
         let mut data = Vec::new();
         minip2p_core::write_uvarint(u64::from(u32::MAX), &mut data);
-        core.identify
-            .handle_input(IdentifyInput::StreamData {
-                peer_id,
-                stream_id,
-                data,
-            })
-            .expect("refused bytes are reported, not returned");
+        core.identify.on_stream_data(peer_id, stream_id, &data);
         core.drain_identify_outputs();
 
         assert!(matches!(
@@ -5094,10 +4980,7 @@ mod tests {
         while core.poll_output().is_some() {}
         core.insert_stream_owner(conn_id, stream_id, ProtocolKind::Ping);
         core.ping
-            .handle_input(PingInput::RegisterOutboundStream {
-                peer_id: peer_id.clone(),
-                stream_id,
-            })
+            .register_outbound_stream(peer_id.clone(), stream_id)
             .expect("register outbound ping stream");
         while core.ping.poll_output().is_some() {}
     }

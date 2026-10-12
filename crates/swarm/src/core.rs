@@ -954,10 +954,9 @@ mod tests {
     use alloc::string::ToString;
     use alloc::vec;
 
-    use minip2p_core::SansIoProtocol;
     use minip2p_identify::IDENTIFY_PROTOCOL_ID;
     use minip2p_identity::Ed25519Keypair;
-    use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
+    use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
     use minip2p_ping::PING_PROTOCOL_ID;
     use minip2p_platform::EntropyError;
     use minip2p_transport::{ConnectionEndpoint, TransportEvent};
@@ -1054,11 +1053,7 @@ mod tests {
                     IDENTIFY_PROTOCOL_ID.to_string(),
                     PING_PROTOCOL_ID.to_string(),
                 ]);
-                listener
-                    .handle_input(MultistreamInput::Start)
-                    .map_err(|error| TransportError::PollError {
-                        reason: alloc::format!("listener start failed: {error}"),
-                    })?;
+                listener.start();
                 self.negotiators.insert(stream_id, listener);
             }
             Ok(stream_id)
@@ -1077,11 +1072,7 @@ mod tests {
                 return Ok(());
             };
 
-            negotiator
-                .handle_input(MultistreamInput::Data(data.to_vec()))
-                .map_err(|error| TransportError::PollError {
-                    reason: alloc::format!("listener negotiation input failed: {error}"),
-                })?;
+            negotiator.on_data(&data);
             let mut negotiated = false;
             let mut outbound = Vec::new();
             while let Some(output) = negotiator.poll_output() {
