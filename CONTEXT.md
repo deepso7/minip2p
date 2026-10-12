@@ -84,6 +84,10 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Unsettled stream**: A stream whose delivered bytes are not yet all acknowledged or abandoned. It keeps its stream slot even after closing, so stream churn cannot grow retained receive data. _Avoid_: zombie stream, lingering stream
 
+**QUIC memory budget**: The bytes one QUIC transport may commit to its connections and streams, across all its sockets. Every connection and stream holds a memory reservation against it, so the budget caps the transport's worst-case queued memory. _Avoid_: send budget, memory limit, quota
+
+**Memory reservation**: The share of a QUIC memory budget that a connection or stream holds from admission until its bytes are released, which for delivered data means acknowledged or abandoned. A connection or stream whose reservation does not fit is refused, not queued. Distinct from a relay reservation. _Avoid_: reservation (unqualified), allocation, quota
+
 **Manual acknowledgement**: A protocol registration whose stream data the application acknowledges itself (`stream_consumed`) once it has really consumed the bytes, instead of the Endpoint acknowledging data as its event is pulled. Every protocol registered through FFI uses it; the SDK acknowledges when `read()` returns a chunk or a `data` listener returns. _Avoid_: manual read, flow control mode
 
 ### Errors
