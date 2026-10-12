@@ -492,6 +492,7 @@ function convertEvent(event: NativeEvent, maps: NativeIdMaps): P2pEvent {
     case P2pEvent_Tags.IdentifyReceived: {
       return {
         inner: {
+          connId: maps.connectionIds.toPublic(BigInt(event.inner.connId)),
           info: identifyInfo(event.inner.info),
           peerId: event.inner.peerId,
         },

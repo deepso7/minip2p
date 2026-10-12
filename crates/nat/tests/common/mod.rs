@@ -182,6 +182,7 @@ pub fn identify_observed(node: &mut Node, reporter: &PeerId, addr: &Multiaddr, n
     node.handle_event(
         &SwarmEvent::IdentifyReceived {
             peer_id: reporter.clone(),
+            conn_id: ConnectionId::new(1),
             info: IdentifyMessage {
                 observed_addr: Some(addr.to_bytes()),
                 ..IdentifyMessage::default()

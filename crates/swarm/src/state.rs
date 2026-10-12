@@ -249,7 +249,7 @@ fn event_peer_mut(event: &mut SwarmEvent) -> Option<&mut PeerId> {
         | SwarmEvent::IdentifyReceived { peer_id, .. }
         | SwarmEvent::PeerReady { peer_id, .. }
         | SwarmEvent::PingRttMeasured { peer_id, .. }
-        | SwarmEvent::PingTimeout { peer_id }
+        | SwarmEvent::PingTimeout { peer_id, .. }
         | SwarmEvent::StreamReady { peer_id, .. }
         | SwarmEvent::StreamData { peer_id, .. }
         | SwarmEvent::StreamWritable { peer_id, .. }
@@ -1807,6 +1807,7 @@ impl SwarmState {
             self.ping_deadlines.remove(peer_id);
             self.events.push_back(SwarmEvent::PingTimeout {
                 peer_id: peer_id.clone(),
+                conn_id: old,
             });
             None
         } else {
@@ -2627,18 +2628,30 @@ impl SwarmState {
         self.drain_identify_outputs();
     }
 
+    // Ping and Identify outputs are drained right after the input that
+    // produced them, so the peer's current connection is the one the event
+    // came from. It is fixed here, at queue time: a later replacement must
+    // not re-attribute it.
     fn handle_ping_event(&mut self, event: PingEvent) {
         match event {
             PingEvent::RttMeasured {
                 peer_id, rtt_ms, ..
             } => {
                 self.ping_deadlines.remove(&peer_id);
-                self.events
-                    .push_back(SwarmEvent::PingRttMeasured { peer_id, rtt_ms });
+                if let Some(conn_id) = self.connection_id(&peer_id) {
+                    self.events.push_back(SwarmEvent::PingRttMeasured {
+                        peer_id,
+                        conn_id,
+                        rtt_ms,
+                    });
+                }
             }
             PingEvent::Timeout { peer_id, .. } => {
                 self.ping_deadlines.remove(&peer_id);
-                self.events.push_back(SwarmEvent::PingTimeout { peer_id });
+                if let Some(conn_id) = self.connection_id(&peer_id) {
+                    self.events
+                        .push_back(SwarmEvent::PingTimeout { peer_id, conn_id });
+                }
             }
             PingEvent::OutboundStreamClosed { ref peer_id, .. } => {
                 // The outbound stream carried the in-flight ping (if any);
@@ -2663,10 +2676,13 @@ impl SwarmState {
         match event {
             IdentifyEvent::Received { peer_id, info } => {
                 self.peer_info.insert(peer_id.clone(), info.clone());
-                self.events.push_back(SwarmEvent::IdentifyReceived {
-                    peer_id: peer_id.clone(),
-                    info,
-                });
+                if let Some(conn_id) = self.connection_id(&peer_id) {
+                    self.events.push_back(SwarmEvent::IdentifyReceived {
+                        peer_id: peer_id.clone(),
+                        conn_id,
+                        info,
+                    });
+                }
                 self.try_emit_peer_ready(&peer_id);
             }
             IdentifyEvent::Error { error, .. } => {
@@ -4596,7 +4612,15 @@ mod tests {
             .expect("not ready yet, so no protocol rejection");
 
         identify_on(&mut core, replacement, StreamId::new(1), &["/app/1"]);
-        assert_eq!(ready_conns(&drain_events(&mut core)), [replacement]);
+        let events = drain_events(&mut core);
+        assert_eq!(ready_conns(&events), [replacement]);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::IdentifyReceived { conn_id, .. } if *conn_id == replacement
+            )),
+            "Identify names the connection it arrived on: {events:?}"
+        );
         assert_eq!(
             core.peer_readiness(&peer_id).map(|(conn, _)| conn),
             Some(replacement)
@@ -4730,7 +4754,7 @@ mod tests {
         let timed_out: Vec<_> = outputs
             .iter()
             .filter_map(|output| match output {
-                Output::Event(SwarmEvent::PingTimeout { peer_id }) => Some(peer_id),
+                Output::Event(SwarmEvent::PingTimeout { peer_id, .. }) => Some(peer_id),
                 _ => None,
             })
             .collect();
@@ -5126,9 +5150,11 @@ mod tests {
         assert_eq!(core.next_deadline(Now::from_millis(1_500)), None);
         let events = drain_events(&mut core);
         assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, SwarmEvent::PingRttMeasured { .. }))
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::PingRttMeasured { conn_id: id, .. } if *id == conn_id
+            )),
+            "the RTT names the connection it was measured on: {events:?}"
         );
     }
 
@@ -5154,9 +5180,11 @@ mod tests {
         core.handle_tick(11_001);
         let events = drain_events(&mut core);
         assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, SwarmEvent::PingTimeout { .. }))
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::PingTimeout { conn_id: id, .. } if *id == conn_id
+            )),
+            "the timeout names the connection the ping was sent on: {events:?}"
         );
         assert_eq!(core.next_deadline(Now::from_millis(11_001)), None);
     }

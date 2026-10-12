@@ -2426,7 +2426,7 @@ mod tests {
             .expect("ping timeout event");
         assert!(matches!(
             event,
-            SwarmEvent::PingTimeout { peer_id } if peer_id == remote_peer
+            SwarmEvent::PingTimeout { peer_id, .. } if peer_id == remote_peer
         ));
 
         let waits = &swarm.wait_budgets;

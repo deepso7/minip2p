@@ -283,7 +283,7 @@ fn sample(m: &mut Endpoint, peer: &PeerId) -> Duration {
                 assert!(rtt <= SAMPLE_TIMEOUT, "ping sample took {rtt:?}");
                 return rtt;
             }
-            EndpointEvent::PingTimeout { peer_id } => {
+            EndpointEvent::PingTimeout { peer_id, .. } => {
                 assert!(&peer_id != peer, "ping timed out");
             }
             _ => {}

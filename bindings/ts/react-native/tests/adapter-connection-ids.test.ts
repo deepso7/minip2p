@@ -134,7 +134,7 @@ describe("React Native connection identities", () => {
     endpoint.on("peerReady", ({ peerId }) => peers.push(peerId));
     fake.enqueue([
       {
-        inner: { peerId: PEER, rttMs: 2n ** 63n },
+        inner: { connId: 1n, peerId: PEER, rttMs: 2n ** 63n },
         tag: "PingRttMeasured",
       },
       { inner: { connId: 1n, peerId: PEER, protocols: [] }, tag: "PeerReady" },

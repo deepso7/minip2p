@@ -2499,6 +2499,7 @@ mod tests {
         let other = Ed25519Keypair::generate().peer_id();
         dialer.engine.events.push_back(EndpointEvent::PingTimeout {
             peer_id: other.clone(),
+            conn_id: ConnectionId::new(1),
         });
 
         let (mut settled, mut queued) = (false, false);
@@ -2509,7 +2510,7 @@ mod tests {
                     connect_id: id,
                     ..
                 }) if id == connect_id => settled = true,
-                EndpointWaitOutcome::Event(EndpointEvent::PingTimeout { peer_id })
+                EndpointWaitOutcome::Event(EndpointEvent::PingTimeout { peer_id, .. })
                     if peer_id == other =>
                 {
                     queued = true;

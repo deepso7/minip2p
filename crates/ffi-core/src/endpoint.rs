@@ -1148,22 +1148,26 @@ mod tests {
             let mut events = endpoint.shared.lock_events();
             events.carry.push(P2pEvent::PingTimeout {
                 peer_id: "a".into(),
+                conn_id: 1,
             });
             events.carry.push(P2pEvent::PingTimeout {
                 peer_id: "b".into(),
+                conn_id: 1,
             });
         }
 
         assert_eq!(
             endpoint.drain_events(1),
             vec![P2pEvent::PingTimeout {
-                peer_id: "a".into()
+                peer_id: "a".into(),
+                conn_id: 1,
             }]
         );
         assert_eq!(
             endpoint.drain_events(1),
             vec![P2pEvent::PingTimeout {
-                peer_id: "b".into()
+                peer_id: "b".into(),
+                conn_id: 1,
             }]
         );
         assert!(endpoint.drain_events(1).is_empty());
@@ -1195,6 +1199,7 @@ mod tests {
         let endpoint = endpoint(config()).expect("endpoint");
         let ping = P2pEvent::PingTimeout {
             peer_id: "a".into(),
+            conn_id: 1,
         };
         endpoint.shared.lock_events().carry.push(ping.clone());
         // A driver parked in `wait` holds the state lock.

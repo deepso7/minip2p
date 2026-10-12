@@ -468,7 +468,7 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
         a_log
             .wait_for(Duration::from_secs(5), |event| matches!(
                 event,
-                P2pEvent::IdentifyReceived { peer_id, info }
+                P2pEvent::IdentifyReceived { peer_id, info, .. }
                     if peer_id == &b_peer && info.protocols.iter().any(|id| id == protocol)
             ))
             .is_some()

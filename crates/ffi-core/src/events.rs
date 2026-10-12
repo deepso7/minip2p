@@ -245,6 +245,8 @@ pub enum P2pEvent {
     IdentifyReceived {
         /// Remote peer.
         peer_id: String,
+        /// The connection the snapshot arrived on.
+        conn_id: u64,
         /// Decoded Identify information.
         info: IdentifyInfo,
     },
@@ -252,6 +254,8 @@ pub enum P2pEvent {
     PingRttMeasured {
         /// Remote peer.
         peer_id: String,
+        /// The connection the ping was measured on.
+        conn_id: u64,
         /// Round-trip duration in milliseconds.
         rtt_ms: u64,
     },
@@ -259,6 +263,8 @@ pub enum P2pEvent {
     PingTimeout {
         /// Remote peer.
         peer_id: String,
+        /// The connection the ping was sent on.
+        conn_id: u64,
     },
     /// A custom application stream completed protocol negotiation.
     StreamReady {
@@ -544,8 +550,13 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
             old_conn_id: old.as_u64(),
             new_conn_id: new.as_u64(),
         },
-        EndpointEvent::IdentifyReceived { peer_id, info } => P2pEvent::IdentifyReceived {
+        EndpointEvent::IdentifyReceived {
+            peer_id,
+            conn_id,
+            info,
+        } => P2pEvent::IdentifyReceived {
             peer_id: peer_id.to_base58(),
+            conn_id: conn_id.as_u64(),
             info: convert_identify(&info),
         },
         EndpointEvent::PeerReady {
@@ -557,12 +568,18 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
             conn_id: conn_id.as_u64(),
             protocols,
         },
-        EndpointEvent::PingRttMeasured { peer_id, rtt_ms } => P2pEvent::PingRttMeasured {
+        EndpointEvent::PingRttMeasured {
+            peer_id,
+            conn_id,
+            rtt_ms,
+        } => P2pEvent::PingRttMeasured {
             peer_id: peer_id.to_base58(),
+            conn_id: conn_id.as_u64(),
             rtt_ms,
         },
-        EndpointEvent::PingTimeout { peer_id } => P2pEvent::PingTimeout {
+        EndpointEvent::PingTimeout { peer_id, conn_id } => P2pEvent::PingTimeout {
             peer_id: peer_id.to_base58(),
+            conn_id: conn_id.as_u64(),
         },
         EndpointEvent::StreamReady {
             peer_id,
@@ -951,6 +968,28 @@ mod tests {
                 protocols: vec!["/example/1".into()],
             })
         );
+        assert_eq!(
+            convert_swarm(EndpointEvent::PingRttMeasured {
+                peer_id: remote.clone(),
+                conn_id: ConnectionId::new(18),
+                rtt_ms: 7,
+            }),
+            Some(P2pEvent::PingRttMeasured {
+                peer_id: remote.to_base58(),
+                conn_id: 18,
+                rtt_ms: 7,
+            })
+        );
+        assert_eq!(
+            convert_swarm(EndpointEvent::PingTimeout {
+                peer_id: remote.clone(),
+                conn_id: ConnectionId::new(18),
+            }),
+            Some(P2pEvent::PingTimeout {
+                peer_id: remote.to_base58(),
+                conn_id: 18,
+            })
+        );
     }
 
     #[test]
@@ -961,6 +1000,7 @@ mod tests {
         assert_eq!(
             convert_swarm(EndpointEvent::IdentifyReceived {
                 peer_id: remote.clone(),
+                conn_id: ConnectionId::new(8),
                 info: minip2p::IdentifyMessage {
                     listen_addrs: vec![address.to_bytes()],
                     protocols: vec!["/example/1".into()],
@@ -969,6 +1009,7 @@ mod tests {
             }),
             Some(P2pEvent::IdentifyReceived {
                 peer_id: remote.to_base58(),
+                conn_id: 8,
                 info: IdentifyInfo {
                     public_key: None,
                     listen_addrs: vec![address.to_string()],

@@ -680,7 +680,7 @@ impl NatAgent {
                 touched_state = true;
                 self.connection_replaced(peer_id, *old, *new, is_circuit, swarm, now);
             }
-            SwarmEvent::IdentifyReceived { peer_id, info } => {
+            SwarmEvent::IdentifyReceived { peer_id, info, .. } => {
                 // The remote reports the transport address it sees us from.
                 // Behind a NAT that is our public mapping — the only usable
                 // DCUtR punch candidate, since bound addresses are private.

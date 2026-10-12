@@ -308,7 +308,9 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
     let mut ping_rtt = None;
     while ping_rtt.is_none() {
         assert!(Instant::now() < ping_deadline, "circuit ping timed out");
-        if let Some(EndpointEvent::PingRttMeasured { peer_id, rtt_ms }) = initiator
+        if let Some(EndpointEvent::PingRttMeasured {
+            peer_id, rtt_ms, ..
+        }) = initiator
             .next_event(Duration::from_millis(20))
             .expect("drive initiator ping")
             && peer_id == responder_peer

@@ -291,7 +291,11 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
         EndpointEvent::ConnectionReplaced { peer_id, old, new } => {
             println!("[{role}] connection-replaced peer={peer_id} old={old} new={new}");
         }
-        EndpointEvent::IdentifyReceived { peer_id, info } => {
+        EndpointEvent::IdentifyReceived {
+            peer_id,
+            conn_id,
+            info,
+        } => {
             let agent = info.agent_version.as_deref().unwrap_or("?");
             let nprotos = info.protocols.len();
             let protocols = format_protocols(&info.protocols);
@@ -302,7 +306,7 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|| "?".into());
             println!(
-                "[{role}] identify peer={peer_id} agent={agent} protocols={nprotos} list=[{protocols}] observed={observed}"
+                "[{role}] identify peer={peer_id} conn={conn_id} agent={agent} protocols={nprotos} list=[{protocols}] observed={observed}"
             );
         }
         EndpointEvent::PeerReady {
@@ -317,11 +321,15 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
                 protocol_list
             );
         }
-        EndpointEvent::PingRttMeasured { peer_id, rtt_ms } => {
-            println!("[{role}] ping peer={peer_id} rtt={rtt_ms}ms");
+        EndpointEvent::PingRttMeasured {
+            peer_id,
+            conn_id,
+            rtt_ms,
+        } => {
+            println!("[{role}] ping peer={peer_id} conn={conn_id} rtt={rtt_ms}ms");
         }
-        EndpointEvent::PingTimeout { peer_id } => {
-            println!("[{role}] ping-timeout peer={peer_id}");
+        EndpointEvent::PingTimeout { peer_id, conn_id } => {
+            println!("[{role}] ping-timeout peer={peer_id} conn={conn_id}");
         }
         EndpointEvent::StreamReady {
             peer_id,

@@ -934,6 +934,7 @@ fn undecodable_observed_addr_bytes_are_ignored() {
     h.agent.handle_event(
         &SwarmEvent::IdentifyReceived {
             peer_id: relay,
+            conn_id: ConnectionId::new(1),
             info: minip2p_swarm::IdentifyMessage {
                 observed_addr: Some(vec![0xff, 0xff, 0xff]),
                 ..minip2p_swarm::IdentifyMessage::default()
