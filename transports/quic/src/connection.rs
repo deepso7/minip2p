@@ -216,7 +216,9 @@ pub(crate) struct QuicConnection {
     /// Stream limit per direction: it caps local opens, and the peer's open
     /// and unsettled streams.
     max_streams: u64,
-    /// Total application bytes queued but not yet accepted by the engine.
+    /// Total application bytes queued but not yet accepted by the engine:
+    /// always the sum of every queue's `pending`, so subtracting a queue's
+    /// share cannot underflow.
     pending_write_bytes: usize,
     /// How much may queue per stream and per connection.
     caps: SendCaps,

@@ -3357,6 +3357,7 @@ mod tests {
         for (stream_id, protocol, marks) in [
             (StreamId::new(3), PROTOCOL, [true, false].as_slice()),
             (StreamId::new(7), PING_PROTOCOL_ID, [true].as_slice()),
+            (StreamId::new(11), IDENTIFY_PROTOCOL_ID, [true].as_slice()),
         ] {
             feed(
                 &mut core,
