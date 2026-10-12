@@ -344,7 +344,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
                 } if peer_id == responder_peer && stream_id == stream => {
                     initiator_stream_ready = true;
                     initiator
-                        .send_stream(&responder_peer, conn, stream, payload.clone())
+                        .send_stream(conn, stream, payload.clone())
                         .expect("send echo payload");
                 }
                 EndpointEvent::StreamData {
@@ -379,7 +379,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
                     && Some((conn_id, stream_id)) == responder_stream =>
                 {
                     responder
-                        .send_stream(&initiator_peer, conn_id, stream_id, data)
+                        .send_stream(conn_id, stream_id, data)
                         .expect("echo payload");
                 }
                 _ => {}
@@ -618,7 +618,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
                     ..
                 } if peer_id == responder_peer && stream_id == stream => {
                     initiator
-                        .send_stream(&responder_peer, conn, stream, payload.clone())
+                        .send_stream(conn, stream, payload.clone())
                         .expect("send echo payload");
                 }
                 EndpointEvent::StreamData {
@@ -653,7 +653,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
                     && Some((conn_id, stream_id)) == responder_stream =>
                 {
                     responder
-                        .send_stream(&initiator_peer, conn_id, stream_id, data)
+                        .send_stream(conn_id, stream_id, data)
                         .expect("echo payload");
                 }
                 _ => {}

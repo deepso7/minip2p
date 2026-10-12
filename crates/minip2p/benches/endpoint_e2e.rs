@@ -106,7 +106,7 @@ impl EchoServer {
                         data,
                     }) if streams.contains(&(peer_id.clone(), conn_id, stream_id)) => {
                         endpoint
-                            .send_stream(&peer_id, conn_id, stream_id, data)
+                            .send_stream(conn_id, stream_id, data)
                             .expect("echo");
                     }
                     Some(EndpointEvent::StreamRemoteWriteClosed {
@@ -115,7 +115,7 @@ impl EchoServer {
                         stream_id,
                     }) if streams.contains(&(peer_id.clone(), conn_id, stream_id)) => {
                         endpoint
-                            .close_stream_write(&peer_id, conn_id, stream_id)
+                            .close_stream_write(conn_id, stream_id)
                             .expect("close echo");
                     }
                     Some(EndpointEvent::StreamClosed {
@@ -188,7 +188,7 @@ impl Crossed {
             vec![HashMap::<(ConnectionId, StreamId), Vec<u8>>::new(); self.clients.len()];
         while pending.iter().any(|streams| !streams.is_empty()) {
             assert!(Instant::now() < deadline, "crossed echo timeout");
-            for (index, (client, peer)) in self.clients.iter_mut().enumerate() {
+            for (index, (client, _)) in self.clients.iter_mut().enumerate() {
                 let Some(event) = next_event(client, Duration::from_millis(1)) else {
                     continue;
                 };
@@ -205,10 +205,10 @@ impl Crossed {
                             .is_some_and(|streams| streams.contains(&(conn_id, stream_id))) =>
                     {
                         client
-                            .send_stream(peer, conn_id, stream_id, payload.clone())
+                            .send_stream(conn_id, stream_id, payload.clone())
                             .expect("send");
                         client
-                            .close_stream_write(peer, conn_id, stream_id)
+                            .close_stream_write(conn_id, stream_id)
                             .expect("close write");
                     }
                     EndpointEvent::StreamData {
@@ -301,7 +301,6 @@ impl Pair {
                     let end = payload.len().min(32 * 1024);
                     self.client
                         .send_stream(
-                            &self.peer,
                             conn_id,
                             stream_id,
                             payload.get(..end).expect("first payload chunk").to_vec(),
@@ -326,7 +325,6 @@ impl Pair {
                         let end = payload.len().min(*sent + 32 * 1024);
                         self.client
                             .send_stream(
-                                &self.peer,
                                 conn_id,
                                 stream_id,
                                 payload
@@ -340,7 +338,7 @@ impl Pair {
                     if response.len() == payload.len() {
                         assert_eq!(*response, payload);
                         self.client
-                            .close_stream_write(&self.peer, conn_id, stream_id)
+                            .close_stream_write(conn_id, stream_id)
                             .expect("close write");
                         pending.remove(&(conn_id, stream_id));
                     }

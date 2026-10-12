@@ -38,10 +38,10 @@ use alloc::vec::Vec;
 #[cfg(not(feature = "_mdns-driver"))]
 use core::marker::PhantomData;
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
 use minip2p_platform::{Deadline as PollDeadline, EntropySource, Now};
 use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
-use minip2p_transport::{ConnectionId, StreamId, Transport};
+use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
 #[cfg(feature = "_discovery-driver")]
 use crate::discovery::{DiscoveryDriver, resolve_book_candidates};
@@ -249,6 +249,75 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         self.core.disconnect(peer_id, now.monotonic_ms)
     }
 
+    /// The peer a stream operation on `stream_id` of `conn_id` addresses:
+    /// the connection's peer while it is established, otherwise the peer a
+    /// stream event still queued for it names (how `abandon_stream` reaches
+    /// a stream whose `StreamClosed` is undelivered). The swarm then checks
+    /// the exact connection, so a stale id never reaches a replacement's
+    /// stream. A connection with neither is
+    /// [`TransportError::ConnectionNotFound`].
+    fn stream_peer(
+        &self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<PeerId, DriverError> {
+        self.core
+            .connection_peer(conn_id)
+            .or_else(|| {
+                self.events
+                    .iter()
+                    .find_map(|event| event.stream_peer(conn_id, stream_id))
+            })
+            .or_else(|| {
+                self.core.buffered_events().find_map(|event| {
+                    event
+                        .peer_id()
+                        .filter(|peer| event.matches_stream(peer, conn_id, stream_id))
+                })
+            })
+            .cloned()
+            .ok_or(DriverError::Transport(TransportError::ConnectionNotFound {
+                id: conn_id,
+            }))
+    }
+
+    /// Sends on an application stream; see `Endpoint::send_stream`.
+    pub(crate) fn send_stream(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        data: Bytes,
+        now: Now,
+    ) -> Result<(), DriverError> {
+        let peer_id = self.stream_peer(conn_id, stream_id)?;
+        self.core
+            .send_stream(&peer_id, conn_id, stream_id, data, now.monotonic_ms)
+    }
+
+    /// Half-closes an application stream's write side.
+    pub(crate) fn close_stream_write(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now: Now,
+    ) -> Result<(), DriverError> {
+        let peer_id = self.stream_peer(conn_id, stream_id)?;
+        self.core
+            .close_stream_write(&peer_id, conn_id, stream_id, now.monotonic_ms)
+    }
+
+    /// Resets an application stream.
+    pub(crate) fn reset_stream(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now: Now,
+    ) -> Result<(), DriverError> {
+        let peer_id = self.stream_peer(conn_id, stream_id)?;
+        self.core
+            .reset_stream(&peer_id, conn_id, stream_id, now.monotonic_ms)
+    }
+
     /// Resets and forgets a stream, dropping its events still queued here.
     ///
     /// A queued `StreamClosed` proves the stream existed even though the
@@ -259,11 +328,11 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// is ignored.
     pub(crate) fn abandon_stream(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
+        let peer_id = &self.stream_peer(conn_id, stream_id)?;
         let queued_close = self.events.iter().any(|event| {
             matches!(event, EndpointEvent::StreamClosed { .. })
                 && event.matches_stream(peer_id, conn_id, stream_id)

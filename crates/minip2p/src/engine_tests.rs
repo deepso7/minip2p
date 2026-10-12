@@ -384,7 +384,7 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
     }
     let now = Now::from_millis(clock.get());
     for chunk in 0..8u8 {
-        a.send_stream(&b_peer, conn, stream, vec![chunk; 16], now)
+        a.send_stream(conn, stream, vec![chunk; 16], now)
             .expect("send");
     }
 

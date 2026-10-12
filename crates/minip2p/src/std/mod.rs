@@ -40,6 +40,9 @@ mod dial;
 mod nat_tests;
 #[cfg(feature = "relay-server")]
 pub(crate) mod relay_server;
+mod writer;
+
+pub use writer::{StreamWriteError, StreamWriter, WriteAccepted, WriteProgress};
 
 use std::time::Duration;
 
@@ -570,55 +573,66 @@ impl Endpoint {
             .open_stream(peer_id, protocol_id, now.monotonic_ms)
     }
 
-    /// Sends bytes on a negotiated application stream.
+    /// Sends bytes on a negotiated application stream, named by the
+    /// connection and stream ids [`Self::open_stream`] or
+    /// [`EndpointEvent::StreamReady`] gave; the peer is the connection's.
     ///
-    /// Accepts as much of `data` as the stream can queue (ADR 0012). When not
-    /// every byte fit, returns [`Error::Full`] carrying the exact unsent
-    /// suffix: hold it, wait for [`EndpointEvent::StreamWritable`] for the
-    /// stream, and send it again. Full is retryable, never a fault. Close the
-    /// write side only once every held tail has been accepted.
+    /// Accepts as much of `data` as the stream can queue (ADR 0012), and
+    /// `Ok(())` means every byte was accepted locally, not delivered. When
+    /// not every byte fit it returns [`Error::Full`]: **a prefix may already
+    /// have been accepted, and only `unsent` is yours.** Hold it, wait for
+    /// [`EndpointEvent::StreamWritable`] for the stream, and send it again.
+    /// Full is retryable ([`Error::is_retryable`]), never a fault, so `?` on
+    /// this call silently drops the tail:
+    ///
+    /// ```rust,ignore
+    /// endpoint.send_stream(conn_id, stream_id, payload)?; // loses `unsent` on Full
+    /// ```
+    ///
+    /// [`StreamWriter`](crate::StreamWriter) holds the tail, resends it on
+    /// Writable, and defers a write-side close behind it, which is what most
+    /// applications want.
     ///
     /// Fails with [`SwarmError::StreamNotFound`] if `conn_id` is no longer
-    /// the peer's connection holding the stream (for example after
+    /// the connection holding the stream (for example after
     /// `ConnectionReplaced`), so a write never reaches a same-numbered stream
-    /// on a newer connection. The other stream operations behave the same.
+    /// on a newer connection, and with
+    /// [`TransportError::ConnectionNotFound`] once nothing names the
+    /// connection any more. [`Error::is_stream_gone`] covers both. The other
+    /// stream operations behave the same.
     pub fn send_stream(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
         data: impl Into<Bytes>,
     ) -> Result<(), Error> {
         let now = self.now();
         self.engine
-            .core
-            .send_stream(peer_id, conn_id, stream_id, data.into(), now.monotonic_ms)
+            .send_stream(conn_id, stream_id, data.into(), now)
     }
 
     /// Half-closes the local write side of an application stream.
+    ///
+    /// The FIN follows every byte the stream accepted; a tail you hold after
+    /// a Full is not among them. [`StreamWriter::close_write`](crate::StreamWriter::close_write)
+    /// waits for its own pending tail first.
     pub fn close_stream_write(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), Error> {
         let now = self.now();
-        self.engine
-            .core
-            .close_stream_write(peer_id, conn_id, stream_id, now.monotonic_ms)
+        self.engine.close_stream_write(conn_id, stream_id, now)
     }
 
     /// Resets an application stream.
     pub fn reset_stream(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), Error> {
         let now = self.now();
-        self.engine
-            .core
-            .reset_stream(peer_id, conn_id, stream_id, now.monotonic_ms)
+        self.engine.reset_stream(conn_id, stream_id, now)
     }
 
     /// Resets and forgets an application stream that will no longer be consumed.
@@ -629,15 +643,16 @@ impl Endpoint {
     /// no-op. A stream the peer has already closed has nothing left to reset:
     /// it is abandoned (and its undelivered data acknowledged) only while its
     /// [`EndpointEvent::StreamClosed`] is undelivered, and fails with
-    /// [`SwarmError::StreamNotFound`] after that, including on a second call.
+    /// [`SwarmError::StreamNotFound`] (or
+    /// [`TransportError::ConnectionNotFound`] once its connection is gone)
+    /// after that, including on a second call.
     pub fn abandon_stream(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), Error> {
         let now = self.now();
-        self.engine.abandon_stream(peer_id, conn_id, stream_id, now)
+        self.engine.abandon_stream(conn_id, stream_id, now)
     }
 
     /// Runs one drive batch without blocking and returns every queued event.
@@ -4304,7 +4319,7 @@ mod tests {
         };
         // The reader closes first, so the writer's FIN closes the stream.
         reader
-            .close_stream_write(&writer_peer, conn, stream)
+            .close_stream_write(conn, stream)
             .expect("reader close");
         loop {
             assert!(std::time::Instant::now() < give_up, "reader FIN lost");
@@ -4318,10 +4333,10 @@ mod tests {
         }
         let conn_out = writer.core().connection_id(&reader_peer).expect("conn");
         writer
-            .send_stream(&reader_peer, conn_out, out_stream, vec![1, 2, 3])
+            .send_stream(conn_out, out_stream, vec![1, 2, 3])
             .expect("send");
         writer
-            .close_stream_write(&reader_peer, conn_out, out_stream)
+            .close_stream_write(conn_out, out_stream)
             .expect("writer close");
         writer.next_event(tick).expect("flush writer");
 
@@ -4344,9 +4359,7 @@ mod tests {
             }
         }
 
-        reader
-            .abandon_stream(&writer_peer, conn, stream)
-            .expect("abandon");
+        reader.abandon_stream(conn, stream).expect("abandon");
         // Its three bytes were acknowledged, so the stream settled and an
         // over-acknowledgement is a no-op rather than `AckExceedsDelivered`.
         reader

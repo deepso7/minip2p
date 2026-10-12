@@ -416,10 +416,10 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
             })
         {
             dialer
-                .send_stream(&listener_peer, conn_id, stream_id, PAYLOAD.to_vec(), now)
+                .send_stream(conn_id, stream_id, PAYLOAD.to_vec(), now)
                 .expect("payload sends");
             dialer
-                .close_stream_write(&listener_peer, conn_id, stream_id, now)
+                .close_stream_write(conn_id, stream_id, now)
                 .expect("write side closes");
             payload_sent = true;
         }
