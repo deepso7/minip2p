@@ -24,7 +24,9 @@ fn pending_write_bytes(server: &QuicTransport, id: ConnectionId) -> usize {
 /// A server whose write queue holds at most `bytes`.
 fn server_with_queue(bytes: usize) -> QuicTransport {
     listening_server(QuicLimits {
-        max_pending_stream_bytes: bytes,
+        max_pending_bytes_per_stream: bytes,
+        max_pending_connection_bytes: bytes,
+        control_stream_reserve_bytes: 0,
         ..QuicLimits::default()
     })
 }

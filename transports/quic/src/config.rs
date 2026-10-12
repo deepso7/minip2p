@@ -12,17 +12,32 @@ pub struct QuicLimits {
     pub max_connections: usize,
     /// Maximum locally initiated bidirectional streams per connection.
     pub max_streams_per_connection: u64,
-    /// Maximum application bytes queued per connection beyond what the QUIC
-    /// engine accepts immediately, shared by all its streams. Must be
-    /// non-zero.
+    /// Maximum application bytes queued per stream beyond what the QUIC
+    /// engine accepts immediately. Must be non-zero.
     ///
-    /// A write takes what the engine accepts now plus what fits here, regardless
-    /// of the peer's flow-control credit, and returns
+    /// A stream stalled on the peer's credit fills only this share, so it
+    /// cannot keep the connection's other streams from writing (ADR 0012).
+    pub max_pending_bytes_per_stream: usize,
+    /// Maximum application bytes queued per connection beyond what the QUIC
+    /// engine accepts immediately, shared by all its streams. Must be greater
+    /// than [`control_stream_reserve_bytes`](Self::control_stream_reserve_bytes).
+    ///
+    /// A write takes what the engine accepts now plus what fits both this and
+    /// [`max_pending_bytes_per_stream`](Self::max_pending_bytes_per_stream),
+    /// regardless of the peer's flow-control credit, and returns
     /// [`TransportError::Full`](minip2p_transport::TransportError::Full) with
-    /// the rest. Armed streams get a
+    /// the rest. An armed stream gets a
     /// [`StreamWritable`](minip2p_transport::TransportEvent::StreamWritable)
-    /// once at least half of this is free again.
-    pub max_pending_stream_bytes: usize,
+    /// once it can queue at least half of the smaller cap again. Queued bytes
+    /// enter the engine round-robin across streams. Neither cap counts the
+    /// engine's own send buffer.
+    pub max_pending_connection_bytes: usize,
+    /// Part of [`max_pending_connection_bytes`](Self::max_pending_connection_bytes)
+    /// that only control streams may fill: those the swarm marks with
+    /// [`Transport::set_control_stream`](minip2p_transport::Transport::set_control_stream)
+    /// (ping, Identify, multistream negotiation). Application streams cannot
+    /// starve them of it.
+    pub control_stream_reserve_bytes: usize,
     /// Maximum UDP datagrams retained after the non-blocking socket reports
     /// `WouldBlock`.
     pub max_pending_datagrams: usize,
@@ -42,7 +57,9 @@ impl Default for QuicLimits {
         Self {
             max_connections: 1_024,
             max_streams_per_connection: 128,
-            max_pending_stream_bytes: 8 * 1024 * 1024,
+            max_pending_bytes_per_stream: 256 * 1024,
+            max_pending_connection_bytes: 8 * 1024 * 1024,
+            control_stream_reserve_bytes: 256 * 1024,
             max_pending_datagrams: 1_024,
             idle_timeout_ms: 30_000,
             require_address_validation: true,
