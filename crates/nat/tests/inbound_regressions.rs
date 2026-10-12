@@ -768,3 +768,51 @@ fn no_blast_leaves_after_the_upgrade_budget() {
     assert_eq!(blast_count(&drain_actions(&mut h.agent)), 0);
     assert!(h.agent.is_idle());
 }
+
+#[test]
+fn a_reply_after_the_exchange_budget_starts_the_next_round_instead() {
+    let mut h = inbound_harness(NatConfig {
+        dcutr_exchange_timeout_ms: 5,
+        ..NatConfig::default()
+    });
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+
+    // The reply lands before any tick expired the exchange.
+    answer_dcutr_at(
+        &mut h,
+        conn,
+        stream,
+        &["/ip4/8.8.8.8/udp/4001/quic-v1"],
+        100,
+    );
+    let actions = drain_actions(&mut h.agent);
+    assert!(has_reset_for(&actions, stream));
+    assert_eq!(send_stream_count(&actions), 0, "no SYNC");
+    assert_eq!(blast_count(&actions), 0);
+    assert_ne!(opened_stream(&actions), stream);
+}
+
+#[test]
+fn a_reply_after_the_upgrade_budget_ends_coordination() {
+    let mut h = inbound_harness(NatConfig {
+        upgrade_timeout_ms: 50,
+        ..NatConfig::default()
+    });
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+
+    answer_dcutr_at(
+        &mut h,
+        conn,
+        stream,
+        &["/ip4/8.8.8.8/udp/4001/quic-v1"],
+        100,
+    );
+    let actions = drain_actions(&mut h.agent);
+    assert_eq!(send_stream_count(&actions), 0, "no SYNC");
+    assert_eq!(blast_count(&actions), 0);
+    assert!(h.agent.is_idle());
+}

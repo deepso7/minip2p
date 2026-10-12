@@ -540,6 +540,18 @@ impl InboundCircuit {
         let Some((conn, _)) = self.dcutr_stream.filter(|(_, s)| *s == stream) else {
             return;
         };
+        // Input can arrive before the tick that expires the exchange or the
+        // upgrade: expire them first, as that tick would have.
+        let expired = [self.dcutr_deadline, self.upgrade_deadline]
+            .into_iter()
+            .flatten()
+            .any(|deadline| now.monotonic_ms >= deadline);
+        if expired {
+            self.on_tick(swarm, shared, now);
+            if self.done || self.dcutr_stream != Some((conn, stream)) {
+                return;
+            }
+        }
         let rtt_ms = self
             .dcutr_connect_sent_at
             .map_or(0, |sent_at| now.monotonic_ms.saturating_sub(sent_at));
