@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 
 use minip2p::{
-    ConnectionId, Deadline, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId,
-    StreamId,
+    ConnectionId, Deadline, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, StreamId,
+    StreamWriter,
 };
 
 const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";
 
-fn main() -> Result<(), minip2p::Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut node = Endpoint::builder()
         .agent_version("minip2p-stream/listener")
         .protocol(ECHO_PROTOCOL)
@@ -18,46 +18,46 @@ fn main() -> Result<(), minip2p::Error> {
         println!("listen={}", local_dialable(&address));
     }
 
-    // Stream ids are per connection, so a stream is named by all three.
-    let mut echo_streams: HashSet<(PeerId, ConnectionId, StreamId)> = HashSet::new();
+    // Stream ids are per connection, so a stream is named by both.
+    let mut echo_streams: HashSet<(ConnectionId, StreamId)> = HashSet::new();
+    // Holds what a full stream could not take yet and finishes it on
+    // `StreamWritable`; `?` on a bare `send_stream` would drop that tail.
+    let mut writer = StreamWriter::new(1024 * 1024);
 
     loop {
         let EndpointWaitOutcome::Event(event) = node.wait(Deadline::NEVER)? else {
             continue;
         };
+        writer.observe(&mut node, &event);
         match event {
             EndpointEvent::StreamReady {
-                peer_id,
                 conn_id,
                 stream_id,
                 protocol_id,
                 initiated_locally: false,
+                ..
             } if protocol_id == ECHO_PROTOCOL => {
-                echo_streams.insert((peer_id, conn_id, stream_id));
+                echo_streams.insert((conn_id, stream_id));
             }
             EndpointEvent::StreamData {
-                peer_id,
                 conn_id,
                 stream_id,
                 data,
-            } if echo_streams.contains(&(peer_id.clone(), conn_id, stream_id)) => {
-                node.send_stream(&peer_id, conn_id, stream_id, data)?;
-                node.close_stream_write(&peer_id, conn_id, stream_id)?;
-                echo_streams.remove(&(peer_id, conn_id, stream_id));
+                ..
+            } if echo_streams.remove(&(conn_id, stream_id)) => {
+                // The FIN waits for every byte of the echo.
+                writer.write(&mut node, conn_id, stream_id, data)?;
+                writer.close_write(&mut node, conn_id, stream_id)?;
             }
             EndpointEvent::StreamRemoteWriteClosed {
-                peer_id,
-                conn_id,
-                stream_id,
-            } if echo_streams.remove(&(peer_id.clone(), conn_id, stream_id)) => {
-                node.close_stream_write(&peer_id, conn_id, stream_id)?;
+                conn_id, stream_id, ..
+            } if echo_streams.remove(&(conn_id, stream_id)) => {
+                writer.close_write(&mut node, conn_id, stream_id)?;
             }
             EndpointEvent::StreamClosed {
-                peer_id,
-                conn_id,
-                stream_id,
+                conn_id, stream_id, ..
             } => {
-                echo_streams.remove(&(peer_id, conn_id, stream_id));
+                echo_streams.remove(&(conn_id, stream_id));
             }
             EndpointEvent::Error(error) => eprintln!("runtime error: {error:?}"),
             _ => {}
