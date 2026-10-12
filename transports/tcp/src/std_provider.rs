@@ -823,25 +823,10 @@ impl PollSource for StdTcpProvider {
             slots: Vec::new(),
             free: Vec::new(),
         };
-        let to_io = |error: TcpError| std::io::Error::other(error.to_string());
-        for listener in self.listeners.values_mut() {
-            listener.token = Some(
-                registration
-                    .register(&mut listener.listener, Slot::Listener, Interest::READABLE)
-                    .map_err(to_io)?,
-            );
-        }
-        for (&handle, socket) in &mut self.sockets {
-            let interest = if socket.watching_writable {
-                Interest::READABLE | Interest::WRITABLE
-            } else {
-                Interest::READABLE
-            };
-            socket.token = Some(
-                registration
-                    .register(&mut socket.stream, Slot::Socket(handle), interest)
-                    .map_err(to_io)?,
-            );
+        if let Err(error) = self.register_all(&mut registration) {
+            // All or nothing, so a later attach can try again from scratch.
+            self.deregister_all(&mut registration);
+            return Err(std::io::Error::other(error.to_string()));
         }
         self.registration = Some(registration);
         Ok(())
@@ -857,6 +842,41 @@ impl PollSource for StdTcpProvider {
 }
 
 impl StdTcpProvider {
+    /// Registers every listener and socket, recording each token.
+    fn register_all(&mut self, registration: &mut Registration) -> Result<(), TcpError> {
+        for listener in self.listeners.values_mut() {
+            listener.token = Some(registration.register(
+                &mut listener.listener,
+                Slot::Listener,
+                Interest::READABLE,
+            )?);
+        }
+        for (&handle, socket) in &mut self.sockets {
+            let interest = if socket.watching_writable {
+                Interest::READABLE | Interest::WRITABLE
+            } else {
+                Interest::READABLE
+            };
+            socket.token =
+                Some(registration.register(&mut socket.stream, Slot::Socket(handle), interest)?);
+        }
+        Ok(())
+    }
+
+    /// Undoes a partial [`register_all`](Self::register_all).
+    fn deregister_all(&mut self, registration: &mut Registration) {
+        for listener in self.listeners.values_mut() {
+            if let Some(token) = listener.token.take() {
+                registration.deregister(&mut listener.listener, token);
+            }
+        }
+        for socket in self.sockets.values_mut() {
+            if let Some(token) = socket.token.take() {
+                registration.deregister(&mut socket.stream, token);
+            }
+        }
+    }
+
     /// What [`dispatch`](PollSource::dispatch) records for one event.
     fn record_readiness(&mut self, token: Token, readable: bool, writable: bool) {
         self.dispatched = true;
@@ -954,6 +974,47 @@ mod tests {
                 .iter()
                 .all(|event| !matches!(event, TcpEvent::Closed { .. } | TcpEvent::Received { .. })),
             "a spurious wake is harmless: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_attach_rolls_back_so_a_later_one_succeeds() {
+        let mut provider = StdTcpProvider::new().expect("provider");
+        for _ in 0..3 {
+            provider
+                .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("address"))
+                .expect("listen");
+        }
+        let poll = mio::Poll::new().expect("poll");
+        let waker = Arc::new(Waker::new(poll.registry(), Token(usize::MAX)).expect("waker"));
+        // Two tokens for three listeners: the third registration fails.
+        let tiny = TokenSpace::full()
+            .subspace(usize::BITS - 1, 0)
+            .expect("a one-bit space");
+        let registry = || poll.registry().try_clone().expect("registry");
+        assert!(
+            provider
+                .attach(registry(), tiny, Arc::clone(&waker))
+                .is_err()
+        );
+        assert!(provider.registration.is_none());
+        assert!(
+            provider
+                .listeners
+                .values()
+                .all(|listener| listener.token.is_none()),
+            "the listeners registered before the failure were rolled back"
+        );
+
+        let roomy = TokenSpace::full().subspace(4, 0).expect("space");
+        provider
+            .attach(registry(), roomy, waker)
+            .expect("a retry registers everything afresh");
+        assert!(
+            provider
+                .listeners
+                .values()
+                .all(|listener| listener.token.is_some())
         );
     }
 

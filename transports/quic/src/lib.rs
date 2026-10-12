@@ -1204,14 +1204,29 @@ impl PollSource for QuicTransport {
         tokens: TokenSpace,
         _waker: Arc<Waker>,
     ) -> std::io::Result<()> {
-        for (index, socket) in self.sockets.iter().enumerate() {
-            let token = tokens
-                .token(index)
-                .ok_or_else(|| std::io::Error::other("no token left for a QUIC socket"))?;
-            let mut clone = mio::net::UdpSocket::from_std(socket.udp.try_clone()?);
-            registry.register(&mut clone, token, Interest::READABLE)?;
-            self.registered.push(clone);
+        let mut registered = Vec::with_capacity(self.sockets.len());
+        let result = self
+            .sockets
+            .iter()
+            .enumerate()
+            .try_for_each(|(index, socket)| {
+                let token = tokens
+                    .token(index)
+                    .ok_or_else(|| std::io::Error::other("no token left for a QUIC socket"))?;
+                let mut clone = mio::net::UdpSocket::from_std(socket.udp.try_clone()?);
+                registry.register(&mut clone, token, Interest::READABLE)?;
+                registered.push(clone);
+                Ok(())
+            });
+        if let Err(error) = result {
+            // All or nothing: a clone shares the socket's file description,
+            // so dropping it would not drop the registration.
+            for mut clone in registered {
+                drop(registry.deregister(&mut clone));
+            }
+            return Err(error);
         }
+        self.registered = registered;
         Ok(())
     }
 
