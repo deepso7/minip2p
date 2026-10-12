@@ -673,15 +673,17 @@ mod tests {
         }
         let mut driver = driver(io);
 
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        // At nonzero uptime, so "due now" is told apart from `IMMEDIATE`.
+        let now = Now::from_millis(7_000);
+        driver.tick(now, &[]).expect("tick");
         assert_eq!(
             driver.io.as_ref().expect("still running").inbound.len(),
             5,
             "a link that keeps talking must not hold the caller inside one tick"
         );
         assert_eq!(
-            driver.next_deadline(Now::from_millis(0)),
-            Some(Deadline::IMMEDIATE),
+            driver.next_deadline(now),
+            Some(now.as_deadline()),
             "what was left over is due now, whatever the timers say"
         );
     }
@@ -1050,6 +1052,11 @@ mod tests {
             sent.borrow()
         );
         assert!(!driver.is_active());
+        assert_eq!(
+            driver.next_deadline(Now::from_millis(10)),
+            None,
+            "a stopped driver drops off the host's timeline"
+        );
 
         driver
             .shutdown(Now::from_millis(20))

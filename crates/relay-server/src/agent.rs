@@ -5847,8 +5847,6 @@ mod tests {
         ));
     }
 
-    /// One-second reservations, so a tick reaches the deadline long before
-    /// the control-stream timeout.
     #[test]
     fn next_deadline_reports_the_absolute_reservation_expiry() {
         let mut agent = relay(short_reservations());
@@ -5874,6 +5872,8 @@ mod tests {
         assert_eq!(agent.reservation_count(), 0);
     }
 
+    /// One-second reservations, so a tick reaches the deadline long before
+    /// the control-stream timeout.
     fn short_reservations() -> RelayServerConfig {
         RelayServerConfig {
             reservation_duration_secs: 1,
