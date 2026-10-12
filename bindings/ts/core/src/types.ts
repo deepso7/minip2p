@@ -229,12 +229,18 @@ export interface Minip2pNamedEventMap {
   inboundPathEstablished: {
     readonly peerId: string;
     readonly path: Path;
+    /** Circuit connection carrying the path. */
+    readonly connId: number;
   };
   pathUpgraded: {
     readonly connectId: number;
     readonly peerId: string;
     readonly from: Path;
     readonly to: Path;
+    /** Connection that carried `from`. */
+    readonly oldConnId: number;
+    /** Connection carrying `to`. */
+    readonly newConnId: number;
   };
   holePunchFailed: {
     readonly connectId: number;
@@ -251,7 +257,13 @@ export interface Minip2pNamedEventMap {
     readonly connectId: number;
     readonly peerId: string;
   };
-  inboundDirectUpgrade: { readonly peerId: string };
+  inboundDirectUpgrade: {
+    readonly peerId: string;
+    /** Circuit connection that carried the relayed path. */
+    readonly oldConnId: number;
+    /** Direct connection now carrying the peer. */
+    readonly newConnId: number;
+  };
   message: {
     readonly fromPeerId: string;
     readonly topics: readonly string[];
@@ -538,11 +550,18 @@ export type P2pEvent =
     >
   | RawEvent<
       typeof P2pEvent_Tags.InboundPathEstablished,
-      { peerId: string; path: PathKind }
+      { peerId: string; path: PathKind; connId: number }
     >
   | RawEvent<
       typeof P2pEvent_Tags.PathUpgraded,
-      { connectId: number; peerId: string; from: PathKind; to: PathKind }
+      {
+        connectId: number;
+        peerId: string;
+        from: PathKind;
+        to: PathKind;
+        oldConnId: number;
+        newConnId: number;
+      }
     >
   | RawEvent<
       typeof P2pEvent_Tags.HolePunchFailed,
