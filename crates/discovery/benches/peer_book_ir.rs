@@ -2,6 +2,7 @@ use gungraun::prelude::*;
 use minip2p_core::{Multiaddr, PeerId};
 use minip2p_discovery::{Observation, PeerDiscoveryAgent, PeerDiscoveryConfig};
 use minip2p_identity::{KeyType, PublicKey};
+use minip2p_platform::Now;
 use std::hint::black_box;
 
 const PEERS: usize = 128;
@@ -55,10 +56,10 @@ fn tick_expire(mut agent: PeerDiscoveryAgent) {
 }
 
 #[library_benchmark]
-#[bench::next_timeout(populated(u64::MAX / 2))]
-fn next_timeout(agent: PeerDiscoveryAgent) {
-    black_box(agent.next_timeout(black_box(1)));
+#[bench::next_deadline(populated(u64::MAX / 2))]
+fn next_deadline(agent: PeerDiscoveryAgent) {
+    black_box(agent.next_deadline(black_box(Now::from_millis(1))));
 }
 
-library_benchmark_group!(name = benches; benchmarks = tick_active, tick_expire, next_timeout);
+library_benchmark_group!(name = benches; benchmarks = tick_active, tick_expire, next_deadline);
 gungraun::main!(library_benchmark_groups = benches);

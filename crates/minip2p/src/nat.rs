@@ -6,7 +6,7 @@ use alloc::{collections::BTreeMap, string::ToString};
 use alloc::{collections::VecDeque, vec, vec::Vec};
 #[cfg(not(feature = "_circuit-driver"))]
 use core::marker::PhantomData;
-use minip2p_platform::{EntropySource, Now as PlatformNow};
+use minip2p_platform::{Deadline, EntropySource, Now};
 
 #[cfg(feature = "_circuit-driver")]
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole, CircuitTransport};
@@ -14,7 +14,7 @@ use minip2p_core::{Bytes, ConnectId, Multiaddr, PeerAddr, PeerId, Protocol, sele
 #[cfg(feature = "_circuit-driver")]
 use minip2p_nat::BridgeRole;
 use minip2p_nat::{
-    ConnectLegs, DialStart, NatAction, NatAgent, NatEvent, NatSwarm, NatSwarmError, NatToken, Now,
+    ConnectLegs, DialStart, NatAction, NatAgent, NatEvent, NatSwarm, NatSwarmError, NatToken,
     PromoteError, ReachabilityState,
 };
 use minip2p_swarm::{DriverError, HeldWrites, SwarmCore, SwarmEvent};
@@ -25,14 +25,6 @@ use minip2p_transport::{ConnectionId, StreamId, Transport};
 use crate::EndpointEvent;
 use crate::portable::connect::ConnectEngine;
 use crate::stream_conns::StreamConns;
-
-/// Converts a host time sample into the agent's clock pair.
-pub(crate) fn to_nat_now(now: PlatformNow) -> Now {
-    Now {
-        mono_ms: now.monotonic_ms,
-        unix_secs: now.unix_seconds,
-    }
-}
 
 /// `ConnectFailed` and `FellBackToRelay` are attempt terminals the
 /// Connection-attempt engine already reports as `ConnectSettled`, so they
@@ -200,8 +192,8 @@ impl<T: Transport> NatDriver<T> {
     /// Whether the agent still waits on a parked dial; retires it when not.
     /// See [`NatAgent::deferred_dial_wanted`].
     #[cfg(feature = "nat")]
-    pub(crate) fn named_dial_wanted(&mut self, token: NatToken, sample: PlatformNow) -> bool {
-        self.agent.deferred_dial_wanted(token, to_nat_now(sample))
+    pub(crate) fn named_dial_wanted(&mut self, token: NatToken, sample: Now) -> bool {
+        self.agent.deferred_dial_wanted(token, sample)
     }
 
     /// Finishes a parked dial: dials the first resolved address the swarm
@@ -213,7 +205,7 @@ impl<T: Transport> NatDriver<T> {
         token: NatToken,
         resolved: crate::portable::connect::NameAnswer,
         swarm: &mut SwarmCore<T, R>,
-        sample: PlatformNow,
+        sample: Now,
     ) {
         if !self.named_dial_wanted(token, sample) {
             return;
@@ -229,8 +221,7 @@ impl<T: Transport> NatDriver<T> {
             Err(last)
         });
         let mut io = EndpointSwarm::new(swarm, &mut self.io);
-        self.agent
-            .dial_result(&mut io, token, result, to_nat_now(sample));
+        self.agent.dial_result(&mut io, token, result, sample);
         self.pump(swarm, sample);
     }
 
@@ -240,10 +231,10 @@ impl<T: Transport> NatDriver<T> {
         &mut self,
         id: ConnectId,
         swarm: &mut SwarmCore<T, R>,
-        now: PlatformNow,
+        now: Now,
     ) {
         let mut io = EndpointSwarm::new(swarm, &mut self.io);
-        self.agent.cancel(&mut io, id, to_nat_now(now));
+        self.agent.cancel(&mut io, id, now);
     }
 
     /// Cancels `id` in the Connection-attempt engine and, while the attempt
@@ -258,7 +249,7 @@ impl<T: Transport> NatDriver<T> {
         connect: &mut ConnectEngine,
         id: ConnectId,
         swarm: &mut SwarmCore<T, R>,
-        now: PlatformNow,
+        now: Now,
     ) -> bool {
         let pending = connect.is_pending(id);
         connect.cancel(id, swarm);
@@ -276,21 +267,20 @@ impl<T: Transport> NatDriver<T> {
         peer: PeerId,
         legs: ConnectLegs,
         swarm: &mut SwarmCore<T, R>,
-        sample: PlatformNow,
+        sample: Now,
     ) {
         let mut io = EndpointSwarm::new(swarm, &mut self.io);
-        self.agent
-            .connect(&mut io, id, peer, legs, to_nat_now(sample));
+        self.agent.connect(&mut io, id, peer, legs, sample);
         self.pump(swarm, sample);
     }
 
-    /// How long the caller may idle before [`NatDriver::tick`] has work: `0`
-    /// when queued events or agent timers are due, `None` when nothing is.
-    pub(crate) fn next_timeout(&self, now: PlatformNow) -> Option<u64> {
+    /// When [`NatDriver::tick`] next has work: immediately while events are
+    /// queued, else the agent's next timer, `None` when nothing is armed.
+    pub(crate) fn next_deadline(&self, now: Now) -> Option<Deadline> {
         if !self.unrouted.is_empty() || !self.staged.is_empty() {
-            Some(0)
+            Some(Deadline::IMMEDIATE)
         } else {
-            self.agent.next_timeout(now.monotonic_ms)
+            self.agent.next_deadline(now)
         }
     }
 
@@ -335,15 +325,14 @@ impl<T: Transport> NatDriver<T> {
         &mut self,
         event: &SwarmEvent,
         swarm: &mut SwarmCore<T, R>,
-        sample: PlatformNow,
+        now: Now,
     ) -> bool {
         self.sync_listen_addrs(swarm);
         self.io.held.observe(event);
         self.io.stream_conns.observe(event);
-        let now = to_nat_now(sample);
         #[cfg(feature = "_circuit-driver")]
         if self.inject_straggler(event, swarm) {
-            self.pump(swarm, sample);
+            self.pump(swarm, now);
             return true;
         }
         if let SwarmEvent::StreamWritable {
@@ -357,9 +346,9 @@ impl<T: Transport> NatDriver<T> {
                 peer_id,
                 *conn_id,
                 *stream_id,
-                sample.monotonic_ms,
+                now.monotonic_ms,
             );
-            self.pump(swarm, sample);
+            self.pump(swarm, now);
             return true;
         }
         let is_circuit = match event {
@@ -406,7 +395,7 @@ impl<T: Transport> NatDriver<T> {
             self.promoted
                 .retain(|(inner_conn, _), circuit| inner_conn != conn_id && circuit != conn_id);
         }
-        self.pump(swarm, sample);
+        self.pump(swarm, now);
         handled
     }
 
@@ -417,11 +406,7 @@ impl<T: Transport> NatDriver<T> {
     /// vanished without a lifecycle event is forgotten here, once per
     /// endpoint batch rather than on every swarm event. Closures that do
     /// surface reach `ingest`'s `ConnectionClosed` branch regardless.
-    pub(crate) fn tick<R: EntropySource>(
-        &mut self,
-        swarm: &mut SwarmCore<T, R>,
-        sample: PlatformNow,
-    ) {
+    pub(crate) fn tick<R: EntropySource>(&mut self, swarm: &mut SwarmCore<T, R>, now: Now) {
         #[cfg(feature = "_circuit-driver")]
         if let Some(circuits) = self.circuits.as_ref() {
             self.promoted
@@ -431,22 +416,21 @@ impl<T: Transport> NatDriver<T> {
         // the seed is what arms the probe timers that would otherwise
         // keep this tick early-returning forever.
         self.sync_listen_addrs(swarm);
-        let now = to_nat_now(sample);
-        if self.agent.next_timeout(now.mono_ms) != Some(0) {
+        if !self
+            .agent
+            .next_deadline(now)
+            .is_some_and(|due| due.is_expired_at(now))
+        {
             return;
         }
         let mut io = EndpointSwarm::new(swarm, &mut self.io);
         self.agent.handle_tick(&mut io, now);
-        self.pump(swarm, sample);
+        self.pump(swarm, now);
     }
 
     /// Executes queued agent actions (echoing promotion results back) and
     /// collects application-visible NAT events.
-    pub(crate) fn pump<R: EntropySource>(
-        &mut self,
-        swarm: &mut SwarmCore<T, R>,
-        sample: PlatformNow,
-    ) {
+    pub(crate) fn pump<R: EntropySource>(&mut self, swarm: &mut SwarmCore<T, R>, sample: Now) {
         self.sync_listen_addrs(swarm);
         loop {
             let mut progressed = false;
@@ -506,7 +490,7 @@ impl<T: Transport> NatDriver<T> {
         allow_relay: bool,
         target_addrs: Vec<Multiaddr>,
         swarm: &mut SwarmCore<T, R>,
-        sample: PlatformNow,
+        sample: Now,
     ) {
         if connect.is_pending(id) {
             self.connect(
@@ -533,7 +517,7 @@ impl<T: Transport> NatDriver<T> {
         work: crate::discovery::DiscoveryNatWork,
         connect: &ConnectEngine,
         swarm: &mut SwarmCore<T, R>,
-        sample: PlatformNow,
+        sample: Now,
     ) {
         for leg in work.legs {
             self.attach_leg(
@@ -558,7 +542,7 @@ impl<T: Transport> NatDriver<T> {
         &mut self,
         event: &EndpointEvent,
         swarm: &mut SwarmCore<T, R>,
-        sample: PlatformNow,
+        sample: Now,
     ) {
         let EndpointEvent::ConnectSettled {
             connect_id,
@@ -650,16 +634,15 @@ impl<T: Transport> NatDriver<T> {
         &mut self,
         action: NatAction,
         swarm: &mut SwarmCore<T, R>,
-        sample: PlatformNow,
+        now: Now,
     ) {
-        let now = to_nat_now(sample);
         match action {
             NatAction::SendRandomUdp {
                 target,
                 payload_len,
             } => {
                 let mut payload = vec![0u8; payload_len];
-                // A failed entropy sample simply skips this one best-effort
+                // A failed entropy now simply skips this one best-effort
                 // hole-punch datagram.
                 if let Ok(()) = swarm.entropy_mut().fill_bytes(&mut payload) {
                     match swarm.transport_mut().send_datagram(&target, &payload) {

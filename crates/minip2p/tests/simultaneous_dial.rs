@@ -7,8 +7,8 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectOutcome, Ed25519Keypair, Endpoint, EndpointBuilder, EndpointEvent, Multiaddr, Now,
-    PeerAddr, PeerId, PollDeadline, PortableEndpoint, StreamId,
+    ConnectOutcome, Deadline, Ed25519Keypair, Endpoint, EndpointBuilder, EndpointEvent, Multiaddr,
+    Now, PeerAddr, PeerId, PortableEndpoint, StreamId,
 };
 use minip2p_platform::{Clock, StdClock, StdEntropy};
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
@@ -288,7 +288,7 @@ impl<T: Transport> Transport for ReverseFirstTwo<T> {
         Ok(out)
     }
 
-    fn next_deadline(&self) -> Option<PollDeadline> {
+    fn next_deadline(&self) -> Option<Deadline> {
         self.inner.next_deadline()
     }
 

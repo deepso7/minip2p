@@ -77,7 +77,7 @@ loop {
     }
     // 3. Surface events to the application.
     while let Some(event) = agent.poll_event() { /* ... */ }
-    // 4. Sleep at most `agent.next_timeout(now_ms)`, then tick.
+    // 4. Sleep until at most `agent.next_deadline(now)`, then tick.
     agent.handle_tick(&mut swarm, now());
 }
 ```

@@ -114,7 +114,7 @@ fn the_bare_swarm_rejects_a_named_relay_dial() {
 
     let id = minip2p_core::ConnectId::from_u64(1);
     let target = PeerId::from_public_key_protobuf(b"target");
-    agent.connect(&mut swarm, id, target, RELAY_NOW, Now::from_mono(0));
+    agent.connect(&mut swarm, id, target, RELAY_NOW, Now::from_millis(0));
 
     assert!(swarm.transport().dials.is_empty());
     assert!(matches!(
@@ -136,10 +136,10 @@ fn a_reservation_and_a_connect_share_one_relay_dial() {
     let local = swarm.local_peer_id().clone();
     let mut agent = NatAgent::new(local, nat_config(relay, ReservationPolicy::Always));
 
-    agent.handle_tick(&mut swarm, Now::from_mono(0));
+    agent.handle_tick(&mut swarm, Now::from_millis(0));
     let id = minip2p_core::ConnectId::from_u64(1);
     let target = PeerId::from_public_key_protobuf(b"target");
-    agent.connect(&mut swarm, id, target, RELAY_NOW, Now::from_mono(1));
+    agent.connect(&mut swarm, id, target, RELAY_NOW, Now::from_millis(1));
 
     assert_eq!(
         swarm.transport().dials.len(),
@@ -187,15 +187,15 @@ fn a_command_between_buffered_deliveries_keeps_the_swarm_order() {
     // The host delivers the first buffered event, then a connect starts:
     // the swarm reports the relay ready, so the HOP stream opens at once.
     let first = buffered.pop_front().expect("a buffered event");
-    agent.handle_event(&mut local, &first, false, Now::from_mono(1));
+    agent.handle_event(&mut local, &first, false, Now::from_millis(1));
     let id = minip2p_core::ConnectId::from_u64(1);
     let target = PeerId::from_public_key_protobuf(b"target");
-    agent.connect(&mut local, id, target, RELAY_NOW, Now::from_mono(1));
+    agent.connect(&mut local, id, target, RELAY_NOW, Now::from_millis(1));
 
     // The rest of the batch, including the relay's PeerReady, follows the
     // command; it must not start a second exchange.
     for event in buffered {
-        agent.handle_event(&mut local, &event, false, Now::from_mono(2));
+        agent.handle_event(&mut local, &event, false, Now::from_millis(2));
     }
 
     // The swarm queued the open's StreamReady after the batch NAT already
@@ -210,7 +210,7 @@ fn a_command_between_buffered_deliveries_keeps_the_swarm_order() {
             {
                 hop_streams += 1;
             }
-            agent.handle_event(&mut local, &event, false, Now::from_mono(3));
+            agent.handle_event(&mut local, &event, false, Now::from_millis(3));
         }
         for event in relay.poll(SwarmNow::from_millis(ms)).expect("drive relay") {
             match event {

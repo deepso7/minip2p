@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use minip2p_core::PeerId;
 use minip2p_identity::Ed25519Keypair;
+use minip2p_platform::{Deadline, Now};
 use minip2p_pubsub::{
     ControlMessage, FrameDecode, GossipsubAction, GossipsubAgent, GossipsubConfig, GossipsubToken,
     MESHSUB_PROTOCOL_ID_V11, RawMessage, Rpc, SubOpts, decode_frame, encode_frame,
@@ -371,7 +372,10 @@ pub fn heartbeat_fixture() -> GossipsubAgent {
         }
     }
     assert_eq!(now + HEARTBEAT_INTERVAL_MS, HEARTBEAT_AT_MS);
-    assert_eq!(agent.next_timeout(now), Some(HEARTBEAT_INTERVAL_MS));
+    assert_eq!(
+        agent.next_deadline(Now::from_millis(now)),
+        Some(Deadline::from_millis(HEARTBEAT_AT_MS))
+    );
     while agent.poll_event().is_some() {}
 
     for (index, topic) in (0..HEARTBEAT_TOPICS).zip(&topics) {
@@ -401,8 +405,10 @@ pub fn heartbeat(agent: &mut GossipsubAgent) {
 /// got IHAVE for exactly that topic's messages in the 3 newest windows.
 pub fn assert_heartbeat_ran(agent: &mut GossipsubAgent) {
     assert_eq!(
-        agent.next_timeout(HEARTBEAT_AT_MS),
-        Some(HEARTBEAT_INTERVAL_MS)
+        agent.next_deadline(Now::from_millis(HEARTBEAT_AT_MS)),
+        Some(Deadline::from_millis(
+            HEARTBEAT_AT_MS + HEARTBEAT_INTERVAL_MS
+        ))
     );
     // topic -> peer -> advertised ids
     let mut gossip: BTreeMap<String, BTreeMap<PeerId, BTreeSet<Vec<u8>>>> = BTreeMap::new();

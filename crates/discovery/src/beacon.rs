@@ -4,6 +4,7 @@ use alloc::{collections::VecDeque, format, string::ToString, vec::Vec};
 
 use minip2p_core::{Multiaddr, PeerId, Protocol};
 use minip2p_identity::PublicKey;
+use minip2p_platform::{Deadline, Now};
 
 use crate::{
     Beacon, BeaconAction, BeaconConfig, BeaconEvent, DiscoveryConfigError, MAX_PUBLIC_KEY_LEN,
@@ -114,9 +115,10 @@ impl BeaconAgent {
         self.events.pop_front()
     }
 
-    /// Returns milliseconds until the next local beacon.
-    pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
-        Some(self.next_beacon_at_ms.saturating_sub(now_ms))
+    /// Returns when the next local beacon is due, as an absolute monotonic
+    /// deadline. The beacon timer is always armed.
+    pub fn next_deadline(&self, _now: Now) -> Option<Deadline> {
+        Some(Deadline::from_millis(self.next_beacon_at_ms))
     }
 
     fn build_beacon(&self) -> Beacon {
@@ -308,13 +310,22 @@ mod tests {
         let mut agent = BeaconAgent::new(key(1), BeaconConfig::default()).unwrap();
         agent.handle_tick(0);
         let _ = agent.poll_action();
-        assert_eq!(agent.next_timeout(1), Some(9_999));
+        assert_eq!(
+            agent.next_deadline(Now::from_millis(1)),
+            Some(Deadline::from_millis(10_000))
+        );
         agent.set_local_addrs(&[], 5);
-        assert_eq!(agent.next_timeout(5), Some(9_995));
+        assert_eq!(
+            agent.next_deadline(Now::from_millis(5)),
+            Some(Deadline::from_millis(10_000))
+        );
         agent.set_local_addrs(
             &[Multiaddr::from_str("/ip4/127.0.0.1/udp/1/quic-v1").unwrap()],
             6,
         );
-        assert_eq!(agent.next_timeout(6), Some(0));
+        let now = Now::from_millis(6);
+        let due = agent.next_deadline(now).unwrap();
+        assert_eq!(due, Deadline::from_millis(6));
+        assert!(due.is_expired_at(now));
     }
 }

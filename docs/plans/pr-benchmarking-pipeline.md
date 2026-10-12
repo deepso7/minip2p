@@ -55,7 +55,7 @@ A 1:1 mirror of the ten existing deterministic Criterion cases. Criterion suites
 | --- | --- |
 | `multiaddr` | `parse_text`, `encode_binary`, `decode_binary` |
 | `yamux` / 64 KiB | `session_send_and_drain`, `session_receive_and_drain` |
-| `peer_book_128_peers_16_addrs` | `tick_active`, `tick_expire`, `next_timeout` |
+| `peer_book_128_peers_16_addrs` | `tick_active`, `tick_expire`, `next_deadline` |
 | `pubsub` | `gossipsub_publish_32x60KiB` |
 | `relay_server_event` | `relay_handle_event_same_now_128_pending_hops` |
 

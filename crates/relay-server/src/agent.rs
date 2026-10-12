@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::ops::RangeInclusive;
 
 use minip2p_core::{Bytes, Multiaddr, PeerId, Protocol};
-use minip2p_platform::Now;
+use minip2p_platform::{Deadline, Now};
 use minip2p_relay::{
     HOP_PROTOCOL_ID, HopRequest, HopResponder, HopResponderOutput, Limit, MAX_PENDING_BRIDGE_SIZE,
     RelayError, Reservation, STOP_PROTOCOL_ID, Status, StopInitiator, StopInitiatorOutcome,
@@ -1159,8 +1159,12 @@ impl RelayServerAgent {
         self.events.pop_front()
     }
 
-    /// Returns milliseconds until the earliest timer, with zero meaning due.
-    pub fn next_timeout(&self, now: Now) -> Option<u64> {
+    /// Returns when the earliest timer is due on the monotonic timeline, or
+    /// `None` when no timer is armed.
+    ///
+    /// An overdue timer reports its past due time, so it is already expired
+    /// at `now`; call [`handle_tick`](Self::handle_tick) once it expires.
+    pub fn next_deadline(&self, _now: Now) -> Option<Deadline> {
         let reservation = self.reservation_deadlines.earliest();
         let hop = self.hop_deadlines.earliest();
         let stop = self.stop_deadlines.earliest();
@@ -1176,7 +1180,7 @@ impl RelayServerAgent {
             .into_iter()
             .flatten()
             .min()
-            .map(|due| due.saturating_sub(now.monotonic_ms))
+            .map(Deadline::from_millis)
     }
 
     /// Whether the stream is owned by a HOP worker, STOP worker, or circuit.
@@ -5843,6 +5847,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn next_deadline_reports_the_absolute_reservation_expiry() {
+        let mut agent = relay(short_reservations());
+        assert_eq!(agent.next_deadline(Now::from_millis(0)), None);
+
+        let peer = PeerId::from_public_key_protobuf(b"client-deadline");
+        let stream = StreamKey {
+            conn_id: ConnectionId::new(350),
+            stream_id: StreamId::new(1),
+        };
+        reserve(&mut agent, &peer, stream);
+        let due = Deadline::from_millis(1_000);
+        assert_eq!(agent.next_deadline(Now::from_millis(0)), Some(due));
+        assert!(due.is_expired_at(Now::from_millis(1_000)));
+
+        let overdue = Now::from_millis(5_000);
+        assert_eq!(
+            agent.next_deadline(overdue),
+            Some(due),
+            "an overdue timer keeps its past due time"
+        );
+        agent.handle_tick(overdue);
+        assert_eq!(agent.reservation_count(), 0);
+    }
+
     /// One-second reservations, so a tick reaches the deadline long before
     /// the control-stream timeout.
     fn short_reservations() -> RelayServerConfig {
@@ -5891,9 +5920,11 @@ mod tests {
             agent.poll_event().is_none(),
             "the client was already sent SUCCESS for the renewal"
         );
-        assert_ne!(
-            agent.next_timeout(Now::from_millis(1_000)),
-            Some(0),
+        let now = Now::from_millis(1_000);
+        assert!(
+            agent
+                .next_deadline(now)
+                .is_some_and(|deadline| !deadline.is_expired_at(now)),
             "the kept-alive deadline must not spin the host's timer"
         );
 

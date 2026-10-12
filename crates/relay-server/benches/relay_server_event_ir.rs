@@ -557,11 +557,11 @@ fn assert_send_cancelled((Scale { mut agent, size }, _): (Scale, SwarmEvent)) {
 // `teardown` stay outside the measured region.
 
 #[library_benchmark]
-#[bench::relay_100_next_timeout(args = (100), setup = scale_agent, teardown = assert_unchanged)]
-#[bench::relay_1k_next_timeout(args = (1_000), setup = scale_agent, teardown = assert_unchanged)]
-#[bench::relay_10k_next_timeout(args = (10_000), setup = scale_agent, teardown = assert_unchanged)]
-fn relay_next_timeout(scale: Scale) -> Scale {
-    black_box(scale.agent.next_timeout(black_box(NOW)));
+#[bench::relay_100_next_deadline(args = (100), setup = scale_agent, teardown = assert_unchanged)]
+#[bench::relay_1k_next_deadline(args = (1_000), setup = scale_agent, teardown = assert_unchanged)]
+#[bench::relay_10k_next_deadline(args = (10_000), setup = scale_agent, teardown = assert_unchanged)]
+fn relay_next_deadline(scale: Scale) -> Scale {
+    black_box(scale.agent.next_deadline(black_box(NOW)));
     scale
 }
 
@@ -686,7 +686,7 @@ fn relay_cancel_inflight_send(input: (Scale, SwarmEvent)) -> (Scale, SwarmEvent)
 library_benchmark_group!(
     name = benches;
     benchmarks = relay_event,
-        relay_next_timeout,
+        relay_next_deadline,
         relay_tick_idle,
         relay_tick_expire_100,
         relay_reserve_new_peer,

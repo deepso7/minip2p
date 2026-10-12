@@ -2,6 +2,7 @@
 
 use minip2p_core::PeerId;
 use minip2p_identity::Ed25519Keypair;
+use minip2p_platform::{Deadline, Now};
 use minip2p_pubsub::{
     ControlGraft, ControlIHave, ControlIWant, ControlMessage, ControlPrune, FrameDecode,
     GossipsubAction, GossipsubAgent, GossipsubConfig, GossipsubEvent, MESHSUB_PROTOCOL_ID_V10,
@@ -302,7 +303,7 @@ fn decode_rpc(frame: &[u8]) -> Rpc {
 fn build_time_subscribe_does_not_arm_heartbeat() {
     let mut agent = agent();
     agent.subscribe("room", 0).unwrap();
-    assert_eq!(agent.next_timeout(50_000), None);
+    assert_eq!(agent.next_deadline(Now::from_millis(50_000)), None);
 
     let remote = peer(2);
     connect(
@@ -311,7 +312,16 @@ fn build_time_subscribe_does_not_arm_heartbeat() {
         &[MESHSUB_PROTOCOL_ID_V11, MESHSUB_PROTOCOL_ID_V10],
         50_000,
     );
-    assert_eq!(agent.next_timeout(50_000), Some(1_000));
+    assert_eq!(
+        agent.next_deadline(Now::from_millis(50_000)),
+        Some(Deadline::from_millis(51_000))
+    );
+    // Due exactly at its ms; an overdue heartbeat keeps its past value.
+    assert!(Deadline::from_millis(51_000).is_expired_at(Now::from_millis(51_000)));
+    assert_eq!(
+        agent.next_deadline(Now::from_millis(60_000)),
+        Some(Deadline::from_millis(51_000))
+    );
     assert!(agent.mesh_peers("room").is_empty());
 }
 

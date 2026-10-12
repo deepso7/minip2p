@@ -8,8 +8,8 @@ use common::*;
 use minip2p_autonat::AUTONAT_PROTOCOL_ID;
 use minip2p_core::{PeerAddr, PeerId};
 use minip2p_nat::{
-    MAX_RESERVATION_RETRY_BACKOFF_MS, NatConfig, NatEvent, NatSwarm, Now, ReachabilityState,
-    ReservationPolicy,
+    Deadline, MAX_RESERVATION_RETRY_BACKOFF_MS, NatConfig, NatEvent, NatSwarm, Now,
+    ReachabilityState, ReservationPolicy,
 };
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
@@ -191,13 +191,13 @@ impl Hk {
 #[test]
 fn initial_reservation_policy_arms_only_the_needed_tick() {
     let mut wanted = build(ReservationPolicy::Always, 1, 0);
-    assert_eq!(wanted.agent.next_timeout(0), Some(0));
+    assert_eq!(wanted.agent.next_deadline(at(0)), Some(Deadline::IMMEDIATE));
     wanted.agent.handle_tick(at(0));
     let relay = wanted.relay.clone();
     assert_eq!(dial_count_for(&drain_actions(&mut wanted.agent), &relay), 1);
 
     let not_wanted = build(ReservationPolicy::Never, 1, 0);
-    assert_eq!(not_wanted.agent.next_timeout(0), None);
+    assert_eq!(not_wanted.agent.next_deadline(at(0)), None);
 }
 
 #[test]
@@ -423,7 +423,10 @@ fn reservation_renews_at_half_the_reported_lifetime() {
     ));
     let info = hk.agent.active_reservation().expect("reservation held");
     assert_eq!(info.renew_at_mono_ms, expected_renew);
-    assert_eq!(hk.agent.next_timeout(10_000), Some(expected_renew - 10_000));
+    assert_eq!(
+        hk.agent.next_deadline(at(10_000)),
+        Some(Deadline::from_millis(expected_renew))
+    );
     // The completed exchange closes its write side; drain it.
     drain_actions(&mut hk.agent);
 
@@ -542,7 +545,10 @@ fn reservation_keep_alive_uses_synthetic_time_only_for_quic() {
     reserve_via_relay(&mut quic, hop_reserve_ok(None), at(10));
     drain_actions(&mut quic.agent); // completed exchange's close-write
 
-    assert_eq!(quic.agent.next_timeout(10), Some(100));
+    assert_eq!(
+        quic.agent.next_deadline(at(10)),
+        Some(Deadline::from_millis(110))
+    );
     quic.agent.handle_tick(at(109));
     assert!(drain_actions(&mut quic.agent).is_empty());
     quic.agent.handle_tick(at(110));
@@ -1043,12 +1049,12 @@ fn a_deferred_dial_past_its_flight_is_retired_and_its_late_result_ignored() {
         "a retired dial stays retired"
     );
 
-    let timeout = hk.agent.next_timeout(3_600_000);
+    let deadline = hk.agent.next_deadline(at(3_600_000));
     hk.agent
         .dial_result(reserve_dial, Err("lookup failed".into()), at(3_600_000));
     assert!(drain_actions(&mut hk.agent).is_empty());
     assert!(hk.agent.poll_event().is_none());
-    assert_eq!(hk.agent.next_timeout(3_600_000), timeout);
+    assert_eq!(hk.agent.next_deadline(at(3_600_000)), deadline);
 }
 
 #[test]
@@ -1059,7 +1065,11 @@ fn reserve_dial_failed_event_schedules_backoff() {
     let conn_id = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
     assert!(dial_failed(&mut hk, conn_id, "connection refused", at(6)));
     let base = NatConfig::default().reservation_retry_backoff_ms;
-    let delay = hk.agent.next_timeout(6).expect("a backoff");
+    let delay = hk
+        .agent
+        .next_deadline(at(6))
+        .expect("a backoff")
+        .millis_until(at(6));
     assert!(
         (base..base + base / 5).contains(&delay),
         "refused reservation dial must back off by the base plus jitter: {delay}"
@@ -1079,7 +1089,11 @@ fn reservation_retries_back_off_exponentially_and_reset_on_success() {
         hk.agent.handle_tick(at(now));
         let conn_id = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
         assert!(dial_failed(&mut hk, conn_id, "connection refused", at(now)));
-        let delay = hk.agent.next_timeout(now).expect("a backoff");
+        let delay = hk
+            .agent
+            .next_deadline(at(now))
+            .expect("a backoff")
+            .millis_until(at(now));
         delays.push(delay);
         now += delay;
     }
@@ -1112,7 +1126,11 @@ fn reservation_retries_back_off_exponentially_and_reset_on_success() {
         false,
         at(now + 1),
     );
-    let delay = hk.agent.next_timeout(now + 1).expect("a backoff");
+    let delay = hk
+        .agent
+        .next_deadline(at(now + 1))
+        .expect("a backoff")
+        .millis_until(at(now + 1));
     assert!((base..base + base / 5).contains(&delay), "{delay}");
 }
 

@@ -6,7 +6,7 @@ use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use minip2p_platform::EntropySource;
+use minip2p_platform::{Deadline, EntropySource, Now};
 use minip2p_pubsub::{GossipsubAction, GossipsubAgent, GossipsubEvent, PublishError, TopicError};
 use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
 use minip2p_transport::Transport;
@@ -55,13 +55,13 @@ impl GossipsubDriver {
         }
     }
 
-    /// How long the caller may idle before [`Self::tick`] has work: `0` when
-    /// queued events or agent timers are due, `None` when nothing is.
-    pub(crate) fn next_timeout(&self, now_ms: u64) -> Option<u64> {
+    /// When [`Self::tick`] next has work: immediately while events are
+    /// queued, else the agent's next timer, `None` when nothing is armed.
+    pub(crate) fn next_deadline(&self, now: Now) -> Option<Deadline> {
         if !self.events.is_empty() {
-            Some(0)
+            Some(Deadline::IMMEDIATE)
         } else {
-            self.agent.next_timeout(now_ms)
+            self.agent.next_deadline(now)
         }
     }
 
@@ -165,13 +165,17 @@ impl GossipsubDriver {
     pub(crate) fn tick<T: Transport, R: EntropySource>(
         &mut self,
         swarm: &mut SwarmCore<T, R>,
-        now_ms: u64,
+        now: Now,
     ) {
-        if self.agent.next_timeout(now_ms) != Some(0) {
+        if !self
+            .agent
+            .next_deadline(now)
+            .is_some_and(|due| due.is_expired_at(now))
+        {
             return;
         }
-        self.agent.handle_tick(now_ms);
-        self.pump(swarm, now_ms);
+        self.agent.handle_tick(now.monotonic_ms);
+        self.pump(swarm, now.monotonic_ms);
     }
 
     /// Moves events still inside the agent into the queue. Terminal

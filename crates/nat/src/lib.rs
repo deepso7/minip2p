@@ -31,6 +31,12 @@
 //! the few [`NatAction`]s it emits need the transport underneath. Events for
 //! streams the agent does not own cost one map lookup and zero clones.
 //!
+//! Every input carries the host's [`Now`] sample. Its monotonic reading
+//! orders all of the agent's timers; its wall-clock reading is only used to
+//! schedule relay-reservation renewal from the absolute `expire` a relay
+//! returns, and without one renewal falls back to
+//! [`NatConfig::reservation_default_ttl_secs`].
+//!
 //! The driver executes [`NatAction::PromoteBridge`] against a circuit
 //! transport. Relayed paths are therefore ordinary identity-verified swarm
 //! connections: identify, ping, pubsub, and application protocols use the
@@ -58,7 +64,10 @@ pub use events::{BridgeRole, NatAction, NatEvent};
 pub use housekeeping::MAX_RESERVATION_RETRY_BACKOFF_MS;
 pub use inbound::MAX_PUNCH_CANDIDATES;
 pub use swarm::{DialStart, NatSwarm, NatSwarmError, is_named};
-pub use types::{NatError, NatToken, Now, Path, PromoteError, ReachabilityState, ReservationInfo};
+pub use types::{NatError, NatToken, Path, PromoteError, ReachabilityState, ReservationInfo};
+// The component time sample and deadline, re-exported so callers need not
+// depend on the platform crate to name them.
+pub use minip2p_platform::{Deadline, Now};
 
 // Protocol ids for everything the agent drives, so a driver can register
 // them without depending on each protocol crate.
