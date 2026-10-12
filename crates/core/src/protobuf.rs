@@ -48,7 +48,8 @@ pub enum WireError {
     #[error("unsupported wire type {wire_type} at offset {offset}")]
     UnsupportedWireType { wire_type: u8, offset: usize },
     /// A tag carries a field number outside protobuf's valid `1..=2^29-1`.
-    /// `offset` is where the tag starts.
+    /// `offset` is where the tag starts, relative to the slice the failing
+    /// decoder was given (a sub-message's bytes for nested fields).
     #[error(
         "invalid protobuf field number {field} in tag at offset {offset}; field numbers must be in 1..=536870911"
     )]
