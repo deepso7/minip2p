@@ -1,8 +1,7 @@
 use core::str::FromStr;
 
-use minip2p_core::SansIoProtocol;
 use minip2p_identity::{Ed25519Keypair, PeerId};
-use minip2p_noise::{NoiseConfig, NoiseInput, NoiseOutput, NoiseRole, NoiseSession};
+use minip2p_noise::{NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
 
 const FIXTURE: &str = include_str!("fixtures/libp2p-noise-0.46.1.txt");
 
@@ -35,17 +34,13 @@ fn responder_completes_pinned_rust_libp2p_initiator_transcript() {
         ephemeral_secret: array("responder_ephemeral_secret"),
         expected_peer: Some(expected_peer.clone()),
     });
-    responder.handle_input(NoiseInput::Start).unwrap();
-    responder
-        .handle_input(NoiseInput::Data(hex(value("message1"))))
-        .unwrap();
+    responder.start().unwrap();
+    responder.on_data(hex(value("message1"))).unwrap();
     assert_eq!(
         responder.poll_output(),
         Some(NoiseOutput::Outbound(hex(value("message2"))))
     );
-    responder
-        .handle_input(NoiseInput::Data(hex(value("message3"))))
-        .unwrap();
+    responder.on_data(hex(value("message3"))).unwrap();
     match responder.poll_output().expect("handshake completion") {
         NoiseOutput::HandshakeComplete { peer, identity_key } => {
             assert_eq!(peer, expected_peer);

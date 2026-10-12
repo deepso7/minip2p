@@ -4,7 +4,7 @@
 //!
 //! Field framing uses the shared protobuf vocabulary in [`minip2p_core`];
 //! this module keeps pubsub message types, StrictSign canonicalization, and
-//! contextual [`GossipsubWireError`] values (including field-number policy).
+//! contextual [`GossipsubWireError`] values.
 //!
 //! Verification matches upstream (go-libp2p / rust-libp2p) exactly: the
 //! decoded message is canonically re-encoded with `signature` and `key`
@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 
 use minip2p_core::{
     PeerId, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_varint_field,
-    read_len_delimited, read_string, read_varint_value, skip_field,
+    read_len_delimited, read_string, read_tag, read_varint_value, skip_field,
 };
 use minip2p_identity::{Ed25519Keypair, PublicKey};
 
@@ -163,14 +163,6 @@ pub enum GossipsubWireError {
     /// A shared protobuf framing failure.
     #[error(transparent)]
     Wire(#[from] WireError),
-    /// A tag used field number zero, which protobuf reserves as illegal.
-    /// Upstream decoders reject it; silently skipping would let hostile
-    /// encoders smuggle bytes that canonical re-encoding drops.
-    #[error("illegal field number 0 at offset {offset}")]
-    InvalidFieldNumber {
-        /// Offset of the field's tag.
-        offset: usize,
-    },
 }
 
 /// Why an inbound message failed StrictSign verification.
@@ -690,22 +682,6 @@ impl Rpc {
 }
 
 // ---------------------------------------------------------------------------
-// Field-number policy
-// ---------------------------------------------------------------------------
-
-/// Reads the next `(field_number, wire_type)` pair and rejects field 0.
-///
-/// Shared [`minip2p_core::read_tag`] does not enforce field-number policy.
-/// Pubsub matches upstream by refusing field 0 rather than skipping it.
-fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, GossipsubWireError> {
-    let offset = *idx;
-    match minip2p_core::read_tag(input, idx)? {
-        Some((0, _)) => Err(GossipsubWireError::InvalidFieldNumber { offset }),
-        other => Ok(other),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Length-prefixed framing
 // ---------------------------------------------------------------------------
 
@@ -895,13 +871,16 @@ mod tests {
     }
 
     #[test]
-    fn control_rejects_field_zero_and_skips_unknown_fields() {
-        // Control messages share field-0 policy and still skip unknown tags.
-        let field_zero = [0x00, 0x01];
-        assert!(matches!(
-            ControlMessage::decode(&field_zero),
-            Err(GossipsubWireError::InvalidFieldNumber { offset: 0 })
-        ));
+    fn control_rejects_invalid_field_numbers_and_skips_unknown_fields() {
+        // Control messages reject invalid field numbers and still skip unknown tags.
+        assert_eq!(
+            ControlMessage::decode(&[0x00, 0x01]),
+            Err(invalid_field(0, 0))
+        );
+        assert_eq!(
+            ControlGraft::decode(&FIELD_2_POW_29),
+            Err(invalid_field(1 << 29, 0))
+        );
 
         let mut with_unknown = ControlGraft {
             topic_id: Some(String::from("t")),
@@ -919,9 +898,14 @@ mod tests {
 
     #[test]
     fn decode_rejects_malformed_control() {
-        // The nested field-zero tag is malformed protobuf.
+        // control { graft { field 0 } }: offset is relative to the GRAFT body.
+        let mut graft = Vec::new();
+        encode_bytes_field(&mut graft, 1, b"t");
+        graft.extend_from_slice(&[0x00, 0x01]);
+        let mut control = Vec::new();
+        encode_bytes_field(&mut control, 3, &graft);
         let mut encoded = Vec::new();
-        encode_bytes_field(&mut encoded, 3, &[0x00, 0x01]);
+        encode_bytes_field(&mut encoded, 3, &control);
         encode_bytes_field(
             &mut encoded,
             1,
@@ -932,10 +916,7 @@ mod tests {
             .encode(),
         );
 
-        assert!(matches!(
-            Rpc::decode(&encoded),
-            Err(GossipsubWireError::InvalidFieldNumber { .. })
-        ));
+        assert_eq!(Rpc::decode(&encoded), Err(invalid_field(0, 3)));
     }
 
     #[test]
@@ -998,22 +979,20 @@ mod tests {
     }
 
     #[test]
-    fn field_number_zero_is_rejected() {
-        // Tag 0x00 = field 0, wire type varint: protobuf-illegal; upstream
-        // decoders error rather than skip.
+    fn invalid_field_numbers_are_rejected() {
+        // Tag 0x00 = field 0, wire type varint: protobuf-illegal.
         let encoded = [0x00, 0x01];
-        assert!(matches!(
-            RawMessage::decode(&encoded),
-            Err(GossipsubWireError::InvalidFieldNumber { offset: 0 })
-        ));
-        assert!(matches!(
-            SubOpts::decode(&encoded),
-            Err(GossipsubWireError::InvalidFieldNumber { offset: 0 })
-        ));
-        assert!(matches!(
-            Rpc::decode(&encoded),
-            Err(GossipsubWireError::InvalidFieldNumber { offset: 0 })
-        ));
+        assert_eq!(RawMessage::decode(&encoded), Err(invalid_field(0, 0)));
+        assert_eq!(SubOpts::decode(&encoded), Err(invalid_field(0, 0)));
+        assert_eq!(Rpc::decode(&encoded), Err(invalid_field(0, 0)));
+        assert_eq!(Rpc::decode(&FIELD_2_POW_29), Err(invalid_field(1 << 29, 0)));
+    }
+
+    /// Tag for field `2^29` (one past the protobuf maximum), wire type varint, then a value.
+    const FIELD_2_POW_29: [u8; 6] = [0x80, 0x80, 0x80, 0x80, 0x10, 0x00];
+
+    fn invalid_field(field: u64, offset: usize) -> GossipsubWireError {
+        GossipsubWireError::Wire(WireError::InvalidFieldNumber { field, offset })
     }
 
     // -- framing -------------------------------------------------------------

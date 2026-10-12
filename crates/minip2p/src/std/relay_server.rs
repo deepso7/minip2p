@@ -1,17 +1,18 @@
-//! Std adapter for the caller-driven relay-server service.
+//! Drives the caller-driven relay-server service against the endpoint's
+//! swarm. Std-only by policy (relay hosting is a server role), though the
+//! driver itself takes the host's time sample like every other capability.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use minip2p_platform::Now;
+use minip2p_platform::{EntropySource, Now};
 use minip2p_relay_server::{
     RelayServerAction, RelayServerAgent, RelayServerEvent, RelayServerSendError, RelayServerToken,
     StreamKey,
 };
-use minip2p_swarm::{DriverError, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
-use minip2p_transport::{ConnectionId, TransportError};
-
-use crate::EndpointSwarm;
+use minip2p_swarm::{
+    DriverError, SwarmCore, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError,
+};
+use minip2p_transport::{ConnectionId, Transport, TransportError};
 
 fn take_pending_for_connection<T>(
     pending: &mut BTreeMap<StreamKey, T>,
@@ -30,7 +31,6 @@ fn take_pending_for_connection<T>(
 pub(crate) struct RelayServerDriver {
     pub(crate) agent: RelayServerAgent,
     pub(crate) events: VecDeque<RelayServerEvent>,
-    epoch: Instant,
     pending_opens: BTreeMap<StreamKey, RelayServerToken>,
 }
 
@@ -39,24 +39,16 @@ impl RelayServerDriver {
         Self {
             agent,
             events: VecDeque::new(),
-            epoch: Instant::now(),
             pending_opens: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn now(&self) -> Now {
-        Now::new(
-            self.epoch.elapsed().as_millis() as u64,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0),
-        )
-    }
-
-    pub(crate) fn ingest(&mut self, event: &SwarmEvent, swarm: &mut EndpointSwarm) -> bool {
-        let now = self.now();
+    pub(crate) fn ingest<T: Transport, E: EntropySource>(
+        &mut self,
+        event: &SwarmEvent,
+        swarm: &mut SwarmCore<T, E>,
+        now: Now,
+    ) -> bool {
         // A closed or replaced connection takes its in-flight negotiations with it.
         if let SwarmEvent::ConnectionClosed { conn_id, .. }
         | SwarmEvent::ConnectionReplaced { old: conn_id, .. } = event
@@ -76,7 +68,7 @@ impl RelayServerDriver {
         {
             self.agent
                 .stream_open_result(token, result.map(|()| key), now);
-            self.pump(swarm);
+            self.pump(swarm, now);
             return true;
         }
         let is_circuit = match event {
@@ -99,28 +91,35 @@ impl RelayServerDriver {
         let claimed = self.agent.handle_event(event, is_circuit, now);
         if let SwarmEvent::ConnectionEstablished { conn_id, .. }
         | SwarmEvent::ConnectionReplaced { new: conn_id, .. } = event
-            && let Some(address) = swarm.core().connection_remote_addr(*conn_id).cloned()
+            && let Some(address) = swarm.connection_remote_addr(*conn_id).cloned()
         {
             self.agent.set_connection_addr(*conn_id, address);
         }
-        self.pump(swarm);
+        self.pump(swarm, now);
         claimed
     }
 
-    pub(crate) fn tick(&mut self, swarm: &mut EndpointSwarm) {
-        let now = self.now();
+    pub(crate) fn tick<T: Transport, E: EntropySource>(
+        &mut self,
+        swarm: &mut SwarmCore<T, E>,
+        now: Now,
+    ) {
         if self.agent.next_timeout(now) == Some(0) {
             self.agent.handle_tick(now);
-            self.pump(swarm);
+            self.pump(swarm, now);
         }
     }
 
-    pub(crate) fn pump(&mut self, swarm: &mut EndpointSwarm) {
+    pub(crate) fn pump<T: Transport, E: EntropySource>(
+        &mut self,
+        swarm: &mut SwarmCore<T, E>,
+        now: Now,
+    ) {
         loop {
             let mut progressed = false;
             while let Some(action) = self.agent.poll_action() {
                 progressed = true;
-                self.execute(action, swarm);
+                self.execute(action, swarm, now);
             }
             while let Some(event) = self.agent.poll_event() {
                 progressed = true;
@@ -132,8 +131,13 @@ impl RelayServerDriver {
         }
     }
 
-    fn execute(&mut self, action: RelayServerAction, swarm: &mut EndpointSwarm) {
-        let now = self.now();
+    fn execute<T: Transport, E: EntropySource>(
+        &mut self,
+        action: RelayServerAction,
+        swarm: &mut SwarmCore<T, E>,
+        now: Now,
+    ) {
+        let now_ms = now.monotonic_ms;
         match action {
             RelayServerAction::OpenStream {
                 token,
@@ -141,11 +145,7 @@ impl RelayServerDriver {
                 expected_conn_id,
                 protocol_id,
             } => {
-                if swarm
-                    .core()
-                    .connection_remote_addr(expected_conn_id)
-                    .is_none()
-                {
+                if swarm.connection_remote_addr(expected_conn_id).is_none() {
                     self.agent.stream_open_result(
                         token,
                         Err(format!(
@@ -155,7 +155,7 @@ impl RelayServerDriver {
                     );
                     return;
                 }
-                match swarm.open_stream(&peer_id, &protocol_id) {
+                match swarm.open_stream(&peer_id, &protocol_id, now_ms) {
                     Ok((conn_id, stream_id)) => {
                         self.pending_opens
                             .insert(StreamKey { conn_id, stream_id }, token);
@@ -173,7 +173,7 @@ impl RelayServerDriver {
                 data,
             } => {
                 let result = swarm
-                    .send_stream(&peer_id, stream.conn_id, stream.stream_id, data)
+                    .send_stream(&peer_id, stream.conn_id, stream.stream_id, data, now_ms)
                     .map_err(|error| match error {
                         DriverError::Full { unsent, .. } => RelayServerSendError::Full { unsent },
                         error => RelayServerSendError::Failed(error.to_string()),
@@ -181,10 +181,7 @@ impl RelayServerDriver {
                 self.agent.send_stream_result(token, result, now);
             }
             RelayServerAction::AckStream { stream, bytes } => {
-                match swarm
-                    .core_mut()
-                    .ack_stream(stream.conn_id, stream.stream_id, bytes)
-                {
+                match swarm.ack_stream(stream.conn_id, stream.stream_id, bytes) {
                     // A stream or connection that is gone (or torn down by
                     // this ack's flush) released its bytes with it.
                     Ok(())
@@ -204,7 +201,7 @@ impl RelayServerDriver {
                 stream,
             } => {
                 let result = swarm
-                    .close_stream_write(&peer_id, stream.conn_id, stream.stream_id)
+                    .close_stream_write(&peer_id, stream.conn_id, stream.stream_id, now_ms)
                     .map_err(|error| error.to_string());
                 self.agent.close_stream_write_result(token, result, now);
             }
@@ -213,16 +210,34 @@ impl RelayServerDriver {
                 peer_id,
                 stream,
             } => {
-                let result = match swarm.reset_stream(&peer_id, stream.conn_id, stream.stream_id) {
-                    // A stream that is gone (or whose connection is) is
-                    // already reset.
-                    Ok(()) | Err(DriverError::Swarm(SwarmError::StreamNotFound { .. })) => Ok(()),
-                    Err(error) => Err(error.to_string()),
-                };
+                let result =
+                    match swarm.reset_stream(&peer_id, stream.conn_id, stream.stream_id, now_ms) {
+                        // A stream that is gone (or whose connection is) is
+                        // already reset.
+                        Ok(()) | Err(DriverError::Swarm(SwarmError::StreamNotFound { .. })) => {
+                            Ok(())
+                        }
+                        Err(error) => Err(error.to_string()),
+                    };
                 self.agent.reset_stream_result(token, result, now);
             }
         }
     }
+}
+
+/// The bound addresses a relay server may announce: wildcards are dropped,
+/// since a peer cannot dial `0.0.0.0` or `::`.
+pub(crate) fn concrete_relay_listener_addrs(
+    addrs: Vec<minip2p_core::Multiaddr>,
+) -> Vec<minip2p_core::Multiaddr> {
+    use minip2p_core::Protocol;
+    addrs
+        .into_iter()
+        .filter(|address| {
+            !matches!(address.iter().next(), Some(Protocol::Ip4(ip)) if *ip == [0; 4])
+                && !matches!(address.iter().next(), Some(Protocol::Ip6(ip)) if *ip == [0; 16])
+        })
+        .collect()
 }
 
 /// The outbound open `event` settles, if any: ready, or failed with a

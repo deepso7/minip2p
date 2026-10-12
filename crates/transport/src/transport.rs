@@ -226,6 +226,21 @@ pub trait Transport {
         Vec::new()
     }
 
+    /// A counter that advances whenever [`local_addresses`](Transport::local_addresses)
+    /// may report something different, or `None` when this transport cannot
+    /// tell.
+    ///
+    /// The swarm caches the address list it advertises and rebuilds it only
+    /// when this value (or its own external set) moves, so a transport that
+    /// returns `Some` must advance it on every change -- a new listener, and
+    /// an interface address a wildcard listener answers on. It never goes
+    /// backwards, which is what lets a composite add its members' counters.
+    /// The default, `None`, makes the swarm re-read `local_addresses` on
+    /// every poll, which is always correct.
+    fn local_addresses_revision(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns the remote transport address for every active inbound/accepted
     /// connection (pre-`Closed`), intentionally excluding outbound dials.
     ///

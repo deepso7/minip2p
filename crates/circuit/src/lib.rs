@@ -1062,6 +1062,10 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         self.inner.local_addresses()
     }
 
+    fn local_addresses_revision(&self) -> Option<u64> {
+        self.inner.local_addresses_revision()
+    }
+
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         self.inner.active_inbound_connection_sources()
     }
@@ -1121,11 +1125,8 @@ impl<T> CircuitTransport<T, StdEntropy> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minip2p_core::SansIoProtocol;
-    use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
-    use minip2p_noise::{
-        NOISE_PROTOCOL_ID, NoiseConfig, NoiseInput, NoiseOutput, NoiseRole, NoiseSession,
-    };
+    use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
+    use minip2p_noise::{NOISE_PROTOCOL_ID, NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
     use minip2p_secure_mux::KEEPALIVE_INTERVAL_MS;
     use minip2p_test_support::InMemoryTransport;
 
@@ -2030,9 +2031,7 @@ mod tests {
         let _ = b.poll(Now::from_millis(0)).expect("remote bridge event");
 
         let mut select = MultistreamSelect::dialer(NOISE_PROTOCOL_ID);
-        select
-            .handle_input(MultistreamInput::Start)
-            .expect("scripted multistream start");
+        select.start();
         let mut pending_data = Vec::new();
         while let Some(output) = select.poll_output() {
             if let MultistreamOutput::OutboundData(bytes) = output {
@@ -2040,16 +2039,12 @@ mod tests {
             }
         }
         let mut scripted_listener = MultistreamSelect::listener([NOISE_PROTOCOL_ID.to_string()]);
-        scripted_listener
-            .handle_input(MultistreamInput::Start)
-            .expect("scripted listener start");
+        scripted_listener.start();
         let listener_header = match scripted_listener.poll_output() {
             Some(MultistreamOutput::OutboundData(bytes)) => bytes,
             other => panic!("expected listener header, got {other:?}"),
         };
-        select
-            .handle_input(MultistreamInput::Data(listener_header))
-            .expect("scripted dialer receives listener header");
+        select.on_data(&listener_header);
         while let Some(output) = select.poll_output() {
             if let MultistreamOutput::OutboundData(bytes) = output {
                 pending_data.extend(bytes);
@@ -2063,9 +2058,7 @@ mod tests {
             ephemeral_secret: [12; 32],
             expected_peer: Some(b_peer.clone()),
         });
-        scripted_noise
-            .handle_input(NoiseInput::Start)
-            .expect("scripted Noise start");
+        scripted_noise.start().expect("scripted Noise start");
         while let Some(output) = scripted_noise.poll_output() {
             if let NoiseOutput::Outbound(bytes) = output {
                 pending_data.extend(bytes);

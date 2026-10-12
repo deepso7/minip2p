@@ -2,7 +2,7 @@
 //!
 //! Field framing uses the shared protobuf vocabulary in [`minip2p_core`];
 //! this module keeps beacon layout, size caps, and contextual
-//! [`DiscoveryWireError`] values (including field-number policy).
+//! [`DiscoveryWireError`] values.
 
 use alloc::vec::Vec;
 
@@ -24,8 +24,6 @@ pub const MAX_ADDR_LEN: usize = 1024;
 ///
 /// The three remaining bytes encode the field tag and its two-byte length prefix.
 pub const MAX_PUBLIC_KEY_LEN: usize = MAX_BEACON_SIZE - 3;
-
-const MAX_FIELD_NUMBER: u64 = (1 << 29) - 1;
 
 /// Presence payload: protobuf `Peer { bytes publicKey = 1; repeated bytes addrs = 2; }`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -69,12 +67,6 @@ impl Beacon {
         let mut beacon = Self::default();
         let mut idx = 0;
         while let Some((field, wire)) = read_tag(input, &mut idx)? {
-            if field == 0 {
-                return Err(DiscoveryWireError::FieldZero);
-            }
-            if field > MAX_FIELD_NUMBER {
-                return Err(DiscoveryWireError::InvalidFieldNumber);
-            }
             match (field, wire) {
                 (1, WIRE_LEN) => {
                     let value = read_len_delimited(input, &mut idx)?;
@@ -112,12 +104,6 @@ pub enum DiscoveryWireError {
     /// The top-level payload exceeds [`MAX_BEACON_SIZE`].
     #[error("discovery beacon exceeds the maximum size")]
     BeaconTooLarge,
-    /// Protobuf field zero is forbidden.
-    #[error("protobuf field number zero is invalid")]
-    FieldZero,
-    /// The field number exceeds protobuf's 29-bit range.
-    #[error("protobuf field number exceeds the supported range")]
-    InvalidFieldNumber,
     /// The public-key field exceeds its bound.
     #[error("discovery public key exceeds the maximum length")]
     PublicKeyTooLarge,
@@ -156,9 +142,19 @@ mod tests {
     }
 
     #[test]
-    fn field_zero_is_rejected_and_unknown_fields_are_skipped() {
-        // Discovery-specific field-number policy plus unknown-field skip.
-        assert_eq!(Beacon::decode(&[0]), Err(DiscoveryWireError::FieldZero));
+    fn invalid_field_numbers_are_rejected_and_unknown_fields_are_skipped() {
+        let invalid = |field, offset| {
+            Err(DiscoveryWireError::Wire(WireError::InvalidFieldNumber {
+                field,
+                offset,
+            }))
+        };
+        assert_eq!(Beacon::decode(&[0]), invalid(0, 0));
+        // A valid key field, then field 2^29.
+        assert_eq!(
+            Beacon::decode(&[0x0a, 1, 7, 0x80, 0x80, 0x80, 0x80, 0x10, 0]),
+            invalid(1 << 29, 3)
+        );
         let input = [0x18, 0x96, 1, 0x0a, 1, 7];
         assert_eq!(Beacon::decode(&input).unwrap().public_key, vec![7]);
     }

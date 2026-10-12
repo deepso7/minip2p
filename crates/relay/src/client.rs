@@ -1,16 +1,13 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{SansIoProtocol, WireError};
+use minip2p_core::FrameExchange;
 
 use crate::RelayError;
 use crate::{
-    FrameDecode, HopMessage, HopMessageType, Limit, MAX_PENDING_BRIDGE_SIZE, Peer, Reservation,
-    Status, StopMessage, StopMessageType, checked_outbound_frame, decode_frame, describe_status,
-    encode_frame, enforce_max_size,
+    HopMessage, HopMessageType, Limit, MAX_PENDING_BRIDGE_SIZE, Peer, Reservation, Status,
+    StopMessage, StopMessageType, describe_status, handshake_frames, queue_control,
 };
-#[cfg(test)]
-use crate::{MAX_FRAME_PREFIX_LEN, MAX_MESSAGE_SIZE};
 
 // ---------------------------------------------------------------------------
 // HopReservation: RESERVE flow (client -> relay)
@@ -35,18 +32,7 @@ pub enum ReservationOutcome {
     },
 }
 
-/// Input accepted by [`HopReservation`] through [`SansIoProtocol`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HopReservationInput {
-    /// Drain queued RESERVE bytes into an output.
-    Flush,
-    /// Bytes received from the relay stream.
-    Data(Vec<u8>),
-    /// Remote write side closed.
-    RemoteWriteClosed,
-}
-
-/// Output produced by [`HopReservation`] through [`SansIoProtocol`].
+/// Output produced by [`HopReservation::poll_output`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HopReservationOutput {
     /// Bytes to write to the relay stream.
@@ -60,13 +46,15 @@ pub enum HopReservationOutput {
 /// Usage:
 /// 1. Construct with [`HopReservation::new`].
 /// 2. Drain [`HopReservationOutput::Outbound`] from
-///    [`SansIoProtocol::poll_output`] and send the bytes on the relay stream.
-/// 3. Feed incoming stream bytes with [`HopReservationInput::Data`].
+///    [`HopReservation::poll_output`] and send the bytes on the relay stream.
+/// 3. Feed incoming stream bytes with [`HopReservation::on_data`].
 /// 4. Drain [`HopReservationOutput::Outcome`] to observe accepted/refused
 ///    completion.
+///
+/// Bytes the relay sends behind its STATUS frame are ignored: a reservation
+/// stream carries nothing after the response.
 pub struct HopReservation {
-    outbound: Vec<u8>,
-    recv_buf: Vec<u8>,
+    frames: FrameExchange,
     state: FlowState,
     outcome: Option<ReservationOutcome>,
     emitted_outcome: bool,
@@ -86,9 +74,6 @@ enum FlowState {
 impl HopReservation {
     /// Creates a new reservation state machine and queues the RESERVE message.
     pub fn new() -> Self {
-        // The RESERVE request has no variable-length fields, so its encoded
-        // frame is structurally far below MAX_MESSAGE_SIZE; no outbound size
-        // check is needed here.
         let request = HopMessage {
             kind: HopMessageType::Reserve,
             peer: None,
@@ -96,45 +81,64 @@ impl HopReservation {
             limit: None,
             status: None,
         };
-        let body = request.encode();
-        let outbound = encode_frame(&body);
+        let mut frames = handshake_frames();
+        frames
+            .queue(&request.encode())
+            .expect("RESERVE has no variable-length fields and always fits one frame");
 
         Self {
-            outbound,
-            recv_buf: Vec::new(),
+            frames,
             state: FlowState::Pending,
             outcome: None,
             emitted_outcome: false,
         }
     }
 
-    /// Drains and returns any pending outbound bytes.
-    ///
-    /// Call this after construction and whenever you need to flush data to
-    /// the relay stream.
-    fn take_outbound(&mut self) -> Vec<u8> {
-        if self.state == FlowState::Pending {
-            self.state = FlowState::AwaitingResponse;
-        }
-        core::mem::take(&mut self.outbound)
-    }
-
     /// Feeds incoming stream bytes from the relay.
-    fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
+    ///
+    /// Any error ends the flow; later input is ignored.
+    pub fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
         if self.state == FlowState::Done {
             return Ok(());
         }
-
-        self.recv_buf.extend_from_slice(data);
-        self.try_decode_response()
+        let result = self
+            .frames
+            .push(data)
+            .map_err(RelayError::from)
+            .and_then(|()| self.try_decode_response());
+        self.finish_on_error(result)
     }
 
     /// Notifies the state machine that the remote closed its write side.
     ///
     /// If a complete response has not yet been decoded, this is not itself
     /// an error -- callers can still receive partial buffered data.
-    fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
-        self.try_decode_response()
+    pub fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
+        if self.state == FlowState::Done {
+            return Ok(());
+        }
+        let result = self.try_decode_response();
+        self.finish_on_error(result)
+    }
+
+    /// Returns the next pending output, if any.
+    ///
+    /// Drain until `None` after construction and after every input, before
+    /// waiting on the stream again.
+    pub fn poll_output(&mut self) -> Option<HopReservationOutput> {
+        if self.frames.has_outbound() {
+            if self.state == FlowState::Pending {
+                self.state = FlowState::AwaitingResponse;
+            }
+            return Some(HopReservationOutput::Outbound(self.frames.take_outbound()));
+        }
+        if !self.emitted_outcome
+            && let Some(outcome) = self.outcome.clone()
+        {
+            self.emitted_outcome = true;
+            return Some(HopReservationOutput::Outcome(outcome));
+        }
+        None
     }
 
     /// Returns the outcome of the flow, if available.
@@ -148,52 +152,20 @@ impl HopReservation {
         self.state == FlowState::Done
     }
 
+    fn finish_on_error(&mut self, result: Result<(), RelayError>) -> Result<(), RelayError> {
+        if result.is_err() {
+            self.state = FlowState::Done;
+        }
+        result
+    }
+
     /// Attempts to decode the response frame from the receive buffer.
     fn try_decode_response(&mut self) -> Result<(), RelayError> {
-        if self.state == FlowState::Done {
+        let Some(msg) = next_hop_status(&mut self.frames)? else {
             return Ok(());
-        }
-
-        let (msg, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => {
-                let msg = HopMessage::decode(payload).map_err(|e| {
-                    self.state = FlowState::Done;
-                    RelayError::Malformed(e)
-                })?;
-                (msg, consumed)
-            }
-            // Only the incomplete remainder is bounded: a complete frame
-            // decodes (and drains) regardless of what is coalesced behind
-            // it -- e.g. a STATUS frame pipelined with the first bridged
-            // bytes -- so the backstop can never reject a frame the
-            // decoder would accept.
-            FrameDecode::Incomplete => {
-                enforce_max_size(&self.recv_buf).inspect_err(|_| {
-                    self.state = FlowState::Done;
-                })?;
-                return Ok(());
-            }
-            FrameDecode::TooLarge { len } => {
-                self.state = FlowState::Done;
-                return Err(RelayError::FrameTooLarge { len });
-            }
-            FrameDecode::Error(e) => {
-                self.state = FlowState::Done;
-                return Err(RelayError::Malformed(WireError::from(e).into()));
-            }
         };
-        self.recv_buf.drain(..consumed);
-
-        if msg.kind != HopMessageType::Status {
-            self.state = FlowState::Done;
-            return Err(RelayError::UnexpectedMessage(unexpected_hop_reason(
-                msg.kind, "STATUS",
-            )));
-        }
-
         let status = msg.status.unwrap_or(Status::Unused);
         self.state = FlowState::Done;
-
         self.outcome = Some(if status == Status::Ok {
             ReservationOutcome::Accepted {
                 reservation: msg.reservation,
@@ -206,41 +178,7 @@ impl HopReservation {
             }
         });
         self.emitted_outcome = false;
-
         Ok(())
-    }
-}
-
-impl SansIoProtocol for HopReservation {
-    type Input = HopReservationInput;
-    type Output = HopReservationOutput;
-    type Error = RelayError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        match input {
-            HopReservationInput::Flush => {}
-            HopReservationInput::Data(data) => self.on_data(&data)?,
-            HopReservationInput::RemoteWriteClosed => self.on_remote_write_closed()?,
-        }
-        Ok(())
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
-        let outbound = self.take_outbound();
-        if !outbound.is_empty() {
-            return Some(HopReservationOutput::Outbound(outbound));
-        }
-        if !self.emitted_outcome
-            && let Some(outcome) = self.outcome.clone()
-        {
-            self.emitted_outcome = true;
-            return Some(HopReservationOutput::Outcome(outcome));
-        }
-        None
-    }
-
-    fn is_idle(&self) -> bool {
-        self.outbound.is_empty() && (self.emitted_outcome || self.outcome.is_none())
     }
 }
 
@@ -269,18 +207,7 @@ pub enum ConnectOutcome {
     Refused { status: Status, reason: String },
 }
 
-/// Input accepted by [`HopConnect`] through [`SansIoProtocol`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HopConnectInput {
-    /// Drain queued CONNECT bytes into an output.
-    Flush,
-    /// Bytes received from the relay stream.
-    Data(Vec<u8>),
-    /// Remote write side closed.
-    RemoteWriteClosed,
-}
-
-/// Output produced by [`HopConnect`] through [`SansIoProtocol`].
+/// Output produced by [`HopConnect::poll_output`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HopConnectOutput {
     /// Bytes to write to the relay stream.
@@ -295,22 +222,21 @@ pub enum HopConnectOutput {
 ///
 /// Usage:
 /// 1. Construct with [`HopConnect::new`], passing the target peer's id.
-/// 2. Drain [`HopConnectOutput::Outbound`] from
-///    [`SansIoProtocol::poll_output`] and send the bytes.
-/// 3. Feed incoming stream bytes with [`HopConnectInput::Data`].
+/// 2. Drain [`HopConnectOutput::Outbound`] from [`HopConnect::poll_output`]
+///    and send the bytes.
+/// 3. Feed incoming stream bytes with [`HopConnect::on_data`].
 /// 4. When [`HopConnectOutput::Outcome`] returns `ConnectOutcome::Bridged`,
 ///    the stream becomes the relay circuit; drain
 ///    [`HopConnectOutput::BridgeData`] for any pipelined peer-to-peer bytes.
+///
+/// Bytes behind an accepting STATUS frame, in the same read or later, are
+/// bridged traffic and are not bound by the control-frame limit.
 pub struct HopConnect {
-    outbound: Vec<u8>,
-    recv_buf: Vec<u8>,
+    frames: FrameExchange,
     state: FlowState,
     outcome: Option<ConnectOutcome>,
     emitted_outcome: bool,
     bridge_bytes: Vec<u8>,
-    /// Deferred construction error (oversized CONNECT), surfaced by the
-    /// first [`SansIoProtocol::handle_input`] call.
-    pending_error: Option<RelayError>,
 }
 
 impl HopConnect {
@@ -318,12 +244,10 @@ impl HopConnect {
     ///
     /// `target_peer_id` should be the multihash-encoded PeerId bytes.
     ///
-    /// If the encoded CONNECT would exceed [`MAX_MESSAGE_SIZE`] -- a frame
-    /// any hardened relay (including this crate's own decoder) would
-    /// reject -- no bytes are queued and the first
-    /// [`SansIoProtocol::handle_input`] call fails with
-    /// [`RelayError::MessageTooLarge`].
-    pub fn new(target_peer_id: Vec<u8>) -> Self {
+    /// Fails with [`RelayError::MessageTooLarge`] if the encoded CONNECT
+    /// would exceed [`MAX_MESSAGE_SIZE`](crate::MAX_MESSAGE_SIZE) -- a frame
+    /// any hardened relay (including this crate's own decoder) would reject.
+    pub fn new(target_peer_id: Vec<u8>) -> Result<Self, RelayError> {
         let request = HopMessage {
             kind: HopMessageType::Connect,
             peer: Some(Peer {
@@ -334,36 +258,24 @@ impl HopConnect {
             limit: None,
             status: None,
         };
-        let (outbound, state, pending_error) = match checked_outbound_frame(&request.encode()) {
-            Ok(frame) => (frame, FlowState::Pending, None),
-            Err(err) => (Vec::new(), FlowState::Done, Some(err)),
-        };
+        let mut frames = handshake_frames();
+        queue_control(&mut frames, &request.encode())?;
 
-        Self {
-            outbound,
-            recv_buf: Vec::new(),
-            state,
+        Ok(Self {
+            frames,
+            state: FlowState::Pending,
             outcome: None,
             emitted_outcome: false,
             bridge_bytes: Vec::new(),
-            pending_error,
-        }
-    }
-
-    /// Drains and returns any pending outbound bytes.
-    fn take_outbound(&mut self) -> Vec<u8> {
-        if self.state == FlowState::Pending {
-            self.state = FlowState::AwaitingResponse;
-        }
-        core::mem::take(&mut self.outbound)
+        })
     }
 
     /// Feeds incoming stream bytes from the relay.
     ///
     /// After the CONNECT is accepted, any further bytes passed here are
-    /// buffered as bridged relay traffic; drain them with
-    /// [`HopConnect::take_bridge_bytes`].
-    fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
+    /// emitted as [`HopConnectOutput::BridgeData`]. Any error ends the flow;
+    /// later input is ignored.
+    pub fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
         if self.state == FlowState::Done {
             // Already bridged or errored — any further bytes belong to the
             // bridged channel (or are garbage after an error).
@@ -372,14 +284,45 @@ impl HopConnect {
             }
             return Ok(());
         }
-
-        self.recv_buf.extend_from_slice(data);
-        self.try_decode_response()
+        let result = self
+            .frames
+            .push(data)
+            .map_err(RelayError::from)
+            .and_then(|()| self.try_decode_response());
+        self.finish_on_error(result)
     }
 
     /// Notifies the state machine that the remote closed its write side.
-    fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
-        self.try_decode_response()
+    pub fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
+        if self.state == FlowState::Done {
+            return Ok(());
+        }
+        let result = self.try_decode_response();
+        self.finish_on_error(result)
+    }
+
+    /// Returns the next pending output, if any.
+    ///
+    /// Drain until `None` after construction and after every input, before
+    /// waiting on the stream again.
+    pub fn poll_output(&mut self) -> Option<HopConnectOutput> {
+        if self.frames.has_outbound() {
+            if self.state == FlowState::Pending {
+                self.state = FlowState::AwaitingResponse;
+            }
+            return Some(HopConnectOutput::Outbound(self.frames.take_outbound()));
+        }
+        if !self.emitted_outcome
+            && let Some(outcome) = self.outcome.clone()
+        {
+            self.emitted_outcome = true;
+            return Some(HopConnectOutput::Outcome(outcome));
+        }
+        let bridge_bytes = self.take_bridge_bytes();
+        if !bridge_bytes.is_empty() {
+            return Some(HopConnectOutput::BridgeData(bridge_bytes));
+        }
+        None
     }
 
     /// Returns the outcome of the flow, if available.
@@ -400,59 +343,25 @@ impl HopConnect {
         core::mem::take(&mut self.bridge_bytes)
     }
 
+    fn finish_on_error(&mut self, result: Result<(), RelayError>) -> Result<(), RelayError> {
+        if result.is_err() {
+            self.state = FlowState::Done;
+        }
+        result
+    }
+
     /// Attempts to decode the response from the receive buffer.
     fn try_decode_response(&mut self) -> Result<(), RelayError> {
-        if self.state == FlowState::Done {
+        let Some(msg) = next_hop_status(&mut self.frames)? else {
             return Ok(());
-        }
-
-        let (msg, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => {
-                let msg = HopMessage::decode(payload).map_err(|e| {
-                    self.state = FlowState::Done;
-                    RelayError::Malformed(e)
-                })?;
-                (msg, consumed)
-            }
-            // Only the incomplete remainder is bounded: a complete frame
-            // decodes (and drains) regardless of what is coalesced behind
-            // it -- e.g. a STATUS frame pipelined with the first bridged
-            // bytes -- so the backstop can never reject a frame the
-            // decoder would accept.
-            FrameDecode::Incomplete => {
-                enforce_max_size(&self.recv_buf).inspect_err(|_| {
-                    self.state = FlowState::Done;
-                })?;
-                return Ok(());
-            }
-            FrameDecode::TooLarge { len } => {
-                self.state = FlowState::Done;
-                return Err(RelayError::FrameTooLarge { len });
-            }
-            FrameDecode::Error(e) => {
-                self.state = FlowState::Done;
-                return Err(RelayError::Malformed(WireError::from(e).into()));
-            }
         };
-        self.recv_buf.drain(..consumed);
-
-        if msg.kind != HopMessageType::Status {
-            self.state = FlowState::Done;
-            return Err(RelayError::UnexpectedMessage(unexpected_hop_reason(
-                msg.kind, "STATUS",
-            )));
-        }
-
         let status = msg.status.unwrap_or(Status::Unused);
         self.state = FlowState::Done;
-
         self.outcome = Some(if status == Status::Ok {
             // Any bytes buffered after the STATUS frame belong to the bridged
             // stream. This catches the case where the relay pipelines the
             // first bytes of the bridged connection into the same packet.
-            if !self.recv_buf.is_empty() {
-                self.bridge_bytes.append(&mut self.recv_buf);
-            }
+            self.bridge_bytes.append(&mut self.frames.take_buffered());
             ConnectOutcome::Bridged { limit: msg.limit }
         } else {
             ConnectOutcome::Refused {
@@ -461,51 +370,7 @@ impl HopConnect {
             }
         });
         self.emitted_outcome = false;
-
         Ok(())
-    }
-}
-
-impl SansIoProtocol for HopConnect {
-    type Input = HopConnectInput;
-    type Output = HopConnectOutput;
-    type Error = RelayError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        if let Some(err) = self.pending_error.take() {
-            return Err(err);
-        }
-        match input {
-            HopConnectInput::Flush => {}
-            HopConnectInput::Data(data) => self.on_data(&data)?,
-            HopConnectInput::RemoteWriteClosed => self.on_remote_write_closed()?,
-        }
-        Ok(())
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
-        let outbound = self.take_outbound();
-        if !outbound.is_empty() {
-            return Some(HopConnectOutput::Outbound(outbound));
-        }
-        if !self.emitted_outcome
-            && let Some(outcome) = self.outcome.clone()
-        {
-            self.emitted_outcome = true;
-            return Some(HopConnectOutput::Outcome(outcome));
-        }
-        let bridge_bytes = self.take_bridge_bytes();
-        if !bridge_bytes.is_empty() {
-            return Some(HopConnectOutput::BridgeData(bridge_bytes));
-        }
-        None
-    }
-
-    fn is_idle(&self) -> bool {
-        self.pending_error.is_none()
-            && self.outbound.is_empty()
-            && self.bridge_bytes.is_empty()
-            && (self.emitted_outcome || self.outcome.is_none())
     }
 }
 
@@ -522,22 +387,7 @@ pub struct StopConnectRequest {
     pub limit: Option<Limit>,
 }
 
-/// Input accepted by [`StopResponder`] through [`SansIoProtocol`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StopResponderInput {
-    /// Drain queued STATUS bytes into an output.
-    Flush,
-    /// Bytes received from the relay stream.
-    Data(Vec<u8>),
-    /// Remote write side closed.
-    RemoteWriteClosed,
-    /// Accept the pending CONNECT request.
-    Accept,
-    /// Reject the pending CONNECT request with a status.
-    Reject(Status),
-}
-
-/// Output produced by [`StopResponder`] through [`SansIoProtocol`].
+/// Output produced by [`StopResponder::poll_output`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StopResponderOutput {
     /// Decoded CONNECT request.
@@ -552,10 +402,10 @@ pub enum StopResponderOutput {
 ///
 /// Flow:
 /// 1. Relay opens a STOP stream to us and sends a CONNECT message.
-/// 2. Feed bytes with [`StopResponderInput::Data`] and drain
+/// 2. Feed bytes with [`StopResponder::on_data`] and drain
 ///    [`StopResponderOutput::Request`].
-/// 3. Decide to accept or reject with [`StopResponderInput::Accept`] or
-///    [`StopResponderInput::Reject`].
+/// 3. Decide to accept or reject with [`StopResponder::accept`] or
+///    [`StopResponder::reject`].
 /// 4. Send resulting [`StopResponderOutput::Outbound`] bytes to the relay.
 /// 5. If accepted, the stream becomes the bridged circuit; drain
 ///    [`StopResponderOutput::BridgeData`] for any pipelined bytes.
@@ -565,8 +415,7 @@ pub enum StopResponderOutput {
 /// Payload coalesced with CONNECT is capped by [`MAX_PENDING_BRIDGE_SIZE`]; a
 /// larger pending payload returns [`RelayError::PendingBridgeTooLarge`].
 pub struct StopResponder {
-    outbound: Vec<u8>,
-    recv_buf: Vec<u8>,
+    frames: FrameExchange,
     state: StopState,
     request: Option<StopConnectRequest>,
     emitted_request: bool,
@@ -590,8 +439,7 @@ impl StopResponder {
     /// Creates a new STOP responder waiting for a CONNECT frame.
     pub fn new() -> Self {
         Self {
-            outbound: Vec::new(),
-            recv_buf: Vec::new(),
+            frames: handshake_frames(),
             state: StopState::AwaitingConnect,
             request: None,
             emitted_request: false,
@@ -599,37 +447,72 @@ impl StopResponder {
         }
     }
 
-    /// Drains and returns any pending outbound bytes.
-    fn take_outbound(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.outbound)
-    }
-
     /// Feeds incoming stream bytes from the relay.
-    fn on_data(&mut self, mut data: Vec<u8>) -> Result<(), RelayError> {
-        if self.state == StopState::Bridged {
-            self.bridge_bytes.append(&mut data);
-            return Ok(());
+    ///
+    /// Returns [`RelayError::DecisionPending`] while a request awaits its
+    /// decision. Any other error ends the flow; later input is ignored.
+    pub fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
+        match self.state {
+            StopState::Bridged => {
+                self.bridge_bytes.extend_from_slice(data);
+                return Ok(());
+            }
+            StopState::Done => return Ok(()),
+            StopState::AwaitingDecision => return Err(RelayError::DecisionPending),
+            StopState::AwaitingConnect => {}
         }
-
-        if self.state == StopState::Done {
-            return Ok(());
-        }
-
-        if self.state == StopState::AwaitingDecision {
-            return Err(RelayError::DecisionPending);
-        }
-
-        if self.recv_buf.is_empty() {
-            self.recv_buf = data;
-        } else {
-            self.recv_buf.append(&mut data);
-        }
-        self.try_decode_connect()
+        let result = self
+            .frames
+            .push(data)
+            .map_err(RelayError::from)
+            .and_then(|()| self.try_decode_connect());
+        self.finish_on_error(result)
     }
 
     /// Notifies the state machine that the remote closed its write side.
-    fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
-        self.try_decode_connect()
+    pub fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
+        if self.state != StopState::AwaitingConnect {
+            return Ok(());
+        }
+        let result = self.try_decode_connect();
+        self.finish_on_error(result)
+    }
+
+    /// Accepts the CONNECT request, queuing a `STATUS: OK` response.
+    ///
+    /// After this, the stream becomes the bridged circuit; payload the relay
+    /// pipelined behind its CONNECT, and any further bytes received, are
+    /// emitted as [`StopResponderOutput::BridgeData`].
+    pub fn accept(&mut self) -> Result<(), RelayError> {
+        self.send_status(Status::Ok, StopState::Bridged)?;
+        self.bridge_bytes.append(&mut self.frames.take_buffered());
+        Ok(())
+    }
+
+    /// Rejects the CONNECT request with the given status code.
+    pub fn reject(&mut self, status: Status) -> Result<(), RelayError> {
+        self.send_status(status, StopState::Done)
+    }
+
+    /// Returns the next pending output, if any.
+    ///
+    /// Drain until `None` after every input, before waiting on the stream
+    /// or the decision again.
+    pub fn poll_output(&mut self) -> Option<StopResponderOutput> {
+        if !self.emitted_request
+            && let Some(request) = self.request.clone()
+        {
+            self.emitted_request = true;
+            return Some(StopResponderOutput::Request(request));
+        }
+        if self.frames.has_outbound() {
+            return Some(StopResponderOutput::Outbound(self.frames.take_outbound()));
+        }
+        let bridge_bytes = self.take_bridge_bytes();
+        if !bridge_bytes.is_empty() {
+            return Some(StopResponderOutput::BridgeData(bridge_bytes));
+        }
+        None
     }
 
     /// Returns the decoded CONNECT request, if received.
@@ -643,30 +526,19 @@ impl StopResponder {
         matches!(self.state, StopState::Done | StopState::Bridged)
     }
 
-    /// Accepts the CONNECT request, queuing a `STATUS: OK` response.
-    ///
-    /// After this, the stream becomes the bridged circuit; any further bytes
-    /// received from the relay are queued into [`StopResponder::take_bridge_bytes`].
-    fn accept(&mut self) -> Result<(), RelayError> {
-        self.send_status(Status::Ok, StopState::Bridged)?;
-        // Any bytes the relay pipelined after its CONNECT belong to the bridge.
-        if !self.recv_buf.is_empty() {
-            self.bridge_bytes.append(&mut self.recv_buf);
-        }
-        Ok(())
-    }
-
-    /// Rejects the CONNECT request with the given status code.
-    fn reject(&mut self, status: Status) -> Result<(), RelayError> {
-        self.send_status(status, StopState::Done)
-    }
-
     /// Drains any bridged relay traffic received since the last call.
     fn take_bridge_bytes(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.bridge_bytes)
     }
 
-    /// Emits a StopMessage with `type = STATUS` and the given status code.
+    fn finish_on_error(&mut self, result: Result<(), RelayError>) -> Result<(), RelayError> {
+        if result.is_err() {
+            self.state = StopState::Done;
+        }
+        result
+    }
+
+    /// Queues a StopMessage with `type = STATUS` and the given status code.
     fn send_status(&mut self, status: Status, next_state: StopState) -> Result<(), RelayError> {
         if self.state != StopState::AwaitingDecision {
             return Err(RelayError::UnexpectedMessage(alloc::format!(
@@ -674,76 +546,37 @@ impl StopResponder {
                 self.state
             )));
         }
-
-        // The STATUS response carries only fixed varint fields, so its
-        // encoded frame is structurally far below MAX_MESSAGE_SIZE; no
-        // outbound size check is needed here.
         let response = StopMessage {
             kind: StopMessageType::Status,
             peer: None,
             limit: None,
             status: Some(status),
         };
-        let body = response.encode();
-        self.outbound.extend(encode_frame(&body));
+        queue_control(&mut self.frames, &response.encode())?;
         self.state = next_state;
         Ok(())
     }
 
     /// Decodes the CONNECT request from the receive buffer.
     fn try_decode_connect(&mut self) -> Result<(), RelayError> {
-        if self.state != StopState::AwaitingConnect {
+        let Some(msg) = self
+            .frames
+            .next_frame(|payload| StopMessage::decode(payload).map_err(RelayError::Malformed))?
+        else {
             return Ok(());
-        }
-
-        let (msg, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => {
-                let msg = StopMessage::decode(payload).map_err(|e| {
-                    self.state = StopState::Done;
-                    RelayError::Malformed(e)
-                })?;
-                (msg, consumed)
-            }
-            // Only the incomplete remainder is bounded: a complete frame
-            // decodes (and drains) regardless of what is coalesced behind
-            // it -- e.g. a CONNECT pipelined with the first bridged bytes
-            // -- so the backstop can never reject a frame the decoder
-            // would accept.
-            FrameDecode::Incomplete => {
-                enforce_max_size(&self.recv_buf).inspect_err(|_| {
-                    self.state = StopState::Done;
-                })?;
-                return Ok(());
-            }
-            FrameDecode::TooLarge { len } => {
-                self.state = StopState::Done;
-                return Err(RelayError::FrameTooLarge { len });
-            }
-            FrameDecode::Error(e) => {
-                self.state = StopState::Done;
-                return Err(RelayError::Malformed(WireError::from(e).into()));
-            }
         };
-        let pending_len = self.recv_buf.len() - consumed;
+        let pending_len = self.frames.buffered().len();
         if pending_len > MAX_PENDING_BRIDGE_SIZE {
-            self.recv_buf.clear();
-            self.state = StopState::Done;
+            self.frames.take_buffered();
             return Err(RelayError::PendingBridgeTooLarge { len: pending_len });
         }
-        self.recv_buf.drain(..consumed);
-
         if msg.kind != StopMessageType::Connect {
-            self.state = StopState::Done;
             return Err(RelayError::UnexpectedMessage(unexpected_stop_reason(
                 msg.kind, "CONNECT",
             )));
         }
-
         let peer = msg.peer.ok_or_else(|| {
-            self.state = StopState::Done;
-            RelayError::UnexpectedMessage(alloc::string::String::from(
-                "STOP CONNECT missing peer field",
-            ))
+            RelayError::UnexpectedMessage(String::from("STOP CONNECT missing peer field"))
         })?;
 
         self.request = Some(StopConnectRequest {
@@ -752,49 +585,7 @@ impl StopResponder {
         });
         self.emitted_request = false;
         self.state = StopState::AwaitingDecision;
-
         Ok(())
-    }
-}
-
-impl SansIoProtocol for StopResponder {
-    type Input = StopResponderInput;
-    type Output = StopResponderOutput;
-    type Error = RelayError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        match input {
-            StopResponderInput::Flush => {}
-            StopResponderInput::Data(data) => self.on_data(data)?,
-            StopResponderInput::RemoteWriteClosed => self.on_remote_write_closed()?,
-            StopResponderInput::Accept => self.accept()?,
-            StopResponderInput::Reject(status) => self.reject(status)?,
-        }
-        Ok(())
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
-        if !self.emitted_request
-            && let Some(request) = self.request.clone()
-        {
-            self.emitted_request = true;
-            return Some(StopResponderOutput::Request(request));
-        }
-        let outbound = self.take_outbound();
-        if !outbound.is_empty() {
-            return Some(StopResponderOutput::Outbound(outbound));
-        }
-        let bridge_bytes = self.take_bridge_bytes();
-        if !bridge_bytes.is_empty() {
-            return Some(StopResponderOutput::BridgeData(bridge_bytes));
-        }
-        None
-    }
-
-    fn is_idle(&self) -> bool {
-        self.outbound.is_empty()
-            && self.bridge_bytes.is_empty()
-            && (self.emitted_request || self.request.is_none())
     }
 }
 
@@ -807,6 +598,22 @@ impl Default for StopResponder {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// Decodes the relay's HOP response, if a whole frame is buffered, and
+/// checks that it is a STATUS.
+fn next_hop_status(frames: &mut FrameExchange) -> Result<Option<HopMessage>, RelayError> {
+    let Some(msg) =
+        frames.next_frame(|payload| HopMessage::decode(payload).map_err(RelayError::Malformed))?
+    else {
+        return Ok(None);
+    };
+    if msg.kind != HopMessageType::Status {
+        return Err(RelayError::UnexpectedMessage(unexpected_hop_reason(
+            msg.kind, "STATUS",
+        )));
+    }
+    Ok(Some(msg))
+}
 
 fn unexpected_hop_reason(actual: HopMessageType, expected: &str) -> String {
     use alloc::format;
@@ -831,6 +638,7 @@ fn unexpected_stop_reason(actual: StopMessageType, expected: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FrameDecode, MAX_MESSAGE_SIZE, RelayMessageError, decode_frame, encode_frame};
 
     /// Helper: encode a HopMessage as a length-prefixed frame.
     fn frame_hop(msg: HopMessage) -> Vec<u8> {
@@ -842,24 +650,86 @@ mod tests {
         encode_frame(&msg.encode())
     }
 
+    fn hop_status(status: Status) -> HopMessage {
+        HopMessage {
+            kind: HopMessageType::Status,
+            peer: None,
+            reservation: None,
+            limit: None,
+            status: Some(status),
+        }
+    }
+
+    /// A `STATUS: OK` whose payload is exactly [`MAX_MESSAGE_SIZE`] bytes,
+    /// padded with a reservation voucher.
+    fn max_size_ok_status() -> Vec<u8> {
+        let msg = (MAX_MESSAGE_SIZE - 16..MAX_MESSAGE_SIZE)
+            .map(|voucher_len| HopMessage {
+                reservation: Some(Reservation {
+                    expire: None,
+                    addrs: Vec::new(),
+                    voucher: Some(vec![0x5a; voucher_len]),
+                }),
+                ..hop_status(Status::Ok)
+            })
+            .find(|msg| msg.encode().len() == MAX_MESSAGE_SIZE)
+            .expect("some voucher length pads STATUS to exactly the maximum");
+        frame_hop(msg)
+    }
+
+    fn stop_connect(id: &[u8]) -> StopMessage {
+        StopMessage {
+            kind: StopMessageType::Connect,
+            peer: Some(Peer {
+                id: id.to_vec(),
+                addrs: vec![],
+            }),
+            limit: None,
+            status: None,
+        }
+    }
+
+    /// A header declaring one byte more than the maximum, with no payload.
+    fn over_declared_header() -> Vec<u8> {
+        let mut header = Vec::new();
+        minip2p_core::write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut header);
+        header
+    }
+
+    /// Takes the RESERVE queued at construction.
+    fn reservation_request(flow: &mut HopReservation) -> Vec<u8> {
+        let Some(HopReservationOutput::Outbound(bytes)) = flow.poll_output() else {
+            panic!("RESERVE is queued at construction");
+        };
+        bytes
+    }
+
+    /// Takes the CONNECT queued at construction.
+    fn connect_request(flow: &mut HopConnect) -> Vec<u8> {
+        let Some(HopConnectOutput::Outbound(bytes)) = flow.poll_output() else {
+            panic!("CONNECT is queued at construction");
+        };
+        bytes
+    }
+
+    fn decode_hop(bytes: &[u8]) -> HopMessage {
+        let FrameDecode::Complete { payload, .. } = decode_frame(bytes) else {
+            panic!("expected complete frame");
+        };
+        HopMessage::decode(payload).unwrap()
+    }
+
     // --- HopReservation -----------------------------------------------------
 
     #[test]
     fn reservation_sends_reserve_and_accepts_ok_response() {
         let mut flow = HopReservation::new();
 
-        // Take and decode outbound.
-        let outbound = flow.take_outbound();
-        let FrameDecode::Complete { payload, .. } = decode_frame(&outbound) else {
-            panic!("expected complete frame");
-        };
-        let req = HopMessage::decode(payload).unwrap();
+        let req = decode_hop(&reservation_request(&mut flow));
         assert_eq!(req.kind, HopMessageType::Reserve);
 
         // Simulate relay response: STATUS:OK with reservation.
         let response = frame_hop(HopMessage {
-            kind: HopMessageType::Status,
-            peer: None,
             reservation: Some(Reservation {
                 expire: Some(2_000_000_000),
                 addrs: vec![vec![0x04, 1, 2, 3, 4]],
@@ -869,36 +739,34 @@ mod tests {
                 duration: Some(900),
                 data: Some(10_000_000),
             }),
-            status: Some(Status::Ok),
+            ..hop_status(Status::Ok)
         });
         flow.on_data(&response).unwrap();
 
         assert!(flow.is_done());
-        match flow.outcome() {
-            Some(ReservationOutcome::Accepted { reservation, limit }) => {
+        match flow.poll_output() {
+            Some(HopReservationOutput::Outcome(ReservationOutcome::Accepted {
+                reservation,
+                limit,
+            })) => {
                 assert_eq!(
                     reservation.as_ref().and_then(|r| r.expire),
                     Some(2_000_000_000)
                 );
                 assert_eq!(limit.as_ref().and_then(|l| l.duration), Some(900));
             }
-            other => panic!("unexpected outcome: {other:?}"),
+            other => panic!("unexpected output: {other:?}"),
         }
+        assert!(flow.poll_output().is_none());
     }
 
     #[test]
     fn reservation_handles_refusal() {
         let mut flow = HopReservation::new();
-        let _ = flow.take_outbound();
+        reservation_request(&mut flow);
 
-        let response = frame_hop(HopMessage {
-            kind: HopMessageType::Status,
-            peer: None,
-            reservation: None,
-            limit: None,
-            status: Some(Status::ReservationRefused),
-        });
-        flow.on_data(&response).unwrap();
+        flow.on_data(&frame_hop(hop_status(Status::ReservationRefused)))
+            .unwrap();
 
         match flow.outcome() {
             Some(ReservationOutcome::Refused { status, .. }) => {
@@ -911,18 +779,9 @@ mod tests {
     #[test]
     fn reservation_handles_fragmented_response() {
         let mut flow = HopReservation::new();
-        let _ = flow.take_outbound();
+        reservation_request(&mut flow);
 
-        let response = frame_hop(HopMessage {
-            kind: HopMessageType::Status,
-            peer: None,
-            reservation: None,
-            limit: None,
-            status: Some(Status::Ok),
-        });
-
-        // Feed byte-by-byte.
-        for byte in &response {
+        for byte in &frame_hop(hop_status(Status::Ok)) {
             flow.on_data(&[*byte]).unwrap();
         }
 
@@ -934,33 +793,49 @@ mod tests {
     }
 
     #[test]
-    fn reservation_rejects_wrong_response_type() {
+    fn reservation_accepts_a_status_at_exactly_the_maximum_size() {
         let mut flow = HopReservation::new();
-        let _ = flow.take_outbound();
+        reservation_request(&mut flow);
 
-        let response = frame_hop(HopMessage {
-            kind: HopMessageType::Connect,
-            peer: None,
-            reservation: None,
-            limit: None,
-            status: None,
-        });
-        let err = flow.on_data(&response).unwrap_err();
-        assert!(matches!(err, RelayError::UnexpectedMessage(_)));
+        flow.on_data(&max_size_ok_status()).unwrap();
+        assert!(matches!(
+            flow.outcome(),
+            Some(ReservationOutcome::Accepted { .. })
+        ));
     }
 
     #[test]
-    fn receive_buffer_backstop_bounds_partial_frames() {
-        // The backstop allows one maximal legal frame (payload + 2-byte
-        // prefix) and rejects anything beyond it. It runs only on stalled
-        // (incomplete) buffers, where `decode_frame`'s own bounds make it
-        // unreachable from wire input -- a pure defense-in-depth check.
-        enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN])
-            .expect("the maximum legal partial frame must be accepted");
+    fn reservation_ignores_bytes_behind_the_status() {
+        let mut flow = HopReservation::new();
+        reservation_request(&mut flow);
+
+        let mut packet = frame_hop(hop_status(Status::Ok));
+        packet.extend_from_slice(&vec![0xab; MAX_MESSAGE_SIZE + 1]);
+        flow.on_data(&packet).unwrap();
+        flow.on_data(b"later").unwrap();
+
         assert!(matches!(
-            enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN + 1]),
-            Err(RelayError::MessageTooLarge { .. })
+            flow.poll_output(),
+            Some(HopReservationOutput::Outcome(
+                ReservationOutcome::Accepted { .. }
+            ))
         ));
+        assert!(flow.poll_output().is_none());
+    }
+
+    #[test]
+    fn reservation_rejects_wrong_response_type() {
+        let mut flow = HopReservation::new();
+        reservation_request(&mut flow);
+
+        let response = frame_hop(HopMessage {
+            kind: HopMessageType::Connect,
+            status: None,
+            ..hop_status(Status::Ok)
+        });
+        let err = flow.on_data(&response).unwrap_err();
+        assert!(matches!(err, RelayError::UnexpectedMessage(_)));
+        assert!(flow.is_done());
     }
 
     #[test]
@@ -968,12 +843,26 @@ mod tests {
         // A tiny header declaring an impossible payload length must fail
         // immediately instead of stalling while waiting for more bytes.
         let mut flow = HopReservation::new();
-        let _ = flow.take_outbound();
+        reservation_request(&mut flow);
 
-        let mut header = Vec::new();
-        minip2p_core::write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut header);
-        let err = flow.on_data(&header).unwrap_err();
-        assert!(matches!(err, RelayError::FrameTooLarge { .. }));
+        let err = flow.on_data(&over_declared_header()).unwrap_err();
+        assert_eq!(
+            err,
+            RelayError::FrameTooLarge {
+                len: MAX_MESSAGE_SIZE as u64 + 1
+            }
+        );
+        assert!(flow.is_done());
+    }
+
+    #[test]
+    fn reservation_reports_a_malformed_status_frame() {
+        let mut flow = HopReservation::new();
+        reservation_request(&mut flow);
+
+        // A well-framed payload with no `type` field.
+        let err = flow.on_data(&encode_frame(&[])).unwrap_err();
+        assert_eq!(err, RelayError::Malformed(RelayMessageError::MissingType));
         assert!(flow.is_done());
     }
 
@@ -982,53 +871,40 @@ mod tests {
     #[test]
     fn connect_sends_connect_and_bridges_on_ok() {
         let target = b"target-peer-id".to_vec();
-        let mut flow = HopConnect::new(target.clone());
+        let mut flow = HopConnect::new(target.clone()).unwrap();
 
-        // Outbound must be a CONNECT message with the target peer id.
-        let outbound = flow.take_outbound();
-        let FrameDecode::Complete { payload, .. } = decode_frame(&outbound) else {
-            panic!();
-        };
-        let req = HopMessage::decode(payload).unwrap();
+        let req = decode_hop(&connect_request(&mut flow));
         assert_eq!(req.kind, HopMessageType::Connect);
         assert_eq!(req.peer.as_ref().map(|p| &p.id), Some(&target));
 
-        // Relay accepts.
-        let response = frame_hop(HopMessage {
-            kind: HopMessageType::Status,
-            peer: None,
-            reservation: None,
-            limit: None,
-            status: Some(Status::Ok),
-        });
-        flow.on_data(&response).unwrap();
+        flow.on_data(&frame_hop(hop_status(Status::Ok))).unwrap();
 
-        assert!(matches!(
-            flow.outcome(),
-            Some(ConnectOutcome::Bridged { .. })
-        ));
+        assert_eq!(
+            flow.poll_output(),
+            Some(HopConnectOutput::Outcome(ConnectOutcome::Bridged {
+                limit: None
+            }))
+        );
+        assert!(flow.poll_output().is_none());
     }
 
     #[test]
-    fn connect_pipelined_bridge_bytes_are_captured() {
-        let mut flow = HopConnect::new(b"peer".to_vec());
-        let _ = flow.take_outbound();
+    fn connect_pipelined_bridge_bytes_follow_the_outcome() {
+        let mut flow = HopConnect::new(b"peer".to_vec()).unwrap();
+        connect_request(&mut flow);
 
-        let mut packet = frame_hop(HopMessage {
-            kind: HopMessageType::Status,
-            peer: None,
-            reservation: None,
-            limit: None,
-            status: Some(Status::Ok),
-        });
+        let mut packet = frame_hop(hop_status(Status::Ok));
         packet.extend_from_slice(b"bridged-payload");
         flow.on_data(&packet).unwrap();
 
         assert!(matches!(
-            flow.outcome(),
-            Some(ConnectOutcome::Bridged { .. })
+            flow.poll_output(),
+            Some(HopConnectOutput::Outcome(ConnectOutcome::Bridged { .. }))
         ));
-        assert_eq!(flow.take_bridge_bytes(), b"bridged-payload");
+        assert_eq!(
+            flow.poll_output(),
+            Some(HopConnectOutput::BridgeData(b"bridged-payload".to_vec()))
+        );
     }
 
     #[test]
@@ -1036,16 +912,10 @@ mod tests {
         // A coalesced read can carry the STATUS frame plus more bridged
         // bytes than one maximal frame; the receive path must not tear
         // the flow down over the buffer total.
-        let mut flow = HopConnect::new(b"peer".to_vec());
-        let _ = flow.take_outbound();
+        let mut flow = HopConnect::new(b"peer".to_vec()).unwrap();
+        connect_request(&mut flow);
 
-        let mut packet = frame_hop(HopMessage {
-            kind: HopMessageType::Status,
-            peer: None,
-            reservation: None,
-            limit: None,
-            status: Some(Status::Ok),
-        });
+        let mut packet = max_size_ok_status();
         let bridged = vec![0xabu8; MAX_MESSAGE_SIZE + 1];
         packet.extend_from_slice(&bridged);
         flow.on_data(&packet).unwrap();
@@ -1059,17 +929,10 @@ mod tests {
 
     #[test]
     fn connect_post_bridge_data_goes_to_bridge_buffer() {
-        let mut flow = HopConnect::new(b"peer".to_vec());
-        let _ = flow.take_outbound();
+        let mut flow = HopConnect::new(b"peer".to_vec()).unwrap();
+        connect_request(&mut flow);
 
-        let response = frame_hop(HopMessage {
-            kind: HopMessageType::Status,
-            peer: None,
-            reservation: None,
-            limit: None,
-            status: Some(Status::Ok),
-        });
-        flow.on_data(&response).unwrap();
+        flow.on_data(&frame_hop(hop_status(Status::Ok))).unwrap();
         assert!(flow.take_bridge_bytes().is_empty());
 
         flow.on_data(b"more-data-from-peer").unwrap();
@@ -1077,40 +940,64 @@ mod tests {
     }
 
     #[test]
-    fn connect_handles_refusal() {
-        let mut flow = HopConnect::new(b"peer".to_vec());
-        let _ = flow.take_outbound();
+    fn connect_handles_fragmented_response() {
+        let mut flow = HopConnect::new(b"peer".to_vec()).unwrap();
+        connect_request(&mut flow);
 
-        let response = frame_hop(HopMessage {
-            kind: HopMessageType::Status,
-            peer: None,
-            reservation: None,
-            limit: None,
-            status: Some(Status::NoReservation),
-        });
-        flow.on_data(&response).unwrap();
-
+        for byte in &frame_hop(hop_status(Status::Ok)) {
+            flow.on_data(&[*byte]).unwrap();
+        }
         assert!(matches!(
             flow.outcome(),
-            Some(ConnectOutcome::Refused {
-                status: Status::NoReservation,
-                ..
-            })
+            Some(ConnectOutcome::Bridged { .. })
         ));
     }
 
     #[test]
-    fn connect_rejects_oversized_target_peer_id() {
-        let mut flow = HopConnect::new(vec![0u8; MAX_MESSAGE_SIZE + 1]);
+    fn connect_handles_refusal_and_drops_later_bytes() {
+        let mut flow = HopConnect::new(b"peer".to_vec()).unwrap();
+        connect_request(&mut flow);
 
-        // The oversized frame must never be emitted...
-        assert!(!flow.is_idle());
+        let mut packet = frame_hop(hop_status(Status::NoReservation));
+        packet.extend_from_slice(b"not-a-circuit");
+        flow.on_data(&packet).unwrap();
+
+        assert!(matches!(
+            flow.poll_output(),
+            Some(HopConnectOutput::Outcome(ConnectOutcome::Refused {
+                status: Status::NoReservation,
+                ..
+            }))
+        ));
         assert!(flow.poll_output().is_none());
-        // ...and the error surfaces on the first input.
-        let err = flow.handle_input(HopConnectInput::Flush).unwrap_err();
-        assert!(matches!(err, RelayError::MessageTooLarge { .. }));
+    }
+
+    #[test]
+    fn connect_rejects_oversized_declared_frame_length() {
+        let mut flow = HopConnect::new(b"peer".to_vec()).unwrap();
+        connect_request(&mut flow);
+
+        let err = flow.on_data(&over_declared_header()).unwrap_err();
+        assert_eq!(
+            err,
+            RelayError::FrameTooLarge {
+                len: MAX_MESSAGE_SIZE as u64 + 1
+            }
+        );
         assert!(flow.is_done());
-        assert!(flow.is_idle());
+        // A failed flow never turns later bytes into bridge data.
+        flow.on_data(b"after-failure").unwrap();
+        assert!(flow.poll_output().is_none());
+    }
+
+    #[test]
+    fn connect_constructor_refuses_an_oversized_target_peer_id() {
+        // The oversized frame is never built: the caller learns at
+        // construction, with no input needed to surface the error.
+        assert!(matches!(
+            HopConnect::new(vec![0u8; MAX_MESSAGE_SIZE + 1]),
+            Err(RelayError::MessageTooLarge { len }) if len > MAX_MESSAGE_SIZE
+        ));
     }
 
     #[test]
@@ -1120,54 +1007,18 @@ mod tests {
         // varint for the nested Peer + (1 tag + 2-byte length varint +
         // 8184 id bytes).
         let id = vec![0u8; 8184];
-        let request = HopMessage {
-            kind: HopMessageType::Connect,
-            peer: Some(Peer {
-                id: id.clone(),
-                addrs: Vec::new(),
-            }),
-            reservation: None,
-            limit: None,
-            status: None,
-        };
-        assert_eq!(request.encode().len(), MAX_MESSAGE_SIZE);
-
-        let mut flow = HopConnect::new(id.clone());
-        flow.handle_input(HopConnectInput::Flush).unwrap();
-        let Some(HopConnectOutput::Outbound(bytes)) = flow.poll_output() else {
+        let mut flow = HopConnect::new(id.clone()).unwrap();
+        let bytes = connect_request(&mut flow);
+        let FrameDecode::Complete { payload, .. } = decode_frame(&bytes) else {
             panic!("exactly-max CONNECT must be emitted");
         };
-        assert!(matches!(decode_frame(&bytes), FrameDecode::Complete { .. }));
-
-        // An exactly-max frame (payload + 2-byte prefix) must also survive
-        // a state machine's receive path, not just decode_frame -- even
-        // with pipelined bridge bytes coalesced behind it in one input.
-        // A STOP CONNECT carrying the same peer id is exactly max-size too.
-        let stop_connect = StopMessage {
-            kind: StopMessageType::Connect,
-            peer: Some(Peer {
-                id,
-                addrs: Vec::new(),
-            }),
-            limit: None,
-            status: None,
-        };
-        assert_eq!(stop_connect.encode().len(), MAX_MESSAGE_SIZE);
-        let mut coalesced = encode_frame(&stop_connect.encode());
-        coalesced.extend_from_slice(b"early-bridge-bytes");
-        let mut responder = StopResponder::new();
-        responder
-            .handle_input(StopResponderInput::Data(coalesced))
-            .expect("exactly-max STOP CONNECT + pipelined bytes must be accepted");
-        assert!(matches!(
-            responder.poll_output(),
-            Some(StopResponderOutput::Request(_))
-        ));
+        assert_eq!(payload.len(), MAX_MESSAGE_SIZE);
 
         // One more byte and the frame must be refused.
-        let mut flow = HopConnect::new(vec![0u8; 8185]);
-        let err = flow.handle_input(HopConnectInput::Flush).unwrap_err();
-        assert!(matches!(err, RelayError::MessageTooLarge { len } if len == MAX_MESSAGE_SIZE + 1));
+        assert!(matches!(
+            HopConnect::new(vec![0u8; 8185]).err(),
+            Some(RelayError::MessageTooLarge { len }) if len == MAX_MESSAGE_SIZE + 1
+        ));
     }
 
     // --- StopResponder ------------------------------------------------------
@@ -1178,27 +1029,25 @@ mod tests {
 
         // Incoming CONNECT from relay.
         let connect = frame_stop(StopMessage {
-            kind: StopMessageType::Connect,
-            peer: Some(Peer {
-                id: b"source-peer".to_vec(),
-                addrs: vec![],
-            }),
             limit: Some(Limit {
                 duration: Some(300),
                 data: None,
             }),
-            status: None,
+            ..stop_connect(b"source-peer")
         });
-        flow.on_data(connect).unwrap();
+        flow.on_data(&connect).unwrap();
 
-        // We should now have a pending request.
-        let request = flow.request().expect("request should be populated");
+        let Some(StopResponderOutput::Request(request)) = flow.poll_output() else {
+            panic!("request should be emitted");
+        };
         assert_eq!(request.source_peer_id, b"source-peer");
         assert_eq!(request.limit.as_ref().and_then(|l| l.duration), Some(300));
 
         // Accept and verify outbound is STATUS:OK.
         flow.accept().unwrap();
-        let outbound = flow.take_outbound();
+        let Some(StopResponderOutput::Outbound(outbound)) = flow.poll_output() else {
+            panic!("STATUS should be queued");
+        };
         let FrameDecode::Complete { payload, .. } = decode_frame(&outbound) else {
             panic!();
         };
@@ -1207,47 +1056,82 @@ mod tests {
         assert_eq!(response.status, Some(Status::Ok));
 
         // Subsequent data is bridged.
-        flow.on_data(b"relayed-peer-traffic".to_vec()).unwrap();
-        assert_eq!(flow.take_bridge_bytes(), b"relayed-peer-traffic");
+        flow.on_data(b"relayed-peer-traffic").unwrap();
+        assert_eq!(
+            flow.poll_output(),
+            Some(StopResponderOutput::BridgeData(
+                b"relayed-peer-traffic".to_vec()
+            ))
+        );
     }
 
     #[test]
-    fn stop_pipelined_bridge_bytes_captured_on_accept() {
+    fn stop_pipelined_bridge_bytes_follow_the_status_on_accept() {
         let mut flow = StopResponder::new();
 
-        let mut packet = frame_stop(StopMessage {
-            kind: StopMessageType::Connect,
-            peer: Some(Peer {
-                id: b"src".to_vec(),
-                addrs: vec![],
-            }),
-            limit: None,
-            status: None,
-        });
+        let mut packet = frame_stop(stop_connect(b"src"));
         packet.extend_from_slice(b"pipelined-bytes");
-        flow.on_data(packet).unwrap();
+        flow.on_data(&packet).unwrap();
+        assert!(matches!(
+            flow.poll_output(),
+            Some(StopResponderOutput::Request(_))
+        ));
         flow.accept().unwrap();
 
-        assert_eq!(flow.take_bridge_bytes(), b"pipelined-bytes");
+        assert!(matches!(
+            flow.poll_output(),
+            Some(StopResponderOutput::Outbound(_))
+        ));
+        assert_eq!(
+            flow.poll_output(),
+            Some(StopResponderOutput::BridgeData(b"pipelined-bytes".to_vec()))
+        );
+    }
+
+    #[test]
+    fn stop_accepts_an_exactly_max_connect_with_pipelined_bytes() {
+        // A STOP CONNECT whose payload is exactly MAX_MESSAGE_SIZE, with
+        // bridge bytes coalesced behind it in one read.
+        let connect = stop_connect(&[0u8; 8184]);
+        assert_eq!(connect.encode().len(), MAX_MESSAGE_SIZE);
+        let mut coalesced = frame_stop(connect);
+        coalesced.extend_from_slice(b"early-bridge-bytes");
+
+        let mut flow = StopResponder::new();
+        flow.on_data(&coalesced)
+            .expect("exactly-max STOP CONNECT + pipelined bytes must be accepted");
+        assert!(matches!(
+            flow.poll_output(),
+            Some(StopResponderOutput::Request(_))
+        ));
+    }
+
+    #[test]
+    fn stop_rejects_oversized_declared_frame_length() {
+        let mut flow = StopResponder::new();
+        let err = flow.on_data(&over_declared_header()).unwrap_err();
+        assert_eq!(
+            err,
+            RelayError::FrameTooLarge {
+                len: MAX_MESSAGE_SIZE as u64 + 1
+            }
+        );
+        assert!(flow.is_done());
     }
 
     #[test]
     fn stop_reject_emits_non_ok_status() {
         let mut flow = StopResponder::new();
-
-        let connect = frame_stop(StopMessage {
-            kind: StopMessageType::Connect,
-            peer: Some(Peer {
-                id: b"src".to_vec(),
-                addrs: vec![],
-            }),
-            limit: None,
-            status: None,
-        });
-        flow.on_data(connect).unwrap();
+        flow.on_data(&frame_stop(stop_connect(b"src"))).unwrap();
         flow.reject(Status::ConnectionFailed).unwrap();
 
-        let outbound = flow.take_outbound();
+        assert!(matches!(
+            flow.poll_output(),
+            Some(StopResponderOutput::Request(_))
+        ));
+        let Some(StopResponderOutput::Outbound(outbound)) = flow.poll_output() else {
+            panic!("STATUS should be queued");
+        };
         let FrameDecode::Complete { payload, .. } = decode_frame(&outbound) else {
             panic!();
         };
@@ -1267,12 +1151,10 @@ mod tests {
     fn stop_connect_without_peer_fails() {
         let mut flow = StopResponder::new();
         let connect = frame_stop(StopMessage {
-            kind: StopMessageType::Connect,
             peer: None,
-            limit: None,
-            status: None,
+            ..stop_connect(b"")
         });
-        let err = flow.on_data(connect).unwrap_err();
+        let err = flow.on_data(&connect).unwrap_err();
         assert!(matches!(err, RelayError::UnexpectedMessage(_)));
     }
 
@@ -1285,85 +1167,16 @@ mod tests {
             limit: None,
             status: Some(Status::Ok),
         });
-        let err = flow.on_data(msg).unwrap_err();
+        let err = flow.on_data(&msg).unwrap_err();
         assert!(matches!(err, RelayError::UnexpectedMessage(_)));
     }
 
     #[test]
     fn stop_handles_fragmented_connect() {
         let mut flow = StopResponder::new();
-
-        let connect = frame_stop(StopMessage {
-            kind: StopMessageType::Connect,
-            peer: Some(Peer {
-                id: b"src".to_vec(),
-                addrs: vec![],
-            }),
-            limit: None,
-            status: None,
-        });
-
-        for byte in &connect {
-            flow.on_data(vec![*byte]).unwrap();
+        for byte in &frame_stop(stop_connect(b"src")) {
+            flow.on_data(&[*byte]).unwrap();
         }
-
         assert!(flow.request().is_some());
-    }
-
-    #[test]
-    fn relay_flows_implement_sans_io_protocol() {
-        let mut reservation = HopReservation::new();
-        reservation
-            .handle_input(HopReservationInput::Flush)
-            .unwrap();
-        assert!(matches!(
-            reservation.poll_output(),
-            Some(HopReservationOutput::Outbound(_))
-        ));
-
-        let response = frame_hop(HopMessage {
-            kind: HopMessageType::Status,
-            peer: None,
-            reservation: None,
-            limit: None,
-            status: Some(Status::Ok),
-        });
-        reservation
-            .handle_input(HopReservationInput::Data(response))
-            .unwrap();
-        assert!(matches!(
-            reservation.poll_output(),
-            Some(HopReservationOutput::Outcome(
-                ReservationOutcome::Accepted { .. }
-            ))
-        ));
-
-        let mut stop = StopResponder::new();
-        let mut connect = frame_stop(StopMessage {
-            kind: StopMessageType::Connect,
-            peer: Some(Peer {
-                id: b"src".to_vec(),
-                addrs: vec![],
-            }),
-            limit: None,
-            status: None,
-        });
-        connect.extend_from_slice(b"bridge");
-        stop.handle_input(StopResponderInput::Data(connect))
-            .unwrap();
-        assert!(matches!(
-            stop.poll_output(),
-            Some(StopResponderOutput::Request(_))
-        ));
-
-        stop.handle_input(StopResponderInput::Accept).unwrap();
-        assert!(matches!(
-            stop.poll_output(),
-            Some(StopResponderOutput::Outbound(_))
-        ));
-        assert_eq!(
-            stop.poll_output(),
-            Some(StopResponderOutput::BridgeData(b"bridge".to_vec()))
-        );
     }
 }

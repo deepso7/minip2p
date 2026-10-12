@@ -102,6 +102,16 @@ pub struct SwarmCore<T: Transport, E: EntropySource> {
     /// sockets, so this — not that — is the set that accepts inbound.
     listened_addrs: Vec<Multiaddr>,
 
+    /// What the advertised address snapshot was last built from: the
+    /// transport's address revision, the external-address revision, and the
+    /// listened-address revision. `None` until the first build, and kept
+    /// `None` while the transport cannot report a revision, so the snapshot
+    /// is rebuilt only when one of its inputs moved.
+    local_addresses_key: Option<(u64, u64, u64)>,
+    /// How many times [`drive`](Self::drive) rebuilt the address snapshot.
+    #[cfg(test)]
+    pub(crate) address_rebuilds: usize,
+
     /// Randomness for ping nonces. Injected so the swarm stays deterministic
     /// and testable, and so `no_std` hosts can supply their own source.
     entropy: E,
@@ -128,6 +138,9 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             external_addresses_revision: 0,
             listened_addrs_revision: 0,
             listened_addrs: Vec::new(),
+            local_addresses_key: None,
+            #[cfg(test)]
+            address_rebuilds: 0,
             entropy,
         }
     }
@@ -142,8 +155,12 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     ///
     /// Replaces the previous external set; pass an empty vector to stop
     /// advertising extras. Duplicates of transport-bound addresses are
-    /// dropped.
+    /// dropped. Setting the set it already holds changes nothing, not even
+    /// [`external_addresses_revision`](Self::external_addresses_revision).
     pub fn set_external_addresses(&mut self, addrs: Vec<Multiaddr>) {
+        if self.external_addresses == addrs {
+            return;
+        }
         self.external_addresses = addrs;
         self.external_addresses_revision = self.external_addresses_revision.wrapping_add(1);
     }
@@ -154,10 +171,9 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         &self.external_addresses
     }
 
-    /// Returns the wrapping revision of the external-address replacement.
+    /// Returns the wrapping revision of the external-address set.
     ///
-    /// The revision advances even when a replacement contains the same values,
-    /// allowing composed hosts to distinguish address ownership changes.
+    /// It advances only when a replacement actually changed the set.
     pub fn external_addresses_revision(&self) -> u64 {
         self.external_addresses_revision
     }
@@ -462,6 +478,12 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     // Commands
     // -----------------------------------------------------------------------
 
+    /// The swarm's entropy source, for composed drivers that need random
+    /// bytes of their own without holding a second source.
+    pub fn entropy_mut(&mut self) -> &mut E {
+        &mut self.entropy
+    }
+
     /// Pings a peer, sending a random 32-byte payload and measuring RTT.
     ///
     /// If a ping stream isn't yet negotiated the payload is queued and
@@ -705,14 +727,8 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
 
         // Refresh the snapshot of our listening addresses so Identify
         // advertises the current bound set plus any validated external
-        // addresses. Cheap -- a handful of multiaddrs at most.
-        let mut local_addresses = self.transport.local_addresses();
-        for addr in &self.external_addresses {
-            if !local_addresses.contains(addr) {
-                local_addresses.push(addr.clone());
-            }
-        }
-        self.state.set_local_addresses(local_addresses);
+        // addresses -- but only when one of those moved.
+        self.refresh_local_addresses();
 
         // Each transport event's work runs to completion before the next
         // event is ingested: a later event must not observe state that
@@ -726,6 +742,34 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         self.state.handle_tick(now_ms);
         self.flush(now_ms);
         Ok(())
+    }
+
+    /// Rebuilds the advertised address snapshot when the transport's
+    /// addresses, the external set, or the listened set moved since the last
+    /// build. A transport without an address revision is re-read every time.
+    fn refresh_local_addresses(&mut self) {
+        let key = self.transport.local_addresses_revision().map(|transport| {
+            (
+                transport,
+                self.external_addresses_revision,
+                self.listened_addrs_revision,
+            )
+        });
+        if key.is_some() && key == self.local_addresses_key {
+            return;
+        }
+        self.local_addresses_key = key;
+        #[cfg(test)]
+        {
+            self.address_rebuilds += 1;
+        }
+        let mut local_addresses = self.transport.local_addresses();
+        for addr in &self.external_addresses {
+            if !local_addresses.contains(addr) {
+                local_addresses.push(addr.clone());
+            }
+        }
+        self.state.set_local_addresses(local_addresses);
     }
 
     /// Takes the next queued event, delivering it to the caller.
@@ -910,10 +954,9 @@ mod tests {
     use alloc::string::ToString;
     use alloc::vec;
 
-    use minip2p_core::SansIoProtocol;
     use minip2p_identify::IDENTIFY_PROTOCOL_ID;
     use minip2p_identity::Ed25519Keypair;
-    use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
+    use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
     use minip2p_ping::PING_PROTOCOL_ID;
     use minip2p_platform::EntropyError;
     use minip2p_transport::{ConnectionEndpoint, TransportEvent};
@@ -1010,11 +1053,7 @@ mod tests {
                     IDENTIFY_PROTOCOL_ID.to_string(),
                     PING_PROTOCOL_ID.to_string(),
                 ]);
-                listener
-                    .handle_input(MultistreamInput::Start)
-                    .map_err(|error| TransportError::PollError {
-                        reason: alloc::format!("listener start failed: {error}"),
-                    })?;
+                listener.start();
                 self.negotiators.insert(stream_id, listener);
             }
             Ok(stream_id)
@@ -1033,11 +1072,7 @@ mod tests {
                 return Ok(());
             };
 
-            negotiator
-                .handle_input(MultistreamInput::Data(data.to_vec()))
-                .map_err(|error| TransportError::PollError {
-                    reason: alloc::format!("listener negotiation input failed: {error}"),
-                })?;
+            negotiator.on_data(&data);
             let mut negotiated = false;
             let mut outbound = Vec::new();
             while let Some(output) = negotiator.poll_output() {

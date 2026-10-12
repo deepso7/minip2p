@@ -90,6 +90,13 @@ impl Deadline {
         Deadline { at }
     }
 
+    /// Time left until the deadline; `None` for [`Deadline::NEVER`], and
+    /// zero once it has passed. Lets a host that blocks on its own budget
+    /// (the Endpoint's wait) fold the caller's deadline in.
+    pub fn remaining(self) -> Option<Duration> {
+        self.remaining_at(Instant::now())
+    }
+
     /// Whether the deadline has passed at `now`.
     fn is_expired_at(self, now: Instant) -> bool {
         self.at.is_some_and(|deadline| now >= deadline)
@@ -616,11 +623,10 @@ mod tests {
 
     use super::*;
     use crate::events::SwarmErrorKind;
-    use minip2p_core::SansIoProtocol;
     use minip2p_core::{Multiaddr, PeerAddr};
     use minip2p_identify::IDENTIFY_PROTOCOL_ID;
     use minip2p_identity::Ed25519Keypair;
-    use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
+    use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
     use minip2p_ping::PING_PROTOCOL_ID;
     use minip2p_transport::mio::{self, Registry, Waker, event::Event};
     use minip2p_transport::{
@@ -666,6 +672,8 @@ mod tests {
         next_stream_id: u64,
         /// Streams the driver opened while dispatching actions.
         opened_streams: usize,
+        /// Reported verbatim from `local_addresses_revision`.
+        address_revision: Option<u64>,
     }
 
     impl Transport for IdleTransport {
@@ -729,6 +737,10 @@ mod tests {
                 events.extend(inbox.try_iter());
             }
             Ok(events)
+        }
+
+        fn local_addresses_revision(&self) -> Option<u64> {
+            self.address_revision
         }
 
         fn next_deadline(&self) -> Option<minip2p_platform::Deadline> {
@@ -1085,7 +1097,11 @@ mod tests {
         swarm
             .core_mut()
             .set_external_addresses(vec![external.clone(), circuit.clone()]);
-        assert_eq!(swarm.core().external_addresses_revision(), 2);
+        assert_eq!(
+            swarm.core().external_addresses_revision(),
+            1,
+            "an identical replacement is not a change"
+        );
         swarm.poll().unwrap();
         // IdleTransport binds nothing, so the snapshot is exactly the
         // external set.
@@ -1095,6 +1111,48 @@ mod tests {
         swarm.core_mut().set_external_addresses(Vec::new());
         swarm.poll().unwrap();
         assert!(swarm.core().local_addresses().is_empty());
+    }
+
+    /// The advertised snapshot is rebuilt only when one of its inputs moved:
+    /// a busy poll with unchanged addresses costs no rebuild, and a
+    /// transport that cannot report a revision is re-read every time.
+    #[test]
+    fn the_address_snapshot_is_rebuilt_only_when_an_input_moves() {
+        let mut swarm = idle_swarm();
+        swarm.core_mut().transport_mut().address_revision = Some(0);
+        swarm.poll().unwrap();
+        assert_eq!(swarm.core().address_rebuilds, 1, "the first poll builds it");
+        for _ in 0..3 {
+            swarm.poll().unwrap();
+        }
+        assert_eq!(swarm.core().address_rebuilds, 1, "nothing moved");
+
+        let external: Multiaddr = "/ip4/203.0.113.9/tcp/4001".parse().unwrap();
+        swarm
+            .core_mut()
+            .set_external_addresses(vec![external.clone()]);
+        swarm.poll().unwrap();
+        assert_eq!(swarm.core().address_rebuilds, 2, "the external set moved");
+        assert_eq!(
+            swarm.core().local_addresses(),
+            std::slice::from_ref(&external)
+        );
+        swarm.core_mut().set_external_addresses(vec![external]);
+        swarm.poll().unwrap();
+        assert_eq!(
+            swarm.core().address_rebuilds,
+            2,
+            "an identical set is no move"
+        );
+
+        swarm.core_mut().transport_mut().address_revision = Some(1);
+        swarm.poll().unwrap();
+        assert_eq!(swarm.core().address_rebuilds, 3, "the transport moved");
+
+        swarm.core_mut().transport_mut().address_revision = None;
+        swarm.poll().unwrap();
+        swarm.poll().unwrap();
+        assert_eq!(swarm.core().address_rebuilds, 5, "no revision, no cache");
     }
 
     /// Reports two bound addresses and refuses the second listen, so a
@@ -1857,11 +1915,7 @@ mod tests {
                 PING_PROTOCOL_ID.to_string(),
                 self.user_protocol.clone(),
             ]);
-            listener
-                .handle_input(MultistreamInput::Start)
-                .map_err(|error| TransportError::PollError {
-                    reason: format!("listener start failed: {error}"),
-                })?;
+            listener.start();
             self.negotiators.insert(stream_id, listener);
             Ok(stream_id)
         }
@@ -1881,11 +1935,7 @@ mod tests {
                 // Other negotiated streams (identify, ping): swallow.
                 return Ok(());
             };
-            negotiator
-                .handle_input(MultistreamInput::Data(data.to_vec()))
-                .map_err(|error| TransportError::PollError {
-                    reason: format!("listener negotiation input failed: {error}"),
-                })?;
+            negotiator.on_data(&data);
             let mut negotiated_protocol = None;
             let mut outbound = Vec::new();
             while let Some(output) = negotiator.poll_output() {
@@ -2250,11 +2300,7 @@ mod tests {
                 IDENTIFY_PROTOCOL_ID.to_string(),
                 PING_PROTOCOL_ID.to_string(),
             ]);
-            listener
-                .handle_input(MultistreamInput::Start)
-                .map_err(|error| TransportError::PollError {
-                    reason: format!("listener start failed: {error}"),
-                })?;
+            listener.start();
             self.negotiators.insert(stream_id, listener);
             Ok(stream_id)
         }
@@ -2270,11 +2316,7 @@ mod tests {
                 // pings never receive a response.
                 return Ok(());
             };
-            negotiator
-                .handle_input(MultistreamInput::Data(data.to_vec()))
-                .map_err(|error| TransportError::PollError {
-                    reason: format!("listener negotiation input failed: {error}"),
-                })?;
+            negotiator.on_data(&data);
             let mut negotiated = false;
             let mut outbound = Vec::new();
             while let Some(output) = negotiator.poll_output() {

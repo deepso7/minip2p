@@ -1,10 +1,12 @@
 //! Application-facing `Endpoint` API for minip2p.
 //!
-//! This crate is the ergonomic std entrypoint. It composes the lower-level
-//! crates without hiding them: protocol crates and `SwarmCore` remain the
-//! Sans-I/O / `no_std + alloc` surface, while [`Endpoint`] gives applications a
-//! small batteries-included API for identity, transports, listen/dial, ping,
-//! and event polling.
+//! This is the ergonomic std entrypoint. It composes the lower-level crates
+//! without hiding them: protocol crates and `SwarmCore` remain the Sans-I/O /
+//! `no_std + alloc` surface, while [`Endpoint`] gives applications a small
+//! batteries-included API for identity, transports, listen/dial, ping, and
+//! event polling. It runs the same private engine as the portable endpoint
+//! and adds what only an operating system has: a clock, socket binding, Name
+//! resolution, and a blocking [`Endpoint::wait`].
 //!
 //! # Transports
 //!
@@ -34,57 +36,43 @@
 //! install the trusted client roles, and combined endpoints compose both.
 
 mod dial;
-#[cfg(feature = "mdns")]
-mod mdns;
 #[cfg(all(test, feature = "nat", feature = "quic"))]
 mod nat_tests;
-#[cfg(feature = "nat")]
-type NatDriver = crate::nat::NatDriver<minip2p_platform::StdEntropy>;
 #[cfg(feature = "relay-server")]
-mod relay_server;
+pub(crate) mod relay_server;
 
+use std::time::Duration;
+
+#[cfg(feature = "discovery")]
+use crate::BeaconConfig;
+#[cfg(feature = "pubsub")]
+use crate::GossipsubConfig;
 #[cfg(feature = "pubsub")]
 use crate::GossipsubError;
 #[cfg(any(feature = "discovery", feature = "mdns"))]
-use crate::discovery::{DiscoveryDriver, resolve_book_candidates};
+use crate::discovery::DiscoveryDriver;
+use crate::engine::Engine;
+#[cfg(feature = "nat")]
+use crate::nat::{CircuitOps, NatDriver};
 #[cfg(feature = "nat")]
 use crate::portable::connect::Expansion;
-#[cfg(feature = "nat")]
-use crate::portable::connect::cancel_attempt;
-use crate::portable::connect::{ConnectAdmission, admit_connect};
 #[cfg(feature = "pubsub")]
 use crate::pubsub::GossipsubDriver;
+#[cfg(any(feature = "discovery", feature = "mdns"))]
+use crate::{DiscoveryConfigError, KnownPeer, PeerDiscoveryConfig};
+#[cfg(feature = "mdns")]
+use crate::{MdnsConfig, MdnsConfigError};
+#[cfg(feature = "nat")]
+use crate::{NatConfig, Path, ReachabilityState, ReservationInfo};
 use minip2p_core::Multiaddr;
 #[cfg(any(feature = "quic", feature = "tcp", feature = "relay-server"))]
 use minip2p_core::Protocol;
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_core::TransportKind;
 use minip2p_core::{PeerAddr, PeerId};
-#[cfg(feature = "discovery")]
-pub use minip2p_discovery::{BeaconConfig, DISCOVERY_TOPIC};
-#[cfg(any(feature = "discovery", feature = "mdns"))]
-pub use minip2p_discovery::{DiscoveryConfigError, KnownPeer, PeerDiscoveryConfig};
-// `portable-mdns` already re-exports these from the portable module.
-#[cfg(all(
-    any(feature = "discovery", feature = "mdns"),
-    not(feature = "portable-mdns")
-))]
-pub use minip2p_discovery::{DiscoveryEvent, DiscoverySource};
 pub use minip2p_identify::IdentifyMessage;
 pub use minip2p_identity::Ed25519Keypair;
-#[cfg(feature = "mdns")]
-pub use minip2p_mdns::{MdnsConfig, MdnsConfigError};
-#[cfg(feature = "nat")]
-pub use minip2p_nat::{
-    NatConfig, NatError, NatEvent, Path, ReachabilityState, ReservationInfo, ReservationPolicy,
-};
-#[cfg(feature = "tcp")]
-use minip2p_platform::StdEntropy;
-#[cfg(feature = "pubsub")]
-pub use minip2p_pubsub::{
-    GOSSIPSUB_PROTOCOL_IDS, GossipsubConfig, GossipsubConfigError, GossipsubEvent, PublishError,
-    TopicError,
-};
+use minip2p_platform::{Clock, Now, StdClock, StdEntropy};
 #[cfg(feature = "quic")]
 pub use minip2p_quic::QuicLimits;
 #[cfg(feature = "quic")]
@@ -97,21 +85,24 @@ pub use minip2p_relay_server::{
     RelayServerRuntimeErrorKind, ReservationCloseReason, Status,
 };
 use minip2p_swarm::SwarmBuilder;
-pub use minip2p_swarm::WaitHandle;
 pub use minip2p_swarm::{
-    Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, Swarm, SwarmError, SwarmEvent,
+    Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, Swarm, SwarmError,
 };
 #[cfg(feature = "tcp")]
 use minip2p_tcp::{StdTcpProvider, TcpConfig, TcpTransport};
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_transport::ConnectionNamespace;
-use minip2p_transport::Transport;
-pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet};
+pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet, WaitHandle};
+use minip2p_transport::{SharedPoll, Transport};
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use std::str::FromStr;
 
-use crate::portable::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS, StreamAcks};
+use crate::portable::{DEFAULT_CONNECT_DEADLINE_MS, StreamAcks};
 use crate::{Bytes, ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
+
+/// Cap on one readiness wait when the caller has no deadline; re-arming it
+/// occasionally keeps unbounded durations out of OS interfaces.
+const MAX_IDLE_WAIT: Duration = Duration::from_secs(60);
 
 /// Why one blocking [`Endpoint::wait`] returned.
 ///
@@ -236,20 +227,24 @@ pub(crate) type EndpointTransport =
 #[cfg(not(feature = "nat"))]
 pub(crate) type EndpointTransport = TransportSet;
 
-/// Concrete swarm type owned by [`Endpoint`].
-pub(crate) type EndpointSwarm = Swarm<EndpointTransport>;
+/// The std endpoint's mDNS carrier: OS multicast sockets, which are `Send`.
+#[cfg(feature = "_mdns-driver")]
+type StdCarrier = minip2p_mdns::MdnsSockets;
+#[cfg(not(feature = "_mdns-driver"))]
+type StdCarrier = ();
+
+/// The engine the std [`Endpoint`] drives.
+type StdEngine = Engine<EndpointTransport, StdEntropy, StdCarrier>;
 
 /// App-facing minip2p endpoint over the transports it was asked to bind.
 ///
-/// `Endpoint` owns identity, transports, and the std swarm driver. It has one
-/// Connection-attempt entry point, [`connect`](Self::connect), and one ordered
-/// Endpoint event stream, read with [`wait`](Self::wait) (blocking) or
-/// [`poll`](Self::poll) (non-blocking). Every enabled capability (NAT,
-/// Gossipsub, Discovery, relay-server) delivers its output once, as an
-/// [`EndpointEvent`] variant on that stream. `poll` and `wait` finish each
-/// swarm event before the next one: that swarm event, then capability events
-/// in relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt
-/// terminals.
+/// `Endpoint` owns identity, transports, a clock, and the same engine as
+/// [`crate::PortableEndpoint`]. It has one Connection-attempt entry point,
+/// [`connect`](Self::connect), and one ordered Endpoint event stream, read
+/// with [`wait`](Self::wait) (blocking) or [`poll`](Self::poll)
+/// (non-blocking). Every enabled capability (NAT, Gossipsub, Discovery,
+/// relay-server) delivers its output once, as an [`EndpointEvent`] variant
+/// on that stream, in the per-batch order documented there.
 ///
 /// Applications correlate events by the IDs they carry (a [`ConnectId`], a
 /// [`ConnectionId`], a [`StreamId`]) and dispatch unrelated events while they
@@ -283,33 +278,27 @@ pub(crate) type EndpointSwarm = Swarm<EndpointTransport>;
 /// is not left on the QUIC idle timeout. Neither path helps after `kill -9`
 /// or a hard partition.
 pub struct Endpoint {
-    swarm: EndpointSwarm,
-    connect: ConnectEngine,
-    #[cfg(feature = "relay-server")]
-    relay_server: Option<relay_server::RelayServerDriver>,
-    #[cfg(feature = "nat")]
-    nat: Option<NatDriver>,
-    #[cfg(feature = "pubsub")]
-    gossipsub: Option<GossipsubDriver>,
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
-    discovery: Option<DiscoveryDriver>,
-    #[cfg(feature = "mdns")]
-    mdns: Option<mdns::MdnsDriver>,
-    /// The Endpoint event stream's queue: events produced by a step beyond
-    /// the one returned.
-    pending_events: std::collections::VecDeque<EndpointEvent>,
-    /// Acknowledges user-stream data as the application pulls it.
-    acks: StreamAcks,
+    pub(crate) engine: StdEngine,
+    clock: StdClock,
     /// Name resolution for `/dns*` candidates, off the driver thread.
     resolver: dial::Resolver,
     /// NAT relay and AutoNAT dials waiting on Name resolution.
     #[cfg(feature = "nat")]
     nat_dials: Vec<(minip2p_nat::NatToken, PeerAddr)>,
-    /// Addresses set by [`Endpoint::set_external_addresses`]; the NAT and
-    /// relay-server contributions are merged onto them before Identify.
-    #[cfg(any(feature = "nat", feature = "relay-server"))]
-    caller_external_addresses: Vec<Multiaddr>,
+    /// The one readiness poll the transport and mDNS sockets are registered
+    /// with (ADR 0013). Its `Waker` carries caller interrupts and the
+    /// endpoint's own wakeups (a finished name lookup) apart.
+    poll: SharedPoll,
+    /// Swarm events a test's raw poll read but has not handed out yet.
+    #[cfg(all(test, feature = "quic"))]
+    raw_events: std::collections::VecDeque<crate::SwarmEvent>,
 }
+
+// The ffi-core detached driver moves the endpoint onto its own thread.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Endpoint>();
+};
 
 impl Endpoint {
     /// Starts portable endpoint configuration with explicit identity and entropy.
@@ -326,13 +315,13 @@ impl Endpoint {
     /// Returns a cloneable handle that can interrupt a blocking endpoint wait
     /// from another thread.
     ///
-    /// The swarm's interrupt handle, on the one readiness poll every
-    /// transport and mDNS socket is registered with. Its interrupts surface as
+    /// The interrupt handle of the one readiness poll every transport and
+    /// mDNS socket is registered with. Its interrupts surface as
     /// [`EndpointWaitOutcome::Interrupted`]; interrupts sent before one is
-    /// reported coalesce into one. The endpoint's own wakeups (a finished name
-    /// lookup, mDNS input) use the swarm's wake-only handle and never do.
+    /// reported coalesce into one. The endpoint's own wakeups (a finished
+    /// name lookup, mDNS input) use the poll's wake-only handle and never do.
     pub fn wait_handle(&self) -> WaitHandle {
-        self.swarm.wait_handle()
+        self.poll.wait_handle()
     }
 
     /// Starts building an endpoint.
@@ -340,9 +329,14 @@ impl Endpoint {
         EndpointBuilder::default()
     }
 
+    /// Samples the endpoint's clock; every engine call takes one sample.
+    fn now(&mut self) -> Now {
+        self.clock.now()
+    }
+
     /// Returns this node's peer id.
     pub fn peer_id(&self) -> &PeerId {
-        self.swarm.core().local_peer_id()
+        self.engine.core.local_peer_id()
     }
 
     /// Returns the first listen address.
@@ -364,8 +358,7 @@ impl Endpoint {
     /// re-confirms each with its transport, which is a no-op for an address
     /// already listening.
     pub fn listen_all(&mut self) -> Result<Vec<PeerAddr>, Error> {
-        let addrs = self.swarm.core_mut().listen_on_bound_addrs()?;
-        Ok(addrs)
+        self.engine.core.listen_on_bound_addrs()
     }
 
     /// Admits one Connection attempt and returns its [`ConnectId`].
@@ -412,97 +405,33 @@ impl Endpoint {
         &mut self,
         target: impl TryInto<ConnectTarget, Error: Into<ConnectTargetError>>,
     ) -> Result<ConnectId, ConnectTargetError> {
-        Ok(self.connect_from(target.try_into().map_err(Into::into)?, true))
-    }
-
-    fn connect_from(&mut self, target: ConnectTarget, allow_relay: bool) -> ConnectId {
-        let peer = target.peer_id().clone();
-        #[cfg(any(feature = "discovery", feature = "mdns"))]
-        let candidates = resolve_book_candidates(
-            self.discovery.as_ref().map(|discovery| &discovery.book),
-            &peer,
-            target.candidates().to_vec(),
-        );
-        #[cfg(not(any(feature = "discovery", feature = "mdns")))]
-        let candidates = target.candidates().to_vec();
-        let now = self.swarm.now();
-        let id = admit_connect(
-            &mut self.connect,
-            self.swarm.core_mut(),
-            #[cfg(feature = "nat")]
-            self.nat.as_ref(),
-            #[cfg(all(feature = "_nat-driver", not(feature = "nat")))]
-            None,
-            ConnectAdmission {
-                peer: peer.clone(),
-                candidates,
-                allow_relay,
-            },
-            &mut |addr| self.resolver.expand(addr),
-            now.monotonic_ms,
-        );
-        #[cfg(feature = "nat")]
-        if let Some(nat) = self.nat.as_mut() {
-            let now = self.swarm.now();
-            // The book may know circuit addresses for the peer, which tell
-            // the relay leg where the peer holds a reservation.
-            #[cfg(any(feature = "discovery", feature = "mdns"))]
-            let target_addrs = self
-                .discovery
-                .as_ref()
-                .map(|discovery| discovery.book.known_addrs(&peer))
-                .unwrap_or_default();
-            #[cfg(not(any(feature = "discovery", feature = "mdns")))]
-            let target_addrs = Vec::new();
-            nat.attach_leg(
-                &self.connect,
-                id,
-                peer,
-                allow_relay,
-                target_addrs,
-                self.swarm.core_mut(),
-                now,
-            );
-        }
-        self.feed_nat_to_connect();
-        self.flush_step_events();
-        id
+        let target = target.try_into().map_err(Into::into)?;
+        let now = self.now();
+        let resolver = &mut self.resolver;
+        Ok(self
+            .engine
+            .connect(target, &mut |addr| resolver.expand(addr), now))
     }
 
     /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
     pub fn cancel_connect(&mut self, id: ConnectId) {
-        #[cfg(feature = "nat")]
-        {
-            let now = self.swarm.now();
-            let needs_pump = cancel_attempt(
-                &mut self.connect,
-                self.nat.as_mut(),
-                id,
-                self.swarm.core_mut(),
-                now,
-            );
-            if needs_pump && let Some(nat) = self.nat.as_mut() {
-                nat.pump(self.swarm.core_mut(), now);
-            }
-        }
-        #[cfg(not(feature = "nat"))]
-        self.connect.cancel(id, self.swarm.core_mut());
-        self.feed_nat_to_connect();
-        self.flush_step_events();
+        let now = self.now();
+        self.engine.cancel_connect(id, now);
     }
 
     /// Sends a ping to `peer_id`.
     ///
     /// The RTT is emitted later as [`EndpointEvent::PingRttMeasured`].
     pub fn ping(&mut self, peer_id: &PeerId) -> Result<(), Error> {
-        self.swarm.ping(peer_id)
+        let now = self.now();
+        self.engine.core.ping(peer_id, now.monotonic_ms)
     }
 
     /// Closes the active connection to `peer_id`, aborting any dials still
     /// kept open for its simultaneous dial so none of them reconnects it.
     pub fn disconnect(&mut self, peer_id: &PeerId) -> Result<(), Error> {
-        self.connect.abort_retained(peer_id, self.swarm.core_mut());
-        self.swarm.disconnect(peer_id)
+        let now = self.now();
+        self.engine.disconnect(peer_id, now)
     }
 
     /// Returns the current usable NAT-orchestrated path to `peer_id`.
@@ -513,27 +442,25 @@ impl Endpoint {
     /// queued and is independent of event consumption. On a
     /// [`EndpointEvent::ConnectionReplaced`] it becomes the new connection's
     /// origin, and it is gone once the peer disconnects. Connections NAT did
-    /// not announce (such as raw swarm dials) have no path, so this can return
-    /// `None` while the peer is connected.
+    /// not announce have no path, so this can return `None` while the peer is
+    /// connected.
     #[cfg(feature = "nat")]
     pub fn path(&self, peer_id: &PeerId) -> Option<Path> {
-        self.nat
-            .as_ref()
-            .and_then(|nat| nat.path(self.swarm.core(), peer_id))
+        self.engine.path(peer_id)
     }
 
     /// Returns peers with an established connection.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn connected_peers(&self) -> Vec<PeerId> {
-        self.swarm.core().connected_peers()
+        self.engine.core.connected_peers()
     }
 
     /// Returns whether Identify has completed for `peer_id`.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
-        self.swarm.core().is_peer_ready(peer_id)
+        self.engine.core.is_peer_ready(peer_id)
     }
 
     /// Returns the peer's current connection and its Identify info once that
@@ -544,28 +471,28 @@ impl Endpoint {
     /// connection's [`EndpointEvent::PeerReady`]. A ready wait checks this
     /// first, then accepts only a `PeerReady` for the current connection.
     pub fn peer_readiness(&self, peer_id: &PeerId) -> Option<(ConnectionId, &IdentifyMessage)> {
-        self.swarm.core().peer_readiness(peer_id)
+        self.engine.core.peer_readiness(peer_id)
     }
 
     /// Returns the latest Identify information received for `peer_id`.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
-        self.swarm.core().peer_info(peer_id)
+        self.engine.core.peer_info(peer_id)
     }
 
     /// Returns the active transport connection selected for `peer_id`.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
-        self.swarm.core().connection_id(peer_id)
+        self.engine.core.connection_id(peer_id)
     }
 
     /// Returns the remote transport address recorded for an exact connection.
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
-        self.swarm.core().connection_remote_addr(conn_id)
+        self.engine.core.connection_remote_addr(conn_id)
     }
 
     /// Returns addresses currently bound on the local transport.
@@ -575,7 +502,7 @@ impl Endpoint {
     ///
     /// See [State snapshots](Self#state-snapshots).
     pub fn bound_addresses(&self) -> Vec<Multiaddr> {
-        self.swarm.core().transport().local_addresses()
+        self.engine.core.transport().local_addresses()
     }
 
     /// Registers an application protocol for inbound and outbound negotiation.
@@ -584,7 +511,7 @@ impl Endpoint {
     /// [`SwarmError::ReservedProtocol`]; the endpoint's own identify and
     /// ping handlers already own them.
     pub fn add_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), Error> {
-        Ok(self.swarm.core_mut().add_protocol(protocol_id)?)
+        Ok(self.engine.core.add_protocol(protocol_id)?)
     }
 
     /// Registers an application protocol whose received data the
@@ -595,35 +522,7 @@ impl Endpoint {
     /// sender is held back until they are really consumed (ADR 0012). Streams
     /// that became ready before this call keep the acknowledgement they had.
     pub fn add_manual_ack_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), Error> {
-        let protocol_id = protocol_id.into();
-        self.swarm.core_mut().add_protocol(protocol_id.clone())?;
-        // Streams already ready keep their acknowledgement, whether their
-        // StreamReady waits in the Endpoint's queue or the swarm's.
-        let queued = self.pending_events.iter().filter_map(|event| match event {
-            EndpointEvent::StreamReady {
-                conn_id,
-                stream_id,
-                protocol_id: ready,
-                ..
-            } => (*ready == protocol_id).then_some((*conn_id, *stream_id)),
-            _ => None,
-        });
-        let buffered = self
-            .swarm
-            .core()
-            .buffered_events()
-            .filter_map(|event| match event {
-                SwarmEvent::StreamReady {
-                    conn_id,
-                    stream_id,
-                    protocol_id: ready,
-                    ..
-                } => (*ready == protocol_id).then_some((*conn_id, *stream_id)),
-                _ => None,
-            });
-        let already_ready: Vec<_> = queued.chain(buffered).collect();
-        self.acks.set_manual(protocol_id, already_ready);
-        Ok(())
+        self.engine.add_manual_ack_protocol(protocol_id.into())
     }
 
     /// Acknowledges `bytes` of a manual-acknowledgement stream's received
@@ -644,7 +543,7 @@ impl Endpoint {
         stream_id: StreamId,
         bytes: usize,
     ) -> Result<(), Error> {
-        self.swarm.core_mut().ack_stream(conn_id, stream_id, bytes)
+        self.engine.core.ack_stream(conn_id, stream_id, bytes)
     }
 
     /// Opens an application stream after negotiating `protocol_id`.
@@ -665,7 +564,10 @@ impl Endpoint {
         peer_id: &PeerId,
         protocol_id: &str,
     ) -> Result<(ConnectionId, StreamId), Error> {
-        self.swarm.open_stream(peer_id, protocol_id)
+        let now = self.now();
+        self.engine
+            .core
+            .open_stream(peer_id, protocol_id, now.monotonic_ms)
     }
 
     /// Sends bytes on a negotiated application stream.
@@ -687,8 +589,10 @@ impl Endpoint {
         stream_id: StreamId,
         data: impl Into<Bytes>,
     ) -> Result<(), Error> {
-        self.swarm
-            .send_stream(peer_id, conn_id, stream_id, data.into())
+        let now = self.now();
+        self.engine
+            .core
+            .send_stream(peer_id, conn_id, stream_id, data.into(), now.monotonic_ms)
     }
 
     /// Half-closes the local write side of an application stream.
@@ -698,7 +602,10 @@ impl Endpoint {
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), Error> {
-        self.swarm.close_stream_write(peer_id, conn_id, stream_id)
+        let now = self.now();
+        self.engine
+            .core
+            .close_stream_write(peer_id, conn_id, stream_id, now.monotonic_ms)
     }
 
     /// Resets an application stream.
@@ -708,116 +615,68 @@ impl Endpoint {
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), Error> {
-        self.swarm.reset_stream(peer_id, conn_id, stream_id)
+        let now = self.now();
+        self.engine
+            .core
+            .reset_stream(peer_id, conn_id, stream_id, now.monotonic_ms)
     }
 
     /// Resets and forgets an application stream that will no longer be consumed.
     ///
     /// Unlike [`Endpoint::reset_stream`], this also discards matching events
-    /// already buffered by the endpoint and suppresses later data, EOF, and
+    /// already queued by the endpoint and suppresses later data, EOF, and
     /// close events for the stream. Abandoning a live stream again is a
     /// no-op. A stream the peer has already closed has nothing left to reset:
     /// it is abandoned (and its undelivered data acknowledged) only while its
-    /// [`EndpointEvent::StreamClosed`] is undelivered and still in the swarm,
-    /// and fails with [`SwarmError::StreamNotFound`] after that, including on
-    /// a second call.
+    /// [`EndpointEvent::StreamClosed`] is undelivered, and fails with
+    /// [`SwarmError::StreamNotFound`] after that, including on a second call.
     pub fn abandon_stream(
         &mut self,
         peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), Error> {
-        self.swarm.abandon_stream(peer_id, conn_id, stream_id)?;
-        let mut dropped_data = 0usize;
-        self.pending_events.retain(|event| {
-            if !event.matches_stream(peer_id, conn_id, stream_id) {
-                return true;
-            }
-            if let EndpointEvent::StreamData { data, .. } = event {
-                dropped_data += data.len();
-            }
-            false
-        });
-        // The swarm settled only the data still in its own queue. Data that
-        // already moved here was never pulled, so nobody else will
-        // acknowledge it; a closed stream would hold its slot for good. After
-        // a reset the acknowledgement is moot, so its error is ignored.
-        if dropped_data > 0 {
-            match self
-                .swarm
-                .core_mut()
-                .ack_stream(conn_id, stream_id, dropped_data)
-            {
-                Ok(()) | Err(_) => {}
-            }
-        }
-        self.acks.forget(conn_id, stream_id);
-        Ok(())
+        let now = self.now();
+        self.engine.abandon_stream(peer_id, conn_id, stream_id, now)
     }
 
-    /// Polls the endpoint once and returns all currently available events.
+    /// Runs one drive batch without blocking and returns every queued event.
     ///
     /// Returned values are [`EndpointEvent`]s from the Endpoint event stream,
-    /// including enabled capability output. Each swarm event is finished
-    /// before the next, matching [`Self::wait`]: that event, then capability
-    /// events, then Connection-attempt terminals. Streams owned by an agent
-    /// (NAT, relay service, Gossipsub) are consumed here and never surface as
-    /// application stream events.
+    /// including enabled capability output, in the per-batch order documented
+    /// on [`EndpointEvent`]. Streams owned by an agent (NAT, relay service,
+    /// Gossipsub) are consumed here and never surface as application stream
+    /// events.
     ///
-    /// An error discards nothing: events already collected stay queued and
-    /// come out of the next `poll` or `wait`.
+    /// An error discards nothing: events already queued come out of the next
+    /// `poll` or `wait`.
     pub fn poll(&mut self) -> Result<Vec<EndpointEvent>, Error> {
-        self.tick_connect()?;
-        // Everything is queued before anything is handed out, so a failing
-        // step leaves earlier output in `pending_events`.
-        let mut polled = self.swarm.poll()?.into_iter();
-        if polled.len() == 0 {
-            // A quiet poll still ticks drivers and drains anything they queued.
-            let mut produced = Vec::new();
-            self.finish_step(&mut produced)?;
-            self.pending_events.extend(produced);
-        }
-        while let Some(event) = polled.next() {
-            if let Err(error) = self.step(event) {
-                // The swarm events not reached yet go back for next time.
-                self.swarm.preload_poll_events(polled);
-                return Err(error);
-            }
-        }
-        let events: Vec<EndpointEvent> = self.pending_events.drain(..).collect();
-        for event in &events {
-            self.ack_pulled(event);
-        }
-        Ok(events)
-    }
-
-    /// Acknowledges the data of a user-stream event the application is
-    /// pulling, unless its protocol takes manual acknowledgement.
-    ///
-    /// It only fails for data the application also acknowledged by hand,
-    /// which leaves nothing for this acknowledgement to release.
-    fn ack_pulled(&mut self, event: &EndpointEvent) {
-        if let Some((conn_id, stream_id, bytes)) = self.acks.pulled(event) {
-            match self.swarm.core_mut().ack_stream(conn_id, stream_id, bytes) {
-                Ok(()) | Err(_) => {}
-            }
-        }
+        self.harvest(Duration::ZERO)?;
+        let now = self.now();
+        self.resolve_names(now);
+        self.drive(now)?;
+        // Start lookups for NAT dials the batch parked, so they run between
+        // polls rather than from the next one.
+        self.resolve_names(now);
+        Ok(self.engine.take_events())
     }
 
     /// Drives the endpoint until an Endpoint event, the caller's deadline, or
     /// an interruption.
     ///
-    /// This is the single Endpoint blocking wait. Deadline and interruption
-    /// stay visible so a loop can service its own timers and commands (a
-    /// [`WaitHandle`] from another thread interrupts it). A deadline that has
-    /// already passed -- a stale [`std::time::Instant`] or
+    /// This is the single Endpoint blocking wait. It runs one drive batch
+    /// whenever its queue is empty and hands the batch's events out one per
+    /// call, in the order documented on [`EndpointEvent`]. Deadline and
+    /// interruption stay visible so a loop can service its own timers and
+    /// commands (a [`WaitHandle`] from another thread interrupts it). A
+    /// deadline that has already passed -- a stale [`std::time::Instant`] or
     /// [`std::time::Duration::ZERO`] alike -- never sleeps, but still returns
     /// a queued event or drives the endpoint once, so a stale timer cannot
     /// stall it. The deadline bounds blocking, not delivery: a caller with a
     /// strict operation timeout checks its own clock before each `wait`, as
-    /// below. Enabled capabilities deliver their
-    /// output here as [`EndpointEvent`] variants, so one `wait` loop sees
-    /// every event exactly once. Each call drives only this endpoint.
+    /// below. Enabled capabilities deliver their output here as
+    /// [`EndpointEvent`] variants, so one `wait` loop sees every event
+    /// exactly once. Each call drives only this endpoint.
     ///
     /// # Examples
     ///
@@ -869,72 +728,117 @@ impl Endpoint {
     /// ```
     pub fn wait(&mut self, deadline: impl Into<Deadline>) -> Result<EndpointWaitOutcome, Error> {
         let deadline = deadline.into();
-        // `Swarm::poll_next_interruptible` performs one synchronous poll even
-        // for an expired deadline, which is what lets a passed deadline still
-        // drive the endpoint. Allow that once, so a continuous event stream
-        // cannot keep this wait running past its deadline.
-        let mut expired_poll_used = false;
+        // A passed deadline still drives the endpoint once, which is what
+        // lets a stale timer make progress. Only once, so a continuous event
+        // stream cannot keep this wait running past its deadline.
+        let mut drove_past_deadline = false;
+        // A blocking harvest already collected this batch's readiness; a
+        // zero-timeout one right behind it would only cost a syscall.
+        let mut harvested = false;
+        // A taken host wake owes one more batch, which is what reads the
+        // edge-triggered mDNS sockets; a passed deadline must not skip it.
+        let mut woken = false;
         loop {
-            // A shortened step deadline is an internal timer, not the
-            // caller's. Tick first so an attempt Timeout lands as
-            // ConnectSettled.
-            self.tick_connect()?;
-            if let Some(event) = self.pending_events.pop_front() {
-                self.ack_pulled(&event);
+            if let Some(event) = self.engine.pop_event() {
                 return Ok(EndpointWaitOutcome::Event(event));
             }
+            if drove_past_deadline && deadline.has_passed() && !woken {
+                return Ok(EndpointWaitOutcome::Deadline);
+            }
+            if !harvested {
+                self.harvest(Duration::ZERO)?;
+            }
+            // Lookups start before any sleep; finished ones (a lookup thread
+            // is what woke the last sleep, unless the caller did) are applied
+            // to the batch.
+            let now = self.now();
+            self.resolve_names(now);
+            drove_past_deadline |= deadline.has_passed();
+            woken = false;
+            self.drive(now)?;
+            if !self.engine.events.is_empty() {
+                harvested = false;
+                continue;
+            }
+            // A pending interrupt outranks an expired deadline, so a host's
+            // non-blocking pump still notices it. Checked before sleeping
+            // even when its `Waker` event was already harvested.
+            if self.poll.take_interrupt() {
+                return Ok(EndpointWaitOutcome::Interrupted);
+            }
+            if self.poll.take_wake() {
+                (harvested, woken) = (false, true);
+                continue;
+            }
             if deadline.has_passed() {
-                if expired_poll_used {
-                    return Ok(EndpointWaitOutcome::Deadline);
-                }
-                expired_poll_used = true;
+                return Ok(EndpointWaitOutcome::Deadline);
             }
-            let step = self.step_deadline(deadline);
-            let polled = self.swarm.poll_next_interruptible(step)?;
-            if deadline.has_passed() {
-                expired_poll_used = true;
-            }
-            match polled {
-                PollNext::Event(event) => {
-                    self.step(event)?;
-                }
-                PollNext::Deadline => {
-                    // An agent timer may have ended this step; let it act.
-                    let mut produced = Vec::new();
-                    self.finish_step(&mut produced)?;
-                    if produced.is_empty() && deadline.has_passed() {
-                        return Ok(EndpointWaitOutcome::Deadline);
-                    }
-                    self.pending_events.extend(produced);
-                }
-                PollNext::Interrupted => return Ok(EndpointWaitOutcome::Interrupted),
-                PollNext::Woken => {
-                    // Host work: a lookup thread with an answer, or mDNS
-                    // input. Apply the answers, then tick the drivers, which
-                    // reads every mDNS socket.
-                    self.tick_connect()?;
-                    let mut produced = Vec::new();
-                    self.finish_step(&mut produced)?;
-                    self.pending_events.extend(produced);
-                }
-            }
+            // The batch may have parked NAT dials to named hosts; their
+            // lookups must be under way before this sleeps, or nothing
+            // would wake it for them.
+            let now = self.now();
+            self.resolve_names(now);
+            harvested = self.block(deadline)?;
         }
     }
 
-    /// Starts lookups for NAT dials to named hosts, expires due attempts,
-    /// applies finished lookups to the Connection attempts and NAT dials
-    /// still waiting on them, and queues whatever settled.
+    /// Runs one engine batch, with Name resolution as candidate expansion.
+    fn drive(&mut self, now: Now) -> Result<(), Error> {
+        let resolver = &mut self.resolver;
+        self.engine.drive(now, &mut |addr| resolver.expand(addr))
+    }
+
+    /// Sleeps until input on any registered source, a `Waker` wake, the
+    /// caller's deadline, or the engine's next timer, and dispatches the
+    /// transport's share of the readiness. Returns whether it harvested.
     ///
-    /// Runs before every blocking wait, so a lookup is under way before the
-    /// driver sleeps, and its answer is applied on the wake it causes.
-    fn tick_connect(&mut self) -> Result<(), Error> {
+    /// The engine's own timers (attempt deadlines, capability drivers) are
+    /// floored at 1 ms, so a driver reporting "due now" without new input
+    /// cannot spin the thread; the swarm's own due work is not.
+    fn block(&mut self, deadline: Deadline) -> Result<bool, Error> {
+        let now = self.now();
+        let mut budget = deadline.remaining().unwrap_or(MAX_IDLE_WAIT);
+        if let Some(next) = self.engine.core.next_deadline(now) {
+            budget = budget.min(Duration::from_millis(next.millis_until(now)));
+        }
+        if let Some(ms) = self.engine.timer_ms(now) {
+            budget = budget.min(Duration::from_millis(ms.max(1)));
+        }
+        if budget.is_zero() {
+            return Ok(false);
+        }
+        self.harvest(budget)?;
+        Ok(true)
+    }
+
+    /// Collects one bounded batch of readiness, blocking up to `timeout`,
+    /// and dispatches the transport's share. Every drive path harvests
+    /// first: an edge-triggered transport reads only what was dispatched.
+    fn harvest(&mut self, timeout: Duration) -> Result<(), Error> {
+        self.poll
+            .harvest(self.engine.core.transport_mut(), timeout)
+            .map(drop)
+            .map_err(|error| {
+                TransportError::PollError {
+                    reason: format!("waiting for readiness: {error}"),
+                }
+                .into()
+            })
+    }
+
+    /// Starts lookups for NAT dials to named hosts, expires due attempts,
+    /// and applies finished lookups to the Connection attempts and NAT dials
+    /// still waiting on them.
+    ///
+    /// Runs before every batch, so a lookup is under way before the driver
+    /// sleeps, and its answer is applied on the wake it causes.
+    fn resolve_names(&mut self, now: Now) {
         #[cfg(feature = "nat")]
         let mut nat_answered = Vec::new();
         #[cfg(feature = "nat")]
-        if let Some(nat) = self.nat.as_mut() {
+        if let Some(nat) = self.engine.nat.as_mut() {
             // A lookup can outlive the flight that wanted it; retire those so
             // retries during a stall do not pile up.
-            let now = self.swarm.now();
             self.nat_dials
                 .retain(|(token, _)| nat.named_dial_wanted(*token, now));
             for (token, addr) in nat.take_named_dials() {
@@ -947,13 +851,12 @@ impl Endpoint {
         }
         // Expire first: an answer that arrives after an attempt's deadline
         // must not turn its Timeout into another outcome.
-        let now_ms = self.swarm.now().monotonic_ms;
-        self.connect.tick(self.swarm.core_mut(), now_ms);
+        self.engine.expire_attempts(now);
         let answers = self.resolver.take_answers();
         if !answers.is_empty() {
-            self.connect.resolved(
+            self.engine.connect.resolved(
                 &mut |addr| dial::answer_for(addr, &answers),
-                self.swarm.core_mut(),
+                &mut self.engine.core,
             );
             #[cfg(feature = "nat")]
             self.nat_dials
@@ -966,317 +869,11 @@ impl Endpoint {
                 });
         }
         #[cfg(feature = "nat")]
-        if !nat_answered.is_empty()
-            && let Some(nat) = self.nat.as_mut()
-        {
-            let now = self.swarm.now();
+        if let Some(nat) = self.engine.nat.as_mut() {
             for (token, result) in nat_answered {
-                nat.named_dial_resolved(token, result, self.swarm.core_mut(), now);
-            }
-            // The agent reacted to its dials; run a full step so discovery
-            // sweeps what that queued before anything is drained.
-            let mut produced = Vec::new();
-            self.finish_step(&mut produced)?;
-            self.pending_events.extend(produced);
-            return Ok(());
-        }
-        self.flush_step_events();
-        Ok(())
-    }
-
-    /// Queues output produced outside a swarm step (API calls, timers):
-    /// capability events first, then Connection-attempt events, so a
-    /// terminal never overtakes the NAT events of the same call.
-    fn flush_step_events(&mut self) {
-        let mut out = Vec::new();
-        self.drain_step_events(&mut out);
-        self.pending_events.extend(out);
-    }
-
-    /// Runs one Endpoint step for a swarm event and queues everything it
-    /// produced, in Endpoint emission order.
-    ///
-    /// The event's own output is queued before the drivers tick, so a
-    /// failing tick cannot discard it.
-    fn step(&mut self, event: SwarmEvent) -> Result<(), Error> {
-        let ingested = self.ingest(event);
-        self.pending_events.extend(ingested);
-        let mut produced = Vec::new();
-        self.finish_step(&mut produced)?;
-        self.pending_events.extend(produced);
-        Ok(())
-    }
-
-    /// Ends one Endpoint step: ticks the agents, then appends capability
-    /// events and Connection-attempt events in the documented order.
-    fn finish_step(&mut self, out: &mut Vec<EndpointEvent>) -> Result<(), Error> {
-        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-        self.tick_drivers()?;
-        self.drain_step_events(out);
-        Ok(())
-    }
-
-    /// Appends already-queued capability events, then Connection-attempt
-    /// events, without driving anything.
-    fn drain_step_events(&mut self, out: &mut Vec<EndpointEvent>) {
-        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-        self.collect_capability_events(out);
-        out.extend(self.take_connect_events());
-    }
-
-    /// Moves every queued capability event into `out` exactly once, in
-    /// relay-server, NAT, Gossipsub, Discovery order.
-    ///
-    /// The discovery sweep removes beacon-topic Gossipsub traffic and
-    /// discovery-owned NAT events before this drain. [`Self::finish_step`]
-    /// runs that sweep and then calls this. [`Self::flush_step_events`] also
-    /// calls this from `connect`, `cancel_connect`, and `tick_connect`
-    /// without sweeping again; that stays correct only while
-    /// every path that fills a driver queue ends in `finish_step` first.
-    /// NAT output reaches the Connection-attempt engine before the drain;
-    /// the attempt terminals it turns into `ConnectSettled` are not repeated
-    /// as NAT events.
-    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn collect_capability_events(&mut self, out: &mut Vec<EndpointEvent>) {
-        #[cfg(all(debug_assertions, any(feature = "discovery", feature = "mdns")))]
-        if let (Some(discovery), Some(nat)) = (self.discovery.as_ref(), self.nat.as_ref()) {
-            debug_assert!(
-                nat.queued_events()
-                    .all(|event| !discovery.owns_nat_event(event)),
-                "discovery-owned NAT events must be swept before the capability drain"
-            );
-        }
-        #[cfg(feature = "relay-server")]
-        if let Some(relay_server) = self.relay_server.as_mut() {
-            out.extend(
-                relay_server
-                    .events
-                    .drain(..)
-                    .map(EndpointEvent::RelayServer),
-            );
-        }
-        #[cfg(feature = "nat")]
-        {
-            self.feed_nat_to_connect();
-            if let Some(nat) = self.nat.as_mut() {
-                out.extend(nat.drain_application_events().map(EndpointEvent::Nat));
+                nat.named_dial_resolved(token, result, &mut self.engine.core, now);
             }
         }
-        #[cfg(feature = "pubsub")]
-        if let Some(pubsub) = self.gossipsub.as_mut() {
-            out.extend(pubsub.events.drain(..).map(EndpointEvent::Gossipsub));
-        }
-        #[cfg(any(feature = "discovery", feature = "mdns"))]
-        if let Some(discovery) = self.discovery.as_mut() {
-            discovery.drain_events(out);
-        }
-    }
-
-    fn take_connect_events(&mut self) -> Vec<EndpointEvent> {
-        let mut out = Vec::new();
-        while let Some(event) = self.connect.pop_event() {
-            #[cfg(feature = "nat")]
-            self.cancel_nat_leg_on_terminal(&event);
-            #[cfg(any(feature = "discovery", feature = "mdns"))]
-            if self.discovery_claim_settled(&event) {
-                continue;
-            }
-            out.push(event);
-        }
-        out
-    }
-
-    #[cfg(feature = "nat")]
-    fn cancel_nat_leg_on_terminal(&mut self, event: &EndpointEvent) {
-        if let Some(nat) = self.nat.as_mut() {
-            let now = self.swarm.now();
-            nat.cancel_leg_on_terminal(event, self.swarm.core_mut(), now);
-        }
-    }
-
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
-    fn discovery_claim_settled(&mut self, event: &EndpointEvent) -> bool {
-        let Some(discovery) = self.discovery.as_mut() else {
-            return false;
-        };
-        let now_ms = self.swarm.now().monotonic_ms;
-        discovery.claim_settled(event, now_ms)
-    }
-
-    /// Lets the Connection-attempt engine observe NAT output it has not seen
-    /// yet, by reference; the events stay queued for the application.
-    fn feed_nat_to_connect(&mut self) {
-        #[cfg(feature = "nat")]
-        if let Some(nat) = self.nat.as_mut() {
-            let now = self.swarm.now();
-            nat.feed_unobserved_to_connect(&mut self.connect, self.swarm.core_mut(), now);
-        }
-    }
-
-    /// Feeds one swarm event to the Connection engine and the agents.
-    ///
-    /// Returns the event when no one claimed it. Capability and
-    /// Connection-attempt output follows via [`Self::finish_step`].
-    fn ingest(&mut self, event: SwarmEvent) -> Option<EndpointEvent> {
-        let now_ms = self.swarm.now().monotonic_ms;
-        let engine_consumed = self.connect.observe(&event, self.swarm.core_mut(), now_ms);
-        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-        let driver_consumed = !engine_consumed && self.ingest_into_drivers(&event);
-        #[cfg(not(any(feature = "nat", feature = "pubsub", feature = "relay-server")))]
-        let driver_consumed = false;
-        self.feed_nat_to_connect();
-        (!engine_consumed && !driver_consumed).then(|| EndpointEvent::from(event))
-    }
-
-    /// One wait step's deadline: the caller's, shortened by whichever
-    /// Connection-attempt or agent timer is due first.
-    fn step_deadline(&mut self, deadline: Deadline) -> Deadline {
-        let now = self.swarm.now();
-        let mut step = deadline;
-        let mut shorten = |ms: u64| {
-            step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
-        };
-        if let Some(next) = self.connect.next_deadline() {
-            shorten(next.millis_until(now));
-        }
-        #[cfg(feature = "relay-server")]
-        if let Some(relay_server) = self.relay_server.as_ref()
-            && let Some(ms) = relay_server.agent.next_timeout(relay_server.now())
-        {
-            shorten(ms);
-        }
-        #[cfg(feature = "nat")]
-        if let Some(ms) = self.nat.as_ref().and_then(|nat| nat.next_timeout(now)) {
-            shorten(ms);
-        }
-        #[cfg(feature = "pubsub")]
-        if let Some(ms) = self
-            .gossipsub
-            .as_ref()
-            .and_then(|pubsub| pubsub.next_timeout(now.monotonic_ms))
-        {
-            shorten(ms);
-        }
-        #[cfg(any(feature = "discovery", feature = "mdns"))]
-        if let Some(ms) = self
-            .discovery
-            .as_ref()
-            .and_then(|discovery| discovery.next_timeout(now.monotonic_ms))
-        {
-            shorten(ms);
-        }
-        #[cfg(feature = "mdns")]
-        if let Some(ms) = self
-            .mdns
-            .as_ref()
-            .and_then(|mdns| mdns.next_timeout(mdns.now_ms()))
-        {
-            shorten(ms);
-        }
-        step
-    }
-
-    /// Feeds one swarm event through relay-server, NAT, then pubsub.
-    ///
-    /// Relay service owns inbound HOP before NAT considers its client-side
-    /// streams. Neither service claims connection lifecycle or `PeerReady`,
-    /// so both still observe the shared connection state.
-    ///
-    /// A stale `PeerReady` (queued before its connection was replaced)
-    /// reaches only the application: drivers act peer-scoped, so it would
-    /// start work on the replacement before that connection is ready.
-    ///
-    /// Returns `true` when a driver claimed the event.
-    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn ingest_into_drivers(&mut self, event: &SwarmEvent) -> bool {
-        if self.swarm.core().is_stale_peer_ready(event) {
-            return false;
-        }
-        #[cfg(any(feature = "discovery", feature = "mdns"))]
-        if let Some(discovery) = self.discovery.as_mut() {
-            let now_ms = self.swarm.now().monotonic_ms;
-            discovery.observe(event, self.swarm.core(), now_ms);
-        }
-        let mut claimed = false;
-        #[cfg(feature = "relay-server")]
-        if let Some(relay_server) = self.relay_server.as_mut() {
-            claimed = relay_server.ingest(event, &mut self.swarm);
-        }
-        #[cfg(feature = "nat")]
-        if !claimed && let Some(nat) = self.nat.as_mut() {
-            let now = self.swarm.now();
-            claimed = nat.ingest(event, self.swarm.core_mut(), now);
-        }
-        #[cfg(feature = "pubsub")]
-        if !claimed && let Some(pubsub) = self.gossipsub.as_mut() {
-            let now_ms = self.swarm.now().monotonic_ms;
-            claimed = pubsub.ingest(event, self.swarm.core_mut(), now_ms);
-        }
-        #[cfg(any(feature = "nat", feature = "relay-server"))]
-        self.refresh_external_address_contributions();
-        claimed
-    }
-
-    /// Ticks every active driver.
-    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn tick_drivers(&mut self) -> Result<(), Error> {
-        #[cfg(feature = "relay-server")]
-        if let Some(relay_server) = self.relay_server.as_mut() {
-            relay_server.tick(&mut self.swarm);
-        }
-        #[cfg(feature = "nat")]
-        if let Some(nat) = self.nat.as_mut() {
-            let now = self.swarm.now();
-            nat.tick(self.swarm.core_mut(), now);
-        }
-        #[cfg(feature = "pubsub")]
-        if let Some(pubsub) = self.gossipsub.as_mut() {
-            let now_ms = self.swarm.now().monotonic_ms;
-            pubsub.tick(self.swarm.core_mut(), now_ms);
-        }
-        #[cfg(feature = "mdns")]
-        if let Some(mdns) = self.mdns.as_mut() {
-            mdns.tick(self.swarm.core().local_addresses())
-                .map_err(mdns_driver_error)?;
-        }
-        self.feed_nat_to_connect();
-        #[cfg(any(feature = "discovery", feature = "mdns"))]
-        if let Some(discovery) = self.discovery.as_mut() {
-            #[cfg(feature = "mdns")]
-            if let Some(mdns) = self.mdns.as_mut() {
-                let now_ms = self.swarm.now().monotonic_ms;
-                while let Some(event) = mdns.poll_event() {
-                    discovery.handle_mdns_event(event, now_ms);
-                }
-            }
-            let now = self.swarm.now();
-            let work = discovery.sweep(
-                #[cfg(feature = "pubsub")]
-                self.gossipsub.as_mut(),
-                self.nat.as_mut(),
-                &mut self.connect,
-                self.swarm.core_mut(),
-                &mut |addr| self.resolver.expand(addr),
-                now,
-            );
-            // Both discovery features imply `nat`.
-            if let Some(nat) = self.nat.as_mut() {
-                nat.apply_sweep_work(work, &self.connect, self.swarm.core_mut(), now);
-                // Attaching a leg can queue a synchronous terminal the
-                // sweep's claim pass already ran past; the engine must
-                // observe it before the capability drain filters it out.
-                discovery.claim_nat_events(
-                    nat,
-                    &mut self.connect,
-                    self.swarm.core_mut(),
-                    now.monotonic_ms,
-                );
-            }
-        }
-        #[cfg(any(feature = "nat", feature = "relay-server"))]
-        self.refresh_external_address_contributions();
-        self.feed_nat_to_connect();
-        Ok(())
     }
 
     /// Pauses or resumes admission of new relay reservations and circuits.
@@ -1293,6 +890,7 @@ impl Endpoint {
         accepting: bool,
     ) -> Result<(), RelayServerControlError> {
         let relay_server = self
+            .engine
             .relay_server
             .as_mut()
             .ok_or(RelayServerControlError::NotConfigured)?;
@@ -1317,6 +915,7 @@ impl Endpoint {
         addrs: Vec<Multiaddr>,
     ) -> Result<(), RelayServerControlError> {
         let relay_server = self
+            .engine
             .relay_server
             .as_mut()
             .ok_or(RelayServerControlError::NotConfigured)?;
@@ -1324,50 +923,8 @@ impl Endpoint {
             .agent
             .replace_announce_addrs(addrs)
             .map_err(RelayServerControlError::InvalidAddress)?;
-        self.refresh_external_address_contributions();
+        self.engine.addresses_changed();
         Ok(())
-    }
-
-    #[cfg(any(feature = "nat", feature = "relay-server"))]
-    fn refresh_external_address_contributions(&mut self) {
-        #[cfg(feature = "relay-server")]
-        {
-            let listeners =
-                concrete_relay_listener_addrs(self.swarm.core().transport().local_addresses());
-            #[cfg(feature = "nat")]
-            let confirmed = self
-                .nat
-                .as_ref()
-                .map(NatDriver::confirmed_public_addrs)
-                .unwrap_or_default();
-            if let Some(relay_server) = self.relay_server.as_mut() {
-                // The address source comes from local bound listeners; on
-                // rejection the agent deliberately keeps its previous source.
-                drop(relay_server.agent.set_listener_addrs(listeners));
-                #[cfg(feature = "nat")]
-                // Confirmed addresses were already accepted by the NAT agent;
-                // retain the previous relay source if conversion rejects one.
-                drop(relay_server.agent.set_confirmed_addrs(confirmed));
-            }
-        }
-        let mut addresses = self.caller_external_addresses.clone();
-        #[cfg(feature = "nat")]
-        if let Some(nat) = self.nat.as_ref() {
-            for address in nat.advertised_addrs() {
-                if !addresses.contains(&address) {
-                    addresses.push(address);
-                }
-            }
-        }
-        #[cfg(feature = "relay-server")]
-        if let Some(relay_server) = self.relay_server.as_ref() {
-            for address in relay_server.agent.selected_addrs() {
-                if !addresses.contains(address) {
-                    addresses.push(address.clone());
-                }
-            }
-        }
-        self.swarm.core_mut().set_external_addresses(addresses);
     }
 
     /// Sets externally validated addresses to advertise through Identify.
@@ -1377,13 +934,7 @@ impl Endpoint {
     /// relay circuits and confirmed public addresses, relay-server announce
     /// addresses) are kept and merged after these.
     pub fn set_external_addresses(&mut self, addresses: Vec<Multiaddr>) {
-        #[cfg(any(feature = "nat", feature = "relay-server"))]
-        {
-            self.caller_external_addresses = addresses;
-            self.refresh_external_address_contributions();
-        }
-        #[cfg(not(any(feature = "nat", feature = "relay-server")))]
-        self.swarm.core_mut().set_external_addresses(addresses);
+        self.engine.set_external_addresses(addresses);
     }
 
     /// Our current reachability verdict from AutoNAT probing
@@ -1391,18 +942,13 @@ impl Endpoint {
     /// when NAT is not configured).
     #[cfg(feature = "nat")]
     pub fn reachability(&self) -> ReachabilityState {
-        self.nat
-            .as_ref()
-            .map(|nat| nat.reachability())
-            .unwrap_or_default()
+        self.engine.reachability()
     }
 
     /// The relay reservation currently held, if any.
     #[cfg(feature = "nat")]
     pub fn active_reservation(&self) -> Option<ReservationInfo> {
-        self.nat
-            .as_ref()
-            .and_then(|nat| nat.active_reservation().cloned())
+        self.engine.active_reservation()
     }
 
     /// Subscribes to a pubsub topic. Returns `Ok(false)` when already
@@ -1412,11 +958,8 @@ impl Endpoint {
     /// built with [`EndpointBuilder::gossipsub`].
     #[cfg(feature = "pubsub")]
     pub fn subscribe(&mut self, topic: &str) -> Result<bool, GossipsubError> {
-        let Some(pubsub) = self.gossipsub.as_mut() else {
-            return Err(GossipsubError::NotEnabled);
-        };
-        let now_ms = self.swarm.now().monotonic_ms;
-        Ok(pubsub.subscribe(topic, self.swarm.core_mut(), now_ms)?)
+        let now = self.now();
+        self.engine.subscribe(topic, now)
     }
 
     /// Withdraws a pubsub subscription. Returns `Ok(false)` when not
@@ -1425,15 +968,8 @@ impl Endpoint {
     /// [`GossipsubError::DiscoveryTopicReserved`].
     #[cfg(feature = "pubsub")]
     pub fn unsubscribe(&mut self, topic: &str) -> Result<bool, GossipsubError> {
-        #[cfg(feature = "discovery")]
-        let reserved = self.discovery.as_ref().and_then(|d| d.topic());
-        #[cfg(not(feature = "discovery"))]
-        let reserved = None;
-        let Some(pubsub) = self.gossipsub.as_mut() else {
-            return Err(GossipsubError::NotEnabled);
-        };
-        let now_ms = self.swarm.now().monotonic_ms;
-        pubsub.unsubscribe(topic, reserved, self.swarm.core_mut(), now_ms)
+        let now = self.now();
+        self.engine.unsubscribe(topic, now)
     }
 
     /// Publishes `data` on `topic`, signed with this endpoint's identity and
@@ -1443,31 +979,20 @@ impl Endpoint {
     /// streams were initiated — the frames themselves go out as the
     /// endpoint is driven (`wait` / `poll`), so keep driving after
     /// publishing. Delivery failures are never synchronous errors; they
-    /// surface later as [`GossipsubEvent::OutboundFailure`] (or
+    /// surface later as [`crate::GossipsubEvent::OutboundFailure`] (or
     /// [`EndpointEvent::Error`] runtime events). There is no self-delivery. The
     /// configured discovery topic is reserved while discovery is enabled
     /// and returns [`GossipsubError::DiscoveryTopicReserved`].
     #[cfg(feature = "pubsub")]
     pub fn publish(&mut self, topic: &str, data: impl Into<Vec<u8>>) -> Result<(), GossipsubError> {
-        #[cfg(feature = "discovery")]
-        let reserved = self.discovery.as_ref().and_then(|d| d.topic());
-        #[cfg(not(feature = "discovery"))]
-        let reserved = None;
-        let Some(pubsub) = self.gossipsub.as_mut() else {
-            return Err(GossipsubError::NotEnabled);
-        };
-        let now_ms = self.swarm.now().monotonic_ms;
-        pubsub.publish(topic, data.into(), reserved, self.swarm.core_mut(), now_ms)?;
-        Ok(())
+        let now = self.now();
+        self.engine.publish(topic, data.into(), now)
     }
 
     /// Returns the current discovery address-book snapshot.
     #[cfg(any(feature = "discovery", feature = "mdns"))]
     pub fn known_peers(&self) -> Vec<KnownPeer> {
-        self.discovery
-            .as_ref()
-            .map(|driver| driver.book.known_peers())
-            .unwrap_or_default()
+        self.engine.known_peers()
     }
 
     /// Returns the discovery driver's current monotonic timestamp.
@@ -1479,8 +1004,8 @@ impl Endpoint {
     /// is active.
     #[cfg(any(feature = "discovery", feature = "mdns"))]
     pub fn discovery_now_ms(&mut self) -> Option<u64> {
-        self.discovery.as_ref()?;
-        Some(self.swarm.now().monotonic_ms)
+        self.engine.discovery.as_ref()?;
+        Some(self.now().monotonic_ms)
     }
 
     /// Sends mDNS goodbyes once and cancels discovery-owned dial attempts.
@@ -1492,29 +1017,8 @@ impl Endpoint {
     /// This does not close QUIC/TCP peers; use [`close`](Self::close) or drop.
     #[cfg(feature = "mdns")]
     pub fn shutdown(&mut self) -> Result<(), Error> {
-        let result = self
-            .mdns
-            .as_mut()
-            .map(mdns::MdnsDriver::shutdown)
-            .transpose()
-            .map(|_| ())
-            .map_err(mdns_driver_error);
-        if let Some(discovery) = self.discovery.as_mut() {
-            let now = self.swarm.now();
-            let work = discovery.shutdown(
-                &mut self.connect,
-                self.nat.as_mut(),
-                self.swarm.core_mut(),
-                now,
-            );
-            // `mdns` implies `nat`. Shutdown already cleared `inflight`, so
-            // its queued events are not discovery-owned anymore; the next
-            // poll feeds them to the engine and the app like any NAT event.
-            if let Some(nat) = self.nat.as_mut() {
-                nat.apply_sweep_work(work, &self.connect, self.swarm.core_mut(), now);
-            }
-        }
-        result
+        let now = self.now();
+        self.engine.shutdown_mdns(now)
     }
 
     /// Disconnects established peers, waits briefly until none remain,
@@ -1531,7 +1035,7 @@ impl Endpoint {
         if let Err(error) = self.shutdown() {
             first_error = Some(error);
         }
-        let drain_by = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let drain_by = std::time::Instant::now() + Duration::from_millis(500);
         let mut events = Vec::new();
         loop {
             if let Some(error) = self.disconnect_established()
@@ -1542,29 +1046,35 @@ impl Endpoint {
             if std::time::Instant::now() >= drain_by {
                 break;
             }
-            let polled = if self.close_drain_busy() {
-                self.swarm.poll_next(drain_by)
+            let harvested = if self.close_drain_busy() {
+                // Interrupts only end this sleep early.
+                self.block(Deadline::from(drain_by))
             } else {
-                self.swarm.poll_next(std::time::Duration::ZERO)
+                Ok(false)
             };
-            match polled {
-                Ok(Some(event)) => {
-                    // No agent tick or discovery sweep runs while closing, so
-                    // only connection and attempt events are returned.
-                    events.extend(self.ingest(event));
-                    events.extend(self.take_connect_events());
-                }
-                Ok(None) => {
-                    if !self.close_drain_busy() || std::time::Instant::now() >= drain_by {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    return match first_error {
-                        Some(first) => Err(first),
-                        None => Err(error),
-                    };
-                }
+            let harvested = match harvested {
+                Ok(true) => Ok(()),
+                Ok(false) => self.harvest(Duration::ZERO),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = harvested {
+                return Err(first_error.unwrap_or(error));
+            }
+            let now = self.now();
+            let polled = match self.engine.core.poll(now) {
+                Ok(polled) => polled,
+                Err(error) => return Err(first_error.unwrap_or(error)),
+            };
+            let quiet = polled.is_empty();
+            // No agent tick or discovery sweep runs while closing, so only
+            // connection and attempt events are returned.
+            for event in polled {
+                self.engine.ingest(event, now);
+            }
+            events.extend(self.engine.events.drain(..));
+            events.extend(self.engine.collect_terminals(now));
+            if quiet && (!self.close_drain_busy() || std::time::Instant::now() >= drain_by) {
+                break;
             }
         }
         match first_error {
@@ -1574,14 +1084,14 @@ impl Endpoint {
     }
 
     fn close_drain_busy(&self) -> bool {
-        !self.swarm.core().connected_peers().is_empty()
-            || self.swarm.core().has_tracked_connections()
+        !self.engine.core.connected_peers().is_empty() || self.engine.core.has_tracked_connections()
     }
 
     fn disconnect_established(&mut self) -> Option<Error> {
+        let now = self.now();
         let mut first_error = None;
-        for peer in self.swarm.core().connected_peers() {
-            if let Err(error) = self.swarm.disconnect(&peer)
+        for peer in self.engine.core.connected_peers() {
+            if let Err(error) = self.engine.core.disconnect(&peer, now.monotonic_ms)
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -1598,14 +1108,7 @@ impl Drop for Endpoint {
     }
 }
 
-#[cfg(feature = "mdns")]
-fn mdns_driver_error(error: minip2p_mdns::MdnsError) -> Error {
-    TransportError::PollError {
-        reason: error.to_string(),
-    }
-    .into()
-}
-
+/// A per-process mDNS seed: the peer id mixed with the wall clock.
 #[cfg(feature = "mdns")]
 fn mdns_seed(keypair: &Ed25519Keypair) -> [u8; 32] {
     let mut seed = [0u8; 32];
@@ -2179,18 +1682,23 @@ fn reject_duplicate_quic_family(existing: &[Multiaddr], next: &Multiaddr) -> Res
 /// and IPv6 addresses become one QUIC member, and every `/tcp` address lands on
 /// one TCP member. Members are inserted in the order their shape first appears,
 /// so `listen_all` reports addresses in configuration order.
+#[cfg_attr(
+    not(any(feature = "quic", feature = "tcp")),
+    expect(
+        unused_mut,
+        unused_variables,
+        reason = "without a transport feature there is nothing to bind"
+    )
+)]
 fn bind_transports(
-    _options: &EndpointBuilder,
-    _keypair: &Ed25519Keypair,
+    options: &EndpointBuilder,
+    keypair: &Ed25519Keypair,
 ) -> Result<TransportSet, Error> {
-    #[cfg(any(feature = "quic", feature = "tcp"))]
     let mut set = TransportSet::new();
-    #[cfg(not(any(feature = "quic", feature = "tcp")))]
-    let set = TransportSet::new();
 
     #[cfg(any(feature = "quic", feature = "tcp"))]
     {
-        let addrs = &_options.listen_addrs;
+        let addrs = &options.listen_addrs;
         #[cfg(feature = "quic")]
         let quic_addrs: Vec<&Multiaddr> = addrs
             .iter()
@@ -2213,7 +1721,7 @@ fn bind_transports(
             #[cfg(feature = "quic")]
             if want_quic && !quic_addrs.is_empty() {
                 let config =
-                    QuicNodeConfig::new(_keypair.clone()).with_limits(_options.quic_limits.clone());
+                    QuicNodeConfig::new(keypair.clone()).with_limits(options.quic_limits.clone());
                 // `listen_on` allows at most one QUIC address per family, which
                 // is what the transport binds: one socket per family.
                 let addresses: Vec<Multiaddr> =
@@ -2224,7 +1732,7 @@ fn bind_transports(
             }
             #[cfg(feature = "tcp")]
             if !want_quic && !tcp_addrs.is_empty() {
-                let transport = bind_tcp_member(_options, _keypair, &tcp_addrs)?;
+                let transport = bind_tcp_member(options, keypair, &tcp_addrs)?;
                 let namespace = transport.namespace();
                 insert_member(&mut set, TransportKind::Tcp, [namespace], transport)?;
             }
@@ -2296,7 +1804,7 @@ fn insert_member<T: minip2p_transport::BlockingTransport + Send + 'static>(
         })
 }
 
-fn build_endpoint(
+pub(crate) fn build_endpoint(
     options: EndpointBuilder,
     keypair: Ed25519Keypair,
     transport: TransportSet,
@@ -2314,158 +1822,159 @@ fn build_endpoint(
     for protocol in options.manual_ack_protocols {
         acks.set_manual(protocol, []);
     }
-    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    #[cfg_attr(
+        not(any(feature = "nat", feature = "pubsub")),
+        expect(unused_mut, reason = "only capabilities add protocols")
+    )]
     let mut protocols = options.protocols;
-    #[cfg(not(any(feature = "nat", feature = "pubsub")))]
-    let protocols = options.protocols;
     #[cfg(feature = "nat")]
     if nat_config.is_some() {
-        for id in [
-            minip2p_nat::DCUTR_PROTOCOL_ID,
-            minip2p_nat::AUTONAT_PROTOCOL_ID,
-        ] {
-            if !protocols.iter().any(|existing| existing == id) {
-                protocols.push(id.to_string());
-            }
-        }
+        protocols.extend(
+            [
+                minip2p_nat::DCUTR_PROTOCOL_ID,
+                minip2p_nat::AUTONAT_PROTOCOL_ID,
+            ]
+            .map(String::from),
+        );
     }
     #[cfg(feature = "pubsub")]
     if options.gossipsub_config.is_some() {
         // Pubsub streams route as ordinary user protocols, and the gossipsub
         // ids must be advertised by Identify from the first handshake.
-        for id in minip2p_pubsub::GOSSIPSUB_PROTOCOL_IDS {
-            if !protocols.iter().any(|existing| existing == id) {
-                protocols.push((*id).to_string());
-            }
+        protocols.extend(
+            minip2p_pubsub::GOSSIPSUB_PROTOCOL_IDS
+                .iter()
+                .map(|id| String::from(*id)),
+        );
+    }
+    let mut registered = Vec::new();
+    for protocol in protocols {
+        if !registered.contains(&protocol) {
+            builder = builder.protocol(protocol.clone());
+            registered.push(protocol);
         }
     }
-    for protocol in protocols {
-        builder = builder.protocol(protocol);
-    }
     #[cfg(feature = "nat")]
-    let transport = minip2p_circuit::CircuitTransport::new_os(transport, keypair.clone());
-    #[cfg(any(feature = "nat", feature = "relay-server"))]
-    let mut swarm = builder.build(transport)?;
-    #[cfg(not(any(feature = "nat", feature = "relay-server")))]
-    let swarm = builder.build(transport)?;
+    let mut transport = minip2p_circuit::CircuitTransport::new_os(transport, keypair.clone());
+    #[cfg(not(feature = "nat"))]
+    let mut transport = transport;
+    let mut poll = SharedPoll::new().map_err(|error| TransportError::PollError {
+        reason: format!("opening the readiness poll: {error}"),
+    })?;
+    poll.attach(&mut transport)
+        .map_err(|error| TransportError::PollError {
+            reason: format!("attaching the transport: {error}"),
+        })?;
+    let resolver = dial::Resolver::new(poll.wake_handle());
+    let core = builder.build_core(transport, StdEntropy::new())?;
+    #[cfg_attr(
+        not(any(
+            feature = "relay-server",
+            feature = "nat",
+            feature = "pubsub",
+            feature = "mdns"
+        )),
+        expect(unused_mut, reason = "only capabilities install drivers")
+    )]
+    let mut engine = Engine::new(
+        core,
+        u64::try_from(options.connect_deadline.as_millis()).unwrap_or(u64::MAX),
+        acks,
+    );
     #[cfg(feature = "relay-server")]
-    if options.relay_server_config.is_some() {
-        let core = swarm.core_mut();
+    if let Some(config) = options.relay_server_config {
+        let core = &mut engine.core;
         core.add_inbound_protocol(RELAY_HOP_PROTOCOL_ID)?;
         core.add_advertised_protocol(RELAY_HOP_PROTOCOL_ID)?;
         core.add_outbound_protocol(RELAY_STOP_PROTOCOL_ID)?;
+        let invalid = |error: &dyn core::fmt::Display| TransportError::InvalidConfig {
+            reason: error.to_string(),
+        };
+        let mut agent =
+            minip2p_relay_server::RelayServerAgent::new(core.local_peer_id().clone(), config)
+                .map_err(|error| invalid(&error))?;
+        agent
+            .replace_announce_addrs(options.relay_server_announce_addrs)
+            .map_err(|error| invalid(&error))?;
+        agent
+            .set_listener_addrs(relay_server::concrete_relay_listener_addrs(
+                core.transport().local_addresses(),
+            ))
+            .map_err(|error| invalid(&error))?;
+        engine.relay_server = Some(relay_server::RelayServerDriver::new(agent));
     }
     #[cfg(feature = "nat")]
-    if nat_config.is_some() {
-        let core = swarm.core_mut();
+    if let Some(config) = nat_config {
+        let core = &mut engine.core;
         core.add_outbound_protocol(minip2p_nat::HOP_PROTOCOL_ID)?;
         core.add_inbound_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
         core.add_advertised_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
-    }
-    #[cfg(feature = "nat")]
-    let nat = nat_config.map(|config| {
         let relay_addrs = config
             .relays
             .iter()
             .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
             .collect();
-        let agent = minip2p_nat::NatAgent::new(swarm.core().local_peer_id().clone(), config);
+        let agent = minip2p_nat::NatAgent::new(core.local_peer_id().clone(), config);
         // Relay and AutoNAT server addresses may name a host; the endpoint
         // resolves those off the driver, like Connection-attempt candidates.
-        NatDriver::new(agent, relay_addrs, minip2p_platform::StdEntropy).park_named_dials()
-    });
-    #[cfg(feature = "relay-server")]
-    let relay_server = options
-        .relay_server_config
-        .map(|config| -> Result<relay_server::RelayServerDriver, Error> {
-            let mut agent = minip2p_relay_server::RelayServerAgent::new(
-                swarm.core().local_peer_id().clone(),
-                config,
-            )
-            .map_err(|error| TransportError::InvalidConfig {
-                reason: error.to_string(),
-            })?;
-            agent
-                .replace_announce_addrs(options.relay_server_announce_addrs)
-                .map_err(|error| TransportError::InvalidConfig {
-                    reason: error.to_string(),
-                })?;
-            agent
-                .set_listener_addrs(concrete_relay_listener_addrs(
-                    swarm.core().transport().local_addresses(),
-                ))
-                .map_err(|error| TransportError::InvalidConfig {
-                    reason: error.to_string(),
-                })?;
-            Ok(relay_server::RelayServerDriver::new(agent))
-        })
-        .transpose()?;
-    #[cfg(feature = "discovery")]
-    let discovery_config = options.discovery_config;
-    #[cfg(feature = "mdns")]
-    let mdns_config = options.mdns_config;
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
-    let peer_discovery_config = options.peer_discovery_config;
+        engine.nat = Some(
+            NatDriver::new(agent, relay_addrs, &mut StdEntropy)
+                .with_circuits(CircuitOps::circuit_transport())
+                .park_named_dials(),
+        );
+    }
     #[cfg(feature = "pubsub")]
-    let gossipsub = options
-        .gossipsub_config
-        .map(|config| -> Result<GossipsubDriver, Error> {
-            // Message ids are (from, seqno); a wall-clock seed keeps restarts
-            // from reusing ids the network may still remember. Mix the local
-            // identity into the peer-selection seed so endpoints created in the
-            // same clock tick do not walk the same deterministic sequence.
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0);
-            let initial_seqno = timestamp as u64;
-            let entropy_seed = keypair
-                .peer_id()
-                .digest_bytes()
-                .iter()
-                .fold(initial_seqno ^ (timestamp >> 64) as u64, |seed, byte| {
-                    seed.rotate_left(5) ^ u64::from(*byte)
-                });
-            let agent = minip2p_pubsub::GossipsubAgent::new(
-                keypair.clone(),
-                config,
-                initial_seqno,
-                entropy_seed,
-            )
-            .map_err(|error| TransportError::InvalidConfig {
-                reason: error.to_string(),
-            })?;
-            Ok(GossipsubDriver::new(agent))
-        })
-        .transpose()?;
-    #[cfg(feature = "discovery")]
-    let mut gossipsub = gossipsub;
-    #[cfg(feature = "discovery")]
-    if let (Some(pubsub), Some(config)) = (gossipsub.as_mut(), discovery_config.as_ref()) {
-        #[expect(
-            clippy::map_err_ignore,
-            reason = "Both agents validate the shared topic before construction, so this exposes a stable invariant."
-        )]
-        pubsub
-            .agent
-            .subscribe(&config.topic, 0)
-            .map_err(|_| Error::Invariant {
-                reason: "validated discovery topic was rejected by pubsub",
-            })?;
+    if let Some(config) = options.gossipsub_config {
+        // Message ids are (from, seqno); a wall-clock seed keeps restarts
+        // from reusing ids the network may still remember. Mix the local
+        // identity into the peer-selection seed so endpoints created in the
+        // same clock tick do not walk the same deterministic sequence.
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let initial_seqno = timestamp as u64;
+        let entropy_seed = keypair
+            .peer_id()
+            .digest_bytes()
+            .iter()
+            .fold(initial_seqno ^ (timestamp >> 64) as u64, |seed, byte| {
+                seed.rotate_left(5) ^ u64::from(*byte)
+            });
+        let agent = minip2p_pubsub::GossipsubAgent::new(
+            keypair.clone(),
+            config,
+            initial_seqno,
+            entropy_seed,
+        )
+        .map_err(|error| TransportError::InvalidConfig {
+            reason: error.to_string(),
+        })?;
+        engine.gossipsub = Some(GossipsubDriver::new(agent));
     }
     #[cfg(feature = "discovery")]
     #[expect(
         clippy::map_err_ignore,
-        reason = "The builder validated this beacon configuration before creating the agent."
+        reason = "Both agents validate the shared topic and beacon before construction, so these expose a stable invariant."
     )]
-    let beacon = match discovery_config {
-        Some(config) => Some(
-            minip2p_discovery::BeaconAgent::new(keypair.public_key(), config).map_err(|_| {
-                Error::Invariant {
-                    reason: "validated beacon configuration was rejected",
-                }
-            })?,
-        ),
+    let beacon = match options.discovery_config {
+        Some(config) => {
+            if let Some(pubsub) = engine.gossipsub.as_mut() {
+                pubsub
+                    .agent
+                    .subscribe(&config.topic, 0)
+                    .map_err(|_| Error::Invariant {
+                        reason: "validated discovery topic was rejected by pubsub",
+                    })?;
+            }
+            Some(
+                minip2p_discovery::BeaconAgent::new(keypair.public_key(), config).map_err(
+                    |_| Error::Invariant {
+                        reason: "validated beacon configuration was rejected",
+                    },
+                )?,
+            )
+        }
         None => None,
     };
     // `mdns` enables the shared driver without `discovery`, so no beacon can
@@ -2473,103 +1982,114 @@ fn build_endpoint(
     #[cfg(all(feature = "pubsub", feature = "mdns", not(feature = "discovery")))]
     let beacon = None;
     #[cfg(feature = "mdns")]
-    let mdns = match mdns_config {
-        Some(config) => {
-            let agent = minip2p_mdns::MdnsAgent::new(
-                keypair.peer_id(),
-                config.clone(),
-                mdns_seed(&keypair),
-            )
-            .map_err(|error| TransportError::InvalidConfig {
-                reason: error.to_string(),
-            })?;
-            let mut sockets = minip2p_mdns::MdnsSockets::new(&config).map_err(|error| {
-                TransportError::ListenFailed {
+    if let Some(config) = options.mdns_config {
+        let agent =
+            minip2p_mdns::MdnsAgent::new(keypair.peer_id(), config.clone(), mdns_seed(&keypair))
+                .map_err(|error| TransportError::InvalidConfig {
                     reason: error.to_string(),
-                }
-            })?;
-            // The sockets only wake the swarm's wait (as `PollNext::Woken`);
-            // the next driver tick reads them. A refresh re-registers what
-            // it rebuilds. (`mdns` implies `nat`, so the swarm is mutable.)
-            swarm.attach_host_source(&mut sockets)?;
-            Some(mdns::MdnsDriver::new(agent, sockets, &config))
-        }
-        None => None,
-    };
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
-    let discovery_enabled = {
-        #[cfg(feature = "discovery")]
-        {
-            beacon.is_some()
-        }
-        #[cfg(not(feature = "discovery"))]
-        {
-            false
-        }
-    } || {
-        #[cfg(feature = "mdns")]
-        {
-            mdns.is_some()
-        }
-        #[cfg(not(feature = "mdns"))]
-        {
-            false
-        }
-    };
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "The shared discovery policy was validated before the endpoint reached this point."
-    )]
-    let discovery = if discovery_enabled {
-        let book =
-            minip2p_discovery::PeerDiscoveryAgent::new(keypair.peer_id(), peer_discovery_config)
-                .map_err(|_| Error::Invariant {
-                    reason: "validated discovery configuration was rejected",
                 })?;
-        Some(DiscoveryDriver::new(
-            book,
-            #[cfg(feature = "pubsub")]
-            beacon,
-        ))
-    } else {
-        None
-    };
-    let resolver = dial::Resolver::new(swarm.wake_handle());
-    Ok(Endpoint {
-        swarm,
-        connect: ConnectEngine::new(
-            u64::try_from(options.connect_deadline.as_millis()).unwrap_or(u64::MAX),
-        ),
-        #[cfg(feature = "relay-server")]
-        relay_server,
-        #[cfg(feature = "nat")]
-        nat,
-        #[cfg(feature = "pubsub")]
-        gossipsub,
-        #[cfg(any(feature = "discovery", feature = "mdns"))]
-        discovery,
+        let mut sockets = minip2p_mdns::MdnsSockets::new(&config).map_err(|error| {
+            TransportError::ListenFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        // The sockets only wake the endpoint's wait; the next batch's mDNS
+        // tick reads them, and a refresh re-registers what it rebuilds.
+        poll.attach_host_source(&mut sockets)
+            .map_err(|error| TransportError::PollError {
+                reason: format!("attaching the mDNS sockets: {error}"),
+            })?;
+        // OS sockets are not the transport's: no second transport poll.
+        engine.set_mdns(
+            minip2p_mdns::MdnsDriver::new(agent, sockets, &config),
+            false,
+        );
+    }
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    {
+        #[cfg(feature = "discovery")]
+        let beacon_enabled = beacon.is_some();
+        #[cfg(not(feature = "discovery"))]
+        let beacon_enabled = false;
         #[cfg(feature = "mdns")]
-        mdns,
-        pending_events: std::collections::VecDeque::new(),
-        acks,
+        let mdns_enabled = engine.has_mdns();
+        #[cfg(not(feature = "mdns"))]
+        let mdns_enabled = false;
+        if beacon_enabled || mdns_enabled {
+            #[expect(
+                clippy::map_err_ignore,
+                reason = "The shared discovery policy was validated before the endpoint reached this point."
+            )]
+            let book = minip2p_discovery::PeerDiscoveryAgent::new(
+                keypair.peer_id(),
+                options.peer_discovery_config,
+            )
+            .map_err(|_| Error::Invariant {
+                reason: "validated discovery configuration was rejected",
+            })?;
+            engine.discovery = Some(DiscoveryDriver::new(
+                book,
+                #[cfg(feature = "pubsub")]
+                beacon,
+            ));
+        }
+    }
+    Ok(Endpoint {
+        engine,
+        clock: StdClock::new(),
         resolver,
         #[cfg(feature = "nat")]
         nat_dials: Vec::new(),
-        #[cfg(any(feature = "nat", feature = "relay-server"))]
-        caller_external_addresses: Vec::new(),
+        poll,
+        #[cfg(all(test, feature = "quic"))]
+        raw_events: std::collections::VecDeque::new(),
     })
 }
 
-#[cfg(feature = "relay-server")]
-fn concrete_relay_listener_addrs(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
-    addrs
-        .into_iter()
-        .filter(|address| {
-            !matches!(address.iter().next(), Some(Protocol::Ip4(ip)) if *ip == [0; 4])
-                && !matches!(address.iter().next(), Some(Protocol::Ip6(ip)) if *ip == [0; 16])
-        })
-        .collect()
+/// Raw swarm access for the crate's own tests, bypassing the engine.
+#[cfg(all(test, feature = "quic"))]
+impl Endpoint {
+    pub(crate) fn core(&self) -> &minip2p_swarm::SwarmCore<EndpointTransport, StdEntropy> {
+        &self.engine.core
+    }
+
+    #[cfg(any(feature = "nat", feature = "tcp"))]
+    pub(crate) fn core_mut(
+        &mut self,
+    ) -> &mut minip2p_swarm::SwarmCore<EndpointTransport, StdEntropy> {
+        &mut self.engine.core
+    }
+
+    /// One swarm poll whose events skip the engine.
+    pub(crate) fn raw_poll(&mut self) -> Result<Vec<crate::SwarmEvent>, Error> {
+        self.harvest(Duration::ZERO)?;
+        let now = self.now();
+        self.engine.core.poll(now)
+    }
+
+    /// The next swarm event within `timeout`, skipping the engine. A poll's
+    /// other events are kept for the next call.
+    pub(crate) fn raw_poll_next(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<crate::SwarmEvent>, Error> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(event) = self.raw_events.pop_front() {
+                return Ok(Some(event));
+            }
+            let polled = self.raw_poll()?;
+            self.raw_events.extend(polled);
+            if self.raw_events.is_empty() {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Ok(None);
+                }
+                let budget = (deadline - now).min(Duration::from_millis(10));
+                self.harvest(budget)?;
+            }
+        }
+    }
 }
 
 /// Test-only convenience over [`Endpoint::wait`]: the next event, or `None`
@@ -2609,6 +2129,11 @@ fn default_agent_version_matches_package_version() {
 #[cfg(all(test, feature = "quic"))]
 mod tests {
     use super::*;
+    #[cfg(feature = "pubsub")]
+    use crate::GossipsubEvent;
+    #[cfg(feature = "nat")]
+    use crate::NatEvent;
+    use crate::SwarmEvent;
     use crate::{ConnectFailure, ConnectOutcome};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2811,7 +2336,7 @@ mod tests {
     }
 
     fn with_lookup(endpoint: &mut Endpoint, lookup: dial::Lookup) {
-        let wake = endpoint.swarm.wake_handle();
+        let wake = endpoint.poll.wake_handle();
         endpoint.resolver = dial::Resolver::with_lookup(move || wake.wake(), lookup);
     }
 
@@ -2847,7 +2372,7 @@ mod tests {
             ConnectOutcome::Connected { .. }
         ));
         assert!(
-            dialer.connect.is_pending(stalled),
+            dialer.engine.connect.is_pending(stalled),
             "the stalled attempt is still waiting on its lookup"
         );
     }
@@ -2929,11 +2454,11 @@ mod tests {
         }
     }
 
-    /// Swarm input and a lookup's wake land in the same batch: the event is
-    /// returned, the wake stays pending behind it, and neither the answer nor
-    /// the event is lost or reported as the caller's interrupt.
+    /// A lookup's wake and an event queued in the same batch both arrive:
+    /// the event is returned first, the wake stays pending behind it, and
+    /// neither is lost or reported as the caller's interrupt.
     #[test]
-    fn a_resolver_wake_and_swarm_input_in_one_batch_both_arrive() {
+    fn a_resolver_wake_and_a_queued_event_in_one_batch_both_arrive() {
         let mut dialer = quic_endpoint();
         let (lookup, started, answer) = stalling_lookup();
         with_lookup(&mut dialer, lookup);
@@ -2949,16 +2474,16 @@ mod tests {
         answer
             .send(Err("NXDOMAIN".to_string()))
             .expect("lookup waiting");
-        // Let the lookup thread queue its answer and wake the swarm.
+        // Let the lookup thread queue its answer and wake the poll.
         std::thread::sleep(Duration::from_millis(100));
         let other = Ed25519Keypair::generate().peer_id();
-        dialer.swarm.preload_poll_events([SwarmEvent::PingTimeout {
+        dialer.engine.events.push_back(EndpointEvent::PingTimeout {
             peer_id: other.clone(),
-        }]);
+        });
 
-        let (mut settled, mut input) = (false, false);
+        let (mut settled, mut queued) = (false, false);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !(settled && input) {
+        while !(settled && queued) {
             match dialer.wait(deadline).expect("wait") {
                 EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
                     connect_id: id,
@@ -2967,10 +2492,10 @@ mod tests {
                 EndpointWaitOutcome::Event(EndpointEvent::PingTimeout { peer_id })
                     if peer_id == other =>
                 {
-                    input = true;
+                    queued = true;
                 }
                 EndpointWaitOutcome::Event(_) => {}
-                other => panic!("lost something: settled {settled}, input {input}: {other:?}"),
+                other => panic!("lost something: settled {settled}, queued {queued}: {other:?}"),
             }
         }
     }
@@ -3463,7 +2988,6 @@ mod tests {
         // Read straight off the bound sockets, so nothing here arms anything:
         // `listen` below is the only call that does.
         let bound = listener
-            .swarm
             .core()
             .transport()
             .local_addresses()
@@ -3566,11 +3090,7 @@ mod tests {
         // The id a raw swarm dial hands back is minted by the transport, so
         // its namespace is what the configuration actually reached -- whether
         // anything answers is beside the point.
-        let id = endpoint
-            .swarm
-            .core_mut()
-            .dial(&target)
-            .expect("the dial starts");
+        let id = endpoint.core_mut().dial(&target).expect("the dial starts");
         assert_eq!(id.namespace(), ConnectionNamespace::TCP_IPV6);
     }
 
@@ -3626,7 +3146,8 @@ mod tests {
             .expect("bind loopback endpoint");
         let peer = Ed25519Keypair::generate().peer_id();
         endpoint
-            .pending_events
+            .engine
+            .events
             .push_back(EndpointEvent::ConnectionClosed {
                 peer_id: peer.clone(),
                 conn_id: ConnectionId::new(1),
@@ -3689,7 +3210,8 @@ mod tests {
         let peer = Ed25519Keypair::generate().peer_id();
         let arrive = |endpoint: &mut Endpoint| {
             endpoint
-                .pending_events
+                .engine
+                .events
                 .push_back(EndpointEvent::ConnectionClosed {
                     peer_id: peer.clone(),
                     conn_id: ConnectionId::new(1),
@@ -3749,7 +3271,8 @@ mod tests {
             .expect("bind loopback endpoint");
         let peer = Ed25519Keypair::generate().peer_id();
         endpoint
-            .pending_events
+            .engine
+            .events
             .push_back(EndpointEvent::ConnectionClosed {
                 peer_id: peer.clone(),
                 conn_id: ConnectionId::new(1),
@@ -3760,7 +3283,7 @@ mod tests {
                 if peer_id == peer
         ));
         assert!(
-            endpoint.pending_events.is_empty(),
+            endpoint.engine.events.is_empty(),
             "Duration::ZERO must drain queued events"
         );
     }
@@ -3897,6 +3420,7 @@ mod tests {
             .bind()
             .expect("bind NAT endpoint");
         endpoint
+            .engine
             .nat
             .as_mut()
             .expect("NAT configured")
@@ -3927,6 +3451,7 @@ mod tests {
             .expect("bind pubsub endpoint");
         let peer = Ed25519Keypair::generate().peer_id();
         endpoint
+            .engine
             .gossipsub
             .as_mut()
             .expect("pubsub configured")
@@ -3958,6 +3483,7 @@ mod tests {
             .expect("bind capability endpoint");
         let peer = Ed25519Keypair::generate().peer_id();
         endpoint
+            .engine
             .gossipsub
             .as_mut()
             .unwrap()
@@ -3966,7 +3492,7 @@ mod tests {
                 peer: peer.clone(),
                 topic: "test".into(),
             });
-        let nat = endpoint.nat.as_mut().unwrap();
+        let nat = endpoint.engine.nat.as_mut().unwrap();
         nat.push_event(NatEvent::FellBackToRelay {
             connect_id: ConnectId::from_u64(99),
             peer: peer.clone(),
@@ -3977,6 +3503,7 @@ mod tests {
             confirmed_addrs: Vec::new(),
         });
         endpoint
+            .engine
             .relay_server
             .as_mut()
             .unwrap()
@@ -4112,7 +3639,8 @@ mod tests {
             build_endpoint(Endpoint::builder(), Ed25519Keypair::generate(), set).expect("build");
         let peer = Ed25519Keypair::generate().peer_id();
         endpoint
-            .pending_events
+            .engine
+            .events
             .push_back(EndpointEvent::ConnectionClosed {
                 peer_id: peer.clone(),
                 conn_id: ConnectionId::new(1),
@@ -4130,61 +3658,6 @@ mod tests {
             )),
             "the queued event must survive the failed poll: {events:?}"
         );
-    }
-
-    /// One transport poll can return several swarm events. `poll` must finish
-    /// each one before the next, the same way `wait` does. Batching the whole
-    /// poll and calling `finish_step` once puts `ConnectSettled` after the
-    /// later swarm event.
-    #[test]
-    fn poll_finishes_each_swarm_event_before_the_next() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        let mut endpoint = Endpoint::builder()
-            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
-            .expect("quic listen address")
-            .bind()
-            .expect("bind endpoint");
-        let peer = Ed25519Keypair::generate().peer_id();
-        let unreachable = PeerAddr::quic_v1(IpAddr::V4(Ipv4Addr::LOCALHOST), 9, peer.clone());
-        let connect_id = endpoint.connect(&unreachable).expect("start connect");
-        endpoint.swarm.preload_poll_events([
-            SwarmEvent::ConnectionEstablished {
-                peer_id: peer.clone(),
-                conn_id: ConnectionId::new(1),
-            },
-            SwarmEvent::PingTimeout {
-                peer_id: peer.clone(),
-            },
-        ]);
-
-        let events = endpoint.poll().expect("poll");
-        let established = events.iter().position(|event| {
-            matches!(
-                event,
-                EndpointEvent::ConnectionEstablished { peer_id, .. } if peer_id == &peer
-            )
-        });
-        let settled = events.iter().position(|event| {
-            matches!(
-                event,
-                EndpointEvent::ConnectSettled { connect_id: id, .. } if *id == connect_id
-            )
-        });
-        let ping = events.iter().position(
-            |event| matches!(event, EndpointEvent::PingTimeout { peer_id } if peer_id == &peer),
-        );
-        match (established, settled, ping) {
-            (Some(established_at), Some(settled_at), Some(ping_at)) => {
-                assert!(
-                    established_at < settled_at && settled_at < ping_at,
-                    "ConnectSettled must follow its ConnectionEstablished and precede the next swarm event: {events:?}"
-                );
-            }
-            _ => panic!(
-                "expected ConnectionEstablished, ConnectSettled, then PingTimeout; got {events:?}"
-            ),
-        }
     }
 
     #[cfg(feature = "nat")]
@@ -4498,7 +3971,7 @@ mod tests {
             .expect("tcp listen address")
             .bind()
             .expect("enabled relay server binds");
-        assert!(endpoint.relay_server.is_some());
+        assert!(endpoint.engine.relay_server.is_some());
 
         let result = Endpoint::builder()
             .relay_server_announce_addrs(announce)
@@ -4589,6 +4062,7 @@ mod tests {
         ));
         assert_eq!(
             endpoint
+                .engine
                 .relay_server
                 .as_ref()
                 .unwrap()
@@ -4600,6 +4074,7 @@ mod tests {
             .set_relay_server_announce_addrs(Vec::new())
             .expect("empty replacement clears override");
         let selected = endpoint
+            .engine
             .relay_server
             .as_ref()
             .unwrap()
@@ -4620,6 +4095,7 @@ mod tests {
             .expect("wildcard listener may host once a usable address source appears");
         assert!(
             endpoint
+                .engine
                 .relay_server
                 .as_ref()
                 .unwrap()
@@ -4639,6 +4115,7 @@ mod tests {
             .bind()
             .expect("bind relay server");
         endpoint
+            .engine
             .relay_server
             .as_mut()
             .unwrap()
@@ -4672,20 +4149,23 @@ mod tests {
         let duplicate: Multiaddr = "/ip4/203.0.113.2/udp/4002/quic-v1".parse().unwrap();
         let relay_only: Multiaddr = "/ip4/203.0.113.3/udp/4003/quic-v1".parse().unwrap();
         endpoint
+            .engine
             .nat
             .as_mut()
             .unwrap()
             .set_test_public_addrs(vec![nat_only.clone(), duplicate.clone()]);
         endpoint
+            .engine
             .relay_server
             .as_mut()
             .unwrap()
             .agent
             .replace_announce_addrs(vec![duplicate.clone(), relay_only.clone()])
             .unwrap();
-        endpoint.refresh_external_address_contributions();
-        endpoint.swarm.poll().expect("refresh identify snapshot");
-        let advertised = endpoint.swarm.core().local_addresses();
+        // One batch merges the contributions; the next advertises them.
+        endpoint.poll().expect("merge address contributions");
+        endpoint.poll().expect("refresh identify snapshot");
+        let advertised = endpoint.core().local_addresses();
         let nat_index = advertised
             .iter()
             .position(|addr| addr == &nat_only)
@@ -4718,9 +4198,9 @@ mod tests {
         endpoint
             .set_relay_server_announce_addrs(vec![relay_owned.clone()])
             .expect("replace relay addresses");
-        endpoint.swarm.poll().expect("refresh identify snapshot");
+        endpoint.raw_poll().expect("refresh identify snapshot");
 
-        let advertised = endpoint.swarm.core().local_addresses();
+        let advertised = endpoint.core().local_addresses();
         assert!(advertised.contains(&caller_owned));
         assert!(advertised.contains(&relay_owned));
     }
@@ -4743,9 +4223,9 @@ mod tests {
         endpoint
             .set_relay_server_announce_addrs(Vec::new())
             .expect("clear relay contribution");
-        endpoint.swarm.poll().expect("refresh identify snapshot");
+        endpoint.raw_poll().expect("refresh identify snapshot");
 
-        assert!(endpoint.swarm.core().local_addresses().contains(&shared));
+        assert!(endpoint.core().local_addresses().contains(&shared));
     }
 
     #[test]
@@ -4796,11 +4276,7 @@ mod tests {
                 break;
             }
         }
-        let conn_out = writer
-            .swarm
-            .core()
-            .connection_id(&reader_peer)
-            .expect("conn");
+        let conn_out = writer.core().connection_id(&reader_peer).expect("conn");
         writer
             .send_stream(&reader_peer, conn_out, out_stream, vec![1, 2, 3])
             .expect("send");
@@ -4809,18 +4285,19 @@ mod tests {
             .expect("writer close");
         writer.next_event(tick).expect("flush writer");
 
-        // Stage what a `wait` cut short leaves behind: the step's data in the
-        // Endpoint queue, its close still in the swarm's. Data and FIN may
-        // arrive separately, so pull until the close and then queue it back.
+        // Stage what a `wait` cut short leaves behind: the batch's data and
+        // its close still in the Endpoint queue, the close already gone from
+        // the swarm. Data and FIN may arrive separately, so pull until the
+        // close.
         loop {
             assert!(std::time::Instant::now() < give_up, "stream never closed");
             writer.next_event(tick).expect("drive writer");
-            match reader.swarm.poll_next(tick).expect("poll reader") {
+            match reader.raw_poll_next(tick).expect("poll reader") {
                 Some(event @ SwarmEvent::StreamData { stream_id, .. }) if stream_id == stream => {
-                    reader.pending_events.push_back(event.into());
+                    reader.engine.events.push_back(event.into());
                 }
                 Some(event @ SwarmEvent::StreamClosed { stream_id, .. }) if stream_id == stream => {
-                    reader.swarm.preload_poll_events([event]);
+                    reader.engine.events.push_back(event.into());
                     break;
                 }
                 _ => {}

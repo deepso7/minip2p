@@ -65,13 +65,13 @@ loop {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Every std `Endpoint` dial goes through `connect` and its attempt policy. Portable endpoints can still make a raw Transport dial, which bypasses that policy, with `endpoint.core_mut().dial(..)`.
+Every dial goes through `connect` and its attempt policy, on the std and the portable endpoint alike.
 
 `set_external_addresses` replaces the externally validated addresses advertised through Identify alongside the bound ones; NAT and relay-server contributions are kept and merged after them.
 
 ## Portable endpoint
 
-Disable default features for `no_std + alloc`, then provide identity, entropy, and a concrete transport explicitly:
+There are two endpoint types over one engine: the std `Endpoint` above, and `PortableEndpoint<T, E>`, which runs over any `Transport` with no clock, sockets, or executor. Both drive the same batches and emit the same event stream in the same order (see the event loop section below). Disable default features for `no_std + alloc`, then provide identity, entropy, and a transport explicitly:
 
 ```rust,ignore
 let mut endpoint = minip2p::Endpoint::portable(&identity, entropy)
@@ -83,19 +83,36 @@ let events = endpoint.poll(now)?;
 let deadline = endpoint.next_deadline(now);
 ```
 
-The portable endpoint supports listening, Connection attempts, ping, Identify inspection, custom streams, state statistics, and consuming `shutdown(now)`. Every operation that advances protocol work uses a caller-provided `Now`, so the host controls time consistently.
+The portable endpoint supports listening, Connection attempts, ping, Identify inspection, custom streams (`add_protocol` registers one after build), state statistics, and consuming `shutdown(now)`. Every operation that advances protocol work uses a caller-provided `Now`, so the host controls time consistently. There is no access to the raw swarm: every dial goes through `connect`.
 
-For an embedded TCP endpoint, enable `smoltcp` with default features disabled and build the endpoint over a `TcpTransport<SmoltcpTcpProvider<_>, _>`. The host owns the smoltcp device and interface; minip2p owns the TCP, Noise XX, Yamux, Identify, Ping, and application-protocol state above them:
+### Capabilities
+
+`PortableEndpointBuilder` configures each capability behind its own Cargo feature, over any transport; none of them needs smoltcp:
+
+| Feature | Builder setters |
+| --- | --- |
+| `pubsub` | `.gossipsub()`, `.gossipsub_config(..)`; with `portable-mdns` also signed `.discovery()` and `.beacon_config(..)` |
+| `portable-mdns` | `.mdns(io, config)` over any caller-owned `MdnsIo`, `.peer_discovery_config(..)` |
+| `portable-autonat` | `.autonat(server)`, `.nat_config(..)` |
+| `portable-relay` | `.relay(addr)`; includes `portable-autonat` |
+
+`.mdns(io, config)` takes the carrier by value and stores it as a `Box<dyn MdnsIo>`, so it must be `'static`; keep a handle to whatever it runs on to reconfigure it later. The mDNS seed comes from the builder's entropy. The endpoint polls the transport again after each mDNS tick, since a carrier may share the transport's stack.
+
+Relay paths turn a relay bridge into a connection, which takes circuit operations from the transport. `build(transport)` works over any transport and rejects relay configuration with an error saying so; wrap the transport in a `CircuitTransport` and call `build_with_circuits(transport)` to run relays. AutoNAT alone needs nothing from the transport. Portable relay configurations must set `force_relay`: portable endpoints do not run DCUtR.
+
+### smoltcp
+
+For an embedded TCP endpoint, enable `smoltcp` with default features disabled. The host owns the smoltcp device and interface; minip2p owns the TCP, Noise XX, Yamux, Identify, Ping, and application-protocol state above them:
 
 ```bash
 cargo add minip2p-rs --no-default-features --features smoltcp,pubsub
 ```
 
-The portable smoltcp builder can compose TCP, pubsub, signed-beacon discovery, and mDNS into one endpoint. Build one `SmoltcpStack` from the device and configured interface, then select the services needed by the application. TCP and portable mDNS are supplied by `smoltcp`; the separate `pubsub` feature enables `.gossipsub()` and signed `.discovery()`, which itself implies pubsub at runtime:
+`.smoltcp(stack)` turns the builder into a `SmoltcpEndpointBuilder` that installs TCP (and mDNS, when asked) on one shared `SmoltcpStack` and builds an ordinary `PortableEndpoint` over a `SmoltcpTransport`. TCP and mDNS on the stack come with `smoltcp`; `pubsub` adds `.gossipsub()` and signed `.discovery()`:
 
 ```rust,ignore
 let mut endpoint = Endpoint::portable(&identity, entropy)
-    .smoltcp(stack)
+    .smoltcp(stack.clone())
     .listen("/ip4/0.0.0.0/tcp/4001")
     .mdns()
     .discovery()
@@ -103,7 +120,7 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
     .build()?;
 ```
 
-Use `tcp_config`, `smoltcp_config`, `mdns_config`, `mdns_carrier_config`, `gossipsub_config`, `beacon_config`, and `discovery_config` only when overriding defaults. The endpoint installs every adapter on the same stack, returns TCP, NAT, pubsub, and discovery progress as `EndpointEvent` values (`EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, `EndpointEvent::Discovery`), and automatically dials newly observed peers. `poll(now)` advances all enabled services and `next_deadline(now)` folds their timelines. Manual provider composition remains available through `build(transport)`.
+Use `tcp_config`, `smoltcp_config`, `mdns_config`, `mdns_carrier_config`, `gossipsub_config`, `beacon_config`, and `peer_discovery_config` only when overriding defaults. Keep a cloned `SmoltcpStack` to reconfigure the interface later: a wildcard listener follows the interface's addresses, and Identify advertises a changed address without another `listen`. `poll(now)` advances every enabled service and `next_deadline(now)` folds their timelines.
 
 Portable AutoNAT is opt-in, and does not pull circuit transport state into an AutoNAT-only binary. Enable `portable-autonat`, configure one or more trusted servers, and read the latest verdict from the same caller-driven endpoint:
 
@@ -123,7 +140,7 @@ let reachability = endpoint.reachability();
 
 Once at least one TCP listen address exists, the first due `poll(now)` starts a probe by dialing the configured server. Successful exchanges emit `EndpointEvent::Nat(NatEvent::ReachabilityChanged { .. })` after the configured confidence threshold is met; `reachability()` then returns that same settled verdict. Until a server exchange succeeds, it remains `Unknown`.
 
-Portable relay circuits remain a separate opt-in. Enable `portable-relay` (which includes `portable-autonat` and `smoltcp`), configure a relay, and drive connection progress through the same endpoint:
+With `smoltcp` and `portable-relay`, the smoltcp builder wraps its TCP transport in a `CircuitTransport` itself, so a relay just works:
 
 ```rust,ignore
 let mut endpoint = Endpoint::portable(&identity, entropy)
@@ -139,7 +156,7 @@ while endpoint.path(&remote_peer).is_none() {
 }
 ```
 
-`.relay()` selects a relay-only path and does not reserve inbound capacity. Use `.nat_config(...)` to combine AutoNAT servers with relay policy, and `ReservationPolicy::Always` for a device that must remain reachable through the relay. Raw-UDP DCUtR actions are not run by the TCP-only portable endpoint.
+`.relay()` selects a relay-only path and does not reserve inbound capacity. Use `.nat_config(...)` to combine AutoNAT servers with relay policy, and `ReservationPolicy::Always` for a device that must remain reachable through the relay.
 
 ## Transports
 
@@ -164,7 +181,7 @@ With the `nat` feature, an endpoint holding a QUIC relay reservation sends a pin
 
 `minip2p::Error` preserves transport failures, Sans-I/O state rejections, and driver-invariant failures as separate variants. Resource limits are configurable through `EndpointBuilder::quic_limits` and `EndpointBuilder::tcp_config`.
 
-Prefer `Endpoint::wait` for the ordered Endpoint event stream: it returns an event, deadline, or interruption without swallowing interrupts. `EndpointEvent` is `#[non_exhaustive]` and carries enabled capability output — `Nat`, `Gossipsub`, `Discovery`, `RelayServer` — so one `wait` loop sees every event exactly once for every feature combination. `poll()` is the non-blocking drain of the same stream. Within one Endpoint step, swarm events come first, then capability events in relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt terminals (`ConnectSettled`); no order is promised between concurrently racing Transport candidates. NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) never appear: the outcome is `ConnectSettled`. A `PathUpgraded` can still follow its attempt's `ConnectSettled` when the attempt settled on a provisional Relayed path.
+Prefer `Endpoint::wait` for the ordered Endpoint event stream: it returns an event, deadline, or interruption without swallowing interrupts. `EndpointEvent` is `#[non_exhaustive]` and carries enabled capability output — `Nat`, `Gossipsub`, `Discovery`, `RelayServer` — so one `wait` loop sees every event exactly once for every feature combination. `poll()` is the non-blocking drain of the same stream. Both endpoint types work in drive batches: one bounded batch of swarm events, one capability pass, then Connection-attempt terminals. `wait` runs one batch and hands its events out one per call; `poll` returns the whole batch. Within a batch the batch's swarm events come first, then capability events in relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt terminals (`ConnectSettled`). A `ConnectSettled` follows the `ConnectionEstablished` it reports, but other lifecycle events from the same batch (`PeerReady`, `ConnectionReplaced`, `ConnectionClosed`) may come before it too. No order is promised between concurrently racing Transport candidates. NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) never appear: the outcome is `ConnectSettled`. A `PathUpgraded` can still follow its attempt's `ConnectSettled` when the attempt settled on a provisional Relayed path.
 
 ```rust,ignore
 use std::time::Duration;
@@ -183,7 +200,7 @@ loop {
 
 State snapshot getters (`path`, `connected_peers`, `is_peer_ready`, `peer_readiness`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`, `reachability`, `active_reservation`, `known_peers`) expose durable state without driving the endpoint; they are not one cross-getter atomic snapshot and may be ahead of the event stream, never behind their own emitted transition. Prefer `connect` plus `ConnectSettled` for a Connection attempt. `wait` and `poll` use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. Deadlines accept an `Instant` (absolute), a `Duration` (relative), or `minip2p::Deadline::NEVER`. A deadline that has already passed, whether a stale `Instant` or `Duration::ZERO`, makes `wait` return a queued event or drive the endpoint once without sleeping, so a stale timer never stalls it. The deadline bounds blocking, not delivery: with a strict operation timeout, check the clock before each `wait`, as in the loop above.
 
-Background drivers can clone `Endpoint::wait_handle()` — the swarm's `WaitHandle` — and interrupt a blocked `wait` from another thread. The wake is reported as `EndpointWaitOutcome::Interrupted`; interrupts sent before one is reported coalesce into one, and a pending one is reported even by a `wait` whose deadline has passed. Every transport and mDNS socket is registered with the swarm's one readiness poll, so an idle `wait` sleeps until input or a real timer, with no fixed cadence.
+Background drivers can clone `Endpoint::wait_handle()` — the `WaitHandle` of its readiness poll — and interrupt a blocked `wait` from another thread. The wake is reported as `EndpointWaitOutcome::Interrupted`; interrupts sent before one is reported coalesce into one, and a pending one is reported even by a `wait` whose deadline has passed. Every transport and mDNS socket is registered with the endpoint's one readiness poll, so an idle `wait` sleeps until input or a real timer, with no fixed cadence.
 
 `open_stream` is allowed once the peer is connected. Identify (`PeerReady`) supplies advertised protocols and enables early `RemoteDoesNotSupport` rejects; waiting for it before opening a known application protocol is optional policy, not a stack requirement. Every open ends in exactly one terminal: `StreamReady`, or an `Error` event naming the stream (a `SwarmErrorKind`) when negotiation fails, the peer closes the stream first, or `OUTBOUND_NEGOTIATION_TIMEOUT_MS` passes; a closed or replaced connection ends it with its own event.
 
@@ -236,7 +253,7 @@ Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see `minip2p::RES
 
 ## Benchmarks
 
-`benches/endpoint_e2e.rs` times connection setup, ping, echo, and transfer over QUIC and TCP. `benches/endpoint_idle.rs` measures what an idle endpoint with no peers costs: blocking waits on the swarm's shared poll per second and process CPU milliseconds per second, for QUIC alone, for QUIC + TCP with the relay server, Gossipsub, and mDNS started, and for the same without mDNS. It needs the `bench` feature, which compiles in the wait counters from `minip2p_transport::bench` and is off by default:
+`benches/endpoint_e2e.rs` times connection setup, ping, echo, and transfer over QUIC and TCP. `benches/endpoint_idle.rs` measures what an idle endpoint with no peers costs: blocking waits on the endpoint's shared poll per second and process CPU milliseconds per second, for QUIC alone, for QUIC + TCP with the relay server, Gossipsub, and mDNS started, and for the same without mDNS. It needs the `bench` feature, which compiles in the wait counters from `minip2p_transport::bench` and is off by default:
 
 ```bash
 cargo bench -p minip2p-rs --features tcp,relay-server,pubsub,mdns,bench --bench endpoint_idle

@@ -35,6 +35,8 @@ Four details matter:
 - **Report what you wrote, never more.** The driver's buffer is one byte longer than the largest datagram mDNS will act on, so filling it is how truncation is recognised; capping a read at some smaller length of your own would hand over a truncated claim wearing a plausible length.
 - **A full send buffer is `Congested`, not a failure.** The driver sends up to 128 datagrams a turn, so a burst can outrun a queue that drains only when the stack is driven. Saying so parks the datagram until the next turn; reporting a general failure instead ends mDNS for good over a moment's backpressure. A datagram the buffer could never hold is `Oversized` rather than `Congested`, and the driver drops it: draining cannot make room that does not exist, so parking it would retry the same impossible send forever.
 
+A `Box<I>` of any carrier (`Box<dyn MdnsIo>` included) is itself an `MdnsIo` that forwards all six operations, so a host can store a carrier without naming its type and an embedded stack behind the box is still driven.
+
 `poll` defaults to doing nothing, which is right for a socket an operating system services. A stack running in this process needs it: the driver calls it before reading, after writing, and once more before releasing the carrier at shutdown — that last one is what gets the goodbyes onto the wire.
 
 A claim carries whatever the host listens on — `/quic-v1`, `/tcp`, or a circuit through a relay — because a device with no operating system has only the first of those, and mDNS that could not say so would find peers on the link and leave them no way back.

@@ -35,6 +35,8 @@ minip2p-rs|default|nat,portable-mdns
 minip2p-rs|no-default|portable-autonat
 minip2p-rs|no-default|portable-relay
 minip2p-rs|no-default|portable-relay,pubsub
+minip2p-rs|no-default|portable-mdns,pubsub
+minip2p-rs|no-default|smoltcp,portable-relay,pubsub
 minip2p-rs|default|nat,portable-relay,pubsub
 minip2p-tcp|default|smoltcp
 minip2p-mdns|default|smoltcp

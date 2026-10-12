@@ -389,9 +389,12 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         // that batch on its own.
         //
         // No deadline of our own: the wait already wakes for every timer the
-        // endpoint's transports, protocols and agents report (mDNS's socket
-        // polling included), and every command, query and `stop` interrupts
-        // it. An idle driver therefore sleeps until something is due.
+        // endpoint's transports, protocols and agents report, and for input
+        // on any socket registered with its readiness poll (mDNS included).
+        // Every command, query and `stop` interrupts it; interrupts sent
+        // before one is reported coalesce into one, so a burst of commands
+        // costs one wake and the queue is drained below. An idle driver
+        // therefore sleeps until something is due.
         let mut batch = Vec::new();
         let mut interrupted = false;
         match endpoint.wait(Deadline::NEVER)? {

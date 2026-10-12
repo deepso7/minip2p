@@ -35,20 +35,22 @@ std = [
 ]
 quic = ["std", "dep:minip2p-quic"]
 tcp = ["dep:minip2p-tcp"]
+# Adapter: TCP over a host-owned smoltcp stack, with mDNS on the same stack.
 smoltcp = [
   "tcp",
   "portable-mdns",
   "minip2p-tcp/smoltcp",
   "minip2p-mdns/smoltcp",
 ]
-portable-mdns = ["dep:minip2p-mdns", "_discovery-driver"]
-portable-autonat = ["smoltcp", "_nat-driver"]
+# Portable capabilities: each compiles `no_std` over any `Transport`.
+portable-mdns = ["_mdns-driver"]
+portable-autonat = ["_nat-driver"]
 portable-relay = ["portable-autonat", "_circuit-driver"]
 nat = ["std", "_circuit-driver", "_nat-driver"]
 relay-server = ["std", "dep:minip2p-relay-server"]
 pubsub = ["dep:minip2p-pubsub"]
 discovery = ["nat", "pubsub", "_discovery-driver"]
-mdns = ["nat", "dep:minip2p-mdns", "_discovery-driver"]
+mdns = ["nat", "_mdns-driver"]
 # Bench-only counters, off by default and compiled out when off:
 # shared-poll wait counters (`minip2p_transport::bench`), read by the
 # `endpoint_idle` bench, and QUIC datagram counters (`minip2p-quic`'s
@@ -58,6 +60,7 @@ bench = ["std", "minip2p-transport/bench", "minip2p-quic?/diagnostics"]
 # the public features above; not a supported opt-in surface.
 _circuit-driver = ["dep:minip2p-circuit"]
 _discovery-driver = ["dep:minip2p-discovery"]
+_mdns-driver = ["dep:minip2p-mdns", "_discovery-driver"]
 _nat-driver = ["dep:minip2p-nat"]
 
 [dependencies]

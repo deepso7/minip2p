@@ -196,6 +196,17 @@ impl FrameExchange {
     pub fn buffered(&self) -> &[u8] {
         &self.recv
     }
+
+    /// Takes the bytes received but not yet consumed, leaving the receive
+    /// buffer empty.
+    ///
+    /// For a protocol whose stream stops carrying frames after the exchange —
+    /// a relay circuit that becomes bridged, a hole punch that hands the
+    /// stream to the application — the bytes behind the last frame are no
+    /// longer the exchange's.
+    pub fn take_buffered(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.recv)
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +326,8 @@ mod tests {
             .expect("a maximal frame plus trailing bytes");
         assert_eq!(ex.next_frame(identity).unwrap().unwrap().len(), MAX);
         assert_eq!(ex.buffered(), b"pipelined");
+        assert_eq!(ex.take_buffered(), b"pipelined");
+        assert!(ex.buffered().is_empty());
     }
 
     #[test]

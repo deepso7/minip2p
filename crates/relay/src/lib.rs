@@ -26,10 +26,11 @@ mod server;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use minip2p_core::{FrameExchange, FrameFault};
+
 pub use client::{
-    ConnectOutcome, HopConnect, HopConnectInput, HopConnectOutput, HopReservation,
-    HopReservationInput, HopReservationOutput, ReservationOutcome, StopConnectRequest,
-    StopResponder, StopResponderInput, StopResponderOutput,
+    ConnectOutcome, HopConnect, HopConnectOutput, HopReservation, HopReservationOutput,
+    ReservationOutcome, StopConnectRequest, StopResponder, StopResponderOutput,
 };
 pub(crate) use message::describe_status;
 pub use message::{
@@ -37,8 +38,8 @@ pub use message::{
     StopMessage, StopMessageType, decode_frame, encode_frame,
 };
 pub use server::{
-    HopRequest, HopResponder, HopResponderInput, HopResponderOutput, StopInitiator,
-    StopInitiatorInput, StopInitiatorOutcome, StopInitiatorOutput,
+    HopRequest, HopResponder, HopResponderOutput, StopInitiator, StopInitiatorOutcome,
+    StopInitiatorOutput,
 };
 
 /// Protocol ID for the HOP subprotocol (client ↔ relay).
@@ -90,14 +91,35 @@ pub enum RelayError {
     PendingBridgeTooLarge { len: usize },
 }
 
-/// Longest length prefix a legal frame can carry.
-pub(crate) const MAX_FRAME_PREFIX_LEN: usize = 2;
-
-pub(crate) fn enforce_max_size(buf: &[u8]) -> Result<(), RelayError> {
-    if buf.len() > MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN {
-        return Err(RelayError::MessageTooLarge { len: buf.len() });
+impl From<FrameFault> for RelayError {
+    fn from(fault: FrameFault) -> Self {
+        match fault {
+            FrameFault::TooLarge { len, .. } => Self::FrameTooLarge { len },
+            FrameFault::Overflow { len, .. } => Self::MessageTooLarge { len },
+            FrameFault::Wire(e) => Self::Malformed(e.into()),
+        }
     }
-    Ok(())
+}
+
+/// The frame exchange every relay machine reads its handshake through.
+///
+/// Bytes behind the handshake frame are not the exchange's to bound: once
+/// the circuit is established they are bridged traffic, which streams
+/// without the control-frame limit, and the server roles cap what they hold
+/// before a decision with [`MAX_PENDING_BRIDGE_SIZE`] themselves. Every
+/// machine decodes as soon as it buffers, so the receive buffer never holds
+/// more than one incomplete frame plus the read that completes it.
+pub(crate) fn handshake_frames() -> FrameExchange {
+    FrameExchange::with_trailing(MAX_MESSAGE_SIZE, usize::MAX)
+}
+
+/// Queues an outbound control frame, refusing a payload over
+/// [`MAX_MESSAGE_SIZE`] as [`RelayError::MessageTooLarge`].
+pub(crate) fn queue_control(frames: &mut FrameExchange, payload: &[u8]) -> Result<(), RelayError> {
+    frames.queue(payload).map_err(|fault| match fault {
+        FrameFault::TooLarge { .. } => RelayError::MessageTooLarge { len: payload.len() },
+        other => other.into(),
+    })
 }
 
 pub(crate) fn checked_outbound_frame(payload: &[u8]) -> Result<Vec<u8>, RelayError> {

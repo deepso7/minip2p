@@ -970,6 +970,10 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         self.provider.local_addresses()
     }
 
+    fn local_addresses_revision(&self) -> Option<u64> {
+        self.provider.local_addresses_revision()
+    }
+
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         self.connections
             .values()

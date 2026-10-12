@@ -36,6 +36,8 @@ check-nostd:
     cargo check --no-default-features --features portable-autonat --target thumbv7em-none-eabi -p minip2p-rs
     cargo check --no-default-features --features portable-relay --target thumbv7em-none-eabi -p minip2p-rs
     cargo check --no-default-features --features portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
+    cargo check --no-default-features --features portable-mdns,pubsub,portable-relay --target thumbv7em-none-eabi -p minip2p-rs
+    cargo check --no-default-features --features smoltcp,portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
 
 peer-ping:
     cargo test -p minip2p-peer --test ping
@@ -58,6 +60,7 @@ docs:
     cargo doc -p minip2p-rs --no-default-features --features smoltcp,pubsub --no-deps
     cargo doc -p minip2p-rs --no-default-features --features portable-autonat --no-deps
     cargo doc -p minip2p-rs --no-default-features --features portable-relay --no-deps
+    cargo doc -p minip2p-rs --no-default-features --features smoltcp,portable-relay,pubsub --no-deps
 
 package-check:
     # Every published workspace package declares and actually ships its README.

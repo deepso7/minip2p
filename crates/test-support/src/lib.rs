@@ -439,6 +439,11 @@ impl Transport for InMemoryTransport {
         vec![self.local_addr.clone()]
     }
 
+    /// The pair's addresses are fixed at construction.
+    fn local_addresses_revision(&self) -> Option<u64> {
+        Some(0)
+    }
+
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         if self.side == LinkSide::Second && self.shared.borrow().active {
             vec![self.remote_addr.clone()]

@@ -10,11 +10,9 @@ extern crate alloc;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use minip2p_core::PeerId;
-use minip2p_core::SansIoProtocol;
 use minip2p_transport::StreamId;
 use thiserror::Error;
 
@@ -106,58 +104,7 @@ pub enum PingEvent {
     },
 }
 
-/// Inputs accepted by [`PingProtocol`] when driven through
-/// [`SansIoProtocol`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PingInput {
-    /// Register a negotiated outbound ping stream.
-    RegisterOutboundStream {
-        peer_id: PeerId,
-        stream_id: StreamId,
-    },
-    /// Register a negotiated inbound ping stream.
-    RegisterInboundStream {
-        peer_id: PeerId,
-        stream_id: StreamId,
-    },
-    /// Send one ping payload on the outbound stream.
-    SendPing {
-        peer_id: PeerId,
-        payload: [u8; PING_PAYLOAD_LEN],
-        now_ms: u64,
-    },
-    /// Close the write side of the outbound ping stream.
-    CloseOutboundStreamWrite { peer_id: PeerId },
-    /// Received stream data.
-    StreamData {
-        peer_id: PeerId,
-        stream_id: StreamId,
-        data: Vec<u8>,
-        now_ms: u64,
-    },
-    /// The remote closed its write side.
-    StreamRemoteWriteClosed {
-        peer_id: PeerId,
-        stream_id: StreamId,
-    },
-    /// The stream fully closed.
-    StreamClosed {
-        peer_id: PeerId,
-        stream_id: StreamId,
-    },
-    /// Remove all state for a peer.
-    RemovePeer { peer_id: PeerId },
-    /// Move all peer-scoped state from an old id to a verified id.
-    MigratePeer {
-        old_peer_id: PeerId,
-        new_peer_id: PeerId,
-    },
-    /// Time advanced.
-    Tick { now_ms: u64 },
-}
-
-/// Outputs produced by [`PingProtocol`] when driven through
-/// [`SansIoProtocol`].
+/// Outputs produced by [`PingProtocol::poll_output`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PingOutput {
     /// Command the host must execute.
@@ -211,9 +158,9 @@ struct PeerPingState {
 pub struct PingProtocol {
     /// Per-peer protocol state.
     peers: BTreeMap<PeerId, PeerPingState>,
-    /// Events buffered until the next `SansIoProtocol::poll_output` call.
+    /// Events buffered for [`PingProtocol::poll_output`].
     pending_events: VecDeque<PingEvent>,
-    /// Actions buffered for [`SansIoProtocol::poll_output`].
+    /// Actions buffered for [`PingProtocol::poll_output`].
     pending_actions: VecDeque<PingAction>,
     /// Protocol configuration.
     config: PingConfig,
@@ -237,7 +184,7 @@ impl PingProtocol {
     }
 
     /// Registers a negotiated outbound stream for a peer.
-    fn register_outbound_stream(
+    pub fn register_outbound_stream(
         &mut self,
         peer_id: PeerId,
         stream_id: StreamId,
@@ -281,10 +228,10 @@ impl PingProtocol {
     }
 
     /// Registers a negotiated inbound stream from a peer.
-    fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) -> Vec<PingAction> {
+    pub fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) {
         let peer = self.peers.entry(peer_id.clone()).or_default();
         if peer.inbound_streams.contains(&stream_id) {
-            return Vec::new();
+            return;
         }
 
         if peer.inbound_streams.len() >= MAX_INBOUND_STREAMS {
@@ -295,22 +242,23 @@ impl PingProtocol {
                     limit: MAX_INBOUND_STREAMS,
                 });
 
-            return vec![PingAction::ResetStream { peer_id, stream_id }];
+            self.pending_actions
+                .push_back(PingAction::ResetStream { peer_id, stream_id });
+            return;
         }
 
         peer.inbound_streams.insert(stream_id);
         self.pending_events
             .push_back(PingEvent::InboundStreamAccepted { peer_id, stream_id });
-        Vec::new()
     }
 
-    /// Sends a ping with the given 32-byte payload. Returns the action to execute.
-    fn send_ping(
+    /// Sends a ping with the given 32-byte payload, queuing the send action.
+    pub fn send_ping(
         &mut self,
         peer_id: &PeerId,
         payload: &[u8],
         now_ms: u64,
-    ) -> Result<PingAction, PingError> {
+    ) -> Result<(), PingError> {
         if payload.len() != PING_PAYLOAD_LEN {
             return Err(PingError::InvalidPayloadLength {
                 actual: payload.len(),
@@ -343,15 +291,16 @@ impl PingProtocol {
             sent_at_ms: now_ms,
         });
 
-        Ok(PingAction::Send {
+        self.pending_actions.push_back(PingAction::Send {
             peer_id: peer_id.clone(),
             stream_id,
             data: frame,
-        })
+        });
+        Ok(())
     }
 
     /// Half-closes the outbound stream. Fails if a ping is in flight.
-    fn close_outbound_stream_write(&mut self, peer_id: &PeerId) -> Result<PingAction, PingError> {
+    pub fn close_outbound_stream_write(&mut self, peer_id: &PeerId) -> Result<(), PingError> {
         let peer = self
             .peers
             .get_mut(peer_id)
@@ -371,20 +320,22 @@ impl PingProtocol {
             });
         }
 
-        Ok(PingAction::CloseStreamWrite {
-            peer_id: peer_id.clone(),
-            stream_id,
-        })
+        self.pending_actions
+            .push_back(PingAction::CloseStreamWrite {
+                peer_id: peer_id.clone(),
+                stream_id,
+            });
+        Ok(())
     }
 
-    /// Feeds received stream data into the protocol. Returns actions to execute.
-    fn on_stream_data(
+    /// Feeds received stream data into the protocol, queuing any actions.
+    pub fn on_stream_data(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
         data: &[u8],
         now_ms: u64,
-    ) -> Vec<PingAction> {
+    ) {
         // Check stream is known, collecting info before mutating.
         let is_known = self.peers.get(peer_id).is_some_and(|p| {
             p.outbound_stream == Some(stream_id) || p.inbound_streams.contains(&stream_id)
@@ -430,7 +381,7 @@ impl PingProtocol {
         }
 
         if buf_len < PING_PAYLOAD_LEN {
-            return Vec::new();
+            return;
         }
 
         // Exactly PING_PAYLOAD_LEN bytes -- extract payload and drop the buffer.
@@ -471,7 +422,7 @@ impl PingProtocol {
         stream_id: StreamId,
         payload: [u8; PING_PAYLOAD_LEN],
         now_ms: u64,
-    ) -> Vec<PingAction> {
+    ) {
         let peer = self.peers.get_mut(peer_id).expect("peer exists");
 
         if peer.outbound_stream == Some(stream_id) {
@@ -497,33 +448,27 @@ impl PingProtocol {
                 stream_id,
                 rtt_ms,
             });
-            return Vec::new();
+            return;
         }
 
         if peer.inbound_streams.contains(&stream_id) {
-            return vec![PingAction::Send {
+            self.pending_actions.push_back(PingAction::Send {
                 peer_id: peer_id.clone(),
                 stream_id,
                 data: payload,
-            }];
+            });
         }
-
-        Vec::new()
     }
 
     /// Notifies the protocol that the remote peer closed its write side.
-    fn on_stream_remote_write_closed(
-        &mut self,
-        peer_id: &PeerId,
-        stream_id: StreamId,
-    ) -> Vec<PingAction> {
+    pub fn on_stream_remote_write_closed(&mut self, peer_id: &PeerId, stream_id: StreamId) {
         let Some(peer) = self.peers.get_mut(peer_id) else {
-            return Vec::new();
+            return;
         };
 
         if peer.inbound_streams.remove(&stream_id) {
             peer.recv_bufs.remove(&stream_id);
-            return Vec::new();
+            return;
         }
 
         if peer.outbound_stream == Some(stream_id) {
@@ -546,14 +491,11 @@ impl PingProtocol {
                     peer_id: peer_id.clone(),
                     stream_id,
                 });
-            return Vec::new();
         }
-
-        Vec::new()
     }
 
     /// Notifies the protocol that a stream was fully closed.
-    fn on_stream_closed(&mut self, peer_id: &PeerId, stream_id: StreamId) {
+    pub fn on_stream_closed(&mut self, peer_id: &PeerId, stream_id: StreamId) {
         let Some(peer) = self.peers.get_mut(peer_id) else {
             return;
         };
@@ -568,7 +510,7 @@ impl PingProtocol {
 
     /// Remove all state for a peer. Call this when the connection to a peer is
     /// closed to prevent unbounded memory growth.
-    fn remove_peer(&mut self, peer_id: &PeerId) {
+    pub fn remove_peer(&mut self, peer_id: &PeerId) {
         self.peers.remove(peer_id);
     }
 
@@ -582,7 +524,7 @@ impl PingProtocol {
     /// the application only ever sees events under the real PeerId.
     ///
     /// If there is no state for `old_peer_id`, this is a no-op.
-    fn migrate_peer(&mut self, old_peer_id: &PeerId, new_peer_id: &PeerId) {
+    pub fn migrate_peer(&mut self, old_peer_id: &PeerId, new_peer_id: &PeerId) {
         if old_peer_id == new_peer_id {
             return;
         }
@@ -609,9 +551,7 @@ impl PingProtocol {
     }
 
     /// Checks for timed-out ping requests. Call periodically.
-    fn on_tick(&mut self, now_ms: u64) -> Vec<PingAction> {
-        let mut actions = Vec::new();
-
+    pub fn on_tick(&mut self, now_ms: u64) {
         for (peer_id, peer) in self.peers.iter_mut() {
             let Some(stream_id) = peer.outbound_stream else {
                 continue;
@@ -635,105 +575,46 @@ impl PingProtocol {
                         peer_id: peer_id.clone(),
                         stream_id,
                     });
-                actions.push(PingAction::ResetStream {
+                self.pending_actions.push_back(PingAction::ResetStream {
                     peer_id: peer_id.clone(),
                     stream_id,
                 });
             }
         }
-
-        actions
     }
 
-    /// Emits a ProtocolViolation event and returns a ResetStream action.
-    fn protocol_violation(
-        &mut self,
-        peer_id: &PeerId,
-        stream_id: StreamId,
-        reason: String,
-    ) -> Vec<PingAction> {
+    /// Emits a ProtocolViolation event and queues a ResetStream action.
+    fn protocol_violation(&mut self, peer_id: &PeerId, stream_id: StreamId, reason: String) {
         self.pending_events.push_back(PingEvent::ProtocolViolation {
             peer_id: peer_id.clone(),
             stream_id,
             reason,
         });
 
-        vec![PingAction::ResetStream {
+        self.pending_actions.push_back(PingAction::ResetStream {
             peer_id: peer_id.clone(),
             stream_id,
-        }]
+        });
     }
 }
 
-impl SansIoProtocol for PingProtocol {
-    type Input = PingInput;
-    type Output = PingOutput;
-    type Error = PingError;
-
-    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
-        match input {
-            PingInput::RegisterOutboundStream { peer_id, stream_id } => {
-                self.register_outbound_stream(peer_id, stream_id)?;
-            }
-            PingInput::RegisterInboundStream { peer_id, stream_id } => {
-                let actions = self.register_inbound_stream(peer_id, stream_id);
-                self.pending_actions.extend(actions);
-            }
-            PingInput::SendPing {
-                peer_id,
-                payload,
-                now_ms,
-            } => {
-                let action = self.send_ping(&peer_id, &payload, now_ms)?;
-                self.pending_actions.push_back(action);
-            }
-            PingInput::CloseOutboundStreamWrite { peer_id } => {
-                let action = self.close_outbound_stream_write(&peer_id)?;
-                self.pending_actions.push_back(action);
-            }
-            PingInput::StreamData {
-                peer_id,
-                stream_id,
-                data,
-                now_ms,
-            } => {
-                let actions = self.on_stream_data(&peer_id, stream_id, &data, now_ms);
-                self.pending_actions.extend(actions);
-            }
-            PingInput::StreamRemoteWriteClosed { peer_id, stream_id } => {
-                let actions = self.on_stream_remote_write_closed(&peer_id, stream_id);
-                self.pending_actions.extend(actions);
-            }
-            PingInput::StreamClosed { peer_id, stream_id } => {
-                self.on_stream_closed(&peer_id, stream_id);
-            }
-            PingInput::RemovePeer { peer_id } => self.remove_peer(&peer_id),
-            PingInput::MigratePeer {
-                old_peer_id,
-                new_peer_id,
-            } => self.migrate_peer(&old_peer_id, &new_peer_id),
-            PingInput::Tick { now_ms } => {
-                let actions = self.on_tick(now_ms);
-                self.pending_actions.extend(actions);
-            }
-        }
-        Ok(())
-    }
-
-    fn poll_output(&mut self) -> Option<Self::Output> {
+impl PingProtocol {
+    /// Returns the next pending output, if any: actions first, then events.
+    ///
+    /// Drain until `None` after every input, before waiting on the
+    /// transport or timers again.
+    pub fn poll_output(&mut self) -> Option<PingOutput> {
         if let Some(action) = self.pending_actions.pop_front() {
             return Some(PingOutput::Action(action));
         }
         self.pending_events.pop_front().map(PingOutput::Event)
     }
-
-    fn is_idle(&self) -> bool {
-        self.pending_actions.is_empty() && self.pending_events.is_empty()
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use core::str::FromStr;
 
     use super::*;
@@ -742,6 +623,11 @@ mod tests {
         /// Drains and returns all pending events (test helper).
         fn poll_events(&mut self) -> Vec<PingEvent> {
             self.pending_events.drain(..).collect()
+        }
+
+        /// Drains and returns all pending actions (test helper).
+        fn poll_actions(&mut self) -> Vec<PingAction> {
+            self.pending_actions.drain(..).collect()
         }
     }
 
@@ -754,26 +640,15 @@ mod tests {
     }
 
     #[test]
-    fn ping_protocol_implements_sans_io_protocol() {
+    fn outputs_drain_actions_before_events() {
         let mut ping = PingProtocol::default();
         let peer = test_peer();
         let stream_id = StreamId::new(1);
 
-        ping.handle_input(PingInput::RegisterInboundStream {
-            peer_id: peer.clone(),
-            stream_id,
-        })
-        .expect("register inbound");
-
+        ping.register_inbound_stream(peer.clone(), stream_id);
         let mut payload = [0u8; PING_PAYLOAD_LEN];
         payload[0] = 7;
-        ping.handle_input(PingInput::StreamData {
-            peer_id: peer.clone(),
-            stream_id,
-            data: payload.to_vec(),
-            now_ms: 10,
-        })
-        .expect("stream data");
+        ping.on_stream_data(&peer, stream_id, &payload, 10);
 
         assert!(matches!(
             ping.poll_output(),
@@ -783,7 +658,6 @@ mod tests {
                 data,
             })) if p == peer && sid == stream_id && data == payload
         ));
-        assert!(!ping.is_idle());
         assert!(matches!(
             ping.poll_output(),
             Some(PingOutput::Event(PingEvent::InboundStreamAccepted {
@@ -791,7 +665,7 @@ mod tests {
                 stream_id: sid,
             })) if p == peer && sid == stream_id
         ));
-        assert!(ping.is_idle());
+        assert!(ping.poll_output().is_none());
     }
 
     #[test]
@@ -804,19 +678,19 @@ mod tests {
             .expect("register stream");
 
         let payload = [42u8; PING_PAYLOAD_LEN];
-        let send = ping
-            .send_ping(&peer, &payload, 100)
+        ping.send_ping(&peer, &payload, 100)
             .expect("send ping action");
         assert!(matches!(
-            send,
-            PingAction::Send {
+            ping.poll_actions().as_slice(),
+            [PingAction::Send {
                 stream_id,
                 data,
                 ..
-            } if stream_id == stream && data == payload
+            }] if *stream_id == stream && *data == payload
         ));
 
-        let response_actions = ping.on_stream_data(&peer, stream, &payload, 135);
+        ping.on_stream_data(&peer, stream, &payload, 135);
+        let response_actions = ping.poll_actions();
         assert!(response_actions.is_empty());
 
         let events = ping.poll_events();
@@ -837,9 +711,12 @@ mod tests {
         let mut ping = PingProtocol::default();
         let peer = test_peer();
 
-        let a = ping.register_inbound_stream(peer.clone(), StreamId::new(1));
-        let b = ping.register_inbound_stream(peer.clone(), StreamId::new(5));
-        let c = ping.register_inbound_stream(peer.clone(), StreamId::new(9));
+        ping.register_inbound_stream(peer.clone(), StreamId::new(1));
+        let a = ping.poll_actions();
+        ping.register_inbound_stream(peer.clone(), StreamId::new(5));
+        let b = ping.poll_actions();
+        ping.register_inbound_stream(peer.clone(), StreamId::new(9));
+        let c = ping.poll_actions();
 
         assert!(a.is_empty());
         assert!(b.is_empty());
@@ -865,10 +742,12 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(3);
 
-        let _ = ping.register_inbound_stream(peer.clone(), stream);
+        ping.register_inbound_stream(peer.clone(), stream);
+        let _ = ping.poll_actions();
 
         let payload = [7u8; PING_PAYLOAD_LEN];
-        let out = ping.on_stream_data(&peer, stream, &payload, 5);
+        ping.on_stream_data(&peer, stream, &payload, 5);
+        let out = ping.poll_actions();
         assert_eq!(
             out,
             vec![PingAction::Send {
@@ -890,9 +769,11 @@ mod tests {
         ping.register_outbound_stream(peer.clone(), stream)
             .expect("register stream");
         let payload = [1u8; PING_PAYLOAD_LEN];
-        let _ = ping.send_ping(&peer, &payload, 100).expect("send ping");
+        ping.send_ping(&peer, &payload, 100).expect("send ping");
+        let _ = ping.poll_actions();
 
-        let actions = ping.on_tick(111);
+        ping.on_tick(111);
+        let actions = ping.poll_actions();
         assert_eq!(
             actions,
             vec![PingAction::ResetStream {
@@ -929,16 +810,19 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(3);
 
-        let _ = ping.register_inbound_stream(peer.clone(), stream);
+        ping.register_inbound_stream(peer.clone(), stream);
+        let _ = ping.poll_actions();
 
         let payload = [7u8; PING_PAYLOAD_LEN];
 
         // Send first 16 bytes -- should buffer, no action yet.
-        let out = ping.on_stream_data(&peer, stream, &payload[..16], 5);
+        ping.on_stream_data(&peer, stream, &payload[..16], 5);
+        let out = ping.poll_actions();
         assert!(out.is_empty());
 
         // Send remaining 16 bytes -- should now echo the full payload.
-        let out = ping.on_stream_data(&peer, stream, &payload[16..], 6);
+        ping.on_stream_data(&peer, stream, &payload[16..], 6);
+        let out = ping.poll_actions();
         assert_eq!(
             out,
             vec![PingAction::Send {
@@ -959,18 +843,21 @@ mod tests {
             .expect("register stream");
 
         let payload = [42u8; PING_PAYLOAD_LEN];
-        let _ = ping.send_ping(&peer, &payload, 100).expect("send ping");
+        ping.send_ping(&peer, &payload, 100).expect("send ping");
+        let _ = ping.poll_actions();
 
         // Drain the OutboundStreamRegistered event from registration.
         let _ = ping.poll_events();
 
         // First chunk -- buffered.
-        let actions = ping.on_stream_data(&peer, stream, &payload[..10], 120);
+        ping.on_stream_data(&peer, stream, &payload[..10], 120);
+        let actions = ping.poll_actions();
         assert!(actions.is_empty());
         assert!(ping.poll_events().is_empty());
 
         // Second chunk -- completes the payload.
-        let actions = ping.on_stream_data(&peer, stream, &payload[10..], 135);
+        ping.on_stream_data(&peer, stream, &payload[10..], 135);
+        let actions = ping.poll_actions();
         assert!(actions.is_empty());
 
         let events = ping.poll_events();
@@ -992,11 +879,13 @@ mod tests {
         let peer = test_peer();
         let stream = StreamId::new(3);
 
-        let _ = ping.register_inbound_stream(peer.clone(), stream);
+        ping.register_inbound_stream(peer.clone(), stream);
+        let _ = ping.poll_actions();
 
         // Send more than 32 bytes in one shot.
         let oversized = [0u8; PING_PAYLOAD_LEN + 1];
-        let actions = ping.on_stream_data(&peer, stream, &oversized, 5);
+        ping.on_stream_data(&peer, stream, &oversized, 5);
+        let actions = ping.poll_actions();
         assert_eq!(
             actions,
             vec![PingAction::ResetStream {
@@ -1023,7 +912,8 @@ mod tests {
             .expect("register stream");
 
         let payload = [1u8; PING_PAYLOAD_LEN];
-        let _ = ping.send_ping(&peer, &payload, 100).expect("send ping");
+        ping.send_ping(&peer, &payload, 100).expect("send ping");
+        let _ = ping.poll_actions();
 
         let result = ping.close_outbound_stream_write(&peer);
         assert!(matches!(result, Err(PingError::PingAlreadyInFlight { .. })));
@@ -1037,17 +927,20 @@ mod tests {
 
         ping.register_outbound_stream(peer.clone(), stream)
             .expect("register stream");
-        let _ = ping.register_inbound_stream(peer.clone(), StreamId::new(1));
+        ping.register_inbound_stream(peer.clone(), StreamId::new(1));
+        let _ = ping.poll_actions();
 
         let payload = [1u8; PING_PAYLOAD_LEN];
-        let _ = ping.send_ping(&peer, &payload, 100).expect("send ping");
+        ping.send_ping(&peer, &payload, 100).expect("send ping");
+        let _ = ping.poll_actions();
 
         ping.remove_peer(&peer);
 
         // After removal, we can re-register everything fresh.
         ping.register_outbound_stream(peer.clone(), StreamId::new(10))
             .expect("re-register outbound stream after remove_peer");
-        let actions = ping.register_inbound_stream(peer.clone(), StreamId::new(11));
+        ping.register_inbound_stream(peer.clone(), StreamId::new(11));
+        let actions = ping.poll_actions();
         assert!(actions.is_empty());
     }
 
@@ -1074,7 +967,8 @@ mod tests {
             .expect("register stream");
 
         // No ping in flight -- remote closes write side.
-        let actions = ping.on_stream_remote_write_closed(&peer, stream);
+        ping.on_stream_remote_write_closed(&peer, stream);
+        let actions = ping.poll_actions();
         assert!(actions.is_empty());
 
         let events = ping.poll_events();

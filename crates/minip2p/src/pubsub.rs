@@ -8,9 +8,7 @@ use alloc::vec::Vec;
 
 use minip2p_platform::EntropySource;
 use minip2p_pubsub::{GossipsubAction, GossipsubAgent, GossipsubEvent, PublishError, TopicError};
-#[cfg(any(feature = "std", feature = "smoltcp"))]
-use minip2p_swarm::SwarmEvent;
-use minip2p_swarm::{DriverError, SwarmCore};
+use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
 use minip2p_transport::Transport;
 
 use crate::stream_conns::StreamConns;
@@ -22,7 +20,6 @@ use crate::stream_conns::StreamConns;
 #[derive(Debug, thiserror::Error)]
 pub enum GossipsubError {
     /// Gossipsub was not enabled on this endpoint.
-    #[cfg(any(feature = "std", feature = "smoltcp"))]
     #[error("gossipsub is not enabled on this endpoint (gossipsub or discovery builder opt-in)")]
     NotEnabled,
     /// The discovery topic is reserved for signed beacons while discovery
@@ -49,11 +46,7 @@ pub(crate) struct GossipsubDriver {
     stream_conns: StreamConns,
 }
 
-// The `std`/`smoltcp` gates keep portable-mDNS-only builds from carrying
-// endpoint-facing methods nothing calls there; a `DiscoveryDriver` sweep
-// still names the type in its signature.
 impl GossipsubDriver {
-    #[cfg(any(feature = "std", feature = "smoltcp"))]
     pub(crate) fn new(agent: GossipsubAgent) -> Self {
         Self {
             agent,
@@ -64,7 +57,6 @@ impl GossipsubDriver {
 
     /// How long the caller may idle before [`Self::tick`] has work: `0` when
     /// queued events or agent timers are due, `None` when nothing is.
-    #[cfg(any(feature = "std", feature = "smoltcp"))]
     pub(crate) fn next_timeout(&self, now_ms: u64) -> Option<u64> {
         if !self.events.is_empty() {
             Some(0)
@@ -75,7 +67,6 @@ impl GossipsubDriver {
 
     /// Subscribes to a topic and immediately flushes the announcement.
     /// Returns `Ok(false)` when already subscribed.
-    #[cfg(any(feature = "std", feature = "smoltcp"))]
     pub(crate) fn subscribe<T: Transport, R: EntropySource>(
         &mut self,
         topic: &str,
@@ -90,7 +81,6 @@ impl GossipsubDriver {
     /// Withdraws a subscription and flushes the change. Returns `false` when
     /// not subscribed. `reserved` names a driver-owned topic (discovery's
     /// beacon topic) that applications cannot withdraw or publish to.
-    #[cfg(any(feature = "std", feature = "smoltcp"))]
     pub(crate) fn unsubscribe<T: Transport, R: EntropySource>(
         &mut self,
         topic: &str,
@@ -146,7 +136,6 @@ impl GossipsubDriver {
     ///
     /// Returns `true` when the event belongs to a pubsub stream and must
     /// not be forwarded to the application.
-    #[cfg(any(feature = "std", feature = "smoltcp"))]
     pub(crate) fn ingest<T: Transport, R: EntropySource>(
         &mut self,
         event: &SwarmEvent,
@@ -173,7 +162,6 @@ impl GossipsubDriver {
 
     /// Advances timers only when the agent reports a due deadline, then
     /// executes any resulting work.
-    #[cfg(any(feature = "std", feature = "smoltcp"))]
     pub(crate) fn tick<T: Transport, R: EntropySource>(
         &mut self,
         swarm: &mut SwarmCore<T, R>,
@@ -188,7 +176,6 @@ impl GossipsubDriver {
 
     /// Moves events still inside the agent into the queue. Terminal
     /// shutdown calls this before draining: collecting needs no swarm turn.
-    #[cfg(feature = "smoltcp")]
     pub(crate) fn collect_agent_events(&mut self) {
         while let Some(event) = self.agent.poll_event() {
             self.events.push_back(event);
