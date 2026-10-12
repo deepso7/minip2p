@@ -25,6 +25,10 @@ pub enum BridgeRole {
 /// [`NatAgent::promote_result`](crate::NatAgent::promote_result) with its
 /// token; the others are fire-and-forget.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "actions are drained one at a time, and PromoteBridge, the large one, is rare"
+)]
 pub enum NatAction {
     /// Send one datagram of `payload_len` random bytes to `target` to open
     /// our NAT mapping (responder-side hole punch). The wiring fills the
