@@ -204,8 +204,17 @@ impl FrameExchange {
     /// a relay circuit that becomes bridged, a hole punch that hands the
     /// stream to the application — the bytes behind the last frame are no
     /// longer the exchange's.
+    ///
+    /// The receive buffer's allocation leaves with the bytes. When nothing is
+    /// buffered the result is an unallocated `Vec`, so a caller that keeps it
+    /// for the life of a stream holds no capacity a drained frame left behind.
     pub fn take_buffered(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.recv)
+        let buffered = core::mem::take(&mut self.recv);
+        if buffered.is_empty() {
+            Vec::new()
+        } else {
+            buffered
+        }
     }
 }
 
@@ -328,6 +337,17 @@ mod tests {
         assert_eq!(ex.buffered(), b"pipelined");
         assert_eq!(ex.take_buffered(), b"pipelined");
         assert!(ex.buffered().is_empty());
+    }
+
+    /// Draining a frame leaves the receive buffer empty but allocated; handing
+    /// that out would let a caller hold the allocation for a whole stream.
+    #[test]
+    fn take_buffered_after_a_fully_consumed_frame_holds_no_allocation() {
+        let mut ex = FrameExchange::new(MAX);
+        ex.push(&encode_frame(b"hello")).unwrap();
+        assert_eq!(ex.next_frame(identity).unwrap().unwrap(), b"hello");
+
+        assert_eq!(ex.take_buffered().capacity(), 0);
     }
 
     #[test]
