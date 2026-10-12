@@ -676,8 +676,8 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// capability events (relay-server, NAT, Gossipsub, Discovery), then the
     /// terminals.
     ///
-    /// A failed or cancelled terminal cancels its NAT leg, which can produce
-    /// more NAT events; those are routed before the drain. Discovery-owned
+    /// Every terminal settles its NAT leg, which can produce more NAT
+    /// events; those are routed before the drain. Discovery-owned
     /// terminals are claimed (and update the book) before the book's events
     /// are drained, so the updates surface in the same batch.
     pub(crate) fn settle(&mut self, now: Now) {
@@ -719,7 +719,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             };
             #[cfg(feature = "_nat-driver")]
             if let Some(nat) = self.nat.as_mut() {
-                nat.cancel_leg_on_terminal(&event, &mut self.core, now);
+                nat.settle_leg_on_terminal(&event, &mut self.core, now);
             }
             #[cfg(feature = "_discovery-driver")]
             if let Some(discovery) = self.discovery.as_mut()

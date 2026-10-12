@@ -150,31 +150,34 @@ pub enum ConnectOutcome {
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConnectFailure {
-    /// Every candidate was refused before a Transport dial started.
-    #[error("no usable route: {}{}", no_usable_route_detail(.candidates, .relay), relay_suffix(.relay))]
+    /// No route ever started: every candidate was refused before a
+    /// Transport dial, and no relay was tried.
+    #[error("no usable route: {}{}", no_usable_route_detail(.candidates, .relays), relay_suffix(.relays))]
     NoUsableRoute {
         /// Per-candidate refusals (no transport, DNS produced nothing, …).
         candidates: Vec<CandidateFailure>,
-        /// Relay-leg diagnostic when a relay was in play.
-        relay: Option<RelayFailure>,
+        /// Relay-leg diagnostics when a relay leg was in play but none of
+        /// its relays started.
+        relays: Vec<RelayFailure>,
     },
-    /// Dials started; every one of them failed.
-    #[error("every candidate dial failed: {}{}", candidate_summary(.candidates), relay_suffix(.relay))]
-    AllCandidatesFailed {
+    /// Routes started (direct dials, relays, or both) and every one failed.
+    /// A relay-only attempt whose relays all failed lands here too.
+    #[error("every route failed: {}{}", candidate_summary(.candidates), relay_suffix(.relays))]
+    AllRoutesFailed {
         /// Per-candidate dial failures.
         candidates: Vec<CandidateFailure>,
-        /// Relay-leg diagnostic when a relay was in play.
-        relay: Option<RelayFailure>,
+        /// One failure per relay tried, in order.
+        relays: Vec<RelayFailure>,
     },
     /// The attempt deadline elapsed with dials still pending.
-    #[error("connect deadline elapsed after {elapsed_ms} ms{}", relay_suffix(.relay))]
+    #[error("connect deadline elapsed after {elapsed_ms} ms{}", relay_suffix(.relays))]
     Timeout {
         /// Milliseconds from admit to the tick that expired the attempt.
         elapsed_ms: u64,
         /// Failures observed before the deadline, plus pending candidates.
         candidates: Vec<CandidateFailure>,
-        /// Relay-leg diagnostic when a relay was in play.
-        relay: Option<RelayFailure>,
+        /// One failure per relay tried, then the relay still pending.
+        relays: Vec<RelayFailure>,
     },
 }
 
@@ -182,8 +185,8 @@ pub enum ConnectFailure {
 /// settled when the attempt did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayFailure {
-    /// Configured relay, when known.
-    pub relay: Option<PeerId>,
+    /// The relay (peer and address) being tried, when one had started.
+    pub relay: Option<PeerAddr>,
     /// Transport, protocol, or policy reason.
     pub reason: String,
 }
@@ -191,7 +194,7 @@ pub struct RelayFailure {
 impl core::fmt::Display for RelayFailure {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match &self.relay {
-            Some(peer) => write!(f, "relay {peer}: {}", self.reason),
+            Some(relay) => write!(f, "relay {relay}: {}", self.reason),
             None => write!(f, "relay: {}", self.reason),
         }
     }
@@ -231,9 +234,9 @@ pub struct CandidateFailure {
     pub reason: String,
 }
 
-fn no_usable_route_detail(candidates: &[CandidateFailure], relay: &Option<RelayFailure>) -> String {
+fn no_usable_route_detail(candidates: &[CandidateFailure], relays: &[RelayFailure]) -> String {
     if candidates.is_empty() {
-        if relay.is_none() {
+        if relays.is_empty() {
             String::from("no known addresses and no relay configured")
         } else {
             String::from("no known addresses")
@@ -243,11 +246,11 @@ fn no_usable_route_detail(candidates: &[CandidateFailure], relay: &Option<RelayF
     }
 }
 
-fn relay_suffix(relay: &Option<RelayFailure>) -> String {
-    match relay {
-        Some(failure) => format!("; {failure}"),
-        None => String::new(),
-    }
+fn relay_suffix(relays: &[RelayFailure]) -> String {
+    relays
+        .iter()
+        .map(|failure| format!("; {failure}"))
+        .collect()
 }
 
 fn candidate_summary(candidates: &[CandidateFailure]) -> String {
@@ -317,10 +320,13 @@ struct Attempt {
     /// `/dns*` candidates whose Name resolution has not answered yet. Each
     /// joins `direct` or `failed` when [`ConnectEngine::resolved`] sees it.
     resolving: Vec<PeerAddr>,
-    /// True once at least one Transport dial started.
+    /// True once at least one route started: a Transport dial, or a relay
+    /// the NAT leg began trying.
     dialed_any: bool,
     failed: Vec<CandidateFailure>,
     relay: RelayLeg,
+    /// One failure per relay the leg gave up on, in order.
+    relay_failures: Vec<RelayFailure>,
 }
 
 impl Attempt {
@@ -329,24 +335,42 @@ impl Attempt {
     fn racing_direct(&self) -> bool {
         !self.direct.is_empty() || !self.resolving.is_empty()
     }
+
+    /// Every relay failure so far, plus the relay still being tried with
+    /// `pending_reason` when the leg is still live.
+    fn relay_diagnostics(&self, pending_reason: Option<&str>) -> Vec<RelayFailure> {
+        let mut relays = self.relay_failures.clone();
+        if let (
+            RelayLeg::Pending { relay, .. } | RelayLeg::Provisional { relay, .. },
+            Some(reason),
+        ) = (&self.relay, pending_reason)
+        {
+            relays.push(RelayFailure {
+                relay: relay.clone(),
+                reason: String::from(reason),
+            });
+        }
+        relays
+    }
 }
 
 enum RelayLeg {
     None,
+    /// `relay` is the relay currently being tried, once the leg started one.
     Pending {
         forced: bool,
-        relay: Option<PeerId>,
+        relay: Option<PeerAddr>,
     },
     Provisional {
         conn_id: ConnectionId,
         forced: bool,
-        relay: Option<PeerId>,
+        relay: Option<PeerAddr>,
     },
     #[cfg_attr(
         not(feature = "_nat-driver"),
         expect(dead_code, reason = "only observe_nat constructs a failed relay leg",)
     )]
-    Failed(RelayFailure),
+    Failed,
 }
 
 impl RelayLeg {
@@ -366,40 +390,22 @@ impl RelayLeg {
 
     #[cfg_attr(
         not(feature = "_nat-driver"),
-        expect(dead_code, reason = "only observe_nat reads the relay peer")
+        expect(dead_code, reason = "only observe_nat records the relay")
     )]
-    fn relay_peer(&self) -> Option<PeerId> {
-        match self {
-            Self::None => None,
-            Self::Pending { relay, .. } | Self::Provisional { relay, .. } => relay.clone(),
-            Self::Failed(failure) => failure.relay.clone(),
+    fn set_relay(&mut self, started: PeerAddr) {
+        if let Self::Pending { relay, .. } | Self::Provisional { relay, .. } = self {
+            *relay = Some(started);
         }
     }
 
     #[cfg_attr(
         not(feature = "_nat-driver"),
-        expect(dead_code, reason = "only observe_nat records the relay peer")
+        expect(dead_code, reason = "only observe_nat reads the relay")
     )]
-    fn set_relay(&mut self, peer: PeerId) {
+    fn relay(&self) -> Option<&PeerAddr> {
         match self {
-            Self::Pending { relay, .. } | Self::Provisional { relay, .. } => {
-                *relay = Some(peer);
-            }
-            Self::Failed(failure) => failure.relay = Some(peer),
-            Self::None => {}
-        }
-    }
-
-    fn diagnostic(&self, pending_reason: Option<&str>) -> Option<RelayFailure> {
-        match self {
-            Self::None => None,
-            Self::Failed(failure) => Some(failure.clone()),
-            Self::Pending { relay, .. } | Self::Provisional { relay, .. } => {
-                pending_reason.map(|reason| RelayFailure {
-                    relay: relay.clone(),
-                    reason: String::from(reason),
-                })
-            }
+            Self::Pending { relay, .. } | Self::Provisional { relay, .. } => relay.as_ref(),
+            Self::None | Self::Failed => None,
         }
     }
 }
@@ -476,7 +482,7 @@ impl ConnectEngine {
                 peer,
                 ConnectOutcome::Failed(ConnectFailure::NoUsableRoute {
                     candidates: failed,
-                    relay: None,
+                    relays: Vec::new(),
                 }),
             );
             return id;
@@ -493,6 +499,7 @@ impl ConnectEngine {
                 dialed_any,
                 failed,
                 relay,
+                relay_failures: Vec::new(),
             },
         );
         id
@@ -758,7 +765,7 @@ impl ConnectEngine {
             };
             let settle = match attempt.relay {
                 _ if !circuit => true,
-                RelayLeg::None | RelayLeg::Failed(_) => true,
+                RelayLeg::None | RelayLeg::Failed => true,
                 RelayLeg::Pending { forced, .. } | RelayLeg::Provisional { forced, .. } => forced,
             };
             if settle {
@@ -846,7 +853,7 @@ impl ConnectEngine {
                 self.push_settled(id, attempt.peer, ConnectOutcome::Connected { conn_id });
                 continue;
             }
-            let relay = attempt.relay.diagnostic(Some("relay leg still pending"));
+            let relays = attempt.relay_diagnostics(Some("relay leg still pending"));
             for (conn_id, addr) in attempt.direct.iter() {
                 attempt.failed.push(CandidateFailure {
                     addr: addr.clone(),
@@ -866,7 +873,7 @@ impl ConnectEngine {
                 ConnectOutcome::Failed(ConnectFailure::Timeout {
                     elapsed_ms: now_ms.saturating_sub(attempt.started_ms),
                     candidates: attempt.failed,
-                    relay,
+                    relays,
                 }),
             );
         }
@@ -914,20 +921,20 @@ impl ConnectEngine {
             RelayLeg::Pending { .. } | RelayLeg::Provisional { .. } => {
                 self.attempts.insert(id, attempt);
             }
-            RelayLeg::Failed(_) if attempt.racing_direct() => {
+            RelayLeg::Failed if attempt.racing_direct() => {
                 self.attempts.insert(id, attempt);
             }
-            RelayLeg::None | RelayLeg::Failed(_) => {
-                let relay = attempt.relay.diagnostic(None);
+            RelayLeg::None | RelayLeg::Failed => {
+                let relays = attempt.relay_diagnostics(None);
                 let failure = if attempt.dialed_any {
-                    ConnectFailure::AllCandidatesFailed {
+                    ConnectFailure::AllRoutesFailed {
                         candidates: attempt.failed,
-                        relay,
+                        relays,
                     }
                 } else {
                     ConnectFailure::NoUsableRoute {
                         candidates: attempt.failed,
-                        relay,
+                        relays,
                     }
                 };
                 self.push_settled(id, attempt.peer, ConnectOutcome::Failed(failure));
@@ -942,19 +949,42 @@ impl ConnectEngine {
         runtime: &mut SwarmCore<T, E>,
         _now_ms: u64,
     ) {
-        use minip2p_nat::{NatEvent, Path};
+        use minip2p_nat::NatEvent;
         match event {
+            NatEvent::RelayStarted { connect_id, relay } => {
+                if let Some(attempt) = self.attempts.get_mut(connect_id) {
+                    attempt.dialed_any = true;
+                    attempt.relay.set_relay(relay.clone());
+                }
+            }
+            NatEvent::RelayFailed {
+                connect_id,
+                relay,
+                error,
+            } => {
+                if let Some(attempt) = self.attempts.get_mut(connect_id) {
+                    attempt.relay_failures.push(RelayFailure {
+                        relay: Some(relay.clone()),
+                        reason: error.to_string(),
+                    });
+                }
+            }
             NatEvent::ConnectFailed {
                 connect_id, error, ..
             } => {
                 let Some(mut attempt) = self.attempts.remove(connect_id) else {
                     return;
                 };
-                let relay = attempt.relay.relay_peer();
-                attempt.relay = RelayLeg::Failed(RelayFailure {
-                    relay,
+                // The last relay's own failure is already recorded; any
+                // other leg-ending error is added once.
+                let failure = RelayFailure {
+                    relay: attempt.relay.relay().cloned(),
                     reason: error.to_string(),
-                });
+                };
+                if attempt.relay_failures.last() != Some(&failure) {
+                    attempt.relay_failures.push(failure);
+                }
+                attempt.relay = RelayLeg::Failed;
                 self.settle_if_exhausted(*connect_id, attempt);
             }
             NatEvent::FellBackToRelay { connect_id, .. } => {
@@ -970,15 +1000,6 @@ impl ConnectEngine {
                     );
                 } else {
                     self.attempts.insert(*connect_id, attempt);
-                }
-            }
-            NatEvent::PathEstablished {
-                connect_id,
-                path: Path::Relayed { relay },
-                ..
-            } => {
-                if let Some(attempt) = self.attempts.get_mut(connect_id) {
-                    attempt.relay.set_relay(relay.clone());
                 }
             }
             NatEvent::PathEstablished { .. }
@@ -1476,9 +1497,8 @@ mod tests {
         runtime.transport_mut().push_closed(ConnectionId::new(2));
         let events = drain(&mut engine, &mut runtime, 0);
         match settled_for(&events, id) {
-            Some(ConnectOutcome::Failed(ConnectFailure::AllCandidatesFailed {
-                candidates,
-                ..
+            Some(ConnectOutcome::Failed(ConnectFailure::AllRoutesFailed {
+                candidates, ..
             })) => {
                 let addrs: Vec<_> = candidates.iter().map(|c| c.addr.clone()).collect();
                 assert!(
@@ -1486,7 +1506,7 @@ mod tests {
                     "{candidates:?}"
                 );
             }
-            other => panic!("expected AllCandidatesFailed, got {other:?} from {events:?}"),
+            other => panic!("expected AllRoutesFailed, got {other:?} from {events:?}"),
         }
         assert!(settled_for(&drain(&mut engine, &mut runtime, 1), id).is_none());
     }
@@ -2378,8 +2398,10 @@ mod tests {
         );
         let events = drain(&mut engine, &mut runtime, 1_000);
         match settled_for(&events, id) {
-            Some(ConnectOutcome::Failed(ConnectFailure::Timeout { relay, .. })) => {
-                let relay = relay.as_ref().expect("pending relay diagnostic");
+            Some(ConnectOutcome::Failed(ConnectFailure::Timeout { relays, .. })) => {
+                let [relay] = relays.as_slice() else {
+                    panic!("expected one pending relay diagnostic: {relays:?}");
+                };
                 assert!(
                     relay.reason.contains("relay leg still pending"),
                     "{relay:?}"
@@ -2543,14 +2565,18 @@ mod tests {
         match engine.pop_event() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
-                outcome: ConnectOutcome::Failed(ConnectFailure::AllCandidatesFailed { relay, .. }),
+                outcome: ConnectOutcome::Failed(ConnectFailure::AllRoutesFailed { relays, .. }),
                 ..
             }) => {
                 assert_eq!(connect_id, id);
-                let relay = relay.expect("relay diagnostic");
-                assert!(relay.reason.contains("relay unreachable"), "{relay:?}");
+                assert!(
+                    relays
+                        .iter()
+                        .any(|relay| relay.reason.contains("relay unreachable")),
+                    "{relays:?}"
+                );
             }
-            other => panic!("expected AllCandidatesFailed, got {other:?}"),
+            other => panic!("expected AllRoutesFailed, got {other:?}"),
         }
         assert!(engine.pop_event().is_none());
     }
@@ -2576,11 +2602,15 @@ mod tests {
         runtime.transport_mut().push_closed(ConnectionId::new(1));
         let events = drain(&mut engine, &mut runtime, 0);
         match settled_for(&events, id) {
-            Some(ConnectOutcome::Failed(ConnectFailure::AllCandidatesFailed { relay, .. })) => {
-                let relay = relay.as_ref().expect("relay diagnostic");
-                assert!(relay.reason.contains("relay unreachable"), "{relay:?}");
+            Some(ConnectOutcome::Failed(ConnectFailure::AllRoutesFailed { relays, .. })) => {
+                assert!(
+                    relays
+                        .iter()
+                        .any(|relay| relay.reason.contains("relay unreachable")),
+                    "{relays:?}"
+                );
             }
-            other => panic!("expected AllCandidatesFailed after last direct, got {other:?}"),
+            other => panic!("expected AllRoutesFailed after last direct, got {other:?}"),
         }
         assert!(
             events
@@ -2593,7 +2623,7 @@ mod tests {
 
     #[cfg(feature = "nat")]
     #[test]
-    fn race_no_candidates_connect_failed_is_no_usable_route() {
+    fn a_relay_leg_that_never_started_a_relay_is_no_usable_route() {
         let peer = peer(b"no-cand-relay");
         let mut runtime = runtime(FakeTransport::default());
         let mut engine = ConnectEngine::new(30_000);
@@ -2605,22 +2635,16 @@ mod tests {
             &mut runtime,
             0,
         );
-        engine.observe_nat(&nat_failed(id, &peer, "no reservation"), &mut runtime, 0);
+        engine.observe_nat(&nat_failed(id, &peer, "no eligible relay"), &mut runtime, 0);
         match engine.pop_event() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
-                outcome: ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { relay, .. }),
+                outcome: ConnectOutcome::Failed(failure @ ConnectFailure::NoUsableRoute { .. }),
                 ..
             }) => {
                 assert_eq!(connect_id, id);
-                let relay = relay.expect("relay diagnostic");
-                assert!(relay.reason.contains("no reservation"), "{relay:?}");
-                let text = ConnectFailure::NoUsableRoute {
-                    candidates: Vec::new(),
-                    relay: Some(relay.clone()),
-                }
-                .to_string();
-                assert!(text.contains("relay:"), "{text}");
+                let text = failure.to_string();
+                assert!(text.contains("no eligible relay"), "{text}");
                 assert!(
                     !text.contains("no relay configured"),
                     "relay diagnostic must not claim the relay was missing: {text}"
@@ -2629,6 +2653,64 @@ mod tests {
             other => panic!("expected NoUsableRoute, got {other:?}"),
         }
         assert!(engine.pop_event().is_none());
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
+    fn a_relay_only_attempt_keeps_every_relays_failure() {
+        use minip2p_nat::{NatError, NatEvent};
+        let peer = peer(b"relay-only");
+        let relay_a = addr(&super::tests::peer(b"relay-a"), 7);
+        let relay_b = addr(&super::tests::peer(b"relay-b"), 8);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let id = admit(
+            &mut engine,
+            peer.clone(),
+            Vec::new(),
+            RelayPolicy::Forced,
+            &mut runtime,
+            0,
+        );
+        for (relay, reason) in [(&relay_a, "refused"), (&relay_b, "unreachable")] {
+            engine.observe_nat(
+                &NatEvent::RelayStarted {
+                    connect_id: id,
+                    relay: relay.clone(),
+                },
+                &mut runtime,
+                0,
+            );
+            engine.observe_nat(
+                &NatEvent::RelayFailed {
+                    connect_id: id,
+                    relay: relay.clone(),
+                    error: NatError::DialFailed(reason.into()),
+                },
+                &mut runtime,
+                0,
+            );
+        }
+        engine.observe_nat(
+            &NatEvent::ConnectFailed {
+                connect_id: id,
+                peer: peer.clone(),
+                error: NatError::DialFailed("unreachable".into()),
+            },
+            &mut runtime,
+            0,
+        );
+        match engine.pop_event() {
+            Some(EndpointEvent::ConnectSettled {
+                outcome: ConnectOutcome::Failed(ConnectFailure::AllRoutesFailed { relays, .. }),
+                ..
+            }) => {
+                let tried: Vec<_> = relays.iter().map(|relay| relay.relay.clone()).collect();
+                assert_eq!(tried, vec![Some(relay_a), Some(relay_b)], "{relays:?}");
+                assert!(relays[0].reason.contains("refused"), "{relays:?}");
+            }
+            other => panic!("expected AllRoutesFailed, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "nat")]
@@ -2654,6 +2736,7 @@ mod tests {
             &minip2p_nat::NatEvent::FellBackToRelay {
                 connect_id: id,
                 peer: peer.clone(),
+                reason: minip2p_nat::UpgradeStop::PunchFailed { rounds: 3 },
             },
             &mut runtime,
             0,

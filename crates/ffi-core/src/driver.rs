@@ -627,6 +627,8 @@ mod tests {
                     relay_peer_id: "relay".into()
                 },
                 to: crate::PathKind::DirectPunched,
+                old_conn_id: 1,
+                new_conn_id: 2,
             }),
             None
         );

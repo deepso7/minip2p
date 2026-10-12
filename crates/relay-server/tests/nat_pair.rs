@@ -510,6 +510,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         Some(NatEvent::InboundPathEstablished {
             peer: _,
             path: Path::Relayed { .. },
+            ..
         })
     ));
     assert!(

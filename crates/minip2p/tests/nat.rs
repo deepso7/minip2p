@@ -110,7 +110,7 @@ fn connect_without_candidates_or_relay_fails_fast() {
             ..
         }) if connect_id == id => {
             assert!(
-                matches!(failure, ConnectFailure::NoUsableRoute { relay: None, .. }),
+                matches!(failure, ConnectFailure::NoUsableRoute { ref relays, .. } if relays.is_empty()),
                 "expected NoUsableRoute, got {failure:?}"
             );
             let text = failure.to_string();

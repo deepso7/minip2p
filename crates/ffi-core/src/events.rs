@@ -385,6 +385,8 @@ pub enum P2pEvent {
         peer_id: String,
         /// Established relayed path.
         path: PathKind,
+        /// Circuit connection carrying the path.
+        conn_id: u64,
     },
     /// A better path replaced an earlier path.
     PathUpgraded {
@@ -396,12 +398,17 @@ pub enum P2pEvent {
         from: PathKind,
         /// Replacement path.
         to: PathKind,
+        /// Connection that carried the previous path.
+        old_conn_id: u64,
+        /// Connection carrying the replacement path.
+        new_conn_id: u64,
     },
-    /// One hole-punch window failed.
+    /// One DCUtR hole-punch round failed; the relay holder may start the
+    /// next one.
     HolePunchFailed {
         /// Endpoint-local connection-attempt id.
         connect_id: u64,
-        /// One-based attempt number.
+        /// One-based DCUtR round.
         attempt: u32,
         /// Human-readable failure detail.
         reason: String,
@@ -429,6 +436,10 @@ pub enum P2pEvent {
     InboundDirectUpgrade {
         /// Remote peer.
         peer_id: String,
+        /// Circuit connection that carried the relayed path.
+        old_conn_id: u64,
+        /// Direct connection now carrying the peer.
+        new_conn_id: u64,
     },
     /// An accepted pubsub message arrived.
     ///
@@ -735,20 +746,29 @@ pub(crate) fn convert_nat(event: NatEvent) -> Option<P2pEvent> {
         NatEvent::PathEstablished { .. }
         | NatEvent::ConnectFailed { .. }
         | NatEvent::FellBackToRelay { .. } => return None,
-        NatEvent::InboundPathEstablished { peer, path } => P2pEvent::InboundPathEstablished {
+        NatEvent::InboundPathEstablished {
+            peer,
+            path,
+            conn_id,
+        } => P2pEvent::InboundPathEstablished {
             peer_id: peer.to_base58(),
             path: convert_path(path),
+            conn_id: conn_id.as_u64(),
         },
         NatEvent::PathUpgraded {
             connect_id,
             peer,
             from,
             to,
+            old_conn_id,
+            new_conn_id,
         } => P2pEvent::PathUpgraded {
             connect_id: connect_id.as_u64(),
             peer_id: peer.to_base58(),
             from: convert_path(from),
             to: convert_path(to),
+            old_conn_id: old_conn_id.as_u64(),
+            new_conn_id: new_conn_id.as_u64(),
         },
         NatEvent::HolePunchFailed {
             connect_id,
@@ -759,8 +779,14 @@ pub(crate) fn convert_nat(event: NatEvent) -> Option<P2pEvent> {
             attempt,
             reason,
         },
-        NatEvent::InboundDirectUpgrade { peer } => P2pEvent::InboundDirectUpgrade {
+        NatEvent::InboundDirectUpgrade {
+            peer,
+            old_conn_id,
+            new_conn_id,
+        } => P2pEvent::InboundDirectUpgrade {
             peer_id: peer.to_base58(),
+            old_conn_id: old_conn_id.as_u64(),
+            new_conn_id: new_conn_id.as_u64(),
         },
         // An event this binding predates has no binding shape yet.
         _ => return None,
@@ -888,9 +914,11 @@ fn convert_swarm_error_kind(kind: SwarmErrorKind) -> EndpointErrorKind {
 
 fn convert_connect_failure_kind(failure: &ConnectFailure) -> NatErrorKind {
     match failure {
+        // Only an attempt that never started a route.
         ConnectFailure::NoUsableRoute { .. } => NatErrorKind::NoPathAvailable,
         ConnectFailure::Timeout { .. } => NatErrorKind::Timeout,
-        ConnectFailure::AllCandidatesFailed { .. } => NatErrorKind::DialFailed,
+        // Started routes (direct dials, relays) that all failed.
+        ConnectFailure::AllRoutesFailed { .. } => NatErrorKind::DialFailed,
         // A failure this binding predates.
         _ => NatErrorKind::Protocol,
     }
@@ -1064,7 +1092,7 @@ mod tests {
         fn convert_nat_error_kind(error: &NatError) -> NatErrorKind {
             match error {
                 NatError::NoPathAvailable => NatErrorKind::NoPathAvailable,
-                NatError::Timeout => NatErrorKind::Timeout,
+                NatError::Timeout { .. } => NatErrorKind::Timeout,
                 NatError::DialFailed(_) => NatErrorKind::DialFailed,
                 NatError::Protocol(_) => NatErrorKind::Protocol,
                 NatError::RelayRefused(_) => NatErrorKind::RelayRefused,
@@ -1072,7 +1100,15 @@ mod tests {
         }
         for (error, expected) in [
             (NatError::NoPathAvailable, NatErrorKind::NoPathAvailable),
-            (NatError::Timeout, NatErrorKind::Timeout),
+            (
+                NatError::Timeout {
+                    stage: minip2p::RelayStage::HopStatus,
+                    relay: None,
+                    elapsed_ms: 12_000,
+                    budget_ms: 12_000,
+                },
+                NatErrorKind::Timeout,
+            ),
             (
                 NatError::DialFailed("dial".into()),
                 NatErrorKind::DialFailed,
@@ -1112,7 +1148,7 @@ mod tests {
         );
         let failure = ConnectFailure::NoUsableRoute {
             candidates: Vec::new(),
-            relay: None,
+            relays: Vec::new(),
         };
         assert_eq!(
             convert_settled(
@@ -1128,6 +1164,21 @@ mod tests {
                 detail: failure.to_string(),
             })
         );
+        // A relay-only attempt whose relays all failed started a route.
+        let failure = ConnectFailure::AllRoutesFailed {
+            candidates: Vec::new(),
+            relays: vec![minip2p::RelayFailure {
+                relay: None,
+                reason: "refused".into(),
+            }],
+        };
+        assert!(matches!(
+            convert_settled(connect_id, &remote, ConnectOutcome::Failed(failure), None),
+            Some(P2pEvent::ConnectFailed {
+                kind: NatErrorKind::DialFailed,
+                ..
+            })
+        ));
         assert_eq!(
             convert_settled(connect_id, &remote, ConnectOutcome::Cancelled, None),
             Some(P2pEvent::ConnectCancelled {
@@ -1160,6 +1211,7 @@ mod tests {
             convert_nat(NatEvent::FellBackToRelay {
                 connect_id: minip2p::ConnectId::from_u64(1),
                 peer: remote,
+                reason: minip2p::UpgradeStop::PunchFailed { rounds: 3 },
             }),
             None
         );
@@ -1176,12 +1228,51 @@ mod tests {
                 path: Path::Relayed {
                     relay: relay.clone(),
                 },
+                conn_id: ConnectionId::new(4),
             }),
             Some(P2pEvent::InboundPathEstablished {
                 peer_id: remote.to_base58(),
                 path: PathKind::Relayed {
                     relay_peer_id: relay.to_base58(),
                 },
+                conn_id: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn upgrade_conversions_carry_both_connection_ids() {
+        let remote = peer(14);
+        assert_eq!(
+            convert_nat(NatEvent::InboundDirectUpgrade {
+                peer: remote.clone(),
+                old_conn_id: ConnectionId::new(4),
+                new_conn_id: ConnectionId::new(5),
+            }),
+            Some(P2pEvent::InboundDirectUpgrade {
+                peer_id: remote.to_base58(),
+                old_conn_id: 4,
+                new_conn_id: 5,
+            })
+        );
+        assert_eq!(
+            convert_nat(NatEvent::PathUpgraded {
+                connect_id: minip2p::ConnectId::from_u64(2),
+                peer: remote.clone(),
+                from: Path::Relayed { relay: peer(15) },
+                to: Path::DirectPunched,
+                old_conn_id: ConnectionId::new(4),
+                new_conn_id: ConnectionId::new(5),
+            }),
+            Some(P2pEvent::PathUpgraded {
+                connect_id: 2,
+                peer_id: remote.to_base58(),
+                from: PathKind::Relayed {
+                    relay_peer_id: peer(15).to_base58(),
+                },
+                to: PathKind::DirectPunched,
+                old_conn_id: 4,
+                new_conn_id: 5,
             })
         );
     }
