@@ -179,6 +179,11 @@ impl Hk {
     /// the probe dials it, and answers with `answer`. Returns the server the
     /// probe went to and the events the answer produced.
     fn probe(&mut self, answer: Answer<'_>, t: u64) -> (PeerId, Vec<NatEvent>) {
+        self.probe_taking(answer, t, 2)
+    }
+
+    /// [`Self::probe`], answered `span` ms after the tick.
+    fn probe_taking(&mut self, answer: Answer<'_>, t: u64, span: u64) -> (PeerId, Vec<NatEvent>) {
         self.agent.handle_tick(at(t));
         let mut actions = drain_actions(&mut self.agent);
         let dialed = self
@@ -201,14 +206,14 @@ impl Hk {
                 _ => None,
             })
             .expect("the tick starts a probe");
-        self.stream_ready(&server, stream, AUTONAT_PROTOCOL_ID, at(t + 1));
+        self.stream_ready(&server, stream, AUTONAT_PROTOCOL_ID, at(t + span.min(1)));
         let request = sent_data_on(&drain_actions(&mut self.agent), stream);
         let response = match answer {
             Answer::Public(addrs) => autonat_response(&request, Some(addrs)),
             Answer::DialError => autonat_response(&request, None),
             Answer::DialRefused => autonat_error_response(&request, ResponseStatus::DialRefused),
         };
-        self.stream_data(&server, stream, response, at(t + 2));
+        self.stream_data(&server, stream, response, at(t + span));
         (server, drain_events(&mut self.agent))
     }
 
@@ -566,6 +571,38 @@ fn a_settled_verdict_wakes_the_host_when_its_votes_expire() {
             ..
         }]
     ));
+    // Back to Unknown, it probes again at the unsettled cadence.
+    assert_eq!(
+        hk.agent.next_deadline(at(906_002)),
+        Some(Deadline::from_millis(911_002))
+    );
+}
+
+#[test]
+fn the_window_keeps_the_latest_servers_even_at_one_instant() {
+    let mut hk = build_with_config(ReservationPolicy::Never, 0, 6, |config| {
+        config.probe_interval_unsettled_ms = 0;
+        config.probe_interval_settled_ms = 0;
+    });
+    let public = [maddr(LISTEN_ADDR)];
+    // Every answer lands at 0ms. The first server's is inconclusive, so it
+    // votes last.
+    assert!(hk.probe_taking(Answer::DialRefused, 0, 0).1.is_empty());
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        events.extend(hk.probe_taking(Answer::DialError, 0, 0).1);
+    }
+    assert_eq!(hk.agent.reachability(), ReachabilityState::Private);
+    for _ in 0..3 {
+        events.extend(hk.probe_taking(Answer::Public(&public), 0, 0).1);
+    }
+    // The sixth vote pushes out the first private one, not itself: the
+    // latest five servers hold three public votes.
+    assert_eq!(
+        hk.agent.reachability(),
+        ReachabilityState::Public,
+        "{events:?}"
+    );
 }
 
 #[test]

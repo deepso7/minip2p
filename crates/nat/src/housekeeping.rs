@@ -166,6 +166,9 @@ struct Vote {
     /// The dialable addresses it confirmed; empty for a private vote.
     public_addrs: Vec<Multiaddr>,
     cast_at_ms: u64,
+    /// When it was recorded relative to the other votes, so votes cast at
+    /// one instant still have an order.
+    seq: u64,
 }
 
 /// AutoNAT probing that trusts a quorum of distinct servers.
@@ -180,6 +183,7 @@ pub(crate) struct Prober {
     verdict: ReachabilityState,
     /// The latest vote of each recent server.
     votes: BTreeMap<PeerId, Vote>,
+    next_vote_seq: u64,
     /// Most recently confirmed, directly dialable public addresses.
     public_addrs: Vec<Multiaddr>,
     flight: Option<ProbeFlight>,
@@ -192,6 +196,7 @@ impl Prober {
         Self {
             verdict: ReachabilityState::Unknown,
             votes: BTreeMap::new(),
+            next_vote_seq: 0,
             public_addrs: Vec::new(),
             flight: None,
             // Without configured servers there is nothing to schedule, and
@@ -481,8 +486,10 @@ impl Prober {
             Vote {
                 public_addrs,
                 cast_at_ms: now.monotonic_ms,
+                seq: self.next_vote_seq,
             },
         );
+        self.next_vote_seq += 1;
         self.settle_verdict(shared, now)
     }
 
@@ -500,7 +507,7 @@ impl Prober {
             let oldest = self
                 .votes
                 .iter()
-                .min_by_key(|(_, vote)| vote.cast_at_ms)
+                .min_by_key(|(_, vote)| vote.seq)
                 .map(|(server, _)| server.clone())
                 .expect("the window is over a positive size");
             self.votes.remove(&oldest);
@@ -542,6 +549,12 @@ impl Prober {
         }
         let old = core::mem::replace(&mut self.verdict, new);
         self.public_addrs = addrs;
+        if new == ReachabilityState::Unknown {
+            // Gather fresh evidence at the unsettled cadence, not the
+            // settled one the next probe may be waiting on.
+            let soon = now_ms.saturating_add(shared.config.probe_interval_unsettled_ms);
+            self.next_probe_at = self.next_probe_at.map(|due| due.min(soon));
+        }
         shared.push_event(NatEvent::ReachabilityChanged {
             old,
             new,
@@ -596,7 +609,7 @@ impl Prober {
     /// first, each in its server's order.
     fn quorum_addrs(&self, threshold: usize) -> Vec<Multiaddr> {
         let mut newest_first: Vec<&Vote> = self.votes.values().collect();
-        newest_first.sort_by_key(|vote| core::cmp::Reverse(vote.cast_at_ms));
+        newest_first.sort_by_key(|vote| core::cmp::Reverse(vote.seq));
         let mut confirmed = Vec::new();
         for addr in newest_first.iter().flat_map(|vote| &vote.public_addrs) {
             let votes = newest_first

@@ -53,8 +53,11 @@ pub struct RelayServerConfig {
     /// Most keys each enabled rate limiter tracks at once. Fully refilled
     /// buckets are dropped first; when the map is still full, a request with
     /// a new key is refused rather than evicting a depleted bucket, which
-    /// would hand its burst back. Zero refuses every request an enabled
-    /// limiter sees.
+    /// would hand its burst back. That fails closed: once the distinct keys
+    /// spending tokens within a refill interval outnumber this cap, new peers
+    /// or IPs are refused with `RESOURCE_LIMIT_EXCEEDED` until buckets
+    /// refill, so size it for the churn you expect. Zero refuses every
+    /// request an enabled limiter sees.
     pub max_rate_limit_entries: usize,
 }
 
