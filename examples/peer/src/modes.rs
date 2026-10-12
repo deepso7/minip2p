@@ -55,9 +55,9 @@ const AGENT: &str = "minip2p-peer/0.1.0";
 const ECHO_PROTOCOL: &str = "/minip2p/echo/1";
 /// One ping frame: 8-byte seq (BE) ++ 8-byte send-timestamp millis (BE).
 const FRAME_LEN: usize = 16;
-/// The most bytes one echo stream may queue behind its pending write (so it
-/// owes its peer at most twice this); a peer that sends more without reading
-/// is reset.
+/// The most bytes one echo stream may queue behind its pending write; a peer
+/// that sends more without reading is reset. Bytes arriving while nothing is
+/// pending go straight to the writer, within `ECHO_WRITE_BUDGET`.
 const ECHO_STREAM_LIMIT: usize = 64 * 1024;
 /// The most echo bytes the writer holds across every stream; a stream it
 /// cannot admit is reset like an overflowing one.
@@ -284,7 +284,9 @@ fn handle_listen_event(endpoint: &mut Endpoint, event: &EndpointEvent, echoes: &
         } => {
             let key = (*conn_id, *stream_id);
             if let Some(echo) = echoes.streams.get_mut(&key) {
-                if echo.backlog.len() + data.len() > ECHO_STREAM_LIMIT {
+                if echoes.writer.is_pending(*conn_id, *stream_id)
+                    && echo.backlog.len() + data.len() > ECHO_STREAM_LIMIT
+                {
                     drop_echo(endpoint, key, echoes, "the peer is not reading its echo");
                 } else {
                     echo.backlog.extend_from_slice(data);
@@ -301,7 +303,11 @@ fn handle_listen_event(endpoint: &mut Endpoint, event: &EndpointEvent, echoes: &
                 flush_echo(endpoint, key, echoes);
             }
         }
-        EndpointEvent::StreamClosed {
+        // A stopped write side can never carry the echo, so drop its backlog.
+        EndpointEvent::StreamWriteStopped {
+            conn_id, stream_id, ..
+        }
+        | EndpointEvent::StreamClosed {
             conn_id, stream_id, ..
         } => {
             echoes.streams.remove(&(*conn_id, *stream_id));

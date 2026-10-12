@@ -142,6 +142,11 @@ impl StreamWriter {
     /// A writer holding at most `budget` bytes of unsent tails across all
     /// streams. A write is admitted only if its whole payload fits in what
     /// is left, so the writer never holds more than `budget`.
+    ///
+    /// The budget counts payload lengths, as the ADR 0012 retained-slice
+    /// rule does: a `Bytes` slice of a larger buffer keeps that buffer alive
+    /// until the tail shrinks below half the slice and is copied out. Pass
+    /// owned payloads when the budget must bound the memory pinned.
     pub fn new(budget: usize) -> Self {
         Self {
             budget,

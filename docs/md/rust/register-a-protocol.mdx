@@ -31,11 +31,13 @@ Once the attempt settles `Connected`, request a stream. A protocol both peers re
 ```rust
 use std::time::{Duration, Instant};
 
-use minip2p::{ConnectOutcome, EndpointEvent, EndpointWaitOutcome};
+use minip2p::{ConnectOutcome, EndpointEvent, EndpointWaitOutcome, StreamWriter};
 
 let peer_id = target.peer_id().clone();
 let connect_id = node.connect(target)?;
 let mut stream = None;
+// Holds what a full stream does not accept yet (see Write backpressure below).
+let mut writer = StreamWriter::new(1024 * 1024);
 let deadline = Instant::now() + Duration::from_secs(10);
 
 loop {
@@ -45,6 +47,9 @@ loop {
         EndpointWaitOutcome::Deadline => return Err("stream negotiation timed out".into()),
         _ => continue, // interrupted by a WaitHandle
     };
+    // The writer sees every event: it resends a held tail on StreamWritable
+    // and sends the deferred FIN once that tail is accepted.
+    writer.observe(&mut node, &event);
 
     match event {
         EndpointEvent::ConnectSettled {
@@ -64,10 +69,9 @@ loop {
             protocol_id,
             ..
         } if peer == peer_id && Some((conn_id, ready)) == stream && protocol_id == ECHO_PROTOCOL => {
-            // `writer` is a `StreamWriter` (see Write backpressure below).
             writer.write(&mut node, conn_id, ready, b"hello".to_vec())?;
             writer.close_write(&mut node, conn_id, ready)?;
-            break;
+            // Keep dispatching: a held tail and the FIN finish from `observe`.
         }
         other => handle_other_event(other),
     }
