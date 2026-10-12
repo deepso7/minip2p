@@ -1061,12 +1061,14 @@ impl QuicConnection {
                     }
                 }
             } else {
-                let len = front.bytes.len().min(budget);
+                // At most this turn's budget; the whole write when it fits.
+                let offer = front.bytes.get(..budget).unwrap_or(&front.bytes);
+                let len = offer.len();
                 if len == 0 {
                     return progressed;
                 }
                 // Copies the accepted prefix, as in `send_stream`.
-                match self.conn.send_stream(stream).write(&front.bytes[..len]) {
+                match self.conn.send_stream(stream).write(offer) {
                     Ok(0) => return progressed,
                     Ok(written) => {
                         front.advance(written);

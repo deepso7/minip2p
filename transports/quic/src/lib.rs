@@ -42,10 +42,10 @@ mod stream_send_tests;
 #[cfg(test)]
 mod stream_tests;
 #[cfg(test)]
-mod write_fairness_tests;
-#[cfg(test)]
 mod test_peer;
 mod tls;
+#[cfg(test)]
+mod write_fairness_tests;
 
 pub use config::{QuicLimits, QuicNodeConfig};
 #[cfg(feature = "diagnostics")]
@@ -223,8 +223,9 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, TransportErr
     }
     if limits.max_pending_connection_bytes <= limits.control_stream_reserve_bytes {
         return Err(TransportError::InvalidConfig {
-            reason: "max_pending_connection_bytes must be greater than control_stream_reserve_bytes"
-                .into(),
+            reason:
+                "max_pending_connection_bytes must be greater than control_stream_reserve_bytes"
+                    .into(),
         });
     }
     // QUIC treats a zero idle timeout as "no timeout", which would keep dead

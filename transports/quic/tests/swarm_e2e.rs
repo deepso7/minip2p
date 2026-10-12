@@ -609,5 +609,8 @@ fn ping_completes_while_stuck_application_streams_fill_the_send_queue() {
     }
 
     assert!(ping_issued, "application streams never filled the queue");
-    assert!(rtt_measured, "ping must complete through the control reserve");
+    assert!(
+        rtt_measured,
+        "ping must complete through the control reserve"
+    );
 }

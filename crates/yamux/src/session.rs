@@ -359,8 +359,7 @@ impl YamuxSession {
             .streams
             .get_mut(&stream)
             .ok_or(YamuxError::UnknownStream(stream))?;
-        let total_room =
-            total_cap_for(config, state.control).saturating_sub(total_buffered_send);
+        let total_room = total_cap_for(config, state.control).saturating_sub(total_buffered_send);
         if state.local_write_closed || state.close_pending {
             return Err(YamuxError::StreamWriteClosed(stream));
         }
@@ -1447,7 +1446,7 @@ mod tests {
         // Application streams stop at the cap less the reserve.
         assert!(matches!(
             session.send(other_app, Bytes::from_static(b"xyz")),
-            Err(YamuxError::Full { unsent, .. }) if unsent == &b"xyz"[..]
+            Err(YamuxError::Full { unsent, .. }) if unsent == b"xyz"[..]
         ));
         session
             .send(control, Bytes::from_static(b"ping"))

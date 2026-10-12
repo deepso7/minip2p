@@ -893,9 +893,10 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         if self.connections.contains_key(&id) {
             // A session the mark fails is torn down by `operate_session`;
             // the caller has nothing to retry.
-            let _ = self.operate_session(id, |session| {
-                session.set_control_stream(stream_id, control)
-            });
+            match self.operate_session(id, |session| session.set_control_stream(stream_id, control))
+            {
+                Ok(()) | Err(_) => {}
+            }
         }
     }
 

@@ -154,8 +154,10 @@ pub enum YamuxOutput {
     ///
     /// One pending notification per armed stream: repeated Fulls before it
     /// fires coalesce into one. It fires when the stream can queue at least
-    /// half of the smaller of [`YamuxConfig::max_buffered_send`] and
-    /// [`YamuxConfig::max_total_buffered_send`]. Bytes leaving another stream
+    /// half of the smaller of [`YamuxConfig::max_buffered_send`] and the
+    /// part of [`YamuxConfig::max_total_buffered_send`] it may fill (all of it
+    /// for a control stream, all but
+    /// [`YamuxConfig::control_stream_reserve`] otherwise). Bytes leaving another stream
     /// free the shared cap, so this can fire for a stream that was blocked
     /// only by the total. It never fires after the stream's write side ended
     /// (`close_write`, reset, or close).

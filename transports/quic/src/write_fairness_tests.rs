@@ -60,10 +60,7 @@ fn a_stream_without_peer_credit_cannot_keep_other_streams_from_writable() {
 
     // The peer never reads `stuck`, so it keeps its backlog for good.
     let payload = Bytes::from(vec![7; 9 * 1024 * 1024]);
-    let taken = accepted(
-        &payload,
-        server.send_stream(id, stuck, payload.clone()),
-    );
+    let taken = accepted(&payload, server.send_stream(id, stuck, payload.clone()));
     let stream_cap = QuicLimits::default().max_pending_bytes_per_stream;
     assert!(
         taken <= 1_000 + stream_cap,

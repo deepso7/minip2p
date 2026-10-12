@@ -387,7 +387,11 @@ impl SecureMuxSession {
     /// or back as an application stream. Unknown substreams, and a session
     /// that is not established, are ignored; an error means flushing what the
     /// mark woke failed the session.
-    pub fn set_control_stream(&mut self, stream: StreamId, control: bool) -> Result<(), SessionError> {
+    pub fn set_control_stream(
+        &mut self,
+        stream: StreamId,
+        control: bool,
+    ) -> Result<(), SessionError> {
         let Ok(yamux_stream) = yamux_stream(stream) else {
             return Ok(());
         };
