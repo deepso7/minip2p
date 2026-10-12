@@ -3,6 +3,7 @@ use alloc::format;
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::{Cell, RefCell};
 use core::net::{Ipv4Addr, Ipv6Addr};
 use core::ops::RangeInclusive;
 
@@ -15,7 +16,7 @@ use minip2p_smoltcp::smoltcp::iface::{
 use minip2p_smoltcp::smoltcp::phy::Device;
 use minip2p_smoltcp::smoltcp::socket::tcp;
 use minip2p_smoltcp::smoltcp::time::Instant;
-use minip2p_smoltcp::smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
+use minip2p_smoltcp::smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 
 use crate::provider::{SocketHandle, TcpError, TcpEvent, TcpProvider, host_and_port};
 
@@ -265,6 +266,13 @@ pub struct SmoltcpTcpProvider<D: Device> {
     /// `poll` because computing it needs the interface mutably.
     poll_at: Option<u64>,
     read_buffer: Vec<u8>,
+    /// The interface addresses a wildcard listener answered on when the
+    /// address revision was last asked for, and how often they have moved
+    /// since. Interior: the host reconfigures the shared interface directly,
+    /// so the change is noticed when the revision is read, not when it
+    /// happens.
+    seen_ip_addrs: RefCell<Vec<IpCidr>>,
+    ip_addr_moves: Cell<u64>,
 }
 
 fn instant(millis: u64) -> Instant {
@@ -339,6 +347,8 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             ingress_pending: false,
             poll_at: None,
             read_buffer,
+            seen_ip_addrs: RefCell::new(Vec::new()),
+            ip_addr_moves: Cell::new(0),
         }
     }
 
@@ -1032,5 +1042,28 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
                     .collect(),
             })
             .collect()
+    }
+
+    /// Listeners are only ever added; a wildcard one also moves whenever the
+    /// interface's addresses do (DHCP, or a host reconfiguring the shared
+    /// stack), with no `listen` to say so.
+    fn local_addresses_revision(&self) -> Option<u64> {
+        if self
+            .listeners
+            .iter()
+            .any(|listener| listener.endpoint.addr.is_none())
+        {
+            let stack = self.stack.borrow();
+            let current = stack.interface.ip_addrs();
+            let mut seen = self.seen_ip_addrs.borrow_mut();
+            if seen.as_slice() != current {
+                seen.clear();
+                seen.extend_from_slice(current);
+                self.ip_addr_moves
+                    .set(self.ip_addr_moves.get().wrapping_add(1));
+            }
+        }
+        let listeners = u64::try_from(self.listeners.len()).unwrap_or(u64::MAX);
+        Some(listeners.wrapping_add(self.ip_addr_moves.get()))
     }
 }

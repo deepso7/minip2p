@@ -195,6 +195,38 @@ pub trait MdnsIo {
     }
 }
 
+/// A boxed carrier is a carrier, so a host can hold one behind
+/// `Box<dyn MdnsIo>` without naming its type.
+///
+/// Every method forwards, `poll` and `next_deadline` included: inheriting
+/// their do-nothing defaults would leave an embedded stack undriven while it
+/// looked like any other carrier.
+impl<I: MdnsIo + ?Sized> MdnsIo for alloc::boxed::Box<I> {
+    fn interfaces(&self) -> &[InterfaceSnapshot] {
+        (**self).interfaces()
+    }
+
+    fn refresh(&mut self) -> Result<bool, MdnsError> {
+        (**self).refresh()
+    }
+
+    fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<MdnsDatagram>, MdnsError> {
+        (**self).receive(buffer)
+    }
+
+    fn send(&mut self, action: &MdnsAction) -> Result<(), MdnsError> {
+        (**self).send(action)
+    }
+
+    fn poll(&mut self, now_ms: u64) -> Result<(), MdnsError> {
+        (**self).poll(now_ms)
+    }
+
+    fn next_deadline(&self, now_ms: u64) -> Option<u64> {
+        (**self).next_deadline(now_ms)
+    }
+}
+
 /// Whether `source` is on one of the networks this interface holds.
 ///
 /// mDNS is a link-local protocol, so a datagram from off-link is not a peer on
@@ -259,6 +291,47 @@ mod tests {
             family,
             addrs,
         }
+    }
+
+    /// A carrier that records its `poll` calls and reports a fixed timer,
+    /// so a test can tell forwarding from the trait defaults.
+    #[derive(Default)]
+    struct TimedCarrier {
+        polled_at: Vec<u64>,
+    }
+
+    impl MdnsIo for TimedCarrier {
+        fn interfaces(&self) -> &[InterfaceSnapshot] {
+            &[]
+        }
+        fn refresh(&mut self) -> Result<bool, MdnsError> {
+            Ok(false)
+        }
+        fn receive(&mut self, _: &mut [u8]) -> Result<Option<MdnsDatagram>, MdnsError> {
+            Ok(None)
+        }
+        fn send(&mut self, _: &MdnsAction) -> Result<(), MdnsError> {
+            Ok(())
+        }
+        fn poll(&mut self, now_ms: u64) -> Result<(), MdnsError> {
+            self.polled_at.push(now_ms);
+            Ok(())
+        }
+        fn next_deadline(&self, now_ms: u64) -> Option<u64> {
+            Some(now_ms + 7)
+        }
+    }
+
+    #[test]
+    fn a_boxed_carrier_forwards_poll_and_next_deadline() {
+        let mut boxed: alloc::boxed::Box<dyn MdnsIo> =
+            alloc::boxed::Box::new(TimedCarrier::default());
+        boxed.poll(42).expect("poll");
+        assert_eq!(boxed.next_deadline(10), Some(17));
+
+        let mut boxed = alloc::boxed::Box::new(TimedCarrier::default());
+        MdnsIo::poll(&mut boxed, 5).expect("poll");
+        assert_eq!(boxed.polled_at, vec![5]);
     }
 
     #[test]

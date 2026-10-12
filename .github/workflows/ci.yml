@@ -98,6 +98,8 @@ jobs:
       - run: cargo check --no-default-features --features portable-autonat --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo check --no-default-features --features portable-relay --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo check --no-default-features --features portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
+      - run: cargo check --no-default-features --features portable-mdns,pubsub,portable-relay --target thumbv7em-none-eabi -p minip2p-rs
+      - run: cargo check --no-default-features --features smoltcp,portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo doc --workspace --no-deps
       - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps
       - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
@@ -107,6 +109,7 @@ jobs:
       - run: cargo doc -p minip2p-rs --no-default-features --features smoltcp,pubsub --no-deps
       - run: cargo doc -p minip2p-rs --no-default-features --features portable-autonat --no-deps
       - run: cargo doc -p minip2p-rs --no-default-features --features portable-relay --no-deps
+      - run: cargo doc -p minip2p-rs --no-default-features --features smoltcp,portable-relay,pubsub --no-deps
       - run: cargo bench -p minip2p-core --bench multiaddr --no-run
       - run: cargo metadata --no-deps --format-version 1 | jq -e '[.packages[] | select(.publish != []) | .readme != null] | all'
       - run: cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name' | while read package; do cargo package -p "$package" --list | grep -q '^README.md$' || exit 1; done

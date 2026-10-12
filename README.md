@@ -85,7 +85,7 @@ let endpoint = minip2p::Endpoint::builder()
 # Ok::<(), minip2p::Error>(())
 ```
 
-On bare-metal or other `no_std` hosts, turn off default features and build with `Endpoint::portable(...)`, supplying time samples, entropy, and a transport. With `smoltcp`, you get TCP plus optional mDNS, discovery, pubsub, AutoNAT, and relay on one embedded stack. See the [`minip2p-rs` crate guide](crates/minip2p/README.md#portable-endpoint).
+On bare-metal or other `no_std` hosts, turn off default features and build a `PortableEndpoint` with `Endpoint::portable(...)`, supplying time samples, entropy, and any transport. It runs the same engine and event order as the std `Endpoint`, and adds mDNS, discovery, pubsub, AutoNAT, and relay over any transport; with `smoltcp`, TCP and mDNS share one embedded stack. See the [`minip2p-rs` crate guide](crates/minip2p/README.md#portable-endpoint).
 
 For a complete application, run the gossipsub chat example:
 

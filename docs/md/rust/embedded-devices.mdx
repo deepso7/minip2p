@@ -24,6 +24,8 @@ Add only what you need:
 | `portable-autonat` | AutoNAT probing over the portable endpoint |
 | `portable-relay` | Relay-only circuit connections; includes portable AutoNAT |
 
+None of these needs smoltcp: they configure the same `PortableEndpoint` over any transport you build yourself (`Endpoint::portable(..).build(transport)`, or `build_with_circuits` over a `CircuitTransport` for relays). `.smoltcp(stack)` is the shortcut that builds TCP and mDNS on one stack for you.
+
 The QUIC adapter needs `std`, so embedded endpoints cannot use QUIC or DCUtR. They can still use relay circuits.
 
 ## What you supply
@@ -66,7 +68,7 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
     .build()?;
 ```
 
-Prefer a real interface address over `0.0.0.0` when Identify and discovery should advertise something peers can dial right away. When DHCP or SLAAC changes the interface addresses, update the shared smoltcp interface; the adapters see that on later polls.
+Prefer a real interface address over `0.0.0.0` when Identify and discovery should advertise something peers can dial right away. When DHCP or SLAAC changes the interface addresses, update the shared smoltcp interface through a `SmoltcpStack` clone you kept from before `.smoltcp(stack)`; a wildcard listener follows the change on later polls, and Identify advertises the new address without another `listen`.
 
 Optional services go on the same builder. The following example requires the `smoltcp` and `pubsub` features because signed discovery uses pubsub:
 
@@ -83,7 +85,7 @@ For this combination, install with `cargo add minip2p-rs --no-default-features -
 
 ## Drive time and network progress
 
-No executor, no background thread. Sample the monotonic clock once, pass that same `Now` into the endpoint, handle every event, then use `next_deadline` to decide how long the board may sleep. `poll(now)` and `shutdown(now)` return `Vec<EndpointEvent>`; enabled services add `EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, and `EndpointEvent::Discovery` variants:
+No executor, no background thread. Sample the monotonic clock once, pass that same `Now` into the endpoint, handle every event, then use `next_deadline` to decide how long the board may sleep. Each `poll` runs one batch and returns its events in the same order as the hosted endpoint: swarm events, then capability events, then `ConnectSettled` terminals. `poll(now)` and `shutdown(now)` return `Vec<EndpointEvent>`; enabled services add `EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, and `EndpointEvent::Discovery` variants:
 
 ```rust
 use minip2p::{EndpointEvent, Now};

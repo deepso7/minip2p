@@ -1173,6 +1173,11 @@ impl Transport for QuicTransport {
             .collect()
     }
 
+    /// Sockets are bound once, at construction, so the set never changes.
+    fn local_addresses_revision(&self) -> Option<u64> {
+        Some(0)
+    }
+
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         self.connections
             .values()

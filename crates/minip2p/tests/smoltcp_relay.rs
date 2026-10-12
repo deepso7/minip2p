@@ -1,6 +1,6 @@
 //! Three-node portable relay gate over a virtual smoltcp IP network.
 
-#![cfg(feature = "portable-relay")]
+#![cfg(all(feature = "smoltcp", feature = "portable-relay"))]
 #![expect(
     clippy::unwrap_used,
     clippy::panic,
@@ -196,7 +196,10 @@ impl RelayService {
 
     fn handle(
         &mut self,
-        endpoint: &mut minip2p::SmoltcpEndpoint<BusDevice, CountingEntropy>,
+        endpoint: &mut minip2p::PortableEndpoint<
+            minip2p::SmoltcpTransport<BusDevice, CountingEntropy>,
+            minip2p::SharedEntropy<CountingEntropy>,
+        >,
         event: EndpointEvent,
         now: Now,
     ) {

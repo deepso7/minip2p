@@ -11,9 +11,9 @@ use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, select_direct_addrs};
 #[cfg(feature = "pubsub")]
 use minip2p_discovery::{BeaconAction, BeaconAgent, BeaconEvent};
 use minip2p_discovery::{DiscoveryAction, DiscoverySource, PeerDiscoveryAgent};
-#[cfg(any(feature = "mdns", feature = "portable-mdns"))]
+#[cfg(feature = "_mdns-driver")]
 use minip2p_mdns::MdnsEvent;
-#[cfg(all(debug_assertions, any(feature = "discovery", feature = "mdns")))]
+#[cfg(feature = "_nat-driver")]
 use minip2p_nat::NatEvent;
 use minip2p_platform::{EntropySource, Now};
 #[cfg(feature = "pubsub")]
@@ -57,13 +57,10 @@ fn direct_candidates(addrs: &[Multiaddr], peer: &PeerId) -> Vec<PeerAddr> {
 
 /// An admitted attempt awaiting `NatDriver::attach_leg`.
 #[cfg_attr(
-    not(any(
-        feature = "portable-autonat",
-        all(feature = "nat", any(feature = "discovery", feature = "mdns"))
-    )),
+    not(feature = "_nat-driver"),
     expect(
         dead_code,
-        reason = "only compositions applying DiscoveryNatWork read the fields"
+        reason = "only NAT compositions apply DiscoveryNatWork and read the fields"
     )
 )]
 pub(crate) struct PendingLeg {
@@ -78,9 +75,7 @@ pub(crate) struct PendingLeg {
 }
 
 /// NAT-driver work a [`DiscoveryDriver::sweep`] or
-/// [`DiscoveryDriver::shutdown`] queued. The composition drains it because
-/// attaching legs and pumping actions needs its concrete transport while
-/// the sweep itself only needs [`Transport`].
+/// [`DiscoveryDriver::shutdown`] queued, for `NatDriver::apply_sweep_work`.
 #[derive(Default)]
 #[must_use = "apply with NatDriver::apply_sweep_work or the queued NAT work is lost"]
 pub(crate) struct DiscoveryNatWork {
@@ -95,8 +90,8 @@ pub(crate) struct DiscoveryNatWork {
 }
 
 /// Coordinates source observations, the shared peer book, and automatic
-/// connects. The same driver backs the standard `Endpoint` and the portable
-/// mDNS/smoltcp compositions; only the clock sample and transport differ.
+/// connects. The endpoint engine owns one; only the clock sample and the
+/// transport differ between the standard and portable endpoints.
 pub(crate) struct DiscoveryDriver {
     /// Peer book; the endpoint drains its events into the Endpoint stream.
     pub(crate) book: PeerDiscoveryAgent,
@@ -125,18 +120,16 @@ impl DiscoveryDriver {
         }
     }
 
-    /// Beacon topic, when signed beacons are configured. Only pubsub-capable
-    /// endpoint compositions read it, for the reserved-topic guard.
-    #[cfg(all(feature = "pubsub", any(feature = "discovery", feature = "smoltcp")))]
+    /// Beacon topic, when signed beacons are configured, for the
+    /// reserved-topic guard.
+    #[cfg(feature = "pubsub")]
     pub(crate) fn topic(&self) -> Option<&str> {
         self.beacon.as_ref().map(BeaconAgent::topic)
     }
 
     /// Moves queued book events into `out` as Endpoint events.
-    pub(crate) fn drain_events(&mut self, out: &mut Vec<EndpointEvent>) {
-        while let Some(event) = self.book.poll_event() {
-            out.push(EndpointEvent::Discovery(event));
-        }
+    pub(crate) fn drain_events(&mut self, out: &mut impl Extend<EndpointEvent>) {
+        out.extend(core::iter::from_fn(|| self.book.poll_event()).map(EndpointEvent::Discovery));
     }
 
     /// The earliest timeout across book and beacon at `now_ms`.
@@ -159,9 +152,10 @@ impl DiscoveryDriver {
         timeout
     }
 
-    /// Whether `event` belongs to a discovery-owned attempt that the sweep
-    /// must hide before the Endpoint drains NAT output.
-    #[cfg(all(debug_assertions, any(feature = "discovery", feature = "mdns")))]
+    /// Whether `event` belongs to an attempt automatic dialing owns: NAT
+    /// routing consumes those after the Connection engine observes them,
+    /// so they never reach the application.
+    #[cfg(feature = "_nat-driver")]
     pub(crate) fn owns_nat_event(&self, event: &NatEvent) -> bool {
         event
             .connect_id()
@@ -193,7 +187,7 @@ impl DiscoveryDriver {
     }
 
     /// Feeds an mDNS observation into the book.
-    #[cfg(any(feature = "mdns", feature = "portable-mdns"))]
+    #[cfg(feature = "_mdns-driver")]
     pub(crate) fn handle_mdns_event(&mut self, event: MdnsEvent, now_ms: u64) {
         match event {
             MdnsEvent::PeerObserved { peer, addrs } => {
@@ -231,53 +225,20 @@ impl DiscoveryDriver {
         true
     }
 
-    /// Removes queued NAT events owned by automatic-dial attempts, feeding
-    /// each to the Connection-attempt engine first. Returns `true` when any
-    /// were claimed.
-    ///
-    /// The sweep calls this between actions; compositions must call it again
-    /// after `NatDriver::apply_sweep_work`, because attaching a leg can queue
-    /// a synchronous terminal (for example `ConnectFailed` from a relay that
-    /// offers no HOP) after the sweep's own pass already ran.
-    #[cfg(feature = "_nat-driver")]
-    pub(crate) fn claim_nat_events<T: Transport, E: EntropySource>(
-        &mut self,
-        nat: &mut NatDriver<E>,
-        connect: &mut ConnectEngine,
-        runtime: &mut SwarmCore<T, E>,
-        now_ms: u64,
-    ) -> bool {
-        let mut claimed = false;
-        let mut i = 0;
-        while let Some(event) = nat.event_at(i) {
-            if event
-                .connect_id()
-                .is_some_and(|id| self.inflight.contains_key(&id))
-            {
-                claimed = true;
-                let event = nat.remove_event(i);
-                connect.observe_nat(&event, runtime, now_ms);
-            } else {
-                i += 1;
-            }
-        }
-        claimed
-    }
-
     /// Runs all cross-driver work until no new work is produced.
     ///
     /// Feed queued mDNS observations with [`Self::handle_mdns_event`] first:
     /// they are part of the same fixpoint as beacon and book output.
     ///
     /// NAT legs for attempts admitted here and pumps for cancelled legs are
-    /// returned as [`DiscoveryNatWork`]; the composition applies them with
-    /// `NatDriver::apply_sweep_work` against its concrete transport. On the
-    /// standard Endpoint `expand` starts Name resolution off the driver, so a
-    /// sweep never blocks on a lookup.
+    /// returned as [`DiscoveryNatWork`]; the endpoint applies them with
+    /// `NatDriver::apply_sweep_work`, and routes the NAT events that
+    /// produces afterwards. On the standard Endpoint `expand` starts Name
+    /// resolution off the driver, so a sweep never blocks on a lookup.
     pub(crate) fn sweep<T: Transport, E: EntropySource>(
         &mut self,
         #[cfg(feature = "pubsub")] mut pubsub: Option<&mut GossipsubDriver>,
-        #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<E>>,
+        #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<T>>,
         connect: &mut ConnectEngine,
         runtime: &mut SwarmCore<T, E>,
         expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
@@ -317,15 +278,6 @@ impl DiscoveryDriver {
                         _ => false,
                     });
                 }
-            }
-
-            // Discovery-owned attempt events are hidden from the app, but
-            // the engine must observe them first: cancelled-leg pumps in
-            // this same sweep can queue them after the pre-sweep
-            // `feed_unobserved_to_connect` pass.
-            #[cfg(feature = "_nat-driver")]
-            if let Some(nat) = nat.as_deref_mut() {
-                progressed |= self.claim_nat_events(nat, connect, runtime, now_ms);
             }
 
             #[cfg(feature = "pubsub")]
@@ -433,7 +385,7 @@ impl DiscoveryDriver {
         &mut self,
         peer: &PeerId,
         connect: &mut ConnectEngine,
-        #[cfg(feature = "_nat-driver")] nat: Option<&mut NatDriver<E>>,
+        #[cfg(feature = "_nat-driver")] nat: Option<&mut NatDriver<T>>,
         runtime: &mut SwarmCore<T, E>,
         now: Now,
         work: &mut DiscoveryNatWork,
@@ -454,7 +406,7 @@ impl DiscoveryDriver {
 
     /// Cancels all discovery-owned attempts during endpoint shutdown. The
     /// returned work carries whether the NAT driver must pump afterwards.
-    #[cfg(any(feature = "mdns", feature = "portable-mdns"))]
+    #[cfg(feature = "_mdns-driver")]
     #[cfg_attr(
         not(feature = "_nat-driver"),
         expect(
@@ -466,7 +418,7 @@ impl DiscoveryDriver {
     pub(crate) fn shutdown<T: Transport, E: EntropySource>(
         &mut self,
         connect: &mut ConnectEngine,
-        #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<E>>,
+        #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<T>>,
         runtime: &mut SwarmCore<T, E>,
         now: Now,
     ) -> DiscoveryNatWork {
@@ -486,7 +438,7 @@ impl DiscoveryDriver {
     }
 }
 
-#[cfg(all(test, any(feature = "mdns", feature = "portable-mdns")))]
+#[cfg(all(test, feature = "_mdns-driver"))]
 mod tests {
     use super::*;
     use alloc::vec;

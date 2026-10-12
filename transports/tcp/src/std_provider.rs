@@ -766,6 +766,12 @@ impl TcpProvider for StdTcpProvider {
             .map(|listener| listener.bound.clone())
             .collect()
     }
+
+    /// Listeners are only ever added, and each reports the address it was
+    /// bound to, so their count is the revision.
+    fn local_addresses_revision(&self) -> Option<u64> {
+        Some(u64::try_from(self.listeners.len()).unwrap_or(u64::MAX))
+    }
 }
 
 impl BlockingTcpProvider for StdTcpProvider {

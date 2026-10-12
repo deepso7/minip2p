@@ -234,10 +234,8 @@ fn autonat_picks_up_listen_addresses_bound_after_build() {
         now_ms += 100;
     }
 
-    // Binding through the core accessor must reach the agent just like
-    // the endpoint's own listen path.
+    // A post-build listen must reach the agent too.
     endpoint
-        .core_mut()
         .listen(
             &format!("/ip4/{DIALER_IP}/tcp/4001")
                 .parse()
@@ -525,6 +523,81 @@ fn portable_connect_settles_over_smoltcp_tcp() {
         }
     }
     panic!("portable connect did not settle\n  dialer: {dialer_events:?}");
+}
+
+/// The host reconfigures a wildcard listener's interface through a stack
+/// handle it kept, with no further `listen`: the endpoint's warmed address
+/// cache must notice, so Identify advertises the new address.
+#[test]
+fn identify_follows_an_interface_address_change_under_a_wildcard_listener() {
+    let wire = Wire::default();
+    let dialer_identity = identity(5);
+    let listener_identity = identity(6);
+    let listener_peer = listener_identity.peer_id();
+    let mut dialer = endpoint(
+        wire.dialer_device(),
+        &format!("{DIALER_IP}/24"),
+        &dialer_identity,
+        31,
+    );
+    let listener_stack = stack(wire.listener_device(), &format!("{LISTENER_IP}/24"));
+    let mut listener = Endpoint::portable(&listener_identity, CountingEntropy(42))
+        .protocol(PROTOCOL)
+        .build(transport_on_stack(
+            listener_stack.clone(),
+            listener_identity.clone(),
+            41,
+        ))
+        .expect("listener builds");
+    listener
+        .listen(&"/ip4/0.0.0.0/tcp/4001".parse().expect("wildcard"))
+        .expect("listener binds the wildcard");
+    for now_ms in 0..3 {
+        listener
+            .poll(Now::from_millis(now_ms))
+            .expect("warm the cache");
+    }
+
+    let added: Multiaddr = "/ip4/192.168.1.50/tcp/4001".parse().expect("added address");
+    listener_stack
+        .borrow_mut()
+        .interface
+        .update_ip_addrs(|addrs| {
+            addrs
+                .push("192.168.1.50/24".parse::<IpCidr>().expect("cidr"))
+                .expect("room for a second address");
+        });
+
+    let target = PeerAddr::new(
+        format!("/ip4/{LISTENER_IP}/tcp/4001")
+            .parse()
+            .expect("listener address"),
+        listener_peer.clone(),
+    )
+    .expect("peer address");
+    dialer
+        .connect(target, Now::from_millis(3))
+        .expect("admitted");
+    let mut now_ms = 3;
+    for _ in 0..MAX_STEPS {
+        let now = Now::from_millis(now_ms);
+        dialer.poll(now).expect("dialer polls");
+        listener.poll(now).expect("listener polls");
+        if let Some(info) = dialer.peer_info(&listener_peer) {
+            assert!(
+                info.listen_addrs.contains(&added.to_bytes()),
+                "Identify still advertises the old interface addresses"
+            );
+            return;
+        }
+        if wire.is_quiet() {
+            let deadline =
+                PollDeadline::earliest_opt(dialer.next_deadline(now), listener.next_deadline(now))
+                    .expect("connect wedged");
+            now_ms = now_ms.max(deadline.as_millis());
+        }
+    }
+    panic!("Identify never arrived");
 }
 
 #[test]
