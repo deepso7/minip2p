@@ -3,7 +3,7 @@
 //! defers the FIN behind it, and forgets it once the stream or its
 //! connection ends.
 
-#![cfg(feature = "tcp")]
+#![cfg(all(feature = "std", feature = "tcp"))]
 
 use std::time::{Duration, Instant};
 
