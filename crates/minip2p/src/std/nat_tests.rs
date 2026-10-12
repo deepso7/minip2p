@@ -49,7 +49,9 @@ fn negotiated_bridge() -> BridgePair {
     let local_addr = local.listen().expect("local listens");
     local.core_mut().dial(&relay_addr).expect("dial relay");
 
-    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    // A failure backstop only: under a loaded test run the loopback handshake
+    // can take seconds (see .config/nextest.toml).
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
     let mut inner_conn = None;
     let mut relay_conn = None;
     let mut local_ready = false;
