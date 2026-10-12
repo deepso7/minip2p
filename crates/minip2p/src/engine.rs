@@ -596,9 +596,14 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
 
     /// The batch's one capability pass: driver timers, the discovery sweep,
     /// and the external-address refresh when an input moved.
+    #[cfg_attr(
+        not(feature = "_discovery-driver"),
+        expect(
+            unused_variables,
+            reason = "only the discovery sweep expands candidates"
+        )
+    )]
     fn capability_pass(&mut self, now: Now, expand: &mut dyn FnMut(&PeerAddr) -> Expansion) {
-        // Only the discovery sweep expands candidates.
-        let _ = &expand;
         #[cfg(test)]
         {
             self.stats.capability_passes += 1;

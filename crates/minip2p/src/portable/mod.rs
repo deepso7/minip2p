@@ -1,6 +1,6 @@
 extern crate alloc;
 
-#[cfg(feature = "_mdns-driver")]
+#[cfg(feature = "portable-mdns")]
 use alloc::boxed::Box;
 #[cfg(feature = "smoltcp")]
 use alloc::string::ToString;
@@ -91,10 +91,37 @@ impl Endpoint {
 }
 
 /// The mDNS carrier a portable endpoint holds: any caller-owned `MdnsIo`.
-#[cfg(feature = "_mdns-driver")]
+#[cfg(feature = "portable-mdns")]
 type PortableCarrier = Box<dyn MdnsIo>;
+#[cfg(all(feature = "_mdns-driver", not(feature = "portable-mdns")))]
+type PortableCarrier = NoMdns;
 #[cfg(not(feature = "_mdns-driver"))]
 type PortableCarrier = ();
+
+/// The carrier of a portable endpoint built without `portable-mdns`, when the
+/// std `mdns` feature still compiles the driver in. Uninhabited: such an
+/// endpoint cannot run mDNS, and stays `Send`.
+#[cfg(all(feature = "_mdns-driver", not(feature = "portable-mdns")))]
+pub(crate) enum NoMdns {}
+
+#[cfg(all(feature = "_mdns-driver", not(feature = "portable-mdns")))]
+impl MdnsIo for NoMdns {
+    fn interfaces(&self) -> &[minip2p_mdns::InterfaceSnapshot] {
+        match *self {}
+    }
+
+    fn refresh(&mut self) -> Result<bool, MdnsError> {
+        match *self {}
+    }
+
+    fn receive(&mut self, _: &mut [u8]) -> Result<Option<minip2p_mdns::MdnsDatagram>, MdnsError> {
+        match *self {}
+    }
+
+    fn send(&mut self, _: &minip2p_mdns::MdnsAction) -> Result<(), MdnsError> {
+        match *self {}
+    }
+}
 
 /// Candidate expansion for portable endpoints: addresses are already
 /// concrete, so expansion is the identity.
@@ -104,9 +131,10 @@ fn expand_concrete(addr: &PeerAddr) -> Expansion {
 
 /// Caller-driven endpoint over an injected transport and entropy source.
 ///
-/// It is `Send` whenever its transport and entropy source are, unless mDNS
-/// is compiled in (`portable-mdns`): the carrier is held as a
-/// `Box<dyn MdnsIo>`, which embedded carriers on a shared stack are not.
+/// It is `Send` whenever its transport and entropy source are, unless
+/// `portable-mdns` (or `smoltcp`, which enables it) is compiled in: the
+/// carrier is then held as a `Box<dyn MdnsIo>`, which embedded carriers on a
+/// shared stack are not. The std `mdns` feature alone does not affect it.
 ///
 /// Portable entry point for embedded systems and deterministic event loops.
 /// It performs no blocking and never reads a system clock. Callers drive it
@@ -506,11 +534,11 @@ pub enum PortableBuildError {
     #[error("invalid listen address {address}: {reason}")]
     ListenAddress { address: String, reason: String },
     /// The mDNS carrier could not be constructed.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "portable-mdns")]
     #[error(transparent)]
     Mdns(#[from] MdnsError),
     /// mDNS wire or scheduling policy was invalid.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "portable-mdns")]
     #[error(transparent)]
     MdnsConfig(#[from] MdnsConfigError),
     /// Gossipsub configuration was invalid.
@@ -568,7 +596,7 @@ pub struct PortableEndpointBuilder<E> {
     beacon: Option<BeaconConfig>,
     #[cfg(feature = "_discovery-driver")]
     peer_discovery: PeerDiscoveryConfig,
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "portable-mdns")]
     mdns: Option<(PortableCarrier, MdnsConfig)>,
 }
 
@@ -588,7 +616,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
             beacon: None,
             #[cfg(feature = "_discovery-driver")]
             peer_discovery: PeerDiscoveryConfig::default(),
-            #[cfg(feature = "_mdns-driver")]
+            #[cfg(feature = "portable-mdns")]
             mdns: None,
         }
     }
@@ -710,7 +738,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     /// entropy. Peer-book and automatic-dial policy comes from
     /// [`Self::peer_discovery_config`]. The endpoint polls the transport
     /// again after each mDNS tick, in case the carrier shares its stack.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "portable-mdns")]
     pub fn mdns(mut self, io: impl MdnsIo + 'static, config: MdnsConfig) -> Self {
         self.mdns = Some((Box::new(io), config));
         self
@@ -846,7 +874,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
             engine.gossipsub = pubsub.map(GossipsubDriver::new);
         }
 
-        #[cfg(feature = "_mdns-driver")]
+        #[cfg(feature = "portable-mdns")]
         if let Some((io, config)) = self.mdns {
             let mut seed = [0; 32];
             engine.core.entropy_mut().fill_bytes(&mut seed)?;
@@ -1293,10 +1321,10 @@ mod tests {
 
     /// An mDNS carrier with no interfaces whose driving fails, as a stack
     /// that has gone away does.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "portable-mdns")]
     struct BrokenMdns;
 
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "portable-mdns")]
     impl MdnsIo for BrokenMdns {
         fn interfaces(&self) -> &[minip2p_mdns::InterfaceSnapshot] {
             &[]
@@ -1323,7 +1351,7 @@ mod tests {
 
     /// A stream whose close is still queued in the endpoint is gone from
     /// the swarm, yet abandoning it drops every queued event for it.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "portable-mdns")]
     #[test]
     fn abandoning_a_stream_closed_in_held_events_drops_them() {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
@@ -1366,7 +1394,7 @@ mod tests {
 
     /// A failed mDNS tick keeps the events the batch already queued: the
     /// deadline turns immediate, and the next poll returns them.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "portable-mdns")]
     #[test]
     fn a_failed_mdns_poll_keeps_its_collected_events_for_the_next() {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);

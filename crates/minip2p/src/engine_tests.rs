@@ -43,7 +43,7 @@ struct FlashTransport {
 }
 
 impl FlashTransport {
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "portable-mdns")]
     fn polls(&self) -> usize {
         *self.polls.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -371,10 +371,10 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
 }
 
 /// An mDNS carrier that is always idle.
-#[cfg(feature = "_mdns-driver")]
+#[cfg(feature = "portable-mdns")]
 struct IdleCarrier(Arc<Mutex<usize>>);
 
-#[cfg(feature = "_mdns-driver")]
+#[cfg(feature = "portable-mdns")]
 impl minip2p_mdns::MdnsIo for IdleCarrier {
     fn interfaces(&self) -> &[minip2p_mdns::InterfaceSnapshot] {
         &[]
@@ -399,7 +399,7 @@ impl minip2p_mdns::MdnsIo for IdleCarrier {
 
 /// A carrier on the transport's stack can put bytes into its sockets, so
 /// the batch polls the transport again after the mDNS tick.
-#[cfg(feature = "_mdns-driver")]
+#[cfg(feature = "portable-mdns")]
 #[test]
 fn a_portable_mdns_batch_polls_the_transport_around_the_tick() {
     let identity = Ed25519Keypair::from_secret_key_bytes([44; 32]);
@@ -423,7 +423,7 @@ fn a_portable_mdns_batch_polls_the_transport_around_the_tick() {
 /// Portable capabilities need no smoltcp: Gossipsub, signed discovery, and
 /// mDNS compose over any transport (the crate's `no_std` matrix runs this
 /// with only `portable-mdns,pubsub`).
-#[cfg(all(feature = "pubsub", feature = "_mdns-driver"))]
+#[cfg(all(feature = "pubsub", feature = "portable-mdns"))]
 #[test]
 fn portable_capabilities_compose_over_a_plain_transport() {
     let identity = Ed25519Keypair::from_secret_key_bytes([45; 32]);
@@ -447,9 +447,9 @@ fn portable_capabilities_compose_over_a_plain_transport() {
 }
 
 /// A plain portable endpoint over `Send` parts can move to another thread:
-/// only capabilities that need it (an mDNS carrier, smoltcp's shared
-/// entropy) make it single-threaded.
-#[cfg(not(feature = "_mdns-driver"))]
+/// only capabilities that need it (a `portable-mdns` carrier, smoltcp's shared
+/// entropy) make it single-threaded. The std `mdns` feature keeps it `Send`.
+#[cfg(not(feature = "portable-mdns"))]
 const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<crate::PortableEndpoint<FlashTransport, CountingEntropy>>();
