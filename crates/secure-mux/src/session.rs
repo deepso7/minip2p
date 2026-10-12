@@ -4,15 +4,13 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{Bytes, SansIoProtocol};
+use minip2p_core::Bytes;
 use minip2p_identity::{Ed25519Keypair, PeerId};
-use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
-use minip2p_noise::{
-    NOISE_PROTOCOL_ID, NoiseConfig, NoiseInput, NoiseOutput, NoiseRole, NoiseSession,
-};
+use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
+use minip2p_noise::{NOISE_PROTOCOL_ID, NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
 use minip2p_platform::{Deadline, Now};
 use minip2p_transport::StreamId;
-use minip2p_yamux::{YAMUX_PROTOCOL_ID, YamuxInput, YamuxOutput, YamuxRole, YamuxSession};
+use minip2p_yamux::{YAMUX_PROTOCOL_ID, YamuxOutput, YamuxRole, YamuxSession};
 use thiserror::Error;
 
 pub use minip2p_yamux::{KEEPALIVE_INTERVAL_MS, YamuxConfig, YamuxError};
@@ -242,11 +240,7 @@ impl SecureMuxSession {
         let phase = self.take_phase()?;
         let phase = match phase {
             Phase::SelectNoise { mut select, noise } => {
-                select
-                    .handle_input(MultistreamInput::Start)
-                    .map_err(|error| {
-                        SessionError::protocol(format!("Noise multistream start failed: {error}"))
-                    })?;
+                select.start();
                 self.drain_raw_select(&mut select)?;
                 Phase::SelectNoise { select, noise }
             }
@@ -475,11 +469,7 @@ impl SecureMuxSession {
                 mut select,
                 mut noise,
             } => {
-                select
-                    .handle_input(MultistreamInput::Data(data))
-                    .map_err(|error| {
-                        SessionError::protocol(format!("Noise multistream failed: {error}"))
-                    })?;
+                select.on_data(&data);
                 let mut negotiated = false;
                 while let Some(output) = select.poll_output() {
                     match output {
@@ -507,7 +497,7 @@ impl SecureMuxSession {
                 let mut noise = noise
                     .take()
                     .ok_or_else(|| SessionError::protocol("Noise session unavailable"))?;
-                noise.handle_input(NoiseInput::Start).map_err(|error| {
+                noise.start().map_err(|error| {
                     SessionError::protocol(format!("Noise start failed: {error}"))
                 })?;
                 let (peer, decrypted) = self.drain_noise(&mut noise)?;
@@ -523,11 +513,9 @@ impl SecureMuxSession {
                 }
             }
             Phase::Noise { mut noise } => {
-                noise
-                    .handle_input(NoiseInput::Data(data))
-                    .map_err(|error| {
-                        SessionError::protocol(format!("Noise handshake failed: {error}"))
-                    })?;
+                noise.on_data(data).map_err(|error| {
+                    SessionError::protocol(format!("Noise handshake failed: {error}"))
+                })?;
                 let (peer, decrypted) = self.drain_noise(&mut noise)?;
                 let Some(peer) = peer else {
                     if !decrypted.is_empty() {
@@ -543,11 +531,7 @@ impl SecureMuxSession {
                         MultistreamSelect::listener([YAMUX_PROTOCOL_ID.to_string()])
                     }
                 };
-                select
-                    .handle_input(MultistreamInput::Start)
-                    .map_err(|error| {
-                        SessionError::protocol(format!("Yamux multistream start failed: {error}"))
-                    })?;
+                select.start();
                 self.drain_encrypted_select(&mut noise, &mut select)?;
                 let mut phase = Phase::SelectYamux {
                     noise,
@@ -564,11 +548,9 @@ impl SecureMuxSession {
                 select,
                 peer,
             } => {
-                noise
-                    .handle_input(NoiseInput::Data(data))
-                    .map_err(|error| {
-                        SessionError::protocol(format!("Noise transport failed: {error}"))
-                    })?;
+                noise.on_data(data).map_err(|error| {
+                    SessionError::protocol(format!("Noise transport failed: {error}"))
+                })?;
                 let (unexpected_peer, decrypted) = self.drain_noise(&mut noise)?;
                 if unexpected_peer.is_some() {
                     return Err(SessionError::protocol("Noise authenticated twice"));
@@ -588,17 +570,15 @@ impl SecureMuxSession {
                 mut yamux,
                 peer,
             } => {
-                noise
-                    .handle_input(NoiseInput::Data(data))
-                    .map_err(|error| {
-                        SessionError::protocol(format!("Noise transport failed: {error}"))
-                    })?;
+                noise.on_data(data).map_err(|error| {
+                    SessionError::protocol(format!("Noise transport failed: {error}"))
+                })?;
                 let (unexpected_peer, decrypted) = self.drain_noise(&mut noise)?;
                 if unexpected_peer.is_some() {
                     return Err(SessionError::protocol("Noise authenticated twice"));
                 }
                 for plaintext in decrypted {
-                    let result = yamux.handle_input(YamuxInput::Data(plaintext));
+                    let result = yamux.handle_data(&plaintext);
                     self.drain_yamux(&mut noise, &mut yamux, result.is_err())?;
                     result.map_err(|error| {
                         SessionError::protocol(format!("Yamux protocol failed: {error}"))
@@ -625,7 +605,7 @@ impl SecureMuxSession {
                 mut yamux,
                 peer,
             } => {
-                let result = yamux.handle_input(YamuxInput::Data(plaintext));
+                let result = yamux.handle_data(&plaintext);
                 self.drain_yamux(&mut noise, &mut yamux, result.is_err())?;
                 result.map_err(|error| {
                     SessionError::protocol(format!("Yamux protocol failed: {error}"))
@@ -653,11 +633,7 @@ impl SecureMuxSession {
                 "Yamux selection completed before pipelined data",
             ));
         };
-        select
-            .handle_input(MultistreamInput::Data(plaintext))
-            .map_err(|error| {
-                SessionError::protocol(format!("Yamux multistream failed: {error}"))
-            })?;
+        select.on_data(&plaintext);
         let mut negotiated = false;
         while let Some(output) = select.poll_output() {
             match output {
@@ -704,7 +680,7 @@ impl SecureMuxSession {
         // that drains outputs after an error would treat a dead session as up.
         let established_at = self.outputs.len();
         if !remaining.is_empty() {
-            let handled = yamux.handle_input(YamuxInput::Data(remaining));
+            let handled = yamux.handle_data(&remaining);
             let drained = self.drain_yamux(&mut noise, &mut yamux, handled.is_err());
             let outcome = drained.and_then(|()| {
                 handled.map_err(|error| {
@@ -839,7 +815,7 @@ fn encrypt_into(
     writes: &mut WriteQueue,
 ) -> Result<(), SessionError> {
     noise
-        .handle_input(NoiseInput::Encrypt(plaintext))
+        .encrypt(&plaintext)
         .map_err(|error| SessionError::protocol(format!("Noise encryption failed: {error}")))?;
     while let Some(output) = noise.poll_output() {
         match output {
@@ -993,8 +969,8 @@ mod tests {
             ephemeral_secret: [4; 32],
             expected_peer: None,
         });
-        initiator.handle_input(NoiseInput::Start).expect("start");
-        responder.handle_input(NoiseInput::Start).expect("start");
+        initiator.start().expect("start");
+        responder.start().expect("start");
 
         // Takes everything `from` has queued and delivers it to `to`, reporting
         // whether anything moved and whether `to` finished its handshake.
@@ -1010,7 +986,7 @@ mod tests {
             if batch.is_empty() {
                 return (false, false);
             }
-            to.handle_input(NoiseInput::Data(batch)).expect("handshake");
+            to.on_data(batch).expect("handshake");
             (true, false)
         }
 
@@ -1042,7 +1018,7 @@ mod tests {
         let (mut initiator_noise, responder_noise) =
             noise_pair(initiator_key, Ed25519Keypair::generate());
         let mut select = MultistreamSelect::listener([YAMUX_PROTOCOL_ID.to_string()]);
-        select.handle_input(MultistreamInput::Start).expect("start");
+        select.start();
         while select.poll_output().is_some() {}
 
         let mut responder = SecureMuxSession {
@@ -1058,7 +1034,7 @@ mod tests {
         };
         let proposals = b"\x13/multistream/1.0.0\n\x0d/mplex/6.7.0\n\x0d/yamux/1.0.0\n".to_vec();
         initiator_noise
-            .handle_input(NoiseInput::Encrypt(proposals))
+            .encrypt(&proposals)
             .expect("encrypt proposals");
         let ciphertext = core::iter::from_fn(|| initiator_noise.poll_output())
             .filter_map(|output| match output {
@@ -1090,14 +1066,12 @@ mod tests {
         const MULTISTREAM_HEADER: &[u8] = b"\x13/multistream/1.0.0\n";
 
         let mut select = MultistreamSelect::dialer(YAMUX_PROTOCOL_ID);
-        select.handle_input(MultistreamInput::Start).expect("start");
+        select.start();
         while select.poll_output().is_some() {}
 
         // The header echo makes the dialer send its protocol proposal; the
         // peer echoes that same line back to confirm.
-        select
-            .handle_input(MultistreamInput::Data(MULTISTREAM_HEADER.to_vec()))
-            .expect("header echo");
+        select.on_data(MULTISTREAM_HEADER);
         let mut echo = Vec::new();
         while let Some(output) = select.poll_output() {
             if let MultistreamOutput::OutboundData(bytes) = output {
@@ -1150,7 +1124,7 @@ mod tests {
         let mut packed = echo;
         packed.extend_from_slice(&trailing);
         listener_noise
-            .handle_input(NoiseInput::Encrypt(packed))
+            .encrypt(&packed)
             .expect("encrypt the packed plaintext");
         let mut ciphertext = Vec::new();
         while let Some(output) = listener_noise.poll_output() {

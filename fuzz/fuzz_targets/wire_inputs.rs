@@ -1,29 +1,29 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use minip2p_autonat::{AutoNatClient, AutoNatClientInput, AutoNatServer, AutoNatServerInput};
+use minip2p_autonat::{AutoNatClient, AutoNatServer};
 use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport};
-use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId, Protocol, SansIoProtocol, TransportKind};
-use minip2p_dcutr::{FrameDecode as DcutrFrame, HolePunch};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
+use minip2p_dcutr::{DcutrInitiator, DcutrResponder, FrameDecode as DcutrFrame, HolePunch};
 use minip2p_discovery::{
     Beacon, BeaconAgent, BeaconConfig, BeaconEvent, DiscoverySource, Observation,
     PeerDiscoveryAgent, PeerDiscoveryConfig,
 };
-use minip2p_identify::{IdentifyConfig, IdentifyInput, IdentifyMessage, IdentifyProtocol};
+use minip2p_identify::{IdentifyConfig, IdentifyMessage, IdentifyProtocol};
 use minip2p_identity::{KeyType, PublicKey};
 use minip2p_mdns::{
     DnsMessage, InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAgent, MdnsConfig,
 };
-use minip2p_multistream_select::{MultistreamInput, MultistreamSelect};
-use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseInput, NoiseRole, NoiseSession};
+use minip2p_multistream_select::MultistreamSelect;
+use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseRole, NoiseSession};
 use minip2p_platform::{EntropyError, EntropySource, Now};
 use minip2p_pubsub::{
     FrameDecode as PubsubFrame, GossipsubAgent, GossipsubConfig, MESHSUB_PROTOCOL_ID_V11,
     RawMessage, Rpc,
 };
 use minip2p_relay::{
-    FrameDecode as RelayFrame, HopMessage, HopResponder, HopResponderInput, StopInitiator,
-    StopInitiatorInput, StopMessage,
+    FrameDecode as RelayFrame, HopConnect, HopMessage, HopReservation, HopResponder, StopInitiator,
+    StopMessage, StopResponder,
 };
 use minip2p_secure_mux::{
     SecureMuxSession, SessionConfig, SessionOutput, SessionRole, YamuxConfig,
@@ -48,6 +48,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_secure_mux(data);
     fuzz_circuit(data);
     fuzz_relay_server_machines(data);
+    fuzz_handshake_machines(data);
 
     // Peer TLS certificates are attacker-controlled X.509 DER.
     let _ = minip2p_tls::verify_libp2p_certificate(
@@ -67,15 +68,65 @@ fuzz_target!(|data: &[u8]| {
 /// Exercises the relay-side incremental framing and terminal-action boundary.
 fn fuzz_relay_server_machines(data: &[u8]) {
     let mut hop = HopResponder::new();
-    let _ = hop.handle_input(HopResponderInput::Data(data.to_vec()));
-    let _ = hop.handle_input(HopResponderInput::RemoteWriteClosed);
+    let _ = hop.on_data(data);
+    hop.on_remote_write_closed();
     while hop.poll_output().is_some() {}
 
     let mut stop = StopInitiator::new(fuzz_peer_id(), None);
     while stop.poll_output().is_some() {}
-    let _ = stop.handle_input(StopInitiatorInput::Data(data.to_vec()));
-    let _ = stop.handle_input(StopInitiatorInput::RemoteWriteClosed);
+    stop.on_data(data);
+    stop.on_remote_write_closed();
     while stop.poll_output().is_some() {}
+}
+
+/// Feeds the relay client and DCUtR handshake machines the input in two
+/// halves, so a frame header can straddle buffered bytes and the incoming
+/// chunk, and the bytes behind a decoded frame take each machine's
+/// trailing-byte path.
+fn fuzz_handshake_machines(data: &[u8]) {
+    let (head, tail) = data.split_at(data.len() / 2);
+
+    let mut reservation = HopReservation::new();
+    while reservation.poll_output().is_some() {}
+    for chunk in [head, tail] {
+        let _ = reservation.on_data(chunk);
+    }
+    let _ = reservation.on_remote_write_closed();
+    while reservation.poll_output().is_some() {}
+
+    if let Ok(mut connect) = HopConnect::new(fuzz_peer_id().to_bytes()) {
+        while connect.poll_output().is_some() {}
+        for chunk in [head, tail] {
+            let _ = connect.on_data(chunk);
+        }
+        while connect.poll_output().is_some() {}
+    }
+
+    let mut stop = StopResponder::new();
+    for chunk in [head, tail] {
+        let _ = stop.on_data(chunk);
+    }
+    let _ = stop.accept();
+    while stop.poll_output().is_some() {}
+
+    if let Ok(mut initiator) = DcutrInitiator::new(&[]) {
+        while initiator.poll_output().is_some() {}
+        for chunk in [head, tail] {
+            let _ = initiator.on_data(chunk, 0);
+        }
+        let _ = initiator.send_sync();
+        while initiator.poll_output().is_some() {}
+        let _ = initiator.take_trailing_data();
+    }
+
+    if let Ok(mut responder) = DcutrResponder::new(&[]) {
+        for chunk in [head, tail] {
+            let _ = responder.on_data(chunk);
+        }
+        let _ = responder.on_remote_write_closed();
+        while responder.poll_output().is_some() {}
+        let _ = responder.take_trailing_data();
+    }
 }
 
 /// Exercises pubsub framing, RPC/control decoding, canonical re-encoding,
@@ -150,8 +201,8 @@ fn fuzz_multistream(data: &[u8]) {
         MultistreamSelect::listener(["/ipfs/ping/1.0.0".to_string()]),
     ];
     for mut machine in machines {
-        let _ = machine.handle_input(MultistreamInput::Start);
-        let _ = machine.handle_input(MultistreamInput::Data(data.to_vec()));
+        machine.start();
+        machine.on_data(data);
         while machine.poll_output().is_some() {}
         let _ = machine.take_remaining_buffer();
     }
@@ -515,21 +566,14 @@ fn fuzz_identify(data: &[u8]) {
         protocols: vec!["/ipfs/id/1.0.0".into()],
         public_key: b"fuzz-public-key".to_vec(),
     });
-    let _ = identify.handle_input(IdentifyInput::RegisterInboundStream {
-        peer_id: peer_id.clone(),
-        stream_id,
-    });
+    identify.register_inbound_stream(peer_id.clone(), stream_id);
     let (head, tail) = data.split_at(data.len() / 2);
     for chunk in [head, tail] {
-        let _ = identify.handle_input(IdentifyInput::StreamData {
-            peer_id: peer_id.clone(),
-            stream_id,
-            data: chunk.to_vec(),
-        });
+        identify.on_stream_data(peer_id.clone(), stream_id, chunk);
     }
     // Closing the remote write side decodes the buffered length-prefixed
     // message.
-    let _ = identify.handle_input(IdentifyInput::StreamRemoteWriteClosed { peer_id, stream_id });
+    identify.on_stream_remote_write_closed(peer_id, stream_id);
     while identify.poll_output().is_some() {}
 }
 
@@ -543,13 +587,13 @@ fn fuzz_autonat(data: &[u8]) {
 
     let mut server = AutoNatServer::new();
     for chunk in [head, tail] {
-        let _ = server.handle_input(AutoNatServerInput::Data(chunk.to_vec()));
+        let _ = server.on_data(chunk);
     }
     while server.poll_output().is_some() {}
 
     let mut client = AutoNatClient::new(&fuzz_peer_id(), &[]);
     for chunk in [head, tail] {
-        let _ = client.handle_input(AutoNatClientInput::Data(chunk.to_vec()));
+        let _ = client.on_data(chunk);
     }
     while client.poll_output().is_some() {}
 }
@@ -571,8 +615,8 @@ fn fuzz_noise(data: &[u8]) {
             ephemeral_secret: [3; 32],
             expected_peer: None,
         });
-        let _ = session.handle_input(NoiseInput::Start);
-        let _ = session.handle_input(NoiseInput::Data(data.to_vec()));
+        let _ = session.start();
+        let _ = session.on_data(data.to_vec());
         while session.poll_output().is_some() {}
     }
 }

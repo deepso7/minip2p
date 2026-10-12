@@ -4,12 +4,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
 
-use minip2p_core::{Bytes, Multiaddr, PeerId, Protocol, SansIoProtocol};
+use minip2p_core::{Bytes, Multiaddr, PeerId, Protocol};
 use minip2p_platform::Now;
 use minip2p_relay::{
-    HOP_PROTOCOL_ID, HopRequest, HopResponder, HopResponderInput, HopResponderOutput, Limit,
-    MAX_PENDING_BRIDGE_SIZE, Reservation, STOP_PROTOCOL_ID, Status, StopInitiator,
-    StopInitiatorInput, StopInitiatorOutcome, StopInitiatorOutput, encode_hop_status,
+    HOP_PROTOCOL_ID, HopRequest, HopResponder, HopResponderOutput, Limit, MAX_PENDING_BRIDGE_SIZE,
+    RelayError, Reservation, STOP_PROTOCOL_ID, Status, StopInitiator, StopInitiatorOutcome,
+    StopInitiatorOutput, encode_hop_status,
 };
 use minip2p_swarm::{SwarmCore, SwarmError, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId, Transport};
@@ -688,7 +688,7 @@ impl RelayServerAgent {
                     // Payload coalesced with CONNECT stays in the responder
                     // until the decision, unacknowledged.
                     let held = self.hop_bridge_len(key);
-                    if self.feed_hop(key, HopResponderInput::Data(data.to_vec())) {
+                    if self.feed_hop(key, |hop| hop.on_data(data)) {
                         self.drain_hop(key, now);
                     }
                     let payload = self.hop_bridge_len(key).saturating_sub(held);
@@ -705,9 +705,7 @@ impl RelayServerAgent {
                             data.clone(),
                         );
                     } else {
-                        let bridged = if self
-                            .feed_stop(source_stream, StopInitiatorInput::Data(data.to_vec()))
-                        {
+                        let bridged = if self.feed_stop(source_stream, |stop| stop.on_data(data)) {
                             self.drain_stop(source_stream, now)
                         } else {
                             0
@@ -738,12 +736,15 @@ impl RelayServerAgent {
                     if let Some(circuit) = self.pending_circuits.get_mut(&key) {
                         circuit.source_eof = true;
                     }
-                    if self.feed_hop(key, HopResponderInput::RemoteWriteClosed) {
+                    if self.feed_hop(key, |hop| {
+                        hop.on_remote_write_closed();
+                        Ok(())
+                    }) {
                         self.drain_hop(key, now);
                     }
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
-                    && self.feed_stop(source_stream, StopInitiatorInput::RemoteWriteClosed)
+                    && self.feed_stop(source_stream, StopInitiator::on_remote_write_closed)
                 {
                     if let Some(circuit) = self.pending_circuits.get_mut(&source_stream) {
                         circuit.destination_eof = true;
@@ -804,7 +805,7 @@ impl RelayServerAgent {
                     self.circuit_leg_closed(source_stream, CircuitLeg::Destination);
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
-                    && self.feed_stop(source_stream, StopInitiatorInput::RemoteReset)
+                    && self.feed_stop(source_stream, StopInitiator::on_remote_reset)
                 {
                     self.drain_stop(source_stream, now);
                     true
@@ -1379,12 +1380,16 @@ impl RelayServerAgent {
     /// responder error after the agent routed the event is an internal
     /// contract failure, so surface it before the caller decides whether to
     /// drain any output.
-    fn feed_hop(&mut self, key: StreamKey, input: HopResponderInput) -> bool {
+    fn feed_hop(
+        &mut self,
+        key: StreamKey,
+        input: impl FnOnce(&mut HopResponder) -> Result<(), RelayError>,
+    ) -> bool {
         let Some(worker) = self.hop_workers.get_mut(&key) else {
             return false;
         };
         let peer_id = worker.peer_id.clone();
-        let result = worker.responder.handle_input(input);
+        let result = input(&mut worker.responder);
         if let Err(error) = result {
             self.runtime_error(
                 RelayServerRuntimeErrorKind::InternalInvariant,
@@ -1396,24 +1401,21 @@ impl RelayServerAgent {
         true
     }
 
-    /// Delivers an input to a pending STOP initiator, ignoring stale streams.
-    fn feed_stop(&mut self, source_stream: StreamKey, input: StopInitiatorInput) -> bool {
-        let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
+    /// Delivers an input to a pending STOP initiator; returns false for a
+    /// stale stream.
+    fn feed_stop(
+        &mut self,
+        source_stream: StreamKey,
+        input: impl FnOnce(&mut StopInitiator),
+    ) -> bool {
+        let Some(stop) = self
+            .pending_circuits
+            .get_mut(&source_stream)
+            .and_then(|circuit| circuit.stop.as_mut())
+        else {
             return false;
         };
-        let Some(stop) = circuit.stop.as_mut() else {
-            return false;
-        };
-        let peer_id = circuit.source_peer_id.clone();
-        let result = stop.handle_input(input);
-        if let Err(error) = result {
-            self.runtime_error(
-                RelayServerRuntimeErrorKind::InternalInvariant,
-                Some(peer_id),
-                format!("STOP initiator rejected routed input: {error}"),
-            );
-            return false;
-        }
+        input(stop);
         true
     }
 
@@ -1439,7 +1441,7 @@ impl RelayServerAgent {
                             peer_id,
                             status: Status::PermissionDenied,
                         });
-                        self.feed_hop(key, HopResponderInput::Reject(Status::PermissionDenied));
+                        self.feed_hop(key, |hop| hop.reject(Status::PermissionDenied));
                     } else {
                         self.decide_reservation(key, now)
                     }
@@ -1514,20 +1516,16 @@ impl RelayServerAgent {
                 .pending_circuits
                 .get_mut(&source_stream)
                 .and_then(|circuit| circuit.stop.as_mut())
-                .and_then(SansIoProtocol::poll_output);
+                .and_then(StopInitiator::poll_output);
             let Some(output) = output else { break };
             match output {
                 StopInitiatorOutput::Outcome(StopInitiatorOutcome::Accepted) => {
                     self.stop_deadlines.remove(&source_stream);
-                    if !self.feed_hop(
-                        source_stream,
-                        HopResponderInput::AcceptConnect {
-                            limit: Some(Limit {
-                                duration: Some(self.config.max_circuit_duration_secs as u32),
-                                data: Some(self.config.max_circuit_bytes),
-                            }),
-                        },
-                    ) {
+                    let limit = Limit {
+                        duration: Some(self.config.max_circuit_duration_secs as u32),
+                        data: Some(self.config.max_circuit_bytes),
+                    };
+                    if !self.feed_hop(source_stream, |hop| hop.accept_connect(Some(limit))) {
                         self.fail_pending_connect(source_stream, Status::ConnectionFailed);
                         return bridged;
                     }
@@ -1930,18 +1928,12 @@ impl RelayServerAgent {
                 peer_id: peer_id.clone(),
                 status,
             });
-            self.feed_hop(key, HopResponderInput::Reject(status));
+            self.feed_hop(key, |hop| hop.reject(status));
             return;
         }
 
         let (reservation, limit) = wire.expect("availability checked above");
-        if !self.feed_hop(
-            key,
-            HopResponderInput::AcceptReservation {
-                reservation,
-                limit: Some(limit),
-            },
-        ) {
+        if !self.feed_hop(key, |hop| hop.accept_reservation(reservation, Some(limit))) {
             return;
         }
         let Some(worker) = self.hop_workers.get_mut(&key) else {
@@ -2144,7 +2136,7 @@ impl RelayServerAgent {
             destination_peer_id,
             status,
         });
-        self.feed_hop(key, HopResponderInput::Reject(status));
+        self.feed_hop(key, |hop| hop.reject(status));
     }
 
     fn fail_pending_connect(&mut self, source_stream: StreamKey, status: Status) {

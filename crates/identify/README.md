@@ -13,14 +13,14 @@ Identify is the libp2p handshake that lets two peers exchange their supported pr
 - Protobuf encode/decode for `IdentifyMessage` (field-number order on encode, any-order accept on decode; unknown fields with known wire types are silently skipped; invalid field numbers such as 0 are rejected). Field framing uses the shared vocabulary in `minip2p-core`; semantic validation and contextual `IdentifyMessageError` values stay here.
 - 8 KiB frame size cap; a message may arrive in up to two frames, which are merged.
 - Peer-id migration support for swarms that discover the real `PeerId` after connection establishment.
-- `IdentifyInput` values for stream lifecycle, peer migration, and received bytes.
+- Methods for stream lifecycle, peer migration, and received bytes (`register_outbound_stream`, `register_inbound_stream`, `on_stream_data`, `on_stream_remote_write_closed`, `on_stream_closed`, `remove_peer`, `migrate_peer`).
 - `IdentifyOutput` values wrapping host actions (`Send`, `CloseStreamWrite`, `ResetStream`) and protocol events (`Received`, `Error`).
 
 ## Usage
 
 ```rust
-use minip2p_core::{Multiaddr, PeerId, SansIoProtocol};
-use minip2p_identify::{IdentifyConfig, IdentifyInput, IdentifyOutput, IdentifyProtocol};
+use minip2p_core::{Multiaddr, PeerId};
+use minip2p_identify::{IdentifyConfig, IdentifyOutput, IdentifyProtocol};
 use minip2p_transport::StreamId;
 
 let config = IdentifyConfig {
@@ -33,28 +33,23 @@ let mut identify = IdentifyProtocol::new(config);
 
 // After multistream-select negotiates /ipfs/id/1.0.0:
 //   - inbound stream (we respond):
-//     identify.handle_input(IdentifyInput::RegisterOutboundStream {
-//         peer_id,
-//         stream_id,
-//         observed_addr: Some(remote_addr),
-//         listen_addrs,
-//     })?;
+//     identify.register_outbound_stream(peer_id, stream_id, Some(remote_addr), &listen_addrs)?;
 //   - outbound stream (we receive the remote's info):
-//     identify.handle_input(IdentifyInput::RegisterInboundStream { peer_id, stream_id })?;
+//     identify.register_inbound_stream(peer_id, stream_id);
 
 // Feed stream data / lifecycle events:
-// identify.handle_input(IdentifyInput::StreamData { peer_id, stream_id, data })?;
-// identify.handle_input(IdentifyInput::StreamRemoteWriteClosed { peer_id, stream_id })?;
-// identify.handle_input(IdentifyInput::StreamClosed { peer_id, stream_id })?;
+// identify.on_stream_data(peer_id, stream_id, &data);
+// identify.on_stream_remote_write_closed(peer_id, stream_id);
+// identify.on_stream_closed(peer_id, stream_id);
 
-// Drain outputs and run actions through the host/transport:
+// After every input, drain outputs until `None` and run actions through the
+// host/transport:
 // while let Some(output) = identify.poll_output() {
 //     match output {
 //         IdentifyOutput::Action(action) => execute(action),
 //         IdentifyOutput::Event(event) => handle(event),
 //     }
 // }
-// assert!(identify.is_idle());
 ```
 
 `observed_addr` should be the transport address we observed the remote dialing us from. Pass `None` when the information is not available.
@@ -79,4 +74,4 @@ minip2p-identify = { path = "crates/identify", default-features = false }
 
 ## Scope
 
-This crate implements the identify protocol state machine only. It does not open streams or perform multistream-select. The host is responsible for driving negotiation, feeding `IdentifyInput` values into `IdentifyProtocol`, executing `IdentifyOutput::Action` commands against the transport, and draining outputs until `SansIoProtocol::is_idle()` returns `true`.
+This crate implements the identify protocol state machine only. It does not open streams or perform multistream-select. The host is responsible for driving negotiation, feeding stream events into `IdentifyProtocol`, executing `IdentifyOutput::Action` commands against the transport, and draining `poll_output` until it returns `None`.

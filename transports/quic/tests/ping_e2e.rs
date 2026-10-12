@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use minip2p_core::{PeerAddr, PeerId, SansIoProtocol};
-use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
+use minip2p_core::{PeerAddr, PeerId};
+use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
 use minip2p_ping::{
-    PING_PAYLOAD_LEN, PING_PROTOCOL_ID, PingAction, PingEvent, PingInput, PingOutput, PingProtocol,
+    PING_PAYLOAD_LEN, PING_PROTOCOL_ID, PingAction, PingEvent, PingOutput, PingProtocol,
 };
 use minip2p_quic::QuicTransport;
 use minip2p_transport::{Bytes, ConnectionId, StreamId, Transport, TransportEvent};
@@ -66,18 +66,16 @@ fn drain_ping_outputs(
 
 fn drive_ping_input(
     ping: &mut PingProtocol,
-    input: PingInput,
+    input: impl FnOnce(&mut PingProtocol),
     transport: &mut QuicTransport,
     connection_id: ConnectionId,
 ) -> Vec<PingEvent> {
-    ping.handle_input(input).expect("ping input");
+    input(ping);
     drain_ping_outputs(ping, transport, connection_id)
 }
 
 fn multistream_start(negotiator: &mut MultistreamSelect) -> Vec<MultistreamOutput> {
-    negotiator
-        .handle_input(MultistreamInput::Start)
-        .expect("start multistream");
+    negotiator.start();
     let mut outputs = Vec::new();
     while let Some(output) = negotiator.poll_output() {
         outputs.push(output);
@@ -89,9 +87,7 @@ fn multistream_receive(
     negotiator: &mut MultistreamSelect,
     data: Vec<u8>,
 ) -> Vec<MultistreamOutput> {
-    negotiator
-        .handle_input(MultistreamInput::Data(data))
-        .expect("feed multistream");
+    negotiator.on_data(&data);
     let mut outputs = Vec::new();
     while let Some(output) = negotiator.poll_output() {
         outputs.push(output);
@@ -214,9 +210,12 @@ impl PingHarness {
                                     assert_eq!(stream_id, client_stream);
                                     drive_ping_input(
                                         &mut client_ping,
-                                        PingInput::RegisterOutboundStream {
-                                            peer_id: peer_addr.peer_id().clone(),
-                                            stream_id: client_stream,
+                                        |ping| {
+                                            ping.register_outbound_stream(
+                                                peer_addr.peer_id().clone(),
+                                                client_stream,
+                                            )
+                                            .expect("ping input")
                                         },
                                         &mut client,
                                         client_conn_id,
@@ -355,9 +354,11 @@ impl PingHarness {
 
                                     drive_ping_input(
                                         server_ping,
-                                        PingInput::RegisterInboundStream {
-                                            peer_id: peer_addr.peer_id().clone(),
-                                            stream_id: *stream_id,
+                                        |ping| {
+                                            ping.register_inbound_stream(
+                                                peer_addr.peer_id().clone(),
+                                                *stream_id,
+                                            )
                                         },
                                         server,
                                         server_conn_id,
@@ -379,11 +380,13 @@ impl PingHarness {
                     } else if ping_streams.contains(stream_id) {
                         drive_ping_input(
                             server_ping,
-                            PingInput::StreamData {
-                                peer_id: peer_addr.peer_id().clone(),
-                                stream_id: *stream_id,
-                                data: data.to_vec(),
-                                now_ms: start.elapsed().as_millis() as u64,
+                            |ping| {
+                                ping.on_stream_data(
+                                    peer_addr.peer_id(),
+                                    *stream_id,
+                                    data,
+                                    start.elapsed().as_millis() as u64,
+                                )
                             },
                             server,
                             server_conn_id,
@@ -396,10 +399,7 @@ impl PingHarness {
                     assert_eq!(*id, server_conn_id);
                     drive_ping_input(
                         server_ping,
-                        PingInput::StreamRemoteWriteClosed {
-                            peer_id: peer_addr.peer_id().clone(),
-                            stream_id: *stream_id,
-                        },
+                        |ping| ping.on_stream_remote_write_closed(peer_addr.peer_id(), *stream_id),
                         server,
                         server_conn_id,
                     );
@@ -409,10 +409,7 @@ impl PingHarness {
                     assert_eq!(*id, server_conn_id);
                     drive_ping_input(
                         server_ping,
-                        PingInput::StreamClosed {
-                            peer_id: peer_addr.peer_id().clone(),
-                            stream_id: *stream_id,
-                        },
+                        |ping| ping.on_stream_closed(peer_addr.peer_id(), *stream_id),
                         server,
                         server_conn_id,
                     );
@@ -443,7 +440,7 @@ impl PingHarness {
         let now_ms = self.start.elapsed().as_millis() as u64;
         let events = drive_ping_input(
             &mut self.server_ping,
-            PingInput::Tick { now_ms },
+            |ping| ping.on_tick(now_ms),
             &mut self.server,
             self.server_conn_id,
         );
@@ -480,7 +477,7 @@ impl PingHarness {
         let now_ms = self.start.elapsed().as_millis() as u64;
         let events = drive_ping_input(
             &mut self.server_ping,
-            PingInput::Tick { now_ms },
+            |ping| ping.on_tick(now_ms),
             &mut self.server,
             self.server_conn_id,
         );
@@ -526,12 +523,7 @@ fn ping_roundtrip_after_identity_verification_and_multistream_negotiation() {
                     let now = h.now_ms();
                     client_ping_events.extend(drive_ping_input(
                         &mut h.client_ping,
-                        PingInput::StreamData {
-                            peer_id: peer_id.clone(),
-                            stream_id,
-                            data: data.to_vec(),
-                            now_ms: now,
-                        },
+                        |ping| ping.on_stream_data(&peer_id, stream_id, &data, now),
                         &mut h.client,
                         h.client_conn_id,
                     ));
@@ -540,10 +532,7 @@ fn ping_roundtrip_after_identity_verification_and_multistream_negotiation() {
                     assert_eq!(id, h.client_conn_id);
                     client_ping_events.extend(drive_ping_input(
                         &mut h.client_ping,
-                        PingInput::StreamRemoteWriteClosed {
-                            peer_id: peer_id.clone(),
-                            stream_id,
-                        },
+                        |ping| ping.on_stream_remote_write_closed(&peer_id, stream_id),
                         &mut h.client,
                         h.client_conn_id,
                     ));
@@ -552,10 +541,7 @@ fn ping_roundtrip_after_identity_verification_and_multistream_negotiation() {
                     assert_eq!(id, h.client_conn_id);
                     client_ping_events.extend(drive_ping_input(
                         &mut h.client_ping,
-                        PingInput::StreamClosed {
-                            peer_id: peer_id.clone(),
-                            stream_id,
-                        },
+                        |ping| ping.on_stream_closed(&peer_id, stream_id),
                         &mut h.client,
                         h.client_conn_id,
                     ));
@@ -567,7 +553,7 @@ fn ping_roundtrip_after_identity_verification_and_multistream_negotiation() {
         let now_ms = h.now_ms();
         client_ping_events.extend(drive_ping_input(
             &mut h.client_ping,
-            PingInput::Tick { now_ms },
+            |ping| ping.on_tick(now_ms),
             &mut h.client,
             h.client_conn_id,
         ));
@@ -575,10 +561,9 @@ fn ping_roundtrip_after_identity_verification_and_multistream_negotiation() {
         if !ping_sent {
             client_ping_events.extend(drive_ping_input(
                 &mut h.client_ping,
-                PingInput::SendPing {
-                    peer_id: peer_id.clone(),
-                    payload,
-                    now_ms,
+                |ping| {
+                    ping.send_ping(&peer_id, &payload, now_ms)
+                        .expect("ping input")
                 },
                 &mut h.client,
                 h.client_conn_id,
@@ -654,12 +639,7 @@ fn repeated_ping_on_same_stream_then_close_write_exits_listener_loop() {
                     let now = h.now_ms();
                     client_ping_events.extend(drive_ping_input(
                         &mut h.client_ping,
-                        PingInput::StreamData {
-                            peer_id: peer_id.clone(),
-                            stream_id,
-                            data: data.to_vec(),
-                            now_ms: now,
-                        },
+                        |ping| ping.on_stream_data(&peer_id, stream_id, &data, now),
                         &mut h.client,
                         h.client_conn_id,
                     ));
@@ -671,10 +651,7 @@ fn repeated_ping_on_same_stream_then_close_write_exits_listener_loop() {
                     }
                     client_ping_events.extend(drive_ping_input(
                         &mut h.client_ping,
-                        PingInput::StreamRemoteWriteClosed {
-                            peer_id: peer_id.clone(),
-                            stream_id,
-                        },
+                        |ping| ping.on_stream_remote_write_closed(&peer_id, stream_id),
                         &mut h.client,
                         h.client_conn_id,
                     ));
@@ -683,10 +660,7 @@ fn repeated_ping_on_same_stream_then_close_write_exits_listener_loop() {
                     assert_eq!(id, h.client_conn_id);
                     client_ping_events.extend(drive_ping_input(
                         &mut h.client_ping,
-                        PingInput::StreamClosed {
-                            peer_id: peer_id.clone(),
-                            stream_id,
-                        },
+                        |ping| ping.on_stream_closed(&peer_id, stream_id),
                         &mut h.client,
                         h.client_conn_id,
                     ));
@@ -698,7 +672,7 @@ fn repeated_ping_on_same_stream_then_close_write_exits_listener_loop() {
         let now_ms = h.now_ms();
         client_ping_events.extend(drive_ping_input(
             &mut h.client_ping,
-            PingInput::Tick { now_ms },
+            |ping| ping.on_tick(now_ms),
             &mut h.client,
             h.client_conn_id,
         ));
@@ -706,10 +680,9 @@ fn repeated_ping_on_same_stream_then_close_write_exits_listener_loop() {
         if next_ping_idx < payloads.len() && measured_rtts.len() == next_ping_idx {
             client_ping_events.extend(drive_ping_input(
                 &mut h.client_ping,
-                PingInput::SendPing {
-                    peer_id: peer_id.clone(),
-                    payload: payloads[next_ping_idx],
-                    now_ms,
+                |ping| {
+                    ping.send_ping(&peer_id, &payloads[next_ping_idx], now_ms)
+                        .expect("ping input")
                 },
                 &mut h.client,
                 h.client_conn_id,
@@ -744,8 +717,9 @@ fn repeated_ping_on_same_stream_then_close_write_exits_listener_loop() {
         if measured_rtts.len() == payloads.len() && !close_requested {
             let _ = drive_ping_input(
                 &mut h.client_ping,
-                PingInput::CloseOutboundStreamWrite {
-                    peer_id: peer_id.clone(),
+                |ping| {
+                    ping.close_outbound_stream_write(&peer_id)
+                        .expect("ping input")
                 },
                 &mut h.client,
                 h.client_conn_id,

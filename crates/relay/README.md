@@ -22,7 +22,7 @@ Those service responsibilities belong above these reusable wire machines.
 - **`HopResponder`** -- accepts one inbound `HOP.RESERVE` or `HOP.CONNECT`, exposes the decoded request for an explicit service decision, and emits the resulting status/close/reset actions.
 - **`StopInitiator`** -- sends one outbound `STOP.CONNECT`, preserves the destination's exact status, and maps terminal outcomes back to a HOP status with `StopInitiatorOutcome::hop_status`.
 
-Each machine is driven through `SansIoProtocol`: feed its role-specific inputs and drain outputs until idle. A valid request is always emitted before outputs caused by its decision. Bytes pipelined behind an accepted HOP request or STOP response are retained and emitted as bridge data only after the final `STATUS:OK` frame.
+Each machine takes inputs through methods named for what they do (`on_data`, `on_remote_write_closed`, `accept`, `reject`, `accept_connect`, ...); after construction and after every input, drain `poll_output` until it returns `None`. Every machine reads its handshake through a `minip2p_core::FrameExchange`, so a frame declaring more than 8 KiB is refused from its header. `HopConnect::new` returns `Result`: a CONNECT that would not fit one frame is refused with `RelayError::MessageTooLarge` before anything is queued. A valid request is always emitted before outputs caused by its decision. Bytes pipelined behind an accepted HOP request or STOP response are retained and emitted as bridge data only after the final `STATUS:OK` frame. A client that accepted a CONNECT emits the bytes behind the relay's `STATUS:OK` as bridge data, and a reservation ignores bytes behind its `STATUS`.
 
 Relay-side malformed handling is deterministic. A complete, well-framed message with a wrong kind or missing/invalid required field receives `UNEXPECTED_MESSAGE` or `MALFORMED_MESSAGE`, followed by a local write close. Invalid varint framing, declarations over the limit, and locally constructed responses that cannot fit request a stream reset. A remote write close preserves a complete request and queued handshake/bridge outputs; a HOP reset discards them. `StopInitiatorOutcome` maps close/reset before a complete STOP response to `CONNECTION_FAILED`. After decoding a STOP response, a close preserves all preceding outputs; a reset preserves semantic outcome/bridge outputs but discards unsent transport actions.
 
@@ -37,8 +37,7 @@ The 8 KiB maximum applies to every relay control frame, with an exactly 8 KiB pa
 ## Usage (reservation)
 
 ```rust
-use minip2p_core::SansIoProtocol;
-use minip2p_relay::{HopReservation, HopReservationInput, HopReservationOutput};
+use minip2p_relay::{HopReservation, HopReservationOutput};
 
 let mut reservation = HopReservation::new();
 
@@ -50,12 +49,12 @@ while let Some(output) = reservation.poll_output() {
 }
 
 // Feed incoming bytes:
-// reservation.handle_input(HopReservationInput::Data(data))?;
+// reservation.on_data(&data)?;
 ```
 
-`HopConnect`, `StopResponder`, `HopResponder`, and `StopInitiator` follow the same input/output drain-loop shape. Relay hosts execute `Outbound`, `CloseWrite`, and `Reset` outputs against the owned stream and retain `BridgeData` for circuit forwarding.
+`HopConnect`, `StopResponder`, `HopResponder`, and `StopInitiator` follow the same shape: inputs through methods, outputs drained from `poll_output`. Relay hosts execute `Outbound`, `CloseWrite`, and `Reset` outputs against the owned stream and retain `BridgeData` for circuit forwarding.
 
-After `HopResponder` or `StopResponder` emits a request, its driver pauses reads on that stream until it supplies the accept or reject decision. A `Data` input while the decision is pending returns `RelayError::DecisionPending` without retaining the bytes. Payload already coalesced behind the request frame is retained and released only after CONNECT acceptance. `HopResponder::pending_bridge_len` reports how much is retained, so a host that acknowledges reads can keep that payload's credit until it is forwarded. That pre-authorization buffer is limited to 64 KiB; exceeding it resets an inbound HOP stream or returns `RelayError::PendingBridgeTooLarge` from STOP so its driver can reset. This is not a circuit data limit: after acceptance, bridge data streams without that restriction. Transport queues provide backpressure for bytes that arrive while policy is deciding.
+After `HopResponder` or `StopResponder` emits a request, its driver pauses reads on that stream until it supplies the accept or reject decision. An `on_data` call while the decision is pending returns `RelayError::DecisionPending` without retaining the bytes. Payload already coalesced behind the request frame is retained and released only after CONNECT acceptance. `HopResponder::pending_bridge_len` reports how much is retained, so a host that acknowledges reads can keep that payload's credit until it is forwarded. That pre-authorization buffer is limited to 64 KiB; exceeding it resets an inbound HOP stream or returns `RelayError::PendingBridgeTooLarge` from STOP so its driver can reset. This is not a circuit data limit: after acceptance, bridge data streams without that restriction. Transport queues provide backpressure for bytes that arrive while policy is deciding.
 
 ## no_std
 

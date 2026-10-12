@@ -19,7 +19,7 @@ This crate implements the message state machines only. Protobuf field framing fo
 
 Both machines accept `&[Multiaddr]` at construction time and automatically serialize them to the wire using multicodec-binary encoding (via `Multiaddr::to_bytes()` in `minip2p-core`). Incoming `obs_addrs` are decoded the same way; entries that fail to parse are dropped silently but remain available as raw bytes in `remote_addr_bytes` for diagnostics.
 
-Each machine is driven through `SansIoProtocol`: feed `DcutrInitiatorInput` / `DcutrResponderInput` values, then drain `DcutrInitiatorOutput` / `DcutrResponderOutput` values until idle. The wire format is length-prefixed protobuf `HolePunch` messages; the frame helpers (`encode_frame`, `decode_frame`, `FrameDecode`) are re-exported from the crate root.
+Each machine takes inputs through methods named for what they do (`on_data`, `send_sync`, `on_remote_write_closed`); after construction and after every input, drain `poll_output` until it returns `None`. Both constructors return `Result`: addresses that would not fit one 4 KiB frame are refused with `DcutrError::MessageTooLarge` before anything is queued. The receive buffer is a `minip2p_core::FrameExchange`, so a frame declaring more than the maximum is refused from its header. Bytes coalesced behind the initiator's CONNECT reply, or behind the responder's SYNC, belong to the application and are returned once by `take_trailing_data` after the exchange completes. The wire format is length-prefixed protobuf `HolePunch` messages; the frame helpers (`encode_frame`, `decode_frame`, `FrameDecode`) are re-exported from the crate root.
 
 ## Protocol ID
 
@@ -30,10 +30,9 @@ Each machine is driven through `SansIoProtocol`: feed `DcutrInitiatorInput` / `D
 
 ```rust
 use minip2p_core::Multiaddr;
-use minip2p_core::SansIoProtocol;
-use minip2p_dcutr::{DcutrInitiator, DcutrInitiatorInput, DcutrInitiatorOutput, InitiatorOutcome};
+use minip2p_dcutr::{DcutrInitiator, DcutrInitiatorOutput, InitiatorOutcome};
 
-let mut initiator = DcutrInitiator::new(&our_observed_addrs); // &[Multiaddr]
+let mut initiator = DcutrInitiator::new(&our_observed_addrs)?; // &[Multiaddr]
 
 while let Some(output) = initiator.poll_output() {
     match output {
@@ -41,13 +40,13 @@ while let Some(output) = initiator.poll_output() {
         DcutrInitiatorOutput::Outcome(InitiatorOutcome::DialNow { remote_addrs, rtt_ms, .. }) => {
             // Dial each remote Multiaddr directly, wait rtt_ms for a connection,
             // then queue SYNC once the simultaneous dial attempt starts.
-            initiator.handle_input(DcutrInitiatorInput::SendSync)?;
+            initiator.send_sync()?;
         }
     }
 }
 
 // Feed incoming bytes + measured relay RTT:
-// initiator.handle_input(DcutrInitiatorInput::Data { bytes: data, rtt_ms })?;
+// initiator.on_data(&data, rtt_ms)?;
 ```
 
 The timing rules (wait `rtt / 2` on the responder side before blasting UDP, etc.) live in the caller.

@@ -31,16 +31,15 @@
 use std::collections::VecDeque;
 use std::str::FromStr;
 
-use minip2p_core::{Multiaddr, SansIoProtocol};
+use minip2p_core::Multiaddr;
 use minip2p_dcutr::{
-    DcutrInitiator, DcutrInitiatorInput, DcutrInitiatorOutput, DcutrResponder, DcutrResponderInput,
-    DcutrResponderOutput, InitiatorOutcome, ResponderEvent, decode_frame as dcutr_decode_frame,
+    DcutrInitiator, DcutrInitiatorOutput, DcutrResponder, DcutrResponderOutput, InitiatorOutcome,
+    ResponderEvent, decode_frame as dcutr_decode_frame,
 };
 use minip2p_identity::Ed25519Keypair;
 use minip2p_relay::{
-    HopConnect, HopConnectInput, HopConnectOutput, HopReservation, HopReservationInput,
-    HopReservationOutput, ReservationOutcome, Status, StopResponder, StopResponderInput,
-    StopResponderOutput,
+    HopConnect, HopConnectOutput, HopReservation, HopReservationOutput, ReservationOutcome, Status,
+    StopResponder, StopResponderOutput,
 };
 use minip2p_test_support::{ConnectRequestOutcome, RelayEmulator, RelayEvent};
 
@@ -88,7 +87,7 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
 
     // ---- Step 2: A asks the relay to CONNECT it to B ----------------------
 
-    let mut a_connect = HopConnect::new(peer_b.to_bytes());
+    let mut a_connect = HopConnect::new(peer_b.to_bytes()).unwrap();
 
     // A sends HOP CONNECT(peer=B).
     let connect_bytes = connect_flush(&mut a_connect);
@@ -154,8 +153,8 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     let b_observed: Vec<Multiaddr> =
         vec![Multiaddr::from_str("/ip4/198.51.100.2/udp/54321/quic-v1").unwrap()];
 
-    let mut dcutr_a = DcutrInitiator::new(&a_observed);
-    let mut dcutr_b = DcutrResponder::new(&b_observed);
+    let mut dcutr_a = DcutrInitiator::new(&a_observed).unwrap();
+    let mut dcutr_b = DcutrResponder::new(&b_observed).unwrap();
 
     // A sends CONNECT over the bridge.
     push_bytes(&mut a_to_b, &dcutr_initiator_flush(&mut dcutr_a));
@@ -220,7 +219,7 @@ fn connect_refused_when_target_not_reserved() {
 
     let mut relay = RelayEmulator::new();
 
-    let mut a_connect = HopConnect::new(target.to_bytes());
+    let mut a_connect = HopConnect::new(target.to_bytes()).unwrap();
     let connect_bytes = connect_flush(&mut a_connect);
 
     let mut initiator_inbox: Vec<u8> = Vec::new();
@@ -244,8 +243,10 @@ fn connect_refused_when_target_not_reserved() {
 
 #[test]
 fn dcutr_rtt_is_reported_back_to_initiator() {
-    let mut a = DcutrInitiator::new(&[Multiaddr::from_str("/ip4/1.2.3.4/udp/1/quic-v1").unwrap()]);
-    let mut b = DcutrResponder::new(&[Multiaddr::from_str("/ip4/5.6.7.8/udp/2/quic-v1").unwrap()]);
+    let mut a =
+        DcutrInitiator::new(&[Multiaddr::from_str("/ip4/1.2.3.4/udp/1/quic-v1").unwrap()]).unwrap();
+    let mut b =
+        DcutrResponder::new(&[Multiaddr::from_str("/ip4/5.6.7.8/udp/2/quic-v1").unwrap()]).unwrap();
 
     let connect_from_a = dcutr_initiator_flush(&mut a);
     dcutr_responder_feed(&mut b, connect_from_a);
@@ -271,7 +272,6 @@ fn drain_pipe(pipe: &mut VecDeque<u8>) -> Vec<u8> {
 }
 
 fn reserve_flush(flow: &mut HopReservation) -> Vec<u8> {
-    flow.handle_input(HopReservationInput::Flush).unwrap();
     match flow.poll_output() {
         Some(HopReservationOutput::Outbound(bytes)) => bytes,
         other => panic!("expected reservation outbound, got {other:?}"),
@@ -279,7 +279,7 @@ fn reserve_flush(flow: &mut HopReservation) -> Vec<u8> {
 }
 
 fn reserve_feed(flow: &mut HopReservation, bytes: Vec<u8>) -> ReservationOutcome {
-    flow.handle_input(HopReservationInput::Data(bytes)).unwrap();
+    flow.on_data(&bytes).unwrap();
     match flow.poll_output() {
         Some(HopReservationOutput::Outcome(outcome)) => outcome,
         other => panic!("expected reservation outcome, got {other:?}"),
@@ -287,7 +287,6 @@ fn reserve_feed(flow: &mut HopReservation, bytes: Vec<u8>) -> ReservationOutcome
 }
 
 fn connect_flush(flow: &mut HopConnect) -> Vec<u8> {
-    flow.handle_input(HopConnectInput::Flush).unwrap();
     match flow.poll_output() {
         Some(HopConnectOutput::Outbound(bytes)) => bytes,
         other => panic!("expected connect outbound, got {other:?}"),
@@ -295,7 +294,7 @@ fn connect_flush(flow: &mut HopConnect) -> Vec<u8> {
 }
 
 fn connect_feed(flow: &mut HopConnect, bytes: Vec<u8>) -> minip2p_relay::ConnectOutcome {
-    flow.handle_input(HopConnectInput::Data(bytes)).unwrap();
+    flow.on_data(&bytes).unwrap();
     match flow.poll_output() {
         Some(HopConnectOutput::Outcome(outcome)) => outcome,
         other => panic!("expected connect outcome, got {other:?}"),
@@ -303,7 +302,7 @@ fn connect_feed(flow: &mut HopConnect, bytes: Vec<u8>) -> minip2p_relay::Connect
 }
 
 fn stop_feed(flow: &mut StopResponder, bytes: Vec<u8>) -> minip2p_relay::StopConnectRequest {
-    flow.handle_input(StopResponderInput::Data(bytes)).unwrap();
+    flow.on_data(&bytes).unwrap();
     match flow.poll_output() {
         Some(StopResponderOutput::Request(request)) => request,
         other => panic!("expected stop request, got {other:?}"),
@@ -311,7 +310,7 @@ fn stop_feed(flow: &mut StopResponder, bytes: Vec<u8>) -> minip2p_relay::StopCon
 }
 
 fn stop_accept_flush(flow: &mut StopResponder) -> Vec<u8> {
-    flow.handle_input(StopResponderInput::Accept).unwrap();
+    flow.accept().unwrap();
     match flow.poll_output() {
         Some(StopResponderOutput::Outbound(bytes)) => bytes,
         other => panic!("expected stop outbound, got {other:?}"),
@@ -319,7 +318,6 @@ fn stop_accept_flush(flow: &mut StopResponder) -> Vec<u8> {
 }
 
 fn dcutr_initiator_flush(flow: &mut DcutrInitiator) -> Vec<u8> {
-    flow.handle_input(DcutrInitiatorInput::Flush).unwrap();
     match flow.poll_output() {
         Some(DcutrInitiatorOutput::Outbound(bytes)) => bytes,
         other => panic!("expected dcutr initiator outbound, got {other:?}"),
@@ -331,8 +329,7 @@ fn dcutr_initiator_feed(
     bytes: Vec<u8>,
     rtt_ms: u64,
 ) -> InitiatorOutcome {
-    flow.handle_input(DcutrInitiatorInput::Data { bytes, rtt_ms })
-        .unwrap();
+    flow.on_data(&bytes, rtt_ms).unwrap();
     match flow.poll_output() {
         Some(DcutrInitiatorOutput::Outcome(outcome)) => outcome,
         other => panic!("expected dcutr initiator outcome, got {other:?}"),
@@ -340,16 +337,15 @@ fn dcutr_initiator_feed(
 }
 
 fn dcutr_send_sync_flush(flow: &mut DcutrInitiator) -> Vec<u8> {
-    flow.handle_input(DcutrInitiatorInput::SendSync).unwrap();
+    flow.send_sync().unwrap();
     dcutr_initiator_flush(flow)
 }
 
 fn dcutr_responder_feed(flow: &mut DcutrResponder, bytes: Vec<u8>) {
-    flow.handle_input(DcutrResponderInput::Data(bytes)).unwrap();
+    flow.on_data(&bytes).unwrap();
 }
 
 fn dcutr_responder_flush(flow: &mut DcutrResponder) -> Vec<u8> {
-    flow.handle_input(DcutrResponderInput::Flush).unwrap();
     match flow.poll_output() {
         Some(DcutrResponderOutput::Outbound(bytes)) => bytes,
         other => panic!("expected dcutr responder outbound, got {other:?}"),
