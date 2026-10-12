@@ -947,10 +947,7 @@ impl SwarmState {
         self.reset_pending.remove(&key);
         self.abandoned_streams.remove(&key);
         self.user_writable_wanted.remove(&key);
-        // The new owner sends the owed bytes as application writes.
-        if self.pending_demotions.remove(&key) {
-            self.mark_control(conn_id, stream_id, false);
-        }
+        let mut demote = self.pending_demotions.remove(&key);
         let mut owed = self
             .held
             .take(conn_id, stream_id)
@@ -961,11 +958,18 @@ impl SwarmState {
             if !stream_action_matches(action, conn_id, stream_id) {
                 return true;
             }
-            if let Action::SendStream { data, .. } = action {
-                owed.push_back(data.clone());
+            match action {
+                Action::SendStream { data, .. } => owed.push_back(data.clone()),
+                Action::SetControlStream { control: false, .. } => demote = true,
+                _ => {}
             }
             false
         });
+        // The new owner sends the owed bytes as application writes, so a
+        // demotion the cleanup dropped still goes out, after it.
+        if demote {
+            self.mark_control(conn_id, stream_id, false);
+        }
         owed
     }
 
@@ -3706,50 +3710,65 @@ mod tests {
     #[test]
     fn forgetting_a_stream_hands_back_the_bytes_the_core_still_owes() {
         const PROTOCOL: &str = "/test/1";
-        let mut core = test_core();
-        core.add_protocol(PROTOCOL).expect("register protocol");
-        let peer_id = PeerId::from_public_key_protobuf(b"bridge-relay");
-        let conn_id = ConnectionId::new(7);
-        let stream_id = StreamId::new(3);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id, conn_id);
+        // Whether the demotion is still queued or already held behind the
+        // tail when the stream changes hands.
+        for demotion_held in [false, true] {
+            let mut core = test_core();
+            core.add_protocol(PROTOCOL).expect("register protocol");
+            let peer_id = PeerId::from_public_key_protobuf(b"bridge-relay");
+            let conn_id = ConnectionId::new(7);
+            let stream_id = StreamId::new(3);
+            core.conn_to_peer.insert(conn_id, peer_id.clone());
+            core.peer_to_conn.insert(peer_id, conn_id);
 
-        // The negotiation header comes back Full, and the echo queues behind it.
-        feed(
-            &mut core,
-            TransportEvent::IncomingStream {
-                id: conn_id,
+            // The negotiation header comes back Full, and the echo queues
+            // behind it.
+            feed(
+                &mut core,
+                TransportEvent::IncomingStream {
+                    id: conn_id,
+                    stream_id,
+                },
+            );
+            let header = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+            drain_actions(&mut core);
+            core.handle_send_full(
+                conn_id,
                 stream_id,
-            },
-        );
-        let header = multistream_frame(MULTISTREAM_PROTOCOL_ID);
-        drain_actions(&mut core);
-        core.handle_send_full(
-            conn_id,
-            stream_id,
-            Bytes::copy_from_slice(&header[3..]),
-            header.len(),
-        );
-        let mut offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
-        offer.extend_from_slice(&multistream_frame(PROTOCOL));
-        feed(
-            &mut core,
-            TransportEvent::StreamData {
-                id: conn_id,
-                stream_id,
-                data: Bytes::from(offer),
-            },
-        );
+                Bytes::copy_from_slice(&header[3..]),
+                header.len(),
+            );
+            let mut offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+            offer.extend_from_slice(&multistream_frame(PROTOCOL));
+            feed(
+                &mut core,
+                TransportEvent::StreamData {
+                    id: conn_id,
+                    stream_id,
+                    data: Bytes::from(offer),
+                },
+            );
+            if demotion_held {
+                drain_actions(&mut core);
+            }
 
-        let owed: Vec<u8> = core
-            .forget_stream(conn_id, stream_id)
-            .into_iter()
-            .flatten()
-            .collect();
-        let mut expected = header[3..].to_vec();
-        expected.extend_from_slice(&multistream_frame(PROTOCOL));
-        assert_eq!(owed, expected, "the held tail, then the queued echo");
-        assert!(!core.held.is_held(conn_id, stream_id));
+            let owed: Vec<u8> = core
+                .forget_stream(conn_id, stream_id)
+                .into_iter()
+                .flatten()
+                .collect();
+            let mut expected = header[3..].to_vec();
+            expected.extend_from_slice(&multistream_frame(PROTOCOL));
+            assert_eq!(owed, expected, "the held tail, then the queued echo");
+            assert!(!core.held.is_held(conn_id, stream_id));
+            // The new owner writes application data, so the stream must not
+            // keep the control reserve.
+            assert_eq!(
+                control_marks(&drain_actions(&mut core), stream_id),
+                [false],
+                "demotion held: {demotion_held}"
+            );
+        }
     }
 
     #[test]
