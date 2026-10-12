@@ -742,10 +742,13 @@ pub(crate) fn convert_nat(event: NatEvent) -> Option<P2pEvent> {
             relay_peer_id: relay.to_base58(),
         },
         // Attempt terminals reach the app only as the Endpoint's
-        // `ConnectSettled`, converted by `convert_settled`.
+        // `ConnectSettled`, converted by `convert_settled`. Per-relay progress reaches the app inside the settled failure's
+        // message, which lists each relay tried and why it failed.
         NatEvent::PathEstablished { .. }
         | NatEvent::ConnectFailed { .. }
-        | NatEvent::FellBackToRelay { .. } => return None,
+        | NatEvent::FellBackToRelay { .. }
+        | NatEvent::RelayStarted { .. }
+        | NatEvent::RelayFailed { .. } => return None,
         NatEvent::InboundPathEstablished {
             peer,
             path,

@@ -76,7 +76,7 @@ pub(crate) struct ConnectAttempt {
     /// The caller's deadline for the attempt, which clips every budget.
     attempt_deadline: Option<u64>,
     /// Absolute end of the current relay's budget, across all its addresses.
-    share_deadline: u64,
+    relay_budget_deadline: u64,
     /// Absolute deadline for the current relay address: the end of its part
     /// of the relay's budget. Armed until the circuit carries a path.
     relay_deadline: Option<u64>,
@@ -150,7 +150,7 @@ impl ConnectAttempt {
             untried,
             leg: RelayLeg::Inactive,
             attempt_deadline: legs.deadline_ms,
-            share_deadline: 0,
+            relay_budget_deadline: 0,
             relay_deadline: None,
             relay_started_at: 0,
             hop: None,
@@ -226,15 +226,18 @@ impl ConnectAttempt {
     }
 
     /// The holder opened a DCUtR stream: a new round starts. A punch window
-    /// still open from the previous round ends here, failed.
+    /// still open from the previous round ends here, failed, and its unfinished
+    /// dials are aborted.
     pub(crate) fn on_dcutr_stream_opened(
         &mut self,
         conn: ConnectionId,
         stream: StreamId,
+        swarm: &dyn NatSwarm,
         shared: &mut Shared,
         now: Now,
     ) {
         if self.punch_deadline.take().is_some() {
+            shared.abort_attempt_dials(self.id, &self.peer, swarm);
             shared.push_event(NatEvent::HolePunchFailed {
                 connect_id: self.id,
                 attempt: self.rounds,
@@ -308,9 +311,6 @@ impl ConnectAttempt {
                             now,
                         );
                     } else {
-                        // The previous round's unfinished dials make way for
-                        // this round's.
-                        shared.abort_attempt_dials(self.id, &self.peer, swarm);
                         self.issue_punch_dials(swarm, shared);
                         self.punch_deadline = Some(
                             self.clip_upgrade(now.monotonic_ms + shared.config.punch_deadline_ms),
@@ -348,6 +348,9 @@ impl ConnectAttempt {
     ) {
         self.exchange_deadline = None;
         self.punch_deadline = None;
+        // Punch dials left from this round must not land as a late
+        // `DirectPunched` while the next round runs.
+        shared.abort_attempt_dials(self.id, &self.peer, swarm);
         shared.push_event(NatEvent::HolePunchFailed {
             connect_id: self.id,
             attempt: self.rounds,
@@ -958,15 +961,16 @@ impl ConnectAttempt {
             };
             let relay_peer = relay.peer_id().clone();
             if !self.is_relay_peer(&relay_peer) {
-                self.share_deadline = self.clip(now.monotonic_ms + shared.config.relay_timeout_ms);
+                self.relay_budget_deadline =
+                    self.clip(now.monotonic_ms + shared.config.relay_timeout_ms);
             }
             let addrs_left = 1 + self
                 .untried
                 .iter()
                 .take_while(|entry| entry.peer_id() == &relay_peer)
                 .count() as u64;
-            let share_left = self.share_deadline.saturating_sub(now.monotonic_ms);
-            self.relay_deadline = Some(now.monotonic_ms + share_left / addrs_left);
+            let budget_left = self.relay_budget_deadline.saturating_sub(now.monotonic_ms);
+            self.relay_deadline = Some(now.monotonic_ms + budget_left / addrs_left);
             self.relay_started_at = now.monotonic_ms;
             self.relay = Some(relay.clone());
             shared.push_event(NatEvent::RelayStarted {

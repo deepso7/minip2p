@@ -720,7 +720,7 @@ fn duplicate_direct_connection_does_not_double_report() {
 }
 
 #[test]
-fn relay_leg_deadline_fails_a_stalled_leg() {
+fn relay_timeout_fails_a_stalled_leg() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.start(RELAY_NOW, at(0));
     let actions = drain_actions(&mut h.agent);

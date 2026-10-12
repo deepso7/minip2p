@@ -516,7 +516,7 @@ fn sync_resets_the_completed_dcutr_control_stream() {
 }
 
 #[test]
-fn the_holder_runs_three_rounds_and_each_cancels_the_last_rounds_dials() {
+fn the_holder_runs_three_rounds_and_each_failed_round_cancels_its_dials() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (id, conn) = drive_to_relayed(&mut h);
 
@@ -527,15 +527,14 @@ fn the_holder_runs_three_rounds_and_each_cancels_the_last_rounds_dials() {
         drain_events(&mut h.agent).as_slice(),
         [NatEvent::HolePunchFailed { attempt: 1, .. }]
     ));
-
-    // The second round's SYNC drops the first round's unfinished dial
-    // before dialing again.
-    let second = drive_round_at(&mut h, conn, StreamId::new(91), 3_400);
+    // The failed window drops its unfinished dial before the next round.
     assert!(
-        second
+        drain_actions(&mut h.agent)
             .iter()
             .any(|out| matches!(out, Out::CloseCircuit { conn_id } if *conn_id == first_dial))
     );
+
+    let second = drive_round_at(&mut h, conn, StreamId::new(91), 3_400);
     assert_eq!(dial_count_for(&second, &h.target), 1);
     h.agent.handle_tick(at(6_402));
     drive_round_at(&mut h, conn, StreamId::new(92), 6_500);

@@ -735,6 +735,7 @@ impl NatAgent {
                             attempt.on_dcutr_stream_opened(
                                 *conn_id,
                                 *stream_id,
+                                swarm,
                                 &mut self.shared,
                                 now,
                             );
