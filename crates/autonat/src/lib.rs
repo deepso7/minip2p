@@ -367,18 +367,17 @@ impl AutoNatClient {
     /// `/p2p/<our peer id>`; malformed or unrelated addresses match nothing.
     fn confirmed(&self, raw: &[Vec<u8>]) -> Vec<Multiaddr> {
         let ours = Protocol::P2p(self.peer_id.clone());
-        let returned: Vec<Multiaddr> = decode_addrs(raw)
-            .into_iter()
-            .map(|addr| match addr.protocols().split_last() {
-                Some((last, transport)) if *last == ours => {
-                    Multiaddr::from_protocols(transport.to_vec())
-                }
-                _ => addr,
-            })
-            .collect();
+        let returned = decode_addrs(raw);
+        let names = |requested: &Multiaddr, addr: &Multiaddr| {
+            addr == requested
+                || addr
+                    .protocols()
+                    .split_last()
+                    .is_some_and(|(last, rest)| *last == ours && rest == requested.protocols())
+        };
         self.requested
             .iter()
-            .filter(|requested| returned.contains(requested))
+            .filter(|requested| returned.iter().any(|addr| names(requested, addr)))
             .cloned()
             .collect()
     }
@@ -961,8 +960,14 @@ mod tests {
         // Unrelated addresses are dropped, and a /p2p suffix naming us
         // still matches what we asked about.
         assert!(matches!(
-            public_outcome(&[asked], &[other.clone(), with_peer]),
+            public_outcome(&[asked], &[other.clone(), with_peer.clone()]),
             Reachability::Public { addrs, .. } if addrs == vec![asked_addr]
+        ));
+        // A requested address that already names us matches itself.
+        let with_peer_text = with_peer.to_string();
+        assert!(matches!(
+            public_outcome(&[&with_peer_text], core::slice::from_ref(&with_peer)),
+            Reachability::Public { addrs, .. } if addrs == vec![with_peer.clone()]
         ));
         // Only unrelated, or nothing at all: no evidence either way.
         for returned in [vec![other], Vec::new()] {

@@ -516,33 +516,60 @@ impl Prober {
             .values()
             .filter(|vote| vote.public_addrs.is_empty())
             .count();
-        let new = if !confirmed.is_empty() {
-            ReachabilityState::Public
+        let (new, addrs) = if !confirmed.is_empty() {
+            (ReachabilityState::Public, confirmed)
         } else if private_votes >= threshold {
-            ReachabilityState::Private
+            (ReachabilityState::Private, Vec::new())
         } else if self.votes.len() < threshold {
-            ReachabilityState::Unknown
+            (ReachabilityState::Unknown, Vec::new())
         } else {
-            self.verdict
+            self.held_verdict(private_votes)
         };
         if new == self.verdict {
-            if new == ReachabilityState::Public
-                && !confirmed.is_empty()
-                && confirmed != self.public_addrs
-            {
-                self.public_addrs = confirmed.clone();
-                shared.push_event(NatEvent::PublicAddressesChanged { addrs: confirmed });
+            if new == ReachabilityState::Public && addrs != self.public_addrs {
+                self.public_addrs = addrs.clone();
+                shared.push_event(NatEvent::PublicAddressesChanged { addrs });
             }
             return false;
         }
         let old = core::mem::replace(&mut self.verdict, new);
-        self.public_addrs = confirmed;
+        self.public_addrs = addrs;
         shared.push_event(NatEvent::ReachabilityChanged {
             old,
             new,
             confirmed_addrs: self.public_addrs.clone(),
         });
         true
+    }
+
+    /// The verdict, and its addresses, held without a quorum either way: only
+    /// what some live vote still supports. A public verdict keeps the
+    /// confirmed addresses a live vote still names, a private one needs a
+    /// live private vote; with nothing left it lapses to Unknown.
+    fn held_verdict(&self, private_votes: usize) -> (ReachabilityState, Vec<Multiaddr>) {
+        match self.verdict {
+            ReachabilityState::Public => {
+                let held: Vec<Multiaddr> = self
+                    .public_addrs
+                    .iter()
+                    .filter(|addr| {
+                        self.votes
+                            .values()
+                            .any(|vote| vote.public_addrs.contains(addr))
+                    })
+                    .cloned()
+                    .collect();
+                if held.is_empty() {
+                    (ReachabilityState::Unknown, held)
+                } else {
+                    (ReachabilityState::Public, held)
+                }
+            }
+            ReachabilityState::Private if private_votes == 0 => {
+                (ReachabilityState::Unknown, Vec::new())
+            }
+            verdict => (verdict, Vec::new()),
+        }
     }
 
     /// The addresses at least `threshold` live votes confirm, newest vote
@@ -596,11 +623,20 @@ impl Prober {
     }
 
     fn next_deadline(&self) -> Option<u64> {
-        let flight_deadline = self.flight.as_ref().map(|f| f.deadline);
-        match (flight_deadline, self.next_probe_at) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        // A settled verdict must lapse when its votes expire, even between
+        // probes.
+        let expiry = (self.verdict != ReachabilityState::Unknown)
+            .then(|| self.votes.values().map(|vote| vote.cast_at_ms).min())
+            .flatten()
+            .map(|cast_at_ms| cast_at_ms.saturating_add(AUTONAT_VOTE_TTL_MS));
+        [
+            self.flight.as_ref().map(|f| f.deadline),
+            self.next_probe_at,
+            expiry,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 }
 

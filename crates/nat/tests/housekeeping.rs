@@ -494,6 +494,79 @@ fn a_settled_verdict_lapses_to_unknown_once_its_votes_expire() {
 }
 
 #[test]
+fn a_confirmed_address_is_dropped_once_no_live_vote_names_it() {
+    let mut hk = build(ReservationPolicy::Never, 0, 4);
+    let (x, y, z) = (
+        maddr(LISTEN_ADDR),
+        maddr(OUR_OBSERVED_ADDR),
+        maddr("/ip4/203.0.113.78/udp/4001/quic-v1"),
+    );
+    hk.agent
+        .set_listen_addrs(&[x.clone(), y.clone(), z.clone()]);
+    let only = |addr: &minip2p_core::Multiaddr| std::slice::from_ref(addr).to_vec();
+    assert!(hk.probe(Answer::Public(&only(&x)), 0).1.is_empty());
+    assert!(hk.probe(Answer::Public(&only(&x)), 6_000).1.is_empty());
+    assert_eq!(hk.probe(Answer::Public(&only(&x)), 12_000).1.len(), 1);
+
+    // Three live votes, none a quorum, and the last vote for `x` (cast at
+    // 12_002ms) expires at 912_002ms. Three votes stay live past it (the
+    // oldest, for `y`, until 1_002_102ms), so only the lost support for `x`
+    // can end the verdict.
+    let mut events = Vec::new();
+    events.extend(hk.probe(Answer::Public(&only(&y)), 102_100).1);
+    events.extend(hk.probe(Answer::Public(&only(&z)), 192_200).1);
+    events.extend(hk.probe(Answer::DialError, 282_300).1);
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(hk.agent.reachability(), ReachabilityState::Public);
+    assert_eq!(
+        hk.agent.next_deadline(at(282_400)),
+        Some(Deadline::from_millis(372_302)),
+        "the next probe comes before the vote expiry"
+    );
+    for round in 0..7 {
+        events.extend(hk.probe(Answer::DialRefused, 372_400 + round * 90_100).1);
+    }
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::ReachabilityChanged {
+                old: ReachabilityState::Public,
+                new: ReachabilityState::Unknown,
+                confirmed_addrs,
+            }] if confirmed_addrs.is_empty()
+        ),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_settled_verdict_wakes_the_host_when_its_votes_expire() {
+    let mut hk = build_with_config(ReservationPolicy::Never, 0, 3, |config| {
+        config.probe_interval_settled_ms = 3_600_000;
+    });
+    let public = [maddr(LISTEN_ADDR)];
+    assert!(hk.probe(Answer::Public(&public), 0).1.is_empty());
+    assert!(hk.probe(Answer::Public(&public), 6_000).1.is_empty());
+    assert_eq!(hk.probe(Answer::Public(&public), 12_000).1.len(), 1);
+    // The probe after the flip is the last for an hour.
+    assert!(hk.probe(Answer::Public(&public), 17_002).1.is_empty());
+    drain_actions(&mut hk.agent);
+    // The oldest live vote, cast at 6_002ms, expires long before then.
+    assert_eq!(
+        hk.agent.next_deadline(at(20_000)),
+        Some(Deadline::from_millis(906_002))
+    );
+    hk.agent.handle_tick(at(906_002));
+    assert!(matches!(
+        drain_events(&mut hk.agent).as_slice(),
+        [NatEvent::ReachabilityChanged {
+            new: ReachabilityState::Unknown,
+            ..
+        }]
+    ));
+}
+
+#[test]
 fn probe_timeout_rotates_to_the_next_server() {
     let mut hk = build(ReservationPolicy::Never, 0, 2);
 
