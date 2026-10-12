@@ -527,6 +527,7 @@ pub enum Out {
         remote_peer: PeerId,
         role: BridgeRole,
         pending_data: Vec<u8>,
+        unsent_data: Vec<u8>,
         remote_write_closed: bool,
     },
     CloseCircuit {
@@ -552,6 +553,7 @@ impl From<NatAction> for Out {
                 remote_peer,
                 role,
                 pending_data,
+                unsent_data,
                 remote_write_closed,
             } => Out::PromoteBridge {
                 token,
@@ -561,6 +563,7 @@ impl From<NatAction> for Out {
                 remote_peer,
                 role,
                 pending_data,
+                unsent_data,
                 remote_write_closed,
             },
             NatAction::CloseCircuit { conn_id } => Out::CloseCircuit { conn_id },
@@ -588,6 +591,9 @@ pub struct FakeSwarm {
     /// The id the next stream open returns, as a transport that numbers
     /// streams per connection reuses ids across connections.
     pub next_stream_id: Option<StreamId>,
+    /// Refuse every write as Full with nothing accepted; the attempt is
+    /// still logged.
+    pub full_sends: bool,
 }
 
 impl FakeSwarm {
@@ -717,6 +723,13 @@ impl NatSwarm for FakeSwarm {
             stream_id,
             data: data.to_vec(),
         });
+        if self.full_sends {
+            return Err(NatSwarmError::Swarm(DriverError::Full {
+                conn_id,
+                stream_id,
+                unsent: data,
+            }));
+        }
         Ok(())
     }
 

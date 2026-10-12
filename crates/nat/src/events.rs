@@ -44,6 +44,10 @@ pub enum NatAction {
         remote_peer: PeerId,
         role: BridgeRole,
         pending_data: Vec<u8>,
+        /// Bytes NAT wrote on the bridge that the swarm refused as Full and
+        /// the agent still held (a STOP STATUS, say). The circuit sends
+        /// them before anything of its own.
+        unsent_data: Vec<u8>,
         remote_write_closed: bool,
     },
     /// Close a promoted circuit connection, or a NAT dial's handshake that

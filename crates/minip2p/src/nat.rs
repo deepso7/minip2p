@@ -658,6 +658,7 @@ impl<T: Transport> NatDriver<T> {
                 remote_peer,
                 role,
                 pending_data,
+                unsent_data,
                 remote_write_closed,
             } => {
                 #[cfg(not(feature = "_circuit-driver"))]
@@ -669,6 +670,7 @@ impl<T: Transport> NatDriver<T> {
                         remote_peer,
                         role,
                         pending_data,
+                        unsent_data,
                         remote_write_closed,
                     );
                     let mut io = EndpointSwarm::new(swarm, &mut self.io);
@@ -704,11 +706,15 @@ impl<T: Transport> NatDriver<T> {
                     };
                     // Bytes refused as Full are still owed to the peer: the
                     // core's (a negotiation reply, say), then ours (a STOP
-                    // STATUS). The circuit takes Writable for the stream now,
-                    // so it sends them first, in that order.
+                    // STATUS), then any the agent held itself. The circuit
+                    // takes Writable for the stream now, so it sends them
+                    // first, in that order.
                     let mut owed = swarm.forget_stream(inner_conn, stream_id);
                     if let Some(held) = self.io.held.take(inner_conn, stream_id) {
                         owed.extend(held.tails);
+                    }
+                    if !unsent_data.is_empty() {
+                        owed.push_back(unsent_data.into());
                     }
                     let unsent_prefix = concat(owed);
                     let adoption = BridgeAdoption {

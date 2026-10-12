@@ -99,6 +99,24 @@ fn default_inbound_promotes_immediately_after_stop_acceptance() {
 }
 
 #[test]
+fn a_stop_status_refused_as_full_rides_the_promotion() {
+    let mut h = inbound_harness(NatConfig::default());
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    let target = h.target.clone();
+
+    h.agent.swarm.full_sends = true;
+    h.stream_data(stream, stop_connect(&target), at(10));
+
+    let actions = drain_actions(&mut h.agent);
+    let status = sent_data_on(&actions, stream);
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        Out::PromoteBridge { unsent_data, .. } if *unsent_data == status
+    )));
+}
+
+#[test]
 fn inbound_relay_path_opens_dcutr_after_the_circuit_is_connected() {
     let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);

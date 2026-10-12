@@ -9,7 +9,7 @@
 use alloc::string::String;
 
 use minip2p_core::{Bytes, PeerAddr, PeerId, Protocol};
-use minip2p_swarm::{DriverError, EntropySource, SwarmCore};
+use minip2p_swarm::{DriverError, EntropySource, HeldWrites, SwarmCore};
 use minip2p_transport::{ConnectionId, StreamId, Transport};
 
 use crate::types::NatToken;
@@ -45,8 +45,10 @@ pub enum NatSwarmError {
 /// The swarm operations NAT traversal needs.
 ///
 /// The swarm is passed into every [`NatAgent`](crate::NatAgent) call and never
-/// stored. Implemented for [`SwarmCore`]; hosts that resolve names or hold
-/// write tails wrap it in a small borrowing adapter that forwards the rest.
+/// stored. Implemented for [`SwarmCore`]; hosts that resolve names wrap it
+/// in a small borrowing adapter that forwards the rest. Writes refused as
+/// [`DriverError::Full`] need no host help: the agent holds and resends
+/// them.
 ///
 /// Reads may be ahead of the event the agent is handling (see the
 /// "State snapshot" entry in `CONTEXT.md`). The agent uses them only to
@@ -120,8 +122,8 @@ pub fn is_named(addr: &PeerAddr) -> bool {
 
 /// The bare swarm dials concrete addresses only and rejects named ones with
 /// [`NatSwarmError::NamedAddress`]. Writes a full stream refuses are
-/// reported as [`DriverError::Full`] and not retried; NAT control messages
-/// are small, and each exchange's deadline ends one that stalls.
+/// reported as [`DriverError::Full`]; the agent holds their tails and
+/// resends them on the stream's Writable.
 impl<T: Transport, E: EntropySource> NatSwarm for SwarmCore<T, E> {
     fn connection(&self, peer: &PeerId) -> Option<ConnectionId> {
         if self.is_peer_connected(peer) {
@@ -191,5 +193,135 @@ impl<T: Transport, E: EntropySource> NatSwarm for SwarmCore<T, E> {
 
     fn ping(&mut self, peer: &PeerId, now_ms: u64) -> Result<(), NatSwarmError> {
         Ok(SwarmCore::ping(self, peer, now_ms)?)
+    }
+}
+
+/// Bytes NAT holds for one stream before it gives up on it. NAT messages
+/// are a few hundred bytes; a peer that leaves this much unread is not
+/// completing the exchange.
+const MAX_HELD_PER_STREAM: usize = 64 * 1024;
+
+/// Wraps the host's swarm for one agent call so writes it refuses as Full
+/// are held, not lost (ADR 0012).
+///
+/// A held stream's later writes and its write-side close queue behind the
+/// tail, and [`replay`](Self::replay) resends them on the stream's
+/// Writable. Hosts whose adapter already holds tails never return Full, so
+/// for them this only forwards.
+pub(crate) struct HoldingSwarm<'a> {
+    pub(crate) inner: &'a mut dyn NatSwarm,
+    pub(crate) held: &'a mut HeldWrites,
+}
+
+impl HoldingSwarm<'_> {
+    /// Resends a writable stream's held tails, then its deferred close.
+    /// Failures surface through the exchange deadlines and the swarm's
+    /// events, as for the first write.
+    pub(crate) fn replay(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now_ms: u64,
+    ) {
+        let Some(held) = self.held.take(conn_id, stream_id) else {
+            return;
+        };
+        for data in held.tails {
+            match self.send_stream(peer, conn_id, stream_id, data, now_ms) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        if held.close {
+            match self.close_stream_write(peer, conn_id, stream_id, now_ms) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    }
+}
+
+impl NatSwarm for HoldingSwarm<'_> {
+    fn connection(&self, peer: &PeerId) -> Option<ConnectionId> {
+        self.inner.connection(peer)
+    }
+
+    fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[String])> {
+        self.inner.readiness(peer)
+    }
+
+    fn dial(&mut self, addr: &PeerAddr, token: NatToken) -> Result<DialStart, NatSwarmError> {
+        self.inner.dial(addr, token)
+    }
+
+    fn open_stream(
+        &mut self,
+        peer: &PeerId,
+        protocol_id: &str,
+        now_ms: u64,
+    ) -> Result<(ConnectionId, StreamId), NatSwarmError> {
+        self.inner.open_stream(peer, protocol_id, now_ms)
+    }
+
+    /// Writes `data`, or holds it behind the stream's unsent tail. A Full
+    /// holds what the stream did not take; a stream holding more than
+    /// [`MAX_HELD_PER_STREAM`] is reset.
+    fn send_stream(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        data: Bytes,
+        now_ms: u64,
+    ) -> Result<(), NatSwarmError> {
+        let counted = data.len();
+        if self.held.is_held(conn_id, stream_id) {
+            self.held.push(conn_id, stream_id, data, counted);
+        } else {
+            match self
+                .inner
+                .send_stream(peer, conn_id, stream_id, data, now_ms)
+            {
+                Ok(()) => {}
+                Err(NatSwarmError::Swarm(DriverError::Full { unsent, .. })) => {
+                    self.held.push(conn_id, stream_id, unsent, counted);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if self.held.held_bytes(conn_id, stream_id) > MAX_HELD_PER_STREAM {
+            self.reset_stream(peer, conn_id, stream_id, now_ms)?;
+        }
+        Ok(())
+    }
+
+    /// Closes the write side now, or after the stream's held tails.
+    fn close_stream_write(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now_ms: u64,
+    ) -> Result<(), NatSwarmError> {
+        if self.held.close_after(conn_id, stream_id) {
+            return Ok(());
+        }
+        self.inner
+            .close_stream_write(peer, conn_id, stream_id, now_ms)
+    }
+
+    /// Resets the stream, dropping whatever it still held.
+    fn reset_stream(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now_ms: u64,
+    ) -> Result<(), NatSwarmError> {
+        self.held.forget_stream(conn_id, stream_id);
+        self.inner.reset_stream(peer, conn_id, stream_id, now_ms)
+    }
+
+    fn ping(&mut self, peer: &PeerId, now_ms: u64) -> Result<(), NatSwarmError> {
+        self.inner.ping(peer, now_ms)
     }
 }
