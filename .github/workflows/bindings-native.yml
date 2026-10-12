@@ -105,7 +105,7 @@ jobs:
                 --repository https://dl-cdn.alpinelinux.org/alpine/v3.23/main \
                 nodejs npm
               export PATH=/usr/bin:$PATH
-              npm install --global --prefix /opt/pnpm "$(node -p "require(\"/work/package.json\").packageManager")"
+              npm install --global --prefix /opt/pnpm "$(node -p "require(\"/work/package.json\").packageManager.split(\"+\")[0]")"
               export PATH=/opt/pnpm/bin:/usr/bin:$PATH
               rustup toolchain install 1.91 --profile minimal
               rustup default 1.91
