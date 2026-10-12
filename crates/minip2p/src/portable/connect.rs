@@ -166,7 +166,7 @@ pub enum ConnectFailure {
     AllRoutesFailed {
         /// Per-candidate dial failures.
         candidates: Vec<CandidateFailure>,
-        /// One failure per relay tried, in order.
+        /// One failure per relay address tried, in order.
         relays: Vec<RelayFailure>,
     },
     /// The attempt deadline elapsed with dials still pending.
@@ -176,7 +176,7 @@ pub enum ConnectFailure {
         elapsed_ms: u64,
         /// Failures observed before the deadline, plus pending candidates.
         candidates: Vec<CandidateFailure>,
-        /// One failure per relay tried, then the relay still pending.
+        /// One failure per relay address tried, then the relay still pending.
         relays: Vec<RelayFailure>,
     },
 }
@@ -325,7 +325,7 @@ struct Attempt {
     dialed_any: bool,
     failed: Vec<CandidateFailure>,
     relay: RelayLeg,
-    /// One failure per relay the leg gave up on, in order.
+    /// One failure per relay address the leg gave up on, in order.
     relay_failures: Vec<RelayFailure>,
 }
 

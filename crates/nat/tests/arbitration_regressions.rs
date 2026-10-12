@@ -932,6 +932,43 @@ fn a_stalled_exchange_settles_relayed_with_its_round() {
 }
 
 #[test]
+fn an_exchange_finishing_near_its_deadline_keeps_its_punch_window() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (_, conn) = drive_to_relayed(&mut h);
+    let stream = StreamId::new(90);
+    open_inbound_dcutr_at(&mut h, conn, stream, 1_000);
+    for (data, t) in [
+        (
+            dcutr_connect_reply(&[maddr("/ip4/9.9.9.9/udp/4002/quic-v1")]),
+            10_900,
+        ),
+        (dcutr_sync(), 10_950),
+    ] {
+        h.agent.handle_event(
+            &SwarmEvent::StreamData {
+                conn_id: conn,
+                peer_id: h.target.clone(),
+                stream_id: stream,
+                data: Bytes::from(data),
+            },
+            false,
+            at(t),
+        );
+    }
+    drain_actions(&mut h.agent);
+
+    // Past the 10 s exchange budget but inside the punch window: the
+    // round is still running.
+    h.agent.handle_tick(at(11_500));
+    assert!(drain_events(&mut h.agent).is_empty());
+    h.agent.handle_tick(at(13_950));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::HolePunchFailed { attempt: 1, .. }]
+    ));
+}
+
+#[test]
 fn the_whole_upgrade_is_bounded() {
     let mut h = Harness::with_relay(NatConfig {
         upgrade_timeout_ms: 5_000,

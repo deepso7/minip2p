@@ -302,6 +302,9 @@ impl ConnectAttempt {
                     self.punch_addrs = select_global_punch_candidates(&remote_addrs);
                 }
                 DcutrResponderOutput::Event(ResponderEvent::SyncReceived) => {
+                    // The exchange is done; only the punch window bounds
+                    // the rest of the round.
+                    self.exchange_deadline = None;
                     self.teardown_dcutr_stream(swarm, shared, now);
                     if self.punch_addrs.is_empty() {
                         self.round_failed(

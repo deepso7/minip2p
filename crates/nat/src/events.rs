@@ -88,7 +88,8 @@ pub enum NatEvent {
         connect_id: ConnectId,
         relay: PeerAddr,
     },
-    /// `relay` failed for this attempt. The leg moves on to the next relay
+    /// One address of `relay` failed for this attempt; a relay listed under
+    /// several addresses reports each. The leg moves on to the next relay
     /// while it has one; otherwise [`NatEvent::ConnectFailed`] follows.
     RelayFailed {
         connect_id: ConnectId,

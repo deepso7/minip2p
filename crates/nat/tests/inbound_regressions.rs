@@ -744,3 +744,27 @@ fn named_listen_addresses_do_not_crowd_out_concrete_punch_candidates() {
     let addrs = dcutr_obs_addrs(&sent_data_on(&drain_actions(&mut h.agent), stream));
     assert!(addrs.contains(&concrete), "{addrs:?}");
 }
+
+#[test]
+fn no_blast_leaves_after_the_upgrade_budget() {
+    let mut h = inbound_harness(NatConfig {
+        upgrade_timeout_ms: 500,
+        ..NatConfig::default()
+    });
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+
+    // A 400 ms RTT puts the first blast at t=613, past the budget.
+    answer_dcutr_at(
+        &mut h,
+        conn,
+        stream,
+        &["/ip4/8.8.8.8/udp/4001/quic-v1"],
+        413,
+    );
+    drain_actions(&mut h.agent);
+    h.agent.handle_tick(at(700));
+    assert_eq!(blast_count(&drain_actions(&mut h.agent)), 0);
+    assert!(h.agent.is_idle());
+}

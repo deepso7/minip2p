@@ -300,6 +300,16 @@ impl InboundCircuit {
                 return;
             }
         }
+        if let Some(deadline) = self.upgrade_deadline
+            && now.monotonic_ms >= deadline
+        {
+            // The whole upgrade is over, before any late blast goes out; the
+            // Relayed path stays.
+            self.finish_dcutr(swarm, shared, now);
+            self.blast = None;
+            self.done = true;
+            return;
+        }
         if let Some(blast) = &mut self.blast {
             let interval = shared.config.blast_interval_ms.max(1);
             let mut exhausted = false;
@@ -321,15 +331,6 @@ impl InboundCircuit {
             if now.monotonic_ms >= blast.until || exhausted {
                 self.blast = None;
             }
-        }
-        if let Some(deadline) = self.upgrade_deadline
-            && now.monotonic_ms >= deadline
-        {
-            // The whole upgrade is over; the Relayed path stays.
-            self.finish_dcutr(swarm, shared, now);
-            self.blast = None;
-            self.done = true;
-            return;
         }
         if let Some(until) = self.round_until
             && now.monotonic_ms >= until
@@ -587,7 +588,10 @@ impl InboundCircuit {
                     self.remote_addrs = select_global_punch_candidates(&remote_addrs);
                     completed = true;
                     let blast_start = now.monotonic_ms.saturating_add(rtt_ms.div_ceil(2));
-                    let blast_until = blast_start.saturating_add(shared.config.punch_deadline_ms);
+                    let window_end = blast_start.saturating_add(shared.config.punch_deadline_ms);
+                    let blast_until = self
+                        .upgrade_deadline
+                        .map_or(window_end, |deadline| deadline.min(window_end));
                     if !self.remote_addrs.is_empty() {
                         let next_at = if rtt_ms == 0 {
                             for addr in &self.remote_addrs {
