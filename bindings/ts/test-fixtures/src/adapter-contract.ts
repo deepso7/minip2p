@@ -495,7 +495,6 @@ export function describeAdapterContract(
           maxAnnouncedAddrs: 16,
           maxPacketBytes: 1400,
           queryIntervalMs: 300_000n,
-          socketPollIntervalMs: 100n,
           ttlMs: 120_000n,
         },
         protocols: [],

@@ -105,7 +105,8 @@ use minip2p_tcp::{StdTcpProvider, TcpConfig, TcpTransport};
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_transport::ConnectionNamespace;
 use minip2p_transport::Transport;
-pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet, WaitHandle};
+pub use minip2p_swarm::WaitHandle;
+pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet};
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use std::str::FromStr;
 
@@ -304,9 +305,6 @@ pub struct Endpoint {
     /// NAT relay and AutoNAT dials waiting on Name resolution.
     #[cfg(feature = "nat")]
     nat_dials: Vec<(minip2p_nat::NatToken, PeerAddr)>,
-    /// Set by [`Endpoint::wait_handle`] interrupts, so [`Endpoint::wait`] can
-    /// tell a caller's interrupt from a lookup thread waking the driver.
-    caller_interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Addresses set by [`Endpoint::set_external_addresses`]; the NAT and
     /// relay-server contributions are merged onto them before Identify.
     #[cfg(any(feature = "nat", feature = "relay-server"))]
@@ -328,20 +326,13 @@ impl Endpoint {
     /// Returns a cloneable handle that can interrupt a blocking endpoint wait
     /// from another thread.
     ///
-    /// Taken through the transport trait rather than the concrete QUIC
-    /// endpoint, so it stays correct once the endpoint drives more than one
-    /// transport. Use this handle rather than the transport's own: the
-    /// endpoint also wakes its wait internally (a finished name lookup), and
-    /// only this handle's interrupts surface as
-    /// [`EndpointWaitOutcome::Interrupted`].
+    /// The swarm's interrupt handle, on the one readiness poll every
+    /// transport and mDNS socket is registered with. Its interrupts surface as
+    /// [`EndpointWaitOutcome::Interrupted`]; interrupts sent before one is
+    /// reported coalesce into one. The endpoint's own wakeups (a finished name
+    /// lookup, mDNS input) use the swarm's wake-only handle and never do.
     pub fn wait_handle(&self) -> WaitHandle {
-        let transport =
-            minip2p_transport::BlockingTransport::wait_handle(self.swarm.core().transport());
-        let caller_interrupt = std::sync::Arc::clone(&self.caller_interrupt);
-        WaitHandle::new(move || {
-            caller_interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
-            transport.interrupt();
-        })
+        self.swarm.wait_handle()
     }
 
     /// Starts building an endpoint.
@@ -916,15 +907,15 @@ impl Endpoint {
                     }
                     self.pending_events.extend(produced);
                 }
-                PollNext::Interrupted => {
-                    // Anything but a caller's interrupt is a lookup thread
-                    // with an answer; the next `tick_connect` applies it.
-                    if self
-                        .caller_interrupt
-                        .swap(false, std::sync::atomic::Ordering::SeqCst)
-                    {
-                        return Ok(EndpointWaitOutcome::Interrupted);
-                    }
+                PollNext::Interrupted => return Ok(EndpointWaitOutcome::Interrupted),
+                PollNext::Woken => {
+                    // Host work: a lookup thread with an answer, or mDNS
+                    // input. Apply the answers, then tick the drivers, which
+                    // reads every mDNS socket.
+                    self.tick_connect()?;
+                    let mut produced = Vec::new();
+                    self.finish_step(&mut produced)?;
+                    self.pending_events.extend(produced);
                 }
             }
         }
@@ -2492,11 +2483,15 @@ fn build_endpoint(
             .map_err(|error| TransportError::InvalidConfig {
                 reason: error.to_string(),
             })?;
-            let sockets = minip2p_mdns::MdnsSockets::new(&config).map_err(|error| {
+            let mut sockets = minip2p_mdns::MdnsSockets::new(&config).map_err(|error| {
                 TransportError::ListenFailed {
                     reason: error.to_string(),
                 }
             })?;
+            // The sockets only wake the swarm's wait (as `PollNext::Woken`);
+            // the next driver tick reads them. A refresh re-registers what
+            // it rebuilds. (`mdns` implies `nat`, so the swarm is mutable.)
+            swarm.attach_host_source(&mut sockets)?;
             Some(mdns::MdnsDriver::new(agent, sockets, &config))
         }
         None => None,
@@ -2540,9 +2535,7 @@ fn build_endpoint(
     } else {
         None
     };
-    let resolver = dial::Resolver::new(minip2p_transport::BlockingTransport::wait_handle(
-        swarm.core().transport(),
-    ));
+    let resolver = dial::Resolver::new(swarm.wake_handle());
     Ok(Endpoint {
         swarm,
         connect: ConnectEngine::new(
@@ -2563,7 +2556,6 @@ fn build_endpoint(
         resolver,
         #[cfg(feature = "nat")]
         nat_dials: Vec::new(),
-        caller_interrupt: std::sync::Arc::default(),
         #[cfg(any(feature = "nat", feature = "relay-server"))]
         caller_external_addresses: Vec::new(),
     })
@@ -2819,9 +2811,8 @@ mod tests {
     }
 
     fn with_lookup(endpoint: &mut Endpoint, lookup: dial::Lookup) {
-        let wake =
-            minip2p_transport::BlockingTransport::wait_handle(endpoint.swarm.core().transport());
-        endpoint.resolver = dial::Resolver::with_lookup(wake, lookup);
+        let wake = endpoint.swarm.wake_handle();
+        endpoint.resolver = dial::Resolver::with_lookup(move || wake.wake(), lookup);
     }
 
     /// `addr` with its host swapped for the name `host`.
@@ -2934,6 +2925,51 @@ mod tests {
                 }
                 EndpointWaitOutcome::Event(_) => {}
                 other => panic!("expected both attempts to settle, got {other:?}"),
+            }
+        }
+    }
+
+    /// Swarm input and a lookup's wake land in the same batch: the event is
+    /// returned, the wake stays pending behind it, and neither the answer nor
+    /// the event is lost or reported as the caller's interrupt.
+    #[test]
+    fn a_resolver_wake_and_swarm_input_in_one_batch_both_arrive() {
+        let mut dialer = quic_endpoint();
+        let (lookup, started, answer) = stalling_lookup();
+        with_lookup(&mut dialer, lookup);
+        let peer = Ed25519Keypair::generate().peer_id();
+        let named_target = PeerAddr::new(
+            "/dns/gone.invalid/udp/4001/quic-v1".parse().expect("addr"),
+            peer.clone(),
+        )
+        .expect("peer addr");
+        let connect_id = dialer.connect(named_target).expect("connect");
+        assert_eq!(started.recv().expect("lookup started"), "gone.invalid");
+
+        answer
+            .send(Err("NXDOMAIN".to_string()))
+            .expect("lookup waiting");
+        // Let the lookup thread queue its answer and wake the swarm.
+        std::thread::sleep(Duration::from_millis(100));
+        let other = Ed25519Keypair::generate().peer_id();
+        dialer.swarm.preload_poll_events([SwarmEvent::PingTimeout {
+            peer_id: other.clone(),
+        }]);
+
+        let (mut settled, mut input) = (false, false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !(settled && input) {
+            match dialer.wait(deadline).expect("wait") {
+                EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+                    connect_id: id, ..
+                }) if id == connect_id => settled = true,
+                EndpointWaitOutcome::Event(EndpointEvent::PingTimeout { peer_id })
+                    if peer_id == other =>
+                {
+                    input = true;
+                }
+                EndpointWaitOutcome::Event(_) => {}
+                other => panic!("lost something: settled {settled}, input {input}: {other:?}"),
             }
         }
     }
@@ -3680,23 +3716,24 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupt_survives_a_wait_with_a_passed_instant() {
+    fn a_pending_interrupt_is_reported_once_even_past_the_deadline() {
         let mut endpoint = Endpoint::builder()
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")
             .bind()
             .expect("bind loopback endpoint");
         endpoint.wait_handle().interrupt();
+        endpoint.wait_handle().interrupt();
 
-        // An expired call never blocks, so it never reaches the readiness wait
-        // that reports the interrupt; the interrupt stays pending.
+        // A pending interrupt outranks an expired deadline, so a host's
+        // non-blocking pump still notices it; the two calls are one.
+        assert!(matches!(
+            endpoint.wait(past_instant()).expect("wait past deadline"),
+            EndpointWaitOutcome::Interrupted
+        ));
         assert!(matches!(
             endpoint.wait(past_instant()).expect("wait past deadline"),
             EndpointWaitOutcome::Deadline
-        ));
-        assert!(matches!(
-            endpoint.wait(Deadline::NEVER).expect("wait endpoint"),
-            EndpointWaitOutcome::Interrupted
         ));
     }
 
@@ -4042,7 +4079,18 @@ mod tests {
         }
     }
 
-    impl minip2p_transport::BlockingTransport for FlakyPollTransport {}
+    impl minip2p_transport::PollSource for FlakyPollTransport {
+        fn attach(
+            &mut self,
+            _: minip2p_transport::mio::Registry,
+            _: minip2p_transport::TokenSpace,
+            _: std::sync::Arc<minip2p_transport::mio::Waker>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn dispatch(&mut self, _: &minip2p_transport::mio::event::Event) {}
+    }
 
     /// Events already queued survive a `poll` that fails, and come out of the
     /// next one.

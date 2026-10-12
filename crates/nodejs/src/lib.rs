@@ -53,8 +53,6 @@ pub struct NodeMdnsOptions {
     pub max_announced_addrs: u32,
     /// Interface refresh interval in milliseconds.
     pub interface_refresh_ms: BigInt,
-    /// Socket polling interval in milliseconds.
-    pub socket_poll_interval_ms: BigInt,
     /// Whether observations may trigger dials.
     pub auto_dial: bool,
 }
@@ -117,10 +115,6 @@ fn convert_mdns(options: NodeMdnsOptions) -> Result<MdnsOptions> {
         max_packet_bytes: options.max_packet_bytes,
         max_announced_addrs: options.max_announced_addrs,
         interface_refresh_ms: bigint_u64(options.interface_refresh_ms, "interfaceRefreshMs")?,
-        socket_poll_interval_ms: bigint_u64(
-            options.socket_poll_interval_ms,
-            "socketPollIntervalMs",
-        )?,
         auto_dial: options.auto_dial,
     })
 }

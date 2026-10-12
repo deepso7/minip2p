@@ -10,7 +10,8 @@
 //! A lookup blocks for as long as the system resolver takes, so it never runs
 //! on the driver thread. [`Resolver::expand`] starts one detached thread per
 //! distinct in-flight name and reports the candidate as resolving. The thread
-//! wakes the driver through the transport [`WaitHandle`]; the next tick drains
+//! wakes the driver through the swarm's wake-only [`WakeHandle`], so the wait
+//! sees a host wakeup rather than an interrupt; the next tick drains
 //! [`Resolver::take_answers`] and hands them to the Connection-attempt engine,
 //! which dials what [`answer_for`] rebuilt or records the failure.
 
@@ -21,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use minip2p_core::{Multiaddr, PeerAddr, Protocol};
-use minip2p_transport::WaitHandle;
+use minip2p_swarm::WakeHandle;
 
 use crate::portable::connect::{Expansion, NameAnswer};
 
@@ -174,7 +175,8 @@ fn system_lookup(host: &str) -> Answer {
 /// settled is simply dropped.
 pub(crate) struct Resolver {
     lookup: Lookup,
-    wake: WaitHandle,
+    /// Wakes the driver once an answer is queued.
+    wake: Arc<dyn Fn() + Send + Sync>,
     /// Names with a lookup thread running or an answer not yet taken.
     in_flight: BTreeSet<String>,
     /// Lookup threads still blocked in the resolver; what the cap counts.
@@ -186,16 +188,16 @@ pub(crate) struct Resolver {
 
 impl Resolver {
     /// A resolver on the system lookup that wakes the driver with `wake`.
-    pub(crate) fn new(wake: WaitHandle) -> Self {
-        Self::with_lookup(wake, Arc::new(system_lookup))
+    pub(crate) fn new(wake: WakeHandle) -> Self {
+        Self::with_lookup(move || wake.wake(), Arc::new(system_lookup))
     }
 
     /// A resolver on `lookup`: the test seam.
-    pub(crate) fn with_lookup(wake: WaitHandle, lookup: Lookup) -> Self {
+    pub(crate) fn with_lookup(wake: impl Fn() + Send + Sync + 'static, lookup: Lookup) -> Self {
         let (answers_tx, answers_rx) = channel();
         Self {
             lookup,
-            wake,
+            wake: Arc::new(wake),
             in_flight: BTreeSet::new(),
             running: Arc::default(),
             answers_tx,
@@ -232,7 +234,7 @@ impl Resolver {
         }
         let lookup = Arc::clone(&self.lookup);
         let answers = self.answers_tx.clone();
-        let wake = self.wake.clone();
+        let wake = Arc::clone(&self.wake);
         let running = Arc::clone(&self.running);
         let name = host.to_owned();
         running.fetch_add(1, Ordering::SeqCst);
@@ -244,7 +246,7 @@ impl Resolver {
                 // A closed channel means the endpoint is gone and nobody
                 // is waiting for this answer.
                 if answers.send((name, answer)).is_ok() {
-                    wake.interrupt();
+                    wake();
                 }
             })
             .map_err(|error| {
@@ -291,7 +293,7 @@ mod tests {
     #[test]
     fn a_concrete_address_needs_no_resolution() {
         let mut resolver = Resolver::with_lookup(
-            WaitHandle::noop(),
+            || {},
             Arc::new(|_| panic!("a concrete address must not be looked up")),
         );
         for text in [
@@ -383,7 +385,7 @@ mod tests {
         // name's clothes; it is refused rather than taking the path meant for
         // names.
         let mut resolver = Resolver::with_lookup(
-            WaitHandle::noop(),
+            || {},
             Arc::new(|_| panic!("an IP literal must not be looked up")),
         );
         for text in ["/dns/[::1]/tcp/4001", "/dns/127.0.0.1/tcp/4001"] {
@@ -397,7 +399,7 @@ mod tests {
     #[test]
     fn a_name_without_a_port_cannot_be_resolved() {
         let mut resolver = Resolver::with_lookup(
-            WaitHandle::noop(),
+            || {},
             Arc::new(|_| panic!("a portless name must not be looked up")),
         );
         let refused = resolver.expand(&peer_addr("/dns/localhost"));
@@ -412,7 +414,7 @@ mod tests {
         let (release_tx, release_rx) = channel::<()>();
         let release_rx = std::sync::Mutex::new(release_rx);
         let mut resolver = Resolver::with_lookup(
-            WaitHandle::noop(),
+            || {},
             Arc::new(move |_: &str| {
                 // Held until the test ends, like a dead resolver.
                 match release_rx.lock().expect("lock").recv() {

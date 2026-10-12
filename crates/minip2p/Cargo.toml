@@ -50,7 +50,7 @@ pubsub = ["dep:minip2p-pubsub"]
 discovery = ["nat", "pubsub", "_discovery-driver"]
 mdns = ["nat", "dep:minip2p-mdns", "_discovery-driver"]
 # Bench-only counters, off by default and compiled out when off:
-# `TransportSet` wait counters (`minip2p_transport::bench`), read by the
+# shared-poll wait counters (`minip2p_transport::bench`), read by the
 # `endpoint_idle` bench, and QUIC datagram counters (`minip2p-quic`'s
 # `diagnostics`), read by the `endpoint_throughput` bench.
 bench = ["std", "minip2p-transport/bench", "minip2p-quic?/diagnostics"]

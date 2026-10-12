@@ -144,8 +144,6 @@ export interface NodeMdnsOptions {
   maxAnnouncedAddrs: number
   /** Interface refresh interval in milliseconds. */
   interfaceRefreshMs: bigint
-  /** Socket polling interval in milliseconds. */
-  socketPollIntervalMs: bigint
   /** Whether observations may trigger dials. */
   autoDial: boolean
 }

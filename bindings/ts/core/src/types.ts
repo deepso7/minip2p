@@ -32,8 +32,6 @@ export interface Minip2pMdnsOptions {
   readonly maxAnnouncedAddrs?: number;
   /** Period between network-interface refreshes. */
   readonly interfaceRefreshMs?: number;
-  /** Socket polling interval used by the native driver. */
-  readonly socketPollIntervalMs?: number;
   /** Whether newly discovered peers should be dialed automatically. */
   readonly autoDial?: boolean;
 }

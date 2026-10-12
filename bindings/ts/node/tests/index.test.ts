@@ -56,7 +56,6 @@ describe("@minip2p/node", () => {
         maxAnnouncedAddrs: 12,
         maxPacketBytes: 1300,
         queryIntervalMs: 222,
-        socketPollIntervalMs: 333,
         ttlMs: 444,
       },
       secretKey: nodeSdk.generateSecretKey(),

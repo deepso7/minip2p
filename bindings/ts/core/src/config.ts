@@ -32,7 +32,6 @@ export interface BackendEndpointConfig {
     readonly maxAnnouncedAddrs: number;
     readonly maxPacketBytes: number;
     readonly queryIntervalMs: bigint;
-    readonly socketPollIntervalMs: bigint;
     readonly ttlMs: bigint;
   };
   readonly protocols: string[];
@@ -94,10 +93,6 @@ function resolveMdns(
     ),
     maxPacketBytes: u32(options.maxPacketBytes ?? 1400, "maxPacketBytes"),
     queryIntervalMs: u64(options.queryIntervalMs ?? 300_000, "queryIntervalMs"),
-    socketPollIntervalMs: u64(
-      options.socketPollIntervalMs ?? 100,
-      "socketPollIntervalMs"
-    ),
     ttlMs: u64(options.ttlMs ?? 120_000, "ttlMs"),
   };
 }

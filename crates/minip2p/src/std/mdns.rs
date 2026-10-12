@@ -3,6 +3,8 @@
 //! Everything mDNS does is in `minip2p_mdns::MdnsDriver`, which owns no clock
 //! because a `no_std` host has none to give it. This supplies one, and nothing
 //! else: an epoch taken when the endpoint starts, read as milliseconds since.
+//! Its sockets are attached to the swarm's readiness poll before they get
+//! here, so incoming datagrams wake the endpoint rather than a timer.
 
 use std::time::Instant;
 
