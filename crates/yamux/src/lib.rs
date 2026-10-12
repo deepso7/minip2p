@@ -55,6 +55,9 @@ const DEFAULT_MAX_BUFFERED_SEND: usize = 256 * 1024;
 /// Default aggregate cap for accepted bytes not yet pulled as frames.
 const DEFAULT_MAX_TOTAL_BUFFERED_SEND: usize = 4 * 1024 * 1024;
 
+/// Default part of the aggregate send cap only control streams may fill.
+const DEFAULT_CONTROL_STREAM_RESERVE: usize = 256 * 1024;
+
 /// Default reserve for peer-provoked control frames awaiting a pull.
 const DEFAULT_MAX_PENDING_CONTROL: usize = 1024;
 
@@ -90,7 +93,15 @@ pub struct YamuxConfig {
     /// twice the bytes this cap and the total cap count.
     pub max_buffered_send: usize,
     /// Aggregate cap for accepted, unpulled send bytes across all streams.
+    /// Must be greater than
+    /// [`control_stream_reserve`](Self::control_stream_reserve).
     pub max_total_buffered_send: usize,
+    /// Part of [`max_total_buffered_send`](Self::max_total_buffered_send)
+    /// that only control streams may fill: those marked with
+    /// [`YamuxSession::set_control`] (the swarm's ping, Identify and
+    /// multistream negotiation streams). Application streams cannot starve
+    /// them of it.
+    pub control_stream_reserve: usize,
     /// How many control frames may wait to be pulled before a peer that
     /// provokes another reply (a ping acknowledgement, a reset) fails the
     /// session. Bounds what a peer that floods pings without reading can
@@ -106,6 +117,7 @@ impl Default for YamuxConfig {
             max_streams: DEFAULT_MAX_STREAMS,
             max_buffered_send: DEFAULT_MAX_BUFFERED_SEND,
             max_total_buffered_send: DEFAULT_MAX_TOTAL_BUFFERED_SEND,
+            control_stream_reserve: DEFAULT_CONTROL_STREAM_RESERVE,
             max_pending_control: DEFAULT_MAX_PENDING_CONTROL,
         }
     }

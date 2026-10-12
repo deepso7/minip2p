@@ -579,6 +579,7 @@ fn stream_bytes_are_encrypted_only_when_pulled_and_full_wakes_writable() {
     let caps = YamuxConfig {
         max_buffered_send: 64 * 1024,
         max_total_buffered_send: 64 * 1024,
+        control_stream_reserve: 0,
         ..YamuxConfig::default()
     };
     let dialer_key = Ed25519Keypair::generate();

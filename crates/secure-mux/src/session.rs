@@ -382,6 +382,24 @@ impl SecureMuxSession {
         }
     }
 
+    /// Marks a substream as a control stream, which may queue into Yamux's
+    /// [`control_stream_reserve`](minip2p_yamux::YamuxConfig::control_stream_reserve),
+    /// or back as an application stream. Unknown substreams, and a session
+    /// that is not established, are ignored; an error means flushing what the
+    /// mark woke failed the session.
+    pub fn set_control_stream(&mut self, stream: StreamId, control: bool) -> Result<(), SessionError> {
+        let Ok(yamux_stream) = yamux_stream(stream) else {
+            return Ok(());
+        };
+        match self.with_yamux(move |yamux| {
+            yamux.set_control(yamux_stream, control);
+            Ok(())
+        }) {
+            Err(SessionError::NotEstablished) => Ok(()),
+            result => result,
+        }
+    }
+
     /// Writable never follows the end of a write side.
     fn drop_writable(&mut self, stream: StreamId) {
         self.outputs
