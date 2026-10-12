@@ -7,8 +7,7 @@ use common::*;
 
 use minip2p_core::{PeerAddr, PeerId};
 use minip2p_nat::{
-    ConnectLegs, NatConfig, NatError, NatEvent, Path, PromoteError, RelayStage,
-    ReservationPolicy,
+    ConnectLegs, NatConfig, NatError, NatEvent, Path, PromoteError, RelayStage, ReservationPolicy,
 };
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;

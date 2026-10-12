@@ -84,7 +84,10 @@ pub enum NatEvent {
     RelayReservationLost { relay: PeerId },
     /// The relay leg started on `relay`: from here on the attempt's relay
     /// diagnostics name it.
-    RelayStarted { connect_id: ConnectId, relay: PeerAddr },
+    RelayStarted {
+        connect_id: ConnectId,
+        relay: PeerAddr,
+    },
     /// `relay` failed for this attempt. The leg moves on to the next relay
     /// while it has one; otherwise [`NatEvent::ConnectFailed`] follows.
     RelayFailed {

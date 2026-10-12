@@ -86,7 +86,11 @@ fn silent_inbound_dcutr_exchange_times_out_and_starts_the_next_round() {
     let actions = drain_actions(&mut h.agent);
     assert!(has_reset_for(&actions, stream));
     assert!(!h.agent.owns_stream(conn, stream));
-    assert_ne!(opened_stream(&actions), stream, "a fresh round opens a fresh stream");
+    assert_ne!(
+        opened_stream(&actions),
+        stream,
+        "a fresh round opens a fresh stream"
+    );
 }
 
 #[test]
@@ -124,7 +128,11 @@ fn early_closed_inbound_dcutr_exchange_resets_the_stream_and_starts_the_next_rou
     let actions = drain_actions(&mut h.agent);
     assert!(has_reset_for(&actions, stream));
     assert!(!h.agent.owns_stream(conn, stream));
-    assert_ne!(opened_stream(&actions), stream, "a fresh round opens a fresh stream");
+    assert_ne!(
+        opened_stream(&actions),
+        stream,
+        "a fresh round opens a fresh stream"
+    );
 }
 
 fn answer_dcutr_at(h: &mut Harness, conn: ConnectionId, stream: StreamId, addrs: &[&str], t: u64) {
@@ -201,6 +209,101 @@ fn blast_schedule_starts_at_half_measured_rtt_and_respects_deadline() {
             "t={time}"
         );
     }
+}
+
+#[test]
+fn rtt_is_timed_from_when_a_held_connect_is_fully_written() {
+    let mut h = inbound_harness(NatConfig {
+        punch_deadline_ms: 250,
+        ..NatConfig::default()
+    });
+    h.agent.swarm.hold_writes = true;
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+
+    // CONNECT was queued at t=13 but sat behind a full stream until the
+    // host drained it at t=1_013. The reply at t=1_020 measures 7 ms, not
+    // 1_007 ms, so the first blast is due at t=1_024.
+    h.agent.write_completed(conn, stream, at(1_013));
+    answer_dcutr_at(
+        &mut h,
+        conn,
+        stream,
+        &["/ip4/8.8.8.8/udp/4001/quic-v1"],
+        1_020,
+    );
+    drain_actions(&mut h.agent);
+    h.agent.handle_tick(at(1_023));
+    assert_eq!(blast_count(&drain_actions(&mut h.agent)), 0);
+    h.agent.handle_tick(at(1_024));
+    assert_eq!(blast_count(&drain_actions(&mut h.agent)), 1);
+}
+
+#[test]
+fn the_holder_runs_three_rounds_each_with_a_fresh_rtt() {
+    let mut h = inbound_harness(NatConfig {
+        punch_deadline_ms: 250,
+        blast_interval_ms: 1_000,
+        ..NatConfig::default()
+    });
+    let (conn, mut actions) = drive_to_relayed(&mut h);
+    let mut opened_at = 13;
+    let mut streams = Vec::new();
+    for round in 1..=3u64 {
+        let stream = opened_stream(&actions);
+        assert!(!streams.contains(&stream), "round {round} reuses a stream");
+        streams.push(stream);
+        h.agent.handle_event(
+            &SwarmEvent::StreamReady {
+                conn_id: conn,
+                peer_id: h.target.clone(),
+                stream_id: stream,
+                protocol_id: DCUTR_PROTOCOL_ID.into(),
+                initiated_locally: true,
+            },
+            false,
+            at(opened_at),
+        );
+        drain_actions(&mut h.agent);
+
+        // Each round measures its own RTT: 100, 200, then 300 ms.
+        let rtt = 100 * round;
+        let replied_at = opened_at + rtt;
+        answer_dcutr_at(
+            &mut h,
+            conn,
+            stream,
+            &["/ip4/8.8.8.8/udp/4001/quic-v1"],
+            replied_at,
+        );
+        drain_actions(&mut h.agent);
+        let first_blast = replied_at + rtt / 2;
+        h.agent.handle_tick(at(first_blast - 1));
+        assert_eq!(
+            blast_count(&drain_actions(&mut h.agent)),
+            0,
+            "round {round}"
+        );
+        h.agent.handle_tick(at(first_blast));
+        assert_eq!(
+            blast_count(&drain_actions(&mut h.agent)),
+            1,
+            "round {round}"
+        );
+
+        // The punch window ends without a direct connection.
+        opened_at = first_blast + 250;
+        h.agent.handle_tick(at(opened_at));
+        actions = drain_actions(&mut h.agent);
+    }
+    assert!(
+        !actions
+            .iter()
+            .any(|out| matches!(out, Out::OpenStream { .. })),
+        "no fourth round"
+    );
+    assert!(h.agent.is_idle());
 }
 
 #[test]

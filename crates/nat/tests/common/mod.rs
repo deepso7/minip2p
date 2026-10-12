@@ -588,6 +588,9 @@ pub struct FakeSwarm {
     /// The id the next stream open returns, as a transport that numbers
     /// streams per connection reuses ids across connections.
     pub next_stream_id: Option<StreamId>,
+    /// Report every write as held behind a full stream, as a host that
+    /// queues refused tails does.
+    pub hold_writes: bool,
 }
 
 impl FakeSwarm {
@@ -750,6 +753,10 @@ impl NatSwarm for FakeSwarm {
         Ok(())
     }
 
+    fn write_pending(&self, _conn_id: ConnectionId, _stream_id: StreamId) -> bool {
+        self.hold_writes
+    }
+
     fn ping(&mut self, peer: &PeerId, _now_ms: u64) -> Result<(), NatSwarmError> {
         self.calls.push(Out::Ping { peer: peer.clone() });
         Ok(())
@@ -822,6 +829,10 @@ impl Node {
     ) {
         self.agent
             .promote_result(&mut self.swarm, token, result, now);
+    }
+
+    pub fn settled(&mut self, id: ConnectId, kept: Option<ConnectionId>, now: Now) {
+        self.agent.settled(&mut self.swarm, id, kept, now);
     }
 
     pub fn path(&self, peer: &PeerId) -> Option<&minip2p_nat::Path> {

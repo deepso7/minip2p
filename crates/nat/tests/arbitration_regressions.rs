@@ -886,3 +886,112 @@ fn circuit_promoted_by_an_inbound_circuit_is_not_adopted_by_the_attempt() {
         "cancelling the attempt must not close the inbound circuit"
     );
 }
+
+#[test]
+fn a_remote_that_never_starts_dcutr_settles_relayed_after_the_start_timeout() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+
+    // The Relayed path became usable at t=301; the holder never opens DCUtR.
+    h.agent.handle_tick(at(10_300));
+    assert!(drain_events(&mut h.agent).is_empty());
+    h.agent.handle_tick(at(10_301));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::FellBackToRelay {
+            connect_id,
+            reason: UpgradeStop::StartTimeout { budget_ms: 10_000 },
+            ..
+        }] if *connect_id == id
+    ));
+    assert!(
+        drain_actions(&mut h.agent)
+            .iter()
+            .all(|out| !matches!(out, Out::CloseCircuit { conn_id } if *conn_id == conn)),
+        "the Relayed path stays"
+    );
+    assert!(h.agent.is_idle());
+}
+
+#[test]
+fn a_stalled_exchange_settles_relayed_with_its_round() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    open_inbound_dcutr_at(&mut h, conn, StreamId::new(90), 1_000);
+
+    h.agent.handle_tick(at(10_999));
+    assert!(drain_events(&mut h.agent).is_empty());
+    h.agent.handle_tick(at(11_000));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::FellBackToRelay {
+            connect_id,
+            reason: UpgradeStop::ExchangeTimeout { round: 1, budget_ms: 10_000 },
+            ..
+        }] if *connect_id == id
+    ));
+}
+
+#[test]
+fn the_whole_upgrade_is_bounded() {
+    let mut h = Harness::with_relay(NatConfig {
+        upgrade_timeout_ms: 5_000,
+        ..NatConfig::default()
+    });
+    let (id, conn) = drive_to_relayed(&mut h);
+    drive_round_at(&mut h, conn, StreamId::new(90), 4_000);
+    drain_events(&mut h.agent);
+
+    // The punch window would run to t=7_002, past the 5 s upgrade budget.
+    h.agent.handle_tick(at(5_301));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::FellBackToRelay {
+            connect_id,
+            reason: UpgradeStop::UpgradeTimeout { budget_ms: 5_000 },
+            ..
+        }] if *connect_id == id
+    ));
+}
+
+#[test]
+fn no_attempt_event_follows_the_engine_settling() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    let actions = drive_round_at(&mut h, conn, StreamId::new(90), 310);
+    let punch_conn = dial_conn_for(&actions, &h.target);
+    drain_events(&mut h.agent);
+
+    // The engine settles Connected on the circuit (its own deadline).
+    h.agent.settled(id, Some(conn), at(400));
+    let actions = drain_actions(&mut h.agent);
+    assert!(
+        actions
+            .iter()
+            .all(|out| !matches!(out, Out::CloseCircuit { conn_id } if *conn_id == conn)),
+        "the kept connection stays open"
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|out| matches!(out, Out::CloseCircuit { conn_id } if *conn_id == punch_conn)),
+        "the attempt's punch dial is dropped"
+    );
+
+    // Nothing the attempt owned can name it any more.
+    h.agent.handle_tick(at(60_000));
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            peer_id: h.target.clone(),
+            conn_id: conn,
+        },
+        true,
+        at(60_001),
+    );
+    assert!(
+        drain_events(&mut h.agent)
+            .iter()
+            .all(|event| event.connect_id() != Some(id))
+    );
+    assert!(h.agent.is_idle());
+}

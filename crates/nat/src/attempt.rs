@@ -13,10 +13,10 @@ use crate::acquire::{self, AcquireError, Acquired};
 use crate::agent::{
     ConnectLegs, DialPurpose, Shared, StreamInput, StreamRole, TokenPurpose, reset, send,
 };
+use crate::config::MAX_DCUTR_ROUNDS;
 use crate::events::{BridgeRole, NatAction, NatEvent};
 use crate::inbound::select_global_punch_candidates;
 use crate::swarm::NatSwarm;
-use crate::config::MAX_DCUTR_ROUNDS;
 use crate::types::{NatError, Path, PromoteError, RelayStage, UpgradeStop};
 
 /// Progress of the relay leg of a connect attempt.
@@ -312,8 +312,9 @@ impl ConnectAttempt {
                         // this round's.
                         shared.abort_attempt_dials(self.id, &self.peer, swarm);
                         self.issue_punch_dials(swarm, shared);
-                        self.punch_deadline =
-                            Some(self.clip_upgrade(now.monotonic_ms + shared.config.punch_deadline_ms));
+                        self.punch_deadline = Some(
+                            self.clip_upgrade(now.monotonic_ms + shared.config.punch_deadline_ms),
+                        );
                     }
                 }
             }
@@ -324,7 +325,13 @@ impl ConnectAttempt {
     }
 
     /// The current round's exchange failed before SYNC.
-    fn fail_round(&mut self, reason: String, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
+    fn fail_round(
+        &mut self,
+        reason: String,
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) {
         self.teardown_dcutr_stream(swarm, shared, now);
         self.round_failed(reason, swarm, shared, now);
     }
@@ -383,12 +390,14 @@ impl ConnectAttempt {
 
     /// `at`, clipped to the attempt's deadline.
     fn clip(&self, at: u64) -> u64 {
-        self.attempt_deadline.map_or(at, |deadline| deadline.min(at))
+        self.attempt_deadline
+            .map_or(at, |deadline| deadline.min(at))
     }
 
     /// `at`, clipped to the whole-upgrade budget.
     fn clip_upgrade(&self, at: u64) -> u64 {
-        self.upgrade_deadline.map_or(at, |deadline| deadline.min(at))
+        self.upgrade_deadline
+            .map_or(at, |deadline| deadline.min(at))
     }
 
     /// Earliest pending absolute deadline, for the driver's timer fold-in.
@@ -849,6 +858,15 @@ impl ConnectAttempt {
         // re-drive is what keeps a stalled owner from stranding the leg.
         self.redrive_relay_leg(swarm, shared, now);
 
+        // A budget that ran out keeps the Relayed path; the stage that was
+        // waiting names why. It is checked before the punch window, so a
+        // window the upgrade budget cut short is not reported as a failed
+        // round.
+        if let Some(stop) = self.upgrade_stop(now) {
+            self.settle_relayed(stop, swarm, shared, now);
+            return;
+        }
+
         if let Some(deadline) = self.punch_deadline
             && now.monotonic_ms >= deadline
         {
@@ -860,35 +878,31 @@ impl ConnectAttempt {
                 now,
             );
         }
+    }
 
-        // A budget that ran out keeps the Relayed path; the stage that was
-        // waiting names why.
-        let due = |deadline: Option<u64>| deadline.is_some_and(|at| now.monotonic_ms >= at);
-        if self.done {
-            return;
+    /// The upgrade budget that ran out at `now`, while the circuit still
+    /// carries the Relayed path.
+    fn upgrade_stop(&self, now: Now) -> Option<UpgradeStop> {
+        if self.done || self.promoted.is_none() {
+            return None;
         }
-        let elapsed = |at: Option<u64>| at.unwrap_or(0).saturating_sub(self.relayed_at);
-        let stop = if due(self.start_deadline) {
+        let due = |deadline: Option<u64>| deadline.is_some_and(|at| now.monotonic_ms >= at);
+        let budget = |deadline: Option<u64>, from: u64| deadline.unwrap_or(0).saturating_sub(from);
+        if due(self.start_deadline) {
             Some(UpgradeStop::StartTimeout {
-                budget_ms: elapsed(self.start_deadline),
+                budget_ms: budget(self.start_deadline, self.relayed_at),
             })
         } else if due(self.exchange_deadline) {
             Some(UpgradeStop::ExchangeTimeout {
                 round: self.rounds,
-                budget_ms: self
-                    .exchange_deadline
-                    .unwrap_or(0)
-                    .saturating_sub(self.exchange_started_at),
+                budget_ms: budget(self.exchange_deadline, self.exchange_started_at),
             })
         } else if due(self.upgrade_deadline) {
             Some(UpgradeStop::UpgradeTimeout {
-                budget_ms: elapsed(self.upgrade_deadline),
+                budget_ms: budget(self.upgrade_deadline, self.relayed_at),
             })
         } else {
             None
-        };
-        if let Some(stop) = stop {
-            self.settle_relayed(stop, swarm, shared, now);
         }
     }
 

@@ -734,14 +734,14 @@ fn relay_leg_deadline_fails_a_stalled_leg() {
     assert!(matches!(
         events.as_slice(),
         [NatEvent::ConnectFailed {
-                error: NatError::Timeout {
-                    stage: RelayStage::RelayDial,
-                    elapsed_ms: 12_000,
-                    budget_ms: 12_000,
-                    ..
-                },
+            error: NatError::Timeout {
+                stage: RelayStage::RelayDial,
+                elapsed_ms: 12_000,
+                budget_ms: 12_000,
                 ..
-            }]
+            },
+            ..
+        }]
     ));
     assert!(
         drain_actions(&mut h.agent)
