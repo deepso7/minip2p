@@ -1200,6 +1200,7 @@ dependencies = [
  "minip2p-core",
  "minip2p-identity",
  "minip2p-smoltcp",
+ "minip2p-transport",
  "socket2",
  "thiserror",
 ]

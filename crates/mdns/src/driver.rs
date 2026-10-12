@@ -63,7 +63,6 @@ pub struct MdnsDriver<I: MdnsIo> {
     io: Option<I>,
     next_interface_refresh_ms: u64,
     interface_refresh_ms: u64,
-    poll_interval_ms: u64,
     backlog: bool,
     /// An action the previous tick's budget did not cover. Held rather than
     /// dropped so a burst is delayed instead of lost.
@@ -85,7 +84,6 @@ impl<I: MdnsIo> MdnsDriver<I> {
             io: Some(io),
             next_interface_refresh_ms: config.interface_refresh_ms,
             interface_refresh_ms: config.interface_refresh_ms,
-            poll_interval_ms: config.socket_poll_interval_ms,
             backlog: false,
             pending_action: None,
             last_now_ms: 0,
@@ -213,6 +211,12 @@ impl<I: MdnsIo> MdnsDriver<I> {
 
     /// How long the host may idle before this needs another tick.
     ///
+    /// Covers timers only: the next interface refresh, the agent's next word,
+    /// and the carrier's own deadlines. A datagram arriving is not a timer --
+    /// a hosted carrier's sockets wake the host through its readiness poll,
+    /// and an in-process stack reports a datagram it holds as a carrier
+    /// deadline of now -- so an idle mDNS host sleeps until something is due.
+    ///
     /// `None` once mDNS has stopped, so a host can drop it from its timeline
     /// rather than wake for something that will do nothing.
     pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
@@ -222,9 +226,7 @@ impl<I: MdnsIo> MdnsDriver<I> {
             // one is due regardless of what any timer says.
             return Some(0);
         }
-        let mut timeout = self
-            .poll_interval_ms
-            .min(self.next_interface_refresh_ms.saturating_sub(now_ms));
+        let mut timeout = self.next_interface_refresh_ms.saturating_sub(now_ms);
         if let Some(agent) = self.agent.next_timeout(now_ms) {
             timeout = timeout.min(agent);
         }

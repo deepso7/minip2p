@@ -61,6 +61,7 @@ impl Bus {
         BusDevice {
             bus: self.clone(),
             inbox,
+            defer: Rc::default(),
             blocked: Link::default(),
         }
     }
@@ -95,6 +96,9 @@ impl Bus {
 struct BusDevice {
     bus: Bus,
     inbox: Frames,
+    /// Receives that report nothing even with a frame waiting, so a test can
+    /// make a frame "arrive" between two polls of one tick.
+    defer: Rc<Cell<usize>>,
     /// A link that will not take a frame right now -- a radio mid-transmit, a
     /// driver with no descriptor free. Nothing about mDNS is broken while this
     /// is set; the frames simply have to wait.
@@ -134,6 +138,10 @@ impl Device for BusDevice {
         Self: 'a;
 
     fn receive(&mut self, _now: Instant) -> Option<(RxFrame, TxSink)> {
+        if self.defer.get() > 0 && !self.inbox.borrow().is_empty() {
+            self.defer.set(self.defer.get() - 1);
+            return None;
+        }
         let frame = self.inbox.borrow_mut().pop_front()?;
         Some((RxFrame(frame), self.sink()))
     }
@@ -391,8 +399,8 @@ fn an_idle_link_lets_the_host_sleep() {
     }
     let now = idle_at.expect("the link never went quiet");
 
-    // The answer is the soonest of everything the driver combines: its own
-    // poll interval, its next interface re-enumeration, the agent's next
+    // The answer is the soonest of everything the driver combines: its next
+    // interface re-enumeration, the agent's next
     // scheduled word, and whatever the carrier owes -- nothing, on an idle
     // link, but taken from the carrier rather than assumed, so a carrier that
     // claimed a deadline it did not have is caught shortening this instead of
@@ -401,9 +409,7 @@ fn an_idle_link_lets_the_host_sleep() {
     // deadlines would not be caught here at all, which is what the next test
     // is for.
     let config = MdnsConfig::default();
-    let mut expected = config
-        .socket_poll_interval_ms
-        .min(config.interface_refresh_ms - now);
+    let mut expected = config.interface_refresh_ms - now;
     if let Some(agent) = first.driver.agent().next_timeout(now) {
         expected = expected.min(agent);
     }
@@ -740,4 +746,100 @@ fn an_address_that_arrives_later_reaches_the_agent() {
         io.send(&datagram()).expect_err("the address went away"),
         MdnsError::UnknownInterface { interface: IPV4 }
     );
+}
+
+// ------------------------------------------------- an ingress-driven host
+
+/// A host with no fixed step: it ticks mDNS only when its device has input
+/// or mDNS says something is due now. Anything this misses would sit until
+/// the next timer.
+fn host_wakes(driver: &Driver, inbox: &Frames, now: u64) -> bool {
+    !inbox.borrow().is_empty() || driver.next_timeout(now) == Some(0)
+}
+
+/// Whether a datagram is still waiting in the receiver's carrier.
+fn carrier_owes(driver: &Driver, now: u64) -> bool {
+    driver
+        .io()
+        .and_then(|io| io.next_deadline(now))
+        .is_some_and(|due| due == 0)
+}
+
+/// A receiver on its own shared stack, ticked until it has nothing due.
+fn idle_receiver(bus: &Bus) -> (Driver, SmoltcpStack<BusDevice>, Frames, Rc<Cell<usize>>) {
+    let mut device = bus.attach();
+    let inbox = Rc::clone(&device.inbox);
+    let defer = Rc::clone(&device.defer);
+    let mut iface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    iface.update_ip_addrs(|addrs| {
+        addrs
+            .push(IpCidr::new(Ipv4Address::new(192, 168, 1, 2).into(), 24))
+            .expect("address");
+    });
+    let stack = SmoltcpStack::new(device, iface);
+    let io = SmoltcpMdnsIo::on_stack(
+        stack.clone(),
+        SmoltcpMdnsConfig {
+            enable_ipv6: false,
+            ..SmoltcpMdnsConfig::default()
+        },
+    )
+    .expect("mDNS on the shared stack");
+    let agent = MdnsAgent::new(peer(2), MdnsConfig::default(), [2; 32]).expect("agent");
+    let mut driver = MdnsDriver::new(agent, io, &MdnsConfig::default());
+    for _ in 0..100 {
+        if !host_wakes(&driver, &inbox, 0) {
+            break;
+        }
+        driver.tick(0, &[]).expect("tick");
+        inbox.borrow_mut().clear();
+    }
+    assert!(!host_wakes(&driver, &inbox, 0), "the receiver went idle");
+    (driver, stack, inbox, defer)
+}
+
+#[test]
+fn an_ingress_driven_host_hears_datagrams_its_device_no_longer_shows() {
+    let bus = Bus::default();
+    let mut sender = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 1)]);
+    sender.poll(0).expect("sender joins");
+    let (mut driver, stack, inbox, defer) = idle_receiver(&bus);
+
+    // Another user of the shared stack (a TCP provider, say) polls the
+    // interface on ingress first, moving the frame into mDNS's socket.
+    sender.send(&datagram()).expect("queue");
+    sender.poll(0).expect("put it on the bus");
+    assert!(!inbox.borrow().is_empty());
+    {
+        let mut shared = stack.borrow_mut();
+        let state = &mut *shared;
+        state
+            .interface
+            .poll(Instant::from_millis(0), &mut state.device, &mut state.sockets);
+    }
+    assert!(inbox.borrow().is_empty(), "the other user took the frame in");
+    assert!(
+        host_wakes(&driver, &inbox, 0),
+        "a datagram in mDNS's socket is a carrier deadline of now"
+    );
+    driver.tick(0, &[]).expect("tick");
+    assert!(!carrier_owes(&driver, 0), "and that tick read it");
+
+    // A frame that lands between a tick's two carrier polls is taken in by
+    // the final one, after mDNS has stopped reading.
+    sender.send(&datagram()).expect("queue");
+    sender.poll(0).expect("put it on the bus");
+    defer.set(1);
+    driver.tick(0, &[]).expect("tick");
+    assert!(inbox.borrow().is_empty(), "the final poll took the frame in");
+    assert!(
+        host_wakes(&driver, &inbox, 0),
+        "what the final poll delivered is owed a tick now"
+    );
+    driver.tick(0, &[]).expect("tick");
+    assert!(!carrier_owes(&driver, 0));
 }
