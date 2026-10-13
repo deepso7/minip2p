@@ -427,7 +427,9 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         // right after the event that caused it.
         let mut converted = Vec::with_capacity(batch.len());
         for event in batch {
-            let settled = writes.observe(endpoint, &event);
+            let settled = writes
+                .observe(endpoint, &event)
+                .map(crate::writes::accepted_event);
             converted.extend(convert_endpoint_event(endpoint, event));
             converted.extend(settled);
         }

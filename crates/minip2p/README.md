@@ -204,7 +204,7 @@ Background drivers can clone `Endpoint::wait_handle()` — the `WaitHandle` of i
 
 `open_stream` is allowed once the peer is connected. Identify (`PeerReady`) supplies advertised protocols and enables early `RemoteDoesNotSupport` rejects; waiting for it before opening a known application protocol is optional policy, not a stack requirement. Every open ends in exactly one terminal: `StreamReady`, or an `Error` event naming the stream (a `SwarmErrorKind`) when negotiation fails, the peer closes the stream first, or `OUTBOUND_NEGOTIATION_TIMEOUT_MS` passes; a closed or replaced connection ends it with its own event.
 
-The swarm keeps one connection per peer. Two direct connections to one peer that register within `SIMULTANEOUS_DIAL_WINDOW_MS` (5 s; `EndpointBuilder::simultaneous_dial_window` overrides it, and both peers should use the same value) race, and both peers keep the same one whatever order each sees them in: the one the lower peer ID dialed when the peers `connect` to each other at once, and the one with the lower connection token (shared by both ends: QUIC derives it from the connection IDs, TCP from the Noise handshake hash) when both are one peer's candidate dials. A transport without a token falls back to newest-wins for that case, so its peers can still end up on different connections. Past that window the newest connection wins. Within it, a winner arriving second replaces the other (`ConnectionReplaced`, below), while a loser arriving second closes unannounced; a losing dial of our own completes as `DialFailed` (a `connect` the winner already settled absorbs it), and `connect` settles on the connection the swarm kept. Because the peers agree only once each has seen both, a settled `connect` keeps its other candidate dials open until the window ends whenever one of them could still win; a higher-ID peer settled by the lower peer's dial aborts them at once, as they lose on both sides. Over TCP the listener sees both first; if it closes the dialer's only connection before the winning dial lands there, the dialer sees `ConnectionClosed` and then `ConnectionEstablished` on the winner. When a newer connection takes over, the stream carries a single `ConnectionReplaced { peer_id, old, new }` instead of a close and a second establishment, and the peer stays connected throughout. Streams and pending opens on `old` end with it without their own terminal events, so release whatever you keyed by `old`. Stream ids are unique only per connection, so `open_stream` returns `(ConnectionId, StreamId)` and every stream operation takes both; one aimed at `old` fails with `SwarmError::StreamNotFound` rather than reaching a stream on `new` that reuses its id. Readiness belongs to a connection: `PeerReady { conn_id, .. }` fires again for `new` once it is identified, and a ready wait should check `peer_readiness(peer)` (current connection plus Identify info, one snapshot) and then accept only a `PeerReady` whose `conn_id` is the current connection.
+The swarm keeps one connection per peer. Two direct connections to one peer that register within `SIMULTANEOUS_DIAL_WINDOW_MS` (5 s; `EndpointBuilder::simultaneous_dial_window` overrides it, and both peers should use the same value) race, and both peers keep the same one whatever order each sees them in: the one the lower peer ID dialed when the peers `connect` to each other at once, and the one with the lower connection token (shared by both ends: QUIC derives it from the connection IDs, TCP from the Noise handshake hash) when both are one peer's candidate dials. A transport without a token falls back to newest-wins for that case, so its peers can still end up on different connections. Past that window the newest connection wins. Within it, a winner arriving second replaces the other (`ConnectionReplaced`, below), while a loser arriving second closes unannounced; a losing dial of our own completes as `DialFailed` (a `connect` the winner already settled absorbs it), and `connect` settles on the connection the swarm kept. Because the peers agree only once each has seen both, a settled `connect` keeps its other candidate dials open until the window ends whenever one of them could still win; a higher-ID peer settled by the lower peer's dial aborts them at once, as they lose on both sides. Over TCP the listener sees both first; if it closes the dialer's only connection before the winning dial lands there, the dialer sees `ConnectionClosed` and then `ConnectionEstablished` on the winner. When a newer connection takes over, the stream carries a single `ConnectionReplaced { peer_id, old, new }` instead of a close and a second establishment, and the peer stays connected throughout. Streams and pending opens on `old` end with it without their own terminal events, so release whatever you keyed by `old`. Stream ids are unique only per connection, so `open_stream` returns `(ConnectionId, StreamId)` and every stream operation takes both; one aimed at `old` fails (`Error::is_stream_gone`) rather than reaching a stream on `new` that reuses its id. Readiness belongs to a connection: `PeerReady { conn_id, .. }` fires again for `new` once it is identified, and a ready wait should check `peer_readiness(peer)` (current connection plus Identify info, one snapshot) and then accept only a `PeerReady` whose `conn_id` is the current connection.
 
 ## Hosting a relay server
 
@@ -226,16 +226,33 @@ Relay-only endpoints accept and advertise inbound HOP and can open outbound STOP
 
 Reading is backpressured too (ADR 0012): each stream delivers at most one receive window that has not been acknowledged. The Endpoint acknowledges `EndpointEvent::StreamData` when the application pulls it from `poll` or `wait`, so a reader that stops pulling slows its sender. A protocol registered with `EndpointBuilder::manual_ack_protocol` or `Endpoint::add_manual_ack_protocol` is acknowledged by the application instead, with `Endpoint::stream_consumed`, for readers whose bytes outlive the event. Over-acknowledging is `TransportError::AckExceedsDelivered`, naming the stream and both counts.
 
-`send_stream` takes anything that converts into `Bytes` and accepts as much as the stream can queue. When not every byte fit it returns `Error::Full` with the exact unsent tail: hold it and send it again on `EndpointEvent::StreamWritable` for that stream. Full is backpressure, never a fault, and a slow reader slows the writer instead of tearing the connection down. A relay server forwards the same way: a full destination pauses the circuit's sender instead of closing it. Close the write side only once every held tail has been accepted; `StreamWriteStopped`, `StreamClosed`, or the connection ending mean the tail should be dropped.
+Stream operations (`send_stream`, `close_stream_write`, `reset_stream`, `abandon_stream`, `stream_consumed`) take the connection and stream ids that `open_stream` or `StreamReady` gave; the peer is the connection's. The exact connection is still checked, so an id from a closed or replaced connection fails instead of reaching a same-numbered stream on its replacement.
 
-```rust
-match endpoint.send_stream(&peer, conn_id, stream_id, chunk) {
-    Ok(()) => {}
-    // Resend `unsent` on EndpointEvent::StreamWritable for this stream.
-    Err(minip2p::Error::Full { unsent, .. }) => held = Some(unsent),
-    Err(error) => return Err(error.into()),
-}
+`send_stream` takes anything that converts into `Bytes` and accepts as much as the stream can queue. When not every byte fit it returns `Error::Full`: **a prefix may already have been accepted, and only the `unsent` tail is yours.** Hold it and send it again on `EndpointEvent::StreamWritable` for that stream. Full is backpressure, never a fault, and a slow reader slows the writer instead of tearing the connection down. A relay server forwards the same way: a full destination pauses the circuit's sender instead of closing it. `Ok(())` means accepted locally, never delivered.
+
+A `?` on `send_stream` drops the tail:
+
+```rust,ignore
+endpoint.send_stream(conn_id, stream_id, chunk)?; // a Full here loses `unsent`
 ```
+
+On the std `Endpoint`, `StreamWriter` does the holding for you (`PortableEndpoint` callers hold the tail themselves): one pending write per stream within an explicit byte budget, the tail resent on `StreamWritable`, and a `close_write` that sends the FIN only once the tail is accepted. Feed it every event; it drops its state when the stream ends or the connection closes or is replaced. Its `WriteAccepted` means the whole payload was accepted locally, never delivered.
+
+```rust,ignore
+use minip2p::{StreamWriter, WriteProgress};
+
+let mut writer = StreamWriter::new(8 * 1024 * 1024);
+if writer.write(&mut endpoint, conn_id, stream_id, payload)? == WriteProgress::Pending {
+    // A WriteAccepted for this stream follows from `observe`.
+}
+// After the last chunk only: later writes are refused. The FIN follows the tail.
+writer.close_write(&mut endpoint, conn_id, stream_id)?;
+
+// In the event loop:
+if let Some(done) = writer.observe(&mut endpoint, &event) { /* done.stream_id's write was accepted */ }
+```
+
+`Error::is_retryable()` is true for `Full`, and `Error::is_stream_gone()` for a stream or connection that no longer exists (`SwarmError::StreamNotFound`, `NotConnected`, or the transport's stream or connection not found). Neither covers a write side that is closing, or a stream still negotiating (`SwarmError::StreamNotReady`, usable once its `StreamReady` arrives).
 
 When an application permanently relinquishes a stream, `Endpoint::abandon_stream` resets it, purges its already-buffered events (matched by connection as well as stream id), and suppresses later stream events. Use `Endpoint::reset_stream` when those terminal events should remain visible.
 

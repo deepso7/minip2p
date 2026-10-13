@@ -190,45 +190,27 @@ class NodeBackend implements Minip2pBackend {
     };
   }
 
-  sendStream(
-    peerId: string,
-    connId: number,
-    streamId: number,
-    data: Uint8Array
-  ): boolean {
+  sendStream(connId: number, streamId: number, data: Uint8Array): boolean {
     return translateErrors(() =>
-      this.#endpoint.sendStream(
-        peerId,
-        ...this.#nativeStream(connId, streamId),
-        data
-      )
+      this.#endpoint.sendStream(...this.#nativeStream(connId, streamId), data)
     );
   }
 
-  closeStreamWrite(peerId: string, connId: number, streamId: number): void {
+  closeStreamWrite(connId: number, streamId: number): void {
     translateErrors(() => {
-      this.#endpoint.closeStreamWrite(
-        peerId,
-        ...this.#nativeStream(connId, streamId)
-      );
+      this.#endpoint.closeStreamWrite(...this.#nativeStream(connId, streamId));
     });
   }
 
-  resetStream(peerId: string, connId: number, streamId: number): void {
+  resetStream(connId: number, streamId: number): void {
     translateErrors(() => {
-      this.#endpoint.resetStream(
-        peerId,
-        ...this.#nativeStream(connId, streamId)
-      );
+      this.#endpoint.resetStream(...this.#nativeStream(connId, streamId));
     });
   }
 
-  abandonStream(peerId: string, connId: number, streamId: number): void {
+  abandonStream(connId: number, streamId: number): void {
     translateErrors(() => {
-      this.#endpoint.abandonStream(
-        peerId,
-        ...this.#nativeStream(connId, streamId)
-      );
+      this.#endpoint.abandonStream(...this.#nativeStream(connId, streamId));
     });
   }
 

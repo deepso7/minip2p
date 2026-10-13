@@ -229,15 +229,9 @@ class ReactNativeBackend implements Minip2pBackend {
     };
   }
 
-  sendStream(
-    peerId: string,
-    connId: number,
-    streamId: number,
-    data: Uint8Array
-  ): boolean {
+  sendStream(connId: number, streamId: number, data: Uint8Array): boolean {
     return translateErrors(() =>
       this.#endpoint.sendStream(
-        peerId,
         this.#connectionIds.toNative(connId),
         numberToU64(streamId, "streamId"),
         toArrayBuffer(data)
@@ -245,30 +239,27 @@ class ReactNativeBackend implements Minip2pBackend {
     );
   }
 
-  closeStreamWrite(peerId: string, connId: number, streamId: number): void {
+  closeStreamWrite(connId: number, streamId: number): void {
     translateErrors(() => {
       this.#endpoint.closeStreamWrite(
-        peerId,
         this.#connectionIds.toNative(connId),
         numberToU64(streamId, "streamId")
       );
     });
   }
 
-  resetStream(peerId: string, connId: number, streamId: number): void {
+  resetStream(connId: number, streamId: number): void {
     translateErrors(() => {
       this.#endpoint.resetStream(
-        peerId,
         this.#connectionIds.toNative(connId),
         numberToU64(streamId, "streamId")
       );
     });
   }
 
-  abandonStream(peerId: string, connId: number, streamId: number): void {
+  abandonStream(connId: number, streamId: number): void {
     translateErrors(() => {
       this.#endpoint.abandonStream(
-        peerId,
         this.#connectionIds.toNative(connId),
         numberToU64(streamId, "streamId")
       );
