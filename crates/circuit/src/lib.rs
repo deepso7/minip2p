@@ -968,6 +968,24 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         self.operate_session(id, |session| session.ack_stream(stream_id, bytes))
     }
 
+    fn set_control_stream(&mut self, id: ConnectionId, stream_id: StreamId, control: bool) {
+        if !id.is_circuit() {
+            return self.inner.set_control_stream(id, stream_id, control);
+        }
+        // Nothing returns to the caller, so a circuit the mark's flush fails
+        // is torn down with an `Error` carrying the reason.
+        if !self.circuits.contains_key(&id) {
+            return;
+        }
+        let result = self.with_circuit(id, |this, circuit| {
+            circuit.session.set_control_stream(stream_id, control)?;
+            this.pump(circuit)
+        });
+        if let Err(teardown) = result {
+            self.fail_circuit(id, teardown.message, !teardown.graceful);
+        }
+    }
+
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
         if !id.is_circuit() {
             return self.inner.close(id);
@@ -2611,6 +2629,7 @@ mod tests {
             max_streams: 8,
             max_buffered_send,
             max_total_buffered_send: 128,
+            control_stream_reserve: 0,
             ..YamuxConfig::default()
         };
         let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) =
@@ -2740,6 +2759,7 @@ mod tests {
         let config = YamuxConfig {
             max_buffered_send: 64,
             max_total_buffered_send: 128,
+            control_stream_reserve: 0,
             ..YamuxConfig::default()
         };
         let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) =

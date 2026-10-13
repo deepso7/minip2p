@@ -901,6 +901,13 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
                     ));
                 }
             }
+            Action::SetControlStream {
+                conn_id,
+                stream_id,
+                control,
+            } => self
+                .transport
+                .set_control_stream(conn_id, stream_id, control),
             Action::CloseConnection { conn_id } => match self.transport.close(conn_id) {
                 Ok(()) | Err(TransportError::ConnectionNotFound { .. }) => {}
                 Err(e) => self.state.record_runtime_error(transport_error(

@@ -556,7 +556,9 @@ fn tiny_reads_are_copied_into_allocations_of_their_own_length() {
 fn opens_past_peer_credit_keep_their_ids_and_a_reset_one_is_released_at_once() {
     let mut server = listening_server(QuicLimits {
         max_streams_per_connection: 3,
-        max_pending_stream_bytes: 4_000,
+        max_pending_bytes_per_stream: 4_000,
+        max_pending_connection_bytes: 4_000,
+        control_stream_reserve_bytes: 0,
         ..QuicLimits::default()
     });
     // The peer grants no streams until told to.
