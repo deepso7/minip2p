@@ -620,10 +620,10 @@ impl NatAgent {
         let Some(mut attempt) = self.attempts.remove(&id) else {
             return;
         };
-        match kept {
-            Some(kept) => attempt.settled(kept, swarm, &mut self.shared, now),
-            None => attempt.cancel(swarm, &mut self.shared, now),
-        }
+        self.holding(swarm, |agent, swarm| match kept {
+            Some(kept) => attempt.settled(kept, swarm, &mut agent.shared, now),
+            None => attempt.cancel(swarm, &mut agent.shared, now),
+        });
     }
 
     /// The bytes the agent held for `stream_id` of `conn_id` are now fully

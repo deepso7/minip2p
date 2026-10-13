@@ -1116,3 +1116,38 @@ fn no_attempt_event_follows_the_engine_settling() {
     );
     assert!(h.agent.is_idle());
 }
+
+#[test]
+fn settling_clears_what_the_attempt_held() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    let stream = StreamId::new(90);
+    open_inbound_dcutr(&mut h, conn, stream);
+    // The DCUtR reply is refused as Full and held.
+    h.agent.swarm.full_sends = true;
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            conn_id: conn,
+            peer_id: h.target.clone(),
+            stream_id: stream,
+            data: Bytes::from(dcutr_connect_reply(&[maddr(
+                "/ip4/9.9.9.9/udp/4002/quic-v1",
+            )])),
+        },
+        false,
+        at(311),
+    );
+    h.agent.swarm.full_sends = false;
+    drain_actions(&mut h.agent);
+    drain_events(&mut h.agent);
+    assert!(!h.agent.is_idle());
+
+    // The engine settles before the stream turns writable. The fake swarm
+    // never reports the reset stream closed, as when the reset fails.
+    h.agent.settled(id, Some(conn), at(320));
+    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
+    assert!(
+        h.agent.is_idle(),
+        "nothing stays held for a settled attempt"
+    );
+}
