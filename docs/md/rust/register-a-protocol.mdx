@@ -118,8 +118,11 @@ match event {
         data,
         ..
     } if echo_streams.remove(&(conn_id, stream_id)) => {
-        // The FIN waits for every byte of the echo. A failure ends this
-        // stream, not the listener.
+        // A single-chunk echo: it answers the first `StreamData` and
+        // half-closes, so a message split across chunks loses the rest.
+        // Echoing every chunk needs a backlog behind the one pending write
+        // (see `examples/peer`). The FIN waits for every byte of the echo,
+        // and a failure ends this stream, not the listener.
         let echoed = writer
             .write(&mut node, conn_id, stream_id, data)
             .and_then(|_| writer.close_write(&mut node, conn_id, stream_id));
