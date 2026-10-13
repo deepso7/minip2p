@@ -1315,6 +1315,11 @@ fn a_held_request_is_resent_and_closed_after_its_exchange_finishes() {
         [NatEvent::RelayReserved { .. }]
     ));
     hk.agent.swarm.full_sends = false;
+    drain_actions(&mut hk.agent);
+    assert!(
+        !hk.agent.is_idle(),
+        "held bytes are work: an idle agent might not be serviced again"
+    );
 
     hk.agent.handle_event(
         &SwarmEvent::StreamWritable {
@@ -1331,6 +1336,7 @@ fn a_held_request_is_resent_and_closed_after_its_exchange_finishes() {
         actions.last(),
         Some(Out::CloseStreamWrite { stream_id, .. }) if *stream_id == stream
     ));
+    assert!(hk.agent.is_idle());
 }
 
 #[test]

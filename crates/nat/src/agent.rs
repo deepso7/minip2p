@@ -1104,11 +1104,12 @@ impl NatAgent {
         self.housekeeping.active_reservation()
     }
 
-    /// Returns `true` when the agent has no queued outputs and no work in
-    /// flight (a settled reservation or a scheduled future probe is not
-    /// "work").
+    /// Returns `true` when the agent has no queued outputs, no held writes
+    /// awaiting a Writable, and no work in flight (a settled reservation or
+    /// a scheduled future probe is not "work").
     pub fn is_idle(&self) -> bool {
-        self.shared.actions.is_empty()
+        self.held.is_empty()
+            && self.shared.actions.is_empty()
             && self.shared.events.is_empty()
             && self.attempts.is_empty()
             && self.inbound.is_empty()

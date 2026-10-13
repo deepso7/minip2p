@@ -57,6 +57,11 @@ impl HeldWrites {
         Self::default()
     }
 
+    /// Whether nothing is held for any stream.
+    pub fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
     /// Whether writes on the stream must wait behind held bytes.
     pub fn is_held(&self, conn_id: ConnectionId, stream_id: StreamId) -> bool {
         self.streams.contains_key(&(conn_id, stream_id))
