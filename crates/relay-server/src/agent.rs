@@ -1,3 +1,4 @@
+use alloc::collections::btree_map::Entry;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::String;
@@ -25,37 +26,68 @@ use crate::{
 
 /// The key per-IP admission limits share: an IPv4 address (IPv4-mapped
 /// IPv6 included) or an IPv6 /64, since one host commonly holds a whole /64.
+/// Held as integers, so a map lookup compares words rather than calling
+/// `memcmp` per key.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum IpKey {
-    V4([u8; 4]),
-    V6Prefix([u8; 8]),
+    V4(u32),
+    V6Prefix(u64),
 }
 
-/// Live reservations or circuits per admission key.
+/// What an admission key holds: its reservations or its circuits.
+#[derive(Clone, Copy)]
+enum Held {
+    Reservations,
+    Circuits,
+}
+
+/// One admission key's live reservations and circuits.
 #[derive(Debug, Default, Eq, PartialEq)]
-struct IpTally(BTreeMap<IpKey, usize>);
+struct IpLoad {
+    reservations: usize,
+    circuits: usize,
+}
+
+impl IpLoad {
+    fn count(&mut self, held: Held) -> &mut usize {
+        match held {
+            Held::Reservations => &mut self.reservations,
+            Held::Circuits => &mut self.circuits,
+        }
+    }
+}
+
+/// Live reservations and circuits per admission key, in one map so a key
+/// that still holds the other kind is only decremented, not removed.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct IpTally(BTreeMap<IpKey, IpLoad>);
 
 impl IpTally {
-    /// Whether `key` already holds `max` entries. A connection without an IP
-    /// has no key and is never at the cap.
-    fn is_full(&self, key: Option<&IpKey>, max: usize) -> bool {
-        key.is_some_and(|key| self.0.get(key).copied().unwrap_or(0) >= max)
+    /// Whether `key` already holds `max` of `held`. A connection without an
+    /// IP has no key and is never at the cap.
+    fn is_full(&self, key: Option<&IpKey>, held: Held, max: usize) -> bool {
+        let count = |load: &IpLoad| match held {
+            Held::Reservations => load.reservations,
+            Held::Circuits => load.circuits,
+        };
+        key.is_some_and(|key| self.0.get(key).map_or(0, count) >= max)
     }
 
-    fn add(&mut self, key: Option<&IpKey>) {
+    fn add(&mut self, key: Option<&IpKey>, held: Held) {
         if let Some(key) = key {
-            *self.0.entry(key.clone()).or_default() += 1;
+            *self.0.entry(key.clone()).or_default().count(held) += 1;
         }
     }
 
-    fn remove(&mut self, key: Option<&IpKey>) {
+    fn remove(&mut self, key: Option<&IpKey>, held: Held) {
         let Some(key) = key else {
             return;
         };
-        if let Some(count) = self.0.get_mut(key) {
-            *count -= 1;
-            if *count == 0 {
-                self.0.remove(key);
+        // One descent: the entry both decrements and, once empty, removes.
+        if let Entry::Occupied(mut entry) = self.0.entry(key.clone()) {
+            *entry.get_mut().count(held) -= 1;
+            if *entry.get() == IpLoad::default() {
+                entry.remove();
             }
         }
     }
@@ -537,11 +569,9 @@ pub struct RelayServerAgent {
     last_event_tick_ms: Option<u64>,
     reservation_limiters: AdmissionLimiters,
     circuit_limiters: AdmissionLimiters,
-    /// Pending plus committed reservations per admission key.
-    ip_reservations: IpTally,
-    /// Pending plus committed circuits per admission key, a circuit whose
-    /// ends share a key counted once.
-    ip_circuits: IpTally,
+    /// Pending plus committed reservations and circuits per admission key,
+    /// a circuit whose ends share a key counted once.
+    ip_tally: IpTally,
 }
 
 impl RelayServerAgent {
@@ -577,8 +607,7 @@ impl RelayServerAgent {
                 config.circuit_rate_limit_per_ip,
                 config.max_rate_limit_entries,
             ),
-            ip_reservations: IpTally::default(),
-            ip_circuits: IpTally::default(),
+            ip_tally: IpTally::default(),
             config,
             accepting: true,
             explicit_addrs: None,
@@ -2066,8 +2095,8 @@ impl RelayServerAgent {
         let pending_initial = self.reserving_peers.len();
         if self.reservations.len().saturating_add(pending_initial) >= self.config.max_reservations
             || self
-                .ip_reservations
-                .is_full(ip, self.config.max_reservations_per_ip)
+                .ip_tally
+                .is_full(ip, Held::Reservations, self.config.max_reservations_per_ip)
         {
             return false;
         }
@@ -2115,7 +2144,7 @@ impl RelayServerAgent {
                 && self.peer_circuit_count(&destination_peer_id)
                     >= self.config.max_circuits_per_peer)
             || circuit_ip_keys(source_ip.as_ref(), destination_ip.as_ref())
-                .any(|ip| self.ip_circuits.is_full(Some(ip), max_per_ip))
+                .any(|ip| self.ip_tally.is_full(Some(ip), Held::Circuits, max_per_ip))
             || self
                 .pending_circuits
                 .len()
@@ -2391,7 +2420,7 @@ impl RelayServerAgent {
                 self.renewing_peers.insert(pending.peer_id.clone(), parked);
             } else {
                 self.reserving_peers.insert(pending.peer_id.clone());
-                self.ip_reservations.add(pending.ip.as_ref());
+                self.ip_tally.add(pending.ip.as_ref(), Held::Reservations);
             }
         }
         self.pending_operations.insert(token, operation);
@@ -2413,7 +2442,8 @@ impl RelayServerAgent {
                 }
             } else {
                 self.reserving_peers.remove(&pending.peer_id);
-                self.ip_reservations.remove(pending.ip.as_ref());
+                self.ip_tally
+                    .remove(pending.ip.as_ref(), Held::Reservations);
             }
         }
         Some(operation)
@@ -2427,19 +2457,21 @@ impl RelayServerAgent {
         deadline_ms: u64,
     ) {
         self.reservation_deadlines.set(peer_id.clone(), deadline_ms);
-        self.ip_reservations.add(ip.as_ref());
+        self.ip_tally.add(ip.as_ref(), Held::Reservations);
         if let Some(replaced) = self
             .reservations
             .insert(peer_id, ReservationRecord { conn_id, ip })
         {
-            self.ip_reservations.remove(replaced.ip.as_ref());
+            self.ip_tally
+                .remove(replaced.ip.as_ref(), Held::Reservations);
         }
     }
 
     fn remove_reservation(&mut self, peer_id: &PeerId) {
         self.reservation_deadlines.remove(peer_id);
         if let Some(removed) = self.reservations.remove(peer_id) {
-            self.ip_reservations.remove(removed.ip.as_ref());
+            self.ip_tally
+                .remove(removed.ip.as_ref(), Held::Reservations);
         }
     }
 
@@ -2505,7 +2537,7 @@ impl RelayServerAgent {
             *self.peer_circuits.entry(peer.clone()).or_default() += 1;
         }
         for ip in circuit_ip_keys(source_ip, destination_ip) {
-            self.ip_circuits.add(Some(ip));
+            self.ip_tally.add(Some(ip), Held::Circuits);
         }
     }
 
@@ -2517,7 +2549,7 @@ impl RelayServerAgent {
         destination_ip: Option<&IpKey>,
     ) {
         for ip in circuit_ip_keys(source_ip, destination_ip) {
-            self.ip_circuits.remove(Some(ip));
+            self.ip_tally.remove(Some(ip), Held::Circuits);
         }
         for peer in circuit_endpoints(source, destination) {
             if let Some(count) = self.peer_circuits.get_mut(peer) {
@@ -2593,7 +2625,7 @@ impl RelayServerAgent {
             }
         }
         assert_eq!(peer_circuits, self.peer_circuits);
-        let mut ip_circuits = IpTally::default();
+        let mut ip_tally = IpTally::default();
         let ends = self
             .pending_circuits
             .values()
@@ -2605,22 +2637,20 @@ impl RelayServerAgent {
             );
         for (source, destination) in ends {
             for ip in circuit_ip_keys(source.as_ref(), destination.as_ref()) {
-                ip_circuits.add(Some(ip));
+                ip_tally.add(Some(ip), Held::Circuits);
             }
         }
-        assert_eq!(ip_circuits, self.ip_circuits);
-        let mut ip_reservations = IpTally::default();
         for reservation in self.reservations.values() {
-            ip_reservations.add(reservation.ip.as_ref());
+            ip_tally.add(reservation.ip.as_ref(), Held::Reservations);
         }
         for pending in self.pending_operations.values() {
             if let Some(pending) = pending.pending_reservation()
                 && !pending.renewed
             {
-                ip_reservations.add(pending.ip.as_ref());
+                ip_tally.add(pending.ip.as_ref(), Held::Reservations);
             }
         }
-        assert_eq!(ip_reservations, self.ip_reservations);
+        assert_eq!(ip_tally, self.ip_tally);
 
         let operations_by_stream: BTreeSet<_> = self
             .pending_operations
@@ -2704,14 +2734,15 @@ fn first_ip(address: &Multiaddr) -> Option<IpKey> {
         .protocols()
         .iter()
         .find_map(|protocol| match protocol {
-            Protocol::Ip4(ip) => Some(IpKey::V4(*ip)),
-            Protocol::Ip6(ip) if ip[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] => {
-                Some(IpKey::V4([ip[12], ip[13], ip[14], ip[15]]))
-            }
+            Protocol::Ip4(ip) => Some(IpKey::V4(u32::from_be_bytes(*ip))),
             Protocol::Ip6(ip) => {
-                let mut prefix = [0; 8];
-                prefix.copy_from_slice(&ip[..8]);
-                Some(IpKey::V6Prefix(prefix))
+                let ip = u128::from_be_bytes(*ip);
+                // IPv4-mapped (`::ffff:a.b.c.d`) counts as its IPv4 address.
+                Some(if ip >> 32 == 0xffff {
+                    IpKey::V4(ip as u32)
+                } else {
+                    IpKey::V6Prefix((ip >> 64) as u64)
+                })
             }
             _ => None,
         })
@@ -6243,6 +6274,27 @@ mod tests {
             circuit_rate_limit_per_ip: None,
             ..RelayServerConfig::default()
         }
+    }
+
+    #[test]
+    fn admission_keys_fold_ipv4_mapped_ipv6_and_each_ipv6_slash_64() {
+        let key = |address: &str| first_ip(&Multiaddr::from_str(address).unwrap());
+        assert_eq!(
+            key("/ip6/::ffff:198.51.100.7/tcp/1"),
+            key("/ip4/198.51.100.7/tcp/1")
+        );
+        assert_eq!(
+            key("/ip6/2001:db8:1:2::1/tcp/1"),
+            key("/ip6/2001:db8:1:2:ffff::9/udp/1/quic-v1")
+        );
+        assert_ne!(
+            key("/ip6/2001:db8:1:2::1/tcp/1"),
+            key("/ip6/2001:db8:1:3::1/tcp/1")
+        );
+        assert_ne!(
+            key("/ip6/::c633:6407/tcp/1"),
+            key("/ip4/198.51.100.7/tcp/1")
+        );
     }
 
     #[test]
