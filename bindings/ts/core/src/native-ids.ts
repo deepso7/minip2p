@@ -67,22 +67,19 @@ export class ConnectionIdMap {
   /**
    * The public ID for the connection field `key` of a native `tag` event.
    * Path events and `oldConnId` fields name a connection that may already be
-   * released: a live mapping wins, then a retired one, and an unknown ID gets
-   * a fresh number without being mapped, so nothing is revived. Any other
-   * field may introduce a connection, possibly under a native ID reused after
-   * a close, so it never reads the retired mappings.
+   * released: a live mapping wins, then a retired one, which keeps its number
+   * without being revived. An unknown ID is mapped like any other, so a live
+   * connection whose `ConnectionEstablished` was dropped keeps one ID. Any
+   * other field may introduce a connection, possibly under a native ID reused
+   * after a close, so it never reads the retired mappings.
    */
   toPublicInEvent(tag: string, key: string, native: bigint): number {
-    if (!PATH_EVENT_TAGS.has(tag) && key !== "oldConnId") {
-      return this.toPublic(native);
-    }
-    const known = this.#publicByNative.get(native) ?? this.#retired.get(native);
-    if (known !== undefined) {
-      return known;
-    }
-    const fresh = this.#next;
-    this.#next += 1;
-    return fresh;
+    const retired =
+      (PATH_EVENT_TAGS.has(tag) || key === "oldConnId") &&
+      !this.#publicByNative.has(native)
+        ? this.#retired.get(native)
+        : undefined;
+    return retired ?? this.toPublic(native);
   }
 
   /**

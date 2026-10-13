@@ -228,6 +228,32 @@ export function describeAdapterContract(
       endpoint.close();
     });
 
+    test("a live connection first named by a path event keeps that public ID", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      const paths: number[] = [];
+      endpoint.on("inboundPathEstablished", ({ connId }) => paths.push(connId));
+      native.setConnectionInfo({ connId: CONN_ID, remoteAddr: QUIC });
+
+      // The queue dropped this circuit's `ConnectionEstablished`.
+      native.deliver([
+        {
+          inner: {
+            connId: CONN_ID,
+            path: { inner: { relayPeerId: "relay" }, tag: "Relayed" },
+            peerId: PEER,
+          },
+          tag: "InboundPathEstablished",
+        },
+      ]);
+      await drained();
+
+      expect(paths).toHaveLength(1);
+      expect(endpoint.connectionInfo(PEER)?.connId).toBe(paths[0]);
+      endpoint.close();
+    });
+
     test("ConnectionReplaced moves the peer to the new connection and ends opens on the old one", async () => {
       vi.useFakeTimers();
       const endpoint = harness.create();
