@@ -74,10 +74,15 @@ pub struct NatConfig {
     pub blast_interval_ms: u64,
     /// Payload length of each random-UDP blast packet.
     pub blast_payload_len: usize,
-    /// Probe verdicts (out of [`confidence_window`](Self::confidence_window))
-    /// that must agree before reachability flips.
+    /// Distinct AutoNAT servers (out of
+    /// [`confidence_window`](Self::confidence_window)) whose latest votes
+    /// must agree before reachability flips; a public verdict also needs this
+    /// many to confirm each address it reports. Values above the window mean
+    /// unanimity.
     pub confidence_threshold: u8,
-    /// Size of the sliding window of recent probe verdicts.
+    /// How many servers' votes count: the latest vote of each of the most
+    /// recent servers to answer, each live for
+    /// [`AUTONAT_VOTE_TTL_MS`](crate::AUTONAT_VOTE_TTL_MS).
     pub confidence_window: u8,
     /// Probe interval once reachability is settled.
     pub probe_interval_settled_ms: u64,

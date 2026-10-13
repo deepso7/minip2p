@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 
-use minip2p_autonat::AUTONAT_PROTOCOL_ID;
+use minip2p_autonat::{AUTONAT_PROTOCOL_ID, ResponseStatus};
 use minip2p_core::{PeerAddr, PeerId};
 use minip2p_nat::{
     Deadline, MAX_RESERVATION_RETRY_BACKOFF_MS, NatConfig, NatEvent, NatSwarm, Now,
@@ -16,7 +16,6 @@ use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId, TransportError};
 
 const SERVER_ADDR: &str = "/ip4/203.0.113.50/udp/4001/quic-v1";
-const SERVER2_ADDR: &str = "/ip4/203.0.113.51/udp/4001/quic-v1";
 const RELAY2_TRANSPORT_ADDR: &str = "/ip4/203.0.113.2/udp/4001/quic-v1";
 
 struct Hk {
@@ -25,6 +24,28 @@ struct Hk {
     relay2: PeerId,
     server: PeerId,
     server2: PeerId,
+    /// Every configured AutoNAT server, `server` and `server2` first.
+    servers: Vec<PeerId>,
+}
+
+/// How a scripted AutoNAT server answers a probe.
+enum Answer<'a> {
+    Public(&'a [minip2p_core::Multiaddr]),
+    DialError,
+    DialRefused,
+}
+
+/// The `index`th AutoNAT server's peer id and transport address.
+fn autonat_server(index: usize) -> (PeerId, String) {
+    let peer_id = match index {
+        0 => peer(b"autonat-server"),
+        1 => peer(b"autonat-server-2"),
+        _ => peer(format!("autonat-server-{}", index + 1).as_bytes()),
+    };
+    (
+        peer_id,
+        format!("/ip4/203.0.113.{}/udp/4001/quic-v1", 50 + index),
+    )
 }
 
 fn build(policy: ReservationPolicy, relay_count: usize, server_count: usize) -> Hk {
@@ -39,8 +60,10 @@ fn build_with_config(
 ) -> Hk {
     let relay = peer(b"relay-peer");
     let relay2 = peer(b"relay-peer-2");
-    let server = peer(b"autonat-server");
-    let server2 = peer(b"autonat-server-2");
+    let servers: Vec<PeerId> = (0..server_count)
+        .map(|index| autonat_server(index).0)
+        .collect();
+    let (server, server2) = (autonat_server(0).0, autonat_server(1).0);
 
     let mut relays = Vec::new();
     if relay_count >= 1 {
@@ -55,19 +78,12 @@ fn build_with_config(
                 .expect("valid second relay peer address"),
         );
     }
-    let mut autonat_servers = Vec::new();
-    if server_count >= 1 {
-        autonat_servers.push(
-            PeerAddr::new(maddr(SERVER_ADDR), server.clone())
-                .expect("valid AutoNAT server peer address"),
-        );
-    }
-    if server_count >= 2 {
-        autonat_servers.push(
-            PeerAddr::new(maddr(SERVER2_ADDR), server2.clone())
-                .expect("valid second AutoNAT server peer address"),
-        );
-    }
+    let autonat_servers = (0..server_count)
+        .map(|index| {
+            let (peer_id, addr) = autonat_server(index);
+            PeerAddr::new(maddr(&addr), peer_id).expect("valid AutoNAT server peer address")
+        })
+        .collect();
 
     let mut config = NatConfig {
         reservation_policy: policy,
@@ -84,6 +100,7 @@ fn build_with_config(
         relay2,
         server,
         server2,
+        servers,
     }
 }
 
@@ -158,11 +175,46 @@ impl Hk {
         self.finish_probe_with_addrs(public.then_some(&public_addrs), t)
     }
 
-    /// Ticks to start the next probe (the server session must be ready),
-    /// then completes it.
-    fn run_probe(&mut self, public: bool, t: u64) -> Vec<NatEvent> {
+    /// Ticks at `t` to start the next probe, connecting its server first if
+    /// the probe dials it, and answers with `answer`. Returns the server the
+    /// probe went to and the events the answer produced.
+    fn probe(&mut self, answer: Answer<'_>, t: u64) -> (PeerId, Vec<NatEvent>) {
+        self.probe_taking(answer, t, 2)
+    }
+
+    /// [`Self::probe`], answered `span` ms after the tick.
+    fn probe_taking(&mut self, answer: Answer<'_>, t: u64, span: u64) -> (PeerId, Vec<NatEvent>) {
         self.agent.handle_tick(at(t));
-        self.finish_probe(public, t + 1)
+        let mut actions = drain_actions(&mut self.agent);
+        let dialed = self
+            .servers
+            .iter()
+            .find(|server| dial_count_for(&actions, server) == 1)
+            .cloned();
+        if let Some(server) = dialed {
+            self.session_ready(&server, &[AUTONAT_PROTOCOL_ID], at(t));
+            actions.extend(drain_actions(&mut self.agent));
+        }
+        let (server, stream) = actions
+            .iter()
+            .find_map(|action| match action {
+                Out::OpenStream {
+                    peer,
+                    protocol_id,
+                    opened: Some((_, stream)),
+                } if protocol_id == AUTONAT_PROTOCOL_ID => Some((peer.clone(), *stream)),
+                _ => None,
+            })
+            .expect("the tick starts a probe");
+        self.stream_ready(&server, stream, AUTONAT_PROTOCOL_ID, at(t + span.min(1)));
+        let request = sent_data_on(&drain_actions(&mut self.agent), stream);
+        let response = match answer {
+            Answer::Public(addrs) => autonat_response(&request, Some(addrs)),
+            Answer::DialError => autonat_response(&request, None),
+            Answer::DialRefused => autonat_error_response(&request, ResponseStatus::DialRefused),
+        };
+        self.stream_data(&server, stream, response, at(t + span));
+        (server, drain_events(&mut self.agent))
     }
 
     /// Completes a reservation exchange whose `OpenStream` is already
@@ -202,24 +254,18 @@ fn initial_reservation_policy_arms_only_the_needed_tick() {
 
 #[test]
 fn confidence_window_flips_once_and_never_flaps_on_one_probe() {
-    let mut hk = build(ReservationPolicy::Never, 0, 1);
+    let mut hk = build(ReservationPolicy::Never, 0, 3);
     assert_eq!(hk.agent.reachability(), ReachabilityState::Unknown);
+    let public = [maddr(LISTEN_ADDR)];
 
-    // First probe bootstraps the server session.
-    hk.agent.handle_tick(at(0));
-    drain_actions(&mut hk.agent);
-    let server = hk.server.clone();
-    hk.session_ready(&server, &[AUTONAT_PROTOCOL_ID], at(2));
-    assert!(hk.finish_probe(true, 3).is_empty(), "1 vote of 3: no flip");
+    // Unsettled cadence is 5s; each probe asks the next server.
+    let (_, events) = hk.probe(Answer::Public(&public), 0);
+    assert!(events.is_empty(), "1 vote of 3: no flip");
     assert_eq!(hk.agent.reachability(), ReachabilityState::Unknown);
+    let (_, events) = hk.probe(Answer::Public(&public), 6_000);
+    assert!(events.is_empty(), "2 votes of 3: no flip");
 
-    // Unsettled cadence is 5s.
-    assert!(
-        hk.run_probe(true, 6_000).is_empty(),
-        "2 votes of 3: no flip"
-    );
-
-    let events = hk.run_probe(true, 12_000);
+    let (_, events) = hk.probe(Answer::Public(&public), 12_000);
     assert!(matches!(
         events.as_slice(),
         [NatEvent::ReachabilityChanged {
@@ -231,18 +277,19 @@ fn confidence_window_flips_once_and_never_flaps_on_one_probe() {
     assert_eq!(hk.agent.reachability(), ReachabilityState::Public);
 
     // Settled cadence is 90s; more agreement changes nothing.
-    assert!(hk.run_probe(true, 110_000).is_empty());
+    assert!(hk.probe(Answer::Public(&public), 110_000).1.is_empty());
 
-    // One disagreeing probe must never flap the verdict.
+    // One disagreeing server must never flap the verdict.
+    let (_, events) = hk.probe(Answer::DialError, 210_000);
     assert!(
-        hk.run_probe(false, 210_000).is_empty(),
-        "single private probe in a public window: no flip"
+        events.is_empty(),
+        "single private vote among public ones: no flip"
     );
     assert_eq!(hk.agent.reachability(), ReachabilityState::Public);
 
-    // A private majority (3 of the last 5) flips exactly once.
-    assert!(hk.run_probe(false, 310_000).is_empty());
-    let events = hk.run_probe(false, 410_000);
+    // Three servers voting private flip it exactly once.
+    assert!(hk.probe(Answer::DialError, 310_000).1.is_empty());
+    let (_, events) = hk.probe(Answer::DialError, 410_000);
     assert!(matches!(
         events.as_slice(),
         [NatEvent::ReachabilityChanged {
@@ -256,21 +303,18 @@ fn confidence_window_flips_once_and_never_flaps_on_one_probe() {
 
 #[test]
 fn confidence_threshold_above_window_clamps_to_unanimity() {
-    let mut hk = build_with_config(ReservationPolicy::Never, 0, 1, |config| {
+    let mut hk = build_with_config(ReservationPolicy::Never, 0, 3, |config| {
         config.confidence_window = 3;
         config.confidence_threshold = 9;
     });
 
-    // Bootstrap the AutoNAT session, then collect a full (three-vote)
-    // unanimous window. An unclamped threshold could never settle here.
-    hk.agent.handle_tick(at(0));
-    drain_actions(&mut hk.agent);
-    let server = hk.server.clone();
-    hk.session_ready(&server, &[AUTONAT_PROTOCOL_ID], at(2));
-    assert!(hk.finish_probe(true, 3).is_empty());
-    assert!(hk.run_probe(true, 6_000).is_empty());
+    // A full (three-server) unanimous window. An unclamped threshold could
+    // never settle here.
+    let public = [maddr(LISTEN_ADDR)];
+    assert!(hk.probe(Answer::Public(&public), 0).1.is_empty());
+    assert!(hk.probe(Answer::Public(&public), 6_000).1.is_empty());
 
-    let events = hk.run_probe(true, 12_000);
+    let (_, events) = hk.probe(Answer::Public(&public), 12_000);
     assert!(matches!(
         events.as_slice(),
         [NatEvent::ReachabilityChanged {
@@ -287,6 +331,10 @@ fn public_probe_without_a_usable_quic_addr_is_inconclusive() {
         config.confidence_window = 1;
         config.confidence_threshold = 1;
     });
+    // We ask about a wildcard listen address too, so the server may name it.
+    let wildcard = maddr("/ip4/0.0.0.0/udp/4001/quic-v1");
+    hk.agent
+        .set_listen_addrs(&[maddr(LISTEN_ADDR), wildcard.clone()]);
 
     // Establish both housekeeping sessions, then hold a relay reservation
     // while reachability is still Unknown.
@@ -305,8 +353,7 @@ fn public_probe_without_a_usable_quic_addr_is_inconclusive() {
 
     let server = hk.server.clone();
     hk.session_ready(&server, &[AUTONAT_PROTOCOL_ID], at(4));
-    let wildcard_only = [maddr("/ip4/0.0.0.0/udp/4001/quic-v1")];
-    let events = hk.finish_probe_with_addrs(Some(&wildcard_only), 5);
+    let events = hk.finish_probe_with_addrs(Some(&[wildcard]), 5);
 
     assert!(
         events.is_empty(),
@@ -316,6 +363,329 @@ fn public_probe_without_a_usable_quic_addr_is_inconclusive() {
     assert!(
         hk.agent.active_reservation().is_some(),
         "WhenPrivate must retain its only advertised path"
+    );
+}
+
+#[test]
+fn one_server_answering_repeatedly_casts_a_single_vote() {
+    let mut hk = build(ReservationPolicy::Never, 0, 1);
+    let public = [maddr(LISTEN_ADDR)];
+    for round in 0..5 {
+        let (server, events) = hk.probe(Answer::Public(&public), round * 6_000);
+        assert_eq!(server, hk.server);
+        assert!(events.is_empty(), "round {round}: {events:?}");
+    }
+    assert_eq!(hk.agent.reachability(), ReachabilityState::Unknown);
+}
+
+#[test]
+fn a_quorum_of_distinct_servers_confirms_each_address() {
+    let mut hk = build(ReservationPolicy::Never, 0, 3);
+    let (a, b) = (maddr(LISTEN_ADDR), maddr(OUR_OBSERVED_ADDR));
+    hk.agent.set_listen_addrs(&[a.clone(), b.clone()]);
+
+    // Probes rotate across the servers after every completed exchange.
+    let (first, events) = hk.probe(Answer::Public(std::slice::from_ref(&a)), 0);
+    assert!(events.is_empty());
+    let (second, events) = hk.probe(Answer::Public(&[a.clone(), b.clone()]), 6_000);
+    assert!(events.is_empty());
+    let (third, events) = hk.probe(Answer::Public(std::slice::from_ref(&a)), 12_000);
+    assert_eq!([first, second, third], hk.servers[..]);
+
+    // Three servers vouch for `a`, only one for `b`.
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::ReachabilityChanged {
+                old: ReachabilityState::Unknown,
+                new: ReachabilityState::Public,
+                confirmed_addrs,
+            }] if *confirmed_addrs == vec![a.clone()]
+        ),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn unrelated_returned_addresses_are_ignored() {
+    let mut hk = build(ReservationPolicy::Never, 0, 3);
+    let unrelated = [maddr(OUR_OBSERVED_ADDR)];
+    for round in 0..3 {
+        let (_, events) = hk.probe(Answer::Public(&unrelated), round * 6_000);
+        assert!(events.is_empty(), "{events:?}");
+    }
+    assert_eq!(hk.agent.reachability(), ReachabilityState::Unknown);
+}
+
+#[test]
+fn servers_dialing_back_our_observed_ip_confirm_the_listen_port_there() {
+    // rust-libp2p and go-libp2p servers dial back the requested transport
+    // and port at the IP they observe, so the probe must ask about our
+    // listen port at that IP; the observed port (often ephemeral) is not it.
+    let cases = [
+        (
+            "/ip4/10.0.0.2/tcp/4001",
+            "/ip4/203.0.113.77/tcp/51234",
+            "/ip4/203.0.113.77/tcp/4001",
+        ),
+        (
+            LISTEN_ADDR,
+            OUR_OBSERVED_ADDR,
+            "/ip4/203.0.113.77/udp/4500/quic-v1",
+        ),
+    ];
+    for (listen, observed, dialed_back) in cases {
+        let mut hk = build(ReservationPolicy::Never, 0, 3);
+        hk.agent.set_listen_addrs(&[maddr(listen)]);
+        for server in hk.servers.clone() {
+            identify_observed(&mut hk.agent, &server, &maddr(observed), at(0));
+        }
+        let public = [maddr(dialed_back)];
+        let mut events = Vec::new();
+        for round in 0..3 {
+            events = hk.probe(Answer::Public(&public), round * 6_000).1;
+        }
+        assert!(
+            matches!(
+                events.as_slice(),
+                [NatEvent::ReachabilityChanged {
+                    new: ReachabilityState::Public,
+                    confirmed_addrs,
+                    ..
+                }] if *confirmed_addrs == public
+            ),
+            "{listen}: {events:?}"
+        );
+    }
+}
+
+#[test]
+fn a_dual_stack_reporter_contributes_its_ipv4_and_ipv6_observations() {
+    let mut hk = build(ReservationPolicy::Never, 0, 3);
+    hk.agent.set_listen_addrs(&[
+        maddr("/ip4/10.0.0.2/tcp/4001"),
+        maddr("/ip6/fd00::2/tcp/4001"),
+    ]);
+    for server in hk.servers.clone() {
+        identify_observed(
+            &mut hk.agent,
+            &server,
+            &maddr("/ip4/203.0.113.77/tcp/51234"),
+            at(0),
+        );
+        identify_observed(
+            &mut hk.agent,
+            &server,
+            &maddr("/ip6/2001:db8::77/tcp/51235"),
+            at(0),
+        );
+    }
+    let public = [
+        maddr("/ip4/203.0.113.77/tcp/4001"),
+        maddr("/ip6/2001:db8::77/tcp/4001"),
+    ];
+    let mut events = Vec::new();
+    for round in 0..3 {
+        events = hk.probe(Answer::Public(&public), round * 6_000).1;
+    }
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::ReachabilityChanged {
+                new: ReachabilityState::Public,
+                confirmed_addrs,
+                ..
+            }] if *confirmed_addrs == public
+        ),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn dial_refused_is_never_a_private_vote() {
+    let mut hk = build(ReservationPolicy::Never, 0, 3);
+    for round in 0..3 {
+        let (_, events) = hk.probe(Answer::DialRefused, round * 6_000);
+        assert!(events.is_empty(), "{events:?}");
+    }
+    assert_eq!(hk.agent.reachability(), ReachabilityState::Unknown);
+
+    // A failed dial-back is still a private vote.
+    for round in 3..5 {
+        assert!(hk.probe(Answer::DialError, round * 6_000).1.is_empty());
+    }
+    let (_, events) = hk.probe(Answer::DialError, 30_000);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::ReachabilityChanged {
+                new: ReachabilityState::Private,
+                ..
+            }]
+        ),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn votes_expire_after_fifteen_minutes() {
+    let mut hk = build(ReservationPolicy::Never, 0, 3);
+    let public = [maddr(LISTEN_ADDR)];
+    assert!(hk.probe(Answer::Public(&public), 0).1.is_empty());
+    assert!(hk.probe(Answer::Public(&public), 10_000).1.is_empty());
+
+    // The first server's vote (cast at 2ms) is over 15 minutes old by the
+    // third: two live votes are no quorum.
+    let (_, events) = hk.probe(Answer::Public(&public), 900_001);
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(hk.agent.reachability(), ReachabilityState::Unknown);
+
+    // The first server votes again: three live votes.
+    let (_, events) = hk.probe(Answer::Public(&public), 906_000);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::ReachabilityChanged {
+                new: ReachabilityState::Public,
+                ..
+            }]
+        ),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_settled_verdict_lapses_to_unknown_once_its_votes_expire() {
+    let mut hk = build(ReservationPolicy::Never, 0, 3);
+    let public = [maddr(LISTEN_ADDR)];
+    assert!(hk.probe(Answer::Public(&public), 0).1.is_empty());
+    assert!(hk.probe(Answer::Public(&public), 6_000).1.is_empty());
+    assert_eq!(hk.probe(Answer::Public(&public), 12_000).1.len(), 1);
+    assert_eq!(hk.agent.reachability(), ReachabilityState::Public);
+
+    // Every server only refuses from now on. Once the first vote (cast at
+    // 2ms) is 15 minutes old, two live votes are too few to stand on.
+    let mut changes = Vec::new();
+    for round in 1..=10 {
+        changes.extend(hk.probe(Answer::DialRefused, 12_000 + round * 90_100).1);
+    }
+    assert!(
+        matches!(
+            changes.as_slice(),
+            [NatEvent::ReachabilityChanged {
+                old: ReachabilityState::Public,
+                new: ReachabilityState::Unknown,
+                confirmed_addrs,
+            }] if confirmed_addrs.is_empty()
+        ),
+        "{changes:?}"
+    );
+}
+
+#[test]
+fn a_confirmed_address_needs_a_quorum_to_be_withdrawn() {
+    let mut hk = build(ReservationPolicy::Never, 0, 3);
+    let (a, b) = (maddr(LISTEN_ADDR), maddr(OUR_OBSERVED_ADDR));
+    hk.agent.set_listen_addrs(&[a.clone(), b.clone()]);
+    let both = [a.clone(), b.clone()];
+    assert!(hk.probe(Answer::Public(&both), 0).1.is_empty());
+    assert!(hk.probe(Answer::Public(&both), 6_000).1.is_empty());
+    let (_, events) = hk.probe(Answer::Public(&both), 12_000);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::ReachabilityChanged { confirmed_addrs, .. }]
+                if *confirmed_addrs == both
+        ),
+        "{events:?}"
+    );
+
+    // One, then two servers leave `b` out: it stays advertised.
+    let only_a = std::slice::from_ref(&a);
+    assert!(hk.probe(Answer::Public(only_a), 17_100).1.is_empty());
+    assert!(hk.probe(Answer::Public(only_a), 107_200).1.is_empty());
+    // The third makes a quorum without it.
+    let (_, events) = hk.probe(Answer::Public(only_a), 197_300);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::PublicAddressesChanged { addrs }] if *addrs == vec![a.clone()]
+        ),
+        "{events:?}"
+    );
+
+    // Likewise a quorum of private votes, not one, ends the verdict.
+    assert!(hk.probe(Answer::DialError, 287_400).1.is_empty());
+    assert!(hk.probe(Answer::DialError, 377_500).1.is_empty());
+    let (_, events) = hk.probe(Answer::DialError, 467_600);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::ReachabilityChanged {
+                new: ReachabilityState::Private,
+                ..
+            }]
+        ),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_settled_verdict_wakes_the_host_when_its_votes_expire() {
+    let mut hk = build_with_config(ReservationPolicy::Never, 0, 3, |config| {
+        config.probe_interval_settled_ms = 3_600_000;
+    });
+    let public = [maddr(LISTEN_ADDR)];
+    assert!(hk.probe(Answer::Public(&public), 0).1.is_empty());
+    assert!(hk.probe(Answer::Public(&public), 6_000).1.is_empty());
+    assert_eq!(hk.probe(Answer::Public(&public), 12_000).1.len(), 1);
+    // The probe after the flip is the last for an hour.
+    assert!(hk.probe(Answer::Public(&public), 17_002).1.is_empty());
+    drain_actions(&mut hk.agent);
+    // The oldest live vote, cast at 6_002ms, expires long before then.
+    assert_eq!(
+        hk.agent.next_deadline(at(20_000)),
+        Some(Deadline::from_millis(906_002))
+    );
+    hk.agent.handle_tick(at(906_002));
+    assert!(matches!(
+        drain_events(&mut hk.agent).as_slice(),
+        [NatEvent::ReachabilityChanged {
+            new: ReachabilityState::Unknown,
+            ..
+        }]
+    ));
+    // Back to Unknown, it probes again at the unsettled cadence.
+    assert_eq!(
+        hk.agent.next_deadline(at(906_002)),
+        Some(Deadline::from_millis(911_002))
+    );
+}
+
+#[test]
+fn the_window_keeps_the_latest_servers_even_at_one_instant() {
+    let mut hk = build_with_config(ReservationPolicy::Never, 0, 6, |config| {
+        config.probe_interval_unsettled_ms = 0;
+        config.probe_interval_settled_ms = 0;
+    });
+    let public = [maddr(LISTEN_ADDR)];
+    // Every answer lands at 0ms. The first server's is inconclusive, so it
+    // votes last.
+    assert!(hk.probe_taking(Answer::DialRefused, 0, 0).1.is_empty());
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        events.extend(hk.probe_taking(Answer::DialError, 0, 0).1);
+    }
+    assert_eq!(hk.agent.reachability(), ReachabilityState::Private);
+    for _ in 0..3 {
+        events.extend(hk.probe_taking(Answer::Public(&public), 0, 0).1);
+    }
+    // The sixth vote pushes out the first private one, not itself: the
+    // latest five servers hold three public votes.
+    assert_eq!(
+        hk.agent.reachability(),
+        ReachabilityState::Public,
+        "{events:?}"
     );
 }
 
@@ -843,7 +1213,8 @@ fn reservation_work_started_on_a_replacement_survives_the_replacement_event() {
 
 #[test]
 fn when_private_policy_follows_the_reachability_verdict() {
-    let mut hk = build(ReservationPolicy::WhenPrivate, 1, 1);
+    let mut hk = build(ReservationPolicy::WhenPrivate, 1, 3);
+    let public = [maddr(LISTEN_ADDR)];
 
     // While reachability is Unknown, both housekeeping flows start: a
     // reservation (dialable now) and a probe (gather evidence).
@@ -862,11 +1233,11 @@ fn when_private_policy_follows_the_reachability_verdict() {
 
     hk.session_ready(&server, &[AUTONAT_PROTOCOL_ID], at(4));
     assert!(hk.finish_probe(true, 5).is_empty());
-    assert!(hk.run_probe(true, 6_000).is_empty());
+    assert!(hk.probe(Answer::Public(&public), 6_000).1.is_empty());
 
-    // Third public probe: the verdict flips and, in the same cascade, the
-    // now-unneeded reservation is released.
-    let events = hk.run_probe(true, 12_000);
+    // The third server's public vote: the verdict flips and, in the same
+    // cascade, the now-unneeded reservation is released.
+    let (_, events) = hk.probe(Answer::Public(&public), 12_000);
     assert!(matches!(
         events.as_slice(),
         [
@@ -881,7 +1252,7 @@ fn when_private_policy_follows_the_reachability_verdict() {
 
     // Service the next scheduled probe, then verify quiet ticks stay quiet:
     // no reservation reacquisition while confidently public.
-    assert!(hk.run_probe(true, 50_000).is_empty());
+    assert!(hk.probe(Answer::Public(&public), 50_000).1.is_empty());
     drain_actions(&mut hk.agent); // the finished probe's close-write
     hk.agent.handle_tick(at(100_000));
     let actions = drain_actions(&mut hk.agent);
@@ -890,11 +1261,11 @@ fn when_private_policy_follows_the_reachability_verdict() {
         "no reservation while confidently public: {actions:?}"
     );
 
-    // Flip back to Private: reacquisition begins in the same cascade.
-    assert!(hk.run_probe(false, 145_000).is_empty());
-    assert!(hk.run_probe(false, 236_000).is_empty());
-    hk.agent.handle_tick(at(330_000));
-    let events = hk.finish_probe(false, 330_001);
+    // Flip back to Private once three servers say so: reacquisition
+    // begins in the same cascade.
+    assert!(hk.probe(Answer::DialError, 145_000).1.is_empty());
+    assert!(hk.probe(Answer::DialError, 236_000).1.is_empty());
+    let (_, events) = hk.probe(Answer::DialError, 330_000);
     assert!(matches!(
         events.as_slice(),
         [NatEvent::ReachabilityChanged {

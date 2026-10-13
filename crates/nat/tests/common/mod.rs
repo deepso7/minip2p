@@ -153,11 +153,26 @@ pub fn hop_reserve_ok(expire_unix_secs: Option<u64>) -> Vec<u8> {
 
 /// Runs `request_bytes` through a real [`AutoNatServer`] and returns the
 /// wire bytes of the given response — public with `addrs`, or a dial error.
+pub fn autonat_response(request_bytes: &[u8], public_addrs: Option<&[Multiaddr]>) -> Vec<u8> {
+    autonat_answer(request_bytes, |server| match public_addrs {
+        Some(addrs) => server.respond_public(addrs),
+        None => server.respond_error(ResponseStatus::DialError, "dial-back failed"),
+    })
+}
+
+/// Runs `request_bytes` through a real [`AutoNatServer`] and returns the
+/// wire bytes of an error response with `status`.
+pub fn autonat_error_response(request_bytes: &[u8], status: ResponseStatus) -> Vec<u8> {
+    autonat_answer(request_bytes, |server| {
+        server.respond_error(status, "refused")
+    })
+}
+
 #[expect(
     clippy::panic,
     reason = "the shared test helper must fail at the unexpected AutoNAT response"
 )]
-pub fn autonat_response(request_bytes: &[u8], public_addrs: Option<&[Multiaddr]>) -> Vec<u8> {
+fn autonat_answer(request_bytes: &[u8], respond: impl FnOnce(&mut AutoNatServer)) -> Vec<u8> {
     let mut server = AutoNatServer::new();
     server
         .on_data(request_bytes)
@@ -166,10 +181,7 @@ pub fn autonat_response(request_bytes: &[u8], public_addrs: Option<&[Multiaddr]>
         server.poll_output(),
         Some(AutoNatServerOutput::Request(_))
     ));
-    match public_addrs {
-        Some(addrs) => server.respond_public(addrs),
-        None => server.respond_error(ResponseStatus::DialError, "dial-back failed"),
-    }
+    respond(&mut server);
     match server.poll_output() {
         Some(AutoNatServerOutput::Outbound(bytes)) => bytes,
         other => panic!("expected outbound response, got {other:?}"),

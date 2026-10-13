@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use minip2p_core::write_uvarint;
 use minip2p_core::{
-    FrameExchange, FrameFault, Multiaddr, PeerId, WIRE_LEN, WIRE_VARINT, WireError,
+    FrameExchange, FrameFault, Multiaddr, PeerId, Protocol, WIRE_LEN, WIRE_VARINT, WireError,
     encode_bytes_field, encode_varint_field, read_len_delimited, read_tag, read_varint_value,
     skip_field, uvarint_len,
 };
@@ -84,21 +84,25 @@ impl ResponseStatus {
 /// Reachability result emitted by the client state machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Reachability {
-    /// AutoNAT service successfully dialed at least one advertised address.
+    /// AutoNAT service successfully dialed at least one requested address.
     Public {
-        /// Addresses the service reports as dialable.
+        /// The requested addresses the service reports as dialable, in
+        /// request order. Returned addresses the client did not ask about
+        /// are dropped.
         addrs: Vec<Multiaddr>,
         /// Raw address bytes from the response, retained for diagnostics.
         raw_addrs: Vec<Vec<u8>>,
     },
-    /// Dial-back failed or was refused, so the peer is likely private.
+    /// Dial-back failed, so the peer is likely private.
     Private {
         /// Response status.
         status: ResponseStatus,
         /// Human-readable service-provided reason, if any.
         reason: String,
     },
-    /// The service could not provide a useful result.
+    /// The service could not provide a useful result: it refused to dial,
+    /// failed, rejected the request, or reported success without naming any
+    /// requested address.
     Unknown {
         /// Response status.
         status: ResponseStatus,
@@ -218,6 +222,9 @@ pub const MAX_STATUS_TEXT: usize = 1024;
 
 /// Client-side AutoNAT probe.
 pub struct AutoNatClient {
+    peer_id: PeerId,
+    /// The addresses the request carried, after trimming.
+    requested: Vec<Multiaddr>,
     frames: FrameExchange,
     state: FlowState,
     outcome: Option<Reachability>,
@@ -252,10 +259,12 @@ impl AutoNatClient {
     /// The request carries `addrs` in order, skipping any that would not fit
     /// in one AutoNAT frame. Offering a subset is legal — the
     /// server just has fewer candidates to dial back — whereas an oversized
-    /// request is one the server is required to refuse.
+    /// request is one the server is required to refuse. Only addresses the
+    /// request carried can be confirmed by the response.
     pub fn new(peer_id: &PeerId, addrs: &[Multiaddr]) -> Self {
         let id = peer_id.to_bytes();
         let addrs = fitting_addrs(addrs, field_len(id.len()), dial_message_len);
+        let requested = decode_addrs(&addrs);
         let peer = PeerInfo { id, addrs };
         let msg = Message {
             kind: MessageType::Dial,
@@ -267,6 +276,8 @@ impl AutoNatClient {
             .queue(&msg.encode())
             .expect("addresses were trimmed to fit one frame");
         Self {
+            peer_id: peer_id.clone(),
+            requested,
             frames,
             state: FlowState::Pending,
             outcome: None,
@@ -321,21 +332,54 @@ impl AutoNatClient {
         let raw_addrs = response.addrs;
 
         self.outcome = Some(match response.status {
-            ResponseStatus::Ok => Reachability::Public {
-                addrs: decode_addrs(&raw_addrs),
-                raw_addrs,
-            },
-            ResponseStatus::DialError | ResponseStatus::DialRefused => Reachability::Private {
+            ResponseStatus::Ok => {
+                let addrs = self.confirmed(&raw_addrs);
+                if addrs.is_empty() {
+                    Reachability::Unknown {
+                        status: response.status,
+                        reason: "the response confirmed no requested address".into(),
+                    }
+                } else {
+                    Reachability::Public { addrs, raw_addrs }
+                }
+            }
+            ResponseStatus::DialError => Reachability::Private {
                 status: response.status,
                 reason,
             },
-            ResponseStatus::BadRequest | ResponseStatus::InternalError => Reachability::Unknown {
+            // A refusal says nothing about our reachability: the server may
+            // simply be rate limiting.
+            ResponseStatus::DialRefused
+            | ResponseStatus::BadRequest
+            | ResponseStatus::InternalError => Reachability::Unknown {
                 status: response.status,
                 reason,
             },
         });
         self.state = FlowState::Done;
         Ok(())
+    }
+}
+
+impl AutoNatClient {
+    /// The requested addresses `raw` names, in request order. A returned
+    /// address matches a requested one exactly, or with a trailing
+    /// `/p2p/<our peer id>`; malformed or unrelated addresses match nothing.
+    fn confirmed(&self, raw: &[Vec<u8>]) -> Vec<Multiaddr> {
+        let ours = Protocol::P2p(self.peer_id.clone());
+        let returned = decode_addrs(raw);
+        let names = |requested: &Multiaddr, addr: &Multiaddr| {
+            addr == requested
+                || addr
+                    .protocols()
+                    .split_last()
+                    .is_some_and(|(last, rest)| *last == ours && rest == requested.protocols())
+        };
+        self.requested
+            .iter()
+            .filter(|requested| returned.iter().any(|addr| names(requested, addr)))
+            .cloned()
+            .collect()
     }
 }
 
@@ -847,7 +891,7 @@ mod tests {
 
         let mut server = AutoNatServer::new();
         server.respond_public(&addrs);
-        let mut client = AutoNatClient::new(&peer_id, &[]);
+        let mut client = AutoNatClient::new(&peer_id, &addrs);
         client
             .on_data(&server.take_outbound())
             .expect("the response fits");
@@ -887,6 +931,74 @@ mod tests {
         assert!(
             matches!(client.outcome(), Some(Reachability::Public { addrs, .. }) if addrs == &vec![addr])
         );
+    }
+
+    /// The outcome of a probe offering `requested` that the server answers
+    /// as public with `returned`.
+    fn public_outcome(requested: &[&str], returned: &[Multiaddr]) -> Reachability {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let requested: Vec<_> = requested
+            .iter()
+            .map(|addr| Multiaddr::from_str(addr).unwrap())
+            .collect();
+        let mut client = AutoNatClient::new(&peer_id, &requested);
+        let mut server = AutoNatServer::new();
+        server.on_data(&client.take_outbound()).unwrap();
+        server.respond_public(returned);
+        client.on_data(&server.take_outbound()).unwrap();
+        client.outcome().cloned().expect("an outcome")
+    }
+
+    #[test]
+    fn only_requested_addresses_count_as_confirmed() {
+        let asked = "/ip4/203.0.113.7/udp/4001/quic-v1";
+        let other = Multiaddr::from_str("/ip4/198.51.100.1/udp/4001/quic-v1").unwrap();
+        let asked_addr = Multiaddr::from_str(asked).unwrap();
+        let mut with_peer = asked_addr.clone();
+        with_peer.push(Protocol::P2p(PeerId::from_str(PEER_ID).unwrap()));
+
+        // Unrelated addresses are dropped, and a /p2p suffix naming us
+        // still matches what we asked about.
+        assert!(matches!(
+            public_outcome(&[asked], &[other.clone(), with_peer.clone()]),
+            Reachability::Public { addrs, .. } if addrs == vec![asked_addr]
+        ));
+        // A requested address that already names us matches itself.
+        let with_peer_text = with_peer.to_string();
+        assert!(matches!(
+            public_outcome(&[&with_peer_text], core::slice::from_ref(&with_peer)),
+            Reachability::Public { addrs, .. } if addrs == vec![with_peer.clone()]
+        ));
+        // Only unrelated, or nothing at all: no evidence either way.
+        for returned in [vec![other], Vec::new()] {
+            assert!(
+                matches!(
+                    public_outcome(&[asked], &returned),
+                    Reachability::Unknown {
+                        status: ResponseStatus::Ok,
+                        ..
+                    }
+                ),
+                "{returned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_dial_is_inconclusive() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        let mut server = AutoNatServer::new();
+        server.on_data(&client.take_outbound()).unwrap();
+        server.respond_error(ResponseStatus::DialRefused, "rate limited");
+        client.on_data(&server.take_outbound()).unwrap();
+        assert!(matches!(
+            client.outcome(),
+            Some(Reachability::Unknown {
+                status: ResponseStatus::DialRefused,
+                ..
+            })
+        ));
     }
 
     #[test]

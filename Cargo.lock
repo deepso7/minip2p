@@ -1356,6 +1356,7 @@ version = "0.8.2"
 dependencies = [
  "cpu-time",
  "criterion",
+ "minip2p-autonat",
  "minip2p-circuit",
  "minip2p-core",
  "minip2p-discovery",

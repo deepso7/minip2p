@@ -667,7 +667,11 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
         self
     }
 
-    /// Enables AutoNAT probing through one trusted server.
+    /// Adds a trusted AutoNAT server, enabling probing.
+    ///
+    /// Call once per server: a reachability verdict needs a quorum of
+    /// distinct servers ([`NatConfig::confidence_threshold`], 3 by default),
+    /// so with fewer reachable servers reachability stays Unknown.
     #[cfg(feature = "portable-autonat")]
     pub fn autonat(mut self, server: PeerAddr) -> Self {
         self.nat_config
@@ -1101,7 +1105,11 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         self
     }
 
-    /// Enables portable AutoNAT probing through one trusted server.
+    /// Adds a trusted portable AutoNAT server, enabling probing.
+    ///
+    /// Call once per server: a reachability verdict needs a quorum of
+    /// distinct servers ([`NatConfig::confidence_threshold`], 3 by default),
+    /// so with fewer reachable servers reachability stays Unknown.
     #[cfg(feature = "portable-autonat")]
     pub fn autonat(mut self, server: PeerAddr) -> Self {
         self.portable = self.portable.autonat(server);

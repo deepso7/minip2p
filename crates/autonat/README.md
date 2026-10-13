@@ -45,6 +45,10 @@ while let Some(output) = server.poll_output() {
 }
 ```
 
+## Client outcomes
+
+The client remembers exactly which addresses its request carried (after trimming to one frame). An `OK` response is `Reachability::Public` only for the requested addresses it names, matched exactly or with a trailing `/p2p/<our peer id>`; unrelated or malformed addresses are dropped, and an `OK` naming none of them is `Unknown`. `E_DIAL_ERROR` is `Private`. `E_DIAL_REFUSED` (often rate limiting), `E_BAD_REQUEST` and `E_INTERNAL_ERROR` are `Unknown`: they say nothing about our reachability. Aggregating outcomes across servers is the caller's policy; `minip2p-nat` requires a quorum of distinct servers.
+
 ## Size limits
 
 Messages carry at most 8192 payload bytes. The declared length is checked from the frame header, so a message at exactly the maximum is accepted — including one that arrives with pipelined bytes behind it — while bytes that could never complete a legal frame are refused before they are buffered. Outgoing messages respect the same limit, so neither side puts a frame on the wire that the other is required to refuse: a DIAL request or DIAL_RESPONSE carries the given addresses in order, skipping any that would not fit, and a response's status text is cut to `MAX_STATUS_TEXT` (1024) bytes.

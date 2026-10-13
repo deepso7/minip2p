@@ -41,12 +41,18 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             "--max-reservations" => {
                 options.config.max_reservations = number(&flag, value(&mut args)?)?
             }
+            "--max-reservations-per-ip" => {
+                options.config.max_reservations_per_ip = number(&flag, value(&mut args)?)?
+            }
             "--reservation-duration" => {
                 options.config.reservation_duration_secs = number(&flag, value(&mut args)?)?
             }
             "--max-circuits" => options.config.max_circuits = number(&flag, value(&mut args)?)?,
             "--max-circuits-per-peer" => {
                 options.config.max_circuits_per_peer = number(&flag, value(&mut args)?)?
+            }
+            "--max-circuits-per-ip" => {
+                options.config.max_circuits_per_ip = number(&flag, value(&mut args)?)?
             }
             "--max-circuit-duration" => {
                 options.config.max_circuit_duration_secs = number(&flag, value(&mut args)?)?
@@ -76,6 +82,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             }
             "--circuit-ip-rate" => {
                 options.config.circuit_rate_limit_per_ip = rate(&flag, value(&mut args)?)?
+            }
+            "--max-rate-limit-entries" => {
+                options.config.max_rate_limit_entries = number(&flag, value(&mut args)?)?
             }
             _ => return Err(format!("unknown option {flag}\n\n{}", usage())),
         }
@@ -132,7 +141,7 @@ fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
 }
 
 pub fn usage() -> &'static str {
-    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic HOST:PORT               exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp HOST:PORT                exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable)\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME\n  minip2p-relay service status | logs | restart | uninstall"
+    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic HOST:PORT               exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp HOST:PORT                exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable)\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--max-reservations-per-ip N    reservations per IPv4 address or IPv6 /64\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuits-per-ip N        circuits per IPv4 address or IPv6 /64\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n--max-rate-limit-entries N     keys each rate limiter tracks\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME\n  minip2p-relay service status | logs | restart | uninstall"
 }
 
 #[cfg(test)]
@@ -212,6 +221,8 @@ mod tests {
             "--paused".into(),
             "--max-circuits".into(),
             "7".into(),
+            "--max-circuits-per-ip".into(),
+            "3".into(),
             "--reservation-peer-rate".into(),
             "3/250".into(),
             "--circuit-ip-rate".into(),
@@ -224,6 +235,7 @@ mod tests {
         );
         assert!(!options.accepting);
         assert_eq!(options.config.max_circuits, 7);
+        assert_eq!(options.config.max_circuits_per_ip, 3);
         assert_eq!(
             options.config.reservation_rate_limit_per_peer,
             Some(RateLimit {

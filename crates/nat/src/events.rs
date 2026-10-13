@@ -66,8 +66,9 @@ pub enum NatAction {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum NatEvent {
-    /// The reachability verdict flipped (majority-of-window confidence, so
-    /// this never flaps on a single probe).
+    /// The reachability verdict flipped: a quorum of distinct AutoNAT
+    /// servers agreed, so this never flaps on a single server, or the votes
+    /// behind the verdict expired and it lapsed to `Unknown`.
     ReachabilityChanged {
         old: ReachabilityState,
         new: ReachabilityState,
