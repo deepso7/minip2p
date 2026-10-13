@@ -1,5 +1,5 @@
 //! Relay-leg rotation: one connect attempt tries each configured relay in
-//! turn, each within its share of the relay-leg deadline.
+//! turn, each within its own relay budget clipped by the attempt deadline.
 
 mod common;
 
@@ -7,7 +7,7 @@ use common::*;
 
 use minip2p_core::{PeerAddr, PeerId};
 use minip2p_nat::{
-    ConnectLegs, NatConfig, NatError, NatEvent, Path, PromoteError, ReservationPolicy,
+    ConnectLegs, NatConfig, NatError, NatEvent, Path, PromoteError, RelayStage, ReservationPolicy,
 };
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
@@ -152,7 +152,7 @@ fn assert_relayed_via(w: &mut World, relay: &PeerId, now: u64) {
 }
 
 #[test]
-fn stalled_first_relay_hands_over_after_its_share() {
+fn stalled_first_relay_hands_over_after_its_own_budget() {
     let mut w = two_relays();
     let target = w.target.clone();
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
@@ -160,25 +160,104 @@ fn stalled_first_relay_hands_over_after_its_share() {
     assert_eq!(dial_count_for(&actions, &w.a), 1);
     assert_eq!(dial_count_for(&actions, &w.b), 0);
 
-    // A never answers. Its share is half of the 12 s relay-leg deadline.
-    w.agent.handle_tick(at(5_999));
+    // A never answers. It gets the whole 12 s relay budget, not a share.
+    w.agent.handle_tick(at(11_999));
     assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.b), 0);
-    w.agent.handle_tick(at(6_000));
+    assert!(matches!(
+        drain_all_events(&mut w.agent).as_slice(),
+        [NatEvent::RelayStarted { relay, .. }] if *relay.peer_id() == w.a
+    ));
+    w.agent.handle_tick(at(12_000));
     let actions = drain_actions(&mut w.agent);
     assert_eq!(dial_count_for(&actions, &w.b), 1);
+    let a = w.a.clone();
     assert!(
-        drain_events(&mut w.agent).is_empty(),
-        "the leg is still live"
+        matches!(
+            drain_all_events(&mut w.agent).as_slice(),
+            [
+                NatEvent::RelayFailed {
+                    relay,
+                    error: NatError::Timeout {
+                        stage: RelayStage::RelayDial,
+                        relay: Some(timed_out),
+                        elapsed_ms: 12_000,
+                        budget_ms: 12_000,
+                    },
+                    ..
+                },
+                NatEvent::RelayStarted { relay: next, .. },
+            ] if *relay.peer_id() == a && *timed_out == a && *next.peer_id() == w.b
+        ),
+        "A's stalled stage is reported and the leg moves on to B"
     );
 
     let b = w.b.clone();
     let b_conn = dial_conn_for(&actions, &b);
-    hop_exchange(&mut w, &b, b_conn, Status::Ok, 6_500);
-    assert_relayed_via(&mut w, &b, 6_501);
+    hop_exchange(&mut w, &b, b_conn, Status::Ok, 12_500);
+    assert_relayed_via(&mut w, &b, 12_501);
 }
 
 #[test]
-fn shares_fit_a_caller_deadline_shorter_than_the_leg_deadline() {
+fn a_relay_stalled_on_hop_status_reports_that_stage() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let legs = ConnectLegs {
+        deadline_ms: Some(5_000),
+        ..RELAY_NOW
+    };
+    let _ = start(&mut w.agent, 1, target, legs, at(0));
+    let a = w.a.clone();
+    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
+    w.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: a.clone(),
+            conn_id: a_conn,
+        },
+        false,
+        at(10),
+    );
+    w.agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: a.clone(),
+            conn_id: a_conn,
+            protocols: vec![HOP_PROTOCOL_ID.to_string()],
+        },
+        false,
+        at(10),
+    );
+    let stream = opened_stream_for(&drain_actions(&mut w.agent), &a);
+    w.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: a_conn,
+            peer_id: a.clone(),
+            stream_id: stream,
+            protocol_id: HOP_PROTOCOL_ID.to_string(),
+            initiated_locally: true,
+        },
+        false,
+        at(20),
+    );
+    drain_all_events(&mut w.agent);
+
+    // The relay never answers CONNECT; the attempt's 5 s deadline clips
+    // its budget and leaves no time for B.
+    w.agent.handle_tick(at(5_000));
+    assert!(matches!(
+        drain_events(&mut w.agent).as_slice(),
+        [NatEvent::ConnectFailed {
+            error: NatError::Timeout {
+                stage: RelayStage::HopStatus,
+                elapsed_ms: 5_000,
+                budget_ms: 5_000,
+                ..
+            },
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn the_relay_budget_is_clipped_by_a_shorter_caller_deadline() {
     let mut w = two_relays();
     let target = w.target.clone();
     let legs = ConnectLegs {
@@ -188,14 +267,16 @@ fn shares_fit_a_caller_deadline_shorter_than_the_leg_deadline() {
     let _ = start(&mut w.agent, 1, target, legs, at(0));
     drain_actions(&mut w.agent);
 
-    // The attempt gives up at 4 s, so A gets 2 s rather than 6 s.
-    w.agent.handle_tick(at(2_000));
-    assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.b), 1);
+    // The attempt gives up at 4 s, so A gets 4 s rather than 12 s and B
+    // is never tried.
+    w.agent.handle_tick(at(3_999));
+    assert!(drain_events(&mut w.agent).is_empty());
     w.agent.handle_tick(at(4_000));
+    assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.b), 0);
     assert!(matches!(
         drain_events(&mut w.agent).as_slice(),
         [NatEvent::ConnectFailed {
-            error: NatError::Timeout,
+            error: NatError::Timeout { .. },
             ..
         }]
     ));
@@ -245,11 +326,11 @@ fn late_dial_failure_from_an_abandoned_relay_is_ignored() {
     let target = w.target.clone();
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let a_dial = dial_for(&drain_actions(&mut w.agent), &w.a);
-    w.agent.handle_tick(at(6_000));
+    w.agent.handle_tick(at(12_000));
     let actions = drain_actions(&mut w.agent);
     assert_eq!(dial_count_for(&actions, &w.b), 1);
 
-    dial_failed(&mut w, a_dial, "relay A finally gave up", 6_100);
+    dial_failed(&mut w, a_dial, "relay A finally gave up", 12_100);
     assert!(
         drain_events(&mut w.agent).is_empty(),
         "B's leg is untouched"
@@ -258,8 +339,8 @@ fn late_dial_failure_from_an_abandoned_relay_is_ignored() {
 
     let b = w.b.clone();
     let b_conn = dial_conn_for(&actions, &b);
-    hop_exchange(&mut w, &b, b_conn, Status::Ok, 6_200);
-    assert_relayed_via(&mut w, &b, 6_201);
+    hop_exchange(&mut w, &b, b_conn, Status::Ok, 12_200);
+    assert_relayed_via(&mut w, &b, 12_201);
 }
 
 #[test]
@@ -413,6 +494,106 @@ fn failed_promotion_at_first_relay_moves_to_the_next() {
 }
 
 #[test]
+fn a_promotion_answered_after_its_relay_timed_out_closes_its_circuit() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let (a, b) = (w.a.clone(), w.b.clone());
+    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
+    hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
+    let stale = promote_token(&drain_actions(&mut w.agent));
+
+    // A's promotion is still unanswered when its budget runs out; B
+    // bridges and requests its own.
+    w.agent.handle_tick(at(12_000));
+    let b_conn = dial_conn_for(&drain_actions(&mut w.agent), &b);
+    hop_exchange(&mut w, &b, b_conn, Status::Ok, 12_010);
+    let b_actions = drain_actions(&mut w.agent);
+    drain_all_events(&mut w.agent);
+
+    // A's late circuit is not B's: it closes, and B's promotion still lands.
+    let late = ConnectionId::new((1 << 63) | 78);
+    w.agent.promote_result(stale, Ok(late), at(12_020));
+    assert!(
+        drain_actions(&mut w.agent)
+            .iter()
+            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == late))
+    );
+    complete_promotion(&mut w.agent, &w.target.clone(), &b_actions, at(12_030));
+    assert!(matches!(
+        drain_events(&mut w.agent).as_slice(),
+        [NatEvent::PathEstablished { path: Path::Relayed { relay }, .. }] if *relay == b
+    ));
+}
+
+/// Asserts `w`'s pending actions close the circuit `conn`.
+fn assert_closes(w: &mut World, conn: ConnectionId) {
+    assert!(
+        drain_actions(&mut w.agent)
+            .iter()
+            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == conn)),
+        "the orphaned circuit must close"
+    );
+}
+
+#[test]
+fn a_promotion_answered_after_the_last_relay_timed_out_closes_its_circuit() {
+    let mut w = relays_with(|a, _| vec![relay_addr("/ip4/203.0.113.1/udp/4001/quic-v1", a)]);
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let a = w.a.clone();
+    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
+    hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
+    let token = promote_token(&drain_actions(&mut w.agent));
+    w.agent.handle_tick(at(12_000));
+    assert!(
+        drain_events(&mut w.agent)
+            .iter()
+            .any(|event| matches!(event, NatEvent::ConnectFailed { .. }))
+    );
+
+    let late = ConnectionId::new((1 << 63) | 78);
+    w.agent.promote_result(token, Ok(late), at(12_020));
+    assert_closes(&mut w, late);
+}
+
+#[test]
+fn a_promotion_answered_after_the_attempt_was_cancelled_closes_its_circuit() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let id = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let a = w.a.clone();
+    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
+    hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
+    let token = promote_token(&drain_actions(&mut w.agent));
+    w.agent.cancel(id, at(20));
+    drain_actions(&mut w.agent);
+
+    let late = ConnectionId::new((1 << 63) | 78);
+    w.agent.promote_result(token, Ok(late), at(30));
+    assert_closes(&mut w, late);
+}
+
+#[test]
+fn a_peer_already_direct_disarms_the_relay_budget() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let a = w.a.clone();
+    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
+    hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
+    let token = promote_token(&drain_actions(&mut w.agent));
+    w.agent
+        .promote_result(token, Err(PromoteError::PeerAlreadyDirect), at(20));
+    drain_all_events(&mut w.agent);
+
+    // The relay's budget has nothing left to bound: no relay timeout, no
+    // failure for a peer that is already direct.
+    w.agent.handle_tick(at(12_000));
+    assert!(drain_all_events(&mut w.agent).is_empty());
+}
+
+#[test]
 fn circuit_closing_before_it_establishes_moves_to_the_next_relay() {
     let mut w = two_relays();
     let target = w.target.clone();
@@ -474,7 +655,7 @@ fn relay_addresses_are_tried_until_the_relay_is_reached() {
 }
 
 #[test]
-fn a_relays_addresses_split_its_share_not_the_next_relays() {
+fn a_relays_addresses_split_its_budget_not_the_next_relays() {
     // A's second address is listed after B; it is still tried with A.
     let mut w = relays_with(|a, b| {
         vec![
@@ -487,12 +668,12 @@ fn a_relays_addresses_split_its_share_not_the_next_relays() {
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     drain_actions(&mut w.agent);
 
-    // A never answers on either address; together they use A's half of the
-    // 12 s leg, and B still gets the other half.
-    w.agent.handle_tick(at(3_000));
-    w.agent.handle_tick(at(5_999));
-    assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.b), 0);
+    // A never answers on either address; together they use A's 12 s, and
+    // B then gets its own.
     w.agent.handle_tick(at(6_000));
+    w.agent.handle_tick(at(11_999));
+    assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.b), 0);
+    w.agent.handle_tick(at(12_000));
     assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.b), 1);
     assert!(
         drain_events(&mut w.agent).is_empty(),
@@ -514,13 +695,13 @@ fn late_failure_of_a_relays_first_address_dials_its_next() {
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let quic_dial = dial_for(&drain_actions(&mut w.agent), &w.a);
 
-    // The QUIC address's part (half of A's 6 s share) elapses with the dial
+    // The QUIC address's part (half of A's 12 s) elapses with the dial
     // still in flight; the TCP entry waits on it rather than dialing A a
     // second time.
-    w.agent.handle_tick(at(3_000));
+    w.agent.handle_tick(at(6_000));
     assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.a), 0);
 
-    dial_failed(&mut w, quic_dial, "QUIC gave up", 3_100);
+    dial_failed(&mut w, quic_dial, "QUIC gave up", 6_100);
     assert!(
         drain_actions(&mut w.agent)
             .iter()
@@ -530,5 +711,28 @@ fn late_failure_of_a_relays_first_address_dials_its_next() {
     assert!(
         drain_events(&mut w.agent).is_empty(),
         "the leg is still live"
+    );
+}
+
+#[test]
+fn a_relay_refused_at_once_never_reports_started() {
+    let mut w = two_relays();
+    w.agent.swarm.refuse_dials = Some("no transport".into());
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let events = drain_all_events(&mut w.agent);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, NatEvent::RelayStarted { .. })),
+        "{events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, NatEvent::RelayFailed { .. }))
+            .count(),
+        2,
+        "{events:?}"
     );
 }

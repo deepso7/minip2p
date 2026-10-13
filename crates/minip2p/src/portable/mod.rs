@@ -49,7 +49,8 @@ pub use minip2p_mdns::{MdnsConfig, MdnsConfigError, MdnsError, MdnsEvent, MdnsIo
 pub use minip2p_mdns::{SmoltcpMdnsConfig, SmoltcpMdnsIo};
 #[cfg(feature = "_nat-driver")]
 pub use minip2p_nat::{
-    NatConfig, NatError, NatEvent, Path, ReachabilityState, ReservationInfo, ReservationPolicy,
+    NatConfig, NatError, NatEvent, Path, ReachabilityState, RelayStage, ReservationInfo,
+    ReservationPolicy, UpgradeStop,
 };
 #[cfg(feature = "pubsub")]
 pub use minip2p_pubsub::{

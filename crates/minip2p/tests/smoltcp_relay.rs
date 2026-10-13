@@ -398,7 +398,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
         });
         let b_relayed = b_events.iter().any(|event| {
             matches!(event, EndpointEvent::Nat(NatEvent::InboundPathEstablished {
-                peer, path: Path::Relayed { relay }
+                peer, path: Path::Relayed { relay }, ..
             }) if peer == &a_peer && relay == &relay_peer)
         });
         let a_settled = connect_id.is_some_and(|id| {

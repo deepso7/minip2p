@@ -2741,7 +2741,7 @@ inner: {connectId: bigint; peerId: string; connId: bigint; path: PathKind }): Pa
     type InboundPathEstablished__interface = {
         tag: P2pEvent_Tags.InboundPathEstablished;
         inner:
-Readonly<{peerId: string; path: PathKind}>
+Readonly<{peerId: string; path: PathKind; connId: bigint}>
     };
     /**
      * An inbound relay circuit became a usable path.
@@ -2754,15 +2754,15 @@ Readonly<{peerId: string; path: PathKind}>
         readonly [uniffiTypeNameSymbol] = "P2pEvent";
         readonly tag = P2pEvent_Tags.InboundPathEstablished;
         readonly inner:
-Readonly<{peerId: string; path: PathKind}>;
+Readonly<{peerId: string; path: PathKind; connId: bigint}>;
         constructor(
-inner: {peerId: string; path: PathKind }) {
+inner: {peerId: string; path: PathKind; connId: bigint }) {
             super("P2pEvent", "InboundPathEstablished");
 
             this.inner = Object.freeze(inner);
         }
         static new(
-inner: {peerId: string; path: PathKind }): InboundPathEstablished_ {
+inner: {peerId: string; path: PathKind; connId: bigint }): InboundPathEstablished_ {
             return new InboundPathEstablished_(inner);
         }
 
@@ -2775,7 +2775,7 @@ inner: {peerId: string; path: PathKind }): InboundPathEstablished_ {
     type PathUpgraded__interface = {
         tag: P2pEvent_Tags.PathUpgraded;
         inner:
-Readonly<{connectId: bigint; peerId: string; from: PathKind; to: PathKind}>
+Readonly<{connectId: bigint; peerId: string; from: PathKind; to: PathKind; oldConnId: bigint; newConnId: bigint}>
     };
     /**
      * A better path replaced an earlier path.
@@ -2788,15 +2788,15 @@ Readonly<{connectId: bigint; peerId: string; from: PathKind; to: PathKind}>
         readonly [uniffiTypeNameSymbol] = "P2pEvent";
         readonly tag = P2pEvent_Tags.PathUpgraded;
         readonly inner:
-Readonly<{connectId: bigint; peerId: string; from: PathKind; to: PathKind}>;
+Readonly<{connectId: bigint; peerId: string; from: PathKind; to: PathKind; oldConnId: bigint; newConnId: bigint}>;
         constructor(
-inner: {connectId: bigint; peerId: string; from: PathKind; to: PathKind }) {
+inner: {connectId: bigint; peerId: string; from: PathKind; to: PathKind; oldConnId: bigint; newConnId: bigint }) {
             super("P2pEvent", "PathUpgraded");
 
             this.inner = Object.freeze(inner);
         }
         static new(
-inner: {connectId: bigint; peerId: string; from: PathKind; to: PathKind }): PathUpgraded_ {
+inner: {connectId: bigint; peerId: string; from: PathKind; to: PathKind; oldConnId: bigint; newConnId: bigint }): PathUpgraded_ {
             return new PathUpgraded_(inner);
         }
 
@@ -2812,7 +2812,8 @@ inner: {connectId: bigint; peerId: string; from: PathKind; to: PathKind }): Path
 Readonly<{connectId: bigint; attempt: number; reason: string}>
     };
     /**
-     * One hole-punch window failed.
+     * One DCUtR hole-punch round failed; the relay holder may start the
+     * next one.
      */
     class HolePunchFailed_ extends UniffiEnum implements HolePunchFailed__interface {
         /**
@@ -2912,7 +2913,7 @@ inner: {connectId: bigint; peerId: string }): ConnectCancelled_ {
     type InboundDirectUpgrade__interface = {
         tag: P2pEvent_Tags.InboundDirectUpgrade;
         inner:
-Readonly<{peerId: string}>
+Readonly<{peerId: string; oldConnId: bigint; newConnId: bigint}>
     };
     /**
      * An inbound circuit upgraded to a direct connection.
@@ -2925,15 +2926,15 @@ Readonly<{peerId: string}>
         readonly [uniffiTypeNameSymbol] = "P2pEvent";
         readonly tag = P2pEvent_Tags.InboundDirectUpgrade;
         readonly inner:
-Readonly<{peerId: string}>;
+Readonly<{peerId: string; oldConnId: bigint; newConnId: bigint}>;
         constructor(
-inner: {peerId: string }) {
+inner: {peerId: string; oldConnId: bigint; newConnId: bigint }) {
             super("P2pEvent", "InboundDirectUpgrade");
 
             this.inner = Object.freeze(inner);
         }
         static new(
-inner: {peerId: string }): InboundDirectUpgrade_ {
+inner: {peerId: string; oldConnId: bigint; newConnId: bigint }): InboundDirectUpgrade_ {
             return new InboundDirectUpgrade_(inner);
         }
 
@@ -3367,12 +3368,12 @@ const FfiConverterTypeP2pEvent = (() => {
                 case 19: return new P2pEvent.RelayReserved({relayPeerId: FfiConverterString.readFromCursor(c), expiresUnixSecs: FfiConverterOptionalUInt64.readFromCursor(c) });
                 case 20: return new P2pEvent.RelayReservationLost({relayPeerId: FfiConverterString.readFromCursor(c) });
                 case 21: return new P2pEvent.PathEstablished({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), path: FfiConverterTypePathKind.readFromCursor(c) });
-                case 22: return new P2pEvent.InboundPathEstablished({peerId: FfiConverterString.readFromCursor(c), path: FfiConverterTypePathKind.readFromCursor(c) });
-                case 23: return new P2pEvent.PathUpgraded({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), from: FfiConverterTypePathKind.readFromCursor(c), to: FfiConverterTypePathKind.readFromCursor(c) });
+                case 22: return new P2pEvent.InboundPathEstablished({peerId: FfiConverterString.readFromCursor(c), path: FfiConverterTypePathKind.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
+                case 23: return new P2pEvent.PathUpgraded({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), from: FfiConverterTypePathKind.readFromCursor(c), to: FfiConverterTypePathKind.readFromCursor(c), oldConnId: FfiConverterUInt64.readFromCursor(c), newConnId: FfiConverterUInt64.readFromCursor(c) });
                 case 24: return new P2pEvent.HolePunchFailed({connectId: FfiConverterUInt64.readFromCursor(c), attempt: FfiConverterUInt32.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
                 case 25: return new P2pEvent.ConnectFailed({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), kind: FfiConverterTypeNatErrorKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
                 case 26: return new P2pEvent.ConnectCancelled({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c) });
-                case 27: return new P2pEvent.InboundDirectUpgrade({peerId: FfiConverterString.readFromCursor(c) });
+                case 27: return new P2pEvent.InboundDirectUpgrade({peerId: FfiConverterString.readFromCursor(c), oldConnId: FfiConverterUInt64.readFromCursor(c), newConnId: FfiConverterUInt64.readFromCursor(c) });
                 case 28: return new P2pEvent.Message({fromPeerId: FfiConverterString.readFromCursor(c), topics: FfiConverterSequenceString.readFromCursor(c), data: FfiConverterArrayBuffer.readFromCursor(c), seqno: FfiConverterArrayBuffer.readFromCursor(c), signed: FfiConverterBool.readFromCursor(c) });
                 case 29: return new P2pEvent.PeerSubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
                 case 30: return new P2pEvent.PeerUnsubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
@@ -3556,6 +3557,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterTypePathKind.writeIntoCursor(inner.path, c);
+                    FfiConverterUInt64.writeIntoCursor(inner.connId, c);
                     return;
                 }
                 case P2pEvent_Tags.PathUpgraded: {
@@ -3565,6 +3567,8 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterTypePathKind.writeIntoCursor(inner.from, c);
                     FfiConverterTypePathKind.writeIntoCursor(inner.to, c);
+                    FfiConverterUInt64.writeIntoCursor(inner.oldConnId, c);
+                    FfiConverterUInt64.writeIntoCursor(inner.newConnId, c);
                     return;
                 }
                 case P2pEvent_Tags.HolePunchFailed: {
@@ -3595,6 +3599,8 @@ const FfiConverterTypeP2pEvent = (() => {
                     c.writeI32(27);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
+                    FfiConverterUInt64.writeIntoCursor(inner.oldConnId, c);
+                    FfiConverterUInt64.writeIntoCursor(inner.newConnId, c);
                     return;
                 }
                 case P2pEvent_Tags.Message: {
@@ -3848,6 +3854,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     let size = 4;
                     size += FfiConverterString.allocationSize(inner.peerId);
                     size += FfiConverterTypePathKind.allocationSize(inner.path);
+                    size += FfiConverterUInt64.allocationSize(inner.connId);
                     return size;
                 }
                 case P2pEvent_Tags.PathUpgraded: {
@@ -3857,6 +3864,8 @@ const FfiConverterTypeP2pEvent = (() => {
                     size += FfiConverterString.allocationSize(inner.peerId);
                     size += FfiConverterTypePathKind.allocationSize(inner.from);
                     size += FfiConverterTypePathKind.allocationSize(inner.to);
+                    size += FfiConverterUInt64.allocationSize(inner.oldConnId);
+                    size += FfiConverterUInt64.allocationSize(inner.newConnId);
                     return size;
                 }
                 case P2pEvent_Tags.HolePunchFailed: {
@@ -3887,6 +3896,8 @@ const FfiConverterTypeP2pEvent = (() => {
                     const inner = value.inner;
                     let size = 4;
                     size += FfiConverterString.allocationSize(inner.peerId);
+                    size += FfiConverterUInt64.allocationSize(inner.oldConnId);
+                    size += FfiConverterUInt64.allocationSize(inner.newConnId);
                     return size;
                 }
                 case P2pEvent_Tags.Message: {

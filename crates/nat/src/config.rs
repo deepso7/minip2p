@@ -2,6 +2,11 @@ use alloc::vec::Vec;
 
 use minip2p_core::PeerAddr;
 
+/// The most DCUtR rounds the reservation holder runs per relayed session:
+/// each a fresh CONNECT/SYNC exchange with its own RTT and punch window. The
+/// circuit dialer settles on its Relayed path once this many have failed.
+pub const MAX_DCUTR_ROUNDS: u32 = 3;
+
 /// When the agent should hold a relay reservation for inbound reachability.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReservationPolicy {
@@ -45,20 +50,26 @@ pub struct NatConfig {
     pub circuit_handshake_timeout_ms: u64,
     /// Use relayed circuits without racing direct dials or attempting DCUtR.
     pub force_relay: bool,
-    /// Deadline for the relay leg to reach `Bridged` (measured from when the
-    /// leg starts, i.e. after the stagger), or the caller's
-    /// [`ConnectLegs::deadline_ms`](crate::ConnectLegs::deadline_ms) if that
-    /// comes first. Shared by the relays the leg
-    /// tries: each gets an even share of the time left when it starts
-    /// (`remaining / relays left`), so a relay that fails fast leaves its
-    /// time to the rest and one slow relay cannot use up the whole leg.
-    pub relay_leg_deadline_ms: u64,
-    /// One hole-punch window: how long to wait for the direct connection
-    /// after dialing the remote's observed addresses.
+    /// Budget for one relay, from its first dial to its circuit carrying a
+    /// usable Relayed path, clipped by the caller's
+    /// [`ConnectLegs::deadline_ms`](crate::ConnectLegs::deadline_ms). A
+    /// relay that fails earlier hands over to the next one at once; a relay
+    /// listed under several addresses splits its budget across them. Also
+    /// the flight budget of reservation and STOP exchanges.
+    pub relay_timeout_ms: u64,
+    /// One hole-punch window: how long each side keeps punching after a
+    /// DCUtR round's SYNC.
     pub punch_deadline_ms: u64,
-    /// Extra punch windows after the first one fails (re-dialing the same
-    /// observed addresses each time).
-    pub punch_max_retries: u32,
+    /// How long the circuit dialer waits for the remote to start DCUtR,
+    /// counted from the Relayed path becoming usable. Past it the attempt
+    /// settles on the Relayed path with
+    /// [`UpgradeStop::StartTimeout`](crate::UpgradeStop::StartTimeout).
+    pub dcutr_start_timeout_ms: u64,
+    /// Budget for one DCUtR CONNECT/SYNC exchange, on either side.
+    pub dcutr_exchange_timeout_ms: u64,
+    /// Budget for the whole direct upgrade (every DCUtR round and punch
+    /// window), counted from the Relayed path becoming usable.
+    pub upgrade_timeout_ms: u64,
     /// Cadence of responder-side random-UDP blasts during a punch.
     pub blast_interval_ms: u64,
     /// Payload length of each random-UDP blast packet.
@@ -109,9 +120,11 @@ impl Default for NatConfig {
             relay_stagger_ms: 200,
             circuit_handshake_timeout_ms: 20_000,
             force_relay: false,
-            relay_leg_deadline_ms: 12_000,
+            relay_timeout_ms: 12_000,
             punch_deadline_ms: 3_000,
-            punch_max_retries: 2,
+            dcutr_start_timeout_ms: 10_000,
+            dcutr_exchange_timeout_ms: 10_000,
+            upgrade_timeout_ms: 20_000,
             blast_interval_ms: 100,
             blast_payload_len: 32,
             confidence_threshold: 3,

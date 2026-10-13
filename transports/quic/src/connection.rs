@@ -28,6 +28,53 @@ const TOKEN_LABEL: &[u8] = b"minip2p quic connection token";
 /// previous one's events and endpoint events produced.
 const MAX_SERVICE_PASSES: usize = 4;
 
+/// Most queued bytes one stream hands the engine per turn of the send
+/// scheduler, so backlogged streams share the peer's connection credit.
+const SEND_QUANTUM: usize = 64 * 1024;
+
+/// The send caps of ADR 0012, from [`crate::QuicLimits`]: how much each stream
+/// and the whole connection may queue beyond what the engine accepted, and
+/// the part of the connection cap only control streams may fill.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SendCaps {
+    stream: usize,
+    connection: usize,
+    control_reserve: usize,
+}
+
+impl SendCaps {
+    /// The caps of validated limits: the reserve is below the connection cap.
+    pub(crate) fn new(limits: &crate::QuicLimits) -> Self {
+        Self {
+            stream: limits.max_pending_bytes_per_stream,
+            connection: limits.max_pending_connection_bytes,
+            control_reserve: limits.control_stream_reserve_bytes,
+        }
+    }
+
+    /// The connection cap a stream may fill: all of it for a control
+    /// stream, all but the reserve otherwise.
+    fn connection_for(&self, control: bool) -> usize {
+        if control {
+            self.connection
+        } else {
+            self.connection.saturating_sub(self.control_reserve)
+        }
+    }
+
+    /// Room a Full stream needs on both caps before its Writable fires:
+    /// half the smaller one it may fill. A control stream may be left only
+    /// the reserve once application streams fill their share, so a non-zero
+    /// reserve bounds its threshold too.
+    fn writable_threshold(&self, control: bool) -> usize {
+        let mut smallest = self.stream.min(self.connection_for(control));
+        if control && self.control_reserve != 0 {
+            smallest = smallest.min(self.control_reserve);
+        }
+        (smallest / 2).max(1)
+    }
+}
+
 /// What servicing a connection needs from its transport.
 pub(crate) struct Cx<'a> {
     pub(crate) endpoint: &'a mut quinn_proto::Endpoint,
@@ -85,11 +132,11 @@ impl PendingStreamWrite {
 }
 
 /// Queued writes for one stream, never empty while stored.
-type SendQueue = VecDeque<PendingStreamWrite>;
-
-/// Unsent bytes held by a dropped queue.
-fn unsent_bytes(queue: SendQueue) -> usize {
-    queue.into_iter().map(|write| write.bytes.len()).sum()
+#[derive(Debug, Default)]
+struct SendQueue {
+    writes: VecDeque<PendingStreamWrite>,
+    /// Unsent bytes across `writes`: what counts against the stream cap.
+    pending: usize,
 }
 
 /// Per-stream bookkeeping for half-close tracking.
@@ -108,6 +155,9 @@ struct StreamRuntimeState {
     /// the stream's close until they are acknowledged: the stream holds its
     /// slot until it settles.
     unacked: usize,
+    /// A control stream may queue into the connection cap's reserve
+    /// ([`Transport::set_control_stream`](minip2p_transport::Transport::set_control_stream)).
+    control: bool,
 }
 
 impl StreamRuntimeState {
@@ -158,9 +208,9 @@ pub(crate) struct QuicConnection {
     /// Outbound write queues keyed by raw QUIC stream id. Only streams with
     /// pending output have an entry, so a drain visits nothing else.
     send_queues: HashMap<u64, SendQueue>,
-    /// Scratch copy of the `send_queues` keys for `drain_send_queues`. Kept
-    /// so its capacity is reused.
-    drain_stream_ids: Vec<u64>,
+    /// The keys of `send_queues` in round-robin order: the front stream has
+    /// the next turn, and the order persists between drains.
+    send_order: VecDeque<u64>,
     /// Next local bidirectional stream id `open_stream` hands out.
     next_local_bidi_stream_id: u64,
     /// Streams handed out but not yet opened in the engine, in id order.
@@ -172,10 +222,12 @@ pub(crate) struct QuicConnection {
     /// Stream limit per direction: it caps local opens, and the peer's open
     /// and unsettled streams.
     max_streams: u64,
-    /// Total application bytes queued but not yet accepted by the engine.
+    /// Total application bytes queued but not yet accepted by the engine:
+    /// always the sum of every queue's `pending`, so subtracting a queue's
+    /// share cannot underflow.
     pending_write_bytes: usize,
-    /// Maximum queued application bytes for this connection.
-    max_pending_write_bytes: usize,
+    /// How much may queue per stream and per connection.
+    caps: SendCaps,
     /// Streams whose last write was Full and that want a `StreamWritable`.
     writable_armed: BTreeSet<u64>,
     /// Streams that spent their receive budget with input still waiting in
@@ -207,7 +259,7 @@ impl QuicConnection {
         conn: quinn_proto::Connection,
         endpoint: ConnectionEndpoint,
         max_streams: u64,
-        max_pending_write_bytes: usize,
+        caps: SendCaps,
         counters: ConnectionCounters,
     ) -> Self {
         let next_local_bidi_stream_id = u64::from(conn.side().is_server());
@@ -219,13 +271,13 @@ impl QuicConnection {
             state: ConnectionState::Connecting,
             stream_states: HashMap::new(),
             send_queues: HashMap::new(),
-            drain_stream_ids: Vec::new(),
+            send_order: VecDeque::new(),
             next_local_bidi_stream_id,
             pending_opens: VecDeque::new(),
             bound_local_bidi_streams: 0,
             max_streams,
             pending_write_bytes: 0,
-            max_pending_write_bytes,
+            caps,
             writable_armed: BTreeSet::new(),
             gated: BTreeSet::new(),
             read_chunks: Vec::new(),
@@ -410,9 +462,9 @@ impl QuicConnection {
             Event::ConnectionLost { reason } => self.on_lost(&reason, cx.events),
             Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => self.accept_streams(cx.events),
             Event::Stream(StreamEvent::Readable { id }) => self.scan(u64::from(id), cx.events),
-            Event::Stream(StreamEvent::Writable { id }) => {
-                self.drain_stream(u64::from(id), now, cx.events);
-            }
+            // New credit: the scheduler that runs after these events hands
+            // it out in turn, rather than to the stream it names.
+            Event::Stream(StreamEvent::Writable { .. }) => {}
             Event::Stream(StreamEvent::Stopped { id, error_code }) => {
                 self.on_stopped(u64::from(id), error_code, cx.events);
             }
@@ -719,11 +771,12 @@ impl QuicConnection {
     }
 
     /// Accepts as much of `data` as the engine takes now plus what fits the
-    /// connection's queue, whatever the peer's credit (ADR 0012).
+    /// stream's and the connection's queues, whatever the peer's credit
+    /// (ADR 0012).
     ///
     /// Returns [`TransportError::Full`] with the exact unsent suffix when the
-    /// queue cannot hold the rest, and arms a `StreamWritable` that fires
-    /// once at least half the queue is free again.
+    /// queues cannot hold the rest, and arms a `StreamWritable` that fires
+    /// once the stream can queue half the smaller cap again.
     pub(crate) fn send_stream(
         &mut self,
         stream_id: StreamId,
@@ -735,7 +788,8 @@ impl QuicConnection {
         }
         let raw = stream_id.as_u64();
         let closing = self.is_closing();
-        if closing || self.stream_state_mut(stream_id)?.local_write_closed {
+        let state = self.stream_state_mut(stream_id)?;
+        if closing || state.local_write_closed {
             return Err(TransportError::StreamSendFailed {
                 id: self.id,
                 stream_id,
@@ -746,10 +800,12 @@ impl QuicConnection {
                 },
             });
         }
+        let control = state.control;
 
-        // Earlier bytes still queued go first, so the direct write below
-        // cannot reorder the stream; a stream not opened yet queues it all.
-        let direct = if self.send_queues.contains_key(&raw) || self.is_unbound(raw) {
+        // While any stream has bytes queued, this write takes its turn in the
+        // scheduler behind them, which also keeps the stream's own bytes in
+        // order; a stream not opened yet queues it all.
+        let direct = if !self.send_queues.is_empty() || self.is_unbound(raw) {
             0
         } else {
             // `write` copies only what the engine accepts: handing it a slice
@@ -775,20 +831,16 @@ impl QuicConnection {
             }
         };
 
-        let room = self
-            .max_pending_write_bytes
-            .saturating_sub(self.pending_write_bytes);
-        let queued = (data.len() - direct).min(room);
+        let queued = (data.len() - direct).min(self.send_room(raw, control));
         let accepted = direct + queued;
         if queued != 0 {
             self.pending_write_bytes += queued;
-            self.send_queues
-                .entry(raw)
-                .or_default()
-                .push_back(PendingStreamWrite::data(
-                    data.slice(direct..accepted),
-                    data.len(),
-                ));
+            let queue = self.queue_mut(raw);
+            queue.pending += queued;
+            queue.writes.push_back(PendingStreamWrite::data(
+                data.slice(direct..accepted),
+                data.len(),
+            ));
         }
         if accepted < data.len() {
             self.writable_armed.insert(raw);
@@ -799,6 +851,42 @@ impl QuicConnection {
             });
         }
         Ok(())
+    }
+
+    /// Bytes stream `raw` may still queue: the smaller of what is left of
+    /// its own cap and of the connection cap it may fill.
+    fn send_room(&self, raw: u64, control: bool) -> usize {
+        let stream_pending = self.send_queues.get(&raw).map_or(0, |queue| queue.pending);
+        let stream_room = self.caps.stream.saturating_sub(stream_pending);
+        let connection_room = self
+            .caps
+            .connection_for(control)
+            .saturating_sub(self.pending_write_bytes);
+        stream_room.min(connection_room)
+    }
+
+    /// The stream's queue, created at the back of the round-robin order.
+    fn queue_mut(&mut self, raw: u64) -> &mut SendQueue {
+        let order = &mut self.send_order;
+        self.send_queues.entry(raw).or_insert_with(|| {
+            order.push_back(raw);
+            SendQueue::default()
+        })
+    }
+
+    /// Marks a stream as a control stream, which may queue into the
+    /// connection cap's reserve, or back as an application stream.
+    pub(crate) fn set_control_stream(
+        &mut self,
+        stream_id: StreamId,
+        control: bool,
+        events: &mut Vec<TransportEvent>,
+    ) {
+        if let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) {
+            state.control = control;
+            // A control stream may have room an application one lacked.
+            self.wake_writable(events);
+        }
     }
 
     /// Queues the stream's FIN behind its queued writes.
@@ -813,9 +901,8 @@ impl QuicConnection {
         }
         state.local_write_closed = true;
         self.writable_armed.remove(&stream_id.as_u64());
-        self.send_queues
-            .entry(stream_id.as_u64())
-            .or_default()
+        self.queue_mut(stream_id.as_u64())
+            .writes
             .push_back(PendingStreamWrite::fin());
         Ok(())
     }
@@ -921,39 +1008,56 @@ impl QuicConnection {
     /// Writable fires.
     fn end_writes(&mut self) {
         self.send_queues.clear();
+        self.send_order.clear();
         self.pending_write_bytes = 0;
         self.writable_armed.clear();
     }
 
-    /// Pushes queued writes into the engine.
+    /// Pushes queued writes into the engine, round-robin: each stream in turn
+    /// hands it up to [`SEND_QUANTUM`] bytes, and rounds repeat while any
+    /// stream makes progress. The pass ends once every stream in a row has
+    /// made none, so the next pass starts with the stream after the last one
+    /// that did: scarce connection credit goes to each stream in turn.
     fn drain_send_queues(&mut self, now: Instant, events: &mut Vec<TransportEvent>) {
-        self.drain_stream_ids.clear();
-        self.drain_stream_ids
-            .extend(self.send_queues.keys().copied());
-        while let Some(raw) = self.drain_stream_ids.pop() {
-            self.drain_stream(raw, now, events);
+        let mut idle = 0;
+        while idle < self.send_order.len() {
+            let Some(raw) = self.send_order.pop_front() else {
+                break;
+            };
+            let progressed = self.drain_stream(raw, now, events);
+            if self.send_queues.contains_key(&raw) {
+                self.send_order.push_back(raw);
+            }
+            idle = if progressed { 0 } else { idle + 1 };
         }
         self.wake_writable(events);
     }
 
-    /// Pushes one stream's queued writes into the engine, handling partial
-    /// writes.
+    /// Gives one stream its turn: pushes up to [`SEND_QUANTUM`] queued bytes
+    /// into the engine, then any FIN they reach. Returns whether anything
+    /// went in. The caller has taken the stream out of the round-robin order
+    /// and puts it back if its queue remains.
     ///
     /// Never fails the caller: a stopped stream loses only its own queue, a
     /// write still waiting on peer credit stays queued, and any other engine
     /// error closes only this connection.
-    fn drain_stream(&mut self, raw: u64, now: Instant, events: &mut Vec<TransportEvent>) {
+    fn drain_stream(&mut self, raw: u64, now: Instant, events: &mut Vec<TransportEvent>) -> bool {
         if self.is_unbound(raw) {
-            return;
+            return false;
         }
         let stream = engine_stream(raw);
-        while let Some(front) = self.send_queues.get_mut(&raw).and_then(VecDeque::front_mut) {
+        let mut budget = SEND_QUANTUM;
+        let mut progressed = false;
+        while let Some(queue) = self.send_queues.get_mut(&raw) {
+            let Some(front) = queue.writes.front_mut() else {
+                break;
+            };
             if front.fin {
                 match self.conn.send_stream(stream).finish() {
                     Ok(()) => {}
                     Err(FinishError::Stopped(error_code)) => {
                         self.on_stopped(raw, error_code, events);
-                        return;
+                        return progressed;
                     }
                     Err(FinishError::ClosedStream) => {
                         self.fail_connection(
@@ -961,26 +1065,39 @@ impl QuicConnection {
                             format!("finish failed on {}: closed stream", StreamId::new(raw)),
                             events,
                         );
-                        return;
+                        return progressed;
                     }
                 }
             } else {
+                // At most this turn's budget; the whole write when it fits.
+                let offer = front.bytes.get(..budget).unwrap_or(&front.bytes);
+                let len = offer.len();
+                if len == 0 {
+                    return progressed;
+                }
                 // Copies the accepted prefix, as in `send_stream`.
-                match self.conn.send_stream(stream).write(&front.bytes) {
-                    Ok(0) => return,
+                match self.conn.send_stream(stream).write(offer) {
+                    Ok(0) => return progressed,
                     Ok(written) => {
                         front.advance(written);
-                        self.pending_write_bytes = self.pending_write_bytes.saturating_sub(written);
+                        queue.pending -= written;
+                        self.pending_write_bytes -= written;
+                        budget -= written;
+                        progressed = true;
                         if !front.bytes.is_empty() {
-                            return;
+                            // Out of credit, or out of this turn's budget.
+                            if written < len {
+                                return progressed;
+                            }
+                            continue;
                         }
                     }
                     // Out of flow-control credit or send window: the peer's
-                    // next MAX_* frame raises `Writable`.
-                    Err(WriteError::Blocked) => return,
+                    // next MAX_* frame raises `Writable`, and a drain follows.
+                    Err(WriteError::Blocked) => return progressed,
                     Err(WriteError::Stopped(error_code)) => {
                         self.on_stopped(raw, error_code, events);
-                        return;
+                        return progressed;
                     }
                     Err(WriteError::ClosedStream) => {
                         self.fail_connection(
@@ -988,24 +1105,27 @@ impl QuicConnection {
                             format!("write failed on {}: closed stream", StreamId::new(raw)),
                             events,
                         );
-                        return;
+                        return progressed;
                     }
                 }
             }
+            progressed = true;
             if let Some(queue) = self.send_queues.get_mut(&raw) {
-                queue.pop_front();
-                if queue.is_empty() {
+                queue.writes.pop_front();
+                if queue.writes.is_empty() {
                     self.send_queues.remove(&raw);
                 }
             }
             self.note_stream_closed_if_finished(raw, events);
         }
+        progressed
     }
 
     /// Drops a stream's queued writes and their byte accounting.
     fn drop_send_queue(&mut self, raw: u64) {
         if let Some(queue) = self.send_queues.remove(&raw) {
-            self.pending_write_bytes = self.pending_write_bytes.saturating_sub(unsent_bytes(queue));
+            self.pending_write_bytes -= queue.pending;
+            self.send_order.retain(|&queued| queued != raw);
         }
     }
 
@@ -1017,31 +1137,32 @@ impl QuicConnection {
         events.retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
     }
 
-    /// Emits `StreamWritable` for every armed stream once at least half of
-    /// the connection's queue is free. The queue is shared, so freeing it
-    /// wakes every stream it blocked.
+    /// Emits `StreamWritable` for every armed stream that can again queue
+    /// half the smaller of its stream cap and the connection cap it may fill
+    /// ([`SendCaps::writable_threshold`]). The connection cap is shared, so
+    /// freeing it wakes every stream it blocked.
     fn wake_writable(&mut self, events: &mut Vec<TransportEvent>) {
         if self.writable_armed.is_empty() || self.is_closing() {
             return;
         }
-        let room = self
-            .max_pending_write_bytes
-            .saturating_sub(self.pending_write_bytes);
-        if room < self.max_pending_write_bytes.div_ceil(2) {
-            return;
-        }
         for raw in mem::take(&mut self.writable_armed) {
             // A write side that ended since never gets a Writable.
-            if self
+            let Some(state) = self
                 .stream_states
                 .get(&raw)
-                .is_some_and(|state| !state.local_write_closed)
-            {
-                events.push(TransportEvent::StreamWritable {
-                    id: self.id,
-                    stream_id: StreamId::new(raw),
-                });
+                .filter(|state| !state.local_write_closed)
+            else {
+                continue;
+            };
+            let control = state.control;
+            if self.send_room(raw, control) < self.caps.writable_threshold(control) {
+                self.writable_armed.insert(raw);
+                continue;
             }
+            events.push(TransportEvent::StreamWritable {
+                id: self.id,
+                stream_id: StreamId::new(raw),
+            });
         }
     }
 

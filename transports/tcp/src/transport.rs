@@ -889,6 +889,14 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         self.operate_session(id, |session| session.ack_stream(stream_id, bytes))
     }
 
+    fn set_control_stream(&mut self, id: ConnectionId, stream_id: StreamId, control: bool) {
+        // Nothing returns to the caller, so a session the mark's flush fails
+        // is torn down with an `Error` carrying the reason.
+        if self.connections.contains_key(&id) {
+            self.drive_connection(id, |session| session.set_control_stream(stream_id, control));
+        }
+    }
+
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
         let mut connection = self
             .connections

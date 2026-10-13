@@ -158,6 +158,7 @@ fn relayed_chat_and_reservation_loss() {
             P2pEvent::InboundPathEstablished {
                 peer_id,
                 path: PathKind::Relayed { relay_peer_id },
+                ..
             } if peer_id == &a_peer && relay_peer_id == &relay_peer
         )
     });
