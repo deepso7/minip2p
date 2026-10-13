@@ -376,9 +376,8 @@ impl Shared {
 
 /// Writes NAT control bytes on an exact stream. Every agent entry point that
 /// writes wraps the host's swarm in a [`HoldingSwarm`], so a write refused as
-/// Full is held
-/// and resent on the stream's Writable; any other refusal is left to the
-/// exchange's own deadline.
+/// Full is held and resent on the stream's Writable; any other refusal is
+/// left to the exchange's own deadline.
 pub(crate) fn send(
     swarm: &mut dyn NatSwarm,
     peer: &PeerId,
