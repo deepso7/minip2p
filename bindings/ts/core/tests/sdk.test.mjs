@@ -221,6 +221,7 @@ test("inbound relayed path events preserve relay provenance", async () => {
 
   backend.emit({
     inner: {
+      connId: 4,
       path: {
         inner: { relayPeerId: "relay" },
         tag: PathKind_Tags.Relayed,
@@ -233,6 +234,7 @@ test("inbound relayed path events preserve relay provenance", async () => {
 
   assert.deepEqual(events, [
     {
+      connId: 4,
       path: { kind: "relayed", relayPeerId: "relay" },
       peerId: "peer",
     },

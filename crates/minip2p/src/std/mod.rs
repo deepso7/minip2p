@@ -3541,6 +3541,7 @@ mod tests {
         nat.push_event(NatEvent::FellBackToRelay {
             connect_id: ConnectId::from_u64(99),
             peer: peer.clone(),
+            reason: minip2p_nat::UpgradeStop::PunchFailed { rounds: 3 },
         });
         nat.push_event(NatEvent::ReachabilityChanged {
             old: ReachabilityState::Unknown,

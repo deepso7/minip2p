@@ -59,19 +59,56 @@ pub struct ReservationInfo {
     pub renew_at_mono_ms: u64,
 }
 
+/// The relay-leg step a [`NatError::Timeout`] stalled in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RelayStage {
+    /// Dialing the relay, or waiting for its connection to finish Identify.
+    RelayDial,
+    /// Negotiating the HOP protocol on the relay connection.
+    HopNegotiation,
+    /// Waiting for the relay's answer to HOP CONNECT.
+    HopStatus,
+    /// The bridged circuit's Noise and Yamux handshake.
+    CircuitHandshake,
+}
+
+impl core::fmt::Display for RelayStage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            RelayStage::RelayDial => "relay dial",
+            RelayStage::HopNegotiation => "HOP negotiation",
+            RelayStage::HopStatus => "HOP status",
+            RelayStage::CircuitHandshake => "circuit handshake",
+        })
+    }
+}
+
 /// Terminal errors for a connect attempt, carried by
-/// [`NatEvent::ConnectFailed`](crate::NatEvent::ConnectFailed).
+/// [`NatEvent::ConnectFailed`](crate::NatEvent::ConnectFailed), and the
+/// per-relay errors carried by
+/// [`NatEvent::RelayFailed`](crate::NatEvent::RelayFailed).
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum NatError {
     /// No dialable direct candidates and no relay configured.
     #[error("no dialable candidates and no relay configured")]
     NoPathAvailable,
-    /// The relay leg's deadline
-    /// ([`NatConfig::relay_leg_deadline_ms`](crate::NatConfig::relay_leg_deadline_ms))
-    /// elapsed while the last relay tried was still working on the circuit.
-    /// The overall connect deadline belongs to the Connection-attempt engine.
-    #[error("relay leg deadline elapsed before a relay bridged the circuit")]
-    Timeout,
+    /// A relay ran out its budget
+    /// ([`NatConfig::relay_timeout_ms`](crate::NatConfig::relay_timeout_ms),
+    /// clipped by the attempt's deadline) before its circuit carried a
+    /// path. The overall connect deadline belongs to the Connection-attempt
+    /// engine.
+    #[error("{stage} timed out after {elapsed_ms} ms (budget {budget_ms} ms){}", relay_suffix(.relay))]
+    Timeout {
+        /// The step that stalled.
+        stage: RelayStage,
+        /// The relay being tried.
+        relay: Option<PeerId>,
+        /// Time spent on this relay when it gave up.
+        elapsed_ms: u64,
+        /// The relay's budget.
+        budget_ms: u64,
+    },
     /// A dial was rejected or a connection was lost.
     #[error("dial failed: {0}")]
     DialFailed(alloc::string::String),
@@ -81,6 +118,43 @@ pub enum NatError {
     /// The relay refused the circuit.
     #[error("relay refused: {0}")]
     RelayRefused(alloc::string::String),
+}
+
+fn relay_suffix(relay: &Option<PeerId>) -> alloc::string::String {
+    match relay {
+        Some(relay) => alloc::format!(" at relay {relay}"),
+        None => alloc::string::String::new(),
+    }
+}
+
+/// Why a relayed attempt settled on its Relayed path without a direct
+/// upgrade, carried by
+/// [`NatEvent::FellBackToRelay`](crate::NatEvent::FellBackToRelay). The
+/// budgets are in [`NatConfig`](crate::NatConfig), each clipped to the
+/// attempt's deadline; `budget_ms` is the clipped value.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum UpgradeStop {
+    /// The remote never started DCUtR within
+    /// [`NatConfig::dcutr_start_timeout_ms`](crate::NatConfig::dcutr_start_timeout_ms)
+    /// of the Relayed path becoming usable.
+    #[error("the remote did not start DCUtR within {budget_ms} ms")]
+    StartTimeout { budget_ms: u64 },
+    /// A DCUtR exchange did not reach SYNC within
+    /// [`NatConfig::dcutr_exchange_timeout_ms`](crate::NatConfig::dcutr_exchange_timeout_ms).
+    #[error("DCUtR round {round} did not finish within {budget_ms} ms")]
+    ExchangeTimeout { round: u32, budget_ms: u64 },
+    /// The whole upgrade ran past
+    /// [`NatConfig::upgrade_timeout_ms`](crate::NatConfig::upgrade_timeout_ms).
+    #[error("the direct upgrade did not finish within {budget_ms} ms")]
+    UpgradeTimeout { budget_ms: u64 },
+    /// Every DCUtR round ended without a direct connection.
+    #[error("{rounds} hole-punch rounds failed")]
+    PunchFailed { rounds: u32 },
+    /// The upgrade could not continue, for example because another
+    /// attempt's circuit took over the peer's connection.
+    #[error("upgrade aborted: {reason}")]
+    Aborted { reason: alloc::string::String },
 }
 
 /// Failure reported by the driver while promoting a relay bridge.

@@ -290,7 +290,7 @@ pub fn print_nat_event(role: &str, event: &NatEvent) {
                 path_name(path)
             );
         }
-        NatEvent::InboundPathEstablished { peer, path } => {
+        NatEvent::InboundPathEstablished { peer, path, .. } => {
             println!(
                 "[{role}] nat-inbound-path-established peer={peer} path={}",
                 path_name(path)
@@ -314,7 +314,7 @@ pub fn print_nat_event(role: &str, event: &NatEvent) {
         NatEvent::ConnectFailed { peer, error, .. } => {
             println!("[{role}] nat-connect-failed peer={peer} error={error}");
         }
-        NatEvent::InboundDirectUpgrade { peer } => {
+        NatEvent::InboundDirectUpgrade { peer, .. } => {
             println!("[{role}] nat-inbound-direct-upgrade peer={peer}");
         }
         other => println!("[{role}] nat-event {other:?}"),

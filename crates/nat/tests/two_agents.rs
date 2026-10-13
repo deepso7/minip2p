@@ -621,6 +621,7 @@ fn two_agents_punch_to_a_direct_connection() {
             [NatEvent::InboundPathEstablished {
                 peer,
                 path: Path::Relayed { relay },
+                ..
             }] if peer == &world.a_id && relay == &world.relay_id
         ),
         "B records the inbound relayed path, got {events:?}"
@@ -651,6 +652,7 @@ fn two_agents_punch_to_a_direct_connection() {
                 peer,
                 from: Path::Relayed { relay },
                 to: Path::DirectPunched,
+                ..
             }]
                 if *connect_id == id && peer == &world.b_id && relay == &world.relay_id
         ),
@@ -658,7 +660,7 @@ fn two_agents_punch_to_a_direct_connection() {
     );
     let events = drain_events(&mut world.b);
     assert!(
-        matches!(events.as_slice(), [NatEvent::InboundDirectUpgrade { peer }] if *peer == world.a_id),
+        matches!(events.as_slice(), [NatEvent::InboundDirectUpgrade { peer, .. }] if *peer == world.a_id),
         "B reports the inbound upgrade, got {events:?}"
     );
 }

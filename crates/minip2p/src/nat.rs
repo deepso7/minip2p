@@ -36,6 +36,17 @@ fn nat_event_reaches_application(event: &NatEvent) -> bool {
     )
 }
 
+/// Events that speak for a still-pending attempt's outcome. Once the
+/// Connection engine settled the attempt, they are stale and dropped.
+fn is_attempt_outcome(event: &NatEvent) -> bool {
+    matches!(
+        event,
+        NatEvent::ConnectFailed { .. }
+            | NatEvent::FellBackToRelay { .. }
+            | NatEvent::HolePunchFailed { .. }
+    )
+}
+
 /// Most bytes the NAT host holds for one stream before resetting it.
 const MAX_HELD_PER_STREAM: usize = 64 * 1024;
 
@@ -342,12 +353,17 @@ impl<T: Transport> NatDriver<T> {
         } = event
             && self.io.stream_conns.get(peer_id, *stream_id) == Some(*conn_id)
         {
-            EndpointSwarm::new(swarm, &mut self.io).replay_held(
+            let drained = EndpointSwarm::new(swarm, &mut self.io).replay_held(
                 peer_id,
                 *conn_id,
                 *stream_id,
                 now.monotonic_ms,
             );
+            if drained {
+                // DCUtR times its RTT from here, not from when the bytes
+                // were queued.
+                self.agent.write_completed(*conn_id, *stream_id, now);
+            }
             self.pump(swarm, now);
             return true;
         }
@@ -466,6 +482,13 @@ impl<T: Transport> NatDriver<T> {
         owned: impl Fn(&NatEvent) -> bool,
     ) {
         while let Some(event) = self.unrouted.pop_front() {
+            // An attempt outcome produced in the same turn the engine
+            // settled the attempt, before the agent learned of it.
+            if is_attempt_outcome(&event)
+                && event.connect_id().is_some_and(|id| !connect.is_pending(id))
+            {
+                continue;
+            }
             connect.observe_nat(&event, swarm, now_ms);
             if !owned(&event) && nat_event_reaches_application(&event) {
                 self.staged.push_back(event);
@@ -535,10 +558,12 @@ impl<T: Transport> NatDriver<T> {
         }
     }
 
-    /// Cancels the attempt's NAT leg when `event` is a failed or cancelled
-    /// Connection-attempt terminal. Connected and unrelated events are a
-    /// no-op: a settled provisional path is the leg to keep.
-    pub(crate) fn cancel_leg_on_terminal<R: EntropySource>(
+    /// Tells the agent a Connection-attempt terminal settled `event`'s
+    /// attempt, so it drops what it still holds for it and emits no further
+    /// attempt event. A Connected terminal keeps its connection open, even
+    /// a relayed circuit the leg promoted; a failed or cancelled one closes
+    /// the leg's circuit. Other events are a no-op.
+    pub(crate) fn settle_leg_on_terminal<R: EntropySource>(
         &mut self,
         event: &EndpointEvent,
         swarm: &mut SwarmCore<T, R>,
@@ -546,13 +571,18 @@ impl<T: Transport> NatDriver<T> {
     ) {
         let EndpointEvent::ConnectSettled {
             connect_id,
-            outcome: crate::ConnectOutcome::Failed(_) | crate::ConnectOutcome::Cancelled,
+            outcome,
             ..
         } = event
         else {
             return;
         };
-        self.cancel(*connect_id, swarm, sample);
+        let kept = match outcome {
+            crate::ConnectOutcome::Connected { conn_id } => Some(*conn_id),
+            crate::ConnectOutcome::Failed(_) | crate::ConnectOutcome::Cancelled => None,
+        };
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        self.agent.settled(&mut io, *connect_id, kept, sample);
         self.pump(swarm, sample);
     }
 
@@ -938,28 +968,33 @@ impl<'a, T: Transport, R: EntropySource> EndpointSwarm<'a, T, R> {
     }
 
     /// Resends a writable stream's held tails, then its deferred close.
+    /// `true` when bytes were held and the stream took all of them; a
+    /// rejected resend is not a completed write.
     fn replay_held(
         &mut self,
         peer: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
         now_ms: u64,
-    ) {
+    ) -> bool {
         let Some(held) = self.io.held.take(conn_id, stream_id) else {
-            return;
+            return false;
         };
+        let had_bytes = !held.tails.is_empty();
         // Failures surface through the agent's own timeouts and the swarm's
         // events, as for the first write.
+        let mut all_sent = true;
         for data in held.tails {
-            match self.send_or_hold(peer, conn_id, stream_id, data, now_ms) {
-                Ok(()) | Err(_) => {}
-            }
+            all_sent &= self
+                .send_or_hold(peer, conn_id, stream_id, data, now_ms)
+                .is_ok();
         }
         if held.close {
             match self.close_or_hold(peer, conn_id, stream_id, now_ms) {
                 Ok(()) | Err(_) => {}
             }
         }
+        had_bytes && all_sent && self.io.held.held_bytes(conn_id, stream_id) == 0
     }
 }
 
@@ -1024,6 +1059,10 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
         now_ms: u64,
     ) -> Result<(), NatSwarmError> {
         Ok(self.swarm.reset_stream(peer, conn_id, stream_id, now_ms)?)
+    }
+
+    fn write_pending(&self, conn_id: ConnectionId, stream_id: StreamId) -> bool {
+        self.io.held.held_bytes(conn_id, stream_id) > 0
     }
 
     fn ping(&mut self, peer: &PeerId, now_ms: u64) -> Result<(), NatSwarmError> {

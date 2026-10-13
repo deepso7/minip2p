@@ -11,27 +11,37 @@ Parallel racing with convergence — not sequential fallback:
 ```text
 t0      caller races direct candidates (ConnectEngine)
 t0+δ    relay leg (stagger δ when direct_racing, else now):
-          for each eligible relay, within its share of the leg deadline:
+          for each eligible relay (RelayStarted), within its own budget:
             ensure relay session → HOP CONNECT(target)
-            relay fails (unreachable, refused, share elapsed) ⇒ next relay
+            relay fails (unreachable, refused, budget spent)
+              ⇒ RelayFailed, next relay
           → Bridged ⇒ promote bridge through Noise + Yamux
           → circuit Connected ⇒ PathEstablished(Relayed)  (provisional)
-          → reserved peer opens /libp2p/dcutr on the Relayed path
+          → reserved peer runs up to 3 DCUtR rounds on the Relayed path
 inbound STOP circuit Connected ⇒ InboundPathEstablished(Relayed)
 a better path later  ⇒ PathUpgraded { from, to }  (+ the circuit closes)
-punch exhausted      ⇒ FellBackToRelay            (engine settles Connected)
+rounds exhausted or
+  an upgrade budget spent ⇒ FellBackToRelay { reason } (engine settles Connected)
 relay leg dead       ⇒ ConnectFailed { error }    (engine decides the attempt)
 ```
 
 Ranking: `DirectDialed` ≈ `DirectPunched` > `Relayed`.
 
-HOP CONNECT only works at a relay where the _target_ holds a reservation, so the relay leg tries the configured relays one at a time. Relays that `ConnectLegs::target_addrs` name in a circuit address (`.../p2p/<relay>/p2p-circuit`) go first, the rest follow in `NatConfig::relays` order; relays that are not configured are never used. A relay listed under several addresses is tried at the next address when the previous one could not reach it; once it is reached, its other addresses are skipped. A bridge that fails to promote, or a circuit that closes before it carries a path, counts as that relay failing. Each relay gets `remaining / relays left` of `relay_leg_deadline_ms`, split across its addresses, so a relay that fails fast leaves its time to the rest and one stalled relay cannot use up the leg. The leg fails only after every relay has failed, with the last relay's error (`NatError::Timeout` when the last one ran out the leg deadline).
+HOP CONNECT only works at a relay where the _target_ holds a reservation, so the relay leg tries the configured relays one at a time. Relays that `ConnectLegs::target_addrs` name in a circuit address (`.../p2p/<relay>/p2p-circuit`) go first, the rest follow in `NatConfig::relays` order; relays that are not configured are never used. A relay listed under several addresses is tried at the next address when the previous one could not reach it; once it is reached, its other addresses are skipped. A bridge that fails to promote, or a circuit that closes before it carries a path, counts as that relay failing. Each relay gets `relay_timeout_ms` (12 s), clipped by the attempt's deadline and split across its addresses, from its first dial to its circuit carrying a path; a relay that fails earlier hands over to the next one at once. `RelayStarted` names each relay as the leg starts it and `RelayFailed` reports each failure, so the Endpoint keeps one diagnostic per relay. The leg fails only after every relay has failed, with the last relay's error. A relay that runs out its budget fails with `NatError::Timeout`, naming the `RelayStage` that stalled (relay dial, HOP negotiation, HOP status, circuit handshake), the relay, the time spent, and the budget. The relay server's own 60 s HOP/STOP timeout is a cleanup ceiling, not a promise that clients wait that long.
+
+## Direct upgrade
+
+The reservation holder drives DCUtR (ADR 0017). It runs up to `MAX_DCUTR_ROUNDS` (3) rounds per relayed session, each on a fresh stream with a fresh CONNECT/SYNC exchange, its own RTT and a `punch_deadline_ms` window on both sides; the circuit dialer answers each round and dials the holder's addresses, dropping the previous round's unfinished dials first. The holder times RTT from when CONNECT is fully written: a host that holds write tails behind a full stream reports `NatSwarm::write_pending` and calls `NatAgent::write_completed` once the tail drains.
+
+Every wait is bounded, each budget clipped to the attempt's deadline and counted on the circuit dialer from the Relayed path becoming usable: `dcutr_start_timeout_ms` (10 s) for the holder to start DCUtR, `dcutr_exchange_timeout_ms` (10 s) per exchange, and `upgrade_timeout_ms` (20 s) for the whole upgrade. When one runs out, or every round failed, the Relayed path stays and the attempt ends with `FellBackToRelay { reason }`, a typed `UpgradeStop`. Each failed round reports `HolePunchFailed`. Nothing re-runs DCUtR on a live Relayed path later.
+
+Once the host's Connection-attempt engine settles an attempt (Connected, failed, or cancelled), the host calls `NatAgent::settled(swarm, id, kept, now)`: the agent drops what it still holds for the attempt (punch dials, the DCUtR exchange, timers) without closing `kept`, and emits no further attempt event for it.
 
 ## Relayed paths are normal connections
 
 `Path::Relayed { relay }` is metadata describing how the peer was reached. The bridge itself is promoted through end-to-end Noise XX and Yamux before `PathEstablished` (outbound) or `InboundPathEstablished` (inbound) is emitted. Identify, ping, pubsub, and application protocols can therefore use the ordinary swarm stream APIs without knowing whether the selected connection is direct or relayed.
 
-Set `NatConfig::force_relay` to skip direct candidates and DCUtR entirely. This is useful for deterministic relay-only deployments and tests. Stalled outbound promotions are bounded by `relay_leg_deadline_ms`; inbound promotions are bounded by `circuit_handshake_timeout_ms`. The Connection-attempt engine owns the overall 30 s deadline.
+Set `NatConfig::force_relay` to skip direct candidates and DCUtR entirely. This is useful for deterministic relay-only deployments and tests. Stalled outbound promotions are bounded by `relay_timeout_ms`; inbound promotions are bounded by `circuit_handshake_timeout_ms`. The Connection-attempt engine owns the overall 30 s deadline.
 
 ## Driving the agent
 
@@ -132,7 +142,7 @@ Independent of connect attempts, the agent also runs:
 
 ## Responder side
 
-A NAT'd listener holding a reservation handles inbound circuits automatically: the relay's STOP CONNECT is auto-accepted and the bridge is promoted into a normal circuit connection. The agent announces that Relayed path, opens `/libp2p/dcutr`, and sends CONNECT followed by SYNC. It emits `SendRandomUdp` blasts at the original circuit dialer's observed addresses to open its own NAT mapping (first after half the measured relay RTT, then every `blast_interval_ms` until `punch_deadline_ms`). The original circuit dialer makes the QUIC simultaneous-open dial. A landed punch is announced with `InboundDirectUpgrade` and replaces the circuit.
+A NAT'd listener holding a reservation handles inbound circuits automatically: the relay's STOP CONNECT is auto-accepted and the bridge is promoted into a normal circuit connection. The agent announces that Relayed path and runs the DCUtR rounds: each opens `/libp2p/dcutr` and sends CONNECT followed by SYNC, then emits `SendRandomUdp` blasts at the original circuit dialer's observed addresses to open its own NAT mapping (first after half the round's measured relay RTT, then every `blast_interval_ms` until `punch_deadline_ms`). The next round starts when the window passes, or at once when an exchange fails or runs past `dcutr_exchange_timeout_ms`. The original circuit dialer makes the QUIC simultaneous-open dial. A landed punch is announced with `InboundDirectUpgrade { old_conn_id, new_conn_id }` and replaces the circuit.
 
 Punch candidates are bounded both ways: a peer's CONNECT is filtered to globally routable QUIC addresses, and that list and our own advertised one keep at most `MAX_PUNCH_CANDIDATES` (8) addresses, at most 4 per IP family and 2 per IP, skipping port 0 and privileged ports (below 1024).
 

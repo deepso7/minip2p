@@ -453,7 +453,10 @@ function normalizeGenericEvent(
   event: NativeP2pEvent,
   connectionIds: ConnectionIdMap
 ): P2pEvent {
-  const inner = normalizeBigInts(event.inner, connectionIds);
+  const inner = normalizeBigInts(event.inner, {
+    connectionIds,
+    tag: event.tag,
+  });
   if (inner === null || typeof inner !== "object") {
     throw new TypeError("The native endpoint returned an invalid event");
   }
@@ -501,14 +504,20 @@ const CONNECTION_ID_KEYS: ReadonlySet<string> = new Set([
   "newConnId",
 ]);
 
+/** The endpoint's connection map and the native event a value belongs to. */
+interface EventIds {
+  readonly connectionIds: ConnectionIdMap;
+  readonly tag: string;
+}
+
 /**
- * Converts native `bigint` fields to numbers. Connection ID fields go through
- * the endpoint's connection map when one is supplied; every other `u64` keeps
- * the checked conversion.
+ * Converts native `bigint` fields to numbers. Connection ID fields of an
+ * event go through the endpoint's connection map; every other `u64` keeps the
+ * checked conversion.
  */
 function normalizeBigInts(
   value: unknown,
-  connectionIds?: ConnectionIdMap,
+  event?: EventIds,
   key?: string
 ): unknown {
   if (typeof value === "bigint") {
@@ -516,23 +525,22 @@ function normalizeBigInts(
     if (key === "errorCode") {
       return value;
     }
-    return key !== undefined &&
-      CONNECTION_ID_KEYS.has(key) &&
-      connectionIds !== undefined
-      ? connectionIds.toPublic(value)
-      : u64ToNumber(value, "native u64");
+    if (key === undefined || !CONNECTION_ID_KEYS.has(key) || !event) {
+      return u64ToNumber(value, "native u64");
+    }
+    return event.connectionIds.toPublicInEvent(event.tag, key, value);
   }
   if (value instanceof ArrayBuffer) {
     return value;
   }
   if (Array.isArray(value)) {
-    return value.map((item) => normalizeBigInts(item, connectionIds));
+    return value.map((item) => normalizeBigInts(item, event));
   }
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value).map(([itemKey, item]) => [
         itemKey,
-        normalizeBigInts(item, connectionIds, itemKey),
+        normalizeBigInts(item, event, itemKey),
       ])
     );
   }

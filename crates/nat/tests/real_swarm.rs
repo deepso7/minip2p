@@ -29,6 +29,16 @@ const RELAY_NOW: ConnectLegs = ConnectLegs {
     deadline_ms: None,
 };
 
+/// The next event that is not per-relay progress (`RelayStarted`/`RelayFailed`).
+fn next_outcome(agent: &mut NatAgent) -> Option<NatEvent> {
+    core::iter::from_fn(|| agent.poll_event()).find(|event| {
+        !matches!(
+            event,
+            NatEvent::RelayStarted { .. } | NatEvent::RelayFailed { .. }
+        )
+    })
+}
+
 fn maddr(s: &str) -> Multiaddr {
     s.parse().expect("valid multiaddr")
 }
@@ -118,7 +128,7 @@ fn the_bare_swarm_rejects_a_named_relay_dial() {
 
     assert!(swarm.transport().dials.is_empty());
     assert!(matches!(
-        agent.poll_event(),
+        next_outcome(&mut agent),
         Some(NatEvent::ConnectFailed {
             connect_id,
             error: NatError::DialFailed(reason),
@@ -146,7 +156,7 @@ fn a_reservation_and_a_connect_share_one_relay_dial() {
         1,
         "the attempt waits on the reservation's in-flight relay dial"
     );
-    assert!(agent.poll_event().is_none());
+    assert!(next_outcome(&mut agent).is_none());
 }
 
 #[test]
@@ -231,5 +241,5 @@ fn a_command_between_buffered_deliveries_keeps_the_swarm_order() {
     }
     assert_eq!(hop_streams, 1, "exactly one HOP stream was opened");
     assert!(relay_hop_data > 0, "the relay received HOP CONNECT");
-    assert!(agent.poll_event().is_none());
+    assert!(next_outcome(&mut agent).is_none());
 }
