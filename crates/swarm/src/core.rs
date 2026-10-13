@@ -61,6 +61,37 @@ pub enum DriverError {
     Entropy,
 }
 
+impl DriverError {
+    /// Whether the same operation can succeed later: a `Full` write, whose
+    /// stream announces room with a Writable event. The unsent bytes are the
+    /// caller's to resend; a `?` on a Full send drops them.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Full { .. }
+                | Self::Swarm(SwarmError::Full { .. })
+                | Self::Transport(TransportError::Full { .. })
+        )
+    }
+
+    /// Whether the stream or its connection no longer exists (it ended, the
+    /// connection closed or was replaced, or the ids never named one), so no
+    /// later operation on it can succeed. A write side that is closing or
+    /// closed is not "gone": the stream may still be read. Neither is a
+    /// stream still negotiating ([`SwarmError::StreamNotReady`]), which
+    /// becomes usable at its `StreamReady`.
+    pub fn is_stream_gone(&self) -> bool {
+        matches!(
+            self,
+            Self::Swarm(SwarmError::StreamNotFound { .. } | SwarmError::NotConnected { .. })
+                | Self::Transport(
+                    TransportError::StreamNotFound { .. }
+                        | TransportError::ConnectionNotFound { .. }
+                )
+        )
+    }
+}
+
 /// The swarm: connection and protocol orchestration over a concrete
 /// [`Transport`].
 ///
@@ -257,6 +288,12 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// and replaced connections never appear.
     pub fn established_connections(&self) -> impl Iterator<Item = (ConnectionId, &PeerId)> {
         self.state.established_connections()
+    }
+
+    /// Returns the peer whose established connection `conn_id` is: `None`
+    /// once it was replaced or closed, and for a pending dial or handshake.
+    pub fn connection_peer(&self, conn_id: ConnectionId) -> Option<&PeerId> {
+        self.state.connection_peer(conn_id)
     }
 
     /// Returns whether a transport connection is still tracked, including
@@ -911,6 +948,13 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
                     ));
                 }
             }
+            Action::SetControlStream {
+                conn_id,
+                stream_id,
+                control,
+            } => self
+                .transport
+                .set_control_stream(conn_id, stream_id, control),
             Action::CloseConnection { conn_id } => match self.transport.close(conn_id) {
                 Ok(()) | Err(TransportError::ConnectionNotFound { .. }) => {}
                 Err(e) => self.state.record_runtime_error(transport_error(
@@ -951,6 +995,48 @@ mod tests {
     use minip2p_ping::PING_PROTOCOL_ID;
     use minip2p_platform::EntropyError;
     use minip2p_transport::{ConnectionEndpoint, TransportEvent};
+
+    #[test]
+    fn error_predicates_separate_retryable_gone_and_closed() {
+        let (conn_id, stream_id) = (ConnectionId::new(1), StreamId::new(2));
+        let peer_id = PeerId::from_public_key_protobuf(b"predicate-peer");
+        let unsent = Bytes::from_static(b"tail");
+        let full = DriverError::Full {
+            conn_id,
+            stream_id,
+            unsent: unsent.clone(),
+        };
+        let swarm_full = DriverError::from(SwarmError::Full {
+            conn_id,
+            stream_id,
+            unsent,
+        });
+        let gone = [
+            DriverError::from(SwarmError::StreamNotFound {
+                peer_id: peer_id.clone(),
+                conn_id,
+                stream_id,
+            }),
+            DriverError::from(SwarmError::NotConnected { peer_id }),
+            DriverError::from(TransportError::ConnectionNotFound { id: conn_id }),
+            DriverError::from(TransportError::StreamNotFound {
+                id: conn_id,
+                stream_id,
+            }),
+        ];
+        let write_closed = DriverError::from(SwarmError::WriteClosed { conn_id, stream_id });
+        let not_ready = DriverError::from(SwarmError::StreamNotReady { conn_id, stream_id });
+
+        for error in [&full, &swarm_full] {
+            assert!(error.is_retryable() && !error.is_stream_gone(), "{error}");
+        }
+        for error in &gone {
+            assert!(error.is_stream_gone() && !error.is_retryable(), "{error}");
+        }
+        for error in [&write_closed, &not_ready] {
+            assert!(!error.is_retryable() && !error.is_stream_gone(), "{error}");
+        }
+    }
 
     /// Counter-based entropy: no OS, no `getrandom`, fully deterministic.
     struct SeqEntropy(u8);

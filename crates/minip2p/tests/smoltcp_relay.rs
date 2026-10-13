@@ -229,7 +229,7 @@ impl RelayService {
                 self.b_stop = Some((conn_id, stream_id));
                 let request = self.emulator.drain_stop_bytes_for(&self.b);
                 endpoint
-                    .send_stream(&self.b, conn_id, stream_id, request, now)
+                    .send_stream(conn_id, stream_id, request, now)
                     .unwrap();
             }
             EndpointEvent::StreamData {
@@ -241,7 +241,7 @@ impl RelayService {
                 self.emulator.on_reserve_request(&self.b, &data).unwrap();
                 let response = self.emulator.drain_hop_bytes_for(&self.b);
                 endpoint
-                    .send_stream(&self.b, conn_id, stream_id, response, now)
+                    .send_stream(conn_id, stream_id, response, now)
                     .unwrap();
             }
             EndpointEvent::StreamData {
@@ -291,14 +291,10 @@ impl RelayService {
                     .unwrap();
                 self.bridged = true;
                 let (conn, stream) = self.a_bridge.unwrap();
-                endpoint
-                    .send_stream(&self.a, conn, stream, response, now)
-                    .unwrap();
+                endpoint.send_stream(conn, stream, response, now).unwrap();
                 if !trailing.is_empty() {
                     let (conn, stream) = self.a_bridge.unwrap();
-                    endpoint
-                        .send_stream(&self.a, conn, stream, trailing, now)
-                        .unwrap();
+                    endpoint.send_stream(conn, stream, trailing, now).unwrap();
                 }
             }
             EndpointEvent::StreamData {
@@ -311,9 +307,7 @@ impl RelayService {
                 && Some((conn_id, stream_id)) == self.a_bridge =>
             {
                 let (conn, stream) = self.b_stop.unwrap();
-                endpoint
-                    .send_stream(&self.b, conn, stream, data, now)
-                    .unwrap();
+                endpoint.send_stream(conn, stream, data, now).unwrap();
             }
             EndpointEvent::StreamData {
                 peer_id,
@@ -322,9 +316,7 @@ impl RelayService {
                 data,
             } if self.bridged && peer_id == self.b && Some((conn_id, stream_id)) == self.b_stop => {
                 let (conn, stream) = self.a_bridge.unwrap();
-                endpoint
-                    .send_stream(&self.a, conn, stream, data, now)
-                    .unwrap();
+                endpoint.send_stream(conn, stream, data, now).unwrap();
             }
             EndpointEvent::StreamClosed {
                 peer_id,
@@ -406,7 +398,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
         });
         let b_relayed = b_events.iter().any(|event| {
             matches!(event, EndpointEvent::Nat(NatEvent::InboundPathEstablished {
-                peer, path: Path::Relayed { relay }
+                peer, path: Path::Relayed { relay }, ..
             }) if peer == &a_peer && relay == &relay_peer)
         });
         let a_settled = connect_id.is_some_and(|id| {
@@ -429,8 +421,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
                 } if peer_id == &b_peer && *conn_id == conn && *stream_id == stream)
             })
         {
-            a.send_stream(&b_peer, conn, stream, PAYLOAD.to_vec(), now)
-                .unwrap();
+            a.send_stream(conn, stream, PAYLOAD.to_vec(), now).unwrap();
             sent = true;
         }
         // B's current connection to A: stream ids are only unique per

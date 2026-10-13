@@ -6,7 +6,7 @@
 use minip2p_core::{Multiaddr, Protocol};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_ping::PING_PROTOCOL_ID;
-use minip2p_quic::{QuicNodeConfig, QuicTransport};
+use minip2p_quic::{QuicLimits, QuicNodeConfig, QuicTransport};
 use minip2p_swarm::{DriverError, Swarm, SwarmBuilder, SwarmError, SwarmErrorKind, SwarmEvent};
 use minip2p_transport::{Bytes, StreamId, Transport};
 
@@ -516,5 +516,103 @@ fn rapid_ping_calls_do_not_open_duplicate_streams() {
     assert!(
         !saw_register_error,
         "rapid ping() calls must not emit ping-register errors"
+    );
+}
+
+/// Application streams stuck on peer credit fill everything but the control
+/// reserve of the client's send queue, and a ping still completes: the swarm
+/// marks its ping stream as a control stream (ADR 0012, #327 finding 16).
+#[test]
+fn ping_completes_while_stuck_application_streams_fill_the_send_queue() {
+    let mut server = make_swarm(Ed25519Keypair::generate());
+    server
+        .core_mut()
+        .add_protocol(USER_PROTOCOL_ID)
+        .expect("register protocol");
+    let peer_addr = server
+        .core_mut()
+        .listen_on_bound_addr()
+        .expect("server listen");
+    let server_peer_id = peer_addr.peer_id().clone();
+
+    // Two stuck streams fill the application share; the reserve is left.
+    let keypair = Ed25519Keypair::generate();
+    let limits = QuicLimits {
+        max_pending_bytes_per_stream: 64 * 1024,
+        max_pending_connection_bytes: 192 * 1024,
+        control_stream_reserve_bytes: 64 * 1024,
+        ..QuicLimits::default()
+    };
+    let transport = QuicTransport::bind(
+        QuicNodeConfig::new(keypair.clone()).with_limits(limits),
+        &[loopback()],
+    )
+    .expect("bind");
+    let mut client = SwarmBuilder::new(&keypair)
+        .agent_version("minip2p-test/0.1.0")
+        .build(transport)
+        .expect("build swarm");
+    client
+        .core_mut()
+        .add_protocol(USER_PROTOCOL_ID)
+        .expect("register protocol");
+    client.core_mut().dial(&peer_addr).expect("dial");
+
+    // The server never acknowledges what it reads, so these streams stall
+    // once the peer's stream window is spent.
+    let chunk = Bytes::from(vec![7u8; 256 * 1024]);
+    let mut ready = Vec::new();
+    // Rounds in a row in which no stream accepted a byte: the peer's credit
+    // is spent and the queue holds all it may.
+    let mut stalled_rounds = 0;
+    let mut ping_issued = false;
+    let mut rtt_measured = false;
+    for _ in 0..2_000 {
+        let (_server_events, client_events) = drive_pair(&mut server, &mut client);
+        for event in client_events {
+            match event {
+                SwarmEvent::PeerReady { ref peer_id, .. } if *peer_id == server_peer_id => {
+                    for _ in 0..3 {
+                        client
+                            .open_stream(&server_peer_id, USER_PROTOCOL_ID)
+                            .expect("open user stream");
+                    }
+                }
+                SwarmEvent::StreamReady {
+                    conn_id, stream_id, ..
+                } => ready.push((conn_id, stream_id)),
+                SwarmEvent::PingRttMeasured { ref peer_id, .. } if *peer_id == server_peer_id => {
+                    rtt_measured = true;
+                }
+                _ => {}
+            }
+        }
+        let mut accepted = 0;
+        for &(conn_id, stream_id) in &ready {
+            accepted += match client.send_stream(&server_peer_id, conn_id, stream_id, chunk.clone())
+            {
+                Ok(()) => chunk.len(),
+                Err(DriverError::Full { unsent, .. }) => chunk.len() - unsent.len(),
+                Err(error) => panic!("send failed: {error}"),
+            };
+        }
+        stalled_rounds = if ready.len() == 3 && accepted == 0 {
+            stalled_rounds + 1
+        } else {
+            0
+        };
+        if stalled_rounds >= 20 && !ping_issued {
+            client.ping(&server_peer_id).expect("ping");
+            ping_issued = true;
+        }
+        if rtt_measured {
+            break;
+        }
+    }
+
+    assert!(ping_issued, "application streams never filled the queue");
+    assert!(
+        rtt_measured,
+        "ping must complete through the control reserve"
     );
 }

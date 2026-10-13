@@ -282,6 +282,15 @@ pub enum SwarmError {
         /// Stream id supplied by the caller.
         stream_id: StreamId,
     },
+    /// The stream is still negotiating: its id came from `open_stream`, and
+    /// only `abandon_stream` takes it before [`SwarmEvent::StreamReady`].
+    /// Neither gone nor retryable on a Writable: wait for its `StreamReady`
+    /// (or the error that ends the open).
+    #[error("user stream {stream_id} on connection {conn_id} is still negotiating")]
+    StreamNotReady {
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    },
     /// The ping state machine rejected the request (e.g. a ping is already
     /// in flight on the target peer).
     #[error("ping error: {reason}")]

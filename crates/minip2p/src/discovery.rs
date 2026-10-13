@@ -528,7 +528,7 @@ mod tests {
                 outcome: ConnectOutcome::Failed(crate::ConnectFailure::Timeout {
                     elapsed_ms: 30_000,
                     candidates: Vec::new(),
-                    relay: None,
+                    relays: Vec::new(),
                 }),
             },
             100,

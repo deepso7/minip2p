@@ -76,6 +76,8 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Unsent tail**: The suffix of a payload a Full write did not accept, handed back to the caller. It is the whole payload when nothing fit. _Avoid_: rejected payload, remainder
 
+**Control stream**: A stream the swarm uses for its own protocols: every stream while multistream negotiates it, and ping and Identify streams after. It may write into a reserve of the connection's send cap that application streams cannot fill, so they cannot starve it. The swarm marks it; transports never inspect protocols. _Avoid_: priority stream, system stream
+
 **Writable**: The one-shot notice that a stream which reported Full can again accept at least half of its smallest send limit. A Full arms it; it fires once, and never if the stream's write side ends first. _Avoid_: ready, drain event
 
 **Stream writer**: The opt-in holder of an application's unsent tails: one pending write per stream, retried on Writable, with a write-side close that waits for it. Its completion means the whole payload was accepted, never delivered. The Rust Endpoint and the FFI core share one. _Avoid_: buffered stream, write queue

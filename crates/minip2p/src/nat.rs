@@ -35,6 +35,17 @@ fn nat_event_reaches_application(event: &NatEvent) -> bool {
     )
 }
 
+/// Events that speak for a still-pending attempt's outcome. Once the
+/// Connection engine settled the attempt, they are stale and dropped.
+fn is_attempt_outcome(event: &NatEvent) -> bool {
+    matches!(
+        event,
+        NatEvent::ConnectFailed { .. }
+            | NatEvent::FellBackToRelay { .. }
+            | NatEvent::HolePunchFailed { .. }
+    )
+}
+
 /// Joins the bytes a promoted bridge still owes into one payload; a single
 /// chunk is passed through.
 #[cfg(feature = "_circuit-driver")]
@@ -442,6 +453,13 @@ impl<T: Transport> NatDriver<T> {
         owned: impl Fn(&NatEvent) -> bool,
     ) {
         while let Some(event) = self.unrouted.pop_front() {
+            // An attempt outcome produced in the same turn the engine
+            // settled the attempt, before the agent learned of it.
+            if is_attempt_outcome(&event)
+                && event.connect_id().is_some_and(|id| !connect.is_pending(id))
+            {
+                continue;
+            }
             connect.observe_nat(&event, swarm, now_ms);
             if !owned(&event) && nat_event_reaches_application(&event) {
                 self.staged.push_back(event);
@@ -511,10 +529,12 @@ impl<T: Transport> NatDriver<T> {
         }
     }
 
-    /// Cancels the attempt's NAT leg when `event` is a failed or cancelled
-    /// Connection-attempt terminal. Connected and unrelated events are a
-    /// no-op: a settled provisional path is the leg to keep.
-    pub(crate) fn cancel_leg_on_terminal<R: EntropySource>(
+    /// Tells the agent a Connection-attempt terminal settled `event`'s
+    /// attempt, so it drops what it still holds for it and emits no further
+    /// attempt event. A Connected terminal keeps its connection open, even
+    /// a relayed circuit the leg promoted; a failed or cancelled one closes
+    /// the leg's circuit. Other events are a no-op.
+    pub(crate) fn settle_leg_on_terminal<R: EntropySource>(
         &mut self,
         event: &EndpointEvent,
         swarm: &mut SwarmCore<T, R>,
@@ -522,13 +542,18 @@ impl<T: Transport> NatDriver<T> {
     ) {
         let EndpointEvent::ConnectSettled {
             connect_id,
-            outcome: crate::ConnectOutcome::Failed(_) | crate::ConnectOutcome::Cancelled,
+            outcome,
             ..
         } = event
         else {
             return;
         };
-        self.cancel(*connect_id, swarm, sample);
+        let kept = match outcome {
+            crate::ConnectOutcome::Connected { conn_id } => Some(*conn_id),
+            crate::ConnectOutcome::Failed(_) | crate::ConnectOutcome::Cancelled => None,
+        };
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        self.agent.settled(&mut io, *connect_id, kept, sample);
         self.pump(swarm, sample);
     }
 

@@ -19,7 +19,6 @@ const native = vi.hoisted(() => {
 
     readonly config: Readonly<Record<string, unknown>>;
     readonly abandonedStreams: {
-      peerId: string;
       connId: bigint;
       streamId: bigint;
     }[] = [];
@@ -88,8 +87,8 @@ const native = vi.hoisted(() => {
 
     addProtocol(): void {}
 
-    abandonStream(peerId: string, connId: bigint, streamId: bigint): void {
-      this.abandonedStreams.push({ connId, peerId, streamId });
+    abandonStream(connId: bigint, streamId: bigint): void {
+      this.abandonedStreams.push({ connId, streamId });
       if (this.abandonError !== undefined) {
         throw this.abandonError;
       }
@@ -170,12 +169,7 @@ const native = vi.hoisted(() => {
       this.consumed.push({ bytes, connId, streamId });
     }
 
-    sendStream(
-      _peerId: string,
-      connId: bigint,
-      streamId: bigint,
-      data: Uint8Array
-    ): boolean {
+    sendStream(connId: bigint, streamId: bigint, data: Uint8Array): boolean {
       if (this.liveConnId !== undefined && connId !== this.liveConnId) {
         throw new Error(
           `stream ${streamId} on connection ${connId} is not active`

@@ -647,7 +647,7 @@ export class Stream {
     }
     this.#writeEnded = new StreamClosedError("The stream write side closed");
     if (this.#writes.length === 0) {
-      this.#backend.closeStreamWrite(this.peerId, this.connId, this.streamId);
+      this.#backend.closeStreamWrite(this.connId, this.streamId);
       return;
     }
     this.#closeWriteQueued = true;
@@ -662,7 +662,7 @@ export class Stream {
       this.#discardUnread();
       return;
     }
-    this.#backend.resetStream(this.peerId, this.connId, this.streamId);
+    this.#backend.resetStream(this.connId, this.streamId);
     this.terminal();
   }
 
@@ -676,7 +676,7 @@ export class Stream {
       return;
     }
     try {
-      this.#backend.abandonStream(this.peerId, this.connId, this.streamId);
+      this.#backend.abandonStream(this.connId, this.streamId);
     } catch {
       // A native close can overtake its queued terminal event.
     }
@@ -820,11 +820,7 @@ export class Stream {
         if (this.#closeWriteQueued) {
           this.#closeWriteQueued = false;
           try {
-            this.#backend.closeStreamWrite(
-              this.peerId,
-              this.connId,
-              this.streamId
-            );
+            this.#backend.closeStreamWrite(this.connId, this.streamId);
           } catch {
             // A deferred close has no caller left to throw to; the stream
             // already ended, and its terminal event reports that.
@@ -835,7 +831,6 @@ export class Stream {
       let accepted: boolean;
       try {
         accepted = this.#backend.sendStream(
-          this.peerId,
           this.connId,
           this.streamId,
           head.data
@@ -1632,11 +1627,7 @@ export class Minip2pBase {
       clearPendingOpen(pending);
       pending.reject(error);
       try {
-        this.#backend.abandonStream(
-          pending.peerId,
-          pending.connId,
-          pending.streamId
-        );
+        this.#backend.abandonStream(pending.connId, pending.streamId);
       } catch {
         // The operation is already failed; native cleanup is best effort.
       }
@@ -2070,11 +2061,7 @@ export class Minip2pBase {
     clearPendingOpen(pending);
     pending.reject(error);
     try {
-      this.#backend.abandonStream(
-        pending.peerId,
-        pending.connId,
-        pending.streamId
-      );
+      this.#backend.abandonStream(pending.connId, pending.streamId);
     } catch {
       // Cleanup failure must not replace the caller's timeout or abort.
     }

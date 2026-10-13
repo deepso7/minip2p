@@ -88,6 +88,15 @@ pub trait NatSwarm {
         now_ms: u64,
     ) -> Result<(), NatSwarmError>;
 
+    /// Whether bytes the agent wrote on this stream are still held, waiting
+    /// for the stream to become writable again. The agent holds its own
+    /// tails and answers this itself (DCUtR times its RTT from when a held
+    /// CONNECT drains); hosts keep the default.
+    fn write_pending(&self, conn_id: ConnectionId, stream_id: StreamId) -> bool {
+        let _ = (conn_id, stream_id);
+        false
+    }
+
     /// Half-closes a stream's write side. Transport failures arrive later
     /// as swarm events.
     fn close_stream_write(
@@ -218,16 +227,20 @@ impl HoldingSwarm<'_> {
     /// that may have taken a prefix gets the stream reset, so the peer never
     /// reads a truncated message as complete; a stream or connection already
     /// gone needs nothing. The exchange deadlines report the failure.
+    ///
+    /// Returns `true` when bytes were held and the stream took all of them,
+    /// the moment DCUtR times its RTT from.
     pub(crate) fn replay(
         &mut self,
         peer: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
         now_ms: u64,
-    ) {
+    ) -> bool {
         let Some(held) = self.held.take(conn_id, stream_id) else {
-            return;
+            return false;
         };
+        let had_bytes = !held.tails.is_empty();
         for data in held.tails {
             match self.send_stream(peer, conn_id, stream_id, data, now_ms) {
                 Ok(()) => {}
@@ -238,12 +251,12 @@ impl HoldingSwarm<'_> {
                         | TransportError::InvalidState { .. },
                     ))
                     | NatSwarmError::Swarm(DriverError::Swarm(_)),
-                ) => return,
+                ) => return false,
                 Err(_) => {
                     match self.reset_stream(peer, conn_id, stream_id, now_ms) {
                         Ok(()) | Err(_) => {}
                     }
-                    return;
+                    return false;
                 }
             }
         }
@@ -252,6 +265,7 @@ impl HoldingSwarm<'_> {
                 Ok(()) | Err(_) => {}
             }
         }
+        had_bytes && !self.held.is_held(conn_id, stream_id)
     }
 }
 
@@ -334,6 +348,10 @@ impl NatSwarm for HoldingSwarm<'_> {
     ) -> Result<(), NatSwarmError> {
         self.held.forget_stream(conn_id, stream_id);
         self.inner.reset_stream(peer, conn_id, stream_id, now_ms)
+    }
+
+    fn write_pending(&self, conn_id: ConnectionId, stream_id: StreamId) -> bool {
+        self.held.held_bytes(conn_id, stream_id) > 0
     }
 
     fn ping(&mut self, peer: &PeerId, now_ms: u64) -> Result<(), NatSwarmError> {

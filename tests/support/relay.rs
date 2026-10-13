@@ -83,7 +83,7 @@ impl RelayMachine {
                     .connect_bytes
                     .clone();
                 endpoint
-                    .send_stream(&peer_id, conn_id, stream_id, bytes)
+                    .send_stream(conn_id, stream_id, bytes)
                     .map_err(|e| format!("send STOP CONNECT: {e}"))?;
             }
             EndpointEvent::StreamData {
@@ -98,12 +98,10 @@ impl RelayMachine {
                 stream_id,
             } => {
                 let key = (peer_id, conn_id, stream_id);
-                if let Some((other_peer, other_conn, other_stream)) =
-                    self.bridges.get(&key).cloned()
-                {
+                if let Some((_, other_conn, other_stream)) = self.bridges.get(&key).cloned() {
                     // A FIN can race teardown of the other bridge half; that
                     // stale close must not replace the original lifecycle event.
-                    match endpoint.close_stream_write(&other_peer, other_conn, other_stream) {
+                    match endpoint.close_stream_write(other_conn, other_stream) {
                         Ok(()) | Err(_) => {}
                     }
                 }
@@ -142,7 +140,7 @@ impl RelayMachine {
             // connection may already be closing before its `ConnectionClosed`
             // arrives, and the transport rejects writes there. That ends the
             // bridge; any other failure (`Full` included) is a relay fault.
-            match endpoint.send_stream(&other_peer, other_conn, other_stream, data) {
+            match endpoint.send_stream(other_conn, other_stream, data) {
                 Ok(()) => {}
                 Err(error) if other_half_is_gone(&error) => {
                     self.trace
@@ -192,7 +190,7 @@ impl RelayMachine {
                 }
                 let response = self.protocol.drain_hop_bytes_for(&key.0);
                 endpoint
-                    .send_stream(&key.0, key.1, key.2, response)
+                    .send_stream(key.1, key.2, response)
                     .map_err(|e| format!("send RESERVE response: {e}"))?;
             }
             HopMessageType::Connect => {
@@ -207,7 +205,7 @@ impl RelayMachine {
                             return Err("unexpected bytes trailing refused CONNECT".into());
                         }
                         endpoint
-                            .send_stream(&key.0, key.1, key.2, response)
+                            .send_stream(key.1, key.2, response)
                             .map_err(|e| format!("send CONNECT refusal: {e}"))?;
                     }
                     ConnectRequestOutcome::Bridging {
@@ -277,21 +275,16 @@ impl RelayMachine {
             .map_err(|e| format!("handle STOP response: {e}"))?;
 
         endpoint
-            .send_stream(
-                &pending.hop.0,
-                pending.hop.1,
-                pending.hop.2,
-                initiator_response,
-            )
+            .send_stream(pending.hop.1, pending.hop.2, initiator_response)
             .map_err(|e| format!("send HOP success: {e}"))?;
         if !pending.hop_trailing.is_empty() {
             endpoint
-                .send_stream(&key.0, key.1, key.2, pending.hop_trailing)
+                .send_stream(key.1, key.2, pending.hop_trailing)
                 .map_err(|e| format!("forward pipelined initiator bytes: {e}"))?;
         }
         if !stop_trailing.is_empty() {
             endpoint
-                .send_stream(&pending.hop.0, pending.hop.1, pending.hop.2, stop_trailing)
+                .send_stream(pending.hop.1, pending.hop.2, stop_trailing)
                 .map_err(|e| format!("forward pipelined responder bytes: {e}"))?;
         }
         self.bridges.insert(pending.hop.clone(), key.clone());
@@ -323,13 +316,13 @@ impl RelayMachine {
         self.hop_buffers.remove(key);
         if let Some(stop) = self.hop_to_stop.remove(key) {
             self.pending_stops.remove(&stop);
-            match endpoint.reset_stream(&stop.0, stop.1, stop.2) {
+            match endpoint.reset_stream(stop.1, stop.2) {
                 Ok(()) | Err(_) => {}
             }
         }
         if let Some(other) = self.bridges.remove(key) {
             self.bridges.remove(&other);
-            match endpoint.reset_stream(&other.0, other.1, other.2) {
+            match endpoint.reset_stream(other.1, other.2) {
                 Ok(()) | Err(_) => {}
             }
         }

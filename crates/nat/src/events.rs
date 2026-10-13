@@ -1,10 +1,10 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{ConnectId, Multiaddr, PeerId};
-use minip2p_transport::StreamId;
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
+use minip2p_transport::{ConnectionId, StreamId};
 
-use crate::types::{NatError, NatToken, Path, ReachabilityState};
+use crate::types::{NatError, NatToken, Path, ReachabilityState, UpgradeStop};
 
 /// Local role used when promoting a relay bridge into a circuit connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +90,20 @@ pub enum NatEvent {
     /// The reservation lapsed or the relay connection was lost; reacquisition
     /// starts automatically per the configured policy.
     RelayReservationLost { relay: PeerId },
+    /// The relay leg started on `relay`: from here on the attempt's relay
+    /// diagnostics name it.
+    RelayStarted {
+        connect_id: ConnectId,
+        relay: PeerAddr,
+    },
+    /// One address of `relay` failed for this attempt; a relay listed under
+    /// several addresses reports each. The leg moves on to the next relay
+    /// while it has one; otherwise [`NatEvent::ConnectFailed`] follows.
+    RelayFailed {
+        connect_id: ConnectId,
+        relay: PeerAddr,
+        error: NatError,
+    },
     /// A first usable path to the peer is available.
     PathEstablished {
         connect_id: ConnectId,
@@ -97,7 +111,12 @@ pub enum NatEvent {
         path: Path,
     },
     /// An inbound relay circuit became a usable path to the peer.
-    InboundPathEstablished { peer: PeerId, path: Path },
+    InboundPathEstablished {
+        peer: PeerId,
+        path: Path,
+        /// The circuit connection carrying the path.
+        conn_id: ConnectionId,
+    },
     /// A better path replaced the previously announced one. When `from` was
     /// [`Path::Relayed`], its circuit connection is closed automatically.
     PathUpgraded {
@@ -105,19 +124,27 @@ pub enum NatEvent {
         peer: PeerId,
         from: Path,
         to: Path,
+        /// The connection that carried `from`.
+        old_conn_id: ConnectionId,
+        /// The connection carrying `to`.
+        new_conn_id: ConnectionId,
     },
-    /// One hole-punch window elapsed (or the punch aborted) without a direct
-    /// connection. Informational; retries and fallback are automatic.
+    /// One DCUtR round ended without a direct connection: its punch window
+    /// elapsed, or its exchange failed. Informational; the reservation
+    /// holder starts the next round.
     HolePunchFailed {
         connect_id: ConnectId,
-        /// 1-based punch window index.
+        /// 1-based DCUtR round.
         attempt: u32,
         reason: String,
     },
-    /// All punch windows are exhausted (or another attempt's circuit took
-    /// over the peer's connection); the established relayed connection
-    /// remains the final path for this attempt.
-    FellBackToRelay { connect_id: ConnectId, peer: PeerId },
+    /// The attempt settles on its established Relayed path without a direct
+    /// upgrade, for `reason`.
+    FellBackToRelay {
+        connect_id: ConnectId,
+        peer: PeerId,
+        reason: UpgradeStop,
+    },
     /// The attempt ended with no usable path.
     ConnectFailed {
         connect_id: ConnectId,
@@ -127,7 +154,13 @@ pub enum NatEvent {
     /// An inbound relayed path became direct: an inbound circuit's hole
     /// punch succeeded, or a direct connection replaced the circuit later.
     /// The peer is now directly connected.
-    InboundDirectUpgrade { peer: PeerId },
+    InboundDirectUpgrade {
+        peer: PeerId,
+        /// The circuit connection that carried the relayed path.
+        old_conn_id: ConnectionId,
+        /// The direct connection now carrying the peer.
+        new_conn_id: ConnectionId,
+    },
 }
 
 impl NatEvent {
@@ -138,7 +171,9 @@ impl NatEvent {
     /// returning its `connect_id` here stops the compile.
     pub fn connect_id(&self) -> Option<ConnectId> {
         match self {
-            NatEvent::PathEstablished { connect_id, .. }
+            NatEvent::RelayStarted { connect_id, .. }
+            | NatEvent::RelayFailed { connect_id, .. }
+            | NatEvent::PathEstablished { connect_id, .. }
             | NatEvent::PathUpgraded { connect_id, .. }
             | NatEvent::HolePunchFailed { connect_id, .. }
             | NatEvent::FellBackToRelay { connect_id, .. }

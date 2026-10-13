@@ -110,7 +110,7 @@ fn bulk_transfer_to_slow_reader(listen: &str, total: usize) {
                 None => None,
             };
             if let Some(data) = data {
-                match writer.send_stream(&reader_peer, conn_id, stream_id, data) {
+                match writer.send_stream(conn_id, stream_id, data) {
                     Ok(()) => {}
                     Err(Error::Full { unsent, .. }) => {
                         fulls += 1;
@@ -122,7 +122,7 @@ fn bulk_transfer_to_slow_reader(listen: &str, total: usize) {
             } else if !closed_write {
                 // Every byte is accepted, so the FIN may follow.
                 writer
-                    .close_stream_write(&reader_peer, conn_id, stream_id)
+                    .close_stream_write(conn_id, stream_id)
                     .expect("close write");
                 closed_write = true;
             }
@@ -198,13 +198,7 @@ impl Sender {
         }
     }
 
-    fn turn(
-        &mut self,
-        writer: &mut Endpoint,
-        peer: &PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-    ) {
+    fn turn(&mut self, writer: &mut Endpoint, conn_id: ConnectionId, stream_id: StreamId) {
         if self.writable {
             let data = self.tail.take().or_else(|| {
                 (self.offset < self.payload.len()).then(|| {
@@ -215,7 +209,7 @@ impl Sender {
                 })
             });
             match data {
-                Some(data) => match writer.send_stream(peer, conn_id, stream_id, data) {
+                Some(data) => match writer.send_stream(conn_id, stream_id, data) {
                     Ok(()) => {}
                     Err(Error::Full { unsent, .. }) => {
                         self.tail = Some(unsent);
@@ -225,7 +219,7 @@ impl Sender {
                 },
                 None if !self.closed_write => {
                     writer
-                        .close_stream_write(peer, conn_id, stream_id)
+                        .close_stream_write(conn_id, stream_id)
                         .expect("close write");
                     self.closed_write = true;
                 }
@@ -252,7 +246,7 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
         .bind()
         .expect("bind reader");
     let mut writer = bind(listen);
-    let (reader_peer, conn_id, stream_id) = open(&mut writer, &mut reader);
+    let (_, conn_id, stream_id) = open(&mut writer, &mut reader);
     let total = 3 * window;
     let payload = Bytes::from((0..total).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
     let mut sender = Sender::new(payload.clone());
@@ -277,7 +271,7 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
             "an unacknowledged reader should get one window, got {} of {window}",
             received.len()
         );
-        sender.turn(&mut writer, &reader_peer, conn_id, stream_id);
+        sender.turn(&mut writer, conn_id, stream_id);
         // Sampled before the drain, so a closed window gets one more poll.
         let quiet_closed = quiet_since.elapsed() >= Duration::from_millis(500);
         let mut arrived = false;
@@ -333,7 +327,7 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
             "stalled at {} bytes",
             received.len()
         );
-        sender.turn(&mut writer, &reader_peer, conn_id, stream_id);
+        sender.turn(&mut writer, conn_id, stream_id);
         while let Some(event) = next(&mut reader, Duration::from_millis(1)) {
             match event {
                 EndpointEvent::StreamData {

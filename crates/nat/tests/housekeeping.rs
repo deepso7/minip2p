@@ -1212,7 +1212,7 @@ fn stalled_session_dial_expires_and_the_retry_redials() {
     assert_eq!(dial_count_for(&actions, &relay), 1);
     // No dial_result, no connection: the handshake silently stalls.
 
-    // Past the acquisition deadline (relay_leg_deadline_ms) and the retry
+    // Past the acquisition deadline (relay_timeout_ms) and the retry
     // backoff, the manager tries again — with a real dial, not a wait on
     // the dead one.
     hk.agent.handle_tick(at(12_600));
@@ -1284,12 +1284,12 @@ fn late_reserve_dial_failure_after_rotation_keeps_the_new_acquisition() {
     let (relay, relay2) = (hk.relay.clone(), hk.relay2.clone());
     let config = NatConfig::default();
     // The base backoff plus its most jitter, a fifth.
-    let retry_at = config.relay_leg_deadline_ms + config.reservation_retry_backoff_ms * 6 / 5;
+    let retry_at = config.relay_timeout_ms + config.reservation_retry_backoff_ms * 6 / 5;
 
     hk.agent.handle_tick(at(0));
     let old = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
     // The first relay never connects; after the backoff the second is dialed.
-    hk.agent.handle_tick(at(config.relay_leg_deadline_ms));
+    hk.agent.handle_tick(at(config.relay_timeout_ms));
     hk.agent.handle_tick(at(retry_at));
     let new = dial_conn_for(&drain_actions(&mut hk.agent), &relay2);
 

@@ -54,14 +54,13 @@ pub fn bind_on(builder: EndpointBuilder, listen: &str) -> Endpoint {
 /// panics.
 pub fn send_chunk(
     endpoint: &mut Endpoint,
-    peer: &PeerId,
     stream: (ConnectionId, StreamId),
     chunk: &Bytes,
     held: &mut Option<Bytes>,
 ) -> (u64, bool) {
     let data = held.take().unwrap_or_else(|| chunk.clone());
     let len = data.len();
-    match endpoint.send_stream(peer, stream.0, stream.1, data) {
+    match endpoint.send_stream(stream.0, stream.1, data) {
         Err(Error::Full { unsent, .. }) => {
             let accepted = len - unsent.len();
             *held = Some(unsent);

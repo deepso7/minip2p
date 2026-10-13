@@ -204,16 +204,54 @@ impl EndpointEvent {
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> bool {
-        matches!(
-            self,
-            Self::StreamReady { peer_id: peer, conn_id: conn, stream_id: stream, .. }
-                | Self::StreamData { peer_id: peer, conn_id: conn, stream_id: stream, .. }
-                | Self::StreamWritable { peer_id: peer, conn_id: conn, stream_id: stream }
-                | Self::StreamRemoteWriteClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
-                | Self::StreamWriteStopped { peer_id: peer, conn_id: conn, stream_id: stream, .. }
-                | Self::StreamClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
-                if peer == peer_id && *conn == conn_id && *stream == stream_id
-        )
+        self.stream_peer(conn_id, stream_id) == Some(peer_id)
+    }
+
+    /// The peer a stream-scoped event names, if it is about `stream_id` on
+    /// `conn_id`.
+    pub(crate) fn stream_peer(
+        &self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Option<&PeerId> {
+        match self {
+            Self::StreamReady {
+                peer_id,
+                conn_id: conn,
+                stream_id: stream,
+                ..
+            }
+            | Self::StreamData {
+                peer_id,
+                conn_id: conn,
+                stream_id: stream,
+                ..
+            }
+            | Self::StreamWritable {
+                peer_id,
+                conn_id: conn,
+                stream_id: stream,
+            }
+            | Self::StreamRemoteWriteClosed {
+                peer_id,
+                conn_id: conn,
+                stream_id: stream,
+                ..
+            }
+            | Self::StreamWriteStopped {
+                peer_id,
+                conn_id: conn,
+                stream_id: stream,
+                ..
+            }
+            | Self::StreamClosed {
+                peer_id,
+                conn_id: conn,
+                stream_id: stream,
+                ..
+            } if *conn == conn_id && *stream == stream_id => Some(peer_id),
+            _ => None,
+        }
     }
 }
 

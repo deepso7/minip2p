@@ -196,7 +196,7 @@ fn transfer(
         while sent < TOTAL
             && sent - progress.received.load(Ordering::Acquire) < IN_FLIGHT * CHUNK as u64
         {
-            let (accepted, full) = send_chunk(client, peer, (conn, stream), &chunk, &mut held);
+            let (accepted, full) = send_chunk(client, (conn, stream), &chunk, &mut held);
             sent += accepted;
             if full {
                 break;
@@ -209,7 +209,7 @@ fn transfer(
         let _outcome = client.wait(Duration::from_millis(5)).expect("drive client");
     };
     client
-        .close_stream_write(peer, conn, stream)
+        .close_stream_write(conn, stream)
         .expect("close write");
     (start, end)
 }

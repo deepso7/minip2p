@@ -427,7 +427,9 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         // right after the event that caused it.
         let mut converted = Vec::with_capacity(batch.len());
         for event in batch {
-            let settled = writes.observe(endpoint, &event);
+            let settled = writes
+                .observe(endpoint, &event)
+                .map(crate::writes::accepted_event);
             converted.extend(convert_endpoint_event(endpoint, event));
             converted.extend(settled);
         }
@@ -627,6 +629,8 @@ mod tests {
                     relay_peer_id: "relay".into()
                 },
                 to: crate::PathKind::DirectPunched,
+                old_conn_id: 1,
+                new_conn_id: 2,
             }),
             None
         );
