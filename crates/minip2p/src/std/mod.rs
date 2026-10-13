@@ -1126,6 +1126,14 @@ impl Endpoint {
                 break;
             }
         }
+        // The last pass's own work (a driver's reset the transport refused,
+        // say) can queue more swarm events: hand them over without polling.
+        let now = self.now();
+        for event in self.engine.core.take_buffered_events() {
+            self.engine.ingest(event, now);
+        }
+        self.engine.settle(now);
+        report.events.extend(self.engine.events.drain(..));
         report
     }
 
