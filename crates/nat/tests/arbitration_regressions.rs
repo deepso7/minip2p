@@ -5,7 +5,7 @@ mod common;
 use common::*;
 
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
-use minip2p_nat::{MAX_PUNCH_CANDIDATES, NatConfig, NatEvent, Path, PromoteError};
+use minip2p_nat::{MAX_PUNCH_CANDIDATES, NatConfig, NatEvent, Path, PromoteError, UpgradeStop};
 use minip2p_relay::Status;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
@@ -38,6 +38,10 @@ fn drive_to_relayed(h: &mut Harness) -> (ConnectId, ConnectionId) {
 }
 
 fn open_inbound_dcutr(h: &mut Harness, conn: ConnectionId, stream: StreamId) {
+    open_inbound_dcutr_at(h, conn, stream, 310);
+}
+
+fn open_inbound_dcutr_at(h: &mut Harness, conn: ConnectionId, stream: StreamId, t: u64) {
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: conn,
@@ -47,7 +51,7 @@ fn open_inbound_dcutr(h: &mut Harness, conn: ConnectionId, stream: StreamId) {
             initiated_locally: false,
         },
         false,
-        at(310),
+        at(t),
     );
     assert!(h.agent.owns_stream(conn, stream));
 }
@@ -386,14 +390,18 @@ fn cancel_closes_an_in_flight_punch_dial() {
 fn fallback_closes_an_in_flight_punch_dial() {
     let mut h = Harness::with_relay(NatConfig {
         punch_deadline_ms: 250,
-        punch_max_retries: 0,
         ..NatConfig::default()
     });
     let (id, conn) = drive_to_relayed(&mut h);
-    let actions = drive_dcutr_through_sync(&mut h, conn, StreamId::new(90));
-    let punch_conn = dial_conn_for(&actions, &h.target);
-
+    drive_round_at(&mut h, conn, StreamId::new(88), 310);
     h.agent.handle_tick(at(562));
+    drive_round_at(&mut h, conn, StreamId::new(89), 600);
+    h.agent.handle_tick(at(852));
+    let actions = drive_round_at(&mut h, conn, StreamId::new(90), 900);
+    let punch_conn = dial_conn_for(&actions, &h.target);
+    drain_events(&mut h.agent);
+
+    h.agent.handle_tick(at(1_152));
     let after = drain_actions(&mut h.agent);
     assert!(
         after.iter().any(
@@ -420,14 +428,14 @@ fn fallback_closes_an_in_flight_punch_dial() {
             peer_id: h.target.clone(),
         },
         false,
-        at(563),
+        at(1_153),
     );
     assert!(
         drain_events(&mut h.agent).is_empty(),
         "a punch must not connect the target after FellBackToRelay"
     );
 
-    h.agent.cancel(id, at(564));
+    h.agent.cancel(id, at(1_154));
     assert!(
         drain_actions(&mut h.agent)
             .iter()
@@ -454,18 +462,22 @@ fn incomplete_dcutr_close_fails_and_resets_the_exchange() {
     );
 
     assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
+    // A failed round, not a settled attempt: the holder starts the next.
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
-        [
-            NatEvent::HolePunchFailed { connect_id, .. },
-            NatEvent::FellBackToRelay { connect_id: fallback_id, .. }
-        ] if *connect_id == id && *fallback_id == id
+        [NatEvent::HolePunchFailed { connect_id, attempt: 1, .. }] if *connect_id == id
     ));
-    assert!(h.agent.is_idle());
+    assert!(!h.agent.is_idle());
 }
 
 fn drive_dcutr_through_sync(h: &mut Harness, conn: ConnectionId, stream: StreamId) -> Vec<Out> {
-    open_inbound_dcutr(h, conn, stream);
+    drive_round_at(h, conn, stream, 310)
+}
+
+/// One holder round on `stream`: the stream opens at `t`, CONNECT arrives
+/// at `t + 1` and SYNC at `t + 2`. Returns what the agent did on SYNC.
+fn drive_round_at(h: &mut Harness, conn: ConnectionId, stream: StreamId, t: u64) -> Vec<Out> {
+    open_inbound_dcutr_at(h, conn, stream, t);
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
@@ -476,7 +488,7 @@ fn drive_dcutr_through_sync(h: &mut Harness, conn: ConnectionId, stream: StreamI
             )])),
         },
         false,
-        at(311),
+        at(t + 1),
     );
     drain_actions(&mut h.agent);
     h.agent.handle_event(
@@ -487,7 +499,7 @@ fn drive_dcutr_through_sync(h: &mut Harness, conn: ConnectionId, stream: StreamI
             data: Bytes::from(dcutr_sync()),
         },
         false,
-        at(312),
+        at(t + 2),
     );
     drain_actions(&mut h.agent)
 }
@@ -504,24 +516,68 @@ fn sync_resets_the_completed_dcutr_control_stream() {
 }
 
 #[test]
-fn sync_makes_dcutr_one_shot() {
+fn the_holder_runs_three_rounds_and_each_failed_round_cancels_its_dials() {
     let mut h = Harness::with_relay(NatConfig::default());
-    let (_, conn) = drive_to_relayed(&mut h);
-    drive_dcutr_through_sync(&mut h, conn, StreamId::new(90));
+    let (id, conn) = drive_to_relayed(&mut h);
 
-    let second = StreamId::new(91);
+    let first = drive_round_at(&mut h, conn, StreamId::new(90), 310);
+    let first_dial = dial_conn_for(&first, &h.target);
+    h.agent.handle_tick(at(3_312));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::HolePunchFailed { attempt: 1, .. }]
+    ));
+    // The failed window drops its unfinished dial before the next round.
+    assert!(
+        drain_actions(&mut h.agent)
+            .iter()
+            .any(|out| matches!(out, Out::CloseCircuit { conn_id } if *conn_id == first_dial))
+    );
+
+    let second = drive_round_at(&mut h, conn, StreamId::new(91), 3_400);
+    assert_eq!(dial_count_for(&second, &h.target), 1);
+    h.agent.handle_tick(at(6_402));
+    drive_round_at(&mut h, conn, StreamId::new(92), 6_500);
+    h.agent.handle_tick(at(9_502));
+
+    // The third failed round settles on the Relayed path, keeping the
+    // circuit.
+    let events = drain_events(&mut h.agent);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                NatEvent::HolePunchFailed { attempt: 2, .. },
+                NatEvent::HolePunchFailed { attempt: 3, .. },
+                NatEvent::FellBackToRelay {
+                    connect_id,
+                    reason: UpgradeStop::PunchFailed { rounds: 3 },
+                    ..
+                }
+            ] if *connect_id == id
+        ),
+        "{events:?}"
+    );
+    assert!(
+        drain_actions(&mut h.agent)
+            .iter()
+            .all(|out| !matches!(out, Out::CloseCircuit { conn_id } if *conn_id == conn))
+    );
+
+    // A fourth stream has no attempt to answer it.
+    let fourth = StreamId::new(93);
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
             conn_id: conn,
             peer_id: h.target.clone(),
-            stream_id: second,
+            stream_id: fourth,
             protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
             initiated_locally: false,
         },
         false,
-        at(313),
+        at(9_600),
     );
-    assert!(has_reset_for(&drain_actions(&mut h.agent), second));
+    assert!(has_reset_for(&drain_actions(&mut h.agent), fourth));
 }
 
 #[test]
@@ -558,14 +614,9 @@ fn empty_filtered_dcutr_targets_fail_permanently() {
     assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
-        [
-            NatEvent::HolePunchFailed { connect_id, reason, .. },
-            NatEvent::FellBackToRelay { connect_id: fallback_id, .. }
-        ] if *connect_id == id
-            && *fallback_id == id
+        [NatEvent::HolePunchFailed { connect_id, reason, .. }] if *connect_id == id
             && reason == "no dialable remote addresses in DCUtR CONNECT"
     ));
-    assert!(h.agent.is_idle());
 }
 
 #[test]
@@ -832,5 +883,271 @@ fn circuit_promoted_by_an_inbound_circuit_is_not_adopted_by_the_attempt() {
             Out::CloseCircuit { conn_id } if *conn_id == inbound_circuit
         )),
         "cancelling the attempt must not close the inbound circuit"
+    );
+}
+
+#[test]
+fn a_remote_that_never_starts_dcutr_settles_relayed_after_the_start_timeout() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+
+    // The Relayed path became usable at t=301; the holder never opens DCUtR.
+    h.agent.handle_tick(at(10_300));
+    assert!(drain_events(&mut h.agent).is_empty());
+    h.agent.handle_tick(at(10_301));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::FellBackToRelay {
+            connect_id,
+            reason: UpgradeStop::StartTimeout { budget_ms: 10_000 },
+            ..
+        }] if *connect_id == id
+    ));
+    assert!(
+        drain_actions(&mut h.agent)
+            .iter()
+            .all(|out| !matches!(out, Out::CloseCircuit { conn_id } if *conn_id == conn)),
+        "the Relayed path stays"
+    );
+    assert!(h.agent.is_idle());
+}
+
+#[test]
+fn a_stalled_exchange_settles_relayed_with_its_round() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    open_inbound_dcutr_at(&mut h, conn, StreamId::new(90), 1_000);
+
+    h.agent.handle_tick(at(10_999));
+    assert!(drain_events(&mut h.agent).is_empty());
+    h.agent.handle_tick(at(11_000));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::FellBackToRelay {
+            connect_id,
+            reason: UpgradeStop::ExchangeTimeout { round: 1, budget_ms: 10_000 },
+            ..
+        }] if *connect_id == id
+    ));
+}
+
+#[test]
+fn an_exchange_finishing_near_its_deadline_keeps_its_punch_window() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (_, conn) = drive_to_relayed(&mut h);
+    let stream = StreamId::new(90);
+    open_inbound_dcutr_at(&mut h, conn, stream, 1_000);
+    for (data, t) in [
+        (
+            dcutr_connect_reply(&[maddr("/ip4/9.9.9.9/udp/4002/quic-v1")]),
+            10_900,
+        ),
+        (dcutr_sync(), 10_950),
+    ] {
+        h.agent.handle_event(
+            &SwarmEvent::StreamData {
+                conn_id: conn,
+                peer_id: h.target.clone(),
+                stream_id: stream,
+                data: Bytes::from(data),
+            },
+            false,
+            at(t),
+        );
+    }
+    drain_actions(&mut h.agent);
+
+    // Past the 10 s exchange budget but inside the punch window: the
+    // round is still running.
+    h.agent.handle_tick(at(11_500));
+    assert!(drain_events(&mut h.agent).is_empty());
+    h.agent.handle_tick(at(13_950));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::HolePunchFailed { attempt: 1, .. }]
+    ));
+}
+
+#[test]
+fn a_dcutr_stream_arriving_after_the_start_budget_settles_relayed() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+
+    // The stream reaches the agent before the tick that would expire the
+    // start budget (t=10_301).
+    let stream = StreamId::new(90);
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: conn,
+            peer_id: h.target.clone(),
+            stream_id: stream,
+            protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
+            initiated_locally: false,
+        },
+        false,
+        at(10_400),
+    );
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::FellBackToRelay {
+            connect_id,
+            reason: UpgradeStop::StartTimeout { .. },
+            ..
+        }] if *connect_id == id
+    ));
+    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
+}
+
+#[test]
+fn a_sync_arriving_after_the_exchange_budget_dials_nothing() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    let actions = drive_round_at(&mut h, conn, StreamId::new(90), 1_000);
+    drain_events(&mut h.agent);
+    assert_eq!(dial_count_for(&actions, &h.target), 1);
+
+    let stream = StreamId::new(91);
+    open_inbound_dcutr_at(&mut h, conn, stream, 2_000);
+    drain_events(&mut h.agent);
+    for (data, t) in [
+        (
+            dcutr_connect_reply(&[maddr("/ip4/9.9.9.9/udp/4002/quic-v1")]),
+            2_001,
+        ),
+        // The exchange budget ended at t=12_000.
+        (dcutr_sync(), 12_100),
+    ] {
+        h.agent.handle_event(
+            &SwarmEvent::StreamData {
+                conn_id: conn,
+                peer_id: h.target.clone(),
+                stream_id: stream,
+                data: Bytes::from(data),
+            },
+            false,
+            at(t),
+        );
+    }
+    assert_eq!(dial_count_for(&drain_actions(&mut h.agent), &h.target), 0);
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::FellBackToRelay {
+            connect_id,
+            reason: UpgradeStop::ExchangeTimeout { round: 2, .. },
+            ..
+        }] if *connect_id == id
+    ));
+}
+
+#[test]
+fn settling_drops_the_attempts_undrained_outcomes() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    h.agent.handle_tick(at(10_301));
+    // FellBackToRelay is queued but the host settles before draining it.
+    h.agent.settled(id, Some(conn), at(10_302));
+    assert!(
+        drain_events(&mut h.agent)
+            .iter()
+            .all(|event| event.connect_id() != Some(id))
+    );
+}
+
+#[test]
+fn the_whole_upgrade_is_bounded() {
+    let mut h = Harness::with_relay(NatConfig {
+        upgrade_timeout_ms: 5_000,
+        ..NatConfig::default()
+    });
+    let (id, conn) = drive_to_relayed(&mut h);
+    drive_round_at(&mut h, conn, StreamId::new(90), 4_000);
+    drain_events(&mut h.agent);
+
+    // The punch window would run to t=7_002, past the 5 s upgrade budget.
+    h.agent.handle_tick(at(5_301));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::FellBackToRelay {
+            connect_id,
+            reason: UpgradeStop::UpgradeTimeout { budget_ms: 5_000 },
+            ..
+        }] if *connect_id == id
+    ));
+}
+
+#[test]
+fn no_attempt_event_follows_the_engine_settling() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    let actions = drive_round_at(&mut h, conn, StreamId::new(90), 310);
+    let punch_conn = dial_conn_for(&actions, &h.target);
+    drain_events(&mut h.agent);
+
+    // The engine settles Connected on the circuit (its own deadline).
+    h.agent.settled(id, Some(conn), at(400));
+    let actions = drain_actions(&mut h.agent);
+    assert!(
+        actions
+            .iter()
+            .all(|out| !matches!(out, Out::CloseCircuit { conn_id } if *conn_id == conn)),
+        "the kept connection stays open"
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|out| matches!(out, Out::CloseCircuit { conn_id } if *conn_id == punch_conn)),
+        "the attempt's punch dial is dropped"
+    );
+
+    // Nothing the attempt owned can name it any more.
+    h.agent.handle_tick(at(60_000));
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            peer_id: h.target.clone(),
+            conn_id: conn,
+        },
+        true,
+        at(60_001),
+    );
+    assert!(
+        drain_events(&mut h.agent)
+            .iter()
+            .all(|event| event.connect_id() != Some(id))
+    );
+    assert!(h.agent.is_idle());
+}
+
+#[test]
+fn settling_clears_what_the_attempt_held() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    let stream = StreamId::new(90);
+    open_inbound_dcutr(&mut h, conn, stream);
+    // The DCUtR reply is refused as Full and held.
+    h.agent.swarm.full_sends = true;
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            conn_id: conn,
+            peer_id: h.target.clone(),
+            stream_id: stream,
+            data: Bytes::from(dcutr_connect_reply(&[maddr(
+                "/ip4/9.9.9.9/udp/4002/quic-v1",
+            )])),
+        },
+        false,
+        at(311),
+    );
+    h.agent.swarm.full_sends = false;
+    drain_actions(&mut h.agent);
+    drain_events(&mut h.agent);
+    assert!(!h.agent.is_idle());
+
+    // The engine settles before the stream turns writable. The fake swarm
+    // never reports the reset stream closed, as when the reset fails.
+    h.agent.settled(id, Some(conn), at(320));
+    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
+    assert!(
+        h.agent.is_idle(),
+        "nothing stays held for a settled attempt"
     );
 }

@@ -128,6 +128,8 @@ mod tests {
                     relay_peer_id: "relay".into(),
                 },
                 to: PathKind::DirectPunched,
+                old_conn_id: 1,
+                new_conn_id: 2,
             }),
             json!({
                 "tag": "PathUpgraded",
@@ -136,6 +138,8 @@ mod tests {
                     "peerId": "peer",
                     "from": { "tag": "Relayed", "inner": { "relayPeerId": "relay" } },
                     "to": { "tag": "DirectPunched" },
+                    "oldConnId": 1,
+                    "newConnId": 2,
                 },
             })
         );

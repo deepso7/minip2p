@@ -61,10 +61,17 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 ///   bytes already framed but not yet written.
 /// - A Full arms a one-shot `StreamWritable` for that stream in the same call,
 ///   so no wakeup is lost. It fires once the stream can again queue at least
-///   half of the smaller of its stream and connection send caps; freeing a
-///   shared cap wakes every armed stream on it. It never fires once the write
+///   half of the smaller of its stream and connection send caps (a control
+///   stream needs at most half a non-zero control reserve, the room it may be
+///   left); freeing a shared cap wakes every armed stream on it. It never
+///   fires once the write
 ///   side has ended (`StreamWriteStopped`, a reset, `close_stream_write`,
 ///   `StreamClosed`, or `Closed`); those tell the holder to drop its tail.
+/// - No stream starves another: a transport bounds each stream's share of
+///   its connection's send cap, so a stream stalled on peer credit fills
+///   only its own share. A small reserve inside the connection cap is kept
+///   for **control streams**, the ones the caller marks with
+///   [`set_control_stream`](Transport::set_control_stream).
 /// - Temporary send pressure never tears down a connection.
 /// - Any error other than `Full` says nothing about how much was accepted:
 ///   a transport may queue a prefix and then fail. Treat such a stream as
@@ -179,6 +186,20 @@ pub trait Transport {
         stream_id: StreamId,
         bytes: usize,
     ) -> Result<(), TransportError>;
+
+    /// Marks a stream as a control stream, or back as an application stream.
+    ///
+    /// Streams start as application streams. A control stream may also queue
+    /// into the reserve kept inside the connection's send cap, so application
+    /// streams cannot starve it (see [Backpressure](#backpressure)). The swarm
+    /// marks its own streams this way -- every stream while multistream
+    /// negotiates it, and ping and Identify streams after -- so a transport
+    /// never has to know protocols. Unknown streams and connections are
+    /// ignored, as is the call on a transport without a reserve (the
+    /// default).
+    fn set_control_stream(&mut self, id: ConnectionId, stream_id: StreamId, control: bool) {
+        let _ = (id, stream_id, control);
+    }
 
     /// Gracefully close a connection.
     ///

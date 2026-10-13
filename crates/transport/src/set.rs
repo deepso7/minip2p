@@ -395,6 +395,12 @@ impl Transport for TransportSet {
         }
     }
 
+    fn set_control_stream(&mut self, id: ConnectionId, stream_id: StreamId, control: bool) {
+        if let Ok(member) = self.for_id(id) {
+            member.set_control_stream(id, stream_id, control);
+        }
+    }
+
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
         self.for_id(id)?.close(id)
     }

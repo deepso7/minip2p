@@ -72,9 +72,11 @@ pub enum EndpointEvent {
         old: ConnectionId,
         new: ConnectionId,
     },
-    /// Identify information received from a remote peer.
+    /// Identify information received from a remote peer on `conn_id`, the
+    /// connection it arrived on (fixed when the event was queued).
     IdentifyReceived {
         peer_id: PeerId,
+        conn_id: ConnectionId,
         info: IdentifyMessage,
     },
     /// A peer is ready for application-level operations on `conn_id`.
@@ -87,10 +89,17 @@ pub enum EndpointEvent {
         conn_id: ConnectionId,
         protocols: alloc::vec::Vec<alloc::string::String>,
     },
-    /// A ping RTT measurement completed.
-    PingRttMeasured { peer_id: PeerId, rtt_ms: u64 },
-    /// A ping timed out.
-    PingTimeout { peer_id: PeerId },
+    /// A ping RTT measurement completed on `conn_id`.
+    PingRttMeasured {
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+        rtt_ms: u64,
+    },
+    /// A ping sent on `conn_id` timed out.
+    PingTimeout {
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+    },
     /// A user-registered protocol was successfully negotiated on a stream.
     StreamReady {
         peer_id: PeerId,
@@ -195,16 +204,54 @@ impl EndpointEvent {
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> bool {
-        matches!(
-            self,
-            Self::StreamReady { peer_id: peer, conn_id: conn, stream_id: stream, .. }
-                | Self::StreamData { peer_id: peer, conn_id: conn, stream_id: stream, .. }
-                | Self::StreamWritable { peer_id: peer, conn_id: conn, stream_id: stream }
-                | Self::StreamRemoteWriteClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
-                | Self::StreamWriteStopped { peer_id: peer, conn_id: conn, stream_id: stream, .. }
-                | Self::StreamClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
-                if peer == peer_id && *conn == conn_id && *stream == stream_id
-        )
+        self.stream_peer(conn_id, stream_id) == Some(peer_id)
+    }
+
+    /// The peer a stream-scoped event names, if it is about `stream_id` on
+    /// `conn_id`.
+    pub(crate) fn stream_peer(
+        &self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Option<&PeerId> {
+        match self {
+            Self::StreamReady {
+                peer_id,
+                conn_id: conn,
+                stream_id: stream,
+                ..
+            }
+            | Self::StreamData {
+                peer_id,
+                conn_id: conn,
+                stream_id: stream,
+                ..
+            }
+            | Self::StreamWritable {
+                peer_id,
+                conn_id: conn,
+                stream_id: stream,
+            }
+            | Self::StreamRemoteWriteClosed {
+                peer_id,
+                conn_id: conn,
+                stream_id: stream,
+                ..
+            }
+            | Self::StreamWriteStopped {
+                peer_id,
+                conn_id: conn,
+                stream_id: stream,
+                ..
+            }
+            | Self::StreamClosed {
+                peer_id,
+                conn_id: conn,
+                stream_id: stream,
+                ..
+            } if *conn == conn_id && *stream == stream_id => Some(peer_id),
+            _ => None,
+        }
     }
 }
 
@@ -220,9 +267,15 @@ impl From<SwarmEvent> for EndpointEvent {
             SwarmEvent::ConnectionReplaced { peer_id, old, new } => {
                 Self::ConnectionReplaced { peer_id, old, new }
             }
-            SwarmEvent::IdentifyReceived { peer_id, info } => {
-                Self::IdentifyReceived { peer_id, info }
-            }
+            SwarmEvent::IdentifyReceived {
+                peer_id,
+                conn_id,
+                info,
+            } => Self::IdentifyReceived {
+                peer_id,
+                conn_id,
+                info,
+            },
             SwarmEvent::PeerReady {
                 peer_id,
                 conn_id,
@@ -233,10 +286,16 @@ impl From<SwarmEvent> for EndpointEvent {
                 protocols,
             },
 
-            SwarmEvent::PingRttMeasured { peer_id, rtt_ms } => {
-                Self::PingRttMeasured { peer_id, rtt_ms }
-            }
-            SwarmEvent::PingTimeout { peer_id } => Self::PingTimeout { peer_id },
+            SwarmEvent::PingRttMeasured {
+                peer_id,
+                conn_id,
+                rtt_ms,
+            } => Self::PingRttMeasured {
+                peer_id,
+                conn_id,
+                rtt_ms,
+            },
+            SwarmEvent::PingTimeout { peer_id, conn_id } => Self::PingTimeout { peer_id, conn_id },
             SwarmEvent::StreamReady {
                 peer_id,
                 conn_id,

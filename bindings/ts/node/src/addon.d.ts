@@ -55,13 +55,13 @@ export declare class NodeEndpoint {
    * `StreamClosed`, a reset, or the connection closing or being replaced),
    * which drops the tail.
    */
-  sendStream(peerId: string, connId: bigint, streamId: bigint, data: Uint8Array): boolean
+  sendStream(connId: bigint, streamId: bigint, data: Uint8Array): boolean
   /** Half-closes the local stream write side. */
-  closeStreamWrite(peerId: string, connId: bigint, streamId: bigint): void
+  closeStreamWrite(connId: bigint, streamId: bigint): void
   /** Resets an application stream. */
-  resetStream(peerId: string, connId: bigint, streamId: bigint): void
+  resetStream(connId: bigint, streamId: bigint): void
   /** Resets and relinquishes an application stream. */
-  abandonStream(peerId: string, connId: bigint, streamId: bigint): void
+  abandonStream(connId: bigint, streamId: bigint): void
   /**
    * Acknowledges `bytes` of a stream's received data as consumed,
    * letting its sender continue. Every registered protocol needs this.

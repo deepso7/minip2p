@@ -222,7 +222,7 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
             if peer_id == &go_peer && protocols.iter().any(|id| id == ECHO_PROTOCOL))
     });
     let identify = log.wait_for(|event| {
-        matches!(event, P2pEvent::IdentifyReceived { peer_id, info }
+        matches!(event, P2pEvent::IdentifyReceived { peer_id, info, .. }
             if peer_id == &go_peer && info.protocols.iter().any(|id| id == ECHO_PROTOCOL))
     });
     let P2pEvent::IdentifyReceived { info, .. } = identify else {
@@ -250,12 +250,11 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
             if *stream_id == opened.stream_id)
     });
     endpoint.send_stream(
-        go_peer.clone(),
         opened.conn_id,
         opened.stream_id,
         PAYLOAD_FROM_MINIP2P.to_vec(),
     )?;
-    endpoint.close_stream_write(go_peer.clone(), opened.conn_id, opened.stream_id)?;
+    endpoint.close_stream_write(opened.conn_id, opened.stream_id)?;
     let mut echoed_to_minip2p = Vec::with_capacity(PAYLOAD_FROM_MINIP2P.len());
     loop {
         let event = log.take_for(|event| {
@@ -306,20 +305,20 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
         });
         match event {
             P2pEvent::StreamData {
-                peer_id,
+                peer_id: _,
                 conn_id,
                 stream_id,
                 data,
             } => {
                 received.extend_from_slice(&data);
-                endpoint.send_stream(peer_id, conn_id, stream_id, data)?;
+                endpoint.send_stream(conn_id, stream_id, data)?;
             }
             P2pEvent::StreamRemoteWriteClosed {
-                peer_id,
+                peer_id: _,
                 conn_id,
                 stream_id,
             } => {
-                endpoint.close_stream_write(peer_id, conn_id, stream_id)?;
+                endpoint.close_stream_write(conn_id, stream_id)?;
                 break;
             }
             _ => panic!("reverse-echo predicate returned a different event"),

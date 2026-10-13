@@ -228,6 +228,32 @@ export function describeAdapterContract(
       endpoint.close();
     });
 
+    test("a live connection first named by a path event keeps that public ID", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      const paths: number[] = [];
+      endpoint.on("inboundPathEstablished", ({ connId }) => paths.push(connId));
+      native.setConnectionInfo({ connId: CONN_ID, remoteAddr: QUIC });
+
+      // The queue dropped this circuit's `ConnectionEstablished`.
+      native.deliver([
+        {
+          inner: {
+            connId: CONN_ID,
+            path: { inner: { relayPeerId: "relay" }, tag: "Relayed" },
+            peerId: PEER,
+          },
+          tag: "InboundPathEstablished",
+        },
+      ]);
+      await drained();
+
+      expect(paths).toHaveLength(1);
+      expect(endpoint.connectionInfo(PEER)?.connId).toBe(paths[0]);
+      endpoint.close();
+    });
+
     test("ConnectionReplaced moves the peer to the new connection and ends opens on the old one", async () => {
       vi.useFakeTimers();
       const endpoint = harness.create();
@@ -277,6 +303,88 @@ export function describeAdapterContract(
         peerId: PEER,
         protocols: ["/test/1"],
       });
+      endpoint.close();
+    });
+
+    test("an upgrade event after ConnectionReplaced names the replaced connection's public ID", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      const established: number[] = [];
+      const upgrades: {
+        readonly oldConnId: number;
+        readonly newConnId: number;
+      }[] = [];
+      endpoint.on("connectionEstablished", ({ connId }) =>
+        established.push(connId)
+      );
+      endpoint.on("inboundDirectUpgrade", (event) => upgrades.push(event));
+      native.deliver([
+        {
+          inner: { connId: CONN_ID, peerId: PEER },
+          tag: "ConnectionEstablished",
+        },
+      ]);
+      await drained();
+      native.deliver([
+        {
+          inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
+          tag: "ConnectionReplaced",
+        },
+        {
+          inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
+          tag: "InboundDirectUpgrade",
+        },
+      ]);
+      await drained();
+
+      expect(upgrades).toHaveLength(1);
+      expect(upgrades[0]?.oldConnId).toBe(established[0]);
+      expect(upgrades[0]?.newConnId).not.toBe(established[0]);
+      endpoint.close();
+    });
+
+    test("path events after their circuit was replaced in the same batch name its original public ID", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      const established: number[] = [];
+      const paths: number[] = [];
+      const upgrades: number[] = [];
+      endpoint.on("connectionEstablished", ({ connId }) =>
+        established.push(connId)
+      );
+      endpoint.on("inboundPathEstablished", ({ connId }) => paths.push(connId));
+      endpoint.on("inboundDirectUpgrade", ({ oldConnId }) =>
+        upgrades.push(oldConnId)
+      );
+      // Lifecycle events come first in a batch, then the path events.
+      native.deliver([
+        {
+          inner: { connId: CONN_ID, peerId: PEER },
+          tag: "ConnectionEstablished",
+        },
+        {
+          inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
+          tag: "ConnectionReplaced",
+        },
+        {
+          inner: {
+            connId: CONN_ID,
+            path: { inner: { relayPeerId: "relay" }, tag: "Relayed" },
+            peerId: PEER,
+          },
+          tag: "InboundPathEstablished",
+        },
+        {
+          inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
+          tag: "InboundDirectUpgrade",
+        },
+      ]);
+      await drained();
+
+      expect(paths).toEqual(established);
+      expect(upgrades).toEqual(established);
       endpoint.close();
     });
 

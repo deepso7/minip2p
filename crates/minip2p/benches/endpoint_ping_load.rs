@@ -173,8 +173,7 @@ fn relay_load() -> (Endpoint, Load) {
     let mut sent = 0;
     let sender = Driven::run(client, move |client| {
         while sent - acked.load(Ordering::Acquire) < IN_FLIGHT * CHUNK as u64 {
-            let (accepted, full) =
-                send_chunk(client, &target_peer, (conn, stream), &chunk, &mut held);
+            let (accepted, full) = send_chunk(client, (conn, stream), &chunk, &mut held);
             sent += accepted;
             if full {
                 break;
@@ -283,7 +282,7 @@ fn sample(m: &mut Endpoint, peer: &PeerId) -> Duration {
                 assert!(rtt <= SAMPLE_TIMEOUT, "ping sample took {rtt:?}");
                 return rtt;
             }
-            EndpointEvent::PingTimeout { peer_id } => {
+            EndpointEvent::PingTimeout { peer_id, .. } => {
                 assert!(&peer_id != peer, "ping timed out");
             }
             _ => {}

@@ -3,7 +3,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr};
+use minip2p::{
+    ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, StreamWriter,
+};
 
 const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";
 
@@ -23,6 +25,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connect_id = node.connect(target)?;
     // Stream ids are per connection, so a stream is named by both.
     let mut stream = None;
+    // Finishes a write the stream could not take at once, then sends the FIN.
+    let mut writer = StreamWriter::new(1024);
     let mut response = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
 
@@ -33,6 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             EndpointWaitOutcome::Deadline => return Err("stream exchange timed out".into()),
             _ => continue, // interrupted by a WaitHandle
         };
+        writer.observe(&mut node, &event);
 
         match event {
             EndpointEvent::ConnectSettled {
@@ -58,8 +63,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 && Some((conn_id, ready)) == stream
                 && protocol_id == ECHO_PROTOCOL =>
             {
-                node.send_stream(&peer_id, conn_id, ready, b"hello".to_vec())?;
-                node.close_stream_write(&peer_id, conn_id, ready)?;
+                writer.write(&mut node, conn_id, ready, b"hello".to_vec())?;
+                writer.close_write(&mut node, conn_id, ready)?;
             }
             EndpointEvent::StreamData {
                 peer_id: peer,

@@ -40,6 +40,9 @@ mod dial;
 mod nat_tests;
 #[cfg(feature = "relay-server")]
 pub(crate) mod relay_server;
+mod writer;
+
+pub use writer::{StreamWriteError, StreamWriter, WriteAccepted, WriteProgress};
 
 use std::time::Duration;
 
@@ -236,6 +239,22 @@ type StdCarrier = ();
 /// The engine the std [`Endpoint`] drives.
 type StdEngine = Engine<EndpointTransport, StdEntropy, StdCarrier>;
 
+/// What [`Endpoint::close`] collected: every event, in order, and every
+/// error close's own calls hit, in order.
+///
+/// A failure the swarm reports as it happens (a transport refusing to close
+/// a connection, say) arrives as [`EndpointEvent::Error`] in `events`, as it
+/// would from [`Endpoint::wait`]; a clean close has no such event either.
+#[derive(Debug, Default)]
+#[must_use = "a close report carries the close's events and errors"]
+#[non_exhaustive]
+pub struct CloseReport {
+    /// Events queued before the close and those its drain produced.
+    pub events: Vec<EndpointEvent>,
+    /// Every failure: the mDNS goodbye, each disconnect, and a failed drain.
+    pub errors: Vec<Error>,
+}
+
 /// App-facing minip2p endpoint over the transports it was asked to bind.
 ///
 /// `Endpoint` owns identity, transports, a clock, and the same engine as
@@ -397,6 +416,10 @@ impl Endpoint {
     /// including names still resolving, has failed and no relay leg remains.
     /// There is no separate DNS timeout: the attempt deadline covers the
     /// lookup. Under `force_relay` names are not looked up at all.
+    ///
+    /// Connecting to a peer that is already connected reuses that
+    /// connection: the attempt settles at once with the current connection,
+    /// and the addresses passed are not dialed.
     #[expect(
         clippy::result_large_err,
         reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."
@@ -570,55 +593,66 @@ impl Endpoint {
             .open_stream(peer_id, protocol_id, now.monotonic_ms)
     }
 
-    /// Sends bytes on a negotiated application stream.
+    /// Sends bytes on a negotiated application stream, named by the
+    /// connection and stream ids [`Self::open_stream`] or
+    /// [`EndpointEvent::StreamReady`] gave; the peer is the connection's.
     ///
-    /// Accepts as much of `data` as the stream can queue (ADR 0012). When not
-    /// every byte fit, returns [`Error::Full`] carrying the exact unsent
-    /// suffix: hold it, wait for [`EndpointEvent::StreamWritable`] for the
-    /// stream, and send it again. Full is retryable, never a fault. Close the
-    /// write side only once every held tail has been accepted.
+    /// Accepts as much of `data` as the stream can queue (ADR 0012), and
+    /// `Ok(())` means every byte was accepted locally, not delivered. When
+    /// not every byte fit it returns [`Error::Full`]: **a prefix may already
+    /// have been accepted, and only `unsent` is yours.** Hold it, wait for
+    /// [`EndpointEvent::StreamWritable`] for the stream, and send it again.
+    /// Full is retryable ([`Error::is_retryable`]), never a fault, so `?` on
+    /// this call silently drops the tail:
+    ///
+    /// ```rust,ignore
+    /// endpoint.send_stream(conn_id, stream_id, payload)?; // loses `unsent` on Full
+    /// ```
+    ///
+    /// [`StreamWriter`](crate::StreamWriter) holds the tail, resends it on
+    /// Writable, and defers a write-side close behind it, which is what most
+    /// applications want.
     ///
     /// Fails with [`SwarmError::StreamNotFound`] if `conn_id` is no longer
-    /// the peer's connection holding the stream (for example after
+    /// the connection holding the stream (for example after
     /// `ConnectionReplaced`), so a write never reaches a same-numbered stream
-    /// on a newer connection. The other stream operations behave the same.
+    /// on a newer connection, and with
+    /// [`TransportError::ConnectionNotFound`] once nothing names the
+    /// connection any more. [`Error::is_stream_gone`] covers both. The other
+    /// stream operations behave the same.
     pub fn send_stream(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
         data: impl Into<Bytes>,
     ) -> Result<(), Error> {
         let now = self.now();
         self.engine
-            .core
-            .send_stream(peer_id, conn_id, stream_id, data.into(), now.monotonic_ms)
+            .send_stream(conn_id, stream_id, data.into(), now)
     }
 
     /// Half-closes the local write side of an application stream.
+    ///
+    /// The FIN follows every byte the stream accepted; a tail you hold after
+    /// a Full is not among them. [`StreamWriter::close_write`](crate::StreamWriter::close_write)
+    /// waits for its own pending tail first.
     pub fn close_stream_write(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), Error> {
         let now = self.now();
-        self.engine
-            .core
-            .close_stream_write(peer_id, conn_id, stream_id, now.monotonic_ms)
+        self.engine.close_stream_write(conn_id, stream_id, now)
     }
 
     /// Resets an application stream.
     pub fn reset_stream(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), Error> {
         let now = self.now();
-        self.engine
-            .core
-            .reset_stream(peer_id, conn_id, stream_id, now.monotonic_ms)
+        self.engine.reset_stream(conn_id, stream_id, now)
     }
 
     /// Resets and forgets an application stream that will no longer be consumed.
@@ -629,15 +663,16 @@ impl Endpoint {
     /// no-op. A stream the peer has already closed has nothing left to reset:
     /// it is abandoned (and its undelivered data acknowledged) only while its
     /// [`EndpointEvent::StreamClosed`] is undelivered, and fails with
-    /// [`SwarmError::StreamNotFound`] after that, including on a second call.
+    /// [`SwarmError::StreamNotFound`] (or
+    /// [`TransportError::ConnectionNotFound`] once its connection is gone)
+    /// after that, including on a second call.
     pub fn abandon_stream(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), Error> {
         let now = self.now();
-        self.engine.abandon_stream(peer_id, conn_id, stream_id, now)
+        self.engine.abandon_stream(conn_id, stream_id, now)
     }
 
     /// Runs one drive batch without blocking and returns every queued event.
@@ -1037,75 +1072,84 @@ impl Endpoint {
     /// notifies a peer after `kill -9` or a hard partition. A replacement
     /// that lands while draining is disconnected too, including a handshake
     /// still pending when the replaced connection closes.
-    pub fn close(mut self) -> Result<Vec<EndpointEvent>, Error> {
-        let mut first_error = None;
+    ///
+    /// Close never stops at the first failure: the [`CloseReport`] carries
+    /// every event collected, starting with those already queued, and every
+    /// error hit. A failed drain ends the drain early.
+    pub fn close(mut self) -> CloseReport {
+        let mut report = CloseReport::default();
+        report.events.extend(self.engine.events.drain(..));
         #[cfg(feature = "mdns")]
         if let Err(error) = self.shutdown() {
-            first_error = Some(error);
+            report.errors.push(error);
         }
         let drain_by = std::time::Instant::now() + Duration::from_millis(500);
-        let mut events = Vec::new();
         loop {
-            if let Some(error) = self.disconnect_established()
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-            if std::time::Instant::now() >= drain_by {
-                break;
-            }
-            let harvested = if self.close_drain_busy() {
-                // Interrupts only end this sleep early.
-                self.block(WaitDeadline::from(drain_by))
+            report.errors.extend(self.disconnect_established());
+            // Out of time or failed: hand over what the swarm already queued
+            // (a disconnect's close failure, say) without polling again.
+            let (polled, last, now) = if std::time::Instant::now() >= drain_by {
+                (self.engine.core.take_buffered_events(), true, self.now())
             } else {
-                Ok(false)
-            };
-            let harvested = match harvested {
-                Ok(true) => Ok(()),
-                Ok(false) => self.harvest(Duration::ZERO),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = harvested {
-                return Err(first_error.unwrap_or(error));
-            }
-            let now = self.now();
-            let polled = match self.engine.core.poll(now) {
-                Ok(polled) => polled,
-                Err(error) => return Err(first_error.unwrap_or(error)),
+                let harvested = if self.close_drain_busy() {
+                    // Interrupts only end this sleep early.
+                    self.block(WaitDeadline::from(drain_by))
+                } else {
+                    Ok(false)
+                };
+                let harvested = match harvested {
+                    Ok(true) => Ok(()),
+                    Ok(false) => self.harvest(Duration::ZERO),
+                    Err(error) => Err(error),
+                };
+                let now = self.now();
+                match harvested.and_then(|()| self.engine.core.poll(now)) {
+                    Ok(polled) => (polled, false, now),
+                    Err(error) => {
+                        report.errors.push(error);
+                        (self.engine.core.take_buffered_events(), true, now)
+                    }
+                }
             };
             let quiet = polled.is_empty();
             // No agent tick or discovery sweep runs while closing, so only
-            // connection and attempt events are returned.
+            // connection, attempt and capability events (a relay
+            // reservation closing, say) are returned.
             for event in polled {
                 self.engine.ingest(event, now);
             }
-            events.extend(self.engine.events.drain(..));
-            events.extend(self.engine.collect_terminals(now));
-            if quiet && (!self.close_drain_busy() || std::time::Instant::now() >= drain_by) {
+            self.engine.settle(now);
+            report.events.extend(self.engine.events.drain(..));
+            if last
+                || (quiet && (!self.close_drain_busy() || std::time::Instant::now() >= drain_by))
+            {
                 break;
             }
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(events),
+        // The last pass's own work (a driver's reset the transport refused,
+        // say) can queue more swarm events: hand them over without polling.
+        let now = self.now();
+        for event in self.engine.core.take_buffered_events() {
+            self.engine.ingest(event, now);
         }
+        self.engine.settle(now);
+        report.events.extend(self.engine.events.drain(..));
+        report
     }
 
     fn close_drain_busy(&self) -> bool {
         !self.engine.core.connected_peers().is_empty() || self.engine.core.has_tracked_connections()
     }
 
-    fn disconnect_established(&mut self) -> Option<Error> {
+    /// Disconnects every established peer, returning each failure.
+    fn disconnect_established(&mut self) -> Vec<Error> {
         let now = self.now();
-        let mut first_error = None;
-        for peer in self.engine.core.connected_peers() {
-            if let Err(error) = self.engine.core.disconnect(&peer, now.monotonic_ms)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-        }
-        first_error
+        self.engine
+            .core
+            .connected_peers()
+            .iter()
+            .filter_map(|peer| self.engine.core.disconnect(peer, now.monotonic_ms).err())
+            .collect()
     }
 }
 
@@ -2493,6 +2537,7 @@ mod tests {
         let other = Ed25519Keypair::generate().peer_id();
         dialer.engine.events.push_back(EndpointEvent::PingTimeout {
             peer_id: other.clone(),
+            conn_id: ConnectionId::new(1),
         });
 
         let (mut settled, mut queued) = (false, false);
@@ -2503,7 +2548,7 @@ mod tests {
                     connect_id: id,
                     ..
                 }) if id == connect_id => settled = true,
-                EndpointWaitOutcome::Event(EndpointEvent::PingTimeout { peer_id })
+                EndpointWaitOutcome::Event(EndpointEvent::PingTimeout { peer_id, .. })
                     if peer_id == other =>
                 {
                     queued = true;
@@ -3545,6 +3590,7 @@ mod tests {
         nat.push_event(NatEvent::FellBackToRelay {
             connect_id: ConnectId::from_u64(99),
             peer: peer.clone(),
+            reason: minip2p_nat::UpgradeStop::PunchFailed { rounds: 3 },
         });
         nat.push_event(NatEvent::ReachabilityChanged {
             old: ReachabilityState::Unknown,
@@ -3707,6 +3753,42 @@ mod tests {
             )),
             "the queued event must survive the failed poll: {events:?}"
         );
+    }
+
+    /// A close whose drain fails still returns the events queued before it,
+    /// alongside the error.
+    #[test]
+    fn close_reports_queued_events_with_a_drain_failure() {
+        let fail = Arc::new(AtomicBool::new(true));
+        let mut set = TransportSet::new();
+        insert_member(
+            &mut set,
+            TransportKind::Tcp,
+            [ConnectionNamespace::TCP_IPV4],
+            FlakyPollTransport { fail },
+        )
+        .expect("insert transport");
+        let mut endpoint =
+            build_endpoint(Endpoint::builder(), Ed25519Keypair::generate(), set).expect("build");
+        let peer = Ed25519Keypair::generate().peer_id();
+        endpoint
+            .engine
+            .events
+            .push_back(EndpointEvent::ConnectionClosed {
+                peer_id: peer.clone(),
+                conn_id: ConnectionId::new(1),
+            });
+
+        let report = endpoint.close();
+        assert!(
+            matches!(
+                report.events.as_slice(),
+                [EndpointEvent::ConnectionClosed { peer_id, .. }] if peer_id == &peer
+            ),
+            "{:?}",
+            report.events
+        );
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     }
 
     #[cfg(feature = "nat")]
@@ -4313,7 +4395,7 @@ mod tests {
         };
         // The reader closes first, so the writer's FIN closes the stream.
         reader
-            .close_stream_write(&writer_peer, conn, stream)
+            .close_stream_write(conn, stream)
             .expect("reader close");
         loop {
             assert!(std::time::Instant::now() < give_up, "reader FIN lost");
@@ -4327,10 +4409,10 @@ mod tests {
         }
         let conn_out = writer.core().connection_id(&reader_peer).expect("conn");
         writer
-            .send_stream(&reader_peer, conn_out, out_stream, vec![1, 2, 3])
+            .send_stream(conn_out, out_stream, vec![1, 2, 3])
             .expect("send");
         writer
-            .close_stream_write(&reader_peer, conn_out, out_stream)
+            .close_stream_write(conn_out, out_stream)
             .expect("writer close");
         writer.next_event(tick).expect("flush writer");
 
@@ -4353,9 +4435,7 @@ mod tests {
             }
         }
 
-        reader
-            .abandon_stream(&writer_peer, conn, stream)
-            .expect("abandon");
+        reader.abandon_stream(conn, stream).expect("abandon");
         // Its three bytes were acknowledged, so the stream settled and an
         // over-acknowledgement is a no-op rather than `AckExceedsDelivered`.
         reader

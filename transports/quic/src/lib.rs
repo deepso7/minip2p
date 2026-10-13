@@ -44,12 +44,14 @@ mod stream_tests;
 #[cfg(test)]
 mod test_peer;
 mod tls;
+#[cfg(test)]
+mod write_fairness_tests;
 
 pub use config::{QuicLimits, QuicNodeConfig};
 #[cfg(feature = "diagnostics")]
 pub use diagnostics::{ConnectionDiagnostics, DatagramCounters, datagram_counters};
 
-use connection::{Cx, QuicConnection};
+use connection::{Cx, QuicConnection, SendCaps};
 use diagnostics::{ConnectionCounters, DatagramTally};
 use socket::{Received, Socket, Sockets};
 use tls::{HostTime, TlsIdentity};
@@ -212,10 +214,18 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, TransportErr
         });
     }
     // A zero queue could never free half of itself, so a Full write would
-    // never be told it can retry.
-    if limits.max_pending_stream_bytes == 0 {
+    // never be told it can retry; nor could an application stream whose
+    // whole connection queue is the control reserve.
+    if limits.max_pending_bytes_per_stream == 0 {
         return Err(TransportError::InvalidConfig {
-            reason: "max_pending_stream_bytes must be greater than zero".into(),
+            reason: "max_pending_bytes_per_stream must be greater than zero".into(),
+        });
+    }
+    if limits.max_pending_connection_bytes <= limits.control_stream_reserve_bytes {
+        return Err(TransportError::InvalidConfig {
+            reason:
+                "max_pending_connection_bytes must be greater than control_stream_reserve_bytes"
+                    .into(),
         });
     }
     // QUIC treats a zero idle timeout as "no timeout", which would keep dead
@@ -742,7 +752,7 @@ impl QuicTransport {
                     conn,
                     endpoint.clone(),
                     limits.max_streams_per_connection,
-                    limits.max_pending_stream_bytes,
+                    SendCaps::new(&limits),
                     counters,
                 );
                 self.connections.insert(id, conn);
@@ -905,7 +915,7 @@ impl Transport for QuicTransport {
             conn,
             ConnectionEndpoint::from_peer_addr(addr),
             limits.max_streams_per_connection,
-            limits.max_pending_stream_bytes,
+            SendCaps::new(&limits),
             ConnectionCounters::default(),
         );
         self.connections.insert(id, conn);
@@ -1026,6 +1036,12 @@ impl Transport for QuicTransport {
         let result = conn.ack_stream(stream_id, bytes, &mut self.pending_events);
         self.service(id, Instant::now());
         result
+    }
+
+    fn set_control_stream(&mut self, id: ConnectionId, stream_id: StreamId, control: bool) {
+        if let Some(conn) = self.connections.get_mut(&id) {
+            conn.set_control_stream(stream_id, control, &mut self.pending_events);
+        }
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {

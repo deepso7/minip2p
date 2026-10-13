@@ -304,25 +304,32 @@ fn stream_operations_reject_ids_not_allocated_by_transport() {
 }
 
 #[test]
-fn zero_pending_limits_are_rejected() {
+fn pending_limits_that_could_never_wake_a_writer_are_rejected() {
     let zero_datagrams = QuicLimits {
         max_pending_datagrams: 0,
         ..QuicLimits::default()
     };
     let zero_stream_bytes = QuicLimits {
-        max_pending_stream_bytes: 0,
+        max_pending_bytes_per_stream: 0,
+        ..QuicLimits::default()
+    };
+    // Application streams would have no room at all.
+    let reserve_is_everything = QuicLimits {
+        max_pending_connection_bytes: 4_096,
+        control_stream_reserve_bytes: 4_096,
         ..QuicLimits::default()
     };
     for (limits, field) in [
         (zero_datagrams, "max_pending_datagrams"),
-        (zero_stream_bytes, "max_pending_stream_bytes"),
+        (zero_stream_bytes, "max_pending_bytes_per_stream"),
+        (reserve_is_everything, "control_stream_reserve_bytes"),
     ] {
         let result = QuicTransport::bind(
             QuicNodeConfig::generate().with_limits(limits),
             &["/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr")],
         );
         let error = match result {
-            Ok(_) => panic!("zero {field} must be rejected"),
+            Ok(_) => panic!("{field} must be rejected"),
             Err(error) => error,
         };
         assert!(matches!(
@@ -335,7 +342,9 @@ fn zero_pending_limits_are_rejected() {
 #[test]
 fn write_larger_than_queue_cap_succeeds_when_the_engine_accepts_it() {
     let limits = QuicLimits {
-        max_pending_stream_bytes: 8,
+        max_pending_bytes_per_stream: 8,
+        max_pending_connection_bytes: 8,
+        control_stream_reserve_bytes: 0,
         ..QuicLimits::default()
     };
     let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
@@ -374,7 +383,9 @@ fn write_larger_than_queue_cap_succeeds_when_the_engine_accepts_it() {
 #[test]
 fn a_partially_accepted_write_does_not_pin_the_callers_buffer() {
     let limits = QuicLimits {
-        max_pending_stream_bytes: 1024,
+        max_pending_bytes_per_stream: 1024,
+        max_pending_connection_bytes: 1024,
+        control_stream_reserve_bytes: 0,
         ..QuicLimits::default()
     };
     let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
@@ -395,7 +406,9 @@ fn a_partially_accepted_write_does_not_pin_the_callers_buffer() {
 #[test]
 fn a_write_past_the_pending_cap_is_full_and_resumes_on_writable() {
     let limits = QuicLimits {
-        max_pending_stream_bytes: 8,
+        max_pending_bytes_per_stream: 8,
+        max_pending_connection_bytes: 8,
+        control_stream_reserve_bytes: 0,
         ..QuicLimits::default()
     };
     let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
@@ -500,7 +513,9 @@ fn resend_on_writable(
 #[test]
 fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
     let limits = QuicLimits {
-        max_pending_stream_bytes: 64 * 1024,
+        max_pending_bytes_per_stream: 64 * 1024,
+        max_pending_connection_bytes: 64 * 1024,
+        control_stream_reserve_bytes: 0,
         ..QuicLimits::default()
     };
     let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);

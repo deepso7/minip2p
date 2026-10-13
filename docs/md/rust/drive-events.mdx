@@ -123,12 +123,12 @@ Synchronous method failures are returned as `minip2p::Error`. Non-fatal problems
 
 ## Stream and connection shutdown
 
-- Call `close_stream_write` after the final byte for a graceful half-close.
+- Call `close_stream_write` after the final byte for a graceful half-close, or `StreamWriter::close_write` to send it once a held tail has been accepted.
 - Call `reset_stream` when the peer should observe abrupt termination and the application still wants terminal events.
 - Call `abandon_stream` when no matching buffered or future events should be delivered.
 - Call `disconnect` to close the active peer connection.
 
-`Endpoint` does not run a background shutdown sequence after it is dropped. Drive any graceful application-level close exchanges before leaving scope, then call `endpoint.close()?`. `close` consumes the endpoint, disconnects peers, and briefly drains the resulting events. Dropping also disconnects, but ignores errors.
+`Endpoint` does not run a background shutdown sequence after it is dropped. Drive any graceful application-level close exchanges before leaving scope, then call `endpoint.close()`. `close` consumes the endpoint, disconnects peers, and briefly drains the resulting events. It returns a `CloseReport` with every event collected, including those still queued when you called it, and every error close's own calls hit. A failure the swarm reports as it happens (a transport refusing to close a connection, say) arrives as `EndpointEvent::Error` in `events`, so a clean close has an empty `errors` and no such event. Dropping also disconnects, but ignores errors.
 
 With the `mdns` feature, `endpoint.shutdown()` has a narrower meaning: it sends mDNS goodbyes and stops mDNS while leaving QUIC and TCP usable.
 

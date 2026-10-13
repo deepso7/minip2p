@@ -107,39 +107,23 @@ impl P2pEndpoint {
     /// or the connection closing or being replaced), which drops the tail.
     pub fn send_stream(
         &self,
-        peer_id: String,
         conn_id: u64,
         stream_id: u64,
         data: Vec<u8>,
     ) -> Result<bool, FfiError> {
-        self.0.send_stream(peer_id, conn_id, stream_id, data)
+        self.0.send_stream(conn_id, stream_id, data)
     }
     /// Half-closes a stream's write side.
-    pub fn close_stream_write(
-        &self,
-        peer_id: String,
-        conn_id: u64,
-        stream_id: u64,
-    ) -> Result<(), FfiError> {
-        self.0.close_stream_write(peer_id, conn_id, stream_id)
+    pub fn close_stream_write(&self, conn_id: u64, stream_id: u64) -> Result<(), FfiError> {
+        self.0.close_stream_write(conn_id, stream_id)
     }
     /// Resets a stream.
-    pub fn reset_stream(
-        &self,
-        peer_id: String,
-        conn_id: u64,
-        stream_id: u64,
-    ) -> Result<(), FfiError> {
-        self.0.reset_stream(peer_id, conn_id, stream_id)
+    pub fn reset_stream(&self, conn_id: u64, stream_id: u64) -> Result<(), FfiError> {
+        self.0.reset_stream(conn_id, stream_id)
     }
     /// Forgets a stream.
-    pub fn abandon_stream(
-        &self,
-        peer_id: String,
-        conn_id: u64,
-        stream_id: u64,
-    ) -> Result<(), FfiError> {
-        self.0.abandon_stream(peer_id, conn_id, stream_id)
+    pub fn abandon_stream(&self, conn_id: u64, stream_id: u64) -> Result<(), FfiError> {
+        self.0.abandon_stream(conn_id, stream_id)
     }
     /// Acknowledges `bytes` of a stream's received data as consumed,
     /// letting its sender continue. Every registered protocol needs this.

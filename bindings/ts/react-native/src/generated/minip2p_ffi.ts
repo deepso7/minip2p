@@ -298,7 +298,7 @@ export interface P2pEndpointLike {
 /**
  * Forgets a stream.
  */
-    abandonStream(peerId: string, connId: bigint, streamId: bigint) /*throws*/: void;
+    abandonStream(connId: bigint, streamId: bigint) /*throws*/: void;
 /**
  * Returns the active relay reservation.
  */
@@ -314,7 +314,7 @@ export interface P2pEndpointLike {
 /**
  * Half-closes a stream's write side.
  */
-    closeStreamWrite(peerId: string, connId: bigint, streamId: bigint) /*throws*/: void;
+    closeStreamWrite(connId: bigint, streamId: bigint) /*throws*/: void;
 /**
  * Starts one Connection attempt and returns its Connect ID.
  */
@@ -386,7 +386,7 @@ export interface P2pEndpointLike {
 /**
  * Resets a stream.
  */
-    resetStream(peerId: string, connId: bigint, streamId: bigint) /*throws*/: void;
+    resetStream(connId: bigint, streamId: bigint) /*throws*/: void;
 /**
  * Sends bytes on a stream, named by its connection and stream ids.
  *
@@ -395,7 +395,7 @@ export interface P2pEndpointLike {
  * write side ends first (`StreamWriteStopped`, `StreamClosed`, a reset,
  * or the connection closing or being replaced), which drops the tail.
  */
-    sendStream(peerId: string, connId: bigint, streamId: bigint, data: ArrayBuffer) /*throws*/: boolean;
+    sendStream(connId: bigint, streamId: bigint, data: ArrayBuffer) /*throws*/: boolean;
 /**
  * Accepted for compatibility; has no effect, since the driver sleeps until the endpoint's next deadline.
  */
@@ -466,11 +466,10 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
 /**
  * Forgets a stream.
  */
-    abandonStream(peerId: string, connId: bigint, streamId: bigint): void /*throws*/ {uniffiCaller.rustCallWithError(
+    abandonStream(connId: bigint, streamId: bigint): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
             /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_abandon_stream(
                 uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
-        FfiConverterString.lower(peerId, nativeModule().rustbuffer_alloc),
         FfiConverterUInt64.lower(connId, nativeModule().rustbuffer_alloc),
         FfiConverterUInt64.lower(streamId, nativeModule().rustbuffer_alloc),
                 callStatus);
@@ -530,11 +529,10 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
 /**
  * Half-closes a stream's write side.
  */
-    closeStreamWrite(peerId: string, connId: bigint, streamId: bigint): void /*throws*/ {uniffiCaller.rustCallWithError(
+    closeStreamWrite(connId: bigint, streamId: bigint): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
             /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_close_stream_write(
                 uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
-        FfiConverterString.lower(peerId, nativeModule().rustbuffer_alloc),
         FfiConverterUInt64.lower(connId, nativeModule().rustbuffer_alloc),
         FfiConverterUInt64.lower(streamId, nativeModule().rustbuffer_alloc),
                 callStatus);
@@ -858,11 +856,10 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
 /**
  * Resets a stream.
  */
-    resetStream(peerId: string, connId: bigint, streamId: bigint): void /*throws*/ {uniffiCaller.rustCallWithError(
+    resetStream(connId: bigint, streamId: bigint): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
             /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_reset_stream(
                 uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
-        FfiConverterString.lower(peerId, nativeModule().rustbuffer_alloc),
         FfiConverterUInt64.lower(connId, nativeModule().rustbuffer_alloc),
         FfiConverterUInt64.lower(streamId, nativeModule().rustbuffer_alloc),
                 callStatus);
@@ -879,13 +876,12 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
  * write side ends first (`StreamWriteStopped`, `StreamClosed`, a reset,
  * or the connection closing or being replaced), which drops the tail.
  */
-    sendStream(peerId: string, connId: bigint, streamId: bigint, data: ArrayBuffer): boolean /*throws*/ {
+    sendStream(connId: bigint, streamId: bigint, data: ArrayBuffer): boolean /*throws*/ {
     return FfiConverterBool.lift(uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
             /*caller:*/ (callStatus) => {
                 return nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_send_stream(
                 uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
-        FfiConverterString.lower(peerId, nativeModule().rustbuffer_alloc),
         FfiConverterUInt64.lower(connId, nativeModule().rustbuffer_alloc),
         FfiConverterUInt64.lower(streamId, nativeModule().rustbuffer_alloc),
         FfiConverterArrayBuffer.lower(data, nativeModule().rustbuffer_alloc),
@@ -1123,7 +1119,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new() !== 40346) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_abandon_stream() !== 39078) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_abandon_stream() !== 3134) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_abandon_stream");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_active_reservation() !== 7490) {
@@ -1135,7 +1131,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_cancel_connect() !== 21146) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_cancel_connect");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_close_stream_write() !== 32688) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_close_stream_write() !== 63517) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_close_stream_write");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect() !== 21790) {
@@ -1189,10 +1185,10 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_reachability() !== 4853) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_reachability");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_reset_stream() !== 50205) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_reset_stream() !== 8949) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_reset_stream");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream() !== 41451) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream() !== 31876) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_set_active() !== 10522) {

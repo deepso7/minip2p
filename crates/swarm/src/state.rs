@@ -174,6 +174,16 @@ pub(crate) enum Action {
         stream_id: StreamId,
         bytes: usize,
     },
+    /// Mark a stream as one of the swarm's control streams, or back as an
+    /// application stream (`Transport::set_control_stream`). Every stream is
+    /// control while multistream negotiates it, and ping and Identify
+    /// streams stay so; a stream negotiated for an application protocol
+    /// becomes an application stream before the application sees it.
+    SetControlStream {
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        control: bool,
+    },
 }
 
 fn stream_action_matches(action: &Action, conn_id: ConnectionId, stream_id: StreamId) -> bool {
@@ -191,6 +201,11 @@ fn stream_action_matches(action: &Action, conn_id: ConnectionId, stream_id: Stre
             | Action::ResetStream {
                 conn_id: action_conn,
                 stream_id: action_stream,
+            }
+            | Action::SetControlStream {
+                conn_id: action_conn,
+                stream_id: action_stream,
+                ..
             }
             if *action_conn == conn_id && *action_stream == stream_id
     )
@@ -218,6 +233,10 @@ fn connection_action_matches(action: &Action, conn_id: ConnectionId) -> bool {
             conn_id: action_conn,
         }
         | Action::AckStream {
+            conn_id: action_conn,
+            ..
+        }
+        | Action::SetControlStream {
             conn_id: action_conn,
             ..
         } => *action_conn == conn_id,
@@ -249,7 +268,7 @@ fn event_peer_mut(event: &mut SwarmEvent) -> Option<&mut PeerId> {
         | SwarmEvent::IdentifyReceived { peer_id, .. }
         | SwarmEvent::PeerReady { peer_id, .. }
         | SwarmEvent::PingRttMeasured { peer_id, .. }
-        | SwarmEvent::PingTimeout { peer_id }
+        | SwarmEvent::PingTimeout { peer_id, .. }
         | SwarmEvent::StreamReady { peer_id, .. }
         | SwarmEvent::StreamData { peer_id, .. }
         | SwarmEvent::StreamWritable { peer_id, .. }
@@ -388,6 +407,14 @@ pub(crate) struct SwarmState {
     /// User streams whose write the core refused because `held` had bytes for
     /// them; they get a `StreamWritable` once `held` is replayed.
     user_writable_wanted: BTreeSet<(ConnectionId, StreamId)>,
+    /// User streams whose write side the application closed or reset: no
+    /// `StreamWritable` reaches them, even one the transport had already
+    /// queued. Cleared when the stream closes.
+    user_write_ended: BTreeSet<(ConnectionId, StreamId)>,
+    /// Streams negotiated for an application protocol while `held` had
+    /// negotiation bytes for them. They stay control streams, so those bytes
+    /// keep the reserve, until the held tail is replayed.
+    pending_demotions: BTreeSet<(ConnectionId, StreamId)>,
 
     // --- Queues ---
     /// The application event queue. An event here has not been delivered:
@@ -458,6 +485,8 @@ impl SwarmState {
             events: VecDeque::new(),
             held: HeldWrites::new(),
             user_writable_wanted: BTreeSet::new(),
+            user_write_ended: BTreeSet::new(),
+            pending_demotions: BTreeSet::new(),
             actions: VecDeque::new(),
             deferred_closes: VecDeque::new(),
         }
@@ -595,6 +624,18 @@ impl SwarmState {
     /// Queues a write or close behind the stream's held bytes. Returns the
     /// action back when it may be dispatched now.
     fn hold_action(&mut self, action: Action) -> Option<Action> {
+        // Demoting a stream before its held negotiation bytes are accepted
+        // would take the control reserve away from them.
+        if let Action::SetControlStream {
+            conn_id,
+            stream_id,
+            control: false,
+        } = action
+            && self.held.is_held(conn_id, stream_id)
+        {
+            self.pending_demotions.insert((conn_id, stream_id));
+            return None;
+        }
         let Some((conn_id, stream_id)) = stream_write_key(&action) else {
             return Some(action);
         };
@@ -624,6 +665,7 @@ impl SwarmState {
         }
         self.held.forget_stream(conn_id, stream_id);
         self.user_writable_wanted.remove(&(conn_id, stream_id));
+        self.pending_demotions.remove(&(conn_id, stream_id));
         // Writes still queued for the stream would otherwise go out ahead of
         // the reset now that nothing holds them back.
         let is_write = |action: &Action| stream_write_key(action) == Some((conn_id, stream_id));
@@ -666,6 +708,10 @@ impl SwarmState {
                     data,
                 });
             }
+            // Behind the tails, and held again if one comes back Full.
+            if self.pending_demotions.remove(&key) {
+                self.mark_control(conn_id, stream_id, false);
+            }
             if held.close {
                 self.actions
                     .push_back(Action::CloseStreamWrite { conn_id, stream_id });
@@ -674,7 +720,7 @@ impl SwarmState {
                 return;
             }
         }
-        if self.abandoned_streams.contains(&key) {
+        if self.abandoned_streams.contains(&key) || self.user_write_ended.contains(&key) {
             return;
         }
         if let Some(ProtocolKind::User(_)) = self.stream_protocol(conn_id, stream_id) {
@@ -691,6 +737,7 @@ impl SwarmState {
     fn forget_held(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
         self.held.forget_stream(conn_id, stream_id);
         self.user_writable_wanted.remove(&(conn_id, stream_id));
+        self.pending_demotions.remove(&(conn_id, stream_id));
     }
 
     /// Whether no action, event, or deferred close is queued.
@@ -852,6 +899,7 @@ impl SwarmState {
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
         self.require_user_stream(peer_id, conn_id, stream_id)?;
+        self.end_user_writes(conn_id, stream_id);
         self.actions
             .push_back(Action::CloseStreamWrite { conn_id, stream_id });
         Ok(())
@@ -865,11 +913,27 @@ impl SwarmState {
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
         self.require_user_stream(peer_id, conn_id, stream_id)?;
+        self.end_user_writes(conn_id, stream_id);
         if self.reset_pending.insert((conn_id, stream_id)) {
             self.actions
                 .push_back(Action::ResetStream { conn_id, stream_id });
         }
         Ok(())
+    }
+
+    /// The application closed or reset the stream's write side: drop its
+    /// queued `StreamWritable` notices and disarm later ones.
+    fn end_user_writes(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        let key = (conn_id, stream_id);
+        self.user_writable_wanted.remove(&key);
+        self.user_write_ended.insert(key);
+        self.events.retain(|event| {
+            !matches!(
+                event,
+                SwarmEvent::StreamWritable { conn_id: c, stream_id: s, .. }
+                    if (*c, *s) == key
+            )
+        });
     }
 
     /// Reports that the transport rejected a queued stream reset.
@@ -905,6 +969,8 @@ impl SwarmState {
         self.reset_pending.remove(&key);
         self.abandoned_streams.remove(&key);
         self.user_writable_wanted.remove(&key);
+        self.user_write_ended.remove(&key);
+        let mut demote = self.pending_demotions.remove(&key);
         let mut owed = self
             .held
             .take(conn_id, stream_id)
@@ -915,11 +981,18 @@ impl SwarmState {
             if !stream_action_matches(action, conn_id, stream_id) {
                 return true;
             }
-            if let Action::SendStream { data, .. } = action {
-                owed.push_back(data.clone());
+            match action {
+                Action::SendStream { data, .. } => owed.push_back(data.clone()),
+                Action::SetControlStream { control: false, .. } => demote = true,
+                _ => {}
             }
             false
         });
+        // The new owner sends the owed bytes as application writes, so a
+        // demotion the cleanup dropped still goes out, after it.
+        if demote {
+            self.mark_control(conn_id, stream_id, false);
+        }
         owed
     }
 
@@ -1034,6 +1107,14 @@ impl SwarmState {
             .iter()
             .filter(|(_, peer)| self.established_peers.contains(*peer))
             .map(|(conn_id, peer)| (*conn_id, peer))
+    }
+
+    /// The peer whose established connection `conn_id` is; `None` for a
+    /// pending, replaced, or closed connection.
+    pub fn connection_peer(&self, conn_id: ConnectionId) -> Option<&PeerId> {
+        self.conn_to_peer.get(&conn_id).filter(|peer| {
+            self.established_peers.contains(*peer) && self.peer_to_conn.get(*peer) == Some(&conn_id)
+        })
     }
 
     /// Returns whether a transport connection is still tracked, including
@@ -1322,6 +1403,7 @@ impl SwarmState {
         target: ProtocolKind,
         now_ms: u64,
     ) {
+        self.mark_control(conn_id, stream_id, true);
         let mut negotiator = MultistreamSelect::dialer(protocol);
         negotiator.start();
         while let Some(output) = negotiator.poll_output() {
@@ -1366,20 +1448,28 @@ impl SwarmState {
 
     /// Checks that `conn_id` is `peer_id`'s connection and holds the
     /// negotiated user stream `stream_id`. Streams of a replaced or closed
-    /// connection are forgotten with it, so they never match.
+    /// connection are forgotten with it, so they never match; an outbound
+    /// stream still negotiating is [`SwarmError::StreamNotReady`].
     fn require_user_stream(
         &self,
         peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
-        if self.conn_to_peer.get(&conn_id) == Some(peer_id)
+        let peer_conn = self.conn_to_peer.get(&conn_id) == Some(peer_id);
+        if peer_conn
             && matches!(
                 self.stream_protocol(conn_id, stream_id),
                 Some(ProtocolKind::User(_))
             )
         {
             Ok(())
+        } else if peer_conn
+            && self
+                .outbound_negotiators
+                .contains_key(&(conn_id, stream_id))
+        {
+            Err(SwarmError::StreamNotReady { conn_id, stream_id })
         } else {
             Err(SwarmError::StreamNotFound {
                 peer_id: peer_id.clone(),
@@ -1784,6 +1874,7 @@ impl SwarmState {
             self.ping_deadlines.remove(peer_id);
             self.events.push_back(SwarmEvent::PingTimeout {
                 peer_id: peer_id.clone(),
+                conn_id: old,
             });
             None
         } else {
@@ -1947,7 +2038,18 @@ impl SwarmState {
     // Internal: stream event handling
     // -----------------------------------------------------------------------
 
+    /// Queues the mark that lets a stream write into the transport's control
+    /// reserve, or takes it away ([`Action::SetControlStream`]).
+    fn mark_control(&mut self, conn_id: ConnectionId, stream_id: StreamId, control: bool) {
+        self.actions.push_back(Action::SetControlStream {
+            conn_id,
+            stream_id,
+            control,
+        });
+    }
+
     fn handle_incoming_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        self.mark_control(conn_id, stream_id, true);
         let mut listener = MultistreamSelect::listener(self.inbound_protocols.clone());
         listener.start();
         self.inbound_negotiators
@@ -2096,6 +2198,7 @@ impl SwarmState {
         let key = (conn_id, stream_id);
 
         self.reset_pending.remove(&key);
+        self.user_write_ended.remove(&key);
         self.forget_held(conn_id, stream_id);
         if self.abandoned_streams.remove(&key) {
             self.inbound_negotiators.remove(&key);
@@ -2179,6 +2282,8 @@ impl SwarmState {
     fn forget_connection_streams(&mut self, conn_id: ConnectionId) {
         self.held.forget_connection(conn_id);
         self.user_writable_wanted.retain(|(cid, _)| *cid != conn_id);
+        self.user_write_ended.retain(|(cid, _)| *cid != conn_id);
+        self.pending_demotions.retain(|(cid, _)| *cid != conn_id);
         self.stream_owner.retain(|key, _| key.conn_id != conn_id);
         self.reset_pending.retain(|(cid, _)| *cid != conn_id);
         self.abandoned_streams.retain(|(cid, _)| *cid != conn_id);
@@ -2422,6 +2527,7 @@ impl SwarmState {
 
         if self.inbound_protocols.iter().any(|p| p == protocol) {
             self.insert_stream_owner(conn_id, stream_id, ProtocolKind::User(protocol.to_string()));
+            self.mark_control(conn_id, stream_id, false);
             self.events.push_back(SwarmEvent::StreamReady {
                 peer_id,
                 conn_id,
@@ -2482,6 +2588,7 @@ impl SwarmState {
             }
             ProtocolKind::IdentifyResponder => {}
             ProtocolKind::User(protocol_id) => {
+                self.mark_control(conn_id, stream_id, false);
                 self.events.push_back(SwarmEvent::StreamReady {
                     peer_id,
                     conn_id,
@@ -2602,18 +2709,30 @@ impl SwarmState {
         self.drain_identify_outputs();
     }
 
+    // Ping and Identify outputs are drained right after the input that
+    // produced them, so the peer's current connection is the one the event
+    // came from. It is fixed here, at queue time: a later replacement must
+    // not re-attribute it.
     fn handle_ping_event(&mut self, event: PingEvent) {
         match event {
             PingEvent::RttMeasured {
                 peer_id, rtt_ms, ..
             } => {
                 self.ping_deadlines.remove(&peer_id);
-                self.events
-                    .push_back(SwarmEvent::PingRttMeasured { peer_id, rtt_ms });
+                if let Some(conn_id) = self.connection_id(&peer_id) {
+                    self.events.push_back(SwarmEvent::PingRttMeasured {
+                        peer_id,
+                        conn_id,
+                        rtt_ms,
+                    });
+                }
             }
             PingEvent::Timeout { peer_id, .. } => {
                 self.ping_deadlines.remove(&peer_id);
-                self.events.push_back(SwarmEvent::PingTimeout { peer_id });
+                if let Some(conn_id) = self.connection_id(&peer_id) {
+                    self.events
+                        .push_back(SwarmEvent::PingTimeout { peer_id, conn_id });
+                }
             }
             PingEvent::OutboundStreamClosed { ref peer_id, .. } => {
                 // The outbound stream carried the in-flight ping (if any);
@@ -2638,10 +2757,13 @@ impl SwarmState {
         match event {
             IdentifyEvent::Received { peer_id, info } => {
                 self.peer_info.insert(peer_id.clone(), info.clone());
-                self.events.push_back(SwarmEvent::IdentifyReceived {
-                    peer_id: peer_id.clone(),
-                    info,
-                });
+                if let Some(conn_id) = self.connection_id(&peer_id) {
+                    self.events.push_back(SwarmEvent::IdentifyReceived {
+                        peer_id: peer_id.clone(),
+                        conn_id,
+                        info,
+                    });
+                }
                 self.try_emit_peer_ready(&peer_id);
             }
             IdentifyEvent::Error { error, .. } => {
@@ -3315,6 +3437,105 @@ mod tests {
         );
     }
 
+    /// The `control` values of the control-stream marks in `actions` for
+    /// `stream_id`, in order.
+    fn control_marks(actions: &[Action], stream_id: StreamId) -> Vec<bool> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::SetControlStream {
+                    stream_id: marked,
+                    control,
+                    ..
+                } if *marked == stream_id => Some(*control),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inbound_streams_are_control_until_they_negotiate_an_application_protocol() {
+        const PROTOCOL: &str = "/test/1";
+        let mut core = test_core();
+        core.add_protocol(PROTOCOL).expect("register protocol");
+        let peer_id = PeerId::from_public_key_protobuf(b"control-peer");
+        let conn_id = ConnectionId::new(7);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id, conn_id);
+
+        for (stream_id, protocol, marks) in [
+            (StreamId::new(3), PROTOCOL, [true, false].as_slice()),
+            (StreamId::new(7), PING_PROTOCOL_ID, [true].as_slice()),
+            (StreamId::new(11), IDENTIFY_PROTOCOL_ID, [true].as_slice()),
+        ] {
+            feed(
+                &mut core,
+                TransportEvent::IncomingStream {
+                    id: conn_id,
+                    stream_id,
+                },
+            );
+            // Marked before negotiation writes anything on it.
+            let actions = drain_actions(&mut core);
+            assert!(matches!(
+                actions.first(),
+                Some(Action::SetControlStream { control: true, .. })
+            ));
+            let mut chunk = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+            chunk.extend_from_slice(&multistream_frame(protocol));
+            feed(
+                &mut core,
+                TransportEvent::StreamData {
+                    id: conn_id,
+                    stream_id,
+                    data: Bytes::from(chunk),
+                },
+            );
+            let mut all = actions;
+            all.extend(drain_actions(&mut core));
+            assert_eq!(control_marks(&all, stream_id), marks, "{protocol}");
+        }
+    }
+
+    #[test]
+    fn an_outbound_application_stream_is_control_only_while_it_negotiates() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"outbound-control-peer");
+        let (conn_id, stream_id) = (ConnectionId::new(61), StreamId::new(7));
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+            },
+        );
+        drain_actions(&mut core);
+        core.add_protocol("/app/1").expect("register");
+        core.open_stream(&peer, "/app/1").expect("admit open");
+        let opens = drain_actions(&mut core);
+        core.opened(opens, conn_id, "/app/1", stream_id);
+        let mut actions = drain_actions(&mut core);
+        // Marked before the negotiation's first write.
+        assert!(matches!(
+            actions.first(),
+            Some(Action::SetControlStream { control: true, .. })
+        ));
+        assert_eq!(control_marks(&actions, stream_id), [true]);
+
+        let mut answer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        answer.extend_from_slice(&multistream_frame("/app/1"));
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: Bytes::from(answer),
+            },
+        );
+        actions.extend(drain_actions(&mut core));
+        assert_eq!(control_marks(&actions, stream_id), [true, false]);
+    }
+
     #[test]
     fn inbound_multistream_accepts_fallback_after_na_on_same_stream() {
         const MESHSUB_V1_2: &str = "/meshsub/1.2.0";
@@ -3398,6 +3619,10 @@ mod tests {
         ));
         assert!(matches!(
             core.actions.pop_front(),
+            Some(Action::SetControlStream { control: false, .. })
+        ));
+        assert!(matches!(
+            core.actions.pop_front(),
             Some(Action::AckStream { .. })
         ));
         assert!(core.actions.is_empty());
@@ -3441,7 +3666,17 @@ mod tests {
             },
         );
         let header = multistream_frame(MULTISTREAM_PROTOCOL_ID);
-        assert_eq!(drain_actions(&mut core), [send(&header)]);
+        assert_eq!(
+            drain_actions(&mut core),
+            [
+                Action::SetControlStream {
+                    conn_id,
+                    stream_id,
+                    control: true,
+                },
+                send(&header),
+            ]
+        );
         core.handle_send_full(
             conn_id,
             stream_id,
@@ -3461,6 +3696,8 @@ mod tests {
                 data: Bytes::from(offer),
             },
         );
+        // The stream stays a control stream while the core holds its reply,
+        // so the held bytes keep the control reserve.
         assert_eq!(
             drain_actions(&mut core),
             [Action::AckStream {
@@ -3510,9 +3747,14 @@ mod tests {
             [
                 send(&header[3..]),
                 send(&multistream_frame(PROTOCOL)),
+                Action::SetControlStream {
+                    conn_id,
+                    stream_id,
+                    control: false,
+                },
                 Action::CloseStreamWrite { conn_id, stream_id },
             ],
-            "the tail, then the queued echo, then the FIN"
+            "the tail, then the queued echo, then the demotion, then the FIN"
         );
         assert!(
             !outputs
@@ -3525,50 +3767,65 @@ mod tests {
     #[test]
     fn forgetting_a_stream_hands_back_the_bytes_the_core_still_owes() {
         const PROTOCOL: &str = "/test/1";
-        let mut core = test_core();
-        core.add_protocol(PROTOCOL).expect("register protocol");
-        let peer_id = PeerId::from_public_key_protobuf(b"bridge-relay");
-        let conn_id = ConnectionId::new(7);
-        let stream_id = StreamId::new(3);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id, conn_id);
+        // Whether the demotion is still queued or already held behind the
+        // tail when the stream changes hands.
+        for demotion_held in [false, true] {
+            let mut core = test_core();
+            core.add_protocol(PROTOCOL).expect("register protocol");
+            let peer_id = PeerId::from_public_key_protobuf(b"bridge-relay");
+            let conn_id = ConnectionId::new(7);
+            let stream_id = StreamId::new(3);
+            core.conn_to_peer.insert(conn_id, peer_id.clone());
+            core.peer_to_conn.insert(peer_id, conn_id);
 
-        // The negotiation header comes back Full, and the echo queues behind it.
-        feed(
-            &mut core,
-            TransportEvent::IncomingStream {
-                id: conn_id,
+            // The negotiation header comes back Full, and the echo queues
+            // behind it.
+            feed(
+                &mut core,
+                TransportEvent::IncomingStream {
+                    id: conn_id,
+                    stream_id,
+                },
+            );
+            let header = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+            drain_actions(&mut core);
+            core.handle_send_full(
+                conn_id,
                 stream_id,
-            },
-        );
-        let header = multistream_frame(MULTISTREAM_PROTOCOL_ID);
-        drain_actions(&mut core);
-        core.handle_send_full(
-            conn_id,
-            stream_id,
-            Bytes::copy_from_slice(&header[3..]),
-            header.len(),
-        );
-        let mut offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
-        offer.extend_from_slice(&multistream_frame(PROTOCOL));
-        feed(
-            &mut core,
-            TransportEvent::StreamData {
-                id: conn_id,
-                stream_id,
-                data: Bytes::from(offer),
-            },
-        );
+                Bytes::copy_from_slice(&header[3..]),
+                header.len(),
+            );
+            let mut offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+            offer.extend_from_slice(&multistream_frame(PROTOCOL));
+            feed(
+                &mut core,
+                TransportEvent::StreamData {
+                    id: conn_id,
+                    stream_id,
+                    data: Bytes::from(offer),
+                },
+            );
+            if demotion_held {
+                drain_actions(&mut core);
+            }
 
-        let owed: Vec<u8> = core
-            .forget_stream(conn_id, stream_id)
-            .into_iter()
-            .flatten()
-            .collect();
-        let mut expected = header[3..].to_vec();
-        expected.extend_from_slice(&multistream_frame(PROTOCOL));
-        assert_eq!(owed, expected, "the held tail, then the queued echo");
-        assert!(!core.held.is_held(conn_id, stream_id));
+            let owed: Vec<u8> = core
+                .forget_stream(conn_id, stream_id)
+                .into_iter()
+                .flatten()
+                .collect();
+            let mut expected = header[3..].to_vec();
+            expected.extend_from_slice(&multistream_frame(PROTOCOL));
+            assert_eq!(owed, expected, "the held tail, then the queued echo");
+            assert!(!core.held.is_held(conn_id, stream_id));
+            // The new owner writes application data, so the stream must not
+            // keep the control reserve.
+            assert_eq!(
+                control_marks(&drain_actions(&mut core), stream_id),
+                [false],
+                "demotion held: {demotion_held}"
+            );
+        }
     }
 
     #[test]
@@ -3640,6 +3897,49 @@ mod tests {
         assert!(
             !core.user_writable_wanted.contains(&(conn_id, stream_id)),
             "a closing stream never waits for a Writable"
+        );
+    }
+
+    #[test]
+    fn closing_or_resetting_a_stream_ends_its_writable_notices() {
+        const PROTOCOL: &str = "/test/1";
+        let mut core = test_core();
+        core.add_protocol(PROTOCOL).expect("register protocol");
+        let peer_id = PeerId::from_public_key_protobuf(b"slow-reader");
+        let conn_id = ConnectionId::new(7);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        let closed = StreamId::new(3);
+        let reset = StreamId::new(5);
+        for stream_id in [closed, reset] {
+            core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User(PROTOCOL.to_string()));
+            // One notice already queued, and one still in the transport.
+            feed(
+                &mut core,
+                TransportEvent::StreamWritable {
+                    id: conn_id,
+                    stream_id,
+                },
+            );
+        }
+
+        core.close_stream_write(&peer_id, conn_id, closed)
+            .expect("close is accepted");
+        core.reset_stream(&peer_id, conn_id, reset)
+            .expect("reset is accepted");
+        for stream_id in [closed, reset] {
+            feed(
+                &mut core,
+                TransportEvent::StreamWritable {
+                    id: conn_id,
+                    stream_id,
+                },
+            );
+        }
+
+        assert!(
+            drain_events(&mut core).is_empty(),
+            "no Writable reaches a stream the app closed or reset"
         );
     }
 
@@ -3847,6 +4147,42 @@ mod tests {
                 stream_id
             })) if conn_id == conn && stream_id == stream
         ));
+    }
+
+    /// A stream `open_stream` handed out is not ready, not gone, until its
+    /// negotiation finishes.
+    #[test]
+    fn a_negotiating_stream_is_not_ready_until_negotiated() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"not-ready-peer");
+        let (conn, stream) = (ConnectionId::new(48), StreamId::new(14));
+        core.conn_to_peer.insert(conn, peer.clone());
+        core.peer_to_conn.insert(peer.clone(), conn);
+        core.outbound_negotiators.insert(
+            (conn, stream),
+            PendingOutbound {
+                negotiator: MultistreamSelect::dialer("/test/1"),
+                target: ProtocolKind::User("/test/1".into()),
+                deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+            },
+        );
+        let not_ready = Err(SwarmError::StreamNotReady {
+            conn_id: conn,
+            stream_id: stream,
+        });
+        assert_eq!(
+            core.admit_user_write(&peer, conn, stream, Bytes::from_static(b"x"))
+                .map(drop),
+            not_ready
+        );
+        assert_eq!(core.close_stream_write(&peer, conn, stream), not_ready);
+        assert_eq!(core.reset_stream(&peer, conn, stream), not_ready);
+
+        // Negotiated: the same stream takes writes.
+        core.outbound_negotiators.remove(&(conn, stream));
+        core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
+        core.admit_user_write(&peer, conn, stream, Bytes::from_static(b"x"))
+            .expect("a negotiated stream takes writes");
     }
 
     #[test]
@@ -4528,7 +4864,15 @@ mod tests {
             .expect("not ready yet, so no protocol rejection");
 
         identify_on(&mut core, replacement, StreamId::new(1), &["/app/1"]);
-        assert_eq!(ready_conns(&drain_events(&mut core)), [replacement]);
+        let events = drain_events(&mut core);
+        assert_eq!(ready_conns(&events), [replacement]);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::IdentifyReceived { conn_id, .. } if *conn_id == replacement
+            )),
+            "Identify names the connection it arrived on: {events:?}"
+        );
         assert_eq!(
             core.peer_readiness(&peer_id).map(|(conn, _)| conn),
             Some(replacement)
@@ -4662,7 +5006,7 @@ mod tests {
         let timed_out: Vec<_> = outputs
             .iter()
             .filter_map(|output| match output {
-                Output::Event(SwarmEvent::PingTimeout { peer_id }) => Some(peer_id),
+                Output::Event(SwarmEvent::PingTimeout { peer_id, .. }) => Some(peer_id),
                 _ => None,
             })
             .collect();
@@ -5058,9 +5402,11 @@ mod tests {
         assert_eq!(core.next_deadline(Now::from_millis(1_500)), None);
         let events = drain_events(&mut core);
         assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, SwarmEvent::PingRttMeasured { .. }))
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::PingRttMeasured { conn_id: id, .. } if *id == conn_id
+            )),
+            "the RTT names the connection it was measured on: {events:?}"
         );
     }
 
@@ -5086,9 +5432,11 @@ mod tests {
         core.handle_tick(11_001);
         let events = drain_events(&mut core);
         assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, SwarmEvent::PingTimeout { .. }))
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::PingTimeout { conn_id: id, .. } if *id == conn_id
+            )),
+            "the timeout names the connection the ping was sent on: {events:?}"
         );
         assert_eq!(core.next_deadline(Now::from_millis(11_001)), None);
     }
@@ -5493,9 +5841,13 @@ mod tests {
             core.established_connections().collect::<Vec<_>>(),
             vec![(direct, &peer)]
         );
+        assert_eq!(core.connection_peer(direct), Some(&peer));
+        assert_eq!(core.connection_peer(circuit), None, "replaced");
+        assert_eq!(core.connection_peer(unverified), None, "not established");
 
         feed(&mut core, TransportEvent::Closed { id: direct });
         assert_eq!(core.established_connections().count(), 0);
+        assert_eq!(core.connection_peer(direct), None);
     }
 
     /// Peer ids that sort below and above [`tie_break_core`]'s own.

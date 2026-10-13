@@ -49,9 +49,14 @@ pub enum SwarmEvent {
         old: ConnectionId,
         new: ConnectionId,
     },
-    /// Identify information received from a remote peer.
+    /// Identify information received from a remote peer on `conn_id`.
+    ///
+    /// `conn_id` is fixed when the event is queued; after a
+    /// [`ConnectionReplaced`](Self::ConnectionReplaced) it still names the
+    /// connection the message arrived on.
     IdentifyReceived {
         peer_id: PeerId,
+        conn_id: ConnectionId,
         info: IdentifyMessage,
     },
     /// A peer is ready for application-level operations on `conn_id`.
@@ -69,10 +74,17 @@ pub enum SwarmEvent {
         conn_id: ConnectionId,
         protocols: Vec<String>,
     },
-    /// A ping RTT measurement completed.
-    PingRttMeasured { peer_id: PeerId, rtt_ms: u64 },
-    /// A ping timed out.
-    PingTimeout { peer_id: PeerId },
+    /// A ping RTT measurement completed on `conn_id`.
+    PingRttMeasured {
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+        rtt_ms: u64,
+    },
+    /// A ping sent on `conn_id` timed out.
+    PingTimeout {
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+    },
     /// A user-registered protocol was successfully negotiated on a stream.
     /// `initiated_locally` is `true` when we opened the stream and `false`
     /// when the remote peer did.
@@ -150,7 +162,7 @@ impl SwarmEvent {
             | Self::IdentifyReceived { peer_id, .. }
             | Self::PeerReady { peer_id, .. }
             | Self::PingRttMeasured { peer_id, .. }
-            | Self::PingTimeout { peer_id }
+            | Self::PingTimeout { peer_id, .. }
             | Self::StreamReady { peer_id, .. }
             | Self::StreamData { peer_id, .. }
             | Self::StreamWritable { peer_id, .. }
@@ -268,6 +280,15 @@ pub enum SwarmError {
         /// Connection the caller expected the stream to live on.
         conn_id: ConnectionId,
         /// Stream id supplied by the caller.
+        stream_id: StreamId,
+    },
+    /// The stream is still negotiating: its id came from `open_stream`, and
+    /// only `abandon_stream` takes it before [`SwarmEvent::StreamReady`].
+    /// Neither gone nor retryable on a Writable: wait for its `StreamReady`
+    /// (or the error that ends the open).
+    #[error("user stream {stream_id} on connection {conn_id} is still negotiating")]
+    StreamNotReady {
+        conn_id: ConnectionId,
         stream_id: StreamId,
     },
     /// The ping state machine rejected the request (e.g. a ping is already

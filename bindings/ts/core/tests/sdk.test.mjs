@@ -221,6 +221,7 @@ test("inbound relayed path events preserve relay provenance", async () => {
 
   backend.emit({
     inner: {
+      connId: 4,
       path: {
         inner: { relayPeerId: "relay" },
         tag: PathKind_Tags.Relayed,
@@ -233,6 +234,7 @@ test("inbound relayed path events preserve relay provenance", async () => {
 
   assert.deepEqual(events, [
     {
+      connId: 4,
       path: { kind: "relayed", relayPeerId: "relay" },
       peerId: "peer",
     },
@@ -292,7 +294,7 @@ test("inbound streams are abandoned only when there is no named or waiter claima
 
   backend.emit(streamReady({ streamId: 8 }));
   await tick();
-  assert.deepEqual(backend.operations.at(-1), ["abandon", "peer", 2, 8]);
+  assert.deepEqual(backend.operations.at(-1), ["abandon", 2, 8]);
 
   const claimed = endpoint.once("stream", { timeoutMs: 1000 });
   backend.emit(streamReady({ streamId: 9 }));
@@ -300,7 +302,7 @@ test("inbound streams are abandoned only when there is no named or waiter claima
   assert.ok(stream instanceof Stream);
   assert.equal(
     backend.operations.some(
-      (operation) => operation[0] === "abandon" && operation[3] === 9
+      (operation) => operation[0] === "abandon" && operation[2] === 9
     ),
     false
   );
@@ -741,7 +743,7 @@ test("ping coalesces native work while caller abort remains independent", async 
   assert.equal(backend.pingCalls, 1);
 
   backend.emit({
-    inner: { peerId: "peer", rttMs: 7 },
+    inner: { connId: 1, peerId: "peer", rttMs: 7 },
     tag: P2pEvent_Tags.PingRttMeasured,
   });
   assert.equal(await second, 7);
@@ -1334,7 +1336,7 @@ test("local stream reset and abandon emit closed exactly once", async () => {
 
     assert.equal(closed, 1);
     await assert.rejects(lateWrite, ClosedError);
-    assert.deepEqual(backend.operations, [[operation, "peer", 2, 3]]);
+    assert.deepEqual(backend.operations, [[operation, 2, 3]]);
     await assert.rejects(reading, ClosedError);
     await assert.rejects(stream.read(), ClosedError);
     endpoint.close();
@@ -1434,7 +1436,7 @@ test("openStream correlates full available identity and abandons late ready", as
   await assert.rejects(late, TimeoutError);
   backend.emit(streamReady({ initiatedLocally: true, streamId: 4 }));
   await tick();
-  assert.deepEqual(backend.operations.at(-1), ["abandon", "peer", 2, 4]);
+  assert.deepEqual(backend.operations.at(-1), ["abandon", 2, 4]);
   endpoint.close();
 });
 
@@ -1450,7 +1452,7 @@ test("orphaned locally initiated streams are durably abandoned", async () => {
   await tick();
 
   assert.equal(claimed, 0);
-  assert.deepEqual(backend.operations, [["abandon", "peer", 2, 99]]);
+  assert.deepEqual(backend.operations, [["abandon", 2, 99]]);
   endpoint.close();
 });
 
@@ -1465,7 +1467,7 @@ test("a throwing inbound stream handler does not claim ownership", async () => {
   await tick();
   await tick();
 
-  assert.deepEqual(backend.operations, [["abandon", "peer", 2, 88]]);
+  assert.deepEqual(backend.operations, [["abandon", 2, 88]]);
   endpoint.close();
 });
 

@@ -31,7 +31,7 @@ mod portable;
 mod pubsub;
 #[cfg(feature = "std")]
 mod std;
-#[cfg(any(feature = "_nat-driver", feature = "pubsub"))]
+#[cfg(feature = "pubsub")]
 mod stream_conns;
 
 pub use portable::*;

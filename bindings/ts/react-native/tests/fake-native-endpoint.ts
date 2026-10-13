@@ -201,12 +201,7 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     this.consumed.push({ bytes: Number(bytes), connId, streamId });
   }
 
-  sendStream(
-    _peerId: string,
-    connId: bigint,
-    streamId: bigint,
-    data: ArrayBuffer
-  ): boolean {
+  sendStream(connId: bigint, streamId: bigint, data: ArrayBuffer): boolean {
     if (this.liveConnId !== undefined && connId !== this.liveConnId) {
       throw new Error(
         `stream ${streamId} on connection ${connId} is not active`

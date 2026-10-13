@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use minip2p_core::{Bytes, ConnectId, Multiaddr, PeerAddr, PeerId, Protocol, select_direct_addrs};
 use minip2p_platform::{Deadline, Now};
-use minip2p_swarm::SwarmEvent;
+use minip2p_swarm::{HeldWrites, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId};
 
 use minip2p_autonat::AUTONAT_PROTOCOL_ID;
@@ -16,7 +16,7 @@ use crate::config::NatConfig;
 use crate::events::{NatAction, NatEvent};
 use crate::housekeeping::Housekeeping;
 use crate::inbound::InboundCircuit;
-use crate::swarm::{DialStart, NatSwarm};
+use crate::swarm::{DialStart, HoldingSwarm, NatSwarm};
 use crate::types::{NatToken, Path, PromoteError, ReachabilityState, ReservationInfo};
 
 /// Roles a stream owned by the agent can play. Streams not in the registry
@@ -428,10 +428,10 @@ impl Shared {
     }
 }
 
-/// Writes NAT control bytes on an exact stream. A refused write is not
-/// retried here: hosts that ride out a full stream hold its tail in their
-/// [`NatSwarm`] adapter, and every exchange's own deadline ends one that
-/// stalls.
+/// Writes NAT control bytes on an exact stream. Every agent entry point that
+/// writes wraps the host's swarm in a [`HoldingSwarm`], so a write refused as
+/// Full is held and resent on the stream's Writable; any other refusal is
+/// left to the exchange's own deadline.
 pub(crate) fn send(
     swarm: &mut dyn NatSwarm,
     peer: &PeerId,
@@ -493,10 +493,8 @@ pub struct ConnectLegs {
     /// through relays that are not configured. Empty keeps config order.
     pub target_addrs: Vec<Multiaddr>,
     /// When the caller gives up on the attempt, on the [`Now::monotonic_ms`]
-    /// clock. The relay leg ends at the earlier of this and
-    /// [`NatConfig::relay_leg_deadline_ms`] after it starts, so its relays
-    /// split time the attempt actually has. `None` when the caller has no
-    /// deadline.
+    /// clock. It clips every relay's [`NatConfig::relay_timeout_ms`] and
+    /// every upgrade budget. `None` when the caller has no deadline.
     pub deadline_ms: Option<u64>,
 }
 
@@ -525,6 +523,9 @@ pub struct NatAgent {
     housekeeping: Housekeeping,
     inbound: BTreeMap<u64, InboundCircuit>,
     next_inbound_id: u64,
+    /// Unsent tails of writes the swarm refused as Full, resent on the
+    /// stream's Writable.
+    held: HeldWrites,
 }
 
 impl NatAgent {
@@ -561,7 +562,27 @@ impl NatAgent {
             housekeeping,
             inbound: BTreeMap::new(),
             next_inbound_id: 0,
+            held: HeldWrites::new(),
         }
+    }
+
+    /// Runs `f` with `swarm` wrapped so writes it refuses as Full are held
+    /// for replay instead of lost.
+    fn holding<R>(
+        &mut self,
+        swarm: &mut dyn NatSwarm,
+        f: impl FnOnce(&mut Self, &mut HoldingSwarm<'_>) -> R,
+    ) -> R {
+        let mut held = core::mem::take(&mut self.held);
+        let result = f(
+            self,
+            &mut HoldingSwarm {
+                inner: swarm,
+                held: &mut held,
+            },
+        );
+        self.held = held;
+        result
     }
 
     /// Seeds the jitter on reservation retry backoffs from the host's
@@ -591,9 +612,13 @@ impl NatAgent {
         if self.attempts.contains_key(&id) {
             return;
         }
-        if let Some(attempt) = ConnectAttempt::start(id, peer, legs, swarm, &mut self.shared, now) {
-            self.attempts.insert(id, attempt);
-        }
+        self.holding(swarm, |agent, swarm| {
+            if let Some(attempt) =
+                ConnectAttempt::start(id, peer, legs, swarm, &mut agent.shared, now)
+            {
+                agent.attempts.insert(id, attempt);
+            }
+        });
     }
 
     /// Whether any relay is configured.
@@ -615,7 +640,56 @@ impl NatAgent {
     /// further events are emitted for `id`.
     pub fn cancel<S: NatSwarm>(&mut self, swarm: &mut S, id: ConnectId, now: Now) {
         if let Some(mut attempt) = self.attempts.remove(&id) {
-            attempt.cancel(swarm, &mut self.shared, now);
+            self.holding(swarm, |agent, swarm| {
+                attempt.cancel(swarm, &mut agent.shared, now);
+            });
+        }
+    }
+
+    /// The host's Connection-attempt engine settled attempt `id`: drop what
+    /// the agent still holds for it (relay-leg streams, the DCUtR exchange,
+    /// punch dials, timers) and emit no further attempt event for it.
+    ///
+    /// `kept` is the connection the attempt settled on, which stays open
+    /// even when this attempt promoted it; `None` (a failed or cancelled
+    /// attempt) closes the attempt's circuit like [`Self::cancel`]. Attempt
+    /// outcomes for `id` still queued and undrained (`ConnectFailed`,
+    /// `FellBackToRelay`, `HolePunchFailed`) are dropped, even when the
+    /// attempt had already finished.
+    pub fn settled<S: NatSwarm>(
+        &mut self,
+        swarm: &mut S,
+        id: ConnectId,
+        kept: Option<ConnectionId>,
+        now: Now,
+    ) {
+        self.shared.events.retain(|event| {
+            !(event.connect_id() == Some(id)
+                && matches!(
+                    event,
+                    NatEvent::ConnectFailed { .. }
+                        | NatEvent::FellBackToRelay { .. }
+                        | NatEvent::HolePunchFailed { .. }
+                ))
+        });
+        let Some(mut attempt) = self.attempts.remove(&id) else {
+            return;
+        };
+        self.holding(swarm, |agent, swarm| match kept {
+            Some(kept) => attempt.settled(kept, swarm, &mut agent.shared, now),
+            None => attempt.cancel(swarm, &mut agent.shared, now),
+        });
+    }
+
+    /// The bytes the agent held for `stream_id` of `conn_id` are now fully
+    /// written. `now` is when the last held byte left. A DCUtR round times
+    /// its RTT from here. Streams the agent no longer waits on are ignored.
+    fn write_completed(&mut self, conn_id: ConnectionId, stream_id: StreamId, now: Now) {
+        if let Some((_, StreamRole::DcutrInbound(id))) =
+            self.shared.streams.get(&(conn_id, stream_id))
+            && let Some(circuit) = self.inbound.get_mut(id)
+        {
+            circuit.on_write_completed(conn_id, stream_id, now);
         }
     }
 
@@ -657,7 +731,28 @@ impl NatAgent {
         is_circuit: bool,
         now: Now,
     ) -> bool {
-        self.handle(swarm, event, is_circuit, now)
+        self.holding(swarm, |agent, swarm| {
+            swarm.held.observe(event);
+            if let SwarmEvent::StreamWritable {
+                peer_id,
+                conn_id,
+                stream_id,
+            } = event
+                // A finished exchange releases its stream at once, so a tail
+                // and FIN still held for it are replayed without ownership.
+                && (swarm.held.is_held(*conn_id, *stream_id)
+                    || agent
+                        .shared
+                        .owned_role(*conn_id, peer_id, *stream_id)
+                        .is_some())
+            {
+                if swarm.replay(peer_id, *conn_id, *stream_id, now.monotonic_ms) {
+                    agent.write_completed(*conn_id, *stream_id, now);
+                }
+                return true;
+            }
+            agent.handle(swarm, event, is_circuit, now)
+        })
     }
 
     fn handle(
@@ -690,7 +785,7 @@ impl NatAgent {
                 touched_state = true;
                 self.connection_replaced(peer_id, *old, *new, is_circuit, swarm, now);
             }
-            SwarmEvent::IdentifyReceived { peer_id, info } => {
+            SwarmEvent::IdentifyReceived { peer_id, info, .. } => {
                 // The remote reports the transport address it sees us from.
                 // Behind a NAT that is our public mapping — the only usable
                 // DCUtR punch candidate, since bound addresses are private.
@@ -737,7 +832,9 @@ impl NatAgent {
                     let dcutr_attempt = (protocol_id == DCUTR_PROTOCOL_ID)
                         .then(|| {
                             self.attempts.iter().find_map(|(id, attempt)| {
-                                attempt.accepts_dcutr(peer_id, *conn_id).then_some(*id)
+                                attempt
+                                    .accepts_dcutr(peer_id, *conn_id, &self.shared)
+                                    .then_some(*id)
                             })
                         })
                         .flatten();
@@ -749,7 +846,13 @@ impl NatAgent {
                             StreamRole::DcutrAttempt(id),
                         );
                         if let Some(attempt) = self.attempts.get_mut(&id) {
-                            attempt.on_dcutr_stream_opened(*conn_id, *stream_id, &self.shared);
+                            attempt.on_dcutr_stream_opened(
+                                *conn_id,
+                                *stream_id,
+                                swarm,
+                                &mut self.shared,
+                                now,
+                            );
                         }
                         handled = true;
                     } else if !trusted_stop {
@@ -895,13 +998,15 @@ impl NatAgent {
     /// Advances time-based state: stagger expiry, leg deadlines, punch
     /// windows, connect deadlines.
     pub fn handle_tick<S: NatSwarm>(&mut self, swarm: &mut S, now: Now) {
-        for attempt in self.attempts.values_mut() {
-            attempt.on_tick(swarm, &mut self.shared, now);
-        }
-        self.housekeeping.on_tick(swarm, &mut self.shared, now);
-        for circuit in self.inbound.values_mut() {
-            circuit.on_tick(swarm, &mut self.shared, now);
-        }
+        self.holding(swarm, |agent, swarm| {
+            for attempt in agent.attempts.values_mut() {
+                attempt.on_tick(swarm, &mut agent.shared, now);
+            }
+            agent.housekeeping.on_tick(swarm, &mut agent.shared, now);
+            for circuit in agent.inbound.values_mut() {
+                circuit.on_tick(swarm, &mut agent.shared, now);
+            }
+        });
         self.reap_done();
     }
 
@@ -950,7 +1055,9 @@ impl NatAgent {
         self.shared.tokens.remove(&token);
         match result {
             Ok(conn_id) => self.dial_started(token, purpose, conn_id),
-            Err(reason) => self.finish_dial_failure(token, purpose, reason, swarm, now),
+            Err(reason) => self.holding(swarm, |agent, swarm| {
+                agent.finish_dial_failure(token, purpose, reason, swarm, now);
+            }),
         }
         self.reap_done();
     }
@@ -1023,27 +1130,55 @@ impl NatAgent {
         result: Result<ConnectionId, PromoteError>,
         now: Now,
     ) {
-        match self.shared.tokens.get(&token) {
+        // A promotion whose owner already ended (timed out, cancelled,
+        // settled) produced a circuit nobody holds: close it.
+        let orphaned = match self.shared.tokens.get(&token) {
             Some(&TokenPurpose::PromoteAttempt(id)) => {
                 self.shared.tokens.remove(&token);
-                if let Some(attempt) = self.attempts.get_mut(&id) {
-                    attempt.on_promote_result(result, swarm, &mut self.shared, now);
-                }
+                self.holding(swarm, |agent, swarm| match agent.attempts.get_mut(&id) {
+                    Some(attempt) => {
+                        attempt.on_promote_result(token, result, swarm, &mut agent.shared, now);
+                        None
+                    }
+                    None => result.ok(),
+                })
             }
             Some(&TokenPurpose::PromoteInbound(id)) => {
                 self.shared.tokens.remove(&token);
-                if let Some(circuit) = self.inbound.get_mut(&id) {
-                    circuit.on_promote_result(result, &mut self.shared, now);
+                match self.inbound.get_mut(&id) {
+                    Some(circuit) => {
+                        circuit.on_promote_result(result, &mut self.shared, now);
+                        None
+                    }
+                    None => result.ok(),
                 }
             }
             Some(TokenPurpose::Dial(_)) | None => return,
+        };
+        if let Some(conn_id) = orphaned {
+            self.shared.push_action(NatAction::CloseCircuit { conn_id });
         }
         self.reap_done();
     }
 
     /// Returns the next queued command for the driver.
     pub fn poll_action(&mut self) -> Option<NatAction> {
-        self.shared.actions.pop_front()
+        let mut action = self.shared.actions.pop_front()?;
+        if let NatAction::PromoteBridge {
+            inner_conn,
+            stream_id,
+            unsent_data,
+            ..
+        } = &mut action
+            && let Some(held) = self.held.take(*inner_conn, *stream_id)
+        {
+            *unsent_data = held
+                .tails
+                .iter()
+                .flat_map(|tail| tail.iter().copied())
+                .collect();
+        }
+        Some(action)
     }
 
     /// Returns the next application-visible event.
@@ -1090,11 +1225,12 @@ impl NatAgent {
         self.housekeeping.active_reservation()
     }
 
-    /// Returns `true` when the agent has no queued outputs and no work in
-    /// flight (a settled reservation or a scheduled future probe is not
-    /// "work").
+    /// Returns `true` when the agent has no queued outputs, no held writes
+    /// awaiting a Writable, and no work in flight (a settled reservation or
+    /// a scheduled future probe is not "work").
     pub fn is_idle(&self) -> bool {
-        self.shared.actions.is_empty()
+        self.held.is_empty()
+            && self.shared.actions.is_empty()
             && self.shared.events.is_empty()
             && self.attempts.is_empty()
             && self.inbound.is_empty()
@@ -1227,8 +1363,14 @@ impl NatAgent {
                 peer: peer.clone(),
                 from: old_origin.path,
                 to,
+                old_conn_id: old,
+                new_conn_id: new,
             },
-            None => NatEvent::InboundDirectUpgrade { peer: peer.clone() },
+            None => NatEvent::InboundDirectUpgrade {
+                peer: peer.clone(),
+                old_conn_id: old,
+                new_conn_id: new,
+            },
         });
     }
 

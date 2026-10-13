@@ -73,6 +73,8 @@ struct StreamState {
     close_pending: bool,
     local_write_closed: bool,
     remote_write_closed: bool,
+    /// May queue into [`YamuxConfig::control_stream_reserve`].
+    control: bool,
 }
 
 impl StreamState {
@@ -104,6 +106,7 @@ impl StreamState {
             close_pending: false,
             local_write_closed: false,
             remote_write_closed: false,
+            control: false,
         }
     }
 
@@ -129,6 +132,28 @@ impl StreamState {
         (self.send_window != 0 && !self.send_buffer.is_empty())
             || (self.close_pending && self.send_buffer.is_empty())
     }
+}
+
+/// The aggregate send cap a stream may fill: all of it for a control stream,
+/// all but the control reserve otherwise.
+fn total_cap_for(config: &YamuxConfig, control: bool) -> usize {
+    if control {
+        config.max_total_buffered_send
+    } else {
+        config.max_total_buffered_send - config.control_stream_reserve
+    }
+}
+
+/// Room a Full stream needs on both caps before its Writable fires: half the
+/// smaller of its stream cap and the total cap it may fill. A control stream
+/// may be left only the reserve once application streams fill their share,
+/// so a non-zero reserve bounds its threshold too.
+fn writable_threshold(config: &YamuxConfig, control: bool) -> usize {
+    let mut smallest = config.max_buffered_send.min(total_cap_for(config, control));
+    if control && config.control_stream_reserve != 0 {
+        smallest = smallest.min(config.control_stream_reserve);
+    }
+    (smallest / 2).max(1)
 }
 
 /// Caller-driven Yamux stream-multiplexing session.
@@ -236,6 +261,11 @@ impl YamuxSession {
                 "send caps must be greater than zero",
             ));
         }
+        if config.max_total_buffered_send <= config.control_stream_reserve {
+            return Err(YamuxError::InvalidConfig(
+                "max_total_buffered_send must be greater than control_stream_reserve",
+            ));
+        }
         Ok(Self::from_validated_config(role, config))
     }
 
@@ -335,14 +365,13 @@ impl YamuxSession {
     /// as remote credit allows. Empty data is a no-op.
     pub fn send(&mut self, stream: u32, data: Bytes) -> Result<(), YamuxError> {
         self.ensure_active()?;
-        let total_room = self
-            .config
-            .max_total_buffered_send
-            .saturating_sub(self.total_buffered_send);
+        let config = &self.config;
+        let total_buffered_send = self.total_buffered_send;
         let state = self
             .streams
             .get_mut(&stream)
             .ok_or(YamuxError::UnknownStream(stream))?;
+        let total_room = total_cap_for(config, state.control).saturating_sub(total_buffered_send);
         if state.local_write_closed || state.close_pending {
             return Err(YamuxError::StreamWriteClosed(stream));
         }
@@ -371,6 +400,18 @@ impl YamuxSession {
             stream,
             unsent: data.slice(accepted..),
         })
+    }
+
+    /// Marks a stream as a control stream, which may queue into
+    /// [`YamuxConfig::control_stream_reserve`], or back as an application
+    /// stream. Streams start as application streams; an unknown stream is
+    /// ignored.
+    pub fn set_control(&mut self, stream: u32, control: bool) {
+        if let Some(state) = self.streams.get_mut(&stream) {
+            state.control = control;
+            // A control stream may have room an application one lacked.
+            self.wake_writable();
+        }
     }
 
     /// Gracefully half-closes a stream after all accepted data.
@@ -843,32 +884,25 @@ impl YamuxSession {
     }
 
     /// Queues [`YamuxOutput::Writable`] for every armed stream that can now
-    /// queue at least half of the smaller send cap.
+    /// queue at least [`writable_threshold`] on both its stream cap and the
+    /// total cap it may fill ([`total_cap_for`]).
     fn wake_writable(&mut self) {
         if self.writable_armed.is_empty() {
             return;
         }
-        let threshold = (self
-            .config
-            .max_buffered_send
-            .min(self.config.max_total_buffered_send)
-            / 2)
-        .max(1);
-        let total_room = self
-            .config
-            .max_total_buffered_send
-            .saturating_sub(self.total_buffered_send);
-        if total_room < threshold {
-            return;
-        }
-        let max_buffered_send = self.config.max_buffered_send;
+        let config = &self.config;
+        let total_buffered_send = self.total_buffered_send;
         let streams = &self.streams;
         let events = &mut self.events;
         self.writable_armed.retain(|stream| {
             let Some(state) = streams.get(stream) else {
                 return false;
             };
-            if max_buffered_send.saturating_sub(state.buffered_send) < threshold {
+            let threshold = writable_threshold(config, state.control);
+            if config.max_buffered_send.saturating_sub(state.buffered_send) < threshold
+                || total_cap_for(config, state.control).saturating_sub(total_buffered_send)
+                    < threshold
+            {
                 return true;
             }
             events.push_back(YamuxOutput::Writable { stream: *stream });
@@ -1031,6 +1065,8 @@ mod tests {
             max_streams: 8,
             max_buffered_send: DEFAULT_RECEIVE_WINDOW as usize,
             max_total_buffered_send: DEFAULT_RECEIVE_WINDOW as usize * 2,
+            // Tests shrink the caps; a reserve is opted into where tested.
+            control_stream_reserve: 0,
             ..YamuxConfig::default()
         }
     }
@@ -1404,6 +1440,86 @@ mod tests {
             None,
             "no second Writable without a Full"
         );
+    }
+
+    #[test]
+    fn control_streams_queue_into_the_reserve_application_streams_cannot_fill() {
+        let mut limits = config();
+        limits.max_buffered_send = 8;
+        limits.max_total_buffered_send = 12;
+        limits.control_stream_reserve = 4;
+        let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        let app = session.open_stream().unwrap();
+        let other_app = session.open_stream().unwrap();
+        let control = session.open_stream().unwrap();
+        session.set_control(control, true);
+
+        session.send(app, Bytes::from(alloc::vec![1; 8])).unwrap();
+        // Application streams stop at the cap less the reserve.
+        assert!(matches!(
+            session.send(other_app, Bytes::from_static(b"xyz")),
+            Err(YamuxError::Full { unsent, .. }) if unsent == b"xyz"[..]
+        ));
+        session
+            .send(control, Bytes::from_static(b"ping"))
+            .expect("the reserve holds a control write");
+        assert_eq!(session.total_buffered_send(), 12);
+
+        // Back to an application stream, it no longer reaches the reserve.
+        session.set_control(control, false);
+        while session.poll_frame().is_some() {}
+        assert!(matches!(
+            session.send(control, Bytes::from(alloc::vec![2; 9])),
+            Err(YamuxError::Full { unsent, .. }) if unsent.len() == 1
+        ));
+    }
+
+    #[test]
+    fn a_full_control_stream_wakes_once_the_reserve_frees_even_when_it_is_small() {
+        let mut limits = config();
+        limits.max_buffered_send = 8;
+        limits.max_total_buffered_send = 12;
+        limits.control_stream_reserve = 2;
+        let mut session = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        let apps = [
+            session.open_stream().unwrap(),
+            session.open_stream().unwrap(),
+        ];
+        let control = session.open_stream().unwrap();
+        session.set_control(control, true);
+
+        // Stalled application streams hold their whole share for good.
+        for app in apps {
+            session.streams.get_mut(&app).unwrap().send_window = 0;
+            match session.send(app, Bytes::from(alloc::vec![1; 8])) {
+                Ok(()) | Err(YamuxError::Full { .. }) => {}
+                Err(error) => panic!("{error}"),
+            }
+        }
+        assert_eq!(session.total_buffered_send(), 10);
+        assert!(matches!(
+            session.send(control, Bytes::from_static(b"ping")),
+            Err(YamuxError::Full { unsent, .. }) if unsent.len() == 2
+        ));
+
+        // Only the reserve can free, and that must be enough to wake it.
+        while session.poll_frame().is_some() {}
+        let events: Vec<_> = core::iter::from_fn(|| session.poll_event()).collect();
+        assert!(
+            events.contains(&YamuxOutput::Writable { stream: control }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_whose_reserve_leaves_application_streams_nothing_is_rejected() {
+        let mut limits = config();
+        limits.max_total_buffered_send = 8;
+        limits.control_stream_reserve = 8;
+        assert!(matches!(
+            YamuxSession::with_config(YamuxRole::Client, limits),
+            Err(YamuxError::InvalidConfig(_))
+        ));
     }
 
     #[test]

@@ -190,45 +190,27 @@ class NodeBackend implements Minip2pBackend {
     };
   }
 
-  sendStream(
-    peerId: string,
-    connId: number,
-    streamId: number,
-    data: Uint8Array
-  ): boolean {
+  sendStream(connId: number, streamId: number, data: Uint8Array): boolean {
     return translateErrors(() =>
-      this.#endpoint.sendStream(
-        peerId,
-        ...this.#nativeStream(connId, streamId),
-        data
-      )
+      this.#endpoint.sendStream(...this.#nativeStream(connId, streamId), data)
     );
   }
 
-  closeStreamWrite(peerId: string, connId: number, streamId: number): void {
+  closeStreamWrite(connId: number, streamId: number): void {
     translateErrors(() => {
-      this.#endpoint.closeStreamWrite(
-        peerId,
-        ...this.#nativeStream(connId, streamId)
-      );
+      this.#endpoint.closeStreamWrite(...this.#nativeStream(connId, streamId));
     });
   }
 
-  resetStream(peerId: string, connId: number, streamId: number): void {
+  resetStream(connId: number, streamId: number): void {
     translateErrors(() => {
-      this.#endpoint.resetStream(
-        peerId,
-        ...this.#nativeStream(connId, streamId)
-      );
+      this.#endpoint.resetStream(...this.#nativeStream(connId, streamId));
     });
   }
 
-  abandonStream(peerId: string, connId: number, streamId: number): void {
+  abandonStream(connId: number, streamId: number): void {
     translateErrors(() => {
-      this.#endpoint.abandonStream(
-        peerId,
-        ...this.#nativeStream(connId, streamId)
-      );
+      this.#endpoint.abandonStream(...this.#nativeStream(connId, streamId));
     });
   }
 
@@ -393,18 +375,19 @@ const CONNECTION_ID_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Converts one value of a native event: integers to numbers, connection IDs
- * through the connection map, and bytes to `ArrayBuffer`s. A stream ID is
+ * Converts one value of a native `tag` event: integers to numbers, connection
+ * IDs through the connection map, and bytes to `ArrayBuffer`s. A stream ID is
  * mapped together with the connection of the record that carries it.
  */
 function normalizeNativeValue(
   value: unknown,
   maps: NativeIdMaps,
+  tag: string,
   key?: string
 ): unknown {
   if (typeof value === "bigint" || typeof value === "number") {
     if (key !== undefined && CONNECTION_ID_KEYS.has(key)) {
-      return maps.connectionIds.toPublic(BigInt(value));
+      return maps.connectionIds.toPublicInEvent(tag, key, BigInt(value));
     }
     // A QUIC stop code is a 62-bit varint the remote picks: keep it whole.
     if (key === "errorCode") {
@@ -416,7 +399,7 @@ function normalizeNativeValue(
     return toArrayBuffer(value);
   }
   if (Array.isArray(value)) {
-    return value.map((item) => normalizeNativeValue(item, maps));
+    return value.map((item) => normalizeNativeValue(item, maps, tag));
   }
   if (value === null || typeof value !== "object") {
     return value;
@@ -424,7 +407,7 @@ function normalizeNativeValue(
   const record: Record<string, unknown> = Object.fromEntries(
     Object.entries(value).map(([itemKey, item]) => [
       itemKey,
-      normalizeNativeValue(item, maps, itemKey),
+      normalizeNativeValue(item, maps, tag, itemKey),
     ])
   );
   const { connId, streamId } = record;
@@ -492,6 +475,7 @@ function convertEvent(event: NativeEvent, maps: NativeIdMaps): P2pEvent {
     case P2pEvent_Tags.IdentifyReceived: {
       return {
         inner: {
+          connId: maps.connectionIds.toPublic(BigInt(event.inner.connId)),
           info: identifyInfo(event.inner.info),
           peerId: event.inner.peerId,
         },
@@ -500,7 +484,7 @@ function convertEvent(event: NativeEvent, maps: NativeIdMaps): P2pEvent {
     }
     default: {
       return {
-        inner: normalizeNativeValue(event.inner, maps),
+        inner: normalizeNativeValue(event.inner, maps, event.tag),
         tag: event.tag,
       } as P2pEvent;
     }

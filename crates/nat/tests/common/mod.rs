@@ -23,7 +23,7 @@ use minip2p_relay::{
     StopMessageType, encode_frame as relay_encode_frame,
 };
 use minip2p_swarm::{DriverError, IdentifyMessage, SwarmError, SwarmEvent};
-use minip2p_transport::{Bytes, ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId, TransportError};
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 
@@ -194,6 +194,7 @@ pub fn identify_observed(node: &mut Node, reporter: &PeerId, addr: &Multiaddr, n
     node.handle_event(
         &SwarmEvent::IdentifyReceived {
             peer_id: reporter.clone(),
+            conn_id: ConnectionId::new(1),
             info: IdentifyMessage {
                 observed_addr: Some(addr.to_bytes()),
                 ..IdentifyMessage::default()
@@ -539,6 +540,7 @@ pub enum Out {
         remote_peer: PeerId,
         role: BridgeRole,
         pending_data: Vec<u8>,
+        unsent_data: Vec<u8>,
         remote_write_closed: bool,
     },
     CloseCircuit {
@@ -564,6 +566,7 @@ impl From<NatAction> for Out {
                 remote_peer,
                 role,
                 pending_data,
+                unsent_data,
                 remote_write_closed,
             } => Out::PromoteBridge {
                 token,
@@ -573,6 +576,7 @@ impl From<NatAction> for Out {
                 remote_peer,
                 role,
                 pending_data,
+                unsent_data,
                 remote_write_closed,
             },
             NatAction::CloseCircuit { conn_id } => Out::CloseCircuit { conn_id },
@@ -600,6 +604,15 @@ pub struct FakeSwarm {
     /// The id the next stream open returns, as a transport that numbers
     /// streams per connection reuses ids across connections.
     pub next_stream_id: Option<StreamId>,
+    /// Refuse every write as Full with nothing accepted; the attempt is
+    /// still logged.
+    pub full_sends: bool,
+    /// Accept at most this many bytes of each write and refuse the rest as
+    /// Full; only the accepted bytes are logged.
+    pub accept_at_most: Option<usize>,
+    /// Fail every write with this transport error after logging it, as a
+    /// transport that may have queued a prefix does.
+    pub failed_sends: Option<TransportError>,
 }
 
 impl FakeSwarm {
@@ -723,12 +736,37 @@ impl NatSwarm for FakeSwarm {
         data: Bytes,
         _now_ms: u64,
     ) -> Result<(), NatSwarmError> {
+        if let Some(limit) = self.accept_at_most
+            && limit < data.len()
+        {
+            self.calls.push(Out::SendStream {
+                peer: peer.clone(),
+                conn: conn_id,
+                stream_id,
+                data: data.slice(..limit).to_vec(),
+            });
+            return Err(NatSwarmError::Swarm(DriverError::Full {
+                conn_id,
+                stream_id,
+                unsent: data.slice(limit..),
+            }));
+        }
         self.calls.push(Out::SendStream {
             peer: peer.clone(),
             conn: conn_id,
             stream_id,
             data: data.to_vec(),
         });
+        if let Some(error) = &self.failed_sends {
+            return Err(NatSwarmError::Swarm(DriverError::Transport(error.clone())));
+        }
+        if self.full_sends {
+            return Err(NatSwarmError::Swarm(DriverError::Full {
+                conn_id,
+                stream_id,
+                unsent: data,
+            }));
+        }
         Ok(())
     }
 
@@ -836,6 +874,10 @@ impl Node {
             .promote_result(&mut self.swarm, token, result, now);
     }
 
+    pub fn settled(&mut self, id: ConnectId, kept: Option<ConnectionId>, now: Now) {
+        self.agent.settled(&mut self.swarm, id, kept, now);
+    }
+
     pub fn path(&self, peer: &PeerId) -> Option<&minip2p_nat::Path> {
         self.agent.path(&self.swarm, peer)
     }
@@ -849,6 +891,21 @@ pub fn drain_actions(node: &mut Node) -> Vec<Out> {
     out
 }
 
-pub fn drain_events(node: &mut Node) -> Vec<NatEvent> {
+/// Every event the agent emitted, relay-leg progress included.
+pub fn drain_all_events(node: &mut Node) -> Vec<NatEvent> {
     core::iter::from_fn(|| node.agent.poll_event()).collect()
+}
+
+/// The events tests usually assert on: everything but the per-relay
+/// `RelayStarted`/`RelayFailed` diagnostics.
+pub fn drain_events(node: &mut Node) -> Vec<NatEvent> {
+    drain_all_events(node)
+        .into_iter()
+        .filter(|event| {
+            !matches!(
+                event,
+                NatEvent::RelayStarted { .. } | NatEvent::RelayFailed { .. }
+            )
+        })
+        .collect()
 }

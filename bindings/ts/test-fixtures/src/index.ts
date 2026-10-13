@@ -10,10 +10,10 @@ import { Reachability } from "../../core/src/index.js";
 import type { ConnectionInfo } from "../../core/src/index.js";
 
 export type MockBackendOperation =
-  | readonly ["abandon" | "closeWrite" | "reset", string, number, number]
+  | readonly ["abandon" | "closeWrite" | "reset", number, number]
   | readonly ["cancelConnect", number]
   | readonly ["connect", BackendConnectTarget]
-  | readonly ["write", string, number, number, readonly number[]];
+  | readonly ["write", number, number, readonly number[]];
 
 /** Scriptable, contract-complete backend for package-level SDK tests. */
 export class MockBackend implements Minip2pBackend {
@@ -132,29 +132,24 @@ export class MockBackend implements Minip2pBackend {
     );
   }
 
-  sendStream(
-    peerId: string,
-    connId: number,
-    streamId: number,
-    data: Uint8Array
-  ): boolean {
-    this.operations.push(["write", peerId, connId, streamId, [...data]]);
+  sendStream(connId: number, streamId: number, data: Uint8Array): boolean {
+    this.operations.push(["write", connId, streamId, [...data]]);
     return this.sendResults.shift() ?? true;
   }
 
-  closeStreamWrite(peerId: string, connId: number, streamId: number): void {
-    this.operations.push(["closeWrite", peerId, connId, streamId]);
+  closeStreamWrite(connId: number, streamId: number): void {
+    this.operations.push(["closeWrite", connId, streamId]);
     if (this.closeWriteError !== undefined) {
       throw this.closeWriteError;
     }
   }
 
-  resetStream(peerId: string, connId: number, streamId: number): void {
-    this.operations.push(["reset", peerId, connId, streamId]);
+  resetStream(connId: number, streamId: number): void {
+    this.operations.push(["reset", connId, streamId]);
   }
 
-  abandonStream(peerId: string, connId: number, streamId: number): void {
-    this.operations.push(["abandon", peerId, connId, streamId]);
+  abandonStream(connId: number, streamId: number): void {
+    this.operations.push(["abandon", connId, streamId]);
     if (this.abandonError !== undefined) {
       throw this.abandonError;
     }

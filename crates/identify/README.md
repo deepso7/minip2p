@@ -54,7 +54,7 @@ let mut identify = IdentifyProtocol::new(config);
 
 `observed_addr` should be the transport address we observed the remote dialing us from. Pass `None` when the information is not available.
 
-`listen_addrs` is the set of multiaddrs we're currently listening on. Typically the swarm driver snapshots this from the transport's `local_addresses()` on each `poll()` tick and passes it through — so the advertised set always reflects what we're actually bound to, with no caller ceremony required.
+`listen_addrs` is the set of multiaddrs we're currently listening on. Typically the swarm driver snapshots this from the transport's `local_addresses()` on each `poll()` tick and passes it through — so the advertised set always reflects what we're actually bound to, with no caller ceremony required. Wildcard hosts (`/ip4/0.0.0.0`, `/ip6/::`) are bind addresses no peer can dial, so they are left out of the message.
 
 ## Protocol
 

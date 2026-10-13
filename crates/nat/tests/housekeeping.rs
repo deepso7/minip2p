@@ -13,7 +13,7 @@ use minip2p_nat::{
 };
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{Bytes, ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId, TransportError};
 
 const SERVER_ADDR: &str = "/ip4/203.0.113.50/udp/4001/quic-v1";
 const RELAY2_TRANSPORT_ADDR: &str = "/ip4/203.0.113.2/udp/4001/quic-v1";
@@ -1583,7 +1583,7 @@ fn stalled_session_dial_expires_and_the_retry_redials() {
     assert_eq!(dial_count_for(&actions, &relay), 1);
     // No dial_result, no connection: the handshake silently stalls.
 
-    // Past the acquisition deadline (relay_leg_deadline_ms) and the retry
+    // Past the acquisition deadline (relay_timeout_ms) and the retry
     // backoff, the manager tries again — with a real dial, not a wait on
     // the dead one.
     hk.agent.handle_tick(at(12_600));
@@ -1655,12 +1655,12 @@ fn late_reserve_dial_failure_after_rotation_keeps_the_new_acquisition() {
     let (relay, relay2) = (hk.relay.clone(), hk.relay2.clone());
     let config = NatConfig::default();
     // The base backoff plus its most jitter, a fifth.
-    let retry_at = config.relay_leg_deadline_ms + config.reservation_retry_backoff_ms * 6 / 5;
+    let retry_at = config.relay_timeout_ms + config.reservation_retry_backoff_ms * 6 / 5;
 
     hk.agent.handle_tick(at(0));
     let old = dial_conn_for(&drain_actions(&mut hk.agent), &relay);
     // The first relay never connects; after the backoff the second is dialed.
-    hk.agent.handle_tick(at(config.relay_leg_deadline_ms));
+    hk.agent.handle_tick(at(config.relay_timeout_ms));
     hk.agent.handle_tick(at(retry_at));
     let new = dial_conn_for(&drain_actions(&mut hk.agent), &relay2);
 
@@ -1668,4 +1668,139 @@ fn late_reserve_dial_failure_after_rotation_keeps_the_new_acquisition() {
 
     ready_on(&mut hk, &relay2, new, HOP_PROTOCOL_ID, at(retry_at + 2));
     assert_eq!(hop_open_count(&drain_actions(&mut hk.agent), &relay2), 1);
+}
+
+#[test]
+fn a_held_request_is_resent_and_closed_after_its_exchange_finishes() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    hk.agent.handle_tick(at(0));
+    let relay = hk.relay.clone();
+    hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
+
+    // The RESERVE is refused as Full; a relay that answers anyway finishes
+    // the exchange, which releases the stream with the tail still held.
+    hk.agent.swarm.full_sends = true;
+    let (events, stream) = hk.finish_reserve(hop_reserve_ok(None), at(3));
+    assert!(matches!(
+        events.as_slice(),
+        [NatEvent::RelayReserved { .. }]
+    ));
+    hk.agent.swarm.full_sends = false;
+    drain_actions(&mut hk.agent);
+    assert!(
+        !hk.agent.is_idle(),
+        "held bytes are work: an idle agent might not be serviced again"
+    );
+
+    hk.agent.handle_event(
+        &SwarmEvent::StreamWritable {
+            peer_id: relay.clone(),
+            conn_id: hk.agent.swarm.connection(&relay).expect("relay session"),
+            stream_id: stream,
+        },
+        false,
+        at(4),
+    );
+    let actions = drain_actions(&mut hk.agent);
+    assert!(!sent_data_on(&actions, stream).is_empty());
+    assert!(matches!(
+        actions.last(),
+        Some(Out::CloseStreamWrite { stream_id, .. }) if *stream_id == stream
+    ));
+    assert!(hk.agent.is_idle());
+}
+
+#[test]
+fn a_held_request_whose_resend_fails_resets_instead_of_closing() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    hk.agent.handle_tick(at(0));
+    let relay = hk.relay.clone();
+    hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
+    // As above: the finished exchange leaves the tail and its FIN held.
+    hk.agent.swarm.full_sends = true;
+    let (_, stream) = hk.finish_reserve(hop_reserve_ok(None), at(3));
+    hk.agent.swarm.full_sends = false;
+    drain_actions(&mut hk.agent);
+
+    // The transport may have taken a prefix before failing.
+    let conn_id = hk.agent.swarm.connection(&relay).expect("relay session");
+    hk.agent.swarm.failed_sends = Some(TransportError::StreamSendFailed {
+        id: conn_id,
+        stream_id: stream,
+        reason: "broken".into(),
+    });
+    hk.agent.handle_event(
+        &SwarmEvent::StreamWritable {
+            peer_id: relay.clone(),
+            conn_id,
+            stream_id: stream,
+        },
+        false,
+        at(4),
+    );
+    let actions = drain_actions(&mut hk.agent);
+    assert!(
+        matches!(
+            actions.last(),
+            Some(Out::ResetStream { stream_id, .. }) if *stream_id == stream
+        ),
+        "a truncated request must not end in a clean FIN: {actions:?}"
+    );
+    assert!(hk.agent.is_idle());
+}
+
+#[test]
+fn a_partly_accepted_request_is_finished_in_order_before_its_close() {
+    // The RESERVE an unconstrained stream carries, for reference.
+    let mut reference = build(ReservationPolicy::Always, 1, 0);
+    reference.agent.handle_tick(at(0));
+    let relay = reference.relay.clone();
+    reference.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
+    let stream = opened_stream_for(&drain_actions(&mut reference.agent), &relay);
+    reference.stream_ready(&relay, stream, HOP_PROTOCOL_ID, at(3));
+    let request = sent_data_on(&drain_actions(&mut reference.agent), stream);
+    assert!(request.len() > 2, "the request must span several writes");
+
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    hk.agent.handle_tick(at(0));
+    hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
+    let stream = opened_stream_for(&drain_actions(&mut hk.agent), &relay);
+    let writable = |hk: &mut Hk, t| {
+        hk.agent.handle_event(
+            &SwarmEvent::StreamWritable {
+                peer_id: relay.clone(),
+                conn_id: ConnectionId::new(1),
+                stream_id: stream,
+            },
+            false,
+            at(t),
+        );
+    };
+
+    // One byte per write: the first write and its replay each leave a tail.
+    hk.agent.swarm.accept_at_most = Some(1);
+    hk.stream_ready(&relay, stream, HOP_PROTOCOL_ID, at(3));
+    writable(&mut hk, 4);
+    // The relay answers early; the finished exchange queues its close behind
+    // the tail.
+    hk.stream_data(&relay, stream, hop_reserve_ok(None), at(5));
+    hk.agent.swarm.accept_at_most = None;
+    writable(&mut hk, 6);
+
+    let actions = drain_actions(&mut hk.agent);
+    let sent: Vec<u8> = actions
+        .iter()
+        .filter_map(|action| match action {
+            Out::SendStream {
+                stream_id, data, ..
+            } if *stream_id == stream => Some(data.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(sent, request);
+    assert!(matches!(
+        actions.last(),
+        Some(Out::CloseStreamWrite { stream_id, .. }) if *stream_id == stream
+    ));
 }

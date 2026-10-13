@@ -267,14 +267,12 @@ impl NodeEndpoint {
     pub fn send_stream(
         &self,
         env: Env,
-        peer_id: String,
         conn_id: BigInt,
         stream_id: BigInt,
         data: Uint8Array,
     ) -> Result<bool> {
         self.0
             .send_stream(
-                peer_id,
                 bigint_u64(conn_id, "connId")?,
                 bigint_u64(stream_id, "streamId")?,
                 data.to_vec(),
@@ -284,16 +282,9 @@ impl NodeEndpoint {
 
     /// Half-closes the local stream write side.
     #[napi]
-    pub fn close_stream_write(
-        &self,
-        env: Env,
-        peer_id: String,
-        conn_id: BigInt,
-        stream_id: BigInt,
-    ) -> Result<()> {
+    pub fn close_stream_write(&self, env: Env, conn_id: BigInt, stream_id: BigInt) -> Result<()> {
         self.0
             .close_stream_write(
-                peer_id,
                 bigint_u64(conn_id, "connId")?,
                 bigint_u64(stream_id, "streamId")?,
             )
@@ -302,16 +293,9 @@ impl NodeEndpoint {
 
     /// Resets an application stream.
     #[napi]
-    pub fn reset_stream(
-        &self,
-        env: Env,
-        peer_id: String,
-        conn_id: BigInt,
-        stream_id: BigInt,
-    ) -> Result<()> {
+    pub fn reset_stream(&self, env: Env, conn_id: BigInt, stream_id: BigInt) -> Result<()> {
         self.0
             .reset_stream(
-                peer_id,
                 bigint_u64(conn_id, "connId")?,
                 bigint_u64(stream_id, "streamId")?,
             )
@@ -320,16 +304,9 @@ impl NodeEndpoint {
 
     /// Resets and relinquishes an application stream.
     #[napi]
-    pub fn abandon_stream(
-        &self,
-        env: Env,
-        peer_id: String,
-        conn_id: BigInt,
-        stream_id: BigInt,
-    ) -> Result<()> {
+    pub fn abandon_stream(&self, env: Env, conn_id: BigInt, stream_id: BigInt) -> Result<()> {
         self.0
             .abandon_stream(
-                peer_id,
                 bigint_u64(conn_id, "connId")?,
                 bigint_u64(stream_id, "streamId")?,
             )

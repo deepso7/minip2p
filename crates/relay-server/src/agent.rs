@@ -1029,7 +1029,9 @@ impl RelayServerAgent {
     /// A forwarding chunk that comes back [`RelayServerSendError::Full`] is
     /// not a failure: the relay holds its unsent tail and resends it on the
     /// stream's [`SwarmEvent::StreamWritable`]. A Full control message fails
-    /// like any other rejected send.
+    /// like any other rejected send, and the stream it was written to is
+    /// reset rather than half-closed, so the peer never reads a truncated
+    /// reply as complete.
     pub fn send_stream_result(
         &mut self,
         token: RelayServerToken,
@@ -1122,12 +1124,10 @@ impl RelayServerAgent {
                         self.fail_pending_connect(source_stream, Status::ConnectionFailed);
                         true
                     }
-                    SendEffect::CommitReservation(pending) => {
-                        self.complete_hop(pending.stream);
-                        true
-                    }
-                    SendEffect::CompleteHop(stream) => {
+                    SendEffect::CommitReservation(PendingReservation { stream, .. })
+                    | SendEffect::CompleteHop(stream) => {
                         self.complete_hop(stream);
+                        self.abort_hop_reply(peer_id.clone(), stream);
                         true
                     }
                     _ => false,
@@ -2287,6 +2287,13 @@ impl RelayServerAgent {
         self.hop_deadlines.remove(&stream);
     }
 
+    /// A HOP reply did not fully enter the stream: cancel its queued FIN and
+    /// reset the stream instead.
+    fn abort_hop_reply(&mut self, peer_id: PeerId, stream: StreamKey) {
+        self.cancel_pending_hop_ops(stream);
+        self.queue_reset(peer_id, stream);
+    }
+
     fn queue_send(
         &mut self,
         peer_id: PeerId,
@@ -3196,6 +3203,57 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn a_partly_written_control_reply_resets_instead_of_finishing() {
+        let local = PeerId::from_public_key_protobuf(b"relay-full-response");
+        let remote = PeerId::from_public_key_protobuf(b"client-full-response");
+        let stream = StreamKey {
+            conn_id: ConnectionId::new(31),
+            stream_id: StreamId::new(1),
+        };
+        let mut agent = RelayServerAgent::new(local, RelayServerConfig::default()).unwrap();
+        establish(&mut agent, &remote, stream.conn_id);
+        // CONNECT to a peer with no reservation: the reply is a rejection
+        // followed by a half-close.
+        feed_hop(
+            &mut agent,
+            &remote,
+            stream,
+            HopMessage {
+                kind: HopMessageType::Connect,
+                peer: Some(minip2p_relay::Peer {
+                    id: PeerId::from_public_key_protobuf(b"absent").to_bytes(),
+                    addrs: Vec::new(),
+                }),
+                reservation: None,
+                limit: None,
+                status: None,
+            },
+            &[],
+        );
+        let RelayServerAction::SendStream { token, data, .. } = io_action(&mut agent).unwrap()
+        else {
+            panic!("rejection reply");
+        };
+
+        agent.send_stream_result(
+            token,
+            Err(RelayServerSendError::Full {
+                unsent: data.slice(1..),
+            }),
+            Now::from_millis(0),
+        );
+
+        let rest: Vec<_> = core::iter::from_fn(|| io_action(&mut agent)).collect();
+        assert!(
+            matches!(
+                rest.as_slice(),
+                [RelayServerAction::ResetStream { stream: reset, .. }] if *reset == stream
+            ),
+            "a truncated reply must not end in a clean FIN: {rest:?}"
+        );
     }
 
     #[test]

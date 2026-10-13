@@ -16,12 +16,22 @@
 //!           ensure relay session → HOP CONNECT(target)
 //!           → Bridged ⇒ promote bridge through Noise + Yamux
 //!           → circuit Connected ⇒ PathEstablished(Relayed) (provisional)
-//!           → reserved peer opens `/libp2p/dcutr` on that connection
+//!           → reserved peer runs up to 3 DCUtR rounds on that connection
 //! inbound STOP circuit Connected ⇒ InboundPathEstablished(Relayed)
 //! a better path later ⇒ explicit PathUpgraded
-//! punch exhausted ⇒ FellBackToRelay (engine settles Connected)
+//! rounds exhausted, or an upgrade budget spent ⇒ FellBackToRelay
+//!   (engine settles Connected, the Relayed path stays)
 //! relay leg dead ⇒ ConnectFailed (engine decides the attempt)
 //! ```
+//!
+//! The reservation holder drives DCUtR: each round opens a fresh stream,
+//! times a fresh RTT from when its CONNECT is fully written (a CONNECT
+//! refused as Full is held and timed once it drains), and opens a punch
+//! window on both sides.
+//! Every wait is bounded by a [`NatConfig`] budget clipped to the attempt's
+//! deadline. Once the host's Connection-attempt engine settles an attempt,
+//! [`NatAgent::settled`] drops what the agent still holds for it, and no
+//! further attempt event names it.
 //!
 //! The agent performs no I/O and reads no clocks: pass it the swarm as a
 //! [`NatSwarm`] (implemented for [`minip2p_swarm::SwarmCore`]), feed it swarm
@@ -59,12 +69,15 @@ mod swarm;
 mod types;
 
 pub use agent::{ConnectLegs, NatAgent};
-pub use config::{NatConfig, ReservationPolicy};
+pub use config::{MAX_DCUTR_ROUNDS, NatConfig, ReservationPolicy};
 pub use events::{BridgeRole, NatAction, NatEvent};
 pub use housekeeping::{AUTONAT_VOTE_TTL_MS, MAX_RESERVATION_RETRY_BACKOFF_MS};
 pub use inbound::MAX_PUNCH_CANDIDATES;
 pub use swarm::{DialStart, NatSwarm, NatSwarmError, is_named};
-pub use types::{NatError, NatToken, Path, PromoteError, ReachabilityState, ReservationInfo};
+pub use types::{
+    NatError, NatToken, Path, PromoteError, ReachabilityState, RelayStage, ReservationInfo,
+    UpgradeStop,
+};
 // The component time sample and deadline, re-exported so callers need not
 // depend on the platform crate to name them.
 pub use minip2p_platform::{Deadline, Now};

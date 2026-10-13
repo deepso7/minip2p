@@ -49,7 +49,8 @@ pub use minip2p_mdns::{MdnsConfig, MdnsConfigError, MdnsError, MdnsEvent, MdnsIo
 pub use minip2p_mdns::{SmoltcpMdnsConfig, SmoltcpMdnsIo};
 #[cfg(feature = "_nat-driver")]
 pub use minip2p_nat::{
-    NatConfig, NatError, NatEvent, Path, ReachabilityState, ReservationInfo, ReservationPolicy,
+    NatConfig, NatError, NatEvent, Path, ReachabilityState, RelayStage, ReservationInfo,
+    ReservationPolicy, UpgradeStop,
 };
 #[cfg(feature = "pubsub")]
 pub use minip2p_pubsub::{
@@ -219,6 +220,10 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// established connection the swarm keeps (including a simultaneous
     /// inbound), and the app sees any later hand-over as an ordinary
     /// connection event.
+    ///
+    /// Connecting to a peer that is already connected reuses that
+    /// connection: the attempt settles at once with the current connection,
+    /// and the addresses passed are not dialed.
     #[expect(
         clippy::result_large_err,
         reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."
@@ -323,50 +328,46 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
             .open_stream(peer_id, protocol_id, now.monotonic_ms)
     }
 
-    /// Sends bytes on an application stream.
+    /// Sends bytes on an application stream named by its connection and
+    /// stream ids; the peer is the connection's.
     ///
-    /// Accepts as much as the stream can queue; [`DriverError::Full`] hands
-    /// back the exact unsent suffix, which the caller resends after
-    /// [`EndpointEvent::StreamWritable`]. Fails with
-    /// [`SwarmError::StreamNotFound`] if `conn_id` is no longer the peer's
-    /// connection holding the stream, as do the other stream operations.
+    /// Accepts as much as the stream can queue. [`DriverError::Full`] means
+    /// a prefix may already have been accepted and only `unsent` is yours to
+    /// resend after [`EndpointEvent::StreamWritable`]; a `?` on this call
+    /// drops that tail. Fails with [`SwarmError::StreamNotFound`] if `conn_id`
+    /// is no longer the connection holding the stream (or
+    /// [`TransportError::ConnectionNotFound`](minip2p_transport::TransportError::ConnectionNotFound)
+    /// once nothing names it), as do the other stream operations;
+    /// [`DriverError::is_stream_gone`] covers both.
     pub fn send_stream(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
         data: impl Into<Bytes>,
         now: Now,
     ) -> Result<(), DriverError> {
         self.engine
-            .core
-            .send_stream(peer_id, conn_id, stream_id, data.into(), now.monotonic_ms)
+            .send_stream(conn_id, stream_id, data.into(), now)
     }
 
     /// Half-closes the local write side of an application stream.
     pub fn close_stream_write(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
-        self.engine
-            .core
-            .close_stream_write(peer_id, conn_id, stream_id, now.monotonic_ms)
+        self.engine.close_stream_write(conn_id, stream_id, now)
     }
 
     /// Abruptly resets an application stream.
     pub fn reset_stream(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
-        self.engine
-            .core
-            .reset_stream(peer_id, conn_id, stream_id, now.monotonic_ms)
+        self.engine.reset_stream(conn_id, stream_id, now)
     }
 
     /// Resets a stream and removes all bookkeeping for it, including its
@@ -374,12 +375,11 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// them). A queued `StreamClosed` still counts as the stream existing.
     pub fn abandon_stream(
         &mut self,
-        peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
-        self.engine.abandon_stream(peer_id, conn_id, stream_id, now)
+        self.engine.abandon_stream(conn_id, stream_id, now)
     }
 
     /// Returns a lightweight aggregate of durable state without driving the endpoint.
@@ -1388,7 +1388,7 @@ mod tests {
             other,
         ]);
         endpoint
-            .abandon_stream(&peer, conn_id, stream_id, Now::from_millis(0))
+            .abandon_stream(conn_id, stream_id, Now::from_millis(0))
             .expect("a held close proves the stream");
         assert!(
             matches!(

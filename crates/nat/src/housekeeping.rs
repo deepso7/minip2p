@@ -842,7 +842,7 @@ impl ReservationManager {
         shared: &mut Shared,
         now: Now,
     ) {
-        let deadline_ms = shared.config.relay_leg_deadline_ms;
+        let deadline_ms = shared.config.relay_timeout_ms;
         let result = acquire::start(
             &relay,
             HOP_PROTOCOL_ID,

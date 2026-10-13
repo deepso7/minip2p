@@ -1,4 +1,5 @@
 import { StreamClosedError } from "./errors.js";
+import { P2pEvent_Tags } from "./types.js";
 
 /**
  * Converts a native `u64` to a number, throwing when it leaves JavaScript's
@@ -14,6 +15,20 @@ export const u64ToNumber = (value: bigint | number, name: string): number => {
   return number;
 };
 
+/** How many released connection IDs stay resolvable for late events. */
+const RETIRED_LIMIT = 64;
+
+/**
+ * Events that name connections the lifecycle events of their batch already
+ * reported, and possibly released: a circuit established and replaced in one
+ * batch reaches its path events only afterwards.
+ */
+const PATH_EVENT_TAGS: ReadonlySet<string> = new Set([
+  P2pEvent_Tags.InboundPathEstablished,
+  P2pEvent_Tags.PathUpgraded,
+  P2pEvent_Tags.InboundDirectUpgrade,
+]);
+
 /**
  * Maps native `u64` connection identities to small public numbers.
  *
@@ -21,13 +36,20 @@ export const u64ToNumber = (value: bigint | number, name: string): number => {
  * through a JavaScript `number`. Each endpoint owns one map so a native ID
  * resolves to the same public ID in events and synchronous results. Adapters
  * release an entry once its `ConnectionClosed`, or the `ConnectionReplaced`
- * that retires it, is normalized, which bounds the map by live connections.
- * Public numbers come from a counter that never repeats, so an event arriving
- * after the release gets a fresh number instead of aliasing a live connection.
+ * that retires it, is normalized. Through {@link toPublicInEvent}, a
+ * released ID still resolves to its public number for the last
+ * {@link RETIRED_LIMIT} releases, so a path event or `oldConnId` that names
+ * it after its close or replacement matches the connection the app saw, while
+ * stream operations on it throw.
+ * That bounds the map by live connections plus the retired window. Public
+ * numbers come from a counter that never repeats, so an event arriving after
+ * the window gets a fresh number instead of aliasing a live connection.
  */
 export class ConnectionIdMap {
   readonly #publicByNative = new Map<bigint, number>();
   readonly #nativeByPublic = new Map<number, bigint>();
+  /** Released IDs, oldest first, kept for later events that name them. */
+  readonly #retired = new Map<bigint, number>();
   #next = 1;
 
   toPublic(native: bigint): number {
@@ -40,6 +62,24 @@ export class ConnectionIdMap {
     this.#publicByNative.set(native, publicId);
     this.#nativeByPublic.set(publicId, native);
     return publicId;
+  }
+
+  /**
+   * The public ID for the connection field `key` of a native `tag` event.
+   * Path events and `oldConnId` fields name a connection that may already be
+   * released: a live mapping wins, then a retired one, which keeps its number
+   * without being revived. An unknown ID is mapped like any other, so a live
+   * connection whose `ConnectionEstablished` was dropped keeps one ID. Any
+   * other field may introduce a connection, possibly under a native ID reused
+   * after a close, so it never reads the retired mappings.
+   */
+  toPublicInEvent(tag: string, key: string, native: bigint): number {
+    const retired =
+      (PATH_EVENT_TAGS.has(tag) || key === "oldConnId") &&
+      !this.#publicByNative.has(native)
+        ? this.#retired.get(native)
+        : undefined;
+    return retired ?? this.toPublic(native);
   }
 
   /**
@@ -58,9 +98,17 @@ export class ConnectionIdMap {
 
   release(publicId: number): void {
     const native = this.#nativeByPublic.get(publicId);
-    if (native !== undefined) {
-      this.#nativeByPublic.delete(publicId);
-      this.#publicByNative.delete(native);
+    if (native === undefined) {
+      return;
+    }
+    this.#nativeByPublic.delete(publicId);
+    this.#publicByNative.delete(native);
+    this.#retired.set(native, publicId);
+    if (this.#retired.size > RETIRED_LIMIT) {
+      const [oldest] = this.#retired.keys();
+      if (oldest !== undefined) {
+        this.#retired.delete(oldest);
+      }
     }
   }
 }

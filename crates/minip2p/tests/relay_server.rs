@@ -199,7 +199,7 @@ fn exercise_relay(
                     ..
                 } if peer_id == responder_peer && stream_id == stream => {
                     initiator
-                        .send_stream(&responder_peer, conn, stream, payload.clone())
+                        .send_stream(conn, stream, payload.clone())
                         .unwrap();
                 }
                 EndpointEvent::StreamData {
@@ -232,9 +232,7 @@ fn exercise_relay(
                 } if peer_id == initiator_peer
                     && Some((conn_id, stream_id)) == responder_stream =>
                 {
-                    responder
-                        .send_stream(&initiator_peer, conn_id, stream_id, data)
-                        .unwrap();
+                    responder.send_stream(conn_id, stream_id, data).unwrap();
                 }
                 _ => {}
             }
@@ -385,19 +383,17 @@ mod bulk {
                     })
                 });
                 match data {
-                    Some(data) => {
-                        match writer.send_stream(&reader_peer, conn_id, sender.stream, data) {
-                            Ok(()) => {}
-                            Err(Error::Full { unsent, .. }) => {
-                                sender.tail = Some(unsent);
-                                sender.writable = false;
-                            }
-                            other => other.expect("send failed"),
+                    Some(data) => match writer.send_stream(conn_id, sender.stream, data) {
+                        Ok(()) => {}
+                        Err(Error::Full { unsent, .. }) => {
+                            sender.tail = Some(unsent);
+                            sender.writable = false;
                         }
-                    }
+                        other => other.expect("send failed"),
+                    },
                     None if !sender.closed => {
                         writer
-                            .close_stream_write(&reader_peer, conn_id, sender.stream)
+                            .close_stream_write(conn_id, sender.stream)
                             .expect("close write");
                         sender.closed = true;
                     }

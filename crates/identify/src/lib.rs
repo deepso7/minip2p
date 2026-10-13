@@ -191,6 +191,7 @@ impl IdentifyProtocol {
     /// `observedAddr` field). `listen_addrs` is our current listening
     /// set, typically snapshotted from the transport by the swarm
     /// driver so it stays in sync with what we're actually bound to.
+    /// Wildcard hosts (`/ip4/0.0.0.0`, `/ip6/::`) in it are not advertised.
     ///
     /// Queues actions that send our identify message and close the write
     /// side.
@@ -216,8 +217,13 @@ impl IdentifyProtocol {
         // <https://github.com/multiformats/multiaddr>). `to_bytes()`
         // produces the on-wire shape foreign libp2p peers expect.
         let observed_addr_bytes = observed_addr.map(|addr| addr.to_bytes());
-        let listen_addrs_bytes: Vec<Vec<u8>> =
-            listen_addrs.iter().map(|addr| addr.to_bytes()).collect();
+        // A wildcard host (`0.0.0.0`, `::`) is a bind address, not one a
+        // peer can dial, so it is left out.
+        let listen_addrs_bytes: Vec<Vec<u8>> = listen_addrs
+            .iter()
+            .filter(|addr| !addr.is_wildcard_host())
+            .map(|addr| addr.to_bytes())
+            .collect();
 
         // libp2p Identify is wire-framed as a varint length prefix
         // followed by the protobuf body (see
@@ -793,6 +799,37 @@ mod tests {
         assert_eq!(msg.listen_addrs.len(), 1);
         let decoded = Multiaddr::from_bytes(&msg.listen_addrs[0]).expect("listen_addr round-trips");
         assert_eq!(decoded, listen_addrs[0]);
+    }
+
+    /// A wildcard bind address is not dialable, so it is never advertised.
+    #[test]
+    fn wildcard_listen_addrs_are_not_advertised() {
+        let mut identify = IdentifyProtocol::new(sample_config());
+        let parse = |addr: &str| <Multiaddr as core::str::FromStr>::from_str(addr).unwrap();
+        let listen_addrs = [
+            parse("/ip4/0.0.0.0/udp/4001/quic-v1"),
+            parse("/ip6/::/tcp/4001"),
+            parse("/ip4/192.168.1.2/udp/4001/quic-v1"),
+        ];
+        identify
+            .register_outbound_stream(sample_peer(), StreamId::new(1), None, &listen_addrs)
+            .unwrap();
+
+        let data = identify
+            .poll_actions()
+            .into_iter()
+            .find_map(|action| match action {
+                IdentifyAction::Send { data, .. } => Some(data),
+                _ => None,
+            })
+            .expect("expected a Send action");
+        let FrameDecode::Complete { payload, .. } =
+            minip2p_core::decode_frame(&data, MAX_MESSAGE_SIZE)
+        else {
+            panic!("expected one complete length-prefixed frame");
+        };
+        let msg = IdentifyMessage::decode(payload).expect("body decodes");
+        assert_eq!(msg.listen_addrs, [listen_addrs[2].to_bytes()]);
     }
 
     #[test]

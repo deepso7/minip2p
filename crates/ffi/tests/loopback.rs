@@ -468,7 +468,7 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
         a_log
             .wait_for(Duration::from_secs(5), |event| matches!(
                 event,
-                P2pEvent::IdentifyReceived { peer_id, info }
+                P2pEvent::IdentifyReceived { peer_id, info, .. }
                     if peer_id == &b_peer && info.protocols.iter().any(|id| id == protocol)
             ))
             .is_some()
@@ -506,13 +506,8 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
         ready,
         P2pEvent::StreamReady { conn_id, .. } if conn_id == opened.conn_id
     ));
-    a.send_stream(
-        b_peer.clone(),
-        opened.conn_id,
-        stream_id,
-        b"stream payload".to_vec(),
-    )?;
-    a.close_stream_write(b_peer, opened.conn_id, stream_id)?;
+    a.send_stream(opened.conn_id, stream_id, b"stream payload".to_vec())?;
+    a.close_stream_write(opened.conn_id, stream_id)?;
     assert!(
         b_log
             .wait_for(Duration::from_secs(5), |event| matches!(
@@ -573,24 +568,19 @@ fn a_write_past_the_send_caps_is_held_settled_once_and_closed_after_every_byte()
         .map(|i| (i % 251) as u8)
         .collect();
     let (conn_id, stream_id) = (opened.conn_id, opened.stream_id);
-    assert!(!a.send_stream(b_peer.clone(), conn_id, stream_id, payload.clone())?);
+    assert!(!a.send_stream(conn_id, stream_id, payload.clone())?);
     assert!(matches!(
-        a.send_stream(b_peer.clone(), conn_id, stream_id, vec![0]),
+        a.send_stream(conn_id, stream_id, vec![0]),
         Err(FfiError::Backpressure)
     ));
-    // Calls naming another peer are refused and leave the held tail alone.
-    let stranger = a.peer_id();
-    assert!(
-        a.reset_stream(stranger.clone(), conn_id, stream_id)
-            .is_err()
-    );
-    assert!(
-        a.abandon_stream(stranger.clone(), conn_id, stream_id)
-            .is_err()
-    );
-    assert!(a.close_stream_write(stranger, conn_id, stream_id).is_err());
+    // Calls naming another connection are refused and leave the held tail
+    // alone.
+    let stranger = conn_id + 1_000;
+    assert!(a.reset_stream(stranger, stream_id).is_err());
+    assert!(a.abandon_stream(stranger, stream_id).is_err());
+    assert!(a.close_stream_write(stranger, stream_id).is_err());
     // Requested while the tail is held, the FIN must still follow it.
-    a.close_stream_write(b_peer, conn_id, stream_id)?;
+    a.close_stream_write(conn_id, stream_id)?;
 
     assert!(
         a_log
@@ -674,13 +664,8 @@ fn a_reader_that_does_not_consume_stalls_its_sender_until_it_does() -> Result<()
     );
     let opened = a.open_stream(b_peer.clone(), protocol.into())?;
     let payload: Vec<u8> = (0..1024 * 1024_usize).map(|i| (i % 251) as u8).collect();
-    assert!(!a.send_stream(
-        b_peer.clone(),
-        opened.conn_id,
-        opened.stream_id,
-        payload.clone()
-    )?);
-    a.close_stream_write(b_peer, opened.conn_id, opened.stream_id)?;
+    assert!(!a.send_stream(opened.conn_id, opened.stream_id, payload.clone())?);
+    a.close_stream_write(opened.conn_id, opened.stream_id)?;
 
     // Unconsumed, the reader is delivered one Yamux window and no more.
     let received = || {

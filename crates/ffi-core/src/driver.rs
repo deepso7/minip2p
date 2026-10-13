@@ -427,7 +427,9 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         // right after the event that caused it.
         let mut converted = Vec::with_capacity(batch.len());
         for event in batch {
-            let settled = writes.observe(endpoint, &event);
+            let settled = writes
+                .observe(endpoint, &event)
+                .map(crate::writes::accepted_event);
             converted.extend(convert_endpoint_event(endpoint, event));
             converted.extend(settled);
         }
@@ -627,6 +629,8 @@ mod tests {
                     relay_peer_id: "relay".into()
                 },
                 to: crate::PathKind::DirectPunched,
+                old_conn_id: 1,
+                new_conn_id: 2,
             }),
             None
         );
@@ -779,6 +783,7 @@ mod tests {
         for index in 0..=MAX_CARRY_EVENTS {
             dropped += usize::from(carry.push(P2pEvent::PingTimeout {
                 peer_id: index.to_string(),
+                conn_id: 1,
             }));
         }
 
@@ -788,7 +793,8 @@ mod tests {
         assert_eq!(
             retained.first(),
             Some(&P2pEvent::PingTimeout {
-                peer_id: "1".into()
+                peer_id: "1".into(),
+                conn_id: 1,
             })
         );
     }
@@ -840,6 +846,7 @@ mod tests {
         };
         let ping = |index: usize| P2pEvent::PingTimeout {
             peer_id: index.to_string(),
+            conn_id: 1,
         };
 
         // A full carry of non-payload events drops the oldest event — the
@@ -907,6 +914,7 @@ mod tests {
         };
         let ping = |index: usize| P2pEvent::PingTimeout {
             peer_id: index.to_string(),
+            conn_id: 1,
         };
         let lost = MAX_CARRY_EVENTS as u64;
 
