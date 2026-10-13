@@ -13,7 +13,7 @@ use minip2p_nat::{
 };
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{Bytes, ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId, TransportError};
 
 const SERVER_ADDR: &str = "/ip4/203.0.113.50/udp/4001/quic-v1";
 const SERVER2_ADDR: &str = "/ip4/203.0.113.51/udp/4001/quic-v1";
@@ -1336,6 +1336,45 @@ fn a_held_request_is_resent_and_closed_after_its_exchange_finishes() {
         actions.last(),
         Some(Out::CloseStreamWrite { stream_id, .. }) if *stream_id == stream
     ));
+    assert!(hk.agent.is_idle());
+}
+
+#[test]
+fn a_held_request_whose_resend_fails_resets_instead_of_closing() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    hk.agent.handle_tick(at(0));
+    let relay = hk.relay.clone();
+    hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
+    // As above: the finished exchange leaves the tail and its FIN held.
+    hk.agent.swarm.full_sends = true;
+    let (_, stream) = hk.finish_reserve(hop_reserve_ok(None), at(3));
+    hk.agent.swarm.full_sends = false;
+    drain_actions(&mut hk.agent);
+
+    // The transport may have taken a prefix before failing.
+    let conn_id = hk.agent.swarm.connection(&relay).expect("relay session");
+    hk.agent.swarm.failed_sends = Some(TransportError::StreamSendFailed {
+        id: conn_id,
+        stream_id: stream,
+        reason: "broken".into(),
+    });
+    hk.agent.handle_event(
+        &SwarmEvent::StreamWritable {
+            peer_id: relay.clone(),
+            conn_id,
+            stream_id: stream,
+        },
+        false,
+        at(4),
+    );
+    let actions = drain_actions(&mut hk.agent);
+    assert!(
+        matches!(
+            actions.last(),
+            Some(Out::ResetStream { stream_id, .. }) if *stream_id == stream
+        ),
+        "a truncated request must not end in a clean FIN: {actions:?}"
+    );
     assert!(hk.agent.is_idle());
 }
 

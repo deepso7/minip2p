@@ -23,7 +23,7 @@ use minip2p_relay::{
     StopMessageType, encode_frame as relay_encode_frame,
 };
 use minip2p_swarm::{DriverError, IdentifyMessage, SwarmError, SwarmEvent};
-use minip2p_transport::{Bytes, ConnectionId, StreamId};
+use minip2p_transport::{Bytes, ConnectionId, StreamId, TransportError};
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 
@@ -598,6 +598,9 @@ pub struct FakeSwarm {
     /// Accept at most this many bytes of each write and refuse the rest as
     /// Full; only the accepted bytes are logged.
     pub accept_at_most: Option<usize>,
+    /// Fail every write with this transport error after logging it, as a
+    /// transport that may have queued a prefix does.
+    pub failed_sends: Option<TransportError>,
 }
 
 impl FakeSwarm {
@@ -742,6 +745,9 @@ impl NatSwarm for FakeSwarm {
             stream_id,
             data: data.to_vec(),
         });
+        if let Some(error) = &self.failed_sends {
+            return Err(NatSwarmError::Swarm(DriverError::Transport(error.clone())));
+        }
         if self.full_sends {
             return Err(NatSwarmError::Swarm(DriverError::Full {
                 conn_id,

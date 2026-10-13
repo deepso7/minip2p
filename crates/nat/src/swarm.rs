@@ -10,7 +10,7 @@ use alloc::string::String;
 
 use minip2p_core::{Bytes, PeerAddr, PeerId, Protocol};
 use minip2p_swarm::{DriverError, EntropySource, HeldWrites, SwarmCore};
-use minip2p_transport::{ConnectionId, StreamId, Transport};
+use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
 use crate::types::NatToken;
 
@@ -214,8 +214,10 @@ pub(crate) struct HoldingSwarm<'a> {
 
 impl HoldingSwarm<'_> {
     /// Resends a writable stream's held tails, then its deferred close.
-    /// Failures surface through the exchange deadlines and the swarm's
-    /// events, as for the first write.
+    /// A Full is held again. Any other failure skips the rest: a transport
+    /// that may have taken a prefix gets the stream reset, so the peer never
+    /// reads a truncated message as complete; a stream or connection already
+    /// gone needs nothing. The exchange deadlines report the failure.
     pub(crate) fn replay(
         &mut self,
         peer: &PeerId,
@@ -228,7 +230,21 @@ impl HoldingSwarm<'_> {
         };
         for data in held.tails {
             match self.send_stream(peer, conn_id, stream_id, data, now_ms) {
-                Ok(()) | Err(_) => {}
+                Ok(()) => {}
+                Err(
+                    NatSwarmError::Swarm(DriverError::Transport(
+                        TransportError::StreamNotFound { .. }
+                        | TransportError::ConnectionNotFound { .. }
+                        | TransportError::InvalidState { .. },
+                    ))
+                    | NatSwarmError::Swarm(DriverError::Swarm(_)),
+                ) => return,
+                Err(_) => {
+                    match self.reset_stream(peer, conn_id, stream_id, now_ms) {
+                        Ok(()) | Err(_) => {}
+                    }
+                    return;
+                }
             }
         }
         if held.close {
