@@ -526,6 +526,54 @@ fn a_promotion_answered_after_its_relay_timed_out_closes_its_circuit() {
     ));
 }
 
+/// Asserts `w`'s pending actions close the circuit `conn`.
+fn assert_closes(w: &mut World, conn: ConnectionId) {
+    assert!(
+        drain_actions(&mut w.agent)
+            .iter()
+            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == conn)),
+        "the orphaned circuit must close"
+    );
+}
+
+#[test]
+fn a_promotion_answered_after_the_last_relay_timed_out_closes_its_circuit() {
+    let mut w = relays_with(|a, _| vec![relay_addr("/ip4/203.0.113.1/udp/4001/quic-v1", a)]);
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let a = w.a.clone();
+    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
+    hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
+    let token = promote_token(&drain_actions(&mut w.agent));
+    w.agent.handle_tick(at(12_000));
+    assert!(
+        drain_events(&mut w.agent)
+            .iter()
+            .any(|event| matches!(event, NatEvent::ConnectFailed { .. }))
+    );
+
+    let late = ConnectionId::new((1 << 63) | 78);
+    w.agent.promote_result(token, Ok(late), at(12_020));
+    assert_closes(&mut w, late);
+}
+
+#[test]
+fn a_promotion_answered_after_the_attempt_was_cancelled_closes_its_circuit() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let id = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let a = w.a.clone();
+    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
+    hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
+    let token = promote_token(&drain_actions(&mut w.agent));
+    w.agent.cancel(id, at(20));
+    drain_actions(&mut w.agent);
+
+    let late = ConnectionId::new((1 << 63) | 78);
+    w.agent.promote_result(token, Ok(late), at(30));
+    assert_closes(&mut w, late);
+}
+
 #[test]
 fn a_peer_already_direct_disarms_the_relay_budget() {
     let mut w = two_relays();

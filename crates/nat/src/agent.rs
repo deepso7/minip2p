@@ -1023,20 +1023,33 @@ impl NatAgent {
         result: Result<ConnectionId, PromoteError>,
         now: Now,
     ) {
-        match self.shared.tokens.get(&token) {
+        // A promotion whose owner already ended (timed out, cancelled,
+        // settled) produced a circuit nobody holds: close it.
+        let orphaned = match self.shared.tokens.get(&token) {
             Some(&TokenPurpose::PromoteAttempt(id)) => {
                 self.shared.tokens.remove(&token);
-                if let Some(attempt) = self.attempts.get_mut(&id) {
-                    attempt.on_promote_result(token, result, swarm, &mut self.shared, now);
+                match self.attempts.get_mut(&id) {
+                    Some(attempt) => {
+                        attempt.on_promote_result(token, result, swarm, &mut self.shared, now);
+                        None
+                    }
+                    None => result.ok(),
                 }
             }
             Some(&TokenPurpose::PromoteInbound(id)) => {
                 self.shared.tokens.remove(&token);
-                if let Some(circuit) = self.inbound.get_mut(&id) {
-                    circuit.on_promote_result(result, &mut self.shared, now);
+                match self.inbound.get_mut(&id) {
+                    Some(circuit) => {
+                        circuit.on_promote_result(result, &mut self.shared, now);
+                        None
+                    }
+                    None => result.ok(),
                 }
             }
             Some(TokenPurpose::Dial(_)) | None => return,
+        };
+        if let Some(conn_id) = orphaned {
+            self.shared.push_action(NatAction::CloseCircuit { conn_id });
         }
         self.reap_done();
     }
