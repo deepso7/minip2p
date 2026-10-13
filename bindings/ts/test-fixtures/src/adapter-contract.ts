@@ -318,6 +318,50 @@ export function describeAdapterContract(
       endpoint.close();
     });
 
+    test("path events after their circuit was replaced in the same batch name its original public ID", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      const established: number[] = [];
+      const paths: number[] = [];
+      const upgrades: number[] = [];
+      endpoint.on("connectionEstablished", ({ connId }) =>
+        established.push(connId)
+      );
+      endpoint.on("inboundPathEstablished", ({ connId }) => paths.push(connId));
+      endpoint.on("inboundDirectUpgrade", ({ oldConnId }) =>
+        upgrades.push(oldConnId)
+      );
+      // Lifecycle events come first in a batch, then the path events.
+      native.deliver([
+        {
+          inner: { connId: CONN_ID, peerId: PEER },
+          tag: "ConnectionEstablished",
+        },
+        {
+          inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
+          tag: "ConnectionReplaced",
+        },
+        {
+          inner: {
+            connId: CONN_ID,
+            path: { inner: { relayPeerId: "relay" }, tag: "Relayed" },
+            peerId: PEER,
+          },
+          tag: "InboundPathEstablished",
+        },
+        {
+          inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
+          tag: "InboundDirectUpgrade",
+        },
+      ]);
+      await drained();
+
+      expect(paths).toEqual(established);
+      expect(upgrades).toEqual(established);
+      endpoint.close();
+    });
+
     test("a write on a connection native already replaced throws instead of reaching the new one", async () => {
       vi.useFakeTimers();
       const endpoint = harness.create();
