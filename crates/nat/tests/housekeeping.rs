@@ -418,30 +418,45 @@ fn unrelated_returned_addresses_are_ignored() {
 }
 
 #[test]
-fn servers_reporting_our_observed_mapping_confirm_it() {
-    // rust-libp2p and go-libp2p servers dial back the IP they observe, not
-    // the one requested, so the probe must ask about the observed mapping.
-    let mut hk = build(ReservationPolicy::Never, 0, 3);
-    let observed = maddr(OUR_OBSERVED_ADDR);
-    for server in hk.servers.clone() {
-        identify_observed(&mut hk.agent, &server, &observed, at(0));
-    }
-    let public = [observed.clone()];
-    let mut events = Vec::new();
-    for round in 0..3 {
-        events = hk.probe(Answer::Public(&public), round * 6_000).1;
-    }
-    assert!(
-        matches!(
-            events.as_slice(),
-            [NatEvent::ReachabilityChanged {
-                new: ReachabilityState::Public,
-                confirmed_addrs,
-                ..
-            }] if *confirmed_addrs == vec![observed.clone()]
+fn servers_dialing_back_our_observed_ip_confirm_the_listen_port_there() {
+    // rust-libp2p and go-libp2p servers dial back the requested transport
+    // and port at the IP they observe, so the probe must ask about our
+    // listen port at that IP; the observed port (often ephemeral) is not it.
+    let cases = [
+        (
+            "/ip4/10.0.0.2/tcp/4001",
+            "/ip4/203.0.113.77/tcp/51234",
+            "/ip4/203.0.113.77/tcp/4001",
         ),
-        "{events:?}"
-    );
+        (
+            LISTEN_ADDR,
+            OUR_OBSERVED_ADDR,
+            "/ip4/203.0.113.77/udp/4500/quic-v1",
+        ),
+    ];
+    for (listen, observed, dialed_back) in cases {
+        let mut hk = build(ReservationPolicy::Never, 0, 3);
+        hk.agent.set_listen_addrs(&[maddr(listen)]);
+        for server in hk.servers.clone() {
+            identify_observed(&mut hk.agent, &server, &maddr(observed), at(0));
+        }
+        let public = [maddr(dialed_back)];
+        let mut events = Vec::new();
+        for round in 0..3 {
+            events = hk.probe(Answer::Public(&public), round * 6_000).1;
+        }
+        assert!(
+            matches!(
+                events.as_slice(),
+                [NatEvent::ReachabilityChanged {
+                    new: ReachabilityState::Public,
+                    confirmed_addrs,
+                    ..
+                }] if *confirmed_addrs == public
+            ),
+            "{listen}: {events:?}"
+        );
+    }
 }
 
 #[test]
