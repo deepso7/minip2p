@@ -157,7 +157,10 @@ pub enum YamuxOutput {
     /// half of the smaller of [`YamuxConfig::max_buffered_send`] and the
     /// part of [`YamuxConfig::max_total_buffered_send`] it may fill (all of it
     /// for a control stream, all but
-    /// [`YamuxConfig::control_stream_reserve`] otherwise). Bytes leaving another stream
+    /// [`YamuxConfig::control_stream_reserve`] otherwise). A non-zero reserve
+    /// also caps a control stream's threshold at half the reserve, the room
+    /// it may be left once application streams fill their share. Bytes
+    /// leaving another stream
     /// free the shared cap, so this can fire for a stream that was blocked
     /// only by the total. It never fires after the stream's write side ended
     /// (`close_write`, reset, or close).

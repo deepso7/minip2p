@@ -61,8 +61,10 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 ///   bytes already framed but not yet written.
 /// - A Full arms a one-shot `StreamWritable` for that stream in the same call,
 ///   so no wakeup is lost. It fires once the stream can again queue at least
-///   half of the smaller of its stream and connection send caps; freeing a
-///   shared cap wakes every armed stream on it. It never fires once the write
+///   half of the smaller of its stream and connection send caps (a control
+///   stream needs at most half a non-zero control reserve, the room it may be
+///   left); freeing a shared cap wakes every armed stream on it. It never
+///   fires once the write
 ///   side has ended (`StreamWriteStopped`, a reset, `close_stream_write`,
 ///   `StreamClosed`, or `Closed`); those tell the holder to drop its tail.
 /// - No stream starves another: a transport bounds each stream's share of

@@ -28,7 +28,10 @@ pub struct QuicLimits {
     /// [`TransportError::Full`](minip2p_transport::TransportError::Full) with
     /// the rest. An armed stream gets a
     /// [`StreamWritable`](minip2p_transport::TransportEvent::StreamWritable)
-    /// once it can queue at least half of the smaller cap again. Queued bytes
+    /// once it can queue at least half of the smaller cap again (for a
+    /// control stream, at most half a non-zero
+    /// [`control_stream_reserve_bytes`](Self::control_stream_reserve_bytes),
+    /// the room it may be left). Queued bytes
     /// enter the engine round-robin across streams. Neither cap counts the
     /// engine's own send buffer.
     pub max_pending_connection_bytes: usize,
