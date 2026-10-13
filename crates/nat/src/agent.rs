@@ -344,6 +344,21 @@ impl Shared {
         }
     }
 
+    /// The addresses an AutoNAT probe asks about: our listen addresses, then
+    /// trusted observed mappings. rust-libp2p and go-libp2p servers dial back
+    /// a requested address with its IP replaced by the one they observe and
+    /// report that address, and only requested addresses count; behind a NAT,
+    /// only an observed mapping can match it.
+    pub(crate) fn probe_addrs(&self) -> Vec<Multiaddr> {
+        let mut addrs = self.listen_addrs.clone();
+        for addr in self.observed_addrs.values() {
+            if !addrs.contains(addr) {
+                addrs.push(addr.clone());
+            }
+        }
+        addrs
+    }
+
     /// Addresses advertised in DCUtR exchanges: the validated listen/external
     /// set plus our peer-observed public mappings, deduplicated.
     ///

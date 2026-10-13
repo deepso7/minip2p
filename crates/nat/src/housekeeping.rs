@@ -283,7 +283,7 @@ impl Prober {
                 );
                 flight.machine = Some(AutoNatClient::new(
                     &shared.local_peer_id,
-                    &shared.listen_addrs,
+                    &shared.probe_addrs(),
                 ));
                 flight.stage = ExchangeStage::WaitStreamReady { conn, stream };
             }

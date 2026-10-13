@@ -418,6 +418,33 @@ fn unrelated_returned_addresses_are_ignored() {
 }
 
 #[test]
+fn servers_reporting_our_observed_mapping_confirm_it() {
+    // rust-libp2p and go-libp2p servers dial back the IP they observe, not
+    // the one requested, so the probe must ask about the observed mapping.
+    let mut hk = build(ReservationPolicy::Never, 0, 3);
+    let observed = maddr(OUR_OBSERVED_ADDR);
+    for server in hk.servers.clone() {
+        identify_observed(&mut hk.agent, &server, &observed, at(0));
+    }
+    let public = [observed.clone()];
+    let mut events = Vec::new();
+    for round in 0..3 {
+        events = hk.probe(Answer::Public(&public), round * 6_000).1;
+    }
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::ReachabilityChanged {
+                new: ReachabilityState::Public,
+                confirmed_addrs,
+                ..
+            }] if *confirmed_addrs == vec![observed.clone()]
+        ),
+        "{events:?}"
+    );
+}
+
+#[test]
 fn dial_refused_is_never_a_private_vote() {
     let mut hk = build(ReservationPolicy::Never, 0, 3);
     for round in 0..3 {
