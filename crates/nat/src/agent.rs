@@ -1027,7 +1027,7 @@ impl NatAgent {
             Some(&TokenPurpose::PromoteAttempt(id)) => {
                 self.shared.tokens.remove(&token);
                 if let Some(attempt) = self.attempts.get_mut(&id) {
-                    attempt.on_promote_result(result, swarm, &mut self.shared, now);
+                    attempt.on_promote_result(token, result, swarm, &mut self.shared, now);
                 }
             }
             Some(&TokenPurpose::PromoteInbound(id)) => {

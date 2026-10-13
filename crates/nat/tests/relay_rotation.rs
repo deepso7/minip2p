@@ -494,6 +494,58 @@ fn failed_promotion_at_first_relay_moves_to_the_next() {
 }
 
 #[test]
+fn a_promotion_answered_after_its_relay_timed_out_closes_its_circuit() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let (a, b) = (w.a.clone(), w.b.clone());
+    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
+    hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
+    let stale = promote_token(&drain_actions(&mut w.agent));
+
+    // A's promotion is still unanswered when its budget runs out; B
+    // bridges and requests its own.
+    w.agent.handle_tick(at(12_000));
+    let b_conn = dial_conn_for(&drain_actions(&mut w.agent), &b);
+    hop_exchange(&mut w, &b, b_conn, Status::Ok, 12_010);
+    let b_actions = drain_actions(&mut w.agent);
+    drain_all_events(&mut w.agent);
+
+    // A's late circuit is not B's: it closes, and B's promotion still lands.
+    let late = ConnectionId::new((1 << 63) | 78);
+    w.agent.promote_result(stale, Ok(late), at(12_020));
+    assert!(
+        drain_actions(&mut w.agent)
+            .iter()
+            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == late))
+    );
+    complete_promotion(&mut w.agent, &w.target.clone(), &b_actions, at(12_030));
+    assert!(matches!(
+        drain_events(&mut w.agent).as_slice(),
+        [NatEvent::PathEstablished { path: Path::Relayed { relay }, .. }] if *relay == b
+    ));
+}
+
+#[test]
+fn a_peer_already_direct_disarms_the_relay_budget() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let a = w.a.clone();
+    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
+    hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
+    let token = promote_token(&drain_actions(&mut w.agent));
+    w.agent
+        .promote_result(token, Err(PromoteError::PeerAlreadyDirect), at(20));
+    drain_all_events(&mut w.agent);
+
+    // The relay's budget has nothing left to bound: no relay timeout, no
+    // failure for a peer that is already direct.
+    w.agent.handle_tick(at(12_000));
+    assert!(drain_all_events(&mut w.agent).is_empty());
+}
+
+#[test]
 fn circuit_closing_before_it_establishes_moves_to_the_next_relay() {
     let mut w = two_relays();
     let target = w.target.clone();
