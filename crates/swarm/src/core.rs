@@ -77,7 +77,9 @@ impl DriverError {
     /// Whether the stream or its connection no longer exists (it ended, the
     /// connection closed or was replaced, or the ids never named one), so no
     /// later operation on it can succeed. A write side that is closing or
-    /// closed is not "gone": the stream may still be read.
+    /// closed is not "gone": the stream may still be read. Neither is a
+    /// stream still negotiating ([`SwarmError::StreamNotReady`]), which
+    /// becomes usable at its `StreamReady`.
     pub fn is_stream_gone(&self) -> bool {
         matches!(
             self,
@@ -1006,6 +1008,7 @@ mod tests {
             }),
         ];
         let write_closed = DriverError::from(SwarmError::WriteClosed { conn_id, stream_id });
+        let not_ready = DriverError::from(SwarmError::StreamNotReady { conn_id, stream_id });
 
         for error in [&full, &swarm_full] {
             assert!(error.is_retryable() && !error.is_stream_gone(), "{error}");
@@ -1013,7 +1016,9 @@ mod tests {
         for error in &gone {
             assert!(error.is_stream_gone() && !error.is_retryable(), "{error}");
         }
-        assert!(!write_closed.is_retryable() && !write_closed.is_stream_gone());
+        for error in [&write_closed, &not_ready] {
+            assert!(!error.is_retryable() && !error.is_stream_gone(), "{error}");
+        }
     }
 
     /// Counter-based entropy: no OS, no `getrandom`, fully deterministic.

@@ -1374,20 +1374,28 @@ impl SwarmState {
 
     /// Checks that `conn_id` is `peer_id`'s connection and holds the
     /// negotiated user stream `stream_id`. Streams of a replaced or closed
-    /// connection are forgotten with it, so they never match.
+    /// connection are forgotten with it, so they never match; an outbound
+    /// stream still negotiating is [`SwarmError::StreamNotReady`].
     fn require_user_stream(
         &self,
         peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
-        if self.conn_to_peer.get(&conn_id) == Some(peer_id)
+        let peer_conn = self.conn_to_peer.get(&conn_id) == Some(peer_id);
+        if peer_conn
             && matches!(
                 self.stream_protocol(conn_id, stream_id),
                 Some(ProtocolKind::User(_))
             )
         {
             Ok(())
+        } else if peer_conn
+            && self
+                .outbound_negotiators
+                .contains_key(&(conn_id, stream_id))
+        {
+            Err(SwarmError::StreamNotReady { conn_id, stream_id })
         } else {
             Err(SwarmError::StreamNotFound {
                 peer_id: peer_id.clone(),
@@ -3855,6 +3863,42 @@ mod tests {
                 stream_id
             })) if conn_id == conn && stream_id == stream
         ));
+    }
+
+    /// A stream `open_stream` handed out is not ready, not gone, until its
+    /// negotiation finishes.
+    #[test]
+    fn a_negotiating_stream_is_not_ready_until_negotiated() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"not-ready-peer");
+        let (conn, stream) = (ConnectionId::new(48), StreamId::new(14));
+        core.conn_to_peer.insert(conn, peer.clone());
+        core.peer_to_conn.insert(peer.clone(), conn);
+        core.outbound_negotiators.insert(
+            (conn, stream),
+            PendingOutbound {
+                negotiator: MultistreamSelect::dialer("/test/1"),
+                target: ProtocolKind::User("/test/1".into()),
+                deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+            },
+        );
+        let not_ready = Err(SwarmError::StreamNotReady {
+            conn_id: conn,
+            stream_id: stream,
+        });
+        assert_eq!(
+            core.admit_user_write(&peer, conn, stream, Bytes::from_static(b"x"))
+                .map(drop),
+            not_ready
+        );
+        assert_eq!(core.close_stream_write(&peer, conn, stream), not_ready);
+        assert_eq!(core.reset_stream(&peer, conn, stream), not_ready);
+
+        // Negotiated: the same stream takes writes.
+        core.outbound_negotiators.remove(&(conn, stream));
+        core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
+        core.admit_user_write(&peer, conn, stream, Bytes::from_static(b"x"))
+            .expect("a negotiated stream takes writes");
     }
 
     #[test]

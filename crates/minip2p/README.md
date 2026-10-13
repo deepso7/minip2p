@@ -252,7 +252,7 @@ writer.close_write(&mut endpoint, conn_id, stream_id)?;
 if let Some(done) = writer.observe(&mut endpoint, &event) { /* done.stream_id's write was accepted */ }
 ```
 
-`Error::is_retryable()` is true for `Full`, and `Error::is_stream_gone()` for a stream or connection that no longer exists (`SwarmError::StreamNotFound`, `NotConnected`, or the transport's stream or connection not found). Neither covers a write side that is closing.
+`Error::is_retryable()` is true for `Full`, and `Error::is_stream_gone()` for a stream or connection that no longer exists (`SwarmError::StreamNotFound`, `NotConnected`, or the transport's stream or connection not found). Neither covers a write side that is closing, or a stream still negotiating (`SwarmError::StreamNotReady`, usable once its `StreamReady` arrives).
 
 When an application permanently relinquishes a stream, `Endpoint::abandon_stream` resets it, purges its already-buffered events (matched by connection as well as stream id), and suppresses later stream events. Use `Endpoint::reset_stream` when those terminal events should remain visible.
 
