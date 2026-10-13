@@ -217,15 +217,24 @@ fn rtt_is_timed_from_when_a_held_connect_is_fully_written() {
         punch_deadline_ms: 250,
         ..NatConfig::default()
     });
-    h.agent.swarm.hold_writes = true;
     let (conn, actions) = drive_to_relayed(&mut h);
+    h.agent.swarm.full_sends = true;
     let stream = open_dcutr(&mut h, conn, &actions);
+    h.agent.swarm.full_sends = false;
     drain_actions(&mut h.agent);
 
-    // CONNECT was queued at t=13 but sat behind a full stream until the
-    // host drained it at t=1_013. The reply at t=1_020 measures 7 ms, not
-    // 1_007 ms, so the first blast is due at t=1_024.
-    h.agent.write_completed(conn, stream, at(1_013));
+    // CONNECT was refused as Full at t=13 and held until the stream turned
+    // writable at t=1_013. The reply at t=1_020 measures 7 ms, not 1_007 ms,
+    // so the first blast is due at t=1_024.
+    h.agent.handle_event(
+        &SwarmEvent::StreamWritable {
+            peer_id: h.target.clone(),
+            conn_id: conn,
+            stream_id: stream,
+        },
+        false,
+        at(1_013),
+    );
     answer_dcutr_at(
         &mut h,
         conn,

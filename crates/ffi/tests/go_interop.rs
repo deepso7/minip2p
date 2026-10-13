@@ -222,7 +222,7 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
             if peer_id == &go_peer && protocols.iter().any(|id| id == ECHO_PROTOCOL))
     });
     let identify = log.wait_for(|event| {
-        matches!(event, P2pEvent::IdentifyReceived { peer_id, info }
+        matches!(event, P2pEvent::IdentifyReceived { peer_id, info, .. }
             if peer_id == &go_peer && info.protocols.iter().any(|id| id == ECHO_PROTOCOL))
     });
     let P2pEvent::IdentifyReceived { info, .. } = identify else {

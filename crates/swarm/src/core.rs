@@ -209,8 +209,9 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         self.external_addresses_revision
     }
 
-    /// The addresses Identify advertised at the last [`poll`](Self::poll):
-    /// the transport's bound set plus the external addresses.
+    /// The address snapshot from the last [`poll`](Self::poll): the
+    /// transport's bound set plus the external addresses. Identify
+    /// advertises it without wildcard hosts, which stay here.
     pub fn local_addresses(&self) -> &[Multiaddr] {
         self.state.local_addresses()
     }
@@ -641,8 +642,9 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// Half-closes the write side of a user stream.
     ///
     /// The FIN follows every write the transport accepted. A caller holding
-    /// an unsent tail of its own must send it before closing. A transport
-    /// failure arrives as [`SwarmEvent::Error`].
+    /// an unsent tail of its own must send it before closing. No
+    /// [`SwarmEvent::StreamWritable`] for the stream follows, including one
+    /// already queued. A transport failure arrives as [`SwarmEvent::Error`].
     pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
@@ -657,7 +659,8 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
 
     /// Resets (abruptly closes) a user stream.
     ///
-    /// A transport failure arrives as [`SwarmEvent::Error`], and the reset
+    /// No [`SwarmEvent::StreamWritable`] for the stream follows, including
+    /// one already queued. A transport failure arrives as [`SwarmEvent::Error`], and the reset
     /// may be retried.
     pub fn reset_stream(
         &mut self,
@@ -747,7 +750,14 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// event at a time.
     pub fn poll(&mut self, now: Now) -> Result<Vec<SwarmEvent>, DriverError> {
         self.drive(now)?;
-        Ok(core::iter::from_fn(|| self.state.next_event()).collect())
+        Ok(self.take_buffered_events())
+    }
+
+    /// Hands out the events already produced without driving the transport,
+    /// so a host whose [`poll`](Self::poll) failed can still deliver what
+    /// was queued before it (a disconnect's close failure, say).
+    pub fn take_buffered_events(&mut self) -> Vec<SwarmEvent> {
+        core::iter::from_fn(|| self.state.next_event()).collect()
     }
 
     /// One drive iteration, leaving its events queued for delivery.

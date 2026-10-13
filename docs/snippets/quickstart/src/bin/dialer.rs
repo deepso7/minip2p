@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // The ping gets its own budget, however long setup took.
                 deadline = Instant::now() + Duration::from_secs(5);
             }
-            EndpointEvent::PingRttMeasured { peer_id, rtt_ms } if peer_id == peer => {
+            EndpointEvent::PingRttMeasured { peer_id, rtt_ms, .. } if peer_id == peer => {
                 println!("peer={peer} rtt={rtt_ms}ms");
                 return Ok(());
             }

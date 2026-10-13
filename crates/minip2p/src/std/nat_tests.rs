@@ -49,7 +49,9 @@ fn negotiated_bridge() -> BridgePair {
     let local_addr = local.listen().expect("local listens");
     local.core_mut().dial(&relay_addr).expect("dial relay");
 
-    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    // A failure backstop only: under a loaded test run the loopback handshake
+    // can take seconds (see .config/nextest.toml).
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
     let mut inner_conn = None;
     let mut relay_conn = None;
     let mut local_ready = false;
@@ -1222,4 +1224,50 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
     drive_gossipsub_until(&mut [&mut a, &mut b], Duration::from_secs(10), |all| {
         saw_message(&all[1], b"after upgrade")
     });
+}
+
+#[cfg(all(feature = "quic", feature = "relay-server"))]
+#[test]
+fn relay_close_reports_the_reservations_it_ends() {
+    let mut relay = Endpoint::builder()
+        .identity(Ed25519Keypair::from_secret_key_bytes([92; 32]))
+        .relay_server()
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind relay");
+    let relay_addr = relay.listen().expect("relay listens");
+    let mut client = Endpoint::builder()
+        .identity(Ed25519Keypair::from_secret_key_bytes([91; 32]))
+        .nat_config(NatConfig {
+            relays: vec![relay_addr],
+            reservation_policy: ReservationPolicy::Always,
+            ..NatConfig::default()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind client");
+    drive_until_reserved(&mut client, &mut relay, "QUIC");
+    // Runs alone (see `.config/nextest.toml`): it asserts on what close()'s
+    // fixed drain collects.
+    // The relay may still hold the commit event; only the close's own
+    // reservation terminal matters here.
+    while relay
+        .next_event(std::time::Duration::ZERO)
+        .expect("drain relay")
+        .is_some()
+    {}
+
+    let client_peer = client.peer_id().clone();
+    let report = relay.close();
+    assert!(
+        report.events.iter().any(|event| matches!(
+            event,
+            EndpointEvent::RelayServer(crate::RelayServerEvent::ReservationClosed { peer_id, .. })
+                if *peer_id == client_peer
+        )),
+        "{:?}",
+        report.events
+    );
 }

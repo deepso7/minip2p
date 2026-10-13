@@ -935,6 +935,7 @@ fn undecodable_observed_addr_bytes_are_ignored() {
     h.agent.handle_event(
         &SwarmEvent::IdentifyReceived {
             peer_id: relay,
+            conn_id: ConnectionId::new(1),
             info: minip2p_swarm::IdentifyMessage {
                 observed_addr: Some(vec![0xff, 0xff, 0xff]),
                 ..minip2p_swarm::IdentifyMessage::default()
@@ -1038,4 +1039,30 @@ fn foreign_dial_failed_is_not_handled() {
     );
     assert!(!handled);
     assert!(drain_events(&mut h.agent).is_empty());
+}
+
+#[test]
+fn a_hop_connect_refused_as_full_is_resent_when_the_stream_is_writable() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    h.start(RACE, at(0));
+    h.agent.handle_tick(at(200));
+    h.relay_session_ready(at(210));
+    let stream = opened_stream(&drain_actions(&mut h.agent));
+
+    h.agent.swarm.full_sends = true;
+    h.stream_ready(stream, at(220));
+    let connect = sent_data_on(&drain_actions(&mut h.agent), stream);
+
+    h.agent.swarm.full_sends = false;
+    let relay = h.relay.clone();
+    h.agent.handle_event(
+        &SwarmEvent::StreamWritable {
+            peer_id: relay,
+            conn_id: ConnectionId::new(1),
+            stream_id: stream,
+        },
+        false,
+        at(230),
+    );
+    assert_eq!(sent_data_on(&drain_actions(&mut h.agent), stream), connect);
 }

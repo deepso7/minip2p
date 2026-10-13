@@ -743,7 +743,7 @@ test("ping coalesces native work while caller abort remains independent", async 
   assert.equal(backend.pingCalls, 1);
 
   backend.emit({
-    inner: { peerId: "peer", rttMs: 7 },
+    inner: { connId: 1, peerId: "peer", rttMs: 7 },
     tag: P2pEvent_Tags.PingRttMeasured,
   });
   assert.equal(await second, 7);

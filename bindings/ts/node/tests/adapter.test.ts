@@ -372,7 +372,7 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
-  test("Identify public keys reach the SDK as ArrayBuffers", async () => {
+  test("Identify snapshots reach the SDK with public keys as ArrayBuffers", async () => {
     vi.useFakeTimers();
     const endpoint = createEndpoint();
     const fake = fakeEndpoint();
@@ -383,9 +383,18 @@ describe("Node adapter", () => {
     };
     fake.identify = info;
     const received: unknown[] = [];
-    endpoint.on("identifyReceived", (event) => received.push(event.info));
+    const connIds: number[] = [];
+    endpoint.on("identifyReceived", (event) => {
+      received.push(event.info);
+      connIds.push(event.connId);
+    });
     fake.enqueue(
-      [{ inner: { info, peerId: "peer" }, tag: "IdentifyReceived" }],
+      [
+        {
+          inner: { connId: 2n ** 60n, info, peerId: "peer" },
+          tag: "IdentifyReceived",
+        },
+      ],
       []
     );
 
@@ -401,6 +410,8 @@ describe("Node adapter", () => {
       expect(snapshot).toMatchObject({ publicKey: expect.any(ArrayBuffer) });
     }
     expect(received).toHaveLength(1);
+    // The native connection ID maps to a public, JS-safe one.
+    expect(connIds).toEqual([1]);
     endpoint.close();
   });
 

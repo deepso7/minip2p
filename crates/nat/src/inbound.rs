@@ -278,6 +278,8 @@ impl InboundCircuit {
                 remote_peer: source.clone(),
                 role: BridgeRole::Responder,
                 pending_data: core::mem::take(&mut self.pending_data),
+                // Filled from the agent's held tails as the action drains.
+                unsent_data: Vec::new(),
                 // CONNECT completion promotes in the same input cascade, so
                 // no later half-close can arrive while NAT owns the bridge.
                 remote_write_closed: false,

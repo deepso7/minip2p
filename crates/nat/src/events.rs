@@ -25,6 +25,10 @@ pub enum BridgeRole {
 /// [`NatAgent::promote_result`](crate::NatAgent::promote_result) with its
 /// token; the others are fire-and-forget.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "actions are drained one at a time, and PromoteBridge, the large one, is rare"
+)]
 pub enum NatAction {
     /// Send one datagram of `payload_len` random bytes to `target` to open
     /// our NAT mapping (responder-side hole punch). The wiring fills the
@@ -44,6 +48,10 @@ pub enum NatAction {
         remote_peer: PeerId,
         role: BridgeRole,
         pending_data: Vec<u8>,
+        /// Bytes NAT wrote on the bridge that the swarm refused as Full and
+        /// the agent still held (a STOP STATUS, say). The circuit sends
+        /// them before anything of its own.
+        unsent_data: Vec<u8>,
         remote_write_closed: bool,
     },
     /// Close a promoted circuit connection, or a NAT dial's handshake that

@@ -126,6 +126,7 @@ fn swarm_ping_roundtrip_with_auto_identify() {
                 SwarmEvent::IdentifyReceived {
                     ref peer_id,
                     ref info,
+                    ..
                 } => {
                     if *peer_id == server_peer_id {
                         assert_eq!(info.agent_version.as_deref(), Some("minip2p-test/0.1.0"));
@@ -155,6 +156,7 @@ fn swarm_ping_roundtrip_with_auto_identify() {
                 SwarmEvent::PingRttMeasured {
                     ref peer_id,
                     rtt_ms,
+                    ..
                 } => {
                     assert_eq!(peer_id, &server_peer_id);
                     assert!(rtt_ms < 5_000, "rtt should be bounded: {rtt_ms}ms");
@@ -424,7 +426,7 @@ fn identify_exchange_carries_observed_addr() {
         let (_server_events, client_events) = drive_pair(&mut server, &mut client);
 
         for event in client_events {
-            if let SwarmEvent::IdentifyReceived { peer_id, info } = event
+            if let SwarmEvent::IdentifyReceived { peer_id, info, .. } = event
                 && peer_id == server_peer_id
             {
                 client_observed = info.observed_addr;

@@ -268,7 +268,7 @@ fn event_peer_mut(event: &mut SwarmEvent) -> Option<&mut PeerId> {
         | SwarmEvent::IdentifyReceived { peer_id, .. }
         | SwarmEvent::PeerReady { peer_id, .. }
         | SwarmEvent::PingRttMeasured { peer_id, .. }
-        | SwarmEvent::PingTimeout { peer_id }
+        | SwarmEvent::PingTimeout { peer_id, .. }
         | SwarmEvent::StreamReady { peer_id, .. }
         | SwarmEvent::StreamData { peer_id, .. }
         | SwarmEvent::StreamWritable { peer_id, .. }
@@ -407,6 +407,10 @@ pub(crate) struct SwarmState {
     /// User streams whose write the core refused because `held` had bytes for
     /// them; they get a `StreamWritable` once `held` is replayed.
     user_writable_wanted: BTreeSet<(ConnectionId, StreamId)>,
+    /// User streams whose write side the application closed or reset: no
+    /// `StreamWritable` reaches them, even one the transport had already
+    /// queued. Cleared when the stream closes.
+    user_write_ended: BTreeSet<(ConnectionId, StreamId)>,
     /// Streams negotiated for an application protocol while `held` had
     /// negotiation bytes for them. They stay control streams, so those bytes
     /// keep the reserve, until the held tail is replayed.
@@ -481,6 +485,7 @@ impl SwarmState {
             events: VecDeque::new(),
             held: HeldWrites::new(),
             user_writable_wanted: BTreeSet::new(),
+            user_write_ended: BTreeSet::new(),
             pending_demotions: BTreeSet::new(),
             actions: VecDeque::new(),
             deferred_closes: VecDeque::new(),
@@ -715,7 +720,7 @@ impl SwarmState {
                 return;
             }
         }
-        if self.abandoned_streams.contains(&key) {
+        if self.abandoned_streams.contains(&key) || self.user_write_ended.contains(&key) {
             return;
         }
         if let Some(ProtocolKind::User(_)) = self.stream_protocol(conn_id, stream_id) {
@@ -894,6 +899,7 @@ impl SwarmState {
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
         self.require_user_stream(peer_id, conn_id, stream_id)?;
+        self.end_user_writes(conn_id, stream_id);
         self.actions
             .push_back(Action::CloseStreamWrite { conn_id, stream_id });
         Ok(())
@@ -907,11 +913,27 @@ impl SwarmState {
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
         self.require_user_stream(peer_id, conn_id, stream_id)?;
+        self.end_user_writes(conn_id, stream_id);
         if self.reset_pending.insert((conn_id, stream_id)) {
             self.actions
                 .push_back(Action::ResetStream { conn_id, stream_id });
         }
         Ok(())
+    }
+
+    /// The application closed or reset the stream's write side: drop its
+    /// queued `StreamWritable` notices and disarm later ones.
+    fn end_user_writes(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        let key = (conn_id, stream_id);
+        self.user_writable_wanted.remove(&key);
+        self.user_write_ended.insert(key);
+        self.events.retain(|event| {
+            !matches!(
+                event,
+                SwarmEvent::StreamWritable { conn_id: c, stream_id: s, .. }
+                    if (*c, *s) == key
+            )
+        });
     }
 
     /// Reports that the transport rejected a queued stream reset.
@@ -947,6 +969,7 @@ impl SwarmState {
         self.reset_pending.remove(&key);
         self.abandoned_streams.remove(&key);
         self.user_writable_wanted.remove(&key);
+        self.user_write_ended.remove(&key);
         let mut demote = self.pending_demotions.remove(&key);
         let mut owed = self
             .held
@@ -1851,6 +1874,7 @@ impl SwarmState {
             self.ping_deadlines.remove(peer_id);
             self.events.push_back(SwarmEvent::PingTimeout {
                 peer_id: peer_id.clone(),
+                conn_id: old,
             });
             None
         } else {
@@ -2174,6 +2198,7 @@ impl SwarmState {
         let key = (conn_id, stream_id);
 
         self.reset_pending.remove(&key);
+        self.user_write_ended.remove(&key);
         self.forget_held(conn_id, stream_id);
         if self.abandoned_streams.remove(&key) {
             self.inbound_negotiators.remove(&key);
@@ -2257,6 +2282,7 @@ impl SwarmState {
     fn forget_connection_streams(&mut self, conn_id: ConnectionId) {
         self.held.forget_connection(conn_id);
         self.user_writable_wanted.retain(|(cid, _)| *cid != conn_id);
+        self.user_write_ended.retain(|(cid, _)| *cid != conn_id);
         self.pending_demotions.retain(|(cid, _)| *cid != conn_id);
         self.stream_owner.retain(|key, _| key.conn_id != conn_id);
         self.reset_pending.retain(|(cid, _)| *cid != conn_id);
@@ -2683,18 +2709,30 @@ impl SwarmState {
         self.drain_identify_outputs();
     }
 
+    // Ping and Identify outputs are drained right after the input that
+    // produced them, so the peer's current connection is the one the event
+    // came from. It is fixed here, at queue time: a later replacement must
+    // not re-attribute it.
     fn handle_ping_event(&mut self, event: PingEvent) {
         match event {
             PingEvent::RttMeasured {
                 peer_id, rtt_ms, ..
             } => {
                 self.ping_deadlines.remove(&peer_id);
-                self.events
-                    .push_back(SwarmEvent::PingRttMeasured { peer_id, rtt_ms });
+                if let Some(conn_id) = self.connection_id(&peer_id) {
+                    self.events.push_back(SwarmEvent::PingRttMeasured {
+                        peer_id,
+                        conn_id,
+                        rtt_ms,
+                    });
+                }
             }
             PingEvent::Timeout { peer_id, .. } => {
                 self.ping_deadlines.remove(&peer_id);
-                self.events.push_back(SwarmEvent::PingTimeout { peer_id });
+                if let Some(conn_id) = self.connection_id(&peer_id) {
+                    self.events
+                        .push_back(SwarmEvent::PingTimeout { peer_id, conn_id });
+                }
             }
             PingEvent::OutboundStreamClosed { ref peer_id, .. } => {
                 // The outbound stream carried the in-flight ping (if any);
@@ -2719,10 +2757,13 @@ impl SwarmState {
         match event {
             IdentifyEvent::Received { peer_id, info } => {
                 self.peer_info.insert(peer_id.clone(), info.clone());
-                self.events.push_back(SwarmEvent::IdentifyReceived {
-                    peer_id: peer_id.clone(),
-                    info,
-                });
+                if let Some(conn_id) = self.connection_id(&peer_id) {
+                    self.events.push_back(SwarmEvent::IdentifyReceived {
+                        peer_id: peer_id.clone(),
+                        conn_id,
+                        info,
+                    });
+                }
                 self.try_emit_peer_ready(&peer_id);
             }
             IdentifyEvent::Error { error, .. } => {
@@ -3860,6 +3901,49 @@ mod tests {
     }
 
     #[test]
+    fn closing_or_resetting_a_stream_ends_its_writable_notices() {
+        const PROTOCOL: &str = "/test/1";
+        let mut core = test_core();
+        core.add_protocol(PROTOCOL).expect("register protocol");
+        let peer_id = PeerId::from_public_key_protobuf(b"slow-reader");
+        let conn_id = ConnectionId::new(7);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        let closed = StreamId::new(3);
+        let reset = StreamId::new(5);
+        for stream_id in [closed, reset] {
+            core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User(PROTOCOL.to_string()));
+            // One notice already queued, and one still in the transport.
+            feed(
+                &mut core,
+                TransportEvent::StreamWritable {
+                    id: conn_id,
+                    stream_id,
+                },
+            );
+        }
+
+        core.close_stream_write(&peer_id, conn_id, closed)
+            .expect("close is accepted");
+        core.reset_stream(&peer_id, conn_id, reset)
+            .expect("reset is accepted");
+        for stream_id in [closed, reset] {
+            feed(
+                &mut core,
+                TransportEvent::StreamWritable {
+                    id: conn_id,
+                    stream_id,
+                },
+            );
+        }
+
+        assert!(
+            drain_events(&mut core).is_empty(),
+            "no Writable reaches a stream the app closed or reset"
+        );
+    }
+
+    #[test]
     fn a_peer_that_never_reads_cannot_grow_the_core_hold_past_its_bound() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"flooder");
@@ -4780,7 +4864,15 @@ mod tests {
             .expect("not ready yet, so no protocol rejection");
 
         identify_on(&mut core, replacement, StreamId::new(1), &["/app/1"]);
-        assert_eq!(ready_conns(&drain_events(&mut core)), [replacement]);
+        let events = drain_events(&mut core);
+        assert_eq!(ready_conns(&events), [replacement]);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::IdentifyReceived { conn_id, .. } if *conn_id == replacement
+            )),
+            "Identify names the connection it arrived on: {events:?}"
+        );
         assert_eq!(
             core.peer_readiness(&peer_id).map(|(conn, _)| conn),
             Some(replacement)
@@ -4914,7 +5006,7 @@ mod tests {
         let timed_out: Vec<_> = outputs
             .iter()
             .filter_map(|output| match output {
-                Output::Event(SwarmEvent::PingTimeout { peer_id }) => Some(peer_id),
+                Output::Event(SwarmEvent::PingTimeout { peer_id, .. }) => Some(peer_id),
                 _ => None,
             })
             .collect();
@@ -5310,9 +5402,11 @@ mod tests {
         assert_eq!(core.next_deadline(Now::from_millis(1_500)), None);
         let events = drain_events(&mut core);
         assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, SwarmEvent::PingRttMeasured { .. }))
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::PingRttMeasured { conn_id: id, .. } if *id == conn_id
+            )),
+            "the RTT names the connection it was measured on: {events:?}"
         );
     }
 
@@ -5338,9 +5432,11 @@ mod tests {
         core.handle_tick(11_001);
         let events = drain_events(&mut core);
         assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, SwarmEvent::PingTimeout { .. }))
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::PingTimeout { conn_id: id, .. } if *id == conn_id
+            )),
+            "the timeout names the connection the ping was sent on: {events:?}"
         );
         assert_eq!(core.next_deadline(Now::from_millis(11_001)), None);
     }

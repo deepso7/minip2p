@@ -25,8 +25,9 @@
 //! ```
 //!
 //! The reservation holder drives DCUtR: each round opens a fresh stream,
-//! times a fresh RTT from when its CONNECT is fully written (see
-//! [`NatAgent::write_completed`]), and opens a punch window on both sides.
+//! times a fresh RTT from when its CONNECT is fully written (a CONNECT
+//! refused as Full is held and timed once it drains), and opens a punch
+//! window on both sides.
 //! Every wait is bounded by a [`NatConfig`] budget clipped to the attempt's
 //! deadline. Once the host's Connection-attempt engine settles an attempt,
 //! [`NatAgent::settled`] drops what the agent still holds for it, and no

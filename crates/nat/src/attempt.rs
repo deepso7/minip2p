@@ -1165,6 +1165,8 @@ impl ConnectAttempt {
                 remote_peer: self.peer.clone(),
                 role: BridgeRole::Initiator,
                 pending_data: core::mem::take(&mut self.bridge_pending_data),
+                // Filled from the agent's held tails as the action drains.
+                unsent_data: Vec::new(),
                 remote_write_closed: self.bridge_remote_write_closed,
             });
         }

@@ -1,5 +1,5 @@
-//! Connection lookup for the internal agents that name streams by peer and
-//! stream id only.
+//! Connection lookup for the Gossipsub agent, which names streams by peer
+//! and stream id only.
 
 use alloc::collections::BTreeMap;
 
@@ -7,11 +7,11 @@ use minip2p_core::PeerId;
 use minip2p_swarm::{SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
 use minip2p_transport::{ConnectionId, StreamId};
 
-/// The connection each stream an internal agent may act on was observed on.
+/// The connection each stream the Gossipsub agent may act on was observed on.
 ///
-/// The NAT and Gossipsub agents address streams by `(peer, stream id)`, but
-/// swarm stream operations also take the connection, because stream ids are
-/// only unique per connection. Their drivers record where every stream was
+/// The Gossipsub agent addresses streams by `(peer, stream id)`, but swarm
+/// stream operations also take the connection, because stream ids are only
+/// unique per connection. Its driver records where every stream was
 /// opened or announced (`StreamReady`) and address operations with that
 /// connection, so a stale operation fails instead of reaching a
 /// same-numbered stream on the peer's newer connection.

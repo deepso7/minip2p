@@ -158,6 +158,13 @@ fn spawn_driver(mut endpoint: Endpoint, what: &'static str) -> Driver {
     Driver { stop, handle }
 }
 
+/// Closes `endpoint`, failing on any close error, and returns its events.
+fn clean_close(endpoint: Endpoint, what: &str) -> Vec<EndpointEvent> {
+    let report = endpoint.close();
+    assert!(report.errors.is_empty(), "{what}: {:?}", report.errors);
+    report.events
+}
+
 fn bind_loopback() -> Endpoint {
     bind_from(Endpoint::builder())
 }
@@ -211,7 +218,7 @@ fn listener_reclaims_state_after_dialer_close() {
     // be the only path that notifies the peer.
     let remote = spawn_driver(listener, "drive listener during close");
 
-    let events = dialer.close().expect("close flushes disconnects");
+    let events = clean_close(dialer, "close flushes disconnects");
     let mut listener = remote.stop();
 
     assert!(
@@ -284,7 +291,7 @@ fn close_drains_replacement_connection() {
 
     let remote = spawn_driver(replacement, "drive replacement during close");
 
-    let events = listener.close().expect("close drains replacements");
+    let events = clean_close(listener, "close drains replacements");
     let _replacement = remote.stop();
 
     let established = replacement_connections(&events, &dialer_peer);
@@ -344,7 +351,7 @@ fn close_drains_pending_replacement_handshake() {
 
     let remote = spawn_driver(replacement, "drive replacement during close");
 
-    let events = listener.close().expect("close drains pending replacement");
+    let events = clean_close(listener, "close drains pending replacement");
     let _replacement = remote.stop();
 
     let established = replacement_connections(&events, &dialer_peer);

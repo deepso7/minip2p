@@ -17,14 +17,13 @@ use minip2p_nat::{
     ConnectLegs, DialStart, NatAction, NatAgent, NatEvent, NatSwarm, NatSwarmError, NatToken,
     PromoteError, ReachabilityState,
 };
-use minip2p_swarm::{DriverError, HeldWrites, SwarmCore, SwarmEvent};
+use minip2p_swarm::{SwarmCore, SwarmEvent};
 #[cfg(feature = "_circuit-driver")]
 use minip2p_transport::TransportError;
 use minip2p_transport::{ConnectionId, StreamId, Transport};
 
 use crate::EndpointEvent;
 use crate::portable::connect::ConnectEngine;
-use crate::stream_conns::StreamConns;
 
 /// `ConnectFailed` and `FellBackToRelay` are attempt terminals the
 /// Connection-attempt engine already reports as `ConnectSettled`, so they
@@ -47,10 +46,8 @@ fn is_attempt_outcome(event: &NatEvent) -> bool {
     )
 }
 
-/// Most bytes the NAT host holds for one stream before resetting it.
-const MAX_HELD_PER_STREAM: usize = 64 * 1024;
-
-/// Joins held tails into one payload; a single tail is passed through.
+/// Joins the bytes a promoted bridge still owes into one payload; a single
+/// chunk is passed through.
 #[cfg(feature = "_circuit-driver")]
 fn concat(mut tails: VecDeque<Bytes>) -> Bytes {
     if tails.len() <= 1 {
@@ -339,31 +336,8 @@ impl<T: Transport> NatDriver<T> {
         now: Now,
     ) -> bool {
         self.sync_listen_addrs(swarm);
-        self.io.held.observe(event);
-        self.io.stream_conns.observe(event);
         #[cfg(feature = "_circuit-driver")]
         if self.inject_straggler(event, swarm) {
-            self.pump(swarm, now);
-            return true;
-        }
-        if let SwarmEvent::StreamWritable {
-            peer_id,
-            conn_id,
-            stream_id,
-        } = event
-            && self.io.stream_conns.get(peer_id, *stream_id) == Some(*conn_id)
-        {
-            let drained = EndpointSwarm::new(swarm, &mut self.io).replay_held(
-                peer_id,
-                *conn_id,
-                *stream_id,
-                now.monotonic_ms,
-            );
-            if drained {
-                // DCUtR times its RTT from here, not from when the bytes
-                // were queued.
-                self.agent.write_completed(*conn_id, *stream_id, now);
-            }
             self.pump(swarm, now);
             return true;
         }
@@ -375,9 +349,6 @@ impl<T: Transport> NatDriver<T> {
         };
         let mut io = EndpointSwarm::new(swarm, &mut self.io);
         let handled = self.agent.handle_event(&mut io, event, is_circuit, now);
-        if !handled {
-            self.io.stream_conns.unclaimed(event);
-        }
         // The agent consumes what it claims as it reads it, including bytes
         // past a CONNECT response that a promoted bridge's circuit takes
         // as adoption data: the circuit acknowledges only what it reads
@@ -688,6 +659,7 @@ impl<T: Transport> NatDriver<T> {
                 remote_peer,
                 role,
                 pending_data,
+                unsent_data,
                 remote_write_closed,
             } => {
                 #[cfg(not(feature = "_circuit-driver"))]
@@ -699,6 +671,7 @@ impl<T: Transport> NatDriver<T> {
                         remote_peer,
                         role,
                         pending_data,
+                        unsent_data,
                         remote_write_closed,
                     );
                     let mut io = EndpointSwarm::new(swarm, &mut self.io);
@@ -733,12 +706,13 @@ impl<T: Transport> NatDriver<T> {
                         return;
                     };
                     // Bytes refused as Full are still owed to the peer: the
-                    // core's (a negotiation reply, say), then ours (a STOP
-                    // STATUS). The circuit takes Writable for the stream now,
-                    // so it sends them first, in that order.
+                    // core's (a negotiation reply, say), then the agent's
+                    // held tails (a STOP STATUS, say). The circuit
+                    // takes Writable for the stream now, so it sends them
+                    // first, in that order.
                     let mut owed = swarm.forget_stream(inner_conn, stream_id);
-                    if let Some(held) = self.io.held.take(inner_conn, stream_id) {
-                        owed.extend(held.tails);
+                    if !unsent_data.is_empty() {
+                        owed.push_back(unsent_data.into());
                     }
                     let unsent_prefix = concat(owed);
                     let adoption = BridgeAdoption {
@@ -892,19 +866,13 @@ impl<T: Transport> NatDriver<T> {
 /// What the NAT driver keeps around the swarm for the agent's commands.
 #[derive(Default)]
 struct HostIo {
-    /// Connection of each stream the agent opened or claimed, so the
-    /// driver can tell the agent's `StreamWritable` events apart.
-    stream_conns: StreamConns,
-    /// Unsent tails of the agent's writes, resent on the stream's Writable
-    /// so a full stream delays control messages instead of losing them.
-    held: HeldWrites,
     /// Dials to `/dns*` hosts parked for the composition to resolve, when it
     /// owns Name resolution (the std Endpoint); `None` rejects them.
     parked: Option<Vec<(NatToken, PeerAddr)>>,
 }
 
 /// The [`NatSwarm`] the driver hands the agent: the swarm, plus parking for
-/// named dials and held write tails. Borrowed for one agent call.
+/// named dials. Borrowed for one agent call.
 struct EndpointSwarm<'a, T: Transport, R: EntropySource> {
     swarm: &'a mut SwarmCore<T, R>,
     io: &'a mut HostIo,
@@ -913,88 +881,6 @@ struct EndpointSwarm<'a, T: Transport, R: EntropySource> {
 impl<'a, T: Transport, R: EntropySource> EndpointSwarm<'a, T, R> {
     fn new(swarm: &'a mut SwarmCore<T, R>, io: &'a mut HostIo) -> Self {
         Self { swarm, io }
-    }
-
-    /// Writes `data`, or holds it behind the stream's unsent tail. A Full
-    /// holds what the stream did not take.
-    fn send_or_hold(
-        &mut self,
-        peer: &PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        data: Bytes,
-        now_ms: u64,
-    ) -> Result<(), DriverError> {
-        let counted = data.len();
-        let held = &mut self.io.held;
-        if held.is_held(conn_id, stream_id) {
-            held.push(conn_id, stream_id, data, counted);
-        } else {
-            match self
-                .swarm
-                .send_stream(peer, conn_id, stream_id, data, now_ms)
-            {
-                Ok(()) => {}
-                Err(DriverError::Full { unsent, .. }) => {
-                    held.push(conn_id, stream_id, unsent, counted);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        // NAT messages are a few hundred bytes; a peer that leaves this much
-        // unread is not completing the exchange, so the stream goes.
-        if held.held_bytes(conn_id, stream_id) > MAX_HELD_PER_STREAM {
-            held.forget_stream(conn_id, stream_id);
-            match self.swarm.reset_stream(peer, conn_id, stream_id, now_ms) {
-                Ok(()) | Err(_) => {}
-            }
-        }
-        Ok(())
-    }
-
-    /// Closes the write side once nothing is held for the stream.
-    fn close_or_hold(
-        &mut self,
-        peer: &PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        now_ms: u64,
-    ) -> Result<(), DriverError> {
-        if self.io.held.close_after(conn_id, stream_id) {
-            return Ok(());
-        }
-        self.swarm
-            .close_stream_write(peer, conn_id, stream_id, now_ms)
-    }
-
-    /// Resends a writable stream's held tails, then its deferred close.
-    /// `true` when bytes were held and the stream took all of them; a
-    /// rejected resend is not a completed write.
-    fn replay_held(
-        &mut self,
-        peer: &PeerId,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        now_ms: u64,
-    ) -> bool {
-        let Some(held) = self.io.held.take(conn_id, stream_id) else {
-            return false;
-        };
-        let had_bytes = !held.tails.is_empty();
-        // Failures surface through the agent's own timeouts and the swarm's
-        // events, as for the first write.
-        let mut all_sent = true;
-        for data in held.tails {
-            all_sent &= self
-                .send_or_hold(peer, conn_id, stream_id, data, now_ms)
-                .is_ok();
-        }
-        if held.close {
-            match self.close_or_hold(peer, conn_id, stream_id, now_ms) {
-                Ok(()) | Err(_) => {}
-            }
-        }
-        had_bytes && all_sent && self.io.held.held_bytes(conn_id, stream_id) == 0
     }
 }
 
@@ -1025,9 +911,7 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
         protocol_id: &str,
         now_ms: u64,
     ) -> Result<(ConnectionId, StreamId), NatSwarmError> {
-        let (conn_id, stream_id) = self.swarm.open_stream(peer, protocol_id, now_ms)?;
-        self.io.stream_conns.opened(peer, conn_id, stream_id);
-        Ok((conn_id, stream_id))
+        Ok(self.swarm.open_stream(peer, protocol_id, now_ms)?)
     }
 
     fn send_stream(
@@ -1038,7 +922,9 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
         data: Bytes,
         now_ms: u64,
     ) -> Result<(), NatSwarmError> {
-        Ok(self.send_or_hold(peer, conn_id, stream_id, data, now_ms)?)
+        Ok(self
+            .swarm
+            .send_stream(peer, conn_id, stream_id, data, now_ms)?)
     }
 
     fn close_stream_write(
@@ -1048,7 +934,9 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
         stream_id: StreamId,
         now_ms: u64,
     ) -> Result<(), NatSwarmError> {
-        Ok(self.close_or_hold(peer, conn_id, stream_id, now_ms)?)
+        Ok(self
+            .swarm
+            .close_stream_write(peer, conn_id, stream_id, now_ms)?)
     }
 
     fn reset_stream(
@@ -1059,10 +947,6 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
         now_ms: u64,
     ) -> Result<(), NatSwarmError> {
         Ok(self.swarm.reset_stream(peer, conn_id, stream_id, now_ms)?)
-    }
-
-    fn write_pending(&self, conn_id: ConnectionId, stream_id: StreamId) -> bool {
-        self.io.held.held_bytes(conn_id, stream_id) > 0
     }
 
     fn ping(&mut self, peer: &PeerId, now_ms: u64) -> Result<(), NatSwarmError> {

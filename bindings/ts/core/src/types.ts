@@ -198,9 +198,20 @@ export interface Minip2pNamedEventMap {
     readonly connId: number;
     readonly protocols: readonly string[];
   };
-  identifyReceived: { readonly peerId: string; readonly info: IdentifyInfo };
-  pingRttMeasured: { readonly peerId: string; readonly rttMs: number };
-  pingTimeout: { readonly peerId: string };
+  /** An Identify snapshot arrived on `connId`. */
+  identifyReceived: {
+    readonly peerId: string;
+    readonly connId: number;
+    readonly info: IdentifyInfo;
+  };
+  /** A ping round trip completed on `connId`. */
+  pingRttMeasured: {
+    readonly peerId: string;
+    readonly connId: number;
+    readonly rttMs: number;
+  };
+  /** A ping sent on `connId` timed out. */
+  pingTimeout: { readonly peerId: string; readonly connId: number };
   stream: Stream;
   endpointError: {
     readonly kind: EndpointErrorKind;
@@ -496,13 +507,16 @@ export type P2pEvent =
   | RawEvent<typeof P2pEvent_Tags.PeerReady, Minip2pNamedEventMap["peerReady"]>
   | RawEvent<
       typeof P2pEvent_Tags.IdentifyReceived,
-      { peerId: string; info: IdentifyInfo }
+      Minip2pNamedEventMap["identifyReceived"]
     >
   | RawEvent<
       typeof P2pEvent_Tags.PingRttMeasured,
-      { peerId: string; rttMs: number }
+      Minip2pNamedEventMap["pingRttMeasured"]
     >
-  | RawEvent<typeof P2pEvent_Tags.PingTimeout, { peerId: string }>
+  | RawEvent<
+      typeof P2pEvent_Tags.PingTimeout,
+      Minip2pNamedEventMap["pingTimeout"]
+    >
   | RawEvent<typeof P2pEvent_Tags.StreamReady, InboundStreamMeta>
   | RawEvent<
       typeof P2pEvent_Tags.StreamData,
