@@ -128,11 +128,12 @@ pub(crate) struct Shared {
     /// refreshes it); that keeps the map bounded by the configured-peer
     /// count.
     observed_addrs: BTreeMap<PeerId, Multiaddr>,
-    /// The IP of each trusted reporter's latest observation over any
-    /// transport: our public IP, which AutoNAT probes ask about. Kept apart
-    /// so a TCP observation does not evict a QUIC punch mapping, and
-    /// dropped alongside `observed_addrs`.
-    observed_ips: BTreeMap<PeerId, Protocol>,
+    /// The IP of each trusted reporter's latest observation per family
+    /// (keyed `(reporter, is_ipv6)`) over any transport: our public IPs,
+    /// which AutoNAT probes ask about. Kept apart so a TCP observation does
+    /// not evict a QUIC punch mapping, and dropped alongside
+    /// `observed_addrs`.
+    observed_ips: BTreeMap<(PeerId, bool), Protocol>,
     /// Session dials in flight: relay-leg, reservation, and probe dials whose
     /// connection has not yet established, keyed by dial token. Concurrent
     /// machines targeting the same infrastructure peer wait on the first
@@ -348,23 +349,32 @@ impl Shared {
             return;
         };
         if let Some(ip @ (Protocol::Ip4(_) | Protocol::Ip6(_))) = addr.protocols().first() {
-            self.observed_ips.insert(reporter.clone(), ip.clone());
+            let is_ipv6 = matches!(ip, Protocol::Ip6(_));
+            self.observed_ips
+                .insert((reporter.clone(), is_ipv6), ip.clone());
         }
         if addr.is_quic_transport() {
             self.observed_addrs.insert(reporter.clone(), addr);
         }
     }
 
-    /// The addresses an AutoNAT probe asks about: each listen address at
-    /// every public IP trusted peers observe (same IP family), then the
-    /// listen addresses themselves. rust-libp2p and go-libp2p servers dial
-    /// back the requested transport and port at the IP they observe and
-    /// report that address, and only requested addresses count, so behind a
-    /// port-preserving NAT or a port forward only the rewritten address can
-    /// match. Bounded by listen addresses times configured peers;
-    /// `AutoNatClient` trims the request to one frame.
+    /// The addresses an AutoNAT probe asks about: the listen addresses, then
+    /// each at every public IP trusted peers observe (same IP family).
+    ///
+    /// rust-libp2p and go-libp2p servers dial back the requested transport
+    /// and port at the IP they observe and report that address, and only
+    /// requested addresses count, so behind a port-preserving NAT or a port
+    /// forward only the rewritten address can match. The list is bounded by
+    /// listen addresses times observed IPs; `AutoNatClient` trims it to one
+    /// frame, which holds hundreds of addresses, and listen addresses go
+    /// first so they survive any trim.
     pub(crate) fn probe_addrs(&self) -> Vec<Multiaddr> {
         let mut addrs: Vec<Multiaddr> = Vec::new();
+        for listen in &self.listen_addrs {
+            if !addrs.contains(listen) {
+                addrs.push(listen.clone());
+            }
+        }
         for ip in self.observed_ips.values() {
             for listen in &self.listen_addrs {
                 let Some((host, rest)) = listen.protocols().split_first() else {
@@ -383,11 +393,6 @@ impl Shared {
                         addrs.push(addr);
                     }
                 }
-            }
-        }
-        for listen in &self.listen_addrs {
-            if !addrs.contains(listen) {
-                addrs.push(listen.clone());
             }
         }
         addrs
@@ -1148,7 +1153,9 @@ impl NatAgent {
         self.shared.dialed.remove(&conn_id);
         self.shared.origins.remove(&conn_id);
         self.shared.observed_addrs.remove(peer);
-        self.shared.observed_ips.remove(peer);
+        self.shared
+            .observed_ips
+            .retain(|(reporter, _), _| reporter != peer);
         self.shared.streams.retain(|(conn, _), _| *conn != conn_id);
     }
 

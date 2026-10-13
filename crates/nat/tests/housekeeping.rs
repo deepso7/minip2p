@@ -460,6 +460,48 @@ fn servers_dialing_back_our_observed_ip_confirm_the_listen_port_there() {
 }
 
 #[test]
+fn a_dual_stack_reporter_contributes_its_ipv4_and_ipv6_observations() {
+    let mut hk = build(ReservationPolicy::Never, 0, 3);
+    hk.agent.set_listen_addrs(&[
+        maddr("/ip4/10.0.0.2/tcp/4001"),
+        maddr("/ip6/fd00::2/tcp/4001"),
+    ]);
+    for server in hk.servers.clone() {
+        identify_observed(
+            &mut hk.agent,
+            &server,
+            &maddr("/ip4/203.0.113.77/tcp/51234"),
+            at(0),
+        );
+        identify_observed(
+            &mut hk.agent,
+            &server,
+            &maddr("/ip6/2001:db8::77/tcp/51235"),
+            at(0),
+        );
+    }
+    let public = [
+        maddr("/ip4/203.0.113.77/tcp/4001"),
+        maddr("/ip6/2001:db8::77/tcp/4001"),
+    ];
+    let mut events = Vec::new();
+    for round in 0..3 {
+        events = hk.probe(Answer::Public(&public), round * 6_000).1;
+    }
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::ReachabilityChanged {
+                new: ReachabilityState::Public,
+                confirmed_addrs,
+                ..
+            }] if *confirmed_addrs == public
+        ),
+        "{events:?}"
+    );
+}
+
+#[test]
 fn dial_refused_is_never_a_private_vote() {
     let mut hk = build(ReservationPolicy::Never, 0, 3);
     for round in 0..3 {
