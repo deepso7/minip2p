@@ -100,6 +100,36 @@ impl From<std::io::ErrorKind> for IoErrorKind {
     }
 }
 
+/// Back to the standard kind, for a hosted adapter that has to hand a
+/// portable failure on as a `std::io::Error`. [`Other`](IoErrorKind::Other)
+/// stays `Other`.
+#[cfg(feature = "std")]
+impl From<IoErrorKind> for std::io::ErrorKind {
+    fn from(kind: IoErrorKind) -> Self {
+        use std::io::ErrorKind as Std;
+        match kind {
+            IoErrorKind::NotFound => Std::NotFound,
+            IoErrorKind::PermissionDenied => Std::PermissionDenied,
+            IoErrorKind::AddrInUse => Std::AddrInUse,
+            IoErrorKind::AddrNotAvailable => Std::AddrNotAvailable,
+            IoErrorKind::NetworkUnreachable => Std::NetworkUnreachable,
+            IoErrorKind::HostUnreachable => Std::HostUnreachable,
+            IoErrorKind::ConnectionRefused => Std::ConnectionRefused,
+            IoErrorKind::ConnectionReset => Std::ConnectionReset,
+            IoErrorKind::ConnectionAborted => Std::ConnectionAborted,
+            IoErrorKind::NotConnected => Std::NotConnected,
+            IoErrorKind::BrokenPipe => Std::BrokenPipe,
+            IoErrorKind::WouldBlock => Std::WouldBlock,
+            IoErrorKind::InvalidInput => Std::InvalidInput,
+            IoErrorKind::TimedOut => Std::TimedOut,
+            IoErrorKind::Interrupted => Std::Interrupted,
+            IoErrorKind::Unsupported => Std::Unsupported,
+            IoErrorKind::OutOfMemory => Std::OutOfMemory,
+            IoErrorKind::Other => Std::Other,
+        }
+    }
+}
+
 #[cfg(feature = "std")]
 impl From<&std::io::Error> for IoErrorKind {
     fn from(error: &std::io::Error) -> Self {
@@ -120,6 +150,10 @@ mod tests {
         assert_eq!(
             IoErrorKind::from(std::io::ErrorKind::UnexpectedEof),
             IoErrorKind::Other
+        );
+        assert_eq!(
+            std::io::ErrorKind::from(IoErrorKind::PermissionDenied),
+            std::io::ErrorKind::PermissionDenied
         );
     }
 }

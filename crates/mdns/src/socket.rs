@@ -326,7 +326,15 @@ impl PollSource for MdnsSockets {
         let registration = Registration { registry, tokens };
         registration
             .register_all(&mut self.pairs)
-            .map_err(io::Error::other)?;
+            .map_err(|error| {
+                // Keep the platform's kind: a host reports it (a refused
+                // registration is not the same failure as running out of room).
+                let kind = match &error {
+                    MdnsError::Io { kind, .. } => (*kind).into(),
+                    _ => io::ErrorKind::Other,
+                };
+                io::Error::new(kind, error)
+            })?;
         self.registration = Some(registration);
         Ok(())
     }
@@ -670,6 +678,72 @@ mod tests {
             .expect("harvest");
         assert!(poll.take_wake(), "the kept socket still wakes the host");
         assert_eq!(next_interface(&mut sockets), InterfaceId::new(1));
+    }
+
+    #[test]
+    fn a_refresh_whose_later_registration_fails_keeps_what_it_had() {
+        let (kept, kept_addr) = loopback_pair(0);
+        let kept_snapshot = kept.snapshot.clone();
+        let mut sockets = MdnsSockets::from_pairs(vec![kept]);
+        let mut poll = mio::Poll::new().expect("poll");
+        // One bit of tokens: interfaces 0 and 1 fit, interface 2 does not.
+        let tokens = TokenSpace::full()
+            .subspace(usize::BITS - 1, 0)
+            .expect("a one-bit space");
+        let registration = Registration {
+            registry: poll.registry().try_clone().expect("registry"),
+            tokens,
+        };
+        registration
+            .register_all(&mut sockets.pairs)
+            .expect("the kept socket registers");
+        sockets.registration = Some(registration);
+
+        // Interface 1's socket registers, then interface 2's cannot, so the
+        // refresh has to undo the first before giving up.
+        let (first, _) = loopback_pair(1);
+        let (second, _) = loopback_pair(2);
+        let arrived = vec![first.snapshot.clone(), second.snapshot.clone()];
+        let mut built = vec![first, second].into_iter();
+        let error = sockets
+            .replace(InterfaceRegistry::default(), arrived, |_| {
+                Ok(built.next().expect("one socket per snapshot"))
+            })
+            .expect_err("interface 2 has no token");
+        assert!(
+            matches!(
+                error,
+                MdnsError::Io {
+                    operation: MdnsIoOperation::Register,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(sockets.interfaces(), core::slice::from_ref(&kept_snapshot));
+
+        // The kept socket still wakes the host.
+        UdpSocket::bind("127.0.0.1:0")
+            .expect("sender")
+            .send_to(b"query", kept_addr)
+            .expect("send");
+        let mut events = mio::Events::with_capacity(4);
+        poll.poll(&mut events, Some(std::time::Duration::from_secs(5)))
+            .expect("poll");
+        assert!(!events.is_empty(), "the kept socket woke the poll");
+
+        // And a retry that fits commits.
+        let (retry, _) = loopback_pair(1);
+        let arrived = vec![kept_snapshot, retry.snapshot.clone()];
+        let mut built = Some(retry);
+        assert!(
+            sockets
+                .replace(InterfaceRegistry::default(), arrived.clone(), |_| {
+                    Ok(built.take().expect("only interface 1 is new"))
+                })
+                .expect("the retry fits")
+        );
+        assert_eq!(sockets.interfaces(), arrived);
     }
 
     #[test]

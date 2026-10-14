@@ -57,7 +57,7 @@ let node = minip2p::Endpoint::builder()
 
 mDNS needs no pubsub or relay. Its observations are unauthenticated until the transport verifies the remote peer, and its automatic dials remain direct-only. `KnownPeer::beacon_addrs` and `KnownPeer::mdns_addrs` show where each address came from.
 
-An invalid `mdns_config` fails `bind` with `BindError::Mdns`, and mDNS sockets that cannot be opened with `BindError::MdnsSocket`. Once running, an mDNS socket failure is `EndpointEvent::MdnsFailed { error }`, not a `wait` error: mDNS keeps retrying, the rest of the endpoint is unaffected, and `EndpointEvent::MdnsRecovered` follows once a retry works. Call `shutdown()` to send goodbyes and stop mDNS; it returns the first goodbye that could not be sent.
+An invalid configuration passed to `mdns_config` returns `MdnsConfigError` immediately. If mDNS sockets cannot be opened during `bind`, it returns `BindError::MdnsSocket`. Once running, an mDNS socket failure is `EndpointEvent::MdnsFailed { error }`, not a `wait` error: mDNS keeps retrying, the rest of the endpoint is unaffected, and `EndpointEvent::MdnsRecovered` follows once a retry works. Call `shutdown()` to send goodbyes and stop mDNS; it returns the first goodbye that could not be sent.
 
 Enable both methods on the same builder when the application needs LAN and pubsub-based discovery.
 
