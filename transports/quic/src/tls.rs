@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::{QuicBindError, QuicTlsStage};
 use minip2p_core::PeerId;
 use minip2p_identity::Ed25519Keypair;
 use rustls::client::Resumption;
@@ -231,14 +232,17 @@ pub(crate) struct TlsIdentity {
 impl TlsIdentity {
     /// Generates a libp2p certificate for `keypair`; `time` is the clock the
     /// verifiers check certificate validity against.
-    pub(crate) fn new(keypair: &Ed25519Keypair, time: Arc<HostTime>) -> Result<Self, String> {
+    pub(crate) fn new(
+        keypair: &Ed25519Keypair,
+        time: Arc<HostTime>,
+    ) -> Result<Self, QuicBindError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let (cert, key) = minip2p_tls::generate_certificate(keypair)
-            .map_err(|e| format!("failed to generate libp2p TLS certificate: {e}"))?;
+        let (cert, key) =
+            minip2p_tls::generate_certificate(keypair).map_err(QuicBindError::Certificate)?;
         let key = PrivateKeyDer::try_from(key)
-            .map_err(|e| format!("failed to parse generated TLS private key: {e}"))?;
+            .map_err(|error| QuicBindError::tls(QuicTlsStage::LoadKey, error))?;
         let key = CertifiedKey::from_der(vec![CertificateDer::from(cert)], key, &provider)
-            .map_err(|e| format!("failed to load generated TLS certificate: {e}"))?;
+            .map_err(|error| QuicBindError::tls(QuicTlsStage::LoadCertificate, error))?;
         Ok(Self {
             provider,
             key: Arc::new(key),

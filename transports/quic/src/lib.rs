@@ -51,7 +51,7 @@ mod write_fairness_tests;
 pub use config::{QuicLimits, QuicNodeConfig};
 #[cfg(feature = "diagnostics")]
 pub use diagnostics::{ConnectionDiagnostics, DatagramCounters, datagram_counters};
-pub use error::QuicBindError;
+pub use error::{QuicBindError, QuicTlsStage};
 
 use connection::{Cx, QuicConnection, SendCaps};
 use diagnostics::{ConnectionCounters, DatagramTally};
@@ -261,12 +261,6 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
     Ok(config)
 }
 
-fn tls_config_error(error: impl std::fmt::Display) -> QuicBindError {
-    QuicBindError::Tls {
-        detail: format!("failed to build the QUIC TLS configuration: {error}"),
-    }
-}
-
 /// QUIC transport over one or two non-blocking UDP sockets -- at most one per
 /// IP family -- and one quinn-proto endpoint serving both.
 ///
@@ -456,10 +450,12 @@ impl QuicTransport {
             .collect::<Result<Vec<_>, _>>()?;
 
         let host_time = Arc::new(HostTime::default());
-        let tls = TlsIdentity::new(node_config.keypair(), Arc::clone(&host_time))
-            .map_err(|detail| QuicBindError::Tls { detail })?;
-        let crypto = QuicServerConfig::try_from(tls.server_config().map_err(tls_config_error)?)
-            .map_err(tls_config_error)?;
+        let tls = TlsIdentity::new(node_config.keypair(), Arc::clone(&host_time))?;
+        let server_tls = tls
+            .server_config()
+            .map_err(|error| QuicBindError::tls(QuicTlsStage::ServerConfig, error))?;
+        let crypto = QuicServerConfig::try_from(server_tls)
+            .map_err(|error| QuicBindError::tls(QuicTlsStage::QuicCipherSuites, error))?;
         let mut server_config = ServerConfig::with_crypto(Arc::new(crypto));
         let mut validation_tokens = ValidationTokenConfig::default();
         // Retry stays the only address validation: no NEW_TOKEN is issued.

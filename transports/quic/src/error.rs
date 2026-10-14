@@ -39,10 +39,15 @@ pub enum QuicBindError {
         /// How many addresses were given.
         count: usize,
     },
-    /// The libp2p TLS identity or configuration could not be built.
-    #[error("QUIC TLS setup failed: {detail}")]
+    /// The libp2p TLS certificate for this identity could not be generated.
+    #[error("QUIC TLS certificate: {0}")]
+    Certificate(minip2p_tls::TlsError),
+    /// A TLS setup step failed in the crypto provider.
+    #[error("QUIC TLS setup failed while {stage}: {detail}")]
     Tls {
-        /// What TLS reported.
+        /// Which step failed.
+        stage: QuicTlsStage,
+        /// What the crypto provider reported.
         detail: String,
     },
     /// The platform refused a UDP socket.
@@ -59,7 +64,39 @@ pub enum QuicBindError {
     },
 }
 
+/// The TLS setup step a [`QuicBindError::Tls`] failed in.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum QuicTlsStage {
+    /// Loading the generated private key.
+    LoadKey,
+    /// Loading the generated certificate with its key.
+    LoadCertificate,
+    /// Building the listener's TLS 1.3 configuration.
+    ServerConfig,
+    /// Turning that configuration into QUIC's (it needs a QUIC cipher suite).
+    QuicCipherSuites,
+}
+
+impl core::fmt::Display for QuicTlsStage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::LoadKey => "loading the private key",
+            Self::LoadCertificate => "loading the certificate",
+            Self::ServerConfig => "building the server configuration",
+            Self::QuicCipherSuites => "selecting QUIC cipher suites",
+        })
+    }
+}
+
 impl QuicBindError {
+    pub(crate) fn tls(stage: QuicTlsStage, error: impl core::fmt::Display) -> Self {
+        Self::Tls {
+            stage,
+            detail: error.to_string(),
+        }
+    }
+
     pub(crate) fn socket(
         addr: SocketAddr,
         operation: &'static str,

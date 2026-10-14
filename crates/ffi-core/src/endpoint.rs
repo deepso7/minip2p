@@ -995,6 +995,7 @@ fn map_bind_error(error: BindError) -> FfiError {
         BindError::Quic(
             QuicBindError::InvalidLimit { .. }
             | QuicBindError::Tls { .. }
+            | QuicBindError::Certificate(_)
             | QuicBindError::AddressFamilies { .. },
         ) => config(ConfigCapability::Transport),
         BindError::Quic(QuicBindError::InvalidAddress { .. })
