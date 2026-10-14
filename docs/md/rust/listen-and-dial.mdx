@@ -9,6 +9,8 @@ This guide covers direct QUIC and TCP with the base Endpoint API. QUIC is on by 
 
 Listening is address-shaped: pass complete multiaddresses to `listen_on` (or `listen_default` for dual-stack QUIC) and call `bind`. The builder infers QUIC vs TCP from each address and groups compatible IPv4/IPv6 listeners onto one transport per shape. It accepts at most one QUIC listen address per IP family, and rejects `/p2p`, `/p2p-circuit`, and DNS hosts, which cannot be listened on.
 
+A listen setter rejects a bad address at once with an `EndpointOptionsError` naming it. `bind` returns a `BindError` naming what failed: `Options` for options that do not fit together, `Quic` or `Listen` when the platform refuses a socket (match its `IoErrorKind`, such as `AddrInUse`), or the capability whose configuration is invalid. `?` turns an `EndpointOptionsError` into a `BindError`, so a function that only builds an endpoint can return `Result<_, minip2p::BindError>`; one that also drives it, as below, mixes in runtime `minip2p::Error`s and usually returns `Box<dyn std::error::Error>`.
+
 | Method | Use it when |
 | --- | --- |
 | `.listen_on("/ip4/…/udp/…/quic-v1")?.bind()` | Configuration already uses complete multiaddresses. |

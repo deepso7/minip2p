@@ -4,17 +4,17 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use minip2p_platform::{Deadline, Now};
+use minip2p_platform::{Deadline, IoErrorKind, Now};
 use minip2p_smoltcp::SmoltcpStack;
 use minip2p_smoltcp::smoltcp::iface::{
-    Interface, PollIngressSingleResult, PollResult, SocketHandle,
+    Interface, MulticastError, PollIngressSingleResult, PollResult, SocketHandle,
 };
 use minip2p_smoltcp::smoltcp::phy::Device;
 use minip2p_smoltcp::smoltcp::socket::udp::{self, PacketBuffer, PacketMetadata, UdpMetadata};
 use minip2p_smoltcp::smoltcp::time::{Duration, Instant};
 use minip2p_smoltcp::smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
-use crate::io::{MdnsDatagram, MdnsError, MdnsIo};
+use crate::io::{MdnsDatagram, MdnsError, MdnsIo, MdnsIoOperation};
 use crate::{InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAction, MdnsTarget};
 
 /// The port mDNS runs on.
@@ -167,8 +167,14 @@ impl<D: Device> SmoltcpMdnsIo<D> {
             }
             if let Err(error) = shared.interface.join_multicast_group(group) {
                 rollback_families(&mut shared, &families);
+                let kind = match error {
+                    MulticastError::GroupTableFull => IoErrorKind::OutOfMemory,
+                    MulticastError::Unaddressable => IoErrorKind::InvalidInput,
+                };
                 return Err(MdnsError::io(
-                    "joining the mDNS multicast group",
+                    MdnsIoOperation::JoinGroup,
+                    kind,
+                    Some(id),
                     DisplayError(error),
                 ));
             }
@@ -191,7 +197,12 @@ impl<D: Device> SmoltcpMdnsIo<D> {
             }) {
                 leave_multicast_group(&mut shared, group);
                 rollback_families(&mut shared, &families);
-                return Err(MdnsError::io("binding the mDNS port", DisplayError(error)));
+                return Err(MdnsError::io(
+                    MdnsIoOperation::Bind,
+                    IoErrorKind::InvalidInput,
+                    Some(id),
+                    DisplayError(error),
+                ));
             }
             // mDNS is link-local by definition, and a hop limit of 255 is what
             // says so on the wire.
@@ -367,6 +378,17 @@ fn socket_addr_to_endpoint(addr: SocketAddr) -> IpEndpoint {
     IpEndpoint::new(address, addr.port())
 }
 
+/// A send smoltcp refused for a reason other than a full ring: the destination
+/// is one it cannot address.
+fn send_error(interface: InterfaceId, error: udp::SendError) -> MdnsError {
+    MdnsError::io(
+        MdnsIoOperation::Send,
+        IoErrorKind::InvalidInput,
+        Some(interface),
+        DisplayError(error),
+    )
+}
+
 /// Wraps a smoltcp error so it can be described without `std::error::Error`.
 struct DisplayError<E>(E);
 
@@ -489,7 +511,7 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
             Ok(()) => Ok(()),
             // The ring empties only when the stack is driven, so a burst fills
             // it well inside a single tick. Draining it here is the difference
-            // between a datagram delayed and the end of mDNS.
+            // between a datagram sent now and one parked for a whole turn.
             Err(udp::SendError::BufferFull) => {
                 let now_ms = self.now_ms;
                 self.drive(now_ms);
@@ -500,13 +522,10 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
                     udp::SendError::BufferFull => MdnsError::Congested {
                         interface: *interface,
                     },
-                    error => MdnsError::io("queueing an mDNS datagram", DisplayError(error)),
+                    error => send_error(*interface, error),
                 })
             }
-            Err(error) => Err(MdnsError::io(
-                "queueing an mDNS datagram",
-                DisplayError(error),
-            )),
+            Err(error) => Err(send_error(*interface, error)),
         }
     }
 

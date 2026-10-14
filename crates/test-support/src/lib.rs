@@ -209,9 +209,7 @@ impl InMemoryTransport {
 
 impl Transport for InMemoryTransport {
     fn dial(&mut self, _addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        Err(TransportError::InvalidConfig {
-            reason: "in-memory pair is already connected".into(),
-        })
+        Err(TransportError::Unsupported { operation: "dial" })
     }
 
     fn listen(&mut self, _addr: &Multiaddr) -> Result<Multiaddr, TransportError> {

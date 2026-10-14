@@ -160,6 +160,28 @@ pub enum NatErrorKind {
     RelayRefused,
 }
 
+/// Category of an mDNS failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum MdnsFailureKind {
+    /// The platform cannot provide mDNS sockets.
+    Unsupported,
+    /// An interface has no usable address.
+    NoInterfaceAddress,
+    /// A send named an interface that has gone away.
+    UnknownInterface,
+    /// A goodbye could not be sent before shutdown gave up on a full send
+    /// buffer.
+    Congested,
+    /// A datagram is larger than the carrier can ever send.
+    Oversized,
+    /// The interface id space is exhausted.
+    InterfaceIdsExhausted,
+    /// Platform I/O failed.
+    Io,
+}
+
 /// Category of a fatal background-driver failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
@@ -524,6 +546,18 @@ pub enum P2pEvent {
         /// Human-readable failure detail.
         reason: String,
     },
+    /// mDNS hit a hard failure. mDNS keeps running and retries; reported
+    /// once per change in failure state, and followed by `MdnsRecovered`
+    /// once a retry succeeds. A goodbye that failed during shutdown is
+    /// final.
+    MdnsFailed {
+        /// What kind of failure.
+        kind: MdnsFailureKind,
+        /// Human-readable failure detail.
+        detail: String,
+    },
+    /// mDNS recovered from its last `MdnsFailed`.
+    MdnsRecovered,
     /// A discovery source supplied an invalid claim.
     DiscoveryProtocolViolation {
         /// Claimed peer, when identifiable.
@@ -676,7 +710,27 @@ pub(crate) fn convert_endpoint_event(
         EndpointEvent::Nat(event) => convert_nat(event),
         EndpointEvent::Gossipsub(event) => Some(convert_gossipsub(event)),
         EndpointEvent::Discovery(event) => Some(convert_discovery(event)),
+        EndpointEvent::MdnsFailed { error } => Some(convert_mdns_failure(&error)),
+        EndpointEvent::MdnsRecovered => Some(P2pEvent::MdnsRecovered),
         other => convert_swarm(other),
+    }
+}
+
+fn convert_mdns_failure(error: &minip2p::MdnsError) -> P2pEvent {
+    use minip2p::MdnsError;
+
+    let kind = match error {
+        MdnsError::Unsupported => MdnsFailureKind::Unsupported,
+        MdnsError::NoInterfaceAddress { .. } => MdnsFailureKind::NoInterfaceAddress,
+        MdnsError::UnknownInterface { .. } => MdnsFailureKind::UnknownInterface,
+        MdnsError::Congested { .. } => MdnsFailureKind::Congested,
+        MdnsError::Oversized { .. } => MdnsFailureKind::Oversized,
+        MdnsError::InterfaceIdsExhausted => MdnsFailureKind::InterfaceIdsExhausted,
+        MdnsError::Io { .. } => MdnsFailureKind::Io,
+    };
+    P2pEvent::MdnsFailed {
+        kind,
+        detail: error.to_string(),
     }
 }
 
@@ -1320,6 +1374,23 @@ mod tests {
                 new_conn_id: 5,
             })
         );
+    }
+
+    #[test]
+    fn mdns_failures_carry_their_kind() {
+        let error = minip2p::MdnsError::io(
+            minip2p::MdnsIoOperation::Send,
+            minip2p::IoErrorKind::NetworkUnreachable,
+            None,
+            "no route",
+        );
+        assert!(matches!(
+            convert_mdns_failure(&error),
+            P2pEvent::MdnsFailed {
+                kind: MdnsFailureKind::Io,
+                ..
+            }
+        ));
     }
 
     #[test]

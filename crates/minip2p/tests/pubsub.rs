@@ -6,9 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use minip2p::{
-    Endpoint, EndpointEvent, GossipsubConfig, GossipsubError, GossipsubEvent, TransportError,
-};
+use minip2p::{Endpoint, EndpointEvent, GossipsubConfig, GossipsubError, GossipsubEvent};
 
 #[path = "../../../tests/support/endpoint.rs"]
 mod endpoint_support;
@@ -232,7 +230,6 @@ fn invalid_gossipsub_config_fails_before_transport_bind() {
         .expect("invalid pubsub config");
     assert!(matches!(
         error,
-        minip2p::Error::Transport(TransportError::InvalidConfig { ref reason })
-            if reason.contains("heartbeat_interval_ms")
+        minip2p::BindError::Gossipsub(ref error) if error.field == "heartbeat_interval_ms"
     ));
 }

@@ -2,7 +2,8 @@ use alloc::string::String;
 
 use thiserror::Error;
 
-use minip2p_core::Bytes;
+use minip2p_core::{Bytes, Multiaddr, PeerAddrError};
+use minip2p_platform::{EntropyError, IoErrorKind};
 
 use crate::{ConnectionId, StreamId};
 
@@ -19,8 +20,32 @@ pub enum TransportError {
         context: &'static str,
         reason: String,
     },
-    #[error("invalid transport configuration: {reason}")]
-    InvalidConfig { reason: String },
+    /// The transport has no bound local address to listen on.
+    #[error("the transport has no bound local address to listen on")]
+    NotListening,
+    /// A bound address could not be made into this node's dialable
+    /// `PeerAddr`.
+    #[error("cannot build a local peer address from {addr}: {error}")]
+    LocalPeerAddr {
+        /// The bound transport address.
+        addr: Multiaddr,
+        /// Why it is not a valid peer address.
+        error: PeerAddrError,
+    },
+    /// The transport needed randomness (a handshake key, say) and the
+    /// platform had none.
+    #[error("entropy unavailable: {0}")]
+    Entropy(#[from] EntropyError),
+    /// The platform I/O under the transport failed.
+    #[error("{operation} failed ({kind}): {detail}")]
+    Io {
+        /// What the transport was doing.
+        operation: &'static str,
+        /// What kind of failure the platform reported.
+        kind: IoErrorKind,
+        /// The platform's own description, for diagnostics.
+        detail: String,
+    },
     #[error("resource exhausted: {resource}")]
     ResourceExhausted { resource: &'static str },
     /// The transport does not offer this operation at all, as opposed to
@@ -36,8 +61,16 @@ pub enum TransportError {
         state: crate::ConnectionState,
         expected: crate::ConnectionState,
     },
-    #[error("listen failed: {reason}")]
-    ListenFailed { reason: String },
+    /// Binding a listener failed in the platform.
+    #[error("listen on {addr} failed ({kind}): {detail}")]
+    ListenFailed {
+        /// The address the listener was asked for.
+        addr: Multiaddr,
+        /// What kind of failure the platform reported.
+        kind: IoErrorKind,
+        /// The platform's own description, for diagnostics.
+        detail: String,
+    },
     #[error("dial failed for {id}: {reason}")]
     DialFailed { id: ConnectionId, reason: String },
     #[error("stream {stream_id} not found on connection {id}")]
@@ -94,11 +127,25 @@ pub enum TransportError {
     },
     #[error("close failed for {id}: {reason}")]
     CloseFailed { id: ConnectionId, reason: String },
+    /// Driving the transport failed inside the transport itself: a session
+    /// or negotiation fault, not the platform underneath.
     #[error("poll error: {reason}")]
     PollError { reason: String },
 }
 
 impl TransportError {
+    /// An [`Io`](Self::Io) error from a `std::io::Error`.
+    #[cfg(feature = "std")]
+    pub fn io(operation: &'static str, error: &std::io::Error) -> Self {
+        use alloc::string::ToString;
+
+        Self::Io {
+            operation,
+            kind: error.kind().into(),
+            detail: error.to_string(),
+        }
+    }
+
     /// The unsent tail of a [`TransportError::Full`] write, or `None` for any
     /// other error.
     pub fn into_unsent(self) -> Option<Bytes> {

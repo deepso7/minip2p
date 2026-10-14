@@ -2,6 +2,18 @@ use alloc::vec::Vec;
 
 use minip2p_core::{Multiaddr, PeerId, Protocol};
 
+/// Host-refreshed address source whose rejection is reported by
+/// [`RelayServerEvent::AddrsRejected`](crate::RelayServerEvent::AddrsRejected).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelayServerAddrSource {
+    /// Concrete bound listeners, from
+    /// [`RelayServerAgent::set_listener_addrs`](crate::RelayServerAgent::set_listener_addrs).
+    Listener,
+    /// AutoNAT-confirmed direct addresses, from
+    /// [`RelayServerAgent::set_confirmed_addrs`](crate::RelayServerAgent::set_confirmed_addrs).
+    Confirmed,
+}
+
 /// Why a relay announce address cannot be advertised.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RelayServerAddressErrorKind {

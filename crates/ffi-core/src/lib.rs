@@ -30,10 +30,11 @@ pub use config::{
 pub use connect::ConnectTarget;
 pub use driver::DriverStats;
 pub use endpoint::P2pEndpoint;
-pub use error::FfiError;
+pub use error::{ConfigCapability, FfiError};
 pub use events::{
     ConnectionInfo, DiscoverySource, DriverFailureKind, EndpointErrorKind, EventDoorbell,
-    IdentifyInfo, NatErrorKind, OpenStreamResult, P2pEvent, PathKind, Reachability,
+    IdentifyInfo, MdnsFailureKind, NatErrorKind, OpenStreamResult, P2pEvent, PathKind,
+    Reachability,
 };
 
 use std::str::FromStr;

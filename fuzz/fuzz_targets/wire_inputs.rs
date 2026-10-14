@@ -248,9 +248,7 @@ impl Transport for FuzzTransport {
     }
 
     fn dial(&mut self, _addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        Err(TransportError::InvalidConfig {
-            reason: "fuzz transport does not dial".into(),
-        })
+        Err(TransportError::Unsupported { operation: "dial" })
     }
 
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {

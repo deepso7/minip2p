@@ -430,12 +430,17 @@ pub fn circuit_address(env: Env, relay_address: String, peer_id: String) -> Resu
 
 /// Converts an `FfiError` into a JS `Error` that keeps the formatted message
 /// and adds a stable `code` (the variant name) plus the variant's `detail`,
-/// when it has one. The TypeScript adapter maps `code` to typed SDK errors.
+/// when it has one, and an `InvalidConfig`'s `capability`. The TypeScript
+/// adapter maps `code` to typed SDK errors.
 fn native_error(env: &Env, error: FfiError) -> Error {
+    let capability = match &error {
+        FfiError::InvalidConfig { capability, .. } => Some(capability.as_str()),
+        _ => None,
+    };
     let (code, detail) = match &error {
         FfiError::AlreadyStarted => ("AlreadyStarted", None),
         FfiError::Stopped => ("Stopped", None),
-        FfiError::InvalidConfig { detail } => ("InvalidConfig", Some(detail)),
+        FfiError::InvalidConfig { detail, .. } => ("InvalidConfig", Some(detail)),
         FfiError::InvalidKey { detail } => ("InvalidKey", Some(detail)),
         FfiError::InvalidPeerId { detail } => ("InvalidPeerId", Some(detail)),
         FfiError::InvalidAddress { detail } => ("InvalidAddress", Some(detail)),
@@ -452,6 +457,9 @@ fn native_error(env: &Env, error: FfiError) -> Error {
         js_error.set_named_property("code", code)?;
         if let Some(detail) = detail {
             js_error.set_named_property("detail", detail.as_str())?;
+        }
+        if let Some(capability) = capability {
+            js_error.set_named_property("capability", capability)?;
         }
         Ok(Error::from(js_error.to_unknown()))
     };

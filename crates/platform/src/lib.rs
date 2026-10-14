@@ -7,7 +7,8 @@
 //! that need randomness.
 //!
 //! This crate holds those contracts, plus the [`Deadline`] type that
-//! caller-driven components use to report when they next need attention. It is
+//! caller-driven components use to report when they next need attention, and
+//! [`IoErrorKind`], a portable classification of I/O failures. It is
 //! `no_std` + `alloc` compatible and has no networking code; the `std` feature
 //! adds [`StdClock`] and [`StdEntropy`] for hosted platforms.
 //!
@@ -52,6 +53,7 @@ extern crate alloc;
 mod clock;
 mod deadline;
 mod entropy;
+mod io;
 
 #[cfg(feature = "std")]
 mod std_impl;
@@ -59,6 +61,7 @@ mod std_impl;
 pub use clock::{Clock, Now};
 pub use deadline::Deadline;
 pub use entropy::{EntropyError, EntropySource, SharedEntropy};
+pub use io::IoErrorKind;
 
 #[cfg(feature = "std")]
 pub use std_impl::{StdClock, StdEntropy};

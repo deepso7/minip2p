@@ -20,7 +20,7 @@ cargo run -p minip2p-relay-server-example -- \
   --announce /dns4/relay.example.com/tcp/19876
 ```
 
-Its default is the small `.relay_server().listen_on(..)?.bind()` application path. Optional flags expose frozen resource/rate/control limits, and stdin `pause`/`resume` changes only new admissions. Explicit addresses are trusted operator input; otherwise selection prefers AutoNAT-confirmed direct addresses and then concrete listeners. Address changes affect future Identify responses only. There is no automatic relay discovery: distribute the printed peer address to clients explicitly. See the [hosting guide](https://github.com/deepso7/minip2p/tree/main/examples/relay-server).
+Its default is the small `.relay_server().listen_on(..)?.bind()` application path. Optional flags expose frozen resource/rate/control limits, and stdin `pause`/`resume` changes only new admissions. Explicit addresses are trusted operator input; otherwise selection prefers AutoNAT-confirmed direct addresses and then concrete listeners. Address changes affect future Identify responses only; a rejected listener or confirmed-address refresh keeps the previous addresses and is reported as `RelayServerEvent::AddrsRejected` (then `AddrsRestored`). There is no automatic relay discovery: distribute the printed peer address to clients explicitly. See the [hosting guide](https://github.com/deepso7/minip2p/tree/main/examples/relay-server).
 
 ## Enable NAT traversal
 

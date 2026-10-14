@@ -20,6 +20,14 @@ pub(crate) const MAX_DATAGRAMS_PER_TICK: usize = 128;
 /// Datagrams sent in one [`tick`](MdnsDriver::tick), for the same reason.
 pub(crate) const MAX_ACTIONS_PER_TICK: usize = 128;
 
+/// How long, in milliseconds, [`MdnsDriver`] waits after a hard failure before
+/// retrying.
+///
+/// Long enough that a carrier failing on every call costs a host ten ticks a
+/// second rather than a spin, short enough that a transient fault -- an
+/// interface flapping, a socket briefly refused -- is over before peers notice.
+pub const MDNS_FAILURE_RETRY: u64 = 100;
+
 /// How many times a shutdown drains the carrier for a goodbye that did not
 /// fit.
 ///
@@ -32,10 +40,10 @@ const SHUTDOWN_DRAIN_ATTEMPTS: usize = 4;
 ///
 /// The agent decides what to say and when; this decides how much of that to
 /// do in one turn, keeps the agent's view of the interfaces current, drops
-/// what did not come from this link, and stops for good if the I/O fails.
-/// None of that is platform work, which is why it lives here rather than in
-/// the host: a hosted socket adapter and an embedded stack get the same
-/// behaviour by supplying the same three operations.
+/// what did not come from this link, and backs off when the I/O fails. None
+/// of that is platform work, which is why it lives here rather than in the
+/// host: a hosted socket adapter and an embedded stack get the same behaviour
+/// by supplying the same three operations.
 ///
 /// # Time
 ///
@@ -50,11 +58,23 @@ const SHUTDOWN_DRAIN_ATTEMPTS: usize = 4;
 ///
 /// # Failure
 ///
-/// A send or receive that fails ends mDNS: the agent is shut down, the I/O is
-/// released, and every later tick is a no-op. A stack that cannot carry
-/// datagrams cannot participate, and a driver that kept trying would produce
-/// the same error forever while the peers' view of it went stale anyway.
-/// Events already observed are still drainable afterwards.
+/// A hard I/O failure does not end mDNS. The turn stops at the first one, the
+/// driver reports it as [`MdnsEvent::Failed`], and it waits
+/// [`MDNS_FAILURE_RETRY`] before trying again: ticks before then do nothing,
+/// and [`next_deadline`](Self::next_deadline) reports exactly the retry time,
+/// whatever else is overdue, so a host's wait never spins on a carrier that
+/// keeps failing. What failed is retried, not lost: an interface refresh stays
+/// due, and a datagram whose send failed is parked like a congested one and
+/// goes first on the retry (unless the interfaces or listen addresses move
+/// first, which makes it stale). The first retried turn that completes
+/// cleanly reports [`MdnsEvent::Recovered`].
+///
+/// There is one failure state, not one per interface. `Failed` is reported
+/// when it is entered and whenever the failure changes; the same failure
+/// again -- same variant, operation, and interface, whatever the platform's
+/// kind or text -- is not reported twice. A goodbye that fails at
+/// [`shutdown`](Self::shutdown) is reported as a final `Failed`, even if it
+/// repeats the failure already reported, and nothing follows it.
 ///
 /// Three things are not failures. A vanished interface takes its packet with
 /// it, because there is nowhere left to send it. A datagram the carrier can
@@ -65,6 +85,7 @@ const SHUTDOWN_DRAIN_ATTEMPTS: usize = 4;
 /// fault.
 pub struct MdnsDriver<I: MdnsIo> {
     agent: MdnsAgent,
+    /// `None` once shut down.
     io: Option<I>,
     /// When the interfaces are next re-read. `None` until the first tick
     /// arms it: construction just read them, and has no reading to date that
@@ -72,15 +93,24 @@ pub struct MdnsDriver<I: MdnsIo> {
     next_interface_refresh_ms: Option<u64>,
     interface_refresh_ms: u64,
     backlog: bool,
-    /// An action the previous tick's budget did not cover. Held rather than
-    /// dropped so a burst is delayed instead of lost.
+    /// An action the previous tick could not send -- its budget ran out, the
+    /// carrier was full, or the send failed. Held rather than dropped so a
+    /// burst is delayed instead of lost.
     pending_action: Option<MdnsAction>,
+    /// The hard failure mDNS is backing off from, if any.
+    failure: Option<Failure>,
     /// The last reading a caller gave, so a drop can date its goodbye.
     last_now: Now,
     /// Reused across ticks: one datagram's worth of buffer is too much to put
     /// on an embedded stack frame every time it is needed.
     buffer: Vec<u8>,
     events: VecDeque<MdnsEvent>,
+}
+
+/// The failure state: what failed last, and when to try again.
+struct Failure {
+    error: MdnsError,
+    retry_at: Deadline,
 }
 
 impl<I: MdnsIo> MdnsDriver<I> {
@@ -94,6 +124,7 @@ impl<I: MdnsIo> MdnsDriver<I> {
             interface_refresh_ms: config.interface_refresh_ms,
             backlog: false,
             pending_action: None,
+            failure: None,
             last_now: Now::from_millis(0),
             // One byte past the limit, so a datagram that fills it is
             // recognisably too big rather than silently truncated.
@@ -112,7 +143,7 @@ impl<I: MdnsIo> MdnsDriver<I> {
         &mut self.agent
     }
 
-    /// The carrier this driver runs on, or `None` once mDNS has stopped.
+    /// The carrier this driver runs on, or `None` once shut down.
     pub fn io(&self) -> Option<&I> {
         self.io.as_ref()
     }
@@ -133,8 +164,8 @@ impl<I: MdnsIo> MdnsDriver<I> {
 
     /// Whether mDNS is still running.
     ///
-    /// False once the I/O has failed or a goodbye has been sent, after which
-    /// [`tick`](Self::tick) does nothing.
+    /// True while backing off from a failure; false once shut down, after
+    /// which [`tick`](Self::tick) does nothing.
     pub fn is_active(&self) -> bool {
         self.io.is_some()
     }
@@ -143,39 +174,78 @@ impl<I: MdnsIo> MdnsDriver<I> {
     ///
     /// `local_addrs` is what this host currently listens on, which is what
     /// mDNS advertises. A change to it invalidates anything already encoded.
-    pub fn tick(&mut self, now: Now, local_addrs: &[Multiaddr]) -> Result<(), MdnsError> {
+    /// A hard I/O failure is reported as [`MdnsEvent::Failed`] rather than
+    /// returned; see [Failure](Self#failure).
+    pub fn tick(&mut self, now: Now, local_addrs: &[Multiaddr]) {
         self.last_now = now;
-        let now_ms = now.monotonic_ms;
-        if self.io.is_none() {
-            return Ok(());
+        if self
+            .failure
+            .as_ref()
+            .is_some_and(|failure| !failure.retry_at.is_expired_at(now))
+        {
+            return;
         }
+        // Out for the turn, so it can be held across the agent's borrows.
+        let Some(mut io) = self.io.take() else {
+            return;
+        };
+        let result = self.turn(&mut io, now.monotonic_ms, local_addrs);
+        self.io = Some(io);
+        self.drain_events();
+        match result {
+            Ok(backlog) => {
+                self.backlog = backlog;
+                if self.failure.take().is_some() {
+                    self.events.push_back(MdnsEvent::Recovered);
+                }
+            }
+            Err(error) => {
+                let repeated = self
+                    .failure
+                    .as_ref()
+                    .is_some_and(|failure| same_failure(&failure.error, &error));
+                if !repeated {
+                    self.events.push_back(MdnsEvent::Failed {
+                        error: error.clone(),
+                    });
+                }
+                self.failure = Some(Failure {
+                    error,
+                    retry_at: now.deadline_after(MDNS_FAILURE_RETRY),
+                });
+            }
+        }
+    }
+
+    /// The body of a tick, stopping at the first hard failure. Reports
+    /// whether this turn's budget left work over.
+    fn turn(
+        &mut self,
+        io: &mut I,
+        now_ms: u64,
+        local_addrs: &[Multiaddr],
+    ) -> Result<bool, MdnsError> {
         // Anything waiting to come in has to be in before it can be read: a
         // carrier that moves bytes only when driven holds them until now.
-        if let Err(error) = self.io.as_mut().expect("checked above").poll(now_ms) {
-            return Err(self.fail(error, now_ms));
-        }
+        io.poll(now_ms)?;
+        let next_refresh = now_ms.saturating_add(self.interface_refresh_ms);
         let refresh_due = match self.next_interface_refresh_ms {
             Some(due) => now_ms >= due,
             // Construction just read the interfaces; the schedule starts here.
             None => {
-                self.next_interface_refresh_ms =
-                    Some(now_ms.saturating_add(self.interface_refresh_ms));
+                self.next_interface_refresh_ms = Some(next_refresh);
                 false
             }
         };
         if refresh_due {
-            let changed = match self.io.as_mut().expect("checked above").refresh() {
-                Ok(changed) => changed,
-                Err(error) => return Err(self.fail(error, now_ms)),
-            };
-            if changed {
-                let interfaces = self.io.as_ref().expect("checked above").interfaces();
-                self.agent.set_interfaces(interfaces, now_ms);
+            // A refresh that fails stays due, so the retry repeats it.
+            if io.refresh()? {
+                self.agent.set_interfaces(io.interfaces(), now_ms);
                 // The parked action may embed address expansion from the old
                 // snapshot even when its stable interface id still exists.
                 self.pending_action = None;
             }
-            self.next_interface_refresh_ms = Some(now_ms.saturating_add(self.interface_refresh_ms));
+            self.next_interface_refresh_ms = Some(next_refresh);
         }
         if self.agent.set_local_addrs(local_addrs, now_ms) {
             // A parked packet was encoded from the previous listen-address
@@ -186,7 +256,7 @@ impl<I: MdnsIo> MdnsDriver<I> {
         let mut sent = 0usize;
         let mut congested = false;
         if let Some(action) = self.pending_action.take() {
-            match self.io.as_mut().expect("checked above").send(&action) {
+            match io.send(&action) {
                 Ok(()) => sent = 1,
                 // Nowhere to send it, or nothing that could ever carry it:
                 // either way holding on to it only delays the next word.
@@ -198,33 +268,23 @@ impl<I: MdnsIo> MdnsDriver<I> {
                     self.pending_action = Some(action);
                     congested = true;
                 }
-                Err(error) => return Err(self.fail(error, now_ms)),
+                // Held for the retry, as a congested one would be.
+                Err(error) => {
+                    self.pending_action = Some(action);
+                    return Err(error);
+                }
             }
         }
 
-        let receive_backlog = match self.receive_batch(now_ms) {
-            Ok(backlog) => backlog,
-            Err(error) => return Err(self.fail(error, now_ms)),
-        };
+        let receive_backlog = self.receive_batch(io, now_ms)?;
         self.agent.handle_tick(now_ms);
-        let action_backlog = if congested {
-            true
-        } else {
-            match self.send_batch(MAX_ACTIONS_PER_TICK.saturating_sub(sent)) {
-                Ok(backlog) => backlog,
-                Err(error) => return Err(self.fail(error, now_ms)),
-            }
-        };
+        let action_backlog =
+            congested || self.send_batch(io, MAX_ACTIONS_PER_TICK.saturating_sub(sent))?;
 
         // And again on the way out, so what was just sent leaves now rather
         // than waiting for whatever wakes the host next.
-        if let Err(error) = self.io.as_mut().expect("checked above").poll(now_ms) {
-            return Err(self.fail(error, now_ms));
-        }
-
-        self.backlog = receive_backlog || action_backlog;
-        self.drain_events();
-        Ok(())
+        io.poll(now_ms)?;
+        Ok(receive_backlog || action_backlog)
     }
 
     /// When this next needs a tick, as an absolute deadline on the host's
@@ -238,11 +298,16 @@ impl<I: MdnsIo> MdnsDriver<I> {
     /// Work the last tick's budget left over is due now. An overdue timer
     /// reports its past due time.
     ///
-    /// `None` once mDNS has stopped -- shut down, or ended by an I/O failure,
-    /// whatever was overdue at the time -- so a host can drop it from its
-    /// timeline rather than wake for something that will do nothing.
+    /// While backing off from a failure this is the retry time and nothing
+    /// else, however overdue the rest is: those timers are what the retry
+    /// serves, and honouring them early would only spin the host. `None` once
+    /// shut down, so a host can drop it from its timeline rather than wake for
+    /// something that will do nothing.
     pub fn next_deadline(&self, now: Now) -> Option<Deadline> {
         let io = self.io.as_ref()?;
+        if let Some(failure) = &self.failure {
+            return Some(failure.retry_at);
+        }
         if self.backlog {
             // Work was left on the floor by this tick's budget, so the next
             // one is due regardless of what any timer says.
@@ -261,8 +326,12 @@ impl<I: MdnsIo> MdnsDriver<I> {
     /// Says goodbye and stops.
     ///
     /// Peers are told to drop this host's records now rather than wait out a
-    /// TTL. Idempotent; the drop does the same thing for a host that does not
-    /// get the chance to call it.
+    /// TTL. A goodbye that could not be sent -- a hard I/O failure, or a
+    /// carrier still full after a bounded drain ([`MdnsError::Congested`]) --
+    /// is returned and also reported as a final [`MdnsEvent::Failed`].
+    /// Idempotent: a second call returns `Ok` and reports nothing. The drop
+    /// does the same thing for a host that does not get the chance to call
+    /// it.
     pub fn shutdown(&mut self, now: Now) -> Result<(), MdnsError> {
         self.last_now = now;
         let now_ms = now.monotonic_ms;
@@ -273,6 +342,7 @@ impl<I: MdnsIo> MdnsDriver<I> {
             return Ok(());
         };
         self.pending_action = None;
+        self.failure = None;
         self.agent.shutdown(now_ms);
 
         let mut first_error = None;
@@ -316,15 +386,19 @@ impl<I: MdnsIo> MdnsDriver<I> {
         }
         self.drain_events();
         match first_error {
-            Some(error) => Err(error),
+            Some(error) => {
+                self.events.push_back(MdnsEvent::Failed {
+                    error: error.clone(),
+                });
+                Err(error)
+            }
             None => Ok(()),
         }
     }
 
     /// Reads up to one tick's worth of datagrams, reporting whether the cap
     /// was reached.
-    fn receive_batch(&mut self, now_ms: u64) -> Result<bool, MdnsError> {
-        let io = self.io.as_mut().expect("callers check the io is present");
+    fn receive_batch(&mut self, io: &mut I, now_ms: u64) -> Result<bool, MdnsError> {
         let mut processed = 0usize;
         while processed < MAX_DATAGRAMS_PER_TICK {
             let Some(datagram) = io.receive(&mut self.buffer)? else {
@@ -358,8 +432,7 @@ impl<I: MdnsIo> MdnsDriver<I> {
 
     /// Sends up to `limit` actions, parking the next one if the budget runs
     /// out, and reporting whether anything was left over.
-    fn send_batch(&mut self, limit: usize) -> Result<bool, MdnsError> {
-        let io = self.io.as_mut().expect("callers check the io is present");
+    fn send_batch(&mut self, io: &mut I, limit: usize) -> Result<bool, MdnsError> {
         for _ in 0..limit {
             let Some(action) = self.agent.poll_action() else {
                 return Ok(false);
@@ -374,35 +447,50 @@ impl<I: MdnsIo> MdnsDriver<I> {
                 // A full send buffer is a moment, not a fault. Park what did
                 // not fit and stop here: the next turn begins with a drain, so
                 // the burst is delayed rather than lost -- and mDNS does not
-                // end because a device spoke faster than its link could carry.
+                // fail because a device spoke faster than its link could carry.
                 Err(MdnsError::Congested { .. }) => {
                     self.pending_action = Some(action);
                     return Ok(true);
                 }
-                Err(error) => return Err(error),
+                // Parked the same way, for the retry.
+                Err(error) => {
+                    self.pending_action = Some(action);
+                    return Err(error);
+                }
             }
         }
         self.pending_action = self.agent.poll_action();
         Ok(self.pending_action.is_some())
     }
 
-    /// Ends mDNS after an I/O failure, keeping what was already observed.
-    fn fail(&mut self, error: MdnsError, now_ms: u64) -> MdnsError {
-        self.pending_action = None;
-        self.backlog = false;
-        self.agent.shutdown(now_ms);
-        // The goodbye the shutdown queued cannot go anywhere: the thing that
-        // would carry it is what just failed.
-        while self.agent.poll_action().is_some() {}
-        self.io = None;
-        self.drain_events();
-        error
-    }
-
     fn drain_events(&mut self) {
         while let Some(event) = self.agent.poll_event() {
             self.events.push_back(event);
         }
+    }
+}
+
+/// Whether two hard failures are the same one, for reporting purposes.
+///
+/// I/O failures match on operation and interface: the platform's kind and
+/// text can drift between attempts at the same broken thing, and reporting
+/// each drift would be noise. Every other variant is its own variant and
+/// interface already.
+fn same_failure(a: &MdnsError, b: &MdnsError) -> bool {
+    match (a, b) {
+        (
+            MdnsError::Io {
+                operation: a_operation,
+                interface: a_interface,
+                ..
+            },
+            MdnsError::Io {
+                operation: b_operation,
+                interface: b_interface,
+                ..
+            },
+        ) => a_operation == b_operation && a_interface == b_interface,
+        _ => a == b,
     }
 }
 
@@ -422,13 +510,14 @@ impl<I: MdnsIo> Drop for MdnsDriver<I> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MdnsIoOperation;
     use crate::io::MdnsDatagram;
     use crate::{InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsTarget};
-    use alloc::string::ToString;
     use alloc::vec;
     use core::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
     use minip2p_core::PeerId;
     use minip2p_identity::{KeyType, PublicKey};
+    use minip2p_platform::IoErrorKind;
 
     /// An `MdnsIo` that carries nothing, scripted per test.
     #[derive(Default)]
@@ -517,7 +606,7 @@ mod tests {
         fn refresh(&mut self) -> Result<bool, MdnsError> {
             self.refreshes += 1;
             if self.refresh_fails {
-                return Err(MdnsError::io("refresh", "no interfaces"));
+                return Err(io_failure(MdnsIoOperation::EnumerateInterfaces, None));
             }
             Ok(self.refresh_changes)
         }
@@ -525,7 +614,10 @@ mod tests {
         fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<MdnsDatagram>, MdnsError> {
             self.ops.borrow_mut().push("receive");
             if self.receive_fails {
-                return Err(MdnsError::io("receive", "socket is gone"));
+                return Err(io_failure(
+                    MdnsIoOperation::Receive,
+                    Some(InterfaceId::new(1)),
+                ));
             }
             let Some((interface, from, payload, len)) = self.inbound.pop_front() else {
                 return Ok(None);
@@ -559,7 +651,7 @@ mod tests {
                 });
             }
             if self.send_fails {
-                return Err(MdnsError::io("send", "network is down"));
+                return Err(io_failure(MdnsIoOperation::Send, Some(*interface)));
             }
             if let Some(room) = self.room.as_mut() {
                 if *room == 0 {
@@ -604,7 +696,7 @@ mod tests {
         let sent = io.sent.clone();
         let mut driver = driver(io);
 
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         let sent = sent.borrow();
         assert_eq!(sent.len(), 2, "one announcement per interface: {sent:?}");
         assert!(
@@ -624,7 +716,7 @@ mod tests {
         io.queue_from(1, Ipv4Addr::new(203, 0, 113, 7), CLAIM, CLAIM.len());
         let mut driver = driver(io);
 
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         assert!(
             driver.poll_event().is_none(),
             "an off-link datagram must not reach the agent at all"
@@ -633,7 +725,7 @@ mod tests {
         // The same bytes from the link do reach it, so the drop above was
         // about where it came from and not about what it said.
         driver.io.as_mut().expect("still running").queue(1, CLAIM);
-        driver.tick(Now::from_millis(1), &[]).expect("tick");
+        driver.tick(Now::from_millis(1), &[]);
         assert!(
             matches!(
                 driver.poll_event(),
@@ -657,7 +749,7 @@ mod tests {
         );
         let mut driver = driver(io);
 
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         assert!(
             driver.poll_event().is_none(),
             "a truncated claim is not a claim; reading it would judge bytes that never arrived"
@@ -675,7 +767,7 @@ mod tests {
 
         // At nonzero uptime, so "due now" is told apart from `IMMEDIATE`.
         let now = Now::from_millis(7_000);
-        driver.tick(now, &[]).expect("tick");
+        driver.tick(now, &[]);
         assert_eq!(
             driver.io.as_ref().expect("still running").inbound.len(),
             5,
@@ -698,7 +790,7 @@ mod tests {
         }
         let mut driver = driver(io);
 
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         assert_eq!(driver.io.as_ref().expect("still running").inbound.len(), 5);
     }
 
@@ -708,7 +800,7 @@ mod tests {
         let sent = io.sent.clone();
         let mut driver = driver(io);
 
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         assert_eq!(sent.borrow().len(), MAX_ACTIONS_PER_TICK);
         assert!(
             driver.pending_action.is_some(),
@@ -720,7 +812,7 @@ mod tests {
         );
 
         // The parked one goes first on the next turn, before anything new.
-        driver.tick(Now::from_millis(1), &[]).expect("second tick");
+        driver.tick(Now::from_millis(1), &[]);
         assert_eq!(sent.borrow().len(), MAX_ACTIONS_PER_TICK + 2);
         assert!(driver.pending_action.is_none());
     }
@@ -735,9 +827,7 @@ mod tests {
         let sent = io.sent.clone();
         let mut driver = driver(io);
 
-        driver
-            .tick(Now::from_millis(0), &[])
-            .expect("a full send buffer is a moment, not a fault");
+        driver.tick(Now::from_millis(0), &[]);
         assert!(
             driver.is_active(),
             "mDNS must not end because a device spoke faster than its link could carry"
@@ -757,7 +847,7 @@ mod tests {
         // first thing said on the next one -- so a burst is delayed, never
         // lost.
         driver.io.as_mut().expect("still running").room = None;
-        driver.tick(Now::from_millis(1), &[]).expect("tick");
+        driver.tick(Now::from_millis(1), &[]);
         assert_eq!(sent.borrow().get(1), Some(&parked));
         assert_eq!(sent.borrow().len(), 3, "and the rest follow it");
         assert!(driver.pending_action.is_none());
@@ -770,11 +860,9 @@ mod tests {
         let sent = io.sent.clone();
         let mut driver = driver(io);
 
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         let parked = driver.pending_action.clone().expect("nothing fit");
-        driver
-            .tick(Now::from_millis(1), &[])
-            .expect("a link that is still full is not a fault");
+        driver.tick(Now::from_millis(1), &[]);
 
         assert!(driver.is_active());
         assert!(sent.borrow().is_empty(), "nothing got through");
@@ -799,9 +887,7 @@ mod tests {
         let sent = io.sent.clone();
         let mut driver = driver(io);
 
-        driver
-            .tick(Now::from_millis(0), &[])
-            .expect("a datagram that will never fit is not a fault either");
+        driver.tick(Now::from_millis(0), &[]);
         assert!(driver.is_active());
         assert!(sent.borrow().is_empty(), "nothing could go");
         assert!(
@@ -827,9 +913,7 @@ mod tests {
 
         // Not a failure: interfaces come and go, and there is nowhere to send
         // a packet encoded for one that left.
-        driver
-            .tick(Now::from_millis(0), &[])
-            .expect("a vanished interface is not a fault");
+        driver.tick(Now::from_millis(0), &[]);
         assert!(driver.is_active());
         assert_eq!(
             sent.borrow().len(),
@@ -838,73 +922,204 @@ mod tests {
         );
     }
 
+    /// An I/O failure the way a carrier would report one.
+    fn io_failure(operation: MdnsIoOperation, interface: Option<InterfaceId>) -> MdnsError {
+        MdnsError::io(operation, IoErrorKind::Other, interface, "scripted failure")
+    }
+
+    /// Drains the driver's events, keeping only its failure-state changes.
+    fn failure_states(driver: &mut MdnsDriver<FakeIo>) -> Vec<MdnsEvent> {
+        core::iter::from_fn(|| driver.poll_event())
+            .filter(|event| matches!(event, MdnsEvent::Failed { .. } | MdnsEvent::Recovered))
+            .collect()
+    }
+
     #[test]
-    fn io_that_fails_ends_mdns_and_leaves_what_was_seen() {
+    fn a_hard_failure_is_reported_once_until_it_changes() {
         let mut io = FakeIo::with_interfaces(1);
         io.queue(1, CLAIM);
         io.send_fails = true;
-        // An overdue carrier timer, which must not outlive the failure either.
-        io.carrier_deadline = Some(Deadline::IMMEDIATE);
         let mut driver = driver(io);
 
-        let error = driver
-            .tick(Now::from_millis(0), &[])
-            .expect_err("the send failed");
-        assert!(matches!(error, MdnsError::Io { .. }), "got {error:?}");
+        driver.tick(Now::from_millis(0), &[]);
         assert!(
-            !driver.is_active(),
-            "a stack that cannot send cannot participate; retrying would only repeat this"
+            driver.is_active(),
+            "a carrier that fails is backed off from, not abandoned"
         );
+        // The claim arrived before the send failed, and is still the host's.
+        assert!(matches!(
+            driver.poll_event(),
+            Some(MdnsEvent::ProtocolViolation { .. })
+        ));
         assert_eq!(
-            driver.next_deadline(Now::from_millis(5)),
-            None,
-            "a host must not keep waking for something that will do nothing, \
-             whatever was overdue when it failed"
+            failure_states(&mut driver),
+            vec![MdnsEvent::Failed {
+                error: io_failure(MdnsIoOperation::Send, Some(InterfaceId::new(1)))
+            }]
         );
-        driver
-            .tick(Now::from_millis(1), &[])
-            .expect("a stopped driver does nothing");
 
-        // The claim was observed before the send failed, and losing it would
-        // lose something the host had already learned.
-        assert!(
-            matches!(
-                driver.poll_event(),
-                Some(MdnsEvent::ProtocolViolation { .. })
-            ),
-            "what was observed survives the failure"
-        );
-    }
+        // The same send failing again, in other words: not news.
+        driver.tick(Now::from_millis(MDNS_FAILURE_RETRY), &[]);
+        assert_eq!(failure_states(&mut driver), vec![]);
 
-    #[test]
-    fn a_receive_that_fails_ends_mdns_too() {
-        let mut io = FakeIo::with_interfaces(1);
+        // A different failure is.
+        let io = driver.io_mut().expect("running");
+        io.send_fails = false;
         io.receive_fails = true;
-        let mut driver = driver(io);
-
-        let error = driver
-            .tick(Now::from_millis(0), &[])
-            .expect_err("the receive failed");
-        assert_eq!(error.to_string(), "receive failed: socket is gone");
-        assert!(!driver.is_active());
+        driver.tick(Now::from_millis(2 * MDNS_FAILURE_RETRY), &[]);
+        assert_eq!(
+            failure_states(&mut driver),
+            vec![MdnsEvent::Failed {
+                error: io_failure(MdnsIoOperation::Receive, Some(InterfaceId::new(1)))
+            }]
+        );
     }
 
     #[test]
-    fn a_refresh_that_fails_ends_mdns_too() {
+    fn a_failure_with_new_wording_is_the_same_failure() {
+        let send = |kind, detail| MdnsError::Io {
+            operation: MdnsIoOperation::Send,
+            kind,
+            interface: Some(InterfaceId::new(1)),
+            detail: alloc::string::String::from(detail),
+        };
+        assert!(same_failure(
+            &send(IoErrorKind::Other, "down"),
+            &send(IoErrorKind::NetworkUnreachable, "unreachable")
+        ));
+        assert!(!same_failure(
+            &send(IoErrorKind::Other, "down"),
+            &io_failure(MdnsIoOperation::Send, Some(InterfaceId::new(2)))
+        ));
+    }
+
+    #[test]
+    fn nothing_is_retried_before_the_retry_deadline() {
+        let mut io = FakeIo::with_interfaces(1);
+        io.send_fails = true;
+        let ops = io.ops.clone();
+        let mut driver = driver(io);
+        driver.tick(Now::from_millis(0), &[]);
+        assert_eq!(failure_states(&mut driver).len(), 1);
+        ops.borrow_mut().clear();
+
+        driver.tick(Now::from_millis(1), &[]);
+        driver.tick(Now::from_millis(MDNS_FAILURE_RETRY - 1), &[]);
+        assert!(
+            ops.borrow().is_empty(),
+            "a backing-off driver leaves the carrier alone: {:?}",
+            ops.borrow()
+        );
+        assert_eq!(driver.poll_event(), None);
+    }
+
+    #[test]
+    fn a_clean_retry_reports_recovery_once() {
+        let mut io = FakeIo::with_interfaces(1);
+        io.send_fails = true;
+        let sent = io.sent.clone();
+        let mut driver = driver(io);
+        driver.tick(Now::from_millis(0), &[]);
+        assert_eq!(failure_states(&mut driver).len(), 1);
+        assert!(
+            driver.pending_action.is_some(),
+            "the datagram that failed is held for the retry"
+        );
+
+        driver.io_mut().expect("running").send_fails = false;
+        driver.tick(Now::from_millis(MDNS_FAILURE_RETRY), &[]);
+        assert_eq!(failure_states(&mut driver), vec![MdnsEvent::Recovered]);
+        assert_eq!(sent.borrow().len(), 1, "and goes out once it can");
+
+        driver.tick(Now::from_millis(MDNS_FAILURE_RETRY + 1), &[]);
+        assert_eq!(failure_states(&mut driver), vec![]);
+    }
+
+    #[test]
+    fn a_failed_driver_sleeps_until_its_retry_whatever_else_is_overdue() {
+        let io = FakeIo::with_interfaces(u32::try_from(MAX_ACTIONS_PER_TICK).expect("fits") + 2);
+        let mut driver = driver(io);
+        driver.tick(Now::from_millis(0), &[]);
+        assert!(driver.pending_action.is_some(), "a send backlog");
+
+        // Failing before the agent's next word is handled, so that is overdue
+        // too, alongside the backlog and the carrier's timer.
+        let agent_due = driver
+            .agent
+            .next_deadline(Now::from_millis(0))
+            .expect("armed");
+        let failed_at = Now::from_millis(agent_due.as_millis() + 1);
+        let io = driver.io_mut().expect("running");
+        io.send_fails = true;
+        io.carrier_deadline = Some(Deadline::IMMEDIATE);
+        driver.tick(failed_at, &[]);
+        assert_eq!(failure_states(&mut driver).len(), 1);
+        assert!(
+            driver
+                .agent
+                .next_deadline(failed_at)
+                .is_some_and(|deadline| deadline.is_expired_at(failed_at))
+        );
+
+        let retry = failed_at.deadline_after(MDNS_FAILURE_RETRY);
+        let late = Now::from_millis(retry.as_millis() - 1);
+        for now in [failed_at, late] {
+            assert_eq!(
+                driver.next_deadline(now),
+                Some(retry),
+                "honouring an overdue timer while failed would spin the host"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_refresh_stays_due_until_it_is_retried() {
         let mut io = FakeIo::with_interfaces(1);
         io.refresh_fails = true;
         let mut driver = driver(io);
-
-        // The refresh is due at the configured interval, not immediately.
         let refresh_at = MdnsConfig::default().interface_refresh_ms;
-        driver
-            .tick(Now::from_millis(0), &[])
-            .expect("nothing is due yet");
+        driver.tick(Now::from_millis(0), &[]);
+
+        driver.tick(Now::from_millis(refresh_at), &[]);
+        assert_eq!(
+            failure_states(&mut driver),
+            vec![MdnsEvent::Failed {
+                error: io_failure(MdnsIoOperation::EnumerateInterfaces, None)
+            }]
+        );
+
+        driver.io_mut().expect("running").refresh_fails = false;
+        driver.tick(Now::from_millis(refresh_at + MDNS_FAILURE_RETRY), &[]);
+        assert_eq!(
+            driver.io().expect("running").refreshes,
+            2,
+            "the retry repeats the refresh rather than waiting out another interval"
+        );
+        assert_eq!(failure_states(&mut driver), vec![MdnsEvent::Recovered]);
+    }
+
+    #[test]
+    fn a_goodbye_that_fails_is_a_final_failure() {
+        let mut io = FakeIo::with_interfaces(1);
+        io.send_fails = true;
+        let mut driver = driver(io);
+        driver.tick(Now::from_millis(0), &[]);
+        assert_eq!(failure_states(&mut driver).len(), 1);
+
         let error = driver
-            .tick(Now::from_millis(refresh_at), &[])
-            .expect_err("the refresh failed");
-        assert!(matches!(error, MdnsError::Io { .. }), "got {error:?}");
-        assert!(!driver.is_active());
+            .shutdown(Now::from_millis(10))
+            .expect_err("the goodbye failed");
+        assert_eq!(
+            failure_states(&mut driver),
+            vec![MdnsEvent::Failed { error }],
+            "reported even though it repeats the failure already active"
+        );
+
+        driver.tick(Now::from_millis(10 + MDNS_FAILURE_RETRY), &[]);
+        driver
+            .shutdown(Now::from_millis(20 + MDNS_FAILURE_RETRY))
+            .expect("a second shutdown is a no-op");
+        assert_eq!(driver.poll_event(), None, "and nothing follows it");
     }
 
     #[test]
@@ -912,7 +1127,7 @@ mod tests {
         let io = FakeIo::with_interfaces(u32::try_from(MAX_ACTIONS_PER_TICK).expect("fits") + 2);
         let sent = io.sent.clone();
         let mut driver = driver(io);
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         assert!(driver.pending_action.is_some());
 
         let announced = sent.borrow().len();
@@ -920,9 +1135,7 @@ mod tests {
         let io = driver.io.as_mut().expect("still running");
         io.refresh_changes = true;
         io.interfaces.clear();
-        driver
-            .tick(Now::from_millis(refresh_at), &[])
-            .expect("tick");
+        driver.tick(Now::from_millis(refresh_at), &[]);
 
         // The parked packet was encoded against the interface set that just
         // changed -- every interface went away -- so sending it now would
@@ -940,7 +1153,7 @@ mod tests {
         let io = FakeIo::with_interfaces(u32::try_from(MAX_ACTIONS_PER_TICK).expect("fits") + 2);
         let sent = io.sent.clone();
         let mut driver = driver(io);
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         let stale = driver
             .pending_action
             .clone()
@@ -954,7 +1167,7 @@ mod tests {
         let addr: Multiaddr = "/ip4/192.168.1.1/udp/4001/quic-v1"
             .parse()
             .expect("test address");
-        driver.tick(Now::from_millis(1), &[addr]).expect("tick");
+        driver.tick(Now::from_millis(1), &[addr]);
         assert_ne!(
             sent.borrow().get(announced),
             Some(&stale),
@@ -969,7 +1182,7 @@ mod tests {
         let ops = io.ops.clone();
         let mut driver = driver(io);
 
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         let ops = ops.borrow();
 
         // A stack running in this process moves nothing on its own. Reading
@@ -988,7 +1201,7 @@ mod tests {
         let mut io = FakeIo::with_interfaces(1);
         io.carrier_deadline = Some(Deadline::from_millis(5));
         let mut driver = driver(io);
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
 
         // A stack of its own gets nothing done between ticks, so a host that
         // slept through one of its deadlines would stall it -- retransmits
@@ -1006,7 +1219,7 @@ mod tests {
         let mut driver = driver(io);
         // A host whose clock has been running a while before mDNS starts.
         let start = Now::from_millis(50_000);
-        driver.tick(start, &[]).expect("tick");
+        driver.tick(start, &[]);
 
         let refresh_ms = MdnsConfig::default().interface_refresh_ms;
         let first_query = driver.agent.next_deadline(start).expect("armed");
@@ -1022,13 +1235,9 @@ mod tests {
         // some epoch of the driver's own: a host started late is not owed one
         // straight away, and is owed one exactly when the interval is up.
         let refresh_at = 50_000 + refresh_ms;
-        driver
-            .tick(Now::from_millis(refresh_at - 1), &[])
-            .expect("tick");
+        driver.tick(Now::from_millis(refresh_at - 1), &[]);
         assert_eq!(driver.io.as_ref().expect("running").refreshes, 0);
-        driver
-            .tick(Now::from_millis(refresh_at), &[])
-            .expect("tick");
+        driver.tick(Now::from_millis(refresh_at), &[]);
         assert_eq!(driver.io.as_ref().expect("running").refreshes, 1);
     }
 
@@ -1037,7 +1246,7 @@ mod tests {
         let io = FakeIo::with_interfaces(3);
         let sent = io.sent.clone();
         let mut driver = driver(io);
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         let announced = sent.borrow().len();
 
         // Every interface, not a budget's worth: this is the last thing that
@@ -1073,7 +1282,7 @@ mod tests {
         let io = FakeIo::with_interfaces(2);
         let ops = io.ops.clone();
         let mut driver = driver(io);
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         ops.borrow_mut().clear();
 
         // The carrier is dropped at the end of a shutdown, so this is its
@@ -1100,7 +1309,7 @@ mod tests {
         io.room_per_poll = 1;
         let sent = io.sent.clone();
         let mut driver = driver(io);
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         let announced = sent.borrow().len();
 
         // A tick would park a congested datagram and come back for it. A
@@ -1144,6 +1353,11 @@ mod tests {
             .expect_err("the goodbye never got out");
         assert!(matches!(error, MdnsError::Congested { .. }), "{error:?}");
         assert!(!driver.is_active());
+        assert_eq!(
+            failure_states(&mut driver),
+            vec![MdnsEvent::Failed { error }],
+            "a goodbye that never left is a final failure"
+        );
         let polls = ops.borrow().iter().filter(|op| **op == "poll").count();
         assert!(
             polls <= (SHUTDOWN_DRAIN_ATTEMPTS + 1) * 2 + 1,
@@ -1156,7 +1370,7 @@ mod tests {
         let io = FakeIo::with_interfaces(2);
         let sent = io.sent.clone();
         let mut driver = driver(io);
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         let announced = sent.borrow().len();
 
         // A host that drops its driver has left the link. Peers that are not

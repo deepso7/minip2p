@@ -4,6 +4,8 @@ use minip2p_core::{Bytes, PeerId};
 use minip2p_relay::Status;
 use minip2p_transport::{ConnectionId, StreamId};
 
+use crate::{RelayServerAddrSource, RelayServerAddressError};
+
 /// Exact identity of a transport stream.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StreamKey {
@@ -188,7 +190,7 @@ pub struct RelayServerRuntimeError {
     pub detail: String,
 }
 
-/// Public reservation, circuit, denial, and diagnostic output.
+/// Public reservation, circuit, denial, address-source, and diagnostic output.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RelayServerEvent {
     /// A new reservation or renewal response entered the transport queue.
@@ -240,6 +242,22 @@ pub enum RelayServerEvent {
         bytes: CircuitByteCounts,
         /// Stable terminal reason.
         reason: CircuitCloseReason,
+    },
+    /// A host address refresh was rejected while `source` was healthy, or
+    /// with a different error while it was already failing. The source's
+    /// previously accepted addresses stay in effect until an accepted
+    /// refresh; an identical repeated rejection queues nothing.
+    AddrsRejected {
+        /// Address source whose refresh was rejected.
+        source: RelayServerAddrSource,
+        /// First invalid address and why it was rejected.
+        error: RelayServerAddressError,
+    },
+    /// The first accepted refresh of a `source` that was failing; later
+    /// accepted refreshes queue nothing.
+    AddrsRestored {
+        /// Address source that accepted a refresh again.
+        source: RelayServerAddrSource,
     },
     /// Asynchronous diagnostic that does not replace stable lifecycle events.
     Error(RelayServerRuntimeError),

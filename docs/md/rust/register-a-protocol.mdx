@@ -18,7 +18,7 @@ You can also call `add_protocol` after binding. Registration affects inbound and
 
 <Callout type="warning">
 
-`/ipfs/id/1.0.0` and `/ipfs/ping/1.0.0` are owned by the endpoint. Registering an ID in `RESERVED_PROTOCOL_IDS` fails with `minip2p::Error::Swarm(minip2p::SwarmError::ReservedProtocol { .. })`.
+`/ipfs/id/1.0.0` and `/ipfs/ping/1.0.0` are owned by the endpoint. Registering an ID in `RESERVED_PROTOCOL_IDS` on the builder fails `bind` with `minip2p::BindError::Swarm(minip2p::SwarmError::ReservedProtocol { .. })`; `add_protocol` rejects it with `minip2p::Error::Swarm(minip2p::SwarmError::ReservedProtocol { .. })`.
 
 </Callout>
 

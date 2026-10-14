@@ -189,6 +189,8 @@ impl DiscoveryDriver {
                 self.book
                     .report_violation(peer, DiscoverySource::Mdns, &reason);
             }
+            // The engine reports mDNS health to the application itself.
+            MdnsEvent::Failed { .. } | MdnsEvent::Recovered => {}
         }
     }
 

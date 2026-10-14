@@ -128,7 +128,7 @@ fn establish(count: usize) -> ReadySet {
     )
     .parse()
     .expect("benchmark address");
-    let mut provider = StdTcpProvider::new().expect("create provider");
+    let mut provider = StdTcpProvider::new();
 
     let mut peers = Vec::with_capacity(count);
     let mut connected = 0;
@@ -274,7 +274,7 @@ struct UpgradedSet {
 
 fn node(seed: u8) -> Node {
     TcpTransport::new(
-        StdTcpProvider::new().expect("create provider"),
+        StdTcpProvider::new(),
         Ed25519Keypair::from_secret_key_bytes([seed; 32]),
         StdEntropy::new(),
     )

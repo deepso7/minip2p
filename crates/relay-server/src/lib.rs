@@ -37,7 +37,7 @@ mod config;
 mod limiter;
 mod types;
 
-pub use address::{RelayServerAddressError, RelayServerAddressErrorKind};
+pub use address::{RelayServerAddrSource, RelayServerAddressError, RelayServerAddressErrorKind};
 pub use agent::RelayServerAgent;
 pub use config::{
     RateLimit, RelayServerConfig, RelayServerConfigError, RelayServerConfigErrorKind,

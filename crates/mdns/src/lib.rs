@@ -43,11 +43,11 @@ pub use minip2p_smoltcp::{SmoltcpStack, smoltcp};
 pub use agent::MdnsAgent;
 pub use config::{MdnsConfig, MdnsConfigError};
 pub use dns::{DnsCodecError, DnsMessage, DnsQuestion, DnsRecord, DnsRecordData};
-pub use driver::MdnsDriver;
+pub use driver::{MDNS_FAILURE_RETRY, MdnsDriver};
 pub use events::{
     InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAction, MdnsEvent, MdnsTarget,
 };
-pub use io::{MAX_DATAGRAM_BYTES, MdnsDatagram, MdnsError, MdnsIo};
+pub use io::{MAX_DATAGRAM_BYTES, MdnsDatagram, MdnsError, MdnsIo, MdnsIoOperation};
 #[cfg(feature = "smoltcp")]
 pub use smoltcp_io::{SmoltcpMdnsConfig, SmoltcpMdnsIo};
 #[cfg(feature = "std")]

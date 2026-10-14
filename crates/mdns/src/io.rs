@@ -3,7 +3,7 @@
 use alloc::string::String;
 use core::net::{IpAddr, SocketAddr};
 
-use minip2p_platform::{Deadline, Now};
+use minip2p_platform::{Deadline, IoErrorKind, Now};
 
 use crate::{InterfaceId, InterfaceSnapshot, IpNet, MdnsAction};
 
@@ -39,7 +39,7 @@ pub enum MdnsError {
     /// Not a fault either: a stack that moves bytes only when it is driven
     /// fills up between polls, and what did not fit is still worth sending.
     /// The driver parks the action and comes back for it on its next turn
-    /// rather than ending mDNS over a full buffer.
+    /// rather than treating a full buffer as a failure.
     #[error("mDNS interface {interface:?} cannot take another datagram yet")]
     Congested {
         /// The interface whose buffer is full.
@@ -66,23 +66,101 @@ pub enum MdnsError {
     #[error("mDNS interface id space is exhausted")]
     InterfaceIdsExhausted,
     /// The underlying I/O failed.
-    #[error("{operation} failed: {reason}")]
+    #[error("{operation} failed{}: {kind}: {detail}", OnInterface(*interface))]
     Io {
-        /// Which operation failed, for the message.
-        operation: &'static str,
-        /// What the platform reported.
-        reason: String,
+        /// Which operation failed.
+        operation: MdnsIoOperation,
+        /// What kind of failure the platform reported.
+        kind: IoErrorKind,
+        /// The interface the operation was for, or `None` for one that spans
+        /// them all -- enumerating interfaces, driving the carrier.
+        interface: Option<InterfaceId>,
+        /// The platform's own description, for diagnostics.
+        detail: String,
     },
 }
 
 impl MdnsError {
-    /// Builds an [`MdnsError::Io`] from anything the platform can describe.
-    pub fn io(operation: &'static str, reason: impl core::fmt::Display) -> Self {
+    /// Builds an [`MdnsError::Io`] from what the platform reported.
+    pub fn io(
+        operation: MdnsIoOperation,
+        kind: IoErrorKind,
+        interface: Option<InterfaceId>,
+        detail: impl core::fmt::Display,
+    ) -> Self {
         use alloc::string::ToString;
 
         Self::Io {
             operation,
-            reason: reason.to_string(),
+            kind,
+            interface,
+            detail: detail.to_string(),
+        }
+    }
+
+    /// Builds an [`MdnsError::Io`] from a `std::io::Error`, keeping its kind.
+    #[cfg(feature = "std")]
+    pub fn std_io(
+        operation: MdnsIoOperation,
+        interface: Option<InterfaceId>,
+        error: &std::io::Error,
+    ) -> Self {
+        Self::io(operation, error.into(), interface, error)
+    }
+}
+
+/// Which I/O operation an [`MdnsError::Io`] failed in.
+///
+/// Every operation the bundled carriers perform has one; a carrier of a
+/// host's own picks the nearest.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum MdnsIoOperation {
+    /// Listing the host's network interfaces and their addresses.
+    EnumerateInterfaces,
+    /// Opening a socket.
+    OpenSocket,
+    /// Setting a socket option: address reuse, multicast interface, hop
+    /// limit, non-blocking mode.
+    ConfigureSocket,
+    /// Binding a socket to the mDNS port.
+    Bind,
+    /// Joining the mDNS multicast group.
+    JoinGroup,
+    /// Registering a socket with the host's readiness poll.
+    Register,
+    /// Sending a datagram.
+    Send,
+    /// Receiving a datagram.
+    Receive,
+    /// Driving the carrier ([`MdnsIo::poll`]).
+    Poll,
+}
+
+impl core::fmt::Display for MdnsIoOperation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::EnumerateInterfaces => "enumerating network interfaces",
+            Self::OpenSocket => "opening an mDNS socket",
+            Self::ConfigureSocket => "configuring an mDNS socket",
+            Self::Bind => "binding the mDNS port",
+            Self::JoinGroup => "joining the mDNS multicast group",
+            Self::Register => "registering an mDNS socket for readiness",
+            Self::Send => "sending an mDNS datagram",
+            Self::Receive => "receiving an mDNS datagram",
+            Self::Poll => "driving the mDNS carrier",
+        })
+    }
+}
+
+/// Names the interface in an [`MdnsError::Io`] message, when there is one.
+struct OnInterface(Option<InterfaceId>);
+
+impl core::fmt::Display for OnInterface {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(interface) => write!(f, " on mDNS interface {interface:?}"),
+            None => Ok(()),
         }
     }
 }
@@ -152,9 +230,18 @@ pub struct MdnsDatagram {
 /// would, because a send buffer smaller than the datagram does not grow, and
 /// calling that congestion would park an impossible send and retry it forever.
 /// The driver drops an oversized datagram rather than parks it, and mDNS
-/// carries on without it. Any other error stops mDNS: a stack that cannot send
-/// cannot participate, and retrying into it would only produce the same error
-/// with the peer's view of us going stale either way.
+/// carries on without it.
+///
+/// # Failing
+///
+/// Any other error, from any operation, is a hard failure: the driver
+/// reports it as [`MdnsEvent::Failed`](crate::MdnsEvent::Failed), stops that
+/// turn there, and retries after
+/// [`MDNS_FAILURE_RETRY`](crate::MDNS_FAILURE_RETRY). Leave the carrier as it
+/// was before the failed operation where that is possible -- a `refresh` that
+/// cannot build a socket for a new interface keeps the old ones serving -- so
+/// the retry starts from something that works. Name the interface in
+/// [`MdnsError::Io`] for anything done on one.
 pub trait MdnsIo {
     /// The interfaces mDNS is currently running on.
     fn interfaces(&self) -> &[InterfaceSnapshot];
@@ -346,6 +433,33 @@ mod tests {
         let mut boxed = alloc::boxed::Box::new(TimedCarrier::default());
         MdnsIo::poll(&mut boxed, 5).expect("poll");
         assert_eq!(boxed.polled_at, vec![5]);
+    }
+
+    #[test]
+    fn an_io_error_names_its_operation_and_interface() {
+        use alloc::string::ToString;
+
+        let error = MdnsError::io(
+            MdnsIoOperation::Send,
+            IoErrorKind::NetworkUnreachable,
+            Some(InterfaceId::new(3)),
+            "no route",
+        );
+        assert_eq!(
+            error.to_string(),
+            "sending an mDNS datagram failed on mDNS interface InterfaceId(3): \
+             network unreachable: no route"
+        );
+        let error = MdnsError::io(
+            MdnsIoOperation::EnumerateInterfaces,
+            IoErrorKind::Other,
+            None,
+            "nope",
+        );
+        assert_eq!(
+            error.to_string(),
+            "enumerating network interfaces failed: other error: nope"
+        );
     }
 
     #[test]

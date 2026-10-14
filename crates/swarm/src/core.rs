@@ -419,10 +419,7 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     pub fn listen_on_bound_addrs(&mut self) -> Result<Vec<PeerAddr>, DriverError> {
         let addrs = self.transport.local_addresses();
         if addrs.is_empty() {
-            return Err(TransportError::InvalidConfig {
-                reason: "transport does not expose a bound local address".into(),
-            }
-            .into());
+            return Err(TransportError::NotListening.into());
         }
 
         let mut resolved = Vec::with_capacity(addrs.len());
@@ -431,12 +428,7 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             // A later bind may still fail, leaving this one bound — record
             // each successful bind, not the batch.
             self.record_listen(&addr);
-            let peer_addr = PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| {
-                TransportError::InvalidConfig {
-                    reason: format!("failed to build local PeerAddr: {e}"),
-                }
-            })?;
-            resolved.push(peer_addr);
+            resolved.push(self.local_peer_addr(addr)?);
         }
         Ok(resolved)
     }
@@ -451,18 +443,16 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             .local_addresses()
             .into_iter()
             .next()
-            .ok_or_else(|| TransportError::InvalidConfig {
-                reason: "transport does not expose a bound local address".into(),
-            })?;
+            .ok_or(TransportError::NotListening)?;
         let addr = self.transport.listen(&addr)?;
         self.record_listen(&addr);
-        Ok(
-            PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| {
-                TransportError::InvalidConfig {
-                    reason: format!("failed to build local PeerAddr: {e}"),
-                }
-            })?,
-        )
+        Ok(self.local_peer_addr(addr)?)
+    }
+
+    /// `addr` as this node's dialable peer address.
+    fn local_peer_addr(&self, addr: Multiaddr) -> Result<PeerAddr, TransportError> {
+        PeerAddr::new(addr.clone(), self.local_peer_id.clone())
+            .map_err(|error| TransportError::LocalPeerAddr { addr, error })
     }
 
     /// Dial a remote peer. The transport allocates the connection id.
@@ -1193,7 +1183,8 @@ mod tests {
         fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
             self.close_count += 1;
             if self.refuse_close {
-                return Err(TransportError::InvalidConfig {
+                return Err(TransportError::CloseFailed {
+                    id,
                     reason: String::from("close refused"),
                 });
             }

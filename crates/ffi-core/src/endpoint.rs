@@ -8,14 +8,15 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, ConnectionId, Endpoint, EndpointBuilder, GossipsubConfig, GossipsubError,
-    MdnsConfig, Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, PublishError, StreamId,
-    TopicError, TransportError, WaitHandle,
+    BeaconConfig, BindError, ConnectionId, DiscoveryConfigError, Endpoint, EndpointBuilder,
+    EndpointOptionsError, GossipsubConfig, GossipsubError, MdnsConfig, MdnsConfigError, Multiaddr,
+    NatConfig, PeerDiscoveryConfig, PeerId, PublishError, QuicBindError, StreamId, TopicError,
+    TransportError, WaitHandle,
 };
 
 use crate::{
-    DriverStats, EndpointConfig, EventDoorbell, FfiError, IdentifyInfo, KnownPeerInfo, P2pEvent,
-    RelayReservationInfo, keypair_from_bytes, parse_direct_peer_addr,
+    ConfigCapability, DriverStats, EndpointConfig, EventDoorbell, FfiError, IdentifyInfo,
+    KnownPeerInfo, P2pEvent, RelayReservationInfo, keypair_from_bytes, parse_direct_peer_addr,
 };
 
 /// Adds address-shaped listeners, or the QUIC dual-stack defaults when
@@ -25,10 +26,11 @@ fn configure_listen(
     listen: Option<Vec<String>>,
 ) -> Result<EndpointBuilder, FfiError> {
     let Some(addresses) = listen else {
-        return builder.listen_default().map_err(map_listen_error);
+        return builder.listen_default().map_err(map_options_error);
     };
     if addresses.is_empty() {
         return Err(FfiError::InvalidConfig {
+            capability: ConfigCapability::Options,
             detail: "listen cannot be empty; omit listen for the QUIC dual-stack defaults, or pass complete multiaddresses".into(),
         });
     }
@@ -38,14 +40,8 @@ fn configure_listen(
         })?;
         builder
             .listen_on_multiaddr(&parsed)
-            .map_err(map_listen_error)
+            .map_err(map_options_error)
     })
-}
-
-fn map_listen_error(error: minip2p::Error) -> FfiError {
-    FfiError::InvalidConfig {
-        detail: error.to_string(),
-    }
 }
 
 /// A minip2p endpoint owned by a foreign runtime.
@@ -145,6 +141,7 @@ impl P2pEndpoint {
             .collect::<Result<Vec<_>, _>>()?;
         if config.force_relay && relays.is_empty() {
             return Err(FfiError::InvalidConfig {
+                capability: ConfigCapability::Options,
                 detail: "force_relay requires at least one relay".into(),
             });
         }
@@ -182,22 +179,21 @@ impl P2pEndpoint {
                 beacon_interval_ms: discovery.beacon_interval_ms,
                 ..BeaconConfig::default()
             };
-            beacon.validate().map_err(invalid_config)?;
             let peer_discovery = PeerDiscoveryConfig {
                 beacon_peer_ttl_ms: discovery.peer_ttl_ms,
                 auto_dial: discovery.auto_dial,
                 ..PeerDiscoveryConfig::default()
             };
-            peer_discovery.validate().map_err(invalid_config)?;
             builder = builder
                 .discovery_config(beacon)
-                .map_err(invalid_config)?
+                .map_err(map_discovery_config_error)?
                 .peer_discovery_config(peer_discovery)
-                .map_err(invalid_config)?;
+                .map_err(map_discovery_config_error)?;
         }
         if let Some(mdns) = config.mdns {
             if signed_auto_dial.is_some_and(|auto_dial| auto_dial != mdns.auto_dial) {
                 return Err(FfiError::InvalidConfig {
+                    capability: ConfigCapability::Options,
                     detail: "signed discovery and mDNS must use the same auto_dial policy".into(),
                 });
             }
@@ -209,23 +205,24 @@ impl P2pEndpoint {
                 max_announced_addrs: mdns.max_announced_addrs as usize,
                 interface_refresh_ms: mdns.interface_refresh_ms,
             };
-            mdns_config.validate().map_err(invalid_config)?;
-            builder = builder.mdns_config(mdns_config).map_err(invalid_config)?;
+            builder = builder
+                .mdns_config(mdns_config)
+                .map_err(map_mdns_config_error)?;
             if signed_auto_dial.is_none() {
                 builder = builder
                     .peer_discovery_config(PeerDiscoveryConfig {
                         auto_dial: mdns.auto_dial,
                         ..PeerDiscoveryConfig::default()
                     })
-                    .map_err(invalid_config)?;
+                    .map_err(map_discovery_config_error)?;
             }
         }
 
         builder = configure_listen(builder, config.listen)?;
-        let mut endpoint = builder.bind().map_err(map_constructor_error)?;
+        let mut endpoint = builder.bind().map_err(map_bind_error)?;
         let listen_addrs = endpoint
             .listen_all()
-            .map_err(map_constructor_error)?
+            .map_err(map_driver_error)?
             .into_iter()
             .map(|address| address.to_string())
             .collect();
@@ -958,8 +955,18 @@ impl Drop for PendingCommand<'_> {
     }
 }
 
-fn invalid_config(error: impl std::fmt::Display) -> FfiError {
+/// Signed-discovery and peer-book policy mistakes.
+fn map_discovery_config_error(error: DiscoveryConfigError) -> FfiError {
     FfiError::InvalidConfig {
+        capability: ConfigCapability::Discovery,
+        detail: error.to_string(),
+    }
+}
+
+/// mDNS policy mistakes.
+fn map_mdns_config_error(error: MdnsConfigError) -> FfiError {
+    FfiError::InvalidConfig {
+        capability: ConfigCapability::Mdns,
         detail: error.to_string(),
     }
 }
@@ -970,16 +977,65 @@ pub(crate) fn parse_peer_id(peer_id: &str) -> Result<PeerId, FfiError> {
     })
 }
 
-fn map_constructor_error(error: minip2p::Error) -> FfiError {
-    match error {
-        minip2p::Error::Transport(TransportError::InvalidAddress { .. }) => {
-            FfiError::InvalidAddress {
-                detail: error.to_string(),
-            }
+/// Maps a failure to build the endpoint: configuration mistakes to
+/// `InvalidConfig` naming their capability, malformed listen input to
+/// `InvalidAddress`, refused sockets to `Transport`, and broken invariants to
+/// `Internal`. Runtime failures go through [`map_driver_error`] instead.
+fn map_bind_error(error: BindError) -> FfiError {
+    let detail = error.to_string();
+    let config = |capability| FfiError::InvalidConfig {
+        capability,
+        detail: detail.clone(),
+    };
+    match &error {
+        BindError::Options(error) => map_options_error(error.clone()),
+        BindError::Swarm(_) => config(ConfigCapability::Options),
+        BindError::Gossipsub(_) => config(ConfigCapability::Gossipsub),
+        BindError::Mdns(_) => config(ConfigCapability::Mdns),
+        BindError::Quic(
+            QuicBindError::InvalidLimit { .. }
+            | QuicBindError::Tls { .. }
+            | QuicBindError::AddressFamilies { .. },
+        ) => config(ConfigCapability::Transport),
+        BindError::Quic(QuicBindError::InvalidAddress { .. })
+        | BindError::Listen(TransportError::InvalidAddress { .. }) => {
+            FfiError::InvalidAddress { detail }
         }
-        minip2p::Error::Transport(TransportError::InvalidConfig { .. }) => invalid_config(error),
-        _ => FfiError::Internal {
-            detail: error.to_string(),
+        BindError::Quic(QuicBindError::Socket { .. })
+        | BindError::Listen(_)
+        | BindError::MdnsSocket(_)
+        | BindError::ReadinessPoll { .. } => FfiError::Transport { detail },
+        BindError::Invariant { .. } => FfiError::Internal { detail },
+        // Bind errors of capabilities this binding does not enable (the
+        // relay server), and variants added later: an unmapped construction
+        // path, not a caller mistake.
+        _ => FfiError::Internal { detail },
+    }
+}
+
+/// Maps a mistake in the endpoint's own options.
+fn map_options_error(error: EndpointOptionsError) -> FfiError {
+    let detail = error.to_string();
+    match error {
+        EndpointOptionsError::InvalidListenAddress { .. }
+        | EndpointOptionsError::UnsupportedListenShape { .. } => {
+            FfiError::InvalidAddress { detail }
+        }
+        EndpointOptionsError::TcpNamespace { .. } => FfiError::InvalidConfig {
+            capability: ConfigCapability::Transport,
+            detail,
+        },
+        EndpointOptionsError::NoTransport
+        | EndpointOptionsError::DuplicateQuicFamily { .. }
+        | EndpointOptionsError::TransportConflict(_) => FfiError::InvalidConfig {
+            capability: ConfigCapability::Options,
+            detail,
+        },
+        // Options of capabilities this binding does not enable (relay-server
+        // announce addresses), and options added later.
+        _ => FfiError::InvalidConfig {
+            capability: ConfigCapability::Options,
+            detail,
         },
     }
 }
@@ -1417,7 +1473,10 @@ mod tests {
 
         assert!(matches!(
             endpoint(config),
-            Err(FfiError::InvalidConfig { .. })
+            Err(FfiError::InvalidConfig {
+                capability: ConfigCapability::Options,
+                ..
+            })
         ));
     }
 
@@ -1457,7 +1516,10 @@ mod tests {
         });
         assert!(matches!(
             endpoint(invalid_topic),
-            Err(FfiError::InvalidConfig { .. })
+            Err(FfiError::InvalidConfig {
+                capability: ConfigCapability::Discovery,
+                ..
+            })
         ));
 
         let mut invalid_ttl = config();
@@ -1469,7 +1531,10 @@ mod tests {
         });
         assert!(matches!(
             endpoint(invalid_ttl),
-            Err(FfiError::InvalidConfig { .. })
+            Err(FfiError::InvalidConfig {
+                capability: ConfigCapability::Discovery,
+                ..
+            })
         ));
     }
 
@@ -1551,10 +1616,13 @@ mod tests {
     fn constructor_rejects_empty_and_duplicate_family_listen() {
         let mut empty = config();
         empty.listen = Some(Vec::new());
-        let Err(FfiError::InvalidConfig { detail }) = endpoint(empty) else {
-            panic!("an explicit empty listen list must fail");
-        };
-        assert!(detail.contains("omit listen"), "{detail}");
+        assert!(matches!(
+            endpoint(empty),
+            Err(FfiError::InvalidConfig {
+                capability: ConfigCapability::Options,
+                ..
+            })
+        ));
 
         let mut duplicate_quic_family = config();
         duplicate_quic_family.listen = Some(vec![
@@ -1563,7 +1631,10 @@ mod tests {
         ]);
         assert!(matches!(
             endpoint(duplicate_quic_family),
-            Err(FfiError::InvalidConfig { .. })
+            Err(FfiError::InvalidConfig {
+                capability: ConfigCapability::Options,
+                ..
+            })
         ));
     }
 
@@ -1611,7 +1682,10 @@ mod tests {
 
         assert!(matches!(
             endpoint(config),
-            Err(FfiError::InvalidConfig { .. })
+            Err(FfiError::InvalidConfig {
+                capability: ConfigCapability::Mdns,
+                ..
+            })
         ));
     }
 
@@ -1701,18 +1775,36 @@ mod tests {
     }
 
     #[test]
-    fn runtime_constructor_failures_are_internal() {
-        for error in [
-            TransportError::ListenFailed {
-                reason: "socket unavailable".into(),
-            },
-            TransportError::ResourceExhausted { resource: "socket" },
-        ] {
-            assert!(matches!(
-                map_constructor_error(error.into()),
-                FfiError::Internal { .. }
-            ));
-        }
+    fn a_socket_the_platform_refuses_is_a_transport_failure() {
+        // TEST-NET-1 is never a local address, so the bind itself fails.
+        let mut unbindable = config();
+        unbindable.listen = Some(vec!["/ip4/192.0.2.1/udp/0/quic-v1".into()]);
+        assert!(matches!(
+            endpoint(unbindable),
+            Err(FfiError::Transport { .. })
+        ));
+    }
+
+    #[test]
+    fn bind_failures_route_by_what_failed() {
+        let limit = BindError::Quic(QuicBindError::InvalidLimit {
+            field: "idle_timeout_ms",
+            requirement: "must be greater than zero",
+        });
+        assert!(matches!(
+            map_bind_error(limit),
+            FfiError::InvalidConfig {
+                capability: ConfigCapability::Transport,
+                ..
+            }
+        ));
+        let listen = BindError::Listen(TransportError::ResourceExhausted { resource: "socket" });
+        assert!(matches!(map_bind_error(listen), FfiError::Transport { .. }));
+        let invariant = BindError::Invariant { reason: "test" };
+        assert!(matches!(
+            map_bind_error(invariant),
+            FfiError::Internal { .. }
+        ));
     }
 
     #[test]

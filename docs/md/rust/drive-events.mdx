@@ -119,7 +119,7 @@ fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> 
 
 The endpoint has no second queue, so a correlated wait never buffers or drops unrelated events: each one comes back to your loop in order. Handle a busy source (such as a chatty stream) where it arrives rather than ignoring it.
 
-Synchronous method failures are returned as `minip2p::Error`. Non-fatal problems that occur later while driving appear as `EndpointEvent::Error` or a capability failure event such as `EndpointEvent::RelayServer(RelayServerEvent::Error { .. })`.
+Synchronous method failures on a running endpoint are returned as `minip2p::Error`; building one fails earlier, with a `BindError`. Non-fatal problems that occur later while driving appear as `EndpointEvent::Error` or a capability failure event, and never fail `wait` or `poll`: `EndpointEvent::MdnsFailed` (mDNS keeps retrying and emits `MdnsRecovered` once it works again), `RelayServerEvent::AddrsRejected` (the previously accepted addresses stay in effect until `AddrsRestored`), or `RelayServerEvent::Error { .. }`. Each failure event is reported once per change in failure state, so a fault that keeps recurring does not flood the loop.
 
 ## Stream and connection shutdown
 
@@ -128,9 +128,9 @@ Synchronous method failures are returned as `minip2p::Error`. Non-fatal problems
 - Call `abandon_stream` when no matching buffered or future events should be delivered.
 - Call `disconnect` to close the active peer connection.
 
-`Endpoint` does not run a background shutdown sequence after it is dropped. Drive any graceful application-level close exchanges before leaving scope, then call `endpoint.close()`. `close` consumes the endpoint, disconnects peers, and briefly drains the resulting events. It returns a `CloseReport` with every event collected, including those still queued when you called it, and every error close's own calls hit. A failure the swarm reports as it happens (a transport refusing to close a connection, say) arrives as `EndpointEvent::Error` in `events`, so a clean close has an empty `errors` and no such event. Dropping also disconnects, but ignores errors.
+`Endpoint` does not run a background shutdown sequence after it is dropped. Drive any graceful application-level close exchanges before leaving scope, then call `endpoint.close()`. `close` consumes the endpoint, disconnects peers, and briefly drains the resulting events. It returns a `CloseReport` with every event collected, including those still queued when you called it, and every error close's own calls hit. A failure the swarm reports as it happens (a transport refusing to close a connection, say) arrives as `EndpointEvent::Error` in `events`, so a clean close has an empty `errors` and no such event. mDNS goodbyes are best effort in `close`: one that could not be sent is an `EndpointEvent::MdnsFailed` in `events`, not an error. Dropping also disconnects, but ignores errors.
 
-With the `mdns` feature, `endpoint.shutdown()` has a narrower meaning: it sends mDNS goodbyes and stops mDNS while leaving QUIC and TCP usable.
+With the `mdns` feature, `endpoint.shutdown()` has a narrower meaning: it sends mDNS goodbyes and stops mDNS while leaving QUIC and TCP usable. It returns `Result<(), MdnsError>` with the first goodbye that could not be sent, which is also queued as a final `MdnsFailed`.
 
 ## Wait for every event family
 
@@ -152,7 +152,7 @@ loop {
 }
 ```
 
-Capability variants exist only when their feature is enabled: `Nat` (`nat`), `Gossipsub` (`pubsub`), `Discovery` (`discovery` / `mdns`), and `RelayServer` (`relay-server`). `poll` and `wait` work in drive batches: one bounded batch of swarm events, one capability pass, then Connection-attempt terminals. Within a batch the swarm events come first, then capability events in relay-server, NAT, Gossipsub, Discovery order, then `ConnectSettled`; `wait` hands the batch out one event per call. A `ConnectSettled` follows the `ConnectionEstablished` it reports, but a `PeerReady`, `ConnectionReplaced`, or `ConnectionClosed` from the same batch can come before it too. No order is promised between concurrently racing Transport candidates. NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) never appear; `ConnectSettled` carries the outcome. A `PathUpgraded` can still follow its attempt's `ConnectSettled` when the attempt settled on a provisional Relayed path. The portable endpoint uses the same batches and order.
+Capability variants exist only when their feature is enabled: `Nat` (`nat`), `Gossipsub` (`pubsub`), `Discovery` (`discovery` / `mdns`), `MdnsFailed` and `MdnsRecovered` (`mdns`), and `RelayServer` (`relay-server`). `poll` and `wait` work in drive batches: one bounded batch of swarm events, one capability pass, then Connection-attempt terminals. Within a batch the swarm events come first, then capability events in relay-server, NAT, Gossipsub, Discovery, mDNS order, then `ConnectSettled`; `wait` hands the batch out one event per call. A `ConnectSettled` follows the `ConnectionEstablished` it reports, but a `PeerReady`, `ConnectionReplaced`, or `ConnectionClosed` from the same batch can come before it too. No order is promised between concurrently racing Transport candidates. NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) never appear; `ConnectSettled` carries the outcome. A `PathUpgraded` can still follow its attempt's `ConnectSettled` when the attempt settled on a provisional Relayed path. The portable endpoint uses the same batches and order.
 
 State snapshot getters such as `path`, `reachability`, `active_reservation`, and `known_peers` stay authoritative for durable state. They may be ahead of the event stream, never behind their own emitted transition.
 

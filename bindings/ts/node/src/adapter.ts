@@ -296,18 +296,20 @@ export function circuitAddress(relayAddress: string, peerId: string): string {
 
 /**
  * Rethrows a native `FfiError` as its typed SDK error. The addon tags each
- * error with the variant name as `code` and its detail field as `detail`;
- * untyped variants are rethrown unchanged with both properties intact.
+ * error with the variant name as `code`, its detail field as `detail`, and
+ * an `InvalidConfig`'s capability name as `capability`; untyped variants are
+ * rethrown unchanged with those properties intact.
  */
 function translateErrors<T>(operation: () => T): T {
   try {
     return operation();
   } catch (error) {
     throw (
-      typedFfiError(
-        stringProperty(error, "code"),
-        stringProperty(error, "detail")
-      ) ?? error
+      typedFfiError({
+        capability: stringProperty(error, "capability"),
+        detail: stringProperty(error, "detail"),
+        tag: stringProperty(error, "code"),
+      }) ?? error
     );
   }
 }
@@ -439,8 +441,8 @@ function normalizeEvent(
 
 /**
  * Per-chunk and per-write events, and pubsub messages, convert field by
- * field. Identify snapshots go through the typed {@link identifyInfo}. The
- * rest share the generic walk: the addon's serde shape is the SDK shape with
+ * field. Identify snapshots go through the typed {@link identifyInfo}, and a
+ * field-less event passes through by tag. The rest share the generic walk: the addon's serde shape is the SDK shape with
  * napi-rs integers and buffers (see `native-shape.ts`).
  */
 function convertEvent(event: NativeEvent, maps: NativeIdMaps): P2pEvent {
@@ -481,6 +483,9 @@ function convertEvent(event: NativeEvent, maps: NativeIdMaps): P2pEvent {
         },
         tag: event.tag,
       };
+    }
+    case P2pEvent_Tags.MdnsRecovered: {
+      return { tag: event.tag };
     }
     default: {
       return {

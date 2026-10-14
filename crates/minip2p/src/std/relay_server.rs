@@ -135,6 +135,14 @@ impl RelayServerDriver {
         }
     }
 
+    /// Moves events the agent queued outside a pump (an address refresh's
+    /// `AddrsRejected`, say) into the driver's queue.
+    pub(crate) fn collect_agent_events(&mut self) {
+        while let Some(event) = self.agent.poll_event() {
+            self.events.push_back(event);
+        }
+    }
+
     fn execute<T: Transport, E: EntropySource>(
         &mut self,
         action: RelayServerAction,

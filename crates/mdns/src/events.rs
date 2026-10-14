@@ -5,6 +5,8 @@ use core::net::{IpAddr, SocketAddr};
 
 use minip2p_core::{Multiaddr, PeerId};
 
+use crate::MdnsError;
+
 /// Stable driver-assigned identity for one interface and address family.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct InterfaceId(u32);
@@ -13,6 +15,12 @@ impl InterfaceId {
     /// Constructs an opaque interface handle from a driver-stable numeric id.
     pub const fn new(value: u32) -> Self {
         Self(value)
+    }
+
+    /// The numeric id this handle was constructed from.
+    #[cfg(feature = "std")]
+    pub(crate) const fn get(self) -> u32 {
+        self.0
     }
 }
 
@@ -96,7 +104,12 @@ pub enum MdnsAction {
     },
 }
 
-/// Validated observations and wire-policy diagnostics emitted by mDNS.
+/// Validated observations and wire-policy diagnostics emitted by mDNS, and
+/// the driver's failure state.
+///
+/// [`MdnsAgent`](crate::MdnsAgent) emits the observations;
+/// [`Failed`](Self::Failed) and [`Recovered`](Self::Recovered) come only from
+/// [`MdnsDriver`](crate::MdnsDriver).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MdnsEvent {
     /// A peer claimed normalized addresses with individual lifetimes.
@@ -113,6 +126,21 @@ pub enum MdnsEvent {
         /// Human-readable rejection cause.
         reason: String,
     },
+    /// mDNS hit a hard failure, or a different one from the failure already
+    /// reported.
+    ///
+    /// The driver keeps running and retries after
+    /// [`MDNS_FAILURE_RETRY`](crate::MDNS_FAILURE_RETRY); a repeat of the same
+    /// failure is not reported again. A goodbye that failed at shutdown is
+    /// reported this way too, and is terminal: no
+    /// [`Recovered`](Self::Recovered) follows it.
+    Failed {
+        /// What failed.
+        error: MdnsError,
+    },
+    /// A retried turn completed without a hard failure, ending the failure
+    /// last reported by [`Failed`](Self::Failed).
+    Recovered,
 }
 
 #[cfg(test)]

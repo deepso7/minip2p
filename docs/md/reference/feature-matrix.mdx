@@ -38,7 +38,7 @@ Available on `EndpointBuilder` with `quic`:
 - Listen: `listen_on`, `listen_on_multiaddr` with `/udp/<port>/quic-v1` addresses (at most one per IP family), `listen_default` (dual-stack QUIC wildcards), then `bind`
 - Configuration: `quic_limits`
 
-`EndpointBuilder::bind` is available with `std`, but needs at least one listen address. Enable `quic` or `tcp` before listening on a corresponding address.
+`EndpointBuilder::bind` is available with `std`, but needs at least one listen address (otherwise it fails with `BindError::Options(EndpointOptionsError::NoTransport)`). Enable `quic` or `tcp` before listening on a corresponding address.
 
 ## TCP API
 
@@ -97,10 +97,10 @@ Compiled with `features = ["mdns"]`, which includes the `nat` Cargo feature but 
 - Activation: `mdns`, `mdns_config`
 - Shared policy: `peer_discovery_config`
 - State: `known_peers`
-- Events: `EndpointEvent::Discovery(..)` via `wait` or `poll`
-- mDNS lifecycle: `shutdown` sends goodbyes and stops mDNS without closing the endpoint
+- Events: `EndpointEvent::Discovery(..)`, plus `EndpointEvent::MdnsFailed { error }` / `MdnsRecovered` for socket failures, via `wait` or `poll`
+- mDNS lifecycle: `shutdown` sends goodbyes and stops mDNS without closing the endpoint, returning `Result<(), MdnsError>`
 
-mDNS discovers peers only on multicast-capable local links. Its address claims remain unauthenticated until the selected transport verifies the peer identity. Automatic mDNS-triggered attempts are direct-only and never activate a configured relay or HOP CONNECT. `Endpoint::shutdown` sends TTL-zero goodbyes and permanently stops mDNS; QUIC and TCP keep working. With both `discovery` and `mdns` enabled, both sources use one bounded peer book and one automatic-dial state.
+mDNS discovers peers only on multicast-capable local links. Its address claims remain unauthenticated until the selected transport verifies the peer identity. Automatic mDNS-triggered attempts are direct-only and never activate a configured relay or HOP CONNECT. A socket failure while running does not stop mDNS: it is reported as `MdnsFailed`, retried after `MDNS_FAILURE_RETRY` (100 ms), and followed by `MdnsRecovered` once a retry works. `Endpoint::shutdown` sends TTL-zero goodbyes and permanently stops mDNS; QUIC and TCP keep working. With both `discovery` and `mdns` enabled, both sources use one bounded peer book and one automatic-dial state.
 
 ## TypeScript
 

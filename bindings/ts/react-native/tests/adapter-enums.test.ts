@@ -5,6 +5,7 @@ import {
   DiscoverySource,
   DriverFailureKind,
   EndpointErrorKind,
+  MdnsFailureKind,
   NatErrorKind,
   Reachability,
 } from "../src/generated/minip2p_ffi_core";
@@ -87,6 +88,34 @@ describe("React Native enum values", () => {
       "Mdns",
       "Timeout",
       "Panic",
+    ]);
+    endpoint.close();
+  });
+
+  test("mDNS failure and recovery reach listeners", async () => {
+    vi.useFakeTimers();
+    const endpoint = Minip2p.create({ secretKey: new Uint8Array(32) });
+    const fake = FakeNativeEndpoint.current();
+    const seen: unknown[] = [];
+    endpoint.on("mdnsFailed", (event) => seen.push(event));
+    endpoint.on("mdnsRecovered", () => seen.push("recovered"));
+    fake.enqueue(
+      [
+        {
+          inner: { detail: "send failed", kind: MdnsFailureKind.Io },
+          tag: "MdnsFailed",
+        },
+        { tag: "MdnsRecovered" },
+      ],
+      []
+    );
+
+    fake.ring();
+    await vi.runAllTimersAsync();
+
+    expect(seen).toEqual([
+      expect.objectContaining({ detail: "send failed", kind: "Io" }),
+      "recovered",
     ]);
     endpoint.close();
   });

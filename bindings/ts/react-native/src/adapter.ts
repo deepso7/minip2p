@@ -4,6 +4,7 @@ import {
   DiscoverySource,
   DriverFailureKind,
   EndpointErrorKind,
+  MdnsFailureKind,
   Minip2pBase,
   NatErrorKind,
   Reachability,
@@ -29,15 +30,18 @@ import type {
   Minip2pBackend,
   Minip2pBackendFactory,
   BackendOpenStream,
+  NativeErrorFields,
   P2pEvent,
   PathKind,
 } from "@minip2p/core/backend";
 
 import {
+  ConfigCapability as NativeConfigCapability,
   ConnectTarget,
   DiscoverySource as NativeDiscoverySource,
   DriverFailureKind as NativeDriverFailureKind,
   EndpointErrorKind as NativeEndpointErrorKind,
+  MdnsFailureKind as NativeMdnsFailureKind,
   NatErrorKind as NativeNatErrorKind,
   P2pEndpoint,
   Reachability as NativeReachability,
@@ -383,6 +387,7 @@ const ENUM_FIELDS: Readonly<
   },
   DriverFailed: { kind: [DriverFailureKind, NativeDriverFailureKind] },
   EndpointError: { kind: [EndpointErrorKind, NativeEndpointErrorKind] },
+  MdnsFailed: { kind: [MdnsFailureKind, NativeMdnsFailureKind] },
   PeerDiscovered: { source: [DiscoverySource, NativeDiscoverySource] },
   PeerUpdated: { source: [DiscoverySource, NativeDiscoverySource] },
   ReachabilityChanged: {
@@ -393,8 +398,9 @@ const ENUM_FIELDS: Readonly<
 
 /**
  * Converts one native event to its SDK form. Per-chunk and per-write
- * events, and pubsub messages, convert field by field; the rest share the
- * generic walk, plus their enum fields.
+ * events, and pubsub messages, convert field by field, and a field-less
+ * event passes through by tag; the rest share the generic walk, plus their
+ * enum fields.
  */
 function normalizeEvent(
   event: NativeP2pEvent,
@@ -417,6 +423,9 @@ function normalizeEvent(
     }
     case P2pEvent_Tags.Message: {
       return { inner: event.inner, tag: event.tag };
+    }
+    case P2pEvent_Tags.MdnsRecovered: {
+      return { tag: event.tag };
     }
     default: {
       return normalizeGenericEvent(event, connectionIds);
@@ -441,7 +450,7 @@ function streamRef(
 }
 
 function normalizeGenericEvent(
-  event: NativeP2pEvent,
+  event: Extract<NativeP2pEvent, { readonly inner: unknown }>,
   connectionIds: ConnectionIdMap
 ): P2pEvent {
   const inner = normalizeBigInts(event.inner, {
@@ -568,34 +577,38 @@ function assertSafeUnsignedInteger(value: number, name: string): void {
   }
 }
 
+/** Rethrows a generated `FfiError` as its typed SDK error, if it has one. */
 function translateErrors<T>(operation: () => T): T {
   try {
     return operation();
   } catch (error) {
-    throw typedFfiError(getErrorTag(error), getErrorDetail(error)) ?? error;
+    throw typedFfiError(nativeErrorFields(error)) ?? error;
   }
 }
 
-function getErrorTag(error: unknown): string | undefined {
-  return typeof error === "object" &&
-    error !== null &&
-    "tag" in error &&
-    typeof error.tag === "string"
-    ? error.tag
-    : undefined;
-}
-
-function getErrorDetail(error: unknown): string | undefined {
-  if (
-    typeof error === "object" &&
-    error !== null &&
-    "inner" in error &&
-    typeof error.inner === "object" &&
-    error.inner !== null &&
-    "detail" in error.inner &&
-    typeof error.inner.detail === "string"
-  ) {
-    return error.inner.detail;
+/**
+ * Reads a generated `FfiError`'s tag and inner fields. An `InvalidConfig`
+ * capability is a numeric UniFFI enum, so it goes through the generated
+ * reverse mapping to its variant name, as event enums do.
+ */
+function nativeErrorFields(error: unknown): NativeErrorFields {
+  if (typeof error !== "object" || error === null) {
+    return {};
   }
-  return undefined;
+  const tag: unknown = Reflect.get(error, "tag");
+  const inner: unknown = Reflect.get(error, "inner");
+  const field = (key: string): unknown =>
+    typeof inner === "object" && inner !== null
+      ? Reflect.get(inner, key)
+      : undefined;
+  const detail = field("detail");
+  const capability = field("capability");
+  return {
+    capability:
+      typeof capability === "number"
+        ? NativeConfigCapability[capability]
+        : undefined,
+    detail: typeof detail === "string" ? detail : undefined,
+    tag: typeof tag === "string" ? tag : undefined,
+  };
 }

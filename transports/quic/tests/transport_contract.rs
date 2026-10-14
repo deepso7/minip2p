@@ -6,7 +6,9 @@
 
 use minip2p_core::{PeerAddr, Protocol};
 use minip2p_platform::{Deadline, Now};
-use minip2p_quic::{QuicLimits, QuicNodeConfig, QuicTransport, STREAM_RECEIVE_WINDOW};
+use minip2p_quic::{
+    QuicBindError, QuicLimits, QuicNodeConfig, QuicTransport, STREAM_RECEIVE_WINDOW,
+};
 use minip2p_transport::{
     Bytes, ConnectionId, ConnectionToken, StreamId, Transport, TransportError, TransportEvent,
 };
@@ -334,7 +336,7 @@ fn pending_limits_that_could_never_wake_a_writer_are_rejected() {
         };
         assert!(matches!(
             error,
-            TransportError::InvalidConfig { ref reason } if reason.contains(field)
+            QuicBindError::InvalidLimit { field: rejected, .. } if rejected == field
         ));
     }
 }

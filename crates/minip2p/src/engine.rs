@@ -18,8 +18,10 @@
 //! 3. Connection-attempt terminals.
 //!
 //! The batch's output is queued in that order: the swarm events, then
-//! capability events (relay-server, NAT, Gossipsub, Discovery), then
-//! `ConnectSettled`. A batch never drains "until empty", so continuous
+//! capability events (relay-server, NAT, Gossipsub, Discovery, mDNS), then
+//! `ConnectSettled`. A capability's failure never fails the batch: it is a
+//! capability event (mDNS `MdnsFailed`, relay-server `AddrsRejected`) while
+//! the rest of the endpoint keeps running. A batch never drains "until empty", so continuous
 //! traffic cannot starve the timers the next batch serves.
 //!
 //! # NAT event routing
@@ -106,6 +108,10 @@ pub(crate) struct Engine<T: Transport, E: EntropySource, M: Carrier> {
     /// transport is polled again after the mDNS tick.
     #[cfg(feature = "_mdns-driver")]
     mdns_shares_transport: bool,
+    /// mDNS failure and recovery events of this batch, queued after
+    /// Discovery's.
+    #[cfg(feature = "_mdns-driver")]
+    mdns_events: Vec<EndpointEvent>,
     #[cfg(not(feature = "_mdns-driver"))]
     carrier: PhantomData<fn(M)>,
     #[cfg(feature = "relay-server")]
@@ -136,6 +142,8 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             mdns: None,
             #[cfg(feature = "_mdns-driver")]
             mdns_shares_transport: false,
+            #[cfg(feature = "_mdns-driver")]
+            mdns_events: Vec::new(),
             #[cfg(not(feature = "_mdns-driver"))]
             carrier: PhantomData,
             #[cfg(feature = "relay-server")]
@@ -516,12 +524,18 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
 
     /// Sends mDNS goodbyes and cancels discovery-owned attempts; their
     /// `ConnectSettled` terminals reach the application from the next batch.
+    ///
+    /// A goodbye that could not be sent is returned and also queued at once
+    /// as a final `MdnsFailed`, so a caller that treats goodbyes as best
+    /// effort still sees it on the event stream.
     #[cfg(feature = "_mdns-driver")]
-    pub(crate) fn shutdown_mdns(&mut self, now: Now) -> Result<(), DriverError> {
+    pub(crate) fn shutdown_mdns(&mut self, now: Now) -> Result<(), minip2p_mdns::MdnsError> {
         let result = match self.mdns.as_mut() {
-            Some(mdns) => mdns.shutdown(now).map_err(mdns_error),
+            Some(mdns) => mdns.shutdown(now),
             None => Ok(()),
         };
+        self.collect_mdns_events(now);
+        self.events.extend(self.mdns_events.drain(..));
         if let Some(discovery) = self.discovery.as_mut() {
             let work = discovery.shutdown(
                 &mut self.connect,
@@ -587,25 +601,45 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     }
 
     /// Ticks mDNS, polls a shared transport again, and feeds mDNS
-    /// observations to the book.
+    /// observations to the book. An mDNS failure is an event, never an
+    /// error: only the shared transport poll can fail here.
     #[cfg(feature = "_mdns-driver")]
     fn tick_mdns(&mut self, now: Now) -> Result<(), DriverError> {
         let Some(mdns) = self.mdns.as_mut() else {
             return Ok(());
         };
-        mdns.tick(now, self.core.local_addresses())
-            .map_err(mdns_error)?;
+        mdns.tick(now, self.core.local_addresses());
+        self.collect_mdns_events(now);
         if self.mdns_shares_transport {
             // The carrier drives the shared interface, which may have put
             // bytes into a socket after the transport was serviced.
             self.ingest_transport(now)?;
         }
-        if let (Some(mdns), Some(discovery)) = (self.mdns.as_mut(), self.discovery.as_mut()) {
-            while let Some(event) = mdns.poll_event() {
-                discovery.handle_mdns_event(event, now.monotonic_ms);
+        Ok(())
+    }
+
+    /// Feeds mDNS observations to the book and stages its failure and
+    /// recovery events for the application.
+    #[cfg(feature = "_mdns-driver")]
+    fn collect_mdns_events(&mut self, now: Now) {
+        use minip2p_mdns::MdnsEvent;
+
+        let Some(mdns) = self.mdns.as_mut() else {
+            return;
+        };
+        while let Some(event) = mdns.poll_event() {
+            match event {
+                MdnsEvent::Failed { error } => {
+                    self.mdns_events.push(EndpointEvent::MdnsFailed { error });
+                }
+                MdnsEvent::Recovered => self.mdns_events.push(EndpointEvent::MdnsRecovered),
+                observation => {
+                    if let Some(discovery) = self.discovery.as_mut() {
+                        discovery.handle_mdns_event(observation, now.monotonic_ms);
+                    }
+                }
             }
         }
-        Ok(())
     }
 
     /// Feeds one swarm event to the Connection engine and the drivers, and
@@ -774,6 +808,8 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         if let Some(discovery) = self.discovery.as_mut() {
             discovery.drain_events(&mut self.events);
         }
+        #[cfg(feature = "_mdns-driver")]
+        self.events.extend(self.mdns_events.drain(..));
         self.events.extend(settled);
     }
 
@@ -831,18 +867,18 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         #[cfg(feature = "relay-server")]
         if let Some(relay_server) = self.relay_server.as_mut() {
             let listeners = concrete_relay_listener_addrs(self.core.transport().local_addresses());
-            // On rejection the agent deliberately keeps its previous source.
+            // A rejected source keeps its previous addresses; the agent
+            // queues `AddrsRejected` (and later `AddrsRestored`) instead.
             drop(relay_server.agent.set_listener_addrs(listeners));
             #[cfg(feature = "_nat-driver")]
             if let Some(nat) = self.nat.as_ref() {
-                // Already accepted by the NAT agent; a rejected conversion
-                // keeps the previous relay source.
                 drop(
                     relay_server
                         .agent
                         .set_confirmed_addrs(nat.confirmed_public_addrs()),
                 );
             }
+            relay_server.collect_agent_events();
         }
         let addresses = self.caller_external_addresses.clone();
         #[cfg(feature = "_nat-driver")]
@@ -931,15 +967,4 @@ fn merge_addresses(
         }
     }
     addresses
-}
-
-/// An mDNS failure as an endpoint error. It stops mDNS for good (#251 will
-/// report it as a capability event instead).
-#[cfg(feature = "_mdns-driver")]
-pub(crate) fn mdns_error(error: minip2p_mdns::MdnsError) -> DriverError {
-    use alloc::string::ToString;
-    minip2p_transport::TransportError::PollError {
-        reason: error.to_string(),
-    }
-    .into()
 }

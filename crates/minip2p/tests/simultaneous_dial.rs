@@ -464,7 +464,7 @@ fn duplicate_quic_candidates_keep_one_shared_connection() {
 fn duplicate_tcp_candidates_keep_one_shared_connection() {
     duplicate_candidates_keep_one_shared_connection(
         |key| {
-            let provider = minip2p_tcp::StdTcpProvider::new().expect("tcp provider");
+            let provider = minip2p_tcp::StdTcpProvider::new();
             minip2p_tcp::TcpTransport::new(provider, key.clone(), StdEntropy)
         },
         |_| "/ip4/127.0.0.1/tcp/0".parse().expect("tcp listen address"),

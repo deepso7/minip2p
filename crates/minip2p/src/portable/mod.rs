@@ -2,13 +2,13 @@ extern crate alloc;
 
 #[cfg(feature = "portable-mdns")]
 use alloc::boxed::Box;
-#[cfg(feature = "smoltcp")]
-use alloc::string::ToString;
 use alloc::{string::String, vec::Vec};
 
-pub use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
+pub use minip2p_core::{
+    Bytes, Multiaddr, MultiaddrError, PeerAddr, PeerAddrError, PeerId, Protocol, TransportKind,
+};
 pub use minip2p_identity::Ed25519Keypair;
-pub use minip2p_platform::{Deadline, EntropySource, Now, SharedEntropy};
+pub use minip2p_platform::{Deadline, EntropySource, IoErrorKind, Now, SharedEntropy};
 pub use minip2p_swarm::{
     // Part of `EndpointEvent` / `SwarmEvent` public shapes (`Error`);
     // re-exported so portable callers can name them without a direct swarm
@@ -44,7 +44,9 @@ pub use minip2p_discovery::{
     DiscoveryConfigError, DiscoveryEvent, DiscoverySource, KnownPeer, PeerDiscoveryConfig,
 };
 #[cfg(feature = "_mdns-driver")]
-pub use minip2p_mdns::{MdnsConfig, MdnsConfigError, MdnsError, MdnsEvent, MdnsIo};
+pub use minip2p_mdns::{
+    MDNS_FAILURE_RETRY, MdnsConfig, MdnsConfigError, MdnsError, MdnsEvent, MdnsIo, MdnsIoOperation,
+};
 #[cfg(feature = "smoltcp")]
 pub use minip2p_mdns::{SmoltcpMdnsConfig, SmoltcpMdnsIo};
 #[cfg(feature = "_nat-driver")]
@@ -429,12 +431,14 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// [`Self::poll`] left. Consuming `self` is intentional: dropping the
     /// transport releases listeners and in-progress connections as well as
     /// established ones. Every established peer is attempted even if an
-    /// earlier step fails; the first error wins (mDNS, then a close, then
-    /// the final drive).
+    /// earlier step fails; the first error wins (a close, then the final
+    /// drive). mDNS goodbyes are best effort: one that could not be sent is
+    /// an [`EndpointEvent::MdnsFailed`] among the returned events, not an
+    /// error.
     pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, DriverError> {
+        // The failure is queued as an event too.
         #[cfg(feature = "_mdns-driver")]
-        let mut first_error = self.engine.shutdown_mdns(now).err();
-        #[cfg(not(feature = "_mdns-driver"))]
+        drop(self.engine.shutdown_mdns(now));
         let mut first_error = None;
         for peer_id in self.engine.core.connected_peers() {
             if let Err(error) = self.engine.core.disconnect(&peer_id, now.monotonic_ms)
@@ -531,8 +535,13 @@ pub enum PortableBuildError {
     #[error(transparent)]
     Driver(#[from] DriverError),
     /// A listen address was not a valid multiaddress.
-    #[error("invalid listen address {address}: {reason}")]
-    ListenAddress { address: String, reason: String },
+    #[error("invalid listen address `{address}`: {error}")]
+    ListenAddress {
+        /// The address as given.
+        address: String,
+        /// Why it does not parse.
+        error: minip2p_core::MultiaddrError,
+    },
     /// The mDNS carrier could not be constructed.
     #[cfg(feature = "portable-mdns")]
     #[error(transparent)]
@@ -556,8 +565,36 @@ pub enum PortableBuildError {
     /// Portable NAT policy requested an unsupported path, or relay paths
     /// over a transport without circuit operations.
     #[cfg(feature = "portable-autonat")]
-    #[error("invalid portable NAT config: {reason}")]
-    NatConfig { reason: &'static str },
+    #[error("invalid portable NAT config: {0}")]
+    NatConfig(PortableNatConfigError),
+}
+
+/// Portable NAT policy that cannot run.
+#[cfg(feature = "portable-autonat")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PortableNatConfigError {
+    /// Neither a relay nor an AutoNAT server is configured.
+    #[error("at least one relay or AutoNAT server is required")]
+    NoServers,
+    /// A reservation policy other than `Never` without a relay to reserve
+    /// on.
+    #[error("relay reservation policy requires at least one relay address")]
+    ReservationWithoutRelay,
+    /// Relays without `force_relay`: portable endpoints do not run DCUtR,
+    /// so a relay is only ever a path, never an upgrade.
+    #[error(
+        "portable relay requires force_relay = true; DCUtR is QUIC-only and portable endpoints do not run it"
+    )]
+    RelayWithoutForceRelay,
+    /// Relays without the `portable-relay` feature.
+    #[error("relay addresses require the portable-relay feature")]
+    RelayFeatureMissing,
+    /// Relays over a transport without circuit operations.
+    #[error(
+        "relay addresses need circuit operations from the transport: wrap it in a CircuitTransport and build with build_with_circuits"
+    )]
+    RelayWithoutCircuits,
 }
 
 /// Builder for a [`PortableEndpoint`].
@@ -954,20 +991,20 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
 /// Rejects portable NAT policy that cannot run.
 #[cfg(feature = "portable-autonat")]
 fn validate_nat(config: &NatConfig, has_circuits: bool) -> Result<(), PortableBuildError> {
-    let reason = if config.relays.is_empty() && config.autonat_servers.is_empty() {
-        "at least one relay or AutoNAT server is required"
+    let error = if config.relays.is_empty() && config.autonat_servers.is_empty() {
+        PortableNatConfigError::NoServers
     } else if config.relays.is_empty() && config.reservation_policy != ReservationPolicy::Never {
-        "relay reservation policy requires at least one relay address"
+        PortableNatConfigError::ReservationWithoutRelay
     } else if !config.relays.is_empty() && !config.force_relay {
-        "portable relay requires force_relay = true; DCUtR is QUIC-only and portable endpoints do not run it"
+        PortableNatConfigError::RelayWithoutForceRelay
     } else if !config.relays.is_empty() && cfg!(not(feature = "portable-relay")) {
-        "relay addresses require the portable-relay feature"
+        PortableNatConfigError::RelayFeatureMissing
     } else if !config.relays.is_empty() && !has_circuits {
-        "relay addresses need circuit operations from the transport: wrap it in a CircuitTransport and build with build_with_circuits"
+        PortableNatConfigError::RelayWithoutCircuits
     } else {
         return Ok(());
     };
-    Err(PortableBuildError::NatConfig { reason })
+    Err(PortableBuildError::NatConfig(error))
 }
 
 /// The transport a [`SmoltcpEndpointBuilder`] builds: TCP over smoltcp,
@@ -1164,12 +1201,10 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             portable.build(transport)?
         };
         for address in listens {
-            let parsed = address.parse::<Multiaddr>().map_err(|error| {
-                PortableBuildError::ListenAddress {
-                    address,
-                    reason: error.to_string(),
-                }
-            })?;
+            let parsed = match address.parse::<Multiaddr>() {
+                Ok(parsed) => parsed,
+                Err(error) => return Err(PortableBuildError::ListenAddress { address, error }),
+            };
             endpoint.listen(&parsed)?;
         }
         Ok(endpoint)
@@ -1350,10 +1385,12 @@ mod tests {
             Ok(())
         }
         fn poll(&mut self, _: u64) -> Result<(), MdnsError> {
-            Err(MdnsError::Io {
-                operation: "poll",
-                reason: "stack gone".into(),
-            })
+            Err(MdnsError::io(
+                MdnsIoOperation::Poll,
+                minip2p_platform::IoErrorKind::NotConnected,
+                None,
+                "stack gone",
+            ))
         }
     }
 
@@ -1400,11 +1437,12 @@ mod tests {
         );
     }
 
-    /// A failed mDNS tick keeps the events the batch already queued: the
-    /// deadline turns immediate, and the next poll returns them.
+    /// A failing mDNS carrier never fails the poll: the failure is one
+    /// capability event, reported once, and the rest of the batch (here an
+    /// attempt's terminal) is unaffected.
     #[cfg(feature = "portable-mdns")]
     #[test]
-    fn a_failed_mdns_poll_keeps_its_collected_events_for_the_next() {
+    fn a_failing_mdns_carrier_is_an_event_not_a_poll_error() {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
         let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
             .mdns(BrokenMdns, MdnsConfig::default())
@@ -1416,25 +1454,60 @@ mod tests {
             peer,
         )
         .expect("peer addr");
-        // The transport refuses the dial, so the attempt settles on the
-        // endpoint pass that runs before the mDNS tick fails.
+        // The transport refuses the dial, so the attempt settles at once.
         let id = endpoint
             .connect(target, Now::from_millis(0))
             .expect("admitted");
 
-        endpoint
-            .poll(Now::from_millis(1))
-            .expect_err("the carrier fails");
-        assert_eq!(
-            endpoint.next_deadline(Now::from_millis(1)),
-            Some(Deadline::IMMEDIATE)
-        );
-        let events = endpoint.poll(Now::from_millis(2)).expect("poll");
+        let events = endpoint.poll(Now::from_millis(1)).expect("poll");
+        let failures = |events: &[EndpointEvent]| {
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        EndpointEvent::MdnsFailed {
+                            error: MdnsError::Io {
+                                operation: MdnsIoOperation::Poll,
+                                ..
+                            }
+                        }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(failures(&events), 1, "{events:?}");
         assert!(
             events.iter().any(|event| matches!(
                 event,
                 EndpointEvent::ConnectSettled { connect_id, .. } if *connect_id == id
             )),
+            "{events:?}"
+        );
+        // The retry fails the same way: still running, nothing new to report.
+        let retried = endpoint
+            .poll(Now::from_millis(1 + MDNS_FAILURE_RETRY))
+            .expect("poll");
+        assert_eq!(failures(&retried), 0, "{retried:?}");
+    }
+
+    /// Goodbyes are best effort: one that cannot be sent is a final
+    /// `MdnsFailed` among the shutdown's events, not a shutdown error.
+    #[cfg(feature = "portable-mdns")]
+    #[test]
+    fn a_failed_goodbye_is_an_event_from_shutdown() {
+        let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
+        let endpoint = Endpoint::portable(&identity, ZeroEntropy)
+            .mdns(BrokenMdns, MdnsConfig::default())
+            .build(NoopTransport)
+            .expect("mdns endpoint");
+        let events = endpoint
+            .shutdown(Now::from_millis(0))
+            .expect("goodbyes are best effort");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EndpointEvent::MdnsFailed { .. })),
             "{events:?}"
         );
     }

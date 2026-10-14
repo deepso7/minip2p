@@ -662,6 +662,67 @@ const FfiConverterTypeRelayReservationInfo = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * The part of an endpoint's configuration an [`FfiError::InvalidConfig`]
+ * names.
+ *
+ * A configuration mistake is fixed by changing that part; an environment
+ * failure (a socket the platform refused) is [`FfiError::Transport`]
+ * instead.
+ */
+export enum ConfigCapability {
+    /**
+     * Gossipsub settings.
+     */
+    Gossipsub,
+    /**
+     * mDNS settings.
+     */
+    Mdns,
+    /**
+     * Signed discovery or peer-book settings.
+     */
+    Discovery,
+    /**
+     * QUIC or TCP transport settings (limits, TLS, the TCP namespace).
+     */
+    Transport,
+    /**
+     * The endpoint's own options: listen addresses, protocols, NAT and
+     * relay policy, auto-dial.
+     */
+    Options
+}
+
+const FfiConverterTypeConfigCapability = (() => {
+    type TypeName = ConfigCapability;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            switch (c.readI32()) {
+                case 1: return ConfigCapability.Gossipsub;
+                case 2: return ConfigCapability.Mdns;
+                case 3: return ConfigCapability.Discovery;
+                case 4: return ConfigCapability.Transport;
+                case 5: return ConfigCapability.Options;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            switch (value) {
+                case ConfigCapability.Gossipsub: return c.writeI32(1);
+                case ConfigCapability.Mdns: return c.writeI32(2);
+                case ConfigCapability.Discovery: return c.writeI32(3);
+                case ConfigCapability.Transport: return c.writeI32(4);
+                case ConfigCapability.Options: return c.writeI32(5);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return 4;
+        }
+    }
+    return new FFIConverter();
+})();
+
 
 // Enum: ConnectTarget
 export enum ConnectTarget_Tags {
@@ -1062,10 +1123,11 @@ export const FfiError = (() => {
     type InvalidConfig__interface = {
         tag: FfiError_Tags.InvalidConfig;
         inner:
-Readonly<{detail: string}>
+Readonly<{capability: ConfigCapability; detail: string}>
     };
     /**
-     * Endpoint configuration was internally inconsistent.
+     * Endpoint configuration was invalid; `capability` names the part of
+     * it that was.
      */
     class InvalidConfig_ extends UniffiError implements InvalidConfig__interface {
         /**
@@ -1075,15 +1137,15 @@ Readonly<{detail: string}>
         readonly [uniffiTypeNameSymbol] = "FfiError";
         readonly tag = FfiError_Tags.InvalidConfig;
         readonly inner:
-Readonly<{detail: string}>;
+Readonly<{capability: ConfigCapability; detail: string}>;
         constructor(
-inner: {detail: string }) {
+inner: {capability: ConfigCapability; detail: string }) {
             super("FfiError", "InvalidConfig");
 
             this.inner = Object.freeze(inner);
         }
         static new(
-inner: {detail: string }): InvalidConfig_ {
+inner: {capability: ConfigCapability; detail: string }): InvalidConfig_ {
             return new InvalidConfig_(inner);
         }
 
@@ -1095,7 +1157,7 @@ inner: {detail: string }): InvalidConfig_ {
         }
 
         static getInner(obj: InvalidConfig_):
-Readonly<{detail: string}> {
+Readonly<{capability: ConfigCapability; detail: string}> {
             return obj.inner;
         }
 
@@ -1377,7 +1439,8 @@ Readonly<{detail: string}> {
 Readonly<{detail: string}>
     };
     /**
-     * A synchronous transport operation failed.
+     * A synchronous transport operation failed, or the platform refused a
+     * socket the endpoint needed (a port in use, say).
      */
     class Transport_ extends UniffiError implements Transport__interface {
         /**
@@ -1534,7 +1597,7 @@ const FfiConverterTypeFfiError = (() => {
             switch (c.readI32()) {
                 case 1: return new FfiError.AlreadyStarted();
                 case 2: return new FfiError.Stopped();
-                case 3: return new FfiError.InvalidConfig({detail: FfiConverterString.readFromCursor(c) });
+                case 3: return new FfiError.InvalidConfig({capability: FfiConverterTypeConfigCapability.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
                 case 4: return new FfiError.InvalidKey({detail: FfiConverterString.readFromCursor(c) });
                 case 5: return new FfiError.InvalidPeerId({detail: FfiConverterString.readFromCursor(c) });
                 case 6: return new FfiError.InvalidAddress({detail: FfiConverterString.readFromCursor(c) });
@@ -1561,6 +1624,7 @@ const FfiConverterTypeFfiError = (() => {
                 case FfiError_Tags.InvalidConfig: {
                     c.writeI32(3);
                     const inner = value.inner;
+                    FfiConverterTypeConfigCapability.writeIntoCursor(inner.capability, c);
                     FfiConverterString.writeIntoCursor(inner.detail, c);
                     return;
                 }
@@ -1636,6 +1700,7 @@ const FfiConverterTypeFfiError = (() => {
                 case FfiError_Tags.InvalidConfig: {
                     const inner = value.inner;
                     let size = 4;
+                    size += FfiConverterTypeConfigCapability.allocationSize(inner.capability);
                     size += FfiConverterString.allocationSize(inner.detail);
                     return size;
                 }
@@ -1695,6 +1760,74 @@ const FfiConverterTypeFfiError = (() => {
                 }
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * Category of an mDNS failure.
+ */
+export enum MdnsFailureKind {
+    /**
+     * The platform cannot provide mDNS sockets.
+     */
+    Unsupported,
+    /**
+     * An interface has no usable address.
+     */
+    NoInterfaceAddress,
+    /**
+     * A send named an interface that has gone away.
+     */
+    UnknownInterface,
+    /**
+     * A goodbye could not be sent before shutdown gave up on a full send
+     * buffer.
+     */
+    Congested,
+    /**
+     * A datagram is larger than the carrier can ever send.
+     */
+    Oversized,
+    /**
+     * The interface id space is exhausted.
+     */
+    InterfaceIdsExhausted,
+    /**
+     * Platform I/O failed.
+     */
+    Io
+}
+
+const FfiConverterTypeMdnsFailureKind = (() => {
+    type TypeName = MdnsFailureKind;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            switch (c.readI32()) {
+                case 1: return MdnsFailureKind.Unsupported;
+                case 2: return MdnsFailureKind.NoInterfaceAddress;
+                case 3: return MdnsFailureKind.UnknownInterface;
+                case 4: return MdnsFailureKind.Congested;
+                case 5: return MdnsFailureKind.Oversized;
+                case 6: return MdnsFailureKind.InterfaceIdsExhausted;
+                case 7: return MdnsFailureKind.Io;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            switch (value) {
+                case MdnsFailureKind.Unsupported: return c.writeI32(1);
+                case MdnsFailureKind.NoInterfaceAddress: return c.writeI32(2);
+                case MdnsFailureKind.UnknownInterface: return c.writeI32(3);
+                case MdnsFailureKind.Congested: return c.writeI32(4);
+                case MdnsFailureKind.Oversized: return c.writeI32(5);
+                case MdnsFailureKind.InterfaceIdsExhausted: return c.writeI32(6);
+                case MdnsFailureKind.Io: return c.writeI32(7);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return 4;
         }
     }
     return new FFIConverter();
@@ -2010,6 +2143,8 @@ export enum P2pEvent_Tags {
     PeerUpdated = "PeerUpdated",
     PeerExpired = "PeerExpired",
     DiscoveryDialFailed = "DiscoveryDialFailed",
+    MdnsFailed = "MdnsFailed",
+    MdnsRecovered = "MdnsRecovered",
     DiscoveryProtocolViolation = "DiscoveryProtocolViolation"
 }
 /**
@@ -3254,6 +3389,70 @@ inner: {peerId: string; reason: string }): DiscoveryDialFailed_ {
 
     }
 
+    type MdnsFailed__interface = {
+        tag: P2pEvent_Tags.MdnsFailed;
+        inner:
+Readonly<{kind: MdnsFailureKind; detail: string}>
+    };
+    /**
+     * mDNS hit a hard failure. mDNS keeps running and retries; reported
+     * once per change in failure state, and followed by `MdnsRecovered`
+     * once a retry succeeds. A goodbye that failed during shutdown is
+     * final.
+     */
+    class MdnsFailed_ extends UniffiEnum implements MdnsFailed__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "P2pEvent";
+        readonly tag = P2pEvent_Tags.MdnsFailed;
+        readonly inner:
+Readonly<{kind: MdnsFailureKind; detail: string}>;
+        constructor(
+inner: {kind: MdnsFailureKind; detail: string }) {
+            super("P2pEvent", "MdnsFailed");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {kind: MdnsFailureKind; detail: string }): MdnsFailed_ {
+            return new MdnsFailed_(inner);
+        }
+
+        static instanceOf(obj: any): obj is MdnsFailed_ {
+            return obj.tag === P2pEvent_Tags.MdnsFailed;
+        }
+
+    }
+
+    type MdnsRecovered__interface = {
+        tag: P2pEvent_Tags.MdnsRecovered
+    };
+    /**
+     * mDNS recovered from its last `MdnsFailed`.
+     */
+    class MdnsRecovered_ extends UniffiEnum implements MdnsRecovered__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "P2pEvent";
+        readonly tag = P2pEvent_Tags.MdnsRecovered;
+        constructor() {
+            super("P2pEvent", "MdnsRecovered");
+        }
+
+        static new(): MdnsRecovered_ {
+            return new MdnsRecovered_();
+        }
+
+        static instanceOf(obj: any): obj is MdnsRecovered_ {
+            return obj.tag === P2pEvent_Tags.MdnsRecovered;
+        }
+
+    }
+
     type DiscoveryProtocolViolation__interface = {
         tag: P2pEvent_Tags.DiscoveryProtocolViolation;
         inner:
@@ -3330,6 +3529,8 @@ inner: {peerId?: string; source: DiscoverySource; reason: string; suppressed: nu
   PeerUpdated: PeerUpdated_,
   PeerExpired: PeerExpired_,
   DiscoveryDialFailed: DiscoveryDialFailed_,
+  MdnsFailed: MdnsFailed_,
+  MdnsRecovered: MdnsRecovered_,
   DiscoveryProtocolViolation: DiscoveryProtocolViolation_
     });
 
@@ -3338,7 +3539,7 @@ inner: {peerId?: string; source: DiscoverySource; reason: string; suppressed: nu
  * Event delivered by the native endpoint driver.
  */
 export type P2pEvent = InstanceType<
-    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingTimeout' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'DiscoveryProtocolViolation']
+    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingTimeout' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation']
 >;
 
 // FfiConverter for enum P2pEvent
@@ -3383,7 +3584,9 @@ const FfiConverterTypeP2pEvent = (() => {
                 case 34: return new P2pEvent.PeerUpdated({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
                 case 35: return new P2pEvent.PeerExpired({peerId: FfiConverterString.readFromCursor(c) });
                 case 36: return new P2pEvent.DiscoveryDialFailed({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 37: return new P2pEvent.DiscoveryProtocolViolation({peerId: FfiConverterOptionalString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c), reason: FfiConverterString.readFromCursor(c), suppressed: FfiConverterUInt32.readFromCursor(c) });
+                case 37: return new P2pEvent.MdnsFailed({kind: FfiConverterTypeMdnsFailureKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
+                case 38: return new P2pEvent.MdnsRecovered();
+                case 39: return new P2pEvent.DiscoveryProtocolViolation({peerId: FfiConverterOptionalString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c), reason: FfiConverterString.readFromCursor(c), suppressed: FfiConverterUInt32.readFromCursor(c) });
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -3673,8 +3876,19 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
-                case P2pEvent_Tags.DiscoveryProtocolViolation: {
+                case P2pEvent_Tags.MdnsFailed: {
                     c.writeI32(37);
+                    const inner = value.inner;
+                    FfiConverterTypeMdnsFailureKind.writeIntoCursor(inner.kind, c);
+                    FfiConverterString.writeIntoCursor(inner.detail, c);
+                    return;
+                }
+                case P2pEvent_Tags.MdnsRecovered: {
+                    c.writeI32(38);
+                    return;
+                }
+                case P2pEvent_Tags.DiscoveryProtocolViolation: {
+                    c.writeI32(39);
                     const inner = value.inner;
                     FfiConverterOptionalString.writeIntoCursor(inner.peerId, c);
                     FfiConverterTypeDiscoverySource.writeIntoCursor(inner.source, c);
@@ -3973,6 +4187,16 @@ const FfiConverterTypeP2pEvent = (() => {
                     size += FfiConverterString.allocationSize(inner.reason);
                     return size;
                 }
+                case P2pEvent_Tags.MdnsFailed: {
+                    const inner = value.inner;
+                    let size = 4;
+                    size += FfiConverterTypeMdnsFailureKind.allocationSize(inner.kind);
+                    size += FfiConverterString.allocationSize(inner.detail);
+                    return size;
+                }
+                case P2pEvent_Tags.MdnsRecovered: {
+                    return 4;
+                }
                 case P2pEvent_Tags.DiscoveryProtocolViolation: {
                     const inner = value.inner;
                     let size = 4;
@@ -4038,6 +4262,7 @@ function uniffiEnsureInitialized() {
 export default Object.freeze({
   initialize: uniffiEnsureInitialized,
   converters: {
+    FfiConverterTypeConfigCapability,
     FfiConverterTypeConnectTarget,
     FfiConverterTypeConnectionInfo,
     FfiConverterTypeDiscoveryOptions,
@@ -4048,6 +4273,7 @@ export default Object.freeze({
     FfiConverterTypeFfiError,
     FfiConverterTypeIdentifyInfo,
     FfiConverterTypeKnownPeerInfo,
+    FfiConverterTypeMdnsFailureKind,
     FfiConverterTypeMdnsOptions,
     FfiConverterTypeNatErrorKind,
     FfiConverterTypeOpenStreamResult,

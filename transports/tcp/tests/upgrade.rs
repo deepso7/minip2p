@@ -892,7 +892,7 @@ fn a_dial_that_cannot_draw_entropy_opens_no_socket() {
     let target = PeerAddr::new(addr(LISTEN_ADDR), identity(2).peer_id()).expect("dial target");
     assert!(matches!(
         dialer.dial(&target),
-        Err(TransportError::PollError { .. })
+        Err(TransportError::Entropy(_))
     ));
     assert!(dialer.connection_ids().is_empty());
 

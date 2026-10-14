@@ -52,6 +52,45 @@ export const DiscoverySource = {
 export type DiscoverySource =
   (typeof DiscoverySource)[keyof typeof DiscoverySource];
 
+/** Categories of an mDNS failure reported by `mdnsFailed`. */
+export const MdnsFailureKind = {
+  /** A goodbye could not be sent before shutdown gave up on a full send buffer. */
+  Congested: "Congested",
+  /** The interface id space is exhausted. */
+  InterfaceIdsExhausted: "InterfaceIdsExhausted",
+  /** Platform I/O failed. */
+  Io: "Io",
+  /** An interface has no usable address. */
+  NoInterfaceAddress: "NoInterfaceAddress",
+  /** A datagram is larger than the carrier can ever send. */
+  Oversized: "Oversized",
+  /** A send named an interface that has gone away. */
+  UnknownInterface: "UnknownInterface",
+  /** The platform cannot provide mDNS sockets. */
+  Unsupported: "Unsupported",
+} as const;
+export type MdnsFailureKind =
+  (typeof MdnsFailureKind)[keyof typeof MdnsFailureKind];
+
+/** The part of an endpoint's configuration an `InvalidConfigError` names. */
+export const ConfigCapability = {
+  /** Signed discovery or peer-book settings. */
+  Discovery: "Discovery",
+  /** Gossipsub settings. */
+  Gossipsub: "Gossipsub",
+  /** mDNS settings. */
+  Mdns: "Mdns",
+  /**
+   * The endpoint's own options: listen addresses, protocols, NAT and relay
+   * policy, auto-dial.
+   */
+  Options: "Options",
+  /** QUIC or TCP transport settings. */
+  Transport: "Transport",
+} as const;
+export type ConfigCapability =
+  (typeof ConfigCapability)[keyof typeof ConfigCapability];
+
 /** Fatal native-driver failure categories. */
 export const DriverFailureKind = {
   Invariant: "Invariant",
@@ -304,6 +343,14 @@ export interface Minip2pNamedEventMap {
   };
   peerExpired: { readonly peerId: string };
   discoveryDialFailed: { readonly peerId: string; readonly reason: string };
+  /**
+   * mDNS hit a hard failure. It keeps running and retries; this fires once
+   * per change in failure state, and `mdnsRecovered` follows once a retry
+   * succeeds. A goodbye that failed during shutdown is final.
+   */
+  mdnsFailed: { readonly kind: MdnsFailureKind; readonly detail: string };
+  /** mDNS recovered from its last `mdnsFailed`. Carries no fields. */
+  mdnsRecovered: Readonly<Record<never, never>>;
   discoveryProtocolViolation: {
     readonly peerId?: string;
     readonly source: DiscoverySource;
@@ -450,6 +497,8 @@ export const P2pEvent_Tags = {
   IdentifyReceived: "IdentifyReceived",
   InboundDirectUpgrade: "InboundDirectUpgrade",
   InboundPathEstablished: "InboundPathEstablished",
+  MdnsFailed: "MdnsFailed",
+  MdnsRecovered: "MdnsRecovered",
   Message: "Message",
   PathEstablished: "PathEstablished",
   PathUpgraded: "PathUpgraded",
@@ -626,6 +675,12 @@ export type P2pEvent =
       typeof P2pEvent_Tags.DiscoveryDialFailed,
       Minip2pNamedEventMap["discoveryDialFailed"]
     >
+  | RawEvent<
+      typeof P2pEvent_Tags.MdnsFailed,
+      Minip2pNamedEventMap["mdnsFailed"]
+    >
+  // A variant without fields has no `inner`, as both runtimes deliver it.
+  | { readonly tag: typeof P2pEvent_Tags.MdnsRecovered }
   | RawEvent<
       typeof P2pEvent_Tags.DiscoveryProtocolViolation,
       Minip2pNamedEventMap["discoveryProtocolViolation"]

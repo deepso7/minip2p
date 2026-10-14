@@ -35,11 +35,7 @@ fn one_entropy_adapter_serves_the_circuit_and_tcp_transports() {
     let rng = BoardRng(0);
 
     let circuit = CircuitTransport::new(inner, identity.clone(), rng);
-    let tcp = TcpTransport::new(
-        StdTcpProvider::new().expect("a readiness registry"),
-        identity,
-        rng,
-    );
+    let tcp = TcpTransport::new(StdTcpProvider::new(), identity, rng);
 
     // Both are live `Transport`s built from one adapter, which is the whole
     // point: no per-crate entropy trait to bridge between them.

@@ -82,7 +82,7 @@ let endpoint = minip2p::Endpoint::builder()
     .listen_default()?
     .listen_on("/ip4/0.0.0.0/tcp/4001")?
     .bind()?;
-# Ok::<(), minip2p::Error>(())
+# Ok::<(), minip2p::BindError>(())
 ```
 
 On bare-metal or other `no_std` hosts, turn off default features and build a `PortableEndpoint` with `Endpoint::portable(...)`, supplying time samples, entropy, and any transport. It runs the same engine and event order as the std `Endpoint`, and adds mDNS, discovery, pubsub, AutoNAT, and relay over any transport; with `smoltcp`, TCP and mDNS share one embedded stack. See the [`minip2p-rs` crate guide](crates/minip2p/README.md#portable-endpoint).

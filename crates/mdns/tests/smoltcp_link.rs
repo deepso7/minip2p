@@ -288,10 +288,12 @@ impl Node {
     }
 
     fn tick(&mut self, now_ms: u64) {
-        self.driver
-            .tick(Now::from_millis(now_ms), &self.addrs)
-            .expect("tick");
+        self.driver.tick(Now::from_millis(now_ms), &self.addrs);
         while let Some(event) = self.driver.poll_event() {
+            assert!(
+                !matches!(event, MdnsEvent::Failed { .. }),
+                "the link never fails: {event:?}"
+            );
             self.events.push(event);
         }
     }
@@ -597,8 +599,8 @@ fn a_send_ring_with_no_room_is_a_backlog_and_not_the_end_of_mdns() {
     assert_eq!(
         error,
         MdnsError::Congested { interface: IPV4 },
-        "a full ring is 'not yet', not 'never': anything else here ends mDNS \
-         because a device spoke faster than its link could carry"
+        "a full ring is 'not yet', not 'never': anything else here is a hard \
+         failure because a device spoke faster than its link could carry"
     );
 
     // And the datagram that would not fit fits once the link takes frames
@@ -696,9 +698,13 @@ fn a_send_buffer_below_this_hosts_own_claim_does_not_spin_the_driver() {
     // buffer every turn and keep this at zero for good.
     for step in 0..200u64 {
         let now = step * STEP_MS;
-        driver
-            .tick(Now::from_millis(now), &addrs)
-            .expect("a claim that will never fit is not a fault");
+        driver.tick(Now::from_millis(now), &addrs);
+        while let Some(event) = driver.poll_event() {
+            assert!(
+                !matches!(event, MdnsEvent::Failed { .. }),
+                "a dropped claim is not a failure: {event:?}"
+            );
+        }
         let at = Now::from_millis(now);
         if bus.is_quiet()
             && driver
@@ -819,7 +825,7 @@ fn idle_receiver(bus: &Bus) -> (Driver, SmoltcpStack<BusDevice>, Frames, Rc<Cell
         if !host_wakes(&driver, &inbox, 0) {
             break;
         }
-        driver.tick(Now::from_millis(0), &[]).expect("tick");
+        driver.tick(Now::from_millis(0), &[]);
         inbox.borrow_mut().clear();
     }
     assert!(!host_wakes(&driver, &inbox, 0), "the receiver went idle");
@@ -855,7 +861,7 @@ fn an_ingress_driven_host_hears_datagrams_its_device_no_longer_shows() {
         host_wakes(&driver, &inbox, 0),
         "a datagram in mDNS's socket is a carrier deadline of now"
     );
-    driver.tick(Now::from_millis(0), &[]).expect("tick");
+    driver.tick(Now::from_millis(0), &[]);
     assert!(!carrier_owes(&driver, 0), "and that tick read it");
 
     // A frame that lands between a tick's two carrier polls is taken in by
@@ -863,7 +869,7 @@ fn an_ingress_driven_host_hears_datagrams_its_device_no_longer_shows() {
     sender.send(&datagram()).expect("queue");
     sender.poll(0).expect("put it on the bus");
     defer.set(1);
-    driver.tick(Now::from_millis(0), &[]).expect("tick");
+    driver.tick(Now::from_millis(0), &[]);
     assert!(
         inbox.borrow().is_empty(),
         "the final poll took the frame in"
@@ -872,7 +878,7 @@ fn an_ingress_driven_host_hears_datagrams_its_device_no_longer_shows() {
         host_wakes(&driver, &inbox, 0),
         "what the final poll delivered is owed a tick now"
     );
-    driver.tick(Now::from_millis(0), &[]).expect("tick");
+    driver.tick(Now::from_millis(0), &[]);
     assert!(!carrier_owes(&driver, 0));
 }
 

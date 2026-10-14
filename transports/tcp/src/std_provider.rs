@@ -15,7 +15,9 @@ use mio::event::Event;
 use mio::{Interest, Registry, Token, Waker};
 use socket2::{Domain, Protocol as SocketProtocol, Socket as Socket2, Type};
 
-use crate::provider::{SocketHandle, TcpError, TcpEvent, TcpProvider, host_and_port};
+use crate::provider::{
+    SocketHandle, TcpError, TcpEvent, TcpIoOperation, TcpProvider, host_and_port,
+};
 
 /// Read size per syscall. Large enough that a busy stream is not dominated by
 /// syscall overhead, small enough not to hold a big buffer per provider.
@@ -29,10 +31,11 @@ const MAX_READS_PER_POLL: usize = 8;
 /// Connections accepted in a single poll, for the same reason.
 const MAX_ACCEPTS_PER_POLL: usize = 32;
 
-fn io_error(operation: &'static str, error: &dyn core::fmt::Display) -> TcpError {
+fn io_error(operation: TcpIoOperation, error: &std::io::Error) -> TcpError {
     TcpError::Io {
         operation,
-        reason: error.to_string(),
+        kind: error.kind().into(),
+        detail: error.to_string(),
     }
 }
 
@@ -94,7 +97,7 @@ fn bind_listener(requested: SocketAddr) -> std::io::Result<mio::net::TcpListener
 fn disable_nagle(stream: &mio::net::TcpStream) -> Result<(), TcpError> {
     stream
         .set_nodelay(true)
-        .map_err(|error| io_error("disabling Nagle's algorithm", &error))
+        .map_err(|error| io_error(TcpIoOperation::ConfigureStream, &error))
 }
 
 /// The socket address a dial targets, rejecting names.
@@ -166,7 +169,7 @@ impl Registration {
         };
         if let Err(error) = self.registry.register(source, token, interest) {
             self.release_index(index);
-            return Err(io_error("registering a socket", &error));
+            return Err(io_error(TcpIoOperation::Register, &error));
         }
         if index == self.slots.len() {
             self.slots.push(Some(slot));
@@ -306,11 +309,17 @@ pub struct StdTcpProvider {
     dispatched: bool,
 }
 
+impl Default for StdTcpProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StdTcpProvider {
     /// Creates a provider. Its sockets register with a host's shared poll
-    /// once it is attached as a [`PollSource`].
-    pub fn new() -> Result<Self, TcpError> {
-        Ok(Self {
+    /// once it is attached as a [`PollSource`], so creating one cannot fail.
+    pub fn new() -> Self {
+        Self {
             registration: None,
             listeners: BTreeMap::new(),
             sockets: BTreeMap::new(),
@@ -323,7 +332,7 @@ impl StdTcpProvider {
             deferred_work: false,
             accept_cursor: 0,
             dispatched: false,
-        })
+        }
     }
 
     fn allocate_handle(&mut self) -> SocketHandle {
@@ -633,11 +642,11 @@ fn event_socket(event: &TcpEvent) -> SocketHandle {
 impl TcpProvider for StdTcpProvider {
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TcpError> {
         let requested = listen_addr(addr)?;
-        let mut listener =
-            bind_listener(requested).map_err(|error| io_error("binding a listener", &error))?;
+        let mut listener = bind_listener(requested)
+            .map_err(|error| io_error(TcpIoOperation::BindListener, &error))?;
         let bound = listener
             .local_addr()
-            .map_err(|error| io_error("reading the bound address", &error))?;
+            .map_err(|error| io_error(TcpIoOperation::ReadLocalAddress, &error))?;
         let key = self.next_listener;
         let token = self.register(&mut listener, Slot::Listener, Interest::READABLE)?;
         self.next_listener += 1;
@@ -657,7 +666,7 @@ impl TcpProvider for StdTcpProvider {
     fn connect(&mut self, addr: &Multiaddr) -> Result<SocketHandle, TcpError> {
         let target = dial_addr(addr)?;
         let mut stream = mio::net::TcpStream::connect(target)
-            .map_err(|error| io_error("starting a connect", &error))?;
+            .map_err(|error| io_error(TcpIoOperation::Connect, &error))?;
         disable_nagle(&stream)?;
         let handle = self.allocate_handle();
         let token = self.register(
@@ -713,7 +722,7 @@ impl TcpProvider for StdTcpProvider {
                         break Ok(0);
                     }
                     Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                    Err(error) => break Err(io_error("writing to a stream", &error)),
+                    Err(error) => break Err(io_error(TcpIoOperation::Write, &error)),
                 }
             }
         };
@@ -737,7 +746,7 @@ impl TcpProvider for StdTcpProvider {
         let result = entry
             .stream
             .shutdown(Shutdown::Write)
-            .map_err(|error| io_error("half-closing a stream", &error));
+            .map_err(|error| io_error(TcpIoOperation::HalfClose, &error));
         // The remote may already have finished, in which case this was the last
         // thing keeping the socket alive.
         self.retire_if_finished(socket);
@@ -929,7 +938,7 @@ mod tests {
     use std::time::Instant;
 
     fn loopback_listener() -> (StdTcpProvider, Multiaddr) {
-        let mut server = StdTcpProvider::new().expect("server");
+        let mut server = StdTcpProvider::new();
         let bound = server
             .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("address"))
             .expect("listen");
@@ -946,7 +955,7 @@ mod tests {
     #[test]
     fn a_recycled_token_never_carries_the_old_handles_lifecycle() {
         let (_server, bound) = loopback_listener();
-        let mut client = StdTcpProvider::new().expect("client");
+        let mut client = StdTcpProvider::new();
         let mut poll = SharedPoll::new().expect("poll");
         poll.attach(&mut client).expect("attach");
 
@@ -985,7 +994,7 @@ mod tests {
 
     #[test]
     fn a_failed_attach_rolls_back_so_a_later_one_succeeds() {
-        let mut provider = StdTcpProvider::new().expect("provider");
+        let mut provider = StdTcpProvider::new();
         for _ in 0..3 {
             provider
                 .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("address"))
@@ -1027,7 +1036,7 @@ mod tests {
     #[test]
     fn a_stale_readable_event_does_not_keep_a_connecting_replacement_due() {
         let (_server, bound) = loopback_listener();
-        let mut client = StdTcpProvider::new().expect("client");
+        let mut client = StdTcpProvider::new();
         let mut poll = SharedPoll::new().expect("poll");
         poll.attach(&mut client).expect("attach");
 
@@ -1112,8 +1121,8 @@ mod tests {
 
     #[test]
     fn accepted_and_dialed_streams_disable_nagle() {
-        let mut server = StdTcpProvider::new().expect("server");
-        let mut client = StdTcpProvider::new().expect("client");
+        let mut server = StdTcpProvider::new();
+        let mut client = StdTcpProvider::new();
         let bound = server
             .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("address"))
             .expect("listen");
