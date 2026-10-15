@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use minip2p::{EndpointWaitOutcome, Error, WaitDeadline};
+use minip2p::{ConnectionId, EndpointWaitOutcome, Error, WaitDeadline};
 
 use crate::endpoint::{Lifecycle, Shared};
 use crate::events::convert_endpoint_event;
@@ -102,7 +102,9 @@ pub(crate) struct Delivery {
 /// successor and the `ConnectionReplaced` goes (when the cap already dropped
 /// that `ConnectionEstablished`, the `ConnectionReplaced` goes too). A
 /// connection the binding could know of otherwise -- a stream it opened or
-/// wrote on, an attempt terminal or path event naming it -- is kept.
+/// wrote on, a ping result, an attempt terminal or path event naming it --
+/// is kept, and so is every relay circuit, whose path events follow its
+/// lifecycle events.
 #[derive(Default)]
 pub(crate) struct Carry {
     events: BTreeMap<u64, P2pEvent>,
@@ -252,7 +254,7 @@ impl Carry {
     fn track_connection(&mut self, event: &P2pEvent) -> bool {
         match event {
             P2pEvent::ConnectionEstablished { conn_id, .. } => {
-                if !self.known_connections.contains(conn_id) {
+                if self.may_elide(*conn_id) {
                     self.unseen_connections.insert(*conn_id);
                 }
             }
@@ -277,7 +279,7 @@ impl Carry {
                     *conn_id = *new_conn_id;
                 }
                 self.remove_connection_events(*old_conn_id);
-                if !self.known_connections.contains(new_conn_id) {
+                if self.may_elide(*new_conn_id) {
                     self.unseen_connections.insert(*new_conn_id);
                 }
                 return true;
@@ -292,8 +294,6 @@ impl Carry {
             // naming it is something the binding acts on or must hear about.
             P2pEvent::PeerReady { .. }
             | P2pEvent::IdentifyReceived { .. }
-            | P2pEvent::PingRttMeasured { .. }
-            | P2pEvent::PingTimeout { .. }
             | P2pEvent::EndpointError { .. }
             | P2pEvent::StreamReady {
                 initiated_locally: false,
@@ -309,6 +309,16 @@ impl Carry {
             }
         }
         false
+    }
+
+    /// Whether `conn_id` may be tracked as unseen. Not one the binding
+    /// learned of otherwise, nor a relay circuit: the Endpoint reports a
+    /// circuit's path events after its connection events, so eliding its
+    /// lifecycle would leave those naming an id the binding never saw end.
+    /// Circuits are admission-limited, so keeping them cannot grow the carry
+    /// without bound.
+    fn may_elide(&self, conn_id: u64) -> bool {
+        !self.known_connections.contains(&conn_id) && !ConnectionId::new(conn_id).is_circuit()
     }
 
     /// Removes every event naming `conn_id`, with its peer streams' records.
@@ -1089,6 +1099,24 @@ mod tests {
         carry.mark_connection_seen(2);
         carry.push(closed(2));
         assert_eq!(carry.take(10), [established(2), closed(2)]);
+
+        // A ping the application waits on keeps its connection.
+        carry.push(established(5));
+        let ping = P2pEvent::PingTimeout {
+            peer_id: "peer".into(),
+            conn_id: 5,
+        };
+        carry.push(ping.clone());
+        carry.push(closed(5));
+        assert_eq!(carry.take(10), [established(5), ping, closed(5)]);
+
+        // So is a relay circuit, whose path events follow its end.
+        // The circuit namespace is the one with the top bit set.
+        let circuit = (1 << 63) | 1;
+        assert!(ConnectionId::new(circuit).is_circuit());
+        carry.push(established(circuit));
+        carry.push(closed(circuit));
+        assert_eq!(carry.take(10), [established(circuit), closed(circuit)]);
 
         // Even when an unseen predecessor folds into it afterwards.
         carry.push(established(3));

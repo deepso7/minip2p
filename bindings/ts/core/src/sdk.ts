@@ -349,8 +349,6 @@ const connectionsOf = (event: P2pEvent): number[] => {
 const UNSEEN_CONNECTION_TAGS: ReadonlySet<string> = new Set<P2pEvent["tag"]>([
   P2pEvent_Tags.PeerReady,
   P2pEvent_Tags.IdentifyReceived,
-  P2pEvent_Tags.PingRttMeasured,
-  P2pEvent_Tags.PingTimeout,
   P2pEvent_Tags.EndpointError,
   P2pEvent_Tags.StreamRemoteWriteClosed,
   P2pEvent_Tags.StreamWriteStopped,
@@ -384,8 +382,8 @@ const streamEventOf = (
  * successor: its queued `ConnectionEstablished` is renamed to the successor
  * and the `ConnectionReplaced` goes (as it does when the capacity already
  * dropped that `ConnectionEstablished`). A connection the application knows
- * otherwise -- a stream it opened, an attempt or path event naming it -- is
- * kept.
+ * otherwise -- a stream it opened, a ping result, an attempt or path event
+ * naming it -- is kept.
  */
 class EventQueue {
   readonly #items = new Map<number, QueueItem>();

@@ -1067,6 +1067,27 @@ test("a connection the application opened a stream on keeps its end", async () =
   endpoint.close();
 });
 
+test("a ping result keeps its connection", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const seen = [];
+  endpoint.on((event) => seen.push(event.type));
+  backend.emit(connectionEvent(P2pEvent_Tags.ConnectionEstablished, 2));
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", rttMs: 3 },
+    tag: P2pEvent_Tags.PingRttMeasured,
+  });
+  backend.emit(connectionEvent(P2pEvent_Tags.ConnectionClosed, 2));
+  await tick();
+
+  assert.deepEqual(seen, [
+    "connectionEstablished",
+    "pingRttMeasured",
+    "connectionClosed",
+  ]);
+  endpoint.close();
+});
+
 test("a connection the application opened a stream on stays seen through a fold", async () => {
   const backend = new MockBackend();
   backend.openResults.push({ connId: 3, streamId: 1 });
