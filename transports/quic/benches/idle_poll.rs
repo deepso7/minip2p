@@ -65,9 +65,15 @@ fn establish(count: usize) -> (QuicTransport, QuicTransport) {
         .ok()
         .and_then(|seconds| seconds.parse().ok())
         .map_or(DEFAULT_SETUP_TIMEOUT, Duration::from_secs);
+    // The default memory budget admits about 70 connections; this measures
+    // idle polling, so the budget fits every connection instead.
+    let defaults = QuicLimits::default();
     let limits = QuicLimits {
         idle_timeout_ms: 3_600_000,
-        ..QuicLimits::default()
+        memory_budget_bytes: defaults.datagram_queue_reservation_bytes()
+            + count * defaults.connection_reservation_bytes()
+            + defaults.stream_reservation_bytes(),
+        ..defaults
     };
     let mut server = loopback(limits.clone());
     let mut client = loopback(limits);
