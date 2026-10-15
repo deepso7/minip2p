@@ -235,7 +235,7 @@ Data therefore always precedes FIN, `StreamClosed` and reset, as today. Finally,
   - `AGENTS.md`, root `README.md` and `docs/pages/index.astro`: "quiche-based" → "quinn-proto-based".
   - `crates/transport/README.md`: QUIC still keeps a fine-grained clock internally, but it is now the adapter's sample.
   - `crates/minip2p/README.md`: remove the BoringSSL allocation note.
-  - `CONTEXT.md` **Connection token**: "QUIC: a TLS exporter value". Update the matching rustdoc in `crates/transport/src/connection_token.rs`.
+  - `GLOSSARY.md` **Connection token**: "QUIC: a TLS exporter value". Update the matching rustdoc in `crates/transport/src/connection_token.rs`.
   - ADR 0012: replace the quiche-specific wording with engine-neutral wording ("the QUIC engine returns credit when bytes are read").
   - New **ADR 0014 "QUIC engine: quinn-proto + rustls"**: the decision, the rejected alternatives (from the research doc), the token change and the accepted rollout limitation.
 - **Release notes for the next minor version:** the token change and the coordinated-upgrade recommendation, rejection signalling, stateless-reset replies, PMTU discovery, and the CID length (8 bytes, down from 20).

@@ -51,7 +51,7 @@ pub enum NatSwarmError {
 /// them.
 ///
 /// Reads may be ahead of the event the agent is handling (see the
-/// "State snapshot" entry in `CONTEXT.md`). The agent uses them only to
+/// "State snapshot" entry in `GLOSSARY.md`). The agent uses them only to
 /// decide whether a new command may start; ownership records follow the
 /// exact connection ids carried by events.
 pub trait NatSwarm {
