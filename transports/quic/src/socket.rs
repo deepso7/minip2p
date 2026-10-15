@@ -153,6 +153,8 @@ impl Socket {
         tally: DatagramTally,
     ) -> io::Result<Self> {
         let state = UdpSocketState::new((&udp).into())?;
+        #[cfg(target_vendor = "apple")]
+        enable_apple_fast_path(&state);
         let buffers = grow_buffers(&state, &udp);
         tally.record_socket_buffers(buffers);
         let namespace = if local_addr.is_ipv6() {
@@ -375,6 +377,23 @@ impl Socket {
             src_ip: None,
         });
     }
+}
+
+/// Switches `state` to Apple's batched `sendmsg_x`/`recvmsg_x` datapath,
+/// which lets one call carry several datagrams where `sendmsg` carries one.
+/// The grown send buffer keeps a batch from being partly dropped
+/// (mozilla/neqo#3898).
+#[cfg(target_vendor = "apple")]
+#[expect(
+    unsafe_code,
+    reason = "the workspace's one unsafe exception: Apple's fast datapath (#359)"
+)]
+fn enable_apple_fast_path(state: &UdpSocketState) {
+    // SAFETY: the calls are private Apple APIs. quinn-udp resolves
+    // `sendmsg_x`/`recvmsg_x` through `dlsym` before first use and falls back
+    // to `sendmsg`/`recvmsg` for good when either symbol is missing, so an OS
+    // without them is never called into.
+    unsafe { state.set_apple_fast_path() }
 }
 
 /// Grows `udp`'s send and receive buffers, best effort, and reads back what
