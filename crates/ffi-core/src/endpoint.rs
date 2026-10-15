@@ -476,8 +476,10 @@ impl P2pEndpoint {
     /// sender instead of buffering without bound. More than the stream's
     /// unacknowledged bytes fails with [`FfiError::Transport`], naming the
     /// stream and both counts. A closed stream releases its bytes (and its
-    /// stream slot once none are left); a settled or unknown stream or
-    /// connection is a no-op.
+    /// stream slot once none are left), also after its connection closed:
+    /// the ended connection holds its slot until every stream settles, so a
+    /// binding must keep acknowledging (or abandon) what it read across a
+    /// close. A settled or unknown stream or connection is a no-op.
     pub fn stream_consumed(
         &self,
         conn_id: u64,
@@ -500,13 +502,19 @@ impl P2pEndpoint {
     ) -> Result<crate::OpenStreamResult, FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         self.with_endpoint_mut(|endpoint| {
-            endpoint
+            let (conn_id, stream_id) = endpoint
                 .open_stream(&peer, &protocol_id)
-                .map(|(conn_id, stream_id)| crate::OpenStreamResult {
-                    conn_id: conn_id.as_u64(),
-                    stream_id: stream_id.as_u64(),
-                })
-                .map_err(map_driver_error)
+                .map_err(map_driver_error)?;
+            // The binding knows this connection now, so the carry must not
+            // elide its events, its end above all.
+            self.shared
+                .lock_events()
+                .carry
+                .mark_connection_seen(conn_id.as_u64());
+            Ok(crate::OpenStreamResult {
+                conn_id: conn_id.as_u64(),
+                stream_id: stream_id.as_u64(),
+            })
         })
     }
 
@@ -573,15 +581,37 @@ impl P2pEndpoint {
         })
     }
 
-    /// Resets and forgets an application stream.
+    /// Resets and forgets an application stream, dropping its events still
+    /// in the carry.
+    ///
+    /// Abandoning works top-down (ADR 0012): the carry and the Endpoint drop
+    /// what they hold for the stream, and the transport resets it, or settles
+    /// it outright once its connection has ended, giving up the bytes it
+    /// delivered. A stream the peer closed on a live connection is abandoned
+    /// only while its `StreamClosed` is undrained, here or in the Endpoint.
     pub fn abandon_stream(&self, conn_id: u64, stream_id: u64) -> Result<(), FfiError> {
+        let (raw_conn, raw_stream) = (conn_id, stream_id);
         let (conn_id, stream_id) = (ConnectionId::new(conn_id), StreamId::new(stream_id));
-        // Forget the tail only once the Endpoint accepted the request, so a
-        // rejected call (a stale connection id) cannot lose a pending write.
+        // Forget the tail only once the request is accepted, so a rejected
+        // call (a stale connection id) cannot lose a pending write.
         self.with_state_mut(|endpoint, writes| {
-            endpoint
-                .abandon_stream(conn_id, stream_id)
-                .map_err(map_driver_error)?;
+            let abandoned = endpoint.abandon_stream(conn_id, stream_id);
+            let mut events = self.shared.lock_events();
+            let accepted =
+                abandoned.is_ok() || events.carry.holds_stream_close(raw_conn, raw_stream);
+            if !accepted {
+                return abandoned.map_err(map_driver_error);
+            }
+            let (dropped_data, _) = events.carry.remove_stream(raw_conn, raw_stream);
+            drop(events);
+            // Never drained, so never acknowledged: after a reset or a
+            // settlement this is moot, and a stream closed on a live
+            // connection is released by it.
+            if dropped_data > 0 {
+                match endpoint.stream_consumed(conn_id, stream_id, dropped_data) {
+                    Ok(()) | Err(_) => {}
+                }
+            }
             writes.forget(conn_id, stream_id);
             Ok(())
         })
