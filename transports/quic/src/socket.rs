@@ -27,7 +27,8 @@ const MAX_TRANSMIT_SEGMENTS: usize = 10;
 /// may cap it (Linux at `net.core.{w,r}mem_max`) or refuse it, in which case
 /// smaller sizes are tried. Platform defaults (about 208 KiB on Linux, a
 /// 9216-byte send buffer on macOS, which silently drops part of a batch:
-/// mozilla/neqo#3898) overflow under bursts a 10 MB window allows.
+/// mozilla/neqo#3898) overflow under bursts a multi-megabyte send window
+/// allows.
 pub(crate) const SOCKET_BUFFER_BYTES: usize = 4 << 20;
 
 /// Smallest size [`grow_buffer`] tries before giving up on a direction.
@@ -101,8 +102,9 @@ impl Received {
 }
 
 /// A non-blocking UDP socket plus its bounded retry queue, and the state the
-/// transport keeps per socket: connections are counted, limited and given ids
-/// per socket, so one family's traffic cannot starve the other's.
+/// transport keeps per socket: connection ids come from the socket's family
+/// namespace, and each socket has its own receive bound, so one family's
+/// traffic cannot starve the other's.
 pub(crate) struct Socket {
     pub(crate) udp: UdpSocket,
     state: UdpSocketState,
@@ -110,8 +112,6 @@ pub(crate) struct Socket {
     pub(crate) local_addr: SocketAddr,
     /// Whether `listen` accepted this socket's address.
     pub(crate) listening: bool,
-    /// Connections owned by this socket.
-    pub(crate) connections: usize,
     /// Ids for this socket's connections, in its family's namespace.
     pub(crate) ids: ConnectionIdAllocator,
     /// The last receive batch hit its bound, so input may be waiting with no
@@ -167,7 +167,6 @@ impl Socket {
             state,
             local_addr,
             listening: false,
-            connections: 0,
             ids: ConnectionIdAllocator::new(namespace),
             saturated: false,
             pending: VecDeque::new(),
@@ -389,7 +388,7 @@ impl Socket {
 #[cfg(target_vendor = "apple")]
 #[expect(
     unsafe_code,
-    reason = "the workspace's one unsafe exception: Apple's fast datapath (#359)"
+    reason = "the workspace's one unsafe exception: Apple's fast datapath (#359, ADR 0019)"
 )]
 fn enable_apple_fast_path(state: &UdpSocketState) {
     // SAFETY: the calls are private Apple APIs. quinn-udp resolves
@@ -442,13 +441,6 @@ impl Sockets {
         self.0
             .iter_mut()
             .find(|socket| socket.local_addr.is_ipv6() == addr.is_ipv6())
-    }
-
-    /// The socket that allocates ids in `namespace`.
-    pub(crate) fn for_namespace(&mut self, namespace: ConnectionNamespace) -> Option<&mut Socket> {
-        self.0
-            .iter_mut()
-            .find(|socket| socket.ids.namespace() == namespace)
     }
 }
 

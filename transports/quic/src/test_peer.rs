@@ -46,6 +46,11 @@ pub(crate) struct RawPeer {
     pub(crate) mute: bool,
 }
 
+/// The default stream receive window: each stream's receive budget.
+pub(crate) fn stream_window() -> usize {
+    QuicLimits::default().stream_receive_window
+}
+
 /// The default engine transport parameters, as the transport itself uses.
 pub(crate) fn default_transport() -> TransportConfig {
     transport_config(&QuicLimits::default()).expect("transport config")
@@ -398,4 +403,25 @@ pub(crate) fn allocation_len(data: Bytes) -> usize {
     data.try_into_mut()
         .map(|unique| unique.capacity())
         .expect("copied stream data owns its allocation")
+}
+
+/// Connects a raw peer that sends `held` on a fresh stream and then closes,
+/// and drives the server until the connection is `Closed`. Returns the
+/// server's connection id and stream.
+pub(crate) fn deliver_then_close(
+    server: &mut QuicTransport,
+) -> (ConnectionId, minip2p_transport::StreamId) {
+    let (mut peer, id) = accept(server, &mut [], |_| {});
+    let stream = peer.open();
+    assert_eq!(peer.write(stream, b"held"), 4);
+    let mut events = Vec::new();
+    drive_until(server, &mut [&mut peer], &mut events, "data", |events| {
+        stream_bytes(events, stream) == b"held"
+    });
+    peer.conn()
+        .close(Instant::now(), VarInt::from_u32(0), Bytes::new());
+    drive_until(server, &mut [&mut peer], &mut events, "close", |events| {
+        events.contains(&TransportEvent::Closed { id })
+    });
+    (id, minip2p_transport::StreamId::new(stream))
 }

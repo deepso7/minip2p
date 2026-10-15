@@ -166,7 +166,8 @@ fn bulk_transfer_to_slow_reader(listen: &str, total: usize) {
 #[cfg(feature = "quic")]
 #[test]
 fn a_bulk_transfer_to_a_slow_reader_over_quic_completes_without_teardown() {
-    // Past QUIC's 8 MiB default connection queue.
+    // Past QUIC's default connection queue (1 MiB) plus its send and
+    // connection windows (3 MiB each).
     bulk_transfer_to_slow_reader("/ip4/127.0.0.1/udp/0/quic-v1", 24 * 1024 * 1024);
 }
 
@@ -354,7 +355,7 @@ fn a_manual_ack_reader_stalls_its_sender_until_it_consumes(listen: &str, window:
 fn a_manual_ack_reader_stalls_its_sender_until_it_consumes_over_quic() {
     a_manual_ack_reader_stalls_its_sender_until_it_consumes(
         "/ip4/127.0.0.1/udp/0/quic-v1",
-        minip2p_quic::STREAM_RECEIVE_WINDOW,
+        minip2p_quic::QuicLimits::default().stream_receive_window,
     );
 }
 

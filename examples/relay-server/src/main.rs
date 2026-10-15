@@ -7,7 +7,10 @@ use std::net::SocketAddr;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use minip2p::{Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, RelayServerEvent};
+use minip2p::{
+    Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, QuicLimits, RelayServerConfig,
+    RelayServerEvent,
+};
 use minip2p_example_common::load_keypair;
 
 const STDIN_COMMAND_CAPACITY: usize = 16;
@@ -15,6 +18,37 @@ const DEFAULT_IPV4_QUIC: &str = "/ip4/0.0.0.0/udp/19876/quic-v1";
 const DEFAULT_IPV6_QUIC: &str = "/ip6/::/udp/19876/quic-v1";
 const DEFAULT_IPV4_TCP: &str = "/ip4/0.0.0.0/tcp/19876";
 const DEFAULT_IPV6_TCP: &str = "/ip6/::/tcp/19876";
+/// Streams one client connection may hold on the relay at once: Identify,
+/// ping, its reservation's HOP stream and one circuit leg.
+const STREAMS_PER_CONNECTION: usize = 4;
+/// Connections budgeted beyond reservations and circuit sources: dial races,
+/// and reconnects whose old connection has not drained yet.
+const DIAL_RACE_SLACK: usize = 8;
+
+/// QUIC limits whose memory budget fits every connection this relay's
+/// `config` admits, each with stream headroom:
+///
+/// ```text
+/// (max_reservations + max_circuits + DIAL_RACE_SLACK)
+///     × (connection_reservation_bytes + STREAMS_PER_CONNECTION × stream_reservation_bytes)
+/// ```
+///
+/// `max_circuits` counts circuit sources, which need no reservation of their
+/// own.
+fn relay_quic_limits(config: &RelayServerConfig) -> QuicLimits {
+    let limits = QuicLimits::default();
+    let per_connection = limits
+        .connection_reservation_bytes()
+        .saturating_add(STREAMS_PER_CONNECTION.saturating_mul(limits.stream_reservation_bytes()));
+    let connections = config
+        .max_reservations
+        .saturating_add(config.max_circuits)
+        .saturating_add(DIAL_RACE_SLACK);
+    QuicLimits {
+        memory_budget_bytes: connections.saturating_mul(per_connection),
+        ..limits
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum AutomaticBind {
@@ -125,6 +159,7 @@ fn try_bind(
 ) -> Result<Endpoint, Box<dyn Error>> {
     let mut builder = Endpoint::builder()
         .identity(identity)
+        .quic_limits(relay_quic_limits(&options.config))
         .relay_server_config(options.config.clone())?;
 
     if options.quic_binds.is_empty() {
@@ -269,6 +304,37 @@ mod tests {
             sender.try_send("overflow".into()),
             Err(mpsc::TrySendError::Full(_))
         ));
+    }
+
+    #[test]
+    fn each_reservation_slot_budgets_one_connection_with_stream_headroom() {
+        let config = RelayServerConfig::default();
+        let more = RelayServerConfig {
+            max_reservations: config.max_reservations + 1,
+            ..config.clone()
+        };
+        let quic = QuicLimits::default();
+        assert_eq!(
+            relay_quic_limits(&more).memory_budget_bytes
+                - relay_quic_limits(&config).memory_budget_bytes,
+            quic.connection_reservation_bytes()
+                + STREAMS_PER_CONNECTION * quic.stream_reservation_bytes()
+        );
+    }
+
+    #[test]
+    fn a_relay_admitting_nothing_still_binds() {
+        let config = RelayServerConfig {
+            max_reservations: 0,
+            max_circuits: 0,
+            ..RelayServerConfig::default()
+        };
+        Endpoint::builder()
+            .quic_limits(relay_quic_limits(&config))
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("the dial-race slack alone is a valid budget");
     }
 
     #[test]

@@ -58,6 +58,11 @@ impl UnsettledConnections {
         self.connections.len()
     }
 
+    /// How many streams are held, across every held connection.
+    pub fn streams(&self) -> usize {
+        self.connections.values().map(BTreeMap::len).sum()
+    }
+
     /// Whether no connection is held.
     pub fn is_empty(&self) -> bool {
         self.connections.is_empty()
@@ -127,11 +132,13 @@ mod tests {
         let (a, b) = (StreamId::new(1), StreamId::new(3));
         assert!(ledger.insert(conn(1), [(a, 10), (b, 4), (StreamId::new(5), 0)]));
         assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.streams(), 2, "the settled stream is not held");
 
         assert_eq!(ledger.ack(conn(1), a, 6), Ok(true));
         assert_eq!(ledger.ack(conn(1), a, 4), Ok(true), "a settles");
         assert_eq!(ledger.ack(conn(1), a, 0), Ok(true), "settled: a no-op");
         assert!(ledger.contains(conn(1)), "b still holds the slot");
+        assert_eq!(ledger.streams(), 1);
 
         assert!(ledger.abandon(conn(1), b));
         assert!(!ledger.contains(conn(1)));

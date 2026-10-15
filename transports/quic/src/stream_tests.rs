@@ -10,7 +10,7 @@ use quinn_proto::{Dir, ReadError};
 use super::*;
 use crate::test_peer::{
     RawPeer, accept, allocation_len, drive_until, listening_server, loopback, now, peer_addr, sid,
-    stream_bytes,
+    stream_bytes, stream_window,
 };
 
 /// Events about `stream`, in order.
@@ -160,7 +160,7 @@ fn a_fin_at_the_budget_boundary_surfaces_while_gated() {
 
     // Exactly one window and then FIN, never acknowledged.
     let mut finished = false;
-    let payload = vec![7u8; STREAM_RECEIVE_WINDOW];
+    let payload = vec![7u8; stream_window()];
     let mut sent = 0;
     let mut events = Vec::new();
     let start = Instant::now();
@@ -183,7 +183,7 @@ fn a_fin_at_the_budget_boundary_surfaces_while_gated() {
     }
 
     let stream_events = stream_events(&events, raw);
-    assert_eq!(delivered(&events, raw), STREAM_RECEIVE_WINDOW);
+    assert_eq!(delivered(&events, raw), stream_window());
     assert!(matches!(
         stream_events.last(),
         Some(TransportEvent::StreamRemoteWriteClosed { .. })
@@ -195,13 +195,9 @@ fn a_reset_at_the_budget_boundary_surfaces_while_gated() {
     let mut server = listening_server(QuicLimits::default());
     let (mut peer, id) = accept(&mut server, &mut [], |_| {});
     let raw = peer.open();
-    let mut events = send_window(
-        &mut server,
-        &mut peer,
-        raw,
-        STREAM_RECEIVE_WINDOW,
-        |events| delivered(events, raw) == STREAM_RECEIVE_WINDOW,
-    );
+    let mut events = send_window(&mut server, &mut peer, raw, stream_window(), |events| {
+        delivered(events, raw) == stream_window()
+    });
 
     peer.reset(raw, 3);
     let stream = StreamId::new(raw);
@@ -218,7 +214,7 @@ fn a_reset_at_the_budget_boundary_surfaces_while_gated() {
         },
     );
     let stream_events = stream_events(&events, raw);
-    assert_eq!(delivered(&events, raw), STREAM_RECEIVE_WINDOW);
+    assert_eq!(delivered(&events, raw), stream_window());
     assert!(matches!(
         stream_events.last(),
         Some(TransportEvent::StreamClosed { .. })
@@ -231,13 +227,9 @@ fn an_exact_window_stays_gated_and_resumes_on_ack_without_a_packet() {
     let (mut peer, id) = accept(&mut server, &mut [], |_| {});
     let raw = peer.open();
     let stream = StreamId::new(raw);
-    let mut events = send_window(
-        &mut server,
-        &mut peer,
-        raw,
-        STREAM_RECEIVE_WINDOW,
-        |events| delivered(events, raw) == STREAM_RECEIVE_WINDOW,
-    );
+    let mut events = send_window(&mut server, &mut peer, raw, stream_window(), |events| {
+        delivered(events, raw) == stream_window()
+    });
     // No FIN and nothing behind the window: the probe finds no data.
     assert!(server.connections[&id].is_gated(stream));
 
@@ -259,13 +251,11 @@ fn an_exact_window_stays_gated_and_resumes_on_ack_without_a_packet() {
         std::thread::sleep(Duration::from_millis(1));
         events.extend(server.poll(now()).expect("poll"));
     }
-    assert_eq!(delivered(&events, raw), STREAM_RECEIVE_WINDOW);
+    assert_eq!(delivered(&events, raw), stream_window());
     assert!(server.connections[&id].is_gated(stream));
 
     // The acknowledgement alone reads it: no packet, no engine event.
-    server
-        .ack_stream(id, stream, STREAM_RECEIVE_WINDOW)
-        .expect("ack");
+    server.ack_stream(id, stream, stream_window()).expect("ack");
     assert_eq!(stream_bytes(&server.pending_events, raw), [9u8; 10]);
     assert!(!server.connections[&id].is_gated(stream));
 }

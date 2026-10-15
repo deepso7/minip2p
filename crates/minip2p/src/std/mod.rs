@@ -1313,7 +1313,9 @@ impl EndpointBuilder {
         self
     }
 
-    /// Overrides QUIC connection, stream, queue, and timeout limits.
+    /// Overrides QUIC connection, stream, queue, window, timeout and memory
+    /// budget limits (`QuicLimits::memory_budget_bytes` caps the QUIC
+    /// transport's worst-case queued memory).
     #[cfg(feature = "quic")]
     pub fn quic_limits(mut self, limits: QuicLimits) -> Self {
         self.quic_limits = limits;

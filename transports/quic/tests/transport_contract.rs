@@ -6,15 +6,18 @@
 
 use minip2p_core::{PeerAddr, Protocol};
 use minip2p_platform::{Deadline, Now};
-use minip2p_quic::{
-    QuicBindError, QuicLimits, QuicNodeConfig, QuicTransport, STREAM_RECEIVE_WINDOW,
-};
+use minip2p_quic::{QuicBindError, QuicLimits, QuicNodeConfig, QuicTransport};
 use minip2p_transport::{
     Bytes, ConnectionId, ConnectionToken, StreamId, Transport, TransportError, TransportEvent,
 };
 
 mod common;
 use common::{drive_pair_once, loopback, peer_addr, setup_pair};
+
+/// The default stream receive window: each stream's receive budget.
+fn stream_window() -> usize {
+    QuicLimits::default().stream_receive_window
+}
 
 fn setup_pair_with_client_limits(limits: QuicLimits) -> (QuicTransport, QuicTransport, PeerAddr) {
     let mut server = loopback(QuicNodeConfig::generate());
@@ -394,7 +397,7 @@ fn a_partially_accepted_write_does_not_pin_the_callers_buffer() {
     let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     let stream = client.open_stream(client_conn).expect("open stream");
 
-    let payload = Bytes::from(vec![7; 8 * STREAM_RECEIVE_WINDOW]);
+    let payload = Bytes::from(vec![7; 8 * stream_window()]);
     match client.send_stream(client_conn, stream, payload.clone()) {
         Err(TransportError::Full { unsent, .. }) => drop(unsent),
         other => panic!("expected Full, got {other:?}"),
@@ -419,7 +422,7 @@ fn a_write_past_the_pending_cap_is_full_and_resumes_on_writable() {
 
     // Beyond the peer's stream credit plus the queue cap: the transport
     // keeps what fits and hands back exactly the rest.
-    let payload: Vec<u8> = (0..2 * STREAM_RECEIVE_WINDOW as u32)
+    let payload: Vec<u8> = (0..2 * stream_window() as u32)
         .map(|i| (i % 251) as u8)
         .collect();
     let error = client
@@ -549,7 +552,7 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
             0
         };
     }
-    assert_eq!(received.len(), STREAM_RECEIVE_WINDOW, "exactly one budget");
+    assert_eq!(received.len(), stream_window(), "exactly one budget");
     assert!(held.is_some(), "the sender still holds its tail");
 
     // One acknowledgement resumes delivery at once, without another packet.
@@ -600,11 +603,7 @@ fn end_after_a_full_window(
     let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     let stream = client.open_stream(client_conn).expect("open stream");
     let mut held = client
-        .send_stream(
-            client_conn,
-            stream,
-            Bytes::from(vec![7u8; STREAM_RECEIVE_WINDOW]),
-        )
+        .send_stream(client_conn, stream, Bytes::from(vec![7u8; stream_window()]))
         .err()
         .and_then(TransportError::into_unsent);
     let mut delivered = 0;
@@ -625,12 +624,13 @@ fn end_after_a_full_window(
                 delivered += data.len();
             }
         }
-        if delivered == STREAM_RECEIVE_WINDOW {
+        if delivered == stream_window() {
             break;
         }
     }
     assert_eq!(
-        delivered, STREAM_RECEIVE_WINDOW,
+        delivered,
+        stream_window(),
         "one whole window, unacknowledged"
     );
     end(&mut client, client_conn, stream);

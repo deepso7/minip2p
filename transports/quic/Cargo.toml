@@ -12,7 +12,7 @@ readme = "README.md"
 
 [lints.rust]
 # One scoped `expect(unsafe_code)` turns on Apple's fast datapath (see
-# `socket.rs`); the workspace's `forbid` cannot be lowered at a single spot.
+# `socket.rs`, ADR 0019); the workspace's `forbid` cannot be lowered at a single spot.
 # `deny` still rejects every other unsafe in this crate.
 unsafe_code = "deny"
 
