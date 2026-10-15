@@ -1,6 +1,6 @@
 [package]
 name = "minip2p-secure-mux"
-description = "Sans-I/O multistream-select + Noise XX + Yamux session over an ordered byte stream"
+description = "Sans-I/O libp2p Noise XX, Yamux, and the multistream-select + Noise + Yamux session over an ordered byte stream"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,9 +19,7 @@ std = [
   "minip2p-core/std",
   "minip2p-identity/std",
   "minip2p-multistream-select/std",
-  "minip2p-noise/std",
   "minip2p-transport/std",
-  "minip2p-yamux/std",
   "thiserror/std",
 ]
 
@@ -31,10 +29,27 @@ minip2p-identity = { path = "../identity", version = "0.8.3", default-features =
   "ed25519",
 ] }
 minip2p-multistream-select = { path = "../multistream-select", version = "0.8.3", default-features = false }
-minip2p-noise = { path = "../noise", version = "0.8.3", default-features = false }
 minip2p-transport = { path = "../transport", version = "0.8.3", default-features = false }
-minip2p-yamux = { path = "../yamux", version = "0.8.3", default-features = false }
 thiserror = { workspace = true }
+# Noise XX
+x25519-dalek = { version = "3.0.0", default-features = false, features = [
+  "static_secrets",
+] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = [
+  "alloc",
+] }
+sha2 = { workspace = true }
+hmac = { version = "0.13.0", default-features = false }
 
 [dev-dependencies]
 minip2p-identity = { path = "../identity", features = ["ed25519", "std"] }
+criterion = { workspace = true }
+gungraun = { workspace = true }
+
+[[bench]]
+name = "data_path"
+harness = false
+
+[[bench]]
+name = "data_path_ir"
+harness = false

@@ -5,7 +5,7 @@ use core::ops::Bound;
 use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Bytes, retain_slice};
 
-use crate::{
+use crate::yamux::{
     DEFAULT_RECEIVE_WINDOW, FLAG_ACK, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, FrameType,
     KEEPALIVE_INTERVAL_MS, YamuxConfig, YamuxError, YamuxOutput, YamuxRole,
 };
@@ -1089,7 +1089,7 @@ impl YamuxSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::KEEPALIVE_INTERVAL_MS;
+    use crate::yamux::KEEPALIVE_INTERVAL_MS;
     use minip2p_core::platform::{Deadline, Now};
 
     fn outbound(session: &mut YamuxSession) -> Vec<u8> {

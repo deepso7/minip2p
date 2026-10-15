@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use minip2p_core::{WIRE_LEN, encode_bytes_field, read_len_delimited, read_tag, skip_field};
 use minip2p_identity::PublicKey;
 
-use crate::NoiseError;
+use crate::noise::NoiseError;
 
 const FIELD_IDENTITY_KEY: u64 = 1;
 const FIELD_IDENTITY_SIG: u64 = 2;

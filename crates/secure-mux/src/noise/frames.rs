@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::NoiseError;
+use crate::noise::NoiseError;
 
 /// Largest payload representable by libp2p Noise's two-byte frame length.
 pub const MAX_FRAME_LEN: usize = u16::MAX as usize;

@@ -4,10 +4,10 @@ use minip2p_identity::{Ed25519Keypair, PeerId, PublicKey};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
-use crate::cipher::CipherState;
-use crate::hkdf;
-use crate::payload::NoiseHandshakePayload;
-use crate::{NoiseError, NoiseRole};
+use crate::noise::cipher::CipherState;
+use crate::noise::hkdf;
+use crate::noise::payload::NoiseHandshakePayload;
+use crate::noise::{NoiseError, NoiseRole};
 
 const PROTOCOL_NAME: &[u8] = b"Noise_XX_25519_ChaChaPoly_SHA256";
 const SIGNATURE_PREFIX: &[u8] = b"noise-libp2p-static-key:";
@@ -362,7 +362,7 @@ fn required<T>(value: Option<T>) -> Result<T, NoiseError> {
 mod tests {
     use super::*;
 
-    const VECTOR: &str = include_str!("../tests/fixtures/noise-c-basic-xx.txt");
+    const VECTOR: &str = include_str!("../../tests/fixtures/noise/noise-c-basic-xx.txt");
 
     #[test]
     fn rejects_bad_identity_signature() {

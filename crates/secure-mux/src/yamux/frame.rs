@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::YamuxError;
+use crate::yamux::YamuxError;
 
 /// Size of every Yamux frame header.
 pub const HEADER_LEN: usize = 12;

@@ -1,9 +1,9 @@
 use core::str::FromStr;
 
 use minip2p_identity::{Ed25519Keypair, PeerId};
-use minip2p_noise::{NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
+use minip2p_secure_mux::noise::{NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
 
-const FIXTURE: &str = include_str!("fixtures/libp2p-noise-0.46.1.txt");
+const FIXTURE: &str = include_str!("fixtures/noise/libp2p-noise-0.46.1.txt");
 
 #[test]
 fn fixture_secrets_and_seed_are_complete() {

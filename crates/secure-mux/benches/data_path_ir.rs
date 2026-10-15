@@ -1,6 +1,6 @@
 use gungraun::prelude::*;
 use minip2p_core::Bytes;
-use minip2p_yamux::{
+use minip2p_secure_mux::yamux::{
     FLAG_SYN, Frame, FrameDecoder, FrameType, YamuxConfig, YamuxOutput, YamuxRole, YamuxSession,
 };
 use std::hint::black_box;

@@ -457,14 +457,12 @@ dependencies = [
  "minip2p-identity",
  "minip2p-mdns",
  "minip2p-multistream-select",
- "minip2p-noise",
  "minip2p-pubsub",
  "minip2p-relay",
  "minip2p-secure-mux",
  "minip2p-swarm",
  "minip2p-tls",
  "minip2p-transport",
- "minip2p-yamux",
 ]
 
 [[package]]
@@ -506,19 +504,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "minip2p-noise"
-version = "0.8.3"
-dependencies = [
- "chacha20poly1305",
- "hmac",
- "minip2p-core",
- "minip2p-identity",
- "sha2",
- "thiserror",
- "x25519-dalek",
-]
-
-[[package]]
 name = "minip2p-ping"
 version = "0.8.3"
 dependencies = [
@@ -550,13 +535,15 @@ dependencies = [
 name = "minip2p-secure-mux"
 version = "0.8.3"
 dependencies = [
+ "chacha20poly1305",
+ "hmac",
  "minip2p-core",
  "minip2p-identity",
  "minip2p-multistream-select",
- "minip2p-noise",
  "minip2p-transport",
- "minip2p-yamux",
+ "sha2",
  "thiserror",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -595,14 +582,6 @@ version = "0.8.3"
 dependencies = [
  "minip2p-core",
  "mio",
- "thiserror",
-]
-
-[[package]]
-name = "minip2p-yamux"
-version = "0.8.3"
-dependencies = [
- "minip2p-core",
  "thiserror",
 ]
 

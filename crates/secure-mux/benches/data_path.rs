@@ -2,7 +2,7 @@ use minip2p_core::Bytes;
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use minip2p_yamux::{
+use minip2p_secure_mux::yamux::{
     FLAG_SYN, Frame, FrameDecoder, FrameType, HEADER_LEN, YamuxConfig, YamuxOutput, YamuxRole,
     YamuxSession,
 };

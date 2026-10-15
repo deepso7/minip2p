@@ -8,7 +8,7 @@ use futures::io::{AsyncRead, AsyncWrite};
 use futures::task::noop_waker;
 use libp2p_core::upgrade::OutboundConnectionUpgrade;
 use minip2p_identity::Ed25519Keypair;
-use minip2p_noise::{NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
+use minip2p_secure_mux::noise::{NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
 
 // This utility is deliberately a standalone workspace. It is run only when a
 // maintainer explicitly regenerates the checked-in transcript; its producer

@@ -33,10 +33,9 @@ minip2p-transport = { path = "../transport", version = "0.8.3", default-features
 thiserror = { workspace = true }
 
 [dev-dependencies]
-# The handshake fixtures script raw multistream and Noise messages onto the
-# bridge, which the transport itself no longer touches directly.
+# The handshake fixtures script raw multistream messages onto the bridge, which
+# the transport itself no longer touches directly.
 minip2p-multistream-select = { path = "../multistream-select" }
-minip2p-noise = { path = "../noise" }
 # Proves one `EntropySource` adapter drives both transports; see
 # `tests/shared_entropy.rs`.
 minip2p-tcp = { path = "../../transports/tcp" }

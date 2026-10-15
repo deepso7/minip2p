@@ -1,19 +1,14 @@
 //! Sans-I/O implementation of the libp2p Noise security protocol.
 //!
-//! The crate implements `Noise_XX_25519_ChaChaPoly_SHA256` with libp2p's
+//! This module implements `Noise_XX_25519_ChaChaPoly_SHA256` with libp2p's
 //! identity-key payload and two-byte big-endian message framing. It performs
 //! end-to-end identity verification and exposes encrypted transport bytes as a
 //! caller-driven state machine: feed it through [`NoiseSession::start`],
 //! [`NoiseSession::on_data`] and [`NoiseSession::encrypt`], then drain
 //! [`NoiseSession::poll_output`] until it returns `None`.
 //!
-//! Randomness deliberately lives outside this crate: callers must provide
+//! Randomness deliberately lives outside this module: callers must provide
 //! fresh X25519 static and ephemeral secret bytes for each [`NoiseSession`].
-
-#![cfg_attr(not(feature = "std"), no_std)]
-#![warn(missing_docs)]
-
-extern crate alloc;
 
 mod cipher;
 mod frames;

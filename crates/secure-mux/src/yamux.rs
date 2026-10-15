@@ -12,11 +12,6 @@
 //! Reads are credit-driven: a stream returns window credit only for bytes its
 //! reader acknowledged with [`YamuxSession::ack`].
 
-#![cfg_attr(not(feature = "std"), no_std)]
-#![warn(missing_docs)]
-
-extern crate alloc;
-
 mod frame;
 mod session;
 

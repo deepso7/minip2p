@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use chacha20poly1305::{AeadInOut, ChaCha20Poly1305, KeyInit};
 
-use crate::NoiseError;
+use crate::noise::NoiseError;
 
 /// Length of the ChaCha20-Poly1305 authentication tag on every keyed ciphertext.
 pub(crate) const TAG_LEN: usize = 16;

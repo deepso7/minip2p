@@ -1,8 +1,8 @@
-use minip2p_yamux::{
+use minip2p_secure_mux::yamux::{
     FLAG_FIN, FLAG_SYN, FrameDecoder, FrameType, YamuxError, YamuxOutput, YamuxRole, YamuxSession,
 };
 
-const FIXTURE: &str = include_str!("fixtures/yamux-0.13.8.txt");
+const FIXTURE: &str = include_str!("fixtures/yamux/yamux-0.13.8.txt");
 
 #[test]
 fn decodes_and_reencodes_pinned_upstream_transcript() {

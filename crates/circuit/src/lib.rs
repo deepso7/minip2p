@@ -1169,8 +1169,10 @@ impl<T> CircuitTransport<T, StdEntropy> {
 mod tests {
     use super::*;
     use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
-    use minip2p_noise::{NOISE_PROTOCOL_ID, NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
     use minip2p_secure_mux::KEEPALIVE_INTERVAL_MS;
+    use minip2p_secure_mux::noise::{
+        NOISE_PROTOCOL_ID, NoiseConfig, NoiseOutput, NoiseRole, NoiseSession,
+    };
     use minip2p_test_support::InMemoryTransport;
 
     #[derive(Clone, Debug)]

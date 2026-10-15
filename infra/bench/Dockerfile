@@ -72,7 +72,7 @@ RUN PNPM_VERSION=$(jq -er '.packageManager | select(startswith("pnpm@")) | ltrim
 COPY --from=planner /minip2p/recipe.json recipe.json
 RUN cargo chef cook --release --package minip2p-nodejs --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-core --benches --recipe-path recipe.json \
-    && cargo chef cook --release --package minip2p-yamux --benches --recipe-path recipe.json \
+    && cargo chef cook --release --package minip2p-secure-mux --benches --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-discovery --benches --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-pubsub --benches --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-relay-server --benches --recipe-path recipe.json \
@@ -87,7 +87,7 @@ COPY . .
 
 RUN pnpm --filter @minip2p/node native:build \
     && cargo bench -p minip2p-core --bench multiaddr --no-run \
-    && cargo bench -p minip2p-yamux --bench data_path --no-run \
+    && cargo bench -p minip2p-secure-mux --bench data_path --no-run \
     && cargo bench -p minip2p-discovery --bench peer_book --no-run \
     && cargo bench -p minip2p-pubsub --bench publish --no-run \
     && cargo bench -p minip2p-pubsub --bench router --no-run \
@@ -100,7 +100,7 @@ RUN pnpm --filter @minip2p/node native:build \
     && cargo bench -p minip2p-rs --features tcp,nat,relay-server,bench --bench endpoint_throughput --no-run \
     && cargo bench -p minip2p-rs --features tcp,nat,relay-server,pubsub --bench endpoint_ping_load --no-run \
     && cargo bench -p minip2p-core --bench multiaddr_ir --no-run \
-    && cargo bench -p minip2p-yamux --bench data_path_ir --no-run \
+    && cargo bench -p minip2p-secure-mux --bench data_path_ir --no-run \
     && cargo bench -p minip2p-discovery --bench peer_book_ir --no-run \
     && cargo bench -p minip2p-pubsub --bench publish_ir --no-run \
     && cargo bench -p minip2p-pubsub --bench router_ir --no-run \
