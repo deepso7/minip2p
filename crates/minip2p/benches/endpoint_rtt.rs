@@ -752,6 +752,10 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
 
     let mut samples = Vec::new();
     for _ in 0..runs {
+        // Loss is counted between two quiet points, so nothing in flight at
+        // either snapshot is miscounted.
+        pinging.store(false, Ordering::Relaxed);
+        quiesce(&mut client, profile);
         up.reset();
         pings.lock().expect("pings").clear();
         pinging.store(true, Ordering::Relaxed);
@@ -781,19 +785,7 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
             .unwrap_or_default() as f64
             / 1e6
             / seconds;
-        // Count loss with nothing left on the link, from one snapshot of
-        // both ends. Undriven, the client sends nothing while the up
-        // direction drains; driven, it reads everything the target sent;
-        // undriven again, its last acknowledgements drain up. With pings
-        // off, the target only answers, and pure acknowledgements need no
-        // answer, so it is quiet by then. Anything it still sends counts
-        // as lost, which can only flag a link, never hide a loss.
-        thread::sleep(profile.rtt * 2);
-        let drained = Instant::now() + profile.rtt * 2;
-        while Instant::now() < drained {
-            drop(client.wait(drained).expect("drive client"));
-        }
-        thread::sleep(profile.rtt * 2);
+        quiesce(&mut client, profile);
         let (client_counts, target_counts) = (
             datagram_counters(&client_peer).since(&before.0),
             datagram_counters(&target_peer).since(&before.1),
@@ -813,6 +805,22 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
         });
     }
     samples
+}
+
+/// Waits until nothing is left on the link, with the target's pings off.
+/// Undriven, the client sends nothing while the up direction drains; driven,
+/// it reads everything the target sent; undriven again, its last
+/// acknowledgements drain up. The target only answers, and pure
+/// acknowledgements need no answer, so it is quiet by then. Anything it
+/// still sends counts as lost at the next snapshot, which can only flag a
+/// link, never hide a loss.
+fn quiesce(client: &mut Endpoint, profile: Profile) {
+    thread::sleep(profile.rtt * 2);
+    let drained = Instant::now() + profile.rtt * 2;
+    while Instant::now() < drained {
+        drop(client.wait(drained).expect("drive client"));
+    }
+    thread::sleep(profile.rtt * 2);
 }
 
 /// Handshakes through the emulated link with Retry on and off:
