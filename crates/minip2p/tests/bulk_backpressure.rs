@@ -167,7 +167,7 @@ fn bulk_transfer_to_slow_reader(listen: &str, total: usize) {
 #[test]
 fn a_bulk_transfer_to_a_slow_reader_over_quic_completes_without_teardown() {
     // Past QUIC's default connection queue (1 MiB) plus its send and
-    // connection windows (3 MiB each).
+    // connection windows (2 and 3 MiB).
     bulk_transfer_to_slow_reader("/ip4/127.0.0.1/udp/0/quic-v1", 24 * 1024 * 1024);
 }
 

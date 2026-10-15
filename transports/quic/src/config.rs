@@ -95,8 +95,13 @@ impl QuicLimits {
     /// The fixed part of a connection's memory reservation: its pending
     /// send queue, the engine's send buffer and its connection receive
     /// window.
+    ///
+    /// The queue counts twice: a queued write may keep a slice of its
+    /// caller's payload, and ADR 0012 only bounds the allocation it pins to
+    /// twice the bytes it counts.
     pub fn connection_reservation_bytes(&self) -> usize {
         self.max_pending_connection_bytes
+            .saturating_mul(2)
             .saturating_add(self.send_window)
             .saturating_add(self.connection_receive_window)
     }
@@ -121,7 +126,7 @@ impl Default for QuicLimits {
             memory_budget_bytes: 512 * 1024 * 1024,
             stream_receive_window: 1_000_000,
             connection_receive_window: 3 * 1024 * 1024,
-            send_window: 3 * 1024 * 1024,
+            send_window: 2 * 1024 * 1024,
         }
     }
 }
