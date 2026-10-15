@@ -246,10 +246,14 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
             return Err(invalid(field, "must be greater than zero"));
         }
     }
+    // Checked, not saturating: a sum that overflows can never fit.
     let smallest_budget = limits
-        .connection_reservation_bytes()
-        .saturating_add(limits.stream_reservation_bytes());
-    if limits.memory_budget_bytes < smallest_budget {
+        .max_pending_connection_bytes
+        .checked_mul(2)
+        .and_then(|queue| queue.checked_add(limits.send_window))
+        .and_then(|fixed| fixed.checked_add(limits.connection_receive_window))
+        .and_then(|fixed| fixed.checked_add(limits.stream_receive_window));
+    if smallest_budget.is_none_or(|smallest| limits.memory_budget_bytes < smallest) {
         return Err(invalid(
             "memory_budget_bytes",
             "must fit one connection and one stream (connection_reservation_bytes() + stream_reservation_bytes())",

@@ -31,6 +31,23 @@ fn a_budget_that_cannot_fit_one_connection_and_one_stream_is_rejected() {
             ..
         })
     ));
+    assert!(
+        matches!(
+            QuicTransport::bind(
+                QuicNodeConfig::generate().with_limits(QuicLimits {
+                    memory_budget_bytes: usize::MAX,
+                    max_pending_connection_bytes: usize::MAX / 2 + 1,
+                    ..QuicLimits::default()
+                }),
+                &[quic_addr("127.0.0.1:0")],
+            ),
+            Err(QuicBindError::InvalidLimit {
+                field: "memory_budget_bytes",
+                ..
+            })
+        ),
+        "a reservation that overflows never fits"
+    );
     let transport = bind(smallest).expect("one connection and one stream fit");
     assert_eq!(transport.budget.reserved(), 0);
 }
