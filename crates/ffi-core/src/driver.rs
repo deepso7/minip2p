@@ -260,9 +260,12 @@ impl Carry {
     /// whether it ended (or replaced) one that carried no data, which leaves
     /// the carry with its events instead.
     fn track_connection(&mut self, event: &P2pEvent) -> bool {
-        if connection_ids(event)
-            .iter()
-            .any(|conn_id| self.elided_connections.contains(conn_id))
+        // Connection-attempt terminals answer the application's own connect,
+        // so they are delivered even naming a connection it never saw.
+        if terminal_connect_id(event).is_none()
+            && connection_ids(event)
+                .iter()
+                .any(|conn_id| self.elided_connections.contains(conn_id))
         {
             return true;
         }
@@ -1150,6 +1153,17 @@ mod tests {
             new_conn_id: 8,
         });
         assert_eq!(carry.take(10), [established(8)]);
+
+        // An attempt terminal naming an elided connection is never elided:
+        // a connection can establish and close before its connect settles.
+        let settled = P2pEvent::PathEstablished {
+            connect_id: 10,
+            peer_id: "peer".into(),
+            path: crate::PathKind::DirectDialed,
+            conn_id: 6,
+        };
+        carry.push(settled.clone());
+        assert_eq!(carry.take(10), [settled]);
 
         // Even when an unseen predecessor folds into it afterwards.
         carry.push(established(3));
