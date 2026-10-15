@@ -51,7 +51,10 @@
 mod support;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex, atomic::Ordering};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -247,13 +250,30 @@ fn run_sweep(sweep: &str) {
         }
     }
     // The candidates either side of the cutoff decide the pick: give them
-    // as many runs again, interleaved.
-    if let Some((pick, below)) = pick(&results) {
-        let boundary: Vec<usize> = below.into_iter().chain([pick]).collect();
-        println!("boundary: {} more runs each for {boundary:?}", runs);
+    // as many runs again, interleaved. Extra runs can move the cutoff, so
+    // repeat until both sides of wherever it lands have them.
+    while let Some((pick, below)) = pick(&results) {
+        let boundary: Vec<usize> = below
+            .into_iter()
+            .chain([pick])
+            .filter(|&index| {
+                results
+                    .get(index)
+                    .is_some_and(|(_, samples)| samples.len() < 2 * runs)
+            })
+            .collect();
+        if boundary.is_empty() {
+            break;
+        }
+        println!("boundary: up to {} runs each for {boundary:?}", 2 * runs);
         for run in runs..2 * runs {
             for &index in &boundary {
-                sample_point(&mut results, index, run);
+                if results
+                    .get(index)
+                    .is_some_and(|(_, samples)| samples.len() < 2 * runs)
+                {
+                    sample_point(&mut results, index, run);
+                }
             }
         }
     }
@@ -685,14 +705,20 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
     } = link(profile, point);
     let client_peer = client.peer_id().clone();
     let pings = Arc::new(Mutex::new(Vec::new()));
+    // Off while loss is counted, so the target goes quiet.
+    let pinging = Arc::new(AtomicBool::new(true));
     let on_event = {
-        let (pings, client_peer) = (Arc::clone(&pings), client_peer.clone());
+        let (pings, pinging, client_peer) = (
+            Arc::clone(&pings),
+            Arc::clone(&pinging),
+            client_peer.clone(),
+        );
         let mut next_ping = Instant::now();
         move |endpoint: &mut Endpoint, event: &EndpointEvent| {
             if let EndpointEvent::PingRttMeasured { rtt_ms, .. } = event {
                 pings.lock().expect("pings").push(*rtt_ms);
             }
-            if Instant::now() >= next_ping {
+            if pinging.load(Ordering::Relaxed) && Instant::now() >= next_ping {
                 // A ping still outstanding is not an error worth stopping for.
                 drop(endpoint.ping(&client_peer));
                 next_ping = Instant::now() + PING_INTERVAL;
@@ -728,6 +754,7 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
     for _ in 0..runs {
         up.reset();
         pings.lock().expect("pings").clear();
+        pinging.store(true, Ordering::Relaxed);
         let counted = point.transport == Transport::Quic;
         let before = (
             datagram_counters(&client_peer),
@@ -743,6 +770,8 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
             Instant::now,
         );
         let seconds = (end - start).as_secs_f64();
+        pinging.store(false, Ordering::Relaxed);
+        let ping_ms = pings.lock().expect("pings").clone();
         let cpu_after = proxy_cpu_us([&up, &down]);
         let proxy_cpu = cpu_before
             .iter()
@@ -752,27 +781,30 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
             .unwrap_or_default() as f64
             / 1e6
             / seconds;
-        // Count loss once nothing is left on the link. The client is not
-        // driven while the up direction drains, so it sends nothing new;
-        // then it is driven while the down direction drains, so it reads
-        // what the target sent up to that point.
+        // Count loss with nothing left on the link, from one snapshot of
+        // both ends. Undriven, the client sends nothing while the up
+        // direction drains; driven, it reads everything the target sent;
+        // undriven again, its last acknowledgements drain up. With pings
+        // off, the target only answers, and pure acknowledgements need no
+        // answer, so it is quiet by then. Anything it still sends counts
+        // as lost, which can only flag a link, never hide a loss.
         thread::sleep(profile.rtt * 2);
-        let target_sent = datagram_counters(&target_peer).since(&before.1).sent;
-        let lost_up = datagram_counters(&client_peer)
-            .since(&before.0)
-            .sent
-            .saturating_sub(datagram_counters(&target_peer).since(&before.1).received);
         let drained = Instant::now() + profile.rtt * 2;
         while Instant::now() < drained {
             drop(client.wait(drained).expect("drive client"));
         }
-        let lost_down =
-            target_sent.saturating_sub(datagram_counters(&client_peer).since(&before.0).received);
+        thread::sleep(profile.rtt * 2);
+        let (client_counts, target_counts) = (
+            datagram_counters(&client_peer).since(&before.0),
+            datagram_counters(&target_peer).since(&before.1),
+        );
+        let lost_up = client_counts.sent.saturating_sub(target_counts.received);
+        let lost_down = target_counts.sent.saturating_sub(client_counts.received);
         samples.push(Sample {
             mb_per_s: total as f64 / MB as f64 / seconds,
             utilization: total as f64 / seconds / profile.bytes_per_s(),
             unloaded_rtt_ms,
-            ping_ms: pings.lock().expect("pings").clone(),
+            ping_ms,
             lost_up: if counted { lost_up } else { 0 },
             lost_down: if counted { lost_down } else { 0 },
             held_high_water: up.held_high_water.load(Ordering::Relaxed),
