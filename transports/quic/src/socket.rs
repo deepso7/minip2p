@@ -381,8 +381,11 @@ impl Socket {
 
 /// Switches `state` to Apple's batched `sendmsg_x`/`recvmsg_x` datapath,
 /// which lets one call carry several datagrams where `sendmsg` carries one.
-/// The grown send buffer keeps a batch from being partly dropped
-/// (mozilla/neqo#3898).
+///
+/// quinn-udp 0.6.3 ignores how many messages `sendmsg_x` reports sent, so a
+/// batch the socket only partly takes still counts as sent: its tail is lost
+/// in-process and recovered like network loss. The grown send buffer is what
+/// keeps that rare (mozilla/neqo#3898); the measured run lost nothing.
 #[cfg(target_vendor = "apple")]
 #[expect(
     unsafe_code,
