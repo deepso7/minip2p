@@ -101,10 +101,15 @@ pub struct LinkStats {
     /// Longest time a unit waited in the FIFO before it started serializing,
     /// in microseconds: queueing delay on top of the base RTT.
     pub max_queue_delay_us: AtomicU64,
+    /// CPU time the direction's reader and writer threads have used so far,
+    /// in microseconds; not reset, so a caller takes differences.
+    pub reader_cpu_us: AtomicU64,
+    pub writer_cpu_us: AtomicU64,
 }
 
 impl LinkStats {
-    /// Resets every counter, for example between a warm-up and a timed pass.
+    /// Resets the traffic counters, for example between a warm-up and a timed
+    /// pass.
     pub fn reset(&self) {
         for counter in [
             &self.units,
@@ -148,6 +153,9 @@ impl Shaper {
         self.stats
             .held_high_water
             .fetch_max(held, Ordering::Relaxed);
+        self.stats
+            .reader_cpu_us
+            .store(thread_cpu_us(), Ordering::Relaxed);
         self.free_at + self.profile.one_way()
     }
 }
@@ -170,7 +178,15 @@ fn deliver_loop(
         }
         stats.units.fetch_add(1, Ordering::Relaxed);
         stats.bytes.fetch_add(unit.len() as u64, Ordering::Relaxed);
+        stats
+            .writer_cpu_us
+            .store(thread_cpu_us(), Ordering::Relaxed);
     }
+}
+
+/// CPU time the calling thread has used, in microseconds.
+fn thread_cpu_us() -> u64 {
+    u64::try_from(cpu_time::ThreadTime::now().as_duration().as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Threads a proxy owns; stopped and joined on drop.

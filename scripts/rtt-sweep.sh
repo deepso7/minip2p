@@ -39,12 +39,28 @@ if ((${#sweeps[@]} == 0)); then
   sweeps=(quic-stream quic-connection quic-send quic-check yamux retry secondary)
 fi
 for sweep in "${sweeps[@]}"; do
+  # One command per line: `set -e` does not stop on a failure inside `&&`.
   case $sweep in
-  quic-stream) run quic-stream && MINIP2P_RTT_STREAM=$(pick quic-stream) && export MINIP2P_RTT_STREAM ;;
-  quic-connection) run quic-connection && MINIP2P_RTT_CONNECTION=$(pick quic-connection) && export MINIP2P_RTT_CONNECTION ;;
-  quic-send) run quic-send && MINIP2P_RTT_SEND=$(pick quic-send) && export MINIP2P_RTT_SEND ;;
+  quic-stream)
+    run quic-stream
+    MINIP2P_RTT_STREAM=$(pick quic-stream)
+    export MINIP2P_RTT_STREAM
+    ;;
+  quic-connection)
+    run quic-connection
+    MINIP2P_RTT_CONNECTION=$(pick quic-connection)
+    export MINIP2P_RTT_CONNECTION
+    ;;
+  quic-send)
+    run quic-send
+    MINIP2P_RTT_SEND=$(pick quic-send)
+    export MINIP2P_RTT_SEND
+    ;;
   quic-check | yamux | retry) run "$sweep" ;;
-  secondary) run quic-check 1g_20ms && run yamux 1g_20ms ;;
+  secondary)
+    run quic-check 1g_20ms
+    run yamux 1g_20ms
+    ;;
   *)
     echo "unknown sweep $sweep" >&2
     exit 2

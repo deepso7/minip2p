@@ -23,17 +23,25 @@
 //! - `quic-send`: four streams at `MINIP2P_RTT_STREAM`; the send window
 //!   varies, the connection window stays large.
 //! - `quic-check`: the windows in `MINIP2P_RTT_{STREAM,CONNECTION,SEND}`
-//!   (QUIC defaults when unset) against large ones, at one and four streams,
-//!   with the target pinging the client throughout.
+//!   (QUIC defaults when unset, and the default budget) against large ones,
+//!   at one and four streams.
 //! - `yamux`: one TCP stream; the Yamux receive window varies.
 //! - `retry`: handshakes with Retry on and off (see [`retry`]).
 //!
 //! Every window sweep also measures a large reference window, interleaved
 //! with the candidates, and picks the smallest candidate whose median
-//! goodput reaches 90% of the reference's median. A pick is flagged when the
-//! spread straddles the cutoff, for a person to judge. Each point gets a
-//! fresh connection with a warm-up transfer before its timed one, and the
-//! point order rotates every run. `MINIP2P_RTT_PROFILE` picks the profile
+//! goodput reaches 90% of the reference's median. The candidates either
+//! side of that cutoff get as many runs again before the pick, which is
+//! flagged when their spread straddles the cutoff, for a person to judge.
+//! Each point gets a fresh connection with a warm-up transfer before its
+//! timed one, and the point order rotates every run.
+//!
+//! Every measurement also calibrates the link: the idle ping RTT, the ping
+//! RTT the target sees during the transfer, datagrams lost each way (QUIC),
+//! the up direction's peak held bytes and queueing delay, and the busiest
+//! proxy thread's CPU share. A sweep reports no pick when its reference
+//! reaches under 85% of the link, anything was lost, the idle RTT is 20%
+//! off the profile's, or a proxy thread used over 80% of a core. `MINIP2P_RTT_PROFILE` picks the profile
 //! (`100m_100ms` by default, or `1g_20ms`), `MINIP2P_RTT_RUNS` the runs per
 //! point (default 5), and `MINIP2P_RTT_TOTAL_MB` the bytes per timed
 //! transfer (default: 2.5 s at the link rate, at least 32 MiB).
@@ -43,7 +51,7 @@
 mod support;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -61,7 +69,7 @@ const PR_RUNS: usize = 3;
 const PR_TOTAL: u64 = 32 * MB;
 /// Share of the reference goodput a picked window must reach.
 const CUTOFF: f64 = 0.9;
-/// How often the target pings the client in `quic-check`.
+/// How often the target pings the client during a transfer.
 const PING_INTERVAL: Duration = Duration::from_millis(100);
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -80,23 +88,34 @@ struct Point {
     streams: usize,
     quic: QuicLimits,
     tcp: TcpConfig,
-    ping: bool,
 }
 
-/// One timed transfer over an emulated link.
+/// One timed transfer over an emulated link, with the link's calibration.
 struct Sample {
     mb_per_s: f64,
     /// Goodput over the link rate.
     utilization: f64,
-    /// Client datagrams the target never read (QUIC only).
+    /// Ping round trip on the idle connection, before the warm-up.
+    unloaded_rtt_ms: f64,
+    /// Ping round trips the target measured during the transfer.
+    ping_ms: Vec<u64>,
+    /// Datagrams sent one way that the far end never read (QUIC only).
     lost_up: u64,
+    lost_down: u64,
     /// Peak bytes the client-to-target direction held, queued or in flight.
     held_high_water: u64,
     /// Longest FIFO wait in the client-to-target direction.
     max_queue_delay_ms: f64,
-    /// Ping round trips the target measured during the transfer.
-    ping_ms: Vec<u64>,
+    /// The busiest proxy thread's CPU time over the transfer's wall time.
+    proxy_cpu: f64,
 }
+
+/// What makes a sweep's measurements untrustworthy: the reference falling
+/// short of the link, loss, an idle RTT off the profile's, or a proxy thread
+/// near a full core.
+const MIN_REFERENCE_UTILIZATION: f64 = 0.85;
+const MAX_RTT_ERROR: f64 = 0.2;
+const MAX_PROXY_CPU: f64 = 0.8;
 
 fn main() {
     match std::env::var("MINIP2P_RTT_SWEEP") {
@@ -116,7 +135,6 @@ fn pr_bench() {
             streams: 1,
             quic: QuicLimits::default(),
             tcp: TcpConfig::default(),
-            ping: false,
         };
         let samples = measure(profile, &point, PR_TOTAL, PR_RUNS);
         let rates: Vec<f64> = samples.iter().map(|sample| sample.mb_per_s).collect();
@@ -197,31 +215,49 @@ fn run_sweep(sweep: &str) {
         .iter()
         .map(|point| (point.clone(), Vec::new()))
         .collect();
+    let mut sample_point = |results: &mut Vec<(Point, Vec<Sample>)>, index: usize, run: usize| {
+        let Some((point, samples)) = results.get_mut(index) else {
+            return;
+        };
+        let sample = measure(profile, point, total, 1).remove(0);
+        println!(
+            "  run {run} {:>10}: {:7.2} MB/s ({:3.0}%), idle RTT {:.0} ms{}, lost {}/{} up/down, \
+             held ≤ {} KiB, queue ≤ {:.1} ms, proxy CPU {:.0}%",
+            point.label,
+            sample.mb_per_s,
+            100.0 * sample.utilization,
+            sample.unloaded_rtt_ms,
+            ping_summary(&sample.ping_ms),
+            sample.lost_up,
+            sample.lost_down,
+            sample.held_high_water / 1024,
+            sample.max_queue_delay_ms,
+            100.0 * sample.proxy_cpu,
+        );
+        lines.push(json_line(sweep, profile, run, point, &sample));
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write sweep results");
+        samples.push(sample);
+    };
+    let count = results.len();
     for run in 0..runs {
         // Rotate the order each run, so drift over the sweep does not
         // always land on the same points.
-        let count = results.len();
         for offset in 0..count {
-            let Some((point, samples)) = results.get_mut((offset + run) % count) else {
-                continue;
-            };
-            let sample = measure(profile, point, total, 1).remove(0);
-            println!(
-                "  run {run} {:>10}: {:7.2} MB/s ({:3.0}%), lost {} up, held ≤ {} KiB, queue ≤ {:.1} ms{}",
-                point.label,
-                sample.mb_per_s,
-                100.0 * sample.utilization,
-                sample.lost_up,
-                sample.held_high_water / 1024,
-                sample.max_queue_delay_ms,
-                ping_summary(&sample.ping_ms),
-            );
-            lines.push(json_line(sweep, profile, run, point, &sample));
-            std::fs::write(&path, lines.join("\n") + "\n").expect("write sweep results");
-            samples.push(sample);
+            sample_point(&mut results, (offset + run) % count, run);
         }
     }
-    summarize(sweep, &results);
+    // The candidates either side of the cutoff decide the pick: give them
+    // as many runs again, interleaved.
+    if let Some((pick, below)) = pick(&results) {
+        let boundary: Vec<usize> = below.into_iter().chain([pick]).collect();
+        println!("boundary: {} more runs each for {boundary:?}", runs);
+        for run in runs..2 * runs {
+            for &index in &boundary {
+                sample_point(&mut results, index, run);
+            }
+        }
+    }
+    summarize(sweep, profile, &results);
     println!("results: {path}");
 }
 
@@ -243,13 +279,12 @@ fn sweep_points(sweep: &str, profile: Profile) -> Vec<Point> {
         memory_budget_bytes: 8 << 30,
         ..QuicLimits::default()
     };
-    let point = |label: String, transport, streams, quic, tcp, ping| Point {
+    let point = |label: String, transport, streams, quic, tcp| Point {
         label,
         transport,
         streams,
         quic,
         tcp,
-        ping,
     };
     let quic_point = |label, streams, limits| {
         point(
@@ -258,7 +293,6 @@ fn sweep_points(sweep: &str, profile: Profile) -> Vec<Point> {
             streams,
             limits,
             TcpConfig::default(),
-            false,
         )
     };
     // Candidate windows, in percent of the BDP.
@@ -307,10 +341,6 @@ fn sweep_points(sweep: &str, profile: Profile) -> Vec<Point> {
                     ),
                 ]
             })
-            .map(|point| Point {
-                ping: true,
-                ..point
-            })
             .collect(),
         "yamux" => {
             let tcp = |window: usize| {
@@ -323,14 +353,7 @@ fn sweep_points(sweep: &str, profile: Profile) -> Vec<Point> {
                 .map(|value| (label(value), value))
                 .chain([("reference".to_owned(), large)])
                 .map(|(label, value)| {
-                    point(
-                        label,
-                        Transport::Tcp,
-                        1,
-                        QuicLimits::default(),
-                        tcp(value),
-                        false,
-                    )
+                    point(label, Transport::Tcp, 1, QuicLimits::default(), tcp(value))
                 })
                 .collect()
         }
@@ -342,60 +365,119 @@ fn sweep_points(sweep: &str, profile: Profile) -> Vec<Point> {
     points
 }
 
-/// Prints each point's median and spread, and for a window sweep the pick:
-/// the smallest candidate whose median reaches [`CUTOFF`] of the
-/// reference's.
-fn summarize(sweep: &str, results: &[(Point, Vec<Sample>)]) {
-    println!("summary ({sweep}): median MB/s [min, max], % of reference median");
-    let reference = results
+/// The median goodput a candidate must reach: [`CUTOFF`] of the reference's.
+fn cutoff(results: &[(Point, Vec<Sample>)]) -> Option<f64> {
+    results
         .iter()
         .find(|(point, _)| point.label == "reference")
-        .map(|(_, samples)| median(&rates(samples)));
+        .map(|(_, samples)| CUTOFF * median(&rates(samples)))
+}
+
+/// The index of the smallest candidate whose median reaches the cutoff, and
+/// of the candidate just below it. Candidates run smallest first.
+fn pick(results: &[(Point, Vec<Sample>)]) -> Option<(usize, Option<usize>)> {
+    let cutoff = cutoff(results)?;
+    let mut below = None;
+    for (index, (point, samples)) in results.iter().enumerate() {
+        if point.label == "reference" {
+            continue;
+        }
+        if median(&rates(samples)) >= cutoff {
+            return Some((index, below));
+        }
+        below = Some(index);
+    }
+    None
+}
+
+/// Why a sweep's link cannot be trusted, if it cannot.
+fn calibration_problems(profile: Profile, results: &[(Point, Vec<Sample>)]) -> Vec<String> {
+    let samples: Vec<&Sample> = results.iter().flat_map(|(_, samples)| samples).collect();
+    let mut problems = Vec::new();
+    let lost: u64 = samples.iter().map(|s| s.lost_up + s.lost_down).sum();
+    if lost > 0 {
+        problems.push(format!("{lost} datagrams lost"));
+    }
+    let rtt = median(
+        &samples
+            .iter()
+            .map(|s| s.unloaded_rtt_ms)
+            .collect::<Vec<_>>(),
+    );
+    let expected = profile.rtt.as_secs_f64() * 1000.0;
+    if (rtt - expected).abs() > MAX_RTT_ERROR * expected {
+        problems.push(format!("idle RTT {rtt:.0} ms, not {expected:.0} ms"));
+    }
+    let cpu = samples.iter().map(|s| s.proxy_cpu).fold(0.0, f64::max);
+    if cpu > MAX_PROXY_CPU {
+        problems.push(format!("a proxy thread used {:.0}% of a core", 100.0 * cpu));
+    }
+    for (point, samples) in results {
+        let utilization = median(&samples.iter().map(|s| s.utilization).collect::<Vec<_>>());
+        if point.label.starts_with("reference") && utilization < MIN_REFERENCE_UTILIZATION {
+            problems.push(format!(
+                "{} reached only {:.0}% of the link",
+                point.label,
+                100.0 * utilization
+            ));
+        }
+    }
+    problems
+}
+
+/// Prints each point's median and spread, the link's calibration, and for a
+/// window sweep the pick: the smallest candidate whose median reaches
+/// [`CUTOFF`] of the reference's, flagged when the runs straddle the cutoff.
+fn summarize(sweep: &str, profile: Profile, results: &[(Point, Vec<Sample>)]) {
+    println!("summary ({sweep}): median MB/s [min, max], % of reference median, loaded ping");
+    let reference = cutoff(results).map(|cutoff| cutoff / CUTOFF);
     for (point, samples) in results {
         let rates = rates(samples);
         let share = reference.map_or(String::new(), |reference| {
             format!(", {:.0}%", 100.0 * median(&rates) / reference)
         });
+        let pings: Vec<u64> = samples
+            .iter()
+            .flat_map(|s| s.ping_ms.iter().copied())
+            .collect();
         println!(
-            "  {:>14}: {:7.2} [{:.2}, {:.2}]{share}{}",
+            "  {:>14}: {:7.2} [{:.2}, {:.2}] ×{}{share}{}",
             point.label,
             median(&rates),
             min(&rates),
             max(&rates),
-            ping_summary(
-                &samples
-                    .iter()
-                    .flat_map(|s| s.ping_ms.clone())
-                    .collect::<Vec<_>>()
-            ),
+            rates.len(),
+            ping_summary(&pings),
         );
     }
-    let Some(reference) = reference else { return };
-    let cutoff = CUTOFF * reference;
-    // Candidates run smallest first; remember the one below the pick.
-    let mut below = None;
-    let mut picked = None;
-    for (point, samples) in results
-        .iter()
-        .filter(|(point, _)| point.label != "reference")
-    {
-        if median(&rates(samples)) >= cutoff {
-            picked = Some((point, samples));
-            break;
+    let problems = calibration_problems(profile, results);
+    if !problems.is_empty() {
+        println!("calibration: INVALID: {}", problems.join("; "));
+        if reference.is_some() {
+            println!("pick: invalid calibration, no pick");
         }
-        below = Some(samples);
+        return;
     }
-    let Some((pick, samples)) = picked else {
+    println!("calibration: ok");
+    let Some(cutoff) = cutoff(results) else {
+        return;
+    };
+    let Some((pick, below)) = pick(results) else {
         println!("pick: none of the candidates reaches {cutoff:.2} MB/s; widen the sweep");
         return;
     };
+    let rates_at = |index: usize| results.get(index).map(|(_, samples)| rates(samples));
     // Ambiguous when the pick's own runs dip below the cutoff, or the next
     // smaller candidate's runs reach it.
-    let straddles =
-        min(&rates(samples)) < cutoff || below.is_some_and(|below| max(&rates(below)) >= cutoff);
+    let straddles = rates_at(pick).is_some_and(|rates| min(&rates) < cutoff)
+        || below
+            .and_then(rates_at)
+            .is_some_and(|rates| max(&rates) >= cutoff);
+    let label = results
+        .get(pick)
+        .map_or("", |(point, _)| point.label.as_str());
     println!(
-        "pick: {} (cutoff {cutoff:.2} MB/s){}",
-        pick.label,
+        "pick: {label} (cutoff {cutoff:.2} MB/s){}",
         if straddles {
             "; FLAG: run-to-run spread straddles the cutoff, a person should judge"
         } else {
@@ -446,8 +528,9 @@ fn json_line(sweep: &str, profile: Profile, run: usize, point: &Point, sample: &
         concat!(
             r#"{{"sweep":"{}","profile":"{}","run":{},"label":"{}","transport":"{:?}","streams":{},"#,
             r#""stream_window":{},"connection_window":{},"send_window":{},"yamux_window":{},"#,
-            r#""mb_per_s":{},"utilization":{},"lost_up":{},"held_high_water":{},"#,
-            r#""max_queue_delay_ms":{},"ping_ms":{:?}}}"#
+            r#""mb_per_s":{},"utilization":{},"unloaded_rtt_ms":{},"ping_ms":{:?},"#,
+            r#""lost_up":{},"lost_down":{},"held_high_water":{},"max_queue_delay_ms":{},"#,
+            r#""proxy_cpu":{}}}"#
         ),
         sweep,
         profile.name,
@@ -461,10 +544,13 @@ fn json_line(sweep: &str, profile: Profile, run: usize, point: &Point, sample: &
         point.tcp.yamux.receive_window,
         sample.mb_per_s,
         sample.utilization,
+        sample.unloaded_rtt_ms,
+        sample.ping_ms,
         sample.lost_up,
+        sample.lost_down,
         sample.held_high_water,
         sample.max_queue_delay_ms,
-        sample.ping_ms,
+        sample.proxy_cpu,
     )
 }
 
@@ -488,8 +574,33 @@ struct Linked {
     target: Endpoint,
     client: Endpoint,
     target_peer: PeerId,
+    /// Client to target, and back.
     up: Arc<LinkStats>,
+    down: Arc<LinkStats>,
+    /// Median of a few pings on the idle connection.
+    unloaded_rtt_ms: f64,
     _proxy: Box<dyn Send>,
+}
+
+/// Pings the idle connection a few times and returns the median round trip
+/// in ms, timed around `ping()` and its `PingRttMeasured`.
+fn idle_rtt_ms(client: &mut Endpoint, target: &mut Endpoint, target_peer: &PeerId) -> f64 {
+    let mut rtts = Vec::new();
+    for _ in 0..3 {
+        let start = Instant::now();
+        client.ping(target_peer).expect("ping");
+        loop {
+            assert!(start.elapsed() < SETUP_TIMEOUT, "idle ping timed out");
+            next_event(target, Duration::from_millis(1));
+            if let Some(EndpointEvent::PingRttMeasured { .. }) =
+                next_event(client, Duration::from_millis(1))
+            {
+                break;
+            }
+        }
+        rtts.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    median(&rtts)
 }
 
 fn link(profile: Profile, point: &Point) -> Linked {
@@ -506,16 +617,18 @@ fn link(profile: Profile, point: &Point) -> Linked {
     let mut target = bind_on(builder(), listen);
     let target_addr = target.listen().expect("target listens");
     let target_peer = target_addr.peer_id().clone();
-    let (proxy_addr, up, proxy): (PeerAddr, _, Box<dyn Send>) = match point.transport {
+    let (proxy_addr, up, down, proxy): (PeerAddr, _, _, Box<dyn Send>) = match point.transport {
         Transport::Quic => {
             let proxy = UdpProxy::spawn(socket_addr(&target_addr), profile);
             let addr = PeerAddr::quic_v1(LOOPBACK, proxy.addr.port(), target_peer.clone());
-            (addr, Arc::clone(&proxy.up), Box::new(proxy))
+            let (up, down) = (Arc::clone(&proxy.up), Arc::clone(&proxy.down));
+            (addr, up, down, Box::new(proxy))
         }
         Transport::Tcp => {
             let proxy = TcpProxy::spawn(socket_addr(&target_addr), profile);
             let addr = PeerAddr::tcp(LOOPBACK, proxy.addr.port(), target_peer.clone());
-            (addr, Arc::clone(&proxy.up), Box::new(proxy))
+            let (up, down) = (Arc::clone(&proxy.up), Arc::clone(&proxy.down));
+            (addr, up, down, Box::new(proxy))
         }
     };
     let mut client = bind_on(builder(), listen);
@@ -533,34 +646,49 @@ fn link(profile: Profile, point: &Point) -> Linked {
             Some(EndpointEvent::PeerReady { peer_id, .. }) if peer_id == target_peer
         );
     }
+    let unloaded_rtt_ms = idle_rtt_ms(&mut client, &mut target, &target_peer);
     Linked {
         target,
         client,
         target_peer,
         up,
+        down,
+        unloaded_rtt_ms,
         _proxy: proxy,
     }
 }
 
+/// CPU time of the busiest proxy thread across both directions, in µs.
+fn proxy_cpu_us(links: [&LinkStats; 2]) -> [u64; 4] {
+    let cpu = |stats: &LinkStats| {
+        [
+            stats.reader_cpu_us.load(Ordering::Relaxed),
+            stats.writer_cpu_us.load(Ordering::Relaxed),
+        ]
+    };
+    let ([a, b], [c, d]) = (cpu(links[0]), cpu(links[1]));
+    [a, b, c, d]
+}
+
 /// `runs` timed transfers of `total` bytes over one fresh connection, after
-/// a warm-up transfer that opens the congestion window.
+/// a warm-up transfer that opens the congestion window. The target pings the
+/// client throughout, for the loaded RTT.
 fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Sample> {
     let Linked {
         target,
         mut client,
         target_peer,
         up,
+        down,
+        unloaded_rtt_ms,
         _proxy,
     } = link(profile, point);
     let client_peer = client.peer_id().clone();
     let pings = Arc::new(Mutex::new(Vec::new()));
     let on_event = {
-        let (pings, client_peer, ping) = (Arc::clone(&pings), client_peer.clone(), point.ping);
+        let (pings, client_peer) = (Arc::clone(&pings), client_peer.clone());
         let mut next_ping = Instant::now();
         move |endpoint: &mut Endpoint, event: &EndpointEvent| {
-            if !ping {
-                return;
-            }
             if let EndpointEvent::PingRttMeasured { rtt_ms, .. } = event {
                 pings.lock().expect("pings").push(*rtt_ms);
             }
@@ -601,12 +729,11 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
         up.reset();
         pings.lock().expect("pings").clear();
         let counted = point.transport == Transport::Quic;
-        let before = counted.then(|| {
-            (
-                datagram_counters(&client_peer),
-                datagram_counters(&target_peer),
-            )
-        });
+        let before = (
+            datagram_counters(&client_peer),
+            datagram_counters(&target_peer),
+        );
+        let cpu_before = proxy_cpu_us([&up, &down]);
         let (start, end) = bulk::transfer(
             &mut client,
             &target_peer,
@@ -616,28 +743,41 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
             Instant::now,
         );
         let seconds = (end - start).as_secs_f64();
-        // Let datagrams still on the link land before counting loss; the
-        // client is not driven meanwhile, so it sends nothing new.
+        let cpu_after = proxy_cpu_us([&up, &down]);
+        let proxy_cpu = cpu_before
+            .iter()
+            .zip(cpu_after)
+            .map(|(before, after)| after.saturating_sub(*before))
+            .max()
+            .unwrap_or_default() as f64
+            / 1e6
+            / seconds;
+        // Count loss once nothing is left on the link. The client is not
+        // driven while the up direction drains, so it sends nothing new;
+        // then it is driven while the down direction drains, so it reads
+        // what the target sent up to that point.
         thread::sleep(profile.rtt * 2);
-        let lost_up = before.map_or(0, |(client_before, target_before)| {
-            let sent = datagram_counters(&client_peer).since(&client_before).sent;
-            let received = datagram_counters(&target_peer)
-                .since(&target_before)
-                .received;
-            sent.saturating_sub(received)
-        });
+        let target_sent = datagram_counters(&target_peer).since(&before.1).sent;
+        let lost_up = datagram_counters(&client_peer)
+            .since(&before.0)
+            .sent
+            .saturating_sub(datagram_counters(&target_peer).since(&before.1).received);
+        let drained = Instant::now() + profile.rtt * 2;
+        while Instant::now() < drained {
+            drop(client.wait(drained).expect("drive client"));
+        }
+        let lost_down =
+            target_sent.saturating_sub(datagram_counters(&client_peer).since(&before.0).received);
         samples.push(Sample {
             mb_per_s: total as f64 / MB as f64 / seconds,
             utilization: total as f64 / seconds / profile.bytes_per_s(),
-            lost_up,
-            held_high_water: up
-                .held_high_water
-                .load(std::sync::atomic::Ordering::Relaxed),
-            max_queue_delay_ms: up
-                .max_queue_delay_us
-                .load(std::sync::atomic::Ordering::Relaxed) as f64
-                / 1000.0,
+            unloaded_rtt_ms,
             ping_ms: pings.lock().expect("pings").clone(),
+            lost_up: if counted { lost_up } else { 0 },
+            lost_down: if counted { lost_down } else { 0 },
+            held_high_water: up.held_high_water.load(Ordering::Relaxed),
+            max_queue_delay_ms: up.max_queue_delay_us.load(Ordering::Relaxed) as f64 / 1000.0,
+            proxy_cpu,
         });
     }
     samples
