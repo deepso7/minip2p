@@ -346,7 +346,7 @@ const connectionsOf = (event: P2pEvent): number[] => {
  * something the application acts on or must hear about, so it keeps the
  * connection's events.
  */
-const UNSEEN_CONNECTION_TAGS: ReadonlySet<string> = new Set<string>([
+const UNSEEN_CONNECTION_TAGS: ReadonlySet<string> = new Set<P2pEvent["tag"]>([
   P2pEvent_Tags.PeerReady,
   P2pEvent_Tags.IdentifyReceived,
   P2pEvent_Tags.PingRttMeasured,
@@ -399,6 +399,12 @@ class EventQueue {
   readonly #unseen = new StreamTable<number[] | undefined>();
   /** Connections whose `ConnectionEstablished` is queued and unseen. */
   readonly #unseenConnections = new Set<number>();
+  /**
+   * Live connections the application learned of outside the queue, so a
+   * later replacement fold must not make them unseen; each leaves with its
+   * end.
+   */
+  readonly #knownConnections = new Set<number>();
   readonly #capacity: number;
   readonly #release: (item: QueueItem) => void;
   #next = 0;
@@ -464,6 +470,7 @@ class EventQueue {
   /** The application learned of `connId` outside the queue. */
   markConnectionSeen(connId: number): void {
     this.#unseenConnections.delete(connId);
+    this.#knownConnections.add(connId);
   }
 
   /**
@@ -478,10 +485,13 @@ class EventQueue {
     const { event } = item;
     switch (event.tag) {
       case P2pEvent_Tags.ConnectionEstablished: {
-        this.#unseenConnections.add(event.inner.connId);
+        if (!this.#knownConnections.has(event.inner.connId)) {
+          this.#unseenConnections.add(event.inner.connId);
+        }
         return false;
       }
       case P2pEvent_Tags.ConnectionClosed: {
+        this.#knownConnections.delete(event.inner.connId);
         if (!this.#unseenConnections.delete(event.inner.connId)) {
           return false;
         }
@@ -491,12 +501,15 @@ class EventQueue {
       }
       case P2pEvent_Tags.ConnectionReplaced: {
         const { newConnId, oldConnId } = event.inner;
+        this.#knownConnections.delete(oldConnId);
         if (!this.#unseenConnections.delete(oldConnId)) {
           return false;
         }
         this.#renameOpening(oldConnId, newConnId);
         this.#removeConnection(oldConnId);
-        this.#unseenConnections.add(newConnId);
+        if (!this.#knownConnections.has(newConnId)) {
+          this.#unseenConnections.add(newConnId);
+        }
         this.#release(item);
         return true;
       }

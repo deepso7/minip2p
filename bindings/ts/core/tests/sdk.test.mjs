@@ -1067,6 +1067,25 @@ test("a connection the application opened a stream on keeps its end", async () =
   endpoint.close();
 });
 
+test("a connection the application opened a stream on stays seen through a fold", async () => {
+  const backend = new MockBackend();
+  backend.openResults.push({ connId: 3, streamId: 1 });
+  const endpoint = new TestMinip2p(backend);
+  backend.emit(connectionEvent(P2pEvent_Tags.ConnectionEstablished, 2));
+  // Native already routes to the successor before its replacement is queued.
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 60_000 });
+  backend.emit({
+    inner: { newConnId: 3, oldConnId: 2, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectionReplaced,
+  });
+  backend.emit(connectionEvent(P2pEvent_Tags.ConnectionClosed, 3));
+  await tick();
+
+  assert.equal(await remainsPending(opening), false);
+  await assert.rejects(opening);
+  endpoint.close();
+});
+
 test("a data event coalesced into the one before it is released to the adapter", async () => {
   const backend = new MockBackend();
   const handled = [];

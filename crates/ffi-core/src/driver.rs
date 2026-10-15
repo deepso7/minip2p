@@ -123,6 +123,9 @@ pub(crate) struct Carry {
     /// Connections whose `ConnectionEstablished` entered the carry and that
     /// neither the binding nor any kept event has seen yet.
     unseen_connections: BTreeSet<u64>,
+    /// Live connections the binding learned of outside the carry, so a later
+    /// replacement fold must not make them unseen; each leaves with its end.
+    known_connections: BTreeSet<u64>,
 }
 
 impl Carry {
@@ -249,7 +252,9 @@ impl Carry {
     fn track_connection(&mut self, event: &P2pEvent) -> bool {
         match event {
             P2pEvent::ConnectionEstablished { conn_id, .. } => {
-                self.unseen_connections.insert(*conn_id);
+                if !self.known_connections.contains(conn_id) {
+                    self.unseen_connections.insert(*conn_id);
+                }
             }
             P2pEvent::ConnectionClosed { conn_id, .. }
                 if self.unseen_connections.remove(conn_id) =>
@@ -272,8 +277,16 @@ impl Carry {
                     *conn_id = *new_conn_id;
                 }
                 self.remove_connection_events(*old_conn_id);
-                self.unseen_connections.insert(*new_conn_id);
+                if !self.known_connections.contains(new_conn_id) {
+                    self.unseen_connections.insert(*new_conn_id);
+                }
                 return true;
+            }
+            P2pEvent::ConnectionClosed { conn_id, .. } => {
+                self.known_connections.remove(conn_id);
+            }
+            P2pEvent::ConnectionReplaced { old_conn_id, .. } => {
+                self.known_connections.remove(old_conn_id);
             }
             // Only the events below leave a connection unseen: anything else
             // naming it is something the binding acts on or must hear about.
@@ -347,6 +360,7 @@ impl Carry {
     /// opened a stream on it), so its events are kept.
     pub(crate) fn mark_connection_seen(&mut self, conn_id: u64) {
         self.unseen_connections.remove(&conn_id);
+        self.known_connections.insert(conn_id);
     }
 
     /// Removes one held event, keeping the droppable counts.
@@ -1075,6 +1089,13 @@ mod tests {
         carry.mark_connection_seen(2);
         carry.push(closed(2));
         assert_eq!(carry.take(10), [established(2), closed(2)]);
+
+        // Even when an unseen predecessor folds into it afterwards.
+        carry.push(established(3));
+        carry.mark_connection_seen(4);
+        carry.push(replaced(3, 4));
+        carry.push(closed(4));
+        assert_eq!(carry.take(10), [established(4), closed(4)]);
     }
 
     #[test]

@@ -10,7 +10,7 @@ pub struct QuicLimits {
     /// Maximum simultaneous QUIC connections per UDP socket, counting both
     /// inbound (accepted) and outbound (dialed) connections.
     ///
-    /// A drained connection whose delivered bytes are not yet acknowledged or
+    /// An ended connection whose delivered bytes are not yet acknowledged or
     /// abandoned still counts (ADR 0012's unsettled connection): with every
     /// slot held, dials fail with `ResourceExhausted` and Initials are
     /// ignored.

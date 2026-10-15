@@ -115,7 +115,7 @@ pub struct NatConfig {
     pub reservation_keep_alive_interval_ms: u64,
     /// When to hold a relay reservation.
     pub reservation_policy: ReservationPolicy,
-    /// Circuit admission limit (#356). A circuit slot is reserved before a
+    /// Circuit admission limit (ADR 0012). A circuit slot is reserved before a
     /// STOP CONNECT is accepted (past the limit it is refused with
     /// `RESOURCE_LIMIT_EXCEEDED`) and before a HOP CONNECT is sent (past it
     /// the relay leg fails with [`NatError::ResourceExhausted`]), and every

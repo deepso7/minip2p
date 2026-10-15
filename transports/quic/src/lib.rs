@@ -295,7 +295,8 @@ pub struct QuicTransport {
     host_time: Arc<HostTime>,
     /// Active connections keyed by connection id.
     connections: HashMap<ConnectionId, QuicConnection>,
-    /// Drained connections whose delivered bytes are not settled yet. Each
+    /// Ended connections whose delivered bytes are not settled yet (unsettled
+    /// connections). Each
     /// still counts against its socket's connection limit (ADR 0012).
     unsettled: UnsettledConnections,
     /// The engine's handle for each connection.
@@ -1024,7 +1025,7 @@ impl Transport for QuicTransport {
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
         let Some(conn) = self.connections.get_mut(&id) else {
-            // Abandoning a stream of a drained connection only settles it.
+            // Abandoning a stream of an ended connection only settles it.
             if self.unsettled.abandon(id, stream_id) {
                 self.release_if_settled(id);
                 return Ok(());
@@ -1046,7 +1047,7 @@ impl Transport for QuicTransport {
         bytes: usize,
     ) -> Result<(), TransportError> {
         let Some(conn) = self.connections.get_mut(&id) else {
-            // A drained connection's bytes are released without credit.
+            // An ended connection's bytes are released without credit.
             if self.unsettled.ack(id, stream_id, bytes)? {
                 self.release_if_settled(id);
             }

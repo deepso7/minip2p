@@ -170,7 +170,7 @@ pub struct SecureMuxSession {
     /// messages, and encrypted Yamux frames already pulled.
     writes: WriteQueue,
     /// Yamux's unsettled counts, kept when a fatal error dropped it.
-    lost_unsettled: Vec<(StreamId, usize)>,
+    unsettled_at_failure: Vec<(StreamId, usize)>,
 }
 
 /// Unread negotiation and handshake bytes a session holds before it fails.
@@ -234,7 +234,7 @@ impl SecureMuxSession {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            lost_unsettled: Vec::new(),
+            unsettled_at_failure: Vec::new(),
         }
     }
 
@@ -291,7 +291,7 @@ impl SecureMuxSession {
         let encrypted = encrypt_into(noise, frame, &mut self.writes);
         push_yamux_events(yamux, &mut self.outputs);
         if let Err(error) = encrypted {
-            self.lost_unsettled = unsettled_of(yamux);
+            self.unsettled_at_failure = unsettled_of(yamux);
             self.phase = None;
             return Err(error);
         }
@@ -314,7 +314,7 @@ impl SecureMuxSession {
     pub fn unsettled_streams(&self) -> Vec<(StreamId, usize)> {
         match &self.phase {
             Some(Phase::Ready { yamux, .. }) => unsettled_of(yamux),
-            _ => self.lost_unsettled.clone(),
+            _ => self.unsettled_at_failure.clone(),
         }
     }
 
@@ -473,7 +473,7 @@ impl SecureMuxSession {
         // its GoAway and leave the phase taken.
         if let Err(error @ YamuxError::ControlReserveExhausted { .. }) = result {
             let drained = self.drain_yamux(&mut noise, &mut yamux, true);
-            self.lost_unsettled = unsettled_of(&yamux);
+            self.unsettled_at_failure = unsettled_of(&yamux);
             drained?;
             return Err(SessionError::protocol(format!(
                 "Yamux protocol failed: {error}"
@@ -482,7 +482,7 @@ impl SecureMuxSession {
         // A failed drain is fatal, exactly as in `handle_input`: leave the
         // phase taken so the session cannot be used again.
         if let Err(error) = self.drain_yamux(&mut noise, &mut yamux, false) {
-            self.lost_unsettled = unsettled_of(&yamux);
+            self.unsettled_at_failure = unsettled_of(&yamux);
             return Err(error);
         }
         self.phase = Some(Phase::Ready { noise, yamux, peer });
@@ -690,7 +690,7 @@ impl SecureMuxSession {
         match fed {
             Ok(()) => Ok(Phase::Ready { noise, yamux, peer }),
             Err(error) => {
-                self.lost_unsettled = unsettled_of(&yamux);
+                self.unsettled_at_failure = unsettled_of(&yamux);
                 Err(error)
             }
         }
@@ -1117,7 +1117,7 @@ mod tests {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            lost_unsettled: Vec::new(),
+            unsettled_at_failure: Vec::new(),
         };
         let proposals = b"\x13/multistream/1.0.0\n\x0d/mplex/6.7.0\n\x0d/yamux/1.0.0\n".to_vec();
         initiator_noise
@@ -1206,7 +1206,7 @@ mod tests {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            lost_unsettled: Vec::new(),
+            unsettled_at_failure: Vec::new(),
         };
 
         let mut packed = echo;
@@ -1312,7 +1312,7 @@ mod tests {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            lost_unsettled: Vec::new(),
+            unsettled_at_failure: Vec::new(),
         };
 
         session
@@ -1349,7 +1349,7 @@ mod tests {
             // An earlier pump already moved this stream's Writable here.
             outputs: VecDeque::from([SessionOutput::StreamWritable { stream }]),
             writes: WriteQueue::default(),
-            lost_unsettled: Vec::new(),
+            unsettled_at_failure: Vec::new(),
         };
 
         session.go_away(0).expect("go away");
@@ -1381,7 +1381,7 @@ mod tests {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            lost_unsettled: Vec::new(),
+            unsettled_at_failure: Vec::new(),
         };
         let stream = StreamId::new(77);
 
