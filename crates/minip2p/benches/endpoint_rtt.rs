@@ -140,7 +140,18 @@ fn pr_bench() {
             tcp: TcpConfig::default(),
         };
         let samples = measure(profile, &point, PR_TOTAL, PR_RUNS);
-        let rates: Vec<f64> = samples.iter().map(|sample| sample.mb_per_s).collect();
+        let results = [(point, samples)];
+        // The row still goes out, so the pipeline keeps its shape, but a
+        // link that failed calibration is called out next to it.
+        let problems = calibration_problems(profile, &results);
+        if !problems.is_empty() {
+            println!(
+                "WARNING: endpoint_rtt/{case}: calibration INVALID, the row below is not comparable: {}",
+                problems.join("; ")
+            );
+        }
+        let [(_, samples)] = &results;
+        let rates = rates(samples);
         let median = median(&rates);
         println!(
             "endpoint_rtt/{case}/{}: {median:.2} MB/s median of {rates:.2?} ({:.0}% of the link)",
@@ -418,15 +429,18 @@ fn calibration_problems(profile: Profile, results: &[(Point, Vec<Sample>)]) -> V
     if lost > 0 {
         problems.push(format!("{lost} datagrams lost"));
     }
-    let rtt = median(
-        &samples
-            .iter()
-            .map(|s| s.unloaded_rtt_ms)
-            .collect::<Vec<_>>(),
-    );
+    // Per sample, so one point measured on a slower link cannot hide in a
+    // sweep-wide median.
     let expected = profile.rtt.as_secs_f64() * 1000.0;
-    if (rtt - expected).abs() > MAX_RTT_ERROR * expected {
-        problems.push(format!("idle RTT {rtt:.0} ms, not {expected:.0} ms"));
+    for (point, samples) in results {
+        for sample in samples {
+            if (sample.unloaded_rtt_ms - expected).abs() > MAX_RTT_ERROR * expected {
+                problems.push(format!(
+                    "{}: idle RTT {:.0} ms, not {expected:.0} ms",
+                    point.label, sample.unloaded_rtt_ms
+                ));
+            }
+        }
     }
     let cpu = samples.iter().map(|s| s.proxy_cpu).fold(0.0, f64::max);
     if cpu > MAX_PROXY_CPU {
@@ -479,6 +493,30 @@ fn summarize(sweep: &str, profile: Profile, results: &[(Point, Vec<Sample>)]) {
         return;
     }
     println!("calibration: ok");
+    // `quic-check`: each chosen point against the reference with as many
+    // streams.
+    for (point, samples) in results {
+        let Some(streams) = point.label.strip_prefix("chosen") else {
+            continue;
+        };
+        let reference = results
+            .iter()
+            .find(|(other, _)| other.label == format!("reference{streams}"))
+            .map(|(_, samples)| median(&rates(samples)));
+        if let Some(reference) = reference {
+            let share = median(&rates(samples)) / reference;
+            println!(
+                "check: {} reaches {:.0}% of reference{streams}{}",
+                point.label,
+                100.0 * share,
+                match (share < CUTOFF, profile.name == Profile::M100_100MS.name) {
+                    (true, true) => ": MISSED the 90% target",
+                    (true, false) => " (not tuned for this profile)",
+                    (false, _) => "",
+                }
+            );
+        }
+    }
     let Some(cutoff) = cutoff(results) else {
         return;
     };

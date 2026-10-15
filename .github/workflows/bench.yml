@@ -41,17 +41,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.ref || github.event.repository.default_branch) || github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.event.pull_request.base.sha || github.sha }}
+      # The scripts and Dockerfile that run with AWS credentials always come
+      # from the trusted checkout above; a PR head or a dispatched `ref` is
+      # only the code measured, checked out beside it.
       - name: Check out benchmark source
-        if: github.event_name == 'pull_request_target'
+        if: github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || inputs.ref }}
           path: bench-source
       - name: Resolve benchmark source
         id: source
         env:
-          SOURCE_DIR: ${{ github.event_name == 'pull_request_target' && format('{0}/bench-source', github.workspace) || github.workspace }}
+          SOURCE_DIR: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')) && format('{0}/bench-source', github.workspace) || github.workspace }}
         run: |
           sha=$(git -C "$SOURCE_DIR" rev-parse HEAD)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
@@ -65,11 +68,12 @@ jobs:
         id: ecr
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # The Dockerfile always comes from the trusted checkout; only the build
-      # context (the code compiled inside the image) may come from the PR.
+      # context (the code compiled inside the image) may come from the PR or
+      # the dispatched `ref`.
       - name: Build and push benchmark image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: ${{ github.event_name == 'pull_request_target' && 'bench-source' || '.' }}
+          context: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')) && 'bench-source' || '.' }}
           file: infra/bench/Dockerfile
           push: true
           tags: ${{ steps.ecr.outputs.registry }}/minip2p-bench:${{ steps.source.outputs.image_tag }}
