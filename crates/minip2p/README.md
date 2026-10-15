@@ -289,7 +289,7 @@ cargo bench -p minip2p-rs --features tcp,nat,relay-server,bench --bench endpoint
 `benches/endpoint_rtt.rs` measures the same one-way goodput over an emulated link: a userspace proxy (`benches/support/delay.rs`) caps each direction at 100 Mbit/s and adds a 100 ms round trip, with no loss, so flow-control windows are measured at a real RTT where `tc netem` is unavailable. It reports the median of 3 warm transfers over QUIC and over TCP + Yamux with default limits. The TCP case measures Yamux credit at the RTT, not kernel TCP, because the proxy terminates TCP on both sides. With `MINIP2P_RTT_SWEEP` set it runs one of #361's window sweeps instead; `scripts/rtt-sweep.sh` runs them all in order and records the picks:
 
 ```bash
-cargo bench -p minip2p-rs --features tcp,bench --bench endpoint_rtt
+cargo bench -p minip2p-rs --features tcp,nat,relay-server,bench --bench endpoint_rtt
 scripts/rtt-sweep.sh                    # every sweep, ~20 minutes
 scripts/rtt-sweep.sh quic-stream yamux  # just these
 ```

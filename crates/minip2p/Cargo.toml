@@ -107,7 +107,7 @@ required-features = ["quic", "tcp", "nat", "relay-server", "bench"]
 [[bench]]
 name = "endpoint_rtt"
 harness = false
-required-features = ["quic", "tcp", "bench"]
+required-features = ["quic", "tcp", "nat", "relay-server", "bench"]
 
 [[bench]]
 name = "endpoint_ping_load"
