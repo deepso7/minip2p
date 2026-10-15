@@ -284,6 +284,14 @@ impl InboundCircuit {
         }
         close_write(swarm, &self.relay, self.inner_conn, self.stream, now);
         self.abandon(false, swarm, shared, now);
+        // Still owned until it closes: whatever the relay sends meanwhile is
+        // NAT's to consume, never an application stream's.
+        shared.own_stream(
+            &self.relay,
+            self.inner_conn,
+            self.stream,
+            StreamRole::RejectedControl,
+        );
     }
 
     /// Hands the exact bridge stream to the circuit transport, exactly once.

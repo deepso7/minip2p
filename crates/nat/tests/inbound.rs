@@ -279,6 +279,22 @@ fn a_stop_past_the_circuit_limit_is_refused_until_a_slot_frees() {
         Some(Status::ResourceLimitExceeded)
     );
     assert!(refused_with_fin(&actions, refused), "{actions:?}");
+    // Draining the status and FIN, the stream stays NAT's: late relay bytes
+    // never surface as an application stream.
+    let conn = minip2p_transport::ConnectionId::new(1);
+    assert!(h.agent.owns_stream(conn, refused));
+    h.stream_data(refused, vec![1, 2, 3], at(35));
+    assert!(drain_actions(&mut h.agent).is_empty());
+    h.agent.handle_event(
+        &SwarmEvent::StreamClosed {
+            conn_id: conn,
+            peer_id: h.relay.clone(),
+            stream_id: refused,
+        },
+        false,
+        at(36),
+    );
+    assert!(!h.agent.owns_stream(conn, refused));
     assert!(
         !actions
             .iter()
