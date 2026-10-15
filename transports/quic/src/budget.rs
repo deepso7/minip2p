@@ -7,12 +7,15 @@ use crate::QuicLimits;
 
 /// Memory reservations held against one transport's QUIC memory budget.
 ///
-/// A connection reserves its fixed part at admission and releases it when it
-/// drains; a stream reserves its receive window when it opens or is admitted
+/// Each socket's retry queue is reserved up front, for the transport's
+/// lifetime. A connection reserves its fixed part at admission and releases
+/// it when it drains; a stream reserves its receive window when it opens or is admitted
 /// and releases it once it settles. A reservation that does not fit is
 /// refused, so `reserved` never exceeds the budget.
 #[derive(Debug)]
 pub(crate) struct MemoryBudget {
+    /// What connections and streams may reserve: the budget less the
+    /// sockets' retry queues.
     capacity: usize,
     connection: usize,
     stream: usize,
@@ -20,13 +23,27 @@ pub(crate) struct MemoryBudget {
 }
 
 impl MemoryBudget {
-    pub(crate) fn new(limits: &QuicLimits) -> Self {
-        Self {
-            capacity: limits.memory_budget_bytes,
+    /// The budget of a transport with `sockets` bound sockets, or `None`
+    /// when it cannot fit their retry queues plus one connection and one
+    /// stream. Checked arithmetic: a sum that overflows can never fit.
+    pub(crate) fn new(limits: &QuicLimits, sockets: usize) -> Option<Self> {
+        let smallest = limits
+            .max_pending_connection_bytes
+            .checked_mul(2)
+            .and_then(|queue| queue.checked_add(limits.send_window))
+            .and_then(|fixed| fixed.checked_add(limits.connection_receive_window))
+            .and_then(|fixed| fixed.checked_add(limits.stream_receive_window))?;
+        let queues = limits
+            .max_pending_datagrams
+            .checked_mul(crate::config::MAX_DATAGRAM_BYTES)?
+            .checked_mul(sockets)?;
+        let capacity = limits.memory_budget_bytes.checked_sub(queues)?;
+        (capacity >= smallest).then(|| Self {
+            capacity,
             connection: limits.connection_reservation_bytes(),
             stream: limits.stream_reservation_bytes(),
             reserved: 0,
-        }
+        })
     }
 
     /// The error for a dial or stream open that does not fit.
@@ -71,7 +88,8 @@ impl MemoryBudget {
         self.reserved = self.reserved.saturating_sub(bytes);
     }
 
-    /// Bytes reserved now.
+    /// Bytes connections and streams reserve now; the retry queues are not
+    /// counted.
     #[cfg(test)]
     pub(crate) fn reserved(&self) -> usize {
         self.reserved

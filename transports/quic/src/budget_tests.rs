@@ -14,7 +14,10 @@ fn quic_addr(addr: &str) -> Multiaddr {
 #[test]
 fn a_budget_that_cannot_fit_one_connection_and_one_stream_is_rejected() {
     let limits = QuicLimits::default();
-    let smallest = limits.connection_reservation_bytes() + limits.stream_reservation_bytes();
+    // One socket's retry queue, one connection and one stream.
+    let smallest = limits.datagram_queue_reservation_bytes()
+        + limits.connection_reservation_bytes()
+        + limits.stream_reservation_bytes();
     let bind = |memory_budget_bytes| {
         QuicTransport::bind(
             QuicNodeConfig::generate().with_limits(QuicLimits {
@@ -53,6 +56,26 @@ fn a_budget_that_cannot_fit_one_connection_and_one_stream_is_rejected() {
 }
 
 #[test]
+fn a_dual_stack_transport_reserves_both_retry_queues() {
+    let limits = QuicLimits::default();
+    let one_socket = limits.datagram_queue_reservation_bytes()
+        + limits.connection_reservation_bytes()
+        + limits.stream_reservation_bytes();
+    let tight = QuicNodeConfig::generate().with_limits(QuicLimits {
+        memory_budget_bytes: one_socket,
+        ..limits
+    });
+    QuicTransport::bind(tight.clone(), &[quic_addr("127.0.0.1:0")]).expect("one socket fits");
+    assert!(matches!(
+        QuicTransport::dual_stack(tight),
+        Err(QuicBindError::InvalidLimit {
+            field: "memory_budget_bytes",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn a_connection_reserves_twice_its_send_queue_beside_its_windows() {
     // 2 × 1 MiB queue (a queued slice may pin twice what it counts) +
     // 2 MiB send window + 3 MiB connection window.
@@ -63,19 +86,22 @@ fn a_connection_reserves_twice_its_send_queue_beside_its_windows() {
 
 #[test]
 fn the_default_budget_admits_64_connections_with_a_stream_each() {
+    // Dual-stack: both sockets' retry queues come out of the budget first.
     let limits = QuicLimits::default();
     assert!(
-        64 * (limits.connection_reservation_bytes() + limits.stream_reservation_bytes())
+        2 * limits.datagram_queue_reservation_bytes()
+            + 64 * (limits.connection_reservation_bytes() + limits.stream_reservation_bytes())
             <= limits.memory_budget_bytes
     );
 }
 
-/// Limits whose budget fits `connections` fixed parts plus `streams` stream
-/// reservations, and nothing more.
+/// Limits whose budget fits one socket's retry queue, `connections` fixed
+/// parts and `streams` stream reservations, and nothing more.
 fn budget_for(connections: usize, streams: usize) -> QuicLimits {
     let limits = QuicLimits::default();
     QuicLimits {
-        memory_budget_bytes: connections * limits.connection_reservation_bytes()
+        memory_budget_bytes: limits.datagram_queue_reservation_bytes()
+            + connections * limits.connection_reservation_bytes()
             + streams * limits.stream_reservation_bytes(),
         ..limits
     }
@@ -269,7 +295,8 @@ fn connection_and_stream_churn_returns_the_budget_to_zero() {
 #[test]
 fn a_stalled_reader_across_close_and_reconnect_stays_within_the_budget() {
     let limits = budget_for(1, 2);
-    let budget = limits.memory_budget_bytes;
+    // What connections and streams may reserve, past the socket's queue.
+    let budget = limits.memory_budget_bytes - limits.datagram_queue_reservation_bytes();
     let stream = limits.stream_reservation_bytes();
     let mut server = listening_server(limits);
 

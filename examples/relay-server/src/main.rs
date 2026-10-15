@@ -26,10 +26,12 @@ const STREAMS_PER_CONNECTION: usize = 4;
 const DIAL_RACE_SLACK: usize = 8;
 
 /// QUIC limits whose memory budget fits every connection this relay's
-/// `config` admits, each with stream headroom:
+/// `config` admits, each with stream headroom, beside the retry queues of
+/// its (at most two) QUIC sockets:
 ///
 /// ```text
-/// (max_reservations + max_circuits + DIAL_RACE_SLACK)
+/// 2 × datagram_queue_reservation_bytes
+///     + (max_reservations + max_circuits + DIAL_RACE_SLACK)
 ///     × (connection_reservation_bytes + STREAMS_PER_CONNECTION × stream_reservation_bytes)
 /// ```
 ///
@@ -45,7 +47,9 @@ fn relay_quic_limits(config: &RelayServerConfig) -> QuicLimits {
         .saturating_add(config.max_circuits)
         .saturating_add(DIAL_RACE_SLACK);
     QuicLimits {
-        memory_budget_bytes: connections.saturating_mul(per_connection),
+        memory_budget_bytes: connections
+            .saturating_mul(per_connection)
+            .saturating_add(2 * limits.datagram_queue_reservation_bytes()),
         ..limits
     }
 }

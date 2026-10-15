@@ -72,10 +72,11 @@ The key file is created owner-only on Unix and never overwritten. Configuration 
 The QUIC memory budget (ADR 0019) is derived from the relay configuration, so raising `--max-reservations` or `--max-circuits` raises it too:
 
 ```text
-memory_budget_bytes = (max_reservations + max_circuits + 8)
+memory_budget_bytes = 2 × datagram_queue_reservation_bytes
+    + (max_reservations + max_circuits + 8)
     × (connection_reservation_bytes + 4 × stream_reservation_bytes)
 ```
 
-Each reservation and each circuit source (which needs no reservation) gets one connection's fixed part plus four streams of headroom (Identify, ping, the HOP stream and one circuit leg), and the 8 extra connections cover dial races and reconnects whose old connection has not drained. With the defaults (128 reservations, 16 circuits) that is 152 × about 10.8 MiB, roughly 1.6 GiB: a cap on what peers can make the relay queue, not memory allocated up front.
+Each reservation and each circuit source (which needs no reservation) gets one connection's fixed part plus four streams of headroom (Identify, ping, the HOP stream and one circuit leg), and the 8 extra connections cover dial races and reconnects whose old connection has not drained. The first term is the retry queues of the relay's two QUIC sockets (about 1.4 MiB each). With the defaults (128 reservations, 16 circuits) that is 152 × about 10.8 MiB, roughly 1.6 GiB: a cap on what peers can make the relay queue, not memory allocated up front.
 
 Explicit announce addresses are trusted operator input and take precedence over AutoNAT-confirmed direct addresses and concrete listeners. Wildcards, circuit addresses, unsupported shapes, and conflicting `/p2p` identities are rejected.

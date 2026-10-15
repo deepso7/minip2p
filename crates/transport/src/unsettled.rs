@@ -22,6 +22,9 @@ pub struct UnsettledConnections {
     /// Unacknowledged bytes by stream, for each held connection. Neither map
     /// keeps an empty entry.
     connections: BTreeMap<ConnectionId, BTreeMap<StreamId, usize>>,
+    /// Streams held across every connection, kept so counting them does not
+    /// walk the maps.
+    streams: usize,
 }
 
 impl UnsettledConnections {
@@ -44,7 +47,10 @@ impl UnsettledConnections {
         if streams.is_empty() {
             return false;
         }
-        self.connections.insert(id, streams);
+        self.streams += streams.len();
+        if let Some(replaced) = self.connections.insert(id, streams) {
+            self.streams -= replaced.len();
+        }
         true
     }
 
@@ -60,7 +66,7 @@ impl UnsettledConnections {
 
     /// How many streams are held, across every held connection.
     pub fn streams(&self) -> usize {
-        self.connections.values().map(BTreeMap::len).sum()
+        self.streams
     }
 
     /// Whether no connection is held.
@@ -110,7 +116,9 @@ impl UnsettledConnections {
         let Some(streams) = self.connections.get_mut(&id) else {
             return false;
         };
-        streams.remove(&stream_id);
+        if streams.remove(&stream_id).is_some() {
+            self.streams -= 1;
+        }
         if streams.is_empty() {
             self.connections.remove(&id);
         }

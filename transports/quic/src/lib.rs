@@ -246,19 +246,6 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
             return Err(invalid(field, "must be greater than zero"));
         }
     }
-    // Checked, not saturating: a sum that overflows can never fit.
-    let smallest_budget = limits
-        .max_pending_connection_bytes
-        .checked_mul(2)
-        .and_then(|queue| queue.checked_add(limits.send_window))
-        .and_then(|fixed| fixed.checked_add(limits.connection_receive_window))
-        .and_then(|fixed| fixed.checked_add(limits.stream_receive_window));
-    if smallest_budget.is_none_or(|smallest| limits.memory_budget_bytes < smallest) {
-        return Err(invalid(
-            "memory_budget_bytes",
-            "must fit one connection and one stream (connection_reservation_bytes() + stream_reservation_bytes())",
-        ));
-    }
     let too_large = |field| invalid(field, "is too large for QUIC");
     let var_int = |field, value: usize| {
         u64::try_from(value)
@@ -447,6 +434,13 @@ impl QuicTransport {
         }
         // Checked before any socket is bound.
         let transport_config = transport_config(node_config.limits())?;
+        let budget = MemoryBudget::new(node_config.limits(), binds.len()).ok_or(
+            QuicBindError::InvalidLimit {
+                field: "memory_budget_bytes",
+                requirement: "must fit each socket's datagram_queue_reservation_bytes() plus one \
+                     connection_reservation_bytes() and one stream_reservation_bytes()",
+            },
+        )?;
         let sockets = binds
             .into_iter()
             .map(|addr| {
@@ -457,7 +451,7 @@ impl QuicTransport {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Self::from_sockets(node_config, transport_config, sockets)
+        Self::from_sockets(node_config, transport_config, budget, sockets)
     }
 
     /// Binds an IPv4 and an IPv6 wildcard socket, each on its own ephemeral
@@ -473,6 +467,7 @@ impl QuicTransport {
     fn from_sockets(
         node_config: QuicNodeConfig,
         transport_config: TransportConfig,
+        budget: MemoryBudget,
         udps: Vec<(SocketAddr, UdpSocket)>,
     ) -> Result<Self, QuicBindError> {
         let transport_config = Arc::new(transport_config);
@@ -535,7 +530,7 @@ impl QuicTransport {
             host_time,
             connections: HashMap::new(),
             unsettled: UnsettledConnections::new(),
-            budget: MemoryBudget::new(node_config.limits()),
+            budget,
             handles: HashMap::new(),
             pending_events: Vec::new(),
             recv_buf: vec![0; recv_buf_len],
