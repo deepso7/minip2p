@@ -64,7 +64,9 @@ export declare class NodeEndpoint {
   abandonStream(connId: bigint, streamId: bigint): void
   /**
    * Acknowledges `bytes` of a stream's received data as consumed,
-   * letting its sender continue. Every registered protocol needs this.
+   * letting its sender continue. Every registered protocol needs this,
+   * also after the stream's connection closed: unacknowledged bytes keep
+   * the ended connection's slot until they are acknowledged or abandoned.
    */
   streamConsumed(connId: bigint, streamId: bigint, bytes: number): void
   /**
