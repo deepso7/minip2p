@@ -10,11 +10,11 @@ on:
       ref:
         description: Commit, branch or tag to measure (default branch when empty)
         required: false
-        default: ''
+        default: ""
       sweep:
         description: Emulated-link window sweeps to run instead of the benchmarks (scripts/rtt-sweep.sh names, space-separated, or `all`)
         required: false
-        default: ''
+        default: ""
 
 permissions:
   contents: read
