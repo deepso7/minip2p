@@ -1,8 +1,10 @@
 import {
   BackpressureError,
+  InvalidConfigError,
   MessageTooLargeError,
   NotPermittedError,
 } from "./errors.js";
+import { ConfigCapability } from "./types.js";
 import type {
   Bytes,
   ConnectionInfo,
@@ -131,14 +133,31 @@ export {
 } from "./types.js";
 
 /**
- * Returns the typed SDK error for a native `FfiError` variant name, or
- * `undefined` for variants that adapters rethrow unchanged. `detail` is the
- * variant's detail field, when it has one.
+ * The parts of a native `FfiError` an adapter reads off its toolchain's error
+ * value: the variant name, its detail field, and an `InvalidConfig`'s
+ * capability as its Rust variant name.
  */
-export const typedFfiError = (
-  tag: string | undefined,
-  detail: string | undefined
-): Error | undefined => {
+export interface NativeErrorFields {
+  readonly tag?: string | undefined;
+  readonly detail?: string | undefined;
+  readonly capability?: string | undefined;
+}
+
+// Each capability's name is its value, so an own key is a capability.
+const isConfigCapability = (name: string): name is ConfigCapability =>
+  Object.hasOwn(ConfigCapability, name);
+
+/**
+ * Returns the typed SDK error for a native `FfiError`, or `undefined` for
+ * variants that adapters rethrow unchanged. An `InvalidConfig` whose
+ * capability is missing or unknown (native and SDK versions out of step)
+ * is rethrown unchanged too, rather than given a capability it did not name.
+ */
+export const typedFfiError = ({
+  capability,
+  detail,
+  tag,
+}: NativeErrorFields): Error | undefined => {
   switch (tag) {
     case "Backpressure": {
       return new BackpressureError();
@@ -148,6 +167,11 @@ export const typedFfiError = (
     }
     case "NotPermitted": {
       return new NotPermittedError(detail);
+    }
+    case "InvalidConfig": {
+      return capability !== undefined && isConfigCapability(capability)
+        ? new InvalidConfigError(capability, detail ?? "")
+        : undefined;
     }
     default: {
       return undefined;

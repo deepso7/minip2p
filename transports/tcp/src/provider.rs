@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use minip2p_core::Multiaddr;
-use minip2p_platform::{Deadline, Now};
+use minip2p_platform::{Deadline, IoErrorKind, Now};
 use thiserror::Error;
 
 use core::fmt;
@@ -51,12 +51,14 @@ pub enum TcpError {
         reason: String,
     },
     /// The underlying I/O failed.
-    #[error("{operation} failed: {reason}")]
+    #[error("{operation} failed ({kind}): {detail}")]
     Io {
-        /// Which operation failed, for the message.
-        operation: &'static str,
-        /// What the platform reported.
-        reason: String,
+        /// Which operation failed.
+        operation: TcpIoOperation,
+        /// What kind of failure the platform reported.
+        kind: IoErrorKind,
+        /// The platform's own description, for diagnostics.
+        detail: String,
     },
     /// The handle does not name a stream this provider currently owns.
     #[error("{socket} is not open")]
@@ -70,6 +72,75 @@ pub enum TcpError {
         /// Which limit, for the message.
         resource: &'static str,
     },
+}
+
+/// The provider operation a [`TcpError::Io`] failed in.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum TcpIoOperation {
+    /// Binding a listener.
+    BindListener,
+    /// Reading the address a listener was bound to.
+    ReadLocalAddress,
+    /// Starting an outbound connect.
+    Connect,
+    /// Configuring a new stream (disabling Nagle's algorithm, say).
+    ConfigureStream,
+    /// Registering a socket with the host's readiness poll.
+    Register,
+    /// Writing to a stream.
+    Write,
+    /// Half-closing a stream's write side.
+    HalfClose,
+}
+
+impl TcpIoOperation {
+    /// What the operation was doing, for messages.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BindListener => "binding a listener",
+            Self::ReadLocalAddress => "reading the bound address",
+            Self::Connect => "starting a connect",
+            Self::ConfigureStream => "configuring a stream",
+            Self::Register => "registering a socket",
+            Self::Write => "writing to a stream",
+            Self::HalfClose => "half-closing a stream",
+        }
+    }
+}
+
+impl fmt::Display for TcpIoOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A provider failure as the transport contract's error.
+///
+/// [`TcpTransport::listen`](crate::TcpTransport) refines an I/O failure into
+/// [`TransportError::ListenFailed`](minip2p_transport::TransportError::ListenFailed),
+/// which also names the address.
+impl From<TcpError> for minip2p_transport::TransportError {
+    fn from(error: TcpError) -> Self {
+        match error {
+            TcpError::Address { context, reason } => Self::InvalidAddress { context, reason },
+            TcpError::Io {
+                operation,
+                kind,
+                detail,
+            } => Self::Io {
+                operation: operation.as_str(),
+                kind,
+                detail,
+            },
+            TcpError::UnknownSocket { socket } => Self::Io {
+                operation: "finding a provider stream",
+                kind: IoErrorKind::NotFound,
+                detail: alloc::format!("{socket} is not open"),
+            },
+            TcpError::Exhausted { resource } => Self::ResourceExhausted { resource },
+        }
+    }
 }
 
 /// Something a provider observed on one of its streams.

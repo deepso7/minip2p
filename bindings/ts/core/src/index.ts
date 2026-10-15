@@ -8,6 +8,7 @@ export {
   ConnectResultUnavailableError,
   DriverFailedError,
   EventQueueOverflowError,
+  InvalidConfigError,
   MessageTooLargeError,
   NotPermittedError,
   OpenStreamError,
@@ -18,9 +19,11 @@ export {
 } from "./errors.js";
 export { Minip2pBase, Stream, type StreamEventMap } from "./sdk.js";
 export {
+  ConfigCapability,
   DiscoverySource,
   DriverFailureKind,
   EndpointErrorKind,
+  MdnsFailureKind,
   NatErrorKind,
   Reachability,
   type Bytes,

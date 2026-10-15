@@ -32,6 +32,7 @@ mod admission_tests;
 mod config;
 mod connection;
 mod diagnostics;
+mod error;
 #[cfg(test)]
 mod recv_batch_tests;
 mod socket;
@@ -50,6 +51,7 @@ mod write_fairness_tests;
 pub use config::{QuicLimits, QuicNodeConfig};
 #[cfg(feature = "diagnostics")]
 pub use diagnostics::{ConnectionDiagnostics, DatagramCounters, datagram_counters};
+pub use error::{QuicBindError, QuicTlsStage};
 
 use connection::{Cx, QuicConnection, SendCaps};
 use diagnostics::{ConnectionCounters, DatagramTally};
@@ -207,38 +209,36 @@ fn socket_addr_to_multiaddr(addr: SocketAddr) -> Multiaddr {
 
 /// The engine's transport parameters for `limits`, every default the
 /// adapter relies on set explicitly.
-fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, TransportError> {
+fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindError> {
+    let invalid = |field, requirement| QuicBindError::InvalidLimit { field, requirement };
     if limits.max_pending_datagrams == 0 {
-        return Err(TransportError::InvalidConfig {
-            reason: "max_pending_datagrams must be greater than zero".into(),
-        });
+        return Err(invalid(
+            "max_pending_datagrams",
+            "must be greater than zero",
+        ));
     }
     // A zero queue could never free half of itself, so a Full write would
     // never be told it can retry; nor could an application stream whose
     // whole connection queue is the control reserve.
     if limits.max_pending_bytes_per_stream == 0 {
-        return Err(TransportError::InvalidConfig {
-            reason: "max_pending_bytes_per_stream must be greater than zero".into(),
-        });
+        return Err(invalid(
+            "max_pending_bytes_per_stream",
+            "must be greater than zero",
+        ));
     }
     if limits.max_pending_connection_bytes <= limits.control_stream_reserve_bytes {
-        return Err(TransportError::InvalidConfig {
-            reason:
-                "max_pending_connection_bytes must be greater than control_stream_reserve_bytes"
-                    .into(),
-        });
+        return Err(invalid(
+            "control_stream_reserve_bytes",
+            "must be less than max_pending_connection_bytes",
+        ));
     }
     // QUIC treats a zero idle timeout as "no timeout", which would keep dead
     // connections alive forever -- the opposite of what a limit promises --
     // so reject it up front.
     if limits.idle_timeout_ms == 0 {
-        return Err(TransportError::InvalidConfig {
-            reason: "idle_timeout_ms must be greater than zero".into(),
-        });
+        return Err(invalid("idle_timeout_ms", "must be greater than zero"));
     }
-    let too_large = |field: &str| TransportError::InvalidConfig {
-        reason: format!("{field} is too large for QUIC"),
-    };
+    let too_large = |field| invalid(field, "is too large for QUIC");
     let max_streams = VarInt::from_u64(limits.max_streams_per_connection)
         .map_err(|_bounds| too_large("max_streams_per_connection"))?;
     let idle_timeout =
@@ -259,12 +259,6 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, TransportErr
             limits.idle_timeout_ms,
         ))));
     Ok(config)
-}
-
-fn tls_config_error(error: impl std::fmt::Display) -> TransportError {
-    TransportError::InvalidConfig {
-        reason: format!("failed to build the QUIC TLS configuration: {error}"),
-    }
 }
 
 /// QUIC transport over one or two non-blocking UDP sockets -- at most one per
@@ -355,23 +349,19 @@ fn family_for_socket_addr(addr: SocketAddr) -> AddressFamily {
 }
 
 /// Binds an IPv4 UDP socket to `addr`.
-fn bind_ipv4_udp(addr: SocketAddr) -> Result<UdpSocket, TransportError> {
-    UdpSocket::bind(addr).map_err(|e| TransportError::ListenFailed {
-        reason: format!("failed to bind udp socket {addr}: {e}"),
-    })
+fn bind_ipv4_udp(addr: SocketAddr) -> Result<UdpSocket, QuicBindError> {
+    UdpSocket::bind(addr).map_err(|e| QuicBindError::socket(addr, "bind", &e))
 }
 
 /// Binds an IPv6-only UDP socket, so an IPv4 wildcard can share its port.
-fn bind_ipv6_only_udp(addr: SocketAddr) -> Result<UdpSocket, TransportError> {
+fn bind_ipv6_only_udp(addr: SocketAddr) -> Result<UdpSocket, QuicBindError> {
     RawSocket::new(Domain::IPV6, Type::DGRAM, Some(SocketProtocol::UDP))
         .and_then(|socket| {
             socket.set_only_v6(true)?;
             socket.bind(&addr.into())?;
             Ok(socket.into())
         })
-        .map_err(|e| TransportError::ListenFailed {
-            reason: format!("failed to bind ipv6-only udp socket {addr}: {e}"),
-        })
+        .map_err(|e| QuicBindError::socket(addr, "bind ipv6-only", &e))
 }
 
 /// The address error for a target whose family has no bound socket.
@@ -390,23 +380,27 @@ impl QuicTransport {
     /// Binds one UDP socket per address: one `/ip4/<ip>/udp/<port>/quic-v1`,
     /// one `/ip6/...`, or one of each. Hosts must be numeric; port 0 picks an
     /// ephemeral port. An IPv6 socket is IPv6-only.
-    pub fn bind(node_config: QuicNodeConfig, addrs: &[Multiaddr]) -> Result<Self, TransportError> {
+    pub fn bind(node_config: QuicNodeConfig, addrs: &[Multiaddr]) -> Result<Self, QuicBindError> {
         let mut binds = addrs
             .iter()
-            .map(|addr| extract_listen_socket_addr(addr, "bind address"))
+            .map(|addr| {
+                extract_listen_socket_addr(addr, "bind address").map_err(|error| {
+                    QuicBindError::InvalidAddress {
+                        addr: addr.clone(),
+                        reason: match error {
+                            TransportError::InvalidAddress { reason, .. } => reason,
+                            other => other.to_string(),
+                        },
+                    }
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         binds.sort_by_key(|addr| addr.is_ipv6());
         match binds.as_slice() {
             [_] => {}
             [first, second] if first.is_ipv6() != second.is_ipv6() => {}
             _ => {
-                return Err(TransportError::InvalidConfig {
-                    reason: format!(
-                        "QUIC binds one /ip4 address, one /ip6 address, or one of each; got {} \
-                         address(es)",
-                        addrs.len()
-                    ),
-                });
+                return Err(QuicBindError::AddressFamilies { count: addrs.len() });
             }
         }
         // Checked before any socket is bound.
@@ -415,9 +409,9 @@ impl QuicTransport {
             .into_iter()
             .map(|addr| {
                 if addr.is_ipv6() {
-                    bind_ipv6_only_udp(addr)
+                    bind_ipv6_only_udp(addr).map(|udp| (addr, udp))
                 } else {
-                    bind_ipv4_udp(addr)
+                    bind_ipv4_udp(addr).map(|udp| (addr, udp))
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -426,7 +420,7 @@ impl QuicTransport {
 
     /// Binds an IPv4 and an IPv6 wildcard socket, each on its own ephemeral
     /// port.
-    pub fn dual_stack(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
+    pub fn dual_stack(node_config: QuicNodeConfig) -> Result<Self, QuicBindError> {
         let wildcards = [
             socket_addr_to_multiaddr(SocketAddr::from(([0, 0, 0, 0], 0))),
             socket_addr_to_multiaddr(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))),
@@ -437,34 +431,31 @@ impl QuicTransport {
     fn from_sockets(
         node_config: QuicNodeConfig,
         transport_config: TransportConfig,
-        udps: Vec<UdpSocket>,
-    ) -> Result<Self, TransportError> {
+        udps: Vec<(SocketAddr, UdpSocket)>,
+    ) -> Result<Self, QuicBindError> {
         let transport_config = Arc::new(transport_config);
         let tally = DatagramTally::register(&node_config.peer_id());
         let max_pending_datagrams = node_config.limits().max_pending_datagrams;
         let sockets = udps
             .into_iter()
-            .map(|udp| {
+            .map(|(requested, udp)| {
                 udp.set_nonblocking(true)
-                    .map_err(|e| TransportError::ListenFailed {
-                        reason: format!("failed to set nonblocking: {e}"),
-                    })?;
-                let local_addr = udp.local_addr().map_err(|e| TransportError::ListenFailed {
-                    reason: format!("failed to get local addr: {e}"),
-                })?;
-                Socket::new(udp, local_addr, max_pending_datagrams, tally.clone()).map_err(|e| {
-                    TransportError::ListenFailed {
-                        reason: format!("failed to configure udp socket: {e}"),
-                    }
-                })
+                    .map_err(|e| QuicBindError::socket(requested, "set non-blocking", &e))?;
+                let local_addr = udp
+                    .local_addr()
+                    .map_err(|e| QuicBindError::socket(requested, "read local address", &e))?;
+                Socket::new(udp, local_addr, max_pending_datagrams, tally.clone())
+                    .map_err(|e| QuicBindError::socket(local_addr, "configure", &e))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
         let host_time = Arc::new(HostTime::default());
-        let tls = TlsIdentity::new(node_config.keypair(), Arc::clone(&host_time))
-            .map_err(|reason| TransportError::InvalidConfig { reason })?;
-        let crypto = QuicServerConfig::try_from(tls.server_config().map_err(tls_config_error)?)
-            .map_err(tls_config_error)?;
+        let tls = TlsIdentity::new(node_config.keypair(), Arc::clone(&host_time))?;
+        let server_tls = tls
+            .server_config()
+            .map_err(|error| QuicBindError::tls(QuicTlsStage::ServerConfig, error))?;
+        let crypto = QuicServerConfig::try_from(server_tls)
+            .map_err(|error| QuicBindError::tls(QuicTlsStage::QuicCipherSuites, error))?;
         let mut server_config = ServerConfig::with_crypto(Arc::new(crypto));
         let mut validation_tokens = ValidationTokenConfig::default();
         // Retry stays the only address validation: no NEW_TOKEN is issued.
@@ -551,11 +542,9 @@ impl QuicTransport {
         self.sockets
             .iter()
             .map(|socket| {
-                PeerAddr::new(socket_addr_to_multiaddr(socket.local_addr), peer_id.clone()).map_err(
-                    |e| TransportError::InvalidConfig {
-                        reason: format!("failed to build local PeerAddr: {e}"),
-                    },
-                )
+                let addr = socket_addr_to_multiaddr(socket.local_addr);
+                PeerAddr::new(addr.clone(), peer_id.clone())
+                    .map_err(|error| TransportError::LocalPeerAddr { addr, error })
             })
             .collect()
     }
@@ -590,12 +579,18 @@ impl QuicTransport {
 
     /// A dial's engine config: this node's identity, and a verifier that
     /// rejects any listener not proving `expected`.
+    ///
+    /// Both steps fail only for a crypto provider without TLS 1.3 or QUIC's
+    /// cipher suites, which the listener's config already proved this one has.
     fn client_config(&self, expected: &PeerId) -> Result<ClientConfig, TransportError> {
+        let unsupported = || TransportError::Unsupported {
+            operation: "a TLS 1.3 QUIC client configuration",
+        };
         let tls = self
             .tls
             .client_config(Some(expected.clone()))
-            .map_err(tls_config_error)?;
-        let crypto = QuicClientConfig::try_from(tls).map_err(tls_config_error)?;
+            .map_err(|_no_tls13| unsupported())?;
+        let crypto = QuicClientConfig::try_from(tls).map_err(|_no_quic_suite| unsupported())?;
         let mut config = ClientConfig::new(Arc::new(crypto));
         config.transport_config(Arc::clone(&self.transport_config));
         Ok(config)
@@ -644,9 +639,7 @@ impl QuicTransport {
                 }
                 Err(e) => {
                     socket.saturated = false;
-                    return Err(TransportError::PollError {
-                        reason: format!("udp recv error: {e}"),
-                    });
+                    return Err(TransportError::io("receiving UDP datagrams", &e));
                 }
             };
             datagrams += received.datagrams();
@@ -1092,9 +1085,7 @@ impl Transport for QuicTransport {
         socket
             .udp
             .send_to(payload, addr)
-            .map_err(|e| TransportError::PollError {
-                reason: format!("raw udp send to {addr} failed: {e}"),
-            })?;
+            .map_err(|e| TransportError::io("sending a raw UDP datagram", &e))?;
         socket.tally.sent(1, payload.len());
         Ok(())
     }
@@ -1324,8 +1315,8 @@ mod tests {
             assert!(
                 matches!(
                     QuicTransport::bind(QuicNodeConfig::generate(), &addrs),
-                    Err(TransportError::InvalidConfig { .. }
-                        | TransportError::InvalidAddress { .. })
+                    Err(QuicBindError::AddressFamilies { .. }
+                        | QuicBindError::InvalidAddress { .. })
                 ),
                 "{addrs:?} must be refused"
             );
@@ -1370,7 +1361,7 @@ mod tests {
                 QuicNodeConfig::generate().with_limits(limits),
                 &[quic_addr("127.0.0.1:0")],
             );
-            assert!(matches!(result, Err(TransportError::InvalidConfig { .. })));
+            assert!(matches!(result, Err(QuicBindError::InvalidLimit { .. })));
         }
     }
 

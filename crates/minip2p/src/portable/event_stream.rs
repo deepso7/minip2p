@@ -1,8 +1,8 @@
 //! Single Endpoint event stream type (ADR 0007).
 //!
 //! Connection, Identify, ping, stream, Connection-attempt, and enabled
-//! capability (NAT, Gossipsub, Discovery, relay-server) transitions all leave
-//! through [`EndpointEvent`].
+//! capability (NAT, Gossipsub, Discovery, mDNS, relay-server) transitions all
+//! leave through [`EndpointEvent`].
 
 use minip2p_core::{Bytes, PeerAddr, PeerId};
 use minip2p_swarm::{IdentifyMessage, SwarmEvent, SwarmRuntimeError};
@@ -27,7 +27,7 @@ use super::connect::{ConnectId, ConnectOutcome};
 ///
 /// 1. the batch's swarm events (connection, Identify, ping, and stream
 ///    events), in swarm order;
-/// 2. capability events: relay-server, NAT, Gossipsub, Discovery;
+/// 2. capability events: relay-server, NAT, Gossipsub, Discovery, mDNS;
 /// 3. Connection-attempt terminals ([`Self::ConnectSettled`]).
 ///
 /// Std `wait` runs one batch and hands its events out one per call; std and
@@ -189,7 +189,21 @@ pub enum EndpointEvent {
     /// Discovery peer-book changes from signed beacons and mDNS.
     #[cfg(feature = "_discovery-driver")]
     Discovery(minip2p_discovery::DiscoveryEvent),
-    /// Relay-service output: reservations, circuits, and runtime errors.
+    /// mDNS hit a hard failure (a socket that will not send, say).
+    ///
+    /// A capability failure event: mDNS keeps running and retries, and the
+    /// rest of the endpoint is unaffected. Reported once per change in
+    /// failure state, so a failure that keeps recurring is reported once;
+    /// [`Self::MdnsRecovered`] follows once a retry succeeds. A goodbye that
+    /// could not be sent during an mDNS shutdown is final: no recovery
+    /// follows it.
+    #[cfg(feature = "_mdns-driver")]
+    MdnsFailed { error: minip2p_mdns::MdnsError },
+    /// mDNS recovered from its last [`Self::MdnsFailed`].
+    #[cfg(feature = "_mdns-driver")]
+    MdnsRecovered,
+    /// Relay-service output: reservations, circuits, rejected and restored
+    /// address sources, and runtime errors.
     #[cfg(feature = "relay-server")]
     RelayServer(minip2p_relay_server::RelayServerEvent),
 }

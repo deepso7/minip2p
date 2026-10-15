@@ -15,11 +15,12 @@ import type {
 
 /**
  * Hand-written stand-in for a generated event class instance. The adapter
- * only reads `tag` and `inner`, so tests enqueue plain literals.
+ * only reads `tag` and `inner`, so tests enqueue plain literals. A field-less
+ * variant has no `inner`.
  */
 export interface FakeEvent {
   readonly tag: string;
-  readonly inner: Readonly<Record<string, unknown>>;
+  readonly inner?: Readonly<Record<string, unknown>>;
 }
 
 const notFaked = (method: keyof P2pEndpointLike): never => {
@@ -34,6 +35,8 @@ const notFaked = (method: keyof P2pEndpointLike): never => {
  */
 export class FakeNativeEndpoint implements P2pEndpointLike {
   static latest: FakeNativeEndpoint | undefined;
+  /** Error the next constructor call throws, as native config validation would. */
+  static constructError: Error | undefined;
 
   /** Native config passed to the most recent constructor. */
   readonly config: unknown;
@@ -66,6 +69,11 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
   #doorbell: P2pEventDoorbell | undefined;
 
   constructor(_secretKey?: Uint8Array, config?: unknown) {
+    const error = FakeNativeEndpoint.constructError;
+    if (error !== undefined) {
+      FakeNativeEndpoint.constructError = undefined;
+      throw error;
+    }
     this.config = config;
     FakeNativeEndpoint.latest = this;
   }
@@ -233,11 +241,13 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
 export const nativeModuleMock = async () => {
   const generated = await import("../src/generated/minip2p_ffi_core");
   return {
+    ConfigCapability: generated.ConfigCapability,
     ConnectTarget: generated.ConnectTarget,
     DiscoverySource: generated.DiscoverySource,
     DriverFailureKind: generated.DriverFailureKind,
     EndpointErrorKind: generated.EndpointErrorKind,
     FfiError_Tags: generated.FfiError_Tags,
+    MdnsFailureKind: generated.MdnsFailureKind,
     NatErrorKind: generated.NatErrorKind,
     P2pEndpoint: FakeNativeEndpoint,
     Reachability: generated.Reachability,

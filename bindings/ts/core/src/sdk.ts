@@ -2209,6 +2209,8 @@ const SDK_EVENT_NAMES: {
   [P2pEvent_Tags.PeerUpdated]: "peerUpdated",
   [P2pEvent_Tags.PeerExpired]: "peerExpired",
   [P2pEvent_Tags.DiscoveryDialFailed]: "discoveryDialFailed",
+  [P2pEvent_Tags.MdnsFailed]: "mdnsFailed",
+  [P2pEvent_Tags.MdnsRecovered]: "mdnsRecovered",
   [P2pEvent_Tags.DiscoveryProtocolViolation]: "discoveryProtocolViolation",
 };
 
@@ -2230,7 +2232,8 @@ function normalizeEvent(
   payload: AnyPayload;
 } {
   const type = SDK_EVENT_NAMES[event.tag];
-  let payload: unknown = event.inner;
+  // A native variant without fields arrives without `inner`.
+  let payload: unknown = "inner" in event ? event.inner : {};
   if (event.tag === P2pEvent_Tags.PathEstablished) {
     payload = { ...event.inner, path: normalizePath(event.inner.path) };
   } else if (event.tag === P2pEvent_Tags.InboundPathEstablished) {

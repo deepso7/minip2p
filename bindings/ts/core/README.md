@@ -43,4 +43,8 @@ A peer holds one connection at a time. `connectionEstablished` and `connectionCl
 
 Use `endpoint.on("stream", handler)` to claim inbound streams. Operations accept `{ timeoutMs, signal }`; the default timeout is 65 seconds and `timeoutMs: 0` disables it. Both endpoints and streams implement `Symbol.dispose`, including the fallback used by `await using`; neither implements `Symbol.asyncDispose`.
 
-Raw native unions, the `Minip2pBackend` adapter contract, `resolveEndpointConfig` (shared config defaults and validation), and `typedFfiError` (native `FfiError` variant name to typed SDK error) are available from `@minip2p/core/backend`.
+`create` throws `InvalidConfigError` when native rejects the configuration. Its `capability` (`Gossipsub`, `Mdns`, `Discovery`, `Transport`, or `Options`, from `ConfigCapability`) names the part to change, and `detail` carries the native diagnostic. A malformed listen address and a socket the platform refused are not config errors; they keep their native error codes.
+
+With mDNS enabled, `mdnsFailed` (`{ kind, detail }`, `kind` from `MdnsFailureKind`) reports a hard mDNS failure once per change in failure state. mDNS keeps running and retries, and `mdnsRecovered` follows once a retry succeeds; a goodbye that failed during shutdown is final.
+
+Raw native unions, the `Minip2pBackend` adapter contract, `resolveEndpointConfig` (shared config defaults and validation), and `typedFfiError` (native `FfiError` variant to typed SDK error) are available from `@minip2p/core/backend`.

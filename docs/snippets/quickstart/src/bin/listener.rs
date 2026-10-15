@@ -1,6 +1,6 @@
 use minip2p::{Endpoint, EndpointWaitOutcome, PeerAddr, WaitDeadline};
 
-fn main() -> Result<(), minip2p::Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut node = Endpoint::builder()
         .agent_version("minip2p-hello/listener")
         .listen_default()?

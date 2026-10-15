@@ -10,6 +10,7 @@ Everything in minip2p is caller-driven: protocol agents, transports, and runtime
 - `Clock`: the trait adapters implement to produce `Now`.
 - `Deadline`: a point on a clock's monotonic timeline, used by caller-driven components to report when they next need attention.
 - `EntropySource` and `EntropyError`: cryptographically secure random bytes, with an explicit "this platform has none" error.
+- `IoErrorKind`: a portable classification of I/O failures, so `no_std` and hosted adapters report the same kinds (`From<std::io::ErrorKind>` behind `std`).
 - `StdClock` and `StdEntropy` behind the default `std` feature.
 
 ## Usage

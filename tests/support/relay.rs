@@ -365,7 +365,7 @@ impl RelayServer {
     }
 
     fn spawn_on(
-        bind: impl FnOnce(minip2p::EndpointBuilder) -> Result<Endpoint, minip2p::Error>,
+        bind: impl FnOnce(minip2p::EndpointBuilder) -> Result<Endpoint, minip2p::BindError>,
     ) -> Self {
         let mut endpoint = bind(
             Endpoint::builder()

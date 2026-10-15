@@ -299,9 +299,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         let mut draw = |target: &mut [u8; 32]| {
             self.entropy
                 .fill_bytes(target)
-                .map_err(|error| TransportError::PollError {
-                    reason: format!("entropy unavailable: {error}"),
-                })
+                .map_err(TransportError::from)
         };
         draw(&mut static_secret)?;
         draw(&mut ephemeral_secret)?;
@@ -794,12 +792,14 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         if self.provider.local_addresses().iter().any(|a| a == addr) {
             return Ok(addr.clone());
         }
-        let bound = self
-            .provider
-            .listen(addr)
-            .map_err(|error| TransportError::ListenFailed {
-                reason: error.to_string(),
-            })?;
+        let bound = self.provider.listen(addr).map_err(|error| match error {
+            TcpError::Io { kind, detail, .. } => TransportError::ListenFailed {
+                addr: addr.clone(),
+                kind,
+                detail,
+            },
+            other => other.into(),
+        })?;
         self.pending.push_back(TransportEvent::Listening {
             addr: bound.clone(),
         });
@@ -932,12 +932,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         if !self.pending.is_empty() {
             return Ok(self.drain_pending_events());
         }
-        let events = self
-            .provider
-            .poll(now)
-            .map_err(|error| TransportError::PollError {
-                reason: error.to_string(),
-            })?;
+        let events = self.provider.poll(now)?;
         for event in events {
             self.handle_provider_event(event);
         }

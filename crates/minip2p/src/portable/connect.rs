@@ -1356,7 +1356,8 @@ mod tests {
 
         fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
             if self.refuse_close {
-                return Err(TransportError::InvalidConfig {
+                return Err(TransportError::CloseFailed {
+                    id,
                     reason: String::from("close refused"),
                 });
             }

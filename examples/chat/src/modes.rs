@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, ConnectId, ConnectOutcome, DISCOVERY_TOPIC, DiscoveryEvent, Endpoint,
+    BeaconConfig, BindError, ConnectId, ConnectOutcome, DISCOVERY_TOPIC, DiscoveryEvent, Endpoint,
     EndpointEvent, EndpointWaitOutcome, GossipsubConfig, GossipsubError, GossipsubEvent, NatConfig,
     NatEvent, Path, PeerAddr, PeerDiscoveryConfig, PeerId, PublishError,
 };
@@ -75,10 +75,12 @@ fn build_endpoint(
     let endpoint = match &options.listen_addr {
         Some(addr) => builder
             .listen_on_multiaddr(addr)
+            .map_err(BindError::from)
             .and_then(|builder| builder.bind())
             .map_err(|e| format!("quic bind {addr}: {e}"))?,
         None => builder
             .listen_default()
+            .map_err(BindError::from)
             .and_then(|builder| builder.bind())
             .map_err(|e| format!("quic dual-stack bind: {e}"))?,
     };

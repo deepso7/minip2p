@@ -78,7 +78,8 @@ Every event leaves through the Endpoint event stream, read with `Endpoint::wait`
 - `EndpointEvent::Nat(NatEvent)` (`nat`): path transitions, reachability, public addresses, and relay reservations. The attempt outcome is `ConnectSettled`, never a `NatEvent`;
 - `EndpointEvent::Gossipsub(GossipsubEvent)` (`pubsub`);
 - `EndpointEvent::Discovery(DiscoveryEvent)` (`discovery` / `mdns`);
-- `EndpointEvent::RelayServer(RelayServerEvent)` (`relay-server`).
+- `EndpointEvent::RelayServer(RelayServerEvent)` (`relay-server`);
+- `EndpointEvent::MdnsFailed { error }` and `EndpointEvent::MdnsRecovered` (`mdns`): an mDNS socket failure and its recovery. mDNS keeps retrying meanwhile, and nothing else on the endpoint stops.
 
 Durable state is available through State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`, and with capabilities `path`, `reachability`, `active_reservation`, `known_peers`). `bound_addresses` reports transport-bound local addresses; `bind` already accepts on each. Those getters do not drive the endpoint, are not one cross-getter atomic snapshot, and may be ahead of the event stream, never behind their own emitted transition.
 

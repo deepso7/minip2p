@@ -34,6 +34,8 @@ Three details are easy to get wrong, and the transport depends on all three:
 - **`Connected` gates writability.** A handle from `connect` is not writable until its `TcpEvent::Connected` is polled.
 - **`Closed` is terminal, and `abort` is silent.** A handle is never reused, and after `abort` the provider emits nothing further for it — the caller asked for the teardown and needs no confirmation.
 
+Failures are a typed `TcpError`: `Address` for an address the provider cannot use, `Io { operation, kind, detail }` for a platform failure (a `TcpIoOperation` and a portable `IoErrorKind`, so `no_std` and hosted providers report the same kinds), `UnknownSocket`, and `Exhausted`. `TcpError` converts into `TransportError` (`Io` stays `TransportError::Io`), and a failed bind in `TcpTransport::listen` is `TransportError::ListenFailed { addr, kind, detail }`.
+
 `TcpProvider`'s rustdoc has the full contract. `TcpEvent::Writable` is a hint rather than a requirement: the transport retries buffered writes on every `poll`, so a provider whose readiness reporting is coarse still drains.
 
 ## Backpressure

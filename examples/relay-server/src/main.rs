@@ -238,6 +238,12 @@ fn print_event(event: RelayServerEvent) {
             "[relay] circuit closed source={source_peer_id} destination={destination_peer_id} source_to_destination_bytes={} destination_to_source_bytes={} cause={reason:?}",
             bytes.source_to_destination, bytes.destination_to_source
         ),
+        RelayServerEvent::AddrsRejected { source, error } => {
+            eprintln!("[relay] {source:?} addresses rejected, keeping the previous ones: {error}")
+        }
+        RelayServerEvent::AddrsRestored { source } => {
+            println!("[relay] {source:?} addresses accepted again")
+        }
         RelayServerEvent::Error(error) => eprintln!(
             "[relay] operational error kind={:?} peer={} detail={} action=check transport reachability and configured limits",
             error.kind,

@@ -85,7 +85,7 @@ For this combination, install with `cargo add minip2p-rs --no-default-features -
 
 ## Drive time and network progress
 
-No executor, no background thread. Sample the monotonic clock once, pass that same `Now` into the endpoint, handle every event, then use `next_deadline` to decide how long the board may sleep. Each `poll` runs one batch and returns its events in the same order as the hosted endpoint: swarm events, then capability events, then `ConnectSettled` terminals. `poll(now)` and `shutdown(now)` return `Vec<EndpointEvent>`; enabled services add `EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, and `EndpointEvent::Discovery` variants:
+No executor, no background thread. Sample the monotonic clock once, pass that same `Now` into the endpoint, handle every event, then use `next_deadline` to decide how long the board may sleep. Each `poll` runs one batch and returns its events in the same order as the hosted endpoint: swarm events, then capability events, then `ConnectSettled` terminals. `poll(now)` and `shutdown(now)` return `Vec<EndpointEvent>`; enabled services add `EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, `EndpointEvent::Discovery`, and (with mDNS) `EndpointEvent::MdnsFailed` / `MdnsRecovered` variants. An mDNS carrier failure is one of those events, never a `poll` error: mDNS retries and the rest of the endpoint keeps running. In `shutdown(now)` mDNS goodbyes are best effort, so a failed one appears as `MdnsFailed` among the returned events:
 
 ```rust
 use minip2p::{EndpointEvent, Now};

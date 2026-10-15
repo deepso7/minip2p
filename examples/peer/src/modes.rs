@@ -13,8 +13,9 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome,
-    NatConfig, NatEvent, Path, PeerAddr, PeerId, StreamId, StreamWriteError, StreamWriter,
+    BindError, ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointEvent,
+    EndpointWaitOutcome, NatConfig, NatEvent, Path, PeerAddr, PeerId, StreamId, StreamWriteError,
+    StreamWriter,
 };
 
 use minip2p_example_common::{
@@ -102,10 +103,12 @@ fn build_endpoint(
     match &options.listen_addr {
         Some(addr) => builder
             .listen_on_multiaddr(addr)
+            .map_err(BindError::from)
             .and_then(|builder| builder.bind())
             .map_err(|e| format!("bind {addr}: {e}").into()),
         None => builder
             .listen_default()
+            .map_err(BindError::from)
             .and_then(|builder| builder.bind())
             .map_err(|e| format!("quic dual-stack bind: {e}").into()),
     }

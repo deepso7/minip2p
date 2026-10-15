@@ -183,10 +183,8 @@ pub struct Swarm<T: BlockingTransport> {
 }
 
 /// A failed poll operation, as the transport error the drive paths report.
-fn poll_error(context: &str, error: &std::io::Error) -> DriverError {
-    DriverError::Transport(TransportError::PollError {
-        reason: format!("{context}: {error}"),
-    })
+fn poll_error(operation: &'static str, error: &std::io::Error) -> DriverError {
+    DriverError::Transport(TransportError::io(operation, error))
 }
 
 impl<T: BlockingTransport> Swarm<T> {

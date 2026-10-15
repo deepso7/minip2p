@@ -127,11 +127,7 @@ fn identity(seed: u8) -> Ed25519Keypair {
 }
 
 fn node(key: Ed25519Keypair) -> Node {
-    TcpTransport::new(
-        StdTcpProvider::new().expect("a readiness registry"),
-        key,
-        StdEntropy,
-    )
+    TcpTransport::new(StdTcpProvider::new(), key, StdEntropy)
 }
 
 /// Polls both nodes until `done`, or panics with what it saw.
@@ -587,7 +583,7 @@ fn is_connected_event(event: &TransportEvent) -> bool {
 
 #[test]
 fn ipv4_and_ipv6_wildcard_listeners_can_share_a_port() {
-    let mut provider = StdTcpProvider::new().expect("a readiness registry");
+    let mut provider = StdTcpProvider::new();
     let ipv4 = provider
         .listen(&"/ip4/0.0.0.0/tcp/0".parse().expect("IPv4 wildcard"))
         .expect("the IPv4 wildcard binds");
@@ -650,7 +646,7 @@ fn names_are_refused_with_a_resolve_first_error() {
     let mut transport = node(identity(1));
     assert!(matches!(
         transport.listen(&"/dns/localhost/tcp/0".parse().expect("addr")),
-        Err(TransportError::ListenFailed { .. })
+        Err(TransportError::InvalidAddress { .. })
     ));
 
     let target = PeerAddr::new(
@@ -869,8 +865,8 @@ mod provider {
 
     /// Connects two providers, returning both ends of the stream.
     fn linked() -> (StdTcpProvider, SocketHandle, StdTcpProvider, SocketHandle) {
-        let mut server = StdTcpProvider::new().expect("server");
-        let mut client = StdTcpProvider::new().expect("client");
+        let mut server = StdTcpProvider::new();
+        let mut client = StdTcpProvider::new();
         let bound = server
             .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
             .expect("bind");
@@ -903,8 +899,8 @@ mod provider {
 
     #[test]
     fn a_connecting_socket_accepts_no_bytes_before_connected() {
-        let mut server = StdTcpProvider::new().expect("server");
-        let mut client = StdTcpProvider::new().expect("client");
+        let mut server = StdTcpProvider::new();
+        let mut client = StdTcpProvider::new();
         let bound = server
             .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
             .expect("bind");
@@ -1137,7 +1133,7 @@ mod provider {
     #[cfg(target_os = "linux")]
     #[test]
     fn one_busy_socket_cannot_monopolise_a_poll() {
-        let mut server = StdTcpProvider::new().expect("server");
+        let mut server = StdTcpProvider::new();
         let bound = server
             .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
             .expect("bind");
@@ -1214,7 +1210,7 @@ mod provider {
 
     #[test]
     fn a_burst_of_connections_cannot_monopolise_a_poll() {
-        let mut server = StdTcpProvider::new().expect("server");
+        let mut server = StdTcpProvider::new();
         let bound = server
             .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
             .expect("bind");
@@ -1287,7 +1283,7 @@ mod provider {
 
     #[test]
     fn a_connection_past_the_accept_budget_is_deferred_not_dropped() {
-        let mut server = StdTcpProvider::new().expect("server");
+        let mut server = StdTcpProvider::new();
         let bound = server
             .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
             .expect("bind");
@@ -1333,7 +1329,7 @@ mod provider {
 
     #[test]
     fn a_flooded_listener_cannot_starve_a_later_bind() {
-        let mut server = StdTcpProvider::new().expect("server");
+        let mut server = StdTcpProvider::new();
         // Bound first, so it is the one a naive walk over the listeners always
         // reaches first.
         let busy = server
@@ -1488,7 +1484,7 @@ mod provider {
 
     #[test]
     fn addresses_must_be_a_bare_host_and_port() {
-        let mut provider = StdTcpProvider::new().expect("provider");
+        let mut provider = StdTcpProvider::new();
         // A trailing component means the address is not this provider's to
         // dial; connecting anyway would reach somewhere the caller did not ask
         // for.

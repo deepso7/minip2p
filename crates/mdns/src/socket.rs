@@ -12,7 +12,9 @@ use minip2p_transport::mio::{self, Interest, Registry, Waker, event::Event};
 use minip2p_transport::{PollSource, TokenSpace};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 
-use crate::io::{MdnsDatagram, MdnsError, MdnsIo};
+use minip2p_platform::IoErrorKind;
+
+use crate::io::{MdnsDatagram, MdnsError, MdnsIo, MdnsIoOperation};
 use crate::{InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAction, MdnsConfig, MdnsTarget};
 
 const MDNS_PORT: u16 = 5353;
@@ -25,7 +27,7 @@ struct InterfaceKey {
     family: IpFamily,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct InterfaceRegistry {
     next_id: u32,
     active: BTreeMap<InterfaceKey, InterfaceId>,
@@ -85,20 +87,51 @@ impl core::fmt::Debug for Registration {
 }
 
 impl Registration {
-    /// Registers (or, for a socket kept across a refresh, re-registers) the
-    /// receive socket of pair `index`.
-    fn register(&self, index: usize, pair: &mut SocketPair, fresh: bool) -> io::Result<()> {
-        let token = self
-            .tokens
-            .token(index)
-            .ok_or_else(|| io::Error::other("no readiness token left for an mDNS socket"))?;
-        if fresh {
-            self.registry
-                .register(&mut pair.receive, token, Interest::READABLE)
-        } else {
-            self.registry
-                .reregister(&mut pair.receive, token, Interest::READABLE)
+    /// Registers the receive socket of `pair`, under a token derived from its
+    /// interface id.
+    ///
+    /// Ids are stable and never reused, so a socket kept across a refresh
+    /// keeps its token and never needs registering again: a refresh only adds
+    /// fresh sockets and drops gone ones, which is what lets a failed one
+    /// leave the poll exactly as it found it.
+    fn register(&self, pair: &mut SocketPair) -> Result<(), MdnsError> {
+        let interface = pair.snapshot.id;
+        let token = usize::try_from(interface.get())
+            .ok()
+            .and_then(|index| self.tokens.token(index))
+            .ok_or_else(|| {
+                MdnsError::io(
+                    MdnsIoOperation::Register,
+                    IoErrorKind::OutOfMemory,
+                    Some(interface),
+                    "no readiness token left for an mDNS socket",
+                )
+            })?;
+        self.registry
+            .register(&mut pair.receive, token, Interest::READABLE)
+            .map_err(io_error(interface, MdnsIoOperation::Register))
+    }
+
+    /// Registers every pair, all or nothing: a failure deregisters the ones
+    /// that got in, so the caller can drop or retry them from scratch.
+    fn register_all(&self, pairs: &mut [SocketPair]) -> Result<(), MdnsError> {
+        let failed = pairs
+            .iter_mut()
+            .enumerate()
+            .find_map(|(index, pair)| self.register(pair).err().map(|error| (index, error)));
+        let Some((index, error)) = failed else {
+            return Ok(());
+        };
+        for registered in pairs.iter_mut().take(index) {
+            self.deregister(registered);
         }
+        Err(error)
+    }
+
+    /// Releases `pair`'s registration ahead of dropping it.
+    fn deregister(&self, pair: &mut SocketPair) {
+        // About to drop, which releases the registration too.
+        drop(self.registry.deregister(&mut pair.receive));
     }
 }
 
@@ -112,8 +145,8 @@ impl Registration {
 ///
 /// As a [`PollSource`] attached to a std host's shared poll (the `Endpoint`
 /// attaches it to its swarm as a host source), the receive sockets are
-/// registered for readiness, and re-registered when an interface refresh
-/// rebuilds them. Readiness only wakes the host: the driver's next tick reads
+/// registered for readiness, and an interface refresh registers the sockets it
+/// adds. Readiness only wakes the host: the driver's next tick reads
 /// every socket until it has nothing more (or its budget runs out, which it
 /// reports as due now), so nothing is dispatched to this. Without a poll the
 /// host has to tick it on a cadence of its own to hear anything.
@@ -155,42 +188,58 @@ impl MdnsSockets {
 
     fn refresh_interfaces(&mut self) -> Result<bool, MdnsError> {
         let grouped = enumerate_interfaces(self.enable_ipv6)?;
-        let snapshots = self.registry.assign(&grouped)?;
+        // Assigned on a copy, so a refresh that fails hands out no ids.
+        let mut registry = self.registry.clone();
+        let snapshots = registry.assign(&grouped)?;
+        self.replace(registry, snapshots, SocketPair::new)
+    }
+
+    /// Moves to `snapshots`, all or nothing.
+    ///
+    /// An interface still here with the same addresses keeps its sockets:
+    /// rebuilding one would drop the multicast membership and lose whatever
+    /// had arrived on it. Every other socket is built with `build` and
+    /// registered before anything is swapped, so a failure leaves the
+    /// accepted sockets, snapshots, ids, and registrations exactly as they
+    /// were -- mDNS keeps running on them while the driver retries.
+    fn replace(
+        &mut self,
+        registry: InterfaceRegistry,
+        snapshots: Vec<InterfaceSnapshot>,
+        mut build: impl FnMut(InterfaceSnapshot) -> Result<SocketPair, MdnsError>,
+    ) -> Result<bool, MdnsError> {
         if snapshots == self.snapshots {
+            self.registry = registry;
             return Ok(false);
         }
 
-        let mut old = core::mem::take(&mut self.pairs);
-        let mut pairs = Vec::with_capacity(snapshots.len());
-        for (index, snapshot) in snapshots.iter().enumerate() {
-            // An interface that is still here with the same addresses keeps
-            // its sockets: rebuilding one would drop the multicast membership
-            // and lose whatever had arrived on it.
-            let existing = old
-                .iter()
-                .position(|pair| pair.snapshot == *snapshot)
-                .map(|index| old.swap_remove(index));
-            let fresh = existing.is_none();
-            let mut pair = match existing {
-                Some(pair) => pair,
-                None => SocketPair::new(snapshot.clone())?,
-            };
-            // Kept sockets may have moved to another index, so another token.
-            if let Some(registration) = &self.registration {
-                registration
-                    .register(index, &mut pair, fresh)
-                    .map_err(|error| MdnsError::io("registering an mDNS socket", error))?;
+        let mut fresh = Vec::new();
+        for snapshot in &snapshots {
+            if !self.pairs.iter().any(|pair| pair.snapshot == *snapshot) {
+                fresh.push(build(snapshot.clone())?);
             }
-            pairs.push(pair);
         }
         if let Some(registration) = &self.registration {
-            for mut gone in old {
-                // About to drop, which releases the registration too.
-                drop(registration.registry.deregister(&mut gone.receive));
+            registration.register_all(&mut fresh)?;
+        }
+
+        // Nothing below fails: this is the commit.
+        let mut old = core::mem::take(&mut self.pairs);
+        let mut fresh = fresh.into_iter();
+        for snapshot in &snapshots {
+            let pair = match old.iter().position(|pair| pair.snapshot == *snapshot) {
+                Some(index) => Some(old.swap_remove(index)),
+                None => fresh.next(),
+            };
+            self.pairs.extend(pair);
+        }
+        if let Some(registration) = &self.registration {
+            for gone in &mut old {
+                registration.deregister(gone);
             }
         }
+        self.registry = registry;
         self.snapshots = snapshots;
-        self.pairs = pairs;
         self.next_receive_offset = 0;
         Ok(true)
     }
@@ -228,7 +277,13 @@ impl MdnsIo for MdnsSockets {
                     }));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(MdnsError::io("reading an mDNS datagram", error)),
+                Err(error) => {
+                    return Err(MdnsError::std_io(
+                        MdnsIoOperation::Receive,
+                        Some(pair.snapshot.id),
+                        &error,
+                    ));
+                }
             }
         }
         Ok(None)
@@ -269,15 +324,17 @@ impl MdnsIo for MdnsSockets {
 impl PollSource for MdnsSockets {
     fn attach(&mut self, registry: Registry, tokens: TokenSpace, _: Arc<Waker>) -> io::Result<()> {
         let registration = Registration { registry, tokens };
-        for (index, pair) in self.pairs.iter_mut().enumerate() {
-            if let Err(error) = registration.register(index, pair, true) {
-                // All or nothing, so a later attach starts from scratch.
-                for registered in self.pairs.iter_mut().take(index) {
-                    drop(registration.registry.deregister(&mut registered.receive));
-                }
-                return Err(error);
-            }
-        }
+        registration
+            .register_all(&mut self.pairs)
+            .map_err(|error| {
+                // Keep the platform's kind: a host reports it (a refused
+                // registration is not the same failure as running out of room).
+                let kind = match &error {
+                    MdnsError::Io { kind, .. } => (*kind).into(),
+                    _ => io::ErrorKind::Other,
+                };
+                io::Error::new(kind, error)
+            })?;
         self.registration = Some(registration);
         Ok(())
     }
@@ -287,6 +344,7 @@ impl PollSource for MdnsSockets {
 }
 
 impl SocketPair {
+    /// Opens and configures both sockets for `snapshot`'s interface.
     fn new(snapshot: InterfaceSnapshot) -> Result<Self, MdnsError> {
         let receive = mio::net::UdpSocket::from_std(create_receive_socket(&snapshot)?);
         let send = create_send_socket(&snapshot)?;
@@ -303,7 +361,7 @@ fn enumerate_interfaces(
 ) -> Result<BTreeMap<InterfaceKey, Vec<IpNet>>, MdnsError> {
     let mut grouped: BTreeMap<InterfaceKey, Vec<IpNet>> = BTreeMap::new();
     let interfaces = if_addrs::get_if_addrs()
-        .map_err(|error| MdnsError::io("enumerating network interfaces", error))?;
+        .map_err(|error| MdnsError::std_io(MdnsIoOperation::EnumerateInterfaces, None, &error))?;
     for iface in interfaces {
         let Some(index) = iface.index else {
             continue;
@@ -333,92 +391,114 @@ fn enumerate_interfaces(
 }
 
 fn create_receive_socket(snapshot: &InterfaceSnapshot) -> Result<UdpSocket, MdnsError> {
+    use MdnsIoOperation::{Bind, ConfigureSocket, JoinGroup, OpenSocket};
+    let id = snapshot.id;
     let domain = match snapshot.family {
         IpFamily::V4 => Domain::IPV4,
         IpFamily::V6 => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(SocketProtocol::UDP))
-        .map_err(|error| MdnsError::io("opening an mDNS receive socket", error))?;
-    configure_reuse(&socket)?;
+        .map_err(io_error(id, OpenSocket))?;
+    configure_reuse(&socket, id)?;
     if snapshot.family == IpFamily::V6 {
-        setup(socket.set_only_v6(true))?;
+        socket
+            .set_only_v6(true)
+            .map_err(io_error(id, ConfigureSocket))?;
     }
     let bind = match snapshot.family {
         IpFamily::V4 => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT)),
         IpFamily::V6 => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0)),
     };
-    setup(socket.bind(&bind.into()))?;
+    socket.bind(&bind.into()).map_err(io_error(id, Bind))?;
 
     match snapshot.family {
         IpFamily::V4 => {
             let interface = primary_v4(snapshot)?;
             #[cfg(target_os = "linux")]
-            setup(socket.set_multicast_all_v4(false))?;
-            setup(socket.join_multicast_v4(&MDNS_V4_GROUP, &interface))?;
+            socket
+                .set_multicast_all_v4(false)
+                .map_err(io_error(id, ConfigureSocket))?;
+            socket
+                .join_multicast_v4(&MDNS_V4_GROUP, &interface)
+                .map_err(io_error(id, JoinGroup))?;
         }
         IpFamily::V6 => {
             #[cfg(target_os = "linux")]
-            setup(socket.set_multicast_all_v6(false))?;
-            setup(socket.join_multicast_v6(&MDNS_V6_GROUP, snapshot.index))?;
+            socket
+                .set_multicast_all_v6(false)
+                .map_err(io_error(id, ConfigureSocket))?;
+            socket
+                .join_multicast_v6(&MDNS_V6_GROUP, snapshot.index)
+                .map_err(io_error(id, JoinGroup))?;
         }
     }
-    setup(socket.set_nonblocking(true))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(io_error(id, ConfigureSocket))?;
     Ok(socket.into())
 }
 
 fn create_send_socket(snapshot: &InterfaceSnapshot) -> Result<UdpSocket, MdnsError> {
+    use MdnsIoOperation::{Bind, ConfigureSocket, OpenSocket};
+    let id = snapshot.id;
+    let configure = io_error(id, ConfigureSocket);
     let domain = match snapshot.family {
         IpFamily::V4 => Domain::IPV4,
         IpFamily::V6 => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(SocketProtocol::UDP))
-        .map_err(|error| MdnsError::io("opening an mDNS send socket", error))?;
-    configure_reuse(&socket)?;
+        .map_err(io_error(id, OpenSocket))?;
+    configure_reuse(&socket, id)?;
     let bind = match snapshot.family {
         IpFamily::V4 => {
             let interface = primary_v4(snapshot)?;
-            setup(socket.set_multicast_if_v4(&interface))?;
-            setup(socket.set_multicast_loop_v4(true))?;
-            setup(socket.set_multicast_ttl_v4(255))?;
+            socket.set_multicast_if_v4(&interface).map_err(configure)?;
+            socket.set_multicast_loop_v4(true).map_err(configure)?;
+            socket.set_multicast_ttl_v4(255).map_err(configure)?;
             SocketAddr::V4(SocketAddrV4::new(interface, MDNS_PORT))
         }
         IpFamily::V6 => {
-            setup(socket.set_only_v6(true))?;
-            setup(socket.set_multicast_if_v6(snapshot.index))?;
-            setup(socket.set_multicast_loop_v6(true))?;
-            setup(socket.set_multicast_hops_v6(255))?;
+            socket.set_only_v6(true).map_err(configure)?;
+            socket
+                .set_multicast_if_v6(snapshot.index)
+                .map_err(configure)?;
+            socket.set_multicast_loop_v6(true).map_err(configure)?;
+            socket.set_multicast_hops_v6(255).map_err(configure)?;
             let interface = primary_v6(snapshot)?;
             SocketAddr::V6(SocketAddrV6::new(interface, MDNS_PORT, 0, snapshot.index))
         }
     };
-    setup(socket.bind(&bind.into()))?;
-    setup(socket.set_nonblocking(true))?;
+    socket.bind(&bind.into()).map_err(io_error(id, Bind))?;
+    socket.set_nonblocking(true).map_err(configure)?;
     Ok(socket.into())
 }
 
-/// Names what every socket option failure has in common: the socket could not
-/// be set up for multicast, and mDNS cannot run on it.
 /// What a failed send means.
 ///
 /// These sockets are non-blocking, so a full kernel send buffer reports itself
 /// rather than waiting. That is backpressure and not a broken socket: the
 /// driver parks the datagram and comes back for it once the buffer has
-/// drained. Calling it an I/O failure would end mDNS for good over a moment of
-/// it -- which is the same distinction an embedded stack draws when its
-/// transmit ring fills.
+/// drained. Calling it an I/O failure would put mDNS into its failure state
+/// over a moment of it -- which is the same distinction an embedded stack
+/// draws when its transmit ring fills.
 fn send_error(interface: InterfaceId, error: io::Error) -> MdnsError {
     if error.kind() == io::ErrorKind::WouldBlock {
         return MdnsError::Congested { interface };
     }
-    MdnsError::io("sending an mDNS datagram", error)
+    MdnsError::std_io(MdnsIoOperation::Send, Some(interface), &error)
 }
 
-fn setup<T>(result: io::Result<T>) -> Result<T, MdnsError> {
-    result.map_err(|error| MdnsError::io("configuring an mDNS socket", error))
+/// Maps a failed socket call for `interface` to an [`MdnsError::Io`].
+fn io_error(
+    interface: InterfaceId,
+    operation: MdnsIoOperation,
+) -> impl Fn(io::Error) -> MdnsError + Copy {
+    move |error| MdnsError::std_io(operation, Some(interface), &error)
 }
 
-fn configure_reuse(socket: &Socket) -> Result<(), MdnsError> {
-    setup(socket.set_reuse_address(true))?;
+fn configure_reuse(socket: &Socket, interface: InterfaceId) -> Result<(), MdnsError> {
+    let configure = io_error(interface, MdnsIoOperation::ConfigureSocket);
+    socket.set_reuse_address(true).map_err(configure)?;
     #[cfg(all(
         unix,
         not(any(
@@ -429,7 +509,7 @@ fn configure_reuse(socket: &Socket) -> Result<(), MdnsError> {
             target_os = "wasi"
         ))
     ))]
-    setup(socket.set_reuse_port(true))?;
+    socket.set_reuse_port(true).map_err(configure)?;
     Ok(())
 }
 
@@ -564,11 +644,114 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_that_cannot_build_a_socket_keeps_the_ones_it_had() {
+        let (kept, addr) = loopback_pair(1);
+        let snapshot = kept.snapshot.clone();
+        let mut sockets = MdnsSockets::from_pairs(vec![kept]);
+        let mut poll = minip2p_transport::SharedPoll::new().expect("poll");
+        poll.attach_host_source(&mut sockets).expect("attach");
+
+        // Interface 1 went away and interface 2 arrived, but 2's socket
+        // cannot be built. Swapping half-way would leave mDNS on nothing.
+        let mut arrived = snapshot.clone();
+        arrived.id = InterfaceId::new(2);
+        let error = sockets
+            .replace(InterfaceRegistry::default(), vec![arrived], |snapshot| {
+                Err(MdnsError::io(
+                    MdnsIoOperation::Bind,
+                    IoErrorKind::AddrInUse,
+                    Some(snapshot.id),
+                    "scripted",
+                ))
+            })
+            .expect_err("the build failed");
+        assert!(matches!(error, MdnsError::Io { .. }), "{error:?}");
+        assert_eq!(sockets.interfaces(), [snapshot], "the snapshots stand");
+
+        // And so does the socket, still registered for readiness.
+        UdpSocket::bind("127.0.0.1:0")
+            .expect("sender")
+            .send_to(b"query", addr)
+            .expect("send");
+        let mut transport = MdnsSockets::from_pairs(Vec::new());
+        poll.harvest(&mut transport, std::time::Duration::from_secs(5))
+            .expect("harvest");
+        assert!(poll.take_wake(), "the kept socket still wakes the host");
+        assert_eq!(next_interface(&mut sockets), InterfaceId::new(1));
+    }
+
+    #[test]
+    fn a_refresh_whose_later_registration_fails_keeps_what_it_had() {
+        let (kept, kept_addr) = loopback_pair(0);
+        let kept_snapshot = kept.snapshot.clone();
+        let mut sockets = MdnsSockets::from_pairs(vec![kept]);
+        let mut poll = mio::Poll::new().expect("poll");
+        // One bit of tokens: interfaces 0 and 1 fit, interface 2 does not.
+        let tokens = TokenSpace::full()
+            .subspace(usize::BITS - 1, 0)
+            .expect("a one-bit space");
+        let registration = Registration {
+            registry: poll.registry().try_clone().expect("registry"),
+            tokens,
+        };
+        registration
+            .register_all(&mut sockets.pairs)
+            .expect("the kept socket registers");
+        sockets.registration = Some(registration);
+
+        // Interface 1's socket registers, then interface 2's cannot, so the
+        // refresh has to undo the first before giving up.
+        let (first, _) = loopback_pair(1);
+        let (second, _) = loopback_pair(2);
+        let arrived = vec![first.snapshot.clone(), second.snapshot.clone()];
+        let mut built = vec![first, second].into_iter();
+        let error = sockets
+            .replace(InterfaceRegistry::default(), arrived, |_| {
+                Ok(built.next().expect("one socket per snapshot"))
+            })
+            .expect_err("interface 2 has no token");
+        assert!(
+            matches!(
+                error,
+                MdnsError::Io {
+                    operation: MdnsIoOperation::Register,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(sockets.interfaces(), core::slice::from_ref(&kept_snapshot));
+
+        // The kept socket still wakes the host.
+        UdpSocket::bind("127.0.0.1:0")
+            .expect("sender")
+            .send_to(b"query", kept_addr)
+            .expect("send");
+        let mut events = mio::Events::with_capacity(4);
+        poll.poll(&mut events, Some(std::time::Duration::from_secs(5)))
+            .expect("poll");
+        assert!(!events.is_empty(), "the kept socket woke the poll");
+
+        // And a retry that fits commits.
+        let (retry, _) = loopback_pair(1);
+        let arrived = vec![kept_snapshot, retry.snapshot.clone()];
+        let mut built = Some(retry);
+        assert!(
+            sockets
+                .replace(InterfaceRegistry::default(), arrived.clone(), |_| {
+                    Ok(built.take().expect("only interface 1 is new"))
+                })
+                .expect("the retry fits")
+        );
+        assert_eq!(sockets.interfaces(), arrived);
+    }
+
+    #[test]
     fn a_full_send_buffer_is_backpressure_and_not_a_broken_socket() {
         // Kernel send-buffer pressure is not something a test can conjure on
         // demand, so the decision is checked where it is made. What it costs
-        // to get wrong is not small: the driver ends mDNS on an I/O failure,
-        // so one busy moment would take the host off the link for good.
+        // to get wrong is not small: the driver backs off on an I/O failure,
+        // so every busy moment would take the host off the link for a while.
         assert_eq!(
             send_error(
                 InterfaceId::new(1),

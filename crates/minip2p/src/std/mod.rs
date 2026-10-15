@@ -35,6 +35,7 @@
 //! endpoints advertise inbound HOP and open outbound STOP; NAT-only endpoints
 //! install the trusted client roles, and combined endpoints compose both.
 
+mod bind_error;
 mod dial;
 #[cfg(all(test, feature = "nat", feature = "quic"))]
 mod nat_tests;
@@ -42,6 +43,7 @@ mod nat_tests;
 pub(crate) mod relay_server;
 mod writer;
 
+pub use bind_error::{BindError, EndpointOptionsError, IpFamily};
 pub use writer::{StreamWriteError, StreamWriter, WriteAccepted, WriteProgress};
 
 use std::time::Duration;
@@ -64,7 +66,7 @@ use crate::pubsub::GossipsubDriver;
 #[cfg(any(feature = "discovery", feature = "mdns"))]
 use crate::{DiscoveryConfigError, KnownPeer, PeerDiscoveryConfig};
 #[cfg(feature = "mdns")]
-use crate::{MdnsConfig, MdnsConfigError};
+use crate::{MdnsConfig, MdnsConfigError, MdnsError};
 #[cfg(feature = "nat")]
 use crate::{NatConfig, Path, ReachabilityState, ReservationInfo};
 use minip2p_core::Multiaddr;
@@ -77,13 +79,13 @@ pub use minip2p_identify::IdentifyMessage;
 pub use minip2p_identity::Ed25519Keypair;
 use minip2p_platform::{Clock, Now, StdClock, StdEntropy};
 #[cfg(feature = "quic")]
-pub use minip2p_quic::QuicLimits;
+pub use minip2p_quic::{QuicBindError, QuicLimits};
 #[cfg(feature = "quic")]
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 #[cfg(feature = "relay-server")]
 pub use minip2p_relay_server::{
     CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
-    RelayServerAddressError, RelayServerAddressErrorKind, RelayServerConfig,
+    RelayServerAddrSource, RelayServerAddressError, RelayServerAddressErrorKind, RelayServerConfig,
     RelayServerConfigError, RelayServerConfigErrorKind, RelayServerEvent, RelayServerRuntimeError,
     RelayServerRuntimeErrorKind, ReservationCloseReason, Status,
 };
@@ -251,7 +253,9 @@ type StdEngine = Engine<EndpointTransport, StdEntropy, StdCarrier>;
 pub struct CloseReport {
     /// Events queued before the close and those its drain produced.
     pub events: Vec<EndpointEvent>,
-    /// Every failure: the mDNS goodbye, each disconnect, and a failed drain.
+    /// Every transport or swarm failure: each disconnect, and a failed
+    /// drain. An mDNS goodbye that could not be sent is an
+    /// [`EndpointEvent::MdnsFailed`] in `events` instead.
     pub errors: Vec<Error>,
 }
 
@@ -861,12 +865,7 @@ impl Endpoint {
         self.poll
             .harvest(self.engine.core.transport_mut(), timeout)
             .map(drop)
-            .map_err(|error| {
-                TransportError::PollError {
-                    reason: format!("waiting for readiness: {error}"),
-                }
-                .into()
-            })
+            .map_err(|error| TransportError::io("waiting for readiness", &error).into())
     }
 
     /// Starts lookups for NAT dials to named hosts, expires due attempts,
@@ -1055,11 +1054,13 @@ impl Endpoint {
     ///
     /// mDNS becomes permanently inactive, while QUIC and the rest of the
     /// endpoint remain usable. Every interface send and every cancellation is
-    /// attempted; the first mDNS socket error is returned afterwards.
+    /// attempted; the first goodbye that could not be sent is returned
+    /// afterwards, and is also queued as a final
+    /// [`EndpointEvent::MdnsFailed`]. Idempotent: a second call does nothing.
     ///
     /// This does not close QUIC/TCP peers; use [`close`](Self::close) or drop.
     #[cfg(feature = "mdns")]
-    pub fn shutdown(&mut self) -> Result<(), Error> {
+    pub fn shutdown(&mut self) -> Result<(), MdnsError> {
         let now = self.now();
         self.engine.shutdown_mdns(now)
     }
@@ -1075,14 +1076,15 @@ impl Endpoint {
     ///
     /// Close never stops at the first failure: the [`CloseReport`] carries
     /// every event collected, starting with those already queued, and every
-    /// error hit. A failed drain ends the drain early.
+    /// transport or swarm error hit. A failed drain ends the drain early.
+    /// mDNS goodbyes are best effort: one that could not be sent is an
+    /// [`EndpointEvent::MdnsFailed`] in the report's events, not an error.
     pub fn close(mut self) -> CloseReport {
         let mut report = CloseReport::default();
         report.events.extend(self.engine.events.drain(..));
+        // The failure is queued as an event too, and drained below.
         #[cfg(feature = "mdns")]
-        if let Err(error) = self.shutdown() {
-            report.errors.push(error);
-        }
+        drop(self.shutdown());
         let drain_by = std::time::Instant::now() + Duration::from_millis(500);
         loop {
             report.errors.extend(self.disconnect_established());
@@ -1330,11 +1332,13 @@ impl EndpointBuilder {
     /// Named `listen_on` to avoid colliding with [`Endpoint::listen`], which
     /// returns the first bound address after bind.
     #[cfg(any(feature = "quic", feature = "tcp"))]
-    pub fn listen_on(mut self, address: impl AsRef<str>) -> Result<Self, Error> {
+    pub fn listen_on(mut self, address: impl AsRef<str>) -> Result<Self, EndpointOptionsError> {
         let raw = address.as_ref();
-        let parsed = Multiaddr::from_str(raw).map_err(|error| TransportError::InvalidAddress {
-            context: "listen address",
-            reason: format!("`{raw}` is not a multiaddr: {error}"),
+        let parsed = Multiaddr::from_str(raw).map_err(|error| {
+            EndpointOptionsError::InvalidListenAddress {
+                addr: raw.to_string(),
+                error,
+            }
         })?;
         self.push_listen_addr(parsed)?;
         Ok(self)
@@ -1342,7 +1346,10 @@ impl EndpointBuilder {
 
     /// Adds a listener from an already-parsed transport multiaddress.
     #[cfg(any(feature = "quic", feature = "tcp"))]
-    pub fn listen_on_multiaddr(mut self, address: &Multiaddr) -> Result<Self, Error> {
+    pub fn listen_on_multiaddr(
+        mut self,
+        address: &Multiaddr,
+    ) -> Result<Self, EndpointOptionsError> {
         self.push_listen_addr(address.clone())?;
         Ok(self)
     }
@@ -1350,10 +1357,11 @@ impl EndpointBuilder {
     /// Configures the common dual-stack QUIC defaults
     /// (`/ip4/0.0.0.0/udp/0/quic-v1` and `/ip6/::/udp/0/quic-v1`).
     ///
-    /// Returns [`Error`] if the builder already has a QUIC listen for either
-    /// family (same duplicate-family rule as [`Self::listen_on`]).
+    /// Returns [`EndpointOptionsError::DuplicateQuicFamily`] if the builder
+    /// already has a QUIC listen for either family (same rule as
+    /// [`Self::listen_on`]).
     #[cfg(feature = "quic")]
-    pub fn listen_default(mut self) -> Result<Self, Error> {
+    pub fn listen_default(mut self) -> Result<Self, EndpointOptionsError> {
         for address in default_listen_quic_addrs() {
             self.push_listen_addr(address)?;
         }
@@ -1361,7 +1369,7 @@ impl EndpointBuilder {
     }
 
     #[cfg(any(feature = "quic", feature = "tcp"))]
-    fn push_listen_addr(&mut self, address: Multiaddr) -> Result<(), Error> {
+    fn push_listen_addr(&mut self, address: Multiaddr) -> Result<(), EndpointOptionsError> {
         validate_listen_multiaddr(&address)?;
         #[cfg(feature = "quic")]
         if address.is_quic_transport() {
@@ -1584,12 +1592,24 @@ impl EndpointBuilder {
     /// Every transport starts accepting at once, QUIC and TCP alike, so the
     /// returned endpoint is reachable on each listen address without a
     /// further call. [`Endpoint::listen_all`] reports those addresses.
-    pub fn bind(mut self) -> Result<Endpoint, Error> {
+    ///
+    /// Every failure is a [`BindError`] naming what failed, before any event
+    /// is polled; see its variants.
+    pub fn bind(mut self) -> Result<Endpoint, BindError> {
         self.validate()?;
         let keypair = self.keypair.take().unwrap_or_else(Ed25519Keypair::generate);
         let transport = bind_transports(&self, &keypair)?;
         let mut endpoint = build_endpoint(self, keypair, transport)?;
-        endpoint.listen_all()?;
+        endpoint
+            .engine
+            .core
+            .listen_on_bound_addrs()
+            .map_err(|error| match error {
+                Error::Transport(error) => BindError::Listen(error),
+                _ => BindError::Invariant {
+                    reason: "listening on bound addresses failed outside the transport",
+                },
+            })?;
         Ok(endpoint)
     }
 
@@ -1598,7 +1618,7 @@ impl EndpointBuilder {
     /// Reserved protocol ids are rejected here -- before any socket is
     /// bound -- so a configuration error can neither allocate resources
     /// nor be masked by a bind failure.
-    fn validate(&self) -> Result<(), Error> {
+    fn validate(&self) -> Result<(), BindError> {
         if let Some(protocol) = self
             .protocols
             .iter()
@@ -1611,18 +1631,11 @@ impl EndpointBuilder {
         }
         #[cfg(feature = "pubsub")]
         if let Some(config) = &self.gossipsub_config {
-            config
-                .validate()
-                .map_err(|error| TransportError::InvalidConfig {
-                    reason: error.to_string(),
-                })?;
+            config.validate().map_err(BindError::Gossipsub)?;
         }
         #[cfg(feature = "relay-server")]
         if self.relay_server_config.is_none() && !self.relay_server_announce_addrs.is_empty() {
-            return Err(TransportError::InvalidConfig {
-                reason: "relay-server announce addresses were configured, but the relay server is not enabled; call EndpointBuilder::relay_server or relay_server_config".into(),
-            }
-            .into());
+            return Err(EndpointOptionsError::RelayAnnounceWithoutServer.into());
         }
         Ok(())
     }
@@ -1654,19 +1667,19 @@ impl EndpointBuilder {
 }
 
 #[cfg(any(feature = "quic", feature = "tcp"))]
-fn validate_listen_multiaddr(address: &Multiaddr) -> Result<(), Error> {
+fn validate_listen_multiaddr(address: &Multiaddr) -> Result<(), EndpointOptionsError> {
+    let unsupported = |expected| EndpointOptionsError::UnsupportedListenShape {
+        addr: address.clone(),
+        expected,
+    };
     if address
         .protocols()
         .iter()
         .any(|protocol| matches!(protocol, Protocol::P2p(_) | Protocol::P2pCircuit))
     {
-        return Err(TransportError::InvalidAddress {
-            context: "listen address",
-            reason: format!(
-                "`{address}` is not a listen address; omit /p2p and /p2p-circuit (those belong on dial targets)"
-            ),
-        }
-        .into());
+        return Err(unsupported(
+            "a transport address without /p2p or /p2p-circuit (those belong on dial targets)",
+        ));
     }
 
     let ip_host = matches!(
@@ -1674,11 +1687,9 @@ fn validate_listen_multiaddr(address: &Multiaddr) -> Result<(), Error> {
         Some(Protocol::Ip4(_)) | Some(Protocol::Ip6(_))
     );
     if !ip_host {
-        return Err(TransportError::InvalidAddress {
-            context: "listen address",
-            reason: format!("`{address}` must use /ip4 or /ip6; DNS names are dial-only"),
-        }
-        .into());
+        return Err(unsupported(
+            "an /ip4 or /ip6 host (DNS names are dial-only)",
+        ));
     }
 
     #[cfg(feature = "quic")]
@@ -1691,29 +1702,28 @@ fn validate_listen_multiaddr(address: &Multiaddr) -> Result<(), Error> {
     }
 
     #[cfg(all(feature = "quic", feature = "tcp"))]
-    let hint = "expected `/ip4|ip6/udp/<port>/quic-v1` or `/ip4|ip6/tcp/<port>`";
+    let expected = "`/ip4|ip6/udp/<port>/quic-v1` or `/ip4|ip6/tcp/<port>`";
     #[cfg(all(feature = "quic", not(feature = "tcp")))]
-    let hint = "expected `/ip4|ip6/udp/<port>/quic-v1`";
+    let expected = "`/ip4|ip6/udp/<port>/quic-v1`";
     #[cfg(all(feature = "tcp", not(feature = "quic")))]
-    let hint = "expected `/ip4|ip6/tcp/<port>`";
-    Err(TransportError::InvalidAddress {
-        context: "listen address",
-        reason: format!("`{address}` is not a supported listen shape ({hint})"),
-    }
-    .into())
+    let expected = "`/ip4|ip6/tcp/<port>`";
+    Err(unsupported(expected))
 }
 
 #[cfg(feature = "quic")]
-fn listen_ip_family(address: &Multiaddr) -> Option<&'static str> {
+fn listen_ip_family(address: &Multiaddr) -> Option<IpFamily> {
     match address.protocols().first() {
-        Some(Protocol::Ip4(_)) => Some("IPv4"),
-        Some(Protocol::Ip6(_)) => Some("IPv6"),
+        Some(Protocol::Ip4(_)) => Some(IpFamily::Ipv4),
+        Some(Protocol::Ip6(_)) => Some(IpFamily::Ipv6),
         _ => None,
     }
 }
 
 #[cfg(feature = "quic")]
-fn reject_duplicate_quic_family(existing: &[Multiaddr], next: &Multiaddr) -> Result<(), Error> {
+fn reject_duplicate_quic_family(
+    existing: &[Multiaddr],
+    next: &Multiaddr,
+) -> Result<(), EndpointOptionsError> {
     let Some(family) = listen_ip_family(next) else {
         return Ok(());
     };
@@ -1722,12 +1732,10 @@ fn reject_duplicate_quic_family(existing: &[Multiaddr], next: &Multiaddr) -> Res
         .filter(|address| address.is_quic_transport())
         .any(|address| listen_ip_family(address) == Some(family))
     {
-        return Err(TransportError::InvalidConfig {
-            reason: format!(
-                "QUIC listen addresses may contain at most one address per IP family; `{next}` repeats {family}"
-            ),
-        }
-        .into());
+        return Err(EndpointOptionsError::DuplicateQuicFamily {
+            addr: next.clone(),
+            family,
+        });
     }
     Ok(())
 }
@@ -1749,7 +1757,7 @@ fn reject_duplicate_quic_family(existing: &[Multiaddr], next: &Multiaddr) -> Res
 fn bind_transports(
     options: &EndpointBuilder,
     keypair: &Ed25519Keypair,
-) -> Result<TransportSet, Error> {
+) -> Result<TransportSet, BindError> {
     let mut set = TransportSet::new();
 
     #[cfg(any(feature = "quic", feature = "tcp"))]
@@ -1782,7 +1790,7 @@ fn bind_transports(
                 // is what the transport binds: one socket per family.
                 let addresses: Vec<Multiaddr> =
                     quic_addrs.iter().map(|&address| address.clone()).collect();
-                let transport = QuicTransport::bind(config, &addresses)?;
+                let transport = QuicTransport::bind(config, &addresses).map_err(BindError::Quic)?;
                 let namespaces = transport.namespaces();
                 insert_member(&mut set, TransportKind::Quic, namespaces, transport)?;
             }
@@ -1796,10 +1804,7 @@ fn bind_transports(
     }
 
     if set.is_empty() {
-        return Err(TransportError::InvalidConfig {
-            reason: "an endpoint needs at least one transport to bind; add a listen address with EndpointBuilder::listen_on or listen_default".into(),
-        }
-        .into());
+        return Err(EndpointOptionsError::NoTransport.into());
     }
     Ok(set)
 }
@@ -1810,27 +1815,18 @@ fn bind_tcp_member(
     options: &EndpointBuilder,
     keypair: &Ed25519Keypair,
     tcp_addrs: &[&Multiaddr],
-) -> Result<TcpTransport<StdTcpProvider, StdEntropy>, Error> {
+) -> Result<TcpTransport<StdTcpProvider, StdEntropy>, BindError> {
     // Checked before a socket exists: the namespace is what routes a connection
     // id back to the transport that minted it, so a TCP transport tagged as
     // something else hands out ids that name the wrong carrier -- and would
     // take a claim a QUIC member needs.
     let namespace = options.tcp_config.namespace;
     if namespace != ConnectionNamespace::TCP_IPV4 && namespace != ConnectionNamespace::TCP_IPV6 {
-        return Err(TransportError::InvalidConfig {
-            reason: format!(
-                "a tcp transport must allocate in a tcp namespace, not {namespace}; \
-                 see TcpConfig::namespace"
-            ),
-        }
-        .into());
+        return Err(EndpointOptionsError::TcpNamespace { namespace }.into());
     }
 
-    let provider = StdTcpProvider::new().map_err(|error| TransportError::ListenFailed {
-        reason: error.to_string(),
-    })?;
     let mut transport = TcpTransport::with_config(
-        provider,
+        StdTcpProvider::new(),
         keypair.clone(),
         StdEntropy::new(),
         options.tcp_config.clone(),
@@ -1839,7 +1835,7 @@ fn bind_tcp_member(
         // Bound here, like a QUIC socket is: `Endpoint::listen` then listens
         // on what is already bound, and a caller that asked for port 0 learns
         // which port it got before the first event.
-        transport.listen(addr)?;
+        transport.listen(addr).map_err(BindError::Listen)?;
     }
     Ok(transport)
 }
@@ -1850,13 +1846,11 @@ fn insert_member<T: minip2p_transport::BlockingTransport + Send + 'static>(
     kind: TransportKind,
     namespaces: impl IntoIterator<Item = ConnectionNamespace>,
     transport: T,
-) -> Result<(), Error> {
+) -> Result<(), BindError> {
     set.insert(kind, namespaces, Box::new(transport))
         .map_err(|rejected| {
-            TransportError::InvalidConfig {
-                reason: rejected.error().to_string(),
-            }
-            .into()
+            let (error, _transport) = rejected.into_parts();
+            EndpointOptionsError::TransportConflict(error).into()
         })
 }
 
@@ -1864,7 +1858,7 @@ pub(crate) fn build_endpoint(
     options: EndpointBuilder,
     keypair: Ed25519Keypair,
     transport: TransportSet,
-) -> Result<Endpoint, Error> {
+) -> Result<Endpoint, BindError> {
     #[cfg(feature = "nat")]
     let mut options = options;
     #[cfg(feature = "nat")]
@@ -1914,13 +1908,10 @@ pub(crate) fn build_endpoint(
     let mut transport = minip2p_circuit::CircuitTransport::new_os(transport, keypair.clone());
     #[cfg(not(feature = "nat"))]
     let mut transport = transport;
-    let mut poll = SharedPoll::new().map_err(|error| TransportError::PollError {
-        reason: format!("opening the readiness poll: {error}"),
-    })?;
+    let mut poll = SharedPoll::new()
+        .map_err(|error| BindError::readiness_poll("opening the readiness poll", &error))?;
     poll.attach(&mut transport)
-        .map_err(|error| TransportError::PollError {
-            reason: format!("attaching the transport: {error}"),
-        })?;
+        .map_err(|error| BindError::readiness_poll("attaching the transport", &error))?;
     let resolver = dial::Resolver::new(poll.wake_handle());
     let core = builder.build_core(transport, StdEntropy::new())?;
     #[cfg_attr(
@@ -1943,20 +1934,20 @@ pub(crate) fn build_endpoint(
         core.add_inbound_protocol(RELAY_HOP_PROTOCOL_ID)?;
         core.add_advertised_protocol(RELAY_HOP_PROTOCOL_ID)?;
         core.add_outbound_protocol(RELAY_STOP_PROTOCOL_ID)?;
-        let invalid = |error: &dyn core::fmt::Display| TransportError::InvalidConfig {
-            reason: error.to_string(),
-        };
         let mut agent =
             minip2p_relay_server::RelayServerAgent::new(core.local_peer_id().clone(), config)
-                .map_err(|error| invalid(&error))?;
+                .map_err(BindError::RelayServer)?;
         agent
             .replace_announce_addrs(options.relay_server_announce_addrs)
-            .map_err(|error| invalid(&error))?;
-        agent
-            .set_listener_addrs(relay_server::concrete_relay_listener_addrs(
+            .map_err(|error| BindError::RelayServerAnnounce(Box::new(error)))?;
+        // Derived from the bound transports, not configured: a rejection is
+        // queued as `AddrsRejected` and drained with the first batch, like
+        // any later listener refresh.
+        drop(
+            agent.set_listener_addrs(relay_server::concrete_relay_listener_addrs(
                 core.transport().local_addresses(),
-            ))
-            .map_err(|error| invalid(&error))?;
+            )),
+        );
         engine.relay_server = Some(relay_server::RelayServerDriver::new(agent));
     }
     #[cfg(feature = "nat")]
@@ -2003,9 +1994,7 @@ pub(crate) fn build_endpoint(
             initial_seqno,
             entropy_seed,
         )
-        .map_err(|error| TransportError::InvalidConfig {
-            reason: error.to_string(),
-        })?;
+        .map_err(BindError::Gossipsub)?;
         engine.gossipsub = Some(GossipsubDriver::new(agent));
     }
     #[cfg(feature = "discovery")]
@@ -2019,13 +2008,13 @@ pub(crate) fn build_endpoint(
                 pubsub
                     .agent
                     .subscribe(&config.topic, 0)
-                    .map_err(|_| Error::Invariant {
+                    .map_err(|_| BindError::Invariant {
                         reason: "validated discovery topic was rejected by pubsub",
                     })?;
             }
             Some(
                 minip2p_discovery::BeaconAgent::new(keypair.public_key(), config).map_err(
-                    |_| Error::Invariant {
+                    |_| BindError::Invariant {
                         reason: "validated beacon configuration was rejected",
                     },
                 )?,
@@ -2041,20 +2030,12 @@ pub(crate) fn build_endpoint(
     if let Some(config) = options.mdns_config {
         let agent =
             minip2p_mdns::MdnsAgent::new(keypair.peer_id(), config.clone(), mdns_seed(&keypair))
-                .map_err(|error| TransportError::InvalidConfig {
-                    reason: error.to_string(),
-                })?;
-        let mut sockets = minip2p_mdns::MdnsSockets::new(&config).map_err(|error| {
-            TransportError::ListenFailed {
-                reason: error.to_string(),
-            }
-        })?;
+                .map_err(BindError::Mdns)?;
+        let mut sockets = minip2p_mdns::MdnsSockets::new(&config).map_err(BindError::MdnsSocket)?;
         // The sockets only wake the endpoint's wait; the next batch's mDNS
         // tick reads them, and a refresh re-registers what it rebuilds.
         poll.attach_host_source(&mut sockets)
-            .map_err(|error| TransportError::PollError {
-                reason: format!("attaching the mDNS sockets: {error}"),
-            })?;
+            .map_err(|error| BindError::readiness_poll("attaching the mDNS sockets", &error))?;
         // OS sockets are not the transport's: no second transport poll.
         engine.set_mdns(
             minip2p_mdns::MdnsDriver::new(agent, sockets, &config),
@@ -2080,7 +2061,7 @@ pub(crate) fn build_endpoint(
                 keypair.peer_id(),
                 options.peer_discovery_config,
             )
-            .map_err(|_| Error::Invariant {
+            .map_err(|_| BindError::Invariant {
                 reason: "validated discovery configuration was rejected",
             })?;
             engine.discovery = Some(DiscoveryDriver::new(
@@ -2848,8 +2829,8 @@ mod tests {
         assert!(
             matches!(
                 &dns,
-                Error::Transport(TransportError::InvalidAddress { reason, .. })
-                    if reason.contains("DNS")
+                EndpointOptionsError::UnsupportedListenShape { expected, .. }
+                    if expected.contains("DNS")
             ),
             "{dns}"
         );
@@ -2862,8 +2843,8 @@ mod tests {
         assert!(
             matches!(
                 &circuit,
-                Error::Transport(TransportError::InvalidAddress { reason, .. })
-                    if reason.contains("p2p-circuit") || reason.contains("listen address")
+                EndpointOptionsError::UnsupportedListenShape { expected, .. }
+                    if expected.contains("p2p-circuit")
             ),
             "{circuit}"
         );
@@ -2878,8 +2859,10 @@ mod tests {
         assert!(
             matches!(
                 &duplicate,
-                Error::Transport(TransportError::InvalidConfig { reason })
-                    if reason.contains("IPv4")
+                EndpointOptionsError::DuplicateQuicFamily {
+                    family: IpFamily::Ipv4,
+                    ..
+                }
             ),
             "{duplicate}"
         );
@@ -2924,13 +2907,15 @@ mod tests {
             .expect("listen ipv4")
             .listen_default()
         else {
-            panic!("listen_default after IPv4 QUIC must return InvalidConfig");
+            panic!("listen_default after IPv4 QUIC must fail");
         };
         assert!(
             matches!(
                 &error,
-                Error::Transport(TransportError::InvalidConfig { reason })
-                    if reason.contains("IPv4")
+                EndpointOptionsError::DuplicateQuicFamily {
+                    family: IpFamily::Ipv4,
+                    ..
+                }
             ),
             "{error}"
         );
@@ -3171,7 +3156,12 @@ mod tests {
             panic!("a tcp transport must not claim another transport's ids");
         };
         assert!(
-            format!("{error}").contains("must allocate in a tcp namespace"),
+            matches!(
+                error,
+                BindError::Options(EndpointOptionsError::TcpNamespace {
+                    namespace: ConnectionNamespace::QUIC_IPV4
+                })
+            ),
             "got {error}"
         );
     }
@@ -4036,6 +4026,78 @@ mod tests {
         ));
     }
 
+    /// Every bind failure names what failed and carries its typed cause.
+    #[test]
+    fn bind_errors_name_what_failed() {
+        let quic = || {
+            Endpoint::builder()
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+                .expect("quic listen address")
+        };
+        let limits = QuicLimits {
+            idle_timeout_ms: 0,
+            ..QuicLimits::default()
+        };
+        assert!(matches!(
+            quic().quic_limits(limits).bind().err(),
+            Some(BindError::Quic(minip2p_quic::QuicBindError::InvalidLimit {
+                field: "idle_timeout_ms",
+                ..
+            }))
+        ));
+        assert!(matches!(
+            Endpoint::builder().bind().err(),
+            Some(BindError::Options(EndpointOptionsError::NoTransport))
+        ));
+        #[cfg(feature = "pubsub")]
+        assert!(matches!(
+            quic()
+                .gossipsub_config(crate::GossipsubConfig {
+                    heartbeat_interval_ms: 0,
+                    ..crate::GossipsubConfig::default()
+                })
+                .bind()
+                .err(),
+            Some(BindError::Gossipsub(crate::GossipsubConfigError {
+                field: "heartbeat_interval_ms",
+                ..
+            }))
+        ));
+        #[cfg(feature = "relay-server")]
+        {
+            let announce: Multiaddr = format!(
+                "/ip4/198.51.100.7/udp/4001/quic-v1/p2p/{}",
+                Ed25519Keypair::generate().peer_id()
+            )
+            .parse()
+            .expect("announce address");
+            assert!(matches!(
+                quic()
+                    .relay_server_announce_addrs(vec![announce.clone()])
+                    .expect("valid for the peer it names")
+                    .bind()
+                    .err(),
+                Some(BindError::Options(
+                    EndpointOptionsError::RelayAnnounceWithoutServer
+                ))
+            ));
+            // Valid for the peer it names, but this endpoint is another one.
+            let Some(BindError::RelayServerAnnounce(error)) = quic()
+                .relay_server()
+                .relay_server_announce_addrs(vec![announce])
+                .expect("valid for the peer it names")
+                .bind()
+                .err()
+            else {
+                panic!("a foreign announce address must fail the bind");
+            };
+            assert!(matches!(
+                error.reason,
+                minip2p_relay_server::RelayServerAddressErrorKind::ConflictingPeerId { .. }
+            ));
+        }
+    }
+
     #[test]
     fn builder_rejects_reserved_protocol_ids() {
         for reserved in RESERVED_PROTOCOL_IDS {
@@ -4048,7 +4110,7 @@ mod tests {
                 .expect("reserved ids must fail the build");
             assert!(matches!(
                 error,
-                Error::Swarm(SwarmError::ReservedProtocol { .. })
+                BindError::Swarm(SwarmError::ReservedProtocol { .. })
             ));
         }
     }
@@ -4067,7 +4129,7 @@ mod tests {
             .expect("reserved ids must fail the build");
         assert!(matches!(
             error,
-            Error::Swarm(SwarmError::ReservedProtocol { .. })
+            BindError::Swarm(SwarmError::ReservedProtocol { .. })
         ));
     }
 

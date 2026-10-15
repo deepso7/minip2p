@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
 use minip2p_core::Multiaddr;
-use minip2p_platform::{EntropyError, EntropySource, Now};
-use minip2p_tcp::{SocketHandle, TcpError, TcpEvent, TcpProvider};
+use minip2p_platform::{EntropyError, EntropySource, IoErrorKind, Now};
+use minip2p_tcp::{SocketHandle, TcpError, TcpEvent, TcpIoOperation, TcpProvider};
 
 /// Deterministic entropy, so a failing test reproduces exactly.
 pub struct CountingEntropy(pub u8);
@@ -296,8 +296,9 @@ impl TcpProvider for VirtualProvider {
         let key = bound.to_string();
         if net.listeners.contains_key(&key) {
             return Err(TcpError::Io {
-                operation: "listen",
-                reason: format!("{key} is already bound"),
+                operation: TcpIoOperation::BindListener,
+                kind: IoErrorKind::AddrInUse,
+                detail: format!("{key} is already bound"),
             });
         }
         net.listeners.insert(key, self.node);
@@ -313,8 +314,9 @@ impl TcpProvider for VirtualProvider {
             .unwrap_or(false)
         {
             return Err(TcpError::Io {
-                operation: "connect",
-                reason: "injected connect failure".to_string(),
+                operation: TcpIoOperation::Connect,
+                kind: IoErrorKind::ConnectionRefused,
+                detail: "injected connect failure".to_string(),
             });
         }
         let client = net.next_handle;
@@ -385,14 +387,16 @@ impl TcpProvider for VirtualProvider {
         };
         if local.gone || peer.gone {
             return Err(TcpError::Io {
-                operation: "send",
-                reason: "stream is gone".to_string(),
+                operation: TcpIoOperation::Write,
+                kind: IoErrorKind::BrokenPipe,
+                detail: "stream is gone".to_string(),
             });
         }
         if local.write_closed {
             return Err(TcpError::Io {
-                operation: "send",
-                reason: "write side is closed".to_string(),
+                operation: TcpIoOperation::Write,
+                kind: IoErrorKind::BrokenPipe,
+                detail: "write side is closed".to_string(),
             });
         }
         let room = peer.capacity.map_or(data.len(), |capacity| {
@@ -400,8 +404,9 @@ impl TcpProvider for VirtualProvider {
         });
         let accepted = room.min(data.len());
         let accepted_data = data.get(..accepted).ok_or(TcpError::Io {
-            operation: "send",
-            reason: "accepted byte count exceeded write buffer".to_string(),
+            operation: TcpIoOperation::Write,
+            kind: IoErrorKind::BrokenPipe,
+            detail: "accepted byte count exceeded write buffer".to_string(),
         })?;
         peer.inbox.extend(accepted_data);
         if accepted < data.len() {

@@ -50,10 +50,12 @@ pub enum TransportSetError {
     /// The set is already attached to a host's shared poll, and the member
     /// could not be attached to it: its sockets failed to register, or the
     /// set's token space has no subspace left for it.
-    #[error("could not attach the member to the shared poll: {reason}")]
+    #[error("could not attach the member to the shared poll ({kind}): {detail}")]
     AttachFailed {
-        /// What the registration reported.
-        reason: alloc::string::String,
+        /// What kind of failure the registration reported.
+        kind: minip2p_platform::IoErrorKind,
+        /// The registration's own description, for diagnostics.
+        detail: alloc::string::String,
     },
 }
 
@@ -219,7 +221,8 @@ impl TransportSet {
         {
             return Err(RejectedTransport {
                 error: TransportSetError::AttachFailed {
-                    reason: error.to_string(),
+                    kind: error.kind().into(),
+                    detail: error.to_string(),
                 },
                 transport,
             });

@@ -93,7 +93,7 @@ mod transport;
 pub use minip2p_smoltcp::{SmoltcpStack, smoltcp};
 
 pub use config::TcpConfig;
-pub use provider::{SocketHandle, TcpError, TcpEvent, TcpProvider};
+pub use provider::{SocketHandle, TcpError, TcpEvent, TcpIoOperation, TcpProvider};
 #[cfg(feature = "smoltcp")]
 pub use smoltcp_provider::{SmoltcpConfig, SmoltcpTcpProvider};
 #[cfg(feature = "std")]

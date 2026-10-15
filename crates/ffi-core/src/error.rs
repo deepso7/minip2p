@@ -10,9 +10,12 @@ pub enum FfiError {
     /// The endpoint has stopped and cannot be restarted.
     #[error("endpoint is stopped")]
     Stopped,
-    /// Endpoint configuration was internally inconsistent.
-    #[error("invalid endpoint configuration: {detail}")]
+    /// Endpoint configuration was invalid; `capability` names the part of
+    /// it that was.
+    #[error("invalid {capability} configuration: {detail}")]
     InvalidConfig {
+        /// The part of the configuration that failed.
+        capability: ConfigCapability,
         /// Human-readable validation detail.
         detail: String,
     },
@@ -52,7 +55,8 @@ pub enum FfiError {
     /// A pubsub message exceeds the protocol limit.
     #[error("message too large")]
     MessageTooLarge,
-    /// A synchronous transport operation failed.
+    /// A synchronous transport operation failed, or the platform refused a
+    /// socket the endpoint needed (a port in use, say).
     #[error("transport error: {detail}")]
     Transport {
         /// Human-readable transport detail.
@@ -70,4 +74,45 @@ pub enum FfiError {
         /// Human-readable failure detail.
         detail: String,
     },
+}
+
+/// The part of an endpoint's configuration an [`FfiError::InvalidConfig`]
+/// names.
+///
+/// A configuration mistake is fixed by changing that part; an environment
+/// failure (a socket the platform refused) is [`FfiError::Transport`]
+/// instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum ConfigCapability {
+    /// Gossipsub settings.
+    Gossipsub,
+    /// mDNS settings.
+    Mdns,
+    /// Signed discovery or peer-book settings.
+    Discovery,
+    /// QUIC or TCP transport settings (limits, TLS, the TCP namespace).
+    Transport,
+    /// The endpoint's own options: listen addresses, protocols, NAT and
+    /// relay policy, auto-dial.
+    Options,
+}
+
+impl ConfigCapability {
+    /// The variant name, the stable tag the bindings expose.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gossipsub => "Gossipsub",
+            Self::Mdns => "Mdns",
+            Self::Discovery => "Discovery",
+            Self::Transport => "Transport",
+            Self::Options => "Options",
+        }
+    }
+}
+
+impl core::fmt::Display for ConfigCapability {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }

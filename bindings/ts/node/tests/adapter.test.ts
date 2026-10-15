@@ -1,6 +1,6 @@
 /* oxlint-disable class-methods-use-this, max-classes-per-file, promise/avoid-new -- The fake implements the native endpoint boundary used by the adapter, including one deferred drain observation. */
 
-import { StreamClosedError } from "@minip2p/core";
+import { InvalidConfigError, StreamClosedError } from "@minip2p/core";
 import { describeAdapterContract } from "@minip2p/test-fixtures/adapter-contract";
 import type { NativeEventLiteral } from "@minip2p/test-fixtures/adapter-contract";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -16,6 +16,8 @@ const native = vi.hoisted(() => {
 
   class FakeNativeEndpoint implements NativeEndpoint {
     static latest: FakeNativeEndpoint | undefined;
+    /** Error the next constructor call throws, as native validation would. */
+    static constructError: Error | undefined;
 
     readonly config: Readonly<Record<string, unknown>>;
     readonly abandonedStreams: {
@@ -49,6 +51,11 @@ const native = vi.hoisted(() => {
       _secretKey: Uint8Array,
       config: Readonly<Record<string, unknown>>
     ) {
+      const error = FakeNativeEndpoint.constructError;
+      if (error !== undefined) {
+        FakeNativeEndpoint.constructError = undefined;
+        throw error;
+      }
       this.config = config;
       FakeNativeEndpoint.latest = this;
     }
@@ -213,6 +220,23 @@ const fakeEndpoint = (): InstanceType<typeof native.FakeNativeEndpoint> => {
   return fake;
 };
 
+/** A native `InvalidConfig` error as the addon throws it. */
+const nativeConfigError = (capability: string): Error =>
+  Object.assign(new Error("invalid config: ttl must be positive"), {
+    capability,
+    code: "InvalidConfig",
+    detail: "ttl must be positive",
+  });
+
+const createFailure = (): unknown => {
+  try {
+    createEndpoint().close();
+  } catch (error) {
+    return error;
+  }
+  throw new Error("create did not throw");
+};
+
 const settle = async (): Promise<void> => {
   await vi.runAllTimersAsync();
   await Promise.resolve();
@@ -233,6 +257,7 @@ describe("Node adapter", () => {
   afterEach(() => {
     vi.useRealTimers();
     native.FakeNativeEndpoint.latest = undefined;
+    native.FakeNativeEndpoint.constructError = undefined;
   });
 
   test("continues draining after a malformed native event", async () => {
@@ -437,6 +462,50 @@ describe("Node adapter", () => {
     expect(kinds).toEqual(["OpenStreamFailed"]);
     expect(endpoint.reachability()).toBe("Private");
     endpoint.close();
+  });
+
+  test("mDNS failure and recovery reach listeners", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const seen: unknown[] = [];
+    endpoint.on("mdnsFailed", (event) => seen.push(event));
+    endpoint.on("mdnsRecovered", () => seen.push("recovered"));
+    fake.enqueue(
+      [
+        { inner: { detail: "send failed", kind: "Io" }, tag: "MdnsFailed" },
+        { tag: "MdnsRecovered" },
+      ],
+      []
+    );
+
+    fake.ring();
+    await settle();
+
+    expect(seen).toEqual([
+      expect.objectContaining({ detail: "send failed", kind: "Io" }),
+      "recovered",
+    ]);
+    endpoint.close();
+  });
+
+  test("a native config rejection names its capability", () => {
+    native.FakeNativeEndpoint.constructError = nativeConfigError("Mdns");
+
+    const error = createFailure();
+
+    expect(error).toBeInstanceOf(InvalidConfigError);
+    expect(error).toMatchObject({
+      capability: "Mdns",
+      detail: "ttl must be positive",
+    });
+  });
+
+  test("a config rejection with an unknown capability is rethrown unchanged", () => {
+    const nativeError = nativeConfigError("Future");
+    native.FakeNativeEndpoint.constructError = nativeError;
+
+    expect(createFailure()).toBe(nativeError);
   });
 
   test("returns no discovery clock when the native option is null", () => {

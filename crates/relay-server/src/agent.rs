@@ -19,9 +19,9 @@ use crate::address::normalize_addrs;
 use crate::limiter::TokenBuckets;
 use crate::{
     CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
-    RelayServerAction, RelayServerAddressError, RelayServerConfig, RelayServerConfigError,
-    RelayServerEvent, RelayServerRuntimeError, RelayServerRuntimeErrorKind, RelayServerSendError,
-    RelayServerToken, ReservationCloseReason, StreamKey,
+    RelayServerAction, RelayServerAddrSource, RelayServerAddressError, RelayServerConfig,
+    RelayServerConfigError, RelayServerEvent, RelayServerRuntimeError, RelayServerRuntimeErrorKind,
+    RelayServerSendError, RelayServerToken, ReservationCloseReason, StreamKey,
 };
 
 /// The key per-IP admission limits share: an IPv4 address (IPv4-mapped
@@ -531,6 +531,10 @@ pub struct RelayServerAgent {
     explicit_addrs: Option<Vec<Multiaddr>>,
     confirmed_addrs: Vec<Multiaddr>,
     listener_addrs: Vec<Multiaddr>,
+    /// Last rejection of each host-refreshed source, cleared by its next
+    /// accepted refresh.
+    confirmed_addrs_error: Option<RelayServerAddressError>,
+    listener_addrs_error: Option<RelayServerAddressError>,
     connections: BTreeMap<ConnectionId, Connection>,
     reservations: BTreeMap<PeerId, ReservationRecord>,
     reservation_deadlines: Deadlines<PeerId>,
@@ -613,6 +617,8 @@ impl RelayServerAgent {
             explicit_addrs: None,
             confirmed_addrs: Vec::new(),
             listener_addrs: Vec::new(),
+            confirmed_addrs_error: None,
+            listener_addrs_error: None,
             connections: BTreeMap::new(),
             reservations: BTreeMap::new(),
             reservation_deadlines: Deadlines::new(),
@@ -657,6 +663,11 @@ impl RelayServerAgent {
     }
 
     /// Replaces the AutoNAT-confirmed direct-address source atomically.
+    ///
+    /// On rejection the previous confirmed addresses stay in effect. The
+    /// outcome is also queued for [`poll_event`](Self::poll_event) as
+    /// [`RelayServerEvent::AddrsRejected`] or [`RelayServerEvent::AddrsRestored`]
+    /// when the source's health changes, so callers may ignore the `Result`.
     #[expect(
         clippy::result_large_err,
         reason = "The error owns the rejected confirmed address for actionable host diagnostics."
@@ -665,11 +676,15 @@ impl RelayServerAgent {
         &mut self,
         addrs: Vec<Multiaddr>,
     ) -> Result<(), RelayServerAddressError> {
-        self.confirmed_addrs = normalize_addrs(&self.local_peer_id, addrs)?;
-        Ok(())
+        self.refresh_addrs(RelayServerAddrSource::Confirmed, addrs)
     }
 
     /// Replaces the concrete bound-listener source atomically.
+    ///
+    /// On rejection the previous listener addresses stay in effect. The
+    /// outcome is also queued for [`poll_event`](Self::poll_event) as
+    /// [`RelayServerEvent::AddrsRejected`] or [`RelayServerEvent::AddrsRestored`]
+    /// when the source's health changes, so callers may ignore the `Result`.
     #[expect(
         clippy::result_large_err,
         reason = "The error owns the rejected listener address for actionable host diagnostics."
@@ -678,8 +693,49 @@ impl RelayServerAgent {
         &mut self,
         addrs: Vec<Multiaddr>,
     ) -> Result<(), RelayServerAddressError> {
-        self.listener_addrs = normalize_addrs(&self.local_peer_id, addrs)?;
-        Ok(())
+        self.refresh_addrs(RelayServerAddrSource::Listener, addrs)
+    }
+
+    /// Replaces one host-refreshed source, queueing an event only when its
+    /// failure state (or its failing error) changes.
+    #[expect(
+        clippy::result_large_err,
+        reason = "The error owns the rejected address for actionable host diagnostics."
+    )]
+    fn refresh_addrs(
+        &mut self,
+        source: RelayServerAddrSource,
+        addrs: Vec<Multiaddr>,
+    ) -> Result<(), RelayServerAddressError> {
+        let result = normalize_addrs(&self.local_peer_id, addrs);
+        let (current, failure) = match source {
+            RelayServerAddrSource::Listener => {
+                (&mut self.listener_addrs, &mut self.listener_addrs_error)
+            }
+            RelayServerAddrSource::Confirmed => {
+                (&mut self.confirmed_addrs, &mut self.confirmed_addrs_error)
+            }
+        };
+        match result {
+            Ok(addrs) => {
+                *current = addrs;
+                if failure.take().is_some() {
+                    self.events
+                        .push_back(RelayServerEvent::AddrsRestored { source });
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if failure.as_ref() != Some(&error) {
+                    *failure = Some(error.clone());
+                    self.events.push_back(RelayServerEvent::AddrsRejected {
+                        source,
+                        error: error.clone(),
+                    });
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Returns the first non-empty normalized address source.
@@ -4004,6 +4060,93 @@ mod tests {
         assert_eq!(agent.selected_addrs(), [explicit]);
         agent.replace_announce_addrs(Vec::new()).unwrap();
         assert_eq!(agent.selected_addrs(), [confirmed]);
+    }
+
+    /// Refreshes `source` with one address, returning its rejection.
+    fn refresh(
+        agent: &mut RelayServerAgent,
+        source: RelayServerAddrSource,
+        addr: &str,
+    ) -> Option<crate::RelayServerAddressError> {
+        let addrs = vec![Multiaddr::from_str(addr).unwrap()];
+        match source {
+            RelayServerAddrSource::Listener => agent.set_listener_addrs(addrs),
+            RelayServerAddrSource::Confirmed => agent.set_confirmed_addrs(addrs),
+        }
+        .err()
+    }
+
+    fn drain_events(agent: &mut RelayServerAgent) -> Vec<RelayServerEvent> {
+        core::iter::from_fn(|| agent.poll_event()).collect()
+    }
+
+    #[test]
+    fn rejected_refresh_keeps_prior_addrs_and_reports_failure_transitions() {
+        for source in [
+            RelayServerAddrSource::Listener,
+            RelayServerAddrSource::Confirmed,
+        ] {
+            let local = PeerId::from_public_key_protobuf(b"relay-address-events");
+            let mut agent = RelayServerAgent::new(local, RelayServerConfig::default()).unwrap();
+            let good = Multiaddr::from_str("/ip4/192.0.2.1/tcp/1").unwrap();
+            assert_eq!(refresh(&mut agent, source, "/ip4/192.0.2.1/tcp/1"), None);
+            assert!(drain_events(&mut agent).is_empty());
+
+            let error = refresh(&mut agent, source, "/ip4/0.0.0.0/tcp/9").unwrap();
+            assert_eq!(agent.selected_addrs(), core::slice::from_ref(&good));
+            assert_eq!(
+                drain_events(&mut agent),
+                [RelayServerEvent::AddrsRejected { source, error }]
+            );
+            refresh(&mut agent, source, "/ip4/0.0.0.0/tcp/9").unwrap();
+            assert!(drain_events(&mut agent).is_empty());
+
+            // A different error while failing is news.
+            let error = refresh(&mut agent, source, "/ip4/192.0.2.1/udp/1").unwrap();
+            assert_eq!(
+                drain_events(&mut agent),
+                [RelayServerEvent::AddrsRejected { source, error }]
+            );
+            assert_eq!(agent.selected_addrs(), core::slice::from_ref(&good));
+
+            assert_eq!(refresh(&mut agent, source, "/ip4/192.0.2.2/tcp/2"), None);
+            assert_eq!(
+                drain_events(&mut agent),
+                [RelayServerEvent::AddrsRestored { source }]
+            );
+            assert_eq!(refresh(&mut agent, source, "/ip4/192.0.2.3/tcp/3"), None);
+            assert!(drain_events(&mut agent).is_empty());
+        }
+    }
+
+    #[test]
+    fn address_sources_fail_and_restore_independently() {
+        use RelayServerAddrSource::{Confirmed, Listener};
+        let local = PeerId::from_public_key_protobuf(b"relay-address-independent");
+        let mut agent = RelayServerAgent::new(local, RelayServerConfig::default()).unwrap();
+        refresh(&mut agent, Listener, "/ip4/0.0.0.0/tcp/1").unwrap();
+        assert_eq!(refresh(&mut agent, Confirmed, "/ip4/192.0.2.2/tcp/2"), None);
+        assert!(matches!(
+            drain_events(&mut agent)[..],
+            [RelayServerEvent::AddrsRejected {
+                source: Listener,
+                ..
+            }]
+        ));
+
+        refresh(&mut agent, Confirmed, "/ip4/0.0.0.0/tcp/2").unwrap();
+        assert_eq!(refresh(&mut agent, Listener, "/ip4/192.0.2.1/tcp/1"), None);
+        refresh(&mut agent, Confirmed, "/ip4/0.0.0.0/tcp/2").unwrap();
+        assert!(matches!(
+            drain_events(&mut agent)[..],
+            [
+                RelayServerEvent::AddrsRejected {
+                    source: Confirmed,
+                    ..
+                },
+                RelayServerEvent::AddrsRestored { source: Listener },
+            ]
+        ));
     }
 
     #[test]

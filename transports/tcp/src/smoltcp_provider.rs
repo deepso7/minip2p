@@ -8,7 +8,7 @@ use core::net::{Ipv4Addr, Ipv6Addr};
 use core::ops::RangeInclusive;
 
 use minip2p_core::{Multiaddr, Protocol};
-use minip2p_platform::{Deadline, Now};
+use minip2p_platform::{Deadline, IoErrorKind, Now};
 use minip2p_smoltcp::SmoltcpStack;
 use minip2p_smoltcp::smoltcp::iface::{
     Interface, PollIngressSingleResult, PollResult, SocketHandle as SmoltcpHandle,
@@ -18,7 +18,9 @@ use minip2p_smoltcp::smoltcp::socket::tcp;
 use minip2p_smoltcp::smoltcp::time::Instant;
 use minip2p_smoltcp::smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 
-use crate::provider::{SocketHandle, TcpError, TcpEvent, TcpProvider, host_and_port};
+use crate::provider::{
+    SocketHandle, TcpError, TcpEvent, TcpIoOperation, TcpProvider, host_and_port,
+};
 
 /// Largest shared read buffer, however big a socket's receive ring is.
 ///
@@ -889,8 +891,12 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             self.stack.borrow_mut().sockets.remove(inner);
             self.used_ports.remove(&local);
             return Err(TcpError::Io {
-                operation: "starting a connect",
-                reason: error.to_string(),
+                operation: TcpIoOperation::Connect,
+                kind: match error {
+                    tcp::ConnectError::Unaddressable => IoErrorKind::AddrNotAvailable,
+                    _ => IoErrorKind::InvalidInput,
+                },
+                detail: error.to_string(),
             });
         }
 

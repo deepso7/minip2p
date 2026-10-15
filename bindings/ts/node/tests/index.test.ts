@@ -8,6 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import * as coreSdk from "@minip2p/core";
 import {
   BackpressureError,
+  InvalidConfigError,
   MessageTooLargeError,
   NotPermittedError,
 } from "@minip2p/core";
@@ -98,14 +99,11 @@ describe("@minip2p/node", () => {
     );
   });
 
-  test("passes mDNS limits through native validation", () => {
-    expect(() =>
-      nodeSdk.Minip2p.create({
-        listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
-        mdns: { maxPacketBytes: 511 },
-        secretKey: nodeSdk.generateSecretKey(),
-      })
-    ).toThrow("mDNS maximum packet size must be between 512 and 4096 bytes");
+  test("an invalid mDNS option is an mDNS config error", () => {
+    expect(createWithUndersizedMdnsPackets).toThrow(InvalidConfigError);
+    expect(createWithUndersizedMdnsPackets).toThrow(
+      expect.objectContaining({ capability: "Mdns" })
+    );
   });
 
   test("Connection targets settle through the native endpoint", async () => {
@@ -401,6 +399,14 @@ describe("@minip2p/node", () => {
     }
   }, 30_000);
 });
+
+function createWithUndersizedMdnsPackets(): nodeSdk.Minip2p {
+  return nodeSdk.Minip2p.create({
+    listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
+    mdns: { maxPacketBytes: 511 },
+    secretKey: nodeSdk.generateSecretKey(),
+  });
+}
 
 function createPubsubEndpoint(): nodeSdk.Minip2p {
   return nodeSdk.Minip2p.create({

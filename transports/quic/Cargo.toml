@@ -36,6 +36,7 @@ quinn-udp = { version = "0.6.3", default-features = false }
 bytes = "1.12.1"
 mio = { version = "1.2", features = ["net", "os-poll"] }
 socket2 = "0.6.5"
+thiserror = "2.0.20"
 
 [dev-dependencies]
 criterion = "0.8.2"

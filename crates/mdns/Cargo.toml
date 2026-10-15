@@ -20,6 +20,7 @@ smoltcp = ["dep:minip2p-smoltcp"]
 std = [
   "minip2p-core/std",
   "minip2p-identity/std",
+  "minip2p-platform/std",
   "thiserror/std",
   "dep:socket2",
   "dep:if-addrs",

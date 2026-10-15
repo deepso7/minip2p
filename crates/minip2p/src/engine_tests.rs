@@ -40,6 +40,8 @@ impl EntropySource for CountingEntropy {
 struct FlashTransport {
     queue: Arc<Mutex<VecDeque<TransportEvent>>>,
     polls: Arc<Mutex<usize>>,
+    /// What `local_addresses` reports.
+    local: Vec<Multiaddr>,
 }
 
 impl FlashTransport {
@@ -97,6 +99,9 @@ impl Transport for FlashTransport {
             .unwrap_or_else(PoisonError::into_inner)
             .drain(..)
             .collect())
+    }
+    fn local_addresses(&self) -> Vec<Multiaddr> {
+        self.local.clone()
     }
     fn local_addresses_revision(&self) -> Option<u64> {
         Some(0)
@@ -317,9 +322,49 @@ fn relay_over_a_transport_without_circuit_operations_is_refused() {
         .err()
         .expect("refused");
     assert!(
-        alloc::string::ToString::to_string(&error).contains("build_with_circuits"),
+        matches!(
+            error,
+            crate::PortableBuildError::NatConfig(
+                crate::PortableNatConfigError::RelayWithoutCircuits
+            )
+        ),
         "{error}"
     );
+}
+
+/// Relay-server listener addresses come from the bound transports, not from
+/// configuration: a set the agent rejects does not fail the build, and is
+/// reported once as a capability event while the endpoint keeps running.
+#[cfg(feature = "relay-server")]
+#[test]
+fn rejected_relay_listener_addresses_are_an_event_not_a_bind_error() {
+    use minip2p_relay_server::{RelayServerAddrSource, RelayServerEvent};
+
+    let transport = FlashTransport {
+        local: vec![
+            "/ip4/198.51.100.1/tcp/4001/p2p-circuit"
+                .parse()
+                .expect("addr"),
+        ],
+        ..FlashTransport::default()
+    };
+    let mut endpoint = std_endpoint(Endpoint::builder().relay_server(), transport);
+    let rejections = |events: &[EndpointEvent]| {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    EndpointEvent::RelayServer(RelayServerEvent::AddrsRejected {
+                        source: RelayServerAddrSource::Listener,
+                        ..
+                    })
+                )
+            })
+            .count()
+    };
+    assert_eq!(rejections(&endpoint.poll().expect("poll")), 1);
+    assert_eq!(rejections(&endpoint.poll().expect("poll")), 0);
 }
 
 /// After the first batch warms the caches, one batch carrying many stream

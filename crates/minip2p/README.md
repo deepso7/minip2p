@@ -20,10 +20,12 @@ let mut endpoint = minip2p::Endpoint::builder()
 for address in endpoint.listen_all()? {
     println!("{address}");
 }
-# Ok::<(), minip2p::Error>(())
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Listening is address-shaped: pass complete multiaddresses to `EndpointBuilder::listen_on` (or `listen_on_multiaddr`), or use `listen_default` for dual-stack QUIC wildcards. The transport is inferred from each address. `bind` starts accepting on every listen address, QUIC and TCP alike; `listen_all` reports them.
+
+The listen setters reject a malformed or unsupported address at once with an `EndpointOptionsError`, and `bind` returns a `BindError` naming what failed: `Options` for inconsistent options (no transport, a second QUIC address for one family, ...), `Quic` or `Listen` for a socket the platform refused (a port in use, say, with its `IoErrorKind`), and `Swarm`, `RelayServer`, `Gossipsub`, or `Mdns`/`MdnsSocket` for that part's own configuration or setup. `?` converts an `EndpointOptionsError` into a `BindError`, so a builder chain needs only the one error type. Bind errors happen before any event is polled; nothing later reuses them.
 
 ## Connecting and the event loop
 
@@ -83,7 +85,7 @@ let events = endpoint.poll(now)?;
 let deadline = endpoint.next_deadline(now);
 ```
 
-The portable endpoint supports listening, Connection attempts, ping, Identify inspection, custom streams (`add_protocol` registers one after build), state statistics, and consuming `shutdown(now)`. Every operation that advances protocol work uses a caller-provided `Now`, so the host controls time consistently. There is no access to the raw swarm: every dial goes through `connect`.
+The portable endpoint supports listening, Connection attempts, ping, Identify inspection, custom streams (`add_protocol` registers one after build), state statistics, and consuming `shutdown(now)` (mDNS goodbyes are best effort there: one that could not be sent is an `EndpointEvent::MdnsFailed` among the returned events). Build failures are a `PortableBuildError` naming the part that failed (`ListenAddress`, `NatConfig`, `Gossipsub`, `MdnsConfig`, ...). Every operation that advances protocol work uses a caller-provided `Now`, so the host controls time consistently. There is no access to the raw swarm: every dial goes through `connect`.
 
 ### Capabilities
 
@@ -98,7 +100,7 @@ The portable endpoint supports listening, Connection attempts, ping, Identify in
 
 `.mdns(io, config)` takes the carrier by value and stores it as a `Box<dyn MdnsIo>`, so it must be `'static`; keep a handle to whatever it runs on to reconfigure it later. The mDNS seed comes from the builder's entropy. The endpoint polls the transport again after each mDNS tick, since a carrier may share the transport's stack.
 
-Relay paths turn a relay bridge into a connection, which takes circuit operations from the transport. `build(transport)` works over any transport and rejects relay configuration with an error saying so; wrap the transport in a `CircuitTransport` and call `build_with_circuits(transport)` to run relays. AutoNAT alone needs nothing from the transport. Portable relay configurations must set `force_relay`: portable endpoints do not run DCUtR.
+Relay paths turn a relay bridge into a connection, which takes circuit operations from the transport. `build(transport)` works over any transport and rejects relay configuration with `PortableBuildError::NatConfig(PortableNatConfigError::RelayWithoutCircuits)`; wrap the transport in a `CircuitTransport` and call `build_with_circuits(transport)` to run relays. AutoNAT alone needs nothing from the transport. Portable relay configurations must set `force_relay`: portable endpoints do not run DCUtR.
 
 ### smoltcp
 
@@ -170,7 +172,7 @@ An endpoint brings up whatever you asked it to listen on, then routes by address
 let mut endpoint = minip2p::Endpoint::builder()
     .listen_on("/ip4/0.0.0.0/udp/4001/quic-v1")?
     .bind()?;
-# Ok::<(), minip2p::Error>(())
+# Ok::<(), minip2p::BindError>(())
 ```
 
 With the `tcp` feature, chain a `/tcp` listen address the same way. Connect to a `/udp/<port>/quic-v1` candidate and it is dialed over QUIC; a `/tcp` candidate goes over TCP. The address decides — nothing above the endpoint cares that there are two transports. `listen_default` is dual-stack QUIC. An endpoint with nothing to bind is refused rather than built empty.
@@ -181,9 +183,9 @@ Dropping a std `Endpoint` (or `Endpoint::close`) disconnects established peers. 
 
 With the `nat` feature, an endpoint holding a QUIC relay reservation sends a ping every `NatConfig::reservation_keep_alive_interval_ms` to stop an idle relay connection from reaching that timeout. The default is 15 seconds. Keep the interval below `QuicLimits::idle_timeout_ms`; setting it to `0` disables the automatic pings. TCP reservations do not send them. Each successful automatic ping emits the ordinary `EndpointEvent::PingRttMeasured` event.
 
-`minip2p::Error` preserves transport failures, Sans-I/O state rejections, and driver-invariant failures as separate variants. Resource limits are configurable through `EndpointBuilder::quic_limits` and `EndpointBuilder::tcp_config`.
+`minip2p::Error` is the runtime error of `poll`, `wait`, and every operation on a running endpoint. It preserves transport failures (platform I/O as `TransportError::Io` with an `IoErrorKind`), Sans-I/O state rejections, and driver-invariant failures as separate variants, and never carries a configuration or mDNS error: a capability that fails while running reports a capability failure event instead (`EndpointEvent::MdnsFailed`, `RelayServerEvent::AddrsRejected`) and the rest of the endpoint keeps going. Resource limits are configurable through `EndpointBuilder::quic_limits` and `EndpointBuilder::tcp_config`.
 
-Prefer `Endpoint::wait` for the ordered Endpoint event stream: it returns an event, deadline, or interruption without swallowing interrupts. `EndpointEvent` is `#[non_exhaustive]` and carries enabled capability output — `Nat`, `Gossipsub`, `Discovery`, `RelayServer` — so one `wait` loop sees every event exactly once for every feature combination. `poll()` is the non-blocking drain of the same stream. Both endpoint types work in drive batches: one bounded batch of swarm events, one capability pass, then Connection-attempt terminals. `wait` runs one batch and hands its events out one per call; `poll` returns the whole batch. Within a batch the batch's swarm events come first, then capability events in relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt terminals (`ConnectSettled`). A `ConnectSettled` follows the `ConnectionEstablished` it reports, but other lifecycle events from the same batch (`PeerReady`, `ConnectionReplaced`, `ConnectionClosed`) may come before it too. No order is promised between concurrently racing Transport candidates. NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) never appear: the outcome is `ConnectSettled`. A `PathUpgraded` can still follow its attempt's `ConnectSettled` when the attempt settled on a provisional Relayed path. No `HolePunchFailed` names an attempt after its `ConnectSettled`. `InboundPathEstablished`, `PathUpgraded`, and `InboundDirectUpgrade` carry the connection ids they concern.
+Prefer `Endpoint::wait` for the ordered Endpoint event stream: it returns an event, deadline, or interruption without swallowing interrupts. `EndpointEvent` is `#[non_exhaustive]` and carries enabled capability output — `Nat`, `Gossipsub`, `Discovery`, `RelayServer` — so one `wait` loop sees every event exactly once for every feature combination. `poll()` is the non-blocking drain of the same stream. Both endpoint types work in drive batches: one bounded batch of swarm events, one capability pass, then Connection-attempt terminals. `wait` runs one batch and hands its events out one per call; `poll` returns the whole batch. Within a batch the batch's swarm events come first, then capability events in relay-server, NAT, Gossipsub, Discovery, mDNS order, then Connection-attempt terminals (`ConnectSettled`). A `ConnectSettled` follows the `ConnectionEstablished` it reports, but other lifecycle events from the same batch (`PeerReady`, `ConnectionReplaced`, `ConnectionClosed`) may come before it too. No order is promised between concurrently racing Transport candidates. NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) never appear: the outcome is `ConnectSettled`. A `PathUpgraded` can still follow its attempt's `ConnectSettled` when the attempt settled on a provisional Relayed path. No `HolePunchFailed` names an attempt after its `ConnectSettled`. `InboundPathEstablished`, `PathUpgraded`, and `InboundDirectUpgrade` carry the connection ids they concern.
 
 ```rust,ignore
 use std::time::Duration;
@@ -217,10 +219,10 @@ let mut endpoint = minip2p::Endpoint::builder()
     .relay_server()
     .listen_on("/ip4/0.0.0.0/udp/4001/quic-v1")?
     .bind()?;
-# Ok::<(), minip2p::Error>(())
+# Ok::<(), minip2p::BindError>(())
 ```
 
-Use `relay_server_config` for validated capacity, duration, byte, control, and rate limits, including the per-IP caps (8 reservations and 8 circuits per IPv4 address or IPv6 /64 by default). `relay_server_announce_addrs` supplies explicit public TCP/QUIC addresses; it does not enable the service, and invalid shapes fail before binding. Runtime replacement is atomic, with an empty list returning to AutoNAT-confirmed addresses and then concrete listeners. Raw Identify-observed addresses are never promoted.
+Use `relay_server_config` for validated capacity, duration, byte, control, and rate limits, including the per-IP caps (8 reservations and 8 circuits per IPv4 address or IPv6 /64 by default). `relay_server_announce_addrs` supplies explicit public TCP/QUIC addresses; it does not enable the service, and invalid shapes fail `bind` with `BindError::RelayServerAnnounce` (an invalid `relay_server_config` is `BindError::RelayServer`). Runtime replacement is atomic, with an empty list returning to AutoNAT-confirmed addresses and then concrete listeners. Raw Identify-observed addresses are never promoted. When a listener or AutoNAT-confirmed address refresh is rejected, the relay keeps advertising that source's previous addresses and reports `RelayServerEvent::AddrsRejected { source, error }`, then `AddrsRestored { source }` once a refresh is accepted again.
 
 `set_relay_server_accepting(false)` pauses only new reservations and circuits; HOP stays advertised and existing lifecycles remain active. Typed output arrives as `EndpointEvent::RelayServer` from `wait`. Synchronous controls return `RelayServerControlError`; failed asynchronous open/send/close/reset operations arrive as `RelayServerEvent::Error`.
 
@@ -262,13 +264,13 @@ Relay bridges are promoted through end-to-end Noise and Yamux before `NatEvent::
 
 With the `discovery` feature, `.discovery()` enables signed pubsub presence beacons, a bounded TTL address book, and caller-driven automatic NAT connects. It implies the `nat` and `pubsub` features. Applications can inspect `known_peers`, handle `EndpointEvent::Discovery` from `wait`, pass a validated `BeaconConfig` to select a room-scoped topic, and use `PeerDiscoveryConfig` for shared book and dial policy. Unsigned discovery beacons are always rejected even if unsigned application pubsub messages are allowed.
 
-With the `mdns` feature, `.mdns()` enables zero-configuration local-link discovery on `_p2p._udp.local` without enabling pubsub. It implies `nat`, uses the same bounded peer book and dial state as signed discovery when both are enabled, and exposes per-address provenance through `KnownPeer`. Use `.mdns_config(...)` for mDNS timing and packet policy, and `.peer_discovery_config(...)` for the shared book and dial policy. Applications can inspect `known_peers` and handle the same `EndpointEvent::Discovery` events used by signed discovery. Because mDNS claims are unauthenticated, their automatic dials are direct-only and never activate configured relays. Call `Endpoint::shutdown()` to send TTL-zero goodbyes and stop mDNS while keeping QUIC usable; drop performs the same sends best-effort.
+With the `mdns` feature, `.mdns()` enables zero-configuration local-link discovery on `_p2p._udp.local` without enabling pubsub. It implies `nat`, uses the same bounded peer book and dial state as signed discovery when both are enabled, and exposes per-address provenance through `KnownPeer`. Use `.mdns_config(...)` for mDNS timing and packet policy, and `.peer_discovery_config(...)` for the shared book and dial policy. Applications can inspect `known_peers` and handle the same `EndpointEvent::Discovery` events used by signed discovery. Because mDNS claims are unauthenticated, their automatic dials are direct-only and never activate configured relays. An mDNS socket failure while running is `EndpointEvent::MdnsFailed { error }`, reported once per change in failure state: mDNS keeps retrying (every `MDNS_FAILURE_RETRY`, 100 ms) and emits `EndpointEvent::MdnsRecovered` once a retry succeeds. Call `Endpoint::shutdown()` to send TTL-zero goodbyes and stop mDNS while keeping QUIC usable; it returns the first goodbye that could not be sent (also queued as a final `MdnsFailed`). `close` and drop send the same goodbyes best-effort; `close` reports a failed one only as an `MdnsFailed` in its `CloseReport`'s events.
 
 Discovery source timestamps use a driver-private monotonic epoch. Compute their ages from `Endpoint::discovery_now_ms()`; an independently created `Instant` does not share that origin.
 
-With the `pubsub` feature, `.gossipsub()` enables gossipsub and advertises `/meshsub/1.1.0` plus `/meshsub/1.0.0`. Pass a `GossipsubConfig` to `.gossipsub_config(...)` to tune mesh policy; an invalid configuration fails `bind()` before any socket is allocated.
+With the `pubsub` feature, `.gossipsub()` enables gossipsub and advertises `/meshsub/1.1.0` plus `/meshsub/1.0.0`. Pass a `GossipsubConfig` to `.gossipsub_config(...)` to tune mesh policy; an invalid configuration fails `bind()` with `BindError::Gossipsub` before any socket is allocated.
 
-Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see `minip2p::RESERVED_PROTOCOL_IDS`) belong to the endpoint's own handlers; registering one via `EndpointBuilder::protocol` makes the bind step fail, and `Endpoint::add_protocol` rejects it with `SwarmError::ReservedProtocol`.
+Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see `minip2p::RESERVED_PROTOCOL_IDS`) belong to the endpoint's own handlers; registering one via `EndpointBuilder::protocol` fails `bind()` with `BindError::Swarm(SwarmError::ReservedProtocol { .. })`, and `Endpoint::add_protocol` rejects it with `SwarmError::ReservedProtocol`.
 
 ## Benchmarks
 

@@ -1,6 +1,7 @@
 /* oxlint-disable max-classes-per-file -- Public error types are intentionally colocated. */
 
 import type {
+  ConfigCapability,
   DriverFailureKind,
   EndpointErrorKind,
   NatErrorKind,
@@ -27,6 +28,25 @@ export class NotPermittedError extends Error {
   constructor(message = "The operation is not permitted") {
     super(message);
     this.name = "NotPermittedError";
+  }
+}
+
+/**
+ * The endpoint configuration was invalid. `capability` names the part of the
+ * configuration to change; a socket the platform refused is a transport
+ * failure instead, and a malformed listen address an invalid-address one.
+ */
+export class InvalidConfigError extends Error {
+  /** The part of the configuration that was invalid. */
+  readonly capability: ConfigCapability;
+  /** Human-readable native diagnostic. */
+  readonly detail: string;
+
+  constructor(capability: ConfigCapability, detail: string) {
+    super(detail.length > 0 ? detail : `Invalid ${capability} configuration`);
+    this.name = "InvalidConfigError";
+    this.capability = capability;
+    this.detail = detail;
   }
 }
 
