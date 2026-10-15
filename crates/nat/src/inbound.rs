@@ -25,7 +25,7 @@ use minip2p_platform::Now;
 use minip2p_relay::{RelayError, Status, StopResponder, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
 
-use crate::agent::{Shared, StreamInput, StreamRole, TokenPurpose, reset, send};
+use crate::agent::{Shared, StreamInput, StreamRole, TokenPurpose, close_write, reset, send};
 use crate::config::MAX_DCUTR_ROUNDS;
 use crate::events::{BridgeRole, NatAction, NatEvent};
 use crate::swarm::NatSwarm;
@@ -262,7 +262,9 @@ impl InboundCircuit {
         self.promote(shared);
     }
 
-    /// Answers the STOP CONNECT with `status` and drops the circuit.
+    /// Answers the STOP CONNECT with `status` and drops the circuit. The
+    /// stream is half-closed, not reset: a FIN follows the status (and any
+    /// tail of it the stream refused), where a reset would discard it.
     fn refuse(&mut self, status: Status, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         let Some(stop) = self.stop.as_mut() else {
             return;
@@ -280,7 +282,8 @@ impl InboundCircuit {
         for bytes in outbound {
             send(swarm, &self.relay, self.inner_conn, self.stream, bytes, now);
         }
-        self.abandon(true, swarm, shared, now);
+        close_write(swarm, &self.relay, self.inner_conn, self.stream, now);
+        self.abandon(false, swarm, shared, now);
     }
 
     /// Hands the exact bridge stream to the circuit transport, exactly once.

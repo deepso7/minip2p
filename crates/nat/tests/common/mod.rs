@@ -336,6 +336,25 @@ pub fn has_reset_for(actions: &[Out], stream: StreamId) -> bool {
         .any(|action| matches!(action, Out::ResetStream { stream_id, .. } if *stream_id == stream))
 }
 
+/// Whether a refusal on `stream` went out as its status then a FIN, with no
+/// reset to discard the status.
+pub fn refused_with_fin(actions: &[Out], stream: StreamId) -> bool {
+    let on = |action: &Out| match action {
+        Out::SendStream { stream_id, .. }
+        | Out::CloseStreamWrite { stream_id, .. }
+        | Out::ResetStream { stream_id, .. } => *stream_id == stream,
+        _ => false,
+    };
+    let sent = actions
+        .iter()
+        .position(|a| on(a) && matches!(a, Out::SendStream { .. }));
+    let closed = actions
+        .iter()
+        .position(|a| on(a) && matches!(a, Out::CloseStreamWrite { .. }));
+    matches!((sent, closed), (Some(sent), Some(closed)) if sent < closed)
+        && !has_reset_for(actions, stream)
+}
+
 pub fn promote_token(actions: &[Out]) -> NatToken {
     let mut tokens = actions.iter().filter_map(|action| match action {
         Out::PromoteBridge { token, .. } => Some(*token),

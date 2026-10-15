@@ -1058,12 +1058,17 @@ impl YamuxSession {
         // Data still queued is dropped below and never delivered, so it is
         // nobody's to acknowledge.
         for event in &self.events {
-            if let YamuxOutput::Data { stream, data } = event
-                && let Some(state) = self.streams.get_mut(stream)
-            {
-                state.unacked = state.unacked.saturating_sub(data.len() as u32);
+            if let YamuxOutput::Data { stream, data } = event {
+                let len = data.len() as u32;
+                if let Some(state) = self.streams.get_mut(stream) {
+                    state.unacked = state.unacked.saturating_sub(len);
+                } else if let Some(unacked) = self.unsettled.get_mut(stream) {
+                    // The stream already closed within this same input.
+                    *unacked = unacked.saturating_sub(len);
+                }
             }
         }
+        self.unsettled.retain(|_, unacked| *unacked != 0);
         self.unsettle_all();
         self.writable_armed.clear();
         self.control_due.clear();
@@ -1957,6 +1962,15 @@ mod tests {
         // the host and must not be left for it to acknowledge.
         let mut server = YamuxSession::with_config(YamuxRole::Server, config()).unwrap();
         let mut input = Frame::encode_data(1, FLAG_SYN, &[7; 10]).unwrap();
+        input.extend_from_slice(&[0xff; 12]);
+        assert!(server.handle_data(&input).is_err());
+        assert_eq!(unsettled(&server), []);
+
+        // Also when the peer reset the stream before the failure, which had
+        // already left its count unsettled.
+        let mut server = YamuxSession::with_config(YamuxRole::Server, config()).unwrap();
+        let mut input = Frame::encode_data(1, FLAG_SYN, &[7; 10]).unwrap();
+        input.extend(Frame::data(1, FLAG_RST, Vec::new()).unwrap().encode());
         input.extend_from_slice(&[0xff; 12]);
         assert!(server.handle_data(&input).is_err());
         assert_eq!(unsettled(&server), []);

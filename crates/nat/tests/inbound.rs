@@ -244,7 +244,7 @@ fn unparsable_source_peer_id_is_rejected() {
         1,
         "a rejection STATUS goes back to the relay"
     );
-    assert!(has_reset_for(&actions, stream));
+    assert!(refused_with_fin(&actions, stream), "{actions:?}");
     assert!(drain_events(&mut h.agent).is_empty());
     assert!(h.agent.is_idle());
 }
@@ -278,7 +278,7 @@ fn a_stop_past_the_circuit_limit_is_refused_until_a_slot_frees() {
         stop_status(&sent_data_on(&actions, refused)),
         Some(Status::ResourceLimitExceeded)
     );
-    assert!(has_reset_for(&actions, refused));
+    assert!(refused_with_fin(&actions, refused), "{actions:?}");
     assert!(
         !actions
             .iter()
