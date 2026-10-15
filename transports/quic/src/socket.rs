@@ -36,7 +36,9 @@ const MIN_SOCKET_BUFFER_BYTES: usize = 64 << 10;
 /// Raises a socket buffer toward [`SOCKET_BUFFER_BYTES`], halving the request
 /// while the platform refuses it (BSDs and macOS do; Linux caps silently).
 /// Stops once a request is no larger than `current`, the size the OS reports
-/// now, so a buffer is never shrunk.
+/// now, so it never asks for less. A Linux host whose default exceeds its cap
+/// (the sysctls are independent) still ends up at the cap; without
+/// `CAP_NET_ADMIN` the default cannot be restored, so that is accepted.
 fn grow_buffer(current: usize, mut set: impl FnMut(usize) -> io::Result<()>) {
     let mut bytes = SOCKET_BUFFER_BYTES;
     while bytes > current && bytes >= MIN_SOCKET_BUFFER_BYTES {

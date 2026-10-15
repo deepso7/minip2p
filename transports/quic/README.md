@@ -101,7 +101,7 @@ Datagrams route by destination connection ID only, never by source address, so p
 
 Each socket is driven through quinn-udp, which uses what the platform offers:
 
-- **Socket buffers.** `SO_SNDBUF` and `SO_RCVBUF` are raised toward a fixed 4 MiB, best effort and with no knob: a size the platform refuses is halved and retried, one it caps (Linux, at `net.core.wmem_max`/`rmem_max`) is kept as granted, and a buffer is never shrunk. The `diagnostics` feature reports what was granted.
+- **Socket buffers.** `SO_SNDBUF` and `SO_RCVBUF` are raised toward a fixed 4 MiB, best effort and with no knob: a size the platform refuses is halved and retried, one it caps (Linux, at `net.core.wmem_max`/`rmem_max`) is kept as granted, and a size below the current one is never asked for (a Linux host whose default exceeds its `*mem_max` cap still ends up at the cap). The `diagnostics` feature reports what was granted.
 
 - **GSO.** One transmit carries up to 10 datagrams of one segment size, quinn's own cap; larger trains arrive as bursts a receiver's socket buffer drops. Where the platform refuses a segmented send (`EIO`/`EINVAL` on Linux), quinn-udp sends single datagrams from then on. The refused batch is treated as lost, and loss recovery resends it.
 - **GRO.** One receive buffer holds a full GRO batch, which is split into its datagrams by stride.
