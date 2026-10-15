@@ -21,7 +21,7 @@ minip2p = { package = "minip2p-rs", path = "../minip2p", features = [
 minip2p-core = { path = "../core" }
 minip2p-swarm = { path = "../swarm" }
 minip2p-pubsub = { path = "../pubsub" }
-serde = { workspace = true, features = ["derive"], optional = true }
+serde = { workspace = true, features = ["std", "derive"], optional = true }
 thiserror = { workspace = true, features = ["std"] }
 # Must remain paired with crates/ffi, ubrn and @ubjs/core 0.31.0-5.
 uniffi = { workspace = true, optional = true }
