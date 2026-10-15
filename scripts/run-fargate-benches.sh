@@ -17,7 +17,11 @@ mkdir -p target/bench-results
 # publishes their logs and JSON lines instead of the benchmark rows.
 if [[ -n "${BENCH_SWEEP:-}" ]]; then
   read -ra sweeps <<< "$BENCH_SWEEP"
-  [[ "${sweeps[0]}" == all ]] && sweeps=()
+  if ((${#sweeps[@]} == 0)); then
+    echo "BENCH_SWEEP names no sweep" >&2
+    exit 2
+  fi
+  if [[ "${sweeps[0]}" == all ]]; then sweeps=(); fi
   scripts/rtt-sweep.sh "${sweeps[@]}"
   printf 'MINIP2P_SWEEP_RESULTS=%s\n' "$(tar -czf - -C target/bench-results rtt | base64 -w0)"
   exit 0
