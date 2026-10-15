@@ -12,7 +12,7 @@ MdnsDriver          budgets, interface refresh, the on-link check
 
 `MdnsDriver` runs that agent against an `MdnsIo`. It owns the decisions about _how much_: how many datagrams to read and send per turn, when to re-enumerate interfaces, what to do when the I/O fails, and which datagrams to drop before the agent ever sees them. None of that is platform work, so it is the same code wherever the datagrams come from.
 
-Time is the host's. `tick` and `shutdown` take a `minip2p_platform::Now`, and `next_deadline(now)` on the driver, the agent, and `MdnsIo` returns an absolute `minip2p_platform::Deadline` on that same monotonic timeline, so it folds directly with the host's other deadlines. Nothing in this crate keeps a clock or an epoch of its own: the first interface refresh is armed one interval after the first tick. Work a tick's budget left over is due now, an overdue timer reports its past due time, and a driver that has been shut down reports `None`.
+Time is the host's. `tick` and `shutdown` take a `minip2p_core::platform::Now`, and `next_deadline(now)` on the driver, the agent, and `MdnsIo` returns an absolute `minip2p_core::platform::Deadline` on that same monotonic timeline, so it folds directly with the host's other deadlines. Nothing in this crate keeps a clock or an epoch of its own: the first interface refresh is armed one interval after the first tick. Work a tick's budget left over is due now, an overdue timer reports its past due time, and a driver that has been shut down reports `None`.
 
 ## Failure
 
@@ -20,7 +20,7 @@ A hard I/O failure does not end mDNS. `tick` returns nothing; the turn stops at 
 
 There is one failure state for the whole carrier. `Failed` is queued on entering it and whenever the failure changes; the same failure again — same variant, `MdnsIoOperation`, and interface, whatever the platform's `kind` or `detail` — is not reported twice.
 
-`MdnsError::Io` is typed: the `operation` that failed, a portable `minip2p_platform::IoErrorKind`, the `interface` it was for (`None` for carrier-wide work such as enumerating interfaces), and the platform's `detail` text.
+`MdnsError::Io` is typed: the `operation` that failed, a portable `minip2p_core::platform::IoErrorKind`, the `interface` it was for (`None` for carrier-wide work such as enumerating interfaces), and the platform's `detail` text.
 
 `shutdown` still returns its error. A goodbye that could not be sent — a hard I/O failure, or a carrier still `Congested` after a bounded drain — is returned and also queued as a final `Failed`, even if it repeats the active failure; no `Recovered` follows. A second `shutdown` returns `Ok` and queues nothing, and dropping the driver still attempts the goodbyes silently.
 

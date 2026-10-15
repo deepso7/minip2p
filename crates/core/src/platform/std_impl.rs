@@ -1,6 +1,6 @@
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::{Clock, EntropyError, EntropySource, Now};
+use super::{Clock, EntropyError, EntropySource, Now};
 
 /// [`Clock`] backed by the operating system's clocks.
 ///
@@ -14,7 +14,7 @@ use crate::{Clock, EntropyError, EntropySource, Now};
 /// # Example
 ///
 /// ```
-/// use minip2p_platform::{Clock, StdClock};
+/// use minip2p_core::platform::{Clock, StdClock};
 ///
 /// let mut clock = StdClock::new();
 /// let start = clock.now();
@@ -81,7 +81,7 @@ impl Clock for StdClock {
 /// # Example
 ///
 /// ```
-/// use minip2p_platform::{EntropySource, StdEntropy};
+/// use minip2p_core::platform::{EntropySource, StdEntropy};
 ///
 /// let mut entropy = StdEntropy::new();
 /// let mut key = [0u8; 32];

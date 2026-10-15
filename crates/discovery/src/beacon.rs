@@ -2,9 +2,9 @@
 
 use alloc::{collections::VecDeque, format, string::ToString, vec::Vec};
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Multiaddr, PeerId, Protocol};
 use minip2p_identity::PublicKey;
-use minip2p_platform::{Deadline, Now};
 
 use crate::{
     Beacon, BeaconAction, BeaconConfig, BeaconEvent, DiscoveryConfigError, MAX_PUBLIC_KEY_LEN,

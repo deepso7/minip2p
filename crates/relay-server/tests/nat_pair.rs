@@ -5,12 +5,12 @@
     reason = "The helper functions assert the fixed action sequence of this acceptance test."
 )]
 
+use minip2p_core::platform::Now;
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
 use minip2p_nat::{
     ConnectLegs, DialStart, NatAction, NatAgent, NatConfig, NatEvent, NatSwarm, NatSwarmError,
     NatToken, Path, ReservationPolicy,
 };
-use minip2p_platform::Now;
 use minip2p_relay_server::{
     RelayServerAction, RelayServerAgent, RelayServerConfig, RelayServerEvent, StreamKey,
 };

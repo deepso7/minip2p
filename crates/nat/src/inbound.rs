@@ -19,9 +19,9 @@
 
 use alloc::vec::Vec;
 
+use minip2p_core::platform::Now;
 use minip2p_core::{Multiaddr, PeerId, Protocol, select_direct_addrs};
 use minip2p_dcutr::{DcutrError, DcutrInitiator, DcutrInitiatorOutput, InitiatorOutcome};
-use minip2p_platform::Now;
 use minip2p_relay::{RelayError, Status, StopResponder, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
 

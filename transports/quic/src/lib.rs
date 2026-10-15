@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
-use minip2p_platform::{Deadline, Now};
 use minip2p_transport::mio::{self, Interest, Registry, Waker, event::Event};
 use minip2p_transport::{
     Bytes, ConnectionEndpoint, ConnectionId, ConnectionNamespace, PollSource, StreamId, TokenSpace,

@@ -28,15 +28,14 @@ minip2p-core = { path = "../core", version = "0.8.3", default-features = false }
 minip2p-identity = { path = "../identity", version = "0.8.3", default-features = false, features = [
   "ed25519",
 ] }
-minip2p-platform = { path = "../platform", version = "0.8.3", default-features = false }
 minip2p-swarm = { path = "../swarm", version = "0.8.3", default-features = false }
 minip2p-transport = { path = "../transport", version = "0.8.3", default-features = false }
-thiserror = { version = "2.0.20", default-features = false }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-criterion = "0.8.2"
-gungraun = "=0.19.4"
-stats_alloc = "0.1.10"
+criterion = { workspace = true }
+gungraun = { workspace = true }
+stats_alloc = { workspace = true }
 
 [[bench]]
 name = "publish"

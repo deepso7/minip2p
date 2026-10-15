@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use minip2p_core::Multiaddr;
-use minip2p_platform::{Deadline, IoErrorKind, Now};
+use minip2p_core::platform::{Deadline, IoErrorKind, Now};
 use thiserror::Error;
 
 use core::fmt;

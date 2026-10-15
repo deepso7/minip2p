@@ -16,9 +16,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use minip2p_core::platform::{Deadline, EntropyError, EntropySource, Now};
 use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_identity::{Ed25519Keypair, PeerId};
-use minip2p_platform::{Deadline, EntropyError, EntropySource, Now};
 use minip2p_tcp::smoltcp::iface::{Config, Interface};
 use minip2p_tcp::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use minip2p_tcp::smoltcp::time::Instant;

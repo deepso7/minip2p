@@ -2,7 +2,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use minip2p_platform::{Clock, StdClock};
+use minip2p_core::platform::{Clock, StdClock};
 use minip2p_quic::{QuicLimits, QuicNodeConfig, QuicTransport};
 use minip2p_transport::{SharedPoll, Transport, TransportEvent};
 

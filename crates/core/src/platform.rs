@@ -1,4 +1,4 @@
-//! Portable platform contracts for minip2p.
+//! Portable platform contracts: clock, deadline, entropy and I/O error kinds.
 //!
 //! Every agent, transport, and runtime in minip2p is caller-driven: it never
 //! reads a system clock and never draws randomness on its own. Instead the host
@@ -6,7 +6,7 @@
 //! everything it drives, and supplies an [`EntropySource`] to the components
 //! that need randomness.
 //!
-//! This crate holds those contracts, plus the [`Deadline`] type that
+//! This module holds those contracts, plus the [`Deadline`] type that
 //! caller-driven components use to report when they next need attention, and
 //! [`IoErrorKind`], a portable classification of I/O failures. It is
 //! `no_std` + `alloc` compatible and has no networking code; the `std` feature
@@ -15,7 +15,7 @@
 //! # Example
 //!
 //! ```
-//! use minip2p_platform::{Clock, Deadline, Now};
+//! use minip2p_core::platform::{Clock, Deadline, Now};
 //!
 //! struct Agent {
 //!     fire_at: Deadline,
@@ -34,7 +34,7 @@
 //!
 //! # #[cfg(feature = "std")]
 //! # {
-//! use minip2p_platform::StdClock;
+//! use minip2p_core::platform::StdClock;
 //!
 //! let mut clock = StdClock::new();
 //! let mut agent = Agent {
@@ -46,9 +46,6 @@
 //! assert!(agent.poll(now));
 //! # }
 //! ```
-#![cfg_attr(not(feature = "std"), no_std)]
-
-extern crate alloc;
 
 mod clock;
 mod deadline;

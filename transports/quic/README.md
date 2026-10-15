@@ -42,7 +42,7 @@ quinn-proto's own defaults stand for the rest: CUBIC congestion control, path MT
 ```rust
 use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_platform::{Clock, StdClock};
+use minip2p_core::platform::{Clock, StdClock};
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_transport::{Bytes, Transport, TransportEvent};
 

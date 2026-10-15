@@ -2,7 +2,7 @@
 //!
 //! [`YamuxSession`] accepts ordered connection bytes and emits encoded Yamux
 //! frames plus stream lifecycle events. It performs no I/O and never reads a
-//! clock: the host supplies [`minip2p_platform::Now`] samples so a quiet
+//! clock: the host supplies [`minip2p_core::platform::Now`] samples so a quiet
 //! session can emit keepalive pings on a deadline.
 //!
 //! Writes follow ADR 0012's backpressure contract: [`YamuxSession::send`]

@@ -4,8 +4,8 @@
 //! They run against the QUIC adapter but should pass for any conforming
 //! transport implementation.
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{PeerAddr, Protocol};
-use minip2p_platform::{Deadline, Now};
 use minip2p_quic::{QuicBindError, QuicLimits, QuicNodeConfig, QuicTransport};
 use minip2p_transport::{
     Bytes, ConnectionId, ConnectionToken, StreamId, Transport, TransportError, TransportEvent,

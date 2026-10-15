@@ -31,7 +31,7 @@ crates/minip2p/src/std/relay_server  I/O adapter and Endpoint composition.
 ```
 
 - `crates/relay` owns protobuf messages, the 8 KiB frame boundary, protocol identifiers, status encoding, and per-stream client/server machines. It owns no reservation table, clock, admission policy, or forwarding policy.
-- `crates/relay-server` owns reservations, circuits, limiters, deadlines, admission, forwarding actions, byte accounting, and public lifecycle events. It is `no_std + alloc` and uses `minip2p_platform::Now`.
+- `crates/relay-server` owns reservations, circuits, limiters, deadlines, admission, forwarding actions, byte accounting, and public lifecycle events. It is `no_std + alloc` and uses `minip2p_core::platform::Now`.
 - `crates/swarm` exposes only the deeper mechanisms shared by NAT and the relay server. It does not learn relay policy.
 - `crates/minip2p` owns feature composition, the driver, address contributions, blocking waits, and the application-facing API.
 

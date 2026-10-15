@@ -11,8 +11,8 @@ use core::{
     str::FromStr,
 };
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Multiaddr, PeerId, Protocol};
-use minip2p_platform::{Deadline, Now};
 
 use crate::dns::{
     CLASS_IN, DnsMessage, DnsQuestion, DnsRecordData, META_QUERY_NAME, ResponseSpec, SERVICE_NAME,

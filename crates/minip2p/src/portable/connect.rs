@@ -11,8 +11,8 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use minip2p_core::platform::{Deadline, EntropySource};
 use minip2p_core::{PeerAddr, PeerId};
-use minip2p_platform::{Deadline, EntropySource};
 use minip2p_swarm::{SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, Transport};
 
@@ -1151,7 +1151,7 @@ pub(crate) fn cancel_attempt<T: Transport, E: EntropySource>(
     nat: Option<&mut NatDriver<T>>,
     id: ConnectId,
     runtime: &mut SwarmCore<T, E>,
-    now: minip2p_platform::Now,
+    now: minip2p_core::platform::Now,
 ) -> bool {
     match nat {
         Some(nat) => nat.cancel_leg(connect, id, runtime, now),
@@ -1168,8 +1168,8 @@ mod tests {
     use alloc::vec;
     use core::net::{IpAddr, Ipv4Addr};
 
+    use minip2p_core::platform::{EntropyError, EntropySource, Now};
     use minip2p_identity::Ed25519Keypair;
-    use minip2p_platform::{EntropyError, EntropySource, Now};
     use minip2p_swarm::{SwarmBuilder, SwarmCore};
     use minip2p_transport::{
         ConnectionEndpoint, ConnectionId, ConnectionToken, StreamId, Transport, TransportError,

@@ -26,7 +26,6 @@ std = [
   "minip2p-identity/std",
   "minip2p-mdns?/std",
   "minip2p-nat?/std",
-  "minip2p-platform/std",
   "minip2p-pubsub?/std",
   "minip2p-relay-server?/std",
   "minip2p-swarm/std",
@@ -73,22 +72,21 @@ minip2p-identity = { path = "../identity", version = "0.8.3", default-features =
 ] }
 minip2p-mdns = { path = "../mdns", version = "0.8.3", default-features = false, optional = true }
 minip2p-nat = { path = "../nat", version = "0.8.3", default-features = false, optional = true }
-minip2p-platform = { path = "../platform", version = "0.8.3", default-features = false }
 minip2p-pubsub = { path = "../pubsub", version = "0.8.3", default-features = false, optional = true }
 minip2p-relay-server = { path = "../relay-server", version = "0.8.3", default-features = false, optional = true }
 minip2p-quic = { path = "../../transports/quic", version = "0.8.3", optional = true }
 minip2p-tcp = { path = "../../transports/tcp", version = "0.8.3", default-features = false, optional = true }
 minip2p-swarm = { path = "../swarm", version = "0.8.3", default-features = false }
 minip2p-transport = { path = "../transport", version = "0.8.3", default-features = false }
-thiserror = { version = "2.0.20", default-features = false }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 cpu-time = "1.0.0"
-criterion = "0.8.2"
+criterion = { workspace = true }
 minip2p-autonat = { path = "../autonat" }
 minip2p-relay = { path = "../relay" }
 minip2p-test-support = { path = "../test-support" }
-stats_alloc = "0.1.10"
+stats_alloc = { workspace = true }
 
 [[bench]]
 name = "endpoint_e2e"

@@ -15,7 +15,7 @@ use minip2p_identity::Ed25519Keypair;
 use minip2p_ping::{PING_PROTOCOL_ID, PingConfig};
 use minip2p_transport::Transport;
 
-use minip2p_platform::EntropySource;
+use minip2p_core::platform::EntropySource;
 
 #[cfg(feature = "std")]
 use crate::Swarm;
@@ -205,8 +205,8 @@ impl SwarmBuilder {
 mod tests {
     use super::*;
     use crate::{DriverError, RESERVED_PROTOCOL_IDS};
+    use minip2p_core::platform::{EntropyError, Now};
     use minip2p_core::{Multiaddr, PeerAddr};
-    use minip2p_platform::{EntropyError, Now};
     use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportEvent};
 
     struct NoopTransport;

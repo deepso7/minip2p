@@ -1097,7 +1097,6 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-noise",
- "minip2p-platform",
  "minip2p-secure-mux",
  "minip2p-tcp",
  "minip2p-test-support",
@@ -1111,6 +1110,7 @@ version = "0.8.3"
 dependencies = [
  "bytes",
  "criterion",
+ "getrandom 0.4.3",
  "gungraun",
  "minip2p-identity",
  "thiserror",
@@ -1132,7 +1132,6 @@ dependencies = [
  "gungraun",
  "minip2p-core",
  "minip2p-identity",
- "minip2p-platform",
  "thiserror",
 ]
 
@@ -1200,7 +1199,6 @@ dependencies = [
  "if-addrs",
  "minip2p-core",
  "minip2p-identity",
- "minip2p-platform",
  "minip2p-smoltcp",
  "minip2p-transport",
  "socket2",
@@ -1223,7 +1221,6 @@ dependencies = [
  "minip2p-core",
  "minip2p-dcutr",
  "minip2p-identity",
- "minip2p-platform",
  "minip2p-relay",
  "minip2p-swarm",
  "minip2p-test-support",
@@ -1273,14 +1270,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "minip2p-platform"
-version = "0.8.3"
-dependencies = [
- "getrandom 0.4.3",
- "thiserror",
-]
-
-[[package]]
 name = "minip2p-pubsub"
 version = "0.8.3"
 dependencies = [
@@ -1288,7 +1277,6 @@ dependencies = [
  "gungraun",
  "minip2p-core",
  "minip2p-identity",
- "minip2p-platform",
  "minip2p-swarm",
  "minip2p-transport",
  "stats_alloc",
@@ -1305,7 +1293,6 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-ping",
- "minip2p-platform",
  "minip2p-swarm",
  "minip2p-tls",
  "minip2p-transport",
@@ -1334,7 +1321,6 @@ dependencies = [
  "minip2p-core",
  "minip2p-identity",
  "minip2p-nat",
- "minip2p-platform",
  "minip2p-relay",
  "minip2p-swarm",
  "minip2p-transport",
@@ -1365,7 +1351,6 @@ dependencies = [
  "minip2p-identity",
  "minip2p-mdns",
  "minip2p-nat",
- "minip2p-platform",
  "minip2p-pubsub",
  "minip2p-quic",
  "minip2p-relay",
@@ -1386,7 +1371,6 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-noise",
- "minip2p-platform",
  "minip2p-transport",
  "minip2p-yamux",
  "thiserror",
@@ -1409,7 +1393,6 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-ping",
- "minip2p-platform",
  "minip2p-relay",
  "minip2p-test-support",
  "minip2p-transport",
@@ -1423,7 +1406,6 @@ dependencies = [
  "criterion",
  "minip2p-core",
  "minip2p-identity",
- "minip2p-platform",
  "minip2p-secure-mux",
  "minip2p-smoltcp",
  "minip2p-swarm",
@@ -1438,7 +1420,6 @@ name = "minip2p-test-support"
 version = "0.8.3"
 dependencies = [
  "minip2p-core",
- "minip2p-platform",
  "minip2p-relay",
  "minip2p-transport",
 ]
@@ -1466,7 +1447,6 @@ name = "minip2p-transport"
 version = "0.8.3"
 dependencies = [
  "minip2p-core",
- "minip2p-platform",
  "mio",
  "thiserror",
 ]
@@ -1478,7 +1458,6 @@ dependencies = [
  "criterion",
  "gungraun",
  "minip2p-core",
- "minip2p-platform",
  "thiserror",
 ]
 

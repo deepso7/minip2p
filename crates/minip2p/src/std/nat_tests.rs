@@ -1,7 +1,7 @@
 //! Standard Endpoint NAT regression tests.
 use minip2p_core::Multiaddr;
+use minip2p_core::platform::StdEntropy;
 use minip2p_nat::{NatAction, NatAgent, NatEvent, Now};
-use minip2p_platform::StdEntropy;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::Transport;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
@@ -690,7 +690,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
             data: Bytes::from(header),
         },
         pair.local.core_mut(),
-        minip2p_platform::Now::from_millis(10),
+        minip2p_core::platform::Now::from_millis(10),
     ));
     assert!(driver.promoted().contains_key(&key));
     assert!(!driver.ingest(
@@ -701,7 +701,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
             data: Bytes::from(vec![1]),
         },
         pair.local.core_mut(),
-        minip2p_platform::Now::from_millis(10),
+        minip2p_core::platform::Now::from_millis(10),
     ));
 
     execute(
@@ -778,7 +778,7 @@ fn promotion_uses_action_connection_after_same_batch_relay_replacement() {
             data: Bytes::from(vec![1]),
         },
         pair.local.core_mut(),
-        minip2p_platform::Now::from_millis(10),
+        minip2p_core::platform::Now::from_millis(10),
     ));
 }
 
@@ -824,7 +824,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
             stream_id: fin_pair.stream,
         },
         fin_pair.local.core_mut(),
-        minip2p_platform::Now::from_millis(10),
+        minip2p_core::platform::Now::from_millis(10),
     ));
 
     // Exact bridge closure is terminal and removes the keyed adoption.
@@ -839,7 +839,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
             stream_id: closed_pair.stream,
         },
         closed_pair.local.core_mut(),
-        minip2p_platform::Now::from_millis(10),
+        minip2p_core::platform::Now::from_millis(10),
     ));
     assert!(!closed.promoted().contains_key(&closed_key));
 
@@ -867,14 +867,14 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         inner.ingest(
             &carrier_gone,
             inner_pair.local.core_mut(),
-            minip2p_platform::Now::from_millis(10),
+            minip2p_core::platform::Now::from_millis(10),
         );
         assert!(!inner.promoted().contains_key(&inner_key));
         let events = inner_pair
             .local
             .core_mut()
             .transport_mut()
-            .poll(minip2p_platform::Now::from_millis(0))
+            .poll(minip2p_core::platform::Now::from_millis(0))
             .expect("promoted circuit closure");
         assert!(
             events.iter().any(|event| matches!(
@@ -897,7 +897,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
             conn_id: promoted,
         },
         circuit_pair.local.core_mut(),
-        minip2p_platform::Now::from_millis(10),
+        minip2p_core::platform::Now::from_millis(10),
     );
     assert!(!circuit.promoted().contains_key(&circuit_key));
 
@@ -917,7 +917,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
     // The batch's capability pass runs the bounded safety sweep.
     swept.tick(
         swept_pair.local.core_mut(),
-        minip2p_platform::Now::from_millis(10),
+        minip2p_core::platform::Now::from_millis(10),
     );
     assert!(swept.promoted().is_empty());
 }

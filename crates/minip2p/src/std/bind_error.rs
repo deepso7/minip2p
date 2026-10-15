@@ -6,8 +6,8 @@
 //! fails later is a runtime [`Error`](super::Error) or a capability failure
 //! event, never one of these.
 
+use minip2p_core::platform::IoErrorKind;
 use minip2p_core::{Multiaddr, MultiaddrError};
-use minip2p_platform::IoErrorKind;
 #[cfg(feature = "tcp")]
 use minip2p_transport::ConnectionNamespace;
 use minip2p_transport::{TransportError, TransportSetError};

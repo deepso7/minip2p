@@ -11,9 +11,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use minip2p_core::platform::{Now, StdEntropy};
 use minip2p_core::{Multiaddr, PeerAddr, Protocol};
 use minip2p_identity::{Ed25519Keypair, PeerId};
-use minip2p_platform::{Now, StdEntropy};
 use minip2p_tcp::{StdTcpProvider, TcpProvider, TcpTransport};
 use minip2p_transport::{
     Bytes, ConnectionId, ConnectionToken, PollSource, SharedPoll, StreamId, Transport,

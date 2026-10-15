@@ -14,8 +14,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use minip2p_core::PeerId;
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_platform::{Deadline, Now};
 use minip2p_pubsub::{
     ControlMessage, FrameDecode, GossipsubAction, GossipsubAgent, GossipsubConfig, GossipsubToken,
     MESHSUB_PROTOCOL_ID_V11, RawMessage, Rpc, SubOpts, decode_frame, encode_frame,

@@ -411,7 +411,6 @@ version = "0.8.3"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
- "minip2p-platform",
  "minip2p-secure-mux",
  "minip2p-transport",
  "thiserror",
@@ -422,6 +421,7 @@ name = "minip2p-core"
 version = "0.8.3"
 dependencies = [
  "bytes",
+ "getrandom",
  "minip2p-identity",
  "thiserror",
 ]
@@ -440,7 +440,6 @@ version = "0.8.3"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
- "minip2p-platform",
  "thiserror",
 ]
 
@@ -459,7 +458,6 @@ dependencies = [
  "minip2p-mdns",
  "minip2p-multistream-select",
  "minip2p-noise",
- "minip2p-platform",
  "minip2p-pubsub",
  "minip2p-relay",
  "minip2p-secure-mux",
@@ -496,7 +494,6 @@ version = "0.8.3"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
- "minip2p-platform",
  "thiserror",
 ]
 
@@ -531,20 +528,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "minip2p-platform"
-version = "0.8.3"
-dependencies = [
- "getrandom",
- "thiserror",
-]
-
-[[package]]
 name = "minip2p-pubsub"
 version = "0.8.3"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
- "minip2p-platform",
  "minip2p-swarm",
  "minip2p-transport",
  "thiserror",
@@ -566,7 +554,6 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-noise",
- "minip2p-platform",
  "minip2p-transport",
  "minip2p-yamux",
  "thiserror",
@@ -581,7 +568,6 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-ping",
- "minip2p-platform",
  "minip2p-transport",
  "thiserror",
 ]
@@ -608,7 +594,6 @@ name = "minip2p-transport"
 version = "0.8.3"
 dependencies = [
  "minip2p-core",
- "minip2p-platform",
  "mio",
  "thiserror",
 ]
@@ -618,7 +603,6 @@ name = "minip2p-yamux"
 version = "0.8.3"
 dependencies = [
  "minip2p-core",
- "minip2p-platform",
  "thiserror",
 ]
 

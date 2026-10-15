@@ -1,4 +1,4 @@
-use crate::Deadline;
+use super::Deadline;
 
 /// A single time sample handed to caller-driven components.
 ///

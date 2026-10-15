@@ -9,10 +9,10 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use minip2p_core::platform::{Clock, Now, StdClock, StdEntropy};
 use minip2p_core::{Bytes, PeerId};
 use minip2p_identify::IdentifyConfig;
 use minip2p_ping::PingConfig;
-use minip2p_platform::{Clock, Now, StdClock, StdEntropy};
 use minip2p_transport::{
     BlockingTransport, ConnectionId, PollSource, SharedPoll, StreamId, TransportError, WaitHandle,
     WakeHandle,
@@ -51,7 +51,7 @@ pub const RUN_UNTIL_SKIP_LIMIT: usize = 1024;
 /// caller with a strict operation timeout checks its own clock before each
 /// wait.
 ///
-/// # Not [`minip2p_platform::Deadline`]
+/// # Not [`minip2p_core::platform::Deadline`]
 ///
 /// The two are deliberately distinct types. This one is how
 /// long a *caller* is prepared to block, so it is measured in real time and
@@ -658,7 +658,7 @@ mod tests {
         /// Every time sample the driver handed to `poll`.
         samples: Vec<Now>,
         /// Reported verbatim from `next_deadline`.
-        deadline: Option<minip2p_platform::Deadline>,
+        deadline: Option<minip2p_core::platform::Deadline>,
         /// Socket-less input from other threads, announced on the shared
         /// `Waker` this keeps from `attach`.
         inbox: Option<std::sync::mpsc::Receiver<TransportEvent>>,
@@ -741,7 +741,7 @@ mod tests {
             self.address_revision
         }
 
-        fn next_deadline(&self) -> Option<minip2p_platform::Deadline> {
+        fn next_deadline(&self) -> Option<minip2p_core::platform::Deadline> {
             self.deadline
         }
     }
@@ -1049,7 +1049,9 @@ mod tests {
         };
         let transport = IdleTransport {
             // Absolute, on the driver's timeline: 40ms past the current sample.
-            deadline: Some(minip2p_platform::Deadline::from_millis(1_000 + DEADLINE_MS)),
+            deadline: Some(minip2p_core::platform::Deadline::from_millis(
+                1_000 + DEADLINE_MS,
+            )),
             ..IdleTransport::default()
         };
 
@@ -2406,7 +2408,7 @@ mod tests {
                 .core
                 .state
                 .next_deadline(Now::from_millis(clock.now_ms())),
-            Some(minip2p_platform::Deadline::from_millis(
+            Some(minip2p_core::platform::Deadline::from_millis(
                 clock.now_ms() + PING_TIMEOUT_MS + 1
             )),
             "ping must be in flight with an armed core timer"

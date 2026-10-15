@@ -20,7 +20,6 @@ std = [
   "dep:socket2",
   "minip2p-core/std",
   "minip2p-identity/std",
-  "minip2p-platform/std",
   "minip2p-secure-mux/std",
   "minip2p-transport/std",
   "thiserror/std",
@@ -34,16 +33,15 @@ minip2p-core = { path = "../../crates/core", version = "0.8.3", default-features
 minip2p-identity = { path = "../../crates/identity", version = "0.8.3", default-features = false, features = [
   "ed25519",
 ] }
-minip2p-platform = { path = "../../crates/platform", version = "0.8.3", default-features = false }
 minip2p-secure-mux = { path = "../../crates/secure-mux", version = "0.8.3", default-features = false }
 minip2p-transport = { path = "../../crates/transport", version = "0.8.3", default-features = false }
-mio = { version = "1.2", features = ["net", "os-poll"], optional = true }
-socket2 = { version = "0.6.5", optional = true }
+mio = { workspace = true, optional = true }
+socket2 = { workspace = true, optional = true }
 minip2p-smoltcp = { path = "../../crates/smoltcp", version = "0.8.3", optional = true }
-thiserror = { version = "2.0.20", default-features = false }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-criterion = "0.8.2"
+criterion = { workspace = true }
 minip2p-identity = { path = "../../crates/identity", features = [
   "ed25519",
   "std",

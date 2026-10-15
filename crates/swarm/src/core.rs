@@ -10,10 +10,10 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::{IdentifyConfig, IdentifyMessage};
 use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
-use minip2p_platform::{Deadline, EntropySource, Now};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
 use crate::events::{SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
@@ -1019,11 +1019,11 @@ mod tests {
     use alloc::vec;
 
     use crate::state::OUTBOUND_NEGOTIATION_TIMEOUT_MS;
+    use minip2p_core::platform::EntropyError;
     use minip2p_identify::IDENTIFY_PROTOCOL_ID;
     use minip2p_identity::Ed25519Keypair;
     use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
     use minip2p_ping::PING_PROTOCOL_ID;
-    use minip2p_platform::EntropyError;
     use minip2p_transport::{ConnectionEndpoint, TransportEvent};
 
     #[test]
@@ -1072,7 +1072,10 @@ mod tests {
     struct SeqEntropy(u8);
 
     impl EntropySource for SeqEntropy {
-        fn fill_bytes(&mut self, output: &mut [u8]) -> Result<(), minip2p_platform::EntropyError> {
+        fn fill_bytes(
+            &mut self,
+            output: &mut [u8],
+        ) -> Result<(), minip2p_core::platform::EntropyError> {
             for byte in output.iter_mut() {
                 *byte = self.0;
                 self.0 = self.0.wrapping_add(1);

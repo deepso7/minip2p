@@ -5,7 +5,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use minip2p_core::Multiaddr;
-use minip2p_platform::{Deadline, Now};
+use minip2p_core::platform::{Deadline, Now};
 
 use crate::io::{MAX_DATAGRAM_BYTES, MdnsError, MdnsIo, source_is_on_link};
 use crate::{MdnsAction, MdnsAgent, MdnsConfig, MdnsEvent};
@@ -516,8 +516,8 @@ mod tests {
     use alloc::vec;
     use core::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
     use minip2p_core::PeerId;
+    use minip2p_core::platform::IoErrorKind;
     use minip2p_identity::{KeyType, PublicKey};
-    use minip2p_platform::IoErrorKind;
 
     /// An `MdnsIo` that carries nothing, scripted per test.
     #[derive(Default)]

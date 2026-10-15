@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
 use minip2p_core::Multiaddr;
-use minip2p_platform::{EntropyError, EntropySource, IoErrorKind, Now};
+use minip2p_core::platform::{EntropyError, EntropySource, IoErrorKind, Now};
 use minip2p_tcp::{SocketHandle, TcpError, TcpEvent, TcpIoOperation, TcpProvider};
 
 /// Deterministic entropy, so a failing test reproduces exactly.

@@ -2,7 +2,7 @@
 //!
 //! [`RelayServerAgent`] owns reservations, admission, control deadlines,
 //! circuit forwarding, limits, and typed lifecycle events. It owns no sockets,
-//! clocks, waits, or executor: the host supplies one [`minip2p_platform::Now`]
+//! clocks, waits, or executor: the host supplies one [`minip2p_core::platform::Now`]
 //! sample, feeds Swarm events, drains [`RelayServerAction`] values, and echoes
 //! every result with its opaque [`RelayServerToken`]. After every claimed
 //! input, actions and synchronous results must be drained to quiescence before

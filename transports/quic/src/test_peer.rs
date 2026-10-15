@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use minip2p_core::PeerAddr;
+use minip2p_core::platform::Now;
 use minip2p_identity::Ed25519Keypair;
-use minip2p_platform::Now;
 use minip2p_transport::{ConnectionId, Transport, TransportEvent};
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn_proto::{

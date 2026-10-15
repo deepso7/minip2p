@@ -1,12 +1,12 @@
 use core::fmt;
 
-use crate::Now;
+use super::Now;
 
 /// A point on a clock's monotonic timeline, in milliseconds.
 ///
 /// Caller-driven components report deadlines so the host knows how long it may
 /// idle before polling again. A deadline is only comparable to [`Now`] samples
-/// from the same [`Clock`](crate::Clock), since monotonic epochs are arbitrary.
+/// from the same [`Clock`](super::Clock), since monotonic epochs are arbitrary.
 ///
 /// Ordering is chronological, so the earliest deadline in a collection is its
 /// minimum and [`NEVER`](Self::NEVER) sorts last.

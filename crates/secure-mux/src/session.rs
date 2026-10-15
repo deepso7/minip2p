@@ -5,10 +5,10 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use minip2p_core::Bytes;
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
 use minip2p_noise::{NOISE_PROTOCOL_ID, NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
-use minip2p_platform::{Deadline, Now};
 use minip2p_transport::StreamId;
 use minip2p_yamux::{YAMUX_PROTOCOL_ID, YamuxOutput, YamuxRole, YamuxSession};
 use thiserror::Error;

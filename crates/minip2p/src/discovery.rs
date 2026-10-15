@@ -7,6 +7,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
+use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, select_direct_addrs};
 #[cfg(feature = "pubsub")]
 use minip2p_discovery::{BeaconAction, BeaconAgent, BeaconEvent};
@@ -15,7 +16,6 @@ use minip2p_discovery::{DiscoveryAction, DiscoverySource, PeerDiscoveryAgent};
 use minip2p_mdns::MdnsEvent;
 #[cfg(feature = "_nat-driver")]
 use minip2p_nat::NatEvent;
-use minip2p_platform::{Deadline, EntropySource, Now};
 #[cfg(feature = "pubsub")]
 use minip2p_pubsub::GossipsubEvent;
 use minip2p_swarm::{SwarmCore, SwarmEvent};

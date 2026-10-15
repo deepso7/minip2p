@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use gungraun::prelude::*;
+use minip2p_core::platform::Now;
 use minip2p_core::{Multiaddr, PeerId};
-use minip2p_platform::Now;
 use minip2p_relay::{
     HOP_PROTOCOL_ID, HopMessage, HopMessageType, Peer, Status, encode_frame, encode_stop_status,
 };

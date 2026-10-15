@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 use std::time::Instant;
 
+use minip2p_core::platform::{Clock, Now, StdClock};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_platform::{Clock, Now, StdClock};
 use minip2p_quic::{QuicLimits, QuicNodeConfig, QuicTransport};
 use minip2p_transport::{Bytes, ConnectionId, Transport, TransportEvent};
 

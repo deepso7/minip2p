@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use minip2p_platform::{EntropySource, Now};
+use minip2p_core::platform::{EntropySource, Now};
 use minip2p_relay_server::{
     RelayServerAction, RelayServerAgent, RelayServerEvent, RelayServerSendError, RelayServerToken,
     StreamKey,
