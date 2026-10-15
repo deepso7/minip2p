@@ -144,10 +144,16 @@ impl Default for QuicLimits {
             max_pending_datagrams: 1_024,
             idle_timeout_ms: 30_000,
             require_address_validation: true,
-            memory_budget_bytes: 512 * 1024 * 1024,
-            stream_receive_window: 1_000_000,
-            connection_receive_window: 3 * 1024 * 1024,
-            send_window: 2 * 1024 * 1024,
+            // At least 64 connections with a stream each, dual-stack.
+            memory_budget_bytes: 640 * 1024 * 1024,
+            // #361: the smallest windows reaching 90% of a large window's
+            // goodput at 100 Mbit/s, 100 ms RTT (`endpoint_rtt` sweeps). The
+            // connection window holds more than three stream windows
+            // (ADR 0019), above the 1.5 MiB that throughput alone needs, so
+            // three stalled streams leave control streams credit.
+            stream_receive_window: 1536 * 1024,
+            connection_receive_window: 5 * 1024 * 1024,
+            send_window: 1216 * 1024,
         }
     }
 }
