@@ -3,10 +3,11 @@
 //!
 //! Each case connects a client to a target, then moves a fixed
 //! [`TOTAL`] bytes over one application stream in one direction. The client
-//! writes [`CHUNK`]-sized chunks and keeps up to [`IN_FLIGHT`] chunks ahead of
-//! what the target has received. A write the stream refuses (transport
-//! backpressure) is not counted and is retried once the endpoint has been
-//! driven. The target counts bytes until the total arrives.
+//! writes [`CHUNK`]-sized chunks and keeps up to [`IN_FLIGHT`] bytes ahead of
+//! what the target has received, well past the transports' own windows, so
+//! transport backpressure rather than the bench bounds the rate. A write the
+//! stream refuses (that backpressure) is not counted and is retried once the
+//! endpoint has been driven. The target counts bytes until the total arrives.
 //!
 //! Every case runs two transfers on fresh streams of the same connection:
 //!
@@ -25,6 +26,7 @@
 //! of its legs together). They count datagrams the Endpoint's QUIC sockets
 //! actually sent or received, not packets the QUIC engine generated, from the
 //! `diagnostics` counters of `minip2p-quic` that the `bench` feature enables.
+//! Each such Endpoint's granted socket buffer sizes are printed alongside.
 //!
 //! Allocations come from `stats_alloc`, installed as this binary's global
 //! allocator, and cover every thread in the process (sender, target and, for
@@ -56,7 +58,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use minip2p::{Bytes, Endpoint, EndpointEvent, PeerId, RelayServerEvent};
-use minip2p_quic::{DatagramCounters, datagram_counters};
+use minip2p_quic::{DatagramCounters, datagram_counters, socket_buffers};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Stats, StatsAlloc};
 use support::{Driven, Relayed, SETUP_TIMEOUT, bind_on, bind_relay, next_event, send_chunk};
 
@@ -65,11 +67,14 @@ static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
 const PROTOCOL: &str = "/minip2p/bench/sink/1";
 /// Bytes moved per transfer.
-const TOTAL: u64 = 64 * MB;
+const TOTAL: u64 = 256 * MB;
 /// Bytes per write.
 const CHUNK: usize = 64 * 1024;
-/// Chunks the client may have written ahead of what the target received.
-const IN_FLIGHT: u64 = 8;
+/// Bytes the client may have written ahead of what the target received: more
+/// than QUIC's connection and send windows (10 MB each) plus the adapter's
+/// pending-send queue per connection (`max_pending_connection_bytes`, 8 MiB)
+/// can hold.
+const IN_FLIGHT: u64 = 32 * MB;
 /// Upper bound for one transfer.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 const MB: u64 = 1 << 20;
@@ -193,9 +198,7 @@ fn transfer(
             Instant::now() < deadline,
             "transfer timed out at {sent} bytes"
         );
-        while sent < TOTAL
-            && sent - progress.received.load(Ordering::Acquire) < IN_FLIGHT * CHUNK as u64
-        {
+        while sent < TOTAL && sent - progress.received.load(Ordering::Acquire) < IN_FLIGHT {
             let (accepted, full) = send_chunk(client, (conn, stream), &chunk, &mut held);
             sent += accepted;
             if full {
@@ -237,7 +240,13 @@ fn rows(case: &str, roles: &Roles, timing: (Mark, Mark), allocation: (Mark, Mark
     .collect();
 
     let marks = timing.0.datagrams.iter().zip(&timing.1.datagrams);
-    for ((role, _), (start, end)) in roles.0.iter().zip(marks) {
+    for ((role, peer), (start, end)) in roles.0.iter().zip(marks) {
+        if let Some(buffers) = socket_buffers(peer) {
+            println!(
+                "endpoint_throughput/{case}/{role}: socket buffers {} B send, {} B receive",
+                buffers.send_bytes, buffers.recv_bytes
+            );
+        }
         let counts = end.since(start);
         for (direction, datagrams, bytes) in [
             ("sent", counts.sent, counts.sent_bytes),
