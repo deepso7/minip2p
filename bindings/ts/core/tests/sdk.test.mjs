@@ -968,6 +968,125 @@ test("peer streams that close without data before dispatch leave the queue whole
   endpoint.close();
 });
 
+function connectionEvent(tag, connId) {
+  return { inner: { connId, peerId: "peer" }, tag };
+}
+
+test("connections that end unseen without data leave the queue whole", async () => {
+  // ADR 0012 (#356): peer churn while nothing is dispatched leaves no trace,
+  // and every elided event still reaches the adapter.
+  const backend = new MockBackend();
+  let handled = 0;
+  backend.eventHandled = () => {
+    handled += 1;
+  };
+  const endpoint = new TestMinip2p(backend);
+  const seen = [];
+  endpoint.on((event) => seen.push(event.type));
+  for (let connId = 10; connId < 1010; connId += 1) {
+    backend.emit(connectionEvent(P2pEvent_Tags.ConnectionEstablished, connId));
+    backend.emit({
+      inner: { connId, peerId: "peer", protocols: [] },
+      tag: P2pEvent_Tags.PeerReady,
+    });
+    backend.emit(streamReady({ connId, streamId: 1 }));
+    backend.emit(connectionEvent(P2pEvent_Tags.ConnectionClosed, connId));
+  }
+  await tick();
+
+  assert.deepEqual(seen, []);
+  assert.equal(handled, 4000);
+
+  // A connection that carried data is kept, with its end.
+  backend.emit(connectionEvent(P2pEvent_Tags.ConnectionEstablished, 5));
+  backend.emit(streamReady({ connId: 5, streamId: 1 }));
+  backend.emit({
+    inner: {
+      connId: 5,
+      data: new Uint8Array([1]).buffer,
+      peerId: "peer",
+      streamId: 1,
+    },
+    tag: P2pEvent_Tags.StreamData,
+  });
+  backend.emit(connectionEvent(P2pEvent_Tags.ConnectionClosed, 5));
+  await tick();
+  assert.deepEqual(seen, [
+    "connectionEstablished",
+    "inboundStream",
+    "connectionClosed",
+  ]);
+  endpoint.close();
+});
+
+test("an unseen connection replaced folds into its successor", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const seen = [];
+  endpoint.on((event) => seen.push([event.type, event.connId]));
+  backend.emit(connectionEvent(P2pEvent_Tags.ConnectionEstablished, 2));
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", protocols: [] },
+    tag: P2pEvent_Tags.PeerReady,
+  });
+  for (const [oldConnId, newConnId] of [
+    [2, 3],
+    [3, 4],
+  ]) {
+    backend.emit({
+      inner: { newConnId, oldConnId, peerId: "peer" },
+      tag: P2pEvent_Tags.ConnectionReplaced,
+    });
+  }
+  // Readiness is the survivor's own, never the replaced connection's.
+  backend.emit({
+    inner: { connId: 4, peerId: "peer", protocols: [] },
+    tag: P2pEvent_Tags.PeerReady,
+  });
+  await tick();
+
+  assert.deepEqual(seen, [
+    ["connectionEstablished", 4],
+    ["peerReady", 4],
+  ]);
+  endpoint.close();
+});
+
+test("a connection the application opened a stream on keeps its end", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  backend.emit(connectionEvent(P2pEvent_Tags.ConnectionEstablished, 2));
+  // Opened before the establishment was dispatched.
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 60_000 });
+  backend.emit(connectionEvent(P2pEvent_Tags.ConnectionClosed, 2));
+  await tick();
+
+  // Rejected by the close, not left to its timeout.
+  assert.equal(await remainsPending(opening), false);
+  await assert.rejects(opening);
+  endpoint.close();
+});
+
+test("a data event coalesced into the one before it is released to the adapter", async () => {
+  const backend = new MockBackend();
+  const handled = [];
+  backend.eventHandled = (event) => handled.push(event.tag);
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  await opening;
+  backend.emit(streamData(new Uint8Array([1]), 3));
+  backend.emit(streamData(new Uint8Array([2]), 3));
+  await tick();
+
+  assert.deepEqual(handled, [
+    P2pEvent_Tags.StreamReady,
+    P2pEvent_Tags.StreamData,
+    P2pEvent_Tags.StreamData,
+  ]);
+  endpoint.close();
+});
+
 test("a data listener attached after a clean close drains and consumes the unread bytes", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);

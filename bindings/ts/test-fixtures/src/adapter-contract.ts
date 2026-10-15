@@ -43,6 +43,8 @@ export interface FakeNativeState {
   readonly writtenData: readonly Uint8Array[];
   /** Native `streamConsumed` calls, in call order. */
   readonly consumed: readonly NativeConsumed[];
+  /** Native `abandonStream` calls, in call order. */
+  readonly abandoned: readonly NativeStreamRef[];
 }
 
 /** One native `streamConsumed` call, in runtime-neutral form. */
@@ -358,12 +360,17 @@ export function describeAdapterContract(
       endpoint.on("inboundDirectUpgrade", ({ oldConnId }) =>
         upgrades.push(oldConnId)
       );
-      // Lifecycle events come first in a batch, then the path events.
+      // Seen before it is replaced: an unseen connection would fold into
+      // its successor instead.
       native.deliver([
         {
           inner: { connId: CONN_ID, peerId: PEER },
           tag: "ConnectionEstablished",
         },
+      ]);
+      await drained();
+      // Lifecycle events come first in a batch, then the path events.
+      native.deliver([
         {
           inner: { newConnId: NEXT_CONN_ID, oldConnId: CONN_ID, peerId: PEER },
           tag: "ConnectionReplaced",
@@ -535,6 +542,79 @@ export function describeAdapterContract(
         { bytes: 3, connId: CONN_ID, streamId: 4n },
       ]);
       expect(await stream.read()).toBeUndefined();
+      endpoint.close();
+    });
+
+    // ADR 0012 (#356): bytes a stream delivered hold its ended connection's
+    // native slot until acknowledged or abandoned, so every path the SDK
+    // settles them on must still reach native after the adapter released
+    // the connection's identity.
+    const lateStream = { connId: CONN_ID, peerId: PEER, streamId: 4n };
+    const closedConnection: NativeEventLiteral = {
+      inner: { connId: CONN_ID, peerId: PEER },
+      tag: "ConnectionClosed",
+    };
+
+    test("a late StreamReady and the data behind it settle after the connection closed", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      // No handler claims the stream, so the SDK abandons it, then discards
+      // its data as untracked: both after the close was normalized.
+      native.deliver([
+        {
+          inner: {
+            ...lateStream,
+            initiatedLocally: false,
+            protocolId: "/test/1",
+          },
+          tag: "StreamReady",
+        },
+        {
+          inner: { ...lateStream, data: new Uint8Array([1, 2]).buffer },
+          tag: "StreamData",
+        },
+        closedConnection,
+      ]);
+      await drained();
+
+      expect(native.abandoned).toEqual([{ connId: CONN_ID, streamId: 4n }]);
+      expect(native.consumed).toEqual([
+        { bytes: 2, connId: CONN_ID, streamId: 4n },
+      ]);
+      endpoint.close();
+    });
+
+    test("bytes kept after a FIN settle when the connection ends", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      native.setNextStream(CONN_ID, 4n);
+      const opening = endpoint.openStream(PEER, "/test/1");
+      native.deliver([
+        {
+          inner: {
+            ...lateStream,
+            initiatedLocally: true,
+            protocolId: "/test/1",
+          },
+          tag: "StreamReady",
+        },
+        {
+          inner: { ...lateStream, data: new Uint8Array([1, 2, 3]).buffer },
+          tag: "StreamData",
+        },
+        { inner: lateStream, tag: "StreamRemoteWriteClosed" },
+        closedConnection,
+      ]);
+      await drained();
+      await opening;
+
+      // The connection ended, so the unread bytes are discarded: released
+      // through the handle the stream took while its events were in flight.
+      expect(native.consumed).toEqual([
+        { bytes: 3, connId: CONN_ID, streamId: 4n },
+      ]);
       endpoint.close();
     });
 

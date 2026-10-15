@@ -328,6 +328,35 @@ class StreamTable<Value> {
   }
 }
 
+/** Every connection a native event names. */
+const connectionsOf = (event: P2pEvent): number[] => {
+  if (!("inner" in event)) {
+    return [];
+  }
+  const { inner } = event;
+  return [
+    "connId" in inner ? inner.connId : undefined,
+    "oldConnId" in inner ? inner.oldConnId : undefined,
+    "newConnId" in inner ? inner.newConnId : undefined,
+  ].filter((id): id is number => typeof id === "number");
+};
+
+/**
+ * Native events that leave a connection unseen. Anything else naming it is
+ * something the application acts on or must hear about, so it keeps the
+ * connection's events.
+ */
+const UNSEEN_CONNECTION_TAGS: ReadonlySet<string> = new Set<string>([
+  P2pEvent_Tags.PeerReady,
+  P2pEvent_Tags.IdentifyReceived,
+  P2pEvent_Tags.PingRttMeasured,
+  P2pEvent_Tags.PingTimeout,
+  P2pEvent_Tags.EndpointError,
+  P2pEvent_Tags.StreamRemoteWriteClosed,
+  P2pEvent_Tags.StreamWriteStopped,
+  P2pEvent_Tags.StreamClosed,
+]);
+
 /** The native per-stream event an item carries, if any. */
 const streamEventOf = (
   item: QueueItem
@@ -348,6 +377,15 @@ const streamEventOf = (
  * A peer-opened stream that closes without data before its `StreamReady`
  * is dispatched leaves the queue whole, so a peer opening and closing
  * streams cannot grow it; its events still reach `release`.
+ *
+ * Connections follow the same rule (ADR 0012): one that ends without data
+ * before any of its events was dispatched, whichever side dialed it, leaves
+ * with every event naming it. One replaced instead folds into its
+ * successor: its queued `ConnectionEstablished` is renamed to the successor
+ * and the `ConnectionReplaced` goes (as it does when the capacity already
+ * dropped that `ConnectionEstablished`). A connection the application knows
+ * otherwise -- a stream it opened, an attempt or path event naming it -- is
+ * kept.
  */
 class EventQueue {
   readonly #items = new Map<number, QueueItem>();
@@ -359,6 +397,8 @@ class EventQueue {
    * queued item ids; `undefined` once one carried data.
    */
   readonly #unseen = new StreamTable<number[] | undefined>();
+  /** Connections whose `ConnectionEstablished` is queued and unseen. */
+  readonly #unseenConnections = new Set<number>();
   readonly #capacity: number;
   readonly #release: (item: QueueItem) => void;
   #next = 0;
@@ -380,14 +420,14 @@ class EventQueue {
     const merged =
       newest === undefined ? undefined : coalesceData(newest, item);
     if (merged !== undefined && this.#newest !== undefined) {
-      // A data event retires no adapter IDs, so the absorbed one needs no
-      // `eventHandled`.
       this.#items.set(this.#newest, merged);
+      // The absorbed event is handled: its adapter state goes now.
+      this.#release(item);
       return undefined;
     }
     const id = this.#next;
     this.#next += 1;
-    if (this.#elideUnseen(item, id)) {
+    if (this.#elideUnseen(item, id) || this.#elideConnection(item)) {
       return undefined;
     }
     this.#items.set(id, item);
@@ -410,13 +450,105 @@ class EventQueue {
       return undefined;
     }
     const item = this.#remove(oldest);
-    if (
-      item?.source === "native" &&
-      item.event.tag === P2pEvent_Tags.StreamReady
-    ) {
-      this.#unseen.delete(item.event.inner.connId, item.event.inner.streamId);
+    if (item?.source === "native") {
+      if (item.event.tag === P2pEvent_Tags.StreamReady) {
+        this.#unseen.delete(item.event.inner.connId, item.event.inner.streamId);
+      }
+      for (const connId of connectionsOf(item.event)) {
+        this.#unseenConnections.delete(connId);
+      }
     }
     return item;
+  }
+
+  /** The application learned of `connId` outside the queue. */
+  markConnectionSeen(connId: number): void {
+    this.#unseenConnections.delete(connId);
+  }
+
+  /**
+   * Records `item` against the unseen connections it names. Returns whether
+   * it ended or replaced one that carried no data, which leaves the queue
+   * with that connection's items instead.
+   */
+  #elideConnection(item: QueueItem): boolean {
+    if (item.source !== "native") {
+      return false;
+    }
+    const { event } = item;
+    switch (event.tag) {
+      case P2pEvent_Tags.ConnectionEstablished: {
+        this.#unseenConnections.add(event.inner.connId);
+        return false;
+      }
+      case P2pEvent_Tags.ConnectionClosed: {
+        if (!this.#unseenConnections.delete(event.inner.connId)) {
+          return false;
+        }
+        this.#removeConnection(event.inner.connId);
+        this.#release(item);
+        return true;
+      }
+      case P2pEvent_Tags.ConnectionReplaced: {
+        const { newConnId, oldConnId } = event.inner;
+        if (!this.#unseenConnections.delete(oldConnId)) {
+          return false;
+        }
+        this.#renameOpening(oldConnId, newConnId);
+        this.#removeConnection(oldConnId);
+        this.#unseenConnections.add(newConnId);
+        this.#release(item);
+        return true;
+      }
+      case P2pEvent_Tags.StreamReady: {
+        if (event.inner.initiatedLocally) {
+          this.#unseenConnections.delete(event.inner.connId);
+        }
+        return false;
+      }
+      default: {
+        if (!UNSEEN_CONNECTION_TAGS.has(event.tag)) {
+          for (const connId of connectionsOf(event)) {
+            this.#unseenConnections.delete(connId);
+          }
+        }
+        return false;
+      }
+    }
+  }
+
+  /** Renames the queued `ConnectionEstablished` of `from` to `to`. */
+  #renameOpening(from: number, to: number): void {
+    for (const [id, queued] of this.#items) {
+      if (
+        queued.source === "native" &&
+        queued.event.tag === P2pEvent_Tags.ConnectionEstablished &&
+        queued.event.inner.connId === from
+      ) {
+        this.#items.set(id, {
+          event: {
+            ...queued.event,
+            inner: { ...queued.event.inner, connId: to },
+          },
+          source: "native",
+        });
+        return;
+      }
+    }
+  }
+
+  /** Removes every queued item naming `connId`, releasing each. */
+  #removeConnection(connId: number): void {
+    for (const [id, queued] of [...this.#items]) {
+      if (
+        queued.source === "native" &&
+        connectionsOf(queued.event).includes(connId)
+      ) {
+        this.#remove(id);
+        this.#release(queued);
+      }
+    }
+    this.#unseen.takeConnection(connId);
   }
 
   /**
@@ -1376,6 +1508,8 @@ export class Minip2pBase {
     let identity: { readonly connId: number; readonly streamId: number };
     try {
       identity = this.#backend.openStream(peerId, protocolId);
+      // The application now knows the connection: its end must reach it.
+      this.#queue.markConnectionSeen(identity.connId);
     } catch (error) {
       return Promise.reject(
         new OpenStreamError({
