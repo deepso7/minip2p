@@ -148,3 +148,29 @@ fn a_burst_past_the_receive_bound_drains_without_another_readiness_edge() {
     assert_eq!(transport.socket().received, TRAINS * SEGMENTS);
     assert!(!socket::has_queued_input(&transport.socket().udp));
 }
+
+#[test]
+fn sockets_are_granted_buffers_no_smaller_than_the_platform_default() {
+    let fresh = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let default = socket2::SockRef::from(&fresh);
+    let (default_send, default_recv) = (
+        default.send_buffer_size().expect("send buffer"),
+        default.recv_buffer_size().expect("recv buffer"),
+    );
+    let mut server = listening_server(QuicLimits::default());
+    let buffers = server.socket().buffers;
+    assert!(buffers.send_bytes >= default_send, "{buffers:?}");
+    assert!(buffers.recv_bytes >= default_recv, "{buffers:?}");
+    assert!(buffers.send_bytes > 0 && buffers.recv_bytes > 0);
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn diagnostics_report_the_granted_socket_buffers() {
+    let mut server = listening_server(QuicLimits::default());
+    let granted = server.socket().buffers;
+    assert_eq!(
+        crate::socket_buffers(&server.local_peer_id()),
+        Some(granted)
+    );
+}

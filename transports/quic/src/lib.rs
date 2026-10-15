@@ -50,7 +50,9 @@ mod write_fairness_tests;
 
 pub use config::{QuicLimits, QuicNodeConfig};
 #[cfg(feature = "diagnostics")]
-pub use diagnostics::{ConnectionDiagnostics, DatagramCounters, datagram_counters};
+pub use diagnostics::{
+    ConnectionDiagnostics, DatagramCounters, SocketBuffers, datagram_counters, socket_buffers,
+};
 pub use error::{QuicBindError, QuicTlsStage};
 
 use connection::{Cx, QuicConnection, SendCaps};

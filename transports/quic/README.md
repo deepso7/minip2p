@@ -101,6 +101,8 @@ Datagrams route by destination connection ID only, never by source address, so p
 
 Each socket is driven through quinn-udp, which uses what the platform offers:
 
+- **Socket buffers.** `SO_SNDBUF` and `SO_RCVBUF` are raised toward a fixed 4 MiB, best effort and with no knob: a size the platform refuses is halved and retried, one it caps (Linux, at `net.core.wmem_max`/`rmem_max`) is kept as granted, and a buffer is never shrunk. The `diagnostics` feature reports what was granted.
+
 - **GSO.** One transmit carries up to 10 datagrams of one segment size, quinn's own cap; larger trains arrive as bursts a receiver's socket buffer drops. Where the platform refuses a segmented send (`EIO`/`EINVAL` on Linux), quinn-udp sends single datagrams from then on. The refused batch is treated as lost, and loss recovery resends it.
 - **GRO.** One receive buffer holds a full GRO batch, which is split into its datagrams by stride.
 - **ECN** codepoints are read and set, and **packet info** gives the local address a datagram was sent to, so a reply leaves from that address.
@@ -120,6 +122,7 @@ The off-by-default `diagnostics` feature compiles in counters for comparing fast
 - `QuicTransport::connection_diagnostics(id)` returns a live connection's `ConnectionDiagnostics`: datagrams routed to it, flushes (passes that asked the engine for output, from any trigger), and the engine's own figures from quinn's connection stats: UDP datagrams and bytes it produced (sent, or retained for a writable socket), packets it declared lost, the current congestion window and the smoothed RTT. `flushes_per_datagram()` and `average_datagram_bytes()` derive ratios from them.
 - Each connection prints its totals to stderr when dropped, as `minip2p-quic diagnostics <id>: ...`, so a host can compare runs without reading them through the transport.
 - `datagram_counters(&peer_id)` returns the `DatagramCounters` of every live transport bound with that identity, both address families together: datagrams and bytes the sockets actually sent or received, each GSO or GRO segment counted once. A datagram retained on `WouldBlock` counts once it leaves. Any thread can read them; `DatagramCounters::since` subtracts an earlier snapshot.
+- `socket_buffers(&peer_id)` returns the `SocketBuffers` the OS granted that identity's sockets (the smallest per direction, since the first live transport with it was bound), as the OS reports them: Linux reports twice the size set.
 
 `minip2p-rs`'s `bench` feature enables this for the `endpoint_throughput` bench. An application enables it by naming the feature on its own `minip2p-quic` dependency.
 

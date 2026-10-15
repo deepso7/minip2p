@@ -10,9 +10,11 @@
 //! - [`DatagramCounters`], per local identity: datagrams actually handed to
 //!   or read from the UDP sockets of every transport bound with that
 //!   identity, both address families included. Read them from any thread with
-//!   [`datagram_counters`].
+//!   [`datagram_counters`], and the socket buffer sizes the OS granted with
+//!   [`socket_buffers`].
 //!
-//! Without the feature the public items here do not exist, and the recording
+//! Without the feature the public items here do not exist (bar
+//! [`SocketBuffers`], which the sockets record either way), and the recording
 //! hooks the transport calls are empty inline functions.
 
 #[cfg(feature = "diagnostics")]
@@ -110,24 +112,53 @@ impl DatagramCounters {
     }
 }
 
+/// Kernel buffer sizes the OS granted a UDP socket, in bytes, as it reports
+/// them (Linux reports twice what was set). 0 where the OS could not say.
+///
+/// The transport asks for a fixed size best effort; there is no knob.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SocketBuffers {
+    /// `SO_SNDBUF`.
+    pub send_bytes: usize,
+    /// `SO_RCVBUF`.
+    pub recv_bytes: usize,
+}
+
+/// The smallest buffers granted to any socket bound with `peer` as its
+/// identity since the first live transport with it was bound, each direction
+/// on its own, ignoring sizes the OS could not report; `None` once all of
+/// them are dropped, or if none was bound.
+#[cfg(feature = "diagnostics")]
+pub fn socket_buffers(peer: &PeerId) -> Option<SocketBuffers> {
+    let tally = lookup(peer)?;
+    *tally
+        .buffers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The counters of every live transport bound with `peer` as its identity;
 /// zeros once all of them are dropped, or if none was bound.
 #[cfg(feature = "diagnostics")]
 pub fn datagram_counters(peer: &PeerId) -> DatagramCounters {
-    // Only the lookup holds the lock; the upgraded `Arc` keeps the counters
-    // alive for the loads.
-    let tally = REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .find(|(id, _)| id == peer)
-        .and_then(|(_, tally)| tally.upgrade());
-    tally.map_or_else(DatagramCounters::default, |tally| DatagramCounters {
+    lookup(peer).map_or_else(DatagramCounters::default, |tally| DatagramCounters {
         sent: tally.sent.load(Relaxed),
         sent_bytes: tally.sent_bytes.load(Relaxed),
         received: tally.received.load(Relaxed),
         received_bytes: tally.received_bytes.load(Relaxed),
     })
+}
+
+/// `peer`'s live tally. Only the lookup holds the registry lock; the upgraded
+/// `Arc` keeps the counters alive for the reads.
+#[cfg(feature = "diagnostics")]
+fn lookup(peer: &PeerId) -> Option<Arc<Atomics>> {
+    REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|(id, _)| id == peer)
+        .and_then(|(_, tally)| tally.upgrade())
 }
 
 #[cfg(feature = "diagnostics")]
@@ -146,6 +177,8 @@ struct Atomics {
     sent_bytes: AtomicU64,
     received: AtomicU64,
     received_bytes: AtomicU64,
+    /// Smallest granted per direction across the identity's sockets.
+    buffers: Mutex<Option<SocketBuffers>>,
 }
 
 /// Live tallies by identity. Transports with the same identity, such as a
@@ -190,6 +223,35 @@ impl DatagramTally {
         }
         #[cfg(not(feature = "diagnostics"))]
         Self {}
+    }
+
+    /// A socket of this identity was granted `buffers`.
+    #[cfg_attr(
+        not(feature = "diagnostics"),
+        expect(
+            unused_variables,
+            reason = "the hooks record nothing without the feature"
+        )
+    )]
+    pub(crate) fn record_socket_buffers(&self, buffers: SocketBuffers) {
+        #[cfg(feature = "diagnostics")]
+        {
+            let mut smallest = self
+                .atomics
+                .buffers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // 0 means the OS could not say, so it never wins the minimum.
+            let min = |known: usize, granted: usize| match (known, granted) {
+                (0, granted) => granted,
+                (known, 0) => known,
+                (known, granted) => known.min(granted),
+            };
+            *smallest = Some(smallest.map_or(buffers, |known| SocketBuffers {
+                send_bytes: min(known.send_bytes, buffers.send_bytes),
+                recv_bytes: min(known.recv_bytes, buffers.recv_bytes),
+            }));
+        }
     }
 
     /// The socket accepted `datagrams` datagrams totalling `bytes` bytes.
