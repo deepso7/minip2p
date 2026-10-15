@@ -129,6 +129,12 @@ impl InboundCircuit {
         self.done
     }
 
+    /// Accepted, and not yet adopted by the host (which then counts the
+    /// circuit itself) nor given up.
+    pub(crate) fn holds_circuit_slot(&self) -> bool {
+        !self.done && self.source.is_some() && self.promoted.is_none()
+    }
+
     pub(crate) fn next_deadline(&self) -> Option<u64> {
         if self.done {
             return None;
@@ -216,23 +222,18 @@ impl InboundCircuit {
 
         let Ok(source) = PeerId::from_bytes(&request.source_peer_id) else {
             // Unusable source identity: reject and drop the circuit.
-            if stop.reject(Status::MalformedMessage).is_err() {
-                self.abandon(true, swarm, shared, now);
-                return;
-            }
-            let mut outbound = Vec::new();
-            while let Some(output) = stop.poll_output() {
-                if let StopResponderOutput::Outbound(bytes) = output {
-                    outbound.push(bytes);
-                }
-            }
-            for bytes in outbound {
-                send(swarm, &self.relay, self.inner_conn, self.stream, bytes, now);
-            }
-            self.abandon(true, swarm, shared, now);
+            self.refuse(Status::MalformedMessage, swarm, shared, now);
             return;
         };
+        // Reserved before acceptance: past the circuit limit, refuse.
+        if !shared.reserve_circuit(swarm) {
+            self.refuse(Status::ResourceLimitExceeded, swarm, shared, now);
+            return;
+        }
 
+        let Some(stop) = self.stop.as_mut() else {
+            return;
+        };
         if stop.accept().is_err() {
             self.abandon(true, swarm, shared, now);
             return;
@@ -259,6 +260,27 @@ impl InboundCircuit {
         // handshake. DCUtR is opened later on the promoted connection.
         self.pending_data = pipelined;
         self.promote(shared);
+    }
+
+    /// Answers the STOP CONNECT with `status` and drops the circuit.
+    fn refuse(&mut self, status: Status, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
+        let Some(stop) = self.stop.as_mut() else {
+            return;
+        };
+        if stop.reject(status).is_err() {
+            self.abandon(true, swarm, shared, now);
+            return;
+        }
+        let mut outbound = Vec::new();
+        while let Some(output) = stop.poll_output() {
+            if let StopResponderOutput::Outbound(bytes) = output {
+                outbound.push(bytes);
+            }
+        }
+        for bytes in outbound {
+            send(swarm, &self.relay, self.inner_conn, self.stream, bytes, now);
+        }
+        self.abandon(true, swarm, shared, now);
     }
 
     /// Hands the exact bridge stream to the circuit transport, exactly once.

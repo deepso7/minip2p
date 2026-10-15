@@ -295,6 +295,14 @@ impl QuicConnection {
         self.conn.side().is_server()
     }
 
+    /// Every stream holding delivered bytes not yet acknowledged, with how
+    /// many: what the transport keeps counting once the connection is gone.
+    pub(crate) fn unsettled_streams(&self) -> impl Iterator<Item = (StreamId, usize)> + '_ {
+        self.stream_states
+            .iter()
+            .map(|(&raw, state)| (StreamId::new(raw), state.unacked))
+    }
+
     /// Whether the engine is done with this connection, which the transport
     /// then removes and reports `Closed`.
     pub(crate) fn is_drained(&self) -> bool {

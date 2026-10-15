@@ -29,7 +29,9 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 /// - After `close()` is called, the connection eventually emits `Closed`.
 ///   No further events are emitted for that connection id after `Closed`.
 /// - `ConnectionNotFound` is returned for any operation on an unknown or
-///   already-closed connection id.
+///   already-closed connection id, except that `ack_stream` and
+///   `reset_stream` still settle the streams of an unsettled connection (see
+///   [Backpressure](#backpressure)).
 ///
 /// ## Stream lifecycle
 ///
@@ -90,10 +92,23 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 ///   abandoned by a local `reset_stream`. Inbound streams past the stream
 ///   limit are refused, so received data per connection stays within the
 ///   stream limit times the stream window.
+/// - **The bound outlives the connection.** When a connection ends with
+///   unsettled streams it becomes an **unsettled connection**: it keeps its
+///   per-stream unacknowledged counts and its connection slot (see
+///   [`UnsettledConnections`](crate::UnsettledConnections)) until every
+///   stream settles, so close-and-reconnect churn cannot grow received data
+///   past the connection limit times that per-connection bound. Everything
+///   else about it is torn down as before, and `Closed` is still emitted.
+///   With every slot held, `dial` fails with
+///   [`TransportError::ResourceExhausted`] and inbound connections are
+///   refused. Timeouts never free delivered bytes.
 /// - Acknowledging more than a stream's unacknowledged bytes is
-///   [`TransportError::AckExceedsDelivered`]. Acknowledging a closed stream
-///   releases its bytes; acknowledging a settled or unknown stream (or
-///   connection) is a no-op.
+///   [`TransportError::AckExceedsDelivered`], also after its connection
+///   ended. Acknowledging a closed stream releases its bytes, also after its
+///   connection ended, without sending credit or producing events;
+///   acknowledging a settled or unknown stream (or connection) is a no-op.
+/// - `reset_stream` on a stream of an unsettled connection abandons its
+///   bytes and settles it outright, with no event.
 ///
 /// ## Event ordering
 ///
@@ -168,7 +183,8 @@ pub trait Transport {
     ///
     /// Emits `StreamClosed` if not already emitted. Pending writes are
     /// dropped, and the stream's unacknowledged bytes are abandoned: it
-    /// settles at once.
+    /// settles at once. On an unsettled connection (one that already
+    /// reported `Closed`) this only settles the stream, with no event.
     fn reset_stream(&mut self, id: ConnectionId, stream_id: StreamId)
     -> Result<(), TransportError>;
 
@@ -178,8 +194,10 @@ pub trait Transport {
     ///
     /// Fails with [`TransportError::AckExceedsDelivered`] when `bytes` is more
     /// than the stream's unacknowledged bytes. On a closed stream this
-    /// releases the bytes, and the stream's slot once none are left; on a
-    /// settled or unknown stream or connection it does nothing.
+    /// releases the bytes, and the stream's slot once none are left, also
+    /// after its connection ended (then the connection's slot goes with its
+    /// last unsettled stream); on a settled or unknown stream or connection
+    /// it does nothing.
     fn ack_stream(
         &mut self,
         id: ConnectionId,

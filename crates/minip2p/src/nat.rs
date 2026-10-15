@@ -70,6 +70,7 @@ pub(crate) struct CircuitOps<T> {
     inject_bridge_data: fn(&mut T, ConnectionId, StreamId, Bytes),
     adopt_bridge: fn(&mut T, BridgeAdoption) -> Result<ConnectionId, AdoptError>,
     reset_bridge: fn(&mut T, ConnectionId, StreamId) -> Result<(), TransportError>,
+    circuit_slots: fn(&T) -> usize,
 }
 
 #[cfg(feature = "_circuit-driver")]
@@ -95,6 +96,7 @@ impl<I: Transport, R: EntropySource> CircuitOps<CircuitTransport<I, R>> {
             reset_bridge: |transport, conn, stream| {
                 transport.inner_mut().reset_stream(conn, stream)
             },
+            circuit_slots: CircuitTransport::circuit_slots,
         }
     }
 }
@@ -123,6 +125,9 @@ pub(crate) struct NatDriver<T> {
     transport: PhantomData<fn(T)>,
     /// What the driver keeps around the swarm for the agent's commands.
     io: HostIo,
+    /// Circuit slots the transport holds, live and unsettled, which the
+    /// agent's circuit admission counts; none without circuits.
+    circuit_slots: fn(&T) -> usize,
     /// The bound-address revision the agent's `listen_addrs` were seeded
     /// from; callers can bind through any swarm path between driver turns.
     listen_addrs_revision: u64,
@@ -160,6 +165,7 @@ impl<T: Transport> NatDriver<T> {
             #[cfg(not(feature = "_circuit-driver"))]
             transport: PhantomData,
             io: HostIo::default(),
+            circuit_slots: |_| 0,
             // Matches a fresh runtime: seed only after a real `listen*`
             // call bumped the revision. Some transports report bound-but-
             // not-listening sockets from `local_addresses`, so syncing on
@@ -174,6 +180,7 @@ impl<T: Transport> NatDriver<T> {
     /// Lets relay bridges become circuit connections over this transport.
     #[cfg(feature = "_circuit-driver")]
     pub(crate) fn with_circuits(mut self, circuits: CircuitOps<T>) -> Self {
+        self.circuit_slots = circuits.circuit_slots;
         self.circuits = Some(circuits);
         self
     }
@@ -228,7 +235,7 @@ impl<T: Transport> NatDriver<T> {
             }
             Err(last)
         });
-        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
         self.agent.dial_result(&mut io, token, result, sample);
         self.pump(swarm, sample);
     }
@@ -241,7 +248,7 @@ impl<T: Transport> NatDriver<T> {
         swarm: &mut SwarmCore<T, R>,
         now: Now,
     ) {
-        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
         self.agent.cancel(&mut io, id, now);
     }
 
@@ -277,7 +284,7 @@ impl<T: Transport> NatDriver<T> {
         swarm: &mut SwarmCore<T, R>,
         sample: Now,
     ) {
-        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
         self.agent.connect(&mut io, id, peer, legs, sample);
         self.pump(swarm, sample);
     }
@@ -347,7 +354,7 @@ impl<T: Transport> NatDriver<T> {
             | SwarmEvent::ConnectionReplaced { new: conn_id, .. } => conn_id.is_circuit(),
             _ => false,
         };
-        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
         let handled = self.agent.handle_event(&mut io, event, is_circuit, now);
         // The agent consumes what it claims as it reads it, including bytes
         // past a CONNECT response that a promoted bridge's circuit takes
@@ -410,7 +417,7 @@ impl<T: Transport> NatDriver<T> {
         {
             return;
         }
-        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
         self.agent.handle_tick(&mut io, now);
         self.pump(swarm, now);
     }
@@ -552,7 +559,7 @@ impl<T: Transport> NatDriver<T> {
             crate::ConnectOutcome::Connected { conn_id } => Some(*conn_id),
             crate::ConnectOutcome::Failed(_) | crate::ConnectOutcome::Cancelled => None,
         };
-        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
         self.agent.settled(&mut io, *connect_id, kept, sample);
         self.pump(swarm, sample);
     }
@@ -674,7 +681,7 @@ impl<T: Transport> NatDriver<T> {
                         unsent_data,
                         remote_write_closed,
                     );
-                    let mut io = EndpointSwarm::new(swarm, &mut self.io);
+                    let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
                     self.agent.promote_result(
                         &mut io,
                         token,
@@ -686,7 +693,7 @@ impl<T: Transport> NatDriver<T> {
                 {
                     let key = (inner_conn, stream_id);
                     if let Some(existing) = self.promoted.get(&key).copied() {
-                        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+                        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
                         self.agent.promote_result(&mut io, token, Ok(existing), now);
                         return;
                     }
@@ -694,7 +701,7 @@ impl<T: Transport> NatDriver<T> {
                     // transport without circuit operations, so this is only
                     // reached by a relay the agent was never given.
                     let Some(circuits) = self.circuits.as_ref() else {
-                        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+                        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
                         self.agent.promote_result(
                             &mut io,
                             token,
@@ -731,7 +738,8 @@ impl<T: Transport> NatDriver<T> {
                     match (circuits.adopt_bridge)(swarm.transport_mut(), adoption) {
                         Ok(conn_id) => {
                             self.promoted.insert(key, conn_id);
-                            let mut io = EndpointSwarm::new(swarm, &mut self.io);
+                            let mut io =
+                                EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
                             self.agent.promote_result(&mut io, token, Ok(conn_id), now);
                         }
                         Err(error) => {
@@ -740,7 +748,8 @@ impl<T: Transport> NatDriver<T> {
                                 AdoptError::UnknownConnection => PromoteError::UnknownConnection,
                                 _ => PromoteError::Failed(error.to_string()),
                             };
-                            let mut io = EndpointSwarm::new(swarm, &mut self.io);
+                            let mut io =
+                                EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
                             self.agent
                                 .promote_result(&mut io, token, Err(promote_error), now);
                             if !matches!(error, AdoptError::UnknownConnection) {
@@ -876,11 +885,20 @@ struct HostIo {
 struct EndpointSwarm<'a, T: Transport, R: EntropySource> {
     swarm: &'a mut SwarmCore<T, R>,
     io: &'a mut HostIo,
+    circuit_slots: fn(&T) -> usize,
 }
 
 impl<'a, T: Transport, R: EntropySource> EndpointSwarm<'a, T, R> {
-    fn new(swarm: &'a mut SwarmCore<T, R>, io: &'a mut HostIo) -> Self {
-        Self { swarm, io }
+    fn new(
+        swarm: &'a mut SwarmCore<T, R>,
+        io: &'a mut HostIo,
+        circuit_slots: fn(&T) -> usize,
+    ) -> Self {
+        Self {
+            swarm,
+            io,
+            circuit_slots,
+        }
     }
 }
 
@@ -951,5 +969,9 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
 
     fn ping(&mut self, peer: &PeerId, now_ms: u64) -> Result<(), NatSwarmError> {
         Ok(self.swarm.ping(peer, now_ms)?)
+    }
+
+    fn circuit_slots(&self) -> usize {
+        (self.circuit_slots)(self.swarm.transport())
     }
 }

@@ -44,7 +44,7 @@ use minip2p_secure_mux::{
 };
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, ConnectionState,
-    StreamId, Transport, TransportError, TransportEvent,
+    StreamId, Transport, TransportError, TransportEvent, UnsettledConnections,
 };
 use thiserror::Error;
 
@@ -176,6 +176,9 @@ pub struct CircuitTransport<T, E> {
     identity: Ed25519Keypair,
     yamux_config: YamuxConfig,
     circuits: BTreeMap<ConnectionId, Circuit>,
+    /// Ended circuits whose delivered bytes are not settled yet; each still
+    /// holds its circuit slot (ADR 0012).
+    unsettled: UnsettledConnections,
     bridge_index: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
     retired_bridges: BTreeSet<(ConnectionId, StreamId)>,
     retired_bridge_order: VecDeque<(ConnectionId, StreamId)>,
@@ -195,6 +198,7 @@ impl<T, E> CircuitTransport<T, E> {
             identity,
             yamux_config: YamuxConfig::default(),
             circuits: BTreeMap::new(),
+            unsettled: UnsettledConnections::new(),
             bridge_index: BTreeMap::new(),
             retired_bridges: BTreeSet::new(),
             retired_bridge_order: VecDeque::new(),
@@ -225,6 +229,14 @@ impl<T, E> CircuitTransport<T, E> {
     /// Returns whether a circuit is still active without collecting its identifiers.
     pub fn contains_circuit(&self, id: ConnectionId) -> bool {
         self.circuits.contains_key(&id)
+    }
+
+    /// Circuit slots in use: active circuits, plus ended ones whose delivered
+    /// bytes are not yet acknowledged or abandoned (ADR 0012's unsettled
+    /// connections). A host admitting new circuits counts these against its
+    /// limit.
+    pub fn circuit_slots(&self) -> usize {
+        self.circuits.len() + self.unsettled.len()
     }
 
     /// Borrows the wrapped transport.
@@ -563,8 +575,17 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         }
     }
 
+    /// Takes a circuit out of the active set for good, keeping its unsettled
+    /// streams' counts.
+    fn retire_circuit(&mut self, id: ConnectionId) -> Option<Circuit> {
+        let circuit = self.circuits.remove(&id)?;
+        self.unsettled
+            .insert(id, circuit.session.unsettled_streams());
+        Some(circuit)
+    }
+
     fn fail_circuit(&mut self, id: ConnectionId, message: String, emit_error: bool) {
-        let Some(circuit) = self.circuits.remove(&id) else {
+        let Some(circuit) = self.retire_circuit(id) else {
             return;
         };
         let key = circuit.bridge_key();
@@ -937,6 +958,10 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !id.is_circuit() {
             return self.inner.reset_stream(id, stream_id);
         }
+        // Abandoning a stream of an ended circuit only settles it.
+        if self.unsettled.abandon(id, stream_id) {
+            return Ok(());
+        }
         let result = self
             .operate_session(id, |session| session.reset_stream(stream_id))
             .map_err(|error| {
@@ -963,7 +988,8 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
             return self.inner.ack_stream(id, stream_id, bytes);
         }
         if !self.circuits.contains_key(&id) {
-            return Ok(());
+            // An ended circuit's bytes are released without credit.
+            return self.unsettled.ack(id, stream_id, bytes).map(|_held| ());
         }
         self.operate_session(id, |session| session.ack_stream(stream_id, bytes))
     }
@@ -991,8 +1017,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
             return self.inner.close(id);
         }
         let mut circuit = self
-            .circuits
-            .remove(&id)
+            .retire_circuit(id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
         let key = circuit.bridge_key();
         self.bridge_index.remove(&key);
@@ -2580,6 +2605,58 @@ mod tests {
             a.poll(Now::from_millis(0))
                 .expect("post-close data is ignored")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_circuit_holds_its_slot_until_its_delivered_bytes_settle() {
+        // ADR 0012 (#356): a circuit that ends -- here because its relay
+        // connection did -- keeps its circuit slot while the bytes it
+        // delivered wait to be acknowledged or abandoned.
+        let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_pair();
+        complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+        let held = a.open_stream(circuit_id).expect("open");
+        let other = a.open_stream(circuit_id).expect("open");
+        for stream in [held, other] {
+            a.send_stream(circuit_id, stream, Bytes::from_static(b"held"))
+                .expect("send");
+        }
+        let _ = a.poll(Now::from_millis(0)).expect("sent");
+        let delivered = b.poll(Now::from_millis(0)).expect("delivered");
+        assert!(
+            delivered
+                .iter()
+                .any(|event| matches!(event, TransportEvent::StreamData { .. }))
+        );
+        assert_eq!(b.circuit_slots(), 1);
+
+        b.inner_mut()
+            .close(ConnectionId::new(1))
+            .expect("relay connection closes");
+        let events = b.poll(Now::from_millis(0)).expect("relay close");
+        assert!(events.contains(&TransportEvent::Closed { id: circuit_id }));
+        assert!(!b.contains_circuit(circuit_id));
+        assert_eq!(b.circuit_slots(), 1, "the circuit's bytes are unsettled");
+
+        b.ack_stream(circuit_id, held, 2)
+            .expect("partial ack after close");
+        assert_eq!(
+            b.ack_stream(circuit_id, held, 3),
+            Err(TransportError::AckExceedsDelivered {
+                id: circuit_id,
+                stream_id: held,
+                acked: 3,
+                unacked: 2,
+            })
+        );
+        b.ack_stream(circuit_id, held, 2).expect("final ack");
+        assert_eq!(b.circuit_slots(), 1, "the other stream still holds it");
+        b.reset_stream(circuit_id, other)
+            .expect("abandoning after close settles");
+        assert_eq!(b.circuit_slots(), 0);
+        assert!(
+            b.poll(Now::from_millis(0)).expect("quiet").is_empty(),
+            "settling produces no events"
         );
     }
 

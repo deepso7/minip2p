@@ -18,7 +18,7 @@ use minip2p_platform::{Deadline, Now};
 use minip2p_transport::mio::{self, Interest, Registry, Waker, event::Event};
 use minip2p_transport::{
     Bytes, ConnectionEndpoint, ConnectionId, ConnectionNamespace, PollSource, StreamId, TokenSpace,
-    Transport, TransportError, TransportEvent,
+    Transport, TransportError, TransportEvent, UnsettledConnections,
 };
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn_proto::{
@@ -295,6 +295,9 @@ pub struct QuicTransport {
     host_time: Arc<HostTime>,
     /// Active connections keyed by connection id.
     connections: HashMap<ConnectionId, QuicConnection>,
+    /// Drained connections whose delivered bytes are not settled yet. Each
+    /// still counts against its socket's connection limit (ADR 0012).
+    unsettled: UnsettledConnections,
     /// The engine's handle for each connection.
     handles: HashMap<ConnectionHandle, ConnectionId>,
     /// Events queued between poll() calls.
@@ -492,6 +495,7 @@ impl QuicTransport {
             tls,
             host_time,
             connections: HashMap::new(),
+            unsettled: UnsettledConnections::new(),
             handles: HashMap::new(),
             pending_events: Vec::new(),
             recv_buf: vec![0; recv_buf_len],
@@ -832,7 +836,9 @@ impl QuicTransport {
         }
     }
 
-    /// Forgets a drained connection and reports it closed.
+    /// Forgets a drained connection and reports it closed. One whose streams
+    /// still hold delivered, unacknowledged bytes keeps only those counts,
+    /// and its connection slot until they settle.
     fn remove_connection(&mut self, id: ConnectionId) {
         let Some(conn) = self.connections.remove(&id) else {
             return;
@@ -843,10 +849,24 @@ impl QuicTransport {
         }
         self.unfinished.remove(&id);
         self.received.remove(&id);
+        if !self.unsettled.insert(id, conn.unsettled_streams()) {
+            self.release_slot(id);
+        }
+        self.pending_events.push(TransportEvent::Closed { id });
+    }
+
+    /// Frees connection `id`'s slot on its socket.
+    fn release_slot(&mut self, id: ConnectionId) {
         if let Some(socket) = self.socket_of(id) {
             socket.connections = socket.connections.saturating_sub(1);
         }
-        self.pending_events.push(TransportEvent::Closed { id });
+    }
+
+    /// Frees the slot of a held connection `id` once its last stream settled.
+    fn release_if_settled(&mut self, id: ConnectionId) {
+        if !self.unsettled.contains(id) {
+            self.release_slot(id);
+        }
     }
 
     /// Discards a connection that never got going: closed, with its close
@@ -1003,10 +1023,14 @@ impl Transport for QuicTransport {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
-        let conn = self
-            .connections
-            .get_mut(&id)
-            .ok_or(TransportError::ConnectionNotFound { id })?;
+        let Some(conn) = self.connections.get_mut(&id) else {
+            // Abandoning a stream of a drained connection only settles it.
+            if self.unsettled.abandon(id, stream_id) {
+                self.release_if_settled(id);
+                return Ok(());
+            }
+            return Err(TransportError::ConnectionNotFound { id });
+        };
 
         let result = conn.reset_stream(stream_id, &mut self.pending_events);
         self.pending_events
@@ -1022,6 +1046,10 @@ impl Transport for QuicTransport {
         bytes: usize,
     ) -> Result<(), TransportError> {
         let Some(conn) = self.connections.get_mut(&id) else {
+            // A drained connection's bytes are released without credit.
+            if self.unsettled.ack(id, stream_id, bytes)? {
+                self.release_if_settled(id);
+            }
             return Ok(());
         };
         // A stream that had spent its budget resumes now, not when the next

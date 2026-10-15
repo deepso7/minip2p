@@ -20,6 +20,9 @@ pub struct TcpConfig {
     /// unauthenticated peer decides how much of that a host holds. A dial past
     /// the ceiling fails the caller; an inbound one is dropped where it stands,
     /// because nothing has been announced about it to report against.
+    ///
+    /// An ended connection whose delivered bytes are not yet acknowledged or
+    /// abandoned still counts (ADR 0012's unsettled connection).
     pub max_connections: usize,
     /// How long a connection may take to authenticate before it is dropped, or
     /// `None` to wait indefinitely.

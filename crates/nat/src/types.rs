@@ -118,6 +118,14 @@ pub enum NatError {
     /// The relay refused the circuit.
     #[error("relay refused: {0}")]
     RelayRefused(alloc::string::String),
+    /// A local limit is full, so the relay leg cannot start a circuit:
+    /// [`NatConfig::max_circuits`](crate::NatConfig::max_circuits) circuits
+    /// are reserved or held until their delivered bytes settle.
+    #[error("{resource} exhausted")]
+    ResourceExhausted {
+        /// What ran out.
+        resource: &'static str,
+    },
 }
 
 fn relay_suffix(relay: &Option<PeerId>) -> alloc::string::String {

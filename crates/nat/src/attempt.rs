@@ -204,6 +204,17 @@ impl ConnectAttempt {
         self.promoted == Some(conn_id)
     }
 
+    /// HOP CONNECT sent, and the circuit not yet adopted by the host (which
+    /// then counts it itself) nor given up.
+    pub(crate) fn holds_circuit_slot(&self) -> bool {
+        !self.done
+            && self.promoted.is_none()
+            && matches!(
+                self.leg,
+                RelayLeg::AwaitHopStatus { .. } | RelayLeg::Bridged { .. }
+            )
+    }
+
     pub(crate) fn is_done(&self) -> bool {
         self.done
     }
@@ -816,7 +827,7 @@ impl ConnectAttempt {
         }
         match (self.leg, input) {
             (RelayLeg::WaitHopReady { conn, stream: s }, StreamInput::Ready) if s == stream => {
-                self.flush_hop_connect(conn, stream, swarm, now);
+                self.flush_hop_connect(conn, stream, swarm, shared, now);
             }
             (RelayLeg::AwaitHopStatus { stream: s, .. }, StreamInput::Data(data))
                 if s == stream =>
@@ -1029,17 +1040,30 @@ impl ConnectAttempt {
         }
     }
 
-    /// The HOP stream finished multistream negotiation: send CONNECT.
+    /// The HOP stream finished multistream negotiation: reserve a circuit
+    /// slot, then send CONNECT.
+    ///
+    /// The circuit limit is local, so no other relay would fare better: a
+    /// full table fails the whole leg.
     fn flush_hop_connect(
         &mut self,
         conn: ConnectionId,
         stream: StreamId,
         swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
         now: Now,
     ) {
         let Some(relay_peer) = self.relay_peer().cloned() else {
             return;
         };
+        if !shared.reserve_circuit(swarm) {
+            self.untried.clear();
+            let error = NatError::ResourceExhausted {
+                resource: "circuits",
+            };
+            self.fail_relay_leg(error, swarm, shared, now);
+            return;
+        }
         let Some(hop) = self.hop.as_mut() else {
             return;
         };

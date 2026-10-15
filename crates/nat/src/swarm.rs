@@ -118,6 +118,15 @@ pub trait NatSwarm {
 
     /// Pings `peer` to keep its connection active.
     fn ping(&mut self, peer: &PeerId, now_ms: u64) -> Result<(), NatSwarmError>;
+
+    /// Circuit slots the host's circuit transport holds: active circuits,
+    /// and ended ones whose delivered bytes are not settled yet. The agent
+    /// adds the circuits it is still negotiating and admits new ones only
+    /// below [`NatConfig::max_circuits`](crate::NatConfig::max_circuits).
+    /// The default, for a host without circuits, is none.
+    fn circuit_slots(&self) -> usize {
+        0
+    }
 }
 
 /// Whether `addr` names its host (`/dns`, `/dns4`, `/dns6`) instead of
@@ -272,6 +281,10 @@ impl HoldingSwarm<'_> {
 impl NatSwarm for HoldingSwarm<'_> {
     fn connection(&self, peer: &PeerId) -> Option<ConnectionId> {
         self.inner.connection(peer)
+    }
+
+    fn circuit_slots(&self) -> usize {
+        self.inner.circuit_slots()
     }
 
     fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[String])> {

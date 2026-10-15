@@ -115,6 +115,17 @@ pub struct NatConfig {
     pub reservation_keep_alive_interval_ms: u64,
     /// When to hold a relay reservation.
     pub reservation_policy: ReservationPolicy,
+    /// Circuit admission limit (#356). A circuit slot is reserved before a
+    /// STOP CONNECT is accepted (past the limit it is refused with
+    /// `RESOURCE_LIMIT_EXCEEDED`) and before a HOP CONNECT is sent (past it
+    /// the relay leg fails with [`NatError::ResourceExhausted`]), and every
+    /// failure or cancellation releases it. Once adopted, the circuit holds
+    /// its slot in the host's circuit transport until it closes and its
+    /// delivered bytes settle; [`NatSwarm::circuit_slots`] reports those.
+    ///
+    /// [`NatError::ResourceExhausted`]: crate::NatError::ResourceExhausted
+    /// [`NatSwarm::circuit_slots`]: crate::NatSwarm::circuit_slots
+    pub max_circuits: usize,
 }
 
 impl Default for NatConfig {
@@ -141,6 +152,7 @@ impl Default for NatConfig {
             reservation_retry_backoff_ms: 500,
             reservation_keep_alive_interval_ms: 15_000,
             reservation_policy: ReservationPolicy::WhenPrivate,
+            max_circuits: 64,
         }
     }
 }

@@ -41,6 +41,8 @@ Once the host's Connection-attempt engine settles an attempt (Connected, failed,
 
 `Path::Relayed { relay }` is metadata describing how the peer was reached. The bridge itself is promoted through end-to-end Noise XX and Yamux before `PathEstablished` (outbound) or `InboundPathEstablished` (inbound) is emitted. Identify, ping, pubsub, and application protocols can therefore use the ordinary swarm stream APIs without knowing whether the selected connection is direct or relayed.
 
+Circuits have their own admission limit, `NatConfig::max_circuits` (64). A slot is reserved before a STOP CONNECT is accepted, refusing it with `RESOURCE_LIMIT_EXCEEDED` past the limit, and before a HOP CONNECT is sent, failing the whole relay leg with `NatError::ResourceExhausted` past it (the limit is local, so no other relay would do better). Every failure or cancellation releases the slot: reservations are recounted from the live machines rather than tracked as a counter. Once the host adopts a circuit, `NatSwarm::circuit_slots` reports it instead, and the circuit transport keeps it until the circuit closes and its delivered bytes settle (ADR 0012).
+
 Set `NatConfig::force_relay` to skip direct candidates and DCUtR entirely. This is useful for deterministic relay-only deployments and tests. Stalled outbound promotions are bounded by `relay_timeout_ms`; inbound promotions are bounded by `circuit_handshake_timeout_ms`. The Connection-attempt engine owns the overall 30 s deadline.
 
 ## Driving the agent
