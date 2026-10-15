@@ -9,8 +9,8 @@ use quinn_proto::{TimeSource, TokenStore};
 
 use super::*;
 use crate::test_peer::{
-    RawPeer, accept, client_config, drive_until, listening_server, loopback, now, peer_addr,
-    stream_bytes, take_datagrams,
+    RawPeer, accept, client_config, deliver_then_close, drive_until, listening_server, loopback,
+    now, peer_addr, take_datagrams,
 };
 
 /// Whether `datagram` is a QUIC v1 Retry packet.
@@ -200,25 +200,6 @@ fn the_handshake_completes_through_retry() {
             .count(),
         1
     );
-}
-
-/// Connects a raw peer that sends `held` on a fresh stream and then closes,
-/// and drives the server until the connection is `Closed`. Returns the
-/// server's connection id and stream.
-fn deliver_then_close(server: &mut QuicTransport) -> (ConnectionId, StreamId) {
-    let (mut peer, id) = accept(server, &mut [], |_| {});
-    let stream = peer.open();
-    assert_eq!(peer.write(stream, b"held"), 4);
-    let mut events = Vec::new();
-    drive_until(server, &mut [&mut peer], &mut events, "data", |events| {
-        stream_bytes(events, stream) == b"held"
-    });
-    peer.conn()
-        .close(Instant::now(), VarInt::from_u32(0), Bytes::new());
-    drive_until(server, &mut [&mut peer], &mut events, "close", |events| {
-        events.contains(&TransportEvent::Closed { id })
-    });
-    (id, StreamId::new(stream))
 }
 
 #[test]

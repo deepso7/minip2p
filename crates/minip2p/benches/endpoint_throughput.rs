@@ -71,9 +71,9 @@ const TOTAL: u64 = 256 * MB;
 /// Bytes per write.
 const CHUNK: usize = 64 * 1024;
 /// Bytes the client may have written ahead of what the target received: more
-/// than QUIC's connection and send windows (10 MB each) plus the adapter's
-/// pending-send queue per connection (`max_pending_connection_bytes`, 8 MiB)
-/// can hold.
+/// than QUIC's connection and send windows (3 and 2 MiB by default) plus the
+/// adapter's pending-send queue per connection
+/// (`max_pending_connection_bytes`, 1 MiB) can hold.
 const IN_FLIGHT: u64 = 32 * MB;
 /// Upper bound for one transfer.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);

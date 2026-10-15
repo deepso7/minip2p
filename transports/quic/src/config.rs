@@ -1,14 +1,21 @@
 use minip2p_core::PeerId;
 use minip2p_identity::Ed25519Keypair;
 
+/// A bound on any UDP payload the transport sends: quinn's default maximum,
+/// Ethernet's 1500-byte MTU less the IP and UDP headers. Path MTU discovery
+/// stops below it (quinn's upper bound is 1452), and the adapter never
+/// raises either.
+pub(crate) const MAX_DATAGRAM_BYTES: usize = 1_472;
+
 /// Resource and flow-control limits for the synchronous QUIC adapter.
 ///
 /// The defaults are intentionally conservative: enough for normal peer-to-peer
 /// workloads while bounding memory and unauthenticated connection state.
 #[derive(Clone, Debug)]
 pub struct QuicLimits {
-    /// Maximum simultaneous QUIC connections per UDP socket, counting both
-    /// inbound (accepted) and outbound (dialed) connections.
+    /// Maximum simultaneous QUIC connections across all of the transport's
+    /// sockets, counting both inbound (accepted) and outbound (dialed)
+    /// connections.
     ///
     /// An ended connection whose delivered bytes are not yet acknowledged or
     /// abandoned still counts (ADR 0012's unsettled connection): with every
@@ -58,6 +65,72 @@ pub struct QuicLimits {
     pub idle_timeout_ms: u64,
     /// Require a stateless Retry before allocating an inbound connection.
     pub require_address_validation: bool,
+    /// The QUIC memory budget: the bytes this transport may reserve for its
+    /// connections and streams, across all its sockets. It caps the
+    /// transport's worst-case queued memory.
+    ///
+    /// Each connection reserves
+    /// [`connection_reservation_bytes`](Self::connection_reservation_bytes)
+    /// from admission until it drains, and each stream reserves
+    /// [`stream_reservation_bytes`](Self::stream_reservation_bytes) from when
+    /// it opens or is admitted until its delivered bytes are acknowledged or
+    /// abandoned, also after its connection ended (an unsettled connection
+    /// keeps its streams' reservations, not its own). Each bound socket
+    /// reserves
+    /// [`datagram_queue_reservation_bytes`](Self::datagram_queue_reservation_bytes)
+    /// for its retry queue up front. What does not fit is
+    /// refused, never queued: a dial or `open_stream` fails with
+    /// `ResourceExhausted { resource: "QUIC memory budget" }`, an inbound
+    /// connection gets `CONNECTION_REFUSED` once its address is validated
+    /// (silence before that), and an inbound stream is refused like one over
+    /// the stream limit. Must fit the sockets' retry queues plus one
+    /// connection and one stream.
+    pub memory_budget_bytes: usize,
+    /// Per-stream receive window, and each stream's receive budget: the most
+    /// delivered bytes it holds unacknowledged (ADR 0012). Must be non-zero.
+    ///
+    /// Fixed, as is the connection window, so the engine buffers at most one
+    /// more window behind a reader that is not acknowledging.
+    pub stream_receive_window: usize,
+    /// Per-connection receive window, fixed like
+    /// [`stream_receive_window`](Self::stream_receive_window). Must be
+    /// non-zero.
+    pub connection_receive_window: usize,
+    /// Bytes the engine buffers per connection for sending and
+    /// retransmission. Must be non-zero.
+    pub send_window: usize,
+}
+
+impl QuicLimits {
+    /// The fixed part of a connection's memory reservation: its pending
+    /// send queue, the engine's send buffer and its connection receive
+    /// window.
+    ///
+    /// The queue counts twice: a queued write may keep a slice of its
+    /// caller's payload, and ADR 0012 only bounds the allocation it pins to
+    /// twice the bytes it counts.
+    pub fn connection_reservation_bytes(&self) -> usize {
+        self.max_pending_connection_bytes
+            .saturating_mul(2)
+            .saturating_add(self.send_window)
+            .saturating_add(self.connection_receive_window)
+    }
+
+    /// What each bound socket reserves for its retry queue: up to
+    /// [`max_pending_datagrams`](Self::max_pending_datagrams) datagrams of
+    /// at most 1,472 bytes (a full Ethernet-sized UDP payload) each, held
+    /// from bind for the
+    /// transport's lifetime, since queued datagrams can outlive their
+    /// connection.
+    pub fn datagram_queue_reservation_bytes(&self) -> usize {
+        self.max_pending_datagrams
+            .saturating_mul(MAX_DATAGRAM_BYTES)
+    }
+
+    /// Each stream's memory reservation: its receive window.
+    pub fn stream_reservation_bytes(&self) -> usize {
+        self.stream_receive_window
+    }
 }
 
 impl Default for QuicLimits {
@@ -66,11 +139,15 @@ impl Default for QuicLimits {
             max_connections: 1_024,
             max_streams_per_connection: 128,
             max_pending_bytes_per_stream: 256 * 1024,
-            max_pending_connection_bytes: 8 * 1024 * 1024,
+            max_pending_connection_bytes: 1024 * 1024,
             control_stream_reserve_bytes: 256 * 1024,
             max_pending_datagrams: 1_024,
             idle_timeout_ms: 30_000,
             require_address_validation: true,
+            memory_budget_bytes: 512 * 1024 * 1024,
+            stream_receive_window: 1_000_000,
+            connection_receive_window: 3 * 1024 * 1024,
+            send_window: 2 * 1024 * 1024,
         }
     }
 }
