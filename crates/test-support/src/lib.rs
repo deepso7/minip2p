@@ -7,8 +7,8 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
-use minip2p_platform::{Deadline, Now};
 use minip2p_relay::{
     FrameDecode, HopMessage, HopMessageType, Peer, Reservation, Status, StopMessage,
     StopMessageType, decode_frame, encode_frame,

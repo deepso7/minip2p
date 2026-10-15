@@ -17,7 +17,7 @@
 //! the circuit's Yamux send caps and report [`TransportError::Full`]; nothing
 //! tears down.
 //!
-//! Fresh Noise key material comes from a [`minip2p_platform::EntropySource`]
+//! Fresh Noise key material comes from a [`minip2p_core::platform::EntropySource`]
 //! the host injects — the same seam every other minip2p transport draws from,
 //! so one adapter over a board's RNG serves a circuit transport and a TCP
 //! transport at once.
@@ -33,11 +33,11 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+#[cfg(feature = "std")]
+use minip2p_core::platform::StdEntropy;
+use minip2p_core::platform::{Deadline, EntropyError, EntropySource, Now};
 use minip2p_core::{Bytes, Multiaddr, Protocol, retain_slice};
 use minip2p_identity::{Ed25519Keypair, PeerId};
-#[cfg(feature = "std")]
-use minip2p_platform::StdEntropy;
-use minip2p_platform::{Deadline, EntropyError, EntropySource, Now};
 use minip2p_secure_mux::{
     SecureMuxSession, SessionConfig, SessionError, SessionOutput, SessionRole, YamuxConfig,
     YamuxError,
@@ -1169,8 +1169,10 @@ impl<T> CircuitTransport<T, StdEntropy> {
 mod tests {
     use super::*;
     use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
-    use minip2p_noise::{NOISE_PROTOCOL_ID, NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
     use minip2p_secure_mux::KEEPALIVE_INTERVAL_MS;
+    use minip2p_secure_mux::noise::{
+        NOISE_PROTOCOL_ID, NoiseConfig, NoiseOutput, NoiseRole, NoiseSession,
+    };
     use minip2p_test_support::InMemoryTransport;
 
     #[derive(Clone, Debug)]

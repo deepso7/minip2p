@@ -22,8 +22,8 @@ ed25519 = ["dep:ed25519-dalek", "dep:rand_core", "ed25519-dalek/rand_core"]
 multihash = { version = "0.19.5", default-features = false, features = [
   "alloc",
 ] }
-sha2 = { version = "0.11.0", default-features = false }
-thiserror = { version = "2.0.20", default-features = false }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
 ed25519-dalek = { version = "3.0.0", default-features = false, optional = true }
-rand_core = { version = "0.10.1", default-features = false, optional = true }
-getrandom = { version = "0.4.3", default-features = false, optional = true }
+rand_core = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }

@@ -2,8 +2,8 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Bytes, ConnectId, Multiaddr, PeerAddr, PeerId, Protocol, select_direct_addrs};
-use minip2p_platform::{Deadline, Now};
 use minip2p_swarm::{HeldWrites, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId};
 

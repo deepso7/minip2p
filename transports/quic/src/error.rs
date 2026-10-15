@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 
 use minip2p_core::Multiaddr;
-use minip2p_platform::IoErrorKind;
+use minip2p_core::platform::IoErrorKind;
 
 /// A failure building a [`QuicTransport`](crate::QuicTransport).
 ///

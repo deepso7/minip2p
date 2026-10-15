@@ -22,7 +22,7 @@ use minip2p::{
     EndpointEvent, EntropySource, Multiaddr, Now, PeerAddr, PeerId, SmoltcpConfig,
     SmoltcpMdnsConfig, SmoltcpStack, SmoltcpTcpProvider, StreamId, TcpConfig, TcpTransport,
 };
-use minip2p_platform::EntropyError;
+use minip2p_core::platform::EntropyError;
 
 const DIALER_IP: &str = "192.168.1.1";
 const LISTENER_IP: &str = "192.168.1.2";

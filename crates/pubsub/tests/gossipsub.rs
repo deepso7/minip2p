@@ -1,8 +1,8 @@
 //! Scripted no-I/O tests for the long-lived gossipsub router.
 
 use minip2p_core::PeerId;
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_platform::{Deadline, Now};
 use minip2p_pubsub::{
     ControlGraft, ControlIHave, ControlIWant, ControlMessage, ControlPrune, FrameDecode,
     GossipsubAction, GossipsubAgent, GossipsubConfig, GossipsubEvent, MESHSUB_PROTOCOL_ID_V10,

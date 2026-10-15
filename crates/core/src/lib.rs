@@ -4,7 +4,8 @@
 //! transport + peer id addresses, [`ConnectId`] for Connection-attempt
 //! correlation, the [`Protocol`] enum, the varint-length-prefixed frame
 //! codec, the shared protobuf field codec used by protocol crates, and the
-//! shared stream payload type [`Bytes`].
+//! shared stream payload type [`Bytes`]. The [`platform`] module holds the
+//! clock, deadline, and entropy contracts every caller-driven component uses.
 //! `no_std` + `alloc` compatible.
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -19,6 +20,7 @@ mod frame;
 mod multiaddr;
 mod payload;
 mod peer_addr;
+pub mod platform;
 mod protobuf;
 mod protocol;
 

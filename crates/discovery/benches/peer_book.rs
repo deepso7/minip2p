@@ -1,8 +1,8 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use minip2p_core::platform::Now;
 use minip2p_core::{Multiaddr, PeerId};
 use minip2p_discovery::{Observation, PeerDiscoveryAgent, PeerDiscoveryConfig};
 use minip2p_identity::{KeyType, PublicKey};
-use minip2p_platform::Now;
 use std::hint::black_box;
 
 const PEERS: usize = 128;

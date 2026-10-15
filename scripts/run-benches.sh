@@ -7,7 +7,7 @@ case "${1:-}" in
 wall)
   python3 scripts/bench_results.py start --output target/bench-results/criterion-start
   cargo bench -p minip2p-core --bench multiaddr
-  cargo bench -p minip2p-yamux --bench data_path
+  cargo bench -p minip2p-secure-mux --bench data_path
   cargo bench -p minip2p-discovery --bench peer_book
   cargo bench -p minip2p-pubsub --bench publish
   cargo bench -p minip2p-pubsub --bench router
@@ -26,7 +26,7 @@ wall)
 ir)
   python3 scripts/bench_results.py start --output target/bench-results/gungraun-start
   GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-core --bench multiaddr_ir
-  GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-yamux --bench data_path_ir
+  GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-secure-mux --bench data_path_ir
   GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-discovery --bench peer_book_ir
   GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-pubsub --bench publish_ir
   GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-pubsub --bench router_ir

@@ -3,9 +3,9 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_core::{Bytes, Multiaddr, PeerAddr};
 use minip2p_identity::{Ed25519Keypair, PeerId};
-use minip2p_platform::{Deadline, EntropySource, Now};
 use minip2p_secure_mux::{
     SecureMuxSession, SessionConfig, SessionError, SessionOutput, SessionRole, YamuxError,
 };

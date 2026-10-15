@@ -1,6 +1,6 @@
 [package]
 name = "minip2p-core"
-description = "Core transport-agnostic types for minip2p"
+description = "Core transport-agnostic types and platform contracts for minip2p"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,17 +15,18 @@ workspace = true
 
 [features]
 default = ["std"]
-std = ["minip2p-identity/std", "thiserror/std"]
+std = ["minip2p-identity/std", "thiserror/std", "dep:getrandom"]
 
 [dependencies]
 # Shared stream payload handle (ADR 0011); re-exported as `minip2p_core::Bytes`.
-bytes = { version = "1.12.1", default-features = false }
+bytes = { workspace = true }
+getrandom = { workspace = true, optional = true }
 minip2p-identity = { path = "../identity", version = "0.8.3", default-features = false }
-thiserror = { version = "2.0.20", default-features = false }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-criterion = "0.8.2"
-gungraun = "=0.19.4"
+criterion = { workspace = true }
+gungraun = { workspace = true }
 
 [[bench]]
 name = "multiaddr"

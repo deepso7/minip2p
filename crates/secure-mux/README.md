@@ -12,6 +12,8 @@ ordered byte stream
   -> Yamux               (libp2p substreams)
 ```
 
+The Noise and Yamux state machines the session drives are public modules of their own, `noise` and `yamux`, for hosts and tests that need them directly; see [Noise](#noise) and [Yamux](#yamux) below.
+
 Relay circuits and TCP connections differ only in what the byte stream _is_ — a relayed stream through a third peer, or a socket — so both drive this one component rather than each carrying its own copy of the state machine.
 
 ## Usage
@@ -68,6 +70,30 @@ Peer _verification_ is not policy and is not optional: set `expected_peer` and N
 - `SessionError::NotEstablished` means a substream operation ran before the upgrade completed. The session is untouched and still mid-upgrade; from `go_away` it means there is nothing to shut down, so just drop the underlying stream.
 - `SessionError::UnknownStream` means the id does not name a substream of this session. Ids are rejected rather than truncated, so a fabricated one can never alias onto somebody else's substream. The session stays usable.
 - `SessionError::Yamux` is passed through so callers can distinguish a full send buffer (retry later) from a fatal failure.
+
+## Noise
+
+`minip2p_secure_mux::noise` is a small, caller-driven implementation of libp2p's Noise security protocol. It implements `Noise_XX_25519_ChaChaPoly_SHA256`, including libp2p identity binding, cryptographic peer-ID verification, and the two-byte libp2p framing used for both handshake and transport messages.
+
+The module is Sans-I/O and supports `no_std + alloc`. Callers provide fresh X25519 static and ephemeral secrets for every session, feed received bytes into the state machine, and write the emitted outbound bytes using their own I/O adapter. It does not own randomness, sockets, clocks, or timers.
+
+Handshake payload field framing uses the shared protobuf vocabulary in `minip2p-core`. Invalid field numbers are rejected by the shared decoder as `NoiseError::Wire`. Identity-binding rules, duplicate-field checks, and contextual `NoiseError` values stay in this module.
+
+Transport plaintext is automatically segmented at 65,519 bytes so every encrypted message, including its 16-byte authentication tag, fits the 65,535 byte wire-frame limit. Each segment is copied once into its outbound frame and encrypted there; received frames are decrypted in place, and a received buffer holding exactly one frame is reused rather than reallocated.
+
+Once the handshake completes, `NoiseSession::handshake_hash` returns the final handshake hash `h`. Both ends compute the same value, so it names the session on either side (channel binding, in Noise terms).
+
+Interoperability fixtures and how to regenerate them are described in [`tests/fixtures/noise`](tests/fixtures/noise/README.md).
+
+## Yamux
+
+`minip2p_secure_mux::yamux` is a small, caller-driven, Sans-I/O implementation of the libp2p Yamux stream multiplexer (`/yamux/1.0.0`). It runs with `no_std + alloc` and leaves sockets, clocks, and task scheduling to its caller. A quiet session emits a keepalive ping every 30 seconds when the host drives `YamuxSession::poll` with a time sample; the session never reads a clock.
+
+The session bounds inbound frame lengths, stream count, per-stream queued sends, aggregate queued sends, and peer-provoked control replies (`max_pending_control`, which also covers resets of peer-opened streams: a peer can open streams without bound). `send` takes a `Bytes` payload and accepts as much as the send caps allow, whatever the remote window; the rest comes back as `YamuxError::Full` with the exact unsent suffix, and `YamuxOutput::Writable` fires once the stream can queue at least half of the smaller of its stream cap and the total cap it may fill again (a control stream needs at most half a non-zero reserve). `control_stream_reserve` (256 KiB of the 4 MiB total cap) is kept for streams marked with `set_control`, so application streams cannot starve the swarm's negotiation, ping and Identify streams. Accepted bytes count against the caps until the host pulls a frame carrying them with `poll_frame`, so a host that pulls only while its socket has room keeps ciphertext bounded too. Events (`poll_event`) and frames (`poll_frame`) leave separately, so inbound data never waits behind outbound frames. The session tracks which streams owe a window update or have a frame to pull, so `poll_frame` and `has_frames` never scan idle streams; data frames rotate round-robin across sendable streams. A partly framed payload stays a slice of the caller's buffer until its tail is shorter than half of it, so queued sends hold at most twice the capped bytes, provided each payload owns its allocation: a `Bytes` slice of a larger buffer keeps that whole buffer alive while queued. Receive credit is read-driven (ADR 0012): a stream's window update goes out only for bytes its reader acknowledged with `ack`, so a stream holds at most `receive_window` unacknowledged bytes and a reader that never acknowledges stalls its sender. A stream that closes with unacknowledged bytes stays unsettled and keeps its slot against `max_streams` until they are acknowledged or a local `reset` abandons them, so stream churn cannot grow retained data past `max_streams` × `receive_window`; input never has to stop. The counts outlive the session: after a GoAway or a protocol failure, `unsettled_streams` lists them for the host to take over, and `ack` and `reset` still settle them. Acknowledging more than a stream's unacknowledged bytes is `YamuxError::AckExceedsDelivered`.
+
+Clients allocate odd stream IDs and servers allocate even stream IDs. The default receive window is 256 KiB, matching the Yamux specification.
+
+The interoperability fixture is described in [`tests/fixtures/yamux`](tests/fixtures/yamux/README.md). The `data_path` and `data_path_ir` benches measure the Yamux session's send and receive paths.
 
 ## no_std
 

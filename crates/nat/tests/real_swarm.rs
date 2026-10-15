@@ -3,12 +3,12 @@
 
 use std::collections::VecDeque;
 
+use minip2p_core::platform::{EntropyError, EntropySource, Now as SwarmNow};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_nat::{
     ConnectLegs, HOP_PROTOCOL_ID, NatAgent, NatConfig, NatError, NatEvent, Now, ReservationPolicy,
 };
-use minip2p_platform::{EntropyError, EntropySource, Now as SwarmNow};
 use minip2p_swarm::{SwarmBuilder, SwarmCore, SwarmEvent};
 use minip2p_test_support::InMemoryTransport;
 use minip2p_transport::{Bytes, ConnectionId, StreamId, Transport, TransportError, TransportEvent};

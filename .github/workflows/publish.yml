@@ -636,13 +636,10 @@ jobs:
           }
 
           crates=(
-            minip2p-platform
             minip2p-identity
             minip2p-core
             minip2p-transport
             minip2p-tls
-            minip2p-noise
-            minip2p-yamux
             minip2p-multistream-select
             minip2p-secure-mux
             minip2p-identify

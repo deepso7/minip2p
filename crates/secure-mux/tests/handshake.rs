@@ -5,8 +5,8 @@
 //! complete the whole upgrade and carry substream traffic, with no socket,
 //! clock, or executor anywhere.
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_identity::{Ed25519Keypair, PeerId};
-use minip2p_platform::{Deadline, Now};
 use minip2p_secure_mux::{
     KEEPALIVE_INTERVAL_MS, SecureMuxSession, SessionConfig, SessionError, SessionOutput,
     SessionRole, YamuxConfig, YamuxError,

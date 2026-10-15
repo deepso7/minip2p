@@ -10,7 +10,7 @@ use minip2p_transport::{ConnectionId, StreamId};
 
 use crate::agent::{DialPurpose, Shared};
 use crate::swarm::NatSwarm;
-use minip2p_platform::Now;
+use minip2p_core::platform::Now;
 
 /// Where an acquisition stands after a step.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

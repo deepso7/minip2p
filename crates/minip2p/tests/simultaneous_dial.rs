@@ -10,7 +10,7 @@ use minip2p::{
     ConnectOutcome, Deadline, Ed25519Keypair, Endpoint, EndpointBuilder, EndpointEvent, Multiaddr,
     Now, PeerAddr, PeerId, PortableEndpoint, StreamId,
 };
-use minip2p_platform::{Clock, StdClock, StdEntropy};
+use minip2p_core::platform::{Clock, StdClock, StdEntropy};
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_transport::{Bytes, ConnectionId, Transport, TransportError, TransportEvent};
 

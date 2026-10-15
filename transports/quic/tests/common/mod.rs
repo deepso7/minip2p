@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use minip2p_core::PeerAddr;
-use minip2p_platform::{Clock, Now, StdClock};
+use minip2p_core::platform::{Clock, Now, StdClock};
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_transport::{Transport, TransportEvent};
 

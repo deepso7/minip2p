@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
+use minip2p_core::platform::{EntropyError, EntropySource, Now};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_platform::{EntropyError, EntropySource, Now};
 use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_relay_server::RelayServerAgent;
 use minip2p_swarm::{DriverError, SwarmBuilder, SwarmError, SwarmEvent};

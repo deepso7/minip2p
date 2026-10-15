@@ -1,15 +1,15 @@
 //! One entropy adapter, both transports.
 //!
 //! Circuit and TCP draw randomness from the same
-//! [`minip2p_platform::EntropySource`], so a host that composes both stacks
+//! [`minip2p_core::platform::EntropySource`], so a host that composes both stacks
 //! writes a single impl over its RNG. This test exists to fail compilation if
 //! either transport ever grows a private entropy trait again.
 
 #![cfg(feature = "std")]
 
 use minip2p_circuit::CircuitTransport;
+use minip2p_core::platform::{EntropyError, EntropySource};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_platform::{EntropyError, EntropySource};
 use minip2p_tcp::{StdTcpProvider, TcpTransport};
 use minip2p_test_support::InMemoryTransport;
 use minip2p_transport::Transport;

@@ -18,8 +18,8 @@ use alloc::vec::Vec;
 use minip2p_autonat::{
     AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatClientOutput, AutoNatError, Reachability,
 };
+use minip2p_core::platform::Now;
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, select_direct_addrs};
-use minip2p_platform::Now;
 use minip2p_relay::{HOP_PROTOCOL_ID, HopReservation, HopReservationOutput, ReservationOutcome};
 use minip2p_transport::{ConnectionId, StreamId};
 

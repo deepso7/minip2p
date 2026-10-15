@@ -6,7 +6,7 @@ use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use minip2p_platform::{Deadline, EntropySource, Now};
+use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_pubsub::{GossipsubAction, GossipsubAgent, GossipsubEvent, PublishError, TopicError};
 use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
 use minip2p_transport::Transport;

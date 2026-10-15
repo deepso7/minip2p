@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr};
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Multiaddr, Protocol};
-use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{PollSource, TokenSpace};
 use mio::event::Event;
 use mio::{Interest, Registry, Token, Waker};

@@ -6,9 +6,9 @@
 
 mod support;
 
+use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_identity::{Ed25519Keypair, PeerId};
-use minip2p_platform::{Deadline, EntropySource, Now};
 use minip2p_secure_mux::KEEPALIVE_INTERVAL_MS;
 use minip2p_tcp::{TcpConfig, TcpTransport};
 use minip2p_transport::{

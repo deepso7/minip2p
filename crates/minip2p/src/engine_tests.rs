@@ -10,9 +10,9 @@ use alloc::vec::Vec;
 extern crate std;
 use std::sync::{Mutex, PoisonError};
 
+use minip2p_core::platform::{EntropyError, EntropySource, Now};
 use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_platform::{EntropyError, EntropySource, Now};
 use minip2p_test_support::InMemoryTransport;
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionNamespace, StreamId, Transport, TransportError,

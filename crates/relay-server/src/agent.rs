@@ -5,8 +5,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Bytes, Multiaddr, PeerId, Protocol};
-use minip2p_platform::{Deadline, Now};
 use minip2p_relay::{
     HOP_PROTOCOL_ID, HopRequest, HopResponder, HopResponderOutput, Limit, MAX_PENDING_BRIDGE_SIZE,
     RelayError, Reservation, STOP_PROTOCOL_ID, Status, StopInitiator, StopInitiatorOutcome,
@@ -585,7 +585,7 @@ impl RelayServerAgent {
     pub fn register_swarm_roles<T, E>(swarm: &mut SwarmCore<T, E>) -> Result<(), SwarmError>
     where
         T: Transport,
-        E: minip2p_platform::EntropySource,
+        E: minip2p_core::platform::EntropySource,
     {
         swarm.add_inbound_protocol(HOP_PROTOCOL_ID)?;
         swarm.add_advertised_protocol(HOP_PROTOCOL_ID)?;
@@ -2808,8 +2808,8 @@ fn first_ip(address: &Multiaddr) -> Option<IpKey> {
 mod tests {
     use core::str::FromStr;
 
+    use minip2p_core::platform::Now;
     use minip2p_core::{Multiaddr, PeerId, Protocol};
-    use minip2p_platform::Now;
     use minip2p_relay::{
         FrameDecode, HOP_PROTOCOL_ID, HopMessage, HopMessageType, MAX_MESSAGE_SIZE,
         MAX_PENDING_BRIDGE_SIZE, Peer, Status, decode_frame, encode_frame, encode_stop_status,

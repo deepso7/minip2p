@@ -5,9 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use minip2p_core::platform::{Now, StdEntropy};
 use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_platform::{Now, StdEntropy};
 use minip2p_tcp::{StdTcpProvider, TcpEvent, TcpProvider, TcpTransport};
 use minip2p_transport::{Bytes, ConnectionId, SharedPoll, StreamId, Transport, TransportEvent};
 

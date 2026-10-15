@@ -5,9 +5,9 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Bytes, PeerId, uvarint_len};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_platform::{Deadline, Now};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::StreamId;
 

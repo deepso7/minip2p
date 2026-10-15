@@ -6,7 +6,7 @@ use alloc::{collections::BTreeMap, string::ToString};
 use alloc::{collections::VecDeque, vec, vec::Vec};
 #[cfg(not(feature = "_circuit-driver"))]
 use core::marker::PhantomData;
-use minip2p_platform::{Deadline, EntropySource, Now};
+use minip2p_core::platform::{Deadline, EntropySource, Now};
 
 #[cfg(feature = "_circuit-driver")]
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole, CircuitTransport};

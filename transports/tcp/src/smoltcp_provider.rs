@@ -7,8 +7,8 @@ use core::cell::{Cell, RefCell};
 use core::net::{Ipv4Addr, Ipv6Addr};
 use core::ops::RangeInclusive;
 
+use minip2p_core::platform::{Deadline, IoErrorKind, Now};
 use minip2p_core::{Multiaddr, Protocol};
-use minip2p_platform::{Deadline, IoErrorKind, Now};
 use minip2p_smoltcp::SmoltcpStack;
 use minip2p_smoltcp::smoltcp::iface::{
     Interface, PollIngressSingleResult, PollResult, SocketHandle as SmoltcpHandle,

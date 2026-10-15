@@ -41,7 +41,7 @@ x509-cert = { version = "0.3.0", default-features = false, features = [
 ] }
 const-oid = { version = "0.10.2", default-features = false }
 spki = { version = "0.8.0", default-features = false, features = ["alloc"] }
-thiserror = { version = "2.0.20", default-features = false }
+thiserror = { workspace = true }
 p256 = { version = "0.14.0", default-features = false, features = [
   "ecdsa",
   "pkcs8",
@@ -52,8 +52,6 @@ ecdsa = { version = "0.17.0", default-features = false, features = [
   "alloc",
 ] }
 signature = { version = "3.0.0", default-features = false }
-sha2 = { version = "0.11.0", default-features = false, features = ["oid"] }
-rand_core = { version = "0.10.1", default-features = false }
-getrandom = { version = "0.4.3", default-features = false, optional = true, features = [
-  "sys_rng",
-] }
+sha2 = { workspace = true, features = ["oid"] }
+rand_core = { workspace = true }
+getrandom = { workspace = true, features = ["sys_rng"], optional = true }

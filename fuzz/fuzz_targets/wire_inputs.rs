@@ -3,6 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use minip2p_autonat::{AutoNatClient, AutoNatServer};
 use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport};
+use minip2p_core::platform::{EntropyError, EntropySource, Now};
 use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
 use minip2p_dcutr::{DcutrInitiator, DcutrResponder, FrameDecode as DcutrFrame, HolePunch};
 use minip2p_discovery::{
@@ -15,8 +16,6 @@ use minip2p_mdns::{
     DnsMessage, InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAgent, MdnsConfig,
 };
 use minip2p_multistream_select::MultistreamSelect;
-use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseRole, NoiseSession};
-use minip2p_platform::{EntropyError, EntropySource, Now};
 use minip2p_pubsub::{
     FrameDecode as PubsubFrame, GossipsubAgent, GossipsubConfig, MESHSUB_PROTOCOL_ID_V11,
     RawMessage, Rpc,
@@ -25,6 +24,8 @@ use minip2p_relay::{
     FrameDecode as RelayFrame, HopConnect, HopMessage, HopReservation, HopResponder, StopInitiator,
     StopMessage, StopResponder,
 };
+use minip2p_secure_mux::noise::{NoiseConfig, NoiseHandshakePayload, NoiseRole, NoiseSession};
+use minip2p_secure_mux::yamux::{FrameDecoder as YamuxFrameDecoder, YamuxRole, YamuxSession};
 use minip2p_secure_mux::{
     SecureMuxSession, SessionConfig, SessionOutput, SessionRole, YamuxConfig,
 };
@@ -32,7 +33,6 @@ use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
 };
-use minip2p_yamux::{FrameDecoder as YamuxFrameDecoder, YamuxRole, YamuxSession};
 
 fuzz_target!(|data: &[u8]| {
     fuzz_multiaddr(data);

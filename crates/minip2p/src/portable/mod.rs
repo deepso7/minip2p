@@ -4,11 +4,11 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::{string::String, vec::Vec};
 
+pub use minip2p_core::platform::{Deadline, EntropySource, IoErrorKind, Now, SharedEntropy};
 pub use minip2p_core::{
     Bytes, Multiaddr, MultiaddrError, PeerAddr, PeerAddrError, PeerId, Protocol, TransportKind,
 };
 pub use minip2p_identity::Ed25519Keypair;
-pub use minip2p_platform::{Deadline, EntropySource, IoErrorKind, Now, SharedEntropy};
 pub use minip2p_swarm::{
     // Part of `EndpointEvent` / `SwarmEvent` public shapes (`Error`);
     // re-exported so portable callers can name them without a direct swarm
@@ -527,7 +527,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
 pub enum PortableBuildError {
     /// The supplied entropy source failed.
     #[error(transparent)]
-    Entropy(#[from] minip2p_platform::EntropyError),
+    Entropy(#[from] minip2p_core::platform::EntropyError),
     /// Swarm configuration was invalid (a reserved protocol id, say).
     #[error(transparent)]
     Swarm(#[from] SwarmError),
@@ -1217,7 +1217,7 @@ mod tests {
     use crate::Endpoint;
     use alloc::{rc::Rc, vec, vec::Vec};
     use core::cell::Cell;
-    use minip2p_platform::EntropyError;
+    use minip2p_core::platform::EntropyError;
     use minip2p_test_support::InMemoryTransport;
     use minip2p_transport::{ConnectionEndpoint, TransportEvent};
 
@@ -1387,7 +1387,7 @@ mod tests {
         fn poll(&mut self, _: u64) -> Result<(), MdnsError> {
             Err(MdnsError::io(
                 MdnsIoOperation::Poll,
-                minip2p_platform::IoErrorKind::NotConnected,
+                minip2p_core::platform::IoErrorKind::NotConnected,
                 None,
                 "stack gone",
             ))

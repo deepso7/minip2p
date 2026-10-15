@@ -52,11 +52,11 @@ pub use minip2p_identify::IdentifyMessage;
 pub use crate::builder::SwarmBuilder;
 #[cfg(feature = "std")]
 pub use crate::driver::{PollNext, RUN_UNTIL_SKIP_LIMIT, Swarm, WaitDeadline};
-// Re-exported so callers need not depend on the platform crate directly.
+// Re-exported so callers need not depend on minip2p-core directly.
 #[cfg(feature = "std")]
-pub use minip2p_platform::{Clock, StdClock};
+pub use minip2p_core::platform::{Clock, StdClock};
 // The handles `Swarm` hands out, re-exported so callers need not depend on
 // the transport crate to name them.
-pub use minip2p_platform::{Deadline, EntropySource, Now};
+pub use minip2p_core::platform::{Deadline, EntropySource, Now};
 #[cfg(feature = "std")]
 pub use minip2p_transport::{WaitHandle, WakeHandle};

@@ -2,8 +2,8 @@ use alloc::string::String;
 
 use thiserror::Error;
 
+use minip2p_core::platform::{EntropyError, IoErrorKind};
 use minip2p_core::{Bytes, Multiaddr, PeerAddrError};
-use minip2p_platform::{EntropyError, IoErrorKind};
 
 use crate::{ConnectionId, StreamId};
 

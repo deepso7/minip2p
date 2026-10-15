@@ -19,6 +19,9 @@
 //! [`SecureMuxSession::poll`] / [`SecureMuxSession::next_deadline`] drive
 //! Yamux keepalive from the host's time sample. `no_std + alloc`.
 //!
+//! The Noise XX and Yamux state machines it drives are public as the
+//! [`noise`] and [`yamux`] modules.
+//!
 //! Relay circuits and TCP connections differ only in what the byte stream is,
 //! so both drive this same component rather than duplicating the state
 //! machine.
@@ -35,7 +38,9 @@
 
 extern crate alloc;
 
+pub mod noise;
 mod session;
+pub mod yamux;
 
 pub use session::{
     KEEPALIVE_INTERVAL_MS, SecureMuxSession, SessionConfig, SessionError, SessionOutput,

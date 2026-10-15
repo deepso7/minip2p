@@ -6,8 +6,8 @@ use alloc::{
     vec::Vec,
 };
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Multiaddr, PeerId};
-use minip2p_platform::{Deadline, Now};
 
 use crate::beacon::normalize_addr;
 use crate::{

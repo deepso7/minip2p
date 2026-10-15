@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr};
 use std::rc::Rc;
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Multiaddr, PeerId};
 use minip2p_identity::{KeyType, PublicKey};
 use minip2p_mdns::smoltcp::iface::{Config, Interface};
@@ -28,7 +29,6 @@ use minip2p_mdns::{
     InterfaceId, MdnsAction, MdnsAgent, MdnsConfig, MdnsDriver, MdnsError, MdnsEvent, MdnsIo,
     MdnsTarget, SmoltcpMdnsConfig, SmoltcpMdnsIo, SmoltcpStack,
 };
-use minip2p_platform::{Deadline, Now};
 
 /// Enough ticks for several announcement rounds; short enough that a livelock
 /// fails rather than hangs.

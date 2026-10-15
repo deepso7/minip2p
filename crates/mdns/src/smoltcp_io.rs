@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use minip2p_platform::{Deadline, IoErrorKind, Now};
+use minip2p_core::platform::{Deadline, IoErrorKind, Now};
 use minip2p_smoltcp::SmoltcpStack;
 use minip2p_smoltcp::smoltcp::iface::{
     Interface, MulticastError, PollIngressSingleResult, PollResult, SocketHandle,

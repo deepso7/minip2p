@@ -2,7 +2,7 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use minip2p_core::PeerId;
-use minip2p_platform::Now;
+use minip2p_core::platform::Now;
 use minip2p_relay::HOP_PROTOCOL_ID;
 use minip2p_relay_server::{RelayServerAgent, RelayServerConfig};
 use minip2p_swarm::SwarmEvent;

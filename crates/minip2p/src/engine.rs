@@ -40,8 +40,8 @@ use alloc::vec::Vec;
 #[cfg(not(feature = "_mdns-driver"))]
 use core::marker::PhantomData;
 
+use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
-use minip2p_platform::{Deadline, EntropySource, Now};
 use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 

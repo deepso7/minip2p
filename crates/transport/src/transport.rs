@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Bytes, Multiaddr, PeerAddr};
-use minip2p_platform::{Deadline, Now};
 
 use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 

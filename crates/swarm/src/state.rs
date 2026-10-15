@@ -21,6 +21,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::{
     IDENTIFY_PROTOCOL_ID, IdentifyAction, IdentifyConfig, IdentifyEvent, IdentifyMessage,
@@ -30,7 +31,6 @@ use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
 use minip2p_ping::{
     PING_PAYLOAD_LEN, PING_PROTOCOL_ID, PingAction, PingConfig, PingEvent, PingOutput, PingProtocol,
 };
-use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{ConnectionId, ConnectionToken, StreamId, TransportEvent};
 
 use crate::events::{SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};

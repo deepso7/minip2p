@@ -3,7 +3,7 @@
 use alloc::string::String;
 use core::net::{IpAddr, SocketAddr};
 
-use minip2p_platform::{Deadline, IoErrorKind, Now};
+use minip2p_core::platform::{Deadline, IoErrorKind, Now};
 
 use crate::{InterfaceId, InterfaceSnapshot, IpNet, MdnsAction};
 

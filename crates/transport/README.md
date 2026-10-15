@@ -16,7 +16,7 @@ This crate defines the transport abstraction that concrete adapters implement â€
 - The bound outlives the connection (ADR 0012): a connection that ends with unsettled streams becomes an unsettled connection, keeping only its per-stream counts and its connection slot until every stream settles. `ack_stream` releases its bytes and `reset_stream` abandons them after `Closed`, with no events; with every slot held, `dial` fails with `ResourceExhausted` and inbound connections are refused. `UnsettledConnections` is the shared ledger transports keep those counts in.
 - Write backpressure (ADR 0012): `send_stream` accepts as much as the stream can queue and returns `TransportError::Full` carrying the exact unsent tail when not every byte fit. Full is retryable, never a fault: the caller holds the tail, and a one-shot `StreamWritable` fires once the stream can queue at least half of its smaller send cap again. It never fires after the write side ended (`StreamWriteStopped`, a reset, `close_stream_write`, `StreamClosed`, `Closed`). Every transport caps each stream's share of its connection's send queue, so a stream stalled on peer credit cannot starve the others, and keeps a reserve inside the connection cap for control streams, which the caller marks with `set_control_stream` (a no-op by default, for transports without a reserve). `close_stream_write` sends its FIN after every accepted byte. Any other `send_stream` error may follow a partial queue (a transport may queue a prefix and then fail), so it is not safe to resend the payload.
 - Host intents via trait methods: `dial`, `listen`, `open_stream`, `send_stream`, `close_stream_write`, `reset_stream`, `close`.
-- Typed error model with transport, connection, and stream context. Platform failures are `TransportError::Io { operation, kind, detail }` and `ListenFailed { addr, kind, detail }`, classified by the portable `minip2p_platform::IoErrorKind`, so `no_std` and hosted adapters report the same kinds; `NotListening`, `LocalPeerAddr`, and `Entropy` name the remaining setup failures. `PollError` is kept for faults inside a transport's own session or negotiation, not the platform under it.
+- Typed error model with transport, connection, and stream context. Platform failures are `TransportError::Io { operation, kind, detail }` and `ListenFailed { addr, kind, detail }`, classified by the portable `minip2p_core::platform::IoErrorKind`, so `no_std` and hosted adapters report the same kinds; `NotListening`, `LocalPeerAddr`, and `Entropy` name the remaining setup failures. `PollError` is kept for faults inside a transport's own session or negotiation, not the platform under it.
 
 ## Running several transports at once
 
@@ -55,7 +55,7 @@ Implement the `Transport` trait for your adapter:
 
 ```rust
 use minip2p_core::{Bytes, Multiaddr, PeerAddr};
-use minip2p_platform::{Deadline, Now};
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 
 struct MyTransport;

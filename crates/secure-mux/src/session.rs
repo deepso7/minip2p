@@ -4,16 +4,16 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use crate::noise::{NOISE_PROTOCOL_ID, NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
+use crate::yamux::{YAMUX_PROTOCOL_ID, YamuxOutput, YamuxRole, YamuxSession};
 use minip2p_core::Bytes;
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
-use minip2p_noise::{NOISE_PROTOCOL_ID, NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
-use minip2p_platform::{Deadline, Now};
 use minip2p_transport::StreamId;
-use minip2p_yamux::{YAMUX_PROTOCOL_ID, YamuxOutput, YamuxRole, YamuxSession};
 use thiserror::Error;
 
-pub use minip2p_yamux::{KEEPALIVE_INTERVAL_MS, YamuxConfig, YamuxError};
+pub use crate::yamux::{KEEPALIVE_INTERVAL_MS, YamuxConfig, YamuxError};
 
 /// Which end of the session opened the underlying byte stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -401,7 +401,7 @@ impl SecureMuxSession {
     }
 
     /// Marks a substream as a control stream, which may queue into Yamux's
-    /// [`control_stream_reserve`](minip2p_yamux::YamuxConfig::control_stream_reserve),
+    /// [`control_stream_reserve`](crate::yamux::YamuxConfig::control_stream_reserve),
     /// or back as an application stream. Unknown substreams, and a session
     /// that is not established, are ignored; an error means flushing what the
     /// mark woke failed the session.
@@ -977,7 +977,7 @@ fn yamux_stream(stream: StreamId) -> Result<u32, SessionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minip2p_yamux::{FLAG_SYN, Frame};
+    use crate::yamux::{FLAG_SYN, Frame};
 
     #[test]
     fn responder_allows_fallback_before_noise() {

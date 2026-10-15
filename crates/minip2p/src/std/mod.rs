@@ -74,10 +74,10 @@ use minip2p_core::Multiaddr;
 use minip2p_core::Protocol;
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_core::TransportKind;
+use minip2p_core::platform::{Clock, Now, StdClock, StdEntropy};
 use minip2p_core::{PeerAddr, PeerId};
 pub use minip2p_identify::IdentifyMessage;
 pub use minip2p_identity::Ed25519Keypair;
-use minip2p_platform::{Clock, Now, StdClock, StdEntropy};
 #[cfg(feature = "quic")]
 pub use minip2p_quic::{QuicBindError, QuicLimits};
 #[cfg(feature = "quic")]
@@ -226,7 +226,7 @@ impl std::error::Error for RelayServerControlError {
 /// above this line.
 #[cfg(feature = "nat")]
 pub(crate) type EndpointTransport =
-    minip2p_circuit::CircuitTransport<TransportSet, minip2p_platform::StdEntropy>;
+    minip2p_circuit::CircuitTransport<TransportSet, minip2p_core::platform::StdEntropy>;
 
 /// Transport used by [`Endpoint`] when NAT traversal is not compiled in.
 #[cfg(not(feature = "nat"))]
@@ -328,7 +328,7 @@ impl Endpoint {
     ///
     /// This constructs the same caller-driven, transport-generic endpoint as
     /// a `no_std` build; the std [`Endpoint::builder`] remains unchanged.
-    pub fn portable<E: minip2p_platform::EntropySource>(
+    pub fn portable<E: minip2p_core::platform::EntropySource>(
         identity: &Ed25519Keypair,
         entropy: E,
     ) -> crate::PortableEndpointBuilder<E> {
@@ -3689,7 +3689,7 @@ mod tests {
         }
         fn poll(
             &mut self,
-            _: minip2p_platform::Now,
+            _: minip2p_core::platform::Now,
         ) -> Result<Vec<minip2p_transport::TransportEvent>, TransportError> {
             if self.fail.load(Ordering::SeqCst) {
                 return Err(TransportError::PollError {

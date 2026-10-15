@@ -16,9 +16,7 @@ members = [
   "crates/multistream-select",
   "crates/nat",
   "crates/nodejs",
-  "crates/noise",
   "crates/ping",
-  "crates/platform",
   "crates/pubsub",
   "crates/relay",
   "crates/relay-server",
@@ -28,7 +26,6 @@ members = [
   "crates/test-support",
   "crates/tls",
   "crates/transport",
-  "crates/yamux",
   "transports/quic",
   "transports/tcp",
   "examples/chat",
@@ -45,6 +42,24 @@ license = "MIT"
 homepage = "https://github.com/deepso7/minip2p"
 repository = "https://github.com/deepso7/minip2p"
 keywords = ["libp2p", "peer-to-peer", "p2p", "networking", "sans-io"]
+
+# External dependencies shared by two or more workspace packages. Portable
+# (no_std-capable) crates turn default features off here and each member
+# enables what it needs. Internal minip2p-* crates stay path dependencies.
+[workspace.dependencies]
+bytes = { version = "1.12.1", default-features = false }
+criterion = "0.8.2"
+getrandom = { version = "0.4.3", default-features = false }
+gungraun = "=0.19.4"
+mio = { version = "1.2", features = ["net", "os-poll"] }
+rand_core = { version = "0.10.1", default-features = false }
+serde = { version = "1.0.229", default-features = false }
+serde_json = "1.0.151"
+sha2 = { version = "0.11.0", default-features = false }
+socket2 = "0.6.5"
+stats_alloc = "0.1.10"
+thiserror = { version = "2.0.20", default-features = false }
+uniffi = "=0.31.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

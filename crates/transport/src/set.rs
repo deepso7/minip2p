@@ -4,8 +4,8 @@ use alloc::format;
 use alloc::vec::Vec;
 use core::fmt;
 
+use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Bytes, Multiaddr, PeerAddr, TransportKind};
-use minip2p_platform::{Deadline, Now};
 use thiserror::Error;
 
 use crate::{
@@ -53,7 +53,7 @@ pub enum TransportSetError {
     #[error("could not attach the member to the shared poll ({kind}): {detail}")]
     AttachFailed {
         /// What kind of failure the registration reported.
-        kind: minip2p_platform::IoErrorKind,
+        kind: minip2p_core::platform::IoErrorKind,
         /// The registration's own description, for diagnostics.
         detail: alloc::string::String,
     },

@@ -22,8 +22,8 @@ use minip2p::{
     EndpointEvent, EntropySource, Multiaddr, NatConfig, NatEvent, Now, Path, PeerAddr, PeerId,
     ReservationPolicy, SmoltcpStack, StreamId, SwarmError,
 };
+use minip2p_core::platform::EntropyError;
 use minip2p_nat::{AUTONAT_PROTOCOL_ID, HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
-use minip2p_platform::EntropyError;
 use minip2p_test_support::{ConnectRequestOutcome, PendingConnectId, RelayEmulator};
 
 const A_IP: &str = "192.168.42.1";

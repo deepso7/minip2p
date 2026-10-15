@@ -87,7 +87,6 @@ allow_attributes_without_reason = "warn"
 diagnostics = []
 
 [dependencies]
-minip2p-platform = { path = "../../crates/platform", version = "0.8.3" }
 minip2p-transport = { path = "../../crates/transport", version = "0.8.3" }
 minip2p-identity = { path = "../../crates/identity", version = "0.8.3" }
 minip2p-core = { path = "../../crates/core", version = "0.8.3" }
@@ -104,13 +103,13 @@ rustls = { version = "0.23", default-features = false, features = [
 quinn-udp = { version = "0.6.3", default-features = false, features = [
   "fast-apple-datapath",
 ] }
-bytes = "1.12.1"
-mio = { version = "1.2", features = ["net", "os-poll"] }
-socket2 = "0.6.5"
-thiserror = "2.0.20"
+bytes = { workspace = true, features = ["std"] }
+mio = { workspace = true }
+socket2 = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
-criterion = "0.8.2"
+criterion = { workspace = true }
 minip2p-multistream-select = { path = "../../crates/multistream-select" }
 minip2p-ping = { path = "../../crates/ping" }
 minip2p-swarm = { path = "../../crates/swarm" }

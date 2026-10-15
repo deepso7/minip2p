@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 
-use minip2p_platform::EntropySource;
+use minip2p_core::platform::EntropySource;
 use minip2p_transport::mio::{Registry, Waker, event::Event};
 use minip2p_transport::{PollSource, TokenSpace};
 

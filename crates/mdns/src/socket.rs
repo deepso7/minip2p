@@ -12,7 +12,7 @@ use minip2p_transport::mio::{self, Interest, Registry, Waker, event::Event};
 use minip2p_transport::{PollSource, TokenSpace};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 
-use minip2p_platform::IoErrorKind;
+use minip2p_core::platform::IoErrorKind;
 
 use crate::io::{MdnsDatagram, MdnsError, MdnsIo, MdnsIoOperation};
 use crate::{InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAction, MdnsConfig, MdnsTarget};

@@ -79,8 +79,8 @@ pub use types::{
     UpgradeStop,
 };
 // The component time sample and deadline, re-exported so callers need not
-// depend on the platform crate to name them.
-pub use minip2p_platform::{Deadline, Now};
+// depend on minip2p-core to name them.
+pub use minip2p_core::platform::{Deadline, Now};
 
 // Protocol ids for everything the agent drives, so a driver can register
 // them without depending on each protocol crate.
