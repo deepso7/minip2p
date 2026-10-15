@@ -280,10 +280,18 @@ Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see `minip2p::RES
 cargo bench -p minip2p-rs --features tcp,relay-server,pubsub,mdns,bench --bench endpoint_idle
 ```
 
-`benches/endpoint_throughput.rs` measures one-way sustained throughput (64 MiB in 64 KiB writes, up to 8 ahead of the receiver) over TCP, QUIC, and a forced relayed circuit through a third Endpoint, plus allocations per MB in a separate pass. It installs `stats_alloc` as its global allocator, so it counts every allocation made through the Rust allocator, QUIC's rustls TLS included. For the QUIC-carried cases it also reports each Endpoint's UDP datagrams per MB and average datagram size in each direction, from the `diagnostics` counters of `minip2p-quic` that the `bench` feature enables:
+`benches/endpoint_throughput.rs` measures one-way sustained throughput (256 MiB in 64 KiB writes, up to 32 MiB ahead of the receiver) over TCP, QUIC, and a forced relayed circuit through a third Endpoint, plus allocations per MB in a separate pass. It installs `stats_alloc` as its global allocator, so it counts every allocation made through the Rust allocator, QUIC's rustls TLS included. For the QUIC-carried cases it also reports each Endpoint's UDP datagrams per MB and average datagram size in each direction, from the `diagnostics` counters of `minip2p-quic` that the `bench` feature enables:
 
 ```bash
 cargo bench -p minip2p-rs --features tcp,nat,relay-server,bench --bench endpoint_throughput
+```
+
+`benches/endpoint_rtt.rs` measures the same one-way goodput over an emulated link: a userspace proxy (`benches/support/delay.rs`) caps each direction at 100 Mbit/s and adds a 100 ms round trip, with no loss, so flow-control windows are measured at a real RTT where `tc netem` is unavailable. It reports the median of 3 warm transfers over QUIC and over TCP + Yamux with default limits. The TCP case measures Yamux credit at the RTT, not kernel TCP, because the proxy terminates TCP on both sides. With `MINIP2P_RTT_SWEEP` set it runs one of #361's window sweeps instead; `scripts/rtt-sweep.sh` runs them all in order and records the picks:
+
+```bash
+cargo bench -p minip2p-rs --features tcp,bench --bench endpoint_rtt
+scripts/rtt-sweep.sh                    # every sweep, ~20 minutes
+scripts/rtt-sweep.sh quic-stream yamux  # just these
 ```
 
 `benches/endpoint_ping_load.rs` measures application-observed ping latency (`Instant` around `ping()` until the matching `PingRttMeasured` event, p50 and p99 over 200 samples) from an Endpoint with QUIC and TCP bound to a probe peer over each transport, while that Endpoint is idle, relays an unbounded transfer over a forced circuit, or forwards 500 1 KiB gossipsub messages per second between two peers. Each loaded case asserts the load advanced across the whole sampling window, and a sample slower than 2 s fails the run:

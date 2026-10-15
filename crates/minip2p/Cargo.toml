@@ -86,6 +86,7 @@ criterion = { workspace = true }
 minip2p-autonat = { path = "../autonat" }
 minip2p-relay = { path = "../relay" }
 minip2p-test-support = { path = "../test-support" }
+socket2 = { workspace = true }
 stats_alloc = { workspace = true }
 
 [[bench]]
@@ -102,6 +103,11 @@ required-features = ["quic", "tcp", "relay-server", "pubsub", "mdns", "bench"]
 name = "endpoint_throughput"
 harness = false
 required-features = ["quic", "tcp", "nat", "relay-server", "bench"]
+
+[[bench]]
+name = "endpoint_rtt"
+harness = false
+required-features = ["quic", "tcp", "bench"]
 
 [[bench]]
 name = "endpoint_ping_load"

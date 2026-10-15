@@ -2,8 +2,8 @@
 //! plus allocation traffic per MB transferred.
 //!
 //! Each case connects a client to a target, then moves a fixed
-//! [`TOTAL`] bytes over one application stream in one direction. The client
-//! writes [`CHUNK`]-sized chunks and keeps up to [`IN_FLIGHT`] bytes ahead of
+//! [`TOTAL`] bytes over one application stream in one direction
+//! (`support::bulk`). The client writes 64 KiB chunks and keeps up to [`IN_FLIGHT`] bytes ahead of
 //! what the target has received, well past the transports' own windows, so
 //! transport backpressure rather than the bench bounds the rate. A write the
 //! stream refuses (that backpressure) is not counted and is retried once the
@@ -35,7 +35,7 @@
 //! outside the Rust allocator are not seen; QUIC's TLS runs on rustls, so its
 //! allocations are counted.
 //! The figures are informational: over real transports they vary with
-//! scheduling and read chunking. The sender allocates its `CHUNK` once: each
+//! scheduling and read chunking. The sender allocates its chunk once: each
 //! write passes a `Bytes` handle to it, and a Full resends the unsent tail.
 //!
 //! `relayed` uses three Endpoints (`support::Relayed`): the target and the
@@ -50,17 +50,14 @@
 mod support;
 
 use std::alloc::System;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-    mpsc,
-};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use minip2p::{Bytes, Endpoint, EndpointEvent, PeerId, RelayServerEvent};
+use minip2p::{Endpoint, EndpointEvent, PeerId, RelayServerEvent};
 use minip2p_quic::{DatagramCounters, datagram_counters, socket_buffers};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Stats, StatsAlloc};
-use support::{Driven, Relayed, SETUP_TIMEOUT, bind_on, bind_relay, next_event, send_chunk};
+use support::bulk::{self, Load, Sink};
+use support::{Driven, Relayed, SETUP_TIMEOUT, bind_on, bind_relay, next_event};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
@@ -68,15 +65,11 @@ static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 const PROTOCOL: &str = "/minip2p/bench/sink/1";
 /// Bytes moved per transfer.
 const TOTAL: u64 = 256 * MB;
-/// Bytes per write.
-const CHUNK: usize = 64 * 1024;
 /// Bytes the client may have written ahead of what the target received: more
 /// than QUIC's connection and send windows (3 and 2 MiB by default) plus the
 /// adapter's pending-send queue per connection
 /// (`max_pending_connection_bytes`, 1 MiB) can hold.
 const IN_FLIGHT: u64 = 32 * MB;
-/// Upper bound for one transfer.
-const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 const MB: u64 = 1 << 20;
 
 /// The Endpoints of a case whose datagrams are counted, by role: at most
@@ -114,107 +107,31 @@ impl Mark {
     }
 }
 
-/// The client's view of the target's receive progress on the current stream.
-struct Progress {
-    received: Arc<AtomicU64>,
-    done: mpsc::Receiver<Mark>,
+/// Drives `target` as the sink, marking the end of each transfer.
+fn spawn_sink(target: Endpoint, client: &Endpoint, roles: Roles) -> (Driven, Sink<Mark>) {
+    bulk::spawn_sink(
+        target,
+        client,
+        PROTOCOL,
+        move || Mark::now(&roles),
+        |_, _| {},
+    )
 }
 
-/// Drives `target` on its own thread as the sink: it counts bytes on the
-/// newest inbound stream, publishes the count, wakes the client, and sends a
-/// [`Mark`] once [`TOTAL`] bytes arrived.
-fn spawn_sink(target: Endpoint, client: &Endpoint, roles: Roles) -> (Driven, Progress) {
-    let received = Arc::new(AtomicU64::new(0));
-    let (done_tx, done) = mpsc::channel();
-    let wake = client.wait_handle();
-    let shared = Arc::clone(&received);
-    let mut stream = None;
-    let mut count = 0;
-    let driven = Driven::spawn(target, move |_, event| match event {
-        EndpointEvent::StreamReady {
-            stream_id,
-            protocol_id,
-            initiated_locally: false,
-            ..
-        } if protocol_id == PROTOCOL => {
-            stream = Some(stream_id);
-            count = 0;
-        }
-        EndpointEvent::StreamData {
-            stream_id, data, ..
-        } if Some(stream_id) == stream => {
-            count += data.len() as u64;
-            assert!(count <= TOTAL, "sink received more than the transfer");
-            // Publish before reporting the end, so the client's reset for the
-            // next transfer cannot be overwritten by this one's final count.
-            shared.store(count, Ordering::Release);
-            if count == TOTAL {
-                done_tx
-                    .send(Mark::now(&roles))
-                    .expect("report transfer end");
-            }
-            wake.interrupt();
-        }
-        _ => {}
-    });
-    (driven, Progress { received, done })
-}
-
-/// Opens a stream and moves [`TOTAL`] bytes over it, returning the marks
-/// taken just before the first write and when the sink got the last byte.
+/// Moves [`TOTAL`] bytes over a fresh stream, returning the marks taken just
+/// before the first write and when the sink got the last byte.
 fn transfer(
     client: &mut Endpoint,
     peer: &PeerId,
-    progress: &Progress,
+    sink: &Sink<Mark>,
     roles: &Roles,
 ) -> (Mark, Mark) {
-    progress.received.store(0, Ordering::Release);
-    let (conn, stream) = client.open_stream(peer, PROTOCOL).expect("open stream");
-    let deadline = Instant::now() + SETUP_TIMEOUT;
-    loop {
-        assert!(Instant::now() < deadline, "stream negotiation timed out");
-        if let Some(EndpointEvent::StreamReady {
-            conn_id,
-            stream_id,
-            initiated_locally: true,
-            ..
-        }) = next_event(client, Duration::from_millis(10))
-            && (conn_id, stream_id) == (conn, stream)
-        {
-            break;
-        }
-    }
-
-    let chunk = Bytes::from(vec![0x5a; CHUNK]);
-    let mut held = None;
-    let start = Mark::now(roles);
-    let deadline = start.at + TRANSFER_TIMEOUT;
-    let mut sent = 0;
-    let end = loop {
-        if let Ok(end) = progress.done.try_recv() {
-            break end;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "transfer timed out at {sent} bytes"
-        );
-        while sent < TOTAL && sent - progress.received.load(Ordering::Acquire) < IN_FLIGHT {
-            let (accepted, full) = send_chunk(client, (conn, stream), &chunk, &mut held);
-            sent += accepted;
-            if full {
-                break;
-            }
-        }
-        // Flushes queued bytes. The sink's progress interrupts this wait,
-        // which returns so the window refills at once (`next_event` would
-        // swallow the interrupt and sleep out the deadline). The sender has
-        // no use for the outcome or any event.
-        let _outcome = client.wait(Duration::from_millis(5)).expect("drive client");
+    let load = Load {
+        total: TOTAL,
+        streams: 1,
+        in_flight: IN_FLIGHT,
     };
-    client
-        .close_stream_write(conn, stream)
-        .expect("close write");
-    (start, end)
+    bulk::transfer(client, peer, PROTOCOL, sink, load, || Mark::now(roles))
 }
 
 /// The rows for one case: throughput and datagrams from the timing pass,
@@ -299,9 +216,9 @@ fn direct(listen: &str) -> Vec<String> {
             Roles::new(vec![("client", client_peer), ("target", peer.clone())]),
         )
     };
-    let (_sink, progress) = spawn_sink(target, &client, roles.clone());
-    let timing = transfer(&mut client, &peer, &progress, &roles);
-    let allocation = transfer(&mut client, &peer, &progress, &roles);
+    let (_sink, sink) = spawn_sink(target, &client, roles.clone());
+    let timing = transfer(&mut client, &peer, &sink, &roles);
+    let allocation = transfer(&mut client, &peer, &sink, &roles);
     rows(case, &roles, timing, allocation)
 }
 
@@ -323,9 +240,9 @@ fn relayed() -> Vec<String> {
         ("target", target_peer.clone()),
         ("relay", relay_addr.peer_id().clone()),
     ]);
-    let (_sink, progress) = spawn_sink(target, &client, roles.clone());
-    let timing = transfer(&mut client, &target_peer, &progress, &roles);
-    let allocation = transfer(&mut client, &target_peer, &progress, &roles);
+    let (_sink, sink) = spawn_sink(target, &client, roles.clone());
+    let timing = transfer(&mut client, &target_peer, &sink, &roles);
+    let allocation = transfer(&mut client, &target_peer, &sink, &roles);
 
     client.disconnect(&target_peer).expect("close circuit");
     let deadline = Instant::now() + SETUP_TIMEOUT;

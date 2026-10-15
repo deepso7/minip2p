@@ -1345,6 +1345,7 @@ dependencies = [
  "minip2p-tcp",
  "minip2p-test-support",
  "minip2p-transport",
+ "socket2",
  "stats_alloc",
  "thiserror",
 ]
