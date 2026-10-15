@@ -150,18 +150,53 @@ fn a_burst_past_the_receive_bound_drains_without_another_readiness_edge() {
 }
 
 #[test]
-fn sockets_are_granted_buffers_no_smaller_than_the_platform_default() {
-    let fresh = UdpSocket::bind("127.0.0.1:0").expect("bind");
-    let default = socket2::SockRef::from(&fresh);
-    let (default_send, default_recv) = (
-        default.send_buffer_size().expect("send buffer"),
-        default.recv_buffer_size().expect("recv buffer"),
-    );
+fn sockets_report_the_buffers_they_were_granted() {
     let mut server = listening_server(QuicLimits::default());
     let buffers = server.socket().buffers;
-    assert!(buffers.send_bytes >= default_send, "{buffers:?}");
-    assert!(buffers.recv_bytes >= default_recv, "{buffers:?}");
-    assert!(buffers.send_bytes > 0 && buffers.recv_bytes > 0);
+    assert!(
+        buffers.send_bytes > 0 && buffers.recv_bytes > 0,
+        "{buffers:?}"
+    );
+}
+
+/// The sizes `grow_buffer` asks for when the platform accepts only `accepts`.
+fn requests(current: usize, accepts: impl Fn(usize) -> bool) -> Vec<usize> {
+    let mut asked = Vec::new();
+    crate::socket::grow_buffer(current, |bytes| {
+        asked.push(bytes);
+        if accepts(bytes) {
+            Ok(())
+        } else {
+            Err(std::io::ErrorKind::OutOfMemory.into())
+        }
+    });
+    asked
+}
+
+#[test]
+fn buffer_growth_halves_refused_requests_and_never_asks_for_less() {
+    use crate::socket::{MIN_SOCKET_BUFFER_BYTES, SOCKET_BUFFER_BYTES};
+
+    assert_eq!(requests(0, |_| true), [SOCKET_BUFFER_BYTES]);
+    assert_eq!(
+        requests(0, |bytes| bytes <= SOCKET_BUFFER_BYTES / 4),
+        [
+            SOCKET_BUFFER_BYTES,
+            SOCKET_BUFFER_BYTES / 2,
+            SOCKET_BUFFER_BYTES / 4
+        ]
+    );
+    // Halving stops at the current size rather than asking for less.
+    assert_eq!(
+        requests(SOCKET_BUFFER_BYTES / 2, |_| false),
+        [SOCKET_BUFFER_BYTES]
+    );
+    assert!(requests(SOCKET_BUFFER_BYTES, |_| true).is_empty());
+    // A platform that refuses everything is given up on at the floor.
+    assert_eq!(
+        requests(0, |_| false).last(),
+        Some(&MIN_SOCKET_BUFFER_BYTES)
+    );
 }
 
 #[cfg(feature = "diagnostics")]

@@ -28,10 +28,10 @@ const MAX_TRANSMIT_SEGMENTS: usize = 10;
 /// smaller sizes are tried. Platform defaults (about 208 KiB on Linux, a
 /// 9216-byte send buffer on macOS, which silently drops part of a batch:
 /// mozilla/neqo#3898) overflow under bursts a 10 MB window allows.
-const SOCKET_BUFFER_BYTES: usize = 4 << 20;
+pub(crate) const SOCKET_BUFFER_BYTES: usize = 4 << 20;
 
 /// Smallest size [`grow_buffer`] tries before giving up on a direction.
-const MIN_SOCKET_BUFFER_BYTES: usize = 64 << 10;
+pub(crate) const MIN_SOCKET_BUFFER_BYTES: usize = 64 << 10;
 
 /// Raises a socket buffer toward [`SOCKET_BUFFER_BYTES`], halving the request
 /// while the platform refuses it (BSDs and macOS do; Linux caps silently).
@@ -39,7 +39,7 @@ const MIN_SOCKET_BUFFER_BYTES: usize = 64 << 10;
 /// now, so it never asks for less. A Linux host whose default exceeds its cap
 /// (the sysctls are independent) still ends up at the cap; without
 /// `CAP_NET_ADMIN` the default cannot be restored, so that is accepted.
-fn grow_buffer(current: usize, mut set: impl FnMut(usize) -> io::Result<()>) {
+pub(crate) fn grow_buffer(current: usize, mut set: impl FnMut(usize) -> io::Result<()>) {
     let mut bytes = SOCKET_BUFFER_BYTES;
     while bytes > current && bytes >= MIN_SOCKET_BUFFER_BYTES {
         if set(bytes).is_ok() {
