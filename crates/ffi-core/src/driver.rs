@@ -6,13 +6,17 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use minip2p::{ConnectionId, EndpointWaitOutcome, Error, WaitDeadline};
+use minip2p::{EndpointWaitOutcome, Error, WaitDeadline};
 
 use crate::endpoint::{Lifecycle, Shared};
 use crate::events::convert_endpoint_event;
 use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
 
 const MAX_CARRY_EVENTS: usize = 4096;
+/// How many elided connection ids the carry remembers, so late path events
+/// naming them are dropped too. The Endpoint reports those in the same batch
+/// as the lifecycle events, and a batch is at most [`PUMP_DRAIN_LIMIT`].
+const ELIDED_CONNECTION_MEMORY: usize = 4 * PUMP_DRAIN_LIMIT;
 /// How many already-queued `wait` results one pump iteration will take
 /// before yielding the lock. Further events stay queued for the next wait.
 const PUMP_DRAIN_LIMIT: usize = 256;
@@ -103,8 +107,8 @@ pub(crate) struct Delivery {
 /// that `ConnectionEstablished`, the `ConnectionReplaced` goes too). A
 /// connection the binding could know of otherwise -- a stream it opened or
 /// wrote on, a ping result, an attempt terminal or path event naming it --
-/// is kept, and so is every relay circuit, whose path events follow its
-/// lifecycle events.
+/// is kept. Path events the Endpoint reports after an elided connection's
+/// lifecycle events (a relay circuit's) leave with it.
 #[derive(Default)]
 pub(crate) struct Carry {
     events: BTreeMap<u64, P2pEvent>,
@@ -128,6 +132,10 @@ pub(crate) struct Carry {
     /// Live connections the binding learned of outside the carry, so a later
     /// replacement fold must not make them unseen; each leaves with its end.
     known_connections: BTreeSet<u64>,
+    /// Recently elided or folded-away connections, oldest first, at most
+    /// [`ELIDED_CONNECTION_MEMORY`]: a later event naming one is dropped, so
+    /// the binding never meets an id whose lifecycle it never saw.
+    elided_connections: VecDeque<u64>,
 }
 
 impl Carry {
@@ -252,6 +260,12 @@ impl Carry {
     /// whether it ended (or replaced) one that carried no data, which leaves
     /// the carry with its events instead.
     fn track_connection(&mut self, event: &P2pEvent) -> bool {
+        if connection_ids(event)
+            .iter()
+            .any(|conn_id| self.elided_connections.contains(conn_id))
+        {
+            return true;
+        }
         match event {
             P2pEvent::ConnectionEstablished { conn_id, .. } => {
                 if self.may_elide(*conn_id) {
@@ -262,6 +276,7 @@ impl Carry {
                 if self.unseen_connections.remove(conn_id) =>
             {
                 self.remove_connection_events(*conn_id);
+                self.remember_elided(*conn_id);
                 return true;
             }
             P2pEvent::ConnectionReplaced {
@@ -279,6 +294,7 @@ impl Carry {
                     *conn_id = *new_conn_id;
                 }
                 self.remove_connection_events(*old_conn_id);
+                self.remember_elided(*old_conn_id);
                 if self.may_elide(*new_conn_id) {
                     self.unseen_connections.insert(*new_conn_id);
                 }
@@ -311,14 +327,20 @@ impl Carry {
         false
     }
 
-    /// Whether `conn_id` may be tracked as unseen. Not one the binding
-    /// learned of otherwise, nor a relay circuit: the Endpoint reports a
-    /// circuit's path events after its connection events, so eliding its
-    /// lifecycle would leave those naming an id the binding never saw end.
-    /// Circuits are admission-limited, so keeping them cannot grow the carry
-    /// without bound.
+    /// Whether `conn_id` may be tracked as unseen: not one the binding
+    /// learned of otherwise.
     fn may_elide(&self, conn_id: u64) -> bool {
-        !self.known_connections.contains(&conn_id) && !ConnectionId::new(conn_id).is_circuit()
+        !self.known_connections.contains(&conn_id)
+    }
+
+    /// Remembers an elided connection, so the path events the Endpoint
+    /// reports after its lifecycle events (a relay circuit's, above all) go
+    /// with it.
+    fn remember_elided(&mut self, conn_id: u64) {
+        if self.elided_connections.len() == ELIDED_CONNECTION_MEMORY {
+            self.elided_connections.pop_front();
+        }
+        self.elided_connections.push_back(conn_id);
     }
 
     /// Removes every event naming `conn_id`, with its peer streams' records.
@@ -1110,13 +1132,24 @@ mod tests {
         carry.push(closed(5));
         assert_eq!(carry.take(10), [established(5), ping, closed(5)]);
 
-        // So is a relay circuit, whose path events follow its end.
-        // The circuit namespace is the one with the top bit set.
-        let circuit = (1 << 63) | 1;
-        assert!(ConnectionId::new(circuit).is_circuit());
-        carry.push(established(circuit));
-        carry.push(closed(circuit));
-        assert_eq!(carry.take(10), [established(circuit), closed(circuit)]);
+        // An elided circuit takes the path events reported after its end
+        // with it, as does a folded-away one.
+        let path = |conn_id| P2pEvent::InboundPathEstablished {
+            peer_id: "peer".into(),
+            conn_id,
+            path: crate::PathKind::DirectDialed,
+        };
+        carry.push(established(6));
+        carry.push(closed(6));
+        carry.push(path(6));
+        carry.push(established(7));
+        carry.push(replaced(7, 8));
+        carry.push(P2pEvent::InboundDirectUpgrade {
+            peer_id: "peer".into(),
+            old_conn_id: 7,
+            new_conn_id: 8,
+        });
+        assert_eq!(carry.take(10), [established(8)]);
 
         // Even when an unseen predecessor folds into it afterwards.
         carry.push(established(3));
