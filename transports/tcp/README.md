@@ -50,7 +50,7 @@ A `poll` costs what has work, not how many connections are open. The transport s
 
 ## Limits
 
-A connection costs a session — Noise state, a Yamux session, whatever is buffered — from the moment the byte stream comes up, which is well before the peer has proved who it is. `TcpConfig::max_connections` bounds how many exist at once: a dial past it fails the caller, and an inbound one is dropped where it stands, because nothing has been announced about it to report against.
+A connection costs a session — Noise state, a Yamux session, whatever is buffered — from the moment the byte stream comes up, which is well before the peer has proved who it is. `TcpConfig::max_connections` bounds how many exist at once: a dial past it fails the caller, and an inbound one is dropped where it stands, because nothing has been announced about it to report against. A connection that ends while some of its streams still hold delivered, unacknowledged bytes keeps its slot until they are acknowledged or abandoned (`ack_stream` and `reset_stream` still settle its streams after `Closed`), so reconnect churn against a slow reader stays bounded (ADR 0012); with every slot held, dials fail with `ResourceExhausted` and inbound connections are refused.
 
 A ceiling alone would not hold, though — a peer that completes the TCP handshake and then says nothing keeps its slot for as long as the socket lives, so a few silent peers could fill the ceiling and keep it full. `TcpConfig::handshake_timeout_ms` is what stops that, measured from the first `poll` that sees the connection rather than from the call that made it: the transport owns no clock, so between polls the only time it holds is the last poll's, and after an idle spell that is arbitrarily long ago.
 

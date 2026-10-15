@@ -10,6 +10,7 @@ use minip2p_nat::{
     AUTONAT_PROTOCOL_ID, DCUTR_PROTOCOL_ID, HOP_PROTOCOL_ID, NatConfig, NatEvent, Path,
     STOP_PROTOCOL_ID,
 };
+use minip2p_relay::Status;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, StreamId};
 
@@ -243,9 +244,77 @@ fn unparsable_source_peer_id_is_rejected() {
         1,
         "a rejection STATUS goes back to the relay"
     );
-    assert!(has_reset_for(&actions, stream));
+    assert!(refused_with_fin(&actions, stream), "{actions:?}");
     assert!(drain_events(&mut h.agent).is_empty());
     assert!(h.agent.is_idle());
+}
+
+#[test]
+fn a_stop_past_the_circuit_limit_is_refused_until_a_slot_frees() {
+    // #356: circuits have their own admission limit, counting circuits the
+    // transport holds (live or unsettled) and STOPs accepted but not yet
+    // adopted. Past it, STOP is refused before acceptance.
+    let mut h = inbound_harness(NatConfig {
+        max_circuits: 2,
+        ..NatConfig::default()
+    });
+    h.agent.swarm.circuit_slots = 1;
+    let target = h.target.clone();
+    let accepted = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, accepted, 0);
+    h.stream_data(accepted, stop_connect(&target), at(10));
+    let actions = drain_actions(&mut h.agent);
+    assert_eq!(
+        stop_status(&sent_data_on(&actions, accepted)),
+        Some(Status::Ok)
+    );
+    let token = promote_token(&actions);
+
+    let refused = StreamId::new(STOP_STREAM + 4);
+    inbound_stop_stream(&mut h, refused, 20);
+    h.stream_data(refused, stop_connect(&target), at(30));
+    let actions = drain_actions(&mut h.agent);
+    assert_eq!(
+        stop_status(&sent_data_on(&actions, refused)),
+        Some(Status::ResourceLimitExceeded)
+    );
+    assert!(refused_with_fin(&actions, refused), "{actions:?}");
+    // Draining the status and FIN, the stream stays NAT's: late relay bytes
+    // never surface as an application stream.
+    let conn = minip2p_transport::ConnectionId::new(1);
+    assert!(h.agent.owns_stream(conn, refused));
+    h.stream_data(refused, vec![1, 2, 3], at(35));
+    assert!(drain_actions(&mut h.agent).is_empty());
+    h.agent.handle_event(
+        &SwarmEvent::StreamClosed {
+            conn_id: conn,
+            peer_id: h.relay.clone(),
+            stream_id: refused,
+        },
+        false,
+        at(36),
+    );
+    assert!(!h.agent.owns_stream(conn, refused));
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Out::PromoteBridge { .. }))
+    );
+
+    // A failed adoption releases the accepted STOP's reservation.
+    h.agent.promote_result(
+        token,
+        Err(minip2p_nat::PromoteError::Failed("gone".into())),
+        at(40),
+    );
+    let again = StreamId::new(STOP_STREAM + 8);
+    inbound_stop_stream(&mut h, again, 50);
+    h.stream_data(again, stop_connect(&target), at(60));
+    let actions = drain_actions(&mut h.agent);
+    assert_eq!(
+        stop_status(&sent_data_on(&actions, again)),
+        Some(Status::Ok)
+    );
 }
 
 #[test]

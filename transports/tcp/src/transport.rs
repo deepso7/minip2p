@@ -11,7 +11,7 @@ use minip2p_secure_mux::{
 };
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, ConnectionState,
-    ConnectionToken, StreamId, Transport, TransportError, TransportEvent,
+    ConnectionToken, StreamId, Transport, TransportError, TransportEvent, UnsettledConnections,
 };
 
 use crate::config::TcpConfig;
@@ -165,6 +165,9 @@ pub struct TcpTransport<P, E> {
     config: TcpConfig,
     ids: ConnectionIdAllocator,
     connections: BTreeMap<ConnectionId, Connection>,
+    /// Ended connections whose delivered bytes are not settled yet. Each
+    /// still holds a slot against [`TcpConfig::max_connections`] (ADR 0012).
+    unsettled: UnsettledConnections,
     by_socket: BTreeMap<SocketHandle, ConnectionId>,
     pending: VecDeque<TransportEvent>,
     /// Connections the next poll services regardless of time: new ones, which
@@ -194,6 +197,7 @@ impl<P, E> TcpTransport<P, E> {
             ids: ConnectionIdAllocator::new(config.namespace),
             config,
             connections: BTreeMap::new(),
+            unsettled: UnsettledConnections::new(),
             by_socket: BTreeMap::new(),
             pending: VecDeque::new(),
             work: BTreeSet::new(),
@@ -234,6 +238,21 @@ impl<P, E> TcpTransport<P, E> {
     /// The active connection identifiers.
     pub fn connection_ids(&self) -> Vec<ConnectionId> {
         self.connections.keys().copied().collect()
+    }
+
+    /// Whether every connection slot is taken, by live connections and by
+    /// ended ones whose delivered bytes are not settled yet.
+    fn at_capacity(&self) -> bool {
+        self.connections.len() + self.unsettled.len() >= self.config.max_connections
+    }
+
+    /// Takes a connection out of the map for good, handing its unsettled
+    /// streams' counts to [`Self::unsettled`].
+    fn retire(&mut self, id: ConnectionId) -> Option<Connection> {
+        let connection = self.connections.remove(&id)?;
+        self.unsettled
+            .insert(id, connection.session.unsettled_streams());
+        Some(connection)
     }
 }
 
@@ -432,7 +451,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
     /// Aborting the socket is what makes this final: a provider emits nothing
     /// further for an aborted handle, so no late event can resurrect the id.
     fn fail_connection(&mut self, id: ConnectionId, message: String, emit_error: bool) {
-        let Some(connection) = self.connections.remove(&id) else {
+        let Some(connection) = self.retire(id) else {
             return;
         };
         self.forget(&connection);
@@ -584,8 +603,9 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         // Shed before naming. An inbound connection at the ceiling is refused
         // where it stands: nothing has been announced about it, so there is
         // nobody to report a failure to, and spending an id on it would burn
-        // the namespace at whatever rate a peer chose to knock.
-        if self.connections.len() >= self.config.max_connections {
+        // the namespace at whatever rate a peer chose to knock. Ended
+        // connections with unsettled bytes still hold their slots.
+        if self.at_capacity() {
             self.provider.abort(socket);
             return;
         }
@@ -734,7 +754,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         // Both checks come before anything with a side effect, so a refused
         // dial leaves nothing behind: no spent id, and no connected socket
         // without an id to name it.
-        if self.connections.len() >= self.config.max_connections {
+        if self.at_capacity() {
             return Err(TransportError::ResourceExhausted {
                 resource: "tcp connections",
             });
@@ -862,6 +882,10 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
+        // Abandoning a stream of an ended connection only settles it.
+        if self.unsettled.abandon(id, stream_id) {
+            return Ok(());
+        }
         let result = self
             .operate_session(id, |session| session.reset_stream(stream_id))
             .map_err(|error| {
@@ -882,7 +906,8 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         bytes: usize,
     ) -> Result<(), TransportError> {
         if !self.connections.contains_key(&id) {
-            return Ok(());
+            // An ended connection's bytes are released without credit.
+            return self.unsettled.ack(id, stream_id, bytes).map(|_held| ());
         }
         // Flushed at once, so the window update reaches the peer without
         // waiting for another poll.
@@ -899,8 +924,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
         let mut connection = self
-            .connections
-            .remove(&id)
+            .retire(id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
         self.forget(&connection);
         self.by_socket.remove(&connection.socket);

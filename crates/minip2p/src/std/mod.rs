@@ -560,8 +560,11 @@ impl Endpoint {
     /// so a reader that never acknowledges stalls its sender. Fails with
     /// [`TransportError::AckExceedsDelivered`] when `bytes` exceeds the
     /// stream's unacknowledged bytes. Acknowledging a closed stream releases
-    /// its bytes (and its stream slot, once none are left); a settled or
-    /// unknown stream or connection is a no-op. Streams of protocols
+    /// its bytes (and its stream slot, once none are left), also after its
+    /// connection closed: an ended connection keeps its connection slot until
+    /// all its streams settle, so a reader that holds bytes across peer
+    /// churn eventually has the transport refuse new connections (ADR 0012).
+    /// A settled or unknown stream or connection is a no-op. Streams of protocols
     /// registered with [`Self::add_protocol`] are acknowledged as their data
     /// is pulled, and must not be acknowledged here too.
     pub fn stream_consumed(
@@ -667,9 +670,12 @@ impl Endpoint {
     /// no-op. A stream the peer has already closed has nothing left to reset:
     /// it is abandoned (and its undelivered data acknowledged) only while its
     /// [`EndpointEvent::StreamClosed`] is undelivered, and fails with
-    /// [`SwarmError::StreamNotFound`] (or
-    /// [`TransportError::ConnectionNotFound`] once its connection is gone)
-    /// after that, including on a second call.
+    /// [`SwarmError::StreamNotFound`] after that, including on a second call.
+    ///
+    /// Once the stream's connection has ended, abandoning always succeeds and
+    /// needs no queued event: the endpoint and swarm drop what they hold for
+    /// it and the transport settles it, giving up the bytes it delivered so
+    /// they no longer hold the connection's slot (ADR 0012).
     pub fn abandon_stream(
         &mut self,
         conn_id: ConnectionId,

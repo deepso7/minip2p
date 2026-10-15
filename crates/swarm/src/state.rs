@@ -174,6 +174,13 @@ pub(crate) enum Action {
         stream_id: StreamId,
         bytes: usize,
     },
+    /// Settle a stream of a connection that already ended, abandoning its
+    /// unacknowledged bytes (`Transport::reset_stream`, ADR 0012). A
+    /// transport holding nothing for it makes this a no-op.
+    SettleStream {
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    },
     /// Mark a stream as one of the swarm's control streams, or back as an
     /// application stream (`Transport::set_control_stream`). Every stream is
     /// control while multistream negotiates it, and ping and Identify
@@ -236,11 +243,26 @@ fn connection_action_matches(action: &Action, conn_id: ConnectionId) -> bool {
             conn_id: action_conn,
             ..
         }
+        | Action::SettleStream {
+            conn_id: action_conn,
+            ..
+        }
         | Action::SetControlStream {
             conn_id: action_conn,
             ..
         } => *action_conn == conn_id,
     }
+}
+
+/// Whether a replacement drops `action` for the replaced connection `old`.
+/// Acknowledgements and settlements stay: delivered bytes remain counted
+/// after the connection ends until they are released (ADR 0012).
+fn dropped_on_replacement(action: &Action, old: ConnectionId) -> bool {
+    connection_action_matches(action, old)
+        && !matches!(
+            action,
+            Action::AckStream { .. } | Action::SettleStream { .. }
+        )
 }
 
 /// The stream a write or write-side close addresses.
@@ -1010,6 +1032,13 @@ impl SwarmState {
     /// delivered, or dropped by an earlier call, the stream is
     /// indistinguishable from one that never existed and both are
     /// [`SwarmError::StreamNotFound`].
+    ///
+    /// After the stream's connection ended -- its `ConnectionClosed` or
+    /// `ConnectionReplaced` may long have been delivered -- no terminal event
+    /// is needed: the swarm drops what it still queues for the stream and the
+    /// transport settles it outright, giving up its unacknowledged bytes
+    /// (ADR 0012). That always succeeds; a transport holding nothing for the
+    /// stream makes it a no-op.
     pub fn abandon_stream(
         &mut self,
         peer_id: &PeerId,
@@ -1041,6 +1070,14 @@ impl SwarmState {
             && !(peer_conn && self.outbound_negotiators.contains_key(&key))
             && let Err(unknown) = self.require_user_stream(peer_id, conn_id, stream_id)
         {
+            // The connection ended: whatever its terminal events said, the
+            // transport may still hold the stream's delivered bytes, and only
+            // it can settle them (ADR 0012).
+            if !self.conn_to_peer.contains_key(&conn_id) {
+                self.actions
+                    .push_back(Action::SettleStream { conn_id, stream_id });
+                return Ok(());
+            }
             // A queued terminal proves the stream was ours and that the
             // transport has already closed and forgotten it; without one it is
             // genuinely unknown.
@@ -1072,6 +1109,34 @@ impl SwarmState {
         self.remove_stream_owner(conn_id, stream_id);
         self.inbound_negotiators.remove(&key);
         self.outbound_negotiators.remove(&key);
+        Ok(())
+    }
+
+    /// Abandons a stream of a connection that already ended, for a caller
+    /// that no longer knows its peer: every event naming it was delivered.
+    /// The transport settles it outright (ADR 0012); one holding nothing for
+    /// it makes this a no-op. A connection the swarm still routes is
+    /// [`SwarmError::StreamNotFound`]: use
+    /// [`abandon_stream`](Self::abandon_stream) there.
+    pub fn abandon_ended_stream(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), SwarmError> {
+        if let Some(peer_id) = self.conn_to_peer.get(&conn_id) {
+            return Err(SwarmError::StreamNotFound {
+                peer_id: peer_id.clone(),
+                conn_id,
+                stream_id,
+            });
+        }
+        self.events.retain(|event| {
+            !event
+                .peer_id()
+                .is_some_and(|peer| event.matches_stream(peer, conn_id, stream_id))
+        });
+        self.actions
+            .push_back(Action::SettleStream { conn_id, stream_id });
         Ok(())
     }
 
@@ -1246,11 +1311,22 @@ impl SwarmState {
         {
             // A replaced connection was already reported through
             // `ConnectionReplaced`; only its final close is bookkeeping.
-            if matches!(event, TransportEvent::Closed { .. }) {
-                self.retired_connections.remove(&id);
-                self.vetoed_establishes.remove(&id);
-                self.conn_to_remote_addr.remove(&id);
-                self.forget_connection_streams(id);
+            match event {
+                TransportEvent::Closed { .. } => {
+                    self.retired_connections.remove(&id);
+                    self.vetoed_establishes.remove(&id);
+                    self.conn_to_remote_addr.remove(&id);
+                    self.forget_connection_streams(id);
+                }
+                // Nobody will read it, so the state consumes it.
+                TransportEvent::StreamData {
+                    stream_id, data, ..
+                } => self.actions.push_back(Action::AckStream {
+                    conn_id: id,
+                    stream_id,
+                    bytes: data.len(),
+                }),
+                _ => {}
             }
             return;
         }
@@ -1809,7 +1885,27 @@ impl SwarmState {
         }
         self.reset_peer_protocols(peer_id);
         self.peer_info.remove(peer_id);
-        self.events.retain(|event| event.peer_id() != Some(peer_id));
+        let actions = &mut self.actions;
+        self.events.retain(|event| {
+            if event.peer_id() != Some(peer_id) {
+                return true;
+            }
+            // Dropped data is never delivered, so the state acknowledges it.
+            if let SwarmEvent::StreamData {
+                conn_id,
+                stream_id,
+                data,
+                ..
+            } = event
+            {
+                actions.push_back(Action::AckStream {
+                    conn_id: *conn_id,
+                    stream_id: *stream_id,
+                    bytes: data.len(),
+                });
+            }
+            false
+        });
     }
 
     /// Starts the swarm's own protocols on a peer's new current connection:
@@ -1891,7 +1987,7 @@ impl SwarmState {
         self.registrations.remove(&old);
         self.forget_connection_streams(old);
         self.actions
-            .retain(|action| !connection_action_matches(action, old));
+            .retain(|action| !dropped_on_replacement(action, old));
         self.retired_connections.insert(old);
         self.deferred_closes.retain(|conn_id| *conn_id != old);
         self.deferred_closes.push_back(old);
@@ -4596,7 +4692,8 @@ mod tests {
             let (mut core, peer_id, old, new, stream) =
                 peer_with_stream_on_two_generations(replace);
 
-            for result in stream_ops(&mut core, &peer_id, old, stream) {
+            let [send, close, reset, abandon] = stream_ops(&mut core, &peer_id, old, stream);
+            for result in [send, close, reset] {
                 assert!(
                     matches!(
                         result,
@@ -4605,6 +4702,17 @@ mod tests {
                     "replace={replace}"
                 );
             }
+            // Abandoning settles the old stream in the transport, never the
+            // successor's.
+            abandon.expect("abandoning after the connection ended succeeds");
+            assert!(
+                matches!(
+                    drain_actions(&mut core).as_slice(),
+                    [Action::SettleStream { conn_id, stream_id }]
+                        if *conn_id == old && *stream_id == stream
+                ),
+                "replace={replace}"
+            );
             assert!(core.poll_output().is_none(), "replace={replace}");
 
             for result in stream_ops(&mut core, &peer_id, new, stream) {
@@ -4637,11 +4745,83 @@ mod tests {
         core.events.push_back(data(old));
         core.events.push_back(data(new));
 
-        assert!(core.abandon_stream(&peer_id, old, stream).is_err());
+        core.abandon_stream(&peer_id, old, stream)
+            .expect("abandoning after the connection ended succeeds");
         assert!(matches!(
             drain_events(&mut core).as_slice(),
             [SwarmEvent::StreamData { conn_id, .. }] if *conn_id == new
         ));
+    }
+
+    #[test]
+    fn abandoning_after_the_close_was_delivered_settles_the_stream_in_the_transport() {
+        // ADR 0012 (#356): abandonment goes top-down. With the connection's
+        // terminal event long delivered, the swarm drops what it still holds
+        // and the transport settles the stream outright.
+        let (mut core, peer_id, old, new, stream) = peer_with_stream_on_two_generations(false);
+        core.abandon_stream(&peer_id, old, stream)
+            .expect("no terminal event is needed as proof");
+        assert!(matches!(
+            drain_actions(&mut core).as_slice(),
+            [Action::SettleStream { conn_id, stream_id }]
+                if *conn_id == old && *stream_id == stream
+        ));
+        // A caller that no longer knows the peer gets the same.
+        core.abandon_ended_stream(old, stream)
+            .expect("an ended connection");
+        assert!(matches!(
+            drain_actions(&mut core).as_slice(),
+            [Action::SettleStream { conn_id, .. }] if *conn_id == old
+        ));
+        // A connection the swarm still routes keeps the strict rules.
+        assert!(matches!(
+            core.abandon_stream(&peer_id, new, StreamId::new(99)),
+            Err(SwarmError::StreamNotFound { .. })
+        ));
+        assert!(matches!(
+            core.abandon_ended_stream(new, StreamId::new(99)),
+            Err(SwarmError::StreamNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn data_from_a_replaced_connection_is_acknowledged_and_queued_acks_survive() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"acked-replaced-peer");
+        let (old, new) = (ConnectionId::new(50), ConnectionId::new(51));
+        connect_again(&mut core, &peer_id, old, false);
+        drain_actions(&mut core);
+        // Bytes for a stream nobody owns are the state's to acknowledge.
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: old,
+                stream_id: StreamId::new(7),
+                data: Bytes::from_static(b"stray"),
+            },
+        );
+        connect_again(&mut core, &peer_id, new, false);
+        // The replaced connection's late data is dropped, and acknowledged.
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: old,
+                stream_id: StreamId::new(9),
+                data: Bytes::from_static(b"late"),
+            },
+        );
+        let acks: Vec<_> = drain_actions(&mut core)
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::AckStream {
+                    conn_id,
+                    stream_id,
+                    bytes,
+                } if conn_id == old => Some((stream_id.as_u64(), bytes)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(acks, [(7, 5), (9, 4)]);
     }
 
     #[test]
@@ -4779,7 +4959,11 @@ mod tests {
                 data: Bytes::from(multistream_frame(MULTISTREAM_PROTOCOL_ID)),
             },
         );
-        assert!(core::iter::from_fn(|| core.poll_output()).next().is_none());
+        // Only the acknowledgement of the data it drops.
+        assert!(matches!(
+            core::iter::from_fn(|| core.poll_output()).collect::<Vec<_>>().as_slice(),
+            [Output::Action(Action::AckStream { conn_id, .. })] if *conn_id == original
+        ));
         assert_eq!(core.connection_id(&peer_id), Some(upgraded));
         feed(&mut core, TransportEvent::Closed { id: original });
         assert!(drain_events(&mut core).is_empty());
@@ -5964,6 +6148,24 @@ mod tests {
                     );
                 }
                 assert_eq!(core.connection_id(&peer), Some(current), "{case}");
+
+                // Data the loser still delivers is dropped and acknowledged.
+                feed(
+                    &mut core,
+                    TransportEvent::StreamData {
+                        id: new,
+                        stream_id: StreamId::new(3),
+                        data: Bytes::from_static(b"lost"),
+                    },
+                );
+                assert!(
+                    drain_actions(&mut core).contains(&Action::AckStream {
+                        conn_id: new,
+                        stream_id: StreamId::new(3),
+                        bytes: 4,
+                    }),
+                    "{case}"
+                );
 
                 // Its transport close is bookkeeping only.
                 feed(&mut core, TransportEvent::Closed { id: new });

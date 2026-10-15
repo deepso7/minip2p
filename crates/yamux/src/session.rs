@@ -195,7 +195,9 @@ fn writable_threshold(config: &YamuxConfig, control: bool) -> usize {
 /// unacknowledged bytes stays **unsettled**: it keeps its slot against
 /// [`YamuxConfig::max_streams`] until they are acknowledged, or abandoned by
 /// a local [`reset`](Self::reset), so stream churn cannot grow retained data
-/// past the stream limit times the window. Input never has to stop.
+/// past the stream limit times the window. Input never has to stop. The
+/// counts outlive the session itself, for its host to take over: see
+/// [`unsettled_streams`](Self::unsettled_streams).
 pub struct YamuxSession {
     role: YamuxRole,
     config: YamuxConfig,
@@ -436,17 +438,18 @@ impl YamuxSession {
     ///
     /// The reset abandons the stream's unacknowledged bytes, so it settles
     /// at once. Resetting a stream that is closed but unsettled only settles
-    /// it.
+    /// it, also after the session ended.
     ///
     /// Resetting a stream the peer opened spends the control reserve: a peer
     /// can open (and provoke the reset of) streams without bound, so a peer
     /// that never reads the resets fails the session with
     /// [`YamuxError::ControlReserveExhausted`].
     pub fn reset(&mut self, stream: u32) -> Result<(), YamuxError> {
-        self.ensure_active()?;
+        // Settling needs no wire, so it works after the session ended too.
         if self.unsettled.remove(&stream).is_some() {
             return Ok(());
         }
+        self.ensure_active()?;
         let unannounced = match self.streams.get(&stream) {
             Some(state) => state.pending_open == Some(OpenFlag::Syn),
             None => return Err(YamuxError::UnknownStream(stream)),
@@ -613,6 +616,22 @@ impl YamuxSession {
     #[cfg(test)]
     pub fn poll_events(&mut self) -> Vec<YamuxOutput> {
         core::iter::from_fn(|| self.poll_event()).collect()
+    }
+
+    /// Every stream still holding delivered bytes that are not acknowledged,
+    /// open or closed, with how many.
+    ///
+    /// A host tearing the connection down takes these over so the bytes stay
+    /// counted until they are acknowledged or abandoned (ADR 0012). They
+    /// survive the session ending: a GoAway or protocol failure leaves
+    /// [`ack`](Self::ack) and [`reset`](Self::reset) settling them here.
+    pub fn unsettled_streams(&self) -> impl Iterator<Item = (u32, usize)> + '_ {
+        self.streams
+            .iter()
+            .map(|(&stream, state)| (stream, state.unacked))
+            .chain(self.unsettled.iter().map(|(&stream, &n)| (stream, n)))
+            .filter(|(_, unacked)| *unacked != 0)
+            .map(|(stream, unacked)| (stream, unacked as usize))
     }
 
     /// Whether open and unsettled streams fill every stream slot.
@@ -998,11 +1017,11 @@ impl YamuxSession {
         }
     }
 
-    /// Ends every stream with the session; nothing is left to settle.
+    /// Ends every stream with the session. Streams still holding
+    /// unacknowledged bytes stay unsettled for the host to settle.
     fn close_all_streams(&mut self) {
         let streams = self.streams.keys().copied().collect::<Vec<_>>();
-        self.streams.clear();
-        self.unsettled.clear();
+        self.unsettle_all();
         self.writable_armed.clear();
         self.control_due.clear();
         self.sendable.clear();
@@ -1023,11 +1042,34 @@ impl YamuxSession {
             }
     }
 
+    /// Moves every open stream's unacknowledged count into `unsettled` and
+    /// drops the open streams.
+    fn unsettle_all(&mut self) {
+        for (stream, state) in core::mem::take(&mut self.streams) {
+            if state.unacked != 0 {
+                self.unsettled.insert(stream, state.unacked);
+            }
+        }
+    }
+
     fn fail_protocol<T>(&mut self, error: YamuxError) -> Result<T, YamuxError> {
         let streams = self.streams.keys().copied().collect::<Vec<_>>();
         self.failed = true;
-        self.streams.clear();
-        self.unsettled.clear();
+        // Data still queued is dropped below and never delivered, so it is
+        // nobody's to acknowledge.
+        for event in &self.events {
+            if let YamuxOutput::Data { stream, data } = event {
+                let len = data.len() as u32;
+                if let Some(state) = self.streams.get_mut(stream) {
+                    state.unacked = state.unacked.saturating_sub(len);
+                } else if let Some(unacked) = self.unsettled.get_mut(stream) {
+                    // The stream already closed within this same input.
+                    *unacked = unacked.saturating_sub(len);
+                }
+            }
+        }
+        self.unsettled.retain(|_, unacked| *unacked != 0);
+        self.unsettle_all();
         self.writable_armed.clear();
         self.control_due.clear();
         self.sendable.clear();
@@ -1878,6 +1920,60 @@ mod tests {
         assert_eq!(server.open_stream(), Err(YamuxError::TooManyStreams));
         server.reset(1).unwrap();
         assert_eq!(server.open_stream(), Ok(2));
+    }
+
+    fn unsettled(session: &YamuxSession) -> Vec<(u32, usize)> {
+        session.unsettled_streams().collect()
+    }
+
+    #[test]
+    fn the_session_ending_keeps_unacknowledged_counts_for_its_host() {
+        // A local GoAway, a remote one, and a protocol failure all end every
+        // stream; what was delivered stays the host's to settle.
+        let go_away = Frame::go_away(0).encode();
+        let garbage = [0xff; 12];
+        for end in 0..3 {
+            let mut server = server_with_delivered(config(), 10, 0);
+            while server.poll_event().is_some() {}
+            server.ack(1, 4).unwrap();
+            match end {
+                0 => server.go_away(0),
+                1 => server.handle_data(&go_away).unwrap(),
+                _ => assert!(server.handle_data(&garbage).is_err()),
+            }
+            assert_eq!(unsettled(&server), [(1, 6)], "end {end}");
+            server.ack(1, 2).unwrap();
+            assert_eq!(
+                server.ack(1, 5),
+                Err(YamuxError::AckExceedsDelivered {
+                    stream: 1,
+                    acked: 5,
+                    unacked: 4,
+                })
+            );
+            server.reset(1).unwrap();
+            assert_eq!(unsettled(&server), [], "end {end}");
+        }
+    }
+
+    #[test]
+    fn a_protocol_failure_counts_only_data_it_still_delivers() {
+        // The failure drops events still queued, so their bytes never reach
+        // the host and must not be left for it to acknowledge.
+        let mut server = YamuxSession::with_config(YamuxRole::Server, config()).unwrap();
+        let mut input = Frame::encode_data(1, FLAG_SYN, &[7; 10]).unwrap();
+        input.extend_from_slice(&[0xff; 12]);
+        assert!(server.handle_data(&input).is_err());
+        assert_eq!(unsettled(&server), []);
+
+        // Also when the peer reset the stream before the failure, which had
+        // already left its count unsettled.
+        let mut server = YamuxSession::with_config(YamuxRole::Server, config()).unwrap();
+        let mut input = Frame::encode_data(1, FLAG_SYN, &[7; 10]).unwrap();
+        input.extend(Frame::data(1, FLAG_RST, Vec::new()).unwrap().encode());
+        input.extend_from_slice(&[0xff; 12]);
+        assert!(server.handle_data(&input).is_err());
+        assert_eq!(unsettled(&server), []);
     }
 
     #[test]

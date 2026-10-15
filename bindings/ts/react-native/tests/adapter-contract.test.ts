@@ -25,6 +25,7 @@ describeAdapterContract("React Native", {
   native: () => {
     const fake = FakeNativeEndpoint.current();
     return {
+      abandoned: fake.abandoned,
       cancelledConnects: fake.cancelledConnects,
       config: fake.config,
       connectTargets: fake.connectTargets.map((target) =>

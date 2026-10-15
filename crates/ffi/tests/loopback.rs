@@ -577,7 +577,9 @@ fn a_write_past_the_send_caps_is_held_settled_once_and_closed_after_every_byte()
     // alone.
     let stranger = conn_id + 1_000;
     assert!(a.reset_stream(stranger, stream_id).is_err());
-    assert!(a.abandon_stream(stranger, stream_id).is_err());
+    // Abandoning a stream of a connection that is not live only settles
+    // whatever native still holds for it (ADR 0012): a no-op here.
+    a.abandon_stream(stranger, stream_id)?;
     assert!(a.close_stream_write(stranger, stream_id).is_err());
     // Requested while the tail is held, the FIN must still follow it.
     a.close_stream_write(conn_id, stream_id)?;

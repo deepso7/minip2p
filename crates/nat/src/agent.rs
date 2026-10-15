@@ -145,6 +145,11 @@ pub(crate) struct Shared {
     /// Started dials still awaiting establishment or
     /// [`SwarmEvent::DialFailed`]: connection → (dial token, purpose).
     dialed: BTreeMap<ConnectionId, (NatToken, DialPurpose)>,
+    /// Circuit slots reserved by accepted STOPs and sent HOP CONNECTs not yet
+    /// adopted by the host. Recounted from the machines before every event,
+    /// so a release never has to be remembered; a reservation made while
+    /// handling the event adds to it.
+    circuits_reserved: usize,
 }
 
 impl Shared {
@@ -167,6 +172,18 @@ impl Shared {
 
     pub(crate) fn push_action(&mut self, action: NatAction) {
         self.actions.push_back(action);
+    }
+
+    /// Reserves a circuit slot if one is free under
+    /// [`NatConfig::max_circuits`], counting the circuits the host holds.
+    /// The caller then holds it for as long as it reports
+    /// `holds_circuit_slot`.
+    pub(crate) fn reserve_circuit(&mut self, swarm: &dyn NatSwarm) -> bool {
+        if self.circuits_reserved + swarm.circuit_slots() >= self.config.max_circuits {
+            return false;
+        }
+        self.circuits_reserved += 1;
+        true
     }
 
     /// Starts a dial and records why it was made.
@@ -557,6 +574,7 @@ impl NatAgent {
                 observed_ips: BTreeMap::new(),
                 pending_session_dials: BTreeMap::new(),
                 dialed: BTreeMap::new(),
+                circuits_reserved: 0,
             },
             attempts: BTreeMap::new(),
             housekeeping,
@@ -751,8 +769,18 @@ impl NatAgent {
                 }
                 return true;
             }
+            // Only stream input accepts a STOP or sends a HOP CONNECT.
+            agent.shared.circuits_reserved = agent.circuits_reserved();
             agent.handle(swarm, event, is_circuit, now)
         })
+    }
+
+    /// Circuit slots held by machines whose circuit the host has not adopted
+    /// yet.
+    fn circuits_reserved(&self) -> usize {
+        let inbound = self.inbound.values().filter(|c| c.holds_circuit_slot());
+        let outbound = self.attempts.values().filter(|a| a.holds_circuit_slot());
+        inbound.count() + outbound.count()
     }
 
     fn handle(

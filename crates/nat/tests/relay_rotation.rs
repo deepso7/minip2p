@@ -437,6 +437,62 @@ fn no_reservation_at_first_relay_moves_to_the_next() {
 }
 
 #[test]
+fn a_full_circuit_table_fails_the_leg_before_hop_connect() {
+    // #356: the circuit limit is local, so no other relay would do better:
+    // the whole leg fails with ResourceExhausted and CONNECT is never sent.
+    let mut w = two_relays();
+    w.agent.swarm.circuit_slots = NatConfig::default().max_circuits;
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let a = w.a.clone();
+    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
+    for event in [
+        SwarmEvent::ConnectionEstablished {
+            peer_id: a.clone(),
+            conn_id: a_conn,
+        },
+        SwarmEvent::PeerReady {
+            peer_id: a.clone(),
+            conn_id: a_conn,
+            protocols: vec![HOP_PROTOCOL_ID.to_string()],
+        },
+    ] {
+        w.agent.handle_event(&event, false, at(10));
+    }
+    let stream = opened_stream_for(&drain_actions(&mut w.agent), &a);
+    drain_all_events(&mut w.agent);
+    w.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: a_conn,
+            peer_id: a.clone(),
+            stream_id: stream,
+            protocol_id: HOP_PROTOCOL_ID.to_string(),
+            initiated_locally: true,
+        },
+        false,
+        at(20),
+    );
+    let actions = drain_actions(&mut w.agent);
+    assert_eq!(send_stream_count(&actions), 0, "no CONNECT goes out");
+    assert!(has_reset_for(&actions, stream));
+    assert_eq!(dial_count_for(&actions, &w.b), 0, "B is not tried");
+    let exhausted = NatError::ResourceExhausted {
+        resource: "circuits",
+    };
+    let events = drain_all_events(&mut w.agent);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                NatEvent::RelayFailed { error: relay, .. },
+                NatEvent::ConnectFailed { error: leg, .. },
+            ] if *relay == exhausted && *leg == exhausted
+        ),
+        "{events:?}"
+    );
+}
+
+#[test]
 fn leg_fails_with_the_last_relays_error_after_trying_all() {
     let mut w = two_relays();
     let target = w.target.clone();

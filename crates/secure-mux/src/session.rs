@@ -169,6 +169,8 @@ pub struct SecureMuxSession {
     /// Bytes ready for the underlying stream: negotiation and handshake
     /// messages, and encrypted Yamux frames already pulled.
     writes: WriteQueue,
+    /// Yamux's unsettled counts, kept when a fatal error dropped it.
+    unsettled_at_failure: Vec<(StreamId, usize)>,
 }
 
 /// Unread negotiation and handshake bytes a session holds before it fails.
@@ -232,6 +234,7 @@ impl SecureMuxSession {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
+            unsettled_at_failure: Vec::new(),
         }
     }
 
@@ -288,6 +291,7 @@ impl SecureMuxSession {
         let encrypted = encrypt_into(noise, frame, &mut self.writes);
         push_yamux_events(yamux, &mut self.outputs);
         if let Err(error) = encrypted {
+            self.unsettled_at_failure = unsettled_of(yamux);
             self.phase = None;
             return Err(error);
         }
@@ -298,6 +302,20 @@ impl SecureMuxSession {
     pub fn has_pending_write(&self) -> bool {
         !self.writes.is_empty()
             || matches!(&self.phase, Some(Phase::Ready { yamux, .. }) if yamux.has_frames())
+    }
+
+    /// Every substream holding delivered bytes not yet acknowledged, open or
+    /// closed, with how many.
+    ///
+    /// A host tearing the connection down takes these over, so the bytes stay
+    /// counted until they are acknowledged or abandoned (ADR 0012). They
+    /// survive whatever ended the session: a GoAway, a Yamux protocol
+    /// failure, or a fatal Noise or output error.
+    pub fn unsettled_streams(&self) -> Vec<(StreamId, usize)> {
+        match &self.phase {
+            Some(Phase::Ready { yamux, .. }) => unsettled_of(yamux),
+            _ => self.unsettled_at_failure.clone(),
+        }
     }
 
     /// Returns whether the upgrade has completed.
@@ -454,14 +472,19 @@ impl SecureMuxSession {
         // reserve, which fails Yamux like a protocol error on input: flush
         // its GoAway and leave the phase taken.
         if let Err(error @ YamuxError::ControlReserveExhausted { .. }) = result {
-            self.drain_yamux(&mut noise, &mut yamux, true)?;
+            let drained = self.drain_yamux(&mut noise, &mut yamux, true);
+            self.unsettled_at_failure = unsettled_of(&yamux);
+            drained?;
             return Err(SessionError::protocol(format!(
                 "Yamux protocol failed: {error}"
             )));
         }
         // A failed drain is fatal, exactly as in `handle_input`: leave the
         // phase taken so the session cannot be used again.
-        self.drain_yamux(&mut noise, &mut yamux, false)?;
+        if let Err(error) = self.drain_yamux(&mut noise, &mut yamux, false) {
+            self.unsettled_at_failure = unsettled_of(&yamux);
+            return Err(error);
+        }
         self.phase = Some(Phase::Ready { noise, yamux, peer });
         result.map_err(SessionError::Yamux)
     }
@@ -592,21 +615,8 @@ impl SecureMuxSession {
                 mut yamux,
                 peer,
             } => {
-                noise.on_data(data).map_err(|error| {
-                    SessionError::protocol(format!("Noise transport failed: {error}"))
-                })?;
-                let (unexpected_peer, decrypted) = self.drain_noise(&mut noise)?;
-                if unexpected_peer.is_some() {
-                    return Err(SessionError::protocol("Noise authenticated twice"));
-                }
-                for plaintext in decrypted {
-                    let result = yamux.handle_data(&plaintext);
-                    self.drain_yamux(&mut noise, &mut yamux, result.is_err())?;
-                    result.map_err(|error| {
-                        SessionError::protocol(format!("Yamux protocol failed: {error}"))
-                    })?;
-                }
-                Ok(Phase::Ready { noise, yamux, peer })
+                let fed = self.feed_ready(&mut noise, &mut yamux, data);
+                self.keep_ready(fed, noise, yamux, peer)
             }
         }
     }
@@ -627,16 +637,62 @@ impl SecureMuxSession {
                 mut yamux,
                 peer,
             } => {
-                let result = yamux.handle_data(&plaintext);
-                self.drain_yamux(&mut noise, &mut yamux, result.is_err())?;
-                result.map_err(|error| {
-                    SessionError::protocol(format!("Yamux protocol failed: {error}"))
-                })?;
-                Ok(Phase::Ready { noise, yamux, peer })
+                let fed = self.feed_yamux(&mut noise, &mut yamux, &plaintext);
+                self.keep_ready(fed, noise, yamux, peer)
             }
             _ => Err(SessionError::protocol(
                 "decrypted transport data arrived before Yamux selection",
             )),
+        }
+    }
+
+    /// Decrypts `data` and feeds the plaintext to the established Yamux.
+    fn feed_ready(
+        &mut self,
+        noise: &mut NoiseSession,
+        yamux: &mut YamuxSession,
+        data: Vec<u8>,
+    ) -> Result<(), SessionError> {
+        noise
+            .on_data(data)
+            .map_err(|error| SessionError::protocol(format!("Noise transport failed: {error}")))?;
+        let (unexpected_peer, decrypted) = self.drain_noise(noise)?;
+        if unexpected_peer.is_some() {
+            return Err(SessionError::protocol("Noise authenticated twice"));
+        }
+        for plaintext in decrypted {
+            self.feed_yamux(noise, yamux, &plaintext)?;
+        }
+        Ok(())
+    }
+
+    /// Feeds one plaintext to the established Yamux and publishes its events.
+    fn feed_yamux(
+        &mut self,
+        noise: &mut NoiseSession,
+        yamux: &mut YamuxSession,
+        plaintext: &[u8],
+    ) -> Result<(), SessionError> {
+        let result = yamux.handle_data(plaintext);
+        self.drain_yamux(noise, yamux, result.is_err())?;
+        result.map_err(|error| SessionError::protocol(format!("Yamux protocol failed: {error}")))
+    }
+
+    /// The `Ready` phase again after feeding it, or the error that ended it,
+    /// keeping its unsettled counts for the host.
+    fn keep_ready(
+        &mut self,
+        fed: Result<(), SessionError>,
+        noise: NoiseSession,
+        yamux: Box<YamuxSession>,
+        peer: PeerId,
+    ) -> Result<Phase, SessionError> {
+        match fed {
+            Ok(()) => Ok(Phase::Ready { noise, yamux, peer }),
+            Err(error) => {
+                self.unsettled_at_failure = unsettled_of(&yamux);
+                Err(error)
+            }
         }
     }
 
@@ -852,6 +908,14 @@ fn encrypt_into(
     Ok(())
 }
 
+/// Yamux's unsettled substreams, as session stream ids.
+fn unsettled_of(yamux: &YamuxSession) -> Vec<(StreamId, usize)> {
+    yamux
+        .unsettled_streams()
+        .map(|(stream, unacked)| (StreamId::new(u64::from(stream)), unacked))
+        .collect()
+}
+
 /// Moves Yamux's queued events into `outputs`, returning the first remote
 /// `GoAway` code seen.
 fn push_yamux_events(
@@ -1053,6 +1117,7 @@ mod tests {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
+            unsettled_at_failure: Vec::new(),
         };
         let proposals = b"\x13/multistream/1.0.0\n\x0d/mplex/6.7.0\n\x0d/yamux/1.0.0\n".to_vec();
         initiator_noise
@@ -1141,6 +1206,7 @@ mod tests {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
+            unsettled_at_failure: Vec::new(),
         };
 
         let mut packed = echo;
@@ -1246,6 +1312,7 @@ mod tests {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
+            unsettled_at_failure: Vec::new(),
         };
 
         session
@@ -1282,6 +1349,7 @@ mod tests {
             // An earlier pump already moved this stream's Writable here.
             outputs: VecDeque::from([SessionOutput::StreamWritable { stream }]),
             writes: WriteQueue::default(),
+            unsettled_at_failure: Vec::new(),
         };
 
         session.go_away(0).expect("go away");
@@ -1313,6 +1381,7 @@ mod tests {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
+            unsettled_at_failure: Vec::new(),
         };
         let stream = StreamId::new(77);
 

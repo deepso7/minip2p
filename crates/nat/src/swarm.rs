@@ -118,6 +118,18 @@ pub trait NatSwarm {
 
     /// Pings `peer` to keep its connection active.
     fn ping(&mut self, peer: &PeerId, now_ms: u64) -> Result<(), NatSwarmError>;
+
+    /// Circuit slots the host's circuit transport holds: active circuits,
+    /// and ended ones whose delivered bytes are not settled yet. The agent
+    /// adds the circuits it is still negotiating and admits new ones only
+    /// below [`NatConfig::max_circuits`](crate::NatConfig::max_circuits).
+    /// The default, for a host without circuits, is none. A host that
+    /// promotes bridges (adopting them into a circuit transport) must report
+    /// that transport's slots here, or adopted and unsettled circuits escape
+    /// the limit: the minip2p `Endpoint`'s own swarm adapter does.
+    fn circuit_slots(&self) -> usize {
+        0
+    }
 }
 
 /// Whether `addr` names its host (`/dns`, `/dns4`, `/dns6`) instead of
@@ -130,7 +142,9 @@ pub fn is_named(addr: &PeerAddr) -> bool {
 }
 
 /// The bare swarm dials concrete addresses only and rejects named ones with
-/// [`NatSwarmError::NamedAddress`]. Writes a full stream refuses are
+/// [`NatSwarmError::NamedAddress`]. It knows nothing of circuits, so it
+/// reports no [`circuit_slots`](NatSwarm::circuit_slots): a host that promotes
+/// bridges wraps it and reports its circuit transport's. Writes a full stream refuses are
 /// reported as [`DriverError::Full`]; the agent holds their tails and
 /// resends them on the stream's Writable.
 impl<T: Transport, E: EntropySource> NatSwarm for SwarmCore<T, E> {
@@ -272,6 +286,10 @@ impl HoldingSwarm<'_> {
 impl NatSwarm for HoldingSwarm<'_> {
     fn connection(&self, peer: &PeerId) -> Option<ConnectionId> {
         self.inner.connection(peer)
+    }
+
+    fn circuit_slots(&self) -> usize {
+        self.inner.circuit_slots()
     }
 
     fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[String])> {

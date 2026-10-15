@@ -544,12 +544,21 @@ describe("Node adapter", () => {
     const fake = fakeEndpoint();
     const ids: number[] = [];
     endpoint.on("connectionEstablished", ({ connId }) => ids.push(connId));
+    // Dispatched before it closes: an unseen connection that ends without
+    // data would leave the queue whole.
     fake.enqueue(
       [
         {
           inner: { connId: 10n, peerId: "remote" },
           tag: "ConnectionEstablished",
         },
+      ],
+      []
+    );
+    fake.ring();
+    await settle();
+    fake.enqueue(
+      [
         { inner: { connId: 10n, peerId: "remote" }, tag: "ConnectionClosed" },
         {
           inner: { connId: 10n, peerId: "remote" },
@@ -733,6 +742,7 @@ describeAdapterContract("Node", {
   native: () => {
     const fake = fakeEndpoint();
     return {
+      abandoned: fake.abandonedStreams,
       cancelledConnects: fake.cancelledConnects,
       config: fake.config,
       connectTargets: fake.connectTargets.map((target) =>

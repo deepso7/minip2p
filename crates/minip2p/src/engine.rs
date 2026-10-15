@@ -334,13 +334,21 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// so it is acknowledged here, as the swarm does for data still in its
     /// own queue; after a reset that acknowledgement is moot, so its error
     /// is ignored.
+    ///
+    /// A stream whose connection ended needs no such proof (ADR 0012): with
+    /// nothing left naming it, the transport settles it outright.
     pub(crate) fn abandon_stream(
         &mut self,
         conn_id: ConnectionId,
         stream_id: StreamId,
         now: Now,
     ) -> Result<(), DriverError> {
-        let peer_id = &self.stream_peer(conn_id, stream_id)?;
+        let Ok(peer_id) = &self.stream_peer(conn_id, stream_id) else {
+            self.acks.forget(conn_id, stream_id);
+            return self
+                .core
+                .abandon_ended_stream(conn_id, stream_id, now.monotonic_ms);
+        };
         let queued_close = self.events.iter().any(|event| {
             matches!(event, EndpointEvent::StreamClosed { .. })
                 && event.matches_stream(peer_id, conn_id, stream_id)

@@ -1195,6 +1195,8 @@ mod tests {
                 NatError::DialFailed(_) => NatErrorKind::DialFailed,
                 NatError::Protocol(_) => NatErrorKind::Protocol,
                 NatError::RelayRefused(_) => NatErrorKind::RelayRefused,
+                // A full local circuit table: no relayed path is available.
+                NatError::ResourceExhausted { .. } => NatErrorKind::NoPathAvailable,
             }
         }
         for (error, expected) in [
@@ -1219,6 +1221,12 @@ mod tests {
             (
                 NatError::RelayRefused("relay".into()),
                 NatErrorKind::RelayRefused,
+            ),
+            (
+                NatError::ResourceExhausted {
+                    resource: "circuits",
+                },
+                NatErrorKind::NoPathAvailable,
             ),
         ] {
             assert_eq!(convert_nat_error_kind(&error), expected);

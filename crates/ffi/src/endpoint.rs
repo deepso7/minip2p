@@ -126,7 +126,9 @@ impl P2pEndpoint {
         self.0.abandon_stream(conn_id, stream_id)
     }
     /// Acknowledges `bytes` of a stream's received data as consumed,
-    /// letting its sender continue. Every registered protocol needs this.
+    /// letting its sender continue. Every registered protocol needs this,
+    /// also after the stream's connection closed: unacknowledged bytes keep
+    /// the ended connection's slot until they are acknowledged or abandoned.
     pub fn stream_consumed(
         &self,
         conn_id: u64,

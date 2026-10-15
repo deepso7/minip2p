@@ -67,6 +67,13 @@
 //! unauthenticated, so a peer that connects and then says nothing cannot hold
 //! a slot indefinitely.
 //!
+//! A connection that ends while some of its streams still hold delivered,
+//! unacknowledged bytes keeps its slot as an **unsettled connection** until
+//! they are acknowledged or abandoned (`ack_stream` and `reset_stream` still
+//! work on its streams), so reconnect churn cannot grow the data a slow
+//! reader holds (ADR 0012). A transport whose slots are all held refuses new
+//! connections.
+//!
 //! # Identity
 //!
 //! The upgrade authenticates both ends, so

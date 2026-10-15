@@ -619,3 +619,38 @@ fn stream_bytes_are_encrypted_only_when_pulled_and_full_wakes_writable() {
         .send(stream, unsent)
         .expect("the tail fits after Writable");
 }
+
+#[test]
+fn delivered_bytes_stay_counted_after_the_session_fails() {
+    // ADR 0012: whatever ends the session, the bytes it already delivered
+    // remain the host's to settle, so it must be able to take their counts.
+    let (mut dialer, mut listener, _, _) = upgraded_pair();
+    let stream = dialer.open_stream().expect("open substream");
+    dialer
+        .send(stream, Bytes::from_static(b"held"))
+        .expect("send on substream");
+    let (_, events) = exchange(&mut dialer, &mut listener);
+    let incoming = events
+        .iter()
+        .find_map(|event| match event {
+            SessionOutput::IncomingStream { stream } => Some(*stream),
+            _ => None,
+        })
+        .expect("incoming substream");
+    assert_eq!(listener.unsettled_streams(), [(incoming, 4)]);
+
+    // Garbage ciphertext is a fatal Noise failure that drops Yamux.
+    assert!(listener.handle_input(vec![0, 4, 1, 2, 3, 4]).is_err());
+    assert!(!listener.is_established());
+    assert_eq!(listener.unsettled_streams(), [(incoming, 4)]);
+
+    // A clean GoAway keeps them too.
+    let (mut dialer, mut listener, _, _) = upgraded_pair();
+    let stream = dialer.open_stream().expect("open substream");
+    dialer
+        .send(stream, Bytes::from_static(b"held"))
+        .expect("send on substream");
+    let _ = exchange(&mut dialer, &mut listener);
+    listener.go_away(0).expect("go away");
+    assert_eq!(listener.unsettled_streams().len(), 1);
+}

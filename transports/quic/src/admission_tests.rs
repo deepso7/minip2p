@@ -9,7 +9,8 @@ use quinn_proto::{TimeSource, TokenStore};
 
 use super::*;
 use crate::test_peer::{
-    RawPeer, accept, client_config, drive_until, listening_server, loopback, now, take_datagrams,
+    RawPeer, accept, client_config, drive_until, listening_server, loopback, now, peer_addr,
+    stream_bytes, take_datagrams,
 };
 
 /// Whether `datagram` is a QUIC v1 Retry packet.
@@ -199,4 +200,72 @@ fn the_handshake_completes_through_retry() {
             .count(),
         1
     );
+}
+
+/// Connects a raw peer that sends `held` on a fresh stream and then closes,
+/// and drives the server until the connection is `Closed`. Returns the
+/// server's connection id and stream.
+fn deliver_then_close(server: &mut QuicTransport) -> (ConnectionId, StreamId) {
+    let (mut peer, id) = accept(server, &mut [], |_| {});
+    let stream = peer.open();
+    assert_eq!(peer.write(stream, b"held"), 4);
+    let mut events = Vec::new();
+    drive_until(server, &mut [&mut peer], &mut events, "data", |events| {
+        stream_bytes(events, stream) == b"held"
+    });
+    peer.conn()
+        .close(Instant::now(), VarInt::from_u32(0), Bytes::new());
+    drive_until(server, &mut [&mut peer], &mut events, "close", |events| {
+        events.contains(&TransportEvent::Closed { id })
+    });
+    (id, StreamId::new(stream))
+}
+
+#[test]
+fn a_closed_connection_keeps_its_slot_until_its_delivered_bytes_settle() {
+    // ADR 0012 (#356): the receive bound outlives the connection, so a reader
+    // that never acknowledges holds the slot, and acknowledging or
+    // abandoning after close releases it.
+    let mut server = listening_server(QuicLimits {
+        max_connections: 1,
+        ..QuicLimits::default()
+    });
+    let (id, stream) = deliver_then_close(&mut server);
+    assert!(server.connections.is_empty(), "only the counts survive");
+
+    let refused = |server: &mut QuicTransport| {
+        let elsewhere = peer_addr(&loopback(QuicNodeConfig::generate()));
+        assert!(matches!(
+            server.dial(&elsewhere),
+            Err(TransportError::ResourceExhausted { .. })
+        ));
+        let _knock = RawPeer::connect(server.local_addr(), |_| {});
+        let events = settle(server);
+        assert!(no_incoming(&events), "a full transport refuses: {events:?}");
+    };
+    refused(&mut server);
+
+    server
+        .ack_stream(id, stream, 2)
+        .expect("a partial ack after close");
+    refused(&mut server);
+    assert_eq!(
+        server.ack_stream(id, stream, 3),
+        Err(TransportError::AckExceedsDelivered {
+            id,
+            stream_id: stream,
+            acked: 3,
+            unacked: 2,
+        })
+    );
+    server.ack_stream(id, stream, 2).expect("the final ack");
+    server.ack_stream(id, stream, 1).expect("settled: a no-op");
+
+    // The slot is free again; this time abandon the bytes instead.
+    let (id, stream) = deliver_then_close(&mut server);
+    refused(&mut server);
+    server
+        .reset_stream(id, stream)
+        .expect("abandoning after close settles");
+    let _ = deliver_then_close(&mut server);
 }

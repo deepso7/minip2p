@@ -118,6 +118,16 @@ pub fn stop_connect(source: &PeerId) -> Vec<u8> {
     stop_connect_raw(source.to_bytes())
 }
 
+/// The status of a framed STOP STATUS response.
+pub fn stop_status(data: &[u8]) -> Option<Status> {
+    match minip2p_relay::decode_frame(data) {
+        minip2p_core::FrameDecode::Complete { payload, .. } => {
+            StopMessage::decode(payload).ok()?.status
+        }
+        _ => None,
+    }
+}
+
 /// A framed DCUtR SYNC.
 pub fn dcutr_sync() -> Vec<u8> {
     let msg = HolePunch {
@@ -324,6 +334,25 @@ pub fn has_reset_for(actions: &[Out], stream: StreamId) -> bool {
     actions
         .iter()
         .any(|action| matches!(action, Out::ResetStream { stream_id, .. } if *stream_id == stream))
+}
+
+/// Whether a refusal on `stream` went out as its status then a FIN, with no
+/// reset to discard the status.
+pub fn refused_with_fin(actions: &[Out], stream: StreamId) -> bool {
+    let on = |action: &Out| match action {
+        Out::SendStream { stream_id, .. }
+        | Out::CloseStreamWrite { stream_id, .. }
+        | Out::ResetStream { stream_id, .. } => *stream_id == stream,
+        _ => false,
+    };
+    let sent = actions
+        .iter()
+        .position(|a| on(a) && matches!(a, Out::SendStream { .. }));
+    let closed = actions
+        .iter()
+        .position(|a| on(a) && matches!(a, Out::CloseStreamWrite { .. }));
+    matches!((sent, closed), (Some(sent), Some(closed)) if sent < closed)
+        && !has_reset_for(actions, stream)
 }
 
 pub fn promote_token(actions: &[Out]) -> NatToken {
@@ -613,6 +642,8 @@ pub struct FakeSwarm {
     /// Fail every write with this transport error after logging it, as a
     /// transport that may have queued a prefix does.
     pub failed_sends: Option<TransportError>,
+    /// Circuit slots the host's circuit transport reports in use.
+    pub circuit_slots: usize,
 }
 
 impl FakeSwarm {
@@ -665,6 +696,10 @@ impl FakeSwarm {
 impl NatSwarm for FakeSwarm {
     fn connection(&self, peer: &PeerId) -> Option<ConnectionId> {
         self.connections.get(peer).copied()
+    }
+
+    fn circuit_slots(&self) -> usize {
+        self.circuit_slots
     }
 
     fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[String])> {

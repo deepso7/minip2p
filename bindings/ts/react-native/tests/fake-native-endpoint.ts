@@ -65,6 +65,8 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
   readonly writtenData: Uint8Array[] = [];
   /** `streamConsumed` calls, in call order. */
   readonly consumed: { bytes: number; connId: bigint; streamId: bigint }[] = [];
+  /** `abandonStream` calls, in call order. */
+  readonly abandoned: { connId: bigint; streamId: bigint }[] = [];
   readonly #batches: FakeEvent[][] = [];
   #doorbell: P2pEventDoorbell | undefined;
 
@@ -119,8 +121,8 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     this.#batches.length = 0;
   }
 
-  abandonStream(): never {
-    return notFaked("abandonStream");
+  abandonStream(connId: bigint, streamId: bigint): void {
+    this.abandoned.push({ connId, streamId });
   }
 
   activeReservation(): never {

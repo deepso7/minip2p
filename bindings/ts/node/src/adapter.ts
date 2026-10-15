@@ -14,6 +14,8 @@ import {
   ConnectionIdMap,
   EventDrain,
   P2pEvent_Tags,
+  SettleHandles,
+  eventStream,
   resolveEndpointConfig,
   typedFfiError,
   u64ToNumber,
@@ -43,6 +45,8 @@ class NodeBackend implements Minip2pBackend {
   readonly #endpoint: NativeEndpoint;
   #events: EventDrain<NativeEvent> | undefined;
   readonly #streamIds = new StreamIdMap();
+  /** Native stream identities while their events are in flight (ADR 0012). */
+  readonly #settleHandles = new SettleHandles<[bigint, bigint]>();
 
   constructor(config: Minip2pConfig) {
     this.#endpoint = translateErrors(
@@ -58,7 +62,17 @@ class NodeBackend implements Minip2pBackend {
     const events = new EventDrain(
       (limit) => this.#endpoint.drainEvents(limit),
       (event: NativeEvent) => {
-        listener(normalizeEvent(event, this.#connectionIds, this.#streamIds));
+        const normalized = normalizeEvent(
+          event,
+          this.#connectionIds,
+          this.#streamIds
+        );
+        const stream = eventStream(normalized);
+        const native = nativeStreamOf(event);
+        if (stream !== undefined && native !== undefined) {
+          this.#settleHandles.hold(stream.connId, stream.streamId, native);
+        }
+        listener(normalized);
       },
       DRAIN_LIMIT,
       // One check-phase turn keeps native callbacks out of the caller's stack
@@ -77,6 +91,10 @@ class NodeBackend implements Minip2pBackend {
 
   eventHandled(event: P2pEvent): void {
     releaseTerminalIds(event, this.#streamIds);
+    const stream = eventStream(event);
+    if (stream !== undefined) {
+      this.#settleHandles.release(stream.connId, stream.streamId);
+    }
   }
 
   close(): void {
@@ -210,12 +228,12 @@ class NodeBackend implements Minip2pBackend {
 
   abandonStream(connId: number, streamId: number): void {
     translateErrors(() => {
-      this.#endpoint.abandonStream(...this.#nativeStream(connId, streamId));
+      this.#endpoint.abandonStream(...this.#settleStream(connId, streamId));
     });
   }
 
   streamConsumer(connId: number, streamId: number): (bytes: number) => void {
-    const [nativeConn, nativeStream] = this.#nativeStream(connId, streamId);
+    const [nativeConn, nativeStream] = this.#settleStream(connId, streamId);
     return (bytes) => {
       translateErrors(() => {
         this.#endpoint.streamConsumed(nativeConn, nativeStream, bytes);
@@ -235,6 +253,24 @@ class NodeBackend implements Minip2pBackend {
       this.#connectionIds.toNative(connId),
       this.#streamIds.toNative(streamId),
     ];
+  }
+
+  /**
+   * Native IDs for settling a stream: acknowledging or abandoning its bytes.
+   * Those still hold the native slot of a connection whose end this adapter
+   * already drained, so a stream with events in flight resolves through its
+   * settle handle once the live mapping is gone.
+   */
+  #settleStream(connId: number, streamId: number): [bigint, bigint] {
+    try {
+      return this.#nativeStream(connId, streamId);
+    } catch (error) {
+      const handle = this.#settleHandles.get(connId, streamId);
+      if (handle === undefined) {
+        throw error;
+      }
+      return handle;
+    }
   }
 
   // Connect IDs are not mapped because they round-trip into native calls,
@@ -492,6 +528,23 @@ function convertEvent(event: NativeEvent, maps: NativeIdMaps): P2pEvent {
         inner: normalizeNativeValue(event.inner, maps, event.tag),
         tag: event.tag,
       } as P2pEvent;
+    }
+  }
+}
+
+/** The native identity of the stream a native stream event names. */
+function nativeStreamOf(event: NativeEvent): [bigint, bigint] | undefined {
+  switch (event.tag) {
+    case P2pEvent_Tags.StreamReady:
+    case P2pEvent_Tags.StreamData:
+    case P2pEvent_Tags.StreamWriteAccepted:
+    case P2pEvent_Tags.StreamWriteStopped:
+    case P2pEvent_Tags.StreamRemoteWriteClosed:
+    case P2pEvent_Tags.StreamClosed: {
+      return [BigInt(event.inner.connId), BigInt(event.inner.streamId)];
+    }
+    default: {
+      return undefined;
     }
   }
 }

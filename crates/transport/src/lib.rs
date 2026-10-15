@@ -20,6 +20,7 @@ mod poll;
 mod set;
 mod stream_id;
 mod transport;
+mod unsettled;
 
 pub use connection_endpoint::ConnectionEndpoint;
 pub use connection_id::{ConnectionId, ConnectionIdAllocator, ConnectionNamespace};
@@ -33,6 +34,7 @@ pub use minip2p_core::Bytes;
 pub use set::{RejectedTransport, TransportSet, TransportSetError};
 pub use stream_id::StreamId;
 pub use transport::Transport;
+pub use unsettled::UnsettledConnections;
 
 /// The readiness crate std sources register with, re-exported so a
 /// [`PollSource`] needs no extra dependency to name its types.

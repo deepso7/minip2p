@@ -715,6 +715,13 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// it has been delivered, or dropped by an earlier call, the stream is
     /// indistinguishable from one that never existed and both are
     /// [`SwarmError::StreamNotFound`].
+    ///
+    /// After the stream's connection ended -- its `ConnectionClosed` or
+    /// `ConnectionReplaced` may long have been delivered -- no terminal event
+    /// is needed: the swarm drops what it still queues for the stream and the
+    /// transport settles it outright, giving up its unacknowledged bytes
+    /// (ADR 0012). That always succeeds; a transport holding nothing for the
+    /// stream makes it a no-op.
     pub fn abandon_stream(
         &mut self,
         peer_id: &PeerId,
@@ -723,6 +730,24 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         now_ms: u64,
     ) -> Result<(), DriverError> {
         self.state.abandon_stream(peer_id, conn_id, stream_id)?;
+        self.flush(now_ms);
+        Ok(())
+    }
+
+    /// Abandons a stream of a connection that already ended, for a caller
+    /// that no longer knows its peer because every event naming the stream
+    /// was delivered. The transport settles it outright, giving up its
+    /// unacknowledged bytes (ADR 0012); one holding nothing for it makes this
+    /// a no-op. A connection the swarm still routes is
+    /// [`SwarmError::StreamNotFound`]: use
+    /// [`abandon_stream`](Self::abandon_stream) there.
+    pub fn abandon_ended_stream(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        now_ms: u64,
+    ) -> Result<(), DriverError> {
+        self.state.abandon_ended_stream(conn_id, stream_id)?;
         self.flush(now_ms);
         Ok(())
     }
@@ -936,6 +961,21 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
                             "ack_stream on connection {conn_id} stream {stream_id} failed: {e}"
                         ),
                     ));
+                }
+            }
+            Action::SettleStream { conn_id, stream_id } => {
+                match self.transport.reset_stream(conn_id, stream_id) {
+                    // Nothing held is nothing to settle.
+                    Ok(())
+                    | Err(
+                        TransportError::ConnectionNotFound { .. }
+                        | TransportError::StreamNotFound { .. },
+                    ) => {}
+                    Err(e) => self.state.record_runtime_error(transport_error(
+                        Some(conn_id),
+                        Some(stream_id),
+                        format!("settling connection {conn_id} stream {stream_id} failed: {e}"),
+                    )),
                 }
             }
             Action::SetControlStream {

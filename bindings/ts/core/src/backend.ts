@@ -42,7 +42,10 @@ export type BackendConnectTarget =
 export interface Minip2pBackend {
   /** Starts native event delivery exactly once. */
   start: (listener: (event: P2pEvent) => void) => void;
-  /** Releases adapter state retained until an event has been dispatched. */
+  /**
+   * Releases adapter state retained until an event has been dispatched,
+   * elided, dropped, or coalesced into an earlier one.
+   */
   eventHandled?: (event: P2pEvent) => void;
   /** Idempotently releases the native endpoint. */
   close: () => void;
@@ -103,8 +106,10 @@ export interface Minip2pBackend {
    *
    * Called once, when the stream becomes ready; the returned function keeps
    * naming that stream after its terminal event retires the public IDs. It
-   * throws on an over-acknowledgement and is a no-op once the stream or its
-   * connection is gone.
+   * throws on an over-acknowledgement and is a no-op once the stream is
+   * settled. Unacknowledged bytes hold their ended connection's native slot,
+   * so this, and `abandonStream`, must still reach native for a stream whose
+   * connection ended while its events were in flight (see `SettleHandles`).
    */
   streamConsumer: (connId: number, streamId: number) => (bytes: number) => void;
   /** Half-closes the local stream write side, after any pending write. */
@@ -124,6 +129,7 @@ export interface Minip2pBackend {
 export { resolveEndpointConfig, type BackendEndpointConfig } from "./config.js";
 export { EventDrain } from "./event-drain.js";
 export { ConnectionIdMap, u64ToNumber } from "./native-ids.js";
+export { SettleHandles, eventStream } from "./settle-handles.js";
 export {
   P2pEvent_Tags,
   PathKind_Tags,

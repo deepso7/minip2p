@@ -1504,3 +1504,104 @@ fn each_connection_is_woken_for_its_own_deadline() {
         "the evicted connection's deadline goes with it"
     );
 }
+
+/// The listener's view of one connect, send, close cycle from the dialer:
+/// the stream it received on, if it was admitted at all.
+fn churn_once(net: &VirtualNetwork, dialer: &mut Node, listener: &mut Node) -> Option<StreamId> {
+    let target = PeerAddr::new(addr(LISTEN_ADDR), identity(2).peer_id()).expect("target");
+    let id = dialer.dial(&target).expect("dial starts");
+    let _ = drive(net, dialer, listener);
+    let Ok(stream) = dialer.open_stream(id) else {
+        return None;
+    };
+    dialer
+        .send_stream(id, stream, Bytes::from_static(b"held"))
+        .expect("send");
+    let (_, listener_events) = drive(net, dialer, listener);
+    dialer.close(id).expect("close");
+    let (_, closed) = drive(net, dialer, listener);
+    assert!(
+        closed
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Closed { .. })),
+        "the listener sees the close: {closed:?}"
+    );
+    listener_events.iter().find_map(|event| match event {
+        TransportEvent::StreamData {
+            stream_id, data, ..
+        } if &data[..] == b"held" => Some(*stream_id),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_closed_connection_keeps_its_slot_until_its_delivered_bytes_settle() {
+    // ADR 0012 (#356): the receive bound outlives the connection. A reader
+    // that never acknowledges holds the slot, so reconnect churn cannot grow
+    // the data it holds; acknowledging after close releases it.
+    let net = VirtualNetwork::new();
+    let mut listener = node_with(
+        &net,
+        identity(2),
+        20,
+        TcpConfig {
+            max_connections: 1,
+            ..TcpConfig::default()
+        },
+    );
+    listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
+    let mut dialer = node(&net, identity(1), 10);
+
+    let held = churn_once(&net, &mut dialer, &mut listener).expect("first cycle delivers");
+    let unsettled = listener.connection_ids();
+    assert!(unsettled.is_empty(), "the connection itself is gone");
+    for _ in 0..4 {
+        assert_eq!(
+            churn_once(&net, &mut dialer, &mut listener),
+            None,
+            "a full listener refuses rather than forgets"
+        );
+    }
+    let elsewhere =
+        PeerAddr::new(addr("/ip4/127.0.0.1/tcp/4002"), identity(3).peer_id()).expect("target");
+    assert!(matches!(
+        listener.dial(&elsewhere),
+        Err(TransportError::ResourceExhausted { .. })
+    ));
+
+    // The first connection's id: the only one the listener ever admitted.
+    let first = ConnectionId::namespaced(listener.namespace(), 1).expect("id");
+    listener
+        .ack_stream(first, held, 2)
+        .expect("a partial ack after close");
+    assert!(matches!(
+        listener.dial(&elsewhere),
+        Err(TransportError::ResourceExhausted { .. })
+    ));
+    assert_eq!(
+        listener.ack_stream(first, held, 3),
+        Err(TransportError::AckExceedsDelivered {
+            id: first,
+            stream_id: held,
+            acked: 3,
+            unacked: 2,
+        })
+    );
+    listener.ack_stream(first, held, 2).expect("the final ack");
+    listener
+        .ack_stream(first, held, 1)
+        .expect("settled: a no-op");
+
+    // The slot is free again; this time abandon the bytes instead.
+    let held = churn_once(&net, &mut dialer, &mut listener).expect("admitted again");
+    assert_eq!(
+        churn_once(&net, &mut dialer, &mut listener),
+        None,
+        "held again"
+    );
+    let second = ConnectionId::namespaced(listener.namespace(), 2).expect("id");
+    listener
+        .reset_stream(second, held)
+        .expect("abandoning after close settles");
+    assert!(churn_once(&net, &mut dialer, &mut listener).is_some());
+}
