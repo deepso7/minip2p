@@ -12,7 +12,7 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use minip2p_transport::{ConnectionIdAllocator, ConnectionNamespace};
 use quinn_udp::{RecvMeta, UdpSocketState};
 
-use crate::diagnostics::DatagramTally;
+use crate::diagnostics::{DatagramTally, SocketBuffers};
 
 /// Largest UDP payload a single datagram can carry.
 const MAX_DATAGRAM_SIZE: usize = 65_535;
@@ -22,6 +22,32 @@ const MAX_DATAGRAM_SIZE: usize = 65_535;
 /// Larger GSO trains arrive as bursts a receiver's socket buffer drops;
 /// quinn itself caps a transmit at the same 10.
 const MAX_TRANSMIT_SEGMENTS: usize = 10;
+
+/// Kernel buffer size asked for in each direction, best effort: a platform
+/// may cap it (Linux at `net.core.{w,r}mem_max`) or refuse it, in which case
+/// smaller sizes are tried. Platform defaults (about 208 KiB on Linux, a
+/// 9216-byte send buffer on macOS, which silently drops part of a batch:
+/// mozilla/neqo#3898) overflow under bursts a 10 MB window allows.
+pub(crate) const SOCKET_BUFFER_BYTES: usize = 4 << 20;
+
+/// Smallest size [`grow_buffer`] tries before giving up on a direction.
+pub(crate) const MIN_SOCKET_BUFFER_BYTES: usize = 64 << 10;
+
+/// Raises a socket buffer toward [`SOCKET_BUFFER_BYTES`], halving the request
+/// while the platform refuses it (BSDs and macOS do; Linux caps silently).
+/// Stops once a request is no larger than `current`, the size the OS reports
+/// now, so it never asks for less. A Linux host whose default exceeds its cap
+/// (the sysctls are independent) still ends up at the cap; without
+/// `CAP_NET_ADMIN` the default cannot be restored, so that is accepted.
+pub(crate) fn grow_buffer(current: usize, mut set: impl FnMut(usize) -> io::Result<()>) {
+    let mut bytes = SOCKET_BUFFER_BYTES;
+    while bytes > current && bytes >= MIN_SOCKET_BUFFER_BYTES {
+        if set(bytes).is_ok() {
+            return;
+        }
+        bytes /= 2;
+    }
+}
 
 /// A transmit retained after the non-blocking socket reported `WouldBlock`.
 struct PendingTransmit {
@@ -97,7 +123,8 @@ pub(crate) struct Socket {
     retained: usize,
     /// Cap on `retained`.
     max_pending: usize,
-    /// Socket datagram counts; empty unless the `diagnostics` feature is on.
+    /// Socket datagram counts and granted buffers; empty unless the
+    /// `diagnostics` feature is on.
     pub(crate) tally: DatagramTally,
     /// Test hooks: a cap on segments per transmit, and a socket that
     /// refuses every send with `WouldBlock`.
@@ -105,6 +132,9 @@ pub(crate) struct Socket {
     pub(crate) max_segments: usize,
     #[cfg(test)]
     pub(crate) blocked: bool,
+    /// Buffer sizes the OS granted.
+    #[cfg(test)]
+    pub(crate) buffers: SocketBuffers,
     /// The most logical datagrams one transmit carried.
     #[cfg(test)]
     pub(crate) largest_transmit: usize,
@@ -115,7 +145,7 @@ pub(crate) struct Socket {
 
 impl Socket {
     /// Wraps a bound, non-blocking socket, enabling what offloads the
-    /// platform offers.
+    /// platform offers and growing its buffers where the platform lets it.
     pub(crate) fn new(
         udp: UdpSocket,
         local_addr: SocketAddr,
@@ -123,6 +153,10 @@ impl Socket {
         tally: DatagramTally,
     ) -> io::Result<Self> {
         let state = UdpSocketState::new((&udp).into())?;
+        #[cfg(target_vendor = "apple")]
+        enable_apple_fast_path(&state);
+        let buffers = grow_buffers(&state, &udp);
+        tally.record_socket_buffers(buffers);
         let namespace = if local_addr.is_ipv6() {
             ConnectionNamespace::QUIC_IPV6
         } else {
@@ -144,6 +178,8 @@ impl Socket {
             max_segments: usize::MAX,
             #[cfg(test)]
             blocked: false,
+            #[cfg(test)]
+            buffers,
             #[cfg(test)]
             largest_transmit: 0,
             #[cfg(test)]
@@ -340,6 +376,40 @@ impl Socket {
             segment_size: None,
             src_ip: None,
         });
+    }
+}
+
+/// Switches `state` to Apple's batched `sendmsg_x`/`recvmsg_x` datapath,
+/// which lets one call carry several datagrams where `sendmsg` carries one.
+///
+/// quinn-udp 0.6.3 ignores how many messages `sendmsg_x` reports sent, so a
+/// batch the socket only partly takes still counts as sent: its tail is lost
+/// in-process and recovered like network loss. The grown send buffer is what
+/// keeps that rare (mozilla/neqo#3898); the measured run lost nothing.
+#[cfg(target_vendor = "apple")]
+#[expect(
+    unsafe_code,
+    reason = "the workspace's one unsafe exception: Apple's fast datapath (#359)"
+)]
+fn enable_apple_fast_path(state: &UdpSocketState) {
+    // SAFETY: the calls are private Apple APIs. quinn-udp resolves
+    // `sendmsg_x`/`recvmsg_x` through `dlsym` before first use and falls back
+    // to `sendmsg`/`recvmsg` for good when either symbol is missing, so an OS
+    // without them is never called into.
+    unsafe { state.set_apple_fast_path() }
+}
+
+/// Grows `udp`'s send and receive buffers, best effort, and reads back what
+/// the OS granted (0 where it cannot say). quinn-udp's setters keep Apple's
+/// send buffer at its safe minimum for batched sends.
+fn grow_buffers(state: &UdpSocketState, udp: &UdpSocket) -> SocketBuffers {
+    let send = state.send_buffer_size(udp.into()).unwrap_or(0);
+    grow_buffer(send, |bytes| state.set_send_buffer_size(udp.into(), bytes));
+    let recv = state.recv_buffer_size(udp.into()).unwrap_or(0);
+    grow_buffer(recv, |bytes| state.set_recv_buffer_size(udp.into(), bytes));
+    SocketBuffers {
+        send_bytes: state.send_buffer_size(udp.into()).unwrap_or(0),
+        recv_bytes: state.recv_buffer_size(udp.into()).unwrap_or(0),
     }
 }
 
