@@ -8,15 +8,18 @@
 #
 # Logs and JSON lines land in target/bench-results/rtt/. Pass sweep names to
 # run only those (picks then come from MINIP2P_RTT_{STREAM,CONNECTION,SEND}).
-# MINIP2P_RTT_RUNS sets the runs per point (default 5).
+# MINIP2P_RTT_RUNS sets the runs per point (default 5), and
+# MINIP2P_RTT_PROFILE the profile the picks come from (default 100m_100ms;
+# any `<rate>m_<rtt>ms`, such as 100m_300ms).
 set -euo pipefail
 
 out=target/bench-results/rtt
+primary=${MINIP2P_RTT_PROFILE:-100m_100ms}
 mkdir -p "$out"
 cargo bench -p minip2p-rs --features tcp,nat,relay-server,bench --bench endpoint_rtt --no-run
 
 run() {
-  local sweep=$1 profile=${2:-100m_100ms}
+  local sweep=$1 profile=${2:-$primary}
   echo "== $sweep on $profile" >&2
   MINIP2P_RTT_SWEEP=$sweep MINIP2P_RTT_PROFILE=$profile \
     cargo bench -q -p minip2p-rs --features tcp,nat,relay-server,bench --bench endpoint_rtt \
@@ -26,9 +29,9 @@ run() {
 # The bytes of the value a sweep's summary picked ("pick: 1216K ...").
 pick() {
   local kib
-  kib=$(sed -n 's/^pick: \([0-9]*\)K.*/\1/p' "$out/$1-100m_100ms.log")
+  kib=$(sed -n 's/^pick: \([0-9]*\)K.*/\1/p' "$out/$1-$primary.log")
   if [[ -z "$kib" ]]; then
-    echo "$1 picked nothing; see $out/$1-100m_100ms.log" >&2
+    echo "$1 picked nothing; see $out/$1-$primary.log" >&2
     exit 1
   fi
   echo $((kib * 1024))

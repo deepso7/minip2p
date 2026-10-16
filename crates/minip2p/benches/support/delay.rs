@@ -40,9 +40,8 @@ const TCP_READ: usize = 16 * 1024;
 const SOCKET_BUFFER: usize = 8 * 1024 * 1024;
 
 /// A link's rate, in bits per second each way, and round-trip delay.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Profile {
-    pub name: &'static str,
     pub rate_bits_per_s: u64,
     pub rtt: Duration,
 }
@@ -50,22 +49,42 @@ pub struct Profile {
 impl Profile {
     /// The profile the window defaults are tuned against (#361).
     pub const M100_100MS: Self = Self {
-        name: "100m_100ms",
         rate_bits_per_s: 100_000_000,
         rtt: Duration::from_millis(100),
     };
     /// A fat, short path, recorded to show what the defaults give up there.
     pub const G1_20MS: Self = Self {
-        name: "1g_20ms",
         rate_bits_per_s: 1_000_000_000,
         rtt: Duration::from_millis(20),
     };
 
-    /// Looks a profile up by [`name`](Self::name).
+    /// The profile's name: the rate in Mbit/s (`m`) or Gbit/s (`g`) and the
+    /// RTT in ms, such as `100m_100ms` or `1g_20ms`.
+    pub fn name(&self) -> String {
+        let rate = if self.rate_bits_per_s.is_multiple_of(1_000_000_000) {
+            format!("{}g", self.rate_bits_per_s / 1_000_000_000)
+        } else {
+            format!("{}m", self.rate_bits_per_s / 1_000_000)
+        };
+        format!("{rate}_{}ms", self.rtt.as_millis())
+    }
+
+    /// Parses a [`name`](Self::name), so any rate and RTT can be measured.
     pub fn named(name: &str) -> Option<Self> {
-        [Self::M100_100MS, Self::G1_20MS]
-            .into_iter()
-            .find(|profile| profile.name == name)
+        let (rate, rtt) = name.split_once('_')?;
+        let rtt_ms: u64 = rtt.strip_suffix("ms")?.parse().ok()?;
+        let rate_bits_per_s = if let Some(gbit) = rate.strip_suffix('g') {
+            gbit.parse::<u64>().ok()?.checked_mul(1_000_000_000)?
+        } else {
+            rate.strip_suffix('m')?
+                .parse::<u64>()
+                .ok()?
+                .checked_mul(1_000_000)?
+        };
+        (rate_bits_per_s > 0 && rtt_ms > 0).then(|| Self {
+            rate_bits_per_s,
+            rtt: Duration::from_millis(rtt_ms),
+        })
     }
 
     /// The link rate in bytes per second.

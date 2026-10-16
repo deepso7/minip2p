@@ -42,9 +42,11 @@
 //! proxy thread's CPU share. A sweep reports no pick when its reference
 //! reaches under 85% of the link, anything was lost, the idle RTT is 20%
 //! off the profile's, or a proxy thread used over 80% of a core. `MINIP2P_RTT_PROFILE` picks the profile
-//! (`100m_100ms` by default, or `1g_20ms`), `MINIP2P_RTT_RUNS` the runs per
+//! (`100m_100ms` by default), `MINIP2P_RTT_RUNS` the runs per
 //! point (default 5), and `MINIP2P_RTT_TOTAL_MB` the bytes per timed
-//! transfer (default: 2.5 s at the link rate, at least 32 MiB).
+//! transfer (default: 2.5 s or 25 round trips at the link rate, whichever is
+//! longer, and at least 32 MiB). The profile is any `<rate>m_<rtt>ms` or
+//! `<rate>g_<rtt>ms`, such as `100m_300ms`.
 //!
 //! An MB here is 2^20 bytes.
 
@@ -155,12 +157,12 @@ fn pr_bench() {
         let median = median(&rates);
         println!(
             "endpoint_rtt/{case}/{}: {median:.2} MB/s median of {rates:.2?} ({:.0}% of the link)",
-            profile.name,
+            profile.name(),
             100.0 * median * MB as f64 / profile.bytes_per_s()
         );
         rows.push(format!(
             r#"{{"tier":"rust-wall","name":"endpoint_rtt/{case}/{}","metric":"mb_per_s","value":{median}}}"#,
-            profile.name
+            profile.name()
         ));
     }
     let dir = concat!(
@@ -197,7 +199,7 @@ fn window(bytes: u64, percent: u64) -> usize {
 }
 
 fn run_sweep(sweep: &str) {
-    let profile_name: String = env_or("MINIP2P_RTT_PROFILE", Profile::M100_100MS.name.to_owned());
+    let profile_name: String = env_or("MINIP2P_RTT_PROFILE", Profile::M100_100MS.name());
     let profile = Profile::named(&profile_name)
         .unwrap_or_else(|| invalid(&format!("unknown MINIP2P_RTT_PROFILE {profile_name}")));
     let runs = env_or("MINIP2P_RTT_RUNS", 5_usize);
@@ -205,14 +207,16 @@ fn run_sweep(sweep: &str) {
         retry(profile, runs);
         return;
     }
-    // 2.5 s at the link rate.
-    let default_total = (profile.rate_bits_per_s / 8 * 5 / 2).div_ceil(MB);
+    // 2.5 s or 25 round trips at the link rate, whichever is longer, so a
+    // long RTT's slow start and credit ramp stay a small share of the time.
+    let seconds_x10 = 25.max(profile.rtt.as_millis() as u64 / 4);
+    let default_total = (profile.rate_bits_per_s / 8 * seconds_x10 / 10).div_ceil(MB);
     let total = env_or("MINIP2P_RTT_TOTAL_MB", default_total.max(32)) * MB;
     let points = sweep_points(sweep, profile);
     let bdp = profile.bdp_bytes();
     println!(
         "sweep {sweep} on {} (BDP {} KiB): {} points × {runs} runs, {} MiB each",
-        profile.name,
+        profile.name(),
         bdp / 1024,
         points.len(),
         total / MB
@@ -223,7 +227,7 @@ fn run_sweep(sweep: &str) {
         "/../../target/bench-results/rtt"
     );
     std::fs::create_dir_all(dir).expect("create sweep results directory");
-    let path = format!("{dir}/{sweep}-{}.jsonl", profile.name);
+    let path = format!("{dir}/{sweep}-{}.jsonl", profile.name());
     let mut lines = Vec::new();
     let mut results: Vec<(Point, Vec<Sample>)> = points
         .iter()
@@ -509,7 +513,7 @@ fn summarize(sweep: &str, profile: Profile, results: &[(Point, Vec<Sample>)]) {
                 "check: {} reaches {:.0}% of reference{streams}{}",
                 point.label,
                 100.0 * share,
-                match (share < CUTOFF, profile.name == Profile::M100_100MS.name) {
+                match (share < CUTOFF, profile == Profile::M100_100MS) {
                     (true, true) => ": MISSED the 90% target",
                     (true, false) => " (not tuned for this profile)",
                     (false, _) => "",
@@ -591,7 +595,7 @@ fn json_line(sweep: &str, profile: Profile, run: usize, point: &Point, sample: &
             r#""proxy_cpu":{}}}"#
         ),
         sweep,
-        profile.name,
+        profile.name(),
         run,
         point.label,
         point.transport,
@@ -880,7 +884,7 @@ fn retry(profile: Profile, runs: usize) {
         require_address_validation: retry,
         ..QuicLimits::default()
     };
-    println!("retry on {} ({runs} runs)", profile.name);
+    println!("retry on {} ({runs} runs)", profile.name());
     let mut connected_on = Vec::new();
     for retry in [true, false] {
         let (mut connected, mut ready) = (Vec::new(), Vec::new());
