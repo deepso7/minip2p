@@ -14,6 +14,7 @@ Supplements ADRs 0012 and 0019. ADR 0019 gave QUIC a memory budget; TCP and circ
   - Circuits: 10.26 MiB fixed (10,760,507 bytes) plus the window is 12.6 MiB, and 64 of them need 809 MiB, so the default 896 MiB admits 70.
 
   Sessions get no fairness guarantee between them, as on QUIC.
+
 - **Limits are checked at construction.** `TcpTransport::with_config` and `CircuitTransport::with_limits` return `InvalidLimit` when the Yamux invariants do not hold, the reservation arithmetic overflows, or the budget cannot fit one fixed part and one stream; TCP's zero outbound cap stays valid. Both `Endpoint` builders take the limits (`tcp_config`, `circuit_limits`) and report `EndpointOptionsError::InvalidLimit` / `PortableBuildError::InvalidLimit`.
 
 ## Rejected alternatives
