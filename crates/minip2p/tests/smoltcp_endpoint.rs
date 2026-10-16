@@ -161,6 +161,7 @@ fn transport_on_stack(
         CountingEntropy(seed),
         TcpConfig::default(),
     )
+    .expect("valid config")
 }
 
 fn endpoint(device: VirtualDevice, cidr: &str, identity: &Ed25519Keypair, seed: u8) -> Portable {

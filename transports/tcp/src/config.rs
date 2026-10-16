@@ -1,5 +1,5 @@
-use minip2p_secure_mux::YamuxConfig;
-use minip2p_transport::ConnectionNamespace;
+use minip2p_secure_mux::{NOISE_WIRE_FRAME, SecureMuxSession, YamuxConfig};
+use minip2p_transport::{ConnectionNamespace, InvalidLimit};
 
 /// Limits and identifiers for one [`TcpTransport`](crate::TcpTransport).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +54,72 @@ pub struct TcpConfig {
     pub send_stall_timeout_ms: Option<u64>,
     /// Limits applied to each connection's Yamux session.
     pub yamux: YamuxConfig,
+    /// The TCP memory budget: the bytes this transport may reserve for its
+    /// connections and streams, across all its listeners (ADR 0021). It caps
+    /// the transport's worst-case retained payload.
+    ///
+    /// Each connection reserves
+    /// [`connection_reservation_bytes`](Self::connection_reservation_bytes)
+    /// from its dial or accept until teardown drops its session, and each
+    /// stream reserves
+    /// [`stream_reservation_bytes`](Self::stream_reservation_bytes) from when
+    /// it opens or is admitted until it settles: closed and its delivered
+    /// bytes acknowledged or abandoned, also after its connection ended.
+    /// What does not fit is refused, never queued: a dial or `open_stream`
+    /// fails with `ResourceExhausted { resource: "TCP memory budget" }`, an
+    /// inbound connection is aborted at accept, as at
+    /// [`max_connections`](Self::max_connections), and an inbound stream is
+    /// reset, as past Yamux's stream limit. Must fit one connection with one
+    /// stream.
+    pub memory_budget_bytes: usize,
+}
+
+impl TcpConfig {
+    /// The fixed part of a connection's memory reservation: its session's
+    /// ([`SecureMuxSession::fixed_reservation_bytes`]: twice the Yamux send
+    /// cap, its write queue and its decoders' backlogs) plus the outbound
+    /// buffer, [`max_buffered_send`](Self::max_buffered_send) and the one
+    /// Noise message a pull may overshoot it by.
+    ///
+    /// Container overhead, allocator slack, temporary copies and the
+    /// provider's socket buffers are not counted. Saturates rather than
+    /// overflowing; [`validate`](Self::validate) rejects that.
+    pub fn connection_reservation_bytes(&self) -> usize {
+        SecureMuxSession::fixed_reservation_bytes(&self.yamux)
+            .saturating_add(self.max_buffered_send)
+            .saturating_add(NOISE_WIRE_FRAME)
+    }
+
+    /// Each stream's memory reservation: its Yamux receive window.
+    pub fn stream_reservation_bytes(&self) -> usize {
+        self.yamux.receive_window as usize
+    }
+
+    /// Checks the limits can work: the Yamux invariants hold, the
+    /// reservation arithmetic does not overflow, and the budget fits one
+    /// connection with one stream. A zero
+    /// [`max_buffered_send`](Self::max_buffered_send) is valid.
+    pub fn validate(&self) -> Result<(), InvalidLimit> {
+        self.yamux.validate().map_err(|requirement| InvalidLimit {
+            field: "TcpConfig::yamux",
+            requirement,
+        })?;
+        let smallest = self
+            .connection_reservation_bytes()
+            .checked_add(self.stream_reservation_bytes())
+            .filter(|bytes| *bytes != usize::MAX)
+            .ok_or(InvalidLimit {
+                field: "TcpConfig::yamux",
+                requirement: "the memory reservation arithmetic must not overflow",
+            })?;
+        if self.memory_budget_bytes < smallest {
+            return Err(InvalidLimit {
+                field: "TcpConfig::memory_budget_bytes",
+                requirement: "must fit one connection's fixed reservation and one stream",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for TcpConfig {
@@ -73,6 +139,25 @@ impl Default for TcpConfig {
             // that a dead one does not hold a connection indefinitely.
             send_stall_timeout_ms: Some(30_000),
             yamux: YamuxConfig::default(),
+            // At least 64 connections with a stream each (ADR 0021): 11.25 MiB
+            // fixed plus a 2,432 KiB window is 13.6 MiB, so 1 GiB admits 75.
+            memory_budget_bytes: 1024 * 1024 * 1024,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_budget_admits_at_least_64_connections_with_a_stream_each() {
+        let config = TcpConfig::default();
+        let session = config.connection_reservation_bytes() + config.stream_reservation_bytes();
+        assert!(
+            config.memory_budget_bytes / session >= 64,
+            "{session} bytes each"
+        );
+        config.validate().expect("the default is valid");
     }
 }

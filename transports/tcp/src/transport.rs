@@ -11,7 +11,8 @@ use minip2p_secure_mux::{
 };
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, ConnectionState,
-    ConnectionToken, StreamId, Transport, TransportError, TransportEvent, UnsettledConnections,
+    ConnectionToken, InvalidLimit, MemoryLedger, StreamId, Transport, TransportError,
+    TransportEvent, UnsettledConnections,
 };
 
 use crate::config::TcpConfig;
@@ -166,8 +167,11 @@ pub struct TcpTransport<P, E> {
     ids: ConnectionIdAllocator,
     connections: BTreeMap<ConnectionId, Connection>,
     /// Ended connections whose delivered bytes are not settled yet. Each
-    /// still holds a slot against [`TcpConfig::max_connections`] (ADR 0012).
+    /// still holds a slot against [`TcpConfig::max_connections`] (ADR 0012),
+    /// and each of its streams its reservation (ADR 0021).
     unsettled: UnsettledConnections,
+    /// The TCP memory budget's reservations ([`TcpConfig::memory_budget_bytes`]).
+    ledger: MemoryLedger,
     by_socket: BTreeMap<SocketHandle, ConnectionId>,
     pending: VecDeque<TransportEvent>,
     /// Connections the next poll services regardless of time: new ones, which
@@ -183,18 +187,32 @@ pub struct TcpTransport<P, E> {
 }
 
 impl<P, E> TcpTransport<P, E> {
-    /// Creates a transport with explicit configuration.
+    /// Creates a transport with explicit configuration, or the limit that
+    /// cannot work ([`TcpConfig::validate`]).
     pub fn with_config(
         provider: P,
         identity: Ed25519Keypair,
         entropy: E,
         config: TcpConfig,
-    ) -> Self {
+    ) -> Result<Self, InvalidLimit> {
+        config.validate()?;
+        Ok(Self::from_valid(provider, identity, entropy, config))
+    }
+
+    /// Creates a transport with [`TcpConfig::default`], which is valid.
+    pub fn new(provider: P, identity: Ed25519Keypair, entropy: E) -> Self {
+        Self::from_valid(provider, identity, entropy, TcpConfig::default())
+    }
+
+    /// Builds the transport from a config that passed
+    /// [`TcpConfig::validate`].
+    fn from_valid(provider: P, identity: Ed25519Keypair, entropy: E, config: TcpConfig) -> Self {
         Self {
             provider,
             entropy,
             identity,
             ids: ConnectionIdAllocator::new(config.namespace),
+            ledger: MemoryLedger::new(config.memory_budget_bytes),
             config,
             connections: BTreeMap::new(),
             unsettled: UnsettledConnections::new(),
@@ -205,9 +223,11 @@ impl<P, E> TcpTransport<P, E> {
         }
     }
 
-    /// Creates a transport with [`TcpConfig::default`].
-    pub fn new(provider: P, identity: Ed25519Keypair, entropy: E) -> Self {
-        Self::with_config(provider, identity, entropy, TcpConfig::default())
+    /// Bytes reserved against the TCP memory budget now, by live
+    /// connections and by streams still unsettled, including those of
+    /// ended connections.
+    pub fn memory_reserved(&self) -> usize {
+        self.ledger.reserved()
     }
 
     /// Borrows the provider.
@@ -247,12 +267,44 @@ impl<P, E> TcpTransport<P, E> {
     }
 
     /// Takes a connection out of the map for good, handing its unsettled
-    /// streams' counts to [`Self::unsettled`].
+    /// streams' counts to [`Self::unsettled`]. Those keep their stream
+    /// reservations; the connection's fixed part and every other stream's
+    /// reservation go now.
     fn retire(&mut self, id: ConnectionId) -> Option<Connection> {
-        let connection = self.connections.remove(&id)?;
-        self.unsettled
-            .insert(id, connection.session.unsettled_streams());
+        let mut connection = self.connections.remove(&id)?;
+        let (unsettled, released) = connection.session.end_streams();
+        self.unsettled.insert(id, unsettled);
+        self.ledger.release(
+            self.config
+                .connection_reservation_bytes()
+                .saturating_add(released * self.config.stream_reservation_bytes()),
+        );
         Some(connection)
+    }
+
+    /// Releases the reservations of streams the session reports settled.
+    fn release_settled(&mut self, session: &mut SecureMuxSession) {
+        let settled = session.take_settled_streams();
+        self.ledger
+            .release(settled * self.config.stream_reservation_bytes());
+    }
+
+    /// Settles streams of ended connections through `settle`, releasing the
+    /// reservation of each one that settles.
+    fn settle_unsettled<R>(&mut self, settle: impl FnOnce(&mut UnsettledConnections) -> R) -> R {
+        let before = self.unsettled.streams();
+        let result = settle(&mut self.unsettled);
+        let settled = before - self.unsettled.streams();
+        self.ledger
+            .release(settled * self.config.stream_reservation_bytes());
+        result
+    }
+
+    /// The refusal for a connection or stream the budget cannot fit.
+    fn budget_exhausted() -> TransportError {
+        TransportError::ResourceExhausted {
+            resource: "TCP memory budget",
+        }
     }
 }
 
@@ -269,6 +321,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             .remove(&id)
             .ok_or_else(|| Teardown::fault(format!("connection {id} is unknown")))?;
         let result = operation(self, &mut connection);
+        self.release_settled(&mut connection.session);
         self.connections.insert(id, connection);
         self.touch(id);
         result
@@ -468,7 +521,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
     fn drive_connection(
         &mut self,
         id: ConnectionId,
-        operation: impl FnOnce(&mut SecureMuxSession) -> Result<(), SessionError>,
+        operation: impl FnOnce(&mut SecureMuxSession, &mut MemoryLedger) -> Result<(), SessionError>,
     ) {
         // A failed session is unusable, so `is_established` reads false
         // afterwards: capture it first. A normal remote GoAway on an
@@ -479,7 +532,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             .get(&id)
             .is_some_and(|connection| !connection.session.is_established());
         let result = self.with_connection(id, |this, connection| {
-            let fed = operation(&mut connection.session);
+            let fed = operation(&mut connection.session, &mut this.ledger);
             // Pump either way: bytes the session queued before failing, and
             // events it already produced, are the host's regardless.
             let pumped = this.pump_and_flush(connection);
@@ -500,14 +553,15 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
     fn operate_session<R>(
         &mut self,
         id: ConnectionId,
-        operation: impl FnOnce(&mut SecureMuxSession) -> Result<R, SessionError>,
+        operation: impl FnOnce(&mut SecureMuxSession, &mut MemoryLedger) -> Result<R, SessionError>,
     ) -> Result<R, TransportError> {
         let mut connection = self
             .connections
             .remove(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
-        let result = operation(&mut connection.session);
+        let result = operation(&mut connection.session, &mut self.ledger);
         let pumped = self.pump_and_flush(&mut connection);
+        self.release_settled(&mut connection.session);
         self.connections.insert(id, connection);
         self.touch(id);
 
@@ -534,6 +588,12 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                     id,
                     stream_id: StreamId::new(u64::from(stream)),
                     unsent,
+                })
+            }
+            Err(SessionError::Yamux(YamuxError::BudgetExhausted)) => Err(Self::budget_exhausted()),
+            Err(SessionError::Yamux(YamuxError::TooManyStreams)) => {
+                Err(TransportError::ResourceExhausted {
+                    resource: "Yamux streams",
                 })
             }
             Err(SessionError::Yamux(YamuxError::AckExceedsDelivered {
@@ -574,11 +634,13 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                     connection.remote = remote;
                     connection.linked = true;
                 }
-                self.drive_connection(id, SecureMuxSession::start);
+                self.drive_connection(id, |session, _| session.start());
             }
             TcpEvent::Received { socket, data } => {
                 if let Some(id) = self.by_socket.get(&socket).copied() {
-                    self.drive_connection(id, move |session| session.handle_input(data));
+                    self.drive_connection(id, move |session, ledger| {
+                        session.handle_input_within(data, ledger)
+                    });
                 }
             }
             // Nothing to do beyond having been polled: `poll` retries every
@@ -605,7 +667,8 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         // nobody to report a failure to, and spending an id on it would burn
         // the namespace at whatever rate a peer chose to knock. Ended
         // connections with unsettled bytes still hold their slots.
-        if self.at_capacity() {
+        // So is one the memory budget cannot fit.
+        if self.at_capacity() || !self.ledger.fits(self.config.connection_reservation_bytes()) {
             self.provider.abort(socket);
             return;
         }
@@ -627,6 +690,10 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             return;
         };
 
+        let reserved = self
+            .ledger
+            .reserve(self.config.connection_reservation_bytes());
+        debug_assert!(reserved, "checked to fit above");
         self.by_socket.insert(socket, id);
         self.connections.insert(
             id,
@@ -636,7 +703,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             id,
             endpoint: ConnectionEndpoint::new(remote),
         });
-        self.drive_connection(id, SecureMuxSession::start);
+        self.drive_connection(id, |session, _| session.start());
     }
 
     /// One poll's worth of work for one connection: enforce its
@@ -697,7 +764,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             // upgrade bytes just drained gets its first keepalive deadline in
             // this poll.
             if connection.session.is_established() {
-                self.drive_connection(id, |session| session.poll(now));
+                self.drive_connection(id, |session, _| session.poll(now));
             }
         } else if let Some(since) = connection.stalled_since {
             // Still set: the socket took nothing this poll.
@@ -759,6 +826,9 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                 resource: "tcp connections",
             });
         }
+        if !self.ledger.fits(self.config.connection_reservation_bytes()) {
+            return Err(Self::budget_exhausted());
+        }
         let id = self.ids.peek().ok_or(TransportError::ResourceExhausted {
             resource: "tcp connection ids",
         })?;
@@ -782,6 +852,10 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
             },
         })?;
 
+        let reserved = self
+            .ledger
+            .reserve(self.config.connection_reservation_bytes());
+        debug_assert!(reserved, "checked to fit above");
         self.by_socket.insert(socket, id);
         self.connections.insert(
             id,
@@ -827,7 +901,8 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
     }
 
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
-        let stream_id = self.operate_session(id, SecureMuxSession::open_stream)?;
+        let stream_id =
+            self.operate_session(id, |session, ledger| session.open_stream_within(ledger))?;
         self.pending
             .push_back(TransportEvent::StreamOpened { id, stream_id });
         Ok(stream_id)
@@ -849,7 +924,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                 Err(TransportError::ConnectionNotFound { id })
             };
         }
-        self.operate_session(id, |session| session.send(stream_id, data))
+        self.operate_session(id, |session, _| session.send(stream_id, data))
             .map_err(|error| {
                 stream_error(error, |reason| TransportError::StreamSendFailed {
                     id,
@@ -865,7 +940,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
         let result = self
-            .operate_session(id, |session| session.close_stream_write(stream_id))
+            .operate_session(id, |session, _| session.close_stream_write(stream_id))
             .map_err(|error| {
                 stream_error(error, |reason| TransportError::StreamCloseWriteFailed {
                     id,
@@ -883,11 +958,11 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
         // Abandoning a stream of an ended connection only settles it.
-        if self.unsettled.abandon(id, stream_id) {
+        if self.settle_unsettled(|unsettled| unsettled.abandon(id, stream_id)) {
             return Ok(());
         }
         let result = self
-            .operate_session(id, |session| session.reset_stream(stream_id))
+            .operate_session(id, |session, _| session.reset_stream(stream_id))
             .map_err(|error| {
                 stream_error(error, |reason| TransportError::StreamResetFailed {
                     id,
@@ -907,18 +982,22 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
     ) -> Result<(), TransportError> {
         if !self.connections.contains_key(&id) {
             // An ended connection's bytes are released without credit.
-            return self.unsettled.ack(id, stream_id, bytes).map(|_held| ());
+            return self
+                .settle_unsettled(|unsettled| unsettled.ack(id, stream_id, bytes))
+                .map(|_held| ());
         }
         // Flushed at once, so the window update reaches the peer without
         // waiting for another poll.
-        self.operate_session(id, |session| session.ack_stream(stream_id, bytes))
+        self.operate_session(id, |session, _| session.ack_stream(stream_id, bytes))
     }
 
     fn set_control_stream(&mut self, id: ConnectionId, stream_id: StreamId, control: bool) {
         // Nothing returns to the caller, so a session the mark's flush fails
         // is torn down with an `Error` carrying the reason.
         if self.connections.contains_key(&id) {
-            self.drive_connection(id, |session| session.set_control_stream(stream_id, control));
+            self.drive_connection(id, |session, _| {
+                session.set_control_stream(stream_id, control)
+            });
         }
     }
 

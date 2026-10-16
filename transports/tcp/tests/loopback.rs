@@ -127,7 +127,11 @@ fn identity(seed: u8) -> Ed25519Keypair {
 }
 
 fn node(key: Ed25519Keypair) -> Node {
-    TcpTransport::new(StdTcpProvider::new(), key, StdEntropy)
+    node_with(key, minip2p_tcp::TcpConfig::default())
+}
+
+fn node_with(key: Ed25519Keypair, config: minip2p_tcp::TcpConfig) -> Node {
+    TcpTransport::with_config(StdTcpProvider::new(), key, StdEntropy, config).expect("valid config")
 }
 
 /// Polls both nodes until `done`, or panics with what it saw.
@@ -218,11 +222,15 @@ struct Pair {
 }
 
 fn upgraded_pair() -> Pair {
+    upgraded_pair_with(minip2p_tcp::TcpConfig::default())
+}
+
+fn upgraded_pair_with(config: minip2p_tcp::TcpConfig) -> Pair {
     let dialer_key = identity(1);
     let listener_key = identity(2);
     let (dialer_peer, listener_peer) = (dialer_key.peer_id(), listener_key.peer_id());
-    let mut dialer = node(dialer_key);
-    let mut listener = node(listener_key);
+    let mut dialer = node_with(dialer_key, config.clone());
+    let mut listener = node_with(listener_key, config);
 
     // Port 0 lets the kernel choose, and the bound address comes back concrete.
     let bound = listener
@@ -361,17 +369,18 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
     let mut pair = upgraded_pair();
     let id = pair.dialer_connection;
     let stream = pair.dialer.open_stream(id).expect("open substream");
-    let payload = Bytes::from(vec![7u8; 1024 * 1024]);
-    let mut held = send_or_hold(&mut pair.dialer, id, stream, payload.clone());
-
     // The reader takes what arrives but acknowledges nothing: the sender may
     // deliver one receive window, and no more.
     let window = minip2p_tcp::TcpConfig::default().yamux.receive_window as usize;
+    let payload = Bytes::from(vec![7u8; 2 * window]);
+    let mut held = send_or_hold(&mut pair.dialer, id, stream, payload.clone());
     let mut unacked = 0;
     let mut listener_stream = None;
     let start = Instant::now();
     let mut quiet_since = Instant::now();
-    while quiet_since.elapsed() < Duration::from_millis(300) {
+    // Quiet only counts once data started: a loaded machine can take longer
+    // than the quiet spell to deliver the first window.
+    while listener_stream.is_none() || quiet_since.elapsed() < Duration::from_millis(300) {
         let now = Now::from_millis(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
         for event in pair.dialer.poll(now).expect("poll dialer") {
             if matches!(event, TransportEvent::StreamWritable { stream_id, .. } if stream_id == stream)
@@ -719,7 +728,11 @@ fn an_idle_wait_times_out_and_input_wakes_it() {
 
 #[test]
 fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
-    let mut pair = upgraded_pair();
+    // The specification's 256 KiB window: one write the send caps accept can
+    // then outrun the peer's window, which the default's cannot.
+    let mut config = minip2p_tcp::TcpConfig::default();
+    config.yamux.receive_window = minip2p_secure_mux::yamux::DEFAULT_RECEIVE_WINDOW;
+    let mut pair = upgraded_pair_with(config);
     let id = pair.dialer_connection;
     let stream = pair.dialer.open_stream(id).expect("open substream");
     settle(&mut pair.dialer, &mut pair.listener);

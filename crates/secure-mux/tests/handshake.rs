@@ -278,6 +278,24 @@ fn substreams_carry_data_in_both_directions() {
 }
 
 #[test]
+fn input_longer_than_one_batch_is_split_without_losing_a_byte() {
+    // Several Noise frames in one input, cut into `MAX_INPUT_BATCH` pieces
+    // that straddle frame boundaries.
+    let (mut dialer, mut listener, _, _) = upgraded_pair();
+    let stream = dialer.open_stream().expect("open substream");
+    let payload: Vec<u8> = (0..200 * 1024_usize).map(|i| (i % 251) as u8).collect();
+    dialer
+        .send(stream, Bytes::from(payload.clone()))
+        .expect("fits the send cap");
+    let batch = take_writes(&mut dialer);
+    assert!(batch.len() > 3 * minip2p_secure_mux::MAX_INPUT_BATCH);
+
+    listener.handle_input(batch).expect("one large input");
+    let events: Vec<SessionOutput> = core::iter::from_fn(|| listener.poll_output()).collect();
+    assert_eq!(stream_payloads(&events).concat(), payload);
+}
+
+#[test]
 fn half_close_and_reset_reach_the_remote() {
     let (mut dialer, mut listener, _, _) = upgraded_pair();
 

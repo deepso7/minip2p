@@ -10,7 +10,7 @@ use minip2p_core::Bytes;
 use minip2p_core::platform::{Deadline, Now};
 use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
-use minip2p_transport::StreamId;
+use minip2p_transport::{MemoryLedger, StreamId};
 use thiserror::Error;
 
 pub use crate::yamux::{KEEPALIVE_INTERVAL_MS, YamuxConfig, YamuxError};
@@ -169,9 +169,27 @@ pub struct SecureMuxSession {
     /// Bytes ready for the underlying stream: negotiation and handshake
     /// messages, and encrypted Yamux frames already pulled.
     writes: WriteQueue,
-    /// Yamux's unsettled counts, kept when a fatal error dropped it.
-    unsettled_at_failure: Vec<(StreamId, usize)>,
+    /// What Yamux's streams still hold, kept when a fatal error dropped it.
+    ended: EndedStreams,
 }
+
+/// Yamux's stream accounting, kept when a fatal error dropped the session.
+#[derive(Default)]
+struct EndedStreams {
+    /// Unsettled counts, for the host to take over.
+    unsettled: Vec<(StreamId, usize)>,
+    /// Streams settled since the host last asked, not yet reported.
+    settled: usize,
+    /// The host took the accounting over with
+    /// [`SecureMuxSession::end_streams`]; nothing more is reported.
+    taken: bool,
+}
+
+/// The most input [`SecureMuxSession::handle_input_within`] feeds the
+/// decoders at once; larger input is split. It bounds what one call can
+/// leave in a decoder's buffer, and so the session's
+/// [`fixed_reservation_bytes`](SecureMuxSession::fixed_reservation_bytes).
+pub const MAX_INPUT_BATCH: usize = 64 * 1024;
 
 /// Unread negotiation and handshake bytes a session holds before it fails.
 ///
@@ -234,7 +252,7 @@ impl SecureMuxSession {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
+            ended: EndedStreams::default(),
         }
     }
 
@@ -253,13 +271,38 @@ impl SecureMuxSession {
         Ok(())
     }
 
-    /// Feeds bytes read from the underlying stream.
+    /// Feeds bytes read from the underlying stream, without a memory budget;
+    /// an owner with one uses [`handle_input_within`](Self::handle_input_within).
     pub fn handle_input(&mut self, data: Vec<u8>) -> Result<(), SessionError> {
+        self.handle_input_within(data, &mut MemoryLedger::unbounded())
+    }
+
+    /// Feeds bytes read from the underlying stream, admitting each inbound
+    /// substream against the owner's `ledger` (see
+    /// [`YamuxSession::handle_data_within`]), including substreams pipelined
+    /// behind negotiation.
+    ///
+    /// Input longer than [`MAX_INPUT_BATCH`] is fed in batches of at most
+    /// that, so a large read cannot grow the decoders' buffers past their
+    /// share of the fixed reservation.
+    pub fn handle_input_within(
+        &mut self,
+        data: Vec<u8>,
+        ledger: &mut MemoryLedger,
+    ) -> Result<(), SessionError> {
+        if data.len() <= MAX_INPUT_BATCH {
+            return self.feed_batch(data, ledger);
+        }
+        data.chunks(MAX_INPUT_BATCH)
+            .try_for_each(|batch| self.feed_batch(batch.to_vec(), ledger))
+    }
+
+    fn feed_batch(&mut self, data: Vec<u8>, ledger: &mut MemoryLedger) -> Result<(), SessionError> {
         if data.is_empty() {
             return Ok(());
         }
         let phase = self.take_phase()?;
-        let phase = self.feed_phase(phase, data)?;
+        let phase = self.feed_phase(phase, data, ledger)?;
         self.phase = Some(phase);
         Ok(())
     }
@@ -291,8 +334,9 @@ impl SecureMuxSession {
         let encrypted = encrypt_into(noise, frame, &mut self.writes);
         push_yamux_events(yamux, &mut self.outputs);
         if let Err(error) = encrypted {
-            self.unsettled_at_failure = unsettled_of(yamux);
-            self.phase = None;
+            if let Some(Phase::Ready { mut yamux, .. }) = self.phase.take() {
+                self.record_end(&mut yamux);
+            }
             return Err(error);
         }
         Ok(self.writes.pop())
@@ -314,8 +358,68 @@ impl SecureMuxSession {
     pub fn unsettled_streams(&self) -> Vec<(StreamId, usize)> {
         match &self.phase {
             Some(Phase::Ready { yamux, .. }) => unsettled_of(yamux),
-            _ => self.unsettled_at_failure.clone(),
+            _ => self.ended.unsettled.clone(),
         }
+    }
+
+    /// Substreams holding a slot, open or closed but unsettled; each holds a
+    /// receive window in the owner's ledger. After a fatal error, the
+    /// unsettled ones, which [`unsettled_streams`](Self::unsettled_streams)
+    /// hands over.
+    pub fn held_streams(&self) -> usize {
+        match &self.phase {
+            Some(Phase::Ready { yamux, .. }) => yamux.held_streams(),
+            _ => self.ended.unsettled.len(),
+        }
+    }
+
+    /// How many substreams settled since the last call, each reported once
+    /// (see [`YamuxSession::take_settled_streams`]), including those a fatal
+    /// error ended. The owner releases one receive window for each.
+    pub fn take_settled_streams(&mut self) -> usize {
+        if self.ended.taken {
+            return 0;
+        }
+        match &mut self.phase {
+            Some(Phase::Ready { yamux, .. }) => yamux.take_settled_streams(),
+            _ => core::mem::take(&mut self.ended.settled),
+        }
+    }
+
+    /// Hands the host this session's stream accounting as it tears the
+    /// session down: the unsettled counts to keep (each still holding its
+    /// receive window), and how many other streams to release now, settled
+    /// or simply dropped with the session. Called once; afterwards the
+    /// session reports nothing more.
+    pub fn end_streams(&mut self) -> (Vec<(StreamId, usize)>, usize) {
+        let unsettled = self.unsettled_streams();
+        let release = self.take_settled_streams() + self.held_streams() - unsettled.len();
+        self.ended.taken = true;
+        (unsettled, release)
+    }
+
+    /// The fixed part of a session's memory reservation under `config`: the
+    /// payload it can retain whatever its streams do.
+    ///
+    /// - twice Yamux's total send cap, since a queued write may pin a slice
+    ///   of its caller's payload twice its counted length (ADR 0012);
+    /// - its write queue: the larger of the handshake backlog and one
+    ///   encrypted Yamux frame of `max_frame_len`;
+    /// - its decoders: a partial Noise frame plus one
+    ///   [`MAX_INPUT_BATCH`], and a partial Yamux frame plus one Noise
+    ///   plaintext.
+    ///
+    /// Container overhead, allocator slack and temporary copies are not
+    /// counted. Saturates rather than overflowing.
+    pub fn fixed_reservation_bytes(config: &YamuxConfig) -> usize {
+        let yamux_frame = (config.max_frame_len as usize).saturating_add(crate::yamux::HEADER_LEN);
+        config
+            .max_total_buffered_send
+            .saturating_mul(2)
+            .saturating_add(encrypted_len(yamux_frame).max(MAX_HANDSHAKE_BACKLOG))
+            .saturating_add(NOISE_WIRE_FRAME + MAX_INPUT_BATCH)
+            .saturating_add(yamux_frame)
+            .saturating_add(crate::noise::MAX_TRANSPORT_PLAINTEXT)
     }
 
     /// Returns whether the upgrade has completed.
@@ -355,7 +459,17 @@ impl SecureMuxSession {
 
     /// Opens an outbound substream.
     pub fn open_stream(&mut self) -> Result<StreamId, SessionError> {
-        let stream = self.with_yamux(|yamux| yamux.open_stream())?;
+        self.open_stream_within(&mut MemoryLedger::unbounded())
+    }
+
+    /// Opens an outbound substream, reserving its receive window in the
+    /// owner's `ledger` first; one that does not fit is
+    /// [`YamuxError::BudgetExhausted`].
+    pub fn open_stream_within(
+        &mut self,
+        ledger: &mut MemoryLedger,
+    ) -> Result<StreamId, SessionError> {
+        let stream = self.with_yamux(|yamux| yamux.open_stream_within(ledger))?;
         Ok(StreamId::new(u64::from(stream)))
     }
 
@@ -449,6 +563,16 @@ impl SecureMuxSession {
     // Internals
     // -----------------------------------------------------------------------
 
+    /// Keeps what a session that just failed holds of Yamux's accounting:
+    /// its unsettled counts, and as settled every other stream it still
+    /// charged for, since Yamux is dropped.
+    fn record_end(&mut self, yamux: &mut YamuxSession) {
+        let unsettled = unsettled_of(yamux);
+        let settled = yamux.take_settled_streams() + yamux.held_streams() - unsettled.len();
+        self.ended.unsettled = unsettled;
+        self.ended.settled += settled;
+    }
+
     /// Runs `operation` against the established Yamux session and drains
     /// the events it produced. Frames it queued wait for
     /// [`poll_write`](Self::poll_write).
@@ -473,7 +597,7 @@ impl SecureMuxSession {
         // its GoAway and leave the phase taken.
         if let Err(error @ YamuxError::ControlReserveExhausted { .. }) = result {
             let drained = self.drain_yamux(&mut noise, &mut yamux, true);
-            self.unsettled_at_failure = unsettled_of(&yamux);
+            self.record_end(&mut yamux);
             drained?;
             return Err(SessionError::protocol(format!(
                 "Yamux protocol failed: {error}"
@@ -482,7 +606,7 @@ impl SecureMuxSession {
         // A failed drain is fatal, exactly as in `handle_input`: leave the
         // phase taken so the session cannot be used again.
         if let Err(error) = self.drain_yamux(&mut noise, &mut yamux, false) {
-            self.unsettled_at_failure = unsettled_of(&yamux);
+            self.record_end(&mut yamux);
             return Err(error);
         }
         self.phase = Some(Phase::Ready { noise, yamux, peer });
@@ -508,7 +632,12 @@ impl SecureMuxSession {
             .ok_or_else(|| SessionError::protocol("session already failed"))
     }
 
-    fn feed_phase(&mut self, phase: Phase, data: Vec<u8>) -> Result<Phase, SessionError> {
+    fn feed_phase(
+        &mut self,
+        phase: Phase,
+        data: Vec<u8>,
+        ledger: &mut MemoryLedger,
+    ) -> Result<Phase, SessionError> {
         match phase {
             Phase::SelectNoise {
                 mut select,
@@ -554,7 +683,7 @@ impl SecureMuxSession {
                 if remaining.is_empty() {
                     Ok(Phase::Noise { noise })
                 } else {
-                    self.feed_phase(Phase::Noise { noise }, remaining)
+                    self.feed_phase(Phase::Noise { noise }, remaining, ledger)
                 }
             }
             Phase::Noise { mut noise } => {
@@ -584,7 +713,7 @@ impl SecureMuxSession {
                     peer,
                 };
                 for plaintext in decrypted {
-                    phase = self.feed_decrypted_transport(phase, plaintext)?;
+                    phase = self.feed_decrypted_transport(phase, plaintext, ledger)?;
                 }
                 Ok(phase)
             }
@@ -606,7 +735,7 @@ impl SecureMuxSession {
                     peer,
                 };
                 for plaintext in decrypted {
-                    phase = self.feed_decrypted_transport(phase, plaintext)?;
+                    phase = self.feed_decrypted_transport(phase, plaintext, ledger)?;
                 }
                 Ok(phase)
             }
@@ -615,7 +744,7 @@ impl SecureMuxSession {
                 mut yamux,
                 peer,
             } => {
-                let fed = self.feed_ready(&mut noise, &mut yamux, data);
+                let fed = self.feed_ready(&mut noise, &mut yamux, data, ledger);
                 self.keep_ready(fed, noise, yamux, peer)
             }
         }
@@ -629,15 +758,18 @@ impl SecureMuxSession {
         &mut self,
         phase: Phase,
         plaintext: Vec<u8>,
+        ledger: &mut MemoryLedger,
     ) -> Result<Phase, SessionError> {
         match phase {
-            phase @ Phase::SelectYamux { .. } => self.feed_decrypted_yamux_select(phase, plaintext),
+            phase @ Phase::SelectYamux { .. } => {
+                self.feed_decrypted_yamux_select(phase, plaintext, ledger)
+            }
             Phase::Ready {
                 mut noise,
                 mut yamux,
                 peer,
             } => {
-                let fed = self.feed_yamux(&mut noise, &mut yamux, &plaintext);
+                let fed = self.feed_yamux(&mut noise, &mut yamux, &plaintext, ledger);
                 self.keep_ready(fed, noise, yamux, peer)
             }
             _ => Err(SessionError::protocol(
@@ -652,6 +784,7 @@ impl SecureMuxSession {
         noise: &mut NoiseSession,
         yamux: &mut YamuxSession,
         data: Vec<u8>,
+        ledger: &mut MemoryLedger,
     ) -> Result<(), SessionError> {
         noise
             .on_data(data)
@@ -661,7 +794,7 @@ impl SecureMuxSession {
             return Err(SessionError::protocol("Noise authenticated twice"));
         }
         for plaintext in decrypted {
-            self.feed_yamux(noise, yamux, &plaintext)?;
+            self.feed_yamux(noise, yamux, &plaintext, ledger)?;
         }
         Ok(())
     }
@@ -672,8 +805,9 @@ impl SecureMuxSession {
         noise: &mut NoiseSession,
         yamux: &mut YamuxSession,
         plaintext: &[u8],
+        ledger: &mut MemoryLedger,
     ) -> Result<(), SessionError> {
-        let result = yamux.handle_data(plaintext);
+        let result = yamux.handle_data_within(plaintext, ledger);
         self.drain_yamux(noise, yamux, result.is_err())?;
         result.map_err(|error| SessionError::protocol(format!("Yamux protocol failed: {error}")))
     }
@@ -684,13 +818,13 @@ impl SecureMuxSession {
         &mut self,
         fed: Result<(), SessionError>,
         noise: NoiseSession,
-        yamux: Box<YamuxSession>,
+        mut yamux: Box<YamuxSession>,
         peer: PeerId,
     ) -> Result<Phase, SessionError> {
         match fed {
             Ok(()) => Ok(Phase::Ready { noise, yamux, peer }),
             Err(error) => {
-                self.unsettled_at_failure = unsettled_of(&yamux);
+                self.record_end(&mut yamux);
                 Err(error)
             }
         }
@@ -700,6 +834,7 @@ impl SecureMuxSession {
         &mut self,
         phase: Phase,
         plaintext: Vec<u8>,
+        ledger: &mut MemoryLedger,
     ) -> Result<Phase, SessionError> {
         let Phase::SelectYamux {
             mut noise,
@@ -758,7 +893,7 @@ impl SecureMuxSession {
         // that drains outputs after an error would treat a dead session as up.
         let established_at = self.outputs.len();
         if !remaining.is_empty() {
-            let handled = yamux.handle_data(&remaining);
+            let handled = yamux.handle_data_within(&remaining, ledger);
             let drained = self.drain_yamux(&mut noise, &mut yamux, handled.is_err());
             let outcome = drained.and_then(|()| {
                 handled.map_err(|error| {
@@ -772,6 +907,9 @@ impl SecureMuxSession {
                 // queued; without this they would also see substream traffic on
                 // a connection they were never told came up.
                 self.outputs.truncate(established_at);
+                // Nor was any of its data: nobody holds bytes to acknowledge,
+                // so every stream it admitted settles with it.
+                self.ended.settled += yamux.take_settled_streams() + yamux.held_streams();
                 return Err(error);
             }
         }
@@ -907,6 +1045,21 @@ fn encrypt_into(
     }
     Ok(())
 }
+
+/// Bytes on the wire for `plaintext` bytes of Noise transport messages: each
+/// segment of at most `MAX_TRANSPORT_PLAINTEXT` gains a length prefix and a
+/// tag.
+fn encrypted_len(plaintext: usize) -> usize {
+    let segments = plaintext
+        .div_ceil(crate::noise::MAX_TRANSPORT_PLAINTEXT)
+        .max(1);
+    let overhead = NOISE_WIRE_FRAME - crate::noise::MAX_TRANSPORT_PLAINTEXT;
+    plaintext.saturating_add(segments.saturating_mul(overhead))
+}
+
+/// The largest Noise transport message on the wire: a full frame and its
+/// two-byte length prefix.
+pub const NOISE_WIRE_FRAME: usize = crate::noise::MAX_FRAME_LEN + 2;
 
 /// Yamux's unsettled substreams, as session stream ids.
 fn unsettled_of(yamux: &YamuxSession) -> Vec<(StreamId, usize)> {
@@ -1117,7 +1270,7 @@ mod tests {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
+            ended: EndedStreams::default(),
         };
         let proposals = b"\x13/multistream/1.0.0\n\x0d/mplex/6.7.0\n\x0d/yamux/1.0.0\n".to_vec();
         initiator_noise
@@ -1190,6 +1343,13 @@ mod tests {
     /// already `Ready`, so they never race the announcement. Only a single
     /// packed plaintext reaches `take_remaining_buffer`.
     fn feed_packed_remainder(trailing: Vec<u8>) -> (SecureMuxSession, Result<(), SessionError>) {
+        feed_packed_remainder_within(trailing, &mut MemoryLedger::unbounded())
+    }
+
+    fn feed_packed_remainder_within(
+        trailing: Vec<u8>,
+        ledger: &mut MemoryLedger,
+    ) -> (SecureMuxSession, Result<(), SessionError>) {
         let dialer_key = Ed25519Keypair::generate();
         let listener_key = Ed25519Keypair::generate();
         let listener_peer = listener_key.peer_id();
@@ -1206,7 +1366,7 @@ mod tests {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
+            ended: EndedStreams::default(),
         };
 
         let mut packed = echo;
@@ -1222,7 +1382,7 @@ mod tests {
         }
         assert!(!ciphertext.is_empty(), "packed plaintext must encrypt");
 
-        let result = dialer.handle_input(ciphertext);
+        let result = dialer.handle_input_within(ciphertext, ledger);
         (dialer, result)
     }
 
@@ -1260,6 +1420,35 @@ mod tests {
             established < first_stream,
             "Established must precede the remainder's stream output: {outputs:?}"
         );
+    }
+
+    #[test]
+    fn a_pipelined_stream_is_admitted_against_the_ledger() {
+        let mut full = MemoryLedger::new(0);
+        let (mut dialer, result) = feed_packed_remainder_within(syn_with_data(), &mut full);
+        result.expect("a refused stream does not fail the upgrade");
+        let outputs: Vec<SessionOutput> = core::iter::from_fn(|| dialer.poll_output()).collect();
+        assert!(
+            matches!(outputs.as_slice(), [SessionOutput::Established { .. }]),
+            "the stream is reset, not announced: {outputs:?}"
+        );
+        assert_eq!(dialer.held_streams(), 0);
+    }
+
+    #[test]
+    fn a_fatal_pipelined_remainder_releases_the_streams_it_admitted() {
+        // The stream is admitted, then the GoAway fails the upgrade: none of
+        // its bytes were published, so its whole window comes back.
+        let window = YamuxConfig::default().receive_window as usize;
+        let mut ledger = MemoryLedger::new(4 * window);
+        let mut trailing = syn_with_data();
+        trailing.extend_from_slice(&Frame::go_away(1).encode());
+        let (mut dialer, result) = feed_packed_remainder_within(trailing, &mut ledger);
+        assert!(result.is_err());
+        let (unsettled, released) = dialer.end_streams();
+        assert_eq!(unsettled, [], "nothing was delivered to acknowledge");
+        ledger.release(released * window);
+        assert_eq!(ledger.reserved(), 0);
     }
 
     #[test]
@@ -1312,7 +1501,7 @@ mod tests {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
+            ended: EndedStreams::default(),
         };
 
         session
@@ -1349,7 +1538,7 @@ mod tests {
             // An earlier pump already moved this stream's Writable here.
             outputs: VecDeque::from([SessionOutput::StreamWritable { stream }]),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
+            ended: EndedStreams::default(),
         };
 
         session.go_away(0).expect("go away");
@@ -1381,7 +1570,7 @@ mod tests {
             }),
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
-            unsettled_at_failure: Vec::new(),
+            ended: EndedStreams::default(),
         };
         let stream = StreamId::new(77);
 

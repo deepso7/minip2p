@@ -22,6 +22,16 @@
 //! The Noise XX and Yamux state machines it drives are public as the
 //! [`noise`] and [`yamux`] modules.
 //!
+//! # Memory budgets
+//!
+//! An owner with a memory budget (ADR 0021) passes its ledger to
+//! [`SecureMuxSession::handle_input_within`] and
+//! [`SecureMuxSession::open_stream_within`], which reserve each substream's
+//! receive window before any state exists for it, and releases one window
+//! for each stream [`SecureMuxSession::take_settled_streams`] reports. The
+//! session's own retained storage is
+//! [`SecureMuxSession::fixed_reservation_bytes`].
+//!
 //! Relay circuits and TCP connections differ only in what the byte stream is,
 //! so both drive this same component rather than duplicating the state
 //! machine.
@@ -43,6 +53,6 @@ mod session;
 pub mod yamux;
 
 pub use session::{
-    KEEPALIVE_INTERVAL_MS, SecureMuxSession, SessionConfig, SessionError, SessionOutput,
-    SessionRole, YamuxConfig, YamuxError,
+    KEEPALIVE_INTERVAL_MS, MAX_INPUT_BATCH, NOISE_WIRE_FRAME, SecureMuxSession, SessionConfig,
+    SessionError, SessionOutput, SessionRole, YamuxConfig, YamuxError,
 };

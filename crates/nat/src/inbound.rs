@@ -225,8 +225,9 @@ impl InboundCircuit {
             self.refuse(Status::MalformedMessage, swarm, shared, now);
             return;
         };
-        // Reserved before acceptance: past the circuit limit, refuse.
-        if !shared.reserve_circuit(swarm) {
+        // Reserved before acceptance: past the circuit limit or the host's
+        // circuit memory budget, refuse.
+        if shared.reserve_circuit(swarm).is_err() {
             self.refuse(Status::ResourceLimitExceeded, swarm, shared, now);
             return;
         }
