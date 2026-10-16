@@ -6,13 +6,23 @@ use std::time::{Duration, Instant};
 use super::*;
 use crate::test_peer::{RawPeer, accept, now, server_with_idle_timeout};
 
-/// Datagrams waiting on the peer's socket, discarded unread.
+/// How long the peer's socket must stay empty before [`discard_raw`] stops.
+/// Some loopbacks (macOS) deliver a datagram a little after it was sent.
+const QUIET: Duration = Duration::from_millis(30);
+
+/// Datagrams arriving on the peer's socket until it has been quiet for
+/// [`QUIET`], discarded unread. Leaves the socket non-blocking.
 fn discard_raw(peer: &RawPeer) -> usize {
     let mut buf = [0u8; 65535];
     let mut count = 0;
+    peer.socket.set_nonblocking(false).expect("blocking");
+    peer.socket
+        .set_read_timeout(Some(QUIET))
+        .expect("read timeout");
     while peer.socket.recv_from(&mut buf).is_ok() {
         count += 1;
     }
+    peer.socket.set_nonblocking(true).expect("non-blocking");
     count
 }
 
