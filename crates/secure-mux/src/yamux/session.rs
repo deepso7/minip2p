@@ -210,6 +210,10 @@ pub struct YamuxSession {
     /// Streams the owner's ledger still charges for: those it admitted, less
     /// those [`take_settled_streams`](Self::take_settled_streams) reported.
     charged: usize,
+    /// The ledger [`handle_data`](Self::handle_data) and
+    /// [`open_stream`](Self::open_stream) lend when run without a budget, so
+    /// reservations and releases still meet one ledger.
+    unbudgeted: MemoryLedger,
     next_stream_id: Option<u32>,
     /// Stream events for [`poll_event`](Self::poll_event).
     events: VecDeque<YamuxOutput>,
@@ -265,11 +269,13 @@ impl YamuxSession {
         });
         Self {
             role,
-            decoder: FrameDecoder::new(config.max_frame_len),
+            // A peer may frame up to the credit it was granted.
+            decoder: FrameDecoder::new(config.receive_window),
             config,
             streams: BTreeMap::new(),
             unsettled: BTreeMap::new(),
             charged: 0,
+            unbudgeted: MemoryLedger::unbounded(),
             next_stream_id,
             events: VecDeque::new(),
             control: VecDeque::new(),
@@ -336,7 +342,7 @@ impl YamuxSession {
     /// Runs without a memory budget; an owner with one uses
     /// [`open_stream_within`](Self::open_stream_within).
     pub fn open_stream(&mut self) -> Result<u32, YamuxError> {
-        self.open_stream_within(&mut MemoryLedger::unbounded())
+        self.unbudgeted(Self::open_stream_within)
     }
 
     /// Opens a local stream, reserving its receive window in the owner's
@@ -533,7 +539,16 @@ impl YamuxSession {
     /// Runs without a memory budget; an owner with one uses
     /// [`handle_data_within`](Self::handle_data_within).
     pub fn handle_data(&mut self, bytes: &[u8]) -> Result<(), YamuxError> {
-        self.handle_data_within(bytes, &mut MemoryLedger::unbounded())
+        self.unbudgeted(|session, ledger| session.handle_data_within(bytes, ledger))
+    }
+
+    /// Runs `operation` with the session's own unbounded ledger. A session
+    /// runs either without a budget or with its owner's, never both.
+    fn unbudgeted<R>(&mut self, operation: impl FnOnce(&mut Self, &mut MemoryLedger) -> R) -> R {
+        let mut ledger = core::mem::replace(&mut self.unbudgeted, MemoryLedger::unbounded());
+        let result = operation(self, &mut ledger);
+        self.unbudgeted = ledger;
+        result
     }
 
     /// Feeds ordered bytes, admitting each inbound stream against the
@@ -541,7 +556,10 @@ impl YamuxSession {
     ///
     /// A stream whose receive window does not fit is reset, as one past
     /// [`YamuxConfig::max_streams`] is. Admitted streams stay charged until
-    /// [`take_settled_streams`](Self::take_settled_streams) reports them.
+    /// they settle: an admission returns the windows of streams settled
+    /// since the last report to `ledger` first, and
+    /// [`take_settled_streams`](Self::take_settled_streams) reports the rest.
+    /// Lend the same ledger to every call.
     pub fn handle_data_within(
         &mut self,
         bytes: &[u8],
@@ -668,8 +686,16 @@ impl YamuxSession {
     }
 
     /// Reserves one stream's receive window in `ledger`, if it fits.
+    ///
+    /// Streams settled since the last report give their windows back to
+    /// `ledger` first, so a stream that settled earlier in the same input
+    /// frees room for the next; [`take_settled_streams`](Self::take_settled_streams)
+    /// then reports only later settlements. The owner must lend the same
+    /// ledger every time.
     fn admit(&mut self, ledger: &mut MemoryLedger) -> bool {
-        let admitted = ledger.reserve(self.config.receive_window as usize);
+        let window = self.config.receive_window as usize;
+        ledger.release(self.take_settled_streams() * window);
+        let admitted = ledger.reserve(window);
         self.charged += usize::from(admitted);
         admitted
     }
@@ -2071,16 +2097,16 @@ mod tests {
 
     #[test]
     fn receive_window_violation_emits_protocol_go_away() {
+        // Each frame fits the decoder's limit; together they exceed the
+        // stream's credit.
         let mut server = spec_session(YamuxRole::Server);
-        let oversized = Frame::data(
-            1,
-            FLAG_SYN,
-            alloc::vec![0; DEFAULT_RECEIVE_WINDOW as usize + 1],
-        )
-        .unwrap()
-        .encode();
+        let full = Frame::data(1, FLAG_SYN, alloc::vec![0; DEFAULT_RECEIVE_WINDOW as usize])
+            .unwrap()
+            .encode();
+        server.handle_data(&full).unwrap();
+        let over = Frame::data(1, 0, alloc::vec![0; 1]).unwrap().encode();
         assert_eq!(
-            server.handle_data(&oversized),
+            server.handle_data(&over),
             Err(YamuxError::ReceiveWindowExceeded { stream: 1 })
         );
         let go_away = decode(&outbound(&mut server));
@@ -2351,6 +2377,29 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_settled_earlier_in_the_same_input_frees_room_for_the_next() {
+        let mut ledger = ledger_for(1);
+        let mut client = spec_session(YamuxRole::Client);
+        let open = Frame::window_update(2, FLAG_SYN, 0).unwrap().encode();
+        client.handle_data_within(&open, &mut ledger).unwrap();
+        client.poll_events();
+
+        // The idle stream's reset and the next stream's open, in one read.
+        let mut packed = Frame::data(2, FLAG_RST, Vec::new()).unwrap().encode();
+        packed.extend_from_slice(&Frame::window_update(4, FLAG_SYN, 0).unwrap().encode());
+        client.handle_data_within(&packed, &mut ledger).unwrap();
+        assert!(
+            client
+                .poll_events()
+                .contains(&YamuxOutput::IncomingStream { stream: 4 }),
+            "the reset stream's window admits the next one"
+        );
+        assert_eq!(client.take_settled_streams(), 0, "released once, inside");
+        assert_eq!(ledger.reserved(), DEFAULT_RECEIVE_WINDOW as usize);
+        assert_eq!(client.held_streams(), 1);
+    }
+
+    #[test]
     fn a_local_open_that_does_not_fit_the_ledger_is_refused() {
         let mut ledger = ledger_for(1);
         let mut client = spec_session(YamuxRole::Client);
@@ -2448,6 +2497,30 @@ mod tests {
         );
         client.reset(2).unwrap();
         assert_eq!(client.take_settled_streams(), 1);
+    }
+
+    #[test]
+    fn a_frame_as_large_as_the_granted_credit_is_accepted() {
+        // The default grants 2,432 KiB, more than `max_frame_len`: a peer
+        // that frames up to its credit must not fail the session.
+        let mut client = YamuxSession::new(YamuxRole::Client);
+        let open = Frame::window_update(2, FLAG_SYN, 0).unwrap().encode();
+        client.handle_data(&open).unwrap();
+        while client.poll_frame().is_some() {}
+        let window = YamuxConfig::default().receive_window as usize;
+        assert!(window > YamuxConfig::default().max_frame_len as usize);
+
+        let frame = Frame::data(2, 0, vec![7; window]).unwrap().encode();
+        client.handle_data(&frame).unwrap();
+        let delivered: usize = client
+            .poll_events()
+            .iter()
+            .map(|event| match event {
+                YamuxOutput::Data { data, .. } => data.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(delivered, window);
     }
 
     #[test]

@@ -171,6 +171,9 @@ pub struct SecureMuxSession {
     writes: WriteQueue,
     /// What Yamux's streams still hold, kept when a fatal error dropped it.
     ended: EndedStreams,
+    /// The ledger [`handle_input`](Self::handle_input) and
+    /// [`open_stream`](Self::open_stream) lend when run without a budget.
+    unbudgeted: MemoryLedger,
 }
 
 /// Yamux's stream accounting, kept when a fatal error dropped the session.
@@ -253,6 +256,7 @@ impl SecureMuxSession {
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
             ended: EndedStreams::default(),
+            unbudgeted: MemoryLedger::unbounded(),
         }
     }
 
@@ -274,7 +278,16 @@ impl SecureMuxSession {
     /// Feeds bytes read from the underlying stream, without a memory budget;
     /// an owner with one uses [`handle_input_within`](Self::handle_input_within).
     pub fn handle_input(&mut self, data: Vec<u8>) -> Result<(), SessionError> {
-        self.handle_input_within(data, &mut MemoryLedger::unbounded())
+        self.unbudgeted(|session, ledger| session.handle_input_within(data, ledger))
+    }
+
+    /// Runs `operation` with the session's own unbounded ledger. A session
+    /// runs either without a budget or with its owner's, never both.
+    fn unbudgeted<R>(&mut self, operation: impl FnOnce(&mut Self, &mut MemoryLedger) -> R) -> R {
+        let mut ledger = core::mem::replace(&mut self.unbudgeted, MemoryLedger::unbounded());
+        let result = operation(self, &mut ledger);
+        self.unbudgeted = ledger;
+        result
     }
 
     /// Feeds bytes read from the underlying stream, admitting each inbound
@@ -404,23 +417,25 @@ impl SecureMuxSession {
     /// - twice Yamux's total send cap, since a queued write may pin a slice
     ///   of its caller's payload twice its counted length (ADR 0012);
     /// - its write queue: the larger of the handshake backlog and one
-    ///   encrypted Yamux frame of `max_frame_len`;
+    ///   encrypted Yamux frame of `max_frame_len`, the largest it sends;
     /// - its decoders: a partial Noise frame plus one
-    ///   [`MAX_INPUT_BATCH`], and a partial Yamux frame plus one Noise
-    ///   plaintext;
+    ///   [`MAX_INPUT_BATCH`], and a partial Yamux frame of up to
+    ///   `receive_window`, the largest it accepts, plus one Noise plaintext;
     /// - the control replies a peer may provoke without reading them:
     ///   [`YamuxConfig::max_pending_control`] header-only frames.
     ///
     /// Container overhead, allocator slack and temporary copies are not
     /// counted. Saturates rather than overflowing.
     pub fn fixed_reservation_bytes(config: &YamuxConfig) -> usize {
-        let yamux_frame = (config.max_frame_len as usize).saturating_add(crate::yamux::HEADER_LEN);
+        let header = crate::yamux::HEADER_LEN;
+        let sent_frame = (config.max_frame_len as usize).saturating_add(header);
+        let received_frame = (config.receive_window as usize).saturating_add(header);
         config
             .max_total_buffered_send
             .saturating_mul(2)
-            .saturating_add(encrypted_len(yamux_frame).max(MAX_HANDSHAKE_BACKLOG))
+            .saturating_add(encrypted_len(sent_frame).max(MAX_HANDSHAKE_BACKLOG))
             .saturating_add(NOISE_WIRE_FRAME + MAX_INPUT_BATCH)
-            .saturating_add(yamux_frame)
+            .saturating_add(received_frame)
             .saturating_add(crate::noise::MAX_TRANSPORT_PLAINTEXT)
             .saturating_add(
                 config
@@ -466,7 +481,7 @@ impl SecureMuxSession {
 
     /// Opens an outbound substream.
     pub fn open_stream(&mut self) -> Result<StreamId, SessionError> {
-        self.open_stream_within(&mut MemoryLedger::unbounded())
+        self.unbudgeted(Self::open_stream_within)
     }
 
     /// Opens an outbound substream, reserving its receive window in the
@@ -1278,6 +1293,7 @@ mod tests {
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
             ended: EndedStreams::default(),
+            unbudgeted: MemoryLedger::unbounded(),
         };
         let proposals = b"\x13/multistream/1.0.0\n\x0d/mplex/6.7.0\n\x0d/yamux/1.0.0\n".to_vec();
         initiator_noise
@@ -1374,6 +1390,7 @@ mod tests {
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
             ended: EndedStreams::default(),
+            unbudgeted: MemoryLedger::unbounded(),
         };
 
         let mut packed = echo;
@@ -1509,6 +1526,7 @@ mod tests {
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
             ended: EndedStreams::default(),
+            unbudgeted: MemoryLedger::unbounded(),
         };
 
         session
@@ -1546,6 +1564,7 @@ mod tests {
             outputs: VecDeque::from([SessionOutput::StreamWritable { stream }]),
             writes: WriteQueue::default(),
             ended: EndedStreams::default(),
+            unbudgeted: MemoryLedger::unbounded(),
         };
 
         session.go_away(0).expect("go away");
@@ -1578,6 +1597,7 @@ mod tests {
             outputs: VecDeque::new(),
             writes: WriteQueue::default(),
             ended: EndedStreams::default(),
+            unbudgeted: MemoryLedger::unbounded(),
         };
         let stream = StreamId::new(77);
 

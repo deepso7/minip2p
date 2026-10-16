@@ -202,10 +202,9 @@ impl Default for CircuitLimits {
     fn default() -> Self {
         Self {
             yamux: YamuxConfig::default(),
-            // At least 64 circuits with a stream each (ADR 0021): 10.26 MiB
-            // fixed plus a 2,432 KiB window is 12.6 MiB, so 896 MiB admits
-            // 70.
-            memory_budget_bytes: 896 * 1024 * 1024,
+            // At least 64 circuits with a stream each (ADR 0021): 11.64 MiB
+            // fixed plus a 2,432 KiB window is 14 MiB, so 960 MiB admits 68.
+            memory_budget_bytes: 960 * 1024 * 1024,
         }
     }
 }

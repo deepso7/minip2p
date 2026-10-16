@@ -139,8 +139,8 @@ impl Default for TcpConfig {
             // that a dead one does not hold a connection indefinitely.
             send_stall_timeout_ms: Some(30_000),
             yamux: YamuxConfig::default(),
-            // At least 64 connections with a stream each (ADR 0021): 11.26 MiB
-            // fixed plus a 2,432 KiB window is 13.6 MiB, so 1 GiB admits 75.
+            // At least 64 connections with a stream each (ADR 0021): 12.64 MiB
+            // fixed plus a 2,432 KiB window is 15 MiB, so 1 GiB admits 68.
             memory_budget_bytes: 1024 * 1024 * 1024,
         }
     }

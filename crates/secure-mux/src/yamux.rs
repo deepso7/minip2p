@@ -45,7 +45,7 @@ pub const DEFAULT_RECEIVE_WINDOW: u32 = 256 * 1024;
 /// granted with the first window update.
 const DEFAULT_STREAM_WINDOW: u32 = 2_432 * 1024;
 
-/// Default maximum payload accepted in one inbound data frame (1 MiB).
+/// Default largest payload this side puts in one data frame (1 MiB).
 const DEFAULT_MAX_FRAME_LEN: u32 = 1024 * 1024;
 
 /// Default maximum number of simultaneously tracked streams.
@@ -80,8 +80,13 @@ pub struct YamuxConfig {
     ///
     /// Values below [`DEFAULT_RECEIVE_WINDOW`] are rejected because the peer
     /// is entitled to the specification-defined initial credit.
+    ///
+    /// Also the largest inbound data-frame payload accepted: a peer may frame
+    /// up to the credit it was granted, and anything larger already exceeds
+    /// it, so the decoder rejects it as soon as its header arrives.
     pub receive_window: u32,
-    /// Largest accepted inbound data-frame payload.
+    /// Largest data-frame payload this side sends. Smaller frames let
+    /// streams share the connection more evenly.
     pub max_frame_len: u32,
     /// Maximum number of simultaneously tracked inbound and outbound streams,
     /// counting closed streams that are still unsettled.
