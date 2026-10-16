@@ -120,6 +120,7 @@ EXPECTED_CUSTOM: set[tuple[str, str, str]] = {
         for direction in ("sent", "received")
         for metric in ("datagrams_per_mb", "avg_datagram_bytes")
     },
+    *{("rust-wall", f"endpoint_rtt/{case}/100m_100ms", "mb_per_s") for case in ("quic", "tcp")},
     *{
         ("rust-wall", f"endpoint_ping_load/{load}/{transport}", metric)
         for load in ("idle", "relay", "pubsub")

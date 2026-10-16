@@ -78,10 +78,10 @@ fn a_dual_stack_transport_reserves_both_retry_queues() {
 #[test]
 fn a_connection_reserves_twice_its_send_queue_beside_its_windows() {
     // 2 × 1 MiB queue (a queued slice may pin twice what it counts) +
-    // 2 MiB send window + 3 MiB connection window.
+    // 1216 KiB send window + 5 MiB connection window.
     let limits = QuicLimits::default();
-    assert_eq!(limits.connection_reservation_bytes(), 7 * 1024 * 1024);
-    assert_eq!(limits.stream_reservation_bytes(), 1_000_000);
+    assert_eq!(limits.connection_reservation_bytes(), 8384 * 1024);
+    assert_eq!(limits.stream_reservation_bytes(), 1536 * 1024);
 }
 
 #[test]

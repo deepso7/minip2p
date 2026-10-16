@@ -3,6 +3,9 @@
 # result document. Registers a task-definition revision for BENCH_IMAGE, runs
 # it in the account's default VPC, streams the CloudWatch log back, and
 # decodes the MINIP2P_BENCH_RESULTS marker the container prints on success.
+# With BENCH_SWEEP set, the task runs those emulated-link sweeps instead
+# (scripts/rtt-sweep.sh; `all` for every one) and their logs and JSON lines
+# land in target/bench-artifacts/rtt/.
 set -euo pipefail
 
 : "${AWS_REGION:?AWS_REGION is required}"
@@ -125,8 +128,8 @@ task_arn=$(aws ecs run-task \
   --task-definition "$task_definition" \
   --launch-type FARGATE \
   --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_group],assignPublicIp=ENABLED}" \
-  --overrides "$(jq -cn --arg sha "$BENCH_GIT_SHA" \
-    '{containerOverrides:[{name:"bench",environment:[{name:"BENCH_GIT_SHA",value:$sha}]}]}')" \
+  --overrides "$(jq -cn --arg sha "$BENCH_GIT_SHA" --arg sweep "${BENCH_SWEEP:-}" \
+    '{containerOverrides:[{name:"bench",environment:[{name:"BENCH_GIT_SHA",value:$sha},{name:"BENCH_SWEEP",value:$sweep}]}]}')" \
   --query 'tasks[0].taskArn' --output text)
 if [[ -z "$task_arn" || "$task_arn" == None ]]; then
   echo "ECS did not return a task ARN" >&2
@@ -161,9 +164,12 @@ retrieve_log() {
   done
 }
 
+marker=MINIP2P_BENCH_RESULTS
+[[ -n "${BENCH_SWEEP:-}" ]] && marker=MINIP2P_SWEEP_RESULTS
+
 # Log delivery lags task exit by a few seconds.
 for _ in {1..12}; do
-  if retrieve_log 2>/dev/null && grep -q 'MINIP2P_BENCH_RESULTS=' target/bench-fargate.log; then
+  if retrieve_log 2>/dev/null && grep -q "$marker=" target/bench-fargate.log; then
     break
   fi
   sleep 5
@@ -178,9 +184,15 @@ if [[ "$exit_code" != 0 ]]; then
   exit 1
 fi
 
-encoded=$(sed -n 's/^MINIP2P_BENCH_RESULTS=//p' target/bench-fargate.log | head -n1)
+encoded=$(sed -n "s/^$marker=//p" target/bench-fargate.log | head -n1)
 if [[ -z "$encoded" ]]; then
   echo "benchmark result marker missing from CloudWatch logs" >&2
   exit 1
 fi
-printf '%s' "$encoded" | base64 -d > "$output"
+if [[ -n "${BENCH_SWEEP:-}" ]]; then
+  # A sweep's logs and JSON lines, as target/bench-artifacts/rtt/.
+  mkdir -p target/bench-artifacts
+  printf '%s' "$encoded" | base64 -d | tar -xzf - -C target/bench-artifacts
+else
+  printf '%s' "$encoded" | base64 -d > "$output"
+fi

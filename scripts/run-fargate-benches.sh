@@ -13,6 +13,20 @@ export MINIP2P_BENCH_SETUP_TIMEOUT_SECS=600
 rm -rf target/bench-results
 mkdir -p target/bench-results
 
+# A dispatched sweep (#361) runs only the emulated-link window sweeps and
+# publishes their logs and JSON lines instead of the benchmark rows.
+if [[ -n "${BENCH_SWEEP:-}" ]]; then
+  read -ra sweeps <<< "$BENCH_SWEEP"
+  if ((${#sweeps[@]} == 0)); then
+    echo "BENCH_SWEEP names no sweep" >&2
+    exit 2
+  fi
+  if [[ "${sweeps[0]}" == all ]]; then sweeps=(); fi
+  scripts/rtt-sweep.sh "${sweeps[@]}"
+  printf 'MINIP2P_SWEEP_RESULTS=%s\n' "$(tar -czf - -C target/bench-results rtt | base64 -w0)"
+  exit 0
+fi
+
 scripts/run-benches.sh ir
 scripts/run-benches.sh wall
 pnpm --filter @minip2p/node bench

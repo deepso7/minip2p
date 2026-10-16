@@ -1,10 +1,14 @@
 //! Endpoint setup shared by the Endpoint benches: event helpers, a driver
-//! thread, and the three-Endpoint forced relayed circuit.
+//! thread, the three-Endpoint forced relayed circuit, bulk transfers
+//! ([`bulk`]) and an emulated link ([`delay`]).
 
 #![allow(
     dead_code,
     reason = "each bench compiles this module on its own and uses a subset of it"
 )]
+
+pub mod bulk;
+pub mod delay;
 
 use std::sync::{
     Arc,
