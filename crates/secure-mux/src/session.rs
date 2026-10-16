@@ -407,7 +407,9 @@ impl SecureMuxSession {
     ///   encrypted Yamux frame of `max_frame_len`;
     /// - its decoders: a partial Noise frame plus one
     ///   [`MAX_INPUT_BATCH`], and a partial Yamux frame plus one Noise
-    ///   plaintext.
+    ///   plaintext;
+    /// - the control replies a peer may provoke without reading them:
+    ///   [`YamuxConfig::max_pending_control`] header-only frames.
     ///
     /// Container overhead, allocator slack and temporary copies are not
     /// counted. Saturates rather than overflowing.
@@ -420,6 +422,11 @@ impl SecureMuxSession {
             .saturating_add(NOISE_WIRE_FRAME + MAX_INPUT_BATCH)
             .saturating_add(yamux_frame)
             .saturating_add(crate::noise::MAX_TRANSPORT_PLAINTEXT)
+            .saturating_add(
+                config
+                    .max_pending_control
+                    .saturating_mul(crate::yamux::HEADER_LEN),
+            )
     }
 
     /// Returns whether the upgrade has completed.

@@ -202,7 +202,7 @@ impl Default for CircuitLimits {
     fn default() -> Self {
         Self {
             yamux: YamuxConfig::default(),
-            // At least 64 circuits with a stream each (ADR 0021): 10.25 MiB
+            // At least 64 circuits with a stream each (ADR 0021): 10.26 MiB
             // fixed plus a 2,432 KiB window is 12.6 MiB, so 896 MiB admits
             // 70.
             memory_budget_bytes: 896 * 1024 * 1024,
@@ -542,9 +542,11 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             remote_peer: adoption.remote_peer,
             role: adoption.role,
             session,
+            // Copied, so a short prefix sliced from a larger allocation
+            // cannot keep that allocation alive while the bridge is Full.
             bridge_tail: (!adoption.unsent_prefix.is_empty()).then(|| {
                 let len = adoption.unsent_prefix.len();
-                (adoption.unsent_prefix, len)
+                (Bytes::copy_from_slice(&adoption.unsent_prefix), len)
             }),
         };
 
