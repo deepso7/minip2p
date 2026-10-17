@@ -1,4 +1,5 @@
 //! Standard Endpoint NAT regression tests.
+use crate::ConnectionCloseReason;
 use minip2p_core::Multiaddr;
 use minip2p_core::platform::StdEntropy;
 use minip2p_nat::{NatAction, NatAgent, NatEvent, Now};
@@ -862,6 +863,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
             SwarmEvent::ConnectionClosed {
                 peer_id,
                 conn_id: inner_pair.inner_conn,
+                reason: ConnectionCloseReason::Local,
             }
         };
         inner.ingest(
@@ -879,7 +881,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                minip2p_transport::TransportEvent::Closed { id } if *id == promoted
+                minip2p_transport::TransportEvent::Closed { id, .. } if *id == promoted
             )),
             "replaced={replaced}"
         );
@@ -895,6 +897,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         &SwarmEvent::ConnectionClosed {
             peer_id: Ed25519Keypair::from_secret_key_bytes([73; 32]).peer_id(),
             conn_id: promoted,
+            reason: ConnectionCloseReason::Local,
         },
         circuit_pair.local.core_mut(),
         minip2p_core::platform::Now::from_millis(10),
@@ -936,9 +939,17 @@ fn remote_bridge_reset_closes_promoted_circuit() {
         .reset_stream(pair.relay_conn, pair.stream)
         .expect("reset bridge at relay");
 
+    // The circuit was never established, so its close reaches no one: it
+    // simply leaves the transport.
     let deadline = Instant::now() + std::time::Duration::from_secs(2);
-    let mut circuit_failed = false;
-    while Instant::now() < deadline && !circuit_failed {
+    while Instant::now() < deadline
+        && pair
+            .local
+            .core()
+            .transport()
+            .circuit_ids()
+            .contains(&promoted)
+    {
         match pair
             .relay
             .raw_poll_next(std::time::Duration::from_millis(10))
@@ -951,17 +962,18 @@ fn remote_bridge_reset_closes_promoted_circuit() {
             .raw_poll_next(std::time::Duration::from_millis(10))
             .expect("drive reset receiver")
         {
-            circuit_failed = matches!(
-                &event,
-                SwarmEvent::Error(error) if error.conn_id == Some(promoted)
-            );
             let now = pair.local.now();
             driver.ingest(&event, pair.local.core_mut(), now);
         }
     }
 
     assert!(
-        circuit_failed,
+        !pair
+            .local
+            .core()
+            .transport()
+            .circuit_ids()
+            .contains(&promoted),
         "remote RESET_STREAM did not fail the promoted circuit"
     );
     // The circuit vanished without a lifecycle event the driver saw; the

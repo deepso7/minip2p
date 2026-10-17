@@ -9,6 +9,7 @@ extern crate alloc;
 
 #[cfg(feature = "bench")]
 pub mod bench;
+mod close_reason;
 mod connection_endpoint;
 mod connection_id;
 mod connection_state;
@@ -23,6 +24,7 @@ mod stream_id;
 mod transport;
 mod unsettled;
 
+pub use close_reason::ConnectionCloseReason;
 pub use connection_endpoint::ConnectionEndpoint;
 pub use connection_id::{ConnectionId, ConnectionIdAllocator, ConnectionNamespace};
 pub use connection_state::ConnectionState;

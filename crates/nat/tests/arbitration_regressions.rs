@@ -3,6 +3,7 @@
 mod common;
 
 use common::*;
+use minip2p_swarm::ConnectionCloseReason;
 
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
 use minip2p_nat::{MAX_PUNCH_CANDIDATES, NatConfig, NatEvent, Path, PromoteError, UpgradeStop};
@@ -272,6 +273,7 @@ fn promoted_circuit_closed_before_fallback_fails_the_leg() {
         &SwarmEvent::ConnectionClosed {
             conn_id: conn,
             peer_id: h.target.clone(),
+            reason: ConnectionCloseReason::Local,
         },
         true,
         at(400),
@@ -710,6 +712,7 @@ fn direct_replacement_of_the_provisional_circuit_upgrades_once() {
         &SwarmEvent::ConnectionClosed {
             peer_id: h.target.clone(),
             conn_id: circuit,
+            reason: ConnectionCloseReason::Local,
         },
         false,
         at(410),
@@ -1105,6 +1108,7 @@ fn no_attempt_event_follows_the_engine_settling() {
         &SwarmEvent::ConnectionClosed {
             peer_id: h.target.clone(),
             conn_id: conn,
+            reason: ConnectionCloseReason::Local,
         },
         true,
         at(60_001),

@@ -28,6 +28,7 @@ export {
   Reachability,
   type Bytes,
   type CloseReason,
+  type ConnectionCloseReason,
   type ConnectionInfo,
   type ConnectOptions,
   type ConnectResult,

@@ -91,6 +91,7 @@ impl StreamAcks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ConnectionCloseReason;
     use minip2p_core::{Bytes, PeerId};
 
     fn peer() -> PeerId {
@@ -159,6 +160,7 @@ mod tests {
         acks.pulled(&EndpointEvent::ConnectionClosed {
             peer_id: peer(),
             conn_id: ConnectionId::new(1),
+            reason: ConnectionCloseReason::Local,
         });
         assert!(acks.manual_streams.is_empty());
     }

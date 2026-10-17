@@ -131,11 +131,13 @@ export { EventDrain } from "./event-drain.js";
 export { ConnectionIdMap, u64ToNumber } from "./native-ids.js";
 export { SettleHandles, eventStream } from "./settle-handles.js";
 export {
+  ConnectionCloseReason_Tags,
   P2pEvent_Tags,
   PathKind_Tags,
   type P2pEvent,
   type P2pEventByTag,
   type PathKind,
+  type RawConnectionCloseReason,
 } from "./types.js";
 
 /**

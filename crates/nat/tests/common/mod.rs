@@ -660,7 +660,9 @@ impl FakeSwarm {
                 self.connect(peer_id, *conn_id);
             }
             SwarmEvent::ConnectionReplaced { peer_id, new, .. } => self.connect(peer_id, *new),
-            SwarmEvent::ConnectionClosed { peer_id, conn_id } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id, conn_id, ..
+            } => {
                 if self.connections.get(peer_id) == Some(conn_id) {
                     self.connections.remove(peer_id);
                     self.ready.remove(peer_id);

@@ -1,3 +1,4 @@
+use minip2p_swarm::ConnectionCloseReason;
 use std::str::FromStr;
 
 use gungraun::prelude::*;
@@ -379,6 +380,7 @@ fn with_closed_source(size: u64) -> (Scale, SwarmEvent) {
     let closed = SwarmEvent::ConnectionClosed {
         peer_id: peer("source", 0),
         conn_id: source_conn(size, 0),
+        reason: ConnectionCloseReason::Local,
     };
     (scale_agent(size), closed)
 }
@@ -389,6 +391,7 @@ fn with_closed_destination(size: u64) -> (Scale, SwarmEvent) {
     let closed = SwarmEvent::ConnectionClosed {
         peer_id: peer("reserved", size - 1),
         conn_id: reserved_conn(size - 1),
+        reason: ConnectionCloseReason::Local,
     };
     (scale_agent(size), closed)
 }

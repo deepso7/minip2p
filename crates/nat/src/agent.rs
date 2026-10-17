@@ -812,7 +812,9 @@ impl NatAgent {
                 touched_state = true;
                 self.connection_up(peer_id, *conn_id, is_circuit, swarm, now);
             }
-            SwarmEvent::ConnectionClosed { peer_id, conn_id } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id, conn_id, ..
+            } => {
                 touched_state = true;
                 self.forget_connection(peer_id, *conn_id);
                 self.notify_connection_down(peer_id, *conn_id, swarm, now);

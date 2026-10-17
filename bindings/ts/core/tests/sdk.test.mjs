@@ -5,7 +5,11 @@ import assert from "node:assert/strict";
 import { MockBackend } from "@minip2p/test-fixtures";
 import { test, vi } from "vitest";
 
-import { P2pEvent_Tags, PathKind_Tags } from "../src/backend.ts";
+import {
+  ConnectionCloseReason_Tags,
+  P2pEvent_Tags,
+  PathKind_Tags,
+} from "../src/backend.ts";
 import {
   AbortError,
   ClosedError,
@@ -211,6 +215,40 @@ test("await using falls back to Symbol.dispose", async () => {
   }
 
   assert.equal(backend.closed, true);
+});
+
+const LOCAL_CLOSE = { tag: ConnectionCloseReason_Tags.Local };
+
+test("connection closes carry their reason", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const reasons = [];
+  endpoint.on("connectionClosed", ({ reason }) => reasons.push(reason));
+
+  for (const [connId, reason] of [
+    [
+      1,
+      {
+        inner: { code: 2n ** 62n - 1n },
+        tag: ConnectionCloseReason_Tags.Remote,
+      },
+    ],
+    [2, { tag: ConnectionCloseReason_Tags.TimedOut }],
+    [3, { inner: { message: "boom" }, tag: ConnectionCloseReason_Tags.Error }],
+  ]) {
+    backend.emit({
+      inner: { connId, peerId: "peer", reason },
+      tag: P2pEvent_Tags.ConnectionClosed,
+    });
+  }
+  await tick();
+
+  assert.deepEqual(reasons, [
+    { code: 2n ** 62n - 1n, kind: "remote" },
+    { kind: "timedOut" },
+    { kind: "error", message: "boom" },
+  ]);
+  endpoint.close();
 });
 
 test("inbound relayed path events preserve relay provenance", async () => {
@@ -969,7 +1007,10 @@ test("peer streams that close without data before dispatch leave the queue whole
 });
 
 function connectionEvent(tag, connId) {
-  return { inner: { connId, peerId: "peer" }, tag };
+  const inner = { connId, peerId: "peer" };
+  return tag === P2pEvent_Tags.ConnectionClosed
+    ? { inner: { ...inner, reason: LOCAL_CLOSE }, tag }
+    : { inner, tag };
 }
 
 test("connections that end unseen without data leave the queue whole", async () => {
@@ -1397,7 +1438,7 @@ test("pending stream read rejects when its connection closes", async () => {
   const reading = stream.read();
 
   backend.emit({
-    inner: { connId: 2, peerId: "peer" },
+    inner: { connId: 2, peerId: "peer", reason: LOCAL_CLOSE },
     tag: P2pEvent_Tags.ConnectionClosed,
   });
 
@@ -1461,7 +1502,7 @@ test("endpoint and connection closure override remote write EOF", async () => {
       await assert.rejects(stream.read(), ClosedError);
     } else {
       backend.emit({
-        inner: { connId: 2, peerId: "peer" },
+        inner: { connId: 2, peerId: "peer", reason: LOCAL_CLOSE },
         tag: P2pEvent_Tags.ConnectionClosed,
       });
       await tick();
@@ -1752,7 +1793,7 @@ test("openStream rejects close and disconnect before ready", async () => {
     timeoutMs: 1000,
   });
   backend.emit({
-    inner: { connId: 2, peerId: "peer" },
+    inner: { connId: 2, peerId: "peer", reason: LOCAL_CLOSE },
     tag: P2pEvent_Tags.ConnectionClosed,
   });
   await assert.rejects(disconnected, PeerDisconnectedError);
@@ -1771,7 +1812,7 @@ test("connection close rejects only opens on that connection", async () => {
   const live = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
 
   backend.emit({
-    inner: { connId: 2, peerId: "peer" },
+    inner: { connId: 2, peerId: "peer", reason: LOCAL_CLOSE },
     tag: P2pEvent_Tags.ConnectionClosed,
   });
 
@@ -1866,13 +1907,13 @@ test("waitPeerReady rejects only once the peer is disconnected", async () => {
 
   // A stale close from before the peer reconnected.
   backend.emit({
-    inner: { connId: 1, peerId: "peer" },
+    inner: { connId: 1, peerId: "peer", reason: LOCAL_CLOSE },
     tag: P2pEvent_Tags.ConnectionClosed,
   });
   assert.equal(await remainsPending(disconnected), true);
   backend.connected = [];
   backend.emit({
-    inner: { connId: 2, peerId: "peer" },
+    inner: { connId: 2, peerId: "peer", reason: LOCAL_CLOSE },
     tag: P2pEvent_Tags.ConnectionClosed,
   });
   await assert.rejects(disconnected, PeerDisconnectedError);

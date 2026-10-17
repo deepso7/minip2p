@@ -1021,6 +1021,7 @@ mod tests {
         P2pEvent::ConnectionClosed {
             peer_id: "peer".into(),
             conn_id,
+            reason: crate::ConnectionCloseReason::Local,
         }
     }
 

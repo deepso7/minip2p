@@ -22,7 +22,9 @@ pub use minip2p_swarm::{
     SwarmEvent,
     SwarmRuntimeError,
 };
-pub use minip2p_transport::{ConnectionId, InvalidLimit, StreamId, Transport, TransportError};
+pub use minip2p_transport::{
+    ConnectionCloseReason, ConnectionId, InvalidLimit, StreamId, Transport, TransportError,
+};
 
 pub(crate) mod connect;
 pub use connect::{
@@ -1374,7 +1376,10 @@ mod tests {
 
         fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
             self.closed.set(true);
-            self.events.push(TransportEvent::Closed { id });
+            self.events.push(TransportEvent::Closed {
+                id,
+                reason: ConnectionCloseReason::Local,
+            });
             Ok(())
         }
 
@@ -1434,6 +1439,7 @@ mod tests {
         let other = EndpointEvent::ConnectionClosed {
             peer_id: peer.clone(),
             conn_id: ConnectionId::new(2),
+            reason: ConnectionCloseReason::Local,
         };
         endpoint.engine.events.extend([
             EndpointEvent::StreamData {

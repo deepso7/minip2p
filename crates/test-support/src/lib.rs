@@ -15,8 +15,8 @@ use minip2p_relay::{
 };
 use minip2p_transport::mio::{Registry, Waker, event::Event};
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, PollSource, StreamId, TokenSpace, Transport, TransportError,
-    TransportEvent,
+    ConnectionCloseReason, ConnectionEndpoint, ConnectionId, PollSource, StreamId, TokenSpace,
+    Transport, TransportError, TransportEvent,
 };
 
 /// Deterministic, connected, in-memory implementation of the transport contract.
@@ -391,9 +391,14 @@ impl Transport for InMemoryTransport {
         shared.unacked = [HashMap::new(), HashMap::new()];
         shared
             .queue_mut(self.side)
-            .push_back(TransportEvent::Closed { id });
+            .push_back(TransportEvent::Closed {
+                id,
+                reason: ConnectionCloseReason::Local,
+            });
+        // The far side sees an orderly close, as from a Yamux `GoAway`.
         shared.queue_mut(other).push_back(TransportEvent::Closed {
             id: self.connection,
+            reason: ConnectionCloseReason::Remote { code: 0 },
         });
         Ok(())
     }
@@ -902,11 +907,17 @@ mod tests {
         assert!(b.active_inbound_connection_sources().is_empty());
         assert_eq!(
             a.poll(Now::from_millis(0)).unwrap(),
-            [TransportEvent::Closed { id }]
+            [TransportEvent::Closed {
+                id,
+                reason: ConnectionCloseReason::Local
+            }]
         );
         assert_eq!(
             b.poll(Now::from_millis(0)).unwrap(),
-            [TransportEvent::Closed { id }]
+            [TransportEvent::Closed {
+                id,
+                reason: ConnectionCloseReason::Remote { code: 0 }
+            }]
         );
         assert!(a.poll(Now::from_millis(0)).unwrap().is_empty());
         assert!(b.poll(Now::from_millis(0)).unwrap().is_empty());

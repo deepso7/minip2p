@@ -192,6 +192,19 @@ export type Path =
   | { readonly kind: "directPunched" }
   | { readonly kind: "relayed"; readonly relayPeerId: string };
 
+/**
+ * Why one connection ended. `remote` carries the peer's close code: its QUIC
+ * CONNECTION_CLOSE code, or its Yamux GoAway code over TCP and relay
+ * circuits. `timedOut` means the peer went silent, `stalled` that it stopped
+ * reading.
+ */
+export type ConnectionCloseReason =
+  | { readonly kind: "local" }
+  | { readonly kind: "remote"; readonly code: bigint }
+  | { readonly kind: "timedOut" }
+  | { readonly kind: "stalled" }
+  | { readonly kind: "error"; readonly message: string };
+
 /** Serializable metadata for an inbound stream catch-all event. */
 export interface InboundStreamMeta {
   readonly peerId: string;
@@ -214,8 +227,16 @@ export interface Minip2pNamedEventMap {
   };
   /** A peer went from disconnected to connected on `connId`. */
   connectionEstablished: { readonly peerId: string; readonly connId: number };
-  /** The peer's last connection closed; the peer is now disconnected. */
-  connectionClosed: { readonly peerId: string; readonly connId: number };
+  /**
+   * The peer's last connection closed, for `reason`; the peer is now
+   * disconnected. A failure that ended it is its `reason`, never also an
+   * `endpointError`.
+   */
+  connectionClosed: {
+    readonly peerId: string;
+    readonly connId: number;
+    readonly reason: ConnectionCloseReason;
+  };
   /**
    * A newer connection took the peer's single connection slot from
    * `oldConnId`. The peer stays connected: this stands in for both a
@@ -479,6 +500,27 @@ export type PathKind =
       readonly inner: { readonly relayPeerId: string };
     };
 
+/** Raw backend-only connection close reason tags. */
+export const ConnectionCloseReason_Tags = {
+  Error: "Error",
+  Local: "Local",
+  Remote: "Remote",
+  Stalled: "Stalled",
+  TimedOut: "TimedOut",
+} as const;
+export type RawConnectionCloseReason =
+  | { readonly tag: typeof ConnectionCloseReason_Tags.Local }
+  | {
+      readonly tag: typeof ConnectionCloseReason_Tags.Remote;
+      readonly inner: { readonly code: bigint };
+    }
+  | { readonly tag: typeof ConnectionCloseReason_Tags.TimedOut }
+  | { readonly tag: typeof ConnectionCloseReason_Tags.Stalled }
+  | {
+      readonly tag: typeof ConnectionCloseReason_Tags.Error;
+      readonly inner: { readonly message: string };
+    };
+
 /** Raw backend-only event tags. */
 export const P2pEvent_Tags = {
   ConnectCancelled: "ConnectCancelled",
@@ -547,7 +589,7 @@ export type P2pEvent =
     >
   | RawEvent<
       typeof P2pEvent_Tags.ConnectionClosed,
-      { peerId: string; connId: number }
+      { peerId: string; connId: number; reason: RawConnectionCloseReason }
     >
   | RawEvent<
       typeof P2pEvent_Tags.ConnectionReplaced,

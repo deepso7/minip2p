@@ -1,8 +1,9 @@
 //! Binding-agnostic event model and upstream event conversion.
 
 use minip2p::{
-    ConnectFailure, ConnectOutcome, DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource,
-    EndpointEvent, GossipsubEvent, IdentifyMessage, Multiaddr, NatEvent, Path, ReachabilityState,
+    ConnectFailure, ConnectOutcome, ConnectionCloseReason as UpstreamConnectionCloseReason,
+    DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource, EndpointEvent, GossipsubEvent,
+    IdentifyMessage, Multiaddr, NatEvent, Path, ReachabilityState,
 };
 use minip2p_swarm::SwarmErrorKind;
 
@@ -107,6 +108,50 @@ pub enum PathKind {
         /// Relay carrying the circuit.
         relay_peer_id: String,
     },
+}
+
+/// Why one connection ended; see `minip2p::ConnectionCloseReason`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(tag = "tag", content = "inner", rename_all_fields = "camelCase")
+)]
+pub enum ConnectionCloseReason {
+    /// We closed it.
+    Local,
+    /// The peer closed it with `code`: its QUIC CONNECTION_CLOSE code, or
+    /// its Yamux `GoAway` code on TCP and relay circuits.
+    Remote {
+        /// The peer's close code.
+        code: u64,
+    },
+    /// The peer went silent (an idle, keepalive or handshake timeout).
+    TimedOut,
+    /// The peer stopped reading (a TCP send stall).
+    Stalled,
+    /// Anything else that ended it.
+    Error {
+        /// Human-readable description.
+        message: String,
+    },
+}
+
+impl From<UpstreamConnectionCloseReason> for ConnectionCloseReason {
+    fn from(reason: UpstreamConnectionCloseReason) -> Self {
+        match reason {
+            UpstreamConnectionCloseReason::Local => Self::Local,
+            UpstreamConnectionCloseReason::Remote { code } => Self::Remote { code },
+            UpstreamConnectionCloseReason::TimedOut => Self::TimedOut,
+            UpstreamConnectionCloseReason::Stalled => Self::Stalled,
+            UpstreamConnectionCloseReason::Error(message) => Self::Error { message },
+            // A reason this binding does not know yet keeps its description.
+            other => Self::Error {
+                message: other.to_string(),
+            },
+        }
+    }
 }
 
 /// Source that contributed a discovery observation.
@@ -239,6 +284,9 @@ pub enum P2pEvent {
         peer_id: String,
         /// Endpoint-local transport connection id.
         conn_id: u64,
+        /// Why it closed. A failure that ended it is reported here, not as
+        /// a separate `EndpointError`.
+        reason: ConnectionCloseReason,
     },
     /// A newer connection took the peer's single connection slot from
     /// `old_conn_id`.
@@ -586,9 +634,14 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
                 conn_id: conn_id.as_u64(),
             }
         }
-        EndpointEvent::ConnectionClosed { peer_id, conn_id } => P2pEvent::ConnectionClosed {
+        EndpointEvent::ConnectionClosed {
+            peer_id,
+            conn_id,
+            reason,
+        } => P2pEvent::ConnectionClosed {
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
+            reason: reason.into(),
         },
         EndpointEvent::ConnectionReplaced { peer_id, old, new } => P2pEvent::ConnectionReplaced {
             peer_id: peer_id.to_base58(),

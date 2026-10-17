@@ -932,7 +932,9 @@ impl QuicTransport {
         let kept = self.unsettled.streams() - held;
         self.budget.release_connection();
         self.budget.release_streams(conn.stream_count() - kept);
-        self.pending_events.push(TransportEvent::Closed { id });
+        let reason = conn.close_reason();
+        self.pending_events
+            .push(TransportEvent::Closed { id, reason });
     }
 
     /// Settles held streams of ended connections through `settle`, releasing
@@ -956,7 +958,7 @@ impl QuicTransport {
         // Nothing was reported for it; the caller learns from the error.
         self.pending_events.retain(|event| match event {
             TransportEvent::Error { id: event_id, .. }
-            | TransportEvent::Closed { id: event_id } => *event_id != id,
+            | TransportEvent::Closed { id: event_id, .. } => *event_id != id,
             _ => true,
         });
     }

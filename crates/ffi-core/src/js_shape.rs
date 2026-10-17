@@ -3,8 +3,9 @@
 //! The event, path and snapshot types serialize to the one public JS shape
 //! the TypeScript SDK consumes:
 //!
-//! - events and paths are `{ tag, inner }` objects, `tag` being the Rust
-//!   variant name; a variant without fields has no `inner`;
+//! - events, paths and connection close reasons are `{ tag, inner }`
+//!   objects, `tag` being the Rust variant name; a variant without fields
+//!   has no `inner`;
 //! - fields are camelCase;
 //! - `None` fields are omitted rather than `null`, matching optional (`?:`)
 //!   TypeScript properties;
@@ -34,8 +35,8 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        ConnectionInfo, DiscoverySource, EndpointErrorKind, IdentifyInfo, KnownPeerInfo,
-        OpenStreamResult, P2pEvent, PathKind, Reachability, RelayReservationInfo,
+        ConnectionCloseReason, ConnectionInfo, DiscoverySource, EndpointErrorKind, IdentifyInfo,
+        KnownPeerInfo, OpenStreamResult, P2pEvent, PathKind, Reachability, RelayReservationInfo,
     };
 
     fn js<T: serde::Serialize>(value: &T) -> serde_json::Value {
@@ -140,6 +141,25 @@ mod tests {
                     "to": { "tag": "DirectPunched" },
                     "oldConnId": 1,
                     "newConnId": 2,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn close_reasons_nest_as_tagged_values() {
+        assert_eq!(
+            js(&P2pEvent::ConnectionClosed {
+                peer_id: "peer".into(),
+                conn_id: 1,
+                reason: ConnectionCloseReason::Remote { code: 2 },
+            }),
+            json!({
+                "tag": "ConnectionClosed",
+                "inner": {
+                    "peerId": "peer",
+                    "connId": 1,
+                    "reason": { "tag": "Remote", "inner": { "code": 2 } },
                 },
             })
         );

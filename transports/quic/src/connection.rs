@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, ConnectionState, ConnectionToken, StreamId, TransportError,
-    TransportEvent,
+    ConnectionCloseReason, ConnectionEndpoint, ConnectionId, ConnectionState, ConnectionToken,
+    StreamId, TransportError, TransportEvent,
 };
 use quinn_proto::{
     ConnectionError, ConnectionHandle, Dir, Event, FinishError, ReadError, StreamEvent, VarInt,
@@ -207,6 +207,9 @@ pub(crate) struct QuicConnection {
     /// Connection endpoint metadata (transport address + optional peer id).
     endpoint: ConnectionEndpoint,
     state: ConnectionState,
+    /// Why the connection is ending: the first cause seen, reported on its
+    /// `Closed`.
+    close_reason: Option<ConnectionCloseReason>,
     /// Per-stream runtime state keyed by raw QUIC stream id. Each entry holds
     /// one stream's memory reservation.
     stream_states: HashMap<u64, StreamRuntimeState>,
@@ -275,6 +278,7 @@ impl QuicConnection {
             conn,
             endpoint,
             state: ConnectionState::Connecting,
+            close_reason: None,
             stream_states: HashMap::new(),
             send_queues: HashMap::new(),
             send_order: VecDeque::new(),
@@ -314,6 +318,15 @@ impl QuicConnection {
     /// tracks.
     pub(crate) fn stream_count(&self) -> usize {
         self.stream_states.len()
+    }
+
+    /// Why the connection ended, for its `Closed`.
+    pub(crate) fn close_reason(&self) -> ConnectionCloseReason {
+        // Every cause records itself; a connection drained without one was
+        // ended on our side.
+        self.close_reason
+            .clone()
+            .unwrap_or(ConnectionCloseReason::Local)
     }
 
     /// Whether the engine is done with this connection, which the transport
@@ -417,7 +430,7 @@ impl QuicConnection {
                 progressed = true;
                 self.on_event(event, now, cx);
             }
-            self.bind_pending_opens(now, cx.events);
+            self.bind_pending_opens(now);
             self.drain_send_queues(now, cx.events);
             // Endpoint events (new connection ids, retirements, the final
             // `Drained`) go out before the transmit below, so their output
@@ -480,7 +493,7 @@ impl QuicConnection {
     fn on_event(&mut self, event: Event, now: Instant, cx: &mut Cx<'_>) {
         match event {
             Event::Connected => self.on_connected(now, cx),
-            Event::ConnectionLost { reason } => self.on_lost(&reason, cx.events),
+            Event::ConnectionLost { reason } => self.on_lost(&reason),
             Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
                 self.accept_streams(cx.budget, cx.events);
             }
@@ -492,7 +505,7 @@ impl QuicConnection {
                 self.on_stopped(u64::from(id), error_code, cx.events);
             }
             Event::Stream(StreamEvent::Available { dir: Dir::Bi }) => {
-                self.bind_pending_opens(now, cx.events);
+                self.bind_pending_opens(now);
             }
             // Unidirectional streams are never granted, half-close is the
             // adapter's own bookkeeping, and DATAGRAM is not advertised.
@@ -508,11 +521,7 @@ impl QuicConnection {
     fn on_connected(&mut self, now: Instant, cx: &mut Cx<'_>) {
         let identity = self.conn.crypto_session().peer_identity();
         let Some(peer_id) = crate::tls::peer_id_from_identity(identity) else {
-            self.fail_connection(
-                now,
-                "peer identity unavailable after the handshake".into(),
-                cx.events,
-            );
+            self.fail_connection(now, "peer identity unavailable after the handshake".into());
             return;
         };
         let mut token = [0u8; 32];
@@ -543,27 +552,21 @@ impl QuicConnection {
         }
     }
 
-    /// The engine lost the connection; `Closed` follows once it drains.
-    ///
-    /// Orderly closes report no `Error`, and neither do an idle timeout or a
-    /// stateless reset of an established connection: those are routine ends
-    /// that the swarm would otherwise surface as errors. While handshaking
-    /// every reason is reported, so a failed dial carries it.
-    fn on_lost(&mut self, reason: &ConnectionError, events: &mut Vec<TransportEvent>) {
-        let established = self.state == ConnectionState::Connected;
-        let orderly = match reason {
-            ConnectionError::LocallyClosed => true,
-            ConnectionError::ApplicationClosed(close) => close.error_code == VarInt::from_u32(0),
-            ConnectionError::ConnectionClosed(close) => u64::from(close.error_code) == 0,
-            ConnectionError::TimedOut | ConnectionError::Reset => established,
-            _ => false,
+    /// The engine lost the connection; `Closed` follows once it drains,
+    /// carrying the loss as its reason unless an earlier cause was recorded.
+    fn on_lost(&mut self, reason: &ConnectionError) {
+        let reason = match reason {
+            ConnectionError::LocallyClosed => ConnectionCloseReason::Local,
+            ConnectionError::ApplicationClosed(close) => ConnectionCloseReason::Remote {
+                code: close.error_code.into_inner(),
+            },
+            ConnectionError::ConnectionClosed(close) => ConnectionCloseReason::Remote {
+                code: u64::from(close.error_code),
+            },
+            ConnectionError::TimedOut => ConnectionCloseReason::TimedOut,
+            other => ConnectionCloseReason::Error(other.to_string()),
         };
-        if !orderly {
-            events.push(TransportEvent::Error {
-                id: self.id,
-                message: reason.to_string(),
-            });
-        }
+        self.close_reason.get_or_insert(reason);
         self.end_writes();
         self.state = ConnectionState::Closed;
     }
@@ -729,7 +732,7 @@ impl QuicConnection {
     }
 
     /// Opens pending streams in the engine, in order, as peer credit allows.
-    fn bind_pending_opens(&mut self, now: Instant, events: &mut Vec<TransportEvent>) {
+    fn bind_pending_opens(&mut self, now: Instant) {
         while !self.pending_opens.is_empty() {
             let Some(stream) = self.conn.streams().open(Dir::Bi) else {
                 return;
@@ -743,7 +746,6 @@ impl QuicConnection {
                 self.fail_connection(
                     now,
                     format!("engine opened stream {raw} where {} was expected", open.id),
-                    events,
                 );
                 return;
             }
@@ -1038,6 +1040,8 @@ impl QuicConnection {
         }
         self.conn
             .close(now, VarInt::from_u32(0), Bytes::from_static(b"bye"));
+        self.close_reason
+            .get_or_insert(ConnectionCloseReason::Local);
         self.state = ConnectionState::Closing;
         self.end_writes();
     }
@@ -1101,7 +1105,6 @@ impl QuicConnection {
                         self.fail_connection(
                             now,
                             format!("finish failed on {}: closed stream", StreamId::new(raw)),
-                            events,
                         );
                         return progressed;
                     }
@@ -1141,7 +1144,6 @@ impl QuicConnection {
                         self.fail_connection(
                             now,
                             format!("write failed on {}: closed stream", StreamId::new(raw)),
-                            events,
                         );
                         return progressed;
                     }
@@ -1234,16 +1236,15 @@ impl QuicConnection {
     }
 
     /// Closes this connection after an error the engine did not scope to a
-    /// single stream. `Closed` follows once the engine drains.
+    /// single stream. `Closed` follows once the engine drains, with the
+    /// error as its reason.
     ///
     /// Every queued write is dropped so later drains cannot hit the same
     /// error again.
-    fn fail_connection(&mut self, now: Instant, message: String, events: &mut Vec<TransportEvent>) {
+    fn fail_connection(&mut self, now: Instant, message: String) {
         self.end_writes();
-        events.push(TransportEvent::Error {
-            id: self.id,
-            message,
-        });
+        self.close_reason
+            .get_or_insert(ConnectionCloseReason::Error(message));
         // 1 is QUIC's INTERNAL_ERROR.
         self.conn.close(
             now,

@@ -5,6 +5,7 @@
 //! `QuicTransport`, so a test can send STOP_SENDING without resetting the read
 //! half and can shape the flow-control and stream credit it grants.
 
+use minip2p_transport::ConnectionCloseReason;
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -120,7 +121,12 @@ fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
         &mut [&mut stopper],
         &mut events,
         "idle timeout of the other connection",
-        |events| events.contains(&TransportEvent::Closed { id: silent_id }),
+        |events| {
+            events.contains(&TransportEvent::Closed {
+                id: silent_id,
+                reason: ConnectionCloseReason::TimedOut,
+            })
+        },
     );
     let stops = events
         .iter()
@@ -342,22 +348,35 @@ fn connection_fatal_send_error_closes_only_that_connection() {
         &mut events,
         "faulty connection close",
         |events| {
-            events.contains(&TransportEvent::Closed { id: faulty_id })
+            events
+                .iter()
+                .any(|event| matches!(event, TransportEvent::Closed { id, .. } if *id == faulty_id))
                 && events
                     .iter()
                     .any(|event| matches!(event, TransportEvent::StreamRemoteWriteClosed { id, .. } if *id == healthy_id))
         },
     );
-    assert_eq!(
-        events
+    // The failure is the close's reason, reported once: the failed write is
+    // dropped, not retried on every drain.
+    assert!(
+        events.contains(&TransportEvent::Closed {
+            id: faulty_id,
+            reason: ConnectionCloseReason::Error("write failed on 0: closed stream".into()),
+        }),
+        "{events:?}"
+    );
+    assert!(
+        !events
             .iter()
-            .filter(|event| matches!(event, TransportEvent::Error { id, .. } if *id == faulty_id))
-            .count(),
-        1,
-        "the failed write is dropped, not retried on every drain: {events:?}"
+            .any(|event| matches!(event, TransportEvent::Error { .. })),
+        "{events:?}"
     );
     assert_eq!(stream_bytes(&events, stream), b"still here");
-    assert!(!events.contains(&TransportEvent::Closed { id: healthy_id }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Closed { id, .. } if *id == healthy_id))
+    );
     assert!(server.connections.contains_key(&healthy_id));
 }
 

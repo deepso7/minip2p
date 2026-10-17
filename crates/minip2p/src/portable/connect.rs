@@ -1164,6 +1164,7 @@ pub(crate) fn cancel_attempt<T: Transport, E: EntropySource>(
 
 #[cfg(test)]
 mod tests {
+    use crate::ConnectionCloseReason;
     use alloc::collections::VecDeque;
     use alloc::vec;
     use core::net::{IpAddr, Ipv4Addr};
@@ -1292,7 +1293,10 @@ mod tests {
         }
 
         fn push_closed(&mut self, id: ConnectionId) {
-            self.events.push_back(TransportEvent::Closed { id });
+            self.events.push_back(TransportEvent::Closed {
+                id,
+                reason: ConnectionCloseReason::Local,
+            });
         }
     }
 

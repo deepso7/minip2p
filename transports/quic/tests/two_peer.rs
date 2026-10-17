@@ -1,7 +1,9 @@
 use minip2p_core::PeerAddr;
 use minip2p_identity::Ed25519Keypair;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
-use minip2p_transport::{Bytes, ConnectionId, StreamId, Transport, TransportError, TransportEvent};
+use minip2p_transport::{
+    Bytes, ConnectionCloseReason, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
+};
 
 mod common;
 #[path = "common/raw.rs"]
@@ -316,18 +318,16 @@ fn events_until_closed(transport: &mut QuicTransport, raw: &mut RawPeer) -> Vec<
     events
 }
 
-/// The handshake failed inside TLS: the local caller saw `Error` carrying
-/// `reason`, then `Closed`, and never `Connected` or an identity.
+/// The handshake failed inside TLS: the local caller saw `Closed` with an
+/// `Error` reason carrying `reason`, and never `Connected` or an identity.
 fn assert_rejected(events: &[TransportEvent], reason: &str) {
-    let error = events.iter().position(
-        |event| matches!(event, TransportEvent::Error { message, .. } if message.contains(reason)),
-    );
-    let closed = events
-        .iter()
-        .position(|event| matches!(event, TransportEvent::Closed { .. }));
     assert!(
-        matches!((error, closed), (Some(error), Some(closed)) if error < closed),
-        "expected Error({reason}) then Closed: {events:?}"
+        events.iter().any(|event| matches!(
+            event,
+            TransportEvent::Closed { reason: ConnectionCloseReason::Error(message), .. }
+                if message.contains(reason)
+        )),
+        "expected Closed with Error({reason}): {events:?}"
     );
     assert!(
         !events.iter().any(|event| matches!(

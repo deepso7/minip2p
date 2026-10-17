@@ -4,6 +4,7 @@
 mod common;
 
 use common::*;
+use minip2p_swarm::ConnectionCloseReason;
 
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
 use minip2p_nat::{Deadline, NatConfig, NatError, NatEvent, Path, RelayStage};
@@ -840,6 +841,7 @@ fn reporter_disconnect_drops_its_observation() {
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay,
+            reason: ConnectionCloseReason::Local,
         },
         false,
         at(1),
@@ -860,6 +862,7 @@ fn untracked_connection_close_is_ignored() {
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(999),
             peer_id: peer(b"untracked-peer"),
+            reason: ConnectionCloseReason::Local,
         },
         false,
         at(1),

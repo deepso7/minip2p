@@ -8,6 +8,7 @@ use minip2p_pubsub::{
     GossipsubAction, GossipsubAgent, GossipsubConfig, GossipsubEvent, MESHSUB_PROTOCOL_ID_V10,
     MESHSUB_PROTOCOL_ID_V11, RawMessage, Rpc, SubOpts, decode_frame, encode_frame,
 };
+use minip2p_swarm::ConnectionCloseReason;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
@@ -1151,6 +1152,7 @@ fn disconnect_preserves_backoff_and_replacement_reannounces_subscriptions() {
         &SwarmEvent::ConnectionClosed {
             peer_id: remote.clone(),
             conn_id: ConnectionId::new(1),
+            reason: ConnectionCloseReason::Local,
         },
         3,
     );
@@ -1661,6 +1663,7 @@ fn disconnect_and_replace_aggregate_queued_failures() {
         &SwarmEvent::ConnectionClosed {
             peer_id: first.clone(),
             conn_id: ConnectionId::new(1),
+            reason: ConnectionCloseReason::Local,
         },
         2,
     );
@@ -2006,6 +2009,7 @@ fn connection_close_unsubscribes_every_announced_topic() {
         &SwarmEvent::ConnectionClosed {
             peer_id: remote.clone(),
             conn_id: ConnectionId::new(1),
+            reason: ConnectionCloseReason::Local,
         },
         2,
     );

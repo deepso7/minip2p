@@ -569,6 +569,7 @@ mod polling {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ConnectionCloseReason;
     use alloc::string::{String, ToString};
     use alloc::vec;
 
@@ -1077,8 +1078,14 @@ mod tests {
         let tcp_id = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("in range");
         let quic_id =
             ConnectionId::namespaced(ConnectionNamespace::QUIC_IPV4, 1).expect("in range");
-        tcp.log().events = vec![TransportEvent::Closed { id: tcp_id }];
-        quic.log().events = vec![TransportEvent::Closed { id: quic_id }];
+        tcp.log().events = vec![TransportEvent::Closed {
+            id: tcp_id,
+            reason: ConnectionCloseReason::Local,
+        }];
+        quic.log().events = vec![TransportEvent::Closed {
+            id: quic_id,
+            reason: ConnectionCloseReason::Local,
+        }];
 
         // Both connections, each exactly once: a count alone would pass on a
         // set that reported one member's event twice and lost the other's.
@@ -1086,8 +1093,14 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                TransportEvent::Closed { id: tcp_id },
-                TransportEvent::Closed { id: quic_id },
+                TransportEvent::Closed {
+                    id: tcp_id,
+                    reason: ConnectionCloseReason::Local
+                },
+                TransportEvent::Closed {
+                    id: quic_id,
+                    reason: ConnectionCloseReason::Local
+                },
             ],
             "both members are polled"
         );
@@ -1101,7 +1114,10 @@ mod tests {
         // The failure comes first, so a set that gave up on the first error
         // would never reach the member with something to report.
         tcp.log().fails_poll = true;
-        quic.log().events = vec![TransportEvent::Closed { id: quic_id }];
+        quic.log().events = vec![TransportEvent::Closed {
+            id: quic_id,
+            reason: ConnectionCloseReason::Local,
+        }];
 
         let error = set
             .poll(Now::from_millis(0))
@@ -1118,7 +1134,10 @@ mod tests {
         let events = set.poll(Now::from_millis(0)).expect("the next poll");
         assert_eq!(
             events,
-            vec![TransportEvent::Closed { id: quic_id }],
+            vec![TransportEvent::Closed {
+                id: quic_id,
+                reason: ConnectionCloseReason::Local
+            }],
             "events held back by a failed poll have to survive it"
         );
     }
@@ -1156,7 +1175,10 @@ mod tests {
         // a queue that only grows.
         let mut delivered = 0;
         for _ in 0..6 {
-            quic.log().events = vec![TransportEvent::Closed { id: quic_id }];
+            quic.log().events = vec![TransportEvent::Closed {
+                id: quic_id,
+                reason: ConnectionCloseReason::Local,
+            }];
             if let Ok(events) = set.poll(Now::from_millis(0)) {
                 delivered += events.len();
             }
@@ -1171,7 +1193,10 @@ mod tests {
     fn held_back_events_are_due_immediately() {
         let (mut set, tcp, quic) = duo();
         let tcp_id = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("in range");
-        tcp.log().events = vec![TransportEvent::Closed { id: tcp_id }];
+        tcp.log().events = vec![TransportEvent::Closed {
+            id: tcp_id,
+            reason: ConnectionCloseReason::Local,
+        }];
         quic.log().fails_poll = true;
         drop(set.poll(Now::from_millis(0)));
 

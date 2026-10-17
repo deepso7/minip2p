@@ -4,6 +4,7 @@
 mod common;
 
 use common::*;
+use minip2p_swarm::ConnectionCloseReason;
 
 use minip2p_autonat::{AUTONAT_PROTOCOL_ID, ResponseStatus};
 use minip2p_core::{PeerAddr, PeerId};
@@ -1012,6 +1013,7 @@ fn lost_relay_connection_emits_lost_and_reacquires() {
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay.clone(),
+            reason: ConnectionCloseReason::Local,
         },
         false,
         at(5_000),
@@ -1056,6 +1058,7 @@ fn retiring_another_relay_connection_keeps_the_reservation() {
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(2),
             peer_id: relay,
+            reason: ConnectionCloseReason::Local,
         },
         false,
         at(21),
@@ -1493,6 +1496,7 @@ fn reservation_retries_back_off_exponentially_and_reset_on_success() {
         &SwarmEvent::ConnectionClosed {
             conn_id: hk.agent.swarm.connection(&relay).expect("relay session"),
             peer_id: relay.clone(),
+            reason: ConnectionCloseReason::Local,
         },
         false,
         at(now + 1),

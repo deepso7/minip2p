@@ -4,6 +4,7 @@
 //! send STOP_SENDING without resetting the read half, put frames in one
 //! packet, shape the credit it grants, or hold packets back.
 
+use minip2p_transport::ConnectionCloseReason;
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, LazyLock};
@@ -421,7 +422,10 @@ pub(crate) fn deliver_then_close(
     peer.conn()
         .close(Instant::now(), VarInt::from_u32(0), Bytes::new());
     drive_until(server, &mut [&mut peer], &mut events, "close", |events| {
-        events.contains(&TransportEvent::Closed { id })
+        events.contains(&TransportEvent::Closed {
+            id,
+            reason: ConnectionCloseReason::Remote { code: 0 },
+        })
     });
     (id, minip2p_transport::StreamId::new(stream))
 }

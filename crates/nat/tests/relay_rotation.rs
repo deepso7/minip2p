@@ -4,6 +4,7 @@
 mod common;
 
 use common::*;
+use minip2p_swarm::ConnectionCloseReason;
 
 use minip2p_core::{PeerAddr, PeerId};
 use minip2p_nat::{
@@ -758,6 +759,7 @@ fn circuit_closing_before_it_establishes_moves_to_the_next_relay() {
         &SwarmEvent::ConnectionClosed {
             peer_id: target,
             conn_id: circuit,
+            reason: ConnectionCloseReason::Local,
         },
         true,
         at(30),

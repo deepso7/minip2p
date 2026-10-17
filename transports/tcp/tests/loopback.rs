@@ -16,8 +16,8 @@ use minip2p_core::{Multiaddr, PeerAddr, Protocol};
 use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_tcp::{StdTcpProvider, TcpProvider, TcpTransport};
 use minip2p_transport::{
-    Bytes, ConnectionId, ConnectionToken, PollSource, SharedPoll, StreamId, Transport,
-    TransportError, TransportEvent, WaitHandle,
+    Bytes, ConnectionCloseReason, ConnectionId, ConnectionToken, PollSource, SharedPoll, StreamId,
+    Transport, TransportError, TransportEvent, WaitHandle,
 };
 
 type Node = TcpTransport<StdTcpProvider, StdEntropy>;
@@ -531,9 +531,9 @@ fn closing_a_connection_reaches_the_peer() {
         &mut pair.dialer_events,
         &mut pair.listener_events,
         |_, listener| {
-            listener
-                .iter()
-                .any(|event| matches!(event, TransportEvent::Closed { id } if *id == listener_id))
+            listener.iter().any(
+                |event| matches!(event, TransportEvent::Closed { id, .. } if *id == listener_id),
+            )
         },
     );
     assert!(pair.dialer.connection_ids().is_empty());
@@ -574,9 +574,11 @@ fn a_refused_connect_is_reported_and_closed() {
     );
 
     assert!(
-        dialer_events.iter().any(
-            |event| matches!(event, TransportEvent::Error { id: failed, .. } if *failed == id)
-        ),
+        dialer_events.iter().any(|event| matches!(
+            event,
+            TransportEvent::Closed { id: failed, reason: ConnectionCloseReason::Error(_) }
+                if *failed == id
+        )),
         "a refused connect must say why: {dialer_events:?}"
     );
     assert!(
