@@ -26,7 +26,7 @@ describe("@minip2p/node", () => {
     }
   });
 
-  test("creates, starts, and closes a QUIC endpoint", () => {
+  test("creates, starts, and closes a QUIC endpoint", async () => {
     const endpoint = nodeSdk.Minip2p.create({
       listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
       secretKey: nodeSdk.generateSecretKey(),
@@ -36,8 +36,29 @@ describe("@minip2p/node", () => {
     expect(endpoint.listenAddrs()).toHaveLength(1);
     expect(endpoint.isRunning()).toBe(true);
 
-    endpoint.close();
+    const closing = endpoint.close();
     expect(endpoint.isRunning()).toBe(false);
+    await expect(closing).resolves.toEqual({
+      outcome: "Drained",
+      reason: "close",
+      unfinished: [],
+    });
+  });
+
+  test("closing within zero reports the connected peer unfinished", async () => {
+    const a = createQuicEndpoint();
+    const b = createQuicEndpoint();
+
+    try {
+      await a.connect(b.listenAddrs()[0], { timeoutMs: 10_000 });
+      await expect(a.close(0)).resolves.toEqual({
+        outcome: "DeadlineExpired",
+        reason: "close",
+        unfinished: [b.peerId()],
+      });
+    } finally {
+      await Promise.all([a.close(0), b.close(0)]);
+    }
   });
 
   test("reserves the configured signed-discovery topic", () => {
@@ -495,6 +516,13 @@ async function startRelay(): Promise<{
       }
     },
   };
+}
+
+function createQuicEndpoint(): nodeSdk.Minip2p {
+  return nodeSdk.Minip2p.create({
+    listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
+    secretKey: nodeSdk.generateSecretKey(),
+  });
 }
 
 function createDualStackEndpoint(): nodeSdk.Minip2p {

@@ -17,8 +17,12 @@ export declare class NodeEndpoint {
   constructor(secretKey: Uint8Array, config: NodeEndpointConfig)
   /** Starts the detached driver with a strong event-loop doorbell. */
   start(doorbell: () => void): void
-  /** Requests shutdown without waiting for the driver thread. */
-  close(): void
+  /**
+   * Requests shutdown without waiting for the driver thread, which drains
+   * for up to `timeoutMs` and then delivers `EndpointClosed` as its last
+   * event.
+   */
+  close(timeoutMs: number): void
   /** Returns the local peer ID. */
   peerId(): string
   /** Returns bound peer addresses. */

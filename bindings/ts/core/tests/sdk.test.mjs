@@ -8,6 +8,7 @@ import { test, vi } from "vitest";
 import { P2pEvent_Tags, PathKind_Tags } from "../src/backend.ts";
 import {
   AbortError,
+  CloseOutcome,
   ClosedError,
   ConnectCancelledError,
   ConnectFailedError,
@@ -201,16 +202,18 @@ test("events rejects invalid buffer caps", async () => {
   endpoint.close();
 });
 
-test("await using falls back to Symbol.dispose", async () => {
+test("await using waits for the close drain", async () => {
   const backend = new MockBackend();
-  assert.equal(Symbol.asyncDispose in Minip2pBase.prototype, false);
+  let reported = false;
 
   {
     await using endpoint = new TestMinip2p(backend);
-    assert.equal(endpoint.peerId(), "local-peer");
+    endpoint.onClose(() => {
+      reported = true;
+    });
   }
 
-  assert.equal(backend.closed, true);
+  assert.equal(reported, true);
 });
 
 test("inbound relayed path events preserve relay provenance", async () => {
@@ -1906,20 +1909,42 @@ test("connection replacement ends only the old connection's streams and opens", 
   endpoint.close();
 });
 
-test("onClose fires once after teardown and swallows listener errors", () => {
+test("close passes its drain to native and reports once the drain finishes", async () => {
   const backend = new MockBackend();
+  const drain = Promise.withResolvers();
+  backend.closeResult = drain.promise;
   const endpoint = new TestMinip2p(backend);
-  const reasons = [];
-  endpoint.onClose((reason) => {
-    assert.equal(backend.closed, true);
-    reasons.push(reason);
+  const reports = [];
+  endpoint.onClose((report) => {
+    reports.push(report);
     throw new Error("ignored");
   });
-  endpoint.onClose((reason) => reasons.push(reason));
+  endpoint.onClose((report) => reports.push(report));
 
-  assert.doesNotThrow(() => endpoint.close());
-  endpoint.close();
-  assert.deepEqual(reasons, [{ reason: "close" }, { reason: "close" }]);
+  const closing = endpoint.close(250);
+  assert.equal(endpoint.close(), closing, "idempotent");
+  assert.equal(backend.closeTimeoutMs, 250);
+  assert.throws(() => endpoint.peerId(), ClosedError);
+  await tick();
+  assert.deepEqual(reports, [], "observers wait for the drain");
+
+  drain.resolve({
+    outcome: CloseOutcome.DeadlineExpired,
+    unfinished: ["peer"],
+  });
+  const report = await closing;
+  assert.deepEqual(report, {
+    outcome: CloseOutcome.DeadlineExpired,
+    reason: "close",
+    unfinished: ["peer"],
+  });
+  assert.deepEqual(reports, [report, report]);
+});
+
+test("close defaults to a 500 ms drain", async () => {
+  const backend = new MockBackend();
+  await new TestMinip2p(backend).close();
+  assert.equal(backend.closeTimeoutMs, 500);
 });
 
 test("driver failure rejects work and reports a distinct close reason", async () => {
@@ -1939,8 +1964,12 @@ test("driver failure rejects work and reports a distinct close reason", async ()
   });
 
   await assert.rejects(waiting, DriverFailedError);
-  assert.equal(reason.reason, "driverFailed");
-  assert.ok(reason.error instanceof DriverFailedError);
+  const report = await endpoint.close();
+  assert.equal(reason, report, "close resolves with the failure's report");
+  assert.equal(report.reason, "driverFailed");
+  assert.ok(report.error instanceof DriverFailedError);
+  assert.equal("outcome" in report, false);
+  assert.equal(backend.closeTimeoutMs, 0, "a failed driver tears down at once");
 });
 
 async function openedStream(backend) {

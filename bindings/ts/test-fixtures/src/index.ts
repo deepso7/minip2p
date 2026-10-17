@@ -1,12 +1,13 @@
 /* oxlint-disable class-methods-use-this, no-empty-function, no-plusplus -- A contract-complete test double must implement inert backend methods directly. */
 
 import type {
+  BackendClosed,
   BackendConnectTarget,
   BackendOpenStream,
   Minip2pBackend,
   P2pEvent,
 } from "../../core/src/backend.js";
-import { Reachability } from "../../core/src/index.js";
+import { CloseOutcome, Reachability } from "../../core/src/index.js";
 import type { ConnectionInfo } from "../../core/src/index.js";
 
 export type MockBackendOperation =
@@ -20,6 +21,13 @@ export class MockBackend implements Minip2pBackend {
   abandonError: unknown;
   closeWriteError: unknown;
   closed = false;
+  /** The drain `close` was asked for, once called. */
+  closeTimeoutMs: number | undefined;
+  /** What `close` resolves with; a pending promise holds the drain open. */
+  closeResult: BackendClosed | Promise<BackendClosed> = {
+    outcome: CloseOutcome.Drained,
+    unfinished: [],
+  };
   connected: string[] = [];
   /** `connectionInfo` snapshots by peer ID. */
   connections = new Map<string, ConnectionInfo>();
@@ -37,6 +45,7 @@ export class MockBackend implements Minip2pBackend {
   sendResults: boolean[] = [];
 
   private listener?: (event: P2pEvent) => void;
+  private closing?: Promise<BackendClosed>;
 
   start(listener: (event: P2pEvent) => void): void {
     this.listener = listener;
@@ -49,8 +58,13 @@ export class MockBackend implements Minip2pBackend {
     this.listener(event);
   }
 
-  close(): void {
-    this.closed = true;
+  close(timeoutMs: number): Promise<BackendClosed> {
+    if (this.closing === undefined) {
+      this.closed = true;
+      this.closeTimeoutMs = timeoutMs;
+      this.closing = Promise.resolve(this.closeResult);
+    }
+    return this.closing;
   }
 
   peerId(): string {

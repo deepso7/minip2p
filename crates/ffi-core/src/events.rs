@@ -197,6 +197,47 @@ pub enum DriverFailureKind {
     Panic,
 }
 
+/// How the driver's closing drain ended; see [`P2pEvent::EndpointClosed`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum CloseOutcome {
+    /// Every tracked connection finished its teardown in time.
+    Drained,
+    /// The stop deadline passed with connections still tracked.
+    DeadlineExpired,
+    /// Driving the transports failed and ended the drain early, or the
+    /// driver panicked and dropped the endpoint without a drain.
+    Failed,
+}
+
+impl From<minip2p::CloseOutcome> for CloseOutcome {
+    fn from(outcome: minip2p::CloseOutcome) -> Self {
+        match outcome {
+            minip2p::CloseOutcome::Drained => Self::Drained,
+            minip2p::CloseOutcome::DeadlineExpired => Self::DeadlineExpired,
+            minip2p::CloseOutcome::Failed => Self::Failed,
+        }
+    }
+}
+
+/// A connection still tracked when the closing drain ended.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+pub struct UnfinishedConnection {
+    /// Endpoint-local transport connection id.
+    pub conn_id: u64,
+    /// Remote peer; `None` for an inbound handshake that had not identified
+    /// one yet.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub peer_id: Option<String>,
+}
+
 /// Event delivered by the native endpoint driver.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
@@ -225,6 +266,16 @@ pub enum P2pEvent {
         kind: DriverFailureKind,
         /// Human-readable diagnostic detail.
         detail: String,
+    },
+    /// The driver finished shutting down: its last event, after
+    /// [`P2pEndpoint::stop`](crate::P2pEndpoint::stop) or a
+    /// [`P2pEvent::DriverFailed`], when a failed driver tears down at once.
+    EndpointClosed {
+        /// How the closing drain ended.
+        outcome: CloseOutcome,
+        /// Connections still tracked when it ended. Empty means no tracked
+        /// teardown remains, not that peers acknowledged it.
+        unfinished: Vec<UnfinishedConnection>,
     },
     /// A peer went from disconnected to connected over a verified connection.
     ConnectionEstablished {

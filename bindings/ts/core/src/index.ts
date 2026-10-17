@@ -19,6 +19,7 @@ export {
 } from "./errors.js";
 export { Minip2pBase, Stream, type StreamEventMap } from "./sdk.js";
 export {
+  CloseOutcome,
   ConfigCapability,
   DiscoverySource,
   DriverFailureKind,
@@ -27,11 +28,12 @@ export {
   NatErrorKind,
   Reachability,
   type Bytes,
-  type CloseReason,
   type ConnectionInfo,
   type ConnectOptions,
   type ConnectResult,
   type ConnectTarget,
+  type EndpointCloseReason,
+  type EndpointCloseReport,
   type EventsOptions,
   type IdentifyInfo,
   type InboundStreamMeta,

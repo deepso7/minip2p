@@ -453,12 +453,38 @@ export interface ConnectResult {
   readonly path: Path;
 }
 
-/** Reason reported to endpoint close observers. */
-export type CloseReason =
-  | { readonly reason: "close" }
+/** How the native close drain ended. */
+export const CloseOutcome = {
+  /** The close deadline passed with connections still tracked. */
+  DeadlineExpired: "DeadlineExpired",
+  /** Every tracked connection finished its teardown in time. */
+  Drained: "Drained",
+  /** Driving the transports failed and ended the drain early. */
+  Failed: "Failed",
+} as const;
+export type CloseOutcome = (typeof CloseOutcome)[keyof typeof CloseOutcome];
+
+/** Why the endpoint stopped: the application closed it, or its driver failed. */
+export type EndpointCloseReason = "close" | "driverFailed";
+
+/**
+ * What endpoint close observers receive once the native drain finished.
+ * `unfinished` lists the peers whose connections were still tracked when it
+ * ended (an inbound handshake that had not identified its peer is not
+ * listed); empty means no tracked teardown remains, not that peers
+ * acknowledged it. A failed driver tears down at once, so its report has no
+ * `outcome`.
+ */
+export type EndpointCloseReport =
+  | {
+      readonly reason: "close";
+      readonly outcome: CloseOutcome;
+      readonly unfinished: readonly string[];
+    }
   | {
       readonly reason: "driverFailed";
       readonly error: DriverFailedError;
+      readonly unfinished: readonly string[];
     };
 
 /** Idempotent callback that removes a subscription. */
@@ -489,6 +515,7 @@ export const P2pEvent_Tags = {
   DiscoveryDialFailed: "DiscoveryDialFailed",
   DiscoveryProtocolViolation: "DiscoveryProtocolViolation",
   DriverFailed: "DriverFailed",
+  EndpointClosed: "EndpointClosed",
   EndpointError: "EndpointError",
   EventsDropped: "EventsDropped",
   GossipsubOutboundFailure: "GossipsubOutboundFailure",
@@ -540,6 +567,13 @@ export type P2pEvent =
   | RawEvent<
       typeof P2pEvent_Tags.DriverFailed,
       { kind: DriverFailureKind; detail: string }
+    >
+  | RawEvent<
+      typeof P2pEvent_Tags.EndpointClosed,
+      {
+        outcome: CloseOutcome;
+        unfinished: { connId: number; peerId?: string }[];
+      }
     >
   | RawEvent<
       typeof P2pEvent_Tags.ConnectionEstablished,

@@ -27,6 +27,7 @@ describeAdapterContract("React Native", {
     return {
       abandoned: fake.abandoned,
       cancelledConnects: fake.cancelledConnects,
+      closeTimeouts: fake.stopTimeouts,
       config: fake.config,
       connectTargets: fake.connectTargets.map((target) =>
         target.tag === ConnectTarget_Tags.Peer
@@ -37,6 +38,9 @@ describeAdapterContract("React Native", {
       deliver: (events: readonly NativeEventLiteral[]) => {
         fake.enqueue([...events], []);
         fake.ring();
+      },
+      setCloseUnfinished: (unfinished) => {
+        fake.closeReport.unfinished = [...unfinished];
       },
       setConnectionInfo: (info) => {
         fake.connection = info;

@@ -45,6 +45,15 @@ export interface FakeNativeState {
   readonly consumed: readonly NativeConsumed[];
   /** Native `abandonStream` calls, in call order. */
   readonly abandoned: readonly NativeStreamRef[];
+  /** Drain timeouts native `stop` received, in milliseconds. */
+  readonly closeTimeouts: readonly number[];
+  /**
+   * Sets the unfinished connections of the `EndpointClosed` native queues
+   * when stopped (its outcome is `Drained`).
+   */
+  setCloseUnfinished: (
+    unfinished: readonly { readonly connId: bigint; readonly peerId?: string }[]
+  ) => void;
 }
 
 /** One native `streamConsumed` call, in runtime-neutral form. */
@@ -106,6 +115,33 @@ export function describeAdapterContract(
   describe(`${runtime} adapter contract`, () => {
     afterEach(() => {
       vi.useRealTimers();
+    });
+
+    test("close hands native its drain and reports once EndpointClosed arrives", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      // A handshake with no peer yet names none; a peer is listed once.
+      native.setCloseUnfinished([
+        { connId: CONN_ID, peerId: PEER },
+        { connId: NEXT_CONN_ID },
+        { connId: NEXT_CONN_ID + 1n, peerId: PEER },
+      ]);
+      const reports: unknown[] = [];
+      endpoint.onClose((report) => reports.push(report));
+
+      const closing = endpoint.close(250);
+      expect(native.closeTimeouts).toEqual([250]);
+      expect(reports).toEqual([]);
+      await drained();
+
+      const report = {
+        outcome: "Drained",
+        reason: "close",
+        unfinished: [PEER],
+      };
+      await expect(closing).resolves.toEqual(report);
+      expect(reports).toEqual([report]);
     });
 
     test("Connection targets reach native in one shape", () => {

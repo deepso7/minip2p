@@ -29,12 +29,12 @@ pub use config::{
 };
 pub use connect::ConnectTarget;
 pub use driver::DriverStats;
-pub use endpoint::P2pEndpoint;
+pub use endpoint::{DEFAULT_STOP_TIMEOUT_MS, P2pEndpoint};
 pub use error::{ConfigCapability, FfiError};
 pub use events::{
-    ConnectionInfo, DiscoverySource, DriverFailureKind, EndpointErrorKind, EventDoorbell,
-    IdentifyInfo, MdnsFailureKind, NatErrorKind, OpenStreamResult, P2pEvent, PathKind,
-    Reachability,
+    CloseOutcome, ConnectionInfo, DiscoverySource, DriverFailureKind, EndpointErrorKind,
+    EventDoorbell, IdentifyInfo, MdnsFailureKind, NatErrorKind, OpenStreamResult, P2pEvent,
+    PathKind, Reachability, UnfinishedConnection,
 };
 
 use std::str::FromStr;

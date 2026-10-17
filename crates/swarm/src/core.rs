@@ -303,6 +303,12 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         self.state.has_tracked_connections()
     }
 
+    /// Returns every tracked transport connection with its peer, if known:
+    /// `None` for an inbound handshake that has not yet identified one.
+    pub fn tracked_connections(&self) -> impl Iterator<Item = (ConnectionId, Option<&PeerId>)> {
+        self.state.tracked_connections()
+    }
+
     /// Returns the latest Identify information received for `peer_id`.
     pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
         self.state.peer_info(peer_id)

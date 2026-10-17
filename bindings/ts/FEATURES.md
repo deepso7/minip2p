@@ -18,7 +18,7 @@
 | Signed discovery | discovery configuration, `knownPeers`, discovery events |
 | mDNS | mDNS configuration, merged `knownPeers`, source-tagged discovery events, and `mdnsFailed` (`{ kind: MdnsFailureKind, detail }`) / `mdnsRecovered` health events |
 | Configuration errors | `create` throws `InvalidConfigError`, whose `capability` (`ConfigCapability`: `Gossipsub`, `Mdns`, `Discovery`, `Transport`, `Options`) names the part of the config to fix |
-| Shutdown | `close`, `onClose`, and `Symbol.dispose`; the low-level native export also provides `stop`/`waitStopped` |
+| Shutdown | bounded `close(timeoutMs?)` resolving with an outcome and unfinished peers, `onClose`, `Symbol.asyncDispose`, and `Symbol.dispose`; the low-level native export also provides `stop`/`waitStopped` |
 | One Endpoint event stream and its blocking wait (event, deadline, interrupted) | Driven by each platform backend; surfaced as typed events, State getters, and Promise waits such as `waitFor` and `waitConnectResult` |
 
 Resource-policy tuning remains native configuration until it has consistent semantics across every backend.

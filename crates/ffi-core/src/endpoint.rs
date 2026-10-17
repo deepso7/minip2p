@@ -51,6 +51,10 @@ pub struct P2pEndpoint {
     listen_addrs: Vec<String>,
 }
 
+/// The close drain a dropped [`P2pEndpoint`] grants, matching
+/// [`minip2p::Endpoint::close`].
+pub const DEFAULT_STOP_TIMEOUT_MS: u64 = 500;
+
 /// How long an interrupted driver sleeps, once pending commands clear, before
 /// checking for further commands. See [`Shared::wait_for_commands`].
 const COMMAND_LINGER: Duration = Duration::from_micros(50);
@@ -92,6 +96,8 @@ pub(crate) struct EndpointState {
     pub(crate) writes: minip2p::StreamWriter,
     /// The peer table last published to `connected_peers`.
     pub(crate) published_peers: Vec<PeerId>,
+    /// How long the exiting driver drains its close, set by `stop`.
+    pub(crate) close_timeout: Duration,
 }
 
 impl EndpointState {
@@ -238,6 +244,7 @@ impl P2pEndpoint {
                     doorbell_thread_id: None,
                     writes: crate::writes::writer(),
                     published_peers: Vec::new(),
+                    close_timeout: Duration::ZERO,
                 }),
                 events: Mutex::default(),
                 stopped: Mutex::new(false),
@@ -352,9 +359,18 @@ impl P2pEndpoint {
 
     /// Requests shutdown without waiting for an in-flight callback.
     ///
+    /// A running driver then closes the endpoint, draining for up to
+    /// `timeout_ms` (`0` tears down at once, best effort), and reports how
+    /// that went as its last event, [`P2pEvent::EndpointClosed`](crate::P2pEvent::EndpointClosed);
+    /// [`P2pEndpoint::wait_stopped`] returns once it has. The deadline
+    /// bounds teardown time only, not delivery of accepted writes: QUIC
+    /// discards queued writes and TCP may abort. Only the first `stop`
+    /// sets the deadline. A never-started endpoint is released at once, with
+    /// no event.
+    ///
     /// Unsettled Connection attempts emit no terminal after this: shells must
     /// settle their pending waits on stop (and on `DriverFailed`) themselves.
-    pub fn stop(&self) {
+    pub fn stop(&self, timeout_ms: u64) {
         let _pending = PendingCommand::new(&self.shared);
         let endpoint = {
             let mut state = self.shared.lock_state();
@@ -365,6 +381,7 @@ impl P2pEndpoint {
                 }
                 Lifecycle::Running => {
                     self.shared.set_lifecycle(&mut state, Lifecycle::Stopping);
+                    state.close_timeout = Duration::from_millis(timeout_ms);
                     None
                 }
                 Lifecycle::Stopping | Lifecycle::Stopped => None,
@@ -846,7 +863,7 @@ impl P2pEndpoint {
 
 impl Drop for P2pEndpoint {
     fn drop(&mut self) {
-        self.stop();
+        self.stop(DEFAULT_STOP_TIMEOUT_MS);
     }
 }
 
@@ -1358,7 +1375,7 @@ mod tests {
             "no further terminal after the first cancel: {drained:#?}"
         );
 
-        a.stop();
+        a.stop(0);
         assert!(a.wait_stopped(5_000));
     }
 
@@ -1416,8 +1433,8 @@ mod tests {
             "settled attempt keeps its PathEstablished terminal: {terminals:#?}"
         );
 
-        a.stop();
-        b.stop();
+        a.stop(0);
+        b.stop(0);
         assert!(a.wait_stopped(5_000));
         assert!(b.wait_stopped(5_000));
     }
@@ -1479,8 +1496,8 @@ mod tests {
             .to_base58();
         assert_eq!(a.connection_info(stranger).expect("connection info"), None);
 
-        a.stop();
-        b.stop();
+        a.stop(0);
+        b.stop(0);
         assert!(a.wait_stopped(5_000));
         assert!(b.wait_stopped(5_000));
     }
@@ -1763,12 +1780,12 @@ mod tests {
         a.disconnect(b.peer_id()).expect("disconnect");
         assert!(reaches(&[]), "drops the peer once closed");
 
-        a.stop();
+        a.stop(0);
         assert!(
             matches!(a.connected_peers(), Err(FfiError::Stopped)),
             "reports stopped as soon as stop returns"
         );
-        b.stop();
+        b.stop(0);
         assert!(a.wait_stopped(5_000));
         assert!(b.wait_stopped(5_000));
     }
@@ -1800,7 +1817,7 @@ mod tests {
     #[test]
     fn connected_peers_reports_a_stopped_endpoint() {
         let endpoint = endpoint(config()).expect("endpoint");
-        endpoint.stop();
+        endpoint.stop(0);
 
         assert!(matches!(endpoint.connected_peers(), Err(FfiError::Stopped)));
     }
@@ -1844,7 +1861,7 @@ mod tests {
 
         assert!(!endpoint.is_running());
         assert!(!endpoint.wait_stopped(0));
-        endpoint.stop();
+        endpoint.stop(0);
         assert!(endpoint.wait_stopped(100));
         assert!(!endpoint.is_running());
     }
@@ -1853,8 +1870,8 @@ mod tests {
     fn stop_is_idempotent_in_created_and_stopped_states() {
         let endpoint = endpoint(config()).expect("endpoint");
 
-        endpoint.stop();
-        endpoint.stop();
+        endpoint.stop(0);
+        endpoint.stop(0);
 
         assert!(endpoint.wait_stopped(0));
         let state = endpoint.shared.lock_state();
@@ -1868,11 +1885,69 @@ mod tests {
         endpoint.start(Arc::new(NoopDoorbell)).expect("start");
         assert!(endpoint.is_running());
 
-        endpoint.stop();
+        endpoint.stop(0);
 
         assert!(endpoint.wait_stopped(1_000));
         assert!(!endpoint.is_running());
         assert!(endpoint.shared.lock_state().endpoint.is_none());
+    }
+
+    /// The last event drained once `endpoint` has stopped.
+    fn last_event_after_stop(endpoint: &P2pEndpoint) -> Option<P2pEvent> {
+        assert!(endpoint.wait_stopped(5_000));
+        endpoint.drain_events(u32::MAX).pop()
+    }
+
+    #[test]
+    fn stopping_an_idle_driver_reports_a_drained_close_last() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        endpoint.start(Arc::new(NoopDoorbell)).expect("start");
+
+        endpoint.stop(DEFAULT_STOP_TIMEOUT_MS);
+
+        assert_eq!(
+            last_event_after_stop(&endpoint),
+            Some(P2pEvent::EndpointClosed {
+                outcome: crate::CloseOutcome::Drained,
+                unfinished: Vec::new(),
+            })
+        );
+    }
+
+    /// `stop(0)` reaches `close_within(ZERO)`, which does not wait for the
+    /// live connection.
+    #[test]
+    fn stopping_within_zero_reports_the_live_connection_unfinished() {
+        let a = endpoint(config()).expect("endpoint a");
+        let b = endpoint(config()).expect("endpoint b");
+        a.start(Arc::new(NoopDoorbell)).expect("start a");
+        b.start(Arc::new(NoopDoorbell)).expect("start b");
+        a.connect(crate::ConnectTarget::Addresses {
+            addresses: vec![b.listen_addrs()[0].clone()],
+        })
+        .expect("connect");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let conn_id = loop {
+            if let Some(info) = a.connection_info(b.peer_id()).expect("connection info") {
+                break info.conn_id;
+            }
+            assert!(Instant::now() < deadline, "a never connected to b");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        a.stop(0);
+
+        assert_eq!(
+            last_event_after_stop(&a),
+            Some(P2pEvent::EndpointClosed {
+                outcome: crate::CloseOutcome::DeadlineExpired,
+                unfinished: vec![crate::UnfinishedConnection {
+                    conn_id,
+                    peer_id: Some(b.peer_id()),
+                }],
+            })
+        );
+        b.stop(0);
     }
 
     #[test]
@@ -1903,7 +1978,7 @@ mod tests {
                 "an interrupt alone is no cycle"
             );
             assert!(caller.subscribe("room".into()).expect("subscribe"));
-            caller.stop();
+            caller.stop(0);
             done.send(caller.wait_stopped(60_000)).expect("report");
         });
         assert_eq!(
@@ -1922,7 +1997,7 @@ mod tests {
             endpoint.start(Arc::new(NoopDoorbell)),
             Err(FfiError::AlreadyStarted)
         ));
-        endpoint.stop();
+        endpoint.stop(0);
         assert!(endpoint.wait_stopped(1_000));
         assert!(matches!(
             endpoint.start(Arc::new(NoopDoorbell)),
@@ -1941,7 +2016,7 @@ mod tests {
             Err(FfiError::AlreadyStarted)
         ));
         assert_eq!(received.recv_timeout(Duration::from_secs(1)), Ok(caller));
-        endpoint.stop();
+        endpoint.stop(0);
         assert!(endpoint.wait_stopped(1_000));
     }
 
@@ -1964,9 +2039,9 @@ mod tests {
         }
         assert!(callbacks.load(Ordering::Acquire) > 0);
 
-        a.stop();
+        a.stop(0);
         assert!(a.wait_stopped(1_000));
-        b.stop();
+        b.stop(0);
         assert!(b.wait_stopped(1_000));
     }
 
@@ -2000,7 +2075,7 @@ mod tests {
             }))
             .expect("start");
 
-        endpoint.stop();
+        endpoint.stop(0);
         assert!(endpoint.wait_stopped(1_000));
 
         assert!(dropped.load(Ordering::Acquire));
@@ -2054,7 +2129,7 @@ mod tests {
         }
 
         std::thread::yield_now();
-        endpoint.stop();
+        endpoint.stop(0);
         for worker in workers {
             worker.join().expect("worker must not panic");
         }
@@ -2084,10 +2159,16 @@ mod tests {
 
         assert!(matches!(
             endpoint.drain_events(10).as_slice(),
-            [crate::P2pEvent::DriverFailed {
-                kind: crate::DriverFailureKind::Panic,
-                ..
-            }]
+            [
+                crate::P2pEvent::DriverFailed {
+                    kind: crate::DriverFailureKind::Panic,
+                    ..
+                },
+                crate::P2pEvent::EndpointClosed {
+                    outcome: crate::CloseOutcome::Failed,
+                    unfinished,
+                },
+            ] if unfinished.is_empty()
         ));
         assert!(matches!(endpoint.connected_peers(), Err(FfiError::Stopped)));
         assert!(endpoint.wait_stopped(0));
@@ -2227,7 +2308,7 @@ mod tests {
             Err(FfiError::InvalidAddress { .. })
         ));
 
-        endpoint.stop();
+        endpoint.stop(0);
         assert!(matches!(
             endpoint.publish("room".into(), Vec::new()),
             Err(FfiError::Stopped)

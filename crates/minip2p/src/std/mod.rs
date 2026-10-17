@@ -243,22 +243,44 @@ type StdCarrier = ();
 /// The engine the std [`Endpoint`] drives.
 type StdEngine = Engine<EndpointTransport, StdEntropy, StdCarrier>;
 
-/// What [`Endpoint::close`] collected: every event, in order, and every
-/// error close's own calls hit, in order.
+/// What [`Endpoint::close_within`] collected: how the drain ended, what it
+/// left unfinished, every event, in order, and every error close's own calls
+/// hit, in order.
 ///
 /// A failure the swarm reports as it happens (a transport refusing to close
 /// a connection, say) arrives as [`EndpointEvent::Error`] in `events`, as it
 /// would from [`Endpoint::wait`]; a clean close has no such event either.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 #[must_use = "a close report carries the close's events and errors"]
 #[non_exhaustive]
 pub struct CloseReport {
+    /// How the drain ended.
+    pub outcome: CloseOutcome,
+    /// Connections still tracked when the drain ended, with their peer when
+    /// known (an inbound handshake may not have identified one yet). Empty
+    /// means no tracked teardown remains, not that peers acknowledged it.
+    pub unfinished: Vec<(ConnectionId, Option<PeerId>)>,
     /// Events queued before the close and those its drain produced.
     pub events: Vec<EndpointEvent>,
     /// Every transport or swarm failure: each disconnect, and a failed
     /// drain. An mDNS goodbye that could not be sent is an
     /// [`EndpointEvent::MdnsFailed`] in `events` instead.
     pub errors: Vec<Error>,
+}
+
+/// How [`Endpoint::close_within`]'s drain ended. None of these is an
+/// [`Error`]: the endpoint is gone either way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloseOutcome {
+    /// Every tracked connection finished its teardown in time.
+    Drained,
+    /// The deadline passed with connections still tracked; they are listed
+    /// in [`CloseReport::unfinished`] and are torn down without waiting.
+    DeadlineExpired,
+    /// Driving the transports failed, which ended the drain early; the
+    /// failure is the last of [`CloseReport::errors`]. A failed disconnect
+    /// alone does not end the drain.
+    Failed,
 }
 
 /// App-facing minip2p endpoint over the transports it was asked to bind.
@@ -1073,27 +1095,48 @@ impl Endpoint {
         self.engine.shutdown_mdns(now)
     }
 
-    /// Disconnects established peers, waits briefly until none remain,
-    /// and consumes the endpoint.
+    /// Disconnects established peers, waits up to 500 ms until none remain,
+    /// and consumes the endpoint: [`close_within`](Self::close_within) with
+    /// a 500 ms deadline.
     ///
     /// Named `close` because `shutdown` is already used for mDNS goodbyes.
-    /// Dropping without `close` still disconnects (errors ignored). Neither
+    pub fn close(self) -> CloseReport {
+        self.close_within(Duration::from_millis(500))
+    }
+
+    /// Disconnects established peers, waits up to `timeout` until no
+    /// connection is tracked, and consumes the endpoint.
+    ///
+    /// The deadline bounds teardown time only, not delivery of accepted
+    /// writes: QUIC discards queued writes and TCP may abort. With
+    /// [`Duration::ZERO`] this is an immediate best-effort teardown: one
+    /// pass disconnects and hands over what is already queued. Running out
+    /// the deadline is [`CloseOutcome::DeadlineExpired`], not an error, and
+    /// [`CloseReport::unfinished`] lists what was still tracked.
+    ///
+    /// Dropping without closing still disconnects (errors ignored). Neither
     /// notifies a peer after `kill -9` or a hard partition. A replacement
     /// that lands while draining is disconnected too, including a handshake
     /// still pending when the replaced connection closes.
     ///
     /// Close never stops at the first failure: the [`CloseReport`] carries
     /// every event collected, starting with those already queued, and every
-    /// transport or swarm error hit. A failed drain ends the drain early.
-    /// mDNS goodbyes are best effort: one that could not be sent is an
-    /// [`EndpointEvent::MdnsFailed`] in the report's events, not an error.
-    pub fn close(mut self) -> CloseReport {
-        let mut report = CloseReport::default();
+    /// transport or swarm error hit. A failed drain ends the drain early
+    /// ([`CloseOutcome::Failed`]). mDNS goodbyes are best effort: one that
+    /// could not be sent is an [`EndpointEvent::MdnsFailed`] in the report's
+    /// events, not an error.
+    pub fn close_within(mut self, timeout: Duration) -> CloseReport {
+        let mut report = CloseReport {
+            outcome: CloseOutcome::Drained,
+            unfinished: Vec::new(),
+            events: Vec::new(),
+            errors: Vec::new(),
+        };
         report.events.extend(self.engine.events.drain(..));
         // The failure is queued as an event too, and drained below.
         #[cfg(feature = "mdns")]
         drop(self.shutdown());
-        let drain_by = std::time::Instant::now() + Duration::from_millis(500);
+        let drain_by = std::time::Instant::now() + timeout;
         loop {
             report.errors.extend(self.disconnect_established());
             // Out of time or failed: hand over what the swarm already queued
@@ -1117,6 +1160,7 @@ impl Endpoint {
                     Ok(polled) => (polled, false, now),
                     Err(error) => {
                         report.errors.push(error);
+                        report.outcome = CloseOutcome::Failed;
                         (self.engine.core.take_buffered_events(), true, now)
                     }
                 }
@@ -1144,6 +1188,15 @@ impl Endpoint {
         }
         self.engine.settle(now);
         report.events.extend(self.engine.events.drain(..));
+        report.unfinished = self
+            .engine
+            .core
+            .tracked_connections()
+            .map(|(conn_id, peer)| (conn_id, peer.cloned()))
+            .collect();
+        if report.outcome == CloseOutcome::Drained && !report.unfinished.is_empty() {
+            report.outcome = CloseOutcome::DeadlineExpired;
+        }
         report
     }
 
@@ -3865,6 +3918,51 @@ mod tests {
             report.events
         );
         assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert_eq!(report.outcome, CloseOutcome::Failed);
+    }
+
+    #[test]
+    fn closing_an_idle_endpoint_drains_with_nothing_unfinished() {
+        let endpoint = Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind");
+
+        let report = endpoint.close();
+        assert_eq!(report.outcome, CloseOutcome::Drained);
+        assert!(report.unfinished.is_empty(), "{:?}", report.unfinished);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    /// A zero deadline tears down at once and names the live connection it
+    /// did not wait for.
+    #[test]
+    fn closing_within_zero_reports_the_live_connection_unfinished() {
+        let mut listener = Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind listener");
+        let addr = listener.listen().expect("listen");
+        let _listener = Driven::new(listener);
+        let mut dialer = Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind dialer");
+        dialer.connect(addr.clone()).expect("connect");
+        let EndpointEvent::ConnectionEstablished { conn_id, .. } =
+            wait_for(&mut dialer, "connection", |event| {
+                matches!(event, EndpointEvent::ConnectionEstablished { .. })
+            })
+        else {
+            panic!("the connection predicate returned an unrelated event")
+        };
+
+        let report = dialer.close_within(Duration::ZERO);
+        assert_eq!(report.outcome, CloseOutcome::DeadlineExpired);
+        assert_eq!(report.unfinished, [(conn_id, Some(addr.peer_id().clone()))]);
     }
 
     #[cfg(feature = "nat")]

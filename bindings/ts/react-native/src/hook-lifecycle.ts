@@ -1,12 +1,12 @@
 /* oxlint-disable promise/prefer-await-to-callbacks -- This module coordinates synchronous lifecycle callbacks. */
 
 import { ClosedError } from "@minip2p/core";
-import type { CloseReason, Unsubscribe } from "@minip2p/core";
+import type { EndpointCloseReport, Unsubscribe } from "@minip2p/core";
 
 export interface HookEndpoint {
   close: () => void;
   listenAddrs: () => readonly string[];
-  onClose: (handler: (reason: CloseReason) => void) => Unsubscribe;
+  onClose: (handler: (report: EndpointCloseReport) => void) => Unsubscribe;
   peerId: () => string;
   setActive: (active: boolean) => void;
 }

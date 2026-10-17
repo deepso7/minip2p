@@ -11,7 +11,7 @@ const endpoints: NativeEndpoint[] = [];
 
 afterEach(() => {
   for (const endpoint of endpoints.splice(0)) {
-    endpoint.close();
+    endpoint.close(0);
   }
 });
 
