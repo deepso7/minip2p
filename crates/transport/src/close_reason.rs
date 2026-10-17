@@ -9,6 +9,14 @@ use core::fmt;
 /// [`TransportEvent::Error`](crate::TransportEvent::Error). A Connection
 /// replacement is not a close: the swarm reports it as `ConnectionReplaced`,
 /// and the replaced connection's own close reads [`Local`](Self::Local).
+///
+/// The swarm reports each close with at most one event: an established
+/// connection's as `ConnectionClosed`, our own pending dial's as
+/// `DialFailed`, and any other connection that failed before it established
+/// (an inbound handshake, a promoted inbound circuit) as a
+/// `SwarmErrorKind::Transport` error naming this reason. A never-established
+/// connection that closed [`Local`](Self::Local)ly, or whose dial was
+/// aborted, reports nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ConnectionCloseReason {

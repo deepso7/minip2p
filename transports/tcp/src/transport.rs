@@ -33,6 +33,9 @@ impl From<SessionError> for Teardown {
             SessionError::GoAway { code } => Self(ConnectionCloseReason::Remote {
                 code: u64::from(code),
             }),
+            SessionError::Yamux(YamuxError::KeepaliveTimeout) => {
+                Self(ConnectionCloseReason::TimedOut)
+            }
             error => Self::fault(error.to_string()),
         }
     }
@@ -114,16 +117,18 @@ impl Connection {
     /// When this connection next needs a poll, [`Deadline::IMMEDIATE`] as 0.
     fn wake_at(&self, stall_timeout: Option<u64>) -> Option<u64> {
         // An unauthenticated connection has to be revisited when its patience
-        // runs out, whether or not it has anything queued.
+        // runs out, and an established one when its keepalive is due, whether
+        // or not it has anything queued: a backed-up write path to a dead
+        // peer is exactly what keepalive has to catch.
         let mut at = self.authenticate_by;
         let mut fold = |deadline: u64| at = Some(at.map_or(deadline, |at| at.min(deadline)));
+        if let Some(keepalive) = self.session.next_deadline() {
+            fold(keepalive.as_millis());
+        }
         if self.outbound.is_empty() {
             if self.linked && self.session.has_pending_write() {
                 // Framed bytes with room to put them: come straight back.
                 return Some(0);
-            }
-            if let Some(keepalive) = self.session.next_deadline() {
-                fold(keepalive.as_millis());
             }
         } else if let Some(since) = self.stalled_since {
             // The socket is refusing bytes, and spinning would not change
@@ -735,13 +740,6 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             // make the next socketful look like the tail of an old stall and
             // fail the connection on the spot.
             connection.stalled_since = None;
-            // Yamux keepalive, only when the socket can take the ping. This
-            // runs after the retry so an established session whose final
-            // upgrade bytes just drained gets its first keepalive deadline in
-            // this poll.
-            if connection.session.is_established() {
-                self.drive_connection(id, |session, _| session.poll(now));
-            }
         } else if let Some(since) = connection.stalled_since {
             // Still set: the socket took nothing this poll.
             let stalled_for = now.saturating_millis_since(Now::from_millis(since));
@@ -751,6 +749,17 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 self.fail_connection(id, ConnectionCloseReason::Stalled);
                 return;
             }
+        }
+        // Yamux keepalive, backlog or not: a ping that cannot get into the
+        // outbound buffer is timed too. This runs after the retry, so the
+        // poll dates a ping the retry just pulled, and a session whose final
+        // upgrade bytes just drained gets its first keepalive deadline here.
+        if self
+            .connections
+            .get(&id)
+            .is_some_and(|connection| connection.session.is_established())
+        {
+            self.drive_connection(id, |session, _| session.poll(now));
         }
 
         // Driving the session above queued it as work; only a backlog keeps it

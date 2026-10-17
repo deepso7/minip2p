@@ -21,7 +21,12 @@ pub enum SwarmEvent {
     ///
     /// A failure that ended the connection is its `reason`, never also a
     /// [`SwarmEvent::Error`]. A connection that is replaced never reports
-    /// this; see [`ConnectionReplaced`](Self::ConnectionReplaced).
+    /// this; see [`ConnectionReplaced`](Self::ConnectionReplaced). A
+    /// connection that never established reports
+    /// [`DialFailed`](Self::DialFailed) if it was our pending dial, and
+    /// otherwise, unless it closed
+    /// [`Local`](ConnectionCloseReason::Local)ly, a
+    /// [`SwarmErrorKind::Transport`] error naming the reason.
     ConnectionClosed {
         peer_id: PeerId,
         conn_id: ConnectionId,
@@ -233,7 +238,10 @@ pub struct SwarmRuntimeError {
 pub enum SwarmErrorKind {
     /// Underlying transport operation failed, or the transport reported an
     /// error its connection survived. One that ended the connection is the
-    /// reason on its close instead.
+    /// reason on its close instead, except for a connection that failed
+    /// before it established and was not our pending dial (an inbound
+    /// handshake, say): with no `ConnectionClosed` or `DialFailed` to carry
+    /// its reason, it is reported here, with `conn_id` set.
     Transport,
     /// Multistream-select negotiation failed.
     Multistream,
