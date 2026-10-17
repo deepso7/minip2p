@@ -63,9 +63,11 @@ impl P2pEndpoint {
     pub fn drain_events(&self, limit: u32) -> Vec<P2pEvent> {
         self.0.drain_events(limit)
     }
-    /// Requests shutdown.
-    pub fn stop(&self) {
-        self.0.stop();
+    /// Requests shutdown; the driver drains its close for up to
+    /// `timeout_ms` and reports how that went as its last event,
+    /// `EndpointClosed`.
+    pub fn stop(&self, timeout_ms: u64) {
+        self.0.stop(timeout_ms);
     }
     /// Waits for complete driver shutdown.
     pub fn wait_stopped(&self, timeout_ms: u64) -> bool {

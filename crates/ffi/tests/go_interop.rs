@@ -328,7 +328,7 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
     let echoed = go.event("echo");
     assert_eq!(required_string(&echoed, "payload"), payload_from_go);
 
-    endpoint.stop();
+    endpoint.stop(0);
     assert!(endpoint.wait_stopped(5_000), "minip2p driver stopped");
     Ok(())
 }

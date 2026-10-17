@@ -144,10 +144,12 @@ impl NodeEndpoint {
             .map_err(|error| native_error(&env, error))
     }
 
-    /// Requests shutdown without waiting for the driver thread.
+    /// Requests shutdown without waiting for the driver thread, which drains
+    /// for up to `timeoutMs` and then delivers `EndpointClosed` as its last
+    /// event.
     #[napi]
-    pub fn close(&self) {
-        self.0.stop();
+    pub fn close(&self, timeout_ms: u32) {
+        self.0.stop(timeout_ms.into());
     }
 
     /// Returns the local peer ID.
@@ -406,7 +408,7 @@ impl NodeEndpoint {
 
 impl Drop for NodeEndpoint {
     fn drop(&mut self) {
-        self.0.stop();
+        self.0.stop(minip2p_ffi_core::DEFAULT_STOP_TIMEOUT_MS);
     }
 }
 

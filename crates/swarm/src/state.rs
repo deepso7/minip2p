@@ -1188,6 +1188,14 @@ impl SwarmState {
         !self.conn_to_remote_addr.is_empty()
     }
 
+    /// Every tracked transport connection with its peer, if known: `None`
+    /// for an inbound handshake that has not yet identified one.
+    pub fn tracked_connections(&self) -> impl Iterator<Item = (ConnectionId, Option<&PeerId>)> {
+        self.conn_to_remote_addr
+            .keys()
+            .map(|conn_id| (*conn_id, self.conn_to_peer.get(conn_id)))
+    }
+
     /// Returns the latest Identify information received for `peer_id`.
     pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
         self.peer_info.get(peer_id)
