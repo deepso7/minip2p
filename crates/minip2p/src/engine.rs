@@ -549,16 +549,21 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     }
 
     /// The path of an established connection (see the module docs); `None`
-    /// for a pending, replaced, or closed one.
+    /// for a pending, replaced, or closed one. A circuit is never Direct:
+    /// one whose remote address does not name its relay is a bug, and
+    /// reports no path rather than a wrong one.
     fn connection_path(&self, conn_id: ConnectionId) -> Option<Path> {
         self.core.connection_peer(conn_id)?;
-        if conn_id.is_circuit()
-            && let Some(relay) = self
+        if conn_id.is_circuit() {
+            let relay = self
                 .core
                 .connection_remote_addr(conn_id)
-                .and_then(circuit_relay)
-        {
-            return Some(Path::Relayed { relay });
+                .and_then(circuit_relay);
+            debug_assert!(
+                relay.is_some(),
+                "circuit {conn_id:?} has no /p2p/<relay>/p2p-circuit remote address"
+            );
+            return relay.map(|relay| Path::Relayed { relay });
         }
         #[cfg(feature = "_nat-driver")]
         if self.nat.as_ref().is_some_and(|nat| nat.is_punched(conn_id)) {

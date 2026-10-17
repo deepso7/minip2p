@@ -577,7 +577,8 @@ impl Drop for ExitGuard {
 
 /// Runs the driver until `stop` or a failure, then closes the endpoint
 /// outside the state lock: within the stop's timeout, or at once after a
-/// failure. Its last event is `EndpointClosed`; the guard then latches
+/// failure. The close's events, but for attempt terminals, are carried
+/// ahead of the last event, `EndpointClosed`; the guard then latches
 /// stopped. Only a panic leaves the endpoint to the guard's plain drop.
 pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
     shared.lock_state().driver_thread_id = Some(std::thread::current().id());
@@ -618,9 +619,18 @@ pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
         };
         (failure, endpoint, timeout)
     };
+    // The drain's events (connection ends among them) go to the binding
+    // ahead of `EndpointClosed`.
+    let mut drained = Vec::new();
     let closed = match endpoint {
         Some(endpoint) => {
             let report = endpoint.close_within(timeout);
+            drained.extend(
+                report
+                    .events
+                    .into_iter()
+                    .filter_map(crate::events::convert_detached_event),
+            );
             P2pEvent::EndpointClosed {
                 outcome: report.outcome.into(),
                 unfinished: report
@@ -642,7 +652,7 @@ pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
         && guard
             .shared
             .lock_events()
-            .ingest(failure.into_iter().chain([closed]))
+            .ingest(failure.into_iter().chain(drained).chain([closed]))
     {
         ring(doorbell);
     }

@@ -59,7 +59,10 @@ declare const TextEncoder: new () => {
 };
 
 const DEFAULT_TIMEOUT_MS = 65_000;
-/** Default close drain, matching the Rust `Endpoint::close`. */
+/**
+ * Default close drain: the Rust `minip2p::DEFAULT_CLOSE_TIMEOUT` (500 ms)
+ * that `Endpoint::close` and native's `DEFAULT_STOP_TIMEOUT_MS` use.
+ */
 const DEFAULT_CLOSE_TIMEOUT_MS = 500;
 const EVENT_QUEUE_CAP = 4096;
 const EVENT_FLUSH_BATCH = 256;
@@ -1337,8 +1340,7 @@ export class Minip2pBase {
     timeoutMs: number = DEFAULT_CLOSE_TIMEOUT_MS
   ): Promise<EndpointCloseReport> {
     assertTimeout(timeoutMs);
-    this.#teardown({ reason: "close" }, new ClosedError(), timeoutMs);
-    return this.#closing as Promise<EndpointCloseReport>;
+    return this.#teardown(new ClosedError(), timeoutMs);
   }
 
   /** Starts {@link close} with the default drain, without waiting for it. */
@@ -1917,7 +1919,7 @@ export class Minip2pBase {
         event.inner.detail
       );
       this.#dispatch("driverFailed", event.inner, event.inner);
-      this.#teardown({ error: failure, reason: "driverFailed" }, failure, 0);
+      void this.#teardown(failure, 0);
       return;
     }
 
@@ -2286,40 +2288,25 @@ export class Minip2pBase {
     }
   }
 
+  /**
+   * Closes the endpoint once, rejecting what is outstanding with `cause`;
+   * later calls return the first call's promise. A
+   * {@link DriverFailedError} cause reports a `driverFailed` close.
+   */
   #teardown(
-    reason:
-      | { readonly reason: "close" }
-      | { readonly reason: "driverFailed"; readonly error: DriverFailedError },
-    error: Error,
+    cause: ClosedError | DriverFailedError,
     timeoutMs: number
-  ): void {
-    if (this.#closed) {
-      return;
+  ): Promise<EndpointCloseReport> {
+    if (this.#closing !== undefined) {
+      return this.#closing;
     }
     this.#closed = true;
     this.#clearQueue();
     this.#dropped = 0;
     this.#named.clear();
     this.#catchAll.clear();
-    for (const waiter of [...this.#waiters]) {
-      this.#settleWaiter(waiter, error);
-    }
-    for (const attempt of this.#connects.values()) {
-      attempt.settle?.({ error, ok: false });
-    }
-    this.#connects.clear();
-    this.#terminalConnects.clear();
-    for (const pending of this.#pendingOpens.takeAll()) {
-      clearPendingOpen(pending);
-      pending.reject(error);
-    }
-    for (const stream of this.#streams.takeAll()) {
-      stream.terminal(error);
-    }
-    for (const ping of this.#pings.values()) {
-      ping.cancel(error);
-    }
-    this.#pings.clear();
+    // Native is asked to close before anything below can call back in: a
+    // re-entrant close returns this promise.
     let closed: Promise<BackendClosed>;
     try {
       closed = this.#backend.close(timeoutMs);
@@ -2329,11 +2316,11 @@ export class Minip2pBase {
         unfinished: [],
       });
     }
-    this.#closing = closed.then(({ outcome, unfinished }) => {
+    const closing = closed.then(({ outcome, unfinished }) => {
       const report: EndpointCloseReport =
-        reason.reason === "close"
-          ? { outcome, reason: "close", unfinished }
-          : { error: reason.error, reason: "driverFailed", unfinished };
+        cause instanceof DriverFailedError
+          ? { error: cause, reason: "driverFailed", unfinished }
+          : { outcome, reason: "close", unfinished };
       this.#closeReported = true;
       const closeHandlers = [...this.#closeHandlers];
       this.#closeHandlers.clear();
@@ -2346,6 +2333,27 @@ export class Minip2pBase {
       }
       return report;
     });
+    this.#closing = closing;
+    for (const waiter of [...this.#waiters]) {
+      this.#settleWaiter(waiter, cause);
+    }
+    for (const attempt of this.#connects.values()) {
+      attempt.settle?.({ error: cause, ok: false });
+    }
+    this.#connects.clear();
+    this.#terminalConnects.clear();
+    for (const pending of this.#pendingOpens.takeAll()) {
+      clearPendingOpen(pending);
+      pending.reject(cause);
+    }
+    for (const stream of this.#streams.takeAll()) {
+      stream.terminal(cause);
+    }
+    for (const ping of this.#pings.values()) {
+      ping.cancel(cause);
+    }
+    this.#pings.clear();
+    return closing;
   }
 
   #assertOpen(): void {

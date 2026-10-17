@@ -269,6 +269,10 @@ pub struct CloseReport {
     pub errors: Vec<Error>,
 }
 
+/// How long [`Endpoint::close`] waits for connections to finish their
+/// teardown. Bindings default their stop and close drains to it too.
+pub const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// How [`Endpoint::close_within`]'s drain ended. None of these is an
 /// [`Error`]: the endpoint is gone either way.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1106,13 +1110,14 @@ impl Endpoint {
         self.engine.shutdown_mdns(now)
     }
 
-    /// Disconnects established peers, waits up to 500 ms until none remain,
-    /// and consumes the endpoint: [`close_within`](Self::close_within) with
-    /// a 500 ms deadline.
+    /// Disconnects established peers, waits up to
+    /// [`DEFAULT_CLOSE_TIMEOUT`] (500 ms) until none remain, and consumes
+    /// the endpoint: [`close_within`](Self::close_within) with that
+    /// deadline.
     ///
     /// Named `close` because `shutdown` is already used for mDNS goodbyes.
     pub fn close(self) -> CloseReport {
-        self.close_within(Duration::from_millis(500))
+        self.close_within(DEFAULT_CLOSE_TIMEOUT)
     }
 
     /// Disconnects established peers, waits up to `timeout` until no

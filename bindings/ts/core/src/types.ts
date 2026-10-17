@@ -495,7 +495,7 @@ export const CloseOutcome = {
 export type CloseOutcome = (typeof CloseOutcome)[keyof typeof CloseOutcome];
 
 /** Why the endpoint stopped: the application closed it, or its driver failed. */
-export type EndpointCloseReason = "close" | "driverFailed";
+export type EndpointCloseReason = EndpointCloseReport["reason"];
 
 /**
  * What endpoint close observers receive once the native drain finished.

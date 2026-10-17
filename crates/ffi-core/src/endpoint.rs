@@ -51,9 +51,9 @@ pub struct P2pEndpoint {
     listen_addrs: Vec<String>,
 }
 
-/// The close drain a dropped [`P2pEndpoint`] grants, matching
-/// [`minip2p::Endpoint::close`].
-pub const DEFAULT_STOP_TIMEOUT_MS: u64 = 500;
+/// The close drain a dropped [`P2pEndpoint`] grants, in milliseconds:
+/// [`minip2p::DEFAULT_CLOSE_TIMEOUT`], as [`minip2p::Endpoint::close`] uses.
+pub const DEFAULT_STOP_TIMEOUT_MS: u64 = minip2p::DEFAULT_CLOSE_TIMEOUT.as_millis() as u64;
 
 /// How long an interrupted driver sleeps, once pending commands clear, before
 /// checking for further commands. See [`Shared::wait_for_commands`].
@@ -1941,6 +1941,56 @@ mod tests {
                     conn_id,
                     peer_id: Some(b.peer_id()),
                 }],
+            })
+        );
+        b.stop(0);
+    }
+
+    /// The drain's `ConnectionClosed` reaches the binding before the
+    /// `EndpointClosed` that reports the drain.
+    #[test]
+    fn stopping_delivers_the_drained_connection_close_before_endpoint_closed() {
+        let a = endpoint(config()).expect("endpoint a");
+        let b = endpoint(config()).expect("endpoint b");
+        a.start(Arc::new(NoopDoorbell)).expect("start a");
+        b.start(Arc::new(NoopDoorbell)).expect("start b");
+        a.connect(crate::ConnectTarget::Addresses {
+            addresses: vec![b.listen_addrs()[0].clone()],
+        })
+        .expect("connect");
+        // The binding takes the connection's events, so the carry keeps its end.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let conn_id = loop {
+            let established = a
+                .drain_events(u32::MAX)
+                .into_iter()
+                .find_map(|event| match event {
+                    P2pEvent::ConnectionEstablished { conn_id, .. } => Some(conn_id),
+                    _ => None,
+                });
+            if let Some(conn_id) = established {
+                break conn_id;
+            }
+            assert!(Instant::now() < deadline, "a never connected to b");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        a.stop(5_000);
+
+        assert!(a.wait_stopped(10_000));
+        let events = a.drain_events(u32::MAX);
+        let closed_at = events
+            .iter()
+            .position(|event| {
+                matches!(event, P2pEvent::ConnectionClosed { conn_id: closed, .. } if *closed == conn_id)
+            })
+            .unwrap_or_else(|| panic!("no ConnectionClosed in {events:?}"));
+        assert!(closed_at < events.len() - 1, "{events:?}");
+        assert_eq!(
+            events.last(),
+            Some(&P2pEvent::EndpointClosed {
+                outcome: crate::CloseOutcome::Drained,
+                unfinished: Vec::new(),
             })
         );
         b.stop(0);

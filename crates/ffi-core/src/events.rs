@@ -816,6 +816,17 @@ pub(crate) fn convert_endpoint_event(
             peer_id,
             outcome,
         } => convert_settled(connect_id, &peer_id, outcome, endpoint.path(&peer_id)),
+        other => convert_detached_event(other),
+    }
+}
+
+/// Converts an event without its endpoint, as the events a closed
+/// endpoint's drain reports must be. A `ConnectSettled`, whose path only the
+/// endpoint knows, yields nothing: shells settle attempts on stop
+/// themselves (see [`P2pEndpoint::stop`](crate::P2pEndpoint::stop)).
+pub(crate) fn convert_detached_event(event: EndpointEvent) -> Option<P2pEvent> {
+    match event {
+        EndpointEvent::ConnectSettled { .. } => None,
         EndpointEvent::Nat(event) => convert_nat(event),
         EndpointEvent::Gossipsub(event) => Some(convert_gossipsub(event)),
         EndpointEvent::Discovery(event) => Some(convert_discovery(event)),
