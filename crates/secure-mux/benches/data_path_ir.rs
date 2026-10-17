@@ -1,14 +1,27 @@
 use gungraun::prelude::*;
 use minip2p_core::Bytes;
 use minip2p_secure_mux::yamux::{
-    FLAG_SYN, Frame, FrameDecoder, FrameType, YamuxConfig, YamuxOutput, YamuxRole, YamuxSession,
+    DEFAULT_RECEIVE_WINDOW, FLAG_SYN, Frame, FrameDecoder, FrameType, YamuxConfig, YamuxOutput,
+    YamuxRole, YamuxSession,
 };
 use std::hint::black_box;
 
 const PAYLOAD_LEN: usize = 64 * 1024;
 
+/// A session with the specification's 256 KiB window: the default grants
+/// more with each stream's first window update, which these benches would
+/// otherwise measure as an extra frame per fresh stream. Pinned so the data
+/// path stays comparable across releases.
+fn session(role: YamuxRole) -> YamuxSession {
+    let config = YamuxConfig {
+        receive_window: DEFAULT_RECEIVE_WINDOW,
+        ..YamuxConfig::default()
+    };
+    YamuxSession::with_config(role, config).expect("valid config")
+}
+
 fn sender() -> (YamuxSession, u32, Vec<u8>) {
-    let mut session = YamuxSession::new(YamuxRole::Client);
+    let mut session = session(YamuxRole::Client);
     let stream = session.open_stream().expect("open stream");
     (session, stream, vec![0x5a; PAYLOAD_LEN])
 }
@@ -25,7 +38,7 @@ fn receiver() -> (YamuxSession, Vec<u8>) {
     let inbound = Frame::data(1, FLAG_SYN, vec![0x5a; PAYLOAD_LEN])
         .expect("valid frame")
         .encode();
-    (YamuxSession::new(YamuxRole::Server), inbound)
+    (session(YamuxRole::Server), inbound)
 }
 
 #[library_benchmark]
@@ -42,7 +55,7 @@ const WINDOW_STEP: u32 = 16 * 1024;
 
 /// A client stream that has spent its whole initial send window.
 fn window_exhausted_sender() -> (YamuxSession, u32) {
-    let mut session = YamuxSession::new(YamuxRole::Client);
+    let mut session = session(YamuxRole::Client);
     let stream = session.open_stream().expect("open stream");
     session
         .send(stream, Bytes::from(vec![0; QUEUED_LEN]))
@@ -114,6 +127,7 @@ const SPARSE_LEN: usize = 64;
 fn idle_streams_sender() -> (YamuxSession, Vec<u32>, Vec<u8>) {
     let config = YamuxConfig {
         max_streams: IDLE_STREAMS,
+        receive_window: DEFAULT_RECEIVE_WINDOW,
         ..YamuxConfig::default()
     };
     let mut session = YamuxSession::with_config(YamuxRole::Client, config).expect("config");
