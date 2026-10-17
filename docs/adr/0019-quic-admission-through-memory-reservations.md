@@ -23,7 +23,7 @@ The workspace forbids `unsafe`. One call is exempt: quinn-udp's `unsafe fn set_a
 
 ## Consequences
 
-- A transport's queued QUIC memory is at most `memory_budget_bytes`, whatever the churn pattern; dual-stack no longer doubles any limit.
+- A transport's queued QUIC memory is at most `memory_budget_bytes`, whatever the churn pattern; dual-stack no longer doubles any limit. One exception: datagrams from one receive call share an allocation (one GRO batch, or up to 32 datagrams where the platform batches receives without GRO, #371), and a stream chunk the engine still buffers keeps all of it alive while the engine counts only its packet. A peer padding its stream packets with junk datagrams can therefore pin up to that many times the reserved receive windows.
 - With the default windows, a single connection buffers less in flight than the 10 MB windows it replaced. #361 then tuned them on an emulated 100 Mbit/s, 100 ms link: a 1,536 KiB stream window and a 1,216 KiB send window are the smallest that reach 90% of a large window's goodput, and the connection window grew to 5 MiB, though throughput alone needs 1.5 MiB, so three stalled streams still leave control streams credit. The default budget grew to 640 MiB to keep the 64-connection floor (65 with a stream each). Fat, short paths give some up: on 1 Gbit/s at 20 ms a single stream gets about half the link.
 - A reader that never acknowledges now exhausts the budget, not just the connection slots: new streams and connections are refused until it acknowledges or abandons.
 - TCP and circuits got their own memory budgets in the same terms: see ADR 0021 (#357).

@@ -83,9 +83,11 @@ fn datagram_count(len: usize, segment_size: Option<usize>) -> usize {
     }
 }
 
-/// What one receive call read: one datagram, or a GRO batch of datagrams
+/// What one receive slot holds: one datagram, or a GRO batch of datagrams
 /// `stride` bytes apart (the last may be shorter).
 pub(crate) struct Received {
+    /// Where the slot starts in the receive buffer.
+    pub(crate) offset: usize,
     pub(crate) len: usize,
     pub(crate) stride: usize,
     pub(crate) from: SocketAddr,
@@ -141,6 +143,9 @@ pub(crate) struct Socket {
     /// Logical datagrams received.
     #[cfg(test)]
     pub(crate) received: usize,
+    /// Receive calls that returned input.
+    #[cfg(test)]
+    pub(crate) recv_calls: usize,
 }
 
 impl Socket {
@@ -183,6 +188,8 @@ impl Socket {
             largest_transmit: 0,
             #[cfg(test)]
             received: 0,
+            #[cfg(test)]
+            recv_calls: 0,
         })
     }
 
@@ -192,10 +199,24 @@ impl Socket {
         self.state.may_fragment()
     }
 
-    /// A receive buffer that holds one full GRO batch, or one datagram of
-    /// any size.
+    /// Datagram slots one receive call fills: several where the platform
+    /// batches receives without GRO, one GRO batch otherwise.
+    pub(crate) fn recv_slots(&self) -> usize {
+        if self.state.gro_segments() > 1 {
+            1
+        } else {
+            quinn_udp::BATCH_SIZE
+        }
+    }
+
+    /// A receive buffer of [`Self::recv_slots`] slots: a lone slot holds one
+    /// full GRO batch, or one datagram of any size; several each hold one
+    /// datagram of up to `max_udp_payload` bytes.
     pub(crate) fn recv_buffer_len(&self, max_udp_payload: usize) -> usize {
-        (self.state.gro_segments() * max_udp_payload).max(MAX_DATAGRAM_SIZE)
+        match self.recv_slots() {
+            1 => (self.state.gro_segments() * max_udp_payload).max(MAX_DATAGRAM_SIZE),
+            slots => slots * max_udp_payload,
+        }
     }
 
     /// How many logical datagrams the next transmit may carry: what the
@@ -320,37 +341,62 @@ impl Socket {
         self.retained = 0;
     }
 
-    /// Reads what is queued into `buf`; `None` once nothing is.
-    pub(crate) fn recv(&mut self, buf: &mut [u8]) -> io::Result<Option<Received>> {
-        let mut meta = [RecvMeta::default()];
-        match self
-            .state
-            .recv((&self.udp).into(), &mut [IoSliceMut::new(buf)], &mut meta)
-        {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+    /// Reads what is queued into `buf`, cut into [`Self::recv_slots`] equal
+    /// slots, and appends one [`Received`] per filled slot to `received`.
+    /// Returns `false` once nothing is queued.
+    ///
+    /// A datagram larger than its slot, which a peer honouring the
+    /// endpoint's advertised maximum payload never sends, arrives truncated
+    /// and the engine drops it.
+    pub(crate) fn recv(
+        &mut self,
+        buf: &mut [u8],
+        received: &mut Vec<Received>,
+    ) -> io::Result<bool> {
+        let slots = self.recv_slots();
+        let slot_len = buf.len() / slots;
+        let mut chunks = buf.chunks_mut(slot_len);
+        let mut bufs: [IoSliceMut<'_>; quinn_udp::BATCH_SIZE] =
+            std::array::from_fn(|_| IoSliceMut::new(chunks.next().unwrap_or_default()));
+        let mut meta = [RecvMeta::default(); quinn_udp::BATCH_SIZE];
+        let within = "receive slots never exceed quinn-udp's BATCH_SIZE";
+        let count = match self.state.recv(
+            (&self.udp).into(),
+            bufs.get_mut(..slots).expect(within),
+            meta.get_mut(..slots).expect(within),
+        ) {
+            Ok(count) => count,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
             Err(e) => return Err(e),
-        }
-        let [meta] = meta;
-        let received = Received {
-            len: meta.len,
-            stride: if meta.stride == 0 {
-                meta.len
-            } else {
-                meta.stride
-            },
-            from: meta.addr,
-            ecn: meta
-                .ecn
-                .and_then(|ecn| quinn_proto::EcnCodepoint::from_bits(ecn as u8)),
-            dst_ip: meta.dst_ip,
         };
-        self.tally.received(received.datagrams(), received.len);
+        for (slot, meta) in meta.iter().take(count).enumerate() {
+            let batch = Received {
+                offset: slot * slot_len,
+                len: meta.len,
+                stride: if meta.stride == 0 {
+                    meta.len
+                } else {
+                    meta.stride
+                },
+                from: meta.addr,
+                ecn: meta
+                    .ecn
+                    .and_then(|ecn| quinn_proto::EcnCodepoint::from_bits(ecn as u8)),
+                dst_ip: meta.dst_ip,
+            };
+            self.tally.received(batch.datagrams(), batch.len);
+            #[cfg(test)]
+            {
+                self.received += batch.datagrams();
+            }
+            received.push(batch);
+        }
+        self.tally.receive_call();
         #[cfg(test)]
         {
-            self.received += received.datagrams();
+            self.recv_calls += 1;
         }
-        Ok(Some(received))
+        Ok(true)
     }
 
     /// Segments the platform lets one transmit carry.

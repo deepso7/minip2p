@@ -330,10 +330,13 @@ pub struct QuicTransport {
     pending_events: Vec<TransportEvent>,
     /// Reused by every receive.
     recv_buf: Vec<u8>,
+    /// Reused by every receive: the slots one receive call filled.
+    recv_slots: Vec<Received>,
     /// Reused by every transmit and stateless reply.
     send_buf: Vec<u8>,
-    /// Connections the current poll routed datagrams to, or accepted.
-    received: BTreeSet<ConnectionId>,
+    /// Connections the current poll routed datagrams to, or accepted,
+    /// possibly repeated; reused so routing allocates nothing per poll.
+    received: Vec<ConnectionId>,
     /// Every connection's cached engine timeout, earliest first, so a poll
     /// finds the due ones and `next_deadline` the next one without visiting
     /// every connection.
@@ -534,8 +537,9 @@ impl QuicTransport {
             handles: HashMap::new(),
             pending_events: Vec::new(),
             recv_buf: vec![0; recv_buf_len],
+            recv_slots: Vec::new(),
             send_buf: Vec::new(),
-            received: BTreeSet::new(),
+            received: Vec::new(),
             timers: BTreeSet::new(),
             unfinished: BTreeSet::new(),
             due: Vec::new(),
@@ -639,40 +643,58 @@ impl QuicTransport {
     /// datagrams have arrived, and hands each to the engine. Connections only
     /// queue output here; the sweep sends it.
     ///
-    /// A GRO batch already read is always split to the end, so the bound can
-    /// be overshot by less than one batch.
+    /// What one receive call read (several datagrams where the platform
+    /// batches receives, a GRO batch where it coalesces them) is always
+    /// handled to the end, so the bound can be overshot by less than one
+    /// call's worth.
     fn recv_batch(&mut self, now: Instant, index: usize) -> Result<(), TransportError> {
+        let mut slots = std::mem::take(&mut self.recv_slots);
+        let result = self.recv_into(now, index, &mut slots);
+        self.recv_slots = slots;
+        result
+    }
+
+    /// [`Self::recv_batch`], with `slots` as scratch for what each receive
+    /// call filled.
+    fn recv_into(
+        &mut self,
+        now: Instant,
+        index: usize,
+        slots: &mut Vec<Received>,
+    ) -> Result<(), TransportError> {
         let mut datagrams = 0;
         let mut saturated = true;
         while datagrams < MAX_DATAGRAMS_PER_POLL {
             let Some(socket) = self.sockets.get_mut(index) else {
                 return Ok(());
             };
+            slots.clear();
             // Through the registered clone's `try_io` once attached: on
             // Windows mio only re-arms readiness when it sees the
             // `WouldBlock` itself, and a receive on the original socket would
             // hide it, leaving later datagrams with no wakeup.
             let recv_buf = &mut self.recv_buf;
-            let received = match self.registered.get(index) {
+            let read = match self.registered.get(index) {
                 Some(registered) => registered
                     .try_io(|| {
                         socket
-                            .recv(recv_buf)?
+                            .recv(recv_buf, slots)?
+                            .then_some(())
                             .ok_or_else(|| std::io::ErrorKind::WouldBlock.into())
                     })
-                    .map(Some)
+                    .map(|()| true)
                     .or_else(|error| {
                         if error.kind() == std::io::ErrorKind::WouldBlock {
-                            Ok(None)
+                            Ok(false)
                         } else {
                             Err(error)
                         }
                     }),
-                None => socket.recv(recv_buf),
+                None => socket.recv(recv_buf, slots),
             };
-            let received = match received {
-                Ok(Some(received)) => received,
-                Ok(None) => {
+            match read {
+                Ok(true) => {}
+                Ok(false) => {
                     saturated = false;
                     break;
                 }
@@ -680,17 +702,24 @@ impl QuicTransport {
                     socket.saturated = false;
                     return Err(TransportError::io("receiving UDP datagrams", &e));
                 }
-            };
-            datagrams += received.datagrams();
-            // One allocation per batch; each datagram is a slice of it.
-            let mut batch = BytesMut::from(
-                self.recv_buf
-                    .get(..received.len)
-                    .expect("UDP receive lengths fit the supplied buffer"),
-            );
-            while !batch.is_empty() {
-                let datagram = batch.split_to(received.stride.min(batch.len()));
-                self.handle_datagram(now, index, &received, datagram);
+            }
+            // One allocation per receive call, whatever it read; each
+            // datagram is a slice of it.
+            let mut data = BytesMut::with_capacity(slots.iter().map(|slot| slot.len).sum());
+            for slot in slots.iter() {
+                data.extend_from_slice(
+                    self.recv_buf
+                        .get(slot.offset..slot.offset + slot.len)
+                        .expect("UDP receive lengths fit their slots"),
+                );
+            }
+            for slot in slots.iter() {
+                datagrams += slot.datagrams();
+                let mut rest = data.split_to(slot.len);
+                while !rest.is_empty() {
+                    let datagram = rest.split_to(slot.stride.min(rest.len()));
+                    self.handle_datagram(now, index, slot, datagram);
+                }
             }
         }
         if let Some(socket) = self.sockets.get_mut(index) {
@@ -726,7 +755,11 @@ impl QuicTransport {
                     .and_then(|(_, id)| self.connections.get_mut(id).map(|conn| (id, conn)))
                 {
                     conn.handle_event(event);
-                    self.received.insert(id);
+                    // `service_due` dedups; this only keeps a burst to one
+                    // connection from repeating it.
+                    if self.received.last() != Some(&id) {
+                        self.received.push(id);
+                    }
                 }
             }
             Some(DatagramEvent::NewConnection(incoming)) => {
@@ -797,7 +830,7 @@ impl QuicTransport {
                     QuicConnection::new(id, handle, conn, endpoint.clone(), &limits, counters);
                 self.connections.insert(id, conn);
                 self.handles.insert(handle, id);
-                self.received.insert(id);
+                self.received.push(id);
                 self.pending_events
                     .push(TransportEvent::IncomingConnection { id, endpoint });
             }
@@ -815,7 +848,7 @@ impl QuicTransport {
     fn service_due(&mut self, now: Instant) {
         let mut due = std::mem::take(&mut self.due);
         due.clear();
-        due.extend(std::mem::take(&mut self.received));
+        due.append(&mut self.received);
         due.extend(self.unfinished.iter().copied());
         due.extend(
             self.timers
@@ -893,7 +926,7 @@ impl QuicTransport {
             self.timers.remove(&(timeout, id));
         }
         self.unfinished.remove(&id);
-        self.received.remove(&id);
+        self.received.retain(|&received| received != id);
         let held = self.unsettled.streams();
         self.unsettled.insert(id, conn.unsettled_streams());
         let kept = self.unsettled.streams() - held;

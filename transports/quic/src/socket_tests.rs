@@ -150,6 +150,27 @@ fn a_burst_past_the_receive_bound_drains_without_another_readiness_edge() {
 }
 
 #[test]
+fn one_receive_call_reads_several_queued_datagrams_where_the_platform_batches() {
+    let mut transport = loopback(QuicNodeConfig::generate());
+    if transport.socket().recv_slots() == 1 {
+        return;
+    }
+    let destination = transport.local_addr();
+    // Junk the endpoint drops, sent one datagram at a time.
+    const DATAGRAMS: usize = 16;
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+    for _ in 0..DATAGRAMS {
+        sender.send_to(&[0x40; 100], destination).expect("send");
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    transport.poll(now()).expect("poll");
+    assert_eq!(transport.socket().received, DATAGRAMS);
+    let calls = transport.socket().recv_calls;
+    assert!(calls < DATAGRAMS, "{calls} receive calls for {DATAGRAMS}");
+}
+
+#[test]
 fn sockets_report_the_buffers_they_were_granted() {
     let mut server = listening_server(QuicLimits::default());
     let buffers = server.socket().buffers;

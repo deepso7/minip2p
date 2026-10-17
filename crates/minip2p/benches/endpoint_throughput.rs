@@ -21,11 +21,12 @@
 //! The QUIC-carried cases (`quic`, and `relayed`, whose circuit runs over two
 //! QUIC legs through the relay) also report, from the timing pass, each
 //! Endpoint's UDP datagrams per direction: `datagrams_per_mb` and
-//! `avg_datagram_bytes`, under `endpoint_throughput/{case}/{endpoint}/{sent,
-//! received}` for the client, the target and, in `relayed`, the relay (both
-//! of its legs together). They count datagrams the Endpoint's QUIC sockets
-//! actually sent or received, not packets the QUIC engine generated, from the
-//! `diagnostics` counters of `minip2p-quic` that the `bench` feature enables.
+//! `avg_datagram_bytes`, plus `datagrams_per_receive_call` for received, under
+//! `endpoint_throughput/{case}/{endpoint}/{sent, received}` for the client,
+//! the target and, in `relayed`, the relay (both of its legs together). They
+//! count datagrams the Endpoint's QUIC sockets actually sent or received, not
+//! packets the QUIC engine generated, from the `diagnostics` counters of
+//! `minip2p-quic` that the `bench` feature enables.
 //! Each such Endpoint's granted socket buffer sizes are printed alongside.
 //!
 //! Allocations come from `stats_alloc`, installed as this binary's global
@@ -180,6 +181,20 @@ fn rows(case: &str, roles: &Roles, timing: (Mark, Mark), allocation: (Mark, Mark
             rows.push((name.clone(), "datagrams_per_mb", datagrams_per_mb));
             rows.push((name, "avg_datagram_bytes", avg_datagram_bytes));
         }
+        assert!(
+            counts.receive_calls > 0,
+            "{case}: the {role} made no receive calls"
+        );
+        let datagrams_per_receive_call = counts.received as f64 / counts.receive_calls as f64;
+        println!(
+            "endpoint_throughput/{case}/{role}/received: \
+             {datagrams_per_receive_call:.2} datagrams/receive call"
+        );
+        rows.push((
+            format!("endpoint_throughput/{case}/{role}/received"),
+            "datagrams_per_receive_call",
+            datagrams_per_receive_call,
+        ));
     }
 
     rows.into_iter()
