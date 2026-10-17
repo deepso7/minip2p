@@ -409,6 +409,9 @@ pub(crate) struct SwarmState {
     /// cannot replace an already-valid peer connection (e.g. after a failed
     /// `abort_dial`). Cleared on close, not on the first establish-stage event.
     vetoed_establishes: BTreeSet<ConnectionId>,
+    /// Dials taken off `pending_dials` to be aborted: their close is silent
+    /// whatever its reason. Cleared on close.
+    aborted_dials: BTreeSet<ConnectionId>,
     /// Connections handed over by a Connection replacement, awaiting the
     /// transport's `Closed`. Every other transport event on them is ignored,
     /// so a late identity, stream, or establish event can never re-register
@@ -502,6 +505,7 @@ impl SwarmState {
             established_peers: BTreeSet::new(),
             pending_dials: BTreeMap::new(),
             vetoed_establishes: BTreeSet::new(),
+            aborted_dials: BTreeSet::new(),
             retired_connections: BTreeSet::new(),
             local_peer_id,
             registrations: BTreeMap::new(),
@@ -1278,9 +1282,9 @@ impl SwarmState {
         &mut self,
         conn_id: ConnectionId,
     ) -> Option<(PeerAddr, Option<String>)> {
-        self.pending_dials
-            .remove(&conn_id)
-            .map(|pending| (pending.addr, pending.last_error))
+        let pending = self.pending_dials.remove(&conn_id)?;
+        self.aborted_dials.insert(conn_id);
+        Some((pending.addr, pending.last_error))
     }
 
     /// Puts a previously taken pending dial back, preserving `last_error`.
@@ -1290,6 +1294,7 @@ impl SwarmState {
         addr: PeerAddr,
         last_error: Option<String>,
     ) {
+        self.aborted_dials.remove(&conn_id);
         self.pending_dials
             .insert(conn_id, PendingDial { addr, last_error });
     }
@@ -2348,10 +2353,17 @@ impl SwarmState {
         }
     }
 
+    /// Ends a connection with at most one event: `DialFailed` for our
+    /// pending dial, `ConnectionClosed` for an established connection, and
+    /// otherwise -- a connection that failed before it ever established, such
+    /// as an inbound handshake -- a [`SwarmErrorKind::Transport`] error with
+    /// the reason, unless we closed it ourselves or aborted its dial.
     fn handle_connection_closed(&mut self, conn_id: ConnectionId, reason: ConnectionCloseReason) {
         self.conn_to_remote_addr.remove(&conn_id);
         self.registrations.remove(&conn_id);
-        self.vetoed_establishes.remove(&conn_id);
+        // A vetoed establish already reported its dial as `DialFailed`.
+        let mut reported = self.vetoed_establishes.remove(&conn_id);
+        reported |= self.aborted_dials.remove(&conn_id);
 
         if let Some(pending) = self.pending_dials.remove(&conn_id) {
             let reason = pending
@@ -2362,6 +2374,7 @@ impl SwarmState {
                 addr: pending.addr,
                 reason,
             });
+            reported = true;
         }
 
         if let Some(peer_id) = self.conn_to_peer.remove(&conn_id)
@@ -2375,8 +2388,9 @@ impl SwarmState {
                 self.events.push_back(SwarmEvent::ConnectionClosed {
                     peer_id,
                     conn_id,
-                    reason,
+                    reason: reason.clone(),
                 });
+                reported = true;
             } else {
                 // Connected-without-identity synthesizes a placeholder peer
                 // the application never saw established, so there is no
@@ -2385,6 +2399,14 @@ impl SwarmState {
             }
         }
 
+        if !reported && reason != ConnectionCloseReason::Local {
+            self.emit_error(
+                SwarmErrorKind::Transport,
+                None,
+                Some(conn_id),
+                format!("connection {conn_id} failed before it was established: {reason}"),
+            );
+        }
         self.forget_connection_streams(conn_id);
     }
 
@@ -5920,6 +5942,70 @@ mod tests {
             drain_events(&mut core).is_empty(),
             "forgotten dials must not emit DialFailed"
         );
+    }
+
+    #[test]
+    fn a_connection_that_fails_before_establishing_reports_a_transport_error() {
+        let mut core = test_core();
+        let conn_id = ConnectionId::new(91);
+        feed(
+            &mut core,
+            TransportEvent::IncomingConnection {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            },
+        );
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: conn_id,
+                reason: ConnectionCloseReason::TimedOut,
+            },
+        );
+        assert!(matches!(
+            drain_events(&mut core).as_slice(),
+            [SwarmEvent::Error(SwarmRuntimeError {
+                kind: SwarmErrorKind::Transport,
+                peer_id: None,
+                conn_id: Some(failed),
+                detail,
+                ..
+            })] if *failed == conn_id && detail.ends_with("timed out")
+        ));
+
+        // Closing it ourselves is no failure.
+        let closed = ConnectionId::new(92);
+        feed(
+            &mut core,
+            TransportEvent::IncomingConnection {
+                id: closed,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            },
+        );
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: closed,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
+        assert!(drain_events(&mut core).is_empty());
+    }
+
+    #[test]
+    fn an_aborted_dial_that_fails_anyway_stays_silent() {
+        let mut core = test_core();
+        let (_, addr, conn_id) = noted_dial_addr(b"aborted-dial-failed");
+        core.note_dial(conn_id, addr);
+        assert!(core.take_pending_dial(conn_id).is_some());
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: conn_id,
+                reason: ConnectionCloseReason::Error("refused".into()),
+            },
+        );
+        assert!(drain_events(&mut core).is_empty());
     }
 
     #[test]

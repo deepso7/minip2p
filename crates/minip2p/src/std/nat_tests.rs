@@ -3,7 +3,7 @@ use crate::ConnectionCloseReason;
 use minip2p_core::Multiaddr;
 use minip2p_core::platform::StdEntropy;
 use minip2p_nat::{NatAction, NatAgent, NatEvent, Now};
-use minip2p_swarm::SwarmEvent;
+use minip2p_swarm::{SwarmErrorKind, SwarmEvent};
 use minip2p_transport::Transport;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
 use std::time::Instant;
@@ -939,17 +939,11 @@ fn remote_bridge_reset_closes_promoted_circuit() {
         .reset_stream(pair.relay_conn, pair.stream)
         .expect("reset bridge at relay");
 
-    // The circuit was never established, so its close reaches no one: it
-    // simply leaves the transport.
+    // The circuit never established, so its failure surfaces as a transport
+    // error naming it rather than as a ConnectionClosed.
     let deadline = Instant::now() + std::time::Duration::from_secs(2);
-    while Instant::now() < deadline
-        && pair
-            .local
-            .core()
-            .transport()
-            .circuit_ids()
-            .contains(&promoted)
-    {
+    let mut circuit_failed = false;
+    while Instant::now() < deadline && !circuit_failed {
         match pair
             .relay
             .raw_poll_next(std::time::Duration::from_millis(10))
@@ -962,19 +956,27 @@ fn remote_bridge_reset_closes_promoted_circuit() {
             .raw_poll_next(std::time::Duration::from_millis(10))
             .expect("drive reset receiver")
         {
+            circuit_failed = matches!(
+                &event,
+                SwarmEvent::Error(error)
+                    if error.kind == SwarmErrorKind::Transport && error.conn_id == Some(promoted)
+            );
             let now = pair.local.now();
             driver.ingest(&event, pair.local.core_mut(), now);
         }
     }
 
     assert!(
+        circuit_failed,
+        "remote RESET_STREAM did not fail the promoted circuit"
+    );
+    assert!(
         !pair
             .local
             .core()
             .transport()
             .circuit_ids()
-            .contains(&promoted),
-        "remote RESET_STREAM did not fail the promoted circuit"
+            .contains(&promoted)
     );
     // The circuit vanished without a lifecycle event the driver saw; the
     // next batch's capability pass forgets its promotion.
