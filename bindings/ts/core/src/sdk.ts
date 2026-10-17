@@ -20,9 +20,15 @@ import {
   TimeoutError,
   WriteBufferFullError,
 } from "./errors.js";
-import { CloseOutcome, P2pEvent_Tags, PathKind_Tags } from "./types.js";
+import {
+  CloseOutcome,
+  ConnectionCloseReason_Tags,
+  P2pEvent_Tags,
+  PathKind_Tags,
+} from "./types.js";
 import type {
   Bytes,
+  ConnectionCloseReason,
   ConnectionInfo,
   ConnectOptions,
   ConnectResult,
@@ -41,6 +47,7 @@ import type {
   P2pEventTag,
   Path,
   PathKind,
+  RawConnectionCloseReason,
   Reachability,
   RelayReservationInfo,
   Unsubscribe,
@@ -2446,8 +2453,35 @@ function normalizeEvent(
       from: normalizePath(event.inner.from),
       to: normalizePath(event.inner.to),
     };
+  } else if (event.tag === P2pEvent_Tags.ConnectionClosed) {
+    payload = {
+      ...event.inner,
+      reason: normalizeCloseReason(event.inner.reason),
+    };
   }
   return { payload: payload as AnyPayload, type };
+}
+
+function normalizeCloseReason(
+  reason: RawConnectionCloseReason
+): ConnectionCloseReason {
+  switch (reason.tag) {
+    case ConnectionCloseReason_Tags.Local: {
+      return { kind: "local" };
+    }
+    case ConnectionCloseReason_Tags.Remote: {
+      return { code: reason.inner.code, kind: "remote" };
+    }
+    case ConnectionCloseReason_Tags.TimedOut: {
+      return { kind: "timedOut" };
+    }
+    case ConnectionCloseReason_Tags.Stalled: {
+      return { kind: "stalled" };
+    }
+    case ConnectionCloseReason_Tags.Error: {
+      return { kind: "error", message: reason.inner.message };
+    }
+  }
 }
 
 function normalizePath(path: PathKind): Path {

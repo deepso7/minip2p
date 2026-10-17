@@ -571,7 +571,10 @@ describe("Node adapter", () => {
     await settle();
     fake.enqueue(
       [
-        { inner: { connId: 10n, peerId: "remote" }, tag: "ConnectionClosed" },
+        {
+          inner: { connId: 10n, peerId: "remote", reason: { tag: "Local" } },
+          tag: "ConnectionClosed",
+        },
         {
           inner: { connId: 10n, peerId: "remote" },
           tag: "ConnectionEstablished",

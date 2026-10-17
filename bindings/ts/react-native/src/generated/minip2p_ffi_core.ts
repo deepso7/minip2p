@@ -976,6 +976,266 @@ const FfiConverterTypeConnectTarget = (() => {
     return new FFIConverter();
 })();
 
+
+// Enum: ConnectionCloseReason
+export enum ConnectionCloseReason_Tags {
+    Local = "Local",
+    Remote = "Remote",
+    TimedOut = "TimedOut",
+    Stalled = "Stalled",
+    Error = "Error"
+}
+/**
+ * Why one connection ended; see `minip2p::ConnectionCloseReason`.
+ */
+export const ConnectionCloseReason = (() => {
+
+    type Local__interface = {
+        tag: ConnectionCloseReason_Tags.Local
+    };
+    /**
+     * We closed it.
+     */
+    class Local_ extends UniffiEnum implements Local__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "ConnectionCloseReason";
+        readonly tag = ConnectionCloseReason_Tags.Local;
+        constructor() {
+            super("ConnectionCloseReason", "Local");
+        }
+
+        static new(): Local_ {
+            return new Local_();
+        }
+
+        static instanceOf(obj: any): obj is Local_ {
+            return obj.tag === ConnectionCloseReason_Tags.Local;
+        }
+
+    }
+
+    type Remote__interface = {
+        tag: ConnectionCloseReason_Tags.Remote;
+        inner:
+Readonly<{code: bigint}>
+    };
+    /**
+     * The peer closed it with `code`: its QUIC CONNECTION_CLOSE code, or
+     * its Yamux `GoAway` code on TCP and relay circuits.
+     */
+    class Remote_ extends UniffiEnum implements Remote__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "ConnectionCloseReason";
+        readonly tag = ConnectionCloseReason_Tags.Remote;
+        readonly inner:
+Readonly<{code: bigint}>;
+        constructor(
+inner: {code: bigint }) {
+            super("ConnectionCloseReason", "Remote");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {code: bigint }): Remote_ {
+            return new Remote_(inner);
+        }
+
+        static instanceOf(obj: any): obj is Remote_ {
+            return obj.tag === ConnectionCloseReason_Tags.Remote;
+        }
+
+    }
+
+    type TimedOut__interface = {
+        tag: ConnectionCloseReason_Tags.TimedOut
+    };
+    /**
+     * The peer went silent (an idle, keepalive or handshake timeout).
+     */
+    class TimedOut_ extends UniffiEnum implements TimedOut__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "ConnectionCloseReason";
+        readonly tag = ConnectionCloseReason_Tags.TimedOut;
+        constructor() {
+            super("ConnectionCloseReason", "TimedOut");
+        }
+
+        static new(): TimedOut_ {
+            return new TimedOut_();
+        }
+
+        static instanceOf(obj: any): obj is TimedOut_ {
+            return obj.tag === ConnectionCloseReason_Tags.TimedOut;
+        }
+
+    }
+
+    type Stalled__interface = {
+        tag: ConnectionCloseReason_Tags.Stalled
+    };
+    /**
+     * The peer stopped reading (a TCP send stall).
+     */
+    class Stalled_ extends UniffiEnum implements Stalled__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "ConnectionCloseReason";
+        readonly tag = ConnectionCloseReason_Tags.Stalled;
+        constructor() {
+            super("ConnectionCloseReason", "Stalled");
+        }
+
+        static new(): Stalled_ {
+            return new Stalled_();
+        }
+
+        static instanceOf(obj: any): obj is Stalled_ {
+            return obj.tag === ConnectionCloseReason_Tags.Stalled;
+        }
+
+    }
+
+    type Error__interface = {
+        tag: ConnectionCloseReason_Tags.Error;
+        inner:
+Readonly<{message: string}>
+    };
+    /**
+     * Anything else that ended it.
+     */
+    class Error_ extends UniffiEnum implements Error__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "ConnectionCloseReason";
+        readonly tag = ConnectionCloseReason_Tags.Error;
+        readonly inner:
+Readonly<{message: string}>;
+        constructor(
+inner: {message: string }) {
+            super("ConnectionCloseReason", "Error");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {message: string }): Error_ {
+            return new Error_(inner);
+        }
+
+        static instanceOf(obj: any): obj is Error_ {
+            return obj.tag === ConnectionCloseReason_Tags.Error;
+        }
+
+    }
+
+    function instanceOf(obj: any): obj is ConnectionCloseReason {
+        return obj[uniffiTypeNameSymbol] === "ConnectionCloseReason";
+    }
+
+    return Object.freeze({
+        instanceOf,
+  Local: Local_,
+  Remote: Remote_,
+  TimedOut: TimedOut_,
+  Stalled: Stalled_,
+  Error: Error_
+    });
+
+})();
+/**
+ * Why one connection ended; see `minip2p::ConnectionCloseReason`.
+ */
+export type ConnectionCloseReason = InstanceType<
+    typeof ConnectionCloseReason['Local' | 'Remote' | 'TimedOut' | 'Stalled' | 'Error']
+>;
+
+// FfiConverter for enum ConnectionCloseReason
+const FfiConverterTypeConnectionCloseReason = (() => {
+    type TypeName = ConnectionCloseReason;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            switch (c.readI32()) {
+                case 1: return new ConnectionCloseReason.Local();
+                case 2: return new ConnectionCloseReason.Remote({code: FfiConverterUInt64.readFromCursor(c) });
+                case 3: return new ConnectionCloseReason.TimedOut();
+                case 4: return new ConnectionCloseReason.Stalled();
+                case 5: return new ConnectionCloseReason.Error({message: FfiConverterString.readFromCursor(c) });
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            switch (value.tag) {
+                case ConnectionCloseReason_Tags.Local: {
+                    c.writeI32(1);
+                    return;
+                }
+                case ConnectionCloseReason_Tags.Remote: {
+                    c.writeI32(2);
+                    const inner = value.inner;
+                    FfiConverterUInt64.writeIntoCursor(inner.code, c);
+                    return;
+                }
+                case ConnectionCloseReason_Tags.TimedOut: {
+                    c.writeI32(3);
+                    return;
+                }
+                case ConnectionCloseReason_Tags.Stalled: {
+                    c.writeI32(4);
+                    return;
+                }
+                case ConnectionCloseReason_Tags.Error: {
+                    c.writeI32(5);
+                    const inner = value.inner;
+                    FfiConverterString.writeIntoCursor(inner.message, c);
+                    return;
+                }
+                default:
+                    // Throwing from here means that ConnectionCloseReason_Tags hasn't matched an ordinal.
+                    throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        allocationSize(value: TypeName): number {
+            switch (value.tag) {
+                case ConnectionCloseReason_Tags.Local: {
+                    return 4;
+                }
+                case ConnectionCloseReason_Tags.Remote: {
+                    const inner = value.inner;
+                    let size = 4;
+                    size += FfiConverterUInt64.allocationSize(inner.code);
+                    return size;
+                }
+                case ConnectionCloseReason_Tags.TimedOut: {
+                    return 4;
+                }
+                case ConnectionCloseReason_Tags.Stalled: {
+                    return 4;
+                }
+                case ConnectionCloseReason_Tags.Error: {
+                    const inner = value.inner;
+                    let size = 4;
+                    size += FfiConverterString.allocationSize(inner.message);
+                    return size;
+                }
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+    }
+    return new FFIConverter();
+})();
+
 /**
  * Source that contributed a discovery observation.
  */
@@ -2391,7 +2651,7 @@ inner: {peerId: string; connId: bigint }): ConnectionEstablished_ {
     type ConnectionClosed__interface = {
         tag: P2pEvent_Tags.ConnectionClosed;
         inner:
-Readonly<{peerId: string; connId: bigint}>
+Readonly<{peerId: string; connId: bigint; reason: ConnectionCloseReason}>
     };
     /**
      * The peer's last connection closed; the peer is now disconnected.
@@ -2404,15 +2664,15 @@ Readonly<{peerId: string; connId: bigint}>
         readonly [uniffiTypeNameSymbol] = "P2pEvent";
         readonly tag = P2pEvent_Tags.ConnectionClosed;
         readonly inner:
-Readonly<{peerId: string; connId: bigint}>;
+Readonly<{peerId: string; connId: bigint; reason: ConnectionCloseReason}>;
         constructor(
-inner: {peerId: string; connId: bigint }) {
+inner: {peerId: string; connId: bigint; reason: ConnectionCloseReason }) {
             super("P2pEvent", "ConnectionClosed");
 
             this.inner = Object.freeze(inner);
         }
         static new(
-inner: {peerId: string; connId: bigint }): ConnectionClosed_ {
+inner: {peerId: string; connId: bigint; reason: ConnectionCloseReason }): ConnectionClosed_ {
             return new ConnectionClosed_(inner);
         }
 
@@ -3687,7 +3947,7 @@ const FfiConverterTypeP2pEvent = (() => {
                 case 2: return new P2pEvent.DriverFailed({kind: FfiConverterTypeDriverFailureKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
                 case 3: return new P2pEvent.EndpointClosed({outcome: FfiConverterTypeCloseOutcome.readFromCursor(c), unfinished: FfiConverterSequenceTypeUnfinishedConnection.readFromCursor(c) });
                 case 4: return new P2pEvent.ConnectionEstablished({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
-                case 5: return new P2pEvent.ConnectionClosed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
+                case 5: return new P2pEvent.ConnectionClosed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), reason: FfiConverterTypeConnectionCloseReason.readFromCursor(c) });
                 case 6: return new P2pEvent.ConnectionReplaced({peerId: FfiConverterString.readFromCursor(c), oldConnId: FfiConverterUInt64.readFromCursor(c), newConnId: FfiConverterUInt64.readFromCursor(c) });
                 case 7: return new P2pEvent.PeerReady({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), protocols: FfiConverterSequenceString.readFromCursor(c) });
                 case 8: return new P2pEvent.IdentifyReceived({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), info: FfiConverterTypeIdentifyInfo.readFromCursor(c) });
@@ -3762,6 +4022,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
+                    FfiConverterTypeConnectionCloseReason.writeIntoCursor(inner.reason, c);
                     return;
                 }
                 case P2pEvent_Tags.ConnectionReplaced: {
@@ -4080,6 +4341,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     let size = 4;
                     size += FfiConverterString.allocationSize(inner.peerId);
                     size += FfiConverterUInt64.allocationSize(inner.connId);
+                    size += FfiConverterTypeConnectionCloseReason.allocationSize(inner.reason);
                     return size;
                 }
                 case P2pEvent_Tags.ConnectionReplaced: {
@@ -4418,6 +4680,7 @@ export default Object.freeze({
     FfiConverterTypeCloseOutcome,
     FfiConverterTypeConfigCapability,
     FfiConverterTypeConnectTarget,
+    FfiConverterTypeConnectionCloseReason,
     FfiConverterTypeConnectionInfo,
     FfiConverterTypeDiscoveryOptions,
     FfiConverterTypeDiscoverySource,

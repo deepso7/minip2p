@@ -31,7 +31,9 @@ use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
 use minip2p_ping::{
     PING_PAYLOAD_LEN, PING_PROTOCOL_ID, PingAction, PingConfig, PingEvent, PingOutput, PingProtocol,
 };
-use minip2p_transport::{ConnectionId, ConnectionToken, StreamId, TransportEvent};
+use minip2p_transport::{
+    ConnectionCloseReason, ConnectionId, ConnectionToken, StreamId, TransportEvent,
+};
 
 use crate::events::{SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
 use crate::held::HeldWrites;
@@ -313,7 +315,7 @@ fn transport_event_connection(event: &TransportEvent) -> Option<ConnectionId> {
         | TransportEvent::StreamRemoteWriteClosed { id, .. }
         | TransportEvent::StreamWriteStopped { id, .. }
         | TransportEvent::StreamClosed { id, .. }
-        | TransportEvent::Closed { id }
+        | TransportEvent::Closed { id, .. }
         | TransportEvent::Error { id, .. }
         | TransportEvent::IncomingConnection { id, .. }
         | TransportEvent::PeerIdentityVerified { id, .. } => Some(*id),
@@ -1409,8 +1411,8 @@ impl SwarmState {
             TransportEvent::StreamClosed { id, stream_id } => {
                 self.handle_stream_closed(id, stream_id);
             }
-            TransportEvent::Closed { id } => {
-                self.handle_connection_closed(id);
+            TransportEvent::Closed { id, reason } => {
+                self.handle_connection_closed(id, reason);
             }
             TransportEvent::Listening { .. } => {}
             TransportEvent::Error { id, message } => {
@@ -2346,7 +2348,7 @@ impl SwarmState {
         }
     }
 
-    fn handle_connection_closed(&mut self, conn_id: ConnectionId) {
+    fn handle_connection_closed(&mut self, conn_id: ConnectionId, reason: ConnectionCloseReason) {
         self.conn_to_remote_addr.remove(&conn_id);
         self.registrations.remove(&conn_id);
         self.vetoed_establishes.remove(&conn_id);
@@ -2354,7 +2356,7 @@ impl SwarmState {
         if let Some(pending) = self.pending_dials.remove(&conn_id) {
             let reason = pending
                 .last_error
-                .unwrap_or_else(|| String::from("connection closed before establishment"));
+                .unwrap_or_else(|| format!("connection closed before establishment: {reason}"));
             self.events.push_back(SwarmEvent::DialFailed {
                 conn_id,
                 addr: pending.addr,
@@ -2370,8 +2372,11 @@ impl SwarmState {
                 self.reset_peer_protocols(&peer_id);
                 self.peer_info.remove(&peer_id);
                 self.ready_peers.remove(&peer_id);
-                self.events
-                    .push_back(SwarmEvent::ConnectionClosed { peer_id, conn_id });
+                self.events.push_back(SwarmEvent::ConnectionClosed {
+                    peer_id,
+                    conn_id,
+                    reason,
+                });
             } else {
                 // Connected-without-identity synthesizes a placeholder peer
                 // the application never saw established, so there is no
@@ -4506,7 +4511,13 @@ mod tests {
             core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User("/test/1".into()));
         }
 
-        feed(&mut core, TransportEvent::Closed { id: closed });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: closed,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
         drain_actions(&mut core);
         core.send_stream(&peer_id, surviving, stream_id, Bytes::from_static(b"ok"))
             .expect("stream on the surviving connection should remain");
@@ -4515,7 +4526,13 @@ mod tests {
             [Action::SendStream { conn_id, .. }] if *conn_id == surviving
         ));
 
-        feed(&mut core, TransportEvent::Closed { id: surviving });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: surviving,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
         assert!(matches!(
             core.reset_stream(&peer_id, surviving, stream_id),
             Err(SwarmError::StreamNotFound { .. })
@@ -4671,7 +4688,13 @@ mod tests {
         connect_again(&mut core, &peer_id, old, false);
         core.insert_stream_owner(old, stream, user());
         if !replace {
-            feed(&mut core, TransportEvent::Closed { id: old });
+            feed(
+                &mut core,
+                TransportEvent::Closed {
+                    id: old,
+                    reason: ConnectionCloseReason::Local,
+                },
+            );
         }
         connect_again(&mut core, &peer_id, new, false);
         core.insert_stream_owner(new, stream, user());
@@ -4860,7 +4883,13 @@ mod tests {
             );
 
             // The transport's close of the retired connection is silent.
-            feed(&mut core, TransportEvent::Closed { id: original });
+            feed(
+                &mut core,
+                TransportEvent::Closed {
+                    id: original,
+                    reason: ConnectionCloseReason::Local,
+                },
+            );
             assert!(drain_events(&mut core).is_empty(), "inbound={inbound}");
             assert!(core.is_peer_connected(&peer_id));
         }
@@ -4973,7 +5002,13 @@ mod tests {
             [Output::Action(Action::AckStream { conn_id, .. })] if *conn_id == original
         ));
         assert_eq!(core.connection_id(&peer_id), Some(upgraded));
-        feed(&mut core, TransportEvent::Closed { id: original });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: original,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
         assert!(drain_events(&mut core).is_empty());
         assert!(core.is_peer_connected(&peer_id));
     }
@@ -5228,18 +5263,26 @@ mod tests {
     }
 
     #[test]
-    fn transport_loss_reports_connection_closed() {
+    fn transport_loss_reports_connection_closed_with_its_reason() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"transport-closed-peer");
         let conn_id = ConnectionId::new(71);
         connect_again(&mut core, &peer_id, conn_id, false);
         let _ = drain_events(&mut core);
 
-        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: conn_id,
+                reason: ConnectionCloseReason::Error("boom".into()),
+            },
+        );
 
+        // The failure is the close's reason, with no separate error event.
         assert!(matches!(
             drain_events(&mut core).as_slice(),
-            [SwarmEvent::ConnectionClosed { conn_id: closed, .. }] if *closed == conn_id
+            [SwarmEvent::ConnectionClosed { conn_id: closed, reason, .. }]
+                if *closed == conn_id && *reason == ConnectionCloseReason::Error("boom".into())
         ));
     }
 
@@ -5298,7 +5341,13 @@ mod tests {
         assert!(core.connected_peers().contains(&peer_id));
         assert!(core.has_tracked_connections());
 
-        feed(&mut core, TransportEvent::Closed { id: incoming });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: incoming,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
         let _ = drain_events(&mut core);
         assert!(core.connected_peers().is_empty());
         assert!(!core.has_tracked_connections());
@@ -5685,7 +5734,13 @@ mod tests {
             Some(Deadline::from_millis(10_001))
         );
 
-        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: conn_id,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
         assert_eq!(core.next_deadline(Now::from_millis(0)), None);
     }
 
@@ -5700,7 +5755,13 @@ mod tests {
         let mut core = test_core();
         let (_, addr, conn_id) = noted_dial_addr(b"noted-dial-closed");
         core.note_dial(conn_id, addr.clone());
-        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: conn_id,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
 
         assert!(matches!(
             drain_events(&mut core).as_slice(),
@@ -5710,23 +5771,22 @@ mod tests {
                 reason,
             }] if *failed == conn_id
                 && failed_addr == &addr
-                && reason == "connection closed before establishment"
+                && reason == "connection closed before establishment: closed locally"
         ));
     }
 
     #[test]
-    fn noted_dial_uses_transport_error_message_as_dial_failed_reason() {
+    fn noted_dial_uses_close_reason_as_dial_failed_reason() {
         let mut core = test_core();
         let (_, addr, conn_id) = noted_dial_addr(b"noted-dial-error");
         core.note_dial(conn_id, addr.clone());
         feed(
             &mut core,
-            TransportEvent::Error {
+            TransportEvent::Closed {
                 id: conn_id,
-                message: "refused".into(),
+                reason: ConnectionCloseReason::Error("refused".into()),
             },
         );
-        feed(&mut core, TransportEvent::Closed { id: conn_id });
 
         let events = drain_events(&mut core);
         assert!(
@@ -5741,7 +5801,9 @@ mod tests {
                 conn_id: failed,
                 addr: failed_addr,
                 reason,
-            }) if *failed == conn_id && failed_addr == &addr && reason == "refused"
+            }) if *failed == conn_id
+                && failed_addr == &addr
+                && reason == "connection closed before establishment: refused"
         ));
     }
 
@@ -5772,7 +5834,13 @@ mod tests {
             "got {established:?}"
         );
 
-        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: conn_id,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
         assert!(matches!(
             drain_events(&mut core).as_slice(),
             [SwarmEvent::ConnectionClosed { conn_id: closed, .. }] if *closed == conn_id
@@ -5791,7 +5859,13 @@ mod tests {
                 endpoint: ConnectionEndpoint::new(loopback_transport()),
             },
         );
-        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: conn_id,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
         assert!(matches!(
             drain_events(&mut core).as_slice(),
             [SwarmEvent::DialFailed {
@@ -5815,7 +5889,13 @@ mod tests {
             },
         );
         assert!(core.take_pending_dial(conn_id).is_some());
-        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: conn_id,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
         let events = drain_events(&mut core);
         assert!(
             events.is_empty(),
@@ -5829,7 +5909,13 @@ mod tests {
         let (_, addr, conn_id) = noted_dial_addr(b"forget-dial-closed");
         core.note_dial(conn_id, addr);
         assert!(core.take_pending_dial(conn_id).is_some());
-        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: conn_id,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
         assert!(
             drain_events(&mut core).is_empty(),
             "forgotten dials must not emit DialFailed"
@@ -5939,7 +6025,13 @@ mod tests {
                 message: "reset after veto".into(),
             },
         );
-        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: conn_id,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
         let trailing = drain_events(&mut core);
         assert!(
             trailing
@@ -5960,7 +6052,13 @@ mod tests {
                 endpoint: ConnectionEndpoint::new(loopback_transport()),
             },
         );
-        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: conn_id,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
         assert!(
             drain_events(&mut core)
                 .iter()
@@ -6037,7 +6135,13 @@ mod tests {
         assert_eq!(core.connection_peer(circuit), None, "replaced");
         assert_eq!(core.connection_peer(unverified), None, "not established");
 
-        feed(&mut core, TransportEvent::Closed { id: direct });
+        feed(
+            &mut core,
+            TransportEvent::Closed {
+                id: direct,
+                reason: ConnectionCloseReason::Local,
+            },
+        );
         assert_eq!(core.established_connections().count(), 0);
         assert_eq!(core.connection_peer(direct), None);
     }
@@ -6176,7 +6280,13 @@ mod tests {
                 );
 
                 // Its transport close is bookkeeping only.
-                feed(&mut core, TransportEvent::Closed { id: new });
+                feed(
+                    &mut core,
+                    TransportEvent::Closed {
+                        id: new,
+                        reason: ConnectionCloseReason::Local,
+                    },
+                );
                 assert!(drain_events(&mut core).is_empty(), "{case}");
                 assert_eq!(core.connection_id(&peer), Some(current), "{case}");
             }

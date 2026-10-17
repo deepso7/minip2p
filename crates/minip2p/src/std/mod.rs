@@ -2253,6 +2253,7 @@ fn default_agent_version_matches_package_version() {
 #[cfg(all(test, feature = "quic"))]
 mod tests {
     use super::*;
+    use crate::ConnectionCloseReason;
     #[cfg(feature = "pubsub")]
     use crate::GossipsubEvent;
     #[cfg(feature = "nat")]
@@ -3339,6 +3340,7 @@ mod tests {
             .push_back(EndpointEvent::ConnectionClosed {
                 peer_id: peer.clone(),
                 conn_id: ConnectionId::new(1),
+                reason: ConnectionCloseReason::Local,
             });
         assert!(matches!(
             endpoint.wait(past_instant()).expect("wait past deadline"),
@@ -3403,6 +3405,7 @@ mod tests {
                 .push_back(EndpointEvent::ConnectionClosed {
                     peer_id: peer.clone(),
                     conn_id: ConnectionId::new(1),
+                    reason: ConnectionCloseReason::Local,
                 });
         };
         let deadline = std::time::Instant::now() + Duration::from_millis(50);
@@ -3499,6 +3502,7 @@ mod tests {
             .push_back(EndpointEvent::ConnectionClosed {
                 peer_id: peer.clone(),
                 conn_id: ConnectionId::new(1),
+                reason: ConnectionCloseReason::Local,
             });
         assert!(matches!(
             endpoint.wait(Duration::ZERO).expect("zero-duration drain"),
@@ -3868,6 +3872,7 @@ mod tests {
             .push_back(EndpointEvent::ConnectionClosed {
                 peer_id: peer.clone(),
                 conn_id: ConnectionId::new(1),
+                reason: ConnectionCloseReason::Local,
             });
 
         fail.store(true, Ordering::SeqCst);
@@ -3906,6 +3911,7 @@ mod tests {
             .push_back(EndpointEvent::ConnectionClosed {
                 peer_id: peer.clone(),
                 conn_id: ConnectionId::new(1),
+                reason: ConnectionCloseReason::Local,
             });
 
         let report = endpoint.close();

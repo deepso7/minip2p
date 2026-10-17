@@ -1030,7 +1030,7 @@ mod tests {
     use minip2p_identity::Ed25519Keypair;
     use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
     use minip2p_ping::PING_PROTOCOL_ID;
-    use minip2p_transport::{ConnectionEndpoint, TransportEvent};
+    use minip2p_transport::{ConnectionCloseReason, ConnectionEndpoint, TransportEvent};
 
     #[test]
     fn error_predicates_separate_retryable_gone_and_closed() {
@@ -1342,6 +1342,7 @@ mod tests {
         // ...and the close half of the lifecycle, on the same timeline.
         swarm.transport_mut().initial = vec![TransportEvent::Closed {
             id: ConnectionId::new(1),
+            reason: ConnectionCloseReason::Local,
         }];
         let events = swarm.poll(Now::from_millis(6_000)).expect("poll");
         assert!(
@@ -1368,7 +1369,10 @@ mod tests {
                     peer,
                 ),
             },
-            TransportEvent::Closed { id },
+            TransportEvent::Closed {
+                id,
+                reason: ConnectionCloseReason::Local,
+            },
         ]);
 
         swarm.poll(Now::from_millis(5_000)).expect("poll");
@@ -1448,6 +1452,7 @@ mod tests {
         swarm.state.events.push_back(SwarmEvent::ConnectionClosed {
             peer_id: Ed25519Keypair::generate().peer_id(),
             conn_id: ConnectionId::new(1),
+            reason: ConnectionCloseReason::Local,
         });
         assert_eq!(swarm.next_deadline(now), Some(Deadline::IMMEDIATE));
     }
@@ -1590,10 +1595,10 @@ mod tests {
         );
         // Pending dial was restored: a later close still emits DialFailed,
         // not a silent half-aborted dial that can still establish.
-        swarm
-            .transport_mut()
-            .initial
-            .push(TransportEvent::Closed { id: conn_id });
+        swarm.transport_mut().initial.push(TransportEvent::Closed {
+            id: conn_id,
+            reason: ConnectionCloseReason::Local,
+        });
         let events = swarm.poll(Now::from_millis(1)).expect("poll");
         assert!(
             matches!(

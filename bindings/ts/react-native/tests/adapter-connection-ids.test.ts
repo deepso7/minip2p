@@ -22,7 +22,7 @@ const established = (connId: bigint): FakeEvent => ({
 });
 
 const closed = (connId: bigint): FakeEvent => ({
-  inner: { connId, peerId: PEER },
+  inner: { connId, peerId: PEER, reason: { tag: "Local" } },
   tag: "ConnectionClosed",
 });
 

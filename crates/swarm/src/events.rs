@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use minip2p_core::{Bytes, PeerAddr, PeerId};
 use minip2p_identify::IdentifyMessage;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamId};
 
 /// Events emitted by the swarm to the application.
 #[derive(Clone, Debug)]
@@ -16,13 +16,16 @@ pub enum SwarmEvent {
         peer_id: PeerId,
         conn_id: ConnectionId,
     },
-    /// The peer's last connection closed; the peer is now disconnected.
+    /// The peer's last connection closed, for `reason`; the peer is now
+    /// disconnected.
     ///
-    /// A connection that is replaced never reports this; see
-    /// [`ConnectionReplaced`](Self::ConnectionReplaced).
+    /// A failure that ended the connection is its `reason`, never also a
+    /// [`SwarmEvent::Error`]. A connection that is replaced never reports
+    /// this; see [`ConnectionReplaced`](Self::ConnectionReplaced).
     ConnectionClosed {
         peer_id: PeerId,
         conn_id: ConnectionId,
+        reason: ConnectionCloseReason,
     },
     /// A newer connection took the peer's single connection slot from `old`.
     ///
@@ -228,7 +231,9 @@ pub struct SwarmRuntimeError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum SwarmErrorKind {
-    /// Underlying transport operation or event failed.
+    /// Underlying transport operation failed, or the transport reported an
+    /// error its connection survived. One that ended the connection is the
+    /// reason on its close instead.
     Transport,
     /// Multistream-select negotiation failed.
     Multistream,

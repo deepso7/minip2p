@@ -285,8 +285,10 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
         EndpointEvent::ConnectionEstablished { peer_id, .. } => {
             println!("[{role}] connected peer={peer_id}");
         }
-        EndpointEvent::ConnectionClosed { peer_id, .. } => {
-            println!("[{role}] disconnected peer={peer_id}");
+        EndpointEvent::ConnectionClosed {
+            peer_id, reason, ..
+        } => {
+            println!("[{role}] disconnected peer={peer_id} reason={reason}");
         }
         EndpointEvent::ConnectionReplaced { peer_id, old, new } => {
             println!("[{role}] connection-replaced peer={peer_id} old={old} new={new}");

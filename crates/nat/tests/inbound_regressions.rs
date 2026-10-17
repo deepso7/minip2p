@@ -3,6 +3,7 @@
 mod common;
 
 use common::*;
+use minip2p_swarm::ConnectionCloseReason;
 
 use minip2p_core::PeerAddr;
 use minip2p_core::{Multiaddr, Protocol};
@@ -434,6 +435,7 @@ fn relay_disconnect_before_stop_acceptance_drops_the_circuit() {
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(1),
             peer_id: h.relay.clone(),
+            reason: ConnectionCloseReason::Local,
         },
         false,
         at(1),

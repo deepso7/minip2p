@@ -6,6 +6,7 @@ use crate::test_peer::{
     RawPeer, accept, deliver_then_close, drive_until, listening_server, loopback, now,
     stream_bytes, take_datagrams,
 };
+use minip2p_transport::ConnectionCloseReason;
 
 fn quic_addr(addr: &str) -> Multiaddr {
     socket_addr_to_multiaddr(addr.parse().expect("socket addr"))
@@ -275,7 +276,12 @@ fn connection_and_stream_churn_returns_the_budget_to_zero() {
             &mut [&mut peer],
             &mut events,
             "close",
-            |events| events.contains(&TransportEvent::Closed { id }),
+            |events| {
+                events.contains(&TransportEvent::Closed {
+                    id,
+                    reason: ConnectionCloseReason::Remote { code: 0 },
+                })
+            },
         );
         assert_eq!(server.budget.reserved(), 0);
 

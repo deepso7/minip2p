@@ -11,6 +11,7 @@ use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_secure_mux::KEEPALIVE_INTERVAL_MS;
 use minip2p_tcp::{TcpConfig, TcpTransport};
+use minip2p_transport::ConnectionCloseReason;
 use minip2p_transport::{
     Bytes, ConnectionId, ConnectionNamespace, StreamId, Transport, TransportError, TransportEvent,
 };
@@ -332,16 +333,12 @@ fn a_mismatched_expected_peer_fails_the_dial() {
     let (dialer_events, _) = drive(&net, &mut dialer, &mut listener);
 
     assert!(
-        dialer_events.iter().any(
-            |event| matches!(event, TransportEvent::Error { id: failed, .. } if *failed == id)
-        ),
-        "the wrong identity must be reported: {dialer_events:?}"
-    );
-    assert!(
-        dialer_events
-            .iter()
-            .any(|event| matches!(event, TransportEvent::Closed { id: closed } if *closed == id)),
-        "the connection must close: {dialer_events:?}"
+        dialer_events.iter().any(|event| matches!(
+            event,
+            TransportEvent::Closed { id: closed, reason: ConnectionCloseReason::Error(message) }
+                if *closed == id && message.contains("does not match")
+        )),
+        "the connection must close, reporting the wrong identity: {dialer_events:?}"
     );
     assert!(
         !dialer_events
@@ -403,12 +400,12 @@ fn a_refused_connect_reports_error_then_closed() {
     assert!(
         matches!(
             dialer_events.as_slice(),
-            [
-                TransportEvent::Error { id: failed, message },
-                TransportEvent::Closed { id: closed },
-            ] if *failed == id && *closed == id && message.contains("refused")
+            [TransportEvent::Closed {
+                id: closed,
+                reason: ConnectionCloseReason::Error(message),
+            }] if *closed == id && message.contains("refused")
         ),
-        "a refused connect must report why, then close: {dialer_events:?}"
+        "a refused connect must close, saying why: {dialer_events:?}"
     );
     assert!(dialer.connection_ids().is_empty());
 }
@@ -676,15 +673,13 @@ fn a_socket_that_never_recovers_fails_once_the_stall_timeout_passes() {
         .dialer
         .poll(Now::from_millis(1_000 + 30_000))
         .expect("stall expires");
-    assert!(
-        matches!(
-            events.as_slice(),
-            [
-                TransportEvent::Error { id: failed, message },
-                TransportEvent::Closed { id: closed },
-            ] if *failed == id && *closed == id && message.contains("not reading")
-        ),
-        "an unrecoverable stall must be reported, then closed: {events:?}"
+    assert_eq!(
+        events,
+        [TransportEvent::Closed {
+            id,
+            reason: ConnectionCloseReason::Stalled,
+        }],
+        "an unrecoverable stall closes the connection as stalled"
     );
     assert!(pair.dialer.connection_ids().is_empty());
 }
@@ -919,7 +914,10 @@ fn close_shuts_the_peer_down_without_reporting_an_error() {
                 id,
                 stream_id: stream
             },
-            TransportEvent::Closed { id },
+            TransportEvent::Closed {
+                id,
+                reason: ConnectionCloseReason::Local
+            },
         ],
         "closing must close the open substream first"
     );
@@ -937,9 +935,12 @@ fn close_shuts_the_peer_down_without_reporting_an_error() {
                 id,
                 stream_id: stream
             },
-            TransportEvent::Closed { id },
+            TransportEvent::Closed {
+                id,
+                reason: ConnectionCloseReason::Remote { code: 0 }
+            },
         ],
-        "the peer sees the same pair the closing side did, and no error: \
+        "the peer sees the same pair, closed by our orderly GoAway: \
          {listener_events:?}"
     );
     assert!(pair.listener.connection_ids().is_empty());
@@ -959,12 +960,12 @@ fn a_truncated_stream_is_a_fault_not_an_orderly_close() {
     assert!(
         matches!(
             dialer_events.as_slice(),
-            [
-                TransportEvent::Error { id: failed, .. },
-                TransportEvent::Closed { id: closed },
-            ] if *failed == id && *closed == id
+            [TransportEvent::Closed {
+                id: closed,
+                reason: ConnectionCloseReason::Error(_),
+            }] if *closed == id
         ),
-        "a truncated stream must be reported, then closed: {dialer_events:?}"
+        "a truncated stream must close as a failure: {dialer_events:?}"
     );
     assert!(pair.dialer.connection_ids().is_empty());
 }
@@ -1249,18 +1250,11 @@ fn a_connection_that_never_authenticates_is_dropped_on_its_deadline() {
         .poll(Now::from_millis(PATIENCE))
         .expect("poll on the deadline");
     assert!(
-        events.iter().any(|event| matches!(
-            event,
-            TransportEvent::Error { id: failed, message }
-                if *failed == id && message.contains("did not complete")
-        )),
-        "the host should be told why: {events:?}"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, TransportEvent::Closed { id: closed } if *closed == id)),
-        "and that the connection is gone: {events:?}"
+        events.contains(&TransportEvent::Closed {
+            id,
+            reason: ConnectionCloseReason::TimedOut,
+        }),
+        "the connection is gone, timed out: {events:?}"
     );
     assert!(
         dialer.connection_ids().is_empty(),
@@ -1426,7 +1420,10 @@ fn closing_a_connection_drops_its_queued_writable() {
     ));
     pair.dialer.close(id).expect("close");
     let events = pair.dialer.poll(Now::from_millis(0)).expect("poll");
-    assert!(events.contains(&TransportEvent::Closed { id }));
+    assert!(events.contains(&TransportEvent::Closed {
+        id,
+        reason: ConnectionCloseReason::Local
+    }));
     assert!(
         !events
             .iter()
@@ -1496,7 +1493,10 @@ fn each_connection_is_woken_for_its_own_deadline() {
         .poll(Now::from_millis(PATIENCE))
         .expect("poll on the handshake deadline");
     assert!(
-        events.contains(&TransportEvent::Closed { id: stuck }),
+        events.contains(&TransportEvent::Closed {
+            id: stuck,
+            reason: ConnectionCloseReason::TimedOut
+        }),
         "{events:?}"
     );
     assert_eq!(pair.dialer.connection_ids(), vec![established]);

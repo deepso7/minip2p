@@ -607,8 +607,9 @@ function normalizeBigInts(
   key?: string
 ): unknown {
   if (typeof value === "bigint") {
-    // A QUIC stop code is a 62-bit varint the remote picks: keep it whole.
-    if (key === "errorCode") {
+    // QUIC stop and close codes are 62-bit varints the remote picks: keep
+    // them whole.
+    if (key === "errorCode" || key === "code") {
       return value;
     }
     if (key === undefined || !CONNECTION_ID_KEYS.has(key) || !event) {

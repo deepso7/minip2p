@@ -6,7 +6,7 @@
 
 use minip2p_core::{Bytes, PeerAddr, PeerId};
 use minip2p_swarm::{IdentifyMessage, SwarmEvent, SwarmRuntimeError};
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamId};
 
 use super::connect::{ConnectId, ConnectOutcome};
 
@@ -55,10 +55,13 @@ pub enum EndpointEvent {
         peer_id: PeerId,
         conn_id: ConnectionId,
     },
-    /// The peer's last connection closed; the peer is now disconnected.
+    /// The peer's last connection closed, for `reason`; the peer is now
+    /// disconnected. A failure that ended the connection is its `reason`,
+    /// never also an [`Self::Error`].
     ConnectionClosed {
         peer_id: PeerId,
         conn_id: ConnectionId,
+        reason: ConnectionCloseReason,
     },
     /// A newer connection took the peer's single connection slot from `old`.
     ///
@@ -275,9 +278,15 @@ impl From<SwarmEvent> for EndpointEvent {
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
                 Self::ConnectionEstablished { peer_id, conn_id }
             }
-            SwarmEvent::ConnectionClosed { peer_id, conn_id } => {
-                Self::ConnectionClosed { peer_id, conn_id }
-            }
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                conn_id,
+                reason,
+            } => Self::ConnectionClosed {
+                peer_id,
+                conn_id,
+                reason,
+            },
             SwarmEvent::ConnectionReplaced { peer_id, old, new } => {
                 Self::ConnectionReplaced { peer_id, old, new }
             }

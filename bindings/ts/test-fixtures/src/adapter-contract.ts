@@ -587,7 +587,7 @@ export function describeAdapterContract(
     // the connection's identity.
     const lateStream = { connId: CONN_ID, peerId: PEER, streamId: 4n };
     const closedConnection: NativeEventLiteral = {
-      inner: { connId: CONN_ID, peerId: PEER },
+      inner: { connId: CONN_ID, peerId: PEER, reason: { tag: "Local" } },
       tag: "ConnectionClosed",
     };
 

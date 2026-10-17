@@ -28,6 +28,7 @@ export {
   NatErrorKind,
   Reachability,
   type Bytes,
+  type ConnectionCloseReason,
   type ConnectionInfo,
   type ConnectOptions,
   type ConnectResult,
