@@ -1,7 +1,7 @@
 //! End-to-end integration of two `NatAgent`s over an in-memory relay
 //! emulator: B reserves, A connects through the relay, DCUtR runs over the
 //! real bridged bytes on both sides, and the race settles either
-//! `DirectPunched` (when the "network" lets the punch land) or `Relayed`
+//! `Punched` (when the "network" lets the punch land) or `Relayed`
 //! (when it withholds the direct connection).
 //!
 //! No QUIC, no UDP — the emulator speaks the actual HOP/STOP wire format
@@ -644,25 +644,30 @@ fn two_agents_punch_to_a_direct_connection() {
     world.pump();
 
     let events = drain_events(&mut world.a);
-    assert!(
-        matches!(
-            events.as_slice(),
-            [NatEvent::PathUpgraded {
+    let punched = match events.as_slice() {
+        [
+            NatEvent::PathUpgraded {
                 connect_id,
                 peer,
                 from: Path::Relayed { relay },
-                to: Path::DirectPunched,
+                to: Path::Punched,
+                new_conn_id,
                 ..
-            }]
-                if *connect_id == id && peer == &world.b_id && relay == &world.relay_id
-        ),
-        "A upgrades explicitly, got {events:?}"
-    );
+            },
+        ] if *connect_id == id && peer == &world.b_id && relay == &world.relay_id => *new_conn_id,
+        _ => panic!("A upgrades explicitly, got {events:?}"),
+    };
+    assert!(world.a.agent.is_punched(punched), "A's path is Punched");
     let events = drain_events(&mut world.b);
-    assert!(
-        matches!(events.as_slice(), [NatEvent::InboundDirectUpgrade { peer, .. }] if *peer == world.a_id),
-        "B reports the inbound upgrade, got {events:?}"
-    );
+    let punched = match events.as_slice() {
+        [
+            NatEvent::InboundDirectUpgrade {
+                peer, new_conn_id, ..
+            },
+        ] if *peer == world.a_id => *new_conn_id,
+        _ => panic!("B reports the inbound upgrade, got {events:?}"),
+    };
+    assert!(world.b.agent.is_punched(punched), "B's path is Punched");
 }
 
 #[test]

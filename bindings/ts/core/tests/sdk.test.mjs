@@ -400,7 +400,7 @@ test("connect operations resolve paths and advanced results are one-shot", async
     inner: {
       connId: 7,
       connectId,
-      path: { tag: PathKind_Tags.DirectDialed },
+      path: { tag: PathKind_Tags.Direct },
       peerId: "peer",
     },
     tag: P2pEvent_Tags.PathEstablished,
@@ -411,14 +411,14 @@ test("connect operations resolve paths and advanced results are one-shot", async
     {
       connId: 7,
       connectId,
-      path: { kind: "directDialed" },
+      path: { kind: "direct" },
       peerId: "peer",
     },
   ]);
   const result = await endpoint.waitConnectResult(connectId, { timeoutMs: 0 });
   assert.deepEqual(result, {
     connectId,
-    path: { kind: "directDialed" },
+    path: { kind: "direct" },
     peerId: "peer",
   });
   await assert.rejects(
@@ -433,7 +433,7 @@ function pathEstablished(connectId, peerId = "peer") {
     inner: {
       connId: 7,
       connectId,
-      path: { tag: PathKind_Tags.DirectDialed },
+      path: { tag: PathKind_Tags.Direct },
       peerId,
     },
     tag: P2pEvent_Tags.PathEstablished,
@@ -1730,7 +1730,7 @@ test("unwatched connect terminal cache evicts its oldest result", async () => {
     backend.emit({
       inner: {
         connectId,
-        path: { tag: PathKind_Tags.DirectDialed },
+        path: { tag: PathKind_Tags.Direct },
         peerId: `peer-${index}`,
       },
       tag: P2pEvent_Tags.PathEstablished,
@@ -1839,10 +1839,40 @@ function peerReadyOn(connId) {
   };
 }
 
+/** A native `connectionInfo` snapshot of the peer's connection `connId`. */
+function connectionOn(connId, readyProtocols) {
+  return {
+    connId,
+    path: { tag: PathKind_Tags.Direct },
+    peerId: "peer",
+    remoteAddr: "/ip4/192.0.2.1/udp/4001/quic-v1",
+    ...(readyProtocols !== undefined && { readyProtocols }),
+  };
+}
+
+test("connectionInfo reports the native path in public form", () => {
+  const backend = new MockBackend();
+  backend.connections.set("peer", {
+    ...connectionOn(2),
+    path: { inner: { relayPeerId: "relay" }, tag: PathKind_Tags.Relayed },
+    remoteAddr: "/p2p/relay/p2p-circuit",
+  });
+  const endpoint = new TestMinip2p(backend);
+
+  assert.deepEqual(endpoint.connectionInfo("peer"), {
+    connId: 2,
+    path: { kind: "relayed", relayPeerId: "relay" },
+    peerId: "peer",
+    remoteAddr: "/p2p/relay/p2p-circuit",
+  });
+  assert.equal(endpoint.connectionInfo("stranger"), undefined);
+  endpoint.close();
+});
+
 test("waitPeerReady resolves only for the current connection's peerReady", async () => {
   const backend = new MockBackend();
   // Native state is ahead of the queued events: 1 was already replaced by 2.
-  backend.connections.set("peer", { connId: 2 });
+  backend.connections.set("peer", connectionOn(2));
   const endpoint = new TestMinip2p(backend);
   const ready = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
 
@@ -1860,7 +1890,7 @@ test("waitPeerReady resolves only for the current connection's peerReady", async
 
 test("waitPeerReady ignores readiness of a connection queued before the snapshot", async () => {
   const backend = new MockBackend();
-  backend.connections.set("peer", { connId: 2 });
+  backend.connections.set("peer", connectionOn(2));
   const endpoint = new TestMinip2p(backend);
   const ready = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
 
@@ -1879,7 +1909,7 @@ test("waitPeerReady follows a connection established after the call", async () =
   const endpoint = new TestMinip2p(backend);
   const ready = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
 
-  backend.connections.set("peer", { connId: 2 });
+  backend.connections.set("peer", connectionOn(2));
   backend.emit({
     inner: { connId: 2, peerId: "peer" },
     tag: P2pEvent_Tags.ConnectionEstablished,
@@ -1891,7 +1921,7 @@ test("waitPeerReady follows a connection established after the call", async () =
 
 test("waitPeerReady reads readiness from one connectionInfo snapshot", async () => {
   const backend = new MockBackend();
-  backend.connections.set("peer", { connId: 2, readyProtocols: ["/a/1"] });
+  backend.connections.set("peer", connectionOn(2, ["/a/1"]));
   const endpoint = new TestMinip2p(backend);
 
   assert.deepEqual(await endpoint.waitPeerReady("peer"), {
@@ -1904,7 +1934,7 @@ test("waitPeerReady reads readiness from one connectionInfo snapshot", async () 
 test("waitPeerReady rejects only once the peer is disconnected", async () => {
   const backend = new MockBackend();
   backend.connected = ["peer"];
-  backend.connections.set("peer", { connId: 2 });
+  backend.connections.set("peer", connectionOn(2));
   const endpoint = new TestMinip2p(backend);
   const disconnected = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
 

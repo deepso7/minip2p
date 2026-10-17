@@ -954,10 +954,6 @@ impl Node {
     pub fn settled(&mut self, id: ConnectId, kept: Option<ConnectionId>, now: Now) {
         self.agent.settled(&mut self.swarm, id, kept, now);
     }
-
-    pub fn path(&self, peer: &PeerId) -> Option<&minip2p_nat::Path> {
-        self.agent.path(&self.swarm, peer)
-    }
 }
 
 /// Everything the agent did since the last drain: swarm commands first, in

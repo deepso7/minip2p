@@ -9,6 +9,7 @@ This crate focuses on typed address handling, peer-qualified endpoint types, Con
 - `Multiaddr` parsing/formatting for a minimal protocol set.
 - `PeerAddr` helper for validated `transport + peer id` addresses with terminal `/p2p/<peer-id>`.
 - `ConnectId` — endpoint-local identity of one Connection attempt (`from_u64` / `as_u64`). Shared by the Connection-attempt engine and `NatAgent`.
+- `Path` — how an established connection was made: `Direct`, `Punched` (by DCUtR), or `Relayed { relay }`. Shared by the Endpoint and `NatAgent`.
 - Poll-driven protocol machines: every protocol machine takes inputs through inherent methods named for what they do (`on_data`, `accept`, `send_sync`, ...) and exposes an inherent `poll_output`. After any input, drain `poll_output` until it returns `None` before waiting on I/O, timers, or the application again.
 - `Bytes`, the shared stream payload type (a re-export of `bytes::Bytes` without default features, ADR 0011): stream reads and writes carry one, so fan-out and forwarding clone a handle instead of the bytes.
 - Varint-length-prefixed frame codec (`decode_frame`/`encode_frame`/`FrameDecode`) shared by the protocol crates; decoding is bounded by a caller-supplied maximum payload length. Canonical framing goldens and malformed-header cases live here.

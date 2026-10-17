@@ -2,13 +2,13 @@
 
 import type {
   BackendClosed,
+  BackendConnectionInfo,
   BackendConnectTarget,
   BackendOpenStream,
   Minip2pBackend,
   P2pEvent,
 } from "../../core/src/backend.js";
 import { CloseOutcome, Reachability } from "../../core/src/index.js";
-import type { ConnectionInfo } from "../../core/src/index.js";
 
 export type MockBackendOperation =
   | readonly ["abandon" | "closeWrite" | "reset", number, number]
@@ -30,7 +30,7 @@ export class MockBackend implements Minip2pBackend {
   };
   connected: string[] = [];
   /** `connectionInfo` snapshots by peer ID. */
-  connections = new Map<string, ConnectionInfo>();
+  connections = new Map<string, BackendConnectionInfo>();
   nextConnectId = 1;
   nextStreamId = 3;
   openResults: BackendOpenStream[] = [];
@@ -103,7 +103,7 @@ export class MockBackend implements Minip2pBackend {
     return undefined;
   }
 
-  connectionInfo(peerId: string): ConnectionInfo | undefined {
+  connectionInfo(peerId: string): BackendConnectionInfo | undefined {
     return this.connections.get(peerId);
   }
 

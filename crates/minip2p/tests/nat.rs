@@ -64,13 +64,13 @@ fn direct_candidate_wins_over_loopback() {
         }
         let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
     }
-    assert!(matches!(path, Some(Path::DirectDialed)));
+    assert!(matches!(path, Some(Path::Direct)));
     assert!(
         matches!(settled, Some(ConnectOutcome::Connected { conn_id }) if !conn_id.is_circuit())
     );
     assert!(a.connected_peers().contains(b_addr.peer_id()));
     assert!(
-        matches!(a.path(b_addr.peer_id()), Some(Path::DirectDialed)),
+        matches!(a.path(b_addr.peer_id()), Some(Path::Direct)),
         "the path query must survive PathEstablished event consumption"
     );
 
@@ -166,7 +166,7 @@ fn waiting_for_peer_ready_drives_the_nat_agent() {
         events.iter().any(|event| {
             matches!(
                 event,
-                EndpointEvent::Nat(NatEvent::PathEstablished { connect_id, path: Path::DirectDialed, .. })
+                EndpointEvent::Nat(NatEvent::PathEstablished { connect_id, path: Path::Direct, .. })
                     if *connect_id == id
             )
         }),

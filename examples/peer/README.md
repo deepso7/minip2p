@@ -35,7 +35,7 @@ Terminal 2 (paste the `bound=` value):
 
 ```console
 $ cargo run -p minip2p-peer -- dial /ip4/127.0.0.1/udp/64294/quic-v1/p2p/12D3KooWDEW8… --count 3
-[dial] path-established path=direct-dialed elapsed=10ms
+[dial] path-established path=direct elapsed=10ms
 [dial] ping seq=1 path=direct
 [dial] pong seq=1 rtt=0ms path=direct
 …
@@ -70,7 +70,7 @@ $ minip2p-peer dial /ip4/<relay-host>/…/p2p-circuit/p2p/12D3KooWB…
 [dial] ping seq=1 path=relayed
 [dial] pong seq=1 rtt=180ms path=relayed
 [dial] pong seq=2 rtt=176ms path=relayed
-[dial] nat-path-upgraded peer=12D3KooWB… from=relayed to=direct-punched
+[dial] nat-path-upgraded peer=12D3KooWB… from=relayed to=punched
 [dial] channel-switched path=direct outstanding-resent=1
 [dial] ping seq=4 path=direct
 [dial] pong seq=3 rtt=41ms path=direct
@@ -82,7 +82,7 @@ $ minip2p-peer dial /ip4/<relay-host>/…/p2p-circuit/p2p/12D3KooWB…
 What to look for:
 
 - the first pongs travel `path=relayed` through the relay bridge;
-- `nat-path-upgraded … to=direct-punched` marks the DCUtR hole punch landing, and `channel-switched` shows any in-flight seqs being resent on the new stream — **the seq sequence never breaks**;
+- `nat-path-upgraded … to=punched` marks the DCUtR hole punch landing, and `channel-switched` shows any in-flight seqs being resent on the new stream — **the seq sequence never breaks**;
 - subsequent pongs are `path=direct` with a clearly lower RTT;
 - the summary splits the RTT accounting per path.
 

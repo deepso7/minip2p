@@ -324,7 +324,7 @@ export interface P2pEndpointLike {
  */
     connectedPeers() /*throws*/: Array<string>;
 /**
- * Returns the transport connection selected for a peer.
+ * Returns a snapshot of a peer's established connection.
  */
     connectionInfo(peerId: string) /*throws*/: ConnectionInfo | undefined;
 /**
@@ -360,7 +360,8 @@ export interface P2pEndpointLike {
  */
     openStream(peerId: string, protocolId: string) /*throws*/: OpenStreamResult;
 /**
- * Returns the current path to a peer.
+ * Returns the path of a peer's established connection; `None` only
+ * while the peer is not connected.
  */
     path(peerId: string) /*throws*/: PathKind | undefined;
 /**
@@ -582,7 +583,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the transport connection selected for a peer.
+ * Returns a snapshot of a peer's established connection.
  */
     connectionInfo(peerId: string): ConnectionInfo | undefined /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
@@ -748,7 +749,8 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the current path to a peer.
+ * Returns the path of a peer's established connection; `None` only
+ * while the peer is not connected.
  */
     path(peerId: string): PathKind | undefined /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
@@ -1149,7 +1151,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers() !== 23362) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connection_info() !== 13610) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connection_info() !== 45983) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connection_info");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_disconnect() !== 7330) {
@@ -1176,7 +1178,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream() !== 35730) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_path() !== 4892) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_path() !== 57440) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_path");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_id() !== 42474) {

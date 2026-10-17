@@ -55,7 +55,8 @@ pub struct OpenStreamResult {
     pub stream_id: u64,
 }
 
-/// State snapshot of the transport connection selected for a peer.
+/// State snapshot of a peer's established connection; see
+/// `minip2p::ConnectionInfo`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[cfg_attr(
@@ -64,15 +65,19 @@ pub struct OpenStreamResult {
     serde(rename_all = "camelCase")
 )]
 pub struct ConnectionInfo {
+    /// The peer on the other end.
+    pub peer_id: String,
     /// Endpoint-local transport connection id.
     pub conn_id: u64,
-    /// Remote transport address, when recorded.
-    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    pub remote_addr: Option<String>,
+    /// Remote transport address the transport reported; a circuit reports
+    /// `/p2p/<relay>/p2p-circuit`.
+    pub remote_addr: String,
+    /// How the connection was made.
+    pub path: PathKind,
     /// Protocols this connection advertised through Identify, once it is
-    /// ready (`PeerReady` for this `conn_id`); `None` until then. Readiness,
-    /// connection and protocols come from one snapshot, so a ready wait can
-    /// trust them together.
+    /// ready (`PeerReady` for this `conn_id`); `None` until then, distinct
+    /// from an empty list. Readiness, connection and protocols come from one
+    /// snapshot, so a ready wait can trust them together.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub ready_protocols: Option<Vec<String>>,
 }
@@ -90,7 +95,7 @@ pub enum Reachability {
     Private,
 }
 
-/// Kind of usable connection path.
+/// How an established connection was made; see `minip2p::Path`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[cfg_attr(
@@ -99,10 +104,10 @@ pub enum Reachability {
     serde(tag = "tag", content = "inner", rename_all_fields = "camelCase")
 )]
 pub enum PathKind {
-    /// A known address was dialed directly.
-    DirectDialed,
-    /// A direct path was established by hole punching.
-    DirectPunched,
+    /// A direct connection we dialed or accepted.
+    Direct,
+    /// A direct connection made by a DCUtR hole punch.
+    Punched,
     /// Traffic is carried through a relay.
     Relayed {
         /// Relay carrying the circuit.
@@ -849,7 +854,7 @@ pub(crate) fn convert_settled(
             connect_id: connect_id.as_u64(),
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
-            path: convert_path(path.unwrap_or(Path::DirectDialed)),
+            path: convert_path(path.unwrap_or(Path::Direct)),
         }),
         ConnectOutcome::Failed(failure) => Some(P2pEvent::ConnectFailed {
             connect_id: connect_id.as_u64(),
@@ -1059,14 +1064,14 @@ pub(crate) fn convert_reachability(state: ReachabilityState) -> Reachability {
 
 pub(crate) fn convert_path(path: Path) -> PathKind {
     match path {
-        Path::DirectDialed => PathKind::DirectDialed,
-        Path::DirectPunched => PathKind::DirectPunched,
+        Path::Direct => PathKind::Direct,
+        Path::Punched => PathKind::Punched,
         Path::Relayed { relay } => PathKind::Relayed {
             relay_peer_id: relay.to_base58(),
         },
         // A path this binding predates; every current non-relayed path is
         // direct.
-        _ => PathKind::DirectDialed,
+        _ => PathKind::Direct,
     }
 }
 
@@ -1348,13 +1353,13 @@ mod tests {
                 ConnectOutcome::Connected {
                     conn_id: ConnectionId::new(9),
                 },
-                Some(Path::DirectDialed),
+                Some(Path::Direct),
             ),
             Some(P2pEvent::PathEstablished {
                 connect_id: 3,
                 peer_id: remote.to_base58(),
                 conn_id: 9,
-                path: PathKind::DirectDialed,
+                path: PathKind::Direct,
             })
         );
         let failure = ConnectFailure::NoUsableRoute {
@@ -1406,7 +1411,7 @@ mod tests {
             convert_nat(NatEvent::PathEstablished {
                 connect_id: minip2p::ConnectId::from_u64(1),
                 peer: remote.clone(),
-                path: Path::DirectDialed,
+                path: Path::Direct,
             }),
             None
         );
@@ -1471,7 +1476,7 @@ mod tests {
                 connect_id: minip2p::ConnectId::from_u64(2),
                 peer: remote.clone(),
                 from: Path::Relayed { relay: peer(15) },
-                to: Path::DirectPunched,
+                to: Path::Punched,
                 old_conn_id: ConnectionId::new(4),
                 new_conn_id: ConnectionId::new(5),
             }),
@@ -1481,7 +1486,7 @@ mod tests {
                 from: PathKind::Relayed {
                     relay_peer_id: peer(15).to_base58(),
                 },
-                to: PathKind::DirectPunched,
+                to: PathKind::Punched,
                 old_conn_id: 4,
                 new_conn_id: 5,
             })

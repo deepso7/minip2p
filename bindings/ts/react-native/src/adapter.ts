@@ -12,7 +12,6 @@ import {
 } from "@minip2p/core";
 import type {
   Bytes,
-  ConnectionInfo,
   IdentifyInfo,
   KnownPeerInfo,
   Minip2pConfig,
@@ -32,6 +31,7 @@ import {
 } from "@minip2p/core/backend";
 import type {
   BackendClosed,
+  BackendConnectionInfo,
   BackendConnectTarget,
   Minip2pBackend,
   Minip2pBackendFactory,
@@ -217,14 +217,16 @@ class ReactNativeBackend implements Minip2pBackend {
       : (normalizeBigInts(path) as PathKind);
   }
 
-  connectionInfo(peerId: string): ConnectionInfo | undefined {
+  connectionInfo(peerId: string): BackendConnectionInfo | undefined {
     const info = translateErrors(() => this.#endpoint.connectionInfo(peerId));
     if (info === undefined) {
       return undefined;
     }
     return {
       connId: this.#connectionIds.toPublic(info.connId),
-      ...(info.remoteAddr !== undefined && { remoteAddr: info.remoteAddr }),
+      path: normalizeBigInts(info.path) as PathKind,
+      peerId: info.peerId,
+      remoteAddr: info.remoteAddr,
       ...(info.readyProtocols !== undefined && {
         readyProtocols: info.readyProtocols,
       }),

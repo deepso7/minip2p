@@ -104,8 +104,8 @@ and shutdown order.
 | `peerInfo(peerId)` | Latest remote Identify snapshot, if known. |
 | `knownPeers()` | Multi-source discovery address book. |
 | `discoveryNowMs()` | Discovery monotonic time, when enabled. |
-| `path(peerId)` | Authoritative current `Path`, if connected. |
-| `connectionInfo(peerId)` | Selected `{ connId, remoteAddr?, readyProtocols? }`, if connected; `readyProtocols` is set once that connection is ready. |
+| `path(peerId)` | The current connection's `Path` (`direct`, `punched`, or `relayed`), if connected. |
+| `connectionInfo(peerId)` | The current connection's `{ peerId, connId, remoteAddr, path, readyProtocols? }`, if connected; `readyProtocols` is set once that connection is ready. |
 | `reachability()` | Latest AutoNAT reachability verdict. |
 | `activeReservation()` | Active relay reservation metadata. |
 | `circuitAddress` | Usable local circuit address, when reserved. |

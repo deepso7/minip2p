@@ -1229,7 +1229,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
         "replacement sequence: {a_sequence:?}"
     );
     assert!(a.core().transport().circuit_ids().is_empty());
-    assert_eq!(a.path(&b_peer), Some(Path::DirectDialed));
+    assert_eq!(a.path(&b_peer), Some(Path::Direct));
 
     a.publish(TOPIC, b"after upgrade")
         .expect("publish after upgrade");

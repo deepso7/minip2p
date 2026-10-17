@@ -2876,7 +2876,7 @@ mod tests {
             &minip2p_nat::NatEvent::PathEstablished {
                 connect_id: id,
                 peer: peer.clone(),
-                path: minip2p_nat::Path::DirectDialed,
+                path: minip2p_nat::Path::Direct,
             },
             &mut runtime,
             0,

@@ -615,15 +615,10 @@ impl<T: Transport> NatDriver<T> {
         self.agent.force_relay()
     }
 
-    /// Returns the NAT-orchestrated path of `peer`'s current connection; see
-    /// [`NatAgent::path`].
-    #[cfg(feature = "_circuit-driver")]
-    pub(crate) fn path<R: EntropySource>(
-        &self,
-        swarm: &SwarmCore<T, R>,
-        peer: &PeerId,
-    ) -> Option<minip2p_nat::Path> {
-        self.agent.path(swarm, peer).cloned()
+    /// Whether NAT's hole punch produced `conn_id`; see
+    /// [`NatAgent::is_punched`].
+    pub(crate) fn is_punched(&self, conn_id: ConnectionId) -> bool {
+        self.agent.is_punched(conn_id)
     }
 
     /// Confirmed public addresses plus circuit addresses for every held

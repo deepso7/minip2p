@@ -91,7 +91,9 @@ pub(crate) enum StreamInput<'a> {
 
 /// How a connection came to carry a peer's path, recorded when a NAT machine
 /// announces it. It outlives the attempt that created it, so a later
-/// Connection replacement can still report the upgrade against it.
+/// Connection replacement can still report the upgrade against it. The
+/// Endpoint's own [`Path`] record takes only [`Path::Punched`] from here
+/// (see [`NatAgent::is_punched`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Origin {
     pub(crate) path: Path,
@@ -644,9 +646,8 @@ impl NatAgent {
     ///
     /// With `allow_relay = false` or no relay configured the attempt has an
     /// inactive relay leg and only tracks the peer's direct establishment so
-    /// [`NatEvent::PathEstablished`] `{ DirectDialed }` and path snapshots
-    /// keep working. It ends when the caller cancels it or a direct
-    /// connection to the peer establishes.
+    /// [`NatEvent::PathEstablished`] `{ Direct }` keeps working. It ends when
+    /// the caller cancels it or a direct connection to the peer establishes.
     pub fn connect<S: NatSwarm>(
         &mut self,
         swarm: &mut S,
@@ -739,11 +740,15 @@ impl NatAgent {
         }
     }
 
-    /// The path `peer`'s current connection carries, when a NAT machine
-    /// announced one for it (or for the connection it replaced).
-    pub fn path<S: NatSwarm>(&self, swarm: &S, peer: &PeerId) -> Option<&Path> {
-        let conn_id = swarm.connection(peer)?;
-        self.shared.origins.get(&conn_id).map(|origin| &origin.path)
+    /// Whether `conn_id` is a direct connection a DCUtR hole punch produced,
+    /// so its [`Path`] is [`Path::Punched`]. It is recorded before the event
+    /// announcing the punch is queued and forgotten when the connection
+    /// closes or is replaced.
+    pub fn is_punched(&self, conn_id: ConnectionId) -> bool {
+        self.shared
+            .origins
+            .get(&conn_id)
+            .is_some_and(|origin| origin.path == Path::Punched)
     }
 
     /// Updates the validated addresses advertised during DCUtR exchanges.
@@ -1405,20 +1410,17 @@ impl NatAgent {
         self.housekeeping
             .on_connection_replaced(peer, old, swarm, &mut self.shared, now);
 
-        // The selected path becomes `new`'s origin. A machine that announced
-        // `new` just now recorded it (with its own event); otherwise a
-        // direct `new` takes over from `old`'s path, and leaving a relay
-        // is reported once, against whatever created that relayed path.
+        // A machine that announced `new` just now recorded its origin (with
+        // its own event). Otherwise a direct `new` that retires a relayed
+        // path is reported once, against whatever created that path. `new`
+        // keeps no origin of `old`'s: its own path is plain Direct.
         let Some(old_origin) = old_origin else {
             return;
         };
-        if self.shared.origins.contains_key(&new) || is_circuit {
-            return;
-        }
-        let to = Path::DirectDialed;
-        self.shared
-            .record_origin(new, to.clone(), old_origin.connect_id);
-        if !matches!(old_origin.path, Path::Relayed { .. }) {
+        if self.shared.origins.contains_key(&new)
+            || is_circuit
+            || !matches!(old_origin.path, Path::Relayed { .. })
+        {
             return;
         }
         self.shared.push_event(match old_origin.connect_id {
@@ -1426,7 +1428,7 @@ impl NatAgent {
                 connect_id,
                 peer: peer.clone(),
                 from: old_origin.path,
-                to,
+                to: Path::Direct,
                 old_conn_id: old,
                 new_conn_id: new,
             },

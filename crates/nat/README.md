@@ -25,7 +25,7 @@ rounds exhausted or
 relay leg dead       ⇒ ConnectFailed { error }    (engine decides the attempt)
 ```
 
-Ranking: `DirectDialed` ≈ `DirectPunched` > `Relayed`.
+Ranking: `Direct` ≈ `Punched` > `Relayed`.
 
 HOP CONNECT only works at a relay where the _target_ holds a reservation, so the relay leg tries the configured relays one at a time. Relays that `ConnectLegs::target_addrs` name in a circuit address (`.../p2p/<relay>/p2p-circuit`) go first, the rest follow in `NatConfig::relays` order; relays that are not configured are never used. A relay listed under several addresses is tried at the next address when the previous one could not reach it; once it is reached, its other addresses are skipped. A bridge that fails to promote, or a circuit that closes before it carries a path, counts as that relay failing. Each relay gets `relay_timeout_ms` (12 s), clipped by the attempt's deadline and split across its addresses, from its first dial to its circuit carrying a path; a relay that fails earlier hands over to the next one at once. `RelayStarted` names each relay as the leg starts it and `RelayFailed` reports each failure, so the Endpoint keeps one diagnostic per relay. The leg fails only after every relay has failed, with the last relay's error. A relay that runs out its budget fails with `NatError::Timeout`, naming the `RelayStage` that stalled (relay dial, HOP negotiation, HOP status, circuit handshake), the relay, the time spent, and the budget. The relay server's own 60 s HOP/STOP timeout is a cleanup ceiling, not a promise that clients wait that long.
 
@@ -154,7 +154,7 @@ Punch candidates are bounded both ways: a peer's CONNECT is filtered to globally
 
 The swarm keeps one connection per peer. When a newer connection takes the slot (`SwarmEvent::ConnectionReplaced { peer_id, old, new }`), the agent applies `new` before retiring `old`, so the peer never counts as disconnected and no relay leg or inbound flow fails just because `old` went away. Everything bound to `old` ends: its streams, its observed address, and the peer's readiness (`PeerReady` for `new` restarts what waits on it). A connection-level disconnect (`ConnectionClosed`) is acted on immediately.
 
-Each connection records the path origin a NAT machine announced for it: Direct (dialed or punched) or Relayed through a relay, plus the Connect ID of the attempt that created it. `NatAgent::path` reports the origin of the peer's current connection. On a replacement the path becomes `new`'s origin; leaving a relay for a direct connection is reported exactly once, as `PathUpgraded` against the attempt that created the relayed path, or as `InboundDirectUpgrade` when it came from an inbound circuit. Other changes, such as relay A to relay B, only update the path.
+Each connection a NAT machine announced records its path origin (`Path::Direct`, `Path::Punched`, or `Path::Relayed { relay }`) and the Connect ID of the attempt that created it. The Endpoint owns every connection's `Path` and derives Direct and Relayed from the transport; the one fact it takes from NAT is a hole punch, through `NatAgent::is_punched(conn_id)`. A replacement does not carry `old`'s origin over to `new`. Leaving a relay for a direct connection is reported exactly once, as `PathUpgraded` against the attempt that created the relayed path, or as `InboundDirectUpgrade` when it came from an inbound circuit. Other changes, such as relay A to relay B, report nothing.
 
 ## Status
 

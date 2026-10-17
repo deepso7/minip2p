@@ -71,23 +71,206 @@ const stringConverter = (() => {
 })();
 const FfiConverterString = uniffiCreateFfiConverterString(stringConverter);
 
+
+// Enum: PathKind
+export enum PathKind_Tags {
+    Direct = "Direct",
+    Punched = "Punched",
+    Relayed = "Relayed"
+}
 /**
- * State snapshot of the transport connection selected for a peer.
+ * How an established connection was made; see `minip2p::Path`.
+ */
+export const PathKind = (() => {
+
+    type Direct__interface = {
+        tag: PathKind_Tags.Direct
+    };
+    /**
+     * A direct connection we dialed or accepted.
+     */
+    class Direct_ extends UniffiEnum implements Direct__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "PathKind";
+        readonly tag = PathKind_Tags.Direct;
+        constructor() {
+            super("PathKind", "Direct");
+        }
+
+        static new(): Direct_ {
+            return new Direct_();
+        }
+
+        static instanceOf(obj: any): obj is Direct_ {
+            return obj.tag === PathKind_Tags.Direct;
+        }
+
+    }
+
+    type Punched__interface = {
+        tag: PathKind_Tags.Punched
+    };
+    /**
+     * A direct connection made by a DCUtR hole punch.
+     */
+    class Punched_ extends UniffiEnum implements Punched__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "PathKind";
+        readonly tag = PathKind_Tags.Punched;
+        constructor() {
+            super("PathKind", "Punched");
+        }
+
+        static new(): Punched_ {
+            return new Punched_();
+        }
+
+        static instanceOf(obj: any): obj is Punched_ {
+            return obj.tag === PathKind_Tags.Punched;
+        }
+
+    }
+
+    type Relayed__interface = {
+        tag: PathKind_Tags.Relayed;
+        inner:
+Readonly<{relayPeerId: string}>
+    };
+    /**
+     * Traffic is carried through a relay.
+     */
+    class Relayed_ extends UniffiEnum implements Relayed__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "PathKind";
+        readonly tag = PathKind_Tags.Relayed;
+        readonly inner:
+Readonly<{relayPeerId: string}>;
+        constructor(
+inner: {relayPeerId: string }) {
+            super("PathKind", "Relayed");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {relayPeerId: string }): Relayed_ {
+            return new Relayed_(inner);
+        }
+
+        static instanceOf(obj: any): obj is Relayed_ {
+            return obj.tag === PathKind_Tags.Relayed;
+        }
+
+    }
+
+    function instanceOf(obj: any): obj is PathKind {
+        return obj[uniffiTypeNameSymbol] === "PathKind";
+    }
+
+    return Object.freeze({
+        instanceOf,
+  Direct: Direct_,
+  Punched: Punched_,
+  Relayed: Relayed_
+    });
+
+})();
+/**
+ * How an established connection was made; see `minip2p::Path`.
+ */
+export type PathKind = InstanceType<
+    typeof PathKind['Direct' | 'Punched' | 'Relayed']
+>;
+
+// FfiConverter for enum PathKind
+const FfiConverterTypePathKind = (() => {
+    type TypeName = PathKind;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            switch (c.readI32()) {
+                case 1: return new PathKind.Direct();
+                case 2: return new PathKind.Punched();
+                case 3: return new PathKind.Relayed({relayPeerId: FfiConverterString.readFromCursor(c) });
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            switch (value.tag) {
+                case PathKind_Tags.Direct: {
+                    c.writeI32(1);
+                    return;
+                }
+                case PathKind_Tags.Punched: {
+                    c.writeI32(2);
+                    return;
+                }
+                case PathKind_Tags.Relayed: {
+                    c.writeI32(3);
+                    const inner = value.inner;
+                    FfiConverterString.writeIntoCursor(inner.relayPeerId, c);
+                    return;
+                }
+                default:
+                    // Throwing from here means that PathKind_Tags hasn't matched an ordinal.
+                    throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        allocationSize(value: TypeName): number {
+            switch (value.tag) {
+                case PathKind_Tags.Direct: {
+                    return 4;
+                }
+                case PathKind_Tags.Punched: {
+                    return 4;
+                }
+                case PathKind_Tags.Relayed: {
+                    const inner = value.inner;
+                    let size = 4;
+                    size += FfiConverterString.allocationSize(inner.relayPeerId);
+                    return size;
+                }
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * State snapshot of a peer's established connection; see
+ * `minip2p::ConnectionInfo`.
  */
 export type ConnectionInfo = {
+    /**
+     * The peer on the other end.
+     */
+    peerId: string,
     /**
      * Endpoint-local transport connection id.
      */
     connId: bigint,
     /**
-     * Remote transport address, when recorded.
+     * Remote transport address the transport reported; a circuit reports
+     * `/p2p/<relay>/p2p-circuit`.
      */
-    remoteAddr?: string,
+    remoteAddr: string,
+    /**
+     * How the connection was made.
+     */
+    path: PathKind,
     /**
      * Protocols this connection advertised through Identify, once it is
-     * ready (`PeerReady` for this `conn_id`); `None` until then. Readiness,
-     * connection and protocols come from one snapshot, so a ready wait can
-     * trust them together.
+     * ready (`PeerReady` for this `conn_id`); `None` until then, distinct
+     * from an empty list. Readiness, connection and protocols come from one
+     * snapshot, so a ready wait can trust them together.
      */
     readyProtocols?: Array<string>
 }
@@ -113,19 +296,25 @@ const FfiConverterTypeConnectionInfo = (() => {
     class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
         readFromCursor(c: Cursor): TypeName {
             return {
+                peerId: FfiConverterString.readFromCursor(c),
                 connId: FfiConverterUInt64.readFromCursor(c),
-                remoteAddr: FfiConverterOptionalString.readFromCursor(c),
+                remoteAddr: FfiConverterString.readFromCursor(c),
+                path: FfiConverterTypePathKind.readFromCursor(c),
                 readyProtocols: FfiConverterOptionalSequenceString.readFromCursor(c)
             };
         }
         writeIntoCursor(value: TypeName, c: Cursor): void {
+            FfiConverterString.writeIntoCursor(value.peerId, c);
             FfiConverterUInt64.writeIntoCursor(value.connId, c);
-            FfiConverterOptionalString.writeIntoCursor(value.remoteAddr, c);
+            FfiConverterString.writeIntoCursor(value.remoteAddr, c);
+            FfiConverterTypePathKind.writeIntoCursor(value.path, c);
             FfiConverterOptionalSequenceString.writeIntoCursor(value.readyProtocols, c);
         }
         allocationSize(value: TypeName): number {
-            return FfiConverterUInt64.allocationSize(value.connId) +
-             FfiConverterOptionalString.allocationSize(value.remoteAddr) +
+            return FfiConverterString.allocationSize(value.peerId) +
+             FfiConverterUInt64.allocationSize(value.connId) +
+             FfiConverterString.allocationSize(value.remoteAddr) +
+             FfiConverterTypePathKind.allocationSize(value.path) +
              FfiConverterOptionalSequenceString.allocationSize(value.readyProtocols);
 
         }
@@ -2283,179 +2472,6 @@ const FfiConverterTypeReachability = (() => {
         }
         allocationSize(value: TypeName): number {
             return 4;
-        }
-    }
-    return new FFIConverter();
-})();
-
-
-// Enum: PathKind
-export enum PathKind_Tags {
-    DirectDialed = "DirectDialed",
-    DirectPunched = "DirectPunched",
-    Relayed = "Relayed"
-}
-/**
- * Kind of usable connection path.
- */
-export const PathKind = (() => {
-
-    type DirectDialed__interface = {
-        tag: PathKind_Tags.DirectDialed
-    };
-    /**
-     * A known address was dialed directly.
-     */
-    class DirectDialed_ extends UniffiEnum implements DirectDialed__interface {
-        /**
-         * @private
-         * This field is private and should not be used, use `tag` instead.
-         */
-        readonly [uniffiTypeNameSymbol] = "PathKind";
-        readonly tag = PathKind_Tags.DirectDialed;
-        constructor() {
-            super("PathKind", "DirectDialed");
-        }
-
-        static new(): DirectDialed_ {
-            return new DirectDialed_();
-        }
-
-        static instanceOf(obj: any): obj is DirectDialed_ {
-            return obj.tag === PathKind_Tags.DirectDialed;
-        }
-
-    }
-
-    type DirectPunched__interface = {
-        tag: PathKind_Tags.DirectPunched
-    };
-    /**
-     * A direct path was established by hole punching.
-     */
-    class DirectPunched_ extends UniffiEnum implements DirectPunched__interface {
-        /**
-         * @private
-         * This field is private and should not be used, use `tag` instead.
-         */
-        readonly [uniffiTypeNameSymbol] = "PathKind";
-        readonly tag = PathKind_Tags.DirectPunched;
-        constructor() {
-            super("PathKind", "DirectPunched");
-        }
-
-        static new(): DirectPunched_ {
-            return new DirectPunched_();
-        }
-
-        static instanceOf(obj: any): obj is DirectPunched_ {
-            return obj.tag === PathKind_Tags.DirectPunched;
-        }
-
-    }
-
-    type Relayed__interface = {
-        tag: PathKind_Tags.Relayed;
-        inner:
-Readonly<{relayPeerId: string}>
-    };
-    /**
-     * Traffic is carried through a relay.
-     */
-    class Relayed_ extends UniffiEnum implements Relayed__interface {
-        /**
-         * @private
-         * This field is private and should not be used, use `tag` instead.
-         */
-        readonly [uniffiTypeNameSymbol] = "PathKind";
-        readonly tag = PathKind_Tags.Relayed;
-        readonly inner:
-Readonly<{relayPeerId: string}>;
-        constructor(
-inner: {relayPeerId: string }) {
-            super("PathKind", "Relayed");
-
-            this.inner = Object.freeze(inner);
-        }
-        static new(
-inner: {relayPeerId: string }): Relayed_ {
-            return new Relayed_(inner);
-        }
-
-        static instanceOf(obj: any): obj is Relayed_ {
-            return obj.tag === PathKind_Tags.Relayed;
-        }
-
-    }
-
-    function instanceOf(obj: any): obj is PathKind {
-        return obj[uniffiTypeNameSymbol] === "PathKind";
-    }
-
-    return Object.freeze({
-        instanceOf,
-  DirectDialed: DirectDialed_,
-  DirectPunched: DirectPunched_,
-  Relayed: Relayed_
-    });
-
-})();
-/**
- * Kind of usable connection path.
- */
-export type PathKind = InstanceType<
-    typeof PathKind['DirectDialed' | 'DirectPunched' | 'Relayed']
->;
-
-// FfiConverter for enum PathKind
-const FfiConverterTypePathKind = (() => {
-    type TypeName = PathKind;
-    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
-        readFromCursor(c: Cursor): TypeName {
-            switch (c.readI32()) {
-                case 1: return new PathKind.DirectDialed();
-                case 2: return new PathKind.DirectPunched();
-                case 3: return new PathKind.Relayed({relayPeerId: FfiConverterString.readFromCursor(c) });
-                default: throw new UniffiInternalError.UnexpectedEnumCase();
-            }
-        }
-        writeIntoCursor(value: TypeName, c: Cursor): void {
-            switch (value.tag) {
-                case PathKind_Tags.DirectDialed: {
-                    c.writeI32(1);
-                    return;
-                }
-                case PathKind_Tags.DirectPunched: {
-                    c.writeI32(2);
-                    return;
-                }
-                case PathKind_Tags.Relayed: {
-                    c.writeI32(3);
-                    const inner = value.inner;
-                    FfiConverterString.writeIntoCursor(inner.relayPeerId, c);
-                    return;
-                }
-                default:
-                    // Throwing from here means that PathKind_Tags hasn't matched an ordinal.
-                    throw new UniffiInternalError.UnexpectedEnumCase();
-            }
-        }
-        allocationSize(value: TypeName): number {
-            switch (value.tag) {
-                case PathKind_Tags.DirectDialed: {
-                    return 4;
-                }
-                case PathKind_Tags.DirectPunched: {
-                    return 4;
-                }
-                case PathKind_Tags.Relayed: {
-                    const inner = value.inner;
-                    let size = 4;
-                    size += FfiConverterString.allocationSize(inner.relayPeerId);
-                    return size;
-                }
-                default: throw new UniffiInternalError.UnexpectedEnumCase();
-            }
         }
     }
     return new FFIConverter();
@@ -4625,14 +4641,14 @@ const FfiConverterTypeP2pEvent = (() => {
     return new FFIConverter();
 })();
 
-// FfiConverter for string | undefined
-const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
-
 // FfiConverter for Array<string>
 const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
 
 // FfiConverter for Array<string> | undefined
 const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
+
+// FfiConverter for string | undefined
+const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
 
 // FfiConverter for DiscoveryOptions | undefined
 const FfiConverterOptionalTypeDiscoveryOptions = new FfiConverterOptional(FfiConverterTypeDiscoveryOptions);

@@ -3,7 +3,6 @@
 import { Minip2pBase, StreamClosedError } from "@minip2p/core";
 import type {
   Bytes,
-  ConnectionInfo,
   IdentifyInfo,
   KnownPeerInfo,
   Minip2pConfig,
@@ -24,6 +23,7 @@ import {
 } from "@minip2p/core/backend";
 import type {
   BackendClosed,
+  BackendConnectionInfo,
   BackendConnectTarget,
   BackendOpenStream,
   Minip2pBackend,
@@ -164,7 +164,7 @@ class NodeBackend implements Minip2pBackend {
     return translateErrors(() => this.#endpoint.path(peerId)) ?? undefined;
   }
 
-  connectionInfo(peerId: string): ConnectionInfo | undefined {
+  connectionInfo(peerId: string): BackendConnectionInfo | undefined {
     const info = translateErrors(() => this.#endpoint.connectionInfo(peerId));
     if (info === null) {
       return undefined;

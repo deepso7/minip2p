@@ -1419,17 +1419,27 @@ export class Minip2pBase {
     return this.#backend.reachability();
   }
 
-  /** Returns the authoritative active path to `peerId`, if connected. */
+  /**
+   * Returns the path of `peerId`'s established connection; `undefined` only
+   * while the peer is not connected.
+   */
   path(peerId: string): Path | undefined {
     this.#assertOpen();
     const path = this.#backend.path(peerId);
     return path === undefined ? undefined : normalizePath(path);
   }
 
-  /** Returns the transport connection selected for `peerId`, if connected. */
+  /**
+   * Returns a snapshot of `peerId`'s established connection: its connection
+   * ID, remote address, path, and Identify protocols once ready;
+   * `undefined` while the peer is not connected.
+   */
   connectionInfo(peerId: string): ConnectionInfo | undefined {
     this.#assertOpen();
-    return this.#backend.connectionInfo(peerId);
+    const info = this.#backend.connectionInfo(peerId);
+    return info === undefined
+      ? undefined
+      : { ...info, path: normalizePath(info.path) };
   }
 
   /** Returns whether the native driver is accepting work. */
@@ -2486,11 +2496,11 @@ function normalizeCloseReason(
 
 function normalizePath(path: PathKind): Path {
   switch (path.tag) {
-    case PathKind_Tags.DirectDialed: {
-      return { kind: "directDialed" };
+    case PathKind_Tags.Direct: {
+      return { kind: "direct" };
     }
-    case PathKind_Tags.DirectPunched: {
-      return { kind: "directPunched" };
+    case PathKind_Tags.Punched: {
+      return { kind: "punched" };
     }
     case PathKind_Tags.Relayed: {
       return { kind: "relayed", relayPeerId: path.inner.relayPeerId };

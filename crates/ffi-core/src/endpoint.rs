@@ -683,11 +683,8 @@ impl P2pEndpoint {
         self.with_endpoint_mut(|endpoint| endpoint.disconnect(&peer).map_err(map_driver_error))
     }
 
-    /// Returns the current usable NAT-orchestrated path to `peer_id`.
-    ///
-    /// `None` once the connection the path describes closes (the last relay
-    /// circuit for a relayed path, the last direct connection for a direct
-    /// one), even while the peer stays connected over the other kind.
+    /// Returns the path of `peer_id`'s established connection; `None` only
+    /// while the peer is not connected. See `minip2p::Endpoint::path`.
     pub fn path(&self, peer_id: String) -> Result<Option<crate::PathKind>, FfiError> {
         let peer = PeerId::from_str(&peer_id).map_err(|error| FfiError::InvalidPeerId {
             detail: error.to_string(),
@@ -695,24 +692,23 @@ impl P2pEndpoint {
         self.with_endpoint(|endpoint| endpoint.path(&peer).map(crate::events::convert_path))
     }
 
-    /// Returns the transport connection selected for `peer_id`, when
-    /// connected.
+    /// Returns a snapshot of `peer_id`'s established connection; `None`
+    /// while the peer is not connected. A by-peer convenience over
+    /// `minip2p::Endpoint::connection_info`.
     pub fn connection_info(
         &self,
         peer_id: String,
     ) -> Result<Option<crate::ConnectionInfo>, FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         self.with_endpoint(|endpoint| {
-            let ready = endpoint.peer_readiness(&peer);
-            endpoint
-                .connection_id(&peer)
-                .map(|id| crate::ConnectionInfo {
-                    conn_id: id.as_u64(),
-                    remote_addr: endpoint.connection_remote_addr(id).map(ToString::to_string),
-                    ready_protocols: ready
-                        .filter(|(ready_id, _)| *ready_id == id)
-                        .map(|(_, info)| info.protocols.clone()),
-                })
+            let info = endpoint.connection_info(endpoint.connection_id(&peer)?)?;
+            Some(crate::ConnectionInfo {
+                peer_id: info.peer_id.to_base58(),
+                conn_id: info.conn_id.as_u64(),
+                remote_addr: info.remote_addr.to_string(),
+                path: crate::events::convert_path(info.path),
+                ready_protocols: info.ready_protocols,
+            })
         })
     }
 
@@ -1481,10 +1477,10 @@ mod tests {
             .expect("connection info")
             .expect("connected peer has a transport connection");
         assert_eq!(info.conn_id, *conn_id);
+        assert_eq!(info.peer_id, b.peer_id());
+        assert_eq!(info.path, crate::PathKind::Direct);
         assert!(
-            info.remote_addr
-                .as_deref()
-                .is_some_and(|addr| addr.contains("/quic-v1")),
+            info.remote_addr.contains("/quic-v1"),
             "remote addr records the transport: {info:?}"
         );
         assert!(matches!(

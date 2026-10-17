@@ -82,9 +82,12 @@ export declare class NodeEndpoint {
   cancelConnect(id: bigint): void
   /** Disconnects one peer. */
   disconnect(peerId: string): void
-  /** Returns the current path to a peer. */
+  /**
+   * Returns the path of a peer's established connection; `null` only
+   * while the peer is not connected.
+   */
   path(peerId: string): NativePathKind | null
-  /** Returns the transport connection selected for a peer. */
+  /** Returns a snapshot of a peer's established connection. */
   connectionInfo(peerId: string): NativeConnectionInfo | null
   /** Returns the discovery address book. */
   knownPeers(): Array<NativeKnownPeerInfo>

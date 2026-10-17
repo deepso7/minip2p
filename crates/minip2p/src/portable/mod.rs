@@ -6,7 +6,8 @@ use alloc::{string::String, vec::Vec};
 
 pub use minip2p_core::platform::{Deadline, EntropySource, IoErrorKind, Now, SharedEntropy};
 pub use minip2p_core::{
-    Bytes, Multiaddr, MultiaddrError, PeerAddr, PeerAddrError, PeerId, Protocol, TransportKind,
+    Bytes, Multiaddr, MultiaddrError, Path, PeerAddr, PeerAddrError, PeerId, Protocol,
+    TransportKind,
 };
 pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_swarm::{
@@ -55,7 +56,7 @@ pub use minip2p_mdns::{
 pub use minip2p_mdns::{SmoltcpMdnsConfig, SmoltcpMdnsIo};
 #[cfg(feature = "_nat-driver")]
 pub use minip2p_nat::{
-    NatConfig, NatError, NatEvent, Path, ReachabilityState, RelayStage, ReservationInfo,
+    NatConfig, NatError, NatEvent, ReachabilityState, RelayStage, ReservationInfo,
     ReservationPolicy, UpgradeStop,
 };
 #[cfg(feature = "pubsub")]
@@ -162,6 +163,7 @@ fn expand_concrete(addr: &PeerAddr) -> Expansion {
 /// [`is_peer_ready`](Self::is_peer_ready), [`peer_info`](Self::peer_info),
 /// [`connection_id`](Self::connection_id),
 /// [`connection_remote_addr`](Self::connection_remote_addr),
+/// [`connection_info`](Self::connection_info), [`path`](Self::path),
 /// [`bound_addresses`](Self::bound_addresses)) do not drive the endpoint.
 /// Separate getters are not one cross-getter atomic snapshot and may be ahead
 /// of the Endpoint event stream (state changes before its corresponding event
@@ -183,6 +185,26 @@ pub struct PortableEndpointStats {
     pub ready_peers: usize,
     /// Transport-bound local addresses (see [`PortableEndpoint::bound_addresses`]).
     pub bound_addresses: Vec<Multiaddr>,
+}
+
+/// A snapshot of one established connection, from
+/// [`PortableEndpoint::connection_info`] or the std `Endpoint`'s.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectionInfo {
+    /// The peer on the other end.
+    pub peer_id: PeerId,
+    /// The connection this describes.
+    pub conn_id: ConnectionId,
+    /// The remote transport address the transport reported for it; a circuit
+    /// reports `/p2p/<relay>/p2p-circuit`.
+    pub remote_addr: Multiaddr,
+    /// How the connection was made.
+    pub path: Path,
+    /// The protocols the peer advertised through Identify on this
+    /// connection: `None` until it is identified (its
+    /// [`EndpointEvent::PeerReady`]), which is distinct from `Some` of an
+    /// empty list.
+    pub ready_protocols: Option<Vec<String>>,
 }
 
 impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
@@ -289,6 +311,28 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// See [State snapshots](Self#state-snapshots).
     pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
         self.engine.core.connection_remote_addr(conn_id)
+    }
+
+    /// Returns the [`Path`] of `peer`'s established connection; `None` only
+    /// while the peer is not connected.
+    ///
+    /// See [`Self::connection_info`].
+    pub fn path(&self, peer: &PeerId) -> Option<Path> {
+        self.engine.path(peer)
+    }
+
+    /// Returns a snapshot of the established connection `conn_id`: its peer,
+    /// remote address, [`Path`], and Identify protocols once ready.
+    ///
+    /// `None` for a pending, replaced, or closed connection. A connection's
+    /// path is [`Path::Relayed`] for a circuit, [`Path::Direct`] for a direct
+    /// connection we dialed or accepted, or [`Path::Punched`] once NAT
+    /// reports its hole punch produced it. A Connection replacement's new
+    /// connection has its own path.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
+    pub fn connection_info(&self, conn_id: ConnectionId) -> Option<ConnectionInfo> {
+        self.engine.connection_info(conn_id)
     }
 
     /// Returns addresses currently bound on the local transport.
@@ -462,17 +506,6 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
             (Some(error), _) | (None, Err(error)) => Err(error),
             (None, Ok(())) => Ok(events),
         }
-    }
-
-    /// Returns the NAT-orchestrated path of `peer`'s current connection.
-    ///
-    /// It follows a Connection replacement to the new connection's origin
-    /// and is gone once the peer disconnects. Connections NAT did not
-    /// announce have no path, so this can return `None` while the peer is
-    /// connected.
-    #[cfg(feature = "portable-relay")]
-    pub fn path(&self, peer: &PeerId) -> Option<Path> {
-        self.engine.path(peer)
     }
 
     /// Returns the currently held relay reservation, when any.
@@ -1246,7 +1279,7 @@ mod tests {
     use core::cell::Cell;
     use minip2p_core::platform::EntropyError;
     use minip2p_test_support::InMemoryTransport;
-    use minip2p_transport::{ConnectionEndpoint, TransportEvent};
+    use minip2p_transport::{ConnectionEndpoint, ConnectionNamespace, TransportEvent};
 
     struct NoopTransport;
 
@@ -1572,6 +1605,124 @@ mod tests {
             error,
             PortableBuildError::Swarm(SwarmError::ReservedProtocol { .. })
         ));
+    }
+
+    /// A circuit is Relayed through the relay its address names; the direct
+    /// connection that replaces it is Direct, inheriting nothing; pending,
+    /// replaced, and closed connections have no info.
+    #[test]
+    fn every_established_connection_has_its_own_path() {
+        let identity = Ed25519Keypair::from_secret_key_bytes([31; 32]);
+        let peer = Ed25519Keypair::from_secret_key_bytes([32; 32]).peer_id();
+        let relay = Ed25519Keypair::from_secret_key_bytes([33; 32]).peer_id();
+        let circuit = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 1).expect("id");
+        let circuit_addr =
+            Multiaddr::from_protocols(vec![Protocol::P2p(relay.clone()), Protocol::P2pCircuit]);
+        let direct = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("id");
+        let direct_addr: Multiaddr = "/ip4/192.0.2.7/tcp/4001".parse().expect("address");
+        let transport = RecordingTransport {
+            events: vec![
+                TransportEvent::Connected {
+                    id: circuit,
+                    endpoint: ConnectionEndpoint::with_peer_id(circuit_addr.clone(), peer.clone()),
+                },
+                TransportEvent::IncomingConnection {
+                    id: direct,
+                    endpoint: ConnectionEndpoint::new(direct_addr.clone()),
+                },
+            ],
+            local_address: direct_addr.clone(),
+            next_stream_id: 0,
+            closed: Rc::new(Cell::new(false)),
+        };
+        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
+            .build(transport)
+            .expect("endpoint configuration is valid");
+        endpoint.poll(Now::from_millis(0)).expect("poll");
+
+        assert_eq!(
+            endpoint.connection_info(circuit),
+            Some(ConnectionInfo {
+                peer_id: peer.clone(),
+                conn_id: circuit,
+                remote_addr: circuit_addr,
+                path: Path::Relayed { relay },
+                ready_protocols: None,
+            })
+        );
+        assert_eq!(
+            endpoint.connection_info(direct),
+            None,
+            "a pending handshake"
+        );
+
+        // The accepted direct connection identifies the peer and replaces
+        // the circuit.
+        endpoint
+            .engine
+            .core
+            .transport_mut()
+            .events
+            .push(TransportEvent::Connected {
+                id: direct,
+                endpoint: ConnectionEndpoint::with_peer_id(direct_addr, peer.clone()),
+            });
+        endpoint.poll(Now::from_millis(1)).expect("poll");
+        assert_eq!(endpoint.connection_info(circuit), None, "replaced");
+        assert_eq!(
+            endpoint.connection_info(direct).map(|info| info.path),
+            Some(Path::Direct)
+        );
+        assert_eq!(endpoint.path(&peer), Some(Path::Direct));
+
+        endpoint
+            .engine
+            .core
+            .transport_mut()
+            .events
+            .push(TransportEvent::Closed {
+                id: direct,
+                reason: ConnectionCloseReason::Local,
+            });
+        endpoint.poll(Now::from_millis(2)).expect("poll");
+        assert_eq!(endpoint.connection_info(direct), None, "closed");
+        assert_eq!(endpoint.path(&peer), None);
+    }
+
+    /// `ready_protocols` is `None` until the connection is identified, then
+    /// the protocols the peer advertised on it.
+    #[test]
+    fn connection_info_reports_protocols_once_identified() {
+        let a_identity = Ed25519Keypair::from_secret_key_bytes([34; 32]);
+        let b_identity = Ed25519Keypair::from_secret_key_bytes([35; 32]);
+        let (a_transport, b_transport) =
+            InMemoryTransport::pair(a_identity.peer_id(), b_identity.peer_id());
+        let conn_id = a_transport.connection_id();
+        let mut a = Endpoint::portable(&a_identity, ZeroEntropy)
+            .build(a_transport)
+            .expect("a endpoint configuration is valid");
+        let mut b = Endpoint::portable(&b_identity, ZeroEntropy)
+            .protocol("/app/1")
+            .build(b_transport)
+            .expect("b endpoint configuration is valid");
+
+        a.poll(Now::from_millis(0)).expect("drive a");
+        let info = a.connection_info(conn_id).expect("established");
+        assert_eq!(info.path, Path::Direct);
+        assert_eq!(info.ready_protocols, None, "not identified yet");
+
+        for now_ms in 1..64 {
+            b.poll(Now::from_millis(now_ms)).expect("drive b");
+            a.poll(Now::from_millis(now_ms)).expect("drive a");
+            if a.is_peer_ready(&b_identity.peer_id()) {
+                break;
+            }
+        }
+        let protocols = a
+            .connection_info(conn_id)
+            .and_then(|info| info.ready_protocols)
+            .expect("identified");
+        assert!(protocols.iter().any(|protocol| protocol == "/app/1"));
     }
 
     #[test]

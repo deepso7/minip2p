@@ -95,6 +95,11 @@ export class NativeCloseLatch {
   }
 }
 
+/** A native connection snapshot: {@link ConnectionInfo} with the raw path. */
+export interface BackendConnectionInfo extends Omit<ConnectionInfo, "path"> {
+  readonly path: PathKind;
+}
+
 /** Full native identity allocated for an outbound stream. */
 export interface BackendOpenStream {
   /** Endpoint-local connection carrying the stream. */
@@ -149,10 +154,10 @@ export interface Minip2pBackend {
   discoveryNowMs: () => number | undefined;
   /** Returns the active relay reservation. */
   activeReservation: () => RelayReservationInfo | undefined;
-  /** Returns the authoritative native path to a peer. */
+  /** Returns the path of a peer's established connection. */
   path: (peerId: string) => PathKind | undefined;
-  /** Returns the transport connection selected for a peer. */
-  connectionInfo: (peerId: string) => ConnectionInfo | undefined;
+  /** Returns a snapshot of a peer's established connection. */
+  connectionInfo: (peerId: string) => BackendConnectionInfo | undefined;
   /** Builds a circuit address through a relay. */
   circuitAddress: (relayAddress: string, peerId: string) => string;
   /** Returns the native reachability state. */

@@ -1,9 +1,15 @@
 import { describeAdapterContract } from "@minip2p/test-fixtures/adapter-contract";
-import type { NativeEventLiteral } from "@minip2p/test-fixtures/adapter-contract";
+import type {
+  NativeConnectionInfo,
+  NativeEventLiteral,
+} from "@minip2p/test-fixtures/adapter-contract";
 import { afterEach, vi } from "vitest";
 
 import { Minip2p } from "../src/adapter";
-import { ConnectTarget_Tags } from "../src/generated/minip2p_ffi_core";
+import {
+  ConnectTarget_Tags,
+  PathKind,
+} from "../src/generated/minip2p_ffi_core";
 import { FakeNativeEndpoint } from "./fake-native-endpoint";
 
 vi.mock("../src/native", async () => {
@@ -14,6 +20,16 @@ vi.mock("../src/native", async () => {
 vi.mock("../src/NativeMinip2p", () => ({
   default: { setMdnsEnabled: vi.fn() },
 }));
+
+/** The generated UniFFI value of a runtime-neutral native path. */
+const generatedPath = (path: NativeConnectionInfo["path"]): PathKind => {
+  if (path.tag === "Relayed") {
+    return PathKind.Relayed.new(path.inner);
+  }
+  return path.tag === "Punched"
+    ? PathKind.Punched.new()
+    : PathKind.Direct.new();
+};
 
 afterEach(() => {
   FakeNativeEndpoint.latest = undefined;
@@ -43,7 +59,7 @@ describeAdapterContract("React Native", {
         fake.closeReport.unfinished = [...unfinished];
       },
       setConnectionInfo: (info) => {
-        fake.connection = info;
+        fake.connection = { ...info, path: generatedPath(info.path) };
       },
       setLiveConnection: (connId) => {
         fake.liveConnId = connId;

@@ -65,12 +65,13 @@ use crate::nat::{CircuitOps, NatDriver};
 use crate::portable::connect::Expansion;
 #[cfg(feature = "pubsub")]
 use crate::pubsub::GossipsubDriver;
+use crate::{ConnectionInfo, Path};
 #[cfg(any(feature = "discovery", feature = "mdns"))]
 use crate::{DiscoveryConfigError, KnownPeer, PeerDiscoveryConfig};
 #[cfg(feature = "mdns")]
 use crate::{MdnsConfig, MdnsConfigError, MdnsError};
 #[cfg(feature = "nat")]
-use crate::{NatConfig, Path, ReachabilityState, ReservationInfo};
+use crate::{NatConfig, ReachabilityState, ReservationInfo};
 use minip2p_core::Multiaddr;
 #[cfg(any(feature = "quic", feature = "tcp", feature = "relay-server"))]
 use minip2p_core::Protocol;
@@ -303,6 +304,7 @@ pub enum CloseOutcome {
 /// [`is_peer_ready`](Self::is_peer_ready), [`peer_info`](Self::peer_info),
 /// [`connection_id`](Self::connection_id),
 /// [`connection_remote_addr`](Self::connection_remote_addr),
+/// [`connection_info`](Self::connection_info), [`path`](Self::path),
 /// [`bound_addresses`](Self::bound_addresses)) do not drive the endpoint.
 /// Separate getters are not one cross-getter atomic snapshot and may be ahead
 /// of the Endpoint event stream (state changes before its corresponding event
@@ -485,19 +487,28 @@ impl Endpoint {
         self.engine.disconnect(peer_id, now)
     }
 
-    /// Returns the current usable NAT-orchestrated path to `peer_id`.
+    /// Returns the [`Path`] of `peer_id`'s established connection; `None`
+    /// only while the peer is not connected.
     ///
-    /// This is the path origin of the peer's current connection: Direct
-    /// (dialed or punched) or Relayed through a relay, recorded when NAT
-    /// announces it. It is updated before the corresponding NAT event is
-    /// queued and is independent of event consumption. On a
-    /// [`EndpointEvent::ConnectionReplaced`] it becomes the new connection's
-    /// origin, and it is gone once the peer disconnects. Connections NAT did
-    /// not announce have no path, so this can return `None` while the peer is
-    /// connected.
-    #[cfg(feature = "nat")]
+    /// See [`Self::connection_info`] and
+    /// [State snapshots](Self#state-snapshots).
     pub fn path(&self, peer_id: &PeerId) -> Option<Path> {
         self.engine.path(peer_id)
+    }
+
+    /// Returns a snapshot of the established connection `conn_id`: its peer,
+    /// remote address, [`Path`], and Identify protocols once ready.
+    ///
+    /// `None` for a pending, replaced, or closed connection. A connection's
+    /// path is [`Path::Relayed`] for a circuit, [`Path::Direct`] for a direct
+    /// connection we dialed or accepted, or [`Path::Punched`] once NAT
+    /// reports its hole punch produced it (before the event announcing the
+    /// punch is queued). On [`EndpointEvent::ConnectionReplaced`] the new
+    /// connection has its own path; nothing carries over.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
+    pub fn connection_info(&self, conn_id: ConnectionId) -> Option<ConnectionInfo> {
+        self.engine.connection_info(conn_id)
     }
 
     /// Returns peers with an established connection.

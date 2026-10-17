@@ -49,8 +49,8 @@ enum RelayLeg {
 
 /// Per-target relay-leg arbiter: staggered HOP CONNECT, bridge promotion,
 /// and DCUtR. Direct candidate racing belongs to the Connection-attempt
-/// engine; this machine only tracks a direct establishment so
-/// [`Path::DirectDialed`] snapshots keep working.
+/// engine; this machine only tracks a direct establishment so it can report
+/// [`Path::Direct`] and upgrade a relayed path.
 ///
 /// The relay leg tries eligible relays one at a time. Each relay gets
 /// [`NatConfig::relay_timeout_ms`](crate::NatConfig::relay_timeout_ms),
@@ -371,7 +371,7 @@ impl ConnectAttempt {
         self.exchange_deadline = None;
         self.punch_deadline = None;
         // Punch dials left from this round must not land as a late
-        // `DirectPunched` while the next round runs.
+        // `Punched` path while the next round runs.
         shared.abort_attempt_dials(self.id, &self.peer, swarm);
         shared.push_event(NatEvent::HolePunchFailed {
             connect_id: self.id,
@@ -509,9 +509,9 @@ impl ConnectAttempt {
         }
         // Classify punched iff this conn id was issued as a punch dial.
         let path = if self.punch_conns.contains(&conn_id) {
-            Path::DirectPunched
+            Path::Punched
         } else {
-            Path::DirectDialed
+            Path::Direct
         };
         match &self.best {
             None => {

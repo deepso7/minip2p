@@ -865,7 +865,7 @@ mod tests {
                 connect_id: 7,
                 peer_id: "peer".into(),
                 conn_id: 70,
-                path: crate::PathKind::DirectDialed,
+                path: crate::PathKind::Direct,
             }),
             Some(7)
         );
@@ -905,7 +905,7 @@ mod tests {
                 from: crate::PathKind::Relayed {
                     relay_peer_id: "relay".into()
                 },
-                to: crate::PathKind::DirectPunched,
+                to: crate::PathKind::Punched,
                 old_conn_id: 1,
                 new_conn_id: 2,
             }),
@@ -1116,7 +1116,7 @@ mod tests {
         let terminal = P2pEvent::PathEstablished {
             connect_id: 9,
             peer_id: "peer".into(),
-            path: crate::PathKind::DirectDialed,
+            path: crate::PathKind::Direct,
             conn_id: 3,
         };
         let kept = [
@@ -1180,7 +1180,7 @@ mod tests {
         let path = |conn_id| P2pEvent::InboundPathEstablished {
             peer_id: "peer".into(),
             conn_id,
-            path: crate::PathKind::DirectDialed,
+            path: crate::PathKind::Direct,
         };
         carry.push(established(6));
         carry.push(closed(6));
@@ -1199,7 +1199,7 @@ mod tests {
         let settled = P2pEvent::PathEstablished {
             connect_id: 10,
             peer_id: "peer".into(),
-            path: crate::PathKind::DirectDialed,
+            path: crate::PathKind::Direct,
             conn_id: 6,
         };
         carry.push(settled.clone());

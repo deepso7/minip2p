@@ -70,7 +70,7 @@ fn promotion_that_loses_to_a_direct_connection_waits_for_its_event() {
 
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
-        [NatEvent::PathEstablished { connect_id, path: Path::DirectDialed, .. }]
+        [NatEvent::PathEstablished { connect_id, path: Path::Direct, .. }]
             if *connect_id == id
     ));
 }
@@ -630,7 +630,7 @@ fn established_during_punch_window_is_direct_dialed_unless_punch_conn() {
     assert_ne!(dial_conn_for(&actions, &h.target), ConnectionId::new(99));
     drain_events(&mut h.agent);
 
-    // A late engine-owned candidate is DirectDialed even while a punch
+    // A late engine-owned candidate is Direct even while a punch
     // window is open.
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
@@ -644,7 +644,7 @@ fn established_during_punch_window_is_direct_dialed_unless_punch_conn() {
         drain_events(&mut h.agent).as_slice(),
         [NatEvent::PathUpgraded {
             connect_id,
-            to: Path::DirectDialed,
+            to: Path::Direct,
             ..
         }] if *connect_id == id
     ));
@@ -671,7 +671,7 @@ fn punch_conn_established_during_window_is_direct_punched() {
         drain_events(&mut h.agent).as_slice(),
         [NatEvent::PathUpgraded {
             connect_id,
-            to: Path::DirectPunched,
+            to: Path::Punched,
             ..
         }] if *connect_id == id
     ));
@@ -701,13 +701,16 @@ fn direct_replacement_of_the_provisional_circuit_upgrades_once() {
         [NatEvent::PathUpgraded {
             connect_id,
             from: Path::Relayed { .. },
-            to: Path::DirectDialed,
+            to: Path::Direct,
             ..
         }] if *connect_id == id
     ));
-    assert_eq!(h.agent.path(&h.target), Some(&Path::DirectDialed));
+    assert!(
+        !h.agent.is_punched(ConnectionId::new(50)),
+        "the replacement keeps no origin of the circuit's"
+    );
 
-    // A late close of the replaced circuit leaves the peer connected.
+    // A late close of the replaced circuit reports nothing more.
     h.agent.handle_event(
         &SwarmEvent::ConnectionClosed {
             peer_id: h.target.clone(),
@@ -717,7 +720,7 @@ fn direct_replacement_of_the_provisional_circuit_upgrades_once() {
         false,
         at(410),
     );
-    assert_eq!(h.agent.path(&h.target), Some(&Path::DirectDialed));
+    assert!(drain_events(&mut h.agent).is_empty());
 }
 
 #[test]
@@ -742,9 +745,8 @@ fn direct_replacement_after_the_attempt_ended_reports_against_its_origin() {
     replace_target(&mut h, circuit, ConnectionId::new(50), 400);
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
-        [NatEvent::PathUpgraded { connect_id, to: Path::DirectDialed, .. }] if *connect_id == id
+        [NatEvent::PathUpgraded { connect_id, to: Path::Direct, .. }] if *connect_id == id
     ));
-    assert_eq!(h.agent.path(&h.target), Some(&Path::DirectDialed));
 }
 
 #[test]
@@ -781,16 +783,12 @@ fn circuit_replacing_the_promoted_circuit_keeps_the_attempt_alive() {
         !h.agent.is_idle(),
         "the attempt still owns the relayed path"
     );
-    assert!(
-        matches!(h.agent.path(&h.target), Some(Path::Relayed { relay }) if *relay == h.relay),
-        "the adopted circuit carries the attempt's relayed path"
-    );
 
     // A later direct connection still upgrades the attempt's path.
     replace_target(&mut h, other_circuit, ConnectionId::new(50), 500);
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
-        [NatEvent::PathUpgraded { connect_id, to: Path::DirectDialed, .. }] if *connect_id == id
+        [NatEvent::PathUpgraded { connect_id, to: Path::Direct, .. }] if *connect_id == id
     ));
 }
 

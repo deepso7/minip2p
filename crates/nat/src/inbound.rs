@@ -440,7 +440,7 @@ impl InboundCircuit {
         // An attempt that dialed this connection already recorded where it
         // came from; only an otherwise unexplained one is the punch.
         if !shared.origins.contains_key(&conn_id) {
-            shared.record_origin(conn_id, crate::Path::DirectPunched, None);
+            shared.record_origin(conn_id, crate::Path::Punched, None);
         }
         if let Some(old_conn_id) = self.promoted {
             shared.push_event(NatEvent::InboundDirectUpgrade {

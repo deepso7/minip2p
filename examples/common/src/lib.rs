@@ -250,8 +250,8 @@ fn hex_value(byte: u8) -> Result<u8, String> {
 /// Short stable name for a [`Path`] variant, used in CLI event lines.
 pub fn path_name(path: &Path) -> &'static str {
     match path {
-        Path::DirectDialed => "direct-dialed",
-        Path::DirectPunched => "direct-punched",
+        Path::Direct => "direct",
+        Path::Punched => "punched",
         Path::Relayed { .. } => "relayed",
         _ => "other",
     }

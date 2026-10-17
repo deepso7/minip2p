@@ -186,10 +186,14 @@ export interface RelayReservationInfo {
   readonly expiresUnixSecs?: number;
 }
 
-/** A usable NAT-orchestrated connection path. */
+/**
+ * How an established connection was made: `direct` (dialed or accepted),
+ * `punched` (by a DCUtR hole punch), or `relayed` through a relay. A
+ * replacement connection has its own path.
+ */
 export type Path =
-  | { readonly kind: "directDialed" }
-  | { readonly kind: "directPunched" }
+  | { readonly kind: "direct" }
+  | { readonly kind: "punched" }
   | { readonly kind: "relayed"; readonly relayPeerId: string };
 
 /**
@@ -437,15 +441,20 @@ export interface ConnectOptions extends OpOptions {
   readonly cancelOnTimeout?: boolean;
 }
 
-/** The transport connection currently selected for a peer. */
+/** A snapshot of a peer's established connection. */
 export interface ConnectionInfo {
+  /** The peer on the other end. */
+  readonly peerId: string;
   /** Endpoint-local connection identifier, as carried by connection events. */
   readonly connId: number;
-  /** Remote transport address, when known. */
-  readonly remoteAddr?: string;
+  /** Remote transport address; a circuit reports `/p2p/<relay>/p2p-circuit`. */
+  readonly remoteAddr: string;
+  /** How the connection was made. */
+  readonly path: Path;
   /**
-   * Protocols this connection advertised, once it is ready; absent until
-   * then. Readiness, `connId` and protocols come from one native snapshot.
+   * Protocols this connection advertised through Identify, once it is ready;
+   * absent until then, which is distinct from an empty list. Readiness,
+   * `connId` and protocols come from one native snapshot.
    */
   readonly readyProtocols?: readonly string[];
 }
@@ -513,14 +522,14 @@ export type Unsubscribe = () => void;
 
 /** Raw backend-only path tags. */
 export const PathKind_Tags = {
-  DirectDialed: "DirectDialed",
-  DirectPunched: "DirectPunched",
+  Direct: "Direct",
+  Punched: "Punched",
   Relayed: "Relayed",
 } as const;
 export type PathKindTag = (typeof PathKind_Tags)[keyof typeof PathKind_Tags];
 export type PathKind =
-  | { readonly tag: typeof PathKind_Tags.DirectDialed }
-  | { readonly tag: typeof PathKind_Tags.DirectPunched }
+  | { readonly tag: typeof PathKind_Tags.Direct }
+  | { readonly tag: typeof PathKind_Tags.Punched }
   | {
       readonly tag: typeof PathKind_Tags.Relayed;
       readonly inner: { readonly relayPeerId: string };

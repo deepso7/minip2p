@@ -79,7 +79,7 @@ fn direct_established_before_stagger_never_touches_the_relay() {
     let events = drain_events(&mut h.agent);
     assert!(matches!(
         events.as_slice(),
-        [NatEvent::PathEstablished { connect_id, path: Path::DirectDialed, .. }] if *connect_id == id
+        [NatEvent::PathEstablished { connect_id, path: Path::Direct, .. }] if *connect_id == id
     ));
 
     h.agent.handle_tick(at(1_000));
@@ -611,7 +611,7 @@ fn bridge_close_before_dcutr_finishes_waits_for_live_direct_dials() {
     h.target_connected(at(320));
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
-        [NatEvent::PathEstablished { connect_id, path: Path::DirectDialed, .. }]
+        [NatEvent::PathEstablished { connect_id, path: Path::Direct, .. }]
             if *connect_id == id
     ));
 }
@@ -776,7 +776,7 @@ fn inactive_leg_reports_direct_established() {
         drain_events(&mut h.agent).as_slice(),
         [NatEvent::PathEstablished {
             connect_id,
-            path: Path::DirectDialed,
+            path: Path::Direct,
             ..
         }] if *connect_id == id
     ));
