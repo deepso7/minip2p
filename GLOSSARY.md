@@ -34,6 +34,10 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Connection token**: A value both ends of one connection compute identically from its handshake (QUIC: a TLS exporter value; TCP: the Noise handshake hash), carried on the transport's `Connected` endpoint. It lets both peers make the same choice in a same-direction connection race without exchanging anything. It is not a secret and identifies nothing outside that comparison.
 
+**Connection close reason**: Why one connection ended, carried on its close event: we closed it, the peer closed it (with its code), the peer went silent (timed out), the peer stopped reading (stalled), or an error. A Connection replacement is not a close. _Avoid_: close reason (unqualified), disconnect reason
+
+**Endpoint close reason**: Why a binding's endpoint stopped: the application closed it, or its driver failed. Distinct from a Connection close reason. _Avoid_: close reason (unqualified)
+
 **Peer readiness**: A peer's current connection has completed Identify, so its protocols are known. Readiness belongs to a connection: after a Connection replacement the peer becomes ready again once the new connection is identified.
 
 ### NAT traversal
@@ -61,6 +65,10 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 **DCUtR**: The `/libp2p/dcutr` protocol that coordinates a hole punch over an existing Relayed path. It is an upgrade, not the circuit handshake. _Avoid_: using DCUtR as the Noise barrier
 
 **Relay leg**: The NAT-owned part of a Connection attempt: relay dial, HOP CONNECT, bridge promotion, DCUtR. Keyed by the attempt's Connect ID; never decides the attempt's terminal outcome.
+
+**Observed address**: The address a trusted relay or AutoNAT server reports, through Identify, as where it sees us on one connection. It belongs to that connection and ends with it, so one reporter vouches for only the family it is currently connected over. Feeds hole-punch candidates and AutoNAT probes; distinct from a confirmed public address. _Avoid_: external address (that is AutoNAT-confirmed)
+
+**Path**: How a peer's current connection was established: Direct (dialed or accepted), Punched (by DCUtR), or Relayed through a named relay. Every established connection has one. _Avoid_: route, origin
 
 **force_relay**: Keep the selected path Relayed: no direct candidate dials and no hole punch. The circuit upgrade is the same as without the flag.
 
