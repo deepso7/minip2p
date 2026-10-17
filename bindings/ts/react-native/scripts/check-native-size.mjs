@@ -29,6 +29,8 @@ function formatChange(change) {
   return `${change >= 0 ? "+" : ""}${change.toFixed(1)}%`;
 }
 
+// Report every artifact before failing, so one regression doesn't hide the rest.
+const regressions = [];
 for (const [name, relativePath] of Object.entries(artifacts)) {
   const bytes = statSync(path.join(packageRoot, relativePath)).size;
   const expected = baseline[platform][name];
@@ -50,9 +52,10 @@ for (const [name, relativePath] of Object.entries(artifacts)) {
   );
   if (change > 20) {
     const message = `${platform}/${name} grew ${change.toFixed(1)}% above its ${expected}-byte baseline`;
-    if (process.env.NATIVE_SIZE_STRICT === "1") {
-      throw new Error(message);
-    }
     console.log(`::warning title=Native size regression::${message}`);
+    regressions.push(message);
   }
+}
+if (regressions.length > 0 && process.env.NATIVE_SIZE_STRICT === "1") {
+  throw new Error(regressions.join("\n"));
 }
