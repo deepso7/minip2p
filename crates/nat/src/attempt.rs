@@ -497,7 +497,7 @@ impl ConnectAttempt {
         if is_circuit {
             if self.promoted == Some(conn_id) {
                 if let Some(relay) = self.relay_peer().cloned() {
-                    shared.record_origin(conn_id, Path::Relayed { relay }, Some(self.id));
+                    shared.record_path(conn_id, Path::Relayed { relay }, Some(self.id));
                 }
                 self.relay_deadline = None;
                 self.announce_relay_path(conn_id, shared, now);
@@ -515,7 +515,7 @@ impl ConnectAttempt {
         };
         match &self.best {
             None => {
-                shared.record_origin(conn_id, path.clone(), Some(self.id));
+                shared.record_path(conn_id, path.clone(), Some(self.id));
                 self.best = Some(path.clone());
                 self.path_conn = Some(conn_id);
                 shared.push_event(NatEvent::PathEstablished {
@@ -525,7 +525,7 @@ impl ConnectAttempt {
                 });
             }
             Some(Path::Relayed { .. }) => {
-                shared.record_origin(conn_id, path.clone(), Some(self.id));
+                shared.record_path(conn_id, path.clone(), Some(self.id));
                 let from = self.best.replace(path.clone()).expect("checked Some above");
                 if let Some(old_conn_id) = self.path_conn.replace(conn_id) {
                     shared.push_event(NatEvent::PathUpgraded {
@@ -579,12 +579,12 @@ impl ConnectAttempt {
             self.path_conn = Some(new);
         }
         // An adopted circuit carries the relayed path this attempt already
-        // reported, so it takes that origin without a new path event.
+        // reported, so it takes that path record without a new path event.
         if !new_owned
             && new.is_circuit()
             && let Some(relay) = self.relay_peer().cloned()
         {
-            shared.record_origin(new, Path::Relayed { relay }, Some(self.id));
+            shared.record_path(new, Path::Relayed { relay }, Some(self.id));
         }
         if new_owned {
             let reason = "another attempt's circuit took over the peer's connection".into();

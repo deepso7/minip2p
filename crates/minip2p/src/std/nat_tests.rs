@@ -463,6 +463,10 @@ impl NatSwarm for BridgeSwarm {
         (*peer == self.relay).then_some((self.conn, self.protocols.as_slice()))
     }
 
+    fn connection_remote_addr(&self, _conn_id: ConnectionId) -> Option<&minip2p_core::Multiaddr> {
+        None
+    }
+
     fn dial(
         &mut self,
         addr: &minip2p_core::PeerAddr,

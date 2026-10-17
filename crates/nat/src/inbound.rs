@@ -408,7 +408,7 @@ impl InboundCircuit {
         if is_circuit {
             if self.promoted == Some(conn_id) {
                 self.handshake_deadline = None;
-                shared.record_origin(
+                shared.record_path(
                     conn_id,
                     crate::Path::Relayed {
                         relay: self.relay.clone(),
@@ -439,8 +439,8 @@ impl InboundCircuit {
         self.round_until = None;
         // An attempt that dialed this connection already recorded where it
         // came from; only an otherwise unexplained one is the punch.
-        if !shared.origins.contains_key(&conn_id) {
-            shared.record_origin(conn_id, crate::Path::Punched, None);
+        if !shared.paths.contains_key(&conn_id) {
+            shared.record_path(conn_id, crate::Path::Punched, None);
         }
         if let Some(old_conn_id) = self.promoted {
             shared.push_event(NatEvent::InboundDirectUpgrade {

@@ -707,7 +707,7 @@ fn direct_replacement_of_the_provisional_circuit_upgrades_once() {
     ));
     assert!(
         !h.agent.is_punched(ConnectionId::new(50)),
-        "the replacement keeps no origin of the circuit's"
+        "the replacement keeps no path record of the circuit's"
     );
 
     // A late close of the replaced circuit reports nothing more.
@@ -724,7 +724,7 @@ fn direct_replacement_of_the_provisional_circuit_upgrades_once() {
 }
 
 #[test]
-fn direct_replacement_after_the_attempt_ended_reports_against_its_origin() {
+fn direct_replacement_after_the_attempt_ended_reports_against_its_path_record() {
     let mut h = Harness::with_relay(NatConfig {
         force_relay: true,
         ..NatConfig::default()

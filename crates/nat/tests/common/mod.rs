@@ -221,6 +221,7 @@ pub fn identify_observed(node: &mut Node, reporter: &PeerId, addr: &Multiaddr, n
 }
 
 /// Feeds `reporter`'s Identify observation `addr` on exactly `conn_id`.
+/// A connection the test gave no remote address runs over `addr`'s family.
 pub fn identify_observed_on(
     node: &mut Node,
     reporter: &PeerId,
@@ -228,6 +229,10 @@ pub fn identify_observed_on(
     addr: &Multiaddr,
     now: Now,
 ) {
+    node.swarm
+        .remote_addrs
+        .entry(conn_id)
+        .or_insert_with(|| addr.clone());
     node.handle_event(
         &SwarmEvent::IdentifyReceived {
             peer_id: reporter.clone(),
@@ -647,6 +652,8 @@ impl From<NatAction> for Out {
 #[derive(Default)]
 pub struct FakeSwarm {
     connections: BTreeMap<PeerId, ConnectionId>,
+    /// Each connection's remote address, when a test gave it one.
+    pub remote_addrs: BTreeMap<ConnectionId, Multiaddr>,
     ready: BTreeMap<PeerId, (ConnectionId, Vec<String>)>,
     calls: Vec<Out>,
     next_conn: u64,
@@ -748,6 +755,10 @@ impl NatSwarm for FakeSwarm {
         self.ready
             .get(peer)
             .map(|(conn, protocols)| (*conn, protocols.as_slice()))
+    }
+
+    fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        self.remote_addrs.get(&conn_id)
     }
 
     fn dial(&mut self, addr: &PeerAddr, token: NatToken) -> Result<DialStart, NatSwarmError> {

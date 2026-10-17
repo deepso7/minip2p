@@ -952,6 +952,43 @@ fn a_replaced_reporter_connection_drops_exactly_its_observation() {
 }
 
 #[test]
+fn a_reporter_vouches_only_for_the_family_it_is_connected_over() {
+    let relay_v6 = "/ip6/2001:db8::77/udp/45679/quic-v1";
+    let autonat_v6 = "/ip6/2001:db8::78/udp/45680/quic-v1";
+    let (mut h, autonat) = with_connected_autonat_server();
+    let relay = h.relay.clone();
+    // The relay is reached over IPv4: its IPv6 claim is ignored and does not
+    // evict its IPv4 one.
+    identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
+    identify_observed(&mut h.agent, &relay, &maddr(relay_v6), at(1));
+    // A reporter reached over IPv6 supplies that family.
+    h.agent.swarm.remote_addrs.insert(
+        ConnectionId::new(2),
+        maddr("/ip6/2001:db8::60/udp/4009/quic-v1"),
+    );
+    identify_observed(&mut h.agent, &autonat, &maddr(autonat_v6), at(2));
+
+    let obs = advertised_dcutr_addrs(&mut h, 10);
+    assert!(obs.contains(&maddr(OUR_OBSERVED_ADDR)), "{obs:?}");
+    assert!(obs.contains(&maddr(autonat_v6)), "{obs:?}");
+    assert!(!obs.contains(&maddr(relay_v6)), "{obs:?}");
+}
+
+#[test]
+fn a_relayed_reporter_vouches_for_no_family() {
+    let (mut h, autonat) = with_connected_autonat_server();
+    let circuit = format!("/p2p/{}/p2p-circuit", h.relay);
+    h.agent
+        .swarm
+        .remote_addrs
+        .insert(ConnectionId::new(2), maddr(&circuit));
+    identify_observed(&mut h.agent, &autonat, &maddr(OUR_OBSERVED_ADDR), at(0));
+
+    let obs = advertised_dcutr_addrs(&mut h, 10);
+    assert_eq!(obs, vec![maddr(LISTEN_ADDR)]);
+}
+
+#[test]
 fn an_observation_from_a_stale_connection_is_ignored() {
     let late = "/ip4/203.0.113.88/udp/2222/quic-v1";
     let (mut h, autonat) = with_connected_autonat_server();

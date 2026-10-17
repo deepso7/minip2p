@@ -8,7 +8,7 @@
 
 use alloc::string::String;
 
-use minip2p_core::{Bytes, PeerAddr, PeerId, Protocol};
+use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_swarm::{DriverError, EntropySource, HeldWrites, SwarmCore};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
@@ -63,6 +63,13 @@ pub trait NatSwarm {
     /// that connection is ready. One coherent read: both describe the same
     /// connection.
     fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[String])>;
+
+    /// The remote address of the connection `conn_id`, while the swarm
+    /// holds it: `/ip4` or `/ip6` for a direct connection,
+    /// `/p2p/<relay>/p2p-circuit` for a relayed one. The agent believes an
+    /// Identify observation only in the IP family of the connection that
+    /// carried it.
+    fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr>;
 
     /// Starts a dial. `token` is already registered by the agent, so a host
     /// that parks the dial can return [`DialStart::Deferred`] and report the
@@ -174,6 +181,10 @@ impl<T: Transport, E: EntropySource> NatSwarm for SwarmCore<T, E> {
     fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[String])> {
         self.peer_readiness(peer)
             .map(|(conn_id, info)| (conn_id, info.protocols.as_slice()))
+    }
+
+    fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        SwarmCore::connection_remote_addr(self, conn_id)
     }
 
     fn dial(&mut self, addr: &PeerAddr, _token: NatToken) -> Result<DialStart, NatSwarmError> {
@@ -313,6 +324,10 @@ impl NatSwarm for HoldingSwarm<'_> {
 
     fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[String])> {
         self.inner.readiness(peer)
+    }
+
+    fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        self.inner.connection_remote_addr(conn_id)
     }
 
     fn dial(&mut self, addr: &PeerAddr, token: NatToken) -> Result<DialStart, NatSwarmError> {

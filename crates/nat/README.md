@@ -96,7 +96,7 @@ loop {
 
 ### Reading the swarm
 
-The agent keeps no copy of connections or readiness; it reads both from the `NatSwarm` each call. That state may be ahead of the event being handled (a host hands over a batch the swarm already applied), so the agent follows two rules: what it owns (dials, streams, reservations, path origins) is keyed by the exact connection id an event carries, and live swarm state only decides whether new work may start. Cleanup for a closed or replaced connection ends only the work bound to that connection, never work already started on its replacement. Readiness-triggered work starts only when the `PeerReady` connection is still the peer's ready one.
+The agent keeps no copy of connections or readiness; it reads both from the `NatSwarm` each call. That state may be ahead of the event being handled (a host hands over a batch the swarm already applied), so the agent follows two rules: what it owns (dials, streams, reservations, path records) is keyed by the exact connection id an event carries, and live swarm state only decides whether new work may start. Cleanup for a closed or replaced connection ends only the work bound to that connection, never work already started on its replacement. Readiness-triggered work starts only when the `PeerReady` connection is still the peer's ready one.
 
 A write the swarm refuses as Full (ADR 0012) is not lost: the agent holds its unsent tail, queues later writes and the write-side close on that stream behind it, and resends them when the stream's `StreamWritable` reaches `handle_event` (which then returns `true`). A resend the transport fails outright resets the stream rather than sending the held close, and so does a stream holding more than 64 KiB. Tails still held when a bridge is promoted ride in `PromoteBridge::unsent_data`; the circuit sends them before its own bytes.
 
@@ -150,11 +150,13 @@ A NAT'd listener holding a reservation handles inbound circuits automatically: t
 
 Punch candidates are bounded both ways: a peer's CONNECT is filtered to globally routable QUIC addresses, and that list and our own advertised one keep at most `MAX_PUNCH_CANDIDATES` (8) addresses, at most 4 per IP family and 2 per IP, skipping port 0 and privileged ports (below 1024).
 
+Our own candidates and AutoNAT probe addresses include where trusted peers (configured relays and AutoNAT servers) observe us through Identify. An observation counts only in the IP family of the connection that carried it (`NatSwarm::connection_remote_addr`), since that is the one family its reporter sees us in; other reporters supply the other family, and one reached over a circuit vouches for none.
+
 ## Connection replacement and paths
 
 The swarm keeps one connection per peer. When a newer connection takes the slot (`SwarmEvent::ConnectionReplaced { peer_id, old, new }`), the agent applies `new` before retiring `old`, so the peer never counts as disconnected and no relay leg or inbound flow fails just because `old` went away. Everything bound to `old` ends: its streams, its observed address, and the peer's readiness (`PeerReady` for `new` restarts what waits on it). A connection-level disconnect (`ConnectionClosed`) is acted on immediately.
 
-Each connection a NAT machine announced records its path origin (`Path::Direct`, `Path::Punched`, or `Path::Relayed { relay }`) and the Connect ID of the attempt that created it. The Endpoint owns every connection's `Path` and derives Direct and Relayed from the transport; the one fact it takes from NAT is a hole punch, through `NatAgent::is_punched(conn_id)`. A replacement does not carry `old`'s origin over to `new`. Leaving a relay for a direct connection is reported exactly once, as `PathUpgraded` against the attempt that created the relayed path, or as `InboundDirectUpgrade` when it came from an inbound circuit. Other changes, such as relay A to relay B, report nothing.
+Each connection a NAT machine announced records its path (`Path::Direct`, `Path::Punched`, or `Path::Relayed { relay }`) and the Connect ID of the attempt that created it. The Endpoint owns every connection's `Path` and derives Direct and Relayed from the transport; the one fact it takes from NAT is a hole punch, through `NatAgent::is_punched(conn_id)`. A replacement does not carry `old`'s path record over to `new`. Leaving a relay for a direct connection is reported exactly once, as `PathUpgraded` against the attempt that created the relayed path, or as `InboundDirectUpgrade` when it came from an inbound circuit. Other changes, such as relay A to relay B, report nothing.
 
 ## Status
 

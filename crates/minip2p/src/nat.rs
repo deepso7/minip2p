@@ -935,6 +935,10 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
         NatSwarm::readiness(&*self.swarm, peer)
     }
 
+    fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        self.swarm.connection_remote_addr(conn_id)
+    }
+
     /// Parks a dial to a named host for the composition's resolver, so the
     /// agent's token is already registered when the answer comes back.
     fn dial(&mut self, addr: &PeerAddr, token: NatToken) -> Result<DialStart, NatSwarmError> {

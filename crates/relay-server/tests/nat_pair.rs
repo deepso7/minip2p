@@ -78,6 +78,10 @@ impl NatSwarm for ClientSwarm {
         Some((CLIENT_RELAY_CONN, protocols))
     }
 
+    fn connection_remote_addr(&self, _conn_id: ConnectionId) -> Option<&minip2p_core::Multiaddr> {
+        None
+    }
+
     fn dial(&mut self, _addr: &PeerAddr, _token: NatToken) -> Result<DialStart, NatSwarmError> {
         Ok(DialStart::Started(CLIENT_RELAY_CONN))
     }
