@@ -72,6 +72,7 @@ Peer _verification_ is not policy and is not optional: set `expected_peer` and N
 - `SessionError::NotEstablished` means a substream operation ran before the upgrade completed. The session is untouched and still mid-upgrade; from `go_away` it means there is nothing to shut down, so just drop the underlying stream.
 - `SessionError::UnknownStream` means the id does not name a substream of this session. Ids are rejected rather than truncated, so a fabricated one can never alias onto somebody else's substream. The session stays usable.
 - `SessionError::Yamux` is passed through so callers can distinguish a full send buffer (retry later) from a fatal failure.
+- `SessionError::close_reason` maps a session-ending error to the connection's `ConnectionCloseReason`: a GoAway is `Remote { code }`, a keepalive timeout (`YamuxError::KeepaliveTimeout`) is `TimedOut`, anything else is `Error`.
 
 ## Noise
 

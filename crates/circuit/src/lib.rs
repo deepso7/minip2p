@@ -220,15 +220,7 @@ impl Teardown {
 
 impl From<SessionError> for Teardown {
     fn from(error: SessionError) -> Self {
-        match error {
-            SessionError::GoAway { code } => Self(ConnectionCloseReason::Remote {
-                code: u64::from(code),
-            }),
-            SessionError::Yamux(YamuxError::KeepaliveTimeout) => {
-                Self(ConnectionCloseReason::TimedOut)
-            }
-            error => Self::fault(error.to_string()),
-        }
+        Self(error.close_reason())
     }
 }
 
