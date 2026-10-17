@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 
-use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
 use minip2p_nat::{Deadline, NatConfig, NatError, NatEvent, Path, RelayStage};
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
@@ -891,8 +891,9 @@ fn observed_addrs_from_untrusted_peers_are_ignored() {
     );
 }
 
-#[test]
-fn autonat_server_is_a_trusted_reporter() {
+/// A relay harness that also trusts one AutoNAT server, connected over
+/// connection 2 (the relay takes connection 1).
+fn with_connected_autonat_server() -> (Harness, PeerId) {
     let autonat = peer(b"autonat-server");
     let autonat_addr = PeerAddr::new(maddr("/ip4/203.0.113.60/udp/4009/quic-v1"), autonat.clone())
         .expect("valid autonat addr");
@@ -900,6 +901,20 @@ fn autonat_server_is_a_trusted_reporter() {
         autonat_servers: vec![autonat_addr],
         ..NatConfig::default()
     });
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: autonat.clone(),
+            conn_id: ConnectionId::new(2),
+        },
+        false,
+        at(0),
+    );
+    (h, autonat)
+}
+
+#[test]
+fn autonat_server_is_a_trusted_reporter() {
+    let (mut h, autonat) = with_connected_autonat_server();
     identify_observed(&mut h.agent, &autonat, &maddr(OUR_OBSERVED_ADDR), at(0));
 
     let obs = advertised_dcutr_addrs(&mut h, 10);
@@ -910,22 +925,54 @@ fn autonat_server_is_a_trusted_reporter() {
 }
 
 #[test]
-fn tcp_observation_does_not_replace_a_trusted_quic_punch_candidate() {
-    let mut h = Harness::with_relay(NatConfig::default());
+fn a_replaced_reporter_connection_drops_exactly_its_observation() {
+    let departed = "/ip4/203.0.113.88/udp/2222/quic-v1";
+    let (mut h, autonat) = with_connected_autonat_server();
     let relay = h.relay.clone();
     identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
-    identify_observed(
-        &mut h.agent,
-        &relay,
-        &maddr("/ip4/198.51.100.50/tcp/4001"),
+    identify_observed(&mut h.agent, &autonat, &maddr(departed), at(0));
+
+    // The server's next connection has not re-identified yet.
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: autonat,
+            old: ConnectionId::new(2),
+            new: ConnectionId::new(3),
+        },
+        false,
         at(1),
     );
 
     let obs = advertised_dcutr_addrs(&mut h, 10);
-    assert!(
-        obs.contains(&maddr(OUR_OBSERVED_ADDR)),
-        "a later TCP Identify observation must not evict the relay's QUIC mapping"
+    assert!(obs.contains(&maddr(OUR_OBSERVED_ADDR)), "{obs:?}");
+    assert!(!obs.contains(&maddr(departed)), "{obs:?}");
+}
+
+#[test]
+fn an_observation_from_a_stale_connection_is_ignored() {
+    let late = "/ip4/203.0.113.88/udp/2222/quic-v1";
+    let (mut h, autonat) = with_connected_autonat_server();
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: autonat.clone(),
+            old: ConnectionId::new(2),
+            new: ConnectionId::new(3),
+        },
+        false,
+        at(1),
     );
+    // Connection 2's Identify arrives after the swarm already replaced it:
+    // nothing would ever remove an entry for it.
+    identify_observed_on(
+        &mut h.agent,
+        &autonat,
+        ConnectionId::new(2),
+        &maddr(late),
+        at(2),
+    );
+
+    let obs = advertised_dcutr_addrs(&mut h, 10);
+    assert_eq!(obs, vec![maddr(LISTEN_ADDR)]);
 }
 
 #[test]

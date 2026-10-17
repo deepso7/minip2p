@@ -199,12 +199,39 @@ fn autonat_answer(request_bytes: &[u8], respond: impl FnOnce(&mut AutoNatServer)
 }
 
 /// Feeds an `IdentifyReceived` event whose `observed_addr` is `addr`'s
-/// binary encoding, as if `reporter` told us where it sees us from.
+/// binary encoding, as if `reporter` told us where it sees us from over its
+/// current connection, establishing connection 1 first when it has none.
 pub fn identify_observed(node: &mut Node, reporter: &PeerId, addr: &Multiaddr, now: Now) {
+    let conn_id = match node.swarm.connection(reporter) {
+        Some(conn_id) => conn_id,
+        None => {
+            let conn_id = ConnectionId::new(1);
+            node.handle_event(
+                &SwarmEvent::ConnectionEstablished {
+                    peer_id: reporter.clone(),
+                    conn_id,
+                },
+                false,
+                now,
+            );
+            conn_id
+        }
+    };
+    identify_observed_on(node, reporter, conn_id, addr, now);
+}
+
+/// Feeds `reporter`'s Identify observation `addr` on exactly `conn_id`.
+pub fn identify_observed_on(
+    node: &mut Node,
+    reporter: &PeerId,
+    conn_id: ConnectionId,
+    addr: &Multiaddr,
+    now: Now,
+) {
     node.handle_event(
         &SwarmEvent::IdentifyReceived {
             peer_id: reporter.clone(),
-            conn_id: ConnectionId::new(1),
+            conn_id,
             info: IdentifyMessage {
                 observed_addr: Some(addr.to_bytes()),
                 ..IdentifyMessage::default()
