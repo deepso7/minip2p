@@ -79,9 +79,21 @@ const native = vi.hoisted(() => {
       return this.#batches.shift() ?? [];
     }
 
-    close(): void {
-      this.#doorbell = undefined;
-      this.#batches.length = 0;
+    /** `close` timeouts, in call order. */
+    readonly closeTimeouts: number[] = [];
+    /** What the `EndpointClosed` a started endpoint's `close` queues reports. */
+    closeReport: {
+      outcome: string;
+      unfinished: { connId: bigint; peerId?: string }[];
+    } = { outcome: "Drained", unfinished: [] };
+
+    /** Queues `closeReport` as the driver's last event, as native does. */
+    close(timeoutMs: number): void {
+      this.closeTimeouts.push(timeoutMs);
+      if (this.#doorbell !== undefined && this.closeTimeouts.length === 1) {
+        this.enqueue([{ inner: this.closeReport, tag: "EndpointClosed" }]);
+        this.ring();
+      }
     }
 
     discoveryNowMs(): bigint | null {
@@ -744,6 +756,7 @@ describeAdapterContract("Node", {
     return {
       abandoned: fake.abandonedStreams,
       cancelledConnects: fake.cancelledConnects,
+      closeTimeouts: fake.closeTimeouts,
       config: fake.config,
       connectTargets: fake.connectTargets.map((target) =>
         typeof target === "string"
@@ -766,6 +779,9 @@ describeAdapterContract("Node", {
           []
         );
         fake.ring();
+      },
+      setCloseUnfinished: (unfinished) => {
+        fake.closeReport.unfinished = [...unfinished];
       },
       setConnectionInfo: (info) => {
         fake.connection = info;

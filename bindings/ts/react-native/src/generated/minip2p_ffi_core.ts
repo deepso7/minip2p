@@ -663,6 +663,103 @@ const FfiConverterTypeRelayReservationInfo = (() => {
 })();
 
 /**
+ * A connection still tracked when the closing drain ended.
+ */
+export type UnfinishedConnection = {
+    /**
+     * Endpoint-local transport connection id.
+     */
+    connId: bigint,
+    /**
+     * Remote peer; `None` for an inbound handshake that had not identified
+     * one yet.
+     */
+    peerId?: string
+}
+
+/**
+ * Generated factory for {@link UnfinishedConnection} record objects.
+ */
+export const UnfinishedConnection = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<UnfinishedConnection, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<UnfinishedConnection>,
+    });
+})();
+
+const FfiConverterTypeUnfinishedConnection = (() => {
+    type TypeName = UnfinishedConnection;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            return {
+                connId: FfiConverterUInt64.readFromCursor(c),
+                peerId: FfiConverterOptionalString.readFromCursor(c)
+            };
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            FfiConverterUInt64.writeIntoCursor(value.connId, c);
+            FfiConverterOptionalString.writeIntoCursor(value.peerId, c);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterUInt64.allocationSize(value.connId) +
+             FfiConverterOptionalString.allocationSize(value.peerId);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * How the driver's closing drain ended; see [`P2pEvent::EndpointClosed`].
+ */
+export enum CloseOutcome {
+    /**
+     * Every tracked connection finished its teardown in time.
+     */
+    Drained,
+    /**
+     * The stop deadline passed with connections still tracked.
+     */
+    DeadlineExpired,
+    /**
+     * Driving the transports failed and ended the drain early, or the
+     * driver panicked and dropped the endpoint without a drain.
+     */
+    Failed
+}
+
+const FfiConverterTypeCloseOutcome = (() => {
+    type TypeName = CloseOutcome;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            switch (c.readI32()) {
+                case 1: return CloseOutcome.Drained;
+                case 2: return CloseOutcome.DeadlineExpired;
+                case 3: return CloseOutcome.Failed;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            switch (value) {
+                case CloseOutcome.Drained: return c.writeI32(1);
+                case CloseOutcome.DeadlineExpired: return c.writeI32(2);
+                case CloseOutcome.Failed: return c.writeI32(3);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return 4;
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
  * The part of an endpoint's configuration an [`FfiError::InvalidConfig`]
  * names.
  *
@@ -2109,6 +2206,7 @@ const FfiConverterTypePathKind = (() => {
 export enum P2pEvent_Tags {
     EventsDropped = "EventsDropped",
     DriverFailed = "DriverFailed",
+    EndpointClosed = "EndpointClosed",
     ConnectionEstablished = "ConnectionEstablished",
     ConnectionClosed = "ConnectionClosed",
     ConnectionReplaced = "ConnectionReplaced",
@@ -2216,6 +2314,42 @@ inner: {kind: DriverFailureKind; detail: string }): DriverFailed_ {
 
         static instanceOf(obj: any): obj is DriverFailed_ {
             return obj.tag === P2pEvent_Tags.DriverFailed;
+        }
+
+    }
+
+    type EndpointClosed__interface = {
+        tag: P2pEvent_Tags.EndpointClosed;
+        inner:
+Readonly<{outcome: CloseOutcome; unfinished: Array<UnfinishedConnection>}>
+    };
+    /**
+     * The driver finished shutting down: its last event, after
+     * [`P2pEndpoint::stop`](crate::P2pEndpoint::stop) or a
+     * [`P2pEvent::DriverFailed`], when a failed driver tears down at once.
+     */
+    class EndpointClosed_ extends UniffiEnum implements EndpointClosed__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "P2pEvent";
+        readonly tag = P2pEvent_Tags.EndpointClosed;
+        readonly inner:
+Readonly<{outcome: CloseOutcome; unfinished: Array<UnfinishedConnection>}>;
+        constructor(
+inner: {outcome: CloseOutcome; unfinished: Array<UnfinishedConnection> }) {
+            super("P2pEvent", "EndpointClosed");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {outcome: CloseOutcome; unfinished: Array<UnfinishedConnection> }): EndpointClosed_ {
+            return new EndpointClosed_(inner);
+        }
+
+        static instanceOf(obj: any): obj is EndpointClosed_ {
+            return obj.tag === P2pEvent_Tags.EndpointClosed;
         }
 
     }
@@ -3495,6 +3629,7 @@ inner: {peerId?: string; source: DiscoverySource; reason: string; suppressed: nu
         instanceOf,
   EventsDropped: EventsDropped_,
   DriverFailed: DriverFailed_,
+  EndpointClosed: EndpointClosed_,
   ConnectionEstablished: ConnectionEstablished_,
   ConnectionClosed: ConnectionClosed_,
   ConnectionReplaced: ConnectionReplaced_,
@@ -3539,7 +3674,7 @@ inner: {peerId?: string; source: DiscoverySource; reason: string; suppressed: nu
  * Event delivered by the native endpoint driver.
  */
 export type P2pEvent = InstanceType<
-    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingTimeout' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation']
+    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'EndpointClosed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingTimeout' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation']
 >;
 
 // FfiConverter for enum P2pEvent
@@ -3550,43 +3685,44 @@ const FfiConverterTypeP2pEvent = (() => {
             switch (c.readI32()) {
                 case 1: return new P2pEvent.EventsDropped({dropped: FfiConverterUInt64.readFromCursor(c), totalDropped: FfiConverterUInt64.readFromCursor(c), terminalConnectIds: FfiConverterSequenceUInt64.readFromCursor(c) });
                 case 2: return new P2pEvent.DriverFailed({kind: FfiConverterTypeDriverFailureKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
-                case 3: return new P2pEvent.ConnectionEstablished({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
-                case 4: return new P2pEvent.ConnectionClosed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
-                case 5: return new P2pEvent.ConnectionReplaced({peerId: FfiConverterString.readFromCursor(c), oldConnId: FfiConverterUInt64.readFromCursor(c), newConnId: FfiConverterUInt64.readFromCursor(c) });
-                case 6: return new P2pEvent.PeerReady({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), protocols: FfiConverterSequenceString.readFromCursor(c) });
-                case 7: return new P2pEvent.IdentifyReceived({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), info: FfiConverterTypeIdentifyInfo.readFromCursor(c) });
-                case 8: return new P2pEvent.PingRttMeasured({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), rttMs: FfiConverterUInt64.readFromCursor(c) });
-                case 9: return new P2pEvent.PingTimeout({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
-                case 10: return new P2pEvent.StreamReady({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c), protocolId: FfiConverterString.readFromCursor(c), initiatedLocally: FfiConverterBool.readFromCursor(c) });
-                case 11: return new P2pEvent.StreamData({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c), data: FfiConverterArrayBuffer.readFromCursor(c) });
-                case 12: return new P2pEvent.StreamWriteAccepted({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c) });
-                case 13: return new P2pEvent.StreamWriteStopped({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c), errorCode: FfiConverterUInt64.readFromCursor(c) });
-                case 14: return new P2pEvent.StreamRemoteWriteClosed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c) });
-                case 15: return new P2pEvent.StreamClosed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c) });
-                case 16: return new P2pEvent.EndpointError({kind: FfiConverterTypeEndpointErrorKind.readFromCursor(c), peerId: FfiConverterOptionalString.readFromCursor(c), connId: FfiConverterOptionalUInt64.readFromCursor(c), streamId: FfiConverterOptionalUInt64.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
-                case 17: return new P2pEvent.ReachabilityChanged({previous: FfiConverterTypeReachability.readFromCursor(c), current: FfiConverterTypeReachability.readFromCursor(c), confirmedAddrs: FfiConverterSequenceString.readFromCursor(c) });
-                case 18: return new P2pEvent.PublicAddressesChanged({addrs: FfiConverterSequenceString.readFromCursor(c) });
-                case 19: return new P2pEvent.RelayReserved({relayPeerId: FfiConverterString.readFromCursor(c), expiresUnixSecs: FfiConverterOptionalUInt64.readFromCursor(c) });
-                case 20: return new P2pEvent.RelayReservationLost({relayPeerId: FfiConverterString.readFromCursor(c) });
-                case 21: return new P2pEvent.PathEstablished({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), path: FfiConverterTypePathKind.readFromCursor(c) });
-                case 22: return new P2pEvent.InboundPathEstablished({peerId: FfiConverterString.readFromCursor(c), path: FfiConverterTypePathKind.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
-                case 23: return new P2pEvent.PathUpgraded({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), from: FfiConverterTypePathKind.readFromCursor(c), to: FfiConverterTypePathKind.readFromCursor(c), oldConnId: FfiConverterUInt64.readFromCursor(c), newConnId: FfiConverterUInt64.readFromCursor(c) });
-                case 24: return new P2pEvent.HolePunchFailed({connectId: FfiConverterUInt64.readFromCursor(c), attempt: FfiConverterUInt32.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 25: return new P2pEvent.ConnectFailed({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), kind: FfiConverterTypeNatErrorKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
-                case 26: return new P2pEvent.ConnectCancelled({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c) });
-                case 27: return new P2pEvent.InboundDirectUpgrade({peerId: FfiConverterString.readFromCursor(c), oldConnId: FfiConverterUInt64.readFromCursor(c), newConnId: FfiConverterUInt64.readFromCursor(c) });
-                case 28: return new P2pEvent.Message({fromPeerId: FfiConverterString.readFromCursor(c), topics: FfiConverterSequenceString.readFromCursor(c), data: FfiConverterArrayBuffer.readFromCursor(c), seqno: FfiConverterArrayBuffer.readFromCursor(c), signed: FfiConverterBool.readFromCursor(c) });
-                case 29: return new P2pEvent.PeerSubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
-                case 30: return new P2pEvent.PeerUnsubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
-                case 31: return new P2pEvent.GossipsubOutboundFailure({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 32: return new P2pEvent.GossipsubProtocolViolation({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 33: return new P2pEvent.PeerDiscovered({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
-                case 34: return new P2pEvent.PeerUpdated({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
-                case 35: return new P2pEvent.PeerExpired({peerId: FfiConverterString.readFromCursor(c) });
-                case 36: return new P2pEvent.DiscoveryDialFailed({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 37: return new P2pEvent.MdnsFailed({kind: FfiConverterTypeMdnsFailureKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
-                case 38: return new P2pEvent.MdnsRecovered();
-                case 39: return new P2pEvent.DiscoveryProtocolViolation({peerId: FfiConverterOptionalString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c), reason: FfiConverterString.readFromCursor(c), suppressed: FfiConverterUInt32.readFromCursor(c) });
+                case 3: return new P2pEvent.EndpointClosed({outcome: FfiConverterTypeCloseOutcome.readFromCursor(c), unfinished: FfiConverterSequenceTypeUnfinishedConnection.readFromCursor(c) });
+                case 4: return new P2pEvent.ConnectionEstablished({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
+                case 5: return new P2pEvent.ConnectionClosed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
+                case 6: return new P2pEvent.ConnectionReplaced({peerId: FfiConverterString.readFromCursor(c), oldConnId: FfiConverterUInt64.readFromCursor(c), newConnId: FfiConverterUInt64.readFromCursor(c) });
+                case 7: return new P2pEvent.PeerReady({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), protocols: FfiConverterSequenceString.readFromCursor(c) });
+                case 8: return new P2pEvent.IdentifyReceived({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), info: FfiConverterTypeIdentifyInfo.readFromCursor(c) });
+                case 9: return new P2pEvent.PingRttMeasured({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), rttMs: FfiConverterUInt64.readFromCursor(c) });
+                case 10: return new P2pEvent.PingTimeout({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
+                case 11: return new P2pEvent.StreamReady({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c), protocolId: FfiConverterString.readFromCursor(c), initiatedLocally: FfiConverterBool.readFromCursor(c) });
+                case 12: return new P2pEvent.StreamData({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c), data: FfiConverterArrayBuffer.readFromCursor(c) });
+                case 13: return new P2pEvent.StreamWriteAccepted({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c) });
+                case 14: return new P2pEvent.StreamWriteStopped({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c), errorCode: FfiConverterUInt64.readFromCursor(c) });
+                case 15: return new P2pEvent.StreamRemoteWriteClosed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c) });
+                case 16: return new P2pEvent.StreamClosed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c) });
+                case 17: return new P2pEvent.EndpointError({kind: FfiConverterTypeEndpointErrorKind.readFromCursor(c), peerId: FfiConverterOptionalString.readFromCursor(c), connId: FfiConverterOptionalUInt64.readFromCursor(c), streamId: FfiConverterOptionalUInt64.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
+                case 18: return new P2pEvent.ReachabilityChanged({previous: FfiConverterTypeReachability.readFromCursor(c), current: FfiConverterTypeReachability.readFromCursor(c), confirmedAddrs: FfiConverterSequenceString.readFromCursor(c) });
+                case 19: return new P2pEvent.PublicAddressesChanged({addrs: FfiConverterSequenceString.readFromCursor(c) });
+                case 20: return new P2pEvent.RelayReserved({relayPeerId: FfiConverterString.readFromCursor(c), expiresUnixSecs: FfiConverterOptionalUInt64.readFromCursor(c) });
+                case 21: return new P2pEvent.RelayReservationLost({relayPeerId: FfiConverterString.readFromCursor(c) });
+                case 22: return new P2pEvent.PathEstablished({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), path: FfiConverterTypePathKind.readFromCursor(c) });
+                case 23: return new P2pEvent.InboundPathEstablished({peerId: FfiConverterString.readFromCursor(c), path: FfiConverterTypePathKind.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
+                case 24: return new P2pEvent.PathUpgraded({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), from: FfiConverterTypePathKind.readFromCursor(c), to: FfiConverterTypePathKind.readFromCursor(c), oldConnId: FfiConverterUInt64.readFromCursor(c), newConnId: FfiConverterUInt64.readFromCursor(c) });
+                case 25: return new P2pEvent.HolePunchFailed({connectId: FfiConverterUInt64.readFromCursor(c), attempt: FfiConverterUInt32.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
+                case 26: return new P2pEvent.ConnectFailed({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), kind: FfiConverterTypeNatErrorKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
+                case 27: return new P2pEvent.ConnectCancelled({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c) });
+                case 28: return new P2pEvent.InboundDirectUpgrade({peerId: FfiConverterString.readFromCursor(c), oldConnId: FfiConverterUInt64.readFromCursor(c), newConnId: FfiConverterUInt64.readFromCursor(c) });
+                case 29: return new P2pEvent.Message({fromPeerId: FfiConverterString.readFromCursor(c), topics: FfiConverterSequenceString.readFromCursor(c), data: FfiConverterArrayBuffer.readFromCursor(c), seqno: FfiConverterArrayBuffer.readFromCursor(c), signed: FfiConverterBool.readFromCursor(c) });
+                case 30: return new P2pEvent.PeerSubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
+                case 31: return new P2pEvent.PeerUnsubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
+                case 32: return new P2pEvent.GossipsubOutboundFailure({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
+                case 33: return new P2pEvent.GossipsubProtocolViolation({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
+                case 34: return new P2pEvent.PeerDiscovered({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
+                case 35: return new P2pEvent.PeerUpdated({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
+                case 36: return new P2pEvent.PeerExpired({peerId: FfiConverterString.readFromCursor(c) });
+                case 37: return new P2pEvent.DiscoveryDialFailed({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
+                case 38: return new P2pEvent.MdnsFailed({kind: FfiConverterTypeMdnsFailureKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
+                case 39: return new P2pEvent.MdnsRecovered();
+                case 40: return new P2pEvent.DiscoveryProtocolViolation({peerId: FfiConverterOptionalString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c), reason: FfiConverterString.readFromCursor(c), suppressed: FfiConverterUInt32.readFromCursor(c) });
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -3607,22 +3743,29 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterString.writeIntoCursor(inner.detail, c);
                     return;
                 }
-                case P2pEvent_Tags.ConnectionEstablished: {
+                case P2pEvent_Tags.EndpointClosed: {
                     c.writeI32(3);
                     const inner = value.inner;
-                    FfiConverterString.writeIntoCursor(inner.peerId, c);
-                    FfiConverterUInt64.writeIntoCursor(inner.connId, c);
+                    FfiConverterTypeCloseOutcome.writeIntoCursor(inner.outcome, c);
+                    FfiConverterSequenceTypeUnfinishedConnection.writeIntoCursor(inner.unfinished, c);
                     return;
                 }
-                case P2pEvent_Tags.ConnectionClosed: {
+                case P2pEvent_Tags.ConnectionEstablished: {
                     c.writeI32(4);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
                     return;
                 }
-                case P2pEvent_Tags.ConnectionReplaced: {
+                case P2pEvent_Tags.ConnectionClosed: {
                     c.writeI32(5);
+                    const inner = value.inner;
+                    FfiConverterString.writeIntoCursor(inner.peerId, c);
+                    FfiConverterUInt64.writeIntoCursor(inner.connId, c);
+                    return;
+                }
+                case P2pEvent_Tags.ConnectionReplaced: {
+                    c.writeI32(6);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.oldConnId, c);
@@ -3630,7 +3773,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.PeerReady: {
-                    c.writeI32(6);
+                    c.writeI32(7);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
@@ -3638,7 +3781,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.IdentifyReceived: {
-                    c.writeI32(7);
+                    c.writeI32(8);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
@@ -3646,7 +3789,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.PingRttMeasured: {
-                    c.writeI32(8);
+                    c.writeI32(9);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
@@ -3654,14 +3797,14 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.PingTimeout: {
-                    c.writeI32(9);
+                    c.writeI32(10);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
                     return;
                 }
                 case P2pEvent_Tags.StreamReady: {
-                    c.writeI32(10);
+                    c.writeI32(11);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
@@ -3671,7 +3814,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.StreamData: {
-                    c.writeI32(11);
+                    c.writeI32(12);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
@@ -3680,7 +3823,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.StreamWriteAccepted: {
-                    c.writeI32(12);
+                    c.writeI32(13);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
@@ -3688,7 +3831,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.StreamWriteStopped: {
-                    c.writeI32(13);
+                    c.writeI32(14);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
@@ -3697,14 +3840,6 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.StreamRemoteWriteClosed: {
-                    c.writeI32(14);
-                    const inner = value.inner;
-                    FfiConverterString.writeIntoCursor(inner.peerId, c);
-                    FfiConverterUInt64.writeIntoCursor(inner.connId, c);
-                    FfiConverterUInt64.writeIntoCursor(inner.streamId, c);
-                    return;
-                }
-                case P2pEvent_Tags.StreamClosed: {
                     c.writeI32(15);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
@@ -3712,8 +3847,16 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterUInt64.writeIntoCursor(inner.streamId, c);
                     return;
                 }
-                case P2pEvent_Tags.EndpointError: {
+                case P2pEvent_Tags.StreamClosed: {
                     c.writeI32(16);
+                    const inner = value.inner;
+                    FfiConverterString.writeIntoCursor(inner.peerId, c);
+                    FfiConverterUInt64.writeIntoCursor(inner.connId, c);
+                    FfiConverterUInt64.writeIntoCursor(inner.streamId, c);
+                    return;
+                }
+                case P2pEvent_Tags.EndpointError: {
+                    c.writeI32(17);
                     const inner = value.inner;
                     FfiConverterTypeEndpointErrorKind.writeIntoCursor(inner.kind, c);
                     FfiConverterOptionalString.writeIntoCursor(inner.peerId, c);
@@ -3723,7 +3866,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.ReachabilityChanged: {
-                    c.writeI32(17);
+                    c.writeI32(18);
                     const inner = value.inner;
                     FfiConverterTypeReachability.writeIntoCursor(inner.previous, c);
                     FfiConverterTypeReachability.writeIntoCursor(inner.current, c);
@@ -3731,26 +3874,26 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.PublicAddressesChanged: {
-                    c.writeI32(18);
+                    c.writeI32(19);
                     const inner = value.inner;
                     FfiConverterSequenceString.writeIntoCursor(inner.addrs, c);
                     return;
                 }
                 case P2pEvent_Tags.RelayReserved: {
-                    c.writeI32(19);
+                    c.writeI32(20);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.relayPeerId, c);
                     FfiConverterOptionalUInt64.writeIntoCursor(inner.expiresUnixSecs, c);
                     return;
                 }
                 case P2pEvent_Tags.RelayReservationLost: {
-                    c.writeI32(20);
+                    c.writeI32(21);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.relayPeerId, c);
                     return;
                 }
                 case P2pEvent_Tags.PathEstablished: {
-                    c.writeI32(21);
+                    c.writeI32(22);
                     const inner = value.inner;
                     FfiConverterUInt64.writeIntoCursor(inner.connectId, c);
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
@@ -3759,7 +3902,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.InboundPathEstablished: {
-                    c.writeI32(22);
+                    c.writeI32(23);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterTypePathKind.writeIntoCursor(inner.path, c);
@@ -3767,7 +3910,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.PathUpgraded: {
-                    c.writeI32(23);
+                    c.writeI32(24);
                     const inner = value.inner;
                     FfiConverterUInt64.writeIntoCursor(inner.connectId, c);
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
@@ -3778,7 +3921,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.HolePunchFailed: {
-                    c.writeI32(24);
+                    c.writeI32(25);
                     const inner = value.inner;
                     FfiConverterUInt64.writeIntoCursor(inner.connectId, c);
                     FfiConverterUInt32.writeIntoCursor(inner.attempt, c);
@@ -3786,7 +3929,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.ConnectFailed: {
-                    c.writeI32(25);
+                    c.writeI32(26);
                     const inner = value.inner;
                     FfiConverterUInt64.writeIntoCursor(inner.connectId, c);
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
@@ -3795,14 +3938,14 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.ConnectCancelled: {
-                    c.writeI32(26);
+                    c.writeI32(27);
                     const inner = value.inner;
                     FfiConverterUInt64.writeIntoCursor(inner.connectId, c);
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     return;
                 }
                 case P2pEvent_Tags.InboundDirectUpgrade: {
-                    c.writeI32(27);
+                    c.writeI32(28);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.oldConnId, c);
@@ -3810,7 +3953,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.Message: {
-                    c.writeI32(28);
+                    c.writeI32(29);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.fromPeerId, c);
                     FfiConverterSequenceString.writeIntoCursor(inner.topics, c);
@@ -3820,42 +3963,34 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.PeerSubscribed: {
-                    c.writeI32(29);
-                    const inner = value.inner;
-                    FfiConverterString.writeIntoCursor(inner.peerId, c);
-                    FfiConverterString.writeIntoCursor(inner.topic, c);
-                    return;
-                }
-                case P2pEvent_Tags.PeerUnsubscribed: {
                     c.writeI32(30);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.topic, c);
                     return;
                 }
-                case P2pEvent_Tags.GossipsubOutboundFailure: {
+                case P2pEvent_Tags.PeerUnsubscribed: {
                     c.writeI32(31);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
-                    FfiConverterString.writeIntoCursor(inner.reason, c);
+                    FfiConverterString.writeIntoCursor(inner.topic, c);
                     return;
                 }
-                case P2pEvent_Tags.GossipsubProtocolViolation: {
+                case P2pEvent_Tags.GossipsubOutboundFailure: {
                     c.writeI32(32);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
-                case P2pEvent_Tags.PeerDiscovered: {
+                case P2pEvent_Tags.GossipsubProtocolViolation: {
                     c.writeI32(33);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
-                    FfiConverterSequenceString.writeIntoCursor(inner.addrs, c);
-                    FfiConverterTypeDiscoverySource.writeIntoCursor(inner.source, c);
+                    FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
-                case P2pEvent_Tags.PeerUpdated: {
+                case P2pEvent_Tags.PeerDiscovered: {
                     c.writeI32(34);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
@@ -3863,32 +3998,40 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterTypeDiscoverySource.writeIntoCursor(inner.source, c);
                     return;
                 }
-                case P2pEvent_Tags.PeerExpired: {
+                case P2pEvent_Tags.PeerUpdated: {
                     c.writeI32(35);
+                    const inner = value.inner;
+                    FfiConverterString.writeIntoCursor(inner.peerId, c);
+                    FfiConverterSequenceString.writeIntoCursor(inner.addrs, c);
+                    FfiConverterTypeDiscoverySource.writeIntoCursor(inner.source, c);
+                    return;
+                }
+                case P2pEvent_Tags.PeerExpired: {
+                    c.writeI32(36);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     return;
                 }
                 case P2pEvent_Tags.DiscoveryDialFailed: {
-                    c.writeI32(36);
+                    c.writeI32(37);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
                 case P2pEvent_Tags.MdnsFailed: {
-                    c.writeI32(37);
+                    c.writeI32(38);
                     const inner = value.inner;
                     FfiConverterTypeMdnsFailureKind.writeIntoCursor(inner.kind, c);
                     FfiConverterString.writeIntoCursor(inner.detail, c);
                     return;
                 }
                 case P2pEvent_Tags.MdnsRecovered: {
-                    c.writeI32(38);
+                    c.writeI32(39);
                     return;
                 }
                 case P2pEvent_Tags.DiscoveryProtocolViolation: {
-                    c.writeI32(39);
+                    c.writeI32(40);
                     const inner = value.inner;
                     FfiConverterOptionalString.writeIntoCursor(inner.peerId, c);
                     FfiConverterTypeDiscoverySource.writeIntoCursor(inner.source, c);
@@ -3916,6 +4059,13 @@ const FfiConverterTypeP2pEvent = (() => {
                     let size = 4;
                     size += FfiConverterTypeDriverFailureKind.allocationSize(inner.kind);
                     size += FfiConverterString.allocationSize(inner.detail);
+                    return size;
+                }
+                case P2pEvent_Tags.EndpointClosed: {
+                    const inner = value.inner;
+                    let size = 4;
+                    size += FfiConverterTypeCloseOutcome.allocationSize(inner.outcome);
+                    size += FfiConverterSequenceTypeUnfinishedConnection.allocationSize(inner.unfinished);
                     return size;
                 }
                 case P2pEvent_Tags.ConnectionEstablished: {
@@ -4237,6 +4387,9 @@ const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
 // FfiConverter for Array<bigint>
 const FfiConverterSequenceUInt64 = new FfiConverterArray(FfiConverterUInt64);
 
+// FfiConverter for Array<UnfinishedConnection>
+const FfiConverterSequenceTypeUnfinishedConnection = new FfiConverterArray(FfiConverterTypeUnfinishedConnection);
+
 
 /**
  * This should be called before anything else.
@@ -4262,6 +4415,7 @@ function uniffiEnsureInitialized() {
 export default Object.freeze({
   initialize: uniffiEnsureInitialized,
   converters: {
+    FfiConverterTypeCloseOutcome,
     FfiConverterTypeConfigCapability,
     FfiConverterTypeConnectTarget,
     FfiConverterTypeConnectionInfo,
@@ -4281,5 +4435,6 @@ export default Object.freeze({
     FfiConverterTypePathKind,
     FfiConverterTypeReachability,
     FfiConverterTypeRelayReservationInfo,
+    FfiConverterTypeUnfinishedConnection,
   }
 });

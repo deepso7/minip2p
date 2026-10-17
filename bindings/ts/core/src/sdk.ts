@@ -1,6 +1,10 @@
 /* oxlint-disable default-case, func-style, max-classes-per-file, no-await-in-loop, no-empty-function, no-loop-func, no-use-before-define, promise/avoid-new, promise/prefer-await-to-callbacks, promise/prefer-await-to-then, typescript/no-invalid-void-type, unicorn/consistent-function-scoping, unicorn/no-new-array, unicorn/no-useless-spread, unicorn/no-useless-undefined -- Promise adapters, sequential async iterators, void event payloads, snapshot fan-out, and bounded queues are deliberate SDK internals. */
 
-import type { BackendConnectTarget, Minip2pBackend } from "./backend.js";
+import type {
+  BackendClosed,
+  BackendConnectTarget,
+  Minip2pBackend,
+} from "./backend.js";
 import {
   AbortError,
   ClosedError,
@@ -16,14 +20,14 @@ import {
   TimeoutError,
   WriteBufferFullError,
 } from "./errors.js";
-import { P2pEvent_Tags, PathKind_Tags } from "./types.js";
+import { CloseOutcome, P2pEvent_Tags, PathKind_Tags } from "./types.js";
 import type {
   Bytes,
-  CloseReason,
   ConnectionInfo,
   ConnectOptions,
   ConnectResult,
   ConnectTarget,
+  EndpointCloseReport,
   EventsOptions,
   IdentifyInfo,
   InboundStreamMeta,
@@ -48,6 +52,8 @@ declare const TextEncoder: new () => {
 };
 
 const DEFAULT_TIMEOUT_MS = 65_000;
+/** Default close drain, matching the Rust `Endpoint::close`. */
+const DEFAULT_CLOSE_TIMEOUT_MS = 500;
 const EVENT_QUEUE_CAP = 4096;
 const EVENT_FLUSH_BATCH = 256;
 const CONNECT_TERMINAL_CAP = 1024;
@@ -1114,7 +1120,7 @@ export class Minip2pBase {
   readonly #relayAddrs: readonly string[];
   readonly #named = new Map<EventKind, Set<(payload: AnyPayload) => void>>();
   readonly #catchAll = new Set<CatchAllHandler>();
-  readonly #closeHandlers = new Set<(reason: CloseReason) => void>();
+  readonly #closeHandlers = new Set<(report: EndpointCloseReport) => void>();
   readonly #waiters = new Set<EventWaiter>();
   readonly #queue = new EventQueue(EVENT_QUEUE_CAP, (item) => {
     this.#releaseQueueItem(item);
@@ -1127,6 +1133,9 @@ export class Minip2pBase {
   #dropped = 0;
   #flushScheduled = false;
   #closed = false;
+  /** Settles once the native drain finished and close observers ran. */
+  #closing: Promise<EndpointCloseReport> | undefined;
+  #closeReported = false;
 
   protected constructor(
     backend: Minip2pBackend,
@@ -1139,7 +1148,7 @@ export class Minip2pBase {
         this.#enqueueNative(event);
       });
     } catch (error) {
-      backend.close();
+      void backend.close(0);
       throw error;
     }
   }
@@ -1295,21 +1304,44 @@ export class Minip2pBase {
     });
   }
 
-  /** Registers a one-shot endpoint shutdown observer. */
-  onClose(handler: (reason: CloseReason) => void): Unsubscribe {
-    if (this.#closed) {
+  /**
+   * Registers a one-shot endpoint shutdown observer. It stays registered
+   * through the native close drain and fires once that finishes, with the
+   * same report {@link close} resolves with. A no-op once it has fired.
+   */
+  onClose(handler: (report: EndpointCloseReport) => void): Unsubscribe {
+    if (this.#closeReported) {
       return () => {};
     }
     return subscribe(this.#closeHandlers, handler);
   }
 
-  /** Idempotently stops the endpoint and rejects outstanding operations. */
-  close(): void {
-    this.#teardown({ reason: "close" }, new ClosedError());
+  /**
+   * Stops the endpoint: rejects outstanding operations and drops listeners
+   * at once, then has native disconnect peers and drain for up to
+   * `timeoutMs` (default 500; `0` tears down at once, best effort). Resolves
+   * with the close report once the drain finished, after `onClose`
+   * observers ran; it never rejects. The deadline bounds teardown time only,
+   * not delivery of accepted writes: QUIC discards queued writes and TCP may
+   * abort. Idempotent: a later call returns the same promise, including
+   * after a driver failure closed the endpoint.
+   */
+  close(
+    timeoutMs: number = DEFAULT_CLOSE_TIMEOUT_MS
+  ): Promise<EndpointCloseReport> {
+    assertTimeout(timeoutMs);
+    this.#teardown({ reason: "close" }, new ClosedError(), timeoutMs);
+    return this.#closing as Promise<EndpointCloseReport>;
   }
 
+  /** Starts {@link close} with the default drain, without waiting for it. */
   [Symbol.dispose](): void {
-    this.close();
+    void this.close();
+  }
+
+  /** {@link close} with the default drain, for `await using`. */
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.close();
   }
 
   /** Returns this endpoint's base58 peer ID. */
@@ -1858,13 +1890,17 @@ export class Minip2pBase {
   }
 
   #dispatchNative(event: P2pEvent): void {
+    // Backends resolve `close` with it instead of delivering it.
+    if (event.tag === P2pEvent_Tags.EndpointClosed) {
+      return;
+    }
     if (event.tag === P2pEvent_Tags.DriverFailed) {
       const failure = new DriverFailedError(
         event.inner.kind,
         event.inner.detail
       );
       this.#dispatch("driverFailed", event.inner, event.inner);
-      this.#teardown({ error: failure, reason: "driverFailed" }, failure);
+      this.#teardown({ error: failure, reason: "driverFailed" }, failure, 0);
       return;
     }
 
@@ -2233,13 +2269,17 @@ export class Minip2pBase {
     }
   }
 
-  #teardown(reason: CloseReason, error: Error): void {
+  #teardown(
+    reason:
+      | { readonly reason: "close" }
+      | { readonly reason: "driverFailed"; readonly error: DriverFailedError },
+    error: Error,
+    timeoutMs: number
+  ): void {
     if (this.#closed) {
       return;
     }
     this.#closed = true;
-    const closeHandlers = [...this.#closeHandlers];
-    this.#closeHandlers.clear();
     this.#clearQueue();
     this.#dropped = 0;
     this.#named.clear();
@@ -2263,17 +2303,32 @@ export class Minip2pBase {
       ping.cancel(error);
     }
     this.#pings.clear();
+    let closed: Promise<BackendClosed>;
     try {
-      this.#backend.close();
-    } finally {
+      closed = this.#backend.close(timeoutMs);
+    } catch {
+      closed = Promise.resolve({
+        outcome: CloseOutcome.Failed,
+        unfinished: [],
+      });
+    }
+    this.#closing = closed.then(({ outcome, unfinished }) => {
+      const report: EndpointCloseReport =
+        reason.reason === "close"
+          ? { outcome, reason: "close", unfinished }
+          : { error: reason.error, reason: "driverFailed", unfinished };
+      this.#closeReported = true;
+      const closeHandlers = [...this.#closeHandlers];
+      this.#closeHandlers.clear();
       for (const handler of closeHandlers) {
         try {
-          handler(reason);
+          handler(report);
         } catch {
           // Close notification is outside the now-closed event queue.
         }
       }
-    }
+      return report;
+    });
   }
 
   #assertOpen(): void {
@@ -2315,6 +2370,7 @@ function toBackendTarget(target: ConnectTarget): BackendConnectTarget {
 type UnnamedEventTag =
   | StreamP2pEvent["tag"]
   | typeof P2pEvent_Tags.DriverFailed
+  | typeof P2pEvent_Tags.EndpointClosed
   | typeof P2pEvent_Tags.StreamReady;
 type NamedEventTag = Exclude<P2pEventTag, UnnamedEventTag>;
 
@@ -2366,6 +2422,7 @@ function normalizeEvent(
     | {
         readonly tag:
           | typeof P2pEvent_Tags.DriverFailed
+          | typeof P2pEvent_Tags.EndpointClosed
           | typeof P2pEvent_Tags.StreamReady;
       }
   >

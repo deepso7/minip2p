@@ -82,9 +82,10 @@ listen: ["/ip4/0.0.0.0/tcp/4001", "/ip6/::/tcp/4001"];
 | `Minip2p.create(config)` | Started `Minip2p` endpoint. |
 | `useMinip2p(createConfig)` | <Badge>React Native</Badge> Hook state plus an idempotent `close` callback. |
 | `bindAppState(endpoint)` | <Badge>React Native</Badge> Idempotent unsubscribe for manual lifecycle ownership. |
-| `endpoint.close()` | Terminal, idempotent shutdown. |
-| `endpoint[Symbol.dispose]()` | Equivalent to `close()`; supports `using` where the toolchain does. |
-| `endpoint.onClose(handler)` | One-shot close observer unsubscribe. |
+| `endpoint.close(timeoutMs?)` | Terminal, idempotent shutdown; resolves with an `EndpointCloseReport` once native drained for up to `timeoutMs` (default 500). |
+| `endpoint[Symbol.asyncDispose]()` | Awaits `close()`; supports `await using`. |
+| `endpoint[Symbol.dispose]()` | Starts `close()` without waiting; supports `using`. |
+| `endpoint.onClose(handler)` | One-shot close observer, called with the same report once the drain finishes; returns an unsubscribe. |
 | `endpoint.isRunning()` | Whether the endpoint still accepts work. |
 | `endpoint.setActive(active)` | Choose normal behavior or reduced background work. |
 

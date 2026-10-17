@@ -4,7 +4,7 @@ import {
   MessageTooLargeError,
   NotPermittedError,
 } from "./errors.js";
-import { ConfigCapability } from "./types.js";
+import { CloseOutcome, ConfigCapability } from "./types.js";
 import type {
   Bytes,
   ConnectionInfo,
@@ -16,6 +16,84 @@ import type {
   Reachability,
   RelayReservationInfo,
 } from "./types.js";
+
+/** How the native endpoint's close drain ended (`EndpointClosed`). */
+export interface BackendClosed {
+  readonly outcome: CloseOutcome;
+  /** Peers whose connections were still tracked, each once. */
+  readonly unfinished: readonly string[];
+}
+
+/**
+ * The peers `EndpointClosed`'s unfinished connections name, each once. An
+ * inbound handshake that had not identified its peer names none.
+ */
+export const unfinishedPeers = (
+  unfinished: readonly { readonly peerId?: string | undefined }[]
+): string[] => [
+  ...new Set(
+    unfinished.flatMap(({ peerId }) => (peerId === undefined ? [] : [peerId]))
+  ),
+];
+
+/**
+ * A native adapter's side of {@link Minip2pBackend.close}: stops native once,
+ * then resolves with the native `EndpointClosed` the adapter hands to
+ * {@link settle}, or at once when no driver started.
+ */
+export class NativeCloseLatch {
+  readonly #closed: Promise<BackendClosed>;
+  #resolve: ((closed: BackendClosed) => void) | undefined;
+  #closing: Promise<BackendClosed> | undefined;
+
+  constructor() {
+    // oxlint-disable-next-line promise/avoid-new -- Settled by a native event, not a callback API.
+    this.#closed = new Promise((resolve) => {
+      this.#resolve = resolve;
+    });
+  }
+
+  /** Whether `close` was called; later native events can be ignored. */
+  get requested(): boolean {
+    return this.#closing !== undefined;
+  }
+
+  /** Records the native `EndpointClosed`, which may precede `close`. */
+  settle(closed: BackendClosed): void {
+    this.#resolve?.(closed);
+  }
+
+  /**
+   * Runs `stop` on the first call, then resolves once native closed and
+   * `release`, if any, ran. Later calls return the same promise.
+   */
+  close(
+    started: boolean,
+    stop: () => void,
+    release?: () => void
+  ): Promise<BackendClosed> {
+    this.#closing ??= this.#finish(started, stop, release);
+    return this.#closing;
+  }
+
+  async #finish(
+    started: boolean,
+    stop: () => void,
+    release: (() => void) | undefined
+  ): Promise<BackendClosed> {
+    stop();
+    // Without a driver, native released the endpoint at once.
+    const closed = started
+      ? await this.#closed
+      : { outcome: CloseOutcome.Drained, unfinished: [] };
+    try {
+      release?.();
+    } catch {
+      // The endpoint is closed either way; the report still stands.
+    }
+    return closed;
+  }
+}
 
 /** Full native identity allocated for an outbound stream. */
 export interface BackendOpenStream {
@@ -47,8 +125,14 @@ export interface Minip2pBackend {
    * elided, dropped, or coalesced into an earlier one.
    */
   eventHandled?: (event: P2pEvent) => void;
-  /** Idempotently releases the native endpoint. */
-  close: () => void;
+  /**
+   * Requests native shutdown, draining for up to `timeoutMs` (`0` tears down
+   * at once), and resolves with the native `EndpointClosed`, the driver's
+   * last event, once the native endpoint is released. Idempotent: later
+   * calls return the same promise and their timeout is ignored. Resolves at
+   * once for a backend whose `start` failed. Never rejects.
+   */
+  close: (timeoutMs: number) => Promise<BackendClosed>;
   /** Returns the local peer ID. */
   peerId: () => string;
   /** Returns bound peer multiaddresses. */

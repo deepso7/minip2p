@@ -405,9 +405,11 @@ export interface P2pEndpointLike {
  */
     start(doorbell: P2pEventDoorbell) /*throws*/: void;
 /**
- * Requests shutdown.
+ * Requests shutdown; the driver drains its close for up to
+ * `timeout_ms` and reports how that went as its last event,
+ * `EndpointClosed`.
  */
-    stop(): void;
+    stop(timeoutMs: bigint): void;
 /**
  * Acknowledges `bytes` of a stream's received data as consumed,
  * letting its sender continue. Every registered protocol needs this,
@@ -921,11 +923,14 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Requests shutdown.
+ * Requests shutdown; the driver drains its close for up to
+ * `timeout_ms` and reports how that went as its last event,
+ * `EndpointClosed`.
  */
-    stop(): void {uniffiCaller.rustCall(
+    stop(timeoutMs: bigint): void {uniffiCaller.rustCall(
             /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_stop(
                 uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
+        FfiConverterUInt64.lower(timeoutMs, nativeModule().rustbuffer_alloc),
                 callStatus);
             },
             /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
@@ -1201,7 +1206,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_start() !== 43725) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_start");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_stop() !== 11062) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_stop() !== 31752) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_stop");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_stream_consumed() !== 52358) {
