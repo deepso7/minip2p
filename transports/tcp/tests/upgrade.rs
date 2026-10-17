@@ -9,7 +9,7 @@ mod support;
 use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_identity::{Ed25519Keypair, PeerId};
-use minip2p_secure_mux::KEEPALIVE_INTERVAL_MS;
+use minip2p_secure_mux::{KEEPALIVE_HANDOFF_TIMEOUT_MS, KEEPALIVE_INTERVAL_MS};
 use minip2p_tcp::{TcpConfig, TcpTransport};
 use minip2p_transport::ConnectionCloseReason;
 use minip2p_transport::{
@@ -605,7 +605,14 @@ fn a_stalled_socket_stops_claiming_urgency_and_recovers() {
 
 #[test]
 fn a_stall_is_measured_from_when_it_started_not_from_an_older_one() {
-    let mut pair = upgraded_pair();
+    // Shorter than keepalive's ACK wait, so the stall is the deadline that
+    // shows once the long-quiet connection's ping goes out.
+    const STALL_TIMEOUT: u64 = 5_000;
+    let config = TcpConfig {
+        send_stall_timeout_ms: Some(STALL_TIMEOUT),
+        ..TcpConfig::default()
+    };
+    let mut pair = upgraded_pair_with(config, TcpConfig::default());
     let id = pair.connection;
     let stream = pair.dialer.open_stream(id).expect("open substream");
     drive(&pair.net, &mut pair.dialer, &mut pair.listener);
@@ -645,9 +652,11 @@ fn a_stall_is_measured_from_when_it_started_not_from_an_older_one() {
         "a fresh stall must not be treated as an expired one: {events:?}"
     );
     assert_eq!(pair.dialer.connection_ids(), vec![id]);
+    // The ping that went out with it is dated by the next poll.
+    pair.dialer.poll(much_later).expect("date the ping");
     assert_eq!(
         pair.dialer.next_deadline(),
-        Some(Deadline::from_millis(10 * 60 * 1000 + 30_000))
+        Some(Deadline::from_millis(10 * 60 * 1000 + STALL_TIMEOUT))
     );
 }
 
@@ -689,8 +698,13 @@ fn a_socket_that_takes_a_frame_every_poll_is_not_stalled() {
     // One equal-sized frame buffered at a time: each poll the socket takes
     // the buffered frame and the session refills it with the next, so the
     // buffer never looks shorter, yet the connection is making progress.
+    // Polls come further apart than the stall timeout, but all within one
+    // keepalive interval: the peer never reads, so it could not answer a
+    // ping.
+    const STALL_TIMEOUT: u64 = 2_000;
     let mut config = TcpConfig {
         max_buffered_send: 1,
+        send_stall_timeout_ms: Some(STALL_TIMEOUT),
         ..TcpConfig::default()
     };
     config.yamux.max_frame_len = 1000;
@@ -715,7 +729,7 @@ fn a_socket_that_takes_a_frame_every_poll_is_not_stalled() {
             .set_in_flight_capacity(Some(allowed));
         let events = pair
             .dialer
-            .poll(Now::from_millis(step * 10_000))
+            .poll(Now::from_millis(step * (STALL_TIMEOUT + 1_000)))
             .expect("poll");
         assert!(
             events.is_empty(),
@@ -1433,7 +1447,7 @@ fn closing_a_connection_drops_its_queued_writable() {
 }
 
 #[test]
-fn traffic_between_polls_restarts_the_keepalive_clock() {
+fn only_received_traffic_restarts_the_keepalive_clock() {
     const LATER: u64 = 10_000;
     let mut pair = upgraded_pair();
     let id = pair.connection;
@@ -1442,9 +1456,7 @@ fn traffic_between_polls_restarts_the_keepalive_clock() {
         Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
     );
 
-    // A write made between polls is traffic, so the next poll -- whenever it
-    // comes -- restarts the quiet interval from its own time sample rather
-    // than leaving the old keepalive deadline standing.
+    // Sending proves nothing about the peer: the deadline stands.
     let stream = pair.dialer.open_stream(id).expect("open substream");
     pair.dialer
         .send_stream(id, stream, Bytes::from_static(b"hello"))
@@ -1456,8 +1468,71 @@ fn traffic_between_polls_restarts_the_keepalive_clock() {
     pair.dialer.poll(Now::from_millis(LATER)).expect("poll");
     assert_eq!(
         pair.dialer.next_deadline(),
-        Some(Deadline::from_millis(LATER + KEEPALIVE_INTERVAL_MS))
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
     );
+
+    // A frame from the peer is dated by the poll that reads it.
+    let listener_id = pair.listener.connection_ids()[0];
+    let back = pair.listener.open_stream(listener_id).expect("open back");
+    pair.listener
+        .send_stream(listener_id, back, Bytes::from_static(b"hi"))
+        .expect("send back");
+    pair.dialer
+        .poll(Now::from_millis(2 * LATER))
+        .expect("read the reply");
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(2 * LATER + KEEPALIVE_INTERVAL_MS))
+    );
+}
+
+#[test]
+fn a_backed_up_connection_to_a_silent_peer_times_out() {
+    // No stall timeout: only keepalive can notice the peer is gone.
+    let config = TcpConfig {
+        max_buffered_send: 1,
+        send_stall_timeout_ms: None,
+        ..TcpConfig::default()
+    };
+    let mut pair = upgraded_pair_with(config, TcpConfig::default());
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // The peer stops reading, and a frame fills the outbound buffer.
+    pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
+    pair.dialer
+        .send_stream(id, stream, Bytes::from(vec![7u8; 1024]))
+        .expect("queue bytes the socket will refuse");
+    let events = pair.dialer.poll(Now::from_millis(0)).expect("stall");
+    assert!(events.is_empty(), "{events:?}");
+    let due = KEEPALIVE_INTERVAL_MS;
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(due)),
+        "the keepalive deadline holds while writes are backed up"
+    );
+
+    // The ping comes due but cannot be handed off to the full buffer.
+    let events = pair.dialer.poll(Now::from_millis(due)).expect("ping due");
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(due + KEEPALIVE_HANDOFF_TIMEOUT_MS))
+    );
+    let events = pair
+        .dialer
+        .poll(Now::from_millis(due + KEEPALIVE_HANDOFF_TIMEOUT_MS))
+        .expect("hand-off times out");
+    assert_eq!(
+        events.last(),
+        Some(&TransportEvent::Closed {
+            id,
+            reason: ConnectionCloseReason::TimedOut,
+        }),
+        "{events:?}"
+    );
+    assert!(pair.dialer.connection_ids().is_empty());
 }
 
 #[test]

@@ -224,6 +224,9 @@ impl From<SessionError> for Teardown {
             SessionError::GoAway { code } => Self(ConnectionCloseReason::Remote {
                 code: u64::from(code),
             }),
+            SessionError::Yamux(YamuxError::KeepaliveTimeout) => {
+                Self(ConnectionCloseReason::TimedOut)
+            }
             error => Self::fault(error.to_string()),
         }
     }
@@ -1426,10 +1429,10 @@ impl<T> CircuitTransport<T, StdEntropy> {
 mod tests {
     use super::*;
     use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
-    use minip2p_secure_mux::KEEPALIVE_INTERVAL_MS;
     use minip2p_secure_mux::noise::{
         NOISE_PROTOCOL_ID, NoiseConfig, NoiseOutput, NoiseRole, NoiseSession,
     };
+    use minip2p_secure_mux::{KEEPALIVE_ACK_TIMEOUT_MS, KEEPALIVE_INTERVAL_MS};
     use minip2p_test_support::InMemoryTransport;
 
     #[derive(Clone, Debug)]
@@ -1968,6 +1971,31 @@ mod tests {
             a.circuit_ids().contains(&circuit_id),
             "keepalive must not tear the circuit down"
         );
+    }
+
+    #[test]
+    fn an_unanswered_keepalive_closes_the_circuit_as_timed_out() {
+        let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_close_observed_pair();
+        complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+
+        // The ping goes out; the next poll dates its hand-off.
+        a.poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .expect("ping");
+        a.poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .expect("date the hand-off");
+        let answer_by = KEEPALIVE_INTERVAL_MS + KEEPALIVE_ACK_TIMEOUT_MS;
+        assert_eq!(a.next_deadline(), Some(Deadline::from_millis(answer_by)));
+
+        // `b` never reads the bridge, so no acknowledgement comes back.
+        let events = a.poll(Now::from_millis(answer_by)).expect("time out");
+        assert!(
+            events.contains(&TransportEvent::Closed {
+                id: circuit_id,
+                reason: ConnectionCloseReason::TimedOut,
+            }),
+            "{events:?}"
+        );
+        assert!(!a.circuit_ids().contains(&circuit_id));
     }
 
     #[test]
