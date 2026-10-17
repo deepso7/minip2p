@@ -288,6 +288,7 @@ impl HoldingSwarm<'_> {
                     NatSwarmError::Swarm(DriverError::Transport(
                         TransportError::StreamNotFound { .. }
                         | TransportError::ConnectionNotFound { .. }
+                        | TransportError::ConnectionClosed { .. }
                         | TransportError::InvalidState { .. },
                     ))
                     | NatSwarmError::Swarm(DriverError::Swarm(_)),

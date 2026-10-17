@@ -55,6 +55,12 @@ pub enum TransportError {
     Unsupported { operation: &'static str },
     #[error("connection {id} not found")]
     ConnectionNotFound { id: ConnectionId },
+    /// The operation failed in a way that ended the connection: the
+    /// transport closed it, and its
+    /// [`Closed`](crate::TransportEvent::Closed) event carries this failure
+    /// as its reason. From then on the connection is not found.
+    #[error("connection {id} closed: {reason}")]
+    ConnectionClosed { id: ConnectionId, reason: String },
     #[error("connection {id} is {state}, expected {expected}")]
     InvalidState {
         id: ConnectionId,

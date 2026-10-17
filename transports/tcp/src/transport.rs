@@ -527,8 +527,9 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
     /// whatever it queued.
     ///
     /// A failure that kills the session closes the connection before
-    /// returning, with the failure as its close reason; the caller also
-    /// learns it from the returned error.
+    /// returning, with the failure as its close reason, and returns
+    /// [`TransportError::ConnectionClosed`] so the caller can tell its
+    /// operation ended the connection.
     fn operate_session<R>(
         &mut self,
         id: ConnectionId,
@@ -547,7 +548,10 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         if let Err(Teardown(reason)) = pumped {
             let message = reason.to_string();
             self.fail_connection(id, reason);
-            return Err(TransportError::PollError { reason: message });
+            return Err(TransportError::ConnectionClosed {
+                id,
+                reason: message,
+            });
         }
         match result {
             Ok(value) => Ok(value),
@@ -594,7 +598,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             Err(fatal) => {
                 let reason = fatal.to_string();
                 self.fail_connection(id, ConnectionCloseReason::Error(reason.clone()));
-                Err(TransportError::PollError { reason })
+                Err(TransportError::ConnectionClosed { id, reason })
             }
         }
     }

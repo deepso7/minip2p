@@ -87,6 +87,7 @@ impl DriverError {
                 | Self::Transport(
                     TransportError::StreamNotFound { .. }
                         | TransportError::ConnectionNotFound { .. }
+                        | TransportError::ConnectionClosed { .. }
                 )
         )
     }
@@ -297,14 +298,15 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     }
 
     /// Returns whether a transport connection is still tracked, including
-    /// inbound handshakes that have not yet emitted
+    /// outbound dials and inbound handshakes that have not yet emitted
     /// [`SwarmEvent::ConnectionEstablished`].
     pub fn has_tracked_connections(&self) -> bool {
         self.state.has_tracked_connections()
     }
 
-    /// Returns every tracked transport connection with its peer, if known:
-    /// `None` for an inbound handshake that has not yet identified one.
+    /// Returns every tracked transport connection, pending dials included,
+    /// with its peer if known: a dial's is the peer it targets, and an
+    /// inbound handshake that has not yet identified one has `None`.
     pub fn tracked_connections(&self) -> impl Iterator<Item = (ConnectionId, Option<&PeerId>)> {
         self.state.tracked_connections()
     }
@@ -897,18 +899,21 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
 
     /// Executes one action against the transport and feeds any result back
     /// into the state.
+    ///
+    /// A [`TransportError::ConnectionClosed`] is not reported here: the
+    /// operation ended the connection, whose close reports the failure once.
     fn dispatch(&mut self, action: Action, now_ms: u64) {
         match action {
             Action::OpenStream {
                 conn_id,
                 protocol,
                 target,
-            } => {
-                if let Err(error) = self.open(conn_id, &protocol, target, now_ms) {
-                    self.state
-                        .open_failed(conn_id, &protocol, &error.to_string());
-                }
-            }
+            } => match self.open(conn_id, &protocol, target, now_ms) {
+                Ok(_) | Err(TransportError::ConnectionClosed { .. }) => {}
+                Err(error) => self
+                    .state
+                    .open_failed(conn_id, &protocol, &error.to_string()),
+            },
             Action::SendStream {
                 conn_id,
                 stream_id,
@@ -916,7 +921,7 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             } => {
                 let counted = data.len();
                 match self.transport.send_stream(conn_id, stream_id, data) {
-                    Ok(()) => {}
+                    Ok(()) | Err(TransportError::ConnectionClosed { .. }) => {}
                     // The state's own write: it holds the tail.
                     Err(TransportError::Full { unsent, .. }) => {
                         self.state
@@ -932,49 +937,52 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
                 }
             }
             Action::CloseStreamWrite { conn_id, stream_id } => {
-                if let Err(e) = self.transport.close_stream_write(conn_id, stream_id) {
-                    self.state.record_runtime_error(transport_error(
+                match self.transport.close_stream_write(conn_id, stream_id) {
+                    Ok(()) | Err(TransportError::ConnectionClosed { .. }) => {}
+                    Err(e) => self.state.record_runtime_error(transport_error(
                         Some(conn_id),
                         Some(stream_id),
                         format!(
                             "close_stream_write on connection {conn_id} stream {stream_id} failed: {e}"
                         ),
-                    ));
+                    )),
                 }
             }
             Action::ResetStream { conn_id, stream_id } => {
-                if let Err(e) = self.transport.reset_stream(conn_id, stream_id) {
-                    self.state.reset_stream_failed(conn_id, stream_id);
-                    self.state.record_runtime_error(transport_error(
-                        Some(conn_id),
-                        Some(stream_id),
-                        format!(
-                            "reset_stream on connection {conn_id} stream {stream_id} failed: {e}"
-                        ),
-                    ));
+                match self.transport.reset_stream(conn_id, stream_id) {
+                    // The connection's close clears the pending reset.
+                    Ok(()) | Err(TransportError::ConnectionClosed { .. }) => {}
+                    Err(e) => {
+                        self.state.reset_stream_failed(conn_id, stream_id);
+                        self.state.record_runtime_error(transport_error(
+                            Some(conn_id),
+                            Some(stream_id),
+                            format!(
+                                "reset_stream on connection {conn_id} stream {stream_id} failed: {e}"
+                            ),
+                        ));
+                    }
                 }
             }
             Action::AckStream {
                 conn_id,
                 stream_id,
                 bytes,
-            } => {
-                if let Err(e) = self.transport.ack_stream(conn_id, stream_id, bytes) {
-                    self.state.record_runtime_error(transport_error(
-                        Some(conn_id),
-                        Some(stream_id),
-                        format!(
-                            "ack_stream on connection {conn_id} stream {stream_id} failed: {e}"
-                        ),
-                    ));
-                }
-            }
+            } => match self.transport.ack_stream(conn_id, stream_id, bytes) {
+                Ok(()) | Err(TransportError::ConnectionClosed { .. }) => {}
+                Err(e) => self.state.record_runtime_error(transport_error(
+                    Some(conn_id),
+                    Some(stream_id),
+                    format!("ack_stream on connection {conn_id} stream {stream_id} failed: {e}"),
+                )),
+            },
             Action::SettleStream { conn_id, stream_id } => {
                 match self.transport.reset_stream(conn_id, stream_id) {
                     // Nothing held is nothing to settle.
                     Ok(())
                     | Err(
                         TransportError::ConnectionNotFound { .. }
+                        | TransportError::ConnectionClosed { .. }
                         | TransportError::StreamNotFound { .. },
                     ) => {}
                     Err(e) => self.state.record_runtime_error(transport_error(
@@ -1055,6 +1063,10 @@ mod tests {
             }),
             DriverError::from(SwarmError::NotConnected { peer_id }),
             DriverError::from(TransportError::ConnectionNotFound { id: conn_id }),
+            DriverError::from(TransportError::ConnectionClosed {
+                id: conn_id,
+                reason: "reset exhausted the control reserve".into(),
+            }),
             DriverError::from(TransportError::StreamNotFound {
                 id: conn_id,
                 stream_id,
@@ -1126,6 +1138,9 @@ mod tests {
         fail_second_close: bool,
         /// Every `close` fails with a non-`ConnectionNotFound` error.
         refuse_close: bool,
+        /// Every `send_stream` ends its connection, as a fatal session
+        /// failure does: `Closed` is queued and `ConnectionClosed` returned.
+        sends_end_connection: bool,
     }
 
     impl ScriptedTransport {
@@ -1181,6 +1196,14 @@ mod tests {
             stream_id: StreamId,
             data: Bytes,
         ) -> Result<(), TransportError> {
+            if self.sends_end_connection {
+                let reason = String::from("session failed");
+                self.initial.push(TransportEvent::Closed {
+                    id,
+                    reason: ConnectionCloseReason::Error(reason.clone()),
+                });
+                return Err(TransportError::ConnectionClosed { id, reason });
+            }
             let Some(negotiator) = self.negotiators.get_mut(&stream_id) else {
                 // Negotiation is done (or was never scripted): this is
                 // protocol payload, which is what tests assert on.
@@ -1353,6 +1376,55 @@ mod tests {
             "expected the close to surface: {events:?}"
         );
         assert!(swarm.connected_peers().is_empty());
+    }
+
+    /// A stream operation that ends its connection is reported once, as the
+    /// close's reason, not also as a transport error.
+    #[test]
+    fn an_operation_that_ends_its_connection_is_reported_once() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let id = ConnectionId::new(1);
+        let mut swarm = swarm_with(
+            ScriptedTransport {
+                initial: vec![TransportEvent::Connected {
+                    id,
+                    endpoint: ConnectionEndpoint::with_peer_id(
+                        "/ip4/198.51.100.7/udp/4001/quic-v1"
+                            .parse()
+                            .expect("endpoint"),
+                        peer.clone(),
+                    ),
+                }],
+                sends_end_connection: true,
+                ..ScriptedTransport::default()
+            },
+            SeqEntropy(1),
+        );
+
+        // Identify's negotiation write ends the connection during this poll;
+        // the next one delivers its close.
+        let mut events = swarm.poll(Now::from_millis(5_000)).expect("poll");
+        events.extend(swarm.poll(Now::from_millis(5_001)).expect("poll"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::Error(_))),
+            "{events:?}"
+        );
+        let closes: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, SwarmEvent::ConnectionClosed { .. }))
+            .collect();
+        assert!(
+            matches!(
+                closes.as_slice(),
+                [SwarmEvent::ConnectionClosed { peer_id, conn_id, reason }]
+                    if *peer_id == peer
+                        && *conn_id == id
+                        && *reason == ConnectionCloseReason::Error("session failed".into())
+            ),
+            "{events:?}"
+        );
     }
 
     #[test]

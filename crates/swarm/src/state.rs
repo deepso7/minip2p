@@ -1189,17 +1189,35 @@ impl SwarmState {
     }
 
     /// Returns whether a transport connection is still tracked, including
-    /// inbound handshakes that have not yet emitted [`SwarmEvent::ConnectionEstablished`].
+    /// outbound dials and inbound handshakes that have not yet emitted
+    /// [`SwarmEvent::ConnectionEstablished`].
     pub fn has_tracked_connections(&self) -> bool {
-        !self.conn_to_remote_addr.is_empty()
+        !self.conn_to_remote_addr.is_empty() || !self.pending_dials.is_empty()
     }
 
-    /// Every tracked transport connection with its peer, if known: `None`
-    /// for an inbound handshake that has not yet identified one.
+    /// Every tracked transport connection, pending dials included, with its
+    /// peer if known: a dial's is the one it targets, and an inbound
+    /// handshake that has not yet identified one has `None`.
     pub fn tracked_connections(&self) -> impl Iterator<Item = (ConnectionId, Option<&PeerId>)> {
+        let dials_only = self
+            .pending_dials
+            .keys()
+            .filter(|conn_id| !self.conn_to_remote_addr.contains_key(conn_id));
         self.conn_to_remote_addr
             .keys()
-            .map(|conn_id| (*conn_id, self.conn_to_peer.get(conn_id)))
+            .chain(dials_only)
+            .map(|conn_id| (*conn_id, self.tracked_peer(*conn_id)))
+    }
+
+    /// The peer behind tracked `conn_id`: a pending dial's target, else its
+    /// established peer. A handshake's placeholder peer is not one.
+    fn tracked_peer(&self, conn_id: ConnectionId) -> Option<&PeerId> {
+        if let Some(dial) = self.pending_dials.get(&conn_id) {
+            return Some(dial.addr.peer_id());
+        }
+        self.conn_to_peer
+            .get(&conn_id)
+            .filter(|peer| self.established_peers.contains(*peer))
     }
 
     /// Returns the latest Identify information received for `peer_id`.

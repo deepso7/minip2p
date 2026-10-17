@@ -257,8 +257,9 @@ type StdEngine = Engine<EndpointTransport, StdEntropy, StdCarrier>;
 pub struct CloseReport {
     /// How the drain ended.
     pub outcome: CloseOutcome,
-    /// Connections still tracked when the drain ended, with their peer when
-    /// known (an inbound handshake may not have identified one yet). Empty
+    /// Connections still tracked when the drain ended, pending dials
+    /// included, with their peer when known (an inbound handshake may not
+    /// have identified one yet). Empty
     /// means no tracked teardown remains, not that peers acknowledged it.
     pub unfinished: Vec<(ConnectionId, Option<PeerId>)>,
     /// Events queued before the close and those its drain produced.
@@ -1121,7 +1122,9 @@ impl Endpoint {
     }
 
     /// Disconnects established peers, waits up to `timeout` until no
-    /// connection is tracked, and consumes the endpoint.
+    /// connection is tracked, and consumes the endpoint. A dial still
+    /// pending is tracked: the drain waits for it to fail, or to establish
+    /// and then be disconnected.
     ///
     /// The deadline bounds teardown time only, not delivery of accepted
     /// writes: QUIC discards queued writes and TCP may abort. With
@@ -3985,6 +3988,31 @@ mod tests {
         let report = dialer.close_within(Duration::ZERO);
         assert_eq!(report.outcome, CloseOutcome::DeadlineExpired);
         assert_eq!(report.unfinished, [(conn_id, Some(addr.peer_id().clone()))]);
+    }
+
+    /// A dial the transport still holds is unfinished teardown, not a drain.
+    #[test]
+    fn closing_within_zero_reports_a_pending_dial_unfinished() {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent socket");
+        let port = silent.local_addr().expect("silent addr").port();
+        let peer = Ed25519Keypair::generate().peer_id();
+        let target = PeerAddr::new(
+            format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+                .parse()
+                .expect("addr"),
+            peer.clone(),
+        )
+        .expect("peer addr");
+        let mut dialer = quic_endpoint();
+        dialer.connect(target).expect("connect");
+
+        let report = dialer.close_within(Duration::ZERO);
+        assert_eq!(report.outcome, CloseOutcome::DeadlineExpired);
+        assert!(
+            matches!(report.unfinished.as_slice(), [(_, Some(unfinished))] if *unfinished == peer),
+            "{:?}",
+            report.unfinished
+        );
     }
 
     #[cfg(feature = "nat")]

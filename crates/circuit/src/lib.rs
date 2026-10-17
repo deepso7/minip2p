@@ -1041,8 +1041,9 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     /// whatever it queued.
     ///
     /// A failure that kills the session closes the circuit before returning,
-    /// with the failure as its close reason; the caller also learns it from
-    /// the returned error.
+    /// with the failure as its close reason, and returns
+    /// [`TransportError::ConnectionClosed`] so the caller can tell its
+    /// operation ended the circuit.
     fn operate_session<R>(
         &mut self,
         id: ConnectionId,
@@ -1060,7 +1061,10 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         if let Err(Teardown(reason)) = pumped {
             let message = reason.to_string();
             self.fail_circuit(id, reason);
-            return Err(TransportError::PollError { reason: message });
+            return Err(TransportError::ConnectionClosed {
+                id,
+                reason: message,
+            });
         }
         match result {
             Ok(value) => Ok(value),
@@ -1111,7 +1115,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             Err(fatal) => {
                 let reason = fatal.to_string();
                 self.fail_circuit(id, ConnectionCloseReason::Error(reason.clone()));
-                Err(TransportError::PollError { reason })
+                Err(TransportError::ConnectionClosed { id, reason })
             }
         }
     }
