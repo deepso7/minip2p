@@ -97,6 +97,9 @@ pub struct DatagramCounters {
     pub received: u64,
     /// Total bytes of those datagrams.
     pub received_bytes: u64,
+    /// Receive calls that read those datagrams: one call reads several where
+    /// the platform batches receives or coalesces them (GRO).
+    pub receive_calls: u64,
 }
 
 #[cfg(feature = "diagnostics")]
@@ -108,6 +111,7 @@ impl DatagramCounters {
             sent_bytes: self.sent_bytes.saturating_sub(earlier.sent_bytes),
             received: self.received.saturating_sub(earlier.received),
             received_bytes: self.received_bytes.saturating_sub(earlier.received_bytes),
+            receive_calls: self.receive_calls.saturating_sub(earlier.receive_calls),
         }
     }
 }
@@ -146,6 +150,7 @@ pub fn datagram_counters(peer: &PeerId) -> DatagramCounters {
         sent_bytes: tally.sent_bytes.load(Relaxed),
         received: tally.received.load(Relaxed),
         received_bytes: tally.received_bytes.load(Relaxed),
+        receive_calls: tally.receive_calls.load(Relaxed),
     })
 }
 
@@ -177,6 +182,7 @@ struct Atomics {
     sent_bytes: AtomicU64,
     received: AtomicU64,
     received_bytes: AtomicU64,
+    receive_calls: AtomicU64,
     /// Smallest granted per direction across the identity's sockets.
     buffers: Mutex<Option<SocketBuffers>>,
 }
@@ -285,6 +291,15 @@ impl DatagramTally {
         {
             self.atomics.received.fetch_add(datagrams as u64, Relaxed);
             self.atomics.received_bytes.fetch_add(bytes as u64, Relaxed);
+        }
+    }
+
+    /// A receive call on the socket read input.
+    #[inline]
+    pub(crate) fn receive_call(&self) {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.atomics.receive_calls.fetch_add(1, Relaxed);
         }
     }
 }
