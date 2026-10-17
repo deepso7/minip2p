@@ -15,6 +15,7 @@ mod connection_state;
 mod connection_token;
 mod error;
 mod event;
+mod memory;
 #[cfg(feature = "std")]
 mod poll;
 mod set;
@@ -28,6 +29,7 @@ pub use connection_state::ConnectionState;
 pub use connection_token::ConnectionToken;
 pub use error::TransportError;
 pub use event::TransportEvent;
+pub use memory::{InvalidLimit, MemoryLedger};
 /// Stream payload type, re-exported from [`minip2p_core::Bytes`] so adapters
 /// need no extra dependency.
 pub use minip2p_core::Bytes;

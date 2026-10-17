@@ -8,7 +8,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use minip2p_core::platform::{Now, StdEntropy};
 use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_tcp::{StdTcpProvider, TcpEvent, TcpProvider, TcpTransport};
+use minip2p_tcp::{StdTcpProvider, TcpConfig, TcpEvent, TcpProvider, TcpTransport};
 use minip2p_transport::{Bytes, ConnectionId, SharedPoll, StreamId, Transport, TransportEvent};
 
 type Node = TcpTransport<StdTcpProvider, StdEntropy>;
@@ -272,12 +272,22 @@ struct UpgradedSet {
     streams: Vec<(ConnectionId, StreamId)>,
 }
 
+/// A transport without a memory budget: this bench measures poll cost per
+/// connection count, and the default budget admits fewer connections than
+/// `COUNTS` asks for. Reservations are bookkeeping only, so lifting the
+/// budget allocates nothing.
 fn node(seed: u8) -> Node {
-    TcpTransport::new(
+    let config = TcpConfig {
+        memory_budget_bytes: usize::MAX,
+        ..TcpConfig::default()
+    };
+    TcpTransport::with_config(
         StdTcpProvider::new(),
         Ed25519Keypair::from_secret_key_bytes([seed; 32]),
         StdEntropy::new(),
+        config,
     )
+    .expect("valid config")
 }
 
 fn upgraded(count: usize) -> UpgradedSet {

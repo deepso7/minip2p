@@ -278,6 +278,24 @@ fn substreams_carry_data_in_both_directions() {
 }
 
 #[test]
+fn input_longer_than_one_batch_is_split_without_losing_a_byte() {
+    // Several Noise frames in one input, cut into `MAX_INPUT_BATCH` pieces
+    // that straddle frame boundaries.
+    let (mut dialer, mut listener, _, _) = upgraded_pair();
+    let stream = dialer.open_stream().expect("open substream");
+    let payload: Vec<u8> = (0..200 * 1024_usize).map(|i| (i % 251) as u8).collect();
+    dialer
+        .send(stream, Bytes::from(payload.clone()))
+        .expect("fits the send cap");
+    let batch = take_writes(&mut dialer);
+    assert!(batch.len() > 3 * minip2p_secure_mux::MAX_INPUT_BATCH);
+
+    listener.handle_input(batch).expect("one large input");
+    let events: Vec<SessionOutput> = core::iter::from_fn(|| listener.poll_output()).collect();
+    assert_eq!(stream_payloads(&events).concat(), payload);
+}
+
+#[test]
 fn half_close_and_reset_reach_the_remote() {
     let (mut dialer, mut listener, _, _) = upgraded_pair();
 
@@ -489,10 +507,10 @@ fn a_session_that_fails_mid_batch_is_dead_and_stays_dead() {
     let dialer_key = Ed25519Keypair::generate();
     let listener_key = Ed25519Keypair::generate();
 
-    // The dialer refuses frames larger than 64 bytes; the listener, on default
-    // limits, will pipeline a much larger one.
+    // The dialer has no reserve for peer-provoked replies, so the listener's
+    // pipelined keepalive ping is fatal to it.
     let strict = YamuxConfig {
-        max_frame_len: 64,
+        max_pending_control: 0,
         ..YamuxConfig::default()
     };
     let mut dialer = session_with(
@@ -508,16 +526,16 @@ fn a_session_that_fails_mid_batch_is_dead_and_stays_dead() {
     // Drive until the listener is up, leaving its confirmation unread.
     drive_until_listener_established(&mut dialer, &mut listener);
 
-    let stream = listener.open_stream().expect("open substream");
+    listener.poll(Now::from_millis(0)).expect("arm keepalive");
     listener
-        .send(stream, Bytes::from(vec![0u8; 4096]))
-        .expect("queue an oversized frame");
+        .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+        .expect("queue a ping");
 
     let result = dialer.handle_input(take_writes(&mut listener));
 
     assert!(
         matches!(result, Err(SessionError::Protocol(_))),
-        "an oversized frame must fail the session: {result:?}"
+        "an unanswerable ping must fail the session: {result:?}"
     );
     assert!(
         !dialer.is_established(),

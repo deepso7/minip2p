@@ -34,6 +34,7 @@ fn node(net: &VirtualNetwork, key: Ed25519Keypair, seed: u8) -> Node {
 
 fn node_with(net: &VirtualNetwork, key: Ed25519Keypair, seed: u8, config: TcpConfig) -> Node {
     TcpTransport::with_config(net.provider(), key, CountingEntropy(seed), config)
+        .expect("valid config")
 }
 
 /// Polls both nodes until the network goes quiet, collecting every event.
@@ -981,7 +982,8 @@ fn an_inbound_connection_that_cannot_be_secured_goes_where_it_stands() {
         listener_key,
         FlakyEntropy::new(1, 20),
         TcpConfig::default(),
-    );
+    )
+    .expect("valid config");
     listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
 
     let target = PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("dial target");
@@ -1604,4 +1606,242 @@ fn a_closed_connection_keeps_its_slot_until_its_delivered_bytes_settle() {
         .reset_stream(second, held)
         .expect("abandoning after close settles");
     assert!(churn_once(&net, &mut dialer, &mut listener).is_some());
+}
+
+/// A config whose budget fits one connection with `streams` streams.
+fn budget_for(streams: usize) -> TcpConfig {
+    let config = TcpConfig::default();
+    TcpConfig {
+        memory_budget_bytes: config.connection_reservation_bytes()
+            + streams * config.stream_reservation_bytes(),
+        ..config
+    }
+}
+
+fn budget_exhausted(result: &Result<impl core::fmt::Debug, TransportError>) -> bool {
+    matches!(
+        result,
+        Err(TransportError::ResourceExhausted {
+            resource: "TCP memory budget"
+        })
+    )
+}
+
+#[test]
+fn a_dial_past_the_memory_budget_is_refused_until_the_connection_ends() {
+    let net = VirtualNetwork::new();
+    let second_addr = addr("/ip4/127.0.0.1/tcp/4002");
+    let mut listener = node(&net, identity(2), 20);
+    listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
+    listener.listen(&second_addr).expect("listener binds again");
+    let mut dialer = node_with(&net, identity(1), 10, budget_for(1));
+    let fixed = TcpConfig::default().connection_reservation_bytes();
+    let target = |address: &Multiaddr| {
+        PeerAddr::new(address.clone(), identity(2).peer_id()).expect("target")
+    };
+
+    let first = dialer.dial(&target(&addr(LISTEN_ADDR))).expect("fits");
+    assert_eq!(dialer.memory_reserved(), fixed);
+    let refused = dialer.dial(&target(&second_addr));
+    assert!(budget_exhausted(&refused), "{refused:?}");
+    assert_eq!(
+        dialer.connection_ids(),
+        [first],
+        "a refused dial leaves nothing"
+    );
+
+    let _ = drive(&net, &mut dialer, &mut listener);
+    dialer.close(first).expect("close");
+    assert_eq!(
+        dialer.memory_reserved(),
+        0,
+        "teardown releases the fixed part"
+    );
+    dialer
+        .dial(&target(&second_addr))
+        .expect("admitted again once released");
+}
+
+#[test]
+fn an_inbound_connection_past_the_memory_budget_is_aborted_at_accept() {
+    let net = VirtualNetwork::new();
+    let mut listener = node_with(&net, identity(2), 20, budget_for(1));
+    listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
+    let target = PeerAddr::new(addr(LISTEN_ADDR), identity(2).peer_id()).expect("target");
+    let mut first = node(&net, identity(1), 10);
+    let mut second = node(&net, identity(3), 30);
+    first.dial(&target).expect("dial");
+    let (_, admitted) = drive(&net, &mut first, &mut listener);
+    second.dial(&target).expect("dial");
+    let (refused, shed) = drive(&net, &mut second, &mut listener);
+
+    assert!(
+        admitted
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Connected { .. }))
+    );
+    assert!(
+        !shed
+            .iter()
+            .any(|event| matches!(event, TransportEvent::IncomingConnection { .. })),
+        "nothing is announced about a shed connection: {shed:?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Closed { .. }))
+    );
+    assert_eq!(listener.connection_ids().len(), 1);
+}
+
+#[test]
+fn an_open_past_the_memory_budget_is_refused_until_a_stream_settles() {
+    let mut pair = upgraded_pair_with(budget_for(1), TcpConfig::default());
+    let id = pair.connection;
+    let first = pair.dialer.open_stream(id).expect("one stream fits");
+    let refused = pair.dialer.open_stream(id);
+    assert!(budget_exhausted(&refused), "{refused:?}");
+
+    pair.dialer.reset_stream(id, first).expect("reset");
+    pair.dialer.open_stream(id).expect("the reset released it");
+}
+
+#[test]
+fn an_inbound_stream_past_the_memory_budget_is_reset() {
+    let mut pair = upgraded_pair_with(TcpConfig::default(), budget_for(1));
+    let id = pair.connection;
+    let streams = [
+        pair.dialer.open_stream(id).expect("open"),
+        pair.dialer.open_stream(id).expect("open"),
+    ];
+    for stream in streams {
+        pair.dialer
+            .send_stream(id, stream, Bytes::from_static(b"x"))
+            .expect("send");
+    }
+    let (dialer_events, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    let incoming = listener_events
+        .iter()
+        .filter(|event| matches!(event, TransportEvent::IncomingStream { .. }))
+        .count();
+    assert_eq!(incoming, 1, "{listener_events:?}");
+    assert!(
+        dialer_events.contains(&TransportEvent::StreamClosed {
+            id,
+            stream_id: streams[1]
+        }),
+        "the refused stream is reset: {dialer_events:?}"
+    );
+
+    // Settling the admitted stream -- its byte acknowledged, then reset --
+    // readmits the next one.
+    let (listener_id, admitted) = listener_events
+        .iter()
+        .find_map(|event| match event {
+            TransportEvent::StreamData { id, stream_id, .. } => Some((*id, *stream_id)),
+            _ => None,
+        })
+        .expect("the admitted stream delivered");
+    pair.listener
+        .ack_stream(listener_id, admitted, 1)
+        .expect("ack");
+    pair.dialer.reset_stream(id, streams[0]).expect("reset");
+    let _ = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    let next = pair.dialer.open_stream(id).expect("open");
+    pair.dialer
+        .send_stream(id, next, Bytes::from_static(b"x"))
+        .expect("send");
+    let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    assert!(
+        listener_events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::IncomingStream { .. })),
+        "admitted once the first settled: {listener_events:?}"
+    );
+}
+
+#[test]
+fn stream_reservations_outlive_their_connection_and_settle_exactly_once() {
+    let mut pair = upgraded_pair();
+    let config = TcpConfig::default();
+    let (fixed, stream) = (
+        config.connection_reservation_bytes(),
+        config.stream_reservation_bytes(),
+    );
+    let id = pair.connection;
+    let held = pair.dialer.open_stream(id).expect("open");
+    let idle = pair.dialer.open_stream(id).expect("open");
+    for stream_id in [held, idle] {
+        pair.dialer
+            .send_stream(id, stream_id, Bytes::from_static(b"held"))
+            .expect("send");
+    }
+    let (_, events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    let listener_id = pair.listener.connection_ids()[0];
+    let delivered: Vec<StreamId> = events
+        .iter()
+        .filter_map(|event| match event {
+            TransportEvent::StreamData { stream_id, .. } => Some(*stream_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered, [held, idle]);
+    pair.listener
+        .ack_stream(listener_id, idle, 4)
+        .expect("ack the idle stream");
+    assert_eq!(pair.listener.memory_reserved(), fixed + 2 * stream);
+
+    pair.dialer.close(id).expect("close");
+    let _ = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    assert!(pair.listener.connection_ids().is_empty());
+    assert_eq!(
+        pair.listener.memory_reserved(),
+        stream,
+        "only the unacknowledged stream keeps its window"
+    );
+
+    pair.listener
+        .ack_stream(listener_id, held, 2)
+        .expect("partial");
+    assert_eq!(
+        pair.listener.memory_reserved(),
+        stream,
+        "partial releases nothing"
+    );
+    pair.listener
+        .ack_stream(listener_id, held, 2)
+        .expect("final");
+    assert_eq!(pair.listener.memory_reserved(), 0);
+    pair.listener
+        .ack_stream(listener_id, held, 0)
+        .expect("no-op");
+    assert!(
+        matches!(
+            pair.listener.reset_stream(listener_id, held),
+            Err(TransportError::ConnectionNotFound { .. })
+        ),
+        "the settled connection is gone"
+    );
+    assert_eq!(pair.listener.memory_reserved(), 0, "released once");
+}
+
+#[test]
+fn a_budget_too_small_for_one_connection_and_stream_is_rejected() {
+    let config = budget_for(1);
+    let small = TcpConfig {
+        memory_budget_bytes: config.memory_budget_bytes - 1,
+        ..config.clone()
+    };
+    let error = small.validate().expect_err("one byte short");
+    assert_eq!(error.field, "TcpConfig::memory_budget_bytes");
+    config
+        .validate()
+        .expect("one connection and one stream fit");
+    let zero_outbound = TcpConfig {
+        max_buffered_send: 0,
+        ..config
+    };
+    zero_outbound
+        .validate()
+        .expect("a zero outbound cap stays valid");
 }

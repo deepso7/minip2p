@@ -50,6 +50,8 @@ use std::time::Duration;
 
 #[cfg(feature = "discovery")]
 use crate::BeaconConfig;
+#[cfg(feature = "nat")]
+use crate::CircuitLimits;
 #[cfg(feature = "pubsub")]
 use crate::GossipsubConfig;
 #[cfg(feature = "pubsub")]
@@ -1227,6 +1229,8 @@ pub struct EndpointBuilder {
     #[cfg(feature = "nat")]
     nat_config: Option<NatConfig>,
     #[cfg(feature = "nat")]
+    circuit_limits: CircuitLimits,
+    #[cfg(feature = "nat")]
     relays: Vec<PeerAddr>,
     #[cfg(feature = "nat")]
     autonat_servers: Vec<PeerAddr>,
@@ -1265,6 +1269,8 @@ impl Default for EndpointBuilder {
             relay_server_announce_addrs: Vec::new(),
             #[cfg(feature = "nat")]
             nat_config: None,
+            #[cfg(feature = "nat")]
+            circuit_limits: CircuitLimits::default(),
             #[cfg(feature = "nat")]
             relays: Vec::new(),
             #[cfg(feature = "nat")]
@@ -1322,11 +1328,22 @@ impl EndpointBuilder {
         self
     }
 
-    /// Overrides TCP connection, buffer, and timeout limits, and the
-    /// connection-id namespace the TCP transport allocates in.
+    /// Overrides TCP connection, buffer, and timeout limits, the TCP
+    /// memory budget, and the connection-id namespace the TCP transport
+    /// allocates in. Checked at bind
+    /// ([`EndpointOptionsError::InvalidLimit`]).
     #[cfg(feature = "tcp")]
     pub fn tcp_config(mut self, config: TcpConfig) -> Self {
         self.tcp_config = config;
+        self
+    }
+
+    /// Overrides the relay circuits' Yamux limits and circuit memory budget
+    /// (ADR 0021). Checked at bind
+    /// ([`EndpointOptionsError::InvalidLimit`]).
+    #[cfg(feature = "nat")]
+    pub fn circuit_limits(mut self, limits: CircuitLimits) -> Self {
+        self.circuit_limits = limits;
         self
     }
 
@@ -1838,7 +1855,8 @@ fn bind_tcp_member(
         keypair.clone(),
         StdEntropy::new(),
         options.tcp_config.clone(),
-    );
+    )
+    .map_err(EndpointOptionsError::InvalidLimit)?;
     for addr in tcp_addrs {
         // Bound here, like a QUIC socket is: `Endpoint::listen` then listens
         // on what is already bound, and a caller that asked for port 0 learns
@@ -1913,7 +1931,13 @@ pub(crate) fn build_endpoint(
         }
     }
     #[cfg(feature = "nat")]
-    let mut transport = minip2p_circuit::CircuitTransport::new_os(transport, keypair.clone());
+    let mut transport = minip2p_circuit::CircuitTransport::with_limits(
+        transport,
+        keypair.clone(),
+        StdEntropy::new(),
+        options.circuit_limits.clone(),
+    )
+    .map_err(EndpointOptionsError::InvalidLimit)?;
     #[cfg(not(feature = "nat"))]
     let mut transport = transport;
     let mut poll = SharedPoll::new()
@@ -2182,6 +2206,8 @@ mod tests {
     use crate::NatEvent;
     use crate::SwarmEvent;
     use crate::{ConnectFailure, ConnectOutcome};
+    #[cfg(any(feature = "tcp", feature = "nat"))]
+    use minip2p_transport::InvalidLimit;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -3144,6 +3170,58 @@ mod tests {
         // anything answers is beside the point.
         let id = endpoint.core_mut().dial(&target).expect("the dial starts");
         assert_eq!(id.namespace(), ConnectionNamespace::TCP_IPV6);
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn a_tcp_budget_that_cannot_admit_a_connection_is_refused_at_bind() {
+        let Err(error) = Endpoint::builder()
+            .tcp_config(TcpConfig {
+                memory_budget_bytes: 0,
+                ..TcpConfig::default()
+            })
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
+            .bind()
+        else {
+            panic!("a zero budget admits nothing");
+        };
+        assert!(
+            matches!(
+                error,
+                BindError::Options(EndpointOptionsError::InvalidLimit(InvalidLimit {
+                    field: "TcpConfig::memory_budget_bytes",
+                    ..
+                }))
+            ),
+            "got {error}"
+        );
+    }
+
+    #[cfg(all(feature = "nat", feature = "quic"))]
+    #[test]
+    fn circuit_limits_that_cannot_admit_a_circuit_are_refused_at_bind() {
+        let Err(error) = Endpoint::builder()
+            .circuit_limits(CircuitLimits {
+                memory_budget_bytes: 0,
+                ..CircuitLimits::default()
+            })
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+        else {
+            panic!("a zero circuit budget admits nothing");
+        };
+        assert!(
+            matches!(
+                error,
+                BindError::Options(EndpointOptionsError::InvalidLimit(InvalidLimit {
+                    field: "CircuitLimits::memory_budget_bytes",
+                    ..
+                }))
+            ),
+            "got {error}"
+        );
     }
 
     #[cfg(feature = "tcp")]

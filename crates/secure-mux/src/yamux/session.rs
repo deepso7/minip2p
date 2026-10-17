@@ -4,6 +4,7 @@ use core::ops::Bound;
 
 use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Bytes, retain_slice};
+use minip2p_transport::MemoryLedger;
 
 use crate::yamux::{
     DEFAULT_RECEIVE_WINDOW, FLAG_ACK, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, FrameType,
@@ -206,6 +207,13 @@ pub struct YamuxSession {
     /// Closed streams still holding unacknowledged bytes, by stream id. Each
     /// keeps a stream slot until those bytes are acknowledged.
     unsettled: BTreeMap<u32, u32>,
+    /// Streams the owner's ledger still charges for: those it admitted, less
+    /// those [`take_settled_streams`](Self::take_settled_streams) reported.
+    charged: usize,
+    /// The ledger [`handle_data`](Self::handle_data) and
+    /// [`open_stream`](Self::open_stream) lend when run without a budget, so
+    /// reservations and releases still meet one ledger.
+    unbudgeted: MemoryLedger,
     next_stream_id: Option<u32>,
     /// Stream events for [`poll_event`](Self::poll_event).
     events: VecDeque<YamuxOutput>,
@@ -248,26 +256,7 @@ impl YamuxSession {
 
     /// Creates a session with explicit resource limits.
     pub fn with_config(role: YamuxRole, config: YamuxConfig) -> Result<Self, YamuxError> {
-        if config.receive_window < DEFAULT_RECEIVE_WINDOW {
-            return Err(YamuxError::InvalidConfig(
-                "receive_window is below Yamux's initial 256 KiB credit",
-            ));
-        }
-        if config.max_frame_len == 0 {
-            return Err(YamuxError::InvalidConfig(
-                "max_frame_len must be greater than zero",
-            ));
-        }
-        if config.max_buffered_send == 0 || config.max_total_buffered_send == 0 {
-            return Err(YamuxError::InvalidConfig(
-                "send caps must be greater than zero",
-            ));
-        }
-        if config.max_total_buffered_send <= config.control_stream_reserve {
-            return Err(YamuxError::InvalidConfig(
-                "max_total_buffered_send must be greater than control_stream_reserve",
-            ));
-        }
+        config.validate().map_err(YamuxError::InvalidConfig)?;
         Ok(Self::from_validated_config(role, config))
     }
 
@@ -280,10 +269,13 @@ impl YamuxSession {
         });
         Self {
             role,
-            decoder: FrameDecoder::new(config.max_frame_len),
+            // A peer may frame up to the credit it was granted.
+            decoder: FrameDecoder::new(config.receive_window),
             config,
             streams: BTreeMap::new(),
             unsettled: BTreeMap::new(),
+            charged: 0,
+            unbudgeted: MemoryLedger::unbounded(),
             next_stream_id,
             events: VecDeque::new(),
             control: VecDeque::new(),
@@ -346,12 +338,25 @@ impl YamuxSession {
     /// The first data/control frame carries `SYN`; if nothing is sent before
     /// the caller pulls frames, [`YamuxSession::poll_frame`] emits a
     /// standalone window-update frame carrying `SYN`.
+    ///
+    /// Runs without a memory budget; an owner with one uses
+    /// [`open_stream_within`](Self::open_stream_within).
     pub fn open_stream(&mut self) -> Result<u32, YamuxError> {
+        self.unbudgeted(Self::open_stream_within)
+    }
+
+    /// Opens a local stream, reserving its receive window in the owner's
+    /// `ledger` first: one that does not fit is
+    /// [`YamuxError::BudgetExhausted`], and nothing is opened.
+    pub fn open_stream_within(&mut self, ledger: &mut MemoryLedger) -> Result<u32, YamuxError> {
         self.ensure_active()?;
         if self.slots_full() {
             return Err(YamuxError::TooManyStreams);
         }
         let stream = self.next_stream_id.ok_or(YamuxError::StreamsExhausted)?;
+        if !self.admit(ledger) {
+            return Err(YamuxError::BudgetExhausted);
+        }
         self.next_stream_id = stream.checked_add(2);
         self.streams
             .insert(stream, StreamState::outbound(&self.config));
@@ -530,7 +535,36 @@ impl YamuxSession {
     /// follow for tracked streams. A caller must therefore tolerate
     /// [`YamuxOutput::StreamClosed`] for a stream whose queued
     /// [`YamuxOutput::IncomingStream`] was discarded.
+    ///
+    /// Runs without a memory budget; an owner with one uses
+    /// [`handle_data_within`](Self::handle_data_within).
     pub fn handle_data(&mut self, bytes: &[u8]) -> Result<(), YamuxError> {
+        self.unbudgeted(|session, ledger| session.handle_data_within(bytes, ledger))
+    }
+
+    /// Runs `operation` with the session's own unbounded ledger. A session
+    /// runs either without a budget or with its owner's, never both.
+    fn unbudgeted<R>(&mut self, operation: impl FnOnce(&mut Self, &mut MemoryLedger) -> R) -> R {
+        let mut ledger = core::mem::replace(&mut self.unbudgeted, MemoryLedger::unbounded());
+        let result = operation(self, &mut ledger);
+        self.unbudgeted = ledger;
+        result
+    }
+
+    /// Feeds ordered bytes, admitting each inbound stream against the
+    /// owner's `ledger` before any state or credit exists for it.
+    ///
+    /// A stream whose receive window does not fit is reset, as one past
+    /// [`YamuxConfig::max_streams`] is. Admitted streams stay charged until
+    /// they settle: an admission returns the windows of streams settled
+    /// since the last report to `ledger` first, and
+    /// [`take_settled_streams`](Self::take_settled_streams) reports the rest.
+    /// Lend the same ledger to every call.
+    pub fn handle_data_within(
+        &mut self,
+        bytes: &[u8],
+        ledger: &mut MemoryLedger,
+    ) -> Result<(), YamuxError> {
         if self.failed {
             return Err(YamuxError::Failed);
         }
@@ -544,7 +578,7 @@ impl YamuxSession {
                 Ok(None) => return Ok(()),
                 Err(error) => return self.fail_protocol(error),
             };
-            if let Err(error) = self.process_frame(frame) {
+            if let Err(error) = self.process_frame(frame, ledger) {
                 return self.fail_protocol(error);
             }
             self.dirty = true;
@@ -634,9 +668,41 @@ impl YamuxSession {
             .map(|(stream, unacked)| (stream, unacked as usize))
     }
 
+    /// Streams holding a slot, open or closed but unsettled: each holds its
+    /// receive window in the owner's ledger.
+    pub fn held_streams(&self) -> usize {
+        self.streams.len() + self.unsettled.len()
+    }
+
+    /// How many streams settled since the last call, each exactly once,
+    /// whatever ended it: a close or reset, the last acknowledgement, a
+    /// GoAway or a session failure. The owner releases one receive window
+    /// from its ledger for each.
+    pub fn take_settled_streams(&mut self) -> usize {
+        let held = self.held_streams();
+        let settled = self.charged.saturating_sub(held);
+        self.charged = held;
+        settled
+    }
+
+    /// Reserves one stream's receive window in `ledger`, if it fits.
+    ///
+    /// Streams settled since the last report give their windows back to
+    /// `ledger` first, so a stream that settled earlier in the same input
+    /// frees room for the next; [`take_settled_streams`](Self::take_settled_streams)
+    /// then reports only later settlements. The owner must lend the same
+    /// ledger every time.
+    fn admit(&mut self, ledger: &mut MemoryLedger) -> bool {
+        let window = self.config.receive_window as usize;
+        ledger.release(self.take_settled_streams() * window);
+        let admitted = ledger.reserve(window);
+        self.charged += usize::from(admitted);
+        admitted
+    }
+
     /// Whether open and unsettled streams fill every stream slot.
     fn slots_full(&self) -> bool {
-        self.streams.len() + self.unsettled.len() >= self.config.max_streams
+        self.held_streams() >= self.config.max_streams
     }
 
     /// Returns aggregate accepted bytes not yet pulled as frames.
@@ -664,10 +730,10 @@ impl YamuxSession {
         }
     }
 
-    fn process_frame(&mut self, frame: Frame) -> Result<(), YamuxError> {
+    fn process_frame(&mut self, frame: Frame, ledger: &mut MemoryLedger) -> Result<(), YamuxError> {
         match frame.frame_type() {
-            FrameType::Data => self.on_data(frame),
-            FrameType::WindowUpdate => self.on_window_update(frame),
+            FrameType::Data => self.on_data(frame, ledger),
+            FrameType::WindowUpdate => self.on_window_update(frame, ledger),
             FrameType::Ping => self.on_ping(frame),
             FrameType::GoAway => {
                 self.remote_go_away = true;
@@ -680,7 +746,7 @@ impl YamuxSession {
         }
     }
 
-    fn on_data(&mut self, frame: Frame) -> Result<(), YamuxError> {
+    fn on_data(&mut self, frame: Frame, ledger: &mut MemoryLedger) -> Result<(), YamuxError> {
         let stream = frame.stream_id();
         let flags = frame.flags();
         if flags & FLAG_RST != 0 {
@@ -697,7 +763,7 @@ impl YamuxSession {
             if self.streams.contains_key(&stream) || self.unsettled.contains_key(&stream) {
                 return Err(YamuxError::Protocol("duplicate SYN for an existing stream"));
             }
-            if self.slots_full() {
+            if self.slots_full() || !self.admit(ledger) {
                 return self.queue_reset_for_unknown(stream);
             }
             self.streams.insert(
@@ -757,7 +823,11 @@ impl YamuxSession {
         Ok(())
     }
 
-    fn on_window_update(&mut self, frame: Frame) -> Result<(), YamuxError> {
+    fn on_window_update(
+        &mut self,
+        frame: Frame,
+        ledger: &mut MemoryLedger,
+    ) -> Result<(), YamuxError> {
         let stream = frame.stream_id();
         let flags = frame.flags();
         if flags & FLAG_RST != 0 {
@@ -774,12 +844,12 @@ impl YamuxSession {
             if self.streams.contains_key(&stream) || self.unsettled.contains_key(&stream) {
                 return Err(YamuxError::Protocol("duplicate SYN for an existing stream"));
             }
-            if self.slots_full() {
-                return self.queue_reset_for_unknown(stream);
-            }
             let send_window = DEFAULT_RECEIVE_WINDOW
                 .checked_add(frame.value())
                 .ok_or(YamuxError::WindowOverflow { stream })?;
+            if self.slots_full() || !self.admit(ledger) {
+                return self.queue_reset_for_unknown(stream);
+            }
             self.streams
                 .insert(stream, StreamState::inbound(&self.config, send_window));
             self.events
@@ -1091,6 +1161,7 @@ mod tests {
     use super::*;
     use crate::yamux::KEEPALIVE_INTERVAL_MS;
     use minip2p_core::platform::{Deadline, Now};
+    use minip2p_transport::MemoryLedger;
 
     fn outbound(session: &mut YamuxSession) -> Vec<u8> {
         session.poll_frame().expect("outbound Yamux frame")
@@ -1102,8 +1173,22 @@ mod tests {
         decoder.next_frame().unwrap().unwrap()
     }
 
+    /// A session with the specification's 256 KiB window, which most tests
+    /// assume: no window update is owed before a stream's first data.
+    fn spec_session(role: YamuxRole) -> YamuxSession {
+        YamuxSession::with_config(role, spec_config()).unwrap()
+    }
+
+    fn spec_config() -> YamuxConfig {
+        YamuxConfig {
+            receive_window: DEFAULT_RECEIVE_WINDOW,
+            ..YamuxConfig::default()
+        }
+    }
+
     fn config() -> YamuxConfig {
         YamuxConfig {
+            receive_window: DEFAULT_RECEIVE_WINDOW,
             max_streams: 8,
             max_buffered_send: DEFAULT_RECEIVE_WINDOW as usize,
             max_total_buffered_send: DEFAULT_RECEIVE_WINDOW as usize * 2,
@@ -1115,8 +1200,8 @@ mod tests {
 
     #[test]
     fn clients_use_odd_ids_and_servers_use_even_ids() {
-        let mut client = YamuxSession::new(YamuxRole::Client);
-        let mut server = YamuxSession::new(YamuxRole::Server);
+        let mut client = spec_session(YamuxRole::Client);
+        let mut server = spec_session(YamuxRole::Server);
         assert_eq!(client.open_stream().unwrap(), 1);
         assert_eq!(client.open_stream().unwrap(), 3);
         assert_eq!(server.open_stream().unwrap(), 2);
@@ -1125,8 +1210,8 @@ mod tests {
 
     #[test]
     fn remote_stream_ids_exclude_the_reserved_session_id() {
-        let client = YamuxSession::new(YamuxRole::Client);
-        let server = YamuxSession::new(YamuxRole::Server);
+        let client = spec_session(YamuxRole::Client);
+        let server = spec_session(YamuxRole::Server);
 
         assert!(!client.valid_remote_stream_id(0));
         assert!(client.valid_remote_stream_id(2));
@@ -1138,8 +1223,8 @@ mod tests {
 
     #[test]
     fn syn_and_ack_piggyback_on_first_data_frames() {
-        let mut client = YamuxSession::new(YamuxRole::Client);
-        let mut server = YamuxSession::new(YamuxRole::Server);
+        let mut client = spec_session(YamuxRole::Client);
+        let mut server = spec_session(YamuxRole::Server);
         let stream = client.open_stream().unwrap();
         client.send(stream, Bytes::from(b"hello".to_vec())).unwrap();
         let opening = outbound(&mut client);
@@ -1172,8 +1257,8 @@ mod tests {
 
     #[test]
     fn server_opened_stream_completes_a_bidirectional_lifecycle() {
-        let mut client = YamuxSession::new(YamuxRole::Client);
-        let mut server = YamuxSession::new(YamuxRole::Server);
+        let mut client = spec_session(YamuxRole::Client);
+        let mut server = spec_session(YamuxRole::Server);
         let stream = server.open_stream().unwrap();
         server
             .send(stream, Bytes::from(b"request".to_vec()))
@@ -1228,8 +1313,8 @@ mod tests {
 
     #[test]
     fn idle_open_and_accept_emit_standalone_control_frames() {
-        let mut client = YamuxSession::new(YamuxRole::Client);
-        let mut server = YamuxSession::new(YamuxRole::Server);
+        let mut client = spec_session(YamuxRole::Client);
+        let mut server = spec_session(YamuxRole::Server);
         let stream = client.open_stream().unwrap();
         let syn = outbound(&mut client);
         let frame = decode(&syn);
@@ -1706,8 +1791,8 @@ mod tests {
 
     #[test]
     fn inbound_events_do_not_wait_behind_unpulled_frames() {
-        let mut client = YamuxSession::new(YamuxRole::Client);
-        let mut server = YamuxSession::new(YamuxRole::Server);
+        let mut client = spec_session(YamuxRole::Client);
+        let mut server = spec_session(YamuxRole::Server);
         let stream = client.open_stream().unwrap();
         client.send(stream, Bytes::from_static(b"hi")).unwrap();
         server.handle_data(&outbound(&mut client)).unwrap();
@@ -2012,16 +2097,16 @@ mod tests {
 
     #[test]
     fn receive_window_violation_emits_protocol_go_away() {
-        let mut server = YamuxSession::new(YamuxRole::Server);
-        let oversized = Frame::data(
-            1,
-            FLAG_SYN,
-            alloc::vec![0; DEFAULT_RECEIVE_WINDOW as usize + 1],
-        )
-        .unwrap()
-        .encode();
+        // Each frame fits the decoder's limit; together they exceed the
+        // stream's credit.
+        let mut server = spec_session(YamuxRole::Server);
+        let full = Frame::data(1, FLAG_SYN, alloc::vec![0; DEFAULT_RECEIVE_WINDOW as usize])
+            .unwrap()
+            .encode();
+        server.handle_data(&full).unwrap();
+        let over = Frame::data(1, 0, alloc::vec![0; 1]).unwrap().encode();
         assert_eq!(
-            server.handle_data(&oversized),
+            server.handle_data(&over),
             Err(YamuxError::ReceiveWindowExceeded { stream: 1 })
         );
         let go_away = decode(&outbound(&mut server));
@@ -2032,7 +2117,7 @@ mod tests {
 
     #[test]
     fn non_empty_data_after_remote_fin_is_a_protocol_error() {
-        let mut server = YamuxSession::new(YamuxRole::Server);
+        let mut server = spec_session(YamuxRole::Server);
         server
             .handle_data(
                 &Frame::data(1, FLAG_SYN | FLAG_FIN, b"final".to_vec())
@@ -2078,7 +2163,7 @@ mod tests {
 
     #[test]
     fn coalesced_data_cannot_spend_unadvertised_window_credit() {
-        let mut server = YamuxSession::new(YamuxRole::Server);
+        let mut server = spec_session(YamuxRole::Server);
         let first_len = DEFAULT_RECEIVE_WINDOW / 2 + 1;
         let second_len = DEFAULT_RECEIVE_WINDOW - first_len + 1;
         let mut coalesced = Frame::data(1, FLAG_SYN, alloc::vec![1; first_len as usize])
@@ -2101,7 +2186,7 @@ mod tests {
 
     #[test]
     fn ping_is_echoed_and_go_away_closes_streams() {
-        let mut session = YamuxSession::new(YamuxRole::Client);
+        let mut session = spec_session(YamuxRole::Client);
         let stream = session.open_stream().unwrap();
         session
             .handle_data(&Frame::ping(FLAG_SYN, 42).unwrap().encode())
@@ -2124,7 +2209,7 @@ mod tests {
 
     #[test]
     fn quiet_session_sends_ping_after_keepalive_interval() {
-        let mut session = YamuxSession::new(YamuxRole::Client);
+        let mut session = spec_session(YamuxRole::Client);
         session.poll(Now::from_millis(0)).unwrap();
         assert_eq!(session.poll_output(), None, "nothing is due at t=0");
 
@@ -2149,7 +2234,7 @@ mod tests {
 
     #[test]
     fn inbound_traffic_defers_the_keepalive_ping() {
-        let mut session = YamuxSession::new(YamuxRole::Server);
+        let mut session = spec_session(YamuxRole::Server);
         session.poll(Now::from_millis(0)).unwrap();
 
         session
@@ -2178,7 +2263,7 @@ mod tests {
 
     #[test]
     fn outbound_traffic_defers_the_keepalive_ping() {
-        let mut session = YamuxSession::new(YamuxRole::Client);
+        let mut session = spec_session(YamuxRole::Client);
         session.poll(Now::from_millis(0)).unwrap();
         let stream = session.open_stream().unwrap();
         session
@@ -2198,7 +2283,7 @@ mod tests {
 
     #[test]
     fn next_deadline_is_the_keepalive_interval_after_the_first_poll() {
-        let mut session = YamuxSession::new(YamuxRole::Client);
+        let mut session = spec_session(YamuxRole::Client);
         assert_eq!(
             session.next_deadline(),
             None,
@@ -2223,7 +2308,7 @@ mod tests {
 
     #[test]
     fn a_closed_session_does_not_keepalive() {
-        let mut session = YamuxSession::new(YamuxRole::Client);
+        let mut session = spec_session(YamuxRole::Client);
         session.poll(Now::from_millis(0)).unwrap();
         session.go_away(0);
         let _ = outbound(&mut session);
@@ -2238,7 +2323,7 @@ mod tests {
 
     #[test]
     fn rst_before_ack_surfaces_stream_closed() {
-        let mut client = YamuxSession::new(YamuxRole::Client);
+        let mut client = spec_session(YamuxRole::Client);
         let stream = client.open_stream().unwrap();
         client
             .handle_data(&Frame::data(stream, FLAG_RST, Vec::new()).unwrap().encode())
@@ -2247,5 +2332,233 @@ mod tests {
             client.poll_output(),
             Some(YamuxOutput::StreamClosed { stream })
         );
+    }
+
+    /// A ledger with room for exactly `streams` default receive windows.
+    fn ledger_for(streams: usize) -> MemoryLedger {
+        MemoryLedger::new(DEFAULT_RECEIVE_WINDOW as usize * streams)
+    }
+
+    #[test]
+    fn an_inbound_stream_that_does_not_fit_the_ledger_is_reset_in_either_syn_form() {
+        let mut ledger = ledger_for(1);
+        let mut client = spec_session(YamuxRole::Client);
+        let data_syn = Frame::data(2, FLAG_SYN, b"hi".to_vec()).unwrap().encode();
+        let update_syn = Frame::window_update(4, FLAG_SYN, 0).unwrap().encode();
+
+        client.handle_data_within(&data_syn, &mut ledger).unwrap();
+        assert_eq!(
+            client.poll_event(),
+            Some(YamuxOutput::IncomingStream { stream: 2 })
+        );
+        client.poll_events();
+        assert!(!ledger.fits(1), "the stream holds its whole window");
+
+        client.handle_data_within(&update_syn, &mut ledger).unwrap();
+        assert_eq!(client.poll_events(), [], "no state for a refused stream");
+        let reset = decode(&outbound(&mut client));
+        assert_eq!((reset.stream_id(), reset.flags()), (4, FLAG_RST));
+
+        let data_syn = Frame::data(6, FLAG_SYN, b"hi".to_vec()).unwrap().encode();
+        client.handle_data_within(&data_syn, &mut ledger).unwrap();
+        assert_eq!(client.poll_events(), []);
+        assert_eq!(decode(&outbound(&mut client)).flags(), FLAG_RST);
+
+        // Settling the admitted stream frees room for the next one.
+        client.reset(2).unwrap();
+        client.poll_events();
+        ledger.release(client.take_settled_streams() * DEFAULT_RECEIVE_WINDOW as usize);
+        let update_syn = Frame::window_update(8, FLAG_SYN, 0).unwrap().encode();
+        client.handle_data_within(&update_syn, &mut ledger).unwrap();
+        assert_eq!(
+            client.poll_event(),
+            Some(YamuxOutput::IncomingStream { stream: 8 })
+        );
+    }
+
+    #[test]
+    fn a_stream_settled_earlier_in_the_same_input_frees_room_for_the_next() {
+        let mut ledger = ledger_for(1);
+        let mut client = spec_session(YamuxRole::Client);
+        let open = Frame::window_update(2, FLAG_SYN, 0).unwrap().encode();
+        client.handle_data_within(&open, &mut ledger).unwrap();
+        client.poll_events();
+
+        // The idle stream's reset and the next stream's open, in one read.
+        let mut packed = Frame::data(2, FLAG_RST, Vec::new()).unwrap().encode();
+        packed.extend_from_slice(&Frame::window_update(4, FLAG_SYN, 0).unwrap().encode());
+        client.handle_data_within(&packed, &mut ledger).unwrap();
+        assert!(
+            client
+                .poll_events()
+                .contains(&YamuxOutput::IncomingStream { stream: 4 }),
+            "the reset stream's window admits the next one"
+        );
+        assert_eq!(client.take_settled_streams(), 0, "released once, inside");
+        assert_eq!(ledger.reserved(), DEFAULT_RECEIVE_WINDOW as usize);
+        assert_eq!(client.held_streams(), 1);
+    }
+
+    #[test]
+    fn a_local_open_that_does_not_fit_the_ledger_is_refused() {
+        let mut ledger = ledger_for(1);
+        let mut client = spec_session(YamuxRole::Client);
+        assert_eq!(client.open_stream_within(&mut ledger), Ok(1));
+        assert_eq!(
+            client.open_stream_within(&mut ledger),
+            Err(YamuxError::BudgetExhausted)
+        );
+        assert_eq!(client.stream_count(), 1, "a refusal opens nothing");
+    }
+
+    #[test]
+    fn a_stream_settles_exactly_once_when_its_last_bytes_are_acknowledged() {
+        let mut ledger = ledger_for(4);
+        let mut client = spec_session(YamuxRole::Client);
+        let fin = Frame::data(2, FLAG_SYN | FLAG_FIN, b"bytes".to_vec())
+            .unwrap()
+            .encode();
+        client.handle_data_within(&fin, &mut ledger).unwrap();
+        client.close_write(2).unwrap();
+        while client.poll_frame().is_some() {}
+        assert!(
+            client
+                .poll_events()
+                .contains(&YamuxOutput::StreamClosed { stream: 2 }),
+            "closed in both directions"
+        );
+        assert_eq!(
+            client.take_settled_streams(),
+            0,
+            "its bytes are unacknowledged"
+        );
+
+        client.ack(2, 3).unwrap();
+        assert_eq!(
+            client.take_settled_streams(),
+            0,
+            "partial acknowledgement releases nothing"
+        );
+        client.ack(2, 2).unwrap();
+        assert_eq!(client.take_settled_streams(), 1);
+        client.ack(2, 0).unwrap();
+        assert_eq!(
+            client.reset(2),
+            Err(YamuxError::UnknownStream(2)),
+            "settled: gone"
+        );
+        assert_eq!(client.take_settled_streams(), 0, "settled once");
+    }
+
+    #[test]
+    fn go_away_settles_idle_streams_and_leaves_unacknowledged_ones_held() {
+        let mut ledger = ledger_for(4);
+        let mut client = spec_session(YamuxRole::Client);
+        let opened = client.open_stream_within(&mut ledger).unwrap();
+        let data = Frame::data(2, FLAG_SYN, b"bytes".to_vec())
+            .unwrap()
+            .encode();
+        client.handle_data_within(&data, &mut ledger).unwrap();
+        assert_eq!(client.held_streams(), 2);
+
+        client.go_away(0);
+        assert_eq!(
+            client.take_settled_streams(),
+            1,
+            "stream {opened} held nothing"
+        );
+        assert_eq!(client.held_streams(), 1);
+
+        // The session ended; acknowledging still settles what it holds.
+        client.ack(2, 5).unwrap();
+        assert_eq!(client.take_settled_streams(), 1);
+        assert_eq!(client.held_streams(), 0);
+    }
+
+    #[test]
+    fn a_protocol_failure_settles_every_stream_without_delivered_bytes() {
+        let mut ledger = ledger_for(4);
+        let mut client = spec_session(YamuxRole::Client);
+        client.open_stream_within(&mut ledger).unwrap();
+        let data = Frame::data(2, FLAG_SYN, b"bytes".to_vec())
+            .unwrap()
+            .encode();
+        client.handle_data_within(&data, &mut ledger).unwrap();
+        client.poll_events();
+
+        // A duplicate SYN is a protocol error.
+        let duplicate = Frame::window_update(2, FLAG_SYN, 0).unwrap().encode();
+        assert!(client.handle_data_within(&duplicate, &mut ledger).is_err());
+        assert_eq!(client.take_settled_streams(), 1);
+        assert_eq!(
+            client.held_streams(),
+            1,
+            "delivered bytes still wait for an ack"
+        );
+        client.reset(2).unwrap();
+        assert_eq!(client.take_settled_streams(), 1);
+    }
+
+    #[test]
+    fn a_frame_as_large_as_the_granted_credit_is_accepted() {
+        // The default grants 2,432 KiB, more than `max_frame_len`: a peer
+        // that frames up to its credit must not fail the session.
+        let mut client = YamuxSession::new(YamuxRole::Client);
+        let open = Frame::window_update(2, FLAG_SYN, 0).unwrap().encode();
+        client.handle_data(&open).unwrap();
+        while client.poll_frame().is_some() {}
+        let window = YamuxConfig::default().receive_window as usize;
+        assert!(window > YamuxConfig::default().max_frame_len as usize);
+
+        let frame = Frame::data(2, 0, vec![7; window]).unwrap().encode();
+        client.handle_data(&frame).unwrap();
+        let delivered: usize = client
+            .poll_events()
+            .iter()
+            .map(|event| match event {
+                YamuxOutput::Data { data, .. } => data.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(delivered, window);
+    }
+
+    #[test]
+    fn the_default_window_is_granted_past_the_initial_credit_with_the_open() {
+        let mut client = YamuxSession::new(YamuxRole::Client);
+        let mut server = YamuxSession::new(YamuxRole::Server);
+        let stream = client.open_stream().unwrap();
+        client.send(stream, Bytes::from_static(b"hi")).unwrap();
+        let open = decode(&outbound(&mut client));
+        assert_eq!(open.frame_type(), FrameType::WindowUpdate);
+        assert_eq!(open.flags(), FLAG_SYN);
+        assert_eq!(open.value(), 2_432 * 1024 - DEFAULT_RECEIVE_WINDOW);
+
+        server.handle_data(&open.encode()).unwrap();
+        server.poll_events();
+        let window = 2_432 * 1024;
+        let payload = Bytes::from(vec![7; window]);
+        // The server may now send the whole window without an update.
+        let mut sent = 0;
+        while sent < window {
+            let unsent = match server.send(stream, payload.slice(sent..)) {
+                Ok(()) => Bytes::new(),
+                Err(YamuxError::Full { unsent, .. }) => unsent,
+                Err(error) => panic!("{error}"),
+            };
+            sent = window - unsent.len();
+            while let Some(frame) = server.poll_frame() {
+                client.handle_data(&frame).unwrap();
+            }
+        }
+        let delivered: usize = client
+            .poll_events()
+            .iter()
+            .map(|event| match event {
+                YamuxOutput::Data { data, .. } => data.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(delivered, window);
     }
 }

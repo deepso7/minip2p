@@ -665,7 +665,9 @@ fn a_reader_that_does_not_consume_stalls_its_sender_until_it_does() -> Result<()
             .is_some()
     );
     let opened = a.open_stream(b_peer.clone(), protocol.into())?;
-    let payload: Vec<u8> = (0..1024 * 1024_usize).map(|i| (i % 251) as u8).collect();
+    // The default Yamux receive window.
+    let window = 2_432 * 1024;
+    let payload: Vec<u8> = (0..2 * window).map(|i| (i % 251) as u8).collect();
     assert!(!a.send_stream(opened.conn_id, opened.stream_id, payload.clone())?);
     a.close_stream_write(opened.conn_id, opened.stream_id)?;
 
@@ -688,7 +690,6 @@ fn a_reader_that_does_not_consume_stalls_its_sender_until_it_does() -> Result<()
         }
         (received, stream)
     };
-    let window = 256 * 1024;
     let started = Instant::now();
     while received().0.len() < window - 1024 {
         assert!(

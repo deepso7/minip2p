@@ -142,6 +142,8 @@ let endpoint = Endpoint::portable(&identity, entropy)
 
 The provider reserves `rx_buffer + tx_buffer` bytes per socket, up to `max_sockets`. Backlog sockets count toward that ceiling. Smaller buffers save RAM but hurt throughput on high-latency links; smaller socket and connection caps reject excess work instead of allocating past the budget.
 
+`TcpConfig::memory_budget_bytes` caps what all connections and streams may retain: each connection reserves `connection_reservation_bytes()` and each stream its Yamux receive window, and what does not fit is refused. The default (1 GiB, sized for hosts around a 2,432 KiB window and a 4 MiB send cap) is far more than a board has; set the budget, and shrink `yamux.receive_window`, `yamux.max_total_buffered_send` and `max_buffered_send`, to what the heap can actually spare. `build` rejects a budget that cannot fit one connection with one stream.
+
 Also budget stream payloads and pubsub queues. Treat backpressure as normal: wait for later polls instead of spinning or growing an unbounded host queue.
 
 ## Bring-up checklist

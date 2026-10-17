@@ -10,7 +10,7 @@ use minip2p_core::platform::IoErrorKind;
 use minip2p_core::{Multiaddr, MultiaddrError};
 #[cfg(feature = "tcp")]
 use minip2p_transport::ConnectionNamespace;
-use minip2p_transport::{TransportError, TransportSetError};
+use minip2p_transport::{InvalidLimit, TransportError, TransportSetError};
 
 #[cfg(feature = "pubsub")]
 use crate::GossipsubConfigError;
@@ -97,6 +97,11 @@ pub enum EndpointOptionsError {
     /// set (two claiming one connection namespace, say).
     #[error("the endpoint's transports conflict: {0}")]
     TransportConflict(TransportSetError),
+    /// A TCP or circuit limit cannot work: see
+    /// [`TcpConfig::validate`](crate::TcpConfig) and
+    /// [`CircuitLimits::validate`](crate::CircuitLimits).
+    #[error(transparent)]
+    InvalidLimit(InvalidLimit),
     /// Relay-server announce addresses were configured without enabling the
     /// relay server.
     #[cfg(feature = "relay-server")]

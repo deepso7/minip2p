@@ -22,7 +22,7 @@ pub use minip2p_swarm::{
     SwarmEvent,
     SwarmRuntimeError,
 };
-pub use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
+pub use minip2p_transport::{ConnectionId, InvalidLimit, StreamId, Transport, TransportError};
 
 pub(crate) mod connect;
 pub use connect::{
@@ -35,6 +35,8 @@ pub use event_stream::EndpointEvent;
 mod stream_acks;
 pub(crate) use stream_acks::StreamAcks;
 
+#[cfg(feature = "_circuit-driver")]
+pub use minip2p_circuit::CircuitLimits;
 #[cfg(feature = "portable-relay")]
 pub use minip2p_circuit::CircuitTransport;
 #[cfg(all(feature = "_discovery-driver", feature = "pubsub"))]
@@ -567,6 +569,10 @@ pub enum PortableBuildError {
     #[cfg(feature = "portable-autonat")]
     #[error("invalid portable NAT config: {0}")]
     NatConfig(PortableNatConfigError),
+    /// A transport limit cannot work ([`TcpConfig::validate`], or
+    /// [`CircuitLimits::validate`] with the `portable-relay` feature).
+    #[error(transparent)]
+    InvalidLimit(#[from] InvalidLimit),
 }
 
 /// Portable NAT policy that cannot run.
@@ -981,6 +987,8 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
             entropy,
             stack,
             tcp_config: TcpConfig::default(),
+            #[cfg(feature = "portable-relay")]
+            circuit_limits: CircuitLimits::default(),
             provider_config: SmoltcpConfig::default(),
             listens: Vec::new(),
             mdns: None,
@@ -1038,6 +1046,8 @@ pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource> {
     entropy: SharedEntropy<E>,
     stack: SmoltcpStack<D>,
     tcp_config: TcpConfig,
+    #[cfg(feature = "portable-relay")]
+    circuit_limits: CircuitLimits,
     provider_config: SmoltcpConfig,
     listens: Vec<String>,
     mdns: Option<EmbeddedMdnsConfig>,
@@ -1057,9 +1067,18 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         self
     }
 
-    /// Overrides secure-session and connection limits.
+    /// Overrides secure-session and connection limits, including the TCP
+    /// memory budget. Checked when the endpoint is built.
     pub fn tcp_config(mut self, config: TcpConfig) -> Self {
         self.tcp_config = config;
+        self
+    }
+
+    /// Overrides the relay circuits' Yamux limits and circuit memory
+    /// budget. Checked when the endpoint is built.
+    #[cfg(feature = "portable-relay")]
+    pub fn circuit_limits(mut self, limits: CircuitLimits) -> Self {
+        self.circuit_limits = limits;
         self
     }
 
@@ -1176,6 +1195,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             entropy,
             stack,
             tcp_config,
+            #[cfg(feature = "portable-relay")]
+            circuit_limits,
             provider_config,
             listens,
             mdns,
@@ -1190,10 +1211,14 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             identity.clone(),
             entropy.clone(),
             tcp_config,
-        );
+        )?;
         #[cfg(feature = "portable-relay")]
-        let mut endpoint =
-            portable.build_with_circuits(CircuitTransport::new(transport, identity, entropy))?;
+        let mut endpoint = portable.build_with_circuits(CircuitTransport::with_limits(
+            transport,
+            identity,
+            entropy,
+            circuit_limits,
+        )?)?;
         #[cfg(not(feature = "portable-relay"))]
         let mut endpoint = {
             let _ = identity;

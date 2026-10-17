@@ -3,8 +3,8 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use minip2p_secure_mux::yamux::{
-    FLAG_SYN, Frame, FrameDecoder, FrameType, HEADER_LEN, YamuxConfig, YamuxOutput, YamuxRole,
-    YamuxSession,
+    DEFAULT_RECEIVE_WINDOW, FLAG_SYN, Frame, FrameDecoder, FrameType, HEADER_LEN, YamuxConfig,
+    YamuxOutput, YamuxRole, YamuxSession,
 };
 
 const PAYLOAD_LEN: usize = 64 * 1024;
@@ -13,6 +13,18 @@ const WINDOW_STEP: u32 = 16 * 1024;
 const IDLE_STREAMS: usize = 1024;
 const ACTIVE_STREAMS: usize = 8;
 const SPARSE_LEN: usize = 64;
+
+/// A session with the specification's 256 KiB window: the default grants
+/// more with each stream's first window update, which these benches would
+/// otherwise measure as an extra frame per fresh stream. Pinned so the data
+/// path stays comparable across releases.
+fn session(role: YamuxRole) -> YamuxSession {
+    let config = YamuxConfig {
+        receive_window: DEFAULT_RECEIVE_WINDOW,
+        ..YamuxConfig::default()
+    };
+    YamuxSession::with_config(role, config).expect("valid config")
+}
 
 fn assert_payload_frame(output: YamuxOutput, payload: &[u8]) {
     match output {
@@ -34,7 +46,7 @@ fn yamux_data_path(c: &mut Criterion) {
         .expect("valid frame")
         .encode();
 
-    let mut verified_sender = YamuxSession::new(YamuxRole::Client);
+    let mut verified_sender = session(YamuxRole::Client);
     let stream = verified_sender.open_stream().expect("open stream");
     verified_sender
         .send(stream, Bytes::from(payload.clone()))
@@ -44,7 +56,7 @@ fn yamux_data_path(c: &mut Criterion) {
         &payload,
     );
 
-    let mut verified_receiver = YamuxSession::new(YamuxRole::Server);
+    let mut verified_receiver = session(YamuxRole::Server);
     verified_receiver
         .handle_data(&inbound)
         .expect("receive payload");
@@ -61,7 +73,7 @@ fn yamux_data_path(c: &mut Criterion) {
     group.bench_function("session_send_and_drain", |b| {
         b.iter_batched(
             || {
-                let mut session = YamuxSession::new(YamuxRole::Client);
+                let mut session = session(YamuxRole::Client);
                 let stream = session.open_stream().expect("open stream");
                 (session, stream, payload.clone())
             },
@@ -74,7 +86,7 @@ fn yamux_data_path(c: &mut Criterion) {
     });
     group.bench_function("session_receive_and_drain", |b| {
         b.iter_batched(
-            || (YamuxSession::new(YamuxRole::Server), inbound.clone()),
+            || (session(YamuxRole::Server), inbound.clone()),
             |(mut session, bytes)| {
                 session.handle_data(&bytes).expect("receive");
                 black_box(session.poll_output());
@@ -157,6 +169,7 @@ fn yamux_data_path(c: &mut Criterion) {
 fn idle_streams_sender() -> (YamuxSession, Vec<u32>) {
     let config = YamuxConfig {
         max_streams: IDLE_STREAMS,
+        receive_window: DEFAULT_RECEIVE_WINDOW,
         ..YamuxConfig::default()
     };
     let mut session = YamuxSession::with_config(YamuxRole::Client, config).expect("config");
@@ -174,7 +187,7 @@ fn idle_streams_sender() -> (YamuxSession, Vec<u32>) {
 
 /// A client stream that has spent its whole initial send window.
 fn window_exhausted_sender() -> (YamuxSession, u32) {
-    let mut session = YamuxSession::new(YamuxRole::Client);
+    let mut session = session(YamuxRole::Client);
     let stream = session.open_stream().expect("open stream");
     session
         .send(stream, Bytes::from(vec![0; QUEUED_LEN]))

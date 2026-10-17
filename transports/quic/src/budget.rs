@@ -1,7 +1,7 @@
 //! The QUIC memory budget: what a transport's connections and streams have
 //! reserved against [`QuicLimits::memory_budget_bytes`].
 
-use minip2p_transport::TransportError;
+use minip2p_transport::{MemoryLedger, TransportError};
 
 use crate::QuicLimits;
 
@@ -11,15 +11,14 @@ use crate::QuicLimits;
 /// lifetime. A connection reserves its fixed part at admission and releases
 /// it when it drains; a stream reserves its receive window when it opens or is admitted
 /// and releases it once it settles. A reservation that does not fit is
-/// refused, so `reserved` never exceeds the budget.
+/// refused, so the ledger never exceeds the budget.
 #[derive(Debug)]
 pub(crate) struct MemoryBudget {
-    /// What connections and streams may reserve: the budget less the
+    /// What connections and streams reserve against: the budget less the
     /// sockets' retry queues.
-    capacity: usize,
+    ledger: MemoryLedger,
     connection: usize,
     stream: usize,
-    reserved: usize,
 }
 
 impl MemoryBudget {
@@ -39,10 +38,9 @@ impl MemoryBudget {
             .checked_mul(sockets)?;
         let capacity = limits.memory_budget_bytes.checked_sub(queues)?;
         (capacity >= smallest).then(|| Self {
-            capacity,
+            ledger: MemoryLedger::new(capacity),
             connection: limits.connection_reservation_bytes(),
             stream: limits.stream_reservation_bytes(),
-            reserved: 0,
         })
     }
 
@@ -55,47 +53,34 @@ impl MemoryBudget {
 
     /// Whether one more connection's fixed part fits.
     pub(crate) fn fits_connection(&self) -> bool {
-        self.fits(self.connection)
+        self.ledger.fits(self.connection)
     }
 
     /// Reserves one connection's fixed part; the caller checked it fits.
     pub(crate) fn reserve_connection(&mut self) {
-        self.reserved += self.connection;
+        let reserved = self.ledger.reserve(self.connection);
+        debug_assert!(reserved, "reserved a connection that does not fit");
     }
 
     /// Releases a drained connection's fixed part.
     pub(crate) fn release_connection(&mut self) {
-        debug_assert!(
-            self.reserved >= self.connection,
-            "released more than reserved"
-        );
-        self.reserved = self.reserved.saturating_sub(self.connection);
+        self.ledger.release(self.connection);
     }
 
     /// Reserves one stream's receive window, if it fits.
     pub(crate) fn reserve_stream(&mut self) -> bool {
-        let fits = self.fits(self.stream);
-        if fits {
-            self.reserved += self.stream;
-        }
-        fits
+        self.ledger.reserve(self.stream)
     }
 
     /// Releases the reservations of `count` settled streams.
     pub(crate) fn release_streams(&mut self, count: usize) {
-        let bytes = self.stream.saturating_mul(count);
-        debug_assert!(self.reserved >= bytes, "released more than reserved");
-        self.reserved = self.reserved.saturating_sub(bytes);
+        self.ledger.release(self.stream.saturating_mul(count));
     }
 
     /// Bytes connections and streams reserve now; the retry queues are not
     /// counted.
     #[cfg(test)]
     pub(crate) fn reserved(&self) -> usize {
-        self.reserved
-    }
-
-    fn fits(&self, bytes: usize) -> bool {
-        self.capacity.saturating_sub(self.reserved) >= bytes
+        self.ledger.reserved()
     }
 }

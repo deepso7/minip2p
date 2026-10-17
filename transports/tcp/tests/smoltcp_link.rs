@@ -227,6 +227,7 @@ fn node(device: VirtualDevice, address: &str, key: Ed25519Keypair, seed: u8) -> 
         CountingEntropy(seed),
         TcpConfig::default(),
     )
+    .expect("valid config")
 }
 
 /// Polls both nodes until `done`, advancing a virtual clock.

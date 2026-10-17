@@ -38,7 +38,14 @@ pub const KEEPALIVE_INTERVAL_MS: u64 = 30_000;
 /// Yamux's specification-defined initial stream window (256 KiB).
 pub const DEFAULT_RECEIVE_WINDOW: u32 = 256 * 1024;
 
-/// Default maximum payload accepted in one inbound data frame (1 MiB).
+/// Default per-stream receive window (2,432 KiB): twice the bandwidth-delay
+/// product of a 100 Mbit/s, 100 ms path, the smallest window the #361
+/// `endpoint_rtt` sweep found reaching 90% of a large window's goodput.
+/// The peer still starts from [`DEFAULT_RECEIVE_WINDOW`]; the rest is
+/// granted with the first window update.
+const DEFAULT_STREAM_WINDOW: u32 = 2_432 * 1024;
+
+/// Default largest payload this side puts in one data frame (1 MiB).
 const DEFAULT_MAX_FRAME_LEN: u32 = 1024 * 1024;
 
 /// Default maximum number of simultaneously tracked streams.
@@ -73,8 +80,13 @@ pub struct YamuxConfig {
     ///
     /// Values below [`DEFAULT_RECEIVE_WINDOW`] are rejected because the peer
     /// is entitled to the specification-defined initial credit.
+    ///
+    /// Also the largest inbound data-frame payload accepted: a peer may frame
+    /// up to the credit it was granted, and anything larger already exceeds
+    /// it, so the decoder rejects it as soon as its header arrives.
     pub receive_window: u32,
-    /// Largest accepted inbound data-frame payload.
+    /// Largest data-frame payload this side sends. Smaller frames let
+    /// streams share the connection more evenly.
     pub max_frame_len: u32,
     /// Maximum number of simultaneously tracked inbound and outbound streams,
     /// counting closed streams that are still unsettled.
@@ -107,7 +119,7 @@ pub struct YamuxConfig {
 impl Default for YamuxConfig {
     fn default() -> Self {
         Self {
-            receive_window: DEFAULT_RECEIVE_WINDOW,
+            receive_window: DEFAULT_STREAM_WINDOW,
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
             max_streams: DEFAULT_MAX_STREAMS,
             max_buffered_send: DEFAULT_MAX_BUFFERED_SEND,
@@ -115,6 +127,26 @@ impl Default for YamuxConfig {
             control_stream_reserve: DEFAULT_CONTROL_STREAM_RESERVE,
             max_pending_control: DEFAULT_MAX_PENDING_CONTROL,
         }
+    }
+}
+
+impl YamuxConfig {
+    /// Checks the Yamux invariants [`YamuxSession::with_config`] enforces,
+    /// returning the one that fails.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.receive_window < DEFAULT_RECEIVE_WINDOW {
+            return Err("receive_window is below Yamux's initial 256 KiB credit");
+        }
+        if self.max_frame_len == 0 {
+            return Err("max_frame_len must be greater than zero");
+        }
+        if self.max_buffered_send == 0 || self.max_total_buffered_send == 0 {
+            return Err("send caps must be greater than zero");
+        }
+        if self.max_total_buffered_send <= self.control_stream_reserve {
+            return Err("max_total_buffered_send must be greater than control_stream_reserve");
+        }
+        Ok(())
     }
 }
 
@@ -240,6 +272,9 @@ pub enum YamuxError {
     /// The configured stream capacity is already in use.
     #[error("maximum Yamux stream count reached")]
     TooManyStreams,
+    /// The owner's memory budget cannot fit another stream's receive window.
+    #[error("the memory budget cannot fit another Yamux stream")]
+    BudgetExhausted,
     /// The local role exhausted its same-parity `u32` stream IDs.
     #[error("Yamux stream IDs exhausted")]
     StreamsExhausted,
