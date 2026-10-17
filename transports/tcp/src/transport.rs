@@ -1066,11 +1066,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
     }
 }
 
-/// Wraps a session failure as the stream error the transport contract expects.
-///
-/// Identifier and state errors pass through: they describe the request rather
-/// than the stream operation, and callers match on them. So does Full, which
-/// carries the caller's unsent tail.
 /// Drops a `StreamWritable` already queued for a stream whose write side
 /// just ended: a Full can queue one before its call returns, and Writable
 /// never follows the end of a write side.
@@ -1078,12 +1073,20 @@ fn drop_writable(pending: &mut VecDeque<TransportEvent>, id: ConnectionId, strea
     pending.retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
 }
 
+/// Wraps a session failure as the stream error the transport contract expects.
+///
+/// Identifier and state errors pass through: they describe the request rather
+/// than the stream operation, and callers match on them. So does Full, which
+/// carries the caller's unsent tail, and ConnectionClosed, which tells the
+/// swarm the failure already ended the connection and is reported by its
+/// `Closed` alone.
 fn stream_error(
     error: TransportError,
     wrap: impl FnOnce(String) -> TransportError,
 ) -> TransportError {
     match error {
         error @ (TransportError::ConnectionNotFound { .. }
+        | TransportError::ConnectionClosed { .. }
         | TransportError::StreamNotFound { .. }
         | TransportError::InvalidState { .. }
         | TransportError::Full { .. }) => error,

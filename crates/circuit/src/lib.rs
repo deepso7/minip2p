@@ -1399,13 +1399,16 @@ impl<T: minip2p_transport::PollSource, E: EntropySource> minip2p_transport::Poll
 /// Wraps a session failure as the stream error the transport contract expects.
 ///
 /// Identifier and state errors pass through: they describe the request rather
-/// than the stream operation, and callers match on them.
+/// than the stream operation, and callers match on them. So does
+/// ConnectionClosed, which tells the swarm the failure already ended the
+/// connection and is reported by its `Closed` alone.
 fn stream_error(
     error: TransportError,
     wrap: impl FnOnce(String) -> TransportError,
 ) -> TransportError {
     match error {
         error @ (TransportError::ConnectionNotFound { .. }
+        | TransportError::ConnectionClosed { .. }
         | TransportError::StreamNotFound { .. }
         | TransportError::InvalidState { .. }
         | TransportError::Full { .. }) => error,
@@ -2898,12 +2901,12 @@ mod tests {
         let _ = a.poll(Now::from_millis(0)).expect("drain local events");
 
         // The relay connection dies between polls, so flushing what the
-        // session queued fails.
+        // session queued fails and ends the circuit: the send says so, which
+        // keeps the swarm from reporting the failure a second time.
         a.inner_mut().fail_send = true;
         assert!(matches!(
             a.send_stream(circuit_id, stream, Bytes::from_static(b"lost")),
-            Err(TransportError::StreamSendFailed { id, stream_id, .. })
-                if id == circuit_id && stream_id == stream
+            Err(TransportError::ConnectionClosed { id, .. }) if id == circuit_id
         ));
 
         // One `Closed`, the failure its reason; no separate `Error`.
