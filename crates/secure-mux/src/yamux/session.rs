@@ -8,8 +8,42 @@ use minip2p_transport::MemoryLedger;
 
 use crate::yamux::{
     DEFAULT_RECEIVE_WINDOW, FLAG_ACK, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, FrameType,
-    KEEPALIVE_INTERVAL_MS, YamuxConfig, YamuxError, YamuxOutput, YamuxRole,
+    KEEPALIVE_ACK_TIMEOUT_MS, KEEPALIVE_HANDOFF_TIMEOUT_MS, KEEPALIVE_INTERVAL_MS, YamuxConfig,
+    YamuxError, YamuxOutput, YamuxRole,
 };
+
+/// Who queued a control frame, which decides what pulling it settles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Origin {
+    /// This side decided to send it (a GoAway, a local reset).
+    Local,
+    /// The peer provoked it; counted against the control reserve.
+    Peer,
+    /// The outstanding keepalive ping; pulling it hands the probe off.
+    Probe,
+}
+
+/// The outstanding keepalive ping.
+#[derive(Clone, Copy, Debug)]
+struct Probe {
+    /// Only an acknowledgement carrying this nonce answers the probe.
+    nonce: u32,
+    phase: ProbePhase,
+}
+
+/// Where an outstanding keepalive ping is. Each timed phase is bounded:
+/// running out fails the session with [`YamuxError::KeepaliveTimeout`].
+#[derive(Clone, Copy, Debug)]
+enum ProbePhase {
+    /// Queued at `since`, waiting to be pulled within
+    /// [`KEEPALIVE_HANDOFF_TIMEOUT_MS`].
+    Queued { since: u64 },
+    /// Pulled since the last poll; the next poll starts the ACK clock.
+    HandedOff,
+    /// Handed off at `since`, waiting up to [`KEEPALIVE_ACK_TIMEOUT_MS`] for
+    /// its acknowledgement.
+    AwaitingAck { since: u64 },
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OpenFlag {
@@ -217,9 +251,9 @@ pub struct YamuxSession {
     next_stream_id: Option<u32>,
     /// Stream events for [`poll_event`](Self::poll_event).
     events: VecDeque<YamuxOutput>,
-    /// Encoded control frames, pulled ahead of data frames, each marked
-    /// whether the peer provoked it.
-    control: VecDeque<(Vec<u8>, bool)>,
+    /// Encoded control frames, pulled ahead of data frames, each with who
+    /// queued it.
+    control: VecDeque<(Vec<u8>, Origin)>,
     /// Peer-provoked frames in `control`: what the reserve bounds.
     peer_control: usize,
     /// Streams whose last `send` was Full and that want a Writable.
@@ -238,13 +272,15 @@ pub struct YamuxSession {
     failed: bool,
     local_go_away: bool,
     remote_go_away: bool,
-    /// Monotonic milliseconds of the last poll that observed traffic, or the
-    /// first poll if none has arrived yet. `None` until the host supplies a
-    /// time sample.
-    last_activity_ms: Option<u64>,
-    /// A frame was queued or consumed since `last_activity_ms` was stamped.
-    dirty: bool,
-    /// Nonce for the next locally originated keepalive ping.
+    /// Monotonic milliseconds of the first poll after the last received
+    /// frame, or of the first poll if none has arrived yet. `None` until the
+    /// host supplies a time sample.
+    last_received_ms: Option<u64>,
+    /// A frame arrived since `last_received_ms` was stamped.
+    received: bool,
+    /// The keepalive ping in flight, if any.
+    probe: Option<Probe>,
+    /// Nonce for the next keepalive ping; never zero.
     next_ping_nonce: u32,
 }
 
@@ -288,39 +324,69 @@ impl YamuxSession {
             failed: false,
             local_go_away: false,
             remote_go_away: false,
-            last_activity_ms: None,
-            dirty: false,
+            last_received_ms: None,
+            received: false,
+            probe: None,
             next_ping_nonce: 1,
         }
     }
 
     /// Advances keepalive using the host's time sample.
     ///
-    /// A quiet session queues a ping once [`KEEPALIVE_INTERVAL_MS`] has elapsed
-    /// since the last inbound or outbound frame. Traffic observed since the
-    /// previous sample restamps the timer, so a busy session never pings.
+    /// Once [`KEEPALIVE_INTERVAL_MS`] passes without a received frame, this
+    /// queues a ping; outbound traffic does not postpone it. The ping must
+    /// then be pulled by [`poll_frame`](Self::poll_frame) within
+    /// [`KEEPALIVE_HANDOFF_TIMEOUT_MS`], and acknowledged with its nonce
+    /// within [`KEEPALIVE_ACK_TIMEOUT_MS`] of the first poll after that.
+    /// Either bound running out fails the session with
+    /// [`YamuxError::KeepaliveTimeout`]; its streams close as on a protocol
+    /// failure, but no GoAway is queued for a peer presumed dead.
+    ///
+    /// Frames received between polls are dated by the next poll's sample.
     pub fn poll(&mut self, now: Now) -> Result<(), YamuxError> {
         self.ensure_active()?;
-        if self.dirty || self.last_activity_ms.is_none() {
-            self.last_activity_ms = Some(now.monotonic_ms);
-            self.dirty = false;
+        let now = now.monotonic_ms;
+        if self.received || self.last_received_ms.is_none() {
+            self.last_received_ms = Some(now);
+            self.received = false;
         }
-        let last = self.last_activity_ms.expect("stamped above");
-        if now.monotonic_ms.saturating_sub(last) >= KEEPALIVE_INTERVAL_MS {
-            let nonce = self.next_ping_nonce;
-            self.next_ping_nonce = self.next_ping_nonce.wrapping_add(1);
-            // A session with control frames still unpulled is not quiet on
-            // the wire, and the ping would only queue behind them.
-            if self.control.is_empty() {
-                self.push_control(Frame::ping(FLAG_SYN, nonce)?);
+        let Some(probe) = &mut self.probe else {
+            let quiet_since = self.last_received_ms.expect("stamped above");
+            if now.saturating_sub(quiet_since) >= KEEPALIVE_INTERVAL_MS {
+                let nonce = self.next_ping_nonce;
+                self.next_ping_nonce = nonce.wrapping_add(1).max(1);
+                let ping = Frame::ping(FLAG_SYN, nonce)?.encode();
+                self.control.push_back((ping, Origin::Probe));
+                self.probe = Some(Probe {
+                    nonce,
+                    phase: ProbePhase::Queued { since: now },
+                });
             }
-            self.last_activity_ms = Some(now.monotonic_ms);
-            self.dirty = false;
+            return Ok(());
+        };
+        let expired = match probe.phase {
+            ProbePhase::Queued { since } => {
+                now.saturating_sub(since) >= KEEPALIVE_HANDOFF_TIMEOUT_MS
+            }
+            ProbePhase::HandedOff => {
+                probe.phase = ProbePhase::AwaitingAck { since: now };
+                false
+            }
+            ProbePhase::AwaitingAck { since } => {
+                now.saturating_sub(since) >= KEEPALIVE_ACK_TIMEOUT_MS
+            }
+        };
+        if expired {
+            self.fail();
+            return Err(YamuxError::KeepaliveTimeout);
         }
         Ok(())
     }
 
-    /// When this session next wants a [`poll`](Self::poll) for keepalive.
+    /// When this session next wants a [`poll`](Self::poll) for keepalive:
+    /// the end of the quiet interval, or of the outstanding ping's current
+    /// phase. [`Deadline::IMMEDIATE`] right after the ping is pulled, so a
+    /// poll can date its hand-off.
     ///
     /// `None` until the first poll supplies a timeline, and once the session
     /// has failed or gone away.
@@ -328,9 +394,17 @@ impl YamuxSession {
         if self.failed || self.local_go_away || self.remote_go_away {
             return None;
         }
-        Some(Deadline::from_millis(
-            self.last_activity_ms?.saturating_add(KEEPALIVE_INTERVAL_MS),
-        ))
+        let at = match self.probe.map(|probe| probe.phase) {
+            None => self.last_received_ms?.saturating_add(KEEPALIVE_INTERVAL_MS),
+            Some(ProbePhase::Queued { since }) => {
+                since.saturating_add(KEEPALIVE_HANDOFF_TIMEOUT_MS)
+            }
+            Some(ProbePhase::HandedOff) => return Some(Deadline::IMMEDIATE),
+            Some(ProbePhase::AwaitingAck { since }) => {
+                since.saturating_add(KEEPALIVE_ACK_TIMEOUT_MS)
+            }
+        };
+        Some(Deadline::from_millis(at))
     }
 
     /// Opens a local stream and returns its role-partitioned identifier.
@@ -581,7 +655,7 @@ impl YamuxSession {
             if let Err(error) = self.process_frame(frame, ledger) {
                 return self.fail_protocol(error);
             }
-            self.dirty = true;
+            self.received = true;
             if self.remote_go_away {
                 self.decoder.clear();
                 return Ok(());
@@ -601,8 +675,16 @@ impl YamuxSession {
     /// remote credit. Pulling a data frame releases its bytes from the send
     /// caps, which may queue [`YamuxOutput::Writable`] events.
     pub fn poll_frame(&mut self) -> Option<Vec<u8>> {
-        if let Some((frame, provoked)) = self.control.pop_front() {
-            self.peer_control -= usize::from(provoked);
+        if let Some((frame, origin)) = self.control.pop_front() {
+            match origin {
+                Origin::Local => {}
+                Origin::Peer => self.peer_control -= 1,
+                Origin::Probe => {
+                    if let Some(probe) = &mut self.probe {
+                        probe.phase = ProbePhase::HandedOff;
+                    }
+                }
+            }
             return Some(frame);
         }
         if self.failed || self.local_go_away || self.remote_go_away {
@@ -610,11 +692,9 @@ impl YamuxSession {
         }
         debug_assert!(self.work_indexed(), "stream work index out of sync");
         if let Some(frame) = self.deferred_control_frame() {
-            self.dirty = true;
             return Some(frame);
         }
         let frame = self.data_frame()?;
-        self.dirty = true;
         self.wake_writable();
         Some(frame)
     }
@@ -897,6 +977,9 @@ impl YamuxSession {
     fn on_ping(&mut self, frame: Frame) -> Result<(), YamuxError> {
         if frame.flags() == FLAG_SYN {
             self.queue_peer_control(Frame::ping(FLAG_ACK, frame.value())?)?;
+        } else if self.probe.is_some_and(|probe| probe.nonce == frame.value()) {
+            // Only our own nonce answers the probe; a stray ACK is ignored.
+            self.probe = None;
         }
         Ok(())
     }
@@ -1045,16 +1128,14 @@ impl YamuxSession {
             });
         }
         self.peer_control += 1;
-        self.dirty = true;
-        self.control.push_back((frame.encode(), true));
+        self.control.push_back((frame.encode(), Origin::Peer));
         Ok(())
     }
 
     /// Queues a control frame this side decided to send. Local frames are
     /// bounded by local behaviour, not by the reserve.
     fn push_control(&mut self, frame: Frame) {
-        self.dirty = true;
-        self.control.push_back((frame.encode(), false));
+        self.control.push_back((frame.encode(), Origin::Local));
     }
 
     /// Ends the stream's claim to a Writable, including one already queued:
@@ -1122,7 +1203,17 @@ impl YamuxSession {
         }
     }
 
+    /// Fails the session for a protocol error, telling the peer with a
+    /// protocol GoAway.
     fn fail_protocol<T>(&mut self, error: YamuxError) -> Result<T, YamuxError> {
+        self.fail();
+        self.push_control(Frame::go_away(1));
+        Err(error)
+    }
+
+    /// Fails the session for good: queued frames and events are dropped,
+    /// and every tracked stream gets its terminal event.
+    fn fail(&mut self) {
         let streams = self.streams.keys().copied().collect::<Vec<_>>();
         self.failed = true;
         // Data still queued is dropped below and never delivered, so it is
@@ -1148,18 +1239,19 @@ impl YamuxSession {
         self.events.clear();
         self.control.clear();
         self.peer_control = 0;
-        self.push_control(Frame::go_away(1));
+        self.probe = None;
         for stream in streams {
             self.events.push_back(YamuxOutput::StreamClosed { stream });
         }
-        Err(error)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::yamux::KEEPALIVE_INTERVAL_MS;
+    use crate::yamux::{
+        KEEPALIVE_ACK_TIMEOUT_MS, KEEPALIVE_HANDOFF_TIMEOUT_MS, KEEPALIVE_INTERVAL_MS,
+    };
     use minip2p_core::platform::{Deadline, Now};
     use minip2p_transport::MemoryLedger;
 
@@ -2262,7 +2354,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_traffic_defers_the_keepalive_ping() {
+    fn outbound_traffic_does_not_postpone_the_probe() {
         let mut session = spec_session(YamuxRole::Client);
         session.poll(Now::from_millis(0)).unwrap();
         let stream = session.open_stream().unwrap();
@@ -2274,11 +2366,124 @@ mod tests {
         session
             .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
             .unwrap();
+        let ping = decode(&outbound(&mut session));
         assert_eq!(
-            session.poll_output(),
-            None,
-            "sending on a stream is traffic; keepalive waits another interval"
+            (ping.frame_type(), ping.flags()),
+            (FrameType::Ping, FLAG_SYN),
+            "only received frames show the peer is alive"
         );
+    }
+
+    /// A session whose keepalive ping came due at the interval and is still
+    /// queued.
+    fn probing_session() -> YamuxSession {
+        let mut session = spec_session(YamuxRole::Client);
+        session.poll(Now::from_millis(0)).unwrap();
+        session
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .unwrap();
+        session
+    }
+
+    #[test]
+    fn a_ping_not_handed_off_in_time_fails_the_session() {
+        let mut session = probing_session();
+        let stream = session.open_stream().unwrap();
+        let due = KEEPALIVE_INTERVAL_MS;
+        assert_eq!(
+            session.next_deadline(),
+            Some(Deadline::from_millis(due + KEEPALIVE_HANDOFF_TIMEOUT_MS))
+        );
+        // The peer is still talking, but the ping cannot leave.
+        session
+            .handle_data(&Frame::ping(FLAG_SYN, 9).unwrap().encode())
+            .unwrap();
+        session
+            .poll(Now::from_millis(due + KEEPALIVE_HANDOFF_TIMEOUT_MS - 1))
+            .unwrap();
+
+        assert_eq!(
+            session.poll(Now::from_millis(due + KEEPALIVE_HANDOFF_TIMEOUT_MS)),
+            Err(YamuxError::KeepaliveTimeout)
+        );
+        assert_eq!(
+            session.poll_events(),
+            vec![YamuxOutput::StreamClosed { stream }]
+        );
+        assert_eq!(session.poll_frame(), None, "no GoAway for a dead peer");
+        assert_eq!(session.next_deadline(), None);
+        assert_eq!(
+            session.poll(Now::from_millis(due + KEEPALIVE_HANDOFF_TIMEOUT_MS)),
+            Err(YamuxError::Failed)
+        );
+    }
+
+    #[test]
+    fn a_due_ping_queues_behind_unpulled_control_frames_and_keeps_its_clock() {
+        let mut session = spec_session(YamuxRole::Client);
+        session.poll(Now::from_millis(0)).unwrap();
+        session
+            .handle_data(&Frame::ping(FLAG_SYN, 9).unwrap().encode())
+            .unwrap();
+        let due = KEEPALIVE_INTERVAL_MS + 5;
+        session.poll(Now::from_millis(5)).unwrap();
+        session.poll(Now::from_millis(due)).unwrap();
+
+        let ack = decode(&outbound(&mut session));
+        assert_eq!((ack.flags(), ack.value()), (FLAG_ACK, 9));
+        let ping = decode(&outbound(&mut session));
+        assert_eq!(ping.flags(), FLAG_SYN, "the ping queues; it is not skipped");
+        assert_eq!(
+            session.next_deadline(),
+            Some(Deadline::IMMEDIATE),
+            "a poll must date the hand-off"
+        );
+        session.poll(Now::from_millis(due + 1)).unwrap();
+        assert_eq!(
+            session.next_deadline(),
+            Some(Deadline::from_millis(due + 1 + KEEPALIVE_ACK_TIMEOUT_MS))
+        );
+    }
+
+    #[test]
+    fn only_an_ack_with_the_pings_nonce_answers_it() {
+        let mut session = probing_session();
+        let ping = decode(&outbound(&mut session));
+        let sent = KEEPALIVE_INTERVAL_MS + 1;
+        session.poll(Now::from_millis(sent)).unwrap();
+
+        let stray = Frame::ping(FLAG_ACK, ping.value().wrapping_add(1)).unwrap();
+        session.handle_data(&stray.encode()).unwrap();
+        session
+            .poll(Now::from_millis(sent + KEEPALIVE_ACK_TIMEOUT_MS - 1))
+            .unwrap();
+        assert_eq!(
+            session.poll(Now::from_millis(sent + KEEPALIVE_ACK_TIMEOUT_MS)),
+            Err(YamuxError::KeepaliveTimeout)
+        );
+    }
+
+    #[test]
+    fn a_matching_ack_restarts_the_quiet_interval() {
+        let mut session = probing_session();
+        let ping = decode(&outbound(&mut session));
+        let sent = KEEPALIVE_INTERVAL_MS + 1;
+        session.poll(Now::from_millis(sent)).unwrap();
+
+        session
+            .handle_data(&Frame::ping(FLAG_ACK, ping.value()).unwrap().encode())
+            .unwrap();
+        let answered = sent + KEEPALIVE_ACK_TIMEOUT_MS - 1;
+        session.poll(Now::from_millis(answered)).unwrap();
+        assert_eq!(
+            session.next_deadline(),
+            Some(Deadline::from_millis(answered + KEEPALIVE_INTERVAL_MS))
+        );
+        session
+            .poll(Now::from_millis(answered + KEEPALIVE_INTERVAL_MS))
+            .unwrap();
+        let next = decode(&outbound(&mut session));
+        assert_ne!(next.value(), ping.value(), "each probe has its own nonce");
     }
 
     #[test]
@@ -2294,15 +2499,6 @@ mod tests {
         assert_eq!(
             session.next_deadline(),
             Some(Deadline::from_millis(10 + KEEPALIVE_INTERVAL_MS))
-        );
-
-        session
-            .poll(Now::from_millis(10 + KEEPALIVE_INTERVAL_MS))
-            .unwrap();
-        let _ = outbound(&mut session);
-        assert_eq!(
-            session.next_deadline(),
-            Some(Deadline::from_millis(10 + KEEPALIVE_INTERVAL_MS * 2))
         );
     }
 

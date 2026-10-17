@@ -771,7 +771,9 @@ impl RelayServerAgent {
                 self.on_connection_established(peer_id.clone(), *conn_id, is_circuit);
                 false
             }
-            SwarmEvent::ConnectionClosed { peer_id, conn_id } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id, conn_id, ..
+            } => {
                 self.on_connection_closed(peer_id, *conn_id);
                 false
             }
@@ -2807,6 +2809,7 @@ fn first_ip(address: &Multiaddr) -> Option<IpKey> {
 #[cfg(test)]
 mod tests {
     use core::str::FromStr;
+    use minip2p_swarm::ConnectionCloseReason;
 
     use minip2p_core::platform::Now;
     use minip2p_core::{Multiaddr, PeerId, Protocol};
@@ -3657,6 +3660,7 @@ mod tests {
             &SwarmEvent::ConnectionClosed {
                 peer_id: holder.clone(),
                 conn_id: holder_conn,
+                reason: ConnectionCloseReason::Local,
             },
             false,
             Now::from_millis(0),
@@ -3917,6 +3921,7 @@ mod tests {
                 SwarmEvent::ConnectionClosed {
                     peer_id: first,
                     conn_id: first_stream.conn_id,
+                    reason: ConnectionCloseReason::Local,
                 }
             } else {
                 SwarmEvent::StreamClosed {
@@ -3999,6 +4004,7 @@ mod tests {
             &SwarmEvent::ConnectionClosed {
                 peer_id: remote.clone(),
                 conn_id: ConnectionId::new(35),
+                reason: ConnectionCloseReason::Local,
             },
             false,
             Now::from_millis(500),
@@ -5658,6 +5664,7 @@ mod tests {
             &SwarmEvent::ConnectionClosed {
                 peer_id: relay.clone(),
                 conn_id: relay_conn,
+                reason: ConnectionCloseReason::Local,
             },
             false,
             now,

@@ -2,7 +2,7 @@
 //!
 //! Spawns `minip2p-peer listen`, parses its `bound=` line from stdout,
 //! then spawns `minip2p-peer dial <addr> --count 3` and asserts the dialer
-//! exits successfully after a direct-dialed path, three pongs with an
+//! exits successfully after a direct path, three pongs with an
 //! unbroken seq sequence, and a complete summary. Both processes are
 //! killed on drop so a panicking assertion doesn't leave a listener bound
 //! to a UDP port on the test host.
@@ -61,7 +61,7 @@ fn listen_and_dial_complete_counted_ping_run() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for needle in [
-        "path-established path=direct-dialed",
+        "path-established path=direct",
         "pong seq=1",
         "pong seq=3",
         "summary sent=3 received=3",

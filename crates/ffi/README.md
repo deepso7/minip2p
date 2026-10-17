@@ -4,6 +4,6 @@
 
 Create a `P2pEndpoint`, register a `P2pEventDoorbell` with `start`, and call `drain_events(limit)` when the doorbell rings. Drain until the method returns an empty batch. The core rings the doorbell only when its carry changes from empty to non-empty, and it never pushes individual events through the binding.
 
-`stop` requests shutdown. `wait_stopped` observes complete driver exit and socket release. Dropping the last endpoint reference requests the same shutdown.
+`stop(timeout_ms)` requests shutdown: the driver disconnects peers and drains for up to `timeout_ms` (`0` tears down at once, best effort), then delivers `EndpointClosed { outcome, unfinished }` as its last event. The deadline bounds teardown time only, not delivery of accepted writes. `wait_stopped` observes complete driver exit and socket release. Dropping the last endpoint reference requests the same shutdown with a 500 ms drain.
 
 The crate builds as an rlib, static library, and dynamic library. It is an internal workspace component and is not published.

@@ -9,12 +9,12 @@
  */
 
 import type {
-  ConnectionInfo,
   IdentifyInfo,
   KnownPeerInfo,
   RelayReservationInfo,
 } from "@minip2p/core";
 import type {
+  BackendConnectionInfo,
   BackendOpenStream,
   P2pEvent,
   PathKind,
@@ -35,7 +35,7 @@ export type NativeEvent = NativeShape<P2pEvent>;
 export type NativeIdentifyInfo = NativeShape<IdentifyInfo>;
 export type NativeKnownPeerInfo = NativeShape<KnownPeerInfo>;
 export type NativeRelayReservationInfo = NativeShape<RelayReservationInfo>;
-export type NativeConnectionInfo = NativeShape<ConnectionInfo>;
+export type NativeConnectionInfo = NativeShape<BackendConnectionInfo>;
 export type NativeOpenStream = NativeShape<BackendOpenStream>;
 export type NativePathKind = NativeShape<PathKind>;
 export type { Reachability } from "@minip2p/core";

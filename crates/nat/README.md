@@ -25,7 +25,7 @@ rounds exhausted or
 relay leg dead       ⇒ ConnectFailed { error }    (engine decides the attempt)
 ```
 
-Ranking: `DirectDialed` ≈ `DirectPunched` > `Relayed`.
+Ranking: `Direct` ≈ `Punched` > `Relayed`.
 
 HOP CONNECT only works at a relay where the _target_ holds a reservation, so the relay leg tries the configured relays one at a time. Relays that `ConnectLegs::target_addrs` name in a circuit address (`.../p2p/<relay>/p2p-circuit`) go first, the rest follow in `NatConfig::relays` order; relays that are not configured are never used. A relay listed under several addresses is tried at the next address when the previous one could not reach it; once it is reached, its other addresses are skipped. A bridge that fails to promote, or a circuit that closes before it carries a path, counts as that relay failing. Each relay gets `relay_timeout_ms` (12 s), clipped by the attempt's deadline and split across its addresses, from its first dial to its circuit carrying a path; a relay that fails earlier hands over to the next one at once. `RelayStarted` names each relay as the leg starts it and `RelayFailed` reports each failure, so the Endpoint keeps one diagnostic per relay. The leg fails only after every relay has failed, with the last relay's error. A relay that runs out its budget fails with `NatError::Timeout`, naming the `RelayStage` that stalled (relay dial, HOP negotiation, HOP status, circuit handshake), the relay, the time spent, and the budget. The relay server's own 60 s HOP/STOP timeout is a cleanup ceiling, not a promise that clients wait that long.
 
@@ -96,7 +96,7 @@ loop {
 
 ### Reading the swarm
 
-The agent keeps no copy of connections or readiness; it reads both from the `NatSwarm` each call. That state may be ahead of the event being handled (a host hands over a batch the swarm already applied), so the agent follows two rules: what it owns (dials, streams, reservations, path origins) is keyed by the exact connection id an event carries, and live swarm state only decides whether new work may start. Cleanup for a closed or replaced connection ends only the work bound to that connection, never work already started on its replacement. Readiness-triggered work starts only when the `PeerReady` connection is still the peer's ready one.
+The agent keeps no copy of connections or readiness; it reads both from the `NatSwarm` each call. That state may be ahead of the event being handled (a host hands over a batch the swarm already applied), so the agent follows two rules: what it owns (dials, streams, reservations, path records) is keyed by the exact connection id an event carries, and live swarm state only decides whether new work may start. Cleanup for a closed or replaced connection ends only the work bound to that connection, never work already started on its replacement. Readiness-triggered work starts only when the `PeerReady` connection is still the peer's ready one.
 
 A write the swarm refuses as Full (ADR 0012) is not lost: the agent holds its unsent tail, queues later writes and the write-side close on that stream behind it, and resends them when the stream's `StreamWritable` reaches `handle_event` (which then returns `true`). A resend the transport fails outright resets the stream rather than sending the held close, and so does a stream holding more than 64 KiB. Tails still held when a bridge is promoted ride in `PromoteBridge::unsent_data`; the circuit sends them before its own bytes.
 
@@ -150,11 +150,13 @@ A NAT'd listener holding a reservation handles inbound circuits automatically: t
 
 Punch candidates are bounded both ways: a peer's CONNECT is filtered to globally routable QUIC addresses, and that list and our own advertised one keep at most `MAX_PUNCH_CANDIDATES` (8) addresses, at most 4 per IP family and 2 per IP, skipping port 0 and privileged ports (below 1024).
 
+Our own candidates and AutoNAT probe addresses include where trusted peers (configured relays and AutoNAT servers) observe us through Identify. An observation counts only in the IP family of the connection that carried it (`NatSwarm::connection_remote_addr`), since that is the one family its reporter sees us in; other reporters supply the other family, and one reached over a circuit vouches for none.
+
 ## Connection replacement and paths
 
 The swarm keeps one connection per peer. When a newer connection takes the slot (`SwarmEvent::ConnectionReplaced { peer_id, old, new }`), the agent applies `new` before retiring `old`, so the peer never counts as disconnected and no relay leg or inbound flow fails just because `old` went away. Everything bound to `old` ends: its streams, its observed address, and the peer's readiness (`PeerReady` for `new` restarts what waits on it). A connection-level disconnect (`ConnectionClosed`) is acted on immediately.
 
-Each connection records the path origin a NAT machine announced for it: Direct (dialed or punched) or Relayed through a relay, plus the Connect ID of the attempt that created it. `NatAgent::path` reports the origin of the peer's current connection. On a replacement the path becomes `new`'s origin; leaving a relay for a direct connection is reported exactly once, as `PathUpgraded` against the attempt that created the relayed path, or as `InboundDirectUpgrade` when it came from an inbound circuit. Other changes, such as relay A to relay B, only update the path.
+Each connection a NAT machine announced records its path (`Path::Direct`, `Path::Punched`, or `Path::Relayed { relay }`) and the Connect ID of the attempt that created it. The Endpoint owns every connection's `Path` and derives Direct and Relayed from the transport; the one fact it takes from NAT is a hole punch, through `NatAgent::is_punched(conn_id)`. A replacement does not carry `old`'s path record over to `new`. Leaving a relay for a direct connection is reported exactly once, as `PathUpgraded` against the attempt that created the relayed path, or as `InboundDirectUpgrade` when it came from an inbound circuit. Other changes, such as relay A to relay B, report nothing.
 
 ## Status
 

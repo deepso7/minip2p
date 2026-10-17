@@ -3,7 +3,8 @@
 //! [`YamuxSession`] accepts ordered connection bytes and emits encoded Yamux
 //! frames plus stream lifecycle events. It performs no I/O and never reads a
 //! clock: the host supplies [`minip2p_core::platform::Now`] samples so a quiet
-//! session can emit keepalive pings on a deadline.
+//! session can probe its peer with keepalive pings, and fail with
+//! [`YamuxError::KeepaliveTimeout`] once one goes unanswered.
 //!
 //! Writes follow ADR 0012's backpressure contract: [`YamuxSession::send`]
 //! accepts what fits the send caps and hands back the unsent tail as
@@ -28,12 +29,27 @@ pub use session::YamuxSession;
 /// Multistream-select protocol identifier for libp2p Yamux.
 pub const YAMUX_PROTOCOL_ID: &str = "/yamux/1.0.0";
 
-/// How long a session may stay quiet before it sends a keepalive ping.
+/// How long a session may go without receiving a frame before it probes
+/// the peer with a keepalive ping.
 ///
-/// The host drives this through [`YamuxSession::poll`] / [`YamuxSession::next_deadline`];
-/// the session never reads a clock of its own. 30 seconds matches go-libp2p
-/// yamux's default `KeepAliveInterval`.
+/// Only received frames count: a session that keeps writing to a peer that
+/// never answers still probes. The host drives keepalive through
+/// [`YamuxSession::poll`] / [`YamuxSession::next_deadline`]; the session
+/// never reads a clock of its own. 30 seconds matches go-libp2p yamux's
+/// default `KeepAliveInterval`.
 pub const KEEPALIVE_INTERVAL_MS: u64 = 30_000;
+
+/// How long a due keepalive ping may wait to be handed off: pulled out of the
+/// session by [`YamuxSession::poll_frame`] into the host's write path. A
+/// write path backed up for longer fails the session with
+/// [`YamuxError::KeepaliveTimeout`]. Matches go-libp2p yamux's
+/// `ConnectionWriteTimeout`.
+pub const KEEPALIVE_HANDOFF_TIMEOUT_MS: u64 = 10_000;
+
+/// How long the peer has to acknowledge a handed-off keepalive ping before
+/// the session fails with [`YamuxError::KeepaliveTimeout`]. Only an
+/// acknowledgement carrying the ping's nonce counts.
+pub const KEEPALIVE_ACK_TIMEOUT_MS: u64 = 10_000;
 
 /// Yamux's specification-defined initial stream window (256 KiB).
 pub const DEFAULT_RECEIVE_WINDOW: u32 = 256 * 1024;
@@ -301,6 +317,12 @@ pub enum YamuxError {
         /// Configured [`YamuxConfig::max_pending_control`].
         limit: usize,
     },
+    /// A keepalive ping was not handed off within
+    /// [`KEEPALIVE_HANDOFF_TIMEOUT_MS`], or not acknowledged within
+    /// [`KEEPALIVE_ACK_TIMEOUT_MS`] of its hand-off: the peer is presumed
+    /// dead. Fatal: the session has failed.
+    #[error("Yamux keepalive timed out; the peer did not answer a ping")]
+    KeepaliveTimeout,
     /// The local or remote side has sent GoAway.
     #[error("Yamux session is closed")]
     SessionClosed,

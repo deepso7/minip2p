@@ -1,8 +1,9 @@
 //! Binding-agnostic event model and upstream event conversion.
 
 use minip2p::{
-    ConnectFailure, ConnectOutcome, DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource,
-    EndpointEvent, GossipsubEvent, IdentifyMessage, Multiaddr, NatEvent, Path, ReachabilityState,
+    ConnectFailure, ConnectOutcome, ConnectionCloseReason as UpstreamConnectionCloseReason,
+    DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource, EndpointEvent, GossipsubEvent,
+    IdentifyMessage, Multiaddr, NatEvent, Path, ReachabilityState,
 };
 use minip2p_swarm::SwarmErrorKind;
 
@@ -54,7 +55,8 @@ pub struct OpenStreamResult {
     pub stream_id: u64,
 }
 
-/// State snapshot of the transport connection selected for a peer.
+/// State snapshot of a peer's established connection; see
+/// `minip2p::ConnectionInfo`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[cfg_attr(
@@ -63,15 +65,19 @@ pub struct OpenStreamResult {
     serde(rename_all = "camelCase")
 )]
 pub struct ConnectionInfo {
+    /// The peer on the other end.
+    pub peer_id: String,
     /// Endpoint-local transport connection id.
     pub conn_id: u64,
-    /// Remote transport address, when recorded.
-    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    pub remote_addr: Option<String>,
+    /// Remote transport address the transport reported; a circuit reports
+    /// `/p2p/<relay>/p2p-circuit`.
+    pub remote_addr: String,
+    /// How the connection was made.
+    pub path: PathKind,
     /// Protocols this connection advertised through Identify, once it is
-    /// ready (`PeerReady` for this `conn_id`); `None` until then. Readiness,
-    /// connection and protocols come from one snapshot, so a ready wait can
-    /// trust them together.
+    /// ready (`PeerReady` for this `conn_id`); `None` until then, distinct
+    /// from an empty list. Readiness, connection and protocols come from one
+    /// snapshot, so a ready wait can trust them together.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub ready_protocols: Option<Vec<String>>,
 }
@@ -89,7 +95,7 @@ pub enum Reachability {
     Private,
 }
 
-/// Kind of usable connection path.
+/// How an established connection was made; see `minip2p::Path`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[cfg_attr(
@@ -98,15 +104,59 @@ pub enum Reachability {
     serde(tag = "tag", content = "inner", rename_all_fields = "camelCase")
 )]
 pub enum PathKind {
-    /// A known address was dialed directly.
-    DirectDialed,
-    /// A direct path was established by hole punching.
-    DirectPunched,
+    /// A direct connection we dialed or accepted.
+    Direct,
+    /// A direct connection made by a DCUtR hole punch.
+    Punched,
     /// Traffic is carried through a relay.
     Relayed {
         /// Relay carrying the circuit.
         relay_peer_id: String,
     },
+}
+
+/// Why one connection ended; see `minip2p::ConnectionCloseReason`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(tag = "tag", content = "inner", rename_all_fields = "camelCase")
+)]
+pub enum ConnectionCloseReason {
+    /// We closed it.
+    Local,
+    /// The peer closed it with `code`: its QUIC CONNECTION_CLOSE code, or
+    /// its Yamux `GoAway` code on TCP and relay circuits.
+    Remote {
+        /// The peer's close code.
+        code: u64,
+    },
+    /// The peer went silent (an idle, keepalive or handshake timeout).
+    TimedOut,
+    /// The peer stopped reading (a TCP send stall).
+    Stalled,
+    /// Anything else that ended it.
+    Error {
+        /// Human-readable description.
+        message: String,
+    },
+}
+
+impl From<UpstreamConnectionCloseReason> for ConnectionCloseReason {
+    fn from(reason: UpstreamConnectionCloseReason) -> Self {
+        match reason {
+            UpstreamConnectionCloseReason::Local => Self::Local,
+            UpstreamConnectionCloseReason::Remote { code } => Self::Remote { code },
+            UpstreamConnectionCloseReason::TimedOut => Self::TimedOut,
+            UpstreamConnectionCloseReason::Stalled => Self::Stalled,
+            UpstreamConnectionCloseReason::Error(message) => Self::Error { message },
+            // A reason this binding does not know yet keeps its description.
+            other => Self::Error {
+                message: other.to_string(),
+            },
+        }
+    }
 }
 
 /// Source that contributed a discovery observation.
@@ -197,6 +247,47 @@ pub enum DriverFailureKind {
     Panic,
 }
 
+/// How the driver's closing drain ended; see [`P2pEvent::EndpointClosed`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum CloseOutcome {
+    /// Every tracked connection finished its teardown in time.
+    Drained,
+    /// The stop deadline passed with connections still tracked.
+    DeadlineExpired,
+    /// Driving the transports failed and ended the drain early, or the
+    /// driver panicked and dropped the endpoint without a drain.
+    Failed,
+}
+
+impl From<minip2p::CloseOutcome> for CloseOutcome {
+    fn from(outcome: minip2p::CloseOutcome) -> Self {
+        match outcome {
+            minip2p::CloseOutcome::Drained => Self::Drained,
+            minip2p::CloseOutcome::DeadlineExpired => Self::DeadlineExpired,
+            minip2p::CloseOutcome::Failed => Self::Failed,
+        }
+    }
+}
+
+/// A connection still tracked when the closing drain ended.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+pub struct UnfinishedConnection {
+    /// Endpoint-local transport connection id.
+    pub conn_id: u64,
+    /// Remote peer; `None` for an inbound handshake that had not identified
+    /// one yet.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub peer_id: Option<String>,
+}
+
 /// Event delivered by the native endpoint driver.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
@@ -226,6 +317,16 @@ pub enum P2pEvent {
         /// Human-readable diagnostic detail.
         detail: String,
     },
+    /// The driver finished shutting down: its last event, after
+    /// [`P2pEndpoint::stop`](crate::P2pEndpoint::stop) or a
+    /// [`P2pEvent::DriverFailed`], when a failed driver tears down at once.
+    EndpointClosed {
+        /// How the closing drain ended.
+        outcome: CloseOutcome,
+        /// Connections still tracked when it ended. Empty means no tracked
+        /// teardown remains, not that peers acknowledged it.
+        unfinished: Vec<UnfinishedConnection>,
+    },
     /// A peer went from disconnected to connected over a verified connection.
     ConnectionEstablished {
         /// Remote peer.
@@ -239,6 +340,9 @@ pub enum P2pEvent {
         peer_id: String,
         /// Endpoint-local transport connection id.
         conn_id: u64,
+        /// Why it closed. A failure that ended it is reported here, not as
+        /// a separate `EndpointError`.
+        reason: ConnectionCloseReason,
     },
     /// A newer connection took the peer's single connection slot from
     /// `old_conn_id`.
@@ -586,9 +690,14 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
                 conn_id: conn_id.as_u64(),
             }
         }
-        EndpointEvent::ConnectionClosed { peer_id, conn_id } => P2pEvent::ConnectionClosed {
+        EndpointEvent::ConnectionClosed {
+            peer_id,
+            conn_id,
+            reason,
+        } => P2pEvent::ConnectionClosed {
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
+            reason: reason.into(),
         },
         EndpointEvent::ConnectionReplaced { peer_id, old, new } => P2pEvent::ConnectionReplaced {
             peer_id: peer_id.to_base58(),
@@ -707,6 +816,17 @@ pub(crate) fn convert_endpoint_event(
             peer_id,
             outcome,
         } => convert_settled(connect_id, &peer_id, outcome, endpoint.path(&peer_id)),
+        other => convert_detached_event(other),
+    }
+}
+
+/// Converts an event without its endpoint, as the events a closed
+/// endpoint's drain reports must be. A `ConnectSettled`, whose path only the
+/// endpoint knows, yields nothing: shells settle attempts on stop
+/// themselves (see [`P2pEndpoint::stop`](crate::P2pEndpoint::stop)).
+pub(crate) fn convert_detached_event(event: EndpointEvent) -> Option<P2pEvent> {
+    match event {
+        EndpointEvent::ConnectSettled { .. } => None,
         EndpointEvent::Nat(event) => convert_nat(event),
         EndpointEvent::Gossipsub(event) => Some(convert_gossipsub(event)),
         EndpointEvent::Discovery(event) => Some(convert_discovery(event)),
@@ -745,7 +865,7 @@ pub(crate) fn convert_settled(
             connect_id: connect_id.as_u64(),
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
-            path: convert_path(path.unwrap_or(Path::DirectDialed)),
+            path: convert_path(path.unwrap_or(Path::Direct)),
         }),
         ConnectOutcome::Failed(failure) => Some(P2pEvent::ConnectFailed {
             connect_id: connect_id.as_u64(),
@@ -955,14 +1075,14 @@ pub(crate) fn convert_reachability(state: ReachabilityState) -> Reachability {
 
 pub(crate) fn convert_path(path: Path) -> PathKind {
     match path {
-        Path::DirectDialed => PathKind::DirectDialed,
-        Path::DirectPunched => PathKind::DirectPunched,
+        Path::Direct => PathKind::Direct,
+        Path::Punched => PathKind::Punched,
         Path::Relayed { relay } => PathKind::Relayed {
             relay_peer_id: relay.to_base58(),
         },
         // A path this binding predates; every current non-relayed path is
         // direct.
-        _ => PathKind::DirectDialed,
+        _ => PathKind::Direct,
     }
 }
 
@@ -1244,13 +1364,13 @@ mod tests {
                 ConnectOutcome::Connected {
                     conn_id: ConnectionId::new(9),
                 },
-                Some(Path::DirectDialed),
+                Some(Path::Direct),
             ),
             Some(P2pEvent::PathEstablished {
                 connect_id: 3,
                 peer_id: remote.to_base58(),
                 conn_id: 9,
-                path: PathKind::DirectDialed,
+                path: PathKind::Direct,
             })
         );
         let failure = ConnectFailure::NoUsableRoute {
@@ -1302,7 +1422,7 @@ mod tests {
             convert_nat(NatEvent::PathEstablished {
                 connect_id: minip2p::ConnectId::from_u64(1),
                 peer: remote.clone(),
-                path: Path::DirectDialed,
+                path: Path::Direct,
             }),
             None
         );
@@ -1367,7 +1487,7 @@ mod tests {
                 connect_id: minip2p::ConnectId::from_u64(2),
                 peer: remote.clone(),
                 from: Path::Relayed { relay: peer(15) },
-                to: Path::DirectPunched,
+                to: Path::Punched,
                 old_conn_id: ConnectionId::new(4),
                 new_conn_id: ConnectionId::new(5),
             }),
@@ -1377,7 +1497,7 @@ mod tests {
                 from: PathKind::Relayed {
                     relay_peer_id: peer(15).to_base58(),
                 },
-                to: PathKind::DirectPunched,
+                to: PathKind::Punched,
                 old_conn_id: 4,
                 new_conn_id: 5,
             })

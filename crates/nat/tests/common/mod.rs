@@ -199,12 +199,44 @@ fn autonat_answer(request_bytes: &[u8], respond: impl FnOnce(&mut AutoNatServer)
 }
 
 /// Feeds an `IdentifyReceived` event whose `observed_addr` is `addr`'s
-/// binary encoding, as if `reporter` told us where it sees us from.
+/// binary encoding, as if `reporter` told us where it sees us from over its
+/// current connection, establishing connection 1 first when it has none.
 pub fn identify_observed(node: &mut Node, reporter: &PeerId, addr: &Multiaddr, now: Now) {
+    let conn_id = match node.swarm.connection(reporter) {
+        Some(conn_id) => conn_id,
+        None => {
+            let conn_id = ConnectionId::new(1);
+            node.handle_event(
+                &SwarmEvent::ConnectionEstablished {
+                    peer_id: reporter.clone(),
+                    conn_id,
+                },
+                false,
+                now,
+            );
+            conn_id
+        }
+    };
+    identify_observed_on(node, reporter, conn_id, addr, now);
+}
+
+/// Feeds `reporter`'s Identify observation `addr` on exactly `conn_id`.
+/// A connection the test gave no remote address runs over `addr`'s family.
+pub fn identify_observed_on(
+    node: &mut Node,
+    reporter: &PeerId,
+    conn_id: ConnectionId,
+    addr: &Multiaddr,
+    now: Now,
+) {
+    node.swarm
+        .remote_addrs
+        .entry(conn_id)
+        .or_insert_with(|| addr.clone());
     node.handle_event(
         &SwarmEvent::IdentifyReceived {
             peer_id: reporter.clone(),
-            conn_id: ConnectionId::new(1),
+            conn_id,
             info: IdentifyMessage {
                 observed_addr: Some(addr.to_bytes()),
                 ..IdentifyMessage::default()
@@ -620,6 +652,8 @@ impl From<NatAction> for Out {
 #[derive(Default)]
 pub struct FakeSwarm {
     connections: BTreeMap<PeerId, ConnectionId>,
+    /// Each connection's remote address, when a test gave it one.
+    pub remote_addrs: BTreeMap<ConnectionId, Multiaddr>,
     ready: BTreeMap<PeerId, (ConnectionId, Vec<String>)>,
     calls: Vec<Out>,
     next_conn: u64,
@@ -660,7 +694,9 @@ impl FakeSwarm {
                 self.connect(peer_id, *conn_id);
             }
             SwarmEvent::ConnectionReplaced { peer_id, new, .. } => self.connect(peer_id, *new),
-            SwarmEvent::ConnectionClosed { peer_id, conn_id } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id, conn_id, ..
+            } => {
                 if self.connections.get(peer_id) == Some(conn_id) {
                     self.connections.remove(peer_id);
                     self.ready.remove(peer_id);
@@ -719,6 +755,10 @@ impl NatSwarm for FakeSwarm {
         self.ready
             .get(peer)
             .map(|(conn, protocols)| (*conn, protocols.as_slice()))
+    }
+
+    fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        self.remote_addrs.get(&conn_id)
     }
 
     fn dial(&mut self, addr: &PeerAddr, token: NatToken) -> Result<DialStart, NatSwarmError> {
@@ -924,10 +964,6 @@ impl Node {
 
     pub fn settled(&mut self, id: ConnectId, kept: Option<ConnectionId>, now: Now) {
         self.agent.settled(&mut self.swarm, id, kept, now);
-    }
-
-    pub fn path(&self, peer: &PeerId) -> Option<&minip2p_nat::Path> {
-        self.agent.path(&self.swarm, peer)
     }
 }
 

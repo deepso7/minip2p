@@ -297,6 +297,7 @@ extern "C" {
     );
     void uniffi_minip2p_ffi_fn_method_p2pendpoint_stop(
         /*handle*/ uint64_t ptr,
+        uint64_t timeout_ms,
         RustCallStatus *uniffi_out_err
     );
     void uniffi_minip2p_ffi_fn_method_p2pendpoint_stream_consumed(
@@ -2771,7 +2772,7 @@ NativeMinip2pFfi::NativeMinip2pFfi(
     props["ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_stop"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_stop"),
-        1,
+        2,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_stop(rt, thisVal, args, count);
         }
@@ -3659,7 +3660,7 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_start(
 }
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_stop(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        uniffi_minip2p_ffi_fn_method_p2pendpoint_stop(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]),
+        uniffi_minip2p_ffi_fn_method_p2pendpoint_stop(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi_jsi::Bridging<uint64_t>::fromJs(rt, callInvoker, args[1]),
             &status
         );
         uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);

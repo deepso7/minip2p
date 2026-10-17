@@ -63,9 +63,11 @@ impl P2pEndpoint {
     pub fn drain_events(&self, limit: u32) -> Vec<P2pEvent> {
         self.0.drain_events(limit)
     }
-    /// Requests shutdown.
-    pub fn stop(&self) {
-        self.0.stop();
+    /// Requests shutdown; the driver drains its close for up to
+    /// `timeout_ms` and reports how that went as its last event,
+    /// `EndpointClosed`.
+    pub fn stop(&self, timeout_ms: u64) {
+        self.0.stop(timeout_ms);
     }
     /// Waits for complete driver shutdown.
     pub fn wait_stopped(&self, timeout_ms: u64) -> bool {
@@ -149,11 +151,12 @@ impl P2pEndpoint {
     pub fn disconnect(&self, peer_id: String) -> Result<(), FfiError> {
         self.0.disconnect(peer_id)
     }
-    /// Returns the current path to a peer.
+    /// Returns the path of a peer's established connection; `None` only
+    /// while the peer is not connected.
     pub fn path(&self, peer_id: String) -> Result<Option<PathKind>, FfiError> {
         self.0.path(peer_id)
     }
-    /// Returns the transport connection selected for a peer.
+    /// Returns a snapshot of a peer's established connection.
     pub fn connection_info(&self, peer_id: String) -> Result<Option<ConnectionInfo>, FfiError> {
         self.0.connection_info(peer_id)
     }

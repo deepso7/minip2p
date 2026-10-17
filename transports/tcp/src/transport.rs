@@ -10,37 +10,26 @@ use minip2p_secure_mux::{
     SecureMuxSession, SessionConfig, SessionError, SessionOutput, SessionRole, YamuxError,
 };
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, ConnectionState,
-    ConnectionToken, InvalidLimit, MemoryLedger, StreamId, Transport, TransportError,
-    TransportEvent, UnsettledConnections,
+    ConnectionCloseReason, ConnectionEndpoint, ConnectionId, ConnectionIdAllocator,
+    ConnectionNamespace, ConnectionState, ConnectionToken, InvalidLimit, MemoryLedger, StreamId,
+    Transport, TransportError, TransportEvent, UnsettledConnections,
 };
 
 use crate::config::TcpConfig;
 use crate::provider::{SocketHandle, TcpError, TcpEvent, TcpProvider};
 
 /// Why a connection is being torn down.
-struct Teardown {
-    /// Text for the public [`TransportEvent::Error`], if one is emitted.
-    message: String,
-    /// The remote ended an established session cleanly rather than failing.
-    graceful: bool,
-}
+struct Teardown(ConnectionCloseReason);
 
 impl Teardown {
     fn fault(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            graceful: false,
-        }
+        Self(ConnectionCloseReason::Error(message.into()))
     }
 }
 
 impl From<SessionError> for Teardown {
     fn from(error: SessionError) -> Self {
-        Self {
-            graceful: matches!(error, SessionError::GoAway { code: 0 }),
-            message: error.to_string(),
-        }
+        Self(error.close_reason())
     }
 }
 
@@ -120,16 +109,18 @@ impl Connection {
     /// When this connection next needs a poll, [`Deadline::IMMEDIATE`] as 0.
     fn wake_at(&self, stall_timeout: Option<u64>) -> Option<u64> {
         // An unauthenticated connection has to be revisited when its patience
-        // runs out, whether or not it has anything queued.
+        // runs out, and an established one when its keepalive is due, whether
+        // or not it has anything queued: a backed-up write path to a dead
+        // peer is exactly what keepalive has to catch.
         let mut at = self.authenticate_by;
         let mut fold = |deadline: u64| at = Some(at.map_or(deadline, |at| at.min(deadline)));
+        if let Some(keepalive) = self.session.next_deadline() {
+            fold(keepalive.as_millis());
+        }
         if self.outbound.is_empty() {
             if self.linked && self.session.has_pending_write() {
                 // Framed bytes with room to put them: come straight back.
                 return Some(0);
-            }
-            if let Some(keepalive) = self.session.next_deadline() {
-                fold(keepalive.as_millis());
             }
         } else if let Some(since) = self.stalled_since {
             // The socket is refusing bytes, and spinning would not change
@@ -499,22 +490,19 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         result
     }
 
-    /// Tears a connection down, emitting `Closed` and optionally `Error`.
+    /// Tears a connection down, emitting `Closed` with `reason`.
     ///
     /// Aborting the socket is what makes this final: a provider emits nothing
     /// further for an aborted handle, so no late event can resurrect the id.
-    fn fail_connection(&mut self, id: ConnectionId, message: String, emit_error: bool) {
+    fn fail_connection(&mut self, id: ConnectionId, reason: ConnectionCloseReason) {
         let Some(connection) = self.retire(id) else {
             return;
         };
         self.forget(&connection);
         self.by_socket.remove(&connection.socket);
         self.provider.abort(connection.socket);
-        if emit_error {
-            self.pending
-                .push_back(TransportEvent::Error { id, message });
-        }
-        self.pending.push_back(TransportEvent::Closed { id });
+        self.pending
+            .push_back(TransportEvent::Closed { id, reason });
     }
 
     /// Feeds a session and flushes, tearing the connection down on failure.
@@ -523,14 +511,6 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         id: ConnectionId,
         operation: impl FnOnce(&mut SecureMuxSession, &mut MemoryLedger) -> Result<(), SessionError>,
     ) {
-        // A failed session is unusable, so `is_established` reads false
-        // afterwards: capture it first. A normal remote GoAway on an
-        // established connection must close without being reported as a
-        // failed handshake.
-        let pre_established = self
-            .connections
-            .get(&id)
-            .is_some_and(|connection| !connection.session.is_established());
         let result = self.with_connection(id, |this, connection| {
             let fed = operation(&mut connection.session, &mut this.ledger);
             // Pump either way: bytes the session queued before failing, and
@@ -539,7 +519,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             fed.map_err(Teardown::from).and(pumped)
         });
         if let Err(teardown) = result {
-            self.fail_connection(id, teardown.message, pre_established || !teardown.graceful);
+            self.fail_connection(id, teardown.0);
         }
     }
 
@@ -547,9 +527,9 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
     /// whatever it queued.
     ///
     /// A failure that kills the session closes the connection before
-    /// returning. No `Error` event goes out: the caller already learns why
-    /// from the returned error, exactly as for a locally requested
-    /// [`Transport::close`].
+    /// returning, with the failure as its close reason, and returns
+    /// [`TransportError::ConnectionClosed`] so the caller can tell its
+    /// operation ended the connection.
     fn operate_session<R>(
         &mut self,
         id: ConnectionId,
@@ -565,10 +545,12 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         self.connections.insert(id, connection);
         self.touch(id);
 
-        if let Err(teardown) = pumped {
-            self.fail_connection(id, teardown.message.clone(), false);
-            return Err(TransportError::PollError {
-                reason: teardown.message,
+        if let Err(Teardown(reason)) = pumped {
+            let message = reason.to_string();
+            self.fail_connection(id, reason);
+            return Err(TransportError::ConnectionClosed {
+                id,
+                reason: message,
             });
         }
         match result {
@@ -615,8 +597,8 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             // exhausted the control reserve (see `YamuxSession::reset`).
             Err(fatal) => {
                 let reason = fatal.to_string();
-                self.fail_connection(id, reason.clone(), false);
-                Err(TransportError::PollError { reason })
+                self.fail_connection(id, ConnectionCloseReason::Error(reason.clone()));
+                Err(TransportError::ConnectionClosed { id, reason })
             }
         }
     }
@@ -651,12 +633,11 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 // libp2p needs the stream in both directions, so a remote FIN
                 // ends the connection. Yamux carries its own orderly shutdown
                 // and would have surfaced it before this.
-                self.close_from_provider(socket, "remote closed its write side".to_string(), false);
+                self.close_from_provider(socket, "remote closed its write side".to_string());
             }
             TcpEvent::Closed { socket, reason } => {
-                let graceful = reason.is_none();
                 let message = reason.unwrap_or_else(|| "byte stream closed".to_string());
-                self.close_from_provider(socket, message, graceful);
+                self.close_from_provider(socket, message);
             }
         }
     }
@@ -729,11 +710,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 .authenticate_by
                 .get_or_insert(now.monotonic_ms.saturating_add(limit));
             if now.monotonic_ms >= deadline {
-                self.fail_connection(
-                    id,
-                    format!("the upgrade did not complete within {limit}ms"),
-                    true,
-                );
+                self.fail_connection(id, ConnectionCloseReason::TimedOut);
                 return;
             }
         }
@@ -748,7 +725,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         if let Err(teardown) =
             self.with_connection(id, |this, connection| this.pump_and_flush(connection))
         {
-            self.fail_connection(id, teardown.message, true);
+            self.fail_connection(id, teardown.0);
             return;
         }
         let Some(connection) = self.connections.get_mut(&id) else {
@@ -759,26 +736,26 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             // make the next socketful look like the tail of an old stall and
             // fail the connection on the spot.
             connection.stalled_since = None;
-            // Yamux keepalive, only when the socket can take the ping. This
-            // runs after the retry so an established session whose final
-            // upgrade bytes just drained gets its first keepalive deadline in
-            // this poll.
-            if connection.session.is_established() {
-                self.drive_connection(id, |session, _| session.poll(now));
-            }
         } else if let Some(since) = connection.stalled_since {
             // Still set: the socket took nothing this poll.
             let stalled_for = now.saturating_millis_since(Now::from_millis(since));
             if let Some(limit) = self.config.send_stall_timeout_ms
                 && stalled_for >= limit
             {
-                self.fail_connection(
-                    id,
-                    format!("socket accepted nothing for {stalled_for}ms; peer is not reading"),
-                    true,
-                );
+                self.fail_connection(id, ConnectionCloseReason::Stalled);
                 return;
             }
+        }
+        // Yamux keepalive, backlog or not: a ping that cannot get into the
+        // outbound buffer is timed too. This runs after the retry, so the
+        // poll dates a ping the retry just pulled, and a session whose final
+        // upgrade bytes just drained gets its first keepalive deadline here.
+        if self
+            .connections
+            .get(&id)
+            .is_some_and(|connection| connection.session.is_established())
+        {
+            self.drive_connection(id, |session, _| session.poll(now));
         }
 
         // Driving the session above queued it as work; only a backlog keeps it
@@ -793,15 +770,12 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         self.reschedule(id);
     }
 
-    fn close_from_provider(&mut self, socket: SocketHandle, message: String, graceful: bool) {
-        let Some(id) = self.by_socket.get(&socket).copied() else {
-            return;
-        };
-        let pre_established = self
-            .connections
-            .get(&id)
-            .is_some_and(|connection| !connection.session.is_established());
-        self.fail_connection(id, message, pre_established || !graceful);
+    /// Ends the connection on `socket` after the byte stream under it ended
+    /// without a Yamux `GoAway`.
+    fn close_from_provider(&mut self, socket: SocketHandle, message: String) {
+        if let Some(id) = self.by_socket.get(&socket).copied() {
+            self.fail_connection(id, ConnectionCloseReason::Error(message));
+        }
     }
 
     fn drain_pending_events(&mut self) -> Vec<TransportEvent> {
@@ -993,7 +967,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
 
     fn set_control_stream(&mut self, id: ConnectionId, stream_id: StreamId, control: bool) {
         // Nothing returns to the caller, so a session the mark's flush fails
-        // is torn down with an `Error` carrying the reason.
+        // is torn down with the failure as its close reason.
         if self.connections.contains_key(&id) {
             self.drive_connection(id, |session, _| {
                 session.set_control_stream(stream_id, control)
@@ -1024,7 +998,10 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         // Every write side ended with the connection.
         self.pending
             .retain(|event| !matches!(event, TransportEvent::StreamWritable { id: owner, .. } if *owner == id));
-        self.pending.push_back(TransportEvent::Closed { id });
+        self.pending.push_back(TransportEvent::Closed {
+            id,
+            reason: ConnectionCloseReason::Local,
+        });
         Ok(())
     }
 
@@ -1089,11 +1066,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
     }
 }
 
-/// Wraps a session failure as the stream error the transport contract expects.
-///
-/// Identifier and state errors pass through: they describe the request rather
-/// than the stream operation, and callers match on them. So does Full, which
-/// carries the caller's unsent tail.
 /// Drops a `StreamWritable` already queued for a stream whose write side
 /// just ended: a Full can queue one before its call returns, and Writable
 /// never follows the end of a write side.
@@ -1101,12 +1073,20 @@ fn drop_writable(pending: &mut VecDeque<TransportEvent>, id: ConnectionId, strea
     pending.retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
 }
 
+/// Wraps a session failure as the stream error the transport contract expects.
+///
+/// Identifier and state errors pass through: they describe the request rather
+/// than the stream operation, and callers match on them. So does Full, which
+/// carries the caller's unsent tail, and ConnectionClosed, which tells the
+/// swarm the failure already ended the connection and is reported by its
+/// `Closed` alone.
 fn stream_error(
     error: TransportError,
     wrap: impl FnOnce(String) -> TransportError,
 ) -> TransportError {
     match error {
         error @ (TransportError::ConnectionNotFound { .. }
+        | TransportError::ConnectionClosed { .. }
         | TransportError::StreamNotFound { .. }
         | TransportError::InvalidState { .. }
         | TransportError::Full { .. }) => error,

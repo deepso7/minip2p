@@ -17,8 +17,12 @@ export declare class NodeEndpoint {
   constructor(secretKey: Uint8Array, config: NodeEndpointConfig)
   /** Starts the detached driver with a strong event-loop doorbell. */
   start(doorbell: () => void): void
-  /** Requests shutdown without waiting for the driver thread. */
-  close(): void
+  /**
+   * Requests shutdown without waiting for the driver thread, which drains
+   * for up to `timeoutMs` and then delivers `EndpointClosed` as its last
+   * event.
+   */
+  close(timeoutMs: number): void
   /** Returns the local peer ID. */
   peerId(): string
   /** Returns bound peer addresses. */
@@ -78,9 +82,12 @@ export declare class NodeEndpoint {
   cancelConnect(id: bigint): void
   /** Disconnects one peer. */
   disconnect(peerId: string): void
-  /** Returns the current path to a peer. */
+  /**
+   * Returns the path of a peer's established connection; `null` only
+   * while the peer is not connected.
+   */
   path(peerId: string): NativePathKind | null
-  /** Returns the transport connection selected for a peer. */
+  /** Returns a snapshot of a peer's established connection. */
   connectionInfo(peerId: string): NativeConnectionInfo | null
   /** Returns the discovery address book. */
   knownPeers(): Array<NativeKnownPeerInfo>

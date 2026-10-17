@@ -1,4 +1,7 @@
 use minip2p_core::PeerId;
+// The connection path NAT events report; owned by core so the Endpoint can
+// name it without NAT.
+pub use minip2p_core::Path;
 
 /// Opaque correlation token the agent allocates for work whose result the
 /// host reports later: a dial the host parked to resolve its named address
@@ -11,29 +14,6 @@ use minip2p_core::PeerId;
 /// [`NatAction::PromoteBridge`]: crate::NatAction::PromoteBridge
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NatToken(pub(crate) u64);
-
-/// A usable path to a peer.
-///
-/// Ranking: [`Path::DirectDialed`] ≈ [`Path::DirectPunched`] >
-/// [`Path::Relayed`]. When a better path becomes available after a worse one
-/// was announced, the agent emits an explicit
-/// [`NatEvent::PathUpgraded`](crate::NatEvent::PathUpgraded) — never a silent
-/// switch.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum Path {
-    /// A direct QUIC connection established by dialing a known candidate
-    /// address. Use the ordinary swarm APIs with the peer id.
-    DirectDialed,
-    /// A direct QUIC connection established by a DCUtR hole punch. Use the
-    /// ordinary swarm APIs with the peer id.
-    DirectPunched,
-    /// A full Noise- and Yamux-protected connection through a relay.
-    Relayed {
-        /// The relay carrying the circuit connection.
-        relay: PeerId,
-    },
-}
 
 /// Our current view of this node's reachability from the public internet.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

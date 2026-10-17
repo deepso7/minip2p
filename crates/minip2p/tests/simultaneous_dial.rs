@@ -198,7 +198,7 @@ fn event_connection(event: &TransportEvent) -> Option<ConnectionId> {
         | TransportEvent::StreamRemoteWriteClosed { id, .. }
         | TransportEvent::StreamWriteStopped { id, .. }
         | TransportEvent::StreamClosed { id, .. }
-        | TransportEvent::Closed { id }
+        | TransportEvent::Closed { id, .. }
         | TransportEvent::Error { id, .. }
         | TransportEvent::IncomingConnection { id, .. }
         | TransportEvent::PeerIdentityVerified { id, .. } => Some(*id),

@@ -17,7 +17,8 @@
 //! it has room -- frames are encrypted only when pulled, so a full downstream
 //! is backpressure rather than growing buffers. After the upgrade,
 //! [`SecureMuxSession::poll`] / [`SecureMuxSession::next_deadline`] drive
-//! Yamux keepalive from the host's time sample. `no_std + alloc`.
+//! Yamux keepalive from the host's time sample; a peer that stops answering
+//! fails the session with [`YamuxError::KeepaliveTimeout`]. `no_std + alloc`.
 //!
 //! The Noise XX and Yamux state machines it drives are public as the
 //! [`noise`] and [`yamux`] modules.
@@ -53,6 +54,7 @@ mod session;
 pub mod yamux;
 
 pub use session::{
-    KEEPALIVE_INTERVAL_MS, MAX_INPUT_BATCH, NOISE_WIRE_FRAME, SecureMuxSession, SessionConfig,
-    SessionError, SessionOutput, SessionRole, YamuxConfig, YamuxError,
+    KEEPALIVE_ACK_TIMEOUT_MS, KEEPALIVE_HANDOFF_TIMEOUT_MS, KEEPALIVE_INTERVAL_MS, MAX_INPUT_BATCH,
+    NOISE_WIRE_FRAME, SecureMuxSession, SessionConfig, SessionError, SessionOutput, SessionRole,
+    YamuxConfig, YamuxError,
 };

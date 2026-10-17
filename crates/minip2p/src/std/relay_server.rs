@@ -200,6 +200,7 @@ impl RelayServerDriver {
                     | Err(DriverError::Transport(
                         TransportError::StreamNotFound { .. }
                         | TransportError::ConnectionNotFound { .. }
+                        | TransportError::ConnectionClosed { .. }
                         | TransportError::PollError { .. },
                     )) => {}
                     // Anything else (an ack past what was delivered, say)

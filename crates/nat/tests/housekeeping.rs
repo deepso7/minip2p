@@ -4,6 +4,7 @@
 mod common;
 
 use common::*;
+use minip2p_swarm::ConnectionCloseReason;
 
 use minip2p_autonat::{AUTONAT_PROTOCOL_ID, ResponseStatus};
 use minip2p_core::{PeerAddr, PeerId};
@@ -438,6 +439,7 @@ fn servers_dialing_back_our_observed_ip_confirm_the_listen_port_there() {
         let mut hk = build(ReservationPolicy::Never, 0, 3);
         hk.agent.set_listen_addrs(&[maddr(listen)]);
         for server in hk.servers.clone() {
+            hk.session_ready(&server, &[AUTONAT_PROTOCOL_ID], at(0));
             identify_observed(&mut hk.agent, &server, &maddr(observed), at(0));
         }
         let public = [maddr(dialed_back)];
@@ -460,26 +462,38 @@ fn servers_dialing_back_our_observed_ip_confirm_the_listen_port_there() {
 }
 
 #[test]
-fn a_dual_stack_reporter_contributes_its_ipv4_and_ipv6_observations() {
-    let mut hk = build(ReservationPolicy::Never, 0, 3);
+fn different_reporters_contribute_different_families() {
+    // Each reporter vouches only for the family of its own connection, so
+    // a dual-stack host learns its IPv4 mapping from an AutoNAT server
+    // reached over IPv4 and its IPv6 one from a relay reached over IPv6.
+    let mut hk = build(ReservationPolicy::Never, 1, 3);
     hk.agent.set_listen_addrs(&[
         maddr("/ip4/10.0.0.2/tcp/4001"),
         maddr("/ip6/fd00::2/tcp/4001"),
     ]);
-    for server in hk.servers.clone() {
-        identify_observed(
-            &mut hk.agent,
-            &server,
-            &maddr("/ip4/203.0.113.77/tcp/51234"),
-            at(0),
-        );
-        identify_observed(
-            &mut hk.agent,
-            &server,
-            &maddr("/ip6/2001:db8::77/tcp/51235"),
-            at(0),
-        );
-    }
+    let server = hk.server.clone();
+    hk.session_ready(&server, &[AUTONAT_PROTOCOL_ID], at(0));
+    identify_observed(
+        &mut hk.agent,
+        &server,
+        &maddr("/ip4/203.0.113.77/tcp/51234"),
+        at(0),
+    );
+    let relay = hk.relay.clone();
+    hk.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: relay.clone(),
+            conn_id: ConnectionId::new(7),
+        },
+        false,
+        at(0),
+    );
+    identify_observed(
+        &mut hk.agent,
+        &relay,
+        &maddr("/ip6/2001:db8::77/tcp/51235"),
+        at(0),
+    );
     let public = [
         maddr("/ip4/203.0.113.77/tcp/4001"),
         maddr("/ip6/2001:db8::77/tcp/4001"),
@@ -1012,6 +1026,7 @@ fn lost_relay_connection_emits_lost_and_reacquires() {
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay.clone(),
+            reason: ConnectionCloseReason::Local,
         },
         false,
         at(5_000),
@@ -1056,6 +1071,7 @@ fn retiring_another_relay_connection_keeps_the_reservation() {
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(2),
             peer_id: relay,
+            reason: ConnectionCloseReason::Local,
         },
         false,
         at(21),
@@ -1493,6 +1509,7 @@ fn reservation_retries_back_off_exponentially_and_reset_on_success() {
         &SwarmEvent::ConnectionClosed {
             conn_id: hk.agent.swarm.connection(&relay).expect("relay session"),
             peer_id: relay.clone(),
+            reason: ConnectionCloseReason::Local,
         },
         false,
         at(now + 1),

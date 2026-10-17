@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use minip2p::{EndpointWaitOutcome, Error, WaitDeadline};
+use minip2p::{EndpointWaitOutcome, Error, PeerId, WaitDeadline};
 
 use crate::endpoint::{Lifecycle, Shared};
-use crate::events::convert_endpoint_event;
+use crate::events::{CloseOutcome, UnfinishedConnection, convert_endpoint_event};
 use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
 
 const MAX_CARRY_EVENTS: usize = 4096;
@@ -575,6 +575,11 @@ impl Drop for ExitGuard {
     }
 }
 
+/// Runs the driver until `stop` or a failure, then closes the endpoint
+/// outside the state lock: within the stop's timeout, or at once after a
+/// failure. The close's events, but for attempt terminals, are carried
+/// ahead of the last event, `EndpointClosed`; the guard then latches
+/// stopped. Only a panic leaves the endpoint to the guard's plain drop.
 pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
     shared.lock_state().driver_thread_id = Some(std::thread::current().id());
     let mut guard = ExitGuard {
@@ -582,30 +587,74 @@ pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
         doorbell: Some(doorbell),
     };
     let result = catch_unwind(AssertUnwindSafe(|| pump(&mut guard)));
-    let report_failure = {
+    let (failure, endpoint, timeout) = {
         let mut state = guard.shared.lock_state();
-        if state.lifecycle == Lifecycle::Running && matches!(&result, Err(_) | Ok(Err(_))) {
+        let failed = matches!(&result, Err(_) | Ok(Err(_)));
+        let panicked = result.is_err();
+        let report_failure = state.lifecycle == Lifecycle::Running && failed;
+        if report_failure {
             guard.shared.set_lifecycle(&mut state, Lifecycle::Stopping);
-            true
-        } else {
-            false
         }
-    };
-    if report_failure && let Some(doorbell) = guard.doorbell.as_ref() {
-        let event = match result {
-            Ok(Err(error)) => P2pEvent::DriverFailed {
+        let failure = match result {
+            Ok(Err(error)) if report_failure => Some(P2pEvent::DriverFailed {
                 kind: failure_kind(&error),
                 detail: error.to_string(),
-            },
-            Err(_) => P2pEvent::DriverFailed {
+            }),
+            Err(_) if report_failure => Some(P2pEvent::DriverFailed {
                 kind: DriverFailureKind::Panic,
                 detail: "background endpoint driver panicked".into(),
-            },
-            Ok(Ok(())) => return,
+            }),
+            _ => None,
         };
-        if guard.shared.lock_events().ingest([event]) {
-            ring(doorbell);
+        // A panic may have left the endpoint mid-update: the guard drops it.
+        let endpoint = if panicked {
+            None
+        } else {
+            state.release_endpoint()
+        };
+        let timeout = if failed {
+            Duration::ZERO
+        } else {
+            state.close_timeout
+        };
+        (failure, endpoint, timeout)
+    };
+    // The drain's events (connection ends among them) go to the binding
+    // ahead of `EndpointClosed`.
+    let mut drained = Vec::new();
+    let closed = match endpoint {
+        Some(endpoint) => {
+            let report = endpoint.close_within(timeout);
+            drained.extend(
+                report
+                    .events
+                    .into_iter()
+                    .filter_map(crate::events::convert_detached_event),
+            );
+            P2pEvent::EndpointClosed {
+                outcome: report.outcome.into(),
+                unfinished: report
+                    .unfinished
+                    .into_iter()
+                    .map(|(conn_id, peer)| UnfinishedConnection {
+                        conn_id: conn_id.as_u64(),
+                        peer_id: peer.as_ref().map(PeerId::to_base58),
+                    })
+                    .collect(),
+            }
         }
+        None => P2pEvent::EndpointClosed {
+            outcome: CloseOutcome::Failed,
+            unfinished: Vec::new(),
+        },
+    };
+    if let Some(doorbell) = guard.doorbell.as_ref()
+        && guard
+            .shared
+            .lock_events()
+            .ingest(failure.into_iter().chain(drained).chain([closed]))
+    {
+        ring(doorbell);
     }
 }
 
@@ -826,7 +875,7 @@ mod tests {
                 connect_id: 7,
                 peer_id: "peer".into(),
                 conn_id: 70,
-                path: crate::PathKind::DirectDialed,
+                path: crate::PathKind::Direct,
             }),
             Some(7)
         );
@@ -866,7 +915,7 @@ mod tests {
                 from: crate::PathKind::Relayed {
                     relay_peer_id: "relay".into()
                 },
-                to: crate::PathKind::DirectPunched,
+                to: crate::PathKind::Punched,
                 old_conn_id: 1,
                 new_conn_id: 2,
             }),
@@ -1021,6 +1070,7 @@ mod tests {
         P2pEvent::ConnectionClosed {
             peer_id: "peer".into(),
             conn_id,
+            reason: crate::ConnectionCloseReason::Local,
         }
     }
 
@@ -1076,7 +1126,7 @@ mod tests {
         let terminal = P2pEvent::PathEstablished {
             connect_id: 9,
             peer_id: "peer".into(),
-            path: crate::PathKind::DirectDialed,
+            path: crate::PathKind::Direct,
             conn_id: 3,
         };
         let kept = [
@@ -1140,7 +1190,7 @@ mod tests {
         let path = |conn_id| P2pEvent::InboundPathEstablished {
             peer_id: "peer".into(),
             conn_id,
-            path: crate::PathKind::DirectDialed,
+            path: crate::PathKind::Direct,
         };
         carry.push(established(6));
         carry.push(closed(6));
@@ -1159,7 +1209,7 @@ mod tests {
         let settled = P2pEvent::PathEstablished {
             connect_id: 10,
             peer_id: "peer".into(),
-            path: crate::PathKind::DirectDialed,
+            path: crate::PathKind::Direct,
             conn_id: 6,
         };
         carry.push(settled.clone());

@@ -186,11 +186,28 @@ export interface RelayReservationInfo {
   readonly expiresUnixSecs?: number;
 }
 
-/** A usable NAT-orchestrated connection path. */
+/**
+ * How an established connection was made: `direct` (dialed or accepted),
+ * `punched` (by a DCUtR hole punch), or `relayed` through a relay. A
+ * replacement connection has its own path.
+ */
 export type Path =
-  | { readonly kind: "directDialed" }
-  | { readonly kind: "directPunched" }
+  | { readonly kind: "direct" }
+  | { readonly kind: "punched" }
   | { readonly kind: "relayed"; readonly relayPeerId: string };
+
+/**
+ * Why one connection ended. `remote` carries the peer's close code: its QUIC
+ * CONNECTION_CLOSE code, or its Yamux GoAway code over TCP and relay
+ * circuits. `timedOut` means the peer went silent, `stalled` that it stopped
+ * reading.
+ */
+export type ConnectionCloseReason =
+  | { readonly kind: "local" }
+  | { readonly kind: "remote"; readonly code: bigint }
+  | { readonly kind: "timedOut" }
+  | { readonly kind: "stalled" }
+  | { readonly kind: "error"; readonly message: string };
 
 /** Serializable metadata for an inbound stream catch-all event. */
 export interface InboundStreamMeta {
@@ -214,8 +231,16 @@ export interface Minip2pNamedEventMap {
   };
   /** A peer went from disconnected to connected on `connId`. */
   connectionEstablished: { readonly peerId: string; readonly connId: number };
-  /** The peer's last connection closed; the peer is now disconnected. */
-  connectionClosed: { readonly peerId: string; readonly connId: number };
+  /**
+   * The peer's last connection closed, for `reason`; the peer is now
+   * disconnected. A failure that ended it is its `reason`, never also an
+   * `endpointError`.
+   */
+  connectionClosed: {
+    readonly peerId: string;
+    readonly connId: number;
+    readonly reason: ConnectionCloseReason;
+  };
   /**
    * A newer connection took the peer's single connection slot from
    * `oldConnId`. The peer stays connected: this stands in for both a
@@ -416,15 +441,20 @@ export interface ConnectOptions extends OpOptions {
   readonly cancelOnTimeout?: boolean;
 }
 
-/** The transport connection currently selected for a peer. */
+/** A snapshot of a peer's established connection. */
 export interface ConnectionInfo {
+  /** The peer on the other end. */
+  readonly peerId: string;
   /** Endpoint-local connection identifier, as carried by connection events. */
   readonly connId: number;
-  /** Remote transport address, when known. */
-  readonly remoteAddr?: string;
+  /** Remote transport address; a circuit reports `/p2p/<relay>/p2p-circuit`. */
+  readonly remoteAddr: string;
+  /** How the connection was made. */
+  readonly path: Path;
   /**
-   * Protocols this connection advertised, once it is ready; absent until
-   * then. Readiness, `connId` and protocols come from one native snapshot.
+   * Protocols this connection advertised through Identify, once it is ready;
+   * absent until then, which is distinct from an empty list. Readiness,
+   * `connId` and protocols come from one native snapshot.
    */
   readonly readyProtocols?: readonly string[];
 }
@@ -453,12 +483,38 @@ export interface ConnectResult {
   readonly path: Path;
 }
 
-/** Reason reported to endpoint close observers. */
-export type CloseReason =
-  | { readonly reason: "close" }
+/** How the native close drain ended. */
+export const CloseOutcome = {
+  /** The close deadline passed with connections still tracked. */
+  DeadlineExpired: "DeadlineExpired",
+  /** Every tracked connection finished its teardown in time. */
+  Drained: "Drained",
+  /** Driving the transports failed and ended the drain early. */
+  Failed: "Failed",
+} as const;
+export type CloseOutcome = (typeof CloseOutcome)[keyof typeof CloseOutcome];
+
+/** Why the endpoint stopped: the application closed it, or its driver failed. */
+export type EndpointCloseReason = EndpointCloseReport["reason"];
+
+/**
+ * What endpoint close observers receive once the native drain finished.
+ * `unfinished` lists the peers whose connections were still tracked when it
+ * ended (an inbound handshake that had not identified its peer is not
+ * listed); empty means no tracked teardown remains, not that peers
+ * acknowledged it. A failed driver tears down at once, so its report has no
+ * `outcome`.
+ */
+export type EndpointCloseReport =
+  | {
+      readonly reason: "close";
+      readonly outcome: CloseOutcome;
+      readonly unfinished: readonly string[];
+    }
   | {
       readonly reason: "driverFailed";
       readonly error: DriverFailedError;
+      readonly unfinished: readonly string[];
     };
 
 /** Idempotent callback that removes a subscription. */
@@ -466,17 +522,38 @@ export type Unsubscribe = () => void;
 
 /** Raw backend-only path tags. */
 export const PathKind_Tags = {
-  DirectDialed: "DirectDialed",
-  DirectPunched: "DirectPunched",
+  Direct: "Direct",
+  Punched: "Punched",
   Relayed: "Relayed",
 } as const;
 export type PathKindTag = (typeof PathKind_Tags)[keyof typeof PathKind_Tags];
 export type PathKind =
-  | { readonly tag: typeof PathKind_Tags.DirectDialed }
-  | { readonly tag: typeof PathKind_Tags.DirectPunched }
+  | { readonly tag: typeof PathKind_Tags.Direct }
+  | { readonly tag: typeof PathKind_Tags.Punched }
   | {
       readonly tag: typeof PathKind_Tags.Relayed;
       readonly inner: { readonly relayPeerId: string };
+    };
+
+/** Raw backend-only connection close reason tags. */
+export const ConnectionCloseReason_Tags = {
+  Error: "Error",
+  Local: "Local",
+  Remote: "Remote",
+  Stalled: "Stalled",
+  TimedOut: "TimedOut",
+} as const;
+export type RawConnectionCloseReason =
+  | { readonly tag: typeof ConnectionCloseReason_Tags.Local }
+  | {
+      readonly tag: typeof ConnectionCloseReason_Tags.Remote;
+      readonly inner: { readonly code: bigint };
+    }
+  | { readonly tag: typeof ConnectionCloseReason_Tags.TimedOut }
+  | { readonly tag: typeof ConnectionCloseReason_Tags.Stalled }
+  | {
+      readonly tag: typeof ConnectionCloseReason_Tags.Error;
+      readonly inner: { readonly message: string };
     };
 
 /** Raw backend-only event tags. */
@@ -489,6 +566,7 @@ export const P2pEvent_Tags = {
   DiscoveryDialFailed: "DiscoveryDialFailed",
   DiscoveryProtocolViolation: "DiscoveryProtocolViolation",
   DriverFailed: "DriverFailed",
+  EndpointClosed: "EndpointClosed",
   EndpointError: "EndpointError",
   EventsDropped: "EventsDropped",
   GossipsubOutboundFailure: "GossipsubOutboundFailure",
@@ -542,12 +620,19 @@ export type P2pEvent =
       { kind: DriverFailureKind; detail: string }
     >
   | RawEvent<
+      typeof P2pEvent_Tags.EndpointClosed,
+      {
+        outcome: CloseOutcome;
+        unfinished: { connId: number; peerId?: string }[];
+      }
+    >
+  | RawEvent<
       typeof P2pEvent_Tags.ConnectionEstablished,
       { peerId: string; connId: number }
     >
   | RawEvent<
       typeof P2pEvent_Tags.ConnectionClosed,
-      { peerId: string; connId: number }
+      { peerId: string; connId: number; reason: RawConnectionCloseReason }
     >
   | RawEvent<
       typeof P2pEvent_Tags.ConnectionReplaced,

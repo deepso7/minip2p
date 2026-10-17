@@ -10,10 +10,13 @@ use minip2p_core::Bytes;
 use minip2p_core::platform::{Deadline, Now};
 use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
-use minip2p_transport::{MemoryLedger, StreamId};
+use minip2p_transport::{ConnectionCloseReason, MemoryLedger, StreamId};
 use thiserror::Error;
 
-pub use crate::yamux::{KEEPALIVE_INTERVAL_MS, YamuxConfig, YamuxError};
+pub use crate::yamux::{
+    KEEPALIVE_ACK_TIMEOUT_MS, KEEPALIVE_HANDOFF_TIMEOUT_MS, KEEPALIVE_INTERVAL_MS, YamuxConfig,
+    YamuxError,
+};
 
 /// Which end of the session opened the underlying byte stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,6 +135,20 @@ pub enum SessionError {
 impl SessionError {
     fn protocol(reason: impl Into<String>) -> Self {
         Self::Protocol(reason.into())
+    }
+
+    /// Why the connection ends when this error tears its session down: a
+    /// remote `GoAway` is [`ConnectionCloseReason::Remote`] with its code, a
+    /// keepalive that went unanswered is [`ConnectionCloseReason::TimedOut`],
+    /// and anything else is a fault.
+    pub fn close_reason(&self) -> ConnectionCloseReason {
+        match self {
+            Self::GoAway { code } => ConnectionCloseReason::Remote {
+                code: u64::from(*code),
+            },
+            Self::Yamux(YamuxError::KeepaliveTimeout) => ConnectionCloseReason::TimedOut,
+            error => ConnectionCloseReason::Error(error.to_string()),
+        }
     }
 }
 
@@ -452,8 +469,14 @@ impl SecureMuxSession {
     /// Advances Yamux keepalive using the host's time sample.
     ///
     /// A no-op until the upgrade has finished: there is no Yamux session to
-    /// ping during negotiation. After that, quiet sessions queue a ping for
-    /// [`poll_write`](Self::poll_write).
+    /// ping during negotiation. After that, a session that has received
+    /// nothing for a while queues a ping for [`poll_write`](Self::poll_write),
+    /// and one whose ping is not pulled or not answered in time fails with
+    /// [`YamuxError::KeepaliveTimeout`] (see [`YamuxSession::poll`]): the
+    /// peer went silent. Its substreams' closes follow in the outputs.
+    ///
+    /// Call this whenever the deadline comes, even while the downstream is
+    /// full: a backed-up write path is what the hand-off bound measures.
     pub fn poll(&mut self, now: Now) -> Result<(), SessionError> {
         match self.with_yamux(|yamux| yamux.poll(now)) {
             Ok(()) | Err(SessionError::NotEstablished) => Ok(()),
@@ -1153,6 +1176,22 @@ fn yamux_stream(stream: StreamId) -> Result<u32, SessionError> {
 mod tests {
     use super::*;
     use crate::yamux::{FLAG_SYN, Frame};
+
+    #[test]
+    fn session_errors_map_to_close_reasons() {
+        assert_eq!(
+            SessionError::GoAway { code: 2 }.close_reason(),
+            ConnectionCloseReason::Remote { code: 2 }
+        );
+        assert_eq!(
+            SessionError::Yamux(YamuxError::KeepaliveTimeout).close_reason(),
+            ConnectionCloseReason::TimedOut
+        );
+        assert!(matches!(
+            SessionError::protocol("bad frame").close_reason(),
+            ConnectionCloseReason::Error(reason) if reason == "bad frame"
+        ));
+    }
 
     #[test]
     fn responder_allows_fallback_before_noise() {

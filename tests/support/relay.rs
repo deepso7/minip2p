@@ -113,7 +113,9 @@ impl RelayMachine {
             } => self.drop_stream(endpoint, &(peer_id, conn_id, stream_id)),
             // A replaced connection ends its streams without per-stream
             // `StreamClosed` events, exactly like a closed one.
-            EndpointEvent::ConnectionClosed { peer_id, conn_id }
+            EndpointEvent::ConnectionClosed {
+                peer_id, conn_id, ..
+            }
             | EndpointEvent::ConnectionReplaced {
                 peer_id,
                 old: conn_id,

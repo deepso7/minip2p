@@ -3,6 +3,7 @@
 //! stop or reset, opens past peer credit, copied reads, close reporting,
 //! keepalive, and what the transport advertises.
 
+use minip2p_transport::ConnectionCloseReason;
 use std::time::{Duration, Instant};
 
 use quinn_proto::{Dir, ReadError};
@@ -665,17 +666,32 @@ fn connected_pair(
 }
 
 #[test]
-fn an_orderly_peer_close_reports_closed_without_an_error() {
+fn a_close_is_local_on_the_closing_side_and_remote_on_the_peer() {
     let (mut server, mut client, server_id, client_id) = connected_pair(QuicLimits::default());
     client.close(client_id).expect("close");
 
     let mut events = Vec::new();
+    let mut client_events = Vec::new();
     let start = Instant::now();
-    while !events.contains(&TransportEvent::Closed { id: server_id }) {
+    while !events.contains(&TransportEvent::Closed {
+        id: server_id,
+        reason: ConnectionCloseReason::Remote { code: 0 },
+    }) {
         assert!(start.elapsed() < Duration::from_secs(5), "{events:?}");
         std::thread::sleep(Duration::from_millis(1));
-        client.poll(now()).expect("client poll");
+        client_events.extend(client.poll(now()).expect("client poll"));
         events.extend(server.poll(now()).expect("server poll"));
+    }
+    while !client_events.contains(&TransportEvent::Closed {
+        id: client_id,
+        reason: ConnectionCloseReason::Local,
+    }) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{client_events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        client_events.extend(client.poll(now()).expect("client poll"));
     }
     assert!(
         !events
@@ -727,7 +743,10 @@ fn keepalive_holds_a_live_idle_pair_and_a_dead_peer_still_times_out() {
         closed = client
             .poll(now())
             .expect("poll")
-            .contains(&TransportEvent::Closed { id: client_id });
+            .contains(&TransportEvent::Closed {
+                id: client_id,
+                reason: ConnectionCloseReason::TimedOut,
+            });
     }
 }
 

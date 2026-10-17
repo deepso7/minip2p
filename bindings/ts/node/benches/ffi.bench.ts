@@ -43,9 +43,9 @@ beforeAll(async () => {
     timeoutMs: TIMEOUT_MS,
   });
   rawA = createRaw();
-  cleanup.push(() => rawA.close());
+  cleanup.push(() => rawA.close(0));
   rawB = createRaw(true);
-  cleanup.push(() => rawB.close());
+  cleanup.push(() => rawB.close(0));
   rawA.connect([firstAddr(rawB.listenAddrs())]);
   await Promise.all([
     waitRawReady(rawA, rawB.peerId()),

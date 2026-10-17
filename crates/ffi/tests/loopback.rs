@@ -247,7 +247,7 @@ fn endpoint(seed: u8) -> Arc<P2pEndpoint> {
 }
 
 fn stop(endpoint: &P2pEndpoint) {
-    endpoint.stop();
+    endpoint.stop(0);
     assert!(endpoint.wait_stopped(5_000), "driver did not stop");
 }
 
@@ -290,7 +290,7 @@ fn a_tcp_listen_address_binds_tcp_and_is_dialed_over_it() -> Result<(), FfiError
                 P2pEvent::PathEstablished {
                     connect_id: observed,
                     peer_id,
-                    path: PathKind::DirectDialed,
+                    path: PathKind::Direct,
                     ..
                 } if *observed == connect_id && peer_id == &b_peer
             ))
@@ -342,7 +342,7 @@ fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
             P2pEvent::PathEstablished {
                 connect_id: observed,
                 peer_id,
-                path: PathKind::DirectDialed,
+                path: PathKind::Direct,
                 ..
             } if *observed == connect_id && peer_id == &b_peer
         )),

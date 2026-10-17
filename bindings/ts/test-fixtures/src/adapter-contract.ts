@@ -2,7 +2,7 @@
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import type { BackendConnectTarget } from "../../core/src/backend.js";
+import type { BackendConnectTarget, PathKind } from "../../core/src/backend.js";
 import {
   ConnectCancelledError,
   ConnectResultLostError,
@@ -45,6 +45,15 @@ export interface FakeNativeState {
   readonly consumed: readonly NativeConsumed[];
   /** Native `abandonStream` calls, in call order. */
   readonly abandoned: readonly NativeStreamRef[];
+  /** Drain timeouts native `stop` received, in milliseconds. */
+  readonly closeTimeouts: readonly number[];
+  /**
+   * Sets the unfinished connections of the `EndpointClosed` native queues
+   * when stopped (its outcome is `Drained`).
+   */
+  setCloseUnfinished: (
+    unfinished: readonly { readonly connId: bigint; readonly peerId?: string }[]
+  ) => void;
 }
 
 /** One native `streamConsumed` call, in runtime-neutral form. */
@@ -60,8 +69,10 @@ export interface NativeStreamRef {
 
 /** A native `connectionInfo` snapshot, in runtime-neutral form. */
 export interface NativeConnectionInfo {
+  readonly peerId: string;
   readonly connId: bigint;
-  readonly remoteAddr?: string;
+  readonly remoteAddr: string;
+  readonly path: PathKind;
   readonly readyProtocols?: string[];
 }
 
@@ -84,7 +95,7 @@ const pathEstablished = (connectId: bigint): NativeEventLiteral => ({
   inner: {
     connId: CONN_ID,
     connectId,
-    path: { tag: "DirectDialed" },
+    path: { tag: "Direct" },
     peerId: PEER,
   },
   tag: "PathEstablished",
@@ -106,6 +117,33 @@ export function describeAdapterContract(
   describe(`${runtime} adapter contract`, () => {
     afterEach(() => {
       vi.useRealTimers();
+    });
+
+    test("close hands native its drain and reports once EndpointClosed arrives", async () => {
+      vi.useFakeTimers();
+      const endpoint = harness.create();
+      const native = harness.native();
+      // A handshake with no peer yet names none; a peer is listed once.
+      native.setCloseUnfinished([
+        { connId: CONN_ID, peerId: PEER },
+        { connId: NEXT_CONN_ID },
+        { connId: NEXT_CONN_ID + 1n, peerId: PEER },
+      ]);
+      const reports: unknown[] = [];
+      endpoint.onClose((report) => reports.push(report));
+
+      const closing = endpoint.close(250);
+      expect(native.closeTimeouts).toEqual([250]);
+      expect(reports).toEqual([]);
+      await drained();
+
+      const report = {
+        outcome: "Drained",
+        reason: "close",
+        unfinished: [PEER],
+      };
+      await expect(closing).resolves.toEqual(report);
+      expect(reports).toEqual([report]);
     });
 
     test("Connection targets reach native in one shape", () => {
@@ -139,7 +177,7 @@ export function describeAdapterContract(
       expect(connectId).toBe(Number(CONNECT_ID));
       expect(await connecting).toEqual({
         connectId,
-        path: { kind: "directDialed" },
+        path: { kind: "direct" },
         peerId: PEER,
       });
       expect(native.cancelledConnects).toEqual([CONNECT_ID]);
@@ -213,7 +251,12 @@ export function describeAdapterContract(
       const native = harness.native();
       const opened: number[] = [];
       endpoint.on("connectionEstablished", ({ connId }) => opened.push(connId));
-      native.setConnectionInfo({ connId: CONN_ID, remoteAddr: QUIC });
+      native.setConnectionInfo({
+        connId: CONN_ID,
+        path: { tag: "Direct" },
+        peerId: PEER,
+        remoteAddr: QUIC,
+      });
 
       native.deliver([
         {
@@ -225,6 +268,8 @@ export function describeAdapterContract(
 
       expect(endpoint.connectionInfo(PEER)).toEqual({
         connId: opened[0],
+        path: { kind: "direct" },
+        peerId: PEER,
         remoteAddr: QUIC,
       });
       endpoint.close();
@@ -236,7 +281,12 @@ export function describeAdapterContract(
       const native = harness.native();
       const paths: number[] = [];
       endpoint.on("inboundPathEstablished", ({ connId }) => paths.push(connId));
-      native.setConnectionInfo({ connId: CONN_ID, remoteAddr: QUIC });
+      native.setConnectionInfo({
+        connId: CONN_ID,
+        path: { inner: { relayPeerId: "relay" }, tag: "Relayed" },
+        peerId: PEER,
+        remoteAddr: "/p2p/relay/p2p-circuit",
+      });
 
       // The queue dropped this circuit's `ConnectionEstablished`.
       native.deliver([
@@ -252,7 +302,12 @@ export function describeAdapterContract(
       await drained();
 
       expect(paths).toHaveLength(1);
-      expect(endpoint.connectionInfo(PEER)?.connId).toBe(paths[0]);
+      expect(endpoint.connectionInfo(PEER)).toEqual({
+        connId: paths[0],
+        path: { kind: "relayed", relayPeerId: "relay" },
+        peerId: PEER,
+        remoteAddr: "/p2p/relay/p2p-circuit",
+      });
       endpoint.close();
     });
 
@@ -282,7 +337,10 @@ export function describeAdapterContract(
 
       native.setConnectionInfo({
         connId: NEXT_CONN_ID,
+        path: { tag: "Direct" },
+        peerId: PEER,
         readyProtocols: ["/test/1"],
+        remoteAddr: QUIC,
       });
       native.deliver([
         {
@@ -299,7 +357,10 @@ export function describeAdapterContract(
       ]);
       expect(current).toEqual({
         connId: replaced[0]?.newConnId,
+        path: { kind: "direct" },
+        peerId: PEER,
         readyProtocols: ["/test/1"],
+        remoteAddr: QUIC,
       });
       expect(await endpoint.waitPeerReady(PEER)).toEqual({
         peerId: PEER,
@@ -551,7 +612,7 @@ export function describeAdapterContract(
     // the connection's identity.
     const lateStream = { connId: CONN_ID, peerId: PEER, streamId: 4n };
     const closedConnection: NativeEventLiteral = {
-      inner: { connId: CONN_ID, peerId: PEER },
+      inner: { connId: CONN_ID, peerId: PEER, reason: { tag: "Local" } },
       tag: "ConnectionClosed",
     };
 

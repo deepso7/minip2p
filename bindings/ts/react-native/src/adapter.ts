@@ -1,6 +1,7 @@
 /* oxlint-disable class-methods-use-this, complexity, func-style, max-classes-per-file, no-use-before-define -- The adapter keeps its contract-complete native endpoint and public SDK subclass together, and uses hoisted conversion helpers. */
 
 import {
+  CloseOutcome,
   DiscoverySource,
   DriverFailureKind,
   EndpointErrorKind,
@@ -11,7 +12,6 @@ import {
 } from "@minip2p/core";
 import type {
   Bytes,
-  ConnectionInfo,
   IdentifyInfo,
   KnownPeerInfo,
   Minip2pConfig,
@@ -20,14 +20,18 @@ import type {
 import {
   ConnectionIdMap,
   EventDrain,
+  NativeCloseLatch,
   P2pEvent_Tags,
   SettleHandles,
   eventStream,
   resolveEndpointConfig,
   typedFfiError,
   u64ToNumber,
+  unfinishedPeers,
 } from "@minip2p/core/backend";
 import type {
+  BackendClosed,
+  BackendConnectionInfo,
   BackendConnectTarget,
   Minip2pBackend,
   Minip2pBackendFactory,
@@ -38,6 +42,7 @@ import type {
 } from "@minip2p/core/backend";
 
 import {
+  CloseOutcome as NativeCloseOutcome,
   ConfigCapability as NativeConfigCapability,
   ConnectTarget,
   DiscoverySource as NativeDiscoverySource,
@@ -68,6 +73,8 @@ class ReactNativeBackend implements Minip2pBackend {
   readonly #settleHandles = new SettleHandles<[bigint, bigint]>();
   #doorbell: P2pEventDoorbell | undefined;
   #events: EventDrain<NativeP2pEvent> | undefined;
+  readonly #close = new NativeCloseLatch();
+  #started = false;
 
   constructor(config: Minip2pConfig) {
     this.#mdnsEnabled = config.mdns !== undefined && config.mdns !== false;
@@ -94,6 +101,22 @@ class ReactNativeBackend implements Minip2pBackend {
     this.#events = new EventDrain(
       (limit) => this.#endpoint.drainEvents(limit),
       (event) => {
+        if (event.tag === P2pEvent_Tags.EndpointClosed) {
+          this.#events?.stop();
+          this.#close.settle({
+            outcome: sdkName(
+              CloseOutcome,
+              NativeCloseOutcome,
+              event.inner.outcome
+            ),
+            unfinished: unfinishedPeers(event.inner.unfinished),
+          });
+          return;
+        }
+        // The SDK has stopped listening; only `EndpointClosed` matters now.
+        if (this.#close.requested) {
+          return;
+        }
         const normalized = normalizeEvent(event, this.#connectionIds);
         const stream = eventStream(normalized);
         const native = nativeStreamOf(event);
@@ -111,6 +134,7 @@ class ReactNativeBackend implements Minip2pBackend {
     translateErrors(() => {
       this.#endpoint.start(this.#doorbell as P2pEventDoorbell);
     });
+    this.#started = true;
   }
 
   eventHandled(event: P2pEvent): void {
@@ -120,9 +144,20 @@ class ReactNativeBackend implements Minip2pBackend {
     }
   }
 
-  close(): void {
+  close(timeoutMs: number): Promise<BackendClosed> {
+    return this.#close.close(
+      this.#started,
+      () => {
+        this.#endpoint.stop(BigInt(timeoutMs));
+      },
+      () => {
+        this.#release();
+      }
+    );
+  }
+
+  #release(): void {
     try {
-      this.#endpoint.stop();
       this.#events?.stop();
       this.#endpoint.uniffiDestroy();
       this.#events = undefined;
@@ -182,14 +217,16 @@ class ReactNativeBackend implements Minip2pBackend {
       : (normalizeBigInts(path) as PathKind);
   }
 
-  connectionInfo(peerId: string): ConnectionInfo | undefined {
+  connectionInfo(peerId: string): BackendConnectionInfo | undefined {
     const info = translateErrors(() => this.#endpoint.connectionInfo(peerId));
     if (info === undefined) {
       return undefined;
     }
     return {
       connId: this.#connectionIds.toPublic(info.connId),
-      ...(info.remoteAddr !== undefined && { remoteAddr: info.remoteAddr }),
+      path: normalizeBigInts(info.path) as PathKind,
+      peerId: info.peerId,
+      remoteAddr: info.remoteAddr,
       ...(info.readyProtocols !== undefined && {
         readyProtocols: info.readyProtocols,
       }),
@@ -572,8 +609,9 @@ function normalizeBigInts(
   key?: string
 ): unknown {
   if (typeof value === "bigint") {
-    // A QUIC stop code is a 62-bit varint the remote picks: keep it whole.
-    if (key === "errorCode") {
+    // QUIC stop and close codes are 62-bit varints the remote picks: keep
+    // them whole.
+    if (key === "errorCode" || key === "code") {
       return value;
     }
     if (key === undefined || !CONNECTION_ID_KEYS.has(key) || !event) {

@@ -424,8 +424,10 @@ fn handle_event(endpoint: &Endpoint, role: &str, relay: Option<&PeerAddr>, event
         EndpointEvent::ConnectionEstablished { peer_id, .. } => {
             println!("[{role}] connected peer={peer_id}");
         }
-        EndpointEvent::ConnectionClosed { peer_id, .. } => {
-            println!("[{role}] disconnected peer={peer_id}");
+        EndpointEvent::ConnectionClosed {
+            peer_id, reason, ..
+        } => {
+            println!("[{role}] disconnected peer={peer_id} reason={reason}");
         }
         EndpointEvent::Error(error) => {
             eprintln!("[{role}] error {:?}: {}", error.kind, error.detail);

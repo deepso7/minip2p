@@ -2,7 +2,7 @@ use alloc::string::String;
 
 use minip2p_core::{Bytes, Multiaddr, PeerId};
 
-use crate::{ConnectionEndpoint, ConnectionId, StreamId};
+use crate::{ConnectionCloseReason, ConnectionEndpoint, ConnectionId, StreamId};
 
 /// Events emitted by a transport back to the host.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,9 +60,14 @@ pub enum TransportEvent {
         id: ConnectionId,
         stream_id: StreamId,
     },
-    /// The connection is fully closed. No further events for this connection.
-    Closed { id: ConnectionId },
-    /// A non-fatal error on a connection.
+    /// The connection is fully closed, for `reason`. No further events for
+    /// this connection.
+    Closed {
+        id: ConnectionId,
+        reason: ConnectionCloseReason,
+    },
+    /// An error on a connection that did not end it. A failure that ends the
+    /// connection is the `reason` of its `Closed` instead.
     Error { id: ConnectionId, message: String },
     /// A new inbound connection was accepted. `Connected` follows after handshake.
     IncomingConnection {
