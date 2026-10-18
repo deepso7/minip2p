@@ -54,13 +54,6 @@ pub const KEEPALIVE_ACK_TIMEOUT_MS: u64 = 10_000;
 /// Yamux's specification-defined initial stream window (256 KiB).
 pub const DEFAULT_RECEIVE_WINDOW: u32 = 256 * 1024;
 
-/// Default per-stream receive window (2,432 KiB): twice the bandwidth-delay
-/// product of a 100 Mbit/s, 100 ms path, the smallest window the #361
-/// `endpoint_rtt` sweep found reaching 90% of a large window's goodput.
-/// The peer still starts from [`DEFAULT_RECEIVE_WINDOW`]; the rest is
-/// granted with the first window update.
-const DEFAULT_STREAM_WINDOW: u32 = 2_432 * 1024;
-
 /// Default largest payload this side puts in one data frame (1 MiB).
 const DEFAULT_MAX_FRAME_LEN: u32 = 1024 * 1024;
 
@@ -135,7 +128,7 @@ pub struct YamuxConfig {
 impl Default for YamuxConfig {
     fn default() -> Self {
         Self {
-            receive_window: DEFAULT_STREAM_WINDOW,
+            receive_window: DEFAULT_RECEIVE_WINDOW,
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
             max_streams: DEFAULT_MAX_STREAMS,
             max_buffered_send: DEFAULT_MAX_BUFFERED_SEND,
@@ -288,9 +281,6 @@ pub enum YamuxError {
     /// The configured stream capacity is already in use.
     #[error("maximum Yamux stream count reached")]
     TooManyStreams,
-    /// The owner's memory budget cannot fit another stream's receive window.
-    #[error("the memory budget cannot fit another Yamux stream")]
-    BudgetExhausted,
     /// The local role exhausted its same-parity `u32` stream IDs.
     #[error("Yamux stream IDs exhausted")]
     StreamsExhausted,

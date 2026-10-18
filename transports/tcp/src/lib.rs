@@ -78,11 +78,6 @@
 //! reader holds (ADR 0012). A transport whose slots are all held refuses new
 //! connections.
 //!
-//! Memory is bounded too: every connection and stream holds a reservation
-//! against [`TcpConfig::memory_budget_bytes`], the TCP memory budget
-//! (ADR 0021), and what does not fit is refused, never queued. See that
-//! field for the reservation formulas.
-//!
 //! # Identity
 //!
 //! The upgrade authenticates both ends, so

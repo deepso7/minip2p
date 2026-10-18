@@ -127,11 +127,7 @@ fn identity(seed: u8) -> Ed25519Keypair {
 }
 
 fn node(key: Ed25519Keypair) -> Node {
-    node_with(key, minip2p_tcp::TcpConfig::default())
-}
-
-fn node_with(key: Ed25519Keypair, config: minip2p_tcp::TcpConfig) -> Node {
-    TcpTransport::with_config(StdTcpProvider::new(), key, StdEntropy, config).expect("valid config")
+    TcpTransport::new(StdTcpProvider::new(), key, StdEntropy)
 }
 
 /// Polls both nodes until `done`, or panics with what it saw.
@@ -222,15 +218,11 @@ struct Pair {
 }
 
 fn upgraded_pair() -> Pair {
-    upgraded_pair_with(minip2p_tcp::TcpConfig::default())
-}
-
-fn upgraded_pair_with(config: minip2p_tcp::TcpConfig) -> Pair {
     let dialer_key = identity(1);
     let listener_key = identity(2);
     let (dialer_peer, listener_peer) = (dialer_key.peer_id(), listener_key.peer_id());
-    let mut dialer = node_with(dialer_key, config.clone());
-    let mut listener = node_with(listener_key, config);
+    let mut dialer = node(dialer_key);
+    let mut listener = node(listener_key);
 
     // Port 0 lets the kernel choose, and the bound address comes back concrete.
     let bound = listener
@@ -372,7 +364,9 @@ fn a_reader_that_never_acks_stalls_its_sender_until_it_does() {
     // The reader takes what arrives but acknowledges nothing: the sender may
     // deliver one receive window, and no more.
     let window = minip2p_tcp::TcpConfig::default().yamux.receive_window as usize;
-    let payload = Bytes::from(vec![7u8; 2 * window]);
+    // More than the window and the stream's send cap together, so the
+    // sender is left holding a tail.
+    let payload = Bytes::from(vec![7u8; 4 * window]);
     let mut held = send_or_hold(&mut pair.dialer, id, stream, payload.clone());
     let mut unacked = 0;
     let mut listener_stream = None;
@@ -730,11 +724,7 @@ fn an_idle_wait_times_out_and_input_wakes_it() {
 
 #[test]
 fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
-    // The specification's 256 KiB window: one write the send caps accept can
-    // then outrun the peer's window, which the default's cannot.
-    let mut config = minip2p_tcp::TcpConfig::default();
-    config.yamux.receive_window = minip2p_secure_mux::yamux::DEFAULT_RECEIVE_WINDOW;
-    let mut pair = upgraded_pair_with(config);
+    let mut pair = upgraded_pair();
     let id = pair.dialer_connection;
     let stream = pair.dialer.open_stream(id).expect("open substream");
     settle(&mut pair.dialer, &mut pair.listener);

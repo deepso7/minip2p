@@ -45,7 +45,7 @@ Available on `EndpointBuilder` with `quic`:
 Compiled with `features = ["tcp"]`:
 
 - Listen: `listen_on`, `listen_on_multiaddr` with `/tcp/<port>` addresses
-- Configuration: `tcp_config` (connection limits and the TCP memory budget)
+- Configuration: `tcp_config` (connection, buffer, timeout and Yamux limits)
 - Routing: QUIC addresses use QUIC; `/tcp` candidates use TCP
 
 ## Portable API
@@ -61,7 +61,7 @@ The `smoltcp` feature adds a shared embedded TCP stack and includes portable mDN
 Compiled with `features = ["nat"]`:
 
 - Activation: `relay`, `autonat_server`, `nat_config`
-- Configuration: `circuit_limits` (relay circuits' Yamux limits and circuit memory budget)
+- Configuration: `circuit_limits` (relay circuits' Yamux limits)
 - Attempts: `connect` races direct candidates against a relay leg; `cancel_connect`
 - Events: `EndpointEvent::Nat(..)` via `wait` or `poll`
 - State: `reachability`, `active_reservation`

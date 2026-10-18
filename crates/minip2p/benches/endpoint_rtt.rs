@@ -23,7 +23,7 @@
 //! - `quic-send`: four streams at `MINIP2P_RTT_STREAM`; the send window
 //!   varies, the connection window stays large.
 //! - `quic-check`: the windows in `MINIP2P_RTT_{STREAM,CONNECTION,SEND}`
-//!   (QUIC defaults when unset, and the default budget) against large ones,
+//!   (QUIC defaults when unset) against large ones,
 //!   at one and four streams.
 //! - `yamux`: one TCP stream; the Yamux receive window varies.
 //! - `retry`: handshakes with Retry on and off (see [`retry`]).
@@ -306,12 +306,10 @@ fn sweep_points(sweep: &str, profile: Profile) -> Vec<Point> {
     let stream = env_or("MINIP2P_RTT_STREAM", defaults.stream_receive_window);
     let connection = env_or("MINIP2P_RTT_CONNECTION", defaults.connection_receive_window);
     let send = env_or("MINIP2P_RTT_SEND", defaults.send_window);
-    // Windows the budget never limits: a sweep measures flow control only.
     let quic = |stream, connection, send| QuicLimits {
         stream_receive_window: stream,
         connection_receive_window: connection,
         send_window: send,
-        memory_budget_bytes: 8 << 30,
         ..QuicLimits::default()
     };
     let point = |label: String, transport, streams, quic, tcp| Point {
@@ -365,8 +363,7 @@ fn sweep_points(sweep: &str, profile: Profile) -> Vec<Point> {
         "quic-check" => [1, 4]
             .into_iter()
             .flat_map(|streams| {
-                let mut chosen = quic(stream, connection, send);
-                chosen.memory_budget_bytes = defaults.memory_budget_bytes;
+                let chosen = quic(stream, connection, send);
                 [
                     quic_point(format!("chosen×{streams}"), streams, chosen),
                     quic_point(
@@ -770,8 +767,10 @@ fn measure(profile: Profile, point: &Point, total: u64, runs: usize) -> Vec<Samp
     let unit = (point.streams * CHUNK) as u64;
     let total = total.div_ceil(unit) * unit;
     let (_sink, sink) = bulk::spawn_sink(target, &client, PROTOCOL, Instant::now, on_event);
-    let windows = point.quic.stream_receive_window as u64 * point.streams as u64
-        + point.quic.connection_receive_window as u64
+    // The streams' windows cap what an unlimited connection window admits.
+    let stream_windows = point.quic.stream_receive_window as u64 * point.streams as u64;
+    let windows = stream_windows
+        + (point.quic.connection_receive_window as u64).min(stream_windows)
         + point.quic.send_window as u64
         + u64::from(point.tcp.yamux.receive_window);
     let load = Load {
@@ -871,15 +870,11 @@ fn quiesce(client: &mut Endpoint, profile: Profile) {
 ///   (`ConnectSettled`) and to `PeerReady` (after Identify).
 /// - `concurrent`: 16 clients dialing at once, each through its own proxy;
 ///   time to each one's connection, and the process CPU time the burst took.
-/// - `refused`: a target whose budget fits one connection; time until a
-///   second client's dial settles (Retry on: `CONNECTION_REFUSED`; off:
-///   silence until the client gives up, capped at 20 s).
 ///
 /// It also prints the margin left in DCUtR's 3 s punch window after a
 /// handshake with Retry on.
 fn retry(profile: Profile, runs: usize) {
     const CONCURRENT: usize = 16;
-    const REFUSAL_CAP: Duration = Duration::from_secs(20);
     let limits = |retry| QuicLimits {
         require_address_validation: retry,
         ..QuicLimits::default()
@@ -914,16 +909,6 @@ fn retry(profile: Profile, runs: usize) {
                 median(&times),
                 max(&times),
                 cpu.as_secs_f64() * 1000.0
-            );
-        }
-    }
-    for retry in [true, false] {
-        for _ in 0..runs.min(3) {
-            let (elapsed, outcome) = refused(profile, limits(retry), REFUSAL_CAP);
-            println!(
-                "  refused, Retry {}: {outcome} after {:.0} ms",
-                on_off(retry),
-                elapsed.as_secs_f64() * 1000.0
             );
         }
     }
@@ -1031,66 +1016,4 @@ fn concurrent_handshakes(
     let cpu = cpu.elapsed();
     drop(drivers);
     (times, cpu)
-}
-
-/// A target whose budget fits one connection: one client connects, then a
-/// second dials. Returns how long the second dial took to settle and how.
-fn refused(profile: Profile, limits: QuicLimits, cap: Duration) -> (Duration, String) {
-    // Small streams, so the slack for the first connection's streams cannot
-    // admit a second connection.
-    let stream_receive_window = 64 * 1024;
-    let limits = QuicLimits {
-        stream_receive_window,
-        memory_budget_bytes: limits.datagram_queue_reservation_bytes()
-            + limits.connection_reservation_bytes()
-            + 16 * stream_receive_window,
-        ..limits
-    };
-    let (_target, addr) = driven_target(limits);
-    let _first = connected_client(profile, &addr);
-    let proxy = UdpProxy::spawn(socket_addr(&addr), profile);
-    let mut client = bind_on(Endpoint::builder(), "/ip4/127.0.0.1/udp/0/quic-v1");
-    let start = Instant::now();
-    client
-        .connect(PeerAddr::quic_v1(
-            LOOPBACK,
-            proxy.addr.port(),
-            addr.peer_id().clone(),
-        ))
-        .expect("connect");
-    while start.elapsed() < cap {
-        if let Some(EndpointEvent::ConnectSettled { outcome, .. }) =
-            next_event(&mut client, Duration::from_millis(5))
-        {
-            let outcome = match outcome {
-                ConnectOutcome::Failed(failure) => format!("failed ({failure})"),
-                other => format!("{other:?}"),
-            };
-            return (start.elapsed(), outcome);
-        }
-    }
-    (start.elapsed(), "still unsettled at the cap".into())
-}
-
-/// A fresh client connected to `addr` through a fresh proxy, driven until
-/// dropped (the first connection of [`refused`]).
-fn connected_client(profile: Profile, addr: &PeerAddr) -> (Driven, UdpProxy) {
-    let proxy = UdpProxy::spawn(socket_addr(addr), profile);
-    let mut client = bind_on(Endpoint::builder(), "/ip4/127.0.0.1/udp/0/quic-v1");
-    client
-        .connect(PeerAddr::quic_v1(
-            LOOPBACK,
-            proxy.addr.port(),
-            addr.peer_id().clone(),
-        ))
-        .expect("connect");
-    let deadline = Instant::now() + SETUP_TIMEOUT;
-    loop {
-        assert!(Instant::now() < deadline, "first connection timed out");
-        if let Some(EndpointEvent::PeerReady { .. }) =
-            next_event(&mut client, Duration::from_millis(1))
-        {
-            return (Driven::spawn(client, |_, _| {}), proxy);
-        }
-    }
 }

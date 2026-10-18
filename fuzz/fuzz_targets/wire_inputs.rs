@@ -414,7 +414,6 @@ fn fuzz_circuit(data: &[u8]) {
             pending_data: Bytes::copy_from_slice(&NOISE_SELECTION[..1]),
             unsent_prefix: Bytes::new(),
             remote_write_closed: false,
-            claimed: false,
         });
         for chunk in NOISE_SELECTION[1..].chunks(chunk_len) {
             transport.inject_bridge_data(

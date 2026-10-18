@@ -1102,15 +1102,15 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         self
     }
 
-    /// Overrides secure-session and connection limits, including the TCP
-    /// memory budget. Checked when the endpoint is built.
+    /// Overrides secure-session and connection limits. Checked when the
+    /// endpoint is built.
     pub fn tcp_config(mut self, config: TcpConfig) -> Self {
         self.tcp_config = config;
         self
     }
 
-    /// Overrides the relay circuits' Yamux limits and circuit memory
-    /// budget. Checked when the endpoint is built.
+    /// Overrides the relay circuits' Yamux limits. Checked when the endpoint
+    /// is built.
     #[cfg(feature = "portable-relay")]
     pub fn circuit_limits(mut self, limits: CircuitLimits) -> Self {
         self.circuit_limits = limits;

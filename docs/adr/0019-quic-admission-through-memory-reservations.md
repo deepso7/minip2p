@@ -1,5 +1,7 @@
 # QUIC admission through memory reservations
 
+> Partly superseded by ADR 0022: the memory budget, memory reservations and the window defaults sized for them are gone. `max_connections` across sockets, Retry, the windows as `QuicLimits` fields and the Apple fast-path exception stand.
+
 Supplements ADR 0012. ADR 0012 bounds received data per transport by connection limit × stream limit × stream window, but QUIC's numbers made that bound meaningless: `max_connections` (1024) counted per socket, so dual-stack allowed 2048, and each connection could commit an 8 MiB pending-send queue, a 10 MB engine send buffer, a 10 MB connection receive window and up to 128 peer streams of 1 MB each, about 284 MB per connection (#243). We decided:
 
 - **One QUIC memory budget per transport.** `QuicLimits::memory_budget_bytes` (512 MiB by default, 640 MiB since #361) covers every socket of a `QuicTransport`, and `max_connections` now counts across sockets too. The budget caps the transport's worst-case queued memory.
