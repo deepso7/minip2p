@@ -312,6 +312,9 @@ pub(crate) struct ConnectEngine {
     /// Their terminals wait for that event: NAT records a punch on it.
     unannounced: BTreeSet<ConnectionId>,
     events: VecDeque<Terminal>,
+    /// Queued Connected terminals still without a path, so
+    /// [`Self::resolve_paths`] skips the scan when none is left.
+    unresolved: usize,
 }
 
 /// A queued attempt terminal. A Connected one names only its connection,
@@ -446,6 +449,7 @@ impl ConnectEngine {
             retained: BTreeMap::new(),
             unannounced: BTreeSet::new(),
             events: VecDeque::new(),
+            unresolved: 0,
         }
     }
 
@@ -949,6 +953,9 @@ impl ConnectEngine {
     /// event's ingest) ends: NAT has recorded a punch, and no later event of
     /// the batch has ended the connection yet.
     pub(crate) fn resolve_paths(&mut self, mut punched: impl FnMut(ConnectionId) -> bool) {
+        if self.unresolved == 0 {
+            return;
+        }
         for terminal in &mut self.events {
             if let Terminal::Connected {
                 connect_id,
@@ -963,6 +970,7 @@ impl ConnectEngine {
                     None if punched(*conn_id) => Path::Punched,
                     None => Path::Direct,
                 };
+                self.unresolved -= 1;
                 *terminal = Terminal::Settled(EndpointEvent::ConnectSettled {
                     connect_id: *connect_id,
                     peer_id: peer_id.clone(),
@@ -1117,6 +1125,7 @@ impl ConnectEngine {
         conn_id: ConnectionId,
         circuit_relay: Option<PeerId>,
     ) {
+        self.unresolved += 1;
         self.events.push_back(Terminal::Connected {
             connect_id,
             peer_id,
