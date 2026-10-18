@@ -479,15 +479,30 @@ fn drive_dcutr_through_sync(h: &mut Harness, conn: ConnectionId, stream: StreamI
 /// One holder round on `stream`: the stream opens at `t`, CONNECT arrives
 /// at `t + 1` and SYNC at `t + 2`. Returns what the agent did on SYNC.
 fn drive_round_at(h: &mut Harness, conn: ConnectionId, stream: StreamId, t: u64) -> Vec<Out> {
+    drive_round_to(
+        h,
+        conn,
+        stream,
+        t,
+        &[maddr("/ip4/9.9.9.9/udp/4002/quic-v1")],
+    )
+}
+
+/// [`drive_round_at`] with the remote offering `addrs` to punch.
+fn drive_round_to(
+    h: &mut Harness,
+    conn: ConnectionId,
+    stream: StreamId,
+    t: u64,
+    addrs: &[Multiaddr],
+) -> Vec<Out> {
     open_inbound_dcutr_at(h, conn, stream, t);
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: stream,
-            data: Bytes::from(dcutr_connect_reply(&[maddr(
-                "/ip4/9.9.9.9/udp/4002/quic-v1",
-            )])),
+            data: Bytes::from(dcutr_connect_reply(addrs)),
         },
         false,
         at(t + 1),
@@ -675,6 +690,101 @@ fn punch_conn_established_during_window_is_direct_punched() {
             ..
         }] if *connect_id == id
     ));
+}
+
+/// Both punch dials land in one batch: the first settles the attempt, and
+/// the second, already the swarm's connection, replaces it. The survivor is
+/// a punch too.
+#[test]
+fn a_second_punch_replacing_the_first_is_punched() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (_, circuit) = drive_to_relayed(&mut h);
+    let actions = drive_round_to(
+        &mut h,
+        circuit,
+        StreamId::new(90),
+        310,
+        &[
+            maddr("/ip4/9.9.9.9/udp/4002/quic-v1"),
+            maddr("/ip4/9.9.9.8/udp/4002/quic-v1"),
+        ],
+    );
+    let punches: Vec<_> = actions
+        .iter()
+        .filter_map(|out| match out {
+            Out::Dial {
+                conn: Some(conn), ..
+            } => Some(*conn),
+            _ => None,
+        })
+        .collect();
+    let [first, second] = punches[..] else {
+        panic!("expected two punch dials, got {punches:?}");
+    };
+
+    // The swarm is past both replacements when NAT sees the first.
+    let target = h.target.clone();
+    h.agent.swarm.connect(&target, second);
+    for (old, new) in [(circuit, first), (first, second)] {
+        h.agent.deliver_late(
+            &SwarmEvent::ConnectionReplaced {
+                peer_id: h.target.clone(),
+                old,
+                new,
+            },
+            false,
+            at(314),
+        );
+    }
+    assert!(h.agent.is_punched(second), "the surviving punch is Punched");
+}
+
+/// The last round's punch lands after its window closed and the attempt
+/// fell back to relay. It replaces the circuit with no machine to claim it,
+/// and the upgrade is still reported as a punch, once, against the attempt.
+#[test]
+fn an_unclaimed_punch_replacing_the_circuit_upgrades_to_punched() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, circuit) = drive_to_relayed(&mut h);
+    drive_round_at(&mut h, circuit, StreamId::new(90), 310);
+    h.agent.handle_tick(at(3_312));
+    drive_round_at(&mut h, circuit, StreamId::new(91), 3_400);
+    h.agent.handle_tick(at(6_402));
+    let last = drive_round_at(&mut h, circuit, StreamId::new(92), 6_500);
+    let punch = dial_conn_for(&last, &h.target);
+    // The swarm already holds the punch when the window ends.
+    let target = h.target.clone();
+    h.agent.swarm.connect(&target, punch);
+    h.agent.handle_tick(at(9_502));
+    assert!(matches!(
+        drain_events(&mut h.agent).last(),
+        Some(NatEvent::FellBackToRelay { connect_id, .. }) if *connect_id == id
+    ));
+
+    h.agent.deliver_late(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: target,
+            old: circuit,
+            new: punch,
+        },
+        false,
+        at(9_510),
+    );
+    let events = drain_events(&mut h.agent);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::PathUpgraded {
+                connect_id,
+                to: Path::Punched,
+                old_conn_id,
+                new_conn_id,
+                ..
+            }] if *connect_id == id && *old_conn_id == circuit && *new_conn_id == punch
+        ),
+        "{events:?}"
+    );
+    assert!(h.agent.is_punched(punch));
 }
 
 /// Hands the target's connection `old` over to the direct connection `new`.
