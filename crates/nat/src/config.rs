@@ -126,6 +126,17 @@ pub struct NatConfig {
     /// [`NatError::ResourceExhausted`]: crate::NatError::ResourceExhausted
     /// [`NatSwarm::circuit_slots`]: crate::NatSwarm::circuit_slots
     pub max_circuits: usize,
+    /// Accept DCUtR punch targets outside globally routable unicast space:
+    /// loopback, private (RFC 1918), shared CGNAT, link-local, and other
+    /// special-use unicast IPs. They are still QUIC-only, IP-only, unicast
+    /// addresses: never DNS names, and never unspecified, multicast, or
+    /// broadcast.
+    ///
+    /// Off by default because punch targets come from the remote peer, which
+    /// could otherwise aim our dials and random-UDP blasts at hosts on our
+    /// own network. Turn it on only where both peers share a private address
+    /// space, such as a lab network or loopback tests.
+    pub allow_private_punch_targets: bool,
 }
 
 impl Default for NatConfig {
@@ -153,6 +164,7 @@ impl Default for NatConfig {
             reservation_keep_alive_interval_ms: 15_000,
             reservation_policy: ReservationPolicy::WhenPrivate,
             max_circuits: 64,
+            allow_private_punch_targets: false,
         }
     }
 }
