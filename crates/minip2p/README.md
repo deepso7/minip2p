@@ -29,7 +29,7 @@ The listen setters reject a malformed or unsupported address at once with an `En
 
 ## Connecting and the event loop
 
-`Endpoint::connect` is the one Connection-attempt entry point. It takes a `PeerId`, one complete peer address, or a list of complete addresses naming the same peer, and returns a `ConnectId` immediately. Candidate racing, Name resolution, relay fallback, and direct-path upgrade all belong to that attempt, which ends with exactly one `EndpointEvent::ConnectSettled` (connected, failed, or cancelled). A failure is `ConnectFailure::NoUsableRoute` only when no route ever started; once a dial or a relay started, it is `AllRoutesFailed` (or `Timeout`), carrying one `RelayFailure` per relay tried, each naming the relay's address. With a relay leg, a Relayed path settles Connected once the direct upgrade stops: the remote never started DCUtR within `NatConfig::dcutr_start_timeout_ms` (10 s), an exchange or the whole upgrade ran out its budget, or every hole-punch round failed (ADR 0017). `cancel_connect` is the explicit cancellation; giving up a local wait never cancels anything.
+`Endpoint::connect` is the one Connection-attempt entry point. It takes a `PeerId`, one complete peer address, or a list of complete addresses naming the same peer, and returns a `ConnectId` immediately. Candidate racing, Name resolution, relay fallback, and direct-path upgrade all belong to that attempt, which ends with exactly one `EndpointEvent::ConnectSettled` (connected, failed, or cancelled). `ConnectOutcome::Connected { conn_id, path }` carries the connection's `Path` as the attempt settled, which stays true after that connection is replaced or closed. A failure is `ConnectFailure::NoUsableRoute` only when no route ever started; once a dial or a relay started, it is `AllRoutesFailed` (or `Timeout`), carrying one `RelayFailure` per relay tried, each naming the relay's address. With a relay leg, a Relayed path settles Connected once the direct upgrade stops: the remote never started DCUtR within `NatConfig::dcutr_start_timeout_ms` (10 s), an exchange or the whole upgrade ran out its budget, or every hole-punch round failed (ADR 0017). `cancel_connect` is the explicit cancellation; giving up a local wait never cancels anything.
 
 `Endpoint::wait` is the one blocking wait over the one Endpoint event stream. The canonical loop dispatches unrelated events while it waits for a correlated one:
 
@@ -54,7 +54,9 @@ loop {
             if id == connect_id =>
         {
             match outcome {
-                ConnectOutcome::Connected { conn_id } => println!("connected: {conn_id:?}"),
+                ConnectOutcome::Connected { conn_id, path } => {
+                    println!("connected: {conn_id:?} over {path:?}")
+                }
                 other => println!("not connected: {other:?}"),
             }
             break;

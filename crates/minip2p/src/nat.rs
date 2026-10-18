@@ -585,7 +585,7 @@ impl<T: Transport> NatDriver<T> {
             return;
         };
         let kept = match outcome {
-            crate::ConnectOutcome::Connected { conn_id } => Some(*conn_id),
+            crate::ConnectOutcome::Connected { conn_id, .. } => Some(*conn_id),
             crate::ConnectOutcome::Failed(_) | crate::ConnectOutcome::Cancelled => None,
         };
         let mut io = EndpointSwarm::new(swarm, &mut self.io, self.admission);

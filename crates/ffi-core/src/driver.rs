@@ -625,12 +625,7 @@ pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
     let closed = match endpoint {
         Some(endpoint) => {
             let report = endpoint.close_within(timeout);
-            drained.extend(
-                report
-                    .events
-                    .into_iter()
-                    .filter_map(crate::events::convert_detached_event),
-            );
+            drained.extend(report.events.into_iter().filter_map(convert_endpoint_event));
             P2pEvent::EndpointClosed {
                 outcome: report.outcome.into(),
                 unfinished: report
@@ -717,7 +712,7 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             let settled = writes
                 .observe(endpoint, &event)
                 .map(crate::writes::accepted_event);
-            converted.extend(convert_endpoint_event(endpoint, event));
+            converted.extend(convert_endpoint_event(event));
             converted.extend(settled);
         }
         // Published and ingested before `state` is released, so no command

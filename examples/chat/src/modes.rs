@@ -261,7 +261,7 @@ pub fn run_join(
 /// Waits for the attempt's first usable path (the provisional relayed one,
 /// when that lands first) while handling unrelated events as the chat loop
 /// would. An attempt that settles connected without a path event reports the
-/// current path. Records whether the host's `topic` announcement went by.
+/// path it settled on. Records whether the host's `topic` announcement went by.
 fn wait_for_path(
     endpoint: &mut Endpoint,
     host_peer: &PeerId,
@@ -285,9 +285,7 @@ fn wait_for_path(
                 outcome,
                 ..
             }) if id == connect_id => {
-                if matches!(outcome, ConnectOutcome::Connected { .. })
-                    && let Some(path) = endpoint.path(host_peer)
-                {
+                if let ConnectOutcome::Connected { path, .. } = outcome {
                     return Ok(path);
                 }
                 eprintln!("[join] connect-settled outcome={outcome:?}");

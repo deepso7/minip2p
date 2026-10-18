@@ -405,7 +405,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
             a_events.iter().any(|event| {
                 matches!(event, EndpointEvent::ConnectSettled {
                     connect_id: found,
-                    outcome: ConnectOutcome::Connected { conn_id },
+                    outcome: ConnectOutcome::Connected { conn_id, .. },
                     ..
                 } if *found == id && conn_id.is_circuit())
             })

@@ -12,7 +12,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use minip2p_core::platform::{Deadline, EntropySource};
-use minip2p_core::{PeerAddr, PeerId};
+use minip2p_core::{Path, PeerAddr, PeerId};
 use minip2p_swarm::{SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, Transport};
 
@@ -138,7 +138,13 @@ impl From<core::convert::Infallible> for ConnectTargetError {
 #[non_exhaustive]
 pub enum ConnectOutcome {
     /// A transport connection to the target peer is established.
-    Connected { conn_id: ConnectionId },
+    Connected {
+        conn_id: ConnectionId,
+        /// The connection's [`Path`] when the attempt settled. It stays
+        /// true after the connection is replaced or closed, when
+        /// `connection_info(conn_id)` no longer answers.
+        path: Path,
+    },
     /// The attempt ended without a connection.
     Failed(ConnectFailure),
     /// `PortableEndpoint::cancel_connect` / `Endpoint::cancel_connect` (std)
@@ -301,7 +307,18 @@ pub(crate) struct ConnectEngine {
     /// attempts, per peer (see [`Self::peer_connected`]). Whatever has not
     /// ended on its own is aborted when the window ends.
     retained: BTreeMap<PeerId, RetainedDials>,
-    events: VecDeque<EndpointEvent>,
+    events: VecDeque<Terminal>,
+}
+
+/// A queued attempt terminal. A Connected one names only its connection
+/// until [`ConnectEngine::resolve_paths`] adds the path.
+enum Terminal {
+    Connected {
+        connect_id: ConnectId,
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+    },
+    Settled(EndpointEvent),
 }
 
 /// Dials kept open while a connection race to one peer settles.
@@ -456,7 +473,7 @@ impl ConnectEngine {
         } = candidates;
         let id = self.alloc();
         if let Some(conn_id) = runtime.connection_id(&peer) {
-            self.push_settled(id, peer, ConnectOutcome::Connected { conn_id });
+            self.push_connected(id, peer, conn_id);
             return id;
         }
 
@@ -713,17 +730,20 @@ impl ConnectEngine {
         // a `DialFailed` queued in between exhaust the attempt. Retired without
         // failing, `conn_id` leaves the race, so nothing aborts it. (When the
         // slot is already empty again, every connection of the batch is gone
-        // and settling on `conn_id` is as good as any; its close is queued.)
-        if let Some(current) = runtime
-            .connection_id(peer_id)
-            .filter(|current| *current != conn_id)
-        {
-            self.forget_retained(conn_id);
-            for attempt in self.attempts.values_mut() {
-                attempt.direct.remove(&conn_id);
+        // and settling on `conn_id` is as good as any; its close is queued.
+        // Not for a circuit: the swarm forgot the address naming its relay,
+        // so it has no path to settle on, and it leaves the race.)
+        match runtime.connection_id(peer_id) {
+            Some(current) if current != conn_id => {
+                self.forget_retained(conn_id);
+                for attempt in self.attempts.values_mut() {
+                    attempt.direct.remove(&conn_id);
+                }
+                self.peer_connected(peer_id, current, runtime, now_ms);
+                return;
             }
-            self.peer_connected(peer_id, current, runtime, now_ms);
-            return;
+            None if conn_id.is_circuit() => return,
+            _ => {}
         }
         // A kept dial that took the slot leaves the race; the rest stay in
         // it, as one may still win at the peer. A direct connection taking
@@ -794,7 +814,7 @@ impl ConnectEngine {
                 } else {
                     self.abort_pending(runtime, pending);
                 }
-                self.push_settled(id, attempt.peer, ConnectOutcome::Connected { conn_id });
+                self.push_connected(id, attempt.peer, conn_id);
                 continue;
             }
             if let RelayLeg::Pending { forced, relay }
@@ -850,7 +870,7 @@ impl ConnectEngine {
             };
             if let RelayLeg::Provisional { conn_id, .. } = attempt.relay {
                 self.abort_pending(runtime, attempt.direct.keys().copied());
-                self.push_settled(id, attempt.peer, ConnectOutcome::Connected { conn_id });
+                self.push_connected(id, attempt.peer, conn_id);
                 continue;
             }
             let relays = attempt.relay_diagnostics(Some("relay leg still pending"));
@@ -891,8 +911,43 @@ impl ConnectEngine {
             .map(Deadline::from_millis)
     }
 
+    /// Names the path of every queued Connected terminal. The Endpoint
+    /// engine calls this as soon as the step that settled them ends, while
+    /// each settled connection is still the peer's current one (and NAT has
+    /// recorded a punch), so later events in the batch cannot change it.
+    pub(crate) fn resolve_paths(&mut self, mut path_of: impl FnMut(ConnectionId) -> Path) {
+        for terminal in &mut self.events {
+            if let Terminal::Connected {
+                connect_id,
+                peer_id,
+                conn_id,
+            } = terminal
+            {
+                *terminal = Terminal::Settled(EndpointEvent::ConnectSettled {
+                    connect_id: *connect_id,
+                    peer_id: peer_id.clone(),
+                    outcome: ConnectOutcome::Connected {
+                        conn_id: *conn_id,
+                        path: path_of(*conn_id),
+                    },
+                });
+            }
+        }
+    }
+
+    /// Pops the next terminal once [`Self::resolve_paths`] has named its path.
     pub(crate) fn pop_event(&mut self) -> Option<EndpointEvent> {
-        self.events.pop_front()
+        match self.events.pop_front()? {
+            Terminal::Settled(event) => Some(event),
+            unresolved => {
+                debug_assert!(
+                    false,
+                    "a Connected terminal is popped before its path is resolved"
+                );
+                self.events.push_front(unresolved);
+                None
+            }
+        }
     }
 
     fn alloc(&mut self) -> ConnectId {
@@ -996,11 +1051,7 @@ impl ConnectEngine {
                 };
                 if let RelayLeg::Provisional { conn_id, .. } = attempt.relay {
                     self.abort_pending(runtime, attempt.direct.keys().copied());
-                    self.push_settled(
-                        *connect_id,
-                        attempt.peer,
-                        ConnectOutcome::Connected { conn_id },
-                    );
+                    self.push_connected(*connect_id, attempt.peer, conn_id);
                 } else {
                     self.attempts.insert(*connect_id, attempt);
                 }
@@ -1012,12 +1063,23 @@ impl ConnectEngine {
         }
     }
 
-    fn push_settled(&mut self, connect_id: ConnectId, peer_id: PeerId, outcome: ConnectOutcome) {
-        self.events.push_back(EndpointEvent::ConnectSettled {
+    /// Queues a Connected terminal; its path is resolved later (see
+    /// [`Self::resolve_paths`]).
+    fn push_connected(&mut self, connect_id: ConnectId, peer_id: PeerId, conn_id: ConnectionId) {
+        self.events.push_back(Terminal::Connected {
             connect_id,
             peer_id,
-            outcome,
+            conn_id,
         });
+    }
+
+    fn push_settled(&mut self, connect_id: ConnectId, peer_id: PeerId, outcome: ConnectOutcome) {
+        self.events
+            .push_back(Terminal::Settled(EndpointEvent::ConnectSettled {
+                connect_id,
+                peer_id,
+                outcome,
+            }));
     }
 
     fn abort_pending<T: Transport, E: EntropySource>(
@@ -1179,6 +1241,16 @@ mod tests {
 
     use super::*;
     use minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS;
+
+    impl ConnectEngine {
+        /// Pops the next terminal. Paths are the Endpoint engine's to name
+        /// (see `engine.rs`), so these settlement tests report every one as
+        /// Direct.
+        fn pop_resolved(&mut self) -> Option<EndpointEvent> {
+            self.resolve_paths(|_| Path::Direct);
+            self.pop_event()
+        }
+    }
 
     fn peer(label: &[u8]) -> PeerId {
         PeerId::from_public_key_protobuf(label)
@@ -1397,7 +1469,7 @@ mod tests {
     ) -> Vec<EndpointEvent> {
         engine.tick(runtime, now_ms);
         let mut out = Vec::new();
-        while let Some(event) = engine.pop_event() {
+        while let Some(event) = engine.pop_resolved() {
             out.push(event);
         }
         for event in runtime.poll(Now::from_millis(now_ms)).expect("poll") {
@@ -1405,7 +1477,7 @@ mod tests {
             if !consumed {
                 out.push(EndpointEvent::from(event));
             }
-            while let Some(engine_event) = engine.pop_event() {
+            while let Some(engine_event) = engine.pop_resolved() {
                 out.push(engine_event);
             }
         }
@@ -1445,7 +1517,7 @@ mod tests {
                     },
                     EndpointEvent::ConnectSettled {
                         connect_id,
-                        outcome: ConnectOutcome::Connected { conn_id: settled },
+                        outcome: ConnectOutcome::Connected { conn_id: settled, .. },
                         ..
                     },
                     ..
@@ -1485,7 +1557,7 @@ mod tests {
         );
         assert!(matches!(
             settled_for(&events, id),
-            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == ConnectionId::new(2)
+            Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == ConnectionId::new(2)
         ));
     }
 
@@ -1526,7 +1598,7 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = engine.connect(ConnectTarget::from(peer.clone()), &mut runtime, 0);
         assert_eq!(runtime.transport().dials.len(), 0);
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
                 outcome: ConnectOutcome::Failed(failure),
@@ -1545,7 +1617,7 @@ mod tests {
             }
             other => panic!("expected NoUsableRoute, got {other:?}"),
         }
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
     }
 
     #[test]
@@ -1559,7 +1631,7 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = engine.connect(target.clone().into(), &mut runtime, 0);
         assert_eq!(runtime.transport().dials.len(), 0);
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
                 outcome: ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { candidates, .. }),
@@ -1576,7 +1648,7 @@ mod tests {
             }
             other => panic!("expected NoUsableRoute, got {other:?}"),
         }
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
     }
 
     #[test]
@@ -1646,7 +1718,7 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = engine.connect(target.into(), &mut runtime, 0);
         engine.cancel(id, &mut runtime);
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
                 outcome: ConnectOutcome::Cancelled,
@@ -1656,9 +1728,9 @@ mod tests {
         }
         assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
         engine.cancel(id, &mut runtime);
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
         engine.cancel(ConnectId::from_u64(99), &mut runtime);
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
         assert_eq!(runtime.transport().closes.len(), 1);
     }
 
@@ -1678,10 +1750,13 @@ mod tests {
         let dials_before = runtime.transport().dials.len();
         let id = engine.connect(target.into(), &mut runtime, 10);
         assert_eq!(runtime.transport().dials.len(), dials_before);
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
-                outcome: ConnectOutcome::Connected { conn_id: settled },
+                outcome:
+                    ConnectOutcome::Connected {
+                        conn_id: settled, ..
+                    },
                 ..
             }) => {
                 assert_eq!(connect_id, id);
@@ -1690,7 +1765,7 @@ mod tests {
             other => panic!("expected Connected, got {other:?}"),
         }
         engine.cancel(id, &mut runtime);
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
         assert_eq!(runtime.connected_peers(), vec![peer]);
     }
 
@@ -1708,7 +1783,7 @@ mod tests {
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(matches!(
             settled_for(&events, id),
-            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == inbound
+            Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == inbound
         ));
         assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
     }
@@ -1737,7 +1812,7 @@ mod tests {
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(matches!(
             settled_for(&events, id),
-            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == inbound
+            Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == inbound
         ));
         assert!(runtime.transport().closes.is_empty(), "dials stay up");
         (runtime, engine, peer, inbound)
@@ -1868,7 +1943,7 @@ mod tests {
         );
         assert!(matches!(
             settled_for(&events, id),
-            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == ConnectionId::new(1)
+            Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == ConnectionId::new(1)
         ));
     }
 
@@ -1908,7 +1983,7 @@ mod tests {
             assert!(
                 matches!(
                     settled_for(&events, id),
-                    Some(ConnectOutcome::Connected { conn_id }) if *conn_id == kept
+                    Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == kept
                 ),
                 "{case}: {events:?}"
             );
@@ -1952,7 +2027,7 @@ mod tests {
             assert!(
                 matches!(
                     settled_for(&events, id),
-                    Some(ConnectOutcome::Connected { conn_id }) if *conn_id == d3
+                    Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == d3
                 ),
                 "{events:?}"
             );
@@ -2128,11 +2203,11 @@ mod tests {
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(matches!(
             settled_for(&events, first),
-            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == ConnectionId::new(2)
+            Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == ConnectionId::new(2)
         ));
         assert!(matches!(
             settled_for(&events, second),
-            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == ConnectionId::new(2)
+            Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == ConnectionId::new(2)
         ));
         let later = drain(&mut engine, &mut runtime, SIMULTANEOUS_DIAL_WINDOW_MS);
         assert!(settled_for(&later, first).is_none());
@@ -2152,7 +2227,7 @@ mod tests {
         let id = engine.connect(target.clone().into(), &mut runtime, 0);
         let conn_id = ConnectionId::new(1);
         engine.cancel(id, &mut runtime);
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
                 outcome: ConnectOutcome::Cancelled,
@@ -2200,7 +2275,7 @@ mod tests {
         let id = engine.connect(target.clone().into(), &mut runtime, 0);
         assert_eq!(runtime.transport().dials, vec![target.clone()]);
         engine.cancel(id, &mut runtime);
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
                 outcome: ConnectOutcome::Cancelled,
@@ -2296,7 +2371,7 @@ mod tests {
             0,
         );
         assert!(engine.is_pending(id));
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
         assert_eq!(runtime.transport().dials.len(), 0);
         let _ = peer;
     }
@@ -2321,7 +2396,7 @@ mod tests {
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(matches!(
             settled_for(&events, id),
-            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == conn
+            Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == conn
         ));
         assert!(settled_for(&drain(&mut engine, &mut runtime, 1), id).is_none());
     }
@@ -2349,14 +2424,14 @@ mod tests {
         let events = drain(&mut engine, &mut runtime, 1_000);
         assert!(matches!(
             settled_for(&events, id),
-            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == conn
+            Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == conn
         ));
         // Discovery CancelDial / shutdown and Endpoint::cancel_connect gate the
         // NAT leg on this: after Connected, cancel is a no-op and must not
         // tear down a provisional relayed path still held by NatAgent.
         assert!(!engine.is_pending(id));
         engine.cancel(id, &mut runtime);
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
         assert!(settled_for(&drain(&mut engine, &mut runtime, 1_001), id).is_none());
     }
 
@@ -2439,7 +2514,7 @@ mod tests {
             .push_connected(conn, peer.clone(), addr(&peer, 9));
         let _ = drain(&mut engine, &mut runtime, 0);
         engine.cancel(id, &mut runtime);
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
                 outcome: ConnectOutcome::Cancelled,
@@ -2448,7 +2523,7 @@ mod tests {
             other => panic!("expected Cancelled, got {other:?}"),
         }
         engine.cancel(id, &mut runtime);
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
     }
 
     #[test]
@@ -2465,7 +2540,7 @@ mod tests {
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(matches!(
             settled_for(&events, id),
-            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == inbound
+            Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == inbound
         ));
         assert!(settled_for(&drain(&mut engine, &mut runtime, 1), id).is_none());
     }
@@ -2511,7 +2586,7 @@ mod tests {
         );
         assert!(matches!(
             settled_for(&events, id),
-            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == ConnectionId::new(1)
+            Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == ConnectionId::new(1)
         ));
         assert!(settled_for(&drain(&mut engine, &mut runtime, 1), id).is_none());
     }
@@ -2538,7 +2613,39 @@ mod tests {
         let events = drain(&mut engine, &mut runtime, 1_000);
         assert!(matches!(
             settled_for(&events, id),
-            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == circuit(4)
+            Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == circuit(4)
+        ));
+    }
+
+    /// A circuit that closed in the batch it established in has no path
+    /// left to settle on: the attempt waits for another.
+    #[test]
+    fn a_circuit_gone_in_its_establishing_batch_does_not_settle() {
+        let peer = peer(b"gone-circuit");
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let id = admit(
+            &mut engine,
+            peer.clone(),
+            Vec::new(),
+            RelayPolicy::Forced,
+            &mut runtime,
+            0,
+        );
+        let transport = runtime.transport_mut();
+        transport.push_connected(circuit(1), peer.clone(), addr(&peer, 9));
+        transport.push_closed(circuit(1));
+        let events = drain(&mut engine, &mut runtime, 0);
+        assert!(settled_for(&events, id).is_none(), "{events:?}");
+        assert!(engine.is_pending(id));
+
+        runtime
+            .transport_mut()
+            .push_connected(circuit(2), peer.clone(), addr(&peer, 9));
+        let events = drain(&mut engine, &mut runtime, 0);
+        assert!(matches!(
+            settled_for(&events, id),
+            Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == circuit(2)
         ));
     }
 
@@ -2570,7 +2677,7 @@ mod tests {
         let events = drain(&mut engine, &mut runtime, 0);
         assert!(settled_for(&events, id).is_none(), "{events:?}");
         engine.observe_nat(&nat_failed(id, &peer, "relay unreachable"), &mut runtime, 0);
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
                 outcome: ConnectOutcome::Failed(ConnectFailure::AllRoutesFailed { relays, .. }),
@@ -2586,7 +2693,7 @@ mod tests {
             }
             other => panic!("expected AllRoutesFailed, got {other:?}"),
         }
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
     }
 
     #[cfg(feature = "nat")]
@@ -2606,7 +2713,7 @@ mod tests {
         );
         engine.observe_nat(&nat_failed(id, &peer, "relay unreachable"), &mut runtime, 0);
         assert!(engine.is_pending(id));
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
         runtime.transport_mut().push_closed(ConnectionId::new(1));
         let events = drain(&mut engine, &mut runtime, 0);
         match settled_for(&events, id) {
@@ -2626,7 +2733,7 @@ mod tests {
                 .all(|event| !matches!(event, EndpointEvent::DialFailed { .. })),
             "owned DialFailed must not leak: {events:?}"
         );
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
     }
 
     #[cfg(feature = "nat")]
@@ -2644,7 +2751,7 @@ mod tests {
             0,
         );
         engine.observe_nat(&nat_failed(id, &peer, "no eligible relay"), &mut runtime, 0);
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
                 outcome: ConnectOutcome::Failed(failure @ ConnectFailure::NoUsableRoute { .. }),
@@ -2660,7 +2767,7 @@ mod tests {
             }
             other => panic!("expected NoUsableRoute, got {other:?}"),
         }
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
     }
 
     #[cfg(feature = "nat")]
@@ -2708,7 +2815,7 @@ mod tests {
             &mut runtime,
             0,
         );
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 outcome: ConnectOutcome::Failed(ConnectFailure::AllRoutesFailed { relays, .. }),
                 ..
@@ -2757,7 +2864,7 @@ mod tests {
             &mut runtime,
             0,
         );
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 outcome: ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { relays, .. }),
                 ..
@@ -2797,10 +2904,10 @@ mod tests {
             &mut runtime,
             0,
         );
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
-                outcome: ConnectOutcome::Connected { conn_id },
+                outcome: ConnectOutcome::Connected { conn_id, .. },
                 ..
             }) => {
                 assert_eq!(connect_id, id);
@@ -2808,7 +2915,7 @@ mod tests {
             }
             other => panic!("expected Connected, got {other:?}"),
         }
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
     }
 
     #[cfg(feature = "nat")]
@@ -2838,7 +2945,7 @@ mod tests {
             &mut runtime,
             0,
         );
-        match engine.pop_event() {
+        match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
                 outcome: ConnectOutcome::Failed(_),
@@ -2846,7 +2953,7 @@ mod tests {
             }) if connect_id == id => {}
             other => panic!("expected Failed, got {other:?}"),
         }
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
     }
 
     #[cfg(feature = "nat")]
@@ -2886,7 +2993,7 @@ mod tests {
             &mut runtime,
             0,
         );
-        assert!(engine.pop_event().is_none());
+        assert!(engine.pop_resolved().is_none());
         assert!(engine.is_pending(id));
     }
 }

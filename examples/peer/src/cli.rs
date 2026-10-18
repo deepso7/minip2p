@@ -386,7 +386,7 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
             peer_id,
             outcome,
         } => match outcome {
-            ConnectOutcome::Connected { conn_id } => {
+            ConnectOutcome::Connected { conn_id, .. } => {
                 println!(
                     "[{role}] connect-settled id={} peer={peer_id} outcome=connected conn={conn_id}",
                     connect_id.as_u64()
