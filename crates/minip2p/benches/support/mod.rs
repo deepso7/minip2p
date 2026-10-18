@@ -213,7 +213,7 @@ impl Relayed {
                     ..
                 }) if settled == connect_id => {
                     assert!(
-                        matches!(outcome, ConnectOutcome::Connected { conn_id } if conn_id.is_circuit()),
+                        matches!(outcome, ConnectOutcome::Connected { conn_id, .. } if conn_id.is_circuit()),
                         "relayed connect did not settle on a circuit: {outcome:?}"
                     );
                     circuit = true;

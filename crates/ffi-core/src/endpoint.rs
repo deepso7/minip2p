@@ -368,8 +368,10 @@ impl P2pEndpoint {
     /// sets the deadline. A never-started endpoint is released at once, with
     /// no event.
     ///
-    /// Unsettled Connection attempts emit no terminal after this: shells must
-    /// settle their pending waits on stop (and on `DriverFailed`) themselves.
+    /// An attempt that settles during the close drain reports its terminal
+    /// ahead of `EndpointClosed`; one still unsettled when the endpoint closes
+    /// emits none, so shells settle their remaining waits on stop (and on
+    /// `DriverFailed`) themselves.
     pub fn stop(&self, timeout_ms: u64) {
         let _pending = PendingCommand::new(&self.shared);
         let endpoint = {

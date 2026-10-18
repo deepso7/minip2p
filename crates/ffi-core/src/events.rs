@@ -806,27 +806,15 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
     })
 }
 
-pub(crate) fn convert_endpoint_event(
-    endpoint: &minip2p::Endpoint,
-    event: EndpointEvent,
-) -> Option<P2pEvent> {
+/// Converts one Endpoint event, live or from a closed endpoint's drain:
+/// every event carries what its foreign event needs.
+pub(crate) fn convert_endpoint_event(event: EndpointEvent) -> Option<P2pEvent> {
     match event {
         EndpointEvent::ConnectSettled {
             connect_id,
             peer_id,
             outcome,
-        } => convert_settled(connect_id, &peer_id, outcome, endpoint.path(&peer_id)),
-        other => convert_detached_event(other),
-    }
-}
-
-/// Converts an event without its endpoint, as the events a closed
-/// endpoint's drain reports must be. A `ConnectSettled`, whose path only the
-/// endpoint knows, yields nothing: shells settle attempts on stop
-/// themselves (see [`P2pEndpoint::stop`](crate::P2pEndpoint::stop)).
-pub(crate) fn convert_detached_event(event: EndpointEvent) -> Option<P2pEvent> {
-    match event {
-        EndpointEvent::ConnectSettled { .. } => None,
+        } => convert_settled(connect_id, &peer_id, outcome),
         EndpointEvent::Nat(event) => convert_nat(event),
         EndpointEvent::Gossipsub(event) => Some(convert_gossipsub(event)),
         EndpointEvent::Discovery(event) => Some(convert_discovery(event)),
@@ -858,14 +846,13 @@ pub(crate) fn convert_settled(
     connect_id: minip2p::ConnectId,
     peer_id: &minip2p::PeerId,
     outcome: ConnectOutcome,
-    path: Option<Path>,
 ) -> Option<P2pEvent> {
     match outcome {
-        ConnectOutcome::Connected { conn_id } => Some(P2pEvent::PathEstablished {
+        ConnectOutcome::Connected { conn_id, path } => Some(P2pEvent::PathEstablished {
             connect_id: connect_id.as_u64(),
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
-            path: convert_path(path.unwrap_or(Path::Direct)),
+            path: convert_path(path),
         }),
         ConnectOutcome::Failed(failure) => Some(P2pEvent::ConnectFailed {
             connect_id: connect_id.as_u64(),
@@ -1353,37 +1340,44 @@ mod tests {
         }
     }
 
+    /// The settled path travels with the terminal, so a close drain's
+    /// `ConnectSettled` converts without the endpoint and keeps it.
     #[test]
-    fn convert_settled_maps_connected_and_failed_and_cancelled() {
+    fn a_detached_connect_settled_reports_its_settled_path() {
         let remote = peer(12);
-        let connect_id = minip2p::ConnectId::from_u64(3);
+        let relay = peer(14);
         assert_eq!(
-            convert_settled(
-                connect_id,
-                &remote,
-                ConnectOutcome::Connected {
+            convert_endpoint_event(EndpointEvent::ConnectSettled {
+                connect_id: minip2p::ConnectId::from_u64(3),
+                peer_id: remote.clone(),
+                outcome: ConnectOutcome::Connected {
                     conn_id: ConnectionId::new(9),
+                    path: Path::Relayed {
+                        relay: relay.clone(),
+                    },
                 },
-                Some(Path::Direct),
-            ),
+            }),
             Some(P2pEvent::PathEstablished {
                 connect_id: 3,
                 peer_id: remote.to_base58(),
                 conn_id: 9,
-                path: PathKind::Direct,
+                path: PathKind::Relayed {
+                    relay_peer_id: relay.to_base58(),
+                },
             })
         );
+    }
+
+    #[test]
+    fn convert_settled_maps_failed_and_cancelled() {
+        let remote = peer(12);
+        let connect_id = minip2p::ConnectId::from_u64(3);
         let failure = ConnectFailure::NoUsableRoute {
             candidates: Vec::new(),
             relays: Vec::new(),
         };
         assert_eq!(
-            convert_settled(
-                connect_id,
-                &remote,
-                ConnectOutcome::Failed(failure.clone()),
-                None,
-            ),
+            convert_settled(connect_id, &remote, ConnectOutcome::Failed(failure.clone()),),
             Some(P2pEvent::ConnectFailed {
                 connect_id: 3,
                 peer_id: remote.to_base58(),
@@ -1400,14 +1394,14 @@ mod tests {
             }],
         };
         assert!(matches!(
-            convert_settled(connect_id, &remote, ConnectOutcome::Failed(failure), None),
+            convert_settled(connect_id, &remote, ConnectOutcome::Failed(failure)),
             Some(P2pEvent::ConnectFailed {
                 kind: NatErrorKind::DialFailed,
                 ..
             })
         ));
         assert_eq!(
-            convert_settled(connect_id, &remote, ConnectOutcome::Cancelled, None),
+            convert_settled(connect_id, &remote, ConnectOutcome::Cancelled),
             Some(P2pEvent::ConnectCancelled {
                 connect_id: 3,
                 peer_id: remote.to_base58(),

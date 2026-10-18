@@ -66,7 +66,7 @@ fn direct_candidate_wins_over_loopback() {
     }
     assert!(matches!(path, Some(Path::Direct)));
     assert!(
-        matches!(settled, Some(ConnectOutcome::Connected { conn_id }) if !conn_id.is_circuit())
+        matches!(settled, Some(ConnectOutcome::Connected { conn_id, .. }) if !conn_id.is_circuit())
     );
     assert!(a.connected_peers().contains(b_addr.peer_id()));
     assert!(
@@ -290,7 +290,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
         })
     );
     match settled {
-        Some(ConnectOutcome::Connected { conn_id }) => {
+        Some(ConnectOutcome::Connected { conn_id, .. }) => {
             assert!(conn_id.is_circuit());
             assert_eq!(Some(conn_id), initiator_circuit);
         }
@@ -508,7 +508,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         {
             if let EndpointEvent::ConnectSettled {
                 connect_id: found,
-                outcome: ConnectOutcome::Connected { conn_id },
+                outcome: ConnectOutcome::Connected { conn_id, .. },
                 ..
             } = &event
                 && *found == connect_id
@@ -784,7 +784,7 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
     };
 
     match outcome {
-        ConnectOutcome::Connected { conn_id } => assert!(conn_id.is_circuit()),
+        ConnectOutcome::Connected { conn_id, .. } => assert!(conn_id.is_circuit()),
         other => panic!("expected Connected on the circuit, got {other:?}"),
     }
     let relayed_at = relayed_at.expect("the Relayed path was reported first");

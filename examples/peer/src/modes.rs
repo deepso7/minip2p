@@ -490,7 +490,7 @@ pub fn run_dial(
         }
     };
 
-    let path = wait_for_path(&mut endpoint, &peer, connect_id)?;
+    let path = wait_for_path(&mut endpoint, connect_id)?;
     println!(
         "[dial] path-established path={} elapsed={}ms elapsed-us={}",
         path_name(&path),
@@ -516,13 +516,9 @@ pub fn run_dial(
 
 /// Waits for the attempt's first usable path (the provisional relayed one,
 /// when that lands first), printing unrelated events as they arrive. An
-/// attempt that settles connected without a path event reports the current
-/// path; a failed or cancelled one ends the run.
-fn wait_for_path(
-    endpoint: &mut Endpoint,
-    peer: &PeerId,
-    connect_id: ConnectId,
-) -> Result<Path, Box<dyn Error>> {
+/// attempt that settles connected without a path event reports the path it
+/// settled on; a failed or cancelled one ends the run.
+fn wait_for_path(endpoint: &mut Endpoint, connect_id: ConnectId) -> Result<Path, Box<dyn Error>> {
     let deadline = Instant::now() + CONNECT_DEADLINE;
     loop {
         match endpoint
@@ -538,17 +534,13 @@ fn wait_for_path(
                 event @ EndpointEvent::ConnectSettled { connect_id: id, .. },
             ) if id == connect_id => {
                 print_event("dial", &event);
-                let connected = matches!(
-                    event,
+                return match event {
                     EndpointEvent::ConnectSettled {
-                        outcome: ConnectOutcome::Connected { .. },
+                        outcome: ConnectOutcome::Connected { path, .. },
                         ..
-                    }
-                );
-                return connected
-                    .then(|| endpoint.path(peer))
-                    .flatten()
-                    .ok_or_else(|| "no path to the target".into());
+                    } => Ok(path),
+                    _ => Err("no path to the target".into()),
+                };
             }
             EndpointWaitOutcome::Event(event) => print_event("dial", &event),
             EndpointWaitOutcome::Deadline => return Err("no path to the target".into()),

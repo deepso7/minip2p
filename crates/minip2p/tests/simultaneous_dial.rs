@@ -439,7 +439,7 @@ fn duplicate_candidates_run<T: Transport>(
         }
         let kept = a.connection_id(&b_peer).expect("a connected");
         assert!(
-            matches!(settled, Some(ConnectOutcome::Connected { conn_id }) if *conn_id == kept),
+            matches!(settled, Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == kept),
             "connect settles on the kept connection {kept}: {a_events:?}"
         );
     }

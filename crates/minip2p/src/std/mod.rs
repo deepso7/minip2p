@@ -794,7 +794,7 @@ impl Endpoint {
     ///                 outcome,
     ///                 ..
     ///             }) if settled == connect_id => match outcome {
-    ///                 ConnectOutcome::Connected { conn_id } => {
+    ///                 ConnectOutcome::Connected { conn_id, .. } => {
     ///                     println!("connected on {conn_id:?}");
     ///                     return Ok(());
     ///                 }
@@ -2396,7 +2396,7 @@ mod tests {
         let id = dialer
             .connect(vec![quic_addr.clone(), tcp_addr.clone()])
             .expect("connect");
-        let ConnectOutcome::Connected { conn_id } = connect_outcome(&mut dialer, id) else {
+        let ConnectOutcome::Connected { conn_id, .. } = connect_outcome(&mut dialer, id) else {
             panic!("expected connected");
         };
         let remote = dialer
@@ -2535,7 +2535,7 @@ mod tests {
         let id = dialer
             .connect(vec![named(&addr, "stalled.invalid"), addr.clone()])
             .expect("connect");
-        let ConnectOutcome::Connected { conn_id } = connect_outcome(&mut dialer, id) else {
+        let ConnectOutcome::Connected { conn_id, .. } = connect_outcome(&mut dialer, id) else {
             panic!("the /ip4 candidate must not wait for the name");
         };
         assert_eq!(
@@ -2734,7 +2734,7 @@ mod tests {
         let target = PeerAddr::new(Multiaddr::from_protocols(protocols), addr.peer_id().clone())
             .expect("named peer addr");
         let id = dialer.connect(target).expect("connect");
-        let ConnectOutcome::Connected { conn_id } = connect_outcome(&mut dialer, id) else {
+        let ConnectOutcome::Connected { conn_id, .. } = connect_outcome(&mut dialer, id) else {
             panic!("localhost must resolve and connect");
         };
         assert_eq!(
@@ -2764,7 +2764,7 @@ mod tests {
         let id = dialer
             .connect(vec![quic_addr.clone(), tcp_addr])
             .expect("connect");
-        let ConnectOutcome::Connected { conn_id } = connect_outcome(&mut dialer, id) else {
+        let ConnectOutcome::Connected { conn_id, .. } = connect_outcome(&mut dialer, id) else {
             panic!("expected connected");
         };
         let remote = dialer.connection_remote_addr(conn_id).expect("remote");

@@ -1689,6 +1689,68 @@ mod tests {
         assert_eq!(endpoint.path(&peer), None);
     }
 
+    /// A Connected terminal names the path it settled on, even when that
+    /// connection is replaced before the application reads the terminal.
+    #[test]
+    fn a_settled_attempt_keeps_its_path_after_the_connection_is_replaced() {
+        let identity = Ed25519Keypair::from_secret_key_bytes([36; 32]);
+        let peer = Ed25519Keypair::from_secret_key_bytes([37; 32]).peer_id();
+        let relay = Ed25519Keypair::from_secret_key_bytes([38; 32]).peer_id();
+        let circuit = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 1).expect("id");
+        let circuit_addr =
+            Multiaddr::from_protocols(vec![Protocol::P2p(relay.clone()), Protocol::P2pCircuit]);
+        let direct = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("id");
+        let direct_addr: Multiaddr = "/ip4/192.0.2.8/tcp/4001".parse().expect("address");
+        let transport = RecordingTransport {
+            events: vec![TransportEvent::Connected {
+                id: circuit,
+                endpoint: ConnectionEndpoint::with_peer_id(circuit_addr, peer.clone()),
+            }],
+            local_address: direct_addr.clone(),
+            next_stream_id: 0,
+            closed: Rc::new(Cell::new(false)),
+        };
+        let mut endpoint = Endpoint::portable(&identity, ZeroEntropy)
+            .build(transport)
+            .expect("endpoint configuration is valid");
+        endpoint.poll(Now::from_millis(0)).expect("poll");
+
+        // Settles at once on the circuit; a direct connection replaces it
+        // before the terminal is read.
+        let target = PeerAddr::new(direct_addr.clone(), peer.clone()).expect("peer addr");
+        let id = endpoint
+            .connect(target, Now::from_millis(1))
+            .expect("connect admitted");
+        endpoint
+            .engine
+            .core
+            .transport_mut()
+            .events
+            .push(TransportEvent::Connected {
+                id: direct,
+                endpoint: ConnectionEndpoint::with_peer_id(direct_addr, peer.clone()),
+            });
+        let events = endpoint.poll(Now::from_millis(2)).expect("poll");
+
+        assert_eq!(endpoint.connection_info(circuit), None, "replaced");
+        let settled = events.iter().find_map(|event| match event {
+            EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome,
+                ..
+            } if *connect_id == id => Some(outcome),
+            _ => None,
+        });
+        assert_eq!(
+            settled,
+            Some(&ConnectOutcome::Connected {
+                conn_id: circuit,
+                path: Path::Relayed { relay },
+            }),
+            "{events:?}"
+        );
+    }
+
     /// `ready_protocols` is `None` until the connection is identified, then
     /// the protocols the peer advertised on it.
     #[test]
@@ -1793,7 +1855,7 @@ mod tests {
             event,
             EndpointEvent::ConnectSettled {
                 connect_id,
-                outcome: ConnectOutcome::Connected { conn_id: settled },
+                outcome: ConnectOutcome::Connected { conn_id: settled, .. },
                 ..
             } if *connect_id == id && *settled == conn_id
         )));

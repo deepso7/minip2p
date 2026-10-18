@@ -42,6 +42,13 @@
 //! punch's (`NatAgent::is_punched`). The swarm's connection records and
 //! NAT's punch record are the only sources, and both end with the
 //! connection, so a replacement never inherits its predecessor's path.
+//!
+//! A Connected `ConnectSettled` carries its connection's path from the step
+//! that settled the attempt, before any later event in the batch can end
+//! that connection, so the terminal stays true after it is replaced or
+//! closed. An attempt settled on a later connection of the same transport
+//! batch takes its path once that connection's own lifecycle event has been
+//! ingested, as NAT records a punch on that event.
 
 use alloc::collections::VecDeque;
 #[cfg(any(feature = "std", feature = "pubsub"))]
@@ -51,7 +58,7 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use minip2p_core::platform::{Deadline, EntropySource, Now};
-use minip2p_core::{Bytes, Multiaddr, Path, PeerAddr, PeerId, Protocol};
+use minip2p_core::{Bytes, Multiaddr, Path, PeerAddr, PeerId};
 use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
@@ -63,6 +70,7 @@ use crate::nat::NatDriver;
 use crate::portable::connect::cancel_attempt;
 use crate::portable::connect::{
     ConnectAdmission, ConnectEngine, ConnectId, ConnectTarget, Expansion, admit_connect,
+    circuit_relay,
 };
 #[cfg(feature = "pubsub")]
 use crate::pubsub::{GossipsubDriver, GossipsubError};
@@ -549,27 +557,36 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     }
 
     /// The path of an established connection (see the module docs); `None`
-    /// for a pending, replaced, or closed one. A circuit is never Direct:
-    /// one whose remote address does not name its relay is a bug, and
-    /// reports no path rather than a wrong one.
+    /// for a pending, replaced, or closed one.
     fn connection_path(&self, conn_id: ConnectionId) -> Option<Path> {
         self.core.connection_peer(conn_id)?;
-        if conn_id.is_circuit() {
-            let relay = self
-                .core
-                .connection_remote_addr(conn_id)
-                .and_then(circuit_relay);
-            debug_assert!(
-                relay.is_some(),
-                "circuit {conn_id:?} has no /p2p/<relay>/p2p-circuit remote address"
-            );
-            return relay.map(|relay| Path::Relayed { relay });
-        }
         #[cfg(feature = "_nat-driver")]
-        if self.nat.as_ref().is_some_and(|nat| nat.is_punched(conn_id)) {
-            return Some(Path::Punched);
-        }
-        Some(Path::Direct)
+        let punched = self.nat.as_ref().is_some_and(|nat| nat.is_punched(conn_id));
+        #[cfg(not(feature = "_nat-driver"))]
+        let punched = false;
+        path_of(&self.core, punched, conn_id)
+    }
+
+    /// Names the path of every attempt that settled Connected in the step
+    /// just run (or ahead of the swarm event just ingested), before a later
+    /// event can replace or close its connection (see
+    /// `ConnectEngine::resolve_paths`). A circuit's relay was recorded when
+    /// it settled; a direct connection only needs NAT's punch record, which
+    /// still holds for one whose close is queued, as NAT has not seen it.
+    fn resolve_settled_paths(&mut self) {
+        #[cfg(feature = "_nat-driver")]
+        let nat = self.nat.as_ref();
+        self.connect.resolve_paths(|conn_id| {
+            #[cfg(feature = "_nat-driver")]
+            {
+                nat.is_some_and(|nat| nat.is_punched(conn_id))
+            }
+            #[cfg(not(feature = "_nat-driver"))]
+            {
+                let _ = conn_id;
+                false
+            }
+        });
     }
 
     #[cfg(feature = "_circuit-driver")]
@@ -629,6 +646,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// late answer cannot turn a Timeout into another outcome.
     pub(crate) fn expire_attempts(&mut self, now: Now) {
         self.connect.tick(&mut self.core, now.monotonic_ms);
+        self.resolve_settled_paths();
     }
 
     /// Runs one drive batch (see the module docs) and queues its output.
@@ -805,7 +823,9 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     }
 
     /// Routes NAT output: the Connection engine, then discovery's ownership
-    /// filter, then application staging.
+    /// filter, then application staging. Then names the paths of what
+    /// settled meanwhile: every step that can settle an attempt but
+    /// `expire_attempts` ends here.
     fn route_nat(&mut self, now: Now) {
         #[cfg(feature = "_nat-driver")]
         if let Some(nat) = self.nat.as_mut() {
@@ -830,6 +850,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         }
         #[cfg(not(feature = "_nat-driver"))]
         let _ = now;
+        self.resolve_settled_paths();
     }
 
     /// Collects Connection-attempt terminals and queues everything staged:
@@ -1011,12 +1032,19 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
 #[path = "engine_tests.rs"]
 mod tests;
 
-/// The relay a circuit's remote address (`/p2p/<relay>/p2p-circuit`) names.
-fn circuit_relay(addr: &Multiaddr) -> Option<PeerId> {
-    match addr.protocols() {
-        [.., Protocol::P2p(relay), Protocol::P2pCircuit] => Some(relay.clone()),
-        _ => None,
+/// `conn_id`'s path: Relayed for a circuit, through the relay its swarm
+/// address names; otherwise Punched or Direct. Only a circuit needs its
+/// swarm record, and one whose address does not name its relay is a bug,
+/// reporting no path rather than a wrong one.
+fn path_of<T: Transport, E: EntropySource>(
+    core: &SwarmCore<T, E>,
+    punched: bool,
+    conn_id: ConnectionId,
+) -> Option<Path> {
+    if conn_id.is_circuit() {
+        return circuit_relay(core, conn_id).map(|relay| Path::Relayed { relay });
     }
+    Some(if punched { Path::Punched } else { Path::Direct })
 }
 
 /// Appends the contributions `addresses` does not already hold, keeping
