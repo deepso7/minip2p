@@ -254,12 +254,12 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
     let idle_timeout =
         VarInt::from_u64(limits.idle_timeout_ms).map_err(|_bounds| too_large("idle_timeout_ms"))?;
     let stream_window = var_int("stream_receive_window", limits.stream_receive_window)?;
-    // Past what QUIC can express, the connection window is unlimited.
-    let connection_window = var_int(
-        "connection_receive_window",
-        limits.connection_receive_window,
-    )
-    .unwrap_or(VarInt::MAX);
+    // `usize::MAX`, or anything past what QUIC can express, is unlimited:
+    // on 32-bit targets `usize::MAX` alone would be a finite 4 GiB window.
+    let connection_window = match limits.connection_receive_window {
+        usize::MAX => VarInt::MAX,
+        window => var_int("connection_receive_window", window).unwrap_or(VarInt::MAX),
+    };
     let send_window =
         u64::try_from(limits.send_window).map_err(|_overflow| too_large("send_window"))?;
 

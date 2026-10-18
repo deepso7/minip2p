@@ -67,15 +67,16 @@ pub struct QuicLimits {
     pub stream_receive_window: usize,
     /// Per-connection receive window, fixed like
     /// [`stream_receive_window`](Self::stream_receive_window). Must be
-    /// non-zero; anything past what QUIC can express (2^62 - 1) is
-    /// unlimited.
+    /// non-zero; `usize::MAX` (the default), or anything past what QUIC can
+    /// express (2^62 - 1), is unlimited.
     ///
     /// Unlimited by default, as in quinn, so one stalled stream cannot spend
     /// the credit the connection's other streams need (ADR 0022). Nothing
-    /// then bounds a connection's received data in aggregate but
+    /// then bounds a connection's received data in aggregate but twice
     /// [`max_streams_per_connection`](Self::max_streams_per_connection)
-    /// times two stream windows: one delivered and unacknowledged, one the
-    /// engine buffers behind it.
+    /// (local and peer streams are limited separately) times two stream
+    /// windows: one delivered and unacknowledged, one the engine buffers
+    /// behind it.
     pub connection_receive_window: usize,
     /// Bytes the engine buffers per connection for sending and
     /// retransmission. Must be non-zero. Defaults to quinn's 10,000,000.
