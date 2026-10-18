@@ -307,6 +307,10 @@ pub(crate) struct ConnectEngine {
     /// attempts, per peer (see [`Self::peer_connected`]). Whatever has not
     /// ended on its own is aborted when the window ends.
     retained: BTreeMap<PeerId, RetainedDials>,
+    /// Connections settled on before their own `ConnectionEstablished` or
+    /// `ConnectionReplaced` was observed (see [`Self::peer_connected`]).
+    /// Their terminals wait for that event: NAT records a punch on it.
+    unannounced: BTreeSet<ConnectionId>,
     events: VecDeque<Terminal>,
 }
 
@@ -435,6 +439,7 @@ impl ConnectEngine {
             attempts: BTreeMap::new(),
             suppressed: BTreeSet::new(),
             retained: BTreeMap::new(),
+            unannounced: BTreeSet::new(),
             events: VecDeque::new(),
         }
     }
@@ -660,10 +665,12 @@ impl ConnectEngine {
                 true
             }
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
+                self.unannounced.remove(conn_id);
                 self.peer_connected(peer_id, *conn_id, runtime, now_ms);
                 false
             }
             SwarmEvent::ConnectionReplaced { peer_id, new, .. } => {
+                self.unannounced.remove(new);
                 // `new` satisfies every pending attempt for the peer exactly
                 // as a first establishment would, whichever side made it.
                 self.peer_connected(peer_id, *new, runtime, now_ms);
@@ -732,13 +739,15 @@ impl ConnectEngine {
         // slot is already empty again, every connection of the batch is gone
         // and settling on `conn_id` is as good as any; its close is queued.
         // Not for a circuit: the swarm forgot the address naming its relay,
-        // so it has no path to settle on, and it leaves the race.)
+        // so it has no path to settle on, and it leaves the race.) The slot
+        // holder's own event is still queued, so its path waits for it.
         match runtime.connection_id(peer_id) {
             Some(current) if current != conn_id => {
                 self.forget_retained(conn_id);
                 for attempt in self.attempts.values_mut() {
                     attempt.direct.remove(&conn_id);
                 }
+                self.unannounced.insert(current);
                 self.peer_connected(peer_id, current, runtime, now_ms);
                 return;
             }
@@ -911,10 +920,11 @@ impl ConnectEngine {
             .map(Deadline::from_millis)
     }
 
-    /// Names the path of every queued Connected terminal. The Endpoint
-    /// engine calls this as soon as the step that settled them ends, while
-    /// each settled connection is still the peer's current one (and NAT has
-    /// recorded a punch), so later events in the batch cannot change it.
+    /// Names the path of every queued Connected terminal whose connection's
+    /// own lifecycle event has been observed. The Endpoint engine calls this
+    /// as soon as the step that settled them (or, for one settled ahead of
+    /// that event, the event's ingest) ends: NAT has recorded a punch, and
+    /// no later event of the batch has ended the connection yet.
     pub(crate) fn resolve_paths(&mut self, mut path_of: impl FnMut(ConnectionId) -> Path) {
         for terminal in &mut self.events {
             if let Terminal::Connected {
@@ -922,6 +932,7 @@ impl ConnectEngine {
                 peer_id,
                 conn_id,
             } = terminal
+                && !self.unannounced.contains(conn_id)
             {
                 *terminal = Terminal::Settled(EndpointEvent::ConnectSettled {
                     connect_id: *connect_id,
@@ -1472,14 +1483,15 @@ mod tests {
         while let Some(event) = engine.pop_resolved() {
             out.push(event);
         }
+        // Terminals follow the batch's swarm events, as in the Endpoint.
         for event in runtime.poll(Now::from_millis(now_ms)).expect("poll") {
             let consumed = engine.observe(&event, runtime, now_ms);
             if !consumed {
                 out.push(EndpointEvent::from(event));
             }
-            while let Some(engine_event) = engine.pop_resolved() {
-                out.push(engine_event);
-            }
+        }
+        while let Some(engine_event) = engine.pop_resolved() {
+            out.push(engine_event);
         }
         out
     }
@@ -2615,6 +2627,59 @@ mod tests {
             settled_for(&events, id),
             Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == circuit(4)
         ));
+    }
+
+    /// A connection settled on before its own lifecycle event is observed
+    /// (a later connection of the batch took the slot) gets its path only
+    /// after that event. Here a relay swap and a hole punch land in one
+    /// batch: the engine settles on the punch while observing the swap, but
+    /// NAT records the punch only on the punch's own `ConnectionReplaced`.
+    #[test]
+    fn a_connection_settled_ahead_of_its_event_is_named_after_it() {
+        let peer = peer(b"swap-and-punch");
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let id = admit(
+            &mut engine,
+            peer.clone(),
+            Vec::new(),
+            RelayPolicy::Race,
+            &mut runtime,
+            0,
+        );
+        runtime
+            .transport_mut()
+            .push_connected(circuit(3), peer.clone(), addr(&peer, 9));
+        assert!(settled_for(&drain(&mut engine, &mut runtime, 0), id).is_none());
+
+        let punch = ConnectionId::new(1);
+        let transport = runtime.transport_mut();
+        transport.push_connected(circuit(4), peer.clone(), addr(&peer, 9));
+        transport.push_connected(punch, peer.clone(), addr(&peer, 1));
+        // Stands in for NAT: the punch is recorded once its event is seen.
+        // Paths are named after each event, terminals popped at batch end,
+        // as the Endpoint engine does.
+        let mut punched = false;
+        for event in runtime.poll(Now::from_millis(1)).expect("poll") {
+            engine.observe(&event, &mut runtime, 1);
+            punched |= matches!(event, SwarmEvent::ConnectionReplaced { new, .. } if new == punch);
+            engine.resolve_paths(|conn_id| {
+                if punched && conn_id == punch {
+                    Path::Punched
+                } else {
+                    Path::Direct
+                }
+            });
+        }
+        assert!(punched, "the punch replaced the swapped circuit");
+        let events: Vec<_> = core::iter::from_fn(|| engine.pop_event()).collect();
+        assert_eq!(
+            settled_for(&events, id),
+            Some(&ConnectOutcome::Connected {
+                conn_id: punch,
+                path: Path::Punched,
+            })
+        );
     }
 
     /// A circuit that closed in the batch it established in has no path

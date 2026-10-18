@@ -46,7 +46,9 @@
 //! A Connected `ConnectSettled` carries its connection's path from the step
 //! that settled the attempt, before any later event in the batch can end
 //! that connection, so the terminal stays true after it is replaced or
-//! closed.
+//! closed. An attempt settled on a later connection of the same transport
+//! batch takes its path once that connection's own lifecycle event has been
+//! ingested, as NAT records a punch on that event.
 
 use alloc::collections::VecDeque;
 #[cfg(any(feature = "std", feature = "pubsub"))]
@@ -565,8 +567,9 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     }
 
     /// Names the path of every attempt that settled Connected in the step
-    /// just run, before a later event can replace or close its connection
-    /// (see `ConnectEngine::resolve_paths`).
+    /// just run (or ahead of the swarm event just ingested), before a later
+    /// event can replace or close its connection (see
+    /// `ConnectEngine::resolve_paths`).
     ///
     /// A settled circuit is still the peer's connection here: the Connection
     /// engine never settles on one the swarm already let go. A direct one
