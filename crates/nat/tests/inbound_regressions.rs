@@ -423,6 +423,9 @@ fn allowed_private_punch_targets_are_still_unicast_quic_ips() {
             "/dns4/localhost/udp/4001/quic-v1",
             "/ip4/255.255.255.255/udp/4001/quic-v1",
             "/ip6/ff02::1/udp/4001/quic-v1",
+            "/ip6/::ffff:255.255.255.255/udp/4001/quic-v1",
+            "/ip6/::ffff:224.0.0.1/udp/4001/quic-v1",
+            "/ip6/::ffff:10.0.0.2/udp/4001/quic-v1",
         ],
         20,
     );
@@ -434,6 +437,7 @@ fn allowed_private_punch_targets_are_still_unicast_quic_ips() {
         vec![
             maddr("/ip4/127.0.0.1/udp/4001/quic-v1"),
             maddr("/ip4/10.0.0.1/udp/4001/quic-v1"),
+            maddr("/ip6/::ffff:10.0.0.2/udp/4001/quic-v1"),
         ]
     );
 }

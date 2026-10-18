@@ -774,19 +774,24 @@ fn is_punchable_quic(addr: &Multiaddr, allow_private: bool) -> bool {
         return false;
     }
     match addr.protocols().first() {
-        Some(Protocol::Ip4(octets)) if allow_private => {
-            let ip = core::net::Ipv4Addr::from(*octets);
-            !(ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast())
-        }
+        Some(Protocol::Ip4(octets)) if allow_private => is_unicast_v4((*octets).into()),
         Some(Protocol::Ip6(octets)) if allow_private => {
             let ip = core::net::Ipv6Addr::from(*octets);
-            !(ip.is_unspecified() || ip.is_multicast())
+            // A mapped IPv4 address is judged as the address it carries.
+            match ip.to_ipv4_mapped() {
+                Some(v4) => is_unicast_v4(v4),
+                None => !(ip.is_unspecified() || ip.is_multicast()),
+            }
         }
         Some(Protocol::Ip4(octets)) => is_global_unicast_v4(*octets),
         Some(Protocol::Ip6(octets)) => is_global_unicast_v6(*octets),
         Some(Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_)) | None => false,
         Some(_) => false,
     }
+}
+
+fn is_unicast_v4(ip: core::net::Ipv4Addr) -> bool {
+    !(ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast())
 }
 
 fn is_global_unicast_v4([a, b, c, d]: [u8; 4]) -> bool {
