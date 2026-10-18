@@ -739,6 +739,54 @@ fn a_second_punch_replacing_the_first_is_punched() {
     assert!(h.agent.is_punched(second), "the surviving punch is Punched");
 }
 
+/// The last round's punch lands after its window closed and the attempt
+/// fell back to relay. It replaces the circuit with no machine to claim it,
+/// and the upgrade is still reported as a punch, once, against the attempt.
+#[test]
+fn an_unclaimed_punch_replacing_the_circuit_upgrades_to_punched() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, circuit) = drive_to_relayed(&mut h);
+    drive_round_at(&mut h, circuit, StreamId::new(90), 310);
+    h.agent.handle_tick(at(3_312));
+    drive_round_at(&mut h, circuit, StreamId::new(91), 3_400);
+    h.agent.handle_tick(at(6_402));
+    let last = drive_round_at(&mut h, circuit, StreamId::new(92), 6_500);
+    let punch = dial_conn_for(&last, &h.target);
+    // The swarm already holds the punch when the window ends.
+    let target = h.target.clone();
+    h.agent.swarm.connect(&target, punch);
+    h.agent.handle_tick(at(9_502));
+    assert!(matches!(
+        drain_events(&mut h.agent).last(),
+        Some(NatEvent::FellBackToRelay { connect_id, .. }) if *connect_id == id
+    ));
+
+    h.agent.deliver_late(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: target,
+            old: circuit,
+            new: punch,
+        },
+        false,
+        at(9_510),
+    );
+    let events = drain_events(&mut h.agent);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [NatEvent::PathUpgraded {
+                connect_id,
+                to: Path::Punched,
+                old_conn_id,
+                new_conn_id,
+                ..
+            }] if *connect_id == id && *old_conn_id == circuit && *new_conn_id == punch
+        ),
+        "{events:?}"
+    );
+    assert!(h.agent.is_punched(punch));
+}
+
 /// Hands the target's connection `old` over to the direct connection `new`.
 fn replace_target(h: &mut Harness, old: ConnectionId, new: ConnectionId, t: u64) {
     h.agent.handle_event(
