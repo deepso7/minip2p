@@ -20,7 +20,8 @@ With the connection window unlimited, one stalled stream cannot spend credit the
 
 ## Consequences
 
-- Yamux goodput on long, fat paths drops back to what a 256 KiB window allows. That is intended; hosts that need more raise `receive_window`.
-- Relayed latency returns to its pre-#385 level, since circuit sessions no longer advertise multi-megabyte windows to the relay.
+- Yamux goodput on long, fat paths drops back to what a 256 KiB window allows. That is intended; hosts that need more raise `receive_window`. On `endpoint_rtt` (100 Mbit/s, 100 ms) TCP falls from 10.97 MB/s (92% of the link) to 1.53 MB/s (13%), and QUIC on quinn's windows from 11.06 MB/s (93%) to 10.25 MB/s (86%).
+- Relayed latency returns to its pre-#385 level, since circuit sessions no longer advertise multi-megabyte windows to the relay: `endpoint_ping_load/relay` p50 goes from 974 to 356–423 µs over TCP and from 940 to 209–246 µs over QUIC (on mito, against the commit before this change).
+- Loopback throughput over Yamux gives back what #385's window gained: `endpoint_throughput/tcp` from 815 to about 405 MB/s and `relayed` from 401 to about 271 MB/s on mito. QUIC loopback is unchanged (740 → 716–732 MB/s).
 - An embedded host sizes memory from its counts, windows and queues (`docs/md/rust/embedded-devices.mdx`).
 - Exposing the windows and the connection and stream limits through FFI and the SDKs is #382.
