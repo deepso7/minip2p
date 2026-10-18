@@ -58,7 +58,7 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use minip2p_core::platform::{Deadline, EntropySource, Now};
-use minip2p_core::{Bytes, Multiaddr, Path, PeerAddr, PeerId, Protocol};
+use minip2p_core::{Bytes, Multiaddr, Path, PeerAddr, PeerId};
 use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
@@ -70,6 +70,7 @@ use crate::nat::NatDriver;
 use crate::portable::connect::cancel_attempt;
 use crate::portable::connect::{
     ConnectAdmission, ConnectEngine, ConnectId, ConnectTarget, Expansion, admit_connect,
+    circuit_relay,
 };
 #[cfg(feature = "pubsub")]
 use crate::pubsub::{GossipsubDriver, GossipsubError};
@@ -569,23 +570,22 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// Names the path of every attempt that settled Connected in the step
     /// just run (or ahead of the swarm event just ingested), before a later
     /// event can replace or close its connection (see
-    /// `ConnectEngine::resolve_paths`).
-    ///
-    /// A settled circuit is still the peer's connection here: the Connection
-    /// engine never settles on one the swarm already let go. A direct one
-    /// may already be gone with its close queued, and needs no swarm record;
-    /// NAT has not seen that close yet, so a punch is still recorded.
+    /// `ConnectEngine::resolve_paths`). A circuit's relay was recorded when
+    /// it settled; a direct connection only needs NAT's punch record, which
+    /// still holds for one whose close is queued, as NAT has not seen it.
     fn resolve_settled_paths(&mut self) {
-        let core = &self.core;
         #[cfg(feature = "_nat-driver")]
         let nat = self.nat.as_ref();
         self.connect.resolve_paths(|conn_id| {
             #[cfg(feature = "_nat-driver")]
-            let punched = nat.is_some_and(|nat| nat.is_punched(conn_id));
+            {
+                nat.is_some_and(|nat| nat.is_punched(conn_id))
+            }
             #[cfg(not(feature = "_nat-driver"))]
-            let punched = false;
-            path_of(core, punched, conn_id)
-                .expect("a settled circuit is established and its address names its relay")
+            {
+                let _ = conn_id;
+                false
+            }
         });
     }
 
@@ -1042,22 +1042,9 @@ fn path_of<T: Transport, E: EntropySource>(
     conn_id: ConnectionId,
 ) -> Option<Path> {
     if conn_id.is_circuit() {
-        let relay = core.connection_remote_addr(conn_id).and_then(circuit_relay);
-        debug_assert!(
-            relay.is_some(),
-            "circuit {conn_id:?} has no /p2p/<relay>/p2p-circuit remote address"
-        );
-        return relay.map(|relay| Path::Relayed { relay });
+        return circuit_relay(core, conn_id).map(|relay| Path::Relayed { relay });
     }
     Some(if punched { Path::Punched } else { Path::Direct })
-}
-
-/// The relay a circuit's remote address (`/p2p/<relay>/p2p-circuit`) names.
-fn circuit_relay(addr: &Multiaddr) -> Option<PeerId> {
-    match addr.protocols() {
-        [.., Protocol::P2p(relay), Protocol::P2pCircuit] => Some(relay.clone()),
-        _ => None,
-    }
 }
 
 /// Appends the contributions `addresses` does not already hold, keeping
