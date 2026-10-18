@@ -389,7 +389,7 @@ fn deliver_one(pair: &mut UpgradedSet, index: usize) {
                 TransportEvent::Error { id, message } => {
                     panic!("connection {id} failed while waiting on stream {index}: {message}")
                 }
-                TransportEvent::Closed { id } => {
+                TransportEvent::Closed { id, .. } => {
                     panic!("connection {id} closed while waiting on stream {index}")
                 }
                 _ => {}

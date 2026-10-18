@@ -26,7 +26,7 @@ Available on the std `Endpoint`:
 
 - Address publication: `listen`, `listen_all`
 - Connection attempts: `connect`, `cancel_connect`, `disconnect`
-- State snapshots: `peer_id`, `connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`
+- State snapshots: `peer_id`, `connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `connection_info`, `path`, `bound_addresses`
 - Streams: `add_protocol`, `open_stream` (returns the connection and stream IDs), `send_stream`, `close_stream_write`, `reset_stream`, `abandon_stream` (each addressed by connection and stream ID), and `StreamWriter` for whole writes with a deferred close
 - Ping: `ping` (RTT arrives as `EndpointEvent::PingRttMeasured`)
 - Driving: blocking `wait` (every event, including capability variants, or the deadline, or an interruption); non-blocking `poll`; `wait_handle` to interrupt a blocked `wait`
@@ -64,7 +64,7 @@ Compiled with `features = ["nat"]`:
 - Configuration: `circuit_limits` (relay circuits' Yamux limits and circuit memory budget)
 - Attempts: `connect` races direct candidates against a relay leg; `cancel_connect`
 - Events: `EndpointEvent::Nat(..)` via `wait` or `poll`
-- State: `reachability`, `active_reservation`, `path`
+- State: `reachability`, `active_reservation`
 
 <Callout type="warning">
 

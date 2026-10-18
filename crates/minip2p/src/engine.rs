@@ -32,6 +32,16 @@
 //! step that can make the agent speak, and again while Connection-attempt
 //! terminals are collected, so even an event produced by a terminal's
 //! cleanup is staged before the batch's final drain.
+//!
+//! # Paths
+//!
+//! Every established connection has a [`Path`], answered here on every
+//! feature set without a record of its own: a circuit (its connection id is
+//! in the circuit namespace) is Relayed through the relay its address names;
+//! anything else is Direct, unless NAT reports the connection as its hole
+//! punch's (`NatAgent::is_punched`). The swarm's connection records and
+//! NAT's punch record are the only sources, and both end with the
+//! connection, so a replacement never inherits its predecessor's path.
 
 use alloc::collections::VecDeque;
 #[cfg(any(feature = "std", feature = "pubsub"))]
@@ -41,7 +51,7 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use minip2p_core::platform::{Deadline, EntropySource, Now};
-use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{Bytes, Multiaddr, Path, PeerAddr, PeerId, Protocol};
 use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
@@ -58,7 +68,7 @@ use crate::portable::connect::{
 use crate::pubsub::{GossipsubDriver, GossipsubError};
 #[cfg(feature = "relay-server")]
 use crate::std::relay_server::{RelayServerDriver, concrete_relay_listener_addrs};
-use crate::{EndpointEvent, StreamAcks};
+use crate::{ConnectionInfo, EndpointEvent, StreamAcks};
 
 /// What an engine needs from its mDNS carrier: an `MdnsIo` when mDNS is
 /// compiled in, nothing otherwise. Std uses the concrete socket carrier, so
@@ -516,11 +526,50 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             .unwrap_or_default()
     }
 
-    #[cfg(feature = "_circuit-driver")]
-    pub(crate) fn path(&self, peer_id: &PeerId) -> Option<minip2p_nat::Path> {
-        self.nat
-            .as_ref()
-            .and_then(|nat| nat.path(&self.core, peer_id))
+    /// See `Endpoint::path`.
+    pub(crate) fn path(&self, peer_id: &PeerId) -> Option<Path> {
+        self.connection_path(self.core.connection_id(peer_id)?)
+    }
+
+    /// See `Endpoint::connection_info`.
+    pub(crate) fn connection_info(&self, conn_id: ConnectionId) -> Option<ConnectionInfo> {
+        let peer_id = self.core.connection_peer(conn_id)?.clone();
+        let ready_protocols = self
+            .core
+            .peer_readiness(&peer_id)
+            .filter(|(ready, _)| *ready == conn_id)
+            .map(|(_, info)| info.protocols.clone());
+        Some(ConnectionInfo {
+            path: self.connection_path(conn_id)?,
+            remote_addr: self.core.connection_remote_addr(conn_id)?.clone(),
+            peer_id,
+            conn_id,
+            ready_protocols,
+        })
+    }
+
+    /// The path of an established connection (see the module docs); `None`
+    /// for a pending, replaced, or closed one. A circuit is never Direct:
+    /// one whose remote address does not name its relay is a bug, and
+    /// reports no path rather than a wrong one.
+    fn connection_path(&self, conn_id: ConnectionId) -> Option<Path> {
+        self.core.connection_peer(conn_id)?;
+        if conn_id.is_circuit() {
+            let relay = self
+                .core
+                .connection_remote_addr(conn_id)
+                .and_then(circuit_relay);
+            debug_assert!(
+                relay.is_some(),
+                "circuit {conn_id:?} has no /p2p/<relay>/p2p-circuit remote address"
+            );
+            return relay.map(|relay| Path::Relayed { relay });
+        }
+        #[cfg(feature = "_nat-driver")]
+        if self.nat.as_ref().is_some_and(|nat| nat.is_punched(conn_id)) {
+            return Some(Path::Punched);
+        }
+        Some(Path::Direct)
     }
 
     #[cfg(feature = "_circuit-driver")]
@@ -961,6 +1010,14 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;
+
+/// The relay a circuit's remote address (`/p2p/<relay>/p2p-circuit`) names.
+fn circuit_relay(addr: &Multiaddr) -> Option<PeerId> {
+    match addr.protocols() {
+        [.., Protocol::P2p(relay), Protocol::P2pCircuit] => Some(relay.clone()),
+        _ => None,
+    }
+}
 
 /// Appends the contributions `addresses` does not already hold, keeping
 /// first-wins order.

@@ -64,7 +64,7 @@ export async function runSmokeSuite(
     report({
       detail: `${result.path.kind}; connectId=${result.connectId}`,
       name: "direct-loopback-path",
-      passed: first.path(secondPeer)?.kind === "directDialed",
+      passed: first.path(secondPeer)?.kind === "direct",
     });
 
     const rttMs = await first.ping(secondPeer, { timeoutMs: WAIT_MS });

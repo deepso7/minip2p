@@ -82,9 +82,10 @@ listen: ["/ip4/0.0.0.0/tcp/4001", "/ip6/::/tcp/4001"];
 | `Minip2p.create(config)` | Started `Minip2p` endpoint. |
 | `useMinip2p(createConfig)` | <Badge>React Native</Badge> Hook state plus an idempotent `close` callback. |
 | `bindAppState(endpoint)` | <Badge>React Native</Badge> Idempotent unsubscribe for manual lifecycle ownership. |
-| `endpoint.close()` | Terminal, idempotent shutdown. |
-| `endpoint[Symbol.dispose]()` | Equivalent to `close()`; supports `using` where the toolchain does. |
-| `endpoint.onClose(handler)` | One-shot close observer unsubscribe. |
+| `endpoint.close(timeoutMs?)` | Terminal, idempotent shutdown; resolves with an `EndpointCloseReport` once native drained for up to `timeoutMs` (default 500). |
+| `endpoint[Symbol.asyncDispose]()` | Awaits `close()`; supports `await using`. |
+| `endpoint[Symbol.dispose]()` | Starts `close()` without waiting; supports `using`. |
+| `endpoint.onClose(handler)` | One-shot close observer, called with the same report once the drain finishes; returns an unsubscribe. |
 | `endpoint.isRunning()` | Whether the endpoint still accepts work. |
 | `endpoint.setActive(active)` | Choose normal behavior or reduced background work. |
 
@@ -103,8 +104,8 @@ and shutdown order.
 | `peerInfo(peerId)` | Latest remote Identify snapshot, if known. |
 | `knownPeers()` | Multi-source discovery address book. |
 | `discoveryNowMs()` | Discovery monotonic time, when enabled. |
-| `path(peerId)` | Authoritative current `Path`, if connected. |
-| `connectionInfo(peerId)` | Selected `{ connId, remoteAddr?, readyProtocols? }`, if connected; `readyProtocols` is set once that connection is ready. |
+| `path(peerId)` | The current connection's `Path` (`direct`, `punched`, or `relayed`), if connected. |
+| `connectionInfo(peerId)` | The current connection's `{ peerId, connId, remoteAddr, path, readyProtocols? }`, if connected; `readyProtocols` is set once that connection is ready. |
 | `reachability()` | Latest AutoNAT reachability verdict. |
 | `activeReservation()` | Active relay reservation metadata. |
 | `circuitAddress` | Usable local circuit address, when reserved. |
@@ -165,7 +166,7 @@ Stream events are `data`, `remoteWriteClosed`, `writeStopped`, and `closed`. Str
 | Pubsub | `message`, `peerSubscribed`, `peerUnsubscribed`, `gossipsubOutboundFailure`, `gossipsubProtocolViolation` |
 | Discovery | `peerDiscovered`, `peerUpdated`, `peerExpired`, `discoveryDialFailed`, `discoveryProtocolViolation` |
 
-`connectionReplaced` (`{ peerId, oldConnId, newConnId }`) reports a newer connection taking over the peer's single connection slot; the peer stays connected, streams and pending opens on `oldConnId` end with `StreamClosedError`, and `peerReady` (which carries `connId`) fires again for `newConnId`. `connectionClosed` means the peer's last connection closed.
+`connectionReplaced` (`{ peerId, oldConnId, newConnId }`) reports a newer connection taking over the peer's single connection slot; the peer stays connected, streams and pending opens on `oldConnId` end with `StreamClosedError`, and `peerReady` (which carries `connId`) fires again for `newConnId`. `connectionClosed` (`{ peerId, connId, reason }`) means the peer's last connection closed; `reason` is a `ConnectionCloseReason`: `{ kind: "local" }`, `{ kind: "remote", code }` (the peer's QUIC close or Yamux GoAway code, a `bigint`), `{ kind: "timedOut" }`, `{ kind: "stalled" }`, or `{ kind: "error", message }`. A failure that ended the connection is its reason, not a separate `endpointError`.
 
 The catch-all stream uses `inboundStream` metadata instead of the live `stream` handle. Subscribe to the named `stream` event to claim an inbound stream.
 

@@ -858,7 +858,7 @@ fn ping_loop(
                     && !channel.direct
                 {
                     println!(
-                        "[dial] path-upgraded path=direct-punched elapsed-us={}",
+                        "[dial] path-upgraded path=punched elapsed-us={}",
                         micros_since(start)
                     );
                     // The old bridge is already reset by the agent — never

@@ -49,7 +49,7 @@ Use `Multiaddr` when choosing where to listen. Use `PeerAddr` when connecting to
 
 `ConnectionEstablished` means the peer went from disconnected to connected: the transport finished connecting and authenticated it. `PeerReady` comes later, after the connection's first Identify exchange has supplied the peer's supported protocols and advertised addresses.
 
-An endpoint keeps one connection per peer. When a newer connection takes over (a punched direct path replacing a relay circuit, or a late duplicate dial), the endpoint reports one `ConnectionReplaced { peer_id, old, new }` instead of a close and a second establishment; the peer stays connected throughout. Streams on `old` end with it without their own close events. Readiness belongs to a connection, so `PeerReady { conn_id, .. }` fires again for `new`; a `PeerReady` whose `conn_id` is not the peer's current connection is stale. `ConnectionClosed` means the peer's last connection closed.
+An endpoint keeps one connection per peer. When a newer connection takes over (a punched direct path replacing a relay circuit, or a late duplicate dial), the endpoint reports one `ConnectionReplaced { peer_id, old, new }` instead of a close and a second establishment; the peer stays connected throughout. Streams on `old` end with it without their own close events. Readiness belongs to a connection, so `PeerReady { conn_id, .. }` fires again for `new`; a `PeerReady` whose `conn_id` is not the peer's current connection is stale. `ConnectionClosed { reason, .. }` means the peer's last connection closed; its `ConnectionCloseReason` says why: `Local`, `Remote { code }` (the peer's QUIC close or Yamux GoAway code), `TimedOut`, `Stalled` (the peer stopped reading), or `Error(message)`. A failure that ended the connection is that reason, not a separate `EndpointEvent::Error`.
 
 `open_stream` is allowed once the peer is connected. The remote-protocol advertisement check applies only after `PeerReady`; before that, negotiation proceeds without an early `RemoteDoesNotSupport` reject. Waiting for Identify is application policy when you want the advertised protocol list first, not a stack requirement for opening a known protocol.
 
@@ -57,13 +57,13 @@ An endpoint keeps one connection per peer. When a newer connection takes over (a
 
 `connect` starts one Connection attempt and returns its `ConnectId` immediately. The target is a `PeerId`, one complete `PeerAddr`, or a non-empty list of complete addresses naming the same peer. The attempt may run several Transport dials at once (one per candidate and IP family) and, with NAT traversal, a relay leg, but it ends with exactly one `EndpointEvent::ConnectSettled` carrying that ID: `Connected`, `Failed`, or `Cancelled`. `cancel_connect` is the only way to stop it; abandoning a wait never cancels.
 
-Each address picks its transport (`/udp/…/quic-v1` or `/tcp`) and IP family (`/ip4`, `/ip6`, or `/dns*` resolution). Without NAT configuration, `connect` dials only direct candidates. With the `nat` capability enabled and a relay configured, it can race direct candidates against a relay leg. The first usable result is:
+Each address picks its transport (`/udp/…/quic-v1` or `/tcp`) and IP family (`/ip4`, `/ip6`, or `/dns*` resolution). Without NAT configuration, `connect` dials only direct candidates. With the `nat` capability enabled and a relay configured, it can race direct candidates against a relay leg. Every established connection has a `Path`:
 
-- `Path::DirectDialed`: a supplied direct address connected;
-- `Path::DirectPunched`: DCUtR established a direct connection;
+- `Path::Direct`: a direct connection we dialed or accepted;
+- `Path::Punched`: DCUtR established a direct connection;
 - `Path::Relayed { relay }`: an end-to-end protected circuit is usable.
 
-A relayed path can later emit `NatEvent::PathUpgraded` when hole punching lands.
+A relayed path can later emit `NatEvent::PathUpgraded` when hole punching lands. The upgrade is a new connection with its own path; nothing carries over from the circuit.
 
 <Callout type="warning">
 
@@ -81,6 +81,6 @@ Every event leaves through the Endpoint event stream, read with `Endpoint::wait`
 - `EndpointEvent::RelayServer(RelayServerEvent)` (`relay-server`);
 - `EndpointEvent::MdnsFailed { error }` and `EndpointEvent::MdnsRecovered` (`mdns`): an mDNS socket failure and its recovery. mDNS keeps retrying meanwhile, and nothing else on the endpoint stops.
 
-Durable state is available through State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`, and with capabilities `path`, `reachability`, `active_reservation`, `known_peers`). `bound_addresses` reports transport-bound local addresses; `bind` already accepts on each. Those getters do not drive the endpoint, are not one cross-getter atomic snapshot, and may be ahead of the event stream, never behind their own emitted transition.
+Durable state is available through State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `connection_info`, `path`, `bound_addresses`, and with capabilities `reachability`, `active_reservation`, `known_peers`). `connection_info(conn_id)` returns an established connection's peer, remote address, `Path`, and Identify protocols (`ready_protocols` is `None` until it is identified); it is `None` for a pending, replaced, or closed connection. `bound_addresses` reports transport-bound local addresses; `bind` already accepts on each. Those getters do not drive the endpoint, are not one cross-getter atomic snapshot, and may be ahead of the event stream, never behind their own emitted transition.
 
 Continue with [Listen and connect](/rust/listen-and-dial) or the [glossary](/reference/glossary).

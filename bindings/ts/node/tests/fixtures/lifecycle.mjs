@@ -36,7 +36,7 @@ if (process.argv[2] === "close") {
   }
   const averageCallMs = (performance.now() - callStarted) / calls;
   const closeStarted = performance.now();
-  endpoint.close();
+  endpoint.close(500);
   const closeMs = performance.now() - closeStarted;
   process.stdout.write(`averageCallMs=${averageCallMs}\ncloseMs=${closeMs}\n`);
 }

@@ -50,9 +50,9 @@ use minip2p_secure_mux::{
     YamuxConfig, YamuxError,
 };
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, ConnectionState,
-    InvalidLimit, MemoryLedger, StreamId, Transport, TransportError, TransportEvent,
-    UnsettledConnections,
+    ConnectionCloseReason, ConnectionEndpoint, ConnectionId, ConnectionIdAllocator,
+    ConnectionNamespace, ConnectionState, InvalidLimit, MemoryLedger, StreamId, Transport,
+    TransportError, TransportEvent, UnsettledConnections,
 };
 use thiserror::Error;
 
@@ -210,28 +210,17 @@ impl Default for CircuitLimits {
 }
 
 /// Why a circuit is being torn down.
-struct Teardown {
-    /// Text for the public [`TransportEvent::Error`], if one is emitted.
-    message: String,
-    /// The remote ended an established session cleanly rather than failing.
-    graceful: bool,
-}
+struct Teardown(ConnectionCloseReason);
 
 impl Teardown {
     fn fault(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            graceful: false,
-        }
+        Self(ConnectionCloseReason::Error(message.into()))
     }
 }
 
 impl From<SessionError> for Teardown {
     fn from(error: SessionError) -> Self {
-        Self {
-            graceful: matches!(error, SessionError::GoAway { code: 0 }),
-            message: error.to_string(),
-        }
+        Self(error.close_reason())
     }
 }
 
@@ -568,7 +557,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             this.pump(circuit)
         });
         if let Err(teardown) = start_result {
-            self.fail_circuit(id, teardown.message, true);
+            self.fail_circuit(id, teardown.0);
             return Ok((id, true));
         }
         // Whoever read these bytes past the CONNECT response already
@@ -609,11 +598,6 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         let Some(id) = self.bridge_index.get(&key).copied() else {
             return;
         };
-        // A failed session is unusable, so `is_ready` reads false afterwards:
-        // capture readiness before feeding it. In particular, a normal Yamux
-        // GoAway from an established circuit must close without being
-        // misclassified as a pre-handshake protocol failure.
-        let pre_ready = self.circuits.get(&id).is_some_and(|c| !c.is_ready());
         let result = self.with_circuit(id, |this, circuit| {
             let fed = circuit
                 .session
@@ -624,7 +608,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             fed.map_err(Teardown::from).and(pumped)
         });
         if let Err(teardown) = result {
-            self.fail_circuit(id, teardown.message, pre_ready || !teardown.graceful);
+            self.fail_circuit(id, teardown.0);
         }
     }
 
@@ -636,11 +620,9 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     ) {
         let key = (inner_conn, bridge_stream);
         if let Some(id) = self.bridge_index.get(&key).copied() {
-            let pre_ready = self.circuits.get(&id).is_some_and(|c| !c.is_ready());
             self.fail_circuit(
                 id,
-                "relay bridge remote write side closed".to_string(),
-                pre_ready,
+                ConnectionCloseReason::Error("relay bridge remote write side closed".to_string()),
             );
         }
     }
@@ -650,8 +632,10 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         let key = (inner_conn, bridge_stream);
         self.release_retired_bridge(key);
         if let Some(id) = self.bridge_index.get(&key).copied() {
-            let pre_ready = self.circuits.get(&id).is_some_and(|c| !c.is_ready());
-            self.fail_circuit(id, "relay bridge closed".to_string(), pre_ready);
+            self.fail_circuit(
+                id,
+                ConnectionCloseReason::Error("relay bridge closed".to_string()),
+            );
         }
     }
 
@@ -665,8 +649,10 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         bridge_stream: StreamId,
     ) {
         if let Some(id) = self.bridge_index.get(&(inner_conn, bridge_stream)).copied() {
-            let pre_ready = self.circuits.get(&id).is_some_and(|c| !c.is_ready());
-            self.fail_circuit(id, "relay bridge write side stopped".to_string(), pre_ready);
+            self.fail_circuit(
+                id,
+                ConnectionCloseReason::Error("relay bridge write side stopped".to_string()),
+            );
         }
     }
 
@@ -743,7 +729,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                         .get(&peer)
                         .is_some_and(|connections| !connections.is_empty())
                     {
-                        return Err(Teardown::fault("direct connection won circuit arbitration"));
+                        return Err(Teardown(ConnectionCloseReason::Local));
                     }
                     TransportEvent::Connected {
                         id,
@@ -819,7 +805,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     fn bridge_writable(&mut self, id: ConnectionId) {
         let result = self.with_circuit(id, |this, circuit| this.pump(circuit));
         if let Err(teardown) = result {
-            self.fail_circuit(id, teardown.message, !teardown.graceful);
+            self.fail_circuit(id, teardown.0);
         }
     }
 
@@ -838,7 +824,9 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         Some(circuit)
     }
 
-    fn fail_circuit(&mut self, id: ConnectionId, message: String, emit_error: bool) {
+    /// Retires a circuit and resets its bridge, emitting `Closed` with
+    /// `reason`.
+    fn fail_circuit(&mut self, id: ConnectionId, reason: ConnectionCloseReason) {
         let Some(circuit) = self.retire_circuit(id) else {
             return;
         };
@@ -849,15 +837,12 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             .inner
             .reset_stream(circuit.inner_conn, circuit.bridge_stream);
         // The circuit is already retired. A failed bridge reset cannot revive
-        // it or replace the error/close transition below.
+        // it or replace the close below.
         match reset_result {
             Ok(()) | Err(_) => {}
         }
-        if emit_error {
-            self.pending
-                .push_back(TransportEvent::Error { id, message });
-        }
-        self.pending.push_back(TransportEvent::Closed { id });
+        self.pending
+            .push_back(TransportEvent::Closed { id, reason });
     }
 
     fn record_direct(&mut self, id: ConnectionId, peer: PeerId) {
@@ -882,11 +867,8 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             })
             .collect();
         for circuit_id in losers {
-            self.fail_circuit(
-                circuit_id,
-                "direct connection won circuit arbitration".to_string(),
-                true,
-            );
+            // A direct connection outranks a relayed one: our own decision.
+            self.fail_circuit(circuit_id, ConnectionCloseReason::Local);
         }
     }
 
@@ -928,7 +910,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             | TransportEvent::StreamRemoteWriteClosed { id, .. }
             | TransportEvent::StreamWriteStopped { id, .. }
             | TransportEvent::StreamClosed { id, .. }
-            | TransportEvent::Closed { id }
+            | TransportEvent::Closed { id, .. }
             | TransportEvent::Error { id, .. }
             | TransportEvent::IncomingConnection { id, .. }
             | TransportEvent::PeerIdentityVerified { id, .. } => Some(*id),
@@ -1031,7 +1013,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                         .push_back(TransportEvent::StreamClosed { id, stream_id });
                 }
             }
-            TransportEvent::Closed { id } => {
+            TransportEvent::Closed { id, reason } => {
                 self.active_inner.remove(&id);
                 self.remove_direct(id);
                 let riding: Vec<_> = self
@@ -1042,14 +1024,14 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                     })
                     .collect();
                 for circuit_id in riding {
-                    let pre_ready = self
-                        .circuits
-                        .get(&circuit_id)
-                        .is_some_and(|circuit| !circuit.is_ready());
-                    self.fail_circuit(circuit_id, "relay connection closed".to_string(), pre_ready);
+                    self.fail_circuit(
+                        circuit_id,
+                        ConnectionCloseReason::Error(format!("relay connection closed: {reason}")),
+                    );
                 }
                 self.release_retired_bridges_for_connection(id);
-                self.pending.push_back(TransportEvent::Closed { id });
+                self.pending
+                    .push_back(TransportEvent::Closed { id, reason });
             }
             other => self.pending.push_back(other),
         }
@@ -1058,9 +1040,10 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     /// Runs one stream operation against a circuit's session and flushes
     /// whatever it queued.
     ///
-    /// A failure that kills the session closes the circuit before returning.
-    /// No `Error` event goes out: the caller already learns why from the
-    /// returned error, exactly as for a locally requested [`Transport::close`].
+    /// A failure that kills the session closes the circuit before returning,
+    /// with the failure as its close reason, and returns
+    /// [`TransportError::ConnectionClosed`] so the caller can tell its
+    /// operation ended the circuit.
     fn operate_session<R>(
         &mut self,
         id: ConnectionId,
@@ -1075,10 +1058,12 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         self.release_settled(&mut circuit.session);
         self.circuits.insert(id, circuit);
 
-        if let Err(teardown) = pumped {
-            self.fail_circuit(id, teardown.message.clone(), false);
-            return Err(TransportError::PollError {
-                reason: teardown.message,
+        if let Err(Teardown(reason)) = pumped {
+            let message = reason.to_string();
+            self.fail_circuit(id, reason);
+            return Err(TransportError::ConnectionClosed {
+                id,
+                reason: message,
             });
         }
         match result {
@@ -1129,8 +1114,8 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             // exhausted the control reserve (see `YamuxSession::reset`).
             Err(fatal) => {
                 let reason = fatal.to_string();
-                self.fail_circuit(id, reason.clone(), false);
-                Err(TransportError::PollError { reason })
+                self.fail_circuit(id, ConnectionCloseReason::Error(reason.clone()));
+                Err(TransportError::ConnectionClosed { id, reason })
             }
         }
     }
@@ -1267,7 +1252,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
             return self.inner.set_control_stream(id, stream_id, control);
         }
         // Nothing returns to the caller, so a circuit the mark's flush fails
-        // is torn down with an `Error` carrying the reason.
+        // is torn down with the failure as its close reason.
         if !self.circuits.contains_key(&id) {
             return;
         }
@@ -1276,7 +1261,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
             this.pump(circuit)
         });
         if let Err(teardown) = result {
-            self.fail_circuit(id, teardown.message, !teardown.graceful);
+            self.fail_circuit(id, teardown.0);
         }
     }
 
@@ -1315,7 +1300,10 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         // Every write side ended with the connection.
         self.pending
             .retain(|event| !matches!(event, TransportEvent::StreamWritable { id: owner, .. } if *owner == id));
-        self.pending.push_back(TransportEvent::Closed { id });
+        self.pending.push_back(TransportEvent::Closed {
+            id,
+            reason: ConnectionCloseReason::Local,
+        });
         Ok(())
     }
 
@@ -1339,7 +1327,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
                 this.pump(circuit)
             });
             if let Err(teardown) = result {
-                self.fail_circuit(id, teardown.message, !teardown.graceful);
+                self.fail_circuit(id, teardown.0);
             }
         }
         Ok(self.drain_pending_events())
@@ -1411,13 +1399,16 @@ impl<T: minip2p_transport::PollSource, E: EntropySource> minip2p_transport::Poll
 /// Wraps a session failure as the stream error the transport contract expects.
 ///
 /// Identifier and state errors pass through: they describe the request rather
-/// than the stream operation, and callers match on them.
+/// than the stream operation, and callers match on them. So does
+/// ConnectionClosed, which tells the swarm the failure already ended the
+/// connection and is reported by its `Closed` alone.
 fn stream_error(
     error: TransportError,
     wrap: impl FnOnce(String) -> TransportError,
 ) -> TransportError {
     match error {
         error @ (TransportError::ConnectionNotFound { .. }
+        | TransportError::ConnectionClosed { .. }
         | TransportError::StreamNotFound { .. }
         | TransportError::InvalidState { .. }
         | TransportError::Full { .. }) => error,
@@ -1437,10 +1428,10 @@ impl<T> CircuitTransport<T, StdEntropy> {
 mod tests {
     use super::*;
     use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
-    use minip2p_secure_mux::KEEPALIVE_INTERVAL_MS;
     use minip2p_secure_mux::noise::{
         NOISE_PROTOCOL_ID, NoiseConfig, NoiseOutput, NoiseRole, NoiseSession,
     };
+    use minip2p_secure_mux::{KEEPALIVE_ACK_TIMEOUT_MS, KEEPALIVE_INTERVAL_MS};
     use minip2p_test_support::InMemoryTransport;
 
     #[derive(Clone, Debug)]
@@ -1979,6 +1970,31 @@ mod tests {
             a.circuit_ids().contains(&circuit_id),
             "keepalive must not tear the circuit down"
         );
+    }
+
+    #[test]
+    fn an_unanswered_keepalive_closes_the_circuit_as_timed_out() {
+        let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_close_observed_pair();
+        complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+
+        // The ping goes out; the next poll dates its hand-off.
+        a.poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .expect("ping");
+        a.poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .expect("date the hand-off");
+        let answer_by = KEEPALIVE_INTERVAL_MS + KEEPALIVE_ACK_TIMEOUT_MS;
+        assert_eq!(a.next_deadline(), Some(Deadline::from_millis(answer_by)));
+
+        // `b` never reads the bridge, so no acknowledgement comes back.
+        let events = a.poll(Now::from_millis(answer_by)).expect("time out");
+        assert!(
+            events.contains(&TransportEvent::Closed {
+                id: circuit_id,
+                reason: ConnectionCloseReason::TimedOut,
+            }),
+            "{events:?}"
+        );
+        assert!(!a.circuit_ids().contains(&circuit_id));
     }
 
     #[test]
@@ -2576,10 +2592,10 @@ mod tests {
     fn assert_pre_ready_bridge_failure(events: &[TransportEvent], circuit_id: ConnectionId) {
         assert!(matches!(
             events,
-            [
-                TransportEvent::Error { id: error_id, .. },
-                TransportEvent::Closed { id: closed_id },
-            ] if *error_id == circuit_id && *closed_id == circuit_id
+            [TransportEvent::Closed {
+                id,
+                reason: ConnectionCloseReason::Error(_),
+            }] if *id == circuit_id
         ));
         assert!(!events.iter().any(|event| matches!(
             event,
@@ -2691,7 +2707,13 @@ mod tests {
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
         a.close(circuit_id).expect("graceful close");
         let events = a.poll(Now::from_millis(0)).expect("closed event");
-        assert_eq!(events, vec![TransportEvent::Closed { id: circuit_id }]);
+        assert_eq!(
+            events,
+            vec![TransportEvent::Closed {
+                id: circuit_id,
+                reason: ConnectionCloseReason::Local
+            }]
+        );
         assert!(matches!(
             a.open_stream(circuit_id),
             Err(TransportError::ConnectionNotFound { .. })
@@ -2731,7 +2753,10 @@ mod tests {
                     id: circuit_id,
                     stream_id: stream,
                 },
-                TransportEvent::Closed { id: circuit_id },
+                TransportEvent::Closed {
+                    id: circuit_id,
+                    reason: ConnectionCloseReason::Local
+                },
             ]
         );
 
@@ -2780,7 +2805,7 @@ mod tests {
                         id: stream_closed_id,
                         stream_id: closed_stream,
                     },
-                    TransportEvent::Closed { id: closed_id },
+                    TransportEvent::Closed { id: closed_id, .. },
                 ] if *id == circuit_id
                     && *stream_id == stream
                     && data[..] == b"queued-before-close"[..]
@@ -2830,7 +2855,10 @@ mod tests {
         assert_eq!(a.inner().reset_calls, 1);
         assert_eq!(
             a.poll(Now::from_millis(0)).expect("local close event"),
-            [TransportEvent::Closed { id: circuit_id }]
+            [TransportEvent::Closed {
+                id: circuit_id,
+                reason: ConnectionCloseReason::Local
+            }]
         );
 
         let peer_wire = b
@@ -2858,7 +2886,10 @@ mod tests {
         assert_eq!(
             b.poll(Now::from_millis(0))
                 .expect("peer observes terminal close"),
-            [TransportEvent::Closed { id: circuit_id }]
+            [TransportEvent::Closed {
+                id: circuit_id,
+                reason: ConnectionCloseReason::Remote { code: 0 }
+            }]
         );
     }
 
@@ -2870,20 +2901,22 @@ mod tests {
         let _ = a.poll(Now::from_millis(0)).expect("drain local events");
 
         // The relay connection dies between polls, so flushing what the
-        // session queued fails.
+        // session queued fails and ends the circuit: the send says so, which
+        // keeps the swarm from reporting the failure a second time.
         a.inner_mut().fail_send = true;
         assert!(matches!(
             a.send_stream(circuit_id, stream, Bytes::from_static(b"lost")),
-            Err(TransportError::StreamSendFailed { id, stream_id, .. })
-                if id == circuit_id && stream_id == stream
+            Err(TransportError::ConnectionClosed { id, .. }) if id == circuit_id
         ));
 
-        // The caller already learned why from that error, so only `Closed`
-        // goes out -- reporting it twice would be noise.
-        assert_eq!(
-            a.poll(Now::from_millis(0)).expect("teardown events"),
-            [TransportEvent::Closed { id: circuit_id }]
-        );
+        // One `Closed`, the failure its reason; no separate `Error`.
+        assert!(matches!(
+            a.poll(Now::from_millis(0)).expect("teardown events").as_slice(),
+            [TransportEvent::Closed {
+                id,
+                reason: ConnectionCloseReason::Error(_),
+            }] if *id == circuit_id
+        ));
         assert_eq!(
             a.close(circuit_id),
             Err(TransportError::ConnectionNotFound { id: circuit_id })
@@ -2900,7 +2933,10 @@ mod tests {
         assert_eq!(a.inner().reset_calls, 1);
         assert_eq!(
             a.poll(Now::from_millis(0)).expect("pre-ready close event"),
-            [TransportEvent::Closed { id: circuit_id }]
+            [TransportEvent::Closed {
+                id: circuit_id,
+                reason: ConnectionCloseReason::Local
+            }]
         );
         assert_eq!(
             a.close(circuit_id),
@@ -2951,7 +2987,13 @@ mod tests {
             .close(ConnectionId::new(1))
             .expect("relay connection closes");
         let events = b.poll(Now::from_millis(0)).expect("relay close");
-        assert!(events.contains(&TransportEvent::Closed { id: circuit_id }));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TransportEvent::Closed {
+                id,
+                reason: ConnectionCloseReason::Error(message),
+            } if *id == circuit_id && message.starts_with("relay connection closed")
+        )));
         assert!(!b.contains_circuit(circuit_id));
         assert_eq!(b.circuit_slots(), 1, "the circuit's bytes are unsettled");
         assert_eq!(
@@ -3004,13 +3046,15 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, TransportEvent::Closed { id } if *id == circuit_id))
+                .filter(
+                    |event| matches!(event, TransportEvent::Closed { id, .. } if *id == circuit_id)
+                )
                 .count(),
             1
         );
         assert!(events.iter().any(|event| matches!(
             event,
-            TransportEvent::Closed { id } if *id == ConnectionId::new(1)
+            TransportEvent::Closed { id, .. } if *id == ConnectionId::new(1)
         )));
         assert!(!events.iter().any(|event| matches!(
             event,
@@ -3179,7 +3223,10 @@ mod tests {
         ));
         a.close(circuit_id).expect("close");
         let events = a.poll(Now::from_millis(0)).expect("poll");
-        assert!(events.contains(&TransportEvent::Closed { id: circuit_id }));
+        assert!(events.contains(&TransportEvent::Closed {
+            id: circuit_id,
+            reason: ConnectionCloseReason::Local
+        }));
         assert!(
             !events
                 .iter()
@@ -3250,14 +3297,16 @@ mod tests {
         let events = a
             .poll(Now::from_millis(0))
             .expect("direct connection arrives");
-        assert!(events.iter().any(|event| matches!(
-            event,
-            TransportEvent::Error { id, .. } if *id == circuit_id
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            TransportEvent::Closed { id } if *id == circuit_id
-        )));
+        // Losing to the direct connection is our own decision.
+        assert!(events.contains(&TransportEvent::Closed {
+            id: circuit_id,
+            reason: ConnectionCloseReason::Local,
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TransportEvent::Error { .. }))
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             TransportEvent::Connected { id, .. } if *id == ConnectionId::new(2)
@@ -3289,7 +3338,13 @@ mod tests {
         // B's encrypted Yamux confirmation is already queued, so this poll is
         // what carries the circuit into Ready.
         let events = a.poll(Now::from_millis(0)).expect("complete the upgrade");
-        assert_pre_ready_bridge_failure(&events, circuit_id);
+        assert_eq!(
+            events,
+            [TransportEvent::Closed {
+                id: circuit_id,
+                reason: ConnectionCloseReason::Local,
+            }]
+        );
         assert!(!a.circuits.contains_key(&circuit_id));
     }
 

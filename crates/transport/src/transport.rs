@@ -28,6 +28,9 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 ///   rather than set one the remote end could compute differently.
 /// - After `close()` is called, the connection eventually emits `Closed`.
 ///   No further events are emitted for that connection id after `Closed`.
+/// - `Closed` carries the [`ConnectionCloseReason`](crate::ConnectionCloseReason):
+///   `Local` after `close()`, otherwise the cause. A failure that ends a
+///   connection is reported only as that reason, never also as `Error`.
 /// - `ConnectionNotFound` is returned for any operation on an unknown or
 ///   already-closed connection id, except that `ack_stream` and
 ///   `reset_stream` still settle the streams of an unsettled connection (see

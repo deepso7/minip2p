@@ -1,8 +1,9 @@
 //! Standard Endpoint NAT regression tests.
+use crate::ConnectionCloseReason;
 use minip2p_core::Multiaddr;
 use minip2p_core::platform::StdEntropy;
 use minip2p_nat::{NatAction, NatAgent, NatEvent, Now};
-use minip2p_swarm::SwarmEvent;
+use minip2p_swarm::{SwarmErrorKind, SwarmEvent};
 use minip2p_transport::Transport;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
 use std::time::Instant;
@@ -462,6 +463,10 @@ impl NatSwarm for BridgeSwarm {
         (*peer == self.relay).then_some((self.conn, self.protocols.as_slice()))
     }
 
+    fn connection_remote_addr(&self, _conn_id: ConnectionId) -> Option<&minip2p_core::Multiaddr> {
+        None
+    }
+
     fn dial(
         &mut self,
         addr: &minip2p_core::PeerAddr,
@@ -862,6 +867,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
             SwarmEvent::ConnectionClosed {
                 peer_id,
                 conn_id: inner_pair.inner_conn,
+                reason: ConnectionCloseReason::Local,
             }
         };
         inner.ingest(
@@ -879,7 +885,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                minip2p_transport::TransportEvent::Closed { id } if *id == promoted
+                minip2p_transport::TransportEvent::Closed { id, .. } if *id == promoted
             )),
             "replaced={replaced}"
         );
@@ -895,6 +901,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         &SwarmEvent::ConnectionClosed {
             peer_id: Ed25519Keypair::from_secret_key_bytes([73; 32]).peer_id(),
             conn_id: promoted,
+            reason: ConnectionCloseReason::Local,
         },
         circuit_pair.local.core_mut(),
         minip2p_core::platform::Now::from_millis(10),
@@ -936,6 +943,8 @@ fn remote_bridge_reset_closes_promoted_circuit() {
         .reset_stream(pair.relay_conn, pair.stream)
         .expect("reset bridge at relay");
 
+    // The circuit never established, so its failure surfaces as a transport
+    // error naming it rather than as a ConnectionClosed.
     let deadline = Instant::now() + std::time::Duration::from_secs(2);
     let mut circuit_failed = false;
     while Instant::now() < deadline && !circuit_failed {
@@ -953,7 +962,8 @@ fn remote_bridge_reset_closes_promoted_circuit() {
         {
             circuit_failed = matches!(
                 &event,
-                SwarmEvent::Error(error) if error.conn_id == Some(promoted)
+                SwarmEvent::Error(error)
+                    if error.kind == SwarmErrorKind::Transport && error.conn_id == Some(promoted)
             );
             let now = pair.local.now();
             driver.ingest(&event, pair.local.core_mut(), now);
@@ -963,6 +973,14 @@ fn remote_bridge_reset_closes_promoted_circuit() {
     assert!(
         circuit_failed,
         "remote RESET_STREAM did not fail the promoted circuit"
+    );
+    assert!(
+        !pair
+            .local
+            .core()
+            .transport()
+            .circuit_ids()
+            .contains(&promoted)
     );
     // The circuit vanished without a lifecycle event the driver saw; the
     // next batch's capability pass forgets its promotion.
@@ -1217,7 +1235,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_replacement() {
         "replacement sequence: {a_sequence:?}"
     );
     assert!(a.core().transport().circuit_ids().is_empty());
-    assert_eq!(a.path(&b_peer), Some(Path::DirectDialed));
+    assert_eq!(a.path(&b_peer), Some(Path::Direct));
 
     a.publish(TOPIC, b"after upgrade")
         .expect("publish after upgrade");

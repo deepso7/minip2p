@@ -19,7 +19,7 @@ Definitions only. For recipes, follow the linked guides.
 | **Transport dial** | One mechanism-level dial of one peer address. A Connection attempt may run several; raw dials outside an attempt live on the swarm. |
 | **Connect ID** | Correlation ID for a Connection attempt, stable across its Transport dials, relay fallback, and upgrade. |
 | **Relay leg** | NAT-owned part of an attempt: relay dial, HOP CONNECT, bridge promotion, DCUtR. Does not decide the terminal. |
-| **Path** | NAT result: `DirectDialed`, `DirectPunched`, or `Relayed`. A Relayed path may be provisional until the attempt settles. See [Traverse NAT](/rust/traverse-nat). |
+| **Path** | How a connection was established: `Direct` (dialed or accepted), `Punched` (by DCUtR), or `Relayed` through a named relay. Every established connection has one; a replacement connection has its own. A Relayed path may be provisional until the attempt settles. See [Traverse NAT](/rust/traverse-nat). |
 | **Stream** | A negotiated byte stream for one application protocol. Writes may be split or combined, so applications add their own framing. |
 | **`useMinip2p`** | React hook that owns an endpoint for a component and closes it during cleanup. |
 | **`queueOverflow`** | TypeScript event reporting that the application did not consume events quickly enough. Refresh queryable state before relying on event history. |

@@ -106,7 +106,7 @@ loop {
 
 `NatEvent::PathEstablished` reports the first usable path, which may be a provisional Relayed circuit. The attempt's terminal is `EndpointEvent::ConnectSettled` (connected after DCUtR settles, or immediately under `force_relay`). NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) are consumed by the Connection-attempt engine and never reach the stream; a failed attempt settles as `ConnectOutcome::Failed`.
 
-`node.path(&peer)` is the State snapshot of the current path, independent of whether its event has been consumed yet.
+`node.path(&peer)` is the State snapshot of the peer's current path, independent of whether its event has been consumed yet. Every established connection has one, with or without NAT; `node.connection_info(conn_id)` returns the same path with the connection's peer, remote address, and Identify protocols.
 
 ## Path selection and upgrade
 
@@ -114,17 +114,17 @@ loop {
 flowchart TB
   A["connect"] --> B["Direct candidates"]
   A --> C["Configured relay leg"]
-  B -->|"wins"| D["DirectDialed"]
+  B -->|"wins"| D["Direct"]
   C -->|"first usable path"| E["Relayed (provisional)"]
   E --> F["DCUtR coordination"]
-  F -->|"punch succeeds"| G["DirectPunched"]
+  F -->|"punch succeeds"| G["Punched"]
   F -->|"retries exhausted"| H["ConnectSettled on Relayed"]
 ```
 
 The first usable path is explicit:
 
-- `Path::DirectDialed`: a direct candidate connected;
-- `Path::DirectPunched`: a DCUtR hole punch connected;
+- `Path::Direct`: a direct candidate connected;
+- `Path::Punched`: a DCUtR hole punch connected;
 - `Path::Relayed { relay }`: the protected relay circuit is usable.
 
 That Relayed path is provisional until `ConnectSettled`. Applications that need the circuit immediately (echo, ping) can use it as soon as `path(peer)` is `Relayed`; the attempt is not finished until DCUtR settles or `force_relay` skips punching. When a relayed path upgrades later, the application receives `NatEvent::PathUpgraded`. If punch windows fail, it receives `HolePunchFailed` events and then `ConnectSettled` on the Relayed path; the relayed connection stays usable.

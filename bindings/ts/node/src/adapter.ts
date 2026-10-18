@@ -3,7 +3,6 @@
 import { Minip2pBase, StreamClosedError } from "@minip2p/core";
 import type {
   Bytes,
-  ConnectionInfo,
   IdentifyInfo,
   KnownPeerInfo,
   Minip2pConfig,
@@ -13,14 +12,18 @@ import type {
 import {
   ConnectionIdMap,
   EventDrain,
+  NativeCloseLatch,
   P2pEvent_Tags,
   SettleHandles,
   eventStream,
   resolveEndpointConfig,
   typedFfiError,
   u64ToNumber,
+  unfinishedPeers,
 } from "@minip2p/core/backend";
 import type {
+  BackendClosed,
+  BackendConnectionInfo,
   BackendConnectTarget,
   BackendOpenStream,
   Minip2pBackend,
@@ -43,10 +46,11 @@ const DRAIN_LIMIT = 256;
 class NodeBackend implements Minip2pBackend {
   readonly #connectionIds = new ConnectionIdMap();
   readonly #endpoint: NativeEndpoint;
-  #events: EventDrain<NativeEvent> | undefined;
   readonly #streamIds = new StreamIdMap();
   /** Native stream identities while their events are in flight (ADR 0012). */
   readonly #settleHandles = new SettleHandles<[bigint, bigint]>();
+  readonly #close = new NativeCloseLatch();
+  #started = false;
 
   constructor(config: Minip2pConfig) {
     this.#endpoint = translateErrors(
@@ -62,6 +66,18 @@ class NodeBackend implements Minip2pBackend {
     const events = new EventDrain(
       (limit) => this.#endpoint.drainEvents(limit),
       (event: NativeEvent) => {
+        if (event.tag === P2pEvent_Tags.EndpointClosed) {
+          events.stop();
+          this.#close.settle({
+            outcome: event.inner.outcome,
+            unfinished: unfinishedPeers(event.inner.unfinished),
+          });
+          return;
+        }
+        // The SDK has stopped listening; only `EndpointClosed` matters now.
+        if (this.#close.requested) {
+          return;
+        }
         const normalized = normalizeEvent(
           event,
           this.#connectionIds,
@@ -81,12 +97,12 @@ class NodeBackend implements Minip2pBackend {
         setImmediate(task);
       }
     );
-    this.#events = events;
     translateErrors(() => {
       this.#endpoint.start(() => {
         events.ring();
       });
     });
+    this.#started = true;
   }
 
   eventHandled(event: P2pEvent): void {
@@ -97,9 +113,10 @@ class NodeBackend implements Minip2pBackend {
     }
   }
 
-  close(): void {
-    this.#endpoint.close();
-    this.#events?.stop();
+  close(timeoutMs: number): Promise<BackendClosed> {
+    return this.#close.close(this.#started, () => {
+      this.#endpoint.close(timeoutMs);
+    });
   }
 
   peerId(): string {
@@ -147,7 +164,7 @@ class NodeBackend implements Minip2pBackend {
     return translateErrors(() => this.#endpoint.path(peerId)) ?? undefined;
   }
 
-  connectionInfo(peerId: string): ConnectionInfo | undefined {
+  connectionInfo(peerId: string): BackendConnectionInfo | undefined {
     const info = translateErrors(() => this.#endpoint.connectionInfo(peerId));
     if (info === null) {
       return undefined;
@@ -427,8 +444,9 @@ function normalizeNativeValue(
     if (key !== undefined && CONNECTION_ID_KEYS.has(key)) {
       return maps.connectionIds.toPublicInEvent(tag, key, BigInt(value));
     }
-    // A QUIC stop code is a 62-bit varint the remote picks: keep it whole.
-    if (key === "errorCode") {
+    // QUIC stop and close codes are 62-bit varints the remote picks: keep
+    // them whole.
+    if (key === "errorCode" || key === "code") {
       return BigInt(value);
     }
     return key === "streamId" ? value : u64ToNumber(value, key ?? "native u64");

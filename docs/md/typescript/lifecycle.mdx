@@ -53,17 +53,17 @@ const endpoint = Minip2p.create({ secretKey });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {
-    endpoint.close();
+    void endpoint.close();
   });
 }
 ```
 
-`close()` returns quickly rather than blocking on network teardown, and it releases the event-loop reference, so the process can exit once nothing else keeps it alive.
+`close()` never blocks the thread: native disconnects peers and drains for up to 500 ms (`close(timeoutMs)` picks the bound; `0` tears down at once) on its own thread, then releases the event-loop reference, so the process can exit once nothing else keeps it alive.
 
-`Minip2p` also implements `Symbol.dispose`. In a scoped tool or test, a `using` declaration closes the endpoint at scope exit:
+`Minip2p` also implements `Symbol.asyncDispose` and `Symbol.dispose`. In a scoped tool or test, an `await using` declaration closes the endpoint at scope exit and waits for the drain; `using` starts the close without waiting:
 
 ```ts
-using endpoint = Minip2p.create({ secretKey });
+await using endpoint = Minip2p.create({ secretKey });
 ```
 
 ## Prefer the lifecycle hook
@@ -142,22 +142,26 @@ endpoint.close();
 
 ## Close is terminal
 
-`endpoint.close()` is idempotent. It:
+`endpoint.close(timeoutMs = 500)` is idempotent: later calls return the same Promise. It:
 
-1. rejects pending Promise operations;
+1. rejects pending Promise operations and drops event listeners;
 2. closes owned `Stream` handles;
-3. stops the endpoint;
-4. invokes each `onClose` observer once.
+3. stops the endpoint, letting native disconnect peers and drain for up to `timeoutMs` (`0` tears down at once, best effort);
+4. once the drain finishes, invokes each `onClose` observer once and resolves with the same report.
+
+The deadline bounds teardown time only, not delivery of accepted writes: QUIC discards queued writes and TCP may abort. The report is `{ reason, outcome?, unfinished }`. `reason` is the `EndpointCloseReason`: `"close"`, or `"driverFailed"` (with `error`) when the native driver failed and the endpoint tore down at once. `outcome` (only for `"close"`) is `Drained`, `DeadlineExpired` (running out is not an error), or `Failed` (driving the transports failed and ended the drain early). `unfinished` lists the peers whose connections were still tracked when the drain ended; empty means no tracked teardown remains, not that peers acknowledged it. The Promise never rejects.
 
 ```ts
-const removeClose = endpoint.onClose((reason) => {
-  if (reason.reason === "driverFailed") {
-    console.error(reason.error.kind, reason.error.message);
+endpoint.onClose((report) => {
+  if (report.reason === "driverFailed") {
+    console.error(report.error.kind, report.error.message);
   }
 });
 
-endpoint.close();
-removeClose();
+const report = await endpoint.close(1_000);
+if (report.reason === "close" && report.outcome !== "Drained") {
+  console.warn("closed with unfinished peers", report.unfinished);
+}
 ```
 
 Next: [Connections and streams](/typescript/connections-and-streams) and [Networking and events](/typescript/networking-and-events), or the [TypeScript API reference](/reference/typescript-api).

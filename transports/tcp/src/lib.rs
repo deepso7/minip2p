@@ -55,8 +55,12 @@
 //! [`TransportEvent::StreamWritable`](minip2p_transport::TransportEvent::StreamWritable)
 //! follows once Yamux has room again -- pulling frames into the outbound
 //! buffer frees its caps, so that can be while ciphertext still waits there.
-//! Established connections also fold in Yamux's 30 s keepalive deadline so a
-//! quiet TCP or relayed path stays up without an application ping.
+//! Established connections also fold in Yamux's keepalive deadline, backlog
+//! or not, so a quiet path stays up without an application ping and a dead
+//! peer is caught even while writes to it are backed up: a ping that cannot
+//! get into the outbound buffer, or that goes unanswered, closes the
+//! connection as
+//! [`ConnectionCloseReason::TimedOut`](minip2p_transport::ConnectionCloseReason::TimedOut).
 //!
 //! # Limits
 //!

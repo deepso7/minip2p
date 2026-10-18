@@ -144,10 +144,12 @@ impl NodeEndpoint {
             .map_err(|error| native_error(&env, error))
     }
 
-    /// Requests shutdown without waiting for the driver thread.
+    /// Requests shutdown without waiting for the driver thread, which drains
+    /// for up to `timeoutMs` and then delivers `EndpointClosed` as its last
+    /// event.
     #[napi]
-    pub fn close(&self) {
-        self.0.stop();
+    pub fn close(&self, timeout_ms: u32) {
+        self.0.stop(timeout_ms.into());
     }
 
     /// Returns the local peer ID.
@@ -364,13 +366,14 @@ impl NodeEndpoint {
             .map_err(|error| native_error(&env, error))
     }
 
-    /// Returns the current path to a peer.
+    /// Returns the path of a peer's established connection; `null` only
+    /// while the peer is not connected.
     #[napi(ts_return_type = "NativePathKind | null")]
     pub fn path(&self, env: Env, peer_id: String) -> Result<Unknown<'static>> {
         js_value(&env, self.0.path(peer_id))
     }
 
-    /// Returns the transport connection selected for a peer.
+    /// Returns a snapshot of a peer's established connection.
     #[napi(ts_return_type = "NativeConnectionInfo | null")]
     pub fn connection_info(&self, env: Env, peer_id: String) -> Result<Unknown<'static>> {
         js_value(&env, self.0.connection_info(peer_id))
@@ -406,7 +409,7 @@ impl NodeEndpoint {
 
 impl Drop for NodeEndpoint {
     fn drop(&mut self) {
-        self.0.stop();
+        self.0.stop(minip2p_ffi_core::DEFAULT_STOP_TIMEOUT_MS);
     }
 }
 

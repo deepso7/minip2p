@@ -94,7 +94,7 @@ fn endpoint(seed: u8, relay: String) -> Arc<P2pEndpoint> {
 }
 
 fn stop(endpoint: &P2pEndpoint) {
-    endpoint.stop();
+    endpoint.stop(0);
     assert!(endpoint.wait_stopped(5_000), "driver did not stop");
 }
 

@@ -3,6 +3,7 @@
 mod common;
 
 use common::*;
+use minip2p_swarm::ConnectionCloseReason;
 
 use minip2p_core::PeerAddr;
 use minip2p_core::{Multiaddr, Protocol};
@@ -434,6 +435,7 @@ fn relay_disconnect_before_stop_acceptance_drops_the_circuit() {
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(1),
             peer_id: h.relay.clone(),
+            reason: ConnectionCloseReason::Local,
         },
         false,
         at(1),
@@ -480,11 +482,10 @@ fn inbound_direct_replacement_after_the_circuit_finished_reports_the_upgrade() {
         drain_events(&mut h.agent).as_slice(),
         [NatEvent::InboundDirectUpgrade { peer, .. }] if *peer == target
     ));
-    assert_eq!(h.agent.path(&target), Some(&Path::DirectDialed));
 }
 
 #[test]
-fn circuit_replacement_through_another_relay_updates_the_path_origin() {
+fn circuit_replacement_through_another_relay_is_not_an_upgrade() {
     let relay_b = peer(b"relay-b");
     let mut config = NatConfig {
         force_relay: true,
@@ -497,12 +498,6 @@ fn circuit_replacement_through_another_relay_updates_the_path_origin() {
     let mut h = inbound_harness(config);
     let (circuit_a, _) = drive_to_relayed(&mut h);
     let target = h.target.clone();
-    assert_eq!(
-        h.agent.path(&target),
-        Some(&Path::Relayed {
-            relay: h.relay.clone()
-        })
-    );
 
     // The same peer reaches us again through relay B.
     let stop = StreamId::new(STOP_STREAM + 10);
@@ -546,10 +541,6 @@ fn circuit_replacement_through_another_relay_updates_the_path_origin() {
         )),
         "a relay-to-relay hand-over is not an upgrade"
     );
-    assert_eq!(
-        h.agent.path(&target),
-        Some(&Path::Relayed { relay: relay_b })
-    );
 }
 
 #[test]
@@ -592,7 +583,6 @@ fn inbound_circuit_replacing_a_direct_connection_announces_its_path() {
         )),
         "the retired direct connection must not make the circuit look redundant"
     );
-    assert!(matches!(h.agent.path(&target), Some(Path::Relayed { .. })));
 }
 
 #[test]

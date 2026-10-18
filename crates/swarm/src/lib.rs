@@ -48,6 +48,7 @@ pub use crate::state::{
 // Part of `SwarmEvent::IdentifyReceived`'s public shape; re-exported so
 // consumers can name the type without depending on `minip2p-identify`.
 pub use minip2p_identify::IdentifyMessage;
+pub use minip2p_transport::ConnectionCloseReason;
 
 pub use crate::builder::SwarmBuilder;
 #[cfg(feature = "std")]

@@ -3,6 +3,7 @@
 
 import { vi } from "vitest";
 
+import { CloseOutcome } from "../src/generated/minip2p_ffi_core";
 import type {
   ConnectionInfo,
   ConnectTarget,
@@ -67,6 +68,16 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
   readonly consumed: { bytes: number; connId: bigint; streamId: bigint }[] = [];
   /** `abandonStream` calls, in call order. */
   readonly abandoned: { connId: bigint; streamId: bigint }[] = [];
+  /** `stop` timeouts in milliseconds, in call order. */
+  readonly stopTimeouts: number[] = [];
+  /** What the `EndpointClosed` a started endpoint's `stop` queues reports. */
+  closeReport: {
+    outcome: CloseOutcome;
+    unfinished: { connId: bigint; peerId?: string }[];
+  } = {
+    outcome: CloseOutcome.Drained,
+    unfinished: [],
+  };
   readonly #batches: FakeEvent[][] = [];
   #doorbell: P2pEventDoorbell | undefined;
 
@@ -113,8 +124,13 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     return this.discoveryNow;
   }
 
-  stop(): void {
-    this.#doorbell = undefined;
+  /** Queues `closeReport` as the driver's last event, as native does. */
+  stop(timeoutMs: bigint): void {
+    this.stopTimeouts.push(Number(timeoutMs));
+    if (this.#doorbell !== undefined && this.stopTimeouts.length === 1) {
+      this.enqueue([{ inner: this.closeReport, tag: "EndpointClosed" }]);
+      this.ring();
+    }
   }
 
   uniffiDestroy(): void {
@@ -243,6 +259,7 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
 export const nativeModuleMock = async () => {
   const generated = await import("../src/generated/minip2p_ffi_core");
   return {
+    CloseOutcome: generated.CloseOutcome,
     ConfigCapability: generated.ConfigCapability,
     ConnectTarget: generated.ConnectTarget,
     DiscoverySource: generated.DiscoverySource,

@@ -26,7 +26,9 @@ use minip2p_tcp::smoltcp::wire::{HardwareAddress, IpCidr};
 use minip2p_tcp::{
     SmoltcpConfig, SmoltcpTcpProvider, SocketHandle, TcpConfig, TcpEvent, TcpProvider, TcpTransport,
 };
-use minip2p_transport::{Bytes, ConnectionId, StreamId, Transport, TransportEvent};
+use minip2p_transport::{
+    Bytes, ConnectionCloseReason, ConnectionId, StreamId, Transport, TransportEvent,
+};
 
 type Node = TcpTransport<SmoltcpTcpProvider<VirtualDevice>, CountingEntropy>;
 
@@ -539,12 +541,24 @@ fn closing_a_connection_ends_it_for_the_peer_too() {
                 .any(|event| matches!(event, TransportEvent::Closed { .. }))
         },
     );
+    // We closed it; the peer saw our orderly Yamux GoAway.
     assert!(
-        !pair
-            .listener_events
-            .iter()
-            .any(|event| matches!(event, TransportEvent::Error { .. })),
-        "an orderly close is not a failure: {:?}",
+        pair.dialer_events.contains(&TransportEvent::Closed {
+            id: pair.connection,
+            reason: ConnectionCloseReason::Local,
+        }),
+        "{:?}",
+        pair.dialer_events
+    );
+    assert!(
+        pair.listener_events.iter().any(|event| matches!(
+            event,
+            TransportEvent::Closed {
+                reason: ConnectionCloseReason::Remote { code: 0 },
+                ..
+            }
+        )),
+        "an orderly close is the peer's GoAway: {:?}",
         pair.listener_events
     );
 }
@@ -589,7 +603,10 @@ fn a_dial_nothing_answers_fails_once_the_connect_timeout_expires() {
     let failure = dialer_events
         .iter()
         .find_map(|event| match event {
-            TransportEvent::Error { message, .. } => Some(message.clone()),
+            TransportEvent::Closed {
+                reason: ConnectionCloseReason::Error(message),
+                ..
+            } => Some(message.clone()),
             _ => None,
         })
         .unwrap_or_else(|| panic!("the dial should say why it failed: {dialer_events:?}"));

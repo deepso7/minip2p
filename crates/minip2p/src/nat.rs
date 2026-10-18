@@ -615,15 +615,10 @@ impl<T: Transport> NatDriver<T> {
         self.agent.force_relay()
     }
 
-    /// Returns the NAT-orchestrated path of `peer`'s current connection; see
-    /// [`NatAgent::path`].
-    #[cfg(feature = "_circuit-driver")]
-    pub(crate) fn path<R: EntropySource>(
-        &self,
-        swarm: &SwarmCore<T, R>,
-        peer: &PeerId,
-    ) -> Option<minip2p_nat::Path> {
-        self.agent.path(swarm, peer).cloned()
+    /// Whether NAT's hole punch produced `conn_id`; see
+    /// [`NatAgent::is_punched`].
+    pub(crate) fn is_punched(&self, conn_id: ConnectionId) -> bool {
+        self.agent.is_punched(conn_id)
     }
 
     /// Confirmed public addresses plus circuit addresses for every held
@@ -938,6 +933,10 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
 
     fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[alloc::string::String])> {
         NatSwarm::readiness(&*self.swarm, peer)
+    }
+
+    fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        self.swarm.connection_remote_addr(conn_id)
     }
 
     /// Parks a dial to a named host for the composition's resolver, so the

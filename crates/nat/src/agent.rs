@@ -91,13 +91,25 @@ pub(crate) enum StreamInput<'a> {
 
 /// How a connection came to carry a peer's path, recorded when a NAT machine
 /// announces it. It outlives the attempt that created it, so a later
-/// Connection replacement can still report the upgrade against it.
+/// Connection replacement can still report the upgrade against it. The
+/// Endpoint's own [`Path`] record takes only [`Path::Punched`] from here
+/// (see [`NatAgent::is_punched`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Origin {
+pub(crate) struct PathRecord {
     pub(crate) path: Path,
     /// The attempt that created the connection; `None` for an inbound
     /// circuit or a connection no attempt made.
     pub(crate) connect_id: Option<ConnectId>,
+}
+
+/// A trusted reporter's latest Identify claim of our transport address on
+/// one connection.
+#[derive(Clone, Debug)]
+struct Observation {
+    /// The address's leading IP, kept on its own for AutoNAT probes.
+    ip: Protocol,
+    /// The validated address; a punch candidate when it is QUIC.
+    addr: Multiaddr,
 }
 
 /// State shared between the agent shell and its attempt state machines.
@@ -115,25 +127,23 @@ pub(crate) struct Shared {
     /// Parked dials and bridge promotions awaiting their host result.
     pub(crate) tokens: BTreeMap<NatToken, TokenPurpose>,
     next_token: u64,
-    /// Path origin of each established connection that carries one.
-    pub(crate) origins: BTreeMap<ConnectionId, Origin>,
+    /// The path record of each established connection a NAT machine announced.
+    pub(crate) paths: BTreeMap<ConnectionId, PathRecord>,
     /// Our validated external/listen addresses, advertised in DCUtR CONNECT.
     pub(crate) listen_addrs: Vec<Multiaddr>,
     /// Our transport address as observed by trusted reporters (Identify's
-    /// `observedAddr` from configured relays and AutoNAT servers). Behind a
-    /// NAT this is the public mapping of our QUIC socket — the address that
-    /// makes cross-NAT hole punching possible. Identify does not name its
-    /// connection, so an entry is dropped when any connection of the
-    /// reporter closes or is replaced (the next connection's Identify
-    /// refreshes it); that keeps the map bounded by the configured-peer
-    /// count.
-    observed_addrs: BTreeMap<PeerId, Multiaddr>,
-    /// The IP of each trusted reporter's latest observation per family
-    /// (keyed `(reporter, is_ipv6)`) over any transport: our public IPs,
-    /// which AutoNAT probes ask about. Kept apart so a TCP observation does
-    /// not evict a QUIC punch mapping, and dropped alongside
-    /// `observed_addrs`.
-    observed_ips: BTreeMap<(PeerId, bool), Protocol>,
+    /// `observedAddr` from configured relays and AutoNAT servers), keyed by
+    /// the connection whose Identify carried it. Behind a NAT a QUIC entry
+    /// is the public mapping of our QUIC socket — the address that makes
+    /// cross-NAT hole punching possible — and every entry's IP is a public
+    /// IP AutoNAT probes ask about. Only an observation in the family of
+    /// the connection that carried it is kept, a newer Identify on the same
+    /// connection replaces its entry, and the entry ends with the
+    /// connection, so a reporter vouches only for the family it is
+    /// currently connected over (the swarm keeps one connection per peer),
+    /// other reporters supply the other family, and the map stays bounded by
+    /// the configured-peer count.
+    observations: BTreeMap<ConnectionId, Observation>,
     /// Session dials in flight: relay-leg, reservation, and probe dials whose
     /// connection has not yet established, keyed by dial token. Concurrent
     /// machines targeting the same infrastructure peer wait on the first
@@ -154,13 +164,13 @@ pub(crate) struct Shared {
 
 impl Shared {
     /// Records the path a connection carries for its peer.
-    pub(crate) fn record_origin(
+    pub(crate) fn record_path(
         &mut self,
         conn_id: ConnectionId,
         path: Path,
         connect_id: Option<ConnectId>,
     ) {
-        self.origins.insert(conn_id, Origin { path, connect_id });
+        self.paths.insert(conn_id, PathRecord { path, connect_id });
     }
 
     pub(crate) fn alloc_token(&mut self, purpose: TokenPurpose) -> NatToken {
@@ -353,14 +363,26 @@ impl Shared {
     /// connected peer must not be able to plant an attacker-chosen address
     /// here; observed addresses are never dial-back verified the way AutoNAT
     /// addresses are.
-    fn record_observed_addr(&mut self, reporter: &PeerId, observed: Option<&[u8]>) {
+    ///
+    /// Only an Identify on the reporter's current connection counts: the
+    /// swarm may already have closed or replaced `conn_id`, and an entry for
+    /// it would then never be removed. And only an address in the IP family
+    /// that connection runs over counts: that is the one family the reporter
+    /// actually sees us in. A relayed connection vouches for neither.
+    fn record_observed_addr(
+        &mut self,
+        swarm: &dyn NatSwarm,
+        reporter: &PeerId,
+        conn_id: ConnectionId,
+        observed: Option<&[u8]>,
+    ) {
         let trusted = self
             .config
             .relays
             .iter()
             .chain(self.config.autonat_servers.iter())
             .any(|peer| peer.peer_id() == reporter);
-        if !trusted {
+        if !trusted || swarm.connection(reporter) != Some(conn_id) {
             return;
         }
         let Some(Ok(addr)) = observed.map(Multiaddr::from_bytes) else {
@@ -370,14 +392,26 @@ impl Shared {
         let Some(addr) = validated.pop() else {
             return;
         };
-        if let Some(ip @ (Protocol::Ip4(_) | Protocol::Ip6(_))) = addr.protocols().first() {
-            let is_ipv6 = matches!(ip, Protocol::Ip6(_));
-            self.observed_ips
-                .insert((reporter.clone(), is_ipv6), ip.clone());
+        // A connection's far end is seen at an IP, never a DNS name.
+        let Some(ip @ (Protocol::Ip4(_) | Protocol::Ip6(_))) = addr.protocols().first().cloned()
+        else {
+            return;
+        };
+        // The reporter sees us only over this connection's family. A
+        // relayed connection has no IP of its own: the reporter sees the
+        // relay, not us, so it vouches for no family.
+        let is_ipv6 = |p: &Protocol| match p {
+            Protocol::Ip4(_) => Some(false),
+            Protocol::Ip6(_) => Some(true),
+            _ => None,
+        };
+        let connected_over = swarm
+            .connection_remote_addr(conn_id)
+            .and_then(|remote| remote.protocols().first().and_then(is_ipv6));
+        if connected_over != is_ipv6(&ip) {
+            return;
         }
-        if addr.is_quic_transport() {
-            self.observed_addrs.insert(reporter.clone(), addr);
-        }
+        self.observations.insert(conn_id, Observation { ip, addr });
     }
 
     /// The addresses an AutoNAT probe asks about: the listen addresses, then
@@ -397,7 +431,7 @@ impl Shared {
                 addrs.push(listen.clone());
             }
         }
-        for ip in self.observed_ips.values() {
+        for Observation { ip, .. } in self.observations.values() {
             for listen in &self.listen_addrs {
                 let Some((host, rest)) = listen.protocols().split_first() else {
                     continue;
@@ -440,7 +474,7 @@ impl Shared {
     /// crowd them out of the cap.
     pub(crate) fn punch_candidates(&self) -> Vec<Multiaddr> {
         let mut addrs: Vec<Multiaddr> = Vec::new();
-        let observed = self.observed_addrs.values();
+        let observed = self.observations.values().map(|obs| &obs.addr);
         for addr in observed.chain(&self.listen_addrs) {
             if addr.is_quic_transport() && !addrs.contains(addr) {
                 addrs.push(addr.clone());
@@ -573,10 +607,9 @@ impl NatAgent {
                 streams: BTreeMap::new(),
                 tokens: BTreeMap::new(),
                 next_token: 0,
-                origins: BTreeMap::new(),
+                paths: BTreeMap::new(),
                 listen_addrs: Vec::new(),
-                observed_addrs: BTreeMap::new(),
-                observed_ips: BTreeMap::new(),
+                observations: BTreeMap::new(),
                 pending_session_dials: BTreeMap::new(),
                 dialed: BTreeMap::new(),
                 circuits_reserved: 0,
@@ -631,9 +664,8 @@ impl NatAgent {
     ///
     /// With `allow_relay = false` or no relay configured the attempt has an
     /// inactive relay leg and only tracks the peer's direct establishment so
-    /// [`NatEvent::PathEstablished`] `{ DirectDialed }` and path snapshots
-    /// keep working. It ends when the caller cancels it or a direct
-    /// connection to the peer establishes.
+    /// [`NatEvent::PathEstablished`] `{ Direct }` keeps working. It ends when
+    /// the caller cancels it or a direct connection to the peer establishes.
     pub fn connect<S: NatSwarm>(
         &mut self,
         swarm: &mut S,
@@ -726,11 +758,15 @@ impl NatAgent {
         }
     }
 
-    /// The path `peer`'s current connection carries, when a NAT machine
-    /// announced one for it (or for the connection it replaced).
-    pub fn path<S: NatSwarm>(&self, swarm: &S, peer: &PeerId) -> Option<&Path> {
-        let conn_id = swarm.connection(peer)?;
-        self.shared.origins.get(&conn_id).map(|origin| &origin.path)
+    /// Whether `conn_id` is a direct connection a DCUtR hole punch produced,
+    /// so its [`Path`] is [`Path::Punched`]. It is recorded before the event
+    /// announcing the punch is queued and forgotten when the connection
+    /// closes or is replaced.
+    pub fn is_punched(&self, conn_id: ConnectionId) -> bool {
+        self.shared
+            .paths
+            .get(&conn_id)
+            .is_some_and(|record| record.path == Path::Punched)
     }
 
     /// Updates the validated addresses advertised during DCUtR exchanges.
@@ -812,9 +848,11 @@ impl NatAgent {
                 touched_state = true;
                 self.connection_up(peer_id, *conn_id, is_circuit, swarm, now);
             }
-            SwarmEvent::ConnectionClosed { peer_id, conn_id } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id, conn_id, ..
+            } => {
                 touched_state = true;
-                self.forget_connection(peer_id, *conn_id);
+                self.forget_connection(*conn_id);
                 self.notify_connection_down(peer_id, *conn_id, swarm, now);
                 self.housekeeping.on_connection_closed(
                     peer_id,
@@ -828,15 +866,23 @@ impl NatAgent {
                 touched_state = true;
                 self.connection_replaced(peer_id, *old, *new, is_circuit, swarm, now);
             }
-            SwarmEvent::IdentifyReceived { peer_id, info, .. } => {
+            SwarmEvent::IdentifyReceived {
+                peer_id,
+                conn_id,
+                info,
+            } => {
                 // The remote reports the transport address it sees us from.
                 // Behind a NAT that is our public mapping — the only usable
                 // DCUtR punch candidate, since bound addresses are private.
                 // The event stays application-visible (`handled` = false),
                 // and nothing here can complete a machine (`touched_state`
                 // stays false).
-                self.shared
-                    .record_observed_addr(peer_id, info.observed_addr.as_deref());
+                self.shared.record_observed_addr(
+                    swarm,
+                    peer_id,
+                    *conn_id,
+                    info.observed_addr.as_deref(),
+                );
             }
             SwarmEvent::PeerReady {
                 peer_id, conn_id, ..
@@ -1326,16 +1372,13 @@ impl NatAgent {
         }
     }
 
-    /// Drops what NAT recorded for `conn_id` — its dial, path origin,
+    /// Drops what NAT recorded for `conn_id` — its dial, path record,
     /// observation, and the streams bound to it — before any machine reacts,
     /// so no machine acts on one of its streams.
-    fn forget_connection(&mut self, peer: &PeerId, conn_id: ConnectionId) {
+    fn forget_connection(&mut self, conn_id: ConnectionId) {
         self.shared.dialed.remove(&conn_id);
-        self.shared.origins.remove(&conn_id);
-        self.shared.observed_addrs.remove(peer);
-        self.shared
-            .observed_ips
-            .retain(|(reporter, _), _| reporter != peer);
+        self.shared.paths.remove(&conn_id);
+        self.shared.observations.remove(&conn_id);
         self.shared.streams.retain(|(conn, _), _| *conn != conn_id);
     }
 
@@ -1368,10 +1411,10 @@ impl NatAgent {
         swarm: &mut dyn NatSwarm,
         now: Now,
     ) {
-        let old_origin = self.shared.origins.get(&old).cloned();
+        let old_record = self.shared.paths.get(&old).cloned();
         // `old`'s records go before machines see `new`: a direct `old` must
         // not make a relayed `new` look redundant.
-        self.forget_connection(peer, old);
+        self.forget_connection(old);
         self.connection_up(peer, new, is_circuit, swarm, now);
         // A circuit another attempt or an inbound circuit promoted stays
         // its owner's: adopting it would let this attempt close it on cancel.
@@ -1385,28 +1428,25 @@ impl NatAgent {
         self.housekeeping
             .on_connection_replaced(peer, old, swarm, &mut self.shared, now);
 
-        // The selected path becomes `new`'s origin. A machine that announced
-        // `new` just now recorded it (with its own event); otherwise a
-        // direct `new` takes over from `old`'s path, and leaving a relay
-        // is reported once, against whatever created that relayed path.
-        let Some(old_origin) = old_origin else {
+        // A machine that announced `new` just now recorded its path (with
+        // its own event). Otherwise a direct `new` that retires a relayed
+        // path is reported once, against whatever created that path. `new`
+        // keeps no path record of `old`'s: its own path is plain Direct.
+        let Some(old_record) = old_record else {
             return;
         };
-        if self.shared.origins.contains_key(&new) || is_circuit {
+        if self.shared.paths.contains_key(&new)
+            || is_circuit
+            || !matches!(old_record.path, Path::Relayed { .. })
+        {
             return;
         }
-        let to = Path::DirectDialed;
-        self.shared
-            .record_origin(new, to.clone(), old_origin.connect_id);
-        if !matches!(old_origin.path, Path::Relayed { .. }) {
-            return;
-        }
-        self.shared.push_event(match old_origin.connect_id {
+        self.shared.push_event(match old_record.connect_id {
             Some(connect_id) => NatEvent::PathUpgraded {
                 connect_id,
                 peer: peer.clone(),
-                from: old_origin.path,
-                to,
+                from: old_record.path,
+                to: Path::Direct,
                 old_conn_id: old,
                 new_conn_id: new,
             },

@@ -1,6 +1,7 @@
 //! Engine tests: the per-batch event order, run against both endpoint
 //! types, and the private work counters.
 
+use crate::ConnectionCloseReason;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -62,7 +63,10 @@ impl Transport for FlashTransport {
                 addr.peer_id().clone(),
             ),
         });
-        queue.push_back(TransportEvent::Closed { id });
+        queue.push_back(TransportEvent::Closed {
+            id,
+            reason: ConnectionCloseReason::Local,
+        });
         Ok(id)
     }
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
