@@ -633,7 +633,10 @@ impl InboundCircuit {
                     rtt_ms,
                     ..
                 }) => {
-                    self.remote_addrs = select_global_punch_candidates(&remote_addrs);
+                    self.remote_addrs = select_punch_candidates(
+                        &remote_addrs,
+                        shared.config.allow_private_punch_targets,
+                    );
                     completed = true;
                     let blast_start = now.monotonic_ms.saturating_add(rtt_ms.div_ceil(2));
                     let window_end = blast_start.saturating_add(shared.config.punch_deadline_ms);
@@ -753,26 +756,42 @@ pub(crate) fn bound_punch_candidates(addrs: impl IntoIterator<Item = Multiaddr>)
 /// private/special-use targets would turn the NAT agent into an SSRF
 /// primitive, and a hole punch aimed at a `/tcp` address would put UDP on a
 /// port whose owner never consented to receive it. Keep only strict QUIC-v1
-/// addresses whose first component is a globally routable unicast IP, then
+/// addresses whose first component is a globally routable unicast IP (any
+/// unicast IP when [`NatConfig::allow_private_punch_targets`] is set), then
 /// bound them with [`bound_punch_candidates`].
-pub(crate) fn select_global_punch_candidates(addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+///
+/// [`NatConfig::allow_private_punch_targets`]: crate::NatConfig::allow_private_punch_targets
+pub(crate) fn select_punch_candidates(addrs: &[Multiaddr], allow_private: bool) -> Vec<Multiaddr> {
     bound_punch_candidates(
         select_direct_addrs(addrs, None, None)
             .into_iter()
-            .filter(is_global_unicast_quic),
+            .filter(|addr| is_punchable_quic(addr, allow_private)),
     )
 }
 
-fn is_global_unicast_quic(addr: &Multiaddr) -> bool {
+fn is_punchable_quic(addr: &Multiaddr, allow_private: bool) -> bool {
     if !addr.is_quic_transport() {
         return false;
     }
     match addr.protocols().first() {
+        Some(Protocol::Ip4(octets)) if allow_private => is_unicast_v4((*octets).into()),
+        Some(Protocol::Ip6(octets)) if allow_private => {
+            let ip = core::net::Ipv6Addr::from(*octets);
+            // A mapped IPv4 address is judged as the address it carries.
+            match ip.to_ipv4_mapped() {
+                Some(v4) => is_unicast_v4(v4),
+                None => !(ip.is_unspecified() || ip.is_multicast()),
+            }
+        }
         Some(Protocol::Ip4(octets)) => is_global_unicast_v4(*octets),
         Some(Protocol::Ip6(octets)) => is_global_unicast_v6(*octets),
         Some(Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_)) | None => false,
         Some(_) => false,
     }
+}
+
+fn is_unicast_v4(ip: core::net::Ipv4Addr) -> bool {
+    !(ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast())
 }
 
 fn is_global_unicast_v4([a, b, c, d]: [u8; 4]) -> bool {

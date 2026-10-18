@@ -145,6 +145,17 @@ pub fn blast_count(actions: &[Out]) -> usize {
         .count()
 }
 
+/// The targets of `SendRandomUdp` actions, in order.
+pub fn blast_targets(actions: Vec<Out>) -> Vec<Multiaddr> {
+    actions
+        .into_iter()
+        .filter_map(|action| match action {
+            Out::SendRandomUdp { target, .. } => Some(target),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A framed HOP STATUS:OK reservation response with an optional expiry.
 pub fn hop_reserve_ok(expire_unix_secs: Option<u64>) -> Vec<u8> {
     let msg = HopMessage {

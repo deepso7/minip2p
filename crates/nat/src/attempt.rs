@@ -15,7 +15,7 @@ use crate::agent::{
 };
 use crate::config::MAX_DCUTR_ROUNDS;
 use crate::events::{BridgeRole, NatAction, NatEvent};
-use crate::inbound::select_global_punch_candidates;
+use crate::inbound::select_punch_candidates;
 use crate::swarm::NatSwarm;
 use crate::types::{NatError, NatToken, Path, PromoteError, RelayStage, UpgradeStop};
 
@@ -318,7 +318,10 @@ impl ConnectAttempt {
                     remote_addrs,
                     ..
                 }) => {
-                    self.punch_addrs = select_global_punch_candidates(&remote_addrs);
+                    self.punch_addrs = select_punch_candidates(
+                        &remote_addrs,
+                        shared.config.allow_private_punch_targets,
+                    );
                 }
                 DcutrResponderOutput::Event(ResponderEvent::SyncReceived) => {
                     // The exchange is done; only the punch window bounds

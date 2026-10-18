@@ -1,5 +1,5 @@
-//! End-to-end coverage for the `nat` endpoint API over direct QUIC and a real
-//! loopback Circuit Relay v2 bridge.
+//! End-to-end coverage for the `nat` endpoint API over direct QUIC, a real
+//! loopback Circuit Relay v2 bridge, and a DCUtR hole punch through it.
 
 #![cfg(feature = "nat")]
 
@@ -198,21 +198,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
     responder.listen().expect("responder listens");
     let responder_peer = responder.peer_id().clone();
 
-    let reservation_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(
-            Instant::now() < reservation_deadline,
-            "responder did not reserve on relay"
-        );
-        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) = responder
-            .next_event(Duration::from_millis(20))
-            .expect("drive responder reservation")
-            && &relay == relay_addr.peer_id()
-        {
-            break;
-        }
-        relay.assert_healthy();
-    }
+    await_reservation(&mut responder, &relay);
 
     let mut initiator = Endpoint::builder()
         .protocol(ECHO_PROTOCOL)
@@ -455,21 +441,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
     responder.listen().expect("responder listens");
     let responder_peer = responder.peer_id().clone();
 
-    let reservation_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(
-            Instant::now() < reservation_deadline,
-            "responder did not reserve on the TCP relay"
-        );
-        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) = responder
-            .next_event(Duration::from_millis(20))
-            .expect("drive responder reservation")
-            && &relay == relay_addr.peer_id()
-        {
-            break;
-        }
-        relay.assert_healthy();
-    }
+    await_reservation(&mut responder, &relay);
 
     let mut initiator = Endpoint::builder()
         .protocol(ECHO_PROTOCOL)
@@ -721,20 +693,7 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
         .expect("bind responder");
     responder.listen().expect("responder listens");
     let responder_peer = responder.peer_id().clone();
-    let reservation_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(
-            Instant::now() < reservation_deadline,
-            "responder did not reserve on relay"
-        );
-        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { .. })) = responder
-            .next_event(Duration::from_millis(20))
-            .expect("drive responder reservation")
-        {
-            break;
-        }
-        relay.assert_healthy();
-    }
+    await_reservation(&mut responder, &relay);
 
     let start_timeout_ms = 1_500;
     let mut initiator = Endpoint::builder()
@@ -800,6 +759,109 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
             relay: relay.addr().peer_id().clone()
         })
     );
+}
+
+#[test]
+fn a_real_dcutr_punch_settles_the_connect_as_punched() {
+    let relay = relay_support::RelayServer::spawn();
+    let relay_addr = relay.addr().clone();
+    // Loopback is not global unicast: both sides must opt in to punch it.
+    let punch_config = |reservation_policy| NatConfig {
+        reservation_policy,
+        allow_private_punch_targets: true,
+        ..NatConfig::default()
+    };
+
+    let mut responder = Endpoint::builder()
+        .relay(relay_addr.clone())
+        .nat_config(punch_config(ReservationPolicy::Always))
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind responder");
+    responder.listen().expect("responder listens");
+    let responder_peer = responder.peer_id().clone();
+    await_reservation(&mut responder, &relay);
+
+    let mut initiator = Endpoint::builder()
+        .relay(relay_addr)
+        .nat_config(punch_config(ReservationPolicy::Never))
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind initiator");
+    initiator.listen().expect("initiator listens");
+    // No candidates: the circuit is the only way in, so a direct connection
+    // can only come from the punch.
+    let connect_id = initiator
+        .connect(&responder_peer)
+        .expect("start relayed connect");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut trace = Vec::new();
+    let mut punched = None;
+    let outcome = loop {
+        assert!(
+            Instant::now() < deadline,
+            "connect did not settle:\n{trace:#?}"
+        );
+        if let Some(event) = initiator
+            .next_event(Duration::from_millis(20))
+            .expect("drive initiator")
+        {
+            trace.push(format!("initiator: {event:?}"));
+            match event {
+                EndpointEvent::Nat(NatEvent::PathUpgraded {
+                    connect_id: id,
+                    to: Path::Punched,
+                    new_conn_id,
+                    ..
+                }) if id == connect_id => punched = Some(new_conn_id),
+                EndpointEvent::ConnectSettled {
+                    connect_id: id,
+                    outcome,
+                    ..
+                } if id == connect_id => break outcome,
+                _ => {}
+            }
+        }
+        if let Some(event) = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder")
+        {
+            trace.push(format!("responder: {event:?}"));
+        }
+        relay.assert_healthy();
+    };
+
+    let ConnectOutcome::Connected { conn_id, path } = outcome else {
+        panic!("expected Connected, got {outcome:?}:\n{trace:#?}");
+    };
+    assert_eq!(path, Path::Punched, "{trace:#?}");
+    assert_eq!(Some(conn_id), punched, "settled on the punched connection");
+    assert_eq!(initiator.path(&responder_peer), Some(Path::Punched));
+}
+
+/// Drives `responder` until it holds a reservation on `relay`.
+fn await_reservation(responder: &mut Endpoint, relay: &relay_support::RelayServer) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "responder did not reserve on {}",
+            relay.addr()
+        );
+        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved {
+            relay: reserved, ..
+        })) = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder reservation")
+            && &reserved == relay.addr().peer_id()
+        {
+            break;
+        }
+        relay.assert_healthy();
+    }
 }
 
 /// Records the first NAT path the Endpoint event stream reports for `id`.

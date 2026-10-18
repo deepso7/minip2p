@@ -399,14 +399,47 @@ fn peer_supplied_punch_targets_must_be_global_unicast_quic_ips() {
     assert!(has_reset_for(&sync, stream));
     assert!(!h.agent.owns_stream(conn, stream));
     h.agent.handle_tick(at(24));
-    let targets: Vec<_> = drain_actions(&mut h.agent)
-        .into_iter()
-        .filter_map(|action| match action {
-            Out::SendRandomUdp { target, .. } => Some(target),
-            _ => None,
-        })
-        .collect();
+    let targets = blast_targets(drain_actions(&mut h.agent));
     assert_eq!(targets, vec![maddr("/ip4/8.8.8.8/udp/4001/quic-v1")]);
+}
+
+#[test]
+fn allowed_private_punch_targets_are_still_unicast_quic_ips() {
+    let mut h = inbound_harness(NatConfig {
+        allow_private_punch_targets: true,
+        ..NatConfig::default()
+    });
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+    answer_dcutr_at(
+        &mut h,
+        conn,
+        stream,
+        &[
+            "/ip4/127.0.0.1/udp/4001/quic-v1",
+            "/ip4/10.0.0.1/udp/4001/quic-v1",
+            "/ip4/10.0.0.1/tcp/4001",
+            "/dns4/localhost/udp/4001/quic-v1",
+            "/ip4/255.255.255.255/udp/4001/quic-v1",
+            "/ip6/ff02::1/udp/4001/quic-v1",
+            "/ip6/::ffff:255.255.255.255/udp/4001/quic-v1",
+            "/ip6/::ffff:224.0.0.1/udp/4001/quic-v1",
+            "/ip6/::ffff:10.0.0.2/udp/4001/quic-v1",
+        ],
+        20,
+    );
+    drain_actions(&mut h.agent);
+    h.agent.handle_tick(at(24));
+    let targets = blast_targets(drain_actions(&mut h.agent));
+    assert_eq!(
+        targets,
+        vec![
+            maddr("/ip4/127.0.0.1/udp/4001/quic-v1"),
+            maddr("/ip4/10.0.0.1/udp/4001/quic-v1"),
+            maddr("/ip6/::ffff:10.0.0.2/udp/4001/quic-v1"),
+        ]
+    );
 }
 
 #[test]
