@@ -572,8 +572,9 @@ function normalizeEvent(
 /**
  * Per-chunk and per-write events, and pubsub messages, convert field by
  * field. Identify snapshots go through the typed {@link identifyInfo}, and a
- * field-less event passes through by tag. The rest share the generic walk: the addon's serde shape is the SDK shape with
- * napi-rs integers and buffers (see `native-shape.ts`).
+ * field-less event passes through by tag. The rest share the generic walk:
+ * either shell's serde shape is the SDK shape with native integers and
+ * bytes (see {@link NativeShape}).
  */
 function convertEvent(event: NativeEvent, maps: NativeIdMaps): P2pEvent {
   switch (event.tag) {
