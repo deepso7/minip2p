@@ -124,6 +124,9 @@ struct Session {
     /// The Noise stream and its session, until the handshake completes.
     noise_stream: Option<StreamHandle>,
     noise: Option<NoiseSession>,
+    /// The server's Noise handshake checked out: the connection is
+    /// established once message three and the FIN are with the platform.
+    verified: bool,
     connected: bool,
     /// When an unconnected session times out, in monotonic ms, stamped at
     /// the first poll that sees it.
@@ -437,6 +440,9 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
                 if refused {
                     self.on_write_refused(id, stream);
                 }
+                if noise {
+                    self.establish_if_sent(id);
+                }
                 self.close_if_done(id, stream);
                 self.wake_writable(id);
             }
@@ -662,14 +668,35 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             state.fin_queued = true;
             state.local_closed = true;
         }
-        if conn.flush(&mut self.io, handle) {
-            self.fail(id, NOISE_REFUSED.into());
-            return;
-        }
         if let Some(hash) = hash {
             conn.endpoint.set_token(ConnectionToken::new(hash));
         }
         conn.noise = None;
+        conn.verified = true;
+        if conn.flush(&mut self.io, handle) {
+            self.fail(id, NOISE_REFUSED.into());
+            return;
+        }
+        self.establish_if_sent(id);
+    }
+
+    /// Reports a verified connection once message three and the Noise
+    /// stream's FIN are with the platform: until then the handshake, and
+    /// its deadline, stay pending.
+    fn establish_if_sent(&mut self, id: ConnectionId) {
+        let Some(conn) = self.connections.get_mut(&id) else {
+            return;
+        };
+        if !conn.verified || conn.connected {
+            return;
+        }
+        let sent = conn
+            .noise_stream
+            .and_then(|handle| conn.streams.get(&handle))
+            .is_some_and(|state| state.writes.is_empty() && !state.fin_queued);
+        if !sent {
+            return;
+        }
         conn.connected = true;
         conn.handshake_deadline = None;
         self.events.push(TransportEvent::Connected {
@@ -683,11 +710,9 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             return;
         };
         if noise {
-            if self
-                .connections
-                .get(&id)
-                .is_some_and(|conn| !conn.connected)
-            {
+            // Once the server's messages are verified it has nothing more
+            // to send, so its FIN is no failure.
+            if self.connections.get(&id).is_some_and(|conn| !conn.verified) {
                 self.fail(
                     id,
                     "the server finished the Noise stream mid-handshake".into(),
@@ -742,9 +767,20 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
     }
 
     fn on_stop_sending(&mut self, handle: StreamHandle, code: u8) {
-        let Some((id, false)) = self.owner(handle) else {
+        let Some((id, noise)) = self.owner(handle) else {
             return;
         };
+        if noise {
+            // Message three can no longer reach the server.
+            if self
+                .connections
+                .get(&id)
+                .is_some_and(|conn| !conn.connected)
+            {
+                self.fail(id, "the server stopped the Noise stream".into());
+            }
+            return;
+        }
         let Some(conn) = self.connections.get_mut(&id) else {
             return;
         };
@@ -904,6 +940,7 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
                 certhashes,
                 noise_stream: None,
                 noise: None,
+                verified: false,
                 connected: false,
                 handshake_deadline: None,
                 streams: BTreeMap::new(),

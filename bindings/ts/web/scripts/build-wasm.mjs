@@ -6,6 +6,7 @@
 // version `crates/web` pins (`cargo install wasm-bindgen-cli --version …`).
 
 import { execFileSync } from "node:child_process";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../../../", import.meta.url));
@@ -24,10 +25,22 @@ run("cargo", [
   "--profile",
   "wasm-release",
 ]);
+// Cargo's target directory, honoring `CARGO_TARGET_DIR` and `build.target-dir`.
+const { target_directory: targetDir } = JSON.parse(
+  execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
+    cwd: root,
+    encoding: "utf-8",
+  })
+);
 run("wasm-bindgen", [
   "--target",
   "web",
   "--out-dir",
   out,
-  "target/wasm32-unknown-unknown/wasm-release/minip2p_web.wasm",
+  path.join(
+    targetDir,
+    "wasm32-unknown-unknown",
+    "wasm-release",
+    "minip2p_web.wasm"
+  ),
 ]);

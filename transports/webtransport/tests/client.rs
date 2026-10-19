@@ -793,3 +793,103 @@ fn a_queued_write_the_platform_later_refuses_stops_the_write_side() {
     assert_eq!(send(&mut client, &conn, b, 100), 0);
     assert_eq!(send(&mut client, &conn, c, 100), 0, "A's bytes are free");
 }
+
+/// A dial whose Noise message two has arrived while the platform takes only
+/// 10 bytes per write, so message three and its FIN wait in Rust: the
+/// connection id, session, Noise stream and the server's Noise session.
+fn dial_with_final_noise_message_queued(
+    client: &mut Client,
+) -> (ConnectionId, SessionHandle, StreamHandle, NoiseSession) {
+    let server = Ed25519Keypair::generate();
+    let addr: PeerAddr = format!(
+        "/ip4/192.0.2.1/udp/4001/quic-v1/webtransport/certhash/{HASH}/p2p/{}",
+        server.peer_id()
+    )
+    .parse()
+    .expect("peer addr");
+    let certhashes = addr.transport().certhashes().copied().collect();
+    let id = client.dial(&addr).expect("dial");
+    let session = SessionHandle(client.io_mut().next);
+    client
+        .io_mut()
+        .events
+        .push_back(IoEvent::SessionReady { session });
+    assert_eq!(poll(client), []);
+    let noise = StreamHandle(client.io_mut().next);
+    let mut responder = NoiseSession::new(NoiseConfig {
+        role: NoiseRole::Responder,
+        identity: server,
+        static_secret: [200; 32],
+        ephemeral_secret: [201; 32],
+        expected_peer: None,
+        local_extensions: Some(NoiseExtensions {
+            webtransport_certhashes: certhashes,
+            stream_muxers: Vec::new(),
+        }),
+    });
+    responder.start().expect("start");
+    let io = client.io_mut();
+    io.complete(noise);
+    responder
+        .on_data(std::mem::take(&mut io.stream(noise).written))
+        .expect("message one");
+    io.in_flight_cap = 10;
+    while let Some(output) = responder.poll_output() {
+        if let NoiseOutput::Outbound(frame) = output {
+            io.events.push_back(IoEvent::Data {
+                stream: noise,
+                bytes: Bytes::from(frame),
+            });
+        }
+    }
+    assert_eq!(poll(client), [], "not connected while message three waits");
+    assert_eq!(client.io_mut().stream(noise).written.len(), 10);
+    assert!(!client.io_mut().stream(noise).fin);
+    (id, session, noise, responder)
+}
+
+#[test]
+fn the_handshake_stays_pending_until_message_three_and_fin_are_handed_off() {
+    let mut client = client(small_limits());
+    let (id, _, noise, mut responder) = dial_with_final_noise_message_queued(&mut client);
+    assert_eq!(client.next_deadline(), Some(Deadline::from_millis(10_000)));
+    assert!(matches!(
+        client.open_stream(id),
+        Err(TransportError::InvalidState { .. })
+    ));
+
+    let mut events = Vec::new();
+    while !client.io_mut().stream(noise).fin {
+        client.io_mut().complete(noise);
+        events.extend(poll(&mut client));
+    }
+    assert!(
+        matches!(events.as_slice(), [TransportEvent::Connected { id: got, .. }] if *got == id),
+        "{events:?}"
+    );
+    assert_eq!(client.next_deadline(), None);
+    responder
+        .on_data(std::mem::take(&mut client.io_mut().stream(noise).written))
+        .expect("message three");
+    assert!(responder.is_handshake_complete());
+}
+
+#[test]
+fn stop_sending_on_a_pending_noise_stream_fails_the_handshake() {
+    let mut client = client(small_limits());
+    let (id, session, noise, _) = dial_with_final_noise_message_queued(&mut client);
+    client.io_mut().events.push_back(IoEvent::StopSending {
+        stream: noise,
+        code: 7,
+    });
+    assert!(matches!(
+        poll(&mut client).as_slice(),
+        [TransportEvent::Closed { id: got, reason: ConnectionCloseReason::Error(_) }] if *got == id
+    ));
+    assert_eq!(client.io_mut().closed_sessions, [session.0]);
+    // The queued tail went with the session: completions write nothing more.
+    client.io_mut().complete(noise);
+    assert_eq!(poll(&mut client), []);
+    assert_eq!(client.io_mut().stream(noise).written.len(), 10);
+    assert_eq!(client.next_deadline(), None);
+}
