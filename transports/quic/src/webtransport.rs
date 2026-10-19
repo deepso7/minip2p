@@ -870,6 +870,16 @@ impl WtSession {
     /// A stream with a WebTransport prefix: admitted once the session is
     /// authenticated, held until then.
     fn on_prefixed(&mut self, conn: &mut Connection, raw: u64, session_id: u64) {
+        // A session id is a CONNECT stream's: client-initiated bidi, so a
+        // multiple of 4. Any other cannot name a session at all (draft-14
+        // §4), unlike a valid id that is not ours.
+        if session_id % 4 != 0 {
+            self.fail(
+                code::H3_ID_ERROR,
+                format!("a stream named session {session_id}, not a request stream id"),
+            );
+            return;
+        }
         if self.established {
             if Some(session_id) == self.session_id() {
                 self.events.push(WtEvent::Admit {

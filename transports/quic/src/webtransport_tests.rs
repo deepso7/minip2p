@@ -509,6 +509,16 @@ fn every_validation_matrix_row_closes_with_its_code() {
             code::H3_ID_ERROR,
         ),
         (
+            "a prefixed stream naming an impossible session",
+            |peer| {
+                peer.control(DRAFT02);
+                // Not a client-initiated bidi stream id.
+                peer.connect = Some(1);
+                peer.wt_stream(b"early");
+            },
+            code::H3_ID_ERROR,
+        ),
+        (
             "a control stream not starting with SETTINGS",
             |peer| {
                 peer.control_bytes(GOAWAY);
@@ -1286,6 +1296,16 @@ fn legal_push_and_qpack_instructions_leave_the_session_up() {
     peer.uni(&[0x03, 0x40, 0x7f, 0xa9, 0x0f]);
     peer.libp2p_connect();
     peer.authenticate(&mut server, &mut events);
+}
+
+#[test]
+fn an_impossible_session_id_after_authentication_closes_the_connection() {
+    let (mut server, mut peer, _) = established(DRAFT02);
+    let session = peer.connect.replace(2);
+    peer.wt_stream(b"data");
+    peer.connect = session;
+    let (code, reason) = peer.closed_with(&mut server, &mut Vec::new());
+    assert_eq!(code, code::H3_ID_ERROR, "{reason}");
 }
 
 #[test]
