@@ -167,6 +167,64 @@ fn force_relay_skips_direct_dials_and_dcutr() {
 }
 
 #[test]
+fn dcutr_off_races_both_legs_and_never_upgrades() {
+    let mut h = Harness::with_relay(NatConfig {
+        dcutr: false,
+        ..NatConfig::default()
+    });
+    // The direct leg keeps its head start: the relay waits out the stagger.
+    let id = h.start(RACE, at(0));
+    assert_eq!(dial_count_for(&drain_actions(&mut h.agent), &h.relay), 0);
+    assert_eq!(
+        h.agent.next_deadline(at(0)),
+        Some(Deadline::from_millis(200))
+    );
+    h.agent.handle_tick(at(200));
+    drain_actions(&mut h.agent);
+    h.relay_session_ready(at(210));
+    let stream = opened_stream(&drain_actions(&mut h.agent));
+    h.stream_ready(stream, at(220));
+    drain_actions(&mut h.agent); // HOP CONNECT
+    h.stream_data(stream, hop_status(Status::Ok), at(300));
+
+    let promotion = drain_actions(&mut h.agent);
+    let target = h.target.clone();
+    complete_promotion(&mut h.agent, &target, &promotion, at(301));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathEstablished { connect_id, path: Path::Relayed { .. }, .. }]
+            if *connect_id == id
+    ));
+    assert_eq!(h.agent.next_deadline(at(301)), None, "no upgrade budgets");
+
+    // A DCUtR stream from the target is refused, not answered.
+    let stream = StreamId::new(9_002);
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: ConnectionId::new(TEST_CIRCUIT_ID),
+            peer_id: target,
+            stream_id: stream,
+            protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
+            initiated_locally: false,
+        },
+        false,
+        at(302),
+    );
+    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
+
+    h.agent.handle_tick(at(60_000));
+    assert_eq!(send_stream_count(&drain_actions(&mut h.agent)), 0);
+    assert!(drain_events(&mut h.agent).is_empty(), "no upgrade timeout");
+
+    // The direct leg can still win the race.
+    h.target_connected(at(60_001));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathUpgraded { connect_id, to: Path::Direct, .. }] if *connect_id == id
+    ));
+}
+
+#[test]
 fn default_connect_promotes_the_bridge_before_dcutr() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (_, stream) = drive_to_bridged(&mut h, 0);

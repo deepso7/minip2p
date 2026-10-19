@@ -229,7 +229,7 @@ impl ConnectAttempt {
         shared: &Shared,
     ) -> bool {
         !self.done
-            && !shared.config.force_relay
+            && shared.config.upgrades()
             && &self.peer == peer
             && self.promoted == Some(conn_id)
             && self.upgrade_deadline.is_some()
@@ -1211,7 +1211,7 @@ impl ConnectAttempt {
         let path = Path::Relayed { relay };
         self.best = Some(path.clone());
         self.path_conn = Some(conn_id);
-        if !shared.config.force_relay {
+        if shared.config.upgrades() {
             self.relayed_at = now.monotonic_ms;
             self.upgrade_deadline =
                 Some(self.clip(now.monotonic_ms + shared.config.upgrade_timeout_ms));
