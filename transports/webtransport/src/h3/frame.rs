@@ -18,7 +18,8 @@ const MAX_GOAWAY_FRAME_LEN: usize = 8;
 /// buffered whole within their caps.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Frame<'a> {
-    /// A chunk of a DATA frame payload. Empty DATA frames yield nothing.
+    /// A chunk of a DATA frame payload. An empty DATA frame yields one
+    /// empty chunk; a non-empty one never does.
     Data(&'a [u8]),
     /// A HEADERS frame's QPACK field section.
     Headers(Vec<u8>),
@@ -114,6 +115,12 @@ impl FrameDecoder {
                     let Some(len) = self.reader.read(input) else {
                         return Ok(None);
                     };
+                    // Reported, not skipped, so callers can reject DATA
+                    // where RFC 9114 forbids it whatever its length.
+                    if ty == frame_type::DATA && len == 0 {
+                        self.state = State::Type;
+                        return Ok(Some(Frame::Data(&[])));
+                    }
                     self.state = self.start_payload(ty, len)?;
                 }
                 State::Data { remaining } => {
@@ -331,6 +338,16 @@ mod tests {
                 Frame::Data(&[0xaa, 0xbb]),
                 Frame::GoAway(4),
             ]
+        );
+        assert!(decoder.is_at_frame_boundary());
+    }
+
+    #[test]
+    fn an_empty_data_frame_is_reported() {
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            decode_all(&mut decoder, &[0x00, 0x00, 0x00, 0x01, 0xaa]),
+            Ok(alloc::vec![Frame::Data(&[]), Frame::Data(&[0xaa])])
         );
         assert!(decoder.is_at_frame_boundary());
     }

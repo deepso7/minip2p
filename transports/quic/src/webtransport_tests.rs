@@ -488,6 +488,33 @@ fn every_validation_matrix_row_closes_with_its_code() {
             code::H3_FRAME_UNEXPECTED,
         ),
         (
+            "an empty DATA on the control stream",
+            |peer| {
+                peer.control_bytes(&after_settings(&[0x00, 0x00]));
+            },
+            code::H3_FRAME_UNEXPECTED,
+        ),
+        (
+            "an empty DATA before the control stream's SETTINGS",
+            |peer| {
+                peer.control_bytes(&[0x00, 0x00]);
+            },
+            code::H3_MISSING_SETTINGS,
+        ),
+        (
+            "an empty DATA before a request's HEADERS",
+            |peer| {
+                peer.control(DRAFT02);
+                let stream = peer.raw.open();
+                let mut bytes = vec![0x00, 0x00];
+                let mut block = Vec::new();
+                encode_field_section(libp2p_request(b"webtransport").iter().copied(), &mut block);
+                encode_frame(frame_type::HEADERS, &block, &mut bytes).expect("HEADERS");
+                assert_eq!(peer.raw.write(stream, &bytes), bytes.len());
+            },
+            code::H3_FRAME_UNEXPECTED,
+        ),
+        (
             "HEADERS on the control stream",
             |peer| {
                 peer.control_bytes(&after_settings(&[0x01, 0x00]));
@@ -1148,12 +1175,16 @@ fn noise_stream_bytes_count_toward_the_pre_auth_byte_cap() {
     peer.drive(&mut server, &mut events, "the 200", |peer, _| {
         peer.status().is_some()
     });
-    // One Noise frame that declares its maximum length and never ends,
-    // sent once the session runs Noise on it.
+    // The responder's reply proves the server took the prefix and runs
+    // Noise on the stream, so what follows is read as Noise, not held.
+    let first = outbound(&mut initiator()).0;
+    let noise = peer.wt_stream(&first);
+    peer.drive(&mut server, &mut events, "the Noise reply", |peer, _| {
+        !peer.raw.read(noise).0.is_empty()
+    });
+    // One Noise frame that declares its maximum length and never ends.
     let mut frame = vec![0xff, 0xff];
     frame.resize(2 + 17 * 1024, 0);
-    let noise = peer.wt_stream(&[]);
-    peer.drive(&mut server, &mut events, "the Noise stream", |_, _| true);
     assert_eq!(peer.raw.write(noise, &frame), frame.len());
     let (code, reason) = peer.closed_with(&mut server, &mut events);
     assert_eq!(code, code::H3_EXCESSIVE_LOAD, "{reason}");
