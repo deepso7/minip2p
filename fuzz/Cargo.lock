@@ -429,6 +429,7 @@ dependencies = [
 name = "minip2p-core"
 version = "0.10.0"
 dependencies = [
+ "base64ct",
  "bytes",
  "getrandom",
  "minip2p-identity",
@@ -472,6 +473,7 @@ dependencies = [
  "minip2p-swarm",
  "minip2p-tls",
  "minip2p-transport",
+ "minip2p-webtransport",
 ]
 
 [[package]]
@@ -592,6 +594,13 @@ version = "0.10.0"
 dependencies = [
  "minip2p-core",
  "mio",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-webtransport"
+version = "0.10.0"
+dependencies = [
  "thiserror",
 ]
 

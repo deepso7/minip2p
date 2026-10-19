@@ -42,6 +42,7 @@ minip2p-tcp|default|smoltcp
 minip2p-mdns|default|smoltcp
 minip2p-transport|default|bench
 minip2p-quic|default|diagnostics
+minip2p-ffi-core|no-default|serde
 EOF
 )
 

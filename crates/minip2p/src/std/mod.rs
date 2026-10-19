@@ -41,10 +41,8 @@ mod dial;
 mod nat_tests;
 #[cfg(feature = "relay-server")]
 pub(crate) mod relay_server;
-mod writer;
 
 pub use bind_error::{BindError, EndpointOptionsError, IpFamily};
-pub use writer::{StreamWriteError, StreamWriter, WriteAccepted, WriteProgress};
 
 use std::time::Duration;
 
@@ -384,7 +382,7 @@ impl Endpoint {
     }
 
     /// Samples the endpoint's clock; every engine call takes one sample.
-    fn now(&mut self) -> Now {
+    pub(crate) fn now(&mut self) -> Now {
         self.clock.now()
     }
 

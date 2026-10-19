@@ -987,6 +987,11 @@ fn send_stateless(socket: &mut Socket, buf: &[u8], transmit: &quinn_proto::Trans
 
 impl Transport for QuicTransport {
     fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        if addr.transport().is_webtransport() {
+            return Err(TransportError::Unsupported {
+                operation: "native WebTransport dialing; dial the peer's /quic-v1 address",
+            });
+        }
         let peer_socket = dial_socket_addr(addr.transport(), "dial target")?;
         let max_connections = self.node_config.limits().max_connections;
         let slots_held = self.slots_held();
@@ -1035,6 +1040,11 @@ impl Transport for QuicTransport {
     }
 
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+        if addr.is_webtransport() {
+            return Err(TransportError::Unsupported {
+                operation: "WebTransport listening yet; listen on the /quic-v1 address",
+            });
+        }
         let requested = extract_listen_socket_addr(addr, "listen address")?;
         let socket = self
             .sockets

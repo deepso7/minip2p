@@ -1,6 +1,6 @@
-//! The stream writer over real TCP endpoints, whose Yamux streams cap at
-//! 256 KiB: it holds the tail a Full send left, finishes it on Writable,
-//! defers the FIN behind it, and forgets it once the stream or its
+//! The stream writer over real TCP endpoints, std and portable, whose Yamux
+//! streams cap at 256 KiB: it holds the tail a Full send left, finishes it on
+//! Writable, defers the FIN behind it, and forgets it once the stream or its
 //! connection ends.
 
 #![cfg(all(feature = "std", feature = "tcp"))]
@@ -8,9 +8,10 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, StreamId, StreamWriteError,
-    StreamWriter, WriteAccepted, WriteProgress,
+    ConnectionId, Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, StreamId,
+    StreamWriteError, StreamWriter, WriteAccepted, WriteProgress,
 };
+use minip2p_core::platform::{Clock, StdClock, StdEntropy};
 
 const PROTOCOL: &str = "/minip2p/stream-writer/1";
 /// Far past every per-stream send cap, so the first write is held.
@@ -223,4 +224,109 @@ fn a_write_past_the_budget_is_refused_before_anything_is_sent() {
         .write(&mut writer, ConnectionId::new(u64::MAX), stream_id, vec![0])
         .expect_err("unknown connection");
     assert!(gone.is_stream_gone() && !gone.is_retryable(), "{gone:?}");
+}
+
+type Portable = minip2p::PortableEndpoint<
+    minip2p::TcpTransport<minip2p_tcp::StdTcpProvider, StdEntropy>,
+    StdEntropy,
+>;
+
+fn bind_portable() -> Portable {
+    let key = Ed25519Keypair::generate();
+    let transport =
+        minip2p::TcpTransport::new(minip2p_tcp::StdTcpProvider::new(), key.clone(), StdEntropy);
+    Endpoint::portable(&key, StdEntropy)
+        .protocol(PROTOCOL)
+        .build(transport)
+        .expect("build portable endpoint")
+}
+
+#[test]
+fn a_portable_endpoint_finishes_a_held_write_and_the_deferred_fin() {
+    let mut clock = StdClock::new();
+    let mut reader = bind_portable();
+    let mut writer = bind_portable();
+    let reader_addr = PeerAddr::new(
+        reader
+            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("multiaddr"))
+            .expect("reader listens"),
+        reader.peer_id().clone(),
+    )
+    .expect("reader address");
+    let (reader_peer, writer_peer) = (reader.peer_id().clone(), writer.peer_id().clone());
+    writer.connect(reader_addr, clock.now()).expect("connect");
+    let deadline = Instant::now() + BACKSTOP;
+    while !writer.is_peer_ready(&reader_peer) || !reader.is_peer_ready(&writer_peer) {
+        assert!(Instant::now() < deadline, "peers never became ready");
+        let now = clock.now();
+        writer.poll(now).expect("writer polls");
+        reader.poll(now).expect("reader polls");
+    }
+    let (conn_id, stream_id) = writer
+        .open_stream(&reader_peer, PROTOCOL, clock.now())
+        .expect("open stream");
+    'negotiate: loop {
+        assert!(Instant::now() < deadline, "stream never negotiated");
+        let now = clock.now();
+        reader.poll(now).expect("reader polls");
+        for event in writer.poll(now).expect("writer polls") {
+            if matches!(event, EndpointEvent::StreamReady { stream_id: id, .. } if id == stream_id)
+            {
+                break 'negotiate;
+            }
+        }
+    }
+
+    let mut streams = StreamWriter::new(PAYLOAD);
+    let payload = payload();
+    assert_eq!(
+        streams
+            .write_at(
+                &mut writer,
+                conn_id,
+                stream_id,
+                payload.clone(),
+                clock.now()
+            )
+            .expect("write"),
+        WriteProgress::Pending,
+        "a write past the send caps is held"
+    );
+    streams
+        .close_write_at(&mut writer, conn_id, stream_id, clock.now())
+        .expect("close write");
+
+    let (mut accepted, mut received) = (Vec::new(), Vec::new());
+    'transfer: loop {
+        assert!(
+            Instant::now() < deadline,
+            "transfer stalled at {} bytes",
+            received.len()
+        );
+        let now = clock.now();
+        for event in writer.poll(now).expect("writer polls") {
+            accepted.extend(streams.observe_at(&mut writer, &event, now));
+        }
+        for event in reader.poll(now).expect("reader polls") {
+            match event {
+                EndpointEvent::StreamData { data, .. } => received.extend_from_slice(&data),
+                EndpointEvent::StreamRemoteWriteClosed { .. } => break 'transfer,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        accepted,
+        vec![WriteAccepted {
+            peer_id: reader_peer,
+            conn_id,
+            stream_id,
+        }],
+        "the held write completes exactly once"
+    );
+    assert!(
+        received == payload,
+        "every byte arrives, in order, before the FIN"
+    );
+    assert_eq!(streams.held_bytes(), 0);
 }

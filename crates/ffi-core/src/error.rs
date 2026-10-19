@@ -116,3 +116,16 @@ impl core::fmt::Display for ConfigCapability {
         f.write_str(self.as_str())
     }
 }
+
+/// Maps a runtime endpoint failure: transport failures to
+/// [`FfiError::Transport`], anything else to [`FfiError::Internal`].
+pub fn map_driver_error(error: minip2p::DriverError) -> FfiError {
+    match error {
+        minip2p::DriverError::Transport(_) => FfiError::Transport {
+            detail: error.to_string(),
+        },
+        _ => FfiError::Internal {
+            detail: error.to_string(),
+        },
+    }
+}

@@ -13,6 +13,7 @@ Small, `no_std`-friendly libp2p identity crate focused on public key protobuf en
   - Legacy base58btc multihash form (`Qm...`, `12D3Koo...`).
   - CIDv1 with `libp2p-key` multicodec (`0x72`) in base32 multibase (`b...`).
 - Typed multihash API via `PeerMultihash` (`multihash::Multihash<64>`), also exported as `Multihash` for non-peer uses such as WebTransport certhashes.
+- Public `multibase` module with the text codecs peer ids use, for other multibase values: `encode_base58btc`/`decode_base58btc`, `encode_base32_lower`/`decode_base32` (case-insensitive) and `decode_base16`. They take the payload without its multibase prefix and fail with `MultibaseError`.
 - Ed25519 keypair generation (`ed25519` feature, enabled by default) with:
   - `generate()` for `std` users.
   - `generate_with_rng(...)` for `no_std` users.
