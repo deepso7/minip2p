@@ -182,7 +182,7 @@ See the research doc for sources. The facts that drive the design:
      - **Peer-initiated close.** A peer capsule, a FIN, reset or STOP_SENDING on the CONNECT stream, or GOAWAY ends the session (`Remote { code }` with the capsule's code, 0 otherwise); STOP_SENDING also resets our side of the CONNECT stream. The server FINs its side and resets the open WT streams, then closes QUIC with `H3_NO_ERROR` as soon as the peer has finished or reset its side of the CONNECT stream and acknowledged (or stopped) our FIN, bounded by the same deadline. Closing sooner would discard the FIN and resets. The browser initiated the close, so it already treats the session as closed.
      - **Refused requests.** The 400 and 404 replies use the same `Closing` path, so the status reaches the browser.
      - `on_lost` counts `H3_NO_ERROR` as orderly on h3 connections, so no `Error` event is raised.
-     - Tests: a native-initiated close in Playwright (PR 5) asserts that the browser's `transport.closed` promise _fulfills_ with code 0; the native test client (Decision 11) asserts that the capsule arrived before the QUIC close.
+     - Tests: a native-initiated close in Playwright (PR 5) asserts that the browser's `transport.closed` promise _fulfills_ with code 0 and the SDK reports a remote close. Chromium alone may instead reject `closed` with `WebTransportError: Connection lost.` (its network service sometimes drops the close report), and the SDK's matching error close reason is then accepted too; Firefox stays strict. The native test client (Decision 11) asserts that the capsule arrived before the QUIC close.
    - **Pre-auth limits.** These are enforced before allocation and bound each connection's pre-auth state once ALPN is `h3` (there is no memory budget, ADR 0022):
      - Encoded caps: HEADERS frames 16 KiB, the SETTINGS frame 4 KiB, a single capsule 64 KiB. Capsule bodies other than CLOSE are parsed as they stream, so the 64 KiB bound only applies to CLOSE messages (1 KiB max) and to skipping unknown capsules, which is done without buffering.
      - Decoded caps: the QPACK decoder stops with `QPACK_DECOMPRESSION_FAILED` once the decoded field section passes **8 KiB** (the RFC 9114 `name + value + 32` per-field accounting) or **64 fields**. That bound applies no matter how few encoded bytes produced it, which covers repeated static-index expansion. The decoder writes into one preallocated 8 KiB buffer, so there is no per-field allocation.
@@ -279,7 +279,7 @@ See the research doc for sources. The facts that drive the design:
       1. build `https://<host>:<port>/.well-known/libp2p-webtransport?type=noise` (IPv6 hosts are bracketed; DNS names pass through to the browser, which resolves them);
       2. `connect` with the address's certhashes;
       3. on `SessionReady`, `open_stream` and run `NoiseSession` as initiator with `expected_peer` from `/p2p`;
-      4. on `HandshakeComplete`, require every dialed certhash to be in `remote_extensions.webtransport_certhashes`; otherwise emit `Error` then `Closed`;
+      4. on `HandshakeComplete`, require every dialed certhash to be in `remote_extensions.webtransport_certhashes`; otherwise emit `Closed` with an error reason (no separate `Error` event);
       5. FIN the Noise stream and emit `Connected`, with the token set to the handshake hash.
     - A dial without a certhash is rejected with `Unsupported` (no CA mode).
     - **Streams.** Streams map 1:1. The full transport contract follows, using the same limits and helpers as the TCP and QUIC transports.
