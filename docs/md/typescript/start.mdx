@@ -1,9 +1,9 @@
 ---
 title: Start with TypeScript
-description: Choose Node.js or React Native, make the first connection, and continue with the shared TypeScript interface.
+description: Choose Node.js, React Native or the browser, make the first connection, and continue with the shared TypeScript interface.
 ---
 
-minip2p has one TypeScript interface on Node.js and React Native. Setup and endpoint ownership differ by runtime. Connections, streams, events, pubsub, discovery, and NAT traversal work the same way after the endpoint starts.
+minip2p has one TypeScript interface on Node.js, React Native and the browser. Setup and endpoint ownership differ by runtime. Connections, streams, events, pubsub, discovery, and NAT traversal work the same way after the endpoint starts; the browser runs a subset (it dials over WebTransport and cannot listen).
 
 ## Choose your runtime
 
@@ -18,6 +18,9 @@ minip2p has one TypeScript interface on Node.js and React Native. Setup and endp
   >
     Create a development build and connect from a component.
   </Card>
+  <Card title="Browser quickstart" href="/typescript/setup-web" icon="globe">
+    Dial a native node over WebTransport from a page.
+  </Card>
 </CardGroup>
 
 Import from the package for your runtime:
@@ -26,9 +29,11 @@ Import from the package for your runtime:
 import { Minip2p } from "@minip2p/node";
 // or
 import { Minip2p } from "@minip2p/react-native";
+// or
+import { Minip2p } from "@minip2p/web";
 ```
 
-Both packages expose the same application types and operations.
+The packages expose the same application types and operations.
 
 ## The shared connection flow
 
