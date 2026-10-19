@@ -886,6 +886,22 @@ fn identify_observed_addr_joins_dcutr_connect() {
 }
 
 #[test]
+fn webtransport_addresses_never_become_punch_candidates() {
+    // What a WebTransport connection looks like to NAT: the shape a QUIC
+    // connection's endpoint takes once ALPN picks h3, here as a trusted
+    // reporter's observation of us and as one of our listen addresses.
+    let observed_wt = "/ip4/203.0.113.77/udp/45678/quic-v1/webtransport";
+    let listen_wt = "/ip4/198.51.100.5/udp/4500/quic-v1/webtransport/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g";
+    let mut h = Harness::with_relay(NatConfig::default());
+    h.agent
+        .set_listen_addrs(&[maddr(LISTEN_ADDR), maddr(listen_wt)]);
+    identify_observed(&mut h.agent, &h.relay.clone(), &maddr(observed_wt), at(0));
+
+    let obs = advertised_dcutr_addrs(&mut h, 10);
+    assert_eq!(obs, [maddr(LISTEN_ADDR)], "only quic-v1 is punched");
+}
+
+#[test]
 fn latest_observation_per_reporter_wins() {
     let stale = "/ip4/203.0.113.77/udp/1111/quic-v1";
     let mut h = Harness::with_relay(NatConfig::default());
