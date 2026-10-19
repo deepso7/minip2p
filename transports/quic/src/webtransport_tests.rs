@@ -12,6 +12,7 @@ use minip2p_webtransport::LIBP2P_WEBTRANSPORT_PATH;
 use minip2p_webtransport::h3::{
     Capsule, Frame, FrameDecoder, Settings, UniStreamType, code, encode_frame,
     encode_uni_stream_type, encode_webtransport_bidi_header, frame_type, setting,
+    webtransport_code_to_h3,
 };
 use minip2p_webtransport::qpack::{QpackDecoder, encode_field_section};
 use quinn_proto::{ConnectionError, Dir, Event, StreamEvent, VarInt};
@@ -2012,21 +2013,31 @@ fn a_noise_stream_stopped_while_held_fails_the_handshake() {
     assert!(!connected(&events), "{events:?}");
 }
 
-/// Whether the server reset its side of `stream`.
-fn was_reset(peer: &mut H3Peer, stream: u64) -> bool {
+/// The code the server reset its side of `stream` with, reading past any
+/// data before it.
+fn reset_code(peer: &mut H3Peer, stream: u64) -> Option<u64> {
     let mut recv = peer.raw.conn().recv_stream(crate::test_peer::sid(stream));
     let Ok(mut chunks) = recv.read(true) else {
-        return false;
+        return None;
     };
     let reset = loop {
         match chunks.next(usize::MAX) {
             Ok(Some(_)) => {}
-            Ok(None) | Err(quinn_proto::ReadError::Blocked) => break false,
-            Err(quinn_proto::ReadError::Reset(_)) => break true,
+            Ok(None) | Err(quinn_proto::ReadError::Blocked) => break None,
+            Err(quinn_proto::ReadError::Reset(code)) => break Some(code.into_inner()),
         }
     };
     let _credit = chunks.finalize();
     reset
+}
+
+/// The code the server stopped the client's side of `stream` with.
+fn stop_code(peer: &mut H3Peer, stream: u64) -> Option<u64> {
+    let sid = crate::test_peer::sid(stream);
+    match peer.raw.conn().send_stream(sid).stopped() {
+        Ok(Some(code)) => Some(code.into_inner()),
+        _ => None,
+    }
 }
 
 #[test]
@@ -2069,9 +2080,12 @@ fn a_session_closed_mid_authentication_resets_its_streams_and_sends_no_more_nois
         });
         assert_eq!(reply, 1, "Noise bytes after the close (local: {local})");
         // The held stream's reset, and the Noise stream's, which the reads
-        // above consumed.
-        assert!(was_reset(&mut peer, held), "held stream (local: {local})");
+        // above consumed; both are stopped too, as the session is gone.
+        let gone = Some(code::WT_SESSION_GONE);
+        assert_eq!(reset_code(&mut peer, held), gone, "local: {local}");
         assert_eq!(resets_received(&mut peer), 2, "local: {local}");
+        assert_eq!(stop_code(&mut peer, held), gone, "local: {local}");
+        assert_eq!(stop_code(&mut peer, stream), gone, "local: {local}");
     }
 }
 
@@ -2141,4 +2155,90 @@ fn a_fin_after_a_close_capsule_ends_the_session_cleanly() {
         Some(&ConnectionCloseReason::Remote { code: 42 })
     );
     assert_eq!(resets_received(&mut peer), 0);
+}
+
+#[test]
+fn data_after_a_close_capsule_is_stopped_even_when_our_fin_ack_lands_in_the_same_poll() {
+    let (mut server, mut peer, _) = established(DRAFT02);
+    let mut events = Vec::new();
+    idle(&mut server, &mut peer, &mut events, 50);
+    let connect = peer.connect.expect("CONNECT");
+    peer.capsule(&Capsule::CloseSession {
+        code: 42,
+        reason: String::new(),
+    });
+    peer.raw.service();
+    events.extend(server.poll(now()).expect("poll the capsule"));
+    // Trailing data goes out before the client has seen the server's FIN;
+    // the FIN's acknowledgement follows, and one server poll reads both.
+    peer.capsule(&Capsule::MaxData(4096));
+    peer.raw.service();
+    peer.raw.receive();
+    peer.raw.run_engine();
+    assert!(peer.raw.read(connect).1, "the server's FIN");
+    peer.connect = None;
+    std::thread::sleep(Duration::from_millis(30));
+    peer.raw.service();
+    events.extend(server.poll(now()).expect("poll the data and the ACK"));
+    idle(&mut server, &mut peer, &mut events, 100);
+    let sid = crate::test_peer::sid(connect);
+    let stopped = peer.raw.conn().send_stream(sid).stopped();
+    assert!(
+        matches!(stopped, Ok(Some(code)) if code.into_inner() == code::H3_MESSAGE_ERROR),
+        "no H3_MESSAGE_ERROR STOP_SENDING: {stopped:?}"
+    );
+}
+
+#[test]
+fn a_fin_on_a_stream_after_close_is_refused_and_the_close_stays_orderly() {
+    let (mut server, mut peer, id) = established(DRAFT02);
+    let mut events = Vec::new();
+    let stream = server.open_stream(id).expect("open");
+    server
+        .send_stream(id, stream, Bytes::from_static(b"x"))
+        .expect("send");
+    idle(&mut server, &mut peer, &mut events, 30);
+    server.close(id).expect("close");
+    assert!(server.close_stream_write(id, stream).is_err());
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
+    assert_eq!(code, code::H3_NO_ERROR, "{reason}");
+}
+
+#[test]
+fn a_closed_session_resets_and_stops_its_application_streams_with_the_drafts_code() {
+    // Draft-14 names WT_SESSION_GONE; draft-02 names no code, so its streams
+    // end like any other minip2p reset, with application error 0.
+    let cases = [
+        (DRAFT14, code::WT_SESSION_GONE),
+        (DRAFT02, webtransport_code_to_h3(0)),
+    ];
+    for (settings, expected) in cases {
+        for local in [true, false] {
+            let (mut server, mut peer, id) = established(settings);
+            let mut events = Vec::new();
+            let theirs = peer.wt_stream(b"app");
+            peer.drive(
+                &mut server,
+                &mut events,
+                "the client's stream",
+                |_, events| crate::test_peer::stream_bytes(events, theirs) == b"app",
+            );
+            let ours = server_stream(&mut server, id, b"x");
+            idle(&mut server, &mut peer, &mut events, 30);
+            if local {
+                server.close(id).expect("close");
+            } else {
+                peer.capsule(&Capsule::CloseSession {
+                    code: 7,
+                    reason: String::new(),
+                });
+            }
+            idle(&mut server, &mut peer, &mut events, 50);
+            for stream in [theirs, ours] {
+                let what = format!("stream {stream} (local: {local}, expected {expected:#x})");
+                assert_eq!(reset_code(&mut peer, stream), Some(expected), "{what}");
+                assert_eq!(stop_code(&mut peer, stream), Some(expected), "{what}");
+            }
+        }
+    }
 }
