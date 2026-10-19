@@ -241,6 +241,9 @@ impl SecureMuxSession {
             static_secret: config.static_secret,
             ephemeral_secret: config.ephemeral_secret,
             expected_peer: config.expected_peer,
+            // Extensions are WebTransport-only; TCP and circuit send none and
+            // ignore any received, so their wire bytes stay unchanged.
+            local_extensions: None,
         });
         let select = match config.role {
             SessionRole::Initiator => MultistreamSelect::dialer(NOISE_PROTOCOL_ID),
@@ -1106,6 +1109,7 @@ mod tests {
             static_secret: [1; 32],
             ephemeral_secret: [2; 32],
             expected_peer: Some(responder_peer),
+            local_extensions: None,
         });
         let mut responder = NoiseSession::new(NoiseConfig {
             role: NoiseRole::Responder,
@@ -1113,6 +1117,7 @@ mod tests {
             static_secret: [3; 32],
             ephemeral_secret: [4; 32],
             expected_peer: None,
+            local_extensions: None,
         });
         initiator.start().expect("start");
         responder.start().expect("start");

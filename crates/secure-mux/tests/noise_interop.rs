@@ -33,6 +33,7 @@ fn responder_completes_pinned_rust_libp2p_initiator_transcript() {
         static_secret: array("responder_static_secret"),
         ephemeral_secret: array("responder_ephemeral_secret"),
         expected_peer: Some(expected_peer.clone()),
+        local_extensions: None,
     });
     responder.start().unwrap();
     responder.on_data(hex(value("message1"))).unwrap();
@@ -42,7 +43,12 @@ fn responder_completes_pinned_rust_libp2p_initiator_transcript() {
     );
     responder.on_data(hex(value("message3"))).unwrap();
     match responder.poll_output().expect("handshake completion") {
-        NoiseOutput::HandshakeComplete { peer, identity_key } => {
+        NoiseOutput::HandshakeComplete {
+            peer,
+            identity_key,
+            remote_extensions,
+        } => {
+            assert_eq!(remote_extensions, None);
             assert_eq!(peer, expected_peer);
             assert_eq!(PeerId::from_public_key(&identity_key), expected_peer);
         }

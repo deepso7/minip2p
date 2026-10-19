@@ -1,4 +1,4 @@
-use minip2p_core::PeerAddr;
+use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_transport::{
@@ -532,4 +532,37 @@ fn open_stream_before_connected_returns_invalid_state() {
 fn stream_id_round_trips_as_u64() {
     let id = StreamId::new(1234);
     assert_eq!(id.as_u64(), 1234);
+}
+
+/// Native WebTransport is not dialable or listenable yet: both say so with
+/// `Unsupported`, which callers choosing between candidates read as "not
+/// here", and point at the `/quic-v1` address instead.
+#[test]
+fn webtransport_addresses_are_unsupported_with_a_quic_v1_hint() {
+    let (mut server, mut client, server_addr) = setup_pair();
+    let webtransport = |transport: &Multiaddr| {
+        format!("{transport}/webtransport/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g")
+            .parse::<Multiaddr>()
+            .expect("webtransport multiaddr")
+    };
+    let target = PeerAddr::new(
+        webtransport(server_addr.transport()),
+        server_addr.peer_id().clone(),
+    )
+    .expect("peer addr");
+
+    let err = client.dial(&target).expect_err("dial must refuse");
+    assert!(
+        matches!(err, TransportError::Unsupported { .. }),
+        "dial: {err:?}"
+    );
+    assert!(err.to_string().contains("/quic-v1"), "dial: {err}");
+
+    let listen = webtransport(server_addr.transport()).without_certhashes();
+    let err = server.listen(&listen).expect_err("listen must refuse");
+    assert!(
+        matches!(err, TransportError::Unsupported { .. }),
+        "listen: {err:?}"
+    );
+    assert!(err.to_string().contains("/quic-v1"), "listen: {err}");
 }

@@ -24,7 +24,9 @@ use minip2p_relay::{
     FrameDecode as RelayFrame, HopConnect, HopMessage, HopReservation, HopResponder, StopInitiator,
     StopMessage, StopResponder,
 };
-use minip2p_secure_mux::noise::{NoiseConfig, NoiseHandshakePayload, NoiseRole, NoiseSession};
+use minip2p_secure_mux::noise::{
+    NoiseConfig, NoiseExtensions, NoiseHandshakePayload, NoiseRole, NoiseSession,
+};
 use minip2p_secure_mux::yamux::{FrameDecoder as YamuxFrameDecoder, YamuxRole, YamuxSession};
 use minip2p_secure_mux::{
     SecureMuxSession, SessionConfig, SessionOutput, SessionRole, YamuxConfig,
@@ -301,6 +303,21 @@ fn expected_transport_kind(addr: &Multiaddr) -> Option<TransportKind> {
     match addr.protocols() {
         [host, Protocol::Tcp(_)] if host.is_host() => Some(TransportKind::Tcp),
         [host, Protocol::Udp(_), Protocol::QuicV1] if host.is_host() => Some(TransportKind::Quic),
+        // WebTransport rides the QUIC transport: quic-v1, webtransport, then
+        // only certhashes.
+        [
+            host,
+            Protocol::Udp(_),
+            Protocol::QuicV1,
+            Protocol::WebTransport,
+            rest @ ..,
+        ] if host.is_host()
+            && rest
+                .iter()
+                .all(|protocol| matches!(protocol, Protocol::Certhash(_))) =>
+        {
+            Some(TransportKind::Quic)
+        }
         _ => None,
     }
 }
@@ -600,10 +617,11 @@ fn fuzz_peer_id() -> PeerId {
     PeerId::from_public_key_protobuf(b"minip2p-fuzz-peer")
 }
 
-/// Exercises framing, both XX roles, payload protobuf decoding, and handshake
-/// parsing with arbitrary wire bytes.
+/// Exercises framing, both XX roles, payload and extensions protobuf
+/// decoding, and handshake parsing with arbitrary wire bytes.
 fn fuzz_noise(data: &[u8]) {
     let _ = NoiseHandshakePayload::decode(data);
+    let _ = NoiseExtensions::decode(data);
     for role in [NoiseRole::Initiator, NoiseRole::Responder] {
         let identity = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([1; 32]);
         let mut session = NoiseSession::new(NoiseConfig {
@@ -612,6 +630,7 @@ fn fuzz_noise(data: &[u8]) {
             static_secret: [2; 32],
             ephemeral_secret: [3; 32],
             expected_peer: None,
+            local_extensions: None,
         });
         let _ = session.start();
         let _ = session.on_data(data.to_vec());

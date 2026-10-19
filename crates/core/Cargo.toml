@@ -18,6 +18,8 @@ default = ["std"]
 std = ["minip2p-identity/std", "thiserror/std", "dep:getrandom"]
 
 [dependencies]
+# base64url text for `/certhash` multihashes.
+base64ct = { version = "1.8.3", default-features = false, features = ["alloc"] }
 # Shared stream payload handle (ADR 0011); re-exported as `minip2p_core::Bytes`.
 bytes = { workspace = true }
 getrandom = { workspace = true, optional = true }

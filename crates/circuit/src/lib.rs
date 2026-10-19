@@ -2170,6 +2170,7 @@ mod tests {
             static_secret: [11; 32],
             ephemeral_secret: [12; 32],
             expected_peer: Some(b_peer.clone()),
+            local_extensions: None,
         });
         scripted_noise.start().expect("scripted Noise start");
         while let Some(output) = scripted_noise.poll_output() {
