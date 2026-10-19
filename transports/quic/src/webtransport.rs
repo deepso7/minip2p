@@ -14,6 +14,13 @@
 //! stream is admitted after it. Prefixed streams that arrive before the
 //! session is authenticated (the Noise stream racing the 200, or streams
 //! racing Noise) are held with their data still in the engine.
+//!
+//! The session also ends orderly, in either direction: [`WtSession::close`]
+//! sends `CLOSE_WEBTRANSPORT_SESSION` and finishes the CONNECT stream, and a
+//! peer's capsule, CONNECT FIN or reset, or GOAWAY reports
+//! [`WtEvent::PeerClosed`]. The connection then waits for
+//! [`WtSession::peer_ended`] (or a deadline) before closing QUIC, so the
+//! capsule or a refusal's status reaches the peer.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -26,8 +33,8 @@ use minip2p_secure_mux::noise::{
 };
 use minip2p_webtransport::LIBP2P_WEBTRANSPORT_PATH;
 use minip2p_webtransport::h3::{
-    Frame, FrameDecoder, Settings, UniStreamHeaderDecoder, UniStreamType, code, encode_frame,
-    encode_uni_stream_type, frame_type, setting,
+    Capsule, CapsuleDecoder, Frame, FrameDecoder, Settings, UniStreamHeaderDecoder, UniStreamType,
+    code, encode_frame, encode_uni_stream_type, frame_type, setting,
 };
 use minip2p_webtransport::qpack::{QpackDecoder, encode_field_section};
 use quinn_proto::{Connection, Dir, ReadError, StreamId, VarInt};
@@ -53,6 +60,12 @@ pub(crate) enum WtEvent {
     Established { peer: PeerId, token: [u8; 32] },
     /// A prefixed peer stream is ready to surface, its prefix consumed.
     Admit(u64),
+    /// The peer ended the session (close capsule, CONNECT FIN or reset, or
+    /// GOAWAY) with this WebTransport code: finish our side and close.
+    PeerClosed { code: u32 },
+    /// The CONNECT was answered with an error status and finished: close
+    /// once the status is through.
+    Refused { reason: String },
     /// The session cannot go on: close the connection with this HTTP/3
     /// code.
     Fail { code: u64, reason: String },
@@ -72,10 +85,16 @@ enum PeerUni {
 struct Connect {
     id: u64,
     frames: FrameDecoder,
+    /// Reassembles capsules from the stream's DATA frames.
+    capsules: CapsuleDecoder,
     /// The status the request earns, before the client's SETTINGS weigh in.
     request_status: &'static str,
     /// The response went out: 200 accepts the session.
     replied: bool,
+    /// Our side is finished (or queued to finish).
+    finished: bool,
+    /// The peer finished or reset its side.
+    peer_ended: bool,
 }
 
 /// The Noise stream and its responder session.
@@ -105,6 +124,8 @@ pub(crate) struct WtSession {
     held: VecDeque<(u64, u64)>,
     noise: Option<NoiseStream>,
     established: bool,
+    /// The session is ending: only the CONNECT stream is read.
+    closing: bool,
     /// Bytes per stream the engine has not accepted yet, with whether a FIN
     /// follows them.
     out: HashMap<u64, (Vec<u8>, bool)>,
@@ -134,6 +155,7 @@ impl WtSession {
             held: VecDeque::new(),
             noise: None,
             established: false,
+            closing: false,
             out: HashMap::new(),
             events: Vec::new(),
         }
@@ -155,6 +177,57 @@ impl WtSession {
             || self.connect.as_ref().is_some_and(|c| c.id == raw)
             || self.noise.as_ref().is_some_and(|n| n.id == raw)
             || self.held.iter().any(|&(id, _)| id == raw)
+    }
+
+    /// Ends an accepted session from our side: a `CLOSE_WEBTRANSPORT_SESSION`
+    /// capsule with `code`, then FIN on the CONNECT stream. Returns whether
+    /// there was such a session to close; without one the connection has
+    /// nothing to wait for.
+    pub(crate) fn close(&mut self, conn: &mut Connection, code: u32) -> bool {
+        self.closing = true;
+        let Some(connect) = self
+            .connect
+            .as_mut()
+            .filter(|connect| connect.replied && connect.request_status == "200")
+        else {
+            return false;
+        };
+        if connect.finished {
+            return true;
+        }
+        connect.finished = true;
+        let id = connect.id;
+        let mut capsule = Vec::new();
+        let mut bytes = Vec::new();
+        let encoded = Capsule::CloseSession {
+            code,
+            reason: String::new(),
+        }
+        .encode(&mut capsule)
+        .and_then(|()| encode_frame(frame_type::DATA, &capsule, &mut bytes));
+        if encoded.is_err() {
+            bytes.clear();
+        }
+        self.send(conn, id, bytes, true);
+        true
+    }
+
+    /// Finishes our side of the CONNECT stream, once.
+    pub(crate) fn finish_connect(&mut self, conn: &mut Connection) {
+        self.closing = true;
+        if let Some(connect) = self.connect.as_mut().filter(|connect| !connect.finished) {
+            connect.finished = true;
+            let id = connect.id;
+            self.send(conn, id, Vec::new(), true);
+        }
+    }
+
+    /// Whether the peer is done with the session: it finished or reset its
+    /// side of the CONNECT stream, or never opened one.
+    pub(crate) fn peer_ended(&self) -> bool {
+        self.connect
+            .as_ref()
+            .is_none_or(|connect| connect.peer_ended)
     }
 
     /// What the connection must act on since the last call.
@@ -209,16 +282,19 @@ impl WtSession {
         self.on_readable(conn, raw);
     }
 
-    /// New data (or a FIN or reset) on a stream the session owns.
+    /// New data (or a FIN or reset) on a stream the session owns. While
+    /// closing only the CONNECT stream is read.
     pub(crate) fn on_readable(&mut self, conn: &mut Connection, raw: u64) {
-        if self.peer_uni.contains_key(&raw) {
-            self.read_uni(conn, raw);
-        } else if self.heads.contains_key(&raw) {
-            self.read_head(conn, raw);
-        } else if self.connect.as_ref().is_some_and(|c| c.id == raw) {
+        if self.connect.as_ref().is_some_and(|c| c.id == raw) {
             self.read_connect(conn);
-        } else if self.noise.as_ref().is_some_and(|n| n.id == raw) {
-            self.read_noise(conn);
+        } else if !self.closing {
+            if self.peer_uni.contains_key(&raw) {
+                self.read_uni(conn, raw);
+            } else if self.heads.contains_key(&raw) {
+                self.read_head(conn, raw);
+            } else if self.noise.as_ref().is_some_and(|n| n.id == raw) {
+                self.read_noise(conn);
+            }
         }
         self.flush(conn);
     }
@@ -260,6 +336,13 @@ impl WtSession {
 
     fn fail(&mut self, code: u64, reason: String) {
         self.events.push(WtEvent::Fail { code, reason });
+    }
+
+    /// The peer ended the session; reported once.
+    fn peer_closed(&mut self, code: u32) {
+        if !std::mem::replace(&mut self.closing, true) {
+            self.events.push(WtEvent::PeerClosed { code });
+        }
     }
 
     fn read_uni(&mut self, conn: &mut Connection, raw: u64) {
@@ -358,7 +441,8 @@ impl WtSession {
                     ));
                 }
                 Ok(Some(Frame::GoAway(_))) => {
-                    return Some((code::H3_NO_ERROR, "the client sent GOAWAY".into()));
+                    self.peer_closed(0);
+                    return None;
                 }
                 Ok(Some(frame)) => {
                     return Some((
@@ -466,8 +550,11 @@ impl WtSession {
         self.connect = Some(Connect {
             id: raw,
             frames,
+            capsules: CapsuleDecoder::new(),
             request_status,
             replied: false,
+            finished: false,
+            peer_ended: false,
         });
         self.reply(conn);
         self.read_connect(conn);
@@ -500,40 +587,55 @@ impl WtSession {
             self.fail(code::H3_INTERNAL_ERROR, "encoding a response failed".into());
             return;
         }
-        self.send(conn, id, bytes, false);
         if status != "200" {
-            self.fail(
-                code::H3_NO_ERROR,
-                format!("refused the WebTransport request with {status}"),
-            );
+            // The refusal ends the stream and the session; the connection
+            // closes once the status is through.
+            connect.finished = true;
+            self.closing = true;
+            self.send(conn, id, bytes, true);
+            self.events.push(WtEvent::Refused {
+                reason: format!("refused the WebTransport request with {status}"),
+            });
             return;
         }
+        self.send(conn, id, bytes, false);
         self.promote_held(conn);
     }
 
-    /// The CONNECT stream after its request: capsules are not read yet,
-    /// and its end ends the session.
+    /// The CONNECT stream after its request: capsules in its DATA frames,
+    /// where a close capsule ends the session, as does the stream's end.
     fn read_connect(&mut self, conn: &mut Connection) {
-        let Some(connect) = self.connect.as_mut() else {
+        let Some(connect) = self.connect.as_mut().filter(|c| !c.peer_ended) else {
             return;
         };
         let (bytes, end) = read_available(conn, connect.id);
         let mut input = &bytes[..];
-        loop {
+        let mut closed_with = None;
+        let failure = 'frames: loop {
             match connect.frames.decode(&mut input) {
+                Ok(Some(Frame::Data(mut chunk))) => loop {
+                    match connect.capsules.decode(&mut chunk) {
+                        Ok(Some(Capsule::CloseSession { code, .. })) => {
+                            closed_with.get_or_insert(code);
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(error) => break 'frames Some(error),
+                    }
+                },
                 Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(error) => {
-                    self.fail(error.code(), format!("CONNECT stream: {error}"));
-                    return;
-                }
+                Ok(None) => break None,
+                Err(error) => break Some(error),
             }
-        }
+        };
         if !matches!(end, ReadEnd::Open) {
-            self.fail(
-                code::H3_NO_ERROR,
-                "the client ended the WebTransport session".into(),
-            );
+            connect.peer_ended = true;
+            closed_with.get_or_insert(0);
+        }
+        if let Some(error) = failure {
+            self.fail(error.code(), format!("CONNECT stream: {error}"));
+        } else if let Some(code) = closed_with {
+            self.peer_closed(code);
         }
     }
 
