@@ -474,6 +474,15 @@ fn every_validation_matrix_row_closes_with_its_code() {
             code::H3_MISSING_SETTINGS,
         ),
         (
+            "an unknown frame before the control stream's SETTINGS",
+            |peer| {
+                let mut bytes = vec![0x21, 0x00];
+                bytes.extend_from_slice(&draft02_settings());
+                peer.control_bytes(&bytes);
+            },
+            code::H3_MISSING_SETTINGS,
+        ),
+        (
             "a second SETTINGS",
             |peer| {
                 peer.control_bytes(&after_settings(&draft02_settings()));

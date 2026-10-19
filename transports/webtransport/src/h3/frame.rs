@@ -47,8 +47,9 @@ pub struct FrameDecoder {
     state: State,
     reader: VarIntReader,
     buf: Vec<u8>,
-    /// Whether a frame has started; `0x41` is only legal before that.
-    started: bool,
+    /// The type of the stream's first frame, once read; `0x41` is only
+    /// legal as that first type.
+    first_type: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -87,8 +88,8 @@ impl FrameDecoder {
                     let Some(ty) = self.reader.read(input) else {
                         return Ok(None);
                     };
-                    let first = !self.started;
-                    self.started = true;
+                    let first = self.first_type.is_none();
+                    self.first_type.get_or_insert(ty);
                     if ty == frame_type::WEBTRANSPORT_STREAM {
                         if !first {
                             return Err(Error::Frame);
@@ -168,6 +169,13 @@ impl FrameDecoder {
     /// else ended mid-frame, which RFC 9114 §7.1 makes `H3_FRAME_ERROR`.
     pub fn is_at_frame_boundary(&self) -> bool {
         matches!(self.state, State::Type) && self.reader.is_empty()
+    }
+
+    /// The type of the stream's first frame, once its type is read, even if
+    /// that frame was skipped. A control stream checks it is SETTINGS
+    /// (RFC 9114 §6.2.1).
+    pub fn first_frame_type(&self) -> Option<u64> {
+        self.first_type
     }
 
     fn start_payload(&mut self, ty: u64, len: u64) -> Result<State, Error> {

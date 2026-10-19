@@ -565,9 +565,25 @@ impl WtSession {
         input: &mut &[u8],
     ) -> Option<(u64, String)> {
         loop {
-            match frames.decode(input) {
-                Ok(None) => return None,
-                Ok(Some(Frame::Settings(settings))) if !*saw_settings => {
+            let frame = match frames.decode(input) {
+                Ok(frame) => frame,
+                Err(error) => return Some((error.code(), format!("control stream: {error}"))),
+            };
+            // Checked by type, so a skipped unknown frame before SETTINGS
+            // fails too.
+            if !*saw_settings
+                && frames
+                    .first_frame_type()
+                    .is_some_and(|ty| ty != frame_type::SETTINGS)
+            {
+                return Some((
+                    code::H3_MISSING_SETTINGS,
+                    "the client's control stream did not start with SETTINGS".into(),
+                ));
+            }
+            match frame {
+                None => return None,
+                Some(Frame::Settings(settings)) if !*saw_settings => {
                     *saw_settings = true;
                     // Legality comes before any draft is chosen, so a bad
                     // value fails even beside a valid offer.
@@ -588,23 +604,16 @@ impl WtSession {
                     self.settings = Some(settings);
                     self.reply(conn);
                 }
-                Ok(Some(_)) if !*saw_settings => {
-                    return Some((
-                        code::H3_MISSING_SETTINGS,
-                        "the client's control stream did not start with SETTINGS".into(),
-                    ));
-                }
-                Ok(Some(Frame::GoAway(_))) => {
+                Some(Frame::GoAway(_)) => {
                     self.peer_closed(0);
                     return None;
                 }
-                Ok(Some(frame)) => {
+                Some(frame) => {
                     return Some((
                         code::H3_FRAME_UNEXPECTED,
                         format!("unexpected frame on the control stream: {frame:?}"),
                     ));
                 }
-                Err(error) => return Some((error.code(), format!("control stream: {error}"))),
             }
         }
     }
