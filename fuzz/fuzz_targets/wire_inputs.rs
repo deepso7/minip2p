@@ -656,11 +656,15 @@ fn fuzz_webtransport(data: &[u8]) {
     use minip2p_webtransport::h3::{
         CapsuleDecoder, Frame, FrameDecoder, Settings, UniStreamHeaderDecoder, varint,
     };
-    use minip2p_webtransport::qpack::{MAX_FIELD_SECTION_SIZE, MAX_FIELDS, QpackDecoder};
+    use minip2p_webtransport::qpack::{
+        DecoderStreamReader, MAX_FIELD_SECTION_SIZE, MAX_FIELDS, QpackDecoder,
+    };
 
     let _ = varint::decode(data);
     let _ = Settings::decode_payload(data);
     let _ = UniStreamHeaderDecoder::new().decode(&mut &data[..]);
+
+    let _ = DecoderStreamReader::new().read(data);
 
     let mut qpack = QpackDecoder::new();
     if let Ok(section) = qpack.decode(data) {

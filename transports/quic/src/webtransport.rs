@@ -5,7 +5,8 @@
 //! `Connected` on. It opens our control stream with SETTINGS, reads the
 //! client's control and QPACK streams, answers the CONNECT to
 //! [`LIBP2P_WEBTRANSPORT_PATH`] with 200 once the client's SETTINGS offer a
-//! draft we speak (draft-13/14 preferred, with its session flow control),
+//! draft we speak with HTTP/3 datagrams (draft-13/14 preferred, with its
+//! session flow control),
 //! and runs Noise XX as responder on the first stream with the
 //! session's `0x41` prefix. Its output is a list of [`WtEvent`]s for the
 //! connection to act on: authenticate, admit a stream, or fail.
@@ -44,7 +45,9 @@ use minip2p_webtransport::h3::{
     Capsule, CapsuleDecoder, Frame, FrameDecoder, Settings, UniStreamHeaderDecoder, UniStreamType,
     code, encode_frame, encode_uni_stream_type, frame_type, setting,
 };
-use minip2p_webtransport::qpack::{FieldSection, QpackDecoder, encode_field_section};
+use minip2p_webtransport::qpack::{
+    DecoderStreamReader, Field, FieldSection, QpackDecoder, encode_field_section,
+};
 use quinn_proto::{Connection, Dir, ReadError, StreamId, VarInt};
 
 /// Peer bidi streams open before the session is authenticated, other than
@@ -95,10 +98,20 @@ pub(crate) enum WtEvent {
 enum PeerUni {
     /// Its type is not known yet.
     Header(UniStreamHeaderDecoder),
-    /// The client's control stream; `bool` is whether SETTINGS arrived.
-    Control(FrameDecoder, bool),
+    /// The client's control stream.
+    Control(Control),
     QpackEncoder,
-    QpackDecoder,
+    QpackDecoder(DecoderStreamReader),
+}
+
+/// What the client's control stream said so far.
+#[derive(Default)]
+struct Control {
+    frames: FrameDecoder,
+    saw_settings: bool,
+    /// The client's latest MAX_PUSH_ID: we never push, but it bounds the
+    /// push ids CANCEL_PUSH may name (RFC 9114 §7.2.3).
+    max_push_id: Option<u64>,
 }
 
 /// The CONNECT stream once its request was read.
@@ -115,15 +128,17 @@ struct Connect {
     finished: bool,
     /// The peer finished or reset its side.
     peer_ended: bool,
+    /// The peer sent its trailer section: nothing may follow.
+    trailers: bool,
     /// The peer acknowledged our FIN, or stopped our side: nothing we
     /// sent on it is still in flight.
     delivered: bool,
 }
 
 /// The client's session flow-control credit for what we send (draft-13/14,
-/// once the client sent any `WT_INITIAL_MAX_*`): server-opened bidi streams,
-/// and stream bytes after their prefixes. Noise's handshake bytes are not
-/// counted.
+/// once the client offered more than one session or any nonzero
+/// `WT_INITIAL_MAX_*`): server-opened bidi streams, and stream bytes after
+/// their prefixes, Noise's replies included.
 #[derive(Debug, Default)]
 struct Credit {
     max_streams: u64,
@@ -159,6 +174,10 @@ struct NoiseStream {
     id: u64,
     /// `None` once the handshake completed.
     session: Option<NoiseSession>,
+    /// Replies the client's data credit does not cover yet.
+    pending: Vec<u8>,
+    /// A FIN follows `pending`.
+    fin: bool,
 }
 
 /// The WebTransport session of one `h3` connection.
@@ -333,6 +352,25 @@ impl WtSession {
         }
     }
 
+    /// The peer stopped our side of `raw`. Our control stream is critical
+    /// (RFC 9114 §6.2.1), so stopping it fails the connection; a stopped
+    /// CONNECT stream has nothing in flight. Returns whether `raw` is one of
+    /// the session's own streams, which the connection leaves alone.
+    pub(crate) fn on_stopped(&mut self, raw: u64) -> bool {
+        if self
+            .control
+            .is_some_and(|control| u64::from(control) == raw)
+        {
+            self.fail(
+                code::H3_CLOSED_CRITICAL_STREAM,
+                "the client stopped our control stream".into(),
+            );
+            return true;
+        }
+        self.on_send_done(raw);
+        self.owns(raw)
+    }
+
     /// What the connection must act on since the last call.
     pub(crate) fn take_events(&mut self) -> Vec<WtEvent> {
         std::mem::take(&mut self.events)
@@ -501,7 +539,7 @@ impl WtSession {
             state = match ty {
                 UniStreamType::Control if !self.has_control => {
                     self.has_control = true;
-                    PeerUni::Control(FrameDecoder::new(), false)
+                    PeerUni::Control(Control::default())
                 }
                 UniStreamType::QpackEncoder if !self.has_encoder => {
                     self.has_encoder = true;
@@ -509,7 +547,7 @@ impl WtSession {
                 }
                 UniStreamType::QpackDecoder if !self.has_decoder => {
                     self.has_decoder = true;
-                    PeerUni::QpackDecoder
+                    PeerUni::QpackDecoder(DecoderStreamReader::new())
                 }
                 UniStreamType::Control
                 | UniStreamType::QpackEncoder
@@ -520,28 +558,35 @@ impl WtSession {
                     );
                     return;
                 }
-                // Push, WebTransport uni and unknown streams: refused,
-                // never fatal.
-                UniStreamType::Push
-                | UniStreamType::WebTransport { .. }
-                | UniStreamType::Unknown(_) => {
+                // Only a server may open a push stream (RFC 9114 §6.2.2).
+                UniStreamType::Push => {
+                    self.fail(
+                        code::H3_STREAM_CREATION_ERROR,
+                        "the client opened a push stream".into(),
+                    );
+                    return;
+                }
+                // WebTransport uni and unknown streams: refused, never fatal.
+                UniStreamType::WebTransport { .. } | UniStreamType::Unknown(_) => {
                     stop(conn, raw, code::H3_STREAM_CREATION_ERROR);
                     return;
                 }
             };
         }
         let failure = match &mut state {
-            PeerUni::Control(frames, saw_settings) => {
-                self.read_control(conn, frames, saw_settings, &mut input)
-            }
+            PeerUni::Control(control) => self.read_control(conn, control, &mut input),
             // The table capacity is 0, so every encoder instruction is
             // illegal.
             PeerUni::QpackEncoder if !input.is_empty() => Some((
                 code::QPACK_ENCODER_STREAM_ERROR,
                 "QPACK encoder instruction with a zero table capacity".into(),
             )),
-            // Decoder instructions only acknowledge a table we never use.
-            PeerUni::QpackEncoder | PeerUni::QpackDecoder | PeerUni::Header(_) => None,
+            // Only Stream Cancellation is legal: we never insert.
+            PeerUni::QpackDecoder(reader) => reader
+                .read(input)
+                .err()
+                .map(|error| (error.code(), format!("QPACK decoder stream: {error}"))),
+            PeerUni::QpackEncoder | PeerUni::Header(_) => None,
         };
         if let Some((code, reason)) = failure {
             self.fail(code, reason);
@@ -556,15 +601,20 @@ impl WtSession {
     }
 
     /// Decodes the client's control frames: SETTINGS first, then nothing
-    /// but GOAWAY (which ends the session) and frames HTTP/3 skips. Returns
-    /// the code and reason of a connection error.
+    /// but GOAWAY (which ends the session), the push frames (checked, though
+    /// we never push) and frames HTTP/3 skips. Returns the code and reason of
+    /// a connection error.
     fn read_control(
         &mut self,
         conn: &mut Connection,
-        frames: &mut FrameDecoder,
-        saw_settings: &mut bool,
+        control: &mut Control,
         input: &mut &[u8],
     ) -> Option<(u64, String)> {
+        let Control {
+            frames,
+            saw_settings,
+            max_push_id,
+        } = control;
         loop {
             let frame = match frames.decode(input) {
                 Ok(frame) => frame,
@@ -608,6 +658,16 @@ impl WtSession {
                 Some(Frame::GoAway(_)) => {
                     self.peer_closed(0);
                     return None;
+                }
+                Some(Frame::MaxPushId(id)) if max_push_id.is_none_or(|max| id >= max) => {
+                    *max_push_id = Some(id);
+                }
+                Some(Frame::CancelPush(id)) if max_push_id.is_some_and(|max| id <= max) => {}
+                Some(Frame::MaxPushId(_) | Frame::CancelPush(_)) => {
+                    return Some((
+                        code::H3_ID_ERROR,
+                        "a push id past the client's MAX_PUSH_ID, or a smaller MAX_PUSH_ID".into(),
+                    ));
                 }
                 Some(frame) => {
                     return Some((
@@ -709,10 +769,10 @@ impl WtSession {
             replied: false,
             finished: false,
             peer_ended: false,
+            trailers: false,
             delivered: false,
         });
         self.reply(conn);
-        self.read_connect(conn);
     }
 
     /// Answers the CONNECT once both it and the client's SETTINGS are in.
@@ -726,24 +786,35 @@ impl WtSession {
         }
         connect.replied = true;
         // The highest draft both sides speak: 13/14 (Safari), else 02
-        // (Chrome, Firefox).
-        let draft14 = settings
-            .get(setting::WT_MAX_SESSIONS)
-            .is_some_and(|sessions| sessions >= 1);
-        let draft02 = settings.get(setting::ENABLE_WEBTRANSPORT) == Some(1);
+        // (Chrome, Firefox). Both need HTTP/3 datagrams, in SETTINGS and as
+        // the QUIC transport parameter (draft-14 §3.1, draft-02 §3.1);
+        // every browser sends both.
+        let datagrams = settings.get(setting::H3_DATAGRAM) == Some(1)
+            && conn.datagrams().max_size().is_some_and(|size| size > 0);
+        let draft14 = datagrams
+            && settings
+                .get(setting::WT_MAX_SESSIONS)
+                .is_some_and(|sessions| sessions >= 1);
+        let draft02 = datagrams && settings.get(setting::ENABLE_WEBTRANSPORT) == Some(1);
         let status = if draft14 || draft02 {
             connect.request_status
         } else {
             "400"
         };
-        // Draft-13/14 flow control is on once both sides sent a limit; ours
-        // are 2^60, so only the client's ever bind.
+        // Draft-13/14 flow control is on once both sides ask for it, with
+        // more than one session or a nonzero initial limit (draft-14 §5.1);
+        // ours are 2^60, so only the client's limits ever bind, and an
+        // omitted one is 0.
         let limits = [
             setting::WT_INITIAL_MAX_DATA,
             setting::WT_INITIAL_MAX_STREAMS_BIDI,
             setting::WT_INITIAL_MAX_STREAMS_UNI,
         ];
-        if draft14 && limits.iter().any(|&id| settings.get(id).unwrap_or(0) > 0) {
+        let flow_control = settings
+            .get(setting::WT_MAX_SESSIONS)
+            .is_some_and(|sessions| sessions > 1)
+            || limits.iter().any(|&id| settings.get(id).unwrap_or(0) > 0);
+        if draft14 && flow_control {
             self.credit = Some(Credit {
                 max_streams: settings
                     .get(setting::WT_INITIAL_MAX_STREAMS_BIDI)
@@ -769,24 +840,34 @@ impl WtSession {
             self.events.push(WtEvent::Refused {
                 reason: format!("refused the WebTransport request with {status}"),
             });
-            return;
+        } else {
+            self.send(conn, id, bytes, false);
+            self.promote_held(conn);
         }
-        self.send(conn, id, bytes, false);
-        self.promote_held(conn);
+        // What waited for the response, and the stream's end.
+        self.read_connect(conn);
     }
 
-    /// The CONNECT stream after its request: capsules in its DATA frames,
+    /// The CONNECT stream once it was answered: capsules in its DATA frames,
     /// which raise the client's credit or close the session, as does the
-    /// stream's end.
+    /// stream's end. Until the answer nothing is read, so no capsule acts on
+    /// a session not yet accepted (RFC 9297 §3.2); the stream's receive
+    /// window bounds what waits.
     fn read_connect(&mut self, conn: &mut Connection) {
-        let Some(connect) = self.connect.as_mut().filter(|c| !c.peer_ended) else {
+        let Some(connect) = self.connect.as_mut().filter(|c| c.replied && !c.peer_ended) else {
             return;
         };
         let (bytes, end) = read_available(conn, connect.id);
         let mut input = &bytes[..];
         let mut closed_with = None;
-        let failure = 'frames: loop {
+        let unexpected =
+            |what: &str| Some((code::H3_FRAME_UNEXPECTED, format!("CONNECT stream: {what}")));
+        let mut failure = 'frames: loop {
             match connect.frames.decode(&mut input) {
+                // Trailers end the message (RFC 9114 §4.1).
+                Ok(Some(Frame::Data(_) | Frame::Headers(_))) if connect.trailers => {
+                    break unexpected("a frame after the trailer section");
+                }
                 Ok(Some(Frame::Data(mut chunk))) => loop {
                     match connect.capsules.decode(&mut chunk) {
                         Ok(Some(Capsule::CloseSession { code, .. })) => {
@@ -798,15 +879,33 @@ impl WtSession {
                             }
                         }
                         Ok(None) => break,
-                        Err(error) => break 'frames Some(error),
+                        Err(error) => {
+                            break 'frames Some((error.code(), format!("CONNECT stream: {error}")));
+                        }
                     }
                 },
-                Ok(Some(_)) => {}
+                Ok(Some(Frame::Headers(block))) => {
+                    connect.trailers = true;
+                    let mut decoder = QpackDecoder::new();
+                    match decoder.decode(&block) {
+                        Ok(section) if section.iter().all(|field| valid_regular_field(&field)) => {}
+                        Ok(_) => {
+                            break Some((
+                                code::H3_MESSAGE_ERROR,
+                                "CONNECT stream: a malformed trailer section".into(),
+                            ));
+                        }
+                        Err(error) => {
+                            break Some((error.code(), format!("CONNECT trailers: {error}")));
+                        }
+                    }
+                }
+                // Control-stream frames.
+                Ok(Some(frame)) => break unexpected(&format!("{frame:?}")),
                 Ok(None) => break None,
-                Err(error) => break Some(error),
+                Err(error) => break Some((error.code(), format!("CONNECT stream: {error}"))),
             }
         };
-        let mut failure = failure.map(|error| (error.code(), format!("CONNECT stream: {error}")));
         if !matches!(end, ReadEnd::Open) {
             connect.peer_ended = true;
             closed_with.get_or_insert(0);
@@ -830,12 +929,25 @@ impl WtSession {
             self.fail(code, reason);
         } else if let Some(code) = closed_with {
             self.peer_closed(code);
+        } else {
+            // New credit may release Noise replies.
+            self.release_noise(conn);
         }
     }
 
     /// A stream with a WebTransport prefix: admitted once the session is
     /// authenticated, held until then.
     fn on_prefixed(&mut self, conn: &mut Connection, raw: u64, session_id: u64) {
+        // A session id is a CONNECT stream's: client-initiated bidi, so a
+        // multiple of 4. Any other cannot name a session at all (draft-14
+        // §4), unlike a valid id that is not ours.
+        if !session_id.is_multiple_of(4) {
+            self.fail(
+                code::H3_ID_ERROR,
+                format!("a stream named session {session_id}, not a request stream id"),
+            );
+            return;
+        }
         if self.established {
             if Some(session_id) == self.session_id() {
                 self.events.push(WtEvent::Admit {
@@ -946,8 +1058,32 @@ impl WtSession {
         self.noise = Some(NoiseStream {
             id: held.id,
             session: Some(session),
+            pending: Vec::new(),
+            fin: false,
         });
         self.feed_noise(conn, held.data, held.end);
+    }
+
+    /// Writes as much of the Noise replies as the client's data credit
+    /// allows (draft-14 §5.4: they are stream data like any other), and
+    /// the FIN after the last.
+    fn release_noise(&mut self, conn: &mut Connection) {
+        let room = self.data_room();
+        let Some(noise) = self.noise.as_mut() else {
+            return;
+        };
+        let take = room.min(noise.pending.len());
+        let bytes: Vec<u8> = noise.pending.drain(..take).collect();
+        let fin = std::mem::take(&mut noise.fin);
+        // The FIN waits for the last byte.
+        noise.fin = fin && !noise.pending.is_empty();
+        let fin = fin && noise.pending.is_empty();
+        let raw = noise.id;
+        if bytes.is_empty() && !fin {
+            return;
+        }
+        self.note_sent(take);
+        self.send(conn, raw, bytes, fin);
     }
 
     /// Reads the Noise stream into the responder.
@@ -967,7 +1103,6 @@ impl WtSession {
         let Some(noise) = self.noise.as_mut() else {
             return;
         };
-        let raw = noise.id;
         let Some(session) = noise.session.as_mut() else {
             // Done: whatever follows is ignored.
             return;
@@ -991,9 +1126,9 @@ impl WtSession {
             }
         }
         let token = session.handshake_hash();
-        if !outbound.is_empty() || peer.is_some() {
-            self.send(conn, raw, outbound, peer.is_some());
-        }
+        noise.pending.extend_from_slice(&outbound);
+        noise.fin |= peer.is_some();
+        self.release_noise(conn);
         if let (Some(peer), Some(token)) = (peer, token) {
             if let Some(noise) = self.noise.as_mut() {
                 noise.session = None;
@@ -1017,7 +1152,9 @@ impl WtSession {
 /// Well formed means exactly one each of `:method CONNECT`, `:protocol
 /// webtransport` (the token drafts 02 and 13/14 share; draft-15's
 /// `webtransport-h3` is not served), `:scheme https`, `:authority` and
-/// `:path`, no other pseudo-header, and none after a regular field.
+/// `:path`, no other pseudo-header, and none after a regular field; a
+/// nonempty `:authority` without userinfo; no NUL, CR or LF in any value;
+/// and only valid regular fields ([`valid_regular_field`]).
 fn request_status(section: &FieldSection<'_>) -> &'static str {
     const PSEUDO: [&[u8]; 5] = [
         b":method",
@@ -1030,8 +1167,14 @@ fn request_status(section: &FieldSection<'_>) -> &'static str {
     let mut regular = false;
     for field in section.iter() {
         if !field.name.starts_with(b":") {
+            if !valid_regular_field(&field) {
+                return "400";
+            }
             regular = true;
             continue;
+        }
+        if !valid_value(field.value) {
+            return "400";
         }
         let slot = PSEUDO
             .iter()
@@ -1046,13 +1189,18 @@ fn request_status(section: &FieldSection<'_>) -> &'static str {
         Some(method),
         Some(protocol),
         Some(scheme),
-        Some(_),
+        Some(authority),
         Some(path),
     ] = values
     else {
         return "400";
     };
-    if method != b"CONNECT" || protocol != b"webtransport" || scheme != b"https" {
+    if method != b"CONNECT"
+        || protocol != b"webtransport"
+        || scheme != b"https"
+        || authority.is_empty()
+        || authority.contains(&b'@')
+    {
         return "400";
     }
     let (want_path, _) = LIBP2P_WEBTRANSPORT_PATH
@@ -1065,6 +1213,35 @@ fn request_status(section: &FieldSection<'_>) -> &'static str {
     } else {
         "404"
     }
+}
+
+/// Whether a regular (non-pseudo) field may appear in a request or its
+/// trailers (RFC 9114 §4.2, RFC 9110 §5): a lowercase token name, a value
+/// without NUL, CR or LF, and none of HTTP/1.1's connection-specific fields
+/// (`te` only as `trailers`).
+fn valid_regular_field(field: &Field<'_>) -> bool {
+    const CONNECTION_SPECIFIC: [&[u8]; 5] = [
+        b"connection",
+        b"keep-alive",
+        b"proxy-connection",
+        b"transfer-encoding",
+        b"upgrade",
+    ];
+    let token = |byte: u8| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    };
+    !field.name.is_empty()
+        && field.name.iter().all(|&byte| token(byte))
+        && valid_value(field.value)
+        && !CONNECTION_SPECIFIC.contains(&field.name)
+        && (field.name != b"te" || field.value == b"trailers")
+}
+
+/// Whether a field value is free of NUL, CR and LF (RFC 9114 §4.1.2).
+fn valid_value(value: &[u8]) -> bool {
+    !value
+        .iter()
+        .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
 }
 
 /// The engine's id for a raw stream id.

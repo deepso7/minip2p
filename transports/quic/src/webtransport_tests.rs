@@ -14,7 +14,7 @@ use minip2p_webtransport::h3::{
     encode_uni_stream_type, encode_webtransport_bidi_header, frame_type, setting,
 };
 use minip2p_webtransport::qpack::{QpackDecoder, encode_field_section};
-use quinn_proto::{ConnectionError, Dir, Event, StreamEvent};
+use quinn_proto::{ConnectionError, Dir, Event, StreamEvent, VarInt};
 
 use super::*;
 use crate::test_peer::{RawPeer, foreign_client_config, now};
@@ -53,10 +53,25 @@ struct H3Peer {
 impl H3Peer {
     /// Connects and drives until the QUIC handshake completes.
     fn connect(server: &mut QuicTransport, events: &mut Vec<TransportEvent>) -> Self {
-        let raw = RawPeer::connect_with(
-            server.local_addr(),
-            foreign_client_config(&[b"h3"], None, Arc::default()),
-        );
+        Self::connect_tuned(server, events, |_| {})
+    }
+
+    /// [`Self::connect`] with transport parameters a browser would send,
+    /// then adjusted by `tune`.
+    fn connect_tuned(
+        server: &mut QuicTransport,
+        events: &mut Vec<TransportEvent>,
+        tune: impl FnOnce(&mut quinn_proto::TransportConfig),
+    ) -> Self {
+        let mut config = foreign_client_config(&[b"h3"], None, Arc::default());
+        // Room for the server's control stream, and QUIC DATAGRAM support.
+        let mut transport = crate::test_peer::default_transport();
+        transport
+            .max_concurrent_uni_streams(VarInt::from_u32(3))
+            .datagram_receive_buffer_size(Some(64 * 1024));
+        tune(&mut transport);
+        config.transport_config(Arc::new(transport));
+        let raw = RawPeer::connect_with(server.local_addr(), config);
         let mut peer = Self {
             raw,
             connect: None,
@@ -401,6 +416,13 @@ fn after_settings(frames: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// Offers draft-02, sends the libp2p CONNECT, then `frames` on it.
+fn connect_then(peer: &mut H3Peer, frames: &[u8]) {
+    peer.control(DRAFT02);
+    let connect = peer.libp2p_connect();
+    assert_eq!(peer.raw.write(connect, frames), frames.len());
+}
+
 /// A GOAWAY frame for stream 0.
 const GOAWAY: &[u8] = &[0x07, 0x01, 0x00];
 
@@ -465,6 +487,58 @@ fn every_validation_matrix_row_closes_with_its_code() {
                 peer.raw.finish(encoder);
             },
             code::H3_CLOSED_CRITICAL_STREAM,
+        ),
+        (
+            "a client push stream",
+            |peer| {
+                peer.uni(&[0x01, 0x00]);
+            },
+            code::H3_STREAM_CREATION_ERROR,
+        ),
+        (
+            "an Insert Count Increment of 0 on the QPACK decoder stream",
+            |peer| {
+                peer.uni(&[0x03, 0x00]);
+            },
+            code::QPACK_DECODER_STREAM_ERROR,
+        ),
+        (
+            "a Section Acknowledgment on the QPACK decoder stream",
+            |peer| {
+                peer.uni(&[0x03, 0x80]);
+            },
+            code::QPACK_DECODER_STREAM_ERROR,
+        ),
+        (
+            "CANCEL_PUSH before any MAX_PUSH_ID",
+            |peer| {
+                peer.control_bytes(&after_settings(&[0x03, 0x01, 0x00]));
+            },
+            code::H3_ID_ERROR,
+        ),
+        (
+            "CANCEL_PUSH past MAX_PUSH_ID",
+            |peer| {
+                peer.control_bytes(&after_settings(&[0x0d, 0x01, 0x02, 0x03, 0x01, 0x03]));
+            },
+            code::H3_ID_ERROR,
+        ),
+        (
+            "a smaller MAX_PUSH_ID",
+            |peer| {
+                peer.control_bytes(&after_settings(&[0x0d, 0x01, 0x02, 0x0d, 0x01, 0x01]));
+            },
+            code::H3_ID_ERROR,
+        ),
+        (
+            "a prefixed stream naming an impossible session",
+            |peer| {
+                peer.control(DRAFT02);
+                // Not a client-initiated bidi stream id.
+                peer.connect = Some(1);
+                peer.wt_stream(b"early");
+            },
+            code::H3_ID_ERROR,
         ),
         (
             "a control stream not starting with SETTINGS",
@@ -582,6 +656,38 @@ fn every_validation_matrix_row_closes_with_its_code() {
                 peer.control_bytes(&after_settings(GOAWAY));
             },
             code::H3_NO_ERROR,
+        ),
+        (
+            "SETTINGS on the CONNECT stream",
+            |peer| connect_then(peer, &draft02_settings()),
+            code::H3_FRAME_UNEXPECTED,
+        ),
+        (
+            "CANCEL_PUSH on the CONNECT stream",
+            |peer| connect_then(peer, &[0x03, 0x01, 0x00]),
+            code::H3_FRAME_UNEXPECTED,
+        ),
+        (
+            "a trailer section QPACK cannot decode",
+            |peer| connect_then(peer, &[0x01, 0x03, 0x01, 0x00, 0x80]),
+            code::QPACK_DECOMPRESSION_FAILED,
+        ),
+        (
+            "a pseudo-header in a trailer section",
+            |peer| connect_then(peer, &[0x01, 0x03, 0x00, 0x00, 0xd9]),
+            code::H3_MESSAGE_ERROR,
+        ),
+        (
+            "DATA after a trailer section",
+            |peer| {
+                let mut frames = Vec::new();
+                let mut block = Vec::new();
+                encode_field_section([(&b"x-trailer"[..], &b"1"[..])], &mut block);
+                encode_frame(frame_type::HEADERS, &block, &mut frames).expect("HEADERS");
+                frames.extend([0x00, 0x00]);
+                connect_then(peer, &frames);
+            },
+            code::H3_FRAME_UNEXPECTED,
         ),
         (
             "the CONNECT stream finished mid-frame",
@@ -709,6 +815,33 @@ fn connect_requests_are_checked_field_by_field() {
             with(b":protocol", b"webtransport-h3"),
             "400",
         ),
+        ("an empty :authority", with(b":authority", b""), "400"),
+        (
+            "userinfo in :authority",
+            with(b":authority", b"user@127.0.0.1"),
+            "400",
+        ),
+        (
+            "a CR LF in :path",
+            with(
+                b":path",
+                b"/.well-known/libp2p-webtransport?type=noise\r\nx: y",
+            ),
+            "400",
+        ),
+        (
+            "an uppercase field name",
+            plus((b"Origin", b"https://example.com")),
+            "400",
+        ),
+        (
+            "a connection-specific field",
+            plus((b"connection", b"keep-alive")),
+            "400",
+        ),
+        ("te other than trailers", plus((b"te", b"gzip")), "400"),
+        ("a CR LF in a value", plus((b"x-test", b"a\r\nb")), "400"),
+        ("an empty field name", plus((b"", b"value")), "400"),
     ];
     for (row, fields, expected) in rows {
         assert_eq!(refused_with(DRAFT02, &fields), expected, "{row}");
@@ -744,6 +877,60 @@ fn a_boolean_setting_other_than_0_or_1_is_a_settings_error_whatever_else_is_offe
         });
         assert_eq!(code, code::H3_SETTINGS_ERROR, "{settings:?}: {reason}");
     }
+}
+
+#[test]
+fn chrome_and_firefox_connect_captures_are_accepted() {
+    let captures: [&[u8]; 2] = [
+        include_bytes!("../../webtransport/tests/fixtures/chrome_connect_headers.bin"),
+        include_bytes!("../../webtransport/tests/fixtures/firefox_connect_headers.bin"),
+    ];
+    for capture in captures {
+        let mut server = server();
+        let mut events = Vec::new();
+        let mut peer = H3Peer::connect(&mut server, &mut events);
+        peer.control(DRAFT02);
+        let stream = peer.raw.open();
+        assert_eq!(peer.raw.write(stream, capture), capture.len());
+        peer.connect = Some(stream);
+        peer.authenticate(&mut server, &mut events);
+        assert_eq!(peer.status().as_deref(), Some("200"));
+    }
+}
+
+#[test]
+fn a_client_without_http_datagrams_is_refused() {
+    let without = |offer: &[(u64, u64)]| {
+        let mut settings = offer.to_vec();
+        settings.retain(|&(id, _)| id != setting::H3_DATAGRAM);
+        settings
+    };
+    let disabled = |offer: &[(u64, u64)]| {
+        let mut settings = without(offer);
+        settings.push((setting::H3_DATAGRAM, 0));
+        settings
+    };
+    let fields = libp2p_request(b"webtransport");
+    for settings in [
+        without(DRAFT02),
+        disabled(DRAFT02),
+        without(DRAFT14),
+        disabled(DRAFT14),
+    ] {
+        assert_eq!(refused_with(&settings, &fields), "400", "{settings:?}");
+    }
+
+    // H3_DATAGRAM offered, but no QUIC DATAGRAM transport parameter.
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect_tuned(&mut server, &mut events, |transport| {
+        transport.datagram_receive_buffer_size(None);
+    });
+    peer.control(DRAFT02);
+    peer.libp2p_connect();
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
+    assert_eq!(code, code::H3_NO_ERROR, "{reason}");
+    assert_eq!(peer.status().as_deref(), Some("400"));
 }
 
 #[test]
@@ -863,22 +1050,104 @@ fn draft14_server_streams_wait_for_the_clients_stream_credit() {
 }
 
 #[test]
-fn draft14_server_bytes_wait_for_the_clients_data_credit() {
+fn more_than_one_session_enables_flow_control_with_zero_initial_credit() {
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    // No WT_INITIAL_MAX_*: offering two sessions alone asks for flow
+    // control, and the omitted limits are 0.
+    peer.control(&[(setting::WT_MAX_SESSIONS, 2), (setting::H3_DATAGRAM, 1)]);
+    peer.libp2p_connect();
+    // Data credit for the Noise reply and what follows; no stream credit.
+    peer.capsule(&Capsule::MaxData(1 << 20));
+    peer.authenticate(&mut server, &mut events);
+    let id = events
+        .iter()
+        .find_map(|event| match event {
+            TransportEvent::Connected { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("connected");
+    let streams = [server_stream(&mut server, id, b"a")];
+    let mut read = [None];
+    assert_eq!(settle(&mut server, &mut peer, &streams, &mut read), [None]);
+
+    peer.capsule(&Capsule::MaxStreamsBidi(1));
+    assert_eq!(
+        settle(&mut server, &mut peer, &streams, &mut read),
+        [Some(b"a".to_vec())]
+    );
+}
+
+#[test]
+fn draft14_noise_replies_and_server_bytes_wait_for_the_clients_data_credit() {
     let mut settings = DRAFT14.to_vec();
     settings.retain(|&(id, _)| id != setting::WT_INITIAL_MAX_DATA);
-    settings.push((setting::WT_INITIAL_MAX_DATA, 4));
-    let (mut server, mut peer, id) = established(&settings);
-    let streams = [server_stream(&mut server, id, b"0123456789")];
-    let mut read = [None];
+    settings.push((setting::WT_INITIAL_MAX_DATA, 1));
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(&settings);
+    peer.libp2p_connect();
+    let mut noise = initiator();
+    let stream = peer.wt_stream(&outbound(&mut noise).0);
+    let mut reply = 0;
+    let mut read = |peer: &mut H3Peer, noise: &mut NoiseSession| {
+        let (bytes, _) = peer.raw.read(stream);
+        reply += bytes.len();
+        if !bytes.is_empty() {
+            noise.on_data(bytes).expect("noise data");
+        }
+        reply
+    };
+    let until = Instant::now() + Duration::from_millis(100);
+    peer.drive(&mut server, &mut events, "a while", |peer, _| {
+        read(peer, &mut noise);
+        Instant::now() >= until
+    });
+    assert_eq!(read(&mut peer, &mut noise), 1, "one byte of credit");
+
+    // The rest of the reply once credit allows, then the last message.
+    peer.capsule(&Capsule::MaxData(4096));
+    let mut last = None;
+    peer.drive(&mut server, &mut events, "the Noise reply", |peer, _| {
+        read(peer, &mut noise);
+        let (out, complete) = outbound(&mut noise);
+        if complete {
+            last = Some(out);
+        }
+        complete
+    });
+    let last = last.expect("the last message");
+    assert_eq!(peer.raw.write(stream, &last), last.len());
+    peer.drive(&mut server, &mut events, "Connected", |_, events| {
+        connected(events)
+    });
+    let id = events
+        .iter()
+        .find_map(|event| match event {
+            TransportEvent::Connected { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("connected");
+
+    // The reply's bytes stay spent: a stream gets only what is left.
+    let left = 4096 - read(&mut peer, &mut noise);
+    let stream = server.open_stream(id).expect("open");
+    server
+        .send_stream(id, stream, Bytes::from(vec![7u8; 4096]))
+        .expect("send");
+    let streams = [stream.as_u64()];
+    let mut seen = [None];
     assert_eq!(
-        settle(&mut server, &mut peer, &streams, &mut read),
-        [Some(b"0123".to_vec())]
+        settle(&mut server, &mut peer, &streams, &mut seen),
+        [Some(vec![7u8; left])]
     );
 
-    peer.capsule(&Capsule::MaxData(10));
+    peer.capsule(&Capsule::MaxData(8192));
     assert_eq!(
-        settle(&mut server, &mut peer, &streams, &mut read),
-        [Some(b"0123456789".to_vec())]
+        settle(&mut server, &mut peer, &streams, &mut seen),
+        [Some(vec![7u8; 4096])]
     );
 }
 
@@ -1229,6 +1498,129 @@ fn a_failed_noise_handshake_closes_with_an_error_code() {
             "{row}: closed with {code:#x} ({reason})"
         );
     }
+}
+
+#[test]
+fn legal_push_and_qpack_instructions_leave_the_session_up() {
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    // MAX_PUSH_ID 2, CANCEL_PUSH 2, MAX_PUSH_ID 2 again.
+    peer.control_bytes(&after_settings(&[
+        0x0d, 0x01, 0x02, 0x03, 0x01, 0x02, 0x0d, 0x01, 0x02,
+    ]));
+    // Stream Cancellations of streams 0 and 1000.
+    peer.uni(&[0x03, 0x40, 0x7f, 0xa9, 0x0f]);
+    peer.libp2p_connect();
+    peer.authenticate(&mut server, &mut events);
+}
+
+#[test]
+fn an_impossible_session_id_after_authentication_closes_the_connection() {
+    let (mut server, mut peer, _) = established(DRAFT02);
+    let session = peer.connect.replace(2);
+    peer.wt_stream(b"data");
+    peer.connect = session;
+    let (code, reason) = peer.closed_with(&mut server, &mut Vec::new());
+    assert_eq!(code, code::H3_ID_ERROR, "{reason}");
+}
+
+/// Accepts the server's control stream and sends STOP_SENDING on it.
+fn stop_server_control(
+    peer: &mut H3Peer,
+    server: &mut QuicTransport,
+    events: &mut Vec<TransportEvent>,
+) {
+    let mut control = None;
+    peer.drive(server, events, "the server's control stream", |peer, _| {
+        control = control.or_else(|| peer.raw.conn().streams().accept(Dir::Uni));
+        control.is_some()
+    });
+    peer.raw
+        .stop(u64::from(control.expect("control stream")), 0);
+}
+
+#[test]
+fn stopping_the_servers_control_stream_closes_the_connection() {
+    // Before the session is accepted.
+    let (code, reason) = {
+        let mut server = server();
+        let mut events = Vec::new();
+        let mut peer = H3Peer::connect(&mut server, &mut events);
+        peer.control(DRAFT02);
+        stop_server_control(&mut peer, &mut server, &mut events);
+        peer.closed_with(&mut server, &mut events)
+    };
+    assert_eq!(code, code::H3_CLOSED_CRITICAL_STREAM, "{reason}");
+
+    // After authentication.
+    let (mut server, mut peer, _) = established(DRAFT02);
+    let mut events = Vec::new();
+    stop_server_control(&mut peer, &mut server, &mut events);
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
+    assert_eq!(code, code::H3_CLOSED_CRITICAL_STREAM, "{reason}");
+}
+
+#[test]
+fn capsules_wait_for_the_session_to_be_accepted() {
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    // CONNECT and a CLOSE capsule, with no SETTINGS yet to accept it.
+    peer.libp2p_connect();
+    peer.capsule(&Capsule::CloseSession {
+        code: 42,
+        reason: String::new(),
+    });
+    let until = Instant::now() + Duration::from_millis(100);
+    peer.drive(&mut server, &mut events, "a while", |_, _| {
+        Instant::now() >= until
+    });
+    assert!(!server_closed(&events), "{events:?}");
+    assert_eq!(peer.status(), None);
+
+    // Accepted, then closed by the capsule that waited.
+    peer.control(DRAFT02);
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
+    assert_eq!(code, code::H3_NO_ERROR, "{reason}");
+    assert_eq!(peer.status().as_deref(), Some("200"));
+    assert_eq!(
+        close_reason(&events),
+        Some(&ConnectionCloseReason::Remote { code: 42 })
+    );
+}
+
+#[test]
+fn a_one_stream_limit_still_authenticates_and_carries_one_stream() {
+    let mut server = server_with(QuicLimits {
+        max_streams_per_connection: 1,
+        ..QuicLimits::default()
+    });
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(DRAFT02);
+    peer.libp2p_connect();
+    // The CONNECT and Noise streams come on top of the limit.
+    peer.drive(&mut server, &mut events, "the 200", |peer, _| {
+        peer.status().is_some()
+    });
+    peer.authenticate(&mut server, &mut events);
+    let mut stream = None;
+    peer.drive(&mut server, &mut events, "stream credit", |peer, _| {
+        stream = peer.raw.conn().streams().open(Dir::Bi).map(u64::from);
+        stream.is_some()
+    });
+    let stream = stream.expect("stream");
+    let mut data = Vec::new();
+    encode_webtransport_bidi_header(peer.connect.expect("session"), &mut data).expect("prefix");
+    data.extend_from_slice(b"app");
+    assert_eq!(peer.raw.write(stream, &data), data.len());
+    peer.drive(
+        &mut server,
+        &mut events,
+        "the application stream",
+        |_, events| crate::test_peer::stream_bytes(events, stream) == b"app",
+    );
 }
 
 #[test]

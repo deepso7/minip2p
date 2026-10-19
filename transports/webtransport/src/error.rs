@@ -27,6 +27,10 @@ pub enum Error {
     /// passed the decoded size or field-count cap.
     #[error("QPACK decompression failed")]
     QpackDecompressionFailed,
+    /// The peer's QPACK decoder stream carried an instruction that refers
+    /// to a dynamic table this encoder never uses.
+    #[error("invalid QPACK decoder stream instruction")]
+    QpackDecoderStream,
 }
 
 impl Error {
@@ -39,6 +43,7 @@ impl Error {
             Error::ExcessiveLoad => code::H3_EXCESSIVE_LOAD,
             Error::Message => code::H3_MESSAGE_ERROR,
             Error::QpackDecompressionFailed => code::QPACK_DECOMPRESSION_FAILED,
+            Error::QpackDecoderStream => code::QPACK_DECODER_STREAM_ERROR,
         }
     }
 }

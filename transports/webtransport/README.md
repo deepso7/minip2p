@@ -7,7 +7,7 @@ It owns no streams, sockets or clocks. A caller feeds the bytes of one QUIC stre
 ## `h3`
 
 - `varint`: QUIC variable-length integers.
-- `FrameDecoder`: DATA, HEADERS, SETTINGS and GOAWAY frames. DATA payloads stream through as borrowed chunks; HEADERS (16 KiB), SETTINGS (4 KiB) and GOAWAY are buffered whole within their caps, checked before allocating. Unknown and reserved (GREASE) frame types are skipped without buffering; HTTP/2-only types and PUSH_PROMISE are rejected. A WebTransport bidi stream's `0x41` + session id prefix decodes as `Frame::WebTransportStream`, after which the stream carries application data.
+- `FrameDecoder`: DATA, HEADERS, SETTINGS, GOAWAY, CANCEL_PUSH and MAX_PUSH_ID frames. DATA payloads stream through as borrowed chunks; HEADERS (16 KiB), SETTINGS (4 KiB) and the single-id frames are buffered whole within their caps, checked before allocating. The push frames are reported, not skipped, so a caller can confine them to the control stream and check their ids. Unknown and reserved (GREASE) frame types are skipped without buffering; HTTP/2-only types and PUSH_PROMISE are rejected. A WebTransport bidi stream's `0x41` + session id prefix decodes as `Frame::WebTransportStream`, after which the stream carries application data.
 - `Settings`: SETTINGS encode and decode, rejecting repeated and HTTP/2-only identifiers. `setting` names the identifiers WebTransport uses.
 - `UniStreamHeaderDecoder`: control, push, QPACK encoder and decoder, and WebTransport (`0x54` + session id) uni streams, or the unknown type for the caller to refuse.
 - `CapsuleDecoder` and `Capsule`: capsules reassembled across DATA frames. `CLOSE_WEBTRANSPORT_SESSION`, `WT_MAX_DATA` and `WT_MAX_STREAMS` are decoded; other capsules up to 64 KiB are skipped without buffering.
@@ -31,7 +31,9 @@ assert_eq!(settings.get(0x08), Some(1));
 
 ## `qpack`
 
-The listener advertises a QPACK table capacity of 0, so peers may only use the static table. `QpackDecoder` accepts exactly that: Required Insert Count 0, indexed static entries, and literals with RFC 7541 Huffman decoding. Any dynamic-table reference fails with `QPACK_DECOMPRESSION_FAILED`, as does a field section that decodes past 8 KiB (counted as `name + value + 32` per field, per RFC 9114) or 64 fields, however few encoded bytes produced it. It decodes into one buffer allocated up front and reused.
+The listener advertises a QPACK table capacity of 0, so peers may only use the static table. `QpackDecoder` accepts exactly that: Required Insert Count 0 with a nonnegative Base, indexed static entries, and literals with RFC 7541 Huffman decoding. Any dynamic-table reference fails with `QPACK_DECOMPRESSION_FAILED`, as does a field section that decodes past 8 KiB (counted as `name + value + 32` per field, per RFC 9114) or 64 fields, however few encoded bytes produced it. It decodes into one buffer allocated up front and reused.
+
+`DecoderStreamReader` checks the peer's QPACK decoder stream incrementally for an encoder that never inserts: Stream Cancellation passes, while a Section Acknowledgment or Insert Count Increment (even of 0) fails with `QPACK_DECODER_STREAM_ERROR`.
 
 `encode_field_section` writes the same subset without Huffman: indexed static entries where they match exactly, static name references, and plain literals. `:status 200` encodes to `00 00 d9`.
 
