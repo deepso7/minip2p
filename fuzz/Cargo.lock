@@ -429,6 +429,7 @@ dependencies = [
 name = "minip2p-core"
 version = "0.10.0"
 dependencies = [
+ "base64ct",
  "bytes",
  "getrandom",
  "minip2p-identity",
