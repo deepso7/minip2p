@@ -81,6 +81,13 @@ pub struct QuicLimits {
     /// Bytes the engine buffers per connection for sending and
     /// retransmission. Must be non-zero. Defaults to quinn's 10,000,000.
     pub send_window: usize,
+    /// How long an `h3` connection may take from the QUIC handshake to a
+    /// completed Noise handshake, in milliseconds. Must be greater than zero.
+    ///
+    /// A WebTransport client that has not authenticated by then is closed
+    /// with `H3_EXCESSIVE_LOAD`, and its `Closed` reports
+    /// [`TimedOut`](minip2p_transport::ConnectionCloseReason::TimedOut).
+    pub webtransport_handshake_timeout_ms: u64,
 }
 
 impl Default for QuicLimits {
@@ -98,6 +105,7 @@ impl Default for QuicLimits {
             stream_receive_window: 1_250_000,
             connection_receive_window: usize::MAX,
             send_window: 10_000_000,
+            webtransport_handshake_timeout_ms: 10_000,
         }
     }
 }
