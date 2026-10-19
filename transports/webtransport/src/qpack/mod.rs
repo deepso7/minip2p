@@ -423,19 +423,25 @@ mod tests {
             encode_frame(frame_type::HEADERS, &block, &mut frame).unwrap();
             frame
         }
-        fn decode(frame: &[u8]) -> Result<usize, Error> {
+        // The field section a HEADERS frame carries.
+        fn block(frame: &[u8]) -> Vec<u8> {
             let mut input = frame;
             let Ok(Some(Frame::Headers(block))) = FrameDecoder::new().decode(&mut input) else {
                 panic!("not a HEADERS frame");
             };
-            QpackDecoder::new().decode(&block).map(|section| section.len())
+            block
         }
+        let mut decoder = QpackDecoder::new();
         // 6804 + 837 bytes decoded: under 8 KiB.
-        assert_eq!(decode(&headers(500)), Ok(64));
+        let fields = decoder.decode(&block(&headers(500))).map(|s| s.len());
+        assert_eq!(fields, Ok(64));
         // 6804 + 3077 bytes decoded from a frame under 2 KiB.
         let frame = headers(1900);
         assert!(frame.len() <= 2 * 1024, "{}", frame.len());
-        assert_eq!(decode(&frame), Err(Error::QpackDecompressionFailed));
+        assert_eq!(
+            decoder.decode(&block(&frame)).err(),
+            Some(Error::QpackDecompressionFailed)
+        );
     }
 
     #[test]

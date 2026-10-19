@@ -1041,7 +1041,10 @@ fn noise_stream_bytes_count_toward_the_pre_auth_byte_cap() {
     assert_eq!(peer.raw.write(noise, &frame), frame.len());
     let (code, reason) = peer.closed_with(&mut server, &mut events);
     assert_eq!(code, code::H3_EXCESSIVE_LOAD, "{reason}");
-    assert_ne!(close_reason(&events), Some(&ConnectionCloseReason::TimedOut));
+    assert_ne!(
+        close_reason(&events),
+        Some(&ConnectionCloseReason::TimedOut)
+    );
 }
 
 #[test]
