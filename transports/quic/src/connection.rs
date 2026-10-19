@@ -530,7 +530,15 @@ impl QuicConnection {
             // New credit: the scheduler that runs after these events hands
             // it out in turn, rather than to the stream it names.
             Event::Stream(StreamEvent::Writable { .. }) => {}
+            Event::Stream(StreamEvent::Finished { id }) => {
+                if let Some(wt) = self.wt.as_mut() {
+                    wt.on_send_done(u64::from(id));
+                }
+            }
             Event::Stream(StreamEvent::Stopped { id, error_code }) => {
+                if let Some(wt) = self.wt.as_mut() {
+                    wt.on_send_done(u64::from(id));
+                }
                 if self.surfaces_streams {
                     self.on_stopped(u64::from(id), error_code, cx.events);
                 }
@@ -1308,13 +1316,15 @@ impl QuicConnection {
         self.finish_wt_closing(now);
     }
 
-    /// Ends the Closing phase once the peer ended its CONNECT stream or the
-    /// deadline passed: QUIC closes with `H3_NO_ERROR`.
+    /// Ends the Closing phase once the peer ended its CONNECT stream and
+    /// acknowledged ours, or the deadline passed: QUIC closes with
+    /// `H3_NO_ERROR`. Closing any sooner would discard our FIN and resets,
+    /// which the engine drops with a close.
     fn finish_wt_closing(&mut self, now: Instant) {
         let Some(at) = self.wt_close_at else {
             return;
         };
-        if now < at && !self.wt.as_ref().is_some_and(WtSession::peer_ended) {
+        if now < at && !self.wt.as_ref().is_some_and(WtSession::ended_and_delivered) {
             return;
         }
         self.wt_close_at = None;

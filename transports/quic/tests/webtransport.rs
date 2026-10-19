@@ -520,9 +520,20 @@ fn a_client_close_is_orderly_on_the_server() {
         Some(ConnectionCloseReason::Remote { code: 0 })
     );
     assert!(!has_error(&seen.server));
-    assert!(wire.events().contains(&WireEvent::ConnectionClosed {
-        code: Some(code::H3_NO_ERROR)
-    }));
+    // Our FIN reaches the client before QUIC closes: the close in the same
+    // service would otherwise discard it.
+    let events = wire.events();
+    let ended = events
+        .iter()
+        .position(|event| *event == WireEvent::ConnectEnded)
+        .unwrap_or_else(|| panic!("the server never ended CONNECT: {events:?}"));
+    assert_eq!(
+        events.get(ended + 1..).and_then(|rest| rest.last()),
+        Some(&WireEvent::ConnectionClosed {
+            code: Some(code::H3_NO_ERROR)
+        }),
+        "{events:?}"
+    );
 }
 
 #[test]

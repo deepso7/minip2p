@@ -26,8 +26,8 @@
 //! sends `CLOSE_WEBTRANSPORT_SESSION` and finishes the CONNECT stream, and a
 //! peer's capsule, CONNECT FIN or reset, or GOAWAY reports
 //! [`WtEvent::PeerClosed`]. The connection then waits for
-//! [`WtSession::peer_ended`] (or a deadline) before closing QUIC, so the
-//! capsule or a refusal's status reaches the peer.
+//! [`WtSession::ended_and_delivered`] (or a deadline) before closing QUIC,
+//! so the capsule or a refusal's status, and our FIN, reach the peer.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -113,6 +113,9 @@ struct Connect {
     finished: bool,
     /// The peer finished or reset its side.
     peer_ended: bool,
+    /// The peer acknowledged our FIN, or stopped our side: nothing we
+    /// sent on it is still in flight.
+    delivered: bool,
 }
 
 /// The client's session flow-control credit for what we send (draft-13/14,
@@ -309,12 +312,23 @@ impl WtSession {
         }
     }
 
-    /// Whether the peer is done with the session: it finished or reset its
-    /// side of the CONNECT stream, or never opened one.
-    pub(crate) fn peer_ended(&self) -> bool {
+    /// Whether QUIC may close without discarding the session's end: the peer
+    /// finished or reset its side of the CONNECT stream (or never opened
+    /// one) and acknowledged our FIN on the
+    /// CONNECT stream, or stopped it. Packets the connection queued before
+    /// that FIN (its resets) went out with or ahead of it.
+    pub(crate) fn ended_and_delivered(&self) -> bool {
         self.connect
             .as_ref()
-            .is_none_or(|connect| connect.peer_ended)
+            .is_none_or(|connect| connect.peer_ended && connect.delivered)
+    }
+
+    /// The engine is done sending on `raw`: everything was acknowledged, or
+    /// the peer stopped it.
+    pub(crate) fn on_send_done(&mut self, raw: u64) {
+        if let Some(connect) = self.connect.as_mut().filter(|connect| connect.id == raw) {
+            connect.delivered = true;
+        }
     }
 
     /// What the connection must act on since the last call.
@@ -662,6 +676,7 @@ impl WtSession {
             replied: false,
             finished: false,
             peer_ended: false,
+            delivered: false,
         });
         self.reply(conn);
         self.read_connect(conn);
