@@ -674,10 +674,19 @@ impl QuicConnection {
                         previous_peer_id: None,
                     });
                 }
-                WtEvent::Admit { raw, early, end } => {
+                WtEvent::Admit {
+                    raw,
+                    early,
+                    end,
+                    stopped,
+                } => {
                     if !self.surfaces_streams {
                         self.refuse_stream(engine_stream(raw));
                     } else if self.admit_remote_stream(raw, events) {
+                        // A stop the session took while it held the stream.
+                        if let Some(error_code) = stopped {
+                            self.on_stopped(raw, error_code, events);
+                        }
                         self.deliver_early(raw, early, end, events);
                     }
                 }

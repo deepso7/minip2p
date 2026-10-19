@@ -79,11 +79,14 @@ pub(crate) enum WtEvent {
     Established { peer: PeerId, token: [u8; 32] },
     /// A prefixed peer stream is ready to surface, its prefix consumed:
     /// `early` is what was read while it was held, and `end` whether the
-    /// peer finished or reset it meanwhile.
+    /// peer finished or reset it meanwhile. `stopped` carries a
+    /// STOP_SENDING code the peer sent meanwhile: our side is already reset,
+    /// and quinn may have forgotten it once the reset was acknowledged.
     Admit {
         raw: u64,
         early: Vec<u8>,
         end: ReadEnd,
+        stopped: Option<VarInt>,
     },
     /// The peer ended the session (close capsule, CONNECT FIN, reset or
     /// STOP_SENDING, or GOAWAY) with this WebTransport code: finish our
@@ -176,6 +179,14 @@ impl Credit {
     }
 }
 
+/// A peer bidi stream whose first frame or prefix is being read.
+#[derive(Default)]
+struct Head {
+    frames: FrameDecoder,
+    /// The peer's STOP_SENDING code, if it stopped our side meanwhile.
+    stopped: Option<VarInt>,
+}
+
 /// A prefixed stream waiting for the session or for Noise.
 struct Held {
     id: u64,
@@ -184,6 +195,8 @@ struct Held {
     /// What it carried meanwhile.
     data: Vec<u8>,
     end: ReadEnd,
+    /// The peer's STOP_SENDING code, if it stopped our side meanwhile.
+    stopped: Option<VarInt>,
 }
 
 /// The Noise stream and its responder session.
@@ -211,7 +224,7 @@ pub(crate) struct WtSession {
     settings: Option<Settings>,
     connect: Option<Connect>,
     /// Peer bidi streams whose first frame or prefix is being read.
-    heads: HashMap<u64, FrameDecoder>,
+    heads: HashMap<u64, Head>,
     /// Prefixed streams waiting for the session or for Noise, in arrival
     /// order.
     held: VecDeque<Held>,
@@ -374,8 +387,9 @@ impl WtSession {
     /// stream of the session's own is reset with the peer's code (RFC 9000
     /// §3.5); a stopped CONNECT stream also ends the session (draft-14 §6),
     /// and a stopped Noise stream, before the handshake completed, fails
-    /// it. Returns whether `raw` is one of the session's own streams, which
-    /// the connection leaves alone.
+    /// it. A stream not yet classified or admitted keeps the code, applied
+    /// once its role is known. Returns whether `raw` is one of the session's
+    /// own streams, which the connection leaves alone.
     pub(crate) fn on_stopped(
         &mut self,
         conn: &mut Connection,
@@ -413,6 +427,10 @@ impl WtSession {
                     "the client stopped the Noise stream mid-handshake".into(),
                 );
             }
+        } else if let Some(head) = self.heads.get_mut(&raw) {
+            head.stopped = Some(error_code);
+        } else if let Some(held) = self.held.iter_mut().find(|held| held.id == raw) {
+            held.stopped = Some(error_code);
         }
         true
     }
@@ -463,7 +481,7 @@ impl WtSession {
                     .insert(raw, PeerUni::Header(UniStreamHeaderDecoder::new()));
             }
             Dir::Bi => {
-                self.heads.insert(raw, FrameDecoder::new());
+                self.heads.insert(raw, Head::default());
                 if self.too_many_early_streams() {
                     return;
                 }
@@ -742,7 +760,7 @@ impl WtSession {
     /// Reads a peer bidi stream's first frame a byte at a time, so nothing
     /// after a WebTransport prefix is consumed.
     fn read_head(&mut self, conn: &mut Connection, raw: u64) {
-        let Some(frames) = self.heads.get_mut(&raw) else {
+        let Some(Head { frames, .. }) = self.heads.get_mut(&raw) else {
             return;
         };
         let mut recv = conn.recv_stream(engine_stream(raw));
@@ -791,12 +809,12 @@ impl WtSession {
         };
         let _credit = chunks.finalize();
         self.count_early(consumed);
-        let Some(frames) = self.heads.remove(&raw) else {
+        let Some(Head { frames, stopped }) = self.heads.remove(&raw) else {
             return;
         };
         match head {
-            Some(Ok(block)) => self.on_request(conn, raw, frames, &block),
-            Some(Err(session_id)) => self.on_prefixed(conn, raw, session_id),
+            Some(Ok(block)) => self.on_request(conn, raw, frames, &block, stopped),
+            Some(Err(session_id)) => self.on_prefixed(conn, raw, session_id, stopped),
             None => {
                 self.fail(
                     code::H3_FRAME_UNEXPECTED,
@@ -807,8 +825,16 @@ impl WtSession {
     }
 
     /// A request on a new bidi stream: the first is the CONNECT, any other
-    /// is refused.
-    fn on_request(&mut self, conn: &mut Connection, raw: u64, frames: FrameDecoder, block: &[u8]) {
+    /// is refused. A CONNECT the peer stopped before its HEADERS were read
+    /// ends the session unanswered, as a stop after them would.
+    fn on_request(
+        &mut self,
+        conn: &mut Connection,
+        raw: u64,
+        frames: FrameDecoder,
+        block: &[u8],
+        stopped: Option<VarInt>,
+    ) {
         if self.connect.is_some() {
             refuse(conn, raw, code::H3_REQUEST_REJECTED);
             return;
@@ -832,6 +858,15 @@ impl WtSession {
             trailers: false,
             delivered: false,
         });
+        if stopped.is_some() {
+            // Our side is reset: nothing to answer or finish.
+            if let Some(connect) = self.connect.as_mut() {
+                connect.finished = true;
+                connect.delivered = true;
+            }
+            self.peer_closed(0);
+            return;
+        }
         self.reply(conn);
     }
 
@@ -841,7 +876,7 @@ impl WtSession {
         else {
             return;
         };
-        if connect.replied {
+        if connect.replied || self.closing {
             return;
         }
         connect.replied = true;
@@ -1006,7 +1041,13 @@ impl WtSession {
 
     /// A stream with a WebTransport prefix: admitted once the session is
     /// authenticated, held until then.
-    fn on_prefixed(&mut self, conn: &mut Connection, raw: u64, session_id: u64) {
+    fn on_prefixed(
+        &mut self,
+        conn: &mut Connection,
+        raw: u64,
+        session_id: u64,
+        stopped: Option<VarInt>,
+    ) {
         // A session id is a CONNECT stream's: client-initiated bidi, so a
         // multiple of 4. Any other cannot name a session at all (draft-14
         // §4), unlike a valid id that is not ours.
@@ -1023,6 +1064,7 @@ impl WtSession {
                     raw,
                     early: Vec::new(),
                     end: ReadEnd::Open,
+                    stopped,
                 });
             } else {
                 refuse(conn, raw, code::H3_ID_ERROR);
@@ -1034,6 +1076,7 @@ impl WtSession {
             session_id,
             data: Vec::new(),
             end: ReadEnd::Open,
+            stopped,
         });
         if self.too_many_early_streams() {
             return;
@@ -1084,6 +1127,7 @@ impl WtSession {
                         raw: held.id,
                         early: held.data,
                         end: held.end,
+                        stopped: held.stopped,
                     });
                 }
             } else {
@@ -1130,6 +1174,13 @@ impl WtSession {
             pending: Vec::new(),
             fin: false,
         });
+        if held.stopped.is_some() {
+            self.fail(
+                code::H3_GENERAL_PROTOCOL_ERROR,
+                "the client stopped the Noise stream mid-handshake".into(),
+            );
+            return;
+        }
         self.feed_noise(conn, held.data, held.end);
     }
 
