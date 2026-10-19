@@ -24,7 +24,7 @@ The spec also forbids certificate chains. The verifier sees one certificate, so 
 
 ### WebTransport certificates
 
-The `webtransport` module builds the certificates a WebTransport listener presents to browsers. They are self-signed ECDSA P-256 with no libp2p extension (Noise proves the peer identity instead) and are a pure function of the host key and a certificate period, so a restarted node serves the same certificate:
+The `webtransport` module builds the certificates a WebTransport listener presents to browsers. They are self-signed X.509v3 ECDSA P-256 end-entity certificates (critical basic constraints `CA:false` and key usage `digitalSignature`, extended key usage server + client auth) with no libp2p extension (Noise proves the peer identity instead) and are a pure function of the host key and a certificate period, so a restarted node serves the same certificate:
 
 ```rust
 use minip2p_tls::webtransport::{certhash, next_boundary, period_at, webtransport_certificate};

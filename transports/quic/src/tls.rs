@@ -317,15 +317,8 @@ impl TlsIdentity {
             .map_err(QuicBindError::Certificate)?;
         let load_key = |error: String| QuicBindError::tls(QuicTlsStage::LoadKey, error);
         let key = PrivateKeyDer::try_from(key).map_err(|error| load_key(error.to_string()))?;
-        let key = self
-            .provider
-            .key_provider
-            .load_private_key(key)
+        let key = CertifiedKey::from_der(vec![CertificateDer::from(cert)], key, &self.provider)
             .map_err(|error| load_key(error.to_string()))?;
-        // Not `CertifiedKey::from_der`: its key check parses the certificate
-        // with webpki, which rejects the extension-free (X.509 v1)
-        // WebTransport certificate. Both halves come from one derivation.
-        let key = CertifiedKey::new(vec![CertificateDer::from(cert)], key);
         Ok(Arc::new(RwLock::new(Arc::new(key))))
     }
 
@@ -611,6 +604,20 @@ mod tests {
             listener.server_config().expect("server"),
         )
         .expect("the system clock answers once the host supplies no time");
+    }
+
+    #[test]
+    fn the_webtransport_certificate_loads_through_the_checked_rustls_path() {
+        let keypair = Ed25519Keypair::from_secret_key_bytes([7; 32]);
+        let (cert, key) =
+            minip2p_tls::webtransport::webtransport_certificate(&keypair, 2_000).expect("cert");
+        let provider = rustls::crypto::ring::default_provider();
+        CertifiedKey::from_der(
+            vec![CertificateDer::from(cert)],
+            PrivateKeyDer::try_from(key).expect("pkcs8"),
+            &provider,
+        )
+        .expect("webpki parses the certificate and its key matches");
     }
 
     #[test]

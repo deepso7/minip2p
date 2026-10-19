@@ -1,10 +1,11 @@
 //! Deterministic WebTransport certificates.
 //!
 //! A browser dialing `/webtransport/certhash/<hash>` accepts a self-signed
-//! certificate only if its SHA-256 matches a pinned hash, it is ECDSA P-256,
-//! and it is valid for at most 14 days. These certificates carry no libp2p
-//! extension: the peer identity is proven over Noise instead, which also
-//! carries the certhashes.
+//! certificate only if its SHA-256 matches a pinned hash, it is X.509v3 and
+//! ECDSA P-256, and it is valid for at most 14 days. These certificates are
+//! plain TLS server leaves (basic constraints, key usage, extended key
+//! usage) with no libp2p extension: the peer identity is proven over Noise
+//! instead, which also carries the certhashes.
 //!
 //! Time is split into certificate periods of [`PERIOD_SECS`] (13 days);
 //! period `k` starts at `k · PERIOD_SECS` Unix seconds. Certificate `k` is
@@ -18,9 +19,11 @@
 //! and addresses it published before the restart stay valid.
 
 use alloc::format;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use const_oid::db::rfc5280::{ID_KP_CLIENT_AUTH, ID_KP_SERVER_AUTH};
 use der::Encode;
 use hkdf::Hkdf;
 use minip2p_identity::{Ed25519Keypair, Multihash};
@@ -30,7 +33,8 @@ use sha2::{Digest, Sha256};
 use spki::SubjectPublicKeyInfoOwned;
 use x509_cert::builder::{Builder, CertificateBuilder};
 use x509_cert::certificate::TbsCertificate;
-use x509_cert::ext::Extension;
+use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages};
+use x509_cert::ext::{Extension, ToExtension};
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
 use x509_cert::time::{Time, Validity};
@@ -67,8 +71,9 @@ pub fn next_boundary(unix_secs: u64) -> u64 {
 /// Builds the WebTransport certificate for `period`, deterministically from
 /// the host key.
 ///
-/// Returns `(cert_der, pkcs8_key_der)`: the self-signed ECDSA P-256
-/// certificate and its private key as PKCS#8 DER. Fails only for a period
+/// Returns `(cert_der, pkcs8_key_der)`: the self-signed X.509v3 ECDSA P-256
+/// certificate and its private key as PKCS#8 DER, loadable with rustls's
+/// checked `CertifiedKey::from_der`. Fails only for a period
 /// whose validity cannot be expressed in X.509 (after year 9999).
 pub fn webtransport_certificate(
     host: &Ed25519Keypair,
@@ -142,7 +147,12 @@ fn derive_signing_key(host: &Ed25519Keypair, period: u64) -> SigningKey {
 }
 
 /// Builder profile for WebTransport certificates: a fixed self-issued
-/// subject and no extensions.
+/// subject and the X.509v3 extensions of a TLS server leaf. Browsers require
+/// v3 for `serverCertificateHashes`, and webpki (rustls) refuses v1.
+///
+/// go-libp2p marks its certificate as a CA (with `keyCertSign`); this one is
+/// a plain end entity instead, which is what it is used as. Browsers
+/// matching a pinned hash check neither.
 struct WebTransportProfile;
 
 impl x509_cert::builder::profile::BuilderProfile for WebTransportProfile {
@@ -160,9 +170,20 @@ impl x509_cert::builder::profile::BuilderProfile for WebTransportProfile {
         &self,
         _spk: spki::SubjectPublicKeyInfoRef<'_>,
         _issuer_spk: spki::SubjectPublicKeyInfoRef<'_>,
-        _tbs: &TbsCertificate,
+        tbs: &TbsCertificate,
     ) -> x509_cert::builder::Result<Vec<Extension>> {
-        Ok(Vec::new())
+        let subject = tbs.subject();
+        let mut extensions = Vec::new();
+        let basic = BasicConstraints {
+            ca: false,
+            path_len_constraint: None,
+        };
+        extensions.push(basic.to_extension(subject, &extensions)?);
+        let usage = KeyUsage(KeyUsages::DigitalSignature.into());
+        extensions.push(usage.to_extension(subject, &extensions)?);
+        let extended = ExtendedKeyUsage(vec![ID_KP_SERVER_AUTH, ID_KP_CLIENT_AUTH]);
+        extensions.push(extended.to_extension(subject, &extensions)?);
+        Ok(extensions)
     }
 }
 
@@ -253,6 +274,25 @@ mod tests {
             key.verifying_key().to_public_key_der().unwrap().as_bytes(),
             der::Encode::to_der(spki).unwrap()
         );
+    }
+
+    #[test]
+    fn certificate_is_x509_v3_end_entity_for_tls() {
+        use x509_cert::certificate::Version;
+        use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage};
+
+        let (cert_der, _) = webtransport_certificate(&host(1), 2_000).unwrap();
+        let cert = parse(&cert_der);
+        let tbs = cert.tbs_certificate();
+        assert_eq!(tbs.version(), Version::V3);
+
+        let (_, basic) = tbs.get_extension::<BasicConstraints>().unwrap().unwrap();
+        assert!(!basic.ca);
+        let (critical, usage) = tbs.get_extension::<KeyUsage>().unwrap().unwrap();
+        assert!(critical && usage.digital_signature() && !usage.key_cert_sign());
+        let (_, extended) = tbs.get_extension::<ExtendedKeyUsage>().unwrap().unwrap();
+        let server_auth = const_oid::db::rfc5280::ID_KP_SERVER_AUTH;
+        assert!(extended.0.contains(&server_auth));
     }
 
     #[test]

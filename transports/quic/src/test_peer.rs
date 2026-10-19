@@ -355,20 +355,12 @@ pub(crate) fn foreign_client_config(
     .dangerous()
     .with_custom_certificate_verifier(server);
     let mut tls = match cert {
-        // Unchecked, so a certificate webpki cannot parse still goes out.
-        Some((cert, key)) => {
-            let key = rustls::crypto::ring::default_provider()
-                .key_provider
-                .load_private_key(rustls::pki_types::PrivateKeyDer::try_from(key).expect("pkcs8"))
-                .expect("signing key");
-            let certified = rustls::sign::CertifiedKey::new(
+        Some((cert, key)) => builder
+            .with_client_auth_cert(
                 vec![rustls::pki_types::CertificateDer::from(cert)],
-                key,
-            );
-            builder.with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
-                certified,
-            )))
-        }
+                rustls::pki_types::PrivateKeyDer::try_from(key).expect("pkcs8"),
+            )
+            .expect("client certificate"),
         None => builder.with_no_client_auth(),
     };
     tls.alpn_protocols = alpns.iter().map(|alpn| alpn.to_vec()).collect();
