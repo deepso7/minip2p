@@ -45,6 +45,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_noise(data);
     fuzz_pubsub(data);
     fuzz_yamux(data);
+    fuzz_webtransport(data);
     fuzz_secure_mux(data);
     fuzz_circuit(data);
     fuzz_relay_server_machines(data);
@@ -630,4 +631,50 @@ fn fuzz_yamux(data: &[u8]) {
         let _ = session.handle_data(data);
         while session.poll_output().is_some() {}
     }
+}
+
+fn fuzz_webtransport(data: &[u8]) {
+    use minip2p_webtransport::h3::{
+        CapsuleDecoder, Frame, FrameDecoder, Settings, UniStreamHeaderDecoder, varint,
+    };
+    use minip2p_webtransport::qpack::{MAX_FIELD_SECTION_SIZE, MAX_FIELDS, QpackDecoder};
+
+    let _ = varint::decode(data);
+    let _ = Settings::decode_payload(data);
+    let _ = UniStreamHeaderDecoder::new().decode(&mut &data[..]);
+
+    let mut qpack = QpackDecoder::new();
+    if let Ok(section) = qpack.decode(data) {
+        let size: usize = section
+            .iter()
+            .map(|f| f.name.len() + f.value.len() + 32)
+            .sum();
+        assert!(size <= MAX_FIELD_SECTION_SIZE && section.len() <= MAX_FIELDS);
+    }
+
+    // Feed the stream decoders in two chunks so the incremental paths run:
+    // frames, with DATA payloads going on to the capsule decoder.
+    let split = data.first().map_or(0, |&b| usize::from(b)).min(data.len());
+    let mut frames = FrameDecoder::new();
+    let mut capsules = CapsuleDecoder::new();
+    'stream: for chunk in [&data[..split], &data[split..]] {
+        let mut input = chunk;
+        loop {
+            match frames.decode(&mut input) {
+                Ok(Some(Frame::Data(mut payload))) => {
+                    while let Ok(Some(_)) = capsules.decode(&mut payload) {}
+                }
+                Ok(Some(Frame::Headers(block))) => {
+                    let _ = qpack.decode(&block);
+                }
+                Ok(Some(Frame::WebTransportStream { .. })) | Err(_) => break 'stream,
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+            }
+        }
+    }
+
+    let mut capsules = CapsuleDecoder::new();
+    let mut input = data;
+    while let Ok(Some(_)) = capsules.decode(&mut input) {}
 }
