@@ -16,7 +16,9 @@
 //! stream is admitted after it. Prefixed streams that arrive before the
 //! session is authenticated (the Noise stream racing the 200, or streams
 //! racing Noise) are held, their data read into a buffer the pre-auth byte
-//! cap bounds, and handed over with them.
+//! cap bounds, and handed over with them. A STOP_SENDING on a stream not
+//! yet classified or admitted resets it at once and is kept until its role
+//! is known, since quinn forgets the stop once the reset is acknowledged.
 //!
 //! Before authentication every allocation is capped: the codec's frame,
 //! capsule and QPACK caps, at most [`MAX_EARLY_STREAMS`] unfinished heads
