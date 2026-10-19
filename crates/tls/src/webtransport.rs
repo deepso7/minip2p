@@ -97,13 +97,19 @@ pub fn webtransport_certificate(
     };
     let validity = Validity::new(time(not_before)?, time(not_after)?);
 
-    // A positive serial unique per period: 0x01 followed by the period.
-    let mut serial = [0u8; 9];
-    serial[0] = 0x01;
-    serial[1..].copy_from_slice(&period.to_be_bytes());
+    let spki = SubjectPublicKeyInfoOwned::from_key(signing_key.verifying_key()).map_err(gen_err)?;
+    // Every certificate has the same self-issued name, so the serial tells
+    // them apart: NSS (Firefox) refuses a certificate whose issuer and serial
+    // match one it already holds. A positive 16-byte serial, 0x01 followed
+    // by 15 bytes of SHA-256 over the period's public key, differs per node
+    // and per period yet stays deterministic.
+    let mut serial = [0x01; 16];
+    let digest = Sha256::digest(spki.subject_public_key.raw_bytes());
+    for (byte, hashed) in serial.iter_mut().skip(1).zip(digest) {
+        *byte = hashed;
+    }
     let serial = SerialNumber::new(&serial).map_err(gen_err)?;
 
-    let spki = SubjectPublicKeyInfoOwned::from_key(signing_key.verifying_key()).map_err(gen_err)?;
     let builder =
         CertificateBuilder::new(WebTransportProfile, serial, validity, spki).map_err(gen_err)?;
     // ECDSA signing in `p256` is RFC 6979 deterministic.
@@ -228,6 +234,20 @@ mod tests {
         let other_key = certhash(&webtransport_certificate(&host(2), 2_000).unwrap().0);
         assert_ne!(base, next_period);
         assert_ne!(base, other_key);
+    }
+
+    /// Every certificate has the same self-issued name, so the serial must
+    /// tell nodes apart: Firefox (NSS) refuses a second certificate with an
+    /// issuer and serial it already holds (`SEC_ERROR_REUSED_ISSUER_AND_SERIAL`),
+    /// which breaks a page connected to two nodes at once.
+    #[test]
+    fn different_keys_or_periods_give_different_serials() {
+        let serial = |host_byte, period| {
+            let (cert_der, _) = webtransport_certificate(&host(host_byte), period).unwrap();
+            parse(&cert_der).tbs_certificate().serial_number().clone()
+        };
+        assert_ne!(serial(1, 2_000), serial(2, 2_000));
+        assert_ne!(serial(1, 2_000), serial(1, 2_001));
     }
 
     #[test]
