@@ -674,10 +674,19 @@ impl QuicConnection {
                         previous_peer_id: None,
                     });
                 }
-                WtEvent::Admit { raw, early, end } => {
+                WtEvent::Admit {
+                    raw,
+                    early,
+                    end,
+                    stopped,
+                } => {
                     if !self.surfaces_streams {
                         self.refuse_stream(engine_stream(raw));
                     } else if self.admit_remote_stream(raw, events) {
+                        // A stop the session took while it held the stream.
+                        if let Some(error_code) = stopped {
+                            self.on_stopped(raw, error_code, events);
+                        }
                         self.deliver_early(raw, early, end, events);
                     }
                 }
@@ -1364,6 +1373,10 @@ impl QuicConnection {
             .collect();
         for raw in bound {
             self.reset_on_wire(raw);
+        }
+        let code = self.stream_code();
+        if let Some(wt) = self.wt.as_mut() {
+            wt.end_streams(&mut self.conn, code);
         }
         let wait = (self.conn.rtt() * 3).clamp(WT_CLOSE_MIN, WT_CLOSE_MAX);
         self.wt_close_early = reason != ConnectionCloseReason::Local;
