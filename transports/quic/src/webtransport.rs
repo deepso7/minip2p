@@ -1115,7 +1115,9 @@ impl WtSession {
 /// Well formed means exactly one each of `:method CONNECT`, `:protocol
 /// webtransport` (the token drafts 02 and 13/14 share; draft-15's
 /// `webtransport-h3` is not served), `:scheme https`, `:authority` and
-/// `:path`, no other pseudo-header, and none after a regular field.
+/// `:path`, no other pseudo-header, and none after a regular field; a
+/// nonempty `:authority` without userinfo; no NUL, CR or LF in any value;
+/// and only valid regular fields ([`valid_regular_field`]).
 fn request_status(section: &FieldSection<'_>) -> &'static str {
     const PSEUDO: [&[u8]; 5] = [
         b":method",
@@ -1128,8 +1130,14 @@ fn request_status(section: &FieldSection<'_>) -> &'static str {
     let mut regular = false;
     for field in section.iter() {
         if !field.name.starts_with(b":") {
+            if !valid_regular_field(&field) {
+                return "400";
+            }
             regular = true;
             continue;
+        }
+        if !valid_value(field.value) {
+            return "400";
         }
         let slot = PSEUDO
             .iter()
@@ -1144,13 +1152,18 @@ fn request_status(section: &FieldSection<'_>) -> &'static str {
         Some(method),
         Some(protocol),
         Some(scheme),
-        Some(_),
+        Some(authority),
         Some(path),
     ] = values
     else {
         return "400";
     };
-    if method != b"CONNECT" || protocol != b"webtransport" || scheme != b"https" {
+    if method != b"CONNECT"
+        || protocol != b"webtransport"
+        || scheme != b"https"
+        || authority.is_empty()
+        || authority.contains(&b'@')
+    {
         return "400";
     }
     let (want_path, _) = LIBP2P_WEBTRANSPORT_PATH

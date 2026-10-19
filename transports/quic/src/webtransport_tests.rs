@@ -802,6 +802,30 @@ fn connect_requests_are_checked_field_by_field() {
             with(b":protocol", b"webtransport-h3"),
             "400",
         ),
+        ("an empty :authority", with(b":authority", b""), "400"),
+        (
+            "userinfo in :authority",
+            with(b":authority", b"user@127.0.0.1"),
+            "400",
+        ),
+        (
+            "a CR LF in :path",
+            with(b":path", b"/.well-known/libp2p-webtransport?type=noise\r\nx: y"),
+            "400",
+        ),
+        (
+            "an uppercase field name",
+            plus((b"Origin", b"https://example.com")),
+            "400",
+        ),
+        (
+            "a connection-specific field",
+            plus((b"connection", b"keep-alive")),
+            "400",
+        ),
+        ("te other than trailers", plus((b"te", b"gzip")), "400"),
+        ("a CR LF in a value", plus((b"x-test", b"a\r\nb")), "400"),
+        ("an empty field name", plus((b"", b"value")), "400"),
     ];
     for (row, fields, expected) in rows {
         assert_eq!(refused_with(DRAFT02, &fields), expected, "{row}");
@@ -836,6 +860,25 @@ fn a_boolean_setting_other_than_0_or_1_is_a_settings_error_whatever_else_is_offe
             peer.control(settings);
         });
         assert_eq!(code, code::H3_SETTINGS_ERROR, "{settings:?}: {reason}");
+    }
+}
+
+#[test]
+fn chrome_and_firefox_connect_captures_are_accepted() {
+    let captures: [&[u8]; 2] = [
+        include_bytes!("../../webtransport/tests/fixtures/chrome_connect_headers.bin"),
+        include_bytes!("../../webtransport/tests/fixtures/firefox_connect_headers.bin"),
+    ];
+    for capture in captures {
+        let mut server = server();
+        let mut events = Vec::new();
+        let mut peer = H3Peer::connect(&mut server, &mut events);
+        peer.control(DRAFT02);
+        let stream = peer.raw.open();
+        assert_eq!(peer.raw.write(stream, capture), capture.len());
+        peer.connect = Some(stream);
+        peer.authenticate(&mut server, &mut events);
+        assert_eq!(peer.status().as_deref(), Some("200"));
     }
 }
 
