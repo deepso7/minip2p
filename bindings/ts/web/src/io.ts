@@ -389,14 +389,18 @@ export class JsIo {
     );
   }
 
-  /** A read side errored: a peer reset, or its session going away. */
+  /**
+   * A read side errored: a peer reset, its session going away (which
+   * `closed` reports too), or an error with no WebTransport code (Firefox
+   * errors the read side so when the peer stops our sending as it closes).
+   * Each ends the read side as a reset, so nothing waits on it.
+   */
   #readFailed(id: number, stream: Stream, error: unknown): void {
-    const code = peerStreamCode(error);
-    if (stream.dead || stream.readEnded || code === undefined) {
+    if (stream.dead || stream.readEnded) {
       return;
     }
     stream.readEnded = true;
-    this.#push({ code, kind: "reset", stream: id });
+    this.#push({ code: peerStreamCode(error) ?? 0, kind: "reset", stream: id });
   }
 
   async #acceptIncoming(id: number, session: Session): Promise<void> {

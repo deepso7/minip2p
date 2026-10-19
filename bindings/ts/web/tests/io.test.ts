@@ -70,6 +70,11 @@ class FakeStream {
     this.#reads?.error(peerStreamError(code));
   }
 
+  /** The browser errors the read side without a WebTransport code. */
+  failRead(): void {
+    this.#reads?.error(new TypeError("Error in input stream"));
+  }
+
   /** The peer asks us to stop sending. */
   stopSending(code: number): void {
     this.#writes?.error(peerStreamError(code));
@@ -284,6 +289,17 @@ describe("JsIo", () => {
         { code: 7, kind: "stopSending", stream },
       ])
     );
+  });
+
+  test("a read side failing without a stream code ends as a reset", async () => {
+    // Firefox does this when the peer stops our sending as it closes.
+    const { events, fake, io, stream } = await openedStream();
+    io.grantRead(stream, 10);
+
+    fake.failRead();
+    await flush();
+
+    expect(events()).toEqual([{ code: 0, kind: "reset", stream }]);
   });
 
   test("a locally reset stream reports nothing more", async () => {
