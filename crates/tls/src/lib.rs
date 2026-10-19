@@ -12,6 +12,9 @@
 //! Ed25519 and ECDSA P-256 host keys; secp256k1 and RSA are deliberately
 //! unsupported for now. Verification takes the current time from the caller,
 //! so the crate stays sans-I/O.
+//!
+//! The [`webtransport`] module builds the deterministic, period-based
+//! certificates a WebTransport listener presents to browsers.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -20,6 +23,7 @@ extern crate alloc;
 mod error;
 mod generate;
 mod verify;
+pub mod webtransport;
 
 #[cfg(test)]
 mod test_rng;
