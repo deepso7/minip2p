@@ -103,6 +103,7 @@ jobs:
       # Mirrors `just check-wasm`.
       - run: cargo check --target wasm32-unknown-unknown -p minip2p-ffi-core --no-default-features --features serde
       - run: cargo check --target wasm32-unknown-unknown -p minip2p-rs --no-default-features --features pubsub
+      - run: cargo check --target wasm32-unknown-unknown -p minip2p-webtransport --no-default-features
       - run: cargo doc --workspace --no-deps
       - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps
       - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
