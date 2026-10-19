@@ -36,6 +36,8 @@ Every value the adapter relies on is set explicitly:
 - idle timeout `idle_timeout_ms` (0 is rejected, because QUIC reads it as "no timeout"), keepalive at half of it;
 - TLS 1.3 only, ALPN `libp2p`, no session resumption.
 
+A socket that also serves WebTransport ([ALPN dispatch](#alpn-dispatch-and-webtransport)) differs in two parameters, for every connection to it (the server config is chosen per socket, before ALPN): three peer unidirectional streams (HTTP/3's control and QPACK streams, RFC 9114 §6.2), and the QUIC DATAGRAM parameter with a 16 KiB receive buffer (Firefox requires it; received datagrams are drained and dropped). Its TLS offers ALPN `libp2p` and `h3`. Other sockets keep the parameters above exactly.
+
 quinn-proto's own defaults stand for the rest: CUBIC congestion control, path MTU discovery (from 1200 bytes, probing up; enabled only where the platform keeps datagrams from being fragmented), 8-byte connection IDs, and passive connection migration. A migrated connection keeps the `ConnectionEndpoint` of its handshake address.
 
 ## Basic usage
@@ -131,8 +133,18 @@ The off-by-default `diagnostics` feature compiles in counters for comparing fast
 
 ## Authentication Notes
 
-- QUIC handshakes require mutual TLS. Custom rustls verifiers check the peer inside the handshake: it must present exactly one certificate, that certificate must pass libp2p verification by `minip2p-tls`, and the TLS 1.3 CertificateVerify signature must check against the certificate's own key. A dial also requires the certificate to prove the `PeerId` it named.
+- QUIC handshakes require mutual TLS for `libp2p` (on a WebTransport-serving socket, enforced once ALPN is known; see [ALPN dispatch](#alpn-dispatch-and-webtransport)). Custom rustls verifiers check the peer inside the handshake: it must present exactly one certificate, that certificate must pass libp2p verification by `minip2p-tls`, and the TLS 1.3 CertificateVerify signature must check against the certificate's own key. A dial also requires the certificate to prove the `PeerId` it named.
 - A rejected peer gets a TLS alert, which aborts the handshake on both ends, so `Connected` is never emitted. The local side reports `Closed` with an `Error` reason carrying the rustls error text. minip2p releases on the earlier quiche engine closed with application codes `0x01`–`0x04` instead.
 - Certificate validity is checked against the host's wall-clock time (`Now::unix_seconds` from the last poll, falling back to the system clock when absent), so a badly wrong clock makes peers' certificates look expired or not yet valid.
 - `minip2p-tls` verifies Ed25519 and ECDSA P-256 host keys; secp256k1 and RSA peers are rejected.
 - `IncomingConnection` is pre-auth and is emitted when the engine accepts an Initial, before the handshake completes. Treat `Connected` or `PeerIdentityVerified` as the authenticated connection signal.
+- Stream events are gated on authentication: no peer stream is accepted before `Connected` (one opened in the same flight as the client's Finished waits in the engine and surfaces after `Connected`, or goes with a connection that fails). After a local `close` or a failed authentication, new peer streams are refused and data on existing ones is discarded, so only `Closed` follows. A refused bidirectional stream gets STOP_SENDING and RESET_STREAM; a peer's unidirectional stream gets STOP_SENDING only, since it has no local send half (quinn-proto asserts on resetting one).
+
+## ALPN dispatch and WebTransport
+
+`QuicNodeConfig::with_webtransport(bind_addr)` makes the socket bound at `bind_addr` (one of the addresses given to `bind`, as given) serve `h3` beside `libp2p`; an address that is not bound fails `bind` with `InvalidAddress`. Nothing serves `h3` by default. Each connection to that socket picks its protocol by ALPN, the server's order winning, so a client offering both gets `libp2p`:
+
+- The certificate is chosen by ALPN: a client offering `libp2p` gets the libp2p certificate, any other client the current WebTransport certificate (`minip2p_tls::webtransport`, for the period of the system clock at bind; ECDSA P-256 and extension-free, so it is loaded without webpki's consistency check).
+- Client certificates are optional on that socket, because browsers send none. A presented certificate is still fully verified inside the handshake. The libp2p requirement moves to the end of the handshake: a `libp2p` connection without a verified peer certificate is closed before any `Connected`.
+- An `h3` connection is closed after its handshake for now, with no `Connected`; the WebTransport session handshake will be served there.
+- Every connection to the socket carries the [two extra transport parameters](#transport-parameters); a libp2p peer that opens a unidirectional stream there gets STOP_SENDING and nothing is surfaced.

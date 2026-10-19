@@ -12,6 +12,7 @@ use minip2p_transport::{
     ConnectionCloseReason, ConnectionEndpoint, ConnectionId, ConnectionState, ConnectionToken,
     StreamId, TransportError, TransportEvent,
 };
+use quinn_proto::crypto::rustls::HandshakeData;
 use quinn_proto::{
     ConnectionError, ConnectionHandle, Dir, Event, FinishError, ReadError, StreamEvent, VarInt,
     WriteError,
@@ -203,6 +204,11 @@ pub(crate) struct QuicConnection {
     /// Connection endpoint metadata (transport address + optional peer id).
     endpoint: ConnectionEndpoint,
     state: ConnectionState,
+    /// Whether stream events reach the caller: from authentication
+    /// (`Connected`) until a local close or a failed authentication. Outside
+    /// it, new peer streams are refused and data on existing ones is
+    /// discarded without events.
+    surfaces_streams: bool,
     /// Why the connection is ending: the first cause seen, reported on its
     /// `Closed`.
     close_reason: Option<ConnectionCloseReason>,
@@ -273,6 +279,7 @@ impl QuicConnection {
             conn,
             endpoint,
             state: ConnectionState::Connecting,
+            surfaces_streams: false,
             close_reason: None,
             stream_states: HashMap::new(),
             send_queues: HashMap::new(),
@@ -483,31 +490,49 @@ impl QuicConnection {
         match event {
             Event::Connected => self.on_connected(now, cx),
             Event::ConnectionLost { reason } => self.on_lost(&reason),
-            Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
-                self.accept_streams(cx.events);
-            }
+            Event::Stream(StreamEvent::Opened { dir }) => self.accept_streams(dir, cx.events),
             Event::Stream(StreamEvent::Readable { id }) => self.scan(u64::from(id), cx.events),
             // New credit: the scheduler that runs after these events hands
             // it out in turn, rather than to the stream it names.
             Event::Stream(StreamEvent::Writable { .. }) => {}
             Event::Stream(StreamEvent::Stopped { id, error_code }) => {
-                self.on_stopped(u64::from(id), error_code, cx.events);
+                if self.surfaces_streams {
+                    self.on_stopped(u64::from(id), error_code, cx.events);
+                }
             }
             Event::Stream(StreamEvent::Available { dir: Dir::Bi }) => {
                 self.bind_pending_opens(now);
             }
-            // Unidirectional streams are never granted, half-close is the
-            // adapter's own bookkeeping, and DATAGRAM is not advertised.
-            Event::Stream(_)
-            | Event::HandshakeDataReady
-            | Event::DatagramReceived
-            | Event::DatagramsUnblocked => {}
+            // Only WebTransport-serving sockets advertise DATAGRAM, and
+            // datagrams are not served there: drained and dropped.
+            Event::DatagramReceived => while self.conn.datagrams().recv().is_some() {},
+            // Local unidirectional streams are never opened, and half-close
+            // is the adapter's own bookkeeping.
+            Event::Stream(_) | Event::HandshakeDataReady | Event::DatagramsUnblocked => {}
         }
     }
 
-    /// The handshake verified the peer inside TLS; record who it is and the
-    /// token both ends derive, then report the connection.
+    /// The ALPN protocol the handshake negotiated.
+    fn negotiated_alpn(&self) -> Option<Vec<u8>> {
+        self.conn
+            .crypto_session()
+            .handshake_data()?
+            .downcast::<HandshakeData>()
+            .ok()?
+            .protocol
+    }
+
+    /// The handshake completed. A `libp2p` connection must have verified
+    /// the peer's certificate inside TLS (client certificates are optional
+    /// on WebTransport-serving sockets): record who it is and the token both
+    /// ends derive, then report the connection and the peer streams that
+    /// waited for it. Anything else fails before `Connected`.
     fn on_connected(&mut self, now: Instant, cx: &mut Cx<'_>) {
+        if self.negotiated_alpn().as_deref() == Some(crate::tls::H3_ALPN) {
+            // Held for the WebTransport handshake once it is served.
+            self.fail_connection(now, "WebTransport sessions are not served yet".into());
+            return;
+        }
         let identity = self.conn.crypto_session().peer_identity();
         let Some(peer_id) = crate::tls::peer_id_from_identity(identity) else {
             self.fail_connection(now, "peer identity unavailable after the handshake".into());
@@ -528,6 +553,7 @@ impl QuicConnection {
         let changed = previous.as_ref() != Some(&peer_id);
         self.endpoint.set_peer_id(peer_id);
         self.state = ConnectionState::Connected;
+        self.surfaces_streams = true;
         cx.events.push(TransportEvent::Connected {
             id: self.id,
             endpoint: self.endpoint.clone(),
@@ -539,6 +565,8 @@ impl QuicConnection {
                 previous_peer_id: previous,
             });
         }
+        self.accept_streams(Dir::Bi, cx.events);
+        self.accept_streams(Dir::Uni, cx.events);
     }
 
     /// The engine lost the connection; `Closed` follows once it drains,
@@ -560,13 +588,43 @@ impl QuicConnection {
         self.state = ConnectionState::Closed;
     }
 
-    /// Accepts every stream the peer opened, scanning each at once: a new
-    /// stream's first frame raises only `Opened`, never `Readable`.
-    fn accept_streams(&mut self, events: &mut Vec<TransportEvent>) {
-        while let Some(stream) = self.conn.streams().accept(Dir::Bi) {
+    /// Accepts every stream the peer opened in `dir`.
+    ///
+    /// Before the handshake completes none is accepted: they wait in the
+    /// engine for `on_connected`, and go with the connection if it never
+    /// authenticates. Bidirectional streams of a connection that surfaces
+    /// streams are admitted and scanned at once (a new stream's first frame
+    /// raises only `Opened`, never `Readable`). Every other stream is
+    /// refused: libp2p uses no unidirectional streams, and a closing
+    /// connection takes no new ones.
+    fn accept_streams(&mut self, dir: Dir, events: &mut Vec<TransportEvent>) {
+        if self.state == ConnectionState::Connecting {
+            return;
+        }
+        while let Some(stream) = self.conn.streams().accept(dir) {
             let raw = u64::from(stream);
-            if self.admit_remote_stream(raw, events) {
-                self.scan(raw, events);
+            if dir == Dir::Bi && self.surfaces_streams {
+                if self.admit_remote_stream(raw, events) {
+                    self.scan(raw, events);
+                }
+            } else {
+                self.refuse_stream(stream);
+            }
+        }
+    }
+
+    /// Refuses a peer-initiated stream with STOP_SENDING, adding
+    /// RESET_STREAM only for a bidirectional one: a peer's unidirectional
+    /// stream has no local send half, and quinn-proto asserts on resetting
+    /// one, which would let a peer panic the transport.
+    fn refuse_stream(&mut self, stream: quinn_proto::StreamId) {
+        let code = VarInt::from_u32(0);
+        match self.conn.recv_stream(stream).stop(code) {
+            Ok(()) | Err(_) => {}
+        }
+        if stream.dir() == Dir::Bi {
+            match self.conn.send_stream(stream).reset(code) {
+                Ok(()) | Err(_) => {}
             }
         }
     }
@@ -583,13 +641,7 @@ impl QuicConnection {
             .filter(|id| !self.is_local(**id))
             .count() as u64;
         if held >= self.max_streams {
-            let stream = engine_stream(raw);
-            match self.conn.recv_stream(stream).stop(VarInt::from_u32(0)) {
-                Ok(()) | Err(_) => {}
-            }
-            match self.conn.send_stream(stream).reset(VarInt::from_u32(0)) {
-                Ok(()) | Err(_) => {}
-            }
+            self.refuse_stream(engine_stream(raw));
             return false;
         }
         self.stream_states
@@ -609,6 +661,9 @@ impl QuicConnection {
     /// not read again until it does ([`Self::ack_stream`]). The engine then
     /// buffers at most one more window, since the windows are fixed.
     fn scan(&mut self, raw: u64, events: &mut Vec<TransportEvent>) {
+        if !self.surfaces_streams {
+            return;
+        }
         // Nothing follows a stream's StreamClosed.
         let Some(room) = self
             .stream_states
@@ -1018,6 +1073,7 @@ impl QuicConnection {
         self.close_reason
             .get_or_insert(ConnectionCloseReason::Local);
         self.state = ConnectionState::Closing;
+        self.surfaces_streams = false;
         self.end_writes();
     }
 
@@ -1227,6 +1283,7 @@ impl QuicConnection {
             Bytes::from_static(b"stream send failed"),
         );
         self.state = ConnectionState::Closing;
+        self.surfaces_streams = false;
     }
 
     /// Emits StreamClosed if both sides are closed and not yet notified.

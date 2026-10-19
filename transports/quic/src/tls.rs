@@ -6,10 +6,14 @@
 //! certificate's own key, and, on a dial, require the `PeerId` the caller
 //! named. Any rejection aborts the handshake with a TLS alert, so neither end
 //! reports the connection as established.
+//!
+//! A socket that also serves WebTransport offers ALPN `libp2p` and `h3`,
+//! picks its certificate by ALPN, and makes the client certificate optional;
+//! the connection then requires one for `libp2p` once ALPN is known.
 
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::{QuicBindError, QuicTlsStage};
@@ -21,8 +25,8 @@ use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, ServerName, SubjectPublicKeyInfoDer, UnixTime,
 };
-use rustls::server::NoServerSessionStorage;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::server::{ClientHello, NoServerSessionStorage, ResolvesServerCert};
 use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use rustls::time_provider::TimeProvider;
 use rustls::{
@@ -31,6 +35,8 @@ use rustls::{
 
 /// The ALPN protocol id libp2p uses for QUIC.
 pub(crate) const ALPN: &[u8] = b"libp2p";
+/// The ALPN protocol id of HTTP/3, which WebTransport runs on.
+pub(crate) const H3_ALPN: &[u8] = b"h3";
 
 /// Wall-clock time since the Unix epoch, or zero if the clock reads earlier.
 pub(crate) fn system_time() -> Duration {
@@ -101,6 +107,10 @@ struct Libp2pVerifier {
     algorithms: WebPkiSupportedAlgorithms,
     /// The peer a dial named; the listener side expects anyone.
     expected: Option<PeerId>,
+    /// Whether a listener requires a client certificate. Sockets serving
+    /// WebTransport do not (browsers present none), and the libp2p
+    /// requirement is enforced once ALPN is known instead.
+    client_auth_mandatory: bool,
 }
 
 impl Libp2pVerifier {
@@ -187,6 +197,10 @@ impl ClientCertVerifier for Libp2pVerifier {
         &[]
     }
 
+    fn client_auth_mandatory(&self) -> bool {
+        self.client_auth_mandatory
+    }
+
     fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -220,6 +234,35 @@ impl ClientCertVerifier for Libp2pVerifier {
     }
 }
 
+/// The current WebTransport certificate, swapped in place on rotation.
+pub(crate) type WebTransportCertificate = Arc<RwLock<Arc<CertifiedKey>>>;
+
+/// Picks a WebTransport-serving socket's certificate by ALPN: a client
+/// offering `libp2p` negotiates it (the server's preference) and gets the
+/// libp2p certificate; any other client gets the WebTransport certificate.
+#[derive(Debug)]
+struct AlpnResolver {
+    libp2p: Arc<CertifiedKey>,
+    webtransport: WebTransportCertificate,
+}
+
+impl ResolvesServerCert for AlpnResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let offers_libp2p = client_hello
+            .alpn()
+            .is_some_and(|mut offered| offered.any(|protocol| protocol == ALPN));
+        if offers_libp2p {
+            return Some(Arc::clone(&self.libp2p));
+        }
+        // A writer that panicked left a whole certificate behind.
+        let current = match self.webtransport.read() {
+            Ok(current) => Arc::clone(&current),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        };
+        Some(current)
+    }
+}
+
 /// A node's TLS identity: its libp2p certificate and key, the crypto
 /// provider, and the host clock its verifiers read. Shared by every config it
 /// builds, so a per-dial client config costs a few `Arc` clones.
@@ -250,25 +293,86 @@ impl TlsIdentity {
         })
     }
 
-    fn verifier(&self, expected: Option<PeerId>) -> Arc<Libp2pVerifier> {
+    fn verifier(
+        &self,
+        expected: Option<PeerId>,
+        client_auth_mandatory: bool,
+    ) -> Arc<Libp2pVerifier> {
         Arc::new(Libp2pVerifier {
             algorithms: self.provider.signature_verification_algorithms,
             expected,
+            client_auth_mandatory,
         })
     }
 
-    /// The listener's config: TLS 1.3, ALPN `libp2p`, a mandatory client
-    /// certificate, and no session resumption (a resumed session would skip
-    /// the peer's certificate).
+    /// The WebTransport certificate for the period containing `unix_secs`,
+    /// derived from `keypair`.
+    pub(crate) fn webtransport_certificate(
+        &self,
+        keypair: &Ed25519Keypair,
+        unix_secs: u64,
+    ) -> Result<WebTransportCertificate, QuicBindError> {
+        let period = minip2p_tls::webtransport::period_at(unix_secs);
+        let (cert, key) = minip2p_tls::webtransport::webtransport_certificate(keypair, period)
+            .map_err(QuicBindError::Certificate)?;
+        let load_key = |error: String| QuicBindError::tls(QuicTlsStage::LoadKey, error);
+        let key = PrivateKeyDer::try_from(key).map_err(|error| load_key(error.to_string()))?;
+        let key = self
+            .provider
+            .key_provider
+            .load_private_key(key)
+            .map_err(|error| load_key(error.to_string()))?;
+        // Not `CertifiedKey::from_der`: its key check parses the certificate
+        // with webpki, which rejects the extension-free (X.509 v1)
+        // WebTransport certificate. Both halves come from one derivation.
+        let key = CertifiedKey::new(vec![CertificateDer::from(cert)], key);
+        Ok(Arc::new(RwLock::new(Arc::new(key))))
+    }
+
+    /// The config of a libp2p-only listening socket: TLS 1.3, ALPN
+    /// `libp2p`, a mandatory client certificate, and no session resumption
+    /// (a resumed session would skip the peer's certificate).
     pub(crate) fn server_config(&self) -> Result<rustls::ServerConfig, rustls::Error> {
+        self.build_server_config(
+            true,
+            Arc::new(SingleCertAndKey::from(Arc::clone(&self.key))),
+            vec![ALPN.to_vec()],
+        )
+    }
+
+    /// The config of a socket that also serves WebTransport: ALPN `libp2p`
+    /// then `h3` (the server's order wins), the certificate chosen by ALPN,
+    /// and an optional client certificate. A presented one is still fully
+    /// verified; `on_connected` requires one for `libp2p`.
+    pub(crate) fn webtransport_server_config(
+        &self,
+        webtransport: WebTransportCertificate,
+    ) -> Result<rustls::ServerConfig, rustls::Error> {
+        let resolver = AlpnResolver {
+            libp2p: Arc::clone(&self.key),
+            webtransport,
+        };
+        self.build_server_config(
+            false,
+            Arc::new(resolver),
+            vec![ALPN.to_vec(), H3_ALPN.to_vec()],
+        )
+    }
+
+    fn build_server_config(
+        &self,
+        client_auth_mandatory: bool,
+        resolver: Arc<dyn ResolvesServerCert>,
+        alpn_protocols: Vec<Vec<u8>>,
+    ) -> Result<rustls::ServerConfig, rustls::Error> {
         let mut config = rustls::ServerConfig::builder_with_details(
             Arc::clone(&self.provider),
             Arc::clone(&self.time) as Arc<dyn TimeProvider>,
         )
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_client_cert_verifier(self.verifier(None))
-        .with_cert_resolver(Arc::new(SingleCertAndKey::from(Arc::clone(&self.key))));
-        config.alpn_protocols = vec![ALPN.to_vec()];
+        .with_client_cert_verifier(self.verifier(None, client_auth_mandatory))
+        .with_cert_resolver(resolver);
+        config.alpn_protocols = alpn_protocols;
         config.session_storage = Arc::new(NoServerSessionStorage {});
         config.send_tls13_tickets = 0;
         Ok(config)
@@ -286,7 +390,7 @@ impl TlsIdentity {
         )
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
-        .with_custom_certificate_verifier(self.verifier(expected))
+        .with_custom_certificate_verifier(self.verifier(expected, true))
         .with_client_cert_resolver(Arc::new(SingleCertAndKey::from(Arc::clone(&self.key))));
         config.alpn_protocols = vec![ALPN.to_vec()];
         config.resumption = Resumption::disabled();
@@ -406,7 +510,7 @@ mod tests {
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("tls13")
         .dangerous()
-        .with_custom_certificate_verifier(listener.verifier(None))
+        .with_custom_certificate_verifier(listener.verifier(None, true))
         .with_no_client_auth();
         let result = handshake(anonymous, listener.server_config().expect("server"));
         assert!(
@@ -450,6 +554,7 @@ mod tests {
         let verifier = Libp2pVerifier {
             algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
             expected: None,
+            client_auth_mandatory: true,
         };
         // Inside the vector's validity window (1975 to 4096).
         let now = UnixTime::since_unix_epoch(Duration::from_secs(1_700_000_000));

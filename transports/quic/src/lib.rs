@@ -29,6 +29,8 @@ use socket2::{Domain, Protocol as SocketProtocol, Socket as RawSocket, Type};
 
 #[cfg(test)]
 mod admission_tests;
+#[cfg(test)]
+mod alpn_tests;
 mod config;
 mod connection;
 mod diagnostics;
@@ -280,6 +282,23 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
     Ok(config)
 }
 
+/// Bytes of received QUIC datagrams a WebTransport-serving connection
+/// buffers. Datagrams are not served: each is drained and dropped.
+const DATAGRAM_RECEIVE_BUFFER: usize = 16 * 1024;
+
+/// A WebTransport-serving socket's transport parameters: the libp2p ones
+/// plus three peer unidirectional streams, which RFC 9114 §6.2 requires for
+/// HTTP/3's control and QPACK streams, and the QUIC DATAGRAM parameter,
+/// which Firefox requires. The server config is chosen per socket, before
+/// ALPN, so libp2p connections there see these too.
+fn webtransport_transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindError> {
+    let mut config = transport_config(limits)?;
+    config
+        .max_concurrent_uni_streams(VarInt::from_u32(3))
+        .datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER));
+    Ok(config)
+}
+
 /// QUIC transport over one or two non-blocking UDP sockets -- at most one per
 /// IP family -- and one quinn-proto endpoint serving both.
 ///
@@ -308,6 +327,10 @@ pub struct QuicTransport {
     /// Installed on the endpoint by the first `listen`; until then it
     /// accepts nothing.
     server_config: Arc<ServerConfig>,
+    /// The per-connection override for sockets that also serve
+    /// WebTransport: ALPN `libp2p` and `h3`, optional client certificates,
+    /// and [`webtransport_transport_config`]. `None` when no socket does.
+    webtransport_config: Option<Arc<ServerConfig>>,
     transport_config: Arc<TransportConfig>,
     tls: TlsIdentity,
     /// The host's wall-clock time, shared with the TLS verifiers.
@@ -431,6 +454,18 @@ impl QuicTransport {
         }
         // Checked before any socket is bound.
         let transport_config = transport_config(node_config.limits())?;
+        if let Some(&unbound) = node_config
+            .webtransport
+            .iter()
+            .find(|addr| !binds.contains(addr))
+        {
+            return Err(QuicBindError::InvalidAddress {
+                addr: socket_addr_to_multiaddr(unbound),
+                reason: "WebTransport was enabled for an address that is not bound; \
+                         pass QuicNodeConfig::with_webtransport one of the bind addresses"
+                    .into(),
+            });
+        }
         let sockets = binds
             .into_iter()
             .map(|addr| {
@@ -470,8 +505,10 @@ impl QuicTransport {
                 let local_addr = udp
                     .local_addr()
                     .map_err(|e| QuicBindError::socket(requested, "read local address", &e))?;
-                Socket::new(udp, local_addr, max_pending_datagrams, tally.clone())
-                    .map_err(|e| QuicBindError::socket(local_addr, "configure", &e))
+                let mut socket = Socket::new(udp, local_addr, max_pending_datagrams, tally.clone())
+                    .map_err(|e| QuicBindError::socket(local_addr, "configure", &e))?;
+                socket.webtransport = node_config.webtransport.contains(&requested);
+                Ok(socket)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -490,6 +527,22 @@ impl QuicTransport {
             .transport_config(Arc::clone(&transport_config))
             .retry_token_lifetime(RETRY_TOKEN_LIFETIME)
             .validation_token_config(validation_tokens);
+        // A clone, so Retry tokens the endpoint's config issues stay valid.
+        let webtransport_config = if sockets.iter().any(|socket| socket.webtransport) {
+            let certificate =
+                tls.webtransport_certificate(node_config.keypair(), host_time.now().as_secs())?;
+            let server_tls = tls
+                .webtransport_server_config(certificate)
+                .map_err(|error| QuicBindError::tls(QuicTlsStage::ServerConfig, error))?;
+            let crypto = QuicServerConfig::try_from(server_tls)
+                .map_err(|error| QuicBindError::tls(QuicTlsStage::QuicCipherSuites, error))?;
+            let mut config = server_config.clone();
+            config.crypto = Arc::new(crypto);
+            config.transport = Arc::new(webtransport_transport_config(node_config.limits())?);
+            Some(Arc::new(config))
+        } else {
+            None
+        };
 
         let endpoint_config = EndpointConfig::default();
         let max_payload =
@@ -514,6 +567,7 @@ impl QuicTransport {
                 None,
             ),
             server_config: Arc::new(server_config),
+            webtransport_config,
             transport_config,
             tls,
             host_time,
@@ -789,7 +843,13 @@ impl QuicTransport {
             self.endpoint.ignore(incoming);
             return;
         };
-        match self.endpoint.accept(incoming, now, buf, None) {
+        // The receiving socket picks the config: libp2p-only sockets keep
+        // the endpoint's.
+        let config = socket
+            .webtransport
+            .then(|| self.webtransport_config.clone())
+            .flatten();
+        match self.endpoint.accept(incoming, now, buf, config) {
             Ok((handle, conn)) => {
                 // The accepted Initial never passes through `handle_event`.
                 let mut counters = ConnectionCounters::default();
