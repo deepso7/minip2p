@@ -517,9 +517,20 @@ fn every_validation_matrix_row_closes_with_its_code() {
             code::H3_ID_ERROR,
         ),
         (
-            "CANCEL_PUSH past MAX_PUSH_ID",
+            "CANCEL_PUSH within MAX_PUSH_ID, for a push never promised",
             |peer| {
-                peer.control_bytes(&after_settings(&[0x0d, 0x01, 0x02, 0x03, 0x01, 0x03]));
+                peer.control_bytes(&after_settings(&[0x0d, 0x01, 0x02, 0x03, 0x01, 0x02]));
+            },
+            code::H3_ID_ERROR,
+        ),
+        (
+            "a WebTransport uni stream naming an impossible session",
+            |peer| {
+                peer.control(DRAFT02);
+                let mut bytes = Vec::new();
+                encode_uni_stream_type(UniStreamType::WebTransport { session_id: 1 }, &mut bytes)
+                    .expect("type");
+                peer.uni(&bytes);
             },
             code::H3_ID_ERROR,
         ),
@@ -842,6 +853,12 @@ fn connect_requests_are_checked_field_by_field() {
         ("te other than trailers", plus((b"te", b"gzip")), "400"),
         ("a CR LF in a value", plus((b"x-test", b"a\r\nb")), "400"),
         ("an empty field name", plus((b"", b"value")), "400"),
+        (
+            "a host other than :authority",
+            plus((b"host", b"other.example:9999")),
+            "400",
+        ),
+        ("an empty host", plus((b"host", b"")), "400"),
     ];
     for (row, fields, expected) in rows {
         assert_eq!(refused_with(DRAFT02, &fields), expected, "{row}");
@@ -1505,10 +1522,8 @@ fn legal_push_and_qpack_instructions_leave_the_session_up() {
     let mut server = server();
     let mut events = Vec::new();
     let mut peer = H3Peer::connect(&mut server, &mut events);
-    // MAX_PUSH_ID 2, CANCEL_PUSH 2, MAX_PUSH_ID 2 again.
-    peer.control_bytes(&after_settings(&[
-        0x0d, 0x01, 0x02, 0x03, 0x01, 0x02, 0x0d, 0x01, 0x02,
-    ]));
+    // MAX_PUSH_ID 2, then MAX_PUSH_ID 2 again.
+    peer.control_bytes(&after_settings(&[0x0d, 0x01, 0x02, 0x0d, 0x01, 0x02]));
     // Stream Cancellations of streams 0 and 1000.
     peer.uni(&[0x03, 0x40, 0x7f, 0xa9, 0x0f]);
     peer.libp2p_connect();
@@ -1648,4 +1663,213 @@ fn a_stream_reset_before_its_prefix_has_the_servers_side_reset_too() {
     // The session goes on.
     peer.libp2p_connect();
     peer.authenticate(&mut server, &mut events);
+}
+
+#[test]
+fn a_host_matching_authority_is_accepted() {
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(DRAFT02);
+    let mut fields = libp2p_request(b"webtransport");
+    fields.push((b"host", b"127.0.0.1"));
+    peer.request(&fields);
+    peer.authenticate(&mut server, &mut events);
+}
+
+#[test]
+fn a_decreasing_credit_capsule_is_a_flow_control_error() {
+    let decreases = [
+        [Capsule::MaxData(1 << 21), Capsule::MaxData((1 << 21) - 1)],
+        [Capsule::MaxStreamsBidi(101), Capsule::MaxStreamsBidi(100)],
+        [Capsule::MaxStreamsUni(101), Capsule::MaxStreamsUni(100)],
+    ];
+    for [first, second] in decreases {
+        let (mut server, mut peer, _) = established(DRAFT14);
+        peer.capsule(&first);
+        peer.capsule(&second);
+        let (code, reason) = peer.closed_with(&mut server, &mut Vec::new());
+        assert_eq!(
+            code,
+            code::WT_FLOW_CONTROL_ERROR,
+            "{first:?} then {second:?}: {reason}"
+        );
+    }
+}
+
+/// How many RESET_STREAM frames the client has received.
+fn resets_received(peer: &mut H3Peer) -> u64 {
+    peer.raw.conn().stats().frame_rx.reset_stream
+}
+
+#[test]
+fn stopping_the_connect_stream_resets_it_and_ends_the_session() {
+    let (mut server, mut peer, _) = established(DRAFT02);
+    let mut events = Vec::new();
+    peer.raw.stop(peer.connect.expect("CONNECT"), 0);
+    peer.drive(
+        &mut server,
+        &mut events,
+        "the reset and close",
+        |peer, events| resets_received(peer) > 0 && server_closed(events),
+    );
+    assert_eq!(
+        close_reason(&events),
+        Some(&ConnectionCloseReason::Remote { code: 0 })
+    );
+}
+
+#[test]
+fn stopping_the_noise_stream_mid_handshake_resets_it_and_fails() {
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(DRAFT02);
+    peer.libp2p_connect();
+    let mut noise = initiator();
+    let stream = peer.wt_stream(&outbound(&mut noise).0);
+    let mut reply = Vec::new();
+    peer.drive(&mut server, &mut events, "the Noise reply", |peer, _| {
+        reply.extend(peer.raw.read(stream).0);
+        !reply.is_empty()
+    });
+    noise.on_data(reply).expect("noise data");
+    let (last, complete) = outbound(&mut noise);
+    assert!(complete);
+    // The client stops our side before its last message, then sends it
+    // once the server answered the stop.
+    peer.raw.stop(stream, 0);
+    peer.drive(&mut server, &mut events, "the server's reset", |peer, _| {
+        resets_received(peer) > 0 || peer.raw.is_closed()
+    });
+    peer.raw.write(stream, &last);
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
+    assert_eq!(code, code::H3_GENERAL_PROTOCOL_ERROR, "{reason}");
+    assert!(!connected(&events), "{events:?}");
+}
+
+/// Opens a WebTransport stream once the server grants credit, sends `app`
+/// and FIN, has the server finish its side, and returns once the client
+/// reads that FIN.
+fn round_trip_stream(
+    server: &mut QuicTransport,
+    peer: &mut H3Peer,
+    id: ConnectionId,
+    events: &mut Vec<TransportEvent>,
+) {
+    let mut stream = None;
+    peer.drive(server, events, "stream credit", |peer, _| {
+        stream = peer.raw.conn().streams().open(Dir::Bi).map(u64::from);
+        stream.is_some()
+    });
+    let stream = stream.expect("stream");
+    let mut data = Vec::new();
+    encode_webtransport_bidi_header(peer.connect.expect("session"), &mut data).expect("prefix");
+    data.extend_from_slice(b"app");
+    assert_eq!(peer.raw.write(stream, &data), data.len());
+    peer.raw.finish(stream);
+    peer.drive(server, events, "the application stream", |_, events| {
+        crate::test_peer::stream_bytes(events, stream) == b"app"
+    });
+    let stream_id = StreamId::new(stream);
+    server.ack_stream(id, stream_id, 3).expect("ack");
+    server
+        .close_stream_write(id, stream_id)
+        .expect("close write");
+    peer.drive(server, events, "the server's FIN", |peer, _| {
+        peer.raw.read(stream).1
+    });
+}
+
+#[test]
+fn stopping_the_noise_stream_after_authentication_resets_it_and_frees_its_slot() {
+    let mut server = server_with(QuicLimits {
+        max_streams_per_connection: 1,
+        ..QuicLimits::default()
+    });
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(DRAFT02);
+    peer.libp2p_connect();
+    // Credit for the Noise stream follows the 200.
+    peer.drive(&mut server, &mut events, "the 200", |peer, _| {
+        peer.status().is_some()
+    });
+    let mut noise = initiator();
+    let stream = peer.wt_stream(&outbound(&mut noise).0);
+    let mut reply = Vec::new();
+    peer.drive(&mut server, &mut events, "the Noise reply", |peer, _| {
+        reply.extend(peer.raw.read(stream).0);
+        !reply.is_empty()
+    });
+    noise.on_data(reply).expect("noise data");
+    let (last, complete) = outbound(&mut noise);
+    assert!(complete);
+    assert_eq!(peer.raw.write(stream, &last), last.len());
+    peer.raw.finish(stream);
+    // The client sends its last message, but reads nothing until it has
+    // stopped the stream: the server's FIN is still unacknowledged then.
+    peer.raw.service();
+    let start = Instant::now();
+    while !connected(&events) {
+        assert!(start.elapsed() < Duration::from_secs(5), "{events:?}");
+        std::thread::sleep(Duration::from_millis(1));
+        events.extend(server.poll(now()).expect("poll"));
+    }
+    peer.raw.stop(stream, 0);
+    peer.raw.service();
+    let until = Instant::now() + Duration::from_millis(50);
+    while Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(1));
+        events.extend(server.poll(now()).expect("poll"));
+    }
+    peer.drive(
+        &mut server,
+        &mut events,
+        "the Noise stream's reset",
+        |peer, _| resets_received(peer) > 0,
+    );
+    let id = events
+        .iter()
+        .find_map(|event| match event {
+            TransportEvent::Connected { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("connected");
+    // One application stream at a time: the second opens only once the
+    // Noise stream's slot is free as well as the first's.
+    round_trip_stream(&mut server, &mut peer, id, &mut events);
+    round_trip_stream(&mut server, &mut peer, id, &mut events);
+    assert!(!server_closed(&events), "{events:?}");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            TransportEvent::StreamWriteStopped { stream_id, .. }
+                | TransportEvent::IncomingStream { stream_id, .. }
+                if stream_id.as_u64() == stream
+        )),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn dropping_the_listener_closes_quic_even_while_a_session_is_closing() {
+    for close_first in [false, true] {
+        let (mut server, mut peer, id) = established(DRAFT02);
+        if close_first {
+            server.close(id).expect("close");
+        }
+        drop(server);
+        let start = Instant::now();
+        while !peer.raw.is_closed() {
+            // Well inside the Closing phase's 500 ms minimum and the idle
+            // timeout.
+            assert!(
+                start.elapsed() < Duration::from_millis(300),
+                "no CONNECTION_CLOSE (closed first: {close_first})"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+            peer.raw.pump();
+        }
+    }
 }

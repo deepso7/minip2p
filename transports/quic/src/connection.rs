@@ -547,7 +547,7 @@ impl QuicConnection {
             Event::Stream(StreamEvent::Stopped { id, error_code }) => {
                 let raw = u64::from(id);
                 if let Some(wt) = self.wt.as_mut()
-                    && wt.on_stopped(raw)
+                    && wt.on_stopped(&mut self.conn, raw, error_code)
                 {
                     self.after_wt(now, cx.events);
                 } else if self.surfaces_streams {
@@ -1397,6 +1397,16 @@ impl QuicConnection {
             VarInt::from_u64(code::H3_NO_ERROR).unwrap_or(VarInt::from_u32(0)),
             Bytes::new(),
         );
+    }
+
+    /// Ends a WebTransport session's Closing phase now, for a transport that
+    /// will not be polled again: QUIC closes with `H3_NO_ERROR` without
+    /// waiting for the deadline. Anything else is left as it is.
+    pub(crate) fn cut_wt_closing(&mut self, now: Instant) {
+        if self.wt_close_at.is_some() {
+            self.wt_close_at = Some(now);
+            self.finish_wt_closing(now);
+        }
     }
 
     /// Resets a stream's send half and stops its receive half with

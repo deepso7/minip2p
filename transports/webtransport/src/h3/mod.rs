@@ -80,7 +80,8 @@ pub mod setting {
     pub const WT_INITIAL_MAX_STREAMS_BIDI: u64 = 0x2b65;
 }
 
-/// HTTP/3 (RFC 9114 §8.1) and QPACK (RFC 9204 §6) error codes.
+/// HTTP/3 (RFC 9114 §8.1), QPACK (RFC 9204 §6) and WebTransport session
+/// error codes.
 pub mod code {
     pub const H3_NO_ERROR: u64 = 0x100;
     pub const H3_GENERAL_PROTOCOL_ERROR: u64 = 0x101;
@@ -102,6 +103,8 @@ pub mod code {
     pub const QPACK_DECOMPRESSION_FAILED: u64 = 0x200;
     pub const QPACK_ENCODER_STREAM_ERROR: u64 = 0x201;
     pub const QPACK_DECODER_STREAM_ERROR: u64 = 0x202;
+    /// A WebTransport session's flow control was violated (draft-14 §9.5).
+    pub const WT_FLOW_CONTROL_ERROR: u64 = 0x045d_4487;
 }
 
 /// The first HTTP/3 code of the WebTransport application error range.
