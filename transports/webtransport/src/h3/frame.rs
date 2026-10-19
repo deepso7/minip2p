@@ -443,7 +443,10 @@ mod tests {
         // CANCEL_PUSH 1, then MAX_PUSH_ID 2^14 (a two-byte varint).
         let mut decoder = FrameDecoder::new();
         assert_eq!(
-            decode_all(&mut decoder, &[0x03, 0x01, 0x01, 0x0d, 0x04, 0x80, 0x00, 0x40, 0x00]),
+            decode_all(
+                &mut decoder,
+                &[0x03, 0x01, 0x01, 0x0d, 0x04, 0x80, 0x00, 0x40, 0x00]
+            ),
             Ok(alloc::vec![Frame::CancelPush(1), Frame::MaxPushId(1 << 14)])
         );
         // A trailing byte after the push id is malformed.

@@ -711,8 +711,8 @@ impl QuicConnection {
     /// Sets the engine's peer bidi stream credit to the application limit
     /// plus `internal` streams the WebTransport session uses itself.
     fn reserve_wt_streams(&mut self, internal: u64) {
-        let count = VarInt::from_u64(self.max_streams.saturating_add(internal))
-            .unwrap_or(VarInt::MAX);
+        let count =
+            VarInt::from_u64(self.max_streams.saturating_add(internal)).unwrap_or(VarInt::MAX);
         self.conn.set_max_concurrent_streams(Dir::Bi, count);
     }
 

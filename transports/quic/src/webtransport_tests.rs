@@ -823,7 +823,10 @@ fn connect_requests_are_checked_field_by_field() {
         ),
         (
             "a CR LF in :path",
-            with(b":path", b"/.well-known/libp2p-webtransport?type=noise\r\nx: y"),
+            with(
+                b":path",
+                b"/.well-known/libp2p-webtransport?type=noise\r\nx: y",
+            ),
             "400",
         ),
         (
@@ -1523,13 +1526,18 @@ fn an_impossible_session_id_after_authentication_closes_the_connection() {
 }
 
 /// Accepts the server's control stream and sends STOP_SENDING on it.
-fn stop_server_control(peer: &mut H3Peer, server: &mut QuicTransport, events: &mut Vec<TransportEvent>) {
+fn stop_server_control(
+    peer: &mut H3Peer,
+    server: &mut QuicTransport,
+    events: &mut Vec<TransportEvent>,
+) {
     let mut control = None;
     peer.drive(server, events, "the server's control stream", |peer, _| {
         control = control.or_else(|| peer.raw.conn().streams().accept(Dir::Uni));
         control.is_some()
     });
-    peer.raw.stop(u64::from(control.expect("control stream")), 0);
+    peer.raw
+        .stop(u64::from(control.expect("control stream")), 0);
 }
 
 #[test]
@@ -1607,9 +1615,12 @@ fn a_one_stream_limit_still_authenticates_and_carries_one_stream() {
     encode_webtransport_bidi_header(peer.connect.expect("session"), &mut data).expect("prefix");
     data.extend_from_slice(b"app");
     assert_eq!(peer.raw.write(stream, &data), data.len());
-    peer.drive(&mut server, &mut events, "the application stream", |_, events| {
-        crate::test_peer::stream_bytes(events, stream) == b"app"
-    });
+    peer.drive(
+        &mut server,
+        &mut events,
+        "the application stream",
+        |_, events| crate::test_peer::stream_bytes(events, stream) == b"app",
+    );
 }
 
 #[test]

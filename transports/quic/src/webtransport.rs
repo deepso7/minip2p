@@ -5,7 +5,8 @@
 //! `Connected` on. It opens our control stream with SETTINGS, reads the
 //! client's control and QPACK streams, answers the CONNECT to
 //! [`LIBP2P_WEBTRANSPORT_PATH`] with 200 once the client's SETTINGS offer a
-//! draft we speak (draft-13/14 preferred, with its session flow control),
+//! draft we speak with HTTP/3 datagrams (draft-13/14 preferred, with its
+//! session flow control),
 //! and runs Noise XX as responder on the first stream with the
 //! session's `0x41` prefix. Its output is a list of [`WtEvent`]s for the
 //! connection to act on: authenticate, admit a stream, or fail.
@@ -356,7 +357,10 @@ impl WtSession {
     /// CONNECT stream has nothing in flight. Returns whether `raw` is one of
     /// the session's own streams, which the connection leaves alone.
     pub(crate) fn on_stopped(&mut self, raw: u64) -> bool {
-        if self.control.is_some_and(|control| u64::from(control) == raw) {
+        if self
+            .control
+            .is_some_and(|control| u64::from(control) == raw)
+        {
             self.fail(
                 code::H3_CLOSED_CRITICAL_STREAM,
                 "the client stopped our control stream".into(),
@@ -850,22 +854,14 @@ impl WtSession {
     /// a session not yet accepted (RFC 9297 §3.2); the stream's receive
     /// window bounds what waits.
     fn read_connect(&mut self, conn: &mut Connection) {
-        let Some(connect) = self
-            .connect
-            .as_mut()
-            .filter(|c| c.replied && !c.peer_ended)
-        else {
+        let Some(connect) = self.connect.as_mut().filter(|c| c.replied && !c.peer_ended) else {
             return;
         };
         let (bytes, end) = read_available(conn, connect.id);
         let mut input = &bytes[..];
         let mut closed_with = None;
-        let unexpected = |what: &str| {
-            Some((
-                code::H3_FRAME_UNEXPECTED,
-                format!("CONNECT stream: {what}"),
-            ))
-        };
+        let unexpected =
+            |what: &str| Some((code::H3_FRAME_UNEXPECTED, format!("CONNECT stream: {what}")));
         let mut failure = 'frames: loop {
             match connect.frames.decode(&mut input) {
                 // Trailers end the message (RFC 9114 §4.1).
@@ -1243,7 +1239,9 @@ fn valid_regular_field(field: &Field<'_>) -> bool {
 
 /// Whether a field value is free of NUL, CR and LF (RFC 9114 §4.1.2).
 fn valid_value(value: &[u8]) -> bool {
-    !value.iter().any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+    !value
+        .iter()
+        .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
 }
 
 /// The engine's id for a raw stream id.
