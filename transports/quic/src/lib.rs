@@ -49,6 +49,8 @@ mod test_peer;
 mod tls;
 mod webtransport;
 #[cfg(test)]
+mod webtransport_tests;
+#[cfg(test)]
 mod write_fairness_tests;
 
 pub use config::{QuicLimits, QuicNodeConfig};
@@ -257,6 +259,12 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
     // so reject it up front.
     if limits.idle_timeout_ms == 0 {
         return Err(invalid("idle_timeout_ms", "must be greater than zero"));
+    }
+    if limits.webtransport_handshake_timeout_ms == 0 {
+        return Err(invalid(
+            "webtransport_handshake_timeout_ms",
+            "must be greater than zero",
+        ));
     }
     for (field, window) in [
         ("stream_receive_window", limits.stream_receive_window),

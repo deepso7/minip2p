@@ -26,10 +26,10 @@ use minip2p_secure_mux::noise::{
 };
 use minip2p_webtransport::LIBP2P_WEBTRANSPORT_PATH;
 use minip2p_webtransport::h3::{
-    Frame, FrameDecoder, Settings, UniStreamHeaderDecoder, UniStreamType, code, encode_frame,
+    Capsule, CapsuleDecoder, Frame, FrameDecoder, Settings, UniStreamHeaderDecoder, UniStreamType, code, encode_frame,
     encode_uni_stream_type, frame_type, setting,
 };
-use minip2p_webtransport::qpack::{QpackDecoder, encode_field_section};
+use minip2p_webtransport::qpack::{FieldSection, QpackDecoder, encode_field_section};
 use quinn_proto::{Connection, Dir, ReadError, StreamId, VarInt};
 
 /// Prefixed streams held before the session is authenticated; one more
@@ -72,10 +72,24 @@ enum PeerUni {
 struct Connect {
     id: u64,
     frames: FrameDecoder,
+    /// The capsules its DATA frames carry.
+    capsules: CapsuleDecoder,
     /// The status the request earns, before the client's SETTINGS weigh in.
     request_status: &'static str,
     /// The response went out: 200 accepts the session.
     replied: bool,
+}
+
+/// The client's session flow-control credit for what we send (draft-13/14,
+/// once the client sent any `WT_INITIAL_MAX_*`): server-opened bidi streams,
+/// and stream bytes after their prefixes. Noise's handshake bytes are not
+/// counted.
+#[derive(Debug, Default)]
+struct Credit {
+    max_streams: u64,
+    opened: u64,
+    max_data: u64,
+    sent: u64,
 }
 
 /// The Noise stream and its responder session.
@@ -105,6 +119,8 @@ pub(crate) struct WtSession {
     held: VecDeque<(u64, u64)>,
     noise: Option<NoiseStream>,
     established: bool,
+    /// Session flow control, when the chosen draft and the client enable it.
+    credit: Option<Credit>,
     /// Bytes per stream the engine has not accepted yet, with whether a FIN
     /// follows them.
     out: HashMap<u64, (Vec<u8>, bool)>,
@@ -134,6 +150,7 @@ impl WtSession {
             held: VecDeque::new(),
             noise: None,
             established: false,
+            credit: None,
             out: HashMap::new(),
             events: Vec::new(),
         }
@@ -146,6 +163,34 @@ impl WtSession {
             .as_ref()
             .filter(|_| self.established)
             .map(|connect| connect.id)
+    }
+
+    /// Whether the client's credit allows opening another stream.
+    pub(crate) fn may_open_stream(&self) -> bool {
+        self.credit
+            .as_ref()
+            .is_none_or(|credit| credit.opened < credit.max_streams)
+    }
+
+    /// Counts a server-opened stream against the client's credit.
+    pub(crate) fn note_opened(&mut self) {
+        if let Some(credit) = self.credit.as_mut() {
+            credit.opened += 1;
+        }
+    }
+
+    /// Stream bytes the client's credit still allows.
+    pub(crate) fn data_room(&self) -> usize {
+        self.credit.as_ref().map_or(usize::MAX, |credit| {
+            usize::try_from(credit.max_data.saturating_sub(credit.sent)).unwrap_or(usize::MAX)
+        })
+    }
+
+    /// Counts stream bytes sent against the client's credit.
+    pub(crate) fn note_sent(&mut self, bytes: usize) {
+        if let Some(credit) = self.credit.as_mut() {
+            credit.sent = credit.sent.saturating_add(bytes as u64);
+        }
     }
 
     /// Whether the session reads `raw` itself rather than the connection.
@@ -348,6 +393,22 @@ impl WtSession {
                 Ok(None) => return None,
                 Ok(Some(Frame::Settings(settings))) if !*saw_settings => {
                     *saw_settings = true;
+                    // Legality comes before any draft is chosen, so a bad
+                    // value fails even beside a valid offer.
+                    let boolean = [
+                        setting::ENABLE_WEBTRANSPORT,
+                        setting::ENABLE_CONNECT_PROTOCOL,
+                        setting::H3_DATAGRAM,
+                    ];
+                    if let Some(id) = boolean
+                        .into_iter()
+                        .find(|&id| settings.get(id).is_some_and(|value| value > 1))
+                    {
+                        return Some((
+                            code::H3_SETTINGS_ERROR,
+                            format!("boolean setting {id:#x} is neither 0 nor 1"),
+                        ));
+                    }
                     self.settings = Some(settings);
                     self.reply(conn);
                 }
@@ -440,24 +501,7 @@ impl WtSession {
         }
         let mut decoder = QpackDecoder::new();
         let request_status = match decoder.decode(block) {
-            Ok(section) => {
-                let field = |name: &[u8]| section.get(name).unwrap_or_default();
-                let path = field(b":path");
-                if field(b":method") != b"CONNECT" || field(b":protocol") != b"webtransport" {
-                    "400"
-                } else if path == LIBP2P_WEBTRANSPORT_PATH.as_bytes() {
-                    "200"
-                } else if path.split(|&byte| byte == b'?').next()
-                    == LIBP2P_WEBTRANSPORT_PATH
-                        .split('?')
-                        .next()
-                        .map(str::as_bytes)
-                {
-                    "400"
-                } else {
-                    "404"
-                }
-            }
+            Ok(section) => request_status(&section),
             Err(error) => {
                 self.fail(error.code(), format!("CONNECT request: {error}"));
                 return;
@@ -466,6 +510,7 @@ impl WtSession {
         self.connect = Some(Connect {
             id: raw,
             frames,
+            capsules: CapsuleDecoder::new(),
             request_status,
             replied: false,
         });
@@ -483,15 +528,33 @@ impl WtSession {
             return;
         }
         connect.replied = true;
-        let offers_webtransport = settings.get(setting::ENABLE_WEBTRANSPORT) == Some(1)
-            || settings
-                .get(setting::WT_MAX_SESSIONS)
-                .is_some_and(|sessions| sessions >= 1);
-        let status = if offers_webtransport {
+        // The highest draft both sides speak: 13/14 (Safari), else 02
+        // (Chrome, Firefox).
+        let draft14 = settings
+            .get(setting::WT_MAX_SESSIONS)
+            .is_some_and(|sessions| sessions >= 1);
+        let draft02 = settings.get(setting::ENABLE_WEBTRANSPORT) == Some(1);
+        let status = if draft14 || draft02 {
             connect.request_status
         } else {
             "400"
         };
+        // Draft-13/14 flow control is on once both sides sent a limit; ours
+        // are 2^60, so only the client's ever bind.
+        let limits = [
+            setting::WT_INITIAL_MAX_DATA,
+            setting::WT_INITIAL_MAX_STREAMS_BIDI,
+            setting::WT_INITIAL_MAX_STREAMS_UNI,
+        ];
+        if draft14 && limits.iter().any(|&id| settings.get(id).unwrap_or(0) > 0) {
+            self.credit = Some(Credit {
+                max_streams: settings
+                    .get(setting::WT_INITIAL_MAX_STREAMS_BIDI)
+                    .unwrap_or(0),
+                max_data: settings.get(setting::WT_INITIAL_MAX_DATA).unwrap_or(0),
+                ..Credit::default()
+            });
+        }
         let id = connect.id;
         let mut block = Vec::new();
         encode_field_section([(&b":status"[..], status.as_bytes())], &mut block);
@@ -511,23 +574,61 @@ impl WtSession {
         self.promote_held(conn);
     }
 
-    /// The CONNECT stream after its request: capsules are not read yet,
-    /// and its end ends the session.
+    /// The CONNECT stream after its request: its DATA frames carry
+    /// capsules, which raise the client's credit or close the session, and
+    /// its end ends the session.
     fn read_connect(&mut self, conn: &mut Connection) {
         let Some(connect) = self.connect.as_mut() else {
             return;
         };
         let (bytes, end) = read_available(conn, connect.id);
         let mut input = &bytes[..];
-        loop {
-            match connect.frames.decode(&mut input) {
-                Ok(Some(_)) => {}
+        let mut failure = None;
+        while failure.is_none() {
+            let mut chunk = match connect.frames.decode(&mut input) {
+                Ok(Some(Frame::Data(chunk))) => chunk,
+                // Trailers and skipped frames carry nothing for us.
+                Ok(Some(_)) => continue,
                 Ok(None) => break,
                 Err(error) => {
-                    self.fail(error.code(), format!("CONNECT stream: {error}"));
-                    return;
+                    failure = Some((error.code(), format!("CONNECT stream: {error}")));
+                    break;
+                }
+            };
+            loop {
+                match connect.capsules.decode(&mut chunk) {
+                    Ok(None) => break,
+                    Ok(Some(Capsule::CloseSession { .. })) => {
+                        failure = Some((
+                            code::H3_NO_ERROR,
+                            "the client closed the WebTransport session".into(),
+                        ));
+                        break;
+                    }
+                    Ok(Some(capsule)) => {
+                        if let Some(credit) = self.credit.as_mut() {
+                            match capsule {
+                                Capsule::MaxData(max) => {
+                                    credit.max_data = credit.max_data.max(max);
+                                }
+                                Capsule::MaxStreamsBidi(max) => {
+                                    credit.max_streams = credit.max_streams.max(max);
+                                }
+                                // We open no uni streams.
+                                Capsule::MaxStreamsUni(_) | Capsule::CloseSession { .. } => {}
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some((error.code(), format!("CONNECT capsule: {error}")));
+                        break;
+                    }
                 }
             }
+        }
+        if let Some((code, reason)) = failure {
+            self.fail(code, reason);
+            return;
         }
         if !matches!(end, ReadEnd::Open) {
             self.fail(
@@ -671,6 +772,50 @@ impl WtSession {
                 "the client ended the Noise stream mid-handshake".into(),
             );
         }
+    }
+}
+
+/// The status a CONNECT request earns on its own: 200 for the libp2p
+/// WebTransport request, 404 for another path, 400 for another query or a
+/// malformed request.
+///
+/// Well formed means exactly one each of `:method CONNECT`, `:protocol
+/// webtransport` (the token drafts 02 and 13/14 share; draft-15's
+/// `webtransport-h3` is not served), `:scheme https`, `:authority` and
+/// `:path`, no other pseudo-header, and none after a regular field.
+fn request_status(section: &FieldSection<'_>) -> &'static str {
+    const PSEUDO: [&[u8]; 5] = [b":method", b":protocol", b":scheme", b":authority", b":path"];
+    let mut values: [Option<&[u8]>; 5] = [None; 5];
+    let mut regular = false;
+    for field in section.iter() {
+        if !field.name.starts_with(b":") {
+            regular = true;
+            continue;
+        }
+        let slot = PSEUDO
+            .iter()
+            .position(|name| *name == field.name)
+            .and_then(|index| values.get_mut(index));
+        match slot {
+            Some(slot @ None) if !regular => *slot = Some(field.value),
+            _ => return "400",
+        }
+    }
+    let [Some(method), Some(protocol), Some(scheme), Some(_), Some(path)] = values else {
+        return "400";
+    };
+    if method != b"CONNECT" || protocol != b"webtransport" || scheme != b"https" {
+        return "400";
+    }
+    let (want_path, _) = LIBP2P_WEBTRANSPORT_PATH
+        .split_once('?')
+        .unwrap_or((LIBP2P_WEBTRANSPORT_PATH, ""));
+    if path == LIBP2P_WEBTRANSPORT_PATH.as_bytes() {
+        "200"
+    } else if path.split(|&byte| byte == b'?').next() == Some(want_path.as_bytes()) {
+        "400"
+    } else {
+        "404"
     }
 }
 
