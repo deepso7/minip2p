@@ -143,6 +143,10 @@ struct Connect {
     /// The peer acknowledged our FIN, or stopped our side: nothing we
     /// sent on it is still in flight.
     delivered: bool,
+    /// We reset and stopped it with `H3_MESSAGE_ERROR` for data after the
+    /// close capsule. Nothing acknowledges that, so only the Closing
+    /// deadline may close QUIC.
+    refused: bool,
 }
 
 /// The client's session flow-control credit for what we send (draft-13/14,
@@ -390,11 +394,12 @@ impl WtSession {
     /// finished or reset its side of the CONNECT stream (or never opened
     /// one) and acknowledged our FIN on the
     /// CONNECT stream, or stopped it. Packets the connection queued before
-    /// that FIN (its resets) went out with or ahead of it.
+    /// that FIN (its resets) went out with or ahead of it. A CONNECT stream
+    /// we refused for data after the close capsule never qualifies.
     pub(crate) fn ended_and_delivered(&self) -> bool {
-        self.connect
-            .as_ref()
-            .is_none_or(|connect| connect.peer_ended && connect.delivered)
+        self.connect.as_ref().is_none_or(|connect| {
+            connect.peer_ended && connect.delivered && !connect.refused
+        })
     }
 
     /// The engine is done sending on `raw`: everything was acknowledged, or
@@ -881,6 +886,7 @@ impl WtSession {
             trailers: false,
             close_received: false,
             delivered: false,
+            refused: false,
         });
         if stopped.is_some() {
             // Our side is reset: nothing to answer or finish.
@@ -1049,10 +1055,11 @@ impl WtSession {
         };
         if trailing {
             // The reset is in flight, with no acknowledgement to wait
-            // for: the Closing phase's deadline lets it out.
+            // for: the Closing phase's deadline lets it out, whatever an
+            // acknowledgement of our FIN read in the same poll says.
             connect.peer_ended = true;
             connect.finished = true;
-            connect.delivered = false;
+            connect.refused = true;
             let id = connect.id;
             self.out.remove(&id);
             refuse(conn, id, code::H3_MESSAGE_ERROR);

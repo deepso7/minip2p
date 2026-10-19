@@ -1230,14 +1230,20 @@ impl QuicConnection {
         }
     }
 
-    /// Queues the stream's FIN behind its queued writes.
+    /// Queues the stream's FIN behind its queued writes. A closing
+    /// connection has reset every send half, so there is nothing to finish.
     pub(crate) fn close_stream_write(&mut self, stream_id: StreamId) -> Result<(), TransportError> {
+        let closing = self.is_closing();
         let state = self.stream_state_mut(stream_id)?;
-        if state.local_write_closed {
+        if closing || state.local_write_closed {
             return Err(TransportError::StreamCloseWriteFailed {
                 id: self.id,
                 stream_id,
-                reason: "local stream write side is already closed".into(),
+                reason: if closing {
+                    "connection is closing".into()
+                } else {
+                    "local stream write side is already closed".into()
+                },
             });
         }
         state.local_write_closed = true;
@@ -1373,6 +1379,10 @@ impl QuicConnection {
             .collect();
         for raw in bound {
             self.reset_on_wire(raw);
+        }
+        // No send half is left, bound or not: an unbound stream never opens.
+        for state in self.stream_states.values_mut() {
+            state.local_write_closed = true;
         }
         let code = self.stream_code();
         if let Some(wt) = self.wt.as_mut() {

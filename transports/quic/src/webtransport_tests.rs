@@ -2142,3 +2142,50 @@ fn a_fin_after_a_close_capsule_ends_the_session_cleanly() {
     );
     assert_eq!(resets_received(&mut peer), 0);
 }
+
+#[test]
+fn data_after_a_close_capsule_is_stopped_even_when_our_fin_ack_lands_in_the_same_poll() {
+    let (mut server, mut peer, _) = established(DRAFT02);
+    let mut events = Vec::new();
+    idle(&mut server, &mut peer, &mut events, 50);
+    let connect = peer.connect.expect("CONNECT");
+    peer.capsule(&Capsule::CloseSession {
+        code: 42,
+        reason: String::new(),
+    });
+    peer.raw.service();
+    events.extend(server.poll(now()).expect("poll the capsule"));
+    // Trailing data goes out before the client has seen the server's FIN;
+    // the FIN's acknowledgement follows, and one server poll reads both.
+    peer.capsule(&Capsule::MaxData(4096));
+    peer.raw.service();
+    peer.raw.receive();
+    peer.raw.run_engine();
+    assert!(peer.raw.read(connect).1, "the server's FIN");
+    peer.connect = None;
+    std::thread::sleep(Duration::from_millis(30));
+    peer.raw.service();
+    events.extend(server.poll(now()).expect("poll the data and the ACK"));
+    idle(&mut server, &mut peer, &mut events, 100);
+    let sid = crate::test_peer::sid(connect);
+    let stopped = peer.raw.conn().send_stream(sid).stopped();
+    assert!(
+        matches!(stopped, Ok(Some(code)) if code.into_inner() == code::H3_MESSAGE_ERROR),
+        "no H3_MESSAGE_ERROR STOP_SENDING: {stopped:?}"
+    );
+}
+
+#[test]
+fn a_fin_on_a_stream_after_close_is_refused_and_the_close_stays_orderly() {
+    let (mut server, mut peer, id) = established(DRAFT02);
+    let mut events = Vec::new();
+    let stream = server.open_stream(id).expect("open");
+    server
+        .send_stream(id, stream, Bytes::from_static(b"x"))
+        .expect("send");
+    idle(&mut server, &mut peer, &mut events, 30);
+    server.close(id).expect("close");
+    assert!(server.close_stream_write(id, stream).is_err());
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
+    assert_eq!(code, code::H3_NO_ERROR, "{reason}");
+}
