@@ -41,7 +41,7 @@ Other limits:
 
 - Only WebTransport addresses with certhashes dial; a `/quic-v1` or `/tcp` candidate fails as a candidate. There is no CA-certificate mode.
 - `listenAddrs()` is always empty (a reservation is `circuitAddress`), `knownPeers()` is empty and `reachability()` stays `unknown`.
-- `close()` closes every session at once with WebTransport's close capsule; its timeout bounds nothing.
+- `close()` closes every session at once with WebTransport's close capsule; its timeout is ignored. `setActive()` is ignored as well: the page's own timers drive the endpoint.
 - A page on a public origin that dials a private address may trigger Chrome's Local Network Access prompt.
 - A trapped wasm module (a Rust panic) fails the endpoint with `DriverFailedError`; later calls throw `ClosedError`. Create a new endpoint to carry on.
 

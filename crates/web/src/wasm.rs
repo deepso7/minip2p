@@ -89,7 +89,10 @@ impl WebEndpoint {
     }
 
     /// Closes the endpoint; `EndpointClosed` is the last event drained.
-    /// Connections close at once, so the timeout bounds nothing here.
+    ///
+    /// The timeout is ignored in the browser: every session closes at once
+    /// (`WebTransport.close()` sends the close capsule), so there is no
+    /// drain for it to bound.
     pub fn close(&mut self, _timeout_ms: u32) {
         let now = self.now();
         if self.host.close(now) {
@@ -146,7 +149,9 @@ impl WebEndpoint {
         js_result(self.host.peer_info(peer_id))
     }
 
-    /// Accepted for compatibility; has no effect.
+    /// Ignored in the browser, kept for the shared SDK surface: there is no
+    /// background driver whose cadence it could change. The page's own
+    /// timers pump the endpoint.
     #[wasm_bindgen(js_name = setActive)]
     pub fn set_active(&self, _active: bool) {}
 

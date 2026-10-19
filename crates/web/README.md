@@ -17,7 +17,7 @@ Two layers:
 
 ## Browser limits
 
-The constructor rejects, with `InvalidConfig` and a reason, what a browser cannot run: `listen`, `mdns`, `discovery`, `autonatServers`, and `forceRelay` without `relays`. With relays the host always reserves (`ReservationPolicy::Always`) and never hole punches (`NatConfig::dcutr = false`): a connect to a native peer races the direct dial against the relay leg and settles `Direct` or `Relayed`. Only `/…/quic-v1/webtransport/certhash/…/p2p/…` addresses dial; anything else fails as a connect candidate. `close` closes every session at once (`WebTransport.close()` sends the close capsule), so its timeout bounds nothing.
+The constructor rejects, with `InvalidConfig` and a reason, what a browser cannot run: `listen`, `mdns`, `discovery`, `autonatServers`, and `forceRelay` without `relays`. With relays the host always reserves (`ReservationPolicy::Always`) and never hole punches (`NatConfig::dcutr = false`): a connect to a native peer races the direct dial against the relay leg and settles `Direct` or `Relayed`. Only `/…/quic-v1/webtransport/certhash/…/p2p/…` addresses dial; anything else fails as a connect candidate. `close` closes every session at once (`WebTransport.close()` sends the close capsule), so its timeout is ignored, and `setActive` is ignored too: there is no background driver, only the page's timers.
 
 ## Building
 

@@ -33,7 +33,10 @@ export class WebEndpoint {
     closeStreamWrite(conn_id: bigint, stream_id: bigint): void;
     /**
      * Closes the endpoint; `EndpointClosed` is the last event drained.
-     * Connections close at once, so the timeout bounds nothing here.
+     *
+     * The timeout is ignored in the browser: every session closes at once
+     * (`WebTransport.close()` sends the close capsule), so there is no
+     * drain for it to bound.
      */
     close(_timeout_ms: number): void;
     /**
@@ -126,7 +129,9 @@ export class WebEndpoint {
      */
     sendStream(conn_id: bigint, stream_id: bigint, data: Uint8Array): boolean;
     /**
-     * Accepted for compatibility; has no effect.
+     * Ignored in the browser, kept for the shared SDK surface: there is no
+     * background driver whose cadence it could change. The page's own
+     * timers pump the endpoint.
      */
     setActive(_active: boolean): void;
     /**
