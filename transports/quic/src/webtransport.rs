@@ -45,7 +45,7 @@ use minip2p_webtransport::h3::{
     code, encode_frame, encode_uni_stream_type, frame_type, setting,
 };
 use minip2p_webtransport::qpack::{
-    DecoderStreamReader, FieldSection, QpackDecoder, encode_field_section,
+    DecoderStreamReader, Field, FieldSection, QpackDecoder, encode_field_section,
 };
 use quinn_proto::{Connection, Dir, ReadError, StreamId, VarInt};
 
@@ -127,6 +127,8 @@ struct Connect {
     finished: bool,
     /// The peer finished or reset its side.
     peer_ended: bool,
+    /// The peer sent its trailer section: nothing may follow.
+    trailers: bool,
     /// The peer acknowledged our FIN, or stopped our side: nothing we
     /// sent on it is still in flight.
     delivered: bool,
@@ -759,6 +761,7 @@ impl WtSession {
             replied: false,
             finished: false,
             peer_ended: false,
+            trailers: false,
             delivered: false,
         });
         self.reply(conn);
@@ -842,8 +845,18 @@ impl WtSession {
         let (bytes, end) = read_available(conn, connect.id);
         let mut input = &bytes[..];
         let mut closed_with = None;
-        let failure = 'frames: loop {
+        let unexpected = |what: &str| {
+            Some((
+                code::H3_FRAME_UNEXPECTED,
+                format!("CONNECT stream: {what}"),
+            ))
+        };
+        let mut failure = 'frames: loop {
             match connect.frames.decode(&mut input) {
+                // Trailers end the message (RFC 9114 §4.1).
+                Ok(Some(Frame::Data(_) | Frame::Headers(_))) if connect.trailers => {
+                    break unexpected("a frame after the trailer section");
+                }
                 Ok(Some(Frame::Data(mut chunk))) => loop {
                     match connect.capsules.decode(&mut chunk) {
                         Ok(Some(Capsule::CloseSession { code, .. })) => {
@@ -855,15 +868,33 @@ impl WtSession {
                             }
                         }
                         Ok(None) => break,
-                        Err(error) => break 'frames Some(error),
+                        Err(error) => {
+                            break 'frames Some((error.code(), format!("CONNECT stream: {error}")));
+                        }
                     }
                 },
-                Ok(Some(_)) => {}
+                Ok(Some(Frame::Headers(block))) => {
+                    connect.trailers = true;
+                    let mut decoder = QpackDecoder::new();
+                    match decoder.decode(&block) {
+                        Ok(section) if section.iter().all(|field| valid_regular_field(&field)) => {}
+                        Ok(_) => {
+                            break Some((
+                                code::H3_MESSAGE_ERROR,
+                                "CONNECT stream: a malformed trailer section".into(),
+                            ));
+                        }
+                        Err(error) => {
+                            break Some((error.code(), format!("CONNECT trailers: {error}")));
+                        }
+                    }
+                }
+                // Control-stream frames.
+                Ok(Some(frame)) => break unexpected(&format!("{frame:?}")),
                 Ok(None) => break None,
-                Err(error) => break Some(error),
+                Err(error) => break Some((error.code(), format!("CONNECT stream: {error}"))),
             }
         };
-        let mut failure = failure.map(|error| (error.code(), format!("CONNECT stream: {error}")));
         if !matches!(end, ReadEnd::Open) {
             connect.peer_ended = true;
             closed_with.get_or_insert(0);
@@ -1132,6 +1163,33 @@ fn request_status(section: &FieldSection<'_>) -> &'static str {
     } else {
         "404"
     }
+}
+
+/// Whether a regular (non-pseudo) field may appear in a request or its
+/// trailers (RFC 9114 §4.2, RFC 9110 §5): a lowercase token name, a value
+/// without NUL, CR or LF, and none of HTTP/1.1's connection-specific fields
+/// (`te` only as `trailers`).
+fn valid_regular_field(field: &Field<'_>) -> bool {
+    const CONNECTION_SPECIFIC: [&[u8]; 5] = [
+        b"connection",
+        b"keep-alive",
+        b"proxy-connection",
+        b"transfer-encoding",
+        b"upgrade",
+    ];
+    let token = |byte: u8| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    };
+    !field.name.is_empty()
+        && field.name.iter().all(|&byte| token(byte))
+        && valid_value(field.value)
+        && !CONNECTION_SPECIFIC.contains(&field.name)
+        && (field.name != b"te" || field.value == b"trailers")
+}
+
+/// Whether a field value is free of NUL, CR and LF (RFC 9114 §4.1.2).
+fn valid_value(value: &[u8]) -> bool {
+    !value.iter().any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
 }
 
 /// The engine's id for a raw stream id.

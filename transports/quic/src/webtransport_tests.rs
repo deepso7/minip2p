@@ -403,6 +403,13 @@ fn after_settings(frames: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// Offers draft-02, sends the libp2p CONNECT, then `frames` on it.
+fn connect_then(peer: &mut H3Peer, frames: &[u8]) {
+    peer.control(DRAFT02);
+    let connect = peer.libp2p_connect();
+    assert_eq!(peer.raw.write(connect, frames), frames.len());
+}
+
 /// A GOAWAY frame for stream 0.
 const GOAWAY: &[u8] = &[0x07, 0x01, 0x00];
 
@@ -636,6 +643,38 @@ fn every_validation_matrix_row_closes_with_its_code() {
                 peer.control_bytes(&after_settings(GOAWAY));
             },
             code::H3_NO_ERROR,
+        ),
+        (
+            "SETTINGS on the CONNECT stream",
+            |peer| connect_then(peer, &draft02_settings()),
+            code::H3_FRAME_UNEXPECTED,
+        ),
+        (
+            "CANCEL_PUSH on the CONNECT stream",
+            |peer| connect_then(peer, &[0x03, 0x01, 0x00]),
+            code::H3_FRAME_UNEXPECTED,
+        ),
+        (
+            "a trailer section QPACK cannot decode",
+            |peer| connect_then(peer, &[0x01, 0x03, 0x01, 0x00, 0x80]),
+            code::QPACK_DECOMPRESSION_FAILED,
+        ),
+        (
+            "a pseudo-header in a trailer section",
+            |peer| connect_then(peer, &[0x01, 0x03, 0x00, 0x00, 0xd9]),
+            code::H3_MESSAGE_ERROR,
+        ),
+        (
+            "DATA after a trailer section",
+            |peer| {
+                let mut frames = Vec::new();
+                let mut block = Vec::new();
+                encode_field_section([(&b"x-trailer"[..], &b"1"[..])], &mut block);
+                encode_frame(frame_type::HEADERS, &block, &mut frames).expect("HEADERS");
+                frames.extend([0x00, 0x00]);
+                connect_then(peer, &frames);
+            },
+            code::H3_FRAME_UNEXPECTED,
         ),
         (
             "the CONNECT stream finished mid-frame",
