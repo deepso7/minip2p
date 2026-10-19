@@ -28,7 +28,12 @@ This crate focuses on typed address handling, peer-qualified endpoint types, Con
 - `/tcp/<port>`
 - `/udp/<port>`
 - `/quic-v1`
+- `/webtransport`
+- `/certhash/<multibase multihash>`
 - `/p2p/<peer-id>`
+- `/p2p-circuit`
+
+A `/certhash` is a WebTransport server certificate hash, held as a `Multihash` (`minip2p_identity::Multihash`, re-exported here). Both codecs accept only sha2-256 with a 32-byte digest. Text parsing accepts the base58btc (`z`), base64url (`u`), base32 (`b`/`B`) and base16 (`f`/`F`) multibases; printing always uses base64url (`u…`), as rust-libp2p and js-libp2p do, so a base58btc address from go-libp2p prints differently but means the same thing. `Multiaddr::certhashes()` iterates them and `without_certhashes()` strips them.
 
 DNS names are validated identically by the text and binary codecs: a name may not be empty or contain `/`, whitespace, or control characters. Without that, a binary name containing `/` would print as several components and re-parse into a _different_ address.
 
@@ -40,9 +45,10 @@ DNS names are validated identically by the text and binary codecs: a name may no
 | ---------------------------- | --------------------------- |
 | `/<host>/tcp/<port>`         | `Some(TransportKind::Tcp)`  |
 | `/<host>/udp/<port>/quic-v1` | `Some(TransportKind::Quic)` |
+| `/<host>/udp/<port>/quic-v1/webtransport[/certhash/<hash>]*` | `Some(TransportKind::Quic)` |
 | anything else                | `None`                      |
 
-A trailing `/p2p/<peer-id>` makes an address a _peer_ address rather than a transport address, so it classifies as `None`; strip it with `PeerAddr::transport()` first. `is_quic_transport()` and `is_tcp_transport()` answer the same question for one transport.
+A trailing `/p2p/<peer-id>` makes an address a _peer_ address rather than a transport address, so it classifies as `None`; strip it with `PeerAddr::transport()` first. `is_quic_transport()` and `is_tcp_transport()` answer the same question for one transport. `is_quic_transport()` is exact: a WebTransport address is not one, which keeps hole punching and NAT candidates on plain QUIC. `is_webtransport()` matches the WebTransport shape.
 
 ## Usage
 
@@ -65,12 +71,12 @@ use minip2p_core::Multiaddr;
 
 let addr = Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").unwrap();
 let bytes = addr.to_bytes();
-// [0x04, 0x7F, 0x00, 0x00, 0x01, 0x91, 0x02, 0x0F, 0xA1, 0xCC, 0x03]
+// [0x04, 0x7F, 0x00, 0x00, 0x01, 0x91, 0x02, 0x0F, 0xA1, 0xCD, 0x03]
 let decoded = Multiaddr::from_bytes(&bytes).unwrap();
 assert_eq!(decoded, addr);
 ```
 
-Wire layout: each component is `<varint(multicodec)><value>`. Value shape depends on the protocol: fixed-size bytes for ip4/ip6 and for the tcp/udp ports (both two bytes, big-endian), varint-length-prefixed UTF-8 for dns*, varint-length-prefixed multihash for p2p, absent for quic-v1 and p2p-circuit. See <https://github.com/multiformats/multiaddr> for the full spec.
+Wire layout: each component is `<varint(multicodec)><value>`. Value shape depends on the protocol: fixed-size bytes for ip4/ip6 and for the tcp/udp ports (both two bytes, big-endian), varint-length-prefixed UTF-8 for dns*, varint-length-prefixed multihash for p2p, varint-length-prefixed multihash for certhash, absent for quic-v1, webtransport and p2p-circuit. See <https://github.com/multiformats/multiaddr> for the full spec.
 
 Work with peer-qualified addresses:
 

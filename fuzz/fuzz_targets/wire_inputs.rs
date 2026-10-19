@@ -301,6 +301,21 @@ fn expected_transport_kind(addr: &Multiaddr) -> Option<TransportKind> {
     match addr.protocols() {
         [host, Protocol::Tcp(_)] if host.is_host() => Some(TransportKind::Tcp),
         [host, Protocol::Udp(_), Protocol::QuicV1] if host.is_host() => Some(TransportKind::Quic),
+        // WebTransport rides the QUIC transport: quic-v1, webtransport, then
+        // only certhashes.
+        [
+            host,
+            Protocol::Udp(_),
+            Protocol::QuicV1,
+            Protocol::WebTransport,
+            rest @ ..,
+        ] if host.is_host()
+            && rest
+                .iter()
+                .all(|protocol| matches!(protocol, Protocol::Certhash(_))) =>
+        {
+            Some(TransportKind::Quic)
+        }
         _ => None,
     }
 }

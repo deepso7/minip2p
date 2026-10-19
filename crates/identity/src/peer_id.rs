@@ -341,7 +341,6 @@ fn build_multihash(code: u64, digest: &[u8]) -> PeerMultihash {
         .expect("peer id digests are bounded (identity<=42, sha2-256=32)")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,7 +440,6 @@ mod tests {
             }
         );
     }
-
 
     #[test]
     fn reports_cid_varint_context() {

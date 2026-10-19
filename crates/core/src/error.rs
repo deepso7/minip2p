@@ -55,7 +55,7 @@ pub enum MultiaddrError {
     Varint(#[from] VarintError),
 }
 
-/// Errors from decoding a [`Certhash`](crate::Certhash).
+/// Errors from decoding a `/certhash` value.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CerthashError {
     #[error("certhash is empty")]
@@ -66,14 +66,12 @@ pub enum CerthashError {
     UnsupportedMultibase(char),
     #[error("invalid multibase text: {reason}")]
     InvalidMultibase { reason: String },
-    #[error("invalid multihash varint: {0}")]
-    Varint(#[from] VarintError),
+    #[error("invalid multihash: {reason}")]
+    InvalidMultihash { reason: String },
     #[error("unsupported certhash multihash code {code:#x}; expected sha2-256 (0x12)")]
     UnsupportedHashCode { code: u64 },
-    #[error(
-        "invalid sha2-256 digest: expected 32 bytes, declared {declared} and carried {actual}"
-    )]
-    InvalidDigestLength { declared: u64, actual: usize },
+    #[error("invalid sha2-256 digest length: expected 32, got {actual}")]
+    InvalidDigestLength { actual: usize },
 }
 
 /// Errors from parsing or constructing a peer address.

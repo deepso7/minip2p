@@ -1,10 +1,10 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_identity::{PeerId, read_uvarint_with_remainder, write_uvarint};
+use minip2p_identity::{Multihash, PeerId, read_uvarint_with_remainder, write_uvarint};
 
-use crate::{Certhash, MultiaddrError};
 use crate::multiaddr::is_valid_dns;
+use crate::{MultiaddrError, certhash};
 
 // ---------------------------------------------------------------------------
 // Multicodec codes
@@ -55,7 +55,10 @@ pub enum Protocol {
     /// `/webtransport`: libp2p WebTransport over the preceding QUIC address.
     WebTransport,
     /// `/certhash/<multihash>`: a WebTransport server certificate hash.
-    Certhash(Certhash),
+    ///
+    /// Must be sha2-256 with a 32-byte digest: both decoders reject anything
+    /// else, so other values built by hand do not round-trip.
+    Certhash(Multihash),
     P2p(PeerId),
     P2pCircuit,
 }
@@ -105,7 +108,7 @@ impl Protocol {
             Self::Tcp(port) | Self::Udp(port) => out.extend_from_slice(&port.to_be_bytes()),
             Self::QuicV1 | Self::WebTransport | Self::P2pCircuit => {}
             Self::Certhash(hash) => {
-                let body = hash.to_multihash_bytes();
+                let body = hash.to_bytes();
                 write_uvarint(body.len() as u64, out);
                 out.extend_from_slice(&body);
             }
@@ -145,12 +148,11 @@ impl Protocol {
             WEBTRANSPORT_CODE => Ok((Self::WebTransport, rest)),
             CERTHASH_CODE => {
                 let (body, rest) = length_prefixed(rest, "certhash")?;
-                let hash = Certhash::from_multihash_bytes(body).map_err(|e| {
-                    MultiaddrError::InvalidBinaryValue {
+                let hash =
+                    certhash::from_bytes(body).map_err(|e| MultiaddrError::InvalidBinaryValue {
                         protocol: "certhash",
                         reason: e.to_string(),
-                    }
-                })?;
+                    })?;
                 Ok((Self::Certhash(hash), rest))
             }
             DNS_CODE | DNS4_CODE | DNS6_CODE => {

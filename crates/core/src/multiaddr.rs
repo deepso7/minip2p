@@ -1,9 +1,9 @@
 use alloc::{string::ToString, vec::Vec};
 use core::{fmt, net::Ipv6Addr, str::FromStr};
 
-use minip2p_identity::PeerId;
+use minip2p_identity::{Multihash, PeerId};
 
-use crate::{Certhash, MultiaddrError, Protocol};
+use crate::{MultiaddrError, Protocol, certhash};
 
 /// An ordered sequence of protocol components representing a network address.
 ///
@@ -105,7 +105,7 @@ impl Multiaddr {
     }
 
     /// Returns the `/certhash` components, in address order.
-    pub fn certhashes(&self) -> impl Iterator<Item = &Certhash> {
+    pub fn certhashes(&self) -> impl Iterator<Item = &Multihash> {
         self.protocols.iter().filter_map(|protocol| match protocol {
             Protocol::Certhash(hash) => Some(hash),
             _ => None,
@@ -234,7 +234,10 @@ impl fmt::Display for Multiaddr {
                 Protocol::Udp(port) => write!(f, "/udp/{port}")?,
                 Protocol::QuicV1 => f.write_str("/quic-v1")?,
                 Protocol::WebTransport => f.write_str("/webtransport")?,
-                Protocol::Certhash(hash) => write!(f, "/certhash/{hash}")?,
+                Protocol::Certhash(hash) => {
+                    f.write_str("/certhash/")?;
+                    certhash::write(hash, f)?;
+                }
                 Protocol::P2p(peer_id) => write!(f, "/p2p/{peer_id}")?,
                 Protocol::P2pCircuit => f.write_str("/p2p-circuit")?,
             }
@@ -272,7 +275,13 @@ pub(crate) fn is_quic_transport_slice(protocols: &[Protocol]) -> bool {
 /// (host + udp + quic-v1 + webtransport + certhash*).
 pub(crate) fn is_webtransport_slice(protocols: &[Protocol]) -> bool {
     match protocols {
-        [host, Protocol::Udp(_), Protocol::QuicV1, Protocol::WebTransport, certhashes @ ..] => {
+        [
+            host,
+            Protocol::Udp(_),
+            Protocol::QuicV1,
+            Protocol::WebTransport,
+            certhashes @ ..,
+        ] => {
             host.is_host()
                 && certhashes
                     .iter()
@@ -396,12 +405,10 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
             "certhash" => {
                 let value = require_value(&segments, idx, "certhash")?;
                 let parsed =
-                    value
-                        .parse::<Certhash>()
-                        .map_err(|source| MultiaddrError::InvalidCerthash {
-                            value: value.to_string(),
-                            source,
-                        })?;
+                    certhash::parse(value).map_err(|source| MultiaddrError::InvalidCerthash {
+                        value: value.to_string(),
+                        source,
+                    })?;
                 protocols.push(Protocol::Certhash(parsed));
                 idx += 2;
             }
@@ -925,7 +932,9 @@ mod tests {
     }
 
     fn digests(addr: &Multiaddr) -> Vec<Vec<u8>> {
-        addr.certhashes().map(|hash| hash.digest().to_vec()).collect()
+        addr.certhashes()
+            .map(|hash| hash.digest().to_vec())
+            .collect()
     }
 
     #[test]
@@ -941,8 +950,9 @@ mod tests {
 
     #[test]
     fn certhash_text_accepts_every_multibase_and_prints_base64url() {
-        let canonical =
-            format!("/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/{GO_BASE64URL_CERTHASH}");
+        let canonical = format!(
+            "/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/{GO_BASE64URL_CERTHASH}"
+        );
         let multihash = format!("1220{GO_DIGEST}");
         let base32 = "ciqmhk4p6e3sb2fnsbd52okgnm6is5hfslbpuob5ji4wa4kmv3ymj4q";
         for encoded in [
@@ -953,8 +963,7 @@ mod tests {
             format!("f{multihash}"),
             format!("F{}", multihash.to_ascii_uppercase()),
         ] {
-            let input =
-                format!("/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/{encoded}");
+            let input = format!("/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/{encoded}");
             let addr = Multiaddr::from_str(&input).expect(&input);
             assert_eq!(addr.to_string(), canonical, "{encoded}");
             assert_eq!(digests(&addr), [hex(GO_DIGEST)], "{encoded}");
@@ -967,8 +976,9 @@ mod tests {
     ///   the multihash `12 20 <32-byte digest>`
     #[test]
     fn binary_codec_reference_vector_webtransport_certhash() {
-        let input =
-            format!("/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/{GO_BASE64URL_CERTHASH}");
+        let input = format!(
+            "/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/{GO_BASE64URL_CERTHASH}"
+        );
         let addr = Multiaddr::from_str(&input).unwrap();
         let mut expected: Vec<u8> = vec![
             0x04, 0x7F, 0x00, 0x00, 0x01, // ip4 127.0.0.1

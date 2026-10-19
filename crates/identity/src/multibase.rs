@@ -104,10 +104,12 @@ pub fn decode_base58btc(input: &str) -> Result<Vec<u8>, MultibaseError> {
     let leading_zeros = input.chars().take_while(|c| *c == '1').count();
     let mut digits = Vec::with_capacity(input.len());
     for (index, ch) in input.chars().enumerate().skip(leading_zeros) {
-        digits.push(base58_value(ch).ok_or(MultibaseError::InvalidBase58Character {
-            character: ch,
-            index,
-        })?);
+        digits.push(
+            base58_value(ch).ok_or(MultibaseError::InvalidBase58Character {
+                character: ch,
+                index,
+            })?,
+        );
     }
 
     // Little-endian limbs in base 2^32. The first group takes the odd
@@ -369,10 +371,11 @@ mod tests {
         let mut bytes = Vec::with_capacity(input.len());
 
         for (index, ch) in input.chars().enumerate().skip(leading_zeros) {
-            let value = reference_base58_value(ch).ok_or(MultibaseError::InvalidBase58Character {
-                character: ch,
-                index,
-            })? as u32;
+            let value =
+                reference_base58_value(ch).ok_or(MultibaseError::InvalidBase58Character {
+                    character: ch,
+                    index,
+                })? as u32;
             let mut carry = value;
 
             if bytes.is_empty() {
