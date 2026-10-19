@@ -65,6 +65,9 @@
     "@minip2p/node#test": {
       "cache": false
     },
+    "@minip2p/web#test": {
+      "cache": false
+    },
     "typecheck": {
       "dependsOn": ["^typecheck"],
       "inputs": ["$TURBO_DEFAULT$", "tsconfig.json"],
