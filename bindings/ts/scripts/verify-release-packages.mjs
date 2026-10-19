@@ -46,7 +46,8 @@ if (
 
 const maximumUnpackedBytes = 125 * 1024 * 1024;
 // What every page that uses @minip2p/web downloads. Raise it deliberately.
-const maximumWasmBytes = 3 * 1024 * 1024;
+// 4 MiB since relay reservations and circuits (3.65 MB, 0.57 MB gzipped).
+const maximumWasmBytes = 4 * 1024 * 1024;
 const temporaryRoot = mkdtempSync(
   path.join(tmpdir(), "minip2p-release-packages-")
 );

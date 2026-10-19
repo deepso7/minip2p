@@ -50,6 +50,12 @@ pub struct NatConfig {
     pub circuit_handshake_timeout_ms: u64,
     /// Use relayed circuits without racing direct dials or attempting DCUtR.
     pub force_relay: bool,
+    /// Upgrade relayed connections to direct ones with DCUtR. `false` keeps
+    /// direct racing and the relay leg but never starts an upgrade: a
+    /// circuit dialer arms no upgrade budgets and answers no DCUtR round,
+    /// and a reservation holder settles on the inbound circuit at once.
+    /// Hosts that cannot hole punch (browsers) turn it off.
+    pub dcutr: bool,
     /// Budget for one relay, from its first dial to its circuit carrying a
     /// usable Relayed path, clipped by the caller's
     /// [`ConnectLegs::deadline_ms`](crate::ConnectLegs::deadline_ms). A
@@ -147,6 +153,7 @@ impl Default for NatConfig {
             relay_stagger_ms: 200,
             circuit_handshake_timeout_ms: 20_000,
             force_relay: false,
+            dcutr: true,
             relay_timeout_ms: 12_000,
             punch_deadline_ms: 3_000,
             dcutr_start_timeout_ms: 10_000,
@@ -166,5 +173,13 @@ impl Default for NatConfig {
             max_circuits: 64,
             allow_private_punch_targets: false,
         }
+    }
+}
+
+impl NatConfig {
+    /// Whether relayed connections may be upgraded with DCUtR: neither
+    /// `force_relay` nor `dcutr = false` rules it out.
+    pub(crate) fn upgrades(&self) -> bool {
+        !self.force_relay && self.dcutr
     }
 }

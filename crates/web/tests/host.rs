@@ -56,7 +56,7 @@ fn run(
 #[test]
 fn browser_config_rejects_what_a_browser_cannot_do() {
     type Edit = fn(&mut EndpointConfig);
-    let cases: [(Edit, ConfigCapability, &str); 6] = [
+    let cases: [(Edit, ConfigCapability, &str); 5] = [
         (
             |c| c.listen = Some(vec!["/ip4/0.0.0.0/udp/0/quic-v1".into()]),
             ConfigCapability::Options,
@@ -95,14 +95,9 @@ fn browser_config_rejects_what_a_browser_cannot_do() {
             "AutoNAT",
         ),
         (
-            |c| c.relays = vec!["/ip4/192.0.2.1/udp/1/quic-v1".into()],
-            ConfigCapability::Options,
-            "later release",
-        ),
-        (
             |c| c.force_relay = true,
             ConfigCapability::Options,
-            "later release",
+            "at least one relay",
         ),
     ];
     for (edit, expected, words) in cases {
@@ -120,6 +115,24 @@ fn browser_config_rejects_what_a_browser_cannot_do() {
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
+    }
+}
+
+/// Relays (with or without `forceRelay`) build: the browser holds a
+/// reservation and races direct WebTransport dials against the relay leg.
+#[test]
+fn browser_config_accepts_relays() {
+    const RELAY: &str =
+        "/ip4/192.0.2.1/udp/1/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+    for force_relay in [false, true] {
+        let mut config = config();
+        config.relays = vec![RELAY.into()];
+        config.force_relay = force_relay;
+        let mut host = Host::new(vec![1; 32], config, |_| {
+            InMemoryTransport::pair(peer(1), peer(2)).0
+        })
+        .expect("relays build");
+        assert!(host.active_reservation().expect("running").is_none());
     }
 }
 

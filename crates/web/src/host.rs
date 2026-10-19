@@ -2,22 +2,26 @@
 //! pump, feeding ffi-core's [`EventCarry`].
 //!
 //! It is the thread-free counterpart of ffi-core's `P2pEndpoint`, with the
-//! same commands, errors and event stream. Nothing here touches wasm or the
+//! same commands, errors and event stream. The transport is always wrapped in
+//! a [`CircuitTransport`], so with relays configured the browser holds a
+//! reservation (it is dialable at its `/p2p-circuit` address) and races
+//! direct dials against a relay leg; it never hole punches (`dcutr = false`). Nothing here touches wasm or the
 //! browser: the caller samples time, schedules [`Host::pump`], and rings the
 //! doorbell [`Pumped::ring`] asks for, so the host runs over any transport
 //! and is tested natively.
 
 use minip2p::{
-    ConnectId, ConnectionId, Deadline, DriverError, Ed25519Keypair, EndpointEvent, GossipsubConfig,
-    Now, PeerId, PortableBuildError, PortableEndpoint, PortableEndpointBuilder, StreamId,
-    Transport, WriteProgress,
+    CircuitTransport, ConnectId, ConnectionId, Deadline, DriverError, Ed25519Keypair,
+    EndpointEvent, GossipsubConfig, NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint,
+    PortableEndpointBuilder, ReservationPolicy, StreamId, Transport, WriteProgress,
 };
 use minip2p_ffi_core::{
     CloseOutcome, ConfigCapability, ConnectTarget, ConnectionInfo, DriverFailureKind,
     EndpointConfig, EventCarry, FfiError, IdentifyInfo, KnownPeerInfo, OpenStreamResult, P2pEvent,
     PUMP_DRAIN_LIMIT, PathKind, Reachability, RelayReservationInfo, convert_endpoint_event,
-    convert_identify, convert_path, keypair_from_bytes, map_driver_error, map_gossipsub_error,
-    map_write_error, parse_connect_target, parse_peer_id, stream_writer, write_accepted_event,
+    convert_identify, convert_path, convert_reachability, keypair_from_bytes, map_driver_error,
+    map_gossipsub_error, map_write_error, parse_connect_target, parse_direct_peer_addr,
+    parse_peer_id, stream_writer, write_accepted_event,
 };
 
 use crate::WebEntropy;
@@ -39,16 +43,20 @@ enum Lifecycle {
     Stopped,
 }
 
+/// The endpoint a [`Host`] drives: `T` behind a circuit transport.
+type HostEndpoint<T> = PortableEndpoint<CircuitTransport<T, WebEntropy>, WebEntropy>;
+
 /// A browser endpoint: the portable endpoint, its pending stream writes, and
 /// the carry its events wait in until the binding drains them.
 pub struct Host<T: Transport> {
     peer_id: String,
     lifecycle: Lifecycle,
-    endpoint: Option<PortableEndpoint<T, WebEntropy>>,
+    endpoint: Option<HostEndpoint<T>>,
     writes: minip2p::StreamWriter,
     carry: EventCarry,
     /// The listen set, followed from `ListenAddressesChanged`; a browser
-    /// never listens, so it stays empty until relay reservations land.
+    /// never listens, so it stays empty (a reservation is reported as
+    /// `RelayReserved`, not as a listen address).
     listen_addrs: Vec<String>,
 }
 
@@ -64,7 +72,12 @@ impl<T: Transport> Host<T> {
     ) -> Result<Self, FfiError> {
         let keypair = keypair_from_bytes(secret_key)?;
         validate_browser_config(&config)?;
-        let mut endpoint = PortableEndpointBuilder::new(&keypair, WebEntropy)
+        let relays = config
+            .relays
+            .iter()
+            .map(|address| parse_direct_peer_addr(address))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut builder = PortableEndpointBuilder::new(&keypair, WebEntropy)
             .agent_version(
                 config
                     .agent_version
@@ -73,8 +86,21 @@ impl<T: Transport> Host<T> {
             .gossipsub_config(GossipsubConfig {
                 allow_unsigned: config.allow_unsigned,
                 ..GossipsubConfig::default()
-            })
-            .build(transport(&keypair))
+            });
+        if !relays.is_empty() {
+            // A browser is never publicly reachable and cannot hole punch:
+            // it always reserves, and its relayed paths never upgrade.
+            builder = builder.nat_config(NatConfig {
+                relays,
+                force_relay: config.force_relay,
+                dcutr: false,
+                reservation_policy: ReservationPolicy::Always,
+                ..NatConfig::default()
+            });
+        }
+        let circuits = CircuitTransport::new(transport(&keypair), keypair.clone(), WebEntropy);
+        let mut endpoint = builder
+            .build_with_circuits(circuits)
             .map_err(map_build_error)?;
         // The binding acknowledges stream data as its reader consumes it
         // (`stream_consumed`), not as the pump pulls the event.
@@ -420,21 +446,27 @@ impl<T: Transport> Host<T> {
         self.endpoint().map(|_| None)
     }
 
-    /// Reachability: `Unknown`, browsers run no AutoNAT.
+    /// Reachability: browsers run no AutoNAT, so it stays `Unknown`.
     pub fn reachability(&mut self) -> Result<Reachability, FfiError> {
-        self.endpoint().map(|_| Reachability::Unknown)
+        Ok(convert_reachability(self.endpoint()?.reachability()))
     }
 
-    /// The active relay reservation: none until relays land for browsers.
+    /// The relay reservation currently held, if any.
     pub fn active_reservation(&mut self) -> Result<Option<RelayReservationInfo>, FfiError> {
-        self.endpoint().map(|_| None)
+        Ok(self
+            .endpoint()?
+            .active_reservation()
+            .map(|reservation| RelayReservationInfo {
+                relay_peer_id: reservation.relay.to_base58(),
+                expires_unix_secs: reservation.expires_unix_secs,
+            }))
     }
 
-    fn endpoint(&mut self) -> Result<&mut PortableEndpoint<T, WebEntropy>, FfiError> {
+    fn endpoint(&mut self) -> Result<&mut HostEndpoint<T>, FfiError> {
         endpoint_mut(&mut self.endpoint, self.lifecycle)
     }
 
-    fn running_endpoint(&mut self) -> Option<&mut PortableEndpoint<T, WebEntropy>> {
+    fn running_endpoint(&mut self) -> Option<&mut HostEndpoint<T>> {
         if self.lifecycle == Lifecycle::Running {
             self.endpoint.as_mut()
         } else {
@@ -497,9 +529,9 @@ impl<T: Transport> Host<T> {
 }
 
 fn endpoint_mut<T: Transport>(
-    endpoint: &mut Option<PortableEndpoint<T, WebEntropy>>,
+    endpoint: &mut Option<HostEndpoint<T>>,
     lifecycle: Lifecycle,
-) -> Result<&mut PortableEndpoint<T, WebEntropy>, FfiError> {
+) -> Result<&mut HostEndpoint<T>, FfiError> {
     match lifecycle {
         Lifecycle::Created | Lifecycle::Running => endpoint.as_mut().ok_or(FfiError::Stopped),
         Lifecycle::Stopped => Err(FfiError::Stopped),
@@ -517,7 +549,7 @@ fn validate_browser_config(config: &EndpointConfig) -> Result<(), FfiError> {
     if config.listen.is_some() {
         return reject(
             ConfigCapability::Options,
-            "browsers cannot listen; omit listen (a browser is reached through a relay reservation, which lands in a later release)",
+            "browsers cannot listen; omit listen and configure relays (a browser is reached at its /p2p-circuit address through a relay reservation)",
         );
     }
     if config.mdns.is_some() {
@@ -538,10 +570,10 @@ fn validate_browser_config(config: &EndpointConfig) -> Result<(), FfiError> {
             "browsers cannot be dialed back, so AutoNAT does not apply; omit autonatServers",
         );
     }
-    if !config.relays.is_empty() || config.force_relay {
+    if config.force_relay && config.relays.is_empty() {
         return reject(
             ConfigCapability::Options,
-            "relay support for browsers lands in a later release; omit relays and forceRelay",
+            "forceRelay requires at least one relay",
         );
     }
     Ok(())
@@ -550,10 +582,12 @@ fn validate_browser_config(config: &EndpointConfig) -> Result<(), FfiError> {
 fn map_build_error(error: PortableBuildError) -> FfiError {
     let detail = error.to_string();
     match error {
-        PortableBuildError::Swarm(_) => FfiError::InvalidConfig {
-            capability: ConfigCapability::Options,
-            detail,
-        },
+        PortableBuildError::Swarm(_) | PortableBuildError::NatConfig(_) => {
+            FfiError::InvalidConfig {
+                capability: ConfigCapability::Options,
+                detail,
+            }
+        }
         PortableBuildError::Gossipsub(_) | PortableBuildError::Topic(_) => {
             FfiError::InvalidConfig {
                 capability: ConfigCapability::Gossipsub,

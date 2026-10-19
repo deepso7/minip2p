@@ -423,7 +423,7 @@ impl InboundCircuit {
                         },
                         conn_id,
                     });
-                    if shared.config.force_relay {
+                    if !shared.config.upgrades() {
                         self.done = true;
                     } else {
                         self.upgrade_deadline =

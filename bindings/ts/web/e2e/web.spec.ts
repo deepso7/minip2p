@@ -2,13 +2,15 @@
 
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+import { createSocket } from "node:dgram";
+import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import { Minip2p as NativeNode, generateSecretKey } from "@minip2p/node";
 import type { ConnectionCloseReason } from "@minip2p/node";
 import { expect, test } from "@playwright/test";
-import type { Page } from "@playwright/test";
+import type { Browser, Page } from "@playwright/test";
 
 import type * as Web from "../src/index.js";
 
@@ -26,10 +28,13 @@ const ECHO = "/minip2p/echo/1";
 const TIMEOUT = { timeoutMs: 15_000 };
 
 /** A native node listening on WebTransport and echoing every stream. */
-function nativePeer(options: { secretKey?: Uint8Array; port?: number } = {}) {
+function nativePeer(
+  options: { secretKey?: Uint8Array; port?: number; relays?: string[] } = {}
+) {
   const node = NativeNode.create({
     listen: [`/ip4/127.0.0.1/udp/${options.port ?? 0}/quic-v1/webtransport`],
     protocols: [ECHO],
+    relays: options.relays ?? [],
     secretKey: options.secretKey ?? generateSecretKey(),
   });
   node.on("stream", (stream) => {
@@ -280,9 +285,13 @@ test("dials the relay-server example's WebTransport address and pings it", async
   }
 });
 
-/** Spawns `minip2p-relay --webtransport` and reads its WebTransport address. */
+/**
+ * Spawns `minip2p-relay --webtransport` and reads its WebTransport address
+ * (what browsers dial) and its `quic-v1` address (what native nodes dial).
+ */
 async function startRelay(): Promise<{
   address: string;
+  quic: string;
   process: ChildProcess;
 }> {
   const binary = fileURLToPath(
@@ -297,14 +306,195 @@ async function startRelay(): Promise<{
     throw new Error("relay stdout is not piped");
   }
   const lines = createInterface({ input: child.stdout });
+  let quic: string | undefined;
   for await (const line of lines) {
+    quic ??= /^\[relay\] listening=(?<addr>.+\/quic-v1\/p2p\/.+)$/u.exec(line)
+      ?.groups?.addr;
     const address = /^\[relay\] webtransport=(?<address>.+)$/u.exec(line)
       ?.groups?.address;
-    if (address !== undefined) {
+    if (address !== undefined && quic !== undefined) {
       // Keep draining its log so the relay never blocks on a full pipe.
       child.stdout.resume();
-      return { address, process: child };
+      return { address, process: child, quic };
     }
   }
-  throw new Error("the relay exited before printing its WebTransport address");
+  throw new Error("the relay exited before printing its addresses");
 }
+
+/** A UDP port nothing listens on: bound once, then released. */
+async function deadUdpPort(): Promise<number> {
+  const socket = createSocket("udp4");
+  socket.bind(0, "127.0.0.1");
+  await once(socket, "listening");
+  const { port } = socket.address();
+  socket.close();
+  await once(socket, "close");
+  return port;
+}
+
+/** Opens the e2e page in a fresh browser context: a second, separate node. */
+async function openSecondPage(browser: Browser): Promise<Page> {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  await openPage(page);
+  return page;
+}
+
+/** Closes a page from `openSecondPage`, with its node and context. */
+async function closeSecondPage(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    await window.node?.close();
+  });
+  await page.context().close();
+}
+
+/**
+ * Starts a browser node on `page` that reserves on `relay` and echoes every
+ * inbound stream; resolves to its peer ID once the reservation is held.
+ */
+async function reservingBrowser(page: Page, relay: string): Promise<string> {
+  const peerId = await page.evaluate(
+    ({ protocol, relayAddress }) => {
+      const { Minip2p, generateSecretKey: key } = window.web;
+      const node = Minip2p.create({
+        protocols: [protocol],
+        relays: [relayAddress],
+        secretKey: key(),
+      });
+      window.node = node;
+      node.on("stream", (stream) => {
+        void (async () => {
+          try {
+            for await (const chunk of stream) {
+              await stream.write(chunk);
+            }
+            stream.closeWrite();
+          } catch {
+            // A reset echo stream simply ends.
+          }
+        })();
+      });
+      return node.peerId();
+    },
+    { protocol: ECHO, relayAddress: relay }
+  );
+  await page.waitForFunction(
+    () => window.node?.circuitAddress !== undefined,
+    undefined,
+    { timeout: 15_000 }
+  );
+  return peerId;
+}
+
+/**
+ * Connects a new node on `page`, with `relays` configured, to `target` (a
+ * peer ID, reached through the relays, or an address); echoes a message and
+ * reports the path.
+ */
+async function connectAndEcho(
+  page: Page,
+  target: string,
+  relays: string[]
+): Promise<{ echoed: string; path: string }> {
+  return await page.evaluate(
+    async ({ protocol, relayAddrs, targetAddr, timeout }) => {
+      const { Minip2p, generateSecretKey: key } = window.web;
+      const node = Minip2p.create({
+        protocols: [protocol],
+        relays: relayAddrs,
+        secretKey: key(),
+      });
+      window.node = node;
+      const connected = await node.connect(targetAddr, timeout);
+      const stream = await node.openStream(connected.peerId, protocol, timeout);
+      await stream.write("echo me");
+      stream.closeWrite();
+      const bytes: number[] = [];
+      for await (const chunk of stream) {
+        bytes.push(...chunk);
+      }
+      return {
+        echoed: new TextDecoder().decode(new Uint8Array(bytes)),
+        path: connected.path.kind,
+      };
+    },
+    { protocol: ECHO, relayAddrs: relays, targetAddr: target, timeout: TIMEOUT }
+  );
+}
+
+test("a browser reserves on the relay and another browser echoes through its circuit", async ({
+  browser,
+  page,
+}) => {
+  const relay = await startRelay();
+  const other = await openSecondPage(browser);
+  try {
+    await openPage(page);
+    const holder = await reservingBrowser(page, relay.address);
+    const result = await connectAndEcho(other, holder, [relay.address]);
+    expect(result).toEqual({ echoed: "echo me", path: "relayed" });
+  } finally {
+    await closeSecondPage(other);
+    relay.process.kill();
+  }
+});
+
+test("a native peer dials a browser through its circuit", async ({ page }) => {
+  const relay = await startRelay();
+  // Relay only: the browser never starts DCUtR, so there is nothing to wait for.
+  const native = NativeNode.create({
+    forceRelay: true,
+    protocols: [ECHO],
+    relays: [relay.quic],
+    secretKey: generateSecretKey(),
+  });
+  try {
+    await openPage(page);
+    const holder = await reservingBrowser(page, relay.address);
+    const connected = await native.connect(holder, TIMEOUT);
+    expect(connected.path.kind).toBe("relayed");
+    const stream = await native.openStream(holder, ECHO, TIMEOUT);
+    await stream.write("native to browser");
+    stream.closeWrite();
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+    expect(Buffer.concat(chunks).toString()).toBe("native to browser");
+  } finally {
+    await native.close();
+    relay.process.kill();
+  }
+});
+
+test("with relays, a browser dials a native WebTransport address directly and falls back to the relay", async ({
+  browser,
+  page,
+}) => {
+  const relay = await startRelay();
+  const native = nativePeer({ relays: [relay.quic] });
+  const second = await openSecondPage(browser);
+  try {
+    await expect
+      .poll(() => native.node.activeReservation() !== undefined, {
+        timeout: 15_000,
+      })
+      .toBe(true);
+    await openPage(page);
+
+    const direct = await connectAndEcho(page, native.address, [relay.address]);
+    expect(direct).toEqual({ echoed: "echo me", path: "direct" });
+
+    // The same peer at a port nothing serves: only the relay leg can land.
+    const unreachable = native.address.replace(
+      /\/udp\/\d+\//u,
+      `/udp/${await deadUdpPort()}/`
+    );
+    const relayed = await connectAndEcho(second, unreachable, [relay.address]);
+    expect(relayed).toEqual({ echoed: "echo me", path: "relayed" });
+  } finally {
+    await closeSecondPage(second);
+    await native.node.close();
+    relay.process.kill();
+  }
+});

@@ -4,7 +4,7 @@ The wasm-bindgen shell behind [`@minip2p/web`](../../bindings/ts/web): minip2p c
 
 Two layers:
 
-- **`Host`** is the browser endpoint: a `PortableEndpoint` over any `Transport`, with ffi-core's thread-free host core (`EventCarry`, the stream writer, the `P2pEvent` model). It has the commands, errors and event stream of ffi-core's std `P2pEndpoint`, but no thread: its owner samples time and calls `pump`. It never touches wasm, so `cargo test -p minip2p-web` runs it natively over an in-memory transport.
+- **`Host`** is the browser endpoint: a `PortableEndpoint` over any `Transport` wrapped in a `CircuitTransport` (relay reservations and circuits through `portable-relay`, with `dcutr = false`), with ffi-core's thread-free host core (`EventCarry`, the stream writer, the `P2pEvent` model). It has the commands, errors and event stream of ffi-core's std `P2pEndpoint`, but no thread: its owner samples time and calls `pump`. It never touches wasm, so `cargo test -p minip2p-web` runs it natively over an in-memory transport.
 - **`WebEndpoint`** (wasm32 only) is the JavaScript class, with the same surface as the Node addon's `NodeEndpoint` so both TypeScript adapters share `@minip2p/core/serde-backend`. It wraps `Host<WebTransportClient<JsIo, WebEntropy>>`, where `JsIo` is the TypeScript `WebTransportIo` (`bindings/ts/web/src/io.ts`).
 
 ## Runtime
@@ -17,7 +17,7 @@ Two layers:
 
 ## Browser limits
 
-The constructor rejects, with `InvalidConfig` and a reason, what a browser cannot run: `listen`, `mdns`, `discovery`, `autonatServers`, and (until relay reservations land for browsers) `relays` and `forceRelay`. Only `/…/quic-v1/webtransport/certhash/…/p2p/…` addresses dial; anything else fails as a connect candidate. `close` closes every session at once (`WebTransport.close()` sends the close capsule), so its timeout bounds nothing.
+The constructor rejects, with `InvalidConfig` and a reason, what a browser cannot run: `listen`, `mdns`, `discovery`, `autonatServers`, and `forceRelay` without `relays`. With relays the host always reserves (`ReservationPolicy::Always`) and never hole punches (`NatConfig::dcutr = false`): a connect to a native peer races the direct dial against the relay leg and settles `Direct` or `Relayed`. Only `/…/quic-v1/webtransport/certhash/…/p2p/…` addresses dial; anything else fails as a connect candidate. `close` closes every session at once (`WebTransport.close()` sends the close capsule), so its timeout bounds nothing.
 
 ## Building
 

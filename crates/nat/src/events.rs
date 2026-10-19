@@ -25,9 +25,13 @@ pub enum BridgeRole {
 /// [`NatAgent::promote_result`](crate::NatAgent::promote_result) with its
 /// token; the others are fire-and-forget.
 #[derive(Clone, Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "actions are drained one at a time, and PromoteBridge, the large one, is rare"
+// Only 64-bit targets cross clippy's size threshold.
+#[cfg_attr(
+    target_pointer_width = "64",
+    expect(
+        clippy::large_enum_variant,
+        reason = "actions are drained one at a time, and PromoteBridge, the large one, is rare"
+    )
 )]
 pub enum NatAction {
     /// Send one datagram of `payload_len` random bytes to `target` to open

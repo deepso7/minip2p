@@ -5,9 +5,9 @@ use minip2p::{
     EndpointEvent, GossipsubEvent, IdentifyMessage, Multiaddr, Path, SwarmErrorKind,
 };
 #[cfg(feature = "driver")]
-use minip2p::{
-    DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource, NatEvent, ReachabilityState,
-};
+use minip2p::{DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource};
+#[cfg(any(feature = "driver", feature = "relay"))]
+use minip2p::{NatEvent, ReachabilityState};
 
 /// Foreign-friendly snapshot of a peer's Identify message.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -830,8 +830,9 @@ pub fn convert_endpoint_event(event: EndpointEvent) -> Option<P2pEvent> {
             outcome,
         } => convert_settled(connect_id, &peer_id, outcome),
         EndpointEvent::Gossipsub(event) => Some(convert_gossipsub(event)),
-        // The NAT, discovery and mDNS capabilities are the std driver's.
-        #[cfg(feature = "driver")]
+        // NAT comes with the std driver or the portable relay; discovery
+        // and mDNS are the std driver's.
+        #[cfg(any(feature = "driver", feature = "relay"))]
         EndpointEvent::Nat(event) => convert_nat(event),
         #[cfg(feature = "driver")]
         EndpointEvent::Discovery(event) => Some(convert_discovery(event)),
@@ -915,7 +916,7 @@ pub fn convert_identify(info: &IdentifyMessage) -> IdentifyInfo {
     }
 }
 
-#[cfg(feature = "driver")]
+#[cfg(any(feature = "driver", feature = "relay"))]
 pub(crate) fn convert_nat(event: NatEvent) -> Option<P2pEvent> {
     Some(match event {
         NatEvent::ReachabilityChanged {
@@ -1075,8 +1076,9 @@ pub(crate) fn convert_discovery(event: DiscoveryEvent) -> P2pEvent {
     }
 }
 
-#[cfg(feature = "driver")]
-pub(crate) fn convert_reachability(state: ReachabilityState) -> Reachability {
+/// Converts a reachability verdict to its foreign kind.
+#[cfg(any(feature = "driver", feature = "relay"))]
+pub fn convert_reachability(state: ReachabilityState) -> Reachability {
     match state {
         ReachabilityState::Unknown => Reachability::Unknown,
         ReachabilityState::Public => Reachability::Public,
@@ -1132,7 +1134,7 @@ fn convert_connect_failure_kind(failure: &ConnectFailure) -> NatErrorKind {
     }
 }
 
-#[cfg(feature = "driver")]
+#[cfg(any(feature = "driver", feature = "relay"))]
 fn display_addrs(addrs: Vec<minip2p::Multiaddr>) -> Vec<String> {
     addrs
         .into_iter()

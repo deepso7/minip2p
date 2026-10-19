@@ -32,6 +32,9 @@ default = ["driver"]
 # conversion, config, errors and key helpers) that a single-threaded wasm
 # host drives itself.
 driver = ["minip2p/default", "minip2p/discovery", "minip2p/mdns", "minip2p/tcp"]
+# Relay reservations and circuits for the thread-free core (the browser
+# host): NAT event and reachability conversion over `minip2p/portable-relay`.
+relay = ["minip2p/portable-relay"]
 # Derives the UniFFI record, enum and error metadata for the UniFFI binding
 # shell (`crates/ffi`). Other shells leave it off.
 uniffi = ["dep:uniffi"]

@@ -100,6 +100,45 @@ fn default_inbound_promotes_immediately_after_stop_acceptance() {
 }
 
 #[test]
+fn dcutr_off_holder_settles_on_the_inbound_circuit() {
+    let config = NatConfig {
+        dcutr: false,
+        ..NatConfig::default()
+    };
+    let past_budgets = config.upgrade_timeout_ms.max(config.dcutr_start_timeout_ms) + 1;
+    let mut h = inbound_harness(config);
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    let target = h.target.clone();
+    h.stream_data(stream, stop_connect(&target), at(10));
+    let promotion = drain_actions(&mut h.agent);
+    complete_promotion(&mut h.agent, &target, &promotion, at(11));
+
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::InboundPathEstablished {
+            path: Path::Relayed { .. },
+            ..
+        }]
+    ));
+    assert_eq!(h.agent.next_deadline(at(11)), None, "no upgrade deadline");
+
+    h.agent.handle_tick(at(11 + past_budgets));
+    let actions = drain_actions(&mut h.agent);
+    assert!(
+        !actions.iter().any(|action| matches!(
+            action,
+            Out::OpenStream { protocol_id, .. } if protocol_id == DCUTR_PROTOCOL_ID
+        )),
+        "no DCUtR stream: {actions:?}"
+    );
+    assert_eq!(blast_count(&actions), 0, "no punch");
+    assert_eq!(dial_count_for(&actions, &target), 0, "no punch dial");
+    assert!(drain_events(&mut h.agent).is_empty());
+    assert!(h.agent.is_idle());
+}
+
+#[test]
 fn a_stop_status_refused_as_full_rides_the_promotion() {
     let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
