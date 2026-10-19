@@ -6,7 +6,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::noise::cipher::CipherState;
 use crate::noise::hkdf;
-use crate::noise::payload::NoiseHandshakePayload;
+use crate::noise::payload::{NoiseExtensions, NoiseHandshakePayload};
 use crate::noise::{NoiseError, NoiseRole};
 
 const PROTOCOL_NAME: &[u8] = b"Noise_XX_25519_ChaChaPoly_SHA256";
@@ -17,6 +17,8 @@ pub(crate) struct HandshakeResult {
     pub(crate) receive: CipherState,
     pub(crate) peer: PeerId,
     pub(crate) identity_key: PublicKey,
+    /// Extensions from the verified remote payload, when it sent any.
+    pub(crate) remote_extensions: Option<NoiseExtensions>,
     /// Final handshake hash `h`, identical on both ends.
     pub(crate) handshake_hash: [u8; 32],
 }
@@ -40,7 +42,16 @@ pub(crate) struct HandshakeState {
     local_ephemeral: [u8; 32],
     remote_ephemeral: Option<[u8; 32]>,
     expected_peer: Option<PeerId>,
+    local_extensions: Option<NoiseExtensions>,
     symmetric: SymmetricState,
+}
+
+/// Identity verified from a remote handshake payload.
+#[derive(Debug, Eq, PartialEq)]
+struct VerifiedRemote {
+    peer: PeerId,
+    identity_key: PublicKey,
+    extensions: Option<NoiseExtensions>,
 }
 
 impl HandshakeState {
@@ -50,6 +61,7 @@ impl HandshakeState {
         local_static: [u8; 32],
         local_ephemeral: [u8; 32],
         expected_peer: Option<PeerId>,
+        local_extensions: Option<NoiseExtensions>,
     ) -> Self {
         let step = match role {
             NoiseRole::Initiator => Step::InitiatorWriteMessage1,
@@ -63,6 +75,7 @@ impl HandshakeState {
             local_ephemeral,
             remote_ephemeral: None,
             expected_peer,
+            local_extensions,
             symmetric: SymmetricState::with_prologue(b""),
         }
     }
@@ -100,15 +113,15 @@ impl HandshakeState {
                 Ok((Some(response), None))
             }
             Step::InitiatorReadMessage2 => {
-                let (peer, identity_key) = self.read_message2(message)?;
+                let remote = self.read_message2(message)?;
                 self.step = Step::InitiatorWriteMessage3;
                 let response = self.write_message3()?;
-                let result = self.finish_with_peer(peer, identity_key);
+                let result = self.finish_with_peer(remote);
                 Ok((Some(response), Some(result)))
             }
             Step::ResponderReadMessage3 => {
-                let (peer, identity_key) = self.read_message3(message)?;
-                let result = self.finish_with_peer(peer, identity_key);
+                let remote = self.read_message3(message)?;
+                let result = self.finish_with_peer(remote);
                 Ok((None, Some(result)))
             }
             _ => Err(NoiseError::UnexpectedHandshakeMessage),
@@ -134,7 +147,7 @@ impl HandshakeState {
         Ok(out)
     }
 
-    fn read_message2(&mut self, message: &[u8]) -> Result<(PeerId, PublicKey), NoiseError> {
+    fn read_message2(&mut self, message: &[u8]) -> Result<VerifiedRemote, NoiseError> {
         if message.len() < 32 + 48 + 16 {
             return Err(NoiseError::InvalidHandshakeMessage(
                 "Noise message 2 is too short",
@@ -179,7 +192,7 @@ impl HandshakeState {
         Ok(out)
     }
 
-    fn read_message3(&mut self, message: &[u8]) -> Result<(PeerId, PublicKey), NoiseError> {
+    fn read_message3(&mut self, message: &[u8]) -> Result<VerifiedRemote, NoiseError> {
         if message.len() < 48 + 16 {
             return Err(NoiseError::InvalidHandshakeMessage(
                 "Noise message 3 is too short",
@@ -203,14 +216,19 @@ impl HandshakeState {
         let mut signed = Vec::with_capacity(SIGNATURE_PREFIX.len() + static_public.len());
         signed.extend_from_slice(SIGNATURE_PREFIX);
         signed.extend_from_slice(&static_public);
-        NoiseHandshakePayload::new(self.identity.public_key(), self.identity.sign(&signed)).encode()
+        NoiseHandshakePayload::new(
+            self.identity.public_key(),
+            self.identity.sign(&signed),
+            self.local_extensions.clone(),
+        )
+        .encode()
     }
 
     fn verify_payload(
         &self,
         payload: &[u8],
         remote_static: [u8; 32],
-    ) -> Result<(PeerId, PublicKey), NoiseError> {
+    ) -> Result<VerifiedRemote, NoiseError> {
         let payload = NoiseHandshakePayload::decode(payload)?;
         #[expect(
             clippy::map_err_ignore,
@@ -244,10 +262,14 @@ impl HandshakeState {
         {
             return Err(NoiseError::IdentityMismatch);
         }
-        Ok((peer, identity_key))
+        Ok(VerifiedRemote {
+            peer,
+            identity_key,
+            extensions: payload.extensions,
+        })
     }
 
-    fn finish_with_peer(&mut self, peer: PeerId, identity_key: PublicKey) -> HandshakeResult {
+    fn finish_with_peer(&mut self, remote: VerifiedRemote) -> HandshakeResult {
         let (first, second) = self.symmetric.split();
         let (send, receive) = match self.role {
             NoiseRole::Initiator => (first, second),
@@ -256,8 +278,9 @@ impl HandshakeState {
         HandshakeResult {
             send,
             receive,
-            peer,
-            identity_key,
+            peer: remote.peer,
+            identity_key: remote.identity_key,
+            remote_extensions: remote.extensions,
             handshake_hash: self.symmetric.hash,
         }
     }
@@ -372,12 +395,13 @@ mod tests {
         signed.extend_from_slice(&remote_static);
         let mut signature = remote_identity.sign(&signed);
         signature[0] ^= 1;
-        let payload = NoiseHandshakePayload::new(remote_identity.public_key(), signature).encode();
+        let payload = NoiseHandshakePayload::new(remote_identity.public_key(), signature, None).encode();
         let state = HandshakeState::new(
             NoiseRole::Initiator,
             Ed25519Keypair::from_secret_key_bytes([1; 32]),
             [2; 32],
             [3; 32],
+            None,
             None,
         );
         assert_eq!(
