@@ -2,10 +2,12 @@
 
 use minip2p::{
     ConnectFailure, ConnectOutcome, ConnectionCloseReason as UpstreamConnectionCloseReason,
-    DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource, EndpointEvent, GossipsubEvent,
-    IdentifyMessage, Multiaddr, NatEvent, Path, ReachabilityState,
+    EndpointEvent, GossipsubEvent, IdentifyMessage, Multiaddr, Path, SwarmErrorKind,
 };
-use minip2p_swarm::SwarmErrorKind;
+#[cfg(feature = "driver")]
+use minip2p::{
+    DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource, NatEvent, ReachabilityState,
+};
 
 /// Foreign-friendly snapshot of a peer's Identify message.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,6 +263,7 @@ pub enum CloseOutcome {
     Failed,
 }
 
+#[cfg(feature = "driver")]
 impl From<minip2p::CloseOutcome> for CloseOutcome {
     fn from(outcome: minip2p::CloseOutcome) -> Self {
         match outcome {
@@ -808,22 +811,28 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
 
 /// Converts one Endpoint event, live or from a closed endpoint's drain:
 /// every event carries what its foreign event needs.
-pub(crate) fn convert_endpoint_event(event: EndpointEvent) -> Option<P2pEvent> {
+pub fn convert_endpoint_event(event: EndpointEvent) -> Option<P2pEvent> {
     match event {
         EndpointEvent::ConnectSettled {
             connect_id,
             peer_id,
             outcome,
         } => convert_settled(connect_id, &peer_id, outcome),
-        EndpointEvent::Nat(event) => convert_nat(event),
         EndpointEvent::Gossipsub(event) => Some(convert_gossipsub(event)),
+        // The NAT, discovery and mDNS capabilities are the std driver's.
+        #[cfg(feature = "driver")]
+        EndpointEvent::Nat(event) => convert_nat(event),
+        #[cfg(feature = "driver")]
         EndpointEvent::Discovery(event) => Some(convert_discovery(event)),
+        #[cfg(feature = "driver")]
         EndpointEvent::MdnsFailed { error } => Some(convert_mdns_failure(&error)),
+        #[cfg(feature = "driver")]
         EndpointEvent::MdnsRecovered => Some(P2pEvent::MdnsRecovered),
         other => convert_swarm(other),
     }
 }
 
+#[cfg(feature = "driver")]
 fn convert_mdns_failure(error: &minip2p::MdnsError) -> P2pEvent {
     use minip2p::MdnsError;
 
@@ -874,7 +883,8 @@ pub(crate) fn convert_settled(
     }
 }
 
-pub(crate) fn convert_identify(info: &IdentifyMessage) -> IdentifyInfo {
+/// Converts an Identify message to its foreign snapshot.
+pub fn convert_identify(info: &IdentifyMessage) -> IdentifyInfo {
     IdentifyInfo {
         public_key: info.public_key.clone(),
         listen_addrs: info
@@ -894,6 +904,7 @@ pub(crate) fn convert_identify(info: &IdentifyMessage) -> IdentifyInfo {
     }
 }
 
+#[cfg(feature = "driver")]
 pub(crate) fn convert_nat(event: NatEvent) -> Option<P2pEvent> {
     Some(match event {
         NatEvent::ReachabilityChanged {
@@ -1011,6 +1022,7 @@ pub(crate) fn convert_gossipsub(event: GossipsubEvent) -> P2pEvent {
     }
 }
 
+#[cfg(feature = "driver")]
 pub(crate) fn convert_discovery(event: DiscoveryEvent) -> P2pEvent {
     match event {
         DiscoveryEvent::PeerDiscovered {
@@ -1052,6 +1064,7 @@ pub(crate) fn convert_discovery(event: DiscoveryEvent) -> P2pEvent {
     }
 }
 
+#[cfg(feature = "driver")]
 pub(crate) fn convert_reachability(state: ReachabilityState) -> Reachability {
     match state {
         ReachabilityState::Unknown => Reachability::Unknown,
@@ -1060,7 +1073,8 @@ pub(crate) fn convert_reachability(state: ReachabilityState) -> Reachability {
     }
 }
 
-pub(crate) fn convert_path(path: Path) -> PathKind {
+/// Converts a Connection path to its foreign kind.
+pub fn convert_path(path: Path) -> PathKind {
     match path {
         Path::Direct => PathKind::Direct,
         Path::Punched => PathKind::Punched,
@@ -1073,6 +1087,7 @@ pub(crate) fn convert_path(path: Path) -> PathKind {
     }
 }
 
+#[cfg(feature = "driver")]
 fn convert_discovery_source(source: UpstreamDiscoverySource) -> DiscoverySource {
     match source {
         UpstreamDiscoverySource::SignedBeacon => DiscoverySource::SignedBeacon,
@@ -1106,6 +1121,7 @@ fn convert_connect_failure_kind(failure: &ConnectFailure) -> NatErrorKind {
     }
 }
 
+#[cfg(feature = "driver")]
 fn display_addrs(addrs: Vec<minip2p::Multiaddr>) -> Vec<String> {
     addrs
         .into_iter()
@@ -1116,7 +1132,9 @@ fn display_addrs(addrs: Vec<minip2p::Multiaddr>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minip2p::{ConnectionId, Ed25519Keypair, NatError, PeerId, StreamId};
+    #[cfg(feature = "driver")]
+    use minip2p::NatError;
+    use minip2p::{ConnectionId, Ed25519Keypair, PeerId, StreamId};
     use std::str::FromStr;
 
     fn peer(seed: u8) -> PeerId {
@@ -1233,7 +1251,7 @@ mod tests {
     fn endpoint_error_conversion_preserves_stream_identity() {
         let remote = peer(9);
         assert_eq!(
-            convert_swarm(EndpointEvent::Error(minip2p_swarm::SwarmRuntimeError {
+            convert_swarm(EndpointEvent::Error(minip2p::SwarmRuntimeError {
                 kind: SwarmErrorKind::UnsupportedProtocol,
                 peer_id: Some(remote.clone()),
                 conn_id: Some(ConnectionId::new(23)),
@@ -1273,6 +1291,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "driver")]
     #[test]
     fn discovery_conversion_preserves_source_and_addresses() {
         let remote = peer(6);
@@ -1293,6 +1312,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "driver")]
     #[test]
     fn nat_error_categories_are_exhaustively_converted() {
         fn convert_nat_error_kind(error: &NatError) -> NatErrorKind {
@@ -1409,6 +1429,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "driver")]
     #[test]
     fn convert_nat_skips_attempt_terminals() {
         let remote = peer(13);
@@ -1438,6 +1459,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "driver")]
     #[test]
     fn inbound_path_conversion_preserves_relay_provenance() {
         let remote = peer(10);
@@ -1461,6 +1483,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "driver")]
     #[test]
     fn upgrade_conversions_carry_both_connection_ids() {
         let remote = peer(14);
@@ -1498,6 +1521,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "driver")]
     #[test]
     fn mdns_failures_carry_their_kind() {
         let error = minip2p::MdnsError::io(
@@ -1515,6 +1539,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "driver")]
     #[test]
     fn discovery_terminal_and_failure_events_preserve_fields() {
         let remote = peer(8);

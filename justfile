@@ -39,6 +39,12 @@ check-nostd:
     cargo check --no-default-features --features portable-mdns,pubsub,portable-relay --target thumbv7em-none-eabi -p minip2p-rs
     cargo check --no-default-features --features smoltcp,portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
 
+# The browser build's crates compile for wasm32 without the std driver.
+check-wasm:
+    rustup target add wasm32-unknown-unknown
+    cargo check --target wasm32-unknown-unknown -p minip2p-ffi-core --no-default-features --features serde
+    cargo check --target wasm32-unknown-unknown -p minip2p-rs --no-default-features --features pubsub
+
 peer-ping:
     cargo test -p minip2p-peer --test ping
 
