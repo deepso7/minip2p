@@ -13,7 +13,7 @@ use bytes::Bytes;
 use minip2p_core::Protocol;
 use minip2p_transport::{
     ConnectionCloseReason, ConnectionEndpoint, ConnectionId, ConnectionState, ConnectionToken,
-    StreamId, TransportError, TransportEvent,
+    SendCaps, StreamId, TransportError, TransportEvent,
 };
 use quinn_proto::crypto::rustls::HandshakeData;
 use quinn_proto::{
@@ -35,49 +35,6 @@ const MAX_SERVICE_PASSES: usize = 4;
 /// Most queued bytes one stream hands the engine per turn of the send
 /// scheduler, so backlogged streams share the peer's connection credit.
 const SEND_QUANTUM: usize = 64 * 1024;
-
-/// The send caps of ADR 0012, from [`crate::QuicLimits`]: how much each stream
-/// and the whole connection may queue beyond what the engine accepted, and
-/// the part of the connection cap only control streams may fill.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SendCaps {
-    stream: usize,
-    connection: usize,
-    control_reserve: usize,
-}
-
-impl SendCaps {
-    /// The caps of validated limits: the reserve is below the connection cap.
-    pub(crate) fn new(limits: &crate::QuicLimits) -> Self {
-        Self {
-            stream: limits.max_pending_bytes_per_stream,
-            connection: limits.max_pending_connection_bytes,
-            control_reserve: limits.control_stream_reserve_bytes,
-        }
-    }
-
-    /// The connection cap a stream may fill: all of it for a control
-    /// stream, all but the reserve otherwise.
-    fn connection_for(&self, control: bool) -> usize {
-        if control {
-            self.connection
-        } else {
-            self.connection.saturating_sub(self.control_reserve)
-        }
-    }
-
-    /// Room a Full stream needs on both caps before its Writable fires:
-    /// half the smaller one it may fill. A control stream may be left only
-    /// the reserve once application streams fill their share, so a non-zero
-    /// reserve bounds its threshold too.
-    fn writable_threshold(&self, control: bool) -> usize {
-        let mut smallest = self.stream.min(self.connection_for(control));
-        if control && self.control_reserve != 0 {
-            smallest = smallest.min(self.control_reserve);
-        }
-        (smallest / 2).max(1)
-    }
-}
 
 /// What servicing a connection needs from its transport.
 pub(crate) struct Cx<'a> {
@@ -315,7 +272,11 @@ impl QuicConnection {
             max_streams: limits.max_streams_per_connection,
             stream_window: limits.stream_receive_window,
             pending_write_bytes: 0,
-            caps: SendCaps::new(limits),
+            caps: SendCaps::new(
+                limits.max_pending_bytes_per_stream,
+                limits.max_pending_connection_bytes,
+                limits.control_stream_reserve_bytes,
+            ),
             writable_armed: BTreeSet::new(),
             gated: BTreeSet::new(),
             read_chunks: Vec::new(),
@@ -1046,12 +1007,8 @@ impl QuicConnection {
     /// its own cap and of the connection cap it may fill.
     fn send_room(&self, raw: u64, control: bool) -> usize {
         let stream_pending = self.send_queues.get(&raw).map_or(0, |queue| queue.pending);
-        let stream_room = self.caps.stream.saturating_sub(stream_pending);
-        let connection_room = self
-            .caps
-            .connection_for(control)
-            .saturating_sub(self.pending_write_bytes);
-        stream_room.min(connection_room)
+        self.caps
+            .room(stream_pending, self.pending_write_bytes, control)
     }
 
     /// The stream's queue, created at the back of the round-robin order.
