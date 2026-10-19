@@ -12,9 +12,8 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { Minip2p } from "../src/adapter.js";
 
 vi.mock("../src/native", async () => {
-  const { FakeSerdeEndpoint: NodeEndpoint } = await import(
-    "@minip2p/test-fixtures/fake-serde-endpoint"
-  );
+  const { FakeSerdeEndpoint: NodeEndpoint } =
+    await import("@minip2p/test-fixtures/fake-serde-endpoint");
   return {
     nativeBinding: {
       NodeEndpoint,

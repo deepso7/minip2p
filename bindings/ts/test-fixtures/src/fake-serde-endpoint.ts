@@ -10,7 +10,10 @@ import type {
   NativePathKind,
   SerdeEndpoint,
 } from "../../core/src/serde-backend.js";
-import type { FakeNativeState, NativeEventLiteral } from "./adapter-contract.js";
+import type {
+  FakeNativeState,
+  NativeEventLiteral,
+} from "./adapter-contract.js";
 
 /**
  * A scriptable native endpoint in the serde shape, standing in for the Node
@@ -28,8 +31,7 @@ export class FakeSerdeEndpoint implements SerdeEndpoint {
   readonly writes: { connId: bigint; streamId: bigint }[] = [];
   /** Bytes `sendStream` received, in call order. */
   readonly writtenData: Uint8Array[] = [];
-  readonly consumed: { bytes: number; connId: bigint; streamId: bigint }[] =
-    [];
+  readonly consumed: { bytes: number; connId: bigint; streamId: bigint }[] = [];
   readonly cancelledConnects: bigint[] = [];
   readonly connectTargets: (string | string[])[] = [];
   readonly drainLimits: number[] = [];
@@ -181,7 +183,9 @@ export class FakeSerdeEndpoint implements SerdeEndpoint {
 
   sendStream(connId: bigint, streamId: bigint, data: Uint8Array): boolean {
     if (this.liveConnId !== undefined && connId !== this.liveConnId) {
-      throw new Error(`stream ${streamId} on connection ${connId} is not active`);
+      throw new Error(
+        `stream ${streamId} on connection ${connId} is not active`
+      );
     }
     this.writes.push({ connId, streamId });
     this.writtenData.push(data);
@@ -209,7 +213,9 @@ export const latestFakeSerdeEndpoint = (): FakeSerdeEndpoint => {
 };
 
 /** The adapter-contract view of a {@link FakeSerdeEndpoint}. */
-export const serdeContractNative = (fake: FakeSerdeEndpoint): FakeNativeState => ({
+export const serdeContractNative = (
+  fake: FakeSerdeEndpoint
+): FakeNativeState => ({
   abandoned: fake.abandonedStreams,
   cancelledConnects: fake.cancelledConnects,
   closeTimeouts: fake.closeTimeouts,

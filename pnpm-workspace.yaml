@@ -4,8 +4,10 @@ packages:
   - bindings/ts/node
   - bindings/ts/node-platforms/*
   - bindings/ts/react-native
+  - bindings/ts/web
   - examples/react-native
   - examples/nodejs
+  - examples/web
   - bindings/ts/test-fixtures
 
 allowBuilds:

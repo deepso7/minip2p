@@ -8,6 +8,14 @@
  * stream settlement and error typing live here once.
  */
 
+import { NativeCloseLatch, typedFfiError, unfinishedPeers } from "./backend.js";
+import type {
+  BackendClosed,
+  BackendConnectionInfo,
+  BackendConnectTarget,
+  BackendOpenStream,
+  Minip2pBackend,
+} from "./backend.js";
 import { StreamClosedError } from "./errors.js";
 import { EventDrain } from "./event-drain.js";
 import { ConnectionIdMap, u64ToNumber } from "./native-ids.js";
@@ -21,18 +29,6 @@ import type {
   Reachability,
   RelayReservationInfo,
 } from "./types.js";
-import {
-  NativeCloseLatch,
-  typedFfiError,
-  unfinishedPeers,
-} from "./backend.js";
-import type {
-  BackendClosed,
-  BackendConnectionInfo,
-  BackendConnectTarget,
-  BackendOpenStream,
-  Minip2pBackend,
-} from "./backend.js";
 
 /**
  * One SDK backend value as a serde shell encodes it: `u64` as a `number` or
@@ -394,7 +390,7 @@ export class SerdeBackend implements Minip2pBackend {
 
   /** Runs one native call through the shell's wrapper, typing its errors. */
   #native<T>(operation: (native: SerdeEndpoint) => T): T {
-    const call = this.#options.call;
+    const { call } = this.#options;
     const typed = (): T => translateErrors(() => operation(this.#endpoint));
     return call === undefined ? typed() : call(typed);
   }

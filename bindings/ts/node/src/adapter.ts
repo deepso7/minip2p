@@ -1,13 +1,10 @@
-/* oxlint-disable func-style -- Hoisted helpers keep the public entry points first. */
+/* oxlint-disable func-style, no-use-before-define -- Hoisted helpers keep the public entry points first. */
 
 import { Minip2pBase } from "@minip2p/core";
 import type { Bytes, Minip2pConfig } from "@minip2p/core";
 import { resolveEndpointConfig } from "@minip2p/core/backend";
 import type { Minip2pBackend } from "@minip2p/core/backend";
-import {
-  SerdeBackend,
-  typedNativeCall,
-} from "@minip2p/core/serde-backend";
+import { SerdeBackend, typedNativeCall } from "@minip2p/core/serde-backend";
 
 import { nativeBinding } from "./native.js";
 
