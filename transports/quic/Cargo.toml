@@ -91,6 +91,8 @@ minip2p-transport = { path = "../../crates/transport", version = "0.10.0" }
 minip2p-identity = { path = "../../crates/identity", version = "0.10.0" }
 minip2p-core = { path = "../../crates/core", version = "0.10.0" }
 minip2p-tls = { path = "../../crates/tls", version = "0.10.0" }
+minip2p-secure-mux = { path = "../../crates/secure-mux", version = "0.10.0" }
+minip2p-webtransport = { path = "../webtransport", version = "0.10.0" }
 quinn-proto = { version = "0.11.19", default-features = false, features = [
   "rustls-ring",
 ] }

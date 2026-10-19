@@ -1,13 +1,16 @@
 //! One QUIC connection: the quinn-proto engine plus the adapter's stream
 //! bookkeeping (half-close tracking, write queues, the read gate of ADR 0012,
-//! and stream-slot accounting).
+//! and stream-slot accounting). An `h3` connection also runs a
+//! [`WtSession`], which authenticates it and owns its HTTP/3 streams.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::mem;
+use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
+use minip2p_core::Protocol;
 use minip2p_transport::{
     ConnectionCloseReason, ConnectionEndpoint, ConnectionId, ConnectionState, ConnectionToken,
     StreamId, TransportError, TransportEvent,
@@ -20,6 +23,7 @@ use quinn_proto::{
 
 use crate::diagnostics::ConnectionCounters;
 use crate::socket::Sockets;
+use crate::webtransport::{WebTransportContext, WtEvent, WtSession};
 
 /// TLS exporter label for the connection token both ends derive.
 const TOKEN_LABEL: &[u8] = b"minip2p quic connection token";
@@ -96,6 +100,9 @@ struct PendingStreamWrite {
     counted: usize,
     /// If true, this entry is the stream's FIN.
     fin: bool,
+    /// The WebTransport stream prefix: queued ahead of the caller's bytes
+    /// and never counted against the send caps.
+    internal: bool,
 }
 
 impl PendingStreamWrite {
@@ -106,6 +113,7 @@ impl PendingStreamWrite {
             bytes,
             counted,
             fin: false,
+            internal: false,
         };
         write.bound_retained();
         write
@@ -117,6 +125,17 @@ impl PendingStreamWrite {
             bytes: Bytes::new(),
             counted: 0,
             fin: true,
+            internal: false,
+        }
+    }
+
+    /// A WebTransport stream prefix, outside the caller's accounting.
+    fn prefix(bytes: Vec<u8>) -> Self {
+        Self {
+            counted: bytes.len(),
+            bytes: Bytes::from(bytes),
+            fin: false,
+            internal: true,
         }
     }
 
@@ -254,6 +273,11 @@ pub(crate) struct QuicConnection {
     unfinished: bool,
     /// Diagnostic hooks; empty unless the `diagnostics` feature is on.
     counters: ConnectionCounters,
+    /// Set for connections to a WebTransport-serving socket: what an `h3`
+    /// handshake needs to authenticate.
+    webtransport: Option<Arc<WebTransportContext>>,
+    /// The WebTransport session, once the handshake negotiated `h3`.
+    wt: Option<WtSession>,
 }
 
 /// The engine's id for a raw stream id the adapter tracks.
@@ -271,6 +295,7 @@ impl QuicConnection {
         endpoint: ConnectionEndpoint,
         limits: &crate::QuicLimits,
         counters: ConnectionCounters,
+        webtransport: Option<Arc<WebTransportContext>>,
     ) -> Self {
         let next_local_bidi_stream_id = u64::from(conn.side().is_server());
         Self {
@@ -297,6 +322,8 @@ impl QuicConnection {
             timeout: None,
             unfinished: false,
             counters,
+            webtransport,
+            wt: None,
         }
     }
 
@@ -426,6 +453,11 @@ impl QuicConnection {
                 progressed = true;
                 self.on_event(event, now, cx);
             }
+            if let Some(wt) = self.wt.as_mut() {
+                wt.open_control(&mut self.conn);
+                wt.flush(&mut self.conn);
+                self.after_wt(now, cx.events);
+            }
             self.bind_pending_opens(now);
             self.drain_send_queues(now, cx.events);
             // Endpoint events (new connection ids, retirements, the final
@@ -490,8 +522,17 @@ impl QuicConnection {
         match event {
             Event::Connected => self.on_connected(now, cx),
             Event::ConnectionLost { reason } => self.on_lost(&reason),
-            Event::Stream(StreamEvent::Opened { dir }) => self.accept_streams(dir, cx.events),
-            Event::Stream(StreamEvent::Readable { id }) => self.scan(u64::from(id), cx.events),
+            Event::Stream(StreamEvent::Opened { dir }) => self.accept_streams(dir, now, cx.events),
+            Event::Stream(StreamEvent::Readable { id }) => {
+                let raw = u64::from(id);
+                match self.wt.as_mut().filter(|wt| wt.owns(raw)) {
+                    Some(wt) => {
+                        wt.on_readable(&mut self.conn, raw);
+                        self.after_wt(now, cx.events);
+                    }
+                    None => self.scan(raw, cx.events),
+                }
+            }
             // New credit: the scheduler that runs after these events hands
             // it out in turn, rather than to the stream it names.
             Event::Stream(StreamEvent::Writable { .. }) => {}
@@ -526,11 +567,27 @@ impl QuicConnection {
     /// the peer's certificate inside TLS (client certificates are optional
     /// on WebTransport-serving sockets): record who it is and the token both
     /// ends derive, then report the connection and the peer streams that
-    /// waited for it. Anything else fails before `Connected`.
+    /// waited for it. An `h3` connection starts its WebTransport session,
+    /// which reports it once Noise authenticates the client. Anything else
+    /// fails before `Connected`.
     fn on_connected(&mut self, now: Instant, cx: &mut Cx<'_>) {
         if self.negotiated_alpn().as_deref() == Some(crate::tls::H3_ALPN) {
-            // Held for the WebTransport handshake once it is served.
-            self.fail_connection(now, "WebTransport sessions are not served yet".into());
+            let Some(context) = self.webtransport.clone() else {
+                self.fail_connection(
+                    now,
+                    "h3 on a socket that does not serve WebTransport".into(),
+                );
+                return;
+            };
+            // A browser's address: never a hole-punching candidate.
+            let mut transport = self.endpoint.transport().clone();
+            transport.push(Protocol::WebTransport);
+            self.endpoint = ConnectionEndpoint::new(transport);
+            let mut wt = WtSession::new(context);
+            wt.open_control(&mut self.conn);
+            self.wt = Some(wt);
+            self.accept_streams(Dir::Uni, now, cx.events);
+            self.accept_streams(Dir::Bi, now, cx.events);
             return;
         }
         let identity = self.conn.crypto_session().peer_identity();
@@ -565,8 +622,50 @@ impl QuicConnection {
                 previous_peer_id: previous,
             });
         }
-        self.accept_streams(Dir::Bi, cx.events);
-        self.accept_streams(Dir::Uni, cx.events);
+        self.accept_streams(Dir::Bi, now, cx.events);
+        self.accept_streams(Dir::Uni, now, cx.events);
+    }
+
+    /// Acts on what the WebTransport session reported: the authenticated
+    /// connection, streams to surface, or a failure.
+    fn after_wt(&mut self, now: Instant, events: &mut Vec<TransportEvent>) {
+        let Some(wt) = self.wt.as_mut() else {
+            return;
+        };
+        for event in wt.take_events() {
+            match event {
+                WtEvent::Established { peer, token } => {
+                    if self.is_closing() {
+                        continue;
+                    }
+                    self.endpoint.set_peer_id(peer);
+                    self.endpoint.set_token(ConnectionToken::new(token));
+                    self.state = ConnectionState::Connected;
+                    self.surfaces_streams = true;
+                    events.push(TransportEvent::Connected {
+                        id: self.id,
+                        endpoint: self.endpoint.clone(),
+                    });
+                    events.push(TransportEvent::PeerIdentityVerified {
+                        id: self.id,
+                        endpoint: self.endpoint.clone(),
+                        previous_peer_id: None,
+                    });
+                }
+                WtEvent::Admit(raw) => {
+                    if !self.surfaces_streams {
+                        self.refuse_stream(engine_stream(raw));
+                    } else if self.admit_remote_stream(raw, events) {
+                        self.scan(raw, events);
+                    }
+                }
+                WtEvent::Fail { code, reason } => {
+                    if !self.is_closing() {
+                        self.close_with(now, code, reason);
+                    }
+                }
+            }
+        }
     }
 
     /// The engine lost the connection; `Closed` follows once it drains,
@@ -597,13 +696,21 @@ impl QuicConnection {
     /// raises only `Opened`, never `Readable`). Every other stream is
     /// refused: libp2p uses no unidirectional streams, and a closing
     /// connection takes no new ones.
-    fn accept_streams(&mut self, dir: Dir, events: &mut Vec<TransportEvent>) {
-        if self.state == ConnectionState::Connecting {
+    ///
+    /// On an `h3` connection the WebTransport session takes every stream
+    /// until the connection closes: it reads HTTP/3's own streams and hands
+    /// back prefixed streams to admit.
+    fn accept_streams(&mut self, dir: Dir, now: Instant, events: &mut Vec<TransportEvent>) {
+        if self.state == ConnectionState::Connecting && self.wt.is_none() {
             return;
         }
         while let Some(stream) = self.conn.streams().accept(dir) {
             let raw = u64::from(stream);
-            if dir == Dir::Bi && self.surfaces_streams {
+            let closing = self.is_closing();
+            if let Some(wt) = self.wt.as_mut().filter(|_| !closing) {
+                wt.on_opened(&mut self.conn, stream);
+                self.after_wt(now, events);
+            } else if dir == Dir::Bi && self.surfaces_streams {
                 if self.admit_remote_stream(raw, events) {
                     self.scan(raw, events);
                 }
@@ -837,6 +944,18 @@ impl QuicConnection {
             id: raw,
             reset_on_bind: false,
         });
+        if let Some(session_id) = self.wt.as_ref().and_then(WtSession::session_id) {
+            let mut prefix = Vec::new();
+            minip2p_webtransport::h3::encode_webtransport_bidi_header(session_id, &mut prefix)
+                .map_err(|_too_large| TransportError::InvalidState {
+                    id: self.id,
+                    state: self.state,
+                    expected: ConnectionState::Connected,
+                })?;
+            self.queue_mut(raw)
+                .writes
+                .push_back(PendingStreamWrite::prefix(prefix));
+        }
         Ok(StreamId::new(raw))
     }
 
@@ -1151,9 +1270,11 @@ impl QuicConnection {
                 match self.conn.send_stream(stream).write(offer) {
                     Ok(0) => return progressed,
                     Ok(written) => {
+                        if !front.internal {
+                            queue.pending -= written;
+                            self.pending_write_bytes -= written;
+                        }
                         front.advance(written);
-                        queue.pending -= written;
-                        self.pending_write_bytes -= written;
                         budget -= written;
                         progressed = true;
                         if !front.bytes.is_empty() {
@@ -1282,6 +1403,19 @@ impl QuicConnection {
             VarInt::from_u32(1),
             Bytes::from_static(b"stream send failed"),
         );
+        self.state = ConnectionState::Closing;
+        self.surfaces_streams = false;
+    }
+
+    /// Closes an `h3` connection with an HTTP/3 error code; `Closed`
+    /// follows with `message` as its reason.
+    fn close_with(&mut self, now: Instant, code: u64, message: String) {
+        self.end_writes();
+        let code = VarInt::from_u64(code).unwrap_or(VarInt::from_u32(1));
+        self.conn
+            .close(now, code, Bytes::from(message.clone().into_bytes()));
+        self.close_reason
+            .get_or_insert(ConnectionCloseReason::Error(message));
         self.state = ConnectionState::Closing;
         self.surfaces_streams = false;
     }

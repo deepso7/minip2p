@@ -333,23 +333,26 @@ impl TlsIdentity {
         )
     }
 
-    /// The config of a socket that also serves WebTransport: ALPN `libp2p`
-    /// then `h3` (the server's order wins), the certificate chosen by ALPN,
-    /// and an optional client certificate. A presented one is still fully
-    /// verified; `on_connected` requires one for `libp2p`.
+    /// The config of a socket that serves WebTransport: ALPN `h3`, after
+    /// `libp2p` when the socket also serves `quic-v1` (the server's order
+    /// wins), the certificate chosen by ALPN, and an optional client
+    /// certificate. A presented one is still fully verified; `on_connected`
+    /// requires one for `libp2p`.
     pub(crate) fn webtransport_server_config(
         &self,
         webtransport: WebTransportCertificate,
+        libp2p: bool,
     ) -> Result<rustls::ServerConfig, rustls::Error> {
         let resolver = AlpnResolver {
             libp2p: Arc::clone(&self.key),
             webtransport,
         };
-        self.build_server_config(
-            false,
-            Arc::new(resolver),
-            vec![ALPN.to_vec(), H3_ALPN.to_vec()],
-        )
+        let alpns = if libp2p {
+            vec![ALPN.to_vec(), H3_ALPN.to_vec()]
+        } else {
+            vec![H3_ALPN.to_vec()]
+        };
+        self.build_server_config(false, Arc::new(resolver), alpns)
     }
 
     fn build_server_config(
