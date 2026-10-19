@@ -1416,10 +1416,14 @@ impl EndpointBuilder {
 
     /// Adds a listener from a complete transport multiaddress.
     ///
-    /// QUIC (`/ip4|ip6/udp/<port>/quic-v1`) and TCP (`/ip4|ip6/tcp/<port>`)
-    /// shapes are accepted. Compatible addresses are grouped at
-    /// [`EndpointBuilder::bind`]; unsupported or contradictory shapes fail
-    /// here with an actionable error.
+    /// QUIC (`/ip4|ip6/udp/<port>/quic-v1`), WebTransport
+    /// (`/ip4|ip6/udp/<port>/quic-v1/webtransport`, without a `/certhash`:
+    /// the node's certificate supplies it) and TCP (`/ip4|ip6/tcp/<port>`)
+    /// shapes are accepted. A `quic-v1` and a WebTransport address on the
+    /// same host and port share one UDP socket, which serves both.
+    /// Compatible addresses are grouped at [`EndpointBuilder::bind`];
+    /// unsupported or contradictory shapes fail here with an actionable
+    /// error.
     ///
     /// Named `listen_on` to avoid colliding with [`Endpoint::listen`], which
     /// returns the first bound address after bind.
@@ -1464,7 +1468,7 @@ impl EndpointBuilder {
     fn push_listen_addr(&mut self, address: Multiaddr) -> Result<(), EndpointOptionsError> {
         validate_listen_multiaddr(&address)?;
         #[cfg(feature = "quic")]
-        if address.is_quic_transport() {
+        if is_quic_listen(&address) {
             reject_duplicate_quic_family(&self.listen_addrs, &address)?;
         }
         self.listen_addrs.push(address);
@@ -1788,15 +1792,26 @@ fn validate_listen_multiaddr(address: &Multiaddr) -> Result<(), EndpointOptionsE
     if address.is_quic_transport() {
         return Ok(());
     }
+    #[cfg(feature = "quic")]
+    if address.is_webtransport() {
+        if address.certhashes().next().is_some() {
+            return Err(unsupported(
+                "`/ip4|ip6/udp/<port>/quic-v1/webtransport` without /certhash \
+                 (the node's own certificate supplies it)",
+            ));
+        }
+        return Ok(());
+    }
     #[cfg(feature = "tcp")]
     if address.is_tcp_transport() {
         return Ok(());
     }
 
     #[cfg(all(feature = "quic", feature = "tcp"))]
-    let expected = "`/ip4|ip6/udp/<port>/quic-v1` or `/ip4|ip6/tcp/<port>`";
+    let expected =
+        "`/ip4|ip6/udp/<port>/quic-v1`, `…/quic-v1/webtransport` or `/ip4|ip6/tcp/<port>`";
     #[cfg(all(feature = "quic", not(feature = "tcp")))]
-    let expected = "`/ip4|ip6/udp/<port>/quic-v1`";
+    let expected = "`/ip4|ip6/udp/<port>/quic-v1` or `…/quic-v1/webtransport`";
     #[cfg(all(feature = "tcp", not(feature = "quic")))]
     let expected = "`/ip4|ip6/tcp/<port>`";
     Err(unsupported(expected))
@@ -1811,6 +1826,16 @@ fn listen_ip_family(address: &Multiaddr) -> Option<IpFamily> {
     }
 }
 
+/// Whether a listen address is one the QUIC transport binds: `quic-v1` or
+/// WebTransport.
+#[cfg(feature = "quic")]
+fn is_quic_listen(address: &Multiaddr) -> bool {
+    address.is_quic_transport() || address.is_webtransport()
+}
+
+/// QUIC binds one socket per family, which may serve one `quic-v1` and one
+/// WebTransport address: a second address of a family must name the same
+/// host and port as the first, in the other shape.
 #[cfg(feature = "quic")]
 fn reject_duplicate_quic_family(
     existing: &[Multiaddr],
@@ -1819,10 +1844,14 @@ fn reject_duplicate_quic_family(
     let Some(family) = listen_ip_family(next) else {
         return Ok(());
     };
+    let socket = |address: &Multiaddr| address.protocols().get(..2).map(<[Protocol]>::to_vec);
     if existing
         .iter()
-        .filter(|address| address.is_quic_transport())
-        .any(|address| listen_ip_family(address) == Some(family))
+        .filter(|address| is_quic_listen(address))
+        .filter(|address| listen_ip_family(address) == Some(family))
+        .any(|address| {
+            address.is_webtransport() == next.is_webtransport() || socket(address) != socket(next)
+        })
     {
         return Err(EndpointOptionsError::DuplicateQuicFamily {
             addr: next.clone(),
@@ -1858,7 +1887,7 @@ fn bind_transports(
         #[cfg(feature = "quic")]
         let quic_addrs: Vec<&Multiaddr> = addrs
             .iter()
-            .filter(|address| address.is_quic_transport())
+            .filter(|address| is_quic_listen(address))
             .collect();
         #[cfg(feature = "tcp")]
         let tcp_addrs: Vec<&Multiaddr> = addrs
@@ -1867,7 +1896,7 @@ fn bind_transports(
             .collect();
         let quic_first = addrs
             .first()
-            .is_none_or(|address| address.is_quic_transport());
+            .is_none_or(|address| address.transport_kind() == Some(TransportKind::Quic));
         let order = if quic_first {
             [true, false]
         } else {
@@ -1878,8 +1907,9 @@ fn bind_transports(
             if want_quic && !quic_addrs.is_empty() {
                 let config =
                     QuicNodeConfig::new(keypair.clone()).with_limits(options.quic_limits.clone());
-                // `listen_on` allows at most one QUIC address per family, which
-                // is what the transport binds: one socket per family.
+                // `listen_on` allows one socket per family, which is what the
+                // transport binds; its `quic-v1` and WebTransport shapes are
+                // grouped onto that socket there.
                 let addresses: Vec<Multiaddr> =
                     quic_addrs.iter().map(|&address| address.clone()).collect();
                 let transport = QuicTransport::bind(config, &addresses).map_err(BindError::Quic)?;
@@ -2967,6 +2997,44 @@ mod tests {
                 }
             ),
             "{duplicate}"
+        );
+    }
+
+    #[test]
+    fn webtransport_listens_share_the_quic_socket_of_their_family() {
+        let builder = || {
+            Endpoint::builder()
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+                .expect("quic-v1")
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")
+                .expect("WebTransport on the same socket")
+        };
+        for rejected in [
+            // Another port: QUIC has one socket per family.
+            "/ip4/127.0.0.1/udp/4001/quic-v1/webtransport",
+            // The same shape twice.
+            "/ip4/127.0.0.1/udp/0/quic-v1/webtransport",
+        ] {
+            let Err(error) = builder().listen_on(rejected) else {
+                panic!("{rejected} must be refused");
+            };
+            assert!(
+                matches!(error, EndpointOptionsError::DuplicateQuicFamily { .. }),
+                "{rejected}: {error}"
+            );
+        }
+        let Err(certhash) = Endpoint::builder().listen_on(
+            "/ip4/127.0.0.1/udp/0/quic-v1/webtransport/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g",
+        ) else {
+            panic!("a listen certhash must be refused");
+        };
+        assert!(
+            matches!(
+                &certhash,
+                EndpointOptionsError::UnsupportedListenShape { expected, .. }
+                    if expected.contains("without /certhash")
+            ),
+            "{certhash}"
         );
     }
 

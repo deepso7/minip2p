@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 
 #[test]
 fn operator_cli_prints_the_release_version() {
@@ -62,4 +63,46 @@ fn service_install_rejects_an_invalid_hostname_before_touching_the_host() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("invalid --hostname"), "{stderr}");
     assert!(stderr.contains("not a hostname"), "{stderr}");
+}
+
+#[test]
+fn webtransport_prints_the_certhash_address_on_the_quic_port() {
+    let mut relay = Command::new(env!("CARGO_BIN_EXE_minip2p-relay"))
+        .args([
+            "--webtransport",
+            "--quic",
+            "127.0.0.1:0",
+            "--tcp",
+            "127.0.0.1:0",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = relay.stdout.take().unwrap();
+    let mut quic = None;
+    let mut webtransport = None;
+    for line in BufReader::new(stdout).lines() {
+        let line = line.unwrap();
+        if let Some(address) = line.strip_prefix("[relay] webtransport=") {
+            webtransport = Some(address.to_owned());
+            break;
+        }
+        if let Some(address) = line.strip_prefix("[relay] listening=")
+            && address.contains("/quic-v1/p2p/")
+        {
+            quic = Some(address.to_owned());
+        }
+    }
+    relay.kill().unwrap();
+    relay.wait().unwrap();
+
+    let webtransport = webtransport.expect("a WebTransport address");
+    let quic = quic.expect("a quic-v1 address");
+    assert!(
+        webtransport.contains("/webtransport/certhash/u"),
+        "{webtransport}"
+    );
+    let socket = |address: &str| address.split("/quic-v1").next().unwrap().to_owned();
+    assert_eq!(socket(&webtransport), socket(&quic));
 }

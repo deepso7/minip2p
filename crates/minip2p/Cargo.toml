@@ -81,11 +81,22 @@ minip2p-transport = { path = "../transport", version = "0.10.0", default-feature
 thiserror = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true, features = ["std"] }
 cpu-time = "1.0.0"
 criterion = { workspace = true }
 minip2p-autonat = { path = "../autonat" }
 minip2p-relay = { path = "../relay" }
 minip2p-test-support = { path = "../test-support" }
+# The test-only WebTransport client in `transports/quic/tests/common`.
+minip2p-tls = { path = "../tls" }
+minip2p-webtransport = { path = "../../transports/webtransport" }
+quinn-proto = { version = "0.11.19", default-features = false, features = [
+  "rustls-ring",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+] }
 socket2 = { workspace = true }
 stats_alloc = { workspace = true }
 
