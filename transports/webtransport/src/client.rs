@@ -34,6 +34,9 @@ pub const LIBP2P_WEBTRANSPORT_PATH: &str = "/.well-known/libp2p-webtransport?typ
 /// Read grant on the Noise stream; handshake messages are far smaller.
 const NOISE_READ_GRANT: usize = 64 * 1024;
 
+/// Why a dial fails when the platform refuses a write on the Noise stream.
+const NOISE_REFUSED: &str = "the platform refused the Noise stream";
+
 /// The `https://` URL a libp2p WebTransport address is served at.
 ///
 /// `addr` is `/<host>/udp/<port>/quic-v1/webtransport[/certhash/…]`. IPv6
@@ -428,13 +431,19 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             IoEvent::Reset { stream, .. } => self.on_reset(stream),
             IoEvent::StopSending { stream, code } => self.on_stop_sending(stream, code),
             IoEvent::WriteCompleted { stream, bytes } => {
-                let Some(&id) = self.by_stream.get(&stream) else {
+                let Some((id, noise)) = self.owner(stream) else {
                     return;
                 };
                 let refused = self.connections.get_mut(&id).is_some_and(|conn| {
                     conn.complete(stream, bytes);
                     conn.flush(&mut self.io, stream)
                 });
+                if refused && noise {
+                    // The Noise stream is the client's own: no stream event,
+                    // the handshake fails.
+                    self.fail(id, NOISE_REFUSED.into());
+                    return;
+                }
                 if refused {
                     self.on_write_refused(id, stream);
                 }
@@ -628,7 +637,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         }
         let Some(offered) = offered else {
             if conn.flush(&mut self.io, handle) {
-                self.fail(id, "the platform refused the Noise stream".into());
+                self.fail(id, NOISE_REFUSED.into());
             }
             return;
         };
@@ -646,7 +655,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             state.local_closed = true;
         }
         if conn.flush(&mut self.io, handle) {
-            self.fail(id, "the platform refused the Noise stream".into());
+            self.fail(id, NOISE_REFUSED.into());
             return;
         }
         if let Some(hash) = hash {

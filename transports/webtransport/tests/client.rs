@@ -687,6 +687,41 @@ fn a_write_the_platform_refuses_fails_the_send() {
 }
 
 #[test]
+fn a_noise_write_the_platform_later_refuses_fails_the_handshake() {
+    let mut client = client(small_limits());
+    // Message one goes out in parts.
+    client.io_mut().in_flight_cap = 10;
+    let server = Ed25519Keypair::generate();
+    let addr: PeerAddr = format!(
+        "/ip4/192.0.2.1/udp/4001/quic-v1/webtransport/certhash/{HASH}/p2p/{}",
+        server.peer_id()
+    )
+    .parse()
+    .expect("peer addr");
+    let id = client.dial(&addr).expect("dial");
+    let session = SessionHandle(client.io_mut().next);
+    client
+        .io_mut()
+        .events
+        .push_back(IoEvent::SessionReady { session });
+    assert_eq!(poll(&mut client), []);
+    let noise = StreamHandle(client.io_mut().next);
+    assert_eq!(client.io_mut().in_flight(noise), 10, "a partial write");
+
+    // The platform drops the Noise stream with the rest still queued.
+    client.io_mut().stream(noise).refuse = true;
+    client.io_mut().complete(noise);
+    assert_eq!(
+        poll(&mut client),
+        [TransportEvent::Closed {
+            id,
+            reason: ConnectionCloseReason::Error("the platform refused the Noise stream".into()),
+        }]
+    );
+    assert_eq!(client.io_mut().closed_sessions, [session.0]);
+}
+
+#[test]
 fn a_queued_write_the_platform_later_refuses_stops_the_write_side() {
     let mut client = client(small_limits());
     let conn = connect(&mut client);

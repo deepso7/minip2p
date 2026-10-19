@@ -25,9 +25,10 @@
 //! The session also ends orderly, in either direction: [`WtSession::close`]
 //! sends `CLOSE_WEBTRANSPORT_SESSION` and finishes the CONNECT stream, and a
 //! peer's capsule, CONNECT FIN or reset, or GOAWAY reports
-//! [`WtEvent::PeerClosed`]. The connection then waits for
-//! [`WtSession::ended_and_delivered`] (or a deadline) before closing QUIC,
-//! so the capsule or a refusal's status, and our FIN, reach the peer.
+//! [`WtEvent::PeerClosed`]. The connection then waits for a deadline (or,
+//! when the peer ended the session, [`WtSession::ended_and_delivered`])
+//! before closing QUIC, so the capsule or a refusal's status, and our FIN,
+//! reach the peer.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

@@ -506,6 +506,32 @@ fn a_server_close_sends_the_capsule_before_closing_quic_without_error() {
     assert!(!has_error(&seen.server) && !has_error(&seen.client));
 }
 
+/// Chrome FINs CONNECT and acknowledges our capsule and FIN in its network
+/// stack, before the page's `closed` settles; a QUIC close in that window
+/// rejects `closed` with "Connection lost". So after our close, QUIC stays
+/// open for the whole Closing phase (at least 500 ms) even though the
+/// client already ended the session.
+#[test]
+fn a_server_close_keeps_quic_open_for_the_closing_phase() {
+    let (mut server, mut client, mut seen, wire) = connected_pair();
+    let (server_conn, _) = connected(&seen.server).expect("server connected");
+
+    let start = Instant::now();
+    server.close(server_conn).expect("close");
+    drive_until_quic_closed(&mut server, &mut client, &mut seen, &wire);
+
+    assert!(
+        start.elapsed() >= Duration::from_millis(500),
+        "QUIC closed {:?} after a local close",
+        start.elapsed()
+    );
+    // The client ended the session well before that.
+    assert_eq!(
+        closed(&seen.client),
+        Some(ConnectionCloseReason::Remote { code: 0 })
+    );
+}
+
 #[test]
 fn a_client_close_is_orderly_on_the_server() {
     let (mut server, mut client, mut seen, wire) = connected_pair();

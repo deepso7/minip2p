@@ -37,8 +37,9 @@ const MAX_SERVICE_PASSES: usize = 4;
 /// scheduler, so backlogged streams share the peer's connection credit.
 const SEND_QUANTUM: usize = 64 * 1024;
 
-/// Bounds on how long a WebTransport session's Closing phase waits for the
-/// peer to end its CONNECT stream: `max(3 × RTT, 500 ms)`, capped at 2 s.
+/// Bounds on a WebTransport session's Closing phase: `max(3 × RTT, 500 ms)`,
+/// capped at 2 s. A peer-ended session may close QUIC sooner; one we closed
+/// waits it out (see [`QuicConnection::finish_wt_closing`]).
 const WT_CLOSE_MIN: Duration = Duration::from_millis(500);
 const WT_CLOSE_MAX: Duration = Duration::from_secs(2);
 
@@ -253,6 +254,9 @@ pub(crate) struct QuicConnection {
     /// `H3_NO_ERROR` at the latest, if the peer has not ended its CONNECT
     /// stream before.
     wt_close_at: Option<Instant>,
+    /// Whether the Closing phase may end before `wt_close_at`, once the
+    /// session's end is delivered: not when we closed the session.
+    wt_close_early: bool,
 }
 
 /// The engine's id for a raw stream id the adapter tracks.
@@ -306,6 +310,7 @@ impl QuicConnection {
             wt_handshake_timeout: Duration::from_millis(limits.webtransport_handshake_timeout_ms),
             wt_deadline: None,
             wt_close_at: None,
+            wt_close_early: false,
         }
     }
 
@@ -1301,7 +1306,7 @@ impl QuicConnection {
     ///
     /// An accepted WebTransport session first enters its Closing phase: it
     /// sends the close capsule and FIN on the CONNECT stream, and QUIC
-    /// closes once the peer ends that stream or the phase's deadline passes.
+    /// closes once the phase's deadline passes.
     pub(crate) fn close(&mut self, now: Instant) {
         if self.is_closing() {
             return;
@@ -1330,7 +1335,6 @@ impl QuicConnection {
     /// every open stream reset, and a deadline for the peer to end its
     /// CONNECT stream. [`Self::finish_wt_closing`] closes QUIC.
     fn enter_wt_closing(&mut self, now: Instant, reason: ConnectionCloseReason) {
-        self.close_reason.get_or_insert(reason);
         self.state = ConnectionState::Closing;
         self.surfaces_streams = false;
         self.end_writes();
@@ -1345,19 +1349,29 @@ impl QuicConnection {
             self.reset_on_wire(raw);
         }
         let wait = (self.conn.rtt() * 3).clamp(WT_CLOSE_MIN, WT_CLOSE_MAX);
+        self.wt_close_early = reason != ConnectionCloseReason::Local;
+        self.close_reason.get_or_insert(reason);
         self.wt_close_at = Some(now + wait);
         self.finish_wt_closing(now);
     }
 
-    /// Ends the Closing phase once the peer ended its CONNECT stream and
-    /// acknowledged ours, or the deadline passed: QUIC closes with
-    /// `H3_NO_ERROR`. Closing any sooner would discard our FIN and resets,
-    /// which the engine drops with a close.
+    /// Ends the Closing phase once the deadline passed, or sooner for a
+    /// session the peer ended, once it ended its CONNECT stream and
+    /// acknowledged ours: QUIC closes with `H3_NO_ERROR`. Closing before
+    /// that would discard our FIN and resets, which the engine drops with a
+    /// close.
+    ///
+    /// A session we closed always waits out the deadline: Chrome ends its
+    /// CONNECT stream and acknowledges ours in its network stack, before the
+    /// page's `closed` settles, and a QUIC close in that window rejects
+    /// `closed` with "Connection lost" instead of fulfilling it.
     fn finish_wt_closing(&mut self, now: Instant) {
         let Some(at) = self.wt_close_at else {
             return;
         };
-        if now < at && !self.wt.as_ref().is_some_and(WtSession::ended_and_delivered) {
+        let delivered =
+            self.wt_close_early && self.wt.as_ref().is_some_and(WtSession::ended_and_delivered);
+        if now < at && !delivered {
             return;
         }
         self.wt_close_at = None;
