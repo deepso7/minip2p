@@ -1067,6 +1067,36 @@ fn draft14_server_bytes_wait_for_the_clients_data_credit() {
 }
 
 #[test]
+fn more_than_one_session_enables_flow_control_with_zero_initial_credit() {
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    // No WT_INITIAL_MAX_*: offering two sessions alone asks for flow
+    // control, and the omitted limits are 0.
+    peer.control(&[(setting::WT_MAX_SESSIONS, 2), (setting::H3_DATAGRAM, 1)]);
+    peer.libp2p_connect();
+    // Data credit for the Noise reply and what follows; no stream credit.
+    peer.capsule(&Capsule::MaxData(1 << 20));
+    peer.authenticate(&mut server, &mut events);
+    let id = events
+        .iter()
+        .find_map(|event| match event {
+            TransportEvent::Connected { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("connected");
+    let streams = [server_stream(&mut server, id, b"a")];
+    let mut read = [None];
+    assert_eq!(settle(&mut server, &mut peer, &streams, &mut read), [None]);
+
+    peer.capsule(&Capsule::MaxStreamsBidi(1));
+    assert_eq!(
+        settle(&mut server, &mut peer, &streams, &mut read),
+        [Some(b"a".to_vec())]
+    );
+}
+
+#[test]
 fn draft02_has_no_session_flow_control() {
     // The same limits, without draft-14's WT_MAX_SESSIONS, limit nothing.
     let mut settings = DRAFT02.to_vec();

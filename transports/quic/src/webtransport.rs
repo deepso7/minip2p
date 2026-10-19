@@ -135,9 +135,9 @@ struct Connect {
 }
 
 /// The client's session flow-control credit for what we send (draft-13/14,
-/// once the client sent any `WT_INITIAL_MAX_*`): server-opened bidi streams,
-/// and stream bytes after their prefixes. Noise's handshake bytes are not
-/// counted.
+/// once the client offered more than one session or any nonzero
+/// `WT_INITIAL_MAX_*`): server-opened bidi streams, and stream bytes after
+/// their prefixes. Noise's handshake bytes are not counted.
 #[derive(Debug, Default)]
 struct Credit {
     max_streams: u64,
@@ -793,14 +793,20 @@ impl WtSession {
         } else {
             "400"
         };
-        // Draft-13/14 flow control is on once both sides sent a limit; ours
-        // are 2^60, so only the client's ever bind.
+        // Draft-13/14 flow control is on once both sides ask for it, with
+        // more than one session or a nonzero initial limit (draft-14 §5.1);
+        // ours are 2^60, so only the client's limits ever bind, and an
+        // omitted one is 0.
         let limits = [
             setting::WT_INITIAL_MAX_DATA,
             setting::WT_INITIAL_MAX_STREAMS_BIDI,
             setting::WT_INITIAL_MAX_STREAMS_UNI,
         ];
-        if draft14 && limits.iter().any(|&id| settings.get(id).unwrap_or(0) > 0) {
+        let flow_control = settings
+            .get(setting::WT_MAX_SESSIONS)
+            .is_some_and(|sessions| sessions > 1)
+            || limits.iter().any(|&id| settings.get(id).unwrap_or(0) > 0);
+        if draft14 && flow_control {
             self.credit = Some(Credit {
                 max_streams: settings
                     .get(setting::WT_INITIAL_MAX_STREAMS_BIDI)
