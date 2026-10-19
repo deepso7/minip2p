@@ -1495,6 +1495,8 @@ impl Drop for QuicTransport {
         // Nothing polls after this, so every connection's CONNECTION_CLOSE
         // leaves now. Drain the retry queues first so a full one has room to
         // retain them; closing an already-closed connection is a no-op.
+        // A WebTransport session's close capsule and FIN go out with the
+        // close, but its Closing phase is cut short: nothing would end it.
         for socket in self.sockets.iter_mut() {
             socket.flush();
         }
@@ -1502,6 +1504,10 @@ impl Drop for QuicTransport {
         for id in ids {
             match self.close(id) {
                 Ok(()) | Err(_) => {}
+            }
+            if let Some(conn) = self.connections.get_mut(&id) {
+                conn.cut_wt_closing(Instant::now());
+                self.service(id, Instant::now());
             }
         }
         for socket in self.sockets.iter_mut() {

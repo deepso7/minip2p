@@ -21,11 +21,13 @@
 //! Before authentication every allocation is capped: the codec's frame,
 //! capsule and QPACK caps, at most [`MAX_EARLY_STREAMS`] unfinished heads
 //! and held streams, and [`MAX_EARLY_BYTES`] across request heads and held
-//! streams. Past a cap the connection closes with `H3_EXCESSIVE_LOAD`.
+//! streams. Past a cap the connection closes with the code RFC 9114 and
+//! RFC 9204 give it: `H3_EXCESSIVE_LOAD` for all but the codec's field
+//! section and CLOSE reason caps.
 //!
 //! The session also ends orderly, in either direction: [`WtSession::close`]
 //! sends `CLOSE_WEBTRANSPORT_SESSION` and finishes the CONNECT stream, and a
-//! peer's capsule, CONNECT FIN or reset, or GOAWAY reports
+//! peer's capsule, CONNECT FIN, reset or STOP_SENDING, or GOAWAY reports
 //! [`WtEvent::PeerClosed`]. The connection then waits for a deadline (or,
 //! when the peer ended the session, [`WtSession::ended_and_delivered`])
 //! before closing QUIC, so the capsule or a refusal's status, and our FIN,
@@ -83,8 +85,9 @@ pub(crate) enum WtEvent {
         early: Vec<u8>,
         end: ReadEnd,
     },
-    /// The peer ended the session (close capsule, CONNECT FIN or reset, or
-    /// GOAWAY) with this WebTransport code: finish our side and close.
+    /// The peer ended the session (close capsule, CONNECT FIN, reset or
+    /// STOP_SENDING, or GOAWAY) with this WebTransport code: finish our
+    /// side and close.
     PeerClosed { code: u32 },
     /// The CONNECT was answered with an error status and finished: close
     /// once the status is through.
@@ -109,8 +112,8 @@ enum PeerUni {
 struct Control {
     frames: FrameDecoder,
     saw_settings: bool,
-    /// The client's latest MAX_PUSH_ID: we never push, but it bounds the
-    /// push ids CANCEL_PUSH may name (RFC 9114 §7.2.3).
+    /// The client's latest MAX_PUSH_ID, which may not shrink (RFC 9114
+    /// §7.2.7); we never push.
     max_push_id: Option<u64>,
 }
 
@@ -145,17 +148,31 @@ struct Credit {
     opened: u64,
     max_data: u64,
     sent: u64,
+    /// The last WT_MAX_DATA, WT_MAX_STREAMS bidi and uni capsule values
+    /// (uni only checked: we open no uni streams).
+    last_data: u64,
+    last_bidi: u64,
+    last_uni: u64,
 }
 
 impl Credit {
-    /// Applies a credit capsule; limits only ever grow.
-    fn raise(&mut self, capsule: &Capsule) {
-        match *capsule {
-            Capsule::MaxData(max) => self.max_data = self.max_data.max(max),
-            Capsule::MaxStreamsBidi(max) => self.max_streams = self.max_streams.max(max),
-            // We open no uni streams.
-            Capsule::MaxStreamsUni(_) | Capsule::CloseSession { .. } => {}
+    /// Applies a credit capsule, so limits only ever grow. Returns false
+    /// for a value below the previous capsule's of its kind, which draft-14
+    /// §§5.6.2, 5.6.4 make a `WT_FLOW_CONTROL_ERROR`.
+    fn raise(&mut self, capsule: &Capsule) -> bool {
+        let (last, max) = match *capsule {
+            Capsule::MaxData(max) => (&mut self.last_data, max),
+            Capsule::MaxStreamsBidi(max) => (&mut self.last_bidi, max),
+            Capsule::MaxStreamsUni(max) => (&mut self.last_uni, max),
+            Capsule::CloseSession { .. } => return true,
+        };
+        if max < *last {
+            return false;
         }
+        *last = max;
+        self.max_data = self.max_data.max(self.last_data);
+        self.max_streams = self.max_streams.max(self.last_bidi);
+        true
     }
 }
 
@@ -353,10 +370,18 @@ impl WtSession {
     }
 
     /// The peer stopped our side of `raw`. Our control stream is critical
-    /// (RFC 9114 §6.2.1), so stopping it fails the connection; a stopped
-    /// CONNECT stream has nothing in flight. Returns whether `raw` is one of
-    /// the session's own streams, which the connection leaves alone.
-    pub(crate) fn on_stopped(&mut self, raw: u64) -> bool {
+    /// (RFC 9114 §6.2.1), so stopping it fails the connection. Any other
+    /// stream of the session's own is reset with the peer's code (RFC 9000
+    /// §3.5); a stopped CONNECT stream also ends the session (draft-14 §6),
+    /// and a stopped Noise stream, before the handshake completed, fails
+    /// it. Returns whether `raw` is one of the session's own streams, which
+    /// the connection leaves alone.
+    pub(crate) fn on_stopped(
+        &mut self,
+        conn: &mut Connection,
+        raw: u64,
+        error_code: VarInt,
+    ) -> bool {
         if self
             .control
             .is_some_and(|control| u64::from(control) == raw)
@@ -367,8 +392,29 @@ impl WtSession {
             );
             return true;
         }
-        self.on_send_done(raw);
-        self.owns(raw)
+        if !self.owns(raw) {
+            return false;
+        }
+        match conn.send_stream(engine_stream(raw)).reset(error_code) {
+            Ok(()) | Err(_) => {}
+        }
+        self.out.remove(&raw);
+        if self.connect.as_ref().is_some_and(|c| c.id == raw) {
+            self.on_send_done(raw);
+            // A close capsule already received keeps its code.
+            self.read_connect(conn);
+            self.peer_closed(0);
+        } else if let Some(noise) = self.noise.as_mut().filter(|n| n.id == raw) {
+            noise.pending.clear();
+            noise.fin = false;
+            if noise.session.is_some() {
+                self.fail(
+                    code::H3_GENERAL_PROTOCOL_ERROR,
+                    "the client stopped the Noise stream mid-handshake".into(),
+                );
+            }
+        }
+        true
     }
 
     /// What the connection must act on since the last call.
@@ -566,7 +612,16 @@ impl WtSession {
                     );
                     return;
                 }
-                // WebTransport uni and unknown streams: refused, never fatal.
+                // An id no request stream has, as on bidi streams.
+                UniStreamType::WebTransport { session_id } if !session_id.is_multiple_of(4) => {
+                    self.fail(
+                        code::H3_ID_ERROR,
+                        format!("a uni stream named session {session_id}, not a request stream id"),
+                    );
+                    return;
+                }
+                // Other WebTransport uni and unknown streams: refused, never
+                // fatal.
                 UniStreamType::WebTransport { .. } | UniStreamType::Unknown(_) => {
                     stop(conn, raw, code::H3_STREAM_CREATION_ERROR);
                     return;
@@ -601,8 +656,9 @@ impl WtSession {
     }
 
     /// Decodes the client's control frames: SETTINGS first, then nothing
-    /// but GOAWAY (which ends the session), the push frames (checked, though
-    /// we never push) and frames HTTP/3 skips. Returns the code and reason of
+    /// but GOAWAY (which ends the session), MAX_PUSH_ID (checked, though we
+    /// never push) and frames HTTP/3 skips; any CANCEL_PUSH names a push we
+    /// never promised. Returns the code and reason of
     /// a connection error.
     fn read_control(
         &mut self,
@@ -662,11 +718,15 @@ impl WtSession {
                 Some(Frame::MaxPushId(id)) if max_push_id.is_none_or(|max| id >= max) => {
                     *max_push_id = Some(id);
                 }
-                Some(Frame::CancelPush(id)) if max_push_id.is_some_and(|max| id <= max) => {}
-                Some(Frame::MaxPushId(_) | Frame::CancelPush(_)) => {
+                Some(Frame::MaxPushId(_)) => {
+                    return Some((code::H3_ID_ERROR, "a smaller MAX_PUSH_ID".into()));
+                }
+                // We never send PUSH_PROMISE, so no push id was ever
+                // promised (RFC 9114 §7.2.3).
+                Some(Frame::CancelPush(_)) => {
                     return Some((
                         code::H3_ID_ERROR,
-                        "a push id past the client's MAX_PUSH_ID, or a smaller MAX_PUSH_ID".into(),
+                        "CANCEL_PUSH for a push never promised".into(),
                     ));
                 }
                 Some(frame) => {
@@ -874,8 +934,17 @@ impl WtSession {
                             closed_with.get_or_insert(code);
                         }
                         Ok(Some(capsule)) => {
-                            if let Some(credit) = self.credit.as_mut() {
-                                credit.raise(&capsule);
+                            // The connection's only session: its flow-control
+                            // error closes the connection.
+                            if self
+                                .credit
+                                .as_mut()
+                                .is_some_and(|credit| !credit.raise(&capsule))
+                            {
+                                break 'frames Some((
+                                    code::WT_FLOW_CONTROL_ERROR,
+                                    format!("{capsule:?} lowers the previous limit"),
+                                ));
                             }
                         }
                         Ok(None) => break,
@@ -1153,8 +1222,9 @@ impl WtSession {
 /// webtransport` (the token drafts 02 and 13/14 share; draft-15's
 /// `webtransport-h3` is not served), `:scheme https`, `:authority` and
 /// `:path`, no other pseudo-header, and none after a regular field; a
-/// nonempty `:authority` without userinfo; no NUL, CR or LF in any value;
-/// and only valid regular fields ([`valid_regular_field`]).
+/// nonempty `:authority` without userinfo, which a `host` field, if any,
+/// repeats exactly (RFC 9114 §4.3.1); no NUL, CR or LF in any value; and
+/// only valid regular fields ([`valid_regular_field`]).
 fn request_status(section: &FieldSection<'_>) -> &'static str {
     const PSEUDO: [&[u8]; 5] = [
         b":method",
@@ -1167,7 +1237,11 @@ fn request_status(section: &FieldSection<'_>) -> &'static str {
     let mut regular = false;
     for field in section.iter() {
         if !field.name.starts_with(b":") {
-            if !valid_regular_field(&field) {
+            // Pseudo-headers come first, so `:authority` is known here.
+            let [.., authority, _] = values;
+            if !valid_regular_field(&field)
+                || (field.name == b"host" && authority != Some(field.value))
+            {
                 return "400";
             }
             regular = true;
