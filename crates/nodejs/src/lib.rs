@@ -438,33 +438,14 @@ pub fn circuit_address(env: Env, relay_address: String, peer_id: String) -> Resu
 /// when it has one, and an `InvalidConfig`'s `capability`. The TypeScript
 /// adapter maps `code` to typed SDK errors.
 fn native_error(env: &Env, error: FfiError) -> Error {
-    let capability = match &error {
-        FfiError::InvalidConfig { capability, .. } => Some(capability.as_str()),
-        _ => None,
-    };
-    let (code, detail) = match &error {
-        FfiError::AlreadyStarted => ("AlreadyStarted", None),
-        FfiError::Stopped => ("Stopped", None),
-        FfiError::InvalidConfig { detail, .. } => ("InvalidConfig", Some(detail)),
-        FfiError::InvalidKey { detail } => ("InvalidKey", Some(detail)),
-        FfiError::InvalidPeerId { detail } => ("InvalidPeerId", Some(detail)),
-        FfiError::InvalidAddress { detail } => ("InvalidAddress", Some(detail)),
-        FfiError::InvalidTopic { detail } => ("InvalidTopic", Some(detail)),
-        FfiError::NotPermitted { detail } => ("NotPermitted", Some(detail)),
-        FfiError::Backpressure => ("Backpressure", None),
-        FfiError::MessageTooLarge => ("MessageTooLarge", None),
-        FfiError::Transport { detail } => ("Transport", Some(detail)),
-        FfiError::InvalidState { detail } => ("InvalidState", Some(detail)),
-        FfiError::Internal { detail } => ("Internal", Some(detail)),
-    };
     let tagged = || -> Result<Error> {
         let mut js_error = env.create_error(Error::from_reason(error.to_string()))?;
-        js_error.set_named_property("code", code)?;
-        if let Some(detail) = detail {
-            js_error.set_named_property("detail", detail.as_str())?;
+        js_error.set_named_property("code", error.code())?;
+        if let Some(detail) = error.detail() {
+            js_error.set_named_property("detail", detail)?;
         }
-        if let Some(capability) = capability {
-            js_error.set_named_property("capability", capability)?;
+        if let Some(capability) = error.capability() {
+            js_error.set_named_property("capability", capability.as_str())?;
         }
         Ok(Error::from(js_error.to_unknown()))
     };

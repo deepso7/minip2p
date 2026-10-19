@@ -10,8 +10,7 @@ use std::time::{Duration, Instant};
 use minip2p::{
     BeaconConfig, BindError, ConnectionId, DiscoveryConfigError, Endpoint, EndpointBuilder,
     EndpointOptionsError, GossipsubConfig, MdnsConfig, MdnsConfigError, Multiaddr, NatConfig,
-    PeerDiscoveryConfig, PeerId, QuicBindError, StreamId,
-    TransportError, WaitHandle,
+    PeerDiscoveryConfig, PeerId, QuicBindError, StreamId, TransportError, WaitHandle,
 };
 
 use crate::{
@@ -2388,11 +2387,15 @@ mod tests {
         ));
 
         assert!(matches!(
-            map_gossipsub_error(GossipsubError::Publish(PublishError::TooLarge)),
+            map_gossipsub_error(minip2p::GossipsubError::Publish(
+                minip2p::PublishError::TooLarge
+            )),
             FfiError::MessageTooLarge
         ));
         assert!(matches!(
-            map_gossipsub_error(GossipsubError::Publish(PublishError::Backpressure)),
+            map_gossipsub_error(minip2p::GossipsubError::Publish(
+                minip2p::PublishError::Backpressure
+            )),
             FfiError::Backpressure
         ));
         assert!(matches!(
