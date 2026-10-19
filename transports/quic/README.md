@@ -144,7 +144,7 @@ The off-by-default `diagnostics` feature compiles in counters for comparing fast
 
 `QuicNodeConfig::with_webtransport(bind_addr)` makes the socket bound at `bind_addr` (one of the addresses given to `bind`, as given) serve `h3` beside `libp2p`; an address that is not bound fails `bind` with `InvalidAddress`. Nothing serves `h3` by default. Each connection to that socket picks its protocol by ALPN, the server's order winning, so a client offering both gets `libp2p`:
 
-- The certificate is chosen by ALPN: a client offering `libp2p` gets the libp2p certificate, any other client the current WebTransport certificate (`minip2p_tls::webtransport`, for the period of the system clock at bind; ECDSA P-256 and extension-free, so it is loaded without webpki's consistency check).
+- The certificate is chosen by ALPN: a client offering `libp2p` gets the libp2p certificate, any other client the current WebTransport certificate (`minip2p_tls::webtransport`, for the period of the system clock at bind; an X.509v3 ECDSA P-256 leaf without the libp2p extension, loaded through rustls's checked `CertifiedKey::from_der`).
 - Client certificates are optional on that socket, because browsers send none. A presented certificate is still fully verified inside the handshake. The libp2p requirement moves to the end of the handshake: a `libp2p` connection without a verified peer certificate is closed before any `Connected`.
 - An `h3` connection is closed after its handshake for now, with no `Connected`; the WebTransport session handshake will be served there.
 - Every connection to the socket carries the [two extra transport parameters](#transport-parameters); a libp2p peer that opens a unidirectional stream there gets STOP_SENDING and nothing is surfaced.
