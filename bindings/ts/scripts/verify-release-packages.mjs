@@ -27,6 +27,7 @@ const [
   nativeSourceRoot,
   nodeTarball,
   nodePlatformRoot,
+  webTarball,
 ] = process.argv.slice(2);
 
 if (
@@ -35,14 +36,17 @@ if (
   reactNativeTarball === undefined ||
   nativeSourceRoot === undefined ||
   nodeTarball === undefined ||
-  nodePlatformRoot === undefined
+  nodePlatformRoot === undefined ||
+  webTarball === undefined
 ) {
   throw new Error(
-    "usage: verify-release-packages.mjs <version> <core.tgz> <react-native.tgz> <native-source-root> <node.tgz> <node-platform-root>"
+    "usage: verify-release-packages.mjs <version> <core.tgz> <react-native.tgz> <native-source-root> <node.tgz> <node-platform-root> <web.tgz>"
   );
 }
 
 const maximumUnpackedBytes = 125 * 1024 * 1024;
+// What every page that uses @minip2p/web downloads. Raise it deliberately.
+const maximumWasmBytes = 3 * 1024 * 1024;
 const temporaryRoot = mkdtempSync(
   path.join(tmpdir(), "minip2p-release-packages-")
 );
@@ -210,6 +214,28 @@ function verifyNativeArtifacts(packedRoot, sourceRoot) {
   }
 }
 
+function verifyWebPackage(web) {
+  const exports = web.manifest.exports ?? {};
+  for (const entry of [".", "./manual"]) {
+    if (exports[entry]?.default === undefined) {
+      throw new Error(`@minip2p/web must export ${entry}`);
+    }
+  }
+  const wasmBytes = lstatSync(
+    path.join(web.root, "wasm/minip2p_web_bg.wasm")
+  ).size;
+  if (wasmBytes > maximumWasmBytes) {
+    throw new Error(
+      `@minip2p/web's wasm is ${wasmBytes} bytes, exceeding the ${maximumWasmBytes}-byte limit`
+    );
+  }
+  requireNamedExports(web.root, "dist/index.js", [
+    "Minip2p",
+    "generateSecretKey",
+  ]);
+  requireNamedExports(web.root, "dist/manual.js", ["Minip2p", "initMinip2p"]);
+}
+
 function directorySize(root) {
   return listFiles(root).reduce(
     (size, file) => size + lstatSync(path.join(root, file)).size,
@@ -221,10 +247,12 @@ try {
   const core = extractPackage(coreTarball, "core");
   const reactNative = extractPackage(reactNativeTarball, "react-native");
   const node = extractPackage(nodeTarball, "node");
+  const web = extractPackage(webTarball, "web");
 
   verifyManifest(core, "@minip2p/core");
   verifyManifest(reactNative, "@minip2p/react-native");
   verifyManifest(node, "@minip2p/node");
+  verifyManifest(web, "@minip2p/web");
 
   if (
     reactNative.manifest.dependencies?.["@minip2p/core"] !== expectedVersion
@@ -233,10 +261,13 @@ try {
       `@minip2p/react-native must depend on @minip2p/core ${expectedVersion}, found ${reactNative.manifest.dependencies?.["@minip2p/core"] ?? "no dependency"}`
     );
   }
-  if (node.manifest.dependencies?.["@minip2p/core"] !== expectedVersion) {
-    throw new Error(
-      `@minip2p/node must depend on @minip2p/core ${expectedVersion}, found ${node.manifest.dependencies?.["@minip2p/core"] ?? "no dependency"}`
-    );
+  for (const binding of [node, web]) {
+    const dependency = binding.manifest.dependencies?.["@minip2p/core"];
+    if (dependency !== expectedVersion) {
+      throw new Error(
+        `${binding.manifest.name} must depend on @minip2p/core ${expectedVersion}, found ${dependency ?? "no dependency"}`
+      );
+    }
   }
 
   requireFiles(core.root, [
@@ -246,6 +277,8 @@ try {
     "dist/backend.js",
     "dist/index.d.ts",
     "dist/index.js",
+    "dist/serde-backend.d.ts",
+    "dist/serde-backend.js",
     "src/index.ts",
   ]);
   requireFiles(reactNative.root, [
@@ -272,10 +305,23 @@ try {
     "dist/native.d.ts",
     "dist/native.js",
   ]);
+  requireFiles(web.root, [
+    "LICENSE",
+    "README.md",
+    "dist/index.d.ts",
+    "dist/index.js",
+    "dist/manual.d.ts",
+    "dist/manual.js",
+    "wasm/minip2p_web.d.ts",
+    "wasm/minip2p_web.js",
+    "wasm/minip2p_web_bg.wasm",
+  ]);
 
   rejectPaths(core.root, core.files);
   rejectPaths(reactNative.root, reactNative.files);
   rejectPaths(node.root, node.files);
+  rejectPaths(web.root, web.files);
+  verifyWebPackage(web);
   verifyNodePackages(node, path.resolve(nodePlatformRoot));
   requireNamedExports(reactNative.root, "lib/module/index.js", ["Minip2p"]);
   requireNamedExports(reactNative.root, "lib/typescript/src/index.d.ts", [
@@ -297,7 +343,8 @@ try {
   const combinedSize =
     directorySize(core.root) +
     directorySize(reactNative.root) +
-    directorySize(node.root);
+    directorySize(node.root) +
+    directorySize(web.root);
   if (combinedSize > maximumUnpackedBytes) {
     throw new Error(
       `release packages unpack to ${combinedSize} bytes, exceeding the ${maximumUnpackedBytes}-byte limit`
@@ -305,7 +352,7 @@ try {
   }
 
   console.log(
-    `verified @minip2p/core, @minip2p/react-native, and @minip2p/node ${expectedVersion} (${combinedSize} unpacked bytes)`
+    `verified @minip2p/core, @minip2p/react-native, @minip2p/node, and @minip2p/web ${expectedVersion} (${combinedSize} unpacked bytes)`
   );
 } finally {
   rmSync(temporaryRoot, { force: true, recursive: true });

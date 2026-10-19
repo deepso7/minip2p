@@ -139,6 +139,7 @@ else
     bindings/ts/core/package.json \
     bindings/ts/react-native/package.json \
     bindings/ts/node/package.json \
+    bindings/ts/web/package.json \
     bindings/ts/node-platforms/*/package.json
 
   echo "release: regenerating lockfiles"
@@ -185,6 +186,8 @@ $mismatched_dependencies"
     die "@minip2p/react-native version does not match"
   [[ "$(jq -r .version bindings/ts/node/package.json)" == "$version" ]] ||
     die "@minip2p/node version does not match"
+  [[ "$(jq -r .version bindings/ts/web/package.json)" == "$version" ]] ||
+    die "@minip2p/web version does not match"
   for manifest in bindings/ts/node-platforms/*/package.json; do
     [[ "$(jq -r .version "$manifest")" == "$version" ]] ||
       die "$(jq -r .name "$manifest") version does not match"
@@ -376,6 +379,7 @@ done
 verify_npm_package '%40minip2p%2Fcore' '@minip2p/core'
 verify_npm_package '%40minip2p%2Freact-native' '@minip2p/react-native'
 verify_npm_package '%40minip2p%2Fnode' '@minip2p/node'
+verify_npm_package '%40minip2p%2Fweb' '@minip2p/web'
 for manifest in bindings/ts/node-platforms/*/package.json; do
   package_name="$(jq -r .name "$manifest")"
   encoded_name="${package_name/@/%40}"
@@ -395,4 +399,4 @@ echo "release: commit $head_sha"
 echo "release: GitHub $release_url"
 echo "release: relay server ${#expected_relay_assets[@]}/${#expected_relay_assets[@]} assets"
 echo "release: crates.io ${#publishable_crates[@]}/${#publishable_crates[@]} packages"
-echo "release: npm @minip2p/core, @minip2p/react-native, @minip2p/node, and 7 platform packages at $version"
+echo "release: npm @minip2p/core, @minip2p/react-native, @minip2p/node, @minip2p/web, and 7 platform packages at $version"

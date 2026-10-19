@@ -17,6 +17,7 @@ const modules = path.resolve(consumerRoot, "node_modules");
 const coreRoot = path.join(modules, "@minip2p/core");
 const reactNativeRoot = path.join(modules, "@minip2p/react-native");
 const nodeRoot = path.join(modules, "@minip2p/node");
+const webRoot = path.join(modules, "@minip2p/web");
 function readManifest(root) {
   return JSON.parse(readFileSync(path.join(root, "package.json"), "utf-8"));
 }
@@ -24,6 +25,7 @@ function readManifest(root) {
 const coreManifest = readManifest(coreRoot);
 const reactNativeManifest = readManifest(reactNativeRoot);
 const nodeManifest = readManifest(nodeRoot);
+const webManifest = readManifest(webRoot);
 
 if (
   reactNativeManifest.dependencies?.["@minip2p/core"] !== coreManifest.version
@@ -33,8 +35,8 @@ if (
   );
 }
 
-function packageExport(manifest, condition) {
-  const target = manifest.exports?.["."]?.[condition];
+function packageExport(manifest, condition, entry = ".") {
+  const target = manifest.exports?.[entry]?.[condition];
   if (typeof target !== "string" || !target.startsWith("./")) {
     throw new Error(
       `${manifest.name} has no valid ${condition} package export`
@@ -88,6 +90,29 @@ requireNamedExport(
   "Minip2p"
 );
 
+// The browser SDK runs in Node too: its manual entry, given the packaged
+// `.wasm`, builds a real endpoint.
+if (webManifest.dependencies?.["@minip2p/core"] !== coreManifest.version) {
+  throw new Error(
+    `installed @minip2p/web requires core ${webManifest.dependencies?.["@minip2p/core"] ?? "missing"}, but ${coreManifest.version} is installed`
+  );
+}
+const web = await import(
+  pathToFileURL(
+    path.join(webRoot, packageExport(webManifest, "default", "./manual"))
+  ).href
+);
+await web.initMinip2p({
+  wasm: readFileSync(path.join(webRoot, "wasm/minip2p_web_bg.wasm")),
+});
+const browserEndpoint = web.Minip2p.create({
+  secretKey: web.generateSecretKey(),
+});
+if (!browserEndpoint.peerId().startsWith("12D3KooW")) {
+  throw new Error("installed @minip2p/web built an endpoint without a peer ID");
+}
+await browserEndpoint.close();
+
 console.log(
-  `smoke-tested installed @minip2p/core, @minip2p/react-native, and @minip2p/node ${coreManifest.version}`
+  `smoke-tested installed @minip2p/core, @minip2p/react-native, @minip2p/node, and @minip2p/web ${coreManifest.version}`
 );
