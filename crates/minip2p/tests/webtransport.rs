@@ -17,6 +17,7 @@ use minip2p_webtransport::WebTransportClient;
 mod endpoint_support;
 use endpoint_support::NextEvent;
 
+#[expect(dead_code, reason = "shared with the QUIC tests, which use more of it")]
 #[path = "../../../transports/quic/tests/common/wt_client.rs"]
 mod wt_client;
 

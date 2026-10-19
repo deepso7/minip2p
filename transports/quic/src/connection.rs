@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::mem;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use minip2p_core::Protocol;
@@ -15,6 +15,7 @@ use minip2p_transport::{
     ConnectionCloseReason, ConnectionEndpoint, ConnectionId, ConnectionState, ConnectionToken,
     StreamId, TransportError, TransportEvent,
 };
+use minip2p_webtransport::h3::{code, h3_code_to_webtransport, webtransport_code_to_h3};
 use quinn_proto::crypto::rustls::HandshakeData;
 use quinn_proto::{
     ConnectionError, ConnectionHandle, Dir, Event, FinishError, ReadError, StreamEvent, VarInt,
@@ -35,6 +36,11 @@ const MAX_SERVICE_PASSES: usize = 4;
 /// Most queued bytes one stream hands the engine per turn of the send
 /// scheduler, so backlogged streams share the peer's connection credit.
 const SEND_QUANTUM: usize = 64 * 1024;
+
+/// Bounds on how long a WebTransport session's Closing phase waits for the
+/// peer to end its CONNECT stream: `max(3 × RTT, 500 ms)`, capped at 2 s.
+const WT_CLOSE_MIN: Duration = Duration::from_millis(500);
+const WT_CLOSE_MAX: Duration = Duration::from_secs(2);
 
 /// The send caps of ADR 0012, from [`crate::QuicLimits`]: how much each stream
 /// and the whole connection may queue beyond what the engine accepted, and
@@ -278,6 +284,10 @@ pub(crate) struct QuicConnection {
     webtransport: Option<Arc<WebTransportContext>>,
     /// The WebTransport session, once the handshake negotiated `h3`.
     wt: Option<WtSession>,
+    /// In a WebTransport session's Closing phase: when QUIC closes with
+    /// `H3_NO_ERROR` at the latest, if the peer has not ended its CONNECT
+    /// stream before.
+    wt_close_at: Option<Instant>,
 }
 
 /// The engine's id for a raw stream id the adapter tracks.
@@ -324,6 +334,7 @@ impl QuicConnection {
             counters,
             webtransport,
             wt: None,
+            wt_close_at: None,
         }
     }
 
@@ -457,6 +468,7 @@ impl QuicConnection {
                 wt.open_control(&mut self.conn);
                 wt.flush(&mut self.conn);
                 self.after_wt(now, cx.events);
+                self.finish_wt_closing(now);
             }
             self.bind_pending_opens(now);
             self.drain_send_queues(now, cx.events);
@@ -475,7 +487,10 @@ impl QuicConnection {
             }
         }
         let failure = self.transmit(now, cx);
-        self.timeout = self.conn.poll_timeout();
+        self.timeout = match (self.conn.poll_timeout(), self.wt_close_at) {
+            (Some(engine), Some(close)) => Some(engine.min(close)),
+            (engine, close) => engine.or(close),
+        };
         self.gc_closed_streams();
         failure
     }
@@ -664,6 +679,24 @@ impl QuicConnection {
                         self.close_with(now, code, reason);
                     }
                 }
+                WtEvent::PeerClosed { code } => {
+                    if let Some(wt) = self.wt.as_mut() {
+                        wt.finish_connect(&mut self.conn);
+                    }
+                    if !self.is_closing() {
+                        self.enter_wt_closing(
+                            now,
+                            ConnectionCloseReason::Remote {
+                                code: u64::from(code),
+                            },
+                        );
+                    }
+                }
+                WtEvent::Refused { reason } => {
+                    if !self.is_closing() {
+                        self.enter_wt_closing(now, ConnectionCloseReason::Error(reason));
+                    }
+                }
             }
         }
     }
@@ -673,6 +706,12 @@ impl QuicConnection {
     fn on_lost(&mut self, reason: &ConnectionError) {
         let reason = match reason {
             ConnectionError::LocallyClosed => ConnectionCloseReason::Local,
+            // HTTP/3's orderly close is minip2p's 0.
+            ConnectionError::ApplicationClosed(close)
+                if self.wt.is_some() && close.error_code.into_inner() == code::H3_NO_ERROR =>
+            {
+                ConnectionCloseReason::Remote { code: 0 }
+            }
             ConnectionError::ApplicationClosed(close) => ConnectionCloseReason::Remote {
                 code: close.error_code.into_inner(),
             },
@@ -684,6 +723,7 @@ impl QuicConnection {
         };
         self.close_reason.get_or_insert(reason);
         self.end_writes();
+        self.wt_close_at = None;
         self.state = ConnectionState::Closed;
     }
 
@@ -725,7 +765,7 @@ impl QuicConnection {
     /// stream has no local send half, and quinn-proto asserts on resetting
     /// one, which would let a peer panic the transport.
     fn refuse_stream(&mut self, stream: quinn_proto::StreamId) {
-        let code = VarInt::from_u32(0);
+        let code = self.stream_code();
         match self.conn.recv_stream(stream).stop(code) {
             Ok(()) | Err(_) => {}
         }
@@ -859,7 +899,8 @@ impl QuicConnection {
             ScanEnd::Reset => {
                 // Reading the reset frees only the receive half; the peer's
                 // stream credit needs the send half freed too.
-                match self.conn.send_stream(stream).reset(VarInt::from_u32(0)) {
+                let code = self.stream_code();
+                match self.conn.send_stream(stream).reset(code) {
                     Ok(()) | Err(_) => {}
                 }
                 self.note_stream_reset(raw, events);
@@ -870,16 +911,35 @@ impl QuicConnection {
     /// The peer sent STOP_SENDING. The engine only records it, so reset the
     /// send half here, which discards buffered sends and sends RESET_STREAM;
     /// then report the stop.
+    ///
+    /// On a WebTransport connection a code in the WebTransport range is
+    /// reported as the WebTransport code it carries; any other passes
+    /// through unchanged.
     fn on_stopped(&mut self, raw: u64, error_code: VarInt, events: &mut Vec<TransportEvent>) {
         match self.conn.send_stream(engine_stream(raw)).reset(error_code) {
             Ok(()) | Err(_) => {}
         }
-        self.note_write_stopped(raw, error_code.into_inner(), events);
+        let mut code = error_code.into_inner();
+        if self.wt.is_some() {
+            code = h3_code_to_webtransport(code).map_or(code, u64::from);
+        }
+        self.note_write_stopped(raw, code, events);
+    }
+
+    /// The wire code for minip2p's stream reset and stop code 0: plain 0 on
+    /// libp2p QUIC, WebTransport application error 0 on WebTransport.
+    fn stream_code(&self) -> VarInt {
+        if self.wt.is_some() {
+            VarInt::from_u64(webtransport_code_to_h3(0)).unwrap_or(VarInt::from_u32(0))
+        } else {
+            VarInt::from_u32(0)
+        }
     }
 
     /// Opens pending streams in the engine, in order, as peer credit allows.
     fn bind_pending_opens(&mut self, now: Instant) {
-        while !self.pending_opens.is_empty() {
+        // A closing connection opens nothing more.
+        while !self.pending_opens.is_empty() && !self.is_closing() {
             let Some(stream) = self.conn.streams().open(Dir::Bi) else {
                 return;
             };
@@ -896,12 +956,7 @@ impl QuicConnection {
                 return;
             }
             if open.reset_on_bind {
-                match self.conn.send_stream(stream).reset(VarInt::from_u32(0)) {
-                    Ok(()) | Err(_) => {}
-                }
-                match self.conn.recv_stream(stream).stop(VarInt::from_u32(0)) {
-                    Ok(()) | Err(_) => {}
-                }
+                self.reset_on_wire(raw);
             } else {
                 self.bound_local_bidi_streams += 1;
             }
@@ -1160,13 +1215,7 @@ impl QuicConnection {
         }
 
         // A closed half is already done.
-        let stream = engine_stream(raw);
-        match self.conn.send_stream(stream).reset(VarInt::from_u32(0)) {
-            Ok(()) | Err(_) => {}
-        }
-        match self.conn.recv_stream(stream).stop(VarInt::from_u32(0)) {
-            Ok(()) | Err(_) => {}
-        }
+        self.reset_on_wire(raw);
 
         let state = self.stream_state_mut(stream_id)?;
         state.local_write_closed = true;
@@ -1183,17 +1232,84 @@ impl QuicConnection {
     }
 
     /// Starts an orderly close; `Closed` follows once the engine drains.
+    ///
+    /// An accepted WebTransport session first enters its Closing phase: it
+    /// sends the close capsule and FIN on the CONNECT stream, and QUIC
+    /// closes once the peer ends that stream or the phase's deadline passes.
     pub(crate) fn close(&mut self, now: Instant) {
         if self.is_closing() {
             return;
         }
-        self.conn
-            .close(now, VarInt::from_u32(0), Bytes::from_static(b"bye"));
+        let code = match self.wt.as_mut().map(|wt| wt.close(&mut self.conn, 0)) {
+            Some(true) => {
+                self.enter_wt_closing(now, ConnectionCloseReason::Local);
+                return;
+            }
+            Some(false) => code::H3_NO_ERROR,
+            None => 0,
+        };
+        self.conn.close(
+            now,
+            VarInt::from_u64(code).unwrap_or(VarInt::from_u32(0)),
+            Bytes::from_static(b"bye"),
+        );
         self.close_reason
             .get_or_insert(ConnectionCloseReason::Local);
         self.state = ConnectionState::Closing;
         self.surfaces_streams = false;
         self.end_writes();
+    }
+
+    /// Starts a WebTransport session's Closing phase: no more stream events,
+    /// every open stream reset, and a deadline for the peer to end its
+    /// CONNECT stream. [`Self::finish_wt_closing`] closes QUIC.
+    fn enter_wt_closing(&mut self, now: Instant, reason: ConnectionCloseReason) {
+        self.close_reason.get_or_insert(reason);
+        self.state = ConnectionState::Closing;
+        self.surfaces_streams = false;
+        self.end_writes();
+        let first_unbound = self.first_unbound();
+        let bound: Vec<u64> = self
+            .stream_states
+            .keys()
+            .copied()
+            .filter(|&raw| !(self.is_local(raw) && raw >= first_unbound))
+            .collect();
+        for raw in bound {
+            self.reset_on_wire(raw);
+        }
+        let wait = (self.conn.rtt() * 3).clamp(WT_CLOSE_MIN, WT_CLOSE_MAX);
+        self.wt_close_at = Some(now + wait);
+        self.finish_wt_closing(now);
+    }
+
+    /// Ends the Closing phase once the peer ended its CONNECT stream or the
+    /// deadline passed: QUIC closes with `H3_NO_ERROR`.
+    fn finish_wt_closing(&mut self, now: Instant) {
+        let Some(at) = self.wt_close_at else {
+            return;
+        };
+        if now < at && !self.wt.as_ref().is_some_and(WtSession::peer_ended) {
+            return;
+        }
+        self.wt_close_at = None;
+        self.conn.close(
+            now,
+            VarInt::from_u64(code::H3_NO_ERROR).unwrap_or(VarInt::from_u32(0)),
+            Bytes::new(),
+        );
+    }
+
+    /// Resets a stream's send half and stops its receive half with
+    /// minip2p's code 0; a half already closed is left alone.
+    fn reset_on_wire(&mut self, raw: u64) {
+        let (stream, code) = (engine_stream(raw), self.stream_code());
+        match self.conn.send_stream(stream).reset(code) {
+            Ok(()) | Err(_) => {}
+        }
+        match self.conn.recv_stream(stream).stop(code) {
+            Ok(()) | Err(_) => {}
+        }
     }
 
     /// Every write side ends with the connection: queued writes go and no
