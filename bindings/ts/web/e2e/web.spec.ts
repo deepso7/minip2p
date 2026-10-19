@@ -207,7 +207,9 @@ test("closes are orderly both ways", async ({ browserName, page }) => {
         window.sessionEnds.length = 0;
         window.closeReasons = [];
         node.on("connectionClosed", ({ reason }) => {
-          window.closeReasons?.push(reason.kind);
+          window.closeReasons?.push(
+            reason.kind === "error" ? `error: ${reason.message}` : reason.kind
+          );
         });
         await node.connect(address, timeout);
         return node.peerId();
@@ -215,15 +217,25 @@ test("closes are orderly both ways", async ({ browserName, page }) => {
       { address: native.address, timeout: TIMEOUT }
     );
     native.node.disconnect(browserPeer);
+    // Chromium sometimes rejects `closed` with "Connection lost" anyway, so
+    // the SDK reports an error: when the CONNECT stream completes before
+    // Chrome reports the session closed, its network service sends
+    // `OnClosed` without the required `final_stats` and the renderer drops
+    // the message (seen in Chrome 156 and current Chromium). The server's
+    // side of that orderly close is covered by
+    // `a_server_close_keeps_quic_open_for_the_closing_phase`.
+    const chromeLostReason = (reason: string) =>
+      browserName === "chromium" &&
+      reason.startsWith("error: ") &&
+      reason.endsWith("Connection lost.");
     await expect
-      .poll(() => page.evaluate(() => window.closeReasons))
+      .poll(async () => {
+        const reasons = (await page.evaluate(() => window.closeReasons)) ?? [];
+        return reasons.map((reason) =>
+          chromeLostReason(reason) ? "remote" : reason
+        );
+      })
       .toEqual(["remote"]);
-    // Chromium sometimes rejects `closed` with "Connection lost" anyway:
-    // when the CONNECT stream completes before Chrome reports the session
-    // closed, its network service sends `OnClosed` without the required
-    // `final_stats` and the renderer drops the message (seen in Chrome 156
-    // and current Chromium). The server's side of that orderly close is
-    // covered by `a_server_close_keeps_quic_open_for_the_closing_phase`.
     const orderly = { closeCode: 0, fulfilled: true };
     const chromeDroppedClose = (end: Window["sessionEnds"][number]) =>
       browserName === "chromium" &&
