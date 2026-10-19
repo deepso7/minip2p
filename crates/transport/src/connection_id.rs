@@ -35,6 +35,8 @@ impl ConnectionNamespace {
     pub const TCP_IPV4: Self = Self(3);
     /// TCP over IPv6.
     pub const TCP_IPV6: Self = Self(4);
+    /// WebTransport client sessions (a browser's dials).
+    pub const WEBTRANSPORT: Self = Self(5);
     /// Relay circuits.
     ///
     /// Deliberately `0x80`, so every circuit id has the top bit of its `u64`
@@ -65,6 +67,7 @@ impl ConnectionNamespace {
             2 => Some("quic/ip6"),
             3 => Some("tcp/ip4"),
             4 => Some("tcp/ip6"),
+            5 => Some("webtransport"),
             0x80 => Some("circuit"),
             _ => None,
         }

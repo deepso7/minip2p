@@ -1287,9 +1287,11 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-ping",
+ "minip2p-secure-mux",
  "minip2p-swarm",
  "minip2p-tls",
  "minip2p-transport",
+ "minip2p-webtransport",
  "mio",
  "quinn-proto",
  "quinn-udp",
@@ -1335,6 +1337,7 @@ dependencies = [
 name = "minip2p-rs"
 version = "0.10.0"
 dependencies = [
+ "bytes",
  "cpu-time",
  "criterion",
  "minip2p-autonat",
@@ -1352,7 +1355,11 @@ dependencies = [
  "minip2p-swarm",
  "minip2p-tcp",
  "minip2p-test-support",
+ "minip2p-tls",
  "minip2p-transport",
+ "minip2p-webtransport",
+ "quinn-proto",
+ "rustls",
  "socket2",
  "stats_alloc",
  "thiserror",
@@ -1455,6 +1462,10 @@ dependencies = [
 name = "minip2p-webtransport"
 version = "0.10.0"
 dependencies = [
+ "minip2p-core",
+ "minip2p-identity",
+ "minip2p-secure-mux",
+ "minip2p-transport",
  "thiserror",
 ]
 

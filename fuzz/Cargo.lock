@@ -601,6 +601,10 @@ dependencies = [
 name = "minip2p-webtransport"
 version = "0.10.0"
 dependencies = [
+ "minip2p-core",
+ "minip2p-identity",
+ "minip2p-secure-mux",
+ "minip2p-transport",
  "thiserror",
 ]
 

@@ -15,7 +15,19 @@ workspace = true
 
 [features]
 default = ["std"]
-std = ["thiserror/std"]
+std = [
+  "minip2p-core/std",
+  "minip2p-identity/std",
+  "minip2p-secure-mux/std",
+  "minip2p-transport/std",
+  "thiserror/std",
+]
 
 [dependencies]
+minip2p-core = { path = "../../crates/core", version = "0.10.0", default-features = false }
+minip2p-identity = { path = "../../crates/identity", version = "0.10.0", default-features = false, features = [
+  "ed25519",
+] }
+minip2p-secure-mux = { path = "../../crates/secure-mux", version = "0.10.0", default-features = false }
+minip2p-transport = { path = "../../crates/transport", version = "0.10.0", default-features = false }
 thiserror = { workspace = true }
