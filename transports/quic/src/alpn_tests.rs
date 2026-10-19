@@ -80,11 +80,20 @@ fn a_quic_v1_only_socket_offers_only_libp2p() {
     assert_eq!(crypto_alert(&lost_reason(&h3)), Some(120), "{events:?}");
 }
 
+/// `quic-v1` and WebTransport bound on one loopback socket.
+fn dual_loopback(config: QuicNodeConfig) -> QuicTransport {
+    let addrs = [
+        "/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr"),
+        "/ip4/127.0.0.1/udp/0/quic-v1/webtransport"
+            .parse()
+            .expect("multiaddr"),
+    ];
+    QuicTransport::bind(config, &addrs).expect("bind")
+}
+
 /// A listening transport on loopback that also serves WebTransport.
 fn dual_server() -> QuicTransport {
-    let config =
-        QuicNodeConfig::generate().with_webtransport("127.0.0.1:0".parse().expect("socket addr"));
-    let mut server = loopback(config);
+    let mut server = dual_loopback(QuicNodeConfig::generate());
     server.listen_on_bound_addrs().expect("listen");
     server
 }
@@ -204,11 +213,9 @@ fn a_client_offering_both_alpns_without_a_certificate_is_negotiated_as_libp2p_an
 }
 
 #[test]
-fn an_h3_client_gets_the_webtransport_certificate_and_no_connection_yet() {
+fn an_h3_client_gets_the_webtransport_certificate_and_no_connection_before_noise() {
     let keypair = Ed25519Keypair::generate();
-    let config = QuicNodeConfig::new(keypair.clone())
-        .with_webtransport("127.0.0.1:0".parse().expect("socket addr"));
-    let mut server = loopback(config);
+    let mut server = dual_loopback(QuicNodeConfig::new(keypair.clone()));
     server.listen_on_bound_addrs().expect("listen");
     let seen = Arc::new(AnyServer::default());
     let mut peer = RawPeer::connect_with(
@@ -222,8 +229,27 @@ fn an_h3_client_gets_the_webtransport_certificate_and_no_connection_yet() {
         minip2p_tls::webtransport::webtransport_certificate(&keypair, period).expect("cert");
     assert_eq!(seen.seen(), Some(expected));
 
+    // A client that never authenticates is never reported.
+    peer.conn().close(
+        Instant::now(),
+        quinn_proto::VarInt::from_u32(0),
+        Bytes::new(),
+    );
     drive_until_server_closed(&mut server, &mut peer, &mut events);
     assert_only_arrival_and_close(&events);
+}
+
+#[test]
+fn an_h3_only_socket_offers_only_h3() {
+    let addr = "/ip4/127.0.0.1/udp/0/quic-v1/webtransport"
+        .parse()
+        .expect("multiaddr");
+    let mut server = QuicTransport::bind(QuicNodeConfig::generate(), &[addr]).expect("bind");
+    server.listen_on_bound_addrs().expect("listen");
+    let mut libp2p = RawPeer::connect(server.local_addr(), |_| {});
+    let events = drive_until_peer_closed(&mut server, &mut libp2p);
+    // TLS's no_application_protocol alert.
+    assert_eq!(crypto_alert(&lost_reason(&libp2p)), Some(120), "{events:?}");
 }
 
 #[test]
@@ -323,17 +349,6 @@ fn close_racing_incoming_streams(mut server: QuicTransport, uni: bool) {
             reason: ConnectionCloseReason::Local
         }]
     );
-}
-
-#[test]
-fn webtransport_on_an_address_that_is_not_bound_is_refused() {
-    let config =
-        QuicNodeConfig::generate().with_webtransport("127.0.0.1:4001".parse().expect("addr"));
-    let bind = "/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr");
-    assert!(matches!(
-        QuicTransport::bind(config, &[bind]),
-        Err(QuicBindError::InvalidAddress { .. })
-    ));
 }
 
 #[test]

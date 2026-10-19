@@ -1,6 +1,6 @@
 # minip2p-webtransport
 
-`minip2p-webtransport` is the sans-I/O HTTP/3 and QPACK codec behind libp2p WebTransport. The QUIC listener (`minip2p-quic`) and the native test client both use it to speak to browsers; browsers bring their own HTTP/3 stack.
+`minip2p-webtransport` is the sans-I/O HTTP/3 and QPACK codec behind libp2p WebTransport, and the client side of libp2p WebTransport. The QUIC listener (`minip2p-quic`) and the native test client use the codec to speak to browsers; browsers bring their own HTTP/3 stack, and run `WebTransportClient` over it.
 
 It owns no streams, sockets or clocks. A caller feeds the bytes of one QUIC stream, in order, into a decoder and gets back frames, a stream header, capsules, or `None` for "need more". Every decoder is bounded by explicit caps, so an unauthenticated peer cannot make it allocate more than a few KiB. `no_std + alloc`; disable default features for embedded targets.
 
@@ -48,6 +48,19 @@ assert_eq!(section.get(b":status"), Some(&b"200"[..]));
 # Ok::<(), minip2p_webtransport::Error>(())
 ```
 
+## `WebTransportIo` and `WebTransportClient`
+
+`WebTransportIo` is the seam to a platform's WebTransport API: in a browser, TypeScript around the `WebTransport` object. It is caller-driven like the rest of minip2p. Calls return at once (`connect` with the URL and certhashes, `open_stream`, `write`, `close_write`, `reset`, `stop`, `grant_read`, `close`), and what the platform learns later comes back as `IoEvent`s from `poll_event`: `SessionReady`, `SessionClosed`, `StreamOpened`, `IncomingStream`, `Data`, `Fin`, `Reset`, `StopSending` and `WriteCompleted`. `write` copies what it accepts, and a short write is backpressure that a later `WriteCompleted` releases. `Data` never exceeds what `grant_read` allowed.
+
+`WebTransportClient<Io, E>` is the libp2p WebTransport dialer over it, as a `minip2p_transport::Transport` (connection ids in `ConnectionNamespace::WEBTRANSPORT`). `dial` takes `/ip4|ip6|dns*/…/udp/<port>/quic-v1/webtransport/certhash/…/p2p/…`:
+
+1. connect to `https://<host>:<port>/.well-known/libp2p-webtransport?type=noise` (`webtransport_url`; IPv6 hosts are bracketed and names pass through), trusting exactly the address's certhashes;
+2. on `SessionReady`, open the first stream and run Noise XX as initiator, requiring the `/p2p` peer;
+3. require every dialed certhash in the server's Noise extensions, or close with an `Error` reason;
+4. finish the Noise stream and emit `Connected`, with the Noise handshake hash as the connection token.
+
+Every later stream maps 1:1 onto a WebTransport stream. `listen` and dials without a `/certhash` are `Unsupported`. This first cut queues writes without a bound and grants each stream a fixed 256 KiB read window; the client's limits (`Full`, connection caps, unsettled connections, the handshake deadline) come later.
+
 ## Tests
 
-Unit tests use the RFC 9000, RFC 7541 and RFC 9204 vectors. `tests/fixtures.rs` decodes byte captures from Chrome, Firefox and webtransport-go (provenance in `tests/fixtures/README.md`), so the listener and the test client cannot share one mistake. Every decoder has a `wire_inputs` fuzz entry.
+Unit tests use the RFC 9000, RFC 7541 and RFC 9204 vectors. `tests/fixtures.rs` decodes byte captures from Chrome, Firefox and webtransport-go (provenance in `tests/fixtures/README.md`), so the listener and the test client cannot share one mistake. Every decoder has a `wire_inputs` fuzz entry. `WebTransportClient` is tested end to end in `minip2p-quic`'s `tests/webtransport.rs`, over a test-only quinn-proto `WebTransportIo` against the real listener.

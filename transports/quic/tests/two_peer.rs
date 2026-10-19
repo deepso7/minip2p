@@ -534,11 +534,12 @@ fn stream_id_round_trips_as_u64() {
     assert_eq!(id.as_u64(), 1234);
 }
 
-/// Native WebTransport is not dialable or listenable yet: both say so with
-/// `Unsupported`, which callers choosing between candidates read as "not
-/// here", and point at the `/quic-v1` address instead.
+/// Native WebTransport is not dialable: `Unsupported`, which callers
+/// choosing between candidates read as "not here", pointing at the
+/// `/quic-v1` address instead. Listening on WebTransport needs a socket
+/// bound for it.
 #[test]
-fn webtransport_addresses_are_unsupported_with_a_quic_v1_hint() {
+fn webtransport_dials_are_unsupported_and_listens_need_a_webtransport_socket() {
     let (mut server, mut client, server_addr) = setup_pair();
     let webtransport = |transport: &Multiaddr| {
         format!("{transport}/webtransport/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g")
@@ -561,8 +562,11 @@ fn webtransport_addresses_are_unsupported_with_a_quic_v1_hint() {
     let listen = webtransport(server_addr.transport()).without_certhashes();
     let err = server.listen(&listen).expect_err("listen must refuse");
     assert!(
-        matches!(err, TransportError::Unsupported { .. }),
+        matches!(err, TransportError::InvalidAddress { .. }),
         "listen: {err:?}"
     );
-    assert!(err.to_string().contains("/quic-v1"), "listen: {err}");
+    assert!(
+        err.to_string().contains("/quic-v1/webtransport"),
+        "listen: {err}"
+    );
 }

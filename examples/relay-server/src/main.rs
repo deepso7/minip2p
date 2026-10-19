@@ -59,6 +59,10 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     );
     for address in endpoint.listen_all()? {
         println!("[relay] listening={address}");
+        if address.transport().is_webtransport() {
+            // What a browser dials: the certhash pins this node's certificate.
+            println!("[relay] webtransport={address}");
+        }
     }
     println!("[relay] commands on stdin: pause | resume");
 
@@ -126,13 +130,23 @@ fn try_bind(
         .identity(identity)
         .relay_server_config(options.config.clone())?;
 
-    if options.quic_binds.is_empty() {
-        for address in automatic_addrs(mode, DEFAULT_IPV4_QUIC, DEFAULT_IPV6_QUIC) {
-            builder = builder.listen_on(address)?;
-        }
+    let quic: Vec<String> = if options.quic_binds.is_empty() {
+        automatic_addrs(mode, DEFAULT_IPV4_QUIC, DEFAULT_IPV6_QUIC)
+            .into_iter()
+            .map(String::from)
+            .collect()
     } else {
-        for &address in &options.quic_binds {
-            builder = builder.listen_on(listen_multiaddr(address, "udp", "/quic-v1"))?;
+        options
+            .quic_binds
+            .iter()
+            .map(|&address| listen_multiaddr(address, "udp", "/quic-v1"))
+            .collect()
+    };
+    for address in quic {
+        builder = builder.listen_on(&address)?;
+        if options.webtransport {
+            // The same socket serves both.
+            builder = builder.listen_on(format!("{address}/webtransport"))?;
         }
     }
 

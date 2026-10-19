@@ -28,7 +28,8 @@ pub enum RelayServerAddressErrorKind {
         /// Different identity found on the address.
         found: PeerId,
     },
-    /// The protocol sequence is not a supported direct TCP or QUIC address.
+    /// The protocol sequence is not a supported direct TCP, QUIC-v1, or
+    /// WebTransport (with `/certhash`) address.
     UnsupportedShape,
 }
 
@@ -40,7 +41,9 @@ impl core::fmt::Display for RelayServerAddressErrorKind {
             Self::ConflictingPeerId { expected, found } => {
                 write!(f, "peer id {found} does not match local peer {expected}")
             }
-            Self::UnsupportedShape => f.write_str("expected a direct TCP or QUIC-v1 address"),
+            Self::UnsupportedShape => f.write_str(
+                "expected a direct TCP, QUIC-v1, or WebTransport address with a /certhash",
+            ),
         }
     }
 }
@@ -128,6 +131,14 @@ fn normalize_addr(
         || matches!(
             protocols.as_slice(),
             [_, Protocol::Udp(port), Protocol::QuicV1] if *port != 0
+        )
+        // A browser dials only what its certificate hash pins.
+        || matches!(
+            protocols.as_slice(),
+            [_, Protocol::Udp(port), Protocol::QuicV1, Protocol::WebTransport, hashes @ ..]
+                if *port != 0
+                    && !hashes.is_empty()
+                    && hashes.iter().all(|hash| matches!(hash, Protocol::Certhash(_)))
         );
     if !supported {
         return Err(RelayServerAddressErrorKind::UnsupportedShape);
@@ -156,12 +167,24 @@ mod tests {
         let local = peer(b"relay-local");
         let tcp = addr("/dns4/relay.example/tcp/4001");
         let quic = addr("/ip6/2001:db8::1/udp/4002/quic-v1");
+        let webtransport = addr(
+            "/ip4/192.0.2.1/udp/4002/quic-v1/webtransport/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g",
+        );
         let mut tcp_with_peer = tcp.clone();
         tcp_with_peer.push(Protocol::P2p(local.clone()));
 
         assert_eq!(
-            normalize_addrs(&local, vec![tcp_with_peer, tcp.clone(), quic.clone()]).unwrap(),
-            vec![tcp, quic]
+            normalize_addrs(
+                &local,
+                vec![
+                    tcp_with_peer,
+                    tcp.clone(),
+                    quic.clone(),
+                    webtransport.clone()
+                ]
+            )
+            .unwrap(),
+            vec![tcp, quic, webtransport]
         );
     }
 
@@ -202,6 +225,11 @@ mod tests {
             ),
             (
                 addr("/ip4/192.0.2.1/udp/4001"),
+                RelayServerAddressErrorKind::UnsupportedShape,
+            ),
+            // No browser can dial a WebTransport address without a certhash.
+            (
+                addr("/ip4/192.0.2.1/udp/4001/quic-v1/webtransport"),
                 RelayServerAddressErrorKind::UnsupportedShape,
             ),
         ] {

@@ -58,6 +58,8 @@ cargo run -p minip2p-relay-server-example -- \
   --tcp 192.0.2.10:4201 --tcp '[2001:db8::10]:4201'
 ```
 
+Add `--webtransport` to serve browsers too: each QUIC socket also listens on `…/quic-v1/webtransport`, and the relay prints the address a browser dials, certhash included, as `[relay] webtransport=/ip4/…/udp/19876/quic-v1/webtransport/certhash/u…/p2p/…`. The certhash pins the relay's current WebTransport certificate, which is derived from its key, so it stays the same across restarts with `--key`.
+
 For a stable public identity and explicit advertised addresses:
 
 ```bash
@@ -69,4 +71,4 @@ cargo run -p minip2p-relay-server-example -- \
 
 The key file is created owner-only on Unix and never overwritten. Configuration and address errors are reported before transport binding where possible. Run with `--help` for capacity (overall, per peer, and per IPv4 address or IPv6 /64), duration, byte, pending-control, timeout, and fixed peer/IP token-bucket flags, plus `--max-rate-limit-entries` for the keys each token-bucket map tracks. A rate flag accepts `CAPACITY/REFILL_MS` or `off`. Zero circuit duration/bytes mean unlimited; zero capacities deny new work.
 
-Explicit announce addresses are trusted operator input and take precedence over AutoNAT-confirmed direct addresses and concrete listeners. Wildcards, circuit addresses, unsupported shapes, and conflicting `/p2p` identities are rejected.
+Explicit announce addresses are trusted operator input and take precedence over AutoNAT-confirmed direct addresses and concrete listeners. TCP, QUIC-v1 and WebTransport shapes are accepted; a WebTransport one must carry its `/certhash` (copy it from the `webtransport=` line). Wildcards, circuit addresses, other shapes, and conflicting `/p2p` identities are rejected.
