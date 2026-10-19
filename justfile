@@ -45,6 +45,7 @@ check-wasm:
     cargo check --target wasm32-unknown-unknown -p minip2p-ffi-core --no-default-features --features serde
     cargo check --target wasm32-unknown-unknown -p minip2p-rs --no-default-features --features pubsub
     cargo check --target wasm32-unknown-unknown -p minip2p-webtransport --no-default-features
+    cargo clippy --target wasm32-unknown-unknown -p minip2p-web -- -D warnings
 
 peer-ping:
     cargo test -p minip2p-peer --test ping
