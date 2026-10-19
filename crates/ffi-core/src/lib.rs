@@ -44,7 +44,8 @@ pub use connect::{ConnectTarget, parse_connect_target};
 #[cfg(feature = "driver")]
 pub use endpoint::{DEFAULT_STOP_TIMEOUT_MS, P2pEndpoint};
 pub use error::{
-    ConfigCapability, FfiError, map_driver_error, map_gossipsub_error, map_topic_error,
+    ConfigCapability, FfiError, driver_failure_kind, map_driver_error, map_gossipsub_error,
+    map_topic_error,
 };
 #[cfg(any(feature = "driver", feature = "relay"))]
 pub use events::convert_reachability;
@@ -106,7 +107,9 @@ pub fn parse_direct_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
     if peer_addr.transport().transport_kind().is_none() || peer_addr.transport().is_wildcard_host()
     {
         return Err(FfiError::InvalidAddress {
-            detail: "address must be a complete direct /quic-v1, /webtransport or /tcp peer address".into(),
+            detail:
+                "address must be a complete direct /quic-v1, /webtransport or /tcp peer address"
+                    .into(),
         });
     }
     Ok(peer_addr)

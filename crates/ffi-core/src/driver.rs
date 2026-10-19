@@ -11,7 +11,7 @@ use minip2p::{EndpointWaitOutcome, Error, PeerId, WaitDeadline};
 use crate::carry::PUMP_DRAIN_LIMIT;
 use crate::endpoint::{Lifecycle, Shared};
 use crate::events::{CloseOutcome, UnfinishedConnection, convert_endpoint_event};
-use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
+use crate::{DriverFailureKind, EventDoorbell, P2pEvent, driver_failure_kind};
 
 struct ExitGuard {
     shared: Arc<Shared>,
@@ -52,7 +52,7 @@ pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
         }
         let failure = match result {
             Ok(Err(error)) if report_failure => Some(P2pEvent::DriverFailed {
-                kind: failure_kind(&error),
+                kind: driver_failure_kind(&error),
                 detail: error.to_string(),
             }),
             Err(_) if report_failure => Some(P2pEvent::DriverFailed {
@@ -195,13 +195,4 @@ fn ring(doorbell: &Arc<dyn EventDoorbell>) {
     drop(catch_unwind(AssertUnwindSafe(|| {
         doorbell.on_events_ready()
     })));
-}
-
-fn failure_kind(error: &Error) -> DriverFailureKind {
-    match error {
-        Error::Transport(_) | Error::Full { .. } => DriverFailureKind::Transport,
-        Error::Swarm(_) => DriverFailureKind::Swarm,
-        // Includes failures this binding predates.
-        _ => DriverFailureKind::Invariant,
-    }
 }
