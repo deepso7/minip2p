@@ -59,7 +59,7 @@ assert_eq!(section.get(b":status"), Some(&b"200"[..]));
 1. connect to `https://<host>:<port>/.well-known/libp2p-webtransport?type=noise` (`webtransport_url`; IPv6 hosts are bracketed and names pass through), trusting exactly the address's certhashes;
 2. on `SessionReady`, open the first stream and run Noise XX as initiator, requiring the `/p2p` peer;
 3. require every dialed certhash in the server's Noise extensions, or close with an `Error` reason;
-4. finish the Noise stream and emit `Connected`, with the Noise handshake hash as the connection token.
+4. finish the Noise stream and emit `Connected`, with the Noise handshake hash as the connection token, once message three and the FIN are with the platform. Until then the handshake and its timeout stay pending, and a `StopSending` or `Reset` on the Noise stream fails it.
 
 Every later stream maps 1:1 onto a WebTransport stream; `reset_stream` sends code 0, and a peer's stop code reaches `StreamWriteStopped` unchanged, matching the QUIC server's mapping. `listen` and dials without a `/certhash` are `Unsupported`.
 
