@@ -42,6 +42,11 @@ export type IoEvent =
       readonly code: number;
       readonly reason: string;
     }
+  | {
+      readonly kind: "sessionFailed";
+      readonly session: number;
+      readonly reason: string;
+    }
   | { readonly kind: "streamOpened"; readonly stream: number }
   | {
       readonly kind: "incomingStream";
@@ -168,10 +173,20 @@ export class JsIo {
     );
     transport.closed.then(
       (info) => {
-        this.#endSession(id, info.closeCode ?? 0, info.reason ?? "");
+        this.#endSession({
+          code: info.closeCode ?? 0,
+          kind: "sessionClosed",
+          reason: info.reason ?? "",
+          session: id,
+        });
       },
+      // Never came up, or lost (the network going away): not an orderly close.
       (error: unknown) => {
-        this.#endSession(id, 0, errorMessage(error));
+        this.#endSession({
+          kind: "sessionFailed",
+          reason: errorMessage(error),
+          session: id,
+        });
       }
     );
     return id;
@@ -451,7 +466,10 @@ export class JsIo {
     }
   }
 
-  #endSession(id: number, code: number, reason: string): void {
+  #endSession(
+    end: Extract<IoEvent, { kind: "sessionClosed" | "sessionFailed" }>
+  ): void {
+    const id = end.session;
     const session = this.#sessions.get(id);
     if (session === undefined) {
       return;
@@ -463,7 +481,7 @@ export class JsIo {
       }
     }
     this.#sessions.delete(id);
-    this.#push({ code, kind: "sessionClosed", reason, session: id });
+    this.#push(end);
   }
 }
 

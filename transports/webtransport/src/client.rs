@@ -94,7 +94,7 @@ pub fn webtransport_url(addr: &Multiaddr) -> Result<String, TransportError> {
 ///   `ack_stream`, and when a connection ends, in [`UnsettledConnections`]
 ///   until `ack_stream` or `reset_stream` settles them.
 ///
-/// A reset, a `SessionClosed` or `close` frees a stream's or session's
+/// A reset, a session ending or `close` frees a stream's or session's
 /// queues and grants at once. Handles are never reused, so platform events
 /// for a handle that is gone are ignored.
 pub struct WebTransportClient<Io, E> {
@@ -408,21 +408,9 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
                 session,
                 code,
                 reason,
-            } => {
-                let Some(&id) = self.by_session.get(&session) else {
-                    return;
-                };
-                let Some(session) = self.remove(id) else {
-                    return;
-                };
-                let reason = if session.connected {
-                    ConnectionCloseReason::Remote {
-                        code: u64::from(code),
-                    }
-                } else {
-                    ConnectionCloseReason::Error(format!("WebTransport session failed: {reason}"))
-                };
-                self.events.push(TransportEvent::Closed { id, reason });
+            } => self.on_session_ended(session, Some(code), &reason),
+            IoEvent::SessionFailed { session, reason } => {
+                self.on_session_ended(session, None, &reason);
             }
             IoEvent::StreamOpened { stream } => self.on_stream_opened(stream),
             IoEvent::IncomingStream { session, stream } => self.on_incoming_stream(session, stream),
@@ -451,6 +439,24 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
                 self.wake_writable(id);
             }
         }
+    }
+
+    /// Reports a session's end: an orderly close (`code` given) of a
+    /// connected session as the peer's, anything else as an error.
+    fn on_session_ended(&mut self, session: SessionHandle, code: Option<u32>, reason: &str) {
+        let Some(&id) = self.by_session.get(&session) else {
+            return;
+        };
+        let Some(session) = self.remove(id) else {
+            return;
+        };
+        let reason = match code {
+            Some(code) if session.connected => ConnectionCloseReason::Remote {
+                code: u64::from(code),
+            },
+            _ => ConnectionCloseReason::Error(format!("WebTransport session failed: {reason}")),
+        };
+        self.events.push(TransportEvent::Closed { id, reason });
     }
 
     /// A stream's state, with the platform I/O beside it.

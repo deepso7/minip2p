@@ -39,13 +39,21 @@ pub struct IoError(pub String);
 pub enum IoEvent {
     /// The session's CONNECT succeeded (`ready` resolved).
     SessionReady { session: SessionHandle },
-    /// The session ended, or never came up (`ready` or `closed` settled).
+    /// The session closed in order (`closed` resolved), by either side.
     /// Every stream of it is gone with it, without events of their own.
     SessionClosed {
         session: SessionHandle,
         /// The WebTransport close code, 0 when the platform gave none.
         code: u32,
         /// Why, for diagnostics.
+        reason: String,
+    },
+    /// The session failed: it never came up, or was lost to an error such
+    /// as the network going away (`closed` rejected). Its streams are gone
+    /// with it, as for [`IoEvent::SessionClosed`].
+    SessionFailed {
+        session: SessionHandle,
+        /// The platform's error, for diagnostics.
         reason: String,
     },
     /// A stream from [`WebTransportIo::open_stream`] is open and writable.
@@ -81,7 +89,8 @@ pub enum IoEvent {
 pub trait WebTransportIo {
     /// Starts a session to `url`, trusting exactly the server certificates
     /// whose SHA-256 hashes are `certhashes` (`serverCertificateHashes`).
-    /// [`IoEvent::SessionReady`] or [`IoEvent::SessionClosed`] follows.
+    /// [`IoEvent::SessionReady`], [`IoEvent::SessionClosed`] or
+    /// [`IoEvent::SessionFailed`] follows.
     fn connect(&mut self, url: &str, certhashes: &[Multihash]) -> Result<SessionHandle, IoError>;
 
     /// Opens a bidirectional stream; [`IoEvent::StreamOpened`] follows once

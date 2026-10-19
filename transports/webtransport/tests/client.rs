@@ -552,6 +552,39 @@ fn late_callbacks_after_reset_or_close_are_ignored() {
 }
 
 #[test]
+fn a_lost_session_closes_with_its_error_and_an_orderly_one_with_its_code() {
+    let mut client = client(small_limits());
+    let lost = connect(&mut client);
+    let closed = connect(&mut client);
+    client.io_mut().events.extend([
+        IoEvent::SessionFailed {
+            session: lost.session,
+            reason: "network connection lost".into(),
+        },
+        IoEvent::SessionClosed {
+            session: closed.session,
+            code: 7,
+            reason: "bye".into(),
+        },
+    ]);
+    assert_eq!(
+        poll(&mut client),
+        [
+            TransportEvent::Closed {
+                id: lost.id,
+                reason: ConnectionCloseReason::Error(
+                    "WebTransport session failed: network connection lost".into()
+                ),
+            },
+            TransportEvent::Closed {
+                id: closed.id,
+                reason: ConnectionCloseReason::Remote { code: 7 },
+            },
+        ]
+    );
+}
+
+#[test]
 fn a_handshake_that_does_not_finish_in_time_closes_with_timed_out() {
     let mut client = client(small_limits());
     let addr: PeerAddr = format!(
