@@ -941,7 +941,7 @@ impl WtSession {
         // A session id is a CONNECT stream's: client-initiated bidi, so a
         // multiple of 4. Any other cannot name a session at all (draft-14
         // §4), unlike a valid id that is not ours.
-        if session_id % 4 != 0 {
+        if !session_id.is_multiple_of(4) {
             self.fail(
                 code::H3_ID_ERROR,
                 format!("a stream named session {session_id}, not a request stream id"),
