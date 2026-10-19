@@ -93,6 +93,7 @@ fn main() {
         static_secret: [22; 32],
         ephemeral_secret: [23; 32],
         expected_peer: None,
+        local_extensions: None,
     });
     responder.start().unwrap();
     responder

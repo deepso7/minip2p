@@ -25,6 +25,12 @@ pub use peer_id::{
     read_uvarint_with_remainder, uvarint_len, write_uvarint,
 };
 
+/// Multihash with up to 64 digest bytes (`multihash::Multihash<64>`).
+///
+/// The same type as [`PeerMultihash`], named for uses beyond peer ids such as
+/// WebTransport certificate hashes.
+pub type Multihash = PeerMultihash;
+
 /// Helpers shared by this crate's unit tests.
 #[cfg(test)]
 pub(crate) mod test_util {

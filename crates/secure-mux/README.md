@@ -86,6 +86,8 @@ Transport plaintext is automatically segmented at 65,519 bytes so every encrypte
 
 Once the handshake completes, `NoiseSession::handshake_hash` returns the final handshake hash `h`. Both ends compute the same value, so it names the session on either side (channel binding, in Noise terms).
 
+The payload's libp2p `NoiseExtensions` are typed: set `NoiseConfig::local_extensions` to send them, and `NoiseOutput::HandshakeComplete` carries the remote's as `remote_extensions`. A WebTransport listener uses them to send its `webtransport_certhashes`; checking those against the dialed certificate is the WebTransport client's job, not Noise's. `SecureMuxSession` sends none and ignores any it receives, so TCP and circuit handshakes stay byte-identical to plain libp2p Noise.
+
 Interoperability fixtures and how to regenerate them are described in [`tests/fixtures/noise`](tests/fixtures/noise/README.md).
 
 ## Yamux
