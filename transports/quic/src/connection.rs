@@ -596,6 +596,11 @@ impl QuicConnection {
             let mut transport = self.endpoint.transport().clone();
             transport.push(Protocol::WebTransport);
             self.endpoint = ConnectionEndpoint::new(transport);
+            // The CONNECT and Noise streams are the session's own, not
+            // application streams: the engine's peer bidi credit gets room
+            // for both on top of `max_streams_per_connection`, which the
+            // adapter goes on enforcing for application streams.
+            self.reserve_wt_streams(2);
             let mut wt = WtSession::new(context);
             wt.open_control(&mut self.conn);
             self.wt = Some(wt);
@@ -653,6 +658,8 @@ impl QuicConnection {
                         continue;
                     }
                     self.wt_deadline = None;
+                    // Only the CONNECT stream stays the session's.
+                    self.reserve_wt_streams(1);
                     self.endpoint.set_peer_id(peer);
                     self.endpoint.set_token(ConnectionToken::new(token));
                     self.state = ConnectionState::Connected;
@@ -699,6 +706,14 @@ impl QuicConnection {
                 }
             }
         }
+    }
+
+    /// Sets the engine's peer bidi stream credit to the application limit
+    /// plus `internal` streams the WebTransport session uses itself.
+    fn reserve_wt_streams(&mut self, internal: u64) {
+        let count = VarInt::from_u64(self.max_streams.saturating_add(internal))
+            .unwrap_or(VarInt::MAX);
+        self.conn.set_max_concurrent_streams(Dir::Bi, count);
     }
 
     /// The engine lost the connection; `Closed` follows once it drains,

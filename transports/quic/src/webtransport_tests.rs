@@ -1583,6 +1583,36 @@ fn capsules_wait_for_the_session_to_be_accepted() {
 }
 
 #[test]
+fn a_one_stream_limit_still_authenticates_and_carries_one_stream() {
+    let mut server = server_with(QuicLimits {
+        max_streams_per_connection: 1,
+        ..QuicLimits::default()
+    });
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(DRAFT02);
+    peer.libp2p_connect();
+    // The CONNECT and Noise streams come on top of the limit.
+    peer.drive(&mut server, &mut events, "the 200", |peer, _| {
+        peer.status().is_some()
+    });
+    peer.authenticate(&mut server, &mut events);
+    let mut stream = None;
+    peer.drive(&mut server, &mut events, "stream credit", |peer, _| {
+        stream = peer.raw.conn().streams().open(Dir::Bi).map(u64::from);
+        stream.is_some()
+    });
+    let stream = stream.expect("stream");
+    let mut data = Vec::new();
+    encode_webtransport_bidi_header(peer.connect.expect("session"), &mut data).expect("prefix");
+    data.extend_from_slice(b"app");
+    assert_eq!(peer.raw.write(stream, &data), data.len());
+    peer.drive(&mut server, &mut events, "the application stream", |_, events| {
+        crate::test_peer::stream_bytes(events, stream) == b"app"
+    });
+}
+
+#[test]
 fn a_stream_reset_before_its_prefix_has_the_servers_side_reset_too() {
     let mut server = server();
     let mut events = Vec::new();
