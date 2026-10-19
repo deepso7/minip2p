@@ -22,3 +22,6 @@ code-ref/
 
 node_modules/
 .turbo/
+
+# The browser example's Vite build.
+/examples/web/dist/
