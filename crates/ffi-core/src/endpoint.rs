@@ -15,8 +15,9 @@ use minip2p::{
 };
 
 use crate::{
-    ConfigCapability, DriverStats, EndpointConfig, EventDoorbell, FfiError, IdentifyInfo,
-    KnownPeerInfo, P2pEvent, RelayReservationInfo, keypair_from_bytes, parse_direct_peer_addr,
+    ConfigCapability, DriverStats, EndpointConfig, EventCarry, EventDoorbell, FfiError,
+    IdentifyInfo, KnownPeerInfo, P2pEvent, RelayReservationInfo, keypair_from_bytes,
+    map_driver_error, parse_direct_peer_addr, parse_peer_id,
 };
 
 /// Adds address-shaped listeners, or the QUIC dual-stack defaults when
@@ -68,7 +69,7 @@ pub(crate) struct Shared {
     /// Converted events awaiting `drain_events`. Locked apart from `state`,
     /// which the driver holds across its wait, so draining neither waits for
     /// nor interrupts the driver. Lock order: `state`, then `events`.
-    events: Mutex<crate::driver::EventState>,
+    events: Mutex<EventState>,
     /// Latched once the lifecycle reaches `Stopped`. `wait_stopped` sleeps on
     /// this rather than on `state`, which the driver holds for as long as the
     /// endpoint has nothing due.
@@ -85,6 +86,19 @@ pub(crate) struct Shared {
     commands_idle_cv: Condvar,
     pub(crate) driver_running: AtomicBool,
     doorbell_running: AtomicBool,
+}
+
+/// The carry and what the driver publishes beside it, behind the endpoint's
+/// event lock.
+#[derive(Default)]
+pub(crate) struct EventState {
+    pub(crate) carry: EventCarry,
+    /// What `connected_peers` returns, published from the endpoint's peer
+    /// table by the driver (see `Shared::publish_peers`), so the
+    /// query neither interrupts nor waits for the driver.
+    pub(crate) connected_peers: Vec<String>,
+    /// Set with the lifecycle once it reaches `Stopping` or `Stopped`.
+    pub(crate) stopped: bool,
 }
 
 pub(crate) struct EndpointState {
@@ -104,7 +118,7 @@ impl EndpointState {
     /// Releases the Endpoint together with the tails held for it, which can
     /// be large and are owed to streams that no longer exist.
     pub(crate) fn release_endpoint(&mut self) -> Option<Endpoint> {
-        self.writes = crate::writes::writer();
+        self.writes = crate::stream_writer();
         self.endpoint.take()
     }
 }
@@ -242,7 +256,7 @@ impl P2pEndpoint {
                     endpoint: Some(endpoint),
                     driver_thread_id: None,
                     doorbell_thread_id: None,
-                    writes: crate::writes::writer(),
+                    writes: crate::stream_writer(),
                     published_peers: Vec::new(),
                     close_timeout: Duration::ZERO,
                 }),
@@ -337,24 +351,10 @@ impl P2pEndpoint {
         if limit == 0 {
             return Vec::new();
         }
-        let mut events = self.shared.lock_events();
-        let crate::driver::EventState {
-            carry,
-            overflow,
-            stats,
-            ..
-        } = &mut *events;
-        let mut delivery = crate::driver::take_delivery(carry, overflow, stats, limit as usize);
-        stats.dispatch_attempted = stats
-            .dispatch_attempted
-            .saturating_add(delivery.batch.len() as u64);
-        let mut events =
-            Vec::with_capacity(delivery.batch.len() + usize::from(delivery.diagnostic.is_some()));
-        if let Some(diagnostic) = delivery.diagnostic.take() {
-            events.push(diagnostic);
-        }
-        events.extend(delivery.batch);
-        events
+        self.shared
+            .lock_events()
+            .carry
+            .take_delivery(limit as usize)
     }
 
     /// Requests shutdown without waiting for an in-flight callback.
@@ -566,7 +566,7 @@ impl P2pEndpoint {
                     data,
                 )
                 .map(|progress| progress == minip2p::WriteProgress::Accepted)
-                .map_err(crate::writes::map_write_error)
+                .map_err(crate::map_write_error)
         })
     }
 
@@ -582,7 +582,7 @@ impl P2pEndpoint {
                     ConnectionId::new(conn_id),
                     StreamId::new(stream_id),
                 )
-                .map_err(crate::writes::map_write_error)
+                .map_err(crate::map_write_error)
         })
     }
 
@@ -621,7 +621,7 @@ impl P2pEndpoint {
             if !accepted {
                 return abandoned.map_err(map_driver_error);
             }
-            let (dropped_data, _) = events.carry.remove_stream(raw_conn, raw_stream);
+            let dropped_data = events.carry.remove_stream(raw_conn, raw_stream);
             drop(events);
             // Never drained, so never acknowledged: after a reset or a
             // settlement this is moot, and a stream closed on a live
@@ -826,7 +826,7 @@ impl P2pEndpoint {
     ///
     /// This method is intentionally outside the UniFFI export block.
     pub fn driver_stats(&self) -> DriverStats {
-        self.shared.lock_events().stats
+        self.shared.lock_events().carry.stats()
     }
 
     fn with_endpoint<T>(&self, operation: impl FnOnce(&Endpoint) -> T) -> Result<T, FfiError> {
@@ -872,7 +872,7 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn lock_events(&self) -> MutexGuard<'_, crate::driver::EventState> {
+    pub(crate) fn lock_events(&self) -> MutexGuard<'_, EventState> {
         self.events.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -1016,12 +1016,6 @@ fn map_mdns_config_error(error: MdnsConfigError) -> FfiError {
     }
 }
 
-pub(crate) fn parse_peer_id(peer_id: &str) -> Result<PeerId, FfiError> {
-    PeerId::from_str(peer_id).map_err(|error| FfiError::InvalidPeerId {
-        detail: error.to_string(),
-    })
-}
-
 /// Maps a failure to build the endpoint: configuration mistakes to
 /// `InvalidConfig` naming their capability, malformed listen input to
 /// `InvalidAddress`, refused sockets to `Transport`, and broken invariants to
@@ -1106,17 +1100,6 @@ fn map_gossipsub_error(error: GossipsubError) -> FfiError {
 fn map_topic_error(error: TopicError) -> FfiError {
     FfiError::InvalidTopic {
         detail: error.to_string(),
-    }
-}
-
-pub(crate) fn map_driver_error(error: minip2p::Error) -> FfiError {
-    match error {
-        minip2p::Error::Transport(_) => FfiError::Transport {
-            detail: error.to_string(),
-        },
-        _ => FfiError::Internal {
-            detail: error.to_string(),
-        },
     }
 }
 
@@ -1236,11 +1219,11 @@ mod tests {
         let endpoint = endpoint(config()).expect("endpoint");
         {
             let mut events = endpoint.shared.lock_events();
-            events.carry.push(P2pEvent::PingTimeout {
+            events.carry.carry.push(P2pEvent::PingTimeout {
                 peer_id: "a".into(),
                 conn_id: 1,
             });
-            events.carry.push(P2pEvent::PingTimeout {
+            events.carry.carry.push(P2pEvent::PingTimeout {
                 peer_id: "b".into(),
                 conn_id: 1,
             });
@@ -1291,7 +1274,7 @@ mod tests {
             peer_id: "a".into(),
             conn_id: 1,
         };
-        endpoint.shared.lock_events().carry.push(ping.clone());
+        endpoint.shared.lock_events().carry.carry.push(ping.clone());
         // A driver parked in `wait` holds the state lock.
         let mut parked = endpoint.shared.lock_state();
         let (drained_tx, drained_rx) = std::sync::mpsc::channel();
@@ -1337,7 +1320,7 @@ mod tests {
             drained.extend(a.drain_events(4_096));
             if drained
                 .iter()
-                .any(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+                .any(|event| crate::carry::terminal_connect_id(event) == Some(connect_id))
             {
                 break;
             }
@@ -1346,7 +1329,7 @@ mod tests {
 
         let terminals: Vec<&P2pEvent> = drained
             .iter()
-            .filter(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+            .filter(|event| crate::carry::terminal_connect_id(event) == Some(connect_id))
             .collect();
         assert_eq!(
             terminals,
@@ -1367,7 +1350,7 @@ mod tests {
         assert_eq!(
             drained
                 .iter()
-                .filter(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+                .filter(|event| crate::carry::terminal_connect_id(event) == Some(connect_id))
                 .count(),
             1,
             "no further terminal after the first cancel: {drained:#?}"
@@ -1403,7 +1386,7 @@ mod tests {
             drained.extend(a.drain_events(4_096));
             if drained
                 .iter()
-                .any(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+                .any(|event| crate::carry::terminal_connect_id(event) == Some(connect_id))
             {
                 break;
             }
@@ -1419,7 +1402,7 @@ mod tests {
 
         let terminals: Vec<&P2pEvent> = drained
             .iter()
-            .filter(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+            .filter(|event| crate::carry::terminal_connect_id(event) == Some(connect_id))
             .collect();
         assert_eq!(
             terminals.len(),
@@ -1463,7 +1446,7 @@ mod tests {
 
         let terminals: Vec<&P2pEvent> = drained
             .iter()
-            .filter(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+            .filter(|event| crate::carry::terminal_connect_id(event) == Some(connect_id))
             .collect();
         assert_eq!(
             terminals.len(),

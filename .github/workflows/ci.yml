@@ -73,8 +73,8 @@ jobs:
           toolchain: stable
           components: clippy,rustfmt
           # Real no_std target: a host check can't catch dependencies that
-          # unconditionally link std.
-          targets: thumbv7em-none-eabi
+          # unconditionally link std. wasm32 is the browser build's target.
+          targets: thumbv7em-none-eabi,wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # PR runs restore main's cache but never save their own: per-branch
@@ -100,6 +100,9 @@ jobs:
       - run: cargo check --no-default-features --features portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo check --no-default-features --features portable-mdns,pubsub,portable-relay --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo check --no-default-features --features smoltcp,portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
+      # Mirrors `just check-wasm`.
+      - run: cargo check --target wasm32-unknown-unknown -p minip2p-ffi-core --no-default-features --features serde
+      - run: cargo check --target wasm32-unknown-unknown -p minip2p-rs --no-default-features --features pubsub
       - run: cargo doc --workspace --no-deps
       - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps
       - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
