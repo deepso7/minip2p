@@ -96,8 +96,10 @@ pub fn webtransport_url(addr: &Multiaddr) -> Result<String, TransportError> {
 ///
 /// A reset, a session ending or `close` frees a stream's or session's
 /// queues and grants at once. Handles are never reused, so platform events
-/// for a handle that is gone are ignored.
-pub struct WebTransportClient<Io, E> {
+/// for a handle that is gone are ignored. Dropping the client closes every
+/// session it still holds, pending dials included, so an endpoint shut
+/// down or freed mid-dial leaves no platform session behind.
+pub struct WebTransportClient<Io: WebTransportIo, E> {
     io: Io,
     identity: Ed25519Keypair,
     entropy: E,
@@ -856,6 +858,14 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
 /// The caller-facing id of a stream handle.
 fn stream_id(handle: StreamHandle) -> StreamId {
     StreamId::new(handle.0)
+}
+
+impl<Io: WebTransportIo, E> Drop for WebTransportClient<Io, E> {
+    fn drop(&mut self) {
+        for session in self.connections.values() {
+            self.io.close(session.handle, 0, "");
+        }
+    }
 }
 
 impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, E> {

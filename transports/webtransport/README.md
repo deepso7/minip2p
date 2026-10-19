@@ -67,7 +67,7 @@ The client honours the full transport contract within `WebTransportLimits` (`Web
 - **Granted reads**: `grant_read` is issued only for `window − unacked − outstanding grant`.
 - **Delivered, unacknowledged bytes**: held per stream until `ack_stream`. A connection that ends with some becomes an unsettled connection (`UnsettledConnections`) that keeps its slot until `ack_stream` or `reset_stream` settles them.
 
-A reset, `StopSending`, `SessionClosed`, `SessionFailed` or `close` frees the affected queues and grants at once. A peer's reset also resets the client's side of the platform stream, as the QUIC transport does. A `StopSending` after `StreamClosed` is not reported but still releases writes the platform will never complete. A write the platform refuses fails `send_stream` with `StreamSendFailed`; one refused later, from the queue, stops the write side with `StreamWriteStopped` (code 0). Handles are never reused, so a late event for a handle that is gone is ignored.
+A reset, `StopSending`, `SessionClosed`, `SessionFailed` or `close` frees the affected queues and grants at once. A peer's reset also resets the client's side of the platform stream, as the QUIC transport does. A `StopSending` after `StreamClosed` is not reported but still releases writes the platform will never complete. A write the platform refuses fails `send_stream` with `StreamSendFailed`; one refused later, from the queue, stops the write side with `StreamWriteStopped` (code 0). Handles are never reused, so a late event for a handle that is gone is ignored. Dropping the client closes every session it still holds, pending dials included.
 
 ## Tests
 
