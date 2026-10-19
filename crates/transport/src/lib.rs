@@ -19,6 +19,7 @@ mod event;
 mod limit;
 #[cfg(feature = "std")]
 mod poll;
+mod send_caps;
 mod set;
 mod stream_id;
 mod transport;
@@ -35,6 +36,7 @@ pub use limit::InvalidLimit;
 /// Stream payload type, re-exported from [`minip2p_core::Bytes`] so adapters
 /// need no extra dependency.
 pub use minip2p_core::Bytes;
+pub use send_caps::SendCaps;
 pub use set::{RejectedTransport, TransportSet, TransportSetError};
 pub use stream_id::StreamId;
 pub use transport::Transport;

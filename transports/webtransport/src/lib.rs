@@ -26,8 +26,10 @@ mod client;
 mod error;
 pub mod h3;
 mod io;
+mod limits;
 pub mod qpack;
 
 pub use client::{LIBP2P_WEBTRANSPORT_PATH, WebTransportClient, webtransport_url};
 pub use error::{Error, VarIntTooLarge};
 pub use io::{IoError, IoEvent, SessionHandle, StreamHandle, WebTransportIo};
+pub use limits::WebTransportLimits;
