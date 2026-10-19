@@ -146,7 +146,7 @@ See the research doc for sources. The facts that drive the design:
         | Any QPACK encoder-stream instruction (the table capacity is 0, so every insert is illegal) | `QPACK_ENCODER_STREAM_ERROR` |
         | Any QPACK decoder-stream instruction but Stream Cancellation (nothing is inserted to acknowledge) | `QPACK_DECODER_STREAM_ERROR` |
         | A field section with required insert count ≠ 0, or a dynamic or post-base reference | `QPACK_DECOMPRESSION_FAILED` |
-        | SETTINGS, GOAWAY or a push frame on the CONNECT stream, or a frame after its trailer section | `H3_FRAME_UNEXPECTED` |
+        | SETTINGS, GOAWAY or a push frame on the CONNECT stream, or DATA or HEADERS after its trailer section (unknown frames are skipped) | `H3_FRAME_UNEXPECTED` |
         | A pseudo-header or malformed field in the CONNECT stream's trailers | `H3_MESSAGE_ERROR` |
         | A `WT_MAX_DATA` or `WT_MAX_STREAMS` (bidi or uni) capsule below the previous one of its kind | `WT_FLOW_CONTROL_ERROR` (`0x045d4487`, draft-14 §§5.6.2, 5.6.4); the session is the connection's only one, so the connection closes with it |
         | A failed Noise handshake, or the client finishing or stopping the Noise stream before it completes | `H3_GENERAL_PROTOCOL_ERROR` |
@@ -166,6 +166,7 @@ See the research doc for sources. The facts that drive the design:
    - **Early streams.** Streams that arrive before the session is established, such as the Noise stream racing the 2xx, are held. The cap is 4 streams and 16 KiB in total; past that the connection fails.
    - **Stream error codes.**
      - minip2p's reset and stop code 0 is sent as the WT application error 0, mapped to `0x52e4a40fa8db` by the draft formula.
+     - When the session ends, draft-13/14 streams are reset and stopped with `WT_SESSION_GONE` (`0x170d7b68`, draft-14 §6). Draft-02 names no code for this, so its streams get WT application error 0.
      - Inbound H3 codes are mapped back into WT codes for `StreamWriteStopped { error_code }`. Codes outside the WT range pass through unchanged.
      - Browsers cut codes to 8 bits, so minip2p only ever sends 0.
    - **Session flow control (needed for Safari).** On draft-13/14, flow control is on once the client asks for it with a `WT_MAX_SESSIONS` above 1 or any nonzero `WT_INITIAL_MAX_*` (draft-14 §5.1); an omitted limit is then 0. Server-opened streams and their bytes after the prefix, Noise's replies included, count against the client's WT stream and data credit. The parser reads `WT_MAX_STREAMS` (`0x190b4d3f`) and `WT_MAX_DATA` capsules on the CONNECT stream, and the existing `pending_opens` and send queue simply wait for that credit. A capsule below the previous one of its kind (uni included) is `WT_FLOW_CONTROL_ERROR`. The server's own limits are 2^60, so it never sends credit capsules.
@@ -173,7 +174,7 @@ See the research doc for sources. The facts that drive the design:
      - **Local `close(id)`** enters a `Closing` phase rather than closing QUIC at once. quinn's `Connection::close` drops undelivered stream data, so an immediate close would lose the capsule.
        1. Send a `CLOSE_WEBTRANSPORT_SESSION` capsule (`0x2843`, code 0) in a DATA frame.
        2. FIN the CONNECT stream.
-       3. Reset the open WT streams.
+       3. Reset and stop the open WT streams (`WT_SESSION_GONE` on draft-13/14).
        4. Wait out a bounded deadline (`max(3 × RTT, 500 ms)`, capped at 2 s), even if the peer ends its side sooner: Chrome finishes CONNECT and acknowledges our FIN in its network stack before the page's `closed` settles, and a QUIC close in that window rejects `closed` with "Connection lost".
        5. Close QUIC with `H3_NO_ERROR` (`0x100`).
 
