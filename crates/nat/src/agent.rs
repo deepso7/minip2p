@@ -873,11 +873,21 @@ impl NatAgent {
                 );
             }
             SwarmEvent::PeerReady {
-                peer_id, conn_id, ..
+                peer_id,
+                conn_id,
+                protocols,
             } => {
                 touched_state = true;
                 for attempt in self.attempts.values_mut() {
                     attempt.on_peer_ready(peer_id, *conn_id, swarm, &mut self.shared, now);
+                    attempt.on_target_ready(
+                        peer_id,
+                        *conn_id,
+                        protocols,
+                        swarm,
+                        &mut self.shared,
+                        now,
+                    );
                 }
                 self.housekeeping
                     .on_peer_ready(peer_id, *conn_id, swarm, &mut self.shared, now);
