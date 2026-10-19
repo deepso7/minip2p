@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use minip2p_core::PeerId;
 use minip2p_identity::Ed25519Keypair;
 
@@ -113,6 +115,8 @@ pub struct QuicNodeConfig {
     pub(crate) keypair: Ed25519Keypair,
     /// Runtime resource and flow-control limits.
     pub(crate) limits: QuicLimits,
+    /// Bind addresses whose sockets also serve WebTransport (ALPN `h3`).
+    pub(crate) webtransport: Vec<SocketAddr>,
 }
 
 impl QuicNodeConfig {
@@ -125,6 +129,7 @@ impl QuicNodeConfig {
         Self {
             keypair,
             limits: QuicLimits::default(),
+            webtransport: Vec::new(),
         }
     }
 
@@ -147,6 +152,24 @@ impl QuicNodeConfig {
     /// Returns the configured runtime limits.
     pub fn limits(&self) -> &QuicLimits {
         &self.limits
+    }
+
+    /// Serves WebTransport beside libp2p on the socket bound at `bind_addr`,
+    /// which must be one of the addresses passed to
+    /// [`QuicTransport::bind`](crate::QuicTransport::bind) (as given, so
+    /// port 0 for an ephemeral port).
+    ///
+    /// Each connection to that socket picks its protocol by ALPN: `libp2p`
+    /// (preferred) still requires a verified libp2p client certificate,
+    /// while `h3` takes none and authenticates through WebTransport. The
+    /// socket's connections carry two extra transport parameters: a limit of
+    /// three peer unidirectional streams and the QUIC DATAGRAM parameter.
+    /// Other sockets are unchanged.
+    pub fn with_webtransport(mut self, bind_addr: SocketAddr) -> Self {
+        if !self.webtransport.contains(&bind_addr) {
+            self.webtransport.push(bind_addr);
+        }
+        self
     }
 
     /// Returns the Ed25519 host keypair.

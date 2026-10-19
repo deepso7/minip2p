@@ -114,6 +114,8 @@ pub(crate) struct Socket {
     pub(crate) local_addr: SocketAddr,
     /// Whether `listen` accepted this socket's address.
     pub(crate) listening: bool,
+    /// Whether the socket also serves WebTransport (ALPN `h3`), set at bind.
+    pub(crate) webtransport: bool,
     /// Ids for this socket's connections, in its family's namespace.
     pub(crate) ids: ConnectionIdAllocator,
     /// The last receive batch hit its bound, so input may be waiting with no
@@ -172,6 +174,7 @@ impl Socket {
             state,
             local_addr,
             listening: false,
+            webtransport: false,
             ids: ConnectionIdAllocator::new(namespace),
             saturated: false,
             pending: VecDeque::new(),
