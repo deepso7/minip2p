@@ -84,12 +84,15 @@ pub fn webtransport_certificate(
     }
 
     let signing_key = derive_signing_key(host, period);
+    let out_of_range = || gen_err("certificate period is out of range");
     let not_before = period
         .checked_mul(PERIOD_SECS)
         // Period 0 starts at the epoch, so its margin is clamped there.
         .map(|start| start.saturating_sub(CLOCK_SKEW_MARGIN_SECS))
-        .ok_or_else(|| gen_err("certificate period is out of range"))?;
-    let not_after = not_before + CERTIFICATE_VALIDITY_SECS;
+        .ok_or_else(out_of_range)?;
+    let not_after = not_before
+        .checked_add(CERTIFICATE_VALIDITY_SECS)
+        .ok_or_else(out_of_range)?;
     let time = |secs| {
         der::DateTime::from_unix_duration(Duration::from_secs(secs))
             .map(Time::from)
@@ -344,5 +347,17 @@ mod tests {
         let boundary = next_boundary(2_000 * 13 * DAY);
         assert_eq!(validity_secs(2_001).0, boundary - 3_600);
         assert_eq!(validity_secs(2_000).1, boundary + 23 * 3_600);
+    }
+
+    #[test]
+    fn periods_past_the_x509_range_are_errors() {
+        // Year 10000 cannot be encoded, and the last period's validity end
+        // overflows `u64`; both are generation errors, not panics.
+        for period in [period_at(253_402_300_800), period_at(u64::MAX)] {
+            assert!(matches!(
+                webtransport_certificate(&host(1), period),
+                Err(TlsError::CertificateGeneration(_))
+            ));
+        }
     }
 }
