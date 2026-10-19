@@ -96,7 +96,7 @@ If the punch cannot land (e.g. UDP blocked between the peers), you'll see `nat-h
 | `--autonat <peer-addr>` | AutoNAT server for reachability probes; optional — with none configured the agent reserves whenever a relay is available |
 | `--count <n>` | dial only: stop after `n` pings with a summary and exit code 0 |
 | `--key <path>` | persistent Ed25519 secret (hex); created on first use. Keep the listener's key stable so its circuit address survives restarts |
-| `--listen <multiaddr>` | explicit QUIC or TCP bind (`/ip4/0.0.0.0/udp/4001/quic-v1` or `/ip4/0.0.0.0/tcp/4001`); default is dual-stack QUIC on UDP/0 |
+| `--listen <multiaddr>` | explicit QUIC, TCP or WebTransport bind (`/ip4/0.0.0.0/udp/4001/quic-v1`, `/ip4/0.0.0.0/tcp/4001`, or `/ip4/0.0.0.0/udp/4001/quic-v1/webtransport` for browsers on `@minip2p/web`); default is dual-stack QUIC on UDP/0 |
 
 ## Notes
 

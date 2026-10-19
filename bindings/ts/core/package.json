@@ -40,6 +40,11 @@
       "types": "./dist/backend.d.ts",
       "default": "./dist/backend.js"
     },
+    "./serde-backend": {
+      "minip2p-source": "./src/serde-backend.ts",
+      "types": "./dist/serde-backend.d.ts",
+      "default": "./dist/serde-backend.js"
+    },
     "./package.json": "./package.json"
   },
   "publishConfig": {

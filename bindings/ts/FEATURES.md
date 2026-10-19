@@ -1,6 +1,6 @@
 # TypeScript feature mapping
 
-`@minip2p/core` describes the portable host API. React Native implements that contract through UniFFI; Node and WASM adapters can implement the same contract without changing application code.
+`@minip2p/core` describes the portable host API. React Native implements that contract through UniFFI, Node through napi-rs, and the browser (`@minip2p/web`) through wasm-bindgen, without changing application code. The browser runs a subset: see the last table.
 
 | Rust `Endpoint` capability | TypeScript SDK |
 | --- | --- |
@@ -22,3 +22,16 @@
 | One Endpoint event stream and its blocking wait (event, deadline, interrupted) | Driven by each platform backend; surfaced as typed events, State getters, and Promise waits such as `waitFor` and `waitConnectResult` |
 
 Resource-policy tuning remains native configuration until it has consistent semantics across every backend.
+
+## In the browser
+
+`@minip2p/web` runs the same SDK over a WebTransport-only portable endpoint.
+
+| Capability | `@minip2p/web` |
+| --- | --- |
+| Dialing | `/…/quic-v1/webtransport/certhash/…/p2p/…` addresses only; other candidates fail as candidates |
+| Ping, Identify, custom protocol streams, pubsub | As on native |
+| Listening, mDNS, signed discovery, AutoNAT | Rejected at `create` with `InvalidConfigError` and the reason |
+| Relay reservations and circuits (`relays`, `forceRelay`) | Rejected until browser relay support lands |
+| Shutdown | `close` closes every session at once with WebTransport's close capsule |
+| Driver failure | A trapped wasm module reports `driverFailed`; later calls throw `ClosedError` |

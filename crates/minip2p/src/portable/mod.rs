@@ -231,6 +231,39 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         Ok(self.engine.core.add_protocol(protocol_id)?)
     }
 
+    /// Registers an application protocol whose received data the caller
+    /// acknowledges itself, with [`Self::stream_consumed`], instead of as
+    /// [`Self::poll`] returns it.
+    ///
+    /// Otherwise like [`Self::add_protocol`]. A host that hands bytes on to
+    /// a reader which may hold them (a foreign runtime's stream queue) uses
+    /// it, so the sender waits until they are really consumed (ADR 0012).
+    /// Streams that became ready before this call keep the acknowledgement
+    /// they had.
+    pub fn add_manual_ack_protocol(
+        &mut self,
+        protocol_id: impl Into<String>,
+    ) -> Result<(), DriverError> {
+        self.engine.add_manual_ack_protocol(protocol_id.into())
+    }
+
+    /// Acknowledges `bytes` of a manual-acknowledgement stream's received
+    /// data as consumed, replenishing its receive budget (ADR 0012).
+    ///
+    /// The same contract as the std `Endpoint::stream_consumed`: more than
+    /// the stream's unacknowledged bytes fails with
+    /// [`TransportError::AckExceedsDelivered`](minip2p_transport::TransportError::AckExceedsDelivered),
+    /// a closed stream (also on an ended connection) releases its bytes, and
+    /// a settled or unknown stream is a no-op.
+    pub fn stream_consumed(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        bytes: usize,
+    ) -> Result<(), DriverError> {
+        self.engine.core.ack_stream(conn_id, stream_id, bytes)
+    }
+
     /// Admits one Connection attempt. Sync errors: malformed target only.
     ///
     /// A [`PeerId`] target uses the discovery book's known addresses (when a

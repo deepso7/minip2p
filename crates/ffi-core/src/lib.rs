@@ -43,7 +43,9 @@ pub use config::{
 pub use connect::{ConnectTarget, parse_connect_target};
 #[cfg(feature = "driver")]
 pub use endpoint::{DEFAULT_STOP_TIMEOUT_MS, P2pEndpoint};
-pub use error::{ConfigCapability, FfiError, map_driver_error};
+pub use error::{
+    ConfigCapability, FfiError, map_driver_error, map_gossipsub_error, map_topic_error,
+};
 pub use events::{
     CloseOutcome, ConnectionCloseReason, ConnectionInfo, DiscoverySource, DriverFailureKind,
     EndpointErrorKind, EventDoorbell, IdentifyInfo, MdnsFailureKind, NatErrorKind,
@@ -106,7 +108,9 @@ fn parse_direct_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
     Ok(peer_addr)
 }
 
-fn keypair_from_bytes(secret_key: Vec<u8>) -> Result<Ed25519Keypair, FfiError> {
+/// Builds the Ed25519 identity from raw secret key material supplied by a
+/// binding, which must be exactly 32 bytes.
+pub fn keypair_from_bytes(secret_key: Vec<u8>) -> Result<Ed25519Keypair, FfiError> {
     let secret_key: [u8; SECRET_KEY_LENGTH] =
         secret_key
             .try_into()

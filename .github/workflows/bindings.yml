@@ -26,13 +26,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: stable
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install wasm-bindgen
+        # Must match crates/web's pinned wasm-bindgen.
+        run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:workflows
       - run: pnpm typecheck
       - run: pnpm --filter @minip2p/node native:build
+      # Builds the web wasm (its pretest) before its tests.
       - run: pnpm test
       - run: pnpm lint
       - run: pnpm build:bindings
@@ -40,3 +45,9 @@ jobs:
       - run: pnpm rn:generate
       - name: Generated files are current
         run: test -z "$(git status --porcelain)"
+      # Chromium and Firefox both pass headless with serverCertificateHashes,
+      # so both are required.
+      - name: Install Playwright browsers
+        run: pnpm --filter @minip2p/web exec playwright install --with-deps chromium firefox
+      - name: Browser e2e
+        run: pnpm --filter @minip2p/web test:e2e

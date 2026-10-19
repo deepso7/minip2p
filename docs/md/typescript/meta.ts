@@ -7,6 +7,7 @@ export default defineMeta({
     "start",
     "setup-node",
     "setup-react-native",
+    "setup-web",
     "lifecycle",
     "connections-and-streams",
     "networking-and-events",

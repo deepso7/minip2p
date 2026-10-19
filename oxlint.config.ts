@@ -21,5 +21,8 @@ export default defineConfig({
     "bindings/ts/react-native/src/NativeMinip2p.ts",
     "bindings/ts/react-native/src/native.tsx",
     "bindings/ts/node/src/addon.d.ts",
+    "bindings/ts/web/wasm",
+    "bindings/ts/web/test-results",
+    "bindings/ts/web/playwright-report",
   ],
 });

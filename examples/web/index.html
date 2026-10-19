@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>minip2p in the browser</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 2rem auto;
+        max-width: 48rem;
+        padding: 0 1rem;
+      }
+      input {
+        box-sizing: border-box;
+        font-family: ui-monospace, monospace;
+        width: 100%;
+      }
+      pre {
+        background: #f4f4f5;
+        padding: 1rem;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>minip2p in the browser</h1>
+    <p>
+      Paste the <code>bound=</code> address a native peer printed (see the
+      README), then connect.
+    </p>
+    <form id="connect">
+      <input
+        id="address"
+        placeholder="/ip4/127.0.0.1/udp/4001/quic-v1/webtransport/certhash/…/p2p/12D3KooW…"
+        required
+      />
+      <p><button type="submit">Connect, ping and echo</button></p>
+    </form>
+    <pre id="log"></pre>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

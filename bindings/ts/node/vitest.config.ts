@@ -12,6 +12,12 @@ export default defineConfig({
         ),
       },
       {
+        find: "@minip2p/core/serde-backend",
+        replacement: fileURLToPath(
+          new URL("../core/src/serde-backend.ts", import.meta.url)
+        ),
+      },
+      {
         find: "@minip2p/core",
         replacement: fileURLToPath(
           new URL("../core/src/index.ts", import.meta.url)

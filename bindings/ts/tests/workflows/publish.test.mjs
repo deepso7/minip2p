@@ -78,6 +78,25 @@ test("a failed tagged release can be resumed without moving its tag", () => {
   assert.match(checkout.with.ref, /inputs\.release_tag/u);
 });
 
+test("the web SDK's wasm is built, packed, verified, smoke-tested and published", () => {
+  const { steps } = workflow.jobs["package-typescript"];
+  assert.ok(
+    steps.some(({ run }) => run === "pnpm --filter @minip2p/web wasm:build")
+  );
+  const step = (name) => steps.find((candidate) => candidate.name === name);
+  assert.match(step("Pack public packages").run, /@minip2p\/web pack/u);
+  for (const name of [
+    "Verify packed contents and dependency versions",
+    "Smoke-test installation from tarballs",
+  ]) {
+    assert.match(step(name).run, /minip2p-web-\$RELEASE_VERSION\.tgz/u);
+  }
+  const publish = workflow.jobs["publish-typescript"].steps.find(
+    ({ name }) => name === "Publish public TypeScript packages"
+  );
+  assert.match(publish.run, /"@minip2p\/web"/u);
+});
+
 test("Node platform packages carry npm provenance repository metadata", async () => {
   await Promise.all(
     nodePlatforms.map(async (platform) => {

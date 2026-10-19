@@ -9,15 +9,14 @@ use std::time::{Duration, Instant};
 
 use minip2p::{
     BeaconConfig, BindError, ConnectionId, DiscoveryConfigError, Endpoint, EndpointBuilder,
-    EndpointOptionsError, GossipsubConfig, GossipsubError, MdnsConfig, MdnsConfigError, Multiaddr,
-    NatConfig, PeerDiscoveryConfig, PeerId, PublishError, QuicBindError, StreamId, TopicError,
-    TransportError, WaitHandle,
+    EndpointOptionsError, GossipsubConfig, MdnsConfig, MdnsConfigError, Multiaddr, NatConfig,
+    PeerDiscoveryConfig, PeerId, QuicBindError, StreamId, TransportError, WaitHandle,
 };
 
 use crate::{
     ConfigCapability, DriverStats, EndpointConfig, EventCarry, EventDoorbell, FfiError,
     IdentifyInfo, KnownPeerInfo, P2pEvent, RelayReservationInfo, keypair_from_bytes,
-    map_driver_error, parse_direct_peer_addr, parse_peer_id,
+    map_driver_error, map_gossipsub_error, parse_direct_peer_addr, parse_peer_id,
 };
 
 /// Adds address-shaped listeners, or the QUIC dual-stack defaults when
@@ -1097,29 +1096,6 @@ fn map_options_error(error: EndpointOptionsError) -> FfiError {
             capability: ConfigCapability::Options,
             detail,
         },
-    }
-}
-
-fn map_gossipsub_error(error: GossipsubError) -> FfiError {
-    match error {
-        GossipsubError::DiscoveryTopicReserved => FfiError::NotPermitted {
-            detail: error.to_string(),
-        },
-        GossipsubError::Publish(PublishError::TooLarge) => FfiError::MessageTooLarge,
-        GossipsubError::Publish(PublishError::Backpressure) => FfiError::Backpressure,
-        GossipsubError::Publish(PublishError::Topic(error)) | GossipsubError::Topic(error) => {
-            map_topic_error(error)
-        }
-        GossipsubError::Driver(error) => map_driver_error(error),
-        GossipsubError::NotEnabled => FfiError::Internal {
-            detail: error.to_string(),
-        },
-    }
-}
-
-fn map_topic_error(error: TopicError) -> FfiError {
-    FfiError::InvalidTopic {
-        detail: error.to_string(),
     }
 }
 
@@ -2411,11 +2387,15 @@ mod tests {
         ));
 
         assert!(matches!(
-            map_gossipsub_error(GossipsubError::Publish(PublishError::TooLarge)),
+            map_gossipsub_error(minip2p::GossipsubError::Publish(
+                minip2p::PublishError::TooLarge
+            )),
             FfiError::MessageTooLarge
         ));
         assert!(matches!(
-            map_gossipsub_error(GossipsubError::Publish(PublishError::Backpressure)),
+            map_gossipsub_error(minip2p::GossipsubError::Publish(
+                minip2p::PublishError::Backpressure
+            )),
             FfiError::Backpressure
         ));
         assert!(matches!(

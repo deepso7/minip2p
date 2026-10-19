@@ -1,236 +1,32 @@
-/* oxlint-disable class-methods-use-this, max-classes-per-file, promise/avoid-new -- The fake implements the native endpoint boundary used by the adapter, including one deferred drain observation. */
+/* oxlint-disable promise/avoid-new -- One test defers a drain observation. */
 
 import { InvalidConfigError, StreamClosedError } from "@minip2p/core";
 import { describeAdapterContract } from "@minip2p/test-fixtures/adapter-contract";
-import type { NativeEventLiteral } from "@minip2p/test-fixtures/adapter-contract";
+import {
+  FakeSerdeEndpoint,
+  latestFakeSerdeEndpoint,
+  serdeContractNative,
+} from "@minip2p/test-fixtures/fake-serde-endpoint";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { Minip2p } from "../src/adapter.js";
-import type { NativeEndpoint } from "../src/native.js";
 
-const native = vi.hoisted(() => {
-  interface Event {
-    readonly inner?: Readonly<Record<string, unknown>>;
-    readonly tag?: string;
-  }
-
-  class FakeNativeEndpoint implements NativeEndpoint {
-    static latest: FakeNativeEndpoint | undefined;
-    /** Error the next constructor call throws, as native validation would. */
-    static constructError: Error | undefined;
-
-    readonly config: Readonly<Record<string, unknown>>;
-    readonly abandonedStreams: {
-      connId: bigint;
-      streamId: bigint;
-    }[] = [];
-    readonly writes: { connId: bigint; streamId: bigint }[] = [];
-    /** Bytes `sendStream` received, in call order. */
-    readonly writtenData: Uint8Array[] = [];
-    readonly consumed: { bytes: number; connId: bigint; streamId: bigint }[] =
-      [];
-    liveConnId: bigint | undefined;
-    readonly cancelledConnects: bigint[] = [];
-    readonly connectTargets: (string | string[])[] = [];
-    connection: {
-      connId: bigint;
-      remoteAddr?: string;
-      readyProtocols?: string[];
-    } | null = null;
-    nextStream = { connId: 10n, streamId: 20n };
-    readonly drainLimits: number[] = [];
-    readonly #batches: Event[][] = [];
-    #doorbell: (() => void) | undefined;
-    #drainCalls = 0;
-    discoveryClock: bigint | null = null;
-    abandonError: Error | undefined;
-    onDrain: ((call: number) => void) | undefined;
-    nextConnectId = 30n;
-
-    constructor(
-      _secretKey: Uint8Array,
-      config: Readonly<Record<string, unknown>>
-    ) {
-      const error = FakeNativeEndpoint.constructError;
-      if (error !== undefined) {
-        FakeNativeEndpoint.constructError = undefined;
-        throw error;
-      }
-      this.config = config;
-      FakeNativeEndpoint.latest = this;
-    }
-
-    enqueue(...batches: Event[][]): void {
-      this.#batches.push(...batches);
-    }
-
-    ring(): void {
-      this.#doorbell?.();
-    }
-
-    start(doorbell: () => void): void {
-      this.#doorbell = doorbell;
-    }
-
-    drainEvents(limit: number): Event[] {
-      this.drainLimits.push(limit);
-      this.#drainCalls += 1;
-      this.onDrain?.(this.#drainCalls);
-      return this.#batches.shift() ?? [];
-    }
-
-    /** `close` timeouts, in call order. */
-    readonly closeTimeouts: number[] = [];
-    /** What the `EndpointClosed` a started endpoint's `close` queues reports. */
-    closeReport: {
-      outcome: string;
-      unfinished: { connId: bigint; peerId?: string }[];
-    } = { outcome: "Drained", unfinished: [] };
-
-    /** Queues `closeReport` as the driver's last event, as native does. */
-    close(timeoutMs: number): void {
-      this.closeTimeouts.push(timeoutMs);
-      if (this.#doorbell !== undefined && this.closeTimeouts.length === 1) {
-        this.enqueue([{ inner: this.closeReport, tag: "EndpointClosed" }]);
-        this.ring();
-      }
-    }
-
-    discoveryNowMs(): bigint | null {
-      return this.discoveryClock;
-    }
-
-    activeReservation(): null {
-      return null;
-    }
-
-    addProtocol(): void {}
-
-    abandonStream(connId: bigint, streamId: bigint): void {
-      this.abandonedStreams.push({ connId, streamId });
-      if (this.abandonError !== undefined) {
-        throw this.abandonError;
-      }
-    }
-
-    cancelConnect(connectId: bigint): void {
-      this.cancelledConnects.push(connectId);
-    }
-
-    circuitAddress(): string {
-      return "";
-    }
-
-    closeStreamWrite(): void {}
-
-    connect(target: string | string[]): bigint {
-      this.connectTargets.push(target);
-      const id = this.nextConnectId;
-      this.nextConnectId += 1n;
-      return id;
-    }
-
-    connectedPeers(): string[] {
-      return [];
-    }
-
-    connectionInfo(): typeof this.connection {
-      return this.connection;
-    }
-
-    disconnect(): void {}
-
-    isPeerReady(): boolean {
-      return false;
-    }
-
-    isRunning(): boolean {
-      return true;
-    }
-
-    knownPeers(): unknown[] {
-      return [];
-    }
-
-    listenAddrs(): string[] {
-      return [];
-    }
-
-    openStream(): { readonly connId: bigint; readonly streamId: bigint } {
-      return this.nextStream;
-    }
-
-    path(): null {
-      return null;
-    }
-
-    peerId(): string {
-      return "local";
-    }
-
-    identify: Readonly<Record<string, unknown>> | null = null;
-
-    peerInfo(): typeof this.identify {
-      return this.identify;
-    }
-
-    ping(): void {}
-
-    publish(): void {}
-
-    reachability(): string {
-      return "Private";
-    }
-
-    resetStream(): void {}
-
-    streamConsumed(connId: bigint, streamId: bigint, bytes: number): void {
-      this.consumed.push({ bytes, connId, streamId });
-    }
-
-    sendStream(connId: bigint, streamId: bigint, data: Uint8Array): boolean {
-      if (this.liveConnId !== undefined && connId !== this.liveConnId) {
-        throw new Error(
-          `stream ${streamId} on connection ${connId} is not active`
-        );
-      }
-      this.writes.push({ connId, streamId });
-      this.writtenData.push(data);
-      return true;
-    }
-
-    setActive(): void {}
-
-    subscribe(): boolean {
-      return true;
-    }
-
-    unsubscribe(): boolean {
-      return true;
-    }
-  }
-
-  return { FakeNativeEndpoint };
+vi.mock("../src/native", async () => {
+  const { FakeSerdeEndpoint: NodeEndpoint } =
+    await import("@minip2p/test-fixtures/fake-serde-endpoint");
+  return {
+    nativeBinding: {
+      NodeEndpoint,
+      circuitAddress: vi.fn(),
+      generateSecretKey: vi.fn(() => new Uint8Array(32)),
+      peerIdFromSecretKey: vi.fn(),
+    },
+  };
 });
-
-vi.mock("../src/native", () => ({
-  nativeBinding: {
-    NodeEndpoint: native.FakeNativeEndpoint,
-    circuitAddress: vi.fn(),
-    generateSecretKey: vi.fn(() => new Uint8Array(32)),
-    peerIdFromSecretKey: vi.fn(),
-  },
-}));
 
 const createEndpoint = () => Minip2p.create({ secretKey: new Uint8Array(32) });
 
-const fakeEndpoint = (): InstanceType<typeof native.FakeNativeEndpoint> => {
-  const fake = native.FakeNativeEndpoint.latest;
-  if (fake === undefined) {
-    throw new Error("native endpoint was not constructed");
-  }
-  return fake;
-};
+const fakeEndpoint = latestFakeSerdeEndpoint;
 
 /** A native `InvalidConfig` error as the addon throws it. */
 const nativeConfigError = (capability: string): Error =>
@@ -268,8 +64,8 @@ const localStreamReady = (connId: bigint) => ({
 describe("Node adapter", () => {
   afterEach(() => {
     vi.useRealTimers();
-    native.FakeNativeEndpoint.latest = undefined;
-    native.FakeNativeEndpoint.constructError = undefined;
+    FakeSerdeEndpoint.latest = undefined;
+    FakeSerdeEndpoint.constructError = undefined;
   });
 
   test("continues draining after a malformed native event", async () => {
@@ -502,7 +298,7 @@ describe("Node adapter", () => {
   });
 
   test("a native config rejection names its capability", () => {
-    native.FakeNativeEndpoint.constructError = nativeConfigError("Mdns");
+    FakeSerdeEndpoint.constructError = nativeConfigError("Mdns");
 
     const error = createFailure();
 
@@ -515,7 +311,7 @@ describe("Node adapter", () => {
 
   test("a config rejection with an unknown capability is rethrown unchanged", () => {
     const nativeError = nativeConfigError("Future");
-    native.FakeNativeEndpoint.constructError = nativeError;
+    FakeSerdeEndpoint.constructError = nativeError;
 
     expect(createFailure()).toBe(nativeError);
   });
@@ -754,49 +550,5 @@ describe("Node adapter", () => {
 describeAdapterContract("Node", {
   create: (config = {}) =>
     Minip2p.create({ ...config, secretKey: new Uint8Array(32) }),
-  native: () => {
-    const fake = fakeEndpoint();
-    return {
-      abandoned: fake.abandonedStreams,
-      cancelledConnects: fake.cancelledConnects,
-      closeTimeouts: fake.closeTimeouts,
-      config: fake.config,
-      connectTargets: fake.connectTargets.map((target) =>
-        typeof target === "string"
-          ? { kind: "peer" as const, peerId: target }
-          : { addresses: target, kind: "addresses" as const }
-      ),
-      consumed: fake.consumed,
-      deliver: (events: readonly NativeEventLiteral[]) => {
-        // The addon hands bytes over as `Uint8Array`s, not `ArrayBuffer`s.
-        fake.enqueue(
-          events.map(({ inner, tag }) => ({
-            inner: Object.fromEntries(
-              Object.entries(inner).map(([key, value]) => [
-                key,
-                value instanceof ArrayBuffer ? new Uint8Array(value) : value,
-              ])
-            ),
-            tag,
-          })),
-          []
-        );
-        fake.ring();
-      },
-      setCloseUnfinished: (unfinished) => {
-        fake.closeReport.unfinished = [...unfinished];
-      },
-      setConnectionInfo: (info) => {
-        fake.connection = info;
-      },
-      setLiveConnection: (connId) => {
-        fake.liveConnId = connId;
-      },
-      setNextStream: (connId, streamId) => {
-        fake.nextStream = { connId, streamId };
-      },
-      writes: fake.writes,
-      writtenData: fake.writtenData,
-    };
-  },
+  native: () => serdeContractNative(fakeEndpoint()),
 });

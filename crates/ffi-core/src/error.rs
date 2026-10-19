@@ -76,6 +76,54 @@ pub enum FfiError {
     },
 }
 
+impl FfiError {
+    /// The variant name: the stable `code` a JavaScript shell tags its
+    /// thrown error with, which the TypeScript SDK maps to typed errors.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::AlreadyStarted => "AlreadyStarted",
+            Self::Stopped => "Stopped",
+            Self::InvalidConfig { .. } => "InvalidConfig",
+            Self::InvalidKey { .. } => "InvalidKey",
+            Self::InvalidPeerId { .. } => "InvalidPeerId",
+            Self::InvalidAddress { .. } => "InvalidAddress",
+            Self::InvalidTopic { .. } => "InvalidTopic",
+            Self::NotPermitted { .. } => "NotPermitted",
+            Self::Backpressure => "Backpressure",
+            Self::MessageTooLarge => "MessageTooLarge",
+            Self::Transport { .. } => "Transport",
+            Self::InvalidState { .. } => "InvalidState",
+            Self::Internal { .. } => "Internal",
+        }
+    }
+
+    /// The variant's detail field, when it has one.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::AlreadyStarted | Self::Stopped | Self::Backpressure | Self::MessageTooLarge => {
+                None
+            }
+            Self::InvalidConfig { detail, .. }
+            | Self::InvalidKey { detail }
+            | Self::InvalidPeerId { detail }
+            | Self::InvalidAddress { detail }
+            | Self::InvalidTopic { detail }
+            | Self::NotPermitted { detail }
+            | Self::Transport { detail }
+            | Self::InvalidState { detail }
+            | Self::Internal { detail } => Some(detail),
+        }
+    }
+
+    /// The capability an [`FfiError::InvalidConfig`] names.
+    pub const fn capability(&self) -> Option<ConfigCapability> {
+        match self {
+            Self::InvalidConfig { capability, .. } => Some(*capability),
+            _ => None,
+        }
+    }
+}
+
 /// The part of an endpoint's configuration an [`FfiError::InvalidConfig`]
 /// names.
 ///
@@ -127,5 +175,35 @@ pub fn map_driver_error(error: minip2p::DriverError) -> FfiError {
         _ => FfiError::Internal {
             detail: error.to_string(),
         },
+    }
+}
+
+/// Maps a Gossipsub refusal: reserved topics to [`FfiError::NotPermitted`],
+/// publish limits to their own variants, topic mistakes to
+/// [`FfiError::InvalidTopic`].
+pub fn map_gossipsub_error(error: minip2p::GossipsubError) -> FfiError {
+    match error {
+        minip2p::GossipsubError::DiscoveryTopicReserved => FfiError::NotPermitted {
+            detail: error.to_string(),
+        },
+        minip2p::GossipsubError::Publish(minip2p::PublishError::TooLarge) => {
+            FfiError::MessageTooLarge
+        }
+        minip2p::GossipsubError::Publish(minip2p::PublishError::Backpressure) => {
+            FfiError::Backpressure
+        }
+        minip2p::GossipsubError::Publish(minip2p::PublishError::Topic(error))
+        | minip2p::GossipsubError::Topic(error) => map_topic_error(error),
+        minip2p::GossipsubError::Driver(error) => map_driver_error(error),
+        minip2p::GossipsubError::NotEnabled => FfiError::Internal {
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// Maps an invalid pubsub topic.
+pub fn map_topic_error(error: minip2p::TopicError) -> FfiError {
+    FfiError::InvalidTopic {
+        detail: error.to_string(),
     }
 }

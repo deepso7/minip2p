@@ -217,7 +217,11 @@ impl Flags {
                     if options.listen_addr.is_some() {
                         return Err(CliError("--listen specified twice".into()));
                     }
-                    let addr = parse_transport_multiaddr("--listen", value)?;
+                    // A listener may also serve browsers over WebTransport.
+                    let addr = match Multiaddr::from_str(value) {
+                        Ok(addr) if addr.is_webtransport() => addr,
+                        _ => parse_transport_multiaddr("--listen", value)?,
+                    };
                     if !matches!(
                         addr.protocols().first(),
                         Some(Protocol::Ip4(_) | Protocol::Ip6(_))
