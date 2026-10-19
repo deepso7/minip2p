@@ -395,7 +395,8 @@ mod tests {
         signed.extend_from_slice(&remote_static);
         let mut signature = remote_identity.sign(&signed);
         signature[0] ^= 1;
-        let payload = NoiseHandshakePayload::new(remote_identity.public_key(), signature, None).encode();
+        let payload =
+            NoiseHandshakePayload::new(remote_identity.public_key(), signature, None).encode();
         let state = HandshakeState::new(
             NoiseRole::Initiator,
             Ed25519Keypair::from_secret_key_bytes([1; 32]),
