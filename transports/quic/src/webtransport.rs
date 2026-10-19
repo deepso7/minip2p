@@ -46,13 +46,13 @@ use minip2p_webtransport::h3::{
 use minip2p_webtransport::qpack::{FieldSection, QpackDecoder, encode_field_section};
 use quinn_proto::{Connection, Dir, ReadError, StreamId, VarInt};
 
-/// Prefixed streams held before the session is authenticated; one more
-/// fails the connection.
+/// Prefixed streams held before the session is authenticated, the Noise
+/// stream among them until Noise completes; one more fails the connection.
 const MAX_EARLY_STREAMS: usize = 4;
 
 /// Bytes read before the session is authenticated, from request heads (up
-/// to their HEADERS or prefix) and held streams; one more fails the
-/// connection.
+/// to their HEADERS or prefix), held streams and the Noise stream; one more
+/// fails the connection.
 const MAX_EARLY_BYTES: usize = 16 * 1024;
 
 /// What every WebTransport connection of one transport shares.
@@ -805,7 +805,8 @@ impl WtSession {
             data: Vec::new(),
             end: ReadEnd::Open,
         });
-        if self.held.len() > MAX_EARLY_STREAMS {
+        // The Noise stream counts until Noise completes.
+        if self.held.len() + usize::from(self.noise.is_some()) > MAX_EARLY_STREAMS {
             self.fail(
                 code::H3_EXCESSIVE_LOAD,
                 "too many WebTransport streams before the session was authenticated".into(),
@@ -911,6 +912,7 @@ impl WtSession {
             return;
         };
         let (bytes, end) = read_available(conn, noise.id);
+        self.count_early(bytes.len());
         self.feed_noise(conn, bytes, end);
     }
 
@@ -930,7 +932,7 @@ impl WtSession {
             && let Err(error) = session.on_data(bytes)
         {
             self.fail(
-                code::H3_NO_ERROR,
+                code::H3_GENERAL_PROTOCOL_ERROR,
                 format!("Noise handshake failed: {error}"),
             );
             return;
@@ -957,7 +959,7 @@ impl WtSession {
             self.promote_held(conn);
         } else if !matches!(end, ReadEnd::Open) {
             self.fail(
-                code::H3_NO_ERROR,
+                code::H3_GENERAL_PROTOCOL_ERROR,
                 "the client ended the Noise stream mid-handshake".into(),
             );
         }

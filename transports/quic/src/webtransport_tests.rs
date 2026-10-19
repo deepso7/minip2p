@@ -199,21 +199,7 @@ impl H3Peer {
         events: &mut Vec<TransportEvent>,
         early: impl FnOnce(&mut Self),
     ) {
-        let mut entropy = StdEntropy::new();
-        let mut secrets = [[0u8; 32]; 2];
-        for secret in &mut secrets {
-            entropy.fill_bytes(secret).expect("entropy");
-        }
-        let [static_secret, ephemeral_secret] = secrets;
-        let mut noise = NoiseSession::new(NoiseConfig {
-            role: NoiseRole::Initiator,
-            identity: Ed25519Keypair::generate(),
-            static_secret,
-            ephemeral_secret,
-            expected_peer: None,
-            local_extensions: None,
-        });
-        noise.start().expect("noise start");
+        let mut noise = initiator();
         let first = outbound(&mut noise).0;
         let stream = self.wt_stream(&first);
         early(self);
@@ -255,6 +241,26 @@ impl H3Peer {
             })
             .unwrap_or_else(|| panic!("no application close: {:?}", self.raw.events))
     }
+}
+
+/// A started Noise initiator with a fresh identity.
+fn initiator() -> NoiseSession {
+    let mut entropy = StdEntropy::new();
+    let mut secrets = [[0u8; 32]; 2];
+    for secret in &mut secrets {
+        entropy.fill_bytes(secret).expect("entropy");
+    }
+    let [static_secret, ephemeral_secret] = secrets;
+    let mut noise = NoiseSession::new(NoiseConfig {
+        role: NoiseRole::Initiator,
+        identity: Ed25519Keypair::generate(),
+        static_secret,
+        ephemeral_secret,
+        expected_peer: None,
+        local_extensions: None,
+    });
+    noise.start().expect("noise start");
+    noise
 }
 
 /// Everything Noise wants to send, and whether the handshake completed.
@@ -940,6 +946,19 @@ fn pre_auth_caps_close_with_their_codes() {
             code::H3_EXCESSIVE_LOAD,
         ),
         (
+            "the Noise stream and four more before authentication",
+            |peer| {
+                peer.control(DRAFT02);
+                peer.libp2p_connect();
+                // The first runs Noise once the session is accepted, and
+                // counts as early until Noise completes.
+                for _ in 0..5 {
+                    peer.wt_stream(&[]);
+                }
+            },
+            code::H3_EXCESSIVE_LOAD,
+        ),
+        (
             "over 16 KiB on streams before the session",
             |peer| {
                 peer.control(DRAFT02);
@@ -995,4 +1014,54 @@ fn an_unknown_uni_stream_is_stopped_and_the_session_goes_on() {
     peer.control(DRAFT02);
     peer.libp2p_connect();
     peer.authenticate(&mut server, &mut events);
+}
+
+#[test]
+fn noise_stream_bytes_count_toward_the_pre_auth_byte_cap() {
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(DRAFT02);
+    peer.libp2p_connect();
+    peer.drive(&mut server, &mut events, "the 200", |peer, _| {
+        peer.status().is_some()
+    });
+    // One Noise frame that declares its maximum length and never ends,
+    // sent once the session runs Noise on it.
+    let mut frame = vec![0xff, 0xff];
+    frame.resize(2 + 17 * 1024, 0);
+    let noise = peer.wt_stream(&[]);
+    peer.drive(&mut server, &mut events, "the Noise stream", |_, _| true);
+    assert_eq!(peer.raw.write(noise, &frame), frame.len());
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
+    assert_eq!(code, code::H3_EXCESSIVE_LOAD, "{reason}");
+    assert_ne!(close_reason(&events), Some(&ConnectionCloseReason::TimedOut));
+}
+
+#[test]
+fn a_failed_noise_handshake_closes_with_an_error_code() {
+    type Script = fn(&mut H3Peer);
+    let rows: &[(&str, Script)] = &[
+        ("a malformed first message", |peer| {
+            peer.control(DRAFT02);
+            peer.libp2p_connect();
+            // A one-byte Noise message where 32 are due.
+            peer.wt_stream(&[0x00, 0x01, 0xff]);
+        }),
+        ("the Noise stream finished mid-handshake", |peer| {
+            peer.control(DRAFT02);
+            peer.libp2p_connect();
+            let first = outbound(&mut initiator()).0;
+            let stream = peer.wt_stream(&first);
+            peer.raw.finish(stream);
+        }),
+    ];
+    for &(row, script) in rows {
+        let (code, reason) = close_after(script);
+        assert_eq!(
+            code,
+            code::H3_GENERAL_PROTOCOL_ERROR,
+            "{row}: closed with {code:#x} ({reason})"
+        );
+    }
 }
