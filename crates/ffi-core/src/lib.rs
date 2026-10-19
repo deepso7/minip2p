@@ -46,6 +46,8 @@ pub use endpoint::{DEFAULT_STOP_TIMEOUT_MS, P2pEndpoint};
 pub use error::{
     ConfigCapability, FfiError, map_driver_error, map_gossipsub_error, map_topic_error,
 };
+#[cfg(any(feature = "driver", feature = "relay"))]
+pub use events::convert_reachability;
 pub use events::{
     CloseOutcome, ConnectionCloseReason, ConnectionInfo, DiscoverySource, DriverFailureKind,
     EndpointErrorKind, EventDoorbell, IdentifyInfo, MdnsFailureKind, NatErrorKind,
@@ -95,7 +97,9 @@ pub fn parse_peer_id(peer_id: &str) -> Result<PeerId, FfiError> {
     })
 }
 
-fn parse_direct_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
+/// Parses a relay or AutoNAT server address supplied by a binding: a
+/// complete direct peer address with a concrete host.
+pub fn parse_direct_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
     let peer_addr = PeerAddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
         detail: error.to_string(),
     })?;

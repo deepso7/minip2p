@@ -63,20 +63,23 @@ From here, [connections and streams](/typescript/connections-and-streams) work a
 
 Serve the page from a secure context, HTTPS or `localhost`: WebTransport is unavailable otherwise. A page on a public origin that dials a private address may trigger Chrome's Local Network Access prompt; production nodes are dialed on public addresses.
 
+## Relays
+
+With `relays` (WebTransport addresses with certhashes) the browser holds a reservation on the relay and is reachable at its `/p2p-circuit` address (`node.circuitAddress`), from other browsers and from native nodes. Connecting by peer ID goes through the relay; connecting to a native peer's WebTransport address races the direct dial against the relay leg, so the path is `direct` or `relayed`, never `punched`: browsers never hole punch. `forceRelay: true` skips the direct dial. `activeReservation()` reports the reservation.
+
 ## Browser limits
 
 `Minip2p.create` throws `InvalidConfigError`, with the reason, for what a browser cannot do:
 
-| Option | Why |
-| --- | --- |
-| `listen` | Browsers cannot listen. |
-| `mdns` | Browsers have no multicast sockets. |
-| `discovery` | Signed discovery is not in the browser build. |
-| `autonatServers` | Browsers cannot be dialed back. |
-| `relays`, `forceRelay` | Relay reservations for browsers land in a later release. |
+| Option           | Why                                           |
+| ---------------- | --------------------------------------------- |
+| `listen`         | Browsers cannot listen.                       |
+| `mdns`           | Browsers have no multicast sockets.           |
+| `discovery`      | Signed discovery is not in the browser build. |
+| `autonatServers` | Browsers cannot be dialed back.               |
 
 - Only `/webtransport/certhash` addresses dial. A `/quic-v1` or `/tcp` candidate fails as a candidate, and there is no CA-certificate mode yet.
-- `listenAddrs()` is empty; `knownPeers()`, `reachability()` and `activeReservation()` report no discovery, AutoNAT or relay state.
+- `listenAddrs()` is empty (a reservation is `circuitAddress`); `knownPeers()` is empty and `reachability()` stays `unknown`.
 - `close()` closes every session at once with WebTransport's close capsule, so its timeout bounds nothing.
 - If the wasm module traps (a Rust panic), the endpoint reports `driverFailed` and later calls throw `ClosedError`. Create a new endpoint to carry on.
 
