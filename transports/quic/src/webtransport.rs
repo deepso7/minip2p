@@ -26,8 +26,8 @@
 //! sends `CLOSE_WEBTRANSPORT_SESSION` and finishes the CONNECT stream, and a
 //! peer's capsule, CONNECT FIN or reset, or GOAWAY reports
 //! [`WtEvent::PeerClosed`]. The connection then waits for
-//! [`WtSession::peer_ended`] (or a deadline) before closing QUIC, so the
-//! capsule or a refusal's status reaches the peer.
+//! [`WtSession::ended_and_delivered`] (or a deadline) before closing QUIC,
+//! so the capsule or a refusal's status, and our FIN, reach the peer.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -46,13 +46,13 @@ use minip2p_webtransport::h3::{
 use minip2p_webtransport::qpack::{FieldSection, QpackDecoder, encode_field_section};
 use quinn_proto::{Connection, Dir, ReadError, StreamId, VarInt};
 
-/// Prefixed streams held before the session is authenticated; one more
-/// fails the connection.
+/// Prefixed streams held before the session is authenticated, the Noise
+/// stream among them until Noise completes; one more fails the connection.
 const MAX_EARLY_STREAMS: usize = 4;
 
 /// Bytes read before the session is authenticated, from request heads (up
-/// to their HEADERS or prefix) and held streams; one more fails the
-/// connection.
+/// to their HEADERS or prefix), held streams and the Noise stream; one more
+/// fails the connection.
 const MAX_EARLY_BYTES: usize = 16 * 1024;
 
 /// What every WebTransport connection of one transport shares.
@@ -113,6 +113,9 @@ struct Connect {
     finished: bool,
     /// The peer finished or reset its side.
     peer_ended: bool,
+    /// The peer acknowledged our FIN, or stopped our side: nothing we
+    /// sent on it is still in flight.
+    delivered: bool,
 }
 
 /// The client's session flow-control credit for what we send (draft-13/14,
@@ -309,12 +312,23 @@ impl WtSession {
         }
     }
 
-    /// Whether the peer is done with the session: it finished or reset its
-    /// side of the CONNECT stream, or never opened one.
-    pub(crate) fn peer_ended(&self) -> bool {
+    /// Whether QUIC may close without discarding the session's end: the peer
+    /// finished or reset its side of the CONNECT stream (or never opened
+    /// one) and acknowledged our FIN on the
+    /// CONNECT stream, or stopped it. Packets the connection queued before
+    /// that FIN (its resets) went out with or ahead of it.
+    pub(crate) fn ended_and_delivered(&self) -> bool {
         self.connect
             .as_ref()
-            .is_none_or(|connect| connect.peer_ended)
+            .is_none_or(|connect| connect.peer_ended && connect.delivered)
+    }
+
+    /// The engine is done sending on `raw`: everything was acknowledged, or
+    /// the peer stopped it.
+    pub(crate) fn on_send_done(&mut self, raw: u64) {
+        if let Some(connect) = self.connect.as_mut().filter(|connect| connect.id == raw) {
+            connect.delivered = true;
+        }
     }
 
     /// What the connection must act on since the last call.
@@ -662,6 +676,7 @@ impl WtSession {
             replied: false,
             finished: false,
             peer_ended: false,
+            delivered: false,
         });
         self.reply(conn);
         self.read_connect(conn);
@@ -790,7 +805,8 @@ impl WtSession {
             data: Vec::new(),
             end: ReadEnd::Open,
         });
-        if self.held.len() > MAX_EARLY_STREAMS {
+        // The Noise stream counts until Noise completes.
+        if self.held.len() + usize::from(self.noise.is_some()) > MAX_EARLY_STREAMS {
             self.fail(
                 code::H3_EXCESSIVE_LOAD,
                 "too many WebTransport streams before the session was authenticated".into(),
@@ -896,6 +912,7 @@ impl WtSession {
             return;
         };
         let (bytes, end) = read_available(conn, noise.id);
+        self.count_early(bytes.len());
         self.feed_noise(conn, bytes, end);
     }
 
@@ -915,7 +932,7 @@ impl WtSession {
             && let Err(error) = session.on_data(bytes)
         {
             self.fail(
-                code::H3_NO_ERROR,
+                code::H3_GENERAL_PROTOCOL_ERROR,
                 format!("Noise handshake failed: {error}"),
             );
             return;
@@ -942,7 +959,7 @@ impl WtSession {
             self.promote_held(conn);
         } else if !matches!(end, ReadEnd::Open) {
             self.fail(
-                code::H3_NO_ERROR,
+                code::H3_GENERAL_PROTOCOL_ERROR,
                 "the client ended the Noise stream mid-handshake".into(),
             );
         }

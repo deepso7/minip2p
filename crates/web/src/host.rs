@@ -11,15 +11,15 @@
 //! and is tested natively.
 
 use minip2p::{
-    CircuitTransport, ConnectId, ConnectionId, Deadline, DriverError, Ed25519Keypair,
-    EndpointEvent, GossipsubConfig, NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint,
+    CircuitTransport, ConnectId, ConnectionId, Deadline, Ed25519Keypair, EndpointEvent,
+    GossipsubConfig, NatConfig, Now, PeerId, PortableBuildError, PortableEndpoint,
     PortableEndpointBuilder, ReservationPolicy, StreamId, Transport, WriteProgress,
 };
 use minip2p_ffi_core::{
-    CloseOutcome, ConfigCapability, ConnectTarget, ConnectionInfo, DriverFailureKind,
-    EndpointConfig, EventCarry, FfiError, IdentifyInfo, KnownPeerInfo, OpenStreamResult, P2pEvent,
-    PUMP_DRAIN_LIMIT, PathKind, Reachability, RelayReservationInfo, convert_endpoint_event,
-    convert_identify, convert_path, convert_reachability, keypair_from_bytes, map_driver_error,
+    CloseOutcome, ConfigCapability, ConnectTarget, ConnectionInfo, EndpointConfig, EventCarry,
+    FfiError, IdentifyInfo, KnownPeerInfo, OpenStreamResult, P2pEvent, PUMP_DRAIN_LIMIT, PathKind,
+    Reachability, RelayReservationInfo, convert_endpoint_event, convert_identify, convert_path,
+    convert_reachability, driver_failure_kind, keypair_from_bytes, map_driver_error,
     map_gossipsub_error, map_write_error, parse_connect_target, parse_direct_peer_addr,
     parse_peer_id, stream_writer, write_accepted_event,
 };
@@ -167,7 +167,7 @@ impl<T: Transport> Host<T> {
             }
             Err(error) => {
                 let failure = P2pEvent::DriverFailed {
-                    kind: failure_kind(&error),
+                    kind: driver_failure_kind(&error),
                     detail: error.to_string(),
                 };
                 Pumped {
@@ -595,13 +595,5 @@ fn map_build_error(error: PortableBuildError) -> FfiError {
             }
         }
         _ => FfiError::Internal { detail },
-    }
-}
-
-fn failure_kind(error: &DriverError) -> DriverFailureKind {
-    match error {
-        DriverError::Transport(_) | DriverError::Full { .. } => DriverFailureKind::Transport,
-        DriverError::Swarm(_) => DriverFailureKind::Swarm,
-        _ => DriverFailureKind::Invariant,
     }
 }

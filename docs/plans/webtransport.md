@@ -67,7 +67,7 @@ See the research doc for sources. The facts that drive the design:
    - A `/…/udp/<port>/quic-v1/webtransport` listen address (no certhash) enables WebTransport on the QUIC socket bound for that address.
    - A socket can serve `quic-v1`, WebTransport, or both, depending on which shapes were listened on. `local_addresses()` reports only the shapes that were listened on. WebTransport addresses always include the current certhashes (Decision 5).
    - **Endpoint wiring:**
-     - `bind_transports` groups both shapes by socket and passes per-socket "serve WebTransport" flags into `QuicNodeConfig`.
+     - `bind_transports` passes the listen addresses of both shapes to `QuicTransport::bind`, which groups them by socket: a socket serves WebTransport because a `/webtransport` address names it (ADR 0023), with no separate flag in `QuicNodeConfig`.
      - `listen()` on the swarm's re-listen path (`listen_on_bound_addrs`) accepts a WebTransport address carrying a certhash and matches it to its socket, ignoring the hashes.
      - `default_listen_quic_addrs` is unchanged, so WebTransport is opt-in.
    - Node and React Native SDK users get WebTransport by putting the address in `listen`; no new config field is needed.

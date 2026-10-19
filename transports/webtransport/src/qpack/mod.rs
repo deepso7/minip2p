@@ -401,13 +401,45 @@ mod tests {
     }
 
     #[test]
-    fn two_kib_of_repeated_static_indexes_is_rejected() {
-        // 2046 copies of `:status 200`: 2 KiB encoded, far past the caps
-        // once expanded.
-        let mut block = vec![0x00, 0x00];
-        block.resize(2048, 0xd9);
+    fn a_2_kib_headers_frame_expanding_past_8_kib_hits_the_size_cap() {
+        use crate::h3::{Frame, FrameDecoder, encode_frame, frame_type};
+        // 63 references to the static content-security-policy (108 bytes
+        // each as counted) and a `:path` whose Huffman value of `huffman`
+        // zero bytes expands to 8/5 as many characters: 64 fields, within
+        // the field cap whatever the size.
+        fn headers(huffman: usize) -> Vec<u8> {
+            let csp = STATIC_TABLE
+                .iter()
+                .position(|(name, _)| *name == b"content-security-policy")
+                .unwrap();
+            let mut block = vec![0x00, 0x00];
+            for _ in 0..63 {
+                encode_int(&mut block, 0xc0, 6, csp as u64);
+            }
+            block.push(0x51);
+            encode_int(&mut block, 0x80, 7, huffman as u64);
+            block.resize(block.len() + huffman, 0x00);
+            let mut frame = Vec::new();
+            encode_frame(frame_type::HEADERS, &block, &mut frame).unwrap();
+            frame
+        }
+        // The field section a HEADERS frame carries.
+        fn block(frame: &[u8]) -> Vec<u8> {
+            let mut input = frame;
+            let Ok(Some(Frame::Headers(block))) = FrameDecoder::new().decode(&mut input) else {
+                panic!("not a HEADERS frame");
+            };
+            block
+        }
+        let mut decoder = QpackDecoder::new();
+        // 6804 + 837 bytes decoded: under 8 KiB.
+        let fields = decoder.decode(&block(&headers(500))).map(|s| s.len());
+        assert_eq!(fields, Ok(64));
+        // 6804 + 3077 bytes decoded from a frame under 2 KiB.
+        let frame = headers(1900);
+        assert!(frame.len() <= 2 * 1024, "{}", frame.len());
         assert_eq!(
-            QpackDecoder::new().decode(&block).err(),
+            decoder.decode(&block(&frame)).err(),
             Some(Error::QpackDecompressionFailed)
         );
     }

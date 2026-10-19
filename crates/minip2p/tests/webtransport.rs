@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, Multiaddr, PeerAddr};
+use minip2p::{ConnectFailure, ConnectOutcome, Endpoint, EndpointEvent, Multiaddr, PeerAddr};
 use minip2p_core::platform::{Now, StdEntropy};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_swarm::{SwarmBuilder, SwarmCore, SwarmEvent};
@@ -32,6 +32,25 @@ fn bind() -> Endpoint {
         .expect("bind loopback")
 }
 
+/// Connects `a` to `candidates` and drives both ends until it settles.
+fn settle(a: &mut Endpoint, b: &mut Endpoint, candidates: Vec<PeerAddr>) -> ConnectOutcome {
+    let id = a.connect(candidates).expect("connect starts");
+    let deadline = Instant::now() + BACKSTOP;
+    loop {
+        assert!(Instant::now() < deadline, "connect never settled");
+        if let Some(EndpointEvent::ConnectSettled {
+            connect_id,
+            outcome,
+            ..
+        }) = a.next_event(Duration::from_millis(5)).expect("a drives")
+            && connect_id == id
+        {
+            return outcome;
+        }
+        let _ = b.next_event(Duration::from_millis(5)).expect("b drives");
+    }
+}
+
 #[test]
 fn connect_skips_webtransport_candidates_and_connects_over_quic_v1() {
     let mut a = bind();
@@ -48,27 +67,23 @@ fn connect_skips_webtransport_candidates_and_connects_over_quic_v1() {
     )
     .expect("peer addr");
 
-    // The WebTransport candidate comes first, so its refusal must not end
-    // the attempt.
-    let id = a
-        .connect(vec![b_webtransport, b_quic.clone()])
-        .expect("connect starts");
-
-    let deadline = Instant::now() + BACKSTOP;
-    let outcome = loop {
-        assert!(Instant::now() < deadline, "connect never settled");
-        if let Some(EndpointEvent::ConnectSettled {
-            connect_id,
-            outcome,
-            ..
-        }) = a.next_event(Duration::from_millis(5)).expect("a drives")
-            && connect_id == id
-        {
-            break outcome;
-        }
-        let _ = b.next_event(Duration::from_millis(5)).expect("b drives");
+    // Alone, the WebTransport candidate fails as a candidate: refused
+    // before any dial.
+    let outcome = settle(&mut a, &mut b, vec![b_webtransport.clone()]);
+    let ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { candidates, .. }) = outcome else {
+        panic!("expected NoUsableRoute, got {outcome:?}");
     };
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|failure| &failure.addr)
+            .collect::<Vec<_>>(),
+        [&b_webtransport],
+        "{candidates:?}"
+    );
 
+    // First among others, its refusal must not end the attempt.
+    let outcome = settle(&mut a, &mut b, vec![b_webtransport, b_quic.clone()]);
     let ConnectOutcome::Connected { conn_id, .. } = outcome else {
         panic!("expected Connected, got {outcome:?}");
     };

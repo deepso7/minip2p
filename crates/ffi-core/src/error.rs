@@ -178,6 +178,20 @@ pub fn map_driver_error(error: minip2p::DriverError) -> FfiError {
     }
 }
 
+/// The category a fatal driver failure reports in
+/// [`P2pEvent::DriverFailed`](crate::P2pEvent::DriverFailed).
+pub fn driver_failure_kind(error: &minip2p::DriverError) -> crate::DriverFailureKind {
+    use crate::DriverFailureKind;
+    match error {
+        minip2p::DriverError::Transport(_) | minip2p::DriverError::Full { .. } => {
+            DriverFailureKind::Transport
+        }
+        minip2p::DriverError::Swarm(_) => DriverFailureKind::Swarm,
+        // Includes failures this binding predates.
+        _ => DriverFailureKind::Invariant,
+    }
+}
+
 /// Maps a Gossipsub refusal: reserved topics to [`FfiError::NotPermitted`],
 /// publish limits to their own variants, topic mistakes to
 /// [`FfiError::InvalidTopic`].
