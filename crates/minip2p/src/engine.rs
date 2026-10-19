@@ -51,7 +51,6 @@
 //! ingested, as NAT records a punch on that event.
 
 use alloc::collections::VecDeque;
-#[cfg(any(feature = "std", feature = "pubsub"))]
 use alloc::string::String;
 use alloc::vec::Vec;
 #[cfg(not(feature = "_mdns-driver"))]
