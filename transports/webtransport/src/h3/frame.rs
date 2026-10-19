@@ -10,8 +10,8 @@ use crate::{Error, VarIntTooLarge};
 pub const MAX_HEADERS_FRAME_LEN: usize = 16 * 1024;
 /// The largest SETTINGS frame payload accepted.
 pub const MAX_SETTINGS_FRAME_LEN: usize = 4 * 1024;
-/// A GOAWAY payload is a single varint.
-const MAX_GOAWAY_FRAME_LEN: usize = 8;
+/// A GOAWAY, CANCEL_PUSH or MAX_PUSH_ID payload is a single varint.
+const MAX_ID_FRAME_LEN: usize = 8;
 
 /// One decoded frame. DATA payloads are streamed as borrowed chunks, so a
 /// large DATA frame arrives as several `Data` items; the other frames are
@@ -27,6 +27,12 @@ pub enum Frame<'a> {
     Settings(Settings),
     /// A GOAWAY frame with its stream or push id.
     GoAway(u64),
+    /// A CANCEL_PUSH frame with its push id. Reported rather than skipped,
+    /// like [`Frame::MaxPushId`], so a caller can enforce that it appears
+    /// only on the control stream and check its id (RFC 9114 §7.2.3).
+    CancelPush(u64),
+    /// A MAX_PUSH_ID frame with its push id (RFC 9114 §7.2.7).
+    MaxPushId(u64),
     /// The `0x41` signal that opens a WebTransport bidi stream, with its
     /// session id. Every later byte on the stream is application data, so
     /// stop feeding this decoder.
@@ -183,12 +189,14 @@ impl FrameDecoder {
             frame_type::DATA => return Ok(State::Data { remaining: len }),
             frame_type::HEADERS => MAX_HEADERS_FRAME_LEN,
             frame_type::SETTINGS => MAX_SETTINGS_FRAME_LEN,
-            frame_type::GOAWAY => MAX_GOAWAY_FRAME_LEN,
+            frame_type::GOAWAY | frame_type::CANCEL_PUSH | frame_type::MAX_PUSH_ID => {
+                MAX_ID_FRAME_LEN
+            }
             _ => return Ok(State::Skip { remaining: len }),
         };
         let len = usize::try_from(len).ok().ok_or(Error::ExcessiveLoad)?;
         if len > cap {
-            return Err(if ty == frame_type::GOAWAY {
+            return Err(if cap == MAX_ID_FRAME_LEN {
                 Error::Frame
             } else {
                 Error::ExcessiveLoad
@@ -219,10 +227,17 @@ fn finish(ty: u64, payload: Vec<u8>) -> Result<Frame<'static>, Error> {
     match ty {
         frame_type::HEADERS => Ok(Frame::Headers(payload)),
         frame_type::SETTINGS => Settings::decode_payload(&payload).map(Frame::Settings),
-        _ => match varint::decode(&payload) {
-            Some((id, used)) if used == payload.len() => Ok(Frame::GoAway(id)),
-            _ => Err(Error::Frame),
-        },
+        _ => {
+            let id = match varint::decode(&payload) {
+                Some((id, used)) if used == payload.len() => id,
+                _ => return Err(Error::Frame),
+            };
+            Ok(match ty {
+                frame_type::CANCEL_PUSH => Frame::CancelPush(id),
+                frame_type::MAX_PUSH_ID => Frame::MaxPushId(id),
+                _ => Frame::GoAway(id),
+            })
+        }
     }
 }
 
@@ -421,6 +436,22 @@ mod tests {
                 Err(Error::FrameUnexpected)
             );
         }
+    }
+
+    #[test]
+    fn push_control_frames_are_reported_not_skipped() {
+        // CANCEL_PUSH 1, then MAX_PUSH_ID 2^14 (a two-byte varint).
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            decode_all(&mut decoder, &[0x03, 0x01, 0x01, 0x0d, 0x04, 0x80, 0x00, 0x40, 0x00]),
+            Ok(alloc::vec![Frame::CancelPush(1), Frame::MaxPushId(1 << 14)])
+        );
+        // A trailing byte after the push id is malformed.
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            decode_all(&mut decoder, &[0x0d, 0x02, 0x01, 0x00]),
+            Err(Error::Frame)
+        );
     }
 
     #[test]

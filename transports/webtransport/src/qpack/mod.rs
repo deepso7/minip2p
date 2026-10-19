@@ -6,7 +6,8 @@
 //! field sections with Required Insert Count 0, built from indexed static
 //! entries and literals (Huffman-coded or not), and rejects everything else
 //! with [`Error::QpackDecompressionFailed`]. [`encode_field_section`] emits
-//! the same subset without Huffman.
+//! the same subset without Huffman, and [`DecoderStreamReader`] checks that
+//! the peer's decoder stream acknowledges nothing it was never sent.
 //!
 //! ```
 //! use minip2p_webtransport::qpack::{QpackDecoder, encode_field_section};
@@ -122,8 +123,10 @@ impl QpackDecoder {
         self.buf.clear();
         self.spans.clear();
         let input = &mut block;
-        // Required Insert Count must be 0; the Base is then unused.
-        if decode_int(input, 8)? != 0 {
+        // Required Insert Count must be 0; the Base is then unused, but a
+        // sign bit would make it 0 - Delta Base - 1, which is negative
+        // (RFC 9204 §4.5.1.2).
+        if decode_int(input, 8)? != 0 || input.first().is_some_and(|&byte| byte & 0x80 != 0) {
             return Err(Error::QpackDecompressionFailed);
         }
         decode_int(input, 7)?;
@@ -172,6 +175,48 @@ impl QpackDecoder {
             buf: &self.buf,
             spans: &self.spans,
         })
+    }
+}
+
+/// Validates the peer's QPACK decoder stream (RFC 9204 §4.4) for an encoder
+/// that only ever uses the static table.
+///
+/// Feed it every byte after the stream type, in order. Stream Cancellation
+/// is always legal. A Section Acknowledgment or Insert Count Increment
+/// (including an increment of 0) refers to dynamic-table state that does
+/// not exist, so each is [`Error::QpackDecoderStream`], fatal to the
+/// connection.
+#[derive(Clone, Debug, Default)]
+pub struct DecoderStreamReader {
+    /// The shift of the next continuation byte of a Stream Cancellation's
+    /// stream id, while one is being read.
+    continuation: Option<u32>,
+}
+
+impl DecoderStreamReader {
+    /// A reader at the start of the stream.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Checks the next bytes of the stream.
+    pub fn read(&mut self, input: &[u8]) -> Result<(), Error> {
+        for &byte in input {
+            self.continuation = match self.continuation {
+                // A stream id needs no more than 2^62, as in `decode_int`.
+                Some(shift) if shift > 56 => return Err(Error::QpackDecoderStream),
+                Some(shift) => (byte & 0x80 != 0).then_some(shift + 7),
+                // Stream Cancellation: 0 1 stream id(6).
+                None if byte & 0xc0 == 0x40 => (byte & 0x3f == 0x3f).then_some(0),
+                None => return Err(Error::QpackDecoderStream),
+            };
+        }
+        Ok(())
+    }
+
+    /// Whether the stream sits between instructions.
+    pub fn is_at_instruction_boundary(&self) -> bool {
+        self.continuation.is_none()
     }
 }
 
@@ -380,6 +425,48 @@ mod tests {
                 "{block:02x?}"
             );
         }
+    }
+
+    #[test]
+    fn a_negative_base_is_rejected_and_an_unused_positive_one_accepted() {
+        let mut decoder = QpackDecoder::new();
+        // Required Insert Count 0 with the Delta Base sign set: Base -1.
+        for block in [&[0x00, 0x80, 0xd9][..], &[0x00, 0x85, 0xd9]] {
+            assert_eq!(
+                decoder.decode(block).err(),
+                Some(Error::QpackDecompressionFailed),
+                "{block:02x?}"
+            );
+        }
+        let section = decoder.decode(&[0x00, 0x05, 0xd9]).unwrap();
+        assert_eq!(section.get(b":status"), Some(&b"200"[..]));
+    }
+
+    #[test]
+    fn decoder_streams_carry_only_stream_cancellations() {
+        // Stream Cancellation of streams 4 and 1000 (a continued integer),
+        // split byte by byte.
+        let mut stream = DecoderStreamReader::new();
+        for byte in [0x44, 0x7f, 0xa9, 0x0f] {
+            assert_eq!(stream.read(&[byte]), Ok(()));
+        }
+        assert!(stream.is_at_instruction_boundary());
+        // An Insert Count Increment of 0 or 1, and a Section Acknowledgment,
+        // all refer to a dynamic table this encoder never uses.
+        for bytes in [&[0x00][..], &[0x01], &[0x84], &[0x44, 0x01]] {
+            assert_eq!(
+                DecoderStreamReader::new().read(bytes),
+                Err(Error::QpackDecoderStream),
+                "{bytes:02x?}"
+            );
+        }
+        // A cancellation whose integer runs past 2^62.
+        let mut overflow = vec![0x7f];
+        overflow.resize(12, 0xff);
+        assert_eq!(
+            DecoderStreamReader::new().read(&overflow),
+            Err(Error::QpackDecoderStream)
+        );
     }
 
     #[test]
