@@ -32,6 +32,6 @@ Resource-policy tuning remains native configuration until it has consistent sema
 | Dialing | `/…/quic-v1/webtransport/certhash/…/p2p/…` addresses only; other candidates fail as candidates |
 | Ping, Identify, custom protocol streams, pubsub | As on native |
 | Listening, mDNS, signed discovery, AutoNAT | Rejected at `create` with `InvalidConfigError` and the reason |
-| Relay reservations and circuits (`relays`, `forceRelay`) | Rejected until browser relay support lands |
+| Relay reservations and circuits (`relays`, `forceRelay`) | Reservations on WebTransport relays, reachable at the `/p2p-circuit` address from browsers and native nodes; connects race the direct dial against the relay leg (`direct` or `relayed`, never `punched`); `forceRelay` needs `relays` |
 | Shutdown | `close` closes every session at once with WebTransport's close capsule |
 | Driver failure | A trapped wasm module reports `driverFailed`; later calls throw `ClosedError` |

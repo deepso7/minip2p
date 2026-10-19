@@ -17,7 +17,9 @@
  * - Reads are pulled: `grantRead` is additive, at most one read is
  *   outstanding per stream, and `data` never exceeds what was granted.
  * - Handles are never reused, and events for a reset stream or an ended
- *   session are dropped.
+ *   session are dropped. A stream whose read side ended and whose write
+ *   side finished (every accepted write reported first) or was stopped is
+ *   retired, so finished streams hold nothing.
  * - Stream error codes are WebTransport application codes cut to `u8`
  *   (minip2p only sends 0); a missing code is 0.
  * - Only `connect`, `openStream` and `write` may throw (Rust catches those
@@ -100,6 +102,8 @@ class Stream {
   reading = false;
   /** Fin, reset or a local stop: no more `data`. */
   readEnded = false;
+  /** Finished after its last write, or stopped by the peer. */
+  writeEnded = false;
   /** Reset locally or its session ended: no more events at all. */
   dead = false;
   /** A `stop` that arrived before the stream finished opening. */
@@ -237,10 +241,16 @@ export class JsIo {
   /** Finishes the write side after every accepted write. */
   closeWrite(streamId: number): void {
     quietly(() => {
-      this.#streams
-        .get(streamId)
-        ?.writer?.close()
-        .catch(() => {});
+      const stream = this.#streams.get(streamId);
+      // Resolves once every accepted write has resolved, and been reported.
+      stream?.writer?.close().then(
+        () => {
+          stream.writeEnded = true;
+          this.#retireIfDone(streamId, stream);
+        },
+        // Stopped or reset: `writer.closed` or the reset covers it.
+        () => {}
+      );
     });
   }
 
@@ -270,6 +280,7 @@ export class JsIo {
         return;
       }
       stream.reader.cancel(streamError(code)).catch(() => {});
+      this.#retireIfDone(streamId, stream);
     });
   }
 
@@ -322,6 +333,13 @@ export class JsIo {
     return id;
   }
 
+  /** Forgets a stream once both of its sides are done. */
+  #retireIfDone(id: number, stream: Stream): void {
+    if (!stream.dead && stream.readEnded && stream.writeEnded) {
+      this.#forget(id, stream);
+    }
+  }
+
   #forget(id: number, stream: Stream): void {
     stream.dead = true;
     this.#streams.delete(id);
@@ -339,7 +357,9 @@ export class JsIo {
     stream.writer.closed.catch((error: unknown) => {
       const code = peerStreamCode(error);
       if (!stream.dead && code !== undefined) {
+        stream.writeEnded = true;
         this.#push({ code, kind: "stopSending", stream: id });
+        this.#retireIfDone(id, stream);
       }
     });
     // The peer's RESET_STREAM errors the read side, read pending or not.
@@ -374,6 +394,7 @@ export class JsIo {
         if (done) {
           stream.readEnded = true;
           this.#push({ kind: "fin", stream: id });
+          this.#retireIfDone(id, stream);
           return;
         }
         if (value.byteLength > 0) {
@@ -401,6 +422,7 @@ export class JsIo {
     }
     stream.readEnded = true;
     this.#push({ code: peerStreamCode(error) ?? 0, kind: "reset", stream: id });
+    this.#retireIfDone(id, stream);
   }
 
   async #acceptIncoming(id: number, session: Session): Promise<void> {

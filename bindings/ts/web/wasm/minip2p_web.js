@@ -30,7 +30,7 @@ export class WebEndpoint {
         }
     }
     /**
-     * The active relay reservation (always `null` for now).
+     * The relay reservation currently held, or `null`.
      * @returns {any}
      */
     activeReservation() {

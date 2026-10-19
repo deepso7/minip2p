@@ -16,7 +16,7 @@ use core::mem;
 use core::net::{Ipv4Addr, Ipv6Addr};
 
 use minip2p_core::platform::{Deadline, EntropySource, IoErrorKind, Now};
-use minip2p_core::{Bytes, Multiaddr, Multihash, PeerAddr, Protocol};
+use minip2p_core::{Bytes, Multiaddr, Multihash, PeerAddr, Protocol, retain_slice};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_secure_mux::noise::{NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
 use minip2p_transport::{
@@ -83,7 +83,8 @@ pub fn webtransport_url(addr: &Multiaddr) -> Result<String, TransportError> {
 ///   [`WriteCompleted`](IoEvent::WriteCompleted), whether still queued in
 ///   Rust or copied into the platform's in-flight writes, counted against
 ///   the stream and connection send caps ([`SendCaps`]). That is where
-///   `Full` and `StreamWritable` come from.
+///   `Full` and `StreamWritable` come from. A queued tail never pins more
+///   than twice its bytes of the caller's payload ([`retain_slice`]).
 /// - **Granted reads**: [`grant_read`](WebTransportIo::grant_read) is only
 ///   ever issued for `window − unacked − outstanding grant`.
 /// - **Delivered, unacknowledged bytes**: held per stream until
@@ -139,7 +140,7 @@ struct Stream {
     /// May fill the connection cap's control reserve.
     control: bool,
     /// Bytes the platform has not accepted yet.
-    writes: VecDeque<Bytes>,
+    writes: VecDeque<QueuedWrite>,
     /// Bytes accepted from the caller and not yet reported written: those
     /// in `writes` plus `in_flight`.
     pending: usize,
@@ -156,6 +157,28 @@ struct Stream {
     unacked: usize,
     /// Bytes granted to the platform and not yet delivered.
     granted: usize,
+}
+
+/// A queued write: a slice of a caller's payload, and the length its
+/// allocation is counted at, so a shrinking tail pins at most twice its
+/// bytes ([`retain_slice`]).
+struct QueuedWrite {
+    bytes: Bytes,
+    counted: usize,
+}
+
+impl QueuedWrite {
+    /// `bytes`, sliced from a payload `counted` bytes long.
+    fn new(mut bytes: Bytes, mut counted: usize) -> Self {
+        retain_slice(&mut bytes, &mut counted);
+        Self { bytes, counted }
+    }
+
+    /// Drops the first `len` bytes, which the platform accepted.
+    fn advance(&mut self, len: usize) {
+        self.bytes = self.bytes.slice(len..);
+        retain_slice(&mut self.bytes, &mut self.counted);
+    }
 }
 
 impl Stream {
@@ -178,43 +201,49 @@ impl Stream {
 }
 
 impl Session {
-    /// Queues `bytes` on a stream, counted as pending.
-    fn queue(&mut self, handle: StreamHandle, bytes: Bytes) {
+    /// Queues `write` on a stream, counted as pending.
+    fn queue(&mut self, handle: StreamHandle, write: QueuedWrite) {
         if let Some(state) = self.streams.get_mut(&handle) {
-            state.pending += bytes.len();
-            self.pending += bytes.len();
-            state.writes.push_back(bytes);
+            state.pending += write.bytes.len();
+            self.pending += write.bytes.len();
+            state.writes.push_back(write);
         }
     }
 
     /// Hands queued writes, then a queued FIN, to the platform as far as it
-    /// takes them.
-    fn flush(&mut self, io: &mut impl WebTransportIo, handle: StreamHandle) {
+    /// takes them. Returns whether the platform refused the stream: its
+    /// writes are then dropped and its write side stopped, for the caller to
+    /// report.
+    #[must_use]
+    fn flush(&mut self, io: &mut impl WebTransportIo, handle: StreamHandle) -> bool {
         let Some(state) = self.streams.get_mut(&handle).filter(|state| state.opened) else {
-            return;
+            return false;
         };
         while let Some(front) = state.writes.front_mut() {
-            match io.write(handle, front) {
-                Ok(written) if written >= front.len() => {
-                    state.in_flight += front.len();
+            match io.write(handle, &front.bytes) {
+                Ok(written) if written >= front.bytes.len() => {
+                    state.in_flight += front.bytes.len();
                     state.writes.pop_front();
                 }
                 // The rest waits for a WriteCompleted.
                 Ok(written) => {
                     state.in_flight += written;
-                    *front = front.slice(written..);
-                    return;
+                    front.advance(written);
+                    return false;
                 }
                 // The platform refused the stream: nothing more goes out.
                 Err(_) => {
+                    state.local_closed = true;
+                    state.write_stopped = true;
                     self.drop_writes(handle);
-                    return;
+                    return true;
                 }
             }
         }
         if mem::take(&mut state.fin_queued) {
             io.close_write(handle);
         }
+        false
     }
 
     /// Releases `bytes` of a stream's in-flight writes, which the platform
@@ -402,9 +431,12 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
                 let Some(&id) = self.by_stream.get(&stream) else {
                     return;
                 };
-                if let Some(conn) = self.connections.get_mut(&id) {
+                let refused = self.connections.get_mut(&id).is_some_and(|conn| {
                     conn.complete(stream, bytes);
-                    conn.flush(&mut self.io, stream);
+                    conn.flush(&mut self.io, stream)
+                });
+                if refused {
+                    self.on_write_refused(id, stream);
                 }
                 self.close_if_done(id, stream);
                 self.wake_writable(id);
@@ -474,11 +506,15 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             return;
         };
         if !noise {
-            if let Some(conn) = self.connections.get_mut(&id) {
+            let refused = self.connections.get_mut(&id).is_some_and(|conn| {
                 if let Some(state) = conn.streams.get_mut(&handle) {
                     state.opened = true;
                 }
-                conn.flush(&mut self.io, handle);
+                conn.flush(&mut self.io, handle)
+            });
+            if refused {
+                self.on_write_refused(id, handle);
+                self.wake_writable(id);
             }
             self.close_if_done(id, handle);
             return;
@@ -583,10 +619,17 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         let hash = noise.handshake_hash();
         // Handshake bytes are the client's own, not counted against the caps.
         if let Some(state) = conn.streams.get_mut(&handle) {
-            state.writes.extend(frames);
+            state
+                .writes
+                .extend(frames.into_iter().map(|frame| QueuedWrite {
+                    counted: frame.len(),
+                    bytes: frame,
+                }));
         }
         let Some(offered) = offered else {
-            conn.flush(&mut self.io, handle);
+            if conn.flush(&mut self.io, handle) {
+                self.fail(id, "the platform refused the Noise stream".into());
+            }
             return;
         };
         if let Some(&missing) = conn.certhashes.iter().find(|hash| !offered.contains(hash)) {
@@ -602,7 +645,10 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             state.fin_queued = true;
             state.local_closed = true;
         }
-        conn.flush(&mut self.io, handle);
+        if conn.flush(&mut self.io, handle) {
+            self.fail(id, "the platform refused the Noise stream".into());
+            return;
+        }
         if let Some(hash) = hash {
             conn.endpoint.set_token(ConnectionToken::new(hash));
         }
@@ -664,6 +710,9 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         let Some(conn) = self.connections.get_mut(&id) else {
             return;
         };
+        // The peer reset only its sending side: reset ours too, as the QUIC
+        // server does, so the platform stream is freed.
+        self.io.reset(handle, 0);
         conn.drop_writes(handle);
         if let Some(state) = conn.streams.get_mut(&handle) {
             state.granted = 0;
@@ -685,20 +734,36 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         let Some(state) = conn.streams.get_mut(&handle) else {
             return;
         };
-        if state.write_stopped || state.closed_notified {
+        if state.write_stopped {
             return;
         }
+        // After StreamClosed nothing more is reported, but writes still in
+        // the platform are released: a stopped stream never completes them.
+        let notify = !state.closed_notified;
         state.write_stopped = true;
         state.local_closed = true;
         conn.drop_writes(handle);
         self.drop_writable(id, handle);
+        if notify {
+            self.events.push(TransportEvent::StreamWriteStopped {
+                id,
+                stream_id: stream_id(handle),
+                error_code: u64::from(code),
+            });
+        }
+        self.close_if_done(id, handle);
+        self.wake_writable(id);
+    }
+
+    /// The platform refused a stream's queued writes: its write side is
+    /// stopped as if the peer had stopped it, with code 0.
+    fn on_write_refused(&mut self, id: ConnectionId, handle: StreamHandle) {
+        self.drop_writable(id, handle);
         self.events.push(TransportEvent::StreamWriteStopped {
             id,
             stream_id: stream_id(handle),
-            error_code: u64::from(code),
+            error_code: 0,
         });
-        self.close_if_done(id, handle);
-        self.wake_writable(id);
     }
 
     /// Emits `StreamClosed` once both halves are done, and forgets the
@@ -893,8 +958,17 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
         let room = caps.room(state.pending, conn.pending, state.control);
         let accepted = data.len().min(room);
         if accepted != 0 {
-            conn.queue(handle, data.slice(..accepted));
-            conn.flush(io, handle);
+            conn.queue(handle, QueuedWrite::new(data.slice(..accepted), data.len()));
+            if conn.flush(io, handle) {
+                self.drop_writable(id, handle);
+                self.close_if_done(id, handle);
+                self.wake_writable(id);
+                return Err(TransportError::StreamSendFailed {
+                    id,
+                    stream_id,
+                    reason: "the platform refused the write".into(),
+                });
+            }
         }
         if accepted < data.len() {
             conn.writable_armed.insert(handle);
@@ -927,9 +1001,17 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
         state.local_closed = true;
         state.fin_queued = true;
         conn.writable_armed.remove(&handle);
-        conn.flush(io, handle);
+        let refused = conn.flush(io, handle);
         self.drop_writable(id, handle);
         self.close_if_done(id, handle);
+        if refused {
+            self.wake_writable(id);
+            return Err(TransportError::StreamCloseWriteFailed {
+                id,
+                stream_id,
+                reason: "the platform refused the stream's queued writes".into(),
+            });
+        }
         Ok(())
     }
 

@@ -46,3 +46,25 @@ test("the manual entry loads nothing at import, and initMinip2p({ wasm }) loads 
     /multicast/u
   );
 });
+
+test("initMinip2p({ wasm }) takes a promised URL", async () => {
+  vi.resetModules();
+  const url = "https://cdn.example/minip2p_web_bg.wasm";
+  const bytes = await wasmBytes();
+  const fetch = vi.fn((input: unknown) =>
+    Promise.resolve(
+      String(input) === url
+        ? new Response(bytes, {
+            headers: { "Content-Type": "application/wasm" },
+          })
+        : new Response("missing", { status: 404 })
+    )
+  );
+  vi.stubGlobal("fetch", fetch);
+
+  const web = await import("../src/manual.js");
+  await web.initMinip2p({ wasm: Promise.resolve(new URL(url)) });
+
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(web.generateSecretKey()).toHaveLength(32);
+});

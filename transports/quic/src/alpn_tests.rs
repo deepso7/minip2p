@@ -4,6 +4,7 @@
 use std::time::{Duration, Instant};
 
 use minip2p_identity::Ed25519Keypair;
+use minip2p_tls::webtransport::PERIOD_SECS;
 use minip2p_transport::ConnectionCloseReason;
 use quinn_proto::crypto::rustls::HandshakeData;
 use quinn_proto::{ConnectionError, Dir, Event, StreamEvent};
@@ -106,6 +107,17 @@ fn handshake_then(
     server: &mut QuicTransport,
     queue: impl FnOnce(&mut RawPeer),
 ) -> Vec<TransportEvent> {
+    handshake_at(peer, server, None, queue)
+}
+
+/// [`handshake_then`], polling the server with its wall clock pinned at
+/// `unix` seconds when given.
+fn handshake_at(
+    peer: &mut RawPeer,
+    server: &mut QuicTransport,
+    unix: Option<u64>,
+    queue: impl FnOnce(&mut RawPeer),
+) -> Vec<TransportEvent> {
     let mut events = Vec::new();
     let start = Instant::now();
     loop {
@@ -114,7 +126,8 @@ fn handshake_then(
             "no handshake: {events:?}"
         );
         std::thread::sleep(Duration::from_millis(1));
-        events.extend(server.poll(now()).expect("poll"));
+        let sample = unix.map_or_else(now, |unix| now().with_unix_seconds(unix));
+        events.extend(server.poll(sample).expect("poll"));
         peer.receive();
         peer.run_engine();
         if peer
@@ -222,9 +235,12 @@ fn an_h3_client_gets_the_webtransport_certificate_and_no_connection_before_noise
         server.local_addr(),
         foreign_client_config(&[H3], None, Arc::clone(&seen)),
     );
-    let mut events = handshake_then(&mut peer, &mut server, |_| {});
+    // The server's wall clock is pinned mid-period, so the certificate it
+    // serves cannot move across a period boundary under the test.
+    let unix = 1_000 * PERIOD_SECS + PERIOD_SECS / 2;
+    let mut events = handshake_at(&mut peer, &mut server, Some(unix), |_| {});
     assert_eq!(negotiated(&mut peer).as_deref(), Some(H3));
-    let period = minip2p_tls::webtransport::period_at(tls::system_time().as_secs());
+    let period = minip2p_tls::webtransport::period_at(unix);
     let (expected, _) =
         minip2p_tls::webtransport::webtransport_certificate(&keypair, period).expect("cert");
     assert_eq!(seen.seen(), Some(expected));
@@ -250,6 +266,31 @@ fn an_h3_only_socket_offers_only_h3() {
     let events = drive_until_peer_closed(&mut server, &mut libp2p);
     // TLS's no_application_protocol alert.
     assert_eq!(crypto_alert(&lost_reason(&libp2p)), Some(120), "{events:?}");
+}
+
+#[test]
+fn an_h3_only_socket_serves_the_webtransport_certificate_to_a_client_also_offering_libp2p() {
+    let keypair = Ed25519Keypair::generate();
+    let addr = "/ip4/127.0.0.1/udp/0/quic-v1/webtransport"
+        .parse()
+        .expect("multiaddr");
+    let mut server =
+        QuicTransport::bind(QuicNodeConfig::new(keypair.clone()), &[addr]).expect("bind");
+    server.listen_on_bound_addrs().expect("listen");
+    let seen = Arc::new(AnyServer::default());
+    let mut peer = RawPeer::connect_with(
+        server.local_addr(),
+        foreign_client_config(&[LIBP2P, H3], None, Arc::clone(&seen)),
+    );
+    let unix = 1_000 * PERIOD_SECS + PERIOD_SECS / 2;
+    handshake_at(&mut peer, &mut server, Some(unix), |_| {});
+    assert_eq!(negotiated(&mut peer).as_deref(), Some(H3));
+    let (expected, _) = minip2p_tls::webtransport::webtransport_certificate(
+        &keypair,
+        minip2p_tls::webtransport::period_at(unix),
+    )
+    .expect("cert");
+    assert_eq!(seen.seen(), Some(expected));
 }
 
 #[test]

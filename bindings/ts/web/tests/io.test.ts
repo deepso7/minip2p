@@ -60,9 +60,10 @@ class FakeStream {
     this.#reads?.enqueue(new Uint8Array(bytes));
   }
 
-  /** The peer finishes its side. */
+  /** The peer finishes its side, ending a read already waiting too. */
   fin(): void {
     this.#reads?.close();
+    this.#reads?.byobRequest?.respond(0);
   }
 
   /** The peer resets its side. */
@@ -314,6 +315,26 @@ describe("JsIo", () => {
 
     expect(fake.aborted).toBe(true);
     expect(events()).toEqual([]);
+    expect(() => io.write(stream, new Uint8Array([2]))).toThrow(
+      /not writable/u
+    );
+  });
+
+  test("a stream finished both ways is retired after its last write completes", async () => {
+    const { events, fake, io, stream } = await openedStream();
+    io.grantRead(stream, 10);
+    io.write(stream, new Uint8Array([1]));
+    io.closeWrite(stream);
+    fake.fin();
+    await flush();
+    expect(events()).toEqual([{ kind: "fin", stream }]);
+
+    // The write still in flight is reported, then the stream is gone.
+    fake.completeWrite();
+    await flush();
+
+    expect(fake.closedWrite).toBe(true);
+    expect(events()).toEqual([{ bytes: 1, kind: "writeCompleted", stream }]);
     expect(() => io.write(stream, new Uint8Array([2]))).toThrow(
       /not writable/u
     );

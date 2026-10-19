@@ -14,7 +14,11 @@ let loading: Promise<void> | undefined;
 let loaded = false;
 
 const instantiate = async (source: WasmSource | undefined): Promise<void> => {
-  await init(source === undefined ? undefined : { module_or_path: source });
+  // wasm-bindgen fetches a string or URL only when it is passed directly,
+  // so a promised one is awaited here first.
+  await init(
+    source === undefined ? undefined : { module_or_path: await source }
+  );
   loaded = true;
 };
 

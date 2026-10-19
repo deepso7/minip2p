@@ -14,6 +14,8 @@ class FakeWebEndpoint extends FakeSerdeEndpoint {
   /** What successive `pump` calls return; `undefined` once exhausted. */
   pumpDelays: (number | undefined)[] = [];
   pumps = 0;
+  /** How many times the wasm object was freed. */
+  frees = 0;
   /** Makes the next call to `method` trap like a panicking wasm module. */
   trapOn: string | undefined;
 
@@ -29,6 +31,17 @@ class FakeWebEndpoint extends FakeSerdeEndpoint {
 
   override ping(): void {
     this.#trap("ping");
+  }
+
+  override drainEvents(
+    limit: number
+  ): ReturnType<FakeSerdeEndpoint["drainEvents"]> {
+    this.#trap("drainEvents");
+    return super.drainEvents(limit);
+  }
+
+  free(): void {
+    this.frees += 1;
   }
 
   #trap(method: string): void {
@@ -113,6 +126,39 @@ describe("Web adapter", () => {
 
     expect(failures).toEqual([expect.stringContaining("trapped")]);
     expect(endpoint.isRunning()).toBe(false);
+  });
+
+  test("a trap while close drains its final events still settles close", async () => {
+    vi.useFakeTimers();
+    const endpoint = create();
+    const native = fake();
+    native.trapOn = "drainEvents";
+
+    const closed = endpoint.close();
+    await vi.advanceTimersByTimeAsync(0);
+
+    await expect(closed).resolves.toMatchObject({
+      outcome: "Failed",
+      reason: "close",
+    });
+  });
+
+  test("close frees the wasm endpoint once its final events drained, and stops pumping", async () => {
+    vi.useFakeTimers();
+    const endpoint = create();
+    const native = fake();
+    // The pump close runs arms one more deadline.
+    native.pumpDelays = [0, 30];
+
+    const closed = endpoint.close();
+    expect(native.frees).toBe(0);
+    await vi.advanceTimersByTimeAsync(0);
+    await closed;
+    expect(native.frees).toBe(1);
+    const { pumps } = native;
+    // That deadline no longer pumps the freed endpoint.
+    await vi.advanceTimersByTimeAsync(100);
+    expect(native.pumps).toBe(pumps);
   });
 });
 

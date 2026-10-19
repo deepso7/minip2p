@@ -179,7 +179,9 @@ impl FrameDecoder {
                 Error::ExcessiveLoad
             });
         }
-        self.buf = Vec::with_capacity(len);
+        // The buffer grows with what arrives: a declared length alone
+        // reserves nothing.
+        self.buf = Vec::new();
         Ok(State::Buffer { ty, len })
     }
 }

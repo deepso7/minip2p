@@ -175,6 +175,22 @@ impl H3Peer {
         stream
     }
 
+    /// Writes all of `bytes` on `stream`, driving while the stream's credit
+    /// runs short.
+    fn write_all(
+        &mut self,
+        server: &mut QuicTransport,
+        events: &mut Vec<TransportEvent>,
+        stream: u64,
+        mut bytes: &[u8],
+    ) {
+        self.drive(server, events, "the write", |peer, _| {
+            let written = peer.raw.write(stream, bytes);
+            bytes = bytes.get(written..).unwrap_or_default();
+            bytes.is_empty()
+        });
+    }
+
     /// Sends one capsule on the CONNECT stream, in a DATA frame.
     fn capsule(&mut self, capsule: &Capsule) {
         let mut raw = Vec::new();
@@ -188,7 +204,7 @@ impl H3Peer {
     /// Runs Noise as initiator on a fresh WebTransport stream until the
     /// server reports `Connected`.
     fn authenticate(&mut self, server: &mut QuicTransport, events: &mut Vec<TransportEvent>) {
-        self.authenticate_with(server, events, |_| {});
+        self.authenticate_with(server, events, |_, _, _| {});
     }
 
     /// [`Self::authenticate`], with `early` run once the Noise stream is
@@ -197,12 +213,12 @@ impl H3Peer {
         &mut self,
         server: &mut QuicTransport,
         events: &mut Vec<TransportEvent>,
-        early: impl FnOnce(&mut Self),
+        early: impl FnOnce(&mut Self, &mut QuicTransport, &mut Vec<TransportEvent>),
     ) {
         let mut noise = initiator();
         let first = outbound(&mut noise).0;
         let stream = self.wt_stream(&first);
-        early(self);
+        early(self, server, events);
         let mut done = false;
         self.drive(server, events, "Noise", |peer, events| {
             if !done {
@@ -531,6 +547,33 @@ fn every_validation_matrix_row_closes_with_its_code() {
             },
             code::H3_NO_ERROR,
         ),
+        (
+            "the CONNECT stream finished mid-frame",
+            |peer| {
+                peer.control(DRAFT02);
+                let connect = peer.libp2p_connect();
+                // A DATA frame declaring 4 bytes, with only 1.
+                let mut data = frame_header(frame_type::DATA, 4);
+                data.push(0);
+                assert_eq!(peer.raw.write(connect, &data), data.len());
+                peer.raw.finish(connect);
+            },
+            code::H3_FRAME_ERROR,
+        ),
+        (
+            "the CONNECT stream finished mid-capsule",
+            |peer| {
+                peer.control(DRAFT02);
+                let connect = peer.libp2p_connect();
+                // A whole DATA frame holding only a capsule's header.
+                let capsule = frame_header(RESERVED_FRAME, 8);
+                let mut data = frame_header(frame_type::DATA, capsule.len() as u64);
+                data.extend(capsule);
+                assert_eq!(peer.raw.write(connect, &data), data.len());
+                peer.raw.finish(connect);
+            },
+            code::H3_MESSAGE_ERROR,
+        ),
     ];
     for &(row, script, expected) in rows {
         let (code, reason) = close_after(script);
@@ -843,7 +886,7 @@ fn a_stream_that_finished_before_noise_completed_is_delivered_whole() {
     peer.control(DRAFT02);
     peer.libp2p_connect();
     let mut early = 0;
-    peer.authenticate_with(&mut server, &mut events, |peer| {
+    peer.authenticate_with(&mut server, &mut events, |peer, _, _| {
         early = peer.wt_stream(b"early");
         peer.raw.finish(early);
     });
@@ -854,6 +897,66 @@ fn a_stream_that_finished_before_noise_completed_is_delivered_whole() {
         })
     });
     assert_eq!(crate::test_peer::stream_bytes(&events, early), b"early");
+}
+
+#[test]
+fn early_bytes_past_the_stream_window_wait_for_acks() {
+    let mut server = server_with(QuicLimits {
+        stream_receive_window: 512,
+        ..QuicLimits::default()
+    });
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(DRAFT02);
+    peer.libp2p_connect();
+    // More than two windows, read while the stream is held.
+    let payload: Vec<u8> = (0..=u8::MAX).cycle().take(1200).collect();
+    let mut early = 0;
+    peer.authenticate_with(&mut server, &mut events, |peer, server, events| {
+        early = peer.wt_stream(&[]);
+        peer.write_all(server, events, early, &payload);
+        peer.raw.finish(early);
+    });
+    let id = events
+        .iter()
+        .find_map(|event| match event {
+            TransportEvent::Connected { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("connected");
+    let stream = StreamId::new(early);
+    let finished = |events: &[TransportEvent]| {
+        events.iter().any(|event| {
+            matches!(event, TransportEvent::StreamRemoteWriteClosed { stream_id, .. }
+                if *stream_id == stream)
+        })
+    };
+    peer.drive(&mut server, &mut events, "the early stream", |_, events| {
+        !crate::test_peer::stream_bytes(events, early).is_empty()
+    });
+    // Within the window, and nothing more until the reader acknowledges.
+    let until = Instant::now() + Duration::from_millis(50);
+    peer.drive(&mut server, &mut events, "a while", |_, _| {
+        Instant::now() >= until
+    });
+    assert_eq!(crate::test_peer::stream_bytes(&events, early).len(), 512);
+    assert!(!finished(&events));
+
+    // Each acknowledgement releases the next window's worth.
+    for delivered in [1024, 1200] {
+        server.ack_stream(id, stream, 512).expect("ack");
+        let mut acked = Vec::new();
+        peer.drive(&mut server, &mut acked, "more early bytes", |_, acked| {
+            !crate::test_peer::stream_bytes(acked, early).is_empty()
+        });
+        events.extend(acked);
+        assert_eq!(
+            crate::test_peer::stream_bytes(&events, early).len(),
+            delivered
+        );
+    }
+    assert_eq!(crate::test_peer::stream_bytes(&events, early), payload);
+    assert!(finished(&events));
 }
 
 /// A frame header: its type and declared length.
@@ -960,6 +1063,19 @@ fn pre_auth_caps_close_with_their_codes() {
                 // counts as early until Noise completes.
                 for _ in 0..5 {
                     peer.wt_stream(&[]);
+                }
+            },
+            code::H3_EXCESSIVE_LOAD,
+        ),
+        (
+            "five unfinished request heads before the session",
+            |peer| {
+                peer.control(DRAFT02);
+                // HEADERS frames that declare 16 KiB and send none of it.
+                for _ in 0..5 {
+                    let stream = peer.raw.open();
+                    let head = frame_header(frame_type::HEADERS, 16 * 1024);
+                    assert_eq!(peer.raw.write(stream, &head), head.len());
                 }
             },
             code::H3_EXCESSIVE_LOAD,
@@ -1073,4 +1189,31 @@ fn a_failed_noise_handshake_closes_with_an_error_code() {
             "{row}: closed with {code:#x} ({reason})"
         );
     }
+}
+
+#[test]
+fn a_stream_reset_before_its_prefix_has_the_servers_side_reset_too() {
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(DRAFT02);
+    let stream = peer.raw.open();
+    // The first byte of the two-byte `0x41` prefix, then a reset.
+    assert_eq!(peer.raw.write(stream, &[0x40]), 1);
+    peer.raw.reset(stream, 0);
+    peer.drive(&mut server, &mut events, "the server's reset", |peer, _| {
+        let mut recv = peer.raw.conn().recv_stream(crate::test_peer::sid(stream));
+        let Ok(mut chunks) = recv.read(true) else {
+            return false;
+        };
+        let reset = matches!(
+            chunks.next(usize::MAX),
+            Err(quinn_proto::ReadError::Reset(_))
+        );
+        let _credit = chunks.finalize();
+        reset
+    });
+    // The session goes on.
+    peer.libp2p_connect();
+    peer.authenticate(&mut server, &mut events);
 }

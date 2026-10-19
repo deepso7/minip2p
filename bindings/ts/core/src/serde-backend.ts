@@ -104,6 +104,12 @@ export interface SerdeBackendOptions {
   readonly call?: <T>(operation: () => T) => T;
   /** The shell's circuit-address helper (a module function of its native). */
   readonly circuitAddress: (relayAddress: string, peerId: string) => string;
+  /**
+   * Frees the native endpoint once `close` finished and its final events
+   * drained; nothing calls native after it. The browser shell frees its
+   * wasm object here; without it, the garbage collector does.
+   */
+  readonly release?: () => void;
 }
 
 /** Native drain batch size. */
@@ -140,7 +146,7 @@ export class SerdeBackend implements Minip2pBackend {
   start(listener: (event: P2pEvent) => void): void {
     this.#listener = listener;
     const events = new EventDrain(
-      (limit) => this.#native((native) => native.drainEvents(limit)),
+      (limit) => this.#drain(limit),
       (event: NativeEvent) => {
         if (event.tag === P2pEvent_Tags.EndpointClosed) {
           events.stop();
@@ -182,15 +188,19 @@ export class SerdeBackend implements Minip2pBackend {
    * Fails the endpoint without native's help, for a native instance that
    * can no longer run (a trapped wasm module): `DriverFailed` reaches the
    * SDK on a later turn and `close` resolves `Failed` without calling
-   * native again. Idempotent; a no-op once `close` was requested.
+   * native again. Idempotent. Once `close` was requested it only settles
+   * `close`: the SDK no longer listens for events.
    */
   fail(detail: string): void {
-    if (this.#failed || this.#close.requested) {
+    if (this.#failed) {
       return;
     }
     this.#failed = true;
     this.#events?.stop();
     this.#close.settle({ outcome: CloseOutcome.Failed, unfinished: [] });
+    if (this.#close.requested) {
+      return;
+    }
     const listener = this.#listener;
     if (listener !== undefined) {
       queueMicrotask(() => {
@@ -211,13 +221,33 @@ export class SerdeBackend implements Minip2pBackend {
   }
 
   close(timeoutMs: number): Promise<BackendClosed> {
-    return this.#close.close(this.#started, () => {
-      if (!this.#failed) {
-        this.#native((native) => {
-          native.close(timeoutMs);
-        });
+    return this.#close.close(
+      this.#started,
+      () => {
+        if (!this.#failed) {
+          this.#native((native) => {
+            native.close(timeoutMs);
+          });
+        }
+      },
+      () => {
+        this.#events?.stop();
+        this.#events = undefined;
+        this.#options.release?.();
       }
-    });
+    );
+  }
+
+  /** One native drain; a throw means native can no longer run. */
+  #drain(limit: number): NativeEvent[] {
+    try {
+      return this.#native((native) => native.drainEvents(limit));
+    } catch (error) {
+      this.fail(
+        `draining native events failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return [];
+    }
   }
 
   peerId(): string {

@@ -18,9 +18,9 @@
 //! cap bounds, and handed over with them.
 //!
 //! Before authentication every allocation is capped: the codec's frame,
-//! capsule and QPACK caps, at most [`MAX_EARLY_STREAMS`] held streams, and
-//! [`MAX_EARLY_BYTES`] across request heads and held streams. Past a cap the
-//! connection closes with `H3_EXCESSIVE_LOAD`.
+//! capsule and QPACK caps, at most [`MAX_EARLY_STREAMS`] unfinished heads
+//! and held streams, and [`MAX_EARLY_BYTES`] across request heads and held
+//! streams. Past a cap the connection closes with `H3_EXCESSIVE_LOAD`.
 //!
 //! The session also ends orderly, in either direction: [`WtSession::close`]
 //! sends `CLOSE_WEBTRANSPORT_SESSION` and finishes the CONNECT stream, and a
@@ -46,8 +46,9 @@ use minip2p_webtransport::h3::{
 use minip2p_webtransport::qpack::{FieldSection, QpackDecoder, encode_field_section};
 use quinn_proto::{Connection, Dir, ReadError, StreamId, VarInt};
 
-/// Prefixed streams held before the session is authenticated, the Noise
-/// stream among them until Noise completes; one more fails the connection.
+/// Peer bidi streams open before the session is authenticated, other than
+/// the CONNECT stream: unfinished request heads, held prefixed streams, and
+/// the Noise stream until Noise completes. One more fails the connection.
 const MAX_EARLY_STREAMS: usize = 4;
 
 /// Bytes read before the session is authenticated, from request heads (up
@@ -378,6 +379,9 @@ impl WtSession {
             }
             Dir::Bi => {
                 self.heads.insert(raw, FrameDecoder::new());
+                if self.too_many_early_streams() {
+                    return;
+                }
             }
         }
         self.on_readable(conn, raw);
@@ -449,6 +453,23 @@ impl WtSession {
                 "too many bytes before the session was authenticated".into(),
             );
         }
+    }
+
+    /// Checks the early streams against [`MAX_EARLY_STREAMS`], failing the
+    /// connection past it; returns whether it failed.
+    fn too_many_early_streams(&mut self) -> bool {
+        if self.established {
+            return false;
+        }
+        let early = self.heads.len() + self.held.len() + usize::from(self.noise.is_some());
+        if early <= MAX_EARLY_STREAMS {
+            return false;
+        }
+        self.fail(
+            code::H3_EXCESSIVE_LOAD,
+            "too many streams before the session was authenticated".into(),
+        );
+        true
     }
 
     fn fail(&mut self, code: u64, reason: String) {
@@ -624,8 +645,10 @@ impl WtSession {
                 }
                 Ok(None) | Err(ReadError::Reset(_)) => {
                     let _credit = chunks.finalize();
-                    // Ended before saying what it is: nothing to keep.
+                    // Ended before saying what it is: nothing to keep, and
+                    // our unused side is reset so the stream is freed.
                     self.heads.remove(&raw);
+                    reset(conn, raw, code::H3_REQUEST_INCOMPLETE);
                     self.count_early(consumed);
                     return;
                 }
@@ -773,12 +796,28 @@ impl WtSession {
                 Err(error) => break Some(error),
             }
         };
+        let mut failure = failure.map(|error| (error.code(), format!("CONNECT stream: {error}")));
         if !matches!(end, ReadEnd::Open) {
             connect.peer_ended = true;
             closed_with.get_or_insert(0);
         }
-        if let Some(error) = failure {
-            self.fail(error.code(), format!("CONNECT stream: {error}"));
+        // A FIN must fall between frames and between capsules; a reset may
+        // cut anywhere.
+        if matches!(end, ReadEnd::Finished) && failure.is_none() {
+            if !connect.frames.is_at_frame_boundary() {
+                failure = Some((
+                    code::H3_FRAME_ERROR,
+                    "the CONNECT stream ended mid-frame".into(),
+                ));
+            } else if !connect.capsules.is_at_capsule_boundary() {
+                failure = Some((
+                    code::H3_MESSAGE_ERROR,
+                    "the CONNECT stream ended mid-capsule".into(),
+                ));
+            }
+        }
+        if let Some((code, reason)) = failure {
+            self.fail(code, reason);
         } else if let Some(code) = closed_with {
             self.peer_closed(code);
         }
@@ -805,12 +844,7 @@ impl WtSession {
             data: Vec::new(),
             end: ReadEnd::Open,
         });
-        // The Noise stream counts until Noise completes.
-        if self.held.len() + usize::from(self.noise.is_some()) > MAX_EARLY_STREAMS {
-            self.fail(
-                code::H3_EXCESSIVE_LOAD,
-                "too many WebTransport streams before the session was authenticated".into(),
-            );
+        if self.too_many_early_streams() {
             return;
         }
         // What already sits behind the prefix.
@@ -1058,11 +1092,16 @@ fn stop(conn: &mut Connection, raw: u64, code: u64) {
     }
 }
 
-/// Refuses a peer bidi stream: stop and reset.
-fn refuse(conn: &mut Connection, raw: u64, code: u64) {
-    stop(conn, raw, code);
+/// Resets our sending half of a peer bidi stream.
+fn reset(conn: &mut Connection, raw: u64, code: u64) {
     let code = VarInt::from_u64(code).unwrap_or(VarInt::from_u32(0));
     match conn.send_stream(engine_stream(raw)).reset(code) {
         Ok(()) | Err(_) => {}
     }
+}
+
+/// Refuses a peer bidi stream: stop and reset.
+fn refuse(conn: &mut Connection, raw: u64, code: u64) {
+    stop(conn, raw, code);
+    reset(conn, raw, code);
 }

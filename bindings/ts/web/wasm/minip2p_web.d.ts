@@ -16,7 +16,7 @@ export class WebEndpoint {
      */
     abandonStream(conn_id: bigint, stream_id: bigint): void;
     /**
-     * The active relay reservation (always `null` for now).
+     * The relay reservation currently held, or `null`.
      */
     activeReservation(): any;
     /**

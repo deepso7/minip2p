@@ -237,12 +237,15 @@ impl ClientCertVerifier for Libp2pVerifier {
 /// The current WebTransport certificate, swapped in place on rotation.
 pub(crate) type WebTransportCertificate = Arc<RwLock<Arc<CertifiedKey>>>;
 
-/// Picks a WebTransport-serving socket's certificate by ALPN: a client
-/// offering `libp2p` negotiates it (the server's preference) and gets the
-/// libp2p certificate; any other client gets the WebTransport certificate.
+/// Picks a WebTransport-serving socket's certificate by ALPN: on a socket
+/// that also serves `quic-v1`, a client offering `libp2p` negotiates it (the
+/// server's preference) and gets the libp2p certificate; any other client,
+/// and every client of an `h3`-only socket, gets the WebTransport
+/// certificate.
 #[derive(Debug)]
 struct AlpnResolver {
-    libp2p: Arc<CertifiedKey>,
+    /// Set when the socket also serves `quic-v1`.
+    libp2p: Option<Arc<CertifiedKey>>,
     webtransport: WebTransportCertificate,
 }
 
@@ -251,8 +254,8 @@ impl ResolvesServerCert for AlpnResolver {
         let offers_libp2p = client_hello
             .alpn()
             .is_some_and(|mut offered| offered.any(|protocol| protocol == ALPN));
-        if offers_libp2p {
-            return Some(Arc::clone(&self.libp2p));
+        if let Some(libp2p) = self.libp2p.as_ref().filter(|_| offers_libp2p) {
+            return Some(Arc::clone(libp2p));
         }
         // A writer that panicked left a whole certificate behind.
         let current = match self.webtransport.read() {
@@ -344,7 +347,7 @@ impl TlsIdentity {
         libp2p: bool,
     ) -> Result<rustls::ServerConfig, rustls::Error> {
         let resolver = AlpnResolver {
-            libp2p: Arc::clone(&self.key),
+            libp2p: libp2p.then(|| Arc::clone(&self.key)),
             webtransport,
         };
         let alpns = if libp2p {

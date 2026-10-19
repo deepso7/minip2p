@@ -327,7 +327,7 @@ impl WebEndpoint {
         js_result(self.host.reachability())
     }
 
-    /// The active relay reservation (always `null` for now).
+    /// The relay reservation currently held, or `null`.
     #[wasm_bindgen(js_name = activeReservation)]
     pub fn active_reservation(&mut self) -> Result<JsValue, JsValue> {
         js_result(self.host.active_reservation())

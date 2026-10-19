@@ -152,6 +152,7 @@ class Pump {
  */
 class WasmCalls {
   readonly #onFail: (detail: string) => void;
+  /** Trapped, or the instance was freed. */
   #failed = false;
 
   constructor(onFail: (detail: string) => void) {
@@ -172,6 +173,14 @@ class WasmCalls {
       const detail = `the minip2p wasm module trapped: ${error.message}`;
       this.#onFail(detail);
       throw new DriverFailedError(DriverFailureKind.Panic, detail);
+    }
+  }
+
+  /** Runs `free` unless the instance trapped; later calls throw `ClosedError`. */
+  release(free: () => void): void {
+    if (!this.#failed) {
+      this.#failed = true;
+      free();
     }
   }
 }
@@ -204,6 +213,14 @@ function webBackend(config: Minip2pConfig): Minip2pBackend {
       }
     },
     circuitAddress,
+    // Closed and drained: stop pumping and free the wasm object, which
+    // drops its doorbell and `JsIo`.
+    release: () => {
+      pump.stop();
+      calls.release(() => {
+        endpoint.free();
+      });
+    },
     schedule: (task) => {
       queueMicrotask(task);
     },

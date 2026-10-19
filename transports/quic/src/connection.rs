@@ -137,6 +137,10 @@ struct StreamRuntimeState {
     /// outlives the stream's close until they are acknowledged: the stream
     /// holds its slot until it settles.
     unacked: usize,
+    /// What a WebTransport stream carried while it was held, not yet
+    /// delivered for want of receive room, and how its read ended then.
+    /// Delivered ahead of anything the engine has behind it.
+    held: Option<(Vec<u8>, ReadEnd)>,
     /// A control stream may queue into the connection cap's reserve
     /// ([`Transport::set_control_stream`](minip2p_transport::Transport::set_control_stream)).
     control: bool,
@@ -823,12 +827,51 @@ impl QuicConnection {
             }
         }
 
+        let mut room = room;
+        if let Some(state) = self.stream_states.get_mut(&raw)
+            && let Some((mut held, end)) = state.held.take()
+        {
+            let take = room.min(held.len());
+            room -= take;
+            if take > 0 {
+                // A partial take is copied out, so it never pins the rest.
+                let data = if take == held.len() {
+                    Bytes::from(mem::take(&mut held))
+                } else {
+                    let data = Bytes::copy_from_slice(held.get(..take).unwrap_or_default());
+                    held.drain(..take);
+                    data
+                };
+                state.unacked += take;
+                events.push(TransportEvent::StreamData {
+                    id: self.id,
+                    stream_id: StreamId::new(raw),
+                    data,
+                });
+            }
+            if !held.is_empty() {
+                state.held = Some((held, end));
+                self.gated.insert(raw);
+                return;
+            }
+            let end = match end {
+                ReadEnd::Open => None,
+                ReadEnd::Finished => Some(ScanEnd::Finished),
+                ReadEnd::Reset => Some(ScanEnd::Reset),
+            };
+            if let Some(end) = end {
+                // The engine's side of the stream ended while it was held.
+                self.gated.remove(&raw);
+                self.on_scan_end(raw, end, events);
+                return;
+            }
+        }
+
         let (read, end) = {
             let mut recv = self.conn.recv_stream(stream);
             let Ok(mut chunks) = recv.read(true) else {
                 return;
             };
-            let mut room = room;
             let mut read = 0;
             let end = loop {
                 if room == 0 {
@@ -877,7 +920,8 @@ impl QuicConnection {
     }
 
     /// Delivers what a WebTransport stream carried while it was held, then
-    /// whatever the engine has behind it.
+    /// whatever the engine has behind it, through the read gate like any
+    /// read: past the receive room, the rest waits for acknowledgements.
     fn deliver_early(
         &mut self,
         raw: u64,
@@ -885,21 +929,10 @@ impl QuicConnection {
         end: ReadEnd,
         events: &mut Vec<TransportEvent>,
     ) {
-        if !early.is_empty() {
-            if let Some(state) = self.stream_states.get_mut(&raw) {
-                state.unacked += early.len();
-            }
-            events.push(TransportEvent::StreamData {
-                id: self.id,
-                stream_id: StreamId::new(raw),
-                data: Bytes::from(early),
-            });
+        if let Some(state) = self.stream_states.get_mut(&raw) {
+            state.held = Some((early, end));
         }
-        match end {
-            ReadEnd::Open => self.scan(raw, events),
-            ReadEnd::Finished => self.on_scan_end(raw, ScanEnd::Finished, events),
-            ReadEnd::Reset => self.on_scan_end(raw, ScanEnd::Reset, events),
-        }
+        self.scan(raw, events);
     }
 
     /// Acts on how a read of a surfaced stream ended: FIN, reset, or not

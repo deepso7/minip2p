@@ -43,6 +43,8 @@ struct FakeStream {
     granted: usize,
     fin: bool,
     reset: bool,
+    /// `write` fails, as for a stream the platform no longer has.
+    refuse: bool,
 }
 
 /// A platform that records calls and delivers what the test queues.
@@ -131,6 +133,9 @@ impl WebTransportIo for FakeIo {
         let cap = self.in_flight_cap;
         let room = cap - self.in_flight(stream);
         let state = self.stream(stream);
+        if state.refuse {
+            return Err(IoError("not writable".into()));
+        }
         let accepted = data.len().min(room);
         if accepted > 0 {
             state
@@ -557,4 +562,150 @@ fn a_handshake_that_does_not_finish_in_time_closes_with_timed_out() {
     );
     assert_eq!(client.io_mut().closed_sessions.len(), 1);
     assert_eq!(client.next_deadline(), None);
+}
+
+#[test]
+fn a_peer_reset_resets_the_platform_stream_and_frees_its_writes() {
+    let mut client = client(small_limits());
+    let conn = connect(&mut client);
+    client.io_mut().in_flight_cap = 30;
+    let (a, a_handle) = open(&mut client, &conn);
+    assert_eq!(send(&mut client, &conn, a, 100), 0);
+    client.io_mut().events.push_back(IoEvent::Reset {
+        stream: a_handle,
+        code: 0,
+    });
+    assert_eq!(
+        poll(&mut client),
+        [TransportEvent::StreamClosed {
+            id: conn.id,
+            stream_id: a
+        }]
+    );
+    assert!(
+        client.io_mut().stream(a_handle).reset,
+        "our side is reset too"
+    );
+    // A's 100 pending bytes are free again.
+    let (b, _) = open(&mut client, &conn);
+    let (c, _) = open(&mut client, &conn);
+    assert_eq!(send(&mut client, &conn, b, 100), 0);
+    assert_eq!(send(&mut client, &conn, c, 100), 0);
+}
+
+/// Whether nothing but `payload` itself still holds its allocation.
+fn unpinned(payload: Bytes) -> bool {
+    payload.try_into_mut().is_ok()
+}
+
+#[test]
+fn queued_tails_never_pin_more_than_twice_their_bytes() {
+    let mut client = client(small_limits());
+    let conn = connect(&mut client);
+    // The platform takes nothing: the accepted 100 bytes wait in Rust.
+    client.io_mut().in_flight_cap = 0;
+    let (a, _) = open(&mut client, &conn);
+    let payload = Bytes::from(vec![1u8; 10_000]);
+    let refused = client.send_stream(conn.id, a, payload.clone());
+    assert!(
+        matches!(&refused, Err(TransportError::Full { unsent, .. }) if unsent.len() == 9_900),
+        "{refused:?}"
+    );
+    drop(refused);
+    assert!(unpinned(payload), "100 queued bytes pin 10 000");
+
+    // A tail the platform shrinks below half is copied out too.
+    client.io_mut().in_flight_cap = 30;
+    let (b, b_handle) = open(&mut client, &conn);
+    let payload = Bytes::from(vec![2u8; 100]);
+    client
+        .send_stream(conn.id, b, payload.clone())
+        .expect("fits");
+    client.io_mut().complete(b_handle);
+    poll(&mut client);
+    assert_eq!(client.io_mut().stream(b_handle).written.len(), 60);
+    assert!(unpinned(payload), "a 40-byte tail pins 100");
+}
+
+#[test]
+fn stop_sending_after_stream_closed_still_frees_in_flight_writes() {
+    let mut client = client(small_limits());
+    let conn = connect(&mut client);
+    let (a, a_handle) = open(&mut client, &conn);
+    assert_eq!(send(&mut client, &conn, a, 100), 0);
+    client.close_stream_write(conn.id, a).expect("fin");
+    client
+        .io_mut()
+        .events
+        .push_back(IoEvent::Fin { stream: a_handle });
+    assert_eq!(
+        poll(&mut client),
+        [
+            TransportEvent::StreamRemoteWriteClosed {
+                id: conn.id,
+                stream_id: a
+            },
+            TransportEvent::StreamClosed {
+                id: conn.id,
+                stream_id: a
+            }
+        ]
+    );
+
+    // The browser rejects the write in flight: no WriteCompleted follows.
+    client.io_mut().events.push_back(IoEvent::StopSending {
+        stream: a_handle,
+        code: 0,
+    });
+    assert_eq!(poll(&mut client), [], "nothing after StreamClosed");
+    let (b, _) = open(&mut client, &conn);
+    let (c, _) = open(&mut client, &conn);
+    let (d, _) = open(&mut client, &conn);
+    assert_eq!(send(&mut client, &conn, b, 100), 0);
+    assert_eq!(send(&mut client, &conn, c, 100), 0);
+    assert_eq!(
+        send(&mut client, &conn, d, 100),
+        50,
+        "A's 100 bytes are free"
+    );
+}
+
+#[test]
+fn a_write_the_platform_refuses_fails_the_send() {
+    let mut client = client(small_limits());
+    let conn = connect(&mut client);
+    let (a, a_handle) = open(&mut client, &conn);
+    client.io_mut().stream(a_handle).refuse = true;
+    assert!(matches!(
+        client.send_stream(conn.id, a, Bytes::from_static(b"lost")),
+        Err(TransportError::StreamSendFailed { .. })
+    ));
+    assert!(matches!(
+        client.send_stream(conn.id, a, Bytes::from_static(b"more")),
+        Err(TransportError::StreamSendFailed { .. })
+    ));
+}
+
+#[test]
+fn a_queued_write_the_platform_later_refuses_stops_the_write_side() {
+    let mut client = client(small_limits());
+    let conn = connect(&mut client);
+    client.io_mut().in_flight_cap = 30;
+    let (a, a_handle) = open(&mut client, &conn);
+    assert_eq!(send(&mut client, &conn, a, 100), 0);
+    // 70 bytes wait in Rust; the platform then drops the stream.
+    client.io_mut().stream(a_handle).refuse = true;
+    client.io_mut().complete(a_handle);
+    assert_eq!(
+        poll(&mut client),
+        [TransportEvent::StreamWriteStopped {
+            id: conn.id,
+            stream_id: a,
+            error_code: 0
+        }]
+    );
+    let (b, _) = open(&mut client, &conn);
+    let (c, _) = open(&mut client, &conn);
+    assert_eq!(send(&mut client, &conn, b, 100), 0);
+    assert_eq!(send(&mut client, &conn, c, 100), 0, "A's bytes are free");
 }
