@@ -1,0 +1,21 @@
+# libp2p WebTransport: server inside the QUIC transport, browser I/O behind a TypeScript seam
+
+Browsers reach native minip2p nodes over libp2p WebTransport ([plan](../plans/webtransport.md), [research](../research/webtransport.md), spec #390). They speak WebTransport over HTTP/3 on QUIC, pin the server certificate by hash, and run Noise XX on the session's first stream. We decided:
+
+- **Addresses (plan Decision 1).** `/…/udp/<port>/quic-v1/webtransport/certhash/…` is its own shape: `Multiaddr::is_webtransport()`, with `is_quic_transport()` staying exact. Both shapes are `TransportKind::Quic`, so `TransportSet` keeps one member per kind and routes them to the QUIC transport. Everything that hole punches or picks NAT candidates checks `is_quic_transport()`, so a WebTransport address never becomes a punch target. An inbound `h3` connection's endpoint is `/…/quic-v1/webtransport` (no certhash) before `Connected`, which keeps the browser's observed address and inbound source out of hole punching too. Native nodes do not dial WebTransport; they use `quic-v1` with each other.
+- **One socket, two ALPNs (Decision 3).** WebTransport is served by `minip2p-quic` itself, on the same UDP socket and quinn endpoint as `quic-v1`. A socket's server config is chosen per socket: ALPN `libp2p`, `h3`, or both, from the shapes it was bound with. The certificate is chosen by ALPN. Client certificates become optional on `h3`-serving sockets, and the libp2p certificate requirement moves to the end of the handshake, so a `libp2p` connection without one still never reaches `Connected`. Stream events are gated on authentication for every connection. The HTTP/3 and WebTransport session (`WtSession`) runs inside `QuicConnection` on a shared sans-I/O codec, `minip2p-webtransport`.
+- **Browser I/O behind a TypeScript seam (Decision 9).** Rust stays caller-driven with no async: `WebTransportIo` is a provider trait shaped like `TcpProvider`, implemented in TypeScript around the browser's `WebTransport` object, which turns promise results into queued events. `WebTransportClient<Io>` in `minip2p-webtransport` owns the protocol: URL, certhash pinning, Noise as initiator, the certhash check against the server's Noise extensions, and the transport contract. A test-only quinn-proto `WebTransportIo` drives it natively against the real listener.
+- **Thread-free host core (Decision 12).** `minip2p-ffi-core` splits into a thread-free core (carry, event conversion, config and key helpers) and the std driver behind a default `driver` feature, so the browser shell reuses the same host logic without threads.
+
+## Rejected alternatives
+
+- **A separate WebTransport transport with its own socket.** It needs a second port, or two engines sharing a socket. Browsers dial the same port libp2p peers do, so the QUIC transport has to dispatch by ALPN anyway.
+- **A Rust `web-sys` / `wasm-bindgen-futures` client.** It brings async and a wasm runtime into Rust and ties the client to one platform; the TypeScript seam keeps Rust executor-free and lets any platform implement the I/O.
+- **The async `h3` / `wtransport` crates.** They are async, own their sockets and do not fit a caller-driven, sans-I/O transport; the subset of HTTP/3 libp2p needs is small enough to own.
+- **WebSocket first.** It needs TLS certificates from a CA or a reverse proxy, which most nodes do not have; WebTransport's certhashes work with self-signed certificates.
+
+## Consequences
+
+- On a socket that serves both shapes, libp2p peers also see the `h3` transport parameters (three peer unidirectional streams, the DATAGRAM parameter); `quic-v1`-only sockets are unchanged.
+- WebTransport is opt-in: only a `/…/quic-v1/webtransport` listen address turns it on.
+- Native WebTransport dialing is a follow-up: promote the test client's `WebTransportIo` to a real provider.
