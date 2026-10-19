@@ -137,7 +137,7 @@ struct Connect {
 /// The client's session flow-control credit for what we send (draft-13/14,
 /// once the client offered more than one session or any nonzero
 /// `WT_INITIAL_MAX_*`): server-opened bidi streams, and stream bytes after
-/// their prefixes. Noise's handshake bytes are not counted.
+/// their prefixes, Noise's replies included.
 #[derive(Debug, Default)]
 struct Credit {
     max_streams: u64,
@@ -173,6 +173,10 @@ struct NoiseStream {
     id: u64,
     /// `None` once the handshake completed.
     session: Option<NoiseSession>,
+    /// Replies the client's data credit does not cover yet.
+    pending: Vec<u8>,
+    /// A FIN follows `pending`.
+    fin: bool,
 }
 
 /// The WebTransport session of one `h3` connection.
@@ -929,6 +933,9 @@ impl WtSession {
             self.fail(code, reason);
         } else if let Some(code) = closed_with {
             self.peer_closed(code);
+        } else {
+            // New credit may release Noise replies.
+            self.release_noise(conn);
         }
     }
 
@@ -1055,8 +1062,32 @@ impl WtSession {
         self.noise = Some(NoiseStream {
             id: held.id,
             session: Some(session),
+            pending: Vec::new(),
+            fin: false,
         });
         self.feed_noise(conn, held.data, held.end);
+    }
+
+    /// Writes as much of the Noise replies as the client's data credit
+    /// allows (draft-14 §5.4: they are stream data like any other), and
+    /// the FIN after the last.
+    fn release_noise(&mut self, conn: &mut Connection) {
+        let room = self.data_room();
+        let Some(noise) = self.noise.as_mut() else {
+            return;
+        };
+        let take = room.min(noise.pending.len());
+        let bytes: Vec<u8> = noise.pending.drain(..take).collect();
+        let fin = std::mem::take(&mut noise.fin);
+        // The FIN waits for the last byte.
+        noise.fin = fin && !noise.pending.is_empty();
+        let fin = fin && noise.pending.is_empty();
+        let raw = noise.id;
+        if bytes.is_empty() && !fin {
+            return;
+        }
+        self.note_sent(take);
+        self.send(conn, raw, bytes, fin);
     }
 
     /// Reads the Noise stream into the responder.
@@ -1076,7 +1107,6 @@ impl WtSession {
         let Some(noise) = self.noise.as_mut() else {
             return;
         };
-        let raw = noise.id;
         let Some(session) = noise.session.as_mut() else {
             // Done: whatever follows is ignored.
             return;
@@ -1100,9 +1130,9 @@ impl WtSession {
             }
         }
         let token = session.handshake_hash();
-        if !outbound.is_empty() || peer.is_some() {
-            self.send(conn, raw, outbound, peer.is_some());
-        }
+        noise.pending.extend_from_slice(&outbound);
+        noise.fin |= peer.is_some();
+        self.release_noise(conn);
         if let (Some(peer), Some(token)) = (peer, token) {
             if let Some(noise) = self.noise.as_mut() {
                 noise.session = None;

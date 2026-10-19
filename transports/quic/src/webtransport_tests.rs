@@ -1047,26 +1047,6 @@ fn draft14_server_streams_wait_for_the_clients_stream_credit() {
 }
 
 #[test]
-fn draft14_server_bytes_wait_for_the_clients_data_credit() {
-    let mut settings = DRAFT14.to_vec();
-    settings.retain(|&(id, _)| id != setting::WT_INITIAL_MAX_DATA);
-    settings.push((setting::WT_INITIAL_MAX_DATA, 4));
-    let (mut server, mut peer, id) = established(&settings);
-    let streams = [server_stream(&mut server, id, b"0123456789")];
-    let mut read = [None];
-    assert_eq!(
-        settle(&mut server, &mut peer, &streams, &mut read),
-        [Some(b"0123".to_vec())]
-    );
-
-    peer.capsule(&Capsule::MaxData(10));
-    assert_eq!(
-        settle(&mut server, &mut peer, &streams, &mut read),
-        [Some(b"0123456789".to_vec())]
-    );
-}
-
-#[test]
 fn more_than_one_session_enables_flow_control_with_zero_initial_credit() {
     let mut server = server();
     let mut events = Vec::new();
@@ -1093,6 +1073,78 @@ fn more_than_one_session_enables_flow_control_with_zero_initial_credit() {
     assert_eq!(
         settle(&mut server, &mut peer, &streams, &mut read),
         [Some(b"a".to_vec())]
+    );
+}
+
+#[test]
+fn draft14_noise_replies_and_server_bytes_wait_for_the_clients_data_credit() {
+    let mut settings = DRAFT14.to_vec();
+    settings.retain(|&(id, _)| id != setting::WT_INITIAL_MAX_DATA);
+    settings.push((setting::WT_INITIAL_MAX_DATA, 1));
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(&settings);
+    peer.libp2p_connect();
+    let mut noise = initiator();
+    let stream = peer.wt_stream(&outbound(&mut noise).0);
+    let mut reply = 0;
+    let mut read = |peer: &mut H3Peer, noise: &mut NoiseSession| {
+        let (bytes, _) = peer.raw.read(stream);
+        reply += bytes.len();
+        if !bytes.is_empty() {
+            noise.on_data(bytes).expect("noise data");
+        }
+        reply
+    };
+    let until = Instant::now() + Duration::from_millis(100);
+    peer.drive(&mut server, &mut events, "a while", |peer, _| {
+        read(peer, &mut noise);
+        Instant::now() >= until
+    });
+    assert_eq!(read(&mut peer, &mut noise), 1, "one byte of credit");
+
+    // The rest of the reply once credit allows, then the last message.
+    peer.capsule(&Capsule::MaxData(4096));
+    let mut last = None;
+    peer.drive(&mut server, &mut events, "the Noise reply", |peer, _| {
+        read(peer, &mut noise);
+        let (out, complete) = outbound(&mut noise);
+        if complete {
+            last = Some(out);
+        }
+        complete
+    });
+    let last = last.expect("the last message");
+    assert_eq!(peer.raw.write(stream, &last), last.len());
+    peer.drive(&mut server, &mut events, "Connected", |_, events| {
+        connected(events)
+    });
+    let id = events
+        .iter()
+        .find_map(|event| match event {
+            TransportEvent::Connected { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("connected");
+
+    // The reply's bytes stay spent: a stream gets only what is left.
+    let left = 4096 - read(&mut peer, &mut noise);
+    let stream = server.open_stream(id).expect("open");
+    server
+        .send_stream(id, stream, Bytes::from(vec![7u8; 4096]))
+        .expect("send");
+    let streams = [stream.as_u64()];
+    let mut seen = [None];
+    assert_eq!(
+        settle(&mut server, &mut peer, &streams, &mut seen),
+        [Some(vec![7u8; left])]
+    );
+
+    peer.capsule(&Capsule::MaxData(8192));
+    assert_eq!(
+        settle(&mut server, &mut peer, &streams, &mut seen),
+        [Some(vec![7u8; 4096])]
     );
 }
 
