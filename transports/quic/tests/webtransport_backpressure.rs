@@ -13,6 +13,10 @@ use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_transport::{Bytes, ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 use minip2p_webtransport::{WebTransportClient, WebTransportLimits};
 
+#[expect(
+    dead_code,
+    reason = "shared with tests/webtransport.rs, which uses more of it"
+)]
 #[path = "common/wt_client.rs"]
 mod wt_client;
 use wt_client::{Options, QuinnIo};

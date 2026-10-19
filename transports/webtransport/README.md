@@ -50,7 +50,7 @@ assert_eq!(section.get(b":status"), Some(&b"200"[..]));
 
 ## `WebTransportIo` and `WebTransportClient`
 
-`WebTransportIo` is the seam to a platform's WebTransport API: in a browser, TypeScript around the `WebTransport` object. It is caller-driven like the rest of minip2p. Calls return at once (`connect` with the URL and certhashes, `open_stream`, `write`, `close_write`, `reset`, `stop`, `grant_read`, `close`), and what the platform learns later comes back as `IoEvent`s from `poll_event`: `SessionReady`, `SessionClosed`, `StreamOpened`, `IncomingStream`, `Data`, `Fin`, `Reset`, `StopSending` and `WriteCompleted`. `write` copies what it accepts, and a short write is backpressure that a later `WriteCompleted` releases. `Data` never exceeds what `grant_read` allowed.
+`WebTransportIo` is the seam to a platform's WebTransport API: in a browser, TypeScript around the `WebTransport` object. It is caller-driven like the rest of minip2p. Calls return at once (`connect` with the URL and certhashes, `open_stream`, `write`, `close_write`, `reset`, `stop`, `grant_read`, `close`), and what the platform learns later comes back as `IoEvent`s from `poll_event`: `SessionReady`, `SessionClosed`, `StreamOpened`, `IncomingStream`, `Data`, `Fin`, `Reset`, `StopSending` and `WriteCompleted`. `write` copies what it accepts, and a short write is backpressure that a later `WriteCompleted` releases. `Data` never exceeds what `grant_read` allowed. Stream codes cross the seam as WebTransport application codes, as a browser reports them; the platform maps them to and from HTTP/3's range (`webtransport_code_to_h3`). `close` sends a close capsule and finishes the CONNECT stream, as `WebTransport.close()` does, and the server closes QUIC.
 
 `WebTransportClient<Io, E>` is the libp2p WebTransport dialer over it, as a `minip2p_transport::Transport` (connection ids in `ConnectionNamespace::WEBTRANSPORT`). `dial` takes `/ip4|ip6|dns*/…/udp/<port>/quic-v1/webtransport/certhash/…/p2p/…`:
 
@@ -59,7 +59,7 @@ assert_eq!(section.get(b":status"), Some(&b"200"[..]));
 3. require every dialed certhash in the server's Noise extensions, or close with an `Error` reason;
 4. finish the Noise stream and emit `Connected`, with the Noise handshake hash as the connection token.
 
-Every later stream maps 1:1 onto a WebTransport stream. `listen` and dials without a `/certhash` are `Unsupported`.
+Every later stream maps 1:1 onto a WebTransport stream; `reset_stream` sends code 0, and a peer's stop code reaches `StreamWriteStopped` unchanged, matching the QUIC server's mapping. `listen` and dials without a `/certhash` are `Unsupported`.
 
 The client honours the full transport contract within `WebTransportLimits` (`WebTransportClient::with_limits`; `new` uses the defaults), mirroring the QUIC transport's limits: `max_connections`, `max_streams_per_connection` (per direction; the server's streams past it are reset with no event), `max_pending_bytes_per_stream`, `max_pending_connection_bytes`, `control_stream_reserve_bytes`, `stream_receive_window`, and `handshake_timeout_ms` (default 10 s, from the first poll that sees the dial, reported through `next_deadline`; expiry closes with `TimedOut`). Every byte sits in exactly one bounded place:
 
