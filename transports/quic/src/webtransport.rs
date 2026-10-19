@@ -778,11 +778,16 @@ impl WtSession {
         }
         connect.replied = true;
         // The highest draft both sides speak: 13/14 (Safari), else 02
-        // (Chrome, Firefox).
-        let draft14 = settings
-            .get(setting::WT_MAX_SESSIONS)
-            .is_some_and(|sessions| sessions >= 1);
-        let draft02 = settings.get(setting::ENABLE_WEBTRANSPORT) == Some(1);
+        // (Chrome, Firefox). Both need HTTP/3 datagrams, in SETTINGS and as
+        // the QUIC transport parameter (draft-14 §3.1, draft-02 §3.1);
+        // every browser sends both.
+        let datagrams = settings.get(setting::H3_DATAGRAM) == Some(1)
+            && conn.datagrams().max_size().is_some_and(|size| size > 0);
+        let draft14 = datagrams
+            && settings
+                .get(setting::WT_MAX_SESSIONS)
+                .is_some_and(|sessions| sessions >= 1);
+        let draft02 = datagrams && settings.get(setting::ENABLE_WEBTRANSPORT) == Some(1);
         let status = if draft14 || draft02 {
             connect.request_status
         } else {

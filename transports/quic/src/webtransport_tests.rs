@@ -53,10 +53,23 @@ struct H3Peer {
 impl H3Peer {
     /// Connects and drives until the QUIC handshake completes.
     fn connect(server: &mut QuicTransport, events: &mut Vec<TransportEvent>) -> Self {
+        Self::connect_tuned(server, events, |_| {})
+    }
+
+    /// [`Self::connect`] with transport parameters a browser would send,
+    /// then adjusted by `tune`.
+    fn connect_tuned(
+        server: &mut QuicTransport,
+        events: &mut Vec<TransportEvent>,
+        tune: impl FnOnce(&mut quinn_proto::TransportConfig),
+    ) -> Self {
         let mut config = foreign_client_config(&[b"h3"], None, Arc::default());
-        // Room for the server's control stream, as a browser grants.
+        // Room for the server's control stream, and QUIC DATAGRAM support.
         let mut transport = crate::test_peer::default_transport();
-        transport.max_concurrent_uni_streams(VarInt::from_u32(3));
+        transport
+            .max_concurrent_uni_streams(VarInt::from_u32(3))
+            .datagram_receive_buffer_size(Some(64 * 1024));
+        tune(&mut transport);
         config.transport_config(Arc::new(transport));
         let raw = RawPeer::connect_with(server.local_addr(), config);
         let mut peer = Self {
@@ -880,6 +893,41 @@ fn chrome_and_firefox_connect_captures_are_accepted() {
         peer.authenticate(&mut server, &mut events);
         assert_eq!(peer.status().as_deref(), Some("200"));
     }
+}
+
+#[test]
+fn a_client_without_http_datagrams_is_refused() {
+    let without = |offer: &[(u64, u64)]| {
+        let mut settings = offer.to_vec();
+        settings.retain(|&(id, _)| id != setting::H3_DATAGRAM);
+        settings
+    };
+    let disabled = |offer: &[(u64, u64)]| {
+        let mut settings = without(offer);
+        settings.push((setting::H3_DATAGRAM, 0));
+        settings
+    };
+    let fields = libp2p_request(b"webtransport");
+    for settings in [
+        without(DRAFT02),
+        disabled(DRAFT02),
+        without(DRAFT14),
+        disabled(DRAFT14),
+    ] {
+        assert_eq!(refused_with(&settings, &fields), "400", "{settings:?}");
+    }
+
+    // H3_DATAGRAM offered, but no QUIC DATAGRAM transport parameter.
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect_tuned(&mut server, &mut events, |transport| {
+        transport.datagram_receive_buffer_size(None);
+    });
+    peer.control(DRAFT02);
+    peer.libp2p_connect();
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
+    assert_eq!(code, code::H3_NO_ERROR, "{reason}");
+    assert_eq!(peer.status().as_deref(), Some("400"));
 }
 
 #[test]
