@@ -467,6 +467,48 @@ fn every_validation_matrix_row_closes_with_its_code() {
             code::H3_CLOSED_CRITICAL_STREAM,
         ),
         (
+            "a client push stream",
+            |peer| {
+                peer.uni(&[0x01, 0x00]);
+            },
+            code::H3_STREAM_CREATION_ERROR,
+        ),
+        (
+            "an Insert Count Increment of 0 on the QPACK decoder stream",
+            |peer| {
+                peer.uni(&[0x03, 0x00]);
+            },
+            code::QPACK_DECODER_STREAM_ERROR,
+        ),
+        (
+            "a Section Acknowledgment on the QPACK decoder stream",
+            |peer| {
+                peer.uni(&[0x03, 0x80]);
+            },
+            code::QPACK_DECODER_STREAM_ERROR,
+        ),
+        (
+            "CANCEL_PUSH before any MAX_PUSH_ID",
+            |peer| {
+                peer.control_bytes(&after_settings(&[0x03, 0x01, 0x00]));
+            },
+            code::H3_ID_ERROR,
+        ),
+        (
+            "CANCEL_PUSH past MAX_PUSH_ID",
+            |peer| {
+                peer.control_bytes(&after_settings(&[0x0d, 0x01, 0x02, 0x03, 0x01, 0x03]));
+            },
+            code::H3_ID_ERROR,
+        ),
+        (
+            "a smaller MAX_PUSH_ID",
+            |peer| {
+                peer.control_bytes(&after_settings(&[0x0d, 0x01, 0x02, 0x0d, 0x01, 0x01]));
+            },
+            code::H3_ID_ERROR,
+        ),
+        (
             "a control stream not starting with SETTINGS",
             |peer| {
                 peer.control_bytes(GOAWAY);
@@ -1229,6 +1271,21 @@ fn a_failed_noise_handshake_closes_with_an_error_code() {
             "{row}: closed with {code:#x} ({reason})"
         );
     }
+}
+
+#[test]
+fn legal_push_and_qpack_instructions_leave_the_session_up() {
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    // MAX_PUSH_ID 2, CANCEL_PUSH 2, MAX_PUSH_ID 2 again.
+    peer.control_bytes(&after_settings(&[
+        0x0d, 0x01, 0x02, 0x03, 0x01, 0x02, 0x0d, 0x01, 0x02,
+    ]));
+    // Stream Cancellations of streams 0 and 1000.
+    peer.uni(&[0x03, 0x40, 0x7f, 0xa9, 0x0f]);
+    peer.libp2p_connect();
+    peer.authenticate(&mut server, &mut events);
 }
 
 #[test]

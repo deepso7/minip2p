@@ -44,7 +44,9 @@ use minip2p_webtransport::h3::{
     Capsule, CapsuleDecoder, Frame, FrameDecoder, Settings, UniStreamHeaderDecoder, UniStreamType,
     code, encode_frame, encode_uni_stream_type, frame_type, setting,
 };
-use minip2p_webtransport::qpack::{FieldSection, QpackDecoder, encode_field_section};
+use minip2p_webtransport::qpack::{
+    DecoderStreamReader, FieldSection, QpackDecoder, encode_field_section,
+};
 use quinn_proto::{Connection, Dir, ReadError, StreamId, VarInt};
 
 /// Peer bidi streams open before the session is authenticated, other than
@@ -95,10 +97,20 @@ pub(crate) enum WtEvent {
 enum PeerUni {
     /// Its type is not known yet.
     Header(UniStreamHeaderDecoder),
-    /// The client's control stream; `bool` is whether SETTINGS arrived.
-    Control(FrameDecoder, bool),
+    /// The client's control stream.
+    Control(Control),
     QpackEncoder,
-    QpackDecoder,
+    QpackDecoder(DecoderStreamReader),
+}
+
+/// What the client's control stream said so far.
+#[derive(Default)]
+struct Control {
+    frames: FrameDecoder,
+    saw_settings: bool,
+    /// The client's latest MAX_PUSH_ID: we never push, but it bounds the
+    /// push ids CANCEL_PUSH may name (RFC 9114 §7.2.3).
+    max_push_id: Option<u64>,
 }
 
 /// The CONNECT stream once its request was read.
@@ -501,7 +513,7 @@ impl WtSession {
             state = match ty {
                 UniStreamType::Control if !self.has_control => {
                     self.has_control = true;
-                    PeerUni::Control(FrameDecoder::new(), false)
+                    PeerUni::Control(Control::default())
                 }
                 UniStreamType::QpackEncoder if !self.has_encoder => {
                     self.has_encoder = true;
@@ -509,7 +521,7 @@ impl WtSession {
                 }
                 UniStreamType::QpackDecoder if !self.has_decoder => {
                     self.has_decoder = true;
-                    PeerUni::QpackDecoder
+                    PeerUni::QpackDecoder(DecoderStreamReader::new())
                 }
                 UniStreamType::Control
                 | UniStreamType::QpackEncoder
@@ -520,28 +532,35 @@ impl WtSession {
                     );
                     return;
                 }
-                // Push, WebTransport uni and unknown streams: refused,
-                // never fatal.
-                UniStreamType::Push
-                | UniStreamType::WebTransport { .. }
-                | UniStreamType::Unknown(_) => {
+                // Only a server may open a push stream (RFC 9114 §6.2.2).
+                UniStreamType::Push => {
+                    self.fail(
+                        code::H3_STREAM_CREATION_ERROR,
+                        "the client opened a push stream".into(),
+                    );
+                    return;
+                }
+                // WebTransport uni and unknown streams: refused, never fatal.
+                UniStreamType::WebTransport { .. } | UniStreamType::Unknown(_) => {
                     stop(conn, raw, code::H3_STREAM_CREATION_ERROR);
                     return;
                 }
             };
         }
         let failure = match &mut state {
-            PeerUni::Control(frames, saw_settings) => {
-                self.read_control(conn, frames, saw_settings, &mut input)
-            }
+            PeerUni::Control(control) => self.read_control(conn, control, &mut input),
             // The table capacity is 0, so every encoder instruction is
             // illegal.
             PeerUni::QpackEncoder if !input.is_empty() => Some((
                 code::QPACK_ENCODER_STREAM_ERROR,
                 "QPACK encoder instruction with a zero table capacity".into(),
             )),
-            // Decoder instructions only acknowledge a table we never use.
-            PeerUni::QpackEncoder | PeerUni::QpackDecoder | PeerUni::Header(_) => None,
+            // Only Stream Cancellation is legal: we never insert.
+            PeerUni::QpackDecoder(reader) => reader
+                .read(input)
+                .err()
+                .map(|error| (error.code(), format!("QPACK decoder stream: {error}"))),
+            PeerUni::QpackEncoder | PeerUni::Header(_) => None,
         };
         if let Some((code, reason)) = failure {
             self.fail(code, reason);
@@ -556,15 +575,20 @@ impl WtSession {
     }
 
     /// Decodes the client's control frames: SETTINGS first, then nothing
-    /// but GOAWAY (which ends the session) and frames HTTP/3 skips. Returns
-    /// the code and reason of a connection error.
+    /// but GOAWAY (which ends the session), the push frames (checked, though
+    /// we never push) and frames HTTP/3 skips. Returns the code and reason of
+    /// a connection error.
     fn read_control(
         &mut self,
         conn: &mut Connection,
-        frames: &mut FrameDecoder,
-        saw_settings: &mut bool,
+        control: &mut Control,
         input: &mut &[u8],
     ) -> Option<(u64, String)> {
+        let Control {
+            frames,
+            saw_settings,
+            max_push_id,
+        } = control;
         loop {
             let frame = match frames.decode(input) {
                 Ok(frame) => frame,
@@ -608,6 +632,16 @@ impl WtSession {
                 Some(Frame::GoAway(_)) => {
                     self.peer_closed(0);
                     return None;
+                }
+                Some(Frame::MaxPushId(id)) if max_push_id.is_none_or(|max| id >= max) => {
+                    *max_push_id = Some(id);
+                }
+                Some(Frame::CancelPush(id)) if max_push_id.is_some_and(|max| id <= max) => {}
+                Some(Frame::MaxPushId(_) | Frame::CancelPush(_)) => {
+                    return Some((
+                        code::H3_ID_ERROR,
+                        "a push id past the client's MAX_PUSH_ID, or a smaller MAX_PUSH_ID".into(),
+                    ));
                 }
                 Some(frame) => {
                     return Some((
