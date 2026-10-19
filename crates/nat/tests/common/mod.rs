@@ -689,11 +689,6 @@ pub struct FakeSwarm {
     pub failed_sends: Option<TransportError>,
     /// Circuit slots the host's circuit transport reports in use.
     pub circuit_slots: usize,
-    /// Most circuit claims the host's circuit memory budget fits; `None`
-    /// fits any number.
-    pub circuit_claim_room: Option<usize>,
-    /// Circuit claims the agent holds at the host.
-    pub circuit_claims: usize,
 }
 
 impl FakeSwarm {
@@ -752,14 +747,6 @@ impl NatSwarm for FakeSwarm {
 
     fn circuit_slots(&self) -> usize {
         self.circuit_slots
-    }
-
-    fn hold_circuit_claims(&mut self, claims: usize) -> bool {
-        if self.circuit_claim_room.is_some_and(|room| claims > room) {
-            return false;
-        }
-        self.circuit_claims = claims;
-        true
     }
 
     fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[String])> {

@@ -96,10 +96,6 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Unsettled connection**: A connection that has ended while some of its streams are still unsettled. It keeps its connection slot (a circuit keeps its circuit slot) until every one of those streams settles, so close-and-reconnect churn cannot grow retained receive data either; a transport whose slots are all held refuses new connections rather than forgetting what was delivered. Only its accounting and ownership survive. _Avoid_: closing connection, draining connection (draining is QUIC's own close phase)
 
-**Memory budget**: The bytes one transport (QUIC, TCP, or the circuit transport) may commit to its connections and streams, across all its sockets. Every connection and stream holds a memory reservation against it, so the budget caps the transport's worst-case retained payload; each transport has its own, named after it ("QUIC memory budget"). _Avoid_: send budget, memory limit, quota
-
-**Memory reservation**: The share of a memory budget that a connection or stream holds from admission until its bytes are released, which for delivered data means acknowledged or abandoned. A connection or stream whose reservation does not fit is refused, not queued. Distinct from a relay reservation. _Avoid_: reservation (unqualified), allocation, quota
-
 **Manual acknowledgement**: A protocol registration whose stream data the application acknowledges itself (`stream_consumed`) once it has really consumed the bytes, instead of the Endpoint acknowledging data as its event is pulled. Every protocol registered through FFI uses it; the SDK acknowledges when `read()` returns a chunk or a `data` listener returns. _Avoid_: manual read, flow control mode
 
 ### Errors

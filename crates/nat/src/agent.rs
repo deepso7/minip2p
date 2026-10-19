@@ -185,20 +185,15 @@ impl Shared {
     }
 
     /// Reserves a circuit slot if one is free under
-    /// [`NatConfig::max_circuits`], counting the circuits the host holds,
-    /// and a claim on the host's circuit memory budget
-    /// ([`NatSwarm::hold_circuit_claims`]). The caller then holds both for
-    /// as long as it reports `holds_circuit_slot`; past either, returns the
-    /// resource that ran out.
-    pub(crate) fn reserve_circuit(&mut self, swarm: &mut dyn NatSwarm) -> Result<(), &'static str> {
+    /// [`NatConfig::max_circuits`], counting the circuits the host holds.
+    /// The caller then holds it for as long as it reports
+    /// `holds_circuit_slot`.
+    pub(crate) fn reserve_circuit(&mut self, swarm: &dyn NatSwarm) -> bool {
         if self.circuits_reserved + swarm.circuit_slots() >= self.config.max_circuits {
-            return Err("circuits");
-        }
-        if !swarm.hold_circuit_claims(self.circuits_reserved + 1) {
-            return Err("circuit memory budget");
+            return false;
         }
         self.circuits_reserved += 1;
-        Ok(())
+        true
     }
 
     /// Starts a dial and records why it was made.
@@ -641,17 +636,7 @@ impl NatAgent {
             },
         );
         self.held = held;
-        self.sync_claims(swarm);
         result
-    }
-
-    /// Holds exactly one circuit claim per circuit still negotiating, so
-    /// holders that ended -- adopted, failed or cancelled -- give theirs
-    /// back whichever path ended them. Adoption already consumed its
-    /// claim at the host, so for it this releases nothing.
-    fn sync_claims(&mut self, swarm: &mut dyn NatSwarm) {
-        let holders = self.circuits_reserved();
-        swarm.hold_circuit_claims(holders);
     }
 
     /// Seeds the jitter on reservation retry backoffs from the host's
@@ -1251,7 +1236,6 @@ impl NatAgent {
             self.shared.push_action(NatAction::CloseCircuit { conn_id });
         }
         self.reap_done();
-        self.sync_claims(swarm);
     }
 
     /// Returns the next queued command for the driver.

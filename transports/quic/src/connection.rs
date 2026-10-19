@@ -17,7 +17,6 @@ use quinn_proto::{
     WriteError,
 };
 
-use crate::budget::MemoryBudget;
 use crate::diagnostics::ConnectionCounters;
 use crate::socket::Sockets;
 
@@ -83,9 +82,6 @@ pub(crate) struct Cx<'a> {
     /// Reused for every transmit.
     pub(crate) send_buf: &'a mut Vec<u8>,
     pub(crate) events: &'a mut Vec<TransportEvent>,
-    /// Peer streams reserve against it when admitted, and settled streams
-    /// release their reservation.
-    pub(crate) budget: &'a mut MemoryBudget,
 }
 
 /// A queued write operation for a QUIC stream.
@@ -156,7 +152,7 @@ struct StreamRuntimeState {
     /// Delivered bytes the reader has not acknowledged (ADR 0012). Reading
     /// stops once they reach the stream receive window, and the state
     /// outlives the stream's close until they are acknowledged: the stream
-    /// holds its slot, and its memory reservation, until it settles.
+    /// holds its slot until it settles.
     unacked: usize,
     /// A control stream may queue into the connection cap's reserve
     /// ([`Transport::set_control_stream`](minip2p_transport::Transport::set_control_stream)).
@@ -210,8 +206,7 @@ pub(crate) struct QuicConnection {
     /// Why the connection is ending: the first cause seen, reported on its
     /// `Closed`.
     close_reason: Option<ConnectionCloseReason>,
-    /// Per-stream runtime state keyed by raw QUIC stream id. Each entry holds
-    /// one stream's memory reservation.
+    /// Per-stream runtime state keyed by raw QUIC stream id.
     stream_states: HashMap<u64, StreamRuntimeState>,
     /// Outbound write queues keyed by raw QUIC stream id. Only streams with
     /// pending output have an entry, so a drain visits nothing else.
@@ -312,12 +307,6 @@ impl QuicConnection {
         self.stream_states
             .iter()
             .map(|(&raw, state)| (StreamId::new(raw), state.unacked))
-    }
-
-    /// Streams holding a memory reservation: every stream the adapter still
-    /// tracks.
-    pub(crate) fn stream_count(&self) -> usize {
-        self.stream_states.len()
     }
 
     /// Why the connection ended, for its `Closed`.
@@ -448,7 +437,7 @@ impl QuicConnection {
         }
         let failure = self.transmit(now, cx);
         self.timeout = self.conn.poll_timeout();
-        self.gc_closed_streams(cx.budget);
+        self.gc_closed_streams();
         failure
     }
 
@@ -495,7 +484,7 @@ impl QuicConnection {
             Event::Connected => self.on_connected(now, cx),
             Event::ConnectionLost { reason } => self.on_lost(&reason),
             Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
-                self.accept_streams(cx.budget, cx.events);
+                self.accept_streams(cx.events);
             }
             Event::Stream(StreamEvent::Readable { id }) => self.scan(u64::from(id), cx.events),
             // New credit: the scheduler that runs after these events hands
@@ -573,10 +562,10 @@ impl QuicConnection {
 
     /// Accepts every stream the peer opened, scanning each at once: a new
     /// stream's first frame raises only `Opened`, never `Readable`.
-    fn accept_streams(&mut self, budget: &mut MemoryBudget, events: &mut Vec<TransportEvent>) {
+    fn accept_streams(&mut self, events: &mut Vec<TransportEvent>) {
         while let Some(stream) = self.conn.streams().accept(Dir::Bi) {
             let raw = u64::from(stream);
-            if self.admit_remote_stream(raw, budget, events) {
+            if self.admit_remote_stream(raw, events) {
                 self.scan(raw, events);
             }
         }
@@ -584,21 +573,16 @@ impl QuicConnection {
 
     /// Emits `IncomingStream` for a new peer stream, or refuses it (both
     /// halves shut down, no event) while open and unsettled peer streams fill
-    /// the stream limit, or its memory reservation does not fit the budget:
-    /// the engine frees a closed stream's slot once it is read, but its
-    /// delivered bytes are the reader's until acknowledged (ADR 0012).
-    fn admit_remote_stream(
-        &mut self,
-        raw: u64,
-        budget: &mut MemoryBudget,
-        events: &mut Vec<TransportEvent>,
-    ) -> bool {
+    /// the stream limit: the engine frees a closed stream's slot once it is
+    /// read, but its delivered bytes are the reader's until acknowledged
+    /// (ADR 0012).
+    fn admit_remote_stream(&mut self, raw: u64, events: &mut Vec<TransportEvent>) -> bool {
         let held = self
             .stream_states
             .keys()
             .filter(|id| !self.is_local(**id))
             .count() as u64;
-        if held >= self.max_streams || !budget.reserve_stream() {
+        if held >= self.max_streams {
             let stream = engine_stream(raw);
             match self.conn.recv_stream(stream).stop(VarInt::from_u32(0)) {
                 Ok(()) | Err(_) => {}
@@ -774,12 +758,8 @@ impl QuicConnection {
         self.is_local(raw) && raw >= self.first_unbound()
     }
 
-    /// Hands out a new local stream, reserving its receive window against
-    /// `budget`.
-    pub(crate) fn open_stream(
-        &mut self,
-        budget: &mut MemoryBudget,
-    ) -> Result<StreamId, TransportError> {
+    /// Hands out a new local stream.
+    pub(crate) fn open_stream(&mut self) -> Result<StreamId, TransportError> {
         if self.state != ConnectionState::Connected {
             return Err(TransportError::InvalidState {
                 id: self.id,
@@ -791,9 +771,6 @@ impl QuicConnection {
             return Err(TransportError::ResourceExhausted {
                 resource: "local QUIC bidirectional streams",
             });
-        }
-        if !budget.reserve_stream() {
-            return Err(MemoryBudget::exhausted());
         }
         // Handed out now, opened in the engine by the next service once the
         // peer grants credit; writes and FIN queue until then.
@@ -981,7 +958,6 @@ impl QuicConnection {
     pub(crate) fn reset_stream(
         &mut self,
         stream_id: StreamId,
-        budget: &mut MemoryBudget,
         events: &mut Vec<TransportEvent>,
     ) -> Result<(), TransportError> {
         let raw = stream_id.as_u64();
@@ -998,14 +974,13 @@ impl QuicConnection {
             if let Some(open) = self.pending_opens.iter_mut().find(|open| open.id == raw) {
                 open.reset_on_bind = true;
             }
-            if let Some(state) = self.stream_states.remove(&raw) {
-                budget.release_streams(1);
-                if !state.closed_notified {
-                    events.push(TransportEvent::StreamClosed {
-                        id: self.id,
-                        stream_id,
-                    });
-                }
+            if let Some(state) = self.stream_states.remove(&raw)
+                && !state.closed_notified
+            {
+                events.push(TransportEvent::StreamClosed {
+                    id: self.id,
+                    stream_id,
+                });
             }
             return Ok(());
         }
@@ -1290,13 +1265,11 @@ impl QuicConnection {
         }
     }
 
-    /// Removes closed, drained and settled streams, releasing their slots
-    /// and memory reservations.
-    fn gc_closed_streams(&mut self, budget: &mut MemoryBudget) {
+    /// Removes closed, drained and settled streams, releasing their slots.
+    fn gc_closed_streams(&mut self) {
         let first_unbound = self.first_unbound();
         let side_bit = u64::from(self.is_server());
         let mut freed_local = 0;
-        let before = self.stream_states.len();
         let (send_queues, gated) = (&self.send_queues, &mut self.gated);
         self.stream_states.retain(|&raw, state| {
             let local = raw & 1 == side_bit;
@@ -1311,7 +1284,6 @@ impl QuicConnection {
             !settled
         });
         self.bound_local_bidi_streams = self.bound_local_bidi_streams.saturating_sub(freed_local);
-        budget.release_streams(before - self.stream_states.len());
     }
 
     /// Returns state for a stream previously opened or discovered.

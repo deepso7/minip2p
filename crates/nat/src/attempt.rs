@@ -1059,9 +1059,11 @@ impl ConnectAttempt {
         let Some(relay_peer) = self.relay_peer().cloned() else {
             return;
         };
-        if let Err(resource) = shared.reserve_circuit(swarm) {
+        if !shared.reserve_circuit(swarm) {
             self.untried.clear();
-            let error = NatError::ResourceExhausted { resource };
+            let error = NatError::ResourceExhausted {
+                resource: "circuits",
+            };
             self.fail_relay_leg(error, swarm, shared, now);
             return;
         }

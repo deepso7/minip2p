@@ -318,56 +318,6 @@ fn a_stop_past_the_circuit_limit_is_refused_until_a_slot_frees() {
 }
 
 #[test]
-fn a_stop_past_the_circuit_memory_budget_is_refused_until_its_claim_is_released() {
-    // #357: an accepted STOP holds a claim on the host's circuit memory
-    // budget until adoption carries it into the circuit's reservation; past
-    // the budget, STOP is refused before acceptance.
-    let mut h = inbound_harness(NatConfig::default());
-    h.agent.swarm.circuit_claim_room = Some(1);
-    let target = h.target.clone();
-    let accepted = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, accepted, 0);
-    h.stream_data(accepted, stop_connect(&target), at(10));
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(
-        stop_status(&sent_data_on(&actions, accepted)),
-        Some(Status::Ok)
-    );
-    assert_eq!(h.agent.swarm.circuit_claims, 1);
-    let token = promote_token(&actions);
-
-    let refused = StreamId::new(STOP_STREAM + 4);
-    inbound_stop_stream(&mut h, refused, 20);
-    h.stream_data(refused, stop_connect(&target), at(30));
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(
-        stop_status(&sent_data_on(&actions, refused)),
-        Some(Status::ResourceLimitExceeded)
-    );
-    assert!(refused_with_fin(&actions, refused), "{actions:?}");
-    assert_eq!(h.agent.swarm.circuit_claims, 1, "a refusal claims nothing");
-
-    h.agent.promote_result(
-        token,
-        Err(minip2p_nat::PromoteError::Failed("gone".into())),
-        at(40),
-    );
-    assert_eq!(
-        h.agent.swarm.circuit_claims, 0,
-        "a failed adoption releases it"
-    );
-    let again = StreamId::new(STOP_STREAM + 8);
-    inbound_stop_stream(&mut h, again, 50);
-    h.stream_data(again, stop_connect(&target), at(60));
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(
-        stop_status(&sent_data_on(&actions, again)),
-        Some(Status::Ok)
-    );
-    assert_eq!(h.agent.swarm.circuit_claims, 1);
-}
-
-#[test]
 fn inbound_application_streams_are_never_claimed() {
     let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);

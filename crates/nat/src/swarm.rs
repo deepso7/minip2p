@@ -137,21 +137,6 @@ pub trait NatSwarm {
     fn circuit_slots(&self) -> usize {
         0
     }
-
-    /// Sets how many circuit claims the agent holds on the host's circuit
-    /// memory budget (ADR 0021), reserving or releasing the difference,
-    /// and returns whether that many fit; a refused growth holds what it
-    /// held before. The agent asks for one more before it accepts a STOP or
-    /// sends a HOP CONNECT, and for exactly the circuits it still
-    /// negotiates after every call, so claims of attempts that ended are
-    /// released whichever way they ended. Each promotion's adoption carries
-    /// a claim into the circuit (`minip2p-circuit`'s
-    /// `BridgeAdoption::claimed`).
-    ///
-    /// The default, for a host without a circuit budget, fits every claim.
-    fn hold_circuit_claims(&mut self, _claims: usize) -> bool {
-        true
-    }
 }
 
 /// Whether `addr` names its host (`/dns`, `/dns4`, `/dns6`) instead of
@@ -317,10 +302,6 @@ impl NatSwarm for HoldingSwarm<'_> {
 
     fn circuit_slots(&self) -> usize {
         self.inner.circuit_slots()
-    }
-
-    fn hold_circuit_claims(&mut self, claims: usize) -> bool {
-        self.inner.hold_circuit_claims(claims)
     }
 
     fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[String])> {

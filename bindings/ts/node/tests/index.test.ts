@@ -287,10 +287,10 @@ describe("@minip2p/node", () => {
   }, 20_000);
 
   test.each([
-    // Several 2,432 KiB Yamux windows plus TCP's socket buffers.
+    // Several 256 KiB Yamux windows plus TCP's socket buffers.
     ["TCP", "/ip4/127.0.0.1/tcp/0", 16 * 1024 * 1024],
-    // Past QUIC's 1 MiB send queue, 2 MiB send and 3 MiB connection windows, and
-    // both 1 MB stream windows.
+    // Past QUIC's 1 MiB send queue, 10 MB send window and both 1.25 MB stream
+    // windows.
     ["QUIC", "/ip4/127.0.0.1/udp/0/quic-v1", 16 * 1024 * 1024],
   ])(
     "a bulk transfer to a slow reader over %s holds the writer back and loses nothing",

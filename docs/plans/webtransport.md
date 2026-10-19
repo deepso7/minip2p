@@ -90,7 +90,7 @@ See the research doc for sources. The facts that drive the design:
    - **Why this is safe.** Session resumption stays disabled (`NoServerSessionStorage`, no tickets), so every handshake verifies afresh. A presented certificate is still fully checked inside the handshake. An anonymous `libp2p` connection never reaches `Connected`, so it can produce no stream or established events. The ALPN is read from `crypto_session().handshake_data()`.
    - **Transport parameters.** h3-serving configs carry their own `TransportConfig`. It differs from the libp2p one in two ways, both set in the initial transport parameters, because RFC 9114 §6.2 requires the parameters themselves to allow the peer's control and QPACK streams:
      - `max_concurrent_uni_streams = 3`;
-     - the QUIC datagram parameter, which Firefox requires, with a small `datagram_receive_buffer_size` counted in the connection's fixed memory reservation (ADR 0019). Received datagrams are drained and dropped.
+     - the QUIC datagram parameter, which Firefox requires, with a small `datagram_receive_buffer_size`. Received datagrams are drained and dropped.
    - **Refusal rule for peer-initiated streams.** A peer-initiated **uni** stream has no local send half, and quinn-proto 0.11's `Connection::send_stream` asserts `dir == Bi || initiator == local` (`connection/mod.rs:441`). Resetting one would let a peer trigger a panic. So:
      - uni streams are refused with `recv_stream(id).stop(code)` only;
      - only bidi streams also get `send_stream(id).reset(code)`.
@@ -174,12 +174,12 @@ See the research doc for sources. The facts that drive the design:
      - **Refused requests.** The 400 and 404 replies use the same `Closing` path, so the status reaches the browser.
      - `on_lost` counts `H3_NO_ERROR` as orderly on h3 connections, so no `Error` event is raised.
      - Tests: a native-initiated close in Playwright (PR 5) asserts that the browser's `transport.closed` promise _fulfills_ with code 0; the native test client (Decision 11) asserts that the capsule arrived before the QUIC close.
-   - **Pre-auth limits.** These are enforced before allocation and form one fixed per-connection reservation (ADR 0019), taken when ALPN is `h3`:
+   - **Pre-auth limits.** These are enforced before allocation and bound each connection's pre-auth state once ALPN is `h3` (there is no memory budget, ADR 0022):
      - Encoded caps: HEADERS frames 16 KiB, the SETTINGS frame 4 KiB, a single capsule 64 KiB. Capsule bodies other than CLOSE are parsed as they stream, so the 64 KiB bound only applies to CLOSE messages (1 KiB max) and to skipping unknown capsules, which is done without buffering.
      - Decoded caps: the QPACK decoder stops with `QPACK_DECOMPRESSION_FAILED` once the decoded field section passes **8 KiB** (the RFC 9114 `name + value + 32` per-field accounting) or **64 fields**. That bound applies no matter how few encoded bytes produced it, which covers repeated static-index expansion. The decoder writes into one preallocated 8 KiB buffer, so there is no per-field allocation.
      - Early streams: as above, 4 streams and 16 KiB in total.
      - A WebTransport handshake deadline, `QuicLimits::webtransport_handshake_timeout_ms` (default 10 s), runs from QUIC Connected to Noise complete and feeds `next_deadline`.
-     - Admission, the connection cap and Retry are unchanged: quinn admits the connection before ALPN is known, as today. The h3 reservation is taken at ALPN time and failing it closes the connection with `H3_EXCESSIVE_LOAD`.
+     - Admission, the connection cap and Retry are unchanged: quinn admits the connection before ALPN is known, as today. The h3 state is set up at ALPN time, and a peer past any cap gets the connection closed with `H3_EXCESSIVE_LOAD`.
      - Fixtures: a 2 KiB HEADERS frame of repeated static indexes that would expand past 8 KiB is rejected; a field count of 65 is rejected.
 
 5. **WebTransport certificates and rotation.**
@@ -277,20 +277,20 @@ See the research doc for sources. The facts that drive the design:
     - **`WebTransportLimits`** mirrors `QuicLimits` where meaningful:
       - `max_connections`, `max_streams_per_connection`;
       - `max_pending_bytes_per_stream`, `max_pending_connection_bytes`, `control_stream_reserve_bytes`;
-      - `stream_receive_window`, `memory_budget_bytes`;
+      - `stream_receive_window`;
       - `handshake_timeout_ms` (default 10 s).
 
-      Incoming streams over the stream cap or the budget are refused with `reset` and no event, as in QUIC's `admit_remote_stream`.
+      Incoming streams over the stream cap are refused with `reset` and no event, as in QUIC's `admit_remote_stream`.
 
     - **Byte ownership.** Every byte is in exactly one place, and each place is bounded:
       - **Rust send queue**, bounded by `send_room` (min of stream and connection caps, plus the control reserve, via the same `SendCaps` logic). This is where `Full` and `StreamWritable` come from.
       - **JS in-flight writes**: bytes `Io::write` accepted and copied, and whose `WriteCompleted` hasn't arrived. The JS side caps them at 64 KiB per stream, and completions are byte-counted (Decision 9). They count against the connection's pending bytes until resolved, so the connection cap covers Rust queue plus JS in-flight.
       - **Granted reads**: `grant_read` is issued only for `window − unacked − outstanding_grant`. `outstanding_grant` is what JS may still deliver, and drops as `Data` arrives. JS never holds a read result beyond its grant, and at most one BYOB read is outstanding per stream.
-      - **Delivered, unacked bytes** are tracked per stream exactly as in QUIC (`unacked`). When a connection ends with unacked streams, they move to `UnsettledConnections` (`crates/transport/src/unsettled.rs`) with their reservations, as QUIC's `remove_connection` does. `reset_stream` and `ack_stream` on an ended connection settle them.
+      - **Delivered, unacked bytes** are tracked per stream exactly as in QUIC (`unacked`). When a connection ends with unacked streams, they move to `UnsettledConnections` (`crates/transport/src/unsettled.rs`), as QUIC's `remove_connection` does. `reset_stream` and `ack_stream` on an ended connection settle them.
       - **Terminal callbacks.** On reset, `SessionClosed` or `close`, the Rust side frees the queues and grants immediately. JS cancels pending reads and drops pending writes, and late promise results for a dead handle are ignored by handle generation.
     - **Other limits.** The handshake deadline feeds `next_deadline`. `listen` → `Unsupported` ("browsers cannot listen; use a relay reservation to be reachable").
     - Tests, with a fake `Io`:
-      - stream churn without acks stays within `memory_budget_bytes`;
+      - stream churn without acks stays within the stream cap times `stream_receive_window`;
       - reconnect churn with unacked data leaves unsettled entries until `ack_stream` or `reset_stream`;
       - grants never exceed the window, with outstanding grants counted;
       - the connection cap covers JS in-flight bytes;
@@ -408,7 +408,6 @@ The biggest PR, organised as reviewable commits.
   - rotation across a mocked period boundary: new hashes, the revision bumped, an old-period address still dials, a live connection survives;
   - Retry with `require_address_validation` before an h3 handshake;
   - session flow control with a client that advertises a small `WT_INITIAL_MAX_STREAMS_BIDI`: server opens queue until `WT_MAX_STREAMS`;
-  - the memory budget: pre-auth state is reserved and released.
 - **3f. relay-server example:** `--webtransport` listens WebTransport on the QUIC port and prints the certhash address. The `--announce` handling learns the shape.
 - **3g. Address propagation** (Decision 5): the refresh moves after `transport.poll`, and `SwarmEvent::ListenAddressesChanged` goes through `EndpointEvent`, `P2pEvent` and the TS event map. ffi-core's `listen_addrs` reads a live snapshot of bound addresses.
 - **Release wiring for the new crate:** add `minip2p-webtransport` to `publish.yml`'s explicit crate publication order, before `minip2p-quic`, along with its registry verification and `scripts/release.sh`'s version bump and checks, so the first release after PR 3 can publish `minip2p-quic`.
@@ -485,7 +484,7 @@ Today, portable relays require `force_relay = true` (`validate_nat`, `crates/min
 | --- | --- |
 | Browser drafts move (Chrome turns on draft-07 or later; Safari's behaviour isn't public) | Send the union SETTINGS used by webtransport-go, never advertise draft-07, accept both `:protocol` values, run Playwright on current stable, keep the research doc's draft table current |
 | Making client auth optional weakens libp2p authentication | Only on h3-serving sockets. The libp2p ALPN still requires a verified certificate before `Connected`, enforced in `on_connected`, with a test |
-| Unauthenticated h3 state used for DoS | Existing admission, budget and Retry; a handshake deadline; capped HEADERS, SETTINGS, capsules and early streams; pre-auth state reserved in the memory budget |
+| Unauthenticated h3 state used for DoS | Existing admission and Retry; a handshake deadline; capped HEADERS, SETTINGS, capsules and early streams |
 | Server clock skew > 1 h makes browsers reject the certificate | 1 h backdate as go-libp2p does; documented; the next certificate is already advertised |
 | Stream prefix bytes break ADR 0012 accounting | Prefixes are parsed before admission and queued outside `send_room`; split-prefix and backpressure tests |
 | Safari sends `:protocol webtransport-h3` (unknown; see research) and gets a 400 | Safari is best-effort; the manual check in PR 3 records which token it sends. If it is `webtransport-h3`, implementing the draft-15+ requirements becomes a follow-up rather than accepting the token loosely |

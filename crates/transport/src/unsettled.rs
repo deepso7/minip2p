@@ -22,9 +22,6 @@ pub struct UnsettledConnections {
     /// Unacknowledged bytes by stream, for each held connection. Neither map
     /// keeps an empty entry.
     connections: BTreeMap<ConnectionId, BTreeMap<StreamId, usize>>,
-    /// Streams held across every connection, kept so counting them does not
-    /// walk the maps.
-    streams: usize,
 }
 
 impl UnsettledConnections {
@@ -47,10 +44,7 @@ impl UnsettledConnections {
         if streams.is_empty() {
             return false;
         }
-        self.streams += streams.len();
-        if let Some(replaced) = self.connections.insert(id, streams) {
-            self.streams -= replaced.len();
-        }
+        self.connections.insert(id, streams);
         true
     }
 
@@ -62,11 +56,6 @@ impl UnsettledConnections {
     /// How many connections are held: each still occupies a connection slot.
     pub fn len(&self) -> usize {
         self.connections.len()
-    }
-
-    /// How many streams are held, across every held connection.
-    pub fn streams(&self) -> usize {
-        self.streams
     }
 
     /// Whether no connection is held.
@@ -116,9 +105,7 @@ impl UnsettledConnections {
         let Some(streams) = self.connections.get_mut(&id) else {
             return false;
         };
-        if streams.remove(&stream_id).is_some() {
-            self.streams -= 1;
-        }
+        streams.remove(&stream_id);
         if streams.is_empty() {
             self.connections.remove(&id);
         }
@@ -140,13 +127,11 @@ mod tests {
         let (a, b) = (StreamId::new(1), StreamId::new(3));
         assert!(ledger.insert(conn(1), [(a, 10), (b, 4), (StreamId::new(5), 0)]));
         assert_eq!(ledger.len(), 1);
-        assert_eq!(ledger.streams(), 2, "the settled stream is not held");
 
         assert_eq!(ledger.ack(conn(1), a, 6), Ok(true));
         assert_eq!(ledger.ack(conn(1), a, 4), Ok(true), "a settles");
         assert_eq!(ledger.ack(conn(1), a, 0), Ok(true), "settled: a no-op");
         assert!(ledger.contains(conn(1)), "b still holds the slot");
-        assert_eq!(ledger.streams(), 1);
 
         assert!(ledger.abandon(conn(1), b));
         assert!(!ledger.contains(conn(1)));

@@ -1391,18 +1391,16 @@ impl EndpointBuilder {
         self
     }
 
-    /// Overrides QUIC connection, stream, queue, window, timeout and memory
-    /// budget limits (`QuicLimits::memory_budget_bytes` caps the QUIC
-    /// transport's worst-case queued memory).
+    /// Overrides QUIC connection, stream, queue, window and timeout limits.
+    /// The windows default to quinn's own (ADR 0022).
     #[cfg(feature = "quic")]
     pub fn quic_limits(mut self, limits: QuicLimits) -> Self {
         self.quic_limits = limits;
         self
     }
 
-    /// Overrides TCP connection, buffer, and timeout limits, the TCP
-    /// memory budget, and the connection-id namespace the TCP transport
-    /// allocates in. Checked at bind
+    /// Overrides TCP connection, buffer, timeout and Yamux limits, and the
+    /// connection-id namespace the TCP transport allocates in. Checked at bind
     /// ([`EndpointOptionsError::InvalidLimit`]).
     #[cfg(feature = "tcp")]
     pub fn tcp_config(mut self, config: TcpConfig) -> Self {
@@ -1410,8 +1408,7 @@ impl EndpointBuilder {
         self
     }
 
-    /// Overrides the relay circuits' Yamux limits and circuit memory budget
-    /// (ADR 0021). Checked at bind
+    /// Overrides the relay circuits' Yamux limits. Checked at bind
     /// ([`EndpointOptionsError::InvalidLimit`]).
     #[cfg(feature = "nat")]
     pub fn circuit_limits(mut self, limits: CircuitLimits) -> Self {
@@ -3247,23 +3244,22 @@ mod tests {
 
     #[cfg(feature = "tcp")]
     #[test]
-    fn a_tcp_budget_that_cannot_admit_a_connection_is_refused_at_bind() {
+    fn a_tcp_config_that_breaks_the_yamux_invariants_is_refused_at_bind() {
+        let mut config = TcpConfig::default();
+        config.yamux.max_frame_len = 0;
         let Err(error) = Endpoint::builder()
-            .tcp_config(TcpConfig {
-                memory_budget_bytes: 0,
-                ..TcpConfig::default()
-            })
+            .tcp_config(config)
             .listen_on("/ip4/127.0.0.1/tcp/0")
             .expect("tcp listen address")
             .bind()
         else {
-            panic!("a zero budget admits nothing");
+            panic!("a zero frame length cannot work");
         };
         assert!(
             matches!(
                 error,
                 BindError::Options(EndpointOptionsError::InvalidLimit(InvalidLimit {
-                    field: "TcpConfig::memory_budget_bytes",
+                    field: "TcpConfig::yamux",
                     ..
                 }))
             ),
@@ -3273,23 +3269,22 @@ mod tests {
 
     #[cfg(all(feature = "nat", feature = "quic"))]
     #[test]
-    fn circuit_limits_that_cannot_admit_a_circuit_are_refused_at_bind() {
+    fn circuit_limits_that_break_the_yamux_invariants_are_refused_at_bind() {
+        let mut limits = CircuitLimits::default();
+        limits.yamux.max_frame_len = 0;
         let Err(error) = Endpoint::builder()
-            .circuit_limits(CircuitLimits {
-                memory_budget_bytes: 0,
-                ..CircuitLimits::default()
-            })
+            .circuit_limits(limits)
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")
             .bind()
         else {
-            panic!("a zero circuit budget admits nothing");
+            panic!("a zero frame length cannot work");
         };
         assert!(
             matches!(
                 error,
                 BindError::Options(EndpointOptionsError::InvalidLimit(InvalidLimit {
-                    field: "CircuitLimits::memory_budget_bytes",
+                    field: "CircuitLimits::yamux",
                     ..
                 }))
             ),

@@ -17,13 +17,6 @@
 //! the circuit's Yamux send caps and report [`TransportError::Full`]; nothing
 //! tears down.
 //!
-//! Each circuit and stream holds a reservation against the circuit memory
-//! budget ([`CircuitLimits::memory_budget_bytes`], ADR 0021). A host that
-//! admits circuits through NAT claims a circuit's fixed part before it
-//! accepts STOP or sends HOP CONNECT ([`CircuitTransport::claim_circuit`]),
-//! and adoption carries the claim into the circuit
-//! ([`BridgeAdoption::claimed`]).
-//!
 //! Fresh Noise key material comes from a [`minip2p_core::platform::EntropySource`]
 //! the host injects — the same seam every other minip2p transport draws from,
 //! so one adapter over a board's RNG serves a circuit transport and a TCP
@@ -51,8 +44,8 @@ use minip2p_secure_mux::{
 };
 use minip2p_transport::{
     ConnectionCloseReason, ConnectionEndpoint, ConnectionId, ConnectionIdAllocator,
-    ConnectionNamespace, ConnectionState, InvalidLimit, MemoryLedger, StreamId, Transport,
-    TransportError, TransportEvent, UnsettledConnections,
+    ConnectionNamespace, ConnectionState, InvalidLimit, StreamId, Transport, TransportError,
+    TransportEvent, UnsettledConnections,
 };
 use thiserror::Error;
 
@@ -92,12 +85,6 @@ pub struct BridgeAdoption {
     pub unsent_prefix: Bytes,
     /// Whether the bridge's remote write side was already closed.
     pub remote_write_closed: bool,
-    /// Whether the host holds a claim for this circuit, taken with
-    /// [`CircuitTransport::claim_circuit`] before it accepted STOP or sent
-    /// HOP CONNECT. Adoption carries the claim into the circuit's
-    /// reservation, or releases it when the adoption fails or repeats one;
-    /// an unclaimed adoption reserves for itself.
-    pub claimed: bool,
 }
 
 /// Synchronous errors from adopting a relay bridge.
@@ -121,91 +108,25 @@ pub enum AdoptError {
     /// All circuit connection identifiers have been allocated.
     #[error("circuit connection IDs exhausted")]
     IdsExhausted,
-    /// The circuit memory budget cannot fit another circuit.
-    #[error("the circuit memory budget cannot fit another circuit")]
-    BudgetExhausted,
     /// [`BridgeAdoption::unsent_prefix`] is longer than one Noise message.
     #[error("the unsent prefix is longer than one Noise message")]
     PrefixTooLong,
 }
 
-/// Limits for one [`CircuitTransport`]: its circuits' Yamux limits and its
-/// circuit memory budget (ADR 0021).
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Limits for one [`CircuitTransport`]: its circuits' Yamux limits.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CircuitLimits {
     /// Limits applied to each circuit's Yamux session.
     pub yamux: YamuxConfig,
-    /// The circuit memory budget: the bytes this transport may reserve for
-    /// its circuits and their streams. It caps the circuits' worst-case
-    /// retained payload; the bridge streams they ride on are charged to the
-    /// wrapped transport's own budget.
-    ///
-    /// Each circuit reserves
-    /// [`connection_reservation_bytes`](Self::connection_reservation_bytes)
-    /// from its claim or adoption until teardown drops its session, and each
-    /// stream reserves
-    /// [`stream_reservation_bytes`](Self::stream_reservation_bytes) from when
-    /// it opens or is admitted until it settles, also after its circuit
-    /// ended. What does not fit is refused, never queued: a claim or an
-    /// unclaimed adoption fails ([`AdoptError::BudgetExhausted`]),
-    /// `open_stream` fails with
-    /// `ResourceExhausted { resource: "circuit memory budget" }`, and an
-    /// inbound stream is reset, as past Yamux's stream limit. Must fit one
-    /// circuit with one stream.
-    pub memory_budget_bytes: usize,
 }
 
 impl CircuitLimits {
-    /// The fixed part of a circuit's memory reservation: its session's
-    /// ([`SecureMuxSession::fixed_reservation_bytes`]) plus the one Noise
-    /// message the bridge may hold refused as Full, or the unsent prefix in
-    /// its place.
-    ///
-    /// Container overhead, allocator slack and temporary copies are not
-    /// counted. Saturates rather than overflowing.
-    pub fn connection_reservation_bytes(&self) -> usize {
-        SecureMuxSession::fixed_reservation_bytes(&self.yamux).saturating_add(NOISE_WIRE_FRAME)
-    }
-
-    /// Each stream's memory reservation: its Yamux receive window.
-    pub fn stream_reservation_bytes(&self) -> usize {
-        self.yamux.receive_window as usize
-    }
-
-    /// Checks the limits can work: the Yamux invariants hold, the
-    /// reservation arithmetic does not overflow, and the budget fits one
-    /// circuit with one stream.
+    /// Checks the limits can work: the Yamux invariants hold.
     pub fn validate(&self) -> Result<(), InvalidLimit> {
         self.yamux.validate().map_err(|requirement| InvalidLimit {
             field: "CircuitLimits::yamux",
             requirement,
-        })?;
-        let smallest = self
-            .connection_reservation_bytes()
-            .checked_add(self.stream_reservation_bytes())
-            .filter(|bytes| *bytes != usize::MAX)
-            .ok_or(InvalidLimit {
-                field: "CircuitLimits::yamux",
-                requirement: "the memory reservation arithmetic must not overflow",
-            })?;
-        if self.memory_budget_bytes < smallest {
-            return Err(InvalidLimit {
-                field: "CircuitLimits::memory_budget_bytes",
-                requirement: "must fit one circuit's fixed reservation and one stream",
-            });
-        }
-        Ok(())
-    }
-}
-
-impl Default for CircuitLimits {
-    fn default() -> Self {
-        Self {
-            yamux: YamuxConfig::default(),
-            // At least 64 circuits with a stream each (ADR 0021): 11.64 MiB
-            // fixed plus a 2,432 KiB window is 14 MiB, so 960 MiB admits 68.
-            memory_budget_bytes: 960 * 1024 * 1024,
-        }
+        })
     }
 }
 
@@ -265,14 +186,9 @@ pub struct CircuitTransport<T, E> {
     entropy: E,
     identity: Ed25519Keypair,
     limits: CircuitLimits,
-    /// The circuit memory budget's reservations.
-    ledger: MemoryLedger,
-    /// Claims the host holds for circuits not adopted yet; each holds one
-    /// fixed part in `ledger`.
-    claims: usize,
     circuits: BTreeMap<ConnectionId, Circuit>,
     /// Ended circuits whose delivered bytes are not settled yet; each still
-    /// holds its circuit slot (ADR 0012), and each stream its reservation.
+    /// holds its circuit slot (ADR 0012).
     unsettled: UnsettledConnections,
     bridge_index: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
     retired_bridges: BTreeSet<(ConnectionId, StreamId)>,
@@ -310,9 +226,7 @@ impl<T, E> CircuitTransport<T, E> {
             inner,
             entropy,
             identity,
-            ledger: MemoryLedger::new(limits.memory_budget_bytes),
             limits,
-            claims: 0,
             circuits: BTreeMap::new(),
             unsettled: UnsettledConnections::new(),
             bridge_index: BTreeMap::new(),
@@ -329,68 +243,6 @@ impl<T, E> CircuitTransport<T, E> {
     /// The limits this transport runs under.
     pub fn limits(&self) -> &CircuitLimits {
         &self.limits
-    }
-
-    /// Bytes reserved against the circuit memory budget now: by claims, by
-    /// live circuits, and by streams still unsettled, including those of
-    /// ended circuits.
-    pub fn memory_reserved(&self) -> usize {
-        self.ledger.reserved()
-    }
-
-    /// Reserves one circuit's fixed part ahead of its adoption, returning
-    /// whether it fit. A host takes the claim before it accepts a STOP or
-    /// sends a HOP CONNECT, carries it into
-    /// [`adopt_bridge`](CircuitTransport::adopt_bridge) with
-    /// [`BridgeAdoption::claimed`], and otherwise gives it back with
-    /// [`release_circuit_claim`](Self::release_circuit_claim).
-    pub fn claim_circuit(&mut self) -> bool {
-        let claimed = self
-            .ledger
-            .reserve(self.limits.connection_reservation_bytes());
-        self.claims += usize::from(claimed);
-        claimed
-    }
-
-    /// Gives back one claim the host no longer needs. Does nothing when it
-    /// holds none.
-    pub fn release_circuit_claim(&mut self) {
-        if self.take_claim() {
-            self.ledger
-                .release(self.limits.connection_reservation_bytes());
-        }
-    }
-
-    /// Claims the host holds now.
-    pub fn circuit_claims(&self) -> usize {
-        self.claims
-    }
-
-    /// Sets the claims the host holds to `claims`, taking or releasing the
-    /// difference, and returns whether that many fit. A growth that does not
-    /// fit takes none. What a host's NAT agent calls through its
-    /// `hold_circuit_claims` hook.
-    pub fn hold_circuit_claims(&mut self, claims: usize) -> bool {
-        while self.claims > claims {
-            self.release_circuit_claim();
-        }
-        let held = self.claims;
-        while self.claims < claims {
-            if !self.claim_circuit() {
-                while self.claims > held {
-                    self.release_circuit_claim();
-                }
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Takes one claim, keeping its bytes reserved, if the host holds one.
-    fn take_claim(&mut self) -> bool {
-        let held = self.claims != 0;
-        self.claims -= usize::from(held);
-        held
     }
 
     /// Returns whether an identifier belongs to a circuit connection.
@@ -434,28 +286,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     /// idempotent and returns the existing circuit identifier when its relay,
     /// remote peer, role, and remote-write state agree. Conflicting immutable
     /// metadata returns [`AdoptError::ConflictingAdoption`].
-    ///
-    /// A new circuit reserves its fixed part, carried over from the host's
-    /// claim when [`BridgeAdoption::claimed`] says it holds one; every other
-    /// outcome, a repeat included, releases that claim.
     pub fn adopt_bridge(&mut self, adoption: BridgeAdoption) -> Result<ConnectionId, AdoptError> {
-        let reserved = adoption.claimed && self.take_claim();
-        let adopted = self.adopt(adoption, reserved);
-        if reserved && !matches!(adopted, Ok((_, true))) {
-            self.ledger
-                .release(self.limits.connection_reservation_bytes());
-        }
-        adopted.map(|(id, _)| id)
-    }
-
-    /// Adopts a bridge, returning the circuit and whether it is new, which
-    /// is when it took over the fixed part already `reserved`. Reserves
-    /// that part itself when not, and rolls it back on failure.
-    fn adopt(
-        &mut self,
-        adoption: BridgeAdoption,
-        reserved: bool,
-    ) -> Result<(ConnectionId, bool), AdoptError> {
         let key = (adoption.inner_conn, adoption.bridge_stream);
         if let Some(id) = self.bridge_index.get(&key).copied() {
             let circuit = self
@@ -469,7 +300,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             {
                 return Err(AdoptError::ConflictingAdoption);
             }
-            return Ok((id, false));
+            return Ok(id);
         }
         if adoption.remote_write_closed {
             return Err(AdoptError::RemoteWriteClosed);
@@ -493,23 +324,10 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             .peek()
             .ok_or(AdoptError::IdsExhausted)?;
 
-        let fixed = self.limits.connection_reservation_bytes();
-        if !reserved && !self.ledger.reserve(fixed) {
-            return Err(AdoptError::BudgetExhausted);
-        }
         let mut static_secret = [0u8; 32];
         let mut ephemeral_secret = [0u8; 32];
-        let drawn = self
-            .entropy
-            .fill_bytes(&mut static_secret)
-            .and_then(|()| self.entropy.fill_bytes(&mut ephemeral_secret));
-        if let Err(error) = drawn {
-            // A claim's reservation is the caller's to release.
-            if !reserved {
-                self.ledger.release(fixed);
-            }
-            return Err(error.into());
-        }
+        self.entropy.fill_bytes(&mut static_secret)?;
+        self.entropy.fill_bytes(&mut ephemeral_secret)?;
 
         let session = SecureMuxSession::new(SessionConfig {
             role: match adoption.role {
@@ -558,14 +376,14 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         });
         if let Err(teardown) = start_result {
             self.fail_circuit(id, teardown.0);
-            return Ok((id, true));
+            return Ok(id);
         }
         // Whoever read these bytes past the CONNECT response already
         // acknowledged them on the bridge.
         if !adoption.pending_data.is_empty() {
             self.feed_bridge(key, adoption.pending_data);
         }
-        Ok((id, true))
+        Ok(id)
     }
 
     /// Injects bytes read from a bridge outside the wrapped transport poll.
@@ -599,9 +417,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             return;
         };
         let result = self.with_circuit(id, |this, circuit| {
-            let fed = circuit
-                .session
-                .handle_input_within(data.into(), &mut this.ledger);
+            let fed = circuit.session.handle_input(data.into());
             // Pump either way: bytes the session queued before failing, and
             // events it already produced, are the caller's regardless.
             let pumped = this.pump(circuit);
@@ -666,26 +482,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             .remove(&id)
             .ok_or_else(|| Teardown::fault(format!("circuit {id} is unknown")))?;
         let result = operation(self, &mut circuit);
-        self.release_settled(&mut circuit.session);
         self.circuits.insert(id, circuit);
-        result
-    }
-
-    /// Releases the reservations of streams the session reports settled.
-    fn release_settled(&mut self, session: &mut SecureMuxSession) {
-        let settled = session.take_settled_streams();
-        self.ledger
-            .release(settled * self.limits.stream_reservation_bytes());
-    }
-
-    /// Settles streams of ended circuits through `settle`, releasing the
-    /// reservation of each one that settles.
-    fn settle_unsettled<R>(&mut self, settle: impl FnOnce(&mut UnsettledConnections) -> R) -> R {
-        let before = self.unsettled.streams();
-        let result = settle(&mut self.unsettled);
-        let settled = before - self.unsettled.streams();
-        self.ledger
-            .release(settled * self.limits.stream_reservation_bytes());
         result
     }
 
@@ -810,17 +607,11 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     }
 
     /// Takes a circuit out of the active set for good, keeping its unsettled
-    /// streams' counts. Those keep their stream reservations; the circuit's
-    /// fixed part and every other stream's reservation go now.
+    /// streams' counts.
     fn retire_circuit(&mut self, id: ConnectionId) -> Option<Circuit> {
-        let mut circuit = self.circuits.remove(&id)?;
-        let (unsettled, released) = circuit.session.end_streams();
-        self.unsettled.insert(id, unsettled);
-        self.ledger.release(
-            self.limits
-                .connection_reservation_bytes()
-                .saturating_add(released * self.limits.stream_reservation_bytes()),
-        );
+        let circuit = self.circuits.remove(&id)?;
+        self.unsettled
+            .insert(id, circuit.session.unsettled_streams());
         Some(circuit)
     }
 
@@ -1047,15 +838,14 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     fn operate_session<R>(
         &mut self,
         id: ConnectionId,
-        operation: impl FnOnce(&mut SecureMuxSession, &mut MemoryLedger) -> Result<R, SessionError>,
+        operation: impl FnOnce(&mut SecureMuxSession) -> Result<R, SessionError>,
     ) -> Result<R, TransportError> {
         let mut circuit = self
             .circuits
             .remove(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
-        let result = operation(&mut circuit.session, &mut self.ledger);
+        let result = operation(&mut circuit.session);
         let pumped = self.pump(&mut circuit);
-        self.release_settled(&mut circuit.session);
         self.circuits.insert(id, circuit);
 
         if let Err(Teardown(reason)) = pumped {
@@ -1083,11 +873,6 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                     id,
                     stream_id: StreamId::new(u64::from(stream)),
                     unsent,
-                })
-            }
-            Err(SessionError::Yamux(YamuxError::BudgetExhausted)) => {
-                Err(TransportError::ResourceExhausted {
-                    resource: "circuit memory budget",
                 })
             }
             Err(SessionError::Yamux(YamuxError::TooManyStreams)) => {
@@ -1151,8 +936,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !id.is_circuit() {
             return self.inner.open_stream(id);
         }
-        let stream_id =
-            self.operate_session(id, |session, ledger| session.open_stream_within(ledger))?;
+        let stream_id = self.operate_session(id, SecureMuxSession::open_stream)?;
         self.pending
             .push_back(TransportEvent::StreamOpened { id, stream_id });
         Ok(stream_id)
@@ -1167,7 +951,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !id.is_circuit() {
             return self.inner.send_stream(id, stream_id, data);
         }
-        self.operate_session(id, |session, _| session.send(stream_id, data))
+        self.operate_session(id, |session| session.send(stream_id, data))
             .map_err(|error| {
                 stream_error(error, |reason| TransportError::StreamSendFailed {
                     id,
@@ -1186,7 +970,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
             return self.inner.close_stream_write(id, stream_id);
         }
         let result = self
-            .operate_session(id, |session, _| session.close_stream_write(stream_id))
+            .operate_session(id, |session| session.close_stream_write(stream_id))
             .map_err(|error| {
                 stream_error(error, |reason| TransportError::StreamCloseWriteFailed {
                     id,
@@ -1210,11 +994,11 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
             return self.inner.reset_stream(id, stream_id);
         }
         // Abandoning a stream of an ended circuit only settles it.
-        if self.settle_unsettled(|unsettled| unsettled.abandon(id, stream_id)) {
+        if self.unsettled.abandon(id, stream_id) {
             return Ok(());
         }
         let result = self
-            .operate_session(id, |session, _| session.reset_stream(stream_id))
+            .operate_session(id, |session| session.reset_stream(stream_id))
             .map_err(|error| {
                 stream_error(error, |reason| TransportError::StreamResetFailed {
                     id,
@@ -1240,11 +1024,9 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         }
         if !self.circuits.contains_key(&id) {
             // An ended circuit's bytes are released without credit.
-            return self
-                .settle_unsettled(|unsettled| unsettled.ack(id, stream_id, bytes))
-                .map(|_held| ());
+            return self.unsettled.ack(id, stream_id, bytes).map(|_held| ());
         }
-        self.operate_session(id, |session, _| session.ack_stream(stream_id, bytes))
+        self.operate_session(id, |session| session.ack_stream(stream_id, bytes))
     }
 
     fn set_control_stream(&mut self, id: ConnectionId, stream_id: StreamId, control: bool) {
@@ -1708,32 +1490,7 @@ mod tests {
     ) {
         let limits = CircuitLimits {
             yamux: yamux_config.unwrap_or_default(),
-            ..CircuitLimits::default()
         };
-        setup_pair_with_limits(limits.clone(), limits)
-    }
-
-    /// Limits whose budget fits one circuit with `streams` streams.
-    fn budget_for(streams: usize) -> CircuitLimits {
-        let limits = CircuitLimits::default();
-        CircuitLimits {
-            memory_budget_bytes: limits.connection_reservation_bytes()
-                + streams * limits.stream_reservation_bytes(),
-            ..limits
-        }
-    }
-
-    fn setup_pair_with_limits(
-        a_limits: CircuitLimits,
-        b_limits: CircuitLimits,
-    ) -> (
-        CircuitTransport<InMemoryTransport, CounterEntropy>,
-        CircuitTransport<InMemoryTransport, CounterEntropy>,
-        ConnectionId,
-        StreamId,
-        PeerId,
-        PeerId,
-    ) {
         let relay = identity(9).peer_id();
         let a_identity = identity(1);
         let b_identity = identity(2);
@@ -1742,11 +1499,10 @@ mod tests {
         let (inner_a, inner_b) = InMemoryTransport::pair(relay.clone(), relay.clone());
         let inner_conn = inner_a.connection_id();
         let mut a =
-            CircuitTransport::with_limits(inner_a, a_identity, CounterEntropy(10), a_limits)
+            CircuitTransport::with_limits(inner_a, a_identity, CounterEntropy(10), limits.clone())
                 .expect("valid limits");
-        let mut b =
-            CircuitTransport::with_limits(inner_b, b_identity, CounterEntropy(20), b_limits)
-                .expect("valid limits");
+        let mut b = CircuitTransport::with_limits(inner_b, b_identity, CounterEntropy(20), limits)
+            .expect("valid limits");
 
         let _ = a.poll(Now::from_millis(0)).expect("initial A events");
         let _ = b.poll(Now::from_millis(0)).expect("initial B events");
@@ -1764,7 +1520,6 @@ mod tests {
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
-                claimed: false,
             })
             .expect("initiator adoption");
         let b_id = b
@@ -1777,7 +1532,6 @@ mod tests {
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
-                claimed: false,
             })
             .expect("responder adoption");
         // Circuit IDs are endpoint-local; synchronized test counters let the
@@ -1833,7 +1587,6 @@ mod tests {
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
-                claimed: false,
             })
             .expect("initiator adoption");
         let b_id = b
@@ -1846,7 +1599,6 @@ mod tests {
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
-                claimed: false,
             })
             .expect("responder adoption");
         // Circuit IDs are endpoint-local; synchronized test counters let the
@@ -2280,7 +2032,6 @@ mod tests {
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
-                claimed: false,
             })
             .expect("initiator adoption");
         let header = b
@@ -2303,7 +2054,6 @@ mod tests {
             pending_data: Bytes::from(header[..split].to_vec()),
             unsent_prefix: Bytes::new(),
             remote_write_closed: false,
-            claimed: false,
         })
         .expect("responder adoption with partial pending data");
         assert!(matches!(
@@ -2344,7 +2094,6 @@ mod tests {
                 pending_data: Bytes::new(),
                 unsent_prefix: prefix.clone(),
                 remote_write_closed: false,
-                claimed: false,
             })
             .expect("initiator adoption");
         let received: Vec<u8> = b
@@ -2371,7 +2120,6 @@ mod tests {
             pending_data: Bytes::from(handshake.to_vec()),
             unsent_prefix: Bytes::new(),
             remote_write_closed: false,
-            claimed: false,
         })
         .expect("responder adoption");
         let _ = b.poll(Now::from_millis(0)).expect("incoming event");
@@ -2441,7 +2189,6 @@ mod tests {
                 pending_data: Bytes::from(pending_data),
                 unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
-                claimed: false,
             })
             .expect("responder adopts pipelined selection and Noise msg1");
         let responder_events = b
@@ -2465,7 +2212,6 @@ mod tests {
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
-                claimed: false,
             })
             .expect("real initiator adoption");
         assert_eq!(a_id, circuit_id);
@@ -2672,7 +2418,6 @@ mod tests {
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
-                claimed: false,
             })
             .expect("identical duplicate is idempotent");
         assert_eq!(duplicate, circuit_id);
@@ -2686,7 +2431,6 @@ mod tests {
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
-                claimed: false,
             }),
             Err(AdoptError::ConflictingAdoption)
         );
@@ -2700,7 +2444,6 @@ mod tests {
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
                 remote_write_closed: true,
-                claimed: false,
             }),
             Err(AdoptError::ConflictingAdoption)
         );
@@ -2976,12 +2719,6 @@ mod tests {
                 .any(|event| matches!(event, TransportEvent::StreamData { .. }))
         );
         assert_eq!(b.circuit_slots(), 1);
-        let limits = CircuitLimits::default();
-        let (fixed, window) = (
-            limits.connection_reservation_bytes(),
-            limits.stream_reservation_bytes(),
-        );
-        assert_eq!(b.memory_reserved(), fixed + 2 * window);
 
         b.inner_mut()
             .close(ConnectionId::new(1))
@@ -2996,11 +2733,6 @@ mod tests {
         )));
         assert!(!b.contains_circuit(circuit_id));
         assert_eq!(b.circuit_slots(), 1, "the circuit's bytes are unsettled");
-        assert_eq!(
-            b.memory_reserved(),
-            2 * window,
-            "teardown releases the fixed part; the streams keep theirs"
-        );
 
         b.ack_stream(circuit_id, held, 2)
             .expect("partial ack after close");
@@ -3013,16 +2745,12 @@ mod tests {
                 unacked: 2,
             })
         );
-        assert_eq!(b.memory_reserved(), 2 * window, "partial releases nothing");
         b.ack_stream(circuit_id, held, 2).expect("final ack");
         assert_eq!(b.circuit_slots(), 1, "the other stream still holds it");
-        assert_eq!(b.memory_reserved(), window);
         b.reset_stream(circuit_id, other)
             .expect("abandoning after close settles");
         assert_eq!(b.circuit_slots(), 0);
-        assert_eq!(b.memory_reserved(), 0);
         b.ack_stream(circuit_id, held, 0).expect("settled: a no-op");
-        assert_eq!(b.memory_reserved(), 0, "released once");
         assert!(
             b.poll(Now::from_millis(0)).expect("quiet").is_empty(),
             "settling produces no events"
@@ -3147,7 +2875,9 @@ mod tests {
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
         let stream = a.open_stream(circuit_id).expect("stream");
         let window = YamuxConfig::default().receive_window as usize;
-        let payload = Bytes::from(vec![7u8; 2 * window]);
+        // More than the window and the stream's send cap together, so the
+        // sender is left holding a tail.
+        let payload = Bytes::from(vec![7u8; 4 * window]);
         let mut held = a
             .send_stream(circuit_id, stream, payload.clone())
             .err()
@@ -3252,7 +2982,6 @@ mod tests {
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
-                claimed: false,
             }),
             Err(AdoptError::UnknownConnection)
         );
@@ -3279,7 +3008,6 @@ mod tests {
                 pending_data: Bytes::from(Vec::new()),
                 unsent_prefix: Bytes::new(),
                 remote_write_closed: false,
-                claimed: false,
             }),
             Err(AdoptError::PeerAlreadyDirect)
         );
@@ -3367,7 +3095,6 @@ mod tests {
             pending_data: Bytes::from(Vec::new()),
             unsent_prefix: Bytes::new(),
             remote_write_closed: false,
-            claimed: false,
         };
         // Adoption peeks the next id up front but must only consume it after
         // every fallible step, so a failure leaves the id space untouched. A
@@ -3446,11 +3173,7 @@ mod tests {
     }
 
     /// An adoption of a fresh bridge on `transport`'s relay connection.
-    fn fresh_adoption(
-        transport: &mut TestCircuit,
-        remote_peer: PeerId,
-        claimed: bool,
-    ) -> BridgeAdoption {
+    fn fresh_adoption(transport: &mut TestCircuit, remote_peer: PeerId) -> BridgeAdoption {
         let inner_conn = transport.inner().connection_id();
         let bridge_stream = transport
             .inner_mut()
@@ -3465,131 +3188,19 @@ mod tests {
             pending_data: Bytes::new(),
             unsent_prefix: Bytes::new(),
             remote_write_closed: false,
-            claimed,
         }
-    }
-
-    #[test]
-    fn an_adoption_past_the_memory_budget_is_refused_until_a_circuit_ends() {
-        let (mut a, _b, circuit_id, _bridge, _a_peer, _b_peer) =
-            setup_pair_with_limits(budget_for(1), CircuitLimits::default());
-        let fixed = budget_for(1).connection_reservation_bytes();
-        assert_eq!(a.memory_reserved(), fixed);
-
-        let adoption = fresh_adoption(&mut a, identity(3).peer_id(), false);
-        assert_eq!(
-            a.adopt_bridge(adoption.clone()),
-            Err(AdoptError::BudgetExhausted)
-        );
-        assert_eq!(a.circuit_ids(), [circuit_id], "a refusal adopts nothing");
-        assert_eq!(a.memory_reserved(), fixed);
-
-        a.close(circuit_id).expect("close");
-        assert_eq!(a.memory_reserved(), 0);
-        a.adopt_bridge(adoption).expect("admitted once released");
-    }
-
-    #[test]
-    fn a_claim_reserves_ahead_of_adoption_and_carries_into_it() {
-        let (mut a, _b, circuit_id, _bridge, _a_peer, _b_peer) =
-            setup_pair_with_limits(budget_for(2), CircuitLimits::default());
-        let fixed = budget_for(2).connection_reservation_bytes();
-        assert!(
-            !a.claim_circuit(),
-            "the live circuit leaves room for streams only"
-        );
-        a.close(circuit_id).expect("close");
-
-        assert!(a.claim_circuit(), "a free budget fits a claim");
-        assert_eq!(a.memory_reserved(), fixed);
-        assert!(!a.claim_circuit(), "the claim holds the fixed part");
-        let unclaimed = fresh_adoption(&mut a, identity(3).peer_id(), false);
-        assert_eq!(
-            a.adopt_bridge(unclaimed),
-            Err(AdoptError::BudgetExhausted),
-            "an unclaimed adoption cannot use another's claim"
-        );
-
-        let claimed = fresh_adoption(&mut a, identity(4).peer_id(), true);
-        let id = a
-            .adopt_bridge(claimed.clone())
-            .expect("the claim carries over");
-        assert_eq!(a.memory_reserved(), fixed, "carried, not reserved twice");
-        assert_eq!(a.circuit_claims(), 0);
-        // Repeating an adoption is idempotent, and its claim goes back.
-        assert_eq!(a.adopt_bridge(claimed), Ok(id));
-        assert_eq!(a.memory_reserved(), fixed);
-        assert_eq!(a.circuit_claims(), 0);
-    }
-
-    #[test]
-    fn a_failed_claimed_adoption_releases_its_claim() {
-        let (mut a, _b, circuit_id, _bridge, _a_peer, _b_peer) =
-            setup_pair_with_limits(budget_for(2), CircuitLimits::default());
-        a.close(circuit_id).expect("close");
-        assert!(a.claim_circuit());
-        let mut adoption = fresh_adoption(&mut a, identity(3).peer_id(), true);
-        adoption.remote_write_closed = true;
-        assert_eq!(a.adopt_bridge(adoption), Err(AdoptError::RemoteWriteClosed));
-        assert_eq!((a.memory_reserved(), a.circuit_claims()), (0, 0));
-
-        assert!(a.claim_circuit());
-        a.release_circuit_claim();
-        assert_eq!((a.memory_reserved(), a.circuit_claims()), (0, 0));
     }
 
     #[test]
     fn an_unsent_prefix_longer_than_one_noise_frame_is_refused() {
         let (mut a, _b, _circuit_id, _bridge, _a_peer, _b_peer) = setup_pair();
-        let before = a.memory_reserved();
-        let mut adoption = fresh_adoption(&mut a, identity(3).peer_id(), false);
+        let mut adoption = fresh_adoption(&mut a, identity(3).peer_id());
         adoption.unsent_prefix = Bytes::from(vec![0; minip2p_secure_mux::NOISE_WIRE_FRAME + 1]);
         assert_eq!(
             a.adopt_bridge(adoption.clone()),
             Err(AdoptError::PrefixTooLong)
         );
-        assert_eq!(a.memory_reserved(), before);
         adoption.unsent_prefix = Bytes::from(vec![0; minip2p_secure_mux::NOISE_WIRE_FRAME]);
         a.adopt_bridge(adoption).expect("one frame fits");
-    }
-
-    #[test]
-    fn an_open_past_the_circuit_memory_budget_is_refused() {
-        let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) =
-            setup_pair_with_limits(budget_for(1), CircuitLimits::default());
-        complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
-        let first = a.open_stream(circuit_id).expect("one stream fits");
-        assert_eq!(
-            a.open_stream(circuit_id),
-            Err(TransportError::ResourceExhausted {
-                resource: "circuit memory budget"
-            })
-        );
-        a.reset_stream(circuit_id, first).expect("reset");
-        a.open_stream(circuit_id).expect("the reset released it");
-    }
-
-    #[test]
-    fn the_default_budget_admits_at_least_64_circuits_with_a_stream_each() {
-        let limits = CircuitLimits::default();
-        let circuit = limits.connection_reservation_bytes() + limits.stream_reservation_bytes();
-        assert!(
-            limits.memory_budget_bytes / circuit >= 64,
-            "{circuit} bytes each"
-        );
-    }
-
-    #[test]
-    fn limits_too_small_for_one_circuit_and_stream_are_rejected() {
-        let limits = budget_for(1);
-        limits.validate().expect("one circuit and one stream fit");
-        let small = CircuitLimits {
-            memory_budget_bytes: limits.memory_budget_bytes - 1,
-            ..limits
-        };
-        assert_eq!(
-            small.validate().map_err(|error| error.field),
-            Err("CircuitLimits::memory_budget_bytes")
-        );
     }
 }

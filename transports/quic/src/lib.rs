@@ -29,9 +29,6 @@ use socket2::{Domain, Protocol as SocketProtocol, Socket as RawSocket, Type};
 
 #[cfg(test)]
 mod admission_tests;
-mod budget;
-#[cfg(test)]
-mod budget_tests;
 mod config;
 mod connection;
 mod diagnostics;
@@ -58,7 +55,6 @@ pub use diagnostics::{
 };
 pub use error::{QuicBindError, QuicTlsStage};
 
-use budget::MemoryBudget;
 use connection::{Cx, QuicConnection};
 use diagnostics::{ConnectionCounters, DatagramTally};
 use socket::{Received, Socket, Sockets};
@@ -258,10 +254,12 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
     let idle_timeout =
         VarInt::from_u64(limits.idle_timeout_ms).map_err(|_bounds| too_large("idle_timeout_ms"))?;
     let stream_window = var_int("stream_receive_window", limits.stream_receive_window)?;
-    let connection_window = var_int(
-        "connection_receive_window",
-        limits.connection_receive_window,
-    )?;
+    // `usize::MAX`, or anything past what QUIC can express, is unlimited:
+    // on 32-bit targets `usize::MAX` alone would be a finite 4 GiB window.
+    let connection_window = match limits.connection_receive_window {
+        usize::MAX => VarInt::MAX,
+        window => var_int("connection_receive_window", window).unwrap_or(VarInt::MAX),
+    };
     let send_window =
         u64::try_from(limits.send_window).map_err(|_overflow| too_large("send_window"))?;
 
@@ -289,9 +287,8 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
 /// addresses (one `/ip4`, one `/ip6`), or both on wildcard addresses with
 /// [`dual_stack`](Self::dual_stack). Each transmit leaves from the socket of
 /// its destination's family. Connections get ids and queue retained datagrams
-/// per socket, and are counted against [`QuicLimits::max_connections`] and
-/// the QUIC memory budget ([`QuicLimits::memory_budget_bytes`]) across the
-/// whole transport.
+/// per socket, and are counted against [`QuicLimits::max_connections`] across
+/// the whole transport.
 pub struct QuicTransport {
     /// The sockets, IPv4 first, with their per-socket state.
     sockets: Sockets,
@@ -318,12 +315,9 @@ pub struct QuicTransport {
     /// Active connections keyed by connection id.
     connections: HashMap<ConnectionId, QuicConnection>,
     /// Ended connections whose delivered bytes are not settled yet (unsettled
-    /// connections). Each still counts against the connection limit, and its
-    /// streams keep their memory reservations (ADR 0012).
+    /// connections). Each still counts against the connection limit
+    /// (ADR 0012).
     unsettled: UnsettledConnections,
-    /// Memory reservations of every connection and stream, live or
-    /// unsettled.
-    budget: MemoryBudget,
     /// The engine's handle for each connection.
     handles: HashMap<ConnectionHandle, ConnectionId>,
     /// Events queued between poll() calls.
@@ -437,13 +431,6 @@ impl QuicTransport {
         }
         // Checked before any socket is bound.
         let transport_config = transport_config(node_config.limits())?;
-        let budget = MemoryBudget::new(node_config.limits(), binds.len()).ok_or(
-            QuicBindError::InvalidLimit {
-                field: "memory_budget_bytes",
-                requirement: "must fit each socket's datagram_queue_reservation_bytes() plus one \
-                     connection_reservation_bytes() and one stream_reservation_bytes()",
-            },
-        )?;
         let sockets = binds
             .into_iter()
             .map(|addr| {
@@ -454,7 +441,7 @@ impl QuicTransport {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Self::from_sockets(node_config, transport_config, budget, sockets)
+        Self::from_sockets(node_config, transport_config, sockets)
     }
 
     /// Binds an IPv4 and an IPv6 wildcard socket, each on its own ephemeral
@@ -470,7 +457,6 @@ impl QuicTransport {
     fn from_sockets(
         node_config: QuicNodeConfig,
         transport_config: TransportConfig,
-        budget: MemoryBudget,
         udps: Vec<(SocketAddr, UdpSocket)>,
     ) -> Result<Self, QuicBindError> {
         let transport_config = Arc::new(transport_config);
@@ -533,7 +519,6 @@ impl QuicTransport {
             host_time,
             connections: HashMap::new(),
             unsettled: UnsettledConnections::new(),
-            budget,
             handles: HashMap::new(),
             pending_events: Vec::new(),
             recv_buf: vec![0; recv_buf_len],
@@ -781,13 +766,10 @@ impl QuicTransport {
     /// Admits a new inbound connection on socket `index`: ignored unless the
     /// socket listens, refused silently at the connection limit (before any
     /// Retry), sent a Retry while its address is unvalidated and validation
-    /// is required, refused when its memory reservation does not fit (with
-    /// `CONNECTION_REFUSED` from a validated address, silently otherwise),
-    /// accepted otherwise.
+    /// is required, accepted otherwise.
     fn admit(&mut self, now: Instant, index: usize, incoming: Incoming, buf: &mut Vec<u8>) {
         let limits = self.node_config.limits().clone();
         let has_slot = self.slots_held() < limits.max_connections;
-        let fits = self.budget.fits_connection();
         let Some(socket) = self
             .sockets
             .get_mut(index)
@@ -803,24 +785,12 @@ impl QuicTransport {
             }
             return;
         }
-        if !fits {
-            // Only a validated address is told: refusing an unvalidated one
-            // would let a spoofed source turn this node into a reflector.
-            if incoming.remote_address_validated() {
-                let transmit = self.endpoint.refuse(incoming, buf);
-                send_stateless(socket, buf, &transmit);
-            } else {
-                self.endpoint.ignore(incoming);
-            }
-            return;
-        }
         let Ok(id) = socket.ids.allocate() else {
             self.endpoint.ignore(incoming);
             return;
         };
         match self.endpoint.accept(incoming, now, buf, None) {
             Ok((handle, conn)) => {
-                self.budget.reserve_connection();
                 // The accepted Initial never passes through `handle_event`.
                 let mut counters = ConnectionCounters::default();
                 counters.datagram_received();
@@ -875,7 +845,6 @@ impl QuicTransport {
             sockets: &mut self.sockets,
             send_buf: &mut self.send_buf,
             events: &mut self.pending_events,
-            budget: &mut self.budget,
         };
         let failure = conn.service(now, &mut cx);
         let (after, unfinished, drained) =
@@ -913,10 +882,9 @@ impl QuicTransport {
         }
     }
 
-    /// Forgets a drained connection, releases its fixed reservation, and
-    /// reports it closed. One whose streams still hold delivered,
-    /// unacknowledged bytes keeps only those counts, their stream
-    /// reservations, and its connection slot until they settle.
+    /// Forgets a drained connection and reports it closed. One whose streams
+    /// still hold delivered, unacknowledged bytes keeps only those counts,
+    /// and its connection slot until they settle.
     fn remove_connection(&mut self, id: ConnectionId) {
         let Some(conn) = self.connections.remove(&id) else {
             return;
@@ -927,24 +895,10 @@ impl QuicTransport {
         }
         self.unfinished.remove(&id);
         self.received.retain(|&received| received != id);
-        let held = self.unsettled.streams();
         self.unsettled.insert(id, conn.unsettled_streams());
-        let kept = self.unsettled.streams() - held;
-        self.budget.release_connection();
-        self.budget.release_streams(conn.stream_count() - kept);
         let reason = conn.close_reason();
         self.pending_events
             .push(TransportEvent::Closed { id, reason });
-    }
-
-    /// Settles held streams of ended connections through `settle`, releasing
-    /// the reservations of every stream it settled. Returns what `settle`
-    /// did.
-    fn settle_unsettled<R>(&mut self, settle: impl FnOnce(&mut UnsettledConnections) -> R) -> R {
-        let held = self.unsettled.streams();
-        let result = settle(&mut self.unsettled);
-        self.budget.release_streams(held - self.unsettled.streams());
-        result
     }
 
     /// Discards a connection that never got going: closed, with its close
@@ -980,16 +934,12 @@ impl Transport for QuicTransport {
             .sockets
             .for_addr(peer_socket)
             .ok_or_else(|| missing_family("dial target", peer_socket))?;
-        // The connection limit and the memory budget count inbound and
-        // outbound alike, across sockets; admission enforces the same bounds
-        // for incoming Initials.
+        // The connection limit counts inbound and outbound alike, across
+        // sockets; admission enforces the same bound for incoming Initials.
         if slots_held >= max_connections {
             return Err(TransportError::ResourceExhausted {
                 resource: "QUIC connections",
             });
-        }
-        if !self.budget.fits_connection() {
-            return Err(MemoryBudget::exhausted());
         }
         let id = socket.ids.allocate()?;
         let config = self.client_config(addr.peer_id())?;
@@ -1001,7 +951,6 @@ impl Transport for QuicTransport {
                 id,
                 reason: format!("QUIC connect error: {e}"),
             })?;
-        self.budget.reserve_connection();
         let conn = QuicConnection::new(
             id,
             handle,
@@ -1055,7 +1004,7 @@ impl Transport for QuicTransport {
             .get_mut(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
 
-        let stream_id = conn.open_stream(&mut self.budget)?;
+        let stream_id = conn.open_stream()?;
         self.pending_events
             .push(TransportEvent::StreamOpened { id, stream_id });
         self.service(id, Instant::now());
@@ -1104,13 +1053,13 @@ impl Transport for QuicTransport {
     ) -> Result<(), TransportError> {
         let Some(conn) = self.connections.get_mut(&id) else {
             // Abandoning a stream of an ended connection only settles it.
-            if self.settle_unsettled(|unsettled| unsettled.abandon(id, stream_id)) {
+            if self.unsettled.abandon(id, stream_id) {
                 return Ok(());
             }
             return Err(TransportError::ConnectionNotFound { id });
         };
 
-        let result = conn.reset_stream(stream_id, &mut self.budget, &mut self.pending_events);
+        let result = conn.reset_stream(stream_id, &mut self.pending_events);
         self.pending_events
             .retain(|event| *event != TransportEvent::StreamWritable { id, stream_id });
         self.service(id, Instant::now());
@@ -1125,7 +1074,7 @@ impl Transport for QuicTransport {
     ) -> Result<(), TransportError> {
         let Some(conn) = self.connections.get_mut(&id) else {
             // An ended connection's bytes are released without credit.
-            self.settle_unsettled(|unsettled| unsettled.ack(id, stream_id, bytes))?;
+            self.unsettled.ack(id, stream_id, bytes)?;
             return Ok(());
         };
         // A stream that had spent its budget resumes now, not when the next
