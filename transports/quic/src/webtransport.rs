@@ -143,9 +143,10 @@ struct Connect {
     /// The peer acknowledged our FIN, or stopped our side: nothing we
     /// sent on it is still in flight.
     delivered: bool,
-    /// We reset and stopped it with `H3_MESSAGE_ERROR` for data after the
-    /// close capsule. Nothing acknowledges that, so only the Closing
-    /// deadline may close QUIC.
+    /// We reset our side of it: after the peer's STOP_SENDING, or with
+    /// `H3_MESSAGE_ERROR` (also stopping it) for data after the close
+    /// capsule. Nothing acknowledges a reset, so only the Closing deadline
+    /// may close QUIC, which lets the session's resets out first.
     refused: bool,
 }
 
@@ -405,7 +406,8 @@ impl WtSession {
     /// one) and acknowledged our FIN on the
     /// CONNECT stream, or stopped it. Packets the connection queued before
     /// that FIN (its resets) went out with or ahead of it. A CONNECT stream
-    /// we refused for data after the close capsule never qualifies.
+    /// we reset (after a stop, or for data after the close capsule) never
+    /// qualifies.
     pub(crate) fn ended_and_delivered(&self) -> bool {
         self.connect
             .as_ref()
@@ -451,8 +453,10 @@ impl WtSession {
             Ok(()) | Err(_) => {}
         }
         self.out.remove(&raw);
-        if self.connect.as_ref().is_some_and(|c| c.id == raw) {
-            self.on_send_done(raw);
+        if let Some(connect) = self.connect.as_mut().filter(|c| c.id == raw) {
+            // Nothing acknowledges our reset: wait out the Closing deadline.
+            connect.delivered = true;
+            connect.refused = true;
             // A close capsule already received keeps its code.
             self.read_connect(conn);
             self.peer_closed(0);
@@ -903,6 +907,7 @@ impl WtSession {
             if let Some(connect) = self.connect.as_mut() {
                 connect.finished = true;
                 connect.delivered = true;
+                connect.refused = true;
             }
             self.peer_closed(0);
             return;

@@ -2242,3 +2242,65 @@ fn a_closed_session_resets_and_stops_its_application_streams_with_the_drafts_cod
         }
     }
 }
+
+#[test]
+fn stopping_the_connect_stream_with_its_end_still_sends_the_teardown() {
+    // The stop marks our side done at once; the session's resets must still
+    // leave before QUIC closes.
+    for settings in [DRAFT02, DRAFT14] {
+        for reset in [false, true] {
+            let (mut server, mut peer, _) = established(settings);
+            let mut events = Vec::new();
+            let app = peer.wt_stream(b"app");
+            peer.drive(
+                &mut server,
+                &mut events,
+                "application stream",
+                |_, events| crate::test_peer::stream_bytes(events, app) == b"app",
+            );
+            idle(&mut server, &mut peer, &mut events, 50);
+            let before = resets_received(&mut peer);
+            let connect = peer.connect.expect("CONNECT");
+            peer.raw.stop(connect, 0);
+            if reset {
+                peer.raw.reset(connect, 0);
+            } else {
+                peer.raw.finish(connect);
+            }
+            let (code, reason) = peer.closed_with(&mut server, &mut events);
+            let what = format!("draft-14 {}, reset {reset}", settings == DRAFT14);
+            assert_eq!(code, code::H3_NO_ERROR, "{what}: {reason}");
+            assert!(resets_received(&mut peer) > before, "{what}");
+        }
+    }
+}
+
+#[test]
+fn a_close_capsule_with_fin_and_stop_still_resets_streams_with_session_gone() {
+    // Draft-14 §6 lets a client send all three together.
+    let (mut server, mut peer, _) = established(DRAFT14);
+    let mut events = Vec::new();
+    let app = peer.wt_stream(b"app");
+    peer.drive(
+        &mut server,
+        &mut events,
+        "application stream",
+        |_, events| crate::test_peer::stream_bytes(events, app) == b"app",
+    );
+    idle(&mut server, &mut peer, &mut events, 50);
+    peer.capsule(&Capsule::CloseSession {
+        code: 42,
+        reason: String::new(),
+    });
+    let connect = peer.connect.expect("CONNECT");
+    peer.raw.finish(connect);
+    peer.raw.stop(connect, code::WT_SESSION_GONE as u32);
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
+    assert_eq!(code, code::H3_NO_ERROR, "{reason}");
+    assert_eq!(
+        close_reason(&events),
+        Some(&ConnectionCloseReason::Remote { code: 42 })
+    );
+    assert_eq!(reset_code(&mut peer, app), Some(code::WT_SESSION_GONE));
+    assert_eq!(stop_code(&mut peer, app), Some(code::WT_SESSION_GONE));
+}
