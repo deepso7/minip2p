@@ -9,6 +9,7 @@ use minip2p_core::{Multiaddr, PeerAddr, Protocol};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_swarm::{SwarmBuilder, SwarmCore, SwarmEvent};
+use minip2p_tls::webtransport;
 use minip2p_transport::ConnectionCloseReason;
 use minip2p_transport::{
     Bytes, ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportEvent,
@@ -70,6 +71,14 @@ fn client(options: Options) -> Client {
 struct Seen {
     server: Vec<TransportEvent>,
     client: Vec<TransportEvent>,
+    /// The wall clock the server is polled with, when mocked.
+    server_unix: Option<u64>,
+}
+
+/// The server's sample: [`now`], with its wall clock mocked when asked.
+fn server_now(unix: Option<u64>) -> Now {
+    let now = now();
+    unix.map_or(now, |unix| now.with_unix_seconds(unix))
 }
 
 /// Polls both until `done` accepts what they reported.
@@ -89,7 +98,9 @@ fn drive(
             seen.client
         );
         std::thread::sleep(Duration::from_millis(1));
-        seen.server.extend(server.poll(now()).expect("server poll"));
+        let server_now = server_now(seen.server_unix);
+        seen.server
+            .extend(server.poll(server_now).expect("server poll"));
         seen.client.extend(client.poll(now()).expect("client poll"));
     }
 }
@@ -385,7 +396,8 @@ fn local_addresses_report_the_bound_shapes_and_relisten_ignores_certhashes() {
     assert_eq!(addrs.len(), 2, "{addrs:?}");
     assert!(addrs[0].is_quic_transport());
     assert!(addrs[1].is_webtransport());
-    assert_eq!(addrs[1].certhashes().count(), 1);
+    // The current and the next period's certificates.
+    assert_eq!(addrs[1].certhashes().count(), 2);
     assert_eq!(
         addrs[1].without_certhashes().protocols()[..3],
         addrs[0].protocols()[..]
@@ -406,4 +418,128 @@ fn local_addresses_report_the_bound_shapes_and_relisten_ignores_certhashes() {
     let addrs = webtransport_only.local_addresses();
     assert_eq!(addrs.len(), 1, "{addrs:?}");
     assert!(addrs[0].is_webtransport());
+}
+
+/// The certhash of `key`'s certificate for `period`.
+fn certhash_of(key: &Ed25519Keypair, period: u64) -> minip2p_core::Multihash {
+    let (der, _) = webtransport::webtransport_certificate(key, period).expect("certificate");
+    webtransport::certhash(&der)
+}
+
+/// The certhashes a transport advertises on its WebTransport address.
+fn advertised(transport: &QuicTransport) -> Vec<minip2p_core::Multihash> {
+    webtransport_addr(transport)
+        .transport()
+        .certhashes()
+        .copied()
+        .collect()
+}
+
+fn listening(events: &[TransportEvent]) -> Vec<Multiaddr> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            TransportEvent::Listening { addr } => Some(addr.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A listener on `key` whose wall clock reads `unix`.
+fn server_at(key: &Ed25519Keypair, unix: u64) -> QuicTransport {
+    let mut server = server_with(QuicNodeConfig::new(key.clone()));
+    server.listen_on_bound_addrs().expect("listen");
+    server.poll(server_now(Some(unix))).expect("poll");
+    server
+}
+
+#[test]
+fn a_period_boundary_rotates_the_certificate_and_keeps_live_connections() {
+    let key = Ed25519Keypair::generate();
+    let k = 2_000;
+    let boundary = (k + 1) * webtransport::PERIOD_SECS;
+    let mut server = server_at(&key, boundary - 5);
+    assert_eq!(
+        advertised(&server),
+        [certhash_of(&key, k), certhash_of(&key, k + 1)]
+    );
+    // The boundary is the transport's next deadline.
+    let before = server_now(Some(boundary - 5));
+    let deadline = server.next_deadline().expect("a rotation deadline");
+    assert!(deadline <= before.deadline_after(5_000), "{deadline:?}");
+    let old_addr = webtransport_addr(&server);
+    let revision = server.local_addresses_revision();
+
+    let mut live = client(Options::default());
+    let mut seen = Seen {
+        server_unix: Some(boundary - 5),
+        ..Seen::default()
+    };
+    connect(&mut server, &mut live, &mut seen);
+    let (client_conn, _) = connected(&seen.client).expect("client connected");
+
+    seen.server.clear();
+    seen.server_unix = Some(boundary);
+    seen.server
+        .extend(server.poll(server_now(Some(boundary))).expect("poll"));
+    let new_hashes = [certhash_of(&key, k + 1), certhash_of(&key, k + 2)];
+    assert_eq!(advertised(&server), new_hashes);
+    assert_ne!(server.local_addresses_revision(), revision);
+    assert_eq!(
+        listening(&seen.server),
+        [webtransport_addr(&server).transport().clone()]
+    );
+    // Only once.
+    let later = server.poll(server_now(Some(boundary + 1))).expect("poll");
+    assert!(listening(&later).is_empty(), "{later:?}");
+
+    // The live connection still carries streams.
+    let stream = live.open_stream(client_conn).expect("open");
+    live.send_stream(client_conn, stream, Bytes::from_static(b"after"))
+        .expect("send");
+    drive(
+        &mut server,
+        &mut live,
+        &mut seen,
+        "a stream after rotation",
+        |seen| incoming_stream(&seen.server).is_some(),
+    );
+
+    // An address from the previous period still dials.
+    let mut late = client(Options::default());
+    let mut late_seen = Seen {
+        server_unix: Some(boundary + 1),
+        ..Seen::default()
+    };
+    late.dial(&old_addr).expect("dial");
+    drive(
+        &mut server,
+        &mut late,
+        &mut late_seen,
+        "an old-period dial",
+        |seen| connected(&seen.client).is_some(),
+    );
+}
+
+#[test]
+fn clock_jumps_and_restarts_yield_the_current_periods_hashes() {
+    let key = Ed25519Keypair::generate();
+    let k = 2_000;
+    let mut server = server_at(&key, k * webtransport::PERIOD_SECS + 10);
+
+    // Forward across several periods, then back: straight to the clock's
+    // period, announced once.
+    for period in [k + 5, k + 2] {
+        let unix = period * webtransport::PERIOD_SECS + 100;
+        let events = server.poll(server_now(Some(unix))).expect("poll");
+        let expected = [certhash_of(&key, period), certhash_of(&key, period + 1)];
+        assert_eq!(advertised(&server), expected);
+        assert_eq!(listening(&events).len(), 1, "{events:?}");
+    }
+
+    // A restart exactly at a boundary matches a node that kept running.
+    let boundary = (k + 3) * webtransport::PERIOD_SECS;
+    server.poll(server_now(Some(boundary))).expect("poll");
+    let restarted = server_at(&key, boundary);
+    assert_eq!(advertised(&restarted), advertised(&server));
 }

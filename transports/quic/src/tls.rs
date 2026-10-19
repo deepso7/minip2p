@@ -305,21 +305,21 @@ impl TlsIdentity {
         })
     }
 
-    /// The WebTransport certificate for the period containing `unix_secs`,
-    /// derived from `keypair`.
-    pub(crate) fn webtransport_certificate(
+    /// The WebTransport certificate for `period`, derived from `keypair`,
+    /// loaded for serving; swap it into a [`WebTransportCertificate`] to
+    /// rotate.
+    pub(crate) fn webtransport_key(
         &self,
         keypair: &Ed25519Keypair,
-        unix_secs: u64,
-    ) -> Result<WebTransportCertificate, QuicBindError> {
-        let period = minip2p_tls::webtransport::period_at(unix_secs);
+        period: u64,
+    ) -> Result<Arc<CertifiedKey>, QuicBindError> {
         let (cert, key) = minip2p_tls::webtransport::webtransport_certificate(keypair, period)
             .map_err(QuicBindError::Certificate)?;
         let load_key = |error: String| QuicBindError::tls(QuicTlsStage::LoadKey, error);
         let key = PrivateKeyDer::try_from(key).map_err(|error| load_key(error.to_string()))?;
         let key = CertifiedKey::from_der(vec![CertificateDer::from(cert)], key, &self.provider)
             .map_err(|error| load_key(error.to_string()))?;
-        Ok(Arc::new(RwLock::new(Arc::new(key))))
+        Ok(Arc::new(key))
     }
 
     /// The config of a libp2p-only listening socket: TLS 1.3, ALPN
