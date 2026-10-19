@@ -106,7 +106,7 @@ pub fn parse_direct_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
     if peer_addr.transport().transport_kind().is_none() || peer_addr.transport().is_wildcard_host()
     {
         return Err(FfiError::InvalidAddress {
-            detail: "address must be a complete direct /quic-v1 or /tcp peer address".into(),
+            detail: "address must be a complete direct /quic-v1, /webtransport or /tcp peer address".into(),
         });
     }
     Ok(peer_addr)
