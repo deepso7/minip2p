@@ -123,17 +123,17 @@ impl FrameDecoder {
                     }
                     self.state = self.start_payload(ty, len)?;
                 }
+                // Never zero: an empty DATA frame is reported from `Length`.
                 State::Data { remaining } => {
-                    if remaining == 0 {
-                        self.state = State::Type;
-                        continue;
-                    }
                     if input.is_empty() {
                         return Ok(None);
                     }
                     let chunk = take(input, remaining);
-                    self.state = State::Data {
-                        remaining: remaining - chunk.len() as u64,
+                    // Leave the frame with its last chunk, so the decoder is
+                    // at a boundary as soon as that chunk is returned.
+                    self.state = match remaining - chunk.len() as u64 {
+                        0 => State::Type,
+                        remaining => State::Data { remaining },
                     };
                     return Ok(Some(Frame::Data(chunk)));
                 }
@@ -430,6 +430,17 @@ mod tests {
         );
         let mut decoder = FrameDecoder::new();
         assert_eq!(decode_all(&mut decoder, &[0x07, 0x09]), Err(Error::Frame));
+    }
+
+    #[test]
+    fn the_last_data_chunk_leaves_the_decoder_at_a_boundary() {
+        let mut decoder = FrameDecoder::new();
+        let mut input: &[u8] = &[0x00, 0x02, 0xaa, 0xbb];
+        assert_eq!(
+            decoder.decode(&mut input),
+            Ok(Some(Frame::Data(&[0xaa, 0xbb])))
+        );
+        assert!(decoder.is_at_frame_boundary());
     }
 
     #[test]
