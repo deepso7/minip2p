@@ -31,7 +31,6 @@ impl StreamAcks {
     /// names the streams whose `StreamReady` was produced but not pulled yet:
     /// they keep automatic acknowledgement. A protocol that is manual
     /// already stays as it is, streams included.
-    #[cfg(any(feature = "std", test))]
     pub(crate) fn set_manual(
         &mut self,
         protocol_id: String,

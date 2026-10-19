@@ -129,3 +129,30 @@ pub fn map_driver_error(error: minip2p::DriverError) -> FfiError {
         },
     }
 }
+
+/// Maps a Gossipsub refusal: reserved topics to [`FfiError::NotPermitted`],
+/// publish limits to their own variants, topic mistakes to
+/// [`FfiError::InvalidTopic`].
+pub fn map_gossipsub_error(error: minip2p::GossipsubError) -> FfiError {
+    match error {
+        minip2p::GossipsubError::DiscoveryTopicReserved => FfiError::NotPermitted {
+            detail: error.to_string(),
+        },
+        minip2p::GossipsubError::Publish(minip2p::PublishError::TooLarge) => FfiError::MessageTooLarge,
+        minip2p::GossipsubError::Publish(minip2p::PublishError::Backpressure) => FfiError::Backpressure,
+        minip2p::GossipsubError::Publish(minip2p::PublishError::Topic(error)) | minip2p::GossipsubError::Topic(error) => {
+            map_topic_error(error)
+        }
+        minip2p::GossipsubError::Driver(error) => map_driver_error(error),
+        minip2p::GossipsubError::NotEnabled => FfiError::Internal {
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// Maps an invalid pubsub topic.
+pub fn map_topic_error(error: minip2p::TopicError) -> FfiError {
+    FfiError::InvalidTopic {
+        detail: error.to_string(),
+    }
+}
