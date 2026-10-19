@@ -11,6 +11,7 @@ extern crate alloc;
 #[cfg(feature = "ed25519")]
 mod ed25519;
 mod key;
+pub mod multibase;
 mod peer_id;
 
 #[cfg(feature = "ed25519")]

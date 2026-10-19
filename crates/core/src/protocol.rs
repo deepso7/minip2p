@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 
 use minip2p_identity::{PeerId, read_uvarint_with_remainder, write_uvarint};
 
-use crate::MultiaddrError;
+use crate::{Certhash, MultiaddrError};
 use crate::multiaddr::is_valid_dns;
 
 // ---------------------------------------------------------------------------
@@ -32,6 +32,10 @@ const TCP_CODE: u64 = 0x06;
 const UDP_CODE: u64 = 0x0111;
 /// Multicodec code for `/quic-v1`. No value.
 const QUIC_V1_CODE: u64 = 0x01cd;
+/// Multicodec code for `/webtransport`. No value.
+const WEBTRANSPORT_CODE: u64 = 0x01d1;
+/// Multicodec code for `/certhash/<multihash>`. Varint-length-prefixed multihash.
+const CERTHASH_CODE: u64 = 0x01d2;
 /// Multicodec code for `/p2p/<peer-id>`. Varint-length-prefixed multihash.
 const P2P_CODE: u64 = 0x01a5;
 /// Multicodec code for `/p2p-circuit`. No value.
@@ -48,6 +52,10 @@ pub enum Protocol {
     Tcp(u16),
     Udp(u16),
     QuicV1,
+    /// `/webtransport`: libp2p WebTransport over the preceding QUIC address.
+    WebTransport,
+    /// `/certhash/<multihash>`: a WebTransport server certificate hash.
+    Certhash(Certhash),
     P2p(PeerId),
     P2pCircuit,
 }
@@ -72,6 +80,8 @@ impl Protocol {
             Self::Tcp(_) => TCP_CODE,
             Self::Udp(_) => UDP_CODE,
             Self::QuicV1 => QUIC_V1_CODE,
+            Self::WebTransport => WEBTRANSPORT_CODE,
+            Self::Certhash(_) => CERTHASH_CODE,
             Self::P2p(_) => P2P_CODE,
             Self::P2pCircuit => P2P_CIRCUIT_CODE,
         }
@@ -93,7 +103,12 @@ impl Protocol {
                 out.extend_from_slice(body);
             }
             Self::Tcp(port) | Self::Udp(port) => out.extend_from_slice(&port.to_be_bytes()),
-            Self::QuicV1 | Self::P2pCircuit => {}
+            Self::QuicV1 | Self::WebTransport | Self::P2pCircuit => {}
+            Self::Certhash(hash) => {
+                let body = hash.to_multihash_bytes();
+                write_uvarint(body.len() as u64, out);
+                out.extend_from_slice(&body);
+            }
             Self::P2p(peer_id) => {
                 let body = peer_id.to_bytes();
                 write_uvarint(body.len() as u64, out);
@@ -127,6 +142,17 @@ impl Protocol {
             }
             QUIC_V1_CODE => Ok((Self::QuicV1, rest)),
             P2P_CIRCUIT_CODE => Ok((Self::P2pCircuit, rest)),
+            WEBTRANSPORT_CODE => Ok((Self::WebTransport, rest)),
+            CERTHASH_CODE => {
+                let (body, rest) = length_prefixed(rest, "certhash")?;
+                let hash = Certhash::from_multihash_bytes(body).map_err(|e| {
+                    MultiaddrError::InvalidBinaryValue {
+                        protocol: "certhash",
+                        reason: e.to_string(),
+                    }
+                })?;
+                Ok((Self::Certhash(hash), rest))
+            }
             DNS_CODE | DNS4_CODE | DNS6_CODE => {
                 let label = match code {
                     DNS_CODE => "dns",
