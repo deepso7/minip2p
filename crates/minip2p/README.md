@@ -102,7 +102,7 @@ The portable endpoint supports listening, Connection attempts, ping, Identify in
 
 `.mdns(io, config)` takes the carrier by value and stores it as a `Box<dyn MdnsIo>`, so it must be `'static`; keep a handle to whatever it runs on to reconfigure it later. The mDNS seed comes from the builder's entropy. The endpoint polls the transport again after each mDNS tick, since a carrier may share the transport's stack.
 
-Relay paths turn a relay bridge into a connection, which takes circuit operations from the transport. `build(transport)` works over any transport and rejects relay configuration with `PortableBuildError::NatConfig(PortableNatConfigError::RelayWithoutCircuits)`; wrap the transport in a `CircuitTransport` and call `build_with_circuits(transport)` to run relays. AutoNAT alone needs nothing from the transport. Portable relay configurations must set `force_relay`: portable endpoints do not run DCUtR.
+Relay paths turn a relay bridge into a connection, which takes circuit operations from the transport. `build(transport)` works over any transport and rejects relay configuration with `PortableBuildError::NatConfig(PortableNatConfigError::RelayWithoutCircuits)`; wrap the transport in a `CircuitTransport` and call `build_with_circuits(transport)` to run relays. AutoNAT alone needs nothing from the transport. Portable endpoints do not run DCUtR, so portable relay configurations set `NatConfig::dcutr = false` (direct candidates still race the relay leg, and the attempt settles on the circuit once none is left) or `force_relay` (relay only).
 
 ### smoltcp
 

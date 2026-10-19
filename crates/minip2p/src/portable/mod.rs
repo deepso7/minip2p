@@ -655,12 +655,14 @@ pub enum PortableNatConfigError {
     /// on.
     #[error("relay reservation policy requires at least one relay address")]
     ReservationWithoutRelay,
-    /// Relays without `force_relay`: portable endpoints do not run DCUtR,
-    /// so a relay is only ever a path, never an upgrade.
+    /// Relays with DCUtR on: portable endpoints do not run DCUtR, so a
+    /// relay is only ever a path, never an upgrade. Set `dcutr = false` to
+    /// keep racing direct candidates, or `force_relay = true` to use the
+    /// relay alone.
     #[error(
-        "portable relay requires force_relay = true; DCUtR is QUIC-only and portable endpoints do not run it"
+        "portable relay requires dcutr = false (or force_relay = true); DCUtR is QUIC-only and portable endpoints do not run it"
     )]
-    RelayWithoutForceRelay,
+    RelayWithDcutr,
     /// Relays without the `portable-relay` feature.
     #[error("relay addresses require the portable-relay feature")]
     RelayFeatureMissing,
@@ -797,9 +799,10 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
 
     /// Enables portable NAT policy with explicit relay and AutoNAT settings.
     ///
-    /// Relay configurations must set `force_relay`: portable endpoints do
-    /// not run DCUtR. AutoNAT servers may be configured with or without
-    /// relays.
+    /// Relay configurations must set `dcutr = false` (direct candidates
+    /// still race the relay leg) or `force_relay` (relay only): portable
+    /// endpoints do not run DCUtR. AutoNAT servers may be configured with or
+    /// without relays.
     #[cfg(feature = "portable-autonat")]
     pub fn nat_config(mut self, config: NatConfig) -> Self {
         self.nat_config = Some(config);
@@ -1071,8 +1074,8 @@ fn validate_nat(config: &NatConfig, has_circuits: bool) -> Result<(), PortableBu
         PortableNatConfigError::NoServers
     } else if config.relays.is_empty() && config.reservation_policy != ReservationPolicy::Never {
         PortableNatConfigError::ReservationWithoutRelay
-    } else if !config.relays.is_empty() && !config.force_relay {
-        PortableNatConfigError::RelayWithoutForceRelay
+    } else if !config.relays.is_empty() && config.dcutr && !config.force_relay {
+        PortableNatConfigError::RelayWithDcutr
     } else if !config.relays.is_empty() && cfg!(not(feature = "portable-relay")) {
         PortableNatConfigError::RelayFeatureMissing
     } else if !config.relays.is_empty() && !has_circuits {
@@ -1242,8 +1245,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
 
     /// Enables portable NAT policy with explicit relay and AutoNAT settings.
     ///
-    /// TCP relay configurations must set `force_relay`; UDP DCUtR remains
-    /// unavailable. AutoNAT servers may be configured with or without relays.
+    /// TCP relay configurations must set `dcutr = false` or `force_relay`;
+    /// UDP DCUtR remains unavailable. AutoNAT servers may be configured with
+    /// or without relays.
     #[cfg(feature = "portable-autonat")]
     pub fn nat_config(mut self, config: NatConfig) -> Self {
         self.portable = self.portable.nat_config(config);
