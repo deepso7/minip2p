@@ -441,9 +441,9 @@ test("a browser reserves on the relay and another browser echoes through its cir
 
 test("a native peer dials a browser through its circuit", async ({ page }) => {
   const relay = await startRelay();
-  // Relay only: the browser never starts DCUtR, so there is nothing to wait for.
+  // Default config: the browser offers no DCUtR, so the native connect
+  // settles Relayed once Identify arrives, not at DCUtR's start timeout.
   const native = NativeNode.create({
-    forceRelay: true,
     protocols: [ECHO],
     relays: [relay.quic],
     secretKey: generateSecretKey(),
@@ -451,8 +451,11 @@ test("a native peer dials a browser through its circuit", async ({ page }) => {
   try {
     await openPage(page);
     const holder = await reservingBrowser(page, relay.address);
+    const started = Date.now();
     const connected = await native.connect(holder, TIMEOUT);
     expect(connected.path.kind).toBe("relayed");
+    // Well inside DCUtR's 10 s start timeout.
+    expect(Date.now() - started).toBeLessThan(5000);
     const stream = await native.openStream(holder, ECHO, TIMEOUT);
     await stream.write("native to browser");
     stream.closeWrite();
