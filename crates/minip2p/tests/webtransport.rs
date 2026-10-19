@@ -96,7 +96,7 @@ fn one_socket_serves_both_shapes_and_webtransport_never_feeds_hole_punching() {
         .find(|addr| addr.transport().is_webtransport())
         .expect("a WebTransport address")
         .clone();
-    assert_eq!(webtransport.transport().certhashes().count(), 1);
+    assert_eq!(webtransport.transport().certhashes().count(), 2);
     assert_eq!(
         webtransport.transport().protocols().get(..3),
         quic.transport().protocols().get(..3),
@@ -174,4 +174,138 @@ fn one_socket_serves_both_shapes_and_webtransport_never_feeds_hole_punching() {
     let observed = Multiaddr::from_bytes(&observed.expect("observed")).expect("observed addr");
     assert_eq!(observed, info.remote_addr);
     assert!(!observed.is_quic_transport());
+}
+
+type PortableServer = minip2p::PortableEndpoint<minip2p_quic::QuicTransport, StdEntropy>;
+
+/// A portable server over `quic-v1` + WebTransport on one loopback socket,
+/// so the test sets its wall clock.
+fn portable_server(key: &Ed25519Keypair) -> PortableServer {
+    let addrs: Vec<Multiaddr> = [
+        "/ip4/127.0.0.1/udp/0/quic-v1",
+        "/ip4/127.0.0.1/udp/0/quic-v1/webtransport",
+    ]
+    .iter()
+    .map(|addr| addr.parse().expect("multiaddr"))
+    .collect();
+    let transport =
+        minip2p_quic::QuicTransport::bind(minip2p_quic::QuicNodeConfig::new(key.clone()), &addrs)
+            .expect("bind");
+    let mut server = Endpoint::portable(key, StdEntropy::new())
+        .build(transport)
+        .expect("portable server");
+    server.listen_all().expect("listen");
+    server
+}
+
+/// Polls `server` with its wall clock at `unix`.
+fn poll_at(server: &mut PortableServer, epoch: Instant, unix: u64) -> Vec<EndpointEvent> {
+    let now = Now::new(epoch.elapsed().as_millis() as u64, unix);
+    server.poll(now).expect("server poll")
+}
+
+fn webtransport_of(addrs: &[PeerAddr]) -> PeerAddr {
+    addrs
+        .iter()
+        .find(|addr| addr.transport().is_webtransport())
+        .expect("a WebTransport address")
+        .clone()
+}
+
+fn listen_changes(events: &[EndpointEvent]) -> Vec<Vec<PeerAddr>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EndpointEvent::ListenAddressesChanged { addrs } => Some(addrs.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Connects `native` to `server` and returns the listen addresses the
+/// server's Identify carried; the server's events go to `seen`.
+fn identify_listen_addrs(
+    native: &mut Endpoint,
+    server: &mut PortableServer,
+    target: &PeerAddr,
+    (epoch, unix): (Instant, u64),
+    seen: &mut Vec<EndpointEvent>,
+) -> Vec<Multiaddr> {
+    native.connect(vec![target.clone()]).expect("connect");
+    let deadline = Instant::now() + BACKSTOP;
+    loop {
+        assert!(Instant::now() < deadline, "never identified the server");
+        seen.extend(poll_at(server, epoch, unix));
+        if let Some(EndpointEvent::IdentifyReceived { peer_id, info, .. }) =
+            native.next_event(Duration::from_millis(5)).expect("native")
+            && &peer_id == target.peer_id()
+        {
+            return info
+                .listen_addrs
+                .iter()
+                .map(|bytes| Multiaddr::from_bytes(bytes).expect("listen addr"))
+                .collect();
+        }
+    }
+}
+
+#[test]
+fn rotation_reports_the_new_listen_set_once_and_identify_carries_it() {
+    let key = Ed25519Keypair::generate();
+    let mut server = portable_server(&key);
+    let epoch = Instant::now();
+    let unix_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    // The next real boundary, so libp2p certificates stay valid.
+    let boundary = minip2p_tls::webtransport::next_boundary(unix_now);
+    let mut seen = poll_at(&mut server, epoch, boundary - 5);
+    let before = server.listen_all().expect("listen addrs");
+    let quic = before
+        .iter()
+        .find(|addr| addr.transport().is_quic_transport())
+        .expect("quic-v1")
+        .clone();
+
+    // A native peer connected before the boundary.
+    let mut native = bind();
+    let advertised = identify_listen_addrs(
+        &mut native,
+        &mut server,
+        &quic,
+        (epoch, boundary - 5),
+        &mut seen,
+    );
+    assert!(advertised.contains(webtransport_of(&before).transport()));
+    assert!(listen_changes(&seen).is_empty(), "{seen:?}");
+
+    // One poll at the boundary reports the change, with `/p2p` kept.
+    let events = poll_at(&mut server, epoch, boundary);
+    let after = server.listen_all().expect("listen addrs");
+    assert_eq!(listen_changes(&events), std::slice::from_ref(&after));
+    assert_eq!(after.len(), before.len());
+    assert_ne!(webtransport_of(&after), webtransport_of(&before));
+    assert_eq!(webtransport_of(&after).peer_id(), &key.peer_id());
+    assert!(after.contains(&quic));
+
+    // After reconnecting, Identify carries the new set.
+    native.disconnect(&key.peer_id()).expect("disconnect");
+    let deadline = Instant::now() + BACKSTOP;
+    while native.is_peer_ready(&key.peer_id()) || server.is_peer_ready(native.peer_id()) {
+        assert!(Instant::now() < deadline, "never disconnected");
+        let _ = poll_at(&mut server, epoch, boundary);
+        let _ = native.next_event(Duration::from_millis(5)).expect("native");
+    }
+    let mut seen = Vec::new();
+    let advertised = identify_listen_addrs(
+        &mut native,
+        &mut server,
+        &quic,
+        (epoch, boundary),
+        &mut seen,
+    );
+    assert!(advertised.contains(webtransport_of(&after).transport()));
+    assert!(!advertised.contains(webtransport_of(&before).transport()));
+    assert!(listen_changes(&seen).is_empty(), "{seen:?}");
 }

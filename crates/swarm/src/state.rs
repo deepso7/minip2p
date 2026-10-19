@@ -300,7 +300,7 @@ fn event_peer_mut(event: &mut SwarmEvent) -> Option<&mut PeerId> {
         | SwarmEvent::StreamWriteStopped { peer_id, .. }
         | SwarmEvent::StreamClosed { peer_id, .. } => Some(peer_id),
         SwarmEvent::Error(error) => error.peer_id.as_mut(),
-        SwarmEvent::DialFailed { .. } => None,
+        SwarmEvent::DialFailed { .. } | SwarmEvent::ListenAddressesChanged { .. } => None,
     }
 }
 

@@ -485,6 +485,14 @@ pub enum P2pEvent {
         /// AutoNAT-confirmed public addresses.
         confirmed_addrs: Vec<String>,
     },
+    /// The listen set changed without a `listen` call, as when a
+    /// WebTransport listener's certificate rotates: `addrs` is the whole new
+    /// set, with `/p2p/<local>`, for the app to republish. External and
+    /// public address changes never fire it.
+    ListenAddressesChanged {
+        /// Every listen address.
+        addrs: Vec<String>,
+    },
     /// AutoNAT confirmed a changed public address set.
     PublicAddressesChanged {
         /// Current public addresses.
@@ -799,6 +807,9 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
             conn_id: error.conn_id.map(|id| id.as_u64()),
             stream_id: error.stream_id.map(|id| id.as_u64()),
             detail: error.detail,
+        },
+        EndpointEvent::ListenAddressesChanged { addrs } => P2pEvent::ListenAddressesChanged {
+            addrs: addrs.iter().map(ToString::to_string).collect(),
         },
         // Capability variants are dispatched by `convert_endpoint_event`;
         // raw dial failures and variants of capabilities this core does

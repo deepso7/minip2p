@@ -37,6 +37,7 @@ mod diagnostics;
 mod error;
 #[cfg(test)]
 mod recv_batch_tests;
+mod rotation;
 mod socket;
 #[cfg(test)]
 mod socket_tests;
@@ -62,9 +63,9 @@ pub use error::{QuicBindError, QuicTlsStage};
 
 use connection::{Cx, QuicConnection};
 use diagnostics::{ConnectionCounters, DatagramTally};
+use rotation::Rotation;
 use socket::{Received, Socket, Sockets};
 use tls::{HostTime, TlsIdentity};
-use webtransport::WebTransportContext;
 
 /// How long a Retry token stays valid.
 const RETRY_TOKEN_LIFETIME: Duration = Duration::from_secs(10);
@@ -366,9 +367,9 @@ pub struct QuicTransport {
     /// optional client certificates and [`webtransport_transport_config`].
     /// `None` when no socket does.
     webtransport_config: Option<WebTransportConfigs>,
-    /// What WebTransport connections authenticate with, when a socket
-    /// serves WebTransport.
-    webtransport: Option<Arc<WebTransportContext>>,
+    /// The rotating certificate and what WebTransport connections
+    /// authenticate with, when a socket serves WebTransport.
+    webtransport: Option<Rotation>,
     transport_config: Arc<TransportConfig>,
     tls: TlsIdentity,
     /// The host's wall-clock time, shared with the TLS verifiers.
@@ -584,46 +585,36 @@ impl QuicTransport {
             .transport_config(Arc::clone(&transport_config))
             .retry_token_lifetime(RETRY_TOKEN_LIFETIME)
             .validation_token_config(validation_tokens);
-        let (webtransport_config, webtransport) =
-            if sockets.iter().any(|socket| socket.webtransport) {
-                let certificate =
-                    tls.webtransport_certificate(node_config.keypair(), host_time.now().as_secs())?;
-                let certhash = {
-                    let current = certificate.read().map_err(|_poisoned| {
-                        QuicBindError::tls(QuicTlsStage::LoadCertificate, "poisoned")
-                    })?;
-                    let der = current.cert.first().ok_or_else(|| {
-                        QuicBindError::tls(QuicTlsStage::LoadCertificate, "no certificate")
-                    })?;
-                    minip2p_tls::webtransport::certhash(der)
-                };
-                let transport = Arc::new(webtransport_transport_config(node_config.limits())?);
-                // Clones of the endpoint's config, so the Retry tokens it issues
-                // stay valid.
-                let config = |libp2p: bool| -> Result<Arc<ServerConfig>, QuicBindError> {
-                    let server_tls = tls
-                        .webtransport_server_config(Arc::clone(&certificate), libp2p)
-                        .map_err(|error| QuicBindError::tls(QuicTlsStage::ServerConfig, error))?;
-                    let crypto = QuicServerConfig::try_from(server_tls).map_err(|error| {
-                        QuicBindError::tls(QuicTlsStage::QuicCipherSuites, error)
-                    })?;
-                    let mut config = server_config.clone();
-                    config.crypto = Arc::new(crypto);
-                    config.transport = Arc::clone(&transport);
-                    Ok(Arc::new(config))
-                };
-                let configs = WebTransportConfigs {
-                    dual: config(true)?,
-                    h3: config(false)?,
-                };
-                let context = WebTransportContext {
-                    keypair: node_config.keypair().clone(),
-                    certhashes: vec![certhash],
-                };
-                (Some(configs), Some(Arc::new(context)))
-            } else {
-                (None, None)
+        let (webtransport_config, webtransport) = if sockets
+            .iter()
+            .any(|socket| socket.webtransport)
+        {
+            // Until the first poll's sample, the system clock picks the
+            // period.
+            let rotation = Rotation::new(&tls, node_config.keypair(), host_time.now().as_secs())?;
+            let certificate = rotation.certificate();
+            let transport = Arc::new(webtransport_transport_config(node_config.limits())?);
+            // Clones of the endpoint's config, so the Retry tokens it issues
+            // stay valid.
+            let config = |libp2p: bool| -> Result<Arc<ServerConfig>, QuicBindError> {
+                let server_tls = tls
+                    .webtransport_server_config(Arc::clone(&certificate), libp2p)
+                    .map_err(|error| QuicBindError::tls(QuicTlsStage::ServerConfig, error))?;
+                let crypto = QuicServerConfig::try_from(server_tls)
+                    .map_err(|error| QuicBindError::tls(QuicTlsStage::QuicCipherSuites, error))?;
+                let mut config = server_config.clone();
+                config.crypto = Arc::new(crypto);
+                config.transport = Arc::clone(&transport);
+                Ok(Arc::new(config))
             };
+            let configs = WebTransportConfigs {
+                dual: config(true)?,
+                h3: config(false)?,
+            };
+            (Some(configs), Some(rotation))
+        } else {
+            (None, None)
+        };
 
         let endpoint_config = EndpointConfig::default();
         let max_payload =
@@ -721,7 +712,7 @@ impl QuicTransport {
             .webtransport
             .as_ref()
             .filter(|_| socket.webtransport)
-            .map(|context| webtransport_multiaddr(quic.clone(), &context.certhashes));
+            .map(|rotation| webtransport_multiaddr(quic.clone(), rotation.advertised()));
         socket
             .quic_v1
             .then_some(quic)
@@ -954,7 +945,11 @@ impl QuicTransport {
                     &configs.h3
                 })
             });
-        let webtransport = self.webtransport.clone().filter(|_| socket.webtransport);
+        let webtransport = self
+            .webtransport
+            .as_ref()
+            .filter(|_| socket.webtransport)
+            .map(|rotation| Arc::clone(rotation.context()));
         match self.endpoint.accept(incoming, now, buf, config) {
             Ok((handle, conn)) => {
                 // The accepted Initial never passes through `handle_event`.
@@ -988,6 +983,31 @@ impl QuicTransport {
     /// Services the connections with work: those this poll routed datagrams
     /// to, those whose timer is due, and those a previous service left
     /// unfinished. Idle connections are not visited.
+    /// Rotates the WebTransport certificate when the host's wall clock has
+    /// left its period, announcing each listening WebTransport address
+    /// with the new certhashes.
+    fn rotate(&mut self) {
+        let Some(rotation) = &mut self.webtransport else {
+            return;
+        };
+        let unix = self.host_time.now().as_secs();
+        if !rotation.advance(&self.tls, self.node_config.keypair(), unix) {
+            return;
+        }
+        let announced: Vec<Multiaddr> = self
+            .sockets
+            .iter()
+            .filter(|socket| socket.announced.1)
+            .flat_map(|socket| self.socket_addresses(socket))
+            .filter(Multiaddr::is_webtransport)
+            .collect();
+        self.pending_events.extend(
+            announced
+                .into_iter()
+                .map(|addr| TransportEvent::Listening { addr }),
+        );
+    }
+
     fn service_due(&mut self, now: Instant) {
         let mut due = std::mem::take(&mut self.due);
         due.clear();
@@ -1339,9 +1359,10 @@ impl Transport for QuicTransport {
             .collect()
     }
 
-    /// Sockets are bound once, at construction, so the set never changes.
+    /// Sockets are bound once, at construction; only a WebTransport
+    /// certificate rotation moves the set.
     fn local_addresses_revision(&self) -> Option<u64> {
-        Some(0)
+        Some(self.webtransport.as_ref().map_or(0, Rotation::revision))
     }
 
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
@@ -1378,6 +1399,7 @@ impl Transport for QuicTransport {
         self.clock = Some((now, instant));
         self.host_time.set(now.unix_seconds);
         self.dispatched = false;
+        self.rotate();
         // Events accumulate in `self.pending_events` for the whole poll and
         // are only taken at the very end, so an error path leaves the batch
         // queued for the next call instead of dropping it.
@@ -1429,9 +1451,14 @@ impl Transport for QuicTransport {
 
         // No sample yet means no timeline to answer on.
         let (now, instant) = self.clock?;
-        self.timers.first().map(|&(timeout, _)| {
+        let timer = self.timers.first().map(|&(timeout, _)| {
             deadline_for_timeout(now, timeout.saturating_duration_since(instant))
-        })
+        });
+        let rotation = self
+            .webtransport
+            .as_ref()
+            .map(|rotation| rotation.deadline(now));
+        Deadline::earliest_opt(timer, rotation)
     }
 }
 

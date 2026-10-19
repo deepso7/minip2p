@@ -163,6 +163,12 @@ pub enum EndpointEvent {
         addr: PeerAddr,
         reason: alloc::string::String,
     },
+    /// The listen set changed without a `listen` call, as when a
+    /// WebTransport listener's certificate rotates: `addrs` is the whole new
+    /// set, in the shape `listen_all` returns (with `/p2p/<local>`),
+    /// for the application to republish. External-address changes never
+    /// fire it.
+    ListenAddressesChanged { addrs: alloc::vec::Vec<PeerAddr> },
     /// The one terminal event of a Connection attempt.
     ///
     /// On success, [`Self::ConnectionEstablished`] for the peer is delivered
@@ -391,6 +397,7 @@ impl From<SwarmEvent> for EndpointEvent {
                 addr,
                 reason,
             },
+            SwarmEvent::ListenAddressesChanged { addrs } => Self::ListenAddressesChanged { addrs },
         }
     }
 }
