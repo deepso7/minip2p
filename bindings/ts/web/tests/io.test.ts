@@ -98,6 +98,7 @@ class FakeWebTransport implements WebTransportSession {
     | undefined;
   #ready: (() => void) | undefined;
   #closed: ((info: WebTransportCloseInfo) => void) | undefined;
+  #failed: ((error: Error) => void) | undefined;
 
   readonly url: string;
   readonly options: WebTransportOptions;
@@ -110,8 +111,9 @@ class FakeWebTransport implements WebTransportSession {
         resolve();
       };
     });
-    this.closed = new Promise((resolve) => {
+    this.closed = new Promise((resolve, reject) => {
       this.#closed = resolve;
+      this.#failed = reject;
     });
     this.incomingBidirectionalStreams = new ReadableStream({
       start: (controller) => {
@@ -138,6 +140,11 @@ class FakeWebTransport implements WebTransportSession {
   /** The session ends, as `closed` reports it. */
   end(info: WebTransportCloseInfo): void {
     this.#closed?.(info);
+  }
+
+  /** The session is lost to an error, as a rejected `closed` reports it. */
+  fail(error: Error): void {
+    this.#failed?.(error);
   }
 
   /** The server opens a stream. */
@@ -382,6 +389,16 @@ describe("JsIo", () => {
     expect(sessions[0]?.closeCalls).toEqual([{ closeCode: 0, reason: "bye" }]);
     expect(events()).toEqual([
       { code: 0, kind: "sessionClosed", reason: "", session },
+    ]);
+  });
+
+  test("a session lost to an error fails with the error, not an orderly close", async () => {
+    const { events, sessions, session } = await openedStream();
+    sessions[0]?.fail(new Error("network connection lost"));
+    await flush();
+
+    expect(events()).toEqual([
+      { kind: "sessionFailed", reason: "network connection lost", session },
     ]);
   });
 

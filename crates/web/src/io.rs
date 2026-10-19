@@ -61,6 +61,10 @@ enum JsEvent {
         code: u32,
         reason: String,
     },
+    SessionFailed {
+        session: u32,
+        reason: String,
+    },
     StreamOpened {
         stream: u32,
     },
@@ -105,6 +109,13 @@ impl From<JsEvent> for IoEvent {
             } => Self::SessionClosed {
                 session: session(id),
                 code,
+                reason,
+            },
+            JsEvent::SessionFailed {
+                session: id,
+                reason,
+            } => Self::SessionFailed {
+                session: session(id),
                 reason,
             },
             JsEvent::StreamOpened { stream: id } => Self::StreamOpened { stream: stream(id) },

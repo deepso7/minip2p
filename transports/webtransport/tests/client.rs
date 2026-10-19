@@ -452,6 +452,22 @@ fn the_connection_cap_covers_bytes_in_flight_in_the_platform() {
 }
 
 #[test]
+fn promoting_a_full_stream_to_control_wakes_it_into_the_reserve() {
+    let mut client = client(small_limits());
+    let conn = connect(&mut client);
+    let streams: Vec<_> = (0..4).map(|_| open(&mut client, &conn).0).collect();
+    // Application streams fill their 250-byte share, so the fourth is Full.
+    assert_eq!(send(&mut client, &conn, streams[0], 100), 0);
+    assert_eq!(send(&mut client, &conn, streams[1], 100), 0);
+    assert_eq!(send(&mut client, &conn, streams[2], 50), 0);
+    assert_eq!(send(&mut client, &conn, streams[3], 1), 1);
+
+    // As a control stream it may use the 50-byte reserve.
+    client.set_control_stream(conn.id, streams[3], true);
+    assert_eq!(writable(&poll(&mut client)), [streams[3]]);
+}
+
+#[test]
 fn interleaved_partial_completions_release_exactly_their_bytes() {
     let mut client = client(small_limits());
     client.io_mut().in_flight_cap = 30;
@@ -533,6 +549,39 @@ fn late_callbacks_after_reset_or_close_are_ignored() {
         reason: String::new(),
     });
     assert!(poll(&mut client).is_empty());
+}
+
+#[test]
+fn a_lost_session_closes_with_its_error_and_an_orderly_one_with_its_code() {
+    let mut client = client(small_limits());
+    let lost = connect(&mut client);
+    let closed = connect(&mut client);
+    client.io_mut().events.extend([
+        IoEvent::SessionFailed {
+            session: lost.session,
+            reason: "network connection lost".into(),
+        },
+        IoEvent::SessionClosed {
+            session: closed.session,
+            code: 7,
+            reason: "bye".into(),
+        },
+    ]);
+    assert_eq!(
+        poll(&mut client),
+        [
+            TransportEvent::Closed {
+                id: lost.id,
+                reason: ConnectionCloseReason::Error(
+                    "WebTransport session failed: network connection lost".into()
+                ),
+            },
+            TransportEvent::Closed {
+                id: closed.id,
+                reason: ConnectionCloseReason::Remote { code: 7 },
+            },
+        ]
+    );
 }
 
 #[test]

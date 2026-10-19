@@ -252,7 +252,7 @@ See the research doc for sources. The facts that drive the design:
          fn grant_read(&mut self, stream: StreamHandle, bytes: usize); // pull: read at most this much more
          fn close(&mut self, session: SessionHandle, code: u32, reason: &str);
          fn poll_event(&mut self) -> Option<IoEvent>;
-         // IoEvent: SessionReady, SessionClosed{reason}, StreamOpened, IncomingStream,
+         // IoEvent: SessionReady, SessionClosed{code, reason}, SessionFailed{reason}, StreamOpened, IncomingStream,
          //          Data{stream, bytes}, Fin, Reset{code}, StopSending{code},
          //          WriteCompleted{stream, bytes}
      }

@@ -1,10 +1,18 @@
 //! The browser host over an in-memory transport: config limits, the pump,
 //! commands and close, without wasm or a browser.
 
+use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
+
 use minip2p::{Ed25519Keypair, Now, PeerId};
-use minip2p_ffi_core::{CloseOutcome, ConfigCapability, EndpointConfig, FfiError, P2pEvent};
+use minip2p_core::Multihash;
+use minip2p_ffi_core::{
+    CloseOutcome, ConfigCapability, ConnectTarget, EndpointConfig, FfiError, P2pEvent,
+};
 use minip2p_test_support::InMemoryTransport;
-use minip2p_web::Host;
+use minip2p_web::{Host, WebEntropy};
+use minip2p_webtransport::{
+    IoError, IoEvent, SessionHandle, StreamHandle, WebTransportClient, WebTransportIo,
+};
 
 const LIMIT: usize = 256;
 
@@ -274,4 +282,77 @@ fn a_never_started_host_closes_without_an_event() {
     a.close(Now::from_millis(0));
     assert!(a.drain_events(LIMIT).is_empty());
     assert!(matches!(a.start(), Err(FfiError::Stopped)));
+}
+
+/// Sessions the platform holds open: connected and not yet closed.
+type OpenSessions = Rc<RefCell<BTreeSet<u64>>>;
+
+/// A platform whose sessions never come up, tracking which are still open.
+struct PendingIo(OpenSessions, u64);
+
+impl WebTransportIo for PendingIo {
+    fn connect(&mut self, _: &str, _: &[Multihash]) -> Result<SessionHandle, IoError> {
+        self.1 += 1;
+        self.0.borrow_mut().insert(self.1);
+        Ok(SessionHandle(self.1))
+    }
+    fn open_stream(&mut self, _: SessionHandle) -> Result<StreamHandle, IoError> {
+        Err(IoError("not ready".into()))
+    }
+    fn write(&mut self, _: StreamHandle, _: &[u8]) -> Result<usize, IoError> {
+        Err(IoError("not ready".into()))
+    }
+    fn close_write(&mut self, _: StreamHandle) {}
+    fn reset(&mut self, _: StreamHandle, _: u8) {}
+    fn stop(&mut self, _: StreamHandle, _: u8) {}
+    fn grant_read(&mut self, _: StreamHandle, _: usize) {}
+    fn close(&mut self, session: SessionHandle, _: u32, _: &str) {
+        self.0.borrow_mut().remove(&session.0);
+    }
+    fn poll_event(&mut self) -> Option<IoEvent> {
+        None
+    }
+}
+
+#[test]
+fn closing_or_freeing_a_host_closes_its_pending_webtransport_sessions() {
+    type End = fn(&mut Option<Host<WebTransportClient<PendingIo, WebEntropy>>>);
+    let close: End = |host| {
+        host.as_mut().expect("host").close(Now::from_millis(1));
+    };
+    let free: End = |host| *host = None;
+    let address = format!(
+        "/ip4/192.0.2.1/udp/4001/quic-v1/webtransport/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g/p2p/{}",
+        peer(2)
+    );
+    for (started, end) in [(true, close), (false, close), (true, free)] {
+        let open = OpenSessions::default();
+        let io = PendingIo(open.clone(), 0);
+        let mut host = Some(
+            Host::new(vec![1; 32], config(), |key| {
+                WebTransportClient::new(io, key.clone(), WebEntropy)
+            })
+            .expect("host"),
+        );
+        let running = host.as_mut().expect("host");
+        if started {
+            running.start().expect("start");
+        }
+        running
+            .connect(
+                ConnectTarget::Addresses {
+                    addresses: vec![address.clone()],
+                },
+                Now::from_millis(0),
+            )
+            .expect("connect");
+        running.pump(Now::from_millis(0));
+        assert_eq!(open.borrow().len(), 1, "the dial is pending");
+
+        end(&mut host);
+        assert!(
+            open.borrow().is_empty(),
+            "started {started}: the pending session outlived its host"
+        );
+    }
 }

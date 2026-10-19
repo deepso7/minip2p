@@ -42,6 +42,11 @@ export type IoEvent =
       readonly code: number;
       readonly reason: string;
     }
+  | {
+      readonly kind: "sessionFailed";
+      readonly session: number;
+      readonly reason: string;
+    }
   | { readonly kind: "streamOpened"; readonly stream: number }
   | {
       readonly kind: "incomingStream";
@@ -129,6 +134,7 @@ export class JsIo {
   readonly #streams = new Map<number, Stream>();
   #nextSession = 1;
   #nextStream = 1;
+  #disposed = false;
 
   /**
    * `wake` runs whenever an event is queued; `openSession` defaults to the
@@ -141,6 +147,9 @@ export class JsIo {
 
   /** Starts a session trusting exactly the certificates `certhashes` name. */
   connect(url: string, certhashes: Uint8Array<ArrayBuffer>[]): number {
+    if (this.#disposed) {
+      throw new Error("this endpoint's WebTransport I/O was disposed");
+    }
     if (this.#openSession === undefined) {
       throw new Error(
         "this browser has no WebTransport; minip2p needs a WebTransport-capable browser"
@@ -168,10 +177,20 @@ export class JsIo {
     );
     transport.closed.then(
       (info) => {
-        this.#endSession(id, info.closeCode ?? 0, info.reason ?? "");
+        this.#endSession({
+          code: info.closeCode ?? 0,
+          kind: "sessionClosed",
+          reason: info.reason ?? "",
+          session: id,
+        });
       },
+      // Never came up, or lost (the network going away): not an orderly close.
       (error: unknown) => {
-        this.#endSession(id, 0, errorMessage(error));
+        this.#endSession({
+          kind: "sessionFailed",
+          reason: errorMessage(error),
+          session: id,
+        });
       }
     );
     return id;
@@ -320,7 +339,25 @@ export class JsIo {
     return this.#events.shift();
   }
 
+  /**
+   * Closes every session and forgets everything, for an owner that can no
+   * longer drive Rust (a trapped wasm module): no later event or wake, and
+   * `connect` throws. Idempotent; called from TypeScript, not Rust.
+   */
+  dispose(): void {
+    this.#disposed = true;
+    this.#events.length = 0;
+    // `close` retires each session's streams, silencing their callbacks.
+    for (const id of this.#sessions.keys()) {
+      this.close(id, 0, "");
+    }
+    this.#sessions.clear();
+  }
+
   #push(event: IoEvent): void {
+    if (this.#disposed) {
+      return;
+    }
     this.#events.push(event);
     this.#wake();
   }
@@ -451,7 +488,10 @@ export class JsIo {
     }
   }
 
-  #endSession(id: number, code: number, reason: string): void {
+  #endSession(
+    end: Extract<IoEvent, { kind: "sessionClosed" | "sessionFailed" }>
+  ): void {
+    const id = end.session;
     const session = this.#sessions.get(id);
     if (session === undefined) {
       return;
@@ -463,7 +503,7 @@ export class JsIo {
       }
     }
     this.#sessions.delete(id);
-    this.#push({ code, kind: "sessionClosed", reason, session: id });
+    this.#push(end);
   }
 }
 
