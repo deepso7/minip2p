@@ -363,6 +363,25 @@ impl WtSession {
         }
     }
 
+    /// Ends the session's own streams but CONNECT as the session closes
+    /// (draft-14 §6), whichever side closed it: the Noise stream and every
+    /// unfinished head and held stream are reset and stopped with `code`,
+    /// and Noise replies still waiting for credit are dropped.
+    pub(crate) fn end_streams(&mut self, conn: &mut Connection, code: VarInt) {
+        self.closing = true;
+        let streams: Vec<u64> = self
+            .heads
+            .drain()
+            .map(|(raw, _)| raw)
+            .chain(self.held.drain(..).map(|held| held.id))
+            .chain(self.noise.take().map(|noise| noise.id))
+            .collect();
+        for raw in streams {
+            self.out.remove(&raw);
+            refuse(conn, raw, code.into_inner());
+        }
+    }
+
     /// Whether QUIC may close without discarding the session's end: the peer
     /// finished or reset its side of the CONNECT stream (or never opened
     /// one) and acknowledged our FIN on the

@@ -2011,3 +2011,66 @@ fn a_noise_stream_stopped_while_held_fails_the_handshake() {
     assert_eq!(code, code::H3_GENERAL_PROTOCOL_ERROR, "{reason}");
     assert!(!connected(&events), "{events:?}");
 }
+
+/// Whether the server reset its side of `stream`.
+fn was_reset(peer: &mut H3Peer, stream: u64) -> bool {
+    let mut recv = peer.raw.conn().recv_stream(crate::test_peer::sid(stream));
+    let Ok(mut chunks) = recv.read(true) else {
+        return false;
+    };
+    let reset = loop {
+        match chunks.next(usize::MAX) {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(quinn_proto::ReadError::Blocked) => break false,
+            Err(quinn_proto::ReadError::Reset(_)) => break true,
+        }
+    };
+    let _credit = chunks.finalize();
+    reset
+}
+
+#[test]
+fn a_session_closed_mid_authentication_resets_its_streams_and_sends_no_more_noise() {
+    let mut settings = DRAFT14.to_vec();
+    settings.retain(|&(id, _)| id != setting::WT_INITIAL_MAX_DATA);
+    settings.push((setting::WT_INITIAL_MAX_DATA, 1));
+    for local in [true, false] {
+        let mut server = server();
+        let mut events = Vec::new();
+        let mut peer = H3Peer::connect(&mut server, &mut events);
+        let control = peer.control(&settings);
+        peer.libp2p_connect();
+        let mut noise = initiator();
+        let stream = peer.wt_stream(&outbound(&mut noise).0);
+        let held = peer.wt_stream(b"early");
+        let mut reply = 0;
+        peer.drive(&mut server, &mut events, "a byte of Noise", |peer, _| {
+            reply += peer.raw.read(stream).0.len();
+            reply > 0
+        });
+        if local {
+            let id = events
+                .iter()
+                .find_map(|event| match event {
+                    TransportEvent::IncomingConnection { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .expect("incoming");
+            server.close(id).expect("close");
+        } else {
+            assert_eq!(peer.raw.write(control, GOAWAY), GOAWAY.len());
+        }
+        idle(&mut server, &mut peer, &mut events, 50);
+        peer.capsule(&Capsule::MaxData(4096));
+        let until = Instant::now() + Duration::from_millis(200);
+        peer.drive(&mut server, &mut events, "a while", |peer, _| {
+            reply += peer.raw.read(stream).0.len();
+            Instant::now() >= until
+        });
+        assert_eq!(reply, 1, "Noise bytes after the close (local: {local})");
+        // The held stream's reset, and the Noise stream's, which the reads
+        // above consumed.
+        assert!(was_reset(&mut peer, held), "held stream (local: {local})");
+        assert_eq!(resets_received(&mut peer), 2, "local: {local}");
+    }
+}

@@ -1374,6 +1374,10 @@ impl QuicConnection {
         for raw in bound {
             self.reset_on_wire(raw);
         }
+        let code = self.stream_code();
+        if let Some(wt) = self.wt.as_mut() {
+            wt.end_streams(&mut self.conn, code);
+        }
         let wait = (self.conn.rtt() * 3).clamp(WT_CLOSE_MIN, WT_CLOSE_MAX);
         self.wt_close_early = reason != ConnectionCloseReason::Local;
         self.close_reason.get_or_insert(reason);
