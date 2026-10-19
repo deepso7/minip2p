@@ -13,11 +13,11 @@ use minip2p_webtransport::h3::{
     Capsule, Frame, FrameDecoder, Settings, UniStreamType, code, encode_frame,
     encode_uni_stream_type, encode_webtransport_bidi_header, frame_type, setting,
 };
-use minip2p_webtransport::qpack::encode_field_section;
+use minip2p_webtransport::qpack::{QpackDecoder, encode_field_section};
 use quinn_proto::{ConnectionError, Dir, Event, StreamEvent};
 
 use super::*;
-use crate::test_peer::{AnyServer, RawPeer, foreign_client_config, now};
+use crate::test_peer::{RawPeer, foreign_client_config, now};
 
 /// What Chrome and Firefox offer.
 const DRAFT02: &[(u64, u64)] = &[(setting::ENABLE_WEBTRANSPORT, 1), (setting::H3_DATAGRAM, 1)];
@@ -46,6 +46,8 @@ struct H3Peer {
     raw: RawPeer,
     /// The CONNECT stream, once sent.
     connect: Option<u64>,
+    /// What the server sent on the CONNECT stream so far.
+    response: Vec<u8>,
 }
 
 impl H3Peer {
@@ -55,7 +57,11 @@ impl H3Peer {
             server.local_addr(),
             foreign_client_config(&[b"h3"], None, Arc::default()),
         );
-        let mut peer = Self { raw, connect: None };
+        let mut peer = Self {
+            raw,
+            connect: None,
+            response: Vec::new(),
+        };
         peer.drive(server, events, "the QUIC handshake", |peer, _| {
             peer.raw
                 .events
@@ -83,7 +89,24 @@ impl H3Peer {
             self.raw.pump();
             events.extend(server.poll(now()).expect("poll"));
             self.raw.pump();
+            if let Some(connect) = self.connect {
+                let (bytes, _) = self.raw.read(connect);
+                self.response.extend(bytes);
+            }
         }
+    }
+
+    /// The `:status` the server answered the CONNECT with, once it arrived.
+    fn status(&self) -> Option<String> {
+        let mut input = &self.response[..];
+        let Ok(Some(Frame::Headers(block))) = FrameDecoder::new().decode(&mut input) else {
+            return None;
+        };
+        let mut decoder = QpackDecoder::new();
+        let section = decoder.decode(&block).ok()?;
+        section
+            .get(b":status")
+            .map(|status| String::from_utf8_lossy(status).into_owned())
     }
 
     /// Opens a unidirectional stream carrying `bytes`.
@@ -509,19 +532,18 @@ fn a_reset_critical_stream_closes_the_connection() {
     }
 }
 
-/// The status a request with `fields` is refused with, read from the close
-/// reason (the response itself is lost to the immediate close).
+/// The status a request with `fields` is refused with, after checking the
+/// session then closed without an error.
 fn refused_with(settings: &[(u64, u64)], fields: &[(&[u8], &[u8])]) -> String {
-    let (code, reason) = close_after(|peer| {
-        peer.control(settings);
-        peer.request(fields);
-    });
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(settings);
+    peer.request(fields);
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
     assert_eq!(code, code::H3_NO_ERROR, "{reason}");
-    reason
-        .rsplit(' ')
-        .next()
-        .unwrap_or_default()
-        .to_owned()
+    assert!(!connected(&events), "{events:?}");
+    peer.status().expect("a response")
 }
 
 #[test]
@@ -884,12 +906,8 @@ fn pre_auth_caps_close_with_their_codes() {
 
 #[test]
 fn settings_without_a_supported_draft_answer_400_and_close() {
-    let (code, reason) = close_after(|peer| {
-        peer.control(&[(setting::H3_DATAGRAM, 1)]);
-        peer.libp2p_connect();
-    });
-    assert_eq!(code, code::H3_NO_ERROR);
-    assert!(reason.contains("400"), "{reason}");
+    let settings = [(setting::H3_DATAGRAM, 1)];
+    assert_eq!(refused_with(&settings, &libp2p_request(b"webtransport")), "400");
 }
 
 #[test]
