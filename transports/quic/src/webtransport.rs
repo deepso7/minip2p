@@ -762,7 +762,6 @@ impl WtSession {
             delivered: false,
         });
         self.reply(conn);
-        self.read_connect(conn);
     }
 
     /// Answers the CONNECT once both it and the client's SETTINGS are in.
@@ -819,17 +818,25 @@ impl WtSession {
             self.events.push(WtEvent::Refused {
                 reason: format!("refused the WebTransport request with {status}"),
             });
-            return;
+        } else {
+            self.send(conn, id, bytes, false);
+            self.promote_held(conn);
         }
-        self.send(conn, id, bytes, false);
-        self.promote_held(conn);
+        // What waited for the response, and the stream's end.
+        self.read_connect(conn);
     }
 
-    /// The CONNECT stream after its request: capsules in its DATA frames,
+    /// The CONNECT stream once it was answered: capsules in its DATA frames,
     /// which raise the client's credit or close the session, as does the
-    /// stream's end.
+    /// stream's end. Until the answer nothing is read, so no capsule acts on
+    /// a session not yet accepted (RFC 9297 §3.2); the stream's receive
+    /// window bounds what waits.
     fn read_connect(&mut self, conn: &mut Connection) {
-        let Some(connect) = self.connect.as_mut().filter(|c| !c.peer_ended) else {
+        let Some(connect) = self
+            .connect
+            .as_mut()
+            .filter(|c| c.replied && !c.peer_ended)
+        else {
             return;
         };
         let (bytes, end) = read_available(conn, connect.id);

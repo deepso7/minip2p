@@ -1342,6 +1342,35 @@ fn stopping_the_servers_control_stream_closes_the_connection() {
 }
 
 #[test]
+fn capsules_wait_for_the_session_to_be_accepted() {
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    // CONNECT and a CLOSE capsule, with no SETTINGS yet to accept it.
+    peer.libp2p_connect();
+    peer.capsule(&Capsule::CloseSession {
+        code: 42,
+        reason: String::new(),
+    });
+    let until = Instant::now() + Duration::from_millis(100);
+    peer.drive(&mut server, &mut events, "a while", |_, _| {
+        Instant::now() >= until
+    });
+    assert!(!server_closed(&events), "{events:?}");
+    assert_eq!(peer.status(), None);
+
+    // Accepted, then closed by the capsule that waited.
+    peer.control(DRAFT02);
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
+    assert_eq!(code, code::H3_NO_ERROR, "{reason}");
+    assert_eq!(peer.status().as_deref(), Some("200"));
+    assert_eq!(
+        close_reason(&events),
+        Some(&ConnectionCloseReason::Remote { code: 42 })
+    );
+}
+
+#[test]
 fn a_stream_reset_before_its_prefix_has_the_servers_side_reset_too() {
     let mut server = server();
     let mut events = Vec::new();
