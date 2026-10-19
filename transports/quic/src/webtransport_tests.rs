@@ -2074,3 +2074,71 @@ fn a_session_closed_mid_authentication_resets_its_streams_and_sends_no_more_nois
         assert_eq!(resets_received(&mut peer), 2, "local: {local}");
     }
 }
+
+#[test]
+fn data_after_a_close_capsule_resets_the_connect_stream_with_h3_message_error() {
+    // The trailing bytes in the same read as the capsule, and in a later one.
+    for later in [false, true] {
+        let (mut server, mut peer, _) = established(DRAFT02);
+        let mut events = Vec::new();
+        peer.capsule(&Capsule::CloseSession {
+            code: 42,
+            reason: String::new(),
+        });
+        if later {
+            idle(&mut server, &mut peer, &mut events, 50);
+        }
+        peer.capsule(&Capsule::MaxData(4096));
+        // Read the CONNECT stream here, so its reset code is seen. Once the
+        // server's FIN was acknowledged (later) there is no send half left
+        // to reset: STOP_SENDING carries the code alone.
+        let connect = peer.connect.take().expect("CONNECT");
+        let (mut reset, mut stopped) = (None, None);
+        peer.drive(&mut server, &mut events, "the CONNECT reset", |peer, _| {
+            let mut recv = peer.raw.conn().recv_stream(crate::test_peer::sid(connect));
+            if let Ok(mut chunks) = recv.read(true) {
+                while let Ok(Some(_)) = chunks.next(usize::MAX) {}
+                if let Err(quinn_proto::ReadError::Reset(code)) = chunks.next(usize::MAX) {
+                    reset = Some(code.into_inner());
+                }
+                let _credit = chunks.finalize();
+            }
+            let sid = crate::test_peer::sid(connect);
+            if let Ok(Some(code)) = peer.raw.conn().send_stream(sid).stopped() {
+                stopped = Some(code.into_inner());
+            }
+            (stopped.is_some() && (later || reset.is_some())) || peer.raw.is_closed()
+        });
+        assert_eq!(stopped, Some(code::H3_MESSAGE_ERROR), "later: {later}");
+        if !later {
+            assert_eq!(reset, Some(code::H3_MESSAGE_ERROR));
+        }
+        peer.drive(&mut server, &mut events, "the close", |_, events| {
+            server_closed(events)
+        });
+        assert_eq!(
+            close_reason(&events),
+            Some(&ConnectionCloseReason::Remote { code: 42 }),
+            "later: {later}"
+        );
+    }
+}
+
+#[test]
+fn a_fin_after_a_close_capsule_ends_the_session_cleanly() {
+    let (mut server, mut peer, _) = established(DRAFT02);
+    let mut events = Vec::new();
+    peer.capsule(&Capsule::CloseSession {
+        code: 42,
+        reason: String::new(),
+    });
+    idle(&mut server, &mut peer, &mut events, 20);
+    peer.raw.finish(peer.connect.expect("CONNECT"));
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
+    assert_eq!(code, code::H3_NO_ERROR, "{reason}");
+    assert_eq!(
+        close_reason(&events),
+        Some(&ConnectionCloseReason::Remote { code: 42 })
+    );
+    assert_eq!(resets_received(&mut peer), 0);
+}

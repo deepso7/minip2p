@@ -136,6 +136,8 @@ struct Connect {
     peer_ended: bool,
     /// The peer sent its trailer section: nothing may follow.
     trailers: bool,
+    /// The peer sent `CLOSE_WEBTRANSPORT_SESSION`: only its FIN may follow.
+    close_received: bool,
     /// The peer acknowledged our FIN, or stopped our side: nothing we
     /// sent on it is still in flight.
     delivered: bool,
@@ -875,6 +877,7 @@ impl WtSession {
             finished: false,
             peer_ended: false,
             trailers: false,
+            close_received: false,
             delivered: false,
         });
         if stopped.is_some() {
@@ -967,6 +970,10 @@ impl WtSession {
     /// stream's end. Until the answer nothing is read, so no capsule acts on
     /// a session not yet accepted (RFC 9297 §3.2); the stream's receive
     /// window bounds what waits.
+    ///
+    /// Anything but a FIN after the close capsule resets the stream with
+    /// `H3_MESSAGE_ERROR` (draft-14 §6); the session still ends with the
+    /// capsule's code.
     fn read_connect(&mut self, conn: &mut Connection) {
         let Some(connect) = self.connect.as_mut().filter(|c| c.replied && !c.peer_ended) else {
             return;
@@ -974,9 +981,13 @@ impl WtSession {
         let (bytes, end) = read_available(conn, connect.id);
         let mut input = &bytes[..];
         let mut closed_with = None;
+        let mut trailing = connect.close_received && !input.is_empty();
         let unexpected =
             |what: &str| Some((code::H3_FRAME_UNEXPECTED, format!("CONNECT stream: {what}")));
         let mut failure = 'frames: loop {
+            if trailing {
+                break None;
+            }
             match connect.frames.decode(&mut input) {
                 // Trailers end the message (RFC 9114 §4.1).
                 Ok(Some(Frame::Data(_) | Frame::Headers(_))) if connect.trailers => {
@@ -985,7 +996,12 @@ impl WtSession {
                 Ok(Some(Frame::Data(mut chunk))) => loop {
                     match connect.capsules.decode(&mut chunk) {
                         Ok(Some(Capsule::CloseSession { code, .. })) => {
+                            connect.close_received = true;
                             closed_with.get_or_insert(code);
+                            trailing = !chunk.is_empty() || !input.is_empty();
+                            if trailing {
+                                break 'frames None;
+                            }
                         }
                         Ok(Some(capsule)) => {
                             // The connection's only session: its flow-control
@@ -1029,6 +1045,18 @@ impl WtSession {
                 Err(error) => break Some((error.code(), format!("CONNECT stream: {error}"))),
             }
         };
+        if trailing {
+            // The reset is in flight, with no acknowledgement to wait
+            // for: the Closing phase's deadline lets it out.
+            connect.peer_ended = true;
+            connect.finished = true;
+            connect.delivered = false;
+            let id = connect.id;
+            self.out.remove(&id);
+            refuse(conn, id, code::H3_MESSAGE_ERROR);
+            self.peer_closed(closed_with.unwrap_or(0));
+            return;
+        }
         if !matches!(end, ReadEnd::Open) {
             connect.peer_ended = true;
             closed_with.get_or_insert(0);
