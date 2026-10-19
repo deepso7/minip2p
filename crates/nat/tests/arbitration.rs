@@ -196,6 +196,17 @@ fn dcutr_off_races_both_legs_and_never_upgrades() {
             if *connect_id == id
     ));
     assert_eq!(h.agent.next_deadline(at(301)), None, "no upgrade budgets");
+    // Identify on the circuit offers DCUtR; still no round starts.
+    h.agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: target.clone(),
+            conn_id: ConnectionId::new(TEST_CIRCUIT_ID),
+            protocols: vec![minip2p_nat::DCUTR_PROTOCOL_ID.into()],
+        },
+        true,
+        at(301),
+    );
+    let mut actions = drain_actions(&mut h.agent);
 
     // A DCUtR stream from the target is refused, not answered.
     let stream = StreamId::new(9_002);
@@ -210,10 +221,21 @@ fn dcutr_off_races_both_legs_and_never_upgrades() {
         false,
         at(302),
     );
-    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
+    let refusal = drain_actions(&mut h.agent);
+    assert!(has_reset_for(&refusal, stream));
+    actions.extend(refusal);
 
     h.agent.handle_tick(at(60_000));
-    assert_eq!(send_stream_count(&drain_actions(&mut h.agent)), 0);
+    let later = drain_actions(&mut h.agent);
+    assert_eq!(send_stream_count(&later), 0);
+    actions.extend(later);
+    assert!(
+        !actions.iter().any(|action| matches!(
+            action,
+            Out::OpenStream { protocol_id, .. } if protocol_id == minip2p_nat::DCUTR_PROTOCOL_ID
+        )),
+        "no DCUtR stream is opened: {actions:?}"
+    );
     assert!(drain_events(&mut h.agent).is_empty(), "no upgrade timeout");
 
     // The direct leg can still win the race.
