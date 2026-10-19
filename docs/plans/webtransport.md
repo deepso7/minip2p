@@ -124,7 +124,7 @@ See the research doc for sources. The facts that drive the design:
 
           Our SETTINGS advertise only drafts 02 and 13/14; the draft-15+ `0x2c7cf000` is never sent. Tests: `ENABLE_WEBTRANSPORT = 2` alone and alongside a valid draft-14 offer (both `H3_SETTINGS_ERROR`), zero values, `webtransport-h3` with each draft, and both drafts offered (14 is chosen).
 
-          **Draft-13/14 is a compatibility subset, not full compliance.** Those drafts already require RESET_STREAM_AT, so that a reset stream still delivers its session prefix. quinn-proto 0.11 has no RESET_STREAM_AT, so our resets are plain RESET_STREAM. A reset that races the prefix leaves the client unable to associate the stream, which it discards; nothing is misdelivered. This targets what Safari 26.4 accepts in practice (webtransport-go ships the same subset). It is verified by hand, recorded as a deviation in ADR 0022 and the research doc, and Safari stays best-effort (Decision 6). Full compliance waits for RESET_STREAM_AT support in quinn (see Follow-ups).
+          **Draft-13/14 is a compatibility subset, not full compliance.** Those drafts already require RESET_STREAM_AT, so that a reset stream still delivers its session prefix. quinn-proto 0.11 has no RESET_STREAM_AT, so our resets are plain RESET_STREAM. A reset that races the prefix leaves the client unable to associate the stream, which it discards; nothing is misdelivered. This targets what Safari 26.4 accepts in practice (webtransport-go ships the same subset). It is verified by hand, recorded as a deviation in ADR 0023 and the research doc, and Safari stays best-effort (Decision 6). Full compliance waits for RESET_STREAM_AT support in quinn (see Follow-ups).
 
         - Reply `:status 200` (`01 03 00 00 D9`). Reply 404 for a wrong path and 400 for a wrong query or malformed request, then close the session (see Close).
         - The session id is the CONNECT stream id.
@@ -336,12 +336,12 @@ See the research doc for sources. The facts that drive the design:
     - **No Effect.** The rest of `bindings/ts` doesn't use Effect, and the SDK should stay consistent; that is reconsidered across all packages, not here.
 
 15. **ADR and terms.**
-    - New **ADR 0022 "libp2p WebTransport: server inside the QUIC transport, browser I/O behind a TypeScript seam"**. It records Decisions 1, 3, 9 and 12 and the rejected alternatives:
+    - New **ADR 0023 "libp2p WebTransport: server inside the QUIC transport, browser I/O behind a TypeScript seam"**. It records Decisions 1, 3, 9 and 12 and the rejected alternatives:
       - a separate WebTransport transport with its own socket;
       - a Rust `web-sys` and `wasm-bindgen-futures` client;
       - the async `h3` / `wtransport` crates;
       - WebSocket first.
-    - `GLOSSARY.md` gains **Certhash**, **WebTransport session** and **Certificate period**. **Connection token** gains "WebTransport: the Noise handshake hash".
+    - `GLOSSARY.md` has **Certhash**, **WebTransport session** and **Certificate period**, and **Connection token** covers WebTransport (added before ticketing).
 
 ## PR stack
 
@@ -411,7 +411,7 @@ The biggest PR, organised as reviewable commits.
 - **3f. relay-server example:** `--webtransport` listens WebTransport on the QUIC port and prints the certhash address. The `--announce` handling learns the shape.
 - **3g. Address propagation** (Decision 5): the refresh moves after `transport.poll`, and `SwarmEvent::ListenAddressesChanged` goes through `EndpointEvent`, `P2pEvent` and the TS event map. ffi-core's `listen_addrs` reads a live snapshot of bound addresses.
 - **Release wiring for the new crate:** add `minip2p-webtransport` to `publish.yml`'s explicit crate publication order, before `minip2p-quic`, along with its registry verification and `scripts/release.sh`'s version bump and checks, so the first release after PR 3 can publish `minip2p-quic`.
-- **Docs:** `transports/quic` README (ALPN dispatch, WebTransport phase, rotation, limits), `transports/webtransport` README, ADR 0022, and the glossary.
+- **Docs:** `transports/quic` README (ALPN dispatch, WebTransport phase, rotation, limits), `transports/webtransport` README, and ADR 0023.
 - **Exit criteria:**
   - `just test`, `just clippy`, `just fmt` and `just check-nostd` (the new crate is in the no_std list) are green;
   - `just fuzz 30` runs clean with the new entries;

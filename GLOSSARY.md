@@ -32,7 +32,7 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Connection replacement**: A newer connection to a peer taking the single per-peer connection slot from an older one. The peer never counts as disconnected. Everything that belonged to the old connection ends with it, including its streams, its readiness, and any writes it had accepted but not yet sent: acceptance is local, never delivery. The newest connection wins, except in a connection race: when two direct connections to one peer register within the simultaneous-dial window (`SIMULTANEOUS_DIAL_WINDOW_MS`, 5 s by default) of each other, both peers keep the same one whatever order each sees them in. In opposite directions (a simultaneous dial) that is the one dialed by the lower peer ID; in the same direction (two of one peer's candidate dials) it is the one with the lower Connection token, falling back to the newest when either has none. A winner arriving second replaces the other as usual (`ConnectionReplaced`); a loser arriving second is closed unannounced, and if that dial was our own it completes as a dial failure. Both peers agree only once each has seen both connections, so a Connection attempt keeps its other direct dials open for the window instead of aborting them. The side that sees both first closes the loser at once, so when the loser was the other side's only connection so far, that side sees it close before the winner establishes there: a disconnect, not a Connection replacement. _Avoid_: supersede, reconnect
 
-**Connection token**: A value both ends of one connection compute identically from its handshake (QUIC: a TLS exporter value; TCP: the Noise handshake hash), carried on the transport's `Connected` endpoint. It lets both peers make the same choice in a same-direction connection race without exchanging anything. It is not a secret and identifies nothing outside that comparison.
+**Connection token**: A value both ends of one connection compute identically from its handshake (QUIC: a TLS exporter value; TCP and WebTransport: the Noise handshake hash), carried on the transport's `Connected` endpoint. It lets both peers make the same choice in a same-direction connection race without exchanging anything. It is not a secret and identifies nothing outside that comparison.
 
 **Connection close reason**: Why one connection ended, carried on its close event: we closed it, the peer closed it (with its code), the peer went silent (timed out), the peer stopped reading (stalled), or an error. A Connection replacement is not a close. _Avoid_: close reason (unqualified), disconnect reason
 
@@ -71,6 +71,14 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 **Path**: How a peer's current connection was established: Direct (dialed or accepted), Punched (by DCUtR), or Relayed through a named relay. Every established connection has one. _Avoid_: route, origin
 
 **force_relay**: Keep the selected path Relayed: no direct candidate dials and no hole punch. The circuit upgrade is the same as without the flag.
+
+### WebTransport
+
+**WebTransport session**: One browser's libp2p connection carried over HTTP/3 WebTransport on a QUIC connection, authenticated by Noise rather than by TLS. A QUIC connection carries at most one. _Avoid_: WT connection, h3 connection
+
+**Certhash**: The hash of a WebTransport listener's self-signed TLS certificate, carried in its address, that lets a browser trust that certificate without a CA. A listener advertises the current and next Certificate period's hashes. _Avoid_: fingerprint, cert hash
+
+**Certificate period**: The fixed span of time (13 days) during which a WebTransport listener presents one certificate. Each period's certificate is derived from the node's identity key, so it is the same across restarts, and a rotation happens at each period boundary. _Avoid_: rotation interval, epoch
 
 ### Wire codecs
 
