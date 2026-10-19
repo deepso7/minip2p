@@ -1,11 +1,12 @@
 //! The WebTransport server phase of an `h3` connection (libp2p WebTransport
-//! over draft-02 HTTP/3).
+//! over HTTP/3, draft-02 or draft-13/14).
 //!
 //! [`WtSession`] runs beside the connection's stream logic from QUIC
 //! `Connected` on. It opens our control stream with SETTINGS, reads the
 //! client's control and QPACK streams, answers the CONNECT to
-//! [`LIBP2P_WEBTRANSPORT_PATH`] with 200 once the client's SETTINGS offer
-//! WebTransport, and runs Noise XX as responder on the first stream with the
+//! [`LIBP2P_WEBTRANSPORT_PATH`] with 200 once the client's SETTINGS offer a
+//! draft we speak (draft-13/14 preferred, with its session flow control),
+//! and runs Noise XX as responder on the first stream with the
 //! session's `0x41` prefix. Its output is a list of [`WtEvent`]s for the
 //! connection to act on: authenticate, admit a stream, or fail.
 //!
@@ -13,7 +14,13 @@
 //! read here, a byte at a time so nothing behind it is consumed, and the
 //! stream is admitted after it. Prefixed streams that arrive before the
 //! session is authenticated (the Noise stream racing the 200, or streams
-//! racing Noise) are held with their data still in the engine.
+//! racing Noise) are held, their data read into a buffer the pre-auth byte
+//! cap bounds, and handed over with them.
+//!
+//! Before authentication every allocation is capped: the codec's frame,
+//! capsule and QPACK caps, at most [`MAX_EARLY_STREAMS`] held streams, and
+//! [`MAX_EARLY_BYTES`] across request heads and held streams. Past a cap the
+//! connection closes with `H3_EXCESSIVE_LOAD`.
 //!
 //! The session also ends orderly, in either direction: [`WtSession::close`]
 //! sends `CLOSE_WEBTRANSPORT_SESSION` and finishes the CONNECT stream, and a
@@ -43,6 +50,11 @@ use quinn_proto::{Connection, Dir, ReadError, StreamId, VarInt};
 /// fails the connection.
 const MAX_EARLY_STREAMS: usize = 4;
 
+/// Bytes read before the session is authenticated, from request heads (up
+/// to their HEADERS or prefix) and held streams; one more fails the
+/// connection.
+const MAX_EARLY_BYTES: usize = 16 * 1024;
+
 /// What every WebTransport connection of one transport shares.
 #[derive(Debug)]
 pub(crate) struct WebTransportContext {
@@ -58,8 +70,14 @@ pub(crate) struct WebTransportContext {
 pub(crate) enum WtEvent {
     /// Noise authenticated the client: the connection is up.
     Established { peer: PeerId, token: [u8; 32] },
-    /// A prefixed peer stream is ready to surface, its prefix consumed.
-    Admit(u64),
+    /// A prefixed peer stream is ready to surface, its prefix consumed:
+    /// `early` is what was read while it was held, and `end` whether the
+    /// peer finished or reset it meanwhile.
+    Admit {
+        raw: u64,
+        early: Vec<u8>,
+        end: ReadEnd,
+    },
     /// The peer ended the session (close capsule, CONNECT FIN or reset, or
     /// GOAWAY) with this WebTransport code: finish our side and close.
     PeerClosed { code: u32 },
@@ -121,6 +139,16 @@ impl Credit {
     }
 }
 
+/// A prefixed stream waiting for the session or for Noise.
+struct Held {
+    id: u64,
+    /// The session its prefix names.
+    session_id: u64,
+    /// What it carried meanwhile.
+    data: Vec<u8>,
+    end: ReadEnd,
+}
+
 /// The Noise stream and its responder session.
 struct NoiseStream {
     id: u64,
@@ -143,9 +171,11 @@ pub(crate) struct WtSession {
     connect: Option<Connect>,
     /// Peer bidi streams whose first frame or prefix is being read.
     heads: HashMap<u64, FrameDecoder>,
-    /// Prefixed streams waiting for the session or for Noise, with the
-    /// session id each names, in arrival order.
-    held: VecDeque<(u64, u64)>,
+    /// Prefixed streams waiting for the session or for Noise, in arrival
+    /// order.
+    held: VecDeque<Held>,
+    /// Bytes read before authentication, against [`MAX_EARLY_BYTES`].
+    early_bytes: usize,
     noise: Option<NoiseStream>,
     established: bool,
     /// Session flow control, when the chosen draft and the client enable it.
@@ -159,7 +189,8 @@ pub(crate) struct WtSession {
 }
 
 /// How a read of a stream ended.
-enum ReadEnd {
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ReadEnd {
     /// More may come.
     Open,
     Finished,
@@ -179,6 +210,7 @@ impl WtSession {
             connect: None,
             heads: HashMap::new(),
             held: VecDeque::new(),
+            early_bytes: 0,
             noise: None,
             established: false,
             credit: None,
@@ -231,7 +263,7 @@ impl WtSession {
             || self.heads.contains_key(&raw)
             || self.connect.as_ref().is_some_and(|c| c.id == raw)
             || self.noise.as_ref().is_some_and(|n| n.id == raw)
-            || self.held.iter().any(|&(id, _)| id == raw)
+            || self.held.iter().any(|held| held.id == raw)
     }
 
     /// Ends an accepted session from our side: a `CLOSE_WEBTRANSPORT_SESSION`
@@ -349,6 +381,8 @@ impl WtSession {
                 self.read_head(conn, raw);
             } else if self.noise.as_ref().is_some_and(|n| n.id == raw) {
                 self.read_noise(conn);
+            } else {
+                self.read_held(raw, conn);
             }
         }
         self.flush(conn);
@@ -387,6 +421,20 @@ impl WtSession {
         entry.0.extend_from_slice(&bytes);
         entry.1 |= fin;
         self.flush(conn);
+    }
+
+    /// Counts bytes read before authentication against the cap.
+    fn count_early(&mut self, bytes: usize) {
+        if self.established {
+            return;
+        }
+        self.early_bytes += bytes;
+        if self.early_bytes > MAX_EARLY_BYTES {
+            self.fail(
+                code::H3_EXCESSIVE_LOAD,
+                "too many bytes before the session was authenticated".into(),
+            );
+        }
     }
 
     fn fail(&mut self, code: u64, reason: String) {
@@ -537,9 +585,11 @@ impl WtSession {
             self.heads.remove(&raw);
             return;
         };
+        let mut consumed = 0;
         let head = loop {
             match chunks.next(1) {
                 Ok(Some(chunk)) => {
+                    consumed += chunk.bytes.len();
                     let mut input = &chunk.bytes[..];
                     match frames.decode(&mut input) {
                         Ok(None) => {}
@@ -562,15 +612,18 @@ impl WtSession {
                     let _credit = chunks.finalize();
                     // Ended before saying what it is: nothing to keep.
                     self.heads.remove(&raw);
+                    self.count_early(consumed);
                     return;
                 }
                 Err(ReadError::Blocked) => {
                     let _credit = chunks.finalize();
+                    self.count_early(consumed);
                     return;
                 }
             }
         };
         let _credit = chunks.finalize();
+        self.count_early(consumed);
         let Some(frames) = self.heads.remove(&raw) else {
             return;
         };
@@ -721,13 +774,22 @@ impl WtSession {
     fn on_prefixed(&mut self, conn: &mut Connection, raw: u64, session_id: u64) {
         if self.established {
             if Some(session_id) == self.session_id() {
-                self.events.push(WtEvent::Admit(raw));
+                self.events.push(WtEvent::Admit {
+                    raw,
+                    early: Vec::new(),
+                    end: ReadEnd::Open,
+                });
             } else {
                 refuse(conn, raw, code::H3_ID_ERROR);
             }
             return;
         }
-        self.held.push_back((raw, session_id));
+        self.held.push_back(Held {
+            id: raw,
+            session_id,
+            data: Vec::new(),
+            end: ReadEnd::Open,
+        });
         if self.held.len() > MAX_EARLY_STREAMS {
             self.fail(
                 code::H3_EXCESSIVE_LOAD,
@@ -735,7 +797,24 @@ impl WtSession {
             );
             return;
         }
+        // What already sits behind the prefix.
+        self.read_held(raw, conn);
         self.promote_held(conn);
+    }
+
+    /// Reads a held stream's new bytes into its buffer.
+    fn read_held(&mut self, raw: u64, conn: &mut Connection) {
+        let Some(held) = self
+            .held
+            .iter_mut()
+            .find(|held| held.id == raw && matches!(held.end, ReadEnd::Open))
+        else {
+            return;
+        };
+        let (bytes, end) = read_available(conn, raw);
+        held.data.extend_from_slice(&bytes);
+        held.end = end;
+        self.count_early(bytes.len());
     }
 
     /// Once the session is accepted, the first held stream runs Noise; once
@@ -749,23 +828,31 @@ impl WtSession {
         else {
             return;
         };
-        while let Some(&(raw, session_id)) = self.held.front() {
-            if session_id != session {
+        while let Some(front) = self.held.front() {
+            if front.session_id != session {
+                let id = front.id;
                 self.held.pop_front();
-                refuse(conn, raw, code::H3_ID_ERROR);
+                refuse(conn, id, code::H3_ID_ERROR);
             } else if self.noise.is_none() {
-                self.held.pop_front();
-                self.start_noise(conn, raw);
+                if let Some(held) = self.held.pop_front() {
+                    self.start_noise(conn, held);
+                }
             } else if self.established {
-                self.held.pop_front();
-                self.events.push(WtEvent::Admit(raw));
+                if let Some(held) = self.held.pop_front() {
+                    self.events.push(WtEvent::Admit {
+                        raw: held.id,
+                        early: held.data,
+                        end: held.end,
+                    });
+                }
             } else {
                 return;
             }
         }
     }
 
-    fn start_noise(&mut self, conn: &mut Connection, raw: u64) {
+    /// Runs Noise as responder on `held`, starting with what it carried.
+    fn start_noise(&mut self, conn: &mut Connection, held: Held) {
         let mut entropy = StdEntropy::new();
         let mut secrets = [[0u8; 32]; 2];
         for secret in &mut secrets {
@@ -797,20 +884,29 @@ impl WtSession {
             return;
         }
         self.noise = Some(NoiseStream {
-            id: raw,
+            id: held.id,
             session: Some(session),
         });
-        self.read_noise(conn);
+        self.feed_noise(conn, held.data, held.end);
     }
 
-    /// Feeds the Noise stream to the responder and writes its replies; on
-    /// completion the connection is authenticated and the stream finished.
+    /// Reads the Noise stream into the responder.
     fn read_noise(&mut self, conn: &mut Connection) {
+        let Some(noise) = self.noise.as_ref() else {
+            return;
+        };
+        let (bytes, end) = read_available(conn, noise.id);
+        self.feed_noise(conn, bytes, end);
+    }
+
+    /// Feeds the responder what the Noise stream carried and writes its
+    /// replies; on completion the connection is authenticated and the stream
+    /// finished.
+    fn feed_noise(&mut self, conn: &mut Connection, bytes: Vec<u8>, end: ReadEnd) {
         let Some(noise) = self.noise.as_mut() else {
             return;
         };
         let raw = noise.id;
-        let (bytes, end) = read_available(conn, raw);
         let Some(session) = noise.session.as_mut() else {
             // Done: whatever follows is ignored.
             return;
@@ -862,7 +958,13 @@ impl WtSession {
 /// `webtransport-h3` is not served), `:scheme https`, `:authority` and
 /// `:path`, no other pseudo-header, and none after a regular field.
 fn request_status(section: &FieldSection<'_>) -> &'static str {
-    const PSEUDO: [&[u8]; 5] = [b":method", b":protocol", b":scheme", b":authority", b":path"];
+    const PSEUDO: [&[u8]; 5] = [
+        b":method",
+        b":protocol",
+        b":scheme",
+        b":authority",
+        b":path",
+    ];
     let mut values: [Option<&[u8]>; 5] = [None; 5];
     let mut regular = false;
     for field in section.iter() {
@@ -879,7 +981,14 @@ fn request_status(section: &FieldSection<'_>) -> &'static str {
             _ => return "400",
         }
     }
-    let [Some(method), Some(protocol), Some(scheme), Some(_), Some(path)] = values else {
+    let [
+        Some(method),
+        Some(protocol),
+        Some(scheme),
+        Some(_),
+        Some(path),
+    ] = values
+    else {
         return "400";
     };
     if method != b"CONNECT" || protocol != b"webtransport" || scheme != b"https" {

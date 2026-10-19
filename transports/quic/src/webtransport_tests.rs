@@ -188,6 +188,17 @@ impl H3Peer {
     /// Runs Noise as initiator on a fresh WebTransport stream until the
     /// server reports `Connected`.
     fn authenticate(&mut self, server: &mut QuicTransport, events: &mut Vec<TransportEvent>) {
+        self.authenticate_with(server, events, |_| {});
+    }
+
+    /// [`Self::authenticate`], with `early` run once the Noise stream is
+    /// open, before the handshake can complete.
+    fn authenticate_with(
+        &mut self,
+        server: &mut QuicTransport,
+        events: &mut Vec<TransportEvent>,
+        early: impl FnOnce(&mut Self),
+    ) {
         let mut entropy = StdEntropy::new();
         let mut secrets = [[0u8; 32]; 2];
         for secret in &mut secrets {
@@ -205,6 +216,7 @@ impl H3Peer {
         noise.start().expect("noise start");
         let first = outbound(&mut noise).0;
         let stream = self.wt_stream(&first);
+        early(self);
         let mut done = false;
         self.drive(server, events, "Noise", |peer, events| {
             if !done {
@@ -259,8 +271,11 @@ fn outbound(noise: &mut NoiseSession) -> (Vec<u8>, bool) {
     (bytes, complete)
 }
 
+/// A request's fields, in order.
+type Fields = Vec<(&'static [u8], &'static [u8])>;
+
 /// The libp2p CONNECT request with `protocol` as `:protocol`.
-fn libp2p_request(protocol: &'static [u8]) -> Vec<(&'static [u8], &'static [u8])> {
+fn libp2p_request(protocol: &'static [u8]) -> Fields {
     vec![
         (b":method", b"CONNECT"),
         (b":protocol", protocol),
@@ -306,7 +321,10 @@ fn a_client_that_never_sends_connect_times_out_without_connecting() {
     let (code, _) = peer.closed_with(&mut server, &mut events);
     assert_eq!(code, code::H3_EXCESSIVE_LOAD);
     assert!(!connected(&events), "{events:?}");
-    assert_eq!(close_reason(&events), Some(&ConnectionCloseReason::TimedOut));
+    assert_eq!(
+        close_reason(&events),
+        Some(&ConnectionCloseReason::TimedOut)
+    );
 }
 
 #[test]
@@ -321,7 +339,10 @@ fn a_client_that_never_finishes_noise_times_out_without_connecting() {
     let (code, _) = peer.closed_with(&mut server, &mut events);
     assert_eq!(code, code::H3_EXCESSIVE_LOAD);
     assert!(!connected(&events), "{events:?}");
-    assert_eq!(close_reason(&events), Some(&ConnectionCloseReason::TimedOut));
+    assert_eq!(
+        close_reason(&events),
+        Some(&ConnectionCloseReason::TimedOut)
+    );
 }
 
 #[test]
@@ -566,7 +587,7 @@ fn connect_requests_are_checked_field_by_field() {
         fields.push(field);
         fields
     };
-    let rows: Vec<(&str, Vec<(&[u8], &[u8])>, &str)> = vec![
+    let rows: Vec<(&str, Fields, &str)> = vec![
         ("another path", with(b":path", b"/index.html"), "404"),
         (
             "another query",
@@ -584,7 +605,11 @@ fn connect_requests_are_checked_field_by_field() {
         ("no :authority", without(b":authority"), "400"),
         ("no :protocol", without(b":protocol"), "400"),
         ("a second :path", plus((b":path", path)), "400"),
-        ("an unknown pseudo-header", plus((b":status", b"200")), "400"),
+        (
+            "an unknown pseudo-header",
+            plus((b":status", b"200")),
+            "400",
+        ),
         (
             "a pseudo-header after a regular field",
             {
@@ -735,7 +760,10 @@ fn draft14_server_streams_wait_for_the_clients_stream_credit() {
         (setting::ENABLE_WEBTRANSPORT, 1),
     ]);
     let (mut server, mut peer, id) = established(&settings);
-    let streams = [server_stream(&mut server, id, b"a"), server_stream(&mut server, id, b"b")];
+    let streams = [
+        server_stream(&mut server, id, b"a"),
+        server_stream(&mut server, id, b"b"),
+    ];
     let mut read = [None, None];
     assert_eq!(
         settle(&mut server, &mut peer, &streams, &mut read),
@@ -778,11 +806,48 @@ fn draft02_has_no_session_flow_control() {
         (setting::WT_INITIAL_MAX_DATA, 1),
     ]);
     let (mut server, mut peer, id) = established(&settings);
-    let streams = [server_stream(&mut server, id, b"a"), server_stream(&mut server, id, b"b")];
+    let streams = [
+        server_stream(&mut server, id, b"a"),
+        server_stream(&mut server, id, b"b"),
+    ];
     assert_eq!(
         settle(&mut server, &mut peer, &streams, &mut [None, None]),
         [Some(b"a".to_vec()), Some(b"b".to_vec())]
     );
+}
+
+#[test]
+fn a_retry_before_the_h3_handshake_still_connects() {
+    let mut server = server_with(QuicLimits {
+        require_address_validation: true,
+        ..QuicLimits::default()
+    });
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(DRAFT02);
+    peer.libp2p_connect();
+    peer.authenticate(&mut server, &mut events);
+}
+
+#[test]
+fn a_stream_that_finished_before_noise_completed_is_delivered_whole() {
+    let mut server = server();
+    let mut events = Vec::new();
+    let mut peer = H3Peer::connect(&mut server, &mut events);
+    peer.control(DRAFT02);
+    peer.libp2p_connect();
+    let mut early = 0;
+    peer.authenticate_with(&mut server, &mut events, |peer| {
+        early = peer.wt_stream(b"early");
+        peer.raw.finish(early);
+    });
+    peer.drive(&mut server, &mut events, "the early stream", |_, events| {
+        events.iter().any(|event| {
+            matches!(event, TransportEvent::StreamRemoteWriteClosed { stream_id, .. }
+                if stream_id.as_u64() == early)
+        })
+    });
+    assert_eq!(crate::test_peer::stream_bytes(&events, early), b"early");
 }
 
 /// A frame header: its type and declared length.
@@ -907,7 +972,10 @@ fn pre_auth_caps_close_with_their_codes() {
 #[test]
 fn settings_without_a_supported_draft_answer_400_and_close() {
     let settings = [(setting::H3_DATAGRAM, 1)];
-    assert_eq!(refused_with(&settings, &libp2p_request(b"webtransport")), "400");
+    assert_eq!(
+        refused_with(&settings, &libp2p_request(b"webtransport")),
+        "400"
+    );
 }
 
 #[test]

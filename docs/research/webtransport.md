@@ -38,7 +38,7 @@ Confidence tags: **[verified]** means I read it in the source. **[inferred]** me
    - The prologue is empty. No `stream_muxers` extension is sent.
    - After the handshake the client closes the stream. The Noise transport keys are **not used**: every later WebTransport stream is a plain libp2p stream that runs multistream-select.
 6. **Certificates.** Self-signed ECDSA P-256, validity ≤ 14 days, never RSA. Advertise the current and next cert hashes. Use go-libp2p's deterministic HKDF scheme if you want the same hashes across restarts.
-7. **quinn-proto.** It has no RESET_STREAM_AT support (no match in quinn `main`). **Correction (plan review):** drafts 13 and 14 already require RESET_STREAM_AT (draft-13 §3.1/§4.3), not only draft-15+. minip2p's draft-14 path is therefore a compatibility subset; see the plan's Decision 4. Draft-15+ requires RESET_STREAM_AT, but no browser enforces it today: Firefox explicitly falls back to RESET_STREAM, and Chrome draft-02 predates it.
+7. **quinn-proto.** It has no RESET_STREAM_AT support (no match in quinn `main`). **Correction (plan review):** drafts 13 and 14 already require RESET_STREAM_AT (draft-13 §3.1/§4.3), not only draft-15+. minip2p's draft-14 path is therefore a compatibility subset; see the plan's Decision 4. **Implemented deviation (#412):** resets on a draft-13/14 session are plain RESET_STREAM; recorded in ADR 0023. Draft-15+ requires RESET_STREAM_AT, but no browser enforces it today: Firefox explicitly falls back to RESET_STREAM, and Chrome draft-02 predates it.
 
 ---
 
@@ -264,7 +264,7 @@ Source: https://www.ietf.org/archive/id/draft-ietf-webtrans-http3-16.html §3.1.
 - So Safari likely sends `WT_INITIAL_MAX_*`, which means **WT flow control becomes enabled** when the server also sends them. Two consequences:
   - The server must respect Safari's stream and data limits for server-opened streams.
   - The server must not let Safari exceed the server's own limits. Huge initial values (as go uses) avoid ever needing `WT_MAX_*` capsules. **[inferred]**
-- Whether Safari sends `:protocol webtransport` or `webtransport-h3` is **[uncertain]**. webtransport-go's server accepts both, and so should ours.
+- Whether Safari sends `:protocol webtransport` or `webtransport-h3` is **[uncertain]**. webtransport-go's server accepts both, and so should ours. **Decided otherwise (plan Decision 4):** minip2p accepts only `webtransport` and answers `webtransport-h3` with 400, since it does not implement draft-15+'s requirements; Safari's actual token is still to be recorded by hand.
 
 **Recommended minimal SETTINGS frame** (server control stream, uni stream type 0x00):
 

@@ -24,7 +24,7 @@ use quinn_proto::{
 
 use crate::diagnostics::ConnectionCounters;
 use crate::socket::Sockets;
-use crate::webtransport::{WebTransportContext, WtEvent, WtSession};
+use crate::webtransport::{ReadEnd, WebTransportContext, WtEvent, WtSession};
 
 /// TLS exporter label for the connection token both ends derive.
 const TOKEN_LABEL: &[u8] = b"minip2p quic connection token";
@@ -687,11 +687,11 @@ impl QuicConnection {
                         previous_peer_id: None,
                     });
                 }
-                WtEvent::Admit(raw) => {
+                WtEvent::Admit { raw, early, end } => {
                     if !self.surfaces_streams {
                         self.refuse_stream(engine_stream(raw));
                     } else if self.admit_remote_stream(raw, events) {
-                        self.scan(raw, events);
+                        self.deliver_early(raw, early, end, events);
                     }
                 }
                 WtEvent::Fail { code, reason } => {
@@ -904,6 +904,39 @@ impl QuicConnection {
                 data: copy_chunks(&mut self.read_chunks, read),
             });
         }
+        self.on_scan_end(raw, end, events);
+    }
+
+    /// Delivers what a WebTransport stream carried while it was held, then
+    /// whatever the engine has behind it.
+    fn deliver_early(
+        &mut self,
+        raw: u64,
+        early: Vec<u8>,
+        end: ReadEnd,
+        events: &mut Vec<TransportEvent>,
+    ) {
+        if !early.is_empty() {
+            if let Some(state) = self.stream_states.get_mut(&raw) {
+                state.unacked += early.len();
+            }
+            events.push(TransportEvent::StreamData {
+                id: self.id,
+                stream_id: StreamId::new(raw),
+                data: Bytes::from(early),
+            });
+        }
+        match end {
+            ReadEnd::Open => self.scan(raw, events),
+            ReadEnd::Finished => self.on_scan_end(raw, ScanEnd::Finished, events),
+            ReadEnd::Reset => self.on_scan_end(raw, ScanEnd::Reset, events),
+        }
+    }
+
+    /// Acts on how a read of a surfaced stream ended: FIN, reset, or not
+    /// yet.
+    fn on_scan_end(&mut self, raw: u64, end: ScanEnd, events: &mut Vec<TransportEvent>) {
+        let stream = engine_stream(raw);
         match end {
             ScanEnd::Waiting | ScanEnd::Gated => {}
             ScanEnd::Finished => {
