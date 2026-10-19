@@ -1093,6 +1093,8 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
             && let Some(state) = conn.streams.get_mut(&handle)
         {
             state.control = control;
+            // Promotion can open the reserve to a stream waiting on Full.
+            self.wake_writable(id);
         }
     }
 

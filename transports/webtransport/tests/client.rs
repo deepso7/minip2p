@@ -452,6 +452,22 @@ fn the_connection_cap_covers_bytes_in_flight_in_the_platform() {
 }
 
 #[test]
+fn promoting_a_full_stream_to_control_wakes_it_into_the_reserve() {
+    let mut client = client(small_limits());
+    let conn = connect(&mut client);
+    let streams: Vec<_> = (0..4).map(|_| open(&mut client, &conn).0).collect();
+    // Application streams fill their 250-byte share, so the fourth is Full.
+    assert_eq!(send(&mut client, &conn, streams[0], 100), 0);
+    assert_eq!(send(&mut client, &conn, streams[1], 100), 0);
+    assert_eq!(send(&mut client, &conn, streams[2], 50), 0);
+    assert_eq!(send(&mut client, &conn, streams[3], 1), 1);
+
+    // As a control stream it may use the 50-byte reserve.
+    client.set_control_stream(conn.id, streams[3], true);
+    assert_eq!(writable(&poll(&mut client)), [streams[3]]);
+}
+
+#[test]
 fn interleaved_partial_completions_release_exactly_their_bytes() {
     let mut client = client(small_limits());
     client.io_mut().in_flight_cap = 30;
