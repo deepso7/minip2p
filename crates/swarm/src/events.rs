@@ -157,10 +157,17 @@ pub enum SwarmEvent {
         addr: PeerAddr,
         reason: String,
     },
+    /// The transport changed a listen address on its own, as a WebTransport
+    /// listener does when its certificate rotates: `addrs` is the whole new
+    /// listen set ([`crate::SwarmCore::listened_addrs`] with `/p2p/<local>`),
+    /// for the application to republish. Listening through the swarm's
+    /// `listen*` methods and external-address changes never fire it.
+    ListenAddressesChanged { addrs: Vec<PeerAddr> },
 }
 
 impl SwarmEvent {
-    /// The peer this event names; `None` for [`DialFailed`](Self::DialFailed)
+    /// The peer this event names; `None` for [`DialFailed`](Self::DialFailed),
+    /// [`ListenAddressesChanged`](Self::ListenAddressesChanged),
     /// and errors without a peer.
     pub fn peer_id(&self) -> Option<&PeerId> {
         match self {
@@ -178,7 +185,7 @@ impl SwarmEvent {
             | Self::StreamWriteStopped { peer_id, .. }
             | Self::StreamClosed { peer_id, .. } => Some(peer_id),
             Self::Error(error) => error.peer_id.as_ref(),
-            Self::DialFailed { .. } => None,
+            Self::DialFailed { .. } | Self::ListenAddressesChanged { .. } => None,
         }
     }
 

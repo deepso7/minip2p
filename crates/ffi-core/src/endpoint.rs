@@ -49,7 +49,6 @@ fn configure_listen(
 pub struct P2pEndpoint {
     shared: Arc<Shared>,
     peer_id: String,
-    listen_addrs: Vec<String>,
 }
 
 /// The close drain a dropped [`P2pEndpoint`] grants, in milliseconds:
@@ -97,8 +96,25 @@ pub(crate) struct EventState {
     /// table by the driver (see `Shared::publish_peers`), so the
     /// query neither interrupts nor waits for the driver.
     pub(crate) connected_peers: Vec<String>,
+    /// What `listen_addrs` returns: the bound listen set at build, then
+    /// each [`P2pEvent::ListenAddressesChanged`] the driver ingests.
+    pub(crate) listen_addrs: Vec<String>,
     /// Set with the lifecycle once it reaches `Stopping` or `Stopped`.
     pub(crate) stopped: bool,
+}
+
+impl EventState {
+    /// Takes the driver's converted events into the carry, following the
+    /// listen set they announce; returns whether to ring the doorbell
+    /// (see [`EventCarry::ingest`]).
+    pub(crate) fn ingest(&mut self, converted: Vec<P2pEvent>) -> bool {
+        for event in &converted {
+            if let P2pEvent::ListenAddressesChanged { addrs } = event {
+                self.listen_addrs.clone_from(addrs);
+            }
+        }
+        self.carry.ingest(converted)
+    }
 }
 
 pub(crate) struct EndpointState {
@@ -260,7 +276,10 @@ impl P2pEndpoint {
                     published_peers: Vec::new(),
                     close_timeout: Duration::ZERO,
                 }),
-                events: Mutex::default(),
+                events: Mutex::new(EventState {
+                    listen_addrs,
+                    ..EventState::default()
+                }),
                 stopped: Mutex::new(false),
                 stopped_cv: Condvar::new(),
                 wait_handle,
@@ -273,7 +292,6 @@ impl P2pEndpoint {
                 doorbell_running: AtomicBool::new(false),
             }),
             peer_id,
-            listen_addrs,
         }))
     }
 
@@ -282,9 +300,11 @@ impl P2pEndpoint {
         self.peer_id.clone()
     }
 
-    /// Returns the bound QUIC or TCP peer addresses.
+    /// Returns the bound QUIC or TCP peer addresses, as of the last
+    /// [`P2pEvent::ListenAddressesChanged`] the driver carried (a
+    /// WebTransport certificate rotation changes them).
     pub fn listen_addrs(&self) -> Vec<String> {
-        self.listen_addrs.clone()
+        self.shared.lock_events().listen_addrs.clone()
     }
 
     /// Returns peers with an established QUIC, TCP, or circuit connection.
@@ -2407,5 +2427,26 @@ mod tests {
             ),
             FfiError::Transport { .. }
         ));
+    }
+
+    #[test]
+    fn listen_addrs_follow_listen_set_changes_only() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        let bound = endpoint.listen_addrs();
+        assert_eq!(bound.len(), 1, "{bound:?}");
+
+        let public = P2pEvent::PublicAddressesChanged {
+            addrs: vec!["/ip4/203.0.113.9/udp/1/quic-v1".into()],
+        };
+        endpoint.shared.lock_events().ingest(vec![public]);
+        assert_eq!(endpoint.listen_addrs(), bound);
+
+        let rotated = vec![format!("{}/rotated", bound[0])];
+        let changed = P2pEvent::ListenAddressesChanged {
+            addrs: rotated.clone(),
+        };
+        endpoint.shared.lock_events().ingest(vec![changed.clone()]);
+        assert_eq!(endpoint.listen_addrs(), rotated);
+        assert!(endpoint.drain_events(8).contains(&changed));
     }
 }

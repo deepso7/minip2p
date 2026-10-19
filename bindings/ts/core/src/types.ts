@@ -289,6 +289,12 @@ export interface Minip2pNamedEventMap {
     readonly current: Reachability;
     readonly confirmedAddrs: readonly string[];
   };
+  /**
+   * The listen set changed without a `listen` call, as when a WebTransport
+   * listener's certificate rotates: `addrs` is the whole new set (what
+   * `listenAddrs()` now returns), for the app to republish.
+   */
+  listenAddressesChanged: { readonly addrs: readonly string[] };
   publicAddressesChanged: { readonly addrs: readonly string[] };
   relayReserved: {
     readonly relayPeerId: string;
@@ -575,6 +581,7 @@ export const P2pEvent_Tags = {
   IdentifyReceived: "IdentifyReceived",
   InboundDirectUpgrade: "InboundDirectUpgrade",
   InboundPathEstablished: "InboundPathEstablished",
+  ListenAddressesChanged: "ListenAddressesChanged",
   MdnsFailed: "MdnsFailed",
   MdnsRecovered: "MdnsRecovered",
   Message: "Message",
@@ -679,6 +686,10 @@ export type P2pEvent =
   | RawEvent<
       typeof P2pEvent_Tags.ReachabilityChanged,
       Minip2pNamedEventMap["reachabilityChanged"]
+    >
+  | RawEvent<
+      typeof P2pEvent_Tags.ListenAddressesChanged,
+      Minip2pNamedEventMap["listenAddressesChanged"]
     >
   | RawEvent<
       typeof P2pEvent_Tags.PublicAddressesChanged,

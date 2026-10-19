@@ -77,6 +77,22 @@ test("named and catch-all subscribers receive flattened events", async () => {
   endpoint.close();
 });
 
+test("a rotated listen set arrives as listenAddressesChanged", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const named = [];
+  endpoint.on("listenAddressesChanged", (event) => named.push(event));
+
+  const addrs = [
+    "/ip4/127.0.0.1/udp/1/quic-v1/webtransport/certhash/uEi/p2p/x",
+  ];
+  backend.emit({ inner: { addrs }, tag: P2pEvent_Tags.ListenAddressesChanged });
+  await tick();
+
+  assert.deepEqual(named, [{ addrs }]);
+  endpoint.close();
+});
+
 test("events iteration yields endpoint events in order and ends on close", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);

@@ -178,7 +178,7 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         let should_ring = {
             let mut events = guard.shared.lock_events();
             events.carry.stats.iterations = events.carry.stats.iterations.saturating_add(1);
-            events.carry.ingest(converted)
+            events.ingest(converted)
         };
         drop(state);
         if should_ring {
