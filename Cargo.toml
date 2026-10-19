@@ -28,6 +28,7 @@ members = [
   "crates/transport",
   "transports/quic",
   "transports/tcp",
+  "transports/webtransport",
   "examples/chat",
   "examples/common",
   "examples/peer",

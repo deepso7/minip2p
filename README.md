@@ -123,7 +123,7 @@ The workspace has four strictly separated layers:
 
 1. **Sans-I/O protocols** — identity, TLS, Noise, Yamux, multistream-select, ping, identify, relay, AutoNAT, DCUtR, pubsub, and mDNS. These crates contain state machines and wire codecs, not sockets or clocks.
 2. **Orchestration** — `SwarmCore` drives the transport it owns with caller-supplied time and entropy, reading no clock itself; `NatAgent`, `RelayServerAgent`, `BeaconAgent`, and `PeerDiscoveryAgent` compose protocols and policy while remaining deterministic and I/O-free. Transport adapters perform the socket I/O.
-3. **Transport adapters** — `minip2p-tcp` over a pluggable `TcpProvider` byte-stream seam (`no_std + alloc`), and the quinn-proto-based `minip2p-quic` over UDP (`std`-only). `TransportSet` puts several behind one contract and routes by address.
+3. **Transport adapters** — `minip2p-tcp` over a pluggable `TcpProvider` byte-stream seam (`no_std + alloc`), and the quinn-proto-based `minip2p-quic` over UDP (`std`-only), with `minip2p-webtransport` holding the sans-I/O HTTP/3 and QPACK codec for WebTransport. `TransportSet` puts several behind one contract and routes by address.
 4. **`std` adapters** — the mDNS socket driver, the application-facing `Endpoint`, and the UniFFI adapter: the hosted end of the I/O seams.
 
 The seams below layer 3 — `TcpProvider` and `MdnsIo` — are what let TCP and mDNS run on a device with no operating system. `StdTcpProvider` and `MdnsSockets` are the hosted implementations; `SmoltcpTcpProvider` and `SmoltcpMdnsIo` are the [smoltcp] ones. Everything above them is the same code either way.

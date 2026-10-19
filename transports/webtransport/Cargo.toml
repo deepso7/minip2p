@@ -1,0 +1,21 @@
+[package]
+name = "minip2p-webtransport"
+description = "Sans-I/O HTTP/3 and QPACK codec for libp2p WebTransport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = ["std"]
+std = ["thiserror/std"]
+
+[dependencies]
+thiserror = { workspace = true }
