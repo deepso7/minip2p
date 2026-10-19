@@ -22,6 +22,7 @@ just clippy        # -D warnings, Endpoint TCP/discovery/mDNS variants, and fuzz
 just fmt           # also formats fuzz/
 just clean         # Cargo targets, node_modules, Turbo caches, docs output
 just check-nostd   # all no_std crates on thumbv7em-none-eabi
+just check-wasm    # the browser build's crates on wasm32-unknown-unknown
 just fuzz 30       # needs nightly + cargo-fuzz
 ```
 

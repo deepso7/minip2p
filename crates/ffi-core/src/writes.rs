@@ -16,14 +16,14 @@ use crate::{FfiError, P2pEvent};
 /// high-water mark, each stream holds at most one pending write, and the
 /// stream limit caps the streams. A refusal here would have no wakeup the
 /// SDK waits for.
-pub(crate) fn writer() -> StreamWriter {
+pub fn stream_writer() -> StreamWriter {
     StreamWriter::new(usize::MAX)
 }
 
 /// Maps a writer refusal to the binding's error: a second write while one is
 /// pending is [`FfiError::Backpressure`], a write behind a deferred close is
 /// [`FfiError::InvalidState`].
-pub(crate) fn map_write_error(error: StreamWriteError) -> FfiError {
+pub fn map_write_error(error: StreamWriteError) -> FfiError {
     match error {
         // The unbounded budget never refuses for size; mapped all the same.
         StreamWriteError::Busy { .. }
@@ -32,7 +32,7 @@ pub(crate) fn map_write_error(error: StreamWriteError) -> FfiError {
         StreamWriteError::Closing { stream_id, .. } => FfiError::InvalidState {
             detail: format!("stream {stream_id} write side is closing"),
         },
-        StreamWriteError::Endpoint(error) => crate::endpoint::map_driver_error(error),
+        StreamWriteError::Endpoint(error) => crate::map_driver_error(error),
         // A refusal this core predates.
         error => FfiError::InvalidState {
             detail: error.to_string(),
@@ -41,7 +41,7 @@ pub(crate) fn map_write_error(error: StreamWriteError) -> FfiError {
 }
 
 /// The binding's settlement of a held write.
-pub(crate) fn accepted_event(accepted: WriteAccepted) -> P2pEvent {
+pub fn write_accepted_event(accepted: WriteAccepted) -> P2pEvent {
     P2pEvent::StreamWriteAccepted {
         peer_id: accepted.peer_id.to_base58(),
         conn_id: accepted.conn_id.as_u64(),

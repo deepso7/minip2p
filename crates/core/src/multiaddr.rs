@@ -1,9 +1,9 @@
 use alloc::{string::ToString, vec::Vec};
 use core::{fmt, net::Ipv6Addr, str::FromStr};
 
-use minip2p_identity::PeerId;
+use minip2p_identity::{Multihash, PeerId};
 
-use crate::{MultiaddrError, Protocol};
+use crate::{MultiaddrError, Protocol, certhash};
 
 /// An ordered sequence of protocol components representing a network address.
 ///
@@ -90,8 +90,40 @@ impl Multiaddr {
     }
 
     /// Returns `true` if this is a valid QUIC transport address (host + udp + quic-v1).
+    ///
+    /// Exact: a WebTransport address is not one, even though it rides QUIC.
+    /// Hole punching and NAT candidates rely on this to stay on plain QUIC.
     pub fn is_quic_transport(&self) -> bool {
         is_quic_transport_slice(&self.protocols)
+    }
+
+    /// Returns `true` if this is a WebTransport transport address:
+    /// `/<host>/udp/<port>/quic-v1/webtransport` followed by zero or more
+    /// `/certhash` components.
+    pub fn is_webtransport(&self) -> bool {
+        is_webtransport_slice(&self.protocols)
+    }
+
+    /// Returns the `/certhash` components, in address order.
+    pub fn certhashes(&self) -> impl Iterator<Item = &Multihash> {
+        self.protocols.iter().filter_map(|protocol| match protocol {
+            Protocol::Certhash(hash) => Some(hash),
+            _ => None,
+        })
+    }
+
+    /// Returns a copy with every `/certhash` component removed.
+    ///
+    /// A WebTransport listen address is matched to its socket this way:
+    /// the hashes change as certificates rotate, the socket does not.
+    pub fn without_certhashes(&self) -> Self {
+        Self::from_protocols(
+            self.protocols
+                .iter()
+                .filter(|protocol| !matches!(protocol, Protocol::Certhash(_)))
+                .cloned()
+                .collect(),
+        )
     }
 
     /// Returns `true` if this is a valid TCP transport address (host + tcp).
@@ -102,7 +134,8 @@ impl Multiaddr {
     /// Returns which transport can dial this address, if any.
     ///
     /// This is the classification a multi-transport host routes on:
-    /// `/udp/.../quic-v1` addresses go to QUIC, `/tcp` addresses to TCP. Anything
+    /// `/udp/.../quic-v1` addresses -- plain or WebTransport -- go to QUIC,
+    /// `/tcp` addresses to TCP. Anything
     /// else -- a bare host, a circuit address, a trailing `/p2p` -- is not a
     /// dialable transport address and returns `None`.
     pub fn transport_kind(&self) -> Option<TransportKind> {
@@ -200,6 +233,11 @@ impl fmt::Display for Multiaddr {
                 Protocol::Tcp(port) => write!(f, "/tcp/{port}")?,
                 Protocol::Udp(port) => write!(f, "/udp/{port}")?,
                 Protocol::QuicV1 => f.write_str("/quic-v1")?,
+                Protocol::WebTransport => f.write_str("/webtransport")?,
+                Protocol::Certhash(hash) => {
+                    f.write_str("/certhash/")?;
+                    certhash::write(hash, f)?;
+                }
                 Protocol::P2p(peer_id) => write!(f, "/p2p/{peer_id}")?,
                 Protocol::P2pCircuit => f.write_str("/p2p-circuit")?,
             }
@@ -233,6 +271,26 @@ pub(crate) fn is_quic_transport_slice(protocols: &[Protocol]) -> bool {
     )
 }
 
+/// Checks if a protocol slice forms a WebTransport address
+/// (host + udp + quic-v1 + webtransport + certhash*).
+pub(crate) fn is_webtransport_slice(protocols: &[Protocol]) -> bool {
+    match protocols {
+        [
+            host,
+            Protocol::Udp(_),
+            Protocol::QuicV1,
+            Protocol::WebTransport,
+            certhashes @ ..,
+        ] => {
+            host.is_host()
+                && certhashes
+                    .iter()
+                    .all(|protocol| matches!(protocol, Protocol::Certhash(_)))
+        }
+        _ => false,
+    }
+}
+
 /// Checks if a protocol slice forms a valid TCP transport (host + tcp).
 pub(crate) fn is_tcp_transport_slice(protocols: &[Protocol]) -> bool {
     matches!(protocols, [host, Protocol::Tcp(_)] if host.is_host())
@@ -242,7 +300,7 @@ pub(crate) fn is_tcp_transport_slice(protocols: &[Protocol]) -> bool {
 pub(crate) fn transport_kind_of(protocols: &[Protocol]) -> Option<TransportKind> {
     if is_tcp_transport_slice(protocols) {
         Some(TransportKind::Tcp)
-    } else if is_quic_transport_slice(protocols) {
+    } else if is_quic_transport_slice(protocols) || is_webtransport_slice(protocols) {
         Some(TransportKind::Quic)
     } else {
         None
@@ -254,7 +312,8 @@ pub(crate) fn transport_kind_of(protocols: &[Protocol]) -> Option<TransportKind>
 pub enum TransportKind {
     /// `/<host>/tcp/<port>`
     Tcp,
-    /// `/<host>/udp/<port>/quic-v1`
+    /// `/<host>/udp/<port>/quic-v1`, and WebTransport on top of it:
+    /// `/<host>/udp/<port>/quic-v1/webtransport[/certhash/<hash>]*`
     Quic,
 }
 
@@ -338,6 +397,20 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
             "quic-v1" => {
                 protocols.push(Protocol::QuicV1);
                 idx += 1;
+            }
+            "webtransport" => {
+                protocols.push(Protocol::WebTransport);
+                idx += 1;
+            }
+            "certhash" => {
+                let value = require_value(&segments, idx, "certhash")?;
+                let parsed =
+                    certhash::parse(value).map_err(|source| MultiaddrError::InvalidCerthash {
+                        value: value.to_string(),
+                        source,
+                    })?;
+                protocols.push(Protocol::Certhash(parsed));
+                idx += 2;
             }
             "p2p-circuit" => {
                 protocols.push(Protocol::P2pCircuit);
@@ -835,6 +908,179 @@ mod tests {
             err,
             MultiaddrError::TruncatedBinaryValue { protocol: "dns" }
         ));
+    }
+
+    // ---------------------------------------------------------------------
+    // WebTransport and certhash
+    // ---------------------------------------------------------------------
+
+    /// rust-libp2p's `webtransport-websys` endpoint test address.
+    const RUST_WEBTRANSPORT: &str = "/ip4/127.0.0.1/udp/44874/quic-v1/webtransport/certhash/uEiCaDd1Ca1A8IVJ3hsIxIyi11cwxaDKqzVrBkGJbKZU5ng/certhash/uEiDv-VGW8oXxui_G_Kqp-87YjvET-Hr2qYAMYPePJDcsjQ/p2p/12D3KooWR7EfNv5SLtgjMRjUwR8AvNu3hP4fLrtSa9fmHHXKYWNG";
+    /// The digests in [`RUST_WEBTRANSPORT`], decoded independently.
+    const RUST_DIGESTS: [&str; 2] = [
+        "9a0ddd426b503c21527786c2312328b5d5cc316832aacd5ac190625b2995399e",
+        "eff95196f285f1ba2fc6fcaaa9fbced88ef113f87af6a9800c60f78f24372c8d",
+    ];
+    /// go-multiaddr's base58btc certhash fixture and the same multihash in
+    /// the base64url form rust-libp2p and js-libp2p print.
+    const GO_BASE58_CERTHASH: &str = "zQmbWTwYGcmdyK9CYfNBcfs9nhZs17a6FQ4Y8oea278xx41";
+    const GO_BASE64URL_CERTHASH: &str = "uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g";
+    const GO_DIGEST: &str = "c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2";
+
+    fn hex(input: &str) -> Vec<u8> {
+        minip2p_identity::multibase::decode_base16(input).unwrap()
+    }
+
+    fn digests(addr: &Multiaddr) -> Vec<Vec<u8>> {
+        addr.certhashes()
+            .map(|hash| hash.digest().to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn round_trips_the_rust_libp2p_webtransport_fixture() {
+        let addr = Multiaddr::from_str(RUST_WEBTRANSPORT).expect("must parse");
+        assert_eq!(addr.to_string(), RUST_WEBTRANSPORT);
+        assert_eq!(Multiaddr::from_bytes(&addr.to_bytes()).unwrap(), addr);
+        assert_eq!(
+            digests(&addr),
+            RUST_DIGESTS.iter().map(|d| hex(d)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn certhash_text_accepts_every_multibase_and_prints_base64url() {
+        let canonical = format!(
+            "/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/{GO_BASE64URL_CERTHASH}"
+        );
+        let multihash = format!("1220{GO_DIGEST}");
+        let base32 = "ciqmhk4p6e3sb2fnsbd52okgnm6is5hfslbpuob5ji4wa4kmv3ymj4q";
+        for encoded in [
+            GO_BASE58_CERTHASH.to_string(),
+            GO_BASE64URL_CERTHASH.to_string(),
+            format!("b{base32}"),
+            format!("B{}", base32.to_ascii_uppercase()),
+            format!("f{multihash}"),
+            format!("F{}", multihash.to_ascii_uppercase()),
+        ] {
+            let input = format!("/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/{encoded}");
+            let addr = Multiaddr::from_str(&input).expect(&input);
+            assert_eq!(addr.to_string(), canonical, "{encoded}");
+            assert_eq!(digests(&addr), [hex(GO_DIGEST)], "{encoded}");
+        }
+    }
+
+    /// Hand-derived reference vector:
+    /// - `/webtransport`: varint code 0x01d1 -> D1 03, no value
+    /// - `/certhash`: varint code 0x01d2 -> D2 03, varint length 34, then
+    ///   the multihash `12 20 <32-byte digest>`
+    #[test]
+    fn binary_codec_reference_vector_webtransport_certhash() {
+        let input = format!(
+            "/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/{GO_BASE64URL_CERTHASH}"
+        );
+        let addr = Multiaddr::from_str(&input).unwrap();
+        let mut expected: Vec<u8> = vec![
+            0x04, 0x7F, 0x00, 0x00, 0x01, // ip4 127.0.0.1
+            0x91, 0x02, 0x04, 0xD2, // udp 1234
+            0xCD, 0x03, // quic-v1
+            0xD1, 0x03, // webtransport
+            0xD2, 0x03, 0x22, 0x12, 0x20, // certhash, len 34, sha2-256, 32
+        ];
+        expected.extend(hex(GO_DIGEST));
+        assert_eq!(addr.to_bytes(), expected);
+        assert_eq!(Multiaddr::from_bytes(&expected).unwrap(), addr);
+    }
+
+    #[test]
+    fn rejects_certhashes_that_are_not_32_byte_sha256() {
+        let zeros = |n: usize| "00".repeat(n);
+        let bad_multihashes = [
+            // sha2-512 code with a 64-byte digest.
+            format!("1340{}", zeros(64)),
+            // identity code.
+            format!("0020{}", zeros(32)),
+            // sha2-256 with a 31-byte digest.
+            format!("121f{}", zeros(31)),
+            // sha2-256 declaring 32 bytes, carrying 31.
+            format!("1220{}", zeros(31)),
+            // sha2-256 with a trailing byte.
+            format!("1220{}", zeros(33)),
+            // Truncated before the digest length.
+            "12".to_string(),
+        ];
+        for multihash in bad_multihashes {
+            let text = format!("/ip4/127.0.0.1/udp/1/quic-v1/webtransport/certhash/f{multihash}");
+            assert!(
+                matches!(
+                    Multiaddr::from_str(&text),
+                    Err(MultiaddrError::InvalidCerthash { .. })
+                ),
+                "text {multihash}"
+            );
+
+            let body = hex(&multihash);
+            let mut bytes = vec![0xD2, 0x03, body.len() as u8];
+            bytes.extend(body);
+            assert!(
+                matches!(
+                    Multiaddr::from_bytes(&bytes),
+                    Err(MultiaddrError::InvalidBinaryValue {
+                        protocol: "certhash",
+                        ..
+                    })
+                ),
+                "binary {multihash}"
+            );
+        }
+
+        for bad_text in ["", "x1220", "u!!", "zO0", "f123"] {
+            let text = format!("/ip4/127.0.0.1/udp/1/quic-v1/webtransport/certhash/{bad_text}");
+            assert!(Multiaddr::from_str(&text).is_err(), "{bad_text:?}");
+        }
+    }
+
+    #[test]
+    fn classifies_webtransport_shapes() {
+        let certhash = format!("/certhash/{GO_BASE64URL_CERTHASH}");
+        for input in [
+            "/ip4/192.0.2.1/udp/4001/quic-v1/webtransport".to_string(),
+            format!("/ip6/2001:db8::1/udp/4001/quic-v1/webtransport{certhash}"),
+            format!("/dns4/example.test/udp/4001/quic-v1/webtransport{certhash}{certhash}"),
+        ] {
+            let addr = Multiaddr::from_str(&input).unwrap();
+            assert!(addr.is_webtransport(), "{input}");
+            assert!(!addr.is_quic_transport(), "{input}");
+            assert_eq!(addr.transport_kind(), Some(TransportKind::Quic), "{input}");
+        }
+
+        let quic = Multiaddr::from_str("/ip4/192.0.2.1/udp/4001/quic-v1").unwrap();
+        assert!(!quic.is_webtransport());
+
+        for input in [
+            format!("/ip4/192.0.2.1/tcp/4001/quic-v1/webtransport{certhash}"),
+            format!("/ip4/192.0.2.1/udp/4001/webtransport{certhash}"),
+            format!("/ip4/192.0.2.1/udp/4001/quic-v1{certhash}"),
+            format!("/ip4/192.0.2.1/udp/4001/quic-v1{certhash}/webtransport"),
+            format!("/ip4/192.0.2.1/udp/4001/quic-v1/webtransport{certhash}/p2p/{PEER_ID}"),
+            "/ip4/192.0.2.1/udp/4001/quic-v1/webtransport/webtransport".to_string(),
+        ] {
+            let addr = Multiaddr::from_str(&input).unwrap();
+            assert!(!addr.is_webtransport(), "{input}");
+            assert!(!addr.is_quic_transport(), "{input}");
+            assert_eq!(addr.transport_kind(), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn without_certhashes_keeps_everything_else() {
+        let addr = Multiaddr::from_str(RUST_WEBTRANSPORT).unwrap();
+        let stripped = addr.without_certhashes();
+        assert_eq!(
+            stripped.to_string(),
+            "/ip4/127.0.0.1/udp/44874/quic-v1/webtransport/p2p/12D3KooWR7EfNv5SLtgjMRjUwR8AvNu3hP4fLrtSa9fmHHXKYWNG"
+        );
+        assert_eq!(stripped.certhashes().count(), 0);
     }
 
     #[test]

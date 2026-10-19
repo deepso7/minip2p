@@ -22,6 +22,23 @@ let peer_id = verify_libp2p_certificate(&cert_der, now)?;
 
 The spec also forbids certificate chains. The verifier sees one certificate, so the transport must reject a peer that presents more than one (the QUIC transport does).
 
+### WebTransport certificates
+
+The `webtransport` module builds the certificates a WebTransport listener presents to browsers. They are self-signed ECDSA P-256 with no libp2p extension (Noise proves the peer identity instead) and are a pure function of the host key and a certificate period, so a restarted node serves the same certificate:
+
+```rust
+use minip2p_tls::webtransport::{certhash, next_boundary, period_at, webtransport_certificate};
+
+let period = period_at(now_unix_secs);
+let (cert_der, pkcs8_key_der) = webtransport_certificate(&keypair, period)?;
+let hash = certhash(&cert_der); // sha2-256 multihash for /certhash/<hash>
+let rotate_at = next_boundary(now_unix_secs);
+```
+
+- Periods are 13 days long; period `k` starts at `k · 13 days` Unix seconds.
+- Certificate `k` is valid from 1 h before its period starts for exactly 14 days (the browser maximum).
+- The key is HKDF-SHA256 over the host secret (salt = the big-endian period, info = `"minip2p webtransport certificate"`, with a counter appended on the rare out-of-range scalar), and the signature is RFC 6979 deterministic.
+
 ### Host key types
 
 | Key type | Verified |
