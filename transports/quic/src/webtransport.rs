@@ -240,6 +240,8 @@ pub(crate) struct WtSession {
     early_bytes: usize,
     noise: Option<NoiseStream>,
     established: bool,
+    /// The session was accepted under draft-13/14, not draft-02.
+    draft14: bool,
     /// Session flow control, when the chosen draft and the client enable it.
     credit: Option<Credit>,
     /// The session is ending: only the CONNECT stream is read.
@@ -275,6 +277,7 @@ impl WtSession {
             early_bytes: 0,
             noise: None,
             established: false,
+            draft14: false,
             credit: None,
             closing: false,
             out: HashMap::new(),
@@ -289,6 +292,13 @@ impl WtSession {
             .as_ref()
             .filter(|_| self.established)
             .map(|connect| connect.id)
+    }
+
+    /// The code the session's streams end with as it closes, when its draft
+    /// names one: `WT_SESSION_GONE` under draft-13/14 (draft-14 §6).
+    /// Draft-02 names none.
+    pub(crate) fn gone_code(&self) -> Option<u64> {
+        self.draft14.then_some(code::WT_SESSION_GONE)
     }
 
     /// Whether the client's credit allows opening another stream.
@@ -397,9 +407,9 @@ impl WtSession {
     /// that FIN (its resets) went out with or ahead of it. A CONNECT stream
     /// we refused for data after the close capsule never qualifies.
     pub(crate) fn ended_and_delivered(&self) -> bool {
-        self.connect.as_ref().is_none_or(|connect| {
-            connect.peer_ended && connect.delivered && !connect.refused
-        })
+        self.connect
+            .as_ref()
+            .is_none_or(|connect| connect.peer_ended && connect.delivered && !connect.refused)
     }
 
     /// The engine is done sending on `raw`: everything was acknowledged, or
@@ -926,6 +936,7 @@ impl WtSession {
         } else {
             "400"
         };
+        self.draft14 = draft14 && status == "200";
         // Draft-13/14 flow control is on once both sides ask for it, with
         // more than one session or a nonzero initial limit (draft-14 §5.1);
         // ours are 2^60, so only the client's limits ever bind, and an

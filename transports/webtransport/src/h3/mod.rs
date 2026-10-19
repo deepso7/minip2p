@@ -105,6 +105,9 @@ pub mod code {
     pub const QPACK_DECODER_STREAM_ERROR: u64 = 0x202;
     /// A WebTransport session's flow control was violated (draft-14 §9.5).
     pub const WT_FLOW_CONTROL_ERROR: u64 = 0x045d_4487;
+    /// Resets and stops a session's streams as the session ends
+    /// (draft-14 §6). Draft-02 names no such code.
+    pub const WT_SESSION_GONE: u64 = 0x170d_7b68;
 }
 
 /// The first HTTP/3 code of the WebTransport application error range.
