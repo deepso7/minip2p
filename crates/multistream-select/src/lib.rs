@@ -131,6 +131,14 @@ impl MultistreamSelect {
         self.state == State::Done
     }
 
+    /// Returns `true` while a dialer has sent its proposal and only reads
+    /// the reply: it has nothing left to write.
+    pub fn awaits_response(&self) -> bool {
+        self.role == Role::Dialer
+            && self.state == State::WaitingForProtocolResponse
+            && self.pending_outputs.is_empty()
+    }
+
     /// Drains and returns any buffered bytes received after negotiation finished.
     ///
     /// If the remote pipelines protocol data into the same network packet that
