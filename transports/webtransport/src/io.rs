@@ -60,9 +60,13 @@ pub enum IoEvent {
     Data { stream: StreamHandle, bytes: Bytes },
     /// The peer finished its side of the stream.
     Fin { stream: StreamHandle },
-    /// The peer reset its side of the stream.
+    /// The peer reset its side of the stream. `code` is the WebTransport
+    /// application error code (a browser's `streamErrorCode`), already
+    /// mapped back from HTTP/3; 0 when the platform gave none.
     Reset { stream: StreamHandle, code: u8 },
-    /// The peer asked us to stop sending on the stream.
+    /// The peer asked us to stop sending on the stream, with a WebTransport
+    /// code as for [`IoEvent::Reset`]. The client reports it unchanged in
+    /// `StreamWriteStopped`, as the QUIC server does.
     StopSending { stream: StreamHandle, code: u8 },
     /// One accepted [`WebTransportIo::write`] resolved, releasing exactly
     /// its `bytes`.
@@ -95,6 +99,8 @@ pub trait WebTransportIo {
     fn close_write(&mut self, stream: StreamHandle);
 
     /// Resets the stream in both directions (`abort()` and `cancel()`).
+    /// `code` is a WebTransport application error code; the platform maps
+    /// it into HTTP/3's range on the wire. minip2p only ever sends 0.
     fn reset(&mut self, stream: StreamHandle, code: u8);
 
     /// Asks the peer to stop sending (`cancel()` only).
@@ -103,7 +109,9 @@ pub trait WebTransportIo {
     /// Lets the stream deliver up to `bytes` more in [`IoEvent::Data`].
     fn grant_read(&mut self, stream: StreamHandle, bytes: usize);
 
-    /// Closes the session with a WebTransport close code and reason.
+    /// Closes the session with a WebTransport close code and reason: a
+    /// `CLOSE_WEBTRANSPORT_SESSION` capsule and FIN on the CONNECT stream,
+    /// as `WebTransport.close()` does, leaving the server to close QUIC.
     fn close(&mut self, session: SessionHandle, code: u32, reason: &str);
 
     /// The next queued event, if any.

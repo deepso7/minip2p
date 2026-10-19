@@ -10,15 +10,15 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use minip2p_core::{Bytes, Multihash};
 use minip2p_webtransport::h3::{
-    Frame, FrameDecoder, Settings, UniStreamHeaderDecoder, UniStreamType, code, encode_frame,
-    encode_uni_stream_type, encode_webtransport_bidi_header, frame_type, h3_code_to_webtransport,
-    setting, webtransport_code_to_h3,
+    Capsule, CapsuleDecoder, Frame, FrameDecoder, Settings, UniStreamHeaderDecoder, UniStreamType,
+    encode_frame, encode_uni_stream_type, encode_webtransport_bidi_header, frame_type,
+    h3_code_to_webtransport, setting, webtransport_code_to_h3,
 };
 use minip2p_webtransport::qpack::{QpackDecoder, encode_field_section};
 use minip2p_webtransport::{IoError, IoEvent, SessionHandle, StreamHandle, WebTransportIo};
@@ -54,6 +54,41 @@ pub struct Options {
     pub race_noise: bool,
     /// The CONNECT `:path`, in place of the libp2p one.
     pub path: Option<String>,
+    /// Records what the server put on the wire, for tests to inspect.
+    pub wire: Wire,
+}
+
+/// What the client saw the server do on the wire, in order. Shared, so a
+/// test keeps a clone after handing the options over.
+#[derive(Clone, Debug, Default)]
+pub struct Wire(Arc<Mutex<Vec<WireEvent>>>);
+
+impl Wire {
+    pub fn events(&self) -> Vec<WireEvent> {
+        self.0.lock().expect("wire log").clone()
+    }
+
+    fn push(&self, event: WireEvent) {
+        self.0.lock().expect("wire log").push(event);
+    }
+}
+
+/// One thing the server did, with the raw HTTP/3 codes it used.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WireEvent {
+    /// The CONNECT response's `:status`.
+    Status(String),
+    /// A `CLOSE_WEBTRANSPORT_SESSION` capsule on the CONNECT stream.
+    CloseCapsule { code: u32 },
+    /// The server finished or reset its side of the CONNECT stream.
+    ConnectEnded,
+    /// RESET_STREAM on a WebTransport stream.
+    Reset { code: u64 },
+    /// STOP_SENDING on a WebTransport stream.
+    StopSending { code: u64 },
+    /// The QUIC connection closed; the application close code, if the
+    /// server sent one.
+    ConnectionClosed { code: Option<u64> },
 }
 
 /// Pins the server certificate by its certhash, then checks the handshake
@@ -159,11 +194,17 @@ struct Session {
     /// The CONNECT stream, once sent.
     connect: Option<StreamId>,
     connect_frames: FrameDecoder,
+    connect_capsules: CapsuleDecoder,
+    /// The server's side of the CONNECT stream ended.
+    connect_ended: bool,
+    /// Our side of the CONNECT stream is finished.
+    connect_finished: bool,
     /// The control stream went out.
     control_sent: bool,
     /// When a held-back control stream goes out.
     control_at: Option<Instant>,
     ready: bool,
+    /// The session is over for the caller: no more events but the wire log.
     closed: bool,
     server_uni: HashMap<StreamId, (UniStreamHeaderDecoder, Option<UniStreamType>, FrameDecoder)>,
     /// Server bidi streams whose prefix is being read.
@@ -257,6 +298,13 @@ impl QuinnIo {
                     }
                 }
                 Event::ConnectionLost { reason } => {
+                    let code = match &reason {
+                        quinn_proto::ConnectionError::ApplicationClosed(close) => {
+                            Some(close.error_code.into_inner())
+                        }
+                        _ => None,
+                    };
+                    self.options.wire.push(WireEvent::ConnectionClosed { code });
                     if !std::mem::replace(&mut session.closed, true) {
                         self.events.push_back(IoEvent::SessionClosed {
                             session: SessionHandle(handle),
@@ -282,6 +330,9 @@ impl QuinnIo {
                 }
                 Event::Stream(StreamEvent::Stopped { id, error_code }) => {
                     if let Some(&stream) = session.by_quinn.get(&id) {
+                        self.options.wire.push(WireEvent::StopSending {
+                            code: error_code.into_inner(),
+                        });
                         self.events.push_back(IoEvent::StopSending {
                             stream: StreamHandle(stream),
                             code: wt_code(error_code),
@@ -291,7 +342,14 @@ impl QuinnIo {
                 _ => {}
             }
         }
+        if session.conn.is_drained() {
+            return;
+        }
+        // A closed session still reads the CONNECT stream, for the log, and
+        // sends what the engine has; its streams are gone.
         if session.closed {
+            self.read_connect(handle);
+            self.transmit(handle, now);
             return;
         }
         // The held control stream goes out a while after a stream has.
@@ -310,9 +368,73 @@ impl QuinnIo {
                 }
             }
         }
+        self.read_connect(handle);
         self.read_server_streams(handle);
         self.flush(handle);
         self.transmit(handle, now);
+    }
+
+    /// Reads the CONNECT stream: the response, then capsules. A refusal, a
+    /// close capsule or the server ending the stream closes the session, and
+    /// we finish our side as a browser does.
+    fn read_connect(&mut self, handle: u64) {
+        let Some(session) = self.sessions.get_mut(&handle) else {
+            return;
+        };
+        let Some(connect) = session.connect.filter(|_| !session.connect_ended) else {
+            return;
+        };
+        let (bytes, ended) = read(&mut session.conn, connect, usize::MAX);
+        let mut input = &bytes[..];
+        let mut closed_with = None;
+        while let Ok(Some(frame)) = session.connect_frames.decode(&mut input) {
+            match frame {
+                Frame::Headers(block) => {
+                    let mut decoder = QpackDecoder::new();
+                    let status = decoder
+                        .decode(&block)
+                        .ok()
+                        .and_then(|section| section.get(b":status").map(<[u8]>::to_vec))
+                        .map(|status| String::from_utf8_lossy(&status).into_owned())
+                        .unwrap_or_default();
+                    self.options.wire.push(WireEvent::Status(status.clone()));
+                    if status == "200" {
+                        if !session.closed && !std::mem::replace(&mut session.ready, true) {
+                            self.events.push_back(IoEvent::SessionReady {
+                                session: SessionHandle(handle),
+                            });
+                        }
+                    } else {
+                        closed_with = Some((0, format!("the server answered {status}")));
+                    }
+                }
+                Frame::Data(mut chunk) => {
+                    while let Ok(Some(capsule)) = session.connect_capsules.decode(&mut chunk) {
+                        if let Capsule::CloseSession { code, reason } = capsule {
+                            self.options.wire.push(WireEvent::CloseCapsule { code });
+                            closed_with = Some((code, reason));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if ended {
+            session.connect_ended = true;
+            self.options.wire.push(WireEvent::ConnectEnded);
+            closed_with.get_or_insert((0, "the server ended the session".into()));
+        }
+        let Some((code, reason)) = closed_with else {
+            return;
+        };
+        if !std::mem::replace(&mut session.closed, true) {
+            self.events.push_back(IoEvent::SessionClosed {
+                session: SessionHandle(handle),
+                code,
+                reason,
+            });
+        }
+        finish_connect(session);
     }
 
     /// Reads the server's uni streams, the CONNECT response, new server
@@ -329,36 +451,6 @@ impl QuinnIo {
             }
             if *ty == Some(UniStreamType::Control) {
                 while let Ok(Some(_)) = frames.decode(&mut input) {}
-            }
-        }
-        if let Some(connect) = session.connect {
-            let (bytes, _) = read(&mut session.conn, connect, usize::MAX);
-            let mut input = &bytes[..];
-            while let Ok(Some(frame)) = session.connect_frames.decode(&mut input) {
-                let Frame::Headers(block) = frame else {
-                    continue;
-                };
-                let mut decoder = QpackDecoder::new();
-                let status = decoder
-                    .decode(&block)
-                    .ok()
-                    .and_then(|section| section.get(b":status").map(<[u8]>::to_vec));
-                if status.as_deref() == Some(b"200") {
-                    if !std::mem::replace(&mut session.ready, true) {
-                        self.events.push_back(IoEvent::SessionReady {
-                            session: SessionHandle(handle),
-                        });
-                    }
-                } else if !std::mem::replace(&mut session.closed, true) {
-                    self.events.push_back(IoEvent::SessionClosed {
-                        session: SessionHandle(handle),
-                        code: 0,
-                        reason: format!(
-                            "the server answered {}",
-                            String::from_utf8_lossy(&status.unwrap_or_default())
-                        ),
-                    });
-                }
             }
         }
         let heads: Vec<StreamId> = session.heads.keys().copied().collect();
@@ -423,6 +515,9 @@ impl QuinnIo {
                         break;
                     }
                     Err(ReadError::Reset(code)) => {
+                        self.options.wire.push(WireEvent::Reset {
+                            code: code.into_inner(),
+                        });
                         end = Some(IoEvent::Reset {
                             stream: StreamHandle(stream),
                             code: wt_code(code),
@@ -551,6 +646,17 @@ fn start_h3(session: &mut Session, send_settings: bool, path: Option<&str>) {
     session.connect = Some(stream);
 }
 
+/// Finishes our side of the CONNECT stream, once.
+fn finish_connect(session: &mut Session) {
+    if let Some(connect) = session.connect
+        && !std::mem::replace(&mut session.connect_finished, true)
+    {
+        match session.conn.send_stream(connect).finish() {
+            Ok(()) | Err(_) => {}
+        }
+    }
+}
+
 /// Our control stream: its type, then draft-02 SETTINGS.
 fn send_control(session: &mut Session) {
     let Some(stream) = session.conn.streams().open(Dir::Uni) else {
@@ -633,6 +739,9 @@ impl WebTransportIo for QuinnIo {
                 path: path.to_owned(),
                 connect: None,
                 connect_frames: FrameDecoder::new(),
+                connect_capsules: CapsuleDecoder::new(),
+                connect_ended: false,
+                connect_finished: false,
                 control_sent: false,
                 control_at: None,
                 ready: false,
@@ -762,16 +871,28 @@ impl WebTransportIo for QuinnIo {
         }
     }
 
-    fn close(&mut self, session: SessionHandle, _code: u32, reason: &str) {
+    /// Closes as a browser does: a close capsule and FIN on the CONNECT
+    /// stream, leaving the server to close QUIC.
+    fn close(&mut self, session: SessionHandle, code: u32, reason: &str) {
         let Some(state) = self.sessions.get_mut(&session.0) else {
             return;
         };
         state.closed = true;
-        state.conn.close(
-            Instant::now(),
-            VarInt::from_u64(code::H3_NO_ERROR).expect("code"),
-            Bytes::copy_from_slice(reason.as_bytes()),
-        );
+        if let Some(connect) = state.connect.filter(|_| !state.connect_finished) {
+            let mut capsule = Vec::new();
+            Capsule::CloseSession {
+                code,
+                reason: reason.to_owned(),
+            }
+            .encode(&mut capsule)
+            .expect("capsule");
+            let mut bytes = Vec::new();
+            encode_frame(frame_type::DATA, &capsule, &mut bytes).expect("DATA");
+            match state.conn.send_stream(connect).write(&bytes) {
+                Ok(_) | Err(_) => {}
+            }
+            finish_connect(state);
+        }
         self.transmit(session.0, Instant::now());
     }
 
@@ -780,5 +901,24 @@ impl WebTransportIo for QuinnIo {
             self.pump();
         }
         self.events.pop_front()
+    }
+}
+
+impl QuinnIo {
+    /// Sends STOP_SENDING with a raw HTTP/3 code, which no browser can.
+    pub fn stop_raw(&mut self, stream: StreamHandle, code: u64) {
+        let Some(state) = self.streams.get(&stream.0) else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&state.session) else {
+            return;
+        };
+        match session
+            .conn
+            .recv_stream(state.id)
+            .stop(VarInt::from_u64(code).expect("code"))
+        {
+            Ok(()) | Err(_) => {}
+        }
     }
 }
