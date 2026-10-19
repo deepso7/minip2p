@@ -545,11 +545,13 @@ impl QuicConnection {
                 }
             }
             Event::Stream(StreamEvent::Stopped { id, error_code }) => {
-                if let Some(wt) = self.wt.as_mut() {
-                    wt.on_send_done(u64::from(id));
-                }
-                if self.surfaces_streams {
-                    self.on_stopped(u64::from(id), error_code, cx.events);
+                let raw = u64::from(id);
+                if let Some(wt) = self.wt.as_mut()
+                    && wt.on_stopped(raw)
+                {
+                    self.after_wt(now, cx.events);
+                } else if self.surfaces_streams {
+                    self.on_stopped(raw, error_code, cx.events);
                 }
             }
             Event::Stream(StreamEvent::Available { dir: Dir::Bi }) => {

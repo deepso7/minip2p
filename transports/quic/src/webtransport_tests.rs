@@ -14,7 +14,7 @@ use minip2p_webtransport::h3::{
     encode_uni_stream_type, encode_webtransport_bidi_header, frame_type, setting,
 };
 use minip2p_webtransport::qpack::{QpackDecoder, encode_field_section};
-use quinn_proto::{ConnectionError, Dir, Event, StreamEvent};
+use quinn_proto::{ConnectionError, Dir, Event, StreamEvent, VarInt};
 
 use super::*;
 use crate::test_peer::{RawPeer, foreign_client_config, now};
@@ -53,10 +53,12 @@ struct H3Peer {
 impl H3Peer {
     /// Connects and drives until the QUIC handshake completes.
     fn connect(server: &mut QuicTransport, events: &mut Vec<TransportEvent>) -> Self {
-        let raw = RawPeer::connect_with(
-            server.local_addr(),
-            foreign_client_config(&[b"h3"], None, Arc::default()),
-        );
+        let mut config = foreign_client_config(&[b"h3"], None, Arc::default());
+        // Room for the server's control stream, as a browser grants.
+        let mut transport = crate::test_peer::default_transport();
+        transport.max_concurrent_uni_streams(VarInt::from_u32(3));
+        config.transport_config(Arc::new(transport));
+        let raw = RawPeer::connect_with(server.local_addr(), config);
         let mut peer = Self {
             raw,
             connect: None,
@@ -1306,6 +1308,37 @@ fn an_impossible_session_id_after_authentication_closes_the_connection() {
     peer.connect = session;
     let (code, reason) = peer.closed_with(&mut server, &mut Vec::new());
     assert_eq!(code, code::H3_ID_ERROR, "{reason}");
+}
+
+/// Accepts the server's control stream and sends STOP_SENDING on it.
+fn stop_server_control(peer: &mut H3Peer, server: &mut QuicTransport, events: &mut Vec<TransportEvent>) {
+    let mut control = None;
+    peer.drive(server, events, "the server's control stream", |peer, _| {
+        control = control.or_else(|| peer.raw.conn().streams().accept(Dir::Uni));
+        control.is_some()
+    });
+    peer.raw.stop(u64::from(control.expect("control stream")), 0);
+}
+
+#[test]
+fn stopping_the_servers_control_stream_closes_the_connection() {
+    // Before the session is accepted.
+    let (code, reason) = {
+        let mut server = server();
+        let mut events = Vec::new();
+        let mut peer = H3Peer::connect(&mut server, &mut events);
+        peer.control(DRAFT02);
+        stop_server_control(&mut peer, &mut server, &mut events);
+        peer.closed_with(&mut server, &mut events)
+    };
+    assert_eq!(code, code::H3_CLOSED_CRITICAL_STREAM, "{reason}");
+
+    // After authentication.
+    let (mut server, mut peer, _) = established(DRAFT02);
+    let mut events = Vec::new();
+    stop_server_control(&mut peer, &mut server, &mut events);
+    let (code, reason) = peer.closed_with(&mut server, &mut events);
+    assert_eq!(code, code::H3_CLOSED_CRITICAL_STREAM, "{reason}");
 }
 
 #[test]

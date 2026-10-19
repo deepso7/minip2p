@@ -345,6 +345,22 @@ impl WtSession {
         }
     }
 
+    /// The peer stopped our side of `raw`. Our control stream is critical
+    /// (RFC 9114 §6.2.1), so stopping it fails the connection; a stopped
+    /// CONNECT stream has nothing in flight. Returns whether `raw` is one of
+    /// the session's own streams, which the connection leaves alone.
+    pub(crate) fn on_stopped(&mut self, raw: u64) -> bool {
+        if self.control.is_some_and(|control| u64::from(control) == raw) {
+            self.fail(
+                code::H3_CLOSED_CRITICAL_STREAM,
+                "the client stopped our control stream".into(),
+            );
+            return true;
+        }
+        self.on_send_done(raw);
+        self.owns(raw)
+    }
+
     /// What the connection must act on since the last call.
     pub(crate) fn take_events(&mut self) -> Vec<WtEvent> {
         std::mem::take(&mut self.events)
