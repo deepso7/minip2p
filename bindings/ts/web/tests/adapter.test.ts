@@ -7,7 +7,29 @@ import {
 } from "@minip2p/test-fixtures/fake-serde-endpoint";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import type { JsIo, WebTransportSession } from "../src/io.js";
 import { Minip2p } from "../src/sdk.js";
+
+/** Sessions {@link PendingWebTransport} closed. */
+let sessionCloses = 0;
+
+/**
+ * A browser `WebTransport` constructor whose sessions never connect: a
+ * `function`, since `new` cannot call an arrow.
+ */
+const PendingWebTransport =
+  function PendingWebTransport(): WebTransportSession {
+    const never = Promise.withResolvers<never>().promise;
+    return {
+      close: () => {
+        sessionCloses += 1;
+      },
+      closed: never,
+      createBidirectionalStream: async () => await never,
+      incomingBidirectionalStreams: new ReadableStream(),
+      ready: never,
+    };
+  };
 
 /** The wasm `WebEndpoint`: the serde fake plus the pump the adapter drives. */
 class FakeWebEndpoint extends FakeSerdeEndpoint {
@@ -18,9 +40,17 @@ class FakeWebEndpoint extends FakeSerdeEndpoint {
   frees = 0;
   /** Makes the next call to `method` trap like a panicking wasm module. */
   trapOn: string | undefined;
+  /** The browser I/O the Rust client would drive. */
+  readonly io: JsIo;
 
-  constructor(secretKey: Uint8Array, config: unknown, _io: unknown) {
+  constructor(secretKey: Uint8Array, config: unknown, io: JsIo) {
     super(secretKey, config);
+    this.io = io;
+  }
+
+  override close(timeoutMs: number): void {
+    this.#trap("close");
+    super.close(timeoutMs);
   }
 
   pump(): number | undefined {
@@ -73,6 +103,7 @@ const fake = (): FakeWebEndpoint => {
 describe("Web adapter", () => {
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   test("a command pumps once, then at the endpoint's next deadline", async () => {
@@ -111,6 +142,46 @@ describe("Web adapter", () => {
     expect(reports).toMatchObject([{ reason: "driverFailed" }]);
     expect(() => endpoint.connectedPeers()).toThrow(ClosedError);
     expect(native.closeTimeouts).toEqual([]);
+  });
+
+  test("a trap closes the browser sessions the wasm endpoint can no longer close", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebTransport", PendingWebTransport);
+    sessionCloses = 0;
+    const endpoint = create();
+    const native = fake();
+    // What a pending Rust dial leaves open in the browser.
+    native.io.connect("https://192.0.2.1:4001/", []);
+    native.trapOn = "ping";
+
+    expect(() => endpoint.ping("12D3KooWPeer")).toThrow(DriverFailedError);
+    await expect(endpoint.close()).resolves.toMatchObject({
+      outcome: "Failed",
+    });
+
+    expect(sessionCloses).toBe(1);
+    expect(native.io.pollEvent()).toBeUndefined();
+    expect(() => native.io.connect("https://192.0.2.1:4001/", [])).toThrow();
+  });
+
+  test("a trap in close itself still settles close, releases and notifies observers", async () => {
+    vi.useFakeTimers();
+    const endpoint = create();
+    const native = fake();
+    const reports: unknown[] = [];
+    endpoint.onClose((report) => reports.push(report));
+    native.pumpDelays = [30];
+    native.trapOn = "close";
+
+    await expect(endpoint.close()).resolves.toMatchObject({
+      outcome: "Failed",
+      reason: "close",
+    });
+    expect(reports).toMatchObject([{ outcome: "Failed", reason: "close" }]);
+    // The pump stopped with the release.
+    const { pumps } = native;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(native.pumps).toBe(pumps);
   });
 
   test("a trap while pumping fails the endpoint", async () => {

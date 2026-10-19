@@ -65,7 +65,8 @@ export class NativeCloseLatch {
 
   /**
    * Runs `stop` on the first call, then resolves once native closed and
-   * `release`, if any, ran. Later calls return the same promise.
+   * `release`, if any, ran; a `stop` that throws resolves `Failed`. Later
+   * calls return the same promise, which never rejects.
    */
   close(
     started: boolean,
@@ -81,11 +82,18 @@ export class NativeCloseLatch {
     stop: () => void,
     release: (() => void) | undefined
   ): Promise<BackendClosed> {
-    stop();
-    // Without a driver, native released the endpoint at once.
-    const closed = started
-      ? await this.#closed
-      : { outcome: CloseOutcome.Drained, unfinished: [] };
+    let closed: BackendClosed;
+    try {
+      stop();
+      // Without a driver, native released the endpoint at once.
+      closed = started
+        ? await this.#closed
+        : { outcome: CloseOutcome.Drained, unfinished: [] };
+    } catch {
+      // Native failed to stop (a trap): no `EndpointClosed` will come, but
+      // close still never rejects and still releases.
+      closed = { outcome: CloseOutcome.Failed, unfinished: [] };
+    }
     try {
       release?.();
     } catch {

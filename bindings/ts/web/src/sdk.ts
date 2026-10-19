@@ -187,8 +187,11 @@ class WasmCalls {
 
 function webBackend(config: Minip2pConfig): Minip2pBackend {
   const module = wasm();
+  // A trapped instance can neither close its sessions nor be freed: close
+  // them from TypeScript.
   const calls = new WasmCalls((detail) => {
     pump.stop();
+    io.dispose();
     backend.fail(detail);
   });
   const pump = new Pump(() => calls.call(() => endpoint.pump()));
