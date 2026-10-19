@@ -887,13 +887,19 @@ fn pre_auth_caps_close_with_their_codes() {
             code::H3_EXCESSIVE_LOAD,
         ),
         (
-            "2 KiB of static references expanding past 8 KiB",
+            "a field section past 8 KiB in 64 fields",
             |peer| {
                 peer.control(DRAFT02);
-                let mut block = vec![0x00, 0x00];
-                // Static index 50, a 77-byte content-security-policy.
-                block.resize(2 * 1024, 0xf2);
-                peer.request_block(&block);
+                // 63 static references (108 bytes each as counted) and a
+                // 2 KiB `:path`.
+                let csp: (&[u8], &[u8]) = (
+                    b"content-security-policy",
+                    b"script-src 'none'; object-src 'none'; base-uri 'none'",
+                );
+                let path = vec![b'/'; 2 * 1024];
+                let mut fields = vec![csp; 63];
+                fields.push((b":path", &path));
+                peer.request(&fields);
             },
             code::QPACK_DECOMPRESSION_FAILED,
         ),
