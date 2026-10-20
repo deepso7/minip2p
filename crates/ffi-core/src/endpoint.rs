@@ -13,20 +13,17 @@ use minip2p::{
     PeerDiscoveryConfig, PeerId, QuicBindError, StreamId, TransportError, WaitHandle,
 };
 
+use crate::limits::{Bound, resolve_limits};
 use crate::{
     ConfigCapability, DriverStats, EndpointConfig, EventCarry, EventDoorbell, FfiError,
     IdentifyInfo, KnownPeerInfo, P2pEvent, RelayReservationInfo, keypair_from_bytes,
     map_driver_error, map_gossipsub_error, parse_direct_peer_addr, parse_peer_id,
 };
 
-/// Adds address-shaped listeners, or the QUIC dual-stack defaults when
-/// `listen` is absent. Transport is inferred from each address's shape.
-fn configure_listen(
-    builder: EndpointBuilder,
-    listen: Option<Vec<String>>,
-) -> Result<EndpointBuilder, FfiError> {
+/// Parses the listen addresses; `None` keeps the QUIC dual-stack defaults.
+fn parse_listen(listen: Option<Vec<String>>) -> Result<Option<Vec<Multiaddr>>, FfiError> {
     let Some(addresses) = listen else {
-        return builder.listen_default().map_err(map_options_error);
+        return Ok(None);
     };
     if addresses.is_empty() {
         return Err(FfiError::InvalidConfig {
@@ -34,12 +31,45 @@ fn configure_listen(
             detail: "listen cannot be empty; omit listen for the QUIC dual-stack defaults, or pass complete multiaddresses".into(),
         });
     }
+    addresses
+        .iter()
+        .map(|address| {
+            Multiaddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
+                detail: format!("invalid listen address `{address}`: {error}"),
+            })
+        })
+        .collect::<Result<_, _>>()
+        .map(Some)
+}
+
+/// The transports `listen` binds, classified the way the endpoint does.
+fn bound_transports(listen: Option<&[Multiaddr]>) -> Bound {
+    listen.map_or(
+        Bound {
+            quic: true,
+            tcp: false,
+        },
+        |addresses| Bound {
+            quic: addresses
+                .iter()
+                .any(|address| address.is_quic_transport() || address.is_webtransport()),
+            tcp: addresses.iter().any(Multiaddr::is_tcp_transport),
+        },
+    )
+}
+
+/// Adds address-shaped listeners, or the QUIC dual-stack defaults when
+/// `listen` is absent. Transport is inferred from each address's shape.
+fn configure_listen(
+    builder: EndpointBuilder,
+    listen: Option<Vec<Multiaddr>>,
+) -> Result<EndpointBuilder, FfiError> {
+    let Some(addresses) = listen else {
+        return builder.listen_default().map_err(map_options_error);
+    };
     addresses.iter().try_fold(builder, |builder, address| {
-        let parsed = Multiaddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
-            detail: format!("invalid listen address `{address}`: {error}"),
-        })?;
         builder
-            .listen_on_multiaddr(&parsed)
+            .listen_on_multiaddr(address)
             .map_err(map_options_error)
     })
 }
@@ -181,7 +211,8 @@ impl P2pEndpoint {
             });
         }
 
-        let limits = crate::limits::resolve_limits(config.limits)?;
+        let listen = parse_listen(config.listen)?;
+        let limits = resolve_limits(config.limits, bound_transports(listen.as_deref()))?;
 
         let gossipsub = GossipsubConfig {
             allow_unsigned: config.allow_unsigned,
@@ -259,7 +290,7 @@ impl P2pEndpoint {
             }
         }
 
-        builder = configure_listen(builder, config.listen)?;
+        builder = configure_listen(builder, listen)?;
         let mut endpoint = builder.bind().map_err(map_bind_error)?;
         let listen_addrs = endpoint
             .listen_all()

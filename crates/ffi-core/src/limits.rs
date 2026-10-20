@@ -16,10 +16,21 @@ pub(crate) struct Limits {
     pub(crate) max_circuits: usize,
 }
 
+/// The listen transports an endpoint binds; the circuit transport always is.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Bound {
+    pub(crate) quic: bool,
+    pub(crate) tcp: bool,
+}
+
 /// Overlays `options` on the native defaults. Values are not validated here:
 /// the endpoint does that for the transports it binds. A value too large for
-/// this platform's `usize` is rejected, never truncated.
-pub(crate) fn resolve_limits(options: Option<LimitsOptions>) -> Result<Limits, FfiError> {
+/// this platform's `usize` is rejected, never truncated. Limits of a transport
+/// `bound` excludes are skipped, so they cannot fail construction either.
+pub(crate) fn resolve_limits(
+    options: Option<LimitsOptions>,
+    bound: Bound,
+) -> Result<Limits, FfiError> {
     let options = options.unwrap_or_default();
     let mut limits = Limits {
         quic: QuicLimits::default(),
@@ -27,10 +38,10 @@ pub(crate) fn resolve_limits(options: Option<LimitsOptions>) -> Result<Limits, F
         circuit: CircuitLimits::default(),
         max_circuits: NatConfig::default().max_circuits,
     };
-    if let Some(quic) = options.quic {
+    if let Some(quic) = options.quic.filter(|_| bound.quic) {
         apply_quic(&mut limits.quic, quic)?;
     }
-    if let Some(tcp) = options.tcp {
+    if let Some(tcp) = options.tcp.filter(|_| bound.tcp) {
         apply_tcp(&mut limits.tcp, tcp)?;
     }
     if let Some(circuit) = options.circuit {
@@ -204,6 +215,11 @@ fn checked<T: TryFrom<u64>>(value: u64, field: &str) -> Result<T, FfiError> {
 mod tests {
     use super::*;
 
+    const ALL: Bound = Bound {
+        quic: true,
+        tcp: true,
+    };
+
     fn assert_defaults(limits: &Limits) {
         assert_eq!(
             format!("{:?}", limits.quic),
@@ -229,19 +245,22 @@ mod tests {
                 max_circuits: None,
             }),
         ] {
-            assert_defaults(&resolve_limits(options).expect("limits"));
+            assert_defaults(&resolve_limits(options, ALL).expect("limits"));
         }
     }
 
     #[test]
     fn a_partial_override_changes_only_its_field() {
-        let limits = resolve_limits(Some(LimitsOptions {
-            quic: Some(QuicLimitsOptions {
-                stream_receive_window: Some(4_000_000),
-                ..QuicLimitsOptions::default()
+        let limits = resolve_limits(
+            Some(LimitsOptions {
+                quic: Some(QuicLimitsOptions {
+                    stream_receive_window: Some(4_000_000),
+                    ..QuicLimitsOptions::default()
+                }),
+                ..LimitsOptions::default()
             }),
-            ..LimitsOptions::default()
-        }))
+            ALL,
+        )
         .expect("limits");
 
         let expected = QuicLimits {
@@ -255,18 +274,21 @@ mod tests {
     #[test]
     fn unlimited_windows_and_never_timeouts_map_to_the_native_forms() {
         let resolve = |window, timeout| {
-            resolve_limits(Some(LimitsOptions {
-                quic: Some(QuicLimitsOptions {
-                    connection_receive_window: Some(window),
-                    ..QuicLimitsOptions::default()
+            resolve_limits(
+                Some(LimitsOptions {
+                    quic: Some(QuicLimitsOptions {
+                        connection_receive_window: Some(window),
+                        ..QuicLimitsOptions::default()
+                    }),
+                    tcp: Some(TcpLimitsOptions {
+                        handshake_timeout_ms: Some(timeout),
+                        send_stall_timeout_ms: Some(timeout),
+                        ..TcpLimitsOptions::default()
+                    }),
+                    ..LimitsOptions::default()
                 }),
-                tcp: Some(TcpLimitsOptions {
-                    handshake_timeout_ms: Some(timeout),
-                    send_stall_timeout_ms: Some(timeout),
-                    ..TcpLimitsOptions::default()
-                }),
-                ..LimitsOptions::default()
-            }))
+                ALL,
+            )
             .expect("limits")
         };
 
@@ -290,22 +312,28 @@ mod tests {
             receive_window: Some(receive_window),
             ..YamuxOptions::default()
         };
-        let tcp_only = resolve_limits(Some(LimitsOptions {
-            tcp: Some(TcpLimitsOptions {
-                yamux: Some(window(1 << 20)),
-                ..TcpLimitsOptions::default()
+        let tcp_only = resolve_limits(
+            Some(LimitsOptions {
+                tcp: Some(TcpLimitsOptions {
+                    yamux: Some(window(1 << 20)),
+                    ..TcpLimitsOptions::default()
+                }),
+                ..LimitsOptions::default()
             }),
-            ..LimitsOptions::default()
-        }))
+            ALL,
+        )
         .expect("limits");
         assert_eq!(tcp_only.tcp.yamux.receive_window, 1 << 20);
         assert_eq!(tcp_only.circuit, CircuitLimits::default());
 
-        let circuit_only = resolve_limits(Some(LimitsOptions {
-            circuit: Some(window(2 << 20)),
-            max_circuits: Some(8),
-            ..LimitsOptions::default()
-        }))
+        let circuit_only = resolve_limits(
+            Some(LimitsOptions {
+                circuit: Some(window(2 << 20)),
+                max_circuits: Some(8),
+                ..LimitsOptions::default()
+            }),
+            ALL,
+        )
         .expect("limits");
         assert_eq!(circuit_only.circuit.yamux.receive_window, 2 << 20);
         assert_eq!(circuit_only.max_circuits, 8);
@@ -328,6 +356,30 @@ mod tests {
         assert_eq!(
             checked::<u32>(u64::from(u32::MAX), "f").ok(),
             Some(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn limits_of_an_unbound_transport_are_not_converted() {
+        // An overflow would surface here on a 32-bit platform; the skipped
+        // record never reaches the conversion.
+        let tcp_only = resolve_limits(
+            Some(LimitsOptions {
+                quic: Some(QuicLimitsOptions {
+                    send_window: Some(u64::MAX),
+                    ..QuicLimitsOptions::default()
+                }),
+                ..LimitsOptions::default()
+            }),
+            Bound {
+                quic: false,
+                tcp: true,
+            },
+        )
+        .expect("limits");
+        assert_eq!(
+            format!("{:?}", tcp_only.quic),
+            format!("{:?}", QuicLimits::default())
         );
     }
 }
