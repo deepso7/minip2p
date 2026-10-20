@@ -50,6 +50,8 @@ Use `endpoint.on("stream", handler)` to claim inbound streams. Operations accept
 ```ts
 const endpoint = Minip2p.create({
   secretKey,
+  // TCP limits apply only when a TCP listen address binds TCP.
+  listen: ["/ip4/0.0.0.0/udp/0/quic-v1", "/ip4/0.0.0.0/tcp/0"],
   limits: {
     quic: {
       streamReceiveWindow: 4_000_000,
