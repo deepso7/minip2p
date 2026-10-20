@@ -48,6 +48,152 @@ pub struct MdnsOptions {
     pub auto_dial: bool,
 }
 
+/// Transport limit overrides.
+///
+/// Every field is optional: an absent record or field keeps the native
+/// default, so an omitted record and an empty one behave identically. Limits
+/// for a transport the endpoint does not bind (TCP without a `/tcp` listen
+/// address, say) are ignored, not validated. An invalid limit fails
+/// construction with `InvalidConfig { capability: Transport }`.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct LimitsOptions {
+    /// QUIC (and WebTransport) transport limits.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub quic: Option<QuicLimitsOptions>,
+    /// TCP transport limits, including its connections' Yamux limits.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub tcp: Option<TcpLimitsOptions>,
+    /// Relay circuits' Yamux limits; independent of [`TcpLimitsOptions::yamux`].
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub circuit: Option<YamuxOptions>,
+    /// Most relayed circuits held at once (`NatConfig::max_circuits`): past
+    /// it inbound circuits are refused and relay legs fail.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_circuits: Option<u64>,
+}
+
+/// QUIC overrides; each field mirrors `minip2p::QuicLimits`.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct QuicLimitsOptions {
+    /// Simultaneous connections, inbound and outbound.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_connections: Option<u64>,
+    /// Locally initiated bidirectional streams per connection.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_streams_per_connection: Option<u64>,
+    /// Bytes queued per stream beyond what the engine accepts; non-zero.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_pending_bytes_per_stream: Option<u64>,
+    /// Bytes queued per connection beyond what the engine accepts; greater
+    /// than `control_stream_reserve_bytes`.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_pending_connection_bytes: Option<u64>,
+    /// Part of the connection queue only control streams may fill.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub control_stream_reserve_bytes: Option<u64>,
+    /// UDP datagrams retained while the socket would block; non-zero.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_pending_datagrams: Option<u64>,
+    /// Idle timeout advertised to peers, in milliseconds; non-zero.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub idle_timeout_ms: Option<u64>,
+    /// Whether inbound connections need a stateless Retry first.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub require_address_validation: Option<bool>,
+    /// Per-stream receive window in bytes; non-zero.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub stream_receive_window: Option<u64>,
+    /// Per-connection receive window (unlimited by default).
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub connection_receive_window: Option<WindowLimit>,
+    /// Bytes buffered per connection for sending; non-zero.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub send_window: Option<u64>,
+    /// Time an `h3` connection has to complete Noise, in milliseconds;
+    /// non-zero.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub webtransport_handshake_timeout_ms: Option<u64>,
+}
+
+/// TCP overrides; each field mirrors `minip2p::TcpConfig` (its connection-id
+/// namespace stays internal).
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct TcpLimitsOptions {
+    /// Connections held at once, dialed and accepted alike.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_connections: Option<u64>,
+    /// How long a connection may take to authenticate.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub handshake_timeout_ms: Option<TimeoutLimit>,
+    /// Encrypted bytes one connection holds for its socket.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_buffered_send: Option<u64>,
+    /// How long a connection may hold bytes its socket refuses.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub send_stall_timeout_ms: Option<TimeoutLimit>,
+    /// Each TCP connection's Yamux limits; independent of
+    /// [`LimitsOptions::circuit`].
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub yamux: Option<YamuxOptions>,
+}
+
+/// Yamux overrides; each field mirrors `minip2p::YamuxConfig`.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct YamuxOptions {
+    /// Per-stream receive window in bytes; at least 256 KiB.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub receive_window: Option<u32>,
+    /// Largest data-frame payload sent; non-zero.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_frame_len: Option<u32>,
+    /// Streams tracked at once, counting unsettled closed ones.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_streams: Option<u64>,
+    /// Per-stream cap on accepted, unpulled send bytes; non-zero.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_buffered_send: Option<u64>,
+    /// Session-wide cap on accepted, unpulled send bytes; greater than
+    /// `control_stream_reserve`.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_total_buffered_send: Option<u64>,
+    /// Part of the session-wide cap only control streams may fill.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub control_stream_reserve: Option<u64>,
+    /// Control frames that may wait to be pulled.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub max_pending_control: Option<u64>,
+}
+
+/// A receive window that may be unbounded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum WindowLimit {
+    /// At most `bytes`.
+    Bounded {
+        /// Window size in bytes.
+        bytes: u64,
+    },
+    /// No window.
+    Unlimited,
+}
+
+/// A timeout that may be disabled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum TimeoutLimit {
+    /// Fires after `ms` milliseconds.
+    AfterMs {
+        /// Timeout in milliseconds.
+        ms: u64,
+    },
+    /// Waits indefinitely.
+    Never,
+}
+
 /// Configuration used to construct an FFI endpoint.
 #[derive(Clone)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
@@ -74,6 +220,8 @@ pub struct EndpointConfig {
     pub discovery: Option<DiscoveryOptions>,
     /// Local-link mDNS settings, or no mDNS discovery when absent.
     pub mdns: Option<MdnsOptions>,
+    /// Transport limit overrides, or every native default when absent.
+    pub limits: Option<LimitsOptions>,
 }
 
 /// One peer in the shared discovery address book.
@@ -132,6 +280,7 @@ impl fmt::Debug for EndpointConfig {
             .field("protocols", &self.protocols)
             .field("discovery", &self.discovery)
             .field("mdns", &self.mdns)
+            .field("limits", &self.limits)
             .finish()
     }
 }

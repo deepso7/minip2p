@@ -64,6 +64,10 @@ pub use minip2p_pubsub::{
     GOSSIPSUB_PROTOCOL_IDS, GossipsubConfig, GossipsubConfigError, GossipsubEvent, PublishError,
     TopicError,
 };
+/// Yamux limits, set per connection through `TcpConfig::yamux` and
+/// `CircuitLimits::yamux`.
+#[cfg(any(feature = "tcp", feature = "_circuit-driver"))]
+pub use minip2p_secure_mux::YamuxConfig;
 use minip2p_swarm::SwarmBuilder;
 #[cfg(feature = "smoltcp")]
 pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};

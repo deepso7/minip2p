@@ -1352,6 +1352,7 @@ dependencies = [
  "minip2p-quic",
  "minip2p-relay",
  "minip2p-relay-server",
+ "minip2p-secure-mux",
  "minip2p-swarm",
  "minip2p-tcp",
  "minip2p-test-support",

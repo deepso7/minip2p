@@ -28,12 +28,13 @@ std = [
   "minip2p-nat?/std",
   "minip2p-pubsub?/std",
   "minip2p-relay-server?/std",
+  "minip2p-secure-mux?/std",
   "minip2p-swarm/std",
   "minip2p-transport/std",
   "minip2p-tcp?/std",
 ]
 quic = ["std", "dep:minip2p-quic"]
-tcp = ["dep:minip2p-tcp"]
+tcp = ["dep:minip2p-tcp", "dep:minip2p-secure-mux"]
 # Adapter: TCP over a host-owned smoltcp stack, with mDNS on the same stack.
 smoltcp = [
   "tcp",
@@ -57,7 +58,7 @@ mdns = ["nat", "_mdns-driver"]
 bench = ["std", "minip2p-transport/bench", "minip2p-quic?/diagnostics"]
 # Internal aliases for capability-driver dependencies, reached only through
 # the public features above; not a supported opt-in surface.
-_circuit-driver = ["dep:minip2p-circuit"]
+_circuit-driver = ["dep:minip2p-circuit", "dep:minip2p-secure-mux"]
 _discovery-driver = ["dep:minip2p-discovery"]
 _mdns-driver = ["dep:minip2p-mdns", "_discovery-driver"]
 _nat-driver = ["dep:minip2p-nat"]
@@ -74,6 +75,7 @@ minip2p-mdns = { path = "../mdns", version = "0.10.1", default-features = false,
 minip2p-nat = { path = "../nat", version = "0.10.1", default-features = false, optional = true }
 minip2p-pubsub = { path = "../pubsub", version = "0.10.1", default-features = false, optional = true }
 minip2p-relay-server = { path = "../relay-server", version = "0.10.1", default-features = false, optional = true }
+minip2p-secure-mux = { path = "../secure-mux", version = "0.10.1", default-features = false, optional = true }
 minip2p-quic = { path = "../../transports/quic", version = "0.10.1", optional = true }
 minip2p-tcp = { path = "../../transports/tcp", version = "0.10.1", default-features = false, optional = true }
 minip2p-swarm = { path = "../swarm", version = "0.10.1", default-features = false }

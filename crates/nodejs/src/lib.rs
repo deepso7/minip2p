@@ -5,8 +5,9 @@
 use std::sync::Arc;
 
 use minip2p_ffi_core::{
-    ConnectTarget, DiscoveryOptions, EndpointConfig, EventDoorbell, FfiError, MdnsOptions,
-    P2pEndpoint,
+    ConfigCapability, ConnectTarget, DiscoveryOptions, EndpointConfig, EventDoorbell, FfiError,
+    LimitsOptions, MdnsOptions, P2pEndpoint, QuicLimitsOptions, TcpLimitsOptions, TimeoutLimit,
+    WindowLimit, YamuxOptions,
 };
 use napi::bindgen_prelude::{BigInt, Either, JsObjectValue, JsValue, Uint8Array};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -57,6 +58,82 @@ pub struct NodeMdnsOptions {
     pub auto_dial: bool,
 }
 
+/// Transport limit overrides accepted from Node.js; see `LimitsOptions`.
+#[napi(object)]
+pub struct NodeLimitsOptions {
+    /// QUIC limits.
+    pub quic: Option<NodeQuicLimitsOptions>,
+    /// TCP limits.
+    pub tcp: Option<NodeTcpLimitsOptions>,
+    /// Relay circuits' Yamux limits.
+    pub circuit: Option<NodeYamuxOptions>,
+    /// Most relayed circuits held at once.
+    pub max_circuits: Option<BigInt>,
+}
+
+/// QUIC limit overrides accepted from Node.js; see `QuicLimitsOptions`.
+#[napi(object)]
+pub struct NodeQuicLimitsOptions {
+    /// Simultaneous connections.
+    pub max_connections: Option<BigInt>,
+    /// Locally initiated streams per connection.
+    pub max_streams_per_connection: Option<BigInt>,
+    /// Bytes queued per stream.
+    pub max_pending_bytes_per_stream: Option<BigInt>,
+    /// Bytes queued per connection.
+    pub max_pending_connection_bytes: Option<BigInt>,
+    /// Connection queue reserved for control streams.
+    pub control_stream_reserve_bytes: Option<BigInt>,
+    /// Datagrams retained while the socket would block.
+    pub max_pending_datagrams: Option<BigInt>,
+    /// Idle timeout in milliseconds.
+    pub idle_timeout_ms: Option<BigInt>,
+    /// Whether inbound connections need a Retry first.
+    pub require_address_validation: Option<bool>,
+    /// Per-stream receive window.
+    pub stream_receive_window: Option<BigInt>,
+    /// Per-connection receive window, or `"unlimited"`.
+    pub connection_receive_window: Option<Either<BigInt, String>>,
+    /// Per-connection send window.
+    pub send_window: Option<BigInt>,
+    /// WebTransport handshake timeout in milliseconds.
+    pub webtransport_handshake_timeout_ms: Option<BigInt>,
+}
+
+/// TCP limit overrides accepted from Node.js; see `TcpLimitsOptions`.
+#[napi(object)]
+pub struct NodeTcpLimitsOptions {
+    /// Connections held at once.
+    pub max_connections: Option<BigInt>,
+    /// Authentication timeout in milliseconds, or `"never"`.
+    pub handshake_timeout_ms: Option<Either<BigInt, String>>,
+    /// Encrypted bytes held per connection.
+    pub max_buffered_send: Option<BigInt>,
+    /// Send-stall timeout in milliseconds, or `"never"`.
+    pub send_stall_timeout_ms: Option<Either<BigInt, String>>,
+    /// Each connection's Yamux limits.
+    pub yamux: Option<NodeYamuxOptions>,
+}
+
+/// Yamux limit overrides accepted from Node.js; see `YamuxOptions`.
+#[napi(object)]
+pub struct NodeYamuxOptions {
+    /// Per-stream receive window.
+    pub receive_window: Option<u32>,
+    /// Largest data-frame payload sent.
+    pub max_frame_len: Option<u32>,
+    /// Streams tracked at once.
+    pub max_streams: Option<BigInt>,
+    /// Per-stream send cap.
+    pub max_buffered_send: Option<BigInt>,
+    /// Session-wide send cap.
+    pub max_total_buffered_send: Option<BigInt>,
+    /// Session-wide send cap reserved for control streams.
+    pub control_stream_reserve: Option<BigInt>,
+    /// Control frames that may wait to be pulled.
+    pub max_pending_control: Option<BigInt>,
+}
+
 /// Endpoint configuration accepted from Node.js.
 #[napi(object)]
 pub struct NodeEndpointConfig {
@@ -78,6 +155,8 @@ pub struct NodeEndpointConfig {
     pub discovery: Option<NodeDiscoveryOptions>,
     /// mDNS configuration.
     pub mdns: Option<NodeMdnsOptions>,
+    /// Transport limit overrides.
+    pub limits: Option<NodeLimitsOptions>,
 }
 
 impl TryFrom<NodeEndpointConfig> for EndpointConfig {
@@ -94,6 +173,8 @@ impl TryFrom<NodeEndpointConfig> for EndpointConfig {
             protocols: config.protocols,
             discovery: config.discovery.map(convert_discovery).transpose()?,
             mdns: config.mdns.map(convert_mdns).transpose()?,
+            // Converted by the constructor, which tags limit errors.
+            limits: None,
         })
     }
 }
@@ -119,6 +200,159 @@ fn convert_mdns(options: NodeMdnsOptions) -> Result<MdnsOptions> {
     })
 }
 
+fn convert_limits(options: NodeLimitsOptions) -> core::result::Result<LimitsOptions, FfiError> {
+    Ok(LimitsOptions {
+        quic: options.quic.map(convert_quic_limits).transpose()?,
+        tcp: options.tcp.map(convert_tcp_limits).transpose()?,
+        circuit: options
+            .circuit
+            .map(|circuit| convert_yamux(circuit, "limits.circuit"))
+            .transpose()?,
+        max_circuits: limit_u64(options.max_circuits, "limits.maxCircuits")?,
+    })
+}
+
+fn convert_quic_limits(
+    options: NodeQuicLimitsOptions,
+) -> core::result::Result<QuicLimitsOptions, FfiError> {
+    Ok(QuicLimitsOptions {
+        max_connections: limit_u64(options.max_connections, "limits.quic.maxConnections")?,
+        max_streams_per_connection: limit_u64(
+            options.max_streams_per_connection,
+            "limits.quic.maxStreamsPerConnection",
+        )?,
+        max_pending_bytes_per_stream: limit_u64(
+            options.max_pending_bytes_per_stream,
+            "limits.quic.maxPendingBytesPerStream",
+        )?,
+        max_pending_connection_bytes: limit_u64(
+            options.max_pending_connection_bytes,
+            "limits.quic.maxPendingConnectionBytes",
+        )?,
+        control_stream_reserve_bytes: limit_u64(
+            options.control_stream_reserve_bytes,
+            "limits.quic.controlStreamReserveBytes",
+        )?,
+        max_pending_datagrams: limit_u64(
+            options.max_pending_datagrams,
+            "limits.quic.maxPendingDatagrams",
+        )?,
+        idle_timeout_ms: limit_u64(options.idle_timeout_ms, "limits.quic.idleTimeoutMs")?,
+        require_address_validation: options.require_address_validation,
+        stream_receive_window: limit_u64(
+            options.stream_receive_window,
+            "limits.quic.streamReceiveWindow",
+        )?,
+        connection_receive_window: options
+            .connection_receive_window
+            .map(|window| convert_window(window, "limits.quic.connectionReceiveWindow"))
+            .transpose()?,
+        send_window: limit_u64(options.send_window, "limits.quic.sendWindow")?,
+        webtransport_handshake_timeout_ms: limit_u64(
+            options.webtransport_handshake_timeout_ms,
+            "limits.quic.webtransportHandshakeTimeoutMs",
+        )?,
+    })
+}
+
+fn convert_tcp_limits(
+    options: NodeTcpLimitsOptions,
+) -> core::result::Result<TcpLimitsOptions, FfiError> {
+    Ok(TcpLimitsOptions {
+        max_connections: limit_u64(options.max_connections, "limits.tcp.maxConnections")?,
+        handshake_timeout_ms: options
+            .handshake_timeout_ms
+            .map(|timeout| convert_timeout(timeout, "limits.tcp.handshakeTimeoutMs"))
+            .transpose()?,
+        max_buffered_send: limit_u64(options.max_buffered_send, "limits.tcp.maxBufferedSend")?,
+        send_stall_timeout_ms: options
+            .send_stall_timeout_ms
+            .map(|timeout| convert_timeout(timeout, "limits.tcp.sendStallTimeoutMs"))
+            .transpose()?,
+        yamux: options
+            .yamux
+            .map(|yamux| convert_yamux(yamux, "limits.tcp.yamux"))
+            .transpose()?,
+    })
+}
+
+/// Converts Yamux options; `path` prefixes the field an error names.
+fn convert_yamux(
+    options: NodeYamuxOptions,
+    path: &str,
+) -> core::result::Result<YamuxOptions, FfiError> {
+    let name = |field: &str| format!("{path}.{field}");
+    Ok(YamuxOptions {
+        receive_window: options.receive_window,
+        max_frame_len: options.max_frame_len,
+        max_streams: limit_u64(options.max_streams, &name("maxStreams"))?,
+        max_buffered_send: limit_u64(options.max_buffered_send, &name("maxBufferedSend"))?,
+        max_total_buffered_send: limit_u64(
+            options.max_total_buffered_send,
+            &name("maxTotalBufferedSend"),
+        )?,
+        control_stream_reserve: limit_u64(
+            options.control_stream_reserve,
+            &name("controlStreamReserve"),
+        )?,
+        max_pending_control: limit_u64(options.max_pending_control, &name("maxPendingControl"))?,
+    })
+}
+
+/// A window in bytes, or the literal `"unlimited"`.
+fn convert_window(
+    window: Either<BigInt, String>,
+    name: &str,
+) -> core::result::Result<WindowLimit, FfiError> {
+    Ok(match u64_or_literal(window, "unlimited", name)? {
+        Some(bytes) => WindowLimit::Bounded { bytes },
+        None => WindowLimit::Unlimited,
+    })
+}
+
+/// A timeout in milliseconds, or the literal `"never"`.
+fn convert_timeout(
+    timeout: Either<BigInt, String>,
+    name: &str,
+) -> core::result::Result<TimeoutLimit, FfiError> {
+    Ok(match u64_or_literal(timeout, "never", name)? {
+        Some(ms) => TimeoutLimit::AfterMs { ms },
+        None => TimeoutLimit::Never,
+    })
+}
+
+/// A `u64`, or `None` for `literal`; any other string is an error.
+fn u64_or_literal(
+    value: Either<BigInt, String>,
+    literal: &str,
+    name: &str,
+) -> core::result::Result<Option<u64>, FfiError> {
+    match value {
+        Either::A(value) => limit_bigint(value, name).map(Some),
+        Either::B(word) if word == literal => Ok(None),
+        Either::B(_) => Err(invalid_limit(format!(
+            "{name} must be an unsigned 64-bit integer or \"{literal}\""
+        ))),
+    }
+}
+
+/// A limit's `u64`, or a Transport `InvalidConfig` naming it.
+fn limit_bigint(value: BigInt, name: &str) -> core::result::Result<u64, FfiError> {
+    bigint_u64(value, name).map_err(|error| invalid_limit(error.reason))
+}
+
+fn limit_u64(value: Option<BigInt>, name: &str) -> core::result::Result<Option<u64>, FfiError> {
+    value.map(|value| limit_bigint(value, name)).transpose()
+}
+
+/// A limit the shell cannot convert: a Transport configuration mistake.
+fn invalid_limit(detail: String) -> FfiError {
+    FfiError::InvalidConfig {
+        capability: ConfigCapability::Transport,
+        detail,
+    }
+}
+
 /// A native minip2p endpoint owned by Node.js.
 #[napi]
 pub struct NodeEndpoint(Arc<P2pEndpoint>);
@@ -131,7 +365,10 @@ impl NodeEndpoint {
         if config.agent_version.is_none() {
             config.agent_version = Some(format!("minip2p-node/{}", env!("CARGO_PKG_VERSION")));
         }
-        P2pEndpoint::new(secret_key.to_vec(), config.try_into()?)
+        let limits = config.limits.take().map(convert_limits).transpose();
+        let mut core = EndpointConfig::try_from(config)?;
+        core.limits = limits.map_err(|error| native_error(&env, error))?;
+        P2pEndpoint::new(secret_key.to_vec(), core)
             .map(Self)
             .map_err(|error| native_error(&env, error))
     }

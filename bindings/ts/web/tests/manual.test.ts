@@ -45,6 +45,20 @@ test("the manual entry loads nothing at import, and initMinip2p({ wasm }) loads 
   expect(() => web.Minip2p.create({ mdns: true, secretKey })).toThrow(
     /multicast/u
   );
+  let limitsError: unknown;
+  try {
+    web.Minip2p.create({
+      limits: { quic: { streamReceiveWindow: 4_000_000 } },
+      secretKey,
+    });
+  } catch (error) {
+    limitsError = error;
+  }
+  expect(limitsError).toBeInstanceOf(web.InvalidConfigError);
+  expect(limitsError).toMatchObject({
+    capability: "Transport",
+    message: expect.stringMatching(/omit limits/u),
+  });
 });
 
 test("initMinip2p({ wasm }) takes a promised URL", async () => {

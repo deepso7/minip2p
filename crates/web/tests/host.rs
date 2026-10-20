@@ -27,6 +27,7 @@ fn config() -> EndpointConfig {
         protocols: vec!["/echo/1".into()],
         discovery: None,
         mdns: None,
+        limits: None,
     }
 }
 
@@ -64,7 +65,7 @@ fn run(
 #[test]
 fn browser_config_rejects_what_a_browser_cannot_do() {
     type Edit = fn(&mut EndpointConfig);
-    let cases: [(Edit, ConfigCapability, &str); 5] = [
+    let cases: [(Edit, ConfigCapability, &str); 6] = [
         (
             |c| c.listen = Some(vec!["/ip4/0.0.0.0/udp/0/quic-v1".into()]),
             ConfigCapability::Options,
@@ -106,6 +107,11 @@ fn browser_config_rejects_what_a_browser_cannot_do() {
             |c| c.force_relay = true,
             ConfigCapability::Options,
             "at least one relay",
+        ),
+        (
+            |c| c.limits = Some(minip2p_ffi_core::LimitsOptions::default()),
+            ConfigCapability::Transport,
+            "omit limits",
         ),
     ];
     for (edit, expected, words) in cases {

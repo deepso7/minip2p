@@ -8,7 +8,8 @@
 
 use minip2p::Now;
 use minip2p_ffi_core::{
-    ConnectTarget, DiscoveryOptions, EndpointConfig, FfiError, MdnsOptions, PUMP_DRAIN_LIMIT,
+    ConnectTarget, DiscoveryOptions, EndpointConfig, FfiError, LimitsOptions, MdnsOptions,
+    PUMP_DRAIN_LIMIT,
 };
 use minip2p_webtransport::WebTransportClient;
 use serde::{Deserialize, Serialize};
@@ -389,6 +390,8 @@ struct WebEndpointConfig {
     protocols: Vec<String>,
     discovery: Option<WebDiscoveryOptions>,
     mdns: Option<WebMdnsOptions>,
+    /// Read only to be refused: the browser build has no limits to tune.
+    limits: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -437,6 +440,7 @@ impl From<WebEndpointConfig> for EndpointConfig {
                 interface_refresh_ms: options.interface_refresh_ms,
                 auto_dial: options.auto_dial,
             }),
+            limits: config.limits.map(|_| LimitsOptions::default()),
         }
     }
 }

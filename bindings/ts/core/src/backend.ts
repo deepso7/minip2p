@@ -223,7 +223,14 @@ export interface Minip2pBackend {
   disconnect: (peerId: string) => void;
 }
 
-export { resolveEndpointConfig, type BackendEndpointConfig } from "./config.js";
+export {
+  resolveEndpointConfig,
+  type BackendEndpointConfig,
+  type BackendLimits,
+  type BackendQuicLimits,
+  type BackendTcpLimits,
+  type BackendYamuxLimits,
+} from "./config.js";
 export { EventDrain } from "./event-drain.js";
 export { ConnectionIdMap, u64ToNumber } from "./native-ids.js";
 export { SettleHandles, eventStream } from "./settle-handles.js";

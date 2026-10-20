@@ -45,6 +45,23 @@ A peer holds one connection at a time. `connectionEstablished` and `connectionCl
 
 Use `endpoint.on("stream", handler)` to claim inbound streams. Operations accept `{ timeoutMs, signal }`; the default timeout is 65 seconds and `timeoutMs: 0` disables it. Streams implement `Symbol.dispose`. `endpoint.close(timeoutMs = 500)` rejects outstanding operations at once, then resolves with an `EndpointCloseReport` (`{ reason, outcome?, unfinished }`) once native has disconnected peers and drained for up to `timeoutMs` (`0` tears down at once); `onClose` observers receive the same report then. The deadline bounds teardown time, not delivery of accepted writes. Endpoints implement `Symbol.asyncDispose` (awaits `close()`) and `Symbol.dispose` (starts it).
 
+`limits` overrides native transport limits: `quic`, `tcp` (with its own `yamux`), `circuit` (relay circuits' Yamux limits, independent of `tcp.yamux`), and `maxCircuits`. Every field is optional, and the SDK passes on only what you set, so the rest keep their native defaults. `quic.connectionReceiveWindow` takes `"unlimited"`, and `tcp.handshakeTimeoutMs` and `tcp.sendStallTimeoutMs` take `"never"`. Limits for a transport the endpoint does not bind are ignored. Native validates the rest: an invalid limit throws `InvalidConfigError` with capability `Transport`. `@minip2p/web` rejects `limits`.
+
+```ts
+const endpoint = Minip2p.create({
+  secretKey,
+  // TCP limits apply only when a TCP listen address binds TCP.
+  listen: ["/ip4/0.0.0.0/udp/0/quic-v1", "/ip4/0.0.0.0/tcp/0"],
+  limits: {
+    quic: {
+      streamReceiveWindow: 4_000_000,
+      connectionReceiveWindow: "unlimited",
+    },
+    tcp: { handshakeTimeoutMs: 10_000, yamux: { receiveWindow: 1 << 20 } },
+  },
+});
+```
+
 `create` throws `InvalidConfigError` when native rejects the configuration. Its `capability` (`Gossipsub`, `Mdns`, `Discovery`, `Transport`, or `Options`, from `ConfigCapability`) names the part to change, and `detail` carries the native diagnostic. A malformed listen address and a socket the platform refused are not config errors; they keep their native error codes.
 
 With mDNS enabled, `mdnsFailed` (`{ kind, detail }`, `kind` from `MdnsFailureKind`) reports a hard mDNS failure once per change in failure state. mDNS keeps running and retries, and `mdnsRecovered` follows once a retry succeeds; a goodbye that failed during shutdown is final.

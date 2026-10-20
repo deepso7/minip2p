@@ -186,6 +186,7 @@ fn config() -> EndpointConfig {
         protocols: vec![ECHO_PROTOCOL.into()],
         discovery: None,
         mdns: None,
+        limits: None,
     }
 }
 

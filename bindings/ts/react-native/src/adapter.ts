@@ -33,6 +33,8 @@ import type {
   BackendClosed,
   BackendConnectionInfo,
   BackendConnectTarget,
+  BackendEndpointConfig,
+  BackendLimits,
   Minip2pBackend,
   Minip2pBackendFactory,
   BackendOpenStream,
@@ -52,13 +54,17 @@ import {
   NatErrorKind as NativeNatErrorKind,
   P2pEndpoint,
   Reachability as NativeReachability,
+  TimeoutLimit,
+  WindowLimit,
   circuitAddress as nativeCircuitAddress,
   generateSecretKey as nativeGenerateSecretKey,
   peerIdFromSecretKey as nativePeerIdFromSecretKey,
 } from "./native";
 import type {
+  EndpointConfig as NativeEndpointConfig,
   IdentifyInfo as NativeIdentifyInfo,
   KnownPeerInfo as NativeKnownPeerInfo,
+  LimitsOptions as NativeLimitsOptions,
   P2pEvent as NativeP2pEvent,
   P2pEventDoorbell,
   RelayReservationInfo as NativeRelayReservationInfo,
@@ -86,7 +92,7 @@ class ReactNativeBackend implements Minip2pBackend {
         () =>
           new P2pEndpoint(
             toArrayBuffer(config.secretKey),
-            resolveEndpointConfig(config)
+            nativeEndpointConfig(resolveEndpointConfig(config))
           )
       );
     } catch (error) {
@@ -634,6 +640,54 @@ function normalizeBigInts(
     );
   }
   return value;
+}
+
+/** The resolved config with its limit literals as UniFFI enums. */
+function nativeEndpointConfig(
+  config: BackendEndpointConfig
+): NativeEndpointConfig {
+  return { ...config, limits: config.limits && nativeLimits(config.limits) };
+}
+
+function nativeLimits({
+  quic,
+  tcp,
+  ...rest
+}: BackendLimits): NativeLimitsOptions {
+  return {
+    ...rest,
+    quic: quic && {
+      ...quic,
+      connectionReceiveWindow: nativeWindow(quic.connectionReceiveWindow),
+    },
+    tcp: tcp && {
+      ...tcp,
+      handshakeTimeoutMs: nativeTimeout(tcp.handshakeTimeoutMs),
+      sendStallTimeoutMs: nativeTimeout(tcp.sendStallTimeoutMs),
+    },
+  };
+}
+
+function nativeWindow(
+  window: bigint | "unlimited" | undefined
+): WindowLimit | undefined {
+  if (window === undefined) {
+    return undefined;
+  }
+  return window === "unlimited"
+    ? WindowLimit.Unlimited.new()
+    : WindowLimit.Bounded.new({ bytes: window });
+}
+
+function nativeTimeout(
+  timeout: bigint | "never" | undefined
+): TimeoutLimit | undefined {
+  if (timeout === undefined) {
+    return undefined;
+  }
+  return timeout === "never"
+    ? TimeoutLimit.Never.new()
+    : TimeoutLimit.AfterMs.new({ ms: timeout });
 }
 
 /**

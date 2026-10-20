@@ -34,11 +34,14 @@ mod error;
 mod events;
 #[cfg(feature = "serde")]
 mod js_shape;
+#[cfg(feature = "driver")]
+mod limits;
 mod writes;
 
 pub use carry::{DriverStats, EventCarry, PUMP_DRAIN_LIMIT};
 pub use config::{
-    DiscoveryOptions, EndpointConfig, KnownPeerInfo, MdnsOptions, RelayReservationInfo,
+    DiscoveryOptions, EndpointConfig, KnownPeerInfo, LimitsOptions, MdnsOptions, QuicLimitsOptions,
+    RelayReservationInfo, TcpLimitsOptions, TimeoutLimit, WindowLimit, YamuxOptions,
 };
 pub use connect::{ConnectTarget, parse_connect_target};
 #[cfg(feature = "driver")]

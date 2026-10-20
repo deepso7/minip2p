@@ -36,6 +36,83 @@ export interface Minip2pMdnsOptions {
   readonly autoDial?: boolean;
 }
 
+/**
+ * Transport limit overrides. Every field is optional and an omitted one keeps
+ * the native default. Limits for a transport the endpoint does not bind are
+ * ignored; an invalid limit makes `create` throw `InvalidConfigError` with
+ * capability `Transport`. Not available in `@minip2p/web`.
+ */
+export interface Minip2pLimits {
+  /** QUIC (and WebTransport) limits. */
+  readonly quic?: Minip2pQuicLimits;
+  /** TCP limits, including each connection's Yamux limits. */
+  readonly tcp?: Minip2pTcpLimits;
+  /** Relay circuits' Yamux limits; independent of `tcp.yamux`. */
+  readonly circuit?: Minip2pYamuxLimits;
+  /** Most relayed circuits held at once. */
+  readonly maxCircuits?: number;
+}
+
+/** QUIC limit overrides, mirroring the native `QuicLimits`. */
+export interface Minip2pQuicLimits {
+  /** Simultaneous connections, inbound and outbound. */
+  readonly maxConnections?: number;
+  /** Locally initiated bidirectional streams per connection. */
+  readonly maxStreamsPerConnection?: number;
+  /** Bytes queued per stream beyond what the engine accepts; non-zero. */
+  readonly maxPendingBytesPerStream?: number;
+  /** Bytes queued per connection; greater than `controlStreamReserveBytes`. */
+  readonly maxPendingConnectionBytes?: number;
+  /** Part of the connection queue only control streams may fill. */
+  readonly controlStreamReserveBytes?: number;
+  /** UDP datagrams retained while the socket would block; non-zero. */
+  readonly maxPendingDatagrams?: number;
+  /** Idle timeout advertised to peers, in milliseconds; non-zero. */
+  readonly idleTimeoutMs?: number;
+  /** Whether inbound connections need a stateless Retry first. */
+  readonly requireAddressValidation?: boolean;
+  /** Per-stream receive window in bytes; non-zero. */
+  readonly streamReceiveWindow?: number;
+  /** Per-connection receive window in bytes (unlimited by default). */
+  readonly connectionReceiveWindow?: number | "unlimited";
+  /** Bytes buffered per connection for sending; non-zero. */
+  readonly sendWindow?: number;
+  /** Time a WebTransport client has to complete Noise, in milliseconds. */
+  readonly webtransportHandshakeTimeoutMs?: number;
+}
+
+/** TCP limit overrides, mirroring the native `TcpConfig`. */
+export interface Minip2pTcpLimits {
+  /** Connections held at once, dialed and accepted alike. */
+  readonly maxConnections?: number;
+  /** How long a connection may take to authenticate, in milliseconds. */
+  readonly handshakeTimeoutMs?: number | "never";
+  /** Encrypted bytes one connection holds for its socket. */
+  readonly maxBufferedSend?: number;
+  /** How long a connection may hold bytes its socket refuses, in milliseconds. */
+  readonly sendStallTimeoutMs?: number | "never";
+  /** Each TCP connection's Yamux limits. */
+  readonly yamux?: Minip2pYamuxLimits;
+}
+
+/** Yamux limit overrides, mirroring the native `YamuxConfig`. */
+export interface Minip2pYamuxLimits {
+  /** Per-stream receive window in bytes; at least 256 KiB. */
+  readonly receiveWindow?: number;
+  /** Largest data-frame payload sent; non-zero. */
+  readonly maxFrameLen?: number;
+  /** Streams tracked at once, counting unsettled closed ones. */
+  readonly maxStreams?: number;
+  /** Per-stream cap on accepted, unsent bytes; non-zero. */
+  readonly maxBufferedSend?: number;
+  /** Session-wide cap on accepted, unsent bytes; greater than `controlStreamReserve`. */
+  readonly maxTotalBufferedSend?: number;
+  /** Part of the session-wide cap only control streams may fill. */
+  readonly controlStreamReserve?: number;
+  /** Control frames that may wait to be sent. */
+  readonly maxPendingControl?: number;
+}
+
 /** Coarse local reachability states. */
 export const Reachability = {
   Private: "Private",
@@ -151,6 +228,8 @@ export interface Minip2pConfig {
   readonly discovery?: Minip2pDiscoveryOptions;
   /** Enables mDNS with defaults or explicit options. */
   readonly mdns?: boolean | Minip2pMdnsOptions;
+  /** Transport limit overrides; omit for the native defaults. */
+  readonly limits?: Minip2pLimits;
 }
 
 /** Latest Identify information advertised by a remote peer. */

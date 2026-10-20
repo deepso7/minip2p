@@ -137,6 +137,20 @@ export interface NodeEndpointConfig {
   discovery?: NodeDiscoveryOptions
   /** mDNS configuration. */
   mdns?: NodeMdnsOptions
+  /** Transport limit overrides. */
+  limits?: NodeLimitsOptions
+}
+
+/** Transport limit overrides accepted from Node.js; see `LimitsOptions`. */
+export interface NodeLimitsOptions {
+  /** QUIC limits. */
+  quic?: NodeQuicLimitsOptions
+  /** TCP limits. */
+  tcp?: NodeTcpLimitsOptions
+  /** Relay circuits' Yamux limits. */
+  circuit?: NodeYamuxOptions
+  /** Most relayed circuits held at once. */
+  maxCircuits?: bigint
 }
 
 /** mDNS configuration accepted from Node.js. */
@@ -155,6 +169,66 @@ export interface NodeMdnsOptions {
   interfaceRefreshMs: bigint
   /** Whether observations may trigger dials. */
   autoDial: boolean
+}
+
+/** QUIC limit overrides accepted from Node.js; see `QuicLimitsOptions`. */
+export interface NodeQuicLimitsOptions {
+  /** Simultaneous connections. */
+  maxConnections?: bigint
+  /** Locally initiated streams per connection. */
+  maxStreamsPerConnection?: bigint
+  /** Bytes queued per stream. */
+  maxPendingBytesPerStream?: bigint
+  /** Bytes queued per connection. */
+  maxPendingConnectionBytes?: bigint
+  /** Connection queue reserved for control streams. */
+  controlStreamReserveBytes?: bigint
+  /** Datagrams retained while the socket would block. */
+  maxPendingDatagrams?: bigint
+  /** Idle timeout in milliseconds. */
+  idleTimeoutMs?: bigint
+  /** Whether inbound connections need a Retry first. */
+  requireAddressValidation?: boolean
+  /** Per-stream receive window. */
+  streamReceiveWindow?: bigint
+  /** Per-connection receive window, or `"unlimited"`. */
+  connectionReceiveWindow?: bigint | string
+  /** Per-connection send window. */
+  sendWindow?: bigint
+  /** WebTransport handshake timeout in milliseconds. */
+  webtransportHandshakeTimeoutMs?: bigint
+}
+
+/** TCP limit overrides accepted from Node.js; see `TcpLimitsOptions`. */
+export interface NodeTcpLimitsOptions {
+  /** Connections held at once. */
+  maxConnections?: bigint
+  /** Authentication timeout in milliseconds, or `"never"`. */
+  handshakeTimeoutMs?: bigint | string
+  /** Encrypted bytes held per connection. */
+  maxBufferedSend?: bigint
+  /** Send-stall timeout in milliseconds, or `"never"`. */
+  sendStallTimeoutMs?: bigint | string
+  /** Each connection's Yamux limits. */
+  yamux?: NodeYamuxOptions
+}
+
+/** Yamux limit overrides accepted from Node.js; see `YamuxOptions`. */
+export interface NodeYamuxOptions {
+  /** Per-stream receive window. */
+  receiveWindow?: number
+  /** Largest data-frame payload sent. */
+  maxFrameLen?: number
+  /** Streams tracked at once. */
+  maxStreams?: bigint
+  /** Per-stream send cap. */
+  maxBufferedSend?: bigint
+  /** Session-wide send cap. */
+  maxTotalBufferedSend?: bigint
+  /** Session-wide send cap reserved for control streams. */
+  controlStreamReserve?: bigint
+  /** Control frames that may wait to be pulled. */
+  maxPendingControl?: bigint
 }
 
 /** Derives a peer ID from raw Ed25519 secret key material. */

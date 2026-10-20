@@ -270,6 +270,8 @@ export const nativeModuleMock = async () => {
     NatErrorKind: generated.NatErrorKind,
     P2pEndpoint: FakeNativeEndpoint,
     Reachability: generated.Reachability,
+    TimeoutLimit: generated.TimeoutLimit,
+    WindowLimit: generated.WindowLimit,
     circuitAddress: vi.fn(),
     generateSecretKey: vi.fn(),
     peerIdFromSecretKey: vi.fn(),

@@ -239,6 +239,7 @@ fn config_on(listen_addr: &str) -> EndpointConfig {
         protocols: Vec::new(),
         discovery: None,
         mdns: None,
+        limits: None,
     }
 }
 
