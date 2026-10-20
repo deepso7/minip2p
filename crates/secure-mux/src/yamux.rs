@@ -149,8 +149,11 @@ impl YamuxConfig {
         if self.max_frame_len == 0 {
             return Err("max_frame_len must be greater than zero");
         }
-        if self.max_buffered_send == 0 || self.max_total_buffered_send == 0 {
-            return Err("send caps must be greater than zero");
+        if self.max_buffered_send == 0 {
+            return Err("max_buffered_send must be greater than zero");
+        }
+        if self.max_total_buffered_send == 0 {
+            return Err("max_total_buffered_send must be greater than zero");
         }
         if self.max_total_buffered_send <= self.control_stream_reserve {
             return Err("max_total_buffered_send must be greater than control_stream_reserve");

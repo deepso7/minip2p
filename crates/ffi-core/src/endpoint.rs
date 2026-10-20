@@ -1897,6 +1897,15 @@ mod tests {
             ..crate::LimitsOptions::default()
         })));
         assert!(circuit.contains("CircuitLimits::yamux"), "{circuit}");
+
+        let send_cap = transport_config_detail(endpoint(limited(crate::LimitsOptions {
+            circuit: Some(crate::YamuxOptions {
+                max_buffered_send: Some(0),
+                ..crate::YamuxOptions::default()
+            }),
+            ..crate::LimitsOptions::default()
+        })));
+        assert!(send_cap.contains("max_buffered_send"), "{send_cap}");
     }
 
     #[test]

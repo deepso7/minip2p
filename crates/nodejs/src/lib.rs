@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use minip2p_ffi_core::{
-    ConnectTarget, DiscoveryOptions, EndpointConfig, EventDoorbell, FfiError, LimitsOptions,
-    MdnsOptions, P2pEndpoint, QuicLimitsOptions, TcpLimitsOptions, TimeoutLimit, WindowLimit,
-    YamuxOptions,
+    ConfigCapability, ConnectTarget, DiscoveryOptions, EndpointConfig, EventDoorbell, FfiError,
+    LimitsOptions, MdnsOptions, P2pEndpoint, QuicLimitsOptions, TcpLimitsOptions, TimeoutLimit,
+    WindowLimit, YamuxOptions,
 };
 use napi::bindgen_prelude::{BigInt, Either, JsObjectValue, JsValue, Uint8Array};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -173,7 +173,8 @@ impl TryFrom<NodeEndpointConfig> for EndpointConfig {
             protocols: config.protocols,
             discovery: config.discovery.map(convert_discovery).transpose()?,
             mdns: config.mdns.map(convert_mdns).transpose()?,
-            limits: config.limits.map(convert_limits).transpose()?,
+            // Converted by the constructor, which tags limit errors.
+            limits: None,
         })
     }
 }
@@ -199,7 +200,7 @@ fn convert_mdns(options: NodeMdnsOptions) -> Result<MdnsOptions> {
     })
 }
 
-fn convert_limits(options: NodeLimitsOptions) -> Result<LimitsOptions> {
+fn convert_limits(options: NodeLimitsOptions) -> core::result::Result<LimitsOptions, FfiError> {
     Ok(LimitsOptions {
         quic: options.quic.map(convert_quic_limits).transpose()?,
         tcp: options.tcp.map(convert_tcp_limits).transpose()?,
@@ -207,36 +208,38 @@ fn convert_limits(options: NodeLimitsOptions) -> Result<LimitsOptions> {
             .circuit
             .map(|circuit| convert_yamux(circuit, "limits.circuit"))
             .transpose()?,
-        max_circuits: optional_u64(options.max_circuits, "limits.maxCircuits")?,
+        max_circuits: limit_u64(options.max_circuits, "limits.maxCircuits")?,
     })
 }
 
-fn convert_quic_limits(options: NodeQuicLimitsOptions) -> Result<QuicLimitsOptions> {
+fn convert_quic_limits(
+    options: NodeQuicLimitsOptions,
+) -> core::result::Result<QuicLimitsOptions, FfiError> {
     Ok(QuicLimitsOptions {
-        max_connections: optional_u64(options.max_connections, "limits.quic.maxConnections")?,
-        max_streams_per_connection: optional_u64(
+        max_connections: limit_u64(options.max_connections, "limits.quic.maxConnections")?,
+        max_streams_per_connection: limit_u64(
             options.max_streams_per_connection,
             "limits.quic.maxStreamsPerConnection",
         )?,
-        max_pending_bytes_per_stream: optional_u64(
+        max_pending_bytes_per_stream: limit_u64(
             options.max_pending_bytes_per_stream,
             "limits.quic.maxPendingBytesPerStream",
         )?,
-        max_pending_connection_bytes: optional_u64(
+        max_pending_connection_bytes: limit_u64(
             options.max_pending_connection_bytes,
             "limits.quic.maxPendingConnectionBytes",
         )?,
-        control_stream_reserve_bytes: optional_u64(
+        control_stream_reserve_bytes: limit_u64(
             options.control_stream_reserve_bytes,
             "limits.quic.controlStreamReserveBytes",
         )?,
-        max_pending_datagrams: optional_u64(
+        max_pending_datagrams: limit_u64(
             options.max_pending_datagrams,
             "limits.quic.maxPendingDatagrams",
         )?,
-        idle_timeout_ms: optional_u64(options.idle_timeout_ms, "limits.quic.idleTimeoutMs")?,
+        idle_timeout_ms: limit_u64(options.idle_timeout_ms, "limits.quic.idleTimeoutMs")?,
         require_address_validation: options.require_address_validation,
-        stream_receive_window: optional_u64(
+        stream_receive_window: limit_u64(
             options.stream_receive_window,
             "limits.quic.streamReceiveWindow",
         )?,
@@ -244,22 +247,24 @@ fn convert_quic_limits(options: NodeQuicLimitsOptions) -> Result<QuicLimitsOptio
             .connection_receive_window
             .map(|window| convert_window(window, "limits.quic.connectionReceiveWindow"))
             .transpose()?,
-        send_window: optional_u64(options.send_window, "limits.quic.sendWindow")?,
-        webtransport_handshake_timeout_ms: optional_u64(
+        send_window: limit_u64(options.send_window, "limits.quic.sendWindow")?,
+        webtransport_handshake_timeout_ms: limit_u64(
             options.webtransport_handshake_timeout_ms,
             "limits.quic.webtransportHandshakeTimeoutMs",
         )?,
     })
 }
 
-fn convert_tcp_limits(options: NodeTcpLimitsOptions) -> Result<TcpLimitsOptions> {
+fn convert_tcp_limits(
+    options: NodeTcpLimitsOptions,
+) -> core::result::Result<TcpLimitsOptions, FfiError> {
     Ok(TcpLimitsOptions {
-        max_connections: optional_u64(options.max_connections, "limits.tcp.maxConnections")?,
+        max_connections: limit_u64(options.max_connections, "limits.tcp.maxConnections")?,
         handshake_timeout_ms: options
             .handshake_timeout_ms
             .map(|timeout| convert_timeout(timeout, "limits.tcp.handshakeTimeoutMs"))
             .transpose()?,
-        max_buffered_send: optional_u64(options.max_buffered_send, "limits.tcp.maxBufferedSend")?,
+        max_buffered_send: limit_u64(options.max_buffered_send, "limits.tcp.maxBufferedSend")?,
         send_stall_timeout_ms: options
             .send_stall_timeout_ms
             .map(|timeout| convert_timeout(timeout, "limits.tcp.sendStallTimeoutMs"))
@@ -272,27 +277,33 @@ fn convert_tcp_limits(options: NodeTcpLimitsOptions) -> Result<TcpLimitsOptions>
 }
 
 /// Converts Yamux options; `path` prefixes the field an error names.
-fn convert_yamux(options: NodeYamuxOptions, path: &str) -> Result<YamuxOptions> {
+fn convert_yamux(
+    options: NodeYamuxOptions,
+    path: &str,
+) -> core::result::Result<YamuxOptions, FfiError> {
     let name = |field: &str| format!("{path}.{field}");
     Ok(YamuxOptions {
         receive_window: options.receive_window,
         max_frame_len: options.max_frame_len,
-        max_streams: optional_u64(options.max_streams, &name("maxStreams"))?,
-        max_buffered_send: optional_u64(options.max_buffered_send, &name("maxBufferedSend"))?,
-        max_total_buffered_send: optional_u64(
+        max_streams: limit_u64(options.max_streams, &name("maxStreams"))?,
+        max_buffered_send: limit_u64(options.max_buffered_send, &name("maxBufferedSend"))?,
+        max_total_buffered_send: limit_u64(
             options.max_total_buffered_send,
             &name("maxTotalBufferedSend"),
         )?,
-        control_stream_reserve: optional_u64(
+        control_stream_reserve: limit_u64(
             options.control_stream_reserve,
             &name("controlStreamReserve"),
         )?,
-        max_pending_control: optional_u64(options.max_pending_control, &name("maxPendingControl"))?,
+        max_pending_control: limit_u64(options.max_pending_control, &name("maxPendingControl"))?,
     })
 }
 
 /// A window in bytes, or the literal `"unlimited"`.
-fn convert_window(window: Either<BigInt, String>, name: &str) -> Result<WindowLimit> {
+fn convert_window(
+    window: Either<BigInt, String>,
+    name: &str,
+) -> core::result::Result<WindowLimit, FfiError> {
     Ok(match u64_or_literal(window, "unlimited", name)? {
         Some(bytes) => WindowLimit::Bounded { bytes },
         None => WindowLimit::Unlimited,
@@ -300,7 +311,10 @@ fn convert_window(window: Either<BigInt, String>, name: &str) -> Result<WindowLi
 }
 
 /// A timeout in milliseconds, or the literal `"never"`.
-fn convert_timeout(timeout: Either<BigInt, String>, name: &str) -> Result<TimeoutLimit> {
+fn convert_timeout(
+    timeout: Either<BigInt, String>,
+    name: &str,
+) -> core::result::Result<TimeoutLimit, FfiError> {
     Ok(match u64_or_literal(timeout, "never", name)? {
         Some(ms) => TimeoutLimit::AfterMs { ms },
         None => TimeoutLimit::Never,
@@ -308,18 +322,35 @@ fn convert_timeout(timeout: Either<BigInt, String>, name: &str) -> Result<Timeou
 }
 
 /// A `u64`, or `None` for `literal`; any other string is an error.
-fn u64_or_literal(value: Either<BigInt, String>, literal: &str, name: &str) -> Result<Option<u64>> {
+fn u64_or_literal(
+    value: Either<BigInt, String>,
+    literal: &str,
+    name: &str,
+) -> core::result::Result<Option<u64>, FfiError> {
     match value {
-        Either::A(value) => bigint_u64(value, name).map(Some),
+        Either::A(value) => limit_bigint(value, name).map(Some),
         Either::B(word) if word == literal => Ok(None),
-        Either::B(_) => Err(Error::from_reason(format!(
+        Either::B(_) => Err(invalid_limit(format!(
             "{name} must be an unsigned 64-bit integer or \"{literal}\""
         ))),
     }
 }
 
-fn optional_u64(value: Option<BigInt>, name: &str) -> Result<Option<u64>> {
-    value.map(|value| bigint_u64(value, name)).transpose()
+/// A limit's `u64`, or a Transport `InvalidConfig` naming it.
+fn limit_bigint(value: BigInt, name: &str) -> core::result::Result<u64, FfiError> {
+    bigint_u64(value, name).map_err(|error| invalid_limit(error.reason))
+}
+
+fn limit_u64(value: Option<BigInt>, name: &str) -> core::result::Result<Option<u64>, FfiError> {
+    value.map(|value| limit_bigint(value, name)).transpose()
+}
+
+/// A limit the shell cannot convert: a Transport configuration mistake.
+fn invalid_limit(detail: String) -> FfiError {
+    FfiError::InvalidConfig {
+        capability: ConfigCapability::Transport,
+        detail,
+    }
 }
 
 /// A native minip2p endpoint owned by Node.js.
@@ -334,7 +365,10 @@ impl NodeEndpoint {
         if config.agent_version.is_none() {
             config.agent_version = Some(format!("minip2p-node/{}", env!("CARGO_PKG_VERSION")));
         }
-        P2pEndpoint::new(secret_key.to_vec(), config.try_into()?)
+        let limits = config.limits.take().map(convert_limits).transpose();
+        let mut core = EndpointConfig::try_from(config)?;
+        core.limits = limits.map_err(|error| native_error(&env, error))?;
+        P2pEndpoint::new(secret_key.to_vec(), core)
             .map(Self)
             .map_err(|error| native_error(&env, error))
     }
