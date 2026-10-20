@@ -60,7 +60,7 @@ done
 
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "version must look like 0.3.2"
 
-for command in cargo curl gh git jq just perl pnpm rg; do
+for command in cargo curl gh git jq just node perl pnpm rg wasm-bindgen; do
   require_command "$command"
 done
 
@@ -146,6 +146,11 @@ else
   cargo metadata --format-version 1 >/dev/null
   cargo metadata --manifest-path fuzz/Cargo.toml --format-version 1 >/dev/null
   pnpm install --lockfile-only --ignore-scripts
+
+  # wasm-bindgen's import shim names hash the crate version, so the committed
+  # web glue changes with every bump.
+  echo "release: regenerating web wasm glue"
+  node bindings/ts/web/scripts/build-wasm.mjs
 
   echo "release: validating release metadata"
   metadata="$(cargo metadata --no-deps --format-version 1)"
