@@ -357,8 +357,9 @@ verify_npm_package() {
   local display_name="$2"
   local attempt found
 
-  # npm can take several minutes to expose a freshly published version.
-  for attempt in $(seq 1 60); do
+  # npm can take a while to expose a freshly published version; the ~30 MB
+  # @minip2p/react-native tarball took ~18 minutes for v0.10.1, so allow 30.
+  for attempt in $(seq 1 180); do
     found="$(curl -fsSL "https://registry.npmjs.org/$encoded_name/$version" 2>/dev/null |
       jq -r '.version // empty' 2>/dev/null || true)"
     [[ "$found" == "$version" ]] && return 0
