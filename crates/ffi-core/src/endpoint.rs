@@ -181,6 +181,8 @@ impl P2pEndpoint {
             });
         }
 
+        let limits = crate::limits::resolve_limits(config.limits)?;
+
         let gossipsub = GossipsubConfig {
             allow_unsigned: config.allow_unsigned,
             ..GossipsubConfig::default()
@@ -193,7 +195,10 @@ impl P2pEndpoint {
                     .agent_version
                     .unwrap_or_else(|| format!("minip2p/{}", env!("CARGO_PKG_VERSION"))),
             )
-            .gossipsub_config(gossipsub);
+            .gossipsub_config(gossipsub)
+            .quic_limits(limits.quic)
+            .tcp_config(limits.tcp)
+            .circuit_limits(limits.circuit);
         // The binding acknowledges stream data as its reader consumes it
         // (`stream_consumed`), not as this driver pulls the event.
         for protocol in config.protocols {
@@ -204,6 +209,7 @@ impl P2pEndpoint {
             relays,
             autonat_servers,
             force_relay: config.force_relay,
+            max_circuits: limits.max_circuits,
             ..NatConfig::default()
         });
 
@@ -1080,10 +1086,12 @@ fn map_options_error(error: EndpointOptionsError) -> FfiError {
         | EndpointOptionsError::UnsupportedListenShape { .. } => {
             FfiError::InvalidAddress { detail }
         }
-        EndpointOptionsError::TcpNamespace { .. } => FfiError::InvalidConfig {
-            capability: ConfigCapability::Transport,
-            detail,
-        },
+        EndpointOptionsError::TcpNamespace { .. } | EndpointOptionsError::InvalidLimit(_) => {
+            FfiError::InvalidConfig {
+                capability: ConfigCapability::Transport,
+                detail,
+            }
+        }
         EndpointOptionsError::NoTransport
         | EndpointOptionsError::DuplicateQuicFamily { .. }
         | EndpointOptionsError::TransportConflict(_) => FfiError::InvalidConfig {
@@ -1207,6 +1215,7 @@ mod tests {
             protocols: Vec::new(),
             discovery: None,
             mdns: None,
+            limits: None,
         }
     }
 
@@ -1830,6 +1839,107 @@ mod tests {
             map_bind_error(invariant),
             FfiError::Internal { .. }
         ));
+    }
+
+    /// A loopback QUIC + TCP config with `limits`.
+    fn limited(limits: crate::LimitsOptions) -> EndpointConfig {
+        let mut config = config();
+        config.listen = Some(vec![
+            "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+            "/ip4/127.0.0.1/tcp/0".into(),
+        ]);
+        config.limits = Some(limits);
+        config
+    }
+
+    fn small_yamux_window() -> crate::YamuxOptions {
+        crate::YamuxOptions {
+            receive_window: Some(1024),
+            ..crate::YamuxOptions::default()
+        }
+    }
+
+    /// The `detail` of a Transport `InvalidConfig`, failing on anything else.
+    fn transport_config_detail(result: Result<Arc<P2pEndpoint>, FfiError>) -> String {
+        match result {
+            Err(FfiError::InvalidConfig {
+                capability: ConfigCapability::Transport,
+                detail,
+            }) => detail,
+            Err(error) => panic!("expected a Transport InvalidConfig, got {error:?}"),
+            Ok(_) => panic!("expected a Transport InvalidConfig, got an endpoint"),
+        }
+    }
+
+    #[test]
+    fn invalid_limits_are_transport_config_errors_naming_the_field() {
+        let quic = transport_config_detail(endpoint(limited(crate::LimitsOptions {
+            quic: Some(crate::QuicLimitsOptions {
+                idle_timeout_ms: Some(0),
+                ..crate::QuicLimitsOptions::default()
+            }),
+            ..crate::LimitsOptions::default()
+        })));
+        assert!(quic.contains("idle_timeout_ms"), "{quic}");
+
+        let tcp = transport_config_detail(endpoint(limited(crate::LimitsOptions {
+            tcp: Some(crate::TcpLimitsOptions {
+                yamux: Some(small_yamux_window()),
+                ..crate::TcpLimitsOptions::default()
+            }),
+            ..crate::LimitsOptions::default()
+        })));
+        assert!(tcp.contains("TcpConfig::yamux"), "{tcp}");
+        assert!(tcp.contains("receive_window"), "{tcp}");
+
+        let circuit = transport_config_detail(endpoint(limited(crate::LimitsOptions {
+            circuit: Some(small_yamux_window()),
+            ..crate::LimitsOptions::default()
+        })));
+        assert!(circuit.contains("CircuitLimits::yamux"), "{circuit}");
+    }
+
+    #[test]
+    fn limits_of_an_unbound_transport_are_ignored() {
+        // QUIC-only listen: no TCP transport is bound to validate against.
+        let mut quic_only = config();
+        quic_only.limits = Some(crate::LimitsOptions {
+            tcp: Some(crate::TcpLimitsOptions {
+                yamux: Some(small_yamux_window()),
+                ..crate::TcpLimitsOptions::default()
+            }),
+            ..crate::LimitsOptions::default()
+        });
+        endpoint(quic_only).expect("QUIC-only endpoint");
+
+        let mut tcp_only = config();
+        tcp_only.listen = Some(vec!["/ip4/127.0.0.1/tcp/0".into()]);
+        tcp_only.limits = Some(crate::LimitsOptions {
+            quic: Some(crate::QuicLimitsOptions {
+                idle_timeout_ms: Some(0),
+                ..crate::QuicLimitsOptions::default()
+            }),
+            ..crate::LimitsOptions::default()
+        });
+        endpoint(tcp_only).expect("TCP-only endpoint");
+    }
+
+    #[test]
+    fn valid_limits_bind() {
+        endpoint(limited(crate::LimitsOptions {
+            quic: Some(crate::QuicLimitsOptions {
+                stream_receive_window: Some(4_000_000),
+                connection_receive_window: Some(crate::WindowLimit::Unlimited),
+                ..crate::QuicLimitsOptions::default()
+            }),
+            tcp: Some(crate::TcpLimitsOptions {
+                handshake_timeout_ms: Some(crate::TimeoutLimit::Never),
+                ..crate::TcpLimitsOptions::default()
+            }),
+            max_circuits: Some(0),
+            ..crate::LimitsOptions::default()
+        }))
+        .expect("endpoint");
     }
 
     #[test]

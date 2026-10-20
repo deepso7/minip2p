@@ -7,8 +7,12 @@ import { afterEach, vi } from "vitest";
 
 import { Minip2p } from "../src/adapter";
 import {
+  ConfigCapability,
   ConnectTarget_Tags,
+  FfiError,
   PathKind,
+  TimeoutLimit,
+  WindowLimit,
 } from "../src/generated/minip2p_ffi_core";
 import { FakeNativeEndpoint } from "./fake-native-endpoint";
 
@@ -31,6 +35,34 @@ const generatedPath = (path: NativeConnectionInfo["path"]): PathKind => {
     : PathKind.Direct.new();
 };
 
+/**
+ * Native limits in the runtime-neutral backend form: generated UniFFI
+ * window and timeout enums back to `bigint | "unlimited" | "never"`, unset
+ * fields dropped.
+ */
+const neutralLimits = (value: unknown): unknown => {
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  if (value instanceof WindowLimit.Unlimited) {
+    return "unlimited";
+  }
+  if (value instanceof TimeoutLimit.Never) {
+    return "never";
+  }
+  if (value instanceof WindowLimit.Bounded) {
+    return value.inner.bytes;
+  }
+  if (value instanceof TimeoutLimit.AfterMs) {
+    return value.inner.ms;
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, field]) => field !== undefined)
+      .map(([key, field]) => [key, neutralLimits(field)])
+  );
+};
+
 afterEach(() => {
   FakeNativeEndpoint.latest = undefined;
 });
@@ -44,7 +76,10 @@ describeAdapterContract("React Native", {
       abandoned: fake.abandoned,
       cancelledConnects: fake.cancelledConnects,
       closeTimeouts: fake.stopTimeouts,
-      config: fake.config,
+      config: {
+        ...(fake.config as object),
+        limits: neutralLimits((fake.config as { limits?: unknown }).limits),
+      },
       connectTargets: fake.connectTargets.map((target) =>
         target.tag === ConnectTarget_Tags.Peer
           ? { kind: "peer" as const, peerId: target.inner.peerId }
@@ -70,5 +105,11 @@ describeAdapterContract("React Native", {
       writes: fake.writes,
       writtenData: fake.writtenData,
     };
+  },
+  rejectNextTransportConfig: (detail) => {
+    FakeNativeEndpoint.constructError = new FfiError.InvalidConfig({
+      capability: ConfigCapability.Transport,
+      detail,
+    });
   },
 });

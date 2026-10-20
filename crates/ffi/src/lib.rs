@@ -10,8 +10,9 @@ pub use endpoint::P2pEndpoint;
 pub use minip2p_ffi_core::{
     ConnectTarget, ConnectionCloseReason, ConnectionInfo, DiscoveryOptions, DiscoverySource,
     DriverFailureKind, EndpointConfig, EndpointErrorKind, FfiError, IdentifyInfo, KnownPeerInfo,
-    MdnsOptions, NatErrorKind, OpenStreamResult, P2pEvent, PathKind, Reachability,
-    RelayReservationInfo,
+    LimitsOptions, MdnsOptions, NatErrorKind, OpenStreamResult, P2pEvent, PathKind,
+    QuicLimitsOptions, Reachability, RelayReservationInfo, TcpLimitsOptions, TimeoutLimit,
+    WindowLimit, YamuxOptions,
 };
 
 /// Doorbell implemented by the embedding runtime.

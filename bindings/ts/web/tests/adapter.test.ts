@@ -3,6 +3,7 @@ import { describeAdapterContract } from "@minip2p/test-fixtures/adapter-contract
 import {
   FakeSerdeEndpoint,
   latestFakeSerdeEndpoint,
+  rejectNextSerdeTransportConfig,
   serdeContractNative,
 } from "@minip2p/test-fixtures/fake-serde-endpoint";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -237,4 +238,5 @@ describeAdapterContract("Web", {
   create: (config = {}) =>
     Minip2p.create({ ...config, secretKey: new Uint8Array(32) }),
   native: () => serdeContractNative(fake()),
+  rejectNextTransportConfig: rejectNextSerdeTransportConfig,
 });

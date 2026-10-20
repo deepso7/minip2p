@@ -21,7 +21,7 @@
 | Shutdown | bounded `close(timeoutMs?)` resolving with an outcome and unfinished peers, `onClose`, `Symbol.asyncDispose`, and `Symbol.dispose`; the low-level native export also provides `stop`/`waitStopped` |
 | One Endpoint event stream and its blocking wait (event, deadline, interrupted) | Driven by each platform backend; surfaced as typed events, State getters, and Promise waits such as `waitFor` and `waitConnectResult` |
 
-Resource-policy tuning remains native configuration until it has consistent semantics across every backend.
+Transport limits (`limits`: QUIC, TCP and circuit Yamux windows and caps, timeouts, `maxCircuits`) are configurable on Node and React Native; omitted fields keep the native defaults. Other resource policy (NAT timings, Gossipsub tuning) remains native configuration.
 
 ## In the browser
 
@@ -31,7 +31,7 @@ Resource-policy tuning remains native configuration until it has consistent sema
 | --- | --- |
 | Dialing | `/…/quic-v1/webtransport/certhash/…/p2p/…` addresses only; other candidates fail as candidates |
 | Ping, Identify, custom protocol streams, pubsub | As on native |
-| Listening, mDNS, signed discovery, AutoNAT | Rejected at `create` with `InvalidConfigError` and the reason |
+| Listening, mDNS, signed discovery, AutoNAT, `limits` | Rejected at `create` with `InvalidConfigError` and the reason |
 | Relay reservations and circuits (`relays`, `forceRelay`) | Reservations on WebTransport relays, reachable at the `/p2p-circuit` address from browsers and native nodes; connects race the direct dial against the relay leg (`direct` or `relayed`, never `punched`); `forceRelay` needs `relays` |
 | Shutdown | `close` closes every session at once with WebTransport's close capsule |
 | Driver failure | A trapped wasm module reports `driverFailed`; later calls throw `ClosedError` |

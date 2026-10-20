@@ -564,6 +564,12 @@ fn validate_browser_config(config: &EndpointConfig) -> Result<(), FfiError> {
             "signed discovery is not available in the browser build; omit discovery",
         );
     }
+    if config.limits.is_some() {
+        return reject(
+            ConfigCapability::Transport,
+            "transport limits are not configurable in the browser build; omit limits",
+        );
+    }
     if !config.autonat_servers.is_empty() {
         return reject(
             ConfigCapability::Options,

@@ -257,3 +257,14 @@ export const serdeContractNative = (
   writes: fake.writes,
   writtenData: fake.writtenData,
 });
+
+/**
+ * Makes the next {@link FakeSerdeEndpoint} throw a serde shell's
+ * `InvalidConfig { capability: Transport }`.
+ */
+export const rejectNextSerdeTransportConfig = (detail: string): void => {
+  FakeSerdeEndpoint.constructError = Object.assign(
+    new Error(`invalid Transport configuration: ${detail}`),
+    { capability: "Transport", code: "InvalidConfig", detail }
+  );
+};

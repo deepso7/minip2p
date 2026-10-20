@@ -6,6 +6,7 @@ import type { BackendConnectTarget, PathKind } from "../../core/src/backend.js";
 import {
   ConnectCancelledError,
   ConnectResultLostError,
+  InvalidConfigError,
   StreamClosedError,
   TimeoutError,
 } from "../../core/src/index.js";
@@ -81,6 +82,11 @@ export interface AdapterContractHarness {
   readonly create: (config?: Omit<Minip2pConfig, "secretKey">) => Minip2pBase;
   /** Fake native endpoint behind the most recently created endpoint. */
   readonly native: () => FakeNativeState;
+  /**
+   * Makes the next native constructor throw this runtime's
+   * `InvalidConfig { capability: Transport, detail }`.
+   */
+  readonly rejectNextTransportConfig: (detail: string) => void;
 }
 
 const PEER = "12D3KooWPeer";
@@ -757,6 +763,72 @@ export function describeAdapterContract(
       expect(() =>
         harness.create({ mdns: { maxPacketBytes: 2 ** 32 } })
       ).toThrow(RangeError);
+    });
+
+    test("native config carries only the limits the caller set", () => {
+      harness.create().close();
+      expect(harness.native().config).toMatchObject({ limits: undefined });
+
+      harness
+        .create({ limits: { quic: { streamReceiveWindow: 4_000_000 } } })
+        .close();
+      expect(harness.native().config).toMatchObject({
+        limits: { quic: { streamReceiveWindow: 4_000_000n } },
+      });
+      expect(
+        (harness.native().config as { limits: unknown }).limits
+      ).toStrictEqual({ quic: { streamReceiveWindow: 4_000_000n } });
+
+      harness
+        .create({
+          limits: {
+            circuit: { maxStreams: 8 },
+            maxCircuits: 4,
+            quic: { connectionReceiveWindow: "unlimited" },
+            tcp: {
+              handshakeTimeoutMs: "never",
+              sendStallTimeoutMs: 5000,
+              yamux: { receiveWindow: 1_048_576 },
+            },
+          },
+        })
+        .close();
+      expect(
+        (harness.native().config as { limits: unknown }).limits
+      ).toStrictEqual({
+        circuit: { maxStreams: 8n },
+        maxCircuits: 4n,
+        quic: { connectionReceiveWindow: "unlimited" },
+        tcp: {
+          handshakeTimeoutMs: "never",
+          sendStallTimeoutMs: 5000n,
+          yamux: { receiveWindow: 1_048_576 },
+        },
+      });
+
+      expect(() =>
+        harness.create({ limits: { quic: { sendWindow: -1 } } })
+      ).toThrow(RangeError);
+      expect(() =>
+        harness.create({
+          limits: { tcp: { yamux: { receiveWindow: 2 ** 32 } } },
+        })
+      ).toThrow(RangeError);
+    });
+
+    test("a limit native rejects is an InvalidConfigError naming Transport", () => {
+      const detail =
+        "invalid limit `idle_timeout_ms`: must be greater than zero";
+      harness.rejectNextTransportConfig(detail);
+
+      let thrown: unknown;
+      try {
+        harness.create({ limits: { quic: { idleTimeoutMs: 0 } } }).close();
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(InvalidConfigError);
+      expect(thrown).toMatchObject({ capability: "Transport", detail });
     });
   });
 }

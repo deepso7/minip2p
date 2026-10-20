@@ -475,6 +475,666 @@ const FfiConverterTypeMdnsOptions = (() => {
     return new FFIConverter();
 })();
 
+
+// Enum: WindowLimit
+export enum WindowLimit_Tags {
+    Bounded = "Bounded",
+    Unlimited = "Unlimited"
+}
+/**
+ * A receive window that may be unbounded.
+ */
+export const WindowLimit = (() => {
+
+    type Bounded__interface = {
+        tag: WindowLimit_Tags.Bounded;
+        inner:
+Readonly<{bytes: bigint}>
+    };
+    /**
+     * At most `bytes`.
+     */
+    class Bounded_ extends UniffiEnum implements Bounded__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "WindowLimit";
+        readonly tag = WindowLimit_Tags.Bounded;
+        readonly inner:
+Readonly<{bytes: bigint}>;
+        constructor(
+inner: {bytes: bigint }) {
+            super("WindowLimit", "Bounded");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {bytes: bigint }): Bounded_ {
+            return new Bounded_(inner);
+        }
+
+        static instanceOf(obj: any): obj is Bounded_ {
+            return obj.tag === WindowLimit_Tags.Bounded;
+        }
+
+    }
+
+    type Unlimited__interface = {
+        tag: WindowLimit_Tags.Unlimited
+    };
+    /**
+     * No window.
+     */
+    class Unlimited_ extends UniffiEnum implements Unlimited__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "WindowLimit";
+        readonly tag = WindowLimit_Tags.Unlimited;
+        constructor() {
+            super("WindowLimit", "Unlimited");
+        }
+
+        static new(): Unlimited_ {
+            return new Unlimited_();
+        }
+
+        static instanceOf(obj: any): obj is Unlimited_ {
+            return obj.tag === WindowLimit_Tags.Unlimited;
+        }
+
+    }
+
+    function instanceOf(obj: any): obj is WindowLimit {
+        return obj[uniffiTypeNameSymbol] === "WindowLimit";
+    }
+
+    return Object.freeze({
+        instanceOf,
+  Bounded: Bounded_,
+  Unlimited: Unlimited_
+    });
+
+})();
+/**
+ * A receive window that may be unbounded.
+ */
+export type WindowLimit = InstanceType<
+    typeof WindowLimit['Bounded' | 'Unlimited']
+>;
+
+// FfiConverter for enum WindowLimit
+const FfiConverterTypeWindowLimit = (() => {
+    type TypeName = WindowLimit;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            switch (c.readI32()) {
+                case 1: return new WindowLimit.Bounded({bytes: FfiConverterUInt64.readFromCursor(c) });
+                case 2: return new WindowLimit.Unlimited();
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            switch (value.tag) {
+                case WindowLimit_Tags.Bounded: {
+                    c.writeI32(1);
+                    const inner = value.inner;
+                    FfiConverterUInt64.writeIntoCursor(inner.bytes, c);
+                    return;
+                }
+                case WindowLimit_Tags.Unlimited: {
+                    c.writeI32(2);
+                    return;
+                }
+                default:
+                    // Throwing from here means that WindowLimit_Tags hasn't matched an ordinal.
+                    throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        allocationSize(value: TypeName): number {
+            switch (value.tag) {
+                case WindowLimit_Tags.Bounded: {
+                    const inner = value.inner;
+                    let size = 4;
+                    size += FfiConverterUInt64.allocationSize(inner.bytes);
+                    return size;
+                }
+                case WindowLimit_Tags.Unlimited: {
+                    return 4;
+                }
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * QUIC overrides; each field mirrors `minip2p::QuicLimits`.
+ */
+export type QuicLimitsOptions = {
+    /**
+     * Simultaneous connections, inbound and outbound.
+     */
+    maxConnections?: bigint,
+    /**
+     * Locally initiated bidirectional streams per connection.
+     */
+    maxStreamsPerConnection?: bigint,
+    /**
+     * Bytes queued per stream beyond what the engine accepts; non-zero.
+     */
+    maxPendingBytesPerStream?: bigint,
+    /**
+     * Bytes queued per connection beyond what the engine accepts; greater
+     * than `control_stream_reserve_bytes`.
+     */
+    maxPendingConnectionBytes?: bigint,
+    /**
+     * Part of the connection queue only control streams may fill.
+     */
+    controlStreamReserveBytes?: bigint,
+    /**
+     * UDP datagrams retained while the socket would block; non-zero.
+     */
+    maxPendingDatagrams?: bigint,
+    /**
+     * Idle timeout advertised to peers, in milliseconds; non-zero.
+     */
+    idleTimeoutMs?: bigint,
+    /**
+     * Whether inbound connections need a stateless Retry first.
+     */
+    requireAddressValidation?: boolean,
+    /**
+     * Per-stream receive window in bytes; non-zero.
+     */
+    streamReceiveWindow?: bigint,
+    /**
+     * Per-connection receive window (unlimited by default).
+     */
+    connectionReceiveWindow?: WindowLimit,
+    /**
+     * Bytes buffered per connection for sending; non-zero.
+     */
+    sendWindow?: bigint,
+    /**
+     * Time an `h3` connection has to complete Noise, in milliseconds;
+     * non-zero.
+     */
+    webtransportHandshakeTimeoutMs?: bigint
+}
+
+/**
+ * Generated factory for {@link QuicLimitsOptions} record objects.
+ */
+export const QuicLimitsOptions = (() => {
+    const defaults = () => ({
+        maxConnections: undefined,
+        maxStreamsPerConnection: undefined,
+        maxPendingBytesPerStream: undefined,
+        maxPendingConnectionBytes: undefined,
+        controlStreamReserveBytes: undefined,
+        maxPendingDatagrams: undefined,
+        idleTimeoutMs: undefined,
+        requireAddressValidation: undefined,
+        streamReceiveWindow: undefined,
+        connectionReceiveWindow: undefined,
+        sendWindow: undefined,
+        webtransportHandshakeTimeoutMs: undefined
+    });
+    const create = (() => {
+        return uniffiCreateRecord<QuicLimitsOptions, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<QuicLimitsOptions>,
+    });
+})();
+
+const FfiConverterTypeQuicLimitsOptions = (() => {
+    type TypeName = QuicLimitsOptions;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            return {
+                maxConnections: FfiConverterOptionalUInt64.readFromCursor(c),
+                maxStreamsPerConnection: FfiConverterOptionalUInt64.readFromCursor(c),
+                maxPendingBytesPerStream: FfiConverterOptionalUInt64.readFromCursor(c),
+                maxPendingConnectionBytes: FfiConverterOptionalUInt64.readFromCursor(c),
+                controlStreamReserveBytes: FfiConverterOptionalUInt64.readFromCursor(c),
+                maxPendingDatagrams: FfiConverterOptionalUInt64.readFromCursor(c),
+                idleTimeoutMs: FfiConverterOptionalUInt64.readFromCursor(c),
+                requireAddressValidation: FfiConverterOptionalBoolean.readFromCursor(c),
+                streamReceiveWindow: FfiConverterOptionalUInt64.readFromCursor(c),
+                connectionReceiveWindow: FfiConverterOptionalTypeWindowLimit.readFromCursor(c),
+                sendWindow: FfiConverterOptionalUInt64.readFromCursor(c),
+                webtransportHandshakeTimeoutMs: FfiConverterOptionalUInt64.readFromCursor(c)
+            };
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            FfiConverterOptionalUInt64.writeIntoCursor(value.maxConnections, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.maxStreamsPerConnection, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.maxPendingBytesPerStream, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.maxPendingConnectionBytes, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.controlStreamReserveBytes, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.maxPendingDatagrams, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.idleTimeoutMs, c);
+            FfiConverterOptionalBoolean.writeIntoCursor(value.requireAddressValidation, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.streamReceiveWindow, c);
+            FfiConverterOptionalTypeWindowLimit.writeIntoCursor(value.connectionReceiveWindow, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.sendWindow, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.webtransportHandshakeTimeoutMs, c);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterOptionalUInt64.allocationSize(value.maxConnections) +
+             FfiConverterOptionalUInt64.allocationSize(value.maxStreamsPerConnection) +
+             FfiConverterOptionalUInt64.allocationSize(value.maxPendingBytesPerStream) +
+             FfiConverterOptionalUInt64.allocationSize(value.maxPendingConnectionBytes) +
+             FfiConverterOptionalUInt64.allocationSize(value.controlStreamReserveBytes) +
+             FfiConverterOptionalUInt64.allocationSize(value.maxPendingDatagrams) +
+             FfiConverterOptionalUInt64.allocationSize(value.idleTimeoutMs) +
+             FfiConverterOptionalBoolean.allocationSize(value.requireAddressValidation) +
+             FfiConverterOptionalUInt64.allocationSize(value.streamReceiveWindow) +
+             FfiConverterOptionalTypeWindowLimit.allocationSize(value.connectionReceiveWindow) +
+             FfiConverterOptionalUInt64.allocationSize(value.sendWindow) +
+             FfiConverterOptionalUInt64.allocationSize(value.webtransportHandshakeTimeoutMs);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+
+// Enum: TimeoutLimit
+export enum TimeoutLimit_Tags {
+    AfterMs = "AfterMs",
+    Never = "Never"
+}
+/**
+ * A timeout that may be disabled.
+ */
+export const TimeoutLimit = (() => {
+
+    type AfterMs__interface = {
+        tag: TimeoutLimit_Tags.AfterMs;
+        inner:
+Readonly<{ms: bigint}>
+    };
+    /**
+     * Fires after `ms` milliseconds.
+     */
+    class AfterMs_ extends UniffiEnum implements AfterMs__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "TimeoutLimit";
+        readonly tag = TimeoutLimit_Tags.AfterMs;
+        readonly inner:
+Readonly<{ms: bigint}>;
+        constructor(
+inner: {ms: bigint }) {
+            super("TimeoutLimit", "AfterMs");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {ms: bigint }): AfterMs_ {
+            return new AfterMs_(inner);
+        }
+
+        static instanceOf(obj: any): obj is AfterMs_ {
+            return obj.tag === TimeoutLimit_Tags.AfterMs;
+        }
+
+    }
+
+    type Never__interface = {
+        tag: TimeoutLimit_Tags.Never
+    };
+    /**
+     * Waits indefinitely.
+     */
+    class Never_ extends UniffiEnum implements Never__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "TimeoutLimit";
+        readonly tag = TimeoutLimit_Tags.Never;
+        constructor() {
+            super("TimeoutLimit", "Never");
+        }
+
+        static new(): Never_ {
+            return new Never_();
+        }
+
+        static instanceOf(obj: any): obj is Never_ {
+            return obj.tag === TimeoutLimit_Tags.Never;
+        }
+
+    }
+
+    function instanceOf(obj: any): obj is TimeoutLimit {
+        return obj[uniffiTypeNameSymbol] === "TimeoutLimit";
+    }
+
+    return Object.freeze({
+        instanceOf,
+  AfterMs: AfterMs_,
+  Never: Never_
+    });
+
+})();
+/**
+ * A timeout that may be disabled.
+ */
+export type TimeoutLimit = InstanceType<
+    typeof TimeoutLimit['AfterMs' | 'Never']
+>;
+
+// FfiConverter for enum TimeoutLimit
+const FfiConverterTypeTimeoutLimit = (() => {
+    type TypeName = TimeoutLimit;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            switch (c.readI32()) {
+                case 1: return new TimeoutLimit.AfterMs({ms: FfiConverterUInt64.readFromCursor(c) });
+                case 2: return new TimeoutLimit.Never();
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            switch (value.tag) {
+                case TimeoutLimit_Tags.AfterMs: {
+                    c.writeI32(1);
+                    const inner = value.inner;
+                    FfiConverterUInt64.writeIntoCursor(inner.ms, c);
+                    return;
+                }
+                case TimeoutLimit_Tags.Never: {
+                    c.writeI32(2);
+                    return;
+                }
+                default:
+                    // Throwing from here means that TimeoutLimit_Tags hasn't matched an ordinal.
+                    throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        allocationSize(value: TypeName): number {
+            switch (value.tag) {
+                case TimeoutLimit_Tags.AfterMs: {
+                    const inner = value.inner;
+                    let size = 4;
+                    size += FfiConverterUInt64.allocationSize(inner.ms);
+                    return size;
+                }
+                case TimeoutLimit_Tags.Never: {
+                    return 4;
+                }
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * Yamux overrides; each field mirrors `minip2p::YamuxConfig`.
+ */
+export type YamuxOptions = {
+    /**
+     * Per-stream receive window in bytes; at least 256 KiB.
+     */
+    receiveWindow?: number,
+    /**
+     * Largest data-frame payload sent; non-zero.
+     */
+    maxFrameLen?: number,
+    /**
+     * Streams tracked at once, counting unsettled closed ones.
+     */
+    maxStreams?: bigint,
+    /**
+     * Per-stream cap on accepted, unpulled send bytes; non-zero.
+     */
+    maxBufferedSend?: bigint,
+    /**
+     * Session-wide cap on accepted, unpulled send bytes; greater than
+     * `control_stream_reserve`.
+     */
+    maxTotalBufferedSend?: bigint,
+    /**
+     * Part of the session-wide cap only control streams may fill.
+     */
+    controlStreamReserve?: bigint,
+    /**
+     * Control frames that may wait to be pulled.
+     */
+    maxPendingControl?: bigint
+}
+
+/**
+ * Generated factory for {@link YamuxOptions} record objects.
+ */
+export const YamuxOptions = (() => {
+    const defaults = () => ({
+        receiveWindow: undefined,
+        maxFrameLen: undefined,
+        maxStreams: undefined,
+        maxBufferedSend: undefined,
+        maxTotalBufferedSend: undefined,
+        controlStreamReserve: undefined,
+        maxPendingControl: undefined
+    });
+    const create = (() => {
+        return uniffiCreateRecord<YamuxOptions, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<YamuxOptions>,
+    });
+})();
+
+const FfiConverterTypeYamuxOptions = (() => {
+    type TypeName = YamuxOptions;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            return {
+                receiveWindow: FfiConverterOptionalUInt32.readFromCursor(c),
+                maxFrameLen: FfiConverterOptionalUInt32.readFromCursor(c),
+                maxStreams: FfiConverterOptionalUInt64.readFromCursor(c),
+                maxBufferedSend: FfiConverterOptionalUInt64.readFromCursor(c),
+                maxTotalBufferedSend: FfiConverterOptionalUInt64.readFromCursor(c),
+                controlStreamReserve: FfiConverterOptionalUInt64.readFromCursor(c),
+                maxPendingControl: FfiConverterOptionalUInt64.readFromCursor(c)
+            };
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            FfiConverterOptionalUInt32.writeIntoCursor(value.receiveWindow, c);
+            FfiConverterOptionalUInt32.writeIntoCursor(value.maxFrameLen, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.maxStreams, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.maxBufferedSend, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.maxTotalBufferedSend, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.controlStreamReserve, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.maxPendingControl, c);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterOptionalUInt32.allocationSize(value.receiveWindow) +
+             FfiConverterOptionalUInt32.allocationSize(value.maxFrameLen) +
+             FfiConverterOptionalUInt64.allocationSize(value.maxStreams) +
+             FfiConverterOptionalUInt64.allocationSize(value.maxBufferedSend) +
+             FfiConverterOptionalUInt64.allocationSize(value.maxTotalBufferedSend) +
+             FfiConverterOptionalUInt64.allocationSize(value.controlStreamReserve) +
+             FfiConverterOptionalUInt64.allocationSize(value.maxPendingControl);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * TCP overrides; each field mirrors `minip2p::TcpConfig` (its connection-id
+ * namespace stays internal).
+ */
+export type TcpLimitsOptions = {
+    /**
+     * Connections held at once, dialed and accepted alike.
+     */
+    maxConnections?: bigint,
+    /**
+     * How long a connection may take to authenticate.
+     */
+    handshakeTimeoutMs?: TimeoutLimit,
+    /**
+     * Encrypted bytes one connection holds for its socket.
+     */
+    maxBufferedSend?: bigint,
+    /**
+     * How long a connection may hold bytes its socket refuses.
+     */
+    sendStallTimeoutMs?: TimeoutLimit,
+    /**
+     * Each TCP connection's Yamux limits; independent of
+     * [`LimitsOptions::circuit`].
+     */
+    yamux?: YamuxOptions
+}
+
+/**
+ * Generated factory for {@link TcpLimitsOptions} record objects.
+ */
+export const TcpLimitsOptions = (() => {
+    const defaults = () => ({
+        maxConnections: undefined,
+        handshakeTimeoutMs: undefined,
+        maxBufferedSend: undefined,
+        sendStallTimeoutMs: undefined,
+        yamux: undefined
+    });
+    const create = (() => {
+        return uniffiCreateRecord<TcpLimitsOptions, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<TcpLimitsOptions>,
+    });
+})();
+
+const FfiConverterTypeTcpLimitsOptions = (() => {
+    type TypeName = TcpLimitsOptions;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            return {
+                maxConnections: FfiConverterOptionalUInt64.readFromCursor(c),
+                handshakeTimeoutMs: FfiConverterOptionalTypeTimeoutLimit.readFromCursor(c),
+                maxBufferedSend: FfiConverterOptionalUInt64.readFromCursor(c),
+                sendStallTimeoutMs: FfiConverterOptionalTypeTimeoutLimit.readFromCursor(c),
+                yamux: FfiConverterOptionalTypeYamuxOptions.readFromCursor(c)
+            };
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            FfiConverterOptionalUInt64.writeIntoCursor(value.maxConnections, c);
+            FfiConverterOptionalTypeTimeoutLimit.writeIntoCursor(value.handshakeTimeoutMs, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.maxBufferedSend, c);
+            FfiConverterOptionalTypeTimeoutLimit.writeIntoCursor(value.sendStallTimeoutMs, c);
+            FfiConverterOptionalTypeYamuxOptions.writeIntoCursor(value.yamux, c);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterOptionalUInt64.allocationSize(value.maxConnections) +
+             FfiConverterOptionalTypeTimeoutLimit.allocationSize(value.handshakeTimeoutMs) +
+             FfiConverterOptionalUInt64.allocationSize(value.maxBufferedSend) +
+             FfiConverterOptionalTypeTimeoutLimit.allocationSize(value.sendStallTimeoutMs) +
+             FfiConverterOptionalTypeYamuxOptions.allocationSize(value.yamux);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * Transport limit overrides.
+ *
+ * Every field is optional: an absent record or field keeps the native
+ * default, so an omitted record and an empty one behave identically. Limits
+ * for a transport the endpoint does not bind (TCP without a `/tcp` listen
+ * address, say) are ignored, not validated. An invalid limit fails
+ * construction with `InvalidConfig { capability: Transport }`.
+ */
+export type LimitsOptions = {
+    /**
+     * QUIC (and WebTransport) transport limits.
+     */
+    quic?: QuicLimitsOptions,
+    /**
+     * TCP transport limits, including its connections' Yamux limits.
+     */
+    tcp?: TcpLimitsOptions,
+    /**
+     * Relay circuits' Yamux limits; independent of [`TcpLimitsOptions::yamux`].
+     */
+    circuit?: YamuxOptions,
+    /**
+     * Most relayed circuits held at once (`NatConfig::max_circuits`): past
+     * it inbound circuits are refused and relay legs fail.
+     */
+    maxCircuits?: bigint
+}
+
+/**
+ * Generated factory for {@link LimitsOptions} record objects.
+ */
+export const LimitsOptions = (() => {
+    const defaults = () => ({
+        quic: undefined,
+        tcp: undefined,
+        circuit: undefined,
+        maxCircuits: undefined
+    });
+    const create = (() => {
+        return uniffiCreateRecord<LimitsOptions, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<LimitsOptions>,
+    });
+})();
+
+const FfiConverterTypeLimitsOptions = (() => {
+    type TypeName = LimitsOptions;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            return {
+                quic: FfiConverterOptionalTypeQuicLimitsOptions.readFromCursor(c),
+                tcp: FfiConverterOptionalTypeTcpLimitsOptions.readFromCursor(c),
+                circuit: FfiConverterOptionalTypeYamuxOptions.readFromCursor(c),
+                maxCircuits: FfiConverterOptionalUInt64.readFromCursor(c)
+            };
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            FfiConverterOptionalTypeQuicLimitsOptions.writeIntoCursor(value.quic, c);
+            FfiConverterOptionalTypeTcpLimitsOptions.writeIntoCursor(value.tcp, c);
+            FfiConverterOptionalTypeYamuxOptions.writeIntoCursor(value.circuit, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.maxCircuits, c);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterOptionalTypeQuicLimitsOptions.allocationSize(value.quic) +
+             FfiConverterOptionalTypeTcpLimitsOptions.allocationSize(value.tcp) +
+             FfiConverterOptionalTypeYamuxOptions.allocationSize(value.circuit) +
+             FfiConverterOptionalUInt64.allocationSize(value.maxCircuits);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 /**
  * Configuration used to construct an FFI endpoint.
  */
@@ -518,7 +1178,11 @@ export type EndpointConfig = {
     /**
      * Local-link mDNS settings, or no mDNS discovery when absent.
      */
-    mdns?: MdnsOptions
+    mdns?: MdnsOptions,
+    /**
+     * Transport limit overrides, or every native default when absent.
+     */
+    limits?: LimitsOptions
 }
 
 /**
@@ -550,7 +1214,8 @@ const FfiConverterTypeEndpointConfig = (() => {
                 allowUnsigned: FfiConverterBool.readFromCursor(c),
                 protocols: FfiConverterSequenceString.readFromCursor(c),
                 discovery: FfiConverterOptionalTypeDiscoveryOptions.readFromCursor(c),
-                mdns: FfiConverterOptionalTypeMdnsOptions.readFromCursor(c)
+                mdns: FfiConverterOptionalTypeMdnsOptions.readFromCursor(c),
+                limits: FfiConverterOptionalTypeLimitsOptions.readFromCursor(c)
             };
         }
         writeIntoCursor(value: TypeName, c: Cursor): void {
@@ -563,6 +1228,7 @@ const FfiConverterTypeEndpointConfig = (() => {
             FfiConverterSequenceString.writeIntoCursor(value.protocols, c);
             FfiConverterOptionalTypeDiscoveryOptions.writeIntoCursor(value.discovery, c);
             FfiConverterOptionalTypeMdnsOptions.writeIntoCursor(value.mdns, c);
+            FfiConverterOptionalTypeLimitsOptions.writeIntoCursor(value.limits, c);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterOptionalString.allocationSize(value.agentVersion) +
@@ -573,7 +1239,8 @@ const FfiConverterTypeEndpointConfig = (() => {
              FfiConverterBool.allocationSize(value.allowUnsigned) +
              FfiConverterSequenceString.allocationSize(value.protocols) +
              FfiConverterOptionalTypeDiscoveryOptions.allocationSize(value.discovery) +
-             FfiConverterOptionalTypeMdnsOptions.allocationSize(value.mdns);
+             FfiConverterOptionalTypeMdnsOptions.allocationSize(value.mdns) +
+             FfiConverterOptionalTypeLimitsOptions.allocationSize(value.limits);
 
         }
     };
@@ -4708,11 +5375,35 @@ const FfiConverterOptionalTypeDiscoveryOptions = new FfiConverterOptional(FfiCon
 // FfiConverter for MdnsOptions | undefined
 const FfiConverterOptionalTypeMdnsOptions = new FfiConverterOptional(FfiConverterTypeMdnsOptions);
 
-// FfiConverter for ArrayBuffer | undefined
-const FfiConverterOptionalBytes = new FfiConverterOptional(FfiConverterArrayBuffer);
-
 // FfiConverter for bigint | undefined
 const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
+
+// FfiConverter for boolean | undefined
+const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
+
+// FfiConverter for WindowLimit | undefined
+const FfiConverterOptionalTypeWindowLimit = new FfiConverterOptional(FfiConverterTypeWindowLimit);
+
+// FfiConverter for QuicLimitsOptions | undefined
+const FfiConverterOptionalTypeQuicLimitsOptions = new FfiConverterOptional(FfiConverterTypeQuicLimitsOptions);
+
+// FfiConverter for TimeoutLimit | undefined
+const FfiConverterOptionalTypeTimeoutLimit = new FfiConverterOptional(FfiConverterTypeTimeoutLimit);
+
+// FfiConverter for number | undefined
+const FfiConverterOptionalUInt32 = new FfiConverterOptional(FfiConverterUInt32);
+
+// FfiConverter for YamuxOptions | undefined
+const FfiConverterOptionalTypeYamuxOptions = new FfiConverterOptional(FfiConverterTypeYamuxOptions);
+
+// FfiConverter for TcpLimitsOptions | undefined
+const FfiConverterOptionalTypeTcpLimitsOptions = new FfiConverterOptional(FfiConverterTypeTcpLimitsOptions);
+
+// FfiConverter for LimitsOptions | undefined
+const FfiConverterOptionalTypeLimitsOptions = new FfiConverterOptional(FfiConverterTypeLimitsOptions);
+
+// FfiConverter for ArrayBuffer | undefined
+const FfiConverterOptionalBytes = new FfiConverterOptional(FfiConverterArrayBuffer);
 
 // FfiConverter for Array<bigint>
 const FfiConverterSequenceUInt64 = new FfiConverterArray(FfiConverterUInt64);
@@ -4758,14 +5449,20 @@ export default Object.freeze({
     FfiConverterTypeFfiError,
     FfiConverterTypeIdentifyInfo,
     FfiConverterTypeKnownPeerInfo,
+    FfiConverterTypeLimitsOptions,
     FfiConverterTypeMdnsFailureKind,
     FfiConverterTypeMdnsOptions,
     FfiConverterTypeNatErrorKind,
     FfiConverterTypeOpenStreamResult,
     FfiConverterTypeP2pEvent,
     FfiConverterTypePathKind,
+    FfiConverterTypeQuicLimitsOptions,
     FfiConverterTypeReachability,
     FfiConverterTypeRelayReservationInfo,
+    FfiConverterTypeTcpLimitsOptions,
+    FfiConverterTypeTimeoutLimit,
     FfiConverterTypeUnfinishedConnection,
+    FfiConverterTypeWindowLimit,
+    FfiConverterTypeYamuxOptions,
   }
 });
