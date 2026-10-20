@@ -1,7 +1,6 @@
 //! One Connection-target shape shared by every binding shell.
 
-use crate::endpoint::parse_peer_id;
-use crate::{FfiError, parse_direct_peer_addr};
+use crate::{FfiError, parse_direct_peer_addr, parse_peer_id};
 
 /// What a foreign runtime supplies to start one Connection attempt.
 ///
@@ -25,9 +24,7 @@ pub enum ConnectTarget {
 }
 
 /// Validates a foreign `target` into the upstream Connection target.
-pub(crate) fn parse_connect_target(
-    target: ConnectTarget,
-) -> Result<minip2p::ConnectTarget, FfiError> {
+pub fn parse_connect_target(target: ConnectTarget) -> Result<minip2p::ConnectTarget, FfiError> {
     match target {
         ConnectTarget::Peer { peer_id } => {
             Ok(minip2p::ConnectTarget::from(parse_peer_id(&peer_id)?))

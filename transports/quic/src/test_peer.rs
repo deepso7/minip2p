@@ -286,6 +286,90 @@ pub(crate) fn client_config(tune: impl FnOnce(&mut TransportConfig)) -> ClientCo
     config
 }
 
+/// Accepts any server certificate and keeps the last one it saw, for clients
+/// that are not libp2p peers (a browser, a peer with a bad certificate).
+#[derive(Debug, Default)]
+pub(crate) struct AnyServer(std::sync::Mutex<Option<Vec<u8>>>);
+
+impl AnyServer {
+    /// The DER of the last certificate the server presented.
+    pub(crate) fn seen(&self) -> Option<Vec<u8>> {
+        self.0.lock().expect("seen lock").clone()
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for AnyServer {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let mut seen = self
+            .0
+            .lock()
+            .map_err(|_poisoned| rustls::Error::General("seen lock poisoned".into()))?;
+        *seen = Some(end_entity.to_vec());
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// A client config offering `alpns` that trusts any server and presents
+/// `cert` (DER certificate and PKCS#8 key), or no certificate at all.
+pub(crate) fn foreign_client_config(
+    alpns: &[&[u8]],
+    cert: Option<(Vec<u8>, Vec<u8>)>,
+    server: Arc<AnyServer>,
+) -> ClientConfig {
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .expect("tls13")
+    .dangerous()
+    .with_custom_certificate_verifier(server);
+    let mut tls = match cert {
+        Some((cert, key)) => builder
+            .with_client_auth_cert(
+                vec![rustls::pki_types::CertificateDer::from(cert)],
+                rustls::pki_types::PrivateKeyDer::try_from(key).expect("pkcs8"),
+            )
+            .expect("client certificate"),
+        None => builder.with_no_client_auth(),
+    };
+    tls.alpn_protocols = alpns.iter().map(|alpn| alpn.to_vec()).collect();
+    let crypto = QuicClientConfig::try_from(tls).expect("quic client tls");
+    let mut config = ClientConfig::new(Arc::new(crypto));
+    config.transport_config(Arc::new(default_transport()));
+    config
+}
+
 /// Datagrams waiting on `socket`, taken.
 pub(crate) fn take_datagrams(socket: &UdpSocket) -> Vec<Vec<u8>> {
     let mut buf = [0u8; 65_535];

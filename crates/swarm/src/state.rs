@@ -130,6 +130,9 @@ struct PendingOutbound {
     /// When the negotiation is given up; see
     /// [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`].
     deadline_ms: u64,
+    /// The peer's stop-sending code, when it arrived after our proposal
+    /// went out: handled as the negotiated protocol would once it is.
+    write_stopped: Option<u64>,
 }
 
 /// Transport work the state queues for [`crate::SwarmCore`] to dispatch.
@@ -300,7 +303,7 @@ fn event_peer_mut(event: &mut SwarmEvent) -> Option<&mut PeerId> {
         | SwarmEvent::StreamWriteStopped { peer_id, .. }
         | SwarmEvent::StreamClosed { peer_id, .. } => Some(peer_id),
         SwarmEvent::Error(error) => error.peer_id.as_mut(),
-        SwarmEvent::DialFailed { .. } => None,
+        SwarmEvent::DialFailed { .. } | SwarmEvent::ListenAddressesChanged { .. } => None,
     }
 }
 
@@ -1525,6 +1528,7 @@ impl SwarmState {
                 negotiator,
                 target,
                 deadline_ms: now_ms.saturating_add(OUTBOUND_NEGOTIATION_TIMEOUT_MS),
+                write_stopped: None,
             },
         );
     }
@@ -2291,8 +2295,14 @@ impl SwarmState {
     }
 
     /// User streams surface the stop to the application. Internal protocols
-    /// and in-flight negotiations cannot finish without writing, so their
-    /// stream is reset; the resulting `StreamClosed` tears them down.
+    /// and in-flight negotiations that still have to write cannot finish, so
+    /// their stream is reset; the resulting `StreamClosed` tears them down.
+    ///
+    /// Two only read on: an Identify request, and an outbound negotiation
+    /// whose proposal is out, which waits for the reply and then handles the
+    /// stop as its protocol would. A peer that answers and closes at once
+    /// (go-libp2p's WebTransport `Close` also stops our sending) must not
+    /// lose its answer.
     fn handle_stream_write_stopped(
         &mut self,
         conn_id: ConnectionId,
@@ -2302,6 +2312,15 @@ impl SwarmState {
         let key = (conn_id, stream_id);
         self.forget_held(conn_id, stream_id);
         if self.abandoned_streams.contains(&key) {
+            return;
+        }
+        if let Some(pending) = self.outbound_negotiators.get_mut(&key)
+            && pending.negotiator.awaits_response()
+        {
+            pending.write_stopped = Some(error_code);
+            return;
+        }
+        if let Some(ProtocolKind::IdentifyInitiator) = self.stream_protocol(conn_id, stream_id) {
             return;
         }
         if let Some(ProtocolKind::User(_)) = self.stream_protocol(conn_id, stream_id) {
@@ -2556,14 +2575,16 @@ impl SwarmState {
         }
 
         if negotiated {
-            let remaining = self
+            let (remaining, write_stopped) = self
                 .outbound_negotiators
-                .get_mut(&key)
-                .map(|p| p.negotiator.take_remaining_buffer())
+                .remove(&key)
+                .map(|mut p| (p.negotiator.take_remaining_buffer(), p.write_stopped))
                 .unwrap_or_default();
 
-            self.outbound_negotiators.remove(&key);
             self.on_outbound_negotiated(conn_id, stream_id, target, now_ms);
+            if let Some(error_code) = write_stopped {
+                self.handle_stream_write_stopped(conn_id, stream_id, error_code);
+            }
 
             if !remaining.is_empty() {
                 return self.dispatch_protocol_data(
@@ -3324,6 +3345,7 @@ mod tests {
                 negotiator,
                 target: ProtocolKind::User("/test/1".into()),
                 deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+                write_stopped: None,
             },
         );
 
@@ -4282,6 +4304,7 @@ mod tests {
                 negotiator: MultistreamSelect::dialer("/test/1"),
                 target: ProtocolKind::User("/test/1".into()),
                 deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+                write_stopped: None,
             },
         );
 
@@ -4313,6 +4336,7 @@ mod tests {
                 negotiator: MultistreamSelect::dialer("/test/1"),
                 target: ProtocolKind::User("/test/1".into()),
                 deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+                write_stopped: None,
             },
         );
         let not_ready = Err(SwarmError::StreamNotReady {
@@ -4535,6 +4559,85 @@ mod tests {
             [Action::ResetStream { conn_id: reset_conn, stream_id }]
                 if *reset_conn == conn_id && *stream_id == ping
         ));
+    }
+
+    /// A multistream-select line: its varint length, then the text.
+    fn ms_line(text: &str) -> Bytes {
+        let mut line = vec![u8::try_from(text.len()).expect("a short line")];
+        line.extend_from_slice(text.as_bytes());
+        Bytes::from(line)
+    }
+
+    /// go-libp2p's WebTransport `Close` stops our sending as it answers, so
+    /// a write stop can overtake the reply to a proposal already sent.
+    #[test]
+    fn a_write_stop_after_the_proposal_waits_for_the_reply() {
+        let (mut core, conn, stream) = negotiating_user_stream(0);
+        let data = |text: &str| TransportEvent::StreamData {
+            id: conn,
+            stream_id: stream,
+            data: ms_line(text),
+        };
+        feed(&mut core, data("/multistream/1.0.0\n"));
+        drain_actions(&mut core);
+        feed(
+            &mut core,
+            TransportEvent::StreamWriteStopped {
+                id: conn,
+                stream_id: stream,
+                error_code: 3,
+            },
+        );
+        let actions = drain_actions(&mut core);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::ResetStream { .. })),
+            "{actions:?}"
+        );
+
+        feed(&mut core, data("/app/1\n"));
+        let events: Vec<_> = drain_events(&mut core)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    SwarmEvent::StreamReady { .. } | SwarmEvent::StreamWriteStopped { .. }
+                )
+            })
+            .collect();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    SwarmEvent::StreamReady { stream_id: ready, .. },
+                    SwarmEvent::StreamWriteStopped { stream_id: stopped, error_code: 3, .. },
+                ] if *ready == stream && *stopped == stream
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_write_stop_on_an_identify_request_lets_the_reply_arrive() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"identify-stop-peer");
+        let conn_id = ConnectionId::new(13);
+        let stream_id = StreamId::new(4);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id, conn_id);
+        core.insert_stream_owner(conn_id, stream_id, ProtocolKind::IdentifyInitiator);
+
+        feed(
+            &mut core,
+            TransportEvent::StreamWriteStopped {
+                id: conn_id,
+                stream_id,
+                error_code: 0,
+            },
+        );
+
+        assert_eq!(drain_actions(&mut core), Vec::new());
     }
 
     #[test]
@@ -5411,6 +5514,7 @@ mod tests {
                 negotiator: MultistreamSelect::dialer("/test/1"),
                 target: ProtocolKind::User("/test/1".into()),
                 deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+                write_stopped: None,
             },
         );
         core.reset_stream(&peer, conn, stream)

@@ -1024,6 +1024,37 @@ fn a_remote_that_never_starts_dcutr_settles_relayed_after_the_start_timeout() {
 }
 
 #[test]
+fn a_remote_without_dcutr_settles_relayed_once_identified() {
+    // A browser: it never offers DCUtR, so it never starts a round.
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    h.agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: h.target.clone(),
+            conn_id: conn,
+            protocols: vec!["/ipfs/ping/1.0.0".into()],
+        },
+        true,
+        at(320),
+    );
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::FellBackToRelay {
+            connect_id,
+            reason: UpgradeStop::Unsupported,
+            ..
+        }] if *connect_id == id
+    ));
+    assert!(
+        drain_actions(&mut h.agent)
+            .iter()
+            .all(|out| !matches!(out, Out::CloseCircuit { conn_id } if *conn_id == conn)),
+        "the Relayed path stays"
+    );
+    assert!(h.agent.is_idle());
+}
+
+#[test]
 fn a_stalled_exchange_settles_relayed_with_its_round() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (id, conn) = drive_to_relayed(&mut h);

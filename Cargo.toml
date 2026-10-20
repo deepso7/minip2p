@@ -26,8 +26,10 @@ members = [
   "crates/test-support",
   "crates/tls",
   "crates/transport",
+  "crates/web",
   "transports/quic",
   "transports/tcp",
+  "transports/webtransport",
   "examples/chat",
   "examples/common",
   "examples/peer",
@@ -124,3 +126,11 @@ dbg_macro = "warn"
 # a deliberate #[expect(..., reason = "…")] rather than a silent #[allow]
 allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
+
+# The browser build (`crates/web`): size over speed, one codegen unit, LTO.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

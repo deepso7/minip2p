@@ -1,0 +1,45 @@
+[package]
+name = "minip2p-web"
+description = "wasm-bindgen shell for minip2p in the browser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+# `cdylib` is the wasm module; `rlib` lets the host tests run natively.
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# The thread-free host core: no std driver, threads, clock or sockets.
+# Relay reservations and circuits come from `portable-relay` (no DCUtR).
+minip2p = { package = "minip2p-rs", path = "../minip2p", default-features = false, features = [
+  "portable-relay",
+  "pubsub",
+] }
+minip2p-core = { path = "../core", default-features = false }
+minip2p-ffi-core = { path = "../ffi-core", default-features = false, features = [
+  "relay",
+  "serde",
+] }
+minip2p-pubsub = { path = "../pubsub", default-features = false }
+minip2p-webtransport = { path = "../../transports/webtransport", default-features = false }
+getrandom = { workspace = true }
+js-sys = "0.3.105"
+serde = { workspace = true, features = ["std", "derive"] }
+serde-wasm-bindgen = "0.6.5"
+serde_bytes = "0.11.19"
+wasm-bindgen = "=0.2.128"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `crypto.getRandomValues`; getrandom 0.4 needs no RUSTFLAGS for it.
+getrandom = { workspace = true, features = ["wasm_js"] }
+
+[dev-dependencies]
+minip2p-test-support = { path = "../test-support" }

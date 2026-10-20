@@ -55,3 +55,4 @@ signature = { version = "3.0.0", default-features = false }
 sha2 = { workspace = true, features = ["oid"] }
 rand_core = { workspace = true }
 getrandom = { workspace = true, features = ["sys_rng"], optional = true }
+hkdf = { version = "0.13.0", default-features = false }

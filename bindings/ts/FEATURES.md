@@ -1,6 +1,6 @@
 # TypeScript feature mapping
 
-`@minip2p/core` describes the portable host API. React Native implements that contract through UniFFI; Node and WASM adapters can implement the same contract without changing application code.
+`@minip2p/core` describes the portable host API. React Native implements that contract through UniFFI, Node through napi-rs, and the browser (`@minip2p/web`) through wasm-bindgen, without changing application code. The browser runs a subset: see the last table.
 
 | Rust `Endpoint` capability | TypeScript SDK |
 | --- | --- |
@@ -13,7 +13,7 @@
 | Negotiated streams | Promise-returning `openStream` and `Stream` handles with `write`, `read`, `closeWrite`, `reset`, and `abandon`; each operation names the stream's own connection, so it never reaches a stream on a newer connection. `write` resolves once native accepted every byte, rejects with `WriteBufferFullError` when bytes are already buffered and the write would push them past `writeHighWaterMark` (a write into an empty buffer is always admitted), and `closeWrite` follows every earlier write. Before the endpoint processes a replacement or close, `write` on the old connection rejects and `closeWrite` and `reset` throw (a `closeWrite` queued behind pending writes reports the end through the stream's terminal event instead); afterwards the stream has ended: `write` rejects, `closeWrite`, `reset`, and `abandon` do nothing, and reads reject (`StreamClosedError` after a replacement) |
 | Connection targets and Connect IDs | Promise-returning `connect(target)`, split-phase `startConnect(target)`/`waitConnectResult`/`cancelConnect`, and typed terminal events |
 | Relay, AutoNAT, DCUtR | Driven by `connect`; `path(peerId)` and typed path/reachability events |
-| State snapshots | `connectedPeers`, `path` (every connected peer's: `direct`, `punched`, or `relayed`), `connectionInfo` (by peer: `{ peerId, connId, remoteAddr, path, readyProtocols? }`), `knownPeers`, `listenAddrs`, `activeReservation` |
+| State snapshots | `connectedPeers`, `path` (every connected peer's: `direct`, `punched`, or `relayed`), `connectionInfo` (by peer: `{ peerId, connId, remoteAddr, path, readyProtocols? }`), `knownPeers`, `listenAddrs` (kept current: `listenAddressesChanged` fires when a WebTransport listener's certhashes rotate), `activeReservation` |
 | Pubsub | gossipsub subscribe/unsubscribe/publish, pubsub events |
 | Signed discovery | discovery configuration, `knownPeers`, discovery events |
 | mDNS | mDNS configuration, merged `knownPeers`, source-tagged discovery events, and `mdnsFailed` (`{ kind: MdnsFailureKind, detail }`) / `mdnsRecovered` health events |
@@ -22,3 +22,16 @@
 | One Endpoint event stream and its blocking wait (event, deadline, interrupted) | Driven by each platform backend; surfaced as typed events, State getters, and Promise waits such as `waitFor` and `waitConnectResult` |
 
 Resource-policy tuning remains native configuration until it has consistent semantics across every backend.
+
+## In the browser
+
+`@minip2p/web` runs the same SDK over a WebTransport-only portable endpoint.
+
+| Capability | `@minip2p/web` |
+| --- | --- |
+| Dialing | `/…/quic-v1/webtransport/certhash/…/p2p/…` addresses only; other candidates fail as candidates |
+| Ping, Identify, custom protocol streams, pubsub | As on native |
+| Listening, mDNS, signed discovery, AutoNAT | Rejected at `create` with `InvalidConfigError` and the reason |
+| Relay reservations and circuits (`relays`, `forceRelay`) | Reservations on WebTransport relays, reachable at the `/p2p-circuit` address from browsers and native nodes; connects race the direct dial against the relay leg (`direct` or `relayed`, never `punched`); `forceRelay` needs `relays` |
+| Shutdown | `close` closes every session at once with WebTransport's close capsule |
+| Driver failure | A trapped wasm module reports `driverFailed`; later calls throw `ClosedError` |

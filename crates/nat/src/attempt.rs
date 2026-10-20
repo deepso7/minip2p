@@ -5,7 +5,9 @@ use alloc::vec::Vec;
 
 use minip2p_core::platform::Now;
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, Protocol};
-use minip2p_dcutr::{DcutrError, DcutrResponder, DcutrResponderOutput, ResponderEvent};
+use minip2p_dcutr::{
+    DCUTR_PROTOCOL_ID, DcutrError, DcutrResponder, DcutrResponderOutput, ResponderEvent,
+};
 use minip2p_relay::{ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectOutput, RelayError};
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -229,7 +231,7 @@ impl ConnectAttempt {
         shared: &Shared,
     ) -> bool {
         !self.done
-            && !shared.config.force_relay
+            && shared.config.upgrades()
             && &self.peer == peer
             && self.promoted == Some(conn_id)
             && self.upgrade_deadline.is_some()
@@ -671,6 +673,28 @@ impl ConnectAttempt {
         }
         if let Some(result) = acquire::on_ready(peer, conn, HOP_PROTOCOL_ID, swarm, now) {
             self.on_acquired(result, swarm, shared, now);
+        }
+    }
+
+    /// The target identified itself on the circuit carrying the Relayed
+    /// path. A target that does not offer DCUtR never starts a round, so
+    /// the attempt settles Relayed now rather than at the start timeout.
+    pub(crate) fn on_target_ready(
+        &mut self,
+        peer: &PeerId,
+        conn: ConnectionId,
+        protocols: &[String],
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) {
+        // The start deadline runs until the target's first round.
+        let waiting = !self.done
+            && &self.peer == peer
+            && self.promoted == Some(conn)
+            && self.start_deadline.is_some();
+        if waiting && !protocols.iter().any(|p| p == DCUTR_PROTOCOL_ID) {
+            self.settle_relayed(UpgradeStop::Unsupported, swarm, shared, now);
         }
     }
 
@@ -1211,7 +1235,7 @@ impl ConnectAttempt {
         let path = Path::Relayed { relay };
         self.best = Some(path.clone());
         self.path_conn = Some(conn_id);
-        if !shared.config.force_relay {
+        if shared.config.upgrades() {
             self.relayed_at = now.monotonic_ms;
             self.upgrade_deadline =
                 Some(self.clip(now.monotonic_ms + shared.config.upgrade_timeout_ms));

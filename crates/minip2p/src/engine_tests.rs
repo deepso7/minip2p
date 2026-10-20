@@ -336,6 +336,38 @@ fn relay_over_a_transport_without_circuit_operations_is_refused() {
     );
 }
 
+/// Portable relays need DCUtR off: `dcutr = false` keeps direct racing,
+/// while relays with DCUtR on (and no `force_relay`) are refused.
+#[cfg(feature = "portable-relay")]
+#[test]
+fn portable_relays_need_dcutr_off_or_force_relay() {
+    let identity = Ed25519Keypair::from_secret_key_bytes([44; 32]);
+    let relay = target(&Ed25519Keypair::from_secret_key_bytes([45; 32]).peer_id());
+    let build = |dcutr: bool| {
+        Endpoint::portable(&identity, CountingEntropy(0))
+            .nat_config(minip2p_nat::NatConfig {
+                relays: vec![relay.clone()],
+                dcutr,
+                reservation_policy: minip2p_nat::ReservationPolicy::Always,
+                ..minip2p_nat::NatConfig::default()
+            })
+            .build_with_circuits(minip2p_circuit::CircuitTransport::new(
+                FlashTransport::default(),
+                identity.clone(),
+                CountingEntropy(9),
+            ))
+    };
+    build(false).expect("dcutr off builds");
+    let error = build(true).err().expect("refused");
+    assert!(
+        matches!(
+            error,
+            crate::PortableBuildError::NatConfig(crate::PortableNatConfigError::RelayWithDcutr)
+        ),
+        "{error}"
+    );
+}
+
 /// Relay-server listener addresses come from the bound transports, not from
 /// configuration: a set the agent rejects does not fail the build, and is
 /// reported once as a capability event while the endpoint keeps running.

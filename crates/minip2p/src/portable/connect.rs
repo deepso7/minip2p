@@ -220,6 +220,17 @@ pub(crate) enum RelayPolicy {
         )
     )]
     Race,
+    /// Race direct candidates against a relay leg that never upgrades
+    /// (DCUtR off): Relayed is provisional only while a direct candidate is
+    /// still in the race.
+    #[cfg_attr(
+        all(not(test), not(feature = "_nat-driver")),
+        expect(
+            dead_code,
+            reason = "only NAT-enabled compositions construct a racing relay policy"
+        )
+    )]
+    RaceWithoutUpgrade,
     /// Skip direct racing; a circuit is a terminal Connected path.
     #[cfg_attr(
         all(not(test), not(feature = "_nat-driver")),
@@ -229,6 +240,18 @@ pub(crate) enum RelayPolicy {
         )
     )]
     Forced,
+}
+
+impl RelayPolicy {
+    /// Whether an established circuit ends the attempt as Connected, given
+    /// whether a direct candidate is still in the race.
+    fn circuit_settles(self, racing_direct: bool) -> bool {
+        match self {
+            Self::None | Self::Forced => true,
+            Self::RaceWithoutUpgrade => !racing_direct,
+            Self::Race => false,
+        }
+    }
 }
 
 /// One candidate's failure diagnostic.
@@ -385,14 +408,14 @@ enum RelayLeg {
     None,
     /// `relay` is the relay currently being tried, once the leg started one.
     Pending {
-        forced: bool,
+        policy: RelayPolicy,
         relay: Option<PeerAddr>,
     },
     /// `conn_id` is an established circuit through `circuit_relay`.
     Provisional {
         conn_id: ConnectionId,
         circuit_relay: PeerId,
-        forced: bool,
+        policy: RelayPolicy,
         relay: Option<PeerAddr>,
     },
     #[cfg_attr(
@@ -406,12 +429,8 @@ impl RelayLeg {
     fn from_policy(policy: RelayPolicy) -> Self {
         match policy {
             RelayPolicy::None => Self::None,
-            RelayPolicy::Race => Self::Pending {
-                forced: false,
-                relay: None,
-            },
-            RelayPolicy::Forced => Self::Pending {
-                forced: true,
+            policy => Self::Pending {
+                policy,
                 relay: None,
             },
         }
@@ -704,14 +723,14 @@ impl ConnectEngine {
         for attempt in self.attempts.values_mut() {
             if let RelayLeg::Provisional {
                 conn_id: provisional,
-                forced,
+                policy,
                 ref relay,
                 ..
             } = attempt.relay
                 && provisional == conn_id
             {
                 attempt.relay = RelayLeg::Pending {
-                    forced,
+                    policy,
                     relay: relay.clone(),
                 };
             }
@@ -812,7 +831,9 @@ impl ConnectEngine {
             let settle = match attempt.relay {
                 _ if !circuit => true,
                 RelayLeg::None | RelayLeg::Failed => true,
-                RelayLeg::Pending { forced, .. } | RelayLeg::Provisional { forced, .. } => forced,
+                RelayLeg::Pending { policy, .. } | RelayLeg::Provisional { policy, .. } => {
+                    policy.circuit_settles(attempt.racing_direct())
+                }
             };
             if settle {
                 let pending = attempt
@@ -845,13 +866,13 @@ impl ConnectEngine {
             }
             // Only a circuit reaches here, so its relay is known.
             if let Some(circuit_relay) = circuit_relay.clone()
-                && let RelayLeg::Pending { forced, relay }
-                | RelayLeg::Provisional { forced, relay, .. } = attempt.relay
+                && let RelayLeg::Pending { policy, relay }
+                | RelayLeg::Provisional { policy, relay, .. } = attempt.relay
             {
                 attempt.relay = RelayLeg::Provisional {
                     conn_id,
                     circuit_relay,
-                    forced,
+                    policy,
                     relay,
                 };
             }
@@ -1020,7 +1041,16 @@ impl ConnectEngine {
     }
 
     fn settle_if_exhausted(&mut self, id: ConnectId, attempt: Attempt) {
-        match &attempt.relay {
+        match attempt.relay {
+            RelayLeg::Provisional {
+                conn_id,
+                ref circuit_relay,
+                policy,
+                ..
+            } if policy.circuit_settles(attempt.racing_direct()) => {
+                let circuit_relay = circuit_relay.clone();
+                self.push_connected(id, attempt.peer, conn_id, Some(circuit_relay));
+            }
             RelayLeg::Pending { .. } | RelayLeg::Provisional { .. } => {
                 self.attempts.insert(id, attempt);
             }
@@ -1271,8 +1301,10 @@ pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
         Some(driver) if allow_relay && driver.has_relay() => {
             if driver.force_relay() {
                 RelayPolicy::Forced
-            } else {
+            } else if driver.dcutr() {
                 RelayPolicy::Race
+            } else {
+                RelayPolicy::RaceWithoutUpgrade
             }
         }
         _ => RelayPolicy::None,
@@ -2700,6 +2732,46 @@ mod tests {
             Some(ConnectOutcome::Connected { conn_id, .. }) if *conn_id == ConnectionId::new(1)
         ));
         assert!(settled_for(&drain(&mut engine, &mut runtime, 1), id).is_none());
+    }
+
+    /// Without DCUtR nothing can upgrade the circuit once the direct
+    /// candidates are gone, so it settles then, in either order.
+    #[test]
+    fn a_race_without_upgrades_settles_relayed_once_direct_candidates_fail() {
+        for circuit_first in [true, false] {
+            let peer = peer(b"no-upgrade");
+            let mut runtime = runtime(FakeTransport::default());
+            let mut engine = ConnectEngine::new(30_000);
+            let id = admit(
+                &mut engine,
+                peer.clone(),
+                vec![addr(&peer, 1)],
+                RelayPolicy::RaceWithoutUpgrade,
+                &mut runtime,
+                0,
+            );
+            let conn = circuit(9);
+            let (first, second) = if circuit_first {
+                runtime.transport_mut().push_circuit(conn, peer.clone());
+                let first = drain(&mut engine, &mut runtime, 0);
+                runtime.transport_mut().push_closed(ConnectionId::new(1));
+                (first, drain(&mut engine, &mut runtime, 0))
+            } else {
+                runtime.transport_mut().push_closed(ConnectionId::new(1));
+                let first = drain(&mut engine, &mut runtime, 0);
+                runtime.transport_mut().push_circuit(conn, peer.clone());
+                (first, drain(&mut engine, &mut runtime, 0))
+            };
+            assert!(settled_for(&first, id).is_none(), "{first:?}");
+            assert!(
+                matches!(
+                    settled_for(&second, id),
+                    Some(ConnectOutcome::Connected { conn_id, path: Path::Relayed { .. } })
+                        if *conn_id == conn
+                ),
+                "circuit_first={circuit_first}: {second:?}"
+            );
+        }
     }
 
     #[test]

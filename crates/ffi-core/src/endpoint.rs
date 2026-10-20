@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 
 use minip2p::{
     BeaconConfig, BindError, ConnectionId, DiscoveryConfigError, Endpoint, EndpointBuilder,
-    EndpointOptionsError, GossipsubConfig, GossipsubError, MdnsConfig, MdnsConfigError, Multiaddr,
-    NatConfig, PeerDiscoveryConfig, PeerId, PublishError, QuicBindError, StreamId, TopicError,
-    TransportError, WaitHandle,
+    EndpointOptionsError, GossipsubConfig, MdnsConfig, MdnsConfigError, Multiaddr, NatConfig,
+    PeerDiscoveryConfig, PeerId, QuicBindError, StreamId, TransportError, WaitHandle,
 };
 
 use crate::{
-    ConfigCapability, DriverStats, EndpointConfig, EventDoorbell, FfiError, IdentifyInfo,
-    KnownPeerInfo, P2pEvent, RelayReservationInfo, keypair_from_bytes, parse_direct_peer_addr,
+    ConfigCapability, DriverStats, EndpointConfig, EventCarry, EventDoorbell, FfiError,
+    IdentifyInfo, KnownPeerInfo, P2pEvent, RelayReservationInfo, keypair_from_bytes,
+    map_driver_error, map_gossipsub_error, parse_direct_peer_addr, parse_peer_id,
 };
 
 /// Adds address-shaped listeners, or the QUIC dual-stack defaults when
@@ -48,7 +48,6 @@ fn configure_listen(
 pub struct P2pEndpoint {
     shared: Arc<Shared>,
     peer_id: String,
-    listen_addrs: Vec<String>,
 }
 
 /// The close drain a dropped [`P2pEndpoint`] grants, in milliseconds:
@@ -68,7 +67,7 @@ pub(crate) struct Shared {
     /// Converted events awaiting `drain_events`. Locked apart from `state`,
     /// which the driver holds across its wait, so draining neither waits for
     /// nor interrupts the driver. Lock order: `state`, then `events`.
-    events: Mutex<crate::driver::EventState>,
+    events: Mutex<EventState>,
     /// Latched once the lifecycle reaches `Stopped`. `wait_stopped` sleeps on
     /// this rather than on `state`, which the driver holds for as long as the
     /// endpoint has nothing due.
@@ -85,6 +84,36 @@ pub(crate) struct Shared {
     commands_idle_cv: Condvar,
     pub(crate) driver_running: AtomicBool,
     doorbell_running: AtomicBool,
+}
+
+/// The carry and what the driver publishes beside it, behind the endpoint's
+/// event lock.
+#[derive(Default)]
+pub(crate) struct EventState {
+    pub(crate) carry: EventCarry,
+    /// What `connected_peers` returns, published from the endpoint's peer
+    /// table by the driver (see `Shared::publish_peers`), so the
+    /// query neither interrupts nor waits for the driver.
+    pub(crate) connected_peers: Vec<String>,
+    /// What `listen_addrs` returns: the bound listen set at build, then
+    /// each [`P2pEvent::ListenAddressesChanged`] the driver ingests.
+    pub(crate) listen_addrs: Vec<String>,
+    /// Set with the lifecycle once it reaches `Stopping` or `Stopped`.
+    pub(crate) stopped: bool,
+}
+
+impl EventState {
+    /// Takes the driver's converted events into the carry, following the
+    /// listen set they announce; returns whether to ring the doorbell
+    /// (see [`EventCarry::ingest`]).
+    pub(crate) fn ingest(&mut self, converted: Vec<P2pEvent>) -> bool {
+        for event in &converted {
+            if let P2pEvent::ListenAddressesChanged { addrs } = event {
+                self.listen_addrs.clone_from(addrs);
+            }
+        }
+        self.carry.ingest(converted)
+    }
 }
 
 pub(crate) struct EndpointState {
@@ -104,7 +133,7 @@ impl EndpointState {
     /// Releases the Endpoint together with the tails held for it, which can
     /// be large and are owed to streams that no longer exist.
     pub(crate) fn release_endpoint(&mut self) -> Option<Endpoint> {
-        self.writes = crate::writes::writer();
+        self.writes = crate::stream_writer();
         self.endpoint.take()
     }
 }
@@ -242,11 +271,14 @@ impl P2pEndpoint {
                     endpoint: Some(endpoint),
                     driver_thread_id: None,
                     doorbell_thread_id: None,
-                    writes: crate::writes::writer(),
+                    writes: crate::stream_writer(),
                     published_peers: Vec::new(),
                     close_timeout: Duration::ZERO,
                 }),
-                events: Mutex::default(),
+                events: Mutex::new(EventState {
+                    listen_addrs,
+                    ..EventState::default()
+                }),
                 stopped: Mutex::new(false),
                 stopped_cv: Condvar::new(),
                 wait_handle,
@@ -259,7 +291,6 @@ impl P2pEndpoint {
                 doorbell_running: AtomicBool::new(false),
             }),
             peer_id,
-            listen_addrs,
         }))
     }
 
@@ -268,9 +299,11 @@ impl P2pEndpoint {
         self.peer_id.clone()
     }
 
-    /// Returns the bound QUIC or TCP peer addresses.
+    /// Returns the bound QUIC or TCP peer addresses, as of the last
+    /// [`P2pEvent::ListenAddressesChanged`] the driver carried (a
+    /// WebTransport certificate rotation changes them).
     pub fn listen_addrs(&self) -> Vec<String> {
-        self.listen_addrs.clone()
+        self.shared.lock_events().listen_addrs.clone()
     }
 
     /// Returns peers with an established QUIC, TCP, or circuit connection.
@@ -337,24 +370,10 @@ impl P2pEndpoint {
         if limit == 0 {
             return Vec::new();
         }
-        let mut events = self.shared.lock_events();
-        let crate::driver::EventState {
-            carry,
-            overflow,
-            stats,
-            ..
-        } = &mut *events;
-        let mut delivery = crate::driver::take_delivery(carry, overflow, stats, limit as usize);
-        stats.dispatch_attempted = stats
-            .dispatch_attempted
-            .saturating_add(delivery.batch.len() as u64);
-        let mut events =
-            Vec::with_capacity(delivery.batch.len() + usize::from(delivery.diagnostic.is_some()));
-        if let Some(diagnostic) = delivery.diagnostic.take() {
-            events.push(diagnostic);
-        }
-        events.extend(delivery.batch);
-        events
+        self.shared
+            .lock_events()
+            .carry
+            .take_delivery(limit as usize)
     }
 
     /// Requests shutdown without waiting for an in-flight callback.
@@ -566,7 +585,7 @@ impl P2pEndpoint {
                     data,
                 )
                 .map(|progress| progress == minip2p::WriteProgress::Accepted)
-                .map_err(crate::writes::map_write_error)
+                .map_err(crate::map_write_error)
         })
     }
 
@@ -582,7 +601,7 @@ impl P2pEndpoint {
                     ConnectionId::new(conn_id),
                     StreamId::new(stream_id),
                 )
-                .map_err(crate::writes::map_write_error)
+                .map_err(crate::map_write_error)
         })
     }
 
@@ -621,7 +640,7 @@ impl P2pEndpoint {
             if !accepted {
                 return abandoned.map_err(map_driver_error);
             }
-            let (dropped_data, _) = events.carry.remove_stream(raw_conn, raw_stream);
+            let dropped_data = events.carry.remove_stream(raw_conn, raw_stream);
             drop(events);
             // Never drained, so never acknowledged: after a reset or a
             // settlement this is moot, and a stream closed on a live
@@ -826,7 +845,7 @@ impl P2pEndpoint {
     ///
     /// This method is intentionally outside the UniFFI export block.
     pub fn driver_stats(&self) -> DriverStats {
-        self.shared.lock_events().stats
+        self.shared.lock_events().carry.stats()
     }
 
     fn with_endpoint<T>(&self, operation: impl FnOnce(&Endpoint) -> T) -> Result<T, FfiError> {
@@ -872,7 +891,7 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn lock_events(&self) -> MutexGuard<'_, crate::driver::EventState> {
+    pub(crate) fn lock_events(&self) -> MutexGuard<'_, EventState> {
         self.events.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -1016,12 +1035,6 @@ fn map_mdns_config_error(error: MdnsConfigError) -> FfiError {
     }
 }
 
-pub(crate) fn parse_peer_id(peer_id: &str) -> Result<PeerId, FfiError> {
-    PeerId::from_str(peer_id).map_err(|error| FfiError::InvalidPeerId {
-        detail: error.to_string(),
-    })
-}
-
 /// Maps a failure to build the endpoint: configuration mistakes to
 /// `InvalidConfig` naming their capability, malformed listen input to
 /// `InvalidAddress`, refused sockets to `Transport`, and broken invariants to
@@ -1082,40 +1095,6 @@ fn map_options_error(error: EndpointOptionsError) -> FfiError {
         _ => FfiError::InvalidConfig {
             capability: ConfigCapability::Options,
             detail,
-        },
-    }
-}
-
-fn map_gossipsub_error(error: GossipsubError) -> FfiError {
-    match error {
-        GossipsubError::DiscoveryTopicReserved => FfiError::NotPermitted {
-            detail: error.to_string(),
-        },
-        GossipsubError::Publish(PublishError::TooLarge) => FfiError::MessageTooLarge,
-        GossipsubError::Publish(PublishError::Backpressure) => FfiError::Backpressure,
-        GossipsubError::Publish(PublishError::Topic(error)) | GossipsubError::Topic(error) => {
-            map_topic_error(error)
-        }
-        GossipsubError::Driver(error) => map_driver_error(error),
-        GossipsubError::NotEnabled => FfiError::Internal {
-            detail: error.to_string(),
-        },
-    }
-}
-
-fn map_topic_error(error: TopicError) -> FfiError {
-    FfiError::InvalidTopic {
-        detail: error.to_string(),
-    }
-}
-
-pub(crate) fn map_driver_error(error: minip2p::Error) -> FfiError {
-    match error {
-        minip2p::Error::Transport(_) => FfiError::Transport {
-            detail: error.to_string(),
-        },
-        _ => FfiError::Internal {
-            detail: error.to_string(),
         },
     }
 }
@@ -1236,11 +1215,11 @@ mod tests {
         let endpoint = endpoint(config()).expect("endpoint");
         {
             let mut events = endpoint.shared.lock_events();
-            events.carry.push(P2pEvent::PingTimeout {
+            events.carry.carry.push(P2pEvent::PingTimeout {
                 peer_id: "a".into(),
                 conn_id: 1,
             });
-            events.carry.push(P2pEvent::PingTimeout {
+            events.carry.carry.push(P2pEvent::PingTimeout {
                 peer_id: "b".into(),
                 conn_id: 1,
             });
@@ -1291,7 +1270,7 @@ mod tests {
             peer_id: "a".into(),
             conn_id: 1,
         };
-        endpoint.shared.lock_events().carry.push(ping.clone());
+        endpoint.shared.lock_events().carry.carry.push(ping.clone());
         // A driver parked in `wait` holds the state lock.
         let mut parked = endpoint.shared.lock_state();
         let (drained_tx, drained_rx) = std::sync::mpsc::channel();
@@ -1337,7 +1316,7 @@ mod tests {
             drained.extend(a.drain_events(4_096));
             if drained
                 .iter()
-                .any(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+                .any(|event| crate::carry::terminal_connect_id(event) == Some(connect_id))
             {
                 break;
             }
@@ -1346,7 +1325,7 @@ mod tests {
 
         let terminals: Vec<&P2pEvent> = drained
             .iter()
-            .filter(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+            .filter(|event| crate::carry::terminal_connect_id(event) == Some(connect_id))
             .collect();
         assert_eq!(
             terminals,
@@ -1367,7 +1346,7 @@ mod tests {
         assert_eq!(
             drained
                 .iter()
-                .filter(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+                .filter(|event| crate::carry::terminal_connect_id(event) == Some(connect_id))
                 .count(),
             1,
             "no further terminal after the first cancel: {drained:#?}"
@@ -1403,7 +1382,7 @@ mod tests {
             drained.extend(a.drain_events(4_096));
             if drained
                 .iter()
-                .any(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+                .any(|event| crate::carry::terminal_connect_id(event) == Some(connect_id))
             {
                 break;
             }
@@ -1419,7 +1398,7 @@ mod tests {
 
         let terminals: Vec<&P2pEvent> = drained
             .iter()
-            .filter(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+            .filter(|event| crate::carry::terminal_connect_id(event) == Some(connect_id))
             .collect();
         assert_eq!(
             terminals.len(),
@@ -1463,7 +1442,7 @@ mod tests {
 
         let terminals: Vec<&P2pEvent> = drained
             .iter()
-            .filter(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+            .filter(|event| crate::carry::terminal_connect_id(event) == Some(connect_id))
             .collect();
         assert_eq!(
             terminals.len(),
@@ -2408,11 +2387,15 @@ mod tests {
         ));
 
         assert!(matches!(
-            map_gossipsub_error(GossipsubError::Publish(PublishError::TooLarge)),
+            map_gossipsub_error(minip2p::GossipsubError::Publish(
+                minip2p::PublishError::TooLarge
+            )),
             FfiError::MessageTooLarge
         ));
         assert!(matches!(
-            map_gossipsub_error(GossipsubError::Publish(PublishError::Backpressure)),
+            map_gossipsub_error(minip2p::GossipsubError::Publish(
+                minip2p::PublishError::Backpressure
+            )),
             FfiError::Backpressure
         ));
         assert!(matches!(
@@ -2424,5 +2407,26 @@ mod tests {
             ),
             FfiError::Transport { .. }
         ));
+    }
+
+    #[test]
+    fn listen_addrs_follow_listen_set_changes_only() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        let bound = endpoint.listen_addrs();
+        assert_eq!(bound.len(), 1, "{bound:?}");
+
+        let public = P2pEvent::PublicAddressesChanged {
+            addrs: vec!["/ip4/203.0.113.9/udp/1/quic-v1".into()],
+        };
+        endpoint.shared.lock_events().ingest(vec![public]);
+        assert_eq!(endpoint.listen_addrs(), bound);
+
+        let rotated = vec![format!("{}/rotated", bound[0])];
+        let changed = P2pEvent::ListenAddressesChanged {
+            addrs: rotated.clone(),
+        };
+        endpoint.shared.lock_events().ingest(vec![changed.clone()]);
+        assert_eq!(endpoint.listen_addrs(), rotated);
+        assert!(endpoint.drain_events(8).contains(&changed));
     }
 }

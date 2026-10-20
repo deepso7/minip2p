@@ -33,9 +33,11 @@ mod pubsub;
 mod std;
 #[cfg(feature = "pubsub")]
 mod stream_conns;
+mod writer;
 
 pub use portable::*;
 #[cfg(feature = "pubsub")]
 pub use pubsub::GossipsubError;
 #[cfg(feature = "std")]
 pub use std::*;
+pub use writer::{StreamWriteError, StreamWriter, WriteAccepted, WriteProgress};

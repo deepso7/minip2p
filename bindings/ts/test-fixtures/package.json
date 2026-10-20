@@ -5,7 +5,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./adapter-contract": "./src/adapter-contract.ts"
+    "./adapter-contract": "./src/adapter-contract.ts",
+    "./fake-serde-endpoint": "./src/fake-serde-endpoint.ts"
   },
   "scripts": {
     "test": "vitest run",

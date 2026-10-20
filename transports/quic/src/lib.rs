@@ -29,12 +29,15 @@ use socket2::{Domain, Protocol as SocketProtocol, Socket as RawSocket, Type};
 
 #[cfg(test)]
 mod admission_tests;
+#[cfg(test)]
+mod alpn_tests;
 mod config;
 mod connection;
 mod diagnostics;
 mod error;
 #[cfg(test)]
 mod recv_batch_tests;
+mod rotation;
 mod socket;
 #[cfg(test)]
 mod socket_tests;
@@ -45,6 +48,9 @@ mod stream_tests;
 #[cfg(test)]
 mod test_peer;
 mod tls;
+mod webtransport;
+#[cfg(test)]
+mod webtransport_tests;
 #[cfg(test)]
 mod write_fairness_tests;
 
@@ -57,6 +63,7 @@ pub use error::{QuicBindError, QuicTlsStage};
 
 use connection::{Cx, QuicConnection};
 use diagnostics::{ConnectionCounters, DatagramTally};
+use rotation::Rotation;
 use socket::{Received, Socket, Sockets};
 use tls::{HostTime, TlsIdentity};
 
@@ -107,6 +114,30 @@ fn extract_quic_host_and_port(
     };
 
     Ok((host.clone(), port))
+}
+
+/// The `/<host>/udp/<port>/quic-v1` socket address of a `quic-v1` or a
+/// WebTransport address, and whether it was the WebTransport one. Certhashes
+/// are ignored: they name a certificate, not a socket.
+fn listen_shape(multiaddr: &Multiaddr) -> Option<(Multiaddr, bool)> {
+    if multiaddr.is_quic_transport() {
+        return Some((multiaddr.clone(), false));
+    }
+    let base = multiaddr.protocols().get(..3)?;
+    multiaddr
+        .is_webtransport()
+        .then(|| (Multiaddr::from_protocols(base.to_vec()), true))
+}
+
+/// The WebTransport listen address of a bound `quic-v1` address, carrying
+/// the current certhashes.
+fn webtransport_multiaddr(quic: Multiaddr, certhashes: &[minip2p_core::Multihash]) -> Multiaddr {
+    let mut addr = quic;
+    addr.push(Protocol::WebTransport);
+    for hash in certhashes {
+        addr.push(Protocol::Certhash(*hash));
+    }
+    addr
 }
 
 /// Like `extract_quic_host_and_port` but only accepts IP hosts (rejects DNS -- DNS is dial-only).
@@ -230,6 +261,12 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
     if limits.idle_timeout_ms == 0 {
         return Err(invalid("idle_timeout_ms", "must be greater than zero"));
     }
+    if limits.webtransport_handshake_timeout_ms == 0 {
+        return Err(invalid(
+            "webtransport_handshake_timeout_ms",
+            "must be greater than zero",
+        ));
+    }
     for (field, window) in [
         ("stream_receive_window", limits.stream_receive_window),
         (
@@ -280,6 +317,23 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
     Ok(config)
 }
 
+/// Bytes of received QUIC datagrams a WebTransport-serving connection
+/// buffers. Datagrams are not served: each is drained and dropped.
+const DATAGRAM_RECEIVE_BUFFER: usize = 16 * 1024;
+
+/// A WebTransport-serving socket's transport parameters: the libp2p ones
+/// plus three peer unidirectional streams, which RFC 9114 §6.2 requires for
+/// HTTP/3's control and QPACK streams, and the QUIC DATAGRAM parameter,
+/// which Firefox requires. The server config is chosen per socket, before
+/// ALPN, so libp2p connections there see these too.
+fn webtransport_transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindError> {
+    let mut config = transport_config(limits)?;
+    config
+        .max_concurrent_uni_streams(VarInt::from_u32(3))
+        .datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER));
+    Ok(config)
+}
+
 /// QUIC transport over one or two non-blocking UDP sockets -- at most one per
 /// IP family -- and one quinn-proto endpoint serving both.
 ///
@@ -308,6 +362,14 @@ pub struct QuicTransport {
     /// Installed on the endpoint by the first `listen`; until then it
     /// accepts nothing.
     server_config: Arc<ServerConfig>,
+    /// The per-connection overrides for sockets that serve WebTransport,
+    /// beside `quic-v1` (ALPN `libp2p` and `h3`) and alone (`h3`), with
+    /// optional client certificates and [`webtransport_transport_config`].
+    /// `None` when no socket does.
+    webtransport_config: Option<WebTransportConfigs>,
+    /// The rotating certificate and what WebTransport connections
+    /// authenticate with, when a socket serves WebTransport.
+    webtransport: Option<Rotation>,
     transport_config: Arc<TransportConfig>,
     tls: TlsIdentity,
     /// The host's wall-clock time, shared with the TLS verifiers.
@@ -349,6 +411,14 @@ pub struct QuicTransport {
     /// `next_deadline` maps engine timeouts onto the host's timeline. `None`
     /// until the first `poll`.
     clock: Option<(Now, Instant)>,
+}
+
+/// The server configs of WebTransport-serving sockets.
+struct WebTransportConfigs {
+    /// ALPN `libp2p` then `h3`: the socket also serves `quic-v1`.
+    dual: Arc<ServerConfig>,
+    /// ALPN `h3` only.
+    h3: Arc<ServerConfig>,
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -403,42 +473,64 @@ fn missing_family(context: &'static str, addr: SocketAddr) -> TransportError {
 }
 
 impl QuicTransport {
-    /// Binds one UDP socket per address: one `/ip4/<ip>/udp/<port>/quic-v1`,
-    /// one `/ip6/...`, or one of each. Hosts must be numeric; port 0 picks an
-    /// ephemeral port. An IPv6 socket is IPv6-only.
+    /// Binds one UDP socket per socket address named: at most one IPv4 and
+    /// one IPv6. Each address is `/<ip>/udp/<port>/quic-v1`, served to libp2p
+    /// peers, or `/<ip>/udp/<port>/quic-v1/webtransport`, served to
+    /// WebTransport clients such as browsers; naming both shapes on one
+    /// socket address serves both on that socket. Hosts must be numeric;
+    /// port 0 picks an ephemeral port. An IPv6 socket is IPv6-only.
+    ///
+    /// Each connection to a socket serving both picks its protocol by ALPN:
+    /// `libp2p` (preferred) still requires a verified libp2p client
+    /// certificate, while `h3` takes none and authenticates through
+    /// WebTransport's Noise handshake. WebTransport-serving sockets carry two
+    /// extra transport parameters: a limit of three peer unidirectional
+    /// streams and the QUIC DATAGRAM parameter.
     pub fn bind(node_config: QuicNodeConfig, addrs: &[Multiaddr]) -> Result<Self, QuicBindError> {
-        let mut binds = addrs
-            .iter()
-            .map(|addr| {
-                extract_listen_socket_addr(addr, "bind address").map_err(|error| {
-                    QuicBindError::InvalidAddress {
-                        addr: addr.clone(),
-                        reason: match error {
-                            TransportError::InvalidAddress { reason, .. } => reason,
-                            other => other.to_string(),
-                        },
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        binds.sort_by_key(|addr| addr.is_ipv6());
+        // (socket address, serves quic-v1, serves WebTransport)
+        let mut binds: Vec<(SocketAddr, bool, bool)> = Vec::new();
+        for addr in addrs {
+            let invalid = |reason: String| QuicBindError::InvalidAddress {
+                addr: addr.clone(),
+                reason,
+            };
+            let (base, webtransport) = listen_shape(addr).ok_or_else(|| {
+                invalid("expected /<host>/udp/<port>/quic-v1 or …/quic-v1/webtransport".into())
+            })?;
+            let socket_addr =
+                extract_listen_socket_addr(&base, "bind address").map_err(|error| {
+                    invalid(match error {
+                        TransportError::InvalidAddress { reason, .. } => reason,
+                        other => other.to_string(),
+                    })
+                })?;
+            match binds.iter_mut().find(|(bound, ..)| *bound == socket_addr) {
+                Some((_, quic_v1, wt)) => {
+                    *quic_v1 |= !webtransport;
+                    *wt |= webtransport;
+                }
+                None => binds.push((socket_addr, !webtransport, webtransport)),
+            }
+        }
+        binds.sort_by_key(|(addr, ..)| addr.is_ipv6());
         match binds.as_slice() {
             [_] => {}
-            [first, second] if first.is_ipv6() != second.is_ipv6() => {}
+            [(first, ..), (second, ..)] if first.is_ipv6() != second.is_ipv6() => {}
             _ => {
-                return Err(QuicBindError::AddressFamilies { count: addrs.len() });
+                return Err(QuicBindError::AddressFamilies { count: binds.len() });
             }
         }
         // Checked before any socket is bound.
         let transport_config = transport_config(node_config.limits())?;
         let sockets = binds
             .into_iter()
-            .map(|addr| {
-                if addr.is_ipv6() {
-                    bind_ipv6_only_udp(addr).map(|udp| (addr, udp))
+            .map(|(addr, quic_v1, webtransport)| {
+                let udp = if addr.is_ipv6() {
+                    bind_ipv6_only_udp(addr)?
                 } else {
-                    bind_ipv4_udp(addr).map(|udp| (addr, udp))
-                }
+                    bind_ipv4_udp(addr)?
+                };
+                Ok((addr, udp, quic_v1, webtransport))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Self::from_sockets(node_config, transport_config, sockets)
@@ -457,21 +549,24 @@ impl QuicTransport {
     fn from_sockets(
         node_config: QuicNodeConfig,
         transport_config: TransportConfig,
-        udps: Vec<(SocketAddr, UdpSocket)>,
+        udps: Vec<(SocketAddr, UdpSocket, bool, bool)>,
     ) -> Result<Self, QuicBindError> {
         let transport_config = Arc::new(transport_config);
         let tally = DatagramTally::register(&node_config.peer_id());
         let max_pending_datagrams = node_config.limits().max_pending_datagrams;
         let sockets = udps
             .into_iter()
-            .map(|(requested, udp)| {
+            .map(|(requested, udp, quic_v1, webtransport)| {
                 udp.set_nonblocking(true)
                     .map_err(|e| QuicBindError::socket(requested, "set non-blocking", &e))?;
                 let local_addr = udp
                     .local_addr()
                     .map_err(|e| QuicBindError::socket(requested, "read local address", &e))?;
-                Socket::new(udp, local_addr, max_pending_datagrams, tally.clone())
-                    .map_err(|e| QuicBindError::socket(local_addr, "configure", &e))
+                let mut socket = Socket::new(udp, local_addr, max_pending_datagrams, tally.clone())
+                    .map_err(|e| QuicBindError::socket(local_addr, "configure", &e))?;
+                socket.quic_v1 = quic_v1;
+                socket.webtransport = webtransport;
+                Ok(socket)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -490,6 +585,36 @@ impl QuicTransport {
             .transport_config(Arc::clone(&transport_config))
             .retry_token_lifetime(RETRY_TOKEN_LIFETIME)
             .validation_token_config(validation_tokens);
+        let (webtransport_config, webtransport) = if sockets
+            .iter()
+            .any(|socket| socket.webtransport)
+        {
+            // Until the first poll's sample, the system clock picks the
+            // period.
+            let rotation = Rotation::new(&tls, node_config.keypair(), host_time.now().as_secs())?;
+            let certificate = rotation.certificate();
+            let transport = Arc::new(webtransport_transport_config(node_config.limits())?);
+            // Clones of the endpoint's config, so the Retry tokens it issues
+            // stay valid.
+            let config = |libp2p: bool| -> Result<Arc<ServerConfig>, QuicBindError> {
+                let server_tls = tls
+                    .webtransport_server_config(Arc::clone(&certificate), libp2p)
+                    .map_err(|error| QuicBindError::tls(QuicTlsStage::ServerConfig, error))?;
+                let crypto = QuicServerConfig::try_from(server_tls)
+                    .map_err(|error| QuicBindError::tls(QuicTlsStage::QuicCipherSuites, error))?;
+                let mut config = server_config.clone();
+                config.crypto = Arc::new(crypto);
+                config.transport = Arc::clone(&transport);
+                Ok(Arc::new(config))
+            };
+            let configs = WebTransportConfigs {
+                dual: config(true)?,
+                h3: config(false)?,
+            };
+            (Some(configs), Some(rotation))
+        } else {
+            (None, None)
+        };
 
         let endpoint_config = EndpointConfig::default();
         let max_payload =
@@ -514,6 +639,8 @@ impl QuicTransport {
                 None,
             ),
             server_config: Arc::new(server_config),
+            webtransport_config,
+            webtransport,
             transport_config,
             tls,
             host_time,
@@ -564,17 +691,33 @@ impl QuicTransport {
         self.connections.get(&id).map(QuicConnection::diagnostics)
     }
 
-    /// A `PeerAddr` other nodes can dial for each bound socket.
+    /// A `PeerAddr` other nodes can dial for each of
+    /// [`local_addresses`](Transport::local_addresses).
     pub fn local_peer_addrs(&self) -> Result<Vec<PeerAddr>, TransportError> {
         let peer_id = self.local_peer_id();
-        self.sockets
-            .iter()
-            .map(|socket| {
-                let addr = socket_addr_to_multiaddr(socket.local_addr);
+        self.local_addresses()
+            .into_iter()
+            .map(|addr| {
                 PeerAddr::new(addr.clone(), peer_id.clone())
                     .map_err(|error| TransportError::LocalPeerAddr { addr, error })
             })
             .collect()
+    }
+
+    /// The addresses one socket serves: `quic-v1`, then WebTransport with
+    /// the current certhashes.
+    fn socket_addresses(&self, socket: &Socket) -> impl Iterator<Item = Multiaddr> + use<> {
+        let quic = socket_addr_to_multiaddr(socket.local_addr);
+        let webtransport = self
+            .webtransport
+            .as_ref()
+            .filter(|_| socket.webtransport)
+            .map(|rotation| webtransport_multiaddr(quic.clone(), rotation.advertised()));
+        socket
+            .quic_v1
+            .then_some(quic)
+            .into_iter()
+            .chain(webtransport)
     }
 
     /// Listens on every bound socket's address; returns them.
@@ -789,15 +932,40 @@ impl QuicTransport {
             self.endpoint.ignore(incoming);
             return;
         };
-        match self.endpoint.accept(incoming, now, buf, None) {
+        // The receiving socket picks the config: libp2p-only sockets keep
+        // the endpoint's.
+        let config = self
+            .webtransport_config
+            .as_ref()
+            .filter(|_| socket.webtransport)
+            .map(|configs| {
+                Arc::clone(if socket.quic_v1 {
+                    &configs.dual
+                } else {
+                    &configs.h3
+                })
+            });
+        let webtransport = self
+            .webtransport
+            .as_ref()
+            .filter(|_| socket.webtransport)
+            .map(|rotation| Arc::clone(rotation.context()));
+        match self.endpoint.accept(incoming, now, buf, config) {
             Ok((handle, conn)) => {
                 // The accepted Initial never passes through `handle_event`.
                 let mut counters = ConnectionCounters::default();
                 counters.datagram_received();
                 let endpoint =
                     ConnectionEndpoint::new(socket_addr_to_multiaddr(conn.remote_address()));
-                let conn =
-                    QuicConnection::new(id, handle, conn, endpoint.clone(), &limits, counters);
+                let conn = QuicConnection::new(
+                    id,
+                    handle,
+                    conn,
+                    endpoint.clone(),
+                    &limits,
+                    counters,
+                    webtransport,
+                );
                 self.connections.insert(id, conn);
                 self.handles.insert(handle, id);
                 self.received.push(id);
@@ -815,6 +983,31 @@ impl QuicTransport {
     /// Services the connections with work: those this poll routed datagrams
     /// to, those whose timer is due, and those a previous service left
     /// unfinished. Idle connections are not visited.
+    /// Rotates the WebTransport certificate when the host's wall clock has
+    /// left its period, announcing each listening WebTransport address
+    /// with the new certhashes.
+    fn rotate(&mut self) {
+        let Some(rotation) = &mut self.webtransport else {
+            return;
+        };
+        let unix = self.host_time.now().as_secs();
+        if !rotation.advance(&self.tls, self.node_config.keypair(), unix) {
+            return;
+        }
+        let announced: Vec<Multiaddr> = self
+            .sockets
+            .iter()
+            .filter(|socket| socket.announced.1)
+            .flat_map(|socket| self.socket_addresses(socket))
+            .filter(Multiaddr::is_webtransport)
+            .collect();
+        self.pending_events.extend(
+            announced
+                .into_iter()
+                .map(|addr| TransportEvent::Listening { addr }),
+        );
+    }
+
     fn service_due(&mut self, now: Instant) {
         let mut due = std::mem::take(&mut self.due);
         due.clear();
@@ -927,6 +1120,11 @@ fn send_stateless(socket: &mut Socket, buf: &[u8], transmit: &quinn_proto::Trans
 
 impl Transport for QuicTransport {
     fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        if addr.transport().is_webtransport() {
+            return Err(TransportError::Unsupported {
+                operation: "native WebTransport dialing; dial the peer's /quic-v1 address",
+            });
+        }
         let peer_socket = dial_socket_addr(addr.transport(), "dial target")?;
         let max_connections = self.node_config.limits().max_connections;
         let slots_held = self.slots_held();
@@ -958,6 +1156,7 @@ impl Transport for QuicTransport {
             ConnectionEndpoint::from_peer_addr(addr),
             self.node_config.limits(),
             ConnectionCounters::default(),
+            None,
         );
         self.connections.insert(id, conn);
         self.handles.insert(handle, id);
@@ -974,18 +1173,64 @@ impl Transport for QuicTransport {
         Ok(id)
     }
 
+    /// Listens on a bound socket, as `/…/quic-v1` or `/…/quic-v1/webtransport`
+    /// (certhashes, if given, are ignored), and returns the address: a
+    /// WebTransport one with the current certhashes. The shape must be one
+    /// the socket was bound with.
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
-        let requested = extract_listen_socket_addr(addr, "listen address")?;
+        let (base, webtransport) =
+            listen_shape(addr).ok_or_else(|| TransportError::InvalidAddress {
+                context: "listen address",
+                reason: "expected /<host>/udp/<port>/quic-v1 or …/quic-v1/webtransport".into(),
+            })?;
+        let requested = extract_listen_socket_addr(&base, "listen address")?;
+        let index = self
+            .sockets
+            .iter()
+            .position(|socket| socket.local_addr.is_ipv6() == requested.is_ipv6())
+            .ok_or_else(|| missing_family("listen address", requested))?;
         let socket = self
             .sockets
-            .for_addr(requested)
+            .get(index)
             .ok_or_else(|| missing_family("listen address", requested))?;
         ensure_listen_matches_bound_socket(requested, socket.local_addr)?;
-        let listen_addr = socket_addr_to_multiaddr(socket.local_addr);
+        let served = if webtransport {
+            socket.webtransport
+        } else {
+            socket.quic_v1
+        };
+        if !served {
+            return Err(TransportError::InvalidAddress {
+                context: "listen address",
+                reason: format!(
+                    "{addr}: the socket at {} was not bound for this shape; \
+                     bind it with a {} address",
+                    socket.local_addr,
+                    if webtransport {
+                        "/quic-v1/webtransport"
+                    } else {
+                        "/quic-v1"
+                    }
+                ),
+            });
+        }
+        let listen_addr = self
+            .socket_addresses(socket)
+            .find(|served| served.is_webtransport() == webtransport)
+            .ok_or_else(|| missing_family("listen address", requested))?;
+        let Some(socket) = self.sockets.get_mut(index) else {
+            return Err(missing_family("listen address", requested));
+        };
+        socket.listening = true;
+        let announced = if webtransport {
+            &mut socket.announced.1
+        } else {
+            &mut socket.announced.0
+        };
         // Listening again is the same listener: report the address without
         // announcing it twice (the endpoint listens at bind, and callers may
         // still ask `listen` for the address afterwards).
-        if std::mem::replace(&mut socket.listening, true) {
+        if std::mem::replace(announced, true) {
             return Ok(listen_addr);
         }
         // One endpoint serves both sockets; admission checks that the socket
@@ -1105,16 +1350,19 @@ impl Transport for QuicTransport {
         Ok(())
     }
 
+    /// Every bound socket's addresses, in the shapes it was bound with:
+    /// `quic-v1`, and WebTransport with the current certhashes.
     fn local_addresses(&self) -> Vec<Multiaddr> {
         self.sockets
             .iter()
-            .map(|socket| socket_addr_to_multiaddr(socket.local_addr))
+            .flat_map(|socket| self.socket_addresses(socket))
             .collect()
     }
 
-    /// Sockets are bound once, at construction, so the set never changes.
+    /// Sockets are bound once, at construction; only a WebTransport
+    /// certificate rotation moves the set.
     fn local_addresses_revision(&self) -> Option<u64> {
-        Some(0)
+        Some(self.webtransport.as_ref().map_or(0, Rotation::revision))
     }
 
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
@@ -1151,6 +1399,7 @@ impl Transport for QuicTransport {
         self.clock = Some((now, instant));
         self.host_time.set(now.unix_seconds);
         self.dispatched = false;
+        self.rotate();
         // Events accumulate in `self.pending_events` for the whole poll and
         // are only taken at the very end, so an error path leaves the batch
         // queued for the next call instead of dropping it.
@@ -1202,9 +1451,14 @@ impl Transport for QuicTransport {
 
         // No sample yet means no timeline to answer on.
         let (now, instant) = self.clock?;
-        self.timers.first().map(|&(timeout, _)| {
+        let timer = self.timers.first().map(|&(timeout, _)| {
             deadline_for_timeout(now, timeout.saturating_duration_since(instant))
-        })
+        });
+        let rotation = self
+            .webtransport
+            .as_ref()
+            .map(|rotation| rotation.deadline(now));
+        Deadline::earliest_opt(timer, rotation)
     }
 }
 
@@ -1241,6 +1495,8 @@ impl Drop for QuicTransport {
         // Nothing polls after this, so every connection's CONNECTION_CLOSE
         // leaves now. Drain the retry queues first so a full one has room to
         // retain them; closing an already-closed connection is a no-op.
+        // A WebTransport session's close capsule and FIN go out with the
+        // close, but its Closing phase is cut short: nothing would end it.
         for socket in self.sockets.iter_mut() {
             socket.flush();
         }
@@ -1248,6 +1504,10 @@ impl Drop for QuicTransport {
         for id in ids {
             match self.close(id) {
                 Ok(()) | Err(_) => {}
+            }
+            if let Some(conn) = self.connections.get_mut(&id) {
+                conn.cut_wt_closing(Instant::now());
+                self.service(id, Instant::now());
             }
         }
         for socket in self.sockets.iter_mut() {

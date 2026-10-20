@@ -65,6 +65,17 @@
     "@minip2p/node#test": {
       "cache": false
     },
+    "@minip2p/web#test": {
+      "cache": false
+    },
+    "minip2p-web-example#build": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/bindings/ts/web/wasm/minip2p_web_bg.wasm"
+      ],
+      "outputs": ["dist/**"]
+    },
     "typecheck": {
       "dependsOn": ["^typecheck"],
       "inputs": ["$TURBO_DEFAULT$", "tsconfig.json"],

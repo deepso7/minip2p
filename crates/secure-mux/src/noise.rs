@@ -26,7 +26,7 @@ use minip2p_identity::{Ed25519Keypair, PeerId, PublicKey};
 use thiserror::Error;
 
 pub use frames::{FrameDecoder, MAX_FRAME_LEN, encode_frame};
-pub use payload::NoiseHandshakePayload;
+pub use payload::{NoiseExtensions, NoiseHandshakePayload};
 
 /// Multistream-select protocol identifier for libp2p Noise.
 pub const NOISE_PROTOCOL_ID: &str = "/noise";
@@ -56,6 +56,9 @@ pub struct NoiseConfig {
     pub ephemeral_secret: [u8; 32],
     /// Required remote identity, when the caller already knows its peer ID.
     pub expected_peer: Option<PeerId>,
+    /// Extensions sent in this side's handshake payload. `None` sends none,
+    /// keeping the payload byte-identical to a plain libp2p Noise handshake.
+    pub local_extensions: Option<NoiseExtensions>,
 }
 
 impl fmt::Debug for NoiseConfig {
@@ -67,6 +70,7 @@ impl fmt::Debug for NoiseConfig {
             .field("static_secret", &"<redacted>")
             .field("ephemeral_secret", &"<redacted>")
             .field("expected_peer", &self.expected_peer)
+            .field("local_extensions", &self.local_extensions)
             .finish()
     }
 }
@@ -82,6 +86,8 @@ pub enum NoiseOutput {
         peer: PeerId,
         /// Identity key from the verified libp2p Noise payload.
         identity_key: PublicKey,
+        /// Extensions the remote sent in its verified payload, if any.
+        remote_extensions: Option<NoiseExtensions>,
     },
     /// One decrypted transport message.
     Decrypted(Vec<u8>),
@@ -175,6 +181,7 @@ impl NoiseSession {
                 config.static_secret,
                 config.ephemeral_secret,
                 config.expected_peer,
+                config.local_extensions,
             )),
             send_cipher: None,
             receive_cipher: None,
@@ -303,6 +310,7 @@ impl NoiseSession {
         self.pending.push_back(NoiseOutput::HandshakeComplete {
             peer: result.peer,
             identity_key: result.identity_key,
+            remote_extensions: result.remote_extensions,
         });
     }
 
@@ -356,6 +364,7 @@ mod tests {
                     static_secret: [3; 32],
                     ephemeral_secret: [4; 32],
                     expected_peer: Some(responder_peer.clone()),
+                    local_extensions: None,
                 }),
                 responder: NoiseSession::new(NoiseConfig {
                     role: NoiseRole::Responder,
@@ -363,6 +372,7 @@ mod tests {
                     static_secret: [5; 32],
                     ephemeral_secret: [6; 32],
                     expected_peer: Some(initiator_peer.clone()),
+                    local_extensions: None,
                 }),
                 initiator_peer,
                 responder_peer,
@@ -392,10 +402,80 @@ mod tests {
     }
 
     fn handshake_peer(session: &mut NoiseSession) -> PeerId {
+        handshake_complete(session).0
+    }
+
+    fn handshake_complete(session: &mut NoiseSession) -> (PeerId, Option<NoiseExtensions>) {
         match session.poll_output().expect("handshake completion") {
-            NoiseOutput::HandshakeComplete { peer, .. } => peer,
+            NoiseOutput::HandshakeComplete {
+                peer,
+                remote_extensions,
+                ..
+            } => (peer, remote_extensions),
             other => panic!("expected handshake completion, got {other:?}"),
         }
+    }
+
+    /// Runs XX to completion and returns what each side learned:
+    /// `(initiator's view of the responder, responder's view of the initiator)`.
+    fn exchange_extensions(
+        initiator: Option<NoiseExtensions>,
+        responder: Option<NoiseExtensions>,
+    ) -> (Option<NoiseExtensions>, Option<NoiseExtensions>) {
+        let mut pair = Pair::new();
+        pair.initiator = NoiseSession::new(NoiseConfig {
+            role: NoiseRole::Initiator,
+            identity: Ed25519Keypair::from_secret_key_bytes([1; 32]),
+            static_secret: [3; 32],
+            ephemeral_secret: [4; 32],
+            expected_peer: Some(pair.responder_peer.clone()),
+            local_extensions: initiator,
+        });
+        pair.responder = NoiseSession::new(NoiseConfig {
+            role: NoiseRole::Responder,
+            identity: Ed25519Keypair::from_secret_key_bytes([2; 32]),
+            static_secret: [5; 32],
+            ephemeral_secret: [6; 32],
+            expected_peer: Some(pair.initiator_peer.clone()),
+            local_extensions: responder,
+        });
+        pair.initiator.start().unwrap();
+        pair.responder.start().unwrap();
+        let message1 = outbound(&mut pair.initiator);
+        pair.responder.on_data(message1).unwrap();
+        let message2 = outbound(&mut pair.responder);
+        pair.initiator.on_data(message2).unwrap();
+        let message3 = outbound(&mut pair.initiator);
+        let (_, at_initiator) = handshake_complete(&mut pair.initiator);
+        pair.responder.on_data(message3).unwrap();
+        let (_, at_responder) = handshake_complete(&mut pair.responder);
+        (at_initiator, at_responder)
+    }
+
+    fn certhash(byte: u8) -> minip2p_identity::Multihash {
+        minip2p_identity::Multihash::wrap(0x12, &[byte; 32]).unwrap()
+    }
+
+    #[test]
+    fn responder_certhashes_reach_the_initiator() {
+        let extensions = NoiseExtensions {
+            webtransport_certhashes: alloc::vec![certhash(1), certhash(2)],
+            stream_muxers: Vec::new(),
+        };
+        let (at_initiator, at_responder) = exchange_extensions(None, Some(extensions.clone()));
+        assert_eq!(at_initiator, Some(extensions));
+        assert_eq!(at_responder, None);
+    }
+
+    #[test]
+    fn initiator_extensions_reach_the_responder() {
+        let extensions = NoiseExtensions {
+            webtransport_certhashes: Vec::new(),
+            stream_muxers: alloc::vec!["/yamux/1.0.0".into()],
+        };
+        let (at_initiator, at_responder) = exchange_extensions(Some(extensions.clone()), None);
+        assert_eq!(at_initiator, None);
+        assert_eq!(at_responder, Some(extensions));
     }
 
     #[test]
@@ -489,6 +569,7 @@ mod tests {
             [3; 32],
             [4; 32],
             Some(Ed25519Keypair::from_secret_key_bytes([99; 32]).peer_id()),
+            None,
         ));
         pair.initiator.start().unwrap();
         pair.responder.start().unwrap();
@@ -585,6 +666,7 @@ mod tests {
             static_secret: [0xaa; 32],
             ephemeral_secret: [0xbb; 32],
             expected_peer: None,
+            local_extensions: None,
         };
         let debug = alloc::format!("{config:?}");
         assert!(debug.contains("<redacted>"));

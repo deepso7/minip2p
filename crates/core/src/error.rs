@@ -30,6 +30,12 @@ pub enum MultiaddrError {
         #[source]
         source: PeerIdError,
     },
+    #[error("invalid certhash '{value}': {source}")]
+    InvalidCerthash {
+        value: String,
+        #[source]
+        source: CerthashError,
+    },
     /// The binary decoder encountered a multicodec code it does not know.
     #[error("unknown multicodec protocol code {code:#x}")]
     UnknownProtocolCode { code: u64 },
@@ -47,6 +53,25 @@ pub enum MultiaddrError {
     /// A varint in the binary encoding was malformed.
     #[error("invalid varint in binary multiaddr: {0}")]
     Varint(#[from] VarintError),
+}
+
+/// Errors from decoding a `/certhash` value.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CerthashError {
+    #[error("certhash is empty")]
+    EmptyInput,
+    #[error(
+        "unsupported multibase prefix '{0}' (supported: u base64url, z base58btc, b/B base32, f/F base16)"
+    )]
+    UnsupportedMultibase(char),
+    #[error("invalid multibase text: {reason}")]
+    InvalidMultibase { reason: String },
+    #[error("invalid multihash: {reason}")]
+    InvalidMultihash { reason: String },
+    #[error("unsupported certhash multihash code {code:#x}; expected sha2-256 (0x12)")]
+    UnsupportedHashCode { code: u64 },
+    #[error("invalid sha2-256 digest length: expected 32, got {actual}")]
+    InvalidDigestLength { actual: usize },
 }
 
 /// Errors from parsing or constructing a peer address.

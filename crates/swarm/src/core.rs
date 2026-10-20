@@ -14,7 +14,7 @@ use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::{IdentifyConfig, IdentifyMessage};
 use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
-use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
+use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 
 use crate::events::{SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
 use crate::state::{Action, ProtocolKind, SwarmState};
@@ -402,12 +402,19 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     // Listening and dialing
     // -----------------------------------------------------------------------
 
-    /// Bumps the listened-address revision and records `addr` (deduped)
-    /// after a successful `Transport::listen`.
+    /// Bumps the listened-address revision and records `addr` after a
+    /// successful `Transport::listen`, in place of the same address with
+    /// other certhashes (an older WebTransport certificate's).
     fn record_listen(&mut self, addr: &Multiaddr) {
         self.listened_addrs_revision = self.listened_addrs_revision.wrapping_add(1);
-        if !self.listened_addrs.contains(addr) {
-            self.listened_addrs.push(addr.clone());
+        let base = addr.without_certhashes();
+        match self
+            .listened_addrs
+            .iter_mut()
+            .find(|listened| listened.without_certhashes() == base)
+        {
+            Some(listened) => *listened = addr.clone(),
+            None => self.listened_addrs.push(addr.clone()),
         }
     }
 
@@ -795,15 +802,33 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         // connections cannot produce another batch ahead of their close.
         self.flush(now_ms);
 
+        let events = self.transport.poll(now)?;
+
+        // A transport that moved a listen address on its own (a
+        // WebTransport certificate rotation) announces it with `Listening`.
+        let listen_changed = self.apply_listen_updates(&events);
+
         // Refresh the snapshot of our listening addresses so Identify
         // advertises the current bound set plus any validated external
-        // addresses -- but only when one of those moved.
+        // addresses -- but only when one of those moved. It runs after the
+        // poll, so addresses the poll itself moved are in it before any of
+        // its events (an Identify reply, say) are handled.
         self.refresh_local_addresses();
+        if listen_changed {
+            let addrs = self
+                .listened_addrs
+                .iter()
+                .filter_map(|addr| self.local_peer_addr(addr.clone()).ok())
+                .collect();
+            self.state
+                .events
+                .push_back(SwarmEvent::ListenAddressesChanged { addrs });
+        }
 
         // Each transport event's work runs to completion before the next
         // event is ingested: a later event must not observe state that
         // assumes an earlier event's transport actions have already run.
-        for event in self.transport.poll(now)? {
+        for event in events {
             self.state.handle_transport_event(event, now_ms);
             self.flush(now_ms);
         }
@@ -812,6 +837,30 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         self.state.handle_tick(now_ms);
         self.flush(now_ms);
         Ok(())
+    }
+
+    /// Replaces each listened address a `Listening` event names in a new
+    /// form (the same address with other certhashes); returns whether the
+    /// listen set changed. Addresses the swarm never listened on are
+    /// ignored: `listen*` records those itself.
+    fn apply_listen_updates(&mut self, events: &[TransportEvent]) -> bool {
+        let mut changed = false;
+        for event in events {
+            let TransportEvent::Listening { addr } = event else {
+                continue;
+            };
+            let base = addr.without_certhashes();
+            for listened in &mut self.listened_addrs {
+                if listened != addr && listened.without_certhashes() == base {
+                    *listened = addr.clone();
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.listened_addrs_revision = self.listened_addrs_revision.wrapping_add(1);
+        }
+        changed
     }
 
     /// Rebuilds the advertised address snapshot when the transport's
@@ -1141,6 +1190,12 @@ mod tests {
         /// Every `send_stream` ends its connection, as a fatal session
         /// failure does: `Closed` is queued and `ConnectionClosed` returned.
         sends_end_connection: bool,
+        /// Bound addresses; `listen` accepts these (certhashes ignored).
+        addrs: Vec<Multiaddr>,
+        address_revision: u64,
+        /// Swapped in by the next `poll`, as a certificate rotation does:
+        /// the revision moves and each changed address is announced.
+        rotate_to: Option<Vec<Multiaddr>>,
     }
 
     impl ScriptedTransport {
@@ -1169,10 +1224,22 @@ mod tests {
             Ok(ConnectionId::new(self.next_conn_id))
         }
 
-        fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
-            Err(TransportError::Unsupported {
-                operation: "listen",
-            })
+        fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+            self.addrs
+                .iter()
+                .find(|bound| bound.without_certhashes() == addr.without_certhashes())
+                .cloned()
+                .ok_or(TransportError::Unsupported {
+                    operation: "listen",
+                })
+        }
+
+        fn local_addresses(&self) -> Vec<Multiaddr> {
+            self.addrs.clone()
+        }
+
+        fn local_addresses_revision(&self) -> Option<u64> {
+            Some(self.address_revision)
         }
 
         fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
@@ -1267,7 +1334,17 @@ mod tests {
         }
 
         fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
-            Ok(core::mem::take(&mut self.initial))
+            let mut events = core::mem::take(&mut self.initial);
+            if let Some(addrs) = self.rotate_to.take() {
+                for addr in &addrs {
+                    if !self.addrs.contains(addr) {
+                        events.push(TransportEvent::Listening { addr: addr.clone() });
+                    }
+                }
+                self.addrs = addrs;
+                self.address_revision += 1;
+            }
+            Ok(events)
         }
 
         fn next_deadline(&self) -> Option<Deadline> {
@@ -1760,5 +1837,75 @@ mod tests {
             "late dial must be closed; close_count={}",
             swarm.transport().close_count
         );
+    }
+
+    /// A loopback WebTransport address whose certhash digest is `byte`s.
+    fn webtransport(byte: u8) -> Multiaddr {
+        let mut addr: Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1/webtransport"
+            .parse()
+            .expect("multiaddr");
+        addr.push(minip2p_core::Protocol::Certhash(
+            minip2p_core::Multihash::wrap(0x12, &[byte; 32]).expect("multihash"),
+        ));
+        addr
+    }
+
+    fn listen_changes(events: &[SwarmEvent]) -> Vec<Vec<PeerAddr>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SwarmEvent::ListenAddressesChanged { addrs } => Some(addrs.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A swarm listening on a `quic-v1` and a WebTransport address.
+    fn rotating_swarm() -> SwarmCore<ScriptedTransport, SeqEntropy> {
+        let quic: Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1".parse().expect("quic");
+        let mut swarm = swarm_with(
+            ScriptedTransport {
+                addrs: vec![quic, webtransport(1)],
+                ..ScriptedTransport::default()
+            },
+            SeqEntropy(1),
+        );
+        swarm.listen_on_bound_addrs().expect("listen");
+        assert!(listen_changes(&swarm.poll(Now::from_millis(0)).expect("poll")).is_empty());
+        swarm
+    }
+
+    #[test]
+    fn a_rotated_listen_address_is_reported_once_and_advertised_by_the_same_poll() {
+        let mut swarm = rotating_swarm();
+        let quic = swarm.transport().addrs[0].clone();
+        swarm.transport_mut().rotate_to = Some(vec![quic.clone(), webtransport(2)]);
+
+        let events = swarm.poll(Now::from_millis(1)).expect("poll");
+
+        let local = swarm.local_peer_id.clone();
+        let expected = vec![
+            PeerAddr::new(quic.clone(), local.clone()).expect("quic peer addr"),
+            PeerAddr::new(webtransport(2), local).expect("wt peer addr"),
+        ];
+        assert_eq!(listen_changes(&events), [expected]);
+        assert_eq!(swarm.listened_addrs(), [quic, webtransport(2)]);
+        // Identify built from this poll's events already advertises it.
+        assert!(swarm.local_addresses().contains(&webtransport(2)));
+        assert!(!swarm.local_addresses().contains(&webtransport(1)));
+    }
+
+    #[test]
+    fn an_external_address_change_leaves_the_listen_set_alone() {
+        let mut swarm = rotating_swarm();
+        let listened = swarm.listened_addrs().to_vec();
+        let external: Multiaddr = "/ip4/203.0.113.9/udp/4001/quic-v1".parse().expect("ext");
+        swarm.set_external_addresses(vec![external.clone()]);
+
+        let events = swarm.poll(Now::from_millis(1)).expect("poll");
+
+        assert!(listen_changes(&events).is_empty(), "{events:?}");
+        assert_eq!(swarm.listened_addrs(), listened);
+        assert!(swarm.local_addresses().contains(&external));
     }
 }

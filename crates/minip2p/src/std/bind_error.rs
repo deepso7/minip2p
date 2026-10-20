@@ -74,9 +74,13 @@ pub enum EndpointOptionsError {
          EndpointBuilder::listen_on or listen_default"
     )]
     NoTransport,
-    /// A second QUIC listen address for a family that already has one; QUIC
-    /// binds one socket per family.
-    #[error("QUIC listens on at most one address per IP family; `{addr}` repeats {family}")]
+    /// A QUIC listen address for a family whose socket is already named: QUIC
+    /// binds one socket per family, serving at most one `/quic-v1` and one
+    /// `/quic-v1/webtransport` address on the same host and port.
+    #[error(
+        "QUIC listens on one socket per IP family (one /quic-v1 and one /quic-v1/webtransport \
+         address on the same host and port); `{addr}` repeats {family}"
+    )]
     DuplicateQuicFamily {
         /// The rejected address.
         addr: Multiaddr,

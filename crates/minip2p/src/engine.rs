@@ -51,7 +51,6 @@
 //! ingested, as NAT records a punch on that event.
 
 use alloc::collections::VecDeque;
-#[cfg(any(feature = "std", feature = "pubsub"))]
 use alloc::string::String;
 use alloc::vec::Vec;
 #[cfg(not(feature = "_mdns-driver"))]
@@ -401,7 +400,6 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// Registers a protocol whose data the application acknowledges itself.
     /// Streams already ready, whether their `StreamReady` waits here or in
     /// the swarm, keep the acknowledgement they had.
-    #[cfg(feature = "std")]
     pub(crate) fn add_manual_ack_protocol(
         &mut self,
         protocol_id: String,

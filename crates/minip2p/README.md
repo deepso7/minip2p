@@ -23,7 +23,7 @@ for address in endpoint.listen_all()? {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Listening is address-shaped: pass complete multiaddresses to `EndpointBuilder::listen_on` (or `listen_on_multiaddr`), or use `listen_default` for dual-stack QUIC wildcards. The transport is inferred from each address. `bind` starts accepting on every listen address, QUIC and TCP alike; `listen_all` reports them.
+Listening is address-shaped: pass complete multiaddresses to `EndpointBuilder::listen_on` (or `listen_on_multiaddr`), or use `listen_default` for dual-stack QUIC wildcards. The transport is inferred from each address. `bind` starts accepting on every listen address, QUIC and TCP alike; `listen_all` reports them. A `/…/udp/<port>/quic-v1/webtransport` address (no `/certhash`) serves browsers over libp2p WebTransport; next to a `quic-v1` address on the same host and port it shares that UDP socket, and `listen_all` reports it with the node's current certhashes. Those rotate every 13 days on the host's wall clock; each rotation emits one `EndpointEvent::ListenAddressesChanged { addrs }` carrying the whole new listen set (what `listen_all` now returns) for the app to republish, and Identify advertises the new set from the same poll on. Addresses from the previous period keep dialing. WebTransport is opt-in: `listen_default` does not include it.
 
 The listen setters reject a malformed or unsupported address at once with an `EndpointOptionsError`, and `bind` returns a `BindError` naming what failed: `Options` for inconsistent options (no transport, a second QUIC address for one family, ...), `Quic` or `Listen` for a socket the platform refused (a port in use, say, with its `IoErrorKind`), and `Swarm`, `RelayServer`, `Gossipsub`, or `Mdns`/`MdnsSocket` for that part's own configuration or setup. `?` converts an `EndpointOptionsError` into a `BindError`, so a builder chain needs only the one error type. Bind errors happen before any event is polled; nothing later reuses them.
 
@@ -102,7 +102,7 @@ The portable endpoint supports listening, Connection attempts, ping, Identify in
 
 `.mdns(io, config)` takes the carrier by value and stores it as a `Box<dyn MdnsIo>`, so it must be `'static`; keep a handle to whatever it runs on to reconfigure it later. The mDNS seed comes from the builder's entropy. The endpoint polls the transport again after each mDNS tick, since a carrier may share the transport's stack.
 
-Relay paths turn a relay bridge into a connection, which takes circuit operations from the transport. `build(transport)` works over any transport and rejects relay configuration with `PortableBuildError::NatConfig(PortableNatConfigError::RelayWithoutCircuits)`; wrap the transport in a `CircuitTransport` and call `build_with_circuits(transport)` to run relays. AutoNAT alone needs nothing from the transport. Portable relay configurations must set `force_relay`: portable endpoints do not run DCUtR.
+Relay paths turn a relay bridge into a connection, which takes circuit operations from the transport. `build(transport)` works over any transport and rejects relay configuration with `PortableBuildError::NatConfig(PortableNatConfigError::RelayWithoutCircuits)`; wrap the transport in a `CircuitTransport` and call `build_with_circuits(transport)` to run relays. AutoNAT alone needs nothing from the transport. Portable endpoints do not run DCUtR, so portable relay configurations set `NatConfig::dcutr = false` (direct candidates still race the relay leg, and the attempt settles on the circuit once none is left) or `force_relay` (relay only).
 
 ### smoltcp
 
@@ -242,7 +242,7 @@ A `?` on `send_stream` drops the tail:
 endpoint.send_stream(conn_id, stream_id, chunk)?; // a Full here loses `unsent`
 ```
 
-On the std `Endpoint`, `StreamWriter` does the holding for you (`PortableEndpoint` callers hold the tail themselves): one pending write per stream within an explicit byte budget, the tail resent on `StreamWritable`, and a `close_write` that sends the FIN only once the tail is accepted. Feed it every event; it drops its state when the stream ends or the connection closes or is replaced. Its `WriteAccepted` means the whole payload was accepted locally, never delivered.
+`StreamWriter` does the holding for you on either endpoint (on a `PortableEndpoint`, through `write_at`, `close_write_at` and `observe_at`, which take your `Now`): one pending write per stream within an explicit byte budget, the tail resent on `StreamWritable`, and a `close_write` that sends the FIN only once the tail is accepted. Feed it every event; it drops its state when the stream ends or the connection closes or is replaced. Its `WriteAccepted` means the whole payload was accepted locally, never delivered.
 
 ```rust,ignore
 use minip2p::{StreamWriter, WriteProgress};

@@ -586,6 +586,11 @@ impl<T: Transport> NatDriver<T> {
         self.agent.force_relay()
     }
 
+    /// Whether relayed connections may be upgraded with DCUtR.
+    pub(crate) fn dcutr(&self) -> bool {
+        self.agent.config().dcutr
+    }
+
     /// Whether NAT's hole punch produced `conn_id`; see
     /// [`NatAgent::is_punched`].
     pub(crate) fn is_punched(&self, conn_id: ConnectionId) -> bool {

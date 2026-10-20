@@ -12,6 +12,8 @@ pub struct Options {
     pub key_path: Option<PathBuf>,
     pub announce_addrs: Vec<Multiaddr>,
     pub accepting: bool,
+    /// Also serve WebTransport (browsers) on every QUIC socket.
+    pub webtransport: bool,
     pub config: RelayServerConfig,
 }
 
@@ -22,6 +24,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         key_path: None,
         announce_addrs: Vec::new(),
         accepting: true,
+        webtransport: false,
         config: RelayServerConfig::default(),
     };
     let mut args = args.into_iter().collect::<Vec<_>>().into_iter();
@@ -38,6 +41,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
                     .map_err(|error| format!("invalid --announce multiaddr: {error}"))?,
             ),
             "--paused" => options.accepting = false,
+            "--webtransport" => options.webtransport = true,
             "--max-reservations" => {
                 options.config.max_reservations = number(&flag, value(&mut args)?)?
             }
@@ -141,7 +145,7 @@ fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
 }
 
 pub fn usage() -> &'static str {
-    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic HOST:PORT               exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp HOST:PORT                exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable)\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--max-reservations-per-ip N    reservations per IPv4 address or IPv6 /64\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuits-per-ip N        circuits per IPv4 address or IPv6 /64\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n--max-rate-limit-entries N     keys each rate limiter tracks\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME\n  minip2p-relay service status | logs | restart | uninstall"
+    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic HOST:PORT               exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp HOST:PORT                exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable; WebTransport ones need their /certhash)\n--webtransport                 also serve WebTransport (browsers) on the QUIC port\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--max-reservations-per-ip N    reservations per IPv4 address or IPv6 /64\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuits-per-ip N        circuits per IPv4 address or IPv6 /64\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n--max-rate-limit-entries N     keys each rate limiter tracks\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME\n  minip2p-relay service status | logs | restart | uninstall"
 }
 
 #[cfg(test)]
@@ -156,6 +160,7 @@ mod tests {
         assert!(options.accepting);
         assert!(options.key_path.is_none());
         assert!(options.announce_addrs.is_empty());
+        assert!(!options.webtransport);
         assert_eq!(options.config, RelayServerConfig::default());
     }
 
@@ -219,6 +224,7 @@ mod tests {
             "--announce".into(),
             "/ip4/203.0.113.4/tcp/4001".into(),
             "--paused".into(),
+            "--webtransport".into(),
             "--max-circuits".into(),
             "7".into(),
             "--max-circuits-per-ip".into(),
@@ -234,6 +240,7 @@ mod tests {
             ["/ip4/203.0.113.4/tcp/4001".parse().unwrap()]
         );
         assert!(!options.accepting);
+        assert!(options.webtransport);
         assert_eq!(options.config.max_circuits, 7);
         assert_eq!(options.config.max_circuits_per_ip, 3);
         assert_eq!(

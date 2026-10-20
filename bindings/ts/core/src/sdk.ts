@@ -1359,7 +1359,10 @@ export class Minip2pBase {
     return this.#backend.peerId();
   }
 
-  /** Returns the currently bound peer multiaddresses. */
+  /**
+   * Returns the currently bound peer multiaddresses. A WebTransport
+   * listener's certhashes rotate; `listenAddressesChanged` says when.
+   */
   listenAddrs(): string[] {
     this.#assertOpen();
     return this.#backend.listenAddrs();
@@ -2416,6 +2419,7 @@ const SDK_EVENT_NAMES: {
   [P2pEvent_Tags.PingTimeout]: "pingTimeout",
   [P2pEvent_Tags.EndpointError]: "endpointError",
   [P2pEvent_Tags.ReachabilityChanged]: "reachabilityChanged",
+  [P2pEvent_Tags.ListenAddressesChanged]: "listenAddressesChanged",
   [P2pEvent_Tags.PublicAddressesChanged]: "publicAddressesChanged",
   [P2pEvent_Tags.RelayReserved]: "relayReserved",
   [P2pEvent_Tags.RelayReservationLost]: "relayReservationLost",

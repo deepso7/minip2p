@@ -1,0 +1,78 @@
+{
+  "name": "@minip2p/web",
+  "version": "0.10.0",
+  "description": "Browser SDK for minip2p over libp2p WebTransport",
+  "keywords": [
+    "browser",
+    "libp2p",
+    "p2p",
+    "peer-to-peer",
+    "wasm",
+    "webtransport"
+  ],
+  "homepage": "https://github.com/deepso7/minip2p#readme",
+  "bugs": {
+    "url": "https://github.com/deepso7/minip2p/issues"
+  },
+  "license": "MIT",
+  "author": "Deepso <deeps.o7o8.y@gmail.com> (https://github.com/deepso7)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepso7/minip2p.git",
+    "directory": "bindings/ts/web"
+  },
+  "files": [
+    "dist",
+    "src",
+    "wasm/minip2p_web.d.ts",
+    "wasm/minip2p_web.js",
+    "wasm/minip2p_web_bg.wasm",
+    "wasm/minip2p_web_bg.wasm.d.ts",
+    "README.md"
+  ],
+  "type": "module",
+  "sideEffects": [
+    "./dist/index.js",
+    "./src/index.ts"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "minip2p-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./manual": {
+      "minip2p-source": "./src/manual.ts",
+      "types": "./dist/manual.d.ts",
+      "default": "./dist/manual.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "build": "del-cli dist && tsc -p tsconfig.build.json",
+    "clean": "del-cli dist",
+    "wasm:build": "node scripts/build-wasm.mjs",
+    "pretest": "node scripts/build-wasm.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@minip2p/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@minip2p/node": "workspace:*",
+    "@minip2p/test-fixtures": "workspace:*",
+    "@playwright/test": "1.64.1",
+    "@types/node": "catalog:",
+    "del-cli": "catalog:",
+    "typescript": "catalog:"
+  }
+}

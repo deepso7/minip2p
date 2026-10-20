@@ -24,7 +24,9 @@ use minip2p_relay::{
     FrameDecode as RelayFrame, HopConnect, HopMessage, HopReservation, HopResponder, StopInitiator,
     StopMessage, StopResponder,
 };
-use minip2p_secure_mux::noise::{NoiseConfig, NoiseHandshakePayload, NoiseRole, NoiseSession};
+use minip2p_secure_mux::noise::{
+    NoiseConfig, NoiseExtensions, NoiseHandshakePayload, NoiseRole, NoiseSession,
+};
 use minip2p_secure_mux::yamux::{FrameDecoder as YamuxFrameDecoder, YamuxRole, YamuxSession};
 use minip2p_secure_mux::{
     SecureMuxSession, SessionConfig, SessionOutput, SessionRole, YamuxConfig,
@@ -45,6 +47,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_noise(data);
     fuzz_pubsub(data);
     fuzz_yamux(data);
+    fuzz_webtransport(data);
     fuzz_secure_mux(data);
     fuzz_circuit(data);
     fuzz_relay_server_machines(data);
@@ -301,6 +304,21 @@ fn expected_transport_kind(addr: &Multiaddr) -> Option<TransportKind> {
     match addr.protocols() {
         [host, Protocol::Tcp(_)] if host.is_host() => Some(TransportKind::Tcp),
         [host, Protocol::Udp(_), Protocol::QuicV1] if host.is_host() => Some(TransportKind::Quic),
+        // WebTransport rides the QUIC transport: quic-v1, webtransport, then
+        // only certhashes.
+        [
+            host,
+            Protocol::Udp(_),
+            Protocol::QuicV1,
+            Protocol::WebTransport,
+            rest @ ..,
+        ] if host.is_host()
+            && rest
+                .iter()
+                .all(|protocol| matches!(protocol, Protocol::Certhash(_))) =>
+        {
+            Some(TransportKind::Quic)
+        }
         _ => None,
     }
 }
@@ -600,10 +618,11 @@ fn fuzz_peer_id() -> PeerId {
     PeerId::from_public_key_protobuf(b"minip2p-fuzz-peer")
 }
 
-/// Exercises framing, both XX roles, payload protobuf decoding, and handshake
-/// parsing with arbitrary wire bytes.
+/// Exercises framing, both XX roles, payload and extensions protobuf
+/// decoding, and handshake parsing with arbitrary wire bytes.
 fn fuzz_noise(data: &[u8]) {
     let _ = NoiseHandshakePayload::decode(data);
+    let _ = NoiseExtensions::decode(data);
     for role in [NoiseRole::Initiator, NoiseRole::Responder] {
         let identity = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([1; 32]);
         let mut session = NoiseSession::new(NoiseConfig {
@@ -612,6 +631,7 @@ fn fuzz_noise(data: &[u8]) {
             static_secret: [2; 32],
             ephemeral_secret: [3; 32],
             expected_peer: None,
+            local_extensions: None,
         });
         let _ = session.start();
         let _ = session.on_data(data.to_vec());
@@ -630,4 +650,54 @@ fn fuzz_yamux(data: &[u8]) {
         let _ = session.handle_data(data);
         while session.poll_output().is_some() {}
     }
+}
+
+fn fuzz_webtransport(data: &[u8]) {
+    use minip2p_webtransport::h3::{
+        CapsuleDecoder, Frame, FrameDecoder, Settings, UniStreamHeaderDecoder, varint,
+    };
+    use minip2p_webtransport::qpack::{
+        DecoderStreamReader, MAX_FIELD_SECTION_SIZE, MAX_FIELDS, QpackDecoder,
+    };
+
+    let _ = varint::decode(data);
+    let _ = Settings::decode_payload(data);
+    let _ = UniStreamHeaderDecoder::new().decode(&mut &data[..]);
+
+    let _ = DecoderStreamReader::new().read(data);
+
+    let mut qpack = QpackDecoder::new();
+    if let Ok(section) = qpack.decode(data) {
+        let size: usize = section
+            .iter()
+            .map(|f| f.name.len() + f.value.len() + 32)
+            .sum();
+        assert!(size <= MAX_FIELD_SECTION_SIZE && section.len() <= MAX_FIELDS);
+    }
+
+    // Feed the stream decoders in two chunks so the incremental paths run:
+    // frames, with DATA payloads going on to the capsule decoder.
+    let split = data.first().map_or(0, |&b| usize::from(b)).min(data.len());
+    let mut frames = FrameDecoder::new();
+    let mut capsules = CapsuleDecoder::new();
+    'stream: for chunk in [&data[..split], &data[split..]] {
+        let mut input = chunk;
+        loop {
+            match frames.decode(&mut input) {
+                Ok(Some(Frame::Data(mut payload))) => {
+                    while let Ok(Some(_)) = capsules.decode(&mut payload) {}
+                }
+                Ok(Some(Frame::Headers(block))) => {
+                    let _ = qpack.decode(&block);
+                }
+                Ok(Some(Frame::WebTransportStream { .. })) | Err(_) => break 'stream,
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+            }
+        }
+    }
+
+    let mut capsules = CapsuleDecoder::new();
+    let mut input = data;
+    while let Ok(Some(_)) = capsules.decode(&mut input) {}
 }

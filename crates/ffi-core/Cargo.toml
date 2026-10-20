@@ -13,20 +13,28 @@ publish = false
 workspace = true
 
 [dependencies]
-minip2p = { package = "minip2p-rs", path = "../minip2p", features = [
-  "discovery",
-  "mdns",
-  "tcp",
+# The thread-free core needs only the portable endpoint types; the `driver`
+# feature adds the std endpoint and the capabilities it binds.
+minip2p = { package = "minip2p-rs", path = "../minip2p", default-features = false, features = [
+  "pubsub",
 ] }
-minip2p-core = { path = "../core" }
-minip2p-swarm = { path = "../swarm" }
-minip2p-pubsub = { path = "../pubsub" }
+minip2p-pubsub = { path = "../pubsub", default-features = false }
 serde = { workspace = true, features = ["std", "derive"], optional = true }
 thiserror = { workspace = true, features = ["std"] }
 # Must remain paired with crates/ffi, ubrn and @ubjs/core 0.31.0-5.
 uniffi = { workspace = true, optional = true }
 
 [features]
+default = ["driver"]
+# The std host: `P2pEndpoint`, its detached driver and doorbell threads, and
+# Name resolution, over QUIC, TCP, NAT traversal, discovery and mDNS. Without
+# it the crate is the thread-free host core (the carry, the event model and
+# conversion, config, errors and key helpers) that a single-threaded wasm
+# host drives itself.
+driver = ["minip2p/default", "minip2p/discovery", "minip2p/mdns", "minip2p/tcp"]
+# Relay reservations and circuits for the thread-free core (the browser
+# host): NAT event and reachability conversion over `minip2p/portable-relay`.
+relay = ["minip2p/portable-relay"]
 # Derives the UniFFI record, enum and error metadata for the UniFFI binding
 # shell (`crates/ffi`). Other shells leave it off.
 uniffi = ["dep:uniffi"]

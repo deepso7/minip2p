@@ -1,5 +1,14 @@
 //! Binding-agnostic endpoint lifecycle and event delivery for foreign runtimes.
 //!
+//! The crate has two layers. The thread-free host core is always built: the
+//! bounded [`EventCarry`], the [`P2pEvent`] model and its conversion from
+//! [`minip2p::EndpointEvent`] ([`convert_endpoint_event`]), the config, error
+//! and [`ConnectTarget`] types, the stream-write helpers, and the key
+//! helpers. It needs no threads, clock or sockets, so a single-threaded host
+//! (the wasm shell) drives a `PortableEndpoint` with it. The default
+//! `driver` feature adds the std host: [`P2pEndpoint`], its detached driver
+//! and doorbell threads, and Name resolution.
+//!
 //! Connection attempts follow one contract: [`P2pEndpoint::connect`]
 //! admits an attempt under a single Connect ID and the event stream carries
 //! exactly one terminal for it — [`P2pEvent::PathEstablished`],
@@ -14,9 +23,12 @@
 
 #![warn(missing_docs)]
 
+mod carry;
 mod config;
 mod connect;
+#[cfg(feature = "driver")]
 mod driver;
+#[cfg(feature = "driver")]
 mod endpoint;
 mod error;
 mod events;
@@ -24,18 +36,26 @@ mod events;
 mod js_shape;
 mod writes;
 
+pub use carry::{DriverStats, EventCarry, PUMP_DRAIN_LIMIT};
 pub use config::{
     DiscoveryOptions, EndpointConfig, KnownPeerInfo, MdnsOptions, RelayReservationInfo,
 };
-pub use connect::ConnectTarget;
-pub use driver::DriverStats;
+pub use connect::{ConnectTarget, parse_connect_target};
+#[cfg(feature = "driver")]
 pub use endpoint::{DEFAULT_STOP_TIMEOUT_MS, P2pEndpoint};
-pub use error::{ConfigCapability, FfiError};
+pub use error::{
+    ConfigCapability, FfiError, driver_failure_kind, map_driver_error, map_gossipsub_error,
+    map_topic_error,
+};
+#[cfg(any(feature = "driver", feature = "relay"))]
+pub use events::convert_reachability;
 pub use events::{
     CloseOutcome, ConnectionCloseReason, ConnectionInfo, DiscoverySource, DriverFailureKind,
     EndpointErrorKind, EventDoorbell, IdentifyInfo, MdnsFailureKind, NatErrorKind,
     OpenStreamResult, P2pEvent, PathKind, Reachability, UnfinishedConnection,
+    convert_endpoint_event, convert_identify, convert_path,
 };
+pub use writes::{map_write_error, stream_writer, write_accepted_event};
 
 use std::str::FromStr;
 
@@ -48,7 +68,9 @@ uniffi::setup_scaffolding!();
 
 const SECRET_KEY_LENGTH: usize = 32;
 
-/// Generates raw Ed25519 secret key material.
+/// Generates raw Ed25519 secret key material from the operating system's
+/// entropy. Hosts without it generate the 32 bytes from their own source.
+#[cfg(feature = "driver")]
 pub fn generate_secret_key() -> Vec<u8> {
     Ed25519Keypair::generate().secret_key_bytes().to_vec()
 }
@@ -61,9 +83,7 @@ pub fn peer_id_from_secret_key(secret_key: Vec<u8>) -> Result<String, FfiError> 
 /// Builds a circuit multiaddress for `peer_id` through `relay_addr`.
 pub fn circuit_address(relay_addr: String, peer_id: String) -> Result<String, FfiError> {
     let relay = parse_direct_peer_addr(&relay_addr)?;
-    let target = PeerId::from_str(&peer_id).map_err(|error| FfiError::InvalidPeerId {
-        detail: error.to_string(),
-    })?;
+    let target = parse_peer_id(&peer_id)?;
     let mut protocols = relay.transport().protocols().to_vec();
     protocols.push(Protocol::P2p(relay.peer_id().clone()));
     protocols.push(Protocol::P2pCircuit);
@@ -71,20 +91,33 @@ pub fn circuit_address(relay_addr: String, peer_id: String) -> Result<String, Ff
     Ok(Multiaddr::from_protocols(protocols).to_string())
 }
 
-fn parse_direct_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
+/// Parses a base58 peer ID supplied by a binding.
+pub fn parse_peer_id(peer_id: &str) -> Result<PeerId, FfiError> {
+    PeerId::from_str(peer_id).map_err(|error| FfiError::InvalidPeerId {
+        detail: error.to_string(),
+    })
+}
+
+/// Parses a relay or AutoNAT server address supplied by a binding: a
+/// complete direct peer address with a concrete host.
+pub fn parse_direct_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
     let peer_addr = PeerAddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
         detail: error.to_string(),
     })?;
     if peer_addr.transport().transport_kind().is_none() || peer_addr.transport().is_wildcard_host()
     {
         return Err(FfiError::InvalidAddress {
-            detail: "address must be a complete direct /quic-v1 or /tcp peer address".into(),
+            detail:
+                "address must be a complete direct /quic-v1, /webtransport or /tcp peer address"
+                    .into(),
         });
     }
     Ok(peer_addr)
 }
 
-fn keypair_from_bytes(secret_key: Vec<u8>) -> Result<Ed25519Keypair, FfiError> {
+/// Builds the Ed25519 identity from raw secret key material supplied by a
+/// binding, which must be exactly 32 bytes.
+pub fn keypair_from_bytes(secret_key: Vec<u8>) -> Result<Ed25519Keypair, FfiError> {
     let secret_key: [u8; SECRET_KEY_LENGTH] =
         secret_key
             .try_into()

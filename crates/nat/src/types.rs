@@ -128,6 +128,10 @@ pub enum UpgradeStop {
     /// of the Relayed path becoming usable.
     #[error("the remote did not start DCUtR within {budget_ms} ms")]
     StartTimeout { budget_ms: u64 },
+    /// The remote's Identify on the circuit does not offer DCUtR, so it
+    /// will never start a round (a browser, for one).
+    #[error("the remote does not offer DCUtR")]
+    Unsupported,
     /// A DCUtR exchange did not reach SYNC within
     /// [`NatConfig::dcutr_exchange_timeout_ms`](crate::NatConfig::dcutr_exchange_timeout_ms).
     #[error("DCUtR round {round} did not finish within {budget_ms} ms")]

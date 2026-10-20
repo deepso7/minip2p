@@ -112,8 +112,16 @@ pub(crate) struct Socket {
     state: UdpSocketState,
     /// Fixed when the socket was bound.
     pub(crate) local_addr: SocketAddr,
-    /// Whether `listen` accepted this socket's address.
+    /// Whether `listen` accepted one of this socket's addresses: only then
+    /// are inbound connections admitted.
     pub(crate) listening: bool,
+    /// Whether the socket serves libp2p QUIC (ALPN `libp2p`), set at bind.
+    pub(crate) quic_v1: bool,
+    /// Whether the socket serves WebTransport (ALPN `h3`), set at bind.
+    pub(crate) webtransport: bool,
+    /// Whether `listen` already announced the `quic-v1` and the
+    /// WebTransport address.
+    pub(crate) announced: (bool, bool),
     /// Ids for this socket's connections, in its family's namespace.
     pub(crate) ids: ConnectionIdAllocator,
     /// The last receive batch hit its bound, so input may be waiting with no
@@ -172,6 +180,9 @@ impl Socket {
             state,
             local_addr,
             listening: false,
+            quic_v1: true,
+            webtransport: false,
+            announced: (false, false),
             ids: ConnectionIdAllocator::new(namespace),
             saturated: false,
             pending: VecDeque::new(),
@@ -476,6 +487,10 @@ impl Sockets {
 
     pub(crate) fn len(&self) -> usize {
         self.0.len()
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&Socket> {
+        self.0.get(index)
     }
 
     pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut Socket> {

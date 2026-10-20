@@ -67,7 +67,7 @@ See the research doc for sources. The facts that drive the design:
    - A `/…/udp/<port>/quic-v1/webtransport` listen address (no certhash) enables WebTransport on the QUIC socket bound for that address.
    - A socket can serve `quic-v1`, WebTransport, or both, depending on which shapes were listened on. `local_addresses()` reports only the shapes that were listened on. WebTransport addresses always include the current certhashes (Decision 5).
    - **Endpoint wiring:**
-     - `bind_transports` groups both shapes by socket and passes per-socket "serve WebTransport" flags into `QuicNodeConfig`.
+     - `bind_transports` passes the listen addresses of both shapes to `QuicTransport::bind`, which groups them by socket: a socket serves WebTransport because a `/webtransport` address names it (ADR 0023), with no separate flag in `QuicNodeConfig`.
      - `listen()` on the swarm's re-listen path (`listen_on_bound_addrs`) accepts a WebTransport address carrying a certhash and matches it to its socket, ignoring the hashes.
      - `default_listen_quic_addrs` is unchanged, so WebTransport is opt-in.
    - Node and React Native SDK users get WebTransport by putting the address in `listen`; no new config field is needed.
@@ -113,11 +113,12 @@ See the research doc for sources. The facts that drive the design:
 
      2. **CONNECT.** The first client bidi stream that carries a HEADERS frame is the CONNECT stream.
         - Decode it with the static-table QPACK decoder (Huffman included).
-        - Require exactly one each of `:method CONNECT`, `:protocol`, `:scheme https`, `:authority` and `:path`, with no other pseudo-headers and no pseudo-header after a regular field.
+        - Require exactly one each of `:method CONNECT`, `:protocol`, `:scheme https`, `:authority` and `:path`, with no other pseudo-headers and no pseudo-header after a regular field. `:authority` must be nonempty without userinfo, and a `host` field, if present, must repeat it exactly (RFC 9114 §4.3.1). Regular field names must be lowercase tokens, no value may hold NUL, CR or LF, and HTTP/1.1's connection-specific fields (`te` other than `trailers`) are malformed. Any of these is a malformed request: 400.
         - `:path` must be exactly `/.well-known/libp2p-webtransport?type=noise`. `origin` is ignored, as go-libp2p does; authentication is Noise.
         - **Draft selection.** Wait for the client's SETTINGS, check them per draft, and pick the highest version both sides support:
           - **Legality first.** Boolean settings (`ENABLE_WEBTRANSPORT` `0x2b603742`, `ENABLE_CONNECT_PROTOCOL` `0x08`, `H3_DATAGRAM` `0x33`) must be 0 or 1. Any other value is a connection error, `H3_SETTINGS_ERROR`, before version selection, even when another draft is validly offered.
-          - **draft-13/14** (Safari): `WT_MAX_SESSIONS` (`0x14e9cd29`) ≥ 1. This enables session flow control (below).
+          - **HTTP/3 datagrams.** Either draft needs the client's `H3_DATAGRAM` (`0x33`) == 1 and its QUIC `max_datagram_frame_size` transport parameter (draft-14 §3.1, draft-02 §3.1). Chrome and Firefox send both; without either the request gets 400.
+          - **draft-13/14** (Safari): `WT_MAX_SESSIONS` (`0x14e9cd29`) ≥ 1. This may enable session flow control (below).
           - **draft-02** (Chrome, Firefox): `ENABLE_WEBTRANSPORT` == 1. 0 means not offered.
 
           `:protocol` must then be exactly `webtransport`, the token both drafts use. `webtransport-h3` (draft-15+) is rejected with 400, because we don't implement that generation's requirements (RESET_STREAM_AT, `WT_ENABLED`). No supported draft → 400. In both cases the session closes afterwards.
@@ -135,12 +136,20 @@ See the research doc for sources. The facts that drive the design:
         | Peer behaviour | Result |
         | --- | --- |
         | A second control stream, or a second QPACK encoder or decoder stream | Connection error `H3_STREAM_CREATION_ERROR` |
-        | A critical stream (control or QPACK) closed or reset | `H3_CLOSED_CRITICAL_STREAM` |
+        | A client push stream | `H3_STREAM_CREATION_ERROR` |
+        | A critical stream (control or QPACK) closed or reset, or STOP_SENDING on our control stream | `H3_CLOSED_CRITICAL_STREAM` |
         | First frame on control is not SETTINGS, a SETTINGS repeat, or DATA/HEADERS on control | `H3_MISSING_SETTINGS` / `H3_FRAME_UNEXPECTED` |
+        | Any CANCEL_PUSH (we never promise a push), or a smaller MAX_PUSH_ID | `H3_ID_ERROR` |
+        | A bidi or uni WebTransport stream naming a session id that is not a multiple of 4 | `H3_ID_ERROR` |
         | Duplicate setting id, or an HTTP/2-only setting | `H3_SETTINGS_ERROR` |
         | Client SETTINGS without a supported WebTransport draft | 400 on CONNECT, then close |
         | Any QPACK encoder-stream instruction (the table capacity is 0, so every insert is illegal) | `QPACK_ENCODER_STREAM_ERROR` |
+        | Any QPACK decoder-stream instruction but Stream Cancellation (nothing is inserted to acknowledge) | `QPACK_DECODER_STREAM_ERROR` |
         | A field section with required insert count ≠ 0, or a dynamic or post-base reference | `QPACK_DECOMPRESSION_FAILED` |
+        | SETTINGS, GOAWAY or a push frame on the CONNECT stream, or DATA or HEADERS after its trailer section (unknown frames are skipped) | `H3_FRAME_UNEXPECTED` |
+        | A pseudo-header or malformed field in the CONNECT stream's trailers | `H3_MESSAGE_ERROR` |
+        | A `WT_MAX_DATA` or `WT_MAX_STREAMS` (bidi or uni) capsule below the previous one of its kind | `WT_FLOW_CONTROL_ERROR` (`0x045d4487`, draft-14 §§5.6.2, 5.6.4); the session is the connection's only one, so the connection closes with it |
+        | A failed Noise handshake, or the client finishing or stopping the Noise stream before it completes | `H3_GENERAL_PROTOCOL_ERROR` |
         | Unknown uni stream type | `STOP_SENDING(H3_STREAM_CREATION_ERROR)` on that stream only |
         | GOAWAY from the client | Treated as session close |
 
@@ -149,7 +158,7 @@ See the research doc for sources. The facts that drive the design:
         - set the connection token to the Noise `handshake_hash()`, which both ends compute;
         - emit `Connected`;
         - FIN the Noise stream. It is never surfaced to the swarm.
-     4. **Established.** Every later bidi stream with the prefix `0x41 + session id` is surfaced as `IncomingStream` once its prefix is parsed. A bidi stream with another session id is refused with stop and reset. A WT uni stream (`0x54`) is refused with `STOP_SENDING` only. libp2p uses neither.
+     4. **Established.** Every later bidi stream with the prefix `0x41 + session id` is surfaced as `IncomingStream` once its prefix is parsed. A bidi stream with another (possible) session id is refused with stop and reset. A WT uni stream (`0x54`) is refused with `STOP_SENDING` only, unless its session id is impossible (matrix above). libp2p uses neither.
    - **Stream prefixes are internal.**
      - Inbound prefix bytes are read before admission and never count against the receive budget (ADR 0012).
      - Outbound streams queue the prefix ahead of any caller bytes. It is not counted in `send_room` and is never part of a `Full { unsent }`.
@@ -157,29 +166,30 @@ See the research doc for sources. The facts that drive the design:
    - **Early streams.** Streams that arrive before the session is established, such as the Noise stream racing the 2xx, are held. The cap is 4 streams and 16 KiB in total; past that the connection fails.
    - **Stream error codes.**
      - minip2p's reset and stop code 0 is sent as the WT application error 0, mapped to `0x52e4a40fa8db` by the draft formula.
+     - When the session ends, draft-13/14 streams are reset and stopped with `WT_SESSION_GONE` (`0x170d7b68`, draft-14 §6). Draft-02 names no code for this, so its streams get WT application error 0.
      - Inbound H3 codes are mapped back into WT codes for `StreamWriteStopped { error_code }`. Codes outside the WT range pass through unchanged.
      - Browsers cut codes to 8 bits, so minip2p only ever sends 0.
-   - **Session flow control (needed for Safari).** When both sides sent `WT_INITIAL_MAX_*`, server-opened streams and bytes count against the client's WT stream and data credit. The parser reads `WT_MAX_STREAMS` (`0x190b4d3f`) and `WT_MAX_DATA` capsules on the CONNECT stream, and the existing `pending_opens` and send queue simply wait for that credit. The server's own limits are 2^60, so it never sends credit capsules.
+   - **Session flow control (needed for Safari).** On draft-13/14, flow control is on once the client asks for it with a `WT_MAX_SESSIONS` above 1 or any nonzero `WT_INITIAL_MAX_*` (draft-14 §5.1); an omitted limit is then 0. Server-opened streams and their bytes after the prefix, Noise's replies included, count against the client's WT stream and data credit. The parser reads `WT_MAX_STREAMS` (`0x190b4d3f`) and `WT_MAX_DATA` capsules on the CONNECT stream, and the existing `pending_opens` and send queue simply wait for that credit. A capsule below the previous one of its kind (uni included) is `WT_FLOW_CONTROL_ERROR`. The server's own limits are 2^60, so it never sends credit capsules.
    - **Close.**
      - **Local `close(id)`** enters a `Closing` phase rather than closing QUIC at once. quinn's `Connection::close` drops undelivered stream data, so an immediate close would lose the capsule.
        1. Send a `CLOSE_WEBTRANSPORT_SESSION` capsule (`0x2843`, code 0) in a DATA frame.
        2. FIN the CONNECT stream.
-       3. Reset the open WT streams.
-       4. Wait until the peer FINs or resets its side of the CONNECT stream, or until a bounded deadline passes (`max(3 × RTT, 500 ms)`, capped at 2 s).
+       3. Reset and stop the open WT streams (`WT_SESSION_GONE` on draft-13/14).
+       4. Wait out a bounded deadline (`max(3 × RTT, 500 ms)`, capped at 2 s), even if the peer ends its side sooner: Chrome finishes CONNECT and acknowledges our FIN in its network stack before the page's `closed` settles, and a QUIC close in that window rejects `closed` with "Connection lost".
        5. Close QUIC with `H3_NO_ERROR` (`0x100`).
 
-       The transport contract is unchanged: `Closed` is emitted once QUIC drains, as today. No stream events follow `close`.
+       The transport contract is unchanged: `Closed` is emitted once QUIC drains, as today. No stream events follow `close`. Dropping the transport cuts the wait short: the capsule and FIN go out, then CONNECTION_CLOSE at once, since nothing polls afterwards.
 
-     - **Peer-initiated close.** A peer capsule, a FIN on the CONNECT stream, or a reset of it ends the session. The server FINs its side of the CONNECT stream, then closes QUIC with `H3_NO_ERROR` after the same bounded delay. The browser initiated the close, so it already treats the session as closed.
+     - **Peer-initiated close.** A peer capsule, a FIN, reset or STOP_SENDING on the CONNECT stream, or GOAWAY ends the session (`Remote { code }` with the capsule's code, 0 otherwise); STOP_SENDING also resets our side of the CONNECT stream. The server FINs its side and resets the open WT streams, then closes QUIC with `H3_NO_ERROR` as soon as the peer has finished or reset its side of the CONNECT stream and acknowledged (or stopped) our FIN, bounded by the same deadline. Closing sooner would discard the FIN and resets. The browser initiated the close, so it already treats the session as closed.
      - **Refused requests.** The 400 and 404 replies use the same `Closing` path, so the status reaches the browser.
      - `on_lost` counts `H3_NO_ERROR` as orderly on h3 connections, so no `Error` event is raised.
-     - Tests: a native-initiated close in Playwright (PR 5) asserts that the browser's `transport.closed` promise _fulfills_ with code 0; the native test client (Decision 11) asserts that the capsule arrived before the QUIC close.
+     - Tests: a native-initiated close in Playwright (PR 5) asserts that the browser's `transport.closed` promise _fulfills_ with code 0 and the SDK reports a remote close. Chromium alone may instead reject `closed` with `WebTransportError: Connection lost.` (its network service sometimes drops the close report), and the SDK's matching error close reason is then accepted too; Firefox stays strict. The native test client (Decision 11) asserts that the capsule arrived before the QUIC close.
    - **Pre-auth limits.** These are enforced before allocation and bound each connection's pre-auth state once ALPN is `h3` (there is no memory budget, ADR 0022):
      - Encoded caps: HEADERS frames 16 KiB, the SETTINGS frame 4 KiB, a single capsule 64 KiB. Capsule bodies other than CLOSE are parsed as they stream, so the 64 KiB bound only applies to CLOSE messages (1 KiB max) and to skipping unknown capsules, which is done without buffering.
      - Decoded caps: the QPACK decoder stops with `QPACK_DECOMPRESSION_FAILED` once the decoded field section passes **8 KiB** (the RFC 9114 `name + value + 32` per-field accounting) or **64 fields**. That bound applies no matter how few encoded bytes produced it, which covers repeated static-index expansion. The decoder writes into one preallocated 8 KiB buffer, so there is no per-field allocation.
      - Early streams: as above, 4 streams and 16 KiB in total.
      - A WebTransport handshake deadline, `QuicLimits::webtransport_handshake_timeout_ms` (default 10 s), runs from QUIC Connected to Noise complete and feeds `next_deadline`.
-     - Admission, the connection cap and Retry are unchanged: quinn admits the connection before ALPN is known, as today. The h3 state is set up at ALPN time, and a peer past any cap gets the connection closed with `H3_EXCESSIVE_LOAD`.
+     - Admission, the connection cap and Retry are unchanged: quinn admits the connection before ALPN is known, as today. The h3 state is set up at ALPN time, and a peer past a cap gets the connection closed with the code RFC 9114 and RFC 9204 give it: a decoded field section past 8 KiB or 64 fields is `QPACK_DECOMPRESSION_FAILED`, a CLOSE reason over 1 KiB is a malformed capsule (`H3_MESSAGE_ERROR`), and every other cap is `H3_EXCESSIVE_LOAD`, as is the handshake deadline.
      - Fixtures: a 2 KiB HEADERS frame of repeated static indexes that would expand past 8 KiB is rejected; a field count of 65 is rejected.
 
 5. **WebTransport certificates and rotation.**
@@ -252,7 +262,7 @@ See the research doc for sources. The facts that drive the design:
          fn grant_read(&mut self, stream: StreamHandle, bytes: usize); // pull: read at most this much more
          fn close(&mut self, session: SessionHandle, code: u32, reason: &str);
          fn poll_event(&mut self) -> Option<IoEvent>;
-         // IoEvent: SessionReady, SessionClosed{reason}, StreamOpened, IncomingStream,
+         // IoEvent: SessionReady, SessionClosed{code, reason}, SessionFailed{reason}, StreamOpened, IncomingStream,
          //          Data{stream, bytes}, Fin, Reset{code}, StopSending{code},
          //          WriteCompleted{stream, bytes}
      }
@@ -270,7 +280,7 @@ See the research doc for sources. The facts that drive the design:
       1. build `https://<host>:<port>/.well-known/libp2p-webtransport?type=noise` (IPv6 hosts are bracketed; DNS names pass through to the browser, which resolves them);
       2. `connect` with the address's certhashes;
       3. on `SessionReady`, `open_stream` and run `NoiseSession` as initiator with `expected_peer` from `/p2p`;
-      4. on `HandshakeComplete`, require every dialed certhash to be in `remote_extensions.webtransport_certhashes`; otherwise emit `Error` then `Closed`;
+      4. on `HandshakeComplete`, require every dialed certhash to be in `remote_extensions.webtransport_certhashes`; otherwise emit `Closed` with an error reason (no separate `Error` event);
       5. FIN the Noise stream and emit `Connected`, with the token set to the handshake hash.
     - A dial without a certhash is rejected with `Unsupported` (no CA mode).
     - **Streams.** Streams map 1:1. The full transport contract follows, using the same limits and helpers as the TCP and QUIC transports.

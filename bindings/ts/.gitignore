@@ -2,3 +2,4 @@ node_modules/
 .turbo/
 core/dist/
 node/dist/
+web/dist/
