@@ -18,5 +18,6 @@ Browsers reach native minip2p nodes over libp2p WebTransport ([plan](../plans/we
 
 - On a socket that serves both shapes, libp2p peers also see the `h3` transport parameters (three peer unidirectional streams, the DATAGRAM parameter); `quic-v1`-only sockets are unchanged.
 - WebTransport is opt-in: only a `/…/quic-v1/webtransport` listen address turns it on.
+- Every WebTransport address carries a `/certhash` here. Superseded in part by [ADR 0024](0024-ca-signed-webtransport-certificates.md): a listener with a CA-signed certificate serves hash-free addresses.
 - Native WebTransport dialing is a follow-up: promote the test client's `WebTransportIo` to a real provider.
 - **Deviation: draft-13/14 is a compatibility subset.** Safari 26.4+ speaks draft-13/14, which already requires RESET_STREAM_AT so a reset stream still delivers its session prefix. quinn-proto 0.11 has no RESET_STREAM_AT, so our resets are plain RESET_STREAM; a reset that races a stream's prefix leaves the client unable to associate the stream, which it discards (nothing is misdelivered). This matches what webtransport-go ships and what Safari accepts in practice; Safari is best-effort and verified by hand until quinn gains RESET_STREAM_AT. Draft-15+ (`webtransport-h3`) is refused with 400.

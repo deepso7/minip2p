@@ -22,7 +22,7 @@ Non-goals:
 - **No native WebTransport dialer** in the shipped API. Native nodes keep using `quic-v1` with each other. A test-only native client exists (Decision 11) and makes a real dialer a short follow-up.
 - **No WebRTC and no WebSocket.** Browser-to-browser traffic goes over a relay circuit in PR 6, not direct.
 - **No hole punching, listening, mDNS, signed discovery or AutoNAT from the browser.** The web config rejects them with `InvalidConfigError`.
-- **No CA-signed certificate mode** (a WebTransport listener without `/certhash`).
+- **No CA-signed certificate mode** (a WebTransport listener without `/certhash`). Added later: see [CA-signed WebTransport certificates](webtransport-ca-certificates.md).
 - **No change to `quic-v1` wire behaviour** for libp2p peers on `quic-v1`-only sockets. On a socket that also serves WebTransport, libp2p peers additionally see the datagram parameter and a uni-stream limit of 3 (Decision 3).
 
 ## Outcome
