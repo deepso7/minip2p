@@ -126,4 +126,4 @@ On a systemd host with certbot, for `relay.example.com`:
 
 6. Check renewal end to end once: run `sudo certbot renew --cert-name relay.example.com --force-renewal`, then confirm in `minip2p-relay service logs` that the relay restarted and printed the new `webtransport_certificate_not_after=`.
 
-Use `service install --webtransport` without a certificate to serve browsers with the rotating self-signed certificates instead.
+Use `service install --webtransport` without a certificate to serve browsers with the rotating self-signed certificates instead. The unit then announces no WebTransport address: an announced certhash would go stale within 26 days, and explicit announces replace listener addresses in reservation replies. Browsers must get the current `webtransport=` address from the logs.

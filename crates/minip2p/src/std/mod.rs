@@ -993,7 +993,7 @@ impl Endpoint {
     /// Each address must be a concrete direct TCP, QUIC or WebTransport
     /// address for this endpoint's peer id. A WebTransport address carries a
     /// `/certhash` with the derived self-signed certificates and none with a
-    /// CA-signed one ([`EndpointBuilder::webtransport_certificate_pem`]).
+    /// CA-signed one (`EndpointBuilder::webtransport_certificate_pem`).
     /// [`RelayServerControlError::InvalidAddress`] retains the rejected
     /// input's index and reason; on error, the previous override remains
     /// active. An empty replacement clears the override, restoring the
@@ -1607,7 +1607,7 @@ impl EndpointBuilder {
     /// and circuit addresses, and checks a trailing peer id against an
     /// already-fixed builder identity. Whether a WebTransport address must carry
     /// a `/certhash` depends on
-    /// [`EndpointBuilder::webtransport_certificate_pem`], so that is checked at
+    /// `EndpointBuilder::webtransport_certificate_pem`, so that is checked at
     /// bind: with the derived self-signed certificates it must, with a CA-signed
     /// one it must not. [`RelayServerAnnounceError`] preserves either the rejected input
     /// or a validator configuration failure. When identity is not fixed yet, the peer-id match is

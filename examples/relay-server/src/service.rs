@@ -179,6 +179,8 @@ fn install(
     }
     require_linux()?;
     require_root()?;
+    // Built first, so a rejected path fails before anything is installed.
+    let unit = unit_file(Path::new(EXECUTABLE_PATH), hostname, webtransport)?;
     let imported_identity = import_key.map(read_import_identity).transpose()?;
     if imported_identity.is_some() && Path::new(IDENTITY_PATH).exists() {
         return Err(format!(
@@ -223,7 +225,6 @@ fn install(
     if let Some(identity) = imported_identity {
         install_identity(&identity)?;
     }
-    let unit = unit_file(Path::new(EXECUTABLE_PATH), hostname, webtransport)?;
     write_unit_atomically(Path::new(UNIT_PATH), &unit)?;
 
     run_status(SYSTEMCTL, ["daemon-reload"])?;
