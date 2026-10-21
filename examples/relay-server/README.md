@@ -58,7 +58,7 @@ cargo run -p minip2p-relay-server-example -- \
   --tcp 192.0.2.10:4201 --tcp '[2001:db8::10]:4201'
 ```
 
-Add `--webtransport` to serve browsers too: each QUIC socket also listens on `…/quic-v1/webtransport`, and the relay prints the address a browser dials, certhash included, as `[relay] webtransport=/ip4/…/udp/19876/quic-v1/webtransport/certhash/u…/p2p/…`. The certhash pins the relay's current WebTransport certificate, which is derived from its key, so it stays the same across restarts with `--key`.
+Add `--webtransport` to serve browsers too: each QUIC socket also listens on `…/quic-v1/webtransport`, and the relay prints the address a browser dials, certhash included, as `[relay] webtransport=/ip4/…/udp/19876/quic-v1/webtransport/certhash/u…/p2p/…`. The certhash pins the relay's current WebTransport certificate. That certificate is derived from the relay's key, so it survives restarts with `--key`, but it rotates every 13 days, so an address with a certhash goes stale within about 26 days. For one permanent address, give the relay a CA-signed certificate (see [Browsers with a stable address](#browsers-with-a-stable-address)).
 
 For a stable public identity and explicit advertised addresses:
 
@@ -71,4 +71,59 @@ cargo run -p minip2p-relay-server-example -- \
 
 The key file is created owner-only on Unix and never overwritten. Configuration and address errors are reported before transport binding where possible. Run with `--help` for capacity (overall, per peer, and per IPv4 address or IPv6 /64), duration, byte, pending-control, timeout, and fixed peer/IP token-bucket flags, plus `--max-rate-limit-entries` for the keys each token-bucket map tracks. A rate flag accepts `CAPACITY/REFILL_MS` or `off`. Zero circuit duration/bytes mean unlimited; zero capacities deny new work.
 
-Explicit announce addresses are trusted operator input and take precedence over AutoNAT-confirmed direct addresses and concrete listeners. TCP, QUIC-v1 and WebTransport shapes are accepted; a WebTransport one must carry its `/certhash` (copy it from the `webtransport=` line). Wildcards, circuit addresses, other shapes, and conflicting `/p2p` identities are rejected.
+Explicit announce addresses are trusted operator input and take precedence over AutoNAT-confirmed direct addresses and concrete listeners. TCP, QUIC-v1 and WebTransport shapes are accepted. Without `--webtransport-cert`, a WebTransport one must carry its `/certhash` (copy it from the `webtransport=` line); with it, a WebTransport one must not. Wildcards, circuit addresses, other shapes, and conflicting `/p2p` identities are rejected.
+
+## Browsers with a stable address
+
+With a domain and a CA-signed certificate, browsers dial a permanent address with no `/certhash`, such as `/dns/relay.example.com/udp/19876/quic-v1/webtransport/p2p/12D3KooW…`, and check the certificate the way they check any HTTPS page:
+
+```bash
+minip2p-relay --key var/relay.ed25519 \
+  --webtransport-cert fullchain.pem --webtransport-key privkey.pem \
+  --announce /dns/relay.example.com/udp/19876/quic-v1/webtransport
+```
+
+`--webtransport-cert` (the PEM chain, leaf first) and `--webtransport-key` (its PEM private key) come together and imply `--webtransport`. The relay reads both files before binding, refuses a key that doesn't match the leaf or a leaf that has expired, and prints each announced `[relay] webtransport=/dns/…` address and the leaf's `webtransport_certificate_not_after=`. The certificate names a domain, so the listener's IP addresses are not printed as `webtransport=` lines. The relay loads the certificate only at startup, so restart it after each renewal. At startup and then daily, it logs `[relay] warning: the WebTransport certificate expires in N days` once the leaf has fewer than 14 days left; point log alerting at that line, because Let's Encrypt no longer emails expiry notices.
+
+On a systemd host with certbot, for `relay.example.com`:
+
+1. Open TCP port 80 for the HTTP-01 challenge, or use a DNS-01 certbot plugin for your DNS provider to avoid the port.
+2. Create the group and the root-owned certificate directory the deploy hook installs into. `service install` reuses an existing group. The relay's state directory is writable by the service, so it can't hold the certificate.
+
+   ```bash
+   sudo groupadd --system minip2p-relay
+   sudo install -d -o root -g minip2p-relay -m 0750 /etc/minip2p-relay/tls
+   ```
+
+3. Install this deploy hook as `/usr/local/sbin/minip2p-relay-cert-hook` (owned by root, mode `0755`). It copies the renewed files under temporary names, then moves them into place, so the relay never reads a half-written file:
+
+   ```sh
+   #!/bin/sh
+   set -eu
+   [ "${RENEWED_LINEAGE:-}" = /etc/letsencrypt/live/relay.example.com ] || exit 0
+   dir=/etc/minip2p-relay/tls
+   for file in fullchain.pem privkey.pem; do
+     install -o root -g minip2p-relay -m 0640 "$RENEWED_LINEAGE/$file" "$dir/.$file.tmp"
+     mv "$dir/.$file.tmp" "$dir/$file"
+   done
+   systemctl try-restart minip2p-relay
+   ```
+
+4. Issue the certificate. Certbot runs the hook now and saves it for every renewal. Then confirm `/etc/minip2p-relay/tls/fullchain.pem` and `privkey.pem` exist.
+
+   ```bash
+   sudo certbot certonly --standalone -d relay.example.com --key-type ecdsa \
+     --deploy-hook /usr/local/sbin/minip2p-relay-cert-hook
+   ```
+
+5. Install the service with the certificate. The unit adds `--webtransport` and announces `/dns/relay.example.com/udp/19876/quic-v1/webtransport`:
+
+   ```bash
+   sudo minip2p-relay service install --hostname relay.example.com \
+     --webtransport-cert /etc/minip2p-relay/tls/fullchain.pem \
+     --webtransport-key /etc/minip2p-relay/tls/privkey.pem
+   ```
+
+6. Check renewal end to end once: run `sudo certbot renew --cert-name relay.example.com --force-renewal`, then confirm in `minip2p-relay service logs` that the relay restarted and printed the new `webtransport_certificate_not_after=`.
+
+Use `service install --webtransport` without a certificate to serve browsers with the rotating self-signed certificates instead.

@@ -2,11 +2,11 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::{Arg, Command as ClapCommand};
+use clap::{Arg, ArgAction, Command as ClapCommand, value_parser};
 
 const SERVICE_NAME: &str = "minip2p-relay";
 const SERVICE_USER: &str = "minip2p-relay";
@@ -40,7 +40,19 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<(), Box<dyn Error>>
                 .expect("clap requires --hostname");
             validate_hostname(hostname)?;
             let import_key = matches.get_one::<String>("import-key").map(Path::new);
-            install(hostname, import_key)
+            let certificate = match (
+                matches.get_one::<PathBuf>("webtransport-cert"),
+                matches.get_one::<PathBuf>("webtransport-key"),
+            ) {
+                (Some(chain), Some(key)) => Some((chain.as_path(), key.as_path())),
+                _ => None,
+            };
+            let webtransport = match certificate {
+                Some(certificate) => WebTransport::CaCertificate(certificate),
+                None if matches.get_flag("webtransport") => WebTransport::Derived,
+                None => WebTransport::Off,
+            };
+            install(hostname, import_key, webtransport)
         }
         Some(("status", _)) => {
             require_linux()?;
@@ -85,14 +97,45 @@ fn validate_hostname(hostname: &str) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn unit_file(executable: &Path, hostname: &str) -> Result<String, Box<dyn Error>> {
-    let executable = executable
+/// Whether the service serves WebTransport, and with which certificate.
+#[derive(Clone, Copy)]
+enum WebTransport<'a> {
+    Off,
+    /// The rotating self-signed certificates derived from the identity key.
+    Derived,
+    /// A CA-signed chain and key, by path; browsers dial `/dns/{hostname}`.
+    CaCertificate((&'a Path, &'a Path)),
+}
+
+/// Quotes one ExecStart path for systemd, naming `what` in errors.
+fn quoted(path: &Path, what: &str) -> Result<String, Box<dyn Error>> {
+    let path = path
         .to_str()
-        .ok_or("the relay executable path is not valid UTF-8")?;
-    if executable.chars().any(char::is_control) {
-        return Err("the relay executable path contains a control character".into());
+        .ok_or_else(|| format!("the {what} path is not valid UTF-8"))?;
+    if path.chars().any(char::is_control) {
+        return Err(format!("the {what} path contains a control character").into());
     }
-    let executable = executable.replace('\\', "\\\\").replace('"', "\\\"");
+    Ok(format!(
+        "\"{}\"",
+        path.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
+fn unit_file(
+    executable: &Path,
+    hostname: &str,
+    webtransport: WebTransport<'_>,
+) -> Result<String, Box<dyn Error>> {
+    let executable = quoted(executable, "relay executable")?;
+    let webtransport = match webtransport {
+        WebTransport::Off => String::new(),
+        WebTransport::Derived => " --webtransport".into(),
+        WebTransport::CaCertificate((chain, key)) => format!(
+            " --webtransport --webtransport-cert {} --webtransport-key {} --announce /dns/{hostname}/udp/19876/quic-v1/webtransport",
+            quoted(chain, "--webtransport-cert")?,
+            quoted(key, "--webtransport-key")?
+        ),
+    };
     Ok(format!(
         "[Unit]\n\
 Description=minip2p circuit relay\n\
@@ -102,7 +145,7 @@ Wants=network-online.target\n\
 [Service]\n\
 User=minip2p-relay\n\
 Group=minip2p-relay\n\
-ExecStart=\"{executable}\" --key /var/lib/minip2p-relay/identity.key --announce /dns/{hostname}/tcp/19876 --announce /dns/{hostname}/udp/19876/quic-v1\n\
+ExecStart={executable} --key /var/lib/minip2p-relay/identity.key --announce /dns/{hostname}/tcp/19876 --announce /dns/{hostname}/udp/19876/quic-v1{webtransport}\n\
 Restart=on-failure\n\
 RestartSec=5\n\
 StandardInput=null\n\
@@ -118,7 +161,17 @@ WantedBy=multi-user.target\n"
     ))
 }
 
-fn install(hostname: &str, import_key: Option<&Path>) -> Result<(), Box<dyn Error>> {
+fn install(
+    hostname: &str,
+    import_key: Option<&Path>,
+    webtransport: WebTransport<'_>,
+) -> Result<(), Box<dyn Error>> {
+    // The unit runs from an unspecified directory; check before touching the host.
+    if let WebTransport::CaCertificate((chain, key)) = webtransport
+        && !(chain.is_absolute() && key.is_absolute())
+    {
+        return Err("--webtransport-cert and --webtransport-key must be absolute paths".into());
+    }
     require_linux()?;
     require_root()?;
     let imported_identity = import_key.map(read_import_identity).transpose()?;
@@ -165,7 +218,7 @@ fn install(hostname: &str, import_key: Option<&Path>) -> Result<(), Box<dyn Erro
     if let Some(identity) = imported_identity {
         install_identity(&identity)?;
     }
-    let unit = unit_file(Path::new(EXECUTABLE_PATH), hostname)?;
+    let unit = unit_file(Path::new(EXECUTABLE_PATH), hostname, webtransport)?;
     write_unit_atomically(Path::new(UNIT_PATH), &unit)?;
 
     run_status(SYSTEMCTL, ["daemon-reload"])?;
@@ -404,7 +457,29 @@ fn command() -> ClapCommand {
                         .value_name("HOSTNAME")
                         .required(true),
                 )
-                .arg(Arg::new("import-key").long("import-key").value_name("PATH")),
+                .arg(Arg::new("import-key").long("import-key").value_name("PATH"))
+                .arg(
+                    Arg::new("webtransport")
+                        .long("webtransport")
+                        .action(ArgAction::SetTrue)
+                        .help("Also serve WebTransport (browsers) on the QUIC port"),
+                )
+                .arg(
+                    Arg::new("webtransport-cert")
+                        .long("webtransport-cert")
+                        .value_name("PATH")
+                        .value_parser(value_parser!(PathBuf))
+                        .requires("webtransport-key")
+                        .help("CA-signed certificate chain (PEM); announces /dns/HOSTNAME WebTransport"),
+                )
+                .arg(
+                    Arg::new("webtransport-key")
+                        .long("webtransport-key")
+                        .value_name("PATH")
+                        .value_parser(value_parser!(PathBuf))
+                        .requires("webtransport-cert")
+                        .help("The --webtransport-cert private key (PEM)"),
+                ),
         )
         .subcommand(ClapCommand::new("status").about("Show the systemd service status"))
         .subcommand(ClapCommand::new("logs").about("Follow the systemd service logs"))
@@ -426,6 +501,7 @@ mod tests {
         let unit = unit_file(
             Path::new("/opt/minip2p relay/minip2p-relay"),
             "relay.minip2p.com",
+            WebTransport::Off,
         )
         .unwrap();
 
@@ -452,6 +528,38 @@ ReadWritePaths=/var/lib/minip2p-relay\n\
 \n\
 [Install]\n\
 WantedBy=multi-user.target\n"
+        );
+    }
+
+    /// The ExecStart line of a unit for `relay.minip2p.com`.
+    fn exec_start(webtransport: WebTransport<'_>) -> String {
+        let unit = unit_file(
+            Path::new("/usr/local/bin/minip2p-relay"),
+            "relay.minip2p.com",
+            webtransport,
+        )
+        .unwrap();
+        unit.lines()
+            .find_map(|line| line.strip_prefix("ExecStart="))
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn unit_passes_webtransport_through() {
+        let base = "\"/usr/local/bin/minip2p-relay\" --key /var/lib/minip2p-relay/identity.key --announce /dns/relay.minip2p.com/tcp/19876 --announce /dns/relay.minip2p.com/udp/19876/quic-v1";
+        assert_eq!(
+            exec_start(WebTransport::Derived),
+            format!("{base} --webtransport")
+        );
+        assert_eq!(
+            exec_start(WebTransport::CaCertificate((
+                Path::new("/etc/minip2p-relay/tls/full\"chain.pem"),
+                Path::new("/etc/minip2p relay/privkey.pem"),
+            ))),
+            format!(
+                "{base} --webtransport --webtransport-cert \"/etc/minip2p-relay/tls/full\\\"chain.pem\" --webtransport-key \"/etc/minip2p relay/privkey.pem\" --announce /dns/relay.minip2p.com/udp/19876/quic-v1/webtransport"
+            )
         );
     }
 

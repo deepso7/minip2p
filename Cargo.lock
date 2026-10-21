@@ -1330,6 +1330,8 @@ dependencies = [
  "clap",
  "minip2p-example-common",
  "minip2p-rs",
+ "minip2p-tls",
+ "rustls-pki-types",
  "tempfile",
 ]
 

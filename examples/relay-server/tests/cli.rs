@@ -44,6 +44,7 @@ fn service_install_help_describes_the_host_setup() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("--hostname <HOSTNAME>"), "{stdout}");
     assert!(stdout.contains("--import-key <PATH>"), "{stdout}");
+    assert!(stdout.contains("--webtransport-cert <PATH>"), "{stdout}");
     assert!(
         stdout.contains("Install and start a systemd service"),
         "{stdout}"
@@ -105,4 +106,49 @@ fn webtransport_prints_the_certhash_address_on_the_quic_port() {
     );
     let socket = |address: &str| address.split("/quic-v1").next().unwrap().to_owned();
     assert_eq!(socket(&webtransport), socket(&quic));
+}
+
+#[test]
+fn a_ca_certificate_prints_the_announced_hash_free_address_and_its_expiry() {
+    let fixture = |name: &str| {
+        format!(
+            "{}/../../transports/quic/tests/fixtures/ca/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    };
+    let mut relay = Command::new(env!("CARGO_BIN_EXE_minip2p-relay"))
+        .args(["--quic", "127.0.0.1:0", "--tcp", "127.0.0.1:0"])
+        .args(["--webtransport-cert", &fixture("localhost.pem")])
+        .args(["--webtransport-key", &fixture("localhost.key")])
+        .args([
+            "--announce",
+            "/dns/localhost/udp/19876/quic-v1/webtransport",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = relay.stdout.take().unwrap();
+    let mut webtransport = Vec::new();
+    let mut not_after = None;
+    for line in BufReader::new(stdout).lines() {
+        let line = line.unwrap();
+        if let Some(address) = line.strip_prefix("[relay] webtransport=") {
+            webtransport.push(address.to_owned());
+        }
+        if let Some(time) = line.strip_prefix("[relay] webtransport_certificate_not_after=") {
+            not_after = Some(time.to_owned());
+            break;
+        }
+    }
+    relay.kill().unwrap();
+    relay.wait().unwrap();
+
+    // Only the announced address: the listener's IP fails the certificate's name.
+    assert_eq!(webtransport.len(), 1, "{webtransport:?}");
+    assert!(
+        webtransport[0].starts_with("/dns/localhost/udp/19876/quic-v1/webtransport/p2p/"),
+        "{webtransport:?}"
+    );
+    assert_eq!(not_after.as_deref(), Some("2125-12-31T00:00:00Z"));
 }

@@ -1,3 +1,4 @@
+mod certificate;
 mod cli;
 mod service;
 
@@ -5,7 +6,7 @@ use std::error::Error;
 use std::io::BufRead as _;
 use std::net::SocketAddr;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use minip2p::{Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, RelayServerEvent};
 use minip2p_example_common::load_keypair;
@@ -15,6 +16,7 @@ const DEFAULT_IPV4_QUIC: &str = "/ip4/0.0.0.0/udp/19876/quic-v1";
 const DEFAULT_IPV6_QUIC: &str = "/ip6/::/udp/19876/quic-v1";
 const DEFAULT_IPV4_TCP: &str = "/ip4/0.0.0.0/tcp/19876";
 const DEFAULT_IPV6_TCP: &str = "/ip6/::/tcp/19876";
+const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 #[derive(Clone, Copy, Debug)]
 enum AutomaticBind {
     Both,
@@ -48,8 +50,13 @@ fn main() {
 fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     let options = cli::parse(args)?;
     let identity = load_keypair(options.key_path.as_deref(), "relay")?;
+    let certificate = options
+        .webtransport_certificate
+        .as_ref()
+        .map(certificate::load)
+        .transpose()?;
 
-    let mut endpoint = bind_endpoint(&options, identity)?;
+    let mut endpoint = bind_endpoint(&options, identity, certificate.as_ref())?;
     endpoint.set_relay_server_accepting(options.accepting)?;
 
     println!(
@@ -59,15 +66,48 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     );
     for address in endpoint.listen_all()? {
         println!("[relay] listening={address}");
-        if address.transport().is_webtransport() {
+        if address.transport().is_webtransport() && certificate.is_none() {
             // What a browser dials: the certhash pins this node's certificate.
             println!("[relay] webtransport={address}");
+        }
+    }
+    // A CA-signed certificate names a domain, so browsers dial the announced
+    // `/dns` address, not a listener's IP.
+    let announced = options
+        .announce_addrs
+        .iter()
+        .filter(|a| a.is_webtransport());
+    for address in announced.clone() {
+        match address.peer_id() {
+            Some(_) => println!("[relay] webtransport={address}"),
+            None => println!("[relay] webtransport={address}/p2p/{}", endpoint.peer_id()),
+        }
+    }
+    if let Some(certificate) = &certificate {
+        println!(
+            "[relay] webtransport_certificate_not_after={}",
+            certificate.validity.not_after
+        );
+        if announced.count() == 0 {
+            eprintln!(
+                "[relay] browsers dial the certificate's domain; add --announce /dns/<domain>/udp/<port>/quic-v1/webtransport"
+            );
         }
     }
     println!("[relay] commands on stdin: pause | resume");
 
     let commands = stdin_commands();
+    let mut next_expiry_check = Instant::now();
     loop {
+        if let Some(certificate) = &certificate
+            && Instant::now() >= next_expiry_check
+        {
+            next_expiry_check += EXPIRY_CHECK_INTERVAL;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            if let Some(warning) = certificate::expiry_warning(&certificate.validity, now) {
+                eprintln!("{warning}");
+            }
+        }
         if let Ok(command) = commands.try_recv() {
             match command.trim() {
                 "pause" => {
@@ -93,6 +133,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
 fn bind_endpoint(
     options: &cli::Options,
     identity: Ed25519Keypair,
+    certificate: Option<&certificate::Certificate>,
 ) -> Result<Endpoint, Box<dyn Error>> {
     let automatic = [
         AutomaticBind::Both,
@@ -107,7 +148,7 @@ fn bind_endpoint(
     let mut last_error = None;
 
     for &mode in modes {
-        match try_bind(options, identity.clone(), mode) {
+        match try_bind(options, identity.clone(), certificate, mode) {
             Ok(endpoint) => {
                 if !matches!(mode, AutomaticBind::Both) {
                     eprintln!("[relay] dual-stack bind unavailable; using {mode:?}");
@@ -124,11 +165,23 @@ fn bind_endpoint(
 fn try_bind(
     options: &cli::Options,
     identity: Ed25519Keypair,
+    certificate: Option<&certificate::Certificate>,
     mode: AutomaticBind,
 ) -> Result<Endpoint, Box<dyn Error>> {
     let mut builder = Endpoint::builder()
         .identity(identity)
         .relay_server_config(options.config.clone())?;
+    if let (Some(certificate), Some(paths)) = (certificate, &options.webtransport_certificate) {
+        builder = builder
+            .webtransport_certificate_pem(&certificate.chain_pem, &certificate.key_pem)
+            .map_err(|error| {
+                format!(
+                    "--webtransport-cert {} with --webtransport-key {}: {error}",
+                    paths.chain.display(),
+                    paths.key.display()
+                )
+            })?;
+    }
 
     let quic: Vec<String> = if options.quic_binds.is_empty() {
         automatic_addrs(mode, DEFAULT_IPV4_QUIC, DEFAULT_IPV6_QUIC)
