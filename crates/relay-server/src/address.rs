@@ -29,8 +29,19 @@ pub enum RelayServerAddressErrorKind {
         found: PeerId,
     },
     /// The protocol sequence is not a supported direct TCP, QUIC-v1, or
-    /// WebTransport (with `/certhash`) address.
+    /// WebTransport address.
     UnsupportedShape,
+    /// A WebTransport address without a `/certhash`, for a listener whose
+    /// certificate is self-signed: browsers can only pin it by hash.
+    ///
+    /// The agent does not know the listener's certificate; a host that does
+    /// (the std `Endpoint`) reports this and [`Self::UnexpectedCerthash`].
+    MissingCerthash,
+    /// A WebTransport address with a `/certhash`, for a listener whose
+    /// certificate is CA-signed: the hash would make browsers pin the
+    /// certificate instead of checking its chain, and pinning refuses a
+    /// certificate valid for more than 14 days.
+    UnexpectedCerthash,
 }
 
 impl core::fmt::Display for RelayServerAddressErrorKind {
@@ -41,8 +52,16 @@ impl core::fmt::Display for RelayServerAddressErrorKind {
             Self::ConflictingPeerId { expected, found } => {
                 write!(f, "peer id {found} does not match local peer {expected}")
             }
-            Self::UnsupportedShape => f.write_str(
-                "expected a direct TCP, QUIC-v1, or WebTransport address with a /certhash",
+            Self::UnsupportedShape => {
+                f.write_str("expected a direct TCP, QUIC-v1, or WebTransport address")
+            }
+            Self::MissingCerthash => f.write_str(
+                "the WebTransport certificate is self-signed, so browsers need the /certhash \
+                 to pin it; add the listener's /certhash, or configure a CA-signed certificate",
+            ),
+            Self::UnexpectedCerthash => f.write_str(
+                "the WebTransport certificate is CA-signed, so browsers check its chain; remove \
+                 the /certhash, which would make them pin a certificate they cannot pin",
             ),
         }
     }
@@ -132,13 +151,12 @@ fn normalize_addr(
             protocols.as_slice(),
             [_, Protocol::Udp(port), Protocol::QuicV1] if *port != 0
         )
-        // A browser dials only what its certificate hash pins.
+        // Whether a certhash belongs depends on the listener's certificate,
+        // which only the host knows: see `MissingCerthash`.
         || matches!(
             protocols.as_slice(),
             [_, Protocol::Udp(port), Protocol::QuicV1, Protocol::WebTransport, hashes @ ..]
-                if *port != 0
-                    && !hashes.is_empty()
-                    && hashes.iter().all(|hash| matches!(hash, Protocol::Certhash(_)))
+                if *port != 0 && hashes.iter().all(|hash| matches!(hash, Protocol::Certhash(_)))
         );
     if !supported {
         return Err(RelayServerAddressErrorKind::UnsupportedShape);
@@ -170,6 +188,8 @@ mod tests {
         let webtransport = addr(
             "/ip4/192.0.2.1/udp/4002/quic-v1/webtransport/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g",
         );
+        // A CA-certified listener's address carries no certhash.
+        let ca_webtransport = addr("/dns/relay.example/udp/4002/quic-v1/webtransport");
         let mut tcp_with_peer = tcp.clone();
         tcp_with_peer.push(Protocol::P2p(local.clone()));
 
@@ -180,11 +200,12 @@ mod tests {
                     tcp_with_peer,
                     tcp.clone(),
                     quic.clone(),
-                    webtransport.clone()
+                    webtransport.clone(),
+                    ca_webtransport.clone(),
                 ]
             )
             .unwrap(),
-            vec![tcp, quic, webtransport]
+            vec![tcp, quic, webtransport, ca_webtransport]
         );
     }
 
@@ -227,9 +248,8 @@ mod tests {
                 addr("/ip4/192.0.2.1/udp/4001"),
                 RelayServerAddressErrorKind::UnsupportedShape,
             ),
-            // No browser can dial a WebTransport address without a certhash.
             (
-                addr("/ip4/192.0.2.1/udp/4001/quic-v1/webtransport"),
+                addr("/ip4/192.0.2.1/udp/0/quic-v1/webtransport"),
                 RelayServerAddressErrorKind::UnsupportedShape,
             ),
         ] {

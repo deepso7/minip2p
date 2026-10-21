@@ -82,7 +82,7 @@ pub use minip2p_identity::Ed25519Keypair;
 #[cfg(feature = "quic")]
 pub use minip2p_quic::{QuicBindError, QuicLimits};
 #[cfg(feature = "quic")]
-use minip2p_quic::{QuicNodeConfig, QuicTransport};
+use minip2p_quic::{QuicNodeConfig, QuicTransport, WebTransportCertificates};
 #[cfg(feature = "relay-server")]
 pub use minip2p_relay_server::{
     CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
@@ -337,6 +337,10 @@ pub struct Endpoint {
     /// NAT relay and AutoNAT dials waiting on Name resolution.
     #[cfg(feature = "nat")]
     nat_dials: Vec<(minip2p_nat::NatToken, PeerAddr)>,
+    /// Whether WebTransport presents a CA-signed certificate, which decides
+    /// whether a WebTransport announce address must carry a `/certhash`.
+    #[cfg(feature = "relay-server")]
+    ca_webtransport_certificate: bool,
     /// The one readiness poll the transport and mDNS sockets are registered
     /// with (ADR 0013). Its `Waker` carries caller interrupts and the
     /// endpoint's own wakeups (a finished name lookup) apart.
@@ -986,10 +990,13 @@ impl Endpoint {
 
     /// Atomically replaces the relay server's explicit announce-address override.
     ///
-    /// Each address must be a concrete direct TCP or QUIC address for this
-    /// endpoint's peer id. [`RelayServerControlError::InvalidAddress`] retains
-    /// the rejected input's index and reason; on error, the previous override
-    /// remains active. An empty replacement clears the override, restoring the
+    /// Each address must be a concrete direct TCP, QUIC or WebTransport
+    /// address for this endpoint's peer id. A WebTransport address carries a
+    /// `/certhash` with the derived self-signed certificates and none with a
+    /// CA-signed one ([`EndpointBuilder::webtransport_certificate_pem`]).
+    /// [`RelayServerControlError::InvalidAddress`] retains the rejected
+    /// input's index and reason; on error, the previous override remains
+    /// active. An empty replacement clears the override, restoring the
     /// confirmed-NAT-then-concrete-listener fallback order.
     #[cfg(feature = "relay-server")]
     #[expect(
@@ -1005,6 +1012,8 @@ impl Endpoint {
             .relay_server
             .as_mut()
             .ok_or(RelayServerControlError::NotConfigured)?;
+        check_webtransport_announce(&addrs, self.ca_webtransport_certificate)
+            .map_err(RelayServerControlError::InvalidAddress)?;
         relay_server
             .agent
             .replace_announce_addrs(addrs)
@@ -1284,6 +1293,9 @@ pub struct EndpointBuilder {
     agent_version: String,
     #[cfg(feature = "quic")]
     quic_limits: QuicLimits,
+    /// What WebTransport listeners present to browsers.
+    #[cfg(feature = "quic")]
+    webtransport_certificates: WebTransportCertificates,
     #[cfg(feature = "tcp")]
     tcp_config: TcpConfig,
     /// Ordered listen addresses; transport is inferred from address shape.
@@ -1327,6 +1339,8 @@ impl Default for EndpointBuilder {
             ),
             #[cfg(feature = "quic")]
             quic_limits: QuicLimits::default(),
+            #[cfg(feature = "quic")]
+            webtransport_certificates: WebTransportCertificates::Derived,
             #[cfg(feature = "tcp")]
             tcp_config: TcpConfig::default(),
             #[cfg(any(feature = "quic", feature = "tcp"))]
@@ -1395,6 +1409,66 @@ impl EndpointBuilder {
     pub fn quic_limits(mut self, limits: QuicLimits) -> Self {
         self.quic_limits = limits;
         self
+    }
+
+    /// Serves WebTransport with a CA-signed certificate instead of the
+    /// rotating self-signed ones derived from the identity key.
+    ///
+    /// `chain_pem` holds the leaf certificate first, then its intermediates
+    /// (certbot's `fullchain.pem`); `key_pem` holds the leaf's one private
+    /// key (`privkey.pem`, PKCS#8, SEC1 or PKCS#1). Both are parsed here, so a
+    /// missing certificate or key, or a second key, is an
+    /// [`EndpointOptionsError::WebTransportCertificatePem`].
+    /// [`bind`](Self::bind) then checks that the key matches the leaf and the
+    /// leaf has not expired ([`BindError::Quic`]), and that a
+    /// `/quic-v1/webtransport` listen address exists to serve it
+    /// ([`EndpointOptionsError::WebTransportCertificateWithoutListener`]).
+    ///
+    /// Browsers check the certificate the way they check any HTTPS page, so
+    /// they must dial the domain it names, with no `/certhash`:
+    /// `/dns/relay.example.com/udp/<port>/quic-v1/webtransport/p2p/…`. The
+    /// certificate never rotates, so the listen addresses carry no
+    /// `/certhash` and never change. Restart with the renewed files to
+    /// replace it.
+    #[cfg(feature = "quic")]
+    pub fn webtransport_certificate_pem(
+        mut self,
+        chain_pem: impl AsRef<[u8]>,
+        key_pem: impl AsRef<[u8]>,
+    ) -> Result<Self, EndpointOptionsError> {
+        use minip2p_quic::pki_types::pem::PemObject;
+        use minip2p_quic::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let invalid =
+            |problem: String| EndpointOptionsError::WebTransportCertificatePem { problem };
+        let chain = CertificateDer::pem_slice_iter(chain_pem.as_ref())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| invalid(format!("certificate chain: {error}")))?;
+        if chain.is_empty() {
+            return Err(invalid(
+                "the certificate chain has no `BEGIN CERTIFICATE` section".into(),
+            ));
+        }
+        let mut keys = PrivateKeyDer::pem_slice_iter(key_pem.as_ref())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| invalid(format!("private key: {error}")))?;
+        let key = match keys.len() {
+            1 => keys.remove(0),
+            0 => {
+                return Err(invalid(
+                    "the key PEM has no `BEGIN PRIVATE KEY`, `BEGIN EC PRIVATE KEY` or \
+                     `BEGIN RSA PRIVATE KEY` section"
+                        .into(),
+                ));
+            }
+            count => {
+                return Err(invalid(format!(
+                    "the key PEM has {count} private keys; pass only the leaf's"
+                )));
+            }
+        };
+        self.webtransport_certificates = WebTransportCertificates::Provided { chain, key };
+        Ok(self)
     }
 
     /// Overrides TCP connection, buffer, timeout and Yamux limits, and the
@@ -1529,9 +1603,13 @@ impl EndpointBuilder {
 
     /// Configures advertised direct addresses without enabling relay service.
     ///
-    /// This method validates direct TCP/QUIC shape, rejects wildcard and circuit
-    /// addresses, and checks a trailing peer id against an already-fixed builder
-    /// identity. [`RelayServerAnnounceError`] preserves either the rejected input
+    /// This method validates direct TCP/QUIC/WebTransport shape, rejects wildcard
+    /// and circuit addresses, and checks a trailing peer id against an
+    /// already-fixed builder identity. Whether a WebTransport address must carry
+    /// a `/certhash` depends on
+    /// [`EndpointBuilder::webtransport_certificate_pem`], so that is checked at
+    /// bind: with the derived self-signed certificates it must, with a CA-signed
+    /// one it must not. [`RelayServerAnnounceError`] preserves either the rejected input
     /// or a validator configuration failure. When identity is not fixed yet, the peer-id match is
     /// checked again at bind. Announce addresses alone do not enable the service;
     /// also call [`EndpointBuilder::relay_server`] or
@@ -1733,7 +1811,34 @@ impl EndpointBuilder {
         if self.relay_server_config.is_none() && !self.relay_server_announce_addrs.is_empty() {
             return Err(EndpointOptionsError::RelayAnnounceWithoutServer.into());
         }
+        #[cfg(feature = "quic")]
+        if self.ca_webtransport_certificate()
+            && !self.listen_addrs.iter().any(Multiaddr::is_webtransport)
+        {
+            return Err(EndpointOptionsError::WebTransportCertificateWithoutListener.into());
+        }
+        // Checked here rather than in `relay_server_announce_addrs`, which
+        // may run before the certificate option.
+        #[cfg(feature = "relay-server")]
+        check_webtransport_announce(
+            &self.relay_server_announce_addrs,
+            self.ca_webtransport_certificate(),
+        )
+        .map_err(|error| BindError::RelayServerAnnounce(Box::new(error)))?;
         Ok(())
+    }
+
+    /// Whether WebTransport presents a CA-signed certificate rather than the
+    /// derived self-signed ones.
+    #[cfg(any(feature = "quic", feature = "relay-server"))]
+    fn ca_webtransport_certificate(&self) -> bool {
+        #[cfg(feature = "quic")]
+        return matches!(
+            self.webtransport_certificates,
+            WebTransportCertificates::Provided { .. }
+        );
+        #[cfg(not(feature = "quic"))]
+        false
     }
 
     /// The NAT configuration to run, if any builder option enabled NAT:
@@ -1861,6 +1966,39 @@ fn reject_duplicate_quic_family(
     Ok(())
 }
 
+/// Browsers pin a self-signed WebTransport certificate by the address's
+/// `/certhash` and check a CA-signed one by its chain, so a WebTransport
+/// announce address carries a hash exactly when the certificate is derived.
+#[cfg(feature = "relay-server")]
+#[expect(
+    clippy::result_large_err,
+    reason = "The error owns the rejected announce address for actionable host diagnostics."
+)]
+fn check_webtransport_announce(
+    addrs: &[Multiaddr],
+    ca_certificate: bool,
+) -> Result<(), RelayServerAddressError> {
+    for (index, address) in addrs.iter().enumerate() {
+        if !address
+            .iter()
+            .any(|protocol| matches!(protocol, Protocol::WebTransport))
+        {
+            continue;
+        }
+        let reason = match (ca_certificate, address.certhashes().next().is_some()) {
+            (false, false) => RelayServerAddressErrorKind::MissingCerthash,
+            (true, true) => RelayServerAddressErrorKind::UnexpectedCerthash,
+            _ => continue,
+        };
+        return Err(RelayServerAddressError {
+            index,
+            address: address.clone(),
+            reason,
+        });
+    }
+    Ok(())
+}
+
 /// Brings up every requested transport behind one set.
 ///
 /// Listen multiaddresses are grouped by transport shape: compatible QUIC IPv4
@@ -1905,8 +2043,9 @@ fn bind_transports(
         for want_quic in order {
             #[cfg(feature = "quic")]
             if want_quic && !quic_addrs.is_empty() {
-                let config =
-                    QuicNodeConfig::new(keypair.clone()).with_limits(options.quic_limits.clone());
+                let config = QuicNodeConfig::new(keypair.clone())
+                    .with_limits(options.quic_limits.clone())
+                    .with_webtransport_certificates(options.webtransport_certificates.clone());
                 // `listen_on` allows one socket per family, which is what the
                 // transport binds; its `quic-v1` and WebTransport shapes are
                 // grouped onto that socket there.
@@ -1982,6 +2121,8 @@ pub(crate) fn build_endpoint(
     keypair: Ed25519Keypair,
     transport: TransportSet,
 ) -> Result<Endpoint, BindError> {
+    #[cfg(feature = "relay-server")]
+    let ca_webtransport_certificate = options.ca_webtransport_certificate();
     #[cfg(feature = "nat")]
     let mut options = options;
     #[cfg(feature = "nat")]
@@ -2206,6 +2347,8 @@ pub(crate) fn build_endpoint(
         resolver,
         #[cfg(feature = "nat")]
         nat_dials: Vec::new(),
+        #[cfg(feature = "relay-server")]
+        ca_webtransport_certificate,
         poll,
         #[cfg(all(test, feature = "quic"))]
         raw_events: std::collections::VecDeque::new(),
@@ -3035,6 +3178,75 @@ mod tests {
                     if expected.contains("without /certhash")
             ),
             "{certhash}"
+        );
+    }
+
+    /// The `localhost` leaf and key from the QUIC transport's CA fixtures.
+    #[cfg(feature = "quic")]
+    const CA_LEAF: &[u8] =
+        include_bytes!("../../../../transports/quic/tests/fixtures/ca/localhost.pem");
+    #[cfg(feature = "quic")]
+    const CA_KEY: &[u8] =
+        include_bytes!("../../../../transports/quic/tests/fixtures/ca/localhost.key");
+
+    #[cfg(feature = "quic")]
+    #[test]
+    fn webtransport_certificate_pem_names_what_is_missing() {
+        let two_keys = [CA_KEY, CA_KEY].concat();
+        for (chain, key, expected) in [
+            (CA_KEY, CA_KEY, "no `BEGIN CERTIFICATE`"),
+            (CA_LEAF, CA_LEAF, "no `BEGIN PRIVATE KEY`"),
+            (CA_LEAF, two_keys.as_slice(), "2 private keys"),
+        ] {
+            let Err(error) = Endpoint::builder().webtransport_certificate_pem(chain, key) else {
+                panic!("{expected}: the PEM must be refused");
+            };
+            assert!(
+                matches!(
+                    &error,
+                    EndpointOptionsError::WebTransportCertificatePem { problem }
+                        if problem.contains(expected)
+                ),
+                "{expected}: {error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "quic")]
+    #[test]
+    fn webtransport_certificate_without_a_webtransport_listener_fails_bind() {
+        let result = Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic-v1")
+            .webtransport_certificate_pem(CA_LEAF, CA_KEY)
+            .expect("fixture PEM")
+            .bind();
+        assert!(matches!(
+            result,
+            Err(BindError::Options(
+                EndpointOptionsError::WebTransportCertificateWithoutListener
+            ))
+        ));
+    }
+
+    #[cfg(feature = "quic")]
+    #[test]
+    fn ca_webtransport_listener_reports_a_hash_free_address() {
+        let mut endpoint = Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")
+            .expect("WebTransport")
+            .webtransport_certificate_pem(CA_LEAF, CA_KEY)
+            .expect("fixture PEM")
+            .bind()
+            .expect("bind with the fixture certificate");
+        let addrs = endpoint.listen_all().expect("listen_all");
+        assert!(
+            matches!(
+                addrs.as_slice(),
+                [addr] if addr.transport().is_webtransport()
+                    && addr.transport().certhashes().next().is_none()
+            ),
+            "{addrs:?}"
         );
     }
 
@@ -4591,6 +4803,83 @@ mod tests {
                 .selected_addrs()
                 .is_empty()
         );
+    }
+
+    #[cfg(all(feature = "relay-server", feature = "quic"))]
+    #[test]
+    fn relay_server_webtransport_announces_follow_the_certificate_mode() {
+        let hash_free: Multiaddr = "/dns/relay.example/udp/4001/quic-v1/webtransport"
+            .parse()
+            .unwrap();
+        let hashed: Multiaddr =
+            format!("{hash_free}/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g")
+                .parse()
+                .unwrap();
+        // Announce addresses are set before the certificate: the mode is
+        // checked at bind, once every option is in.
+        let relay = |announce: &Multiaddr, ca: bool| {
+            let builder = Endpoint::builder()
+                .relay_server()
+                .relay_server_announce_addrs(vec![announce.clone()])
+                .expect("well-shaped announce address")
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")
+                .expect("WebTransport");
+            if ca {
+                builder
+                    .webtransport_certificate_pem(CA_LEAF, CA_KEY)
+                    .expect("fixture PEM")
+            } else {
+                builder
+            }
+            .bind()
+        };
+        let reason = |result: Result<Endpoint, BindError>| match result {
+            Err(BindError::RelayServerAnnounce(error)) => error.reason,
+            Err(error) => panic!("unexpected bind error: {error}"),
+            Ok(_) => panic!("the announce address must be refused"),
+        };
+        assert_eq!(
+            reason(relay(&hash_free, false)),
+            RelayServerAddressErrorKind::MissingCerthash
+        );
+        assert_eq!(
+            reason(relay(&hashed, true)),
+            RelayServerAddressErrorKind::UnexpectedCerthash
+        );
+
+        // At runtime too, and a refused replacement keeps the override.
+        let mut ca = relay(&hash_free, true).expect("CA mode announces hash-free");
+        let error = ca
+            .set_relay_server_announce_addrs(vec![hashed.clone()])
+            .expect_err("CA mode refuses a certhash");
+        assert!(matches!(
+            error,
+            RelayServerControlError::InvalidAddress(RelayServerAddressError {
+                index: 0,
+                reason: RelayServerAddressErrorKind::UnexpectedCerthash,
+                ..
+            })
+        ));
+        let selected = ca
+            .engine
+            .relay_server
+            .as_ref()
+            .unwrap()
+            .agent
+            .selected_addrs();
+        assert_eq!(selected, core::slice::from_ref(&hash_free));
+
+        let mut derived = relay(&hashed, false).expect("derived mode announces a certhash");
+        let error = derived
+            .set_relay_server_announce_addrs(vec![hash_free])
+            .expect_err("derived mode needs a certhash");
+        assert!(matches!(
+            error,
+            RelayServerControlError::InvalidAddress(RelayServerAddressError {
+                reason: RelayServerAddressErrorKind::MissingCerthash,
+                ..
+            })
+        ));
     }
 
     #[cfg(feature = "relay-server")]
