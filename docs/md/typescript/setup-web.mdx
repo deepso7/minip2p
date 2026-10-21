@@ -45,7 +45,7 @@ It prints an address carrying the hashes of the node's self-signed certificates,
 /ip4/127.0.0.1/udp/4001/quic-v1/webtransport/certhash/uEi…/certhash/uEi…/p2p/12D3KooW…
 ```
 
-The hashes derive from the node's key and a 13-day certificate period, so keep the key to keep the address across restarts. An address stays dialable for at least 13 days; `listenAddressesChanged` fires when the node rotates to the next period. A Rust node does the same with `listen_on("/ip4/0.0.0.0/udp/4001/quic-v1/webtransport")`, and the [relay server](/rust/host-a-relay) with `--webtransport`.
+The hashes derive from the node's key and a 13-day certificate period, so keep the key to keep the address across restarts. An address stays dialable for at least 13 days; `listenAddressesChanged` fires when the node rotates to the next period. A Rust node does the same with `listen_on("/ip4/0.0.0.0/udp/4001/quic-v1/webtransport")`, and the [relay server](/rust/host-a-relay) with `--webtransport`. For an address that never changes, serve a CA-signed certificate for a domain instead (CA certificate mode): browsers then dial a hash-free `/dns/…/webtransport/p2p/…` address, as in [Stable browser addresses](/rust/webtransport-certificates).
 
 ## Connect from the page
 
@@ -65,7 +65,7 @@ Serve the page from a secure context, HTTPS or `localhost`: WebTransport is unav
 
 ## Relays
 
-With `relays` (WebTransport addresses with certhashes) the browser holds a reservation on the relay and is reachable at its `/p2p-circuit` address (`node.circuitAddress`), from other browsers and from native nodes. Connecting by peer ID goes through the relay; connecting to a native peer's WebTransport address races the direct dial against the relay leg, so the path is `direct` or `relayed`, never `punched`: browsers never hole punch. `forceRelay: true` skips the direct dial. `activeReservation()` reports the reservation.
+With `relays` (WebTransport addresses, with certhashes or hash-free on a [CA-certificate relay](/rust/webtransport-certificates)) the browser holds a reservation on the relay and is reachable at its `/p2p-circuit` address (`node.circuitAddress`), from other browsers and from native nodes. Connecting by peer ID goes through the relay; connecting to a native peer's WebTransport address races the direct dial against the relay leg, so the path is `direct` or `relayed`, never `punched`: browsers never hole punch. `forceRelay: true` skips the direct dial. `activeReservation()` reports the reservation.
 
 ## Browser limits
 
@@ -78,7 +78,7 @@ With `relays` (WebTransport addresses with certhashes) the browser holds a reser
 | `discovery`      | Signed discovery is not in the browser build. |
 | `autonatServers` | Browsers cannot be dialed back.               |
 
-- Only `/webtransport/certhash` addresses dial. A `/quic-v1` or `/tcp` candidate fails as a candidate, and there is no CA-certificate mode yet.
+- Only WebTransport addresses dial; a `/quic-v1` or `/tcp` candidate fails as a candidate. An address with certhashes pins the node's self-signed certificates. A hash-free one, such as `/dns/relay.example.com/udp/19876/quic-v1/webtransport/p2p/12D3KooW…`, expects a CA-signed certificate for that domain, which the browser checks as it would for any HTTPS page.
 - `listenAddrs()` is empty (a reservation is `circuitAddress`); `knownPeers()` is empty and `reachability()` stays `unknown`.
 - `close()` closes every session at once with WebTransport's close capsule, so its timeout bounds nothing.
 - If the wasm module traps (a Rust panic), the endpoint reports `driverFailed` and later calls throw `ClosedError`. Create a new endpoint to carry on.
