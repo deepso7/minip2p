@@ -234,6 +234,17 @@ describe("JsIo", () => {
     expect(wakes()).toBe(1);
   });
 
+  test("a session without certhashes leaves verification to the browser", () => {
+    const { io, sessions } = harness();
+    const url =
+      "https://relay.example:443/.well-known/libp2p-webtransport?type=noise";
+
+    io.connect(url, []);
+
+    expect(sessions[0]?.url).toBe(url);
+    expect(sessions[0]?.options).toEqual({});
+  });
+
   test("writes copy what they accept, cap in-flight bytes and complete with their own lengths", async () => {
     const { events, fake, io, stream } = await openedStream();
     const source = new Uint8Array(MAX_IN_FLIGHT_BYTES).fill(1);

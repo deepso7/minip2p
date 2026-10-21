@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use minip2p_core::platform::{Deadline, EntropyError, EntropySource, Now};
-use minip2p_core::{Bytes, Multihash, PeerAddr};
+use minip2p_core::{Bytes, Multiaddr, Multihash, PeerAddr};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_secure_mux::noise::{
     NoiseConfig, NoiseExtensions, NoiseOutput, NoiseRole, NoiseSession,
@@ -52,6 +52,8 @@ struct FakeIo {
     next: u64,
     /// Most in-flight bytes per stream, as the browser's 64 KiB cap.
     in_flight_cap: usize,
+    /// Every `connect`'s URL and trusted certhashes, in order.
+    connects: Vec<(String, Vec<Multihash>)>,
     streams: BTreeMap<u64, FakeStream>,
     closed_sessions: Vec<u64>,
     events: VecDeque<IoEvent>,
@@ -62,6 +64,7 @@ impl FakeIo {
         Self {
             next: 0,
             in_flight_cap: 64 * 1024,
+            connects: Vec::new(),
             streams: BTreeMap::new(),
             closed_sessions: Vec::new(),
             events: VecDeque::new(),
@@ -116,7 +119,8 @@ impl FakeIo {
 }
 
 impl WebTransportIo for FakeIo {
-    fn connect(&mut self, _url: &str, _certhashes: &[Multihash]) -> Result<SessionHandle, IoError> {
+    fn connect(&mut self, url: &str, certhashes: &[Multihash]) -> Result<SessionHandle, IoError> {
+        self.connects.push((url.into(), certhashes.to_vec()));
         Ok(SessionHandle(self.handle()))
     }
 
@@ -195,14 +199,26 @@ struct Conn {
 
 /// Dials a fake server and answers the Noise handshake as it would.
 fn connect(client: &mut Client) -> Conn {
-    let server = Ed25519Keypair::generate();
-    let addr: PeerAddr = format!(
-        "/ip4/192.0.2.1/udp/4001/quic-v1/webtransport/certhash/{HASH}/p2p/{}",
-        server.peer_id()
+    connect_to(
+        client,
+        &format!("/ip4/192.0.2.1/udp/4001/quic-v1/webtransport/certhash/{HASH}"),
+        Some(certhashes()),
     )
-    .parse()
-    .expect("peer addr");
-    let certhashes = addr.transport().certhashes().copied().collect();
+}
+
+/// `HASH` as a certhash list.
+fn certhashes() -> Vec<Multihash> {
+    let addr: Multiaddr = format!("/certhash/{HASH}").parse().expect("multiaddr");
+    addr.certhashes().copied().collect()
+}
+
+/// Dials `transport` and answers the Noise handshake as a server whose
+/// extensions list `offered` (`None`: no extensions at all).
+fn connect_to(client: &mut Client, transport: &str, offered: Option<Vec<Multihash>>) -> Conn {
+    let server = Ed25519Keypair::generate();
+    let addr: PeerAddr = format!("{transport}/p2p/{}", server.peer_id())
+        .parse()
+        .expect("peer addr");
     let id = client.dial(&addr).expect("dial");
     let session = SessionHandle(client.io_mut().next);
     client
@@ -218,8 +234,8 @@ fn connect(client: &mut Client) -> Conn {
         static_secret: [200; 32],
         ephemeral_secret: [201; 32],
         expected_peer: None,
-        local_extensions: Some(NoiseExtensions {
-            webtransport_certhashes: certhashes,
+        local_extensions: offered.map(|webtransport_certhashes| NoiseExtensions {
+            webtransport_certhashes,
             stream_muxers: Vec::new(),
         }),
     });
@@ -265,6 +281,37 @@ fn small_limits() -> WebTransportLimits {
         stream_receive_window: 1_000,
         handshake_timeout_ms: 10_000,
     }
+}
+
+#[test]
+fn hash_free_dials_trust_the_platform_and_accept_any_server_certhashes() {
+    let mut client = client(WebTransportLimits::default());
+    // A /dns name passes through untouched; the server lists a hash the
+    // dial never named.
+    connect_to(
+        &mut client,
+        "/dns/relay.example/udp/443/quic-v1/webtransport",
+        Some(certhashes()),
+    );
+    // The server sends no Noise extensions at all.
+    connect_to(
+        &mut client,
+        "/ip4/192.0.2.1/udp/4001/quic-v1/webtransport",
+        None,
+    );
+    assert_eq!(
+        client.io_mut().connects,
+        [
+            (
+                "https://relay.example:443/.well-known/libp2p-webtransport?type=noise".into(),
+                Vec::new()
+            ),
+            (
+                "https://192.0.2.1:4001/.well-known/libp2p-webtransport?type=noise".into(),
+                Vec::new()
+            ),
+        ]
+    );
 }
 
 #[test]

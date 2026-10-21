@@ -88,7 +88,9 @@ pub enum IoEvent {
 /// the client.
 pub trait WebTransportIo {
     /// Starts a session to `url`, trusting exactly the server certificates
-    /// whose SHA-256 hashes are `certhashes` (`serverCertificateHashes`).
+    /// whose SHA-256 hashes are `certhashes` (`serverCertificateHashes`) or,
+    /// when `certhashes` is empty, a CA-signed certificate the platform
+    /// verifies for the URL's host (WebPKI).
     /// [`IoEvent::SessionReady`], [`IoEvent::SessionClosed`] or
     /// [`IoEvent::SessionFailed`] follows.
     fn connect(&mut self, url: &str, certhashes: &[Multihash]) -> Result<SessionHandle, IoError>;

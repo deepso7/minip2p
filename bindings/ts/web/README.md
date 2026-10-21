@@ -26,7 +26,7 @@ A native node serves browsers by listening on a `/…/quic-v1/webtransport` addr
 
 ## What works in a browser
 
-Dialing native nodes at `/webtransport/certhash` addresses, Identify, ping, custom protocol streams with backpressure, gossipsub, and relay reservations with circuits to and from other browsers and native nodes. The page must be a secure context (HTTPS or `localhost`). Chrome and Firefox are supported; Safari 26.4+ is best-effort.
+Dialing native nodes at `/webtransport` addresses, Identify, ping, custom protocol streams with backpressure, gossipsub, and relay reservations with circuits to and from other browsers and native nodes. The page must be a secure context (HTTPS or `localhost`). Chrome and Firefox are supported; Safari 26.4+ is best-effort.
 
 `Minip2p.create` throws `InvalidConfigError`, with the reason, for what a browser cannot do:
 
@@ -39,7 +39,7 @@ Dialing native nodes at `/webtransport/certhash` addresses, Identify, ping, cust
 
 Other limits:
 
-- Only WebTransport addresses with certhashes dial; a `/quic-v1` or `/tcp` candidate fails as a candidate. There is no CA-certificate mode.
+- Only WebTransport addresses dial; a `/quic-v1` or `/tcp` candidate fails as a candidate. An address with certhashes pins the node's self-signed certificates. One without, such as `/dns/relay.example.com/udp/443/quic-v1/webtransport/p2p/12D3KooW…`, expects a CA-signed certificate for that domain, which the browser verifies as it would for any HTTPS page.
 - `listenAddrs()` is always empty (a reservation is `circuitAddress`), `knownPeers()` is empty and `reachability()` stays `unknown`.
 - `close()` closes every session at once with WebTransport's close capsule; its timeout is ignored. `setActive()` is ignored as well: the page's own timers drive the endpoint.
 - A page on a public origin that dials a private address may trigger Chrome's Local Network Access prompt.
@@ -47,7 +47,7 @@ Other limits:
 
 ## Relays
 
-With `relays` (WebTransport addresses with certhashes) the browser holds a reservation on the relay and is reachable at its `/p2p-circuit` address (`node.circuitAddress`), from other browsers and from native nodes. Connecting by peer ID goes through the relay; connecting to a native peer's WebTransport address races the direct dial against the relay leg, so the path is `direct` or `relayed`, never `punched`: browsers never hole punch. `forceRelay: true` skips the direct dial. `activeReservation()` reports the reservation.
+With `relays` (WebTransport addresses) the browser holds a reservation on the relay and is reachable at its `/p2p-circuit` address (`node.circuitAddress`), from other browsers and from native nodes. Connecting by peer ID goes through the relay; connecting to a native peer's WebTransport address races the direct dial against the relay leg, so the path is `direct` or `relayed`, never `punched`: browsers never hole punch. `forceRelay: true` skips the direct dial. `activeReservation()` reports the reservation.
 
 ## Development
 
