@@ -325,6 +325,25 @@ impl TlsIdentity {
         Ok(Arc::new(key))
     }
 
+    /// An operator's CA-signed chain and key, loaded for serving; refused if
+    /// the key does not match the leaf.
+    pub(crate) fn provided_key(
+        &self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<Arc<CertifiedKey>, QuicBindError> {
+        CertifiedKey::from_der(chain, key, &self.provider)
+            .map(Arc::new)
+            .map_err(|error| {
+                QuicBindError::WebTransportCertificate(match error {
+                    rustls::Error::InconsistentKeys(_) => {
+                        "the private key does not match the leaf certificate".into()
+                    }
+                    other => format!("loading the chain and key: {other}"),
+                })
+            })
+    }
+
     /// The config of a libp2p-only listening socket: TLS 1.3, ALPN
     /// `libp2p`, a mandatory client certificate, and no session resumption
     /// (a resumed session would skip the peer's certificate).

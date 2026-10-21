@@ -1,6 +1,7 @@
 //! A test-only native [`WebTransportIo`]: raw quinn-proto with ALPN `h3`, a
-//! verifier that pins the server certificate by certhash, and an HTTP/3
-//! client written with `minip2p-webtransport`'s codec.
+//! verifier that pins the server certificate by certhash (or WebPKI against
+//! given roots), and an HTTP/3 client written with `minip2p-webtransport`'s
+//! codec.
 //!
 //! It stands in for a browser, so `WebTransportClient` can be driven against
 //! the real `QuicTransport` without one. Not exported anywhere; a real
@@ -56,6 +57,11 @@ pub struct Options {
     pub path: Option<String>,
     /// Records what the server put on the wire, for tests to inspect.
     pub wire: Wire,
+    /// Verifies the server with WebPKI against these roots instead of
+    /// pinning certhashes, as a browser does for a hash-free address.
+    pub roots: Option<Arc<rustls::RootCertStore>>,
+    /// The TLS server name, in place of the dialed IP.
+    pub server_name: Option<String>,
 }
 
 /// What the client saw the server do on the wire, in order. Shared, so a
@@ -709,14 +715,18 @@ impl WebTransportIo for QuinnIo {
         let server: SocketAddr = authority
             .parse()
             .map_err(|error| IoError(format!("{authority}: {error}")))?;
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|error| IoError(error.to_string()))?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(CerthashVerifier {
-                certhashes: certhashes.to_vec(),
-            }))
-            .with_no_client_auth();
+            .map_err(|error| IoError(error.to_string()))?;
+        let builder = match &self.options.roots {
+            Some(roots) => builder.with_root_certificates(Arc::clone(roots)),
+            None => builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(CerthashVerifier {
+                    certhashes: certhashes.to_vec(),
+                })),
+        };
+        let mut tls = builder.with_no_client_auth();
         tls.alpn_protocols = vec![b"h3".to_vec()];
         let crypto = QuicClientConfig::try_from(tls).map_err(|error| IoError(error.to_string()))?;
         let (handle, conn) = self
@@ -725,7 +735,11 @@ impl WebTransportIo for QuinnIo {
                 Instant::now(),
                 ClientConfig::new(Arc::new(crypto)),
                 server,
-                &server.ip().to_string(),
+                &self
+                    .options
+                    .server_name
+                    .clone()
+                    .unwrap_or_else(|| server.ip().to_string()),
             )
             .map_err(|error| IoError(error.to_string()))?;
         let session = self.handle();

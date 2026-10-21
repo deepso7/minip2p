@@ -1,5 +1,6 @@
 use minip2p_core::PeerId;
 use minip2p_identity::Ed25519Keypair;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Resource and flow-control limits for the synchronous QUIC adapter.
 ///
@@ -110,6 +111,42 @@ impl Default for QuicLimits {
     }
 }
 
+/// The certificate a WebTransport-serving socket presents to `h3` clients.
+/// Clients negotiating `libp2p` always get the libp2p certificate.
+#[derive(Debug, Default)]
+pub enum WebTransportCertificates {
+    /// Self-signed certificates derived from the host key, one per 13-day
+    /// period, rotated by the host's wall clock. Addresses carry their
+    /// `/certhash`es, which browsers pin.
+    #[default]
+    Derived,
+    /// An operator's CA-signed certificate, presented until the transport is
+    /// dropped. Browsers check it with WebPKI, so addresses carry no
+    /// `/certhash` and should name the certificate's domain (`/dns/…`).
+    ///
+    /// Checked at bind: the key must match the leaf, and the leaf must not
+    /// have expired. Any key type the ring provider signs with (ECDSA,
+    /// Ed25519, RSA) is accepted.
+    Provided {
+        /// The leaf certificate first, then its intermediates.
+        chain: Vec<CertificateDer<'static>>,
+        /// The leaf's private key.
+        key: PrivateKeyDer<'static>,
+    },
+}
+
+impl Clone for WebTransportCertificates {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Derived => Self::Derived,
+            Self::Provided { chain, key } => Self::Provided {
+                chain: chain.clone(),
+                key: key.clone_key(),
+            },
+        }
+    }
+}
+
 /// Configuration for a QUIC transport node.
 ///
 /// QUIC always uses mutual libp2p TLS in minip2p, so a node identity is
@@ -121,6 +158,8 @@ pub struct QuicNodeConfig {
     pub(crate) keypair: Ed25519Keypair,
     /// Runtime resource and flow-control limits.
     pub(crate) limits: QuicLimits,
+    /// What WebTransport-serving sockets present to `h3` clients.
+    pub(crate) webtransport_certificates: WebTransportCertificates,
 }
 
 impl QuicNodeConfig {
@@ -133,6 +172,7 @@ impl QuicNodeConfig {
         Self {
             keypair,
             limits: QuicLimits::default(),
+            webtransport_certificates: WebTransportCertificates::default(),
         }
     }
 
@@ -155,6 +195,21 @@ impl QuicNodeConfig {
     /// Returns the configured runtime limits.
     pub fn limits(&self) -> &QuicLimits {
         &self.limits
+    }
+
+    /// Replaces the default [`WebTransportCertificates::Derived`]. Only
+    /// sockets bound with a `/quic-v1/webtransport` address use it.
+    pub fn with_webtransport_certificates(
+        mut self,
+        certificates: WebTransportCertificates,
+    ) -> Self {
+        self.webtransport_certificates = certificates;
+        self
+    }
+
+    /// Returns what WebTransport-serving sockets present to `h3` clients.
+    pub fn webtransport_certificates(&self) -> &WebTransportCertificates {
+        &self.webtransport_certificates
     }
 
     /// Returns the Ed25519 host keypair.

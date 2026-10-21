@@ -42,6 +42,11 @@ pub enum QuicBindError {
     /// The libp2p TLS certificate for this identity could not be generated.
     #[error("QUIC TLS certificate: {0}")]
     Certificate(minip2p_tls::TlsError),
+    /// A [`WebTransportCertificates::Provided`](crate::WebTransportCertificates::Provided)
+    /// certificate can't be served: the chain is empty or unparseable, the
+    /// key doesn't match the leaf, or the leaf has expired.
+    #[error("WebTransport certificate: {0}")]
+    WebTransportCertificate(String),
     /// A TLS setup step failed in the crypto provider.
     #[error("QUIC TLS setup failed while {stage}: {detail}")]
     Tls {

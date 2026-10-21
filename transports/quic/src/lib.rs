@@ -54,16 +54,19 @@ mod webtransport_tests;
 #[cfg(test)]
 mod write_fairness_tests;
 
-pub use config::{QuicLimits, QuicNodeConfig};
+pub use config::{QuicLimits, QuicNodeConfig, WebTransportCertificates};
 #[cfg(feature = "diagnostics")]
 pub use diagnostics::{
     ConnectionDiagnostics, DatagramCounters, SocketBuffers, datagram_counters, socket_buffers,
 };
 pub use error::{QuicBindError, QuicTlsStage};
+/// The DER types [`WebTransportCertificates::Provided`] takes, including PEM
+/// parsing (`pem::PemObject`).
+pub use rustls::pki_types;
 
 use connection::{Cx, QuicConnection};
 use diagnostics::{ConnectionCounters, DatagramTally};
-use rotation::Rotation;
+use rotation::Certificates;
 use socket::{Received, Socket, Sockets};
 use tls::{HostTime, TlsIdentity};
 
@@ -367,9 +370,10 @@ pub struct QuicTransport {
     /// optional client certificates and [`webtransport_transport_config`].
     /// `None` when no socket does.
     webtransport_config: Option<WebTransportConfigs>,
-    /// The rotating certificate and what WebTransport connections
-    /// authenticate with, when a socket serves WebTransport.
-    webtransport: Option<Rotation>,
+    /// The served certificate (derived and rotating, or provided) and what
+    /// WebTransport connections authenticate with, when a socket serves
+    /// WebTransport.
+    webtransport: Option<Certificates>,
     transport_config: Arc<TransportConfig>,
     tls: TlsIdentity,
     /// The host's wall-clock time, shared with the TLS verifiers.
@@ -486,6 +490,10 @@ impl QuicTransport {
     /// WebTransport's Noise handshake. WebTransport-serving sockets carry two
     /// extra transport parameters: a limit of three peer unidirectional
     /// streams and the QUIC DATAGRAM parameter.
+    ///
+    /// `h3` clients get the certificate
+    /// [`QuicNodeConfig::with_webtransport_certificates`] chose; a provided
+    /// one is checked here (see [`QuicBindError::WebTransportCertificate`]).
     pub fn bind(node_config: QuicNodeConfig, addrs: &[Multiaddr]) -> Result<Self, QuicBindError> {
         // (socket address, serves quic-v1, serves WebTransport)
         let mut binds: Vec<(SocketAddr, bool, bool)> = Vec::new();
@@ -590,9 +598,16 @@ impl QuicTransport {
             .any(|socket| socket.webtransport)
         {
             // Until the first poll's sample, the system clock picks the
-            // period.
-            let rotation = Rotation::new(&tls, node_config.keypair(), host_time.now().as_secs())?;
-            let certificate = rotation.certificate();
+            // period, or judges a provided certificate's expiry.
+            let unix = host_time.now().as_secs();
+            let keypair = node_config.keypair();
+            let certificates = match &node_config.webtransport_certificates {
+                WebTransportCertificates::Derived => Certificates::derived(&tls, keypair, unix)?,
+                WebTransportCertificates::Provided { chain, key } => {
+                    Certificates::provided(&tls, keypair, chain.clone(), key.clone_key(), unix)?
+                }
+            };
+            let certificate = certificates.certificate();
             let transport = Arc::new(webtransport_transport_config(node_config.limits())?);
             // Clones of the endpoint's config, so the Retry tokens it issues
             // stay valid.
@@ -611,7 +626,7 @@ impl QuicTransport {
                 dual: config(true)?,
                 h3: config(false)?,
             };
-            (Some(configs), Some(rotation))
+            (Some(configs), Some(certificates))
         } else {
             (None, None)
         };
@@ -705,14 +720,14 @@ impl QuicTransport {
     }
 
     /// The addresses one socket serves: `quic-v1`, then WebTransport with
-    /// the current certhashes.
+    /// the current certhashes (none for a provided certificate).
     fn socket_addresses(&self, socket: &Socket) -> impl Iterator<Item = Multiaddr> + use<> {
         let quic = socket_addr_to_multiaddr(socket.local_addr);
         let webtransport = self
             .webtransport
             .as_ref()
             .filter(|_| socket.webtransport)
-            .map(|rotation| webtransport_multiaddr(quic.clone(), rotation.advertised()));
+            .map(|certificates| webtransport_multiaddr(quic.clone(), certificates.advertised()));
         socket
             .quic_v1
             .then_some(quic)
@@ -949,7 +964,7 @@ impl QuicTransport {
             .webtransport
             .as_ref()
             .filter(|_| socket.webtransport)
-            .map(|rotation| Arc::clone(rotation.context()));
+            .map(|certificates| Arc::clone(certificates.context()));
         match self.endpoint.accept(incoming, now, buf, config) {
             Ok((handle, conn)) => {
                 // The accepted Initial never passes through `handle_event`.
@@ -980,18 +995,15 @@ impl QuicTransport {
         }
     }
 
-    /// Services the connections with work: those this poll routed datagrams
-    /// to, those whose timer is due, and those a previous service left
-    /// unfinished. Idle connections are not visited.
-    /// Rotates the WebTransport certificate when the host's wall clock has
-    /// left its period, announcing each listening WebTransport address
-    /// with the new certhashes.
+    /// Rotates a derived WebTransport certificate when the host's wall clock
+    /// has left its period, announcing each listening WebTransport address
+    /// with the new certhashes. A provided certificate never rotates.
     fn rotate(&mut self) {
-        let Some(rotation) = &mut self.webtransport else {
+        let Some(certificates) = &mut self.webtransport else {
             return;
         };
         let unix = self.host_time.now().as_secs();
-        if !rotation.advance(&self.tls, self.node_config.keypair(), unix) {
+        if !certificates.advance(&self.tls, self.node_config.keypair(), unix) {
             return;
         }
         let announced: Vec<Multiaddr> = self
@@ -1008,6 +1020,9 @@ impl QuicTransport {
         );
     }
 
+    /// Services the connections with work: those this poll routed datagrams
+    /// to, those whose timer is due, and those a previous service left
+    /// unfinished. Idle connections are not visited.
     fn service_due(&mut self, now: Instant) {
         let mut due = std::mem::take(&mut self.due);
         due.clear();
@@ -1175,7 +1190,8 @@ impl Transport for QuicTransport {
 
     /// Listens on a bound socket, as `/…/quic-v1` or `/…/quic-v1/webtransport`
     /// (certhashes, if given, are ignored), and returns the address: a
-    /// WebTransport one with the current certhashes. The shape must be one
+    /// WebTransport one with the current certhashes, or none when the
+    /// certificate is provided. The shape must be one
     /// the socket was bound with.
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
         let (base, webtransport) =
@@ -1351,7 +1367,8 @@ impl Transport for QuicTransport {
     }
 
     /// Every bound socket's addresses, in the shapes it was bound with:
-    /// `quic-v1`, and WebTransport with the current certhashes.
+    /// `quic-v1`, and WebTransport with the current certhashes (none for a
+    /// provided certificate).
     fn local_addresses(&self) -> Vec<Multiaddr> {
         self.sockets
             .iter()
@@ -1359,10 +1376,10 @@ impl Transport for QuicTransport {
             .collect()
     }
 
-    /// Sockets are bound once, at construction; only a WebTransport
-    /// certificate rotation moves the set.
+    /// Sockets are bound once, at construction; only a derived WebTransport
+    /// certificate's rotation moves the set.
     fn local_addresses_revision(&self) -> Option<u64> {
-        Some(self.webtransport.as_ref().map_or(0, Rotation::revision))
+        Some(self.webtransport.as_ref().map_or(0, Certificates::revision))
     }
 
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
@@ -1457,7 +1474,7 @@ impl Transport for QuicTransport {
         let rotation = self
             .webtransport
             .as_ref()
-            .map(|rotation| rotation.deadline(now));
+            .and_then(|certificates| certificates.deadline(now));
         Deadline::earliest_opt(timer, rotation)
     }
 }
