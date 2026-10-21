@@ -13,6 +13,7 @@ use minip2p::{
     RelayServerEvent,
 };
 use minip2p_example_common::load_keypair;
+use minip2p_tls::Validity;
 
 const STDIN_COMMAND_CAPACITY: usize = 16;
 const DEFAULT_IPV4_QUIC: &str = "/ip4/0.0.0.0/udp/19876/quic-v1";
@@ -53,10 +54,14 @@ fn main() {
 fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     let options = cli::parse(args)?;
     let identity = load_keypair(options.key_path.as_deref(), "relay")?;
-    let certificate = options
+    // Watch before the first load, so a renewal in between is noticed.
+    let mut watched = options
         .webtransport_certificate
+        .clone()
+        .map(certificate::Watched::new);
+    let certificate = watched
         .as_ref()
-        .map(certificate::load)
+        .map(|watched| certificate::load(&watched.paths))
         .transpose()?;
 
     let mut endpoint = bind_endpoint(&options, identity, certificate.as_ref())?;
@@ -100,14 +105,36 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     println!("[relay] commands on stdin: pause | resume");
 
     let commands = stdin_commands();
+    let mut validity = certificate.map(|certificate| certificate.validity);
     let mut next_expiry_check = Instant::now();
+    let mut next_reload_check = Instant::now() + options.webtransport_reload_interval;
     loop {
-        if let Some(certificate) = &certificate
+        if let Some(watched) = &mut watched
+            && Instant::now() >= next_reload_check
+        {
+            next_reload_check = Instant::now() + options.webtransport_reload_interval;
+            if let Some(result) = watched.poll() {
+                match reload_certificate(&mut endpoint, &watched.paths, result) {
+                    Ok(reloaded) => {
+                        println!(
+                            "[relay] webtransport certificate reloaded not_after={}",
+                            reloaded.not_after
+                        );
+                        validity = Some(reloaded);
+                        next_expiry_check = Instant::now();
+                    }
+                    Err(error) => eprintln!(
+                        "[relay] webtransport certificate reload failed, still serving the previous one: {error}"
+                    ),
+                }
+            }
+        }
+        if let Some(validity) = &validity
             && Instant::now() >= next_expiry_check
         {
-            next_expiry_check += EXPIRY_CHECK_INTERVAL;
+            next_expiry_check = Instant::now() + EXPIRY_CHECK_INTERVAL;
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            if let Some(warning) = certificate::expiry_warning(&certificate.validity, now) {
+            if let Some(warning) = certificate::expiry_warning(validity, now) {
                 eprintln!("{warning}");
             }
         }
@@ -131,6 +158,26 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             _ => {}
         }
     }
+}
+
+/// Serves a certificate the watcher reloaded, returning its validity; on
+/// error the endpoint keeps serving the previous one.
+fn reload_certificate(
+    endpoint: &mut Endpoint,
+    paths: &cli::CertificatePaths,
+    loaded: Result<certificate::Certificate, String>,
+) -> Result<Validity, String> {
+    let certificate = loaded?;
+    endpoint
+        .set_webtransport_certificate_pem(&certificate.chain_pem, &certificate.key_pem)
+        .map_err(|error| {
+            format!(
+                "--webtransport-cert {} with --webtransport-key {}: {error}",
+                paths.chain.display(),
+                paths.key.display()
+            )
+        })?;
+    Ok(certificate.validity)
 }
 
 fn bind_endpoint(

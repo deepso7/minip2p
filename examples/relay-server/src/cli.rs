@@ -1,5 +1,6 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use minip2p::{Multiaddr, RateLimit, RelayServerConfig};
 
@@ -16,11 +17,13 @@ pub struct Options {
     pub webtransport: bool,
     /// A CA-signed WebTransport certificate's chain and key PEM files.
     pub webtransport_certificate: Option<CertificatePaths>,
+    /// How often to check the certificate files for a renewal.
+    pub webtransport_reload_interval: Duration,
     pub config: RelayServerConfig,
 }
 
 /// `--webtransport-cert` and `--webtransport-key`, which come as a pair.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertificatePaths {
     pub chain: PathBuf,
     pub key: PathBuf,
@@ -35,6 +38,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         accepting: true,
         webtransport: false,
         webtransport_certificate: None,
+        webtransport_reload_interval: Duration::from_secs(30),
         config: RelayServerConfig::default(),
     };
     let (mut certificate, mut key) = (None, None);
@@ -55,6 +59,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             "--webtransport" => options.webtransport = true,
             "--webtransport-cert" => certificate = Some(value(&mut args)?.into()),
             "--webtransport-key" => key = Some(value(&mut args)?.into()),
+            "--webtransport-reload-secs" => {
+                options.webtransport_reload_interval =
+                    Duration::from_secs(number(&flag, value(&mut args)?)?)
+            }
             "--max-reservations" => {
                 options.config.max_reservations = number(&flag, value(&mut args)?)?
             }
@@ -166,7 +174,7 @@ fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
 }
 
 pub fn usage() -> &'static str {
-    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic HOST:PORT               exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp HOST:PORT                exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable; WebTransport ones need their /certhash without --webtransport-cert, and none with it)\n--webtransport                 also serve WebTransport (browsers) on the QUIC port\n--webtransport-cert PATH       CA-signed WebTransport certificate chain (PEM); implies --webtransport\n--webtransport-key PATH        the --webtransport-cert private key (PEM); required with it\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--max-reservations-per-ip N    reservations per IPv4 address or IPv6 /64\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuits-per-ip N        circuits per IPv4 address or IPv6 /64\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n--max-rate-limit-entries N     keys each rate limiter tracks\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME [--webtransport] [--webtransport-cert PATH --webtransport-key PATH]\n  minip2p-relay service status | logs | restart | uninstall"
+    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic HOST:PORT               exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp HOST:PORT                exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable; WebTransport ones need their /certhash without --webtransport-cert, and none with it)\n--webtransport                 also serve WebTransport (browsers) on the QUIC port\n--webtransport-cert PATH       CA-signed WebTransport certificate chain (PEM); implies --webtransport\n--webtransport-key PATH        the --webtransport-cert private key (PEM); required with it\n--webtransport-reload-secs N   how often to check both files and serve a renewed certificate (default 30)\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--max-reservations-per-ip N    reservations per IPv4 address or IPv6 /64\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuits-per-ip N        circuits per IPv4 address or IPv6 /64\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n--max-rate-limit-entries N     keys each rate limiter tracks\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME [--webtransport] [--webtransport-cert PATH --webtransport-key PATH]\n  minip2p-relay service status | logs | restart | uninstall"
 }
 
 #[cfg(test)]
