@@ -10,11 +10,10 @@ Self-signed WebTransport certificates rotate every 13 days, so any address with 
 
 - **Choosing the certificate by SNI, so one socket serves both modes.** It works (an IP certhash dial sends no SNI, a `/dns` dial sends the name), but nobody needs both yet, and it doubles the Listening-address and Noise-list logic. It is the natural extension if someone does.
 - **An ACME client in minip2p.** Certificates come from files the operator manages with certbot or similar; minip2p stays free of HTTP challenges and account state.
-- **Live certificate reload.** The node loads its certificate at startup, and a renewal restarts it (about every 60 days). The resolver cell could be swapped at runtime if restarts start to hurt.
 
 ## Consequences
 
 - A relay with a domain gets one permanent browser address: `/dns/<domain>/udp/<port>/quic-v1/webtransport/p2p/…`.
-- Each renewal restarts the relay and drops its reservations and circuits; clients reconnect.
+- A renewal needs no restart: `QuicTransport::replace_webtransport_certificate` and `Endpoint::set_webtransport_certificate_pem` swap the certificate for new handshakes (with bind's checks, keeping the old one on error), and live connections, reservations and circuits survive (plan Decision 9).
 - Let's Encrypt no longer emails expiry notices, so the relay logs a warning when its leaf has fewer than 14 days left, at startup and daily.
 - The option is native-only for now: `ffi-core`, UniFFI and the web shell do not expose it.

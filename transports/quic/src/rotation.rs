@@ -11,7 +11,8 @@
 //!
 //! A provided (CA-signed) certificate advertises no certhash, since browsers
 //! check it with WebPKI, lists its leaf's hash in Noise as the spec
-//! requires, and never rotates.
+//! requires, and never rotates; the operator may replace it live through a
+//! [`WebTransportCertificateHandle`].
 
 use std::sync::{Arc, RwLock};
 
@@ -20,10 +21,14 @@ use minip2p_core::platform::{Deadline, Now};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_tls::webtransport::{certhash, next_boundary, period_at, webtransport_certificate};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::sign::CertifiedKey;
 
-use crate::QuicBindError;
 use crate::tls::{TlsIdentity, WebTransportCertificate};
 use crate::webtransport::WebTransportContext;
+use crate::{QuicBindError, WebTransportCertificateError};
+
+/// The Noise context new WebTransport connections take, swapped in place.
+type SharedContext = Arc<RwLock<Arc<WebTransportContext>>>;
 
 /// A WebTransport listener's certificate state.
 pub(crate) struct Certificates {
@@ -33,7 +38,7 @@ pub(crate) struct Certificates {
     /// provided certificate.
     advertised: Vec<Multihash>,
     /// What new WebTransport connections authenticate with.
-    context: Arc<WebTransportContext>,
+    context: SharedContext,
     /// Bumped by every rotation.
     revision: u64,
     /// Where a derived certificate is in its schedule; `None` for a provided
@@ -61,7 +66,7 @@ impl Certificates {
         Ok(Self {
             certificate,
             advertised,
-            context,
+            context: Arc::new(RwLock::new(context)),
             revision: 0,
             schedule: Some(Schedule { period, unix }),
         })
@@ -77,27 +82,12 @@ impl Certificates {
         key: PrivateKeyDer<'static>,
         unix: u64,
     ) -> Result<Self, QuicBindError> {
-        let invalid = QuicBindError::WebTransportCertificate;
-        let leaf = chain
-            .first()
-            .ok_or_else(|| invalid("the chain is empty".into()))?;
-        let not_after = minip2p_tls::certificate_validity(leaf)
-            .map_err(|error| invalid(format!("the leaf certificate does not parse: {error}")))?
-            .not_after;
-        if not_after.to_unix_duration().as_secs() < unix {
-            return Err(invalid(format!(
-                "the leaf certificate expired at {not_after} (the host clock reads {unix} \
-                 Unix seconds); renew it"
-            )));
-        }
-        let context = Arc::new(WebTransportContext {
-            keypair: keypair.clone(),
-            certhashes: vec![certhash(leaf)],
-        });
+        let (certificate, context) = load_provided(tls, keypair, chain, key, unix)
+            .map_err(QuicBindError::WebTransportCertificate)?;
         Ok(Self {
-            certificate: Arc::new(RwLock::new(tls.provided_key(chain, key)?)),
+            certificate: Arc::new(RwLock::new(certificate)),
             advertised: Vec::new(),
-            context,
+            context: Arc::new(RwLock::new(context)),
             revision: 0,
             schedule: None,
         })
@@ -112,8 +102,24 @@ impl Certificates {
         &self.advertised
     }
 
-    pub(crate) fn context(&self) -> &Arc<WebTransportContext> {
-        &self.context
+    /// The context a new WebTransport connection authenticates with.
+    pub(crate) fn context(&self) -> Arc<WebTransportContext> {
+        match self.context.read() {
+            Ok(current) => Arc::clone(&current),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// A handle that replaces a provided certificate; `None` for a derived
+    /// one, which follows its schedule instead.
+    pub(crate) fn handle(&self, tls: &TlsIdentity) -> Option<WebTransportCertificateHandle> {
+        self.schedule
+            .is_none()
+            .then(|| WebTransportCertificateHandle {
+                tls: tls.clone(),
+                certificate: Arc::clone(&self.certificate),
+                context: Arc::clone(&self.context),
+            })
     }
 
     pub(crate) fn revision(&self) -> u64 {
@@ -147,12 +153,9 @@ impl Certificates {
         ) else {
             return false;
         };
-        match self.certificate.write() {
-            Ok(mut current) => *current = key,
-            Err(poisoned) => *poisoned.into_inner() = key,
-        }
+        store(&self.certificate, key);
+        store(&self.context, context);
         self.advertised = advertised;
-        self.context = context;
         self.revision = self.revision.wrapping_add(1);
         true
     }
@@ -164,6 +167,87 @@ impl Certificates {
         let unix = self.schedule.as_ref()?.unix;
         let secs = next_boundary(unix).saturating_sub(unix);
         Some(now.deadline_after(secs.saturating_mul(1_000)))
+    }
+}
+
+/// Replaces a CA-signed WebTransport certificate while the transport runs.
+///
+/// From [`QuicTransport::webtransport_certificate_handle`](crate::QuicTransport::webtransport_certificate_handle),
+/// for hosts that no longer hold the transport itself (one boxed into a
+/// transport set, say). Cloning it shares the same certificate.
+#[derive(Clone)]
+pub struct WebTransportCertificateHandle {
+    tls: TlsIdentity,
+    certificate: WebTransportCertificate,
+    context: SharedContext,
+}
+
+impl WebTransportCertificateHandle {
+    /// Serves `chain` (leaf first, then intermediates) and its `key` to new
+    /// WebTransport handshakes, after the checks bind makes: the key matches
+    /// the leaf and the leaf has not expired by the host clock.
+    ///
+    /// Live connections keep the certificate they were set up with. The
+    /// listen addresses carry no `/certhash`, so they don't change and no
+    /// `Listening` event follows. On error the current certificate stays.
+    pub fn replace(
+        &self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<(), WebTransportCertificateError> {
+        let keypair = self.context.read().map_or_else(
+            |poisoned| poisoned.into_inner().keypair.clone(),
+            |current| current.keypair.clone(),
+        );
+        let unix = self.tls.now().as_secs();
+        let (certificate, context) = load_provided(&self.tls, &keypair, chain, key, unix)
+            .map_err(WebTransportCertificateError::Invalid)?;
+        store(&self.certificate, certificate);
+        store(&self.context, context);
+        Ok(())
+    }
+}
+
+impl core::fmt::Debug for WebTransportCertificateHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WebTransportCertificateHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+/// An operator's chain and key, loaded for serving, with the Noise context
+/// listing the leaf's hash. Refused, with the reason, if the key does not
+/// match the leaf or the leaf expired before `unix`. A leaf not yet valid is
+/// accepted: the host's clock may be the one that's off.
+fn load_provided(
+    tls: &TlsIdentity,
+    keypair: &Ed25519Keypair,
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    unix: u64,
+) -> Result<(Arc<CertifiedKey>, Arc<WebTransportContext>), String> {
+    let leaf = chain.first().ok_or("the chain is empty")?;
+    let not_after = minip2p_tls::certificate_validity(leaf)
+        .map_err(|error| format!("the leaf certificate does not parse: {error}"))?
+        .not_after;
+    if not_after.to_unix_duration().as_secs() < unix {
+        return Err(format!(
+            "the leaf certificate expired at {not_after} (the host clock reads {unix} \
+             Unix seconds); renew it"
+        ));
+    }
+    let context = Arc::new(WebTransportContext {
+        keypair: keypair.clone(),
+        certhashes: vec![certhash(leaf)],
+    });
+    Ok((tls.provided_key(chain, key)?, context))
+}
+
+/// Swaps a shared cell's value, even if a reader panicked holding it.
+fn store<T>(cell: &RwLock<T>, value: T) {
+    match cell.write() {
+        Ok(mut current) => *current = value,
+        Err(poisoned) => *poisoned.into_inner() = value,
     }
 }
 

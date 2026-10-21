@@ -9,7 +9,10 @@ use minip2p_core::{Multiaddr, PeerAddr, Protocol};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_quic::pki_types::pem::PemObject;
 use minip2p_quic::pki_types::{CertificateDer, PrivateKeyDer};
-use minip2p_quic::{QuicBindError, QuicNodeConfig, QuicTransport, WebTransportCertificates};
+use minip2p_quic::{
+    QuicBindError, QuicNodeConfig, QuicTransport, WebTransportCertificateError,
+    WebTransportCertificates,
+};
 use minip2p_swarm::{SwarmBuilder, SwarmCore, SwarmEvent};
 use minip2p_tls::webtransport;
 use minip2p_transport::ConnectionCloseReason;
@@ -976,4 +979,95 @@ fn a_provided_certificate_never_rotates() {
         .expect("a WebTransport address");
     assert_eq!(webtransport.certhashes().count(), 0);
     assert_eq!(server.listen(webtransport), Ok(webtransport.clone()));
+}
+
+const LOCALHOST_KEY: &[u8] = include_bytes!("fixtures/ca/localhost.key");
+
+/// `addr` pinned to the first certificate in `chain`: a dial succeeds only
+/// if TLS presents that leaf and Noise lists its hash.
+fn pinned_to(chain: &[u8], addr: PeerAddr) -> PeerAddr {
+    let leaf = pem_certs(chain).remove(0);
+    let (mut transport, peer) = addr.into_parts();
+    transport.push(Protocol::Certhash(webtransport::certhash(&leaf)));
+    PeerAddr::new(transport, peer).expect("peer addr")
+}
+
+/// Dials `addr` from a fresh client with `options` and drives until both
+/// ends connect.
+fn dial_ok(server: &mut QuicTransport, options: Options, addr: &PeerAddr) {
+    let mut client = client(options);
+    let mut seen = Seen::default();
+    client.dial(addr).expect("dial");
+    drive(server, &mut client, &mut seen, "a dial", |seen| {
+        connected(&seen.server).is_some() && connected(&seen.client).is_some()
+    });
+}
+
+#[test]
+fn a_replaced_certificate_serves_new_handshakes_and_keeps_live_connections() {
+    let mut server = ca_server();
+    let addr = webtransport_addr(&server);
+    let revision = server.local_addresses_revision();
+    let mut live = client(webpki(CA, "localhost"));
+    let mut seen = Seen::default();
+    connect(&mut server, &mut live, &mut seen);
+    let (live_conn, _) = connected(&seen.client).expect("client connected");
+
+    server
+        .replace_webtransport_certificate(pem_certs(LOCALHOST), pem_key(LOCALHOST_KEY))
+        .expect("replace");
+    assert_eq!(webtransport_addr(&server), addr);
+    assert_eq!(server.local_addresses_revision(), revision);
+
+    // The live connection still carries streams, and no address changed.
+    seen.server.clear();
+    let stream = live.open_stream(live_conn).expect("open");
+    live.send_stream(live_conn, stream, Bytes::from_static(b"after"))
+        .expect("send");
+    drive(
+        &mut server,
+        &mut live,
+        &mut seen,
+        "a stream after the swap",
+        |seen| incoming_stream(&seen.server).is_some(),
+    );
+    assert!(listening(&seen.server).is_empty(), "{:?}", seen.server);
+
+    // New handshakes present the new leaf and Noise lists its hash; WebPKI
+    // still verifies it.
+    dial_ok(
+        &mut server,
+        Options::default(),
+        &pinned_to(LOCALHOST, addr.clone()),
+    );
+    dial_ok(&mut server, webpki(CA, "localhost"), &addr);
+    let reason = failed_dial_on(server, Options::default(), |addr| pinned_to(CHAIN, addr));
+    assert!(reason.contains("no dialed certhash"), "{reason}");
+}
+
+#[test]
+fn a_rejected_replacement_keeps_the_current_certificate() {
+    let mut server = ca_server();
+    let expired = include_bytes!("fixtures/ca/expired.pem");
+    let expired_key = include_bytes!("fixtures/ca/expired.key");
+    for (chain, key, expected) in [
+        (&expired[..], &expired_key[..], "expired at 2021-01-01"),
+        (LOCALHOST, &expired_key[..], "does not match"),
+    ] {
+        match server.replace_webtransport_certificate(pem_certs(chain), pem_key(key)) {
+            Err(WebTransportCertificateError::Invalid(reason)) => {
+                assert!(reason.contains(expected), "{reason}");
+            }
+            other => panic!("expected an invalid certificate, got {other:?}"),
+        }
+    }
+    let addr = webtransport_addr(&server);
+    dial_ok(&mut server, Options::default(), &pinned_to(CHAIN, addr));
+
+    // A transport deriving its own certificates has none to replace.
+    assert_eq!(
+        server_with(QuicNodeConfig::generate())
+            .replace_webtransport_certificate(pem_certs(LOCALHOST), pem_key(LOCALHOST_KEY)),
+        Err(WebTransportCertificateError::NotProvided)
+    );
 }

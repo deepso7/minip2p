@@ -164,7 +164,8 @@ None of this applies to a [provided certificate](#ca-signed-certificates): it ne
 
 - Addresses carry no certhash. A CA leaf usually outlives the 14 days browsers allow a pinned certificate (and may be RSA, which pinning forbids), so it must not be pinned. The IP addresses `local_addresses` reports fail WebPKI in a browser, since the certificate names the domain; announce the `/dns` address instead.
 - Noise lists the leaf's certhash, as the spec requires; a client that dialed without a certhash has nothing to compare it with.
-- `bind` checks the chain: a key that does not match the leaf, or a leaf already expired on the host's clock (the system clock at bind), is `QuicBindError::WebTransportCertificate`. A leaf not yet valid is accepted. Any key type the ring provider signs with (ECDSA, Ed25519, RSA) works. The certificate is fixed for the transport's life: renewing it means binding again.
+- `bind` checks the chain: a key that does not match the leaf, or a leaf already expired on the host's clock (the system clock at bind), is `QuicBindError::WebTransportCertificate`. A leaf not yet valid is accepted. Any key type the ring provider signs with (ECDSA, Ed25519, RSA) works. The certificate never rotates on its own.
+- Renewing it needs no restart: `QuicTransport::replace_webtransport_certificate(chain, key)` makes the same checks (`WebTransportCertificateError::Invalid`, or `NotProvided` on a transport without a provided certificate) and, on success, serves the new chain to new handshakes and lists its leaf's hash in their Noise; live connections keep theirs. Addresses don't change, so no `Listening` follows. On error the current certificate stays. A host that has boxed the transport (into a `TransportSet`, say) takes a `WebTransportCertificateHandle` from `webtransport_certificate_handle()` first; its `replace` does the same.
 - `libp2p` clients on the same socket still get the libp2p certificate.
 
 ## WebTransport sessions

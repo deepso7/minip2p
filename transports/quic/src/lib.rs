@@ -59,7 +59,7 @@ pub use config::{QuicLimits, QuicNodeConfig, WebTransportCertificates};
 pub use diagnostics::{
     ConnectionDiagnostics, DatagramCounters, SocketBuffers, datagram_counters, socket_buffers,
 };
-pub use error::{QuicBindError, QuicTlsStage};
+pub use error::{QuicBindError, QuicTlsStage, WebTransportCertificateError};
 /// The DER types [`WebTransportCertificates::Provided`] takes, including PEM
 /// parsing (`pem::PemObject`).
 pub use rustls::pki_types;
@@ -67,6 +67,8 @@ pub use rustls::pki_types;
 use connection::{Cx, QuicConnection};
 use diagnostics::{ConnectionCounters, DatagramTally};
 use rotation::Certificates;
+pub use rotation::WebTransportCertificateHandle;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use socket::{Received, Socket, Sockets};
 use tls::{HostTime, TlsIdentity};
 
@@ -700,6 +702,42 @@ impl QuicTransport {
         self.node_config.peer_id()
     }
 
+    /// Replaces the CA-signed WebTransport certificate this transport was
+    /// bound with ([`WebTransportCertificates::Provided`]), for example after
+    /// a renewal, without dropping a connection.
+    ///
+    /// The new chain gets bind's checks: the key matches the leaf, and the
+    /// leaf has not expired by the host clock. New WebTransport handshakes
+    /// present it and Noise lists its leaf's hash; live connections keep the
+    /// certificate they were set up with. The listen addresses carry no
+    /// `/certhash`, so they don't change and no `Listening` event follows.
+    ///
+    /// On any error the current certificate stays in service:
+    /// [`WebTransportCertificateError::NotProvided`] if the transport derives
+    /// its certificates or has no WebTransport listen address,
+    /// [`WebTransportCertificateError::Invalid`] if the new one fails a check.
+    pub fn replace_webtransport_certificate(
+        &mut self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<(), WebTransportCertificateError> {
+        self.webtransport_certificate_handle()
+            .ok_or(WebTransportCertificateError::NotProvided)?
+            .replace(chain, key)
+    }
+
+    /// A handle that does what
+    /// [`replace_webtransport_certificate`](Self::replace_webtransport_certificate)
+    /// does once the transport is out of reach, such as boxed into a
+    /// `TransportSet`. `None` unless the transport was bound with
+    /// [`WebTransportCertificates::Provided`] and a WebTransport listen
+    /// address.
+    pub fn webtransport_certificate_handle(&self) -> Option<WebTransportCertificateHandle> {
+        self.webtransport
+            .as_ref()
+            .and_then(|certificates| certificates.handle(&self.tls))
+    }
+
     /// A live connection's diagnostic counters (`diagnostics` feature).
     #[cfg(feature = "diagnostics")]
     pub fn connection_diagnostics(&self, id: ConnectionId) -> Option<ConnectionDiagnostics> {
@@ -964,7 +1002,7 @@ impl QuicTransport {
             .webtransport
             .as_ref()
             .filter(|_| socket.webtransport)
-            .map(|certificates| Arc::clone(certificates.context()));
+            .map(Certificates::context);
         match self.endpoint.accept(incoming, now, buf, config) {
             Ok((handle, conn)) => {
                 // The accepted Initial never passes through `handle_event`.

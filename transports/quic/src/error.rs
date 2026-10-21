@@ -69,6 +69,24 @@ pub enum QuicBindError {
     },
 }
 
+/// Why a running transport could not replace its WebTransport certificate.
+/// The certificate it was serving stays in service.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum WebTransportCertificateError {
+    /// The transport serves no provided certificate to replace: it derives
+    /// its own, or has no WebTransport listen address.
+    #[error(
+        "this QUIC transport serves no provided WebTransport certificate; bind it with \
+         WebTransportCertificates::Provided and a /quic-v1/webtransport address"
+    )]
+    NotProvided,
+    /// The new certificate can't be served, for the reasons bind would
+    /// refuse it ([`QuicBindError::WebTransportCertificate`]).
+    #[error("WebTransport certificate: {0}")]
+    Invalid(String),
+}
+
 /// The TLS setup step a [`QuicBindError::Tls`] failed in.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]

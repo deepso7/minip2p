@@ -121,7 +121,8 @@ pub enum WebTransportCertificates {
     #[default]
     Derived,
     /// An operator's CA-signed certificate, presented until the transport is
-    /// dropped. Browsers check it with WebPKI, so addresses carry no
+    /// dropped or it is replaced with
+    /// [`QuicTransport::replace_webtransport_certificate`](crate::QuicTransport::replace_webtransport_certificate). Browsers check it with WebPKI, so addresses carry no
     /// `/certhash` and should name the certificate's domain (`/dns/…`).
     ///
     /// Checked at bind: the key must match the leaf, and the leaf must not

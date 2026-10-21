@@ -17,7 +17,7 @@ Why: self-signed certificates rotate every 13 days (`crates/tls/src/webtransport
 Non-goals:
 
 - **No ACME client in minip2p.** Certificates come from files the operator manages (certbot or similar).
-- **No live certificate reload in v1.** The relay loads its certificate at startup; certbot's deploy hook restarts the service (about every 60 days). See Follow-ups.
+- **No file watching in minip2p.** The transport and Endpoint replace the certificate on request (Decision 9); noticing a renewed file is the host's job.
 - **No mixed mode on one transport.** A transport presents either the derived rotating certificate or the provided one, never both (Decision 2).
 - **No native WebTransport dialer.** That's unchanged from ADR 0023.
 - **No change to `quic-v1`.** libp2p peers still get the libp2p certificate by ALPN.
@@ -101,6 +101,14 @@ Endpoint::builder()
   - `crates/minip2p/README.md:26` (the rotation and `ListenAddressesChanged` paragraph applies to derived mode only), in PR 3.
 - The relay README gets a "Browsers with a stable address" section with the certbot recipe below. It also fixes the "stays the same across restarts" line to mention the 13-day rotation.
 
+### 9. Live reload
+
+A renewal needs no restart, so reservations and circuits survive it.
+
+- `QuicTransport::replace_webtransport_certificate(chain, key)` runs bind's checks (key matches leaf, leaf not expired by the host clock) through the same code, then swaps both the resolver cell and the Noise context (the new leaf's hash). New handshakes get the new certificate; live connections keep theirs. Hash-free addresses don't change: no `Listening` event, revision unchanged. On error nothing changes. A transport in derived mode, or without a WebTransport listener, returns `WebTransportCertificateError::NotProvided`.
+- The Endpoint boxes its transports in a `TransportSet`, so it can't reach `QuicTransport`. At bind it keeps the transport's `WebTransportCertificateHandle` (`Some` only in provided mode), which shares both cells. `Endpoint::set_webtransport_certificate_pem(chain_pem, key_pem)` parses with the builder's PEM code and replaces through it, on the caller's thread: no driver command is needed, since the cells are what the transport reads on its next handshake. Errors: `SetWebTransportCertificateError::{NotConfigured, Pem, Invalid}`.
+- The relay watching its files and calling it is a separate step.
+
 ## Ops: `relay.minip2p.com`
 
 Certificates live in a root-controlled tree, so a compromised relay can't swap in symlinks for a root process to follow. The relay's own state directory, `/var/lib/minip2p-relay`, is writable by the service, so it can't hold them.
@@ -135,7 +143,6 @@ Each PR depends on the one before it.
 
 ## Follow-ups
 
-- Live reload: `Endpoint::set_webtransport_certificate`, a driver command that swaps the resolver cell and the Noise context (the `RwLock` cell already supports this). The relay would watch the file's modification time. Do it if restarting every 60 days turns out to hurt (it drops all reservations and circuits).
 - SNI-based mixed mode (Decision 2, rejected for now).
 - FFI and web config surface for the option.
 
@@ -143,6 +150,6 @@ Each PR depends on the one before it.
 
 | Risk | Mitigation |
 | --- | --- |
-| The relay restarts on renewal and drops every reservation | Every 60 days at most, and clients reconnect. The live-reload follow-up removes it. |
+| The relay restarts on renewal and drops every reservation | Live reload (Decision 9) swaps the certificate in place once the relay calls it; until then, every 60 days at most, and clients reconnect. |
 | The certificate expires because renewal or the deploy hook broke | Let's Encrypt no longer sends expiry emails (ended 2025-06-04). A working renewal restarts the relay with a fresh certificate, so the relay itself checks: at startup and then daily (driven by its own loop's clock), it logs a `warning` when the leaf it serves has less than 14 days left. Point log alerting, or a cron `journalctl` grep, at that line. |
 | A browser quirk with WebPKI over WebTransport on a non-443 port | Chrome and Firefox allow any port. Verified by hand in the manual check. |

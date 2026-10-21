@@ -186,6 +186,34 @@ impl std::error::Error for RelayServerAnnounceError {
     }
 }
 
+/// Why [`Endpoint::set_webtransport_certificate_pem`] kept the current
+/// certificate.
+#[cfg(feature = "quic")]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SetWebTransportCertificateError {
+    /// The endpoint serves no CA-signed WebTransport certificate to replace.
+    #[error(
+        "this endpoint serves no CA-signed WebTransport certificate; bind it with \
+         EndpointBuilder::webtransport_certificate_pem and a /quic-v1/webtransport listen address"
+    )]
+    NotConfigured,
+    /// The PEM is unusable: no certificate, no private key, more than one
+    /// key, or a malformed section.
+    #[error("WebTransport certificate PEM: {problem}")]
+    Pem {
+        /// What is wrong with it.
+        problem: String,
+    },
+    /// The certificate can't be served: the key does not match the leaf, or
+    /// the leaf has expired by the host clock.
+    #[error("WebTransport certificate: {reason}")]
+    Invalid {
+        /// Why, as bind would report it.
+        reason: String,
+    },
+}
+
 /// Synchronous relay-server runtime control failure.
 #[cfg(feature = "relay-server")]
 #[derive(Debug)]
@@ -341,6 +369,10 @@ pub struct Endpoint {
     /// whether a WebTransport announce address must carry a `/certhash`.
     #[cfg(feature = "relay-server")]
     ca_webtransport_certificate: bool,
+    /// Replaces the CA-signed WebTransport certificate; `None` unless one
+    /// was configured and a WebTransport listener serves it.
+    #[cfg(feature = "quic")]
+    webtransport_certificate: Option<minip2p_quic::WebTransportCertificateHandle>,
     /// The one readiness poll the transport and mDNS sockets are registered
     /// with (ADR 0013). Its `Waker` carries caller interrupts and the
     /// endpoint's own wakeups (a finished name lookup) apart.
@@ -988,6 +1020,39 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Replaces the CA-signed WebTransport certificate, for example after a
+    /// renewal, without a restart or dropping a connection.
+    ///
+    /// Takes the same PEM as
+    /// [`EndpointBuilder::webtransport_certificate_pem`] and makes bind's
+    /// checks. New WebTransport handshakes present the new certificate; live
+    /// connections keep theirs. The listen addresses carry no `/certhash`, so
+    /// they and the announced addresses stay as they are.
+    ///
+    /// On any error the current certificate stays in service; see
+    /// [`SetWebTransportCertificateError`] for each case.
+    #[cfg(feature = "quic")]
+    pub fn set_webtransport_certificate_pem(
+        &mut self,
+        chain_pem: impl AsRef<[u8]>,
+        key_pem: impl AsRef<[u8]>,
+    ) -> Result<(), SetWebTransportCertificateError> {
+        let handle = self
+            .webtransport_certificate
+            .as_ref()
+            .ok_or(SetWebTransportCertificateError::NotConfigured)?;
+        let (chain, key) = parse_certificate_pem(chain_pem.as_ref(), key_pem.as_ref())
+            .map_err(|problem| SetWebTransportCertificateError::Pem { problem })?;
+        handle.replace(chain, key).map_err(|error| match error {
+            minip2p_quic::WebTransportCertificateError::Invalid(reason) => {
+                SetWebTransportCertificateError::Invalid { reason }
+            }
+            other => SetWebTransportCertificateError::Invalid {
+                reason: other.to_string(),
+            },
+        })
+    }
+
     /// Atomically replaces the relay server's explicit announce-address override.
     ///
     /// Each address must be a concrete direct TCP, QUIC or WebTransport
@@ -1428,45 +1493,16 @@ impl EndpointBuilder {
     /// they must dial the domain it names, with no `/certhash`:
     /// `/dns/relay.example.com/udp/<port>/quic-v1/webtransport/p2p/…`. The
     /// certificate never rotates, so the listen addresses carry no
-    /// `/certhash` and never change. Restart with the renewed files to
-    /// replace it.
+    /// `/certhash` and never change. Replace it after a renewal, without a
+    /// restart, with [`Endpoint::set_webtransport_certificate_pem`].
     #[cfg(feature = "quic")]
     pub fn webtransport_certificate_pem(
         mut self,
         chain_pem: impl AsRef<[u8]>,
         key_pem: impl AsRef<[u8]>,
     ) -> Result<Self, EndpointOptionsError> {
-        use minip2p_quic::pki_types::pem::PemObject;
-        use minip2p_quic::pki_types::{CertificateDer, PrivateKeyDer};
-
-        let invalid =
-            |problem: String| EndpointOptionsError::WebTransportCertificatePem { problem };
-        let chain = CertificateDer::pem_slice_iter(chain_pem.as_ref())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| invalid(format!("certificate chain: {error}")))?;
-        if chain.is_empty() {
-            return Err(invalid(
-                "the certificate chain has no `BEGIN CERTIFICATE` section".into(),
-            ));
-        }
-        let mut keys = PrivateKeyDer::pem_slice_iter(key_pem.as_ref())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| invalid(format!("private key: {error}")))?;
-        let key = match keys.len() {
-            1 => keys.remove(0),
-            0 => {
-                return Err(invalid(
-                    "the key PEM has no `BEGIN PRIVATE KEY`, `BEGIN EC PRIVATE KEY` or \
-                     `BEGIN RSA PRIVATE KEY` section"
-                        .into(),
-                ));
-            }
-            count => {
-                return Err(invalid(format!(
-                    "the key PEM has {count} private keys; pass only the leaf's"
-                )));
-            }
-        };
+        let (chain, key) = parse_certificate_pem(chain_pem.as_ref(), key_pem.as_ref())
+            .map_err(|problem| EndpointOptionsError::WebTransportCertificatePem { problem })?;
         self.webtransport_certificates = WebTransportCertificates::Provided { chain, key };
         Ok(self)
     }
@@ -1772,8 +1808,12 @@ impl EndpointBuilder {
     pub fn bind(mut self) -> Result<Endpoint, BindError> {
         self.validate()?;
         let keypair = self.keypair.take().unwrap_or_else(Ed25519Keypair::generate);
-        let transport = bind_transports(&self, &keypair)?;
+        let (transport, _certificate) = bind_transports(&self, &keypair)?;
         let mut endpoint = build_endpoint(self, keypair, transport)?;
+        #[cfg(feature = "quic")]
+        {
+            endpoint.webtransport_certificate = _certificate;
+        }
         endpoint
             .engine
             .core
@@ -2016,8 +2056,13 @@ fn check_webtransport_announce(
 fn bind_transports(
     options: &EndpointBuilder,
     keypair: &Ed25519Keypair,
-) -> Result<TransportSet, BindError> {
+) -> Result<(TransportSet, CertificateHandle), BindError> {
     let mut set = TransportSet::new();
+    #[cfg_attr(
+        not(feature = "quic"),
+        expect(unused_mut, reason = "only a QUIC transport sets it")
+    )]
+    let mut certificate: CertificateHandle = None;
 
     #[cfg(any(feature = "quic", feature = "tcp"))]
     {
@@ -2052,6 +2097,7 @@ fn bind_transports(
                 let addresses: Vec<Multiaddr> =
                     quic_addrs.iter().map(|&address| address.clone()).collect();
                 let transport = QuicTransport::bind(config, &addresses).map_err(BindError::Quic)?;
+                certificate = transport.webtransport_certificate_handle();
                 let namespaces = transport.namespaces();
                 insert_member(&mut set, TransportKind::Quic, namespaces, transport)?;
             }
@@ -2067,7 +2113,53 @@ fn bind_transports(
     if set.is_empty() {
         return Err(EndpointOptionsError::NoTransport.into());
     }
-    Ok(set)
+    Ok((set, certificate))
+}
+
+/// What [`Endpoint::set_webtransport_certificate_pem`] replaces a CA-signed
+/// certificate through: the QUIC transport's handle, since the transport
+/// itself is boxed in the [`TransportSet`].
+#[cfg(feature = "quic")]
+type CertificateHandle = Option<minip2p_quic::WebTransportCertificateHandle>;
+#[cfg(not(feature = "quic"))]
+type CertificateHandle = Option<core::convert::Infallible>;
+
+/// A certificate chain (leaf first) and its one private key from PEM, or
+/// what is wrong with them.
+#[cfg(feature = "quic")]
+fn parse_certificate_pem(
+    chain_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<
+    (
+        Vec<minip2p_quic::pki_types::CertificateDer<'static>>,
+        minip2p_quic::pki_types::PrivateKeyDer<'static>,
+    ),
+    String,
+> {
+    use minip2p_quic::pki_types::pem::PemObject;
+    use minip2p_quic::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let chain = CertificateDer::pem_slice_iter(chain_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("certificate chain: {error}"))?;
+    if chain.is_empty() {
+        return Err("the certificate chain has no `BEGIN CERTIFICATE` section".into());
+    }
+    let mut keys = PrivateKeyDer::pem_slice_iter(key_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("private key: {error}"))?;
+    match keys.len() {
+        1 => Ok((chain, keys.remove(0))),
+        0 => Err(
+            "the key PEM has no `BEGIN PRIVATE KEY`, `BEGIN EC PRIVATE KEY` or \
+                  `BEGIN RSA PRIVATE KEY` section"
+                .into(),
+        ),
+        count => Err(format!(
+            "the key PEM has {count} private keys; pass only the leaf's"
+        )),
+    }
 }
 
 /// Builds the one TCP transport, listening on every `/tcp` address asked for.
@@ -2349,6 +2441,8 @@ pub(crate) fn build_endpoint(
         nat_dials: Vec::new(),
         #[cfg(feature = "relay-server")]
         ca_webtransport_certificate,
+        #[cfg(feature = "quic")]
+        webtransport_certificate: None,
         poll,
         #[cfg(all(test, feature = "quic"))]
         raw_events: std::collections::VecDeque::new(),
@@ -3247,6 +3341,40 @@ mod tests {
                     && addr.transport().certhashes().next().is_none()
             ),
             "{addrs:?}"
+        );
+    }
+
+    #[cfg(feature = "quic")]
+    #[test]
+    fn set_webtransport_certificate_pem_needs_ca_mode_and_a_matching_key() {
+        const CHAIN: &[u8] =
+            include_bytes!("../../../../transports/quic/tests/fixtures/ca/chain.pem");
+        const CHAIN_KEY: &[u8] =
+            include_bytes!("../../../../transports/quic/tests/fixtures/ca/chain.key");
+        let mut endpoint = Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")
+            .expect("WebTransport")
+            .webtransport_certificate_pem(CA_LEAF, CA_KEY)
+            .expect("fixture PEM")
+            .bind()
+            .expect("bind with the fixture certificate");
+        endpoint
+            .set_webtransport_certificate_pem(CHAIN, CHAIN_KEY)
+            .expect("replace");
+        assert!(matches!(
+            endpoint.set_webtransport_certificate_pem(CA_LEAF, CHAIN_KEY),
+            Err(SetWebTransportCertificateError::Invalid { reason })
+                if reason.contains("does not match")
+        ));
+
+        let mut derived = Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")
+            .expect("WebTransport")
+            .bind()
+            .expect("bind");
+        assert_eq!(
+            derived.set_webtransport_certificate_pem(CHAIN, CHAIN_KEY),
+            Err(SetWebTransportCertificateError::NotConfigured)
         );
     }
 
