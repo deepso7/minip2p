@@ -91,7 +91,7 @@ On a systemd host with certbot, for `relay.example.com` (also on the docs site a
 2. Create the group and the root-owned certificate directory the deploy hook installs into. `service install` reuses an existing group. The relay's state directory is writable by the service, so it can't hold the certificate.
 
    ```bash
-   sudo groupadd --system minip2p-relay
+   sudo groupadd --system --force minip2p-relay
    sudo install -d -o root -g minip2p-relay -m 0750 /etc/minip2p-relay/tls
    ```
 
