@@ -204,11 +204,14 @@ impl WebTransportCertificateHandle {
             load_provided(&self.tls, &current.keypair, chain, key, unix)
                 .map_err(WebTransportCertificateError::Invalid)?;
         // A handshake whose certificate resolved just before this swap reads
-        // the new context after it, so the previous leaf stays listed.
-        if let (Some(previous), Some(fresh)) =
-            (current.certhashes.first(), Arc::get_mut(&mut context))
-        {
-            fresh.certhashes.push(*previous);
+        // the new context after it, so the previous leaf stays listed. A
+        // reload of the same leaf keeps the list as it was.
+        if let Some(fresh) = Arc::get_mut(&mut context) {
+            if current.certhashes.first() == fresh.certhashes.first() {
+                fresh.certhashes = current.certhashes.clone();
+            } else if let Some(previous) = current.certhashes.first() {
+                fresh.certhashes.push(*previous);
+            }
         }
         store(&self.certificate, certificate);
         *current = context;

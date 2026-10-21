@@ -1042,7 +1042,11 @@ fn a_replaced_certificate_serves_new_handshakes_and_keeps_live_connections() {
     );
     dial_ok(&mut server, webpki(CA, "localhost"), &addr);
     // Noise still lists the previous leaf, for a handshake that straddled
-    // the swap: a dial pinned to both hashes needs both listed.
+    // the swap, even after the same leaf is loaded again: a dial pinned to
+    // both hashes needs both listed.
+    server
+        .replace_webtransport_certificate(pem_certs(LOCALHOST), pem_key(LOCALHOST_KEY))
+        .expect("reload the same leaf");
     dial_ok(
         &mut server,
         Options::default(),
