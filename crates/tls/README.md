@@ -18,7 +18,7 @@ use minip2p_tls::verify_libp2p_certificate;
 let peer_id = verify_libp2p_certificate(&cert_der, now)?;
 ```
 
-`certificate_spki(&cert_der)` returns a certificate's DER-encoded SubjectPublicKeyInfo, so a TLS stack can check the handshake's CertificateVerify signature against the key the libp2p extension vouches for.
+`certificate_spki(&cert_der)` returns a certificate's DER-encoded SubjectPublicKeyInfo, so a TLS stack can check the handshake's CertificateVerify signature against the key the libp2p extension vouches for. `certificate_validity(&cert_der)` reads any certificate's validity window without verifying it, so a transport can refuse to serve an operator's CA-signed certificate that has already expired.
 
 The spec also forbids certificate chains. The verifier sees one certificate, so the transport must reject a peer that presents more than one (the QUIC transport does).
 
