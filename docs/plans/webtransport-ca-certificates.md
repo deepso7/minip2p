@@ -142,7 +142,7 @@ Each PR depends on the one before it.
 ## Risks
 
 | Risk | Mitigation |
-|---|---|
+| --- | --- |
 | The relay restarts on renewal and drops every reservation | Every 60 days at most, and clients reconnect. The live-reload follow-up removes it. |
 | The certificate expires because renewal or the deploy hook broke | Let's Encrypt no longer sends expiry emails (ended 2025-06-04). A working renewal restarts the relay with a fresh certificate, so the relay itself checks: at startup and then daily (driven by its own loop's clock), it logs a `warning` when the leaf it serves has less than 14 days left. Point log alerting, or a cron `journalctl` grep, at that line. |
 | A browser quirk with WebPKI over WebTransport on a non-443 port | Chrome and Firefox allow any port. Verified by hand in the manual check. |
