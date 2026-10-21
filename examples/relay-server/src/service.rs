@@ -107,7 +107,9 @@ enum WebTransport<'a> {
     CaCertificate((&'a Path, &'a Path)),
 }
 
-/// Quotes one ExecStart path for systemd, naming `what` in errors.
+/// Quotes one ExecStart path for systemd, naming `what` in errors. `%` and
+/// `$` are doubled, because systemd expands specifiers and variables even
+/// inside quotes.
 fn quoted(path: &Path, what: &str) -> Result<String, Box<dyn Error>> {
     let path = path
         .to_str()
@@ -117,7 +119,10 @@ fn quoted(path: &Path, what: &str) -> Result<String, Box<dyn Error>> {
     }
     Ok(format!(
         "\"{}\"",
-        path.replace('\\', "\\\\").replace('"', "\\\"")
+        path.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+            .replace('$', "$$")
     ))
 }
 
@@ -555,10 +560,10 @@ WantedBy=multi-user.target\n"
         assert_eq!(
             exec_start(WebTransport::CaCertificate((
                 Path::new("/etc/minip2p-relay/tls/full\"chain.pem"),
-                Path::new("/etc/minip2p relay/privkey.pem"),
+                Path::new("/etc/minip2p relay/%h$HOME.pem"),
             ))),
             format!(
-                "{base} --webtransport --webtransport-cert \"/etc/minip2p-relay/tls/full\\\"chain.pem\" --webtransport-key \"/etc/minip2p relay/privkey.pem\" --announce /dns/relay.minip2p.com/udp/19876/quic-v1/webtransport"
+                "{base} --webtransport --webtransport-cert \"/etc/minip2p-relay/tls/full\\\"chain.pem\" --webtransport-key \"/etc/minip2p relay/%%h$$HOME.pem\" --announce /dns/relay.minip2p.com/udp/19876/quic-v1/webtransport"
             )
         );
     }

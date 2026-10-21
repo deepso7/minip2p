@@ -8,7 +8,10 @@ use std::net::SocketAddr;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use minip2p::{Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, RelayServerEvent};
+use minip2p::{
+    Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, Multiaddr, PeerAddr,
+    RelayServerEvent,
+};
 use minip2p_example_common::load_keypair;
 
 const STDIN_COMMAND_CAPACITY: usize = 16;
@@ -76,7 +79,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     let announced = options
         .announce_addrs
         .iter()
-        .filter(|a| a.is_webtransport());
+        .filter(|address| is_webtransport_announce(address));
     for address in announced.clone() {
         match address.peer_id() {
             Some(_) => println!("[relay] webtransport={address}"),
@@ -321,9 +324,30 @@ fn print_event(event: RelayServerEvent) {
     }
 }
 
+/// Whether an `--announce` is a WebTransport address, with or without its
+/// trailing `/p2p/<peer>`.
+fn is_webtransport_announce(address: &Multiaddr) -> bool {
+    address.is_webtransport()
+        || PeerAddr::from_multiaddr(address).is_ok_and(|peer| peer.transport().is_webtransport())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webtransport_announces_are_recognised_with_or_without_a_peer_id() {
+        let address = "/dns/relay.example/udp/19876/quic-v1/webtransport";
+        let peer = Ed25519Keypair::generate().peer_id();
+        for announce in [address.to_owned(), format!("{address}/p2p/{peer}")] {
+            assert!(
+                is_webtransport_announce(&announce.parse().unwrap()),
+                "{announce}"
+            );
+        }
+        let quic = format!("/dns/relay.example/udp/19876/quic-v1/p2p/{peer}");
+        assert!(!is_webtransport_announce(&quic.parse().unwrap()));
+    }
 
     #[test]
     fn stdin_command_queue_applies_backpressure() {
