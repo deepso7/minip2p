@@ -846,7 +846,9 @@ fn pem_key(pem: &[u8]) -> PrivateKeyDer<'static> {
 }
 
 const LOCALHOST: &[u8] = include_bytes!("fixtures/ca/localhost.pem");
-const LOCALHOST_KEY: &[u8] = include_bytes!("fixtures/ca/localhost.key");
+/// A `localhost` leaf plus the intermediate that signed it, as a full chain.
+const CHAIN: &[u8] = include_bytes!("fixtures/ca/chain.pem");
+const CHAIN_KEY: &[u8] = include_bytes!("fixtures/ca/chain.key");
 
 /// A node presenting `chain` and `key` to WebTransport clients.
 fn provided(chain: &[u8], key: &[u8]) -> QuicNodeConfig {
@@ -856,9 +858,10 @@ fn provided(chain: &[u8], key: &[u8]) -> QuicNodeConfig {
     })
 }
 
-/// A dual-socket listener serving the fixture `localhost` certificate.
+/// A dual-socket listener serving the fixture `localhost` chain, whose
+/// leaf only reaches the root through the intermediate it also sends.
 fn ca_server() -> QuicTransport {
-    let mut server = server_with(provided(LOCALHOST, LOCALHOST_KEY));
+    let mut server = server_with(provided(CHAIN, CHAIN_KEY));
     server.listen_on_bound_addrs().expect("listen");
     server
 }
