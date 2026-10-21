@@ -577,13 +577,13 @@ function __wbg_get_imports() {
             const ret = arg0.call(arg1);
             return ret;
         }, arguments); },
-        __wbg_closeWrite_564579d75455787e: function(arg0, arg1) {
+        __wbg_closeWrite_c2a9cb3bb10e821e: function(arg0, arg1) {
             arg0.closeWrite(arg1 >>> 0);
         },
-        __wbg_close_5a09eeabaf759d61: function(arg0, arg1, arg2, arg3, arg4) {
+        __wbg_close_48a3cfd8bd1dbd0a: function(arg0, arg1, arg2, arg3, arg4) {
             arg0.close(arg1 >>> 0, arg2 >>> 0, getStringFromWasm0(arg3, arg4));
         },
-        __wbg_connect_1a5ece271582f806: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+        __wbg_connect_c166f1da964b14d7: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg0.connect(getStringFromWasm0(arg1, arg2), arg3);
             return ret;
         }, arguments); },
@@ -618,7 +618,7 @@ function __wbg_get_imports() {
             const ret = arg0[arg1];
             return ret;
         },
-        __wbg_grantRead_5663121533a592a7: function(arg0, arg1, arg2) {
+        __wbg_grantRead_26d62ddb1890373a: function(arg0, arg1, arg2) {
             arg0.grantRead(arg1 >>> 0, arg2 >>> 0);
         },
         __wbg_instanceof_ArrayBuffer_d4ff01f8247925ae: function(arg0) {
@@ -713,7 +713,7 @@ function __wbg_get_imports() {
             const ret = arg0.next();
             return ret;
         }, arguments); },
-        __wbg_now_8566e3387c4ceb67: function() {
+        __wbg_now_1441d8b73e117b79: function() {
             const ret = performance.now();
             return ret;
         },
@@ -721,11 +721,11 @@ function __wbg_get_imports() {
             const ret = Date.now();
             return ret;
         },
-        __wbg_openStream_1acee348e26ae2b0: function() { return handleError(function (arg0, arg1) {
+        __wbg_openStream_d97fe2e0b173d6c5: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.openStream(arg1 >>> 0);
             return ret;
         }, arguments); },
-        __wbg_pollEvent_4d65f1beb4fa76e3: function(arg0) {
+        __wbg_pollEvent_a059350039b0fd9f: function(arg0) {
             const ret = arg0.pollEvent();
             return ret;
         },
@@ -736,7 +736,7 @@ function __wbg_get_imports() {
             const ret = arg0.push(arg1);
             return ret;
         },
-        __wbg_reset_c0af0a71d17af46f: function(arg0, arg1, arg2) {
+        __wbg_reset_90da33f34d409d93: function(arg0, arg1, arg2) {
             arg0.reset(arg1 >>> 0, arg2);
         },
         __wbg_set_13d25b81ab403f5e: function(arg0, arg1, arg2) {
@@ -753,7 +753,7 @@ function __wbg_get_imports() {
             const ret = arg0.value;
             return ret;
         },
-        __wbg_write_34afb8e3d5faa499: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+        __wbg_write_547073654f2516dc: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg0.write(arg1 >>> 0, getArrayU8FromWasm0(arg2, arg3));
             return ret;
         }, arguments); },
