@@ -28,7 +28,7 @@ use crate::webtransport::WebTransportContext;
 use crate::{QuicBindError, WebTransportCertificateError};
 
 /// The Noise context new WebTransport connections take, swapped in place.
-type SharedContext = Arc<RwLock<Arc<WebTransportContext>>>;
+pub(crate) type SharedContext = Arc<RwLock<Arc<WebTransportContext>>>;
 
 /// A WebTransport listener's certificate state.
 pub(crate) struct Certificates {
@@ -102,12 +102,10 @@ impl Certificates {
         &self.advertised
     }
 
-    /// The context a new WebTransport connection authenticates with.
-    pub(crate) fn context(&self) -> Arc<WebTransportContext> {
-        match self.context.read() {
-            Ok(current) => Arc::clone(&current),
-            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
-        }
+    /// The cell a new WebTransport connection reads its context from, once
+    /// its TLS handshake is done (see [`current_context`]).
+    pub(crate) fn context(&self) -> SharedContext {
+        Arc::clone(&self.context)
     }
 
     /// A handle that replaces a provided certificate; `None` for a derived
@@ -195,15 +193,25 @@ impl WebTransportCertificateHandle {
         chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<(), WebTransportCertificateError> {
-        let keypair = self.context.read().map_or_else(
-            |poisoned| poisoned.into_inner().keypair.clone(),
-            |current| current.keypair.clone(),
-        );
+        // Held across the swap: concurrent replaces take turns, so the
+        // certificate and the hashes Noise lists never come from two of them.
+        let mut current = self
+            .context
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let unix = self.tls.now().as_secs();
-        let (certificate, context) = load_provided(&self.tls, &keypair, chain, key, unix)
-            .map_err(WebTransportCertificateError::Invalid)?;
+        let (certificate, mut context) =
+            load_provided(&self.tls, &current.keypair, chain, key, unix)
+                .map_err(WebTransportCertificateError::Invalid)?;
+        // A handshake whose certificate resolved just before this swap reads
+        // the new context after it, so the previous leaf stays listed.
+        if let (Some(previous), Some(fresh)) =
+            (current.certhashes.first(), Arc::get_mut(&mut context))
+        {
+            fresh.certhashes.push(*previous);
+        }
         store(&self.certificate, certificate);
-        store(&self.context, context);
+        *current = context;
         Ok(())
     }
 }
@@ -241,6 +249,15 @@ fn load_provided(
         certhashes: vec![certhash(leaf)],
     });
     Ok((tls.provided_key(chain, key)?, context))
+}
+
+/// The context in `cell` now, even if a writer panicked holding it.
+pub(crate) fn current_context(cell: &SharedContext) -> Arc<WebTransportContext> {
+    Arc::clone(
+        &cell
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 /// Swaps a shared cell's value, even if a reader panicked holding it.

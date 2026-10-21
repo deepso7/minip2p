@@ -708,7 +708,8 @@ impl QuicTransport {
     ///
     /// The new chain gets bind's checks: the key matches the leaf, and the
     /// leaf has not expired by the host clock. New WebTransport handshakes
-    /// present it and Noise lists its leaf's hash; live connections keep the
+    /// present it and Noise lists its leaf's hash, then the previous leaf's
+    /// for a handshake that straddled the swap; live connections keep the
     /// certificate they were set up with. The listen addresses carry no
     /// `/certhash`, so they don't change and no `Listening` event follows.
     ///

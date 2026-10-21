@@ -6,7 +6,6 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::mem;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -23,8 +22,9 @@ use quinn_proto::{
 };
 
 use crate::diagnostics::ConnectionCounters;
+use crate::rotation::{SharedContext, current_context};
 use crate::socket::Sockets;
-use crate::webtransport::{ReadEnd, WebTransportContext, WtEvent, WtSession};
+use crate::webtransport::{ReadEnd, WtEvent, WtSession};
 
 /// TLS exporter label for the connection token both ends derive.
 const TOKEN_LABEL: &[u8] = b"minip2p quic connection token";
@@ -243,7 +243,7 @@ pub(crate) struct QuicConnection {
     counters: ConnectionCounters,
     /// Set for connections to a WebTransport-serving socket: what an `h3`
     /// handshake needs to authenticate.
-    webtransport: Option<Arc<WebTransportContext>>,
+    webtransport: Option<SharedContext>,
     /// The WebTransport session, once the handshake negotiated `h3`.
     wt: Option<WtSession>,
     /// How long an `h3` connection may take to authenticate.
@@ -274,7 +274,7 @@ impl QuicConnection {
         endpoint: ConnectionEndpoint,
         limits: &crate::QuicLimits,
         counters: ConnectionCounters,
-        webtransport: Option<Arc<WebTransportContext>>,
+        webtransport: Option<SharedContext>,
     ) -> Self {
         let next_local_bidi_stream_id = u64::from(conn.side().is_server());
         Self {
@@ -585,7 +585,9 @@ impl QuicConnection {
     /// fails before `Connected`.
     fn on_connected(&mut self, now: Instant, cx: &mut Cx<'_>) {
         if self.negotiated_alpn().as_deref() == Some(crate::tls::H3_ALPN) {
-            let Some(context) = self.webtransport.clone() else {
+            // Read now, after TLS: whatever certificate the handshake got,
+            // a context at least as new lists its hash.
+            let Some(context) = self.webtransport.as_ref().map(current_context) else {
                 self.fail_connection(
                     now,
                     "h3 on a socket that does not serve WebTransport".into(),

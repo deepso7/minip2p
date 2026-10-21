@@ -1041,6 +1041,13 @@ fn a_replaced_certificate_serves_new_handshakes_and_keeps_live_connections() {
         &pinned_to(LOCALHOST, addr.clone()),
     );
     dial_ok(&mut server, webpki(CA, "localhost"), &addr);
+    // Noise still lists the previous leaf, for a handshake that straddled
+    // the swap: a dial pinned to both hashes needs both listed.
+    dial_ok(
+        &mut server,
+        Options::default(),
+        &pinned_to(CHAIN, pinned_to(LOCALHOST, addr.clone())),
+    );
     let reason = failed_dial_on(server, Options::default(), |addr| pinned_to(CHAIN, addr));
     assert!(reason.contains("no dialed certhash"), "{reason}");
 }
