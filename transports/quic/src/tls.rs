@@ -269,6 +269,7 @@ impl ResolvesServerCert for AlpnResolver {
 /// A node's TLS identity: its libp2p certificate and key, the crypto
 /// provider, and the host clock its verifiers read. Shared by every config it
 /// builds, so a per-dial client config costs a few `Arc` clones.
+#[derive(Clone)]
 pub(crate) struct TlsIdentity {
     provider: Arc<CryptoProvider>,
     key: Arc<CertifiedKey>,
@@ -323,6 +324,28 @@ impl TlsIdentity {
         let key = CertifiedKey::from_der(vec![CertificateDer::from(cert)], key, &self.provider)
             .map_err(|error| load_key(error.to_string()))?;
         Ok(Arc::new(key))
+    }
+
+    /// An operator's CA-signed chain and key, loaded for serving; refused if
+    /// the key does not match the leaf.
+    pub(crate) fn provided_key(
+        &self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<Arc<CertifiedKey>, String> {
+        CertifiedKey::from_der(chain, key, &self.provider)
+            .map(Arc::new)
+            .map_err(|error| match error {
+                rustls::Error::InconsistentKeys(_) => {
+                    "the private key does not match the leaf certificate".into()
+                }
+                other => format!("loading the chain and key: {other}"),
+            })
+    }
+
+    /// The host's wall clock, as the verifiers read it.
+    pub(crate) fn now(&self) -> Duration {
+        self.time.now()
     }
 
     /// The config of a libp2p-only listening socket: TLS 1.3, ALPN

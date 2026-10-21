@@ -58,6 +58,16 @@ sudo minip2p-relay service restart
 
 `sudo minip2p-relay service uninstall` removes the unit but preserves the identity in `/var/lib/minip2p-relay`.
 
+### Serve browsers
+
+Add `--webtransport` to `service install` or the foreground command to serve browsers on the QUIC port. The relay serves self-signed certificates derived from its key, rotating each 13-day Certificate period, and logs the address a browser dials, Certhash included:
+
+```text
+[relay] webtransport=/ip4/…/udp/19876/quic-v1/webtransport/certhash/u…/p2p/12D3KooW…
+```
+
+The address survives restarts with the same key, but goes stale within about 26 days, so browsers must keep getting the current one from the logs. For one permanent `/dns/relay.example.com/…/webtransport` address, give the relay a CA-signed certificate: see [Stable browser addresses](/rust/webtransport-certificates).
+
 ### Run it in the foreground
 
 For a terminal session instead of systemd:

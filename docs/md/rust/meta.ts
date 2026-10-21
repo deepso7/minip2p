@@ -15,6 +15,7 @@ export default defineMeta({
     "discover-peers",
     "traverse-nat",
     "host-a-relay",
+    "webtransport-certificates",
     "embedded-devices",
     "troubleshooting",
   ],

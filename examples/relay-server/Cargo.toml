@@ -25,6 +25,8 @@ minip2p = { package = "minip2p-rs", path = "../../crates/minip2p", features = [
   "tcp",
 ] }
 minip2p-example-common = { path = "../common" }
+minip2p-tls = { path = "../../crates/tls" }
+rustls-pki-types = "1.15.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

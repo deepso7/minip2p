@@ -13,6 +13,7 @@ use der::{Decode, Encode, Reader, SliceReader};
 use minip2p_identity::{KeyType, PeerId, PublicKey};
 use x509_cert::Certificate;
 use x509_cert::ext::Extension;
+use x509_cert::time::Validity;
 
 use crate::{LIBP2P_EXTENSION_OID, SIGNATURE_PREFIX, TlsError};
 
@@ -93,6 +94,16 @@ pub fn certificate_spki(cert_der: &[u8]) -> Result<Vec<u8>, TlsError> {
         .subject_public_key_info()
         .to_der()
         .map_err(|e| TlsError::Der(format!("{e}")))
+}
+
+/// Returns a DER-encoded X.509 certificate's validity window, **without
+/// verifying anything**.
+///
+/// For any certificate, not only libp2p ones: a transport checks a
+/// CA-signed certificate it was handed has not expired before serving it.
+pub fn certificate_validity(cert_der: &[u8]) -> Result<Validity, TlsError> {
+    let cert = Certificate::from_der(cert_der).map_err(|e| TlsError::Der(format!("{e}")))?;
+    Ok(*cert.tbs_certificate().validity())
 }
 
 /// Returns the `PeerId` a libp2p certificate's extension names, **without

@@ -1,5 +1,6 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use minip2p::{Multiaddr, RateLimit, RelayServerConfig};
 
@@ -14,7 +15,18 @@ pub struct Options {
     pub accepting: bool,
     /// Also serve WebTransport (browsers) on every QUIC socket.
     pub webtransport: bool,
+    /// A CA-signed WebTransport certificate's chain and key PEM files.
+    pub webtransport_certificate: Option<CertificatePaths>,
+    /// How often to check the certificate files for a renewal.
+    pub webtransport_reload_interval: Duration,
     pub config: RelayServerConfig,
+}
+
+/// `--webtransport-cert` and `--webtransport-key`, which come as a pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CertificatePaths {
+    pub chain: PathBuf,
+    pub key: PathBuf,
 }
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
@@ -25,8 +37,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         announce_addrs: Vec::new(),
         accepting: true,
         webtransport: false,
+        webtransport_certificate: None,
+        webtransport_reload_interval: Duration::from_secs(30),
         config: RelayServerConfig::default(),
     };
+    let (mut certificate, mut key) = (None, None);
     let mut args = args.into_iter().collect::<Vec<_>>().into_iter();
     while let Some(flag) = args.next() {
         let value = |args: &mut std::vec::IntoIter<String>| next_value(&flag, args);
@@ -42,6 +57,12 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             ),
             "--paused" => options.accepting = false,
             "--webtransport" => options.webtransport = true,
+            "--webtransport-cert" => certificate = Some(value(&mut args)?.into()),
+            "--webtransport-key" => key = Some(value(&mut args)?.into()),
+            "--webtransport-reload-secs" => {
+                options.webtransport_reload_interval =
+                    Duration::from_secs(number(&flag, value(&mut args)?)?)
+            }
             "--max-reservations" => {
                 options.config.max_reservations = number(&flag, value(&mut args)?)?
             }
@@ -93,6 +114,14 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             _ => return Err(format!("unknown option {flag}\n\n{}", usage())),
         }
     }
+    options.webtransport_certificate = match (certificate, key) {
+        (Some(chain), Some(key)) => Some(CertificatePaths { chain, key }),
+        (None, None) => None,
+        _ => {
+            return Err("--webtransport-cert and --webtransport-key must be given together".into());
+        }
+    };
+    options.webtransport |= options.webtransport_certificate.is_some();
     if options.quic_binds.len() > 2 {
         return Err("--quic accepts at most one IPv4 and one IPv6 address".into());
     }
@@ -145,7 +174,7 @@ fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
 }
 
 pub fn usage() -> &'static str {
-    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic HOST:PORT               exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp HOST:PORT                exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable; WebTransport ones need their /certhash)\n--webtransport                 also serve WebTransport (browsers) on the QUIC port\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--max-reservations-per-ip N    reservations per IPv4 address or IPv6 /64\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuits-per-ip N        circuits per IPv4 address or IPv6 /64\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n--max-rate-limit-entries N     keys each rate limiter tracks\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME\n  minip2p-relay service status | logs | restart | uninstall"
+    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic HOST:PORT               exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp HOST:PORT                exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable; WebTransport ones need their /certhash without --webtransport-cert, and none with it)\n--webtransport                 also serve WebTransport (browsers) on the QUIC port\n--webtransport-cert PATH       CA-signed WebTransport certificate chain (PEM); implies --webtransport\n--webtransport-key PATH        the --webtransport-cert private key (PEM); required with it\n--webtransport-reload-secs N   how often to check both files and serve a renewed certificate (default 30)\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--max-reservations-per-ip N    reservations per IPv4 address or IPv6 /64\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuits-per-ip N        circuits per IPv4 address or IPv6 /64\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n--max-rate-limit-entries N     keys each rate limiter tracks\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME [--webtransport] [--webtransport-cert PATH --webtransport-key PATH]\n  minip2p-relay service status | logs | restart | uninstall"
 }
 
 #[cfg(test)]
@@ -161,6 +190,7 @@ mod tests {
         assert!(options.key_path.is_none());
         assert!(options.announce_addrs.is_empty());
         assert!(!options.webtransport);
+        assert!(options.webtransport_certificate.is_none());
         assert_eq!(options.config, RelayServerConfig::default());
     }
 
@@ -251,5 +281,32 @@ mod tests {
             })
         );
         assert_eq!(options.config.circuit_rate_limit_per_ip, None);
+    }
+
+    #[test]
+    fn a_webtransport_certificate_implies_webtransport() {
+        let options = parse([
+            "--webtransport-cert".into(),
+            "fullchain.pem".into(),
+            "--webtransport-key".into(),
+            "privkey.pem".into(),
+        ])
+        .unwrap();
+        assert!(options.webtransport);
+        assert_eq!(
+            options.webtransport_certificate,
+            Some(CertificatePaths {
+                chain: "fullchain.pem".into(),
+                key: "privkey.pem".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_webtransport_certificate_needs_its_key_and_vice_versa() {
+        for flag in ["--webtransport-cert", "--webtransport-key"] {
+            let error = parse([flag.into(), "file.pem".into()]).unwrap_err();
+            assert!(error.contains("must be given together"), "{error}");
+        }
     }
 }

@@ -1,0 +1,155 @@
+---
+title: Stable browser addresses
+description: Serve browsers a permanent relay address with a CA-signed WebTransport certificate that renews itself.
+---
+
+Browsers reach a relay over WebTransport. This guide gives the relay a Let's Encrypt certificate so browsers dial one permanent `/dns` address, and sets up certbot so renewals reach the running relay without a restart.
+
+## Why a CA certificate
+
+With `--webtransport` alone, the relay serves self-signed certificates derived from its key. Each lasts one 13-day Certificate period and the relay rotates to the next one in-process. Its address carries the Certhashes of the current and next period, so a copied or hardcoded address stops dialing within about 26 days.
+
+In CA certificate mode the relay serves a certificate for your domain instead. Browsers check it like any HTTPS page, the address carries no Certhash, and it never changes.
+
+|  | Self-signed (`--webtransport`) | CA certificate (`--webtransport-cert`) |
+| --- | --- | --- |
+| Address | IP plus certhashes; stale within about 26 days | `/dns/<domain>/…/webtransport/p2p/…`; permanent |
+| Renewal | Automatic, in-process, every 13 days | certbot renews; the relay reloads the files live |
+| Browser checks | The certificate's hash matches the address's hash | The CA chain and the domain name, as for HTTPS |
+| Needs | Nothing | A domain, DNS records, certbot |
+
+## Prerequisites
+
+- A relay host [installed with the service command](/rust/host-a-relay), or about to be.
+- A domain, here `relay.example.com`, with `A` and `AAAA` records pointing at the host. With Cloudflare, keep them DNS-only.
+- Inbound UDP port `19876` open (TCP `19876` too, for the TCP transport).
+- Inbound TCP port `80` for certbot's HTTP-01 challenge, or a DNS-01 certbot plugin for your DNS provider to avoid the port.
+- certbot, with its renewal timer running.
+
+## Set it up
+
+<Steps>
+  <Step title="Create the certificate directory">
+
+    Create the group and the root-owned directory the deploy hook installs into. `service install` reuses an existing group. The relay's state directory is writable by the service, so it can't hold the certificate.
+
+    ```bash
+    sudo groupadd --system --force minip2p-relay
+    sudo install -d -o root -g minip2p-relay -m 0750 /etc/minip2p-relay/tls
+    ```
+
+  </Step>
+  <Step title="Install the deploy hook">
+
+    Save this as `/usr/local/sbin/minip2p-relay-cert-hook`, owned by root, mode `0755`. It copies the renewed files under temporary names, then moves them into place, so the relay never reads a half-written file:
+
+    ```sh
+    #!/bin/sh
+    set -eu
+    [ "${RENEWED_LINEAGE:-}" = /etc/letsencrypt/live/relay.example.com ] || exit 0
+    dir=/etc/minip2p-relay/tls
+    for file in fullchain.pem privkey.pem; do
+      install -o root -g minip2p-relay -m 0640 "$RENEWED_LINEAGE/$file" "$dir/.$file.tmp"
+      mv "$dir/.$file.tmp" "$dir/$file"
+    done
+    ```
+
+    The relay picks the files up within about a minute, so the hook doesn't restart it.
+
+  </Step>
+  <Step title="Issue the certificate">
+
+    Certbot runs the hook now and saves it for every renewal:
+
+    ```bash
+    sudo certbot certonly --standalone -d relay.example.com --key-type ecdsa \
+      --deploy-hook /usr/local/sbin/minip2p-relay-cert-hook
+    ```
+
+    Confirm that `/etc/minip2p-relay/tls/fullchain.pem` and `privkey.pem` exist.
+
+  </Step>
+  <Step title="Install the service with the certificate">
+
+    The unit adds `--webtransport` and announces `/dns/relay.example.com/udp/19876/quic-v1/webtransport`:
+
+    ```bash
+    sudo minip2p-relay service install --hostname relay.example.com \
+      --webtransport-cert /etc/minip2p-relay/tls/fullchain.pem \
+      --webtransport-key /etc/minip2p-relay/tls/privkey.pem
+    ```
+
+    `minip2p-relay service logs` shows the address and the leaf's expiry:
+
+    ```text
+    [relay] webtransport=/dns/relay.example.com/udp/19876/quic-v1/webtransport/p2p/12D3KooW…
+    [relay] webtransport_certificate_not_after=…
+    ```
+
+  </Step>
+  <Step title="Check renewal end to end">
+
+    Force one renewal:
+
+    ```bash
+    sudo certbot renew --cert-name relay.example.com --force-renewal
+    ```
+
+    Within a minute, `minip2p-relay service logs` shows `[relay] webtransport certificate reloaded not_after=…` with the new date. The relay keeps running, with its reservations and circuits.
+
+  </Step>
+</Steps>
+
+Hardcode the `webtransport=` address in the page. [`@minip2p/web`](/typescript/setup-web) dials it with the browser's normal certificate checks:
+
+```text
+/dns/relay.example.com/udp/19876/quic-v1/webtransport/p2p/12D3KooW…
+```
+
+On a relay run in the foreground, pass the same files with `--webtransport-cert PATH --webtransport-key PATH` (they imply `--webtransport`) and announce the address yourself with `--announce /dns/relay.example.com/udp/19876/quic-v1/webtransport`.
+
+## How auto-renewal works
+
+1. certbot's timer renews the certificate when it nears expiry and runs the deploy hook.
+2. The hook moves the new `fullchain.pem` and `privkey.pem` into `/etc/minip2p-relay/tls`.
+3. The relay checks both files' modification times every 30 seconds (`--webtransport-reload-secs`), loads the new pair, and serves it to new connections. Live connections keep theirs, so reservations and circuits survive.
+
+If the new files don't load (unreadable, a key that doesn't match the leaf, an expired leaf), the relay logs why on stderr and keeps serving the previous certificate until either file changes again.
+
+Let's Encrypt no longer emails expiry notices, so alert on the relay's own warning. At startup, after each reload, and then daily, it logs this once the leaf has fewer than 14 days left:
+
+```text
+[relay] warning: the WebTransport certificate expires in N days (not_after=…); renew it
+```
+
+## Embed it without the relay binary
+
+Any Rust node with a domain can serve a CA-signed certificate. Pass the PEM chain (leaf first) and its key to the builder, and give browsers the `/dns/<domain>/udp/<port>/quic-v1/webtransport/p2p/<peer-id>` address; listen addresses carry no Certhash:
+
+```rust
+use minip2p::Endpoint;
+
+let chain = std::fs::read("/etc/minip2p-relay/tls/fullchain.pem")?;
+let key = std::fs::read("/etc/minip2p-relay/tls/privkey.pem")?;
+let mut node = Endpoint::builder()
+    .webtransport_certificate_pem(&chain, &key)?
+    .listen_on("/ip4/0.0.0.0/udp/4001/quic-v1/webtransport")?
+    .bind()?;
+
+// After a renewal, swap the certificate in without a restart.
+let chain = std::fs::read("/etc/minip2p-relay/tls/fullchain.pem")?;
+let key = std::fs::read("/etc/minip2p-relay/tls/privkey.pem")?;
+node.set_webtransport_certificate_pem(&chain, &key)?;
+```
+
+`set_webtransport_certificate_pem` serves the new certificate to new handshakes. On any error (`SetWebTransportCertificateError`) the current certificate stays in service.
+
+## Troubleshooting
+
+**An announce address is rejected for its `/certhash`.** In CA certificate mode, a WebTransport announce must not carry one: the relay refuses it with `the WebTransport certificate is CA-signed, so browsers check its chain; remove the /certhash`. Without `--webtransport-cert`, the reverse holds: it must carry the listener's `/certhash`.
+
+**The browser reports a certificate error.** The certificate names the domain, so a browser dialing the relay's IP (`/ip4/…/webtransport/p2p/…`) rejects it. Dial the `/dns/relay.example.com/…` address. If the relay logs `browsers dial the certificate's domain; add --announce …`, add that announce.
+
+**`webtransport certificate reload failed … the private key does not match the leaf certificate`.** The relay checked between the hook's two moves and saw a new chain with the old key. The second move changes the key file, so the next check loads the matching pair and logs `reloaded`. If it persists, the files in `/etc/minip2p-relay/tls` are from different issuances; force a renewal as in the last setup step.
+
+**The relay refuses to start: `the leaf certificate expired at …`.** The relay won't bind with an expired leaf. Renew with `sudo certbot renew --cert-name relay.example.com`, check that the hook updated `/etc/minip2p-relay/tls`, then run `sudo minip2p-relay service restart`. If the certificate is current, check the host clock: the message includes the time the host reads.

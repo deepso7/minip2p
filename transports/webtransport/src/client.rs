@@ -2,9 +2,11 @@
 //! [`WebTransportIo`], as a [`Transport`].
 //!
 //! A dial opens a session to the server's `/.well-known/libp2p-webtransport`
-//! URL, trusting only the certificates its address names, then runs Noise XX
-//! as initiator on the session's first stream. The server must prove the
-//! dialed peer id and list every dialed certhash in its Noise extensions;
+//! URL, trusting only the certificates its address's certhashes name or,
+//! with none, a CA-signed certificate the platform verifies (WebPKI). It
+//! then runs Noise XX as initiator on the session's first stream. The server
+//! must prove the dialed peer id and list every dialed certhash in its Noise
+//! extensions;
 //! then the Noise stream is finished and the connection is up. Every later
 //! stream is a plain libp2p stream, mapped 1:1 onto a WebTransport stream.
 
@@ -46,7 +48,7 @@ pub fn webtransport_url(addr: &Multiaddr) -> Result<String, TransportError> {
     if !addr.is_webtransport() {
         return Err(TransportError::InvalidAddress {
             context: "dial target",
-            reason: format!("{addr} is not /<host>/udp/<port>/quic-v1/webtransport/certhash/…"),
+            reason: format!("{addr} is not /<host>/udp/<port>/quic-v1/webtransport[/certhash/…]"),
         });
     }
     let (host, port) = match addr.protocols() {
@@ -75,8 +77,9 @@ pub fn webtransport_url(addr: &Multiaddr) -> Result<String, TransportError> {
 /// A libp2p WebTransport dialer over the platform's WebTransport API.
 ///
 /// Dial-only: [`listen`](Transport::listen) is unsupported (a browser cannot
-/// accept connections), and so are addresses without a `/certhash` (there
-/// is no CA-certificate mode). Connection ids come from
+/// accept connections). An address with `/certhash`es pins exactly those
+/// certificates; one without trusts a CA-signed certificate the platform
+/// verifies for the address's host. Connection ids come from
 /// [`ConnectionNamespace::WEBTRANSPORT`].
 ///
 /// It honours the full transport contract within [`WebTransportLimits`].
@@ -119,7 +122,8 @@ pub struct WebTransportClient<Io: WebTransportIo, E> {
 struct Session {
     handle: SessionHandle,
     endpoint: ConnectionEndpoint,
-    /// The dialed certhashes: the server's Noise extensions must list each.
+    /// The dialed certhashes: the server's Noise extensions must list each
+    /// (none for a CA-certificate dial, which any list satisfies).
     certhashes: Vec<Multihash>,
     /// The Noise stream and its session, until the handshake completes.
     noise_stream: Option<StreamHandle>,
@@ -908,15 +912,11 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
     fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
         if !addr.transport().is_webtransport() {
             return Err(TransportError::Unsupported {
-                operation: "dialing anything but /webtransport/certhash addresses",
+                operation: "dialing anything but /webtransport addresses",
             });
         }
+        // Empty for a CA-certificate dial: the platform verifies the chain.
         let certhashes: Vec<Multihash> = addr.transport().certhashes().copied().collect();
-        if certhashes.is_empty() {
-            return Err(TransportError::Unsupported {
-                operation: "WebTransport dials without a /certhash (CA certificates)",
-            });
-        }
         let url = webtransport_url(addr.transport())?;
         if self.connections.len() + self.unsettled.len() >= self.limits.max_connections {
             return Err(TransportError::ResourceExhausted {

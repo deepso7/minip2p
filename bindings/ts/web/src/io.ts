@@ -145,7 +145,11 @@ export class JsIo {
     this.#openSession = openSession;
   }
 
-  /** Starts a session trusting exactly the certificates `certhashes` name. */
+  /**
+   * Starts a session trusting exactly the certificates `certhashes` name or,
+   * when it is empty, a CA-signed certificate the browser verifies for the
+   * URL's host (`serverCertificateHashes` is then left out).
+   */
   connect(url: string, certhashes: Uint8Array<ArrayBuffer>[]): number {
     if (this.#disposed) {
       throw new Error("this endpoint's WebTransport I/O was disposed");
@@ -155,12 +159,17 @@ export class JsIo {
         "this browser has no WebTransport; minip2p needs a WebTransport-capable browser"
       );
     }
-    const transport = this.#openSession(url, {
-      serverCertificateHashes: certhashes.map((value) => ({
-        algorithm: "sha-256",
-        value,
-      })),
-    });
+    const transport = this.#openSession(
+      url,
+      certhashes.length === 0
+        ? {}
+        : {
+            serverCertificateHashes: certhashes.map((value) => ({
+              algorithm: "sha-256",
+              value,
+            })),
+          }
+    );
     const id = this.#nextSession;
     this.#nextSession += 1;
     const session: Session = { streams: new Set(), transport };

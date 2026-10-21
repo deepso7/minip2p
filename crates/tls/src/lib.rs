@@ -32,7 +32,9 @@ pub use error::TlsError;
 #[cfg(feature = "std")]
 pub use generate::generate_certificate;
 pub use generate::generate_certificate_with_rng;
-pub use verify::{certificate_peer_id, certificate_spki, verify_libp2p_certificate};
+pub use verify::{
+    certificate_peer_id, certificate_spki, certificate_validity, verify_libp2p_certificate,
+};
 pub use x509_cert::time::Validity;
 
 /// OID for the libp2p Public Key Extension: `1.3.6.1.4.1.53594.1.1`.

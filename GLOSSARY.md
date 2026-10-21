@@ -76,7 +76,9 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **WebTransport session**: One browser's libp2p connection carried over HTTP/3 WebTransport on a QUIC connection, authenticated by Noise rather than by TLS. A QUIC connection carries at most one. _Avoid_: WT connection, h3 connection
 
-**Certhash**: The hash of a WebTransport listener's self-signed TLS certificate, carried in its address, that lets a browser trust that certificate without a CA. A listener advertises the current and next Certificate period's hashes. _Avoid_: fingerprint, cert hash
+**Certhash** (self-signed mode only): The hash of a WebTransport listener's self-signed TLS certificate, carried in its address, that lets a browser trust that certificate without a CA. A listener advertises the current and next Certificate period's hashes. _Avoid_: fingerprint, cert hash
+
+**CA certificate mode**: A WebTransport listener that presents an operator-supplied, CA-signed certificate instead of the derived self-signed ones. Browsers check it like any HTTPS certificate, so its addresses carry no Certhash, and it never rotates; the operator renews it and swaps it in at runtime (or restarts the node). _Avoid_: Let's Encrypt mode, WebPKI mode
 
 **Certificate period**: The fixed span of time (13 days) during which a WebTransport listener presents one certificate. Each period's certificate is derived from the node's identity key, so it is the same across restarts, and a rotation happens at each period boundary. _Avoid_: rotation interval, epoch
 

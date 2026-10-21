@@ -40,8 +40,8 @@ impl core::fmt::Display for IpFamily {
     }
 }
 
-/// A mistake in the Endpoint's own options: its listen addresses and the
-/// transports they select.
+/// A mistake in the Endpoint's own options: its listen addresses, the
+/// transports they select, and what those transports present.
 ///
 /// The listen setters ([`listen_on`](super::EndpointBuilder::listen_on) and
 /// friends) return this as soon as an address is added;
@@ -106,6 +106,24 @@ pub enum EndpointOptionsError {
     /// [`CircuitLimits::validate`](crate::CircuitLimits).
     #[error(transparent)]
     InvalidLimit(InvalidLimit),
+    /// The PEM given to
+    /// [`webtransport_certificate_pem`](super::EndpointBuilder::webtransport_certificate_pem)
+    /// is unusable: no certificate, no private key, more than one key, or a
+    /// malformed section.
+    #[cfg(feature = "quic")]
+    #[error("WebTransport certificate PEM: {problem}")]
+    WebTransportCertificatePem {
+        /// What is wrong with it.
+        problem: String,
+    },
+    /// A WebTransport certificate was configured, but no listen address
+    /// would serve it.
+    #[cfg(feature = "quic")]
+    #[error(
+        "a WebTransport certificate was configured, but no listen address is \
+         `/ip4|ip6/udp/<port>/quic-v1/webtransport`; add one with EndpointBuilder::listen_on"
+    )]
+    WebTransportCertificateWithoutListener,
     /// Relay-server announce addresses were configured without enabling the
     /// relay server.
     #[cfg(feature = "relay-server")]
@@ -136,7 +154,8 @@ pub enum BindError {
     #[error("relay-server configuration: {0}")]
     RelayServer(RelayServerConfigError),
     /// A relay-server announce address does not fit this endpoint's
-    /// identity.
+    /// identity, or its `/certhash` does not fit the WebTransport
+    /// certificate mode.
     #[cfg(feature = "relay-server")]
     #[error("relay-server announce address: {0}")]
     RelayServerAnnounce(Box<RelayServerAddressError>),
