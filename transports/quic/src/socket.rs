@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 
+use bytes::BytesMut;
 use minip2p_transport::{ConnectionIdAllocator, ConnectionNamespace};
 use quinn_udp::{RecvMeta, UdpSocketState};
 
@@ -100,6 +101,24 @@ pub(crate) struct Received {
 impl Received {
     pub(crate) fn datagrams(&self) -> usize {
         datagram_count(self.len, Some(self.stride))
+    }
+
+    /// Copies each datagram out of `buf`, the buffer the slot was read into,
+    /// into an allocation of exactly its length.
+    ///
+    /// The engine keeps STREAM frames as slices of their packet, so a chunk
+    /// it buffers pins whatever allocation backs the datagram. Separate
+    /// allocations bound that to one datagram, not a whole receive call, in
+    /// the spirit of ADR 0012's retained-slice rule.
+    pub(crate) fn datagrams_in<'a>(&self, buf: &'a [u8]) -> impl Iterator<Item = BytesMut> + 'a {
+        buf.get(self.offset..self.offset + self.len)
+            .expect("UDP receive lengths fit their slots")
+            // A stride of 0 means one datagram, as in `datagram_count`.
+            .chunks(match self.stride {
+                0 => usize::MAX,
+                stride => stride,
+            })
+            .map(BytesMut::from)
     }
 }
 

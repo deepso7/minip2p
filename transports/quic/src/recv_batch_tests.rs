@@ -1,10 +1,15 @@
 //! How an established connection answers a receive batch: one service after
-//! the batch, not one per datagram, and the batch acknowledged by it.
+//! the batch, not one per datagram, and the batch acknowledged by it. Each
+//! datagram in a batch owns its allocation, so a chunk the engine buffers
+//! pins only its own.
 
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::test_peer::{RawPeer, accept, now, server_with_idle_timeout};
+use crate::test_peer::{
+    RawPeer, accept, allocation_len, drive_until, listening_server, now, server_with_idle_timeout,
+    sid, stream_bytes,
+};
 
 /// How long the peer's socket must stay empty before [`discard_raw`] stops.
 /// Some loopbacks (macOS) deliver a datagram a little after it was sent.
@@ -216,4 +221,90 @@ fn diagnostics_count_the_batch_and_the_datagrams_that_left() {
     let sockets = crate::datagram_counters(&identity).since(&sockets_before);
     assert_eq!(sockets.received, BURST as u64);
     assert_eq!(sockets.sent, discard_raw(&peer) as u64);
+}
+
+#[test]
+fn a_chunk_the_engine_buffers_pins_only_its_own_datagram() {
+    const WINDOW: usize = 1_000;
+    const JUNK: usize = 31;
+    let mut server = listening_server(QuicLimits {
+        stream_receive_window: WINDOW,
+        ..QuicLimits::default()
+    });
+    let (mut peer, id) = accept(&mut server, &mut [], |_| {});
+    let stream = peer.open();
+
+    // A window the reader leaves unacknowledged gates the stream, so what
+    // follows stays in the engine.
+    assert_eq!(peer.write(stream, &[1; WINDOW]), WINDOW);
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "window",
+        |events| stream_bytes(events, stream).len() == WINDOW,
+    );
+    std::thread::sleep(Duration::from_millis(2));
+    discard_raw(&peer);
+
+    // One stream datagram, then junk of the same size in the same burst: one
+    // receive call where the platform batches receives, and one GRO batch
+    // where it coalesces a segmented train. Where the platform does neither,
+    // each datagram has its own call and allocation anyway.
+    assert_eq!(peer.write(stream, b"marker"), 6);
+    let mut train = Vec::new();
+    let transmit = peer
+        .conn()
+        .poll_transmit(Instant::now(), 1, &mut train)
+        .expect("the marker's packet");
+    let (to, len) = (transmit.destination, transmit.size);
+    // No fixed bit: the endpoint drops these unread.
+    train.resize(len * (1 + JUNK), 0);
+    let state = quinn_udp::UdpSocketState::new((&peer.socket).into()).expect("peer state");
+    let segmented = state.max_gso_segments() > JUNK;
+    if segmented {
+        let transmit = quinn_udp::Transmit {
+            destination: to,
+            ecn: None,
+            contents: &train,
+            segment_size: Some(len),
+            src_ip: None,
+        };
+        state
+            .try_send((&peer.socket).into(), &transmit)
+            .expect("send train");
+    } else {
+        for datagram in train.chunks(len) {
+            peer.socket.send_to(datagram, to).expect("send");
+        }
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    let (calls, read) = (server.socket().recv_calls, server.socket().received);
+    server.poll(now()).expect("poll");
+    let (calls, read) = (
+        server.socket().recv_calls - calls,
+        server.socket().received - read,
+    );
+    if segmented || server.socket().recv_slots() > 1 {
+        assert!(read > calls, "{read} datagrams took {calls} receive calls");
+    }
+
+    let conn = server.connections.get_mut(&id).expect("live connection");
+    let chunk = conn
+        .engine()
+        .recv_stream(sid(stream))
+        .read(true)
+        .expect("readable")
+        .next(usize::MAX)
+        .expect("not reset")
+        .expect("the marker is buffered");
+    assert_eq!(&chunk.bytes[..], b"marker");
+    // The allocation from the chunk's start to its end: the rest of its
+    // datagram, or the rest of the whole receive call when they share one.
+    let retained = allocation_len(chunk.bytes);
+    assert!(
+        retained < len,
+        "a buffered chunk pins {retained} bytes; its datagram was {len}"
+    );
 }

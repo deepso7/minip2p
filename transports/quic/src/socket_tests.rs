@@ -230,3 +230,37 @@ fn diagnostics_report_the_granted_socket_buffers() {
         Some(granted)
     );
 }
+
+#[test]
+fn each_datagram_a_receive_call_read_owns_an_allocation_of_its_own_length() {
+    let slot = |offset, len, stride| socket::Received {
+        offset,
+        len,
+        stride,
+        from: "127.0.0.1:1".parse().expect("address"),
+        ecn: None,
+        dst_ip: None,
+    };
+    let buf: Vec<u8> = (0..=255).collect();
+    // Two single datagrams in their own slots, then a GRO batch of three
+    // 10-byte segments whose last is 4 bytes.
+    let slots = [slot(0, 7, 7), slot(64, 3, 3), slot(128, 24, 10)];
+    let datagrams: Vec<BytesMut> = slots
+        .iter()
+        .flat_map(|slot| slot.datagrams_in(&buf))
+        .collect();
+    let contents: Vec<&[u8]> = datagrams.iter().map(|d| &d[..]).collect();
+    assert_eq!(
+        contents,
+        [
+            &buf[0..7],
+            &buf[64..67],
+            &buf[128..138],
+            &buf[138..148],
+            &buf[148..152]
+        ]
+    );
+    for datagram in datagrams {
+        assert_eq!(datagram.capacity(), datagram.len(), "exactly sized");
+    }
+}
