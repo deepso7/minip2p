@@ -94,8 +94,17 @@ docker run -d --name "$name" --network none --memory 6g \
   # `head` ends as soon as it hits the cap, even while `docker logs` waits
   # for more output that a pipe would only notice on its next write.
   head -c "$log_max_bytes" < <(docker logs -f "$name" 2>&1) > "$work/bench.log"
+  # Below the cap, the stream normally ends because the container exited. If
+  # the container is still running a few seconds later, `docker logs` itself
+  # failed; stop the run rather than wait unwatched for the job timeout.
   if (($(stat -c %s "$work/bench.log") >= log_max_bytes)); then
     timeout 20 docker kill "$name" >/dev/null 2>&1 || true
+  else
+    sleep 5
+    if [[ "$(timeout 20 docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" == true ]]; then
+      : > "$work/log-stopped"
+      timeout 20 docker kill "$name" >/dev/null 2>&1 || true
+    fi
   fi
 } &
 logs_pid=$!
@@ -108,6 +117,7 @@ fi
 
 (($(stat -c %s "$work/bench.log") < log_max_bytes)) \
   || reject "container log reached $((log_max_bytes / 1024 / 1024)) MB"
+[[ ! -e "$work/log-stopped" ]] || reject "the container log stopped before the container did"
 
 exit_code=$(< "$work/exit-code")
 if [[ "$exit_code" != 0 ]]; then
