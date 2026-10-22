@@ -1,6 +1,8 @@
 # QUIC admission through memory reservations
 
 > Partly superseded by ADR 0022: the memory budget, memory reservations and the window defaults sized for them are gone. `max_connections` across sockets, Retry, the windows as `QuicLimits` fields and the Apple fast-path exception stand.
+>
+> **Amended by #387**: the shared-allocation exception in Consequences is resolved. Each received datagram is copied into an allocation of its own length, so a stream chunk the engine buffers pins only its own datagram, not the rest of its receive call.
 
 Supplements ADR 0012. ADR 0012 bounds received data per transport by connection limit × stream limit × stream window, but QUIC's numbers made that bound meaningless: `max_connections` (1024) counted per socket, so dual-stack allowed 2048, and each connection could commit an 8 MiB pending-send queue, a 10 MB engine send buffer, a 10 MB connection receive window and up to 128 peer streams of 1 MB each, about 284 MB per connection (#243). We decided:
 

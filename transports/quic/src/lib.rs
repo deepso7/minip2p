@@ -831,17 +831,20 @@ impl QuicTransport {
     /// call's worth.
     fn recv_batch(&mut self, now: Instant, index: usize) -> Result<(), TransportError> {
         let mut slots = std::mem::take(&mut self.recv_slots);
-        let result = self.recv_into(now, index, &mut slots);
+        let mut recv_buf = std::mem::take(&mut self.recv_buf);
+        let result = self.recv_into(now, index, &mut recv_buf, &mut slots);
         self.recv_slots = slots;
+        self.recv_buf = recv_buf;
         result
     }
 
-    /// [`Self::recv_batch`], with `slots` as scratch for what each receive
-    /// call filled.
+    /// [`Self::recv_batch`], reading into `recv_buf`, with `slots` as scratch
+    /// for what each receive call filled.
     fn recv_into(
         &mut self,
         now: Instant,
         index: usize,
+        recv_buf: &mut [u8],
         slots: &mut Vec<Received>,
     ) -> Result<(), TransportError> {
         let mut datagrams = 0;
@@ -855,7 +858,6 @@ impl QuicTransport {
             // Windows mio only re-arms readiness when it sees the
             // `WouldBlock` itself, and a receive on the original socket would
             // hide it, leaving later datagrams with no wakeup.
-            let recv_buf = &mut self.recv_buf;
             let read = match self.registered.get(index) {
                 Some(registered) => registered
                     .try_io(|| {
@@ -885,21 +887,9 @@ impl QuicTransport {
                     return Err(TransportError::io("receiving UDP datagrams", &e));
                 }
             }
-            // One allocation per receive call, whatever it read; each
-            // datagram is a slice of it.
-            let mut data = BytesMut::with_capacity(slots.iter().map(|slot| slot.len).sum());
-            for slot in slots.iter() {
-                data.extend_from_slice(
-                    self.recv_buf
-                        .get(slot.offset..slot.offset + slot.len)
-                        .expect("UDP receive lengths fit their slots"),
-                );
-            }
             for slot in slots.iter() {
                 datagrams += slot.datagrams();
-                let mut rest = data.split_to(slot.len);
-                while !rest.is_empty() {
-                    let datagram = rest.split_to(slot.stride.min(rest.len()));
+                for datagram in slot.datagrams_in(recv_buf) {
                     self.handle_datagram(now, index, slot, datagram);
                 }
             }
