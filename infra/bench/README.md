@@ -43,18 +43,24 @@ The OIDC role `minip2p-github-bench` is created once by hand with a maximum sess
 ```json
 {
   "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {"Federated": "arn:aws:iam::AWS_ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"},
-    "Action": "sts:AssumeRoleWithWebIdentity",
-    "Condition": {"StringEquals": {
-      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-      "token.actions.githubusercontent.com:sub": [
-        "repo:deepso7/minip2p:environment:aws-bench",
-        "repo:deepso7/minip2p:environment:aws-bench-keepalive"
-      ]
-    }}
-  }]
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::AWS_ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": [
+            "repo:deepso7/minip2p:environment:aws-bench",
+            "repo:deepso7/minip2p:environment:aws-bench-keepalive"
+          ]
+        }
+      }
+    }
+  ]
 }
 ```
 

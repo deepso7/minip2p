@@ -82,4 +82,8 @@ write_files:
       ./svc.sh start
 
 runcmd:
-  - [bash, -c, "/root/minip2p-bench-setup.sh && rm -f /root/minip2p-bench-setup.sh"]
+  - [
+      bash,
+      -c,
+      "/root/minip2p-bench-setup.sh && rm -f /root/minip2p-bench-setup.sh",
+    ]

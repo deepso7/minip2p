@@ -57,6 +57,7 @@ GitHub (pull_request_target / release / workflow_dispatch / weekly schedule)
 - **Instance-initiated shutdown behaviour:** `stop`, so a poweroff from inside stops (not terminates) the instance and keeps the disk.
 
 Cost, at us-east-1 on-demand ($0.205/h for c7a.xlarge):
+
 - about 40 minutes per run, including boot and the idle tail, which is about $0.15;
 - storage, about $6.40/month for the 80 GB gp3 volume;
 - the public IPv4 address, billed only while the instance runs.
@@ -75,6 +76,7 @@ Run once by the maintainer with administrator credentials; idempotent. It:
    - installs the runner as a systemd service, the job-start hook, the idle watchdog, and the prune settings.
 
    These steps run once per instance (cloud-init's `scripts-user` semantics), so later boots don't re-apply them. Cloud-init stays enabled, since disabling it buys nothing.
+
 3. Prints the instance ID for the maintainer to store as the `AWS_BENCH_INSTANCE_ID` variable on the `aws-bench` environment.
 4. Replaces the CI role `minip2p-github-bench`'s inline policy with exactly:
    - `ec2:StartInstances` on `arn:aws:ec2:us-east-1:<account>:instance/<id>`;
@@ -94,11 +96,13 @@ Run once by the maintainer with administrator credentials; idempotent. It:
     - `release` with `…/bench.yml@refs/tags/v*`.
 
   The hook is the first pre-job step: the runner adds it ahead of container-action builds and job containers (`JobExtension.InitializeJob`), so nothing a workflow controls has run yet. To reject a job it does not just exit non-zero. A failed hook marks the job failed, but the runner still evaluates later steps' conditions, so an `if: always()` step would run as the `runner` user, which is in `docker` and therefore root. Instead the hook walks its parent chain to the `Runner.Worker` process, sends it `SIGKILL`, and exits. The listener reports the job as failed and takes the next one. A fork PR whose workflow targets the `minip2p-bench` label runs under `pull_request` with a `refs/pull/N/merge` ref, so it is killed this way even if a maintainer approved the run and it lands while the instance is up. After the checks pass, the hook removes leftover `bench-*` containers and images (bounded with `timeout`), prunes the BuildKit cache to 40 GB, and fails if less than 15 GB is free.
+
 - **Lease and idle watchdog.** Before every start, `start-runner` sets the instance tag `bench-lease-until` to now + 20 minutes. That is long enough for the instance to boot and the runner to collect the queued job. A systemd timer runs every minute and powers the instance off when either:
   - it has been up at least 10 minutes, the lease has expired (read from instance metadata tags; a missing, malformed, or more-than-30-minutes-ahead value counts as expired, so no tag value can pin the instance on), and no `Runner.Worker` process has existed for 10 consecutive minutes; or
   - the current `Runner.Worker` process is older than 120 minutes. That is a stuck job, since the job timeout is 90 minutes. The bound is per job and resets with each new worker, so a busy day of back-to-back PRs never cuts a job short.
 
   The lease narrows the hand-off race to almost nothing, but cannot close it. A watchdog that read the old lease a moment before `start-runner` set the new one can still power off. Poweroff is asynchronous, and both the EC2 API and IMDS tags are eventually consistent, so `start-runner` cannot reliably detect that. This is accepted as a rare, manual-retry failure (see Failure modes) rather than adding a shutdown handshake. The idle rule covers normal completion, a cancelled run, and a start whose job never came. A job-completed hook is not used to power off, because it runs before GitHub has recorded the job's completion.
+
 - **Docker** is rootful, with the default seccomp profile and the default bridge for build steps. The runner user being in `docker` is root-equivalent on the instance. That is acceptable because the instance holds nothing and is replaceable.
 
 ### Workflow changes (`.github/workflows/bench.yml`)
@@ -107,6 +111,7 @@ Run once by the maintainer with administrator credentials; idempotent. It:
 - **Keepalive environment:** a second environment, `aws-bench-keepalive`, with **no** required reviewers and deployment restricted to `main`, so the weekly start never waits for a human. It gets the same `AWS_BENCH_ROLE_ARN` and `AWS_BENCH_INSTANCE_ID` variables. It can only start the instance and run trusted code from `main`, which a writer could do anyway. `start-runner` picks it with `environment: ${{ github.event_name == 'schedule' && 'aws-bench-keepalive' || 'aws-bench' }}`.
 
   GitHub can drop a scheduled run, and it disables schedules on public repos after 60 days without activity, so the keepalive keeps the runner registered only while those hold. The job-start hook logs each job, and the README's recovery for "no runner online" is `bootstrap.sh --replace`, which creates a fresh, freshly registered instance (one cold build afterwards).
+
 - **`start-runner`** (new) runs on `ubuntu-latest` with the environment above and `permissions: id-token: write, contents: read`. Its `if:` is today's `aws-bench` job's, plus `|| github.event_name == 'schedule'`. It assumes the role with `configure-aws-credentials` and runs the trusted `scripts/start-bench-runner.sh`. That script sets the lease tag, then loops for up to 10 minutes, rechecking state on every pass. It never waits for a transient state that a concurrent starter might already have moved past:
   - `stopped`: call `start-instances`, retrying `InsufficientInstanceCapacity` and `IncorrectInstanceState` with backoff;
   - `stopping`, `pending`, or `shutting-down`: sleep 10 s and recheck;
@@ -119,6 +124,7 @@ Run once by the maintainer with administrator credentials; idempotent. It:
   Re-running a failed bench means **Re-run all jobs**. "Re-run failed jobs" or re-running only `bench` keeps the earlier `start-runner` result: it neither wakes a stopped instance nor asks for approval again. Under the trust boundary only writers can re-run, so the missing approval is acceptable, but the job may sit queued. The README and the failure comment say to re-run all jobs.
 
   Both checkouts stay the same: trusted scripts and Dockerfile from the base, measured code in `bench-source/`. `configure-aws-credentials`, `amazon-ecr-login`, `setup-buildx-action`, `build-push-action`, and the gha cache are removed.
+
 - **`keepalive`** (new): `needs: start-runner`, the same `runs-on`, `if: github.event_name == 'schedule'`, and one `run: true` step.
 - **Measure** runs `exec scripts/run-bench-container.sh` from the trusted checkout. `exec` makes the helper the step's own process, so the runner's cancellation signals reach its traps. The helper:
   1. builds the image with `docker build` (local BuildKit cache) from the trusted `infra/bench/Dockerfile` and the chosen context, tagged `bench-<run_id>-<attempt>`, with `--build-arg BUILD_JOBS=4`. A `release` event adds `--no-cache`, so a baseline never reuses layers a PR build produced;
@@ -171,6 +177,7 @@ Until the next stable release writes the first new baseline, `compare` takes its
 ### Retiring Fargate
 
 In the same PR, delete `scripts/run-aws-bench-task.sh` and `infra/bench/task-definition.json`. `bootstrap.sh` is rewritten rather than deleted. Until teardown, rollback is:
+
 1. revert the PR;
 2. re-run the old `bootstrap.sh` from the reverted tree to restore the CI role's ECS permissions;
 3. restore the `bench-data` pointers.
@@ -195,6 +202,7 @@ After two weeks of healthy runs, as a separate step the maintainer approves, del
    Then remove the allowance.
 
    Hostile-workflow check: push a throwaway branch whose own workflow runs on `minip2p-bench` under `workflow_dispatch`, with a step `if: always()` that writes `/tmp/hook-bypass`. Dispatch it while the instance is up. The hook must kill the worker, and `/tmp/hook-bypass` must not exist afterwards. Then delete the branch.
+
 7. **Cancellation.** During an Actions run, cancel from the UI. `docker ps -a` on the instance must show no `bench-*` container within 10 s, and the instance must stop within the watchdog window. Repeat with a throwaway container that ignores `SIGTERM`.
 8. **Cutover** as in Baseline continuity: cancel old runs, reset both pointers, merge. PR comments then show no-baseline results.
 9. **First release** writes the new baseline. The next PR compares cleanly.
