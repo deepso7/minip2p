@@ -88,7 +88,16 @@ docker run -d --name "$name" --network none --memory 6g \
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
   -e BENCH_GIT_SHA -e BENCH_SWEEP \
   --entrypoint bash "$name" -c "$(< scripts/run-container-benches.sh)" >/dev/null
-docker logs -f "$name" 2>&1 | head -c "$log_max_bytes" > "$work/bench.log" &
+# The follower stops the container once its log reaches the cap, so a
+# runaway run ends here instead of at the job timeout.
+{
+  # `head` ends as soon as it hits the cap, even while `docker logs` waits
+  # for more output that a pipe would only notice on its next write.
+  head -c "$log_max_bytes" < <(docker logs -f "$name" 2>&1) > "$work/bench.log"
+  if (($(stat -c %s "$work/bench.log") >= log_max_bytes)); then
+    timeout 20 docker kill "$name" >/dev/null 2>&1 || true
+  fi
+} &
 logs_pid=$!
 docker wait "$name" > "$work/exit-code" &
 wait $!
@@ -109,18 +118,22 @@ fi
 
 marker=MINIP2P_BENCH_RESULTS
 [[ -n "$BENCH_SWEEP" ]] && marker=MINIP2P_SWEEP_RESULTS
-encoded=$(sed -n "/^$marker=/{s///p;q}" "$work/bench.log")
-[[ -n "$encoded" ]] || reject "$marker marker missing from the container log"
+# Base64 of the largest accepted result, plus slack; a longer marker is
+# rejected rather than decoded.
+encoded_max=$((max_bytes / 3 * 4 + 1024))
+sed -n "/^$marker=/{s///p;q}" "$work/bench.log" | head -c "$encoded_max" > "$work/encoded"
+[[ -s "$work/encoded" ]] || reject "$marker marker missing from the container log"
+(($(stat -c %s "$work/encoded") < encoded_max)) || reject "$marker marker is larger than 50 MB"
 
 # Decode into the quarantine, never more than the size limit (`head -c` also
 # bounds a gzip bomb before tar writes it out), and check it before anything
 # reaches the artifact.
 if [[ -n "$BENCH_SWEEP" ]]; then
-  printf '%s' "$encoded" | base64 -d | gzip -dc | head -c "$((max_bytes + 1))" \
+  base64 -d "$work/encoded" | gzip -dc | head -c "$((max_bytes + 1))" \
     | tar -xf - --no-same-owner --no-same-permissions -C "$quarantine" \
     || reject "sweep archive is malformed or larger than 50 MB"
 else
-  printf '%s' "$encoded" | base64 -d | head -c "$((max_bytes + 1))" \
+  base64 -d "$work/encoded" | head -c "$((max_bytes + 1))" \
     > "$quarantine/current.json" || reject "result marker is not valid base64"
 fi
 [[ -z "$(find "$quarantine" ! -type f ! -type d)" ]] \
