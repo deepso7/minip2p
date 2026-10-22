@@ -1359,6 +1359,8 @@ impl NatAgent {
                 now,
             );
         }
+        // Attempts first: a path an attempt records wins over an inbound
+        // machine's inference that the connection is a punch.
         for circuit in self.inbound.values_mut() {
             circuit.on_connection_established(
                 peer,

@@ -8,7 +8,7 @@ use minip2p_swarm::ConnectionCloseReason;
 use minip2p_core::PeerAddr;
 use minip2p_core::{Multiaddr, Protocol};
 use minip2p_nat::{
-    DCUTR_PROTOCOL_ID, MAX_PUNCH_CANDIDATES, NatConfig, NatEvent, Path, STOP_PROTOCOL_ID,
+    DCUTR_PROTOCOL_ID, Deadline, MAX_PUNCH_CANDIDATES, NatConfig, NatEvent, Path, STOP_PROTOCOL_ID,
 };
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
@@ -847,4 +847,234 @@ fn a_reply_after_the_upgrade_budget_ends_coordination() {
     assert_eq!(send_stream_count(&actions), 0, "no SYNC");
     assert_eq!(blast_count(&actions), 0);
     assert!(h.agent.is_idle());
+}
+
+/// Upgrade budget for the passive-attribution tests: Relayed at t=11, so the
+/// deadline is t=1_011. One round answered at t=20 (7 ms RTT) blasts from
+/// t=24 and its punch window ends at t=124.
+fn passive_budget() -> NatConfig {
+    NatConfig {
+        upgrade_timeout_ms: 1_000,
+        punch_deadline_ms: 100,
+        ..NatConfig::default()
+    }
+}
+const PASSIVE_DEADLINE: u64 = 1_011;
+
+/// Drives an inbound circuit through one completed DCUtR round and returns
+/// the circuit.
+fn complete_a_round(h: &mut Harness) -> ConnectionId {
+    let (circuit, actions) = drive_to_relayed(h);
+    let stream = open_dcutr(h, circuit, &actions);
+    answer_dcutr_at(h, circuit, stream, &["/ip4/8.8.8.8/udp/4001/quic-v1"], 20);
+    drain_actions(&mut h.agent);
+    circuit
+}
+
+fn replace(h: &mut Harness, old: ConnectionId, new: ConnectionId, is_circuit: bool, t: u64) {
+    let target = h.target.clone();
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: target,
+            old,
+            new,
+        },
+        is_circuit,
+        at(t),
+    );
+}
+
+fn upgrade_count(events: &[NatEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                NatEvent::InboundDirectUpgrade { .. } | NatEvent::PathUpgraded { .. }
+            )
+        })
+        .count()
+}
+
+/// Both of the dialer's punches land: the second replaces the first after
+/// this side's punch window ended. Both are punches, announced once.
+#[test]
+fn a_second_inbound_punch_replacing_the_first_is_punched() {
+    let mut h = inbound_harness(passive_budget());
+    let circuit = complete_a_round(&mut h);
+    let (a, b) = (ConnectionId::new(70), ConnectionId::new(71));
+
+    replace(&mut h, circuit, a, false, 30);
+    assert!(h.agent.is_punched(a));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::InboundDirectUpgrade { old_conn_id, new_conn_id, .. }]
+            if *old_conn_id == circuit && *new_conn_id == a
+    ));
+
+    // Past the round's window (t=124), inside the upgrade budget.
+    h.agent.handle_tick(at(200));
+    replace(&mut h, a, b, false, 500);
+    assert!(h.agent.is_punched(b));
+    assert_eq!(upgrade_count(&drain_events(&mut h.agent)), 0);
+    let actions = drain_actions(&mut h.agent);
+    assert!(
+        !actions
+            .iter()
+            .any(|out| matches!(out, Out::OpenStream { .. } | Out::SendRandomUdp { .. })),
+        "no DCUtR round or blast after the upgrade: {actions:?}"
+    );
+}
+
+/// The same two punches, handed over buffered: the swarm already holds the
+/// second when the first's replacement reaches NAT.
+#[test]
+fn a_buffered_second_inbound_punch_is_punched() {
+    let mut h = inbound_harness(passive_budget());
+    let circuit = complete_a_round(&mut h);
+    let (a, b) = (ConnectionId::new(70), ConnectionId::new(71));
+    let target = h.target.clone();
+    h.agent.swarm.connect(&target, b);
+    for (old, new) in [(circuit, a), (a, b)] {
+        h.agent.deliver_late(
+            &SwarmEvent::ConnectionReplaced {
+                peer_id: target.clone(),
+                old,
+                new,
+            },
+            false,
+            at(30),
+        );
+        assert!(h.agent.is_punched(new));
+    }
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::InboundDirectUpgrade { old_conn_id, new_conn_id, .. }]
+            if *old_conn_id == circuit && *new_conn_id == a
+    ));
+}
+
+/// Attribution ends at the upgrade deadline, which the agent schedules; the
+/// surviving punch keeps its path.
+#[test]
+fn passive_attribution_ends_at_the_upgrade_deadline() {
+    let mut h = inbound_harness(passive_budget());
+    let circuit = complete_a_round(&mut h);
+    let a = ConnectionId::new(70);
+    replace(&mut h, circuit, a, false, 30);
+    drain_events(&mut h.agent);
+    drain_actions(&mut h.agent);
+
+    assert_eq!(
+        h.agent.next_deadline(at(30)),
+        Some(Deadline::from_millis(PASSIVE_DEADLINE))
+    );
+    assert!(!h.agent.is_idle());
+    h.agent.handle_tick(at(PASSIVE_DEADLINE));
+    assert!(h.agent.is_idle());
+    assert!(h.agent.is_punched(a));
+}
+
+/// A replacement just inside the budget is a punch; one at the deadline is
+/// not, whether or not a tick ended attribution first.
+#[test]
+fn passive_attribution_cuts_off_exactly_at_the_deadline() {
+    for (t, ticked, punched) in [
+        (PASSIVE_DEADLINE - 1, false, true),
+        (PASSIVE_DEADLINE, false, false),
+        (PASSIVE_DEADLINE, true, false),
+    ] {
+        let mut h = inbound_harness(passive_budget());
+        let circuit = complete_a_round(&mut h);
+        let (a, b) = (ConnectionId::new(70), ConnectionId::new(71));
+        replace(&mut h, circuit, a, false, 30);
+        if ticked {
+            h.agent.handle_tick(at(t));
+        }
+        replace(&mut h, a, b, false, t);
+        assert_eq!(h.agent.is_punched(b), punched, "t={t} ticked={ticked}");
+    }
+}
+
+/// Passive attribution claims only what nothing else explains, from the
+/// source, over a direct connection.
+#[test]
+fn passive_attribution_leaves_other_connections_alone() {
+    let mut h = inbound_harness(passive_budget());
+    let circuit = complete_a_round(&mut h);
+    let a = ConnectionId::new(70);
+    replace(&mut h, circuit, a, false, 30);
+
+    // From another peer.
+    let other = ConnectionId::new(80);
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: other,
+            peer_id: peer(b"someone-else"),
+        },
+        false,
+        at(40),
+    );
+    assert!(!h.agent.is_punched(other));
+
+    // A circuit from the source.
+    let circuit_again = ConnectionId::new(TEST_CIRCUIT_ID + 1);
+    replace(&mut h, a, circuit_again, true, 50);
+    assert!(!h.agent.is_punched(circuit_again));
+}
+
+/// A connection an outbound attempt dialed keeps the Direct path it
+/// recorded, even while an inbound machine is passive.
+#[test]
+fn passive_attribution_keeps_an_outbound_direct_path() {
+    let mut h = inbound_harness(passive_budget());
+    let circuit = complete_a_round(&mut h);
+    let a = ConnectionId::new(70);
+    replace(&mut h, circuit, a, false, 30);
+    drain_events(&mut h.agent);
+
+    // The engine's own direct dial for an attempt, which the attempt
+    // records as Direct.
+    h.agent.swarm.disconnect(&h.target.clone());
+    let id = h.start(NO_RELAY, at(40));
+    let dialed = ConnectionId::new(71);
+    replace(&mut h, a, dialed, false, 50);
+    assert!(!h.agent.is_punched(dialed));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathEstablished { connect_id, path: Path::Direct, .. }] if *connect_id == id
+    ));
+}
+
+/// A direct connection before any DCUtR round completed is not a punch this
+/// side asked for: no passive state, so its replacement is plain Direct.
+#[test]
+fn a_direct_connection_before_any_round_creates_no_passive_state() {
+    let mut h = inbound_harness(passive_budget());
+    let (circuit, _) = drive_to_relayed(&mut h);
+    let (a, b) = (ConnectionId::new(70), ConnectionId::new(71));
+    replace(&mut h, circuit, a, false, 30);
+    drain_events(&mut h.agent);
+    drain_actions(&mut h.agent);
+    assert!(h.agent.is_idle());
+
+    replace(&mut h, a, b, false, 40);
+    assert!(!h.agent.is_punched(b));
+}
+
+/// The first punch lands while a later round's exchange is in flight: that
+/// round ends there, and a second punch is still attributed.
+#[test]
+fn a_punch_during_a_later_round_still_turns_passive() {
+    let mut h = inbound_harness(passive_budget());
+    let circuit = complete_a_round(&mut h);
+    // The first window ends at t=124 and the next round opens.
+    h.agent.handle_tick(at(124));
+    opened_stream(&drain_actions(&mut h.agent));
+    let (a, b) = (ConnectionId::new(70), ConnectionId::new(71));
+
+    replace(&mut h, circuit, a, false, 130);
+    replace(&mut h, a, b, false, 140);
+    assert!(h.agent.is_punched(b));
+    assert_eq!(upgrade_count(&drain_events(&mut h.agent)), 1);
 }

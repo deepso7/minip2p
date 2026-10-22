@@ -11,11 +11,19 @@
 //!   ──▶ round: open DCUtR ──▶ send CONNECT, then SYNC ──▶ punch window
 //!   ──▶ no direct connection: next round, up to MAX_DCUTR_ROUNDS
 //! circuit dialer's punch lands ──▶ InboundDirectUpgrade
+//!   ──▶ passive: later punches are Punched, until the upgrade deadline
 //! ```
 //!
 //! Each round is a fresh exchange on a fresh stream with its own RTT, timed
 //! from when CONNECT is fully written. Rounds are bounded by
 //! `dcutr_exchange_timeout_ms` each and `upgrade_timeout_ms` overall.
+//!
+//! Once a completed round's punch upgrades the circuit, the machine turns
+//! passive until the upgrade deadline: the dialer may land a second punch
+//! that replaces the first, after this side's punch window. It starts no
+//! more rounds or blasts and announces nothing more, but records every
+//! otherwise unexplained direct connection from the source as `Punched`.
+//! This peer dials nothing, so the deadline is its only evidence.
 
 use alloc::vec::Vec;
 
@@ -81,6 +89,11 @@ pub(crate) struct InboundCircuit {
     handshake_deadline: Option<u64>,
     /// Whether the usable inbound relay path was announced.
     path_announced: bool,
+    /// A DCUtR round reached SYNC, so the source may be punching.
+    round_completed: bool,
+    /// A punch upgraded the circuit after a completed round: later direct
+    /// connections from the source are punches until `upgrade_deadline`.
+    passive: bool,
     done: bool,
 }
 
@@ -117,6 +130,8 @@ impl InboundCircuit {
             promoted: None,
             handshake_deadline: None,
             path_announced: false,
+            round_completed: false,
+            passive: false,
             done: false,
         }
     }
@@ -404,6 +419,10 @@ impl InboundCircuit {
         if self.done || self.source.as_ref() != Some(peer) {
             return;
         }
+        if self.passive {
+            self.attribute_passively(conn_id, is_circuit, shared, now);
+            return;
+        }
         if is_circuit {
             if self.promoted == Some(conn_id) {
                 self.handshake_deadline = None;
@@ -450,15 +469,42 @@ impl InboundCircuit {
         }
         if self.released {
             self.finish_dcutr(swarm, shared, now);
+            if self.round_completed {
+                self.passive = true;
+            } else {
+                self.done = true;
+            }
+        }
+    }
+
+    /// A connection from the source while passive: a direct one nothing else
+    /// explains is the dialer's later punch, until the upgrade deadline,
+    /// which ends the machine here as it would on a tick.
+    fn attribute_passively(
+        &mut self,
+        conn_id: ConnectionId,
+        is_circuit: bool,
+        shared: &mut Shared,
+        now: Now,
+    ) {
+        if self
+            .upgrade_deadline
+            .is_none_or(|deadline| now.monotonic_ms >= deadline)
+        {
             self.done = true;
+            return;
+        }
+        if !is_circuit && !shared.paths.contains_key(&conn_id) {
+            shared.record_path(conn_id, crate::Path::Punched, None);
         }
     }
 
     /// The relay connection died. Before release the circuit is gone; after
     /// release the app owns the (now dead) stream and the initiator's punch
-    /// dial may still land, so the circuit lingers.
+    /// dial may still land, so the circuit lingers. A passive machine
+    /// outlives the circuit and earlier punches alike.
     pub(crate) fn on_connection_closed(&mut self, peer: &PeerId, conn_id: ConnectionId) {
-        if self.done {
+        if self.done || self.passive {
             return;
         }
         if self.promoted == Some(conn_id) {
@@ -663,6 +709,7 @@ impl InboundCircuit {
                         });
                     }
                     if dcutr.send_sync().is_ok() {
+                        self.round_completed = true;
                         while let Some(DcutrInitiatorOutput::Outbound(data)) = dcutr.poll_output() {
                             if let Some(peer) = self.source.as_ref() {
                                 send(swarm, peer, conn, stream, data, now);

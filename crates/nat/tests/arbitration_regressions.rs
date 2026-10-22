@@ -726,6 +726,7 @@ fn a_second_punch_replacing_the_first_is_punched() {
     let target = h.target.clone();
     h.agent.swarm.connect(&target, second);
     for (old, new) in [(circuit, first), (first, second)] {
+        drain_events(&mut h.agent);
         h.agent.deliver_late(
             &SwarmEvent::ConnectionReplaced {
                 peer_id: h.target.clone(),
@@ -737,6 +738,13 @@ fn a_second_punch_replacing_the_first_is_punched() {
         );
     }
     assert!(h.agent.is_punched(second), "the surviving punch is Punched");
+    assert!(
+        !drain_events(&mut h.agent).iter().any(|event| matches!(
+            event,
+            NatEvent::PathUpgraded { .. } | NatEvent::InboundDirectUpgrade { .. }
+        )),
+        "punch to punch is no upgrade"
+    );
 }
 
 /// The last round's punch lands after its window closed and the attempt
