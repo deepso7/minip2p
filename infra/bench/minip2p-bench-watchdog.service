@@ -1,0 +1,7 @@
+[Unit]
+Description=Power off the minip2p bench instance when idle or stuck
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/minip2p-bench-watchdog

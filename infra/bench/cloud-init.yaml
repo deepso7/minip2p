@@ -1,0 +1,85 @@
+#cloud-config
+# User data for the minip2p bench instance, rendered by bootstrap.sh. It fills
+# @@RUNNER_TOKEN@@ with a runner registration token (valid for one hour) and the
+# @@*_B64@@ placeholders with the base64 of the matching files in infra/bench/.
+# Never commit or log a rendered copy. runcmd runs once per instance, so later
+# boots only start the services installed here.
+
+write_files:
+  - path: /opt/minip2p-bench/job-started.sh
+    owner: root:root
+    permissions: "0755"
+    encoding: b64
+    content: "@@JOB_STARTED_B64@@"
+  - path: /usr/local/sbin/minip2p-bench-watchdog
+    owner: root:root
+    permissions: "0755"
+    encoding: b64
+    content: "@@WATCHDOG_B64@@"
+  - path: /etc/systemd/system/minip2p-bench-watchdog.service
+    owner: root:root
+    permissions: "0644"
+    encoding: b64
+    content: "@@WATCHDOG_SERVICE_B64@@"
+  - path: /etc/systemd/system/minip2p-bench-watchdog.timer
+    owner: root:root
+    permissions: "0644"
+    encoding: b64
+    content: "@@WATCHDOG_TIMER_B64@@"
+  - path: /root/minip2p-bench-setup.sh
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      runner_version=2.338.1
+      runner_sha256=08e9ccb3604d2462c24b5e33604dc30810296ca15cc65f23cffd4317eb144c37
+      export DEBIAN_FRONTEND=noninteractive
+
+      # Watchdog first, so a setup failure below still leaves an instance
+      # that stops itself. The marker holds it off while setup runs, since
+      # runcmd never runs again on a later boot.
+      touch /run/minip2p-bench-setup
+      trap 'rm -f /run/minip2p-bench-setup' EXIT
+      systemctl daemon-reload
+      systemctl enable --now minip2p-bench-watchdog.timer
+
+      # Docker CE and jq from Docker's apt repository.
+      apt-get update
+      apt-get install -y ca-certificates curl jq
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+      . /etc/os-release
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable" \
+        > /etc/apt/sources.list.d/docker.list
+      apt-get update
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+      systemctl enable --now docker
+
+      # The runner user: in `docker`, no sudo.
+      id runner >/dev/null 2>&1 || useradd --create-home --shell /bin/bash --groups docker runner
+
+      # The pinned actions/runner release, registered at repo level.
+      dir=/home/runner/actions-runner
+      tarball=/tmp/actions-runner.tar.gz
+      curl -fsSL -o "$tarball" \
+        "https://github.com/actions/runner/releases/download/v${runner_version}/actions-runner-linux-x64-${runner_version}.tar.gz"
+      echo "${runner_sha256}  $tarball" | sha256sum -c -
+      install -d -o runner -g runner "$dir"
+      tar -xzf "$tarball" -C "$dir"
+      chown -R runner:runner "$dir"
+      rm -f "$tarball"
+      cd "$dir"
+      ./bin/installdependencies.sh
+      sudo -u runner ./config.sh --unattended \
+        --url https://github.com/deepso7/minip2p \
+        --token '@@RUNNER_TOKEN@@' \
+        --labels self-hosted,linux,x64,minip2p-bench \
+        --name minip2p-bench --replace
+      echo 'ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/minip2p-bench/job-started.sh' >> "$dir/.env"
+      ./svc.sh install runner
+      ./svc.sh start
+
+runcmd:
+  - [bash, -c, "/root/minip2p-bench-setup.sh && rm -f /root/minip2p-bench-setup.sh"]
