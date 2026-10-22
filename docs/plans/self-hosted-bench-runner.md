@@ -190,16 +190,16 @@ After two weeks of healthy runs, as a separate step the maintainer approves, del
    - the runner shows online in repo settings;
    - the security group has no inbound rules and the instance has no IAM profile;
    - the instance's shutdown behaviour is `stop`.
-2. **Watchdog and lease.** Leave the freshly booted instance idle. It must stop itself 10–11 minutes after boot. Start it with `scripts/start-bench-runner.sh`. The runner must come back online and the instance must stay up until the 20-minute lease expires, then stop about 10 minutes later. Also start it while it is `stopping`: the script must end with it `running`. Finally set the tag a year ahead by hand: the idle instance must still stop about 10 minutes later.
+2. **Watchdog and lease.** Leave the freshly booted instance idle. It must stop itself 10–11 minutes after first-boot setup finishes. Start it with `scripts/start-bench-runner.sh`. The runner must come back online and the instance must stay up until the 20-minute lease expires, then stop within a minute or so. The 10 idle minutes have already elapsed during the lease. Also start it while it is `stopping`: the script must end with it `running`. Finally set the tag a year ahead by hand on a freshly started instance. That lease counts as expired, so the idle instance must stop about 10 minutes after boot.
 3. **Dry run on the instance.** With `--ssh-from`, run `scripts/run-bench-container.sh` against `main` by hand, starting from an empty BuildKit cache. Record the build's peak memory (`/proc/pressure/memory` and `free`, sampled). If it comes within 1 GiB of 8 GiB, switch to `m7a.xlarge` before going further. Check that a full run completes, Gungraun reports ASLR disabled, the `quic_dual_stack` rows are present, `current.json` validates, and the elapsed time is recorded. Also run one sweep (`BENCH_SWEEP=all`) and confirm the extracted `rtt/` tree passes the file-type check. Then `--no-ssh`.
 4. **Determinism.** Run twice back to back: Ir rows must be identical. Record the wall-clock spread and compare it with the last two Fargate artifacts.
 5. **Network probe.** A throwaway `docker build` whose `RUN` tries IMDS must fail (hop limit 1). From the host, nothing but the VPC resolver should be reachable in private ranges.
-6. **Actions path.** A `workflow_dispatch` of `bench.yml` on the feature branch must be refused by the hook, since its ref is not `main`; a dispatch at a `v*` tag likewise. Temporarily allow the branch ref in the hook, dispatch again, and confirm the whole path end to end:
+6. **Actions path.** A `workflow_dispatch` of `bench.yml` on the feature branch must be refused by the hook, since its ref is not `main`; a dispatch at a `v*` tag likewise. Main does not yet have the new helper scripts, and both of `bench.yml`'s trusted checkouts use the default branch on a dispatch, so a dispatch on the feature branch cannot exercise them. For the end-to-end check, use a throwaway branch off the feature branch that makes two temporary changes: it points those checkouts at `github.sha`, and it allows its own ref in the hook. Dispatch `bench.yml` on it and confirm the whole path:
    - `start-runner` starts the stopped instance;
    - `bench` runs and the artifact `bench-results` holds `bench.log`;
    - the instance stops itself afterwards.
 
-   Then remove the allowance.
+   Then delete the throwaway branch and restore the hook.
 
    Hostile-workflow check: push a throwaway branch whose own workflow runs on `minip2p-bench` under `workflow_dispatch`, with a step `if: always()` that writes `/tmp/hook-bypass`. Dispatch it while the instance is up. The hook must kill the worker, and `/tmp/hook-bypass` must not exist afterwards. Then delete the branch.
 
@@ -221,7 +221,7 @@ After two weeks of healthy runs, as a separate step the maintainer approves, del
 | Job cancelled mid-measure | The trap force-removes the container within the grace period; the watchdog stops the instance. |
 | Image build fails (PR breaks the build) | Measure fails; the result slice is empty; the comment shows the existing failure warning. |
 | Hostile output (symlinks, huge archive) | The quarantine check fails the job before upload. |
-| Forgotten or runaway instance | Idle shutdown 10 minutes after the lease expires, and a 120-minute cap per job. |
+| Forgotten or runaway instance | Idle shutdown once the lease has expired and the instance has been idle 10 minutes (the idle time already counts during the lease), and a 120-minute cap per job. |
 | Suspected compromise | `bootstrap.sh --replace` before the next release baseline. |
 
 ## Open questions
