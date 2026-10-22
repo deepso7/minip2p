@@ -5,6 +5,8 @@ on:
     types: [published]
   pull_request_target:
     branches: [main]
+  schedule:
+    - cron: '17 6 * * 1'
   workflow_dispatch:
     inputs:
       ref:
@@ -27,15 +29,39 @@ env:
   AWS_REGION: ${{ vars.AWS_BENCH_REGION || 'us-east-1' }}
 
 jobs:
-  aws-bench:
+  # Wakes the self-hosted bench instance (normally stopped; its watchdog
+  # powers it off when idle). The environment is the approval gate for every
+  # run except the weekly keepalive.
+  start-runner:
     if: >-
-      (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+      (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    environment: aws-bench
-    timeout-minutes: 90
+    environment: ${{ github.event_name == 'schedule' && 'aws-bench-keepalive' || 'aws-bench' }}
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Start bench runner
+        env:
+          AWS_BENCH_INSTANCE_ID: ${{ vars.AWS_BENCH_INSTANCE_ID }}
+        run: scripts/start-bench-runner.sh
+
+  bench:
+    if: github.event_name != 'schedule'
+    needs: start-runner
+    runs-on: [self-hosted, linux, x64, minip2p-bench]
+    timeout-minutes: 90
+    permissions:
+      contents: read
     outputs:
       complete: ${{ steps.result.outputs.complete }}
     steps:
@@ -43,9 +69,9 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.event.pull_request.base.sha || github.sha }}
           persist-credentials: false
-      # The scripts and Dockerfile that run with AWS credentials always come
-      # from the trusted checkout above; a PR head or a dispatched `ref` is
-      # only the code measured, checked out beside it.
+      # The scripts and Dockerfile that drive the bench host always come from
+      # the trusted checkout above; a PR head or a dispatched `ref` is only
+      # the code measured (the image's build context), checked out beside it.
       - name: Check out benchmark source
         if: github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,38 +83,17 @@ jobs:
         id: source
         env:
           SOURCE_DIR: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')) && format('{0}/bench-source', github.workspace) || github.workspace }}
-        run: |
-          sha=$(git -C "$SOURCE_DIR" rev-parse HEAD)
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "image_tag=$sha-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-duration-seconds: 7200
-      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
-        id: ecr
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      # The Dockerfile always comes from the trusted checkout; only the build
-      # context (the code compiled inside the image) may come from the PR or
-      # the dispatched `ref`.
-      - name: Build and push benchmark image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')) && 'bench-source' || '.' }}
-          file: infra/bench/Dockerfile
-          push: true
-          tags: ${{ steps.ecr.outputs.registry }}/minip2p-bench:${{ steps.source.outputs.image_tag }}
-          provenance: false
-          cache-from: type=gha,scope=bench
-          cache-to: ${{ github.event_name != 'pull_request_target' && 'type=gha,mode=max,scope=bench' || '' }}
+        run: echo "sha=$(git -C "$SOURCE_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # `exec` makes the helper the step's process, so the runner's
+      # cancellation signals reach its traps.
       - name: Measure
         id: measure
         env:
           BENCH_GIT_SHA: ${{ steps.source.outputs.sha }}
-          BENCH_IMAGE: ${{ steps.ecr.outputs.registry }}/minip2p-bench:${{ steps.source.outputs.image_tag }}
           BENCH_SWEEP: ${{ inputs.sweep }}
-        run: scripts/run-aws-bench-task.sh
+          BENCH_CONTEXT: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')) && 'bench-source' || '.' }}
+          BENCH_NO_CACHE: ${{ github.event_name == 'release' && '1' || '' }}
+        run: exec scripts/run-bench-container.sh
       - name: Prepare result slice
         id: result
         if: always()
@@ -98,14 +103,11 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           complete=false
+          mkdir -p target/bench-artifacts
           if [ "$MEASURE_OUTCOME" = success ] && python3 scripts/bench_results.py merge target/bench-artifacts/current.json --output target/bench-artifacts/current.json --git-sha "$BENCH_GIT_SHA"; then
             complete=true
           else
-            mkdir -p target/bench-artifacts
             jq -n --arg sha "$BENCH_GIT_SHA" '{schema_version: 1, git_sha: $sha, rows: []}' > target/bench-artifacts/current.json
-          fi
-          if [ -f target/bench-fargate.log ]; then
-            mv target/bench-fargate.log target/bench-artifacts/bench-fargate.log
           fi
           if [ -n "$PR_NUMBER" ]; then
             printf '%s\n' "$PR_NUMBER" > target/bench-artifacts/pr-number
@@ -115,14 +117,26 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: bench-aws
+          name: bench-results
           path: target/bench-artifacts/
           if-no-files-found: error
 
+  # The weekly schedule connects the runner so GitHub does not remove it
+  # after 14 days offline; the watchdog stops the instance afterwards.
+  keepalive:
+    if: github.event_name == 'schedule'
+    needs: start-runner
+    runs-on: [self-hosted, linux, x64, minip2p-bench]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - run: "true"
+
   baseline:
     if: >-
-      github.event_name == 'release' && needs.aws-bench.outputs.complete == 'true'
-    needs: [aws-bench]
+      github.event_name == 'release' && needs.bench.outputs.complete == 'true'
+    needs: [bench]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -169,8 +183,8 @@ jobs:
 
   compare:
     if: >-
-      github.event_name == 'pull_request_target' && needs.aws-bench.result == 'success' && needs.aws-bench.outputs.complete == 'true'
-    needs: [aws-bench]
+      github.event_name == 'pull_request_target' && needs.bench.result == 'success' && needs.bench.outputs.complete == 'true'
+    needs: [bench]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
