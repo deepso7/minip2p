@@ -19,7 +19,7 @@ use minip2p_relay::{HOP_PROTOCOL_ID, HopMessage, HopMessageType, Status, encode_
 /// written against the public `minip2p` API (see `extern crate self` in
 /// `lib.rs`).
 #[path = "../../../../tests/support/relay.rs"]
-mod relay_support;
+pub(super) mod relay_support;
 
 struct BridgePair {
     local: Endpoint,

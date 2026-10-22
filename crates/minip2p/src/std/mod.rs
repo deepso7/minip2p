@@ -39,6 +39,8 @@ mod bind_error;
 mod dial;
 #[cfg(all(test, feature = "nat", feature = "quic"))]
 mod nat_tests;
+#[cfg(all(test, feature = "nat", feature = "quic"))]
+mod punch_batch_tests;
 #[cfg(feature = "relay-server")]
 pub(crate) mod relay_server;
 
