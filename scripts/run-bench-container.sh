@@ -25,6 +25,7 @@ work=${RUNNER_TEMP:-target}/$name
 quarantine=$work/quarantine
 output=target/bench-artifacts
 max_bytes=$((50 * 1024 * 1024))
+log_max_bytes=$((256 * 1024 * 1024))
 build_pid=
 
 rm -rf "$work" "$output"
@@ -79,13 +80,15 @@ build_pid=
 
 # Every benchmark is loopback or in-process, so the container gets no network
 # (`endpoint_idle`'s dual-stack variant needs IPv6 loopback, hence the sysctl).
-# Unconfined seccomp lets Gungraun disable ASLR with personality(2).
-docker run -d --name "$name" --network none \
+# Unconfined seccomp lets Gungraun disable ASLR with personality(2). Memory and
+# Docker's own log are capped so a runaway run cannot take the host down.
+docker run -d --name "$name" --network none --memory 6g \
+  --log-opt max-size=100m --log-opt max-file=3 \
   --sysctl net.ipv6.conf.lo.disable_ipv6=0 \
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
   -e BENCH_GIT_SHA -e BENCH_SWEEP \
   --entrypoint bash "$name" -c "$(< scripts/run-container-benches.sh)" >/dev/null
-docker logs -f "$name" > "$work/bench.log" 2>&1 &
+docker logs -f "$name" 2>&1 | head -c "$log_max_bytes" > "$work/bench.log" &
 logs_pid=$!
 docker wait "$name" > "$work/exit-code" &
 wait $!
@@ -93,6 +96,9 @@ if ! wait "$logs_pid"; then
   echo "failed to follow the benchmark container's log" >&2
   exit 1
 fi
+
+(($(stat -c %s "$work/bench.log") < log_max_bytes)) \
+  || reject "container log reached $((log_max_bytes / 1024 / 1024)) MB"
 
 exit_code=$(< "$work/exit-code")
 if [[ "$exit_code" != 0 ]]; then

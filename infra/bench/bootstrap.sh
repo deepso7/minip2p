@@ -100,10 +100,12 @@ if [[ "$mode" == ssh-from || "$mode" == no-ssh ]]; then
       >/dev/null
     echo "allowed SSH from $ssh_cidr on $sg"
   else
-    mapfile -t rules < <(aws ec2 describe-security-group-rules \
+    # All-protocol rules (`-1`, ports -1) also admit SSH.
+    rules_json=$(aws ec2 describe-security-group-rules \
       --filters "Name=group-id,Values=$sg" \
-      --query 'SecurityGroupRules[?!IsEgress && FromPort<=`22` && ToPort>=`22`].SecurityGroupRuleId' \
-      --output text | tr '\t' '\n' | grep . || true)
+      --query 'SecurityGroupRules[?!IsEgress && (IpProtocol==`"-1"` || (IpProtocol==`"tcp"` && FromPort<=`22` && ToPort>=`22`))].SecurityGroupRuleId' \
+      --output json)
+    mapfile -t rules < <(jq -r '.[]' <<<"$rules_json")
     if [[ ${#rules[@]} -gt 0 ]]; then
       aws ec2 revoke-security-group-ingress --group-id "$sg" --security-group-rule-ids "${rules[@]}" >/dev/null
     fi
@@ -174,15 +176,26 @@ if [[ -z "$sg" ]]; then
 fi
 
 # --- Key pair: the private key stays on this machine ---------------------------
-if ! aws ec2 describe-key-pairs --key-names "$name" >/dev/null 2>&1; then
+# Only a definite NotFound creates a key; any other error stops here, and an
+# existing key file is never overwritten (AWS cannot return a lost key).
+if key_error=$(aws ec2 describe-key-pairs --key-names "$name" 2>&1 >/dev/null); then
+  [[ -f "$key_file" ]] \
+    || echo "note: key pair $name exists but $key_file is missing; SSH needs the original key" >&2
+elif [[ "$key_error" == *InvalidKeyPair.NotFound* ]]; then
+  if [[ -e "$key_file" ]]; then
+    echo "$key_file already exists; move it aside before creating key pair $name" >&2
+    exit 1
+  fi
   mkdir -p "$(dirname "$key_file")"
-  (umask 077; aws ec2 create-key-pair --key-name "$name" --key-type ed25519 \
+  key_tmp=$(umask 077; mktemp "$key_file.XXXXXX")
+  aws ec2 create-key-pair --key-name "$name" --key-type ed25519 \
     --tag-specifications "ResourceType=key-pair,Tags=[$tags]" \
-    --query KeyMaterial --output text > "$key_file")
-  chmod 600 "$key_file"
+    --query KeyMaterial --output text > "$key_tmp"
+  mv "$key_tmp" "$key_file"
   echo "created key pair $name; private key in $key_file"
-elif [[ ! -f "$key_file" ]]; then
-  echo "note: key pair $name exists but $key_file is missing; SSH needs the original key" >&2
+else
+  echo "$key_error" >&2
+  exit 1
 fi
 
 # --- Instance -----------------------------------------------------------------
@@ -230,31 +243,20 @@ if ! aws iam get-role --role-name "$role" >/dev/null 2>&1; then
   echo "role $role not found; create it per README.md, then rerun" >&2
   exit 1
 fi
-aws iam update-assume-role-policy --role-name "$role" --policy-document '{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {"Federated": "arn:aws:iam::'"$account"':oidc-provider/token.actions.githubusercontent.com"},
-    "Action": "sts:AssumeRoleWithWebIdentity",
-    "Condition": {"StringEquals": {
-      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-      "token.actions.githubusercontent.com:sub": [
-        "repo:'"$repo"':environment:aws-bench",
-        "repo:'"$repo"':environment:aws-bench-keepalive"
-      ]
-    }}
-  }]
-}'
 
 # Converge to exactly one inline policy and no attached ones. JSON output
 # distinguishes an empty list from a policy named `None`.
 policy_name=minip2p-bench-start
-mapfile -t inline < <(aws iam list-role-policies --role-name "$role" --query PolicyNames --output json | jq -r '.[]')
+# Each listing is captured first so a failed call stops the script under
+# `set -e` (a process substitution would swallow it).
+inline_json=$(aws iam list-role-policies --role-name "$role" --query PolicyNames --output json)
+mapfile -t inline < <(jq -r '.[]' <<<"$inline_json")
 for p in "${inline[@]}"; do
   [[ "$p" == "$policy_name" ]] || aws iam delete-role-policy --role-name "$role" --policy-name "$p"
 done
-mapfile -t attached_arns < <(aws iam list-attached-role-policies --role-name "$role" \
-  --query 'AttachedPolicies[].PolicyArn' --output json | jq -r '.[]')
+attached_json=$(aws iam list-attached-role-policies --role-name "$role" \
+  --query 'AttachedPolicies[].PolicyArn' --output json)
+mapfile -t attached_arns < <(jq -r '.[]' <<<"$attached_json")
 for arn in "${attached_arns[@]}"; do
   aws iam detach-role-policy --role-name "$role" --policy-arn "$arn"
 done
@@ -276,6 +278,22 @@ aws iam put-role-policy --role-name "$role" --policy-name "$policy_name" --polic
     },
     {"Sid": "Describe", "Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*"}
   ]
+}'
+# Trust the keepalive environment only once the permissions have converged.
+aws iam update-assume-role-policy --role-name "$role" --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Federated": "arn:aws:iam::'"$account"':oidc-provider/token.actions.githubusercontent.com"},
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {"StringEquals": {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+      "token.actions.githubusercontent.com:sub": [
+        "repo:'"$repo"':environment:aws-bench",
+        "repo:'"$repo"':environment:aws-bench-keepalive"
+      ]
+    }}
+  }]
 }'
 echo "updated $role: trust aws-bench + aws-bench-keepalive, policy $policy_name"
 
