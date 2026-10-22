@@ -216,7 +216,7 @@ if [[ -z "$instance" ]]; then
     --instance-type "$instance_type" \
     --key-name "$name" \
     --network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true" \
-    --block-device-mappings "DeviceName=$root_device,Ebs={VolumeSize=80,VolumeType=gp3,DeleteOnTermination=true}" \
+    --block-device-mappings "DeviceName=$root_device,Ebs={VolumeSize=80,VolumeType=gp3,Encrypted=true,DeleteOnTermination=true}" \
     --metadata-options HttpEndpoint=enabled,HttpTokens=required,HttpPutResponseHopLimit=1,InstanceMetadataTags=enabled \
     --instance-initiated-shutdown-behavior stop \
     --tag-specifications "ResourceType=instance,Tags=[$tags]" "ResourceType=volume,Tags=[$tags]" \

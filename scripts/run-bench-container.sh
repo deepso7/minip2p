@@ -119,6 +119,8 @@ else
 fi
 [[ -z "$(find "$quarantine" ! -type f ! -type d)" ]] \
   || reject "contains entries other than regular files and directories"
+# `du` counts a hard-linked file once but `cp` copies every link.
+[[ -z "$(find "$quarantine" -type f -links +1)" ]] || reject "contains hard links"
 (($(du -sb "$quarantine" | cut -f1) <= max_bytes)) || reject "larger than 50 MB"
 
 if [[ -n "$BENCH_SWEEP" ]]; then
