@@ -55,13 +55,28 @@ case "$event" in
     ;;
 esac
 
+# The runner service does not wait for Docker, so the first job after a boot
+# can arrive before the daemon is up.
+for _ in {1..30}; do
+  timeout 10 docker info >/dev/null 2>&1 && break
+  sleep 2
+done
+timeout 10 docker info >/dev/null 2>&1 || {
+  echo "minip2p-bench: Docker is not ready after 60 s" >&2
+  exit 1
+}
+
 # Leftovers from cancelled or killed runs. Each docker call is bounded so a
-# wedged daemon fails the job instead of hanging it.
-mapfile -t containers < <(timeout 30 docker ps -aq --filter 'name=^bench-')
+# wedged daemon fails the job instead of hanging it, and its output is
+# captured first so a failure stops the hook (a process substitution would
+# swallow it).
+containers_out=$(timeout 30 docker ps -aq --filter 'name=^bench-')
+mapfile -t containers < <(printf '%s' "$containers_out" | grep . || true)
 if [[ ${#containers[@]} -gt 0 ]]; then
   timeout 60 docker rm -f "${containers[@]}" >/dev/null
 fi
-mapfile -t images < <(timeout 30 docker image ls --filter 'reference=bench-*' --format '{{.Repository}}:{{.Tag}}')
+images_out=$(timeout 30 docker image ls --filter 'reference=bench-*' --format '{{.Repository}}:{{.Tag}}')
+mapfile -t images < <(printf '%s' "$images_out" | grep . || true)
 if [[ ${#images[@]} -gt 0 ]]; then
   timeout 120 docker image rm -f "${images[@]}" >/dev/null
 fi
