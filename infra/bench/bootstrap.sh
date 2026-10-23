@@ -200,14 +200,9 @@ fi
 
 # --- Instance -----------------------------------------------------------------
 instance=$(find_instance)
-if [[ -n "$instance" && "$replace" == true ]]; then
-  aws ec2 terminate-instances --instance-ids "$instance" >/dev/null
-  echo "terminating $instance"
-  aws ec2 wait instance-terminated --instance-ids "$instance"
-  instance=
-fi
-
-if [[ -z "$instance" ]]; then
+# Everything that can fail runs before --replace terminates the old instance,
+# so a failure never leaves the repository without a runner.
+if [[ -z "$instance" || "$replace" == true ]]; then
   ami=$(aws ssm get-parameter \
     --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
     --query Parameter.Value --output text)
@@ -223,7 +218,16 @@ if [[ -z "$instance" ]]; then
   unset token
   size=$(wc -c < "$workdir/user-data.gz")
   ((size <= 16384)) || { echo "user data is $size bytes gzipped; limit 16384" >&2; exit 1; }
+fi
 
+if [[ -n "$instance" && "$replace" == true ]]; then
+  aws ec2 terminate-instances --instance-ids "$instance" >/dev/null
+  echo "terminating $instance"
+  aws ec2 wait instance-terminated --instance-ids "$instance"
+  instance=
+fi
+
+if [[ -z "$instance" ]]; then
   instance=$(aws ec2 run-instances \
     --image-id "$ami" \
     --instance-type "$instance_type" \
