@@ -184,7 +184,7 @@ catalogs:
       version: 7.0.2
 
 patchedDependencies:
-  uniffi-bindgen-react-native@0.31.0-5: 3d3826cb29db1530c60a1092dde51421bfa266d3c2add5512d462f7c0adac050
+  uniffi-bindgen-react-native@0.31.0-5: 6df76f9c9484ee51ff9866fae52304e499b637986f2a70ae7697b50e6d3869d8
 
 importers:
 
@@ -295,7 +295,7 @@ importers:
         version: 0.31.0-5
       uniffi-bindgen-react-native:
         specifier: 0.31.0-5
-        version: 0.31.0-5(patch_hash=3d3826cb29db1530c60a1092dde51421bfa266d3c2add5512d462f7c0adac050)
+        version: 0.31.0-5(patch_hash=6df76f9c9484ee51ff9866fae52304e499b637986f2a70ae7697b50e6d3869d8)
     devDependencies:
       '@minip2p/test-fixtures':
         specifier: workspace:*
@@ -17208,7 +17208,7 @@ snapshots:
 
   unicorn-magic@0.3.0: {}
 
-  uniffi-bindgen-react-native@0.31.0-5(patch_hash=3d3826cb29db1530c60a1092dde51421bfa266d3c2add5512d462f7c0adac050): {}
+  uniffi-bindgen-react-native@0.31.0-5(patch_hash=6df76f9c9484ee51ff9866fae52304e499b637986f2a70ae7697b50e6d3869d8): {}
 
   unified@11.0.5:
     dependencies:
