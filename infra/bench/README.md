@@ -116,7 +116,7 @@ Until the next stable release writes a new baseline, comparisons take the "no ba
 
 ## Emulated-link sweeps
 
-A manual dispatch of the Bench workflow with `sweep` set (for example `all`, or `quic-stream yamux`) and optionally `ref` runs `scripts/rtt-sweep.sh` on the instance instead of the benchmarks: #361's window sweeps over the `endpoint_rtt` emulated link. The artifact carries their logs and JSON lines under `rtt/`; each log ends with the value the sweep picks. A full sweep takes about 20 minutes, well inside the job's 90-minute timeout.
+A manual dispatch of the Bench workflow with `sweep` set (for example `all`, or `quic-stream yamux`) and optionally `ref` runs `scripts/rtt-sweep.sh` on the instance instead of the benchmarks: #361's window sweeps over the `endpoint_rtt` emulated link. The artifact carries their logs and JSON lines under `rtt/`; each log ends with the value the sweep picks. A full sweep takes about 30 minutes on the instance, well inside the job's 90-minute timeout.
 
 ## Cost
 
