@@ -93,6 +93,8 @@ docker run -d --name "$name" --network none --memory 6g \
   --entrypoint bash "$name" -c "$(< scripts/run-container-benches.sh)" >/dev/null
 # The follower stops the container once its log reaches the cap, so a
 # runaway run ends here instead of at the job timeout.
+# Its own output goes to /dev/null so a cancelled step can exit without
+# waiting on it.
 {
   # `head` ends as soon as it hits the cap, even while `docker logs` waits
   # for more output that a pipe would only notice on its next write.
@@ -109,7 +111,7 @@ docker run -d --name "$name" --network none --memory 6g \
       timeout 20 docker kill "$name" >/dev/null 2>&1 || true
     fi
   fi
-} &
+} >/dev/null 2>&1 &
 logs_pid=$!
 docker wait "$name" > "$work/exit-code" &
 wait $!
