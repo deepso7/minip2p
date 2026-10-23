@@ -57,14 +57,14 @@ esac
 
 # The runner service does not wait for Docker, so the first job after a boot
 # can arrive before the daemon is up.
-for _ in {1..30}; do
-  timeout 10 docker info >/dev/null 2>&1 && break
+deadline=$((SECONDS + 60))
+until timeout 10 docker info >/dev/null 2>&1; do
+  if ((SECONDS >= deadline)); then
+    echo "minip2p-bench: Docker is not ready after 60 s" >&2
+    exit 1
+  fi
   sleep 2
 done
-timeout 10 docker info >/dev/null 2>&1 || {
-  echo "minip2p-bench: Docker is not ready after 60 s" >&2
-  exit 1
-}
 
 # Leftovers from cancelled or killed runs. Each docker call is bounded so a
 # wedged daemon fails the job instead of hanging it, and its output is
