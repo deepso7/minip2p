@@ -34,7 +34,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: bench-aws
+          name: bench-results
           path: ${{ runner.temp }}/bench-context
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ github.event.workflow_run.id }}
@@ -106,7 +106,7 @@ jobs:
             printf '%s\n' '<!-- bench-comment -->'
             printf '%s\n' '<!-- bench-status-start -->'
             printf '> [!WARNING]\n'
-            printf '> Benchmark run [%s](%s). The comparison below is from the last successful run.\n' \
+            printf '> Benchmark run [%s](%s). The comparison below is from the last successful run. To retry, use **Re-run all jobs**: re-running only the failed job does not wake the stopped bench instance.\n' \
               "$CONCLUSION" "$RUN_URL"
             printf '%s\n\n' '<!-- bench-status-end -->'
             if [ -n "$existing" ]; then

@@ -1,207 +1,305 @@
 #!/usr/bin/env bash
-# One-time setup of the static AWS resources the benchmark workflow uses.
-# Idempotent: rerun it after editing a policy or retention setting. Needs
-# administrator credentials; the CI role only pushes images and runs tasks.
+# Provision the on-demand EC2 bench runner and the CI role's permissions.
+# Idempotent: resources are found by tag, so reruns converge instead of
+# duplicating. Needs administrator credentials and `gh` logged in as a repo
+# admin (for the runner registration token).
+#
+#   infra/bench/bootstrap.sh                     create what is missing, update the CI role
+#   infra/bench/bootstrap.sh --replace           terminate the instance and create a fresh one
+#   infra/bench/bootstrap.sh --ssh-from <cidr>   add a port-22 ingress rule (nothing else)
+#   infra/bench/bootstrap.sh --no-ssh            remove every port-22 ingress rule (nothing else)
+#   infra/bench/bootstrap.sh --render-user-data <file>
+#                                                write the user data with a dummy token; no AWS calls
+#
+# Env: AWS_BENCH_REGION (default ap-south-1), BENCH_INSTANCE_TYPE (default
+# m8a.xlarge), BENCH_SSH_KEY (private key path, default ~/.ssh/minip2p-bench.pem).
 set -euo pipefail
 
-region=${AWS_BENCH_REGION:-${AWS_REGION:-us-east-1}}
-export AWS_REGION="$region"
-export AWS_DEFAULT_REGION="$region"
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo=deepso7/minip2p
+name=minip2p-bench
+sg_name=minip2p-bench-runner
+role=minip2p-github-bench
+instance_type=${BENCH_INSTANCE_TYPE:-m8a.xlarge}
+key_file=${BENCH_SSH_KEY:-$HOME/.ssh/minip2p-bench.pem}
+lease_tag=bench-lease-until
+
+replace=false
+mode=provision
+ssh_cidr=
+render_out=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --replace) replace=true ;;
+    --ssh-from) mode=ssh-from; ssh_cidr=${2:?--ssh-from needs a CIDR}; shift ;;
+    --no-ssh) mode=no-ssh ;;
+    --render-user-data) mode=render; render_out=${2:?--render-user-data needs a file}; shift ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# Print cloud-init.yaml with the scripts embedded and the given registration
+# token filled in. The output holds a live token: never print or log it.
+render_user_data() {
+  local token=$1 b64
+  local -A files=(
+    [JOB_STARTED_B64]=runner-hooks/job-started.sh
+    [WATCHDOG_B64]=watchdog.sh
+    [WATCHDOG_SERVICE_B64]=minip2p-bench-watchdog.service
+    [WATCHDOG_TIMER_B64]=minip2p-bench-watchdog.timer
+  )
+  local doc
+  doc=$(<"$here/cloud-init.yaml")
+  for key in "${!files[@]}"; do
+    b64=$(base64 -w0 "$here/${files[$key]}")
+    doc=${doc//"@@$key@@"/$b64}
+  done
+  doc=${doc//"@@RUNNER_TOKEN@@"/$token}
+  printf '%s\n' "$doc"
+}
+
+if [[ "$mode" == render ]]; then
+  (umask 077; render_user_data DUMMY-REGISTRATION-TOKEN > "$render_out")
+  echo "wrote $render_out: $(wc -c < "$render_out") bytes, $(gzip -9c "$render_out" | wc -c) gzipped (limit 16384)"
+  exit 0
+fi
+
+region=${AWS_BENCH_REGION:-ap-south-1}
+export AWS_REGION="$region" AWS_DEFAULT_REGION="$region"
 account=$(aws sts get-caller-identity --query Account --output text)
+tags="{Key=project,Value=minip2p},{Key=Name,Value=$name}"
 
-echo "Bootstrapping minip2p benchmark resources in $account/$region"
+# First ID of a tagged resource, or empty. $1 is the describe subcommand, $2
+# the JMESPath to the IDs; extra arguments are added filters.
+find_tagged() {
+  local cmd=$1 query=$2
+  shift 2
+  aws ec2 "$cmd" --filters Name=tag:project,Values=minip2p "Name=tag:Name,Values=$name" "$@" \
+    --query "$query" --output text | awk 'NF && $1 != "None" { print $1; exit }'
+}
 
-# --- ECS cluster ------------------------------------------------------------
-status=$(aws ecs describe-clusters --clusters minip2p-bench \
-  --query 'clusters[0].status' --output text 2>/dev/null || true)
-if [[ "$status" != ACTIVE ]]; then
-  aws ecs create-cluster --cluster-name minip2p-bench \
-    --tags key=project,value=minip2p >/dev/null
-  echo "created cluster minip2p-bench"
+find_instance() {
+  find_tagged describe-instances 'Reservations[].Instances[].InstanceId' \
+    Name=instance-state-name,Values=pending,running,stopping,stopped
+}
+
+find_sg() {
+  aws ec2 describe-security-groups \
+    --filters Name=tag:project,Values=minip2p "Name=group-name,Values=$sg_name" \
+    --query 'SecurityGroups[0].GroupId' --output text | grep -v '^None$' || true
+}
+
+# --- SSH access only ---------------------------------------------------------
+if [[ "$mode" == ssh-from || "$mode" == no-ssh ]]; then
+  sg=$(find_sg)
+  [[ -n "$sg" ]] || { echo "security group $sg_name not found; run bootstrap first" >&2; exit 1; }
+  if [[ "$mode" == ssh-from ]]; then
+    aws ec2 authorize-security-group-ingress --group-id "$sg" \
+      --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$ssh_cidr,Description=bench-admin}]" \
+      >/dev/null
+    echo "allowed SSH from $ssh_cidr on $sg"
+  else
+    # All-protocol rules (`-1`, ports -1) also admit SSH.
+    rules_json=$(aws ec2 describe-security-group-rules \
+      --filters "Name=group-id,Values=$sg" \
+      --query 'SecurityGroupRules[?!IsEgress && (IpProtocol==`"-1"` || (IpProtocol==`"tcp"` && FromPort<=`22` && ToPort>=`22`))].SecurityGroupRuleId' \
+      --output json)
+    mapfile -t rules < <(jq -r '.[]' <<<"$rules_json")
+    if [[ ${#rules[@]} -gt 0 ]]; then
+      aws ec2 revoke-security-group-ingress --group-id "$sg" --security-group-rule-ids "${rules[@]}" >/dev/null
+    fi
+    echo "removed ${#rules[@]} SSH rule(s) from $sg"
+  fi
+  exit 0
 fi
 
-# --- ECR repository with a lifecycle policy bounding storage -----------------
-if ! aws ecr describe-repositories --repository-names minip2p-bench >/dev/null 2>&1; then
-  aws ecr create-repository --repository-name minip2p-bench \
-    --image-tag-mutability IMMUTABLE \
-    --tags Key=project,Value=minip2p >/dev/null
-  echo "created repository minip2p-bench"
+echo "Bootstrapping the minip2p bench runner in $account/$region"
+
+# --- Network: one /24 VPC, one public subnet, egress via an IGW only ---------
+vpc=$(find_tagged describe-vpcs 'Vpcs[].VpcId')
+if [[ -z "$vpc" ]]; then
+  vpc=$(aws ec2 create-vpc --cidr-block 10.77.0.0/24 \
+    --tag-specifications "ResourceType=vpc,Tags=[$tags]" --query Vpc.VpcId --output text)
+  aws ec2 wait vpc-available --vpc-ids "$vpc"
+  echo "created VPC $vpc"
 fi
-aws ecr put-image-tag-mutability --repository-name minip2p-bench \
-  --image-tag-mutability IMMUTABLE >/dev/null
-aws ecr put-lifecycle-policy --repository-name minip2p-bench \
-  --lifecycle-policy-text '{
-    "rules": [
-      {
-        "rulePriority": 1,
-        "description": "Drop untagged layers from interrupted pushes",
-        "selection": {"tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 1},
-        "action": {"type": "expire"}
-      },
-      {
-        "rulePriority": 2,
-        "description": "Keep only the most recent tagged benchmark images",
-        "selection": {"tagStatus": "tagged", "tagPatternList": ["*"], "countType": "imageCountMoreThan", "countNumber": 10},
-        "action": {"type": "expire"}
+
+subnet=$(find_tagged describe-subnets 'Subnets[].SubnetId' "Name=vpc-id,Values=$vpc")
+if [[ -z "$subnet" ]]; then
+  # Not every AZ offers every instance type; pick one that does.
+  az=$(aws ec2 describe-instance-type-offerings --location-type availability-zone \
+    --filters "Name=instance-type,Values=$instance_type" \
+    --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' '\n' | sort | head -n1)
+  [[ -n "$az" ]] || { echo "$instance_type is not offered in $region" >&2; exit 1; }
+  subnet=$(aws ec2 create-subnet --vpc-id "$vpc" --cidr-block 10.77.0.0/24 --availability-zone "$az" \
+    --tag-specifications "ResourceType=subnet,Tags=[$tags]" --query Subnet.SubnetId --output text)
+  echo "created subnet $subnet in $az"
+fi
+
+igw=$(find_tagged describe-internet-gateways 'InternetGateways[].InternetGatewayId')
+if [[ -z "$igw" ]]; then
+  igw=$(aws ec2 create-internet-gateway \
+    --tag-specifications "ResourceType=internet-gateway,Tags=[$tags]" \
+    --query InternetGateway.InternetGatewayId --output text)
+  echo "created internet gateway $igw"
+fi
+attached=$(aws ec2 describe-internet-gateways --internet-gateway-ids "$igw" \
+  --query 'InternetGateways[0].Attachments[0].VpcId' --output text)
+if [[ "$attached" != "$vpc" ]]; then
+  aws ec2 attach-internet-gateway --internet-gateway-id "$igw" --vpc-id "$vpc"
+fi
+
+rtb=$(find_tagged describe-route-tables 'RouteTables[].RouteTableId' "Name=vpc-id,Values=$vpc")
+if [[ -z "$rtb" ]]; then
+  rtb=$(aws ec2 create-route-table --vpc-id "$vpc" \
+    --tag-specifications "ResourceType=route-table,Tags=[$tags]" \
+    --query RouteTable.RouteTableId --output text)
+  echo "created route table $rtb"
+fi
+aws ec2 create-route --route-table-id "$rtb" --destination-cidr-block 0.0.0.0/0 --gateway-id "$igw" >/dev/null 2>&1 \
+  || aws ec2 replace-route --route-table-id "$rtb" --destination-cidr-block 0.0.0.0/0 --gateway-id "$igw"
+associated=$(aws ec2 describe-route-tables --route-table-ids "$rtb" \
+  --query "RouteTables[0].Associations[?SubnetId=='$subnet'].SubnetId" --output text)
+if [[ -z "$associated" || "$associated" == None ]]; then
+  aws ec2 associate-route-table --route-table-id "$rtb" --subnet-id "$subnet" >/dev/null
+fi
+
+# No inbound rules; the default allow-all egress stays.
+sg=$(find_sg)
+if [[ -z "$sg" ]]; then
+  sg=$(aws ec2 create-security-group --group-name "$sg_name" --vpc-id "$vpc" \
+    --description "minip2p bench runner: no inbound" \
+    --tag-specifications "ResourceType=security-group,Tags=[{Key=project,Value=minip2p},{Key=Name,Value=$sg_name}]" \
+    --query GroupId --output text)
+  echo "created security group $sg"
+fi
+
+# --- Key pair: the private key stays on this machine ---------------------------
+# Only a definite NotFound creates a key; any other error stops here, and an
+# existing key file is never overwritten (AWS cannot return a lost key).
+if key_error=$(aws ec2 describe-key-pairs --key-names "$name" 2>&1 >/dev/null); then
+  [[ -f "$key_file" ]] \
+    || echo "note: key pair $name exists but $key_file is missing; SSH needs the original key" >&2
+elif [[ "$key_error" == *InvalidKeyPair.NotFound* ]]; then
+  if [[ -e "$key_file" ]]; then
+    echo "$key_file already exists; move it aside before creating key pair $name" >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$key_file")"
+  key_tmp=$(umask 077; mktemp "$key_file.XXXXXX")
+  aws ec2 create-key-pair --key-name "$name" --key-type ed25519 \
+    --tag-specifications "ResourceType=key-pair,Tags=[$tags]" \
+    --query KeyMaterial --output text > "$key_tmp"
+  mv "$key_tmp" "$key_file"
+  echo "created key pair $name; private key in $key_file"
+else
+  echo "$key_error" >&2
+  exit 1
+fi
+
+# --- Instance -----------------------------------------------------------------
+instance=$(find_instance)
+# Everything that can fail runs before --replace terminates the old instance,
+# so a failure never leaves the repository without a runner.
+if [[ -z "$instance" || "$replace" == true ]]; then
+  ami=$(aws ssm get-parameter \
+    --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+    --query Parameter.Value --output text)
+  root_device=$(aws ec2 describe-images --image-ids "$ami" --query 'Images[0].RootDeviceName' --output text)
+
+  # The rendered user data holds the registration token: keep it in a private
+  # temp file, gzip it (cloud-init accepts gzip) to stay under 16 KB, and
+  # remove it on exit.
+  workdir=$(mktemp -d)
+  trap 'rm -rf "$workdir"' EXIT
+  token=$(gh api -X POST "repos/$repo/actions/runners/registration-token" --jq .token)
+  render_user_data "$token" | gzip -9 > "$workdir/user-data.gz"
+  unset token
+  size=$(wc -c < "$workdir/user-data.gz")
+  ((size <= 16384)) || { echo "user data is $size bytes gzipped; limit 16384" >&2; exit 1; }
+fi
+
+if [[ -n "$instance" && "$replace" == true ]]; then
+  aws ec2 terminate-instances --instance-ids "$instance" >/dev/null
+  echo "terminating $instance"
+  aws ec2 wait instance-terminated --instance-ids "$instance"
+  instance=
+fi
+
+if [[ -z "$instance" ]]; then
+  instance=$(aws ec2 run-instances \
+    --image-id "$ami" \
+    --instance-type "$instance_type" \
+    --key-name "$name" \
+    --network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true" \
+    --block-device-mappings "DeviceName=$root_device,Ebs={VolumeSize=80,VolumeType=gp3,Encrypted=true,DeleteOnTermination=true}" \
+    --metadata-options HttpEndpoint=enabled,HttpTokens=required,HttpPutResponseHopLimit=1,InstanceMetadataTags=enabled \
+    --instance-initiated-shutdown-behavior stop \
+    --tag-specifications "ResourceType=instance,Tags=[$tags]" "ResourceType=volume,Tags=[$tags]" \
+    --user-data "fileb://$workdir/user-data.gz" \
+    --query 'Instances[0].InstanceId' --output text)
+  echo "launched $instance ($instance_type, $ami); first-boot setup takes a few minutes"
+fi
+
+# --- CI role: trust both environments, start and lease only this instance ------
+if ! aws iam get-role --role-name "$role" >/dev/null 2>&1; then
+  echo "role $role not found; create it per README.md, then rerun" >&2
+  exit 1
+fi
+
+# Converge to exactly one inline policy and no attached ones. JSON output
+# distinguishes an empty list from a policy named `None`.
+policy_name=minip2p-bench-start
+# Each listing is captured first so a failed call stops the script under
+# `set -e` (a process substitution would swallow it).
+inline_json=$(aws iam list-role-policies --role-name "$role" --query PolicyNames --output json)
+mapfile -t inline < <(jq -r '.[]' <<<"$inline_json")
+for p in "${inline[@]}"; do
+  [[ "$p" == "$policy_name" ]] || aws iam delete-role-policy --role-name "$role" --policy-name "$p"
+done
+attached_json=$(aws iam list-attached-role-policies --role-name "$role" \
+  --query 'AttachedPolicies[].PolicyArn' --output json)
+mapfile -t attached_arns < <(jq -r '.[]' <<<"$attached_json")
+for arn in "${attached_arns[@]}"; do
+  aws iam detach-role-policy --role-name "$role" --policy-arn "$arn"
+done
+
+instance_arn="arn:aws:ec2:$region:$account:instance/$instance"
+aws iam put-role-policy --role-name "$role" --policy-name "$policy_name" --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid": "Start", "Effect": "Allow", "Action": "ec2:StartInstances", "Resource": "'"$instance_arn"'"},
+    {
+      "Sid": "Lease",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "'"$instance_arn"'",
+      "Condition": {
+        "ForAllValues:StringEquals": {"aws:TagKeys": ["'"$lease_tag"'"]},
+        "Null": {"aws:TagKeys": "false"}
       }
-    ]
-  }' >/dev/null
-
-# --- CloudWatch log group ----------------------------------------------------
-if ! aws logs describe-log-groups --log-group-name-prefix /minip2p/bench \
-  --query 'logGroups[?logGroupName==`/minip2p/bench`]' --output text | grep -q .; then
-  aws logs create-log-group --log-group-name /minip2p/bench \
-    --tags project=minip2p
-  echo "created log group /minip2p/bench"
-fi
-aws logs put-retention-policy --log-group-name /minip2p/bench --retention-in-days 14
-
-# --- Task roles --------------------------------------------------------------
-ecs_trust='{
+    },
+    {"Sid": "Describe", "Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*"}
+  ]
+}'
+# Trust the unattended environment only once the permissions have converged.
+aws iam update-assume-role-policy --role-name "$role" --policy-document '{
   "Version": "2012-10-17",
   "Statement": [{
     "Effect": "Allow",
-    "Principal": {"Service": "ecs-tasks.amazonaws.com"},
-    "Action": "sts:AssumeRole",
-    "Condition": {"StringEquals": {"aws:SourceAccount": "'"$account"'"}}
+    "Principal": {"Federated": "arn:aws:iam::'"$account"':oidc-provider/token.actions.githubusercontent.com"},
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {"StringEquals": {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+      "token.actions.githubusercontent.com:sub": [
+        "repo:'"$repo"':environment:aws-bench",
+        "repo:'"$repo"':environment:aws-bench-unattended"
+      ]
+    }}
   }]
 }'
-ensure_role() {
-  local name=$1
-  if ! aws iam get-role --role-name "$name" >/dev/null 2>&1; then
-    aws iam create-role --role-name "$name" \
-      --assume-role-policy-document "$ecs_trust" \
-      --tags Key=project,Value=minip2p >/dev/null
-    echo "created role $name"
-  else
-    aws iam update-assume-role-policy --role-name "$name" \
-      --policy-document "$ecs_trust"
-  fi
-}
+echo "updated $role: trust aws-bench + aws-bench-unattended, policy $policy_name"
 
-# Strip every inline and attached policy so reruns converge the role to no
-# AWS access. JSON output distinguishes an empty list from a policy named
-# `None`, which the AWS CLI's text output cannot do.
-clear_role_permissions() {
-  local name=$1 policy_name policy_arn
-  local policy_names_json policy_arns_json policy_names_text policy_arns_text
-  local -a policy_names policy_arns
-
-  policy_names_json=$(aws iam list-role-policies --role-name "$name" \
-    --query 'PolicyNames' --output json)
-  policy_names_text=$(jq -r '.[]' <<< "$policy_names_json")
-  if [[ -n "$policy_names_text" ]]; then
-    mapfile -t policy_names <<< "$policy_names_text"
-  fi
-  for policy_name in "${policy_names[@]}"; do
-    aws iam delete-role-policy --role-name "$name" --policy-name "$policy_name"
-  done
-
-  policy_arns_json=$(aws iam list-attached-role-policies --role-name "$name" \
-    --query 'AttachedPolicies[].PolicyArn' --output json)
-  policy_arns_text=$(jq -r '.[]' <<< "$policy_arns_json")
-  if [[ -n "$policy_arns_text" ]]; then
-    mapfile -t policy_arns <<< "$policy_arns_text"
-  fi
-  for policy_arn in "${policy_arns[@]}"; do
-    aws iam detach-role-policy --role-name "$name" --policy-arn "$policy_arn"
-  done
-}
-
-# The task role runs the benchmarks and needs no AWS access.
-ensure_role minip2p-bench-task
-clear_role_permissions minip2p-bench-task
-
-# The execution role pulls the image and ships logs.
-ensure_role minip2p-bench-execution
-aws iam put-role-policy --role-name minip2p-bench-execution \
-  --policy-name pull-and-log \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [
-      {"Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*"},
-      {
-        "Effect": "Allow",
-        "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"],
-        "Resource": "arn:aws:ecr:'"$region"':'"$account"':repository/minip2p-bench"
-      },
-      {
-        "Effect": "Allow",
-        "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
-        "Resource": "arn:aws:logs:'"$region"':'"$account"':log-group:/minip2p/bench:*"
-      }
-    ]
-  }'
-
-# --- CI role policy ---------------------------------------------------------
-# The OIDC role itself (trust policy, GitHub environment binding) is created by
-# hand once; see README.md. This keeps its permissions in sync with the runner.
-if aws iam get-role --role-name minip2p-github-bench >/dev/null 2>&1; then
-  aws iam put-role-policy --role-name minip2p-github-bench \
-    --policy-name minip2p-benchmark-runner \
-    --policy-document '{
-      "Version": "2012-10-17",
-      "Statement": [
-        {"Sid": "EcrLogin", "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*"},
-        {
-          "Sid": "PushImage",
-          "Effect": "Allow",
-          "Action": [
-            "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:CompleteLayerUpload",
-            "ecr:GetDownloadUrlForLayer", "ecr:InitiateLayerUpload", "ecr:PutImage", "ecr:UploadLayerPart"
-          ],
-          "Resource": "arn:aws:ecr:'"$region"':'"$account"':repository/minip2p-bench"
-        },
-        {
-          "Sid": "TaskDefinitions",
-          "Effect": "Allow",
-          "Action": ["ecs:RegisterTaskDefinition", "ecs:DeregisterTaskDefinition", "ecs:DescribeTaskDefinition"],
-          "Resource": "*"
-        },
-        {
-          "Sid": "TagNewTaskDefinitions",
-          "Effect": "Allow",
-          "Action": "ecs:TagResource",
-          "Resource": "arn:aws:ecs:'"$region"':'"$account"':task-definition/minip2p-bench:*",
-          "Condition": {"StringEquals": {"ecs:CreateAction": "RegisterTaskDefinition"}}
-        },
-        {
-          "Sid": "RunTasks",
-          "Effect": "Allow",
-          "Action": ["ecs:RunTask", "ecs:StopTask", "ecs:DescribeTasks", "ecs:ListTasks"],
-          "Resource": "*",
-          "Condition": {"ArnEquals": {"ecs:cluster": "arn:aws:ecs:'"$region"':'"$account"':cluster/minip2p-bench"}}
-        },
-        {
-          "Sid": "PassTaskRoles",
-          "Effect": "Allow",
-          "Action": "iam:PassRole",
-          "Resource": [
-            "arn:aws:iam::'"$account"':role/minip2p-bench-task",
-            "arn:aws:iam::'"$account"':role/minip2p-bench-execution"
-          ],
-          "Condition": {"StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}}
-        },
-        {
-          "Sid": "ReadLogs",
-          "Effect": "Allow",
-          "Action": "logs:GetLogEvents",
-          "Resource": "arn:aws:logs:'"$region"':'"$account"':log-group:/minip2p/bench:*"
-        },
-        {
-          "Sid": "DefaultNetwork",
-          "Effect": "Allow",
-          "Action": ["ec2:DescribeVpcs", "ec2:DescribeSubnets", "ec2:DescribeSecurityGroups"],
-          "Resource": "*"
-        }
-      ]
-    }'
-  # Remove the policy from the previous Alchemy-based deployment, if present.
-  aws iam delete-role-policy --role-name minip2p-github-bench \
-    --policy-name minip2p-benchmark-deploy 2>/dev/null || true
-  echo "updated CI role policy"
-else
-  echo "role minip2p-github-bench not found; create it per README.md, then rerun" >&2
-fi
-
-echo "done"
+echo
+echo "Set AWS_BENCH_INSTANCE_ID=$instance on the aws-bench and aws-bench-unattended environments."

@@ -1,6 +1,7 @@
 //! A userspace emulated link for the Endpoint benches: loopback proxies that
 //! cap the rate and add delay, so a bench measures flow control at a real
-//! RTT without `tc netem` (Fargate grants no `NET_ADMIN`).
+//! RTT without `tc netem` (the bench container runs unprivileged with
+//! `--network none`).
 //!
 //! Each direction of a link is shaped on its own: a packet (UDP) or read
 //! (TCP) waits in an unbounded FIFO until the link is free, takes

@@ -107,4 +107,4 @@ RUN pnpm --filter @minip2p/node native:build \
     && cargo bench -p minip2p-pubsub --bench router_ir --no-run \
     && cargo bench -p minip2p-relay-server --bench relay_server_event_ir --no-run
 
-ENTRYPOINT ["scripts/run-fargate-benches.sh"]
+# No ENTRYPOINT: scripts/run-bench-container.sh supplies the entrypoint.

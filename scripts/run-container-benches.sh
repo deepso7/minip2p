@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
+# Runs inside the benchmark image (cwd /minip2p, the measured code) and prints
+# the result document, or a sweep's logs, as a base64 stdout marker.
+# scripts/run-bench-container.sh passes it from the trusted checkout as the
+# container's `bash -c` argument, so the measured ref never supplies it.
 set -euo pipefail
 
 : "${BENCH_GIT_SHA:?BENCH_GIT_SHA must identify the measured commit}"
-
-# Fargate's seccomp profile blocks the personality syscall that Gungraun uses to
-# disable ASLR. Run Valgrind directly; all compared AWS runs use the same mode.
-export GUNGRAUN_ALLOW_ASLR=1
-# Establishing hundreds of loopback QUIC connections can exceed the local
-# benchmark's setup guard under Fargate's fixed CPU quota. Setup is not timed.
-export MINIP2P_BENCH_SETUP_TIMEOUT_SECS=600
 
 rm -rf target/bench-results
 mkdir -p target/bench-results
