@@ -32,6 +32,8 @@ pnpm rn:android
 
 Generated files under `src/generated`, `cpp/generated`, `android`, and `ios` are committed and must not be edited directly. Android `.so` files and the iOS XCFramework are ignored build products.
 
+ubrn's Android templates are fixed through `patches/uniffi-bindgen-react-native@<version>.patch` (registered in the root `pnpm-workspace.yaml`); fix template output there rather than in the generated files. The patch makes `CMakeLists.txt` resolve ubrn and the Rust library relative to the package, and drops the template's `consumerProguardFiles 'proguard-rules.pro'`, because ubrn only writes that file for JNA bindings and AGP 9 rejects a missing one. Re-check each hunk when bumping ubrn.
+
 The Android build expects SDK 36 and NDK `28.2.13676358`. The iOS script sets the deployment target before Rust and C compilation.
 
 ## Checks

@@ -26,3 +26,15 @@ index c40f2cf1a40a851cdd374fe02f9bb519e4a128fa..dde0c65124d38df8b05a1ed484e94564
    NORMALIZE
  )
  
+diff --git a/crates/ubrn_cli/templates/jsi/android/build.kt.gradle b/crates/ubrn_cli/templates/jsi/android/build.kt.gradle
+index 372fe0ae85e1fb0e19aa5d501bc8c604210a0580..7557e9aeecaab40f1ac5149127d72f5d53f5e959 100644
+--- a/crates/ubrn_cli/templates/jsi/android/build.kt.gradle
++++ b/crates/ubrn_cli/templates/jsi/android/build.kt.gradle
+@@ -70,7 +70,6 @@ android {
+     minSdkVersion getExtOrIntegerDefault("minSdkVersion")
+     targetSdkVersion getExtOrIntegerDefault("targetSdkVersion")
+     buildConfigField "boolean", "IS_NEW_ARCHITECTURE_ENABLED", isNewArchitectureEnabled().toString()
+-    consumerProguardFiles 'proguard-rules.pro'
+ 
+     buildFeatures {
+       prefab true
