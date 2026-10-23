@@ -24,12 +24,12 @@ std = [
 ]
 
 [dependencies]
-minip2p-core = { path = "../core", version = "0.10.3", default-features = false }
-minip2p-identity = { path = "../identity", version = "0.10.3", default-features = false, features = [
+minip2p-core = { path = "../core", version = "0.10.4", default-features = false }
+minip2p-identity = { path = "../identity", version = "0.10.4", default-features = false, features = [
   "ed25519",
 ] }
-minip2p-secure-mux = { path = "../secure-mux", version = "0.10.3", default-features = false }
-minip2p-transport = { path = "../transport", version = "0.10.3", default-features = false }
+minip2p-secure-mux = { path = "../secure-mux", version = "0.10.4", default-features = false }
+minip2p-transport = { path = "../transport", version = "0.10.4", default-features = false }
 thiserror = { workspace = true }
 
 [dev-dependencies]
