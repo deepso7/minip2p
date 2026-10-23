@@ -81,8 +81,11 @@ build_pid=
 # Every benchmark is loopback or in-process, so the container gets no network
 # (`endpoint_idle`'s dual-stack variant needs IPv6 loopback, hence the sysctl).
 # Unconfined seccomp lets Gungraun disable ASLR with personality(2). Memory and
-# Docker's own log are capped so a runaway run cannot take the host down.
+# Docker's own log are capped so a runaway run cannot take the host down. The
+# socket sweeps open over a thousand descriptors, past Docker's default
+# soft limit of 1024 (Fargate allowed 65535).
 docker run -d --name "$name" --network none --memory 6g \
+  --ulimit nofile=65536:65536 \
   --log-opt max-size=100m --log-opt max-file=3 \
   --sysctl net.ipv6.conf.lo.disable_ipv6=0 \
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
