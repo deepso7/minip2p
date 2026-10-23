@@ -34,8 +34,8 @@ The rendered user data holds a live registration token, so bootstrap never print
 
 ## GitHub configuration
 
-- **Environment `aws-bench`**, with required reviewers. Variables: `AWS_BENCH_ROLE_ARN`, `AWS_BENCH_INSTANCE_ID`, and optionally `AWS_BENCH_REGION` (default `ap-south-1`).
-- **Environment `aws-bench-keepalive`**, with **no** required reviewers and deployments restricted to `main`. Same variables. Only the weekly schedule uses it.
+- **Environment `aws-bench`**, with required reviewers, for pull requests and manual runs. Variables: `AWS_BENCH_ROLE_ARN`, `AWS_BENCH_INSTANCE_ID`, and optionally `AWS_BENCH_REGION` (default `ap-south-1`).
+- **Environment `aws-bench-unattended`**, with **no** required reviewers and deployments restricted to the `main` branch and `v*` tags. Same variables. Published releases and the weekly schedule use it, so neither waits for approval: both run only trusted code, a release tag or `main`, which the job-start hook also enforces on the instance.
 - **Actions setting** "Require approval for all external contributors", so no fork pull request's workflow runs without a maintainer's approval.
 
 The OIDC role `minip2p-github-bench` is created once by hand with a maximum session duration of at least one hour. `bootstrap.sh` then rewrites its trust to exactly this:
@@ -55,7 +55,7 @@ The OIDC role `minip2p-github-bench` is created once by hand with a maximum sess
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
           "token.actions.githubusercontent.com:sub": [
             "repo:deepso7/minip2p:environment:aws-bench",
-            "repo:deepso7/minip2p:environment:aws-bench-keepalive"
+            "repo:deepso7/minip2p:environment:aws-bench-unattended"
           ]
         }
       }
@@ -90,7 +90,7 @@ The lease cannot fully close the race with a watchdog that read the old lease ju
 
 ## Keepalive
 
-GitHub removes a self-hosted runner that has not connected for 14 days. A weekly `schedule` run therefore starts the instance through `aws-bench-keepalive`, runs a no-op `keepalive` job on it, and lets the watchdog stop it again. GitHub can drop scheduled runs, and it disables schedules on public repositories after 60 days without activity. If the runner shows offline in the repository settings and bench jobs stay queued, run `bootstrap.sh --replace`.
+GitHub removes a self-hosted runner that has not connected for 14 days. A weekly `schedule` run therefore starts the instance through `aws-bench-unattended`, runs a no-op `keepalive` job on it, and lets the watchdog stop it again. GitHub can drop scheduled runs, and it disables schedules on public repositories after 60 days without activity. If the runner shows offline in the repository settings and bench jobs stay queued, run `bootstrap.sh --replace`.
 
 ## Re-running
 

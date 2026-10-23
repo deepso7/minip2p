@@ -279,7 +279,7 @@ aws iam put-role-policy --role-name "$role" --policy-name "$policy_name" --polic
     {"Sid": "Describe", "Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*"}
   ]
 }'
-# Trust the keepalive environment only once the permissions have converged.
+# Trust the unattended environment only once the permissions have converged.
 aws iam update-assume-role-policy --role-name "$role" --policy-document '{
   "Version": "2012-10-17",
   "Statement": [{
@@ -290,12 +290,12 @@ aws iam update-assume-role-policy --role-name "$role" --policy-document '{
       "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
       "token.actions.githubusercontent.com:sub": [
         "repo:'"$repo"':environment:aws-bench",
-        "repo:'"$repo"':environment:aws-bench-keepalive"
+        "repo:'"$repo"':environment:aws-bench-unattended"
       ]
     }}
   }]
 }'
-echo "updated $role: trust aws-bench + aws-bench-keepalive, policy $policy_name"
+echo "updated $role: trust aws-bench + aws-bench-unattended, policy $policy_name"
 
 echo
-echo "Set AWS_BENCH_INSTANCE_ID=$instance on the aws-bench and aws-bench-keepalive environments."
+echo "Set AWS_BENCH_INSTANCE_ID=$instance on the aws-bench and aws-bench-unattended environments."

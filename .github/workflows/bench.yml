@@ -30,13 +30,15 @@ env:
 
 jobs:
   # Wakes the self-hosted bench instance (normally stopped; its watchdog
-  # powers it off when idle). The environment is the approval gate for every
-  # run except the weekly keepalive.
+  # powers it off when idle). `aws-bench` is the approval gate for pull
+  # requests and manual runs; releases and the weekly keepalive run only
+  # trusted code from a tag or `main`, so they use the reviewer-free
+  # `aws-bench-unattended`.
   start-runner:
     if: >-
       (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    environment: ${{ github.event_name == 'schedule' && 'aws-bench-keepalive' || 'aws-bench' }}
+    environment: ${{ (github.event_name == 'release' || github.event_name == 'schedule') && 'aws-bench-unattended' || 'aws-bench' }}
     timeout-minutes: 15
     permissions:
       contents: read

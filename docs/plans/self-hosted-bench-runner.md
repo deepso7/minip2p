@@ -39,7 +39,7 @@ The instance and its disk persist between runs, so a container escape in one job
 
 ```
 GitHub (pull_request_target / release / workflow_dispatch / weekly schedule)
-  ├─ job `start-runner`   ubuntu-latest, environment aws-bench (aws-bench-keepalive on schedule), OIDC
+  ├─ job `start-runner`   ubuntu-latest, environment aws-bench (aws-bench-unattended for releases and the schedule), OIDC
   │     └─ sets a lease tag, then ec2:StartInstances on the one bench instance (idempotent)
   ├─ job `bench`          needs start-runner; runs-on [self-hosted, linux, x64, minip2p-bench]
   │     └─ instance `minip2p-bench`: Docker, GitHub Actions runner, build cache on its disk
@@ -82,7 +82,7 @@ Run once by the maintainer with administrator credentials; idempotent. It:
    - `ec2:CreateTags` on that instance, with `ForAllValues:StringEquals` `aws:TagKeys = ["bench-lease-until"]` and `Null: {"aws:TagKeys": "false"}`, so it can set only that key. The value is not restricted in IAM; the watchdog treats an implausible value as expired;
    - `ec2:DescribeInstances`, which cannot be resource-scoped.
 
-   The ECS, ECR, logs, and `iam:PassRole` permissions go. The OIDC trust gains a second subject, `environment:aws-bench-keepalive`, beside `environment:aws-bench` (see Keepalive). The root volume uses the default EBS encryption key, so no KMS permissions are needed.
+   The ECS, ECR, logs, and `iam:PassRole` permissions go. The OIDC trust gains a second subject, `environment:aws-bench-unattended`, beside `environment:aws-bench` (see Keepalive). The root volume uses the default EBS encryption key, so no KMS permissions are needed.
 
 `--replace` terminates the instance and runs steps 2–4 again. `--ssh-from` and `--no-ssh` only touch the security group.
 
@@ -107,7 +107,7 @@ Run once by the maintainer with administrator credentials; idempotent. It:
 ### Workflow changes (`.github/workflows/bench.yml`)
 
 - **Triggers:** add `schedule: - cron: '17 6 * * 1'` (weekly). GitHub removes a non-ephemeral self-hosted runner that has not connected for 14 days, which would leave bench jobs queued with no runner. The weekly run starts the instance, runs a no-op `keepalive` job on it, and lets the watchdog stop it again.
-- **Keepalive environment:** a second environment, `aws-bench-keepalive`, with **no** required reviewers and deployment restricted to `main`, so the weekly start never waits for a human. It gets the same `AWS_BENCH_ROLE_ARN` and `AWS_BENCH_INSTANCE_ID` variables. It can only start the instance and run trusted code from `main`, which a writer could do anyway. `start-runner` picks it with `environment: ${{ github.event_name == 'schedule' && 'aws-bench-keepalive' || 'aws-bench' }}`.
+- **Unattended environment:** a second environment, `aws-bench-unattended`, with **no** required reviewers and deployment restricted to the `main` branch and `v*` tags, so neither the weekly start nor a published release waits for a human. It gets the same `AWS_BENCH_ROLE_ARN` and `AWS_BENCH_INSTANCE_ID` variables. It can only start the instance and run trusted code from `main` or a release tag, which a writer could do anyway. `start-runner` picks it with `environment: ${{ (github.event_name == 'release' || github.event_name == 'schedule') && 'aws-bench-unattended' || 'aws-bench' }}`. (Added after rollout: releases originally went through `aws-bench` and waited for approval.)
 
   GitHub can drop a scheduled run, and it disables schedules on public repos after 60 days without activity, so the keepalive keeps the runner registered only while those hold. The job-start hook logs each job, and the README's recovery for "no runner online" is `bootstrap.sh --replace`, which creates a fresh, freshly registered instance (one cold build afterwards).
 
