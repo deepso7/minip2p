@@ -49,20 +49,19 @@ GitHub (pull_request_target / release / workflow_dispatch / weekly schedule)
 
 ### The instance
 
-- **Type:** `c7a.xlarge` (4 vCPU on 4 physical cores, since c7a has no SMT; 8 GiB) in `us-east-1`, the region the existing role and `AWS_BENCH_REGION` already use. On-demand, not spot: an interruption mid-run is exactly the unreliability being removed. If 8 GiB proves tight for the image build, `m7a.xlarge` (same cores, 16 GiB) is the fallback.
-- **OS and disk:** Ubuntu 24.04 LTS, 80 GB gp3 root volume. That leaves room for the BuildKit cache (pruned to 40 GB), one image, and the runner's checkouts.
+- **Type:** `m8a.xlarge` (4 vCPU on 4 physical AMD cores, since m8a has no SMT; 16 GiB) in `ap-south-1`, beside mito. `c7a` and `m7a` are not offered there. On-demand, not spot: an interruption mid-run is exactly the unreliability being removed. - **OS and disk:** Ubuntu 24.04 LTS, 80 GB gp3 root volume. That leaves room for the BuildKit cache (pruned to 40 GB), one image, and the runner's checkouts.
 - **Network:** a dedicated VPC created by bootstrap: one `/24` with one public subnet, an internet gateway, and a route table whose only non-local route is `0.0.0.0/0` to it. There is no peering, endpoints, or other resources. The instance gets a public IPv4 for egress (no NAT gateway to pay for), and its security group has **no inbound rules**. The default VPC's private routes and anything else in the account are out of reach, and it is not on the tailnet, so PR code can reach only the public internet and its own VPC's DNS resolver.
 - **IAM / metadata:** no instance profile. IMDSv2 is required with hop limit 1, so containers cannot reach it; Docker's default builder also runs `RUN` steps on the bridge network, which the limit covers. Instance tags in metadata are enabled so the watchdog can read the lease tag. Nothing secret sits behind IMDS (see the registration token below).
 - **Admin access:** none by default. `bootstrap.sh --ssh-from <cidr>` temporarily adds a port-22 rule and `--no-ssh` removes it. The key pair is created by bootstrap and stays on the maintainer's machine.
 - **Instance-initiated shutdown behaviour:** `stop`, so a poweroff from inside stops (not terminates) the instance and keeps the disk.
 
-Cost, at us-east-1 on-demand ($0.205/h for c7a.xlarge):
+Cost, at ap-south-1 on-demand ($0.256/h for m8a.xlarge):
 
-- about 40 minutes per run, including boot and the idle tail, which is about $0.15;
-- storage, about $6.40/month for the 80 GB gp3 volume;
+- about 40 minutes per run, including boot and the idle tail, which is about $0.17;
+- storage, about $7.30/month for the 80 GB gp3 volume;
 - the public IPv4 address, billed only while the instance runs.
 
-At around 50 runs a month the total is about $15/month.
+At around 50 runs a month the total is about $16/month.
 
 ### Provisioning (`infra/bench/bootstrap.sh`, rewritten)
 
@@ -79,7 +78,7 @@ Run once by the maintainer with administrator credentials; idempotent. It:
 
 3. Prints the instance ID for the maintainer to store as the `AWS_BENCH_INSTANCE_ID` variable on the `aws-bench` environment.
 4. Replaces the CI role `minip2p-github-bench`'s inline policy with exactly:
-   - `ec2:StartInstances` on `arn:aws:ec2:us-east-1:<account>:instance/<id>`;
+   - `ec2:StartInstances` on `arn:aws:ec2:ap-south-1:<account>:instance/<id>`;
    - `ec2:CreateTags` on that instance, with `ForAllValues:StringEquals` `aws:TagKeys = ["bench-lease-until"]` and `Null: {"aws:TagKeys": "false"}`, so it can set only that key. The value is not restricted in IAM; the watchdog treats an implausible value as expired;
    - `ec2:DescribeInstances`, which cannot be resource-scoped.
 
@@ -167,7 +166,7 @@ Until the next stable release writes the first new baseline, `compare` takes its
 - New ADR `docs/adr/0025-benchmarks-on-an-on-demand-ec2-runner.md`. It records the context (Fargate failure rate, ASLR, CPU quota), the decision and the trust boundary. Alternatives considered:
   - GitHub-hosted runners: noisy, variable hardware;
   - mito: free, but shares a dev box, needs heavy isolation, and loses cores permanently;
-  - an always-on instance: about $150/month;
+  - an always-on instance: about $190/month;
   - JIT runners registered per start: no 14-day removal and a clean runner each time, but they need a GitHub App or PAT secret with repo admin rights, and a way to hand the config to the instance. Deferred;
   - a fresh instance per job: cold builds and more moving parts; this is the follow-up trigger;
   - staying on Fargate with retries.
@@ -191,7 +190,7 @@ After two weeks of healthy runs, as a separate step the maintainer approves, del
    - the security group has no inbound rules and the instance has no IAM profile;
    - the instance's shutdown behaviour is `stop`.
 2. **Watchdog and lease.** Leave the freshly booted instance idle. It must stop itself 10–11 minutes after first-boot setup finishes. Start it with `scripts/start-bench-runner.sh`. The runner must come back online and the instance must stay up until the 20-minute lease expires, then stop within a minute or so. The 10 idle minutes have already elapsed during the lease. Also start it while it is `stopping`: the script must end with it `running`. Finally set the tag a year ahead by hand on a freshly started instance. That lease counts as expired, so the idle instance must stop about 10 minutes after boot.
-3. **Dry run on the instance.** With `--ssh-from`, run `scripts/run-bench-container.sh` against `main` by hand, starting from an empty BuildKit cache. Record the build's peak memory (`/proc/pressure/memory` and `free`, sampled). If it comes within 1 GiB of 8 GiB, switch to `m7a.xlarge` before going further. Check that a full run completes, Gungraun reports ASLR disabled, the `quic_dual_stack` rows are present, `current.json` validates, and the elapsed time is recorded. Also run one sweep (`BENCH_SWEEP=all`) and confirm the extracted `rtt/` tree passes the file-type check. Then `--no-ssh`.
+3. **Dry run on the instance.** With `--ssh-from`, run `scripts/run-bench-container.sh` against `main` by hand, starting from an empty BuildKit cache. Record the build's peak memory (`/proc/pressure/memory` and `free`, sampled). It must stay well under the 16 GiB; the bench container itself is capped at 6 GiB. Check that a full run completes, Gungraun reports ASLR disabled, the `quic_dual_stack` rows are present, `current.json` validates, and the elapsed time is recorded. Also run one sweep (`BENCH_SWEEP=all`) and confirm the extracted `rtt/` tree passes the file-type check. Then `--no-ssh`.
 4. **Determinism.** Run twice back to back: Ir rows must be identical. Record the wall-clock spread and compare it with the last two Fargate artifacts.
 5. **Network probe.** A throwaway `docker build` whose `RUN` tries IMDS must fail (hop limit 1). From the host, nothing but the VPC resolver should be reachable in private ranges.
 6. **Actions path.** A `workflow_dispatch` of `bench.yml` on the feature branch must be refused by the hook, since its ref is not `main`; a dispatch at a `v*` tag likewise. Main does not yet have the new helper scripts, and both of `bench.yml`'s trusted checkouts use the default branch on a dispatch, so a dispatch on the feature branch cannot exercise them. For the end-to-end check, use a throwaway branch off the feature branch that makes two temporary changes: it points those checkouts at `github.sha`, and it allows its own ref in the hook. Dispatch `bench.yml` on it and confirm the whole path:
@@ -226,5 +225,4 @@ After two weeks of healthy runs, as a separate step the maintainer approves, del
 
 ## Open questions
 
-1. `c7a.xlarge` (8 GiB, $0.205/h), or `m7a.xlarge` (16 GiB, $0.232/h, about 13% more) from the start? Rollout step 3 measures the build's peak memory either way.
-2. Should the weekly keepalive also run the benchmarks against `main` as a drift check (about $0.15/week), or stay a no-op?
+1. Should the weekly keepalive also run the benchmarks against `main` as a drift check (about $0.17/week), or stay a no-op?

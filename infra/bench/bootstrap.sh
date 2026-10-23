@@ -11,8 +11,8 @@
 #   infra/bench/bootstrap.sh --render-user-data <file>
 #                                                write the user data with a dummy token; no AWS calls
 #
-# Env: AWS_BENCH_REGION (default us-east-1), BENCH_INSTANCE_TYPE (default
-# c7a.xlarge), BENCH_SSH_KEY (private key path, default ~/.ssh/minip2p-bench.pem).
+# Env: AWS_BENCH_REGION (default ap-south-1), BENCH_INSTANCE_TYPE (default
+# m8a.xlarge), BENCH_SSH_KEY (private key path, default ~/.ssh/minip2p-bench.pem).
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -20,7 +20,7 @@ repo=deepso7/minip2p
 name=minip2p-bench
 sg_name=minip2p-bench-runner
 role=minip2p-github-bench
-instance_type=${BENCH_INSTANCE_TYPE:-c7a.xlarge}
+instance_type=${BENCH_INSTANCE_TYPE:-m8a.xlarge}
 key_file=${BENCH_SSH_KEY:-$HOME/.ssh/minip2p-bench.pem}
 lease_tag=bench-lease-until
 
@@ -65,7 +65,7 @@ if [[ "$mode" == render ]]; then
   exit 0
 fi
 
-region=${AWS_BENCH_REGION:-us-east-1}
+region=${AWS_BENCH_REGION:-ap-south-1}
 export AWS_REGION="$region" AWS_DEFAULT_REGION="$region"
 account=$(aws sts get-caller-identity --query Account --output text)
 tags="{Key=project,Value=minip2p},{Key=Name,Value=$name}"

@@ -1,12 +1,12 @@
 # Bench runner: an on-demand EC2 instance
 
-The Bench workflow runs on one dedicated EC2 instance, `minip2p-bench` (`c7a.xlarge`: 4 physical cores, 8 GiB, in `us-east-1`). The instance is a persistent self-hosted GitHub Actions runner with the labels `self-hosted,linux,x64,minip2p-bench`, and it stays stopped between runs. For each run, a hosted `start-runner` job assumes the CI role through OIDC, sets a lease tag and starts the instance with `scripts/start-bench-runner.sh`. The `bench` job then runs on the instance: `scripts/run-bench-container.sh` builds the image from `infra/bench/Dockerfile` with the local BuildKit cache and runs the suite in one container. The result is uploaded as the `bench-results` artifact, and an on-instance watchdog stops the instance once it is idle. The design and its trade-offs are in [ADR 0025](../../docs/adr/0025-benchmarks-on-an-on-demand-ec2-runner.md) and [the plan](../../docs/plans/self-hosted-bench-runner.md).
+The Bench workflow runs on one dedicated EC2 instance, `minip2p-bench` (`m8a.xlarge`: 4 physical cores without SMT, 16 GiB, in `ap-south-1`). The instance is a persistent self-hosted GitHub Actions runner with the labels `self-hosted,linux,x64,minip2p-bench`, and it stays stopped between runs. For each run, a hosted `start-runner` job assumes the CI role through OIDC, sets a lease tag and starts the instance with `scripts/start-bench-runner.sh`. The `bench` job then runs on the instance: `scripts/run-bench-container.sh` builds the image from `infra/bench/Dockerfile` with the local BuildKit cache and runs the suite in one container. The result is uploaded as the `bench-results` artifact, and an on-instance watchdog stops the instance once it is idle. The design and its trade-offs are in [ADR 0025](../../docs/adr/0025-benchmarks-on-an-on-demand-ec2-runner.md) and [the plan](../../docs/plans/self-hosted-bench-runner.md).
 
 Published stable releases produce the baseline stored on `bench-data`. Pull requests from this repository run the same job and compare their head commit with that release when a baseline is available. Fork pull requests skip the bench job and comparison. Manual runs measure the default branch and produce artifacts, but never change the release baseline.
 
 ## Resources
 
-`bootstrap.sh` creates everything, tagged `project=minip2p`, in `AWS_BENCH_REGION` (default `us-east-1`):
+`bootstrap.sh` creates everything, tagged `project=minip2p`, in `AWS_BENCH_REGION` (default `ap-south-1`):
 
 - a dedicated VPC `10.77.0.0/24` with one public subnet, an internet gateway, and a route table whose only non-local route is `0.0.0.0/0` to it. There is no peering, no endpoints, and no NAT gateway;
 - the security group `minip2p-bench-runner`, with no inbound rules;
@@ -21,7 +21,7 @@ The instance's first boot runs `cloud-init.yaml`, which bootstrap renders with t
 With administrator credentials exported and `gh` logged in as a repository admin:
 
 ```bash
-AWS_BENCH_REGION=us-east-1 infra/bench/bootstrap.sh
+AWS_BENCH_REGION=ap-south-1 infra/bench/bootstrap.sh
 ```
 
 It is idempotent and finds existing resources by tag. Rerun it to recreate anything missing or to restore the CI role's trust and policy. It prints the instance ID to store as `AWS_BENCH_INSTANCE_ID`. `BENCH_INSTANCE_TYPE` overrides the instance type for a new instance.
@@ -34,7 +34,7 @@ The rendered user data holds a live registration token, so bootstrap never print
 
 ## GitHub configuration
 
-- **Environment `aws-bench`**, with required reviewers. Variables: `AWS_BENCH_ROLE_ARN`, `AWS_BENCH_INSTANCE_ID`, and optionally `AWS_BENCH_REGION` (default `us-east-1`).
+- **Environment `aws-bench`**, with required reviewers. Variables: `AWS_BENCH_ROLE_ARN`, `AWS_BENCH_INSTANCE_ID`, and optionally `AWS_BENCH_REGION` (default `ap-south-1`).
 - **Environment `aws-bench-keepalive`**, with **no** required reviewers and deployments restricted to `main`. Same variables. Only the weekly schedule uses it.
 - **Actions setting** "Require approval for all external contributors", so no fork pull request's workflow runs without a maintainer's approval.
 
@@ -120,7 +120,7 @@ A manual dispatch of the Bench workflow with `sweep` set (for example `all`, or 
 
 ## Cost
 
-On-demand `c7a.xlarge` in `us-east-1` is about $0.205/hour, billed only while running. A run, including boot and the idle tail, takes about 40 minutes, about $0.15. The 80 GB gp3 volume costs about $6.40/month, and the public IPv4 address is billed only while the instance runs. At about 50 runs a month, the total is about $15/month.
+On-demand `m8a.xlarge` in `ap-south-1` is about $0.256/hour, billed only while running. A run, including boot and the idle tail, takes about 40 minutes, about $0.17. The 80 GB gp3 volume costs about $7.30/month, and the public IPv4 address is billed only while the instance runs. At about 50 runs a month, the total is about $16/month.
 
 ## Running by hand on the instance
 
@@ -128,7 +128,7 @@ Allow SSH, start the instance, and log in:
 
 ```bash
 infra/bench/bootstrap.sh --ssh-from "$(curl -s https://checkip.amazonaws.com)/32"
-AWS_REGION=us-east-1 AWS_BENCH_INSTANCE_ID=i-... scripts/start-bench-runner.sh
+AWS_REGION=ap-south-1 AWS_BENCH_INSTANCE_ID=i-... scripts/start-bench-runner.sh
 ssh -i ~/.ssh/minip2p-bench.pem ubuntu@<public IP>
 ```
 

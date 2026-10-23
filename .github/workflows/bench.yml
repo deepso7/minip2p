@@ -26,7 +26,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 env:
-  AWS_REGION: ${{ vars.AWS_BENCH_REGION || 'us-east-1' }}
+  AWS_REGION: ${{ vars.AWS_BENCH_REGION || 'ap-south-1' }}
 
 jobs:
   # Wakes the self-hosted bench instance (normally stopped; its watchdog

@@ -4,8 +4,8 @@ The Bench workflow ran every benchmark in one AWS Fargate task, and it was unrel
 
 ## Decision
 
-- **One dedicated, normally stopped `c7a.xlarge` in `us-east-1` is a persistent self-hosted runner** with the label `minip2p-bench`. A hosted `start-runner` job, approved through the `aws-bench` environment, assumes an OIDC role that can only tag and start that one instance. It sets a `bench-lease-until` tag and starts it. The `bench` job then builds and runs the benchmark container on the instance with a local BuildKit cache. A per-minute watchdog on the instance powers it off (shutdown behaviour `stop`) once the lease has expired and no job has run for 10 minutes, or when a job is older than 120 minutes.
-- **The whole machine is the benchmark.** c7a has no SMT, so the four vCPUs are four physical cores. Nothing else runs there, and the container runs with `seccomp=unconfined` and `--network none`, so Gungraun disables ASLR and the setup-timeout override goes.
+- **One dedicated, normally stopped `m8a.xlarge` in `ap-south-1` is a persistent self-hosted runner** with the label `minip2p-bench`. A hosted `start-runner` job, approved through the `aws-bench` environment, assumes an OIDC role that can only tag and start that one instance. It sets a `bench-lease-until` tag and starts it. The `bench` job then builds and runs the benchmark container on the instance with a local BuildKit cache. A per-minute watchdog on the instance powers it off (shutdown behaviour `stop`) once the lease has expired and no job has run for 10 minutes, or when a job is older than 120 minutes.
+- **The whole machine is the benchmark.** m8a has no SMT, so the four vCPUs are four physical cores. Nothing else runs there, and the container runs with `seccomp=unconfined` and `--network none`, so Gungraun disables ASLR and the setup-timeout override goes.
 - **The instance holds nothing.** It has no instance profile, IMDSv2 with hop limit 1, a security group with no inbound rules, and its own VPC whose only route out is the internet gateway. It is not on the tailnet. Admin SSH is added and removed by `bootstrap.sh` on demand.
 - **A weekly keepalive** runs through a second environment, `aws-bench-keepalive`, with no reviewers and only `main` allowed. It keeps the runner from being removed after 14 days offline.
 
@@ -19,7 +19,7 @@ The instance and its disk persist between runs, so a container escape could tamp
 
 - **GitHub-hosted runners.** They are noisy, and the hardware varies between runs.
 - **mito, the maintainer's always-on dev box.** It is free, but it would mix PR code and benchmark noise with dev work. That would need a permanent CPU split, a restricted user, egress filtering, and cgroup limits, and it would lose those cores to the benchmarks all the time.
-- **An always-on instance.** About $150/month, against about $15 on demand.
+- **An always-on instance.** About $190/month, against about $16 on demand.
 - **JIT runners registered per start.** They avoid the 14-day removal and give a clean runner each time. But they need a GitHub App or PAT secret with repository admin rights, and a way to hand the JIT config to the instance. Deferred.
 - **A fresh instance per job.** It would close the persistence gap, but every build would be cold and there would be more moving parts. This is the follow-up if outside contributors ever need benchmarks.
 - **Staying on Fargate with retries.** Retries multiply the slow ECR/ECS path without fixing ASLR or the CPU quota.
