@@ -315,9 +315,10 @@ describe("@minip2p/node", () => {
         const inbound = await inboundPromise;
         const payload = Uint8Array.from({ length: size }, (_, i) => i % 251);
         let accepted = false;
-        const written = outbound.write(payload).then(() => {
+        const written = (async () => {
+          await outbound.write(payload);
           accepted = true;
-        });
+        })();
         outbound.closeWrite();
 
         // Nothing reads yet: the receive window fills and the writer waits.

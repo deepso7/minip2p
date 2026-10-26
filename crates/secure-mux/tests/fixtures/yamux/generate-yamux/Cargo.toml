@@ -8,5 +8,5 @@ rust-version = "1.91"
 publish = false
 
 [dependencies]
-futures = "=0.3.31"
+futures = "=0.3.34"
 yamux = "=0.13.8"

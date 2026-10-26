@@ -15,11 +15,11 @@ allowBuilds:
   esbuild: true
 
 catalog:
-  "@types/node": 26.5.0
-  "@types/react": 19.2.18
-  del-cli: 7.0.0
-  react: 19.2.8
-  react-native: 0.86.3
+  "@types/node": 26.6.5
+  "@types/react": 19.3.0
+  del-cli: 8.0.1
+  react: 19.3.0
+  react-native: 0.88.0
   typescript: 7.0.2
 
 minimumReleaseAge: 0

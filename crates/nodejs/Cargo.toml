@@ -64,12 +64,12 @@ allow_attributes_without_reason = "warn"
 
 [dependencies]
 minip2p-ffi-core = { path = "../ffi-core", features = ["serde"] }
-napi = { version = "=3.12.2", default-features = false, features = [
+napi = { version = "=3.15.0", default-features = false, features = [
   "napi8",
   "serde-json",
 ] }
-napi-derive = "=3.6.3"
+napi-derive = "=3.6.13"
 serde = { workspace = true, features = ["std"] }
 
 [build-dependencies]
-napi-build = "=2.4.1"
+napi-build = "=2.6.0"

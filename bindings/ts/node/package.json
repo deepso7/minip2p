@@ -55,7 +55,7 @@
   },
   "devDependencies": {
     "@minip2p/test-fixtures": "workspace:*",
-    "@napi-rs/cli": "3.9.0",
+    "@napi-rs/cli": "3.10.9",
     "@types/node": "catalog:",
     "del-cli": "catalog:",
     "typescript": "catalog:"
