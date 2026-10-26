@@ -25,4 +25,10 @@ export default defineConfig({
     "bindings/ts/web/test-results",
     "bindings/ts/web/playwright-report",
   ],
+  rules: {
+    // Fire-and-forget `.then(onFulfilled, onRejected)` handles both outcomes,
+    // and a final callback has no consumer for its return value.
+    "promise/always-return": ["error", { ignoreLastCallback: true }],
+    "promise/catch-or-return": ["error", { allowThen: true }],
+  },
 });

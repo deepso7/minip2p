@@ -1867,7 +1867,7 @@ export class Minip2pBase {
       return;
     }
     this.#flushScheduled = true;
-    Promise.resolve().then(() => {
+    queueMicrotask(() => {
       this.#flush();
     });
   }
