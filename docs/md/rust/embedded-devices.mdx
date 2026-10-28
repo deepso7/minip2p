@@ -74,7 +74,7 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
 
 Prefer a real interface address over `0.0.0.0` when Identify and discovery should advertise something peers can dial right away. When DHCP or SLAAC changes the interface addresses, update the shared smoltcp interface through a `SmoltcpStack` clone you kept from before `.smoltcp(stack)`; a wildcard listener follows the change on later polls, and Identify advertises the new address without another `listen`.
 
-Optional services go on the same builder. The following example requires the `smoltcp` and `pubsub` features because signed discovery uses pubsub:
+Optional services go on the same builder. The following example requires the `smoltcp` and `discovery` features (`discovery` includes the pubsub it runs on):
 
 ```rust
 let mut endpoint = Endpoint::portable(&identity, entropy)
