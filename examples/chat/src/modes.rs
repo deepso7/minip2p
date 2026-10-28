@@ -40,6 +40,9 @@ fn build_endpoint(
     relays: &[PeerAddr],
     options: &ChatOptions,
 ) -> Result<ChatEndpoint, Box<dyn Error>> {
+    if options.relay_only && relays.is_empty() {
+        return Err("--relay-only needs at least one --relay".into());
+    }
     let keypair = load_keypair(options.key_path.as_deref(), role)?;
     let mut builder = Endpoint::builder()
         .identity(keypair)

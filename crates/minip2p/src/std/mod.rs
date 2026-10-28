@@ -1838,7 +1838,8 @@ impl EndpointBuilder {
     /// server with its announce addresses.
     ///
     /// Without an explicit config, AutoNAT servers alone hold no
-    /// reservation; relays keep the default policy. Discovery and mDNS turn
+    /// reservation; relays keep the default policy, with DCUtR only where
+    /// the endpoint runs it. Discovery and mDNS turn
     /// NAT on in setup, not here.
     fn take_capabilities(&mut self) -> Capabilities {
         #[cfg_attr(
@@ -1852,7 +1853,12 @@ impl EndpointBuilder {
             let relays = !self.relays.is_empty();
             let mut config = self.nat_config.take().unwrap_or_else(|| {
                 if relays {
-                    NatConfig::default()
+                    // DCUtR only where this endpoint runs it, so `.relay(..)`
+                    // alone also binds without QUIC.
+                    NatConfig {
+                        dcutr: STD_PLATFORM.runs_dcutr,
+                        ..NatConfig::default()
+                    }
                 } else {
                     setup::no_reservation_nat()
                 }
