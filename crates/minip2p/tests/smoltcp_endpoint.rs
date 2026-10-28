@@ -11,12 +11,14 @@ extern crate alloc;
 use alloc::{collections::VecDeque, rc::Rc, vec, vec::Vec};
 use core::cell::RefCell;
 
+#[cfg(feature = "pubsub")]
+use minip2p::GossipsubEvent;
 use minip2p::smoltcp::iface::{Config, Interface};
 use minip2p::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use minip2p::smoltcp::time::Instant;
 use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
-#[cfg(feature = "pubsub")]
-use minip2p::{BeaconConfig, GossipsubError, GossipsubEvent};
+#[cfg(feature = "discovery")]
+use minip2p::{BeaconConfig, GossipsubError};
 use minip2p::{
     ConnectOutcome, ConnectionId, Deadline, DiscoveryEvent, Ed25519Keypair, Endpoint,
     EndpointEvent, EntropySource, Multiaddr, Now, PeerAddr, PeerId, SmoltcpConfig,
@@ -172,7 +174,7 @@ fn endpoint(device: VirtualDevice, cidr: &str, identity: &Ed25519Keypair, seed: 
 }
 
 #[test]
-#[cfg(feature = "portable-autonat")]
+#[cfg(feature = "autonat")]
 fn portable_autonat_builds_without_relay_state() {
     let local = identity(120);
     let server = identity(121);
@@ -205,7 +207,7 @@ fn portable_autonat_builds_without_relay_state() {
 }
 
 #[test]
-#[cfg(feature = "portable-autonat")]
+#[cfg(feature = "autonat")]
 fn autonat_picks_up_listen_addresses_bound_after_build() {
     let local = identity(140);
     let server = identity(141);
@@ -254,95 +256,6 @@ fn autonat_picks_up_listen_addresses_bound_after_build() {
         now_ms += 100;
     }
     panic!("AutoNAT never probed after a post-build listen");
-}
-
-#[test]
-#[cfg(feature = "portable-autonat")]
-fn portable_nat_rejects_an_empty_policy() {
-    let local = identity(123);
-    let result = Endpoint::portable(&local, CountingEntropy(124))
-        .smoltcp(stack(
-            Wire::default().dialer_device(),
-            &format!("{DIALER_IP}/24"),
-        ))
-        .nat_config(minip2p::NatConfig::default())
-        .build();
-    let error = match result {
-        Ok(_) => panic!("empty portable NAT policy must be invalid"),
-        Err(error) => error,
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("at least one relay or AutoNAT server")
-    );
-}
-
-#[test]
-#[cfg(all(feature = "portable-autonat", not(feature = "portable-relay")))]
-fn portable_autonat_rejects_relay_addresses_without_relay_support() {
-    let local = identity(125);
-    let relay = identity(126);
-    let relay_addr = PeerAddr::new(
-        "/ip4/192.168.1.10/tcp/4001".parse().unwrap(),
-        relay.peer_id(),
-    )
-    .unwrap();
-    let config = minip2p::NatConfig {
-        relays: vec![relay_addr],
-        force_relay: true,
-        reservation_policy: minip2p::ReservationPolicy::Never,
-        ..minip2p::NatConfig::default()
-    };
-
-    let result = Endpoint::portable(&local, CountingEntropy(127))
-        .smoltcp(stack(
-            Wire::default().dialer_device(),
-            &format!("{DIALER_IP}/24"),
-        ))
-        .nat_config(config)
-        .build();
-    let error = match result {
-        Ok(_) => panic!("relay addresses must require portable-relay"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("relay addresses require the portable-relay feature")
-    );
-}
-
-#[test]
-#[cfg(feature = "portable-autonat")]
-fn portable_autonat_rejects_reservation_policy_without_a_relay() {
-    let local = identity(128);
-    let server = identity(129);
-    let config = minip2p::NatConfig {
-        autonat_servers: vec![
-            PeerAddr::new(
-                "/ip4/192.168.1.9/tcp/4001".parse().unwrap(),
-                server.peer_id(),
-            )
-            .unwrap(),
-        ],
-        reservation_policy: minip2p::ReservationPolicy::Always,
-        ..minip2p::NatConfig::default()
-    };
-
-    let result = Endpoint::portable(&local, CountingEntropy(130))
-        .smoltcp(stack(
-            Wire::default().dialer_device(),
-            &format!("{DIALER_IP}/24"),
-        ))
-        .nat_config(config)
-        .build();
-    let error = match result {
-        Ok(_) => panic!("reservation policy without a relay must be invalid"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("requires at least one relay"));
 }
 
 fn has_ready(events: &[EndpointEvent], peer: &PeerId) -> bool {
@@ -620,7 +533,7 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
         .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
         .mdns()
         .mdns_carrier_config(carrier.clone());
-    #[cfg(feature = "pubsub")]
+    #[cfg(feature = "discovery")]
     let a_builder = a_builder.gossipsub().discovery();
     let mut a = a_builder
         .protocol(PROTOCOL)
@@ -631,7 +544,7 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
         .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
         .mdns()
         .mdns_carrier_config(carrier);
-    #[cfg(feature = "pubsub")]
+    #[cfg(feature = "discovery")]
     let b_builder = b_builder.gossipsub().discovery();
     let mut b = b_builder
         .protocol(PROTOCOL)
@@ -677,15 +590,15 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
             matches!(event, EndpointEvent::PingRttMeasured { peer_id, .. }
                 if peer_id == &b_peer)
         });
-        #[cfg(feature = "pubsub")]
+        #[cfg(feature = "discovery")]
         let a_merged = a.known_peers().iter().any(|known| {
             known.peer == b_peer && !known.beacon_addrs.is_empty() && !known.mdns_addrs.is_empty()
         });
-        #[cfg(feature = "pubsub")]
+        #[cfg(feature = "discovery")]
         let b_merged = b.known_peers().iter().any(|known| {
             known.peer == a_peer && !known.beacon_addrs.is_empty() && !known.mdns_addrs.is_empty()
         });
-        #[cfg(not(feature = "pubsub"))]
+        #[cfg(not(feature = "discovery"))]
         let (a_merged, b_merged) = (true, true);
         if a_discovered
             && b_discovered
@@ -774,7 +687,7 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
 }
 
 #[test]
-#[cfg(feature = "pubsub")]
+#[cfg(feature = "discovery")]
 fn signed_discovery_reserves_its_pubsub_topic() {
     const RESERVED: &str = "/minip2p/test/reserved-discovery";
     let identity = identity(83);
@@ -803,7 +716,7 @@ fn signed_discovery_reserves_its_pubsub_topic() {
 }
 
 #[test]
-#[cfg(feature = "pubsub")]
+#[cfg(feature = "discovery")]
 fn signed_beacons_populate_discovery_without_mdns() {
     let wire = Wire::default();
     let a_identity = identity(91);

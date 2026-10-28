@@ -1,6 +1,6 @@
 //! Opt-in live gate against the pinned rust-libp2p relay client.
 
-#![cfg(all(feature = "relay-server", feature = "tcp"))]
+#![cfg(all(feature = "relay-server", feature = "tcp", feature = "std"))]
 
 use std::path::PathBuf;
 use std::process::{Child, Command};

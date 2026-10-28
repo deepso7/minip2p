@@ -189,14 +189,14 @@ pub enum EndpointEvent {
     /// transition such as `NatEvent::PathUpgraded` can still follow its
     /// attempt's `ConnectSettled` when the attempt settled on a provisional
     /// Relayed path first.
-    #[cfg(feature = "_nat-driver")]
+    #[cfg(feature = "autonat")]
     Nat(minip2p_nat::NatEvent),
     /// Gossipsub output: messages, subscription changes, and diagnostics.
     /// Discovery-owned beacon-topic traffic never appears here.
     #[cfg(feature = "pubsub")]
     Gossipsub(minip2p_pubsub::GossipsubEvent),
     /// Discovery peer-book changes from signed beacons and mDNS.
-    #[cfg(feature = "_discovery-driver")]
+    #[cfg(feature = "_peer-book")]
     Discovery(minip2p_discovery::DiscoveryEvent),
     /// mDNS hit a hard failure (a socket that will not send, say).
     ///
@@ -206,10 +206,10 @@ pub enum EndpointEvent {
     /// [`Self::MdnsRecovered`] follows once a retry succeeds. A goodbye that
     /// could not be sent during an mDNS shutdown is final: no recovery
     /// follows it.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "mdns")]
     MdnsFailed { error: minip2p_mdns::MdnsError },
     /// mDNS recovered from its last [`Self::MdnsFailed`].
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "mdns")]
     MdnsRecovered,
     /// Relay-service output: reservations, circuits, rejected and restored
     /// address sources, and runtime errors.

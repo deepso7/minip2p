@@ -143,6 +143,6 @@ node.disconnect(&peer)?;
 
 ## Direct and NAT-aware attempts
 
-Without NAT configuration, `connect` dials only the direct candidates. With the `nat` feature and a configured relay, the same call also races a relay leg and can later upgrade to a direct path. See [Traverse NAT](/rust/traverse-nat).
+Without NAT configuration, `connect` dials only the direct candidates. With the `relay` feature and a configured relay, the same call also races a relay leg and can later upgrade to a direct path. See [Traverse NAT](/rust/traverse-nat).
 
 Next: [Register a protocol](/rust/register-a-protocol) or [Identity](/rust/identity).

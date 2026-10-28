@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use minip2p::{
     BindError, ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointEvent,
-    EndpointWaitOutcome, NatConfig, NatEvent, Path, PeerAddr, PeerId, StreamId, StreamWriteError,
+    EndpointWaitOutcome, NatEvent, Path, PeerAddr, PeerId, StreamId, StreamWriteError,
     StreamWriter,
 };
 
@@ -81,8 +81,8 @@ const SETUP_DEADLINE: Duration = Duration::from_secs(10);
 
 // --- shared plumbing -------------------------------------------------------
 
-/// Builds the endpoint both modes share. The NAT agent is always enabled so
-/// `connect` reports a path even with no relay configured.
+/// Builds the endpoint both modes share. A relay or an AutoNAT server turns
+/// the NAT agent on; `connect` reports a path either way.
 fn build_endpoint(
     role: &str,
     relays: &[PeerAddr],
@@ -92,8 +92,7 @@ fn build_endpoint(
     let mut builder = Endpoint::builder()
         .identity(keypair)
         .agent_version(AGENT)
-        .protocol(ECHO_PROTOCOL)
-        .nat_config(NatConfig::default());
+        .protocol(ECHO_PROTOCOL);
     for relay in relays {
         builder = builder.relay(relay.clone());
     }

@@ -22,27 +22,33 @@
 //! With the `pubsub` feature, `EndpointBuilder::gossipsub` enables gossipsub
 //! and `EndpointBuilder::gossipsub_config` tunes it with a `GossipsubConfig`.
 //!
-//! The `nat` feature exposes relay, AutoNAT, and DCUtR coordination. The
-//! `discovery` feature includes `nat` and `pubsub`, adding signed presence
-//! beacons plus a bounded peer book. The `mdns` feature includes `nat` but not
-//! `pubsub`, and adds caller-driven local-link multicast discovery. Enable
+//! The `autonat` feature exposes AutoNAT probing, and `relay` (which
+//! includes `autonat`) adds relay paths, reservations, and, with QUIC,
+//! DCUtR coordination. The `discovery` feature includes `pubsub`, adding
+//! signed presence beacons plus a bounded peer book. The `mdns` feature adds
+//! caller-driven local-link multicast discovery over the same book. Enable
 //! both discovery sources to feed one shared peer book and automatic-dial
-//! state. Cargo features expose these APIs; the corresponding builder methods
-//! activate their drivers.
+//! state; with `autonat` or `relay` built too, discovered peers are dialed
+//! through the NAT connect race. Cargo features expose these APIs; the
+//! corresponding builder methods activate their drivers.
 //!
-//! The independent std-only `relay-server` feature enables the three-line
-//! `Endpoint::builder().relay_server().listen_on(…)?.bind()` hosting path. Relay-only
-//! endpoints advertise inbound HOP and open outbound STOP; NAT-only endpoints
-//! install the trusted client roles, and combined endpoints compose both.
+//! The `relay-server` feature enables the three-line
+//! `Endpoint::builder().relay_server().listen_on(…)?.bind()` hosting path.
+//!
+//! Capabilities are validated, registered and installed by the same
+//! Endpoint setup as the portable endpoint's; this module adds only OS
+//! resources around it: the clock, the readiness poll, the mDNS sockets,
+//! Name resolution, and WebTransport certificates. A capability's protocols
+//! are advertised through Identify only when its configuration uses them:
+//! relay-only endpoints advertise inbound HOP, a relay client advertises
+//! STOP (and DCUtR with QUIC), and an AutoNAT client the AutoNAT protocol.
 
 mod bind_error;
 mod dial;
-#[cfg(all(test, feature = "nat", feature = "quic"))]
+#[cfg(all(test, feature = "relay", feature = "quic"))]
 mod nat_tests;
-#[cfg(all(test, feature = "nat", feature = "quic"))]
+#[cfg(all(test, feature = "relay", feature = "quic"))]
 mod punch_batch_tests;
-#[cfg(feature = "relay-server")]
-pub(crate) mod relay_server;
 
 pub use bind_error::{BindError, EndpointOptionsError, IpFamily};
 
@@ -50,28 +56,32 @@ use std::time::Duration;
 
 #[cfg(feature = "discovery")]
 use crate::BeaconConfig;
-#[cfg(feature = "nat")]
+#[cfg(feature = "relay")]
 use crate::CircuitLimits;
 #[cfg(feature = "pubsub")]
 use crate::GossipsubConfig;
 #[cfg(feature = "pubsub")]
 use crate::GossipsubError;
-#[cfg(any(feature = "discovery", feature = "mdns"))]
-use crate::discovery::DiscoveryDriver;
+#[cfg(feature = "relay")]
+use crate::ReservationInfo;
 use crate::engine::Engine;
-#[cfg(feature = "nat")]
-use crate::nat::{CircuitOps, NatDriver};
-#[cfg(feature = "nat")]
+#[cfg(feature = "relay")]
+use crate::nat::CircuitOps;
+#[cfg(feature = "autonat")]
 use crate::portable::connect::Expansion;
-#[cfg(feature = "pubsub")]
-use crate::pubsub::GossipsubDriver;
+use crate::setup::{self, Capabilities, Platform};
 use crate::{ConnectionInfo, Path};
 #[cfg(any(feature = "discovery", feature = "mdns"))]
 use crate::{DiscoveryConfigError, KnownPeer, PeerDiscoveryConfig};
 #[cfg(feature = "mdns")]
 use crate::{MdnsConfig, MdnsConfigError, MdnsError};
-#[cfg(feature = "nat")]
-use crate::{NatConfig, ReachabilityState, ReservationInfo};
+#[cfg(feature = "autonat")]
+use crate::{NatConfig, ReachabilityState};
+#[cfg(feature = "relay-server")]
+use crate::{
+    RelayServerAddressError, RelayServerAddressErrorKind, RelayServerConfig,
+    RelayServerConfigError, RelayServerControlError,
+};
 use minip2p_core::Multiaddr;
 #[cfg(any(feature = "quic", feature = "tcp", feature = "relay-server"))]
 use minip2p_core::Protocol;
@@ -85,13 +95,6 @@ pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_quic::{QuicBindError, QuicLimits};
 #[cfg(feature = "quic")]
 use minip2p_quic::{QuicNodeConfig, QuicTransport, WebTransportCertificates};
-#[cfg(feature = "relay-server")]
-pub use minip2p_relay_server::{
-    CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
-    RelayServerAddrSource, RelayServerAddressError, RelayServerAddressErrorKind, RelayServerConfig,
-    RelayServerConfigError, RelayServerConfigErrorKind, RelayServerEvent, RelayServerRuntimeError,
-    RelayServerRuntimeErrorKind, ReservationCloseReason, Status,
-};
 use minip2p_swarm::SwarmBuilder;
 pub use minip2p_swarm::{
     DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, Swarm, SwarmError, WaitDeadline,
@@ -138,11 +141,6 @@ pub enum EndpointWaitOutcome {
 }
 
 const DEFAULT_AGENT_VERSION: &str = concat!("minip2p/", env!("CARGO_PKG_VERSION"));
-
-#[cfg(feature = "relay-server")]
-const RELAY_HOP_PROTOCOL_ID: &str = "/libp2p/circuit/relay/0.2.0/hop";
-#[cfg(feature = "relay-server")]
-const RELAY_STOP_PROTOCOL_ID: &str = "/libp2p/circuit/relay/0.2.0/stop";
 
 /// Relay announce-address validation failure while building an endpoint.
 #[cfg(feature = "relay-server")]
@@ -216,61 +214,39 @@ pub enum SetWebTransportCertificateError {
     },
 }
 
-/// Synchronous relay-server runtime control failure.
-#[cfg(feature = "relay-server")]
-#[derive(Debug)]
-pub enum RelayServerControlError {
-    /// This endpoint was not built with relay-server enablement.
-    NotConfigured,
-    /// The complete replacement contained an invalid address and was not applied.
-    InvalidAddress(RelayServerAddressError),
-}
-
-#[cfg(feature = "relay-server")]
-impl core::fmt::Display for RelayServerControlError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::NotConfigured => formatter.write_str("relay server is not configured"),
-            Self::InvalidAddress(error) => {
-                write!(formatter, "invalid relay-server address: {error}")
-            }
-        }
-    }
-}
-
-#[cfg(feature = "relay-server")]
-impl std::error::Error for RelayServerControlError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidAddress(error) => Some(error),
-            Self::NotConfigured => None,
-        }
-    }
-}
-
-/// Transport used by [`Endpoint`]. With NAT enabled, relay bridges are
+/// Transport used by [`Endpoint`]. With relays built, relay bridges are
 /// promoted into ordinary Noise/Yamux connections by `CircuitTransport`.
 ///
 /// The endpoint always holds a [`TransportSet`], even with one member in it:
 /// what an address is dialed over is then a routing decision the set makes
 /// from the address itself, and adding a second transport changes nothing
 /// above this line.
-#[cfg(feature = "nat")]
+#[cfg(feature = "relay")]
 pub(crate) type EndpointTransport =
     minip2p_circuit::CircuitTransport<TransportSet, minip2p_core::platform::StdEntropy>;
 
-/// Transport used by [`Endpoint`] when NAT traversal is not compiled in.
-#[cfg(not(feature = "nat"))]
+/// Transport used by [`Endpoint`] when relays are not compiled in.
+#[cfg(not(feature = "relay"))]
 pub(crate) type EndpointTransport = TransportSet;
 
-/// The std endpoint's mDNS carrier: OS multicast sockets, which are `Send`.
-#[cfg(feature = "_mdns-driver")]
+/// The std endpoint's mDNS carrier: OS multicast sockets, which are `Send`
+/// (the ffi-core detached driver needs that).
+#[cfg(feature = "mdns")]
 type StdCarrier = minip2p_mdns::MdnsSockets;
-#[cfg(not(feature = "_mdns-driver"))]
+#[cfg(not(feature = "mdns"))]
 type StdCarrier = ();
 
 /// The engine the std [`Endpoint`] drives.
 type StdEngine = Engine<EndpointTransport, StdEntropy, StdCarrier>;
+
+/// What the std endpoint offers its capabilities: DCUtR with QUIC, circuit
+/// operations whenever relays are built (the transport set is wrapped in a
+/// `CircuitTransport`), and OS mDNS sockets apart from the transport.
+const STD_PLATFORM: Platform = Platform {
+    runs_dcutr: cfg!(feature = "quic"),
+    has_circuits: cfg!(feature = "relay"),
+    mdns_shares_transport: false,
+};
 
 /// What [`Endpoint::close_within`] collected: how the drain ended, what it
 /// left unfinished, every event, in order, and every error close's own calls
@@ -350,7 +326,7 @@ pub enum CloseOutcome {
 /// takes the same complete peer addresses, [`listen`](Self::listen) arms every
 /// bound address, and the events are the same events.
 ///
-/// With the `nat` cargo feature and a NAT configuration
+/// With the `relay` cargo feature and a relay configuration
 /// (`EndpointBuilder::relay` / `EndpointBuilder::nat_config`), `connect`
 /// races direct candidates against a relay leg. Path transitions arrive as
 /// `EndpointEvent::Nat`; the attempt's outcome is its
@@ -365,7 +341,7 @@ pub struct Endpoint {
     /// Name resolution for `/dns*` candidates, off the driver thread.
     resolver: dial::Resolver,
     /// NAT relay and AutoNAT dials waiting on Name resolution.
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "autonat")]
     nat_dials: Vec<(minip2p_nat::NatToken, PeerAddr)>,
     /// Whether WebTransport presents a CA-signed certificate, which decides
     /// whether a WebTransport announce address must carry a `/certhash`.
@@ -957,9 +933,9 @@ impl Endpoint {
     /// Runs before every batch, so a lookup is under way before the driver
     /// sleeps, and its answer is applied on the wake it causes.
     fn resolve_names(&mut self, now: Now) {
-        #[cfg(feature = "nat")]
+        #[cfg(feature = "autonat")]
         let mut nat_answered = Vec::new();
-        #[cfg(feature = "nat")]
+        #[cfg(feature = "autonat")]
         if let Some(nat) = self.engine.nat.as_mut() {
             // A lookup can outlive the flight that wanted it; retire those so
             // retries during a stall do not pile up.
@@ -982,7 +958,7 @@ impl Endpoint {
                 &mut |addr| dial::answer_for(addr, &answers),
                 &mut self.engine.core,
             );
-            #[cfg(feature = "nat")]
+            #[cfg(feature = "autonat")]
             self.nat_dials
                 .retain(|(token, addr)| match dial::answer_for(addr, &answers) {
                     Some(result) => {
@@ -992,7 +968,7 @@ impl Endpoint {
                     None => true,
                 });
         }
-        #[cfg(feature = "nat")]
+        #[cfg(feature = "autonat")]
         if let Some(nat) = self.engine.nat.as_mut() {
             for (token, result) in nat_answered {
                 nat.named_dial_resolved(token, result, &mut self.engine.core, now);
@@ -1102,13 +1078,13 @@ impl Endpoint {
     /// Our current reachability verdict from AutoNAT probing
     /// ([`ReachabilityState::Unknown`] until probes gather confidence, or
     /// when NAT is not configured).
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "autonat")]
     pub fn reachability(&self) -> ReachabilityState {
         self.engine.reachability()
     }
 
     /// The relay reservation currently held, if any.
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     pub fn active_reservation(&self) -> Option<ReservationInfo> {
         self.engine.active_reservation()
     }
@@ -1316,26 +1292,6 @@ impl Drop for Endpoint {
     }
 }
 
-/// A per-process mDNS seed: the peer id mixed with the wall clock.
-#[cfg(feature = "mdns")]
-fn mdns_seed(keypair: &Ed25519Keypair) -> [u8; 32] {
-    let mut seed = [0u8; 32];
-    let peer_id = keypair.peer_id();
-    let digest = peer_id.digest_bytes();
-    for (slot, byte) in seed.iter_mut().zip(digest.iter().cycle()) {
-        *slot ^= *byte;
-    }
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0)
-        .to_le_bytes();
-    for (slot, byte) in seed.iter_mut().zip(timestamp.iter().cycle()) {
-        *slot ^= *byte;
-    }
-    seed
-}
-
 /// Default dual-stack QUIC listen addresses used by
 /// [`EndpointBuilder::listen_default`].
 #[cfg(feature = "quic")]
@@ -1375,22 +1331,17 @@ pub struct EndpointBuilder {
     relay_server_config: Option<RelayServerConfig>,
     #[cfg(feature = "relay-server")]
     relay_server_announce_addrs: Vec<Multiaddr>,
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "autonat")]
     nat_config: Option<NatConfig>,
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     circuit_limits: CircuitLimits,
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "autonat")]
     relays: Vec<PeerAddr>,
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "autonat")]
     autonat_servers: Vec<PeerAddr>,
-    #[cfg(feature = "pubsub")]
-    gossipsub_config: Option<GossipsubConfig>,
-    #[cfg(feature = "discovery")]
-    discovery_config: Option<BeaconConfig>,
-    #[cfg(feature = "mdns")]
-    mdns_config: Option<MdnsConfig>,
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
-    peer_discovery_config: PeerDiscoveryConfig,
+    /// Gossipsub, discovery and mDNS configuration; NAT and the relay
+    /// server join it at bind.
+    capabilities: Capabilities,
     connect_deadline: std::time::Duration,
     simultaneous_dial_window: std::time::Duration,
 }
@@ -1418,22 +1369,15 @@ impl Default for EndpointBuilder {
             relay_server_config: None,
             #[cfg(feature = "relay-server")]
             relay_server_announce_addrs: Vec::new(),
-            #[cfg(feature = "nat")]
+            #[cfg(feature = "autonat")]
             nat_config: None,
-            #[cfg(feature = "nat")]
+            #[cfg(feature = "relay")]
             circuit_limits: CircuitLimits::default(),
-            #[cfg(feature = "nat")]
+            #[cfg(feature = "autonat")]
             relays: Vec::new(),
-            #[cfg(feature = "nat")]
+            #[cfg(feature = "autonat")]
             autonat_servers: Vec::new(),
-            #[cfg(feature = "pubsub")]
-            gossipsub_config: None,
-            #[cfg(feature = "discovery")]
-            discovery_config: None,
-            #[cfg(feature = "mdns")]
-            mdns_config: None,
-            #[cfg(any(feature = "discovery", feature = "mdns"))]
-            peer_discovery_config: PeerDiscoveryConfig::default(),
+            capabilities: Capabilities::default(),
         }
     }
 }
@@ -1520,7 +1464,7 @@ impl EndpointBuilder {
 
     /// Overrides the relay circuits' Yamux limits. Checked at bind
     /// ([`EndpointOptionsError::InvalidLimit`]).
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     pub fn circuit_limits(mut self, limits: CircuitLimits) -> Self {
         self.circuit_limits = limits;
         self
@@ -1686,7 +1630,7 @@ impl EndpointBuilder {
     /// Adds a relay for NAT traversal (circuit legs and reservations), in
     /// preference order. Configuring at least one relay (or calling
     /// [`EndpointBuilder::nat_config`]) enables the traversal agent.
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     pub fn relay(mut self, relay: PeerAddr) -> Self {
         self.relays.push(relay);
         self
@@ -1696,8 +1640,10 @@ impl EndpointBuilder {
     ///
     /// Call once per server: a reachability verdict needs a quorum of
     /// distinct servers ([`NatConfig::confidence_threshold`], 3 by default),
-    /// so with fewer reachable servers reachability stays Unknown.
-    #[cfg(feature = "nat")]
+    /// so with fewer reachable servers reachability stays Unknown. Without
+    /// [`EndpointBuilder::nat_config`] or a relay, the endpoint holds no
+    /// reservation ([`ReservationPolicy::Never`](crate::ReservationPolicy::Never)).
+    #[cfg(feature = "autonat")]
     pub fn autonat_server(mut self, server: PeerAddr) -> Self {
         self.autonat_servers.push(server);
         self
@@ -1705,9 +1651,14 @@ impl EndpointBuilder {
 
     /// Sets the base NAT configuration (timeouts, punch retries,
     /// reservation policy, …). Relays and AutoNAT servers added through
-    /// [`EndpointBuilder::relay`] / [`EndpointBuilder::autonat_server`] are
+    /// `EndpointBuilder::relay` / [`EndpointBuilder::autonat_server`] are
     /// appended to the config's own lists.
-    #[cfg(feature = "nat")]
+    ///
+    /// Checked at bind ([`BindError::NatConfig`]): it needs a relay or an
+    /// AutoNAT server, and a reservation policy other than `Never` needs a
+    /// relay. Without any NAT configuration, discovery and mDNS turn NAT on
+    /// for the peers they find.
+    #[cfg(feature = "autonat")]
     pub fn nat_config(mut self, config: NatConfig) -> Self {
         self.nat_config = Some(config);
         self
@@ -1720,7 +1671,8 @@ impl EndpointBuilder {
     /// set from the first handshake.
     #[cfg(feature = "pubsub")]
     pub fn gossipsub(mut self) -> Self {
-        self.gossipsub_config
+        self.capabilities
+            .gossipsub
             .get_or_insert_with(GossipsubConfig::default);
         self
     }
@@ -1731,7 +1683,7 @@ impl EndpointBuilder {
     /// before a socket is allocated.
     #[cfg(feature = "pubsub")]
     pub fn gossipsub_config(mut self, config: GossipsubConfig) -> Self {
-        self.gossipsub_config = Some(config);
+        self.capabilities.gossipsub = Some(config);
         self
     }
 
@@ -1742,9 +1694,10 @@ impl EndpointBuilder {
     /// subscription events are consumed before reaching the application.
     #[cfg(feature = "discovery")]
     pub fn discovery(mut self) -> Self {
-        self.gossipsub_config
+        self.capabilities
+            .gossipsub
             .get_or_insert_with(GossipsubConfig::default);
-        self.discovery_config = Some(BeaconConfig::default());
+        self.capabilities.beacon = Some(BeaconConfig::default());
         self
     }
 
@@ -1757,16 +1710,17 @@ impl EndpointBuilder {
     #[cfg(feature = "discovery")]
     pub fn discovery_config(mut self, config: BeaconConfig) -> Result<Self, DiscoveryConfigError> {
         config.validate()?;
-        self.gossipsub_config
+        self.capabilities
+            .gossipsub
             .get_or_insert_with(GossipsubConfig::default);
-        self.discovery_config = Some(config);
+        self.capabilities.beacon = Some(config);
         Ok(self)
     }
 
     /// Enables local-link mDNS discovery with interoperable defaults.
     #[cfg(feature = "mdns")]
     pub fn mdns(mut self) -> Self {
-        self.mdns_config = Some(MdnsConfig::default());
+        self.capabilities.mdns = Some(MdnsConfig::default());
         self
     }
 
@@ -1776,7 +1730,7 @@ impl EndpointBuilder {
     #[cfg(feature = "mdns")]
     pub fn mdns_config(mut self, config: MdnsConfig) -> Result<Self, MdnsConfigError> {
         config.validate()?;
-        self.mdns_config = Some(config);
+        self.capabilities.mdns = Some(config);
         Ok(self)
     }
 
@@ -1789,7 +1743,7 @@ impl EndpointBuilder {
         config: PeerDiscoveryConfig,
     ) -> Result<Self, DiscoveryConfigError> {
         config.validate()?;
-        self.peer_discovery_config = config;
+        self.capabilities.peer_discovery = config;
         Ok(self)
     }
 
@@ -1808,10 +1762,9 @@ impl EndpointBuilder {
     /// Every failure is a [`BindError`] naming what failed, before any event
     /// is polled; see its variants.
     pub fn bind(mut self) -> Result<Endpoint, BindError> {
-        self.validate()?;
-        let keypair = self.keypair.take().unwrap_or_else(Ed25519Keypair::generate);
+        let (keypair, capabilities) = self.prepare()?;
         let (transport, _certificate) = bind_transports(&self, &keypair)?;
-        let mut endpoint = build_endpoint(self, keypair, transport)?;
+        let mut endpoint = build_endpoint(self, keypair, transport, capabilities)?;
         #[cfg(feature = "quic")]
         {
             endpoint.webtransport_certificate = _certificate;
@@ -1833,7 +1786,8 @@ impl EndpointBuilder {
     ///
     /// Reserved protocol ids are rejected here -- before any socket is
     /// bound -- so a configuration error can neither allocate resources
-    /// nor be masked by a bind failure.
+    /// nor be masked by a bind failure. Capabilities are validated by
+    /// Endpoint setup, also before binding.
     fn validate(&self) -> Result<(), BindError> {
         if let Some(protocol) = self
             .protocols
@@ -1844,10 +1798,6 @@ impl EndpointBuilder {
                 protocol_id: protocol.clone(),
             }
             .into());
-        }
-        #[cfg(feature = "pubsub")]
-        if let Some(config) = &self.gossipsub_config {
-            config.validate().map_err(BindError::Gossipsub)?;
         }
         #[cfg(feature = "relay-server")]
         if self.relay_server_config.is_none() && !self.relay_server_announce_addrs.is_empty() {
@@ -1883,29 +1833,66 @@ impl EndpointBuilder {
         false
     }
 
-    /// The NAT configuration to run, if any builder option enabled NAT:
-    /// explicit config, relays, AutoNAT servers, or a discovery source.
-    #[cfg(feature = "nat")]
-    fn take_nat_config(&mut self) -> Option<NatConfig> {
-        #[cfg(feature = "discovery")]
-        let discovery = self.discovery_config.is_some();
-        #[cfg(not(feature = "discovery"))]
-        let discovery = false;
-        #[cfg(feature = "mdns")]
-        let mdns = self.mdns_config.is_some();
-        #[cfg(not(feature = "mdns"))]
-        let mdns = false;
-        let enabled = self.nat_config.is_some()
-            || !self.relays.is_empty()
-            || !self.autonat_servers.is_empty()
-            || discovery
-            || mdns;
-        enabled.then(|| {
-            let mut config = self.nat_config.take().unwrap_or_default();
+    /// Moves every capability's configuration out for Endpoint setup: NAT
+    /// from its explicit config, relays and AutoNAT servers, and the relay
+    /// server with its announce addresses.
+    ///
+    /// Without an explicit config, AutoNAT servers alone hold no
+    /// reservation; relays keep the default policy, with DCUtR only where
+    /// the endpoint runs it. Discovery and mDNS turn
+    /// NAT on in setup, not here.
+    fn take_capabilities(&mut self) -> Capabilities {
+        #[cfg_attr(
+            not(any(feature = "autonat", feature = "relay-server")),
+            expect(unused_mut, reason = "only NAT and the relay server join here")
+        )]
+        let mut capabilities = std::mem::take(&mut self.capabilities);
+        #[cfg(feature = "autonat")]
+        if self.nat_config.is_some() || !self.relays.is_empty() || !self.autonat_servers.is_empty()
+        {
+            let relays = !self.relays.is_empty();
+            let mut config = self.nat_config.take().unwrap_or_else(|| {
+                if relays {
+                    // DCUtR only where this endpoint runs it, so `.relay(..)`
+                    // alone also binds without QUIC.
+                    NatConfig {
+                        dcutr: STD_PLATFORM.runs_dcutr,
+                        ..NatConfig::default()
+                    }
+                } else {
+                    setup::no_reservation_nat()
+                }
+            });
             config.relays.append(&mut self.relays);
             config.autonat_servers.append(&mut self.autonat_servers);
-            config
-        })
+            capabilities.nat = Some(config);
+        }
+        #[cfg(feature = "relay-server")]
+        if let Some(config) = self.relay_server_config.take() {
+            capabilities.relay_server = Some(setup::RelayServerSetup {
+                config,
+                announce_addrs: std::mem::take(&mut self.relay_server_announce_addrs),
+            });
+        }
+        capabilities
+    }
+
+    /// Everything bind checks before a socket opens: the options, then the
+    /// capabilities through Endpoint setup. Returns the identity and the
+    /// validated capabilities.
+    fn prepare(&mut self) -> Result<(Ed25519Keypair, setup::Validated), BindError> {
+        self.validate()?;
+        let keypair = self.keypair.take().unwrap_or_else(Ed25519Keypair::generate);
+        let capabilities =
+            setup::validate(self.take_capabilities(), STD_PLATFORM, &keypair.peer_id())?;
+        Ok((keypair, capabilities))
+    }
+
+    /// Binds over an already-bound transport set, for the crate's tests.
+    #[cfg(test)]
+    pub(crate) fn bind_over(mut self, transport: TransportSet) -> Result<Endpoint, BindError> {
+        let (keypair, capabilities) = self.prepare()?;
+        build_endpoint(self, keypair, transport, capabilities)
     }
 }
 
@@ -2210,59 +2197,30 @@ fn insert_member<T: minip2p_transport::BlockingTransport + Send + 'static>(
         })
 }
 
-pub(crate) fn build_endpoint(
+/// Wraps the bound transports in the OS resources the endpoint drives them
+/// with (circuits, the readiness poll, mDNS sockets, Name resolution), and
+/// installs the validated capabilities through Endpoint setup.
+fn build_endpoint(
     options: EndpointBuilder,
     keypair: Ed25519Keypair,
     transport: TransportSet,
+    capabilities: setup::Validated,
 ) -> Result<Endpoint, BindError> {
     #[cfg(feature = "relay-server")]
     let ca_webtransport_certificate = options.ca_webtransport_certificate();
-    #[cfg(feature = "nat")]
-    let mut options = options;
-    #[cfg(feature = "nat")]
-    let nat_config = options.take_nat_config();
     let mut builder = SwarmBuilder::new(&keypair)
         .agent_version(options.agent_version)
         .simultaneous_dial_window_ms(
             u64::try_from(options.simultaneous_dial_window.as_millis()).unwrap_or(u64::MAX),
         );
+    for protocol in options.protocols {
+        builder = builder.protocol(protocol);
+    }
     let mut acks = StreamAcks::default();
     for protocol in options.manual_ack_protocols {
         acks.set_manual(protocol, []);
     }
-    #[cfg_attr(
-        not(any(feature = "nat", feature = "pubsub")),
-        expect(unused_mut, reason = "only capabilities add protocols")
-    )]
-    let mut protocols = options.protocols;
-    #[cfg(feature = "nat")]
-    if nat_config.is_some() {
-        protocols.extend(
-            [
-                minip2p_nat::DCUTR_PROTOCOL_ID,
-                minip2p_nat::AUTONAT_PROTOCOL_ID,
-            ]
-            .map(String::from),
-        );
-    }
-    #[cfg(feature = "pubsub")]
-    if options.gossipsub_config.is_some() {
-        // Pubsub streams route as ordinary user protocols, and the gossipsub
-        // ids must be advertised by Identify from the first handshake.
-        protocols.extend(
-            minip2p_pubsub::GOSSIPSUB_PROTOCOL_IDS
-                .iter()
-                .map(|id| String::from(*id)),
-        );
-    }
-    let mut registered = Vec::new();
-    for protocol in protocols {
-        if !registered.contains(&protocol) {
-            builder = builder.protocol(protocol.clone());
-            registered.push(protocol);
-        }
-    }
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     let mut transport = minip2p_circuit::CircuitTransport::with_limits(
         transport,
         keypair.clone(),
@@ -2270,176 +2228,53 @@ pub(crate) fn build_endpoint(
         options.circuit_limits.clone(),
     )
     .map_err(EndpointOptionsError::InvalidLimit)?;
-    #[cfg(not(feature = "nat"))]
+    #[cfg(not(feature = "relay"))]
     let mut transport = transport;
     let mut poll = SharedPoll::new()
         .map_err(|error| BindError::readiness_poll("opening the readiness poll", &error))?;
     poll.attach(&mut transport)
         .map_err(|error| BindError::readiness_poll("attaching the transport", &error))?;
     let resolver = dial::Resolver::new(poll.wake_handle());
+    #[cfg(feature = "mdns")]
+    let mdns_sockets = match capabilities.mdns() {
+        Some(config) => {
+            let mut sockets =
+                minip2p_mdns::MdnsSockets::new(config).map_err(BindError::MdnsSocket)?;
+            // The sockets only wake the endpoint's wait; the next batch's
+            // mDNS tick reads them, and a refresh re-registers what it
+            // rebuilds.
+            poll.attach_host_source(&mut sockets)
+                .map_err(|error| BindError::readiness_poll("attaching the mDNS sockets", &error))?;
+            Some(sockets)
+        }
+        None => None,
+    };
     let core = builder.build_core(transport, StdEntropy::new())?;
-    #[cfg_attr(
-        not(any(
-            feature = "relay-server",
-            feature = "nat",
-            feature = "pubsub",
-            feature = "mdns"
-        )),
-        expect(unused_mut, reason = "only capabilities install drivers")
-    )]
     let mut engine = Engine::new(
         core,
         u64::try_from(options.connect_deadline.as_millis()).unwrap_or(u64::MAX),
         acks,
     );
-    #[cfg(feature = "relay-server")]
-    if let Some(config) = options.relay_server_config {
-        let core = &mut engine.core;
-        core.add_inbound_protocol(RELAY_HOP_PROTOCOL_ID)?;
-        core.add_advertised_protocol(RELAY_HOP_PROTOCOL_ID)?;
-        core.add_outbound_protocol(RELAY_STOP_PROTOCOL_ID)?;
-        let mut agent =
-            minip2p_relay_server::RelayServerAgent::new(core.local_peer_id().clone(), config)
-                .map_err(BindError::RelayServer)?;
-        agent
-            .replace_announce_addrs(options.relay_server_announce_addrs)
-            .map_err(|error| BindError::RelayServerAnnounce(Box::new(error)))?;
-        // Derived from the bound transports, not configured: a rejection is
-        // queued as `AddrsRejected` and drained with the first batch, like
-        // any later listener refresh.
-        drop(
-            agent.set_listener_addrs(relay_server::concrete_relay_listener_addrs(
-                core.transport().local_addresses(),
-            )),
-        );
-        engine.relay_server = Some(relay_server::RelayServerDriver::new(agent));
-    }
-    #[cfg(feature = "nat")]
-    if let Some(config) = nat_config {
-        let core = &mut engine.core;
-        core.add_outbound_protocol(minip2p_nat::HOP_PROTOCOL_ID)?;
-        core.add_inbound_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
-        core.add_advertised_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
-        let relay_addrs = config
-            .relays
-            .iter()
-            .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
-            .collect();
-        let agent = minip2p_nat::NatAgent::new(core.local_peer_id().clone(), config);
-        // Relay and AutoNAT server addresses may name a host; the endpoint
-        // resolves those off the driver, like Connection-attempt candidates.
-        engine.nat = Some(
-            NatDriver::new(agent, relay_addrs, &mut StdEntropy)
-                .with_circuits(CircuitOps::circuit_transport())
-                .park_named_dials(),
-        );
-    }
-    #[cfg(feature = "pubsub")]
-    if let Some(config) = options.gossipsub_config {
-        // Message ids are (from, seqno); a wall-clock seed keeps restarts
-        // from reusing ids the network may still remember. Mix the local
-        // identity into the peer-selection seed so endpoints created in the
-        // same clock tick do not walk the same deterministic sequence.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let initial_seqno = timestamp as u64;
-        let entropy_seed = keypair
-            .peer_id()
-            .digest_bytes()
-            .iter()
-            .fold(initial_seqno ^ (timestamp >> 64) as u64, |seed, byte| {
-                seed.rotate_left(5) ^ u64::from(*byte)
-            });
-        let agent = minip2p_pubsub::GossipsubAgent::new(
-            keypair.clone(),
-            config,
-            initial_seqno,
-            entropy_seed,
-        )
-        .map_err(BindError::Gossipsub)?;
-        engine.gossipsub = Some(GossipsubDriver::new(agent));
-    }
-    #[cfg(feature = "discovery")]
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "Both agents validate the shared topic and beacon before construction, so these expose a stable invariant."
-    )]
-    let beacon = match options.discovery_config {
-        Some(config) => {
-            if let Some(pubsub) = engine.gossipsub.as_mut() {
-                pubsub
-                    .agent
-                    .subscribe(&config.topic, 0)
-                    .map_err(|_| BindError::Invariant {
-                        reason: "validated discovery topic was rejected by pubsub",
-                    })?;
-            }
-            Some(
-                minip2p_discovery::BeaconAgent::new(keypair.public_key(), config).map_err(
-                    |_| BindError::Invariant {
-                        reason: "validated beacon configuration was rejected",
-                    },
-                )?,
-            )
-        }
-        None => None,
-    };
-    // `mdns` enables the shared driver without `discovery`, so no beacon can
-    // be configured; the driver's pubsub slot stays empty in that build.
-    #[cfg(all(feature = "pubsub", feature = "mdns", not(feature = "discovery")))]
-    let beacon = None;
-    #[cfg(feature = "mdns")]
-    if let Some(config) = options.mdns_config {
-        let agent =
-            minip2p_mdns::MdnsAgent::new(keypair.peer_id(), config.clone(), mdns_seed(&keypair))
-                .map_err(BindError::Mdns)?;
-        let mut sockets = minip2p_mdns::MdnsSockets::new(&config).map_err(BindError::MdnsSocket)?;
-        // The sockets only wake the endpoint's wait; the next batch's mDNS
-        // tick reads them, and a refresh re-registers what it rebuilds.
-        poll.attach_host_source(&mut sockets)
-            .map_err(|error| BindError::readiness_poll("attaching the mDNS sockets", &error))?;
-        // OS sockets are not the transport's: no second transport poll.
-        engine.set_mdns(
-            minip2p_mdns::MdnsDriver::new(agent, sockets, &config),
-            false,
-        );
-    }
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
-    {
-        #[cfg(feature = "discovery")]
-        let beacon_enabled = beacon.is_some();
-        #[cfg(not(feature = "discovery"))]
-        let beacon_enabled = false;
+    setup::install(
+        &mut engine,
+        capabilities,
+        &keypair,
+        #[cfg(feature = "relay")]
+        Some(CircuitOps::circuit_transport()),
         #[cfg(feature = "mdns")]
-        let mdns_enabled = engine.has_mdns();
-        #[cfg(not(feature = "mdns"))]
-        let mdns_enabled = false;
-        if beacon_enabled || mdns_enabled {
-            #[expect(
-                clippy::map_err_ignore,
-                reason = "The shared discovery policy was validated before the endpoint reached this point."
-            )]
-            let book = minip2p_discovery::PeerDiscoveryAgent::new(
-                keypair.peer_id(),
-                options.peer_discovery_config,
-            )
-            .map_err(|_| BindError::Invariant {
-                reason: "validated discovery configuration was rejected",
-            })?;
-            engine.discovery = Some(DiscoveryDriver::new(
-                book,
-                #[cfg(feature = "pubsub")]
-                beacon,
-            ));
-        }
+        mdns_sockets,
+    )?;
+    // Relay and AutoNAT server addresses may name a host; the endpoint
+    // resolves those off the driver, like Connection-attempt candidates.
+    #[cfg(feature = "autonat")]
+    if let Some(nat) = engine.nat.as_mut() {
+        nat.park_named_dials();
     }
     Ok(Endpoint {
         engine,
         clock: StdClock::new(),
         resolver,
-        #[cfg(feature = "nat")]
+        #[cfg(feature = "autonat")]
         nat_dials: Vec::new(),
         #[cfg(feature = "relay-server")]
         ca_webtransport_certificate,
@@ -2458,7 +2293,7 @@ impl Endpoint {
         &self.engine.core
     }
 
-    #[cfg(any(feature = "nat", feature = "tcp"))]
+    #[cfg(any(feature = "relay", feature = "tcp"))]
     pub(crate) fn core_mut(
         &mut self,
     ) -> &mut minip2p_swarm::SwarmCore<EndpointTransport, StdEntropy> {
@@ -2539,11 +2374,13 @@ mod tests {
     use crate::ConnectionCloseReason;
     #[cfg(feature = "pubsub")]
     use crate::GossipsubEvent;
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     use crate::NatEvent;
     use crate::SwarmEvent;
     use crate::{ConnectFailure, ConnectOutcome};
-    #[cfg(any(feature = "tcp", feature = "nat"))]
+    #[cfg(feature = "relay-server")]
+    use crate::{RelayServerEvent, RelayServerRuntimeError, RelayServerRuntimeErrorKind};
+    #[cfg(any(feature = "tcp", feature = "relay"))]
     use minip2p_transport::InvalidLimit;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3675,7 +3512,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "nat", feature = "quic"))]
+    #[cfg(all(feature = "relay", feature = "quic"))]
     #[test]
     fn circuit_limits_that_break_the_yamux_invariants_are_refused_at_bind() {
         let mut limits = CircuitLimits::default();
@@ -3908,11 +3745,11 @@ mod tests {
         assert!(batches <= 2, "ran {batches} batches past the deadline");
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn wait_with_duration_zero_still_drains_queued_events() {
         let mut endpoint = Endpoint::builder()
-            .nat_config(NatConfig::default())
+            .nat_config(super::nat_tests::idle_nat_config())
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")
             .bind()
@@ -4059,11 +3896,11 @@ mod tests {
         assert!(!endpoint.is_peer_ready(listened[0].peer_id()));
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn wait_delivers_queued_nat_events_once() {
         let mut endpoint = Endpoint::builder()
-            .nat_config(NatConfig::default())
+            .nat_config(super::nat_tests::idle_nat_config())
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")
             .bind()
@@ -4119,11 +3956,11 @@ mod tests {
         ));
     }
 
-    #[cfg(all(feature = "nat", feature = "pubsub", feature = "relay-server"))]
+    #[cfg(all(feature = "relay", feature = "pubsub", feature = "relay-server"))]
     #[test]
     fn capability_events_leave_once_in_endpoint_order() {
         let mut endpoint = Endpoint::builder()
-            .nat_config(NatConfig::default())
+            .nat_config(super::nat_tests::idle_nat_config())
             .gossipsub()
             .relay_server()
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
@@ -4285,8 +4122,7 @@ mod tests {
             },
         )
         .expect("insert transport");
-        let mut endpoint =
-            build_endpoint(Endpoint::builder(), Ed25519Keypair::generate(), set).expect("build");
+        let mut endpoint = Endpoint::builder().bind_over(set).expect("build");
         let peer = Ed25519Keypair::generate().peer_id();
         endpoint
             .engine
@@ -4324,8 +4160,7 @@ mod tests {
             FlakyPollTransport { fail },
         )
         .expect("insert transport");
-        let mut endpoint =
-            build_endpoint(Endpoint::builder(), Ed25519Keypair::generate(), set).expect("build");
+        let mut endpoint = Endpoint::builder().bind_over(set).expect("build");
         let peer = Ed25519Keypair::generate().peer_id();
         endpoint
             .engine
@@ -4418,11 +4253,11 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn wait_honors_expired_deadline_with_active_driver() {
         let mut endpoint = Endpoint::builder()
-            .nat_config(NatConfig::default())
+            .nat_config(super::nat_tests::idle_nat_config())
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")
             .bind()
@@ -4434,14 +4269,14 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn wait_returns_application_event_produced_during_driver_poll() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut endpoint = Endpoint::builder()
-            .nat_config(NatConfig::default())
+            .nat_config(super::nat_tests::idle_nat_config())
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")
             .bind()
@@ -4481,11 +4316,11 @@ mod tests {
     /// A step's first event is often `ConnectionEstablished`, with the NAT
     /// path and `ConnectSettled` behind it. `wait` must hand them out in that
     /// order: the terminal never overtakes the connection it reports.
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn nat_path_and_connect_settled_follow_connection_established() {
         let mut endpoint = Endpoint::builder()
-            .nat_config(NatConfig::default())
+            .nat_config(super::nat_tests::idle_nat_config())
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")
             .bind()
@@ -4519,14 +4354,14 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn wait_delivers_connect_timeout_with_an_active_driver() {
         use std::net::{IpAddr, Ipv4Addr};
 
         let mut endpoint = Endpoint::builder()
             .connect_deadline(Duration::from_millis(20))
-            .nat_config(NatConfig::default())
+            .nat_config(super::nat_tests::idle_nat_config())
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")
             .bind()
@@ -5042,11 +4877,11 @@ mod tests {
         ));
     }
 
-    #[cfg(all(feature = "nat", feature = "relay-server"))]
+    #[cfg(all(feature = "relay", feature = "relay-server"))]
     #[test]
     fn nat_and_relay_address_contributions_form_a_stable_first_wins_union() {
         let mut endpoint = Endpoint::builder()
-            .nat_config(NatConfig::default())
+            .nat_config(super::nat_tests::idle_nat_config())
             .relay_server()
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")

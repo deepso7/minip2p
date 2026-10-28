@@ -1,7 +1,6 @@
 //! Standard Endpoint NAT regression tests.
 use crate::ConnectionCloseReason;
 use minip2p_core::Multiaddr;
-use minip2p_core::platform::StdEntropy;
 use minip2p_nat::{NatAction, NatAgent, NatEvent, Now};
 use minip2p_swarm::{SwarmErrorKind, SwarmEvent};
 use minip2p_transport::Transport;
@@ -14,6 +13,25 @@ use crate::QuicLimits;
 use crate::{Ed25519Keypair, Endpoint, EndpointEvent, NatConfig, ReachabilityState};
 use minip2p_nat::{DialStart, NatSwarm, NatSwarmError, NatToken, ReservationPolicy};
 use minip2p_relay::{HOP_PROTOCOL_ID, HopMessage, HopMessageType, Status, encode_frame};
+
+/// A NAT configuration that runs the agent without traffic a test would
+/// see: one AutoNAT server on an unroutable TEST-NET address, and no
+/// reservation.
+pub(crate) fn idle_nat_config() -> NatConfig {
+    NatConfig {
+        autonat_servers: vec![
+            minip2p_core::PeerAddr::new(
+                "/ip4/192.0.2.250/udp/4001/quic-v1"
+                    .parse()
+                    .expect("address"),
+                Ed25519Keypair::from_secret_key_bytes([250; 32]).peer_id(),
+            )
+            .expect("peer address"),
+        ],
+        reservation_policy: ReservationPolicy::Never,
+        ..NatConfig::default()
+    }
+}
 
 /// Shares the loopback relay application with the integration tests; it is
 /// written against the public `minip2p` API (see `extern crate self` in
@@ -593,7 +611,7 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
     let driver = NatDriver::new(
         agent,
         vec![(relay_peer, pair.relay_addr.transport().clone())],
-        &mut StdEntropy,
+        0,
     )
     .with_circuits(crate::nat::CircuitOps::circuit_transport());
     (driver, promotion)
@@ -611,7 +629,7 @@ fn circuit_id(driver: &NatDriver, key: (ConnectionId, StreamId)) -> ConnectionId
 #[test]
 fn autonat_listen_addrs_are_seeded_by_bind() {
     let mut endpoint = Endpoint::builder()
-        .nat_config(NatConfig::default())
+        .nat_config(idle_nat_config())
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")
         .bind()
@@ -630,7 +648,7 @@ fn autonat_listen_addrs_are_seeded_by_bind() {
 #[test]
 fn confirmed_public_addresses_are_advertised_and_cleared() {
     let mut endpoint = Endpoint::builder()
-        .nat_config(NatConfig::default())
+        .nat_config(idle_nat_config())
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")
         .bind()

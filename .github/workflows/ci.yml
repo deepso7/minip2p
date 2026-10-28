@@ -84,8 +84,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
       - run: cargo check -p minip2p-rs --features relay-server
-      - run: cargo check -p minip2p-rs --features nat,relay-server
-      - run: cargo check -p minip2p-rs --features nat,relay-server,tcp
+      - run: cargo check -p minip2p-rs --features relay,relay-server
+      - run: cargo check -p minip2p-rs --features relay,relay-server,tcp
       - run: cargo check -p minip2p-rs --no-default-features --features std,tcp,relay-server
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: scripts/run-feature-matrix.sh clippy
@@ -95,11 +95,12 @@ jobs:
       - run: cargo check --no-default-features --target thumbv7em-none-eabi -p minip2p-core -p minip2p-identity -p minip2p-transport -p minip2p-tls -p minip2p-secure-mux -p minip2p-smoltcp -p minip2p-tcp -p minip2p-circuit -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping -p minip2p-pubsub -p minip2p-discovery -p minip2p-mdns -p minip2p-relay -p minip2p-relay-server -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat -p minip2p-webtransport -p minip2p-rs
       - run: cargo check --no-default-features --features smoltcp --target thumbv7em-none-eabi -p minip2p-tcp -p minip2p-mdns -p minip2p-rs
       - run: cargo check --no-default-features --features smoltcp,pubsub --target thumbv7em-none-eabi -p minip2p-rs
-      - run: cargo check --no-default-features --features portable-autonat --target thumbv7em-none-eabi -p minip2p-rs
-      - run: cargo check --no-default-features --features portable-relay --target thumbv7em-none-eabi -p minip2p-rs
-      - run: cargo check --no-default-features --features portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
-      - run: cargo check --no-default-features --features portable-mdns,pubsub,portable-relay --target thumbv7em-none-eabi -p minip2p-rs
-      - run: cargo check --no-default-features --features smoltcp,portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
+      - run: cargo check --no-default-features --features autonat --target thumbv7em-none-eabi -p minip2p-rs
+      - run: cargo check --no-default-features --features relay --target thumbv7em-none-eabi -p minip2p-rs
+      - run: cargo check --no-default-features --features relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
+      - run: cargo check --no-default-features --features relay-server --target thumbv7em-none-eabi -p minip2p-rs
+      - run: cargo check --no-default-features --features mdns,discovery,relay --target thumbv7em-none-eabi -p minip2p-rs
+      - run: cargo check --no-default-features --features smoltcp,relay,discovery,relay-server --target thumbv7em-none-eabi -p minip2p-rs
       # Mirrors `just check-wasm`.
       - run: cargo check --target wasm32-unknown-unknown -p minip2p-ffi-core --no-default-features --features serde
       - run: cargo check --target wasm32-unknown-unknown -p minip2p-rs --no-default-features --features pubsub
@@ -107,18 +108,18 @@ jobs:
       - run: cargo clippy --target wasm32-unknown-unknown -p minip2p-web -- -D warnings
       - run: cargo doc --workspace --no-deps
       - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features relay,discovery,mdns,tcp,relay-server --no-deps
       - run: cargo doc -p minip2p-tcp --features smoltcp --no-deps
       - run: cargo doc -p minip2p-mdns --features smoltcp --no-deps
       - run: cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps
       - run: cargo doc -p minip2p-rs --no-default-features --features smoltcp,pubsub --no-deps
-      - run: cargo doc -p minip2p-rs --no-default-features --features portable-autonat --no-deps
-      - run: cargo doc -p minip2p-rs --no-default-features --features portable-relay --no-deps
-      - run: cargo doc -p minip2p-rs --no-default-features --features smoltcp,portable-relay,pubsub --no-deps
+      - run: cargo doc -p minip2p-rs --no-default-features --features autonat --no-deps
+      - run: cargo doc -p minip2p-rs --no-default-features --features relay --no-deps
+      - run: cargo doc -p minip2p-rs --no-default-features --features smoltcp,relay,discovery,relay-server --no-deps
       - run: cargo bench -p minip2p-core --bench multiaddr --no-run
       - run: cargo metadata --no-deps --format-version 1 | jq -e '[.packages[] | select(.publish != []) | .readme != null] | all'
       - run: cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name' | while read package; do cargo package -p "$package" --list | grep -q '^README.md$' || exit 1; done
-      - run: cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["std", "dep:minip2p-relay-server"]'
+      - run: cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["dep:minip2p-relay-server"]'
 
   test:
     runs-on: ubuntu-latest

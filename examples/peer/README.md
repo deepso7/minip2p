@@ -1,6 +1,6 @@
 # minip2p-peer
 
-A NAT-aware echo-ping demo for the full minip2p stack, built entirely on the `minip2p` `Endpoint` API (`features = ["nat", "tcp"]`). Two subcommands:
+A NAT-aware echo-ping demo for the full minip2p stack, built entirely on the `minip2p` `Endpoint` API (`features = ["relay", "tcp"]`). Two subcommands:
 
 - **`listen`** — bind QUIC or TCP, echo every inbound ping stream byte for byte. With `--relay`, hold a Circuit Relay v2 reservation and print a paste-ready circuit address.
 - **`dial`** — `connect` to a target (direct candidates and/or a relay leg) and ping once per second, tagging every RTT with the path it travelled. When a DCUtR hole punch upgrades the path mid-run, the seq sequence continues unbroken and the RTT visibly drops.

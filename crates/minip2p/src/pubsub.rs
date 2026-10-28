@@ -117,7 +117,7 @@ impl GossipsubDriver {
     /// Removes every queued event `f` claims, returning `true` when it
     /// claimed any. Cross-driver sweeps lift their traffic out of the
     /// application queue with this before the Endpoint drains it.
-    #[cfg(feature = "_discovery-driver")]
+    #[cfg(feature = "_peer-book")]
     pub(crate) fn extract_events(&mut self, mut f: impl FnMut(&GossipsubEvent) -> bool) -> bool {
         let mut claimed = false;
         let mut retained = VecDeque::new();

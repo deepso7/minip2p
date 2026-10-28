@@ -12,17 +12,17 @@ use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, select_direct_addrs};
 #[cfg(feature = "pubsub")]
 use minip2p_discovery::{BeaconAction, BeaconAgent, BeaconEvent};
 use minip2p_discovery::{DiscoveryAction, DiscoverySource, PeerDiscoveryAgent};
-#[cfg(feature = "_mdns-driver")]
+#[cfg(feature = "mdns")]
 use minip2p_mdns::MdnsEvent;
-#[cfg(feature = "_nat-driver")]
+#[cfg(feature = "autonat")]
 use minip2p_nat::NatEvent;
 #[cfg(feature = "pubsub")]
 use minip2p_pubsub::GossipsubEvent;
 use minip2p_swarm::{SwarmCore, SwarmEvent};
 
-#[cfg(feature = "_nat-driver")]
+#[cfg(feature = "autonat")]
 use crate::nat::NatDriver;
-#[cfg(feature = "_nat-driver")]
+#[cfg(feature = "autonat")]
 use crate::portable::connect::cancel_attempt;
 use crate::portable::connect::{ConnectAdmission, ConnectEngine, Expansion, admit_connect};
 #[cfg(feature = "pubsub")]
@@ -57,7 +57,7 @@ fn direct_candidates(addrs: &[Multiaddr], peer: &PeerId) -> Vec<PeerAddr> {
 
 /// An admitted attempt awaiting `NatDriver::attach_leg`.
 #[cfg_attr(
-    not(feature = "_nat-driver"),
+    not(feature = "autonat"),
     expect(
         dead_code,
         reason = "only NAT compositions apply DiscoveryNatWork and read the fields"
@@ -83,7 +83,7 @@ pub(crate) struct DiscoveryNatWork {
     pub(crate) legs: Vec<PendingLeg>,
     /// A NAT leg was cancelled; `NatDriver::pump` must run once.
     #[cfg_attr(
-        not(feature = "_nat-driver"),
+        not(feature = "autonat"),
         expect(dead_code, reason = "only NAT compositions pump after a cancelled leg")
     )]
     pub(crate) pump: bool,
@@ -147,7 +147,7 @@ impl DiscoveryDriver {
     /// Whether `event` belongs to an attempt automatic dialing owns: NAT
     /// routing consumes those after the Connection engine observes them,
     /// so they never reach the application.
-    #[cfg(feature = "_nat-driver")]
+    #[cfg(feature = "autonat")]
     pub(crate) fn owns_nat_event(&self, event: &NatEvent) -> bool {
         event
             .connect_id()
@@ -179,7 +179,7 @@ impl DiscoveryDriver {
     }
 
     /// Feeds an mDNS observation into the book.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "mdns")]
     pub(crate) fn handle_mdns_event(&mut self, event: MdnsEvent, now_ms: u64) {
         match event {
             MdnsEvent::PeerObserved { peer, addrs } => {
@@ -232,7 +232,7 @@ impl DiscoveryDriver {
     pub(crate) fn sweep<T: Transport, E: EntropySource>(
         &mut self,
         #[cfg(feature = "pubsub")] mut pubsub: Option<&mut GossipsubDriver>,
-        #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<T>>,
+        #[cfg(feature = "autonat")] mut nat: Option<&mut NatDriver<T>>,
         connect: &mut ConnectEngine,
         runtime: &mut SwarmCore<T, E>,
         expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
@@ -336,7 +336,7 @@ impl DiscoveryDriver {
                         let id = admit_connect(
                             connect,
                             runtime,
-                            #[cfg(feature = "_nat-driver")]
+                            #[cfg(feature = "autonat")]
                             nat.as_deref(),
                             ConnectAdmission {
                                 peer: peer.clone(),
@@ -358,7 +358,7 @@ impl DiscoveryDriver {
                         self.cancel_peer(
                             &peer,
                             connect,
-                            #[cfg(feature = "_nat-driver")]
+                            #[cfg(feature = "autonat")]
                             nat.as_deref_mut(),
                             runtime,
                             now,
@@ -375,7 +375,7 @@ impl DiscoveryDriver {
     }
 
     #[cfg_attr(
-        not(feature = "_nat-driver"),
+        not(feature = "autonat"),
         expect(
             unused_variables,
             reason = "NAT leg cancellation is the only user of now and work"
@@ -385,7 +385,7 @@ impl DiscoveryDriver {
         &mut self,
         peer: &PeerId,
         connect: &mut ConnectEngine,
-        #[cfg(feature = "_nat-driver")] nat: Option<&mut NatDriver<T>>,
+        #[cfg(feature = "autonat")] nat: Option<&mut NatDriver<T>>,
         runtime: &mut SwarmCore<T, E>,
         now: Now,
         work: &mut DiscoveryNatWork,
@@ -395,20 +395,20 @@ impl DiscoveryDriver {
             .iter()
             .find_map(|(id, candidate)| (candidate == peer).then_some(*id));
         if let Some(id) = active {
-            #[cfg(feature = "_nat-driver")]
+            #[cfg(feature = "autonat")]
             {
                 work.pump |= cancel_attempt(connect, nat, id, runtime, now);
             }
-            #[cfg(not(feature = "_nat-driver"))]
+            #[cfg(not(feature = "autonat"))]
             connect.cancel(id, runtime);
         }
     }
 
     /// Cancels all discovery-owned attempts during endpoint shutdown. The
     /// returned work carries whether the NAT driver must pump afterwards.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "mdns")]
     #[cfg_attr(
-        not(feature = "_nat-driver"),
+        not(feature = "autonat"),
         expect(
             unused_mut,
             unused_variables,
@@ -418,18 +418,18 @@ impl DiscoveryDriver {
     pub(crate) fn shutdown<T: Transport, E: EntropySource>(
         &mut self,
         connect: &mut ConnectEngine,
-        #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<T>>,
+        #[cfg(feature = "autonat")] mut nat: Option<&mut NatDriver<T>>,
         runtime: &mut SwarmCore<T, E>,
         now: Now,
     ) -> DiscoveryNatWork {
         let mut work = DiscoveryNatWork::default();
         let attempts: Vec<ConnectId> = self.inflight.keys().copied().collect();
         for id in attempts {
-            #[cfg(feature = "_nat-driver")]
+            #[cfg(feature = "autonat")]
             {
                 work.pump |= cancel_attempt(connect, nat.as_deref_mut(), id, runtime, now);
             }
-            #[cfg(not(feature = "_nat-driver"))]
+            #[cfg(not(feature = "autonat"))]
             connect.cancel(id, runtime);
         }
         self.inflight.clear();
@@ -438,7 +438,7 @@ impl DiscoveryDriver {
     }
 }
 
-#[cfg(all(test, feature = "_mdns-driver"))]
+#[cfg(all(test, feature = "mdns"))]
 mod tests {
     use super::*;
     use alloc::vec;

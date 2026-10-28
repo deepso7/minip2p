@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use minip2p::{
     BeaconConfig, BindError, ConnectionId, DiscoveryConfigError, Endpoint, EndpointBuilder,
     EndpointOptionsError, GossipsubConfig, MdnsConfig, MdnsConfigError, Multiaddr, NatConfig,
-    PeerDiscoveryConfig, PeerId, QuicBindError, StreamId, TransportError, WaitHandle,
+    PeerDiscoveryConfig, PeerId, QuicBindError, ReservationPolicy, StreamId, TransportError,
+    WaitHandle,
 };
 
 use crate::limits::{Bound, resolve_limits};
@@ -236,13 +237,24 @@ impl P2pEndpoint {
             builder = builder.manual_ack_protocol(protocol);
         }
 
-        builder = builder.nat_config(NatConfig {
-            relays,
-            autonat_servers,
-            force_relay: config.force_relay,
-            max_circuits: limits.max_circuits,
-            ..NatConfig::default()
-        });
+        // NAT runs when the config names a relay or an AutoNAT server (or
+        // forces the relay); discovery and mDNS turn it on for their peers
+        // otherwise. Without a relay there is nothing to reserve on.
+        if !relays.is_empty() || !autonat_servers.is_empty() || config.force_relay {
+            let reservation_policy = if relays.is_empty() {
+                ReservationPolicy::Never
+            } else {
+                ReservationPolicy::default()
+            };
+            builder = builder.nat_config(NatConfig {
+                relays,
+                autonat_servers,
+                force_relay: config.force_relay,
+                max_circuits: limits.max_circuits,
+                reservation_policy,
+                ..NatConfig::default()
+            });
+        }
 
         let signed_auto_dial = config.discovery.as_ref().map(|options| options.auto_dial);
         if let Some(discovery) = config.discovery {
@@ -1087,6 +1099,8 @@ fn map_bind_error(error: BindError) -> FfiError {
         BindError::Swarm(_) => config(ConfigCapability::Options),
         BindError::Gossipsub(_) => config(ConfigCapability::Gossipsub),
         BindError::Mdns(_) => config(ConfigCapability::Mdns),
+        BindError::Discovery(_) => config(ConfigCapability::Discovery),
+        BindError::NatConfig(_) => config(ConfigCapability::Options),
         BindError::Quic(
             QuicBindError::InvalidLimit { .. }
             | QuicBindError::Tls { .. }

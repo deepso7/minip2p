@@ -36,32 +36,23 @@ std = [
 quic = ["std", "dep:minip2p-quic"]
 tcp = ["dep:minip2p-tcp", "dep:minip2p-secure-mux"]
 # Adapter: TCP over a host-owned smoltcp stack, with mDNS on the same stack.
-smoltcp = [
-  "tcp",
-  "portable-mdns",
-  "minip2p-tcp/smoltcp",
-  "minip2p-mdns/smoltcp",
-]
-# Portable capabilities: each compiles `no_std` over any `Transport`.
-portable-mdns = ["_mdns-driver"]
-portable-autonat = ["_nat-driver"]
-portable-relay = ["portable-autonat", "_circuit-driver"]
-nat = ["std", "_circuit-driver", "_nat-driver"]
-relay-server = ["std", "dep:minip2p-relay-server"]
+smoltcp = ["tcp", "mdns", "minip2p-tcp/smoltcp", "minip2p-mdns/smoltcp"]
+# Capabilities: one name each, the same on every platform. Each compiles
+# `no_std` over any `Transport`, and implies only what it depends on.
+autonat = ["dep:minip2p-nat"]
+relay = ["autonat", "dep:minip2p-circuit", "dep:minip2p-secure-mux"]
+relay-server = ["dep:minip2p-relay-server"]
 pubsub = ["dep:minip2p-pubsub"]
-discovery = ["nat", "pubsub", "_discovery-driver"]
-mdns = ["nat", "_mdns-driver"]
+discovery = ["pubsub", "_peer-book"]
+mdns = ["dep:minip2p-mdns", "_peer-book"]
 # Bench-only counters, off by default and compiled out when off:
 # shared-poll wait counters (`minip2p_transport::bench`), read by the
 # `endpoint_idle` bench, and QUIC datagram counters (`minip2p-quic`'s
 # `diagnostics`), read by the `endpoint_throughput` bench.
 bench = ["std", "minip2p-transport/bench", "minip2p-quic?/diagnostics"]
-# Internal aliases for capability-driver dependencies, reached only through
-# the public features above; not a supported opt-in surface.
-_circuit-driver = ["dep:minip2p-circuit", "dep:minip2p-secure-mux"]
-_discovery-driver = ["dep:minip2p-discovery"]
-_mdns-driver = ["dep:minip2p-mdns", "_discovery-driver"]
-_nat-driver = ["dep:minip2p-nat"]
+# The bounded peer book that discovery and mDNS share; reached only through
+# those features, not a supported opt-in surface.
+_peer-book = ["dep:minip2p-discovery"]
 
 [dependencies]
 minip2p-core = { path = "../core", version = "0.10.5", default-features = false }
@@ -115,14 +106,14 @@ required-features = ["quic", "tcp", "relay-server", "pubsub", "mdns", "bench"]
 [[bench]]
 name = "endpoint_throughput"
 harness = false
-required-features = ["quic", "tcp", "nat", "relay-server", "bench"]
+required-features = ["quic", "tcp", "relay", "relay-server", "bench"]
 
 [[bench]]
 name = "endpoint_rtt"
 harness = false
-required-features = ["quic", "tcp", "nat", "relay-server", "bench"]
+required-features = ["quic", "tcp", "relay", "relay-server", "bench"]
 
 [[bench]]
 name = "endpoint_ping_load"
 harness = false
-required-features = ["quic", "tcp", "nat", "relay-server", "pubsub"]
+required-features = ["quic", "tcp", "relay", "relay-server", "pubsub"]

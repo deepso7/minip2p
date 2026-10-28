@@ -101,13 +101,14 @@ The base `Endpoint` includes whatever you bind — QUIC, TCP, or both — plus m
 
 | Feature | Adds |
 | --- | --- |
-| `nat` | Circuit Relay v2, AutoNAT, and DCUtR traversal policy |
-| `relay-server` | std-only Circuit Relay v2 hosting, independent of `nat` |
+| `autonat` | AutoNAT reachability probing |
+| `relay` | Circuit Relay v2 paths and reservations, and DCUtR with QUIC; implies `autonat` |
+| `relay-server` | Circuit Relay v2 hosting, on the std and portable endpoints |
 | `pubsub` | StrictSign gossipsub |
-| `discovery` | Signed pubsub presence beacons and coordinated dialing; implies `nat` and `pubsub` |
-| `mdns` | Local-link discovery and coordinated direct dialing; implies `nat` |
+| `discovery` | Signed pubsub presence beacons and coordinated dialing; implies `pubsub` |
+| `mdns` | Local-link discovery and coordinated direct dialing |
 
-Features layer onto the same API. Lower-level users can instead drive `SwarmCore` and individual protocol crates directly with explicit timestamps, entropy, and deadlines.
+Each capability has one feature name on every platform, and implies only what it depends on. With `autonat` or `relay` built, `discovery` and `mdns` dial the peers they find through the NAT connect race. Features layer onto the same API. Lower-level users can instead drive `SwarmCore` and individual protocol crates directly with explicit timestamps, entropy, and deadlines.
 
 Host a relay on QUIC and TCP with production defaults:
 

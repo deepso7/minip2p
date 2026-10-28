@@ -46,7 +46,7 @@ struct FlashTransport {
 }
 
 impl FlashTransport {
-    #[cfg(feature = "portable-mdns")]
+    #[cfg(feature = "mdns")]
     fn polls(&self) -> usize {
         *self.polls.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -199,7 +199,7 @@ fn std_endpoint(builder: crate::EndpointBuilder, transport: FlashTransport) -> E
     )
     .map_err(|rejected| rejected.error().clone())
     .expect("member");
-    crate::std::build_endpoint(builder, Ed25519Keypair::generate(), set).expect("builds")
+    builder.bind_over(set).expect("builds")
 }
 
 #[cfg(feature = "std")]
@@ -228,7 +228,7 @@ fn std_batches_report_lifecycle_before_connect_settled() {
 /// Connection engine and the application before the final drain: NAT
 /// output first, the terminal it caused last, the NAT attempt terminal
 /// never.
-#[cfg(any(feature = "nat", feature = "portable-relay"))]
+#[cfg(feature = "relay")]
 fn assert_late_nat_events_settle_in_order<T: Transport, E: EntropySource, M: super::Carrier>(
     engine: &mut super::Engine<T, E, M>,
     connect_id: crate::ConnectId,
@@ -269,7 +269,7 @@ fn assert_late_nat_events_settle_in_order<T: Transport, E: EntropySource, M: sup
     );
 }
 
-#[cfg(any(feature = "nat", feature = "portable-relay"))]
+#[cfg(feature = "relay")]
 fn forced_relay(relay: &PeerAddr) -> minip2p_nat::NatConfig {
     minip2p_nat::NatConfig {
         relays: vec![relay.clone()],
@@ -279,7 +279,7 @@ fn forced_relay(relay: &PeerAddr) -> minip2p_nat::NatConfig {
     }
 }
 
-#[cfg(feature = "nat")]
+#[cfg(all(feature = "std", feature = "relay"))]
 #[test]
 fn std_routes_late_nat_events_before_the_final_drain() {
     let relay = target(&Ed25519Keypair::from_secret_key_bytes([35; 32]).peer_id());
@@ -292,7 +292,7 @@ fn std_routes_late_nat_events_before_the_final_drain() {
     assert_late_nat_events_settle_in_order(&mut endpoint.engine, id, &peer);
 }
 
-#[cfg(feature = "portable-relay")]
+#[cfg(feature = "relay")]
 #[test]
 fn portable_routes_late_nat_events_before_the_final_drain() {
     let identity = Ed25519Keypair::from_secret_key_bytes([37; 32]);
@@ -313,64 +313,10 @@ fn portable_routes_late_nat_events_before_the_final_drain() {
     assert_late_nat_events_settle_in_order(&mut endpoint.engine, id, &peer);
 }
 
-/// Relay paths need circuit operations; a plain transport is refused with
-/// an error that says how to provide them.
-#[cfg(feature = "portable-relay")]
-#[test]
-fn relay_over_a_transport_without_circuit_operations_is_refused() {
-    let identity = Ed25519Keypair::from_secret_key_bytes([40; 32]);
-    let relay = target(&Ed25519Keypair::from_secret_key_bytes([41; 32]).peer_id());
-    let error = Endpoint::portable(&identity, CountingEntropy(0))
-        .relay(relay)
-        .build(FlashTransport::default())
-        .err()
-        .expect("refused");
-    assert!(
-        matches!(
-            error,
-            crate::PortableBuildError::NatConfig(
-                crate::PortableNatConfigError::RelayWithoutCircuits
-            )
-        ),
-        "{error}"
-    );
-}
-
-/// Portable relays need DCUtR off: `dcutr = false` keeps direct racing,
-/// while relays with DCUtR on (and no `force_relay`) are refused.
-#[cfg(feature = "portable-relay")]
-#[test]
-fn portable_relays_need_dcutr_off_or_force_relay() {
-    let identity = Ed25519Keypair::from_secret_key_bytes([44; 32]);
-    let relay = target(&Ed25519Keypair::from_secret_key_bytes([45; 32]).peer_id());
-    let build = |dcutr: bool| {
-        Endpoint::portable(&identity, CountingEntropy(0))
-            .nat_config(minip2p_nat::NatConfig {
-                relays: vec![relay.clone()],
-                dcutr,
-                reservation_policy: minip2p_nat::ReservationPolicy::Always,
-                ..minip2p_nat::NatConfig::default()
-            })
-            .build_with_circuits(minip2p_circuit::CircuitTransport::new(
-                FlashTransport::default(),
-                identity.clone(),
-                CountingEntropy(9),
-            ))
-    };
-    build(false).expect("dcutr off builds");
-    let error = build(true).err().expect("refused");
-    assert!(
-        matches!(
-            error,
-            crate::PortableBuildError::NatConfig(crate::PortableNatConfigError::RelayWithDcutr)
-        ),
-        "{error}"
-    );
-}
-
 /// Relay-server listener addresses come from the bound transports, not from
 /// configuration: a set the agent rejects does not fail the build, and is
 /// reported once as a capability event while the endpoint keeps running.
+/// The relay server runs on the portable endpoint, as on std.
 #[cfg(feature = "relay-server")]
 #[test]
 fn rejected_relay_listener_addresses_are_an_event_not_a_bind_error() {
@@ -384,7 +330,11 @@ fn rejected_relay_listener_addresses_are_an_event_not_a_bind_error() {
         ],
         ..FlashTransport::default()
     };
-    let mut endpoint = std_endpoint(Endpoint::builder().relay_server(), transport);
+    let identity = Ed25519Keypair::from_secret_key_bytes([46; 32]);
+    let mut endpoint = Endpoint::portable(&identity, CountingEntropy(0))
+        .relay_server()
+        .build(transport)
+        .expect("a relay server builds over any transport");
     let rejections = |events: &[EndpointEvent]| {
         events
             .iter()
@@ -399,8 +349,14 @@ fn rejected_relay_listener_addresses_are_an_event_not_a_bind_error() {
             })
             .count()
     };
-    assert_eq!(rejections(&endpoint.poll().expect("poll")), 1);
-    assert_eq!(rejections(&endpoint.poll().expect("poll")), 0);
+    assert_eq!(
+        rejections(&endpoint.poll(Now::from_millis(0)).expect("poll")),
+        1
+    );
+    assert_eq!(
+        rejections(&endpoint.poll(Now::from_millis(1)).expect("poll")),
+        0
+    );
 }
 
 /// After the first batch warms the caches, one batch carrying many stream
@@ -414,13 +370,13 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
     // AutoNAT, so the NAT agent is live but its probes go nowhere.
     let configure = |builder: crate::PortableEndpointBuilder<CountingEntropy>, server: PeerAddr| {
         let builder = builder.protocol(PROTOCOL);
-        #[cfg(all(feature = "pubsub", feature = "_discovery-driver"))]
+        #[cfg(feature = "discovery")]
         let builder = builder.discovery();
-        #[cfg(all(feature = "pubsub", not(feature = "_discovery-driver")))]
+        #[cfg(all(feature = "pubsub", not(feature = "discovery")))]
         let builder = builder.gossipsub();
-        #[cfg(feature = "portable-autonat")]
+        #[cfg(feature = "autonat")]
         let builder = builder.autonat(server);
-        #[cfg(not(feature = "portable-autonat"))]
+        #[cfg(not(feature = "autonat"))]
         drop(server);
         builder
     };
@@ -469,11 +425,11 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
             .expect("send");
     }
 
-    #[cfg(feature = "portable-autonat")]
+    #[cfg(feature = "autonat")]
     assert!(b.engine.nat.is_some(), "NAT driver is live");
     #[cfg(feature = "pubsub")]
     assert!(b.engine.gossipsub.is_some(), "Gossipsub driver is live");
-    #[cfg(all(feature = "pubsub", feature = "_discovery-driver"))]
+    #[cfg(feature = "discovery")]
     assert!(b.engine.discovery.is_some(), "discovery driver is live");
     let passes = b.engine.stats.capability_passes;
     let refreshes = b.engine.stats.address_refreshes;
@@ -488,10 +444,10 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
 }
 
 /// An mDNS carrier that is always idle.
-#[cfg(feature = "portable-mdns")]
+#[cfg(feature = "mdns")]
 struct IdleCarrier(Arc<Mutex<usize>>);
 
-#[cfg(feature = "portable-mdns")]
+#[cfg(feature = "mdns")]
 impl minip2p_mdns::MdnsIo for IdleCarrier {
     fn interfaces(&self) -> &[minip2p_mdns::InterfaceSnapshot] {
         &[]
@@ -516,7 +472,7 @@ impl minip2p_mdns::MdnsIo for IdleCarrier {
 
 /// A carrier on the transport's stack can put bytes into its sockets, so
 /// the batch polls the transport again after the mDNS tick.
-#[cfg(feature = "portable-mdns")]
+#[cfg(feature = "mdns")]
 #[test]
 fn a_portable_mdns_batch_polls_the_transport_around_the_tick() {
     let identity = Ed25519Keypair::from_secret_key_bytes([44; 32]);
@@ -539,8 +495,8 @@ fn a_portable_mdns_batch_polls_the_transport_around_the_tick() {
 
 /// Portable capabilities need no smoltcp: Gossipsub, signed discovery, and
 /// mDNS compose over any transport (the crate's `no_std` matrix runs this
-/// with only `portable-mdns,pubsub`).
-#[cfg(all(feature = "pubsub", feature = "portable-mdns"))]
+/// with only `mdns,discovery`).
+#[cfg(all(feature = "discovery", feature = "mdns"))]
 #[test]
 fn portable_capabilities_compose_over_a_plain_transport() {
     let identity = Ed25519Keypair::from_secret_key_bytes([45; 32]);
@@ -564,9 +520,9 @@ fn portable_capabilities_compose_over_a_plain_transport() {
 }
 
 /// A plain portable endpoint over `Send` parts can move to another thread:
-/// only capabilities that need it (a `portable-mdns` carrier, smoltcp's shared
-/// entropy) make it single-threaded. The std `mdns` feature keeps it `Send`.
-#[cfg(not(feature = "portable-mdns"))]
+/// only capabilities that need it (an `mdns` carrier, smoltcp's shared
+/// entropy) make it single-threaded.
+#[cfg(not(feature = "mdns"))]
 const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<crate::PortableEndpoint<FlashTransport, CountingEntropy>>();

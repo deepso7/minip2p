@@ -21,14 +21,17 @@ extern crate alloc;
 #[cfg(test)]
 extern crate self as minip2p;
 
-#[cfg(feature = "_discovery-driver")]
+#[cfg(feature = "_peer-book")]
 mod discovery;
 mod engine;
-#[cfg(feature = "_nat-driver")]
+#[cfg(feature = "autonat")]
 mod nat;
 mod portable;
 #[cfg(feature = "pubsub")]
 mod pubsub;
+#[cfg(feature = "relay-server")]
+mod relay_server;
+mod setup;
 #[cfg(feature = "std")]
 mod std;
 #[cfg(feature = "pubsub")]
@@ -38,6 +41,10 @@ mod writer;
 pub use portable::*;
 #[cfg(feature = "pubsub")]
 pub use pubsub::GossipsubError;
+#[cfg(feature = "relay-server")]
+pub use relay_server::RelayServerControlError;
+#[cfg(feature = "autonat")]
+pub use setup::NatConfigError;
 #[cfg(feature = "std")]
 pub use std::*;
 pub use writer::{StreamWriteError, StreamWriter, WriteAccepted, WriteProgress};

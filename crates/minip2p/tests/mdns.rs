@@ -1,6 +1,6 @@
 //! Host-multicast integration coverage for mDNS discovery.
 
-#![cfg(feature = "mdns")]
+#![cfg(all(feature = "mdns", feature = "quic"))]
 
 use std::time::{Duration, Instant};
 

@@ -1,6 +1,6 @@
 //! Three-node portable relay gate over a virtual smoltcp IP network.
 
-#![cfg(all(feature = "smoltcp", feature = "portable-relay"))]
+#![cfg(all(feature = "smoltcp", feature = "relay"))]
 #![expect(
     clippy::unwrap_used,
     clippy::panic,
@@ -486,28 +486,6 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
     panic!(
         "relay circuit did not close after its relay link\n  a: {a_events:?}\n  b: {b_events:?}"
     );
-}
-
-#[test]
-fn portable_relay_rejects_udp_traversal_policy() {
-    let bus = VirtualBus::new(1);
-    let local = identity(124);
-    let relay = identity(125);
-    let relay_addr = PeerAddr::new(
-        format!("/ip4/{RELAY_IP}/tcp/4001").parse().unwrap(),
-        relay.peer_id(),
-    )
-    .unwrap();
-    let mut config = relay_config(relay_addr, ReservationPolicy::Never);
-    config.force_relay = false;
-
-    let error = Endpoint::portable(&local, CountingEntropy(40))
-        .smoltcp(stack(bus.device(0), A_IP))
-        .nat_config(config)
-        .build()
-        .err()
-        .expect("DCUtR policy is rejected");
-    assert!(error.to_string().contains("DCUtR is QUIC-only"));
 }
 
 #[test]

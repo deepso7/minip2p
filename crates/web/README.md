@@ -4,7 +4,7 @@ The wasm-bindgen shell behind [`@minip2p/web`](../../bindings/ts/web): minip2p c
 
 Two layers:
 
-- **`Host`** is the browser endpoint: a `PortableEndpoint` over any `Transport` wrapped in a `CircuitTransport` (relay reservations and circuits through `portable-relay`, with `dcutr = false`), with ffi-core's thread-free host core (`EventCarry`, the stream writer, the `P2pEvent` model). It has the commands, errors and event stream of ffi-core's std `P2pEndpoint`, but no thread: its owner samples time and calls `pump`. It never touches wasm, so `cargo test -p minip2p-web` runs it natively over an in-memory transport.
+- **`Host`** is the browser endpoint: a `PortableEndpoint` over any `Transport` wrapped in a `CircuitTransport` (relay reservations and circuits through `relay`, with `dcutr = false`), with ffi-core's thread-free host core (`EventCarry`, the stream writer, the `P2pEvent` model). It has the commands, errors and event stream of ffi-core's std `P2pEndpoint`, but no thread: its owner samples time and calls `pump`. It never touches wasm, so `cargo test -p minip2p-web` runs it natively over an in-memory transport.
 - **`WebEndpoint`** (wasm32 only) is the JavaScript class, with the same surface as the Node addon's `NodeEndpoint` so both TypeScript adapters share `@minip2p/core/serde-backend`. It wraps `Host<WebTransportClient<JsIo, WebEntropy>>`, where `JsIo` is the TypeScript `WebTransportIo` (`bindings/ts/web/src/io.ts`).
 
 ## Runtime

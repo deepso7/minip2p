@@ -19,10 +19,14 @@ Add only what you need:
 
 | Feature | Adds |
 | --- | --- |
-| `pubsub` | Gossipsub, plus optional signed-beacon discovery |
-| `portable-mdns` | Portable mDNS and the shared discovery book; already included by `smoltcp` |
-| `portable-autonat` | AutoNAT probing over the portable endpoint |
-| `portable-relay` | Relay-only circuit connections; includes portable AutoNAT |
+| `pubsub` | Gossipsub |
+| `discovery` | Signed-beacon discovery; includes `pubsub` |
+| `mdns` | mDNS and the shared discovery book; already included by `smoltcp` |
+| `autonat` | AutoNAT probing |
+| `relay` | Relay circuit connections; includes `autonat` |
+| `relay-server` | Circuit Relay v2 hosting |
+
+These are the same names the std `Endpoint` uses.
 
 None of these needs smoltcp: they configure the same `PortableEndpoint` over any transport you build yourself (`Endpoint::portable(..).build(transport)`, or `build_with_circuits` over a `CircuitTransport` for relays). `.smoltcp(stack)` is the shortcut that builds TCP and mDNS on one stack for you.
 
@@ -70,7 +74,7 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
 
 Prefer a real interface address over `0.0.0.0` when Identify and discovery should advertise something peers can dial right away. When DHCP or SLAAC changes the interface addresses, update the shared smoltcp interface through a `SmoltcpStack` clone you kept from before `.smoltcp(stack)`; a wildcard listener follows the change on later polls, and Identify advertises the new address without another `listen`.
 
-Optional services go on the same builder. The following example requires the `smoltcp` and `pubsub` features because signed discovery uses pubsub:
+Optional services go on the same builder. The following example requires the `smoltcp` and `discovery` features (`discovery` includes the pubsub it runs on):
 
 ```rust
 let mut endpoint = Endpoint::portable(&identity, entropy)
@@ -81,7 +85,7 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
     .build()?;
 ```
 
-For this combination, install with `cargo add minip2p-rs --no-default-features --features smoltcp,pubsub`. mDNS does not use pubsub.
+For this combination, install with `cargo add minip2p-rs --no-default-features --features smoltcp,discovery`. mDNS does not use pubsub.
 
 ## Drive time and network progress
 

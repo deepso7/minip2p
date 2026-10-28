@@ -7,7 +7,7 @@ This guide starts where direct [listen and connect](/rust/listen-and-dial) leave
 
 <Badge>pre-1.0</Badge>
 
-The `nat` feature adds an orchestrator that can race a direct QUIC or TCP dial against a Circuit Relay v2 path. DCUtR hole punching still needs QUIC.
+The `relay` feature (which includes `autonat`) adds an orchestrator that can race a direct QUIC or TCP dial against a Circuit Relay v2 path. DCUtR hole punching still needs QUIC.
 
 ## Host the relay
 
@@ -25,7 +25,7 @@ Its default is the small `.relay_server().listen_on(..)?.bind()` application pat
 ## Enable NAT traversal
 
 ```bash
-cargo add minip2p-rs --features nat
+cargo add minip2p-rs --features relay
 ```
 
 Builder configuration determines the available behavior:
