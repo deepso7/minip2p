@@ -1,6 +1,6 @@
 extern crate alloc;
 
-#[cfg(feature = "portable-mdns")]
+#[cfg(feature = "mdns")]
 use alloc::boxed::Box;
 use alloc::{string::String, vec::Vec};
 
@@ -38,23 +38,23 @@ pub use event_stream::EndpointEvent;
 mod stream_acks;
 pub(crate) use stream_acks::StreamAcks;
 
-#[cfg(feature = "_circuit-driver")]
+#[cfg(feature = "relay")]
 pub use minip2p_circuit::CircuitLimits;
-#[cfg(feature = "portable-relay")]
+#[cfg(feature = "relay")]
 pub use minip2p_circuit::CircuitTransport;
-#[cfg(all(feature = "_discovery-driver", feature = "pubsub"))]
+#[cfg(feature = "discovery")]
 pub use minip2p_discovery::{BeaconConfig, DISCOVERY_TOPIC};
-#[cfg(feature = "_discovery-driver")]
+#[cfg(feature = "_peer-book")]
 pub use minip2p_discovery::{
     DiscoveryConfigError, DiscoveryEvent, DiscoverySource, KnownPeer, PeerDiscoveryConfig,
 };
-#[cfg(feature = "_mdns-driver")]
+#[cfg(feature = "mdns")]
 pub use minip2p_mdns::{
     MDNS_FAILURE_RETRY, MdnsConfig, MdnsConfigError, MdnsError, MdnsEvent, MdnsIo, MdnsIoOperation,
 };
 #[cfg(feature = "smoltcp")]
 pub use minip2p_mdns::{SmoltcpMdnsConfig, SmoltcpMdnsIo};
-#[cfg(feature = "_nat-driver")]
+#[cfg(feature = "autonat")]
 pub use minip2p_nat::{
     NatConfig, NatError, NatEvent, ReachabilityState, RelayStage, ReservationInfo,
     ReservationPolicy, UpgradeStop,
@@ -64,9 +64,16 @@ pub use minip2p_pubsub::{
     GOSSIPSUB_PROTOCOL_IDS, GossipsubConfig, GossipsubConfigError, GossipsubEvent, PublishError,
     TopicError,
 };
+#[cfg(feature = "relay-server")]
+pub use minip2p_relay_server::{
+    CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
+    RelayServerAddrSource, RelayServerAddressError, RelayServerAddressErrorKind, RelayServerConfig,
+    RelayServerConfigError, RelayServerConfigErrorKind, RelayServerEvent, RelayServerRuntimeError,
+    RelayServerRuntimeErrorKind, ReservationCloseReason, Status,
+};
 /// Yamux limits, set per connection through `TcpConfig::yamux` and
 /// `CircuitLimits::yamux`.
-#[cfg(any(feature = "tcp", feature = "_circuit-driver"))]
+#[cfg(any(feature = "tcp", feature = "relay"))]
 pub use minip2p_secure_mux::YamuxConfig;
 use minip2p_swarm::SwarmBuilder;
 #[cfg(feature = "smoltcp")]
@@ -74,15 +81,12 @@ pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
 #[cfg(feature = "tcp")]
 pub use minip2p_tcp::{TcpConfig, TcpProvider, TcpTransport};
 
-#[cfg(feature = "_discovery-driver")]
-use crate::discovery::DiscoveryDriver;
 use crate::engine::Engine;
-#[cfg(feature = "_circuit-driver")]
+#[cfg(feature = "relay")]
 use crate::nat::CircuitOps;
-#[cfg(feature = "portable-autonat")]
-use crate::nat::NatDriver;
-#[cfg(feature = "pubsub")]
-use crate::pubsub::GossipsubDriver;
+#[cfg(feature = "autonat")]
+use crate::setup::NatConfigError;
+use crate::setup::{self, Capabilities, Platform, SetupError};
 
 /// Portable endpoint entry point when the std `Endpoint` is not compiled.
 ///
@@ -103,35 +107,19 @@ impl Endpoint {
 }
 
 /// The mDNS carrier a portable endpoint holds: any caller-owned `MdnsIo`.
-#[cfg(feature = "portable-mdns")]
+#[cfg(feature = "mdns")]
 type PortableCarrier = Box<dyn MdnsIo>;
-#[cfg(all(feature = "_mdns-driver", not(feature = "portable-mdns")))]
-type PortableCarrier = NoMdns;
-#[cfg(not(feature = "_mdns-driver"))]
+#[cfg(not(feature = "mdns"))]
 type PortableCarrier = ();
 
-/// The carrier of a portable endpoint built without `portable-mdns`, when the
-/// std `mdns` feature still compiles the driver in. Uninhabited: such an
-/// endpoint cannot run mDNS, and stays `Send`.
-#[cfg(all(feature = "_mdns-driver", not(feature = "portable-mdns")))]
-pub(crate) enum NoMdns {}
-
-#[cfg(all(feature = "_mdns-driver", not(feature = "portable-mdns")))]
-impl MdnsIo for NoMdns {
-    fn interfaces(&self) -> &[minip2p_mdns::InterfaceSnapshot] {
-        match *self {}
-    }
-
-    fn refresh(&mut self) -> Result<bool, MdnsError> {
-        match *self {}
-    }
-
-    fn receive(&mut self, _: &mut [u8]) -> Result<Option<minip2p_mdns::MdnsDatagram>, MdnsError> {
-        match *self {}
-    }
-
-    fn send(&mut self, _: &minip2p_mdns::MdnsAction) -> Result<(), MdnsError> {
-        match *self {}
+/// What a portable endpoint offers its capabilities: no DCUtR, circuit
+/// operations only over a `CircuitTransport`, and an mDNS carrier that may
+/// share the transport's stack.
+fn portable_platform(has_circuits: bool) -> Platform {
+    Platform {
+        runs_dcutr: false,
+        has_circuits,
+        mdns_shares_transport: true,
     }
 }
 
@@ -144,9 +132,9 @@ fn expand_concrete(addr: &PeerAddr) -> Expansion {
 /// Caller-driven endpoint over an injected transport and entropy source.
 ///
 /// It is `Send` whenever its transport and entropy source are, unless
-/// `portable-mdns` (or `smoltcp`, which enables it) is compiled in: the
-/// carrier is then held as a `Box<dyn MdnsIo>`, which embedded carriers on a
-/// shared stack are not. The std `mdns` feature alone does not affect it.
+/// `mdns` (or `smoltcp`, which enables it) is compiled in: the carrier is
+/// then held as a `Box<dyn MdnsIo>`, which embedded carriers on a shared
+/// stack are not.
 ///
 /// Portable entry point for embedded systems and deterministic event loops.
 /// It performs no blocking and never reads a system clock. Callers drive it
@@ -157,8 +145,9 @@ fn expand_concrete(addr: &PeerAddr) -> Expansion {
 ///
 /// It runs the same engine and the same per-batch event order as the std
 /// `Endpoint` (see [`EndpointEvent`]). Capabilities configured on
-/// [`PortableEndpointBuilder`] (AutoNAT and relay, Gossipsub, signed
-/// discovery, mDNS) report through their [`EndpointEvent`] variants. Every
+/// [`PortableEndpointBuilder`] (AutoNAT and relay, the relay server,
+/// Gossipsub, signed discovery, mDNS) report through their [`EndpointEvent`]
+/// variants. Every
 /// dial goes through [`connect`](Self::connect).
 ///
 /// # State snapshots
@@ -522,7 +511,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// error.
     pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, DriverError> {
         // The failure is queued as an event too.
-        #[cfg(feature = "_mdns-driver")]
+        #[cfg(feature = "mdns")]
         drop(self.engine.shutdown_mdns(now));
         let mut first_error = None;
         for peer_id in self.engine.core.connected_peers() {
@@ -545,8 +534,30 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         }
     }
 
+    /// Pauses or resumes admission of new relay reservations and circuits.
+    ///
+    /// Existing reservations and circuits remain active, and HOP remains
+    /// advertised while admission is paused.
+    #[cfg(feature = "relay-server")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "The error type retains a rejected address for the announce control."
+    )]
+    pub fn set_relay_server_accepting(
+        &mut self,
+        accepting: bool,
+    ) -> Result<(), crate::RelayServerControlError> {
+        let relay_server = self
+            .engine
+            .relay_server
+            .as_mut()
+            .ok_or(crate::RelayServerControlError::NotConfigured)?;
+        relay_server.agent.set_accepting(accepting);
+        Ok(())
+    }
+
     /// Returns the currently held relay reservation, when any.
-    #[cfg(feature = "portable-relay")]
+    #[cfg(feature = "relay")]
     pub fn active_reservation(&self) -> Option<ReservationInfo> {
         self.engine.active_reservation()
     }
@@ -554,7 +565,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// Returns the current AutoNAT reachability verdict
     /// ([`ReachabilityState::Unknown`] until a server exchange succeeds, or
     /// when NAT is not configured).
-    #[cfg(feature = "portable-autonat")]
+    #[cfg(feature = "autonat")]
     pub fn reachability(&self) -> ReachabilityState {
         self.engine.reachability()
     }
@@ -590,7 +601,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
 
     /// Returns the bounded peer book shared by mDNS and signed beacons;
     /// empty when neither is configured.
-    #[cfg(feature = "_discovery-driver")]
+    #[cfg(feature = "_peer-book")]
     pub fn known_peers(&self) -> Vec<KnownPeer> {
         self.engine.known_peers()
     }
@@ -617,11 +628,11 @@ pub enum PortableBuildError {
         error: minip2p_core::MultiaddrError,
     },
     /// The mDNS carrier could not be constructed.
-    #[cfg(feature = "portable-mdns")]
+    #[cfg(feature = "mdns")]
     #[error(transparent)]
     Mdns(#[from] MdnsError),
     /// mDNS wire or scheduling policy was invalid.
-    #[cfg(feature = "portable-mdns")]
+    #[cfg(feature = "mdns")]
     #[error(transparent)]
     MdnsConfig(#[from] MdnsConfigError),
     /// Gossipsub configuration was invalid.
@@ -633,56 +644,58 @@ pub enum PortableBuildError {
     #[error(transparent)]
     Topic(#[from] TopicError),
     /// Signed-beacon or bounded peer-book policy was invalid.
-    #[cfg(feature = "_discovery-driver")]
+    #[cfg(feature = "_peer-book")]
     #[error(transparent)]
     Discovery(#[from] DiscoveryConfigError),
-    /// Portable NAT policy requested an unsupported path, or relay paths
-    /// over a transport without circuit operations.
-    #[cfg(feature = "portable-autonat")]
-    #[error("invalid portable NAT config: {0}")]
-    NatConfig(PortableNatConfigError),
+    /// NAT policy that cannot run on this endpoint: no servers, a
+    /// reservation without a relay, or relays it cannot use.
+    #[cfg(feature = "autonat")]
+    #[error("invalid NAT config: {0}")]
+    NatConfig(NatConfigError),
+    /// The relay server's configuration is invalid.
+    #[cfg(feature = "relay-server")]
+    #[error("relay-server configuration: {0}")]
+    RelayServer(RelayServerConfigError),
+    /// A relay-server announce address does not fit this endpoint's
+    /// identity.
+    #[cfg(feature = "relay-server")]
+    #[error("relay-server announce address: {0}")]
+    RelayServerAnnounce(alloc::boxed::Box<RelayServerAddressError>),
     /// A transport limit cannot work ([`TcpConfig::validate`], or
-    /// [`CircuitLimits::validate`] with the `portable-relay` feature).
+    /// [`CircuitLimits::validate`] with the `relay` feature).
     #[error(transparent)]
     InvalidLimit(#[from] InvalidLimit),
 }
 
-/// Portable NAT policy that cannot run.
-#[cfg(feature = "portable-autonat")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
-pub enum PortableNatConfigError {
-    /// Neither a relay nor an AutoNAT server is configured.
-    #[error("at least one relay or AutoNAT server is required")]
-    NoServers,
-    /// A reservation policy other than `Never` without a relay to reserve
-    /// on.
-    #[error("relay reservation policy requires at least one relay address")]
-    ReservationWithoutRelay,
-    /// Relays with DCUtR on: portable endpoints do not run DCUtR, so a
-    /// relay is only ever a path, never an upgrade. Set `dcutr = false` to
-    /// keep racing direct candidates, or `force_relay = true` to use the
-    /// relay alone.
-    #[error(
-        "portable relay requires dcutr = false (or force_relay = true); DCUtR is QUIC-only and portable endpoints do not run it"
-    )]
-    RelayWithDcutr,
-    /// Relays without the `portable-relay` feature.
-    #[error("relay addresses require the portable-relay feature")]
-    RelayFeatureMissing,
-    /// Relays over a transport without circuit operations.
-    #[error(
-        "relay addresses need circuit operations from the transport: wrap it in a CircuitTransport and build with build_with_circuits"
-    )]
-    RelayWithoutCircuits,
+impl From<SetupError> for PortableBuildError {
+    fn from(error: SetupError) -> Self {
+        match error {
+            SetupError::Entropy(error) => Self::Entropy(error),
+            SetupError::Swarm(error) => Self::Swarm(error),
+            #[cfg(feature = "autonat")]
+            SetupError::NatConfig(error) => Self::NatConfig(error),
+            #[cfg(feature = "pubsub")]
+            SetupError::Gossipsub(error) => Self::Gossipsub(error),
+            #[cfg(feature = "discovery")]
+            SetupError::Topic(error) => Self::Topic(error),
+            #[cfg(feature = "_peer-book")]
+            SetupError::Discovery(error) => Self::Discovery(error),
+            #[cfg(feature = "mdns")]
+            SetupError::Mdns(error) => Self::MdnsConfig(error),
+            #[cfg(feature = "relay-server")]
+            SetupError::RelayServer(error) => Self::RelayServer(error),
+            #[cfg(feature = "relay-server")]
+            SetupError::RelayServerAnnounce(error) => Self::RelayServerAnnounce(error),
+        }
+    }
 }
 
 /// Builder for a [`PortableEndpoint`].
 ///
 /// Base endpoint operations work over any [`Transport`]. Capabilities are
 /// opt-in setters behind their Cargo features: AutoNAT and relay
-/// (`portable-autonat`, `portable-relay`), Gossipsub and signed discovery
-/// (`pubsub`), and mDNS (`portable-mdns`).
+/// (`autonat`, `relay`), the relay server (`relay-server`), Gossipsub
+/// (`pubsub`), signed discovery (`discovery`), and mDNS (`mdns`).
 ///
 /// # Relay needs circuit operations
 ///
@@ -690,31 +703,17 @@ pub enum PortableNatConfigError {
 /// operations from the transport. [`build`](Self::build) works over any
 /// transport and refuses relay configuration with
 /// `PortableBuildError::NatConfig`; wrap the transport in a
-/// `CircuitTransport` and call `build_with_circuits` (feature
-/// `portable-relay`) to run relays.
-/// AutoNAT alone needs nothing from the transport.
+/// `CircuitTransport` and call `build_with_circuits` (feature `relay`) to
+/// run relays. AutoNAT alone needs nothing from the transport.
 pub struct PortableEndpointBuilder<E> {
     swarm: SwarmBuilder,
-    #[cfg_attr(
-        not(any(feature = "pubsub", feature = "smoltcp")),
-        expect(
-            dead_code,
-            reason = "only Gossipsub, beacons, and smoltcp sign with it"
-        )
-    )]
     identity: Ed25519Keypair,
     entropy: E,
     connect_deadline_ms: u64,
-    #[cfg(feature = "portable-autonat")]
-    nat_config: Option<NatConfig>,
-    #[cfg(feature = "pubsub")]
-    gossipsub: Option<GossipsubConfig>,
-    #[cfg(all(feature = "pubsub", feature = "_discovery-driver"))]
-    beacon: Option<BeaconConfig>,
-    #[cfg(feature = "_discovery-driver")]
-    peer_discovery: PeerDiscoveryConfig,
-    #[cfg(feature = "portable-mdns")]
-    mdns: Option<(PortableCarrier, MdnsConfig)>,
+    capabilities: Capabilities,
+    /// The carrier [`Self::mdns`] hands over with `capabilities.mdns`.
+    #[cfg(feature = "mdns")]
+    mdns_io: Option<PortableCarrier>,
 }
 
 impl<E: EntropySource> PortableEndpointBuilder<E> {
@@ -725,16 +724,9 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
             identity: identity.clone(),
             entropy,
             connect_deadline_ms: DEFAULT_CONNECT_DEADLINE_MS,
-            #[cfg(feature = "portable-autonat")]
-            nat_config: None,
-            #[cfg(feature = "pubsub")]
-            gossipsub: None,
-            #[cfg(all(feature = "pubsub", feature = "_discovery-driver"))]
-            beacon: None,
-            #[cfg(feature = "_discovery-driver")]
-            peer_discovery: PeerDiscoveryConfig::default(),
-            #[cfg(feature = "portable-mdns")]
-            mdns: None,
+            capabilities: Capabilities::default(),
+            #[cfg(feature = "mdns")]
+            mdns_io: None,
         }
     }
 
@@ -769,18 +761,11 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     ///
     /// Needs a transport with circuit operations: build with
     /// `build_with_circuits`.
-    #[cfg(feature = "portable-relay")]
+    #[cfg(feature = "relay")]
     pub fn relay(mut self, relay: PeerAddr) -> Self {
-        let mut config = match self.nat_config.take() {
-            Some(config) => config,
-            None => NatConfig {
-                reservation_policy: ReservationPolicy::Never,
-                ..NatConfig::default()
-            },
-        };
+        let config = self.nat_or_default();
         config.relays.push(relay);
         config.force_relay = true;
-        self.nat_config = Some(config);
         self
     }
 
@@ -789,34 +774,61 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     /// Call once per server: a reachability verdict needs a quorum of
     /// distinct servers ([`NatConfig::confidence_threshold`], 3 by default),
     /// so with fewer reachable servers reachability stays Unknown.
-    #[cfg(feature = "portable-autonat")]
+    #[cfg(feature = "autonat")]
     pub fn autonat(mut self, server: PeerAddr) -> Self {
-        self.nat_config
-            .get_or_insert_with(|| NatConfig {
-                reservation_policy: ReservationPolicy::Never,
-                ..NatConfig::default()
-            })
-            .autonat_servers
-            .push(server);
+        self.nat_or_default().autonat_servers.push(server);
         self
     }
 
-    /// Enables portable NAT policy with explicit relay and AutoNAT settings.
+    /// The NAT configuration the setters add to; a fresh one holds no
+    /// reservation.
+    #[cfg(feature = "autonat")]
+    fn nat_or_default(&mut self) -> &mut NatConfig {
+        self.capabilities
+            .nat
+            .get_or_insert_with(setup::no_reservation_nat)
+    }
+
+    /// Enables NAT policy with explicit relay and AutoNAT settings.
     ///
     /// Relay configurations must set `dcutr = false` (direct candidates
     /// still race the relay leg) or `force_relay` (relay only): portable
     /// endpoints do not run DCUtR. AutoNAT servers may be configured with or
     /// without relays.
-    #[cfg(feature = "portable-autonat")]
+    #[cfg(feature = "autonat")]
     pub fn nat_config(mut self, config: NatConfig) -> Self {
-        self.nat_config = Some(config);
+        self.capabilities.nat = Some(config);
+        self
+    }
+
+    /// Enables Circuit Relay v2 service with production-oriented defaults.
+    ///
+    /// The server announces the transport's concrete listener addresses
+    /// and any public addresses AutoNAT confirms. Pause and resume admission
+    /// with [`PortableEndpoint::set_relay_server_accepting`]; its events
+    /// arrive as [`EndpointEvent::RelayServer`].
+    #[cfg(feature = "relay-server")]
+    pub fn relay_server(self) -> Self {
+        self.relay_server_config(RelayServerConfig::default())
+    }
+
+    /// Enables Circuit Relay v2 service with custom limits, validated at
+    /// build.
+    #[cfg(feature = "relay-server")]
+    pub fn relay_server_config(mut self, config: RelayServerConfig) -> Self {
+        self.capabilities.relay_server = Some(setup::RelayServerSetup {
+            config,
+            announce_addrs: Vec::new(),
+        });
         self
     }
 
     /// Enables pubsub with interoperable gossipsub defaults.
     #[cfg(feature = "pubsub")]
     pub fn gossipsub(mut self) -> Self {
-        self.gossipsub.get_or_insert_with(GossipsubConfig::default);
+        self.capabilities
+            .gossipsub
+            .get_or_insert_with(GossipsubConfig::default);
         self
     }
 
@@ -824,31 +836,31 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     /// at build.
     #[cfg(feature = "pubsub")]
     pub fn gossipsub_config(mut self, config: GossipsubConfig) -> Self {
-        self.gossipsub = Some(config);
+        self.capabilities.gossipsub = Some(config);
         self
     }
 
     /// Enables signed-beacon discovery. Pubsub is enabled automatically.
-    #[cfg(all(feature = "pubsub", feature = "_discovery-driver"))]
-    pub fn discovery(mut self) -> Self {
-        self.gossipsub.get_or_insert_with(GossipsubConfig::default);
-        self.beacon.get_or_insert_with(BeaconConfig::default);
-        self
+    #[cfg(feature = "discovery")]
+    pub fn discovery(self) -> Self {
+        self.beacon_config(BeaconConfig::default())
     }
 
     /// Enables signed-beacon discovery with explicit beacon policy.
-    #[cfg(all(feature = "pubsub", feature = "_discovery-driver"))]
+    #[cfg(feature = "discovery")]
     pub fn beacon_config(mut self, config: BeaconConfig) -> Self {
-        self.gossipsub.get_or_insert_with(GossipsubConfig::default);
-        self.beacon = Some(config);
+        self.capabilities
+            .gossipsub
+            .get_or_insert_with(GossipsubConfig::default);
+        self.capabilities.beacon = Some(config);
         self
     }
 
     /// Overrides the shared bounded peer-book and automatic-dial policy,
     /// validated at build. It applies to every enabled discovery source.
-    #[cfg(feature = "_discovery-driver")]
+    #[cfg(feature = "_peer-book")]
     pub fn peer_discovery_config(mut self, config: PeerDiscoveryConfig) -> Self {
-        self.peer_discovery = config;
+        self.capabilities.peer_discovery = config;
         self
     }
 
@@ -860,9 +872,10 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     /// entropy. Peer-book and automatic-dial policy comes from
     /// [`Self::peer_discovery_config`]. The endpoint polls the transport
     /// again after each mDNS tick, in case the carrier shares its stack.
-    #[cfg(feature = "portable-mdns")]
+    #[cfg(feature = "mdns")]
     pub fn mdns(mut self, io: impl MdnsIo + 'static, config: MdnsConfig) -> Self {
-        self.mdns = Some((Box::new(io), config));
+        self.mdns_io = Some(Box::new(io));
+        self.capabilities.mdns = Some(config);
         self
     }
 
@@ -874,14 +887,14 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     ) -> Result<PortableEndpoint<T, E>, PortableBuildError> {
         self.assemble(
             transport,
-            #[cfg(feature = "_circuit-driver")]
+            #[cfg(feature = "relay")]
             None,
         )
     }
 
     /// Builds the endpoint over a [`CircuitTransport`], whose circuit
     /// operations let relay legs and reservations run.
-    #[cfg(feature = "portable-relay")]
+    #[cfg(feature = "relay")]
     pub fn build_with_circuits<T: Transport, R: EntropySource>(
         self,
         transport: CircuitTransport<T, R>,
@@ -889,147 +902,34 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
         self.assemble(transport, Some(CircuitOps::circuit_transport()))
     }
 
-    #[cfg_attr(
-        not(any(feature = "portable-autonat", feature = "pubsub")),
-        expect(
-            unused_mut,
-            reason = "only capabilities add protocols while assembling"
-        )
-    )]
+    /// Validates the capabilities, builds the swarm over `transport`, and
+    /// installs them through Endpoint setup.
     fn assemble<T: Transport>(
-        mut self,
+        self,
         transport: T,
-        #[cfg(feature = "_circuit-driver")] circuits: Option<CircuitOps<T>>,
+        #[cfg(feature = "relay")] circuits: Option<CircuitOps<T>>,
     ) -> Result<PortableEndpoint<T, E>, PortableBuildError> {
-        #[cfg(feature = "portable-autonat")]
-        if let Some(config) = &self.nat_config {
-            #[cfg(feature = "_circuit-driver")]
-            let has_circuits = circuits.is_some();
-            #[cfg(not(feature = "_circuit-driver"))]
-            let has_circuits = false;
-            validate_nat(config, has_circuits)?;
-            if !config.autonat_servers.is_empty() {
-                self.swarm = self.swarm.protocol(minip2p_nat::AUTONAT_PROTOCOL_ID);
-            }
-        }
-        #[cfg(feature = "pubsub")]
-        if let Some(config) = &self.gossipsub {
-            config.validate().map_err(PortableBuildError::Gossipsub)?;
-            for protocol in GOSSIPSUB_PROTOCOL_IDS {
-                self.swarm = self.swarm.protocol(*protocol);
-            }
-        }
-        #[cfg(feature = "_discovery-driver")]
-        self.peer_discovery.validate()?;
+        #[cfg(feature = "relay")]
+        let has_circuits = circuits.is_some();
+        #[cfg(not(feature = "relay"))]
+        let has_circuits = false;
+        let validated = setup::validate(
+            self.capabilities,
+            portable_platform(has_circuits),
+            &self.identity.peer_id(),
+        )?;
         // The swarm owns the entropy from here on; capabilities draw from it.
         let core = self.swarm.build_core(transport, self.entropy)?;
-        #[cfg_attr(
-            not(any(
-                feature = "portable-autonat",
-                feature = "pubsub",
-                feature = "_discovery-driver"
-            )),
-            expect(unused_mut, reason = "no capability to install")
-        )]
         let mut engine = Engine::new(core, self.connect_deadline_ms, StreamAcks::default());
-
-        #[cfg(feature = "portable-autonat")]
-        if let Some(config) = self.nat_config {
-            if !config.relays.is_empty() {
-                engine
-                    .core
-                    .add_outbound_protocol(minip2p_nat::HOP_PROTOCOL_ID)?;
-                engine
-                    .core
-                    .add_inbound_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
-                engine
-                    .core
-                    .add_advertised_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
-            }
-            let relay_addrs = config
-                .relays
-                .iter()
-                .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
-                .collect();
-            // The driver seeds the agent's listen addresses on its first turn.
-            let agent = minip2p_nat::NatAgent::new(engine.core.local_peer_id().clone(), config);
-            let driver = NatDriver::new(agent, relay_addrs, engine.core.entropy_mut());
-            #[cfg(feature = "_circuit-driver")]
-            let driver = match circuits {
-                Some(circuits) => driver.with_circuits(circuits),
-                None => driver,
-            };
-            engine.nat = Some(driver);
-        }
-        // Without portable NAT there is no relay to hand the operations to.
-        #[cfg(all(feature = "_circuit-driver", not(feature = "portable-autonat")))]
-        let _ = circuits;
-
-        #[cfg(feature = "pubsub")]
-        #[cfg_attr(
-            not(feature = "_discovery-driver"),
-            expect(unused_mut, reason = "only the beacon subscribes during assembly")
-        )]
-        let mut pubsub = match self.gossipsub {
-            Some(config) => Some(
-                minip2p_pubsub::GossipsubAgent::new(
-                    self.identity.clone(),
-                    config,
-                    engine.core.entropy_mut().next_u64()?,
-                    engine.core.entropy_mut().next_u64()?,
-                )
-                .map_err(PortableBuildError::Gossipsub)?,
-            ),
-            None => None,
-        };
-        #[cfg(all(feature = "pubsub", feature = "_discovery-driver"))]
-        let beacon = self
-            .beacon
-            .map(|config| minip2p_discovery::BeaconAgent::new(self.identity.public_key(), config))
-            .transpose()?;
-        #[cfg(all(feature = "pubsub", feature = "_discovery-driver"))]
-        if let (Some(pubsub), Some(beacon)) = (&mut pubsub, &beacon) {
-            pubsub.subscribe(beacon.topic(), 0)?;
-        }
-        #[cfg(feature = "pubsub")]
-        {
-            engine.gossipsub = pubsub.map(GossipsubDriver::new);
-        }
-
-        #[cfg(feature = "portable-mdns")]
-        if let Some((io, config)) = self.mdns {
-            let mut seed = [0; 32];
-            engine.core.entropy_mut().fill_bytes(&mut seed)?;
-            let agent = minip2p_mdns::MdnsAgent::new(
-                engine.core.local_peer_id().clone(),
-                config.clone(),
-                seed,
-            )?;
-            engine.set_mdns(minip2p_mdns::MdnsDriver::new(agent, io, &config), true);
-        }
-
-        #[cfg(feature = "_discovery-driver")]
-        {
-            #[cfg(feature = "pubsub")]
-            let beacon_enabled = beacon.is_some();
-            #[cfg(not(feature = "pubsub"))]
-            let beacon_enabled = false;
-            #[cfg(feature = "_mdns-driver")]
-            let mdns_enabled = engine.has_mdns();
-            #[cfg(not(feature = "_mdns-driver"))]
-            let mdns_enabled = false;
-            if beacon_enabled || mdns_enabled {
-                let book = minip2p_discovery::PeerDiscoveryAgent::new(
-                    engine.core.local_peer_id().clone(),
-                    self.peer_discovery,
-                )?;
-                engine.discovery = Some(DiscoveryDriver::new(
-                    book,
-                    #[cfg(feature = "pubsub")]
-                    beacon,
-                ));
-            }
-        }
+        setup::install(
+            &mut engine,
+            validated,
+            &self.identity,
+            #[cfg(feature = "relay")]
+            circuits,
+            #[cfg(feature = "mdns")]
+            self.mdns_io,
+        )?;
         Ok(PortableEndpoint { engine })
     }
 
@@ -1050,19 +950,13 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
                 identity: self.identity,
                 entropy: entropy.clone(),
                 connect_deadline_ms: self.connect_deadline_ms,
-                #[cfg(feature = "portable-autonat")]
-                nat_config: self.nat_config,
-                #[cfg(feature = "pubsub")]
-                gossipsub: self.gossipsub,
-                #[cfg(feature = "pubsub")]
-                beacon: self.beacon,
-                peer_discovery: self.peer_discovery,
-                mdns: self.mdns,
+                capabilities: self.capabilities,
+                mdns_io: self.mdns_io,
             },
             entropy,
             stack,
             tcp_config: TcpConfig::default(),
-            #[cfg(feature = "portable-relay")]
+            #[cfg(feature = "relay")]
             circuit_limits: CircuitLimits::default(),
             provider_config: SmoltcpConfig::default(),
             listens: Vec::new(),
@@ -1071,33 +965,14 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     }
 }
 
-/// Rejects portable NAT policy that cannot run.
-#[cfg(feature = "portable-autonat")]
-fn validate_nat(config: &NatConfig, has_circuits: bool) -> Result<(), PortableBuildError> {
-    let error = if config.relays.is_empty() && config.autonat_servers.is_empty() {
-        PortableNatConfigError::NoServers
-    } else if config.relays.is_empty() && config.reservation_policy != ReservationPolicy::Never {
-        PortableNatConfigError::ReservationWithoutRelay
-    } else if !config.relays.is_empty() && config.dcutr && !config.force_relay {
-        PortableNatConfigError::RelayWithDcutr
-    } else if !config.relays.is_empty() && cfg!(not(feature = "portable-relay")) {
-        PortableNatConfigError::RelayFeatureMissing
-    } else if !config.relays.is_empty() && !has_circuits {
-        PortableNatConfigError::RelayWithoutCircuits
-    } else {
-        return Ok(());
-    };
-    Err(PortableBuildError::NatConfig(error))
-}
-
 /// The transport a [`SmoltcpEndpointBuilder`] builds: TCP over smoltcp,
-/// wrapped in a `CircuitTransport` with the `portable-relay` feature.
-#[cfg(all(feature = "smoltcp", not(feature = "portable-relay")))]
+/// wrapped in a `CircuitTransport` with the `relay` feature.
+#[cfg(all(feature = "smoltcp", not(feature = "relay")))]
 pub type SmoltcpTransport<D, E> = TcpTransport<SmoltcpTcpProvider<D>, SharedEntropy<E>>;
 
 /// The transport a [`SmoltcpEndpointBuilder`] builds: TCP over smoltcp,
-/// wrapped in a [`CircuitTransport`] with the `portable-relay` feature.
-#[cfg(all(feature = "smoltcp", feature = "portable-relay"))]
+/// wrapped in a [`CircuitTransport`] with the `relay` feature.
+#[cfg(all(feature = "smoltcp", feature = "relay"))]
 pub type SmoltcpTransport<D, E> =
     CircuitTransport<TcpTransport<SmoltcpTcpProvider<D>, SharedEntropy<E>>, SharedEntropy<E>>;
 
@@ -1121,7 +996,7 @@ pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource> {
     entropy: SharedEntropy<E>,
     stack: SmoltcpStack<D>,
     tcp_config: TcpConfig,
-    #[cfg(feature = "portable-relay")]
+    #[cfg(feature = "relay")]
     circuit_limits: CircuitLimits,
     provider_config: SmoltcpConfig,
     listens: Vec<String>,
@@ -1151,7 +1026,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
 
     /// Overrides the relay circuits' Yamux limits. Checked when the endpoint
     /// is built.
-    #[cfg(feature = "portable-relay")]
+    #[cfg(feature = "relay")]
     pub fn circuit_limits(mut self, limits: CircuitLimits) -> Self {
         self.circuit_limits = limits;
         self
@@ -1210,14 +1085,14 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
     }
 
     /// Enables signed-beacon discovery. Pubsub is enabled automatically.
-    #[cfg(feature = "pubsub")]
+    #[cfg(feature = "discovery")]
     pub fn discovery(mut self) -> Self {
         self.portable = self.portable.discovery();
         self
     }
 
     /// Enables signed-beacon discovery with explicit beacon policy.
-    #[cfg(feature = "pubsub")]
+    #[cfg(feature = "discovery")]
     pub fn beacon_config(mut self, config: BeaconConfig) -> Self {
         self.portable = self.portable.beacon_config(config);
         self
@@ -1230,29 +1105,44 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
     }
 
     /// Enables relay-only connectivity through one relay address.
-    #[cfg(feature = "portable-relay")]
+    #[cfg(feature = "relay")]
     pub fn relay(mut self, relay: PeerAddr) -> Self {
         self.portable = self.portable.relay(relay);
         self
     }
 
-    /// Adds a trusted portable AutoNAT server, enabling probing.
+    /// Enables Circuit Relay v2 service with production-oriented defaults.
+    #[cfg(feature = "relay-server")]
+    pub fn relay_server(mut self) -> Self {
+        self.portable = self.portable.relay_server();
+        self
+    }
+
+    /// Enables Circuit Relay v2 service with custom limits, validated at
+    /// build.
+    #[cfg(feature = "relay-server")]
+    pub fn relay_server_config(mut self, config: RelayServerConfig) -> Self {
+        self.portable = self.portable.relay_server_config(config);
+        self
+    }
+
+    /// Adds a trusted AutoNAT server, enabling probing.
     ///
     /// Call once per server: a reachability verdict needs a quorum of
     /// distinct servers ([`NatConfig::confidence_threshold`], 3 by default),
     /// so with fewer reachable servers reachability stays Unknown.
-    #[cfg(feature = "portable-autonat")]
+    #[cfg(feature = "autonat")]
     pub fn autonat(mut self, server: PeerAddr) -> Self {
         self.portable = self.portable.autonat(server);
         self
     }
 
-    /// Enables portable NAT policy with explicit relay and AutoNAT settings.
+    /// Enables NAT policy with explicit relay and AutoNAT settings.
     ///
     /// TCP relay configurations must set `dcutr = false` or `force_relay`;
     /// UDP DCUtR remains unavailable. AutoNAT servers may be configured with
     /// or without relays.
-    #[cfg(feature = "portable-autonat")]
+    #[cfg(feature = "autonat")]
     pub fn nat_config(mut self, config: NatConfig) -> Self {
         self.portable = self.portable.nat_config(config);
         self
@@ -1271,7 +1161,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             entropy,
             stack,
             tcp_config,
-            #[cfg(feature = "portable-relay")]
+            #[cfg(feature = "relay")]
             circuit_limits,
             provider_config,
             listens,
@@ -1288,14 +1178,14 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             entropy.clone(),
             tcp_config,
         )?;
-        #[cfg(feature = "portable-relay")]
+        #[cfg(feature = "relay")]
         let mut endpoint = portable.build_with_circuits(CircuitTransport::with_limits(
             transport,
             identity,
             entropy,
             circuit_limits,
         )?)?;
-        #[cfg(not(feature = "portable-relay"))]
+        #[cfg(not(feature = "relay"))]
         let mut endpoint = {
             let _ = identity;
             drop(entropy);
@@ -1468,10 +1358,10 @@ mod tests {
 
     /// An mDNS carrier with no interfaces whose driving fails, as a stack
     /// that has gone away does.
-    #[cfg(feature = "portable-mdns")]
+    #[cfg(feature = "mdns")]
     struct BrokenMdns;
 
-    #[cfg(feature = "portable-mdns")]
+    #[cfg(feature = "mdns")]
     impl MdnsIo for BrokenMdns {
         fn interfaces(&self) -> &[minip2p_mdns::InterfaceSnapshot] {
             &[]
@@ -1500,7 +1390,7 @@ mod tests {
 
     /// A stream whose close is still queued in the endpoint is gone from
     /// the swarm, yet abandoning it drops every queued event for it.
-    #[cfg(feature = "portable-mdns")]
+    #[cfg(feature = "mdns")]
     #[test]
     fn abandoning_a_stream_closed_in_held_events_drops_them() {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
@@ -1545,7 +1435,7 @@ mod tests {
     /// A failing mDNS carrier never fails the poll: the failure is one
     /// capability event, reported once, and the rest of the batch (here an
     /// attempt's terminal) is unaffected.
-    #[cfg(feature = "portable-mdns")]
+    #[cfg(feature = "mdns")]
     #[test]
     fn a_failing_mdns_carrier_is_an_event_not_a_poll_error() {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
@@ -1598,7 +1488,7 @@ mod tests {
 
     /// Goodbyes are best effort: one that cannot be sent is a final
     /// `MdnsFailed` among the shutdown's events, not a shutdown error.
-    #[cfg(feature = "portable-mdns")]
+    #[cfg(feature = "mdns")]
     #[test]
     fn a_failed_goodbye_is_an_event_from_shutdown() {
         let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);

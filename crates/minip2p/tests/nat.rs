@@ -1,13 +1,13 @@
-//! End-to-end coverage for the `nat` endpoint API over direct QUIC, a real
+//! End-to-end coverage for the `relay` endpoint API over direct QUIC, a real
 //! loopback Circuit Relay v2 bridge, and a DCUtR hole punch through it.
 
-#![cfg(feature = "nat")]
+#![cfg(all(feature = "relay", feature = "quic"))]
 
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectFailure, ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointEvent, NatConfig,
-    NatEvent, Path, PeerId, ReservationPolicy,
+    ConnectFailure, ConnectId, ConnectOutcome, ConnectionId, Ed25519Keypair, Endpoint,
+    EndpointEvent, NatConfig, NatEvent, Path, PeerAddr, PeerId, ReservationPolicy,
 };
 
 #[path = "../../../tests/support/endpoint.rs"]
@@ -21,7 +21,20 @@ const ECHO_PROTOCOL: &str = "/minip2p/tests/nat-echo/1.0.0";
 
 fn nat_endpoint() -> Endpoint {
     Endpoint::builder()
-        .nat_config(NatConfig::default())
+        .nat_config(NatConfig {
+            // Unroutable, so the agent runs without traffic a test sees.
+            autonat_servers: vec![
+                PeerAddr::new(
+                    "/ip4/192.0.2.250/udp/4001/quic-v1"
+                        .parse()
+                        .expect("address"),
+                    Ed25519Keypair::from_secret_key_bytes([250; 32]).peer_id(),
+                )
+                .expect("peer address"),
+            ],
+            reservation_policy: ReservationPolicy::Never,
+            ..NatConfig::default()
+        })
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")
         .bind()
@@ -679,8 +692,11 @@ fn a_remote_that_never_starts_dcutr_settles_connected_at_the_start_timeout() {
     let relay = relay_support::RelayServer::spawn();
     let relay_addr = relay.addr().clone();
 
-    // A `force_relay` holder never starts DCUtR on its inbound circuits.
+    // A `force_relay` holder never starts DCUtR on its inbound circuits,
+    // and so does not advertise it; registering the id by hand makes it a
+    // remote that offers DCUtR yet never starts a round.
     let mut responder = Endpoint::builder()
+        .protocol("/libp2p/dcutr")
         .relay(relay_addr.clone())
         .nat_config(NatConfig {
             force_relay: true,

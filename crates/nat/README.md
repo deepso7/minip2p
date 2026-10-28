@@ -102,7 +102,7 @@ A write the swarm refuses as Full (ADR 0012) is not lost: the agent holds its un
 
 A dial to a concrete `/ip4`/`/ip6` address starts synchronously (`DialStart::Started`); its outcome arrives as `ConnectionEstablished` or `DialFailed`. The bare `SwarmCore` implementation rejects `/dns*` addresses with `NatSwarmError::NamedAddress`. A host that resolves names wraps the swarm in a small adapter that parks such a dial and returns `DialStart::Deferred`, keeping the token the agent passed in: the agent allocates and registers that token before the dial reaches the host, so the result can come back at any later point. Before dialing and reporting the parked dial through `agent.dial_result(&mut swarm, token, result, now)`, the host calls `agent.deferred_dial_wanted(token, now)` and drops the dial when that returns `false`: the owning flight has moved on, and a late result must not land on a newer one.
 
-The `minip2p` crate (cargo feature `nat`) wires exactly this loop into `Endpoint` so applications get `connect(target)`, `ConnectSettled`, and `EndpointEvent::Nat(..)` from `Endpoint::wait` without touching the pump. Attempt terminals (`ConnectFailed`, `FellBackToRelay`) are consumed by the Endpoint's Connection-attempt engine and surface only as `ConnectSettled`:
+The `minip2p` crate (cargo feature `autonat`, or `relay` for relay paths) wires exactly this loop into `Endpoint` so applications get `connect(target)`, `ConnectSettled`, and `EndpointEvent::Nat(..)` from `Endpoint::wait` without touching the pump. Attempt terminals (`ConnectFailed`, `FellBackToRelay`) are consumed by the Endpoint's Connection-attempt engine and surface only as `ConnectSettled`:
 
 ```rust,ignore
 use minip2p::{EndpointEvent, EndpointWaitOutcome, NatEvent};

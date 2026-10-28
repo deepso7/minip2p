@@ -217,9 +217,10 @@ fn gated_initiator(relay: PeerAddr, peer: PeerId) -> (Endpoint, Arc<Mutex<GateSt
         .map_err(|rejected| rejected.error().clone())
         .expect("member");
     let builder = Endpoint::builder()
+        .identity(keypair)
         .relay(relay)
         .nat_config(punch_config(ReservationPolicy::Never));
-    let mut endpoint = super::build_endpoint(builder, keypair, set).expect("builds");
+    let mut endpoint = builder.bind_over(set).expect("builds");
     endpoint
         .engine
         .core

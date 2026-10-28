@@ -17,7 +17,7 @@ use minip2p_swarm::{SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, Transport};
 
 use super::event_stream::EndpointEvent;
-#[cfg(feature = "_nat-driver")]
+#[cfg(feature = "autonat")]
 use crate::nat::NatDriver;
 
 /// Default Connection-attempt deadline: 30 seconds.
@@ -213,7 +213,7 @@ pub(crate) enum RelayPolicy {
     None,
     /// Race direct candidates against the relay; Relayed is provisional.
     #[cfg_attr(
-        all(not(test), not(feature = "_nat-driver")),
+        all(not(test), not(feature = "autonat")),
         expect(
             dead_code,
             reason = "only NAT-enabled compositions construct a racing relay policy"
@@ -224,7 +224,7 @@ pub(crate) enum RelayPolicy {
     /// (DCUtR off): Relayed is provisional only while a direct candidate is
     /// still in the race.
     #[cfg_attr(
-        all(not(test), not(feature = "_nat-driver")),
+        all(not(test), not(feature = "autonat")),
         expect(
             dead_code,
             reason = "only NAT-enabled compositions construct a racing relay policy"
@@ -233,7 +233,7 @@ pub(crate) enum RelayPolicy {
     RaceWithoutUpgrade,
     /// Skip direct racing; a circuit is a terminal Connected path.
     #[cfg_attr(
-        all(not(test), not(feature = "_nat-driver")),
+        all(not(test), not(feature = "autonat")),
         expect(
             dead_code,
             reason = "only NAT-enabled compositions construct a forced relay policy"
@@ -419,7 +419,7 @@ enum RelayLeg {
         relay: Option<PeerAddr>,
     },
     #[cfg_attr(
-        not(feature = "_nat-driver"),
+        not(feature = "autonat"),
         expect(dead_code, reason = "only observe_nat constructs a failed relay leg",)
     )]
     Failed,
@@ -437,7 +437,7 @@ impl RelayLeg {
     }
 
     #[cfg_attr(
-        not(feature = "_nat-driver"),
+        not(feature = "autonat"),
         expect(dead_code, reason = "only observe_nat records the relay")
     )]
     fn set_relay(&mut self, started: PeerAddr) {
@@ -447,7 +447,7 @@ impl RelayLeg {
     }
 
     #[cfg_attr(
-        not(feature = "_nat-driver"),
+        not(feature = "autonat"),
         expect(dead_code, reason = "only observe_nat reads the relay")
     )]
     fn relay(&self) -> Option<&PeerAddr> {
@@ -614,7 +614,7 @@ impl ConnectEngine {
     }
 
     #[cfg_attr(
-        all(not(test), not(feature = "_nat-driver")),
+        all(not(test), not(feature = "autonat")),
         expect(
             dead_code,
             reason = "only NAT-enabled compositions start a relay leg after admit"
@@ -628,14 +628,14 @@ impl ConnectEngine {
     /// or a name still resolving into one. The NAT driver reads this snapshot
     /// at leg-attach time to stagger the relay leg; it does not track later
     /// direct-dial failures.
-    #[cfg(feature = "_nat-driver")]
+    #[cfg(feature = "autonat")]
     pub(crate) fn dialed_direct(&self, id: ConnectId) -> bool {
         self.attempts.get(&id).is_some_and(Attempt::racing_direct)
     }
 
     /// When the pending attempt expires, in monotonic ms. The NAT driver
     /// hands it to the relay leg so relays split time the attempt has.
-    #[cfg(feature = "_nat-driver")]
+    #[cfg(feature = "autonat")]
     pub(crate) fn expires_ms(&self, id: ConnectId) -> Option<u64> {
         self.attempts.get(&id).map(|attempt| attempt.expires_ms)
     }
@@ -1075,7 +1075,7 @@ impl ConnectEngine {
         }
     }
 
-    #[cfg(feature = "_nat-driver")]
+    #[cfg(feature = "autonat")]
     pub(crate) fn observe_nat<T: Transport, E: EntropySource>(
         &mut self,
         event: &minip2p_nat::NatEvent,
@@ -1285,7 +1285,7 @@ pub(crate) enum Expansion {
 pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
     connect: &mut ConnectEngine,
     runtime: &mut SwarmCore<T, E>,
-    #[cfg(feature = "_nat-driver")] nat: Option<&NatDriver<T>>,
+    #[cfg(feature = "autonat")] nat: Option<&NatDriver<T>>,
     admission: ConnectAdmission,
     expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
     now_ms: u64,
@@ -1296,7 +1296,7 @@ pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
         allow_relay,
     } = admission;
 
-    #[cfg(feature = "_nat-driver")]
+    #[cfg(feature = "autonat")]
     let relay = match &nat {
         Some(driver) if allow_relay && driver.has_relay() => {
             if driver.force_relay() {
@@ -1309,9 +1309,9 @@ pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
         }
         _ => RelayPolicy::None,
     };
-    #[cfg(not(feature = "_nat-driver"))]
+    #[cfg(not(feature = "autonat"))]
     let relay = RelayPolicy::None;
-    #[cfg(not(feature = "_nat-driver"))]
+    #[cfg(not(feature = "autonat"))]
     let _ = allow_relay;
 
     let candidates = if matches!(relay, RelayPolicy::Forced) {
@@ -1335,7 +1335,7 @@ pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
 /// leg) when the composition has one and through the engine alone
 /// otherwise. Returns `true` when a leg was cancelled and the driver must
 /// `pump` the queued actions.
-#[cfg(feature = "_nat-driver")]
+#[cfg(feature = "autonat")]
 pub(crate) fn cancel_attempt<T: Transport, E: EntropySource>(
     connect: &mut ConnectEngine,
     nat: Option<&mut NatDriver<T>>,
@@ -2913,7 +2913,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     fn nat_failed(id: ConnectId, peer: &PeerId, reason: &str) -> minip2p_nat::NatEvent {
         minip2p_nat::NatEvent::ConnectFailed {
             connect_id: id,
@@ -2922,7 +2922,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn race_direct_failures_stay_pending_then_relay_failure_settles() {
         let peer = peer(b"all-then-relay");
@@ -2960,7 +2960,7 @@ mod tests {
         assert!(engine.pop_resolved().is_none());
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn race_connect_failed_while_direct_pending_stays_open() {
         let peer = peer(b"relay-then-direct");
@@ -3000,7 +3000,7 @@ mod tests {
         assert!(engine.pop_resolved().is_none());
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn a_relay_leg_that_never_started_a_relay_is_no_usable_route() {
         let peer = peer(b"no-cand-relay");
@@ -3034,7 +3034,7 @@ mod tests {
         assert!(engine.pop_resolved().is_none());
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn a_relay_only_attempt_keeps_every_relays_failure() {
         use minip2p_nat::{NatError, NatEvent};
@@ -3092,7 +3092,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn a_relay_refused_before_it_started_is_no_usable_route() {
         use minip2p_nat::{NatError, NatEvent};
@@ -3140,7 +3140,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn fell_back_to_relay_settles_provisional() {
         let peer = peer(b"fallback");
@@ -3180,7 +3180,7 @@ mod tests {
         assert!(engine.pop_resolved().is_none());
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn provisional_closed_then_connect_failed_settles() {
         let peer = peer(b"lost-circuit");
@@ -3216,7 +3216,7 @@ mod tests {
         assert!(engine.pop_resolved().is_none());
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "relay")]
     #[test]
     fn unknown_nat_events_are_noops() {
         let peer = peer(b"noop");

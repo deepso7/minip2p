@@ -33,11 +33,12 @@ check-nostd:
     cargo check --no-default-features --target thumbv7em-none-eabi -p minip2p-core -p minip2p-identity -p minip2p-transport -p minip2p-tls -p minip2p-secure-mux -p minip2p-smoltcp -p minip2p-tcp -p minip2p-circuit -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping -p minip2p-pubsub -p minip2p-discovery -p minip2p-mdns -p minip2p-relay -p minip2p-relay-server -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat -p minip2p-webtransport -p minip2p-rs
     cargo check --no-default-features --features smoltcp --target thumbv7em-none-eabi -p minip2p-tcp -p minip2p-mdns -p minip2p-rs
     cargo check --no-default-features --features smoltcp,pubsub --target thumbv7em-none-eabi -p minip2p-rs
-    cargo check --no-default-features --features portable-autonat --target thumbv7em-none-eabi -p minip2p-rs
-    cargo check --no-default-features --features portable-relay --target thumbv7em-none-eabi -p minip2p-rs
-    cargo check --no-default-features --features portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
-    cargo check --no-default-features --features portable-mdns,pubsub,portable-relay --target thumbv7em-none-eabi -p minip2p-rs
-    cargo check --no-default-features --features smoltcp,portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
+    cargo check --no-default-features --features autonat --target thumbv7em-none-eabi -p minip2p-rs
+    cargo check --no-default-features --features relay --target thumbv7em-none-eabi -p minip2p-rs
+    cargo check --no-default-features --features relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
+    cargo check --no-default-features --features relay-server --target thumbv7em-none-eabi -p minip2p-rs
+    cargo check --no-default-features --features mdns,discovery,relay --target thumbv7em-none-eabi -p minip2p-rs
+    cargo check --no-default-features --features smoltcp,relay,discovery,relay-server --target thumbv7em-none-eabi -p minip2p-rs
 
 # The browser build's crates compile for wasm32 without the std driver.
 check-wasm:
@@ -61,20 +62,20 @@ interop-relay-rust:
 docs:
     cargo doc --workspace --no-deps
     RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps
-    RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features relay,discovery,mdns,tcp,relay-server --no-deps
     cargo doc -p minip2p-tcp --features smoltcp --no-deps
     cargo doc -p minip2p-mdns --features smoltcp --no-deps
     cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps
     cargo doc -p minip2p-rs --no-default-features --features smoltcp,pubsub --no-deps
-    cargo doc -p minip2p-rs --no-default-features --features portable-autonat --no-deps
-    cargo doc -p minip2p-rs --no-default-features --features portable-relay --no-deps
-    cargo doc -p minip2p-rs --no-default-features --features smoltcp,portable-relay,pubsub --no-deps
+    cargo doc -p minip2p-rs --no-default-features --features autonat --no-deps
+    cargo doc -p minip2p-rs --no-default-features --features relay --no-deps
+    cargo doc -p minip2p-rs --no-default-features --features smoltcp,relay,discovery,relay-server --no-deps
 
 package-check:
     # Every published workspace package declares and actually ships its README.
     cargo metadata --no-deps --format-version 1 | jq -e '[.packages[] | select(.publish != []) | .readme != null] | all'
     cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name' | while read package; do cargo package -p "$package" --allow-dirty --list | rg -q '^README.md$' || exit 1; done
-    cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["std", "dep:minip2p-relay-server"]'
+    cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["dep:minip2p-relay-server"]'
 
 docs-site:
     pnpm docs:check

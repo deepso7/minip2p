@@ -1,6 +1,6 @@
 //! Loopback endpoint coverage for pubsub peer discovery.
 
-#![cfg(feature = "discovery")]
+#![cfg(all(feature = "discovery", feature = "quic"))]
 
 use std::time::{Duration, Instant};
 

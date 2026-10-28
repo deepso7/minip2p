@@ -53,7 +53,7 @@
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
-#[cfg(not(feature = "_mdns-driver"))]
+#[cfg(not(feature = "mdns"))]
 use core::marker::PhantomData;
 
 use minip2p_core::platform::{Deadline, EntropySource, Now};
@@ -61,11 +61,11 @@ use minip2p_core::{Bytes, Multiaddr, Path, PeerAddr, PeerId};
 use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
-#[cfg(feature = "_discovery-driver")]
+#[cfg(feature = "_peer-book")]
 use crate::discovery::{DiscoveryDriver, resolve_book_candidates};
-#[cfg(feature = "_nat-driver")]
+#[cfg(feature = "autonat")]
 use crate::nat::NatDriver;
-#[cfg(feature = "_nat-driver")]
+#[cfg(feature = "autonat")]
 use crate::portable::connect::cancel_attempt;
 use crate::portable::connect::{
     ConnectAdmission, ConnectEngine, ConnectId, ConnectTarget, Expansion, admit_connect,
@@ -74,21 +74,21 @@ use crate::portable::connect::{
 #[cfg(feature = "pubsub")]
 use crate::pubsub::{GossipsubDriver, GossipsubError};
 #[cfg(feature = "relay-server")]
-use crate::std::relay_server::{RelayServerDriver, concrete_relay_listener_addrs};
+use crate::relay_server::{RelayServerDriver, concrete_relay_listener_addrs};
 use crate::{ConnectionInfo, EndpointEvent, StreamAcks};
 
 /// What an engine needs from its mDNS carrier: an `MdnsIo` when mDNS is
 /// compiled in, nothing otherwise. Std uses the concrete socket carrier, so
 /// a type-erased, non-`Send` carrier never enters it; portable uses
 /// `Box<dyn MdnsIo>`.
-#[cfg(feature = "_mdns-driver")]
+#[cfg(feature = "mdns")]
 pub(crate) trait Carrier: minip2p_mdns::MdnsIo {}
-#[cfg(feature = "_mdns-driver")]
+#[cfg(feature = "mdns")]
 impl<I: minip2p_mdns::MdnsIo> Carrier for I {}
 /// What an engine needs from its mDNS carrier: nothing, without mDNS.
-#[cfg(not(feature = "_mdns-driver"))]
+#[cfg(not(feature = "mdns"))]
 pub(crate) trait Carrier {}
-#[cfg(not(feature = "_mdns-driver"))]
+#[cfg(not(feature = "mdns"))]
 impl<I> Carrier for I {}
 
 /// Private counters for the work-reduction tests.
@@ -113,23 +113,23 @@ pub(crate) struct Engine<T: Transport, E: EntropySource, M: Carrier> {
     /// Addresses set through `set_external_addresses`; driver contributions
     /// are merged after them.
     caller_external_addresses: Vec<Multiaddr>,
-    #[cfg(feature = "_nat-driver")]
+    #[cfg(feature = "autonat")]
     pub(crate) nat: Option<NatDriver<T>>,
     #[cfg(feature = "pubsub")]
     pub(crate) gossipsub: Option<GossipsubDriver>,
-    #[cfg(feature = "_discovery-driver")]
+    #[cfg(feature = "_peer-book")]
     pub(crate) discovery: Option<DiscoveryDriver>,
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "mdns")]
     mdns: Option<minip2p_mdns::MdnsDriver<M>>,
     /// Whether the mDNS carrier shares the transport's stack, so the
     /// transport is polled again after the mDNS tick.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "mdns")]
     mdns_shares_transport: bool,
     /// mDNS failure and recovery events of this batch, queued after
     /// Discovery's.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "mdns")]
     mdns_events: Vec<EndpointEvent>,
-    #[cfg(not(feature = "_mdns-driver"))]
+    #[cfg(not(feature = "mdns"))]
     carrier: PhantomData<fn(M)>,
     #[cfg(feature = "relay-server")]
     pub(crate) relay_server: Option<RelayServerDriver>,
@@ -149,19 +149,19 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             acks,
             events: VecDeque::new(),
             caller_external_addresses: Vec::new(),
-            #[cfg(feature = "_nat-driver")]
+            #[cfg(feature = "autonat")]
             nat: None,
             #[cfg(feature = "pubsub")]
             gossipsub: None,
-            #[cfg(feature = "_discovery-driver")]
+            #[cfg(feature = "_peer-book")]
             discovery: None,
-            #[cfg(feature = "_mdns-driver")]
+            #[cfg(feature = "mdns")]
             mdns: None,
-            #[cfg(feature = "_mdns-driver")]
+            #[cfg(feature = "mdns")]
             mdns_shares_transport: false,
-            #[cfg(feature = "_mdns-driver")]
+            #[cfg(feature = "mdns")]
             mdns_events: Vec::new(),
-            #[cfg(not(feature = "_mdns-driver"))]
+            #[cfg(not(feature = "mdns"))]
             carrier: PhantomData,
             #[cfg(feature = "relay-server")]
             relay_server: None,
@@ -174,13 +174,13 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
 
     /// Installs mDNS. `shares_transport` asks for the second transport poll
     /// after each mDNS tick.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "mdns")]
     pub(crate) fn set_mdns(&mut self, driver: minip2p_mdns::MdnsDriver<M>, shares_transport: bool) {
         self.mdns = Some(driver);
         self.mdns_shares_transport = shares_transport;
     }
 
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "mdns")]
     pub(crate) fn has_mdns(&self) -> bool {
         self.mdns.is_some()
     }
@@ -199,18 +199,18 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         now: Now,
     ) -> ConnectId {
         let peer = target.peer_id().clone();
-        #[cfg(feature = "_discovery-driver")]
+        #[cfg(feature = "_peer-book")]
         let candidates = resolve_book_candidates(
             self.discovery.as_ref().map(|discovery| &discovery.book),
             &peer,
             target.candidates().to_vec(),
         );
-        #[cfg(not(feature = "_discovery-driver"))]
+        #[cfg(not(feature = "_peer-book"))]
         let candidates = target.candidates().to_vec();
         let id = admit_connect(
             &mut self.connect,
             &mut self.core,
-            #[cfg(feature = "_nat-driver")]
+            #[cfg(feature = "autonat")]
             self.nat.as_ref(),
             ConnectAdmission {
                 peer: peer.clone(),
@@ -220,17 +220,17 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             expand,
             now.monotonic_ms,
         );
-        #[cfg(feature = "_nat-driver")]
+        #[cfg(feature = "autonat")]
         if let Some(nat) = self.nat.as_mut() {
             // Circuit addresses the book knows tell the relay leg where the
             // peer holds a reservation.
-            #[cfg(feature = "_discovery-driver")]
+            #[cfg(feature = "_peer-book")]
             let target_addrs = self
                 .discovery
                 .as_ref()
                 .map(|discovery| discovery.book.known_addrs(&peer))
                 .unwrap_or_default();
-            #[cfg(not(feature = "_discovery-driver"))]
+            #[cfg(not(feature = "_peer-book"))]
             let target_addrs = Vec::new();
             nat.attach_leg(
                 &self.connect,
@@ -249,7 +249,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// Cancels an attempt and its NAT leg. Settled or unknown ids are a
     /// no-op; the terminal is queued before this returns.
     pub(crate) fn cancel_connect(&mut self, id: ConnectId, now: Now) {
-        #[cfg(feature = "_nat-driver")]
+        #[cfg(feature = "autonat")]
         {
             let pump = cancel_attempt(
                 &mut self.connect,
@@ -262,7 +262,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                 nat.pump(&mut self.core, now);
             }
         }
-        #[cfg(not(feature = "_nat-driver"))]
+        #[cfg(not(feature = "autonat"))]
         self.connect.cancel(id, &mut self.core);
         self.settle(now);
     }
@@ -466,7 +466,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
 
     /// Re-merges the external address set after a driver's own address
     /// configuration changed outside a batch.
-    #[cfg(feature = "relay-server")]
+    #[cfg(all(feature = "std", feature = "relay-server"))]
     pub(crate) fn addresses_changed(&mut self) {
         self.refresh_addresses(true);
     }
@@ -505,18 +505,18 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// The discovery beacon topic, reserved while signed discovery runs.
     #[cfg(feature = "pubsub")]
     fn reserved_topic(&self) -> Option<String> {
-        #[cfg(feature = "_discovery-driver")]
+        #[cfg(feature = "_peer-book")]
         {
             self.discovery
                 .as_ref()
                 .and_then(DiscoveryDriver::topic)
                 .map(String::from)
         }
-        #[cfg(not(feature = "_discovery-driver"))]
+        #[cfg(not(feature = "_peer-book"))]
         None
     }
 
-    #[cfg(feature = "_discovery-driver")]
+    #[cfg(feature = "_peer-book")]
     pub(crate) fn known_peers(&self) -> Vec<minip2p_discovery::KnownPeer> {
         self.discovery
             .as_ref()
@@ -524,7 +524,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             .unwrap_or_default()
     }
 
-    #[cfg(feature = "_nat-driver")]
+    #[cfg(feature = "autonat")]
     pub(crate) fn reachability(&self) -> minip2p_nat::ReachabilityState {
         self.nat
             .as_ref()
@@ -558,9 +558,9 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// for a pending, replaced, or closed one.
     fn connection_path(&self, conn_id: ConnectionId) -> Option<Path> {
         self.core.connection_peer(conn_id)?;
-        #[cfg(feature = "_nat-driver")]
+        #[cfg(feature = "autonat")]
         let punched = self.nat.as_ref().is_some_and(|nat| nat.is_punched(conn_id));
-        #[cfg(not(feature = "_nat-driver"))]
+        #[cfg(not(feature = "autonat"))]
         let punched = false;
         path_of(&self.core, punched, conn_id)
     }
@@ -572,14 +572,14 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// it settled; a direct connection only needs NAT's punch record, which
     /// still holds for one whose close is queued, as NAT has not seen it.
     fn resolve_settled_paths(&mut self) {
-        #[cfg(feature = "_nat-driver")]
+        #[cfg(feature = "autonat")]
         let nat = self.nat.as_ref();
         self.connect.resolve_paths(|conn_id| {
-            #[cfg(feature = "_nat-driver")]
+            #[cfg(feature = "autonat")]
             {
                 nat.is_some_and(|nat| nat.is_punched(conn_id))
             }
-            #[cfg(not(feature = "_nat-driver"))]
+            #[cfg(not(feature = "autonat"))]
             {
                 let _ = conn_id;
                 false
@@ -587,7 +587,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         });
     }
 
-    #[cfg(feature = "_circuit-driver")]
+    #[cfg(feature = "relay")]
     pub(crate) fn active_reservation(&self) -> Option<minip2p_nat::ReservationInfo> {
         self.nat
             .as_ref()
@@ -600,7 +600,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// A goodbye that could not be sent is returned and also queued at once
     /// as a final `MdnsFailed`, so a caller that treats goodbyes as best
     /// effort still sees it on the event stream.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "mdns")]
     pub(crate) fn shutdown_mdns(&mut self, now: Now) -> Result<(), minip2p_mdns::MdnsError> {
         let result = match self.mdns.as_mut() {
             Some(mdns) => mdns.shutdown(now),
@@ -611,16 +611,16 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         if let Some(discovery) = self.discovery.as_mut() {
             let work = discovery.shutdown(
                 &mut self.connect,
-                #[cfg(feature = "_nat-driver")]
+                #[cfg(feature = "autonat")]
                 self.nat.as_mut(),
                 &mut self.core,
                 now,
             );
-            #[cfg(feature = "_nat-driver")]
+            #[cfg(feature = "autonat")]
             if let Some(nat) = self.nat.as_mut() {
                 nat.apply_sweep_work(work, &self.connect, &mut self.core, now);
             }
-            #[cfg(not(feature = "_nat-driver"))]
+            #[cfg(not(feature = "autonat"))]
             drop(work);
         }
         result
@@ -658,7 +658,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     ) -> Result<(), DriverError> {
         self.expire_attempts(now);
         self.ingest_transport(now)?;
-        #[cfg(feature = "_mdns-driver")]
+        #[cfg(feature = "mdns")]
         self.tick_mdns(now)?;
         self.capability_pass(now, expand);
         self.settle(now);
@@ -676,7 +676,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// Ticks mDNS, polls a shared transport again, and feeds mDNS
     /// observations to the book. An mDNS failure is an event, never an
     /// error: only the shared transport poll can fail here.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "mdns")]
     fn tick_mdns(&mut self, now: Now) -> Result<(), DriverError> {
         let Some(mdns) = self.mdns.as_mut() else {
             return Ok(());
@@ -693,7 +693,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
 
     /// Feeds mDNS observations to the book and stages its failure and
     /// recovery events for the application.
-    #[cfg(feature = "_mdns-driver")]
+    #[cfg(feature = "mdns")]
     fn collect_mdns_events(&mut self, now: Now) {
         use minip2p_mdns::MdnsEvent;
 
@@ -741,7 +741,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// not-yet-ready replacement. Returns `true` when a driver claimed it.
     fn ingest_into_drivers(&mut self, event: &SwarmEvent, now: Now) -> bool {
         let _ = now;
-        #[cfg(feature = "_discovery-driver")]
+        #[cfg(feature = "_peer-book")]
         if let Some(discovery) = self.discovery.as_mut() {
             discovery.observe(event, &self.core, now.monotonic_ms);
         }
@@ -755,7 +755,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                 .relay_server
                 .as_mut()
                 .is_some_and(|relay_server| relay_server.ingest(event, &mut self.core, now));
-        #[cfg(feature = "_nat-driver")]
+        #[cfg(feature = "autonat")]
         let claimed = claimed
             || self
                 .nat
@@ -773,7 +773,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// The batch's one capability pass: driver timers, the discovery sweep,
     /// and the external-address refresh when an input moved.
     #[cfg_attr(
-        not(feature = "_discovery-driver"),
+        not(feature = "_peer-book"),
         expect(
             unused_variables,
             reason = "only the discovery sweep expands candidates"
@@ -788,7 +788,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         if let Some(relay_server) = self.relay_server.as_mut() {
             relay_server.tick(&mut self.core, now);
         }
-        #[cfg(feature = "_nat-driver")]
+        #[cfg(feature = "autonat")]
         if let Some(nat) = self.nat.as_mut() {
             nat.tick(&mut self.core, now);
         }
@@ -797,23 +797,23 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             pubsub.tick(&mut self.core, now);
         }
         self.route_nat(now);
-        #[cfg(feature = "_discovery-driver")]
+        #[cfg(feature = "_peer-book")]
         if let Some(discovery) = self.discovery.as_mut() {
             let work = discovery.sweep(
                 #[cfg(feature = "pubsub")]
                 self.gossipsub.as_mut(),
-                #[cfg(feature = "_nat-driver")]
+                #[cfg(feature = "autonat")]
                 self.nat.as_mut(),
                 &mut self.connect,
                 &mut self.core,
                 expand,
                 now,
             );
-            #[cfg(feature = "_nat-driver")]
+            #[cfg(feature = "autonat")]
             if let Some(nat) = self.nat.as_mut() {
                 nat.apply_sweep_work(work, &self.connect, &mut self.core, now);
             }
-            #[cfg(not(feature = "_nat-driver"))]
+            #[cfg(not(feature = "autonat"))]
             drop(work);
             self.route_nat(now);
         }
@@ -825,20 +825,20 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// settled meanwhile: every step that can settle an attempt but
     /// `expire_attempts` ends here.
     fn route_nat(&mut self, now: Now) {
-        #[cfg(feature = "_nat-driver")]
+        #[cfg(feature = "autonat")]
         if let Some(nat) = self.nat.as_mut() {
-            #[cfg(feature = "_discovery-driver")]
+            #[cfg(feature = "_peer-book")]
             let discovery = self.discovery.as_ref();
             nat.route(
                 &mut self.connect,
                 &mut self.core,
                 now.monotonic_ms,
                 |event| {
-                    #[cfg(feature = "_discovery-driver")]
+                    #[cfg(feature = "_peer-book")]
                     {
                         discovery.is_some_and(|discovery| discovery.owns_nat_event(event))
                     }
-                    #[cfg(not(feature = "_discovery-driver"))]
+                    #[cfg(not(feature = "_peer-book"))]
                     {
                         let _ = event;
                         false
@@ -846,7 +846,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                 },
             );
         }
-        #[cfg(not(feature = "_nat-driver"))]
+        #[cfg(not(feature = "autonat"))]
         let _ = now;
         self.resolve_settled_paths();
     }
@@ -870,7 +870,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                     .map(EndpointEvent::RelayServer),
             );
         }
-        #[cfg(feature = "_nat-driver")]
+        #[cfg(feature = "autonat")]
         if let Some(nat) = self.nat.as_mut() {
             self.events
                 .extend(nat.drain_application_events().map(EndpointEvent::Nat));
@@ -880,11 +880,11 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             self.events
                 .extend(pubsub.events.drain(..).map(EndpointEvent::Gossipsub));
         }
-        #[cfg(feature = "_discovery-driver")]
+        #[cfg(feature = "_peer-book")]
         if let Some(discovery) = self.discovery.as_mut() {
             discovery.drain_events(&mut self.events);
         }
-        #[cfg(feature = "_mdns-driver")]
+        #[cfg(feature = "mdns")]
         self.events.extend(self.mdns_events.drain(..));
         self.events.extend(settled);
     }
@@ -898,11 +898,11 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             let Some(event) = self.connect.pop_event() else {
                 break;
             };
-            #[cfg(feature = "_nat-driver")]
+            #[cfg(feature = "autonat")]
             if let Some(nat) = self.nat.as_mut() {
                 nat.settle_leg_on_terminal(&event, &mut self.core, now);
             }
-            #[cfg(feature = "_discovery-driver")]
+            #[cfg(feature = "_peer-book")]
             if let Some(discovery) = self.discovery.as_mut()
                 && discovery.claim_settled(&event, now.monotonic_ms)
             {
@@ -917,12 +917,12 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// an input moved: the caller's set (`force`), NAT's contribution, or
     /// (with a relay server) the transport's listener addresses.
     fn refresh_addresses(&mut self, force: bool) {
-        #[cfg(feature = "_nat-driver")]
+        #[cfg(feature = "autonat")]
         let nat_moved = self
             .nat
             .as_mut()
             .is_some_and(NatDriver::take_address_change);
-        #[cfg(not(feature = "_nat-driver"))]
+        #[cfg(not(feature = "autonat"))]
         let nat_moved = false;
         #[cfg(feature = "relay-server")]
         let listeners_moved = self.relay_server.is_some() && {
@@ -946,7 +946,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             // A rejected source keeps its previous addresses; the agent
             // queues `AddrsRejected` (and later `AddrsRestored`) instead.
             drop(relay_server.agent.set_listener_addrs(listeners));
-            #[cfg(feature = "_nat-driver")]
+            #[cfg(feature = "autonat")]
             if let Some(nat) = self.nat.as_ref() {
                 drop(
                     relay_server
@@ -957,7 +957,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             relay_server.collect_agent_events();
         }
         let addresses = self.caller_external_addresses.clone();
-        #[cfg(feature = "_nat-driver")]
+        #[cfg(feature = "autonat")]
         let addresses = match self.nat.as_ref() {
             Some(nat) => merge_addresses(addresses, nat.advertised_addrs()),
             None => addresses,
@@ -980,10 +980,10 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         #[cfg_attr(
             not(any(
                 feature = "relay-server",
-                feature = "_nat-driver",
+                feature = "autonat",
                 feature = "pubsub",
-                feature = "_discovery-driver",
-                feature = "_mdns-driver"
+                feature = "_peer-book",
+                feature = "mdns"
             )),
             expect(
                 unused_variables,
@@ -998,17 +998,17 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             self.relay_server
                 .as_ref()
                 .and_then(|relay_server| relay_server.agent.next_deadline(now)),
-            #[cfg(feature = "_nat-driver")]
+            #[cfg(feature = "autonat")]
             self.nat.as_ref().and_then(|nat| nat.next_deadline(now)),
             #[cfg(feature = "pubsub")]
             self.gossipsub
                 .as_ref()
                 .and_then(|pubsub| pubsub.next_deadline(now)),
-            #[cfg(feature = "_discovery-driver")]
+            #[cfg(feature = "_peer-book")]
             self.discovery
                 .as_ref()
                 .and_then(|discovery| discovery.next_deadline(now)),
-            #[cfg(feature = "_mdns-driver")]
+            #[cfg(feature = "mdns")]
             self.mdns.as_ref().and_then(|mdns| mdns.next_deadline(now)),
         ]
         .into_iter()
@@ -1047,7 +1047,7 @@ fn path_of<T: Transport, E: EntropySource>(
 
 /// Appends the contributions `addresses` does not already hold, keeping
 /// first-wins order.
-#[cfg(any(feature = "_nat-driver", feature = "relay-server"))]
+#[cfg(any(feature = "autonat", feature = "relay-server"))]
 fn merge_addresses(
     mut addresses: Vec<Multiaddr>,
     contributions: impl IntoIterator<Item = Multiaddr>,

@@ -1,24 +1,24 @@
 //! Caller-driven NAT capability shared by standard and portable Endpoints.
 //! Time and entropy are supplied by the host; I/O runs through `SwarmCore`.
 
-#[cfg(feature = "_circuit-driver")]
+#[cfg(feature = "relay")]
 use alloc::{collections::BTreeMap, string::ToString};
 use alloc::{collections::VecDeque, vec, vec::Vec};
-#[cfg(not(feature = "_circuit-driver"))]
+#[cfg(not(feature = "relay"))]
 use core::marker::PhantomData;
 use minip2p_core::platform::{Deadline, EntropySource, Now};
 
-#[cfg(feature = "_circuit-driver")]
+#[cfg(feature = "relay")]
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole, CircuitTransport};
 use minip2p_core::{Bytes, ConnectId, Multiaddr, PeerAddr, PeerId, Protocol, select_direct_addrs};
-#[cfg(feature = "_circuit-driver")]
+#[cfg(feature = "relay")]
 use minip2p_nat::BridgeRole;
 use minip2p_nat::{
     ConnectLegs, DialStart, NatAction, NatAgent, NatEvent, NatSwarm, NatSwarmError, NatToken,
     PromoteError, ReachabilityState,
 };
 use minip2p_swarm::{SwarmCore, SwarmEvent};
-#[cfg(feature = "_circuit-driver")]
+#[cfg(feature = "relay")]
 use minip2p_transport::TransportError;
 use minip2p_transport::{ConnectionId, StreamId, Transport};
 
@@ -48,7 +48,7 @@ fn is_attempt_outcome(event: &NatEvent) -> bool {
 
 /// Joins the bytes a promoted bridge still owes into one payload; a single
 /// chunk is passed through.
-#[cfg(feature = "_circuit-driver")]
+#[cfg(feature = "relay")]
 fn concat(mut tails: VecDeque<Bytes>) -> Bytes {
     if tails.len() <= 1 {
         return tails.pop_front().unwrap_or_default();
@@ -61,7 +61,7 @@ fn concat(mut tails: VecDeque<Bytes>) -> Bytes {
 /// events through. Captured as plain functions when the endpoint is built
 /// over a [`CircuitTransport`], so the endpoint itself stays generic over
 /// any `Transport`; a transport without them gets no relay configuration.
-#[cfg(feature = "_circuit-driver")]
+#[cfg(feature = "relay")]
 pub(crate) struct CircuitOps<T> {
     contains_circuit: fn(&T, ConnectionId) -> bool,
     inject_bridge_closed: fn(&mut T, ConnectionId, StreamId),
@@ -73,7 +73,7 @@ pub(crate) struct CircuitOps<T> {
     circuit_slots: fn(&T) -> usize,
 }
 
-#[cfg(feature = "_circuit-driver")]
+#[cfg(feature = "relay")]
 impl<I: Transport, R: EntropySource> CircuitOps<CircuitTransport<I, R>> {
     /// The operations of a [`CircuitTransport`] over any inner transport.
     pub(crate) fn circuit_transport() -> Self {
@@ -116,12 +116,12 @@ pub(crate) struct NatDriver<T> {
     /// Direct public addresses confirmed by AutoNAT.
     public_addrs: Vec<Multiaddr>,
     /// Exact adopted bridge keys mapped to their promoted circuit ids.
-    #[cfg(feature = "_circuit-driver")]
+    #[cfg(feature = "relay")]
     promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
     /// The transport's circuit operations; `None` refuses promotions.
-    #[cfg(feature = "_circuit-driver")]
+    #[cfg(feature = "relay")]
     circuits: Option<CircuitOps<T>>,
-    #[cfg(not(feature = "_circuit-driver"))]
+    #[cfg(not(feature = "relay"))]
     transport: PhantomData<fn(T)>,
     /// What the driver keeps around the swarm for the agent's commands.
     io: HostIo,
@@ -131,25 +131,22 @@ pub(crate) struct NatDriver<T> {
     /// The bound-address revision the agent's `listen_addrs` were seeded
     /// from; callers can bind through any swarm path between driver turns.
     listen_addrs_revision: u64,
-    #[cfg(all(test, feature = "nat", feature = "quic"))]
+    #[cfg(all(test, feature = "relay", feature = "quic"))]
     pub(crate) bridge_reset_attempts: Vec<(ConnectionId, StreamId)>,
 }
 
 impl<T: Transport> NatDriver<T> {
     /// Creates a driver over `agent`. `relay_addrs` are the transport
     /// addresses of configured relays, retained so reservations can be
-    /// advertised as circuit addresses. `entropy` seeds the agent's jitter;
-    /// later random bytes come from the swarm's own source.
+    /// advertised as circuit addresses. `jitter_seed`, drawn from the
+    /// engine's entropy, seeds the agent's jitter; later random bytes come
+    /// from the swarm's own source.
     pub(crate) fn new(
         mut agent: NatAgent,
         relay_addrs: Vec<(PeerId, Multiaddr)>,
-        entropy: &mut impl EntropySource,
+        jitter_seed: u64,
     ) -> Self {
-        // A failed draw keeps the agent's peer-id seed.
-        let mut seed = [0u8; 8];
-        if entropy.fill_bytes(&mut seed).is_ok() {
-            agent.seed_jitter(u64::from_le_bytes(seed));
-        }
+        agent.seed_jitter(jitter_seed);
         Self {
             agent,
             unrouted: VecDeque::new(),
@@ -158,11 +155,11 @@ impl<T: Transport> NatDriver<T> {
             reserved_relays: Vec::new(),
             relay_addrs,
             public_addrs: Vec::new(),
-            #[cfg(feature = "_circuit-driver")]
+            #[cfg(feature = "relay")]
             promoted: BTreeMap::new(),
-            #[cfg(feature = "_circuit-driver")]
+            #[cfg(feature = "relay")]
             circuits: None,
-            #[cfg(not(feature = "_circuit-driver"))]
+            #[cfg(not(feature = "relay"))]
             transport: PhantomData,
             io: HostIo::default(),
             circuit_slots: |_| 0,
@@ -172,13 +169,13 @@ impl<T: Transport> NatDriver<T> {
             // an untouched revision would advertise a dial-back address
             // that drops packets.
             listen_addrs_revision: 0,
-            #[cfg(all(test, feature = "nat", feature = "quic"))]
+            #[cfg(all(test, feature = "relay", feature = "quic"))]
             bridge_reset_attempts: Vec::new(),
         }
     }
 
     /// Lets relay bridges become circuit connections over this transport.
-    #[cfg(feature = "_circuit-driver")]
+    #[cfg(feature = "relay")]
     pub(crate) fn with_circuits(mut self, circuits: CircuitOps<T>) -> Self {
         self.circuit_slots = circuits.circuit_slots;
         self.circuits = Some(circuits);
@@ -187,15 +184,14 @@ impl<T: Transport> NatDriver<T> {
 
     /// Parks relay and AutoNAT dials to `/dns*` hosts for the caller to
     /// resolve off the driver; see [`Self::take_named_dials`].
-    #[cfg(feature = "nat")]
-    pub(crate) fn park_named_dials(mut self) -> Self {
+    #[cfg(feature = "std")]
+    pub(crate) fn park_named_dials(&mut self) {
         self.io.parked = Some(Vec::new());
-        self
     }
 
     /// Moves out the parked `/dns*` dials. Each must come back through
     /// [`Self::named_dial_resolved`] once its name has an answer.
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "std")]
     pub(crate) fn take_named_dials(&mut self) -> Vec<(NatToken, PeerAddr)> {
         self.io
             .parked
@@ -206,7 +202,7 @@ impl<T: Transport> NatDriver<T> {
 
     /// Whether the agent still waits on a parked dial; retires it when not.
     /// See [`NatAgent::deferred_dial_wanted`].
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "std")]
     pub(crate) fn named_dial_wanted(&mut self, token: NatToken, sample: Now) -> bool {
         self.agent.deferred_dial_wanted(token, sample)
     }
@@ -214,7 +210,7 @@ impl<T: Transport> NatDriver<T> {
     /// Finishes a parked dial: dials the first resolved address the swarm
     /// accepts, or reports the resolution failure, then pumps the agent. An
     /// answer for a dial the agent no longer waits on is dropped.
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "std")]
     pub(crate) fn named_dial_resolved<R: EntropySource>(
         &mut self,
         token: NatToken,
@@ -305,7 +301,7 @@ impl<T: Transport> NatDriver<T> {
     }
 
     /// Returns the currently held relay reservation, when any.
-    #[cfg(feature = "_circuit-driver")]
+    #[cfg(feature = "relay")]
     pub(crate) fn active_reservation(&self) -> Option<&minip2p_nat::ReservationInfo> {
         self.agent.active_reservation()
     }
@@ -343,7 +339,7 @@ impl<T: Transport> NatDriver<T> {
         now: Now,
     ) -> bool {
         self.sync_listen_addrs(swarm);
-        #[cfg(feature = "_circuit-driver")]
+        #[cfg(feature = "relay")]
         if self.inject_straggler(event, swarm) {
             self.pump(swarm, now);
             return true;
@@ -374,7 +370,7 @@ impl<T: Transport> NatDriver<T> {
         }
         // A gone carrier connection (closed, or replaced: its streams end
         // with it) closes the bridges it carried.
-        #[cfg(feature = "_circuit-driver")]
+        #[cfg(feature = "relay")]
         if let SwarmEvent::ConnectionClosed { conn_id, .. }
         | SwarmEvent::ConnectionReplaced { old: conn_id, .. } = event
             && let Some(circuits) = self.circuits.as_ref()
@@ -401,7 +397,7 @@ impl<T: Transport> NatDriver<T> {
     /// endpoint batch rather than on every swarm event. Closures that do
     /// surface reach `ingest`'s `ConnectionClosed` branch regardless.
     pub(crate) fn tick<R: EntropySource>(&mut self, swarm: &mut SwarmCore<T, R>, now: Now) {
-        #[cfg(feature = "_circuit-driver")]
+        #[cfg(feature = "relay")]
         if let Some(circuits) = self.circuits.as_ref() {
             self.promoted
                 .retain(|_, id| (circuits.contains_circuit)(swarm.transport(), *id));
@@ -512,7 +508,7 @@ impl<T: Transport> NatDriver<T> {
     /// Applies the work a `DiscoveryDriver` sweep queued: attaches legs for
     /// attempts automatic dialing admitted, then pumps once when a leg was
     /// cancelled. Call it right after the sweep.
-    #[cfg(feature = "_discovery-driver")]
+    #[cfg(feature = "_peer-book")]
     pub(crate) fn apply_sweep_work<R: EntropySource>(
         &mut self,
         work: crate::discovery::DiscoveryNatWork,
@@ -566,7 +562,7 @@ impl<T: Transport> NatDriver<T> {
 
     /// Queues an event as if the agent emitted it; the next route sends it
     /// through the Connection engine and on to the application.
-    #[cfg(all(test, any(feature = "nat", feature = "portable-relay")))]
+    #[cfg(all(test, feature = "relay"))]
     pub(crate) fn push_event(&mut self, event: NatEvent) {
         self.unrouted.push_back(event);
     }
@@ -616,20 +612,20 @@ impl<T: Transport> NatDriver<T> {
         self.public_addrs.clone()
     }
 
-    #[cfg(all(test, feature = "relay-server"))]
+    #[cfg(all(test, feature = "std", feature = "relay-server"))]
     pub(crate) fn set_test_public_addrs(&mut self, addrs: Vec<Multiaddr>) {
         self.public_addrs = addrs;
         self.addresses_changed = true;
     }
 
     /// The listen addresses AutoNAT currently offers for dial-back.
-    #[cfg(all(test, feature = "nat", feature = "quic"))]
+    #[cfg(all(test, feature = "relay", feature = "quic"))]
     pub(crate) fn listen_addrs(&self) -> &[Multiaddr] {
         self.agent.listen_addrs()
     }
 
     /// The adopted-bridge to promoted-circuit map, for test assertions.
-    #[cfg(all(test, feature = "nat", feature = "quic"))]
+    #[cfg(all(test, feature = "relay", feature = "quic"))]
     pub(crate) fn promoted(&self) -> &BTreeMap<(ConnectionId, StreamId), ConnectionId> {
         &self.promoted
     }
@@ -669,7 +665,7 @@ impl<T: Transport> NatDriver<T> {
                 unsent_data,
                 remote_write_closed,
             } => {
-                #[cfg(not(feature = "_circuit-driver"))]
+                #[cfg(not(feature = "relay"))]
                 {
                     let _ = (
                         inner_conn,
@@ -689,7 +685,7 @@ impl<T: Transport> NatDriver<T> {
                         now,
                     );
                 }
-                #[cfg(feature = "_circuit-driver")]
+                #[cfg(feature = "relay")]
                 {
                     let key = (inner_conn, stream_id);
                     if let Some(existing) = self.promoted.get(&key).copied() {
@@ -753,7 +749,7 @@ impl<T: Transport> NatDriver<T> {
                             self.agent
                                 .promote_result(&mut io, token, Err(promote_error), now);
                             if !matches!(error, AdoptError::UnknownConnection) {
-                                #[cfg(all(test, feature = "nat", feature = "quic"))]
+                                #[cfg(all(test, feature = "relay", feature = "quic"))]
                                 self.bridge_reset_attempts.push((inner_conn, stream_id));
                                 match (circuits.reset_bridge)(
                                     swarm.transport_mut(),
@@ -770,7 +766,7 @@ impl<T: Transport> NatDriver<T> {
             NatAction::CloseCircuit { conn_id } => {
                 match swarm.transport_mut().close(conn_id) {
                     Ok(()) | Err(minip2p_transport::TransportError::ConnectionNotFound { .. }) => {
-                        #[cfg(feature = "_circuit-driver")]
+                        #[cfg(feature = "relay")]
                         self.promoted.retain(|_, id| *id != conn_id);
                     }
                     // A transport failure will emerge through its normal
@@ -781,7 +777,7 @@ impl<T: Transport> NatDriver<T> {
         }
     }
 
-    #[cfg(feature = "_circuit-driver")]
+    #[cfg(feature = "relay")]
     fn inject_straggler<R: EntropySource>(
         &mut self,
         event: &SwarmEvent,

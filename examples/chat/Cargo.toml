@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 minip2p = { package = "minip2p-rs", path = "../../crates/minip2p", features = [
   "discovery",
+  "relay",
 ] }
 minip2p-example-common = { path = "../common" }
 

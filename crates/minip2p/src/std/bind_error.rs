@@ -6,15 +6,20 @@
 //! fails later is a runtime [`Error`](super::Error) or a capability failure
 //! event, never one of these.
 
-use minip2p_core::platform::IoErrorKind;
+use minip2p_core::platform::{EntropyError, IoErrorKind};
 use minip2p_core::{Multiaddr, MultiaddrError};
 #[cfg(feature = "tcp")]
 use minip2p_transport::ConnectionNamespace;
 use minip2p_transport::{InvalidLimit, TransportError, TransportSetError};
 
+#[cfg(any(feature = "discovery", feature = "mdns"))]
+use crate::DiscoveryConfigError;
 #[cfg(feature = "pubsub")]
 use crate::GossipsubConfigError;
+#[cfg(feature = "autonat")]
+use crate::NatConfigError;
 use crate::SwarmError;
+use crate::setup::SetupError;
 #[cfg(feature = "mdns")]
 use crate::{MdnsConfigError, MdnsError};
 #[cfg(feature = "relay-server")]
@@ -149,6 +154,20 @@ pub enum BindError {
     /// The swarm refused the configuration (a reserved protocol id, say).
     #[error("swarm configuration: {0}")]
     Swarm(#[from] SwarmError),
+    /// The operating system's entropy source failed while seeding a
+    /// capability (Gossipsub, mDNS, NAT jitter).
+    #[error("entropy: {0}")]
+    Entropy(EntropyError),
+    /// The NAT configuration cannot run on this endpoint: no relay or
+    /// AutoNAT server, a reservation without a relay, or relays with DCUtR
+    /// on an endpoint without QUIC.
+    #[cfg(feature = "autonat")]
+    #[error("NAT configuration: {0}")]
+    NatConfig(NatConfigError),
+    /// The signed-beacon or peer-book configuration is invalid.
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    #[error("discovery configuration: {0}")]
+    Discovery(DiscoveryConfigError),
     /// The relay server's configuration is invalid.
     #[cfg(feature = "relay-server")]
     #[error("relay-server configuration: {0}")]
@@ -196,6 +215,34 @@ pub enum BindError {
         /// Which invariant.
         reason: &'static str,
     },
+}
+
+impl From<SetupError> for BindError {
+    fn from(error: SetupError) -> Self {
+        match error {
+            SetupError::Entropy(error) => Self::Entropy(error),
+            SetupError::Swarm(error) => Self::Swarm(error),
+            #[cfg(feature = "autonat")]
+            SetupError::NatConfig(error) => Self::NatConfig(error),
+            #[cfg(feature = "pubsub")]
+            SetupError::Gossipsub(error) => Self::Gossipsub(error),
+            // The beacon setters validate the topic, so pubsub refusing it
+            // is a bug; the portable builder takes its config unchecked and
+            // reports it as `PortableBuildError::Topic`.
+            #[cfg(feature = "discovery")]
+            SetupError::Topic(_) => Self::Invariant {
+                reason: "validated discovery topic was rejected by pubsub",
+            },
+            #[cfg(any(feature = "discovery", feature = "mdns"))]
+            SetupError::Discovery(error) => Self::Discovery(error),
+            #[cfg(feature = "mdns")]
+            SetupError::Mdns(error) => Self::Mdns(error),
+            #[cfg(feature = "relay-server")]
+            SetupError::RelayServer(error) => Self::RelayServer(error),
+            #[cfg(feature = "relay-server")]
+            SetupError::RelayServerAnnounce(error) => Self::RelayServerAnnounce(error),
+        }
+    }
 }
 
 impl BindError {

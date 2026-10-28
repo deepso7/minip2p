@@ -18,9 +18,9 @@ wall)
   python3 scripts/bench_results.py criterion --since target/bench-results/criterion-start --output target/bench-results/rust-wall.json --git-sha "$git_sha"
   python3 scripts/bench_results.py start --output target/bench-results/custom-start
   cargo bench -p minip2p-rs --features tcp,relay-server,pubsub,mdns,bench --bench endpoint_idle
-  cargo bench -p minip2p-rs --features tcp,nat,relay-server,bench --bench endpoint_throughput
-  cargo bench -p minip2p-rs --features tcp,nat,relay-server,bench --bench endpoint_rtt
-  cargo bench -p minip2p-rs --features tcp,nat,relay-server,pubsub --bench endpoint_ping_load
+  cargo bench -p minip2p-rs --features tcp,relay,relay-server,bench --bench endpoint_throughput
+  cargo bench -p minip2p-rs --features tcp,relay,relay-server,bench --bench endpoint_rtt
+  cargo bench -p minip2p-rs --features tcp,relay,relay-server,pubsub --bench endpoint_ping_load
   cargo bench -p minip2p-pubsub --bench router_allocs
   python3 scripts/bench_results.py custom --since target/bench-results/custom-start --output target/bench-results/custom.json --git-sha "$git_sha"
   ;;

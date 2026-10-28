@@ -18,9 +18,9 @@ workspace = true
 
 [dependencies]
 # The thread-free host core: no std driver, threads, clock or sockets.
-# Relay reservations and circuits come from `portable-relay` (no DCUtR).
+# Relay reservations and circuits come from `relay` (no DCUtR).
 minip2p = { package = "minip2p-rs", path = "../minip2p", default-features = false, features = [
-  "portable-relay",
+  "relay",
   "pubsub",
 ] }
 minip2p-core = { path = "../core", default-features = false }

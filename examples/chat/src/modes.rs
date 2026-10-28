@@ -41,18 +41,13 @@ fn build_endpoint(
     options: &ChatOptions,
 ) -> Result<ChatEndpoint, Box<dyn Error>> {
     let keypair = load_keypair(options.key_path.as_deref(), role)?;
-    let nat_config = NatConfig {
-        force_relay: options.relay_only,
-        ..NatConfig::default()
-    };
     let mut builder = Endpoint::builder()
         .identity(keypair)
         .agent_version(AGENT)
         .gossipsub_config(GossipsubConfig {
             allow_unsigned: options.allow_unsigned,
             ..GossipsubConfig::default()
-        })
-        .nat_config(nat_config);
+        });
     if !options.no_mesh {
         let room = options
             .topic
@@ -68,6 +63,13 @@ fn build_endpoint(
                 beacon_peer_ttl_ms: 10_000,
                 ..PeerDiscoveryConfig::default()
             })?;
+    }
+    // Without relays, discovery's own NAT agent dials the mesh directly.
+    if !relays.is_empty() {
+        builder = builder.nat_config(NatConfig {
+            force_relay: options.relay_only,
+            ..NatConfig::default()
+        });
     }
     for relay in relays {
         builder = builder.relay(relay.clone());

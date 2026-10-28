@@ -16,13 +16,13 @@ set -euo pipefail
 out=target/bench-results/rtt
 primary=${MINIP2P_RTT_PROFILE:-100m_100ms}
 mkdir -p "$out"
-cargo bench -p minip2p-rs --features tcp,nat,relay-server,bench --bench endpoint_rtt --no-run
+cargo bench -p minip2p-rs --features tcp,relay,relay-server,bench --bench endpoint_rtt --no-run
 
 run() {
   local sweep=$1 profile=${2:-$primary}
   echo "== $sweep on $profile" >&2
   MINIP2P_RTT_SWEEP=$sweep MINIP2P_RTT_PROFILE=$profile \
-    cargo bench -q -p minip2p-rs --features tcp,nat,relay-server,bench --bench endpoint_rtt \
+    cargo bench -q -p minip2p-rs --features tcp,relay,relay-server,bench --bench endpoint_rtt \
     | tee "$out/$sweep-$profile.log" >&2
 }
 

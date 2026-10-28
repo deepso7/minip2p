@@ -57,7 +57,7 @@ An endpoint keeps one connection per peer. When a newer connection takes over (a
 
 `connect` starts one Connection attempt and returns its `ConnectId` immediately. The target is a `PeerId`, one complete `PeerAddr`, or a non-empty list of complete addresses naming the same peer. The attempt may run several Transport dials at once (one per candidate and IP family) and, with NAT traversal, a relay leg, but it ends with exactly one `EndpointEvent::ConnectSettled` carrying that ID: `Connected`, `Failed`, or `Cancelled`. `cancel_connect` is the only way to stop it; abandoning a wait never cancels.
 
-Each address picks its transport (`/udp/…/quic-v1` or `/tcp`) and IP family (`/ip4`, `/ip6`, or `/dns*` resolution). Without NAT configuration, `connect` dials only direct candidates. With the `nat` capability enabled and a relay configured, it can race direct candidates against a relay leg. Every established connection has a `Path`:
+Each address picks its transport (`/udp/…/quic-v1` or `/tcp`) and IP family (`/ip4`, `/ip6`, or `/dns*` resolution). Without NAT configuration, `connect` dials only direct candidates. With the `relay` feature enabled and a relay configured, it can race direct candidates against a relay leg. Every established connection has a `Path`:
 
 - `Path::Direct`: a direct connection we dialed or accepted;
 - `Path::Punched`: DCUtR established a direct connection;
@@ -75,7 +75,7 @@ A Cargo feature makes a capability available. Enable it on `EndpointBuilder`; se
 
 Every event leaves through the Endpoint event stream, read with `Endpoint::wait` or `poll`. One loop sees every event exactly once. Applications wait for a particular outcome by matching its ID (a `ConnectId`, `ConnectionId`, or `StreamId`) in that loop while dispatching everything else; see [Drive events](/rust/drive-events). Connection, Identify, Ping, and application stream events arrive as ordinary `EndpointEvent` variants. Enabled capabilities add variants to the same `#[non_exhaustive]` enum:
 
-- `EndpointEvent::Nat(NatEvent)` (`nat`): path transitions, reachability, public addresses, and relay reservations. The attempt outcome is `ConnectSettled`, never a `NatEvent`;
+- `EndpointEvent::Nat(NatEvent)` (`autonat`): path transitions, reachability, public addresses, and relay reservations. The attempt outcome is `ConnectSettled`, never a `NatEvent`;
 - `EndpointEvent::Gossipsub(GossipsubEvent)` (`pubsub`);
 - `EndpointEvent::Discovery(DiscoveryEvent)` (`discovery` / `mdns`);
 - `EndpointEvent::RelayServer(RelayServerEvent)` (`relay-server`);

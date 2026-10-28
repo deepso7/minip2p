@@ -1,8 +1,11 @@
 //! Drives the caller-driven relay-server service against the endpoint's
-//! swarm. Std-only by policy (relay hosting is a server role), though the
-//! driver itself takes the host's time sample like every other capability.
+//! swarm, on either endpoint. Like every other capability it takes the
+//! host's time sample and needs only `alloc`.
 
-use std::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use minip2p_core::platform::{EntropySource, Now};
 use minip2p_relay_server::{
@@ -13,6 +16,17 @@ use minip2p_swarm::{
     DriverError, SwarmCore, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError,
 };
 use minip2p_transport::{ConnectionId, Transport, TransportError};
+
+/// Synchronous relay-server runtime control failure.
+#[derive(Debug, thiserror::Error)]
+pub enum RelayServerControlError {
+    /// This endpoint was not built with relay-server enablement.
+    #[error("relay server is not configured")]
+    NotConfigured,
+    /// The complete replacement contained an invalid address and was not applied.
+    #[error("invalid relay-server address: {0}")]
+    InvalidAddress(#[source] minip2p_relay_server::RelayServerAddressError),
+}
 
 fn take_pending_for_connection<T>(
     pending: &mut BTreeMap<StreamKey, T>,
@@ -290,6 +304,7 @@ fn settled_open(event: &SwarmEvent) -> Option<(StreamKey, Result<(), String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use minip2p_transport::{ConnectionId, StreamId};
 
     /// A destination that never finishes negotiating STOP settles the
