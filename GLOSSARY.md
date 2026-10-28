@@ -58,6 +58,10 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **State snapshot**: An authoritative getter over durable current endpoint state, such as active connections, selected paths, known peer addresses, or listener addresses. State changes before its event is queued, so separate getters may be ahead of the Endpoint event stream and are not one cross-getter atomic snapshot.
 
+**Capability**: An optional protocol agent an endpoint can run beside Identify and ping: AutoNAT, relay, relay server, pubsub, discovery, or mDNS. A capability is _built_ when its Cargo feature is on and _configured_ when the endpoint's builder turns it on; it runs only when both hold. _Avoid_: feature (that is the Cargo flag)
+
+**Endpoint setup**: The one place that turns an endpoint's configuration into running capabilities over the shared engine: it validates capability config, registers their protocols, and installs their agents, the same way for the std `Endpoint` and `PortableEndpoint`. The std endpoint adds only OS resources around it (clock, readiness poll, sockets, name resolution, certificates). _Avoid_: assembly, wiring
+
 **Circuit**: The hop/stop bridged byte pipe through a Circuit Relay v2 hop, before Noise and Yamux have turned it into a Relayed path. _Avoid_: connection (until that upgrade finishes)
 
 **Relayed path**: A swarm connection whose transport is a circuit. Identify, ping, and application streams use it like any other connection. _Avoid_: fallback connection
