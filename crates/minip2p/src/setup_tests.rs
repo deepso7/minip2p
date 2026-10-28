@@ -42,10 +42,10 @@ impl EntropySource for CountingEntropy {
 }
 
 /// An entropy source that always fails, as a broken OS RNG would.
-#[cfg(feature = "pubsub")]
+#[cfg(any(feature = "autonat", feature = "pubsub", feature = "mdns"))]
 struct FailingEntropy;
 
-#[cfg(feature = "pubsub")]
+#[cfg(any(feature = "autonat", feature = "pubsub", feature = "mdns"))]
 impl EntropySource for FailingEntropy {
     fn fill_bytes(&mut self, _: &mut [u8]) -> Result<(), EntropyError> {
         Err(EntropyError::unavailable("no entropy"))
@@ -413,19 +413,89 @@ fn without_discovery_nat_stays_off() {
     assert!(engine.nat.is_none());
 }
 
-/// Seeds come from the engine's entropy: a failing source fails setup.
-#[cfg(feature = "pubsub")]
-#[test]
-fn a_failing_entropy_source_fails_setup() {
+/// Installs `capabilities` over a failing entropy source, with `carrier` as
+/// the mDNS carrier, and expects setup to fail on the seed draw.
+#[cfg(any(feature = "autonat", feature = "pubsub", feature = "mdns"))]
+fn assert_seed_failure_fails_setup(
+    capabilities: Capabilities,
+    #[cfg(feature = "mdns")] carrier: Option<TestCarrier>,
+) {
     let identity = key(1);
     let (transport, _) = InMemoryTransport::pair(identity.peer_id(), key(2).peer_id());
     let mut engine = engine(&identity, transport, FailingEntropy);
-    let capabilities = Capabilities {
-        gossipsub: Some(minip2p_pubsub::GossipsubConfig::default()),
-        ..Capabilities::default()
-    };
-    assert!(matches!(
-        setup(&mut engine, capabilities, PORTABLE_PLAIN, &identity),
-        Err(SetupError::Entropy(_))
-    ));
+    let validated = validate(capabilities, PORTABLE_PLAIN, &identity.peer_id()).expect("validates");
+    let result = install(
+        &mut engine,
+        validated,
+        &identity,
+        #[cfg(feature = "relay")]
+        None,
+        #[cfg(feature = "mdns")]
+        carrier,
+    );
+    assert!(matches!(result, Err(SetupError::Entropy(_))), "{result:?}");
+}
+
+/// Seeds come from the engine's entropy, with no fallback: a failing source
+/// fails setup for NAT jitter, Gossipsub, and mDNS alike.
+#[cfg(feature = "autonat")]
+#[test]
+fn a_failing_entropy_source_fails_nat_setup() {
+    assert_seed_failure_fails_setup(
+        nat(NatConfig {
+            autonat_servers: vec![server(3)],
+            reservation_policy: ReservationPolicy::Never,
+            ..NatConfig::default()
+        }),
+        #[cfg(feature = "mdns")]
+        None,
+    );
+}
+
+#[cfg(feature = "pubsub")]
+#[test]
+fn a_failing_entropy_source_fails_gossipsub_setup() {
+    assert_seed_failure_fails_setup(
+        Capabilities {
+            gossipsub: Some(minip2p_pubsub::GossipsubConfig::default()),
+            ..Capabilities::default()
+        },
+        #[cfg(feature = "mdns")]
+        None,
+    );
+}
+
+/// An mDNS carrier with no interfaces that never has input.
+#[cfg(feature = "mdns")]
+struct IdleMdns;
+
+#[cfg(feature = "mdns")]
+impl minip2p_mdns::MdnsIo for IdleMdns {
+    fn interfaces(&self) -> &[minip2p_mdns::InterfaceSnapshot] {
+        &[]
+    }
+    fn refresh(&mut self) -> Result<bool, minip2p_mdns::MdnsError> {
+        Ok(false)
+    }
+    fn receive(
+        &mut self,
+        _: &mut [u8],
+    ) -> Result<Option<minip2p_mdns::MdnsDatagram>, minip2p_mdns::MdnsError> {
+        Ok(None)
+    }
+    fn send(&mut self, _: &minip2p_mdns::MdnsAction) -> Result<(), minip2p_mdns::MdnsError> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "mdns")]
+#[test]
+fn a_failing_entropy_source_fails_mdns_setup() {
+    assert_seed_failure_fails_setup(
+        Capabilities {
+            mdns: Some(minip2p_mdns::MdnsConfig::default()),
+            ..Capabilities::default()
+        },
+        Some(alloc::boxed::Box::new(IdleMdns)),
+    );
 }
