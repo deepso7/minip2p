@@ -258,14 +258,21 @@ const body = "mt-3 ps-5 sm:ps-14";
 </PageLayout>
 
 <script>
-  // Copy buttons exist only once this runs; without it the commands stay
-  // plain, selectable text.
-  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-copy]")) {
-    button.hidden = false;
-    button.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(button.dataset.copy ?? "");
-      button.textContent = "copied";
-      setTimeout(() => (button.textContent = "copy"), 1500);
-    });
+  // Copy buttons appear only where the Clipboard API does; otherwise the
+  // commands stay plain, selectable text. A denied write says so on the
+  // button rather than failing silently.
+  if (navigator.clipboard) {
+    for (const button of document.querySelectorAll<HTMLButtonElement>("[data-copy]")) {
+      button.hidden = false;
+      button.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(button.dataset.copy ?? "");
+          button.textContent = "copied";
+        } catch {
+          button.textContent = "select it";
+        }
+        setTimeout(() => (button.textContent = "copy"), 1500);
+      });
+    }
   }
 </script>
