@@ -1,0 +1,41 @@
+---
+// One row of an index listing (see card-group.astro): the title as the entry,
+// its description beneath, and where it goes on the right. The icon is
+// dropped; the path says more about the destination than a glyph would.
+import type { CardProps } from "blume/components";
+
+type Props = CardProps;
+
+const { href, title } = Astro.props;
+const external = href !== undefined && /^https?:\/\//u.test(href);
+// `/rust/connect-peers` reads as-is; an external link shows only its host.
+let target: string | undefined;
+if (href !== undefined) {
+  target = external ? new URL(href).host : href;
+}
+const Tag = href ? "a" : "div";
+---
+
+<li class="term-index-row m-0 border-t border-dashed border-border first:border-t-0">
+  <Tag
+    class="group grid gap-x-4 gap-y-1 px-1 py-2.5 text-inherit no-underline! sm:grid-cols-[1fr_auto]"
+    href={href}
+    target={external ? "_blank" : undefined}
+    rel={external ? "noopener noreferrer" : undefined}
+    data-blume-card
+  >
+    <span class="flex items-baseline gap-2 font-bold text-foreground group-hover:text-accent">
+      <span class="text-accent" aria-hidden="true">›</span>{title}
+    </span>
+    {
+      target && (
+        <span class="hidden truncate text-xs text-muted-foreground sm:block sm:row-start-1 sm:col-start-2 group-hover:text-accent">
+          {target}{external ? " ↗" : ""}
+        </span>
+      )
+    }
+    <div class="ps-4 text-sm leading-relaxed text-muted-foreground sm:col-span-2 [&_p]:m-0 [&_code]:text-foreground">
+      <slot />
+    </div>
+  </Tag>
+</li>

@@ -1,0 +1,50 @@
+---
+// The site footer as a tmux-style status line: the session name and release
+// on the left, where to go next on the right. Used as the docs `Footer` slot
+// (see components.ts) and at the foot of the landing page. It keeps the
+// repository link the built-in footer would have carried.
+import { license, version } from "./workspace";
+
+const links = [
+  { href: "/intro", label: "docs" },
+  { href: "/changelog", label: "changelog" },
+  { href: "https://github.com/deepso7/minip2p", label: "github" },
+  { href: "https://docs.rs/minip2p-rs/latest/minip2p/", label: "docs.rs" },
+];
+const item = "px-2 py-1.5 sm:px-3";
+---
+
+<footer class="term-status border-t border-border font-mono text-xs" data-blume-footer>
+  <div class="flex flex-wrap items-stretch justify-between">
+    <p class="m-0 flex flex-wrap items-stretch">
+      <a class={`${item} bg-accent font-bold text-accent-foreground no-underline`} href="/">[minip2p]</a>
+      {version && <span class={`${item} text-foreground`}>v{version}</span>}
+      {license && <span class={`${item} border-s border-border text-muted-foreground`}>{license}</span>}
+      <span class={`${item} hidden border-s border-border text-muted-foreground md:inline`}>sans-I/O · no_std + alloc · quic + tcp</span>
+    </p>
+    <nav class="flex flex-wrap items-stretch" aria-label="Footer">
+      {
+        links.map(({ href, label }) => {
+          const external = href.startsWith("http");
+          return (
+            <a
+              class={`${item} text-muted-foreground no-underline hover:bg-muted hover:text-accent`}
+              href={href}
+              target={external ? "_blank" : undefined}
+              rel={external ? "noopener noreferrer" : undefined}
+            >
+              {label}
+              {external && <span aria-hidden="true"> ↗</span>}
+            </a>
+          );
+        })
+      }
+      <a
+        class={`${item} border-s border-border text-muted-foreground no-underline hover:text-foreground`}
+        href="https://deepso.sh"
+        target="_blank"
+        rel="noopener noreferrer">by deepso</a
+      >
+    </nav>
+  </div>
+</footer>

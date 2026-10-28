@@ -56,7 +56,15 @@ export default defineConfig({
       dark: brand.black,
       light: brand.white,
     },
-    radius: "sm",
+    // Terminal / packet-log direction: monospace for nearly everything, a
+    // condensed grotesk only for the largest type.
+    fonts: {
+      body: "jetbrains-mono",
+      display: { name: "Big Shoulders", weights: [600, 800] },
+      mono: "jetbrains-mono",
+    },
+    mode: "dark",
+    radius: "none",
   },
   title: "minip2p",
 });
