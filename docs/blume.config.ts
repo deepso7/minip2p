@@ -8,6 +8,20 @@ const brand = {
   white: "oklch(0.950 0.006 60)",
 } as const;
 
+// Paper Mono (OFL, fonts/paper-mono/OFL.txt) for every role: body, headings,
+// and code. It isn't on Google Fonts, so the site serves its own files.
+const paperMono = {
+  fallback: "mono",
+  name: "Paper Mono",
+  variants: [
+    { src: "./fonts/paper-mono/PaperMono-Regular.woff2", weight: 400 },
+    { src: "./fonts/paper-mono/PaperMono-Medium.woff2", weight: 500 },
+    { src: "./fonts/paper-mono/PaperMono-SemiBold.woff2", weight: 600 },
+    { src: "./fonts/paper-mono/PaperMono-Bold.woff2", weight: 700 },
+    { src: "./fonts/paper-mono/PaperMono-ExtraBold.woff2", weight: 800 },
+  ],
+} as const;
+
 export default defineConfig({
   content: {
     sources: [
@@ -56,12 +70,10 @@ export default defineConfig({
       dark: brand.black,
       light: brand.white,
     },
-    // Terminal / packet-log direction: monospace for nearly everything, a
-    // condensed grotesk only for the largest type.
     fonts: {
-      body: "jetbrains-mono",
-      display: { name: "Big Shoulders", weights: [600, 800] },
-      mono: "jetbrains-mono",
+      body: paperMono,
+      display: paperMono,
+      mono: paperMono,
     },
     mode: "dark",
     radius: "none",

@@ -267,13 +267,13 @@ nav[aria-label="Sections"] a[aria-current="page"]::after {
   content: "/";
 }
 
-/* Article type: the condensed display face for the page title only; every
-   other heading stays monospace and keeps its Markdown hashes. */
+/* Article type: the page title is set heavy and uppercase, at a size a wide
+   mono can carry; every other heading keeps its Markdown hashes. */
 .prose :where(h1) {
-  font-size: clamp(2.75rem, 6vw, 4.25rem);
+  font-size: clamp(1.75rem, 3.2vw, 2.5rem);
   font-weight: 800;
   letter-spacing: -0.01em;
-  line-height: 0.95;
+  line-height: 1.05;
   text-transform: uppercase;
 }
 .prose :where(h1) + p.text-lg {
