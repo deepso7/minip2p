@@ -8,7 +8,8 @@ use alloc::string::{String, ToString};
 use minip2p_core::{PeerAddr, PeerId};
 use minip2p_transport::{ConnectionId, StreamId};
 
-use crate::agent::{DialPurpose, Shared};
+use crate::agent::Shared;
+use crate::ledger::DialPurpose;
 use crate::swarm::NatSwarm;
 use minip2p_core::platform::Now;
 

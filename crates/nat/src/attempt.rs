@@ -1,4 +1,4 @@
-use alloc::collections::{BTreeSet, VecDeque};
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -12,12 +12,11 @@ use minip2p_relay::{ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectOutpu
 use minip2p_transport::{ConnectionId, StreamId};
 
 use crate::acquire::{self, AcquireError, Acquired};
-use crate::agent::{
-    ConnectLegs, DialPurpose, Shared, StreamInput, StreamRole, TokenPurpose, reset, send,
-};
+use crate::agent::{ConnectLegs, Shared, StreamInput, StreamRole, TokenPurpose, reset, send};
 use crate::config::MAX_DCUTR_ROUNDS;
 use crate::events::{BridgeRole, NatAction, NatEvent};
 use crate::inbound::select_punch_candidates;
+use crate::ledger::{Attribution, Claim, DialPurpose, Owner};
 use crate::swarm::NatSwarm;
 use crate::types::{NatError, NatToken, Path, PromoteError, RelayStage, UpgradeStop};
 
@@ -105,8 +104,6 @@ pub(crate) struct ConnectAttempt {
     /// the circuit transport with `PromoteBridge`.
     bridge_pending_data: Vec<u8>,
     punch_addrs: Vec<Multiaddr>,
-    /// Connections started by punch dials, in any round.
-    punch_conns: BTreeSet<ConnectionId>,
     /// Absolute deadline of the current round's punch window.
     punch_deadline: Option<u64>,
     /// DCUtR rounds the holder started on this attempt's circuit.
@@ -166,7 +163,6 @@ impl ConnectAttempt {
             bridge_remote_write_closed: false,
             bridge_pending_data: Vec::new(),
             punch_addrs: Vec::new(),
-            punch_conns: BTreeSet::new(),
             punch_deadline: None,
             rounds: 0,
             relayed_at: 0,
@@ -487,40 +483,59 @@ impl ConnectAttempt {
     // Inputs routed from the agent
     // -----------------------------------------------------------------------
 
+    /// What this attempt claims about the establishing circuit `conn_id`:
+    /// that it is the one the attempt promoted, Relayed through its relay.
+    pub(crate) fn circuit_claim(&self, conn_id: ConnectionId) -> Option<Claim> {
+        if self.done || self.promoted != Some(conn_id) {
+            return None;
+        }
+        Some(Claim::Circuit {
+            relay: self.relay_peer()?.clone(),
+            owner: Owner::Attempt(self.id),
+        })
+    }
+
+    /// Whether this attempt takes a direct connection to `peer` as its own:
+    /// it still waits for a path, or for a better one than its relay.
+    pub(crate) fn direct_claim(&self, peer: &PeerId) -> Option<Claim> {
+        let waiting = matches!(self.best, None | Some(Path::Relayed { .. }));
+        (!self.done && *peer == self.peer && waiting).then_some(Claim::Direct(self.id))
+    }
+
+    /// A connection to the target established, attributed by the ledger
+    /// (`None` for a circuit no machine claimed). Returns whether the
+    /// attempt took it, announcing its path itself.
     pub(crate) fn on_connection_established(
         &mut self,
         peer: &PeerId,
         conn_id: ConnectionId,
-        is_circuit: bool,
+        attribution: Option<&Attribution>,
         swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
         now: Now,
-    ) {
+    ) -> bool {
         if self.done || *peer != self.peer {
-            return;
+            return false;
         }
-        if is_circuit {
-            if self.promoted == Some(conn_id) {
-                if let Some(relay) = self.relay_peer().cloned() {
-                    shared.record_path(conn_id, Path::Relayed { relay }, Some(self.id));
-                }
-                self.relay_deadline = None;
-                self.announce_relay_path(conn_id, shared, now);
-                if shared.config.force_relay {
-                    self.done = true;
-                }
-            }
-            return;
-        }
-        // Classify punched iff this conn id was issued as a punch dial.
-        let path = if self.punch_conns.contains(&conn_id) {
-            Path::Punched
-        } else {
-            Path::Direct
+        let Some(attribution) = attribution else {
+            return false;
         };
+        if let Path::Relayed { .. } = attribution.path {
+            // Only the circuit this attempt promoted announces its path; an
+            // adopted one carries on the path already announced.
+            if self.promoted != Some(conn_id) {
+                return false;
+            }
+            self.relay_deadline = None;
+            self.announce_relay_path(conn_id, shared, now);
+            if shared.config.force_relay {
+                self.done = true;
+            }
+            return true;
+        }
+        let path = attribution.path.clone();
         match &self.best {
             None => {
-                shared.record_path(conn_id, path.clone(), Some(self.id));
                 self.best = Some(path.clone());
                 self.path_conn = Some(conn_id);
                 shared.push_event(NatEvent::PathEstablished {
@@ -530,7 +545,6 @@ impl ConnectAttempt {
                 });
             }
             Some(Path::Relayed { .. }) => {
-                shared.record_path(conn_id, path.clone(), Some(self.id));
                 let from = self.best.replace(path.clone()).expect("checked Some above");
                 if let Some(old_conn_id) = self.path_conn.replace(conn_id) {
                     shared.push_event(NatEvent::PathUpgraded {
@@ -544,11 +558,12 @@ impl ConnectAttempt {
                 }
             }
             // A second direct connection replacing the first — nothing new.
-            Some(_) => return,
+            Some(_) => return false,
         }
         self.punch_deadline = None;
         self.teardown_relay_leg(swarm, shared, now);
         self.done = true;
+        true
     }
 
     /// The target's connection `old` was replaced by `new` while the peer
@@ -560,7 +575,9 @@ impl ConnectAttempt {
     ///
     /// When `new_owned` (another attempt or an inbound circuit promoted
     /// `new`), `new` stays its owner's and this attempt ends on the relayed
-    /// path it already reported.
+    /// path it already reported. Otherwise the ledger already attributed
+    /// `new` to this attempt's relayed path (see [`Self::circuit_claim`]),
+    /// so adopting it reports no new path event.
     #[expect(
         clippy::too_many_arguments,
         reason = "the replacement's two connections plus the call context"
@@ -582,14 +599,6 @@ impl ConnectAttempt {
         self.promoted = (!new_owned).then_some(new);
         if !new_owned {
             self.path_conn = Some(new);
-        }
-        // An adopted circuit carries the relayed path this attempt already
-        // reported, so it takes that path record without a new path event.
-        if !new_owned
-            && new.is_circuit()
-            && let Some(relay) = self.relay_peer().cloned()
-        {
-            shared.record_path(new, Path::Relayed { relay }, Some(self.id));
         }
         if new_owned {
             let reason = "another attempt's circuit took over the peer's connection".into();
@@ -751,13 +760,6 @@ impl ConnectAttempt {
         let purpose = DialPurpose::Relay(self.id, relay.clone());
         if let Err(reason) = shared.session_dial(swarm, purpose, relay, now, deadline_ms) {
             self.fail_relay_leg(NatError::DialFailed(reason), swarm, shared, now);
-        }
-    }
-
-    /// A parked dial of this attempt started its connection.
-    pub(crate) fn on_dial_started(&mut self, purpose: &DialPurpose, conn_id: ConnectionId) {
-        if !self.done && matches!(purpose, DialPurpose::Punch(_)) {
-            self.punch_conns.insert(conn_id);
         }
     }
 
@@ -1185,11 +1187,7 @@ impl ConnectAttempt {
                 continue;
             };
             // A refused punch dial just does not race; the window decides.
-            if let Ok((_, Some(conn_id))) =
-                shared.start_dial(swarm, DialPurpose::Punch(self.id), &peer_addr)
-            {
-                self.punch_conns.insert(conn_id);
-            }
+            let _refused = shared.start_dial(swarm, DialPurpose::Punch(self.id), &peer_addr);
         }
     }
 

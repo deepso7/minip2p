@@ -25,8 +25,9 @@ use minip2p_transport::{ConnectionId, StreamId};
 
 use crate::ReservationPolicy;
 use crate::acquire::{self, AcquireError, Acquired};
-use crate::agent::{DialPurpose, Shared, StreamInput, StreamRole, close_write, reset, send};
+use crate::agent::{Shared, StreamInput, StreamRole, close_write, reset, send};
 use crate::events::NatEvent;
+use crate::ledger::DialPurpose;
 use crate::swarm::NatSwarm;
 use crate::types::{ReachabilityState, ReservationInfo};
 
