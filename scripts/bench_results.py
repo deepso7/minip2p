@@ -91,7 +91,7 @@ GUNGRAUN_NAMES = {
             "hop_admission",
             "close_connection_100_circuits",
             "close_destination_connection",
-            "cancel_inflight_send",
+            "reset_holding_full_tails",
         )
     },
 }
