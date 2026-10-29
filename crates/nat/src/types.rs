@@ -114,8 +114,11 @@ fn relay_suffix(relay: &Option<PeerId>) -> alloc::string::String {
 /// Why a relayed attempt settled on its Relayed path without a direct
 /// upgrade, carried by
 /// [`NatEvent::FellBackToRelay`](crate::NatEvent::FellBackToRelay). The
-/// budgets are in [`NatConfig`](crate::NatConfig), each clipped to the
-/// attempt's deadline; `budget_ms` is the clipped value.
+/// budgets are in [`NatConfig`](crate::NatConfig): the whole upgrade is
+/// clipped to the attempt's deadline, and the start wait and each exchange
+/// to the whole upgrade; `budget_ms` is the clipped value. The budget that
+/// ran out first names the stop; a start wait or exchange the whole-upgrade
+/// deadline cut short reports [`UpgradeStop::UpgradeTimeout`].
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum UpgradeStop {

@@ -13,6 +13,7 @@ use minip2p_transport::{ConnectionId, StreamId};
 
 use crate::acquire::{self, AcquireError, Acquired};
 use crate::agent::{ConnectLegs, Shared, StreamInput, StreamRole, reset, send};
+use crate::budget::UpgradeBudget;
 use crate::config::MAX_DCUTR_ROUNDS;
 use crate::events::{NatAction, NatEvent};
 use crate::inbound::select_punch_candidates;
@@ -74,7 +75,8 @@ pub(crate) struct ConnectAttempt {
     /// Relays still to try after `relay`, in order.
     untried: VecDeque<PeerAddr>,
     leg: RelayLeg,
-    /// The caller's deadline for the attempt, which clips every budget.
+    /// The caller's deadline for the attempt: it bounds relay acquisition
+    /// and caps the upgrade budget.
     attempt_deadline: Option<u64>,
     /// Absolute end of the current relay's budget, across all its addresses.
     relay_budget_deadline: u64,
@@ -106,18 +108,9 @@ pub(crate) struct ConnectAttempt {
     punch_addrs: Vec<Multiaddr>,
     /// Absolute deadline of the current round's punch window.
     punch_deadline: Option<u64>,
-    /// DCUtR rounds the holder started on this attempt's circuit.
-    rounds: u32,
-    /// When the Relayed path became usable; upgrade budgets count from it.
-    relayed_at: u64,
-    /// Waiting for the holder to start its first DCUtR round.
-    start_deadline: Option<u64>,
-    /// When the current DCUtR exchange started.
-    exchange_started_at: u64,
-    /// The current DCUtR exchange must reach SYNC by then.
-    exchange_deadline: Option<u64>,
-    /// The whole upgrade must finish by then.
-    upgrade_deadline: Option<u64>,
+    /// The upgrade's limits and round count, armed once the Relayed path is
+    /// usable: the start wait, each exchange until SYNC, the whole upgrade.
+    budget: Option<UpgradeBudget>,
     best: Option<Path>,
     /// The connection carrying `best`.
     path_conn: Option<ConnectionId>,
@@ -164,12 +157,7 @@ impl ConnectAttempt {
             bridge_pending_data: Vec::new(),
             punch_addrs: Vec::new(),
             punch_deadline: None,
-            rounds: 0,
-            relayed_at: 0,
-            start_deadline: None,
-            exchange_started_at: 0,
-            exchange_deadline: None,
-            upgrade_deadline: None,
+            budget: None,
             best: None,
             path_conn: None,
             last_error: None,
@@ -230,9 +218,8 @@ impl ConnectAttempt {
             && shared.config.upgrades()
             && &self.peer == peer
             && self.promoted == Some(conn_id)
-            && self.upgrade_deadline.is_some()
             && self.dcutr_stream.is_none()
-            && self.rounds < MAX_DCUTR_ROUNDS
+            && self.budget.as_ref().is_some_and(UpgradeBudget::rounds_left)
     }
 
     /// The holder opened a DCUtR stream: a new round starts. A punch window
@@ -255,15 +242,15 @@ impl ConnectAttempt {
             shared.abort_attempt_dials(self.id, &self.peer, swarm);
             shared.push_event(NatEvent::HolePunchFailed {
                 connect_id: self.id,
-                attempt: self.rounds,
+                attempt: self.rounds(),
                 reason: "the remote started the next round".into(),
             });
         }
-        self.rounds += 1;
-        self.start_deadline = None;
-        self.exchange_started_at = now.monotonic_ms;
-        self.exchange_deadline =
-            Some(self.clip(now.monotonic_ms + shared.config.dcutr_exchange_timeout_ms));
+        // `accepts_dcutr` checked the round cap and the spent-budget check
+        // above the overall deadline, so the round begins.
+        if let Some(budget) = self.budget.as_mut() {
+            budget.begin_round(now.monotonic_ms);
+        }
         self.dcutr = Some(DcutrResponder::new(&shared.punch_candidates()));
     }
 
@@ -324,7 +311,9 @@ impl ConnectAttempt {
                 DcutrResponderOutput::Event(ResponderEvent::SyncReceived) => {
                     // The exchange is done; only the punch window bounds
                     // the rest of the round.
-                    self.exchange_deadline = None;
+                    if let Some(budget) = self.budget.as_mut() {
+                        budget.end_exchange();
+                    }
                     self.teardown_dcutr_stream(swarm, shared, now);
                     if self.punch_addrs.is_empty() {
                         self.round_failed(
@@ -335,9 +324,10 @@ impl ConnectAttempt {
                         );
                     } else {
                         self.issue_punch_dials(swarm, shared);
-                        self.punch_deadline = Some(
-                            self.clip_upgrade(now.monotonic_ms + shared.config.punch_deadline_ms),
-                        );
+                        self.punch_deadline = self
+                            .budget
+                            .as_ref()
+                            .map(|budget| budget.punch_window_end(now.monotonic_ms));
                     }
                 }
             }
@@ -369,14 +359,16 @@ impl ConnectAttempt {
         shared: &mut Shared,
         now: Now,
     ) {
-        self.exchange_deadline = None;
+        if let Some(budget) = self.budget.as_mut() {
+            budget.end_exchange();
+        }
         self.punch_deadline = None;
         // Punch dials left from this round must not land as a late
         // `Punched` path while the next round runs.
         shared.abort_attempt_dials(self.id, &self.peer, swarm);
         shared.push_event(NatEvent::HolePunchFailed {
             connect_id: self.id,
-            attempt: self.rounds,
+            attempt: self.rounds(),
             reason,
         });
         if self.promoted.is_none() {
@@ -385,10 +377,10 @@ impl ConnectAttempt {
                 .take()
                 .unwrap_or(NatError::DialFailed("promoted circuit closed".into()));
             self.fail(error, swarm, shared, now);
-        } else if self.rounds >= MAX_DCUTR_ROUNDS {
+        } else if self.rounds() >= MAX_DCUTR_ROUNDS {
             self.settle_relayed(
                 UpgradeStop::PunchFailed {
-                    rounds: self.rounds,
+                    rounds: self.rounds(),
                 },
                 swarm,
                 shared,
@@ -420,10 +412,9 @@ impl ConnectAttempt {
             .map_or(at, |deadline| deadline.min(at))
     }
 
-    /// `at`, clipped to the whole-upgrade budget.
-    fn clip_upgrade(&self, at: u64) -> u64 {
-        self.upgrade_deadline
-            .map_or(at, |deadline| deadline.min(at))
+    /// DCUtR rounds the holder started on this attempt's circuit.
+    fn rounds(&self) -> u32 {
+        self.budget.as_ref().map_or(0, UpgradeBudget::rounds)
     }
 
     /// Earliest pending absolute deadline, for the driver's timer fold-in.
@@ -439,9 +430,7 @@ impl ConnectAttempt {
             stagger,
             self.relay_deadline,
             self.punch_deadline,
-            self.start_deadline,
-            self.exchange_deadline,
-            self.upgrade_deadline,
+            self.budget.as_ref().map(UpgradeBudget::next_deadline),
         ]
         .into_iter()
         .flatten()
@@ -701,7 +690,10 @@ impl ConnectAttempt {
         let waiting = !self.done
             && &self.peer == peer
             && self.promoted == Some(conn)
-            && self.start_deadline.is_some();
+            && self
+                .budget
+                .as_ref()
+                .is_some_and(UpgradeBudget::awaiting_first_round);
         if waiting && !protocols.iter().any(|p| p == DCUTR_PROTOCOL_ID) {
             self.settle_relayed(UpgradeStop::Unsupported, swarm, shared, now);
         }
@@ -912,8 +904,8 @@ impl ConnectAttempt {
         // re-drive is what keeps a stalled owner from stranding the leg.
         self.redrive_relay_leg(swarm, shared, now);
 
-        // A budget that ran out keeps the Relayed path; the stage that was
-        // waiting names why. It is checked before the punch window, so a
+        // A budget that ran out keeps the Relayed path; the one that ran out
+        // first names why. It is checked before the punch window, so a
         // window the upgrade budget cut short is not reported as a failed
         // round.
         if self.settle_if_budget_spent(swarm, shared, now) {
@@ -940,37 +932,19 @@ impl ConnectAttempt {
         shared: &mut Shared,
         now: Now,
     ) -> bool {
-        let Some(stop) = self.upgrade_stop(now) else {
+        // Only while the circuit still carries the Relayed path.
+        if self.done || self.promoted.is_none() {
+            return false;
+        }
+        let Some(stop) = self
+            .budget
+            .as_ref()
+            .and_then(|budget| budget.due(now.monotonic_ms))
+        else {
             return false;
         };
         self.settle_relayed(stop, swarm, shared, now);
         true
-    }
-
-    /// The upgrade budget that ran out at `now`, while the circuit still
-    /// carries the Relayed path.
-    fn upgrade_stop(&self, now: Now) -> Option<UpgradeStop> {
-        if self.done || self.promoted.is_none() {
-            return None;
-        }
-        let due = |deadline: Option<u64>| deadline.is_some_and(|at| now.monotonic_ms >= at);
-        let budget = |deadline: Option<u64>, from: u64| deadline.unwrap_or(0).saturating_sub(from);
-        if due(self.start_deadline) {
-            Some(UpgradeStop::StartTimeout {
-                budget_ms: budget(self.start_deadline, self.relayed_at),
-            })
-        } else if due(self.exchange_deadline) {
-            Some(UpgradeStop::ExchangeTimeout {
-                round: self.rounds,
-                budget_ms: budget(self.exchange_deadline, self.exchange_started_at),
-            })
-        } else if due(self.upgrade_deadline) {
-            Some(UpgradeStop::UpgradeTimeout {
-                budget_ms: budget(self.upgrade_deadline, self.relayed_at),
-            })
-        } else {
-            None
-        }
     }
 
     /// The current relay address ran out its budget in whatever step it
@@ -1250,11 +1224,10 @@ impl ConnectAttempt {
         self.best = Some(path.clone());
         self.path_conn = Some(conn_id);
         if shared.config.upgrades() {
-            self.relayed_at = now.monotonic_ms;
-            self.upgrade_deadline =
-                Some(self.clip(now.monotonic_ms + shared.config.upgrade_timeout_ms));
-            self.start_deadline =
-                Some(self.clip_upgrade(now.monotonic_ms + shared.config.dcutr_start_timeout_ms));
+            self.budget = Some(
+                UpgradeBudget::arm(now.monotonic_ms, &shared.config, self.attempt_deadline)
+                    .awaiting_start(&shared.config),
+            );
         }
         shared.push_event(NatEvent::PathEstablished {
             connect_id: self.id,
