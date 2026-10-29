@@ -19,7 +19,7 @@ Definitions only. For recipes, follow the linked guides.
 | **Transport dial** | One mechanism-level dial of one peer address. A Connection attempt may run several; raw dials outside an attempt live on the swarm. |
 | **Connect ID** | Correlation ID for a Connection attempt, stable across its Transport dials, relay fallback, and upgrade. |
 | **Relay leg** | NAT-owned part of an attempt: relay dial, HOP CONNECT, bridge promotion, DCUtR. Does not decide the terminal. |
-| **Path** | How a connection was established: `Direct` (dialed or accepted), `Punched` (by DCUtR), or `Relayed` through a named relay. Every established connection has one; a replacement connection has its own. A Relayed path may be provisional until the attempt settles. See [Traverse NAT](/rust/traverse-nat). |
+| **Path** | How a connection was established: `Direct` (dialed or accepted), `Punched` (by DCUtR), or `Relayed` through a named relay. Every established connection has one; a replacement connection has its own. A Relayed path may be provisional until the attempt settles. See [Traverse NAT](/docs/rust/traverse-nat). |
 | **Stream** | A negotiated byte stream for one application protocol. Writes may be split or combined, so applications add their own framing. |
 | **`useMinip2p`** | React hook that owns an endpoint for a component and closes it during cleanup. |
 | **`queueOverflow`** | TypeScript event reporting that the application did not consume events quickly enough. Refresh queryable state before relying on event history. |
@@ -30,7 +30,7 @@ Definitions only. For recipes, follow the linked guides.
 | **Endpoint wait outcome** | Why `wait` returned: `Event(EndpointEvent)`, `Deadline`, or `Interrupted`. |
 | **`EndpointEvent`** | Ordered, non-exhaustive event from the Endpoint's single public stream; enabled capabilities add `Nat`, `Gossipsub`, `Discovery`, and `RelayServer` variants. |
 | **State snapshot** | Getter over durable connection, peer, or transport-bound address state; not one atomic mega-snapshot and may be ahead of the event stream, never behind its own emitted transition. `bound_addresses` is bound sockets, not “accepting connections”. |
-| **Available vs enabled** | A Cargo feature makes a capability available; a builder method enables it on an endpoint. See [Install](/rust/install#add-an-optional-capability). |
+| **Available vs enabled** | A Cargo feature makes a capability available; a builder method enables it on an endpoint. See [Install](/docs/rust/install#add-an-optional-capability). |
 | **Circuit address** | `/…/p2p/<relay>/p2p-circuit/p2p/<target>` reaches a peer through a Circuit Relay v2 reservation. |
 
-For symptom-driven fixes, see [Rust troubleshooting](/rust/troubleshooting) or [TypeScript troubleshooting](/typescript/troubleshooting). For APIs grouped by feature, see the [feature matrix](/reference/feature-matrix).
+For symptom-driven fixes, see [Rust troubleshooting](/docs/rust/troubleshooting) or [TypeScript troubleshooting](/docs/typescript/troubleshooting). For APIs grouped by feature, see the [feature matrix](/docs/reference/feature-matrix).

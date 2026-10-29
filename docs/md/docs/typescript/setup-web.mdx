@@ -45,7 +45,7 @@ It prints an address carrying the hashes of the node's self-signed certificates,
 /ip4/127.0.0.1/udp/4001/quic-v1/webtransport/certhash/uEi…/certhash/uEi…/p2p/12D3KooW…
 ```
 
-The hashes derive from the node's key and a 13-day certificate period, so keep the key to keep the address across restarts. An address stays dialable for at least 13 days; `listenAddressesChanged` fires when the node rotates to the next period. A Rust node does the same with `listen_on("/ip4/0.0.0.0/udp/4001/quic-v1/webtransport")`, and the [relay server](/rust/host-a-relay) with `--webtransport`. For an address that never changes, serve a CA-signed certificate for a domain instead (CA certificate mode): browsers then dial a hash-free `/dns/…/webtransport/p2p/…` address, as in [Stable browser addresses](/rust/webtransport-certificates).
+The hashes derive from the node's key and a 13-day certificate period, so keep the key to keep the address across restarts. An address stays dialable for at least 13 days; `listenAddressesChanged` fires when the node rotates to the next period. A Rust node does the same with `listen_on("/ip4/0.0.0.0/udp/4001/quic-v1/webtransport")`, and the [relay server](/docs/rust/host-a-relay) with `--webtransport`. For an address that never changes, serve a CA-signed certificate for a domain instead (CA certificate mode): browsers then dial a hash-free `/dns/…/webtransport/p2p/…` address, as in [Stable browser addresses](/docs/rust/webtransport-certificates).
 
 ## Connect from the page
 
@@ -59,13 +59,13 @@ await endpoint.waitPeerReady(path.peerId, { timeoutMs: 10_000 });
 console.log(`ping: ${await endpoint.ping(path.peerId)} ms`);
 ```
 
-From here, [connections and streams](/typescript/connections-and-streams) work as on Node.js: register protocols with `protocols`, open streams, read with backpressure.
+From here, [connections and streams](/docs/typescript/connections-and-streams) work as on Node.js: register protocols with `protocols`, open streams, read with backpressure.
 
 Serve the page from a secure context, HTTPS or `localhost`: WebTransport is unavailable otherwise. A page on a public origin that dials a private address may trigger Chrome's Local Network Access prompt; production nodes are dialed on public addresses.
 
 ## Relays
 
-With `relays` (WebTransport addresses, with certhashes or hash-free on a [CA-certificate relay](/rust/webtransport-certificates)) the browser holds a reservation on the relay and is reachable at its `/p2p-circuit` address (`node.circuitAddress`), from other browsers and from native nodes. Connecting by peer ID goes through the relay; connecting to a native peer's WebTransport address races the direct dial against the relay leg, so the path is `direct` or `relayed`, never `punched`: browsers never hole punch. `forceRelay: true` skips the direct dial. `activeReservation()` reports the reservation.
+With `relays` (WebTransport addresses, with certhashes or hash-free on a [CA-certificate relay](/docs/rust/webtransport-certificates)) the browser holds a reservation on the relay and is reachable at its `/p2p-circuit` address (`node.circuitAddress`), from other browsers and from native nodes. Connecting by peer ID goes through the relay; connecting to a native peer's WebTransport address races the direct dial against the relay leg, so the path is `direct` or `relayed`, never `punched`: browsers never hole punch. `forceRelay: true` skips the direct dial. `activeReservation()` reports the reservation.
 
 ## Browser limits
 

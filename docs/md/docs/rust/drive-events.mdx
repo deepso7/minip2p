@@ -3,7 +3,7 @@ title: Drive events
 description: Use one Endpoint::wait loop for every event, including NAT, pubsub, discovery, and relay-server output.
 ---
 
-minip2p remains caller-driven at every layer. The application chooses when to poll, how long to wait, and which events to handle. Read [where events go](/rust/concepts#where-events-go) first. If you are working with custom streams, also read [Register a protocol](/rust/register-a-protocol).
+minip2p remains caller-driven at every layer. The application chooses when to poll, how long to wait, and which events to handle. Read [where events go](/docs/rust/concepts#where-events-go) first. If you are working with custom streams, also read [Register a protocol](/docs/rust/register-a-protocol).
 
 ## Pick a driving method
 
@@ -156,4 +156,4 @@ Capability variants exist only when their feature is enabled: `Nat` (`autonat`),
 
 State snapshot getters such as `path`, `reachability`, `active_reservation`, and `known_peers` stay authoritative for durable state. They may be ahead of the event stream, never behind their own emitted transition.
 
-See [Rust troubleshooting](/rust/troubleshooting) for common event symptoms and responses.
+See [Rust troubleshooting](/docs/rust/troubleshooting) for common event symptoms and responses.

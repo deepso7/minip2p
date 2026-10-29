@@ -3,7 +3,7 @@ title: Publish with pubsub
 description: Enable gossipsub, subscribe and publish signed messages, and consume pubsub events.
 ---
 
-The `pubsub` feature exposes gossipsub. `EndpointBuilder::gossipsub()` enables it with interoperable defaults and advertises `/meshsub/1.1.0` and `/meshsub/1.0.0`. You need a second peer on the same topic to observe delivery. See [Drive events](/rust/drive-events) for the caller-driven event model.
+The `pubsub` feature exposes gossipsub. `EndpointBuilder::gossipsub()` enables it with interoperable defaults and advertises `/meshsub/1.1.0` and `/meshsub/1.0.0`. You need a second peer on the same topic to observe delivery. See [Drive events](/docs/rust/drive-events) for the caller-driven event model.
 
 ## Enable gossipsub
 
@@ -111,4 +111,4 @@ let node = Endpoint::builder()
 
 Messages that include a signature are still verified. `allow_unsigned` does not make local publications unsigned.
 
-For automatic peer address exchange on a signed pubsub topic, continue to [Discover peers](/rust/discover-peers).
+For automatic peer address exchange on a signed pubsub topic, continue to [Discover peers](/docs/rust/discover-peers).

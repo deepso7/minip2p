@@ -48,7 +48,7 @@ npx expo run:ios
 
 `useMinip2p` owns the endpoint for a component. It starts the endpoint after the component commits and closes it during cleanup.
 
-First, run the listener from the [Node.js quickstart](/typescript/setup-node#run-two-peers). Its default listener uses `127.0.0.1`, which is reachable only from the desktop itself. Change `listener.mjs` to bind the desktop's LAN address, for example `/ip4/192.168.1.42/udp/4001/quic-v1`, then restart it. Copy the complete address it prints:
+First, run the listener from the [Node.js quickstart](/docs/typescript/setup-node#run-two-peers). Its default listener uses `127.0.0.1`, which is reachable only from the desktop itself. Change `listener.mjs` to bind the desktop's LAN address, for example `/ip4/192.168.1.42/udp/4001/quic-v1`, then restart it. Copy the complete address it prints:
 
 ```text
 /ip4/192.168.1.42/udp/4001/quic-v1/p2p/12D3KooW...
@@ -148,4 +148,4 @@ If the app enables `mdns: true`, add its Bonjour service type on iOS and the mul
 
 Rebuild after changing either file.
 
-Next: [Endpoint lifecycle](/typescript/lifecycle) or [Networking and events](/typescript/networking-and-events).
+Next: [Endpoint lifecycle](/docs/typescript/lifecycle) or [Networking and events](/docs/typescript/networking-and-events).

@@ -20,7 +20,7 @@ In CA certificate mode the relay serves a certificate for your domain instead. B
 
 ## Prerequisites
 
-- A relay host [installed with the service command](/rust/host-a-relay), or about to be.
+- A relay host [installed with the service command](/docs/rust/host-a-relay), or about to be.
 - A domain, here `relay.example.com`, with `A` and `AAAA` records pointing at the host. With Cloudflare, keep them DNS-only.
 - Inbound UDP port `19876` open (TCP `19876` too, for the TCP transport).
 - Inbound TCP port `80` for certbot's HTTP-01 challenge, or a DNS-01 certbot plugin for your DNS provider to avoid the port.
@@ -100,7 +100,7 @@ In CA certificate mode the relay serves a certificate for your domain instead. B
   </Step>
 </Steps>
 
-Hardcode the `webtransport=` address in the page. [`@minip2p/web`](/typescript/setup-web) dials it with the browser's normal certificate checks:
+Hardcode the `webtransport=` address in the page. [`@minip2p/web`](/docs/typescript/setup-web) dials it with the browser's normal certificate checks:
 
 ```text
 /dns/relay.example.com/udp/19876/quic-v1/webtransport/p2p/12D3KooW…

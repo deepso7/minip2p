@@ -3,7 +3,7 @@ title: Listen and connect
 description: Listen on QUIC, TCP, or both; publish dialable peer addresses; and connect to a known peer.
 ---
 
-This guide covers direct QUIC and TCP with the base Endpoint API. QUIC is on by default; TCP needs the `tcp` Cargo feature. For relay races and hole punching, use [Traverse NAT](/rust/traverse-nat). If you have not run a local connection yet, start with [Connect two peers](/rust/connect-peers).
+This guide covers direct QUIC and TCP with the base Endpoint API. QUIC is on by default; TCP needs the `tcp` Cargo feature. For relay races and hole punching, use [Traverse NAT](/docs/rust/traverse-nat). If you have not run a local connection yet, start with [Connect two peers](/docs/rust/connect-peers).
 
 ## Bind an endpoint
 
@@ -143,6 +143,6 @@ node.disconnect(&peer)?;
 
 ## Direct and NAT-aware attempts
 
-Without NAT configuration, `connect` dials only the direct candidates. With the `relay` feature and a configured relay, the same call also races a relay leg and can later upgrade to a direct path. See [Traverse NAT](/rust/traverse-nat).
+Without NAT configuration, `connect` dials only the direct candidates. With the `relay` feature and a configured relay, the same call also races a relay leg and can later upgrade to a direct path. See [Traverse NAT](/docs/rust/traverse-nat).
 
-Next: [Register a protocol](/rust/register-a-protocol) or [Identity](/rust/identity).
+Next: [Register a protocol](/docs/rust/register-a-protocol) or [Identity](/docs/rust/identity).

@@ -8,7 +8,7 @@ type Props = CardProps;
 
 const { href, title } = Astro.props;
 const external = href !== undefined && /^https?:\/\//u.test(href);
-// `/rust/connect-peers` reads as-is; an external link shows only its host.
+// `/docs/rust/connect-peers` reads as-is; an external link shows only its host.
 let target: string | undefined;
 if (href !== undefined) {
   target = external ? new URL(href).host : href;

@@ -66,7 +66,7 @@ Add `--webtransport` to `service install` or the foreground command to serve bro
 [relay] webtransport=/ip4/…/udp/19876/quic-v1/webtransport/certhash/u…/p2p/12D3KooW…
 ```
 
-The address survives restarts with the same key, but goes stale within about 26 days, so browsers must keep getting the current one from the logs. For one permanent `/dns/relay.example.com/…/webtransport` address, give the relay a CA-signed certificate: see [Stable browser addresses](/rust/webtransport-certificates).
+The address survives restarts with the same key, but goes stale within about 26 days, so browsers must keep getting the current one from the logs. For one permanent `/dns/relay.example.com/…/webtransport` address, give the relay a CA-signed certificate: see [Stable browser addresses](/docs/rust/webtransport-certificates).
 
 ### Run it in the foreground
 

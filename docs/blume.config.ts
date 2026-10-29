@@ -49,10 +49,18 @@ export default defineConfig({
   },
   navigation: {
     tabs: [
-      { href: "/intro", label: "Docs", path: "/" },
+      { href: "/docs/intro", label: "Docs", path: "/docs" },
       { label: "Changelog", path: "/changelog" },
     ],
   },
+  // The docs lived at the site root until the landing page took it over.
+  redirects: [
+    { from: "/docs", to: "/docs/intro" },
+    { from: "/intro", to: "/docs/intro" },
+    { from: "/rust/:slug*", to: "/docs/rust/:slug*" },
+    { from: "/typescript/:slug*", to: "/docs/typescript/:slug*" },
+    { from: "/reference/:slug*", to: "/docs/reference/:slug*" },
+  ],
   seo: {
     og: {
       logo: "/logo.svg",

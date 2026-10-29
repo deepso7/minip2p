@@ -43,7 +43,7 @@ A `PeerAddr` pairs that transport with a terminal peer identity:
 /ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooW…
 ```
 
-Use `Multiaddr` when choosing where to listen. Use `PeerAddr` when connecting to a specific authenticated peer. See [Identity](/rust/identity) for circuit addresses and wildcards.
+Use `Multiaddr` when choosing where to listen. Use `PeerAddr` when connecting to a specific authenticated peer. See [Identity](/docs/rust/identity) for circuit addresses and wildcards.
 
 ## Connection readiness
 
@@ -67,13 +67,13 @@ A relayed path can later emit `NatEvent::PathUpgraded` when hole punching lands.
 
 <Callout type="warning">
 
-A Cargo feature makes a capability available. Enable it on `EndpointBuilder`; see [Install](/rust/install#add-an-optional-capability).
+A Cargo feature makes a capability available. Enable it on `EndpointBuilder`; see [Install](/docs/rust/install#add-an-optional-capability).
 
 </Callout>
 
 ## Where events go
 
-Every event leaves through the Endpoint event stream, read with `Endpoint::wait` or `poll`. One loop sees every event exactly once. Applications wait for a particular outcome by matching its ID (a `ConnectId`, `ConnectionId`, or `StreamId`) in that loop while dispatching everything else; see [Drive events](/rust/drive-events). Connection, Identify, Ping, and application stream events arrive as ordinary `EndpointEvent` variants. Enabled capabilities add variants to the same `#[non_exhaustive]` enum:
+Every event leaves through the Endpoint event stream, read with `Endpoint::wait` or `poll`. One loop sees every event exactly once. Applications wait for a particular outcome by matching its ID (a `ConnectId`, `ConnectionId`, or `StreamId`) in that loop while dispatching everything else; see [Drive events](/docs/rust/drive-events). Connection, Identify, Ping, and application stream events arrive as ordinary `EndpointEvent` variants. Enabled capabilities add variants to the same `#[non_exhaustive]` enum:
 
 - `EndpointEvent::Nat(NatEvent)` (`autonat`): path transitions, reachability, public addresses, and relay reservations. The attempt outcome is `ConnectSettled`, never a `NatEvent`;
 - `EndpointEvent::Gossipsub(GossipsubEvent)` (`pubsub`);
@@ -83,4 +83,4 @@ Every event leaves through the Endpoint event stream, read with `Endpoint::wait`
 
 Durable state is available through State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `connection_info`, `path`, `bound_addresses`, and with capabilities `reachability`, `active_reservation`, `known_peers`). `connection_info(conn_id)` returns an established connection's peer, remote address, `Path`, and Identify protocols (`ready_protocols` is `None` until it is identified); it is `None` for a pending, replaced, or closed connection. `bound_addresses` reports transport-bound local addresses; `bind` already accepts on each. Those getters do not drive the endpoint, are not one cross-getter atomic snapshot, and may be ahead of the event stream, never behind their own emitted transition.
 
-Continue with [Listen and connect](/rust/listen-and-dial) or the [glossary](/reference/glossary).
+Continue with [Listen and connect](/docs/rust/listen-and-dial) or the [glossary](/docs/reference/glossary).
