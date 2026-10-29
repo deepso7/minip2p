@@ -28,12 +28,11 @@ pub use minip2p_transport::{
     ConnectionCloseReason, ConnectionId, InvalidLimit, StreamId, Transport, TransportError,
 };
 
-pub(crate) mod connect;
-pub use connect::{
+pub use crate::connect::{
     CandidateFailure, ConnectFailure, ConnectId, ConnectOutcome, ConnectTarget, ConnectTargetError,
     RelayFailure,
 };
-pub(crate) use connect::{DEFAULT_CONNECT_DEADLINE_MS, Expansion};
+pub(crate) use crate::connect::{DEFAULT_CONNECT_DEADLINE_MS, Expansion};
 mod event_stream;
 pub use event_stream::EndpointEvent;
 mod stream_acks;

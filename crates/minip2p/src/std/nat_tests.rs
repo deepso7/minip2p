@@ -990,6 +990,127 @@ fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
     assert!(!initiator.connected_peers().contains(&responder_peer));
 }
 
+/// The pending check in `ConnectEngine::cancel`: an attempt that settled on
+/// the circuit its relay leg promoted keeps that circuit when a cancel lands
+/// before the terminal is drained, while the agent still owns the circuit.
+/// The batch is stepped by hand so the cancel lands in exactly that window
+/// (as a discovery `CancelDial` in the same batch would).
+#[test]
+fn cancel_after_a_relayed_settle_keeps_the_promoted_circuit() {
+    let relay = relay_support::RelayServer::spawn();
+    let relay_addr = relay.addr().clone();
+    let mut responder = Endpoint::builder()
+        .relay(relay_addr.clone())
+        .nat_config(NatConfig {
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Always,
+            ..NatConfig::default()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind responder");
+    responder.listen().expect("responder listens");
+    let responder_peer = responder.peer_id().clone();
+    let reservation_deadline = Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < reservation_deadline,
+            "responder did not reserve on relay"
+        );
+        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) = responder
+            .next_event(std::time::Duration::from_millis(20))
+            .expect("drive responder reservation")
+            && &relay == relay_addr.peer_id()
+        {
+            break;
+        }
+        relay.assert_healthy();
+    }
+
+    // DCUtR off and no direct candidate: the leg's circuit settles the
+    // attempt the moment it is established, while the agent, never told,
+    // still holds it as the circuit it promoted.
+    let mut initiator = Endpoint::builder()
+        .relay(relay_addr)
+        .nat_config(NatConfig {
+            dcutr: false,
+            reservation_policy: ReservationPolicy::Never,
+            ..NatConfig::default()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind initiator");
+    initiator.listen().expect("initiator listens");
+    let id = initiator
+        .connect(&responder_peer)
+        .expect("start relay connect");
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    let circuit = loop {
+        assert!(Instant::now() < deadline, "the relay leg never settled");
+        initiator
+            .harvest(std::time::Duration::from_millis(20))
+            .expect("harvest");
+        let now = initiator.now();
+        let engine = &mut initiator.engine;
+        engine.expire_attempts(now);
+        for event in engine.core.poll(now).expect("poll") {
+            engine.ingest(event, now);
+        }
+        if !engine.connect.is_pending(id) {
+            break engine
+                .core
+                .connection_id(&responder_peer)
+                .expect("settled on a connection");
+        }
+        engine
+            .drive(now, &mut |addr| {
+                crate::connect::Expansion::Ready(vec![addr.clone()])
+            })
+            .expect("drive");
+        let _ = responder
+            .next_event(std::time::Duration::from_millis(5))
+            .expect("drive responder");
+        relay.assert_healthy();
+    };
+    assert!(circuit.is_circuit(), "the leg promoted the circuit");
+
+    let now = initiator.now();
+    initiator.engine.cancel_connect(id, now);
+    let events = initiator.poll().expect("poll");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome: crate::ConnectOutcome::Connected { conn_id, .. },
+                ..
+            } if *connect_id == id && *conn_id == circuit
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            EndpointEvent::ConnectSettled {
+                outcome: crate::ConnectOutcome::Cancelled,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    assert!(
+        initiator
+            .core()
+            .transport()
+            .circuit_ids()
+            .contains(&circuit),
+        "the settled circuit stays open"
+    );
+}
+
 /// Drives `endpoints` until `condition` holds over the Gossipsub events each
 /// one has delivered so far.
 #[cfg(feature = "pubsub")]

@@ -26,12 +26,15 @@
 //!
 //! # NAT event routing
 //!
-//! Every NAT event reaches the Connection engine exactly once, then
-//! discovery's ownership filter, then application staging
-//! ([`NatDriver::route`]). Routing runs after every swarm event, after every
-//! step that can make the agent speak, and again while Connection-attempt
-//! terminals are collected, so even an event produced by a terminal's
-//! cleanup is staged before the batch's final drain.
+//! The Connection-attempt engine owns the relay leg's whole lifecycle
+//! ([`ConnectEngine::admit`], `cancel`, `route`, `pop_terminal`) and reaches
+//! the NAT driver only through the [`Legs`] it is lent per call. Every NAT
+//! event reaches it exactly once ([`ConnectEngine::route`]), then
+//! discovery's ownership filter, then application staging. Routing runs
+//! after every swarm event, after every step that can make the agent speak,
+//! and again before each Connection-attempt terminal is popped, so even an
+//! event produced by a terminal's cleanup is staged before the batch's
+//! final drain.
 //!
 //! # Paths
 //!
@@ -61,16 +64,14 @@ use minip2p_core::{Bytes, Multiaddr, Path, PeerAddr, PeerId};
 use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
+use crate::connect::{
+    ConnectAdmission, ConnectEngine, ConnectId, ConnectTarget, Expansion, LegProvider, Legs,
+    circuit_relay, is_punched,
+};
 #[cfg(feature = "_peer-book")]
 use crate::discovery::{DiscoveryDriver, resolve_book_candidates};
 #[cfg(feature = "autonat")]
 use crate::nat::NatDriver;
-#[cfg(feature = "autonat")]
-use crate::portable::connect::cancel_attempt;
-use crate::portable::connect::{
-    ConnectAdmission, ConnectEngine, ConnectId, ConnectTarget, Expansion, admit_connect,
-    circuit_relay,
-};
 #[cfg(feature = "pubsub")]
 use crate::pubsub::{GossipsubDriver, GossipsubError};
 #[cfg(feature = "relay-server")]
@@ -113,8 +114,9 @@ pub(crate) struct Engine<T: Transport, E: EntropySource, M: Carrier> {
     /// Addresses set through `set_external_addresses`; driver contributions
     /// are merged after them.
     caller_external_addresses: Vec<Multiaddr>,
-    #[cfg(feature = "autonat")]
-    pub(crate) nat: Option<NatDriver<T>>,
+    /// The relay-leg provider and NAT capability: the NAT driver, once
+    /// configured.
+    pub(crate) nat: LegProvider<T>,
     #[cfg(feature = "pubsub")]
     pub(crate) gossipsub: Option<GossipsubDriver>,
     #[cfg(feature = "_peer-book")]
@@ -149,8 +151,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             acks,
             events: VecDeque::new(),
             caller_external_addresses: Vec::new(),
-            #[cfg(feature = "autonat")]
-            nat: None,
+            nat: LegProvider::default(),
             #[cfg(feature = "pubsub")]
             gossipsub: None,
             #[cfg(feature = "_peer-book")]
@@ -190,8 +191,9 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     // ---------------------------------------------------------------------
 
     /// Admits one Connection attempt. A Peer-ID target resolves through the
-    /// discovery book when there is one; the NAT leg attaches when NAT is
-    /// configured. Whatever settles at once is queued before this returns.
+    /// discovery book when there is one, and every address the book knows
+    /// for the peer steers the relay leg. Whatever settles at once is queued
+    /// before this returns.
     pub(crate) fn connect(
         &mut self,
         target: ConnectTarget,
@@ -200,70 +202,35 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     ) -> ConnectId {
         let peer = target.peer_id().clone();
         #[cfg(feature = "_peer-book")]
-        let candidates = resolve_book_candidates(
-            self.discovery.as_ref().map(|discovery| &discovery.book),
-            &peer,
-            target.candidates().to_vec(),
+        let book = self.discovery.as_ref().map(|discovery| &discovery.book);
+        #[cfg(feature = "_peer-book")]
+        let (candidates, targets) = (
+            resolve_book_candidates(book, &peer, target.candidates().to_vec()),
+            book.map(|book| book.known_addrs(&peer)).unwrap_or_default(),
         );
         #[cfg(not(feature = "_peer-book"))]
-        let candidates = target.candidates().to_vec();
-        let id = admit_connect(
-            &mut self.connect,
+        let (candidates, targets) = (target.candidates().to_vec(), Vec::new());
+        let id = self.connect.admit(
+            Legs::of(&mut self.nat),
             &mut self.core,
-            #[cfg(feature = "autonat")]
-            self.nat.as_ref(),
             ConnectAdmission {
-                peer: peer.clone(),
+                peer,
                 candidates,
                 allow_relay: true,
+                targets,
             },
             expand,
-            now.monotonic_ms,
+            now,
         );
-        #[cfg(feature = "autonat")]
-        if let Some(nat) = self.nat.as_mut() {
-            // Circuit addresses the book knows tell the relay leg where the
-            // peer holds a reservation.
-            #[cfg(feature = "_peer-book")]
-            let target_addrs = self
-                .discovery
-                .as_ref()
-                .map(|discovery| discovery.book.known_addrs(&peer))
-                .unwrap_or_default();
-            #[cfg(not(feature = "_peer-book"))]
-            let target_addrs = Vec::new();
-            nat.attach_leg(
-                &self.connect,
-                id,
-                peer,
-                true,
-                target_addrs,
-                &mut self.core,
-                now,
-            );
-        }
         self.settle(now);
         id
     }
 
-    /// Cancels an attempt and its NAT leg. Settled or unknown ids are a
+    /// Cancels an attempt and its relay leg. Settled or unknown ids are a
     /// no-op; the terminal is queued before this returns.
     pub(crate) fn cancel_connect(&mut self, id: ConnectId, now: Now) {
-        #[cfg(feature = "autonat")]
-        {
-            let pump = cancel_attempt(
-                &mut self.connect,
-                self.nat.as_mut(),
-                id,
-                &mut self.core,
-                now,
-            );
-            if pump && let Some(nat) = self.nat.as_mut() {
-                nat.pump(&mut self.core);
-            }
-        }
-        #[cfg(not(feature = "autonat"))]
-        self.connect.cancel(id, &mut self.core);
+        self.connect
+            .cancel(Legs::of(&mut self.nat), &mut self.core, id, now);
         self.settle(now);
     }
 
@@ -558,33 +525,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// for a pending, replaced, or closed one.
     fn connection_path(&self, conn_id: ConnectionId) -> Option<Path> {
         self.core.connection_peer(conn_id)?;
-        #[cfg(feature = "autonat")]
-        let punched = self.nat.as_ref().is_some_and(|nat| nat.is_punched(conn_id));
-        #[cfg(not(feature = "autonat"))]
-        let punched = false;
-        path_of(&self.core, punched, conn_id)
-    }
-
-    /// Names the path of every attempt that settled Connected in the step
-    /// just run (or ahead of the swarm event just ingested), before a later
-    /// event can replace or close its connection (see
-    /// `ConnectEngine::resolve_paths`). A circuit's relay was recorded when
-    /// it settled; a direct connection only needs NAT's punch record, which
-    /// still holds for one whose close is queued, as NAT has not seen it.
-    fn resolve_settled_paths(&mut self) {
-        #[cfg(feature = "autonat")]
-        let nat = self.nat.as_ref();
-        self.connect.resolve_paths(|conn_id| {
-            #[cfg(feature = "autonat")]
-            {
-                nat.is_some_and(|nat| nat.is_punched(conn_id))
-            }
-            #[cfg(not(feature = "autonat"))]
-            {
-                let _ = conn_id;
-                false
-            }
-        });
+        path_of(&self.core, is_punched(&self.nat, conn_id), conn_id)
     }
 
     #[cfg(feature = "relay")]
@@ -609,19 +550,12 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         self.collect_mdns_events(now);
         self.events.extend(self.mdns_events.drain(..));
         if let Some(discovery) = self.discovery.as_mut() {
-            let work = discovery.shutdown(
+            discovery.shutdown(
                 &mut self.connect,
-                #[cfg(feature = "autonat")]
-                self.nat.as_mut(),
+                Legs::of(&mut self.nat),
                 &mut self.core,
                 now,
             );
-            #[cfg(feature = "autonat")]
-            if let Some(nat) = self.nat.as_mut() {
-                nat.apply_sweep_work(work, &self.connect, &mut self.core, now);
-            }
-            #[cfg(not(feature = "autonat"))]
-            drop(work);
         }
         result
     }
@@ -643,8 +577,8 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     /// first; std calls it before applying Name-resolution answers, so a
     /// late answer cannot turn a Timeout into another outcome.
     pub(crate) fn expire_attempts(&mut self, now: Now) {
-        self.connect.tick(&mut self.core, now.monotonic_ms);
-        self.resolve_settled_paths();
+        self.connect
+            .expire(Legs::of(&mut self.nat), &mut self.core, now);
     }
 
     /// Runs one drive batch (see the module docs) and queues its output.
@@ -799,63 +733,49 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         self.route_nat(now);
         #[cfg(feature = "_peer-book")]
         if let Some(discovery) = self.discovery.as_mut() {
-            let work = discovery.sweep(
+            discovery.sweep(
                 #[cfg(feature = "pubsub")]
                 self.gossipsub.as_mut(),
-                #[cfg(feature = "autonat")]
-                self.nat.as_mut(),
+                Legs::of(&mut self.nat),
                 &mut self.connect,
                 &mut self.core,
                 expand,
                 now,
             );
-            #[cfg(feature = "autonat")]
-            if let Some(nat) = self.nat.as_mut() {
-                nat.apply_sweep_work(work, &self.connect, &mut self.core, now);
-            }
-            #[cfg(not(feature = "autonat"))]
-            drop(work);
             self.route_nat(now);
         }
         self.refresh_addresses(false);
     }
 
-    /// Routes NAT output: the Connection engine, then discovery's ownership
-    /// filter, then application staging. Then names the paths of what
-    /// settled meanwhile: every step that can settle an attempt but
-    /// `expire_attempts` ends here.
+    /// Routes NAT output through the Connection engine, with discovery's
+    /// ownership filter, and names the paths of what settled meanwhile
+    /// (see [`ConnectEngine::route`]).
     fn route_nat(&mut self, now: Now) {
-        #[cfg(feature = "autonat")]
-        if let Some(nat) = self.nat.as_mut() {
-            #[cfg(feature = "_peer-book")]
-            let discovery = self.discovery.as_ref();
-            nat.route(
-                &mut self.connect,
-                &mut self.core,
-                now.monotonic_ms,
-                |event| {
-                    #[cfg(feature = "_peer-book")]
-                    {
-                        discovery.is_some_and(|discovery| discovery.owns_nat_event(event))
-                    }
-                    #[cfg(not(feature = "_peer-book"))]
-                    {
-                        let _ = event;
-                        false
-                    }
-                },
-            );
-        }
-        #[cfg(not(feature = "autonat"))]
-        let _ = now;
-        self.resolve_settled_paths();
+        #[cfg(feature = "_peer-book")]
+        let discovery = self.discovery.as_ref();
+        self.connect.route(
+            Legs::of(&mut self.nat),
+            &mut self.core,
+            |id| {
+                #[cfg(feature = "_peer-book")]
+                {
+                    discovery.is_some_and(|discovery| discovery.owns_attempt(id))
+                }
+                #[cfg(not(feature = "_peer-book"))]
+                {
+                    let _ = id;
+                    false
+                }
+            },
+            now,
+        );
     }
 
     /// Collects Connection-attempt terminals and queues everything staged:
     /// capability events (relay-server, NAT, Gossipsub, Discovery), then the
     /// terminals.
     ///
-    /// Every terminal settles its NAT leg, which can produce more NAT
+    /// Every terminal settles its relay leg, which can produce more NAT
     /// events; those are routed before the drain. Discovery-owned
     /// terminals are claimed (and update the book) before the book's events
     /// are drained, so the updates surface in the same batch.
@@ -895,13 +815,12 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         let mut settled = Vec::new();
         loop {
             self.route_nat(now);
-            let Some(event) = self.connect.pop_event() else {
+            let Some(event) =
+                self.connect
+                    .pop_terminal(Legs::of(&mut self.nat), &mut self.core, now)
+            else {
                 break;
             };
-            #[cfg(feature = "autonat")]
-            if let Some(nat) = self.nat.as_mut() {
-                nat.settle_leg_on_terminal(&event, &mut self.core, now);
-            }
             #[cfg(feature = "_peer-book")]
             if let Some(discovery) = self.discovery.as_mut()
                 && discovery.claim_settled(&event, now.monotonic_ms)

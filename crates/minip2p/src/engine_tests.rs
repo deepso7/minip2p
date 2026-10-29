@@ -527,3 +527,414 @@ const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<crate::PortableEndpoint<FlashTransport, CountingEntropy>>();
 };
+
+/// A transport whose dials stay in flight until the test scripts their
+/// outcome; it records every dial and close.
+#[cfg(feature = "autonat")]
+#[derive(Default)]
+struct Script {
+    next_id: u64,
+    dials: Vec<(ConnectionId, PeerAddr)>,
+    closes: Vec<ConnectionId>,
+    queue: VecDeque<TransportEvent>,
+}
+
+#[cfg(feature = "autonat")]
+#[derive(Clone, Default)]
+struct ScriptedTransport(Arc<Mutex<Script>>);
+
+#[cfg(feature = "autonat")]
+impl ScriptedTransport {
+    fn script(&self) -> std::sync::MutexGuard<'_, Script> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The dials made to `peer`, oldest first.
+    fn dials_to(&self, peer: &PeerId) -> Vec<ConnectionId> {
+        self.script()
+            .dials
+            .iter()
+            .filter(|(_, addr)| addr.peer_id() == peer)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    fn closed(&self, id: ConnectionId) -> bool {
+        self.script().closes.contains(&id)
+    }
+
+    /// Reports an established connection to `peer` at `remote`.
+    fn connect(&self, id: ConnectionId, remote: Multiaddr, peer: &PeerId) {
+        self.script().queue.push_back(TransportEvent::Connected {
+            id,
+            endpoint: ConnectionEndpoint::with_peer_id(remote, peer.clone()),
+        });
+    }
+}
+
+#[cfg(feature = "autonat")]
+impl Transport for ScriptedTransport {
+    fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        let mut script = self.script();
+        script.next_id += 1;
+        let id =
+            ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, script.next_id).expect("id");
+        script.dials.push((id, addr.clone()));
+        Ok(id)
+    }
+    fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+        Ok(addr.clone())
+    }
+    fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
+        Ok(StreamId::new(1))
+    }
+    fn send_stream(
+        &mut self,
+        _: ConnectionId,
+        _: StreamId,
+        _: Bytes,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn close_stream_write(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn ack_stream(&mut self, _: ConnectionId, _: StreamId, _: usize) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
+        self.script().closes.push(id);
+        Ok(())
+    }
+    fn poll(&mut self, _: Now) -> Result<Vec<TransportEvent>, TransportError> {
+        Ok(self.script().queue.drain(..).collect())
+    }
+    fn local_addresses(&self) -> Vec<Multiaddr> {
+        Vec::new()
+    }
+}
+
+/// A portable endpoint over a [`ScriptedTransport`] with a real NAT driver
+/// configured for one relay. Its relay legs are genuine: the agent dials
+/// the relay through the swarm, and the dial stays in flight until the
+/// test says otherwise.
+#[cfg(feature = "autonat")]
+struct RelayLegFixture {
+    endpoint: crate::PortableEndpoint<ScriptedTransport, CountingEntropy>,
+    transport: ScriptedTransport,
+    relay: PeerAddr,
+    peer: PeerId,
+}
+
+#[cfg(feature = "autonat")]
+impl RelayLegFixture {
+    fn new(seed: u8, force_relay: bool) -> Self {
+        let identity = Ed25519Keypair::from_secret_key_bytes([seed; 32]);
+        let relay = PeerAddr::new(
+            "/ip4/192.0.2.50/tcp/4001".parse().expect("addr"),
+            Ed25519Keypair::from_secret_key_bytes([seed + 1; 32]).peer_id(),
+        )
+        .expect("relay");
+        let peer = Ed25519Keypair::from_secret_key_bytes([seed + 2; 32]).peer_id();
+        let transport = ScriptedTransport::default();
+        let mut endpoint = Endpoint::portable(&identity, CountingEntropy(0))
+            .build(transport.clone())
+            .expect("builds");
+        let config = minip2p_nat::NatConfig {
+            relays: vec![relay.clone()],
+            force_relay,
+            reservation_policy: minip2p_nat::ReservationPolicy::Never,
+            // The relay's budget is the whole attempt: the leg gives up
+            // exactly when the attempt does.
+            relay_timeout_ms: crate::DEFAULT_CONNECT_DEADLINE_MS,
+            ..minip2p_nat::NatConfig::default()
+        };
+        endpoint.engine.nat = Some(crate::nat::NatDriver::new(
+            minip2p_nat::NatAgent::new(identity.peer_id(), config),
+            vec![(relay.peer_id().clone(), relay.transport().clone())],
+            7,
+        ));
+        Self {
+            endpoint,
+            transport,
+            relay,
+            peer,
+        }
+    }
+
+    /// The relay leg's dial to the relay, once there is exactly one.
+    fn relay_dial(&self) -> ConnectionId {
+        match self.transport.dials_to(self.relay.peer_id()).as_slice() {
+            [dial] => *dial,
+            dials => panic!("expected one relay dial, saw {dials:?}"),
+        }
+    }
+
+    fn terminals(events: &[EndpointEvent], id: crate::ConnectId) -> Vec<&ConnectOutcome> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EndpointEvent::ConnectSettled {
+                    connect_id,
+                    outcome,
+                    ..
+                } if *connect_id == id => Some(outcome),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn nat_events_for(events: &[EndpointEvent], id: crate::ConnectId) -> usize {
+        events
+            .iter()
+            .filter(
+                |event| matches!(event, EndpointEvent::Nat(nat) if nat.connect_id() == Some(id)),
+            )
+            .count()
+    }
+}
+
+#[cfg(feature = "autonat")]
+#[test]
+fn cancel_while_the_relay_leg_is_pending_cancels_once_and_silences_the_leg() {
+    let mut f = RelayLegFixture::new(60, true);
+    let now = Now::from_millis(0);
+    let id = f.endpoint.connect(f.peer.clone(), now).expect("admitted");
+    f.endpoint.poll(now).expect("poll");
+    let relay_dial = f.relay_dial();
+    assert!(
+        f.endpoint.engine.connect.is_pending(id),
+        "the leg is in flight"
+    );
+
+    let engine = &mut f.endpoint.engine;
+    engine.connect.cancel(
+        crate::connect::Legs::of(&mut engine.nat),
+        &mut engine.core,
+        id,
+        now,
+    );
+    assert!(
+        f.transport.closed(relay_dial),
+        "the leg's cleanup ran inside cancel, before its terminal is drained"
+    );
+    // The relay answers late, and the attempt's budget runs out: neither
+    // wakes the cancelled leg.
+    f.transport
+        .connect(relay_dial, f.relay.transport().clone(), f.relay.peer_id());
+    let mut events = f.endpoint.poll(now).expect("poll");
+    events.extend(f.endpoint.poll(Now::from_millis(60_000)).expect("poll"));
+    assert!(
+        matches!(
+            RelayLegFixture::terminals(&events, id).as_slice(),
+            [ConnectOutcome::Cancelled]
+        ),
+        "{events:?}"
+    );
+    assert_eq!(
+        RelayLegFixture::nat_events_for(&events, id),
+        0,
+        "{events:?}"
+    );
+}
+
+/// The engine side of a cancel after a provisional relayed settle: no
+/// `Cancelled`, and the Connected terminal keeps its circuit. The circuit
+/// here is reported by the transport, not promoted by the leg; the std
+/// `cancel_after_a_relayed_settle_keeps_the_promoted_circuit` covers a
+/// circuit the agent owns.
+#[cfg(feature = "autonat")]
+#[test]
+fn cancel_after_a_provisional_relayed_settle_keeps_the_circuit() {
+    // DCUtR on: a circuit stays provisional until the deadline settles it.
+    let mut f = RelayLegFixture::new(63, false);
+    let now = Now::from_millis(0);
+    let id = f.endpoint.connect(f.peer.clone(), now).expect("admitted");
+    f.relay_dial();
+    let circuit = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 1).expect("circuit");
+    f.transport.connect(
+        circuit,
+        Multiaddr::from_protocols(vec![
+            minip2p_core::Protocol::P2p(f.relay.peer_id().clone()),
+            minip2p_core::Protocol::P2pCircuit,
+        ]),
+        &f.peer,
+    );
+    f.endpoint.poll(now).expect("poll");
+    assert!(
+        f.endpoint.engine.connect.is_pending(id),
+        "Relayed is provisional"
+    );
+
+    // The deadline settles the attempt on the circuit; a cancel arriving
+    // before that terminal is drained finds nothing pending.
+    let deadline = Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS);
+    f.endpoint.engine.expire_attempts(deadline);
+    f.endpoint.cancel_connect(id, deadline);
+    let events = f.endpoint.poll(deadline).expect("poll");
+    assert!(
+        matches!(
+            RelayLegFixture::terminals(&events, id).as_slice(),
+            [ConnectOutcome::Connected { conn_id, path: minip2p_core::Path::Relayed { .. } }]
+                if *conn_id == circuit
+        ),
+        "{events:?}"
+    );
+    assert!(
+        !f.transport.closed(circuit),
+        "the settled circuit stays open"
+    );
+    assert_eq!(f.endpoint.engine.core.connection_id(&f.peer), Some(circuit));
+}
+
+#[cfg(feature = "autonat")]
+#[test]
+fn an_admission_that_settles_at_once_attaches_no_leg() {
+    let mut f = RelayLegFixture::new(66, false);
+    let now = Now::from_millis(0);
+    let direct = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 100).expect("id");
+    f.transport.connect(
+        direct,
+        "/ip4/192.0.2.60/tcp/4001".parse().expect("addr"),
+        &f.peer,
+    );
+    f.endpoint.poll(now).expect("poll");
+
+    let id = f.endpoint.connect(f.peer.clone(), now).expect("admitted");
+    let mut events = f.endpoint.poll(now).expect("poll");
+    events.extend(f.endpoint.poll(Now::from_millis(1_000)).expect("poll"));
+    assert!(
+        matches!(
+            RelayLegFixture::terminals(&events, id).as_slice(),
+            [ConnectOutcome::Connected { conn_id, .. }] if *conn_id == direct
+        ),
+        "{events:?}"
+    );
+    assert!(
+        f.transport.script().dials.is_empty(),
+        "no relay leg started"
+    );
+    assert_eq!(
+        RelayLegFixture::nat_events_for(&events, id),
+        0,
+        "{events:?}"
+    );
+}
+
+/// The relay leg and the attempt share one deadline. The engine settles the
+/// attempt first; the leg's `ConnectFailed` from the same batch is stale.
+#[cfg(feature = "autonat")]
+#[test]
+fn a_connect_failed_after_the_attempt_settled_is_dropped() {
+    use minip2p_nat::NatEvent;
+
+    let mut f = RelayLegFixture::new(69, true);
+    let id = f
+        .endpoint
+        .connect(f.peer.clone(), Now::from_millis(0))
+        .expect("admitted");
+    f.relay_dial();
+    let deadline = Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS);
+    let engine = &mut f.endpoint.engine;
+    engine.expire_attempts(deadline);
+    assert!(!engine.connect.is_pending(id), "the engine settled first");
+    let nat = engine.nat.as_mut().expect("NAT configured");
+    nat.tick(&mut engine.core, deadline);
+    assert!(
+        nat.unrouted().any(|event| matches!(
+            event,
+            NatEvent::ConnectFailed { connect_id, .. } if *connect_id == id
+        )),
+        "the leg reported its own failure before learning of the settle"
+    );
+    // A stale punch failure is dropped too; it would otherwise reach the
+    // application.
+    nat.push_event(NatEvent::HolePunchFailed {
+        connect_id: id,
+        attempt: 1,
+        reason: "late".into(),
+    });
+    engine.settle(deadline);
+    let events = f.endpoint.poll(deadline).expect("poll");
+    assert!(
+        matches!(
+            RelayLegFixture::terminals(&events, id).as_slice(),
+            [ConnectOutcome::Failed(
+                crate::ConnectFailure::Timeout { .. }
+            )]
+        ),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EndpointEvent::Nat(NatEvent::HolePunchFailed { .. }))),
+        "{events:?}"
+    );
+}
+
+/// Automatic dialing admits and cancels through the same interface: a
+/// `CancelDial` cancels the relay leg inside the sweep that produced it.
+#[cfg(all(feature = "autonat", feature = "_peer-book"))]
+#[test]
+fn a_discovery_cancel_dial_cancels_the_relay_leg_in_the_same_batch() {
+    use minip2p_discovery::{Observation, PeerDiscoveryAgent, PeerDiscoveryConfig};
+
+    let mut f = RelayLegFixture::new(72, true);
+    let book = PeerDiscoveryAgent::new(
+        Ed25519Keypair::from_secret_key_bytes([72; 32]).peer_id(),
+        PeerDiscoveryConfig {
+            // A second peer evicts the first, cancelling its dial.
+            max_known_peers: 1,
+            dial_tie_break: false,
+            ..PeerDiscoveryConfig::default()
+        },
+    )
+    .expect("valid policy");
+    f.endpoint.engine.discovery = Some(crate::discovery::DiscoveryDriver::new(
+        book,
+        #[cfg(feature = "pubsub")]
+        None,
+    ));
+    let observe = |f: &mut RelayLegFixture, peer: PeerId| {
+        f.endpoint
+            .engine
+            .discovery
+            .as_mut()
+            .expect("discovery")
+            .book
+            .observe_beacon(
+                Observation {
+                    peer,
+                    addrs: vec!["/ip4/192.0.2.70/tcp/4001".parse().expect("addr")],
+                },
+                0,
+            );
+    };
+    let now = Now::from_millis(0);
+    let peer = f.peer.clone();
+    observe(&mut f, peer);
+    f.endpoint.poll(now).expect("poll");
+    // The book's dial is the first attempt the endpoint admitted.
+    let id = crate::ConnectId::from_u64(1);
+    assert!(f.endpoint.engine.connect.is_pending(id));
+    let relay_dial = f.relay_dial();
+
+    observe(
+        &mut f,
+        Ed25519Keypair::from_secret_key_bytes([90; 32]).peer_id(),
+    );
+    let events = f.endpoint.poll(now).expect("poll");
+    assert!(!f.endpoint.engine.connect.is_pending(id));
+    assert!(
+        f.transport.closed(relay_dial),
+        "the cancelled leg's cleanup ran in the batch: {events:?}"
+    );
+    assert!(
+        RelayLegFixture::terminals(&events, id).is_empty(),
+        "discovery claims its own terminal: {events:?}"
+    );
+}

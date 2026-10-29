@@ -21,6 +21,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate self as minip2p;
 
+mod connect;
 #[cfg(feature = "_peer-book")]
 mod discovery;
 mod engine;

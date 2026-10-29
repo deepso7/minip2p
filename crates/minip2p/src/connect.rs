@@ -1,22 +1,32 @@
-//! Direct Connection-attempt types and the sans-I/O engine that owns them.
+//! Connection-attempt types and the sans-I/O engine that owns them, shared
+//! by both Endpoint types.
 //!
 //! One [`ConnectId`] covers every candidate Transport dial, relay fallback,
 //! and direct-path upgrade in an attempt. The engine races complete
-//! [`PeerAddr`]s through [`SwarmCore::dial`], observes the NAT relay leg
-//! by reference, and emits exactly one [`EndpointEvent::ConnectSettled`] per
-//! admitted attempt.
+//! [`PeerAddr`]s through [`SwarmCore::dial`] and emits exactly one
+//! [`EndpointEvent::ConnectSettled`] per admitted attempt.
+//!
+//! It also owns the attempt's relay leg end to end (ADR-0008): admission
+//! attaches it while the attempt is still pending, cancellation cancels it,
+//! NAT output is routed through the engine, and every terminal settles it.
+//! The leg provider (the NAT driver, when NAT is compiled in and
+//! configured) is lent to each call as [`Legs`], so no caller forks on NAT;
+//! the provider itself knows nothing of this engine.
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::platform::{Deadline, EntropySource};
-use minip2p_core::{Path, PeerAddr, PeerId, Protocol};
+#[cfg(not(feature = "autonat"))]
+use core::marker::PhantomData;
+
+use minip2p_core::platform::{Deadline, EntropySource, Now};
+use minip2p_core::{Multiaddr, Path, PeerAddr, PeerId, Protocol};
 use minip2p_swarm::{SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, Transport};
 
-use super::event_stream::EndpointEvent;
+use crate::EndpointEvent;
 #[cfg(feature = "autonat")]
 use crate::nat::NatDriver;
 
@@ -613,35 +623,30 @@ impl ConnectEngine {
         }
     }
 
-    #[cfg_attr(
-        all(not(test), not(feature = "autonat")),
-        expect(
-            dead_code,
-            reason = "only NAT-enabled compositions start a relay leg after admit"
-        )
-    )]
     pub(crate) fn is_pending(&self, id: ConnectId) -> bool {
         self.attempts.contains_key(&id)
     }
 
     /// Whether admission left the attempt racing a direct candidate: a dial,
-    /// or a name still resolving into one. The NAT driver reads this snapshot
-    /// at leg-attach time to stagger the relay leg; it does not track later
-    /// direct-dial failures.
+    /// or a name still resolving into one. [`Self::admit`] reads this
+    /// snapshot when it attaches the relay leg, which staggers itself behind
+    /// direct dials; it does not track later direct-dial failures.
     #[cfg(feature = "autonat")]
-    pub(crate) fn dialed_direct(&self, id: ConnectId) -> bool {
+    fn dialed_direct(&self, id: ConnectId) -> bool {
         self.attempts.get(&id).is_some_and(Attempt::racing_direct)
     }
 
-    /// When the pending attempt expires, in monotonic ms. The NAT driver
+    /// When the pending attempt expires, in monotonic ms. [`Self::admit`]
     /// hands it to the relay leg so relays split time the attempt has.
     #[cfg(feature = "autonat")]
-    pub(crate) fn expires_ms(&self, id: ConnectId) -> Option<u64> {
+    fn expires_ms(&self, id: ConnectId) -> Option<u64> {
         self.attempts.get(&id).map(|attempt| attempt.expires_ms)
     }
 
-    /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
-    pub(crate) fn cancel<T: Transport, E: EntropySource>(
+    /// Cancels the attempt in this engine alone (see [`Self::cancel`] for
+    /// its relay leg). Idempotent. Settled or unknown ids are a no-op. Never
+    /// disconnects.
+    fn abort_attempt<T: Transport, E: EntropySource>(
         &mut self,
         id: ConnectId,
         runtime: &mut SwarmCore<T, E>,
@@ -892,11 +897,9 @@ impl ConnectEngine {
         }
     }
 
-    pub(crate) fn tick<T: Transport, E: EntropySource>(
-        &mut self,
-        runtime: &mut SwarmCore<T, E>,
-        now_ms: u64,
-    ) {
+    /// Settles attempts whose deadline passed and ends lapsed kept-dial
+    /// windows; see [`Self::expire`].
+    fn tick<T: Transport, E: EntropySource>(&mut self, runtime: &mut SwarmCore<T, E>, now_ms: u64) {
         let lapsed: Vec<PeerId> = self
             .retained
             .iter()
@@ -969,11 +972,11 @@ impl ConnectEngine {
     /// Names the path of every queued Connected terminal whose connection's
     /// own lifecycle event has been observed: Relayed through a circuit's
     /// recorded relay, else Punched when `punched` says NAT recorded a punch
-    /// on it, else Direct. The Endpoint engine calls this as soon as the
-    /// step that settled them (or, for one settled ahead of that event, the
-    /// event's ingest) ends: NAT has recorded a punch, and no later event of
-    /// the batch has ended the connection yet.
-    pub(crate) fn resolve_paths(&mut self, mut punched: impl FnMut(ConnectionId) -> bool) {
+    /// on it, else Direct. [`Self::route`] and [`Self::expire`] run this as
+    /// soon as the step that settled them (or, for one settled ahead of that
+    /// event, the event's ingest) ends: NAT has recorded a punch, and no
+    /// later event of the batch has ended the connection yet.
+    fn resolve_paths(&mut self, mut punched: impl FnMut(ConnectionId) -> bool) {
         if self.unresolved == 0 {
             return;
         }
@@ -1005,7 +1008,7 @@ impl ConnectEngine {
     }
 
     /// Pops the next terminal once [`Self::resolve_paths`] has named its path.
-    pub(crate) fn pop_event(&mut self) -> Option<EndpointEvent> {
+    fn pop_event(&mut self) -> Option<EndpointEvent> {
         match self.events.pop_front()? {
             Terminal::Settled(event) => Some(event),
             unresolved => {
@@ -1075,8 +1078,9 @@ impl ConnectEngine {
         }
     }
 
+    /// Applies one routed NAT event to the attempt it names.
     #[cfg(feature = "autonat")]
-    pub(crate) fn observe_nat<T: Transport, E: EntropySource>(
+    fn observe_nat<T: Transport, E: EntropySource>(
         &mut self,
         event: &minip2p_nat::NatEvent,
         runtime: &mut SwarmCore<T, E>,
@@ -1246,11 +1250,17 @@ pub(crate) fn circuit_relay<T: Transport, E: EntropySource>(
 }
 
 /// What one Connection attempt should dial: the peer, its candidate
-/// addresses, and whether a relay leg may race them.
+/// addresses, whether a relay leg may race them, and every address known
+/// for the peer.
 pub(crate) struct ConnectAdmission {
     pub(crate) peer: PeerId,
     pub(crate) candidates: Vec<PeerAddr>,
     pub(crate) allow_relay: bool,
+    /// Every address known for the peer from any source, circuit addresses
+    /// included. Circuit addresses tell the relay leg where the peer holds a
+    /// reservation; they are not among the direct `candidates`, so the
+    /// caller hands them over here.
+    pub(crate) targets: Vec<Multiaddr>,
 }
 
 /// What admission's `expand` step made of one candidate address.
@@ -1273,82 +1283,299 @@ pub(crate) enum Expansion {
     Refused(String),
 }
 
-/// Admits one Connection attempt for `peer`: selects the relay policy from
-/// the NAT driver, expands each candidate through `expand` (Name resolution
-/// on std, identity on portable), and starts direct dials. Both Endpoint
-/// types run this; only the injected `expand` differs. Under `force_relay`
-/// direct candidates are discarded unexpanded, so no name is looked up for
-/// them.
-///
-/// When the attempt stays pending, the caller attaches its NAT leg with
-/// [`NatDriver::attach_leg`].
-pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
-    connect: &mut ConnectEngine,
-    runtime: &mut SwarmCore<T, E>,
-    #[cfg(feature = "autonat")] nat: Option<&NatDriver<T>>,
-    admission: ConnectAdmission,
-    expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
-    now_ms: u64,
-) -> ConnectId {
-    let ConnectAdmission {
-        peer,
-        candidates,
-        allow_relay,
-    } = admission;
+/// Where an engine keeps its relay-leg provider: the NAT driver once NAT is
+/// configured, and nothing in a build without NAT. Lend it to one
+/// Connection-attempt call with [`Legs::of`].
+#[cfg(feature = "autonat")]
+pub(crate) type LegProvider<T> = Option<NatDriver<T>>;
+/// Where an engine keeps its relay-leg provider: nothing, without NAT.
+#[cfg(not(feature = "autonat"))]
+pub(crate) type LegProvider<T> = PhantomData<fn(T)>;
 
+/// The relay-leg provider lent to one Connection-attempt call. The engine
+/// reaches the NAT driver only through its leg primitives (register, cancel,
+/// settle, and its raw event queue), so callers never fork on whether NAT is
+/// compiled in.
+pub(crate) struct Legs<'a, T> {
     #[cfg(feature = "autonat")]
-    let relay = match &nat {
-        Some(driver) if allow_relay && driver.has_relay() => {
-            if driver.force_relay() {
-                RelayPolicy::Forced
-            } else if driver.dcutr() {
-                RelayPolicy::Race
-            } else {
-                RelayPolicy::RaceWithoutUpgrade
+    nat: Option<&'a mut NatDriver<T>>,
+    #[cfg(not(feature = "autonat"))]
+    provider: PhantomData<&'a mut LegProvider<T>>,
+}
+
+impl<'a, T: Transport> Legs<'a, T> {
+    /// Lends `provider` for one call.
+    pub(crate) fn of(provider: &'a mut LegProvider<T>) -> Self {
+        #[cfg(feature = "autonat")]
+        {
+            Self {
+                nat: provider.as_mut(),
             }
         }
-        _ => RelayPolicy::None,
-    };
-    #[cfg(not(feature = "autonat"))]
-    let relay = RelayPolicy::None;
-    #[cfg(not(feature = "autonat"))]
-    let _ = allow_relay;
-
-    let candidates = if matches!(relay, RelayPolicy::Forced) {
-        Vec::new()
-    } else {
-        candidates
-    };
-    let mut sorted = Candidates::default();
-    for addr in candidates {
-        match expand(&addr) {
-            Expansion::Ready(addrs) => sorted.ready.extend(addrs),
-            Expansion::Resolving => sorted.resolving.push(addr),
-            Expansion::Refused(reason) => sorted.refused.push(CandidateFailure { addr, reason }),
+        #[cfg(not(feature = "autonat"))]
+        {
+            let _ = provider;
+            Self {
+                provider: PhantomData,
+            }
         }
     }
 
-    connect.connect_candidates(peer, sorted, relay, runtime, now_ms)
-}
+    /// Lends the same provider again, for a caller that makes several calls.
+    #[cfg_attr(
+        not(feature = "_peer-book"),
+        expect(dead_code, reason = "only the discovery sweep makes several calls")
+    )]
+    pub(crate) fn reborrow(&mut self) -> Legs<'_, T> {
+        Legs {
+            #[cfg(feature = "autonat")]
+            nat: self.nat.as_deref_mut(),
+            #[cfg(not(feature = "autonat"))]
+            provider: PhantomData,
+        }
+    }
 
-/// Cancels `id`, routing through the NAT driver (engine cancel plus relay
-/// leg) when the composition has one and through the engine alone
-/// otherwise. Returns `true` when a leg was cancelled and the driver must
-/// `pump` the queued actions.
-#[cfg(feature = "autonat")]
-pub(crate) fn cancel_attempt<T: Transport, E: EntropySource>(
-    connect: &mut ConnectEngine,
-    nat: Option<&mut NatDriver<T>>,
-    id: ConnectId,
-    runtime: &mut SwarmCore<T, E>,
-    now: minip2p_core::platform::Now,
-) -> bool {
-    match nat {
-        Some(nat) => nat.cancel_leg(connect, id, runtime, now),
-        None => {
-            connect.cancel(id, runtime);
+    /// How an admitted attempt may use a relay: not at all without a
+    /// configured relay (or when `allow_relay` is off), else as NAT is
+    /// configured.
+    fn relay_policy(&self, allow_relay: bool) -> RelayPolicy {
+        #[cfg(feature = "autonat")]
+        if let Some(nat) = self.nat.as_deref()
+            && allow_relay
+            && nat.has_relay()
+        {
+            return if nat.force_relay() {
+                RelayPolicy::Forced
+            } else if nat.dcutr() {
+                RelayPolicy::Race
+            } else {
+                RelayPolicy::RaceWithoutUpgrade
+            };
+        }
+        let _ = allow_relay;
+        RelayPolicy::None
+    }
+
+    fn is_punched(&self, conn_id: ConnectionId) -> bool {
+        #[cfg(feature = "autonat")]
+        {
+            self.nat
+                .as_deref()
+                .is_some_and(|nat| nat.is_punched(conn_id))
+        }
+        #[cfg(not(feature = "autonat"))]
+        {
+            let _ = conn_id;
             false
         }
+    }
+}
+
+/// Whether NAT's hole punch produced `conn_id` (always `false` without
+/// NAT), for naming a live connection's path.
+pub(crate) fn is_punched<T: Transport>(provider: &LegProvider<T>, conn_id: ConnectionId) -> bool {
+    #[cfg(feature = "autonat")]
+    {
+        provider.as_ref().is_some_and(|nat| nat.is_punched(conn_id))
+    }
+    #[cfg(not(feature = "autonat"))]
+    {
+        let _ = (provider, conn_id);
+        false
+    }
+}
+
+/// `ConnectFailed` and `FellBackToRelay` are attempt terminals the engine
+/// already reports as `ConnectSettled`, so they are not repeated to the
+/// application.
+#[cfg(feature = "autonat")]
+fn reaches_application(event: &minip2p_nat::NatEvent) -> bool {
+    use minip2p_nat::NatEvent;
+    !matches!(
+        event,
+        NatEvent::ConnectFailed { .. } | NatEvent::FellBackToRelay { .. }
+    )
+}
+
+/// Events that speak for a still-pending attempt's outcome. Once the engine
+/// settled the attempt, they are stale and dropped.
+#[cfg(feature = "autonat")]
+fn is_attempt_outcome(event: &minip2p_nat::NatEvent) -> bool {
+    use minip2p_nat::NatEvent;
+    matches!(
+        event,
+        NatEvent::ConnectFailed { .. }
+            | NatEvent::FellBackToRelay { .. }
+            | NatEvent::HolePunchFailed { .. }
+    )
+}
+
+/// The Connection-attempt lifecycle both Endpoint types drive, relay leg
+/// included: [`Self::admit`], then [`Self::route`] after every step that can
+/// make the leg provider speak, [`Self::cancel`], and [`Self::pop_terminal`]
+/// for each terminal. Each takes the provider as [`Legs`].
+impl ConnectEngine {
+    /// Admits one Connection attempt: selects the relay policy from the leg
+    /// provider, expands each candidate through `expand` (Name resolution on
+    /// std, identity on portable), starts direct dials, and attaches the
+    /// relay leg while the attempt is still pending. Under `force_relay`
+    /// direct candidates are discarded unexpanded, so no name is looked up
+    /// for them. An attempt that settles at once (the peer is already
+    /// connected, or nothing can be dialed) attaches no leg; its terminal is
+    /// queued.
+    pub(crate) fn admit<T: Transport, E: EntropySource>(
+        &mut self,
+        mut legs: Legs<'_, T>,
+        core: &mut SwarmCore<T, E>,
+        admission: ConnectAdmission,
+        expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
+        now: Now,
+    ) -> ConnectId {
+        let ConnectAdmission {
+            peer,
+            candidates,
+            allow_relay,
+            targets,
+        } = admission;
+        let relay = legs.relay_policy(allow_relay);
+        let candidates = if matches!(relay, RelayPolicy::Forced) {
+            Vec::new()
+        } else {
+            candidates
+        };
+        let mut sorted = Candidates::default();
+        for addr in candidates {
+            match expand(&addr) {
+                Expansion::Ready(addrs) => sorted.ready.extend(addrs),
+                Expansion::Resolving => sorted.resolving.push(addr),
+                Expansion::Refused(reason) => {
+                    sorted.refused.push(CandidateFailure { addr, reason });
+                }
+            }
+        }
+        let id = self.connect_candidates(peer.clone(), sorted, relay, core, now.monotonic_ms);
+        #[cfg(feature = "autonat")]
+        if let Some(nat) = legs.nat.as_deref_mut()
+            && self.is_pending(id)
+        {
+            nat.connect(
+                id,
+                peer,
+                minip2p_nat::ConnectLegs {
+                    direct_racing: self.dialed_direct(id),
+                    allow_relay,
+                    target_addrs: targets,
+                    deadline_ms: self.expires_ms(id),
+                },
+                core,
+                now,
+            );
+        }
+        #[cfg(not(feature = "autonat"))]
+        let _ = (&mut legs, peer, targets);
+        id
+    }
+
+    /// Cancels a pending attempt: its direct dials, then its relay leg,
+    /// whose cleanup runs before this returns. Settled or unknown ids are a
+    /// no-op, so a relayed circuit an attempt already settled on stays open
+    /// even while its terminal is still queued. Never disconnects.
+    pub(crate) fn cancel<T: Transport, E: EntropySource>(
+        &mut self,
+        mut legs: Legs<'_, T>,
+        core: &mut SwarmCore<T, E>,
+        id: ConnectId,
+        now: Now,
+    ) {
+        if !self.is_pending(id) {
+            return;
+        }
+        self.abort_attempt(id, core);
+        #[cfg(feature = "autonat")]
+        if let Some(nat) = legs.nat.as_deref_mut() {
+            nat.cancel(id, core, now);
+        }
+        #[cfg(not(feature = "autonat"))]
+        let _ = (&mut legs, now);
+    }
+
+    /// Routes every event the leg provider produced since the last call,
+    /// each exactly once: an attempt outcome for an attempt already settled
+    /// is dropped as stale; the rest updates the attempt it names, then is
+    /// staged for the Endpoint event stream unless `owned` claims its
+    /// attempt (discovery's automatic dials) or it is an attempt terminal
+    /// this engine reports as `ConnectSettled` instead. Then names the paths
+    /// of what settled meanwhile.
+    ///
+    /// Call it after every swarm event and every step that can make the
+    /// provider speak, so attempts see NAT output in step with its cause.
+    pub(crate) fn route<T: Transport, E: EntropySource>(
+        &mut self,
+        mut legs: Legs<'_, T>,
+        core: &mut SwarmCore<T, E>,
+        owned: impl Fn(ConnectId) -> bool,
+        now: Now,
+    ) {
+        #[cfg(feature = "autonat")]
+        if let Some(nat) = legs.nat.as_deref_mut() {
+            while let Some(event) = nat.take_unrouted() {
+                // An outcome produced in the turn the attempt settled,
+                // before the agent learned of it.
+                if is_attempt_outcome(&event)
+                    && event.connect_id().is_some_and(|id| !self.is_pending(id))
+                {
+                    continue;
+                }
+                self.observe_nat(&event, core, now.monotonic_ms);
+                if !event.connect_id().is_some_and(&owned) && reaches_application(&event) {
+                    nat.stage(event);
+                }
+            }
+        }
+        #[cfg(not(feature = "autonat"))]
+        let _ = (&mut legs, core, owned, now);
+        self.resolve_paths(|conn_id| legs.is_punched(conn_id));
+    }
+
+    /// Settles attempts whose deadline passed, then names their paths.
+    pub(crate) fn expire<T: Transport, E: EntropySource>(
+        &mut self,
+        legs: Legs<'_, T>,
+        core: &mut SwarmCore<T, E>,
+        now: Now,
+    ) {
+        self.tick(core, now.monotonic_ms);
+        self.resolve_paths(|conn_id| legs.is_punched(conn_id));
+    }
+
+    /// Pops the next terminal and settles its relay leg: the provider drops
+    /// what it holds for the attempt and emits nothing more for it, keeping
+    /// a Connected terminal's connection open. The leg's cleanup can produce
+    /// more provider output, so [`Self::route`] runs before every pop.
+    pub(crate) fn pop_terminal<T: Transport, E: EntropySource>(
+        &mut self,
+        mut legs: Legs<'_, T>,
+        core: &mut SwarmCore<T, E>,
+        now: Now,
+    ) -> Option<EndpointEvent> {
+        let event = self.pop_event()?;
+        #[cfg(feature = "autonat")]
+        if let Some(nat) = legs.nat.as_deref_mut()
+            && let EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome,
+                ..
+            } = &event
+        {
+            let kept = match outcome {
+                ConnectOutcome::Connected { conn_id, .. } => Some(*conn_id),
+                ConnectOutcome::Failed(_) | ConnectOutcome::Cancelled => None,
+            };
+            nat.settled(*connect_id, kept, core, now);
+        }
+        #[cfg(not(feature = "autonat"))]
+        let _ = (&mut legs, core, now);
+        Some(event)
     }
 }
 
@@ -1863,7 +2090,7 @@ mod tests {
         let mut runtime = runtime(FakeTransport::default());
         let mut engine = ConnectEngine::new(30_000);
         let id = engine.connect(target.into(), &mut runtime, 0);
-        engine.cancel(id, &mut runtime);
+        engine.abort_attempt(id, &mut runtime);
         match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
@@ -1873,9 +2100,9 @@ mod tests {
             other => panic!("expected Cancelled, got {other:?}"),
         }
         assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
-        engine.cancel(id, &mut runtime);
+        engine.abort_attempt(id, &mut runtime);
         assert!(engine.pop_resolved().is_none());
-        engine.cancel(ConnectId::from_u64(99), &mut runtime);
+        engine.abort_attempt(ConnectId::from_u64(99), &mut runtime);
         assert!(engine.pop_resolved().is_none());
         assert_eq!(runtime.transport().closes.len(), 1);
     }
@@ -1910,7 +2137,7 @@ mod tests {
             }
             other => panic!("expected Connected, got {other:?}"),
         }
-        engine.cancel(id, &mut runtime);
+        engine.abort_attempt(id, &mut runtime);
         assert!(engine.pop_resolved().is_none());
         assert_eq!(runtime.connected_peers(), vec![peer]);
     }
@@ -2372,7 +2599,7 @@ mod tests {
         let mut engine = ConnectEngine::new(30_000);
         let id = engine.connect(target.clone().into(), &mut runtime, 0);
         let conn_id = ConnectionId::new(1);
-        engine.cancel(id, &mut runtime);
+        engine.abort_attempt(id, &mut runtime);
         match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
@@ -2420,7 +2647,7 @@ mod tests {
         // failed abort so the candidate is restored + vetoed.
         let id = engine.connect(target.clone().into(), &mut runtime, 0);
         assert_eq!(runtime.transport().dials, vec![target.clone()]);
-        engine.cancel(id, &mut runtime);
+        engine.abort_attempt(id, &mut runtime);
         match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
@@ -2577,7 +2804,7 @@ mod tests {
         // NAT leg on this: after Connected, cancel is a no-op and must not
         // tear down a provisional relayed path still held by NatAgent.
         assert!(!engine.is_pending(id));
-        engine.cancel(id, &mut runtime);
+        engine.abort_attempt(id, &mut runtime);
         assert!(engine.pop_resolved().is_none());
         assert!(settled_for(&drain(&mut engine, &mut runtime, 1_001), id).is_none());
     }
@@ -2658,7 +2885,7 @@ mod tests {
         let conn = circuit(4);
         runtime.transport_mut().push_circuit(conn, peer.clone());
         let _ = drain(&mut engine, &mut runtime, 0);
-        engine.cancel(id, &mut runtime);
+        engine.abort_attempt(id, &mut runtime);
         match engine.pop_resolved() {
             Some(EndpointEvent::ConnectSettled {
                 connect_id,
@@ -2667,7 +2894,7 @@ mod tests {
             }) if connect_id == id => {}
             other => panic!("expected Cancelled, got {other:?}"),
         }
-        engine.cancel(id, &mut runtime);
+        engine.abort_attempt(id, &mut runtime);
         assert!(engine.pop_resolved().is_none());
     }
 

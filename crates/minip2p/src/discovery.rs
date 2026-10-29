@@ -14,17 +14,11 @@ use minip2p_discovery::{BeaconAction, BeaconAgent, BeaconEvent};
 use minip2p_discovery::{DiscoveryAction, DiscoverySource, PeerDiscoveryAgent};
 #[cfg(feature = "mdns")]
 use minip2p_mdns::MdnsEvent;
-#[cfg(feature = "autonat")]
-use minip2p_nat::NatEvent;
 #[cfg(feature = "pubsub")]
 use minip2p_pubsub::GossipsubEvent;
 use minip2p_swarm::{SwarmCore, SwarmEvent};
 
-#[cfg(feature = "autonat")]
-use crate::nat::NatDriver;
-#[cfg(feature = "autonat")]
-use crate::portable::connect::cancel_attempt;
-use crate::portable::connect::{ConnectAdmission, ConnectEngine, Expansion, admit_connect};
+use crate::connect::{ConnectAdmission, ConnectEngine, Expansion, Legs};
 #[cfg(feature = "pubsub")]
 use crate::pubsub::GossipsubDriver;
 use crate::{ConnectOutcome, EndpointEvent};
@@ -53,40 +47,6 @@ fn direct_candidates(addrs: &[Multiaddr], peer: &PeerId) -> Vec<PeerAddr> {
         .into_iter()
         .filter_map(|addr| PeerAddr::new(addr, peer.clone()).ok())
         .collect()
-}
-
-/// An admitted attempt awaiting `NatDriver::attach_leg`.
-#[cfg_attr(
-    not(feature = "autonat"),
-    expect(
-        dead_code,
-        reason = "only NAT compositions apply DiscoveryNatWork and read the fields"
-    )
-)]
-pub(crate) struct PendingLeg {
-    /// The admitted attempt.
-    pub(crate) id: ConnectId,
-    /// Its target peer.
-    pub(crate) peer: PeerId,
-    /// Whether a relay leg may race its direct dials.
-    pub(crate) allow_relay: bool,
-    /// Every address the source announced, circuit addresses included.
-    pub(crate) addrs: Vec<Multiaddr>,
-}
-
-/// NAT-driver work a [`DiscoveryDriver::sweep`] or
-/// [`DiscoveryDriver::shutdown`] queued, for `NatDriver::apply_sweep_work`.
-#[derive(Default)]
-#[must_use = "apply with NatDriver::apply_sweep_work or the queued NAT work is lost"]
-pub(crate) struct DiscoveryNatWork {
-    /// Newly admitted attempts awaiting `NatDriver::attach_leg`.
-    pub(crate) legs: Vec<PendingLeg>,
-    /// A NAT leg was cancelled; `NatDriver::pump` must run once.
-    #[cfg_attr(
-        not(feature = "autonat"),
-        expect(dead_code, reason = "only NAT compositions pump after a cancelled leg")
-    )]
-    pub(crate) pump: bool,
 }
 
 /// Coordinates source observations, the shared peer book, and automatic
@@ -144,14 +104,11 @@ impl DiscoveryDriver {
         Deadline::earliest_opt(self.book.next_deadline(now), beacon)
     }
 
-    /// Whether `event` belongs to an attempt automatic dialing owns: NAT
-    /// routing consumes those after the Connection engine observes them,
-    /// so they never reach the application.
-    #[cfg(feature = "autonat")]
-    pub(crate) fn owns_nat_event(&self, event: &NatEvent) -> bool {
-        event
-            .connect_id()
-            .is_some_and(|id| self.inflight.contains_key(&id))
+    /// Whether automatic dialing owns attempt `id`: NAT routing consumes
+    /// its NAT events after the Connection engine observes them, so they
+    /// never reach the application.
+    pub(crate) fn owns_attempt(&self, id: ConnectId) -> bool {
+        self.inflight.contains_key(&id)
     }
 
     /// Observes connection lifecycle for the book, whichever driver claimed
@@ -224,21 +181,19 @@ impl DiscoveryDriver {
     /// Feed queued mDNS observations with [`Self::handle_mdns_event`] first:
     /// they are part of the same fixpoint as beacon and book output.
     ///
-    /// NAT legs for attempts admitted here and pumps for cancelled legs are
-    /// returned as [`DiscoveryNatWork`]; the endpoint applies them with
-    /// `NatDriver::apply_sweep_work`, and routes the NAT events that
-    /// produces afterwards. On the standard Endpoint `expand` starts Name
-    /// resolution off the driver, so a sweep never blocks on a lookup.
+    /// Automatic dials are admitted and cancelled through `connect`, relay
+    /// legs included, as they happen; the endpoint routes the NAT events
+    /// that produces afterwards. On the standard Endpoint `expand` starts
+    /// Name resolution off the driver, so a sweep never blocks on a lookup.
     pub(crate) fn sweep<T: Transport, E: EntropySource>(
         &mut self,
         #[cfg(feature = "pubsub")] mut pubsub: Option<&mut GossipsubDriver>,
-        #[cfg(feature = "autonat")] mut nat: Option<&mut NatDriver<T>>,
+        mut legs: Legs<'_, T>,
         connect: &mut ConnectEngine,
         runtime: &mut SwarmCore<T, E>,
         expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
         now: Now,
-    ) -> DiscoveryNatWork {
-        let mut work = DiscoveryNatWork::default();
+    ) {
         let now_ms = now.monotonic_ms;
         loop {
             let mut progressed = false;
@@ -331,39 +286,30 @@ impl DiscoveryDriver {
                         addrs,
                         source,
                     } => {
-                        let allow_relay = source == DiscoverySource::SignedBeacon;
-                        let candidates = direct_candidates(&addrs, &peer);
-                        let id = admit_connect(
-                            connect,
+                        let id = connect.admit(
+                            legs.reborrow(),
                             runtime,
-                            #[cfg(feature = "autonat")]
-                            nat.as_deref(),
                             ConnectAdmission {
+                                candidates: direct_candidates(&addrs, &peer),
                                 peer: peer.clone(),
-                                candidates,
-                                allow_relay,
+                                allow_relay: source == DiscoverySource::SignedBeacon,
+                                // Every address the source announced, circuit
+                                // addresses included.
+                                targets: addrs,
                             },
                             expand,
-                            now_ms,
+                            now,
                         );
-                        self.inflight.insert(id, peer.clone());
-                        work.legs.push(PendingLeg {
-                            id,
-                            peer,
-                            allow_relay,
-                            addrs,
-                        });
+                        self.inflight.insert(id, peer);
                     }
                     DiscoveryAction::CancelDial { peer } => {
-                        self.cancel_peer(
-                            &peer,
-                            connect,
-                            #[cfg(feature = "autonat")]
-                            nat.as_deref_mut(),
-                            runtime,
-                            now,
-                            &mut work,
-                        );
+                        let active = self
+                            .inflight
+                            .iter()
+                            .find_map(|(id, candidate)| (*candidate == peer).then_some(*id));
+                        if let Some(id) = active {
+                            connect.cancel(legs.reborrow(), runtime, id, now);
+                        }
                     }
                 }
             }
@@ -371,70 +317,22 @@ impl DiscoveryDriver {
                 break;
             }
         }
-        work
     }
 
-    #[cfg_attr(
-        not(feature = "autonat"),
-        expect(
-            unused_variables,
-            reason = "NAT leg cancellation is the only user of now and work"
-        )
-    )]
-    fn cancel_peer<T: Transport, E: EntropySource>(
-        &mut self,
-        peer: &PeerId,
-        connect: &mut ConnectEngine,
-        #[cfg(feature = "autonat")] nat: Option<&mut NatDriver<T>>,
-        runtime: &mut SwarmCore<T, E>,
-        now: Now,
-        work: &mut DiscoveryNatWork,
-    ) {
-        let active = self
-            .inflight
-            .iter()
-            .find_map(|(id, candidate)| (candidate == peer).then_some(*id));
-        if let Some(id) = active {
-            #[cfg(feature = "autonat")]
-            {
-                work.pump |= cancel_attempt(connect, nat, id, runtime, now);
-            }
-            #[cfg(not(feature = "autonat"))]
-            connect.cancel(id, runtime);
-        }
-    }
-
-    /// Cancels all discovery-owned attempts during endpoint shutdown. The
-    /// returned work carries whether the NAT driver must pump afterwards.
+    /// Cancels all discovery-owned attempts, relay legs included, during
+    /// endpoint shutdown.
     #[cfg(feature = "mdns")]
-    #[cfg_attr(
-        not(feature = "autonat"),
-        expect(
-            unused_mut,
-            unused_variables,
-            reason = "NAT leg cancellation is the only user of now and pump"
-        )
-    )]
     pub(crate) fn shutdown<T: Transport, E: EntropySource>(
         &mut self,
         connect: &mut ConnectEngine,
-        #[cfg(feature = "autonat")] mut nat: Option<&mut NatDriver<T>>,
+        mut legs: Legs<'_, T>,
         runtime: &mut SwarmCore<T, E>,
         now: Now,
-    ) -> DiscoveryNatWork {
-        let mut work = DiscoveryNatWork::default();
-        let attempts: Vec<ConnectId> = self.inflight.keys().copied().collect();
-        for id in attempts {
-            #[cfg(feature = "autonat")]
-            {
-                work.pump |= cancel_attempt(connect, nat.as_deref_mut(), id, runtime, now);
-            }
-            #[cfg(not(feature = "autonat"))]
-            connect.cancel(id, runtime);
+    ) {
+        for id in core::mem::take(&mut self.inflight).into_keys() {
+            connect.cancel(legs.reborrow(), runtime, id, now);
         }
-        self.inflight.clear();
         self.book.reset_dials();
-        work
     }
 }
 
