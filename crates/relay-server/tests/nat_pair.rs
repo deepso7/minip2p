@@ -153,10 +153,15 @@ impl NatSwarm for ClientSwarm {
     }
 }
 
-/// The one control or payload write the relay issued since the last call.
+/// The one control or payload write the relay issued since the last call,
+/// with no stream reset alongside it.
 fn relay_send(server: &mut Node) -> (StreamKey, Vec<u8>) {
-    let sends: Vec<_> = server
-        .calls()
+    let calls = server.calls();
+    assert!(
+        !calls.iter().any(|call| matches!(call, Call::Reset { .. })),
+        "unexpected relay reset: {calls:?}"
+    );
+    let sends: Vec<_> = calls
         .into_iter()
         .filter_map(|call| match call {
             Call::Send { stream, data, .. } => Some((stream, data)),
