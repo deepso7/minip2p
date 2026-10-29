@@ -31,11 +31,11 @@ crates/minip2p/src/std/relay_server  I/O adapter and Endpoint composition.
 ```
 
 - `crates/relay` owns protobuf messages, the 8 KiB frame boundary, protocol identifiers, status encoding, and per-stream client/server machines. It owns no reservation table, clock, admission policy, or forwarding policy.
-- `crates/relay-server` owns reservations, circuits, limiters, deadlines, admission, forwarding actions, byte accounting, and public lifecycle events. It is `no_std + alloc` and uses `minip2p_core::platform::Now`.
+- `crates/relay-server` owns reservations, circuits, limiters, deadlines, admission, forwarding, byte accounting, and public lifecycle events. It is `no_std + alloc` and uses `minip2p_core::platform::Now`.
 - `crates/swarm` exposes only the deeper mechanisms shared by NAT and the relay server. It does not learn relay policy.
 - `crates/minip2p` owns feature composition, the driver, address contributions, blocking waits, and the application-facing API.
 
-Actions, action tokens, `StreamKey`, pending-control records, and driver plumbing remain public only where needed by low-level `minip2p-relay-server` embedders. They are not re-exported from `minip2p`.
+The `RelaySwarm` seam, `StreamKey`, and driver plumbing remain public only where needed by low-level `minip2p-relay-server` embedders. They are not re-exported from `minip2p`.
 
 ## Frozen public API
 
@@ -197,7 +197,7 @@ Emit each `ReservationDenied`/`CircuitDenied` once when the agent makes the stab
 
 ### Low-level agent/driver seam
 
-`minip2p-relay-server` exposes the caller-driven seam needed by non-Endpoint hosts without lifting it into `minip2p`:
+`minip2p-relay-server` exposes the caller-driven seam needed by non-Endpoint hosts without lifting it into `minip2p`. Revised by #443: the agent drives a borrowed swarm instead of emitting tokenized actions, as NAT does with `NatSwarm` (#231).
 
 ```rust
 pub struct StreamKey {
@@ -205,35 +205,33 @@ pub struct StreamKey {
     pub stream_id: StreamId,
 }
 
-pub enum RelayServerAction {
-    OpenStream {
-        token: RelayServerToken,
-        peer_id: PeerId,
-        expected_conn_id: ConnectionId,
-        protocol_id: String,
-    },
-    SendStream {
-        token: RelayServerToken,
-        peer_id: PeerId,
-        stream: StreamKey,
-        data: Vec<u8>,
-    },
-    CloseStreamWrite {
-        token: RelayServerToken,
-        peer_id: PeerId,
-        stream: StreamKey,
-    },
-    ResetStream {
-        token: RelayServerToken,
-        peer_id: PeerId,
-        stream: StreamKey,
-    },
+pub struct RelaySwarmError(pub DriverError);
+
+pub trait RelaySwarm {
+    fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr>;
+    fn open_stream(&mut self, peer: &PeerId, protocol_id: &str, now_ms: u64)
+        -> Result<StreamKey, RelaySwarmError>;
+    fn send_stream(&mut self, peer: &PeerId, stream: StreamKey, data: Bytes, now_ms: u64)
+        -> Result<(), RelaySwarmError>;
+    fn ack_stream(&mut self, stream: StreamKey, bytes: usize);
+    fn close_stream_write(&mut self, peer: &PeerId, stream: StreamKey, now_ms: u64)
+        -> Result<(), RelaySwarmError>;
+    fn reset_stream(&mut self, peer: &PeerId, stream: StreamKey, now_ms: u64)
+        -> Result<(), RelaySwarmError>;
 }
 ```
 
-`RelayServerToken` is opaque. The driver echoes every result through the matching `stream_open_result`, `send_stream_result`, `close_stream_write_result`, or `reset_stream_result` method with `Now`; operation failures carry an allocated diagnostic string. Open success includes the actual `StreamKey`, which the agent verifies against `expected_conn_id`. Unknown/stale tokens are ignored after any necessary successful-open cleanup.
+`minip2p-relay-server` implements `RelaySwarm` for `SwarmCore`. That impl absorbs the filtering the host used to do: an ack or reset on a stream or connection already gone is harmless, while any other ack failure is an accounting violation (`debug_assert`).
 
-`RelayServerAgent` exposes `new`, `set_accepting`, atomic `replace_announce_addrs`, `set_confirmed_addrs`, `set_listener_addrs`, `selected_addrs`, `set_connection_addr`, `handle_event`, `handle_tick`, the four result methods, `poll_action`, `poll_event`, `next_deadline`, `owns_stream`, and `is_idle`. `handle_event` receives the driver's direct-versus-circuit classification and returns whether the event was claimed. The driver calls `handle_tick(now)` before delivering any event sampled at the same `now`, which enforces deadline-first ordering. After each claimed input, the driver must drain actions and echo their synchronous results to quiescence before delivering the next transport event; this is the load-bearing bound that keeps payload backpressure in transport queues rather than an unbounded agent queue.
+`RelayServerAgent` exposes `new`, `register_swarm_roles`, `set_accepting`, atomic `replace_announce_addrs`, `set_confirmed_addrs`, `set_listener_addrs`, `selected_addrs`, `handle_event(swarm, event, is_circuit, now)`, `handle_tick(swarm, now)`, `poll_event`, `next_deadline`, `owns_stream`, `reservation_count`, and `circuit_count`. The swarm is passed into each call and never stored. `handle_event` receives the driver's direct-versus-circuit classification and returns whether the event was claimed; the agent reads each new connection's remote address (its admission key) from the swarm. The first event at each `now` runs the deadline sweep before dispatch, which enforces deadline-first ordering.
+
+Every command runs inline and its result is applied before the call returns: a send that commits a reservation or circuit commits it at once, a forwarding `Full { unsent }` holds the tail until the leg's `StreamWritable` (ADR 0012), and a failed or `Full` control reply resets its stream and stops that HOP worker, so no later responder output (its FIN) runs. Nothing the agent issued is outstanding between calls, so there is no stale-result handling except for the one genuinely asynchronous command, the STOP open. `open_stream` returns the `StreamKey` at once; the agent checks it landed on the reservation's exact connection (and resets it and answers `NO_RESERVATION` otherwise), then settles it from `StreamReady`, `StreamClosed`, or the `SwarmEvent::Error` naming the stream, or from `ConnectionClosed` / `ConnectionReplaced`.
+
+Decisions recorded with #443:
+
+1. **A cancelled STOP open stays owned until it ends.** `SwarmCore::reset_stream` rejects a stream still negotiating, so a circuit abandoned before its STOP stream is ready (HOP or STOP timeout, source close, an open on the wrong connection) keeps a bounded record of that stream. Its late `StreamReady` resets it; the relay claims its events until `StreamClosed`, its negotiation error, or its connection's close drops the record. A negotiated STOP stream given up the same way is reset at once and claimed the same way. No `abandon_stream` swarm operation is added.
+2. **Deadline wins.** Settlement runs inside `handle_event`, behind the deadline sweep, so STOP readiness or STOP acceptance at `now == deadline` times the pending circuit out.
+3. **The contract change is recorded here**, not in a new ADR; ADR 0012 and ADR 0018 are unchanged.
 
 ## Swarm and Endpoint foundations
 
@@ -336,7 +334,7 @@ The duration deadline is `acceptance_monotonic_now + configured_duration`, so it
 
 ### Forwarding and byte accounting
 
-Forwarding remains action-based. Every send action carries an opaque token and the agent serializes sends per direction. The driver reports whether the whole chunk was accepted by the destination transport. Transport/yamux/QUIC queues provide backpressure; the agent retains only bounded in-flight state.
+Forwarding writes through the `RelaySwarm` seam, one direction's queue in order. Each write reports at once how much of the chunk the destination transport accepted. Transport/yamux/QUIC queues provide backpressure; the agent retains only the queue bounded by the receive budget it withholds (ADR 0012).
 
 Maintain independent saturating source-to-destination and destination-to-source counters. The 128 KiB default applies to each direction, allowing up to 256 KiB aggregate payload. Count all application payload, including both sides' pipelined handshake leftovers, only after the destination transport accepts the send. Equality with the configured limit remains open. The first non-empty accepted chunk that makes its direction exceed the limit is delivered completely, included in that direction's total, and then both legs reset. Opposite-direction traffic consumes none of that allowance. Zero never triggers and wire `Limit.data = 0`.
 

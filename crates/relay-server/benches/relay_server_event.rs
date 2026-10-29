@@ -5,30 +5,34 @@ use minip2p_core::PeerId;
 use minip2p_core::platform::Now;
 use minip2p_relay::HOP_PROTOCOL_ID;
 use minip2p_relay_server::{RelayServerAgent, RelayServerConfig};
+
+#[path = "../tests/common/mod.rs"]
+mod common;
+use common::FakeSwarm;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 const PEERS: u64 = 128;
 const EVENTS_PER_BATCH: usize = 100;
 
-fn populated_agent(now: Now) -> (RelayServerAgent, SwarmEvent) {
+fn populated_agent(now: Now) -> (RelayServerAgent, FakeSwarm, SwarmEvent) {
     let local = PeerId::from_public_key_protobuf(b"relay-server-bench-local");
     let mut agent = RelayServerAgent::new(local, RelayServerConfig::default())
         .expect("default relay server configuration is valid");
+    let mut swarm = FakeSwarm::default();
 
     for index in 0..PEERS {
         let peer = PeerId::from_public_key_protobuf(&index.to_le_bytes());
         let conn_id = ConnectionId::new(index + 1);
         let stream_id = StreamId::new(1);
-        agent.handle_event(
-            &SwarmEvent::ConnectionEstablished {
-                peer_id: peer.clone(),
-                conn_id,
-            },
-            false,
-            Now::from_millis(0),
-        );
+        let established = SwarmEvent::ConnectionEstablished {
+            peer_id: peer.clone(),
+            conn_id,
+        };
+        swarm.apply(&established);
+        agent.handle_event(&mut swarm, &established, false, Now::from_millis(0));
         assert!(agent.handle_event(
+            &mut swarm,
             &SwarmEvent::StreamReady {
                 peer_id: peer,
                 conn_id,
@@ -41,14 +45,14 @@ fn populated_agent(now: Now) -> (RelayServerAgent, SwarmEvent) {
         ));
     }
 
-    agent.handle_tick(now);
+    agent.handle_tick(&mut swarm, now);
     let inert = SwarmEvent::StreamData {
         peer_id: PeerId::from_public_key_protobuf(b"relay-server-bench-unrelated"),
         conn_id: ConnectionId::new(PEERS + 1),
         stream_id: StreamId::new(1),
         data: Bytes::from(Vec::new()),
     };
-    (agent, inert)
+    (agent, swarm, inert)
 }
 
 fn relay_server_event(c: &mut Criterion) {
@@ -57,9 +61,9 @@ fn relay_server_event(c: &mut Criterion) {
         // By reference, so tearing the agent down stays out of the timing.
         b.iter_batched_ref(
             || populated_agent(now),
-            |(agent, inert)| {
+            |(agent, swarm, inert)| {
                 for _ in 0..EVENTS_PER_BATCH {
-                    black_box(agent.handle_event(black_box(&*inert), false, black_box(now)));
+                    black_box(agent.handle_event(swarm, black_box(&*inert), false, black_box(now)));
                 }
             },
             BatchSize::SmallInput,
