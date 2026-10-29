@@ -1,8 +1,9 @@
 ---
-// A cursor-tracking mascot: the head turns toward the pointer and reacts when
-// clicked. Each character is two 3×3 sprite sheets (nine head directions, nine
-// expressions); frames swap by moving `background-position`. Vanilla port of
-// page-mascot's React component, so the page ships no framework JS.
+// A cursor-tracking mascot: the head turns toward the pointer, and a click
+// makes it hop and pull a face. Each character is two 3×3 sprite sheets (nine
+// head directions, nine expressions); frames swap by moving
+// `background-position`. Vanilla port of page-mascot's React component, so the
+// page ships no framework JS.
 interface Props {
   /** Served path of the 3×3 head-directions sheet. */
   directions: string;
@@ -78,12 +79,15 @@ const { directions, reactions, aspect = 1, class: className, label = "mascot" } 
   const DIZZY_AFTER = 4;
   const DIZZY_WINDOW = 1600;
   const DIZZY_END = 1100;
-  const SQUASH: Keyframe[] = [
-    { easing: "ease-in", transform: "scale(1, 1)" },
-    { easing: "ease-out", offset: 0.18, transform: "scale(1.10, 0.86)" },
-    { easing: "ease-in-out", offset: 0.45, transform: "scale(0.95, 1.08)" },
-    { easing: "ease-in-out", offset: 0.72, transform: "scale(1.03, 0.97)" },
-    { transform: "scale(1, 1)" },
+  // A hop: crouch, leap (stretched, decelerating to the apex), fall back,
+  // squash on landing, settle.
+  const HOP: Keyframe[] = [
+    { easing: "ease-out", transform: "translateY(0) scale(1, 1)" },
+    { easing: "ease-out", offset: 0.14, transform: "translateY(0) scale(1.12, 0.84)" },
+    { easing: "ease-in", offset: 0.46, transform: "translateY(-24%) scale(0.94, 1.08)" },
+    { easing: "ease-out", offset: 0.7, transform: "translateY(0) scale(1.1, 0.88)" },
+    { easing: "ease-in-out", offset: 0.85, transform: "translateY(0) scale(0.98, 1.03)" },
+    { transform: "translateY(0) scale(1, 1)" },
   ];
 
   // background-size 300% makes each cell a clean 0/50/100% step on both axes.
@@ -173,7 +177,7 @@ const { directions, reactions, aspect = 1, class: className, label = "mascot" } 
       }
       // Per-keyframe easing with the effect itself linear: an easing on the effect
       // would reinterpret every offset and front-load the whole bounce.
-      squash.animate(SQUASH, { duration: 420, easing: "linear" });
+      squash.animate(HOP, { duration: 620, easing: "linear" });
     });
   }
 </script>
