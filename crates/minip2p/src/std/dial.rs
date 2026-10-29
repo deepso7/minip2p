@@ -24,7 +24,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use minip2p_core::{Multiaddr, PeerAddr, Protocol};
 use minip2p_swarm::WakeHandle;
 
-use crate::portable::connect::{Expansion, NameAnswer};
+use crate::connect::{Expansion, NameAnswer};
 
 /// Which IP family an address belongs to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

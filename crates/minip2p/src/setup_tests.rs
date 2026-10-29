@@ -20,9 +20,9 @@ use minip2p_swarm::SwarmBuilder;
 use minip2p_test_support::InMemoryTransport;
 
 use super::{Capabilities, Platform, SetupError, install, validate};
+use crate::connect::Expansion;
 use crate::engine::Engine;
 use crate::portable::StreamAcks;
-use crate::portable::connect::Expansion;
 #[cfg(feature = "autonat")]
 use {
     super::NatConfigError,

@@ -8,7 +8,7 @@ use minip2p_core::{Bytes, PeerAddr, PeerId};
 use minip2p_swarm::{IdentifyMessage, SwarmEvent, SwarmRuntimeError};
 use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamId};
 
-use super::connect::{ConnectId, ConnectOutcome};
+use crate::connect::{ConnectId, ConnectOutcome};
 
 /// Ordered application event from the Endpoint's single public stream.
 ///

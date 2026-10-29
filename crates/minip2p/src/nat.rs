@@ -1,5 +1,9 @@
 //! Caller-driven NAT capability shared by standard and portable Endpoints.
 //! Time and entropy are supplied by the host; I/O runs through `SwarmCore`.
+//!
+//! The driver offers Connection attempts only leg primitives (`connect`,
+//! `cancel`, `settled`, and its raw event queue); the Connection-attempt
+//! engine in `crate::connect` decides when to use them.
 
 #[cfg(feature = "relay")]
 use alloc::{collections::BTreeMap, string::ToString};
@@ -21,30 +25,6 @@ use minip2p_swarm::{SwarmCore, SwarmEvent};
 #[cfg(feature = "relay")]
 use minip2p_transport::TransportError;
 use minip2p_transport::{ConnectionId, StreamId, Transport};
-
-use crate::EndpointEvent;
-use crate::portable::connect::ConnectEngine;
-
-/// `ConnectFailed` and `FellBackToRelay` are attempt terminals the
-/// Connection-attempt engine already reports as `ConnectSettled`, so they
-/// are not repeated to the application.
-fn nat_event_reaches_application(event: &NatEvent) -> bool {
-    !matches!(
-        event,
-        NatEvent::ConnectFailed { .. } | NatEvent::FellBackToRelay { .. }
-    )
-}
-
-/// Events that speak for a still-pending attempt's outcome. Once the
-/// Connection engine settled the attempt, they are stale and dropped.
-fn is_attempt_outcome(event: &NatEvent) -> bool {
-    matches!(
-        event,
-        NatEvent::ConnectFailed { .. }
-            | NatEvent::FellBackToRelay { .. }
-            | NatEvent::HolePunchFailed { .. }
-    )
-}
 
 /// Joins the bytes a promoted bridge still owes into one payload; a single
 /// chunk is passed through.
@@ -104,7 +84,7 @@ impl<I: Transport, R: EntropySource> CircuitOps<CircuitTransport<I, R>> {
 /// Drives a [`NatAgent`] against the endpoint's swarm.
 pub(crate) struct NatDriver<T> {
     agent: NatAgent,
-    /// Agent output not yet routed; see [`Self::route`].
+    /// Agent output not yet routed; see [`Self::take_unrouted`].
     unrouted: VecDeque<NatEvent>,
     /// Routed events bound for the Endpoint event stream.
     staged: VecDeque<NatEvent>,
@@ -198,7 +178,7 @@ impl<T: Transport> NatDriver<T> {
     pub(crate) fn named_dial_resolved<R: EntropySource>(
         &mut self,
         token: NatToken,
-        resolved: crate::portable::connect::NameAnswer,
+        resolved: Result<Vec<PeerAddr>, alloc::string::String>,
         swarm: &mut SwarmCore<T, R>,
         sample: Now,
     ) {
@@ -220,8 +200,8 @@ impl<T: Transport> NatDriver<T> {
         self.pump(swarm);
     }
 
-    /// Cancels a pending connect's NAT leg; settled or unknown ids are a
-    /// no-op.
+    /// Cancels a pending connect's NAT leg and executes the cleanup it
+    /// queues; settled or unknown ids are a no-op.
     pub(crate) fn cancel<R: EntropySource>(
         &mut self,
         id: ConnectId,
@@ -230,28 +210,23 @@ impl<T: Transport> NatDriver<T> {
     ) {
         let mut io = EndpointSwarm::new(swarm, &mut self.io);
         self.agent.cancel(&mut io, id, now);
+        self.pump(swarm);
     }
 
-    /// Cancels `id` in the Connection-attempt engine and, while the attempt
-    /// is still pending, its NAT leg. Returns `true` when the leg was
-    /// cancelled and the caller must `pump` the queued actions.
-    ///
-    /// The pending check runs before the engine cancel: `ConnectEngine`
-    /// forgets the attempt once it settles, but the agent would still close
-    /// a provisional relayed path the engine already settled on.
-    pub(crate) fn cancel_leg<R: EntropySource>(
+    /// Tells the agent the Connection-attempt engine settled `id`, so it
+    /// drops what it still holds for it and emits no further attempt event.
+    /// `kept` (the connection a Connected terminal names) stays open, even a
+    /// relayed circuit the leg promoted; `None` closes the leg's circuit.
+    pub(crate) fn settled<R: EntropySource>(
         &mut self,
-        connect: &mut ConnectEngine,
         id: ConnectId,
+        kept: Option<ConnectionId>,
         swarm: &mut SwarmCore<T, R>,
         now: Now,
-    ) -> bool {
-        let pending = connect.is_pending(id);
-        connect.cancel(id, swarm);
-        if pending {
-            self.cancel(id, swarm, now);
-        }
-        pending
+    ) {
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
+        self.agent.settled(&mut io, id, kept, now);
+        self.pump(swarm);
     }
 
     /// Registers a pending connect with the agent and immediately executes
@@ -426,132 +401,29 @@ impl<T: Transport> NatDriver<T> {
         }
     }
 
-    /// Routes every event the agent produced since the last call, each
-    /// exactly once: the Connection-attempt engine observes it first, then
-    /// `owned` (discovery's ownership filter) consumes events that belong
-    /// to automatic dials, and the rest is staged for the Endpoint event
-    /// stream unless the engine reports it as `ConnectSettled` instead.
-    ///
-    /// Observing can settle attempts, whose terminals the endpoint collects
-    /// next; their cleanup can produce more events, so the endpoint routes
-    /// again until nothing is left before its final drain.
-    pub(crate) fn route<R: EntropySource>(
-        &mut self,
-        connect: &mut ConnectEngine,
-        swarm: &mut SwarmCore<T, R>,
-        now_ms: u64,
-        owned: impl Fn(&NatEvent) -> bool,
-    ) {
-        while let Some(event) = self.unrouted.pop_front() {
-            // An attempt outcome produced in the same turn the engine
-            // settled the attempt, before the agent learned of it.
-            if is_attempt_outcome(&event)
-                && event.connect_id().is_some_and(|id| !connect.is_pending(id))
-            {
-                continue;
-            }
-            connect.observe_nat(&event, swarm, now_ms);
-            if !owned(&event) && nat_event_reaches_application(&event) {
-                self.staged.push_back(event);
-            }
-        }
+    /// Takes the next agent event not yet routed. The Connection-attempt
+    /// engine routes each one (`ConnectEngine::route`), handing the ones
+    /// bound for the application back through [`Self::stage`].
+    pub(crate) fn take_unrouted(&mut self) -> Option<NatEvent> {
+        self.unrouted.pop_front()
     }
 
-    /// Attaches the attempt's NAT leg while it is still pending. The endpoint
-    /// calls this right after `admit_connect`, which itself knows nothing of
-    /// NAT. `target_addrs` are the addresses known for `peer`; circuit
-    /// addresses among them steer the relay leg toward relays the peer is
-    /// reserved at.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one flat call per admission site; a bundle type would only move the fields"
-    )]
-    pub(crate) fn attach_leg<R: EntropySource>(
-        &mut self,
-        connect: &ConnectEngine,
-        id: ConnectId,
-        peer: PeerId,
-        allow_relay: bool,
-        target_addrs: Vec<Multiaddr>,
-        swarm: &mut SwarmCore<T, R>,
-        sample: Now,
-    ) {
-        if connect.is_pending(id) {
-            self.connect(
-                id,
-                peer,
-                ConnectLegs {
-                    direct_racing: connect.dialed_direct(id),
-                    allow_relay,
-                    target_addrs,
-                    deadline_ms: connect.expires_ms(id),
-                },
-                swarm,
-                sample,
-            );
-        }
-    }
-
-    /// Applies the work a `DiscoveryDriver` sweep queued: attaches legs for
-    /// attempts automatic dialing admitted, then pumps once when a leg was
-    /// cancelled. Call it right after the sweep.
-    #[cfg(feature = "_peer-book")]
-    pub(crate) fn apply_sweep_work<R: EntropySource>(
-        &mut self,
-        work: crate::discovery::DiscoveryNatWork,
-        connect: &ConnectEngine,
-        swarm: &mut SwarmCore<T, R>,
-        sample: Now,
-    ) {
-        for leg in work.legs {
-            self.attach_leg(
-                connect,
-                leg.id,
-                leg.peer,
-                leg.allow_relay,
-                leg.addrs,
-                swarm,
-                sample,
-            );
-        }
-        if work.pump {
-            self.pump(swarm);
-        }
-    }
-
-    /// Tells the agent a Connection-attempt terminal settled `event`'s
-    /// attempt, so it drops what it still holds for it and emits no further
-    /// attempt event. A Connected terminal keeps its connection open, even
-    /// a relayed circuit the leg promoted; a failed or cancelled one closes
-    /// the leg's circuit. Other events are a no-op.
-    pub(crate) fn settle_leg_on_terminal<R: EntropySource>(
-        &mut self,
-        event: &EndpointEvent,
-        swarm: &mut SwarmCore<T, R>,
-        sample: Now,
-    ) {
-        let EndpointEvent::ConnectSettled {
-            connect_id,
-            outcome,
-            ..
-        } = event
-        else {
-            return;
-        };
-        let kept = match outcome {
-            crate::ConnectOutcome::Connected { conn_id, .. } => Some(*conn_id),
-            crate::ConnectOutcome::Failed(_) | crate::ConnectOutcome::Cancelled => None,
-        };
-        let mut io = EndpointSwarm::new(swarm, &mut self.io);
-        self.agent.settled(&mut io, *connect_id, kept, sample);
-        self.pump(swarm);
+    /// Stages a routed event for the Endpoint event stream.
+    pub(crate) fn stage(&mut self, event: NatEvent) {
+        self.staged.push_back(event);
     }
 
     /// Queues an event as if the agent emitted it; the next route sends it
     /// through the Connection engine and on to the application.
-    #[cfg(all(test, feature = "relay"))]
+    #[cfg(test)]
     pub(crate) fn push_event(&mut self, event: NatEvent) {
         self.unrouted.push_back(event);
+    }
+
+    /// Agent output not yet routed, for test assertions.
+    #[cfg(test)]
+    pub(crate) fn unrouted(&self) -> impl Iterator<Item = &NatEvent> {
+        self.unrouted.iter()
     }
 
     /// Drains the routed events bound for the Endpoint event stream.

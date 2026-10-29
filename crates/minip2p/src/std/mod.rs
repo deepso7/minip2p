@@ -64,11 +64,11 @@ use crate::GossipsubConfig;
 use crate::GossipsubError;
 #[cfg(feature = "relay")]
 use crate::ReservationInfo;
+#[cfg(feature = "autonat")]
+use crate::connect::Expansion;
 use crate::engine::Engine;
 #[cfg(feature = "relay")]
 use crate::nat::CircuitOps;
-#[cfg(feature = "autonat")]
-use crate::portable::connect::Expansion;
 use crate::setup::{self, Capabilities, Platform};
 use crate::{ConnectionInfo, Path};
 #[cfg(any(feature = "discovery", feature = "mdns"))]
