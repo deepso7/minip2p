@@ -741,6 +741,11 @@ fn cancel_while_the_relay_leg_is_pending_cancels_once_and_silences_the_leg() {
     );
 }
 
+/// The engine side of a cancel after a provisional relayed settle: no
+/// `Cancelled`, and the Connected terminal keeps its circuit. The circuit
+/// here is reported by the transport, not promoted by the leg; the std
+/// `cancel_after_a_relayed_settle_keeps_the_promoted_circuit` covers a
+/// circuit the agent owns.
 #[cfg(feature = "autonat")]
 #[test]
 fn cancel_after_a_provisional_relayed_settle_keeps_the_circuit() {
