@@ -299,6 +299,7 @@ mod bulk {
 
     use minip2p::{Bytes, CircuitCloseReason, Error, RelayServerConfig, StreamId};
 
+    use super::endpoint_support::is_stranger_handshake_failure;
     use super::*;
 
     /// Inner streams sending at once. Each holds at most one 256 KiB Yamux
@@ -407,6 +408,7 @@ mod bulk {
                             sender.writable = true;
                         }
                     }
+                    EndpointEvent::Error(error) if is_stranger_handshake_failure(&error) => {}
                     EndpointEvent::StreamClosed { .. }
                     | EndpointEvent::ConnectionClosed { .. }
                     | EndpointEvent::Error(_) => panic!("writer saw a teardown: {event:?}"),
@@ -427,6 +429,7 @@ mod bulk {
                             assert_eq!(bytes, BULK_PER_STREAM, "the FIN follows the last byte");
                             finished += 1;
                         }
+                        EndpointEvent::Error(error) if is_stranger_handshake_failure(&error) => {}
                         EndpointEvent::StreamClosed { .. }
                         | EndpointEvent::ConnectionClosed { .. }
                         | EndpointEvent::Error(_) => panic!("reader saw a teardown: {event:?}"),

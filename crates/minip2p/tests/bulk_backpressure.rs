@@ -10,6 +10,10 @@ use minip2p::{
     Bytes, ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, Error, PeerId, StreamId,
 };
 
+#[path = "../../../tests/support/endpoint.rs"]
+mod endpoint_support;
+use endpoint_support::is_stranger_handshake_failure;
+
 const PROTOCOL: &str = "/minip2p/bulk-backpressure/1";
 /// Larger than one stream's send window plus its queue cap.
 const CHUNK: usize = 1024 * 1024;
@@ -36,14 +40,17 @@ fn next(endpoint: &mut Endpoint, timeout: Duration) -> Option<EndpointEvent> {
 }
 
 fn fail_on_teardown(event: &EndpointEvent) {
-    assert!(
-        !matches!(
+    let teardown = match event {
+        EndpointEvent::Error(error) => !is_stranger_handshake_failure(error),
+        event => matches!(
             event,
             EndpointEvent::ConnectionClosed { .. }
                 | EndpointEvent::StreamClosed { .. }
                 | EndpointEvent::StreamWriteStopped { .. }
-                | EndpointEvent::Error(_)
         ),
+    };
+    assert!(
+        !teardown,
         "a slow reader must not tear anything down: {event:?}"
     );
 }
