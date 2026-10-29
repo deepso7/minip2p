@@ -1,0 +1,15 @@
+---
+// Steps as a progress log: each Step is headed `[n/total]`. The total is
+// counted from the rendered steps and seeded into a CSS counter, so each Step
+// can print it without knowing its siblings.
+import type { StepsProps } from "blume/components";
+
+type Props = StepsProps;
+
+const html = await Astro.slots.render("default");
+const total = html.match(/data-blume-step\b/gu)?.length ?? 0;
+---
+
+<div class="term-steps my-8" style={`counter-reset: blume-step term-steps-total ${total}`}>
+  <Fragment set:html={html} />
+</div>

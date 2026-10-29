@@ -1,0 +1,190 @@
+---
+title: Register a protocol
+description: Register an application protocol, negotiate streams, exchange bytes, and close or abandon stream state on purpose.
+---
+
+Application protocols use libp2p multistream-select negotiation over an authenticated connection. Both peers must register the same versioned protocol ID. `connect` first; open streams once the peer is connected. Waiting for [`PeerReady`](/docs/rust/concepts#connection-readiness) is optional when you want Identify's advertised protocols before opening.
+
+```rust
+const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";
+
+let mut node = minip2p::Endpoint::builder()
+    .protocol(ECHO_PROTOCOL)
+    .listen_default()?
+    .bind()?;
+```
+
+You can also call `add_protocol` after binding. Registration affects inbound and outbound negotiation.
+
+<Callout type="warning">
+
+`/ipfs/id/1.0.0` and `/ipfs/ping/1.0.0` are owned by the endpoint. Registering an ID in `RESERVED_PROTOCOL_IDS` on the builder fails `bind` with `minip2p::BindError::Swarm(minip2p::SwarmError::ReservedProtocol { .. })`; `add_protocol` rejects it with `minip2p::Error::Swarm(minip2p::SwarmError::ReservedProtocol { .. })`.
+
+</Callout>
+
+## Open an outbound stream
+
+Once the attempt settles `Connected`, request a stream. A protocol both peers registered does not need to wait for Identify; match `PeerReady` first only if you want unsupported protocols to fail early with `RemoteDoesNotSupport`.
+
+`open_stream` starts negotiation and returns the connection and the allocated stream ID. Stream IDs are unique only per connection, so every stream operation takes both. Wait for the matching `EndpointEvent::StreamReady` before writing:
+
+```rust
+use std::time::{Duration, Instant};
+
+use minip2p::{ConnectOutcome, EndpointEvent, EndpointWaitOutcome, StreamWriter};
+
+let peer_id = target.peer_id().clone();
+let connect_id = node.connect(target)?;
+let mut stream = None;
+// Holds what a full stream does not accept yet (see Write backpressure below).
+let mut writer = StreamWriter::new(1024 * 1024);
+let deadline = Instant::now() + Duration::from_secs(10);
+
+loop {
+    let event = match node.wait(deadline)? {
+        EndpointWaitOutcome::Event(event) => event,
+        // Another thread woke the wait; nothing to service here.
+        EndpointWaitOutcome::Deadline => return Err("stream exchange timed out".into()),
+        _ => continue, // interrupted by a WaitHandle
+    };
+    // The writer sees every event: it resends a held tail on StreamWritable
+    // and sends the deferred FIN once that tail is accepted.
+    writer.observe(&mut node, &event);
+
+    match event {
+        EndpointEvent::ConnectSettled {
+            connect_id: id,
+            outcome,
+            ..
+        } if id == connect_id => match outcome {
+            ConnectOutcome::Connected { .. } => {
+                stream = Some(node.open_stream(&peer_id, ECHO_PROTOCOL)?);
+            }
+            other => return Err(format!("connect failed: {other:?}").into()),
+        },
+        EndpointEvent::StreamReady {
+            peer_id: peer,
+            conn_id,
+            stream_id: ready,
+            protocol_id,
+            ..
+        } if peer == peer_id && Some((conn_id, ready)) == stream && protocol_id == ECHO_PROTOCOL => {
+            writer.write(&mut node, conn_id, ready, b"hello".to_vec())?;
+            writer.close_write(&mut node, conn_id, ready)?;
+            // Keep dispatching: a held tail and the FIN finish from `observe`.
+        }
+        // The peer half-closed after its reply (delivered as StreamData):
+        // the exchange is done, and our FIN went out before it was echoed.
+        EndpointEvent::StreamRemoteWriteClosed {
+            conn_id,
+            stream_id: done,
+            ..
+        } if Some((conn_id, done)) == stream => break,
+        other => handle_other_event(other),
+    }
+}
+```
+
+Put this match in the application's ordinary event dispatcher. Do not discard events for other peers or streams while waiting for negotiation.
+
+QUIC is a byte stream: writes can be fragmented or coalesced. Add framing when one application message must be distinguishable from the next.
+
+## Accept an inbound stream
+
+Inbound negotiation produces the same `StreamReady` event with `initiated_locally: false`. Track accepted streams by connection and stream ID so later `StreamData` can be routed to the correct handler:
+
+```rust
+use std::collections::HashSet;
+
+use minip2p::{ConnectionId, EndpointEvent, StreamId, StreamWriter};
+
+let mut echo_streams: HashSet<(ConnectionId, StreamId)> = HashSet::new();
+let mut writer = StreamWriter::new(1024 * 1024);
+
+writer.observe(&mut node, &event);
+match event {
+    EndpointEvent::StreamReady {
+        conn_id,
+        stream_id,
+        protocol_id,
+        initiated_locally: false,
+        ..
+    } if protocol_id == ECHO_PROTOCOL => {
+        echo_streams.insert((conn_id, stream_id));
+    }
+    EndpointEvent::StreamData {
+        conn_id,
+        stream_id,
+        data,
+        ..
+    } if echo_streams.remove(&(conn_id, stream_id)) => {
+        // A single-chunk echo: it answers the first `StreamData` and
+        // half-closes, so a message split across chunks loses the rest.
+        // Echoing every chunk needs a backlog behind the one pending write
+        // (see `examples/peer`). The FIN waits for every byte of the echo,
+        // and a failure ends this stream, not the listener.
+        let echoed = writer
+            .write(&mut node, conn_id, stream_id, data)
+            .and_then(|_| writer.close_write(&mut node, conn_id, stream_id));
+        if let Err(error) = echoed {
+            eprintln!("echo on stream {stream_id} failed: {error}");
+            writer.forget(conn_id, stream_id);
+            let _ = node.reset_stream(conn_id, stream_id);
+        }
+    }
+    _ => {}
+}
+```
+
+## Write backpressure
+
+`send_stream(conn_id, stream_id, data)` accepts anything that converts into `Bytes` and queues as much as the stream can take. When not every byte fit it returns `Error::Full`, and **a prefix may already have been accepted: only the `unsent` tail in the error is still yours.** That is backpressure, not a failure (`error.is_retryable()` is true): keep the tail and send it again when `EndpointEvent::StreamWritable` arrives for the stream. A `?` on `send_stream` silently drops that tail:
+
+```rust
+node.send_stream(conn_id, stream_id, payload)?; // a Full here loses `unsent`
+```
+
+Most applications on the std `Endpoint` want `StreamWriter` instead (`PortableEndpoint` callers hold the tail themselves). It holds one pending write per stream within a byte budget you choose, resends the tail on `StreamWritable`, and makes `close_write` send the FIN only after the tail is accepted:
+
+```rust
+use minip2p::{StreamWriter, WriteProgress};
+
+let mut writer = StreamWriter::new(8 * 1024 * 1024);
+
+// Writing: `Pending` means the writer holds the rest of the payload.
+if writer.write(&mut node, conn_id, stream_id, chunk)? == WriteProgress::Pending {
+    // Wait for its `WriteAccepted` before the next chunk; a second write
+    // meanwhile is refused with `StreamWriteError::Busy`.
+}
+
+// After the last chunk: half-close. The FIN follows the held tail, and any
+// later write on the stream is refused.
+writer.close_write(&mut node, conn_id, stream_id)?;
+
+// In the event loop: feed every event to the writer.
+if let Some(done) = writer.observe(&mut node, &event) {
+    // Every byte of the pending write on `done.stream_id` was accepted.
+}
+```
+
+Completion means the bytes were accepted locally, never that they were delivered. `StreamWriteStopped`, `StreamClosed`, or the connection closing or being replaced drop the held tail; `observe` forgets it on those events, which are how the application learns the write will not complete. With a slow reader, the writer keeps resending on `StreamWritable` until a large write completes, and the slow reader slows the writer instead of tearing the connection down.
+
+## Close, reset, or abandon
+
+| Operation | Meaning |
+| --- | --- |
+| `close_stream_write` | Gracefully half-close the local write side; reads may continue. |
+| `reset_stream` | Abruptly terminate the stream while keeping terminal stream events visible. |
+| `abandon_stream` | Reset the stream, purge buffered matching events, and suppress later matching stream events. |
+
+Stream operations take the connection and stream IDs; the peer is the connection's. An operation whose connection has closed or been replaced fails (`SwarmError::StreamNotFound`, or `TransportError::ConnectionNotFound` once nothing names the connection) instead of reaching a stream on the peer's new connection that reuses the ID; `error.is_stream_gone()` is true for both, and false for a write side that is closing.
+
+Use `abandon_stream` when an application has permanently stopped consuming a stream. Calling it again while the abandon/reset is still pending is safe and keeps an ignored stream's events out of the Endpoint event stream. After the stream is fully forgotten, a later call returns an error.
+
+The complete two-peer echo used in CI lives in [`docs/snippets/custom-stream`](https://github.com/deepso7/minip2p/tree/main/docs/snippets/custom-stream). That fixture rewrites wildcard listen addresses to loopback before printing them, the same way [Connect two peers](/docs/rust/connect-peers) does.
+
+## Driver-owned streams
+
+When NAT, pubsub, or discovery drivers are active, they register and consume their own control-plane streams. Those events do not surface as application `StreamData`; handle `EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, or `EndpointEvent::Discovery` instead.
+
+Next: [Drive events](/docs/rust/drive-events).

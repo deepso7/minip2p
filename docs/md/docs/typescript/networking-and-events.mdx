@@ -1,0 +1,171 @@
+---
+title: Networking and events
+description: Use typed events, pubsub, signed discovery, mDNS, and relay-assisted NAT traversal from TypeScript.
+---
+
+`Minip2p.create` returns a running endpoint. Configuration selects the network capabilities it uses.
+
+## Prefer named events
+
+Named subscriptions are typed by event name and receive a flattened payload:
+
+```ts
+const removeReady = endpoint.on("peerReady", ({ peerId, protocols }) => {
+  console.log("ready", peerId, protocols);
+});
+
+const removePath = endpoint.on("pathUpgraded", ({ peerId, from, to }) => {
+  console.log("upgraded", peerId, from.kind, "→", to.kind);
+});
+
+removeReady();
+removePath();
+```
+
+For one result, use a Promise:
+
+```ts
+const message = await endpoint.waitFor("message", {
+  predicate: (event) => event.topics.includes("/example/chat/1"),
+  timeoutMs: 10_000,
+});
+```
+
+`once(name, options?)` is the same pattern without a predicate.
+
+Use async iteration when one loop handles every event:
+
+```ts
+const controller = new AbortController();
+
+for await (const event of endpoint.events({ signal: controller.signal })) {
+  console.log(event.type, event);
+}
+```
+
+The iterator ends when the endpoint closes or its signal aborts. Each iterator buffers independently. A slow consumer receives `queueOverflow` with the number of events it missed. Set `bufferCap` only when the application needs a different per-iterator limit.
+
+Use the catch-all form for logging and diagnostics:
+
+```ts
+const removeLog = endpoint.on((event) => {
+  console.log(event.type, event);
+});
+```
+
+Catch-all events are a discriminated union with a `type` field. Inbound streams appear there as safe `inboundStream` metadata only. Subscribe specifically to `"stream"` to receive and claim a live `Stream`.
+
+Handler exceptions are isolated from event delivery and from other handlers. The endpoint emits `handlerError` afterward with safe metadata and the thrown value.
+
+<Callout type="warning">
+
+Events cross a bounded FIFO queue. Stream events and connection-end events (`connectionClosed`, `connectionReplaced`) are never dropped from it; past its bound it drops gossipsub messages first, then other events, including `connectionEstablished` and `peerReady`. If `queueOverflow` is emitted, some event history was lost. Refresh queryable state such as `connectedPeers()`, `connectionInfo(peerId)`, `knownPeers()`, `path(peerId)`, `reachability()`, and `activeReservation()`.
+
+</Callout>
+
+## Pubsub
+
+Gossipsub is enabled by default. Messages published by this endpoint are signed, and inbound validation rejects unsigned messages by default.
+
+```ts
+const topic = "/example/chat/1";
+
+endpoint.subscribe(topic);
+const removeMessages = endpoint.on("message", (message) => {
+  if (message.topics.includes(topic)) {
+    console.log(new TextDecoder().decode(message.data));
+  }
+});
+
+endpoint.publish(topic, "hello from minip2p");
+
+// Later:
+removeMessages();
+endpoint.unsubscribe(topic);
+```
+
+There is no self-delivery. Apply the local UI action directly and use the event for remote messages. Queue pressure throws `BackpressureError` synchronously; later forwarding failures arrive as `gossipsubOutboundFailure`.
+
+`allowUnsigned: true` accepts unsigned inbound application messages. When `message.signed` is `false`, both the bytes and `fromPeerId` are attacker-controlled; do not treat either as authenticated identity.
+
+## Signed discovery
+
+Enable application-scoped signed beacons with a topic:
+
+```ts
+const endpoint = Minip2p.create({
+  secretKey,
+  discovery: {
+    topic: "/example/peer-discovery/1",
+    autoDial: true,
+  },
+});
+```
+
+Discovery maintains a bounded, multi-source peer book and can automatically dial advertised direct addresses. Inspect it with `knownPeers()` and observe `peerDiscovered`, `peerUpdated`, `peerExpired`, and `discoveryDialFailed`.
+
+Discovery beacons stay signed even when `allowUnsigned` is true for application pubsub messages.
+
+## Local-link mDNS
+
+Use mDNS to find peers on the same multicast-capable network:
+
+```ts
+const endpoint = Minip2p.create({
+  secretKey,
+  mdns: {
+    autoDial: true,
+    enableIpv6: false,
+  },
+});
+```
+
+`mdns: true` uses the defaults. mDNS observations join the same `knownPeers()` book as signed discovery. The event `source` distinguishes `DiscoverySource.Mdns` from `DiscoverySource.SignedBeacon`.
+
+Signed discovery and mDNS share one automatic-dial policy. If both options set `autoDial`, the values must match. Set it only on `discovery` when mDNS should inherit that choice.
+
+Discovery stays local to the link and depends on the network allowing multicast. React Native apps must also declare the [iOS local-network and Android multicast permissions](/docs/typescript/setup-react-native#prepare-mdns-permissions).
+
+## Relay and NAT traversal
+
+minip2p is a Circuit Relay v2 **client** and traversal orchestrator. Supply a reachable relay server as a direct QUIC or TCP peer multiaddress:
+
+```ts
+const endpoint = Minip2p.create({
+  secretKey,
+  relays: [relayAddress],
+  autonatServers: [probeServerAddress],
+});
+```
+
+| Configuration | What it adds |
+| --- | --- |
+| `relays` | Reservations, relayed connections, direct/relay races, and relay-assisted DCUtR. |
+| `autonatServers` | Reachability probing only. It does not create a traversal path. |
+| `forceRelay: true` | Routes outbound connectivity through configured relays. |
+
+`connect` runs NAT orchestration: direct candidates and the relay leg race under one Connect ID.
+
+```ts
+const result = await endpoint.connect(remoteAddress);
+
+if (result.path.kind === "relayed") {
+  console.log("relay", result.path.relayPeerId);
+}
+
+console.log(endpoint.reachability());
+console.log(endpoint.activeReservation());
+console.log(endpoint.circuitAddress);
+```
+
+`circuitAddress` is available after a usable reservation matches one of the configured relay addresses. The exported `circuitAddress(relayAddress, peerId)` helper builds the same address explicitly.
+
+Watch `relayReserved`, `relayReservationLost`, `pathEstablished`, `pathUpgraded`, `holePunchFailed`, and `connectFailed` for diagnostics and UI state. Keep using ordinary peer and stream APIs when a path upgrades. The peer identity does not change.
+
+<Callout type="note">
+
+Discovery can connect peers directly from advertised addresses without a relay. A relay is still required for relayed connectivity and relay-assisted hole punching.
+
+</Callout>
+
+See the [TypeScript API reference](/docs/reference/typescript-api) for the full configuration and event-family map.

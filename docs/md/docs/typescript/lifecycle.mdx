@@ -1,0 +1,167 @@
+---
+title: Endpoint lifecycle
+description: Persist an identity, own the endpoint lifetime on each runtime, and shut down cleanly.
+---
+
+A `Minip2p` object owns one endpoint. Its identity, events, pending Promises, and streams all share that lifetime.
+
+## Identity first
+
+The secret key is the node's identity. Generate it once, store the raw 32 bytes somewhere protected, and supply the same bytes on later launches when the node needs a stable peer ID.
+
+<Tabs>
+  <Tab title="Node.js">
+
+    ```ts
+    import { generateSecretKey, peerIdFromSecretKey } from "@minip2p/node";
+
+    const secretKey = generateSecretKey();
+    const peerId = peerIdFromSecretKey(secretKey);
+    ```
+
+  </Tab>
+  <Tab title="React Native">
+
+    ```ts
+    import {
+      generateSecretKey,
+      peerIdFromSecretKey,
+    } from "@minip2p/react-native";
+
+    const secretKey = generateSecretKey();
+    const peerId = peerIdFromSecretKey(secretKey);
+    ```
+
+  </Tab>
+</Tabs>
+
+`peerIdFromSecretKey` derives the public peer identity without starting an endpoint. Treat `secretKey` as credentials: do not log it or transmit it.
+
+- On Node.js, keep it in a file with restrictive permissions or a secret manager, and do not bake it into an image.
+- On React Native, keep it in platform-appropriate secure storage, not in ordinary preferences.
+
+## Own the process lifetime
+
+<Badge>Node.js</Badge>
+
+A started endpoint holds a strong event-loop reference. The process will not exit until `close()` is called, so a long-running service should wire shutdown to its termination signals:
+
+```ts
+import { Minip2p } from "@minip2p/node";
+
+const endpoint = Minip2p.create({ secretKey });
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    void endpoint.close();
+  });
+}
+```
+
+`close()` never blocks the thread: native disconnects peers and drains for up to 500 ms (`close(timeoutMs)` picks the bound; `0` tears down at once) on its own thread, then releases the event-loop reference, so the process can exit once nothing else keeps it alive.
+
+`Minip2p` also implements `Symbol.asyncDispose` and `Symbol.dispose`. In a scoped tool or test, an `await using` declaration closes the endpoint at scope exit and waits for the drain; `using` starts the close without waiting:
+
+```ts
+await using endpoint = Minip2p.create({ secretKey });
+```
+
+## Prefer the lifecycle hook
+
+<Badge>React Native</Badge>
+
+`useMinip2p` is the normal component interface. It starts in `starting`, then exposes the endpoint after creation succeeds.
+
+```tsx
+const node = useMinip2p(createConfig);
+
+switch (node.status) {
+  case "starting":
+    return <LoadingView />;
+  case "failed":
+    return <ErrorView error={node.error} />;
+  case "closed":
+    return <ClosedView />;
+  case "running":
+    return <PeerView endpoint={node.endpoint} peerId={node.peerId} />;
+}
+```
+
+| Status     | Available state                                       |
+| ---------- | ----------------------------------------------------- |
+| `starting` | Endpoint creation is scheduled after commit.          |
+| `running`  | `endpoint`, `peerId`, and the initial `listenAddrs`.  |
+| `closed`   | The endpoint closed normally.                         |
+| `failed`   | Creation failed or the endpoint stopped unexpectedly. |
+
+Every state also carries an idempotent `close()` callback. Component cleanup unbinds `AppState` and closes the endpoint automatically.
+
+Use `isDriverFailure(node)` to narrow a failed hook state to `DriverFailedError` when the UI needs the machine-readable failure kind.
+
+<Callout type="warning">
+
+Keep the configuration factory pure and stable. React may render a component without committing it; the hook creates the endpoint only after commit.
+
+</Callout>
+
+## Active and idle
+
+An endpoint starts active. `setActive(false)` reduces background work at the cost of higher network latency. `setActive(true)` restores normal behavior on the same endpoint. Servers normally stay active.
+
+### Foreground and background
+
+<Badge>React Native</Badge>
+
+The hook immediately mirrors the current React Native `AppState` and keeps it in sync:
+
+- `active` selects foreground polling;
+- every other state reduces background work.
+
+This does not destroy the endpoint. When the app returns to the foreground, the same endpoint becomes active again.
+
+If the endpoint is not component-owned, bind and release `AppState` manually:
+
+```ts
+import {
+  Minip2p,
+  bindAppState,
+  generateSecretKey,
+} from "@minip2p/react-native";
+
+const endpoint = Minip2p.create({
+  secretKey: generateSecretKey(),
+});
+const unbindAppState = bindAppState(endpoint);
+
+// Later, in the owner's cleanup path:
+unbindAppState();
+endpoint.close();
+```
+
+`bindAppState` applies the current state before it subscribes to later changes.
+
+## Close is terminal
+
+`endpoint.close(timeoutMs = 500)` is idempotent: later calls return the same Promise. It:
+
+1. rejects pending Promise operations and drops event listeners;
+2. closes owned `Stream` handles;
+3. stops the endpoint, letting native disconnect peers and drain for up to `timeoutMs` (`0` tears down at once, best effort);
+4. once the drain finishes, invokes each `onClose` observer once and resolves with the same report.
+
+The deadline bounds teardown time only, not delivery of accepted writes: QUIC discards queued writes and TCP may abort. The report is `{ reason, outcome?, unfinished }`. `reason` is the `EndpointCloseReason`: `"close"`, or `"driverFailed"` (with `error`) when the native driver failed and the endpoint tore down at once. `outcome` (only for `"close"`) is `Drained`, `DeadlineExpired` (running out is not an error), or `Failed` (driving the transports failed and ended the drain early). `unfinished` lists the peers whose connections were still tracked when the drain ended; empty means no tracked teardown remains, not that peers acknowledged it. The Promise never rejects.
+
+```ts
+endpoint.onClose((report) => {
+  if (report.reason === "driverFailed") {
+    console.error(report.error.kind, report.error.message);
+  }
+});
+
+const report = await endpoint.close(1_000);
+if (report.reason === "close" && report.outcome !== "Drained") {
+  console.warn("closed with unfinished peers", report.unfinished);
+}
+```
+
+Next: [Connections and streams](/docs/typescript/connections-and-streams) and [Networking and events](/docs/typescript/networking-and-events), or the [TypeScript API reference](/docs/reference/typescript-api).

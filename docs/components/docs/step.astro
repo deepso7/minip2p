@@ -1,0 +1,19 @@
+---
+// One step of a progress log (see steps.astro): `[2/5] Title`, its body hung
+// off a rule so long steps still read as one unit.
+import type { StepProps } from "blume/components";
+
+type Props = StepProps;
+
+const { title } = Astro.props;
+---
+
+<div class="term-step relative [counter-increment:blume-step]" data-blume-step>
+  <p class="term-step-title m-0! flex items-baseline gap-3 font-bold">
+    <span class="term-step-count shrink-0 text-accent" aria-hidden="true"></span>
+    {title && <span>{title}</span>}
+  </p>
+  <div class="term-step-body ms-[0.6ch] border-s border-dashed border-border ps-4 pt-1 sm:ps-[calc(4ch+0.75rem)] pb-6 [&>:first-child]:mt-2! [&>:last-child]:mb-0!">
+    <slot />
+  </div>
+</div>

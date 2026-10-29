@@ -1,0 +1,148 @@
+---
+title: Listen and connect
+description: Listen on QUIC, TCP, or both; publish dialable peer addresses; and connect to a known peer.
+---
+
+This guide covers direct QUIC and TCP with the base Endpoint API. QUIC is on by default; TCP needs the `tcp` Cargo feature. For relay races and hole punching, use [Traverse NAT](/docs/rust/traverse-nat). If you have not run a local connection yet, start with [Connect two peers](/docs/rust/connect-peers).
+
+## Bind an endpoint
+
+Listening is address-shaped: pass complete multiaddresses to `listen_on` (or `listen_default` for dual-stack QUIC) and call `bind`. The builder infers QUIC vs TCP from each address and groups compatible IPv4/IPv6 listeners onto one transport per shape. It accepts at most one QUIC listen address per IP family, and rejects `/p2p`, `/p2p-circuit`, and DNS hosts, which cannot be listened on.
+
+A listen setter rejects a bad address at once with an `EndpointOptionsError` naming it. `bind` returns a `BindError` naming what failed: `Options` for options that do not fit together, `Quic` or `Listen` when the platform refuses a socket (match its `IoErrorKind`, such as `AddrInUse`), or the capability whose configuration is invalid. `?` turns an `EndpointOptionsError` into a `BindError`, so a function that only builds an endpoint can return `Result<_, minip2p::BindError>`; one that also drives it, as below, mixes in runtime `minip2p::Error`s and usually returns `Box<dyn std::error::Error>`.
+
+| Method | Use it when |
+| --- | --- |
+| `.listen_on("/ip4/…/udp/…/quic-v1")?.bind()` | Configuration already uses complete multiaddresses. |
+| `.listen_default()?.bind()` | Common dual-stack QUIC wildcards. |
+| `.listen_on_multiaddr(&addr)?.bind()` | You already hold a parsed `Multiaddr`. |
+| `.listen_on(quic)?.listen_on(tcp)?.bind()` | One endpoint that speaks both (`tcp` feature). |
+
+Port `0` asks the operating system to pick a free UDP or TCP port.
+
+```rust
+use minip2p::{Endpoint, PeerAddr};
+
+let mut node = Endpoint::builder()
+    .agent_version("my-app/0.1.0")
+    .listen_default()?
+    .bind()?;
+
+for address in node.listen_all()? {
+    // Wildcards describe the bind socket; rewrite before sharing locally.
+    println!("listen={}", local_dialable(&address));
+}
+
+fn local_dialable(address: &PeerAddr) -> String {
+    address
+        .to_string()
+        .replace("/ip4/0.0.0.0/", "/ip4/127.0.0.1/")
+        .replace("/ip6/::/", "/ip6/::1/")
+}
+```
+
+`bind` starts accepting on every listen address, QUIC and TCP alike, so a bound endpoint is already reachable. `listen()` then reports the first address and `listen_all()` every one, which is normally the right choice for a dual-stack endpoint.
+
+To listen on both QUIC and TCP:
+
+```rust
+let mut node = Endpoint::builder()
+    .listen_on("/ip4/0.0.0.0/udp/4001/quic-v1")?
+    .listen_on("/ip4/0.0.0.0/tcp/4001")?
+    .bind()?;
+```
+
+`/udp/.../quic-v1` goes over QUIC; `/tcp` goes over TCP. Above that, swarm and app-protocol APIs look the same.
+
+<Callout type="warning">
+
+An address containing `/ip4/0.0.0.0` or `/ip6/::` describes where the socket is bound, not an address another machine can dial. Advertise a real interface, public, or relay circuit address to remote peers.
+
+</Callout>
+
+## Connect to a known peer
+
+`connect` takes a complete `PeerAddr`, including its terminal `/p2p/<peer-id>`, and returns a `ConnectId` immediately:
+
+```rust
+use minip2p::{Endpoint, PeerAddr};
+
+let target: PeerAddr =
+    "/ip4/192.0.2.7/udp/4001/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+        .parse()?;
+let peer = target.peer_id().clone();
+
+let mut node = Endpoint::builder().listen_default()?.bind()?;
+let connect_id = node.connect(target)?;
+```
+
+A target can also be a `PeerId` (known addresses and the configured relay are used) or a non-empty `Vec<PeerAddr>` naming the same peer. Every candidate is dialed at once and the attempt ends with exactly one `EndpointEvent::ConnectSettled`: `Connected { conn_id }`, `Failed(ConnectFailure)`, or `Cancelled`. Only a malformed target (an empty list, or addresses naming different peers) fails synchronously; "no usable route" is a `Failed` outcome.
+
+The address picks the transport and the IP family. `/ip4` and `/ip6` candidates are dialed as written; a `/dns` candidate is resolved and dialed over every family it answers with, while `/dns4` and `/dns6` keep to one. To limit an attempt to one family, pass only addresses of that family.
+
+## Wait for the outcome
+
+Wait for the Connect ID in your event loop and dispatch every other event as usual:
+
+```rust
+use std::time::{Duration, Instant};
+
+use minip2p::{ConnectOutcome, EndpointEvent, EndpointWaitOutcome};
+
+let deadline = Instant::now() + Duration::from_secs(10);
+loop {
+    match node.wait(deadline)? {
+        EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+            connect_id: id,
+            outcome,
+            ..
+        }) if id == connect_id => {
+            match outcome {
+                ConnectOutcome::Connected { conn_id } => println!("connected on {conn_id:?}"),
+                other => eprintln!("connect failed: {other:?}"),
+            }
+            break;
+        }
+        EndpointWaitOutcome::Event(event) => println!("{event:?}"), // dispatch as usual
+        EndpointWaitOutcome::Deadline => {
+            // The deadline only bounds this wait; cancel the attempt explicitly.
+            node.cancel_connect(connect_id);
+            break;
+        }
+        _ => {} // interrupted by a WaitHandle
+    }
+}
+```
+
+`cancel_connect` is the only way to stop an attempt: it closes anything the attempt opened and settles it `Cancelled`. Giving up on a wait never cancels. Cancelling a settled or unknown ID is a no-op, and closing an established connection is `disconnect`.
+
+A connected peer then reaches `PeerReady` once the first Identify exchange completes, so the endpoint knows which protocols it supports. `open_stream` works as soon as the peer is connected; you do not have to wait for `PeerReady` to open a protocol you already know the remote speaks. After Identify completes, `open_stream` can reject an unsupported protocol immediately with `minip2p::Error::Swarm(minip2p::SwarmError::RemoteDoesNotSupport { .. })`. Match `PeerReady` in the same loop when you want that early check or the advertised protocol list.
+
+## Inspect and disconnect
+
+State snapshot getters read current state without driving the endpoint:
+
+```rust
+if node.is_peer_ready(&peer) {
+    if let Some(info) = node.peer_info(&peer) {
+        println!(
+            "agent={}",
+            info.agent_version.as_deref().unwrap_or("<none>")
+        );
+    }
+}
+
+for connected in node.connected_peers() {
+    println!("connected={connected}");
+}
+
+node.disconnect(&peer)?;
+```
+
+`disconnect` closes the active connection. The closure appears as `EndpointEvent::ConnectionClosed`.
+
+## Direct and NAT-aware attempts
+
+Without NAT configuration, `connect` dials only the direct candidates. With the `relay` feature and a configured relay, the same call also races a relay leg and can later upgrade to a direct path. See [Traverse NAT](/docs/rust/traverse-nat).
+
+Next: [Register a protocol](/docs/rust/register-a-protocol) or [Identity](/docs/rust/identity).

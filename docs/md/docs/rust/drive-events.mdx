@@ -1,0 +1,159 @@
+---
+title: Drive events
+description: Use one Endpoint::wait loop for every event, including NAT, pubsub, discovery, and relay-server output.
+---
+
+minip2p remains caller-driven at every layer. The application chooses when to poll, how long to wait, and which events to handle. Read [where events go](/docs/rust/concepts#where-events-go) first. If you are working with custom streams, also read [Register a protocol](/docs/rust/register-a-protocol).
+
+## Pick a driving method
+
+The endpoint has one ordered event stream and two ways to read it. `Endpoint::wait` blocks until an Endpoint event, the caller's deadline, or an interruption; `poll()` drains whatever is ready without blocking. Enabled capabilities (NAT, pubsub, discovery, relay server) deliver their output as variants on the same stream, so one loop sees every event exactly once for every feature combination. Both use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
+
+| Method | Behavior | Good fit |
+| --- | --- | --- |
+| `wait(deadline)` | Drive until one `EndpointWaitOutcome`: `Event(EndpointEvent)`, `Deadline`, or `Interrupted`. | Every blocking application loop; correlating an operation while dispatching others |
+| `poll()` | One non-blocking drive; returns currently available Endpoint events, finishing each swarm event the same way `wait` does. | Existing game, UI, or reactor loops |
+
+## Deadline forms
+
+Every endpoint wait accepts `impl Into<WaitDeadline>`:
+
+```rust
+use std::time::{Duration, Instant};
+
+use minip2p::WaitDeadline;
+
+let relative = Duration::from_secs(5);
+let absolute = Instant::now() + Duration::from_secs(5);
+let forever = WaitDeadline::NEVER;
+```
+
+A deadline that has already passed — a stale `Instant` or `Duration::ZERO` alike — still lets `wait` return a queued event or drive the endpoint once, so a stale timer never stalls it. The endpoint does not sleep or poll repeatedly past the deadline. The deadline bounds blocking, not delivery: with a strict operation timeout, check the clock before each `wait`, as in the loop below.
+
+## Wait for a correlated outcome
+
+Operations return IDs; wait for the matching event in your own loop:
+
+```rust
+use std::time::Duration;
+
+use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome};
+
+fn connect_to(
+    node: &mut Endpoint,
+    target: minip2p::PeerAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let connect_id = node.connect(target)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        // `wait` still serves events once the deadline has passed: enforce it here.
+        if std::time::Instant::now() >= deadline {
+            node.cancel_connect(connect_id);
+            return Err("connect did not settle".into());
+        }
+        match node.wait(deadline)? {
+            EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+                connect_id: settled,
+                outcome: ConnectOutcome::Connected { .. },
+                ..
+            }) if settled == connect_id => return Ok(()),
+            EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+                connect_id: settled,
+                outcome,
+                ..
+            }) if settled == connect_id => {
+                return Err(format!("connect failed: {outcome:?}").into());
+            }
+            // Unrelated events keep flowing: dispatch them as usual.
+            EndpointWaitOutcome::Event(event) => println!("{event:?}"),
+            // The clock check above gives up.
+            _ => {}
+        }
+    }
+}
+```
+
+The deadline bounds only this wait. Abandoning a wait never cancels the attempt, which keeps running and still settles; `cancel_connect` is the explicit stop.
+
+With the `relay` feature, `connect` races direct candidates against a relay leg when one is configured. `EndpointEvent::Nat(NatEvent::PathEstablished { connect_id, .. })` reports the first usable path (the provisional Relayed path, when that lands first); `ConnectSettled` is the attempt's terminal. Match `PeerReady` only when the application needs Identify's protocol list (for example early `RemoteDoesNotSupport` checks). `open_stream` is allowed once the peer is connected; Identify is not a stack gate for opening known app protocols.
+
+## Application event loops
+
+Prefer `wait` and dispatch unrelated events while correlating an operation:
+
+```rust
+use std::time::{Duration, Instant};
+
+use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome};
+
+fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> {
+    // One absolute deadline for the whole correlated wait — recreating a
+    // relative Duration inside the loop would reset the timeout on every
+    // unrelated event or interruption.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // Checked before each wait: unrelated events keep arriving past it.
+    while Instant::now() < deadline {
+        match node.wait(deadline)? {
+            EndpointWaitOutcome::Event(EndpointEvent::PeerReady { peer_id, .. })
+                if peer_id == peer =>
+            {
+                println!("ready={peer_id}");
+                break;
+            }
+            EndpointWaitOutcome::Event(EndpointEvent::Error(error)) => {
+                eprintln!("runtime error: {error:?}");
+            }
+            EndpointWaitOutcome::Event(_) => {
+                // Handle unrelated connection / stream / ping / capability events.
+            }
+            EndpointWaitOutcome::Deadline => {}
+            // `Interrupted` (EndpointWaitOutcome is non-exhaustive).
+            _ => {
+                // Service external commands, then continue.
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+The endpoint has no second queue, so a correlated wait never buffers or drops unrelated events: each one comes back to your loop in order. Handle a busy source (such as a chatty stream) where it arrives rather than ignoring it.
+
+Synchronous method failures on a running endpoint are returned as `minip2p::Error`; building one fails earlier, with a `BindError`. Non-fatal problems that occur later while driving appear as `EndpointEvent::Error` or a capability failure event, and never fail `wait` or `poll`: `EndpointEvent::MdnsFailed` (mDNS keeps retrying and emits `MdnsRecovered` once it works again), `RelayServerEvent::AddrsRejected` (the previously accepted addresses stay in effect until `AddrsRestored`), or `RelayServerEvent::Error(_)`. `MdnsFailed` and `AddrsRejected` are reported once per change in failure state, so a fault that keeps recurring does not flood the loop; `RelayServerEvent::Error` can repeat for each failed operation.
+
+## Stream and connection shutdown
+
+- Call `close_stream_write` after the final byte for a graceful half-close, or `StreamWriter::close_write` to send it once a held tail has been accepted.
+- Call `reset_stream` when the peer should observe abrupt termination and the application still wants terminal events.
+- Call `abandon_stream` when no matching buffered or future events should be delivered.
+- Call `disconnect` to close the active peer connection.
+
+`Endpoint` does not run a background shutdown sequence after it is dropped. Drive any graceful application-level close exchanges before leaving scope, then call `endpoint.close()`. `close` consumes the endpoint, disconnects peers, and drains the resulting events for up to 500 ms; `close_within(timeout)` picks the deadline, and `Duration::ZERO` tears down at once, best effort. The deadline bounds teardown time only, not delivery of accepted writes: QUIC discards queued writes and TCP may abort. It returns a `CloseReport` whose `outcome` is `Drained`, `DeadlineExpired` (connections were still tracked when the deadline passed; running out is not an error), or `Failed` (driving the transports failed, ending the drain early), and whose `unfinished` lists each connection still tracked with its peer, when known. The report also carries every event collected, including those still queued when you called it, and every error close's own calls hit. A failure the swarm reports as it happens (a transport refusing to close a connection, say) arrives as `EndpointEvent::Error` in `events`, so a clean close has an empty `errors` and no such event. mDNS goodbyes are best effort in `close`: one that could not be sent is an `EndpointEvent::MdnsFailed` in `events`, not an error. Dropping also disconnects, but ignores errors.
+
+With the `mdns` feature, `endpoint.shutdown()` has a narrower meaning: it sends mDNS goodbyes and stops mDNS while leaving QUIC and TCP usable. It returns `Result<(), MdnsError>` with the first goodbye that could not be sent, which is also queued as a final `MdnsFailed`.
+
+## Wait for every event family
+
+`wait` delivers ordinary and capability events on one stream. `EndpointEvent` is `#[non_exhaustive]`, so keep a wildcard arm:
+
+```rust
+use std::time::Duration;
+
+use minip2p::{EndpointEvent, EndpointWaitOutcome, GossipsubEvent, NatEvent};
+
+loop {
+    match endpoint.wait(Duration::from_millis(250))? {
+        EndpointWaitOutcome::Event(EndpointEvent::Gossipsub(GossipsubEvent::Message { data, .. })) => { /* ... */ }
+        EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) => { /* ... */ }
+        EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled { connect_id, outcome, .. }) => { /* ... */ }
+        EndpointWaitOutcome::Event(_) => {} // EndpointEvent is non-exhaustive
+        _ => {}
+    }
+}
+```
+
+Capability variants exist only when their feature is enabled: `Nat` (`autonat`), `Gossipsub` (`pubsub`), `Discovery` (`discovery` / `mdns`), `MdnsFailed` and `MdnsRecovered` (`mdns`), and `RelayServer` (`relay-server`). `poll` and `wait` work in drive batches: one bounded batch of swarm events, one capability pass, then Connection-attempt terminals. Within a batch the swarm events come first, then capability events in relay-server, NAT, Gossipsub, Discovery, mDNS order, then `ConnectSettled`; `wait` hands the batch out one event per call. A `ConnectSettled` follows the `ConnectionEstablished` it reports, but a `PeerReady`, `ConnectionReplaced`, or `ConnectionClosed` from the same batch can come before it too. No order is promised between concurrently racing Transport candidates. NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) never appear; `ConnectSettled` carries the outcome. A `PathUpgraded` can still follow its attempt's `ConnectSettled` when the attempt settled on a provisional Relayed path. The portable endpoint uses the same batches and order.
+
+State snapshot getters such as `path`, `reachability`, `active_reservation`, and `known_peers` stay authoritative for durable state. They may be ahead of the event stream, never behind their own emitted transition.
+
+See [Rust troubleshooting](/docs/rust/troubleshooting) for common event symptoms and responses.

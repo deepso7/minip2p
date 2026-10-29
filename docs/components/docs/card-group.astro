@@ -1,0 +1,11 @@
+---
+// A CardGroup as an index listing: one ruled row per card, whatever `cols`
+// says, so a page's links read like `ls` output rather than a tile grid.
+import type { CardGroupProps } from "blume/components";
+
+type Props = CardGroupProps;
+---
+
+<ul class="term-index not-prose my-6 list-none border-t border-border p-0">
+  <slot />
+</ul>

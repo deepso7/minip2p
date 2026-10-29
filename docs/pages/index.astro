@@ -5,14 +5,14 @@ import Tabs from "blume/components/content/Tabs.astro";
 import PageLayout from "blume/components/layout/PageLayout.astro";
 import { highlightCode } from "blume/markdown";
 import Mascot from "../components/mascot.astro";
-import ConnectionAttempt from "../components/connection-attempt.astro";
-import SansIoLoop from "../components/sans-io-loop.astro";
+import StatusBar from "../components/status-bar.astro";
 // Both snippets are read verbatim from files CI checks, so the landing page
 // shows code that compiles: the Rust dialer (`cargo check` in the docs job)
 // and the Node example (`tsc` in the bindings job's `pnpm typecheck`).
 import dialer from "../snippets/quickstart/src/bin/dialer.rs?raw";
 // oxlint-disable-next-line import/default -- Vite's `?raw` adds the default export; the linter resolves the bare `.ts`.
 import ping from "../../examples/nodejs/ping.ts?raw";
+import { rustVersion as msrv, version } from "../components/workspace";
 
 const { config, navigation, fontCssVars } = data;
 
@@ -26,23 +26,41 @@ const [dialerHtml, pingHtml] = await Promise.all([
   highlight(ping, "ts"),
 ]);
 
-const platforms = [
-  {
-    body: "QUIC over quinn-proto with libp2p TLS certificates, and TCP upgraded with Noise XX and Yamux. One transport set routes each address to the transport that serves its shape.",
-    label: "Transports",
-    title: "QUIC and TCP",
-  },
-  {
-    body: "The core crates build for thumbv7em with no operating system. TCP runs over smoltcp, and mDNS discovery comes with it.",
-    label: "Embedded",
-    title: "no_std + alloc",
-  },
-  {
-    body: "One binding-agnostic FFI core, wrapped by napi-rs for Node and UniFFI for React Native, under a shared TypeScript SDK.",
-    label: "Bindings",
-    title: "Node and React Native",
-  },
+// The landing page is the project's man page: the sections a reader of
+// `man minip2p` expects, in the order they expect them.
+const install = [
+  { command: "cargo add minip2p-rs", note: "Rust" },
+  { command: "npm install @minip2p/node", note: "Node.js" },
+  { command: "npm install @minip2p/react-native", note: "React Native" },
+  { command: "npm install @minip2p/web", note: "browser" },
 ];
+
+// Cargo features of `minip2p-rs`, as `crates/minip2p/Cargo.toml` names them.
+const features = [
+  { body: "QUIC over quinn-proto with libp2p TLS. On by default; needs std.", name: "quic" },
+  { body: "TCP upgraded with Noise XX and Yamux, beside or instead of QUIC.", name: "tcp" },
+  { body: "AutoNAT probes and reachability state.", name: "autonat" },
+  { body: "Relay reservations and races, plus DCUtR hole punching with quic.", name: "relay" },
+  { body: "Signed gossipsub publish and subscribe.", name: "pubsub" },
+  { body: "Signed beacons, a shared peer book, and optional auto-dial.", name: "discovery" },
+  { body: "Local-link discovery over multicast DNS.", name: "mdns" },
+  { body: "Host a Circuit Relay v2 server.", name: "relay-server" },
+  { body: "TCP and mDNS over a host-owned smoltcp stack, for no_std devices.", name: "smoltcp" },
+];
+
+const seeAlso = [
+  { body: "Install, connect two peers, drive the event loop.", href: "/docs/rust/install", name: "minip2p-rust", section: 7 },
+  { body: "Node.js, React Native, and the browser.", href: "/docs/typescript/start", name: "minip2p-typescript", section: 7 },
+  { body: "The portable no_std + alloc endpoint.", href: "/docs/rust/embedded-devices", name: "minip2p-embedded", section: 7 },
+  { body: "Relays, AutoNAT, and hole punching.", href: "/docs/rust/traverse-nat", name: "minip2p-nat", section: 7 },
+  { body: "Every capability and what it needs.", href: "/docs/reference/feature-matrix", name: "minip2p-features", section: 5 },
+  { body: "What changed in each release.", href: "/changelog", name: "minip2p-changelog", section: 1 },
+  { body: "The Rust API reference.", href: "https://docs.rs/minip2p-rs/latest/minip2p/", name: "docs.rs", section: 3 },
+];
+
+const heading = "m-0 text-sm font-bold tracking-wide text-foreground";
+// The man-page indent, in rem so the larger NAME line lines up with the rest.
+const body = "mt-3 ps-5 sm:ps-14";
 ---
 
 <PageLayout
@@ -65,205 +83,117 @@ const platforms = [
     route: "/",
   }}
 >
-  <div
-    class="mx-auto -mt-16 flex min-h-dvh max-w-7xl flex-col px-6 pt-16 lg:px-8"
-  >
-    <p
-      class="m-0 shrink-0 pt-3 text-center sm:pt-4 font-mono text-xs text-muted-foreground lg:pt-8 landscape:max-lg:pt-2"
-    >
-      A minimal libp2p implementation
+  <article class="man mx-auto max-w-4xl px-6 pt-8 pb-20 font-mono text-sm leading-relaxed sm:pt-12 lg:px-8">
+    <p class="man-running m-0 flex justify-between sm:grid sm:grid-cols-[1fr_auto_1fr] gap-4 text-xs text-muted-foreground" aria-hidden="true">
+      <span>MINIP2P(7)</span>
+      <span class="hidden sm:inline">Peer-to-Peer Networking Manual</span>
+      <span class="text-end">MINIP2P(7)</span>
     </p>
-    <section
-      class="grid flex-1 grid-cols-1 content-evenly items-center gap-2 py-3 text-center sm:gap-4 sm:py-4 lg:grid-cols-3 lg:gap-8 lg:py-8 lg:text-left landscape:max-lg:grid-cols-2 landscape:max-lg:gap-2 landscape:max-lg:py-2"
-      aria-labelledby="hero-title"
-    >
+
+    {/* NAME and SYNOPSIS share the first screen with the mascot, at the size
+        it had on the old hero; it still watches the pointer and reacts when
+        booped. */}
+    <div class="mt-10 grid items-center gap-x-10 gap-y-8 lg:grid-cols-[minmax(0,1fr)_16rem]">
+      <figure class="m-0 justify-self-center lg:order-last lg:justify-self-end">
+        <div class="w-44 select-none sm:w-56 lg:w-64">
+          <Mascot
+            directions="/mascots/logo-directions.svg"
+            reactions="/mascots/logo-reactions.svg"
+            aspect={840 / 700}
+            label="minip2p dinosaur"
+          />
+        </div>
+        <figcaption class="mt-3 text-center text-xs text-muted-foreground">
+          fig. 1 — the dino. <span class="text-accent">boop it.</span>
+        </figcaption>
+      </figure>
+
       <div>
-        <h1
-          class="m-0 text-3xl font-medium leading-tight tracking-tighter sm:text-4xl xl:text-5xl landscape:max-lg:text-3xl"
-          id="hero-title"
-        >
-          Peer-to-peer.<br />Keep it simple.
-        </h1>
-        <p
-          class="mx-auto my-3 max-w-xs text-sm leading-relaxed text-muted-foreground lg:mx-0 lg:my-6 lg:text-base landscape:max-lg:my-2"
-        >
-          Connect applications over authenticated QUIC and TCP.
-        </p>
-        <div
-          class="mx-auto grid w-48 gap-3 sm:flex sm:w-auto sm:flex-wrap sm:justify-center lg:mx-0 lg:justify-start"
-        >
-          <a
-            class="inline-flex items-center justify-center gap-2 rounded-full border border-transparent bg-foreground px-3 py-3 text-sm font-medium text-background no-underline hover:bg-muted-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent sm:px-4 landscape:max-lg:py-2"
-            href="/intro">Read the docs <span aria-hidden="true">↗</span></a
-          >
-          <a
-            class="inline-flex items-center justify-center gap-2 rounded-full border border-border px-3 py-3 text-sm font-medium text-foreground no-underline hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent sm:px-4 landscape:max-lg:py-2"
-            href="https://github.com/deepso7/minip2p"
-            >GitHub <span aria-hidden="true">↗</span></a
-          >
-        </div>
+        <section aria-labelledby="man-name">
+          <h2 class={heading} id="man-name">NAME</h2>
+          <h1 class={`${body} mb-0 text-[clamp(1.25rem,2.6vw,1.875rem)] leading-tight font-normal text-foreground`}>
+            <b class="font-bold">minip2p</b> <span class="text-muted-foreground">—</span>{" "}
+            <span class="whitespace-nowrap">peer-to-peer,</span> <span class="whitespace-nowrap text-accent">kept simple.</span>
+          </h1>
+        </section>
+
+        <section class="mt-10" aria-labelledby="man-synopsis">
+          <h2 class={heading} id="man-synopsis">SYNOPSIS</h2>
+          <ul class={`${body} m-0 list-none p-0`}>
+            {
+              install.map(({ command, note }) => (
+                <li class="man-command group flex items-center gap-3 py-1">
+                  <span class="text-muted-foreground" aria-hidden="true">$</span>
+                  <code class="text-foreground">{command}</code>
+                  <span class="hidden text-muted-foreground sm:inline"># {note}</span>
+                  <button
+                    type="button"
+                    class="man-copy ms-auto text-xs text-muted-foreground hover:text-accent focus-visible:text-accent"
+                    data-copy={command}
+                    aria-label={`Copy ${command}`}
+                    hidden
+                  >
+                    copy
+                  </button>
+                </li>
+              ))
+            }
+          </ul>
+        </section>
       </div>
-      <div
-        class="relative isolate order-first w-28 select-none justify-self-center sm:w-48 lg:order-none lg:w-full landscape:max-lg:order-none landscape:max-lg:w-36"
-      >
-        <div
-          class="pointer-events-none absolute inset-0 -z-10 scale-150 rounded-full bg-accent/15 blur-3xl"
-          aria-hidden="true"
-        >
-        </div>
-        <Mascot
-          directions="/mascots/logo-directions.svg"
-          reactions="/mascots/logo-reactions.svg"
-          aspect={840 / 700}
-          label="minip2p dinosaur"
-        />
+    </div>
+
+    <section class="mt-10" aria-labelledby="man-description">
+      <h2 class={heading} id="man-description">DESCRIPTION</h2>
+      <div class={`${body} flex flex-col gap-4 text-muted-foreground`}>
+        <p class="m-0">
+          <b class="text-foreground">minip2p</b> is a minimal libp2p implementation
+          in Rust. It connects applications over authenticated QUIC and TCP,
+          negotiates custom protocol streams, and adds pubsub, discovery, relays,
+          and NAT traversal only when you ask for them.
+        </p>
+        <p class="m-0">
+          Nothing runs behind your back. There is no async runtime: the protocols
+          are deterministic sans-I/O state machines that move only when you call{" "}
+          <b class="text-foreground">wait</b>. Sockets, clocks, and timers live in
+          adapters, and{" "}
+          <span class="underline decoration-accent underline-offset-4">unsafe</span>{" "}
+          is forbidden across the workspace.
+        </p>
+        <p class="m-0">
+          The core builds as <b class="text-foreground">no_std + alloc</b> for
+          microcontrollers. Node.js, React Native, and the browser drive the same
+          endpoint through bindings, with Promises and typed events.
+        </p>
       </div>
-      <nav
-        class="flex flex-wrap justify-center gap-x-4 gap-y-2 lg:grid lg:justify-self-end lg:gap-7 landscape:max-lg:col-span-full"
-        aria-label="Get started by platform"
-      >
-        <a
-          class="group grid gap-1.5 py-1.5 text-foreground no-underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
-          href="/rust/install"
-        >
-          <span
-            class="text-xs font-medium underline-offset-4 group-hover:underline lg:text-sm"
-            >Rust</span
-          >
-          <small class="hidden text-sm text-muted-foreground lg:block"
-            >Drive your own event loop.</small
-          >
-        </a>
-        <a
-          class="group grid gap-1.5 py-1.5 text-foreground no-underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
-          href="/typescript/start"
-        >
-          <span
-            class="text-xs font-medium underline-offset-4 group-hover:underline lg:text-sm"
-            >Node.js &amp; React Native</span
-          >
-          <small class="hidden text-sm text-muted-foreground lg:block"
-            >Promises and typed events.</small
-          >
-        </a>
-        <a
-          class="group grid gap-1.5 py-1.5 text-foreground no-underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
-          href="/rust/embedded-devices"
-        >
-          <span
-            class="text-xs font-medium underline-offset-4 group-hover:underline lg:text-sm"
-            >Embedded Rust</span
-          >
-          <small class="hidden text-sm text-muted-foreground lg:block"
-            >A portable no_std + alloc core.</small
-          >
-        </a>
-      </nav>
-    </section>
-    <p class="shrink-0 pb-3 text-center sm:pb-4 landscape:max-lg:pb-2">
-      <a
-        class="font-mono text-xs text-muted-foreground no-underline hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
-        href="#how-it-works">How it works <span aria-hidden="true">↓</span></a
-      >
-    </p>
-  </div>
-
-  <div class="mx-auto max-w-7xl px-6 lg:px-8">
-    <section
-      class="border-t border-border py-16 sm:py-20"
-      id="how-it-works"
-      aria-labelledby="attempt-title"
-    >
-      <ConnectionAttempt>
-        <p class="m-0 font-mono text-xs uppercase tracking-wide text-muted-foreground">Connection attempt</p>
-        <h2 class="mt-4 mb-0 text-2xl font-medium leading-tight tracking-tighter sm:text-3xl" id="attempt-title">Many routes.<br />One outcome.</h2>
-        <p class="mt-4 mb-0 text-sm leading-relaxed text-muted-foreground sm:text-base">
-          Call <code class="font-mono text-foreground">connect</code> once. Every
-          route races inside one attempt, and your loop hears how it ends exactly
-          once.
-        </p>
-        <a class="text-sm text-foreground underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent" href="/rust/traverse-nat" slot="more"
-          >Traverse NAT <span aria-hidden="true">↗</span></a
-        >
-      </ConnectionAttempt>
     </section>
 
-    <section
-      class="border-t border-border py-16 sm:py-20"
-      aria-labelledby="loop-title"
-    >
-      <SansIoLoop>
-        <p class="m-0 font-mono text-xs uppercase tracking-wide text-muted-foreground">Sans-I/O</p>
-        <h2 class="mt-4 mb-0 text-2xl font-medium leading-tight tracking-tighter sm:text-3xl" id="loop-title">You drive<br />the loop.</h2>
-        <p class="mt-4 mb-0 text-sm leading-relaxed text-muted-foreground sm:text-base">
-          Nothing runs behind your back. Sockets, clocks and timers live in
-          adapters; the protocols are deterministic state machines that only move
-          when you call <code class="font-mono text-foreground">wait</code>.
-        </p>
-        <a class="text-sm text-foreground underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent" href="/rust/drive-events" slot="more"
-          >Drive events <span aria-hidden="true">↗</span></a
-        >
-      </SansIoLoop>
-    </section>
-
-    <section
-      class="border-t border-border py-16 sm:py-20"
-      aria-labelledby="platforms-title"
-    >
-      <p
-        class="m-0 font-mono text-xs uppercase tracking-wide text-muted-foreground"
-      >
-        Same core everywhere
+    <section class="mt-10" aria-labelledby="man-features">
+      <h2 class={heading} id="man-features">FEATURES</h2>
+      <p class={`${body} m-0 text-muted-foreground`}>
+        Cargo features of <b class="text-foreground">minip2p-rs</b>. Each adds a
+        capability without changing the endpoint interface.
       </p>
-      <h2
-        class="mt-4 mb-0 max-w-xl text-2xl font-medium leading-tight tracking-tighter sm:text-3xl"
-        id="platforms-title"
-      >
-        From a server to a microcontroller.
-      </h2>
-      <div class="mt-10 grid gap-4 md:grid-cols-3">
+      <dl class={`${body} m-0`}>
         {
-          platforms.map((platform) => (
-            <div class="rounded-blume border border-border p-6">
-              <p class="m-0 font-mono text-xs uppercase tracking-wide text-accent">
-                {platform.label}
-              </p>
-              <p class="mt-3 mb-0 text-lg font-medium">{platform.title}</p>
-              <p class="mt-2 mb-0 text-sm leading-relaxed text-muted-foreground">
-                {platform.body}
-              </p>
+          features.map(({ name, body: text }) => (
+            <div class="grid gap-x-6 py-1.5 sm:grid-cols-[16ch_1fr]">
+              <dt class="font-bold text-accent">{name}</dt>
+              <dd class="m-0 ps-[4ch] text-muted-foreground sm:ps-0">{text}</dd>
             </div>
           ))
         }
-      </div>
+      </dl>
     </section>
 
-    <section
-      class="border-t border-border py-16 sm:py-20"
-      aria-labelledby="start-title"
-    >
-      <p
-        class="m-0 font-mono text-xs uppercase tracking-wide text-muted-foreground"
-      >
-        Quickstart
-      </p>
-      <h2
-        class="mt-4 mb-0 text-2xl font-medium leading-tight tracking-tighter sm:text-3xl"
-        id="start-title"
-      >
-        Connect, then drive.
-      </h2>
-      <p
-        class="mt-4 mb-0 max-w-xl text-sm leading-relaxed text-muted-foreground sm:text-base"
-      >
-        Add <code class="font-mono text-foreground">minip2p-rs</code> or{" "}
-        <code class="font-mono text-foreground">@minip2p/node</code>, then dial
-        a peer, wait until it is ready, and ping it. Both snippets are shown
-        verbatim from the repository, and CI compiles both: the Rust dialer and
-        the TypeScript example you can run with Node.
+    <section class="mt-10" aria-labelledby="man-examples">
+      <h2 class={heading} id="man-examples">EXAMPLES</h2>
+      <p class={`${body} m-0 text-muted-foreground`}>
+        Dial a peer, wait until it is ready, and ping it. Both programs are
+        compiled in CI exactly as shown.
       </p>
       {/* `.prose` gives the tabs the same code styles as a docs page. */}
-      <div class="prose mt-8 max-w-none" data-quickstart>
+      <div class={`${body} prose man-example max-w-none`} data-quickstart>
         <Tabs hash={false}>
           <Tab title="Rust"><Fragment set:html={dialerHtml} /></Tab>
           <Tab title="TypeScript"><Fragment set:html={pingHtml} /></Tab>
@@ -291,37 +221,59 @@ const platforms = [
           </style>
         </noscript>
       </div>
-      <div class="mt-6 flex flex-wrap gap-4">
-        <a
-          class="text-sm text-foreground underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
-          href="/rust/install"
-          >Rust quickstart <span aria-hidden="true">↗</span></a
-        >
-        <a
-          class="text-sm text-foreground underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
-          href="/typescript/start"
-          >TypeScript quickstart <span aria-hidden="true">↗</span></a
-        >
-      </div>
     </section>
-  </div>
 
-  <footer
-    class="mx-auto max-w-7xl shrink-0 px-6 py-6 text-center text-xs text-muted-foreground lg:px-8"
-  >
-    Made with <svg
-      class="inline-block size-3.5 fill-accent align-middle"
-      viewBox="0 0 24 24"
-      role="img"
-      aria-label="love"
-      ><path
-        d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78Z"
-      ></path></svg
-    > by <a
-      class="text-foreground no-underline underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
-      href="https://deepso.sh"
-      target="_blank"
-      rel="noopener noreferrer">deepso</a
-    >
-  </footer>
+    <section class="mt-10" aria-labelledby="man-see-also">
+      <h2 class={heading} id="man-see-also">SEE ALSO</h2>
+      <ul class={`${body} m-0 list-none p-0`}>
+        {
+          seeAlso.map(({ href, name, section, body: text }) => {
+            const external = href.startsWith("http");
+            return (
+              <li>
+                <a
+                  class="group grid gap-x-6 py-1.5 text-muted-foreground no-underline sm:grid-cols-[24ch_1fr]"
+                  href={href}
+                  target={external ? "_blank" : undefined}
+                  rel={external ? "noopener noreferrer" : undefined}
+                >
+                  <span>
+                    <b class="text-foreground underline decoration-accent/60 underline-offset-4 group-hover:text-accent group-hover:decoration-accent">{name}</b>({section})
+                  </span>
+                  <span class="ps-[4ch] group-hover:text-foreground sm:ps-0">{text}</span>
+                </a>
+              </li>
+            );
+          })
+        }
+      </ul>
+    </section>
+
+    <p class="man-running mt-14 mb-0 flex justify-between sm:grid sm:grid-cols-[1fr_auto_1fr] gap-4 text-xs text-muted-foreground">
+      <span>minip2p {version}</span>
+      <span class="hidden sm:inline">{msrv && `rust ${msrv}+`}</span>
+      <span class="text-end">MINIP2P(7)</span>
+    </p>
+  </article>
+  <StatusBar slot="footer" />
 </PageLayout>
+
+<script>
+  // Copy buttons appear only where the Clipboard API does; otherwise the
+  // commands stay plain, selectable text. A denied write says so on the
+  // button rather than failing silently.
+  if (navigator.clipboard) {
+    for (const button of document.querySelectorAll<HTMLButtonElement>("[data-copy]")) {
+      button.hidden = false;
+      button.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(button.dataset.copy ?? "");
+          button.textContent = "copied";
+        } catch {
+          button.textContent = "select it";
+        }
+        setTimeout(() => (button.textContent = "copy"), 1500);
+      });
+    }
+  }
+</script>

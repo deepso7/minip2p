@@ -8,6 +8,20 @@ const brand = {
   white: "oklch(0.950 0.006 60)",
 } as const;
 
+// Paper Mono (OFL, fonts/paper-mono/OFL.txt) for every role: body, headings,
+// and code. It isn't on Google Fonts, so the site serves its own files.
+const paperMono = {
+  fallback: "mono",
+  name: "Paper Mono",
+  variants: [
+    { src: "./fonts/paper-mono/PaperMono-Regular.woff2", weight: 400 },
+    { src: "./fonts/paper-mono/PaperMono-Medium.woff2", weight: 500 },
+    { src: "./fonts/paper-mono/PaperMono-SemiBold.woff2", weight: 600 },
+    { src: "./fonts/paper-mono/PaperMono-Bold.woff2", weight: 700 },
+    { src: "./fonts/paper-mono/PaperMono-ExtraBold.woff2", weight: 800 },
+  ],
+} as const;
+
 export default defineConfig({
   content: {
     sources: [
@@ -35,10 +49,18 @@ export default defineConfig({
   },
   navigation: {
     tabs: [
-      { href: "/intro", label: "Docs", path: "/" },
+      { href: "/docs/intro", label: "Docs", path: "/docs" },
       { label: "Changelog", path: "/changelog" },
     ],
   },
+  // The docs lived at the site root until the landing page took it over.
+  redirects: [
+    { from: "/docs", to: "/docs/intro" },
+    { from: "/intro", to: "/docs/intro" },
+    { from: "/rust/:slug*", to: "/docs/rust/:slug*" },
+    { from: "/typescript/:slug*", to: "/docs/typescript/:slug*" },
+    { from: "/reference/:slug*", to: "/docs/reference/:slug*" },
+  ],
   seo: {
     og: {
       logo: "/logo.svg",
@@ -56,7 +78,13 @@ export default defineConfig({
       dark: brand.black,
       light: brand.white,
     },
-    radius: "sm",
+    fonts: {
+      body: paperMono,
+      display: paperMono,
+      mono: paperMono,
+    },
+    mode: "dark",
+    radius: "none",
   },
   title: "minip2p",
 });
