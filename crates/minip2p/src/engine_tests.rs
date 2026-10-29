@@ -38,7 +38,7 @@ impl EntropySource for CountingEntropy {
 /// and closes again within the same transport poll, so the batch carries
 /// both lifecycle events. Counts its polls.
 #[derive(Clone, Default)]
-struct FlashTransport {
+pub(crate) struct FlashTransport {
     queue: Arc<Mutex<VecDeque<TransportEvent>>>,
     polls: Arc<Mutex<usize>>,
     /// What `local_addresses` reports.
@@ -190,7 +190,7 @@ fn portable_batches_report_lifecycle_before_connect_settled() {
 }
 
 #[cfg(feature = "std")]
-fn std_endpoint(builder: crate::EndpointBuilder, transport: FlashTransport) -> Endpoint {
+pub(crate) fn std_endpoint(builder: crate::EndpointBuilder, transport: FlashTransport) -> Endpoint {
     let mut set = minip2p_transport::TransportSet::new();
     set.insert(
         minip2p_core::TransportKind::Tcp,
@@ -375,7 +375,7 @@ fn a_busy_batch_runs_one_capability_pass_and_no_address_refresh() {
         #[cfg(all(feature = "pubsub", not(feature = "discovery")))]
         let builder = builder.gossipsub();
         #[cfg(feature = "autonat")]
-        let builder = builder.autonat(server);
+        let builder = builder.autonat_server(server);
         #[cfg(not(feature = "autonat"))]
         drop(server);
         builder

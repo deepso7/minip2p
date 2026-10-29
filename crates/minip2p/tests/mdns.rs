@@ -17,7 +17,6 @@ fn endpoint() -> Endpoint {
             dial_tie_break: true,
             ..PeerDiscoveryConfig::default()
         })
-        .expect("valid shared discovery policy")
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")
         .bind()

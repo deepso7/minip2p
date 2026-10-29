@@ -22,13 +22,11 @@ fn discovery_endpoint() -> Endpoint {
             beacon_interval_ms: 100,
             ..BeaconConfig::default()
         })
-        .expect("valid discovery config")
         .peer_discovery_config(PeerDiscoveryConfig {
             beacon_peer_ttl_ms: 2_000,
             auto_dial: false,
             ..PeerDiscoveryConfig::default()
         })
-        .expect("valid peer discovery config")
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")
         .bind()
@@ -46,13 +44,11 @@ fn slow_heartbeat_discovery_endpoint() -> Endpoint {
             beacon_interval_ms: 100,
             ..BeaconConfig::default()
         })
-        .expect("valid discovery config")
         .peer_discovery_config(PeerDiscoveryConfig {
             beacon_peer_ttl_ms: 2_000,
             auto_dial: false,
             ..PeerDiscoveryConfig::default()
         })
-        .expect("valid peer discovery config")
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
         .expect("quic listen address")
         .bind()

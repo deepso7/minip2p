@@ -190,7 +190,7 @@ fn portable_autonat_builds_without_relay_state() {
     let mut endpoint = Endpoint::portable(&local, CountingEntropy(122))
         .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
         .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
-        .autonat(server_addr)
+        .autonat_server(server_addr)
         .build()
         .expect("portable AutoNAT endpoint builds");
 
@@ -222,7 +222,7 @@ fn autonat_picks_up_listen_addresses_bound_after_build() {
 
     let mut endpoint = Endpoint::portable(&local, CountingEntropy(142))
         .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
-        .autonat(server_addr)
+        .autonat_server(server_addr)
         .build()
         .expect("portable AutoNAT endpoint builds");
 
@@ -697,7 +697,7 @@ fn signed_discovery_reserves_its_pubsub_topic() {
             &format!("{DIALER_IP}/24"),
         ))
         .gossipsub()
-        .beacon_config(BeaconConfig {
+        .discovery_config(BeaconConfig {
             topic: RESERVED.into(),
             ..BeaconConfig::default()
         })

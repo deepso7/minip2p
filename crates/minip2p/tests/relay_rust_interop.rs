@@ -35,7 +35,6 @@ fn pinned_rust_libp2p_reserves_connects_and_exchanges_bytes() {
     };
     let mut relay = Endpoint::builder()
         .relay_server_config(config)
-        .unwrap()
         .listen_on("/ip4/127.0.0.1/tcp/0")
         .expect("tcp listen address")
         .bind()

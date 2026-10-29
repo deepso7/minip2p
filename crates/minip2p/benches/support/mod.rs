@@ -138,9 +138,7 @@ pub fn relay_builder() -> EndpointBuilder {
         max_circuit_duration_secs: 3600,
         ..RelayServerConfig::default()
     };
-    Endpoint::builder()
-        .relay_server_config(config)
-        .expect("relay server config")
+    Endpoint::builder().relay_server_config(config)
 }
 
 /// A [`relay_builder`] relay listening on loopback QUIC.

@@ -220,7 +220,7 @@ fn try_bind(
 ) -> Result<Endpoint, Box<dyn Error>> {
     let mut builder = Endpoint::builder()
         .identity(identity)
-        .relay_server_config(options.config.clone())?;
+        .relay_server_config(options.config.clone());
     if let (Some(certificate), Some(paths)) = (certificate, &options.webtransport_certificate) {
         builder = builder
             .webtransport_certificate_pem(&certificate.chain_pem, &certificate.key_pem)

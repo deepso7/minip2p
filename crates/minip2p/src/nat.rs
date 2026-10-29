@@ -136,6 +136,12 @@ pub(crate) struct NatDriver<T> {
 }
 
 impl<T: Transport> NatDriver<T> {
+    /// The configuration the agent runs, as Endpoint setup resolved it.
+    #[cfg(all(test, feature = "relay"))]
+    pub(crate) fn config(&self) -> &minip2p_nat::NatConfig {
+        self.agent.config()
+    }
+
     /// Creates a driver over `agent`. `relay_addrs` are the transport
     /// addresses of configured relays, retained so reservations can be
     /// advertised as circuit addresses. `jitter_seed`, drawn from the

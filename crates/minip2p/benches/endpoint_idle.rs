@@ -105,13 +105,10 @@ fn bind(variant: Variant) -> Endpoint {
     }
     if variant.mdns {
         // Nearby mDNS peers must not be dialed: the endpoint stays peerless.
-        builder = builder
-            .mdns()
-            .peer_discovery_config(PeerDiscoveryConfig {
-                auto_dial: false,
-                ..PeerDiscoveryConfig::default()
-            })
-            .expect("peer discovery config");
+        builder = builder.mdns().peer_discovery_config(PeerDiscoveryConfig {
+            auto_dial: false,
+            ..PeerDiscoveryConfig::default()
+        });
     }
     let mut endpoint = builder.bind().expect("bind endpoint");
     endpoint.listen_all().expect("listen");

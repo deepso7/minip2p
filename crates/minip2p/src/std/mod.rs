@@ -72,9 +72,9 @@ use crate::portable::connect::Expansion;
 use crate::setup::{self, Capabilities, Platform};
 use crate::{ConnectionInfo, Path};
 #[cfg(any(feature = "discovery", feature = "mdns"))]
-use crate::{DiscoveryConfigError, KnownPeer, PeerDiscoveryConfig};
+use crate::{KnownPeer, PeerDiscoveryConfig};
 #[cfg(feature = "mdns")]
-use crate::{MdnsConfig, MdnsConfigError, MdnsError};
+use crate::{MdnsConfig, MdnsError};
 #[cfg(feature = "autonat")]
 use crate::{NatConfig, ReachabilityState};
 #[cfg(feature = "relay-server")]
@@ -1331,16 +1331,10 @@ pub struct EndpointBuilder {
     relay_server_config: Option<RelayServerConfig>,
     #[cfg(feature = "relay-server")]
     relay_server_announce_addrs: Vec<Multiaddr>,
-    #[cfg(feature = "autonat")]
-    nat_config: Option<NatConfig>,
     #[cfg(feature = "relay")]
     circuit_limits: CircuitLimits,
-    #[cfg(feature = "autonat")]
-    relays: Vec<PeerAddr>,
-    #[cfg(feature = "autonat")]
-    autonat_servers: Vec<PeerAddr>,
-    /// Gossipsub, discovery and mDNS configuration; NAT and the relay
-    /// server join it at bind.
+    /// Capability intent for Endpoint setup, which applies the defaults; the
+    /// relay server joins it at bind.
     capabilities: Capabilities,
     connect_deadline: std::time::Duration,
     simultaneous_dial_window: std::time::Duration,
@@ -1369,14 +1363,8 @@ impl Default for EndpointBuilder {
             relay_server_config: None,
             #[cfg(feature = "relay-server")]
             relay_server_announce_addrs: Vec::new(),
-            #[cfg(feature = "autonat")]
-            nat_config: None,
             #[cfg(feature = "relay")]
             circuit_limits: CircuitLimits::default(),
-            #[cfg(feature = "autonat")]
-            relays: Vec::new(),
-            #[cfg(feature = "autonat")]
-            autonat_servers: Vec::new(),
             capabilities: Capabilities::default(),
         }
     }
@@ -1396,7 +1384,7 @@ impl EndpointBuilder {
     }
 
     /// Sets the Connection-attempt deadline. Default is 30 seconds.
-    pub fn connect_deadline(mut self, deadline: std::time::Duration) -> Self {
+    pub fn connect_deadline(mut self, deadline: Duration) -> Self {
         self.connect_deadline = deadline;
         self
     }
@@ -1409,7 +1397,7 @@ impl EndpointBuilder {
     /// window. A shorter one lets a peer that reconnects after its old
     /// connection died silently get back in sooner, at the cost of settling
     /// slow candidate races less reliably.
-    pub fn simultaneous_dial_window(mut self, window: std::time::Duration) -> Self {
+    pub fn simultaneous_dial_window(mut self, window: Duration) -> Self {
         self.simultaneous_dial_window = window;
         self
     }
@@ -1568,19 +1556,15 @@ impl EndpointBuilder {
         self
     }
 
-    /// Enables Circuit Relay v2 service with validated custom limits.
+    /// Enables Circuit Relay v2 service with custom limits.
     ///
-    /// Returns [`RelayServerConfigError`] with the invalid field path and reason
-    /// when a required value is zero or a duration exceeds the wire encoding.
-    /// A failed call leaves the builder unchanged.
+    /// Checked at bind ([`BindError::RelayServer`], naming the invalid field
+    /// and why): a required value that is zero, or a duration the wire
+    /// encoding cannot carry.
     #[cfg(feature = "relay-server")]
-    pub fn relay_server_config(
-        mut self,
-        config: RelayServerConfig,
-    ) -> Result<Self, RelayServerConfigError> {
-        config.validate()?;
+    pub fn relay_server_config(mut self, config: RelayServerConfig) -> Self {
         self.relay_server_config = Some(config);
-        Ok(self)
+        self
     }
 
     /// Configures advertised direct addresses without enabling relay service.
@@ -1627,16 +1611,24 @@ impl EndpointBuilder {
         Ok(self)
     }
 
-    /// Adds a relay for NAT traversal (circuit legs and reservations), in
-    /// preference order. Configuring at least one relay (or calling
-    /// [`EndpointBuilder::nat_config`]) enables the traversal agent.
+    /// Adds a relay, in preference order; each call adds one.
+    ///
+    /// A relay is a path, not a mode: connects still race direct candidates
+    /// against a leg through the relay, upgrade a relayed connection with
+    /// DCUtR where the endpoint runs it (QUIC), and reserve a slot on the
+    /// relay for inbound connections while the endpoint is not known to be
+    /// public. Without [`EndpointBuilder::nat_config`], that is the default
+    /// policy ([`ReservationPolicy::WhenPrivate`](crate::ReservationPolicy::WhenPrivate)),
+    /// with DCUtR only when the endpoint is built with QUIC. For relay-only
+    /// connects set [`NatConfig::force_relay`].
     #[cfg(feature = "relay")]
     pub fn relay(mut self, relay: PeerAddr) -> Self {
-        self.relays.push(relay);
+        self.capabilities.relays.push(relay);
         self
     }
 
-    /// Adds an AutoNAT server used for reachability probing.
+    /// Adds an AutoNAT server used for reachability probing; each call adds
+    /// one.
     ///
     /// Call once per server: a reachability verdict needs a quorum of
     /// distinct servers ([`NatConfig::confidence_threshold`], 3 by default),
@@ -1645,22 +1637,24 @@ impl EndpointBuilder {
     /// reservation ([`ReservationPolicy::Never`](crate::ReservationPolicy::Never)).
     #[cfg(feature = "autonat")]
     pub fn autonat_server(mut self, server: PeerAddr) -> Self {
-        self.autonat_servers.push(server);
+        self.capabilities.autonat_servers.push(server);
         self
     }
 
     /// Sets the base NAT configuration (timeouts, punch retries,
-    /// reservation policy, …). Relays and AutoNAT servers added through
+    /// reservation policy, …), kept as given. A second call replaces the
+    /// first. Relays and AutoNAT servers added through
     /// `EndpointBuilder::relay` / [`EndpointBuilder::autonat_server`] are
-    /// appended to the config's own lists.
+    /// appended to the config's own lists, in either call order, without
+    /// exact repeats.
     ///
-    /// Checked at bind ([`BindError::NatConfig`]): it needs a relay or an
-    /// AutoNAT server, and a reservation policy other than `Never` or
-    /// `force_relay` needs a relay. Without any NAT configuration, discovery and mDNS turn NAT on
-    /// for the peers they find.
+    /// Checked at bind, after the merge ([`BindError::NatConfig`]): it needs
+    /// a relay or an AutoNAT server, and a reservation policy other than
+    /// `Never` or `force_relay` needs a relay. Without any NAT
+    /// configuration, discovery and mDNS turn NAT on for the peers they find.
     #[cfg(feature = "autonat")]
     pub fn nat_config(mut self, config: NatConfig) -> Self {
-        self.nat_config = Some(config);
+        self.capabilities.nat = Some(config);
         self
     }
 
@@ -1701,20 +1695,19 @@ impl EndpointBuilder {
         self
     }
 
-    /// Enables discovery with an explicitly validated configuration.
+    /// Enables discovery with an explicit beacon configuration, checked at
+    /// bind before any socket opens ([`BindError::Discovery`]).
     ///
-    /// Validation occurs before any transport bind can allocate a socket.
     /// The configured topic is driver-owned: subscribing to it again through
     /// [`Endpoint::subscribe`] is redundant, and its pubsub messages and
     /// subscription events are consumed before reaching the application.
     #[cfg(feature = "discovery")]
-    pub fn discovery_config(mut self, config: BeaconConfig) -> Result<Self, DiscoveryConfigError> {
-        config.validate()?;
+    pub fn discovery_config(mut self, config: BeaconConfig) -> Self {
         self.capabilities
             .gossipsub
             .get_or_insert_with(GossipsubConfig::default);
         self.capabilities.beacon = Some(config);
-        Ok(self)
+        self
     }
 
     /// Enables local-link mDNS discovery with interoperable defaults.
@@ -1724,27 +1717,23 @@ impl EndpointBuilder {
         self
     }
 
-    /// Enables local-link mDNS discovery with an explicitly validated configuration.
-    ///
-    /// Validation occurs before the QUIC or mDNS sockets are allocated.
+    /// Enables local-link mDNS discovery with an explicit configuration,
+    /// checked at bind before the QUIC or mDNS sockets open
+    /// ([`BindError::Mdns`]).
     #[cfg(feature = "mdns")]
-    pub fn mdns_config(mut self, config: MdnsConfig) -> Result<Self, MdnsConfigError> {
-        config.validate()?;
+    pub fn mdns_config(mut self, config: MdnsConfig) -> Self {
         self.capabilities.mdns = Some(config);
-        Ok(self)
+        self
     }
 
-    /// Overrides the shared address-book and automatic-dial policy.
+    /// Overrides the shared address-book and automatic-dial policy, checked
+    /// at bind ([`BindError::Discovery`]).
     ///
     /// This policy is shared by every enabled discovery source.
     #[cfg(any(feature = "discovery", feature = "mdns"))]
-    pub fn peer_discovery_config(
-        mut self,
-        config: PeerDiscoveryConfig,
-    ) -> Result<Self, DiscoveryConfigError> {
-        config.validate()?;
+    pub fn peer_discovery_config(mut self, config: PeerDiscoveryConfig) -> Self {
         self.capabilities.peer_discovery = config;
-        Ok(self)
+        self
     }
 
     /// Builds the endpoint, bringing up every transport it was given.
@@ -1833,40 +1822,14 @@ impl EndpointBuilder {
         false
     }
 
-    /// Moves every capability's configuration out for Endpoint setup: NAT
-    /// from its explicit config, relays and AutoNAT servers, and the relay
-    /// server with its announce addresses.
-    ///
-    /// Without an explicit config, AutoNAT servers alone hold no
-    /// reservation; relays keep the default policy, with DCUtR only where
-    /// the endpoint runs it. Discovery and mDNS turn
-    /// NAT on in setup, not here.
+    /// Moves the capability intent out for Endpoint setup, which applies
+    /// every default; the relay server joins it with its announce addresses.
     fn take_capabilities(&mut self) -> Capabilities {
         #[cfg_attr(
-            not(any(feature = "autonat", feature = "relay-server")),
-            expect(unused_mut, reason = "only NAT and the relay server join here")
+            not(feature = "relay-server"),
+            expect(unused_mut, reason = "only the relay server joins here")
         )]
         let mut capabilities = std::mem::take(&mut self.capabilities);
-        #[cfg(feature = "autonat")]
-        if self.nat_config.is_some() || !self.relays.is_empty() || !self.autonat_servers.is_empty()
-        {
-            let relays = !self.relays.is_empty();
-            let mut config = self.nat_config.take().unwrap_or_else(|| {
-                if relays {
-                    // DCUtR only where this endpoint runs it, so `.relay(..)`
-                    // alone also binds without QUIC.
-                    NatConfig {
-                        dcutr: STD_PLATFORM.runs_dcutr,
-                        ..NatConfig::default()
-                    }
-                } else {
-                    setup::no_reservation_nat()
-                }
-            });
-            config.relays.append(&mut self.relays);
-            config.autonat_servers.append(&mut self.autonat_servers);
-            capabilities.nat = Some(config);
-        }
         #[cfg(feature = "relay-server")]
         if let Some(config) = self.relay_server_config.take() {
             capabilities.relay_server = Some(setup::RelayServerSetup {
@@ -2925,9 +2888,17 @@ mod tests {
             beacon_interval_ms: 0,
             ..BeaconConfig::default()
         };
+        // TEST-NET-1 is never a local address: a socket bind would fail.
         assert!(matches!(
-            Endpoint::builder().discovery_config(config),
-            Err(DiscoveryConfigError::ZeroBeaconInterval)
+            Endpoint::builder()
+                .discovery_config(config)
+                .listen_on("/ip4/192.0.2.1/udp/0/quic-v1")
+                .expect("quic listen address")
+                .bind()
+                .err(),
+            Some(BindError::Discovery(
+                crate::DiscoveryConfigError::ZeroBeaconInterval
+            ))
         ));
     }
 
@@ -4418,9 +4389,17 @@ mod tests {
             max_packet_bytes: 4_097,
             ..MdnsConfig::default()
         };
+        // TEST-NET-1 is never a local address: a socket bind would fail.
         assert!(matches!(
-            Endpoint::builder().mdns_config(config),
-            Err(MdnsConfigError::InvalidMaxPacketBytes)
+            Endpoint::builder()
+                .mdns_config(config)
+                .listen_on("/ip4/192.0.2.1/udp/0/quic-v1")
+                .expect("quic listen address")
+                .bind()
+                .err(),
+            Some(BindError::Mdns(
+                crate::MdnsConfigError::InvalidMaxPacketBytes
+            ))
         ));
     }
 
@@ -4433,7 +4412,6 @@ mod tests {
                 auto_dial: false,
                 ..PeerDiscoveryConfig::default()
             })
-            .expect("valid peer discovery policy")
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")
             .bind()
@@ -4457,7 +4435,6 @@ mod tests {
         };
         let mut endpoint = Endpoint::builder()
             .discovery_config(config)
-            .expect("valid discovery configuration")
             .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic listen address")
             .bind()
