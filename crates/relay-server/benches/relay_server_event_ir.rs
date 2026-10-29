@@ -467,6 +467,12 @@ fn with_new_connector(size: u64) -> (Scale, SwarmEvent) {
     };
     establish(&mut scale, &peer_id, stream.conn_id, NOW);
     open_hop(&mut scale, &peer_id, stream, NOW);
+    // Reserved peer 0 already carries a circuit on `STOP_STREAM`; the new
+    // circuit's STOP leg must be a stream of its own, not replace that one.
+    scale.swarm.next_open = Some(StreamKey {
+        conn_id: reserved_conn(0),
+        stream_id: StreamId::new(STOP_STREAM + 1),
+    });
     let request = stream_data(
         &peer_id,
         stream,
