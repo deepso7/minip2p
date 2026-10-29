@@ -1055,7 +1055,6 @@ fn cancel_after_a_relayed_settle_keeps_the_promoted_circuit() {
             .expect("harvest");
         let now = initiator.now();
         let engine = &mut initiator.engine;
-        engine.expire_attempts(now);
         for event in engine.core.poll(now).expect("poll") {
             engine.ingest(event, now);
         }
@@ -1066,9 +1065,7 @@ fn cancel_after_a_relayed_settle_keeps_the_promoted_circuit() {
                 .expect("settled on a connection");
         }
         engine
-            .drive(now, &mut |addr| {
-                crate::connect::Expansion::Ready(vec![addr.clone()])
-            })
+            .drive(now, &mut crate::names::Concrete)
             .expect("drive");
         let _ = responder
             .next_event(std::time::Duration::from_millis(5))

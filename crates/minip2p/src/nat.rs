@@ -6,8 +6,8 @@
 //! engine in `crate::connect` decides when to use them.
 
 #[cfg(feature = "relay")]
-use alloc::{collections::BTreeMap, string::ToString};
-use alloc::{collections::VecDeque, vec, vec::Vec};
+use alloc::collections::BTreeMap;
+use alloc::{collections::VecDeque, string::ToString, vec, vec::Vec};
 #[cfg(not(feature = "relay"))]
 use core::marker::PhantomData;
 use minip2p_core::platform::{Deadline, EntropySource, Now};
@@ -25,6 +25,8 @@ use minip2p_swarm::{SwarmCore, SwarmEvent};
 #[cfg(feature = "relay")]
 use minip2p_transport::TransportError;
 use minip2p_transport::{ConnectionId, StreamId, Transport};
+
+use crate::names::{Expander, Expansion, NameAnswer, NameAnswers, answer_for};
 
 /// Joins the bytes a promoted bridge still owes into one payload; a single
 /// chunk is passed through.
@@ -98,6 +100,9 @@ pub(crate) struct NatDriver<T> {
     /// What the driver keeps around the swarm for the agent's commands,
     /// lent to the agent beside it as an [`EndpointSwarm`].
     io: HostIo<T>,
+    /// Parked dials whose name lookup is under way, until its answer comes
+    /// back or the agent stops waiting on them.
+    resolving: Vec<(NatToken, PeerAddr)>,
     /// The bound-address revision the agent's `listen_addrs` were seeded
     /// from; callers can bind through any swarm path between driver turns.
     listen_addrs_revision: u64,
@@ -130,6 +135,7 @@ impl<T: Transport> NatDriver<T> {
             relay_addrs,
             public_addrs: Vec::new(),
             io: HostIo::new(),
+            resolving: Vec::new(),
             // Matches a fresh runtime: seed only after a real `listen*`
             // call bumped the revision. Some transports report bound-but-
             // not-listening sockets from `local_addresses`, so syncing on
@@ -146,43 +152,96 @@ impl<T: Transport> NatDriver<T> {
         self
     }
 
-    /// Parks relay and AutoNAT dials to `/dns*` hosts for the caller to
-    /// resolve off the driver; see [`Self::take_named_dials`].
-    #[cfg(feature = "std")]
+    /// Parks relay and AutoNAT dials to `/dns*` hosts instead of rejecting
+    /// them, for an engine whose [`Expander`] resolves names (the std
+    /// Endpoint); see [`Self::expand_parked`].
+    #[cfg(any(feature = "std", test))]
     pub(crate) fn park_named_dials(&mut self) {
         self.io.parked = Some(Vec::new());
     }
 
-    /// Moves out the parked `/dns*` dials. Each must come back through
-    /// [`Self::named_dial_resolved`] once its name has an answer.
-    #[cfg(feature = "std")]
-    pub(crate) fn take_named_dials(&mut self) -> Vec<(NatToken, PeerAddr)> {
-        self.io
-            .parked
-            .as_mut()
-            .map(core::mem::take)
-            .unwrap_or_default()
+    /// Expands the dials parked since the last call that the agent still
+    /// waits on: a dial whose lookup started waits for [`Self::resolved`], and one expansion settles at
+    /// once (refused, say at the resolver's lookup cap) is finished now.
+    /// Repeats until nothing new is parked, since a finished dial can make
+    /// the agent park the next (a relay leg moving on to its next relay).
+    pub(crate) fn expand_parked<R: EntropySource>(
+        &mut self,
+        names: &mut dyn Expander,
+        swarm: &mut SwarmCore<T, R>,
+        now: Now,
+    ) {
+        loop {
+            let parked = self
+                .io
+                .parked
+                .as_mut()
+                .map(core::mem::take)
+                .unwrap_or_default();
+            if parked.is_empty() {
+                return;
+            }
+            for (token, addr) in parked {
+                // A dial whose flight ended before it was expanded (its
+                // attempt cancelled or expired) starts no lookup: a lookup
+                // cannot be cancelled and would hold a resolver slot.
+                if !self.agent.deferred_dial_wanted(token, now) {
+                    continue;
+                }
+                let answer = match names.expand(&addr) {
+                    Expansion::Resolving => {
+                        self.resolving.push((token, addr));
+                        continue;
+                    }
+                    Expansion::Ready(targets) => Ok(targets),
+                    Expansion::Refused(reason) => Err(reason),
+                };
+                self.finish_named_dial(token, answer, swarm, now);
+            }
+        }
     }
 
-    /// Whether the agent still waits on a parked dial; retires it when not.
-    /// See [`NatAgent::deferred_dial_wanted`].
-    #[cfg(feature = "std")]
-    pub(crate) fn named_dial_wanted(&mut self, token: NatToken, sample: Now) -> bool {
-        self.agent.deferred_dial_wanted(token, sample)
+    /// Applies a batch's Name-resolution answers to the dials waiting on
+    /// them. Dials the agent no longer waits on (their flight ended while
+    /// the name resolved) are retired first, so their answers are dropped
+    /// and retries during a stall do not pile up.
+    pub(crate) fn resolved<R: EntropySource>(
+        &mut self,
+        answers: &NameAnswers,
+        swarm: &mut SwarmCore<T, R>,
+        now: Now,
+    ) {
+        let agent = &mut self.agent;
+        self.resolving
+            .retain(|(token, _)| agent.deferred_dial_wanted(*token, now));
+        if answers.is_empty() {
+            return;
+        }
+        let mut answered = Vec::new();
+        self.resolving
+            .retain(|(token, addr)| match answer_for(addr, answers) {
+                Some(answer) => {
+                    answered.push((*token, answer));
+                    false
+                }
+                None => true,
+            });
+        for (token, answer) in answered {
+            self.finish_named_dial(token, answer, swarm, now);
+        }
     }
 
     /// Finishes a parked dial: dials the first resolved address the swarm
     /// accepts, or reports the resolution failure, then pumps the agent. An
     /// answer for a dial the agent no longer waits on is dropped.
-    #[cfg(feature = "std")]
-    pub(crate) fn named_dial_resolved<R: EntropySource>(
+    fn finish_named_dial<R: EntropySource>(
         &mut self,
         token: NatToken,
-        resolved: Result<Vec<PeerAddr>, alloc::string::String>,
+        resolved: NameAnswer,
         swarm: &mut SwarmCore<T, R>,
         sample: Now,
     ) {
-        if !self.named_dial_wanted(token, sample) {
+        if !self.agent.deferred_dial_wanted(token, sample) {
             return;
         }
         let result = resolved.and_then(|targets| {

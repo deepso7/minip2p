@@ -28,11 +28,11 @@ pub use minip2p_transport::{
     ConnectionCloseReason, ConnectionId, InvalidLimit, StreamId, Transport, TransportError,
 };
 
+pub(crate) use crate::connect::DEFAULT_CONNECT_DEADLINE_MS;
 pub use crate::connect::{
     CandidateFailure, ConnectFailure, ConnectId, ConnectOutcome, ConnectTarget, ConnectTargetError,
     RelayFailure,
 };
-pub(crate) use crate::connect::{DEFAULT_CONNECT_DEADLINE_MS, Expansion};
 mod event_stream;
 pub use event_stream::EndpointEvent;
 mod stream_acks;
@@ -82,6 +82,7 @@ pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
 pub use minip2p_tcp::{TcpConfig, TcpProvider, TcpTransport};
 
 use crate::engine::Engine;
+use crate::names::Concrete;
 #[cfg(feature = "relay")]
 use crate::nat::CircuitOps;
 #[cfg(feature = "autonat")]
@@ -121,12 +122,6 @@ fn portable_platform(has_circuits: bool) -> Platform {
         has_circuits,
         mdns_shares_transport: true,
     }
-}
-
-/// Candidate expansion for portable endpoints: addresses are already
-/// concrete, so expansion is the identity.
-fn expand_concrete(addr: &PeerAddr) -> Expansion {
-    Expansion::Ready(alloc::vec![addr.clone()])
 }
 
 /// Caller-driven endpoint over an injected transport and entropy source.
@@ -288,7 +283,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         now: Now,
     ) -> Result<ConnectId, ConnectTargetError> {
         let target = target.try_into().map_err(Into::into)?;
-        Ok(self.engine.connect(target, &mut expand_concrete, now))
+        Ok(self.engine.connect(target, &mut Concrete, now))
     }
 
     /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
@@ -486,7 +481,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// An error discards nothing: events already queued come out of the next
     /// call, and [`Self::next_deadline`] is immediate until then.
     pub fn poll(&mut self, now: Now) -> Result<Vec<EndpointEvent>, DriverError> {
-        self.engine.drive(now, &mut expand_concrete)?;
+        self.engine.drive(now, &mut Concrete)?;
         Ok(self.engine.take_events())
     }
 
@@ -521,7 +516,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
                 first_error = Some(error);
             }
         }
-        let drove = self.engine.drive(now, &mut expand_concrete);
+        let drove = self.engine.drive(now, &mut Concrete);
         #[cfg(feature = "pubsub")]
         {
             self.engine.collect_agent_events();

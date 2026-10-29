@@ -11,11 +11,17 @@
 //! [`Engine::drive`] runs one batch, the unit of work behind std `poll`,
 //! std `wait`, and portable `poll`:
 //!
-//! 1. Ingest one bounded batch of swarm events: one transport poll, or two
+//! 1. Name resolution: expire due attempts, then apply the [`Expander`]'s
+//!    answers to Connection attempts and to NAT dials parked on a name.
+//!    Expiry comes first so a late answer cannot turn a Timeout into another
+//!    outcome.
+//! 2. Ingest one bounded batch of swarm events: one transport poll, or two
 //!    around the mDNS tick when the mDNS carrier shares the transport's
 //!    stack (mDNS can put bytes into the shared sockets).
-//! 2. One capability pass: relay-server, NAT, Gossipsub, Discovery.
-//! 3. Connection-attempt terminals.
+//! 3. One capability pass: relay-server, NAT, Gossipsub, Discovery.
+//! 4. Expand the NAT dials the batch parked on a name, so their lookups run
+//!    before the caller sleeps, and route what expansion settled at once.
+//! 5. Connection-attempt terminals.
 //!
 //! The batch's output is queued in that order: the swarm events, then
 //! capability events (relay-server, NAT, Gossipsub, Discovery, mDNS), then
@@ -60,16 +66,17 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use minip2p_core::platform::{Deadline, EntropySource, Now};
-use minip2p_core::{Bytes, Multiaddr, Path, PeerAddr, PeerId};
+use minip2p_core::{Bytes, Multiaddr, Path, PeerId};
 use minip2p_swarm::{DriverError, SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
 use crate::connect::{
-    ConnectAdmission, ConnectEngine, ConnectId, ConnectTarget, Expansion, LegProvider, Legs,
-    circuit_relay, is_punched,
+    ConnectAdmission, ConnectEngine, ConnectId, ConnectTarget, LegProvider, Legs, circuit_relay,
+    is_punched,
 };
 #[cfg(feature = "_peer-book")]
 use crate::discovery::{DiscoveryDriver, resolve_book_candidates};
+use crate::names::Expander;
 #[cfg(feature = "autonat")]
 use crate::nat::NatDriver;
 #[cfg(feature = "pubsub")]
@@ -197,7 +204,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     pub(crate) fn connect(
         &mut self,
         target: ConnectTarget,
-        expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
+        names: &mut dyn Expander,
         now: Now,
     ) -> ConnectId {
         let peer = target.peer_id().clone();
@@ -219,7 +226,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                 allow_relay: true,
                 targets,
             },
-            expand,
+            names,
             now,
         );
         self.settle(now);
@@ -574,29 +581,58 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
     // ---------------------------------------------------------------------
 
     /// Settles attempts whose deadline passed. [`Self::drive`] does this
-    /// first; std calls it before applying Name-resolution answers, so a
-    /// late answer cannot turn a Timeout into another outcome.
-    pub(crate) fn expire_attempts(&mut self, now: Now) {
+    /// before it applies Name-resolution answers, so a late answer cannot
+    /// turn a Timeout into another outcome.
+    fn expire_attempts(&mut self, now: Now) {
         self.connect
             .expire(Legs::of(&mut self.nat), &mut self.core, now);
     }
 
     /// Runs one drive batch (see the module docs) and queues its output.
     ///
+    /// `names` expands candidates and parked NAT dials, and its answers are
+    /// routed here, in this order: expire due attempts; expand NAT dials
+    /// parked since the last batch; apply the answers to Connection attempts,
+    /// then to parked NAT dials; run the batch; expand the NAT dials the
+    /// batch parked, so their lookups are under way before the caller
+    /// sleeps and whatever expansion settled at once is routed in this
+    /// batch.
+    ///
     /// An error discards nothing: what this batch already queued stays
     /// queued, and the next batch finishes the rest.
-    pub(crate) fn drive(
-        &mut self,
-        now: Now,
-        expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
-    ) -> Result<(), DriverError> {
+    pub(crate) fn drive(&mut self, now: Now, names: &mut dyn Expander) -> Result<(), DriverError> {
         self.expire_attempts(now);
+        self.expand_parked(now, names);
+        let answers = names.take_answers();
+        self.connect.resolved(&answers, &mut self.core);
+        #[cfg(feature = "autonat")]
+        if let Some(nat) = self.nat.as_mut() {
+            nat.resolved(&answers, &mut self.core, now);
+        }
+        if !answers.is_empty() {
+            self.route_nat(now);
+        }
         self.ingest_transport(now)?;
         #[cfg(feature = "mdns")]
         self.tick_mdns(now)?;
-        self.capability_pass(now, expand);
+        self.capability_pass(now, names);
+        self.expand_parked(now, names);
         self.settle(now);
         Ok(())
+    }
+
+    /// Expands the NAT dials parked on Name resolution since the last call
+    /// (see `NatDriver::expand_parked`) and routes what that settled.
+    #[cfg_attr(
+        not(feature = "autonat"),
+        expect(unused_variables, reason = "only NAT parks dials")
+    )]
+    fn expand_parked(&mut self, now: Now, names: &mut dyn Expander) {
+        #[cfg(feature = "autonat")]
+        if let Some(nat) = self.nat.as_mut() {
+            nat.expand_parked(names, &mut self.core, now);
+            self.route_nat(now);
+        }
     }
 
     /// One transport poll's worth of swarm events.
@@ -713,7 +749,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             reason = "only the discovery sweep expands candidates"
         )
     )]
-    fn capability_pass(&mut self, now: Now, expand: &mut dyn FnMut(&PeerAddr) -> Expansion) {
+    fn capability_pass(&mut self, now: Now, names: &mut dyn Expander) {
         #[cfg(test)]
         {
             self.stats.capability_passes += 1;
@@ -739,7 +775,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                 Legs::of(&mut self.nat),
                 &mut self.connect,
                 &mut self.core,
-                expand,
+                names,
                 now,
             );
             self.route_nat(now);
