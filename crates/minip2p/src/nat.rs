@@ -160,8 +160,8 @@ impl<T: Transport> NatDriver<T> {
         self.io.parked = Some(Vec::new());
     }
 
-    /// Expands the dials parked since the last call: a dial whose lookup
-    /// started waits for [`Self::resolved`], and one expansion settles at
+    /// Expands the dials parked since the last call that the agent still
+    /// waits on: a dial whose lookup started waits for [`Self::resolved`], and one expansion settles at
     /// once (refused, say at the resolver's lookup cap) is finished now.
     /// Repeats until nothing new is parked, since a finished dial can make
     /// the agent park the next (a relay leg moving on to its next relay).
@@ -182,6 +182,12 @@ impl<T: Transport> NatDriver<T> {
                 return;
             }
             for (token, addr) in parked {
+                // A dial whose flight ended before it was expanded (its
+                // attempt cancelled or expired) starts no lookup: a lookup
+                // cannot be cancelled and would hold a resolver slot.
+                if !self.agent.deferred_dial_wanted(token, now) {
+                    continue;
+                }
                 let answer = match names.expand(&addr) {
                     Expansion::Resolving => {
                         self.resolving.push((token, addr));

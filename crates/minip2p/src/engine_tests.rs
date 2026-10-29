@@ -1123,6 +1123,22 @@ fn an_answer_for_a_nat_dial_no_longer_wanted_is_dropped() {
     assert!(f.dialed(f.relay.peer_id()).is_empty());
 }
 
+/// A dial whose flight ended before its first expansion starts no lookup:
+/// a lookup cannot be cancelled, and a stalled one would hold a resolver
+/// slot that live attempts need.
+#[cfg(feature = "autonat")]
+#[test]
+fn a_nat_dial_cancelled_before_expansion_starts_no_lookup() {
+    let mut f = RelayLegFixture::with_relay(87, true, "/dns4/relay.test/tcp/4001");
+    let mut names = FakeNames::default();
+    let now = Now::from_millis(0);
+    let engine = &mut f.endpoint.engine;
+    let id = engine.connect(f.peer.clone().into(), &mut names, now);
+    engine.cancel_connect(id, now);
+    engine.drive(now, &mut names).expect("drive");
+    assert!(names.lookups.is_empty(), "{:?}", names.lookups);
+}
+
 /// One answer serves every consumer naming the host: candidates of
 /// different shapes (`/dns4` over TCP, `/dns6` over QUIC) and a parked
 /// relay dial (`/dns`, another port) each rebuild their own targets.
