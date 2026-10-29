@@ -30,13 +30,20 @@
 //! The session also ends orderly, in either direction: [`WtSession::close`]
 //! sends `CLOSE_WEBTRANSPORT_SESSION` and finishes the CONNECT stream, and a
 //! peer's capsule, CONNECT FIN, reset or STOP_SENDING, or GOAWAY reports
-//! [`WtEvent::PeerClosed`]. The connection then waits for a deadline (or,
-//! when the peer ended the session, [`WtSession::ended_and_delivered`])
-//! before closing QUIC, so the capsule or a refusal's status, and our FIN,
-//! reach the peer.
+//! [`WtEvent::PeerClosed`]. The connection then resets its own streams and
+//! calls [`WtSession::start_closing`]; the session owns the Closing phase's
+//! wait (see [`WT_CLOSE_MIN`]) and the rule for ending it early, so the
+//! capsule or a refusal's status, and our FIN, reach the peer before
+//! [`WtSession::poll_close`] tells the connection to close QUIC.
+//!
+//! The session also owns its handshake deadline, armed at QUIC handshake
+//! completion: [`WtSession::poll_timeout`] is the one session deadline the
+//! connection's timer folds in, and [`WtSession::disarm`] drops both
+//! deadlines on a hard shutdown.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use minip2p_core::platform::{EntropySource, StdEntropy};
 use minip2p_core::{Multihash, PeerId};
@@ -63,6 +70,13 @@ const MAX_EARLY_STREAMS: usize = 4;
 /// to their HEADERS or prefix), held streams and the Noise stream; one more
 /// fails the connection.
 const MAX_EARLY_BYTES: usize = 16 * 1024;
+
+/// Bounds on the Closing phase's wait, which [`WtSession::start_closing`]
+/// arms and [`WtSession::poll_close`] ends: `max(3 × RTT, 500 ms)`, capped
+/// at 2 s. A peer-ended session may close QUIC sooner; one we closed waits
+/// it out (see [`WtSession::may_close_early`]).
+const WT_CLOSE_MIN: Duration = Duration::from_millis(500);
+const WT_CLOSE_MAX: Duration = Duration::from_secs(2);
 
 /// What every WebTransport connection of one transport shares.
 #[derive(Debug)]
@@ -100,6 +114,16 @@ pub(crate) enum WtEvent {
     /// The session cannot go on: close the connection with this HTTP/3
     /// code.
     Fail { code: u64, reason: String },
+}
+
+/// A session deadline that came due, from [`WtSession::poll_close`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WtClose {
+    /// Noise did not complete in time: close the connection with
+    /// `H3_EXCESSIVE_LOAD`, reporting `TimedOut`.
+    HandshakeTimedOut,
+    /// The Closing phase is over: close QUIC with `H3_NO_ERROR`.
+    CloseQuic,
 }
 
 /// One peer unidirectional stream.
@@ -251,6 +275,14 @@ pub(crate) struct WtSession {
     /// follows them.
     out: HashMap<u64, (Vec<u8>, bool)>,
     events: Vec<WtEvent>,
+    /// When the connection fails for not authenticating: until Noise
+    /// completes, the Closing phase starts, or the session is disarmed.
+    handshake_deadline: Option<Instant>,
+    /// In the Closing phase: when QUIC closes with `H3_NO_ERROR` at the
+    /// latest.
+    close_at: Option<Instant>,
+    /// We closed the session, so the Closing phase waits out `close_at`.
+    we_closed: bool,
 }
 
 /// How a read of a stream ended.
@@ -263,7 +295,13 @@ pub(crate) enum ReadEnd {
 }
 
 impl WtSession {
-    pub(crate) fn new(ctx: Arc<WebTransportContext>) -> Self {
+    /// A session for an `h3` connection whose QUIC handshake completed at
+    /// `armed_at`: Noise must complete within `handshake_timeout` of it.
+    pub(crate) fn new(
+        ctx: Arc<WebTransportContext>,
+        armed_at: Instant,
+        handshake_timeout: Duration,
+    ) -> Self {
         Self {
             ctx,
             control: None,
@@ -283,6 +321,9 @@ impl WtSession {
             closing: false,
             out: HashMap::new(),
             events: Vec::new(),
+            handshake_deadline: Some(armed_at + handshake_timeout),
+            close_at: None,
+            we_closed: false,
         }
     }
 
@@ -382,11 +423,21 @@ impl WtSession {
         }
     }
 
-    /// Ends the session's own streams but CONNECT as the session closes
-    /// (draft-14 §6), whichever side closed it: the Noise stream and every
-    /// unfinished head and held stream are reset and stopped with `code`,
-    /// and Noise replies still waiting for credit are dropped.
-    pub(crate) fn end_streams(&mut self, conn: &mut Connection, code: VarInt) {
+    /// Starts the Closing phase, after the connection reset its own
+    /// streams: the session's own streams but CONNECT end (draft-14 §6),
+    /// whichever side closed it (the Noise stream and every unfinished head
+    /// and held stream are reset and stopped with `code`, and Noise replies
+    /// still waiting for credit are dropped), the handshake deadline is
+    /// dropped, and QUIC may close `max(3 × RTT, 500 ms)` from `now`, capped
+    /// at 2 s. `we_closed` says the session ended from our side, which waits
+    /// the whole phase out.
+    pub(crate) fn start_closing(
+        &mut self,
+        conn: &mut Connection,
+        now: Instant,
+        code: VarInt,
+        we_closed: bool,
+    ) {
         self.closing = true;
         let streams: Vec<u64> = self
             .heads
@@ -399,19 +450,77 @@ impl WtSession {
             self.out.remove(&raw);
             refuse(conn, raw, code.into_inner());
         }
+        self.handshake_deadline = None;
+        self.we_closed = we_closed;
+        self.close_at = Some(now + (conn.rtt() * 3).clamp(WT_CLOSE_MIN, WT_CLOSE_MAX));
     }
 
-    /// Whether QUIC may close without discarding the session's end: the peer
-    /// finished or reset its side of the CONNECT stream (or never opened
-    /// one) and acknowledged our FIN on the
-    /// CONNECT stream, or stopped it. Packets the connection queued before
-    /// that FIN (its resets) went out with or ahead of it. A CONNECT stream
-    /// we reset (after a stop, or for data after the close capsule) never
-    /// qualifies.
-    pub(crate) fn ended_and_delivered(&self) -> bool {
-        self.connect
-            .as_ref()
-            .is_none_or(|connect| connect.peer_ended && connect.delivered && !connect.refused)
+    /// The session's next deadline: the handshake's, or the Closing
+    /// phase's. Never both: closing drops the handshake deadline.
+    pub(crate) fn poll_timeout(&self) -> Option<Instant> {
+        self.close_at.or(self.handshake_deadline)
+    }
+
+    /// What the connection must do now about a session deadline, reported
+    /// once: the handshake ran out, or the Closing phase is over (its
+    /// deadline passed, or [`Self::may_close_early`] holds). The connection
+    /// does the close itself, since the engine drops queued resets and FINs
+    /// with it.
+    pub(crate) fn poll_close(&mut self, now: Instant) -> Option<WtClose> {
+        if let Some(at) = self.close_at {
+            if now < at && !self.may_close_early() {
+                return None;
+            }
+            self.close_at = None;
+            return Some(WtClose::CloseQuic);
+        }
+        if self
+            .handshake_deadline
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.handshake_deadline = None;
+            return Some(WtClose::HandshakeTimedOut);
+        }
+        None
+    }
+
+    /// Ends the Closing phase now, for a transport that will not be polled
+    /// again: the next [`Self::poll_close`] reports it over. Outside the
+    /// phase, nothing changes.
+    pub(crate) fn cut_closing(&mut self, now: Instant) {
+        if self.close_at.is_some() {
+            self.close_at = Some(now);
+        }
+    }
+
+    /// Drops both deadlines, for a connection shut down hard (a local or
+    /// failed close, or transport loss): no session timeout fires and no
+    /// further QUIC close is asked for.
+    pub(crate) fn disarm(&mut self) {
+        self.handshake_deadline = None;
+        self.close_at = None;
+    }
+
+    /// Whether the Closing phase may end before its deadline, closing QUIC
+    /// without discarding the session's end. Only when the peer ended the
+    /// session, never when we closed it: Chrome ends its CONNECT stream and
+    /// acknowledges ours in its network stack, before the page's `closed`
+    /// settles, and a QUIC close in that window rejects `closed` with
+    /// "Connection lost" instead of fulfilling it.
+    ///
+    /// A peer-ended session qualifies once the peer finished or reset its
+    /// side of the CONNECT stream (or never opened one) and acknowledged our
+    /// FIN on it, or stopped it: packets the connection queued before that
+    /// FIN (its resets) went out with or ahead of it. A CONNECT stream we
+    /// reset (after a stop, or for data after the close capsule) never
+    /// qualifies: nothing acknowledges a reset, so only the deadline lets
+    /// the resets out first.
+    fn may_close_early(&self) -> bool {
+        !self.we_closed
+            && self
+                .connect
+                .as_ref()
+                .is_none_or(|connect| connect.peer_ended && connect.delivered && !connect.refused)
     }
 
     /// The engine is done sending on `raw`: everything was acknowledged, or
@@ -1326,6 +1435,7 @@ impl WtSession {
                 noise.session = None;
             }
             self.established = true;
+            self.handshake_deadline = None;
             self.events.push(WtEvent::Established { peer, token });
             self.promote_held(conn);
         } else if !matches!(end, ReadEnd::Open) {

@@ -9,7 +9,7 @@ use std::mem;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use minip2p_core::Protocol;
+use minip2p_core::{PeerId, Protocol};
 use minip2p_transport::{
     ConnectionCloseReason, ConnectionEndpoint, ConnectionId, ConnectionState, ConnectionToken,
     SendCaps, StreamId, TransportError, TransportEvent,
@@ -24,7 +24,7 @@ use quinn_proto::{
 use crate::diagnostics::ConnectionCounters;
 use crate::rotation::{SharedContext, current_context};
 use crate::socket::Sockets;
-use crate::webtransport::{ReadEnd, WtEvent, WtSession};
+use crate::webtransport::{ReadEnd, WtClose, WtEvent, WtSession};
 
 /// TLS exporter label for the connection token both ends derive.
 const TOKEN_LABEL: &[u8] = b"minip2p quic connection token";
@@ -36,12 +36,6 @@ const MAX_SERVICE_PASSES: usize = 4;
 /// Most queued bytes one stream hands the engine per turn of the send
 /// scheduler, so backlogged streams share the peer's connection credit.
 const SEND_QUANTUM: usize = 64 * 1024;
-
-/// Bounds on a WebTransport session's Closing phase: `max(3 × RTT, 500 ms)`,
-/// capped at 2 s. A peer-ended session may close QUIC sooner; one we closed
-/// waits it out (see [`QuicConnection::finish_wt_closing`]).
-const WT_CLOSE_MIN: Duration = Duration::from_millis(500);
-const WT_CLOSE_MAX: Duration = Duration::from_secs(2);
 
 /// What servicing a connection needs from its transport.
 pub(crate) struct Cx<'a> {
@@ -243,20 +237,19 @@ pub(crate) struct QuicConnection {
     counters: ConnectionCounters,
     /// Set for connections to a WebTransport-serving socket: what an `h3`
     /// handshake needs to authenticate.
-    webtransport: Option<SharedContext>,
-    /// The WebTransport session, once the handshake negotiated `h3`.
+    webtransport: Option<WtConfig>,
+    /// The WebTransport session, once the handshake negotiated `h3`. It
+    /// owns the session's deadlines and when its Closing phase ends.
     wt: Option<WtSession>,
-    /// How long an `h3` connection may take to authenticate.
-    wt_handshake_timeout: Duration,
-    /// When an `h3` connection that has not authenticated yet is closed.
-    wt_deadline: Option<Instant>,
-    /// In a WebTransport session's Closing phase: when QUIC closes with
-    /// `H3_NO_ERROR` at the latest, if the peer has not ended its CONNECT
-    /// stream before.
-    wt_close_at: Option<Instant>,
-    /// Whether the Closing phase may end before `wt_close_at`, once the
-    /// session's end is delivered: not when we closed the session.
-    wt_close_early: bool,
+}
+
+/// What a connection to a WebTransport-serving socket starts its session
+/// with.
+struct WtConfig {
+    /// The Noise context, read once TLS completes.
+    context: SharedContext,
+    /// How long, from QUIC handshake completion, Noise may take.
+    handshake_timeout: Duration,
 }
 
 /// The engine's id for a raw stream id the adapter tracks.
@@ -305,12 +298,11 @@ impl QuicConnection {
             timeout: None,
             unfinished: false,
             counters,
-            webtransport,
+            webtransport: webtransport.map(|context| WtConfig {
+                context,
+                handshake_timeout: Duration::from_millis(limits.webtransport_handshake_timeout_ms),
+            }),
             wt: None,
-            wt_handshake_timeout: Duration::from_millis(limits.webtransport_handshake_timeout_ms),
-            wt_deadline: None,
-            wt_close_at: None,
-            wt_close_early: false,
         }
     }
 
@@ -427,16 +419,10 @@ impl QuicConnection {
     /// socket error the output hit, whose datagram was dropped as lost.
     pub(crate) fn service(&mut self, now: Instant, cx: &mut Cx<'_>) -> Option<io::Error> {
         self.unfinished = true;
-        if self.is_closing() {
-            self.wt_deadline = None;
-        } else if self.wt_deadline.is_some_and(|deadline| deadline <= now) {
-            self.close_reason
-                .get_or_insert(ConnectionCloseReason::TimedOut);
-            self.close_with(
-                now,
-                minip2p_webtransport::h3::code::H3_EXCESSIVE_LOAD,
-                "the WebTransport handshake timed out".into(),
-            );
+        // The handshake deadline, before anything else runs. A Closing
+        // phase ends below, once this service's events are in.
+        if !self.is_closing() {
+            self.poll_wt_close(now);
         }
         for _ in 0..MAX_SERVICE_PASSES {
             if self
@@ -455,7 +441,7 @@ impl QuicConnection {
                 wt.open_control(&mut self.conn);
                 wt.flush(&mut self.conn);
                 self.after_wt(now, cx.events);
-                self.finish_wt_closing(now);
+                self.poll_wt_close(now);
             }
             self.bind_pending_opens(now);
             self.drain_send_queues(now, cx.events);
@@ -475,10 +461,8 @@ impl QuicConnection {
         }
         let failure = self.transmit(now, cx);
         // The engine's timer, or an earlier WebTransport one.
-        self.timeout = [self.conn.poll_timeout(), self.wt_deadline, self.wt_close_at]
-            .into_iter()
-            .flatten()
-            .min();
+        let wt = self.wt.as_ref().and_then(WtSession::poll_timeout);
+        self.timeout = [self.conn.poll_timeout(), wt].into_iter().flatten().min();
         self.gc_closed_streams();
         failure
     }
@@ -585,9 +569,7 @@ impl QuicConnection {
     /// fails before `Connected`.
     fn on_connected(&mut self, now: Instant, cx: &mut Cx<'_>) {
         if self.negotiated_alpn().as_deref() == Some(crate::tls::H3_ALPN) {
-            // Read now, after TLS: whatever certificate the handshake got,
-            // a context at least as new lists its hash.
-            let Some(context) = self.webtransport.as_ref().map(current_context) else {
+            let Some(config) = self.webtransport.as_ref() else {
                 self.fail_connection(
                     now,
                     "h3 on a socket that does not serve WebTransport".into(),
@@ -598,15 +580,21 @@ impl QuicConnection {
             let mut transport = self.endpoint.transport().clone();
             transport.push(Protocol::WebTransport);
             self.endpoint = ConnectionEndpoint::new(transport);
+            // Read now, after TLS: whatever certificate the handshake got,
+            // a context at least as new lists its hash. The handshake
+            // deadline runs from here, QUIC handshake completion.
+            let mut wt = WtSession::new(
+                current_context(&config.context),
+                now,
+                config.handshake_timeout,
+            );
             // The CONNECT and Noise streams are the session's own, not
             // application streams: the engine's peer bidi credit gets room
             // for both on top of `max_streams_per_connection`, which the
             // adapter goes on enforcing for application streams.
             self.reserve_wt_streams(2);
-            let mut wt = WtSession::new(context);
             wt.open_control(&mut self.conn);
             self.wt = Some(wt);
-            self.wt_deadline = Some(now + self.wt_handshake_timeout);
             self.accept_streams(Dir::Uni, now, cx.events);
             self.accept_streams(Dir::Bi, now, cx.events);
             return;
@@ -619,32 +607,47 @@ impl QuicConnection {
         let mut token = [0u8; 32];
         // Left unset rather than guessed if the exporter fails, as the
         // transport contract asks.
-        if self
+        let token = self
             .conn
             .crypto_session()
             .export_keying_material(&mut token, TOKEN_LABEL, b"")
             .is_ok()
-        {
+            .then_some(token);
+        self.authenticated(peer_id, token, cx.events);
+        self.accept_streams(Dir::Bi, now, cx.events);
+        self.accept_streams(Dir::Uni, now, cx.events);
+    }
+
+    /// The peer authenticated, by TLS on `libp2p` or by Noise on `h3`: the
+    /// connection is up and surfaces streams. `token` is `None` only when
+    /// native QUIC's exporter failed; Noise always yields one. Reports
+    /// `Connected`, then `PeerIdentityVerified` when `peer` differs from the
+    /// id the endpoint held (a WebTransport endpoint holds none).
+    fn authenticated(
+        &mut self,
+        peer: PeerId,
+        token: Option<[u8; 32]>,
+        events: &mut Vec<TransportEvent>,
+    ) {
+        if let Some(token) = token {
             self.endpoint.set_token(ConnectionToken::new(token));
         }
         let previous = self.endpoint.peer_id().cloned();
-        let changed = previous.as_ref() != Some(&peer_id);
-        self.endpoint.set_peer_id(peer_id);
+        let changed = previous.as_ref() != Some(&peer);
+        self.endpoint.set_peer_id(peer);
         self.state = ConnectionState::Connected;
         self.surfaces_streams = true;
-        cx.events.push(TransportEvent::Connected {
+        events.push(TransportEvent::Connected {
             id: self.id,
             endpoint: self.endpoint.clone(),
         });
         if changed {
-            cx.events.push(TransportEvent::PeerIdentityVerified {
+            events.push(TransportEvent::PeerIdentityVerified {
                 id: self.id,
                 endpoint: self.endpoint.clone(),
                 previous_peer_id: previous,
             });
         }
-        self.accept_streams(Dir::Bi, now, cx.events);
-        self.accept_streams(Dir::Uni, now, cx.events);
     }
 
     /// Acts on what the WebTransport session reported: the authenticated
@@ -659,22 +662,9 @@ impl QuicConnection {
                     if self.is_closing() {
                         continue;
                     }
-                    self.wt_deadline = None;
                     // Only the CONNECT stream stays the session's.
                     self.reserve_wt_streams(1);
-                    self.endpoint.set_peer_id(peer);
-                    self.endpoint.set_token(ConnectionToken::new(token));
-                    self.state = ConnectionState::Connected;
-                    self.surfaces_streams = true;
-                    events.push(TransportEvent::Connected {
-                        id: self.id,
-                        endpoint: self.endpoint.clone(),
-                    });
-                    events.push(TransportEvent::PeerIdentityVerified {
-                        id: self.id,
-                        endpoint: self.endpoint.clone(),
-                        previous_peer_id: None,
-                    });
+                    self.authenticated(peer, Some(token), events);
                 }
                 WtEvent::Admit {
                     raw,
@@ -749,7 +739,7 @@ impl QuicConnection {
         };
         self.close_reason.get_or_insert(reason);
         self.end_writes();
-        self.wt_close_at = None;
+        self.disarm_wt();
         self.state = ConnectionState::Closed;
     }
 
@@ -1367,6 +1357,7 @@ impl QuicConnection {
             Some(false) => code::H3_NO_ERROR,
             None => 0,
         };
+        self.disarm_wt();
         self.conn.close(
             now,
             VarInt::from_u64(code).unwrap_or(VarInt::from_u32(0)),
@@ -1380,8 +1371,9 @@ impl QuicConnection {
     }
 
     /// Starts a WebTransport session's Closing phase: no more stream events,
-    /// every open stream reset, and a deadline for the peer to end its
-    /// CONNECT stream. [`Self::finish_wt_closing`] closes QUIC.
+    /// and every open stream reset. The session ends its own streams and
+    /// arms the phase's wait; [`Self::poll_wt_close`] closes QUIC when the
+    /// session says the phase is over.
     fn enter_wt_closing(&mut self, now: Instant, reason: ConnectionCloseReason) {
         self.state = ConnectionState::Closing;
         self.surfaces_streams = false;
@@ -1401,50 +1393,54 @@ impl QuicConnection {
         for state in self.stream_states.values_mut() {
             state.local_write_closed = true;
         }
+        let we_closed = reason == ConnectionCloseReason::Local;
         if let Some(wt) = self.wt.as_mut() {
-            wt.end_streams(&mut self.conn, code);
+            wt.start_closing(&mut self.conn, now, code, we_closed);
         }
-        let wait = (self.conn.rtt() * 3).clamp(WT_CLOSE_MIN, WT_CLOSE_MAX);
-        self.wt_close_early = reason != ConnectionCloseReason::Local;
         self.close_reason.get_or_insert(reason);
-        self.wt_close_at = Some(now + wait);
-        self.finish_wt_closing(now);
+        self.poll_wt_close(now);
     }
 
-    /// Ends the Closing phase once the deadline passed, or sooner for a
-    /// session the peer ended, once it ended its CONNECT stream and
-    /// acknowledged ours: QUIC closes with `H3_NO_ERROR`. Closing before
-    /// that would discard our FIN and resets, which the engine drops with a
-    /// close.
-    ///
-    /// A session we closed always waits out the deadline: Chrome ends its
-    /// CONNECT stream and acknowledges ours in its network stack, before the
-    /// page's `closed` settles, and a QUIC close in that window rejects
-    /// `closed` with "Connection lost" instead of fulfilling it.
-    fn finish_wt_closing(&mut self, now: Instant) {
-        let Some(at) = self.wt_close_at else {
-            return;
-        };
-        let delivered =
-            self.wt_close_early && self.wt.as_ref().is_some_and(WtSession::ended_and_delivered);
-        if now < at && !delivered {
-            return;
+    /// Acts on a due WebTransport session deadline: a handshake that ran
+    /// out closes the connection with `H3_EXCESSIVE_LOAD`, reporting
+    /// `TimedOut`; a Closing phase that is over closes QUIC with
+    /// `H3_NO_ERROR`. QUIC closes here, not in the session, because the
+    /// engine drops queued resets and FINs with the close.
+    fn poll_wt_close(&mut self, now: Instant) {
+        match self.wt.as_mut().and_then(|wt| wt.poll_close(now)) {
+            Some(WtClose::HandshakeTimedOut) => {
+                self.close_reason
+                    .get_or_insert(ConnectionCloseReason::TimedOut);
+                self.close_with(
+                    now,
+                    code::H3_EXCESSIVE_LOAD,
+                    "the WebTransport handshake timed out".into(),
+                );
+            }
+            Some(WtClose::CloseQuic) => self.conn.close(
+                now,
+                VarInt::from_u64(code::H3_NO_ERROR).unwrap_or(VarInt::from_u32(0)),
+                Bytes::new(),
+            ),
+            None => {}
         }
-        self.wt_close_at = None;
-        self.conn.close(
-            now,
-            VarInt::from_u64(code::H3_NO_ERROR).unwrap_or(VarInt::from_u32(0)),
-            Bytes::new(),
-        );
     }
 
     /// Ends a WebTransport session's Closing phase now, for a transport that
     /// will not be polled again: QUIC closes with `H3_NO_ERROR` without
     /// waiting for the deadline. Anything else is left as it is.
     pub(crate) fn cut_wt_closing(&mut self, now: Instant) {
-        if self.wt_close_at.is_some() {
-            self.wt_close_at = Some(now);
-            self.finish_wt_closing(now);
+        if let Some(wt) = self.wt.as_mut() {
+            wt.cut_closing(now);
+            self.poll_wt_close(now);
+        }
+    }
+
+    /// A hard shutdown: the WebTransport session, if any, keeps no deadline,
+    /// so no session timeout fires and no extra QUIC close follows.
+    fn disarm_wt(&mut self) {
+        if let Some(wt) = self.wt.as_mut() {
+            wt.disarm();
         }
     }
 
@@ -1668,6 +1664,7 @@ impl QuicConnection {
     /// error again.
     fn fail_connection(&mut self, now: Instant, message: String) {
         self.end_writes();
+        self.disarm_wt();
         self.close_reason
             .get_or_insert(ConnectionCloseReason::Error(message));
         // 1 is QUIC's INTERNAL_ERROR.
@@ -1683,7 +1680,7 @@ impl QuicConnection {
     /// Closes an `h3` connection with an HTTP/3 error code; `Closed`
     /// follows with `message` as its reason.
     fn close_with(&mut self, now: Instant, code: u64, message: String) {
-        self.wt_deadline = None;
+        self.disarm_wt();
         self.end_writes();
         let code = VarInt::from_u64(code).unwrap_or(VarInt::from_u32(1));
         self.conn
