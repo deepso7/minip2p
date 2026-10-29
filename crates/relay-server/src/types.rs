@@ -1,6 +1,6 @@
 use alloc::string::String;
 
-use minip2p_core::{Bytes, PeerId};
+use minip2p_core::PeerId;
 use minip2p_relay::Status;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -13,84 +13,6 @@ pub struct StreamKey {
     pub conn_id: ConnectionId,
     /// Stream id within that connection.
     pub stream_id: StreamId,
-}
-
-/// Opaque correlation token echoed with a driver result.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RelayServerToken(pub(crate) u64);
-
-/// I/O operation requested from the relay server's host.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RelayServerAction {
-    /// Open and negotiate a protocol on an exact connection.
-    OpenStream {
-        /// Correlation token echoed to `stream_open_result`.
-        token: RelayServerToken,
-        /// Remote peer expected on the connection.
-        peer_id: PeerId,
-        /// Connection on which the stream must land.
-        expected_conn_id: ConnectionId,
-        /// Multistream-select protocol id to negotiate.
-        protocol_id: String,
-    },
-    /// Queue a byte chunk on a stream.
-    SendStream {
-        /// Correlation token echoed to `send_stream_result`.
-        token: RelayServerToken,
-        /// Remote peer owning the stream.
-        peer_id: PeerId,
-        /// Exact destination stream.
-        stream: StreamKey,
-        /// Chunk to queue; report a partial write as
-        /// [`RelayServerSendError::Full`] with the unsent tail.
-        data: Bytes,
-    },
-    /// Acknowledge `bytes` of a stream's delivered data as consumed, which
-    /// returns receive credit to its sender (ADR 0012). Untokenized: no
-    /// result is echoed.
-    ///
-    /// The relay acknowledges control messages as it reads them and circuit
-    /// payload only once the other leg accepts it, so a full leg pauses its
-    /// sender. The host must not acknowledge claimed data itself.
-    AckStream {
-        /// Exact stream whose data was consumed.
-        stream: StreamKey,
-        /// Bytes consumed.
-        bytes: usize,
-    },
-    /// Half-close the local write side.
-    CloseStreamWrite {
-        /// Correlation token echoed to `close_stream_write_result`.
-        token: RelayServerToken,
-        /// Remote peer owning the stream.
-        peer_id: PeerId,
-        /// Exact stream to half-close.
-        stream: StreamKey,
-    },
-    /// Abruptly reset a stream.
-    ResetStream {
-        /// Correlation token echoed to `reset_stream_result`.
-        token: RelayServerToken,
-        /// Remote peer owning the stream.
-        peer_id: PeerId,
-        /// Exact stream to reset.
-        stream: StreamKey,
-    },
-}
-
-/// Why a [`RelayServerAction::SendStream`] did not queue every byte.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RelayServerSendError {
-    /// The stream queued a prefix and refused `unsent`, the rest (the whole
-    /// chunk when nothing fit). Retryable, never a fault (ADR 0012): the
-    /// relay holds the tail and resends it on the stream's
-    /// `SwarmEvent::StreamWritable`.
-    Full {
-        /// Exact unsent suffix of the chunk.
-        unsent: Bytes,
-    },
-    /// The transport rejected the send.
-    Failed(String),
 }
 
 /// Exactly-once terminal reason for a committed reservation.
@@ -175,7 +97,7 @@ pub enum RelayServerRuntimeErrorKind {
     CloseStream,
     /// A stream reset failed.
     ResetStream,
-    /// The caller/agent action contract was violated.
+    /// An agent invariant failed.
     InternalInvariant,
 }
 

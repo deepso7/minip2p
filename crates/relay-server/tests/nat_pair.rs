@@ -5,16 +5,18 @@
     reason = "The helper functions assert the fixed action sequence of this acceptance test."
 )]
 
+mod common;
+
 use minip2p_core::platform::Now;
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
 use minip2p_nat::{
     BridgeHandoff, ConnectLegs, DialStart, NatAgent, NatConfig, NatEvent, NatSwarm, NatSwarmError,
     NatToken, Path, PromoteError, ReservationPolicy,
 };
-use minip2p_relay_server::{
-    RelayServerAction, RelayServerAgent, RelayServerConfig, RelayServerEvent, StreamKey,
-};
+use minip2p_relay_server::{RelayServerConfig, RelayServerEvent, StreamKey};
 use minip2p_swarm::SwarmEvent;
+
+use common::{Call, Node};
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 const CLIENT_RELAY_CONN: ConnectionId = ConnectionId::new(1);
@@ -151,38 +153,20 @@ impl NatSwarm for ClientSwarm {
     }
 }
 
-/// The relay's next I/O action, skipping its read acknowledgements.
-fn relay_action(server: &mut RelayServerAgent) -> Option<RelayServerAction> {
-    core::iter::from_fn(|| server.poll_action())
-        .find(|action| !matches!(action, RelayServerAction::AckStream { .. }))
-}
-
-fn relay_send(server: &mut RelayServerAgent, ms: u64) -> (StreamKey, Vec<u8>) {
-    let RelayServerAction::SendStream {
-        token,
-        stream,
-        data,
-        ..
-    } = relay_action(server).expect("relay sends control bytes")
-    else {
-        panic!("expected relay SendStream action")
+/// The one control or payload write the relay issued since the last call.
+fn relay_send(server: &mut Node) -> (StreamKey, Vec<u8>) {
+    let sends: Vec<_> = server
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Send { stream, data, .. } => Some((stream, data)),
+            _ => None,
+        })
+        .collect();
+    let [send] = &sends[..] else {
+        panic!("expected one relay write, got {sends:?}")
     };
-    server.send_stream_result(token, Ok(()), at(ms));
-    (stream, data.to_vec())
-}
-
-fn finish_relay_stream_cleanup(server: &mut RelayServerAgent, ms: u64) {
-    while let Some(action) = relay_action(server) {
-        match action {
-            RelayServerAction::CloseStreamWrite { token, .. } => {
-                server.close_stream_write_result(token, Ok(()), at(ms));
-            }
-            RelayServerAction::ResetStream { token, .. } => {
-                server.reset_stream_result(token, Ok(()), at(ms));
-            }
-            other => panic!("unexpected relay action during cleanup: {other:?}"),
-        }
-    }
+    send.clone()
 }
 
 fn establish_relay_session(agent: &mut NatAgent, swarm: &mut ClientSwarm, relay: &PeerId, ms: u64) {
@@ -232,7 +216,7 @@ fn ready_client_hop(
 }
 
 fn ready_server_hop(
-    server: &mut RelayServerAgent,
+    server: &mut Node,
     client: &PeerId,
     conn_id: ConnectionId,
     stream_id: StreamId,
@@ -259,8 +243,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     let relay_addr = PeerAddr::new(addr("/ip4/203.0.113.1/udp/4001/quic-v1"), relay.clone())
         .expect("peer address");
 
-    let mut server =
-        RelayServerAgent::new(relay.clone(), RelayServerConfig::default()).expect("valid defaults");
+    let mut server = Node::unannounced(RelayServerConfig::default());
     server
         .set_listener_addrs(vec![addr("/ip4/203.0.113.1/udp/4001/quic-v1")])
         .expect("usable relay address");
@@ -318,7 +301,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         false,
         at(5),
     );
-    let (_, reserve_response) = relay_send(&mut server, 6);
+    let (_, reserve_response) = relay_send(&mut server);
     destination_nat.handle_event(
         &mut destination_swarm,
         &SwarmEvent::StreamData {
@@ -330,7 +313,6 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         false,
         at(6),
     );
-    finish_relay_stream_cleanup(&mut server, 6);
     assert!(destination_nat.active_reservation().is_some());
     assert_eq!(server.reservation_count(), 1);
 
@@ -364,6 +346,11 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     ready_client_hop(&mut source_nat, &mut source_swarm, &relay, source_hop, 14);
     ready_server_hop(&mut server, &source, SOURCE_RELAY_CONN, source_hop, 14);
     let connect_request = source_swarm.take_sent();
+    let stop_key = StreamKey {
+        conn_id: DESTINATION_RELAY_CONN,
+        stream_id: StreamId::new(DESTINATION_STOP),
+    };
+    server.swarm.next_open = Some(stop_key);
     server.handle_event(
         &SwarmEvent::StreamData {
             peer_id: source.clone(),
@@ -374,22 +361,12 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         false,
         at(15),
     );
-
-    let action = relay_action(&mut server).expect("relay opens STOP");
-    let RelayServerAction::OpenStream {
-        token,
-        expected_conn_id,
-        ..
-    } = action
-    else {
-        panic!("expected relay OpenStream action, got {action:?}")
-    };
-    assert_eq!(expected_conn_id, DESTINATION_RELAY_CONN);
-    let stop_key = StreamKey {
-        conn_id: DESTINATION_RELAY_CONN,
-        stream_id: StreamId::new(DESTINATION_STOP),
-    };
-    server.stream_open_result(token, Ok(stop_key), at(16));
+    assert_eq!(
+        common::opened(&server.calls()),
+        Some(stop_key),
+        "relay opens STOP on the destination's reserved connection"
+    );
+    assert!(server.stop_ready(&destination, stop_key, at(16)));
     destination_nat.handle_event(
         &mut destination_swarm,
         &SwarmEvent::StreamReady {
@@ -402,7 +379,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         false,
         at(16),
     );
-    let (_, stop_request) = relay_send(&mut server, 17);
+    let (_, stop_request) = relay_send(&mut server);
     destination_nat.handle_event(
         &mut destination_swarm,
         &SwarmEvent::StreamData {
@@ -426,7 +403,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         false,
         at(18),
     );
-    let (_, hop_response) = relay_send(&mut server, 19);
+    let (_, hop_response) = relay_send(&mut server);
     source_nat.handle_event(
         &mut source_swarm,
         &SwarmEvent::StreamData {
@@ -440,7 +417,6 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     );
     let source_circuit = source_swarm.promoted_circuit();
 
-    finish_relay_stream_cleanup(&mut server, 19);
     let source_payload = b"payload from source".to_vec();
     server.handle_event(
         &SwarmEvent::StreamData {
@@ -452,7 +428,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         false,
         at(20),
     );
-    let (forwarded_to_destination, data) = relay_send(&mut server, 20);
+    let (forwarded_to_destination, data) = relay_send(&mut server);
     assert_eq!(forwarded_to_destination, stop_key);
     assert_eq!(data, source_payload);
 
@@ -467,7 +443,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         false,
         at(21),
     );
-    let (forwarded_to_source, data) = relay_send(&mut server, 21);
+    let (forwarded_to_source, data) = relay_send(&mut server);
     assert_eq!(forwarded_to_source.conn_id, SOURCE_RELAY_CONN);
     assert_eq!(forwarded_to_source.stream_id, source_hop);
     assert_eq!(data, destination_payload);

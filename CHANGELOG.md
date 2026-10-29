@@ -4,6 +4,15 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### Relay server drives the swarm through `RelaySwarm` (#443)
+
+`RelayServerAgent` now runs its commands on a borrowed swarm instead of emitting tokenized actions, as `NatAgent` does with `NatSwarm`. Breaking changes for direct `minip2p-relay-server` users (the `Endpoint` API is unchanged):
+
+- **`handle_event(swarm, event, is_circuit, now)` and `handle_tick(swarm, now)`** take a `&mut impl RelaySwarm`, implemented for `SwarmCore`. A host on another swarm implements its six methods; `ack_stream` returns nothing, so absorb a stream already gone there.
+- **`RelayServerAction`, `RelayServerToken`, `RelayServerSendError`, `poll_action`, `is_idle`, and the four `*_result` methods are gone.** Each command's result is applied before the call returns; a forwarding write refused as `DriverError::Full` is held until the stream's `StreamWritable`, as before.
+- **`set_connection_addr` is gone.** The agent reads each new connection's remote address from `RelaySwarm::connection_remote_addr`.
+- **STOP opens settle from swarm events.** Stop correlating them in the host: the agent settles each from its `StreamReady`, `StreamClosed`, or negotiation `SwarmEvent::Error` (claiming those events), and resets a STOP stream it gave up while it negotiated once it is ready. STOP readiness or acceptance exactly at the circuit's deadline now times the circuit out.
+
 ### NAT promotes relay bridges through `NatSwarm` (#442)
 
 A bridged relay stream now goes straight to the host's circuit transport through the swarm seam instead of an action and a token round-trip. Breaking changes for direct `minip2p-nat` users (the `Endpoint` API is unchanged):
