@@ -65,6 +65,7 @@ mod config;
 mod events;
 mod housekeeping;
 mod inbound;
+mod ledger;
 mod swarm;
 mod types;
 

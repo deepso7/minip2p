@@ -16,8 +16,9 @@ use crate::config::NatConfig;
 use crate::events::{NatAction, NatEvent};
 use crate::housekeeping::Housekeeping;
 use crate::inbound::InboundCircuit;
+use crate::ledger::{Attribution, DialPurpose, Owner, PathLedger};
 use crate::swarm::{DialStart, HoldingSwarm, NatSwarm};
-use crate::types::{NatToken, Path, PromoteError, ReachabilityState, ReservationInfo};
+use crate::types::{NatToken, PromoteError, ReachabilityState, ReservationInfo};
 
 /// Roles a stream owned by the agent can play. Streams not in the registry
 /// belong to the application (`Released` is modeled as removal).
@@ -41,34 +42,6 @@ pub(crate) enum StreamRole {
     RejectedControl,
 }
 
-/// Why NAT dialed a connection. The swarm does not know, so NAT keeps it
-/// per dial until the connection establishes or the dial fails.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum DialPurpose {
-    /// Dial of a relay address (to start a relay leg on it). The address is
-    /// kept so a failure arriving after the leg moved on to another relay,
-    /// or to another address of the same relay, is not taken for the
-    /// current one.
-    Relay(ConnectId, PeerAddr),
-    /// Simultaneous-open dial of a DCUtR observed address.
-    Punch(ConnectId),
-    /// Dial of an AutoNAT server for a reachability probe. The server is
-    /// kept so a late failure is only applied to a probe still waiting on
-    /// it.
-    Probe(PeerId),
-    /// Dial of the relay for a reservation, keyed like [`Self::Probe`].
-    Reserve(PeerId),
-}
-
-impl DialPurpose {
-    fn connect_id(&self) -> Option<ConnectId> {
-        match self {
-            Self::Relay(id, _) | Self::Punch(id) => Some(*id),
-            Self::Probe(_) | Self::Reserve(_) => None,
-        }
-    }
-}
-
 /// What a [`NatToken`] correlates: a parked dial, or a bridge promotion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TokenPurpose {
@@ -87,19 +60,6 @@ pub(crate) enum StreamInput<'a> {
     Data(&'a [u8]),
     RemoteWriteClosed,
     Closed,
-}
-
-/// How a connection came to carry a peer's path, recorded when a NAT machine
-/// announces it. It outlives the attempt that created it, so a later
-/// Connection replacement can still report the upgrade against it. The
-/// Endpoint's own [`Path`] record takes only [`Path::Punched`] from here
-/// (see [`NatAgent::is_punched`]).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PathRecord {
-    pub(crate) path: Path,
-    /// The attempt that created the connection; `None` for an inbound
-    /// circuit or a connection no attempt made.
-    pub(crate) connect_id: Option<ConnectId>,
 }
 
 /// A trusted reporter's latest Identify claim of our transport address on
@@ -127,8 +87,9 @@ pub(crate) struct Shared {
     /// Parked dials and bridge promotions awaiting their host result.
     pub(crate) tokens: BTreeMap<NatToken, TokenPurpose>,
     next_token: u64,
-    /// The path record of each established connection a NAT machine announced.
-    pub(crate) paths: BTreeMap<ConnectionId, PathRecord>,
+    /// How each connection reached its peer, and why NAT dialed the ones
+    /// still in flight.
+    pub(crate) ledger: PathLedger,
     /// Our validated external/listen addresses, advertised in DCUtR CONNECT.
     pub(crate) listen_addrs: Vec<Multiaddr>,
     /// Our transport address as observed by trusted reporters (Identify's
@@ -152,9 +113,6 @@ pub(crate) struct Shared {
     /// streams. Values carry the dialed peer and an expiry (monotonic ms) so a
     /// handshake that never completes cannot suppress dialing forever.
     pending_session_dials: BTreeMap<NatToken, (PeerId, u64)>,
-    /// Started dials still awaiting establishment or
-    /// [`SwarmEvent::DialFailed`]: connection → (dial token, purpose).
-    dialed: BTreeMap<ConnectionId, (NatToken, DialPurpose)>,
     /// Circuit slots reserved by accepted STOPs and sent HOP CONNECTs not yet
     /// adopted by the host. Recounted from the machines before every event,
     /// so a release never has to be remembered; a reservation made while
@@ -163,16 +121,6 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    /// Records the path a connection carries for its peer.
-    pub(crate) fn record_path(
-        &mut self,
-        conn_id: ConnectionId,
-        path: Path,
-        connect_id: Option<ConnectId>,
-    ) {
-        self.paths.insert(conn_id, PathRecord { path, connect_id });
-    }
-
     pub(crate) fn alloc_token(&mut self, purpose: TokenPurpose) -> NatToken {
         let token = NatToken(self.next_token);
         self.next_token += 1;
@@ -214,7 +162,7 @@ impl Shared {
         match swarm.dial(addr, token) {
             Ok(DialStart::Started(conn_id)) => {
                 self.tokens.remove(&token);
-                self.dialed.insert(conn_id, (token, purpose));
+                self.ledger.dial_started(conn_id, token, purpose);
                 Ok((token, Some(conn_id)))
             }
             Ok(DialStart::Deferred) => Ok((token, None)),
@@ -256,43 +204,24 @@ impl Shared {
     /// Forgets parked relay/punch dials for attempt `id` (connecting to
     /// `target`) and closes handshakes that already have a connection but
     /// have not established. Established punch or relay sessions stay up —
-    /// those are no longer in flight. That includes a connection the swarm
-    /// already reports established while its event is still buffered:
-    /// another attempt may have started work on it. Such a punch dial keeps
-    /// its `dialed` entry, so its event still records it Punched.
+    /// those are no longer in flight (see
+    /// [`PathLedger::abort_attempt_dials`]).
     pub(crate) fn abort_attempt_dials(
         &mut self,
         id: ConnectId,
         target: &PeerId,
         swarm: &dyn NatSwarm,
     ) {
-        let owned = |purpose: &DialPurpose| purpose.connect_id() == Some(id);
         let mut retired = BTreeSet::new();
         self.tokens.retain(|token, purpose| match purpose {
-            TokenPurpose::Dial(dial) if owned(dial) => {
+            TokenPurpose::Dial(dial) if dial.connect_id() == Some(id) => {
                 retired.insert(*token);
                 false
             }
             _ => true,
         });
-        let mut close = Vec::new();
-        self.dialed.retain(|conn_id, (token, purpose)| {
-            if owned(purpose) {
-                let peer = match purpose {
-                    DialPurpose::Relay(_, addr) => addr.peer_id(),
-                    _ => target,
-                };
-                retired.insert(*token);
-                if swarm.connection(peer) != Some(*conn_id) {
-                    close.push(*conn_id);
-                    false
-                } else {
-                    matches!(purpose, DialPurpose::Punch(_))
-                }
-            } else {
-                true
-            }
-        });
+        let (tokens, close) = self.ledger.abort_attempt_dials(id, target, swarm);
+        retired.extend(tokens);
         for conn_id in close {
             self.push_action(NatAction::CloseCircuit { conn_id });
         }
@@ -605,11 +534,10 @@ impl NatAgent {
                 streams: BTreeMap::new(),
                 tokens: BTreeMap::new(),
                 next_token: 0,
-                paths: BTreeMap::new(),
+                ledger: PathLedger::default(),
                 listen_addrs: Vec::new(),
                 observations: BTreeMap::new(),
                 pending_session_dials: BTreeMap::new(),
-                dialed: BTreeMap::new(),
                 circuits_reserved: 0,
             },
             attempts: BTreeMap::new(),
@@ -747,14 +675,12 @@ impl NatAgent {
     }
 
     /// Whether `conn_id` is a direct connection a DCUtR hole punch produced,
-    /// so its [`Path`] is [`Path::Punched`]. It is recorded before the event
-    /// announcing the punch is queued and forgotten when the connection
-    /// closes or is replaced.
+    /// so its [`Path`](crate::Path) is
+    /// [`Path::Punched`](crate::Path::Punched). It is decided when the
+    /// connection establishes, before any event announcing it is queued,
+    /// and forgotten when the connection closes or is replaced.
     pub fn is_punched(&self, conn_id: ConnectionId) -> bool {
-        self.shared
-            .paths
-            .get(&conn_id)
-            .is_some_and(|record| record.path == Path::Punched)
+        self.shared.ledger.is_punched(conn_id)
     }
 
     /// Updates the validated addresses advertised during DCUtR exchanges.
@@ -834,7 +760,7 @@ impl NatAgent {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
                 touched_state = true;
-                let _ = self.connection_up(peer_id, *conn_id, is_circuit, swarm, now);
+                self.connection_up(peer_id, *conn_id, is_circuit, None, swarm, now);
             }
             SwarmEvent::ConnectionClosed {
                 peer_id, conn_id, ..
@@ -1065,7 +991,7 @@ impl NatAgent {
             SwarmEvent::DialFailed {
                 conn_id, reason, ..
             } => {
-                if let Some((token, purpose)) = self.shared.dialed.remove(conn_id) {
+                if let Some((token, purpose)) = self.shared.ledger.finish_dial(*conn_id) {
                     handled = true;
                     touched_state = true;
                     self.finish_dial_failure(token, purpose, reason.clone(), swarm, now);
@@ -1083,7 +1009,7 @@ impl NatAgent {
     }
 
     /// Advances time-based state: stagger expiry, leg deadlines, punch
-    /// windows, connect deadlines.
+    /// windows (the attempts' and the ledger's), connect deadlines.
     pub fn handle_tick<S: NatSwarm>(&mut self, swarm: &mut S, now: Now) {
         self.holding(swarm, |agent, swarm| {
             for attempt in agent.attempts.values_mut() {
@@ -1093,6 +1019,7 @@ impl NatAgent {
             for circuit in agent.inbound.values_mut() {
                 circuit.on_tick(swarm, &mut agent.shared, now);
             }
+            agent.shared.ledger.on_tick(now.monotonic_ms);
         });
         self.reap_done();
     }
@@ -1152,18 +1079,12 @@ impl NatAgent {
     /// A parked dial now has a connection: track it like a started dial.
     fn dial_started(&mut self, token: NatToken, purpose: DialPurpose, conn_id: ConnectionId) {
         match purpose.connect_id() {
-            Some(id) => match self.attempts.get_mut(&id) {
-                Some(attempt) => {
-                    attempt.on_dial_started(&purpose, conn_id);
-                    self.shared.dialed.insert(conn_id, (token, purpose));
-                }
-                // The attempt ended while the name resolved. Close the
-                // handshake so it cannot land after the attempt is gone.
-                None => self.shared.push_action(NatAction::CloseCircuit { conn_id }),
-            },
-            None => {
-                self.shared.dialed.insert(conn_id, (token, purpose));
+            // The attempt ended while the name resolved. Close the handshake
+            // so it cannot land after the attempt is gone.
+            Some(id) if !self.attempts.contains_key(&id) => {
+                self.shared.push_action(NatAction::CloseCircuit { conn_id });
             }
+            _ => self.shared.ledger.dial_started(conn_id, token, purpose),
         }
     }
 
@@ -1289,6 +1210,7 @@ impl NatAgent {
                     .values()
                     .filter_map(InboundCircuit::next_deadline),
             )
+            .chain(self.shared.ledger.next_deadline())
             .min()
             .map(Deadline::from_millis)
     }
@@ -1321,24 +1243,55 @@ impl NatAgent {
             && self.shared.events.is_empty()
             && self.attempts.is_empty()
             && self.inbound.is_empty()
+            && self.shared.ledger.is_quiet()
             && self.housekeeping.is_quiet()
     }
 
-    /// A connection to `peer` became usable: let the machines that wait on
-    /// the peer see it. Returns whether it was a punch no machine took,
-    /// which this records Punched itself.
+    /// A connection to `peer` became usable: the ledger attributes it
+    /// once, from what the machines claim about it, and every machine that
+    /// waits on the peer acts on that answer. `replaced` is the connection
+    /// it replaces, whose owner adopts a circuit no one else claims.
+    /// Returns whether a machine took the connection, announcing it itself.
     fn connection_up(
         &mut self,
         peer: &PeerId,
         conn_id: ConnectionId,
         is_circuit: bool,
+        replaced: Option<ConnectionId>,
         swarm: &mut dyn NatSwarm,
         now: Now,
     ) -> bool {
+        let claim = if is_circuit {
+            let claim_of = |conn| {
+                self.attempts
+                    .values()
+                    .find_map(|attempt| attempt.circuit_claim(conn))
+                    .or_else(|| {
+                        self.inbound
+                            .values()
+                            .find_map(|circuit| circuit.circuit_claim(conn))
+                    })
+            };
+            // A circuit no machine promoted, replacing an attempt's circuit,
+            // carries that attempt's relayed path on.
+            claim_of(conn_id).or_else(|| {
+                let old = replaced?;
+                self.attempts
+                    .values()
+                    .find_map(|attempt| attempt.circuit_claim(old))
+            })
+        } else {
+            self.attempts
+                .values()
+                .find_map(|attempt| attempt.direct_claim(peer))
+        };
+        let attribution =
+            self.shared
+                .ledger
+                .attribute(conn_id, peer, is_circuit, claim, now.monotonic_ms);
         // The dial that made this connection is done.
-        let dialed = self.shared.dialed.remove(&conn_id);
-        if let Some((token, _)) = &dialed {
-            self.shared.pending_session_dials.remove(token);
+        if let Some((token, _)) = self.shared.ledger.finish_dial(conn_id) {
+            self.shared.pending_session_dials.remove(&token);
         }
         // While the peer is still connected, every other session dial toward
         // it has done its job too: further dials would replace the
@@ -1349,25 +1302,19 @@ impl NatAgent {
                 .pending_session_dials
                 .retain(|_, (dialed, _)| dialed != peer);
         }
-        // Whether this is a punch is decided once, from the dial that made
-        // it, and shared with every attempt: another attempt to the same
-        // peer must not take it for a direct connection of its own.
-        let punched = matches!(dialed, Some((_, DialPurpose::Punch(_))));
+        let mut taken = false;
         for attempt in self.attempts.values_mut() {
-            attempt.on_connection_established(
+            taken |= attempt.on_connection_established(
                 peer,
                 conn_id,
-                is_circuit,
-                punched,
+                attribution.as_ref(),
                 swarm,
                 &mut self.shared,
                 now,
             );
         }
-        // Attempts first: a path an attempt records wins over an inbound
-        // machine's inference that the connection is a punch.
         for circuit in self.inbound.values_mut() {
-            circuit.on_connection_established(
+            taken |= circuit.on_connection_established(
                 peer,
                 conn_id,
                 is_circuit,
@@ -1376,23 +1323,16 @@ impl NatAgent {
                 now,
             );
         }
-        // A punch no machine took (its attempt already settled on another,
-        // which this one replaces) is still a punch.
-        let unclaimed_punch = punched && !self.shared.paths.contains_key(&conn_id);
-        if unclaimed_punch {
-            self.shared.record_path(conn_id, Path::Punched, None);
-        }
-        unclaimed_punch
+        taken
     }
 
-    /// Drops what NAT recorded for `conn_id` — its dial, path record,
-    /// observation, and the streams bound to it — before any machine reacts,
-    /// so no machine acts on one of its streams.
-    fn forget_connection(&mut self, conn_id: ConnectionId) {
-        self.shared.dialed.remove(&conn_id);
-        self.shared.paths.remove(&conn_id);
+    /// Drops what NAT recorded for `conn_id` — its dial, path, observation,
+    /// and the streams bound to it — before any machine reacts, so no
+    /// machine acts on one of its streams. Returns its path attribution.
+    fn forget_connection(&mut self, conn_id: ConnectionId) -> Option<Attribution> {
         self.shared.observations.remove(&conn_id);
         self.shared.streams.retain(|(conn, _), _| *conn != conn_id);
+        self.shared.ledger.forget(conn_id)
     }
 
     /// Lets every attempt and inbound circuit end what it bound to `conn_id`.
@@ -1424,11 +1364,10 @@ impl NatAgent {
         swarm: &mut dyn NatSwarm,
         now: Now,
     ) {
-        let old_record = self.shared.paths.get(&old).cloned();
         // `old`'s records go before machines see `new`: a direct `old` must
         // not make a relayed `new` look redundant.
-        self.forget_connection(old);
-        let unclaimed_punch = self.connection_up(peer, new, is_circuit, swarm, now);
+        let old_path = self.forget_connection(old);
+        let taken = self.connection_up(peer, new, is_circuit, Some(old), swarm, now);
         // A circuit another attempt or an inbound circuit promoted stays
         // its owner's: adopting it would let this attempt close it on cancel.
         let new_owned = self.attempts.values().any(|a| a.promotes(new))
@@ -1441,34 +1380,27 @@ impl NatAgent {
         self.housekeeping
             .on_connection_replaced(peer, old, swarm, &mut self.shared, now);
 
-        // A machine that announced `new` just now recorded its path (with
-        // its own event). Otherwise a direct `new` that retires a relayed
-        // path is reported once, against whatever created that path. `new`
-        // keeps no path record of `old`'s: its own path is plain Direct, or
-        // Punched when it was a punch no machine took.
-        let Some(old_record) = old_record else {
-            return;
-        };
-        if (self.shared.paths.contains_key(&new) && !unclaimed_punch)
-            || is_circuit
-            || !matches!(old_record.path, Path::Relayed { .. })
-        {
+        // A machine that took `new` reported it with its own event.
+        // Otherwise a direct `new` that retires a relayed path is reported
+        // once, against whatever created that path.
+        if taken {
             return;
         }
-        self.shared.push_event(match old_record.connect_id {
-            Some(connect_id) => NatEvent::PathUpgraded {
+        let Some(upgrade) =
+            old_path.and_then(|old_path| self.shared.ledger.replaced(&old_path, new))
+        else {
+            return;
+        };
+        self.shared.push_event(match upgrade.owner {
+            Owner::Attempt(connect_id) => NatEvent::PathUpgraded {
                 connect_id,
                 peer: peer.clone(),
-                from: old_record.path,
-                to: if unclaimed_punch {
-                    Path::Punched
-                } else {
-                    Path::Direct
-                },
+                from: upgrade.from,
+                to: upgrade.to,
                 old_conn_id: old,
                 new_conn_id: new,
             },
-            None => NatEvent::InboundDirectUpgrade {
+            Owner::Inbound => NatEvent::InboundDirectUpgrade {
                 peer: peer.clone(),
                 old_conn_id: old,
                 new_conn_id: new,
