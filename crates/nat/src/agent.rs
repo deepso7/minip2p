@@ -1349,11 +1349,16 @@ impl NatAgent {
                 .pending_session_dials
                 .retain(|_, (dialed, _)| dialed != peer);
         }
+        // Whether this is a punch is decided once, from the dial that made
+        // it, and shared with every attempt: another attempt to the same
+        // peer must not take it for a direct connection of its own.
+        let punched = matches!(dialed, Some((_, DialPurpose::Punch(_))));
         for attempt in self.attempts.values_mut() {
             attempt.on_connection_established(
                 peer,
                 conn_id,
                 is_circuit,
+                punched,
                 swarm,
                 &mut self.shared,
                 now,
@@ -1373,8 +1378,7 @@ impl NatAgent {
         }
         // A punch no machine took (its attempt already settled on another,
         // which this one replaces) is still a punch.
-        let unclaimed_punch = matches!(dialed, Some((_, DialPurpose::Punch(_))))
-            && !self.shared.paths.contains_key(&conn_id);
+        let unclaimed_punch = punched && !self.shared.paths.contains_key(&conn_id);
         if unclaimed_punch {
             self.shared.record_path(conn_id, Path::Punched, None);
         }

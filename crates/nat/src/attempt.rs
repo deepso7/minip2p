@@ -487,11 +487,18 @@ impl ConnectAttempt {
     // Inputs routed from the agent
     // -----------------------------------------------------------------------
 
+    /// `punched` is whether a punch dial, this attempt's or another's,
+    /// made the connection.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the connection's facts plus the call context"
+    )]
     pub(crate) fn on_connection_established(
         &mut self,
         peer: &PeerId,
         conn_id: ConnectionId,
         is_circuit: bool,
+        punched: bool,
         swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
         now: Now,
@@ -512,8 +519,7 @@ impl ConnectAttempt {
             }
             return;
         }
-        // Classify punched iff this conn id was issued as a punch dial.
-        let path = if self.punch_conns.contains(&conn_id) {
+        let path = if punched || self.punch_conns.contains(&conn_id) {
             Path::Punched
         } else {
             Path::Direct

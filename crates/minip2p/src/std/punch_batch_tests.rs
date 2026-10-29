@@ -1,6 +1,7 @@
-//! A real DCUtR punch whose connection is settled on ahead of its own event.
+//! Real DCUtR punches between two loopback Endpoints, checking that the
+//! Endpoint names the punch's path Punched.
 //!
-//! Two loopback Endpoints punch through the loopback relay, and a gate under
+//! The first test settles on a punch ahead of its own event. A gate under
 //! the initiator's QUIC transport makes both punch dials land in one
 //! transport batch. The batch replaces the circuit with the first punch, then
 //! that punch with the second. Seeing the first replacement, the Connection
@@ -311,6 +312,113 @@ fn a_punch_settled_on_ahead_of_its_event_is_punched() {
             path: Path::Punched,
         },
         "{trace:#?}"
+    );
+    assert_eq!(initiator.path(&responder_peer), Some(Path::Punched));
+}
+
+/// Two connects to one peer, admitted before any connection exists. The
+/// first reaches the peer through the relay and punches; the second, racing
+/// a direct candidate that never answers, is still waiting out its relay
+/// stagger when the punch lands. Both settle on the punch, as Punched.
+#[test]
+fn a_punch_landing_during_a_second_attempts_relay_leg_is_punched() {
+    let relay = relay_support::RelayServer::spawn();
+    // One loopback family: the responder offers a single punch target, so
+    // exactly one punch replaces the circuit.
+    let mut responder = Endpoint::builder()
+        .relay(relay.addr().clone())
+        .nat_config(punch_config(ReservationPolicy::Always))
+        .listen_on(LOOPBACK_QUIC_ADDRS[0])
+        .expect("listen address")
+        .bind()
+        .expect("bind responder");
+    let responder_peer = responder.peer_id().clone();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(Instant::now() < deadline, "responder did not reserve");
+        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { .. })) = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder")
+        {
+            break;
+        }
+        relay.assert_healthy();
+    }
+
+    let mut initiator = Endpoint::builder()
+        .relay(relay.addr().clone())
+        .nat_config(NatConfig {
+            // Holds the second attempt's relay leg back past the punch.
+            relay_stagger_ms: 60_000,
+            ..punch_config(ReservationPolicy::Never)
+        })
+        .listen_on(LOOPBACK_QUIC_ADDRS[0])
+        .expect("listen address")
+        .bind()
+        .expect("bind initiator");
+    // A bound socket that never answers: the second attempt's direct
+    // candidate stays in flight.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent socket");
+    let silent_addr = PeerAddr::new(
+        format!(
+            "/ip4/127.0.0.1/udp/{}/quic-v1",
+            silent.local_addr().expect("silent addr").port()
+        )
+        .parse()
+        .expect("addr"),
+        responder_peer.clone(),
+    )
+    .expect("peer addr");
+    let first = initiator.connect(&responder_peer).expect("first connect");
+    let second = initiator.connect(silent_addr).expect("second connect");
+
+    let mut trace = Vec::new();
+    let mut settled = Vec::new();
+    while settled.len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "connects did not settle:\n{trace:#?}"
+        );
+        if let Some(event) = initiator
+            .next_event(Duration::from_millis(20))
+            .expect("drive initiator")
+        {
+            trace.push(format!("initiator: {event:?}"));
+            if let EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome,
+                ..
+            } = event
+            {
+                settled.push((connect_id, outcome));
+            }
+        }
+        if let Some(event) = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder")
+        {
+            trace.push(format!("responder: {event:?}"));
+        }
+        relay.assert_healthy();
+    }
+
+    settled.sort_by_key(|(connect_id, _)| *connect_id);
+    let punched = |outcome: &ConnectOutcome| {
+        matches!(
+            outcome,
+            ConnectOutcome::Connected {
+                path: Path::Punched,
+                ..
+            }
+        )
+    };
+    assert!(
+        matches!(
+            settled.as_slice(),
+            [(a, first_outcome), (b, second_outcome)]
+                if *a == first && *b == second && punched(first_outcome) && punched(second_outcome)
+        ),
+        "{settled:?}\n{trace:#?}"
     );
     assert_eq!(initiator.path(&responder_peer), Some(Path::Punched));
 }

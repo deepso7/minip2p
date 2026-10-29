@@ -795,6 +795,38 @@ fn an_unclaimed_punch_replacing_the_circuit_upgrades_to_punched() {
     assert!(h.agent.is_punched(punch));
 }
 
+/// One attempt's punch lands while a second attempt to the same peer is
+/// still acquiring its relay. The second attempt would take any other direct
+/// connection as its own, but this one is the first attempt's punch: it is
+/// Punched for both, whatever order the attempts see it in.
+#[test]
+fn a_punch_landing_during_another_attempts_relay_leg_is_punched() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (first, circuit) = drive_to_relayed(&mut h);
+    let second = h.start(RELAY_NOW, at(305));
+    assert!(
+        has_hop_open(&drain_actions(&mut h.agent)),
+        "the second attempt is acquiring its relay"
+    );
+    let actions = drive_dcutr_through_sync(&mut h, circuit, StreamId::new(90));
+    let punch = dial_conn_for(&actions, &h.target);
+    drain_events(&mut h.agent);
+
+    replace_target(&mut h, circuit, punch, 314);
+    assert!(h.agent.is_punched(punch));
+    let events = drain_events(&mut h.agent);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                NatEvent::PathUpgraded { connect_id: upgraded, to: Path::Punched, .. },
+                NatEvent::PathEstablished { connect_id: established, path: Path::Punched, .. },
+            ] if *upgraded == first && *established == second
+        ),
+        "{events:?}"
+    );
+}
+
 /// Hands the target's connection `old` over to the direct connection `new`.
 fn replace_target(h: &mut Harness, old: ConnectionId, new: ConnectionId, t: u64) {
     h.agent.handle_event(
