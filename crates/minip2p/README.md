@@ -25,7 +25,7 @@ for address in endpoint.listen_all()? {
 
 Listening is address-shaped: pass complete multiaddresses to `EndpointBuilder::listen_on` (or `listen_on_multiaddr`), or use `listen_default` for dual-stack QUIC wildcards. The transport is inferred from each address. `bind` starts accepting on every listen address, QUIC and TCP alike; `listen_all` reports them. A `/…/udp/<port>/quic-v1/webtransport` address (no `/certhash`) serves browsers over libp2p WebTransport; next to a `quic-v1` address on the same host and port it shares that UDP socket, and `listen_all` reports it with the node's current certhashes. By default those come from self-signed certificates derived from the identity key, which rotate every 13 days on the host's wall clock; each rotation emits one `EndpointEvent::ListenAddressesChanged { addrs }` carrying the whole new listen set (what `listen_all` now returns) for the app to republish, and Identify advertises the new set from the same poll on. Addresses from the previous period keep dialing. A node with a domain can instead serve a CA-signed certificate with `EndpointBuilder::webtransport_certificate_pem(chain_pem, key_pem)` (certbot's `fullchain.pem` and `privkey.pem`): browsers then check it like any HTTPS page and dial a stable `/dns/<name>/udp/<port>/quic-v1/webtransport/p2p/…` address, the listen addresses carry no certhash and never rotate. After a renewal, `Endpoint::set_webtransport_certificate_pem(chain_pem, key_pem)` swaps the certificate in without a restart: new handshakes get it, live connections keep theirs, and on any error (`SetWebTransportCertificateError`: `NotConfigured`, `Pem`, `Invalid`) the current one stays. Relay-server announce addresses follow the mode: a WebTransport one carries its `/certhash` with derived certificates and none with a CA-signed one. WebTransport is opt-in: `listen_default` does not include it.
 
-The listen setters reject a malformed or unsupported address at once with an `EndpointOptionsError`, and `bind` returns a `BindError` naming what failed: `Options` for inconsistent options (no transport, a second QUIC address for one family, ...), `Quic` or `Listen` for a socket the platform refused (a port in use, say, with its `IoErrorKind`), and `Swarm`, `RelayServer`, `Gossipsub`, `Discovery`, or `Mdns`/`MdnsSocket` for that part's own configuration or setup. `NatConfig` (a `NatConfigError`, the same one the portable builder reports) refuses NAT configuration that cannot run: no relay or AutoNAT server (leave NAT unconfigured and discovery or mDNS turns it on for the peers they find), a reservation policy other than `Never` without a relay, or relays with DCUtR on an endpoint built without QUIC. `.autonat_server(..)` alone holds no reservation (`ReservationPolicy::Never`). `Entropy` means the operating system's entropy source failed while seeding a capability. `?` converts an `EndpointOptionsError` into a `BindError`, so a builder chain needs only the one error type. Bind errors happen before any event is polled; nothing later reuses them.
+The listen setters reject a malformed or unsupported address at once with an `EndpointOptionsError`, and `bind` returns a `BindError` naming what failed: `Options` for inconsistent options (no transport, a second QUIC address for one family, ...), `Quic` or `Listen` for a socket the platform refused (a port in use, say, with its `IoErrorKind`), and `Swarm`, `RelayServer`, `Gossipsub`, `Discovery`, or `Mdns`/`MdnsSocket` for that part's own configuration or setup. `NatConfig` (a `NatConfigError`, the same one the portable builder reports) refuses NAT configuration that cannot run: no relay or AutoNAT server (leave NAT unconfigured and discovery or mDNS turns it on for the peers they find), a reservation policy other than `Never` without a relay, or relays with DCUtR on an endpoint built without QUIC. Capability setters only record what you asked for, in any order, and are all checked at `bind`, before any socket opens. `.autonat_server(..)` alone holds no reservation (`ReservationPolicy::Never`). `Entropy` means the operating system's entropy source failed while seeding a capability. `?` converts an `EndpointOptionsError` into a `BindError`, so a builder chain needs only the one error type. Bind errors happen before any event is polled; nothing later reuses them.
 
 ## Connecting and the event loop
 
@@ -96,17 +96,17 @@ The portable endpoint supports listening, Connection attempts, ping, Identify in
 | Feature | Builder setters |
 | --- | --- |
 | `pubsub` | `.gossipsub()`, `.gossipsub_config(..)` |
-| `discovery` | signed `.discovery()`, `.beacon_config(..)`, `.peer_discovery_config(..)`; includes `pubsub` |
+| `discovery` | signed `.discovery()`, `.discovery_config(..)`, `.peer_discovery_config(..)`; includes `pubsub` |
 | `mdns` | `.mdns(io, config)` over any caller-owned `MdnsIo`, `.peer_discovery_config(..)` |
-| `autonat` | `.autonat(server)`, `.nat_config(..)` |
+| `autonat` | `.autonat_server(server)`, `.nat_config(..)` |
 | `relay` | `.relay(addr)`; includes `autonat` |
 | `relay-server` | `.relay_server()`, `.relay_server_config(..)`; `set_relay_server_accepting` on the endpoint |
 
-These are the same feature names as the std `Endpoint`'s, and the same Endpoint setup validates, registers and installs them on both, so a configuration behaves alike on either. With `autonat` or `relay` built, `discovery` and `mdns` turn NAT on with no servers, so discovered peers are dialed through the connect race. A capability's protocols are advertised through Identify only when its configuration uses them.
+These are the same feature names as the std `Endpoint`'s, and the shared setters have the same names and signatures on `EndpointBuilder`, `PortableEndpointBuilder` and `SmoltcpEndpointBuilder` (`connect_deadline` and `simultaneous_dial_window` take a `core::time::Duration` on all three). Setters only record intent and return the builder; the same Endpoint setup applies the defaults, validates, registers and installs them on both, so a configuration behaves alike on either, and errors surface at build. With `autonat` or `relay` built, `discovery` and `mdns` turn NAT on with no servers, so discovered peers are dialed through the connect race. A capability's protocols are advertised through Identify only when its configuration uses them.
 
 `.mdns(io, config)` takes the carrier by value and stores it as a `Box<dyn MdnsIo>`, so it must be `'static`; keep a handle to whatever it runs on to reconfigure it later. The mDNS seed comes from the builder's entropy. The endpoint polls the transport again after each mDNS tick, since a carrier may share the transport's stack.
 
-Relay paths turn a relay bridge into a connection, which takes circuit operations from the transport. `build(transport)` works over any transport and rejects relay configuration with `PortableBuildError::NatConfig(NatConfigError::RelayWithoutCircuits)`; wrap the transport in a `CircuitTransport` and call `build_with_circuits(transport)` to run relays. AutoNAT alone needs nothing from the transport. Portable endpoints do not run DCUtR, so portable relay configurations set `NatConfig::dcutr = false` (direct candidates still race the relay leg, and the attempt settles on the circuit once none is left) or `force_relay` (relay only); otherwise the build fails with `NatConfigError::RelayWithDcutr`, as it does on a std endpoint built without QUIC.
+Relay paths turn a relay bridge into a connection, which takes circuit operations from the transport. `build(transport)` works over any transport and rejects relay configuration with `PortableBuildError::NatConfig(NatConfigError::RelayWithoutCircuits)`; wrap the transport in a `CircuitTransport` and call `build_with_circuits(transport)` to run relays. AutoNAT alone needs nothing from the transport. Portable endpoints do not run DCUtR, so `.relay(..)` without a `nat_config` uses `dcutr = false`, and an explicit portable relay configuration sets `NatConfig::dcutr = false` (direct candidates still race the relay leg, and the attempt settles on the circuit once none is left) or `force_relay` (relay only); otherwise the build fails with `NatConfigError::RelayWithDcutr`, as it does on a std endpoint built without QUIC.
 
 ### smoltcp
 
@@ -128,7 +128,7 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
     .build()?;
 ```
 
-Use `tcp_config`, `smoltcp_config`, `mdns_config`, `mdns_carrier_config`, `gossipsub_config`, `beacon_config`, and `peer_discovery_config` only when overriding defaults. Keep a cloned `SmoltcpStack` to reconfigure the interface later: a wildcard listener follows the interface's addresses, and Identify advertises a changed address without another `listen`. `poll(now)` advances every enabled service and `next_deadline(now)` folds their timelines.
+Use `tcp_config`, `smoltcp_config`, `mdns_config`, `mdns_carrier_config`, `gossipsub_config`, `discovery_config`, and `peer_discovery_config` only when overriding defaults. Keep a cloned `SmoltcpStack` to reconfigure the interface later: a wildcard listener follows the interface's addresses, and Identify advertises a changed address without another `listen`. `poll(now)` advances every enabled service and `next_deadline(now)` folds their timelines.
 
 Portable AutoNAT is opt-in, and does not pull circuit transport state into an AutoNAT-only binary. Enable `autonat`, configure trusted servers, and read the latest verdict from the same caller-driven endpoint. A verdict needs a quorum of distinct servers (3 of the last 5 by default), and a public one reports only addresses that quorum confirms, so with fewer than three reachable servers reachability stays Unknown:
 
@@ -136,9 +136,9 @@ Portable AutoNAT is opt-in, and does not pull circuit transport state into an Au
 let mut endpoint = Endpoint::portable(&identity, entropy)
     .smoltcp(stack)
     .listen("/ip4/0.0.0.0/tcp/4001")
-    .autonat(server_a)
-    .autonat(server_b)
-    .autonat(server_c)
+    .autonat_server(server_a)
+    .autonat_server(server_b)
+    .autonat_server(server_c)
     .build()?;
 
 for event in endpoint.poll(now)? {
@@ -150,11 +150,16 @@ let reachability = endpoint.reachability();
 
 Once at least one TCP listen address exists, the first due `poll(now)` starts a probe by dialing the configured server. Successful exchanges emit `EndpointEvent::Nat(NatEvent::ReachabilityChanged { .. })` after the configured confidence threshold is met; `reachability()` then returns that same settled verdict. Until a server exchange succeeds, it remains `Unknown`.
 
-With `smoltcp` and `relay`, the smoltcp builder wraps its TCP transport in a `CircuitTransport` itself, so a relay just works:
+With `smoltcp` and `relay`, the smoltcp builder wraps its TCP transport in a `CircuitTransport` itself, so a relay just works. This one connects only through the relay:
 
 ```rust,ignore
 let mut endpoint = Endpoint::portable(&identity, entropy)
     .smoltcp(stack)
+    .nat_config(NatConfig {
+        force_relay: true,
+        reservation_policy: ReservationPolicy::Never,
+        ..NatConfig::default()
+    })
     .relay(relay_addr)
     .build()?;
 
@@ -166,7 +171,7 @@ while endpoint.path(&remote_peer).is_none() {
 }
 ```
 
-`.relay()` selects a relay-only path and does not reserve inbound capacity. Use `.nat_config(...)` to combine AutoNAT servers with relay policy, and `ReservationPolicy::Always` for a device that must remain reachable through the relay.
+`.relay(addr)` means the same on every endpoint: it adds a relay as a path, not a mode. Connects race direct candidates against a leg through the relay (and upgrade with DCUtR on a std endpoint with QUIC), and without `.nat_config(..)` the endpoint holds a reservation on the relay while it is not known to be public (`ReservationPolicy::WhenPrivate`, so also while reachability is `Unknown`, with or without AutoNAT servers), with `dcutr = false` where the endpoint does not run DCUtR. Relay-only connects are `NatConfig::force_relay`, as above. `.nat_config(..)` sets a base that is kept as given, and a second call replaces the first; `.relay(..)` and `.autonat_server(..)` add to its lists in either order (base first, then the setters in call order, without exact repeats). Use `ReservationPolicy::Never` for a device that only dials out, and `ReservationPolicy::Always` for one that must remain reachable through the relay.
 
 ## Transports
 

@@ -268,6 +268,154 @@ fn relays_without_the_relay_feature_are_refused() {
     );
 }
 
+/// The NAT config [`validate`] resolves from `capabilities` on `platform`.
+#[cfg(feature = "relay")]
+fn resolved(capabilities: Capabilities, platform: Platform) -> Option<NatConfig> {
+    validate(capabilities, platform, &key(1).peer_id())
+        .expect("validates")
+        .capabilities
+        .nat
+}
+
+/// Without an explicit base, setup builds one from the platform: relays get
+/// the default policy with DCUtR only where the platform runs it, AutoNAT
+/// servers alone hold no reservation, discovery alone runs server-less
+/// auto-NAT, and nothing configured runs no NAT.
+#[cfg(feature = "relay")]
+#[test]
+fn an_absent_base_follows_the_platform() {
+    for platform in [STD_QUIC, PORTABLE_CIRCUITS] {
+        let relayed = resolved(
+            Capabilities {
+                relays: vec![server(3)],
+                ..Capabilities::default()
+            },
+            platform,
+        )
+        .expect("relays run NAT");
+        assert_eq!(relayed.relays, vec![server(3)]);
+        assert_eq!(relayed.dcutr, platform.runs_dcutr);
+        assert!(!relayed.force_relay);
+        assert_eq!(relayed.reservation_policy, ReservationPolicy::WhenPrivate);
+
+        let autonat = resolved(
+            Capabilities {
+                autonat_servers: vec![server(4)],
+                ..Capabilities::default()
+            },
+            platform,
+        )
+        .expect("AutoNAT servers run NAT");
+        assert_eq!(autonat.autonat_servers, vec![server(4)]);
+        assert_eq!(autonat.reservation_policy, ReservationPolicy::Never);
+
+        assert!(resolved(Capabilities::default(), platform).is_none());
+    }
+    #[cfg(feature = "discovery")]
+    {
+        let auto = resolved(discovery_only(), PORTABLE_PLAIN).expect("auto-NAT");
+        assert!(auto.relays.is_empty() && auto.autonat_servers.is_empty());
+        assert_eq!(auto.reservation_policy, ReservationPolicy::Never);
+    }
+}
+
+/// Merged lists hold the base's addresses, then the setters' in call order,
+/// without exact repeats; another address for the same peer stays.
+#[cfg(feature = "relay")]
+#[test]
+fn merged_lists_put_the_base_first_and_drop_exact_repeats() {
+    let other_address = PeerAddr::new(
+        "/ip4/192.0.2.10/tcp/4001".parse().expect("address"),
+        key(3).peer_id(),
+    )
+    .expect("peer address");
+    let config = resolved(
+        Capabilities {
+            nat: Some(NatConfig {
+                relays: vec![server(3), server(4)],
+                autonat_servers: vec![server(6)],
+                dcutr: false,
+                ..NatConfig::default()
+            }),
+            relays: vec![server(5), server(3), other_address.clone(), server(5)],
+            autonat_servers: vec![server(6), server(7)],
+            ..Capabilities::default()
+        },
+        PORTABLE_CIRCUITS,
+    )
+    .expect("NAT");
+    assert_eq!(
+        config.relays,
+        vec![server(3), server(4), server(5), other_address]
+    );
+    assert_eq!(config.autonat_servers, vec![server(6), server(7)]);
+}
+
+/// `relay`, `autonat_server` and `nat_config` only record intent, so both
+/// public builders bind the same config in either order. The base keeps its
+/// policy and tuning (an explicit `dcutr: true` included), and its
+/// `force_relay` binds once a setter adds the relay.
+#[cfg(feature = "relay")]
+#[test]
+fn relay_and_nat_config_bind_the_same_config_in_either_order() {
+    use crate::engine::tests::FlashTransport;
+
+    let base = NatConfig {
+        autonat_servers: vec![server(4)],
+        force_relay: true,
+        dcutr: true,
+        reservation_policy: ReservationPolicy::Always,
+        relay_timeout_ms: 1_234,
+        ..NatConfig::default()
+    };
+    let check = |config: &NatConfig| {
+        assert_eq!(config.relays, vec![server(3)]);
+        assert_eq!(config.autonat_servers, vec![server(4), server(5)]);
+        assert!(config.force_relay && config.dcutr);
+        assert_eq!(config.reservation_policy, ReservationPolicy::Always);
+        assert_eq!(config.relay_timeout_ms, 1_234);
+    };
+
+    let portable = |builder: crate::PortableEndpointBuilder<CountingEntropy>| {
+        let circuits = minip2p_circuit::CircuitTransport::new(
+            FlashTransport::default(),
+            key(1),
+            CountingEntropy(9),
+        );
+        let endpoint = builder.build_with_circuits(circuits).expect("builds");
+        check(endpoint.engine.nat.as_ref().expect("NAT").config());
+    };
+    let builder = || crate::PortableEndpointBuilder::new(&key(1), CountingEntropy(0));
+    portable(
+        builder()
+            .relay(server(3))
+            .autonat_server(server(5))
+            .nat_config(base.clone()),
+    );
+    portable(
+        builder()
+            .nat_config(base.clone())
+            .autonat_server(server(5))
+            .relay(server(3)),
+    );
+
+    #[cfg(feature = "std")]
+    {
+        let std = |builder: crate::EndpointBuilder| {
+            let endpoint = crate::engine::tests::std_endpoint(builder, FlashTransport::default());
+            check(endpoint.engine.nat.as_ref().expect("NAT").config());
+        };
+        std(crate::Endpoint::builder()
+            .relay(server(3))
+            .autonat_server(server(5))
+            .nat_config(base.clone()));
+        std(crate::Endpoint::builder()
+            .nat_config(base)
+            .autonat_server(server(5))
+            .relay(server(3)));
+    }
+}
+
 /// An AutoNAT client advertises AutoNAT and nothing a relay client would.
 #[cfg(feature = "autonat")]
 #[test]

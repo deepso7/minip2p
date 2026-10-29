@@ -93,12 +93,14 @@ impl<T: Transport> Host<T> {
             // A browser is never publicly reachable and cannot hole punch:
             // it always reserves, and its relayed paths never upgrade.
             builder = builder.nat_config(NatConfig {
-                relays,
                 force_relay: config.force_relay,
                 dcutr: false,
                 reservation_policy: ReservationPolicy::Always,
                 ..NatConfig::default()
             });
+        }
+        for relay in relays {
+            builder = builder.relay(relay);
         }
         let circuits = CircuitTransport::new(transport(&keypair), keypair.clone(), WebEntropy);
         let mut endpoint = builder

@@ -326,7 +326,6 @@ mod bulk {
                 max_circuit_bytes: 1 << 40,
                 ..RelayServerConfig::default()
             })
-            .expect("relay config")
             .listen_on("/ip4/127.0.0.1/tcp/0")
             .expect("tcp listen address")
             .bind()

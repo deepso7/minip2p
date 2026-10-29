@@ -2,9 +2,10 @@
 //! configuration into running capabilities over the shared [`Engine`], the
 //! same way for the std `Endpoint` and [`crate::PortableEndpoint`].
 //!
-//! A builder collects [`Capabilities`]. [`validate`] checks them against
-//! the [`Platform`] before any socket opens and turns NAT on for discovered
-//! peers (auto-NAT); [`install`] then registers each capability's protocols
+//! A builder only records intent in [`Capabilities`]. [`validate`] applies
+//! every default against the [`Platform`] (the NAT base, the merged relay and
+//! AutoNAT lists, NAT for discovered peers) and checks the result before any
+//! socket opens; [`install`] then registers each capability's protocols
 //! on the swarm and installs its agent. A capability's protocols are
 //! registered, and so advertised through Identify, only when its config uses
 //! them. Every seed (Gossipsub, mDNS, NAT jitter) comes from the engine's
@@ -14,9 +15,11 @@
 //! readiness poll, the mDNS sockets it hands in as the carrier, parked
 //! Name resolution for NAT dials, and WebTransport certificates.
 
-#[cfg(feature = "relay-server")]
+#[cfg(any(feature = "autonat", feature = "relay-server"))]
 use alloc::vec::Vec;
 
+#[cfg(feature = "autonat")]
+use minip2p_core::PeerAddr;
 use minip2p_core::PeerId;
 use minip2p_core::platform::{EntropyError, EntropySource};
 use minip2p_identity::Ed25519Keypair;
@@ -49,13 +52,21 @@ use minip2p_pubsub::{GossipsubConfig, GossipsubConfigError};
 #[cfg(feature = "relay-server")]
 use minip2p_relay_server::{RelayServerAddressError, RelayServerConfig, RelayServerConfigError};
 
-/// The capability configuration a builder collected. A capability is
-/// configured when its field is set; it runs only if its Cargo feature
-/// built it, which the fields' own gates already ensure.
+/// The capability intent a builder recorded, with no defaults applied. A
+/// capability is configured when its field is set; it runs only if its
+/// Cargo feature built it, which the fields' own gates already ensure.
 #[derive(Default)]
 pub(crate) struct Capabilities {
+    /// The explicit NAT base (`nat_config`), kept as given; [`validate`]
+    /// appends the relay and AutoNAT lists to it.
     #[cfg(feature = "autonat")]
     pub(crate) nat: Option<NatConfig>,
+    /// Relays added one by one (`relay`), in call order.
+    #[cfg(feature = "autonat")]
+    pub(crate) relays: Vec<PeerAddr>,
+    /// AutoNAT servers added one by one (`autonat_server`), in call order.
+    #[cfg(feature = "autonat")]
+    pub(crate) autonat_servers: Vec<PeerAddr>,
     #[cfg(feature = "relay-server")]
     pub(crate) relay_server: Option<RelayServerSetup>,
     #[cfg(feature = "pubsub")]
@@ -129,10 +140,10 @@ pub(crate) struct Validated {
     relay_server: Option<minip2p_relay_server::RelayServerAgent>,
 }
 
-/// NAT configuration that holds no reservation: what the AutoNAT and relay
-/// setters start from, and what discovery turns on.
+/// NAT configuration that holds no reservation: the base for AutoNAT
+/// servers alone, and what discovery turns on.
 #[cfg(feature = "autonat")]
-pub(crate) fn no_reservation_nat() -> NatConfig {
+fn no_reservation_nat() -> NatConfig {
     NatConfig {
         reservation_policy: ReservationPolicy::Never,
         ..NatConfig::default()
@@ -161,7 +172,7 @@ pub enum NatConfigError {
     )]
     ForceRelayWithoutRelay,
     /// An explicit NAT configuration names neither a relay nor an AutoNAT
-    /// server. (Discovery and mDNS turn NAT on for the peers they find
+    /// server, even with the ones the setters added. (Discovery and mDNS turn NAT on for the peers they find
     /// without one, when no NAT configuration is given.)
     #[error(
         "NAT needs at least one relay or AutoNAT server; leave NAT unconfigured to let discovery or mDNS dial the peers they find"
@@ -246,11 +257,8 @@ impl From<RelayServerConfigError> for SetupError {
     }
 }
 
-/// Validates every configured capability for `platform`, before any socket
-/// opens, and turns NAT on for discovered peers (auto-NAT): with discovery
-/// or mDNS configured and NAT built, an endpoint without its own NAT config
-/// dials discovered peers through the connect race, with no servers and no
-/// reservation. An explicit NAT config still needs a server.
+/// Applies every capability default for `platform` and validates the
+/// result, before any socket opens. NAT is built by [`resolve_nat`].
 ///
 /// `local_peer` is the identity relay-server announce addresses must name.
 #[cfg_attr(
@@ -296,10 +304,9 @@ pub(crate) fn validate(
         None => None,
     };
     #[cfg(feature = "autonat")]
-    match &capabilities.nat {
-        Some(config) => validate_nat(config, platform).map_err(SetupError::NatConfig)?,
-        None if capabilities.discovers_peers() => capabilities.nat = Some(no_reservation_nat()),
-        None => {}
+    {
+        capabilities.nat =
+            resolve_nat(&mut capabilities, platform).map_err(SetupError::NatConfig)?;
     }
     Ok(Validated {
         capabilities,
@@ -307,6 +314,56 @@ pub(crate) fn validate(
         #[cfg(feature = "relay-server")]
         relay_server,
     })
+}
+
+/// The NAT configuration the endpoint runs, from the builder's intent:
+///
+/// - The base is the explicit `nat_config`, kept as given. Without one,
+///   relays get the default policy (reserve while not public) with DCUtR
+///   only where `platform` runs it, AutoNAT servers alone get a config that
+///   holds no reservation, and with neither, discovery or mDNS turn NAT on
+///   with no servers so their peers go through the connect race (auto-NAT).
+///   Nothing configured runs no NAT.
+/// - The relay and AutoNAT lists are the base's addresses, then the
+///   setters' in call order, without exact repeats.
+/// - The merged config is then checked; auto-NAT needs no server.
+#[cfg(feature = "autonat")]
+fn resolve_nat(
+    capabilities: &mut Capabilities,
+    platform: Platform,
+) -> Result<Option<NatConfig>, NatConfigError> {
+    let relays = core::mem::take(&mut capabilities.relays);
+    let autonat_servers = core::mem::take(&mut capabilities.autonat_servers);
+    let mut config = match capabilities.nat.take() {
+        Some(base) => base,
+        None if !relays.is_empty() => NatConfig {
+            dcutr: platform.runs_dcutr,
+            ..NatConfig::default()
+        },
+        None if !autonat_servers.is_empty() => no_reservation_nat(),
+        None if capabilities.discovers_peers() => return Ok(Some(no_reservation_nat())),
+        None => return Ok(None),
+    };
+    config.relays = merge_unique(core::mem::take(&mut config.relays), relays);
+    config.autonat_servers = merge_unique(
+        core::mem::take(&mut config.autonat_servers),
+        autonat_servers,
+    );
+    validate_nat(&config, platform)?;
+    Ok(Some(config))
+}
+
+/// `base` then `added`, keeping the first of any exact repeat; distinct
+/// addresses for one peer all stay.
+#[cfg(feature = "autonat")]
+fn merge_unique(base: Vec<PeerAddr>, added: Vec<PeerAddr>) -> Vec<PeerAddr> {
+    let mut merged = Vec::with_capacity(base.len() + added.len());
+    for addr in base.into_iter().chain(added) {
+        if !merged.contains(&addr) {
+            merged.push(addr);
+        }
+    }
+    merged
 }
 
 /// Rejects NAT configuration that cannot run on `platform`.

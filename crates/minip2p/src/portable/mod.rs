@@ -3,6 +3,7 @@ extern crate alloc;
 #[cfg(feature = "mdns")]
 use alloc::boxed::Box;
 use alloc::{string::String, vec::Vec};
+use core::time::Duration;
 
 pub use minip2p_core::platform::{Deadline, EntropySource, IoErrorKind, Now, SharedEntropy};
 pub use minip2p_core::{
@@ -742,55 +743,57 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
         self
     }
 
-    /// Sets how long, in milliseconds, a peer's new connection can lose a race
-    /// to its current one. Default
-    /// [`SIMULTANEOUS_DIAL_WINDOW_MS`](minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS);
+    /// Sets how long a peer's new connection can lose a race to its current
+    /// one. Default 5 seconds
+    /// ([`SIMULTANEOUS_DIAL_WINDOW_MS`](minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS));
     /// both peers should use the same window.
-    pub fn simultaneous_dial_window_ms(mut self, ms: u64) -> Self {
-        self.swarm = self.swarm.simultaneous_dial_window_ms(ms);
+    pub fn simultaneous_dial_window(mut self, window: Duration) -> Self {
+        self.swarm = self.swarm.simultaneous_dial_window_ms(duration_ms(window));
         self
     }
 
-    /// Sets the Connection-attempt deadline in milliseconds. Default 30_000.
-    pub fn connect_deadline_ms(mut self, ms: u64) -> Self {
-        self.connect_deadline_ms = ms;
+    /// Sets the Connection-attempt deadline. Default 30 seconds.
+    pub fn connect_deadline(mut self, deadline: Duration) -> Self {
+        self.connect_deadline_ms = duration_ms(deadline);
         self
     }
 
-    /// Enables relay-only connectivity through one relay address.
+    /// Adds a relay, in preference order; each call adds one.
+    ///
+    /// A relay is a path, not a mode: connects still race direct candidates
+    /// against a leg through the relay, and the endpoint reserves a slot on
+    /// the relay for inbound connections while it is not known to be public.
+    /// Without [`Self::nat_config`], that is the default policy
+    /// ([`ReservationPolicy::WhenPrivate`](crate::ReservationPolicy::WhenPrivate))
+    /// with `dcutr = false`, since portable endpoints do not run DCUtR. For
+    /// relay-only connects set [`NatConfig::force_relay`].
     ///
     /// Needs a transport with circuit operations: build with
     /// `build_with_circuits`.
     #[cfg(feature = "relay")]
     pub fn relay(mut self, relay: PeerAddr) -> Self {
-        let config = self.nat_or_default();
-        config.relays.push(relay);
-        config.force_relay = true;
+        self.capabilities.relays.push(relay);
         self
     }
 
-    /// Adds a trusted AutoNAT server, enabling probing.
+    /// Adds a trusted AutoNAT server, enabling probing; each call adds one.
     ///
     /// Call once per server: a reachability verdict needs a quorum of
     /// distinct servers ([`NatConfig::confidence_threshold`], 3 by default),
-    /// so with fewer reachable servers reachability stays Unknown.
+    /// so with fewer reachable servers reachability stays Unknown. Without
+    /// [`Self::nat_config`] or a relay, the endpoint holds no reservation.
     #[cfg(feature = "autonat")]
-    pub fn autonat(mut self, server: PeerAddr) -> Self {
-        self.nat_or_default().autonat_servers.push(server);
+    pub fn autonat_server(mut self, server: PeerAddr) -> Self {
+        self.capabilities.autonat_servers.push(server);
         self
     }
 
-    /// The NAT configuration the setters add to; a fresh one holds no
-    /// reservation.
-    #[cfg(feature = "autonat")]
-    fn nat_or_default(&mut self) -> &mut NatConfig {
-        self.capabilities
-            .nat
-            .get_or_insert_with(setup::no_reservation_nat)
-    }
-
-    /// Enables NAT policy with explicit relay and AutoNAT settings.
+    /// Sets the base NAT configuration, kept as given. A second call
+    /// replaces the first. Relays and AutoNAT servers added through
+    /// `relay` / [`Self::autonat_server`] are appended to the config's own
+    /// lists, in either call order, without exact repeats.
     ///
+    /// Checked at build, after the merge (`PortableBuildError::NatConfig`).
     /// Relay configurations must set `dcutr = false` (direct candidates
     /// still race the relay leg) or `force_relay` (relay only): portable
     /// endpoints do not run DCUtR. AutoNAT servers may be configured with or
@@ -843,12 +846,13 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     /// Enables signed-beacon discovery. Pubsub is enabled automatically.
     #[cfg(feature = "discovery")]
     pub fn discovery(self) -> Self {
-        self.beacon_config(BeaconConfig::default())
+        self.discovery_config(BeaconConfig::default())
     }
 
-    /// Enables signed-beacon discovery with explicit beacon policy.
+    /// Enables signed-beacon discovery with explicit beacon policy,
+    /// validated at build.
     #[cfg(feature = "discovery")]
-    pub fn beacon_config(mut self, config: BeaconConfig) -> Self {
+    pub fn discovery_config(mut self, config: BeaconConfig) -> Self {
         self.capabilities
             .gossipsub
             .get_or_insert_with(GossipsubConfig::default);
@@ -965,6 +969,11 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     }
 }
 
+/// Whole milliseconds in `duration`, saturating.
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// The transport a [`SmoltcpEndpointBuilder`] builds: TCP over smoltcp,
 /// wrapped in a `CircuitTransport` with the `relay` feature.
 #[cfg(all(feature = "smoltcp", not(feature = "relay")))]
@@ -1014,6 +1023,19 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
     /// Registers an application stream protocol.
     pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {
         self.portable = self.portable.protocol(protocol_id);
+        self
+    }
+
+    /// Sets how long a peer's new connection can lose a race to its current
+    /// one (see [`PortableEndpointBuilder::simultaneous_dial_window`]).
+    pub fn simultaneous_dial_window(mut self, window: Duration) -> Self {
+        self.portable = self.portable.simultaneous_dial_window(window);
+        self
+    }
+
+    /// Sets the Connection-attempt deadline. Default 30 seconds.
+    pub fn connect_deadline(mut self, deadline: Duration) -> Self {
+        self.portable = self.portable.connect_deadline(deadline);
         self
     }
 
@@ -1091,10 +1113,11 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         self
     }
 
-    /// Enables signed-beacon discovery with explicit beacon policy.
+    /// Enables signed-beacon discovery with explicit beacon policy,
+    /// validated at build.
     #[cfg(feature = "discovery")]
-    pub fn beacon_config(mut self, config: BeaconConfig) -> Self {
-        self.portable = self.portable.beacon_config(config);
+    pub fn discovery_config(mut self, config: BeaconConfig) -> Self {
+        self.portable = self.portable.discovery_config(config);
         self
     }
 
@@ -1104,7 +1127,10 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         self
     }
 
-    /// Enables relay-only connectivity through one relay address.
+    /// Adds a relay, in preference order: a path raced against direct
+    /// candidates, with a reservation while the endpoint is not known to be
+    /// public (see [`PortableEndpointBuilder::relay`]). For relay-only
+    /// connects set [`NatConfig::force_relay`].
     #[cfg(feature = "relay")]
     pub fn relay(mut self, relay: PeerAddr) -> Self {
         self.portable = self.portable.relay(relay);
@@ -1126,18 +1152,20 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         self
     }
 
-    /// Adds a trusted AutoNAT server, enabling probing.
+    /// Adds a trusted AutoNAT server, enabling probing; each call adds one.
     ///
     /// Call once per server: a reachability verdict needs a quorum of
     /// distinct servers ([`NatConfig::confidence_threshold`], 3 by default),
     /// so with fewer reachable servers reachability stays Unknown.
     #[cfg(feature = "autonat")]
-    pub fn autonat(mut self, server: PeerAddr) -> Self {
-        self.portable = self.portable.autonat(server);
+    pub fn autonat_server(mut self, server: PeerAddr) -> Self {
+        self.portable = self.portable.autonat_server(server);
         self
     }
 
-    /// Enables NAT policy with explicit relay and AutoNAT settings.
+    /// Sets the base NAT configuration; a second call replaces the first,
+    /// and the relay and AutoNAT setters add to its lists in either order
+    /// (see [`PortableEndpointBuilder::nat_config`]).
     ///
     /// TCP relay configurations must set `dcutr = false` or `force_relay`;
     /// UDP DCUtR remains unavailable. AutoNAT servers may be configured with

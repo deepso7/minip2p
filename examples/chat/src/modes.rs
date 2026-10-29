@@ -61,11 +61,11 @@ fn build_endpoint(
                 topic: format!("{room}/{DISCOVERY_TOPIC}"),
                 beacon_interval_ms: 2_000,
                 ..BeaconConfig::default()
-            })?
+            })
             .peer_discovery_config(PeerDiscoveryConfig {
                 beacon_peer_ttl_ms: 10_000,
                 ..PeerDiscoveryConfig::default()
-            })?;
+            });
     }
     // Without relays, discovery's own NAT agent dials the mesh directly.
     if !relays.is_empty() {

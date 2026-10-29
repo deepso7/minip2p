@@ -1028,7 +1028,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
 
 #[cfg(test)]
 #[path = "engine_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 /// `conn_id`'s path: Relayed for a circuit, through the relay its swarm
 /// address names; otherwise Punched or Direct. Only a circuit needs its

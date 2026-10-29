@@ -8,10 +8,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, BindError, ConnectionId, DiscoveryConfigError, Endpoint, EndpointBuilder,
-    EndpointOptionsError, GossipsubConfig, MdnsConfig, MdnsConfigError, Multiaddr, NatConfig,
-    PeerDiscoveryConfig, PeerId, QuicBindError, ReservationPolicy, StreamId, TransportError,
-    WaitHandle,
+    BeaconConfig, BindError, ConnectionId, Endpoint, EndpointBuilder, EndpointOptionsError,
+    GossipsubConfig, MdnsConfig, Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, QuicBindError,
+    ReservationPolicy, StreamId, TransportError, WaitHandle,
 };
 
 use crate::limits::{Bound, resolve_limits};
@@ -231,23 +230,31 @@ impl P2pEndpoint {
             builder = builder.manual_ack_protocol(protocol);
         }
 
-        // NAT runs when the config names a relay or an AutoNAT server (or
-        // forces the relay); discovery and mDNS turn it on for their peers
-        // otherwise. Without a relay there is nothing to reserve on.
-        if !relays.is_empty() || !autonat_servers.is_empty() || config.force_relay {
+        // Endpoint setup picks the NAT defaults from the relays and AutoNAT
+        // servers alone. A base config carries only what has no setter:
+        // `force_relay`, and `max_circuits`, which only relays use.
+        // `force_relay` without a relay still submits it, so setup refuses it
+        // rather than dropping the flag. Without a relay there is nothing to
+        // reserve on.
+        let custom_circuits = limits.max_circuits != NatConfig::default().max_circuits;
+        if config.force_relay || (custom_circuits && !relays.is_empty()) {
             let reservation_policy = if relays.is_empty() {
                 ReservationPolicy::Never
             } else {
                 ReservationPolicy::default()
             };
             builder = builder.nat_config(NatConfig {
-                relays,
-                autonat_servers,
                 force_relay: config.force_relay,
                 max_circuits: limits.max_circuits,
                 reservation_policy,
                 ..NatConfig::default()
             });
+        }
+        for relay in relays {
+            builder = builder.relay(relay);
+        }
+        for server in autonat_servers {
+            builder = builder.autonat_server(server);
         }
 
         let signed_auto_dial = config.discovery.as_ref().map(|options| options.auto_dial);
@@ -264,9 +271,7 @@ impl P2pEndpoint {
             };
             builder = builder
                 .discovery_config(beacon)
-                .map_err(map_discovery_config_error)?
-                .peer_discovery_config(peer_discovery)
-                .map_err(map_discovery_config_error)?;
+                .peer_discovery_config(peer_discovery);
         }
         if let Some(mdns) = config.mdns {
             if signed_auto_dial.is_some_and(|auto_dial| auto_dial != mdns.auto_dial) {
@@ -283,16 +288,12 @@ impl P2pEndpoint {
                 max_announced_addrs: mdns.max_announced_addrs as usize,
                 interface_refresh_ms: mdns.interface_refresh_ms,
             };
-            builder = builder
-                .mdns_config(mdns_config)
-                .map_err(map_mdns_config_error)?;
+            builder = builder.mdns_config(mdns_config);
             if signed_auto_dial.is_none() {
-                builder = builder
-                    .peer_discovery_config(PeerDiscoveryConfig {
-                        auto_dial: mdns.auto_dial,
-                        ..PeerDiscoveryConfig::default()
-                    })
-                    .map_err(map_discovery_config_error)?;
+                builder = builder.peer_discovery_config(PeerDiscoveryConfig {
+                    auto_dial: mdns.auto_dial,
+                    ..PeerDiscoveryConfig::default()
+                });
             }
         }
 
@@ -1059,22 +1060,6 @@ impl Drop for PendingCommand<'_> {
                 .unwrap_or_else(PoisonError::into_inner);
             self.shared.commands_idle_cv.notify_all();
         }
-    }
-}
-
-/// Signed-discovery and peer-book policy mistakes.
-fn map_discovery_config_error(error: DiscoveryConfigError) -> FfiError {
-    FfiError::InvalidConfig {
-        capability: ConfigCapability::Discovery,
-        detail: error.to_string(),
-    }
-}
-
-/// mDNS policy mistakes.
-fn map_mdns_config_error(error: MdnsConfigError) -> FfiError {
-    FfiError::InvalidConfig {
-        capability: ConfigCapability::Mdns,
-        detail: error.to_string(),
     }
 }
 

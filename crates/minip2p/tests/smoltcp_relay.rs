@@ -488,6 +488,128 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
     );
 }
 
+/// A relay that is a path rather than a mode (`dcutr = false`,
+/// `force_relay = false`, the default `WhenPrivate` policy) still reserves
+/// while reachability is Unknown, accepts a peer's connection over the
+/// circuit, and renews the reservation.
+#[test]
+fn a_raced_relay_reserves_carries_inbound_traffic_and_renews() {
+    let bus = VirtualBus::new(3);
+    let a_identity = identity(141);
+    let b_identity = identity(142);
+    let relay_identity = identity(143);
+    let a_peer = a_identity.peer_id();
+    let b_peer = b_identity.peer_id();
+    let relay_peer = relay_identity.peer_id();
+    let relay_addr = PeerAddr::new(
+        format!("/ip4/{RELAY_IP}/tcp/4001").parse().unwrap(),
+        relay_peer.clone(),
+    )
+    .unwrap();
+
+    let mut a = Endpoint::portable(&a_identity, CountingEntropy(60))
+        .smoltcp(stack(bus.device(0), A_IP))
+        .nat_config(relay_config(relay_addr.clone(), ReservationPolicy::Never))
+        .protocol(APP_PROTOCOL)
+        .build()
+        .unwrap();
+    // Renews every two seconds: this endpoint has no wall clock, so renewal
+    // runs at half the default TTL.
+    let mut b = Endpoint::portable(&b_identity, CountingEntropy(70))
+        .smoltcp(stack(bus.device(1), B_IP))
+        .nat_config(NatConfig {
+            dcutr: false,
+            reservation_default_ttl_secs: 4,
+            ..NatConfig::default()
+        })
+        .relay(relay_addr)
+        .protocol(APP_PROTOCOL)
+        .build()
+        .unwrap();
+    let mut relay = Endpoint::portable(&relay_identity, CountingEntropy(80))
+        .smoltcp(stack(bus.device(2), RELAY_IP))
+        .listen(format!("/ip4/{RELAY_IP}/tcp/4001"))
+        .protocol(HOP_PROTOCOL_ID)
+        .protocol(STOP_PROTOCOL_ID)
+        .build()
+        .unwrap();
+    let mut service = RelayService::new(a_peer.clone(), b_peer.clone());
+
+    let mut now_ms = 0;
+    let mut a_events = Vec::new();
+    let mut b_events = Vec::new();
+    let mut connect_id = None;
+    let mut app_stream = None;
+    let mut sent = false;
+    for _ in 0..MAX_STEPS {
+        let now = Now::from_millis(now_ms);
+        a_events.extend(a.poll(now).unwrap());
+        b_events.extend(b.poll(now).unwrap());
+        for event in relay.poll(now).unwrap() {
+            service.handle(&mut relay, event, now);
+        }
+
+        let reservations = b_events
+            .iter()
+            .filter(|event| {
+                matches!(event, EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })
+                    if relay == &relay_peer)
+            })
+            .count();
+        if reservations > 0 && connect_id.is_none() {
+            connect_id = Some(a.connect(&b_peer, now).unwrap());
+        }
+        let a_settled = connect_id.is_some_and(|id| {
+            a_events.iter().any(|event| {
+                matches!(event, EndpointEvent::ConnectSettled {
+                    connect_id: found,
+                    outcome: ConnectOutcome::Connected { conn_id, .. },
+                    ..
+                } if *found == id && conn_id.is_circuit())
+            })
+        });
+        if a_settled && app_stream.is_none() {
+            app_stream = Some(a.open_stream(&b_peer, APP_PROTOCOL, now).unwrap());
+        }
+        if let Some((conn, stream)) = app_stream
+            && !sent
+            && a_events.iter().any(|event| {
+                matches!(event, EndpointEvent::StreamReady {
+                    peer_id, conn_id, stream_id, initiated_locally: true, ..
+                } if peer_id == &b_peer && *conn_id == conn && *stream_id == stream)
+            })
+        {
+            a.send_stream(conn, stream, PAYLOAD.to_vec(), now).unwrap();
+            sent = true;
+        }
+        // Inbound: B receives A's data on a circuit connection.
+        let received = b_events.iter().any(|event| {
+            matches!(event, EndpointEvent::StreamData { peer_id, conn_id, data, .. }
+                if peer_id == &a_peer && conn_id.is_circuit() && data == PAYLOAD)
+        });
+        if received && reservations >= 2 {
+            assert!(
+                matches!(b.path(&a_peer), Some(Path::Relayed { relay }) if relay == relay_peer)
+            );
+            return;
+        }
+
+        if bus.is_quiet() {
+            let deadline = [
+                a.next_deadline(now),
+                b.next_deadline(now),
+                relay.next_deadline(now),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .expect("relay world retains a deadline");
+            now_ms = now_ms.max(deadline.as_millis());
+        }
+    }
+    panic!("no inbound circuit traffic and renewal\n  a: {a_events:?}\n  b: {b_events:?}");
+}
+
 #[test]
 fn portable_relay_and_autonat_compose_and_register_their_protocols() {
     let bus = VirtualBus::new(1);
@@ -542,7 +664,7 @@ fn peer_target_on_an_autonat_only_portable_endpoint_settles_no_usable_route() {
     .unwrap();
     let mut endpoint = Endpoint::portable(&local, CountingEntropy(51))
         .smoltcp(stack(bus.device(0), A_IP))
-        .autonat(server_addr)
+        .autonat_server(server_addr)
         .build()
         .expect("AutoNAT-only policy builds with relay code available");
 
@@ -575,6 +697,7 @@ fn relay_preserves_an_explicit_reservation_policy() {
     )
     .unwrap();
     let config = NatConfig {
+        force_relay: true,
         reservation_policy: ReservationPolicy::Always,
         ..NatConfig::default()
     };
@@ -606,7 +729,7 @@ fn relay_attempt_uses_host_deadline_and_cancellation_settles_once() {
         .unwrap();
         let peer = identity(137).peer_id();
         let mut endpoint = Endpoint::portable(&local, CountingEntropy(53))
-            .connect_deadline_ms(50)
+            .connect_deadline(core::time::Duration::from_millis(50))
             .smoltcp(stack(bus.device(0), A_IP))
             .nat_config(relay_config(relay, ReservationPolicy::Never))
             .build()

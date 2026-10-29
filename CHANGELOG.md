@@ -4,6 +4,29 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### Endpoint builders record intent; Endpoint setup applies NAT defaults (#439)
+
+The std, portable and smoltcp builders now only record what you configure. Endpoint setup picks every NAT default and merges the relay and AutoNAT lists, and every capability is checked at build. Breaking changes:
+
+- **Renames and signature changes:**
+
+  | Builder | Was | Now |
+  | --- | --- | --- |
+  | `PortableEndpointBuilder`, `SmoltcpEndpointBuilder` | `autonat(server)` | `autonat_server(server)` |
+  | `PortableEndpointBuilder`, `SmoltcpEndpointBuilder` | `beacon_config(config)` | `discovery_config(config)` |
+  | `PortableEndpointBuilder` | `connect_deadline_ms(u64)` | `connect_deadline(Duration)` |
+  | `PortableEndpointBuilder` | `simultaneous_dial_window_ms(u64)` | `simultaneous_dial_window(Duration)` |
+  | `SmoltcpEndpointBuilder` | (none) | `connect_deadline(Duration)`, `simultaneous_dial_window(Duration)` |
+  | `EndpointBuilder` | `discovery_config(..) -> Result<Self, DiscoveryConfigError>` | `discovery_config(..) -> Self` |
+  | `EndpointBuilder` | `peer_discovery_config(..) -> Result<Self, DiscoveryConfigError>` | `peer_discovery_config(..) -> Self` |
+  | `EndpointBuilder` | `mdns_config(..) -> Result<Self, MdnsConfigError>` | `mdns_config(..) -> Self` |
+  | `EndpointBuilder` | `relay_server_config(..) -> Result<Self, RelayServerConfigError>` | `relay_server_config(..) -> Self` |
+
+  `Duration` is `core::time::Duration` (the same type as `std::time::Duration`). The std setters no longer validate eagerly: an invalid config fails `bind` with `BindError::Discovery`, `BindError::Mdns` or `BindError::RelayServer`, still before any socket opens. Drop the `?` / `.expect(..)` after those calls.
+
+- **Portable and smoltcp `.relay(addr)` no longer forces relay-only.** `.relay` now means the same on every endpoint: a relay is a path raced against direct candidates, not a mode. Without `nat_config`, a portable endpoint with a relay runs the default policy with `dcutr = false`, so it now **reserves on the relay by default while reachability is not public, including while it is `Unknown`** (with or without AutoNAT servers). For the old behaviour, ask for it explicitly: `.nat_config(NatConfig { force_relay: true, reservation_policy: ReservationPolicy::Never, ..NatConfig::default() })` next to `.relay(addr)`.
+- **`nat_config` is a base the list setters add to, in any order.** On portable and smoltcp, `.relay(a).nat_config(c)` used to drop `a`; now, as on std, the base keeps its policy and tuning fields as given, and its relay and AutoNAT lists come first, followed by the setters' addresses in call order, without exact repeats. A second `nat_config` call replaces the first, while `relay` and `autonat_server` add to each other. The merged config is what setup validates, so `.nat_config(NatConfig { force_relay: true, .. }).relay(a)` binds in either order.
+
 ### Endpoint setup: one place for capabilities (#432)
 
 The std `Endpoint` and `PortableEndpoint` now validate, register and install capabilities through the same Endpoint setup, so a configuration behaves alike on both. Breaking changes:
