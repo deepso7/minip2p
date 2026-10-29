@@ -141,7 +141,11 @@ impl NatSwarm for ClientSwarm {
         Ok(())
     }
 
-    fn promote_bridge(&mut self, handoff: BridgeHandoff) -> Result<ConnectionId, PromoteError> {
+    fn promote_bridge(
+        &mut self,
+        handoff: BridgeHandoff,
+        _now_ms: u64,
+    ) -> Result<ConnectionId, PromoteError> {
         self.promoted = Some(handoff);
         Ok(self.circuit)
     }

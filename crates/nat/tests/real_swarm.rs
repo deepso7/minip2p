@@ -7,7 +7,8 @@ use minip2p_core::platform::{EntropyError, EntropySource, Now as SwarmNow};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_nat::{
-    ConnectLegs, HOP_PROTOCOL_ID, NatAgent, NatConfig, NatError, NatEvent, Now, ReservationPolicy,
+    BridgeHandoff, BridgeRole, ConnectLegs, HOP_PROTOCOL_ID, NatAgent, NatConfig, NatError,
+    NatEvent, NatSwarm, Now, PromoteError, ReservationPolicy,
 };
 use minip2p_swarm::{SwarmBuilder, SwarmCore, SwarmEvent};
 use minip2p_test_support::InMemoryTransport;
@@ -242,4 +243,79 @@ fn a_command_between_buffered_deliveries_keeps_the_swarm_order() {
     assert_eq!(hop_streams, 1, "exactly one HOP stream was opened");
     assert!(relay_hop_data > 0, "the relay received HOP CONNECT");
     assert!(next_outcome(&mut agent).is_none());
+}
+
+#[test]
+fn the_bare_swarm_resets_a_bridge_it_cannot_promote() {
+    let local_key = Ed25519Keypair::from_secret_key_bytes([2; 32]);
+    let relay_key = Ed25519Keypair::from_secret_key_bytes([3; 32]);
+    let relay_peer = relay_key.peer_id();
+    let (local_io, relay_io) = InMemoryTransport::pair(local_key.peer_id(), relay_peer.clone());
+    let mut local = SwarmBuilder::new(&local_key)
+        .protocol(HOP_PROTOCOL_ID)
+        .build_core(local_io, ZeroEntropy)
+        .expect("valid local swarm");
+    let mut relay = SwarmBuilder::new(&relay_key)
+        .protocol(HOP_PROTOCOL_ID)
+        .build_core(relay_io, ZeroEntropy)
+        .expect("valid relay swarm");
+    for ms in 0..64 {
+        relay.poll(SwarmNow::from_millis(ms)).expect("drive relay");
+        local.poll(SwarmNow::from_millis(ms)).expect("drive local");
+        if local.is_peer_ready(&relay_peer) {
+            break;
+        }
+    }
+    let (inner_conn, stream_id) = local
+        .open_stream(&relay_peer, HOP_PROTOCOL_ID, 64)
+        .expect("open the bridge stream");
+    // Both ends negotiate the bridge, as before a HOP CONNECT.
+    let (mut local_ready, mut relay_stream) = (false, None);
+    for ms in 64..128 {
+        for event in local.poll(SwarmNow::from_millis(ms)).expect("drive local") {
+            local_ready |=
+                matches!(event, SwarmEvent::StreamReady { stream_id: s, .. } if s == stream_id);
+        }
+        for event in relay.poll(SwarmNow::from_millis(ms)).expect("drive relay") {
+            if let SwarmEvent::StreamReady { stream_id, .. } = event {
+                relay_stream = Some(stream_id);
+            }
+        }
+        if local_ready && relay_stream.is_some() {
+            break;
+        }
+    }
+    let relay_stream = relay_stream.expect("the relay saw the bridge stream");
+
+    let handoff = BridgeHandoff {
+        inner_conn,
+        stream_id,
+        relay: relay_peer,
+        remote_peer: PeerId::from_public_key_protobuf(b"target"),
+        role: BridgeRole::Initiator,
+        pending_data: Vec::new(),
+        unsent_data: Vec::new(),
+        remote_write_closed: false,
+    };
+    let refused = NatSwarm::promote_bridge(&mut local, handoff, 128);
+
+    assert!(matches!(refused, Err(PromoteError::Failed(_))));
+
+    // The refused bridge must not stay open for later bytes to reach the
+    // application as ordinary stream events.
+    let mut closed = false;
+    for ms in 128..192 {
+        local.poll(SwarmNow::from_millis(ms)).expect("drive local");
+        for event in relay.poll(SwarmNow::from_millis(ms)).expect("drive relay") {
+            if let SwarmEvent::StreamClosed { stream_id, .. } = event
+                && stream_id == relay_stream
+            {
+                closed = true;
+            }
+        }
+        if closed {
+            break;
+        }
+    }
+    assert!(closed, "the relay saw the refused bridge close");
 }

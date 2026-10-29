@@ -179,11 +179,23 @@ pub trait NatSwarm {
     /// synchronous; the circuit's handshake completes later as
     /// `SwarmEvent::ConnectionEstablished`. A bridge already adopted returns
     /// its existing circuit. The default, for a host without circuits,
-    /// refuses: the minip2p `Endpoint`'s own swarm adapter adopts. A host
-    /// that refuses for any reason other than
+    /// resets the bridge stream and refuses: the minip2p `Endpoint`'s own
+    /// swarm adapter adopts. A host that refuses for any reason other than
     /// [`PromoteError::UnknownConnection`] should reset the bridge stream.
-    fn promote_bridge(&mut self, handoff: BridgeHandoff) -> Result<ConnectionId, PromoteError> {
-        let _ = handoff;
+    fn promote_bridge(
+        &mut self,
+        handoff: BridgeHandoff,
+        now_ms: u64,
+    ) -> Result<ConnectionId, PromoteError> {
+        // Best effort: a stream already gone needs no reset.
+        match self.reset_stream(
+            &handoff.relay,
+            handoff.inner_conn,
+            handoff.stream_id,
+            now_ms,
+        ) {
+            Ok(()) | Err(_) => {}
+        }
         Err(PromoteError::Failed(
             "this swarm cannot promote bridges".into(),
         ))
@@ -358,13 +370,17 @@ impl NatSwarm for HoldingSwarm<'_> {
     /// Adds the bridge's held tails to the handoff, so the circuit sends
     /// them before its own bytes (ADR 0012). A held close is dropped: the
     /// circuit owns the stream's write side now.
-    fn promote_bridge(&mut self, mut handoff: BridgeHandoff) -> Result<ConnectionId, PromoteError> {
+    fn promote_bridge(
+        &mut self,
+        mut handoff: BridgeHandoff,
+        now_ms: u64,
+    ) -> Result<ConnectionId, PromoteError> {
         if let Some(held) = self.held.take(handoff.inner_conn, handoff.stream_id) {
             handoff
                 .unsent_data
                 .extend(held.tails.iter().flat_map(|tail| tail.iter().copied()));
         }
-        self.inner.promote_bridge(handoff)
+        self.inner.promote_bridge(handoff, now_ms)
     }
 
     fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[String])> {

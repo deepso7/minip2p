@@ -1219,7 +1219,7 @@ impl ConnectAttempt {
             unsent_data: Vec::new(),
             remote_write_closed: self.bridge_remote_write_closed,
         };
-        match swarm.promote_bridge(handoff) {
+        match swarm.promote_bridge(handoff, now.monotonic_ms) {
             Ok(conn_id) => {
                 self.promoted = Some(conn_id);
                 self.promoting = true;

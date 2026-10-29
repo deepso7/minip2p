@@ -878,7 +878,11 @@ impl NatSwarm for FakeSwarm {
         Ok(())
     }
 
-    fn promote_bridge(&mut self, handoff: BridgeHandoff) -> Result<ConnectionId, PromoteError> {
+    fn promote_bridge(
+        &mut self,
+        handoff: BridgeHandoff,
+        _now_ms: u64,
+    ) -> Result<ConnectionId, PromoteError> {
         let result = self.promote_results.pop_front().unwrap_or_else(|| {
             let conn_id = ConnectionId::new(TEST_CIRCUIT_ID + self.promotions);
             self.promotions += 1;

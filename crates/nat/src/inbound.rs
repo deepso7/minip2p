@@ -327,7 +327,7 @@ impl InboundCircuit {
             // later half-close can arrive while NAT owns the bridge.
             remote_write_closed: false,
         };
-        match swarm.promote_bridge(handoff) {
+        match swarm.promote_bridge(handoff, now.monotonic_ms) {
             Ok(conn_id) => {
                 self.promoted = Some(conn_id);
                 self.handshake_deadline =

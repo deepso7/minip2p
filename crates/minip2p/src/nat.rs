@@ -631,7 +631,7 @@ impl<T: Transport> NatDriver<T> {
         handoff: BridgeHandoff,
         swarm: &mut SwarmCore<T, R>,
     ) -> Result<ConnectionId, PromoteError> {
-        EndpointSwarm::new(swarm, &mut self.io).promote_bridge(handoff)
+        EndpointSwarm::new(swarm, &mut self.io).promote_bridge(handoff, 0)
     }
 
     /// Executes one agent action. These need the transport underneath the
@@ -895,7 +895,11 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
     /// Adopts the bridge into the circuit transport. Without `relay` the
     /// default refusal stands.
     #[cfg(feature = "relay")]
-    fn promote_bridge(&mut self, handoff: BridgeHandoff) -> Result<ConnectionId, PromoteError> {
+    fn promote_bridge(
+        &mut self,
+        handoff: BridgeHandoff,
+        _now_ms: u64,
+    ) -> Result<ConnectionId, PromoteError> {
         let BridgeHandoff {
             inner_conn,
             stream_id,
