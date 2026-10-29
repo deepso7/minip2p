@@ -194,8 +194,13 @@ nav[aria-label="Sections"] a[aria-current="page"] {
 nav[aria-label="Sections"] a[aria-current="page"]::before {
   color: inherit;
 }
-nav[aria-label="Sections"] a[aria-current="page"]::after {
+/* Every tab reserves the tmux `*` so lighting one up doesn't resize it. */
+nav[aria-label="Sections"] a::after {
   content: "*";
+  visibility: hidden;
+}
+nav[aria-label="Sections"] a[aria-current="page"]::after {
+  visibility: visible;
 }
 [data-blume-header] button,
 [data-blume-header] a,
