@@ -384,6 +384,29 @@ fn a_client_that_never_finishes_noise_times_out_without_connecting() {
 }
 
 #[test]
+fn the_handshake_deadline_fires_once_and_a_disarmed_session_keeps_none() {
+    use crate::webtransport::{WebTransportContext, WtClose, WtSession};
+    let context = std::sync::Arc::new(WebTransportContext {
+        keypair: Ed25519Keypair::generate(),
+        certhashes: Vec::new(),
+    });
+    let armed_at = Instant::now();
+    let timeout = Duration::from_millis(200);
+    let mut wt = WtSession::new(context.clone(), armed_at, timeout);
+    let deadline = armed_at + timeout;
+    assert_eq!(wt.poll_timeout(), Some(deadline));
+    assert_eq!(wt.poll_close(armed_at + Duration::from_millis(199)), None);
+    assert_eq!(wt.poll_close(deadline), Some(WtClose::HandshakeTimedOut));
+    assert_eq!(wt.poll_close(deadline), None, "reported once");
+    assert_eq!(wt.poll_timeout(), None);
+
+    let mut wt = WtSession::new(context, armed_at, timeout);
+    wt.disarm();
+    assert_eq!(wt.poll_timeout(), None);
+    assert_eq!(wt.poll_close(deadline), None);
+}
+
+#[test]
 fn a_draft02_client_authenticates() {
     let mut server = impatient_server();
     let mut events = Vec::new();
