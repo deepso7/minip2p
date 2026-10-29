@@ -3,6 +3,8 @@
 
 use crate::ConnectionCloseReason;
 use alloc::collections::VecDeque;
+use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -20,6 +22,7 @@ use minip2p_transport::{
     TransportEvent,
 };
 
+use crate::names::{Expander, Expansion, NameAnswers, name_of};
 use crate::{ConnectOutcome, Endpoint, EndpointEvent};
 
 struct CountingEntropy(u8);
@@ -632,9 +635,16 @@ struct RelayLegFixture {
 #[cfg(feature = "autonat")]
 impl RelayLegFixture {
     fn new(seed: u8, force_relay: bool) -> Self {
+        Self::with_relay(seed, force_relay, "/ip4/192.0.2.50/tcp/4001")
+    }
+
+    /// Like [`Self::new`], with the relay at `relay` (which may name a host)
+    /// and NAT dials to named hosts parked for the engine's [`Expander`],
+    /// as on the std Endpoint.
+    fn with_relay(seed: u8, force_relay: bool, relay: &str) -> Self {
         let identity = Ed25519Keypair::from_secret_key_bytes([seed; 32]);
         let relay = PeerAddr::new(
-            "/ip4/192.0.2.50/tcp/4001".parse().expect("addr"),
+            relay.parse().expect("addr"),
             Ed25519Keypair::from_secret_key_bytes([seed + 1; 32]).peer_id(),
         )
         .expect("relay");
@@ -652,17 +662,30 @@ impl RelayLegFixture {
             relay_timeout_ms: crate::DEFAULT_CONNECT_DEADLINE_MS,
             ..minip2p_nat::NatConfig::default()
         };
-        endpoint.engine.nat = Some(crate::nat::NatDriver::new(
+        let mut nat = crate::nat::NatDriver::new(
             minip2p_nat::NatAgent::new(identity.peer_id(), config),
             vec![(relay.peer_id().clone(), relay.transport().clone())],
             7,
-        ));
+        );
+        nat.park_named_dials();
+        endpoint.engine.nat = Some(nat);
         Self {
             endpoint,
             transport,
             relay,
             peer,
         }
+    }
+
+    /// The transport addresses dialed for `peer`, oldest first.
+    fn dialed(&self, peer: &PeerId) -> Vec<String> {
+        self.transport
+            .script()
+            .dials
+            .iter()
+            .filter(|(_, addr)| addr.peer_id() == peer)
+            .map(|(_, addr)| addr.transport().to_string())
+            .collect()
     }
 
     /// The relay leg's dial to the relay, once there is exactly one.
@@ -937,4 +960,200 @@ fn a_discovery_cancel_dial_cancels_the_relay_leg_in_the_same_batch() {
         RelayLegFixture::terminals(&events, id).is_empty(),
         "discovery claims its own terminal: {events:?}"
     );
+}
+
+/// Name resolution the test answers by hand: it records a lookup for each
+/// name it is asked about, refuses the names in `refuse`, and hands out
+/// `answers` on the next batch.
+#[derive(Default)]
+struct FakeNames {
+    lookups: Vec<String>,
+    refuse: Vec<&'static str>,
+    answers: NameAnswers,
+}
+
+impl FakeNames {
+    /// Answers `host` on the next batch: its IP addresses, or the lookup's
+    /// error.
+    fn answer(&mut self, host: &str, answer: Result<&[&str], &str>) {
+        let answer = answer
+            .map(|ips| ips.iter().map(|ip| ip.parse().expect("ip")).collect())
+            .map_err(String::from);
+        self.answers.insert(host.to_string(), answer);
+    }
+}
+
+impl Expander for FakeNames {
+    fn expand(&mut self, addr: &PeerAddr) -> Expansion {
+        match name_of(addr) {
+            Ok(None) => Expansion::Ready(vec![addr.clone()]),
+            Ok(Some(name)) if self.refuse.contains(&name.host) => {
+                Expansion::Refused(format!("refused {}", name.host))
+            }
+            Ok(Some(name)) => {
+                self.lookups.push(name.host.to_string());
+                Expansion::Resolving
+            }
+            Err(reason) => Expansion::Refused(reason),
+        }
+    }
+
+    fn take_answers(&mut self) -> NameAnswers {
+        core::mem::take(&mut self.answers)
+    }
+}
+
+fn named(host_addr: &str, peer: &PeerId) -> PeerAddr {
+    PeerAddr::new(host_addr.parse().expect("addr"), peer.clone()).expect("peer addr")
+}
+
+/// Expiry runs before answers: a failed lookup answered in the batch that
+/// passes the deadline leaves the attempt `Timeout`, not `NoUsableRoute`.
+#[test]
+fn an_answer_after_the_attempt_deadline_leaves_it_timed_out() {
+    let identity = Ed25519Keypair::from_secret_key_bytes([40; 32]);
+    let peer = Ed25519Keypair::from_secret_key_bytes([41; 32]).peer_id();
+    let mut endpoint = Endpoint::portable(&identity, CountingEntropy(0))
+        .build(FlashTransport::default())
+        .expect("builds");
+    let mut names = FakeNames::default();
+    let engine = &mut endpoint.engine;
+    let id = engine.connect(
+        named("/dns4/peer.test/tcp/4001", &peer).into(),
+        &mut names,
+        Now::from_millis(0),
+    );
+    assert_eq!(names.lookups, ["peer.test"]);
+
+    names.answer("peer.test", Err("NXDOMAIN"));
+    let deadline = Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS);
+    engine.drive(deadline, &mut names).expect("drive");
+    let events = engine.take_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome: ConnectOutcome::Failed(crate::ConnectFailure::Timeout { .. }),
+                ..
+            } if *connect_id == id
+        )),
+        "{events:?}"
+    );
+}
+
+/// A relay leg staggered behind a direct dial parks its named relay dial in
+/// a later batch's NAT tick. That batch starts the lookup before `drive`
+/// returns, so the caller never sleeps with it unstarted.
+#[cfg(feature = "autonat")]
+#[test]
+fn a_nat_dial_parked_in_a_batch_has_its_lookup_started_by_that_batch() {
+    let mut f = RelayLegFixture::with_relay(75, false, "/dns4/relay.test/tcp/4001");
+    let mut names = FakeNames::default();
+    let direct = named("/ip4/192.0.2.60/tcp/4001", &f.peer);
+    let engine = &mut f.endpoint.engine;
+    engine.connect(direct.into(), &mut names, Now::from_millis(0));
+    engine
+        .drive(Now::from_millis(0), &mut names)
+        .expect("drive");
+    assert!(
+        names.lookups.is_empty(),
+        "the relay leg waits out its stagger"
+    );
+
+    let stagger = minip2p_nat::NatConfig::default().relay_stagger_ms;
+    engine
+        .drive(Now::from_millis(stagger), &mut names)
+        .expect("drive");
+    assert_eq!(names.lookups, ["relay.test"]);
+}
+
+/// A NAT dial refused at expansion (the resolver's lookup cap, say) is
+/// finished and routed in the batch that parked it: its `RelayFailed`
+/// reaches the application from that same `drive`.
+#[cfg(feature = "autonat")]
+#[test]
+fn a_nat_dial_refused_at_expansion_is_settled_in_the_same_drive() {
+    use minip2p_nat::NatEvent;
+
+    let mut f = RelayLegFixture::with_relay(78, false, "/dns4/relay.test/tcp/4001");
+    let mut names = FakeNames {
+        refuse: vec!["relay.test"],
+        ..FakeNames::default()
+    };
+    let direct = named("/ip4/192.0.2.60/tcp/4001", &f.peer);
+    let engine = &mut f.endpoint.engine;
+    let id = engine.connect(direct.into(), &mut names, Now::from_millis(0));
+    engine
+        .drive(Now::from_millis(0), &mut names)
+        .expect("drive");
+    engine.take_events();
+
+    let stagger = minip2p_nat::NatConfig::default().relay_stagger_ms;
+    engine
+        .drive(Now::from_millis(stagger), &mut names)
+        .expect("drive");
+    let events = engine.take_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EndpointEvent::Nat(NatEvent::RelayFailed { connect_id, .. }) if *connect_id == id
+        )),
+        "{events:?}"
+    );
+    assert!(f.dialed(f.relay.peer_id()).is_empty());
+}
+
+/// A lookup outlives the leg that wanted it: once the attempt is
+/// cancelled, the answer for its relay is dropped rather than dialed.
+#[cfg(feature = "autonat")]
+#[test]
+fn an_answer_for_a_nat_dial_no_longer_wanted_is_dropped() {
+    let mut f = RelayLegFixture::with_relay(81, true, "/dns4/relay.test/tcp/4001");
+    let mut names = FakeNames::default();
+    let now = Now::from_millis(0);
+    let engine = &mut f.endpoint.engine;
+    let id = engine.connect(f.peer.clone().into(), &mut names, now);
+    engine.drive(now, &mut names).expect("drive");
+    assert_eq!(names.lookups, ["relay.test"]);
+
+    engine.cancel_connect(id, now);
+    names.answer("relay.test", Ok(&["192.0.2.50"]));
+    engine.drive(now, &mut names).expect("drive");
+    assert!(f.dialed(f.relay.peer_id()).is_empty());
+}
+
+/// One answer serves every consumer naming the host: candidates of
+/// different shapes (`/dns4` over TCP, `/dns6` over QUIC) and a parked
+/// relay dial (`/dns`, another port) each rebuild their own targets.
+#[cfg(feature = "autonat")]
+#[test]
+fn one_answer_serves_every_candidate_and_parked_dial_naming_the_host() {
+    let mut f = RelayLegFixture::with_relay(84, false, "/dns/shared.test/tcp/4002");
+    let mut names = FakeNames::default();
+    let now = Now::from_millis(0);
+    let candidates = vec![
+        named("/dns4/shared.test/tcp/4001", &f.peer),
+        named("/dns6/shared.test/udp/4001/quic-v1", &f.peer),
+    ];
+    let engine = &mut f.endpoint.engine;
+    let target = crate::ConnectTarget::try_from(candidates).expect("one peer");
+    let id = engine.connect(target, &mut names, now);
+    // Resolving candidates count as racing, so the relay leg waits out its
+    // stagger before it parks the relay dial.
+    let now = Now::from_millis(minip2p_nat::NatConfig::default().relay_stagger_ms);
+    engine.drive(now, &mut names).expect("drive");
+    assert_eq!(names.lookups, ["shared.test"; 3]);
+
+    names.answer("shared.test", Ok(&["192.0.2.9", "2001:db8::9"]));
+    engine.drive(now, &mut names).expect("drive");
+    assert!(engine.connect.is_pending(id));
+    assert_eq!(
+        f.dialed(&f.peer),
+        [
+            "/ip4/192.0.2.9/tcp/4001",
+            "/ip6/2001:db8::9/udp/4001/quic-v1"
+        ]
+    );
+    assert_eq!(f.dialed(f.relay.peer_id()), ["/ip4/192.0.2.9/tcp/4002"]);
 }

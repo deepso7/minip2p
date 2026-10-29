@@ -27,6 +27,7 @@ use minip2p_swarm::{SwarmCore, SwarmEvent};
 use minip2p_transport::{ConnectionId, Transport};
 
 use crate::EndpointEvent;
+use crate::names::{Expander, Expansion, NameAnswers, answer_for};
 #[cfg(feature = "autonat")]
 use crate::nat::NatDriver;
 
@@ -322,11 +323,6 @@ impl Candidates {
     }
 }
 
-/// What Name resolution made of one `/dns*` candidate: the concrete
-/// addresses to dial, or why there are none.
-#[cfg(feature = "std")]
-pub(crate) type NameAnswer = Result<Vec<PeerAddr>, String>;
-
 /// Sans-I/O engine that owns Connection attempts for both Endpoint compositions.
 pub(crate) struct ConnectEngine {
     next_id: u64,
@@ -569,17 +565,20 @@ impl ConnectEngine {
 
     /// Feeds Name resolution answers to every attempt waiting on one.
     ///
-    /// `answer` is asked about each still-resolving candidate: `None` keeps
-    /// it waiting, `Some(Ok(addrs))` dials the concrete addresses, and
-    /// `Some(Err(reason))` records a failed candidate. An attempt left with no
-    /// direct candidate and no relay leg settles as failed. Answers for
-    /// attempts that already settled have nowhere to go and are dropped.
-    #[cfg(feature = "std")]
+    /// Each still-resolving candidate rebuilds its own dial targets from the
+    /// answer for its name ([`answer_for`]): no answer keeps it waiting, a
+    /// usable one dials the concrete addresses, and a failed one records a
+    /// failed candidate. An attempt left with no direct candidate and no
+    /// relay leg settles as failed. Answers for attempts that already
+    /// settled have nowhere to go and are dropped.
     pub(crate) fn resolved<T: Transport, E: EntropySource>(
         &mut self,
-        answer: &mut dyn FnMut(&PeerAddr) -> Option<NameAnswer>,
+        answers: &NameAnswers,
         runtime: &mut SwarmCore<T, E>,
     ) {
+        if answers.is_empty() {
+            return;
+        }
         let ids: Vec<ConnectId> = self
             .attempts
             .iter()
@@ -592,7 +591,7 @@ impl ConnectEngine {
             };
             let mut answered = false;
             for addr in core::mem::take(&mut attempt.resolving) {
-                match answer(&addr) {
+                match answer_for(&addr, answers) {
                     None => attempt.resolving.push(addr),
                     Some(Ok(addrs)) => {
                         answered = true;
@@ -1263,26 +1262,6 @@ pub(crate) struct ConnectAdmission {
     pub(crate) targets: Vec<Multiaddr>,
 }
 
-/// What admission's `expand` step made of one candidate address.
-pub(crate) enum Expansion {
-    /// Concrete addresses to dial now.
-    Ready(Vec<PeerAddr>),
-    /// Name resolution started; the answer arrives later through
-    /// [`ConnectEngine::resolved`].
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(dead_code, reason = "only the std Endpoint resolves names")
-    )]
-    Resolving,
-    /// The candidate cannot be used; the reason becomes its
-    /// [`CandidateFailure`].
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(dead_code, reason = "portable expansion never refuses")
-    )]
-    Refused(String),
-}
-
 /// Where an engine keeps its relay-leg provider: the NAT driver once NAT is
 /// configured, and nothing in a build without NAT. Lend it to one
 /// Connection-attempt call with [`Legs::of`].
@@ -1416,7 +1395,7 @@ fn is_attempt_outcome(event: &minip2p_nat::NatEvent) -> bool {
 /// for each terminal. Each takes the provider as [`Legs`].
 impl ConnectEngine {
     /// Admits one Connection attempt: selects the relay policy from the leg
-    /// provider, expands each candidate through `expand` (Name resolution on
+    /// provider, expands each candidate through `names` (Name resolution on
     /// std, identity on portable), starts direct dials, and attaches the
     /// relay leg while the attempt is still pending. Under `force_relay`
     /// direct candidates are discarded unexpanded, so no name is looked up
@@ -1428,7 +1407,7 @@ impl ConnectEngine {
         mut legs: Legs<'_, T>,
         core: &mut SwarmCore<T, E>,
         admission: ConnectAdmission,
-        expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
+        names: &mut dyn Expander,
         now: Now,
     ) -> ConnectId {
         let ConnectAdmission {
@@ -1445,7 +1424,7 @@ impl ConnectEngine {
         };
         let mut sorted = Candidates::default();
         for addr in candidates {
-            match expand(&addr) {
+            match names.expand(&addr) {
                 Expansion::Ready(addrs) => sorted.ready.extend(addrs),
                 Expansion::Resolving => sorted.resolving.push(addr),
                 Expansion::Refused(reason) => {

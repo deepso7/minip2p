@@ -10,9 +10,11 @@
 )]
 
 use alloc::string::String;
+#[cfg(feature = "autonat")]
 use alloc::vec;
 use alloc::vec::Vec;
 
+#[cfg(feature = "autonat")]
 use minip2p_core::PeerAddr;
 use minip2p_core::platform::{EntropyError, EntropySource, Now};
 use minip2p_identity::Ed25519Keypair;
@@ -20,8 +22,8 @@ use minip2p_swarm::SwarmBuilder;
 use minip2p_test_support::InMemoryTransport;
 
 use super::{Capabilities, Platform, SetupError, install, validate};
-use crate::connect::Expansion;
 use crate::engine::Engine;
+use crate::names::Concrete;
 use crate::portable::StreamAcks;
 #[cfg(feature = "autonat")]
 use {
@@ -138,11 +140,10 @@ fn advertised(capabilities: Capabilities, platform: Platform) -> Vec<String> {
     let mut a = engine(&a_id, a_transport, CountingEntropy(0));
     setup(&mut a, capabilities, platform, &a_id).expect("installs");
     let mut b = engine(&b_id, b_transport, CountingEntropy(1));
-    let mut expand = |addr: &PeerAddr| Expansion::Ready(vec![addr.clone()]);
     for ms in 0..64 {
         let now = Now::from_millis(ms);
-        a.drive(now, &mut expand).expect("drive a");
-        b.drive(now, &mut expand).expect("drive b");
+        a.drive(now, &mut Concrete).expect("drive a");
+        b.drive(now, &mut Concrete).expect("drive b");
         if b.core.is_peer_ready(&a_id.peer_id()) {
             break;
         }

@@ -64,8 +64,6 @@ use crate::GossipsubConfig;
 use crate::GossipsubError;
 #[cfg(feature = "relay")]
 use crate::ReservationInfo;
-#[cfg(feature = "autonat")]
-use crate::connect::Expansion;
 use crate::engine::Engine;
 #[cfg(feature = "relay")]
 use crate::nat::CircuitOps;
@@ -338,11 +336,9 @@ pub enum CloseOutcome {
 pub struct Endpoint {
     pub(crate) engine: StdEngine,
     clock: StdClock,
-    /// Name resolution for `/dns*` candidates, off the driver thread.
+    /// Name resolution for `/dns*` candidates and NAT dials, off the driver
+    /// thread; the engine routes its answers.
     resolver: dial::Resolver,
-    /// NAT relay and AutoNAT dials waiting on Name resolution.
-    #[cfg(feature = "autonat")]
-    nat_dials: Vec<(minip2p_nat::NatToken, PeerAddr)>,
     /// Whether WebTransport presents a CA-signed certificate, which decides
     /// whether a WebTransport announce address must carry a `/certhash`.
     #[cfg(feature = "relay-server")]
@@ -477,10 +473,7 @@ impl Endpoint {
     ) -> Result<ConnectId, ConnectTargetError> {
         let target = target.try_into().map_err(Into::into)?;
         let now = self.now();
-        let resolver = &mut self.resolver;
-        Ok(self
-            .engine
-            .connect(target, &mut |addr| resolver.expand(addr), now))
+        Ok(self.engine.connect(target, &mut self.resolver, now))
     }
 
     /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
@@ -750,11 +743,7 @@ impl Endpoint {
     pub fn poll(&mut self) -> Result<Vec<EndpointEvent>, Error> {
         self.harvest(Duration::ZERO)?;
         let now = self.now();
-        self.resolve_names(now);
         self.drive(now)?;
-        // Start lookups for NAT dials the batch parked, so they run between
-        // polls rather than from the next one.
-        self.resolve_names(now);
         Ok(self.engine.take_events())
     }
 
@@ -852,11 +841,10 @@ impl Endpoint {
             if !harvested {
                 self.harvest(Duration::ZERO)?;
             }
-            // Lookups start before any sleep; finished ones (a lookup thread
-            // is what woke the last sleep, unless the caller did) are applied
-            // to the batch.
+            // The batch applies finished lookups (a lookup thread is what
+            // woke the last sleep, unless the caller did) and starts the
+            // lookups it parks before this can sleep.
             let now = self.now();
-            self.resolve_names(now);
             drove_past_deadline |= deadline.has_passed();
             woke_past_deadline |= woken && deadline.has_passed();
             woken = false;
@@ -878,19 +866,13 @@ impl Endpoint {
             if deadline.has_passed() {
                 return Ok(EndpointWaitOutcome::Deadline);
             }
-            // The batch may have parked NAT dials to named hosts; their
-            // lookups must be under way before this sleeps, or nothing
-            // would wake it for them.
-            let now = self.now();
-            self.resolve_names(now);
             harvested = self.block(deadline)?;
         }
     }
 
     /// Runs one engine batch, with Name resolution as candidate expansion.
     fn drive(&mut self, now: Now) -> Result<(), Error> {
-        let resolver = &mut self.resolver;
-        self.engine.drive(now, &mut |addr| resolver.expand(addr))
+        self.engine.drive(now, &mut self.resolver)
     }
 
     /// Sleeps until input on any registered source, a `Waker` wake, the
@@ -924,56 +906,6 @@ impl Endpoint {
             .harvest(self.engine.core.transport_mut(), timeout)
             .map(drop)
             .map_err(|error| TransportError::io("waiting for readiness", &error).into())
-    }
-
-    /// Starts lookups for NAT dials to named hosts, expires due attempts,
-    /// and applies finished lookups to the Connection attempts and NAT dials
-    /// still waiting on them.
-    ///
-    /// Runs before every batch, so a lookup is under way before the driver
-    /// sleeps, and its answer is applied on the wake it causes.
-    fn resolve_names(&mut self, now: Now) {
-        #[cfg(feature = "autonat")]
-        let mut nat_answered = Vec::new();
-        #[cfg(feature = "autonat")]
-        if let Some(nat) = self.engine.nat.as_mut() {
-            // A lookup can outlive the flight that wanted it; retire those so
-            // retries during a stall do not pile up.
-            self.nat_dials
-                .retain(|(token, _)| nat.named_dial_wanted(*token, now));
-            for (token, addr) in nat.take_named_dials() {
-                match self.resolver.expand(&addr) {
-                    Expansion::Resolving => self.nat_dials.push((token, addr)),
-                    Expansion::Ready(targets) => nat_answered.push((token, Ok(targets))),
-                    Expansion::Refused(reason) => nat_answered.push((token, Err(reason))),
-                }
-            }
-        }
-        // Expire first: an answer that arrives after an attempt's deadline
-        // must not turn its Timeout into another outcome.
-        self.engine.expire_attempts(now);
-        let answers = self.resolver.take_answers();
-        if !answers.is_empty() {
-            self.engine.connect.resolved(
-                &mut |addr| dial::answer_for(addr, &answers),
-                &mut self.engine.core,
-            );
-            #[cfg(feature = "autonat")]
-            self.nat_dials
-                .retain(|(token, addr)| match dial::answer_for(addr, &answers) {
-                    Some(result) => {
-                        nat_answered.push((*token, result));
-                        false
-                    }
-                    None => true,
-                });
-        }
-        #[cfg(feature = "autonat")]
-        if let Some(nat) = self.engine.nat.as_mut() {
-            for (token, result) in nat_answered {
-                nat.named_dial_resolved(token, result, &mut self.engine.core, now);
-            }
-        }
     }
 
     /// Pauses or resumes admission of new relay reservations and circuits.
@@ -2237,8 +2169,6 @@ fn build_endpoint(
         engine,
         clock: StdClock::new(),
         resolver,
-        #[cfg(feature = "autonat")]
-        nat_dials: Vec::new(),
         #[cfg(feature = "relay-server")]
         ca_webtransport_certificate,
         #[cfg(feature = "quic")]
@@ -2524,10 +2454,10 @@ mod tests {
     fn stalling_lookup() -> (
         dial::Lookup,
         std::sync::mpsc::Receiver<String>,
-        std::sync::mpsc::Sender<dial::Answer>,
+        std::sync::mpsc::Sender<crate::names::Answer>,
     ) {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (answer_tx, answer_rx) = std::sync::mpsc::channel::<dial::Answer>();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel::<crate::names::Answer>();
         let answer_rx = std::sync::Mutex::new(answer_rx);
         let lookup: dial::Lookup = Arc::new(move |host: &str| {
             drop(started_tx.send(host.to_string()));

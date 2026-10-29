@@ -25,6 +25,7 @@ mod connect;
 #[cfg(feature = "_peer-book")]
 mod discovery;
 mod engine;
+mod names;
 #[cfg(feature = "autonat")]
 mod nat;
 mod portable;

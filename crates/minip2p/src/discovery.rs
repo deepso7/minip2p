@@ -18,7 +18,8 @@ use minip2p_mdns::MdnsEvent;
 use minip2p_pubsub::GossipsubEvent;
 use minip2p_swarm::{SwarmCore, SwarmEvent};
 
-use crate::connect::{ConnectAdmission, ConnectEngine, Expansion, Legs};
+use crate::connect::{ConnectAdmission, ConnectEngine, Legs};
+use crate::names::Expander;
 #[cfg(feature = "pubsub")]
 use crate::pubsub::GossipsubDriver;
 use crate::{ConnectOutcome, EndpointEvent};
@@ -183,7 +184,7 @@ impl DiscoveryDriver {
     ///
     /// Automatic dials are admitted and cancelled through `connect`, relay
     /// legs included, as they happen; the endpoint routes the NAT events
-    /// that produces afterwards. On the standard Endpoint `expand` starts
+    /// that produces afterwards. On the standard Endpoint `names` starts
     /// Name resolution off the driver, so a sweep never blocks on a lookup.
     pub(crate) fn sweep<T: Transport, E: EntropySource>(
         &mut self,
@@ -191,7 +192,7 @@ impl DiscoveryDriver {
         mut legs: Legs<'_, T>,
         connect: &mut ConnectEngine,
         runtime: &mut SwarmCore<T, E>,
-        expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
+        names: &mut dyn Expander,
         now: Now,
     ) {
         let now_ms = now.monotonic_ms;
@@ -297,7 +298,7 @@ impl DiscoveryDriver {
                                 // addresses included.
                                 targets: addrs,
                             },
-                            expand,
+                            names,
                             now,
                         );
                         self.inflight.insert(id, peer);
