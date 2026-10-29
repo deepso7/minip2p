@@ -39,7 +39,8 @@ const install = [
 const features = [
   { body: "QUIC over quinn-proto with libp2p TLS. On by default; needs std.", name: "quic" },
   { body: "TCP upgraded with Noise XX and Yamux, beside or instead of QUIC.", name: "tcp" },
-  { body: "AutoNAT probes, relayed connections, and DCUtR hole punching.", name: "nat" },
+  { body: "AutoNAT probes and reachability state.", name: "autonat" },
+  { body: "Relay reservations and races, plus DCUtR hole punching with quic.", name: "relay" },
   { body: "Signed gossipsub publish and subscribe.", name: "pubsub" },
   { body: "Signed beacons, a shared peer book, and optional auto-dial.", name: "discovery" },
   { body: "Local-link discovery over multicast DNS.", name: "mdns" },
