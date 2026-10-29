@@ -1655,8 +1655,8 @@ impl EndpointBuilder {
     /// appended to the config's own lists.
     ///
     /// Checked at bind ([`BindError::NatConfig`]): it needs a relay or an
-    /// AutoNAT server, and a reservation policy other than `Never` needs a
-    /// relay. Without any NAT configuration, discovery and mDNS turn NAT on
+    /// AutoNAT server, and a reservation policy other than `Never` or
+    /// `force_relay` needs a relay. Without any NAT configuration, discovery and mDNS turn NAT on
     /// for the peers they find.
     #[cfg(feature = "autonat")]
     pub fn nat_config(mut self, config: NatConfig) -> Self {

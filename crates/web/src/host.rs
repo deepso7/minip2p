@@ -87,7 +87,9 @@ impl<T: Transport> Host<T> {
                 allow_unsigned: config.allow_unsigned,
                 ..GossipsubConfig::default()
             });
-        if !relays.is_empty() {
+        // `force_relay` without a relay still submits the config, so the
+        // endpoint's validation refuses it rather than dropping the flag.
+        if !relays.is_empty() || config.force_relay {
             // A browser is never publicly reachable and cannot hole punch:
             // it always reserves, and its relayed paths never upgrade.
             builder = builder.nat_config(NatConfig {
@@ -574,12 +576,6 @@ fn validate_browser_config(config: &EndpointConfig) -> Result<(), FfiError> {
         return reject(
             ConfigCapability::Options,
             "browsers cannot be dialed back, so AutoNAT does not apply; omit autonatServers",
-        );
-    }
-    if config.force_relay && config.relays.is_empty() {
-        return reject(
-            ConfigCapability::Options,
-            "forceRelay requires at least one relay",
         );
     }
     Ok(())

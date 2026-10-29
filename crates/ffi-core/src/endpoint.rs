@@ -205,12 +205,6 @@ impl P2pEndpoint {
             .iter()
             .map(|address| parse_direct_peer_addr(address))
             .collect::<Result<Vec<_>, _>>()?;
-        if config.force_relay && relays.is_empty() {
-            return Err(FfiError::InvalidConfig {
-                capability: ConfigCapability::Options,
-                detail: "force_relay requires at least one relay".into(),
-            });
-        }
 
         let listen = parse_listen(config.listen)?;
         let limits = resolve_limits(config.limits, bound_transports(listen.as_deref()))?;

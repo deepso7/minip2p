@@ -153,6 +153,13 @@ impl Validated {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum NatConfigError {
+    /// `force_relay` without a relay: a forced connect never dials direct
+    /// candidates, so it would have no path at all. Checked first, on every
+    /// endpoint, so it is reported even when both lists are empty.
+    #[error(
+        "NatConfig::force_relay requires at least one relay address; add a relay or set force_relay = false"
+    )]
+    ForceRelayWithoutRelay,
     /// An explicit NAT configuration names neither a relay nor an AutoNAT
     /// server. (Discovery and mDNS turn NAT on for the peers they find
     /// without one, when no NAT configuration is given.)
@@ -306,7 +313,9 @@ pub(crate) fn validate(
 #[cfg(feature = "autonat")]
 fn validate_nat(config: &NatConfig, platform: Platform) -> Result<(), NatConfigError> {
     let relays = !config.relays.is_empty();
-    if !relays && config.autonat_servers.is_empty() {
+    if !relays && config.force_relay {
+        Err(NatConfigError::ForceRelayWithoutRelay)
+    } else if !relays && config.autonat_servers.is_empty() {
         Err(NatConfigError::NoServers)
     } else if !relays && config.reservation_policy != ReservationPolicy::Never {
         Err(NatConfigError::ReservationWithoutRelay)

@@ -645,6 +645,25 @@ fn autonat_listen_addrs_are_seeded_by_bind() {
     );
 }
 
+/// `force_relay` without a relay is refused at bind, not ignored at connect.
+#[test]
+fn force_relay_without_a_relay_fails_to_bind() {
+    let result = Endpoint::builder()
+        .nat_config(NatConfig {
+            force_relay: true,
+            ..idle_nat_config()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind();
+    assert!(matches!(
+        result,
+        Err(crate::BindError::NatConfig(
+            crate::NatConfigError::ForceRelayWithoutRelay
+        ))
+    ));
+}
+
 #[test]
 fn confirmed_public_addresses_are_advertised_and_cleared() {
     let mut endpoint = Endpoint::builder()
