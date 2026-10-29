@@ -203,6 +203,30 @@ fn nat_needs_a_server_and_a_reservation_needs_a_relay() {
     }
 }
 
+/// `force_relay` never dials direct candidates, so it needs a relay on every
+/// platform, whatever else the config names.
+#[cfg(feature = "autonat")]
+#[test]
+fn force_relay_needs_a_relay() {
+    let forced = NatConfig {
+        force_relay: true,
+        reservation_policy: ReservationPolicy::Never,
+        ..NatConfig::default()
+    };
+    let autonat_only = NatConfig {
+        autonat_servers: vec![server(3)],
+        ..forced.clone()
+    };
+    for platform in [STD_QUIC, PORTABLE_PLAIN] {
+        for config in [forced.clone(), autonat_only.clone()] {
+            assert_eq!(
+                nat_error(check(nat(config), platform)),
+                NatConfigError::ForceRelayWithoutRelay
+            );
+        }
+    }
+}
+
 /// Relay errors follow the platform: circuits are needed, and DCUtR must be
 /// off (or the relay forced) where the endpoint does not run it.
 #[cfg(feature = "relay")]
