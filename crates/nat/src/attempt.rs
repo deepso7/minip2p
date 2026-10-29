@@ -12,13 +12,13 @@ use minip2p_relay::{ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectOutpu
 use minip2p_transport::{ConnectionId, StreamId};
 
 use crate::acquire::{self, AcquireError, Acquired};
-use crate::agent::{ConnectLegs, Shared, StreamInput, StreamRole, TokenPurpose, reset, send};
+use crate::agent::{ConnectLegs, Shared, StreamInput, StreamRole, reset, send};
 use crate::config::MAX_DCUTR_ROUNDS;
-use crate::events::{BridgeRole, NatAction, NatEvent};
+use crate::events::{NatAction, NatEvent};
 use crate::inbound::select_punch_candidates;
 use crate::ledger::{Attribution, Claim, DialPurpose, Owner};
-use crate::swarm::NatSwarm;
-use crate::types::{NatError, NatToken, Path, PromoteError, RelayStage, UpgradeStop};
+use crate::swarm::{BridgeHandoff, BridgeRole, NatSwarm};
+use crate::types::{NatError, Path, PromoteError, RelayStage, UpgradeStop};
 
 /// Progress of the relay leg of a connect attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,15 +93,15 @@ pub(crate) struct ConnectAttempt {
     bridge_alive: bool,
     /// The bridge stream has been handed to the circuit transport.
     bridge_released: bool,
-    /// Circuit connection the host reported for the promotion.
+    /// Circuit connection the host adopted the bridge as.
     promoted: Option<ConnectionId>,
-    /// The token of the current bridge's promotion request, once requested;
-    /// a result for any other token is stale.
-    promotion: Option<NatToken>,
+    /// The current bridge was adopted as a circuit: until the bridge fails,
+    /// a relay timeout is a circuit-handshake timeout.
+    promoting: bool,
     /// The remote write half reached EOF while the bridge was agent-owned.
     bridge_remote_write_closed: bool,
     /// Secure-mux bytes coalesced behind the HOP success response. Passed to
-    /// the circuit transport with `PromoteBridge`.
+    /// the circuit transport in the bridge handoff.
     bridge_pending_data: Vec<u8>,
     punch_addrs: Vec<Multiaddr>,
     /// Absolute deadline of the current round's punch window.
@@ -159,7 +159,7 @@ impl ConnectAttempt {
             bridge_alive: false,
             bridge_released: false,
             promoted: None,
-            promotion: None,
+            promoting: false,
             bridge_remote_write_closed: false,
             bridge_pending_data: Vec::new(),
             punch_addrs: Vec::new(),
@@ -985,8 +985,8 @@ impl ConnectAttempt {
         let stage = match self.leg {
             RelayLeg::WaitHopReady { .. } => RelayStage::HopNegotiation,
             RelayLeg::AwaitHopStatus { .. } => RelayStage::HopStatus,
-            // Bridged, or the bridge was lost with its promotion pending.
-            _ if self.promotion.is_some() => RelayStage::CircuitHandshake,
+            // Adopted, its circuit still handshaking (or its bridge lost).
+            _ if self.promoting => RelayStage::CircuitHandshake,
             _ => RelayStage::RelayDial,
         };
         let error = NatError::Timeout {
@@ -995,7 +995,7 @@ impl ConnectAttempt {
             elapsed_ms: now.monotonic_ms.saturating_sub(self.relay_started_at),
             budget_ms: deadline.saturating_sub(self.relay_started_at),
         };
-        if self.promotion.is_some() {
+        if self.promoting {
             // The circuit never finished its handshake: close it and move
             // on like any other bridge failure.
             if let Some(conn_id) = self.promoted.take() {
@@ -1139,7 +1139,7 @@ impl ConnectAttempt {
                     }
                 }
                 HopConnectOutput::Outcome(ConnectOutcome::Bridged { .. }) => {
-                    self.on_bridged(shared);
+                    self.on_bridged(swarm, shared, now);
                 }
                 HopConnectOutput::Outcome(ConnectOutcome::Refused { status, reason }) => {
                     self.fail_relay_leg(
@@ -1157,7 +1157,7 @@ impl ConnectAttempt {
 
     /// The relay bridged the circuit: promote the raw pipe through Noise and
     /// Yamux. DCUtR runs later on the established circuit connection.
-    fn on_bridged(&mut self, shared: &mut Shared) {
+    fn on_bridged(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         let RelayLeg::AwaitHopStatus { conn, stream } = self.leg else {
             return;
         };
@@ -1168,11 +1168,11 @@ impl ConnectAttempt {
         self.leg = RelayLeg::Bridged { conn, stream };
         self.bridge_alive = true;
         self.hop = None;
-        self.promote_bridge(shared);
+        self.promote_bridge(swarm, shared, now);
     }
 
     /// Capture bytes coalesced behind STATUS:OK before processing the
-    /// preceding `Outcome(Bridged)`, which queues the promotion action.
+    /// preceding `Outcome(Bridged)`, which promotes the bridge with them.
     fn capture_bridge_data(&mut self, outputs: &[HopConnectOutput]) {
         for output in outputs {
             if let HopConnectOutput::BridgeData(bytes) = output {
@@ -1191,33 +1191,49 @@ impl ConnectAttempt {
         }
     }
 
-    /// Relinquishes the exact bridge stream to the circuit transport.
-    fn promote_bridge(&mut self, shared: &mut Shared) {
+    /// Relinquishes the exact bridge stream to the circuit transport and
+    /// applies its answer.
+    fn promote_bridge(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         if self.bridge_released {
             return;
         }
-        if let RelayLeg::Bridged {
+        let RelayLeg::Bridged {
             conn: inner_conn,
             stream,
         } = self.leg
-            && let Some(relay_peer) = self.relay_peer().cloned()
-        {
-            self.bridge_released = true;
-            shared.release_stream(inner_conn, stream);
-            let token = shared.alloc_token(TokenPurpose::PromoteAttempt(self.id));
-            self.promotion = Some(token);
-            shared.push_action(NatAction::PromoteBridge {
-                token,
-                inner_conn,
-                relay: relay_peer,
-                stream_id: stream,
-                remote_peer: self.peer.clone(),
-                role: BridgeRole::Initiator,
-                pending_data: core::mem::take(&mut self.bridge_pending_data),
-                // Filled from the agent's held tails as the action drains.
-                unsent_data: Vec::new(),
-                remote_write_closed: self.bridge_remote_write_closed,
-            });
+        else {
+            return;
+        };
+        let Some(relay) = self.relay_peer().cloned() else {
+            return;
+        };
+        self.bridge_released = true;
+        shared.release_stream(inner_conn, stream);
+        let handoff = BridgeHandoff {
+            inner_conn,
+            stream_id: stream,
+            relay,
+            remote_peer: self.peer.clone(),
+            role: BridgeRole::Initiator,
+            pending_data: core::mem::take(&mut self.bridge_pending_data),
+            unsent_data: Vec::new(),
+            remote_write_closed: self.bridge_remote_write_closed,
+        };
+        match swarm.promote_bridge(handoff, now.monotonic_ms) {
+            Ok(conn_id) => {
+                self.promoted = Some(conn_id);
+                self.promoting = true;
+            }
+            Err(PromoteError::PeerAlreadyDirect) => {
+                // The peer is direct already; the relay has nothing left to
+                // time out.
+                self.bridge_alive = false;
+                self.leg = RelayLeg::Failed;
+                self.relay_deadline = None;
+            }
+            Err(error) => {
+                self.fail_bridge(NatError::Protocol(error.to_string()), swarm, shared, now);
+            }
         }
     }
 
@@ -1286,49 +1302,19 @@ impl ConnectAttempt {
             self.bridge_released = true;
         }
         let error = NatError::DialFailed("relay bridge lost before the attempt settled".into());
-        if self.best.is_none() && self.promotion.is_none() {
-            // No path and no promotion outcome to wait for: this relay is done.
+        if self.best.is_none() && !self.promoting {
+            // No path and no circuit handshake to wait for: this relay is
+            // done.
             self.fail_bridge(error, swarm, shared, now);
             return;
         }
-        // A requested promotion still reports its outcome, which settles
-        // the relay (see `on_promote_result`).
+        // An adopted circuit still finishes or times out its handshake,
+        // which settles the relay.
         self.leg = RelayLeg::Failed;
         self.last_error = Some(error);
         // If punch windows are already running, the punch itself may still
         // succeed via `ConnectionEstablished`; the window deadline settles
         // the rest.
-    }
-
-    pub(crate) fn on_promote_result(
-        &mut self,
-        token: NatToken,
-        result: Result<ConnectionId, PromoteError>,
-        swarm: &mut dyn NatSwarm,
-        shared: &mut Shared,
-        now: Now,
-    ) {
-        // The leg gave up on this bridge while the promotion was in flight,
-        // perhaps for a later relay's: the circuit it produced has no owner.
-        if self.done || self.promotion != Some(token) {
-            if let Ok(conn_id) = result {
-                shared.push_action(NatAction::CloseCircuit { conn_id });
-            }
-            return;
-        }
-        match result {
-            Ok(conn_id) => self.promoted = Some(conn_id),
-            Err(PromoteError::PeerAlreadyDirect) => {
-                // The peer is direct already; the relay has nothing left to
-                // time out.
-                self.bridge_alive = false;
-                self.leg = RelayLeg::Failed;
-                self.relay_deadline = None;
-            }
-            Err(error) => {
-                self.fail_bridge(NatError::Protocol(error.to_string()), swarm, shared, now);
-            }
-        }
     }
 
     /// The bridge failed before the circuit carried a path. Clears the
@@ -1344,7 +1330,7 @@ impl ConnectAttempt {
         self.bridge_alive = false;
         self.bridge_released = false;
         self.promoted = None;
-        self.promotion = None;
+        self.promoting = false;
         self.bridge_remote_write_closed = false;
         self.bridge_pending_data.clear();
         self.fail_relay_leg(error, swarm, shared, now);

@@ -7,12 +7,13 @@
 //! was made, which streams NAT owns, and how each path came to be.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_swarm::{DriverError, EntropySource, HeldWrites, SwarmCore};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
-use crate::types::NatToken;
+use crate::types::{NatToken, PromoteError};
 
 /// How [`NatSwarm::dial`] admitted a dial.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +28,41 @@ pub enum DialStart {
     /// [`NatAgent::dial_result`](crate::NatAgent::dial_result), after
     /// checking [`NatAgent::deferred_dial_wanted`](crate::NatAgent::deferred_dial_wanted).
     Deferred,
+}
+
+/// Local role used when promoting a relay bridge into a circuit connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BridgeRole {
+    /// The local endpoint initiated the HOP CONNECT request.
+    Initiator,
+    /// The local endpoint accepted the STOP CONNECT request.
+    Responder,
+}
+
+/// A negotiated relay bridge the agent hands to the host's circuit
+/// transport through [`NatSwarm::promote_bridge`]. The agent has already
+/// released the stream: from here on it belongs to the circuit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeHandoff {
+    /// The relay connection carrying the bridge.
+    pub inner_conn: ConnectionId,
+    /// The bridge stream on `inner_conn`.
+    pub stream_id: StreamId,
+    /// The relay that bridged the circuit.
+    pub relay: PeerId,
+    /// The peer on the far end of the circuit.
+    pub remote_peer: PeerId,
+    /// Which side of the circuit handshake this node takes.
+    pub role: BridgeRole,
+    /// Bytes the peer sent behind the relay's response, already read by the
+    /// agent: the start of the circuit's secure-mux handshake.
+    pub pending_data: Vec<u8>,
+    /// Bytes NAT wrote on the bridge that the swarm refused as Full and the
+    /// agent still held (a STOP STATUS, say). The circuit sends them before
+    /// anything of its own.
+    pub unsent_data: Vec<u8>,
+    /// The peer's write half reached EOF while the agent owned the bridge.
+    pub remote_write_closed: bool,
 }
 
 /// Why a [`NatSwarm`] command was refused.
@@ -136,6 +172,33 @@ pub trait NatSwarm {
     /// the limit: the minip2p `Endpoint`'s own swarm adapter does.
     fn circuit_slots(&self) -> usize {
         0
+    }
+
+    /// Hands a negotiated relay bridge to the host's circuit transport and
+    /// returns the circuit connection that now carries it. Adoption is
+    /// synchronous; the circuit's handshake completes later as
+    /// `SwarmEvent::ConnectionEstablished`. A bridge already adopted returns
+    /// its existing circuit. The default, for a host without circuits,
+    /// resets the bridge stream and refuses: the minip2p `Endpoint`'s own
+    /// swarm adapter adopts. A host that refuses for any reason other than
+    /// [`PromoteError::UnknownConnection`] should reset the bridge stream.
+    fn promote_bridge(
+        &mut self,
+        handoff: BridgeHandoff,
+        now_ms: u64,
+    ) -> Result<ConnectionId, PromoteError> {
+        // Best effort: a stream already gone needs no reset.
+        match self.reset_stream(
+            &handoff.relay,
+            handoff.inner_conn,
+            handoff.stream_id,
+            now_ms,
+        ) {
+            Ok(()) | Err(_) => {}
+        }
+        Err(PromoteError::Failed(
+            "this swarm cannot promote bridges".into(),
+        ))
     }
 }
 
@@ -302,6 +365,22 @@ impl NatSwarm for HoldingSwarm<'_> {
 
     fn circuit_slots(&self) -> usize {
         self.inner.circuit_slots()
+    }
+
+    /// Adds the bridge's held tails to the handoff, so the circuit sends
+    /// them before its own bytes (ADR 0012). A held close is dropped: the
+    /// circuit owns the stream's write side now.
+    fn promote_bridge(
+        &mut self,
+        mut handoff: BridgeHandoff,
+        now_ms: u64,
+    ) -> Result<ConnectionId, PromoteError> {
+        if let Some(held) = self.held.take(handoff.inner_conn, handoff.stream_id) {
+            handoff
+                .unsent_data
+                .extend(held.tails.iter().flat_map(|tail| tail.iter().copied()));
+        }
+        self.inner.promote_bridge(handoff, now_ms)
     }
 
     fn readiness(&self, peer: &PeerId) -> Option<(ConnectionId, &[String])> {

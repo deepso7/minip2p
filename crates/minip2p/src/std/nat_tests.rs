@@ -1,7 +1,7 @@
 //! Standard Endpoint NAT regression tests.
 use crate::ConnectionCloseReason;
 use minip2p_core::Multiaddr;
-use minip2p_nat::{NatAction, NatAgent, NatEvent, Now};
+use minip2p_nat::{BridgeHandoff, BridgeRole, NatAction, NatAgent, NatEvent, PromoteError};
 use minip2p_swarm::{SwarmErrorKind, SwarmEvent};
 use minip2p_transport::Transport;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
@@ -11,8 +11,8 @@ use super::NextEvent;
 #[cfg(all(feature = "quic", feature = "relay-server"))]
 use crate::QuicLimits;
 use crate::{Ed25519Keypair, Endpoint, EndpointEvent, NatConfig, ReachabilityState};
-use minip2p_nat::{DialStart, NatSwarm, NatSwarmError, NatToken, ReservationPolicy};
-use minip2p_relay::{HOP_PROTOCOL_ID, HopMessage, HopMessageType, Status, encode_frame};
+use minip2p_nat::ReservationPolicy;
+use minip2p_relay::HOP_PROTOCOL_ID;
 
 /// A NAT configuration that runs the agent without traffic a test would
 /// see: one AutoNAT server on an unroutable TEST-NET address, and no
@@ -459,87 +459,9 @@ fn tcp_relay_reservation_does_not_schedule_liveness_pings() {
     assert!(client.active_reservation().is_some());
 }
 
-fn drain_actions(agent: &mut NatAgent) -> Vec<NatAction> {
-    core::iter::from_fn(|| agent.poll_action()).collect()
-}
-
-/// A swarm already holding the negotiated bridge: the relay is ready on
-/// the pair's inner connection, and the one stream it opens is the pair's.
-struct BridgeSwarm {
-    relay: minip2p_core::PeerId,
-    conn: ConnectionId,
-    stream: StreamId,
-    protocols: Vec<String>,
-}
-
-impl NatSwarm for BridgeSwarm {
-    fn connection(&self, peer: &minip2p_core::PeerId) -> Option<ConnectionId> {
-        (*peer == self.relay).then_some(self.conn)
-    }
-
-    fn readiness(&self, peer: &minip2p_core::PeerId) -> Option<(ConnectionId, &[String])> {
-        (*peer == self.relay).then_some((self.conn, self.protocols.as_slice()))
-    }
-
-    fn connection_remote_addr(&self, _conn_id: ConnectionId) -> Option<&minip2p_core::Multiaddr> {
-        None
-    }
-
-    fn dial(
-        &mut self,
-        addr: &minip2p_core::PeerAddr,
-        _token: NatToken,
-    ) -> Result<DialStart, NatSwarmError> {
-        Err(NatSwarmError::NamedAddress(addr.clone()))
-    }
-
-    fn open_stream(
-        &mut self,
-        _peer: &minip2p_core::PeerId,
-        _protocol_id: &str,
-        _now_ms: u64,
-    ) -> Result<(ConnectionId, StreamId), NatSwarmError> {
-        Ok((self.conn, self.stream))
-    }
-
-    fn send_stream(
-        &mut self,
-        _peer: &minip2p_core::PeerId,
-        _conn_id: ConnectionId,
-        _stream_id: StreamId,
-        _data: Bytes,
-        _now_ms: u64,
-    ) -> Result<(), NatSwarmError> {
-        Ok(())
-    }
-
-    fn close_stream_write(
-        &mut self,
-        _peer: &minip2p_core::PeerId,
-        _conn_id: ConnectionId,
-        _stream_id: StreamId,
-        _now_ms: u64,
-    ) -> Result<(), NatSwarmError> {
-        Ok(())
-    }
-
-    fn reset_stream(
-        &mut self,
-        _peer: &minip2p_core::PeerId,
-        _conn_id: ConnectionId,
-        _stream_id: StreamId,
-        _now_ms: u64,
-    ) -> Result<(), NatSwarmError> {
-        Ok(())
-    }
-
-    fn ping(&mut self, _peer: &minip2p_core::PeerId, _now_ms: u64) -> Result<(), NatSwarmError> {
-        Ok(())
-    }
-}
-
-fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver, NatAction) {
-    let target = Ed25519Keypair::from_secret_key_bytes([73; 32]).peer_id();
+/// A driver over a fresh agent configured with the pair's relay, and the
+/// handoff that agent makes once the relay bridges the pair's stream.
+fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver, BridgeHandoff) {
     let relay_peer = pair.relay_addr.peer_id().clone();
     let config = NatConfig {
         relays: vec![pair.relay_addr.clone()],
@@ -547,79 +469,37 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
         reservation_policy: ReservationPolicy::Never,
         ..NatConfig::default()
     };
-    let mut swarm = BridgeSwarm {
+    let agent = NatAgent::new(pair.local.peer_id().clone(), config);
+    let handoff = BridgeHandoff {
+        inner_conn: pair.inner_conn,
+        stream_id: pair.stream,
         relay: relay_peer.clone(),
-        conn: pair.inner_conn,
-        stream: pair.stream,
-        protocols: vec![HOP_PROTOCOL_ID.to_string()],
+        remote_peer: Ed25519Keypair::from_secret_key_bytes([73; 32]).peer_id(),
+        role: BridgeRole::Initiator,
+        pending_data: Vec::new(),
+        unsent_data: Vec::new(),
+        remote_write_closed,
     };
-    let mut agent = NatAgent::new(pair.local.peer_id().clone(), config);
-    agent.connect(
-        &mut swarm,
-        minip2p_core::ConnectId::from_u64(1),
-        target,
-        minip2p_nat::ConnectLegs {
-            direct_racing: false,
-            allow_relay: true,
-            target_addrs: Vec::new(),
-            deadline_ms: None,
-        },
-        Now::from_millis(0),
-    );
-    assert!(agent.owns_stream(pair.inner_conn, pair.stream));
-    agent.handle_event(
-        &mut swarm,
-        &SwarmEvent::StreamReady {
-            peer_id: relay_peer.clone(),
-            conn_id: pair.inner_conn,
-            stream_id: pair.stream,
-            protocol_id: HOP_PROTOCOL_ID.to_string(),
-            initiated_locally: true,
-        },
-        false,
-        Now::from_millis(5),
-    );
-    let status = HopMessage {
-        kind: HopMessageType::Status,
-        peer: None,
-        reservation: None,
-        limit: None,
-        status: Some(Status::Ok),
-    };
-    agent.handle_event(
-        &mut swarm,
-        &SwarmEvent::StreamData {
-            peer_id: relay_peer.clone(),
-            conn_id: pair.inner_conn,
-            stream_id: pair.stream,
-            data: Bytes::from(encode_frame(&status.encode())),
-        },
-        false,
-        Now::from_millis(6),
-    );
-    let mut promotion = drain_actions(&mut agent)
-        .into_iter()
-        .find(|action| matches!(action, NatAction::PromoteBridge { .. }))
-        .expect("promotion action");
-    if let NatAction::PromoteBridge {
-        remote_write_closed: closed,
-        ..
-    } = &mut promotion
-    {
-        *closed = remote_write_closed;
-    }
     let driver = NatDriver::new(
         agent,
         vec![(relay_peer, pair.relay_addr.transport().clone())],
         0,
     )
     .with_circuits(crate::nat::CircuitOps::circuit_transport());
-    (driver, promotion)
+    (driver, handoff)
+}
+
+/// Promotes `handoff` through the swarm adapter the driver lends its agent.
+fn promote(
+    driver: &mut NatDriver,
+    handoff: BridgeHandoff,
+    endpoint: &mut Endpoint,
+) -> Result<ConnectionId, PromoteError> {
+    driver.promote_bridge(handoff, endpoint.core_mut())
 }
 
 fn execute(driver: &mut NatDriver, action: NatAction, endpoint: &mut Endpoint) {
-    let now = endpoint.now();
-    driver.execute(action, endpoint.core_mut(), now);
+    driver.execute(action, endpoint.core_mut());
 }
 
 fn circuit_id(driver: &NatDriver, key: (ConnectionId, StreamId)) -> ConnectionId {
@@ -713,14 +593,17 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
     let (mut driver, promotion) = promotion_driver(&pair, false);
     let duplicate = promotion.clone();
 
-    execute(&mut driver, promotion, &mut pair.local);
-    let promoted = circuit_id(&driver, key);
+    let promoted = promote(&mut driver, promotion, &mut pair.local).expect("adopted");
+    assert_eq!(circuit_id(&driver, key), promoted);
     assert_eq!(pair.local.core().transport().circuit_ids(), vec![promoted]);
 
-    execute(&mut driver, duplicate, &mut pair.local);
+    assert_eq!(
+        promote(&mut driver, duplicate, &mut pair.local),
+        Ok(promoted)
+    );
     assert_eq!(driver.promoted().len(), 1);
     assert_eq!(pair.local.core().transport().circuit_ids(), vec![promoted]);
-    assert!(driver.bridge_reset_attempts.is_empty());
+    assert!(driver.bridge_reset_attempts().is_empty());
 
     let mut header = vec![19];
     header.extend_from_slice(b"/multistream/1.0.0\n");
@@ -764,7 +647,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
 }
 
 #[test]
-fn promotion_uses_action_connection_after_same_batch_relay_replacement() {
+fn promotion_uses_handoff_connection_after_same_batch_relay_replacement() {
     let mut pair = negotiated_bridge();
     let old_conn = pair.inner_conn;
     let stream = pair.stream;
@@ -809,7 +692,7 @@ fn promotion_uses_action_connection_after_same_batch_relay_replacement() {
         Some(replacement)
     );
 
-    execute(&mut driver, promotion, &mut pair.local);
+    promote(&mut driver, promotion, &mut pair.local).expect("adopted");
     assert!(driver.promoted().contains_key(&(old_conn, stream)));
     assert!(!driver.promoted().contains_key(&(replacement, stream)));
     assert!(!driver.ingest(
@@ -828,20 +711,23 @@ fn promotion_uses_action_connection_after_same_batch_relay_replacement() {
 fn driver_resets_failed_adoptions_but_not_unknown_connections() {
     let mut failed_pair = negotiated_bridge();
     let failed_key = (failed_pair.inner_conn, failed_pair.stream);
-    let (mut failed, action) = promotion_driver(&failed_pair, true);
-    execute(&mut failed, action, &mut failed_pair.local);
+    let (mut failed, handoff) = promotion_driver(&failed_pair, true);
+    assert!(matches!(
+        promote(&mut failed, handoff, &mut failed_pair.local),
+        Err(PromoteError::Failed(_))
+    ));
     assert!(failed.promoted().is_empty());
-    assert_eq!(failed.bridge_reset_attempts, vec![failed_key]);
+    assert_eq!(failed.bridge_reset_attempts(), [failed_key]);
 
     let mut unknown_pair = negotiated_bridge();
-    let (mut unknown, mut action) = promotion_driver(&unknown_pair, false);
-    let missing = ConnectionId::new(9_999);
-    if let NatAction::PromoteBridge { inner_conn, .. } = &mut action {
-        *inner_conn = missing;
-    }
-    execute(&mut unknown, action, &mut unknown_pair.local);
+    let (mut unknown, mut handoff) = promotion_driver(&unknown_pair, false);
+    handoff.inner_conn = ConnectionId::new(9_999);
+    assert_eq!(
+        promote(&mut unknown, handoff, &mut unknown_pair.local),
+        Err(PromoteError::UnknownConnection)
+    );
     assert!(unknown.promoted().is_empty());
-    assert!(unknown.bridge_reset_attempts.is_empty());
+    assert!(unknown.bridge_reset_attempts().is_empty());
     assert!(
         unknown_pair
             .local
@@ -857,8 +743,8 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
     // A remote bridge FIN is routed through the promoted transport even
     // though the raw stream was forgotten by the swarm at adoption.
     let mut fin_pair = negotiated_bridge();
-    let (mut fin, action) = promotion_driver(&fin_pair, false);
-    execute(&mut fin, action, &mut fin_pair.local);
+    let (mut fin, handoff) = promotion_driver(&fin_pair, false);
+    promote(&mut fin, handoff, &mut fin_pair.local).expect("adopted");
     assert!(fin.ingest(
         &SwarmEvent::StreamRemoteWriteClosed {
             peer_id: fin_pair.relay_addr.peer_id().clone(),
@@ -872,8 +758,8 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
     // Exact bridge closure is terminal and removes the keyed adoption.
     let mut closed_pair = negotiated_bridge();
     let closed_key = (closed_pair.inner_conn, closed_pair.stream);
-    let (mut closed, action) = promotion_driver(&closed_pair, false);
-    execute(&mut closed, action, &mut closed_pair.local);
+    let (mut closed, handoff) = promotion_driver(&closed_pair, false);
+    promote(&mut closed, handoff, &mut closed_pair.local).expect("adopted");
     assert!(closed.ingest(
         &SwarmEvent::StreamClosed {
             peer_id: closed_pair.relay_addr.peer_id().clone(),
@@ -890,8 +776,8 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
     for replaced in [false, true] {
         let mut inner_pair = negotiated_bridge();
         let inner_key = (inner_pair.inner_conn, inner_pair.stream);
-        let (mut inner, action) = promotion_driver(&inner_pair, false);
-        execute(&mut inner, action, &mut inner_pair.local);
+        let (mut inner, handoff) = promotion_driver(&inner_pair, false);
+        promote(&mut inner, handoff, &mut inner_pair.local).expect("adopted");
         let promoted = circuit_id(&inner, inner_key);
         let peer_id = inner_pair.relay_addr.peer_id().clone();
         let carrier_gone = if replaced {
@@ -931,8 +817,8 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
     // A circuit lifecycle close also removes its reverse map entry.
     let mut circuit_pair = negotiated_bridge();
     let circuit_key = (circuit_pair.inner_conn, circuit_pair.stream);
-    let (mut circuit, action) = promotion_driver(&circuit_pair, false);
-    execute(&mut circuit, action, &mut circuit_pair.local);
+    let (mut circuit, handoff) = promotion_driver(&circuit_pair, false);
+    promote(&mut circuit, handoff, &mut circuit_pair.local).expect("adopted");
     let promoted = circuit_id(&circuit, circuit_key);
     circuit.ingest(
         &SwarmEvent::ConnectionClosed {
@@ -949,8 +835,8 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
     // event passed through the driver.
     let mut swept_pair = negotiated_bridge();
     let swept_key = (swept_pair.inner_conn, swept_pair.stream);
-    let (mut swept, action) = promotion_driver(&swept_pair, false);
-    execute(&mut swept, action, &mut swept_pair.local);
+    let (mut swept, handoff) = promotion_driver(&swept_pair, false);
+    promote(&mut swept, handoff, &mut swept_pair.local).expect("adopted");
     let promoted = circuit_id(&swept, swept_key);
     swept_pair
         .local
@@ -970,8 +856,8 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
 fn remote_bridge_reset_closes_promoted_circuit() {
     let mut pair = negotiated_bridge();
     let key = (pair.inner_conn, pair.stream);
-    let (mut driver, action) = promotion_driver(&pair, false);
-    execute(&mut driver, action, &mut pair.local);
+    let (mut driver, handoff) = promotion_driver(&pair, false);
+    promote(&mut driver, handoff, &mut pair.local).expect("adopted");
     let promoted = circuit_id(&driver, key);
 
     pair.relay

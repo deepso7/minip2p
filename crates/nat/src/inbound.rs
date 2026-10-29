@@ -33,12 +33,11 @@ use minip2p_dcutr::{DcutrError, DcutrInitiator, DcutrInitiatorOutput, InitiatorO
 use minip2p_relay::{RelayError, Status, StopResponder, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
 
-use crate::agent::{Shared, StreamInput, StreamRole, TokenPurpose, close_write, reset, send};
+use crate::agent::{Shared, StreamInput, StreamRole, close_write, reset, send};
 use crate::config::MAX_DCUTR_ROUNDS;
-use crate::events::{BridgeRole, NatAction, NatEvent};
+use crate::events::{NatAction, NatEvent};
 use crate::ledger::{Claim, Owner};
-use crate::swarm::NatSwarm;
-use crate::types::PromoteError;
+use crate::swarm::{BridgeHandoff, BridgeRole, NatSwarm};
 
 /// Responder-side UDP blast schedule during the punch window.
 struct BlastSchedule {
@@ -268,7 +267,7 @@ impl InboundCircuit {
         // Bytes behind STOP STATUS belong to the circuit's secure-mux
         // handshake. DCUtR is opened later on the promoted connection.
         self.pending_data = pipelined;
-        self.promote(shared);
+        self.promote(swarm, shared, now);
     }
 
     /// Answers the STOP CONNECT with `status` and drops the circuit. The
@@ -303,29 +302,38 @@ impl InboundCircuit {
         );
     }
 
-    /// Hands the exact bridge stream to the circuit transport, exactly once.
-    fn promote(&mut self, shared: &mut Shared) {
+    /// Hands the exact bridge stream to the circuit transport, exactly once,
+    /// and applies its answer. The STOP STATUS is already written (or held,
+    /// and so carried in the handoff), and the bytes pipelined behind
+    /// CONNECT are in `pending_data`.
+    fn promote(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         if self.released {
             return;
         }
         self.released = true;
         shared.release_stream(self.inner_conn, self.stream);
-        if let Some(source) = &self.source {
-            let token = shared.alloc_token(TokenPurpose::PromoteInbound(self.id));
-            shared.push_action(NatAction::PromoteBridge {
-                token,
-                inner_conn: self.inner_conn,
-                relay: self.relay.clone(),
-                stream_id: self.stream,
-                remote_peer: source.clone(),
-                role: BridgeRole::Responder,
-                pending_data: core::mem::take(&mut self.pending_data),
-                // Filled from the agent's held tails as the action drains.
-                unsent_data: Vec::new(),
-                // CONNECT completion promotes in the same input cascade, so
-                // no later half-close can arrive while NAT owns the bridge.
-                remote_write_closed: false,
-            });
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        let handoff = BridgeHandoff {
+            inner_conn: self.inner_conn,
+            stream_id: self.stream,
+            relay: self.relay.clone(),
+            remote_peer: source,
+            role: BridgeRole::Responder,
+            pending_data: core::mem::take(&mut self.pending_data),
+            unsent_data: Vec::new(),
+            // CONNECT completion promotes in the same input cascade, so no
+            // later half-close can arrive while NAT owns the bridge.
+            remote_write_closed: false,
+        };
+        match swarm.promote_bridge(handoff, now.monotonic_ms) {
+            Ok(conn_id) => {
+                self.promoted = Some(conn_id);
+                self.handshake_deadline =
+                    Some(now.monotonic_ms + shared.config.circuit_handshake_timeout_ms);
+            }
+            Err(_) => self.done = true,
         }
     }
 
@@ -337,7 +345,7 @@ impl InboundCircuit {
             if self.source.is_some() {
                 // STOP completed but promotion did not run. Preserve the
                 // accepted bridge rather than abandoning it.
-                self.promote(shared);
+                self.promote(swarm, shared, now);
             } else {
                 // The relay never even sent CONNECT.
                 self.abandon(true, swarm, shared, now);
@@ -502,22 +510,6 @@ impl InboundCircuit {
             shared.release_stream(self.inner_conn, self.stream);
         }
         self.done = true;
-    }
-
-    pub(crate) fn on_promote_result(
-        &mut self,
-        result: Result<ConnectionId, PromoteError>,
-        shared: &mut Shared,
-        now: Now,
-    ) {
-        match result {
-            Ok(conn_id) => {
-                self.promoted = Some(conn_id);
-                self.handshake_deadline =
-                    Some(now.monotonic_ms + shared.config.circuit_handshake_timeout_ms);
-            }
-            Err(_) => self.done = true,
-        }
     }
 
     /// Starts the next DCUtR round: opens `/libp2p/dcutr` on the promoted

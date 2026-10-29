@@ -212,10 +212,7 @@ fn stalled_inbound_circuit_handshake_is_closed_at_its_deadline() {
     inbound_stop_stream(&mut h, stream, 0);
     let target = h.target.clone();
     h.stream_data(stream, stop_connect(&target), at(10));
-    let actions = drain_actions(&mut h.agent);
-    let conn_id = minip2p_transport::ConnectionId::new(TEST_CIRCUIT_ID);
-    h.agent
-        .promote_result(promote_token(&actions), Ok(conn_id), at(11));
+    let conn_id = promoted_circuit(&drain_actions(&mut h.agent));
 
     h.agent.handle_tick(at(16));
     assert!(
@@ -307,7 +304,9 @@ fn a_stop_past_the_circuit_limit_is_refused_until_a_slot_frees() {
         stop_status(&sent_data_on(&actions, accepted)),
         Some(Status::Ok)
     );
-    let token = promote_token(&actions);
+    promoted_circuit(&actions);
+    // The transport now holds the adopted circuit too.
+    h.agent.swarm.circuit_slots = 2;
 
     let refused = StreamId::new(STOP_STREAM + 4);
     inbound_stop_stream(&mut h, refused, 20);
@@ -340,20 +339,24 @@ fn a_stop_past_the_circuit_limit_is_refused_until_a_slot_frees() {
             .any(|action| matches!(action, Out::PromoteBridge { .. }))
     );
 
-    // A failed adoption releases the accepted STOP's reservation.
-    h.agent.promote_result(
-        token,
-        Err(minip2p_nat::PromoteError::Failed("gone".into())),
-        at(40),
-    );
-    let again = StreamId::new(STOP_STREAM + 8);
-    inbound_stop_stream(&mut h, again, 50);
-    h.stream_data(again, stop_connect(&target), at(60));
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(
-        stop_status(&sent_data_on(&actions, again)),
-        Some(Status::Ok)
-    );
+    // The adopted circuit ends, freeing its slot. A STOP whose adoption
+    // then fails releases its reservation, so the next STOP still fits.
+    h.agent.swarm.circuit_slots = 1;
+    h.agent
+        .swarm
+        .promote_results
+        .push_back(Err(minip2p_nat::PromoteError::Failed("gone".into())));
+    for (n, at_ms) in [(8, 50), (12, 70)] {
+        let again = StreamId::new(STOP_STREAM + n);
+        inbound_stop_stream(&mut h, again, at_ms);
+        h.stream_data(again, stop_connect(&target), at(at_ms + 10));
+        let actions = drain_actions(&mut h.agent);
+        assert_eq!(
+            stop_status(&sent_data_on(&actions, again)),
+            Some(Status::Ok),
+            "STOP at {at_ms}"
+        );
+    }
 }
 
 #[test]

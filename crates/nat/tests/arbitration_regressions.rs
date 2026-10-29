@@ -60,10 +60,18 @@ fn open_inbound_dcutr_at(h: &mut Harness, conn: ConnectionId, stream: StreamId, 
 #[test]
 fn promotion_that_loses_to_a_direct_connection_waits_for_its_event() {
     let mut h = Harness::with_relay(NatConfig::default());
-    let (id, _, promotion) = drive_to_bridged(&mut h);
-    let token = promote_token(&promotion);
     h.agent
-        .promote_result(token, Err(PromoteError::PeerAlreadyDirect), at(301));
+        .swarm
+        .promote_results
+        .push_back(Err(PromoteError::PeerAlreadyDirect));
+    let (id, _, promotion) = drive_to_bridged(&mut h);
+    assert!(promotion.iter().any(|action| matches!(
+        action,
+        Out::PromoteBridge {
+            result: Err(PromoteError::PeerAlreadyDirect),
+            ..
+        }
+    )));
     assert!(drain_events(&mut h.agent).is_empty());
 
     h.target_connected(at(302));
@@ -955,10 +963,7 @@ fn circuit_promoted_by_another_attempt_settles_the_displaced_one_as_relayed() {
     h.stream_ready(stream, at(312));
     drain_actions(&mut h.agent);
     h.stream_data(stream, hop_status(Status::Ok), at(313));
-    let promotion = drain_actions(&mut h.agent);
-    let other_circuit = ConnectionId::new(TEST_CIRCUIT_ID + 1);
-    h.agent
-        .promote_result(promote_token(&promotion), Ok(other_circuit), at(314));
+    let other_circuit = promoted_circuit(&drain_actions(&mut h.agent));
     replace_target(&mut h, circuit, other_circuit, 315);
     drain_actions(&mut h.agent);
     let events = drain_events(&mut h.agent);
@@ -1013,10 +1018,7 @@ fn circuit_promoted_by_an_inbound_circuit_is_not_adopted_by_the_attempt() {
     );
     let target = h.target.clone();
     h.stream_data(stop, stop_connect(&target), at(311));
-    let promotion = drain_actions(&mut h.agent);
-    let inbound_circuit = ConnectionId::new(TEST_CIRCUIT_ID + 1);
-    h.agent
-        .promote_result(promote_token(&promotion), Ok(inbound_circuit), at(312));
+    let inbound_circuit = promoted_circuit(&drain_actions(&mut h.agent));
     replace_target(&mut h, circuit, inbound_circuit, 313);
     drain_actions(&mut h.agent);
     assert!(

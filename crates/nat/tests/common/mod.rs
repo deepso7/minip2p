@@ -15,8 +15,8 @@ use minip2p_dcutr::{
     encode_frame as dcutr_encode_frame,
 };
 use minip2p_nat::{
-    BridgeRole, ConnectLegs, DialStart, NatAction, NatAgent, NatConfig, NatEvent, NatSwarm,
-    NatSwarmError, NatToken, Now, ReservationPolicy, is_named,
+    BridgeHandoff, BridgeRole, ConnectLegs, DialStart, NatAction, NatAgent, NatConfig, NatEvent,
+    NatSwarm, NatSwarmError, NatToken, Now, PromoteError, ReservationPolicy, is_named,
 };
 use minip2p_relay::{
     HOP_PROTOCOL_ID, HopMessage, HopMessageType, Peer, Reservation, Status, StopMessage,
@@ -24,7 +24,7 @@ use minip2p_relay::{
 };
 use minip2p_swarm::{DriverError, IdentifyMessage, SwarmError, SwarmEvent};
 use minip2p_transport::{Bytes, ConnectionId, StreamId, TransportError};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 
 pub const TEST_CIRCUIT_ID: u64 = (1 << 63) | 77;
@@ -398,14 +398,15 @@ pub fn refused_with_fin(actions: &[Out], stream: StreamId) -> bool {
         && !has_reset_for(actions, stream)
 }
 
-pub fn promote_token(actions: &[Out]) -> NatToken {
-    let mut tokens = actions.iter().filter_map(|action| match action {
-        Out::PromoteBridge { token, .. } => Some(*token),
+/// The circuit the one bridge promotion in `actions` was adopted as.
+pub fn promoted_circuit(actions: &[Out]) -> ConnectionId {
+    let mut results = actions.iter().filter_map(|action| match action {
+        Out::PromoteBridge { result, .. } => Some(result.clone()),
         _ => None,
     });
-    let token = tokens.next().expect("expected PromoteBridge action");
-    assert!(tokens.next().is_none(), "more than one promotion action");
-    token
+    let result = results.next().expect("expected a bridge promotion");
+    assert!(results.next().is_none(), "more than one bridge promotion");
+    result.expect("the fake swarm adopted the bridge")
 }
 
 pub fn promoted_pending_data(actions: &[Out]) -> &[u8] {
@@ -415,17 +416,18 @@ pub fn promoted_pending_data(actions: &[Out]) -> &[u8] {
             Out::PromoteBridge { pending_data, .. } => Some(pending_data.as_slice()),
             _ => None,
         })
-        .expect("expected PromoteBridge action")
+        .expect("expected a bridge promotion")
 }
 
+/// Establishes the circuit the bridge promotion in `actions` was adopted
+/// as, and returns it.
 pub fn complete_promotion(
     node: &mut Node,
     target: &PeerId,
     actions: &[Out],
     now: Now,
 ) -> ConnectionId {
-    let conn_id = ConnectionId::new(TEST_CIRCUIT_ID);
-    node.promote_result(promote_token(actions), Ok(conn_id), now);
+    let conn_id = promoted_circuit(actions);
     node.handle_event(
         &SwarmEvent::ConnectionEstablished {
             peer_id: target.clone(),
@@ -604,8 +606,8 @@ pub enum Out {
         target: Multiaddr,
         payload_len: usize,
     },
+    /// A bridge handed to the fake's circuit transport, and its answer.
     PromoteBridge {
-        token: NatToken,
         inner_conn: ConnectionId,
         relay: PeerId,
         stream_id: StreamId,
@@ -614,6 +616,7 @@ pub enum Out {
         pending_data: Vec<u8>,
         unsent_data: Vec<u8>,
         remote_write_closed: bool,
+        result: Result<ConnectionId, PromoteError>,
     },
     CloseCircuit {
         conn_id: ConnectionId,
@@ -629,27 +632,6 @@ impl From<NatAction> for Out {
             } => Out::SendRandomUdp {
                 target,
                 payload_len,
-            },
-            NatAction::PromoteBridge {
-                token,
-                inner_conn,
-                relay,
-                stream_id,
-                remote_peer,
-                role,
-                pending_data,
-                unsent_data,
-                remote_write_closed,
-            } => Out::PromoteBridge {
-                token,
-                inner_conn,
-                relay,
-                stream_id,
-                remote_peer,
-                role,
-                pending_data,
-                unsent_data,
-                remote_write_closed,
             },
             NatAction::CloseCircuit { conn_id } => Out::CloseCircuit { conn_id },
         }
@@ -689,6 +671,11 @@ pub struct FakeSwarm {
     pub failed_sends: Option<TransportError>,
     /// Circuit slots the host's circuit transport reports in use.
     pub circuit_slots: usize,
+    /// Answers for the next bridge promotions, in order. Once empty, a
+    /// promotion is adopted as a fresh circuit: `TEST_CIRCUIT_ID`, then
+    /// `TEST_CIRCUIT_ID + 1`, and so on.
+    pub promote_results: VecDeque<Result<ConnectionId, PromoteError>>,
+    promotions: u64,
 }
 
 impl FakeSwarm {
@@ -890,6 +877,40 @@ impl NatSwarm for FakeSwarm {
         self.calls.push(Out::Ping { peer: peer.clone() });
         Ok(())
     }
+
+    fn promote_bridge(
+        &mut self,
+        handoff: BridgeHandoff,
+        _now_ms: u64,
+    ) -> Result<ConnectionId, PromoteError> {
+        let result = self.promote_results.pop_front().unwrap_or_else(|| {
+            let conn_id = ConnectionId::new(TEST_CIRCUIT_ID + self.promotions);
+            self.promotions += 1;
+            Ok(conn_id)
+        });
+        let BridgeHandoff {
+            inner_conn,
+            stream_id,
+            relay,
+            remote_peer,
+            role,
+            pending_data,
+            unsent_data,
+            remote_write_closed,
+        } = handoff;
+        self.calls.push(Out::PromoteBridge {
+            inner_conn,
+            relay,
+            stream_id,
+            remote_peer,
+            role,
+            pending_data,
+            unsent_data,
+            remote_write_closed,
+            result: result.clone(),
+        });
+        result
+    }
 }
 
 /// A [`NatAgent`] wired to its own [`FakeSwarm`]. Agent calls that take
@@ -950,23 +971,13 @@ impl Node {
         self.agent.dial_result(&mut self.swarm, token, result, now);
     }
 
-    pub fn promote_result(
-        &mut self,
-        token: NatToken,
-        result: Result<ConnectionId, minip2p_nat::PromoteError>,
-        now: Now,
-    ) {
-        self.agent
-            .promote_result(&mut self.swarm, token, result, now);
-    }
-
     pub fn settled(&mut self, id: ConnectId, kept: Option<ConnectionId>, now: Now) {
         self.agent.settled(&mut self.swarm, id, kept, now);
     }
 }
 
-/// Everything the agent did since the last drain: swarm commands first, in
-/// issue order, then queued actions.
+/// Everything the agent did since the last drain: swarm commands (bridge
+/// promotions included) first, in issue order, then queued actions.
 pub fn drain_actions(node: &mut Node) -> Vec<Out> {
     let mut out = node.swarm.take_calls();
     out.extend(core::iter::from_fn(|| node.agent.poll_action()).map(Out::from));

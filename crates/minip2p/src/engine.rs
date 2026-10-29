@@ -259,7 +259,7 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
                 now,
             );
             if pump && let Some(nat) = self.nat.as_mut() {
-                nat.pump(&mut self.core, now);
+                nat.pump(&mut self.core);
             }
         }
         #[cfg(not(feature = "autonat"))]
