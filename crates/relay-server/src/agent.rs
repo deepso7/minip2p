@@ -887,12 +887,15 @@ impl RelayServerAgent {
                     conn_id: *conn_id,
                     stream_id: *stream_id,
                 };
+                // Resuming can finish or fail the circuit and remove it, so
+                // the claim is decided before.
+                let claimed = self.claims_stream(key);
                 if self.circuits.contains_key(&key) {
                     self.resume_forward(io, key, CircuitDirection::DestinationToSource);
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied() {
                     self.resume_forward(io, source_stream, CircuitDirection::SourceToDestination);
                 }
-                self.claims_stream(key)
+                claimed
             }
             SwarmEvent::StreamWriteStopped {
                 peer_id,

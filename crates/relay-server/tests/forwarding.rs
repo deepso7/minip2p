@@ -234,9 +234,10 @@ fn a_leg_that_closes_gracefully_keeps_the_other_direction_draining() {
     let closed = node.calls();
     assert!(resets(&closed).is_empty(), "nothing is reset: {closed:?}");
 
-    // The held reply still reaches the source, then its FIN.
+    // The held reply still reaches the source, then its FIN. The wakeup
+    // that finishes the circuit is still the relay's, not the application's.
     node.swarm.credit.remove(&source_stream);
-    node.writable(&source, source_stream, now);
+    assert!(node.writable(&source, source_stream, now));
     let drained = without_acks(node.calls());
     assert!(
         matches!(
