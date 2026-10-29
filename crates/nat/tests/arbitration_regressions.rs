@@ -6,13 +6,19 @@ use common::*;
 use minip2p_swarm::ConnectionCloseReason;
 
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
-use minip2p_nat::{MAX_PUNCH_CANDIDATES, NatConfig, NatEvent, Path, PromoteError, UpgradeStop};
+use minip2p_nat::{
+    ConnectLegs, MAX_PUNCH_CANDIDATES, NatConfig, NatEvent, Path, PromoteError, UpgradeStop,
+};
 use minip2p_relay::Status;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
 
 fn drive_to_bridged(h: &mut Harness) -> (ConnectId, StreamId, Vec<Out>) {
-    let id = h.start(RACE, at(0));
+    drive_to_bridged_with(h, RACE)
+}
+
+fn drive_to_bridged_with(h: &mut Harness, legs: ConnectLegs) -> (ConnectId, StreamId, Vec<Out>) {
+    let id = h.start(legs, at(0));
     drain_actions(&mut h.agent);
     h.agent.handle_tick(at(200));
     drain_actions(&mut h.agent);
@@ -27,7 +33,11 @@ fn drive_to_bridged(h: &mut Harness) -> (ConnectId, StreamId, Vec<Out>) {
 }
 
 fn drive_to_relayed(h: &mut Harness) -> (ConnectId, ConnectionId) {
-    let (id, _, promotion) = drive_to_bridged(h);
+    drive_to_relayed_with(h, RACE)
+}
+
+fn drive_to_relayed_with(h: &mut Harness, legs: ConnectLegs) -> (ConnectId, ConnectionId) {
+    let (id, _, promotion) = drive_to_bridged_with(h, legs);
     let target = h.target.clone();
     let conn = complete_promotion(&mut h.agent, &target, &promotion, at(301));
     assert!(matches!(
@@ -1254,6 +1264,31 @@ fn the_whole_upgrade_is_bounded() {
         [NatEvent::FellBackToRelay {
             connect_id,
             reason: UpgradeStop::UpgradeTimeout { budget_ms: 5_000 },
+            ..
+        }] if *connect_id == id
+    ));
+}
+
+#[test]
+fn an_exchange_the_attempt_deadline_cuts_short_settles_with_the_upgrade_timeout() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let legs = ConnectLegs {
+        deadline_ms: Some(5_000),
+        ..RACE
+    };
+    let (id, conn) = drive_to_relayed_with(&mut h, legs);
+    // The 10 s exchange would run to t=11_000; the attempt's deadline caps
+    // the whole upgrade, and with it the exchange, at t=5_000.
+    open_inbound_dcutr_at(&mut h, conn, StreamId::new(90), 1_000);
+
+    h.agent.handle_tick(at(4_999));
+    assert!(drain_events(&mut h.agent).is_empty());
+    h.agent.handle_tick(at(5_000));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::FellBackToRelay {
+            connect_id,
+            reason: UpgradeStop::UpgradeTimeout { budget_ms: 4_699 },
             ..
         }] if *connect_id == id
     ));

@@ -64,6 +64,7 @@ extern crate alloc;
 mod acquire;
 mod agent;
 mod attempt;
+mod budget;
 mod config;
 mod events;
 mod housekeeping;
