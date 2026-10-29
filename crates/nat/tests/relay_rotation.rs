@@ -532,13 +532,13 @@ fn failed_promotion_at_first_relay_moves_to_the_next() {
     let (a, b) = (w.a.clone(), w.b.clone());
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
 
+    w.agent
+        .swarm
+        .promote_results
+        .push_back(Err(PromoteError::Failed(
+            "secure-mux handshake failed".into(),
+        )));
     hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
-    let token = promote_token(&drain_actions(&mut w.agent));
-    w.agent.promote_result(
-        token,
-        Err(PromoteError::Failed("secure-mux handshake failed".into())),
-        at(20),
-    );
     let actions = drain_actions(&mut w.agent);
     assert_eq!(dial_count_for(&actions, &b), 1);
     assert!(
@@ -551,84 +551,37 @@ fn failed_promotion_at_first_relay_moves_to_the_next() {
 }
 
 #[test]
-fn a_promotion_answered_after_its_relay_timed_out_closes_its_circuit() {
+fn an_adopted_circuit_whose_relay_times_out_closes_and_hands_over() {
     let mut w = two_relays();
     let target = w.target.clone();
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let (a, b) = (w.a.clone(), w.b.clone());
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
     hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
-    let stale = promote_token(&drain_actions(&mut w.agent));
+    let a_circuit = promoted_circuit(&drain_actions(&mut w.agent));
 
-    // A's promotion is still unanswered when its budget runs out; B
-    // bridges and requests its own.
+    // A's circuit never finishes its handshake within A's budget: it
+    // closes, and B is tried.
     w.agent.handle_tick(at(12_000));
-    let b_conn = dial_conn_for(&drain_actions(&mut w.agent), &b);
-    hop_exchange(&mut w, &b, b_conn, Status::Ok, 12_010);
-    let b_actions = drain_actions(&mut w.agent);
-    drain_all_events(&mut w.agent);
-
-    // A's late circuit is not B's: it closes, and B's promotion still lands.
-    let late = ConnectionId::new((1 << 63) | 78);
-    w.agent.promote_result(stale, Ok(late), at(12_020));
+    let actions = drain_actions(&mut w.agent);
     assert!(
-        drain_actions(&mut w.agent)
+        actions
             .iter()
-            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == late))
+            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == a_circuit))
     );
-    complete_promotion(&mut w.agent, &w.target.clone(), &b_actions, at(12_030));
-    assert!(matches!(
-        drain_events(&mut w.agent).as_slice(),
-        [NatEvent::PathEstablished { path: Path::Relayed { relay }, .. }] if *relay == b
-    ));
-}
+    assert!(drain_all_events(&mut w.agent).iter().any(|event| matches!(
+        event,
+        NatEvent::RelayFailed {
+            error: NatError::Timeout {
+                stage: RelayStage::CircuitHandshake,
+                ..
+            },
+            ..
+        }
+    )));
 
-/// Asserts `w`'s pending actions close the circuit `conn`.
-fn assert_closes(w: &mut World, conn: ConnectionId) {
-    assert!(
-        drain_actions(&mut w.agent)
-            .iter()
-            .any(|action| matches!(action, Out::CloseCircuit { conn_id } if *conn_id == conn)),
-        "the orphaned circuit must close"
-    );
-}
-
-#[test]
-fn a_promotion_answered_after_the_last_relay_timed_out_closes_its_circuit() {
-    let mut w = relays_with(|a, _| vec![relay_addr("/ip4/203.0.113.1/udp/4001/quic-v1", a)]);
-    let target = w.target.clone();
-    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
-    let a = w.a.clone();
-    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
-    hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
-    let token = promote_token(&drain_actions(&mut w.agent));
-    w.agent.handle_tick(at(12_000));
-    assert!(
-        drain_events(&mut w.agent)
-            .iter()
-            .any(|event| matches!(event, NatEvent::ConnectFailed { .. }))
-    );
-
-    let late = ConnectionId::new((1 << 63) | 78);
-    w.agent.promote_result(token, Ok(late), at(12_020));
-    assert_closes(&mut w, late);
-}
-
-#[test]
-fn a_promotion_answered_after_the_attempt_was_cancelled_closes_its_circuit() {
-    let mut w = two_relays();
-    let target = w.target.clone();
-    let id = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
-    let a = w.a.clone();
-    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
-    hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
-    let token = promote_token(&drain_actions(&mut w.agent));
-    w.agent.cancel(id, at(20));
-    drain_actions(&mut w.agent);
-
-    let late = ConnectionId::new((1 << 63) | 78);
-    w.agent.promote_result(token, Ok(late), at(30));
-    assert_closes(&mut w, late);
+    hop_exchange(&mut w, &b, dial_conn_for(&actions, &b), Status::Ok, 12_010);
+    assert_relayed_via(&mut w, &b, 12_020);
 }
 
 #[test]
@@ -638,10 +591,12 @@ fn a_peer_already_direct_disarms_the_relay_budget() {
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let a = w.a.clone();
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
-    hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
-    let token = promote_token(&drain_actions(&mut w.agent));
     w.agent
-        .promote_result(token, Err(PromoteError::PeerAlreadyDirect), at(20));
+        .swarm
+        .promote_results
+        .push_back(Err(PromoteError::PeerAlreadyDirect));
+    hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
+    drain_actions(&mut w.agent);
     drain_all_events(&mut w.agent);
 
     // The relay's budget has nothing left to bound: no relay timeout, no
@@ -659,9 +614,7 @@ fn circuit_closing_before_it_establishes_moves_to_the_next_relay() {
     let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
 
     hop_exchange(&mut w, &a, a_conn, Status::Ok, 10);
-    let token = promote_token(&drain_actions(&mut w.agent));
-    let circuit = ConnectionId::new(TEST_CIRCUIT_ID);
-    w.agent.promote_result(token, Ok(circuit), at(20));
+    let circuit = promoted_circuit(&drain_actions(&mut w.agent));
     w.agent.handle_event(
         &SwarmEvent::ConnectionClosed {
             peer_id: target,

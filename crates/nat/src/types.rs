@@ -3,15 +3,11 @@ use minip2p_core::PeerId;
 // name it without NAT.
 pub use minip2p_core::Path;
 
-/// Opaque correlation token the agent allocates for work whose result the
-/// host reports later: a dial the host parked to resolve its named address
-/// ([`DialStart::Deferred`](crate::DialStart::Deferred), reported through
-/// [`NatAgent::dial_result`](crate::NatAgent::dial_result)) and a
-/// [`NatAction::PromoteBridge`] (reported through
-/// [`NatAgent::promote_result`](crate::NatAgent::promote_result)). The host
+/// Opaque correlation token the agent allocates for a dial whose result the
+/// host may report later: a dial the host parked to resolve its named
+/// address ([`DialStart::Deferred`](crate::DialStart::Deferred), reported
+/// through [`NatAgent::dial_result`](crate::NatAgent::dial_result)). The host
 /// echoes it back unchanged.
-///
-/// [`NatAction::PromoteBridge`]: crate::NatAction::PromoteBridge
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NatToken(pub(crate) u64);
 
@@ -149,7 +145,8 @@ pub enum UpgradeStop {
     Aborted { reason: alloc::string::String },
 }
 
-/// Failure reported by the driver while promoting a relay bridge.
+/// Why [`NatSwarm::promote_bridge`](crate::NatSwarm::promote_bridge) refused a
+/// relay bridge.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PromoteError {
     /// A verified direct connection won the race before promotion.

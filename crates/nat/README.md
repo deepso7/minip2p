@@ -66,7 +66,7 @@ let legs = ConnectLegs {
 };
 // `swarm` is any `NatSwarm`; `SwarmCore` implements it. It is passed into
 // each call, never stored, and the agent issues dials, stream opens,
-// writes, resets, and pings on it directly.
+// writes, resets, pings, and bridge promotions on it directly.
 agent.connect(&mut swarm, id, target_peer, legs, now());
 
 loop {
@@ -80,10 +80,6 @@ loop {
     // 2. Execute what needs the transport under the swarm.
     while let Some(action) = agent.poll_action() {
         match action {
-            NatAction::PromoteBridge { token, .. } => {
-                let result = promote_bridge(/* ... */);
-                agent.promote_result(&mut swarm, token, result, now());
-            }
             NatAction::SendRandomUdp { .. } | NatAction::CloseCircuit { .. } => { /* ... */ }
         }
     }
@@ -98,7 +94,11 @@ loop {
 
 The agent keeps no copy of connections or readiness; it reads both from the `NatSwarm` each call. That state may be ahead of the event being handled (a host hands over a batch the swarm already applied), so the agent follows two rules: what it owns (dials, streams, reservations, path records) is keyed by the exact connection id an event carries, and live swarm state only decides whether new work may start. Cleanup for a closed or replaced connection ends only the work bound to that connection, never work already started on its replacement. Readiness-triggered work starts only when the `PeerReady` connection is still the peer's ready one.
 
-A write the swarm refuses as Full (ADR 0012) is not lost: the agent holds its unsent tail, queues later writes and the write-side close on that stream behind it, and resends them when the stream's `StreamWritable` reaches `handle_event` (which then returns `true`). A resend the transport fails outright resets the stream rather than sending the held close, and so does a stream holding more than 64 KiB. Tails still held when a bridge is promoted ride in `PromoteBridge::unsent_data`; the circuit sends them before its own bytes.
+A write the swarm refuses as Full (ADR 0012) is not lost: the agent holds its unsent tail, queues later writes and the write-side close on that stream behind it, and resends them when the stream's `StreamWritable` reaches `handle_event` (which then returns `true`). A resend the transport fails outright resets the stream rather than sending the held close, and so does a stream holding more than 64 KiB. Tails still held when a bridge is promoted ride in `BridgeHandoff::unsent_data`; the circuit sends them before its own bytes.
+
+### Promoting bridges
+
+Once a relay bridges a circuit (HOP STATUS OK outbound, or STOP CONNECT accepted inbound), the agent releases the bridge stream and calls `NatSwarm::promote_bridge` with a `BridgeHandoff`: the exact stream, the relay and remote peer, the local `BridgeRole`, the bytes already read behind the relay's response (`pending_data`), and any tails it still held for the stream (`unsent_data`). The host adopts it into its circuit transport and returns the circuit's `ConnectionId` at once; the circuit's handshake completes later as `ConnectionEstablished`. A host that refuses returns a `PromoteError`: `PeerAlreadyDirect` disarms the relay's budget, anything else fails that relay and moves the leg on. The trait's default refuses, so a host without a circuit transport never promotes. The minip2p `Endpoint`'s swarm adapter maps `BridgeRole` and `PromoteError` to and from its circuit transport's own types, and resets a bridge it fails to adopt.
 
 A dial to a concrete `/ip4`/`/ip6` address starts synchronously (`DialStart::Started`); its outcome arrives as `ConnectionEstablished` or `DialFailed`. The bare `SwarmCore` implementation rejects `/dns*` addresses with `NatSwarmError::NamedAddress`. A host that resolves names wraps the swarm in a small adapter that parks such a dial and returns `DialStart::Deferred`, keeping the token the agent passed in: the agent allocates and registers that token before the dial reaches the host, so the result can come back at any later point. Before dialing and reporting the parked dial through `agent.dial_result(&mut swarm, token, result, now)`, the host calls `agent.deferred_dial_wanted(token, now)` and drops the dial when that returns `false`: the owning flight has moved on, and a late result must not land on a newer one.
 

@@ -4,6 +4,13 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### NAT promotes relay bridges through `NatSwarm` (#442)
+
+A bridged relay stream now goes straight to the host's circuit transport through the swarm seam instead of an action and a token round-trip. Breaking changes for direct `minip2p-nat` users (the `Endpoint` API is unchanged):
+
+- **`NatSwarm::promote_bridge(BridgeHandoff) -> Result<ConnectionId, PromoteError>`** is new. It defaults to refusing, so a host without circuits needs no change; a host that adopts bridges implements it with what it used to run for `PromoteBridge`. `BridgeHandoff` carries the fields the action did, minus the token.
+- **`NatAction::PromoteBridge` and `NatAgent::promote_result` are gone.** Tails the agent held for the bridge are in `BridgeHandoff::unsent_data` when the call reaches the host.
+
 ### Endpoint builders record intent; Endpoint setup applies NAT defaults (#439)
 
 The std, portable and smoltcp builders now only record what you configure. Endpoint setup picks every NAT default and merges the relay and AutoNAT lists, and every capability is checked at build. Breaking changes:

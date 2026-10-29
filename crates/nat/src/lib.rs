@@ -37,8 +37,9 @@
 //! [`NatSwarm`] (implemented for [`minip2p_swarm::SwarmCore`]), feed it swarm
 //! events by reference via [`NatAgent::handle_event`] and time via
 //! [`NatAgent::handle_tick`]. It reads connection and readiness facts from
-//! that swarm and issues dials, stream opens, and writes on it directly;
-//! the few [`NatAction`]s it emits need the transport underneath. Events for
+//! that swarm and issues dials, stream opens, writes, and bridge promotions
+//! on it directly; the few [`NatAction`]s it emits need the transport
+//! underneath. Events for
 //! streams the agent does not own cost one map lookup and zero clones.
 //!
 //! Every input carries the host's [`Now`] sample. Its monotonic reading
@@ -47,8 +48,10 @@
 //! returns, and without one renewal falls back to
 //! [`NatConfig::reservation_default_ttl_secs`].
 //!
-//! The driver executes [`NatAction::PromoteBridge`] against a circuit
-//! transport. Relayed paths are therefore ordinary identity-verified swarm
+//! A bridged relay stream is handed to the host's circuit transport through
+//! [`NatSwarm::promote_bridge`], which adopts it synchronously and returns
+//! the circuit connection; bytes the agent still held for the bridge travel
+//! with it in [`BridgeHandoff::unsent_data`]. Relayed paths are therefore ordinary identity-verified swarm
 //! connections: identify, ping, pubsub, and application protocols use the
 //! same stream APIs as direct paths.
 //!
@@ -71,10 +74,10 @@ mod types;
 
 pub use agent::{ConnectLegs, NatAgent};
 pub use config::{MAX_DCUTR_ROUNDS, NatConfig, ReservationPolicy};
-pub use events::{BridgeRole, NatAction, NatEvent};
+pub use events::{NatAction, NatEvent};
 pub use housekeeping::{AUTONAT_VOTE_TTL_MS, MAX_RESERVATION_RETRY_BACKOFF_MS};
 pub use inbound::MAX_PUNCH_CANDIDATES;
-pub use swarm::{DialStart, NatSwarm, NatSwarmError, is_named};
+pub use swarm::{BridgeHandoff, BridgeRole, DialStart, NatSwarm, NatSwarmError, is_named};
 pub use types::{
     NatError, NatToken, Path, PromoteError, ReachabilityState, RelayStage, ReservationInfo,
     UpgradeStop,

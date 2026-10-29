@@ -157,10 +157,7 @@ fn direct_connection_before_circuit_handshake_does_not_downgrade_the_path() {
     inbound_stop_stream(&mut h, stop, 0);
     let target = h.target.clone();
     h.stream_data(stop, stop_connect(&target), at(10));
-    let promotion = drain_actions(&mut h.agent);
-    let conn = ConnectionId::new(TEST_CIRCUIT_ID);
-    h.agent
-        .promote_result(promote_token(&promotion), Ok(conn), at(11));
+    let conn = promoted_circuit(&drain_actions(&mut h.agent));
 
     h.target_connected(at(12));
     h.agent.handle_event(
@@ -555,9 +552,7 @@ fn circuit_replacement_through_another_relay_is_not_an_upgrade() {
         false,
         at(21),
     );
-    let circuit_b = ConnectionId::new(TEST_CIRCUIT_ID + 1);
-    let promotion = promote_token(&drain_actions(&mut h.agent));
-    h.agent.promote_result(promotion, Ok(circuit_b), at(22));
+    let circuit_b = promoted_circuit(&drain_actions(&mut h.agent));
     h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
             peer_id: target.clone(),
@@ -592,10 +587,7 @@ fn inbound_circuit_replacing_a_direct_connection_announces_its_path() {
     let stop = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stop, 1);
     h.stream_data(stop, stop_connect(&target), at(10));
-    let promotion = drain_actions(&mut h.agent);
-    let circuit = ConnectionId::new(TEST_CIRCUIT_ID);
-    h.agent
-        .promote_result(promote_token(&promotion), Ok(circuit), at(11));
+    let circuit = promoted_circuit(&drain_actions(&mut h.agent));
 
     h.agent.handle_event(
         &SwarmEvent::ConnectionReplaced {
@@ -625,10 +617,7 @@ fn inbound_dcutr_is_not_opened_once_a_direct_connection_replaced_the_circuit() {
     inbound_stop_stream(&mut h, stop, 0);
     let target = h.target.clone();
     h.stream_data(stop, stop_connect(&target), at(10));
-    let promotion = drain_actions(&mut h.agent);
-    let circuit = ConnectionId::new(TEST_CIRCUIT_ID);
-    h.agent
-        .promote_result(promote_token(&promotion), Ok(circuit), at(11));
+    let circuit = promoted_circuit(&drain_actions(&mut h.agent));
     // The swarm is ahead: a direct connection already replaced the circuit
     // when its establishment reaches the agent.
     h.agent.swarm.connect(&target, ConnectionId::new(7));

@@ -12,10 +12,10 @@ use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole, CircuitTransport};
 use minip2p_core::{Bytes, ConnectId, Multiaddr, PeerAddr, PeerId, Protocol, select_direct_addrs};
 #[cfg(feature = "relay")]
-use minip2p_nat::BridgeRole;
+use minip2p_nat::{BridgeHandoff, BridgeRole, PromoteError};
 use minip2p_nat::{
     ConnectLegs, DialStart, NatAction, NatAgent, NatEvent, NatSwarm, NatSwarmError, NatToken,
-    PromoteError, ReachabilityState,
+    ReachabilityState,
 };
 use minip2p_swarm::{SwarmCore, SwarmEvent};
 #[cfg(feature = "relay")]
@@ -115,24 +115,12 @@ pub(crate) struct NatDriver<T> {
     relay_addrs: Vec<(PeerId, Multiaddr)>,
     /// Direct public addresses confirmed by AutoNAT.
     public_addrs: Vec<Multiaddr>,
-    /// Exact adopted bridge keys mapped to their promoted circuit ids.
-    #[cfg(feature = "relay")]
-    promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
-    /// The transport's circuit operations; `None` refuses promotions.
-    #[cfg(feature = "relay")]
-    circuits: Option<CircuitOps<T>>,
-    #[cfg(not(feature = "relay"))]
-    transport: PhantomData<fn(T)>,
-    /// What the driver keeps around the swarm for the agent's commands.
-    io: HostIo,
-    /// Circuit slots the transport holds, live and unsettled, which the
-    /// agent's circuit admission counts; none without circuits.
-    circuit_slots: fn(&T) -> usize,
+    /// What the driver keeps around the swarm for the agent's commands,
+    /// lent to the agent beside it as an [`EndpointSwarm`].
+    io: HostIo<T>,
     /// The bound-address revision the agent's `listen_addrs` were seeded
     /// from; callers can bind through any swarm path between driver turns.
     listen_addrs_revision: u64,
-    #[cfg(all(test, feature = "relay", feature = "quic"))]
-    pub(crate) bridge_reset_attempts: Vec<(ConnectionId, StreamId)>,
 }
 
 impl<T: Transport> NatDriver<T> {
@@ -161,30 +149,20 @@ impl<T: Transport> NatDriver<T> {
             reserved_relays: Vec::new(),
             relay_addrs,
             public_addrs: Vec::new(),
-            #[cfg(feature = "relay")]
-            promoted: BTreeMap::new(),
-            #[cfg(feature = "relay")]
-            circuits: None,
-            #[cfg(not(feature = "relay"))]
-            transport: PhantomData,
-            io: HostIo::default(),
-            circuit_slots: |_| 0,
+            io: HostIo::new(),
             // Matches a fresh runtime: seed only after a real `listen*`
             // call bumped the revision. Some transports report bound-but-
             // not-listening sockets from `local_addresses`, so syncing on
             // an untouched revision would advertise a dial-back address
             // that drops packets.
             listen_addrs_revision: 0,
-            #[cfg(all(test, feature = "relay", feature = "quic"))]
-            bridge_reset_attempts: Vec::new(),
         }
     }
 
     /// Lets relay bridges become circuit connections over this transport.
     #[cfg(feature = "relay")]
     pub(crate) fn with_circuits(mut self, circuits: CircuitOps<T>) -> Self {
-        self.circuit_slots = circuits.circuit_slots;
-        self.circuits = Some(circuits);
+        self.io.circuits = Some(circuits);
         self
     }
 
@@ -237,9 +215,9 @@ impl<T: Transport> NatDriver<T> {
             }
             Err(last)
         });
-        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
         self.agent.dial_result(&mut io, token, result, sample);
-        self.pump(swarm, sample);
+        self.pump(swarm);
     }
 
     /// Cancels a pending connect's NAT leg; settled or unknown ids are a
@@ -250,7 +228,7 @@ impl<T: Transport> NatDriver<T> {
         swarm: &mut SwarmCore<T, R>,
         now: Now,
     ) {
-        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
         self.agent.cancel(&mut io, id, now);
     }
 
@@ -286,9 +264,9 @@ impl<T: Transport> NatDriver<T> {
         swarm: &mut SwarmCore<T, R>,
         sample: Now,
     ) {
-        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
         self.agent.connect(&mut io, id, peer, legs, sample);
-        self.pump(swarm, sample);
+        self.pump(swarm);
     }
 
     /// When [`NatDriver::tick`] next has work: immediately while events are
@@ -347,7 +325,7 @@ impl<T: Transport> NatDriver<T> {
         self.sync_listen_addrs(swarm);
         #[cfg(feature = "relay")]
         if self.inject_straggler(event, swarm) {
-            self.pump(swarm, now);
+            self.pump(swarm);
             return true;
         }
         let is_circuit = match event {
@@ -356,7 +334,7 @@ impl<T: Transport> NatDriver<T> {
             | SwarmEvent::ConnectionReplaced { new: conn_id, .. } => conn_id.is_circuit(),
             _ => false,
         };
-        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
         let handled = self.agent.handle_event(&mut io, event, is_circuit, now);
         // The agent consumes what it claims as it reads it, including bytes
         // past a CONNECT response that a promoted bridge's circuit takes
@@ -379,19 +357,21 @@ impl<T: Transport> NatDriver<T> {
         #[cfg(feature = "relay")]
         if let SwarmEvent::ConnectionClosed { conn_id, .. }
         | SwarmEvent::ConnectionReplaced { old: conn_id, .. } = event
-            && let Some(circuits) = self.circuits.as_ref()
+            && let Some(circuits) = self.io.circuits.as_ref()
         {
             for &(inner_conn, stream_id) in self
+                .io
                 .promoted
                 .keys()
                 .filter(|(inner_conn, _)| inner_conn == conn_id)
             {
                 (circuits.inject_bridge_closed)(swarm.transport_mut(), inner_conn, stream_id);
             }
-            self.promoted
+            self.io
+                .promoted
                 .retain(|(inner_conn, _), circuit| inner_conn != conn_id && circuit != conn_id);
         }
-        self.pump(swarm, now);
+        self.pump(swarm);
         handled
     }
 
@@ -404,8 +384,9 @@ impl<T: Transport> NatDriver<T> {
     /// surface reach `ingest`'s `ConnectionClosed` branch regardless.
     pub(crate) fn tick<R: EntropySource>(&mut self, swarm: &mut SwarmCore<T, R>, now: Now) {
         #[cfg(feature = "relay")]
-        if let Some(circuits) = self.circuits.as_ref() {
-            self.promoted
+        if let Some(circuits) = self.io.circuits.as_ref() {
+            self.io
+                .promoted
                 .retain(|_, id| (circuits.contains_circuit)(swarm.transport(), *id));
         }
         // A fresh listen must seed even when the agent has no due work —
@@ -419,20 +400,20 @@ impl<T: Transport> NatDriver<T> {
         {
             return;
         }
-        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
         self.agent.handle_tick(&mut io, now);
-        self.pump(swarm, now);
+        self.pump(swarm);
     }
 
-    /// Executes queued agent actions (echoing promotion results back) and
-    /// collects application-visible NAT events.
-    pub(crate) fn pump<R: EntropySource>(&mut self, swarm: &mut SwarmCore<T, R>, sample: Now) {
+    /// Executes queued agent actions and collects application-visible NAT
+    /// events.
+    pub(crate) fn pump<R: EntropySource>(&mut self, swarm: &mut SwarmCore<T, R>) {
         self.sync_listen_addrs(swarm);
         loop {
             let mut progressed = false;
             while let Some(action) = self.agent.poll_action() {
                 progressed = true;
-                self.execute(action, swarm, sample);
+                self.execute(action, swarm);
             }
             while let Some(event) = self.agent.poll_event() {
                 progressed = true;
@@ -534,7 +515,7 @@ impl<T: Transport> NatDriver<T> {
             );
         }
         if work.pump {
-            self.pump(swarm, sample);
+            self.pump(swarm);
         }
     }
 
@@ -561,9 +542,9 @@ impl<T: Transport> NatDriver<T> {
             crate::ConnectOutcome::Connected { conn_id, .. } => Some(*conn_id),
             crate::ConnectOutcome::Failed(_) | crate::ConnectOutcome::Cancelled => None,
         };
-        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
+        let mut io = EndpointSwarm::new(swarm, &mut self.io);
         self.agent.settled(&mut io, *connect_id, kept, sample);
-        self.pump(swarm, sample);
+        self.pump(swarm);
     }
 
     /// Queues an event as if the agent emitted it; the next route sends it
@@ -633,18 +614,34 @@ impl<T: Transport> NatDriver<T> {
     /// The adopted-bridge to promoted-circuit map, for test assertions.
     #[cfg(all(test, feature = "relay", feature = "quic"))]
     pub(crate) fn promoted(&self) -> &BTreeMap<(ConnectionId, StreamId), ConnectionId> {
-        &self.promoted
+        &self.io.promoted
     }
 
-    /// Executes one agent action and echoes a promotion result back. These
-    /// need the transport underneath the swarm; the agent issues swarm
-    /// commands itself. Best-effort actions swallow errors; the agent's
-    /// timeouts and the swarm's lifecycle events surface failures.
+    /// The bridges a failed adoption reset, for test assertions.
+    #[cfg(all(test, feature = "relay", feature = "quic"))]
+    pub(crate) fn bridge_reset_attempts(&self) -> &[(ConnectionId, StreamId)] {
+        &self.io.bridge_reset_attempts
+    }
+
+    /// Promotes `handoff` through the swarm adapter the agent is lent, as
+    /// the agent does when its relay bridges.
+    #[cfg(all(test, feature = "relay", feature = "quic"))]
+    pub(crate) fn promote_bridge<R: EntropySource>(
+        &mut self,
+        handoff: BridgeHandoff,
+        swarm: &mut SwarmCore<T, R>,
+    ) -> Result<ConnectionId, PromoteError> {
+        EndpointSwarm::new(swarm, &mut self.io).promote_bridge(handoff)
+    }
+
+    /// Executes one agent action. These need the transport underneath the
+    /// swarm; the agent issues swarm commands itself. Best-effort actions
+    /// swallow errors; the agent's timeouts and the swarm's lifecycle events
+    /// surface failures.
     pub(crate) fn execute<R: EntropySource>(
         &mut self,
         action: NatAction,
         swarm: &mut SwarmCore<T, R>,
-        now: Now,
     ) {
         match action {
             NatAction::SendRandomUdp {
@@ -660,120 +657,11 @@ impl<T: Transport> NatDriver<T> {
                     }
                 }
             }
-            NatAction::PromoteBridge {
-                token,
-                inner_conn,
-                relay,
-                stream_id,
-                remote_peer,
-                role,
-                pending_data,
-                unsent_data,
-                remote_write_closed,
-            } => {
-                #[cfg(not(feature = "relay"))]
-                {
-                    let _ = (
-                        inner_conn,
-                        stream_id,
-                        relay,
-                        remote_peer,
-                        role,
-                        pending_data,
-                        unsent_data,
-                        remote_write_closed,
-                    );
-                    let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
-                    self.agent.promote_result(
-                        &mut io,
-                        token,
-                        Err(PromoteError::Failed("portable relay is not enabled".into())),
-                        now,
-                    );
-                }
-                #[cfg(feature = "relay")]
-                {
-                    let key = (inner_conn, stream_id);
-                    if let Some(existing) = self.promoted.get(&key).copied() {
-                        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
-                        self.agent.promote_result(&mut io, token, Ok(existing), now);
-                        return;
-                    }
-                    // The endpoint refuses relay configuration over a
-                    // transport without circuit operations, so this is only
-                    // reached by a relay the agent was never given.
-                    let Some(circuits) = self.circuits.as_ref() else {
-                        let mut io = EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
-                        self.agent.promote_result(
-                            &mut io,
-                            token,
-                            Err(PromoteError::Failed(
-                                "the transport has no circuit operations".into(),
-                            )),
-                            now,
-                        );
-                        return;
-                    };
-                    // Bytes refused as Full are still owed to the peer: the
-                    // core's (a negotiation reply, say), then the agent's
-                    // held tails (a STOP STATUS, say). The circuit
-                    // takes Writable for the stream now, so it sends them
-                    // first, in that order.
-                    let mut owed = swarm.forget_stream(inner_conn, stream_id);
-                    if !unsent_data.is_empty() {
-                        owed.push_back(unsent_data.into());
-                    }
-                    let unsent_prefix = concat(owed);
-                    let adoption = BridgeAdoption {
-                        inner_conn,
-                        bridge_stream: stream_id,
-                        relay,
-                        remote_peer,
-                        role: match role {
-                            BridgeRole::Initiator => CircuitRole::Initiator,
-                            BridgeRole::Responder => CircuitRole::Responder,
-                        },
-                        pending_data: pending_data.into(),
-                        unsent_prefix,
-                        remote_write_closed,
-                    };
-                    match (circuits.adopt_bridge)(swarm.transport_mut(), adoption) {
-                        Ok(conn_id) => {
-                            self.promoted.insert(key, conn_id);
-                            let mut io =
-                                EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
-                            self.agent.promote_result(&mut io, token, Ok(conn_id), now);
-                        }
-                        Err(error) => {
-                            let promote_error = match &error {
-                                AdoptError::PeerAlreadyDirect => PromoteError::PeerAlreadyDirect,
-                                AdoptError::UnknownConnection => PromoteError::UnknownConnection,
-                                _ => PromoteError::Failed(error.to_string()),
-                            };
-                            let mut io =
-                                EndpointSwarm::new(swarm, &mut self.io, self.circuit_slots);
-                            self.agent
-                                .promote_result(&mut io, token, Err(promote_error), now);
-                            if !matches!(error, AdoptError::UnknownConnection) {
-                                #[cfg(all(test, feature = "relay", feature = "quic"))]
-                                self.bridge_reset_attempts.push((inner_conn, stream_id));
-                                match (circuits.reset_bridge)(
-                                    swarm.transport_mut(),
-                                    inner_conn,
-                                    stream_id,
-                                ) {
-                                    Ok(()) | Err(_) => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             NatAction::CloseCircuit { conn_id } => {
                 match swarm.transport_mut().close(conn_id) {
                     Ok(()) | Err(minip2p_transport::TransportError::ConnectionNotFound { .. }) => {
                         #[cfg(feature = "relay")]
-                        self.promoted.retain(|_, id| *id != conn_id);
+                        self.io.promoted.retain(|_, id| *id != conn_id);
                     }
                     // A transport failure will emerge through its normal
                     // event path; retain the promotion until then.
@@ -807,10 +695,10 @@ impl<T: Transport> NatDriver<T> {
             } => (*conn_id, *stream_id),
             _ => return false,
         };
-        let Some(circuits) = self.circuits.as_ref() else {
+        let Some(circuits) = self.io.circuits.as_ref() else {
             return false;
         };
-        if !self.promoted.contains_key(&key) {
+        if !self.io.promoted.contains_key(&key) {
             return false;
         }
         let transport = swarm.transport_mut();
@@ -829,7 +717,7 @@ impl<T: Transport> NatDriver<T> {
             }
             SwarmEvent::StreamClosed { .. } => {
                 (circuits.inject_bridge_closed)(transport, key.0, key.1);
-                self.promoted.remove(&key);
+                self.io.promoted.remove(&key);
             }
             // `key` was extracted above only for these stream events.
             // Keep this defensive if a new swarm event reaches this path.
@@ -875,32 +763,49 @@ impl<T: Transport> NatDriver<T> {
 }
 
 /// What the NAT driver keeps around the swarm for the agent's commands.
-#[derive(Default)]
-struct HostIo {
+struct HostIo<T> {
     /// Dials to `/dns*` hosts parked for the composition to resolve, when it
     /// owns Name resolution (the std Endpoint); `None` rejects them.
     parked: Option<Vec<(NatToken, PeerAddr)>>,
+    /// The transport's circuit operations; `None` refuses promotions.
+    #[cfg(feature = "relay")]
+    circuits: Option<CircuitOps<T>>,
+    /// Exact adopted bridge keys mapped to their promoted circuit ids.
+    #[cfg(feature = "relay")]
+    promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
+    #[cfg(all(test, feature = "relay", feature = "quic"))]
+    bridge_reset_attempts: Vec<(ConnectionId, StreamId)>,
+    #[cfg(not(feature = "relay"))]
+    transport: PhantomData<fn(T)>,
+}
+
+impl<T> HostIo<T> {
+    fn new() -> Self {
+        Self {
+            parked: None,
+            #[cfg(feature = "relay")]
+            circuits: None,
+            #[cfg(feature = "relay")]
+            promoted: BTreeMap::new(),
+            #[cfg(all(test, feature = "relay", feature = "quic"))]
+            bridge_reset_attempts: Vec::new(),
+            #[cfg(not(feature = "relay"))]
+            transport: PhantomData,
+        }
+    }
 }
 
 /// The [`NatSwarm`] the driver hands the agent: the swarm, plus parking for
-/// named dials. Borrowed for one agent call.
+/// named dials and, with `relay`, the transport's circuit operations for
+/// bridge promotion. Borrowed for one agent call.
 struct EndpointSwarm<'a, T: Transport, R: EntropySource> {
     swarm: &'a mut SwarmCore<T, R>,
-    io: &'a mut HostIo,
-    circuit_slots: fn(&T) -> usize,
+    io: &'a mut HostIo<T>,
 }
 
 impl<'a, T: Transport, R: EntropySource> EndpointSwarm<'a, T, R> {
-    fn new(
-        swarm: &'a mut SwarmCore<T, R>,
-        io: &'a mut HostIo,
-        circuit_slots: fn(&T) -> usize,
-    ) -> Self {
-        Self {
-            swarm,
-            io,
-            circuit_slots,
-        }
+    fn new(swarm: &'a mut SwarmCore<T, R>, io: &'a mut HostIo<T>) -> Self {
+        Self { swarm, io }
     }
 }
 
@@ -977,7 +882,84 @@ impl<T: Transport, R: EntropySource> NatSwarm for EndpointSwarm<'_, T, R> {
         Ok(self.swarm.ping(peer, now_ms)?)
     }
 
+    /// Circuit slots the transport holds, live and unsettled; none without
+    /// circuits.
     fn circuit_slots(&self) -> usize {
-        (self.circuit_slots)(self.swarm.transport())
+        #[cfg(feature = "relay")]
+        if let Some(circuits) = self.io.circuits.as_ref() {
+            return (circuits.circuit_slots)(self.swarm.transport());
+        }
+        0
+    }
+
+    /// Adopts the bridge into the circuit transport. Without `relay` the
+    /// default refusal stands.
+    #[cfg(feature = "relay")]
+    fn promote_bridge(&mut self, handoff: BridgeHandoff) -> Result<ConnectionId, PromoteError> {
+        let BridgeHandoff {
+            inner_conn,
+            stream_id,
+            relay,
+            remote_peer,
+            role,
+            pending_data,
+            unsent_data,
+            remote_write_closed,
+        } = handoff;
+        let key = (inner_conn, stream_id);
+        if let Some(existing) = self.io.promoted.get(&key) {
+            return Ok(*existing);
+        }
+        // The endpoint refuses relay configuration over a transport without
+        // circuit operations, so this is only reached by a relay the agent
+        // was never given.
+        let Some(circuits) = self.io.circuits.as_ref() else {
+            return Err(PromoteError::Failed(
+                "the transport has no circuit operations".into(),
+            ));
+        };
+        // Bytes refused as Full are still owed to the peer: the core's (a
+        // negotiation reply, say), then the agent's held tails (a STOP
+        // STATUS, say). The circuit takes Writable for the stream now, so it
+        // sends them first, in that order.
+        let mut owed = self.swarm.forget_stream(inner_conn, stream_id);
+        if !unsent_data.is_empty() {
+            owed.push_back(unsent_data.into());
+        }
+        let adoption = BridgeAdoption {
+            inner_conn,
+            bridge_stream: stream_id,
+            relay,
+            remote_peer,
+            role: match role {
+                BridgeRole::Initiator => CircuitRole::Initiator,
+                BridgeRole::Responder => CircuitRole::Responder,
+            },
+            pending_data: pending_data.into(),
+            unsent_prefix: concat(owed),
+            remote_write_closed,
+        };
+        match (circuits.adopt_bridge)(self.swarm.transport_mut(), adoption) {
+            Ok(conn_id) => {
+                self.io.promoted.insert(key, conn_id);
+                Ok(conn_id)
+            }
+            Err(error) => {
+                // A bridge the circuit did not take is dead to both sides.
+                if !matches!(error, AdoptError::UnknownConnection) {
+                    #[cfg(all(test, feature = "quic"))]
+                    self.io.bridge_reset_attempts.push(key);
+                    match (circuits.reset_bridge)(self.swarm.transport_mut(), inner_conn, stream_id)
+                    {
+                        Ok(()) | Err(_) => {}
+                    }
+                }
+                Err(match error {
+                    AdoptError::PeerAlreadyDirect => PromoteError::PeerAlreadyDirect,
+                    AdoptError::UnknownConnection => PromoteError::UnknownConnection,
+                    error => PromoteError::Failed(error.to_string()),
+                })
+            }
+        }
     }
 }

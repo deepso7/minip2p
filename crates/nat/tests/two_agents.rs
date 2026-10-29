@@ -54,7 +54,6 @@ struct World {
     relay_id: PeerId,
     now: u64,
     next_stream: u64,
-    next_conn: u64,
     relay_emulator: RelayEmulator,
     /// Roles of relay-facing streams, per side.
     streams: Vec<(Side, StreamId, EmuStream)>,
@@ -121,7 +120,6 @@ impl World {
             relay_id,
             now: 0,
             next_stream: 0,
-            next_conn: 0,
             relay_emulator: RelayEmulator::new(),
             streams: Vec::new(),
             bridge: None,
@@ -396,15 +394,16 @@ impl World {
                     self.blasts_from_b += 1;
                 }
             }
+            // The side's fake swarm adopted the bridge; its circuit's
+            // handshake completes at once.
             Out::PromoteBridge {
-                token, remote_peer, ..
+                remote_peer,
+                result,
+                ..
             } => {
-                self.next_conn += 1;
-                let conn_id = ConnectionId::new((1 << 63) | self.next_conn);
+                let conn_id = result.expect("the fake swarm adopts every bridge");
                 self.set_circuit_conn(side, conn_id);
-                let agent = self.agent(side);
-                agent.promote_result(token, Ok(conn_id), now);
-                agent.handle_event(
+                self.agent(side).handle_event(
                     &SwarmEvent::ConnectionEstablished {
                         peer_id: remote_peer,
                         conn_id,

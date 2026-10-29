@@ -18,7 +18,7 @@ use crate::housekeeping::Housekeeping;
 use crate::inbound::InboundCircuit;
 use crate::ledger::{Attribution, DialPurpose, Owner, PathLedger};
 use crate::swarm::{DialStart, HoldingSwarm, NatSwarm};
-use crate::types::{NatToken, PromoteError, ReachabilityState, ReservationInfo};
+use crate::types::{NatToken, ReachabilityState, ReservationInfo};
 
 /// Roles a stream owned by the agent can play. Streams not in the registry
 /// belong to the application (`Released` is modeled as removal).
@@ -40,17 +40,6 @@ pub(crate) enum StreamRole {
     /// Inbound NAT control stream this node does not serve. Kept owned until
     /// terminal close so its reset lifecycle cannot leak into the application.
     RejectedControl,
-}
-
-/// What a [`NatToken`] correlates: a parked dial, or a bridge promotion.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TokenPurpose {
-    /// A dial the host parked to resolve its named address.
-    Dial(DialPurpose),
-    /// Relay bridge promotion for an outbound connect attempt.
-    PromoteAttempt(ConnectId),
-    /// Relay bridge promotion for an inbound circuit.
-    PromoteInbound(u64),
 }
 
 /// A stream-scoped input extracted from a [`SwarmEvent`].
@@ -84,8 +73,9 @@ pub(crate) struct Shared {
     /// Streams the agent currently owns, by exact identity (stream ids are
     /// only unique per connection), with their peer and role.
     streams: BTreeMap<(ConnectionId, StreamId), (PeerId, StreamRole)>,
-    /// Parked dials and bridge promotions awaiting their host result.
-    pub(crate) tokens: BTreeMap<NatToken, TokenPurpose>,
+    /// Dials by token, until the swarm starts them or the host reports a
+    /// parked one's result.
+    pub(crate) tokens: BTreeMap<NatToken, DialPurpose>,
     next_token: u64,
     /// How each connection reached its peer, and why NAT dialed the ones
     /// still in flight.
@@ -121,7 +111,7 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    pub(crate) fn alloc_token(&mut self, purpose: TokenPurpose) -> NatToken {
+    pub(crate) fn alloc_token(&mut self, purpose: DialPurpose) -> NatToken {
         let token = NatToken(self.next_token);
         self.next_token += 1;
         self.tokens.insert(token, purpose);
@@ -158,7 +148,7 @@ impl Shared {
         purpose: DialPurpose,
         addr: &PeerAddr,
     ) -> Result<(NatToken, Option<ConnectionId>), String> {
-        let token = self.alloc_token(TokenPurpose::Dial(purpose.clone()));
+        let token = self.alloc_token(purpose.clone());
         match swarm.dial(addr, token) {
             Ok(DialStart::Started(conn_id)) => {
                 self.tokens.remove(&token);
@@ -213,12 +203,12 @@ impl Shared {
         swarm: &dyn NatSwarm,
     ) {
         let mut retired = BTreeSet::new();
-        self.tokens.retain(|token, purpose| match purpose {
-            TokenPurpose::Dial(dial) if dial.connect_id() == Some(id) => {
+        self.tokens.retain(|token, purpose| {
+            let ours = purpose.connect_id() == Some(id);
+            if ours {
                 retired.insert(*token);
-                false
             }
-            _ => true,
+            !ours
         });
         let (tokens, close) = self.ledger.abort_attempt_dials(id, target, swarm);
         retired.extend(tokens);
@@ -485,11 +475,11 @@ pub struct ConnectLegs {
 ///
 /// The swarm is passed into every call that may act on it, as any
 /// [`NatSwarm`]: the agent reads connection and readiness facts from it and
-/// issues stream, dial, and ping commands directly. Inputs arrive through
-/// [`handle_event`](Self::handle_event) (swarm events, by reference) and
-/// [`handle_tick`](Self::handle_tick) (time); the host reports the outcome
-/// of a parked dial through [`dial_result`](Self::dial_result) and of a
-/// bridge promotion through [`promote_result`](Self::promote_result). The
+/// issues stream, dial, ping, and bridge-promotion commands directly. Inputs
+/// arrive through [`handle_event`](Self::handle_event) (swarm events, by
+/// reference) and [`handle_tick`](Self::handle_tick) (time); the host
+/// reports the outcome of a parked dial through
+/// [`dial_result`](Self::dial_result). The
 /// remaining commands, which need more than the swarm, drain through
 /// [`poll_action`](Self::poll_action), and application events through
 /// [`poll_event`](Self::poll_event); drain both until `None` after every
@@ -1034,7 +1024,7 @@ impl NatAgent {
     /// that the dial is retired with no result delivered, so a late answer
     /// cannot land on a newer flight, and the host drops it.
     pub fn deferred_dial_wanted(&mut self, token: NatToken, now: Now) -> bool {
-        let Some(TokenPurpose::Dial(purpose)) = self.shared.tokens.get(&token) else {
+        let Some(purpose) = self.shared.tokens.get(&token) else {
             return false;
         };
         if matches!(purpose, DialPurpose::Punch(_)) {
@@ -1063,7 +1053,7 @@ impl NatAgent {
         result: Result<ConnectionId, String>,
         now: Now,
     ) {
-        let Some(TokenPurpose::Dial(purpose)) = self.shared.tokens.get(&token).cloned() else {
+        let Some(purpose) = self.shared.tokens.get(&token).cloned() else {
             return;
         };
         self.shared.tokens.remove(&token);
@@ -1129,64 +1119,9 @@ impl NatAgent {
         }
     }
 
-    /// Reports the result of a [`NatAction::PromoteBridge`] executed by the
-    /// driver.
-    pub fn promote_result<S: NatSwarm>(
-        &mut self,
-        swarm: &mut S,
-        token: NatToken,
-        result: Result<ConnectionId, PromoteError>,
-        now: Now,
-    ) {
-        // A promotion whose owner already ended (timed out, cancelled,
-        // settled) produced a circuit nobody holds: close it.
-        let orphaned = match self.shared.tokens.get(&token) {
-            Some(&TokenPurpose::PromoteAttempt(id)) => {
-                self.shared.tokens.remove(&token);
-                self.holding(swarm, |agent, swarm| match agent.attempts.get_mut(&id) {
-                    Some(attempt) => {
-                        attempt.on_promote_result(token, result, swarm, &mut agent.shared, now);
-                        None
-                    }
-                    None => result.ok(),
-                })
-            }
-            Some(&TokenPurpose::PromoteInbound(id)) => {
-                self.shared.tokens.remove(&token);
-                match self.inbound.get_mut(&id) {
-                    Some(circuit) => {
-                        circuit.on_promote_result(result, &mut self.shared, now);
-                        None
-                    }
-                    None => result.ok(),
-                }
-            }
-            Some(TokenPurpose::Dial(_)) | None => return,
-        };
-        if let Some(conn_id) = orphaned {
-            self.shared.push_action(NatAction::CloseCircuit { conn_id });
-        }
-        self.reap_done();
-    }
-
     /// Returns the next queued command for the driver.
     pub fn poll_action(&mut self) -> Option<NatAction> {
-        let mut action = self.shared.actions.pop_front()?;
-        if let NatAction::PromoteBridge {
-            inner_conn,
-            stream_id,
-            unsent_data,
-            ..
-        } = &mut action
-            && let Some(held) = self.held.take(*inner_conn, *stream_id)
-        {
-            *unsent_data = held
-                .tails
-                .iter()
-                .flat_map(|tail| tail.iter().copied())
-                .collect();
-        }
-        Some(action)
+        self.shared.actions.pop_front()
     }
 
     /// Returns the next application-visible event.

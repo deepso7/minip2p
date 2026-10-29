@@ -8,8 +8,8 @@
 use minip2p_core::platform::Now;
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
 use minip2p_nat::{
-    ConnectLegs, DialStart, NatAction, NatAgent, NatConfig, NatEvent, NatSwarm, NatSwarmError,
-    NatToken, Path, ReservationPolicy,
+    BridgeHandoff, ConnectLegs, DialStart, NatAgent, NatConfig, NatEvent, NatSwarm, NatSwarmError,
+    NatToken, Path, PromoteError, ReservationPolicy,
 };
 use minip2p_relay_server::{
     RelayServerAction, RelayServerAgent, RelayServerConfig, RelayServerEvent, StreamKey,
@@ -36,30 +36,40 @@ fn at(ms: u64) -> Now {
     Now::from_millis(ms)
 }
 
-fn drain_nat(agent: &mut NatAgent) -> Vec<NatAction> {
-    core::iter::from_fn(|| agent.poll_action()).collect()
-}
-
 /// One NAT client's view of its relay connection: every dial lands on
-/// `CLIENT_RELAY_CONN`, the next opened stream is `next_stream`, and writes
-/// are recorded for the test to carry to the relay server.
+/// `CLIENT_RELAY_CONN`, the next opened stream is `next_stream`, writes are
+/// recorded for the test to carry to the relay server, and a promoted
+/// bridge is adopted as `circuit`.
 struct ClientSwarm {
     relay: PeerId,
     connected: bool,
     protocols: Option<Vec<String>>,
     next_stream: StreamId,
     sent: Vec<Vec<u8>>,
+    circuit: ConnectionId,
+    promoted: Option<BridgeHandoff>,
 }
 
 impl ClientSwarm {
-    fn new(relay: &PeerId) -> Self {
+    fn new(relay: &PeerId, circuit: ConnectionId) -> Self {
         Self {
             relay: relay.clone(),
             connected: false,
             protocols: None,
             next_stream: StreamId::new(0),
             sent: Vec::new(),
+            circuit,
+            promoted: None,
         }
+    }
+
+    /// The circuit the NAT agent's one bridge promotion was adopted as.
+    fn promoted_circuit(&self) -> ConnectionId {
+        assert!(
+            self.promoted.is_some(),
+            "NAT agent promotes the bridged stream"
+        );
+        self.circuit
     }
 
     fn take_sent(&mut self) -> Vec<u8> {
@@ -130,16 +140,11 @@ impl NatSwarm for ClientSwarm {
     fn ping(&mut self, _peer: &PeerId, _now_ms: u64) -> Result<(), NatSwarmError> {
         Ok(())
     }
-}
 
-fn nat_promote(actions: &[NatAction]) -> minip2p_nat::NatToken {
-    actions
-        .iter()
-        .find_map(|action| match action {
-            NatAction::PromoteBridge { token, .. } => Some(*token),
-            _ => None,
-        })
-        .expect("NAT agent promotes the bridged stream")
+    fn promote_bridge(&mut self, handoff: BridgeHandoff) -> Result<ConnectionId, PromoteError> {
+        self.promoted = Some(handoff);
+        Ok(self.circuit)
+    }
 }
 
 /// The relay's next I/O action, skipping its read acknowledgements.
@@ -278,7 +283,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
             ..NatConfig::default()
         },
     );
-    let mut destination_swarm = ClientSwarm::new(&relay);
+    let mut destination_swarm = ClientSwarm::new(&relay, ConnectionId::new(202));
     let reserve_hop = StreamId::new(RESERVE_HOP);
     destination_swarm.next_stream = reserve_hop;
     destination_nat.handle_tick(&mut destination_swarm, at(0));
@@ -335,7 +340,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         },
     );
     let connect_id = ConnectId::from_u64(1);
-    let mut source_swarm = ClientSwarm::new(&relay);
+    let mut source_swarm = ClientSwarm::new(&relay, ConnectionId::new(201));
     let source_hop = StreamId::new(SOURCE_HOP);
     source_swarm.next_stream = source_hop;
     source_nat.connect(
@@ -406,7 +411,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         at(17),
     );
     let stop_response = destination_swarm.take_sent();
-    let destination_promote = nat_promote(&drain_nat(&mut destination_nat));
+    let destination_circuit = destination_swarm.promoted_circuit();
     server.handle_event(
         &SwarmEvent::StreamData {
             peer_id: destination.clone(),
@@ -429,8 +434,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         false,
         at(19),
     );
-    let source_actions = drain_nat(&mut source_nat);
-    let source_promote = nat_promote(&source_actions);
+    let source_circuit = source_swarm.promoted_circuit();
 
     finish_relay_stream_cleanup(&mut server, 19);
     let source_payload = b"payload from source".to_vec();
@@ -464,13 +468,6 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
     assert_eq!(forwarded_to_source.stream_id, source_hop);
     assert_eq!(data, destination_payload);
 
-    let source_circuit = ConnectionId::new(201);
-    source_nat.promote_result(
-        &mut source_swarm,
-        source_promote,
-        Ok(source_circuit),
-        at(20),
-    );
     source_nat.handle_event(
         &mut source_swarm,
         &SwarmEvent::ConnectionEstablished {
@@ -478,13 +475,6 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
             conn_id: source_circuit,
         },
         true,
-        at(20),
-    );
-    let destination_circuit = ConnectionId::new(202);
-    destination_nat.promote_result(
-        &mut destination_swarm,
-        destination_promote,
-        Ok(destination_circuit),
         at(20),
     );
     destination_nat.handle_event(

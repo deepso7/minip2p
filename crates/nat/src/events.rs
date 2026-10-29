@@ -2,37 +2,18 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::ConnectionId;
 
-use crate::types::{NatError, NatToken, Path, ReachabilityState, UpgradeStop};
-
-/// Local role used when promoting a relay bridge into a circuit connection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BridgeRole {
-    /// The local endpoint initiated the HOP CONNECT request.
-    Initiator,
-    /// The local endpoint accepted the STOP CONNECT request.
-    Responder,
-}
+use crate::types::{NatError, Path, ReachabilityState, UpgradeStop};
 
 /// Commands the agent asks its driver to execute beyond the swarm.
 ///
-/// Swarm commands (dials, stream opens, writes, resets, pings) are not
-/// actions: the agent issues them directly through the
+/// Swarm commands (dials, stream opens, writes, resets, pings) and bridge
+/// promotion are not actions: the agent issues them directly through the
 /// [`NatSwarm`](crate::NatSwarm) passed into each call. What remains needs the
-/// transport underneath the swarm (raw UDP, circuit adoption and closing).
-/// `PromoteBridge` reports its result back through
-/// [`NatAgent::promote_result`](crate::NatAgent::promote_result) with its
-/// token; the others are fire-and-forget.
+/// transport underneath the swarm (raw UDP, circuit closing) and is
+/// fire-and-forget.
 #[derive(Clone, Debug)]
-// Only 64-bit targets cross clippy's size threshold.
-#[cfg_attr(
-    target_pointer_width = "64",
-    expect(
-        clippy::large_enum_variant,
-        reason = "actions are drained one at a time, and PromoteBridge, the large one, is rare"
-    )
-)]
 pub enum NatAction {
     /// Send one datagram of `payload_len` random bytes to `target` to open
     /// our NAT mapping (responder-side hole punch). The wiring fills the
@@ -41,22 +22,6 @@ pub enum NatAction {
     SendRandomUdp {
         target: Multiaddr,
         payload_len: usize,
-    },
-    /// Relinquish a negotiated relay bridge to the circuit transport and
-    /// report the synchronous adoption result with `token`.
-    PromoteBridge {
-        token: NatToken,
-        inner_conn: minip2p_transport::ConnectionId,
-        relay: PeerId,
-        stream_id: StreamId,
-        remote_peer: PeerId,
-        role: BridgeRole,
-        pending_data: Vec<u8>,
-        /// Bytes NAT wrote on the bridge that the swarm refused as Full and
-        /// the agent still held (a STOP STATUS, say). The circuit sends
-        /// them before anything of its own.
-        unsent_data: Vec<u8>,
-        remote_write_closed: bool,
     },
     /// Close a promoted circuit connection, or a NAT dial's handshake that
     /// has not established, through the transport. Closing an already-gone
