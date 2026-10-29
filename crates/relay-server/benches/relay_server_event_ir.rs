@@ -1,4 +1,5 @@
-use minip2p_swarm::ConnectionCloseReason;
+use minip2p_swarm::{ConnectionCloseReason, DriverError};
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use gungraun::prelude::*;
@@ -10,27 +11,134 @@ use minip2p_relay::{
 };
 use minip2p_relay_server::{
     CircuitCloseReason, CircuitLeg, RateLimit, RelayServerAgent, RelayServerConfig,
-    RelayServerEvent, ReservationCloseReason, StreamKey,
+    RelayServerEvent, RelaySwarm, RelaySwarmError, ReservationCloseReason, StreamKey,
 };
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{Bytes, ConnectionId, StreamId};
 use std::hint::black_box;
 
-#[path = "../tests/common/mod.rs"]
-mod common;
-use common::{Call, FakeSwarm};
+/// Commands the agent issued since the last [`BenchSwarm::take_counts`].
+#[derive(Debug, Default, Eq, PartialEq)]
+struct Counts {
+    opens: usize,
+    sends: usize,
+    closes: usize,
+    resets: usize,
+}
+
+/// The swarm these benches drive: it takes every command and only counts
+/// them, so a measured operation costs what the agent does, not what the
+/// swarm does with it.
+///
+/// Not the tests' recording fake on purpose. That fake allocates a copy of
+/// every write into a log; dropping a 10k-peer setup's log left glibc's
+/// fastbins holding O(N) freed chunks, and the first measured operation to
+/// grow a buffer (the agent's event queue, say) paid to consolidate all of
+/// them, so counts grew with N although the agent's own work did not.
+#[derive(Default)]
+struct BenchSwarm {
+    connections: BTreeMap<PeerId, ConnectionId>,
+    remote_addrs: BTreeMap<ConnectionId, Multiaddr>,
+    /// The stream the next open returns.
+    next_open: Option<StreamKey>,
+    /// Streams that refuse every write as Full.
+    full: BTreeSet<StreamKey>,
+    counts: Counts,
+}
+
+impl BenchSwarm {
+    /// Mirrors a connection event, as a swarm does before delivering it.
+    fn apply(&mut self, event: &SwarmEvent) {
+        match event {
+            SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
+                self.connections.insert(peer_id.clone(), *conn_id);
+            }
+            SwarmEvent::ConnectionClosed {
+                peer_id, conn_id, ..
+            } => {
+                self.connections.remove(peer_id);
+                self.remote_addrs.remove(conn_id);
+            }
+            _ => {}
+        }
+    }
+
+    fn take_counts(&mut self) -> Counts {
+        core::mem::take(&mut self.counts)
+    }
+}
+
+impl RelaySwarm for BenchSwarm {
+    fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        self.remote_addrs.get(&conn_id)
+    }
+
+    fn open_stream(
+        &mut self,
+        peer: &PeerId,
+        _protocol_id: &str,
+        _now_ms: u64,
+    ) -> Result<StreamKey, RelaySwarmError> {
+        self.counts.opens += 1;
+        let conn_id = *self.connections.get(peer).expect("connected destination");
+        Ok(self.next_open.take().unwrap_or(StreamKey {
+            conn_id,
+            stream_id: StreamId::new(STOP_STREAM),
+        }))
+    }
+
+    fn send_stream(
+        &mut self,
+        _peer: &PeerId,
+        stream: StreamKey,
+        data: Bytes,
+        _now_ms: u64,
+    ) -> Result<(), RelaySwarmError> {
+        self.counts.sends += 1;
+        if self.full.contains(&stream) {
+            return Err(RelaySwarmError(DriverError::Full {
+                conn_id: stream.conn_id,
+                stream_id: stream.stream_id,
+                unsent: data,
+            }));
+        }
+        Ok(())
+    }
+
+    fn ack_stream(&mut self, _stream: StreamKey, _bytes: usize) {}
+
+    fn close_stream_write(
+        &mut self,
+        _peer: &PeerId,
+        _stream: StreamKey,
+        _now_ms: u64,
+    ) -> Result<(), RelaySwarmError> {
+        self.counts.closes += 1;
+        Ok(())
+    }
+
+    fn reset_stream(
+        &mut self,
+        _peer: &PeerId,
+        _stream: StreamKey,
+        _now_ms: u64,
+    ) -> Result<(), RelaySwarmError> {
+        self.counts.resets += 1;
+        Ok(())
+    }
+}
 
 const PEERS: u64 = 128;
 const EVENTS_PER_BATCH: usize = 100;
 
-fn populated_agent() -> (RelayServerAgent, FakeSwarm, SwarmEvent, Now) {
+fn populated_agent() -> (RelayServerAgent, BenchSwarm, SwarmEvent, Now) {
     let now = Now::from_millis(1);
     let mut agent = RelayServerAgent::new(
         PeerId::from_public_key_protobuf(b"relay-server-bench-local"),
         RelayServerConfig::default(),
     )
     .expect("valid config");
-    let mut swarm = FakeSwarm::default();
+    let mut swarm = BenchSwarm::default();
     for index in 0..PEERS {
         let peer = PeerId::from_public_key_protobuf(&index.to_le_bytes());
         let conn_id = ConnectionId::new(index + 1);
@@ -67,8 +175,8 @@ fn populated_agent() -> (RelayServerAgent, FakeSwarm, SwarmEvent, Now) {
 #[library_benchmark]
 #[bench::relay_handle_event_same_now_128_pending_hops(populated_agent())]
 fn relay_event(
-    input: (RelayServerAgent, FakeSwarm, SwarmEvent, Now),
-) -> (RelayServerAgent, FakeSwarm, SwarmEvent) {
+    input: (RelayServerAgent, BenchSwarm, SwarmEvent, Now),
+) -> (RelayServerAgent, BenchSwarm, SwarmEvent) {
     let (mut agent, mut swarm, event, now) = input;
     for _ in 0..EVENTS_PER_BATCH {
         black_box(agent.handle_event(&mut swarm, black_box(&event), false, black_box(now)));
@@ -88,10 +196,10 @@ fn relay_event(
 // runs at each size: an instruction count that stays flat across sizes shows
 // the operation does not scan the population.
 //
-// The agent runs its swarm commands inline, on the test suite's fake swarm,
-// so the measured regions include the writes, acknowledgements, and resets
-// an operation issues (and the fake's logging of them). Counts from before
-// that change, when commands were queued for the host, are not comparable.
+// The agent runs its swarm commands inline, on `BenchSwarm`, so the measured
+// regions include issuing the writes, acknowledgements, and resets an
+// operation needs. Counts from before that change, when commands were queued
+// for the host, are not comparable.
 
 const CIRCUITS_PER_SOURCE: u64 = 100;
 const EXPIRING: u64 = 100;
@@ -105,7 +213,7 @@ const STOP_STREAM: u64 = 2;
 /// A populated agent, the fake swarm it drives, and its population size N.
 struct Scale {
     agent: RelayServerAgent,
-    swarm: FakeSwarm,
+    swarm: BenchSwarm,
     size: u64,
 }
 
@@ -305,7 +413,7 @@ fn scale_agent(size: u64) -> Scale {
         .expect("valid announce address");
     let mut scale = Scale {
         agent,
-        swarm: FakeSwarm::default(),
+        swarm: BenchSwarm::default(),
         size,
     };
     for index in 0..size {
@@ -330,7 +438,7 @@ fn scale_agent(size: u64) -> Scale {
     assert_eq!(scale.agent.reservation_count(), size as usize);
     assert_eq!(scale.agent.circuit_count(), size as usize);
     assert!(scale.agent.poll_event().is_none());
-    scale.swarm.take_calls();
+    scale.swarm.take_counts();
     scale
 }
 
@@ -406,7 +514,7 @@ fn with_held_tails(size: u64) -> (Scale, SwarmEvent) {
     for source in 0..sources(size) {
         for slot in 0..CIRCUITS_PER_SOURCE {
             let index = source * CIRCUITS_PER_SOURCE + slot;
-            scale.swarm.credit.insert(stop_stream(index), 0);
+            scale.swarm.full.insert(stop_stream(index));
             let data = stream_data(
                 &peer("source", source),
                 source_stream(size, source, slot),
@@ -415,7 +523,7 @@ fn with_held_tails(size: u64) -> (Scale, SwarmEvent) {
             assert!(scale.handle(&data, NOW));
         }
     }
-    scale.swarm.take_calls();
+    scale.swarm.take_counts();
     let stream = source_stream(size, 0, 0);
     let reset = SwarmEvent::StreamClosed {
         peer_id: peer("source", 0),
@@ -430,7 +538,7 @@ fn assert_unchanged(mut scale: Scale) {
     assert_eq!(scale.agent.reservation_count(), scale.size as usize);
     assert_eq!(scale.agent.circuit_count(), scale.size as usize);
     assert!(scale.agent.poll_event().is_none());
-    assert!(scale.swarm.take_calls().is_empty());
+    assert_eq!(scale.swarm.take_counts(), Counts::default());
 }
 
 fn assert_batch_expired(
@@ -474,20 +582,15 @@ fn assert_connect_admitted((mut scale, _): (Scale, SwarmEvent)) {
         scale.agent.poll_event().is_none(),
         "CONNECT must not be denied"
     );
-    assert!(scale.swarm.take_calls().iter().any(|call| matches!(
-        call,
-        Call::Open {
-            opened: Some(_),
-            ..
-        }
-    )));
+    assert_eq!(scale.swarm.take_counts().opens, 1);
     assert_eq!(scale.agent.circuit_count(), scale.size as usize + 1);
 }
 
 fn assert_hop_admitted((mut scale, _): (Scale, SwarmEvent)) {
     // A refused stream would be reset.
-    assert!(
-        scale.swarm.take_calls().is_empty(),
+    assert_eq!(
+        scale.swarm.take_counts(),
+        Counts::default(),
         "the HOP stream must be admitted"
     );
     assert!(
@@ -530,18 +633,13 @@ fn assert_circuits_closed(
     }
     assert_eq!(circuits, closed);
     assert_eq!(reservations, u64::from(reservation_closed));
-    let mut resets = 0;
-    for call in scale.swarm.take_calls() {
-        if matches!(call, Call::Reset { .. }) {
-            resets += 1;
-        } else {
-            assert!(
-                matches!(call, Call::Ack { .. }),
-                "unexpected command {call:?}"
-            );
+    assert_eq!(
+        scale.swarm.take_counts(),
+        Counts {
+            resets: closed as usize,
+            ..Counts::default()
         }
-    }
-    assert_eq!(resets, closed);
+    );
 }
 
 fn assert_source_torn_down((mut scale, _): (Scale, SwarmEvent)) {
