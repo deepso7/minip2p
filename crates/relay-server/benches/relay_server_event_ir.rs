@@ -196,10 +196,13 @@ fn relay_event(
 // runs at each size: an instruction count that stays flat across sizes shows
 // the operation does not scan the population.
 //
-// The agent runs its swarm commands inline, on `BenchSwarm`, so the measured
-// regions include issuing the writes, acknowledgements, and resets an
-// operation needs. Counts from before that change, when commands were queued
-// for the host, are not comparable.
+// The measured region is the agent alone. A real swarm updates its own state
+// before it delivers an event, so each setup applies the measured event to
+// `BenchSwarm` and the fake's bookkeeping stays out of the count. The agent
+// runs its swarm commands inline, on `BenchSwarm`, so the measured regions
+// include issuing the writes, acknowledgements, and resets an operation
+// needs. Counts from before that change, when commands were queued for the
+// host, are not comparable.
 
 const CIRCUITS_PER_SOURCE: u64 = 100;
 const EXPIRING: u64 = 100;
@@ -218,6 +221,7 @@ struct Scale {
 }
 
 impl Scale {
+    /// Delivers `event` as a swarm does: its own state first, then the agent.
     fn handle(&mut self, event: &SwarmEvent, now: Now) -> bool {
         self.swarm.apply(event);
         self.agent.handle_event(&mut self.swarm, event, false, now)
@@ -498,7 +502,9 @@ fn with_closed_source(size: u64) -> (Scale, SwarmEvent) {
         conn_id: source_conn(size, 0),
         reason: ConnectionCloseReason::Local,
     };
-    (scale_agent(size), closed)
+    let mut scale = scale_agent(size);
+    scale.swarm.apply(&closed);
+    (scale, closed)
 }
 
 /// Returns the close of the last reserved peer's connection, which carries
@@ -509,7 +515,9 @@ fn with_closed_destination(size: u64) -> (Scale, SwarmEvent) {
         conn_id: reserved_conn(size - 1),
         reason: ConnectionCloseReason::Local,
     };
-    (scale_agent(size), closed)
+    let mut scale = scale_agent(size);
+    scale.swarm.apply(&closed);
+    (scale, closed)
 }
 
 /// Leaves every circuit's destination full, holding a forwarded byte as an
@@ -726,9 +734,14 @@ fn relay_tick_expire_100(mut scale: Scale) -> Scale {
     scale
 }
 
-/// Feeds one prepared event to the populated agent.
+/// Feeds one prepared event to the populated agent. Setup has already
+/// applied it to the swarm, so only the agent is measured.
 fn feed((mut scale, event): (Scale, SwarmEvent)) -> (Scale, SwarmEvent) {
-    black_box(scale.handle(black_box(&event), black_box(NOW)));
+    black_box(
+        scale
+            .agent
+            .handle_event(&mut scale.swarm, black_box(&event), false, black_box(NOW)),
+    );
     (scale, event)
 }
 
