@@ -2,7 +2,7 @@
 
 The Bench workflow runs on one dedicated EC2 instance, `minip2p-bench` (`m8a.xlarge`: 4 physical cores without SMT, 16 GiB, in `ap-south-1`). The instance is a persistent self-hosted GitHub Actions runner with the labels `self-hosted,linux,x64,minip2p-bench`, and it stays stopped between runs. For each run, a hosted `start-runner` job assumes the CI role through OIDC, sets a lease tag and starts the instance with `scripts/start-bench-runner.sh`. The `bench` job then runs on the instance: `scripts/run-bench-container.sh` builds the image from `infra/bench/Dockerfile` with the local BuildKit cache and runs the suite in one container. The result is uploaded as the `bench-results` artifact, and an on-instance watchdog stops the instance once it is idle. The design and its trade-offs are in [ADR 0025](../../docs/adr/0025-benchmarks-on-an-on-demand-ec2-runner.md) and [the plan](../../docs/plans/self-hosted-bench-runner.md).
 
-Published stable releases produce the baseline stored on `bench-data`. Pull requests from this repository run the same job and compare their head commit with that release when a baseline is available. Fork pull requests skip the bench job and comparison. Manual runs measure the default branch and produce artifacts, but never change the release baseline.
+Published stable releases produce the baseline stored on `bench-data`. Pull requests from this repository run the same job and compare their head commit with that release when a baseline is available. Only pull requests that touch what the image builds or runs, or the bench pipeline, start a run (the `paths` filter in `bench.yml`); closing a pull request cancels its run if it is still waiting for approval. Fork pull requests skip the bench job and comparison. Manual runs measure the default branch, or `ref`, and produce artifacts; they change the release baseline only with `baseline` set (see [Re-recording a release baseline](#re-recording-a-release-baseline)).
 
 ## Resources
 
@@ -91,6 +91,23 @@ The lease cannot fully close the race with a watchdog that read the old lease ju
 ## Keepalive
 
 GitHub removes a self-hosted runner that has not connected for 14 days. A weekly `schedule` run therefore starts the instance through `aws-bench-unattended`, runs a no-op `keepalive` job on it, and lets the watchdog stop it again. GitHub can drop scheduled runs, and it disables schedules on public repositories after 60 days without activity. If the runner shows offline in the repository settings and bench jobs stay queued, run `bootstrap.sh --replace`.
+
+## Re-recording a release baseline
+
+A stable release's own `release` run writes its baseline. If that run failed, or the baseline must be measured again (for example after a [baseline reset](#baseline-resets)), dispatch Bench from `main` with `ref` set to the release tag and `baseline` checked. `start-runner` first checks that the tag is a published stable release. The run measures the tag with `main`'s workflow, Dockerfile and helper scripts, like any dispatched `ref`, and on success the `baseline` job writes `<sha>.json` for the tag's commit. It moves the `latest` and `latest-release` pointers only when the tag is the latest release, as a `release` run does. The tag must carry `bench/targets`, which the image build reads from the measured code.
+
+## Updating the on-instance scripts
+
+Cloud-init installs `runner-hooks/job-started.sh` and `watchdog.sh` only on the instance's first boot. To deploy a change to either without a new instance, start the instance with SSH allowed, as in [Running by hand on the instance](#running-by-hand-on-the-instance), and from the repository root:
+
+```bash
+scp -i ~/.ssh/minip2p-bench.pem infra/bench/watchdog.sh infra/bench/runner-hooks/job-started.sh ubuntu@<public IP>:
+ssh -i ~/.ssh/minip2p-bench.pem ubuntu@<public IP> \
+  'sudo install -m 0755 watchdog.sh /usr/local/sbin/minip2p-bench-watchdog && sudo install -m 0755 job-started.sh /opt/minip2p-bench/job-started.sh'
+infra/bench/bootstrap.sh --no-ssh
+```
+
+The timer runs the new watchdog from its next tick, and the next job runs the new hook. `bootstrap.sh --replace` also installs both, at the cost of a cold build cache.
 
 ## Re-running
 
