@@ -20,7 +20,7 @@ std = ["dep:mio", "minip2p-core/std", "thiserror/std"]
 bench = ["std"]
 
 [dependencies]
-minip2p-core = { path = "../core", version = "0.11.0", default-features = false }
+minip2p-core = { path = "../core", version = "0.11.1", default-features = false }
 thiserror = { workspace = true }
 # The shared readiness poll std hosts block on (ADR 0013).
 mio = { workspace = true, optional = true }
