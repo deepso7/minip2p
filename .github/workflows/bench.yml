@@ -5,6 +5,25 @@ on:
     types: [published]
   pull_request_target:
     branches: [main]
+    # `closed` runs no job: it only joins the PR's concurrency group, which
+    # cancels a run still waiting for `aws-bench` approval.
+    types: [opened, synchronize, reopened, closed]
+    # What the image builds or runs, and the bench pipeline itself.
+    paths:
+      - "crates/**"
+      - "transports/**"
+      - "bindings/**"
+      - "bench/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "rust-toolchain*"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "infra/bench/**"
+      - "scripts/*bench*"
+      - ".github/workflows/bench*.yml"
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
@@ -36,7 +55,7 @@ jobs:
   # `aws-bench-unattended`.
   start-runner:
     if: >-
-      (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'schedule'
+      github.event.action != 'closed' && ((github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'schedule')
     runs-on: ubuntu-latest
     environment: ${{ (github.event_name == 'release' || github.event_name == 'schedule') && 'aws-bench-unattended' || 'aws-bench' }}
     timeout-minutes: 15
