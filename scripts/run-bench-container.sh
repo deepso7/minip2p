@@ -70,7 +70,11 @@ reject() {
 
 # Bash defers traps while a foreground command runs, so each long wait is a
 # background job joined with `wait`, which a trapped signal interrupts.
-docker build -f infra/bench/Dockerfile --build-arg BUILD_JOBS=4 -t "$name" "${BENCH_CONTEXT:-.}" &
+# The image never leaves this host, so skip the provenance attestation and
+# layer compression; together they were most of the export (87 s -> 9 s).
+docker build -f infra/bench/Dockerfile --build-arg BUILD_JOBS=4 \
+  --provenance=false --output "type=docker,name=$name,compression=uncompressed" \
+  "${BENCH_CONTEXT:-.}" &
 build_pid=$!
 wait "$build_pid"
 build_pid=
