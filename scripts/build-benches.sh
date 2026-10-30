@@ -10,24 +10,23 @@ set -euo pipefail
 mode=${1:-build}
 cd "$(dirname "$0")/.."
 
-# "<package> <features>" -> its bench targets, in first-seen order.
-declare -A benches=()
-order=()
-while read -r pass package features bench _; do
-  [[ -z "$pass" || "$pass" == \#* ]] && continue
-  key="$package $features"
-  [[ -v "benches[$key]" ]] || order+=("$key")
-  benches[$key]+=" --bench $bench"
-done < bench/targets
+# One "<package> <features> --bench <target>..." line per package and feature
+# set, in first-seen order. awk rather than an associative array keeps this
+# working on macOS's Bash 3.2. The groups are read on fd 3 so cargo can never
+# consume them from stdin.
+groups=$(awk '$1 !~ /^#/ && NF {
+  key = $2 " " $3
+  if (!(key in benches)) order[++n] = key
+  benches[key] = benches[key] " --bench " $4
+} END { for (i = 1; i <= n; i++) print order[i] benches[order[i]] }' bench/targets)
 
-for key in "${order[@]}"; do
-  read -r package features <<< "$key"
+while read -r -u 3 package features targets; do
   args=(--package "$package")
   [[ "$features" == - ]] || args+=(--features "$features")
   case $mode in
     build)
       # shellcheck disable=SC2086 # word-split the --bench flags
-      cargo bench "${args[@]}" ${benches[$key]} --no-run
+      cargo bench "${args[@]}" $targets --no-run
       ;;
     cook)
       cargo chef cook --release "${args[@]}" --benches --recipe-path recipe.json
@@ -37,4 +36,4 @@ for key in "${order[@]}"; do
       exit 2
       ;;
   esac
-done
+done 3<<< "$groups"
