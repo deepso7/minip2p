@@ -80,6 +80,12 @@ class BenchResultsTest(unittest.TestCase):
         self.assertEqual(self.compare_one("Ir", 100, 103, reason).reason, reason)
         self.assertEqual(self.compare_one("allocs_per_msg", 100, 103, reason).classification, "notable")
 
+    def test_new_ir_row_stays_unmatched_when_pins_differ(self):
+        current = {"schema_version": 1, "git_sha": "sha", "rows": [{"tier": "rust-micro", "name": "new", "metric": "Ir", "value": 1}]}
+        baseline = {"schema_version": 1, "git_sha": "sha", "rows": []}
+        row = bench_results.compare_rows(current, baseline, "incompatible Ir pins: Cargo.lock differs")[0]
+        self.assertEqual(row.reason, "missing baseline row")
+
     def test_no_baseline(self):
         rows = bench_results.compare_rows(self.current, None, None)
         self.assertTrue(all(row.classification == "unclassified" for row in rows))

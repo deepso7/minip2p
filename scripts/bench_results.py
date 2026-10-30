@@ -421,10 +421,10 @@ def compare_rows(
     for row in current["rows"]:
         key = (row["tier"], row["name"], row["metric"])
         reason = "no baseline" if baseline is None else None
-        if reason is None and row["metric"] == "Ir" and ir_reason:
-            reason = ir_reason
         if reason is None and key not in old:
             reason = "missing baseline row"
+        if reason is None and row["metric"] == "Ir" and ir_reason:
+            reason = ir_reason
         baseline_value = old.get(key)
         if reason is not None:
             compared.append(ComparedRow(*key, baseline_value, row["value"], None, "unclassified", "", reason))
