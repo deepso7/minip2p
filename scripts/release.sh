@@ -329,8 +329,8 @@ wait_for_run "$publish_run_id" "publish workflow"
 echo "release: verifying relay-server assets"
 release_assets="$(gh release view "$tag" --json assets)"
 expected_relay_assets=(
-  "minip2p-relay-server-v$version-x86_64-unknown-linux-gnu.tar.gz"
-  "minip2p-relay-server-v$version-aarch64-unknown-linux-gnu.tar.gz"
+  "minip2p-relay-server-v$version-x86_64-unknown-linux-musl.tar.gz"
+  "minip2p-relay-server-v$version-aarch64-unknown-linux-musl.tar.gz"
   SHA256SUMS
 )
 for asset in "${expected_relay_assets[@]}"; do

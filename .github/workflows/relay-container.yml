@@ -45,7 +45,7 @@ jobs:
           esac
 
           assets="$(gh release view "v$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --json assets)"
-          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             asset="minip2p-relay-server-v$RELEASE_VERSION-$target.tar.gz"
             jq -e --arg asset "$asset" \
               'any(.assets[]; .name == $asset and .size > 0)' \
@@ -77,6 +77,35 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+
+      # Run each architecture's image from the downloaded release binaries
+      # before pushing; arm64 runs under QEMU. The publish build below reuses
+      # these layers from the builder cache.
+      - name: Build amd64 image for verification
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: infra/relay/Dockerfile
+          platforms: linux/amd64
+          load: true
+          build-args: MINIP2P_VERSION=${{ inputs.version }}
+          tags: minip2p-relay:verify-amd64
+      - name: Build arm64 image for verification
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: infra/relay/Dockerfile
+          platforms: linux/arm64
+          load: true
+          build-args: MINIP2P_VERSION=${{ inputs.version }}
+          tags: minip2p-relay:verify-arm64
+      - name: Verify images start
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/check-relay-image.sh minip2p-relay:verify-amd64 "$RELEASE_VERSION" linux/amd64
+          scripts/check-relay-image.sh minip2p-relay:verify-arm64 "$RELEASE_VERSION" linux/arm64
 
       - name: Build and publish image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0

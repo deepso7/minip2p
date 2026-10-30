@@ -55,8 +55,14 @@ jobs:
       - run: cargo check --manifest-path docs/snippets/quickstart/Cargo.toml
       - run: cargo check --manifest-path docs/snippets/custom-stream/Cargo.toml
 
+  # Both release architectures, each on a native runner: builds the release
+  # binary the way publish.yml does and runs it in the real relay image.
   relay-container:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: scripts/test-relay-container.sh

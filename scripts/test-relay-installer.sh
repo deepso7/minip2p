@@ -6,7 +6,7 @@ test_root="$(mktemp -d "${TMPDIR:-/tmp}/minip2p-relay-installer.XXXXXX")"
 trap 'rm -rf "$test_root"' EXIT
 
 version="9.8.7"
-target="x86_64-unknown-linux-gnu"
+target="x86_64-unknown-linux-musl"
 archive="minip2p-relay-server-v$version-$target"
 mkdir -p "$test_root/release/$archive" "$test_root/bin" "$test_root/install"
 
@@ -17,7 +17,7 @@ EOF
 chmod 0755 "$test_root/release/$archive/minip2p-relay"
 tar -C "$test_root/release" -czf "$test_root/release/$archive.tar.gz" "$archive"
 
-arm_target="aarch64-unknown-linux-gnu"
+arm_target="aarch64-unknown-linux-musl"
 arm_archive="minip2p-relay-server-v$version-$arm_target"
 mkdir "$test_root/release/$arm_archive"
 cp "$test_root/release/$archive/minip2p-relay" \
