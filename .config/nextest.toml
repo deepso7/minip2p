@@ -90,3 +90,26 @@ filter = '''
   or test(=std::nat_tests::relay_close_reports_the_reservations_it_ends)
 '''
 threads-required = "num-test-threads"
+
+# Start the longest tests first. Nextest otherwise schedules them in name order,
+# so the ~13s QUIC churn reader started near the end and finished last in every
+# QUIC feature variant, and the ~24s reconnect-churn soak (default profile only;
+# the `variants` filter drops it) did the same to the workspace run; the ~12s
+# relayed bulk transfer was next in line. Kept apart from the box-taking entry
+# above: those must not be pulled forward.
+[[profile.default.overrides]]
+filter = '''
+  (
+    binary_id(minip2p-rs::unsettled_churn)
+    and test(=a_reader_holding_bytes_across_quic_churn_stays_bounded)
+  )
+  or (
+    binary_id(minip2p-rs::reconnect_churn)
+    and test(=listener_reclaims_state_after_dialer_drop_without_disconnect)
+  )
+  or (
+    binary_id(minip2p-rs::relay_server)
+    and test(=bulk::a_bulk_transfer_to_a_slow_reader_over_a_relayed_circuit_completes)
+  )
+'''
+priority = 100

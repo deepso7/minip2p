@@ -1,15 +1,21 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS download
+# The download stage runs on the build platform (no QEMU for apt or curl) and
+# picks the prebuilt binary for TARGETARCH; only the runtime stage is per-arch.
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS download
+
+# Kept above the version ARGs so a release bump reuses this layer.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir /data
 
 ARG MINIP2P_VERSION
 ARG MINIP2P_RELEASE_BASE_URL
 ARG TARGETARCH
 
 RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl; \
-    rm -rf /var/lib/apt/lists/*; \
     case "$TARGETARCH" in \
       amd64) target="x86_64-unknown-linux-gnu" ;; \
       arm64) target="aarch64-unknown-linux-gnu" ;; \
@@ -36,7 +42,9 @@ LABEL org.opencontainers.image.title="minip2p relay server" \
       org.opencontainers.image.version="$MINIP2P_VERSION" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
-RUN mkdir /data && chown 10001:10001 /data
+# COPY rather than RUN mkdir, so building the runtime stage executes nothing on
+# the target arch.
+COPY --from=download --chown=10001:10001 /data /data
 
 USER 10001:10001
 WORKDIR /data
