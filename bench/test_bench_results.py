@@ -340,7 +340,7 @@ class BenchResultsTest(unittest.TestCase):
         rows = bench_results.compare_rows(self.current, self.baseline, None)
         markdown = bench_results.render(self.baseline, rows, "v0.4.11", "a" * 40, "https://run", "v0.4.12")
         self.assertIn(f"- Head: `{'a' * 12}` ([run](https://run))", markdown)
-        self.assertIn("the latest release rather than the PR base", markdown)
+        self.assertIn("the newest release with a stored baseline rather than the PR base", markdown)
         self.assertIn("baseline is stale: the latest release is `v0.4.12`", markdown)
         current = bench_results.render(self.baseline, rows, "v0.4.12", "a" * 40, None, "v0.4.12")
         self.assertNotIn("stale", current)

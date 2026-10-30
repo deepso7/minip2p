@@ -503,7 +503,7 @@ def render(
     else:
         sha = baseline["git_sha"][:12]
         name = sha if baseline_label is None else f"{baseline_label} ({sha})"
-        lines.append(f"- Baseline: {markdown_code(name)}, the latest release rather than the PR base, so changes already on `main` show up too.")
+        lines.append(f"- Baseline: {markdown_code(name)}, the newest release with a stored baseline rather than the PR base, so changes already on `main` show up too.")
         if latest_release and baseline_label and latest_release != baseline_label:
             lines += ["", f"> [!WARNING]\n> The baseline is stale: the latest release is {markdown_code(latest_release)}, which has no stored baseline."]
     classifications = ("noise", "changed", "notable", "informational", "unclassified")
