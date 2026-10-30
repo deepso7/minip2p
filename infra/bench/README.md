@@ -2,7 +2,7 @@
 
 The Bench workflow runs on one dedicated EC2 instance, `minip2p-bench` (`m8a.xlarge`: 4 physical cores without SMT, 16 GiB, in `ap-south-1`). The instance is a persistent self-hosted GitHub Actions runner with the labels `self-hosted,linux,x64,minip2p-bench`, and it stays stopped between runs. For each run, a hosted `start-runner` job assumes the CI role through OIDC, sets a lease tag and starts the instance with `scripts/start-bench-runner.sh`. The `bench` job then runs on the instance: `scripts/run-bench-container.sh` builds the image from `infra/bench/Dockerfile` with the local BuildKit cache and runs the suite in one container. The result is uploaded as the `bench-results` artifact, and an on-instance watchdog stops the instance once it is idle. The design and its trade-offs are in [ADR 0025](../../docs/adr/0025-benchmarks-on-an-on-demand-ec2-runner.md) and [the plan](../../docs/plans/self-hosted-bench-runner.md).
 
-Published stable releases produce the baseline stored on `bench-data`. Pull requests from this repository run the same job and compare their head commit with that release when a baseline is available. Only pull requests that touch what the image builds or runs, or the bench pipeline, start a run (the `paths` filter in `bench.yml`); closing a pull request cancels its run if it is still waiting for approval. Fork pull requests skip the bench job and comparison. Manual runs measure the default branch, or `ref`, and produce artifacts; they change the release baseline only with `baseline` set (see [Re-recording a release baseline](#re-recording-a-release-baseline)).
+Published stable releases produce the baseline stored on `bench-data`. A pull request from this repository is measured when a writer adds the `bench` label, typically once before merging: the run removes the label, compares the PR head with that release when a baseline is available, and adding the label again re-measures (after a fix, say). Pushes alone never start a run. Fork pull requests skip the bench job and comparison. Manual runs measure the default branch, or `ref`, and produce artifacts; they change the release baseline only with `baseline` set (see [Re-recording a release baseline](#re-recording-a-release-baseline)).
 
 ## Resources
 
@@ -34,8 +34,9 @@ The rendered user data holds a live registration token, so bootstrap never print
 
 ## GitHub configuration
 
-- **Environment `aws-bench`**, with required reviewers, for pull requests and manual runs. Variables: `AWS_BENCH_ROLE_ARN`, `AWS_BENCH_INSTANCE_ID`, and optionally `AWS_BENCH_REGION` (default `ap-south-1`).
-- **Environment `aws-bench-unattended`**, with **no** required reviewers and deployments restricted to the `main` branch and `v*` tags. Same variables. Published releases and the weekly schedule use it, so neither waits for approval: both run only trusted code, a release tag or `main`, which the job-start hook also enforces on the instance.
+- **Environment `aws-bench`**, with required reviewers, for manual runs. Variables: `AWS_BENCH_ROLE_ARN`, `AWS_BENCH_INSTANCE_ID`, and optionally `AWS_BENCH_REGION` (default `ap-south-1`).
+- **Environment `aws-bench-unattended`**, with **no** required reviewers and deployments restricted to the `main` branch and `v*` tags. Same variables. Published releases, the weekly schedule, and labelled pull requests use it, so none waits for approval. Releases and the schedule run only trusted code, a release tag or `main`. A labelled PR's workflow, scripts and Dockerfile still come from `main` (its ref under `pull_request_target`), which the job-start hook also enforces on the instance; only its build context is the PR head, and `start-runner` admits the label only when the person who added it has write access.
+- **Label `bench`** on the repository, which starts a PR's run.
 - **Actions setting** "Require approval for all external contributors", so no fork pull request's workflow runs without a maintainer's approval.
 
 The OIDC role `minip2p-github-bench` is created once by hand with a maximum session duration of at least one hour. `bootstrap.sh` then rewrites its trust to exactly this:
@@ -68,7 +69,7 @@ No AWS access keys are stored in GitHub, and the instance holds no credentials.
 
 ## Trust boundary
 
-Repository writers are trusted: they can already push to `main`, publish releases, and change workflows. The `aws-bench` approval guards against accidental runs. The design defends against everyone without write access, in two layers:
+Repository writers are trusted: they can already push to `main`, publish releases, and change workflows. The `bench` label and the `aws-bench` approval guard against accidental runs. The design defends against everyone without write access, in two layers:
 
 - **On GitHub:** the external-contributor approval setting holds fork pull requests' runs, and the workflow's same-repository guard keeps fork pull requests out of `bench.yml`.
 - **On the instance:** the job-start hook runs before any workflow-controlled step, container-action build, or job container. It admits a job only if it comes from `deepso7/minip2p` and is `bench.yml` from `refs/heads/main` (for `pull_request_target`, `workflow_dispatch`, and `schedule`) or from a `refs/tags/v*` tag (for `release`). To refuse a job, it walks its parent processes to `Runner.Worker` and kills it with `SIGKILL`. A non-zero exit would not be enough: the runner records the failure but still evaluates later steps, so a hostile `if: always()` step would run as `runner`, which is in `docker` and therefore root on the instance. A fork's workflow aimed at the `minip2p-bench` label runs under `pull_request` with a `refs/pull/N/merge` ref, so it is killed even if it is approved.
@@ -111,7 +112,7 @@ The timer runs the new watchdog from its next tick, and the next job runs the ne
 
 ## Re-running
 
-Re-run a failed Bench run with **Re-run all jobs**. Re-running only the failed jobs, or only `bench`, keeps the earlier `start-runner` result. It neither starts a stopped instance nor asks for approval again, so the job can sit queued.
+Re-measure a pull request by adding the `bench` label again. Re-run a failed run with **Re-run all jobs**. Re-running only the failed jobs, or only `bench`, keeps the earlier `start-runner` result. It neither starts a stopped instance nor asks for approval again, so the job can sit queued.
 
 ## Measurement notes
 

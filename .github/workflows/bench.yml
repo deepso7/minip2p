@@ -3,27 +3,12 @@ name: Bench
 on:
   release:
     types: [published]
+  # A writer adds the `bench` label to measure a PR's head, typically once
+  # before merging; the run removes the label, so adding it again re-measures
+  # (after a fix, say). Pushes alone never start a run.
   pull_request_target:
     branches: [main]
-    # `closed` runs no job: it only joins the PR's concurrency group, which
-    # cancels a run still waiting for `aws-bench` approval.
-    types: [opened, synchronize, reopened, closed]
-    # What the image builds or runs, and the bench pipeline itself.
-    paths:
-      - "crates/**"
-      - "transports/**"
-      - "bindings/**"
-      - "bench/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".cargo/**"
-      - "rust-toolchain*"
-      - "package.json"
-      - "pnpm-lock.yaml"
-      - "pnpm-workspace.yaml"
-      - "infra/bench/**"
-      - "scripts/*bench*"
-      - ".github/workflows/bench*.yml"
+    types: [labeled]
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
@@ -44,8 +29,10 @@ on:
 permissions:
   contents: read
 
+# Re-adding `bench` replaces a PR's earlier run. Any other label's event gets a
+# group of its own, so it cannot cancel a bench in progress.
 concurrency:
-  group: bench-${{ github.event.pull_request.number || github.run_id }}
+  group: bench-${{ github.event.label.name == 'bench' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 env:
@@ -53,20 +40,36 @@ env:
 
 jobs:
   # Wakes the self-hosted bench instance (normally stopped; its watchdog
-  # powers it off when idle). `aws-bench` is the approval gate for pull
-  # requests and manual runs; releases and the weekly keepalive run only
-  # trusted code from a tag or `main`, so they use the reviewer-free
-  # `aws-bench-unattended`.
+  # powers it off when idle). Manual runs need approval through `aws-bench`.
+  # Releases and the weekly keepalive run only trusted code from a tag or
+  # `main`, and a labelled PR was opted in by a writer, so those use the
+  # reviewer-free `aws-bench-unattended`.
   start-runner:
     if: >-
-      github.event.action != 'closed' && ((github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'schedule')
+      (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' || (github.event.label.name == 'bench' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    environment: ${{ (github.event_name == 'release' || github.event_name == 'schedule') && 'aws-bench-unattended' || 'aws-bench' }}
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'aws-bench' || 'aws-bench-unattended' }}
     timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
+      pull-requests: write
     steps:
+      # Removes the label so adding it again starts a new run, then admits
+      # only a writer's label: triage access can label too.
+      - name: Take bench label
+        if: github.event_name == 'pull_request_target'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SENDER: ${{ github.event.sender.login }}
+        run: |
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/bench" >/dev/null || true
+          permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$SENDER/permission" --jq .permission)
+          if [[ "$permission" != admin && "$permission" != write ]]; then
+            echo "$SENDER has $permission access; only writers can start a bench" >&2
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.event.pull_request.base.sha || github.sha }}
