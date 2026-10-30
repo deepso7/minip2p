@@ -89,8 +89,9 @@ jobs:
           tags: ${{ steps.release.outputs.tags }}
           provenance: mode=max
           sbom: true
-          cache-from: type=gha,scope=relay-container
-          cache-to: type=gha,mode=max,scope=relay-container
+          # No type=gha cache: this runs on a release tag ref, and Actions
+          # caches saved there are only readable by that same tag, so the next
+          # release could never restore it (see publish.yml's rust-cache note).
 
       - name: Verify anonymous access
         env:

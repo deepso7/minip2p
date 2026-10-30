@@ -50,6 +50,9 @@ jobs:
           toolchain: "1.91"
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # publish.yml's node-native restores this cache.
+          shared-key: node-native
       - name: Normalize pnpm patches on Windows
         if: runner.os == 'Windows'
         shell: bash
@@ -153,15 +156,42 @@ jobs:
             "build-tools;36.0.0" \
             "ndk;28.2.13676358"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - id: rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: stable
           targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # publish.yml's android-native restores this cache.
+          shared-key: android
+      # After rust-cache, so cargo-ndk is saved in and restored from its
+      # ~/.cargo/bin.
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version 4.1.2 --locked
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: pnpm install --frozen-lockfile
+      # See bindings.yml for the ubrn cache.
+      - name: Restore ubrn CLI build
+        id: ubrn
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            node_modules/uniffi-bindgen-react-native/target
+            node_modules/uniffi-bindgen-react-native/Cargo.lock
+          key: ubrn-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('node_modules/uniffi-bindgen-react-native/package.json', 'bindings/ts/react-native/patches/*.patch') }}
+      - name: Backdate ubrn sources
+        if: steps.ubrn.outputs.cache-hit == 'true'
+        working-directory: node_modules/uniffi-bindgen-react-native
+        run: find . -path ./target -prune -o -exec touch -t 200001010000 {} +
       - run: pnpm --workspace-root rn:android
+      - name: Save ubrn CLI build
+        if: github.ref == 'refs/heads/main' && steps.ubrn.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            node_modules/uniffi-bindgen-react-native/target
+            node_modules/uniffi-bindgen-react-native/Cargo.lock
+          key: ${{ steps.ubrn.outputs.cache-primary-key }}
       - name: Validate Android ELF alignment and allocator hooks
         run: node react-native/scripts/check-android-elf.mjs
       - run: pnpm --workspace-root example prebuild
@@ -194,13 +224,38 @@ jobs:
         with:
           node-version: "24.20.0"
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - id: rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: stable
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # publish.yml's ios-native restores this cache.
+          shared-key: ios
       - run: pnpm install --frozen-lockfile
+      # See bindings.yml for the ubrn cache.
+      - name: Restore ubrn CLI build
+        id: ubrn
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            node_modules/uniffi-bindgen-react-native/target
+            node_modules/uniffi-bindgen-react-native/Cargo.lock
+          key: ubrn-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('node_modules/uniffi-bindgen-react-native/package.json', 'bindings/ts/react-native/patches/*.patch') }}
+      - name: Backdate ubrn sources
+        if: steps.ubrn.outputs.cache-hit == 'true'
+        working-directory: node_modules/uniffi-bindgen-react-native
+        run: find . -path ./target -prune -o -exec touch -t 200001010000 {} +
       - run: pnpm --workspace-root rn:ios
+      - name: Save ubrn CLI build
+        if: github.ref == 'refs/heads/main' && steps.ubrn.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            node_modules/uniffi-bindgen-react-native/target
+            node_modules/uniffi-bindgen-react-native/Cargo.lock
+          key: ${{ steps.ubrn.outputs.cache-primary-key }}
       - name: Validate XCFramework slices
         run: |
           lipo -info react-native/build/Minip2pFfi.xcframework/ios-arm64/libminip2p_ffi.a
