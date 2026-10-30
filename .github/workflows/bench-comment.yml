@@ -101,12 +101,17 @@ jobs:
             cp "$ARTIFACT_DIR/comparison.md" "$TARGET"
             exit 0
           fi
+          # The last successful comparison, without the marker or an earlier
+          # failure's banner; empty when no run has succeeded yet.
+          previous_body=$(printf '%s\n' "$existing" | sed \
+            -e '/^<!-- bench-comment -->$/d' \
+            -e '/^<!-- bench-status-start -->$/,/^<!-- bench-status-end -->$/d')
 
           {
             printf '%s\n' '<!-- bench-comment -->'
             printf '%s\n' '<!-- bench-status-start -->'
             printf '> [!WARNING]\n'
-            if [ -n "$existing" ]; then
+            if [ -n "${previous_body//[[:space:]]/}" ]; then
               previous=' The comparison below is from the last successful run.'
             else
               previous=''
@@ -114,10 +119,8 @@ jobs:
             printf '> Benchmark run [%s](%s).%s To retry, use **Re-run all jobs**: re-running only the failed job does not wake the stopped bench instance.\n' \
               "$CONCLUSION" "$RUN_URL" "$previous"
             printf '%s\n\n' '<!-- bench-status-end -->'
-            if [ -n "$existing" ]; then
-              printf '%s\n' "$existing" | sed \
-                -e '/^<!-- bench-comment -->$/d' \
-                -e '/^<!-- bench-status-start -->$/,/^<!-- bench-status-end -->$/d'
+            if [ -n "$previous" ]; then
+              printf '%s\n' "$previous_body"
             fi
           } > "$TARGET"
 
