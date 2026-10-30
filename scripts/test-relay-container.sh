@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Builds the relay release binary with scripts/build-relay-release.sh, packages
+# it like a release, builds the image through infra/relay/Dockerfile from a
+# local release URL, and runs scripts/check-relay-image.sh on it.
 set -euo pipefail
 
 repository="$(cd "$(dirname "$0")/.." && pwd)"
@@ -7,8 +10,6 @@ version="$(cargo metadata --locked --no-deps --format-version 1 \
 suffix="$$"
 image="minip2p-relay-test:$suffix"
 builder_image="minip2p-relay-builder:$suffix"
-container="minip2p-relay-test-$suffix"
-volume="minip2p-relay-test-$suffix"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/minip2p-relay-container.XXXXXX")"
 server_pid=""
 
@@ -17,8 +18,6 @@ cleanup() {
     kill "$server_pid" >/dev/null 2>&1 || true
     wait "$server_pid" 2>/dev/null || true
   fi
-  docker container rm --force "$container" >/dev/null 2>&1 || true
-  docker volume rm "$volume" >/dev/null 2>&1 || true
   docker image rm --force "$image" >/dev/null 2>&1 || true
   docker image rm --force "$builder_image" >/dev/null 2>&1 || true
   rm -rf "$work_dir"
@@ -26,8 +25,8 @@ cleanup() {
 trap cleanup EXIT
 
 case "$(docker version --format '{{.Server.Arch}}')" in
-  amd64) target="x86_64-unknown-linux-gnu" ;;
-  arm64) target="aarch64-unknown-linux-gnu" ;;
+  amd64) target="x86_64-unknown-linux-musl" ;;
+  arm64) target="aarch64-unknown-linux-musl" ;;
   *) echo "unsupported Docker architecture" >&2; exit 1 ;;
 esac
 
@@ -44,13 +43,12 @@ docker run --rm \
   --volume "$work_dir/build:/build" \
   --workdir /src \
   "$builder_image" \
-  cargo build --release --locked \
-    -p minip2p-relay-server-example --bin minip2p-relay
+  scripts/build-relay-release.sh "$target" >/dev/null
 
 "$repository/scripts/package-relay-server.sh" \
   "$version" \
   "$target" \
-  "$work_dir/build/target/release/minip2p-relay" \
+  "$work_dir/build/target/$target/release/minip2p-relay" \
   "$work_dir/release" >/dev/null
 (
   cd "$work_dir/release"
@@ -86,54 +84,4 @@ docker build \
   --tag "$image" \
   "$repository"
 
-test "$(docker image inspect --format '{{.Config.User}}' "$image")" = "10001:10001"
-metadata="$(docker image inspect "$image")"
-jq -e '.[0].Config.Entrypoint == ["/usr/local/bin/minip2p-relay"]' \
-  <<<"$metadata" >/dev/null
-jq -e '.[0].Config.ExposedPorts | has("19876/tcp")' <<<"$metadata" >/dev/null
-jq -e '.[0].Config.ExposedPorts | has("19876/udp")' <<<"$metadata" >/dev/null
-jq -e '.[0].Config.Volumes | has("/data")' <<<"$metadata" >/dev/null
-test "$(docker run --rm "$image" --version)" = "minip2p-relay $version"
-
-docker volume create "$volume" >/dev/null
-docker run --detach \
-  --name "$container" \
-  --volume "$volume:/data" \
-  "$image" >/dev/null
-
-wait_for_relay() {
-  for _ in {1..20}; do
-    logs="$(docker logs "$container" 2>&1)"
-    if grep -F "/tcp/19876/" <<<"$logs" >/dev/null &&
-      grep -F "/udp/19876/quic-v1/" <<<"$logs" >/dev/null; then
-      test "$(docker container inspect --format '{{.State.Running}}' "$container")" = true
-      return 0
-    fi
-    sleep 0.25
-  done
-
-  docker logs "$container" >&2
-  return 1
-}
-
-wait_for_relay
-first_key="$(docker run --rm \
-  --entrypoint sha256sum \
-  --volume "$volume:/data" \
-  "$image" \
-  /data/identity.key)"
-
-docker container rm --force "$container" >/dev/null
-docker run --detach \
-  --name "$container" \
-  --volume "$volume:/data" \
-  "$image" >/dev/null
-
-wait_for_relay
-second_key="$(docker run --rm \
-  --entrypoint sha256sum \
-  --volume "$volume:/data" \
-  "$image" \
-  /data/identity.key)"
-
-test "$first_key" = "$second_key"
+"$repository/scripts/check-relay-image.sh" "$image" "$version"

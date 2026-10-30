@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 # The download stage runs on the build platform (no QEMU for apt or curl) and
-# picks the prebuilt binary for TARGETARCH; only the runtime stage is per-arch.
+# picks the prebuilt static musl binary for TARGETARCH; only the runtime stage
+# is per-arch. The binary needs no libc, so the runtime is distroless/static.
 FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS download
 
 # Kept above the version ARGs so a release bump reuses this layer.
@@ -17,8 +18,8 @@ ARG TARGETARCH
 
 RUN set -eux; \
     case "$TARGETARCH" in \
-      amd64) target="x86_64-unknown-linux-gnu" ;; \
-      arm64) target="aarch64-unknown-linux-gnu" ;; \
+      amd64) target="x86_64-unknown-linux-musl" ;; \
+      arm64) target="aarch64-unknown-linux-musl" ;; \
       *) echo "unsupported container architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     archive="minip2p-relay-server-v${MINIP2P_VERSION}-${target}"; \
@@ -32,7 +33,7 @@ RUN set -eux; \
     tar -xzf "$archive.tar.gz"; \
     install -m 0755 "$archive/minip2p-relay" /out/minip2p-relay
 
-FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime
+FROM gcr.io/distroless/static-debian13@sha256:15f8637509792e05b97d83451b0b6ccfa4abd548f997e406ac1e72c87fe1fa78 AS runtime
 
 ARG MINIP2P_VERSION
 
@@ -42,8 +43,8 @@ LABEL org.opencontainers.image.title="minip2p relay server" \
       org.opencontainers.image.version="$MINIP2P_VERSION" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
-# COPY rather than RUN mkdir, so building the runtime stage executes nothing on
-# the target arch.
+# COPY rather than RUN mkdir: distroless has no shell, and building the runtime
+# stage then executes nothing on the target arch.
 COPY --from=download --chown=10001:10001 /data /data
 
 USER 10001:10001

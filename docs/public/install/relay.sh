@@ -12,8 +12,8 @@ done
 
 test "$(uname -s)" = Linux || fail "prebuilt relay binaries currently support Linux only"
 case "$(uname -m)" in
-  x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
-  aarch64|arm64) target="aarch64-unknown-linux-gnu" ;;
+  x86_64|amd64) arch="x86_64" ;;
+  aarch64|arm64) arch="aarch64" ;;
   *) fail "unsupported Linux architecture: $(uname -m)" ;;
 esac
 
@@ -28,13 +28,19 @@ case "$version" in
   ""|*[!0-9A-Za-z.+-]*) fail "invalid release version: $version" ;;
 esac
 
-archive="minip2p-relay-server-v$version-$target"
 release_url="https://github.com/deepso7/minip2p/releases/download/v$version"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/minip2p-relay-install.XXXXXX")"
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
-curl -fsSL -o "$work_dir/$archive.tar.gz" "$release_url/$archive.tar.gz" ||
-  fail "relay binary is not available for v$version on $target"
+# Releases ship static musl binaries; releases up to v0.11.0 have only glibc
+# ones, which need glibc 2.39 or newer.
+for libc in musl gnu; do
+  target="$arch-unknown-linux-$libc"
+  archive="minip2p-relay-server-v$version-$target"
+  curl -fsSL -o "$work_dir/$archive.tar.gz" "$release_url/$archive.tar.gz" 2>/dev/null &&
+    break
+  test "$libc" = gnu && fail "relay binary is not available for v$version on $arch Linux"
+done
 curl -fsSL -o "$work_dir/SHA256SUMS" "$release_url/SHA256SUMS" ||
   fail "SHA256SUMS is not available for v$version"
 

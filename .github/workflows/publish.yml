@@ -304,9 +304,9 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -314,18 +314,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.91"
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: false
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # Static musl, so the binary runs on any Linux host and in the
+      # distroless relay image regardless of the runner's glibc.
       - name: Build and smoke-test release binary
         env:
           RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
           RELEASE_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          cargo build --release --locked -p minip2p-relay-server-example
-
-          binary="target/release/minip2p-relay"
+          binary="$(scripts/build-relay-release.sh "$RELEASE_TARGET")"
           "$binary" --help >/dev/null
           test "$("$binary" --version)" = "minip2p-relay $RELEASE_VERSION"
 

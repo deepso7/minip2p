@@ -19,14 +19,16 @@ Linux release archives are also available for x86-64 and ARM64 from the [GitHub 
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf minip2p-relay-server-v*-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf minip2p-relay-server-v*-x86_64-unknown-linux-musl.tar.gz
 sudo install -m 0755 \
-  minip2p-relay-server-v*-x86_64-unknown-linux-gnu/minip2p-relay \
+  minip2p-relay-server-v*-x86_64-unknown-linux-musl/minip2p-relay \
   /usr/local/bin/
 minip2p-relay --version
 ```
 
-Use `aarch64-unknown-linux-gnu` instead on an ARM64 host. Running `minip2p-relay` with no options starts the same dual-stack listener as the Cargo command above.
+Use `aarch64-unknown-linux-musl` instead on an ARM64 host. Running `minip2p-relay` with no options starts the same dual-stack listener as the Cargo command above.
+
+The release binaries are statically linked against musl, so they run on any x86-64 or ARM64 Linux, whatever its glibc, and need no libc in a container. Names they resolve, hostname `--quic`/`--tcp` binds and any `/dns*` address the relay dials (it does not resolve `--announce` addresses), go through musl's resolver: it reads `/etc/hosts` and `/etc/resolv.conf` but no NSS modules, treats `search`/`ndots` differently from glibc, and in the musl 1.2.3 that Rust 1.91 links has no DNS-over-TCP fallback for truncated answers. Bind IP addresses, or build with `cargo` on the host, if you depend on glibc resolution.
 
 On a Linux systemd host with standard administration tools under `/usr/bin` and `/usr/sbin`, install and start the service with one command:
 

@@ -28,5 +28,10 @@ minip2p-example-common = { path = "../common" }
 minip2p-tls = { path = "../../crates/tls" }
 rustls-pki-types = "1.15.1"
 
+# Release binaries are static musl, whose allocator roughly halves relayed
+# throughput; mimalloc brings it back to the glibc build's.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
+
 [dev-dependencies]
 tempfile = "3.27.0"
