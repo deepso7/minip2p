@@ -1,0 +1,29 @@
+# Every Rust benchmark the Bench workflow builds and runs, one per line:
+#
+#   <pass> <package> <features, or - for none> <bench target>
+#
+# `scripts/run-benches.sh` runs them in this order, `ir` lines in its `ir`
+# pass and `criterion` then `custom` lines in its `wall` pass. The bench image
+# (infra/bench/Dockerfile) and CI's bench-build job compile exactly these with
+# `scripts/build-benches.sh`, so a renamed feature or bench fails CI first.
+# `ir` ids must match `GUNGRAUN_NAMES` (`scripts/check-bench-ids.py`).
+ir        minip2p-core          -                                 multiaddr_ir
+ir        minip2p-secure-mux    -                                 data_path_ir
+ir        minip2p-discovery     -                                 peer_book_ir
+ir        minip2p-pubsub        -                                 publish_ir
+ir        minip2p-pubsub        -                                 router_ir
+ir        minip2p-relay-server  -                                 relay_server_event_ir
+criterion minip2p-core          -                                 multiaddr
+criterion minip2p-secure-mux    -                                 data_path
+criterion minip2p-discovery     -                                 peer_book
+criterion minip2p-pubsub        -                                 publish
+criterion minip2p-pubsub        -                                 router
+criterion minip2p-relay-server  -                                 relay_server_event
+criterion minip2p-quic          -                                 idle_poll
+criterion minip2p-tcp           -                                 readiness_poll
+criterion minip2p-rs            tcp                               endpoint_e2e
+custom    minip2p-rs            tcp,relay-server,pubsub,mdns,bench endpoint_idle
+custom    minip2p-rs            tcp,relay,relay-server,bench      endpoint_throughput
+custom    minip2p-rs            tcp,relay,relay-server,bench      endpoint_rtt
+custom    minip2p-rs            tcp,relay,relay-server,pubsub     endpoint_ping_load
+custom    minip2p-pubsub        -                                 router_allocs
