@@ -14,7 +14,7 @@ Published stable releases produce the baseline stored on `bench-data`. Pull requ
 - the instance `minip2p-bench`: Ubuntu 24.04 LTS amd64, an 80 GB gp3 root volume, a public IPv4 address for egress, no instance profile, IMDSv2 required with hop limit 1 (containers cannot reach it), instance tags in metadata, and instance-initiated shutdown behaviour `stop`;
 - the inline policy of the CI role `minip2p-github-bench`: `ec2:StartInstances` on the instance, `ec2:CreateTags` on the instance for the `bench-lease-until` key only, and `ec2:DescribeInstances`.
 
-The instance's first boot runs `cloud-init.yaml`, which bootstrap renders with the scripts in this directory and a runner registration token. It installs Docker CE from Docker's apt repository and `jq`. It creates the user `runner`, in `docker` and without sudo, and installs the pinned, SHA-256-verified `actions/runner` release in `/home/runner/actions-runner` as a systemd service. It also installs the job-start hook (`runner-hooks/job-started.sh`, as `/opt/minip2p-bench/job-started.sh`) and the watchdog (`watchdog.sh` with `minip2p-bench-watchdog.{service,timer}`). These steps run once per instance; later boots only start the services. The runner updates itself when GitHub ships a new release.
+The instance's first boot runs `cloud-init.yaml`, which bootstrap renders with the scripts in this directory and a runner registration token. It installs Docker CE from Docker's apt repository and `jq`. It creates the user `runner`, in `docker` and without sudo, and installs the pinned, SHA-256-verified `actions/runner` release in `/home/runner/actions-runner` as a systemd service. It also installs the job-start hook (`runner-hooks/job-started.sh`, as `/opt/minip2p-bench/job-started.sh`) and the watchdog (`watchdog.sh` with `minip2p-bench-watchdog.{service,timer}`). These steps run once per instance; later boots only start the services, so a change to the hook or the watchdog reaches the instance only when it is redeployed (see [Updating the on-instance scripts](#updating-the-on-instance-scripts)). The runner updates itself when GitHub ships a new release.
 
 ## Bootstrap
 
@@ -81,10 +81,10 @@ After admitting a job, the hook removes leftover `bench-*` containers and images
 
 Before each start, `start-runner` sets the tag `bench-lease-until` to now + 20 minutes (Unix seconds). That covers the boot and the runner picking up the queued job. A systemd timer runs `watchdog.sh` every minute and powers the instance off, which stops it, when either:
 
-- it has been up for at least 10 minutes, the lease has expired, and no `Runner.Worker` process has existed for 10 consecutive minutes; or
+- it has been up for at least 10 minutes, the lease has expired, and no `Runner.Worker` process has existed for 2 consecutive minutes; or
 - the oldest `Runner.Worker` is older than 120 minutes, which means a stuck job, since the bench job's timeout is 90 minutes.
 
-A missing, malformed, or more-than-30-minutes-ahead lease counts as expired, so no tag value can keep the instance on. The first boot's setup counts as busy for up to an hour. Decisions are logged to the journal: `journalctl -u minip2p-bench-watchdog`. For a long manual session, stop the timer with `sudo systemctl stop minip2p-bench-watchdog.timer`; the next boot starts it again.
+The lease, not the idle limit, covers a job that is still queued after a start, so the short idle limit only has to bridge the end of a job; the 10-minute uptime floor keeps an instance started by hand, without a lease, up long enough to log in. A missing, malformed, or more-than-30-minutes-ahead lease counts as expired, so no tag value can keep the instance on. The first boot's setup counts as busy for up to an hour. Decisions are logged to the journal: `journalctl -u minip2p-bench-watchdog`. For a long manual session, stop the timer with `sudo systemctl stop minip2p-bench-watchdog.timer`; the next boot starts it again.
 
 The lease cannot fully close the race with a watchdog that read the old lease just before a new start, so rarely `bench` stays queued after the instance stopped. Cancel the run and use **Re-run all jobs**.
 
@@ -143,7 +143,7 @@ A manual dispatch of the Bench workflow with `sweep` set (for example `all`, or 
 
 ## Cost
 
-On-demand `m8a.xlarge` in `ap-south-1` is about $0.256/hour, billed only while running. A run, including boot and the idle tail, takes about 40 minutes, about $0.17. The 80 GB gp3 volume costs about $7.30/month, and the public IPv4 address is billed only while the instance runs. At about 50 runs a month, the total is about $16/month.
+On-demand `m8a.xlarge` in `ap-south-1` is about $0.256/hour, billed only while running. A run, including boot and the idle tail, takes about 25 minutes, about $0.11. The 20-minute lease bounds the shortest stay, so the weekly keepalive costs about the same. The 80 GB gp3 volume costs about $7.30/month, and the public IPv4 address is billed only while the instance runs. At about 50 runs a month, the total is about $13/month.
 
 ## Running by hand on the instance
 

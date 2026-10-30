@@ -3,9 +3,12 @@
 # minip2p-bench-watchdog.timer. Powers the instance off (shutdown behaviour
 # `stop`) when either:
 #   - it has been up 10 minutes, the `bench-lease-until` tag has expired, and
-#     no Runner.Worker has existed for 10 minutes; or
+#     no Runner.Worker has existed for 2 minutes; or
 #   - the oldest Runner.Worker is older than 120 minutes (a stuck job; the
 #     bench job's own timeout is 90 minutes).
+# The lease, not the idle limit, covers a queued job's wait for the runner
+# after a start, so the idle limit only has to bridge a job's end; the uptime
+# floor keeps a hand-started instance (no lease) up long enough to log in.
 # Cloud-init's first-boot setup counts as busy for up to an hour.
 # Decisions go to the journal: `journalctl -u minip2p-bench-watchdog`.
 set -euo pipefail
@@ -13,7 +16,7 @@ set -euo pipefail
 idle_file=/run/minip2p-bench-idle-since
 setup_marker=/run/minip2p-bench-setup
 min_uptime=600
-idle_limit=600
+idle_limit=120
 max_lease_ahead=1800
 max_job_age=7200
 
