@@ -17,7 +17,8 @@ Additional constraints: `unsafe` is forbidden workspace-wide; sockets, clocks, a
 `just` mirrors CI (`.github/workflows/ci.yml`):
 
 ```bash
-just test          # nextest + doctests over the Endpoint feature matrix; needs cargo-nextest
+just test          # nextest + doctests, workspace + the feature matrix's `ci` rows; needs cargo-nextest
+just test test-full # every matrix row, as the release workflow runs it
 just clippy        # -D warnings, Endpoint TCP/discovery/mDNS variants, and fuzz/
 just fmt           # also formats fuzz/
 just clean         # Cargo targets, node_modules, Turbo caches, docs output
@@ -26,7 +27,7 @@ just check-wasm    # the browser build's crates on wasm32-unknown-unknown
 just fuzz 30       # needs nightly + cargo-fuzz
 ```
 
-Single test: `cargo test -p minip2p-ping test_name` (plain `cargo test` is fine for one test; the full matrix uses nextest because it runs every binary's tests at once instead of one binary at a time). Endpoint features: `cargo test -p minip2p-rs --features tcp` (or `mdns`, `discovery`, `discovery,mdns,tcp`; see `justfile` for the full matrix). `fuzz/` is outside the workspace — use `--manifest-path fuzz/Cargo.toml`.
+Single test: `cargo test -p minip2p-ping test_name` (plain `cargo test` is fine for one test; the matrix runs use nextest because it runs every binary's tests at once instead of one binary at a time). Endpoint features: `cargo test -p minip2p-rs --features tcp` (or `mdns`, `discovery`, `discovery,mdns,tcp`; see `scripts/run-feature-matrix.sh` for the full matrix). `fuzz/` is outside the workspace — use `--manifest-path fuzz/Cargo.toml`.
 
 Publish a release end to end with:
 
@@ -34,7 +35,7 @@ Publish a release end to end with:
 just release <version>
 ```
 
-The command bumps every public package and local dependency, regenerates lockfiles, waits for push CI, publishes the GitHub release, waits for the native build and registry workflow, and verifies crates.io and npm. The default path leaves the full matrix to GitHub to avoid running it twice; use `just release <version> --full-local` to run it locally before pushing as well.
+The command bumps every public package and local dependency, regenerates lockfiles, waits for push CI, publishes the GitHub release, waits for the native build and registry workflow, and verifies crates.io and npm. PRs and push CI test only the matrix's `ci` rows; the full matrix runs in the release workflow's `test-rust` job, which gates every publish job. The default path leaves that to GitHub to avoid running it twice; use `just release <version> --full-local` to run the full matrix locally before pushing as well.
 
 ## Architecture
 

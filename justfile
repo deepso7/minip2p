@@ -19,10 +19,12 @@ clippy:
     scripts/run-feature-matrix.sh clippy
     cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
 
-# Mirrors CI's `test` job. Needs cargo-nextest: https://get.nexte.st
-test:
+# Mirrors CI's `test` job, which runs the feature matrix's `ci` rows;
+# `just test test-full` runs every row, like the release workflow.
+# Needs cargo-nextest: https://get.nexte.st
+test matrix="test":
     cargo nextest run --workspace
-    scripts/run-feature-matrix.sh test
+    scripts/run-feature-matrix.sh {{matrix}}
     # nextest does not run doctests, and --workspace --doc is default-features
     # only, so feature-gated doctests need their own line.
     cargo test --workspace --doc

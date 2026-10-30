@@ -138,6 +138,7 @@ jobs:
       - name: Install cargo-nextest
         run: curl -sSLf "https://get.nexte.st/$NEXTEST_VERSION/linux" | tar zxf - -C "$HOME/.cargo/bin"
       - run: cargo nextest run --workspace
+      # Only the matrix's `ci` rows; publish.yml's test-rust runs every row.
       - run: scripts/run-feature-matrix.sh test
       # nextest does not run doctests, and `--workspace --doc` only builds
       # default features, so a doctest behind a feature gate needs its own line

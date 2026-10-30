@@ -144,8 +144,9 @@ Every crate has its own README with API-specific details.
 [`just`](https://github.com/casey/just) commands mirror CI:
 
 ```bash
-just test          # workspace tests, Endpoint feature matrix, and doctests
+just test          # workspace tests, the feature matrix's CI rows, and doctests
                    # requires cargo-nextest (https://get.nexte.st)
+just test test-full # every feature matrix row, as release CI runs it
 just clippy        # warnings-as-errors, feature variants, and fuzz crate
 just fmt           # format the workspace and fuzz crate
 just clean         # Cargo targets, node_modules, Turbo caches, docs output
