@@ -2,24 +2,13 @@ import { defineConfig } from "blume";
 import { cloudflare } from "blume/deploy";
 import { filesystem, githubReleases } from "blume/sources";
 
+// Brand colours, matching the tokens in theme.css: warm paper and blue-black
+// ink, with the orange accent printed darker on paper and lit amber on ink.
 const brand = {
-  black: "oklch(0.170 0.008 250)",
-  orange: "oklch(0.610 0.112 47)",
-  white: "oklch(0.950 0.006 60)",
-} as const;
-
-// Paper Mono (OFL, fonts/paper-mono/OFL.txt) for every role: body, headings,
-// and code. It isn't on Google Fonts, so the site serves its own files.
-const paperMono = {
-  fallback: "mono",
-  name: "Paper Mono",
-  variants: [
-    { src: "./fonts/paper-mono/PaperMono-Regular.woff2", weight: 400 },
-    { src: "./fonts/paper-mono/PaperMono-Medium.woff2", weight: 500 },
-    { src: "./fonts/paper-mono/PaperMono-SemiBold.woff2", weight: 600 },
-    { src: "./fonts/paper-mono/PaperMono-Bold.woff2", weight: 700 },
-    { src: "./fonts/paper-mono/PaperMono-ExtraBold.woff2", weight: 800 },
-  ],
+  amber: "oklch(0.770 0.135 60)",
+  ink: "oklch(0.155 0.006 250)",
+  orange: "oklch(0.540 0.130 42)",
+  paper: "oklch(0.955 0.006 60)",
 } as const;
 
 export default defineConfig({
@@ -66,25 +55,18 @@ export default defineConfig({
       logo: "/logo.svg",
       palette: {
         accent: brand.orange,
-        background: brand.white,
-        foreground: brand.black,
+        background: brand.paper,
+        foreground: brand.ink,
       },
     },
     x: { creator: "@deepso7", handle: "@deepso7" },
   },
   theme: {
-    accent: brand.orange,
-    background: {
-      dark: brand.black,
-      light: brand.white,
-    },
-    fonts: {
-      body: paperMono,
-      display: paperMono,
-      mono: paperMono,
-    },
-    mode: "dark",
-    radius: "none",
+    accent: { dark: brand.amber, light: brand.orange },
+    background: { dark: brand.ink, light: brand.paper },
+    fonts: { body: "geist", display: "geist", mono: "geist-mono" },
+    mode: "system",
+    radius: "md",
   },
   title: "minip2p",
 });

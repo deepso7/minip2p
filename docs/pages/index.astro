@@ -5,14 +5,13 @@ import Tabs from "blume/components/content/Tabs.astro";
 import PageLayout from "blume/components/layout/PageLayout.astro";
 import { highlightCode } from "blume/markdown";
 import Mascot from "../components/mascot.astro";
-import StatusBar from "../components/status-bar.astro";
 // Both snippets are read verbatim from files CI checks, so the landing page
 // shows code that compiles: the Rust dialer (`cargo check` in the docs job)
 // and the Node example (`tsc` in the bindings job's `pnpm typecheck`).
 import dialer from "../snippets/quickstart/src/bin/dialer.rs?raw";
 // oxlint-disable-next-line import/default -- Vite's `?raw` adds the default export; the linter resolves the bare `.ts`.
 import ping from "../../examples/nodejs/ping.ts?raw";
-import { rustVersion as msrv, version } from "../components/workspace";
+import { license, rustVersion as msrv, version } from "../components/workspace";
 
 const { config, navigation, fontCssVars } = data;
 
@@ -26,13 +25,11 @@ const [dialerHtml, pingHtml] = await Promise.all([
   highlight(ping, "ts"),
 ]);
 
-// The landing page is the project's man page: the sections a reader of
-// `man minip2p` expects, in the order they expect them.
 const install = [
-  { command: "cargo add minip2p-rs", note: "Rust" },
-  { command: "npm install @minip2p/node", note: "Node.js" },
-  { command: "npm install @minip2p/react-native", note: "React Native" },
-  { command: "npm install @minip2p/web", note: "browser" },
+  { command: "cargo add minip2p-rs", id: "cargo", tab: "cargo" },
+  { command: "npm install @minip2p/node", id: "node", tab: "npm · node" },
+  { command: "npm install @minip2p/react-native", id: "react-native", tab: "npm · react-native" },
+  { command: "npm install @minip2p/web", id: "web", tab: "npm · web" },
 ];
 
 // Cargo features of `minip2p-rs`, as `crates/minip2p/Cargo.toml` names them.
@@ -48,19 +45,32 @@ const features = [
   { body: "TCP and mDNS over a host-owned smoltcp stack, for no_std devices.", name: "smoltcp" },
 ];
 
-const seeAlso = [
-  { body: "Install, connect two peers, drive the event loop.", href: "/docs/rust/install", name: "minip2p-rust", section: 7 },
-  { body: "Node.js, React Native, and the browser.", href: "/docs/typescript/start", name: "minip2p-typescript", section: 7 },
-  { body: "The portable no_std + alloc endpoint.", href: "/docs/rust/embedded-devices", name: "minip2p-embedded", section: 7 },
-  { body: "Relays, AutoNAT, and hole punching.", href: "/docs/rust/traverse-nat", name: "minip2p-nat", section: 7 },
-  { body: "Every capability and what it needs.", href: "/docs/reference/feature-matrix", name: "minip2p-features", section: 5 },
-  { body: "What changed in each release.", href: "/changelog", name: "minip2p-changelog", section: 1 },
-  { body: "The Rust API reference.", href: "https://docs.rs/minip2p-rs/latest/minip2p/", name: "docs.rs", section: 3 },
+const next = [
+  { body: "Install, connect two peers, drive the event loop.", href: "/docs/rust/install", name: "Rust" },
+  { body: "Node.js, React Native, and the browser.", href: "/docs/typescript/start", name: "TypeScript" },
+  { body: "The portable no_std + alloc endpoint.", href: "/docs/rust/embedded-devices", name: "Embedded devices" },
+  { body: "Relays, AutoNAT, and hole punching.", href: "/docs/rust/traverse-nat", name: "NAT traversal" },
+  { body: "Every capability and what it needs.", href: "/docs/reference/feature-matrix", name: "Feature matrix" },
+  { body: "What changed in each release.", href: "/changelog", name: "Changelog" },
+  { body: "The Rust API reference.", href: "https://docs.rs/minip2p-rs/latest/minip2p/", name: "docs.rs" },
 ];
 
-const heading = "m-0 text-sm font-bold tracking-wide text-foreground";
-// The man-page indent, in rem so the larger NAME line lines up with the rest.
-const body = "mt-3 ps-5 sm:ps-14";
+const footLinks = [
+  { href: "https://github.com/deepso7/minip2p", label: "github" },
+  { href: "https://docs.rs/minip2p-rs/latest/minip2p/", label: "docs.rs" },
+  { href: "https://deepso.sh", label: "by deepso" },
+];
+const release = [version && `v${version}`, msrv && `rust ${msrv}+`, license].filter(Boolean).join(" · ");
+
+const external = (href: string) =>
+  href.startsWith("http") ? { rel: "noopener noreferrer", target: "_blank" } : {};
+
+// Each section: a mono eyebrow (the heading) in a left rail on wide screens,
+// the content beside it.
+const section = "grid gap-x-8 gap-y-4 border-t border-border py-12 sm:py-16 lg:grid-cols-[10rem_minmax(0,1fr)]";
+const eyebrow = "m-0 font-mono text-xs/6 font-normal text-faint";
+const title = "m-0 font-display text-xl/8 font-medium tracking-[-0.02em] text-foreground sm:text-2xl/8";
+const code = "font-mono text-sm text-foreground";
 ---
 
 <PageLayout
@@ -83,19 +93,12 @@ const body = "mt-3 ps-5 sm:ps-14";
     route: "/",
   }}
 >
-  <article class="man mx-auto max-w-4xl px-6 pt-8 pb-20 font-mono text-sm leading-relaxed sm:pt-12 lg:px-8">
-    <p class="man-running m-0 flex justify-between sm:grid sm:grid-cols-[1fr_auto_1fr] gap-4 text-xs text-muted-foreground" aria-hidden="true">
-      <span>MINIP2P(7)</span>
-      <span class="hidden sm:inline">Peer-to-Peer Networking Manual</span>
-      <span class="text-end">MINIP2P(7)</span>
-    </p>
-
-    {/* NAME and SYNOPSIS share the first screen with the mascot, at the size
-        it had on the old hero; it still watches the pointer and reacts when
-        booped. */}
-    <div class="mt-10 grid items-center gap-x-10 gap-y-8 lg:grid-cols-[minmax(0,1fr)_16rem]">
-      <figure class="m-0 justify-self-center lg:order-last lg:justify-self-end">
-        <div class="w-44 select-none sm:w-56 lg:w-64">
+  {/* The hero sits on a faint dot lattice that fades out downward. */}
+  <section class="relative isolate before:pointer-events-none before:absolute before:inset-0 before:-z-10 before:bg-[radial-gradient(var(--blume-border)_1px,transparent_2px)] before:bg-size-[16px_16px] before:[mask-image:linear-gradient(to_bottom,black,transparent)]">
+    <div class="mx-auto grid max-w-5xl items-center gap-x-12 gap-y-8 px-6 pt-12 pb-16 sm:pt-20 sm:pb-20 md:grid-cols-[minmax(0,1fr)_14rem] lg:px-8">
+      {/* The dino watches the pointer and reacts when booped. */}
+      <figure class="m-0 md:order-last">
+        <div class="w-32 select-none sm:w-40 md:w-56">
           <Mascot
             directions="/mascots/logo-directions.svg"
             reactions="/mascots/logo-reactions.svg"
@@ -103,177 +106,260 @@ const body = "mt-3 ps-5 sm:ps-14";
             label="minip2p dinosaur"
           />
         </div>
-        <figcaption class="mt-3 text-center text-xs text-muted-foreground">
-          fig. 1 — the dino. <span class="text-accent">boop it.</span>
+        <figcaption class="mt-2 font-mono text-xs text-faint md:text-center">
+          fig. 1 — the dino. boop it.
         </figcaption>
       </figure>
 
-      <div>
-        <section aria-labelledby="man-name">
-          <h2 class={heading} id="man-name">NAME</h2>
-          <h1 class={`${body} mb-0 text-[clamp(1.25rem,2.6vw,1.875rem)] leading-tight font-normal text-foreground`}>
-            <b class="font-bold">minip2p</b> <span class="text-muted-foreground">—</span>{" "}
-            <span class="whitespace-nowrap">peer-to-peer,</span> <span class="whitespace-nowrap text-accent">kept simple.</span>
-          </h1>
-        </section>
+      <div class="min-w-0">
+        <h1 class="m-0 font-display text-[2rem]/10 font-semibold tracking-[-0.03em] text-foreground sm:text-5xl/14">
+          minip2p <span class="font-normal text-faint">—</span>{" "}
+          <span class="whitespace-nowrap">peer-to-peer,</span>{" "}
+          <span class="whitespace-nowrap text-accent">kept simple.</span>
+        </h1>
+        <p class="mt-4 mb-0 max-w-xl text-base/7 text-muted-foreground sm:text-lg/8">
+          A minimal libp2p implementation in Rust that connects applications
+          over QUIC and TCP, from Rust, Node.js, React Native, or the browser.
+        </p>
 
-        <section class="mt-10" aria-labelledby="man-synopsis">
-          <h2 class={heading} id="man-synopsis">SYNOPSIS</h2>
-          <ul class={`${body} m-0 list-none p-0`}>
-            {
-              install.map(({ command, note }) => (
-                <li class="man-command group flex items-center gap-3 py-1">
-                  <span class="text-muted-foreground" aria-hidden="true">$</span>
-                  <code class="text-foreground">{command}</code>
-                  <span class="hidden text-muted-foreground sm:inline"># {note}</span>
+        {/* Without scripts this is a plain list of every command; the script
+            below turns it into tabs with one copy button. */}
+        <div class="group/install mt-8 max-w-xl overflow-hidden rounded-lg border border-border bg-code" data-install>
+          <div class="hidden h-10 border-b border-border font-mono text-xs group-data-ready/install:flex">
+            {/* Too wide for a phone: the strip scrolls, fading at its edge. */}
+            <div
+              class="flex min-w-0 grow gap-4 overflow-x-auto px-3 [scrollbar-width:none] max-sm:[mask-image:linear-gradient(to_right,black_calc(100%-24px),transparent)]"
+              role="tablist"
+              aria-label="Install with"
+            >
+              {
+                install.map(({ id, tab }, index) => (
                   <button
                     type="button"
-                    class="man-copy ms-auto text-xs text-muted-foreground hover:text-accent focus-visible:text-accent"
-                    data-copy={command}
-                    aria-label={`Copy ${command}`}
-                    hidden
+                    role="tab"
+                    id={`install-tab-${id}`}
+                    aria-controls={`install-${id}`}
+                    aria-selected={index === 0 ? "true" : "false"}
+                    tabindex={index === 0 ? 0 : -1}
+                    class="shrink-0 cursor-pointer text-faint transition-colors outline-none hover:text-foreground focus-visible:text-foreground focus-visible:underline focus-visible:decoration-accent focus-visible:underline-offset-4 aria-selected:text-foreground aria-selected:shadow-[inset_0_-2px_0_var(--color-accent)]"
                   >
-                    copy
+                    {tab}
                   </button>
+                ))
+              }
+            </div>
+            <button
+              type="button"
+              class="shrink-0 cursor-pointer px-3 text-faint transition-colors outline-none hover:text-foreground focus-visible:text-foreground focus-visible:underline focus-visible:decoration-accent focus-visible:underline-offset-4"
+              data-copy
+              hidden
+            >
+              copy
+            </button>
+          </div>
+          <ul class="m-0 list-none p-0">
+            {
+              install.map(({ command, id, tab }) => (
+                <li
+                  class="overflow-x-auto border-t border-border px-4 py-3 first:border-t-0"
+                  id={`install-${id}`}
+                  role="tabpanel"
+                  aria-labelledby={`install-tab-${id}`}
+                  data-command={command}
+                >
+                  <span class="block font-mono text-xs text-faint group-data-ready/install:hidden">{tab}</span>
+                  <code class="font-mono text-sm whitespace-nowrap text-foreground">
+                    <span class="me-3 text-faint select-none" aria-hidden="true">$</span>{command}
+                  </code>
                 </li>
               ))
             }
           </ul>
-        </section>
+        </div>
       </div>
     </div>
+  </section>
 
-    <section class="mt-10" aria-labelledby="man-description">
-      <h2 class={heading} id="man-description">DESCRIPTION</h2>
-      <div class={`${body} flex flex-col gap-4 text-muted-foreground`}>
+  <div class="mx-auto max-w-5xl px-6 lg:px-8">
+    <section class={section} aria-labelledby="about">
+      <h2 class={eyebrow} id="about">about</h2>
+      <div class="flex max-w-2xl flex-col gap-4 text-base/7 text-muted-foreground">
+        <p class={title}>Nothing runs behind your back.</p>
         <p class="m-0">
-          <b class="text-foreground">minip2p</b> is a minimal libp2p implementation
-          in Rust. It connects applications over authenticated QUIC and TCP,
-          negotiates custom protocol streams, and adds pubsub, discovery, relays,
-          and NAT traversal only when you ask for them.
+          <span class="text-foreground">minip2p</span> is a minimal libp2p
+          implementation in Rust. It connects applications over authenticated
+          QUIC and TCP, negotiates custom protocol streams, and adds pubsub,
+          discovery, relays, and NAT traversal only when you ask for them.
         </p>
         <p class="m-0">
-          Nothing runs behind your back. There is no async runtime: the protocols
-          are deterministic sans-I/O state machines that move only when you call{" "}
-          <b class="text-foreground">wait</b>. Sockets, clocks, and timers live in
-          adapters, and{" "}
-          <span class="underline decoration-accent underline-offset-4">unsafe</span>{" "}
-          is forbidden across the workspace.
+          There is no async runtime: the protocols are deterministic sans-I/O
+          state machines that move only when you call <code class={code}>wait</code>.
+          Sockets, clocks, and timers live in adapters, and{" "}
+          <code class={code}>unsafe</code> is forbidden across the workspace.
         </p>
         <p class="m-0">
-          The core builds as <b class="text-foreground">no_std + alloc</b> for
+          The core builds as <code class={code}>no_std + alloc</code> for
           microcontrollers. Node.js, React Native, and the browser drive the same
           endpoint through bindings, with Promises and typed events.
         </p>
       </div>
     </section>
 
-    <section class="mt-10" aria-labelledby="man-features">
-      <h2 class={heading} id="man-features">FEATURES</h2>
-      <p class={`${body} m-0 text-muted-foreground`}>
-        Cargo features of <b class="text-foreground">minip2p-rs</b>. Each adds a
-        capability without changing the endpoint interface.
-      </p>
-      <dl class={`${body} m-0`}>
-        {
-          features.map(({ name, body: text }) => (
-            <div class="grid gap-x-6 py-1.5 sm:grid-cols-[16ch_1fr]">
-              <dt class="font-bold text-accent">{name}</dt>
-              <dd class="m-0 ps-[4ch] text-muted-foreground sm:ps-0">{text}</dd>
-            </div>
-          ))
-        }
-      </dl>
-    </section>
-
-    <section class="mt-10" aria-labelledby="man-examples">
-      <h2 class={heading} id="man-examples">EXAMPLES</h2>
-      <p class={`${body} m-0 text-muted-foreground`}>
-        Dial a peer, wait until it is ready, and ping it. Both programs are
-        compiled in CI exactly as shown.
-      </p>
-      {/* `.prose` gives the tabs the same code styles as a docs page. */}
-      <div class={`${body} prose man-example max-w-none`} data-quickstart>
-        <Tabs hash={false}>
-          <Tab title="Rust"><Fragment set:html={dialerHtml} /></Tab>
-          <Tab title="TypeScript"><Fragment set:html={pingHtml} /></Tab>
-        </Tabs>
-        {/* Blume builds the tab buttons from script and, until then, shows only
-            the first panel. Without scripts, show both snippets instead, each
-            labelled from the title Blume already puts on its panel. */}
-        <noscript>
-          <style>
-            [data-quickstart] [data-blume-tablist] {
-              display: none;
-            }
-            [data-quickstart] [data-blume-tab-content] > * {
-              display: block !important;
-            }
-            [data-quickstart] [data-blume-tab-panel]::before {
-              border-bottom: 1px solid var(--blume-border);
-              color: var(--blume-muted-foreground);
-              content: attr(data-title);
-              display: block;
-              font-family: var(--blume-font-mono);
-              font-size: 0.75rem;
-              padding: 0.625rem 1rem;
-            }
-          </style>
-        </noscript>
+    <section class={section} aria-labelledby="features">
+      <h2 class={eyebrow} id="features">features</h2>
+      <div class="min-w-0">
+        <p class={title}>Cargo features</p>
+        <p class="mt-2 mb-0 max-w-2xl text-base/7 text-muted-foreground">
+          Each feature of <code class={code}>minip2p-rs</code> adds a capability
+          without changing the endpoint interface.
+        </p>
+        {/* Name, dotted leader, description; stacked on narrow screens. */}
+        <ul class="mt-6 mb-0 list-none border-t border-border p-0">
+          {
+            features.map(({ name, body }) => (
+              <li class="flex flex-col gap-1 border-b border-border py-3 text-sm/6 md:flex-row md:items-baseline md:gap-2 md:py-2">
+                <code class="font-mono text-sm text-accent">{name}</code>
+                <span class="hidden min-w-8 flex-1 -translate-y-1 border-b border-dotted border-faint opacity-60 md:block" aria-hidden="true" />
+                <span class="text-muted-foreground">{body}</span>
+              </li>
+            ))
+          }
+        </ul>
       </div>
     </section>
 
-    <section class="mt-10" aria-labelledby="man-see-also">
-      <h2 class={heading} id="man-see-also">SEE ALSO</h2>
-      <ul class={`${body} m-0 list-none p-0`}>
+    <section class={section} aria-labelledby="example">
+      <h2 class={eyebrow} id="example">example</h2>
+      <div class="min-w-0">
+        <p class={title}>Dial a peer, wait until it is ready, and ping it.</p>
+        <p class="mt-2 mb-0 text-base/7 text-muted-foreground">
+          Both programs are compiled in CI exactly as shown.
+        </p>
+        {/* `.prose` gives the tabs the same code styles as a docs page. */}
+        <div class="prose mt-6 max-w-none [&_blume-tabs]:my-0" data-quickstart>
+          <Tabs hash={false}>
+            <Tab title="Rust"><Fragment set:html={dialerHtml} /></Tab>
+            <Tab title="TypeScript"><Fragment set:html={pingHtml} /></Tab>
+          </Tabs>
+          {/* Blume builds the tab buttons from script and, until then, shows only
+              the first panel. Without scripts, show both snippets instead, each
+              labelled from the title Blume already puts on its panel. */}
+          <noscript>
+            <style>
+              [data-quickstart] [data-blume-tablist] {
+                display: none;
+              }
+              [data-quickstart] [data-blume-tab-content] > * {
+                display: block !important;
+              }
+              [data-quickstart] [data-blume-tab-panel]::before {
+                border-bottom: 1px solid var(--blume-border);
+                color: var(--minip2p-faint);
+                content: attr(data-title);
+                display: block;
+                font-family: var(--blume-font-mono);
+                font-size: 0.75rem;
+                padding: 0.5rem 1rem;
+              }
+            </style>
+          </noscript>
+        </div>
+      </div>
+    </section>
+
+    <section class={section} aria-labelledby="next">
+      <h2 class={eyebrow} id="next">next</h2>
+      {/* Hairline cells: the grid's gap shows its border-coloured background.
+          An odd last cell spans the row so no empty cell shows through. */}
+      <ul class="m-0 grid list-none gap-px overflow-hidden rounded-lg border border-border bg-border p-0 sm:grid-cols-2">
         {
-          seeAlso.map(({ href, name, section, body: text }) => {
-            const external = href.startsWith("http");
-            return (
-              <li>
-                <a
-                  class="group grid gap-x-6 py-1.5 text-muted-foreground no-underline sm:grid-cols-[24ch_1fr]"
-                  href={href}
-                  target={external ? "_blank" : undefined}
-                  rel={external ? "noopener noreferrer" : undefined}
-                >
-                  <span>
-                    <b class="text-foreground underline decoration-accent/60 underline-offset-4 group-hover:text-accent group-hover:decoration-accent">{name}</b>({section})
-                  </span>
-                  <span class="ps-[4ch] group-hover:text-foreground sm:ps-0">{text}</span>
-                </a>
-              </li>
-            );
-          })
+          next.map(({ href, name, body }) => (
+            <li class="bg-background sm:last:odd:col-span-2">
+              <a class="group flex h-full flex-col gap-1 p-4 no-underline transition-colors hover:bg-muted" href={href} {...external(href)}>
+                <span class="text-sm font-medium text-foreground group-hover:text-accent">
+                  {name}
+                  {href.startsWith("http") && <span class="text-faint" aria-hidden="true"> ↗</span>}
+                </span>
+                <span class="text-sm text-muted-foreground">{body}</span>
+              </a>
+            </li>
+          ))
         }
       </ul>
     </section>
+  </div>
 
-    <p class="man-running mt-14 mb-0 flex justify-between sm:grid sm:grid-cols-[1fr_auto_1fr] gap-4 text-xs text-muted-foreground">
-      <span>minip2p {version}</span>
-      <span class="hidden sm:inline">{msrv && `rust ${msrv}+`}</span>
-      <span class="text-end">MINIP2P(7)</span>
-    </p>
-  </article>
-  <StatusBar slot="footer" />
+  <footer slot="footer" class="border-t border-border">
+    <div class="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-x-6 gap-y-2 px-6 py-6 font-mono text-xs text-faint lg:px-8">
+      <p class="m-0">minip2p {release}</p>
+      <nav class="flex gap-4" aria-label="Footer">
+        {
+          footLinks.map(({ href, label }) => (
+            <a class="text-faint no-underline transition-colors hover:text-foreground" href={href} {...external(href)}>
+              {label} <span aria-hidden="true">↗</span>
+            </a>
+          ))
+        }
+      </nav>
+    </div>
+  </footer>
 </PageLayout>
 
 <script>
-  // Copy buttons appear only where the Clipboard API does; otherwise the
-  // commands stay plain, selectable text. A denied write says so on the
-  // button rather than failing silently.
-  if (navigator.clipboard) {
-    for (const button of document.querySelectorAll<HTMLButtonElement>("[data-copy]")) {
-      button.hidden = false;
-      button.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(button.dataset.copy ?? "");
-          button.textContent = "copied";
-        } catch {
-          button.textContent = "select it";
+  // Turn the install list into tabs. The copy button appears only where the
+  // Clipboard API does; a denied write says so rather than failing silently.
+  // Blume's client router swaps pages without rerunning this module, so it
+  // runs on every page load and skips a block it has already set up.
+  document.addEventListener("astro:page-load", () => {
+    for (const block of document.querySelectorAll<HTMLElement>("[data-install]:not([data-ready])")) {
+      const tabs = [...block.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+      const panels = [...block.querySelectorAll<HTMLElement>('[role="tabpanel"]')];
+      const copy = block.querySelector<HTMLButtonElement>("[data-copy]");
+      const steps: Record<string, number> = { ArrowLeft: -1, ArrowRight: 1 };
+      let active = 0;
+
+      const select = (index: number) => {
+        active = index;
+        for (const [i, tab] of tabs.entries()) {
+          tab.setAttribute("aria-selected", String(i === index));
+          tab.tabIndex = i === index ? 0 : -1;
         }
-        setTimeout(() => (button.textContent = "copy"), 1500);
-      });
+        for (const [i, panel] of panels.entries()) {
+          panel.hidden = i !== index;
+        }
+      };
+
+      for (const [i, tab] of tabs.entries()) {
+        tab.addEventListener("click", () => {
+          select(i);
+          // A tab half-hidden in the scrolling strip comes fully into view.
+          tab.scrollIntoView({ block: "nearest", inline: "nearest" });
+        });
+        tab.addEventListener("keydown", (event) => {
+          const step = steps[event.key];
+          if (step) {
+            event.preventDefault();
+            const next = (i + step + tabs.length) % tabs.length;
+            select(next);
+            tabs[next]?.focus();
+          }
+        });
+      }
+      select(0);
+      block.dataset.ready = "";
+
+      if (copy && navigator.clipboard) {
+        copy.hidden = false;
+        copy.addEventListener("click", async () => {
+          try {
+            await navigator.clipboard.writeText(panels[active]?.dataset.command ?? "");
+            copy.textContent = "copied";
+          } catch {
+            copy.textContent = "select it";
+          }
+          setTimeout(() => (copy.textContent = "copy"), 1500);
+        });
+      }
     }
-  }
+  });
 </script>

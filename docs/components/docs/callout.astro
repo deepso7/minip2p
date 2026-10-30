@@ -1,31 +1,28 @@
 ---
-// A callout as a log line: a level tag (`note:`, `warn:`) and the message,
-// coloured by level and hung off a left rule.
+// A callout as a dashed aside: a lowercase mono eyebrow naming the type
+// (`note`, `warning`, …) floats into the first line of the message. Notes and
+// tips print in the accent, warnings in amber, danger in red. Takes the
+// built-in's props; `icon` is accepted and dropped, the eyebrow names the type.
 import type { CalloutProps } from "blume/components";
 
 type Props = CalloutProps;
 
-const { type = "info", title } = Astro.props;
-const level = {
-  check: "ok",
-  danger: "error",
-  info: "info",
-  note: "note",
-  success: "ok",
-  tip: "hint",
-  warning: "warn",
-}[type] ?? "info";
-const tones: Record<string, string> = { error: "term-tone-error", warn: "term-tone-warn" };
-const tone = tones[level] ?? "term-tone-signal";
+const { color, type = "info", title } = Astro.props;
+const tones: Record<string, string> = { danger: "text-danger", warning: "text-warning" };
 ---
 
 <aside
-  class:list={["term-callout not-prose my-6 grid gap-x-3 border-s-2 py-2 ps-4 text-sm leading-relaxed sm:grid-cols-[auto_1fr]", tone]}
+  class="my-6 flow-root rounded-blume border border-dashed border-border px-3.5 py-2.5 text-sm leading-6 text-muted-foreground"
   data-blume-callout={type}
 >
-  <span class="term-callout-level font-bold">{level}:</span>
-  <div class="text-muted-foreground [&>*]:mt-2! [&>*]:mb-0! [&>:first-child]:mt-0! [&_a]:text-foreground [&_a]:underline [&_code]:text-foreground">
-    {title && <p class="font-bold text-foreground">{title}</p>}
+  <span
+    class:list={["float-start me-2 font-mono text-xs leading-6 lowercase", tones[type] ?? "text-accent"]}
+    style={color ? `color:${color}` : undefined}
+  >
+    {type}
+  </span>
+  <div class="[&>*]:mt-2! [&>*]:mb-0! [&>:first-child]:mt-0!">
+    {title && <p class="font-medium text-foreground">{title}</p>}
     <slot />
   </div>
 </aside>

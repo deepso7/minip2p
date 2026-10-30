@@ -1,0 +1,40 @@
+---
+// The Docs / Changelog tabs (`navigation.tabs`) as plain text links: the
+// current tab in the foreground, the others faint. Rendered at the top of the
+// content column by breadcrumbs.astro, and in the header's top row on the
+// changelog index, which has no content-column chrome of its own. The current
+// tab is `aria-current="page"` only on its own landing page, and `"true"` on
+// the pages under it.
+import data from "blume:data";
+import { withMountedBase } from "blume/components/islands/base-path.ts";
+import { currentTabForRoute } from "blume/components/layout/nav-utils.ts";
+import { EN_UI } from "blume/core/i18n-ui.ts";
+
+interface Props {
+  route: string;
+  class?: string;
+}
+
+const { route, class: className } = Astro.props;
+const { tabs, root } = data.navigation;
+const active = currentTabForRoute(tabs, route, root);
+---
+
+{
+  tabs.length > 0 && (
+    <nav aria-label={EN_UI.nav.sections} class:list={["flex gap-6 text-sm", className]}>
+      {tabs.map((tab) => {
+        const href = tab.href ?? tab.path;
+        return (
+          <a
+            aria-current={tab === active ? (href === route ? "page" : "true") : undefined}
+            class="text-faint transition-colors hover:text-foreground aria-[current]:text-foreground"
+            href={withMountedBase(href)}
+          >
+            {tab.label}
+          </a>
+        );
+      })}
+    </nav>
+  )
+}

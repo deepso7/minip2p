@@ -18,7 +18,7 @@ The core idea: **the framework _is_ the template.** There's no starter to clone 
 
 ## Quickstart
 
-Blume needs **Node.js 22.12 or newer**. From an empty folder:
+Blume needs **Node.js 22.19 or newer**. From an empty folder:
 
 ```bash
 npx blume init   # scaffold docs/index.mdx, blume.config.ts, and package.json scripts, then install
@@ -59,13 +59,16 @@ It bumps `blume` in `package.json`, installs, and lists every config change stil
 
 ## Migrating from another framework
 
-To move a Mintlify, Fumadocs, Docusaurus, Starlight, or Nextra site to Blume, the user runs `npx blume migrate [source] --codex` (or `--claude`) from that project, which opens an agent on the `blume-migrate` skill. When you are that agent, or the user asks you to migrate directly, follow `skills/blume-migrate/SKILL.md` in the installed package instead of this file.
+To move a Mintlify, Docusaurus, GitBook, MkDocs, ReadMe, or other docs site to Blume, the user runs `npx blume migrate [source] --codex` (or `--claude`) from that project, which opens an agent on the `blume-migrate` skill. When you are that agent, or the user asks you to migrate directly, follow `skills/blume-migrate/SKILL.md` in the installed package instead of this file.
+
+Every build publishes a generated agent skill for the site at `/skill.md` (`agents.skillMd`). To write a richer one from the docs, the user runs `blume skill --codex` (or `--claude`), which opens an agent on the `blume-write-skill` skill. When you are that agent, or the user asks you to write the site's skill directly, follow `skills/blume-write-skill/SKILL.md` in the installed package.
 
 ## What's included
 
 - **Components** — callouts, cards, steps, tabs, accordions, badges, file trees, and parameter tables, usable in MDX with no imports.
 - **Local search** — Orama in dev and production, with no hosted index; Pagefind, Algolia, and other backends are one adapter away (`search: pagefind()` from `blume/search`).
 - **AI** — `llms.txt`, raw Markdown URLs, a JSON docs API with an OpenAPI description, Copy as Markdown, Open in chat, an in-page assistant, and an MCP server endpoint served by the docs site itself.
+- **Narration** — a "Listen to this page" player (`narration: true` for browser voices, or `narration: { provider: gateway({ … }) }` from `blume/ai` for voices generated at build; `openai({ model, voice })` uses OpenAI's speech models instead, and with a `baseUrl` a self-hosted OpenAI-compatible speech server, and needs `@ai-sdk/openai` installed).
 - **Navigation** — inferred from files, refined with `meta.ts` or config.
 - **SEO** — metadata, Open Graph images, RSS feeds, and JSON-LD.
 - **Customization** — component overrides, React islands, custom pages, theme tokens, and a source-component registry via `blume add`.
