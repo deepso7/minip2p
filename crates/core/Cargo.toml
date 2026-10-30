@@ -23,7 +23,7 @@ base64ct = { version = "1.8.3", default-features = false, features = ["alloc"] }
 # Shared stream payload handle (ADR 0011); re-exported as `minip2p_core::Bytes`.
 bytes = { workspace = true }
 getrandom = { workspace = true, optional = true }
-minip2p-identity = { path = "../identity", version = "0.10.6", default-features = false }
+minip2p-identity = { path = "../identity", version = "0.11.0", default-features = false }
 thiserror = { workspace = true }
 
 [dev-dependencies]

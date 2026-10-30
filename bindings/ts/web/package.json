@@ -1,6 +1,6 @@
 {
   "name": "@minip2p/web",
-  "version": "0.10.6",
+  "version": "0.11.0",
   "description": "Browser SDK for minip2p over libp2p WebTransport",
   "keywords": [
     "browser",
