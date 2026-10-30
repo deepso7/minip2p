@@ -182,7 +182,7 @@ jobs:
       - name: Backdate ubrn sources
         if: steps.ubrn.outputs.cache-hit == 'true'
         working-directory: node_modules/uniffi-bindgen-react-native
-        run: find . -path ./target -prune -o -exec touch -d 2000-01-01T00:00:00Z {} +
+        run: find . -path ./target -prune -o -exec touch -t 200001010000 {} +
       - run: pnpm --workspace-root rn:android
       - name: Save ubrn CLI build
         if: github.ref == 'refs/heads/main' && steps.ubrn.outputs.cache-hit != 'true'
@@ -246,7 +246,7 @@ jobs:
       - name: Backdate ubrn sources
         if: steps.ubrn.outputs.cache-hit == 'true'
         working-directory: node_modules/uniffi-bindgen-react-native
-        run: find . -path ./target -prune -o -exec touch -d 2000-01-01T00:00:00Z {} +
+        run: find . -path ./target -prune -o -exec touch -t 200001010000 {} +
       - run: pnpm --workspace-root rn:ios
       - name: Save ubrn CLI build
         if: github.ref == 'refs/heads/main' && steps.ubrn.outputs.cache-hit != 'true'

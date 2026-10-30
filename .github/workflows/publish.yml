@@ -439,7 +439,7 @@ jobs:
       - name: Backdate ubrn sources
         if: steps.ubrn.outputs.cache-hit == 'true'
         working-directory: node_modules/uniffi-bindgen-react-native
-        run: find . -path ./target -prune -o -exec touch -d 2000-01-01T00:00:00Z {} +
+        run: find . -path ./target -prune -o -exec touch -t 200001010000 {} +
       - run: pnpm --workspace-root rn:android
       - name: Validate Android ELF alignment and allocator hooks
         run: node react-native/scripts/check-android-elf.mjs
@@ -551,7 +551,7 @@ jobs:
       - name: Backdate ubrn sources
         if: steps.ubrn.outputs.cache-hit == 'true'
         working-directory: node_modules/uniffi-bindgen-react-native
-        run: find . -path ./target -prune -o -exec touch -d 2000-01-01T00:00:00Z {} +
+        run: find . -path ./target -prune -o -exec touch -t 200001010000 {} +
       - run: pnpm --workspace-root rn:ios
       - name: Validate XCFramework slices
         run: |
@@ -625,7 +625,7 @@ jobs:
       - name: Backdate ubrn sources
         if: steps.ubrn.outputs.cache-hit == 'true'
         working-directory: node_modules/uniffi-bindgen-react-native
-        run: find . -path ./target -prune -o -exec touch -d 2000-01-01T00:00:00Z {} +
+        run: find . -path ./target -prune -o -exec touch -t 200001010000 {} +
       - name: Build the web wasm
         run: pnpm --filter @minip2p/web wasm:build
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
