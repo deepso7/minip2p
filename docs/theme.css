@@ -14,8 +14,9 @@
   --blume-foreground: oklch(0.2 0.008 250);
   --blume-muted: oklch(0.93 0.006 60);
   --blume-muted-foreground: oklch(0.42 0.008 250);
-  /* Quieter than muted-foreground: sidebar group labels, eyebrows, hints. */
-  --minip2p-faint: oklch(0.62 0.008 250);
+  /* Quieter than muted-foreground: sidebar group labels, eyebrows, hints.
+     Still real text, so it keeps 4.5:1 on the page and on code surfaces. */
+  --minip2p-faint: oklch(0.52 0.008 250);
   --blume-border: oklch(0.87 0.006 60);
   --blume-accent: var(--minip2p-orange);
   --blume-accent-foreground: oklch(0.98 0.004 60);
@@ -31,7 +32,7 @@
   --blume-foreground: oklch(0.93 0.005 60);
   --blume-muted: oklch(0.2 0.006 250);
   --blume-muted-foreground: oklch(0.7 0.006 60);
-  --minip2p-faint: oklch(0.48 0.006 250);
+  --minip2p-faint: oklch(0.6 0.006 250);
   --blume-border: oklch(0.26 0.006 250);
   --blume-accent: var(--minip2p-amber);
   --blume-accent-foreground: oklch(0.155 0.006 250);
