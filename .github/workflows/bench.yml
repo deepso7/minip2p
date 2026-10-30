@@ -202,7 +202,12 @@ jobs:
         run: python3 scripts/bench_results.py merge "$RUNNER_TEMP"/bench-slices/*.json --output "$RUNNER_TEMP/current.json" --git-sha "$(git rev-parse HEAD)"
       - name: Read baseline
         id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # Optional: only used to flag a baseline older than the latest release.
+          latest_release=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)
+          echo "latest-release=$latest_release" >> "$GITHUB_OUTPUT"
           if ! git fetch --depth=1 origin bench-data; then
             echo "available=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -221,11 +226,15 @@ jobs:
         if: steps.baseline.outputs.available == 'true'
         env:
           BASELINE_LABEL: ${{ steps.baseline.outputs.release }}
+          LATEST_RELEASE: ${{ steps.baseline.outputs.latest-release }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: >-
-          python3 scripts/bench_results.py compare --current "$RUNNER_TEMP/current.json" --baseline "$RUNNER_TEMP/baseline.json" --output "$RUNNER_TEMP/comparison.md" --baseline-label "$BASELINE_LABEL" --check-ir-pins --baseline-tree "${{ steps.baseline.outputs.sha }}" --current-tree "${{ github.event.pull_request.head.sha }}"
+          python3 scripts/bench_results.py compare --current "$RUNNER_TEMP/current.json" --baseline "$RUNNER_TEMP/baseline.json" --output "$RUNNER_TEMP/comparison.md" --baseline-label "$BASELINE_LABEL" --check-ir-pins --baseline-tree "${{ steps.baseline.outputs.sha }}" --current-tree "${{ github.event.pull_request.head.sha }}" --run-url "$RUN_URL" --latest-release "$LATEST_RELEASE"
       - name: Compare without baseline
         if: steps.baseline.outputs.available != 'true'
-        run: python3 scripts/bench_results.py compare --current "$RUNNER_TEMP/current.json" --output "$RUNNER_TEMP/comparison.md"
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 scripts/bench_results.py compare --current "$RUNNER_TEMP/current.json" --output "$RUNNER_TEMP/comparison.md" --run-url "$RUN_URL"
       - name: Prepare comparison artifact
         run: printf '%s\n' "${{ github.event.pull_request.number }}" > "$RUNNER_TEMP/pr-number"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

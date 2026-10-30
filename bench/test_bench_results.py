@@ -32,24 +32,37 @@ class BenchResultsTest(unittest.TestCase):
         by_name = {row.name: row for row in rows}
         self.assertEqual(by_name["micro/noise"].classification, "noise")
         self.assertEqual(by_name["micro/boundary"].classification, "notable")
-        self.assertEqual(by_name["wall/changed"].classification, "informational")
+        self.assertEqual(by_name["wall/changed"].classification, "notable")
         self.assertEqual(by_name["wall/changed"].direction, "regressed")
         self.assertEqual(by_name["node/missing"].classification, "unclassified")
         self.assertEqual(by_name["node/missing"].reason, "missing baseline row")
 
-    def compare_one(self, metric, baseline, current, ir_reason=None):
+    def compare_one(self, metric, baseline, current, ir_reason=None, tier="rust-wall", name="bench"):
         def document(value):
-            return {"schema_version": 1, "git_sha": "sha", "rows": [{"tier": "rust-wall", "name": "bench", "metric": metric, "value": value}]}
+            return {"schema_version": 1, "git_sha": "sha", "rows": [{"tier": tier, "name": name, "metric": metric, "value": value}]}
 
         return bench_results.compare_rows(document(current), document(baseline), ir_reason)[0]
 
     def test_higher_is_better_metric_reverses_direction(self):
         faster = self.compare_one("mb_per_s", 100, 150)
-        self.assertEqual((faster.classification, faster.direction), ("informational", "improved"))
+        self.assertEqual((faster.classification, faster.direction), ("notable", "improved"))
         slower = self.compare_one("mb_per_s", 100, 50)
         self.assertEqual(slower.direction, "regressed")
         fuller = self.compare_one("avg_datagram_bytes", 1000, 1200)
-        self.assertEqual((fuller.classification, fuller.direction), ("informational", "improved"))
+        self.assertEqual((fuller.classification, fuller.direction), ("changed", "improved"))
+
+    def test_wall_bands_follow_benchmark_class(self):
+        cases = {
+            ("rust-wall", "e2e/tcp/ping", "median_ns", 106): "changed",
+            ("rust-wall", "yamux/64KiB/session_send_and_drain", "median_ns", 106): "noise",
+            ("rust-wall", "yamux/64KiB/session_send_and_drain", "median_ns", 110): "changed",
+            ("node-ffi", "sdk_drain_flood", "median_ns", 104.9): "noise",
+            ("rust-wall", "endpoint_ping_load/idle/tcp", "rtt_us_p50", 114): "noise",
+            ("rust-wall", "endpoint_ping_load/idle/tcp", "rtt_us_p50", 130): "notable",
+        }
+        for (tier, name, metric, current), expected in cases.items():
+            with self.subTest(name=name, metric=metric, current=current):
+                self.assertEqual(self.compare_one(metric, 100, current, tier=tier, name=name).classification, expected)
 
     def test_classified_allocation_metric_uses_bands(self):
         row = self.compare_one("allocs_per_msg", 100, 103)
@@ -57,10 +70,10 @@ class BenchResultsTest(unittest.TestCase):
         self.assertEqual(self.compare_one("bytes_allocated_per_msg", 1000, 985).classification, "changed")
 
     def test_informational_metrics_are_never_classified(self):
-        for metric in ("wakeups_per_s", "cpu_ms_per_s", "allocs_per_mb", "rtt_us_p99", "datagrams_per_mb"):
+        for metric in ("cpu_ms_per_s", "rtt_us_p99"):
             with self.subTest(metric=metric):
                 row = self.compare_one(metric, 100, 200)
-                self.assertEqual(row.classification, "informational")
+                self.assertEqual((row.classification, row.direction), ("informational", ""))
 
     def test_ir_pin_mismatch_only_unclassifies_ir_rows(self):
         reason = "incompatible Ir pins: Cargo.lock differs"
@@ -72,13 +85,10 @@ class BenchResultsTest(unittest.TestCase):
         self.assertTrue(all(row.classification == "unclassified" for row in rows))
         self.assertTrue(all(row.reason == "no baseline" for row in rows))
 
-    def test_incompatible_ir_keeps_wall_clock_informational(self):
+    def test_incompatible_ir_keeps_wall_clock_classified(self):
         rows = bench_results.compare_rows(self.current, self.baseline, "incompatible Ir pins: Valgrind differs")
         self.assertTrue(all(row.classification == "unclassified" for row in rows if row.tier == "rust-micro"))
-        self.assertEqual(
-            next(row for row in rows if row.tier == "rust-wall").classification,
-            "informational",
-        )
+        self.assertEqual(next(row for row in rows if row.tier == "rust-wall").classification, "notable")
 
     def test_ir_compatibility_checks_each_git_pin(self):
         changes = {
@@ -126,6 +136,19 @@ class BenchResultsTest(unittest.TestCase):
                     os.chdir(previous)
                 self.assertFalse(compatible)
                 self.assertIn(expected, reason)
+
+    def test_lock_comparison_ignores_workspace_versions_only(self):
+        def lock(own, external):
+            return (
+                "version = 4\n\n[[package]]\nname = \"minip2p-core\"\nversion = \"%s\"\ndependencies = [\n \"aead\",\n]\n\n"
+                "[[package]]\nname = \"aead\"\nversion = \"%s\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+                % (own, external)
+            ).encode()
+
+        normalized = bench_results.lock_without_workspace_versions
+        self.assertEqual(normalized(lock("0.10.5", "0.6.1")), normalized(lock("0.10.6", "0.6.1")))
+        self.assertNotEqual(normalized(lock("0.10.5", "0.6.1")), normalized(lock("0.10.5", "0.6.2")))
+        self.assertIn("version = 4\n", normalized(lock("0.10.5", "0.6.1")))
 
     def test_missing_current_row_is_unclassified(self):
         current = {**self.current, "rows": self.current["rows"][:-1]}
@@ -184,8 +207,9 @@ class BenchResultsTest(unittest.TestCase):
             markdown = output.read_text()
             self.assertIn("Baseline: `v0.4.11 (baseline)`", markdown)
             self.assertIn("| rust-micro | 1 | 0 | 1 | 0 | 0 |", markdown)
-            self.assertIn("| rust-wall | 0 | 0 | 0 | 1 | 0 |", markdown)
+            self.assertIn("| rust-wall | 0 | 0 | 1 | 0 | 0 |", markdown)
             self.assertIn("unclassified (missing baseline row)", markdown)
+            self.assertIn("- Head: `current`", markdown)
 
     def test_zero_baseline_is_unclassified(self):
         baseline = {**self.baseline, "rows": [{**self.baseline["rows"][0], "value": 0}]}
@@ -294,18 +318,37 @@ class BenchResultsTest(unittest.TestCase):
             "| tier | noise | changed | notable | informational | unclassified |",
             markdown,
         )
-        self.assertNotIn("`micro/noise`", markdown)
+        top, details = markdown.split("<details>")
+        self.assertIn("`micro/boundary`", top)
+        self.assertIn("`node/missing`", top)
+        self.assertIn("`micro/noise`", details)
+        self.assertNotIn("`micro/noise`", top)
+
+    def test_renderer_collapses_shared_reasons(self):
+        rows = bench_results.compare_rows(self.current, self.baseline, "incompatible Ir pins: Valgrind version differs")
+        markdown = bench_results.render(self.baseline, rows)
+        self.assertIn("- 2 rows unclassified: incompatible Ir pins: Valgrind version differs", markdown)
+        self.assertEqual(markdown.count("Valgrind version differs"), 1)
+
+    def test_renderer_header_links_run_and_flags_stale_baseline(self):
+        rows = bench_results.compare_rows(self.current, self.baseline, None)
+        markdown = bench_results.render(self.baseline, rows, "v0.4.11", "a" * 40, "https://run", "v0.4.12")
+        self.assertIn(f"- Head: `{'a' * 12}` ([run](https://run))", markdown)
+        self.assertIn("the latest release rather than the PR base", markdown)
+        self.assertIn("baseline is stale: the latest release is `v0.4.12`", markdown)
+        current = bench_results.render(self.baseline, rows, "v0.4.12", "a" * 40, None, "v0.4.12")
+        self.assertNotIn("stale", current)
 
     def test_v1_baseline_compares_new_metric_rows_as_missing(self):
         extra = {"tier": "rust-wall", "name": "wall/changed", "metric": "mb_per_s", "value": 900}
         current = {**self.current, "rows": [*self.current["rows"], extra]}
         rows = {(row.name, row.metric): row for row in bench_results.compare_rows(current, self.baseline, None)}
-        self.assertEqual(rows["wall/changed", "median_ns"].classification, "informational")
+        self.assertEqual(rows["wall/changed", "median_ns"].classification, "notable")
         self.assertAlmostEqual(rows["wall/changed", "median_ns"].delta, 20.0)
         self.assertEqual(rows["wall/changed", "mb_per_s"].reason, "missing baseline row")
         markdown = bench_results.render(self.baseline, list(rows.values()))
-        self.assertIn("| `wall/changed` | `median_ns` | 100 | 120 | +20.00% | informational | regressed |", markdown)
-        self.assertIn("| `wall/changed` | `mb_per_s` | — | 900 |", markdown)
+        self.assertIn("| rust-wall | `wall/changed` | `median_ns` | 100 | 120 | +20.00% | notable | regressed |", markdown)
+        self.assertIn("| rust-wall | `wall/changed` | `mb_per_s` | — | 900 |", markdown)
 
     def test_renderer_escapes_benchmark_names(self):
         current = {**self.current, "rows": [{**self.current["rows"][0], "name": "bad\\|`name\rrow\nnext"}]}

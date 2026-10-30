@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -18,30 +19,56 @@ TIERS = ("rust-micro", "rust-wall", "node-ffi")
 
 class Metric(NamedTuple):
     higher_is_better: bool
-    # Classified metrics get noise/changed/notable bands; the rest are informational.
-    classified: bool
 
 
 # Fixed registry: every row's metric must be listed here. Any tier may use any metric.
 METRICS = {
-    "Ir": Metric(higher_is_better=False, classified=True),
-    "median_ns": Metric(higher_is_better=False, classified=False),
-    "mb_per_s": Metric(higher_is_better=True, classified=False),
-    "wakeups_per_s": Metric(higher_is_better=False, classified=False),
-    "cpu_ms_per_s": Metric(higher_is_better=False, classified=False),
-    # Allocations over real transports depend on scheduling and read chunking.
-    "allocs_per_mb": Metric(higher_is_better=False, classified=False),
-    "bytes_allocated_per_mb": Metric(higher_is_better=False, classified=False),
-    # UDP datagrams per transfer depend on scheduling and congestion control.
-    "datagrams_per_mb": Metric(higher_is_better=False, classified=False),
-    "avg_datagram_bytes": Metric(higher_is_better=True, classified=False),
-    "datagrams_per_receive_call": Metric(higher_is_better=True, classified=False),
-    # Isolated agent operations with fixed inputs allocate deterministically.
-    "allocs_per_msg": Metric(higher_is_better=False, classified=True),
-    "bytes_allocated_per_msg": Metric(higher_is_better=False, classified=True),
-    "rtt_us_p50": Metric(higher_is_better=False, classified=False),
-    "rtt_us_p99": Metric(higher_is_better=False, classified=False),
+    "Ir": Metric(higher_is_better=False),
+    "median_ns": Metric(higher_is_better=False),
+    "mb_per_s": Metric(higher_is_better=True),
+    "wakeups_per_s": Metric(higher_is_better=False),
+    "cpu_ms_per_s": Metric(higher_is_better=False),
+    "allocs_per_mb": Metric(higher_is_better=False),
+    "bytes_allocated_per_mb": Metric(higher_is_better=False),
+    "datagrams_per_mb": Metric(higher_is_better=False),
+    "avg_datagram_bytes": Metric(higher_is_better=True),
+    "datagrams_per_receive_call": Metric(higher_is_better=True),
+    "allocs_per_msg": Metric(higher_is_better=False),
+    "bytes_allocated_per_msg": Metric(higher_is_better=False),
+    "rtt_us_p50": Metric(higher_is_better=False),
+    "rtt_us_p99": Metric(higher_is_better=False),
 }
+# Classification bands as (metric, tier or None for any, name prefix,
+# (changed %, notable %)); the first matching entry wins. A row under `changed`
+# is noise. Rows that match no entry are informational: their change is shown
+# without a direction. Wall-clock bands sit above the run-to-run noise measured
+# on code-identical runs on the bench instance (p90 / max absolute change).
+BANDS = (
+    # Deterministic: instruction counts, and allocations of isolated agent
+    # operations with fixed inputs.
+    ("Ir", None, "", (1.0, 2.0)),
+    ("allocs_per_msg", None, "", (1.0, 2.0)),
+    ("bytes_allocated_per_msg", None, "", (1.0, 2.0)),
+    # Endpoint e2e (p90 1.3%, max 4.9%) and Node FFI (p90 2%, max 4.8%).
+    ("median_ns", "rust-wall", "e2e/", (5.0, 10.0)),
+    ("median_ns", "node-ffi", "", (5.0, 10.0)),
+    # Criterion micro benches (p90 4%, outliers to 40%).
+    ("median_ns", "rust-wall", "", (10.0, 20.0)),
+    # Throughput (p90 5.4%, max 5.8%).
+    ("mb_per_s", None, "", (5.0, 10.0)),
+    # Application ping latency under load (p90 3%, swings ~22-37 µs).
+    ("rtt_us_p50", None, "", (15.0, 30.0)),
+    # Idle wakeups are near-deterministic; a change means a new timer.
+    ("wakeups_per_s", None, "", (10.0, 20.0)),
+    # Allocations and datagrams over real transports depend on scheduling, read
+    # chunking and congestion control (p90 1.6%, max 10%).
+    *((metric, None, "", (15.0, 30.0)) for metric in (
+        "allocs_per_mb", "bytes_allocated_per_mb", "datagrams_per_mb",
+        "avg_datagram_bytes", "datagrams_per_receive_call",
+    )),
+    # rtt_us_p99 (p90 49%) and idle cpu_ms_per_s (~0.005 ms/s of timer noise)
+    # stay informational.
+)
 EXPECTED_CRITERION = {
     "multiaddr/parse_text", "multiaddr/encode_binary", "multiaddr/decode_binary",
     "yamux/64KiB/session_send_and_drain", "yamux/64KiB/session_receive_and_drain",
@@ -321,9 +348,22 @@ def git_bytes(tree: str, path: str) -> bytes:
     return result.stdout
 
 
+def lock_without_workspace_versions(lock: bytes) -> str:
+    """`Cargo.lock` with the version of every path package (an entry without a
+    `source`, i.e. a workspace crate) blanked, so a release's version bump does
+    not make instruction counts incomparable. External packages stay exact."""
+    blocks = lock.decode().split("\n[[package]]\n")
+    return "\n[[package]]\n".join(
+        block if "\nsource = " in block else re.sub(r'^version = ".*"$', "version = _", block, flags=re.M)
+        for block in blocks
+    )
+
+
 def ir_compatible(baseline_tree: str, current_tree: str) -> tuple[bool, str | None]:
     """Compare the five pins that make instruction counts comparable."""
-    if git_bytes(baseline_tree, "Cargo.lock") != git_bytes(current_tree, "Cargo.lock"):
+    if lock_without_workspace_versions(git_bytes(baseline_tree, "Cargo.lock")) != lock_without_workspace_versions(
+        git_bytes(current_tree, "Cargo.lock")
+    ):
         return False, "incompatible Ir pins: Cargo.lock differs"
     try:
         before_bytes = git_bytes(baseline_tree, "bench/pins.json")
@@ -362,6 +402,14 @@ def current_name(name: str) -> str:
     return name
 
 
+def band(tier: str, name: str, metric: str) -> tuple[float, float] | None:
+    """The row's (changed, notable) band from `BANDS`, or None when informational."""
+    for band_metric, band_tier, prefix, thresholds in BANDS:
+        if band_metric == metric and band_tier in (None, tier) and name.startswith(prefix):
+            return thresholds
+    return None
+
+
 def compare_rows(
     current: dict[str, Any], baseline: dict[str, Any] | None, ir_reason: str | None
 ) -> list[ComparedRow]:
@@ -385,14 +433,15 @@ def compare_rows(
             compared.append(ComparedRow(*key, baseline_value, row["value"], None, "unclassified", "", "zero baseline"))
             continue
         delta = (row["value"] - baseline_value) / baseline_value * 100
-        metric = METRICS[row["metric"]]
-        better = -delta if metric.higher_is_better else delta
-        direction = "improved" if better < 0 else "regressed" if better > 0 else ""
-        if not metric.classified:
-            compared.append(ComparedRow(*key, baseline_value, row["value"], delta, "informational", direction))
+        thresholds = band(*key)
+        if thresholds is None:
+            compared.append(ComparedRow(*key, baseline_value, row["value"], delta, "informational", ""))
             continue
+        better = -delta if METRICS[row["metric"]].higher_is_better else delta
+        direction = "improved" if better < 0 else "regressed" if better > 0 else ""
+        changed, notable = thresholds
         magnitude = abs(delta)
-        classification = "notable" if magnitude >= 2.0 else "changed" if magnitude >= 1.0 else "noise"
+        classification = "notable" if magnitude >= notable else "changed" if magnitude >= changed else "noise"
         compared.append(ComparedRow(*key, baseline_value, row["value"], delta, classification, direction))
     current_keys = {(row["tier"], row["name"], row["metric"]) for row in current["rows"]}
     for key, baseline_value in old.items():
@@ -423,29 +472,59 @@ def markdown_code(value: str) -> str:
     return f"`{value}`"
 
 
+# Unclassified rows that stay in the top table: rows only one side has.
+UNMATCHED = ("missing baseline row", "missing current row")
+
+
+def row_table(rows: list[ComparedRow], with_reason: bool) -> list[str]:
+    lines = ["| tier | benchmark | metric | baseline | current | Δ% | class | direction |", "| --- | --- | --- | ---: | ---: | ---: | --- | --- |"]
+    for row in rows:
+        delta = "—" if row.delta is None else f"{row.delta:+.2f}%"
+        classification = row.classification if row.reason is None or not with_reason else f"{row.classification} ({row.reason})"
+        lines.append(f"| {row.tier} | {markdown_code(row.name)} | `{row.metric}` | {display_value(row.baseline)} | {display_value(row.current)} | {delta} | {classification} | {row.direction} |")
+    return lines
+
+
 def render(
     baseline: dict[str, Any] | None,
     rows: list[ComparedRow],
     baseline_label: str | None = None,
+    head_sha: str | None = None,
+    run_url: str | None = None,
+    latest_release: str | None = None,
 ) -> str:
-    baseline_sha = "none" if baseline is None else baseline["git_sha"]
-    baseline_name = baseline_sha if baseline_label is None else f"{baseline_label} ({baseline_sha})"
-    lines = ["<!-- bench-comment -->", "## Benchmark comparison", "", f"Baseline: {markdown_code(baseline_name)}"]
+    """The sticky PR comment: rows beyond their band and unmatched rows up top,
+    every other row in a collapsed block, shared unclassified reasons once."""
+    lines = ["<!-- bench-comment -->", "## Benchmark comparison", ""]
+    head = "unknown" if head_sha is None else head_sha[:12]
+    lines.append(f"- Head: {markdown_code(head)}" + ("" if run_url is None else f" ([run]({run_url}))"))
+    if baseline is None:
+        lines.append("- Baseline: none")
+    else:
+        sha = baseline["git_sha"][:12]
+        name = sha if baseline_label is None else f"{baseline_label} ({sha})"
+        lines.append(f"- Baseline: {markdown_code(name)}, the latest release rather than the PR base, so changes already on `main` show up too.")
+        if latest_release and baseline_label and latest_release != baseline_label:
+            lines += ["", f"> [!WARNING]\n> The baseline is stale: the latest release is {markdown_code(latest_release)}, which has no stored baseline."]
     classifications = ("noise", "changed", "notable", "informational", "unclassified")
     lines += ["", "| tier | noise | changed | notable | informational | unclassified |", "| --- | ---: | ---: | ---: | ---: | ---: |"]
     for tier in TIERS:
         tier_rows = [row for row in rows if row.tier == tier]
         counts = {name: sum(row.classification == name for row in tier_rows) for name in classifications}
         lines.append(f"| {tier} | {counts['noise']} | {counts['changed']} | {counts['notable']} | {counts['informational']} | {counts['unclassified']} |")
-    for tier in TIERS:
-        visible = [row for row in rows if row.tier == tier and row.classification != "noise"]
-        if not visible:
-            continue
-        lines += ["", f"### {tier}", "", "| benchmark | metric | baseline | current | Δ% | class | direction |", "| --- | --- | ---: | ---: | ---: | --- | --- |"]
-        for row in visible:
-            delta = "—" if row.delta is None else f"{row.delta:+.2f}%"
-            classification = row.classification if row.reason is None else f"{row.classification} ({row.reason})"
-            lines.append(f"| {markdown_code(row.name)} | `{row.metric}` | {display_value(row.baseline)} | {display_value(row.current)} | {delta} | {classification} | {row.direction} |")
+    beyond = [row.classification in ("changed", "notable") or row.reason in UNMATCHED for row in rows]
+    top = [row for row, up in zip(rows, beyond) if up]
+    rest = [row for row, up in zip(rows, beyond) if not up]
+    reasons: dict[str, int] = {}
+    for row in rest:
+        if row.reason is not None:
+            reasons[row.reason] = reasons.get(row.reason, 0) + 1
+    lines += ["", "### Beyond the noise band", ""]
+    lines += row_table(top, with_reason=True) if top else ["None."]
+    if reasons:
+        lines += ["", *(f"- {count} rows unclassified: {reason}" for reason, count in reasons.items())]
+    if rest:
+        lines += ["", f"<details><summary>Other rows ({len(rest)})</summary>", "", *row_table(rest, with_reason=False), "", "</details>"]
     return "\n".join(lines) + "\n"
 
 
@@ -459,7 +538,7 @@ def command_compare(args: argparse.Namespace) -> None:
             ir_reason = None
     rows = compare_rows(current, baseline, ir_reason)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(render(baseline, rows, args.baseline_label))
+    args.output.write_text(render(baseline, rows, args.baseline_label, current["git_sha"], args.run_url, args.latest_release))
 
 
 def parser() -> argparse.ArgumentParser:
@@ -504,6 +583,8 @@ def parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--baseline-tree")
     compare_parser.add_argument("--baseline-label")
     compare_parser.add_argument("--current-tree")
+    compare_parser.add_argument("--run-url")
+    compare_parser.add_argument("--latest-release", help="the repository's latest release, to flag a stale baseline")
     compare_parser.set_defaults(run=command_compare)
     return root
 
