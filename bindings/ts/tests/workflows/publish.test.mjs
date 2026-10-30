@@ -90,6 +90,11 @@ test("nothing is published before the full Rust test matrix passes", () => {
   for (const jobName of publishJobs) {
     assert.ok(upstream(jobName).includes("test-rust"), jobName);
   }
+
+  const testRelease = workflow.jobs["test-rust"].steps.find(
+    ({ name }) => name === "Test release commit"
+  );
+  assert.match(testRelease.run, /run-feature-matrix\.sh test-full/u);
 });
 
 test("the web SDK's wasm is built, packed, verified, smoke-tested and published", () => {
