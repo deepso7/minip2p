@@ -94,7 +94,6 @@ jobs:
           BENCH_GIT_SHA: ${{ steps.source.outputs.sha }}
           BENCH_SWEEP: ${{ inputs.sweep }}
           BENCH_CONTEXT: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')) && 'bench-source' || '.' }}
-          BENCH_NO_CACHE: ${{ github.event_name == 'release' && '1' || '' }}
         run: exec scripts/run-bench-container.sh
       - name: Prepare result slice
         id: result

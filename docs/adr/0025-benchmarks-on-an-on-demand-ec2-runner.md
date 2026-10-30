@@ -26,7 +26,7 @@ The instance and its disk persist between runs, so a container escape could tamp
 
 ## Consequences
 
-- The only AWS call on a run's critical path is starting one stopped instance. Builds reuse a warm BuildKit cache, except releases, which build with `--no-cache` so a baseline never reuses layers a PR build produced.
+- The only AWS call on a run's critical path is starting one stopped instance. Every build, release baselines included, reuses the warm BuildKit cache. Cache keys cover each layer's inputs, so a release reuses only layers built from identical inputs, and the digest-pinned base image and the toolchain pinned in `bench/pins.json` keep releases on the same toolchain layer that pull requests are measured with. A container escape could still tamper with the cache, as with anything else on the persistent disk (see Trust boundary).
 - Instruction counts are not comparable with the Fargate baselines. At cutover both `bench-data` pointers are removed, and the next stable release writes the first new baseline. A later change of instance type repeats that reset.
 - With one runner, Bench jobs serialise. A second run's `bench` job waits for the first.
 - Re-running a failed run means **Re-run all jobs**. A partial re-run reuses the earlier `start-runner` result and can sit queued against a stopped instance.

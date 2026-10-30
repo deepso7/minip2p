@@ -126,7 +126,7 @@ Run once by the maintainer with administrator credentials; idempotent. It:
 
 - **`keepalive`** (new): `needs: start-runner`, the same `runs-on`, `if: github.event_name == 'schedule'`, and one `run: true` step.
 - **Measure** runs `exec scripts/run-bench-container.sh` from the trusted checkout. `exec` makes the helper the step's own process, so the runner's cancellation signals reach its traps. The helper:
-  1. builds the image with `docker build` (local BuildKit cache) from the trusted `infra/bench/Dockerfile` and the chosen context, tagged `bench-<run_id>-<attempt>`, with `--build-arg BUILD_JOBS=4`. A `release` event adds `--no-cache`, so a baseline never reuses layers a PR build produced;
+  1. builds the image with `docker build` (local BuildKit cache) from the trusted `infra/bench/Dockerfile` and the chosen context, tagged `bench-<run_id>-<attempt>`, with `--build-arg BUILD_JOBS=4`. (Changed after rollout: a `release` event first added `--no-cache`; releases now reuse the cache too, see ADR 0025);
   2. starts it detached as `docker run -d --name bench-<run_id>-<attempt> --network none --sysctl net.ipv6.conf.lo.disable_ipv6=0 --cap-add SYS_PTRACE --security-opt seccomp=unconfined -e BENCH_GIT_SHA -e BENCH_SWEEP --entrypoint bash <image> -c "$(< scripts/run-container-benches.sh)"`:
      - the entrypoint script comes from the trusted checkout as a `-c` argument (about 1.5 KB), so a measured ref never supplies it, older refs work, and no child can read it from stdin;
      - `seccomp=unconfined` lets Gungraun's `personality(ADDR_NO_RANDOMIZE)` through;

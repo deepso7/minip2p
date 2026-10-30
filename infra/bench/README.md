@@ -147,7 +147,7 @@ BENCH_GIT_SHA=$(git rev-parse HEAD) BENCH_SWEEP=all scripts/run-bench-container.
 
 Run it in the foreground, as above. A script started with `&` from another non-interactive script inherits SIGINT as ignored, so its cancellation trap would never fire.
 
-`BENCH_CONTEXT` selects another build context, and `BENCH_NO_CACHE=1` builds without the layer cache, as releases do. The result lands in `target/bench-artifacts/current.json` (or `rtt/` for a sweep) with the container log in `target/bench-artifacts/bench.log`. Run `infra/bench/bootstrap.sh --no-ssh` when done. The watchdog stops the instance afterwards.
+`BENCH_CONTEXT` selects another build context. The result lands in `target/bench-artifacts/current.json` (or `rtt/` for a sweep) with the container log in `target/bench-artifacts/bench.log`. Run `infra/bench/bootstrap.sh --no-ssh` when done. The watchdog stops the instance afterwards.
 
 ## Retiring Fargate
 
