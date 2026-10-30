@@ -8,9 +8,11 @@ Usage: scripts/release.sh <version> [--full-local]
 
 Prepare, publish, and verify a minip2p release.
 
-By default, the script runs fast local release checks and relies on the
-push-triggered GitHub workflows for the full test matrix. Pass --full-local to
-also run test, clippy, and no_std checks before committing.
+By default, the script runs fast local release checks and relies on GitHub:
+push CI runs the workspace tests and the feature matrix's `ci` rows, and the
+release workflow runs the full matrix before anything is published. Pass
+--full-local to also run the full test matrix, clippy, and no_std checks
+before committing.
 
 The command is resumable. Running it again with the same version reuses an
 existing release commit, GitHub release, and successful workflow runs.
@@ -205,7 +207,7 @@ $mismatched_dependencies"
 
   if [[ "$full_local" == true ]]; then
     echo "release: running the full local CI suite"
-    just test
+    just test test-full
     just clippy
     just check-nostd
   else

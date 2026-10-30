@@ -157,6 +157,8 @@ jobs:
       # As in ci.yml: keeps file and line in backtraces but skips full
       # debuginfo, and makes this job's cache key match ci.yml's msrv job.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # Same pin as ci.yml; bump the two together.
+      NEXTEST_VERSION: 0.9.143
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -170,13 +172,16 @@ jobs:
           # shared-key unset, which yields this same prefix.
           shared-key: msrv
           save-if: false
+      - name: Install cargo-nextest
+        run: curl -sSLf "https://get.nexte.st/$NEXTEST_VERSION/linux" | tar zxf - -C "$HOME/.cargo/bin"
+      # PR CI runs only the feature matrix's `ci` rows; every row runs here,
+      # before anything is published. Doctests mirror ci.yml's test job.
       - name: Test release commit
         run: |
-          cargo test --workspace --locked
-          cargo test -p minip2p-rs --features relay,discovery,mdns,tcp --locked
-          cargo test -p minip2p-tcp --features smoltcp --locked
-          cargo test -p minip2p-mdns --features smoltcp --locked
-          cargo test -p minip2p-rs --no-default-features --features smoltcp --locked
+          cargo nextest run --workspace --locked
+          scripts/run-feature-matrix.sh test-full
+          cargo test --workspace --doc --locked
+          cargo test -p minip2p-tcp --features smoltcp --doc --locked
           cargo doc --workspace --no-deps --locked
           cargo doc -p minip2p-tcp --features smoltcp --no-deps --locked
           cargo doc -p minip2p-mdns --features smoltcp --no-deps --locked
@@ -348,7 +353,8 @@ jobs:
   publish-relay-server-binaries:
     name: Publish relay server binaries
     if: github.event_name == 'release' || inputs.release_tag != ''
-    needs: [verify-release, relay-server-binaries]
+    # test-rust gates this and, through it, publish-relay-container.
+    needs: [verify-release, test-rust, relay-server-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -825,7 +831,7 @@ jobs:
   publish-node-platforms:
     name: Publish Node platform packages
     if: github.event_name == 'release' || inputs.release_tag != ''
-    needs: [verify-release, package-typescript, android-apk]
+    needs: [verify-release, test-rust, package-typescript, android-apk]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: npm

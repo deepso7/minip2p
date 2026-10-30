@@ -78,6 +78,25 @@ test("a failed tagged release can be resumed without moving its tag", () => {
   assert.match(checkout.with.ref, /inputs\.release_tag/u);
 });
 
+test("nothing is published before the full Rust test matrix passes", () => {
+  const needs = (jobName) => [workflow.jobs[jobName].needs ?? []].flat();
+  const upstream = (jobName) =>
+    needs(jobName).flatMap((need) => [need, ...upstream(need)]);
+
+  const publishJobs = Object.keys(workflow.jobs).filter((jobName) =>
+    jobName.startsWith("publish-")
+  );
+  assert.ok(publishJobs.length > 0);
+  for (const jobName of publishJobs) {
+    assert.ok(upstream(jobName).includes("test-rust"), jobName);
+  }
+
+  const testRelease = workflow.jobs["test-rust"].steps.find(
+    ({ name }) => name === "Test release commit"
+  );
+  assert.match(testRelease.run, /run-feature-matrix\.sh test-full/u);
+});
+
 test("the web SDK's wasm is built, packed, verified, smoke-tested and published", () => {
   const { steps } = workflow.jobs["package-typescript"];
   assert.ok(
