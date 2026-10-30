@@ -63,11 +63,13 @@ fn forwarding(c: &mut Criterion) {
 fn heartbeat_1k(c: &mut Criterion) {
     let mut group = c.benchmark_group("pubsub");
     // Building the fixture takes about 20x longer than the heartbeat runs, and
-    // Criterion sizes runs by measured time only, so ask for about a second
-    // of heartbeats in 10 equal samples.
+    // Criterion sizes flat samples by wall time, so each sample is a single
+    // heartbeat and the run lasts about sample_size fixture builds (~0.4 s
+    // each on the bench instance). 30 samples keep one slow heartbeat from
+    // moving the median, which 10 did not.
     group
         .sampling_mode(SamplingMode::Flat)
-        .sample_size(10)
+        .sample_size(30)
         .warm_up_time(Duration::from_millis(100))
         .measurement_time(Duration::from_secs(1));
     group.bench_function("gossipsub_heartbeat_1000_peers_100_topics", |b| {
