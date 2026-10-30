@@ -195,3 +195,5 @@ minip2p-core = { path = "crates/core", default-features = false }
 ## Scope
 
 This crate intentionally does not include runtime networking, DNS resolution, or protocol handlers. It provides stable typed building blocks for higher-level transport/protocol crates, and it does not enforce transport-specific address shapes (that validation belongs in transport adapters).
+
+<!-- bench label smoke test; do not merge -->
