@@ -24,8 +24,9 @@ esac
 repository="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repository"
 
-# musl-gcc compiles ring's C for the target; the linker stays Rust's default,
-# since linking through musl-gcc produced a dynamic, crashing binary.
+# musl-gcc compiles ring's and mimalloc's C for the target; the linker stays
+# Rust's default, since linking through musl-gcc produced a dynamic, crashing
+# binary.
 export "CC_${target//-/_}=musl-gcc"
 export RUSTFLAGS="-C target-feature=+crt-static"
 cargo build --release --locked --target "$target" \

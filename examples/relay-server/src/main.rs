@@ -1,3 +1,8 @@
+// See Cargo.toml: musl's allocator is the relay's bottleneck.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod certificate;
 mod cli;
 mod service;
