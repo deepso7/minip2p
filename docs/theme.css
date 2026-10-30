@@ -54,16 +54,444 @@ body {
 }
 
 * {
-  scrollbar-color: color-mix(in oklch, var(--blume-muted-foreground) 30%, transparent)
+  scrollbar-color: color-mix(
+      in oklch,
+      var(--blume-muted-foreground) 30%,
+      transparent
+    )
     transparent;
   scrollbar-width: thin;
 }
 
 /* ── Layout shell ──────────────────────────────────────────────────────────
  * The header, sidebar, table of contents, and their scroll behaviour.
+ * Markup the shell owns is styled in components/site-header.astro,
+ * sidebar.astro, section-tabs.astro, and toc.astro; these rules reach the
+ * parts Blume renders.
  */
+
+/* Height of the logo + search block that site-header.astro pins over the top
+   of the sidebar column from `lg` up: 24px top padding, a 32px logo row, a
+   16px gap, and the 32px search field. */
+:root {
+  --minip2p-shell-pin: 6.5rem;
+}
+
+/* Docs pages have no header bar from `lg` up, so anchors only need a little
+   room above them. */
+html:has([data-site-header="pinned"]) {
+  @apply lg:scroll-pt-10;
+}
+
+/* The sidebar column starts below the pinned block and stays put while the
+   page scrolls; the nav list scrolls inside it with no visible scrollbar.
+   Blume's scroll restoration keeps working because this element is still its
+   scroll container. */
+[data-blume-nav-drawer] {
+  @apply [scrollbar-width:none] lg:top-(--minip2p-shell-pin) lg:mt-(--minip2p-shell-pin) lg:h-[calc(100dvh-var(--minip2p-shell-pin))] lg:px-6 lg:pt-6 lg:pb-10;
+}
+[data-blume-nav-drawer]::-webkit-scrollbar {
+  @apply hidden;
+}
+
+/* 40px fades at the list's top and bottom edges, driven by its own scroll
+   (Rex's sidebar): the top fade grows over the first 40px scrolled, the bottom
+   one shrinks over the last 40px. A list that doesn't scroll has no timeline,
+   so neither fade shows. Keyboard focus drops the mask so a focused link is
+   never half-hidden. */
+@property --fade-top {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --fade-bottom {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@keyframes minip2p-fade-top {
+  from {
+    --fade-top: 0px;
+  }
+  to {
+    --fade-top: 40px;
+  }
+}
+@keyframes minip2p-fade-bottom {
+  from {
+    --fade-bottom: 40px;
+  }
+  to {
+    --fade-bottom: 0px;
+  }
+}
+@supports (animation-timeline: scroll()) {
+  [data-blume-nav-drawer] {
+    mask-image: linear-gradient(
+      to bottom,
+      transparent,
+      #000 var(--fade-top),
+      #000 calc(100% - var(--fade-bottom)),
+      transparent
+    );
+    animation:
+      minip2p-fade-top linear both,
+      minip2p-fade-bottom linear both;
+    animation-timeline: scroll(self), scroll(self);
+    animation-range:
+      0px 40px,
+      calc(100% - 40px) 100%;
+  }
+  [data-blume-nav-drawer]:has(:focus-visible) {
+    mask-image: none;
+  }
+}
+
+/* The nav tree, plain: faint group headings without icons, muted links, the
+   hover and current page in the foreground, no pills. */
+[data-blume-nav-drawer] .blume-nav-heading {
+  @apply text-faint mb-1 px-0 py-1 font-normal;
+}
+[data-blume-nav-drawer] .blume-nav-heading > svg {
+  @apply hidden;
+}
+[data-blume-nav-drawer] .blume-nav-link {
+  @apply rounded-none px-0 py-1 hover:bg-transparent aria-[current=page]:bg-transparent aria-[current=page]:font-normal;
+}
+/* Blume spaces links 1px apart (a bottom margin); drop it so rows land on a
+   28px rhythm. Group gaps are top margins and stay. */
+[data-blume-nav-drawer] .space-y-px > * {
+  @apply mb-0;
+}
+
+/* The section tabs Blume adds to the top of the mobile drawer. */
+[data-blume-nav-drawer] > nav:not([data-blume-nav-tree]) {
+  @apply border-b-0;
+}
+[data-blume-nav-drawer] > nav:not([data-blume-nav-tree]) a {
+  @apply rounded-none px-0 py-1 font-normal hover:bg-transparent aria-[current=page]:bg-transparent;
+}
+
+/* Blume's search trigger. In the pinned block it stretches over the
+   field-style box site-header.astro draws (label and shortcut included) and
+   drops its icon; in the top bars it stays an icon button. */
+[data-site-search] [data-blume-search-open] {
+  @apply rounded-md hover:bg-transparent;
+}
+[data-site-search="field"] [data-blume-search-open] {
+  @apply lg:absolute lg:inset-0 lg:size-full lg:rounded-lg;
+}
+[data-site-search="field"] [data-blume-search-open] svg {
+  @apply lg:hidden;
+}
+
+/* Blume's built-in header, which PageLayout pages (the landing page and the
+   404) always render: its section tabs as plain text, like section-tabs.astro. */
+[data-blume-header]:not([data-site-header]) nav {
+  @apply gap-6;
+}
+[data-blume-header]:not([data-site-header]) nav > a {
+  @apply text-faint hover:text-foreground aria-[current=page]:text-foreground rounded-none px-0 font-normal hover:bg-transparent;
+}
+
+/* The table-of-contents rail: pinned to the top now there is no header bar,
+   with faint page actions under the list. */
+[data-blume-toc] {
+  @apply top-0 h-dvh;
+}
+[data-blume-toc] [data-blume-page-actions] {
+  @apply border-t-0;
+}
+[data-blume-toc] [data-blume-page-actions] > :is(a, button),
+[data-blume-toc] [data-blume-page-actions] > details > summary {
+  @apply text-faint hover:text-foreground;
+}
 
 /* ── Content ───────────────────────────────────────────────────────────────
  * Prose, code blocks, tabs, tables, breadcrumbs, pagination, and the
  * changelog.
  */
+
+/* Callout tones beside the accent: `text-warning`, `text-danger`. */
+:root {
+  --minip2p-warning: oklch(0.58 0.12 70);
+  --minip2p-danger: oklch(0.53 0.17 27);
+}
+
+:root[data-theme="dark"] {
+  --minip2p-warning: oklch(0.8 0.13 80);
+  --minip2p-danger: oklch(0.7 0.15 25);
+}
+
+@theme inline {
+  --color-warning: var(--minip2p-warning);
+  --color-danger: var(--minip2p-danger);
+}
+
+/* Body copy: 16px muted text, foreground for emphasis, faint list markers.
+   The article isolates so the header lattice can sit behind its text. */
+.prose {
+  @apply text-muted-foreground text-base leading-relaxed [--tw-prose-bullets:var(--color-faint)] [--tw-prose-counters:var(--color-faint)];
+  counter-reset: minip2p-section;
+}
+
+#blume-content > article.prose {
+  @apply isolate;
+}
+
+.prose :where(a) {
+  @apply text-foreground decoration-accent hover:decoration-foreground font-normal underline decoration-solid decoration-1 underline-offset-4 transition-colors;
+}
+
+.prose :where(strong) {
+  @apply text-foreground font-medium;
+}
+
+.prose :where(hr) {
+  @apply border-border my-10;
+}
+
+/* The page title and the description Blume renders under it. */
+.prose :where(h1) {
+  @apply mb-3 text-[32px] leading-10 font-semibold tracking-[-0.03em];
+}
+
+.prose > h1 + p.text-lg {
+  @apply text-foreground mt-0 mb-8 text-lg leading-7;
+}
+
+/* A faint dot lattice behind the breadcrumb, title, and description, fading
+   out downward. It reaches up over a breadcrumb only at `xl`, where the
+   "On this page" dropdown between the two is hidden; the breadcrumb stacks
+   above the isolated article so the dots stay behind it. */
+#blume-content > article > h1:first-child {
+  @apply relative;
+}
+
+#blume-content > article > h1:first-child::before {
+  @apply pointer-events-none absolute -inset-x-6 -top-6 -z-10 h-48 bg-[radial-gradient(var(--color-border)_1px,transparent_1.5px)] bg-[length:14px_14px] content-[''] lg:-inset-x-8;
+  mask-image: linear-gradient(to bottom, #000, transparent);
+}
+
+#blume-content
+  > nav[aria-label="Breadcrumb"]
+  ~ article
+  > h1:first-child::before {
+  @apply xl:-top-12 xl:h-56;
+}
+
+#blume-content > nav[aria-label="Breadcrumb"] {
+  @apply text-faint relative z-[1] mb-2 font-mono text-xs lowercase;
+}
+
+#blume-content > nav[aria-label="Breadcrumb"] a {
+  @apply hover:text-muted-foreground transition-colors;
+}
+
+/* Section headings carry a mono counter, "01", "02", reset per article. */
+.prose :where(h2):not(:where(.not-prose *, .blume-toc-only)) {
+  @apply mt-12 mb-4 flex items-baseline gap-2.5 text-xl leading-7 font-medium tracking-[-0.02em];
+  counter-increment: minip2p-section;
+}
+
+.prose :where(h2):not(:where(.not-prose *, .blume-toc-only))::before {
+  @apply text-accent shrink-0 font-mono text-xs font-normal tracking-normal;
+  content: counter(minip2p-section, decimal-leading-zero);
+}
+
+.prose :where(h3) {
+  @apply mt-8 mb-3 text-lg leading-7 font-medium tracking-[-0.015em];
+}
+
+.prose :where(h4) {
+  @apply text-foreground text-base font-medium;
+}
+
+/* Inline code, also inside not-prose chrome (tab panels, accordions). */
+.prose :not(pre) > code {
+  @apply border-border bg-code text-foreground rounded border box-decoration-clone px-1 py-0.5 font-mono text-sm font-normal;
+}
+
+/* Code blocks: a hairline frame on the code surface, a 36px header bar with
+   the title (foreground) or language (faint) in mono, and a quiet copy button
+   on its right. The language icon is dropped. */
+.prose :where(pre) {
+  @apply rounded-blume border-border bg-code! my-6 border pt-3 pb-1.5 font-mono text-sm leading-6;
+}
+
+/* 12px above the first line: under the bar here, from the frame's edge in
+   tabs and not-prose hosts, which drop the bar. */
+.prose :where(pre[data-language]) {
+  @apply pt-12;
+}
+
+blume-tabs pre[data-language],
+.not-prose pre[data-language] {
+  @apply pt-3;
+}
+
+.prose :where(pre[data-language])::before {
+  @apply text-faint h-9 pr-12 pl-3.5 font-mono text-xs font-normal;
+}
+
+.prose :where(pre[data-title])::before {
+  @apply text-foreground;
+}
+
+/* A bare language label reads as an eyebrow, `bash`; titles keep their case. */
+.prose :where(pre[data-language]:not([data-title]))::before {
+  @apply lowercase;
+}
+
+.prose > :where(pre[data-language][data-icon])::after {
+  content: none;
+}
+
+.prose :where(pre:not(.twoslash, .twoslash pre, blume-panel-tabs *) > code) {
+  @apply px-3.5;
+}
+
+#blume-content [data-blume-copy] {
+  @apply text-faint hover:bg-muted hover:text-foreground size-6 rounded-md bg-transparent;
+}
+
+.prose pre > [data-blume-copy] {
+  @apply top-1.5 right-1.5;
+}
+
+/* Tabs and code groups share the code frame: mono tab labels in a 36px strip,
+   the current one in foreground over a 2px accent rule. */
+blume-tabs.not-prose {
+  @apply bg-code;
+}
+
+blume-tabs [data-blume-tablist] {
+  @apply gap-4 px-3.5;
+}
+
+blume-tabs [data-blume-tablist] > [role="tab"] {
+  @apply text-faint aria-selected:text-foreground h-9 px-0 py-0 font-mono text-xs font-normal;
+}
+
+blume-tabs:not(:defined) [data-blume-tablist] {
+  @apply min-h-9;
+}
+
+blume-tabs [data-blume-tab-actions] {
+  @apply pe-1.5;
+}
+
+blume-tabs [data-blume-tab-panel] {
+  @apply text-sm leading-6;
+}
+
+/* Tables: hairline rows, no frame, a quiet mono header row; wide tables still
+   scroll in their wrapper. */
+.blume-table-scroll {
+  @apply rounded-none border-0;
+}
+
+.prose :where(table) {
+  @apply border-border border-y text-sm leading-6;
+}
+
+.prose :where(tbody tr:last-child) {
+  @apply border-b-0;
+}
+
+.blume-table-scroll :is(th, td) {
+  @apply px-3 py-2.5 first:ps-0 last:pe-0;
+}
+
+.prose :where(thead th) {
+  @apply text-faint font-mono text-xs font-normal lowercase;
+}
+
+/* Accordions: a quiet frame with 14px rows. */
+[data-blume-accordion] > summary {
+  @apply px-3.5 py-3 text-sm;
+}
+
+[data-blume-accordion] > div {
+  @apply text-muted-foreground px-3.5 text-sm leading-6;
+}
+
+/* Page end: a quiet "last updated" line and feedback row, then prev/next as a
+   two-cell hairline grid with mono eyebrows. */
+[data-blume-page-end] > p {
+  @apply text-faint mt-12 text-xs;
+}
+
+[data-blume-page-feedback] {
+  @apply mt-3 border-t-0 pt-0;
+}
+
+[data-blume-page-feedback] p {
+  @apply text-faint text-xs;
+}
+
+[data-blume-page-feedback] button {
+  @apply text-muted-foreground hover:text-foreground gap-1.5 px-2.5 py-1 text-xs [&_svg]:size-3.5;
+}
+
+#blume-content nav[aria-label="Pagination"] {
+  @apply rounded-blume border-border mt-8 grid grid-cols-2 gap-0 overflow-hidden border pt-0;
+}
+
+#blume-content nav[aria-label="Pagination"] > a {
+  @apply hover:bg-muted max-w-none rounded-none border-0 px-3.5 py-2.5 transition-colors;
+}
+
+#blume-content
+  nav[aria-label="Pagination"]
+  > a[href]:has(use[href$="arrow-right"]) {
+  @apply border-border col-start-2 border-s;
+}
+
+#blume-content nav[aria-label="Pagination"] svg {
+  @apply hidden;
+}
+
+#blume-content nav[aria-label="Pagination"] > a > span > span:first-child {
+  @apply text-faint font-mono text-xs leading-5 lowercase;
+}
+
+#blume-content nav[aria-label="Pagination"] > a > span > span:last-child {
+  @apply text-sm leading-6 font-normal;
+}
+
+#blume-content
+  nav[aria-label="Pagination"]
+  > a:has(use[href$="arrow-left"])
+  > span
+  > span:first-child::before {
+  content: "← ";
+}
+
+#blume-content
+  nav[aria-label="Pagination"]
+  > a:has(use[href$="arrow-right"])
+  > span
+  > span:first-child::after {
+  content: " →";
+}
+
+/* The changelog index Blume generates: the year in a mono gutter, then one
+   hairline row per release with its version in mono foreground and the date
+   in faint mono. The category pill is hidden: every GitHub release is
+   "Release". (Blume's own `!` utilities fix the year's size and spacing.) */
+.prose > .not-prose > section > h2 {
+  @apply text-faint font-mono;
+}
+
+.prose > .not-prose > section li > a > span:first-child {
+  @apply font-mono text-sm font-normal;
+}
+
+.prose > .not-prose > section li > a > span + span {
+  @apply hidden;
+}
+
+.prose > .not-prose > section li time {
+  @apply text-faint;
+}

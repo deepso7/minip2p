@@ -1,0 +1,20 @@
+---
+// A quiet mono pill for short facts (`pre-1.0`, `Node.js`), in prose or a
+// table cell. Takes the built-in's props; `class` and `tooltip` apply, while
+// variants, colours, sizes, and icons are accepted and render the one style.
+import type { BadgeProps } from "blume/components";
+
+type Props = BadgeProps;
+
+const { class: astroClass, className, tooltip } = Astro.props;
+---
+
+<span
+  class:list={[
+    "inline-flex w-fit items-center rounded-full bg-muted px-2 py-0.5 font-mono text-xs leading-4 text-muted-foreground",
+    astroClass ?? className,
+  ]}
+  title={tooltip}
+>
+  <slot />
+</span>
