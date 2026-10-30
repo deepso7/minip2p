@@ -308,54 +308,58 @@ const code = "font-mono text-sm text-foreground";
 <script>
   // Turn the install list into tabs. The copy button appears only where the
   // Clipboard API does; a denied write says so rather than failing silently.
-  for (const block of document.querySelectorAll<HTMLElement>("[data-install]")) {
-    const tabs = [...block.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
-    const panels = [...block.querySelectorAll<HTMLElement>('[role="tabpanel"]')];
-    const copy = block.querySelector<HTMLButtonElement>("[data-copy]");
-    const steps: Record<string, number> = { ArrowLeft: -1, ArrowRight: 1 };
-    let active = 0;
+  // Blume's client router swaps pages without rerunning this module, so it
+  // runs on every page load and skips a block it has already set up.
+  document.addEventListener("astro:page-load", () => {
+    for (const block of document.querySelectorAll<HTMLElement>("[data-install]:not([data-ready])")) {
+      const tabs = [...block.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+      const panels = [...block.querySelectorAll<HTMLElement>('[role="tabpanel"]')];
+      const copy = block.querySelector<HTMLButtonElement>("[data-copy]");
+      const steps: Record<string, number> = { ArrowLeft: -1, ArrowRight: 1 };
+      let active = 0;
 
-    const select = (index: number) => {
-      active = index;
+      const select = (index: number) => {
+        active = index;
+        for (const [i, tab] of tabs.entries()) {
+          tab.setAttribute("aria-selected", String(i === index));
+          tab.tabIndex = i === index ? 0 : -1;
+        }
+        for (const [i, panel] of panels.entries()) {
+          panel.hidden = i !== index;
+        }
+      };
+
       for (const [i, tab] of tabs.entries()) {
-        tab.setAttribute("aria-selected", String(i === index));
-        tab.tabIndex = i === index ? 0 : -1;
+        tab.addEventListener("click", () => {
+          select(i);
+          // A tab half-hidden in the scrolling strip comes fully into view.
+          tab.scrollIntoView({ block: "nearest", inline: "nearest" });
+        });
+        tab.addEventListener("keydown", (event) => {
+          const step = steps[event.key];
+          if (step) {
+            event.preventDefault();
+            const next = (i + step + tabs.length) % tabs.length;
+            select(next);
+            tabs[next]?.focus();
+          }
+        });
       }
-      for (const [i, panel] of panels.entries()) {
-        panel.hidden = i !== index;
+      select(0);
+      block.dataset.ready = "";
+
+      if (copy && navigator.clipboard) {
+        copy.hidden = false;
+        copy.addEventListener("click", async () => {
+          try {
+            await navigator.clipboard.writeText(panels[active]?.dataset.command ?? "");
+            copy.textContent = "copied";
+          } catch {
+            copy.textContent = "select it";
+          }
+          setTimeout(() => (copy.textContent = "copy"), 1500);
+        });
       }
-    };
-
-    for (const [i, tab] of tabs.entries()) {
-      tab.addEventListener("click", () => {
-        select(i);
-        // A tab half-hidden in the scrolling strip comes fully into view.
-        tab.scrollIntoView({ block: "nearest", inline: "nearest" });
-      });
-      tab.addEventListener("keydown", (event) => {
-        const step = steps[event.key];
-        if (step) {
-          event.preventDefault();
-          const next = (i + step + tabs.length) % tabs.length;
-          select(next);
-          tabs[next]?.focus();
-        }
-      });
     }
-    select(0);
-    block.dataset.ready = "";
-
-    if (copy && navigator.clipboard) {
-      copy.hidden = false;
-      copy.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(panels[active]?.dataset.command ?? "");
-          copy.textContent = "copied";
-        } catch {
-          copy.textContent = "select it";
-        }
-        setTimeout(() => (copy.textContent = "copy"), 1500);
-      });
-    }
-  }
+  });
 </script>
