@@ -72,7 +72,10 @@ RUN PNPM_VERSION=$(jq -er '.packageManager | select(startswith("pnpm@")) | ltrim
 COPY --from=planner /minip2p/recipe.json recipe.json
 COPY bench/targets bench/
 COPY scripts/build-benches.sh scripts/
-RUN cargo chef cook --release --package minip2p-nodejs --recipe-path recipe.json \
+# `napi build` always passes `--target <host triple>`, which builds into
+# target/<triple>/ instead of target/release/, so cook the binding's
+# dependencies for that target explicitly or the napi step rebuilds them.
+RUN cargo chef cook --release --package minip2p-nodejs --target "$(rustc -vV | sed -n 's/^host: //p')" --recipe-path recipe.json \
     && scripts/build-benches.sh cook
 
 COPY . .
