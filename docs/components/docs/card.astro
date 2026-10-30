@@ -11,7 +11,7 @@ type Props = CardProps;
 
 const { arrow, href, icon, title } = Astro.props;
 const external = href !== undefined && /^https?:\/\//u.test(href);
-const showArrow = href !== undefined && arrow !== false && arrow !== "false";
+const showArrow = Boolean(href) && arrow !== false && arrow !== "false";
 const Tag = href ? "a" : "div";
 ---
 
