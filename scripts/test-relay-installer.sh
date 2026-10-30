@@ -17,7 +17,8 @@ EOF
 chmod 0755 "$test_root/release/$archive/minip2p-relay"
 tar -C "$test_root/release" -czf "$test_root/release/$archive.tar.gz" "$archive"
 
-arm_target="aarch64-unknown-linux-musl"
+# A glibc archive, as releases up to v0.11.0 have: the installer falls back to it.
+arm_target="aarch64-unknown-linux-gnu"
 arm_archive="minip2p-relay-server-v$version-$arm_target"
 mkdir "$test_root/release/$arm_archive"
 cp "$test_root/release/$archive/minip2p-relay" \
