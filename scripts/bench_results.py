@@ -6,9 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, NamedTuple
@@ -348,23 +348,76 @@ def git_bytes(tree: str, path: str) -> bytes:
     return result.stdout
 
 
-def lock_without_workspace_versions(lock: bytes) -> str:
-    """`Cargo.lock` with the version of every path package (an entry without a
-    `source`, i.e. a workspace crate) blanked, so a release's version bump does
-    not make instruction counts incomparable. External packages stay exact."""
-    blocks = lock.decode().split("\n[[package]]\n")
-    return "\n[[package]]\n".join(
-        block if "\nsource = " in block else re.sub(r'^version = ".*"$', "version = _", block, flags=re.M)
-        for block in blocks
-    )
+def ir_seeds(targets: bytes) -> set[str]:
+    """The packages of the `ir` lines in `bench/targets`."""
+    return {fields[1] for line in targets.decode().splitlines() if (fields := line.split()) and fields[0] == "ir"}
+
+
+def reachable_lock(lock: bytes, seeds: set[str]) -> set[tuple]:
+    """The `Cargo.lock` entries reachable from `seeds` by any dependency edge,
+    each as (identity, checksum, dependency identities), so a change outside the
+    IR benches' graph (an example's or a binding's dependency) does not make
+    instruction counts incomparable. Edges carry no feature, kind or target, so
+    this is a superset of what the benches build. A path package (no `source`,
+    a workspace crate) is identified by name alone, so a release's version bump
+    does not count as a change; external packages keep version and source."""
+    try:
+        packages = tomllib.loads(lock.decode()).get("package", [])
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise BenchError(f"invalid Cargo.lock: {error}") from error
+
+    def identity(package: dict[str, Any]) -> tuple:
+        source = package.get("source")
+        return (package["name"], None, None) if source is None else (package["name"], package["version"], source)
+
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for package in packages:
+        by_name.setdefault(package["name"], []).append(package)
+
+    # A dependency is written `name`, `name version` or `name version (source)`.
+    def resolve(reference: str) -> dict[str, Any]:
+        name, _, rest = reference.partition(" ")
+        version, _, source = rest.partition(" ")
+        matches = [
+            package
+            for package in by_name.get(name, [])
+            if (not version or package["version"] == version) and (not source or f"({package.get('source')})" == source)
+        ]
+        if len(matches) != 1:
+            raise BenchError(f"Cargo.lock dependency {reference!r} matches {len(matches)} packages")
+        return matches[0]
+
+    entries = set()
+    pending = []
+    for seed in seeds:
+        if seed not in by_name:
+            raise BenchError(f"Cargo.lock has no package {seed}")
+        pending += by_name[seed]
+    seen: set[tuple] = set()
+    while pending:
+        package = pending.pop()
+        key = identity(package)
+        if key in seen:
+            continue
+        seen.add(key)
+        dependencies = [resolve(reference) for reference in package.get("dependencies", [])]
+        entries.add((key, package.get("checksum"), tuple(sorted(identity(dependency) for dependency in dependencies))))
+        pending += dependencies
+    return entries
 
 
 def ir_compatible(baseline_tree: str, current_tree: str) -> tuple[bool, str | None]:
-    """Compare the five pins that make instruction counts comparable."""
-    if lock_without_workspace_versions(git_bytes(baseline_tree, "Cargo.lock")) != lock_without_workspace_versions(
-        git_bytes(current_tree, "Cargo.lock")
-    ):
-        return False, "incompatible Ir pins: Cargo.lock differs"
+    """Compare the pins that make instruction counts comparable: the IR
+    benches' part of `Cargo.lock` and `bench/pins.json`."""
+    try:
+        # The current tree's IR benches: the baseline may predate bench/targets.
+        seeds = ir_seeds(git_bytes(current_tree, "bench/targets"))
+        before_lock = reachable_lock(git_bytes(baseline_tree, "Cargo.lock"), seeds)
+        after_lock = reachable_lock(git_bytes(current_tree, "Cargo.lock"), seeds)
+    except BenchError as error:
+        return False, f"incompatible Ir pins: {error}"
+    if before_lock != after_lock:
+        return False, "incompatible Ir pins: Cargo.lock differs for the IR benches"
     try:
         before_bytes = git_bytes(baseline_tree, "bench/pins.json")
         after_bytes = git_bytes(current_tree, "bench/pins.json")

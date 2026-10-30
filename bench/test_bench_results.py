@@ -22,6 +22,25 @@ def backdate(marker):
     os.utime(marker, ns=(past, past))
 
 
+REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+
+
+def package(name, version, dependencies=(), external=False):
+    """One `Cargo.lock` package entry; `external` gives it a registry source."""
+    lines = ["", "[[package]]", f'name = "{name}"', f'version = "{version}"']
+    if external:
+        lines.append(f'source = "{REGISTRY}"')
+    if dependencies:
+        lines += ["dependencies = [", *(f' "{dependency}",' for dependency in dependencies), "]"]
+    return "\n".join(lines) + "\n"
+
+
+# A workspace crate depending on one external crate through another.
+LOCK = "version = 4\n" + package("minip2p-core", "0.10.5", ["aead"]) + package("aead", "0.6.1", ["inout"], external=True) + package(
+    "inout", "0.2.0", external=True
+)
+
+
 class BenchResultsTest(unittest.TestCase):
     def setUp(self):
         self.current = bench_results.validate(bench_results.load_json(ROOT / "bench/fixtures/current.json"))
@@ -98,7 +117,7 @@ class BenchResultsTest(unittest.TestCase):
 
     def test_ir_compatibility_checks_each_git_pin(self):
         changes = {
-            "Cargo.lock": ("Cargo.lock", "lock changed\n", "Cargo.lock differs"),
+            "Cargo.lock": ("Cargo.lock", LOCK.replace('"0.6.1"', '"0.6.2"'), "Cargo.lock differs for the IR benches"),
             "missing manifest": ("bench/pins.json", None, "pin manifest unavailable"),
             **{
                 key: ("bench/pins.json", {key: "changed"}, f"{label} differs")
@@ -112,7 +131,8 @@ class BenchResultsTest(unittest.TestCase):
                 subprocess.run(["git", "config", "user.email", "bench@example.invalid"], cwd=repository, check=True)
                 subprocess.run(["git", "config", "user.name", "Bench Test"], cwd=repository, check=True)
                 (repository / "bench").mkdir()
-                (repository / "Cargo.lock").write_text("lock\n")
+                (repository / "Cargo.lock").write_text(LOCK)
+                (repository / "bench/targets").write_text("ir minip2p-core - multiaddr_ir\n")
                 pins = {key: "same" for key in bench_results.IR_PINS}
                 (repository / "bench/pins.json").write_text(json.dumps(pins))
                 subprocess.run(["git", "add", "."], cwd=repository, check=True)
@@ -143,18 +163,27 @@ class BenchResultsTest(unittest.TestCase):
                 self.assertFalse(compatible)
                 self.assertIn(expected, reason)
 
-    def test_lock_comparison_ignores_workspace_versions_only(self):
-        def lock(own, external):
-            return (
-                "version = 4\n\n[[package]]\nname = \"minip2p-core\"\nversion = \"%s\"\ndependencies = [\n \"aead\",\n]\n\n"
-                "[[package]]\nname = \"aead\"\nversion = \"%s\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
-                % (own, external)
-            ).encode()
+    def test_lock_comparison_covers_only_the_ir_benches_graph(self):
+        def reachable(lock):
+            return bench_results.reachable_lock(lock.encode(), {"minip2p-core"})
 
-        normalized = bench_results.lock_without_workspace_versions
-        self.assertEqual(normalized(lock("0.10.5", "0.6.1")), normalized(lock("0.10.6", "0.6.1")))
-        self.assertNotEqual(normalized(lock("0.10.5", "0.6.1")), normalized(lock("0.10.5", "0.6.2")))
-        self.assertIn("version = 4\n", normalized(lock("0.10.5", "0.6.1")))
+        self.assertEqual(reachable(LOCK), reachable(LOCK.replace('"0.10.5"', '"0.10.6"')))
+        self.assertNotEqual(reachable(LOCK), reachable(LOCK.replace('"0.6.1"', '"0.6.2"')))
+        self.assertNotEqual(reachable(LOCK), reachable(LOCK.replace('"0.2.0"', '"0.2.1"')))
+        example_dependency = LOCK + package("mimalloc", "0.1.52", external=True) + package("relay-example", "0.10.5", ["mimalloc"])
+        self.assertEqual(reachable(LOCK), reachable(example_dependency))
+
+    def test_lock_comparison_resolves_duplicate_versions(self):
+        two_versions = (
+            package("minip2p-core", "0.10.5", ["aead 0.6.1"])
+            + package("aead", "0.6.1", external=True)
+            + package("aead", "0.5.0", external=True)
+        )
+        entries = bench_results.reachable_lock(two_versions.encode(), {"minip2p-core"})
+        self.assertIn(("aead", "0.6.1", REGISTRY), {entry[0] for entry in entries})
+        self.assertNotIn(("aead", "0.5.0", REGISTRY), {entry[0] for entry in entries})
+        with self.assertRaisesRegex(bench_results.BenchError, "matches 2 packages"):
+            bench_results.reachable_lock(two_versions.replace('"aead 0.6.1"', '"aead"').encode(), {"minip2p-core"})
 
     def test_missing_current_row_is_unclassified(self):
         current = {**self.current, "rows": self.current["rows"][:-1]}
