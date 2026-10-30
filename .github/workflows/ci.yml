@@ -122,10 +122,26 @@ jobs:
       - run: cargo doc -p minip2p-rs --no-default-features --features autonat --no-deps
       - run: cargo doc -p minip2p-rs --no-default-features --features relay --no-deps
       - run: cargo doc -p minip2p-rs --no-default-features --features smoltcp,relay,discovery,relay-server --no-deps
-      - run: cargo bench -p minip2p-core --bench multiaddr --no-run
       - run: cargo metadata --no-deps --format-version 1 | jq -e '[.packages[] | select(.publish != []) | .readme != null] | all'
       - run: cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name' | while read package; do cargo package -p "$package" --list | grep -q '^README.md$' || exit 1; done
       - run: cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["dep:minip2p-relay-server"]'
+
+  # Builds exactly the benchmarks the bench image builds (bench/targets) and
+  # checks the IR bench ids against scripts/bench_results.py, so a renamed
+  # feature or an unregistered bench fails here rather than on the bench
+  # instance after its image build.
+  bench-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: python3 scripts/check-bench-ids.py
+      - run: scripts/build-benches.sh
 
   test:
     runs-on: ubuntu-latest

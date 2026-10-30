@@ -2,7 +2,7 @@
 
 The Bench workflow runs on one dedicated EC2 instance, `minip2p-bench` (`m8a.xlarge`: 4 physical cores without SMT, 16 GiB, in `ap-south-1`). The instance is a persistent self-hosted GitHub Actions runner with the labels `self-hosted,linux,x64,minip2p-bench`, and it stays stopped between runs. For each run, a hosted `start-runner` job assumes the CI role through OIDC, sets a lease tag and starts the instance with `scripts/start-bench-runner.sh`. The `bench` job then runs on the instance: `scripts/run-bench-container.sh` builds the image from `infra/bench/Dockerfile` with the local BuildKit cache and runs the suite in one container. The result is uploaded as the `bench-results` artifact, and an on-instance watchdog stops the instance once it is idle. The design and its trade-offs are in [ADR 0025](../../docs/adr/0025-benchmarks-on-an-on-demand-ec2-runner.md) and [the plan](../../docs/plans/self-hosted-bench-runner.md).
 
-Published stable releases produce the baseline stored on `bench-data`. Pull requests from this repository run the same job and compare their head commit with that release when a baseline is available. Fork pull requests skip the bench job and comparison. Manual runs measure the default branch and produce artifacts, but never change the release baseline.
+Published stable releases produce the baseline stored on `bench-data`. A pull request from this repository is measured when a writer adds the `bench` label, typically once before merging: the run removes the label, compares the PR head with that release when a baseline is available, and adding the label again re-measures (after a fix, say). Pushes alone never start a run. Fork pull requests skip the bench job and comparison. Manual runs measure the default branch, or `ref`, and produce artifacts; they change the release baseline only with `baseline` set (see [Re-recording a release baseline](#re-recording-a-release-baseline)).
 
 ## Resources
 
@@ -14,7 +14,7 @@ Published stable releases produce the baseline stored on `bench-data`. Pull requ
 - the instance `minip2p-bench`: Ubuntu 24.04 LTS amd64, an 80 GB gp3 root volume, a public IPv4 address for egress, no instance profile, IMDSv2 required with hop limit 1 (containers cannot reach it), instance tags in metadata, and instance-initiated shutdown behaviour `stop`;
 - the inline policy of the CI role `minip2p-github-bench`: `ec2:StartInstances` on the instance, `ec2:CreateTags` on the instance for the `bench-lease-until` key only, and `ec2:DescribeInstances`.
 
-The instance's first boot runs `cloud-init.yaml`, which bootstrap renders with the scripts in this directory and a runner registration token. It installs Docker CE from Docker's apt repository and `jq`. It creates the user `runner`, in `docker` and without sudo, and installs the pinned, SHA-256-verified `actions/runner` release in `/home/runner/actions-runner` as a systemd service. It also installs the job-start hook (`runner-hooks/job-started.sh`, as `/opt/minip2p-bench/job-started.sh`) and the watchdog (`watchdog.sh` with `minip2p-bench-watchdog.{service,timer}`). These steps run once per instance; later boots only start the services. The runner updates itself when GitHub ships a new release.
+The instance's first boot runs `cloud-init.yaml`, which bootstrap renders with the scripts in this directory and a runner registration token. It installs Docker CE from Docker's apt repository and `jq`. It creates the user `runner`, in `docker` and without sudo, and installs the pinned, SHA-256-verified `actions/runner` release in `/home/runner/actions-runner` as a systemd service. It also installs the job-start hook (`runner-hooks/job-started.sh`, as `/opt/minip2p-bench/job-started.sh`) and the watchdog (`watchdog.sh` with `minip2p-bench-watchdog.{service,timer}`). These steps run once per instance; later boots only start the services, so a change to the hook or the watchdog reaches the instance only when it is redeployed (see [Updating the on-instance scripts](#updating-the-on-instance-scripts)). The runner updates itself when GitHub ships a new release.
 
 ## Bootstrap
 
@@ -34,8 +34,9 @@ The rendered user data holds a live registration token, so bootstrap never print
 
 ## GitHub configuration
 
-- **Environment `aws-bench`**, with required reviewers, for pull requests and manual runs. Variables: `AWS_BENCH_ROLE_ARN`, `AWS_BENCH_INSTANCE_ID`, and optionally `AWS_BENCH_REGION` (default `ap-south-1`).
-- **Environment `aws-bench-unattended`**, with **no** required reviewers and deployments restricted to the `main` branch and `v*` tags. Same variables. Published releases and the weekly schedule use it, so neither waits for approval: both run only trusted code, a release tag or `main`, which the job-start hook also enforces on the instance.
+- **Environment `aws-bench`**, with required reviewers, for manual runs. Variables: `AWS_BENCH_ROLE_ARN`, `AWS_BENCH_INSTANCE_ID`, and optionally `AWS_BENCH_REGION` (default `ap-south-1`).
+- **Environment `aws-bench-unattended`**, with **no** required reviewers and deployments restricted to the `main` branch and `v*` tags. Same variables. Published releases, the weekly schedule, and labelled pull requests use it, so none waits for approval. Releases and the schedule run only trusted code, a release tag or `main`. A labelled PR's workflow, scripts and Dockerfile still come from `main` (its ref under `pull_request_target`), which the job-start hook also enforces on the instance; only its build context is the PR head, and `start-runner` admits the label only when the person who added it has write access.
+- **Label `bench`** on the repository, which starts a PR's run.
 - **Actions setting** "Require approval for all external contributors", so no fork pull request's workflow runs without a maintainer's approval.
 
 The OIDC role `minip2p-github-bench` is created once by hand with a maximum session duration of at least one hour. `bootstrap.sh` then rewrites its trust to exactly this:
@@ -68,7 +69,7 @@ No AWS access keys are stored in GitHub, and the instance holds no credentials.
 
 ## Trust boundary
 
-Repository writers are trusted: they can already push to `main`, publish releases, and change workflows. The `aws-bench` approval guards against accidental runs. The design defends against everyone without write access, in two layers:
+Repository writers are trusted: they can already push to `main`, publish releases, and change workflows. The `bench` label and the `aws-bench` approval guard against accidental runs. The design defends against everyone without write access, in two layers:
 
 - **On GitHub:** the external-contributor approval setting holds fork pull requests' runs, and the workflow's same-repository guard keeps fork pull requests out of `bench.yml`.
 - **On the instance:** the job-start hook runs before any workflow-controlled step, container-action build, or job container. It admits a job only if it comes from `deepso7/minip2p` and is `bench.yml` from `refs/heads/main` (for `pull_request_target`, `workflow_dispatch`, and `schedule`) or from a `refs/tags/v*` tag (for `release`). To refuse a job, it walks its parent processes to `Runner.Worker` and kills it with `SIGKILL`. A non-zero exit would not be enough: the runner records the failure but still evaluates later steps, so a hostile `if: always()` step would run as `runner`, which is in `docker` and therefore root on the instance. A fork's workflow aimed at the `minip2p-bench` label runs under `pull_request` with a `refs/pull/N/merge` ref, so it is killed even if it is approved.
@@ -81,10 +82,10 @@ After admitting a job, the hook removes leftover `bench-*` containers and images
 
 Before each start, `start-runner` sets the tag `bench-lease-until` to now + 20 minutes (Unix seconds). That covers the boot and the runner picking up the queued job. A systemd timer runs `watchdog.sh` every minute and powers the instance off, which stops it, when either:
 
-- it has been up for at least 10 minutes, the lease has expired, and no `Runner.Worker` process has existed for 10 consecutive minutes; or
+- it has been up for at least 10 minutes, the lease has expired, and no `Runner.Worker` process has existed for 2 consecutive minutes; or
 - the oldest `Runner.Worker` is older than 120 minutes, which means a stuck job, since the bench job's timeout is 90 minutes.
 
-A missing, malformed, or more-than-30-minutes-ahead lease counts as expired, so no tag value can keep the instance on. The first boot's setup counts as busy for up to an hour. Decisions are logged to the journal: `journalctl -u minip2p-bench-watchdog`. For a long manual session, stop the timer with `sudo systemctl stop minip2p-bench-watchdog.timer`; the next boot starts it again.
+The lease, not the idle limit, covers a job that is still queued after a start, so the short idle limit only has to bridge the end of a job; the 10-minute uptime floor keeps an instance started by hand, without a lease, up long enough to log in. A missing, malformed, or more-than-30-minutes-ahead lease counts as expired, so no tag value can keep the instance on. The first boot's setup counts as busy for up to an hour. Decisions are logged to the journal: `journalctl -u minip2p-bench-watchdog`. For a long manual session, stop the timer with `sudo systemctl stop minip2p-bench-watchdog.timer`; the next boot starts it again.
 
 The lease cannot fully close the race with a watchdog that read the old lease just before a new start, so rarely `bench` stays queued after the instance stopped. Cancel the run and use **Re-run all jobs**.
 
@@ -92,15 +93,34 @@ The lease cannot fully close the race with a watchdog that read the old lease ju
 
 GitHub removes a self-hosted runner that has not connected for 14 days. A weekly `schedule` run therefore starts the instance through `aws-bench-unattended`, runs a no-op `keepalive` job on it, and lets the watchdog stop it again. GitHub can drop scheduled runs, and it disables schedules on public repositories after 60 days without activity. If the runner shows offline in the repository settings and bench jobs stay queued, run `bootstrap.sh --replace`.
 
+## Re-recording a release baseline
+
+A stable release's own `release` run writes its baseline. If that run failed, or the baseline must be measured again (for example after a [baseline reset](#baseline-resets)), dispatch Bench from `main` with `ref` set to the release tag and `baseline` checked. `start-runner` first checks that the tag is a published stable release. The run measures the tag with `main`'s workflow, Dockerfile and helper scripts, like any dispatched `ref`, and on success the `baseline` job writes `<sha>.json` for the tag's commit. It moves the `latest` and `latest-release` pointers only when the tag is the latest release, as a `release` run does. The tag must carry `bench/targets`, which the image build reads from the measured code.
+
+## Updating the on-instance scripts
+
+Cloud-init installs `runner-hooks/job-started.sh` and `watchdog.sh` only on the instance's first boot. To deploy a change to either without a new instance, start the instance with SSH allowed, as in [Running by hand on the instance](#running-by-hand-on-the-instance), and from the repository root:
+
+```bash
+scp -i ~/.ssh/minip2p-bench.pem infra/bench/watchdog.sh infra/bench/runner-hooks/job-started.sh ubuntu@<public IP>:
+ssh -i ~/.ssh/minip2p-bench.pem ubuntu@<public IP> \
+  'sudo install -m 0755 watchdog.sh /usr/local/sbin/minip2p-bench-watchdog && sudo install -m 0755 job-started.sh /opt/minip2p-bench/job-started.sh'
+infra/bench/bootstrap.sh --no-ssh
+```
+
+The timer runs the new watchdog from its next tick, and the next job runs the new hook. `bootstrap.sh --replace` also installs both, at the cost of a cold build cache.
+
 ## Re-running
 
-Re-run a failed Bench run with **Re-run all jobs**. Re-running only the failed jobs, or only `bench`, keeps the earlier `start-runner` result. It neither starts a stopped instance nor asks for approval again, so the job can sit queued.
+Re-measure a pull request by adding the `bench` label again. Re-run a failed run with **Re-run all jobs**. Re-running only the failed jobs, or only `bench`, keeps the earlier `start-runner` result. It neither starts a stopped instance nor asks for approval again, so the job can sit queued.
 
 ## Measurement notes
 
 The container runs with no network (`--network none`, IPv6 loopback enabled) and `seccomp=unconfined`, so Gungraun disables ASLR as it does locally; `GUNGRAUN_ALLOW_ASLR` is no longer set. The whole machine is the benchmark, with no co-tenants and no CPU quota, so `MINIP2P_BENCH_SETUP_TIMEOUT_SECS` is no longer overridden either.
 
-Each result row names one metric from the fixed `METRICS` registry in `scripts/bench_results.py`, and one benchmark may have several metric rows. The registry sets each metric's direction; for higher-is-better metrics such as `mb_per_s`, an increase counts as `improved`. The `BANDS` table next to it gives each class of row, by metric, tier and name prefix, its changed/notable thresholds: 1%/2% for the deterministic `Ir`, `allocs_per_msg` and `bytes_allocated_per_msg`, and wider bands for wall-clock rows, set above the run-to-run noise of code-identical runs on the bench instance (for example 5% for Endpoint `e2e/*`, Node FFI and throughput, 10% for Criterion micro benches, 15% for ping `rtt_us_p50`). Rows that match no band, `rtt_us_p99` and idle `cpu_ms_per_s`, are informational: the comparison shows their change but no direction. Only `Ir` rows depend on the instruction-count pins; `Cargo.lock` counts as unchanged when only the workspace's own package versions differ, as after a release bump. A bench that measures its own metrics writes a JSON array of rows into `target/bench-results/custom/`; the `custom` subcommand collects them and checks them against `EXPECTED_CUSTOM`. The `wall` pass of `scripts/run-benches.sh` runs these benches between a `start` marker and the `custom` subcommand, which writes `target/bench-results/custom.json`; `scripts/run-container-benches.sh` merges it with the other tiers. These are `minip2p-rs`'s `endpoint_idle` (`wakeups_per_s` and `cpu_ms_per_s` of an idle endpoint) and `endpoint_throughput` (`mb_per_s`, `allocs_per_mb` and `bytes_allocated_per_mb` over TCP, QUIC and a relayed circuit, plus each QUIC-carried Endpoint's `datagrams_per_mb` and `avg_datagram_bytes` per direction), `endpoint_ping_load` (`rtt_us_p50` and `rtt_us_p99` of application-observed ping latency over TCP and QUIC on an endpoint that is idle, relaying, or forwarding pubsub), `endpoint_rtt` (`mb_per_s` over QUIC and TCP + Yamux on an emulated 100 Mbit/s, 100 ms link), and `minip2p-pubsub`'s `router_allocs` (`allocs_per_msg` and `bytes_allocated_per_msg` for gossipsub forwarding). To add another, add any metric it reports to `METRICS`, register every `(tier, name, metric)` row it emits in `EXPECTED_CUSTOM`, and run it in the same span of the `wall` pass, building it in `infra/bench/Dockerfile` as well.
+Each result row names one metric from the fixed `METRICS` registry in `scripts/bench_results.py`, and one benchmark may have several metric rows. The registry sets each metric's direction; for higher-is-better metrics such as `mb_per_s`, an increase counts as `improved`. The `BANDS` table next to it gives each class of row, by metric, tier and name prefix, its changed/notable thresholds: 1%/2% for the deterministic `Ir`, `allocs_per_msg` and `bytes_allocated_per_msg`, and wider bands for wall-clock rows, set above the run-to-run noise of code-identical runs on the bench instance (for example 5% for Endpoint `e2e/*`, Node FFI and throughput, 10% for Criterion micro benches, 15% for ping `rtt_us_p50`). Rows that match no band, `rtt_us_p99` and idle `cpu_ms_per_s`, are informational: the comparison shows their change but no direction. Only `Ir` rows depend on the instruction-count pins; `Cargo.lock` counts as unchanged when only the workspace's own package versions differ, as after a release bump. A bench that measures its own metrics writes a JSON array of rows into `target/bench-results/custom/`; the `custom` subcommand collects them and checks them against `EXPECTED_CUSTOM`. The `wall` pass of `scripts/run-benches.sh` runs these benches between a `start` marker and the `custom` subcommand, which writes `target/bench-results/custom.json`; `scripts/run-container-benches.sh` merges it with the other tiers. These are `minip2p-rs`'s `endpoint_idle` (`wakeups_per_s` and `cpu_ms_per_s` of an idle endpoint) and `endpoint_throughput` (`mb_per_s`, `allocs_per_mb` and `bytes_allocated_per_mb` over TCP, QUIC and a relayed circuit, plus each QUIC-carried Endpoint's `datagrams_per_mb` and `avg_datagram_bytes` per direction), `endpoint_ping_load` (`rtt_us_p50` and `rtt_us_p99` of application-observed ping latency over TCP and QUIC on an endpoint that is idle, relaying, or forwarding pubsub), `endpoint_rtt` (`mb_per_s` over QUIC and TCP + Yamux on an emulated 100 Mbit/s, 100 ms link), and `minip2p-pubsub`'s `router_allocs` (`allocs_per_msg` and `bytes_allocated_per_msg` for gossipsub forwarding). To add another, add any metric it reports to `METRICS`, register every `(tier, name, metric)` row it emits in `EXPECTED_CUSTOM`, and list it as a `custom` line in `bench/targets`.
+
+`bench/targets` lists every Rust benchmark with its package, features and pass. `scripts/run-benches.sh` runs it, and `scripts/build-benches.sh` compiles the same list, cooking its dependencies in the image (`build-benches.sh cook`) and building the benches afterwards. CI's `bench-build` job runs `build-benches.sh` and `scripts/check-bench-ids.py`, which checks the `ir` benches' Gungraun ids against `GUNGRAUN_NAMES`, so a renamed feature or an unregistered IR bench fails CI before it reaches the instance. The list comes from the measured ref, so a ref older than `bench/targets` cannot be built by the current Dockerfile.
 
 The container runs all three tiers sequentially and publishes one result document. If any tier fails, it publishes no rows. This avoids comparing a partial run as though it covered the full benchmark set.
 
@@ -124,7 +144,7 @@ A manual dispatch of the Bench workflow with `sweep` set (for example `all`, or 
 
 ## Cost
 
-On-demand `m8a.xlarge` in `ap-south-1` is about $0.256/hour, billed only while running. A run, including boot and the idle tail, takes about 40 minutes, about $0.17. The 80 GB gp3 volume costs about $7.30/month, and the public IPv4 address is billed only while the instance runs. At about 50 runs a month, the total is about $16/month.
+On-demand `m8a.xlarge` in `ap-south-1` is about $0.256/hour, billed only while running. A run, including boot and the idle tail, takes about 25 minutes, about $0.11. The 20-minute lease bounds the shortest stay, so the weekly keepalive costs about the same. The 80 GB gp3 volume costs about $7.30/month, and the public IPv4 address is billed only while the instance runs. At about 50 runs a month, the total is about $13/month.
 
 ## Running by hand on the instance
 
@@ -145,7 +165,7 @@ BENCH_GIT_SHA=$(git rev-parse HEAD) BENCH_SWEEP=all scripts/run-bench-container.
 
 Run it in the foreground, as above. A script started with `&` from another non-interactive script inherits SIGINT as ignored, so its cancellation trap would never fire.
 
-`BENCH_CONTEXT` selects another build context, and `BENCH_NO_CACHE=1` builds without the layer cache, as releases do. The result lands in `target/bench-artifacts/current.json` (or `rtt/` for a sweep) with the container log in `target/bench-artifacts/bench.log`. Run `infra/bench/bootstrap.sh --no-ssh` when done. The watchdog stops the instance afterwards.
+`BENCH_CONTEXT` selects another build context. The result lands in `target/bench-artifacts/current.json` (or `rtt/` for a sweep) with the container log in `target/bench-artifacts/bench.log`. Run `infra/bench/bootstrap.sh --no-ssh` when done. The watchdog stops the instance afterwards.
 
 ## Retiring Fargate
 

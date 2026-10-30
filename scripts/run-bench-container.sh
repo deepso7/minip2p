@@ -8,7 +8,6 @@
 #   BENCH_SWEEP     emulated-link sweeps to run instead of the benchmarks
 #                   (scripts/rtt-sweep.sh names, space-separated, or `all`)
 #   BENCH_CONTEXT   build context holding the measured code (default `.`)
-#   BENCH_NO_CACHE  `1` builds without the layer cache (release baselines)
 #   BENCH_RUN_ID    names the image, container and work directory
 set -euo pipefail
 
@@ -71,9 +70,11 @@ reject() {
 
 # Bash defers traps while a foreground command runs, so each long wait is a
 # background job joined with `wait`, which a trapped signal interrupts.
-build_args=(-f infra/bench/Dockerfile --build-arg BUILD_JOBS=4 -t "$name")
-[[ "${BENCH_NO_CACHE:-}" == 1 ]] && build_args+=(--no-cache)
-docker build "${build_args[@]}" "${BENCH_CONTEXT:-.}" &
+# The image never leaves this host, so skip the provenance attestation and
+# layer compression; together they were most of the export (87 s -> 9 s).
+docker build -f infra/bench/Dockerfile --build-arg BUILD_JOBS=4 \
+  --provenance=false --output "type=docker,name=$name,compression=uncompressed" \
+  "${BENCH_CONTEXT:-.}" &
 build_pid=$!
 wait "$build_pid"
 build_pid=

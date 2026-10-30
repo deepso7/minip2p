@@ -111,6 +111,11 @@ bench:
 bench-ir:
     scripts/run-benches.sh ir
 
+# Mirrors CI's bench-build job: build every bench in bench/targets, check IR ids.
+bench-build:
+    python3 scripts/check-bench-ids.py
+    scripts/build-benches.sh
+
 bench-node:
     pnpm --filter @minip2p/node bench
 

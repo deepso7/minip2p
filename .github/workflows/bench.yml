@@ -3,8 +3,12 @@ name: Bench
 on:
   release:
     types: [published]
+  # A writer adds the `bench` label to measure a PR's head, typically once
+  # before merging; the run removes the label, so adding it again re-measures
+  # (after a fix, say). Pushes alone never start a run.
   pull_request_target:
     branches: [main]
+    types: [labeled]
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
@@ -13,6 +17,10 @@ on:
         description: Commit, branch or tag to measure (default branch when empty)
         required: false
         default: ""
+      baseline:
+        description: Record the result as the release baseline of `ref`, a published stable `v*` release tag
+        type: boolean
+        default: false
       sweep:
         description: Emulated-link window sweeps to run instead of the benchmarks (scripts/rtt-sweep.sh names, space-separated, or `all`)
         required: false
@@ -21,8 +29,10 @@ on:
 permissions:
   contents: read
 
+# Re-adding `bench` replaces a PR's earlier run. Any other label's event gets a
+# group of its own, so it cannot cancel a bench in progress.
 concurrency:
-  group: bench-${{ github.event.pull_request.number || github.run_id }}
+  group: bench-${{ github.event.label.name == 'bench' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 env:
@@ -30,24 +40,58 @@ env:
 
 jobs:
   # Wakes the self-hosted bench instance (normally stopped; its watchdog
-  # powers it off when idle). `aws-bench` is the approval gate for pull
-  # requests and manual runs; releases and the weekly keepalive run only
-  # trusted code from a tag or `main`, so they use the reviewer-free
-  # `aws-bench-unattended`.
+  # powers it off when idle). Manual runs need approval through `aws-bench`.
+  # Releases and the weekly keepalive run only trusted code from a tag or
+  # `main`, and a labelled PR was opted in by a writer, so those use the
+  # reviewer-free `aws-bench-unattended`.
   start-runner:
     if: >-
-      (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'schedule'
+      (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' || (github.event.label.name == 'bench' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    environment: ${{ (github.event_name == 'release' || github.event_name == 'schedule') && 'aws-bench-unattended' || 'aws-bench' }}
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'aws-bench' || 'aws-bench-unattended' }}
     timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
+      pull-requests: write
     steps:
+      # Removes the label so adding it again starts a new run, then admits
+      # only a writer's label: triage access can label too.
+      - name: Take bench label
+        if: github.event_name == 'pull_request_target'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SENDER: ${{ github.event.sender.login }}
+        run: |
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/bench" >/dev/null || true
+          permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$SENDER/permission" --jq .permission)
+          if [[ "$permission" != admin && "$permission" != write ]]; then
+            echo "$SENDER has $permission access; only writers can start a bench" >&2
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.event.pull_request.base.sha || github.sha }}
           persist-credentials: false
+      # Fails a baseline dispatch before the instance starts unless it names
+      # what a `release` run would have measured.
+      - name: Check baseline tag
+        if: github.event_name == 'workflow_dispatch' && inputs.baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SWEEP: ${{ inputs.sweep }}
+          TAG: ${{ inputs.ref }}
+        run: |
+          if [[ "$TAG" != v* || -n "$SWEEP" ]]; then
+            echo "a baseline run needs ref set to a v* release tag and no sweep" >&2
+            exit 1
+          fi
+          prerelease=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .prerelease)
+          if [ "$prerelease" != false ]; then
+            echo "$TAG is a prerelease, not a stable release" >&2
+            exit 1
+          fi
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
@@ -66,6 +110,7 @@ jobs:
       contents: read
     outputs:
       complete: ${{ steps.result.outputs.complete }}
+      sha: ${{ steps.source.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -78,7 +123,7 @@ jobs:
         if: github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || inputs.ref }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || inputs.baseline && format('refs/tags/{0}', inputs.ref) || inputs.ref }}
           path: bench-source
           persist-credentials: false
       - name: Resolve benchmark source
@@ -94,7 +139,6 @@ jobs:
           BENCH_GIT_SHA: ${{ steps.source.outputs.sha }}
           BENCH_SWEEP: ${{ inputs.sweep }}
           BENCH_CONTEXT: ${{ (github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')) && 'bench-source' || '.' }}
-          BENCH_NO_CACHE: ${{ github.event_name == 'release' && '1' || '' }}
         run: exec scripts/run-bench-container.sh
       - name: Prepare result slice
         id: result
@@ -135,13 +179,18 @@ jobs:
     steps:
       - run: "true"
 
+  # Records a stable release's result on `bench-data`, from its `release` run
+  # or from a dispatch with `baseline` set that (re)measures its tag.
   baseline:
     if: >-
-      github.event_name == 'release' && needs.bench.outputs.complete == 'true'
+      needs.bench.outputs.complete == 'true' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.baseline))
     needs: [bench]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      BASELINE_SHA: ${{ needs.bench.outputs.sha }}
+      BASELINE_LABEL: ${{ github.event.release.tag_name || inputs.ref }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -150,11 +199,10 @@ jobs:
           path: ${{ runner.temp }}/bench-slices
           merge-multiple: true
       - name: Merge result slices
-        run: python3 scripts/bench_results.py merge "$RUNNER_TEMP"/bench-slices/*.json --output "$RUNNER_TEMP/results.json" --git-sha "$GITHUB_SHA"
+        run: python3 scripts/bench_results.py merge "$RUNNER_TEMP"/bench-slices/*.json --output "$RUNNER_TEMP/results.json" --git-sha "$BASELINE_SHA"
       - name: Update baseline branch
         env:
           BASELINE_DIR: ${{ runner.temp }}/bench-data
-          BASELINE_LABEL: ${{ github.event.release.tag_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
           git worktree add --detach "$BASELINE_DIR"
@@ -165,18 +213,18 @@ jobs:
               git -C "$BASELINE_DIR" checkout --orphan "bench-data-$attempt"
               git -C "$BASELINE_DIR" rm -rf .
             fi
-            cp "$RUNNER_TEMP/results.json" "$BASELINE_DIR/$GITHUB_SHA.json"
-            git -C "$BASELINE_DIR" add "$GITHUB_SHA.json"
+            cp "$RUNNER_TEMP/results.json" "$BASELINE_DIR/$BASELINE_SHA.json"
+            git -C "$BASELINE_DIR" add "$BASELINE_SHA.json"
             latest_release=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
             if [ "$BASELINE_LABEL" = "$latest_release" ]; then
-              printf '%s\n' "$GITHUB_SHA" > "$BASELINE_DIR/latest"
+              printf '%s\n' "$BASELINE_SHA" > "$BASELINE_DIR/latest"
               printf '%s\n' "$BASELINE_LABEL" > "$BASELINE_DIR/latest-release"
               git -C "$BASELINE_DIR" add latest latest-release
             fi
             if git -C "$BASELINE_DIR" diff --cached --quiet; then
               exit 0
             fi
-            git -C "$BASELINE_DIR" -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com commit -m "bench: $GITHUB_SHA"
+            git -C "$BASELINE_DIR" -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com commit -m "bench: $BASELINE_SHA"
             if git -C "$BASELINE_DIR" push origin HEAD:bench-data; then
               exit 0
             fi

@@ -4,10 +4,10 @@ The Bench workflow ran every benchmark in one AWS Fargate task, and it was unrel
 
 ## Decision
 
-- **One dedicated, normally stopped `m8a.xlarge` in `ap-south-1` is a persistent self-hosted runner** with the label `minip2p-bench`. A hosted `start-runner` job, approved through the `aws-bench` environment, assumes an OIDC role that can only tag and start that one instance. It sets a `bench-lease-until` tag and starts it. The `bench` job then builds and runs the benchmark container on the instance with a local BuildKit cache. A per-minute watchdog on the instance powers it off (shutdown behaviour `stop`) once the lease has expired and no job has run for 10 minutes, or when a job is older than 120 minutes.
+- **One dedicated, normally stopped `m8a.xlarge` in `ap-south-1` is a persistent self-hosted runner** with the label `minip2p-bench`. A hosted `start-runner` job assumes an OIDC role that can only tag and start that one instance. It sets a `bench-lease-until` tag and starts it. The `bench` job then builds and runs the benchmark container on the instance with a local BuildKit cache. A per-minute watchdog on the instance powers it off (shutdown behaviour `stop`) once the lease has expired and no job has run for 2 minutes, or when a job is older than 120 minutes.
 - **The whole machine is the benchmark.** m8a has no SMT, so the four vCPUs are four physical cores. Nothing else runs there, and the container runs with `seccomp=unconfined` and `--network none`, so Gungraun disables ASLR and the setup-timeout override goes.
 - **The instance holds nothing.** It has no instance profile, IMDSv2 with hop limit 1, a security group with no inbound rules, and its own VPC whose only route out is the internet gateway. It is not on the tailnet. Admin SSH is added and removed by `bootstrap.sh` on demand.
-- **Releases and a weekly keepalive run unattended** through a second environment, `aws-bench-unattended`, with no reviewers and only `main` and `v*` tags allowed. Both run only trusted code. The keepalive keeps the runner from being removed after 14 days offline. Pull requests and manual runs still need approval through `aws-bench`.
+- **Releases and a weekly keepalive run unattended** through a second environment, `aws-bench-unattended`, with no reviewers and only `main` and `v*` tags allowed. Both run only trusted code. The keepalive keeps the runner from being removed after 14 days offline. Manual runs still need approval through `aws-bench`. (Revised: pull requests first needed that approval on every push; now a writer adds the `bench` label to measure one, typically once before merging, and it runs unattended.)
 
 ## Trust boundary
 
@@ -26,7 +26,7 @@ The instance and its disk persist between runs, so a container escape could tamp
 
 ## Consequences
 
-- The only AWS call on a run's critical path is starting one stopped instance. Builds reuse a warm BuildKit cache, except releases, which build with `--no-cache` so a baseline never reuses layers a PR build produced.
+- The only AWS call on a run's critical path is starting one stopped instance. Every build, release baselines included, reuses the warm BuildKit cache. Cache keys cover each layer's inputs, so a release reuses only layers built from identical inputs, and the digest-pinned base image and the toolchain pinned in `bench/pins.json` keep releases on the same toolchain layer that pull requests are measured with. A container escape could still tamper with the cache, as with anything else on the persistent disk (see Trust boundary).
 - Instruction counts are not comparable with the Fargate baselines. At cutover both `bench-data` pointers are removed, and the next stable release writes the first new baseline. A later change of instance type repeats that reset.
 - With one runner, Bench jobs serialise. A second run's `bench` job waits for the first.
 - Re-running a failed run means **Re-run all jobs**. A partial re-run reuses the earlier `start-runner` result and can sit queued against a stopped instance.
