@@ -159,8 +159,8 @@ html:has([data-site-header="pinned"]) #blume-content {
     mask-image: linear-gradient(
       to bottom,
       transparent,
-      #000 var(--fade-top),
-      #000 calc(100% - var(--fade-bottom)),
+      oklch(0 0 0) var(--fade-top),
+      oklch(0 0 0) calc(100% - var(--fade-bottom)),
       transparent
     );
     animation:
@@ -291,7 +291,7 @@ html:has([data-site-header="pinned"]) #blume-content {
 
 #blume-content > article > h1:first-child::before {
   @apply pointer-events-none absolute -inset-x-6 -top-6 -z-10 h-48 bg-[radial-gradient(var(--color-border)_1px,transparent_1.5px)] bg-[length:14px_14px] content-[''] lg:-inset-x-8;
-  mask-image: linear-gradient(to bottom, #000, transparent);
+  mask-image: linear-gradient(to bottom, oklch(0 0 0), transparent);
 }
 
 #blume-content
