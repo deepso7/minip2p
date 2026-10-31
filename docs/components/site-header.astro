@@ -8,8 +8,11 @@
 //   sidebar column (`--minip2p-shell-pin` tall, see theme.css): 80px of air,
 //   the logo and theme toggle, then a pill-shaped search field. The sidebar
 //   below starts at the same offset, so only the nav list scrolls. The
-//   landing page and the changelog index keep this block but have no nav
-//   list under it.
+//   changelog index keeps this block but has no nav list under it.
+// - The landing page, `lg` and up: no sidebar column at all. This element is
+//   the top row of the content column instead, 80px down: the logo on the
+//   left, the search field and theme toggle on the right. The section tabs
+//   follow in the column (page-header.astro).
 // - Below `lg`: a borderless top bar of menu toggle, logo, search, and theme
 //   toggle. The drawer's top offset is measured from it, as Blume's is.
 import type { ComponentProps } from "astro/types";
@@ -28,6 +31,7 @@ const {
   logo,
   navStrings,
   navigation,
+  route,
   searchEnabled,
   searchLocale,
   searchStrings,
@@ -36,6 +40,7 @@ const {
 } = Astro.props;
 
 const n = { ...EN_UI.nav, ...navStrings };
+const landing = route === "/";
 const iconButton =
   "inline-flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-foreground";
 
@@ -49,9 +54,14 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
 ---
 
 <header
-  class="sticky top-0 z-40 flex h-14 items-center gap-2 bg-background px-4 md:px-6 lg:fixed lg:start-(--minip2p-side-x) lg:grid lg:h-(--minip2p-shell-pin) lg:w-(--minip2p-side-w) lg:grid-cols-[minmax(0,1fr)_auto] lg:content-start lg:gap-x-2 lg:gap-y-6 lg:ps-4 lg:pe-2 lg:pt-20"
+  class:list={[
+    "sticky top-0 z-40 flex h-14 items-center gap-2 bg-background px-4 md:px-6",
+    landing
+      ? "lg:static lg:mx-auto lg:h-auto lg:max-w-content lg:gap-3 lg:px-0 lg:pt-20"
+      : "lg:fixed lg:start-(--minip2p-side-x) lg:grid lg:h-(--minip2p-shell-pin) lg:w-(--minip2p-side-w) lg:grid-cols-[minmax(0,1fr)_auto] lg:content-start lg:gap-x-2 lg:gap-y-6 lg:ps-4 lg:pe-2 lg:pt-20",
+  ]}
   data-blume-header
-  data-site-header="pinned"
+  data-site-header={landing ? "row" : "pinned"}
 >
   <button
     aria-controls="blume-nav-drawer"
@@ -66,11 +76,14 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
   <div class="flex min-w-0 items-center lg:col-start-1 lg:row-start-1">
     <Logo locale={locale} logo={logo} site={site} />
   </div>
-  <div class="flex-1 lg:hidden"></div>
+  <div class:list={["flex-1", !landing && "lg:hidden"]}></div>
   {
     searchEnabled && (
       <div
-        class="relative flex items-center lg:col-span-2 lg:row-start-2 lg:-ms-3 lg:h-8 lg:w-[calc(100%+0.75rem)] lg:gap-2 lg:rounded-full lg:border lg:border-border lg:px-3 lg:text-faint lg:text-sm lg:transition-colors lg:hover:border-faint lg:hover:text-muted-foreground"
+        class:list={[
+          "relative flex items-center lg:h-8 lg:gap-2 lg:rounded-full lg:border lg:border-border lg:px-3 lg:text-faint lg:text-sm lg:transition-colors lg:hover:border-faint lg:hover:text-muted-foreground",
+          landing ? "lg:w-48" : "lg:col-span-2 lg:row-start-2 lg:-ms-3 lg:w-[calc(100%+0.75rem)]",
+        ]}
         data-site-search
       >
         <Icon class="hidden shrink-0 lg:block" name="search" size={14} />
