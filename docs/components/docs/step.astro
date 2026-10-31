@@ -1,6 +1,8 @@
 ---
-// One step of a progress log (see steps.astro): `[2/5] Title`, its body hung
-// off a rule so long steps still read as one unit.
+// One step of a Steps sequence: its number (`01`, from the counter Steps
+// resets) in the gutter, a hairline running down to the next step, then the
+// title and body. The body stays prose, so code blocks keep their header bar.
+// `icon` is accepted and unused; the number marks the step.
 import type { StepProps } from "blume/components";
 
 type Props = StepProps;
@@ -8,12 +10,12 @@ type Props = StepProps;
 const { title } = Astro.props;
 ---
 
-<div class="term-step relative [counter-increment:blume-step]" data-blume-step>
-  <p class="term-step-title m-0! flex items-baseline gap-3 font-bold">
-    <span class="term-step-count shrink-0 text-accent" aria-hidden="true"></span>
-    {title && <span>{title}</span>}
-  </p>
-  <div class="term-step-body ms-[0.6ch] border-s border-dashed border-border ps-4 pt-1 sm:ps-[calc(4ch+0.75rem)] pb-6 [&>:first-child]:mt-2! [&>:last-child]:mb-0!">
+<div
+  class="relative ps-10 pb-8 [counter-increment:minip2p-step] last:pb-0 before:absolute before:start-0 before:top-0 before:font-mono before:text-xs before:leading-6 before:text-accent before:content-[counter(minip2p-step,decimal-leading-zero)] after:absolute after:start-1.5 after:top-8 after:bottom-2 after:w-px after:bg-border last:after:hidden"
+  data-blume-step
+>
+  {title && <p class="m-0! text-base leading-6 font-medium text-foreground">{title}</p>}
+  <div class="mt-2 [&>:first-child]:mt-0! [&>:last-child]:mb-0!">
     <slot />
   </div>
 </div>

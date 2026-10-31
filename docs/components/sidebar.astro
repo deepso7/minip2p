@@ -1,0 +1,29 @@
+---
+// The `Sidebar` layout slot (and so the mobile drawer's nav too): Blume's nav
+// tree, unchanged, then a foot with the repository link and the release
+// version. theme.css styles the tree itself.
+import type { ComponentProps } from "astro/types";
+import data from "blume:data";
+import NavTree from "blume/components/layout/NavTree.astro";
+import { sidebarForRoute } from "blume/components/layout/nav-utils.ts";
+import { newTabAttrs } from "blume/core/new-tab.ts";
+import { version } from "./workspace";
+
+type Props = ComponentProps<typeof NavTree>;
+
+const repository = "https://github.com/deepso7/minip2p";
+// The landing page (`/`) sits under no tab, so Blume hands it the whole tree,
+// every changelog entry included; its drawer (it has no sidebar from `lg`
+// up) lists the docs instead.
+const { sidebar, tabs, root } = data.navigation;
+const items =
+  Astro.props.currentRoute === "/" ? sidebarForRoute(sidebar, tabs, "/docs", root) : Astro.props.items;
+---
+
+<NavTree {...Astro.props} items={items} />
+<div class="mt-8 flex items-center justify-between text-faint text-xs">
+  <a class="transition-colors hover:text-foreground" href={repository} {...newTabAttrs(repository)}>
+    GitHub ↗
+  </a>
+  <span class="font-mono">v{version}</span>
+</div>

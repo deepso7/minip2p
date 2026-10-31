@@ -1,0 +1,57 @@
+---
+// The `Breadcrumbs` layout slot: the section tabs, then the page's whole trail
+// as a mono eyebrow, `docs / rust / install`, led by the current tab and ending
+// on the current page. Every page gets one, even a tab's own page (`changelog`),
+// so titles sit at the same height everywhere. This slot is the first thing in
+// the content column, so both lead every docs and changelog page and scroll
+// away with it.
+import type { ComponentProps } from "astro/types";
+import data from "blume:data";
+import { withMountedBase } from "blume/components/islands/base-path.ts";
+import type BlumeBreadcrumbs from "blume/components/layout/Breadcrumbs.astro";
+import { currentTabForRoute } from "blume/components/layout/nav-utils.ts";
+import { EN_UI } from "blume/core/i18n-ui.ts";
+import SectionTabs from "./section-tabs.astro";
+
+type Props = ComponentProps<typeof BlumeBreadcrumbs>;
+
+const { crumbs, strings, wide = false } = Astro.props;
+const route = Astro.url.pathname.replace(/(?<=.)\/$/u, "");
+const { root, tabs } = data.navigation;
+const tab = currentTabForRoute(tabs, route, root);
+// Blume's trail can repeat the tab as its first crumb (the changelog's).
+const trail = [...(tab ? [{ label: tab.label, route: tab.href ?? tab.path }] : []), ...crumbs].filter(
+  (crumb, index, all) => index === 0 || crumb.label.toLowerCase() !== all[index - 1].label.toLowerCase()
+);
+const width = wide ? "max-w-none" : "mx-auto max-w-content";
+---
+
+<SectionTabs class:list={["mb-10", width]} route={route} />
+{
+  trail.length > 0 && (
+    <nav
+      aria-label={{ ...EN_UI.nav, ...strings }.breadcrumb}
+      class:list={["relative z-[1] mb-2 font-mono text-faint text-xs lowercase", width]}
+    >
+      {trail.map((crumb, index) => {
+        const last = index === trail.length - 1;
+        return (
+          <>
+            {index > 0 && <span aria-hidden="true"> / </span>}
+            {last ? (
+              <span aria-current="page" class="text-muted-foreground">
+                {crumb.label}
+              </span>
+            ) : crumb.route ? (
+              <a class="transition-colors hover:text-muted-foreground" href={withMountedBase(crumb.route)}>
+                {crumb.label}
+              </a>
+            ) : (
+              <span>{crumb.label}</span>
+            )}
+          </>
+        );
+      })}
+    </nav>
+  )
+}

@@ -1,0 +1,281 @@
+---
+// The `Header` layout slot, rendered by every RootLayout page (the landing
+// page, docs pages, changelog entries, and the changelog index). The 404 page
+// uses Blume's PageLayout, which always renders its built-in header; theme.css
+// restyles that one to match the top row below.
+//
+// - `lg` and up: no header bar. This element is fixed over the top of the
+//   sidebar column (`--minip2p-shell-pin` tall, see theme.css): 80px of air,
+//   the logo and theme toggle, then a pill-shaped search field. The sidebar
+//   below starts at the same offset, so only the nav list scrolls. The
+//   changelog index keeps this block but has no nav list under it.
+// - The landing page, `lg` and up: no sidebar column at all. This element is
+//   the top of the content column instead, 80px down: the logo on its own
+//   row, then the section tabs with the search field and theme toggle on
+//   their right. Below `lg` the tabs sit atop the content (page-header.astro).
+//
+// The logo, search field, and theme toggle carry view-transition names (as
+// do the section tabs), so moving between the landing page and the docs
+// glides them from one layout to the other. The search field also grows into
+// the open search bar (the script at the end).
+// - Below `lg`: a borderless top bar of menu toggle, logo, search, and theme
+//   toggle. The drawer's top offset is measured from it, as Blume's is.
+import type { ComponentProps } from "astro/types";
+import data from "blume:data";
+import Icon from "blume/components/Icon.astro";
+import type BlumeHeader from "blume/components/layout/Header.astro";
+import Logo from "blume/components/layout/Logo.astro";
+import Search from "blume/components/layout/Search.astro";
+import { EN_UI } from "blume/core/i18n-ui.ts";
+import SectionTabs from "./section-tabs.astro";
+
+type Props = ComponentProps<typeof BlumeHeader>;
+
+const {
+  assistantEnabled = Boolean(data.config.assistant),
+  locale,
+  logo,
+  navStrings,
+  navigation,
+  route,
+  searchEnabled,
+  searchLocale,
+  searchStrings,
+  searchVersion = null,
+  site,
+} = Astro.props;
+
+const n = { ...EN_UI.nav, ...navStrings };
+const landing = route === "/";
+const iconButton =
+  "inline-flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-foreground";
+
+// Blume's header script, copied verbatim from its Header.astro (which keeps it
+// in frontmatter, so it can't be imported): delegated clicks for the theme
+// toggle (transitions suppressed for the swap, choice saved to storage), the
+// drawer toggle (measuring this header's bottom into `--blume-drawer-top`),
+// and banner dismissal, plus closing the drawer when the window widens past
+// `lg`. Re-copy it when upgrading Blume.
+const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-blume-header]");if(h){document.documentElement.style.setProperty("--blume-drawer-top",h.getBoundingClientRect().bottom+"px");}};const save=(k,v)=>{try{localStorage.setItem(k,v);}catch{}};document.addEventListener("click",(e)=>{const t=e.target.closest("[data-blume-theme-toggle]");if(t){const d=document.documentElement;const next=d.dataset.theme==="dark"?"light":"dark";const s=document.createElement("style");s.appendChild(document.createTextNode("*,*::before,*::after{transition:none!important}"));document.head.appendChild(s);d.dataset.theme=next;window.getComputedStyle(d).opacity;setTimeout(()=>document.head.removeChild(s),1);save("blume-theme",next);}const n=e.target.closest("[data-blume-nav-toggle]");if(n){const d=document.documentElement;const open=d.toggleAttribute("data-blume-nav-open");if(open){dr();}}const b=e.target.closest("[data-blume-banner-dismiss]");if(b){document.documentElement.setAttribute("data-blume-banner-hidden","");requestAnimationFrame(dr);const bar=b.closest("[data-blume-banner]");const k=bar&&bar.getAttribute("data-banner-key");if(k){save("blume-banner:"+k,"1");}}});addEventListener("resize",()=>{const d=document.documentElement;if(!d.hasAttribute("data-blume-nav-open")){return;}if(matchMedia("(min-width:64rem)").matches){d.removeAttribute("data-blume-nav-open");}else{dr();}});})();`;
+---
+
+<header
+  class:list={[
+    "sticky top-0 z-40 flex h-14 items-center gap-2 bg-background px-4 md:px-6",
+    landing
+      ? "lg:static lg:mx-auto lg:grid lg:h-auto lg:max-w-content lg:grid-cols-[minmax(0,1fr)_auto_auto] lg:items-center lg:gap-x-3 lg:gap-y-6 lg:px-0 lg:pt-20 lg:pb-4"
+      : "lg:fixed lg:start-(--minip2p-side-x) lg:grid lg:h-(--minip2p-shell-pin) lg:w-(--minip2p-side-w) lg:grid-cols-[minmax(0,1fr)_auto] lg:content-start lg:gap-x-2 lg:gap-y-6 lg:ps-4 lg:pe-2 lg:pt-20",
+  ]}
+  data-blume-header
+  data-site-header={landing ? "row" : "pinned"}
+>
+  <button
+    aria-controls="blume-nav-drawer"
+    aria-expanded="false"
+    aria-label={n.toggleNavigation}
+    class={`${iconButton} -ms-2 lg:hidden`}
+    data-blume-nav-toggle
+    type="button"
+  >
+    <Icon name="menu" size={20} />
+  </button>
+  <div
+    class="flex min-w-0 items-center lg:col-start-1 lg:row-start-1 lg:h-8"
+    transition:name="minip2p-logo"
+  >
+    <Logo locale={locale} logo={logo} site={site} />
+  </div>
+  {landing && <SectionTabs class="hidden lg:col-start-1 lg:row-start-2 lg:flex" route={route} />}
+  <div class="flex-1 lg:hidden"></div>
+  {
+    searchEnabled && (
+      <div
+        class:list={[
+          "relative flex items-center lg:h-8 lg:gap-2 lg:rounded-full lg:border lg:border-border lg:px-3 lg:text-faint lg:text-sm lg:transition-colors lg:hover:border-faint lg:hover:text-muted-foreground",
+          landing
+            ? "lg:col-start-2 lg:row-start-2 lg:w-48"
+            : "lg:col-span-2 lg:row-start-2 lg:-ms-3 lg:w-[calc(100%+0.75rem)]",
+        ]}
+        data-site-search
+        transition:name="minip2p-search"
+      >
+        <Icon class="hidden shrink-0 lg:block" name="search" size={14} />
+        <span aria-hidden="true" class="hidden flex-1 lg:inline">Search</span>
+        <kbd aria-hidden="true" class="hidden font-mono text-xs lg:inline">⌘K</kbd>
+        <Search
+          assistantEnabled={assistantEnabled}
+          locale={searchLocale}
+          navigation={navigation}
+          popularPages={data.config.search.popular}
+          strings={searchStrings}
+          version={searchVersion}
+        />
+      </div>
+    )
+  }
+  {
+    data.config.theme.toggle && (
+      <button
+        aria-label={n.toggleTheme}
+        class:list={[
+          iconButton,
+          "-me-2 lg:me-0 lg:size-8",
+          landing ? "lg:col-start-3 lg:row-start-2" : "lg:col-start-2 lg:row-start-1",
+        ]}
+        data-blume-theme-toggle
+        transition:name="minip2p-theme"
+        type="button"
+      >
+        <span class="inline-flex dark:hidden"><Icon name="sun" size={16} /></span>
+        <span class="hidden dark:inline-flex"><Icon name="moon" size={16} /></span>
+      </button>
+    )
+  }
+</header>
+<script is:inline set:html={clickScript} />
+<script>
+  // Rex's search: the search field grows into the open search bar, and the
+  // bar shrinks back into the field on close, instead of the dialog popping
+  // in. Blume's <blume-search> still owns the dialog; these capture-phase
+  // listeners only wrap its opens (the field, ⌘K, "/") and closes (Esc, ⌘K,
+  // the backdrop) in a view transition, handing the field's `minip2p-search`
+  // view-transition name to the dialog's search row while it is open. Without
+  // the View Transitions API, or with reduced motion, Blume's own handlers run
+  // as before. Registered once on the document, so they survive the client
+  // router's page swaps and look the parts up per event.
+  type BlumeSearch = HTMLElement & { open: () => Promise<void> };
+  interface Parts {
+    bar: HTMLElement;
+    dialog: HTMLDialogElement;
+    field: HTMLElement;
+    search: BlumeSearch;
+  }
+
+  const name = "minip2p-search";
+  const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
+
+  const parts = (): Parts | null => {
+    const field = document.querySelector<HTMLElement>("[data-site-search]");
+    const search = field?.querySelector<BlumeSearch>("blume-search");
+    const dialog = field?.querySelector<HTMLDialogElement>("[data-blume-search-dialog]");
+    const bar = dialog?.firstElementChild;
+    return field && search && dialog && bar instanceof HTMLElement ? { bar, dialog, field, search } : null;
+  };
+
+  const animates = () => "startViewTransition" in document && !reducedMotion.matches;
+
+  // Open: the dialog's search row carries the name and the field hides (theme.css).
+  const mark = ({ bar, field }: Parts, open: boolean) => {
+    field.toggleAttribute("data-search-open", open);
+    field.style.viewTransitionName = open ? "none" : "";
+    bar.style.viewTransitionName = open ? name : "";
+  };
+
+  const open = (p: Parts) =>
+    document.startViewTransition(() => {
+      mark(p, true);
+      // Blume opens the dialog synchronously, then loads the index.
+      void p.search.open();
+    });
+
+  // The field shows again before the dialog closes, so the dialog can hand
+  // focus back to it.
+  const close = (p: Parts) =>
+    document.startViewTransition(() => {
+      mark(p, false);
+      p.dialog.close();
+    });
+
+  const isField = (target: EventTarget | null) =>
+    target instanceof HTMLElement &&
+    (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+
+  document.addEventListener(
+    "click",
+    (event) => {
+      const p = parts();
+      if (!(p && animates() && event.target instanceof Element)) {
+        return;
+      }
+      if (!p.dialog.open && event.target.closest("[data-blume-search-open]")) {
+        event.stopImmediatePropagation();
+        open(p);
+      } else if (p.dialog.open && event.target === p.dialog) {
+        event.stopImmediatePropagation();
+        close(p);
+      }
+    },
+    true
+  );
+
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      const p = parts();
+      if (!p) {
+        return;
+      }
+      // With no query the results are hidden (theme.css), but Blume still
+      // lists and selects its popular pages; keep Enter and the arrows from
+      // reaching rows nobody can see.
+      const {target} = event;
+      if (
+        p.dialog.open &&
+        target instanceof HTMLInputElement &&
+        target.matches("[data-blume-search-input]") &&
+        target.value === "" &&
+        (event.key === "Enter" || event.key === "ArrowDown" || event.key === "ArrowUp")
+      ) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
+      if (!animates()) {
+        return;
+      }
+      const chord =
+        (event.key === "k" || event.key === "K") &&
+        (event.metaKey || event.ctrlKey) &&
+        !event.shiftKey &&
+        !event.altKey;
+      const slash = event.key === "/" && !p.dialog.open && !isField(event.target);
+      if (chord || slash) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (p.dialog.open) {
+          close(p);
+        } else {
+          open(p);
+        }
+      }
+    },
+    true
+  );
+
+  // Esc asks the dialog to close with a `cancel` event, which doesn't bubble
+  // but still passes the document on its way down. A transition started
+  // inside that event stalls until the next one, so it starts just after.
+  document.addEventListener(
+    "cancel",
+    (event) => {
+      const p = parts();
+      if (p && animates() && event.target === p.dialog) {
+        event.preventDefault();
+        setTimeout(() => close(p), 0);
+      }
+    },
+    true
+  );
+
+  // Any other close (choosing a result, a close without the API) just resets.
+  document.addEventListener(
+    "close",
+    (event) => {
+      const p = parts();
+      if (p && event.target === p.dialog) {
+        mark(p, false);
+      }
+    },
+    true
+  );
+</script>

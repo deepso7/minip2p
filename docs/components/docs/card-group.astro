@@ -1,11 +1,15 @@
 ---
-// A CardGroup as an index listing: one ruled row per card, whatever `cols`
-// says, so a page's links read like `ls` output rather than a tile grid.
+// A grid of Cards: one column on phones, `cols` (default 2) from `sm` up.
 import type { CardGroupProps } from "blume/components";
 
 type Props = CardGroupProps;
+
+const { cols = 2 } = Astro.props;
 ---
 
-<ul class="term-index not-prose my-6 list-none border-t border-border p-0">
+<div
+  class="my-6 grid grid-cols-1 gap-3 sm:grid-cols-[repeat(var(--cols),minmax(0,1fr))]"
+  style={`--cols:${cols}`}
+>
   <slot />
-</ul>
+</div>

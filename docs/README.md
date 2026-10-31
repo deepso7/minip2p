@@ -2,7 +2,7 @@
 
 The user-facing site is built with [Blume](https://useblume.dev/). Content lives in `md/`; `.blume/` and `dist/` are generated and must not be edited.
 
-The landing page at `/` lives in `pages/index.astro`. The documentation starts at `/docs/intro`, in `md/docs/intro.mdx`.
+The landing page at `/` is `md/index.mdx`, with its Astro parts in `components/landing/`. The documentation starts at `/docs/intro`, in `md/docs/intro.mdx`.
 
 Blume emits `js-yaml` imports into its generated runtime. The root `js-yaml` dependency keeps those imports on Blume's v5 API when the workspace also installs v4 for Astro.
 

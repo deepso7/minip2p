@@ -1,0 +1,16 @@
+---
+// The `PageHeader` layout slot, rendered above every article. Only the landing
+// page (`md/index.mdx`) fills it: as a `mode: custom` page it has no
+// Breadcrumbs slot, which leads every other page with the section tabs, so
+// the tabs go here instead, at the top of the column. From `lg` up the header
+// (site-header.astro) carries them beside the search field, so these hide.
+import SectionTabs from "./section-tabs.astro";
+
+interface Props {
+  route: string;
+}
+
+const { route } = Astro.props;
+---
+
+{route === "/" && <SectionTabs class="mx-auto mb-10 max-w-content lg:hidden" route={route} />}
