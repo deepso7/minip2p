@@ -178,10 +178,12 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
       void p.search.open();
     });
 
+  // The field shows again before the dialog closes, so the dialog can hand
+  // focus back to it.
   const close = (p: Parts) =>
     document.startViewTransition(() => {
-      p.dialog.close();
       mark(p, false);
+      p.dialog.close();
     });
 
   const isField = (target: EventTarget | null) =>
@@ -210,7 +212,25 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
     "keydown",
     (event) => {
       const p = parts();
-      if (!(p && animates())) {
+      if (!p) {
+        return;
+      }
+      // With no query the results are hidden (theme.css), but Blume still
+      // lists and selects its popular pages; keep Enter and the arrows from
+      // reaching rows nobody can see.
+      const {target} = event;
+      if (
+        p.dialog.open &&
+        target instanceof HTMLInputElement &&
+        target.matches("[data-blume-search-input]") &&
+        target.value === "" &&
+        (event.key === "Enter" || event.key === "ArrowDown" || event.key === "ArrowUp")
+      ) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
+      if (!animates()) {
         return;
       }
       const chord =

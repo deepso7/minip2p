@@ -252,7 +252,10 @@ html:has([data-site-header="pinned"]) #blume-content {
 [data-blume-search-dialog] span:has(> [data-blume-search-preview-kbd]) {
   @apply hidden;
 }
-[data-blume-search-dialog]:has([data-blume-search-input]:placeholder-shown)
+/* Hidden only behind our header's search field, whose script keeps the keys
+   off these rows; the 404 page's built-in header doesn't load it. */
+[data-site-search]
+  [data-blume-search-dialog]:has([data-blume-search-input]:placeholder-shown)
   > :not(:first-child) {
   @apply hidden;
 }
