@@ -2,11 +2,11 @@ import { defineConfig } from "blume";
 import { cloudflare } from "blume/deploy";
 import { filesystem, githubReleases } from "blume/sources";
 
-// Brand colours, matching the tokens in theme.css: warm paper and blue-black
+// Brand colours, matching the tokens in theme.css: warm paper and neutral
 // ink, with the orange accent printed darker on paper and lit amber on ink.
 const brand = {
   amber: "oklch(0.770 0.135 60)",
-  ink: "oklch(0.155 0.006 250)",
+  ink: "oklch(0.160 0.004 80)",
   orange: "oklch(0.540 0.130 42)",
   paper: "oklch(0.955 0.006 60)",
 } as const;

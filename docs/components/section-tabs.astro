@@ -22,7 +22,7 @@ const active = currentTabForRoute(tabs, route, root);
 
 {
   tabs.length > 0 && (
-    <nav aria-label={EN_UI.nav.sections} class:list={["flex gap-6 text-sm", className]}>
+    <nav aria-label={EN_UI.nav.sections} class:list={["flex h-8 items-center gap-6 text-sm", className]}>
       {tabs.map((tab) => {
         const href = tab.href ?? tab.path;
         return (

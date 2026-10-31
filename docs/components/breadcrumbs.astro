@@ -1,28 +1,53 @@
 ---
-// The `Breadcrumbs` layout slot: the section tabs, then Blume's own eyebrow
-// crumb. This slot is the first thing in the content column, so the tabs lead
-// every docs and changelog entry page and scroll away with it. (`PageHeader`
-// would render below the crumb and the "On this page" dropdown.)
+// The `Breadcrumbs` layout slot: the section tabs, then the page's whole trail
+// as a mono eyebrow, `docs / rust / install`, led by the current tab and ending
+// on the current page. This slot is the first thing in the content column, so
+// both lead every docs and changelog entry page and scroll away with it.
 import type { ComponentProps } from "astro/types";
-import BlumeBreadcrumbs from "blume/components/layout/Breadcrumbs.astro";
+import data from "blume:data";
+import { withMountedBase } from "blume/components/islands/base-path.ts";
+import type BlumeBreadcrumbs from "blume/components/layout/Breadcrumbs.astro";
+import { currentTabForRoute } from "blume/components/layout/nav-utils.ts";
+import { EN_UI } from "blume/core/i18n-ui.ts";
 import SectionTabs from "./section-tabs.astro";
 import { isBareRoute } from "./shell";
 
 type Props = ComponentProps<typeof BlumeBreadcrumbs>;
 
-const { centered = false, wide = false } = Astro.props;
+const { centered = false, crumbs, strings, wide = false } = Astro.props;
 const route = Astro.url.pathname.replace(/(?<=.)\/$/u, "");
+const { root, tabs } = data.navigation;
+const tab = currentTabForRoute(tabs, route, root);
+const trail = [...(tab ? [{ label: tab.label, route: tab.href ?? tab.path }] : []), ...crumbs];
+const width = wide ? "max-w-none" : ["mx-auto", centered ? "max-w-[54rem]" : "max-w-content"];
 ---
 
+{!isBareRoute(route) && <SectionTabs class:list={["mb-10", width]} route={route} />}
 {
-  !isBareRoute(route) && (
-    <SectionTabs
-      class:list={[
-        "mb-8",
-        wide ? "max-w-none" : ["mx-auto", centered ? "max-w-[54rem]" : "max-w-content"],
-      ]}
-      route={route}
-    />
+  crumbs.length > 1 && (
+    <nav
+      aria-label={{ ...EN_UI.nav, ...strings }.breadcrumb}
+      class:list={["relative z-[1] mb-2 font-mono text-faint text-xs lowercase", width]}
+    >
+      {trail.map((crumb, index) => {
+        const last = index === trail.length - 1;
+        return (
+          <>
+            {index > 0 && <span aria-hidden="true"> / </span>}
+            {last ? (
+              <span aria-current="page" class="text-muted-foreground">
+                {crumb.label}
+              </span>
+            ) : crumb.route ? (
+              <a class="transition-colors hover:text-muted-foreground" href={withMountedBase(crumb.route)}>
+                {crumb.label}
+              </a>
+            ) : (
+              <span>{crumb.label}</span>
+            )}
+          </>
+        );
+      })}
+    </nav>
   )
 }
-<BlumeBreadcrumbs {...Astro.props} />

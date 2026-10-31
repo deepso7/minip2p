@@ -1,4 +1,4 @@
-/* minip2p's theme over Blume's tokens: warm paper in light mode, blue-black
+/* minip2p's theme over Blume's tokens: warm paper in light mode, neutral
    ink in dark mode, one orange accent, Geist for text and Geist Mono for code
    and small labels. Fonts, mode, and the accent are set in blume.config.ts;
    everything here is tokens plus the few rules Blume's own markup needs.
@@ -11,34 +11,34 @@
   --minip2p-amber: oklch(0.77 0.135 60);
 
   --blume-background: oklch(0.955 0.006 60);
-  --blume-foreground: oklch(0.2 0.008 250);
+  --blume-foreground: oklch(0.2 0.006 80);
   --blume-muted: oklch(0.93 0.006 60);
-  --blume-muted-foreground: oklch(0.42 0.008 250);
+  --blume-muted-foreground: oklch(0.42 0.006 80);
   /* Quieter than muted-foreground: sidebar group labels, eyebrows, hints.
      Still real text, so it keeps 4.5:1 on the page and on code surfaces. */
-  --minip2p-faint: oklch(0.52 0.008 250);
+  --minip2p-faint: oklch(0.52 0.006 80);
   --blume-border: oklch(0.87 0.006 60);
   --blume-accent: var(--minip2p-orange);
   --blume-accent-foreground: oklch(0.98 0.004 60);
   --blume-action: var(--minip2p-orange);
   --blume-action-foreground: oklch(0.98 0.004 60);
   --blume-code-background: oklch(0.935 0.006 60);
-  --blume-content-width: 40rem;
-  --blume-radius: 0.5rem;
+  --blume-content-width: 38rem;
+  --blume-radius: 0.75rem;
 }
 
 :root[data-theme="dark"] {
-  --blume-background: oklch(0.155 0.006 250);
-  --blume-foreground: oklch(0.93 0.005 60);
-  --blume-muted: oklch(0.2 0.006 250);
-  --blume-muted-foreground: oklch(0.7 0.006 60);
-  --minip2p-faint: oklch(0.6 0.006 250);
-  --blume-border: oklch(0.26 0.006 250);
+  --blume-background: oklch(0.16 0.004 80);
+  --blume-foreground: oklch(0.93 0.004 80);
+  --blume-muted: oklch(0.2 0.004 80);
+  --blume-muted-foreground: oklch(0.7 0.004 80);
+  --minip2p-faint: oklch(0.6 0.004 80);
+  --blume-border: oklch(0.27 0.004 80);
   --blume-accent: var(--minip2p-amber);
-  --blume-accent-foreground: oklch(0.155 0.006 250);
+  --blume-accent-foreground: oklch(0.16 0.004 80);
   --blume-action: var(--minip2p-amber);
-  --blume-action-foreground: oklch(0.155 0.006 250);
-  --blume-code-background: oklch(0.185 0.006 250);
+  --blume-action-foreground: oklch(0.16 0.004 80);
+  --blume-code-background: oklch(0.19 0.004 80);
 }
 
 /* `text-faint`, `border-faint`, … for the quieter tone above. */
@@ -65,17 +65,32 @@ body {
 }
 
 /* ── Layout shell ──────────────────────────────────────────────────────────
- * The header, sidebar, table of contents, and their scroll behaviour.
- * Markup the shell owns is styled in components/site-header.astro,
- * sidebar.astro, section-tabs.astro, and toc.astro; these rules reach the
- * parts Blume renders.
+ * The header, sidebar, content column, and their scroll behaviour. Markup
+ * the shell owns is styled in components/site-header.astro, sidebar.astro,
+ * breadcrumbs.astro, and section-tabs.astro; these rules reach the parts
+ * Blume renders.
  */
 
-/* Height of the logo + search block that site-header.astro pins over the top
-   of the sidebar column from `lg` up: 24px top padding, a 32px logo row, a
-   16px gap, and the 32px search field. */
+/* The docs shell from `lg` up, after Rex: a 200px sidebar column fixed at
+   most 64px from the window's left edge, and the content column centred in
+   the window, pushed right only when it would run into the sidebar. The
+   header block (site-header.astro) is pinned over the column's top: 80px of
+   air, the 32px logo row, a 24px gap, and the 32px search field. Only the
+   nav list below it scrolls. */
 :root {
-  --minip2p-shell-pin: 6.5rem;
+  --minip2p-side-x: clamp(0.5rem, calc(50vw - 33rem), 4rem);
+  --minip2p-side-w: 12.5rem;
+  --minip2p-shell-pin: 10.5rem;
+  /* Start padding that centres `--blume-content-width` in the window but
+     keeps it 32px clear of the sidebar. A percentage here resolves against
+     the main column's containing block, the full-width grid. */
+  --minip2p-content-start: max(
+    0px,
+    calc(
+      2 * (var(--minip2p-side-x) + var(--minip2p-side-w) + 2rem) +
+        var(--blume-content-width) - 100%
+    )
+  );
 }
 
 /* Docs pages have no header bar from `lg` up, so anchors only need a little
@@ -84,12 +99,25 @@ html:has([data-site-header="pinned"]) {
   @apply lg:scroll-pt-10;
 }
 
-/* The sidebar column starts below the pinned block and stays put while the
-   page scrolls; the nav list scrolls inside it with no visible scrollbar.
-   Blume's scroll restoration keeps working because this element is still its
-   scroll container. */
+/* One column: the sidebar is fixed beside it, and there is no table of
+   contents. The TableOfContents slot is empty (components.ts), which drops
+   the "On this page" dropdown; the rail Blume still renders for its page
+   actions is hidden. */
+html:has([data-site-header="pinned"]) [data-blume-doc-grid] {
+  @apply lg:block;
+}
+[data-blume-toc] {
+  @apply hidden;
+}
+html:has([data-site-header="pinned"]) #blume-content {
+  @apply lg:ps-(--minip2p-content-start) lg:pe-0 lg:pt-20 lg:pb-20;
+}
+
+/* The sidebar column below the pinned block; the nav list scrolls inside it
+   with no visible scrollbar. Blume's scroll restoration keeps working because
+   this element is still its scroll container. */
 [data-blume-nav-drawer] {
-  @apply [scrollbar-width:none] lg:top-(--minip2p-shell-pin) lg:mt-(--minip2p-shell-pin) lg:h-[calc(100dvh-var(--minip2p-shell-pin))] lg:px-6 lg:pt-6 lg:pb-10;
+  @apply [scrollbar-width:none] lg:fixed lg:start-(--minip2p-side-x) lg:top-(--minip2p-shell-pin) lg:h-[calc(100dvh-var(--minip2p-shell-pin))] lg:w-(--minip2p-side-w) lg:ps-4 lg:pe-2 lg:pt-6 lg:pb-20;
 }
 [data-blume-nav-drawer]::-webkit-scrollbar {
   @apply hidden;
@@ -180,7 +208,7 @@ html:has([data-site-header="pinned"]) {
   @apply rounded-md hover:bg-transparent;
 }
 [data-site-search="field"] [data-blume-search-open] {
-  @apply lg:absolute lg:inset-0 lg:size-full lg:rounded-lg;
+  @apply lg:absolute lg:inset-0 lg:size-full lg:rounded-full;
 }
 [data-site-search="field"] [data-blume-search-open] svg {
   @apply lg:hidden;
@@ -193,19 +221,6 @@ html:has([data-site-header="pinned"]) {
 }
 [data-blume-header]:not([data-site-header]) nav > a {
   @apply text-faint hover:text-foreground aria-[current=page]:text-foreground rounded-none px-0 font-normal hover:bg-transparent;
-}
-
-/* The table-of-contents rail: pinned to the top now there is no header bar,
-   with faint page actions under the list. */
-[data-blume-toc] {
-  @apply top-0 h-dvh;
-}
-[data-blume-toc] [data-blume-page-actions] {
-  @apply border-t-0;
-}
-[data-blume-toc] [data-blume-page-actions] > :is(a, button),
-[data-blume-toc] [data-blume-page-actions] > details > summary {
-  @apply text-faint hover:text-foreground;
 }
 
 /* ── Content ───────────────────────────────────────────────────────────────
@@ -229,15 +244,20 @@ html:has([data-site-header="pinned"]) {
   --color-danger: var(--minip2p-danger);
 }
 
-/* Body copy: 16px muted text, foreground for emphasis, faint list markers.
-   The article isolates so the header lattice can sit behind its text. */
+/* Body copy: 16/24 muted text, foreground for emphasis, faint list markers,
+   16px between paragraphs. The article isolates so the header lattice can sit
+   behind its text. */
 .prose {
-  @apply text-muted-foreground text-base leading-relaxed [--tw-prose-bullets:var(--color-faint)] [--tw-prose-counters:var(--color-faint)];
+  @apply text-muted-foreground text-base leading-6 [--tw-prose-bullets:var(--color-faint)] [--tw-prose-counters:var(--color-faint)];
   counter-reset: minip2p-section;
 }
 
 #blume-content > article.prose {
   @apply isolate;
+}
+
+.prose :where(p) {
+  @apply my-4;
 }
 
 .prose :where(a) {
@@ -252,19 +272,19 @@ html:has([data-site-header="pinned"]) {
   @apply border-border my-10;
 }
 
-/* The page title and the description Blume renders under it. */
+/* The page title, light as Rex's, and the description Blume renders under it
+   at body size in the foreground. */
 .prose :where(h1) {
-  @apply mb-3 text-[32px] leading-10 font-semibold tracking-[-0.03em];
+  @apply mb-4 text-[28px] leading-8 font-medium tracking-[-0.02em];
 }
 
 .prose > h1 + p.text-lg {
-  @apply text-foreground mt-0 mb-8 text-lg leading-7;
+  @apply text-foreground mt-0 mb-8 text-base leading-6;
 }
 
 /* A faint dot lattice behind the breadcrumb, title, and description, fading
-   out downward. It reaches up over a breadcrumb only at `xl`, where the
-   "On this page" dropdown between the two is hidden; the breadcrumb stacks
-   above the isolated article so the dots stay behind it. */
+   out downward. The breadcrumb (breadcrumbs.astro) stacks above the isolated
+   article so the dots stay behind it. */
 #blume-content > article > h1:first-child {
   @apply relative;
 }
@@ -278,20 +298,12 @@ html:has([data-site-header="pinned"]) {
   > nav[aria-label="Breadcrumb"]
   ~ article
   > h1:first-child::before {
-  @apply xl:-top-12 xl:h-56;
-}
-
-#blume-content > nav[aria-label="Breadcrumb"] {
-  @apply text-faint relative z-[1] mb-2 font-mono text-xs lowercase;
-}
-
-#blume-content > nav[aria-label="Breadcrumb"] a {
-  @apply hover:text-muted-foreground transition-colors;
+  @apply -top-12 h-44;
 }
 
 /* Section headings carry a mono counter, "01", "02", reset per article. */
 .prose :where(h2):not(:where(.not-prose *, .blume-toc-only)) {
-  @apply mt-12 mb-4 flex items-baseline gap-2.5 text-xl leading-7 font-medium tracking-[-0.02em];
+  @apply mt-10 mb-4 flex items-baseline gap-2.5 text-lg leading-6 font-medium tracking-[-0.015em];
   counter-increment: minip2p-section;
 }
 
@@ -301,7 +313,7 @@ html:has([data-site-header="pinned"]) {
 }
 
 .prose :where(h3) {
-  @apply mt-8 mb-3 text-lg leading-7 font-medium tracking-[-0.015em];
+  @apply mt-8 mb-2 text-base leading-6 font-medium tracking-[-0.01em];
 }
 
 .prose :where(h4) {

@@ -5,9 +5,9 @@
 // restyles that one to match the top row below.
 //
 // - Docs pages, `lg` and up: no header bar. This element is fixed over the top
-//   of the sidebar column (`--minip2p-shell-pin` tall): the logo and theme
-//   toggle, then a field-style search trigger. The sidebar below starts at the
-//   same offset (theme.css), so only the nav list scrolls.
+//   of the sidebar column (`--minip2p-shell-pin` tall, see theme.css): 80px of
+//   air, the logo and theme toggle, then a pill-shaped search field. The
+//   sidebar below starts at the same offset, so only the nav list scrolls.
 // - Below `lg`: a borderless top bar of menu toggle, logo, search, and theme
 //   toggle. The drawer's top offset is measured from it, as Blume's is.
 // - The changelog index (no sidebar): the same top bar at every width, with the
@@ -57,7 +57,7 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
     "sticky top-0 z-40 flex h-14 items-center gap-2 bg-background px-4 md:px-6",
     bare
       ? "lg:px-8"
-      : "lg:fixed lg:start-0 lg:grid lg:h-(--minip2p-shell-pin) lg:w-[17.5rem] lg:grid-cols-[minmax(0,1fr)_auto] lg:content-start lg:gap-x-2 lg:gap-y-4 lg:px-6 lg:pt-6",
+      : "lg:fixed lg:start-(--minip2p-side-x) lg:grid lg:h-(--minip2p-shell-pin) lg:w-(--minip2p-side-w) lg:grid-cols-[minmax(0,1fr)_auto] lg:content-start lg:gap-x-2 lg:gap-y-6 lg:ps-4 lg:pe-2 lg:pt-20",
   ]}
   data-blume-header
   data-site-header={bare ? "bar" : "pinned"}
@@ -83,11 +83,12 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
         class:list={[
           "relative flex items-center",
           !bare &&
-            "lg:col-span-2 lg:row-start-2 lg:h-8 lg:justify-between lg:rounded-lg lg:border lg:border-border lg:px-3 lg:text-faint lg:text-sm lg:transition-colors lg:hover:border-faint lg:hover:text-muted-foreground",
+            "lg:col-span-2 lg:row-start-2 lg:-ms-3 lg:h-8 lg:w-[calc(100%+0.75rem)] lg:gap-2 lg:rounded-full lg:border lg:border-border lg:px-3 lg:text-faint lg:text-sm lg:transition-colors lg:hover:border-faint lg:hover:text-muted-foreground",
         ]}
         data-site-search={bare ? "icon" : "field"}
       >
-        {!bare && <span aria-hidden="true" class="hidden lg:inline">Search</span>}
+        {!bare && <Icon class="hidden shrink-0 lg:block" name="search" size={14} />}
+        {!bare && <span aria-hidden="true" class="hidden flex-1 lg:inline">Search</span>}
         {!bare && <kbd aria-hidden="true" class="hidden font-mono text-xs lg:inline">⌘K</kbd>}
         <Search
           assistantEnabled={assistantEnabled}
