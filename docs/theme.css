@@ -76,15 +76,13 @@ body {
    the window, pushed right only when it would run into the sidebar. The
    header block (site-header.astro) is pinned over the column's top: 80px of
    air, the 32px logo row, a 24px gap, and the 32px search field. Only the
-   nav list below it scrolls. The changelog index has the same shell with no
-   nav list and a wider column. */
+   nav list below it scrolls. The changelog index has the same shell and
+   column with no nav list, so nothing moves between the two. */
 :root {
   --minip2p-side-x: clamp(0.5rem, calc(50vw - 33rem), 4rem);
   --minip2p-side-w: 12.5rem;
   --minip2p-shell-pin: 10.5rem;
-  /* The content column's width, which the breadcrumbs slot matches too. */
-  --minip2p-column-w: var(--blume-content-width);
-  /* Start padding that centres `--minip2p-column-w` in the window but keeps
+  /* Start padding that centres `--blume-content-width` in the window but keeps
      it 32px clear of the sidebar, and no further than that when the window
      is too narrow for the full width. It nets out the 32px end padding the
      content column keeps. A percentage here resolves against the main
@@ -93,15 +91,16 @@ body {
     2rem,
     calc(
       2 * (var(--minip2p-side-x) + var(--minip2p-side-w) + 2rem) +
-        var(--minip2p-column-w) + 2rem - 100%
+        var(--blume-content-width) + 2rem - 100%
     ),
     var(--minip2p-side-x) + var(--minip2p-side-w) + 2rem
   );
 }
 
-/* The changelog index Blume generates: its article is Blume's 54rem column. */
-html:has(#blume-content > article.max-w-\[54rem\]) {
-  --minip2p-column-w: 54rem;
+/* The changelog index Blume generates sets its article in a wider 54rem
+   column; keep it on the docs column instead. */
+#blume-content > article.max-w-\[54rem\] {
+  @apply max-w-content;
 }
 
 /* RootLayout pages have no header bar from `lg` up, so anchors only need a

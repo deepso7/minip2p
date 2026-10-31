@@ -1,10 +1,10 @@
 ---
 // The `Breadcrumbs` layout slot: the section tabs, then the page's whole trail
 // as a mono eyebrow, `docs / rust / install`, led by the current tab and ending
-// on the current page. This slot is the first thing in the content column, so
-// both lead every docs and changelog page and scroll away with it. Both take
-// the column's width from `--minip2p-column-w` (theme.css), so they line up
-// with the article on the changelog index's wider column too.
+// on the current page. Every page gets one, even a tab's own page (`changelog`),
+// so titles sit at the same height everywhere. This slot is the first thing in
+// the content column, so both lead every docs and changelog page and scroll
+// away with it.
 import type { ComponentProps } from "astro/types";
 import data from "blume:data";
 import { withMountedBase } from "blume/components/islands/base-path.ts";
@@ -19,13 +19,16 @@ const { crumbs, strings, wide = false } = Astro.props;
 const route = Astro.url.pathname.replace(/(?<=.)\/$/u, "");
 const { root, tabs } = data.navigation;
 const tab = currentTabForRoute(tabs, route, root);
-const trail = [...(tab ? [{ label: tab.label, route: tab.href ?? tab.path }] : []), ...crumbs];
-const width = wide ? "max-w-none" : "mx-auto max-w-(--minip2p-column-w)";
+// Blume's trail can repeat the tab as its first crumb (the changelog's).
+const trail = [...(tab ? [{ label: tab.label, route: tab.href ?? tab.path }] : []), ...crumbs].filter(
+  (crumb, index, all) => index === 0 || crumb.label.toLowerCase() !== all[index - 1].label.toLowerCase()
+);
+const width = wide ? "max-w-none" : "mx-auto max-w-content";
 ---
 
 <SectionTabs class:list={["mb-10", width]} route={route} />
 {
-  crumbs.length > 1 && (
+  trail.length > 0 && (
     <nav
       aria-label={{ ...EN_UI.nav, ...strings }.breadcrumb}
       class:list={["relative z-[1] mb-2 font-mono text-faint text-xs lowercase", width]}
