@@ -1,10 +1,8 @@
 ---
 // The Docs / Changelog tabs (`navigation.tabs`) as plain text links: the
 // current tab in the foreground, the others faint. Rendered at the top of the
-// content column by breadcrumbs.astro, and in the header's top row on the
-// changelog index, which has no content-column chrome of its own. The current
-// tab is `aria-current="page"` only on its own landing page, and `"true"` on
-// the pages under it.
+// content column by breadcrumbs.astro. The current tab is `aria-current="page"`
+// only on its own landing page, and `"true"` on the pages under it.
 import data from "blume:data";
 import { withMountedBase } from "blume/components/islands/base-path.ts";
 import { currentTabForRoute } from "blume/components/layout/nav-utils.ts";

@@ -76,25 +76,36 @@ body {
    the window, pushed right only when it would run into the sidebar. The
    header block (site-header.astro) is pinned over the column's top: 80px of
    air, the 32px logo row, a 24px gap, and the 32px search field. Only the
-   nav list below it scrolls. */
+   nav list below it scrolls. The changelog index has the same shell with no
+   nav list and a wider column. */
 :root {
   --minip2p-side-x: clamp(0.5rem, calc(50vw - 33rem), 4rem);
   --minip2p-side-w: 12.5rem;
   --minip2p-shell-pin: 10.5rem;
-  /* Start padding that centres `--blume-content-width` in the window but
-     keeps it 32px clear of the sidebar. A percentage here resolves against
-     the main column's containing block, the full-width grid. */
-  --minip2p-content-start: max(
-    0px,
+  /* The content column's width, which the breadcrumbs slot matches too. */
+  --minip2p-column-w: var(--blume-content-width);
+  /* Start padding that centres `--minip2p-column-w` in the window but keeps
+     it 32px clear of the sidebar, and no further than that when the window
+     is too narrow for the full width. It nets out the 32px end padding the
+     content column keeps. A percentage here resolves against the main
+     column's containing block, the full-width grid. */
+  --minip2p-content-start: clamp(
+    2rem,
     calc(
       2 * (var(--minip2p-side-x) + var(--minip2p-side-w) + 2rem) +
-        var(--blume-content-width) - 100%
-    )
+        var(--minip2p-column-w) + 2rem - 100%
+    ),
+    var(--minip2p-side-x) + var(--minip2p-side-w) + 2rem
   );
 }
 
-/* Docs pages have no header bar from `lg` up, so anchors only need a little
-   room above them. */
+/* The changelog index Blume generates: its article is Blume's 54rem column. */
+html:has(#blume-content > article.max-w-\[54rem\]) {
+  --minip2p-column-w: 54rem;
+}
+
+/* RootLayout pages have no header bar from `lg` up, so anchors only need a
+   little room above them. */
 html:has([data-site-header="pinned"]) {
   @apply lg:scroll-pt-10;
 }
@@ -110,7 +121,7 @@ html:has([data-site-header="pinned"]) [data-blume-doc-grid] {
   @apply hidden;
 }
 html:has([data-site-header="pinned"]) #blume-content {
-  @apply lg:ps-(--minip2p-content-start) lg:pe-0 lg:pt-20 lg:pb-20;
+  @apply lg:ps-(--minip2p-content-start) lg:pe-8 lg:pt-20 lg:pb-20;
 }
 
 /* The sidebar column below the pinned block; the nav list scrolls inside it
@@ -201,16 +212,13 @@ html:has([data-site-header="pinned"]) #blume-content {
   @apply rounded-none px-0 py-1 font-normal hover:bg-transparent aria-[current=page]:bg-transparent;
 }
 
-/* Blume's search trigger. In the pinned block it stretches over the
-   field-style box site-header.astro draws (label and shortcut included) and
-   drops its icon; in the top bars it stays an icon button. */
+/* Blume's search trigger. From `lg` up it stretches over the field-style box
+   site-header.astro draws (label and shortcut included) and drops its icon;
+   in the mobile bar it stays an icon button. */
 [data-site-search] [data-blume-search-open] {
-  @apply rounded-md hover:bg-transparent;
+  @apply rounded-md hover:bg-transparent lg:absolute lg:inset-0 lg:size-full lg:rounded-full;
 }
-[data-site-search="field"] [data-blume-search-open] {
-  @apply lg:absolute lg:inset-0 lg:size-full lg:rounded-full;
-}
-[data-site-search="field"] [data-blume-search-open] svg {
+[data-site-search] [data-blume-search-open] svg {
   @apply lg:hidden;
 }
 

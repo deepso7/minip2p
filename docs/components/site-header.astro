@@ -4,14 +4,13 @@
 // Blume's PageLayout, which always renders its built-in header; theme.css
 // restyles that one to match the top row below.
 //
-// - Docs pages, `lg` and up: no header bar. This element is fixed over the top
-//   of the sidebar column (`--minip2p-shell-pin` tall, see theme.css): 80px of
-//   air, the logo and theme toggle, then a pill-shaped search field. The
-//   sidebar below starts at the same offset, so only the nav list scrolls.
+// - `lg` and up: no header bar. This element is fixed over the top of the
+//   sidebar column (`--minip2p-shell-pin` tall, see theme.css): 80px of air,
+//   the logo and theme toggle, then a pill-shaped search field. The sidebar
+//   below starts at the same offset, so only the nav list scrolls. The
+//   changelog index keeps this block but has no nav list under it.
 // - Below `lg`: a borderless top bar of menu toggle, logo, search, and theme
 //   toggle. The drawer's top offset is measured from it, as Blume's is.
-// - The changelog index (no sidebar): the same top bar at every width, with the
-//   section tabs after the logo.
 import type { ComponentProps } from "astro/types";
 import data from "blume:data";
 import Icon from "blume/components/Icon.astro";
@@ -19,8 +18,6 @@ import type BlumeHeader from "blume/components/layout/Header.astro";
 import Logo from "blume/components/layout/Logo.astro";
 import Search from "blume/components/layout/Search.astro";
 import { EN_UI } from "blume/core/i18n-ui.ts";
-import SectionTabs from "./section-tabs.astro";
-import { isBareRoute } from "./shell";
 
 type Props = ComponentProps<typeof BlumeHeader>;
 
@@ -30,7 +27,6 @@ const {
   logo,
   navStrings,
   navigation,
-  route,
   searchEnabled,
   searchLocale,
   searchStrings,
@@ -39,7 +35,6 @@ const {
 } = Astro.props;
 
 const n = { ...EN_UI.nav, ...navStrings };
-const bare = isBareRoute(route);
 const iconButton =
   "inline-flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-foreground";
 
@@ -53,14 +48,9 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
 ---
 
 <header
-  class:list={[
-    "sticky top-0 z-40 flex h-14 items-center gap-2 bg-background px-4 md:px-6",
-    bare
-      ? "lg:px-8"
-      : "lg:fixed lg:start-(--minip2p-side-x) lg:grid lg:h-(--minip2p-shell-pin) lg:w-(--minip2p-side-w) lg:grid-cols-[minmax(0,1fr)_auto] lg:content-start lg:gap-x-2 lg:gap-y-6 lg:ps-4 lg:pe-2 lg:pt-20",
-  ]}
+  class="sticky top-0 z-40 flex h-14 items-center gap-2 bg-background px-4 md:px-6 lg:fixed lg:start-(--minip2p-side-x) lg:grid lg:h-(--minip2p-shell-pin) lg:w-(--minip2p-side-w) lg:grid-cols-[minmax(0,1fr)_auto] lg:content-start lg:gap-x-2 lg:gap-y-6 lg:ps-4 lg:pe-2 lg:pt-20"
   data-blume-header
-  data-site-header={bare ? "bar" : "pinned"}
+  data-site-header="pinned"
 >
   <button
     aria-controls="blume-nav-drawer"
@@ -75,21 +65,16 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
   <div class="flex min-w-0 items-center lg:col-start-1 lg:row-start-1">
     <Logo locale={locale} logo={logo} site={site} />
   </div>
-  {bare && <SectionTabs class="ms-6 hidden md:flex" route={route} />}
-  <div class:list={["flex-1", !bare && "lg:hidden"]}></div>
+  <div class="flex-1 lg:hidden"></div>
   {
     searchEnabled && (
       <div
-        class:list={[
-          "relative flex items-center",
-          !bare &&
-            "lg:col-span-2 lg:row-start-2 lg:-ms-3 lg:h-8 lg:w-[calc(100%+0.75rem)] lg:gap-2 lg:rounded-full lg:border lg:border-border lg:px-3 lg:text-faint lg:text-sm lg:transition-colors lg:hover:border-faint lg:hover:text-muted-foreground",
-        ]}
-        data-site-search={bare ? "icon" : "field"}
+        class="relative flex items-center lg:col-span-2 lg:row-start-2 lg:-ms-3 lg:h-8 lg:w-[calc(100%+0.75rem)] lg:gap-2 lg:rounded-full lg:border lg:border-border lg:px-3 lg:text-faint lg:text-sm lg:transition-colors lg:hover:border-faint lg:hover:text-muted-foreground"
+        data-site-search
       >
-        {!bare && <Icon class="hidden shrink-0 lg:block" name="search" size={14} />}
-        {!bare && <span aria-hidden="true" class="hidden flex-1 lg:inline">Search</span>}
-        {!bare && <kbd aria-hidden="true" class="hidden font-mono text-xs lg:inline">⌘K</kbd>}
+        <Icon class="hidden shrink-0 lg:block" name="search" size={14} />
+        <span aria-hidden="true" class="hidden flex-1 lg:inline">Search</span>
+        <kbd aria-hidden="true" class="hidden font-mono text-xs lg:inline">⌘K</kbd>
         <Search
           assistantEnabled={assistantEnabled}
           locale={searchLocale}
@@ -105,11 +90,7 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
     data.config.theme.toggle && (
       <button
         aria-label={n.toggleTheme}
-        class:list={[
-          iconButton,
-          "-me-2",
-          !bare && "lg:col-start-2 lg:row-start-1 lg:me-0 lg:size-8",
-        ]}
+        class={`${iconButton} -me-2 lg:col-start-2 lg:row-start-1 lg:me-0 lg:size-8`}
         data-blume-theme-toggle
         type="button"
       >
