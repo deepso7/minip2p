@@ -225,6 +225,38 @@ html:has([data-site-header="pinned"]) #blume-content {
   @apply lg:hidden;
 }
 
+/* The logo, search field, theme toggle, and section tabs carry
+   view-transition names (site-header.astro, section-tabs.astro), so they
+   glide between the landing page's layout and the docs' while the rest of
+   the page crossfades. Reduced motion skips every page transition. */
+::view-transition-group(minip2p-logo),
+::view-transition-group(minip2p-search),
+::view-transition-group(minip2p-theme),
+::view-transition-group(minip2p-tabs) {
+  animation-duration: 320ms;
+  animation-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+/* Their boxes change width between the layouts (the tabs span the whole
+   column on docs pages, the logo's row is wider on the landing page), so
+   draw each snapshot at its own size, left-aligned, instead of stretching. */
+::view-transition-old(minip2p-logo),
+::view-transition-new(minip2p-logo),
+::view-transition-old(minip2p-search),
+::view-transition-new(minip2p-search),
+::view-transition-old(minip2p-theme),
+::view-transition-new(minip2p-theme),
+::view-transition-old(minip2p-tabs),
+::view-transition-new(minip2p-tabs) {
+  @apply size-full object-none object-left;
+}
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
+  }
+}
+
 /* Blume's built-in header, which the 404 page (on PageLayout) always
    renders: its section tabs as plain text, like section-tabs.astro. */
 [data-blume-header]:not([data-site-header]) nav {

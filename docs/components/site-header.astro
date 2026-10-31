@@ -10,9 +10,13 @@
 //   below starts at the same offset, so only the nav list scrolls. The
 //   changelog index keeps this block but has no nav list under it.
 // - The landing page, `lg` and up: no sidebar column at all. This element is
-//   the top row of the content column instead, 80px down: the logo on the
-//   left, the search field and theme toggle on the right. The section tabs
-//   follow in the column (page-header.astro).
+//   the top of the content column instead, 80px down: the logo on its own
+//   row, then the section tabs with the search field and theme toggle on
+//   their right. Below `lg` the tabs sit atop the content (page-header.astro).
+//
+// The logo, search field, and theme toggle carry view-transition names (as
+// do the section tabs), so moving between the landing page and the docs
+// glides them from one layout to the other.
 // - Below `lg`: a borderless top bar of menu toggle, logo, search, and theme
 //   toggle. The drawer's top offset is measured from it, as Blume's is.
 import type { ComponentProps } from "astro/types";
@@ -22,6 +26,7 @@ import type BlumeHeader from "blume/components/layout/Header.astro";
 import Logo from "blume/components/layout/Logo.astro";
 import Search from "blume/components/layout/Search.astro";
 import { EN_UI } from "blume/core/i18n-ui.ts";
+import SectionTabs from "./section-tabs.astro";
 
 type Props = ComponentProps<typeof BlumeHeader>;
 
@@ -57,7 +62,7 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
   class:list={[
     "sticky top-0 z-40 flex h-14 items-center gap-2 bg-background px-4 md:px-6",
     landing
-      ? "lg:static lg:mx-auto lg:h-auto lg:max-w-content lg:gap-3 lg:px-0 lg:pt-20"
+      ? "lg:static lg:mx-auto lg:grid lg:h-auto lg:max-w-content lg:grid-cols-[minmax(0,1fr)_auto_auto] lg:items-center lg:gap-x-3 lg:gap-y-6 lg:px-0 lg:pt-20 lg:pb-4"
       : "lg:fixed lg:start-(--minip2p-side-x) lg:grid lg:h-(--minip2p-shell-pin) lg:w-(--minip2p-side-w) lg:grid-cols-[minmax(0,1fr)_auto] lg:content-start lg:gap-x-2 lg:gap-y-6 lg:ps-4 lg:pe-2 lg:pt-20",
   ]}
   data-blume-header
@@ -73,18 +78,25 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
   >
     <Icon name="menu" size={20} />
   </button>
-  <div class="flex min-w-0 items-center lg:col-start-1 lg:row-start-1">
+  <div
+    class="flex min-w-0 items-center lg:col-start-1 lg:row-start-1 lg:h-8"
+    transition:name="minip2p-logo"
+  >
     <Logo locale={locale} logo={logo} site={site} />
   </div>
-  <div class:list={["flex-1", !landing && "lg:hidden"]}></div>
+  {landing && <SectionTabs class="hidden lg:col-start-1 lg:row-start-2 lg:flex" route={route} />}
+  <div class="flex-1 lg:hidden"></div>
   {
     searchEnabled && (
       <div
         class:list={[
           "relative flex items-center lg:h-8 lg:gap-2 lg:rounded-full lg:border lg:border-border lg:px-3 lg:text-faint lg:text-sm lg:transition-colors lg:hover:border-faint lg:hover:text-muted-foreground",
-          landing ? "lg:w-48" : "lg:col-span-2 lg:row-start-2 lg:-ms-3 lg:w-[calc(100%+0.75rem)]",
+          landing
+            ? "lg:col-start-2 lg:row-start-2 lg:w-48"
+            : "lg:col-span-2 lg:row-start-2 lg:-ms-3 lg:w-[calc(100%+0.75rem)]",
         ]}
         data-site-search
+        transition:name="minip2p-search"
       >
         <Icon class="hidden shrink-0 lg:block" name="search" size={14} />
         <span aria-hidden="true" class="hidden flex-1 lg:inline">Search</span>
@@ -104,8 +116,13 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
     data.config.theme.toggle && (
       <button
         aria-label={n.toggleTheme}
-        class={`${iconButton} -me-2 lg:col-start-2 lg:row-start-1 lg:me-0 lg:size-8`}
+        class:list={[
+          iconButton,
+          "-me-2 lg:me-0 lg:size-8",
+          landing ? "lg:col-start-3 lg:row-start-2" : "lg:col-start-2 lg:row-start-1",
+        ]}
         data-blume-theme-toggle
+        transition:name="minip2p-theme"
         type="button"
       >
         <span class="inline-flex dark:hidden"><Icon name="sun" size={16} /></span>
