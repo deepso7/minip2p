@@ -225,6 +225,45 @@ html:has([data-site-header="pinned"]) #blume-content {
   @apply lg:hidden;
 }
 
+/* Blume's search dialog, after Rex's: a pill search bar near the top of the
+   dimmed page, and once there is a query, the results in a card under it.
+   The preview pane (and its ⌘J hint) is dropped; the card is one column.
+   site-header.astro grows the search field into the bar as it opens and
+   hides the field while it is open. */
+[data-blume-search-dialog] {
+  @apply bottom-auto mt-16 h-auto max-h-[calc(100dvh-8rem)] w-[min(40rem,calc(100vw-3rem))] overflow-visible rounded-none border-0 bg-transparent shadow-none backdrop-blur-none;
+}
+[data-blume-search-dialog] > :first-child {
+  @apply bg-background border-border mb-2 h-12 shrink-0 rounded-full border px-5 shadow-2xl;
+}
+[data-blume-search-dialog] [data-blume-search-input] {
+  @apply text-base;
+}
+[data-blume-search-grid] {
+  @apply rounded-t-blume bg-background border-border border border-b-0 md:grid-cols-1;
+}
+[data-blume-search-results] {
+  @apply max-h-[min(24rem,56dvh)];
+}
+[data-blume-search-dialog] > :last-child {
+  @apply rounded-b-blume bg-background border-border border;
+}
+[data-blume-search-preview],
+[data-blume-search-dialog] span:has(> [data-blume-search-preview-kbd]) {
+  @apply hidden;
+}
+[data-blume-search-dialog]:has([data-blume-search-input]:placeholder-shown)
+  > :not(:first-child) {
+  @apply hidden;
+}
+[data-site-search][data-search-open] {
+  @apply border-transparent;
+}
+[data-site-search][data-search-open] > :not(blume-search),
+[data-site-search][data-search-open] [data-blume-search-open] {
+  @apply invisible;
+}
+
 /* The logo, search field, theme toggle, and section tabs carry
    view-transition names (site-header.astro, section-tabs.astro), so they
    glide between the landing page's layout and the docs' while the rest of
@@ -248,6 +287,10 @@ html:has([data-site-header="pinned"]) #blume-content {
 ::view-transition-old(minip2p-tabs),
 ::view-transition-new(minip2p-tabs) {
   @apply size-full object-none object-left;
+}
+/* The search field and the search bar it grows into stay pill-shaped. */
+::view-transition-image-pair(minip2p-search) {
+  @apply overflow-clip rounded-full;
 }
 @media (prefers-reduced-motion: reduce) {
   ::view-transition-group(*),

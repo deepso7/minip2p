@@ -16,7 +16,8 @@
 //
 // The logo, search field, and theme toggle carry view-transition names (as
 // do the section tabs), so moving between the landing page and the docs
-// glides them from one layout to the other.
+// glides them from one layout to the other. The search field also grows into
+// the open search bar (the script at the end).
 // - Below `lg`: a borderless top bar of menu toggle, logo, search, and theme
 //   toggle. The drawer's top offset is measured from it, as Blume's is.
 import type { ComponentProps } from "astro/types";
@@ -132,3 +133,129 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
   }
 </header>
 <script is:inline set:html={clickScript} />
+<script>
+  // Rex's search: the search field grows into the open search bar, and the
+  // bar shrinks back into the field on close, instead of the dialog popping
+  // in. Blume's <blume-search> still owns the dialog; these capture-phase
+  // listeners only wrap its opens (the field, ⌘K, "/") and closes (Esc, ⌘K,
+  // the backdrop) in a view transition, handing the field's `minip2p-search`
+  // view-transition name to the dialog's search row while it is open. Without
+  // the View Transitions API, or with reduced motion, Blume's own handlers run
+  // as before. Registered once on the document, so they survive the client
+  // router's page swaps and look the parts up per event.
+  type BlumeSearch = HTMLElement & { open: () => Promise<void> };
+  interface Parts {
+    bar: HTMLElement;
+    dialog: HTMLDialogElement;
+    field: HTMLElement;
+    search: BlumeSearch;
+  }
+
+  const name = "minip2p-search";
+  const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
+
+  const parts = (): Parts | null => {
+    const field = document.querySelector<HTMLElement>("[data-site-search]");
+    const search = field?.querySelector<BlumeSearch>("blume-search");
+    const dialog = field?.querySelector<HTMLDialogElement>("[data-blume-search-dialog]");
+    const bar = dialog?.firstElementChild;
+    return field && search && dialog && bar instanceof HTMLElement ? { bar, dialog, field, search } : null;
+  };
+
+  const animates = () => "startViewTransition" in document && !reducedMotion.matches;
+
+  // Open: the dialog's search row carries the name and the field hides (theme.css).
+  const mark = ({ bar, field }: Parts, open: boolean) => {
+    field.toggleAttribute("data-search-open", open);
+    field.style.viewTransitionName = open ? "none" : "";
+    bar.style.viewTransitionName = open ? name : "";
+  };
+
+  const open = (p: Parts) =>
+    document.startViewTransition(() => {
+      mark(p, true);
+      // Blume opens the dialog synchronously, then loads the index.
+      void p.search.open();
+    });
+
+  const close = (p: Parts) =>
+    document.startViewTransition(() => {
+      p.dialog.close();
+      mark(p, false);
+    });
+
+  const isField = (target: EventTarget | null) =>
+    target instanceof HTMLElement &&
+    (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+
+  document.addEventListener(
+    "click",
+    (event) => {
+      const p = parts();
+      if (!(p && animates() && event.target instanceof Element)) {
+        return;
+      }
+      if (!p.dialog.open && event.target.closest("[data-blume-search-open]")) {
+        event.stopImmediatePropagation();
+        open(p);
+      } else if (p.dialog.open && event.target === p.dialog) {
+        event.stopImmediatePropagation();
+        close(p);
+      }
+    },
+    true
+  );
+
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      const p = parts();
+      if (!(p && animates())) {
+        return;
+      }
+      const chord =
+        (event.key === "k" || event.key === "K") &&
+        (event.metaKey || event.ctrlKey) &&
+        !event.shiftKey &&
+        !event.altKey;
+      const slash = event.key === "/" && !p.dialog.open && !isField(event.target);
+      if (chord || slash) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (p.dialog.open) {
+          close(p);
+        } else {
+          open(p);
+        }
+      }
+    },
+    true
+  );
+
+  // Esc asks the dialog to close with a `cancel` event, which doesn't bubble
+  // but still passes the document on its way down. A transition started
+  // inside that event stalls until the next one, so it starts just after.
+  document.addEventListener(
+    "cancel",
+    (event) => {
+      const p = parts();
+      if (p && animates() && event.target === p.dialog) {
+        event.preventDefault();
+        setTimeout(() => close(p), 0);
+      }
+    },
+    true
+  );
+
+  // Any other close (choosing a result, a close without the API) just resets.
+  document.addEventListener(
+    "close",
+    (event) => {
+      const p = parts();
+      if (p && event.target === p.dialog) {
+        mark(p, false);
+      }
+    },
+    true
+  );
+</script>
