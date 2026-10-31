@@ -436,8 +436,9 @@ blume-tabs [data-blume-tab-panel] {
   @apply text-muted-foreground px-3.5 text-sm leading-6;
 }
 
-/* Page end: a quiet "last updated" line and feedback row, then prev/next as a
-   two-cell hairline grid with mono eyebrows. */
+/* Page end: a quiet "last updated" line and feedback row, then Blume's
+   prev/next cards (each up to half the column, next on the right even alone)
+   as hairline cards with mono eyebrows. */
 [data-blume-page-end] > p {
   @apply text-faint mt-12 text-xs;
 }
@@ -455,17 +456,11 @@ blume-tabs [data-blume-tab-panel] {
 }
 
 #blume-content nav[aria-label="Pagination"] {
-  @apply rounded-blume border-border mt-8 grid grid-cols-2 gap-0 overflow-hidden border pt-0;
+  @apply mt-8 border-t-0 pt-0;
 }
 
 #blume-content nav[aria-label="Pagination"] > a {
-  @apply hover:bg-muted max-w-none rounded-none border-0 px-3.5 py-2.5 transition-colors;
-}
-
-#blume-content
-  nav[aria-label="Pagination"]
-  > a[href]:has(use[href$="arrow-right"]) {
-  @apply border-border col-start-2 border-s;
+  @apply hover:border-faint px-4 py-3;
 }
 
 #blume-content nav[aria-label="Pagination"] svg {
