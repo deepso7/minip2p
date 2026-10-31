@@ -1,0 +1,30 @@
+---
+// The Cargo features of `minip2p-rs`, as `crates/minip2p/Cargo.toml` names
+// them: name, dotted leader, description; stacked on narrow screens.
+const features = [
+  { body: "QUIC over quinn-proto with libp2p TLS. On by default; needs std.", name: "quic" },
+  { body: "TCP upgraded with Noise XX and Yamux, beside or instead of QUIC.", name: "tcp" },
+  { body: "AutoNAT probes and reachability state.", name: "autonat" },
+  { body: "Relay reservations and races, plus DCUtR hole punching with quic.", name: "relay" },
+  { body: "Signed gossipsub publish and subscribe.", name: "pubsub" },
+  { body: "Signed beacons, a shared peer book, and optional auto-dial.", name: "discovery" },
+  { body: "Local-link discovery over multicast DNS.", name: "mdns" },
+  { body: "Host a Circuit Relay v2 server.", name: "relay-server" },
+  { body: "TCP and mDNS over a host-owned smoltcp stack, for no_std devices.", name: "smoltcp" },
+];
+---
+
+<ul class="not-prose my-6 border-border border-t p-0 text-sm leading-6">
+  {
+    features.map(({ name, body }) => (
+      <li class="flex flex-col gap-1 border-border border-b py-3 md:flex-row md:items-baseline md:gap-2 md:py-2">
+        <span class="font-mono text-accent">{name}</span>
+        <span
+          aria-hidden="true"
+          class="hidden min-w-8 flex-1 -translate-y-1 border-faint border-b border-dotted opacity-60 md:block"
+        />
+        <span class="text-muted-foreground">{body}</span>
+      </li>
+    ))
+  }
+</ul>

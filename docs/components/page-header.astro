@@ -1,0 +1,17 @@
+---
+// The `PageHeader` layout slot, rendered above every article. Only the landing
+// page (`md/index.mdx`) fills it: as a `mode: custom` page it has no
+// Breadcrumbs slot, which leads every other page with the section tabs, so
+// the tabs go here instead, in the same place at the top of the column. The
+// 64px under them stand in for the 40px gap, 16px breadcrumb, and 8px gap on
+// other pages, so the title sits at the same height as everywhere else.
+import SectionTabs from "./section-tabs.astro";
+
+interface Props {
+  route: string;
+}
+
+const { route } = Astro.props;
+---
+
+{route === "/" && <SectionTabs class="mx-auto mb-16 max-w-content" route={route} />}

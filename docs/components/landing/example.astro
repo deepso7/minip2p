@@ -1,0 +1,54 @@
+---
+// The landing page's example: the same program in Rust and TypeScript, as
+// tabs styled like a docs CodeGroup.
+import data from "blume:data";
+import Tab from "blume/components/content/Tab.astro";
+import Tabs from "blume/components/content/Tabs.astro";
+import { highlightCode } from "blume/markdown";
+// Both snippets are read verbatim from files CI checks, so the landing page
+// shows code that compiles: the Rust dialer (`cargo check` in the docs job)
+// and the Node example (`tsc` in the bindings job's `pnpm typecheck`).
+import dialer from "../../snippets/quickstart/src/bin/dialer.rs?raw";
+// oxlint-disable-next-line import/default -- Vite's `?raw` adds the default export; the linter resolves the bare `.ts`.
+import ping from "../../../examples/nodejs/ping.ts?raw";
+
+// Highlighted here rather than through <CodeBlock>, which wraps each block in
+// its own div: a <Tab> holding a bare <pre> is a code panel, so it renders
+// flush in the tab box exactly like a CodeGroup in the docs.
+const highlight = (code: string, lang: string) =>
+  highlightCode(code.trimEnd(), lang, { themes: data.config.codeThemes });
+const [dialerHtml, pingHtml] = await Promise.all([highlight(dialer, "rust"), highlight(ping, "ts")]);
+---
+
+<Tabs hash={false}>
+  <Tab title="Rust"><Fragment set:html={dialerHtml} /></Tab>
+  <Tab title="TypeScript"><Fragment set:html={pingHtml} /></Tab>
+</Tabs>
+
+{/* Blume builds the tab buttons from script and, until then, shows only the
+    first panel. Without scripts, show every panel of both tab groups on the
+    page instead (the install commands and these two programs), each labelled
+    from the title Blume already puts on its panel. */}
+<noscript>
+  <style>
+    #blume-content blume-tabs [data-blume-tablist] {
+      display: none;
+    }
+    #blume-content blume-tabs [data-blume-tab-content] > * {
+      display: block !important;
+    }
+    #blume-content blume-tabs [data-blume-tab-panel] + [data-blume-tab-panel] {
+      border-top: 1px solid var(--blume-border);
+    }
+    #blume-content blume-tabs [data-blume-tab-panel]::before {
+      border-bottom: 1px solid var(--blume-border);
+      color: var(--minip2p-faint);
+      content: attr(data-title);
+      display: block;
+      font-family: var(--blume-font-mono);
+      font-size: 0.75rem;
+      line-height: 2.25rem;
+      padding: 0 0.875rem;
+    }
+  </style>
+</noscript>

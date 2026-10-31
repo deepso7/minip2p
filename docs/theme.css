@@ -98,9 +98,13 @@ body {
 }
 
 /* The changelog index Blume generates sets its article in a wider 54rem
-   column; keep it on the docs column instead. */
+   column, and the landing page (`mode: custom`) a full-width one; keep both
+   on the docs column instead. */
 #blume-content > article.max-w-\[54rem\] {
   @apply max-w-content;
+}
+#blume-content > article.max-w-none {
+  @apply max-w-content mx-auto;
 }
 
 /* RootLayout pages have no header bar from `lg` up, so anchors only need a
@@ -221,8 +225,8 @@ html:has([data-site-header="pinned"]) #blume-content {
   @apply lg:hidden;
 }
 
-/* Blume's built-in header, which PageLayout pages (the landing page and the
-   404) always render: its section tabs as plain text, like section-tabs.astro. */
+/* Blume's built-in header, which the 404 page (on PageLayout) always
+   renders: its section tabs as plain text, like section-tabs.astro. */
 [data-blume-header]:not([data-site-header]) nav {
   @apply gap-6;
 }
@@ -280,23 +284,25 @@ html:has([data-site-header="pinned"]) #blume-content {
 }
 
 /* The page title, light as Rex's, and the description Blume renders under it
-   at body size in the foreground. */
+   (or the landing page's first paragraph) at body size in the foreground. */
 .prose :where(h1) {
   @apply mb-4 text-[28px] leading-8 font-medium tracking-[-0.02em];
 }
 
-.prose > h1 + p.text-lg {
+.prose > h1 + p.text-lg,
+#blume-content > article.max-w-none > h1 + p {
   @apply text-foreground mt-0 mb-8 text-base leading-6;
 }
 
 /* A faint dot lattice behind the breadcrumb, title, and description, fading
    out downward. The breadcrumb (breadcrumbs.astro) stacks above the isolated
-   article so the dots stay behind it. */
-#blume-content > article > h1:first-child {
+   article so the dots stay behind it. The title is the article's first `h1`:
+   the landing page floats its mascot ahead of it. */
+#blume-content > article > h1:first-of-type {
   @apply relative;
 }
 
-#blume-content > article > h1:first-child::before {
+#blume-content > article > h1:first-of-type::before {
   @apply pointer-events-none absolute -inset-x-6 -top-6 -z-10 h-48 bg-[radial-gradient(var(--color-border)_1px,transparent_1.5px)] bg-[length:14px_14px] content-[''] lg:-inset-x-8;
   mask-image: linear-gradient(to bottom, oklch(0 0 0), transparent);
 }
@@ -304,7 +310,7 @@ html:has([data-site-header="pinned"]) #blume-content {
 #blume-content
   > nav[aria-label="Breadcrumb"]
   ~ article
-  > h1:first-child::before {
+  > h1:first-of-type::before {
   @apply -top-12 h-44;
 }
 

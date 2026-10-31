@@ -1,14 +1,15 @@
 ---
-// The `Header` layout slot, rendered by every RootLayout page (docs pages,
-// changelog entries, and the changelog index). Landing and 404 pages use
-// Blume's PageLayout, which always renders its built-in header; theme.css
+// The `Header` layout slot, rendered by every RootLayout page (the landing
+// page, docs pages, changelog entries, and the changelog index). The 404 page
+// uses Blume's PageLayout, which always renders its built-in header; theme.css
 // restyles that one to match the top row below.
 //
 // - `lg` and up: no header bar. This element is fixed over the top of the
 //   sidebar column (`--minip2p-shell-pin` tall, see theme.css): 80px of air,
 //   the logo and theme toggle, then a pill-shaped search field. The sidebar
 //   below starts at the same offset, so only the nav list scrolls. The
-//   changelog index keeps this block but has no nav list under it.
+//   landing page and the changelog index keep this block but have no nav
+//   list under it.
 // - Below `lg`: a borderless top bar of menu toggle, logo, search, and theme
 //   toggle. The drawer's top offset is measured from it, as Blume's is.
 import type { ComponentProps } from "astro/types";

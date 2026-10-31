@@ -1,0 +1,27 @@
+---
+// The landing page's foot, in the style of the sidebar's (sidebar.astro): the
+// project's links, then the release, MSRV, and license in faint mono. Inside
+// the article, so the links override its prose link style.
+import { newTabAttrs } from "blume/core/new-tab.ts";
+import { license, rustVersion as msrv, version } from "../workspace";
+
+const links = [
+  { href: "https://github.com/deepso7/minip2p", label: "GitHub" },
+  { href: "https://docs.rs/minip2p-rs/latest/minip2p/", label: "docs.rs" },
+  { href: "https://deepso.sh", label: "by deepso" },
+];
+const release = [version && `v${version}`, msrv && `rust ${msrv}+`, license].filter(Boolean).join(" · ");
+---
+
+<footer class="not-prose mt-16 flex flex-wrap items-center justify-between gap-x-6 gap-y-2 text-faint text-xs">
+  <nav aria-label="Project" class="flex gap-4">
+    {
+      links.map(({ href, label }) => (
+        <a class="text-faint! no-underline! transition-colors hover:text-foreground!" href={href} {...newTabAttrs(href)}>
+          {label} ↗
+        </a>
+      ))
+    }
+  </nav>
+  <span class="font-mono">{release}</span>
+</footer>

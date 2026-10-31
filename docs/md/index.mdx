@@ -1,0 +1,105 @@
+---
+title: Minimal peer-to-peer networking
+description: A minimal libp2p implementation in Rust. Connect applications over QUIC and TCP from Rust, Node.js, or React Native.
+# The landing page, at `/`: only the site header around it (no sidebar, title,
+# breadcrumbs, or page-end links), so it writes its own heading, with the
+# mascot floated beside it. It stays out of the sidebar, search, and
+# llms.txt, which would only repeat the introduction. Its Astro parts are
+# registered in components.ts. Keep it to Markdown and components: the
+# formatter garbles MDX comments and reflows inline HTML paragraphs.
+mode: custom
+hidden: true
+search:
+  exclude: true
+ai:
+  exclude: true
+---
+
+<div class="float-end ms-6 mb-2 w-24 sm:w-28">
+  <Mascot
+    directions="/mascots/logo-directions.svg"
+    reactions="/mascots/logo-reactions.svg"
+    aspect={840 / 700}
+    label="minip2p dinosaur"
+  />
+</div>
+
+# Peer-to-peer, kept simple.
+
+A minimal libp2p implementation in Rust that connects applications over QUIC and TCP, from Rust, Node.js, React Native, or the browser.
+
+<Tabs hash={false}>
+  <Tab title="cargo">
+
+    ```bash
+    cargo add minip2p-rs
+    ```
+
+  </Tab>
+  <Tab title="npm · node">
+
+    ```bash
+    npm install @minip2p/node
+    ```
+
+  </Tab>
+  <Tab title="npm · react-native">
+
+    ```bash
+    npm install @minip2p/react-native
+    ```
+
+  </Tab>
+  <Tab title="npm · web">
+
+    ```bash
+    npm install @minip2p/web
+    ```
+
+  </Tab>
+</Tabs>
+
+## Nothing runs behind your back
+
+minip2p is a minimal libp2p implementation in Rust. It connects applications over authenticated QUIC and TCP, negotiates custom protocol streams, and adds pubsub, discovery, relays, and NAT traversal only when you ask for them.
+
+There is no async runtime: the protocols are deterministic sans-I/O state machines that move only when you call `wait`. Sockets, clocks, and timers live in adapters, and `unsafe` is forbidden across the workspace.
+
+The core builds as `no_std + alloc` for microcontrollers. Node.js, React Native, and the browser drive the same endpoint through bindings, with Promises and typed events.
+
+## Cargo features
+
+Each feature of `minip2p-rs` adds a capability without changing the endpoint interface.
+
+<LandingFeatures />
+
+## Example
+
+Dial a peer, wait until it is ready, and ping it. Both programs are compiled in CI exactly as shown.
+
+<LandingExample />
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Rust" href="/docs/rust/install">
+    Install, connect two peers, drive the event loop.
+  </Card>
+  <Card title="TypeScript" href="/docs/typescript/start">
+    Node.js, React Native, and the browser.
+  </Card>
+  <Card title="Embedded devices" href="/docs/rust/embedded-devices">
+    The portable no_std + alloc endpoint.
+  </Card>
+  <Card title="NAT traversal" href="/docs/rust/traverse-nat">
+    Relays, AutoNAT, and hole punching.
+  </Card>
+  <Card title="Feature matrix" href="/docs/reference/feature-matrix">
+    Every capability and what it needs.
+  </Card>
+  <Card title="Changelog" href="/changelog">
+    What changed in each release.
+  </Card>
+</CardGroup>
+
+<LandingFoot />
