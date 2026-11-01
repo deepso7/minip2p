@@ -246,9 +246,12 @@ html:has([data-site-header="pinned"]) #blume-content {
   @apply border-border bg-background text-foreground shadow-md;
 }
 
-/* The theme toggle and search field sit in the open mobile menu only. */
+/* The theme toggle and search field sit in the open mobile menu only; the
+   field stays while its dialog is open, since `/` and Ctrl/Cmd+K open it
+   with the menu closed. */
 html:not([data-blume-nav-open]) [data-site-header] [data-blume-theme-toggle],
-html:not([data-blume-nav-open]) [data-site-search] {
+html:not([data-blume-nav-open])
+  [data-site-search]:not(:has([data-blume-search-dialog][open])) {
   @apply max-lg:hidden;
 }
 [data-blume-nav-open] [data-site-search] {
