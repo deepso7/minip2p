@@ -82,6 +82,8 @@ body {
   --minip2p-side-x: clamp(0.5rem, calc(50vw - 33rem), 4rem);
   --minip2p-side-w: 12.5rem;
   --minip2p-shell-pin: 10.5rem;
+  /* Rex's mobile menu motion; the header's menu script matches its 320ms. */
+  --minip2p-menu-slide: 320ms cubic-bezier(0.32, 0.72, 0, 1);
   /* Start padding that centres `--blume-content-width` in the window but keeps
      it 32px clear of the sidebar, and no further than that when the window
      is too narrow for the full width. It nets out the 32px end padding the
@@ -207,22 +209,156 @@ html:has([data-site-header="pinned"]) #blume-content {
   @apply mb-0;
 }
 
-/* The section tabs Blume adds to the top of the mobile drawer. */
+/* The navs Blume puts atop the drawer (section tabs, featured links), plain
+   like the nav tree. Our phone menu leaves them out: the section tabs already
+   sit atop the content column. The 404 page's drawer is only these tabs, so
+   it keeps them. */
 [data-blume-nav-drawer] > nav:not([data-blume-nav-tree]) {
   @apply border-b-0;
+}
+html:has([data-site-header])
+  [data-blume-nav-drawer]
+  > nav:not([data-blume-nav-tree]) {
+  @apply max-lg:hidden;
 }
 [data-blume-nav-drawer] > nav:not([data-blume-nav-tree]) a {
   @apply rounded-none px-0 py-1 font-normal hover:bg-transparent aria-[current=page]:bg-transparent;
 }
 
-/* Blume's search trigger. From `lg` up it stretches over the field-style box
-   site-header.astro draws (label and shortcut included) and drops its icon;
-   in the mobile bar it stays an icon button. */
+/* Below `lg`, after Rex's mobile menu: the drawer is a full-screen sheet under
+   the pinned header (site-header.astro) that slides in from the right, with
+   the nav set larger for touch. The header's backing, theme toggle, and search
+   field slide with it; the logo moves on its own (the header's menu script).
+   `data-blume-nav-open` (Blume's) drives the slide; `data-minip2p-menu` (the
+   menu script's) also covers the slide out, keeping the header pinned until
+   the sheet has left. */
+@media (width < 64rem) {
+  [data-blume-nav-drawer] {
+    @apply invisible w-full max-w-none border-e-0 px-6 pt-2 pb-10;
+    translate: 100% 0;
+    transition:
+      translate var(--minip2p-menu-slide),
+      visibility 0s linear 320ms;
+  }
+  [data-blume-nav-open] [data-blume-nav-drawer] {
+    @apply visible;
+    translate: none;
+    transition: translate var(--minip2p-menu-slide);
+  }
+  /* The sheet covers the page, so the list's edge fades would show the page
+     through; it scrolls flush instead. */
+  [data-blume-nav-drawer] {
+    mask-image: none !important;
+  }
+  [data-blume-nav-drawer] .blume-nav-heading,
+  [data-blume-nav-drawer] .blume-nav-link {
+    @apply py-1.5 text-lg;
+  }
+
+  :root:is([data-blume-nav-open], [data-minip2p-menu]) {
+    @apply overflow-hidden;
+  }
+  :is([data-blume-nav-open], [data-minip2p-menu]) [data-site-header] {
+    @apply fixed inset-x-0 top-0 pb-4;
+  }
+  /* Pinning takes the header out of the flow; the page keeps its place by
+     the closed header's 4rem (pt-8, the h-6 logo row, pb-2). */
+  :root:is([data-blume-nav-open], [data-minip2p-menu])
+    body:has(> [data-site-header]) {
+    @apply pt-16;
+  }
+  /* The header's share of the sheet. Drawn only while the menu shows, so the
+     parked copy never widens the page. */
+  :is([data-blume-nav-open], [data-minip2p-menu]) [data-site-header]::before {
+    @apply bg-background absolute inset-0 -z-10;
+    content: "";
+  }
+  [data-site-header]::before,
+  [data-site-header] [data-blume-theme-toggle],
+  [data-site-search] {
+    transition:
+      translate var(--minip2p-menu-slide),
+      color 150ms;
+  }
+  [data-minip2p-menu]:not([data-blume-nav-open]) [data-site-header]::before,
+  [data-minip2p-menu]:not([data-blume-nav-open])
+    [data-site-header]
+    [data-blume-theme-toggle],
+  [data-minip2p-menu]:not([data-blume-nav-open]) [data-site-search] {
+    translate: 100vw 0;
+  }
+  @starting-style {
+    [data-blume-nav-open] [data-site-header]::before,
+    [data-blume-nav-open] [data-site-header] [data-blume-theme-toggle],
+    [data-blume-nav-open] [data-site-search] {
+      translate: 100vw 0;
+    }
+  }
+}
+
+/* The mobile menu button, fixed in the top-right corner: once the page has
+   scrolled under it, a round backing keeps it legible. Its two bars turn into
+   a cross while the menu is open. */
+[data-site-header] [data-blume-nav-toggle] {
+  transition:
+    color 100ms,
+    border-color 200ms ease-out,
+    background-color 200ms ease-out,
+    box-shadow 200ms ease-out;
+}
+[data-minip2p-scrolled]:not([data-blume-nav-open])
+  [data-site-header]
+  [data-blume-nav-toggle] {
+  @apply border-border bg-background text-foreground shadow-md;
+}
+[data-minip2p-burger] path {
+  transform-box: view-box;
+  transform-origin: 10px 10px;
+  transition: transform var(--minip2p-menu-slide);
+}
+[data-blume-nav-open] [data-minip2p-burger] path:first-child {
+  transform: rotate(45deg) translateY(2.75px);
+}
+[data-blume-nav-open] [data-minip2p-burger] path:last-child {
+  transform: rotate(-45deg) translateY(-2.75px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-blume-nav-drawer],
+  [data-site-header]::before,
+  [data-site-header] [data-blume-theme-toggle],
+  [data-site-search],
+  [data-minip2p-burger] path {
+    transition: none !important;
+  }
+}
+
+/* The theme toggle and search field sit in the open mobile menu only; the
+   field stays while its dialog is open, since `/` and Ctrl/Cmd+K open it
+   with the menu closed. */
+html:not([data-blume-nav-open], [data-minip2p-menu])
+  [data-site-header]
+  [data-blume-theme-toggle],
+html:not([data-blume-nav-open], [data-minip2p-menu])
+  [data-site-search]:not(:has([data-blume-search-dialog][open])) {
+  @apply max-lg:hidden;
+}
+:is([data-blume-nav-open], [data-minip2p-menu]) [data-site-search] {
+  @apply max-lg:border-border max-lg:text-faint max-lg:order-last max-lg:h-11 max-lg:basis-full max-lg:gap-2 max-lg:rounded-full max-lg:border max-lg:px-4;
+}
+:is([data-blume-nav-open], [data-minip2p-menu])
+  [data-site-search]
+  > :is(svg, span) {
+  @apply max-lg:block;
+}
+
+/* Blume's search trigger stretches over the field-style box site-header.astro
+   draws (label and shortcut included) and drops its own icon. */
 [data-site-search] [data-blume-search-open] {
-  @apply rounded-md hover:bg-transparent lg:absolute lg:inset-0 lg:size-full lg:rounded-full;
+  @apply absolute inset-0 size-full rounded-full hover:bg-transparent;
 }
 [data-site-search] [data-blume-search-open] svg {
-  @apply lg:hidden;
+  @apply hidden;
 }
 
 /* Blume's search dialog, after Rex's: a pill search bar near the top of the
@@ -251,6 +387,19 @@ html:has([data-site-header="pinned"]) #blume-content {
 [data-blume-search-preview],
 [data-blume-search-dialog] span:has(> [data-blume-search-preview-kbd]) {
   @apply hidden;
+}
+/* Below `lg` the bar sits under the top corner and the keyboard hints (Esc in
+   the bar, the arrows and ↵ in the card's footer) go; the results card closes
+   on its own bottom edge. */
+[data-blume-search-dialog] {
+  @apply max-lg:mt-6;
+}
+[data-blume-search-dialog] > :first-child kbd,
+[data-blume-search-dialog] > :last-child {
+  @apply max-lg:hidden;
+}
+[data-blume-search-grid] {
+  @apply max-lg:rounded-b-blume max-lg:border-b;
 }
 /* Hidden only behind our header's search field, whose script keeps the keys
    off these rows; the 404 page's built-in header doesn't load it. */
