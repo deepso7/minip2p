@@ -210,10 +210,16 @@ html:has([data-site-header="pinned"]) #blume-content {
 }
 
 /* The navs Blume puts atop the drawer (section tabs, featured links), plain
-   like the nav tree. The phone menu leaves them out: the section tabs already
-   sit atop the content column. */
+   like the nav tree. Our phone menu leaves them out: the section tabs already
+   sit atop the content column. The 404 page's drawer is only these tabs, so
+   it keeps them. */
 [data-blume-nav-drawer] > nav:not([data-blume-nav-tree]) {
-  @apply border-b-0 max-lg:hidden;
+  @apply border-b-0;
+}
+html:has([data-site-header])
+  [data-blume-nav-drawer]
+  > nav:not([data-blume-nav-tree]) {
+  @apply max-lg:hidden;
 }
 [data-blume-nav-drawer] > nav:not([data-blume-nav-tree]) a {
   @apply rounded-none px-0 py-1 font-normal hover:bg-transparent aria-[current=page]:bg-transparent;
