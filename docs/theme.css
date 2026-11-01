@@ -261,6 +261,12 @@ html:has([data-site-header])
   :is([data-blume-nav-open], [data-minip2p-menu]) [data-site-header] {
     @apply fixed inset-x-0 top-0 pb-4;
   }
+  /* Pinning takes the header out of the flow; the page keeps its place by
+     the closed header's 4rem (pt-8, the h-6 logo row, pb-2). */
+  :root:is([data-blume-nav-open], [data-minip2p-menu])
+    body:has(> [data-site-header]) {
+    @apply pt-16;
+  }
   /* The header's share of the sheet. Drawn only while the menu shows, so the
      parked copy never widens the page. */
   :is([data-blume-nav-open], [data-minip2p-menu]) [data-site-header]::before {
