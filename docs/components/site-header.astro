@@ -18,8 +18,11 @@
 // do the section tabs), so moving between the landing page and the docs
 // glides them from one layout to the other. The search field also grows into
 // the open search bar (the script at the end).
-// - Below `lg`: a borderless top bar of menu toggle, logo, search, and theme
-//   toggle. The drawer's top offset is measured from it, as Blume's is.
+// - Below `lg`, after Rex: just the logo, scrolling away with the page, and a
+//   menu button fixed in the top-right corner. Opening the menu pins this
+//   header over a full-screen sheet (the drawer, theme.css): logo, theme
+//   toggle, and close button, then the search field as a full-width pill. The
+//   drawer's top offset is measured from it, as Blume's is.
 import type { ComponentProps } from "astro/types";
 import data from "blume:data";
 import Icon from "blume/components/Icon.astro";
@@ -57,28 +60,24 @@ const iconButton =
 // and banner dismissal, plus closing the drawer when the window widens past
 // `lg`. Re-copy it when upgrading Blume.
 const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-blume-header]");if(h){document.documentElement.style.setProperty("--blume-drawer-top",h.getBoundingClientRect().bottom+"px");}};const save=(k,v)=>{try{localStorage.setItem(k,v);}catch{}};document.addEventListener("click",(e)=>{const t=e.target.closest("[data-blume-theme-toggle]");if(t){const d=document.documentElement;const next=d.dataset.theme==="dark"?"light":"dark";const s=document.createElement("style");s.appendChild(document.createTextNode("*,*::before,*::after{transition:none!important}"));document.head.appendChild(s);d.dataset.theme=next;window.getComputedStyle(d).opacity;setTimeout(()=>document.head.removeChild(s),1);save("blume-theme",next);}const n=e.target.closest("[data-blume-nav-toggle]");if(n){const d=document.documentElement;const open=d.toggleAttribute("data-blume-nav-open");if(open){dr();}}const b=e.target.closest("[data-blume-banner-dismiss]");if(b){document.documentElement.setAttribute("data-blume-banner-hidden","");requestAnimationFrame(dr);const bar=b.closest("[data-blume-banner]");const k=bar&&bar.getAttribute("data-banner-key");if(k){save("blume-banner:"+k,"1");}}});addEventListener("resize",()=>{const d=document.documentElement;if(!d.hasAttribute("data-blume-nav-open")){return;}if(matchMedia("(min-width:64rem)").matches){d.removeAttribute("data-blume-nav-open");}else{dr();}});})();`;
+
+// Below `lg` the menu button stays fixed in the top corner while the rest of
+// the header scrolls away; once the page has scrolled, theme.css gives it a
+// round backing so it reads over the content (Rex's mobile menu button).
+// Registered once, since inline scripts rerun on every client-side swap.
+const scrollScript = `(()=>{const f=()=>document.documentElement.toggleAttribute("data-minip2p-scrolled",scrollY>24);if(!window.__minip2pScroll){window.__minip2pScroll=true;addEventListener("scroll",f,{passive:true});document.addEventListener("astro:after-swap",f);}f();})();`;
 ---
 
 <header
   class:list={[
-    "sticky top-0 z-40 flex h-14 items-center gap-2 bg-background px-4 md:px-6",
+    "relative z-40 flex flex-wrap items-center gap-x-2 gap-y-6 px-6 pt-8 pb-2 [:where([data-blume-nav-open])_&]:fixed [:where([data-blume-nav-open])_&]:inset-x-0 [:where([data-blume-nav-open])_&]:top-0 [:where([data-blume-nav-open])_&]:bg-background [:where([data-blume-nav-open])_&]:pb-4",
     landing
       ? "lg:static lg:mx-auto lg:grid lg:h-auto lg:max-w-content lg:grid-cols-[minmax(0,1fr)_auto_auto] lg:items-center lg:gap-x-3 lg:gap-y-6 lg:px-0 lg:pt-20 lg:pb-4"
-      : "lg:fixed lg:start-(--minip2p-side-x) lg:grid lg:h-(--minip2p-shell-pin) lg:w-(--minip2p-side-w) lg:grid-cols-[minmax(0,1fr)_auto] lg:content-start lg:gap-x-2 lg:gap-y-6 lg:ps-4 lg:pe-2 lg:pt-20",
+      : "lg:fixed lg:start-(--minip2p-side-x) lg:grid lg:h-(--minip2p-shell-pin) lg:w-(--minip2p-side-w) lg:grid-cols-[minmax(0,1fr)_auto] lg:content-start lg:gap-x-2 lg:gap-y-6 lg:ps-4 lg:pe-2 lg:pt-20 lg:pb-0",
   ]}
   data-blume-header
   data-site-header={landing ? "row" : "pinned"}
 >
-  <button
-    aria-controls="blume-nav-drawer"
-    aria-expanded="false"
-    aria-label={n.toggleNavigation}
-    class={`${iconButton} -ms-2 lg:hidden`}
-    data-blume-nav-toggle
-    type="button"
-  >
-    <Icon name="menu" size={20} />
-  </button>
   <div
     class="flex min-w-0 items-center lg:col-start-1 lg:row-start-1 lg:h-8"
     transition:name="minip2p-logo"
@@ -119,7 +118,9 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
         aria-label={n.toggleTheme}
         class:list={[
           iconButton,
-          "-me-2 lg:me-0 lg:size-8",
+          // Below `lg` it sits in the open menu's top row, clear of the fixed
+          // close button and without growing the row past the logo's height.
+          "-my-2 me-10 lg:my-0 lg:me-0 lg:size-8",
           landing ? "lg:col-start-3 lg:row-start-2" : "lg:col-start-2 lg:row-start-1",
         ]}
         data-blume-theme-toggle
@@ -131,8 +132,20 @@ const clickScript = `(()=>{const dr=()=>{const h=document.querySelector("[data-b
       </button>
     )
   }
+  <button
+    aria-controls="blume-nav-drawer"
+    aria-expanded="false"
+    aria-label={n.toggleNavigation}
+    class="fixed end-4 top-6 z-50 inline-flex size-10 cursor-pointer items-center justify-center rounded-full border border-transparent text-foreground lg:hidden"
+    data-blume-nav-toggle
+    type="button"
+  >
+    <span class="inline-flex [:where([data-blume-nav-open])_&]:hidden"><Icon name="menu" size={20} /></span>
+    <span class="hidden [:where([data-blume-nav-open])_&]:inline-flex"><Icon name="x" size={20} /></span>
+  </button>
 </header>
 <script is:inline set:html={clickScript} />
+<script is:inline set:html={scrollScript} />
 <script>
   // Rex's search: the search field grows into the open search bar, and the
   // bar shrinks back into the field on close, instead of the dialog popping
