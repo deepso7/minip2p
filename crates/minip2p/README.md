@@ -227,7 +227,7 @@ Every deadline in the stack, in one place. The three swarm deadlines are set tog
 
 | Deadline | Default | Bounds | Set with |
 | --- | --- | --- | --- |
-| Connect | 30 s | A Connection attempt, from `connect` to `ConnectSettled`: name resolution, candidate dials and their transport handshakes, the relay leg. It settles on `ConnectionEstablished`, before Identify. | `connect_deadline` |
+| Connect | 30 s | A Connection attempt, from `connect` to `ConnectSettled`: name resolution, candidate dials and their transport handshakes, the relay leg. A direct connection settles it on `ConnectionEstablished`, before Identify; with `dcutr`, a relayed circuit stays provisional while a direct upgrade is tried, so its Identify runs inside the attempt. | `connect_deadline` |
 | Transport handshake | TCP 30 s; WebTransport 10 s; QUIC: none | Authenticating one connection: TCP's Noise + Yamux upgrade, WebTransport's `h3` session through Noise. QUIC has no separate one: quinn's idle timeout closes a handshake that goes quiet, but does not cap one that keeps making progress. | `TcpConfig::handshake_timeout_ms`, `QuicLimits::webtransport_handshake_timeout_ms` / `idle_timeout_ms` |
 | Negotiation | 10 s | One outbound stream's multistream-select negotiation, from the transport's `StreamOpened`. Failure: an `Error` naming the stream, or `IdentifyFailed` for Identify's own stream. | `SwarmTimeouts::negotiation_ms` |
 | Stream credit wait | none | A QUIC open waiting for the peer's stream credit. It is not timed: the open waits as long as the connection lives, and the negotiation deadline starts only once credit arrives. | — |
@@ -240,7 +240,7 @@ Every deadline in the stack, in one place. The three swarm deadlines are set tog
 How they should relate:
 
 - **Identify ≥ negotiation.** The first Identify includes a negotiation, so an Identify deadline below the negotiation one cuts it short.
-- **Connect ≥ transport handshake.** A connect deadline shorter than the handshake gives up on a dial that could still authenticate. Identify starts after the connect settles, so a host waiting for `PeerReady` should allow about connect + Identify.
+- **Connect ≥ transport handshake.** A connect deadline shorter than the handshake gives up on a dial that could still authenticate. Identify starts after a direct connect settles, so a host waiting for `PeerReady` should allow about connect + Identify. A provisional relayed circuit (with `dcutr`) runs Identify inside the connect attempt instead, so there the Identify deadline can end it first: on a slow relayed link, raise both.
 - **Ping and reservation keepalives below the idle timeout**, so an idle QUIC connection is kept alive rather than timed out.
 - **Slow or loaded links.** A negotiation costs two to three round trips and a TCP connect about eight. Once the loaded RTT is above a few seconds, raise negotiation and Identify together (say to 5 × RTT), and the connect deadline with them. Automatic RTT scaling is tracked in #483.
 
