@@ -65,7 +65,8 @@ pub enum TransportEvent {
         stream_id: StreamId,
     },
     /// The connection is fully closed, for `reason`. No further events for
-    /// this connection.
+    /// this connection, and any stream still open ended with it, possibly
+    /// without a `StreamClosed` of its own.
     Closed {
         id: ConnectionId,
         reason: ConnectionCloseReason,

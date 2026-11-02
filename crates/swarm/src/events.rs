@@ -17,7 +17,9 @@ pub enum SwarmEvent {
         conn_id: ConnectionId,
     },
     /// The peer's last connection closed, for `reason`; the peer is now
-    /// disconnected.
+    /// disconnected. Its streams that got no prior
+    /// [`StreamClosed`](Self::StreamClosed) ended with it; they get no
+    /// per-stream event of their own.
     ///
     /// A failure that ended the connection is its `reason`, never also a
     /// [`SwarmEvent::Error`]. A connection that is replaced never reports

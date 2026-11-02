@@ -4,6 +4,10 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### A failed Yamux session ends its streams with the connection close (#480)
+
+On TCP and relayed circuits, a session failure (a keepalive timeout or a Yamux protocol error) no longer emits a `StreamClosed` for each open stream before the connection's `Closed`. The streams end with that `Closed` (`SwarmEvent::ConnectionClosed` / the Endpoint's connection close), whose `reason` (`TimedOut` for a keepalive timeout) says why, as QUIC already did. A graceful close or a remote `GoAway` still closes each stream first. If you tracked stream lifetimes only from `StreamClosed`, also end a connection's streams on its close, as you already need to for QUIC. `YamuxSession` and `SecureMuxSession` likewise emit no per-stream close after a failure.
+
 ### Relay server drives the swarm through `RelaySwarm` (#443)
 
 `RelayServerAgent` now runs its commands on a borrowed swarm instead of emitting tokenized actions, as `NatAgent` does with `NatSwarm`. Breaking changes for direct `minip2p-relay-server` users (the `Endpoint` API is unchanged):
