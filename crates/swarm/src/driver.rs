@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use minip2p_core::platform::{Clock, Now, StdClock, StdEntropy};
 use minip2p_core::{Bytes, PeerId};
 use minip2p_identify::IdentifyConfig;
-use minip2p_ping::PingConfig;
 use minip2p_transport::{
     BlockingTransport, ConnectionId, PollSource, SharedPoll, StreamId, TransportError, WaitHandle,
     WakeHandle,
@@ -20,6 +19,7 @@ use minip2p_transport::{
 
 use crate::core::{DriverError, SwarmCore};
 use crate::events::SwarmEvent;
+use crate::state::SwarmTimeouts;
 
 /// Cap on a single readiness wait when the caller has no deadline
 /// ([`WaitDeadline::NEVER`]). Re-arming the wait occasionally is harmless (one
@@ -189,20 +189,21 @@ fn poll_error(operation: &'static str, error: &std::io::Error) -> DriverError {
 
 impl<T: BlockingTransport> Swarm<T> {
     /// Creates a swarm driver around the given transport, identify config,
-    /// and ping config, and attaches the transport to its readiness poll.
+    /// and protocol deadlines, and attaches the transport to its readiness poll.
     ///
-    /// Fails if the poll cannot be opened or the transport's sockets cannot
-    /// be registered with it.
+    /// Fails if a deadline is zero ([`crate::SwarmError::ZeroTimeout`]), or
+    /// if the poll cannot be opened or the transport's sockets cannot be
+    /// registered with it.
     pub fn new(
         transport: T,
         identify_config: IdentifyConfig,
-        ping_config: PingConfig,
+        timeouts: SwarmTimeouts,
         local_peer_id: PeerId,
     ) -> Result<Self, DriverError> {
         Self::with_clock(
             transport,
             identify_config,
-            ping_config,
+            timeouts,
             local_peer_id,
             Box::new(StdClock::new()),
         )
@@ -216,10 +217,12 @@ impl<T: BlockingTransport> Swarm<T> {
     pub fn with_clock(
         mut transport: T,
         identify_config: IdentifyConfig,
-        ping_config: PingConfig,
+        timeouts: SwarmTimeouts,
         local_peer_id: PeerId,
         clock: Box<dyn Clock + Send + Sync>,
     ) -> Result<Self, DriverError> {
+        // Reject bad configuration before the poll opens or a socket attaches.
+        timeouts.validate()?;
         let mut poll =
             SharedPoll::new().map_err(|error| poll_error("opening the readiness poll", &error))?;
         poll.attach(&mut transport)
@@ -228,10 +231,10 @@ impl<T: BlockingTransport> Swarm<T> {
             core: SwarmCore::new(
                 transport,
                 identify_config,
-                ping_config,
+                timeouts,
                 local_peer_id,
                 StdEntropy::new(),
-            ),
+            )?,
             clock,
             poll,
             #[cfg(test)]
@@ -862,7 +865,7 @@ mod tests {
         Swarm::new(
             transport,
             identify,
-            PingConfig::default(),
+            SwarmTimeouts::default(),
             keypair.peer_id(),
         )
         .expect("swarm attaches its transport")
@@ -965,7 +968,7 @@ mod tests {
         Swarm::new(
             IdleTransport::default(),
             identify,
-            PingConfig::default(),
+            SwarmTimeouts::default(),
             keypair.peer_id(),
         )
         .expect("swarm attaches its transport")
@@ -1001,7 +1004,7 @@ mod tests {
         let mut swarm = Swarm::with_clock(
             transport,
             identify,
-            PingConfig::default(),
+            SwarmTimeouts::default(),
             keypair.peer_id(),
             Box::new(clock),
         )
@@ -1058,7 +1061,7 @@ mod tests {
         let mut swarm = Swarm::with_clock(
             transport,
             identify,
-            PingConfig::default(),
+            SwarmTimeouts::default(),
             keypair.peer_id(),
             Box::new(SharedClock(clock.clone())),
         )
@@ -1246,7 +1249,7 @@ mod tests {
         let mut swarm = Swarm::new(
             PartialListenTransport::default(),
             identify,
-            PingConfig::default(),
+            SwarmTimeouts::default(),
             keypair.peer_id(),
         )
         .expect("swarm attaches its transport");
@@ -1773,7 +1776,7 @@ mod tests {
         let mut swarm = Swarm::new(
             transport,
             identify,
-            PingConfig::default(),
+            SwarmTimeouts::default(),
             keypair.peer_id(),
         )
         .expect("swarm attaches its transport");
@@ -2011,7 +2014,7 @@ mod tests {
         let mut swarm = Swarm::new(
             transport,
             identify,
-            PingConfig::default(),
+            SwarmTimeouts::default(),
             keypair.peer_id(),
         )
         .expect("swarm attaches its transport");
@@ -2386,8 +2389,9 @@ mod tests {
         let mut swarm = Swarm::with_clock(
             transport,
             identify,
-            PingConfig {
-                request_timeout_ms: PING_TIMEOUT_MS,
+            SwarmTimeouts {
+                ping_ms: PING_TIMEOUT_MS,
+                ..SwarmTimeouts::default()
             },
             keypair.peer_id(),
             Box::new(SharedClock(clock.clone())),

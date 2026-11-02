@@ -86,7 +86,8 @@ impl<T: Transport> Host<T> {
             .gossipsub_config(GossipsubConfig {
                 allow_unsigned: config.allow_unsigned,
                 ..GossipsubConfig::default()
-            });
+            })
+            .timeouts(config.timeouts.map(Into::into).unwrap_or_default());
         // `force_relay` without a relay still submits the config, so the
         // endpoint's validation refuses it rather than dropping the flag.
         if !relays.is_empty() || config.force_relay {

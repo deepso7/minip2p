@@ -239,9 +239,9 @@ impl SwarmEvent {
 /// [`SwarmEvent::IdentifyFailed`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum IdentifyFailure {
-    /// The exchange did not finish within
-    /// [`IDENTIFY_TIMEOUT_MS`](crate::IDENTIFY_TIMEOUT_MS) of the connection
-    /// establishing: the peer never agreed to Identify, or never replied.
+    /// The exchange did not finish within the Identify deadline
+    /// ([`SwarmTimeouts::identify_ms`](crate::SwarmTimeouts::identify_ms)) of
+    /// the connection establishing: the peer never agreed to Identify, or never replied.
     TimedOut,
     /// The transport refused to open the Identify stream.
     OpenFailed,
@@ -333,6 +333,15 @@ pub enum SwarmError {
     /// receive traffic. See [`crate::RESERVED_PROTOCOL_IDS`].
     #[error("protocol '{protocol_id}' is reserved for the swarm's built-in handlers")]
     ReservedProtocol { protocol_id: String },
+    /// A [`crate::SwarmTimeouts`] deadline was zero, which would expire
+    /// everything it bounds at once.
+    #[error(
+        "the `{field}` deadline is 0 ms; set it above zero, or omit it to keep the 10 s default"
+    )]
+    ZeroTimeout {
+        /// The [`crate::SwarmTimeouts`] field, such as `"identify_ms"`.
+        field: &'static str,
+    },
     /// The peer has completed Identify and did not advertise the requested protocol.
     #[error("peer {peer_id} does not support user protocol '{protocol_id}'")]
     RemoteDoesNotSupport {

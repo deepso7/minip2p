@@ -122,6 +122,21 @@ export interface Minip2pYamuxLimits {
   readonly maxPendingControl?: number;
 }
 
+/**
+ * Protocol deadline overrides, in milliseconds; omitted fields keep the native
+ * default of 10 s. A zero makes `create` throw `InvalidConfigError` with
+ * capability `Options`. Keep `identifyMs` at least `negotiationMs`: the first
+ * Identify includes a negotiation.
+ */
+export interface Minip2pTimeouts {
+  /** How long an outbound stream may negotiate its protocol. */
+  readonly negotiationMs?: number;
+  /** How long a connection's first Identify may take before it is closed. */
+  readonly identifyMs?: number;
+  /** How long a ping waits for its echo. */
+  readonly pingMs?: number;
+}
+
 /** Coarse local reachability states. */
 export const Reachability = {
   Private: "Private",
@@ -239,6 +254,8 @@ export interface Minip2pConfig {
   readonly mdns?: boolean | Minip2pMdnsOptions;
   /** Transport limit overrides; omit for the native defaults. */
   readonly limits?: Minip2pLimits;
+  /** Protocol deadline overrides; omit for the native defaults. */
+  readonly timeouts?: Minip2pTimeouts;
 }
 
 /** Latest Identify information advertised by a remote peer. */

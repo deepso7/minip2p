@@ -77,7 +77,8 @@ pub const RESERVED_PROTOCOL_IDS: [&str; 2] = [IDENTIFY_PROTOCOL_ID, PING_PROTOCO
 /// should use the same window.
 pub const SIMULTANEOUS_DIAL_WINDOW_MS: u64 = 5_000;
 
-/// How long an outbound stream may spend in multistream-select negotiation.
+/// Default for [`SwarmTimeouts::negotiation_ms`]: how long an outbound
+/// stream may spend in multistream-select negotiation.
 ///
 /// The clock starts when the transport reports the stream opened
 /// ([`TransportEvent::StreamOpened`]), so time a transport holds the open
@@ -88,11 +89,62 @@ pub const SIMULTANEOUS_DIAL_WINDOW_MS: u64 = 5_000;
 /// its connection's first Identify ([`SwarmEvent::IdentifyFailed`]).
 pub const OUTBOUND_NEGOTIATION_TIMEOUT_MS: u64 = 10_000;
 
-/// How long a connection's first Identify exchange may take: opening the
-/// stream, negotiating it, and the peer's reply, counted from the connection
-/// establishing. A connection that is not identified by then is reported in
-/// [`SwarmEvent::IdentifyFailed`] and closed.
+/// Default for [`SwarmTimeouts::identify_ms`]: how long a connection's first
+/// Identify exchange may take: opening the stream, negotiating it, and the
+/// peer's reply, counted from the connection establishing. A connection that
+/// is not identified by then is reported in [`SwarmEvent::IdentifyFailed`]
+/// and closed.
 pub const IDENTIFY_TIMEOUT_MS: u64 = 10_000;
+
+/// The swarm's protocol deadlines, in milliseconds. Every field must be
+/// above zero; [`crate::SwarmBuilder::build_core`] rejects a zero with
+/// [`crate::SwarmError::ZeroTimeout`].
+///
+/// Identify's first exchange includes a negotiation, so keep `identify_ms`
+/// at least `negotiation_ms`. Each negotiation takes two to three round
+/// trips, so on a link whose loaded RTT exceeds a few seconds raise both.
+/// The `minip2p-rs` README's deadline table lists the Endpoint and transport
+/// deadlines beside these and how they relate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SwarmTimeouts {
+    /// How long an outbound stream may negotiate its protocol, from the
+    /// transport's `StreamOpened`. Default
+    /// [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`] (10 s).
+    pub negotiation_ms: u64,
+    /// How long a connection's first Identify may take, from the
+    /// connection establishing. Default [`IDENTIFY_TIMEOUT_MS`] (10 s).
+    pub identify_ms: u64,
+    /// How long a ping waits for its echo before
+    /// [`SwarmEvent::PingTimeout`]. Default 10 s
+    /// ([`PingConfig::default`]). The swarm only pings when the host asks.
+    pub ping_ms: u64,
+}
+
+impl Default for SwarmTimeouts {
+    fn default() -> Self {
+        Self {
+            negotiation_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+            identify_ms: IDENTIFY_TIMEOUT_MS,
+            ping_ms: PingConfig::default().request_timeout_ms,
+        }
+    }
+}
+
+impl SwarmTimeouts {
+    /// Rejects a zero deadline, naming the field.
+    pub fn validate(&self) -> Result<(), crate::SwarmError> {
+        for (field, value) in [
+            ("negotiation_ms", self.negotiation_ms),
+            ("identify_ms", self.identify_ms),
+            ("ping_ms", self.ping_ms),
+        ] {
+            if value == 0 {
+                return Err(crate::SwarmError::ZeroTimeout { field });
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Identifies which protocol owns a negotiated stream.
 ///
@@ -138,7 +190,7 @@ struct PendingOutbound {
     negotiator: MultistreamSelect,
     target: ProtocolKind,
     /// When the negotiation is given up; see
-    /// [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`]. `None` until the transport
+    /// [`SwarmTimeouts::negotiation_ms`]. `None` until the transport
     /// reports the stream opened.
     deadline_ms: Option<u64>,
     /// The peer's stop-sending code, when it arrived after our proposal
@@ -401,9 +453,8 @@ pub(crate) struct SwarmState {
     /// (RTT measured, timeout fired, outbound stream closed, peer removed)
     /// and pruned on every tick once their deadline has passed.
     ping_deadlines: BTreeMap<PeerId, u64>,
-    /// Copy of [`PingConfig::request_timeout_ms`] used to compute
-    /// `ping_deadlines` entries.
-    ping_timeout_ms: u64,
+    /// The protocol deadlines; `ping_ms` computes `ping_deadlines` entries.
+    timeouts: SwarmTimeouts,
     /// Snapshot of the transport's local listening addresses, refreshed
     /// by the core at the top of each `poll()` tick. Used to
     /// auto-populate Identify's `listen_addrs` so advertised addresses
@@ -476,7 +527,7 @@ pub(crate) struct SwarmState {
 /// Where a connection's first Identify exchange stands, until it succeeds.
 #[derive(Clone, Copy)]
 enum FirstIdentify {
-    /// Still running; given up at `deadline_ms` ([`IDENTIFY_TIMEOUT_MS`]).
+    /// Still running; given up at `deadline_ms` ([`SwarmTimeouts::identify_ms`]).
     Running { deadline_ms: u64 },
     /// Failed: the connection is closing and never becomes ready.
     Failed(IdentifyFailure),
@@ -499,19 +550,20 @@ struct Registration {
 }
 
 impl SwarmState {
-    /// Creates the state with the given identify and ping configs.
+    /// Creates the state with the given identify config and deadlines.
     ///
     /// The local peer id is derived from `identify_config.public_key`.
-    pub fn new(identify_config: IdentifyConfig, ping_config: PingConfig) -> Self {
+    pub fn new(identify_config: IdentifyConfig, timeouts: SwarmTimeouts) -> Self {
         let local_peer_id = PeerId::from_public_key_protobuf(&identify_config.public_key);
         let inbound_protocols = vec![
             IDENTIFY_PROTOCOL_ID.to_string(),
             PING_PROTOCOL_ID.to_string(),
         ];
 
-        let ping_timeout_ms = ping_config.request_timeout_ms;
         Self {
-            ping: PingProtocol::new(ping_config),
+            ping: PingProtocol::new(PingConfig {
+                request_timeout_ms: timeouts.ping_ms,
+            }),
             identify: IdentifyProtocol::new(identify_config),
             conn_to_peer: BTreeMap::new(),
             peer_to_conn: BTreeMap::new(),
@@ -525,7 +577,7 @@ impl SwarmState {
             outbound_protocols: Vec::new(),
             pending_pings: BTreeMap::new(),
             ping_deadlines: BTreeMap::new(),
-            ping_timeout_ms,
+            timeouts,
             local_addresses: Vec::new(),
             peer_info: BTreeMap::new(),
             ready_peers: BTreeSet::new(),
@@ -1448,8 +1500,7 @@ impl SwarmState {
                 // `Transport::open_stream` (see `start_outbound`); this marks
                 // the stream as actually opened, which starts its deadline.
                 if let Some(pending) = self.outbound_negotiators.get_mut(&(id, stream_id)) {
-                    pending.deadline_ms =
-                        Some(now_ms.saturating_add(OUTBOUND_NEGOTIATION_TIMEOUT_MS));
+                    pending.deadline_ms = Some(now_ms.saturating_add(self.timeouts.negotiation_ms));
                 }
             }
             TransportEvent::StreamData {
@@ -1542,12 +1593,13 @@ impl SwarmState {
                 self.fail_first_identify(conn_id, IdentifyFailure::TimedOut);
             } else {
                 self.emit_error_for_stream(
-                SwarmErrorKind::OpenStreamFailed,
-                self.established_peer_for_conn(conn_id),
-                Some(conn_id),
-                Some(stream_id),
+                    SwarmErrorKind::OpenStreamFailed,
+                    self.established_peer_for_conn(conn_id),
+                    Some(conn_id),
+                    Some(stream_id),
                     format!(
-                        "outbound stream {stream_id} did not finish negotiating within {OUTBOUND_NEGOTIATION_TIMEOUT_MS} ms"
+                        "outbound stream {stream_id} did not finish negotiating within {} ms",
+                        self.timeouts.negotiation_ms
                     ),
                 );
             }
@@ -1860,7 +1912,7 @@ impl SwarmState {
     /// timeout, so the timer is due one millisecond after it.
     fn record_ping_deadline(&mut self, peer_id: &PeerId, now_ms: u64) {
         let due = now_ms
-            .saturating_add(self.ping_timeout_ms)
+            .saturating_add(self.timeouts.ping_ms)
             .saturating_add(1);
         self.ping_deadlines.insert(peer_id.clone(), due);
     }
@@ -2062,7 +2114,7 @@ impl SwarmState {
         ) {
             // An identity upgrade can find the connection ready already.
             Ok(()) if !self.ready_peers.contains(peer_id) => {
-                let deadline_ms = now_ms.saturating_add(IDENTIFY_TIMEOUT_MS);
+                let deadline_ms = now_ms.saturating_add(self.timeouts.identify_ms);
                 self.first_identify
                     .insert(conn_id, FirstIdentify::Running { deadline_ms });
             }
@@ -3130,7 +3182,6 @@ mod tests {
 
     use minip2p_identify::IdentifyConfig;
     use minip2p_multistream_select::MULTISTREAM_PROTOCOL_ID;
-    use minip2p_ping::PingConfig;
     use minip2p_transport::{ConnectionEndpoint, ConnectionId, StreamId, TransportEvent};
 
     use super::*;
@@ -3143,7 +3194,7 @@ mod tests {
                 protocols: Vec::new(),
                 public_key: Vec::new(),
             },
-            PingConfig::default(),
+            SwarmTimeouts::default(),
         )
     }
 
@@ -6580,7 +6631,7 @@ mod tests {
                 protocols: Vec::new(),
                 public_key: b"m".to_vec(),
             },
-            PingConfig::default(),
+            SwarmTimeouts::default(),
         )
     }
 

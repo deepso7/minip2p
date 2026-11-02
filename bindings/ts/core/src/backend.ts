@@ -229,6 +229,7 @@ export {
   type BackendLimits,
   type BackendQuicLimits,
   type BackendTcpLimits,
+  type BackendTimeouts,
   type BackendYamuxLimits,
 } from "./config.js";
 export { EventDrain } from "./event-drain.js";

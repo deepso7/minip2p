@@ -16,16 +16,18 @@ pub use minip2p_swarm::{
     // re-exported so portable callers can name them without a direct swarm
     // dependency.
     DriverError,
-    // How long a connection's first Identify may take before it fails.
+    // The default first-Identify deadline (`SwarmTimeouts::identify_ms`).
     IDENTIFY_TIMEOUT_MS,
     IdentifyFailure,
     IdentifyMessage,
-    // How long an `open_stream` may negotiate before it fails.
+    // The default negotiation deadline (`SwarmTimeouts::negotiation_ms`).
     OUTBOUND_NEGOTIATION_TIMEOUT_MS,
     SwarmError,
     SwarmErrorKind,
     SwarmEvent,
     SwarmRuntimeError,
+    // The negotiation, first-Identify and ping deadlines the builders take.
+    SwarmTimeouts,
 };
 pub use minip2p_transport::{
     ConnectionCloseReason, ConnectionId, InvalidLimit, StreamId, Transport, TransportError,
@@ -755,6 +757,15 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
         self
     }
 
+    /// Overrides the negotiation, first-Identify and ping deadlines
+    /// (default [`SwarmTimeouts::default`], 10 s each). A zero deadline
+    /// fails the build with [`SwarmError::ZeroTimeout`]. See the crate
+    /// README's deadline table for how they relate to the connect deadline.
+    pub fn timeouts(mut self, timeouts: SwarmTimeouts) -> Self {
+        self.swarm = self.swarm.timeouts(timeouts);
+        self
+    }
+
     /// Adds a relay, in preference order; each call adds one.
     ///
     /// A relay is a path, not a mode: connects still race direct candidates
@@ -1033,6 +1044,13 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
     /// Sets the Connection-attempt deadline. Default 30 seconds.
     pub fn connect_deadline(mut self, deadline: Duration) -> Self {
         self.portable = self.portable.connect_deadline(deadline);
+        self
+    }
+
+    /// Overrides the protocol deadlines (see
+    /// [`PortableEndpointBuilder::timeouts`]).
+    pub fn timeouts(mut self, timeouts: SwarmTimeouts) -> Self {
+        self.portable = self.portable.timeouts(timeouts);
         self
     }
 
@@ -1560,6 +1578,21 @@ mod tests {
         assert!(matches!(
             error,
             PortableBuildError::Swarm(SwarmError::ReservedProtocol { .. })
+        ));
+
+        let error = Endpoint::portable(&identity, ZeroEntropy)
+            .timeouts(SwarmTimeouts {
+                negotiation_ms: 0,
+                ..SwarmTimeouts::default()
+            })
+            .build(NoopTransport)
+            .err()
+            .expect("a zero deadline must be rejected");
+        assert!(matches!(
+            error,
+            PortableBuildError::Swarm(SwarmError::ZeroTimeout {
+                field: "negotiation_ms"
+            })
         ));
     }
 

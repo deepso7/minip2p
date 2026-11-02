@@ -839,6 +839,20 @@ export function describeAdapterContract(
       ).toThrow(RangeError);
     });
 
+    test("native config carries only the timeouts the caller set", () => {
+      harness.create().close();
+      expect(harness.native().config).toMatchObject({ timeouts: undefined });
+
+      harness.create({ timeouts: { identifyMs: 20_000 } }).close();
+      expect(
+        (harness.native().config as { timeouts: unknown }).timeouts
+      ).toStrictEqual({ identifyMs: 20_000n });
+
+      expect(() => harness.create({ timeouts: { negotiationMs: -1 } })).toThrow(
+        RangeError
+      );
+    });
+
     test("a limit native rejects is an InvalidConfigError naming Transport", () => {
       const detail =
         "invalid limit `idle_timeout_ms`: must be greater than zero";

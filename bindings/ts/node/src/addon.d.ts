@@ -139,6 +139,8 @@ export interface NodeEndpointConfig {
   mdns?: NodeMdnsOptions
   /** Transport limit overrides. */
   limits?: NodeLimitsOptions
+  /** Protocol deadline overrides. */
+  timeouts?: NodeTimeoutsOptions
 }
 
 /** Transport limit overrides accepted from Node.js; see `LimitsOptions`. */
@@ -217,6 +219,16 @@ export interface NodeTcpLimitsOptions {
   sendStallTimeoutMs?: bigint | string
   /** Each connection's Yamux limits. */
   yamux?: NodeYamuxOptions
+}
+
+/** Protocol deadline overrides accepted from Node.js; see `TimeoutsOptions`. */
+export interface NodeTimeoutsOptions {
+  /** How long an outbound stream may negotiate its protocol, in ms. */
+  negotiationMs?: bigint
+  /** How long a connection's first Identify may take, in ms. */
+  identifyMs?: bigint
+  /** How long a ping waits for its echo, in ms. */
+  pingMs?: bigint
 }
 
 /** Yamux limit overrides accepted from Node.js; see `YamuxOptions`. */

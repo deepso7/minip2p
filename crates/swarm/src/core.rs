@@ -13,11 +13,11 @@ use alloc::vec::Vec;
 use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_core::{Bytes, Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::{IdentifyConfig, IdentifyMessage};
-use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
+use minip2p_ping::PING_PAYLOAD_LEN;
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 
 use crate::events::{SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
-use crate::state::{Action, ProtocolKind, SwarmState};
+use crate::state::{Action, ProtocolKind, SwarmState, SwarmTimeouts};
 
 /// Errors returned synchronously by swarm commands.
 ///
@@ -150,21 +150,23 @@ pub struct SwarmCore<T: Transport, E: EntropySource> {
 }
 
 impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
-    /// Creates a swarm around the given transport, identify config, and ping
-    /// config.
+    /// Creates a swarm around the given transport, identify config, and
+    /// protocol deadlines. Fails with [`SwarmError::ZeroTimeout`] if a
+    /// deadline is zero.
     ///
     /// Most callers should construct via [`crate::SwarmBuilder`] instead,
     /// which derives `local_peer_id` from the keypair automatically.
     pub fn new(
         transport: T,
         identify_config: IdentifyConfig,
-        ping_config: PingConfig,
+        timeouts: SwarmTimeouts,
         local_peer_id: PeerId,
         entropy: E,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, SwarmError> {
+        timeouts.validate()?;
+        Ok(Self {
             transport,
-            state: SwarmState::new(identify_config, ping_config),
+            state: SwarmState::new(identify_config, timeouts),
             local_peer_id,
             external_addresses: Vec::new(),
             external_addresses_revision: 0,
@@ -174,7 +176,7 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             #[cfg(test)]
             address_rebuilds: 0,
             entropy,
-        }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -574,7 +576,8 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// emits no event. Otherwise the open ends in exactly one terminal:
     /// `StreamReady`, or a [`SwarmEvent::Error`] naming the stream when
     /// negotiation fails, the peer closes or resets the stream first, or
-    /// [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`](crate::OUTBOUND_NEGOTIATION_TIMEOUT_MS)
+    /// the negotiation deadline
+    /// ([`SwarmTimeouts::negotiation_ms`](crate::SwarmTimeouts::negotiation_ms))
     /// passes without an answer. That clock starts at the transport's
     /// `StreamOpened`, not at this call: an open QUIC holds for the peer's
     /// stream credit has no deadline until then. A closed or replaced
@@ -1083,6 +1086,7 @@ mod tests {
     use alloc::string::ToString;
     use alloc::vec;
 
+    use crate::IdentifyFailure;
     use crate::state::OUTBOUND_NEGOTIATION_TIMEOUT_MS;
     use minip2p_core::platform::EntropyError;
     use minip2p_identify::IDENTIFY_PROTOCOL_ID;
@@ -1201,6 +1205,11 @@ mod tests {
         /// Swapped in by the next `poll`, as a certificate rotation does:
         /// the revision moves and each changed address is announced.
         rotate_to: Option<Vec<Multiaddr>>,
+        /// A slow peer: opens report `StreamOpened` at once, but the
+        /// listener's answers, and an Identify reply once Identify
+        /// negotiates, are held until the first poll at or past this time.
+        answer_at_ms: Option<u64>,
+        held: Vec<TransportEvent>,
     }
 
     impl ScriptedTransport {
@@ -1251,6 +1260,12 @@ mod tests {
             self.next_stream_id += 1;
             self.opened += 1;
             let stream_id = StreamId::new(self.next_stream_id);
+            if self.answer_at_ms.is_some() {
+                self.initial.push(TransportEvent::StreamOpened {
+                    id: ConnectionId::new(1),
+                    stream_id,
+                });
+            }
             if self.negotiate {
                 let mut listener = MultistreamSelect::listener(vec![
                     IDENTIFY_PROTOCOL_ID.to_string(),
@@ -1284,12 +1299,12 @@ mod tests {
             };
 
             negotiator.on_data(&data);
-            let mut negotiated = false;
+            let mut negotiated = None;
             let mut outbound = Vec::new();
             while let Some(output) = negotiator.poll_output() {
                 match output {
                     MultistreamOutput::OutboundData(bytes) => outbound.push(bytes),
-                    MultistreamOutput::Negotiated { .. } => negotiated = true,
+                    MultistreamOutput::Negotiated { protocol } => negotiated = Some(protocol),
                     other => {
                         return Err(TransportError::PollError {
                             reason: alloc::format!("unexpected multistream output: {other:?}"),
@@ -1297,17 +1312,38 @@ mod tests {
                     }
                 }
             }
-            if negotiated {
+            if negotiated.is_some() {
                 self.negotiators.remove(&stream_id);
             }
             // The dialer only learns the protocol was accepted on its next
             // poll, so hand the answer back as inbound stream data.
+            let answers = if self.answer_at_ms.is_some() {
+                &mut self.held
+            } else {
+                &mut self.initial
+            };
             for data in outbound {
-                self.initial.push(TransportEvent::StreamData {
+                answers.push(TransportEvent::StreamData {
                     id,
                     stream_id,
                     data: Bytes::from(data),
                 });
+            }
+            if self.answer_at_ms.is_some() && negotiated.as_deref() == Some(IDENTIFY_PROTOCOL_ID) {
+                let reply = minip2p_identify::IdentifyMessage {
+                    protocol_version: None,
+                    agent_version: None,
+                    public_key: None,
+                    listen_addrs: Vec::new(),
+                    observed_addr: None,
+                    protocols: Vec::new(),
+                };
+                answers.push(TransportEvent::StreamData {
+                    id,
+                    stream_id,
+                    data: Bytes::from(minip2p_core::encode_frame(&reply.encode())),
+                });
+                answers.push(TransportEvent::StreamRemoteWriteClosed { id, stream_id });
             }
             Ok(())
         }
@@ -1345,8 +1381,11 @@ mod tests {
             Ok(())
         }
 
-        fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+        fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
             let mut events = core::mem::take(&mut self.initial);
+            if self.answer_at_ms.is_some_and(|at| now.monotonic_ms >= at) {
+                events.append(&mut self.held);
+            }
             if let Some(addrs) = self.rotate_to.take() {
                 for addr in &addrs {
                     if !self.addrs.contains(addr) {
@@ -1389,10 +1428,11 @@ mod tests {
         SwarmCore::new(
             transport,
             identify,
-            PingConfig::default(),
+            SwarmTimeouts::default(),
             keypair.peer_id(),
             entropy,
         )
+        .expect("default timeouts")
     }
 
     /// A transport already holding a connection to `peer`, whose
@@ -1764,6 +1804,61 @@ mod tests {
                 .any(|event| matches!(event, SwarmEvent::Error(_))),
             "an already-gone stream's reset must not surface as Error: {events:?}"
         );
+    }
+
+    /// Polls a swarm with `timeouts` against a peer that answers Identify
+    /// (its negotiation and its reply) only 15 s after connecting, as on a
+    /// loaded slow link, and returns every event.
+    fn identify_a_peer_answering_after_15s(timeouts: SwarmTimeouts) -> Vec<SwarmEvent> {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let transport = ScriptedTransport {
+            answer_at_ms: Some(15_000),
+            ..negotiating_transport(&peer)
+        };
+        let keypair = Ed25519Keypair::generate();
+        let mut swarm = crate::SwarmBuilder::new(&keypair)
+            .timeouts(timeouts)
+            .build_core(transport, SeqEntropy(1))
+            .expect("build");
+        let mut events = Vec::new();
+        for now_ms in [0, 1, 2, 5_000, 12_000, 15_000, 15_001, 15_002, 15_003] {
+            events.extend(swarm.poll(Now::from_millis(now_ms)).expect("poll"));
+        }
+        events
+    }
+
+    #[test]
+    fn raised_deadlines_let_a_slow_peer_become_ready() {
+        let failed = |events: &[SwarmEvent]| {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    SwarmEvent::IdentifyFailed { cause, .. } => Some(*cause),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let ready = |events: &[SwarmEvent]| {
+            events
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::PeerReady { .. }))
+        };
+
+        let defaults = identify_a_peer_answering_after_15s(SwarmTimeouts::default());
+        assert_eq!(
+            failed(&defaults),
+            [IdentifyFailure::TimedOut],
+            "{defaults:?}"
+        );
+        assert!(!ready(&defaults), "{defaults:?}");
+
+        let raised = identify_a_peer_answering_after_15s(SwarmTimeouts {
+            negotiation_ms: 20_000,
+            identify_ms: 20_000,
+            ..SwarmTimeouts::default()
+        });
+        assert!(failed(&raised).is_empty(), "{raised:?}");
+        assert!(ready(&raised), "{raised:?}");
     }
 
     #[test]

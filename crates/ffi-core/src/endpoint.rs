@@ -221,6 +221,7 @@ impl P2pEndpoint {
                     .unwrap_or_else(|| format!("minip2p/{}", env!("CARGO_PKG_VERSION"))),
             )
             .gossipsub_config(gossipsub)
+            .timeouts(config.timeouts.map(Into::into).unwrap_or_default())
             .quic_limits(limits.quic)
             .tcp_config(limits.tcp)
             .circuit_limits(limits.circuit);
@@ -1240,6 +1241,7 @@ mod tests {
             discovery: None,
             mdns: None,
             limits: None,
+            timeouts: None,
         }
     }
 
@@ -1863,6 +1865,30 @@ mod tests {
             map_bind_error(invariant),
             FfiError::Internal { .. }
         ));
+    }
+
+    #[test]
+    fn a_zero_timeout_is_an_options_config_error_naming_the_field() {
+        let mut zeroed = config();
+        zeroed.timeouts = Some(crate::TimeoutsOptions {
+            ping_ms: Some(0),
+            ..crate::TimeoutsOptions::default()
+        });
+        match endpoint(zeroed) {
+            Err(FfiError::InvalidConfig {
+                capability: ConfigCapability::Options,
+                detail,
+            }) => assert!(detail.contains("ping_ms"), "{detail}"),
+            Err(error) => panic!("expected an Options InvalidConfig, got {error:?}"),
+            Ok(_) => panic!("a zero deadline must not build"),
+        }
+
+        let mut raised = config();
+        raised.timeouts = Some(crate::TimeoutsOptions {
+            identify_ms: Some(60_000),
+            ..crate::TimeoutsOptions::default()
+        });
+        endpoint(raised).expect("a partial override keeps the other defaults");
     }
 
     /// A loopback QUIC + TCP config with `limits`.
