@@ -73,7 +73,12 @@ use socket::{Received, Socket, Sockets};
 use tls::{HostTime, TlsIdentity};
 
 /// How long a Retry token stays valid.
-const RETRY_TOKEN_LIFETIME: Duration = Duration::from_secs(10);
+///
+/// It must outlive the longest round trip a dial can still succeed with: the
+/// Endpoint's connect deadline is 30 s, and on a bloated link the smoothed RTT
+/// can pass 10 s (#471). The token is bound to the client's address, so a long
+/// lifetime costs little.
+const RETRY_TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 /// Server name every dial presents; libp2p peers authenticate by certificate,
 /// not by name.
 const SERVER_NAME: &str = "l";

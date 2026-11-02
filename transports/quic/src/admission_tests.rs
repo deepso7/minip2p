@@ -203,6 +203,33 @@ fn the_handshake_completes_through_retry() {
 }
 
 #[test]
+fn a_retry_token_survives_a_round_trip_as_long_as_the_connect_deadline() {
+    // #471: on a bloated link the token can come back seconds after the
+    // Retry. Any round trip the Endpoint's 30 s connect deadline could still
+    // succeed with must not expire it.
+    let mut server = listening_server(QuicLimits::default());
+    let time = Arc::new(ShiftedTime::default());
+    server.update_server_config(|config| {
+        config.time_source(Arc::clone(&time) as Arc<dyn TimeSource>);
+    });
+
+    let mut client = RawPeer::connect(server.local_addr(), |_| {});
+    let mut events = settle(&mut server);
+    time.advance(Duration::from_secs(30));
+    drive_until(
+        &mut server,
+        &mut [&mut client],
+        &mut events,
+        "handshake through a slow Retry",
+        |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, TransportEvent::Connected { .. }))
+        },
+    );
+}
+
+#[test]
 fn a_closed_connection_keeps_its_slot_until_its_delivered_bytes_settle() {
     // ADR 0012 (#356): the receive bound outlives the connection, so a reader
     // that never acknowledges holds the slot, and acknowledging or
