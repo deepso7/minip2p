@@ -155,7 +155,10 @@ pub trait Transport {
     /// Open a new bidirectional stream on an existing connection.
     ///
     /// Returns `InvalidState` if the connection is not yet `Connected`.
-    /// Emits `StreamOpened` once the stream is open on the wire.
+    /// Emits `StreamOpened` once the stream is open locally and may send,
+    /// possibly much later (see [`TransportEvent::StreamOpened`]). A stream
+    /// reset, or a connection closed, before then never gets `StreamOpened`:
+    /// its `StreamClosed` (or the connection's `Closed`) arrives without it.
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError>;
 
     /// Write data to a stream.
