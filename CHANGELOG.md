@@ -11,6 +11,8 @@ A connection whose first Identify exchange fails used to stay open and never bec
 - **`SwarmEvent::IdentifyFailed` / `EndpointEvent::IdentifyFailed { peer_id, conn_id, cause }`** is new, with `cause: IdentifyFailure` (`TimedOut`, `OpenFailed`, `Rejected`, `ClosedEarly`, `Malformed`). It replaces the generic `OpenStreamFailed` / `UnsupportedProtocol` / `Identify` error that used to be the only signal. Add an arm if you match these enums exhaustively.
 - **The connection is then closed**; its `ConnectionClosed` reason is `ConnectionCloseReason::Error` naming Identify. Identify is not retried: redial to try again. A ready connection is never closed for Identify.
 - **`SwarmErrorKind::Identify` errors now carry the peer, connection, and stream.**
+- **The 10 s also bounds a provisional relayed connection**: a circuit whose peer never completes Identify is closed then, even inside a longer connect deadline.
+- **Foreign bindings (UniFFI, `@minip2p/web`, `@minip2p/node`) have no `IdentifyFailed` event yet.** They see the `connectionClosed` that follows, whose reason names Identify, so `waitPeerReady` rejects at once.
 
 ### Relay server drives the swarm through `RelaySwarm` (#443)
 

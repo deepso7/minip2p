@@ -416,12 +416,9 @@ pub(crate) struct SwarmState {
     ready_peers: BTreeSet<PeerId>,
     /// Peers that have been surfaced through `ConnectionEstablished`.
     established_peers: BTreeSet<PeerId>,
-    /// Connections whose first Identify exchange is still running, with when
-    /// it is given up; see [`IDENTIFY_TIMEOUT_MS`].
-    identify_deadlines: BTreeMap<ConnectionId, u64>,
-    /// Connections being closed because their first Identify failed, with
-    /// why, until the transport reports them closed. They never become ready.
-    identify_failed: BTreeMap<ConnectionId, IdentifyFailure>,
+    /// Connections whose first Identify has not succeeded yet. Dropped when
+    /// it succeeds or the connection leaves.
+    first_identify: BTreeMap<ConnectionId, FirstIdentify>,
     /// Outbound dials that have not yet established. Closed before
     /// [`SwarmEvent::ConnectionEstablished`] becomes [`SwarmEvent::DialFailed`].
     pending_dials: BTreeMap<ConnectionId, PendingDial>,
@@ -476,6 +473,15 @@ pub(crate) struct SwarmState {
     pub(crate) deferred_closes: VecDeque<ConnectionId>,
 }
 
+/// Where a connection's first Identify exchange stands, until it succeeds.
+#[derive(Clone, Copy)]
+enum FirstIdentify {
+    /// Still running; given up at `deadline_ms` ([`IDENTIFY_TIMEOUT_MS`]).
+    Running { deadline_ms: u64 },
+    /// Failed: the connection is closing and never becomes ready.
+    Failed(IdentifyFailure),
+}
+
 /// An outbound dial waiting to establish, keyed by the transport connection id.
 struct PendingDial {
     addr: PeerAddr,
@@ -524,8 +530,7 @@ impl SwarmState {
             peer_info: BTreeMap::new(),
             ready_peers: BTreeSet::new(),
             established_peers: BTreeSet::new(),
-            identify_deadlines: BTreeMap::new(),
-            identify_failed: BTreeMap::new(),
+            first_identify: BTreeMap::new(),
             pending_dials: BTreeMap::new(),
             vetoed_establishes: BTreeSet::new(),
             aborted_dials: BTreeSet::new(),
@@ -812,8 +817,15 @@ impl SwarmState {
             .filter_map(|pending| pending.deadline_ms);
         self.ping_deadlines
             .values()
-            .chain(self.identify_deadlines.values())
             .copied()
+            .chain(
+                self.first_identify
+                    .values()
+                    .filter_map(|state| match state {
+                        FirstIdentify::Running { deadline_ms } => Some(*deadline_ms),
+                        FirstIdentify::Failed(_) => None,
+                    }),
+            )
             .chain(negotiations)
             .min()
             .map(Deadline::from_millis)
@@ -1503,9 +1515,11 @@ impl SwarmState {
         self.ping_deadlines.retain(|_, due| *due > now_ms);
         self.expire_outbound_negotiations(now_ms);
         let expired: Vec<ConnectionId> = self
-            .identify_deadlines
+            .first_identify
             .iter()
-            .filter(|(_, due)| **due <= now_ms)
+            .filter(|(_, state)| {
+                matches!(state, FirstIdentify::Running { deadline_ms } if *deadline_ms <= now_ms)
+            })
             .map(|(conn_id, _)| *conn_id)
             .collect();
         for conn_id in expired {
@@ -1767,17 +1781,21 @@ impl SwarmState {
 
     /// Ends `conn_id`'s first Identify exchange as failed for `cause`:
     /// reports [`SwarmEvent::IdentifyFailed`] and closes the connection, which
-    /// can no longer become ready. Returns `false`, doing nothing, when the
-    /// exchange is not running (it succeeded, already failed, or the
-    /// connection is gone).
+    /// can no longer become ready. Returns whether it did; when the exchange
+    /// is not running (it succeeded, already failed, or the connection is
+    /// gone) it does nothing, and the caller reports the failure itself.
     fn fail_first_identify(&mut self, conn_id: ConnectionId, cause: IdentifyFailure) -> bool {
-        if self.identify_deadlines.remove(&conn_id).is_none() {
+        if !matches!(
+            self.first_identify.get(&conn_id),
+            Some(FirstIdentify::Running { .. })
+        ) {
             return false;
         }
         let Some(peer_id) = self.established_peer_for_conn(conn_id) else {
             return false;
         };
-        self.identify_failed.insert(conn_id, cause);
+        self.first_identify
+            .insert(conn_id, FirstIdentify::Failed(cause));
         self.events.push_back(SwarmEvent::IdentifyFailed {
             peer_id,
             conn_id,
@@ -1785,6 +1803,25 @@ impl SwarmState {
         });
         self.actions.push_back(Action::CloseConnection { conn_id });
         true
+    }
+
+    /// [`Self::fail_first_identify`] for a failed stream whose `target` is our
+    /// Identify request; `false` for any other stream.
+    fn fail_identify_stream(
+        &mut self,
+        target: &ProtocolKind,
+        conn_id: ConnectionId,
+        cause: IdentifyFailure,
+    ) -> bool {
+        *target == ProtocolKind::IdentifyInitiator && self.fail_first_identify(conn_id, cause)
+    }
+
+    /// Whether `conn_id` is closing because its first Identify failed.
+    fn identify_failed(&self, conn_id: ConnectionId) -> bool {
+        matches!(
+            self.first_identify.get(&conn_id),
+            Some(FirstIdentify::Failed(_))
+        )
     }
 
     /// Emits `PeerReady` for the peer's current connection once it is
@@ -1799,7 +1836,7 @@ impl SwarmState {
         let Some(&conn_id) = self.peer_to_conn.get(peer_id) else {
             return;
         };
-        if self.identify_failed.contains_key(&conn_id) {
+        if self.identify_failed(conn_id) {
             return;
         }
 
@@ -2023,9 +2060,11 @@ impl SwarmState {
             IDENTIFY_PROTOCOL_ID,
             ProtocolKind::IdentifyInitiator,
         ) {
+            // An identity upgrade can find the connection ready already.
             Ok(()) if !self.ready_peers.contains(peer_id) => {
-                self.identify_deadlines
-                    .insert(conn_id, now_ms.saturating_add(IDENTIFY_TIMEOUT_MS));
+                let deadline_ms = now_ms.saturating_add(IDENTIFY_TIMEOUT_MS);
+                self.first_identify
+                    .insert(conn_id, FirstIdentify::Running { deadline_ms });
             }
             Ok(()) => {}
             Err(e) => self.emit_error(
@@ -2445,9 +2484,7 @@ impl SwarmState {
                 ProtocolKind::IdentifyInitiator | ProtocolKind::IdentifyResponder => {
                     self.identify.on_stream_closed(peer_id, stream_id);
                     self.drain_identify_outputs();
-                    if protocol == ProtocolKind::IdentifyInitiator {
-                        self.fail_first_identify(conn_id, IdentifyFailure::ClosedEarly);
-                    }
+                    self.fail_identify_stream(&protocol, conn_id, IdentifyFailure::ClosedEarly);
                 }
                 ProtocolKind::User(_) => {
                     self.events.push_back(SwarmEvent::StreamClosed {
@@ -2462,9 +2499,7 @@ impl SwarmState {
         self.inbound_negotiators.remove(&key);
         // An open that never negotiated still gets its one terminal event.
         if let Some(pending) = self.outbound_negotiators.remove(&key) {
-            if pending.target == ProtocolKind::IdentifyInitiator
-                && self.fail_first_identify(conn_id, IdentifyFailure::ClosedEarly)
-            {
+            if self.fail_identify_stream(&pending.target, conn_id, IdentifyFailure::ClosedEarly) {
                 return;
             }
             self.emit_error_for_stream(
@@ -2484,8 +2519,8 @@ impl SwarmState {
     /// the reason, unless we closed it ourselves or aborted its dial.
     fn handle_connection_closed(&mut self, conn_id: ConnectionId, reason: ConnectionCloseReason) {
         // Our close after a failed first Identify says so.
-        let reason = match self.identify_failed.remove(&conn_id) {
-            Some(cause) if reason == ConnectionCloseReason::Local => {
+        let reason = match self.first_identify.remove(&conn_id) {
+            Some(FirstIdentify::Failed(cause)) if reason == ConnectionCloseReason::Local => {
                 ConnectionCloseReason::Error(format!("{cause}"))
             }
             _ => reason,
@@ -2544,8 +2579,7 @@ impl SwarmState {
     /// Drops the per-stream state of `conn_id`, which is leaving, and its
     /// first-Identify bookkeeping.
     fn forget_connection_streams(&mut self, conn_id: ConnectionId) {
-        self.identify_deadlines.remove(&conn_id);
-        self.identify_failed.remove(&conn_id);
+        self.first_identify.remove(&conn_id);
         self.held.forget_connection(conn_id);
         self.user_writable_wanted.retain(|(cid, _)| *cid != conn_id);
         self.user_write_ended.retain(|(cid, _)| *cid != conn_id);
@@ -2649,9 +2683,7 @@ impl SwarmState {
             match output {
                 MultistreamOutput::Negotiated { .. } => negotiated = true,
                 MultistreamOutput::NotAvailable => {
-                    if target != ProtocolKind::IdentifyInitiator
-                        || !self.fail_first_identify(conn_id, IdentifyFailure::Rejected)
-                    {
+                    if !self.fail_identify_stream(&target, conn_id, IdentifyFailure::Rejected) {
                         self.emit_error_for_stream(
                             SwarmErrorKind::UnsupportedProtocol,
                             self.established_peer_for_conn(conn_id),
@@ -2665,11 +2697,16 @@ impl SwarmState {
                         .push_back(Action::ResetStream { conn_id, stream_id });
                     return 0;
                 }
+                MultistreamOutput::ProtocolError { .. }
+                    if self.fail_identify_stream(&target, conn_id, IdentifyFailure::Malformed) =>
+                {
+                    self.outbound_negotiators.remove(&key);
+                    self.actions
+                        .push_back(Action::ResetStream { conn_id, stream_id });
+                    return 0;
+                }
                 other => {
                     if self.handle_multistream_output(conn_id, stream_id, other, &mut None) {
-                        if target == ProtocolKind::IdentifyInitiator {
-                            self.fail_first_identify(conn_id, IdentifyFailure::Malformed);
-                        }
                         self.outbound_negotiators.remove(&key);
                         self.actions
                             .push_back(Action::ResetStream { conn_id, stream_id });
@@ -3035,10 +3072,10 @@ impl SwarmState {
                 if let Some(conn_id) = conn_id {
                     // A reply that lost the race with the deadline arrives
                     // on a connection that is already closing.
-                    if self.identify_failed.contains_key(&conn_id) {
+                    if self.identify_failed(conn_id) {
                         return;
                     }
-                    self.identify_deadlines.remove(&conn_id);
+                    self.first_identify.remove(&conn_id);
                 }
                 self.peer_info.insert(peer_id.clone(), info.clone());
                 if let Some(conn_id) = conn_id {
@@ -3345,7 +3382,7 @@ mod tests {
         drain_actions(&mut core);
         drain_events(&mut core);
         // Only the user stream's timer is under test.
-        core.identify_deadlines.clear();
+        core.first_identify.clear();
         core.add_protocol("/app/1").expect("register");
         core.open_stream(&peer, "/app/1").expect("admit open");
         let actions = drain_actions(&mut core);
@@ -5470,7 +5507,7 @@ mod tests {
         let _ = drain_actions(&mut core);
 
         connect_again(&mut core, &peer_id, replacement, false);
-        core.identify_deadlines.clear();
+        core.first_identify.clear();
         let actions = drain_actions(&mut core);
         assert_eq!(
             core.next_deadline(Now::from_millis(5_000)),
@@ -5894,7 +5931,7 @@ mod tests {
         );
         while core.poll_output().is_some() {}
         // Only ping's timer is under test.
-        core.identify_deadlines.clear();
+        core.first_identify.clear();
         core.insert_stream_owner(conn_id, stream_id, ProtocolKind::Ping);
         core.ping
             .register_outbound_stream(peer_id.clone(), stream_id)
@@ -6853,8 +6890,8 @@ mod tests {
     enum IdentifyBreak {
         /// The peer never answers the negotiation.
         Silent,
-        /// The peer negotiates Identify and never sends its response.
-        SilentResponder,
+        /// The peer negotiates Identify, then never replies.
+        NegotiatedThenSilent,
         /// The transport refuses to open the stream.
         OpenFails,
         /// The peer answers `na`.
@@ -6865,6 +6902,8 @@ mod tests {
         ClosedNegotiated,
         /// The peer sends a frame Identify refuses.
         Malformed,
+        /// The peer's negotiation reply breaks multistream-select.
+        BadNegotiation,
     }
 
     const FIRST_IDENTIFY_PEER: &[u8] = b"first-identify-peer";
@@ -6919,7 +6958,7 @@ mod tests {
         };
         match how {
             IdentifyBreak::Silent | IdentifyBreak::OpenFails => {}
-            IdentifyBreak::SilentResponder => data(&mut core, accept),
+            IdentifyBreak::NegotiatedThenSilent => data(&mut core, accept),
             IdentifyBreak::Rejected => {
                 let mut na = multistream_frame(MULTISTREAM_PROTOCOL_ID);
                 na.extend_from_slice(&multistream_frame("na"));
@@ -6930,6 +6969,7 @@ mod tests {
                 data(&mut core, accept);
                 closed(&mut core);
             }
+            IdentifyBreak::BadNegotiation => data(&mut core, b"\x05nope\n".to_vec()),
             IdentifyBreak::Malformed => {
                 data(&mut core, accept);
                 // A header declaring a frame far beyond Identify's limit.
@@ -6946,12 +6986,13 @@ mod tests {
         use IdentifyBreak::*;
         let cases = [
             (Silent, IdentifyFailure::TimedOut),
-            (SilentResponder, IdentifyFailure::TimedOut),
+            (NegotiatedThenSilent, IdentifyFailure::TimedOut),
             (OpenFails, IdentifyFailure::OpenFailed),
             (Rejected, IdentifyFailure::Rejected),
             (ClosedNegotiating, IdentifyFailure::ClosedEarly),
             (ClosedNegotiated, IdentifyFailure::ClosedEarly),
             (Malformed, IdentifyFailure::Malformed),
+            (BadNegotiation, IdentifyFailure::Malformed),
         ];
         for (how, cause) in cases {
             let (mut core, peer, conn) = break_first_identify(how);
@@ -6994,7 +7035,9 @@ mod tests {
                     output,
                     Output::Event(SwarmEvent::Error(SwarmRuntimeError {
                         kind: SwarmErrorKind::OpenStreamFailed
-                            | SwarmErrorKind::UnsupportedProtocol,
+                            | SwarmErrorKind::UnsupportedProtocol
+                            | SwarmErrorKind::Multistream
+                            | SwarmErrorKind::Identify,
                         ..
                     }))
                 )),
@@ -7029,7 +7072,7 @@ mod tests {
 
     #[test]
     fn a_failed_identify_blocks_a_late_reply_from_making_the_peer_ready() {
-        let (mut core, peer, conn) = break_first_identify(IdentifyBreak::SilentResponder);
+        let (mut core, peer, conn) = break_first_identify(IdentifyBreak::NegotiatedThenSilent);
         core.handle_tick(IDENTIFY_TIMEOUT_MS);
         drain_events(&mut core);
         // The reply arrives before the transport closes the connection.
