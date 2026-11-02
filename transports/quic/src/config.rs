@@ -101,7 +101,7 @@ pub struct QuicLimits {
     pub packet_threshold: u32,
     /// How long, as a multiple of the RTT, an unacknowledged packet may wait
     /// behind a later acknowledged one before loss detection declares it lost
-    /// (RFC 9002 §6.1.2). Must be finite and at least 1.0. Defaults to
+    /// (RFC 9002 §6.1.2). Must be between 1.0 and 10.0. Defaults to
     /// quinn's 1.125 (9/8).
     ///
     /// Raising it, like [`packet_threshold`](Self::packet_threshold),

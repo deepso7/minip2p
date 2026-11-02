@@ -290,16 +290,14 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
         }
     }
     // RFC 9002's floors: lower thresholds declare packets lost that are only
-    // reordered or still in flight. A NaN or infinite time threshold never
-    // declares one lost.
+    // reordered or still in flight. The time threshold's ceiling keeps
+    // quinn's `Duration::mul_f32` by it from overflowing, which panics, and
+    // rejects NaN and infinity.
     if limits.packet_threshold < 3 {
         return Err(invalid("packet_threshold", "must be at least 3"));
     }
-    if !(limits.time_threshold.is_finite() && limits.time_threshold >= 1.0) {
-        return Err(invalid(
-            "time_threshold",
-            "must be a finite number of at least 1.0",
-        ));
+    if !(1.0..=10.0).contains(&limits.time_threshold) {
+        return Err(invalid("time_threshold", "must be between 1.0 and 10.0"));
     }
     let too_large = |field| invalid(field, "is too large for QUIC");
     let var_int = |field, value: usize| {

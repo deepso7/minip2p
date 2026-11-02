@@ -83,7 +83,7 @@ export interface Minip2pQuicLimits {
   readonly congestionController?: Minip2pCongestionController;
   /** Packets acknowledged past a missing one before it is lost; at least 3. */
   readonly packetThreshold?: number;
-  /** Multiple of the RTT a missing packet may wait before it is lost; at least 1. */
+  /** Multiple of the RTT a missing packet may wait before it is lost; 1 to 10. */
   readonly timeThreshold?: number;
 }
 

@@ -350,7 +350,7 @@ fn pending_limits_that_could_never_wake_a_writer_are_rejected() {
 /// (a NaN or infinite time threshold would never declare any), so bind
 /// rejects them.
 #[test]
-fn loss_thresholds_below_the_rfc_floors_are_rejected() {
+fn loss_thresholds_out_of_range_are_rejected() {
     for (limits, field) in [
         (
             QuicLimits {
@@ -375,7 +375,7 @@ fn loss_thresholds_below_the_rfc_floors_are_rejected() {
         ),
         (
             QuicLimits {
-                time_threshold: f32::INFINITY,
+                time_threshold: f32::MAX,
                 ..QuicLimits::default()
             },
             "time_threshold",

@@ -123,7 +123,7 @@ pub struct QuicLimitsOptions {
     #[cfg_attr(feature = "uniffi", uniffi(default))]
     pub packet_threshold: Option<u32>,
     /// Multiple of the RTT a missing packet may wait before it is declared
-    /// lost; finite and at least 1.0.
+    /// lost; between 1.0 and 10.0.
     #[cfg_attr(feature = "uniffi", uniffi(default))]
     pub time_threshold: Option<f32>,
 }
