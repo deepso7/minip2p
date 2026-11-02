@@ -6,7 +6,7 @@
 import nativeModule from "./minip2p_ffi_core-ffi";
 import { type UniffiRustFutureContinuationCallback, type UniffiForeignFutureDroppedCallback, type UniffiForeignFutureDroppedCallbackStruct,
 } from "./minip2p_ffi_core-ffi";
-import { type UniffiByteArray, AbstractFfiConverterByteArray, Cursor, FfiConverterArray, FfiConverterArrayBuffer, FfiConverterBool, FfiConverterOptional, FfiConverterUInt32, FfiConverterUInt64, FfiConverterUInt8, RustBuffer, UniffiEnum, UniffiError, UniffiInternalError, UniffiRustCaller, uniffiCreateFfiConverterString, uniffiCreateRecord, uniffiTypeNameSymbol, variantOrdinalSymbol,
+import { type UniffiByteArray, AbstractFfiConverterByteArray, Cursor, FfiConverterArray, FfiConverterArrayBuffer, FfiConverterBool, FfiConverterFloat32, FfiConverterOptional, FfiConverterUInt32, FfiConverterUInt64, FfiConverterUInt8, RustBuffer, UniffiEnum, UniffiError, UniffiInternalError, UniffiRustCaller, uniffiCreateFfiConverterString, uniffiCreateRecord, uniffiTypeNameSymbol, variantOrdinalSymbol,
 } from "@ubjs/core";
 const uniffiCaller = new UniffiRustCaller(() => ({ code: 0 }));
 
@@ -612,6 +612,49 @@ const FfiConverterTypeWindowLimit = (() => {
 })();
 
 /**
+ * A QUIC congestion controller; mirrors `minip2p::CongestionController`.
+ */
+export enum CongestionController {
+    /**
+     * CUBIC, the default.
+     */
+    Cubic,
+    /**
+     * NewReno.
+     */
+    NewReno,
+    /**
+     * BBR (experimental in quinn).
+     */
+    Bbr
+}
+
+const FfiConverterTypeCongestionController = (() => {
+    type TypeName = CongestionController;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            switch (c.readI32()) {
+                case 1: return CongestionController.Cubic;
+                case 2: return CongestionController.NewReno;
+                case 3: return CongestionController.Bbr;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            switch (value) {
+                case CongestionController.Cubic: return c.writeI32(1);
+                case CongestionController.NewReno: return c.writeI32(2);
+                case CongestionController.Bbr: return c.writeI32(3);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return 4;
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
  * QUIC overrides; each field mirrors `minip2p::QuicLimits`.
  */
 export type QuicLimitsOptions = {
@@ -664,7 +707,21 @@ export type QuicLimitsOptions = {
      * Time an `h3` connection has to complete Noise, in milliseconds;
      * non-zero.
      */
-    webtransportHandshakeTimeoutMs?: bigint
+    webtransportHandshakeTimeoutMs?: bigint,
+    /**
+     * Congestion controller each connection runs (Cubic by default).
+     */
+    congestionController?: CongestionController,
+    /**
+     * Packets acknowledged past a missing one before it is declared lost;
+     * at least 3.
+     */
+    packetThreshold?: number,
+    /**
+     * Multiple of the RTT a missing packet may wait before it is declared
+     * lost; between 1.0 and 10.0.
+     */
+    timeThreshold?: number
 }
 
 /**
@@ -683,7 +740,10 @@ export const QuicLimitsOptions = (() => {
         streamReceiveWindow: undefined,
         connectionReceiveWindow: undefined,
         sendWindow: undefined,
-        webtransportHandshakeTimeoutMs: undefined
+        webtransportHandshakeTimeoutMs: undefined,
+        congestionController: undefined,
+        packetThreshold: undefined,
+        timeThreshold: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<QuicLimitsOptions, ReturnType<typeof defaults>>(defaults);
@@ -711,7 +771,10 @@ const FfiConverterTypeQuicLimitsOptions = (() => {
                 streamReceiveWindow: FfiConverterOptionalUInt64.readFromCursor(c),
                 connectionReceiveWindow: FfiConverterOptionalTypeWindowLimit.readFromCursor(c),
                 sendWindow: FfiConverterOptionalUInt64.readFromCursor(c),
-                webtransportHandshakeTimeoutMs: FfiConverterOptionalUInt64.readFromCursor(c)
+                webtransportHandshakeTimeoutMs: FfiConverterOptionalUInt64.readFromCursor(c),
+                congestionController: FfiConverterOptionalTypeCongestionController.readFromCursor(c),
+                packetThreshold: FfiConverterOptionalUInt32.readFromCursor(c),
+                timeThreshold: FfiConverterOptionalFloat32.readFromCursor(c)
             };
         }
         writeIntoCursor(value: TypeName, c: Cursor): void {
@@ -727,6 +790,9 @@ const FfiConverterTypeQuicLimitsOptions = (() => {
             FfiConverterOptionalTypeWindowLimit.writeIntoCursor(value.connectionReceiveWindow, c);
             FfiConverterOptionalUInt64.writeIntoCursor(value.sendWindow, c);
             FfiConverterOptionalUInt64.writeIntoCursor(value.webtransportHandshakeTimeoutMs, c);
+            FfiConverterOptionalTypeCongestionController.writeIntoCursor(value.congestionController, c);
+            FfiConverterOptionalUInt32.writeIntoCursor(value.packetThreshold, c);
+            FfiConverterOptionalFloat32.writeIntoCursor(value.timeThreshold, c);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterOptionalUInt64.allocationSize(value.maxConnections) +
@@ -740,7 +806,10 @@ const FfiConverterTypeQuicLimitsOptions = (() => {
              FfiConverterOptionalUInt64.allocationSize(value.streamReceiveWindow) +
              FfiConverterOptionalTypeWindowLimit.allocationSize(value.connectionReceiveWindow) +
              FfiConverterOptionalUInt64.allocationSize(value.sendWindow) +
-             FfiConverterOptionalUInt64.allocationSize(value.webtransportHandshakeTimeoutMs);
+             FfiConverterOptionalUInt64.allocationSize(value.webtransportHandshakeTimeoutMs) +
+             FfiConverterOptionalTypeCongestionController.allocationSize(value.congestionController) +
+             FfiConverterOptionalUInt32.allocationSize(value.packetThreshold) +
+             FfiConverterOptionalFloat32.allocationSize(value.timeThreshold);
 
         }
     };
@@ -5384,14 +5453,20 @@ const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
 // FfiConverter for WindowLimit | undefined
 const FfiConverterOptionalTypeWindowLimit = new FfiConverterOptional(FfiConverterTypeWindowLimit);
 
+// FfiConverter for CongestionController | undefined
+const FfiConverterOptionalTypeCongestionController = new FfiConverterOptional(FfiConverterTypeCongestionController);
+
+// FfiConverter for number | undefined
+const FfiConverterOptionalUInt32 = new FfiConverterOptional(FfiConverterUInt32);
+
+// FfiConverter for number | undefined
+const FfiConverterOptionalFloat32 = new FfiConverterOptional(FfiConverterFloat32);
+
 // FfiConverter for QuicLimitsOptions | undefined
 const FfiConverterOptionalTypeQuicLimitsOptions = new FfiConverterOptional(FfiConverterTypeQuicLimitsOptions);
 
 // FfiConverter for TimeoutLimit | undefined
 const FfiConverterOptionalTypeTimeoutLimit = new FfiConverterOptional(FfiConverterTypeTimeoutLimit);
-
-// FfiConverter for number | undefined
-const FfiConverterOptionalUInt32 = new FfiConverterOptional(FfiConverterUInt32);
 
 // FfiConverter for YamuxOptions | undefined
 const FfiConverterOptionalTypeYamuxOptions = new FfiConverterOptional(FfiConverterTypeYamuxOptions);
@@ -5438,6 +5513,7 @@ export default Object.freeze({
   converters: {
     FfiConverterTypeCloseOutcome,
     FfiConverterTypeConfigCapability,
+    FfiConverterTypeCongestionController,
     FfiConverterTypeConnectTarget,
     FfiConverterTypeConnectionCloseReason,
     FfiConverterTypeConnectionInfo,

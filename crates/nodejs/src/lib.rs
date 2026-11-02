@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use minip2p_ffi_core::{
-    ConfigCapability, ConnectTarget, DiscoveryOptions, EndpointConfig, EventDoorbell, FfiError,
-    LimitsOptions, MdnsOptions, P2pEndpoint, QuicLimitsOptions, TcpLimitsOptions, TimeoutLimit,
-    WindowLimit, YamuxOptions,
+    ConfigCapability, CongestionController, ConnectTarget, DiscoveryOptions, EndpointConfig,
+    EventDoorbell, FfiError, LimitsOptions, MdnsOptions, P2pEndpoint, QuicLimitsOptions,
+    TcpLimitsOptions, TimeoutLimit, WindowLimit, YamuxOptions,
 };
 use napi::bindgen_prelude::{BigInt, Either, JsObjectValue, JsValue, Uint8Array};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -98,6 +98,12 @@ pub struct NodeQuicLimitsOptions {
     pub send_window: Option<BigInt>,
     /// WebTransport handshake timeout in milliseconds.
     pub webtransport_handshake_timeout_ms: Option<BigInt>,
+    /// `"cubic"`, `"newReno"` or `"bbr"`.
+    pub congestion_controller: Option<String>,
+    /// Packet reordering threshold.
+    pub packet_threshold: Option<u32>,
+    /// Time reordering threshold, as a multiple of the RTT.
+    pub time_threshold: Option<f64>,
 }
 
 /// TCP limit overrides accepted from Node.js; see `TcpLimitsOptions`.
@@ -252,7 +258,28 @@ fn convert_quic_limits(
             options.webtransport_handshake_timeout_ms,
             "limits.quic.webtransportHandshakeTimeoutMs",
         )?,
+        congestion_controller: options
+            .congestion_controller
+            .map(|name| convert_congestion_controller(&name))
+            .transpose()?,
+        packet_threshold: options.packet_threshold,
+        // The native threshold is an `f32`; its validation sees the rounding.
+        time_threshold: options.time_threshold.map(|threshold| threshold as f32),
     })
+}
+
+/// A congestion controller from its JavaScript name.
+fn convert_congestion_controller(
+    name: &str,
+) -> core::result::Result<CongestionController, FfiError> {
+    match name {
+        "cubic" => Ok(CongestionController::Cubic),
+        "newReno" => Ok(CongestionController::NewReno),
+        "bbr" => Ok(CongestionController::Bbr),
+        _ => Err(invalid_limit(
+            r#"limits.quic.congestionController must be "cubic", "newReno" or "bbr""#.to_owned(),
+        )),
+    }
 }
 
 fn convert_tcp_limits(

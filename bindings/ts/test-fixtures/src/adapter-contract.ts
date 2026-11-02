@@ -10,7 +10,11 @@ import {
   StreamClosedError,
   TimeoutError,
 } from "../../core/src/index.js";
-import type { Minip2pBase, Minip2pConfig } from "../../core/src/index.js";
+import type {
+  Minip2pBase,
+  Minip2pCongestionController,
+  Minip2pConfig,
+} from "../../core/src/index.js";
 
 /** A native event literal; both fakes accept `{ tag, inner }` with bigints. */
 export interface NativeEventLiteral {
@@ -784,7 +788,12 @@ export function describeAdapterContract(
           limits: {
             circuit: { maxStreams: 8 },
             maxCircuits: 4,
-            quic: { connectionReceiveWindow: "unlimited" },
+            quic: {
+              congestionController: "newReno",
+              connectionReceiveWindow: "unlimited",
+              packetThreshold: 10,
+              timeThreshold: 1.5,
+            },
             tcp: {
               handshakeTimeoutMs: "never",
               sendStallTimeoutMs: 5000,
@@ -798,7 +807,12 @@ export function describeAdapterContract(
       ).toStrictEqual({
         circuit: { maxStreams: 8n },
         maxCircuits: 4n,
-        quic: { connectionReceiveWindow: "unlimited" },
+        quic: {
+          congestionController: "newReno",
+          connectionReceiveWindow: "unlimited",
+          packetThreshold: 10,
+          timeThreshold: 1.5,
+        },
         tcp: {
           handshakeTimeoutMs: "never",
           sendStallTimeoutMs: 5000n,
@@ -808,6 +822,15 @@ export function describeAdapterContract(
 
       expect(() =>
         harness.create({ limits: { quic: { sendWindow: -1 } } })
+      ).toThrow(RangeError);
+      expect(() =>
+        harness.create({
+          limits: {
+            quic: {
+              congestionController: "newreno" as Minip2pCongestionController,
+            },
+          },
+        })
       ).toThrow(RangeError);
       expect(() =>
         harness.create({

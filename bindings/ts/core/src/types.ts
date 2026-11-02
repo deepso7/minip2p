@@ -79,7 +79,16 @@ export interface Minip2pQuicLimits {
   readonly sendWindow?: number;
   /** Time a WebTransport client has to complete Noise, in milliseconds. */
   readonly webtransportHandshakeTimeoutMs?: number;
+  /** Congestion controller each connection runs (`"cubic"` by default). */
+  readonly congestionController?: Minip2pCongestionController;
+  /** Packets acknowledged past a missing one before it is lost; at least 3. */
+  readonly packetThreshold?: number;
+  /** Multiple of the RTT a missing packet may wait before it is lost; 1 to 10. */
+  readonly timeThreshold?: number;
 }
+
+/** A QUIC congestion controller, mirroring the native `CongestionController`. */
+export type Minip2pCongestionController = "cubic" | "newReno" | "bbr";
 
 /** TCP limit overrides, mirroring the native `TcpConfig`. */
 export interface Minip2pTcpLimits {
