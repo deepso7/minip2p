@@ -632,8 +632,8 @@ impl Endpoint {
     /// in exactly one terminal: [`EndpointEvent::StreamReady`], or an error
     /// event naming the stream (see [`crate::SwarmErrorKind`]) when negotiation
     /// fails, the peer closes the stream first, or
-    /// [`crate::OUTBOUND_NEGOTIATION_TIMEOUT_MS`]
-    /// passes; a closed or replaced connection ends it with its own event.
+    /// the negotiation deadline ([`SwarmTimeouts::negotiation_ms`], set with
+    /// [`EndpointBuilder::timeouts`]) passes; a closed or replaced connection ends it with its own event.
     pub fn open_stream(
         &mut self,
         peer_id: &PeerId,

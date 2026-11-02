@@ -576,7 +576,8 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// emits no event. Otherwise the open ends in exactly one terminal:
     /// `StreamReady`, or a [`SwarmEvent::Error`] naming the stream when
     /// negotiation fails, the peer closes or resets the stream first, or
-    /// [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`](crate::OUTBOUND_NEGOTIATION_TIMEOUT_MS)
+    /// the negotiation deadline
+    /// ([`SwarmTimeouts::negotiation_ms`](crate::SwarmTimeouts::negotiation_ms))
     /// passes without an answer. That clock starts at the transport's
     /// `StreamOpened`, not at this call: an open QUIC holds for the peer's
     /// stream credit has no deadline until then. A closed or replaced

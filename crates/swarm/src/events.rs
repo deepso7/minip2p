@@ -239,9 +239,9 @@ impl SwarmEvent {
 /// [`SwarmEvent::IdentifyFailed`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum IdentifyFailure {
-    /// The exchange did not finish within
-    /// [`IDENTIFY_TIMEOUT_MS`](crate::IDENTIFY_TIMEOUT_MS) of the connection
-    /// establishing: the peer never agreed to Identify, or never replied.
+    /// The exchange did not finish within the Identify deadline
+    /// ([`SwarmTimeouts::identify_ms`](crate::SwarmTimeouts::identify_ms)) of
+    /// the connection establishing: the peer never agreed to Identify, or never replied.
     TimedOut,
     /// The transport refused to open the Identify stream.
     OpenFailed,
@@ -336,7 +336,7 @@ pub enum SwarmError {
     /// A [`crate::SwarmTimeouts`] deadline was zero, which would expire
     /// everything it bounds at once.
     #[error(
-        "swarm timeout `{field}` is 0 ms; set it above zero, or leave it at its default (SwarmTimeouts::default())"
+        "the `{field}` deadline is 0 ms; set it above zero, or omit it to keep the 10 s default"
     )]
     ZeroTimeout {
         /// The [`crate::SwarmTimeouts`] field, such as `"identify_ms"`.

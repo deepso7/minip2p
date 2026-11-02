@@ -16,11 +16,11 @@ pub use minip2p_swarm::{
     // re-exported so portable callers can name them without a direct swarm
     // dependency.
     DriverError,
-    // How long a connection's first Identify may take before it fails.
+    // The default first-Identify deadline (`SwarmTimeouts::identify_ms`).
     IDENTIFY_TIMEOUT_MS,
     IdentifyFailure,
     IdentifyMessage,
-    // How long an `open_stream` may negotiate before it fails.
+    // The default negotiation deadline (`SwarmTimeouts::negotiation_ms`).
     OUTBOUND_NEGOTIATION_TIMEOUT_MS,
     SwarmError,
     SwarmErrorKind,
