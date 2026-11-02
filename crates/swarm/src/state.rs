@@ -2299,8 +2299,8 @@ impl SwarmState {
     /// their stream is reset; the resulting `StreamClosed` tears them down.
     ///
     /// Two only read on: an Identify request, and an outbound negotiation
-    /// whose proposal is out, which waits for the reply and then handles the
-    /// stop as its protocol would. A peer that answers and closes at once
+    /// whose proposal is out (drained and not held after a Full), which
+    /// waits for the reply and then handles the stop as its protocol would. A peer that answers and closes at once
     /// (go-libp2p's WebTransport `Close` also stops our sending) must not
     /// lose its answer.
     fn handle_stream_write_stopped(
@@ -2310,12 +2310,16 @@ impl SwarmState {
         error_code: u64,
     ) {
         let key = (conn_id, stream_id);
+        // A write the transport answered Full is still unsent: a proposal in
+        // it never reached the peer, so no reply will come.
+        let proposal_held = self.held.is_held(conn_id, stream_id);
         self.forget_held(conn_id, stream_id);
         if self.abandoned_streams.contains(&key) {
             return;
         }
         if let Some(pending) = self.outbound_negotiators.get_mut(&key)
             && pending.negotiator.awaits_response()
+            && !proposal_held
         {
             pending.write_stopped = Some(error_code);
             return;
@@ -4569,7 +4573,9 @@ mod tests {
     }
 
     /// go-libp2p's WebTransport `Close` stops our sending as it answers, so
-    /// a write stop can overtake the reply to a proposal already sent.
+    /// a write stop can overtake the reply to a proposal already sent. The
+    /// proposal leaves with the header, so the stop can even beat the
+    /// listener's header.
     #[test]
     fn a_write_stop_after_the_proposal_waits_for_the_reply() {
         let (mut core, conn, stream) = negotiating_user_stream(0);
@@ -4578,8 +4584,6 @@ mod tests {
             stream_id: stream,
             data: ms_line(text),
         };
-        feed(&mut core, data("/multistream/1.0.0\n"));
-        drain_actions(&mut core);
         feed(
             &mut core,
             TransportEvent::StreamWriteStopped {
@@ -4596,6 +4600,7 @@ mod tests {
             "{actions:?}"
         );
 
+        feed(&mut core, data("/multistream/1.0.0\n"));
         feed(&mut core, data("/app/1\n"));
         let events: Vec<_> = drain_events(&mut core)
             .into_iter()
@@ -4615,6 +4620,30 @@ mod tests {
                 ] if *ready == stream && *stopped == stream
             ),
             "{events:?}"
+        );
+    }
+
+    /// A proposal the transport answered Full is still unsent, so no reply
+    /// can come: a write stop resets the stream.
+    #[test]
+    fn a_write_stop_while_the_proposal_is_held_resets() {
+        let (mut core, conn, stream) = negotiating_user_stream(0);
+        core.handle_send_full(conn, stream, Bytes::from_static(b"held"), 4);
+        feed(
+            &mut core,
+            TransportEvent::StreamWriteStopped {
+                id: conn,
+                stream_id: stream,
+                error_code: 3,
+            },
+        );
+        let actions = drain_actions(&mut core);
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::ResetStream { conn_id, stream_id } if *conn_id == conn && *stream_id == stream
+            )),
+            "{actions:?}"
         );
     }
 

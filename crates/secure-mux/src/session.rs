@@ -1207,8 +1207,9 @@ mod tests {
         ));
     }
 
-    /// Builds a dialer select that has exchanged multistream headers and sent
-    /// its `/yamux/1.0.0` proposal, plus the exact echo the peer replies with.
+    /// Builds a dialer select that has sent its header and `/yamux/1.0.0`
+    /// proposal and received the peer's header, plus the exact echo the peer
+    /// replies with.
     ///
     /// The echo is the message that completes negotiation, so anything a peer
     /// packs after it in the same write is what
@@ -1218,18 +1219,23 @@ mod tests {
 
         let mut select = MultistreamSelect::dialer(YAMUX_PROTOCOL_ID);
         select.start();
-        while select.poll_output().is_some() {}
-
-        // The header echo makes the dialer send its protocol proposal; the
-        // peer echoes that same line back to confirm.
-        select.on_data(MULTISTREAM_HEADER);
-        let mut echo = Vec::new();
+        let mut first_write = Vec::new();
         while let Some(output) = select.poll_output() {
             if let MultistreamOutput::OutboundData(bytes) = output {
-                echo.extend_from_slice(&bytes);
+                first_write.extend_from_slice(&bytes);
             }
         }
+
+        // The dialer pipelines its proposal after its header; the peer
+        // echoes that proposal line back to confirm.
+        let echo = first_write
+            .strip_prefix(MULTISTREAM_HEADER)
+            .expect("dialer writes its header first")
+            .to_vec();
         assert!(!echo.is_empty(), "dialer must propose a protocol");
+
+        select.on_data(MULTISTREAM_HEADER);
+        assert!(select.poll_output().is_none());
 
         (select, echo)
     }
