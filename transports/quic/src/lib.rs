@@ -23,7 +23,7 @@ use minip2p_transport::{
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn_proto::{
     ClientConfig, ConnectionHandle, DatagramEvent, EndpointConfig, IdleTimeout, Incoming,
-    ServerConfig, TransportConfig, ValidationTokenConfig, VarInt,
+    ServerConfig, TransportConfig, ValidationTokenConfig, VarInt, congestion,
 };
 use socket2::{Domain, Protocol as SocketProtocol, Socket as RawSocket, Type};
 
@@ -54,7 +54,7 @@ mod webtransport_tests;
 #[cfg(test)]
 mod write_fairness_tests;
 
-pub use config::{QuicLimits, QuicNodeConfig, WebTransportCertificates};
+pub use config::{CongestionController, QuicLimits, QuicNodeConfig, WebTransportCertificates};
 #[cfg(feature = "diagnostics")]
 pub use diagnostics::{
     ConnectionDiagnostics, DatagramCounters, SocketBuffers, datagram_counters, socket_buffers,
@@ -289,6 +289,16 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
             return Err(invalid(field, "must be greater than zero"));
         }
     }
+    // RFC 9002's floors: lower thresholds declare packets lost that are only
+    // reordered or still in flight. The time threshold's ceiling keeps
+    // quinn's `Duration::mul_f32` by it from overflowing, which panics, and
+    // rejects NaN and infinity.
+    if limits.packet_threshold < 3 {
+        return Err(invalid("packet_threshold", "must be at least 3"));
+    }
+    if !(1.0..=10.0).contains(&limits.time_threshold) {
+        return Err(invalid("time_threshold", "must be between 1.0 and 10.0"));
+    }
     let too_large = |field| invalid(field, "is too large for QUIC");
     let var_int = |field, value: usize| {
         u64::try_from(value)
@@ -310,8 +320,18 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
     let send_window =
         u64::try_from(limits.send_window).map_err(|_overflow| too_large("send_window"))?;
 
+    let congestion: Arc<dyn congestion::ControllerFactory + Send + Sync> =
+        match limits.congestion_controller {
+            CongestionController::Cubic => Arc::new(congestion::CubicConfig::default()),
+            CongestionController::NewReno => Arc::new(congestion::NewRenoConfig::default()),
+            CongestionController::Bbr => Arc::new(congestion::BbrConfig::default()),
+        };
+
     let mut config = TransportConfig::default();
     config
+        .congestion_controller_factory(congestion)
+        .packet_threshold(limits.packet_threshold)
+        .time_threshold(limits.time_threshold)
         .stream_receive_window(stream_window)
         .receive_window(connection_window)
         .send_window(send_window)
@@ -2124,5 +2144,52 @@ mod tests {
             transport.close(foreign),
             Err(TransportError::ConnectionNotFound { id: foreign })
         );
+    }
+
+    /// The controller and thresholds reach each connection's engine: the
+    /// built transport config carries both thresholds, and an accepted
+    /// connection runs the chosen controller.
+    #[test]
+    fn congestion_tuning_reaches_the_engine() {
+        use crate::test_peer::{accept, listening_server};
+        for controller in [
+            CongestionController::Cubic,
+            CongestionController::NewReno,
+            CongestionController::Bbr,
+        ] {
+            let limits = QuicLimits {
+                congestion_controller: controller,
+                packet_threshold: 10,
+                time_threshold: 2.0,
+                ..QuicLimits::default()
+            };
+            // quinn keeps the thresholds private; its Debug shows them.
+            let config = format!("{:?}", transport_config(&limits).expect("valid limits"));
+            assert!(
+                config.contains("packet_threshold: 10") && config.contains("time_threshold: 2.0"),
+                "{config}"
+            );
+
+            let mut server = listening_server(limits);
+            let (_peer, id) = accept(&mut server, &mut [], |_| {});
+            let running = server
+                .connections
+                .get_mut(&id)
+                .expect("connection")
+                .engine()
+                .congestion_state()
+                .clone_box()
+                .into_any();
+            let running = if running.is::<congestion::Cubic>() {
+                CongestionController::Cubic
+            } else if running.is::<congestion::NewReno>() {
+                CongestionController::NewReno
+            } else if running.is::<congestion::Bbr>() {
+                CongestionController::Bbr
+            } else {
+                panic!("an unknown controller runs")
+            };
+            assert_eq!(running, controller);
+        }
     }
 }

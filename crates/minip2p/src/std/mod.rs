@@ -90,7 +90,7 @@ use minip2p_core::{PeerAddr, PeerId};
 pub use minip2p_identify::IdentifyMessage;
 pub use minip2p_identity::Ed25519Keypair;
 #[cfg(feature = "quic")]
-pub use minip2p_quic::{QuicBindError, QuicLimits};
+pub use minip2p_quic::{CongestionController, QuicBindError, QuicLimits};
 #[cfg(feature = "quic")]
 use minip2p_quic::{QuicNodeConfig, QuicTransport, WebTransportCertificates};
 use minip2p_swarm::SwarmBuilder;
