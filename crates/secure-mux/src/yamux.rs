@@ -54,8 +54,12 @@ pub const KEEPALIVE_ACK_TIMEOUT_MS: u64 = 10_000;
 /// Yamux's specification-defined initial stream window (256 KiB).
 pub const DEFAULT_RECEIVE_WINDOW: u32 = 256 * 1024;
 
-/// Default largest payload this side puts in one data frame (1 MiB).
-const DEFAULT_MAX_FRAME_LEN: u32 = 1024 * 1024;
+/// Default largest payload this side puts in one data frame (16 KiB).
+///
+/// Frames are the unit of round-robin between streams, so small frames let
+/// concurrent streams share a slow link instead of finishing one after
+/// another. A frame plus its header still fits one Noise message.
+const DEFAULT_MAX_FRAME_LEN: u32 = 16 * 1024;
 
 /// Default maximum number of simultaneously tracked streams.
 const DEFAULT_MAX_STREAMS: usize = 256;

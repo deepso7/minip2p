@@ -528,7 +528,7 @@ impl YamuxSession {
 
     /// Acknowledges `bytes` of the stream's delivered data as consumed.
     ///
-    /// Acknowledged bytes return to the peer as credit once more than half
+    /// Acknowledged bytes return to the peer as credit once at least half
     /// the window has been acknowledged since the last update; the window
     /// update is then pulled by [`poll_frame`](Self::poll_frame). On a closed,
     /// unsettled stream the bytes are released, and its slot with the last
@@ -560,7 +560,7 @@ impl YamuxSession {
         };
         state.unacked -= acked;
         state.acked_since_update += acked;
-        if state.acked_since_update > self.config.receive_window / 2 {
+        if state.acked_since_update >= self.config.receive_window / 2 {
             state.pending_credit += u64::from(state.acked_since_update);
             state.acked_since_update = 0;
             self.index_work(stream);
@@ -1324,6 +1324,8 @@ mod tests {
     fn accepted_bytes_count_until_pulled_and_queue_past_the_window() {
         let mut limits = config();
         limits.max_buffered_send *= 2;
+        // Frames large enough that only the window bounds them.
+        limits.max_frame_len = u32::MAX;
         let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
         let stream = client.open_stream().unwrap();
         let data = Bytes::from(alloc::vec![7; DEFAULT_RECEIVE_WINDOW as usize + 5]);
@@ -1406,6 +1408,34 @@ mod tests {
         assert_eq!(next(&mut client), (b, b"b2".to_vec()));
         assert_eq!(next(&mut client), (a, b"a3".to_vec()));
         assert_eq!(client.poll_frame(), None);
+    }
+
+    #[test]
+    fn default_data_frames_carry_at_most_16_kib() {
+        let mut client = YamuxSession::new(YamuxRole::Client);
+        let stream = client.open_stream().unwrap();
+        client
+            .send(stream, Bytes::from(alloc::vec![7; 40 * 1024]))
+            .unwrap();
+        let lens: Vec<_> = core::iter::from_fn(|| client.poll_frame())
+            .map(|frame| decode(&frame).payload().len())
+            .collect();
+        assert_eq!(lens, [16 * 1024, 16 * 1024, 8 * 1024]);
+    }
+
+    #[test]
+    fn default_frames_interleave_backlogged_streams() {
+        let mut client = YamuxSession::new(YamuxRole::Client);
+        let [a, b] = [(); 2].map(|_| client.open_stream().unwrap());
+        for stream in [a, b] {
+            client
+                .send(stream, Bytes::from(alloc::vec![1; 64 * 1024]))
+                .unwrap();
+        }
+        let order: Vec<_> = core::iter::from_fn(|| client.poll_frame())
+            .map(|frame| decode(&frame).stream_id())
+            .collect();
+        assert_eq!(order, [a, b].repeat(4));
     }
 
     #[test]
@@ -1856,12 +1886,13 @@ mod tests {
             Err(YamuxError::ReceiveWindowExceeded { stream: 1 })
         );
 
-        server.ack(1, window / 2).unwrap();
+        server.ack(1, window / 2 - 1).unwrap();
         assert_eq!(server.poll_frame(), None, "credit returns in half windows");
+        // Exactly half, so frames that divide the window return it in halves.
         server.ack(1, 1).unwrap();
         let update = decode(&outbound(&mut server));
         assert_eq!(update.frame_type(), FrameType::WindowUpdate);
-        assert_eq!(update.value() as usize, window / 2 + 1);
+        assert_eq!(update.value() as usize, window / 2);
         server.handle_data(&more).unwrap();
     }
 

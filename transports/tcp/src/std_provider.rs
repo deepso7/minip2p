@@ -93,11 +93,26 @@ fn bind_listener(requested: SocketAddr) -> std::io::Result<mio::net::TcpListener
     Ok(mio::net::TcpListener::from_std(socket.into()))
 }
 
-/// Keeps small protocol frames from waiting behind an unacknowledged write.
-fn disable_nagle(stream: &mio::net::TcpStream) -> Result<(), TcpError> {
+/// Most unsent bytes a socket's send buffer holds before it stops accepting
+/// writes, where the platform supports `TCP_NOTSENT_LOWAT`.
+///
+/// Without it the kernel buffer grows far past bandwidth × RTT, so a slow
+/// link queues there, behind whichever stream wrote first, where Yamux can
+/// no longer interleave streams or put pings and window updates first.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const NOTSENT_LOWAT: u32 = 32 * 1024;
+
+/// Disables Nagle, so small protocol frames do not wait behind an
+/// unacknowledged write, and caps unsent bytes at `NOTSENT_LOWAT` where
+/// supported.
+fn configure_stream(stream: &mio::net::TcpStream) -> Result<(), TcpError> {
     stream
         .set_nodelay(true)
-        .map_err(|error| io_error(TcpIoOperation::ConfigureStream, &error))
+        .map_err(|error| io_error(TcpIoOperation::ConfigureStream, &error))?;
+    // Best effort: the link still works with the kernel's default buffering.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    drop(socket2::SockRef::from(stream).set_tcp_notsent_lowat(NOTSENT_LOWAT));
+    Ok(())
 }
 
 /// The socket address a dial targets, rejecting names.
@@ -447,7 +462,7 @@ impl StdTcpProvider {
         mut stream: mio::net::TcpStream,
         remote: Multiaddr,
     ) -> Result<(), TcpError> {
-        disable_nagle(&stream)?;
+        configure_stream(&stream)?;
         let handle = self.allocate_handle();
         let token = self.register(&mut stream, Slot::Socket(handle), Interest::READABLE)?;
         // Data may have arrived with the connection, before any edge this
@@ -667,7 +682,7 @@ impl TcpProvider for StdTcpProvider {
         let target = dial_addr(addr)?;
         let mut stream = mio::net::TcpStream::connect(target)
             .map_err(|error| io_error(TcpIoOperation::Connect, &error))?;
-        disable_nagle(&stream)?;
+        configure_stream(&stream)?;
         let handle = self.allocate_handle();
         let token = self.register(
             &mut stream,
@@ -1119,8 +1134,20 @@ mod tests {
         );
     }
 
+    /// Asserts the options `configure_stream` sets.
+    fn assert_configured(stream: &mio::net::TcpStream) {
+        assert!(stream.nodelay().expect("TCP_NODELAY"));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(
+            socket2::SockRef::from(stream)
+                .tcp_notsent_lowat()
+                .expect("TCP_NOTSENT_LOWAT"),
+            32 * 1024
+        );
+    }
+
     #[test]
-    fn accepted_and_dialed_streams_disable_nagle() {
+    fn accepted_and_dialed_streams_are_configured() {
         let mut server = StdTcpProvider::new();
         let mut client = StdTcpProvider::new();
         let bound = server
@@ -1128,12 +1155,7 @@ mod tests {
             .expect("listen");
 
         let dialed = client.connect(&bound).expect("connect");
-        assert!(
-            client.sockets[&dialed]
-                .stream
-                .nodelay()
-                .expect("dialed stream option")
-        );
+        assert_configured(&client.sockets[&dialed].stream);
 
         let started = Instant::now();
         let accepted = loop {
@@ -1154,11 +1176,6 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         };
-        assert!(
-            server.sockets[&accepted]
-                .stream
-                .nodelay()
-                .expect("accepted stream option")
-        );
+        assert_configured(&server.sockets[&accepted].stream);
     }
 }
