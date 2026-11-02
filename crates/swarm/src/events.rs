@@ -86,9 +86,10 @@ pub enum SwarmEvent {
     },
     /// The first Identify exchange on `conn_id` failed, so the connection
     /// can never become ready: no [`PeerReady`](Self::PeerReady) follows for
-    /// it. The swarm closes the connection, and its
-    /// [`ConnectionClosed`](Self::ConnectionClosed) names Identify as the
-    /// reason. Redial to try again.
+    /// it. The swarm closes the connection; when that close is what ends it,
+    /// its [`ConnectionClosed`](Self::ConnectionClosed) names Identify as the
+    /// reason, while a close the peer or transport got in first keeps its own.
+    /// Redial to try again.
     ///
     /// Only a connection that is not yet ready fails this way: Identify
     /// trouble on a ready connection never ends it.
@@ -246,9 +247,11 @@ pub enum IdentifyFailure {
     OpenFailed,
     /// The peer refused Identify during protocol negotiation.
     Rejected,
-    /// The stream closed before the peer's reply arrived.
+    /// The stream was reset, or closed during negotiation, before the
+    /// peer's reply arrived.
     ClosedEarly,
-    /// The peer's negotiation or Identify reply was malformed.
+    /// The peer's negotiation or Identify reply was malformed, including a
+    /// reply its half-close cut short or left empty.
     Malformed,
 }
 
