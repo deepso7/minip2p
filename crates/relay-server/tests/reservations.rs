@@ -419,6 +419,39 @@ fn address_sources_fail_and_restore_independently() {
     ));
 }
 
+/// A relay bound only to a wildcard, with nothing announced, has no address
+/// to put in a reservation: the refusal names that cause.
+#[test]
+fn reservation_refused_for_lack_of_addresses_names_the_cause() {
+    let remote = peer(b"client-wildcard-relay");
+    let stream = key(38, 1);
+    let mut node = Node::unannounced(RelayServerConfig::default());
+    refresh(
+        &mut node,
+        RelayServerAddrSource::Listener,
+        "/ip4/0.0.0.0/tcp/1",
+    )
+    .unwrap();
+    node.events();
+    node.establish(&remote, stream.conn_id);
+    node.feed_hop(&remote, stream, reserve_request(), &[]);
+
+    assert!(matches!(
+        &node.events()[..],
+        [
+            RelayServerEvent::Error(RelayServerRuntimeError {
+                kind: RelayServerRuntimeErrorKind::NoAdvertisableAddrs,
+                peer_id: Some(error_peer),
+                ..
+            }),
+            RelayServerEvent::ReservationDenied {
+                peer_id,
+                status: Status::ReservationRefused,
+            },
+        ] if *peer_id == remote && *error_peer == remote
+    ));
+}
+
 #[test]
 fn hop_over_circuit_negotiates_then_denies_with_permission_status() {
     let remote = peer(b"client-circuit-hop");
@@ -584,7 +617,7 @@ fn ipv4_mapped_ipv6_shares_the_ipv4_rate_limit_bucket() {
 }
 
 #[test]
-fn reservation_addresses_truncate_to_a_wire_prefix_and_empty_refuses() {
+fn reservation_addresses_truncate_to_a_wire_prefix() {
     let local = peer(b"relay");
     let addrs: Vec<_> = (0..160)
         .map(|index| {
@@ -615,19 +648,6 @@ fn reservation_addresses_truncate_to_a_wire_prefix_and_empty_refuses() {
         })
         .collect();
     assert_eq!(reservation.addrs, expected);
-
-    let remote = peer(b"empty-address-client");
-    let stream = key(100, 1);
-    let mut empty = Node::unannounced(RelayServerConfig::default());
-    empty.establish(&remote, stream.conn_id);
-    empty.feed_hop(&remote, stream, reserve_request(), &[]);
-    assert!(matches!(
-        empty.events()[..],
-        [RelayServerEvent::ReservationDenied {
-            status: Status::ReservationRefused,
-            ..
-        }]
-    ));
 }
 
 #[test]
