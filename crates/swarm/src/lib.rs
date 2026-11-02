@@ -40,10 +40,13 @@ mod builder;
 mod driver;
 
 pub use crate::core::{DriverError, SwarmCore};
-pub use crate::events::{SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
+pub use crate::events::{
+    IdentifyFailure, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError,
+};
 pub use crate::held::{HeldStream, HeldWrites};
 pub use crate::state::{
-    OUTBOUND_NEGOTIATION_TIMEOUT_MS, RESERVED_PROTOCOL_IDS, SIMULTANEOUS_DIAL_WINDOW_MS,
+    IDENTIFY_TIMEOUT_MS, OUTBOUND_NEGOTIATION_TIMEOUT_MS, RESERVED_PROTOCOL_IDS,
+    SIMULTANEOUS_DIAL_WINDOW_MS,
 };
 // Part of `SwarmEvent::IdentifyReceived`'s public shape; re-exported so
 // consumers can name the type without depending on `minip2p-identify`.
