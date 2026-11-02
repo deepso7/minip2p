@@ -346,9 +346,9 @@ fn pending_limits_that_could_never_wake_a_writer_are_rejected() {
     }
 }
 
-/// Thresholds below RFC 9002's floors would declare in-order packets lost
-/// (a NaN or infinite time threshold would never declare any), so bind
-/// rejects them.
+/// Bind rejects loss thresholds out of range: below RFC 9002's floors they
+/// declare in-order packets lost; a NaN or infinite time threshold would
+/// never declare any, and a huge finite one overflows quinn's RTT multiply.
 #[test]
 fn loss_thresholds_out_of_range_are_rejected() {
     for (limits, field) in [
@@ -369,6 +369,13 @@ fn loss_thresholds_out_of_range_are_rejected() {
         (
             QuicLimits {
                 time_threshold: f32::NAN,
+                ..QuicLimits::default()
+            },
+            "time_threshold",
+        ),
+        (
+            QuicLimits {
+                time_threshold: f32::INFINITY,
                 ..QuicLimits::default()
             },
             "time_threshold",
