@@ -1122,6 +1122,12 @@ impl YamuxSession {
         Err(error)
     }
 
+    /// Whether the session failed: a protocol error or keepalive timeout
+    /// ended it, and every stream with it.
+    pub(crate) fn has_failed(&self) -> bool {
+        self.failed
+    }
+
     /// Fails the session for good: queued frames and events are dropped,
     /// and no stream gets a terminal event of its own; the failure ends them.
     fn fail(&mut self) {

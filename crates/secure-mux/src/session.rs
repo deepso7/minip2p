@@ -898,7 +898,14 @@ impl SecureMuxSession {
                 encrypt_into(noise, frame, &mut self.writes)?;
             }
         }
-        match push_yamux_events(yamux, &mut self.outputs) {
+        let go_away = push_yamux_events(yamux, &mut self.outputs);
+        if yamux.has_failed() {
+            // The failure ended every stream without a close of its own, so
+            // no Writable an earlier pump moved here may follow it.
+            self.outputs
+                .retain(|output| !matches!(output, SessionOutput::StreamWritable { .. }));
+        }
+        match go_away {
             Some(code) => Err(SessionError::GoAway { code }),
             None => Ok(()),
         }
@@ -1435,6 +1442,55 @@ mod tests {
         assert!(
             !outputs.contains(&SessionOutput::StreamWritable { stream }),
             "no Writable for a stream that ended: {outputs:?}"
+        );
+    }
+
+    #[test]
+    fn a_keepalive_timeout_drops_pending_writables() {
+        let initiator_key = Ed25519Keypair::generate();
+        let responder_key = Ed25519Keypair::generate();
+        let peer = responder_key.peer_id();
+        let (noise, _) = noise_pair(initiator_key, responder_key);
+        let mut yamux = YamuxSession::new(YamuxRole::Client);
+        let syn = Frame::window_update(2, FLAG_SYN, 0).unwrap();
+        yamux.handle_data(&syn.encode()).unwrap();
+        let stream = StreamId::new(2);
+        let mut session = SecureMuxSession {
+            role: SessionRole::Initiator,
+            yamux_config: YamuxConfig::default(),
+            phase: Some(Phase::Ready {
+                noise,
+                yamux: Box::new(yamux),
+                peer,
+            }),
+            // An earlier pump already moved this stream's Writable here.
+            outputs: VecDeque::from([SessionOutput::StreamWritable { stream }]),
+            writes: WriteQueue::default(),
+            unsettled_at_failure: Vec::new(),
+        };
+
+        // The ping is never pulled, so the hand-off bound runs out.
+        session
+            .poll(Now::from_millis(0))
+            .expect("quiet clock starts");
+        session
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .expect("ping queued");
+        let failed = session.poll(Now::from_millis(
+            KEEPALIVE_INTERVAL_MS + KEEPALIVE_HANDOFF_TIMEOUT_MS,
+        ));
+        assert!(
+            matches!(
+                failed,
+                Err(SessionError::Yamux(YamuxError::KeepaliveTimeout))
+            ),
+            "{failed:?}"
+        );
+
+        let outputs: Vec<_> = core::iter::from_fn(|| session.poll_output()).collect();
+        assert!(
+            !outputs.contains(&SessionOutput::StreamWritable { stream }),
+            "no Writable for a stream the failure ended: {outputs:?}"
         );
     }
 
