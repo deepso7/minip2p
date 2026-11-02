@@ -99,6 +99,12 @@ pub enum RelayServerRuntimeErrorKind {
     ResetStream,
     /// An agent invariant failed.
     InternalInvariant,
+    /// A RESERVE was refused because the relay has no address to advertise:
+    /// no announce addresses, and no confirmed or listener address that is
+    /// dialable (a wildcard bind such as `0.0.0.0` is not). Set announce
+    /// addresses with
+    /// [`replace_announce_addrs`](crate::RelayServerAgent::replace_announce_addrs).
+    NoAdvertisableAddrs,
 }
 
 /// Actionable diagnostic for an asynchronous operational failure.
