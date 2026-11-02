@@ -366,7 +366,8 @@ impl SecureMuxSession {
     /// nothing for a while queues a ping for [`poll_write`](Self::poll_write),
     /// and one whose ping is not pulled or not answered in time fails with
     /// [`YamuxError::KeepaliveTimeout`] (see [`YamuxSession::poll`]): the
-    /// peer went silent. Its substreams' closes follow in the outputs.
+    /// peer went silent. Its substreams end with the session, without a
+    /// [`SessionOutput::StreamClosed`] each: the error is their cause.
     ///
     /// Call this whenever the deadline comes, even while the downstream is
     /// full: a backed-up write path is what the hand-off bound measures.

@@ -61,6 +61,8 @@
 //! get into the outbound buffer, or that goes unanswered, closes the
 //! connection as
 //! [`ConnectionCloseReason::TimedOut`](minip2p_transport::ConnectionCloseReason::TimedOut).
+//! As with any session failure, its open streams end with that `Closed`,
+//! not with a `StreamClosed` each, as QUIC reports a lost connection.
 //!
 //! # Limits
 //!
