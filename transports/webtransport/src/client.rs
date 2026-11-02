@@ -36,7 +36,8 @@ use crate::limits::WebTransportLimits;
 /// before the session's own close. A session end inside the window is
 /// reported alone, as [`TransportEvent::Closed`] with its reason, instead of
 /// streams ending one by one ahead of it (which would read as the peer
-/// abandoning them on a live connection).
+/// abandoning them on a live connection). Only resets wait: a stop leaves
+/// the stream readable, so it is reported at once.
 pub const SESSION_END_GRACE_MS: u64 = 100;
 
 /// The path and query of every libp2p WebTransport session.
@@ -106,9 +107,9 @@ pub fn webtransport_url(addr: &Multiaddr) -> Result<String, TransportError> {
 ///   `ack_stream`, and when a connection ends, in [`UnsettledConnections`]
 ///   until `ack_stream` or `reset_stream` settles them.
 ///
-/// A reset, a session ending or `close` frees a stream's or session's
-/// queues and grants at once; a peer's reset is applied
-/// [`SESSION_END_GRACE_MS`] after it arrives. Handles are never reused, so platform events
+/// A caller's reset, a session ending or `close` frees a stream's or
+/// session's queues and grants at once. A peer's reset does so
+/// [`SESSION_END_GRACE_MS`] after it arrives, unless its session ends first. Handles are never reused, so platform events
 /// for a handle that is gone are ignored. Dropping the client closes every
 /// session it still holds, pending dials included, so an endpoint shut
 /// down or freed mid-dial leaves no platform session behind.
@@ -443,6 +444,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             IoEvent::Data { stream, bytes } => self.on_data(stream, bytes),
             IoEvent::Fin { stream } => self.on_fin(stream),
             IoEvent::Reset { stream, .. } => match self.owner(stream) {
+                // A caller stream's reset may be its session ending.
                 Some((_, false)) => self.held_resets.push((
                     stream,
                     now.monotonic_ms.saturating_add(SESSION_END_GRACE_MS),
