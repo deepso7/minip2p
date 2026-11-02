@@ -30,6 +30,15 @@ use minip2p_transport::{
 use crate::io::{IoEvent, SessionHandle, StreamHandle, WebTransportIo};
 use crate::limits::WebTransportLimits;
 
+/// How long a peer's reset of a stream is held, in ms, in case its
+/// session is ending: a session close resets every stream first (draft-14
+/// §6), and browsers report that reset like any peer's, code 0, a few ms
+/// before the session's own close. A session end inside the window is
+/// reported alone, as [`TransportEvent::Closed`] with its reason, instead of
+/// streams ending one by one ahead of it (which would read as the peer
+/// abandoning them on a live connection).
+pub const SESSION_END_GRACE_MS: u64 = 100;
+
 /// The path and query of every libp2p WebTransport session.
 pub const LIBP2P_WEBTRANSPORT_PATH: &str = "/.well-known/libp2p-webtransport?type=noise";
 
@@ -98,7 +107,8 @@ pub fn webtransport_url(addr: &Multiaddr) -> Result<String, TransportError> {
 ///   until `ack_stream` or `reset_stream` settles them.
 ///
 /// A reset, a session ending or `close` frees a stream's or session's
-/// queues and grants at once. Handles are never reused, so platform events
+/// queues and grants at once; a peer's reset is applied
+/// [`SESSION_END_GRACE_MS`] after it arrives. Handles are never reused, so platform events
 /// for a handle that is gone are ignored. Dropping the client closes every
 /// session it still holds, pending dials included, so an endpoint shut
 /// down or freed mid-dial leaves no platform session behind.
@@ -115,6 +125,9 @@ pub struct WebTransportClient<Io: WebTransportIo, E> {
     unsettled: UnsettledConnections,
     by_session: BTreeMap<SessionHandle, ConnectionId>,
     by_stream: BTreeMap<StreamHandle, ConnectionId>,
+    /// Peer resets of caller streams, held until the monotonic ms beside
+    /// each ([`SESSION_END_GRACE_MS`]).
+    held_resets: Vec<(StreamHandle, u64)>,
     events: Vec<TransportEvent>,
 }
 
@@ -333,6 +346,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             unsettled: UnsettledConnections::new(),
             by_session: BTreeMap::new(),
             by_stream: BTreeMap::new(),
+            held_resets: Vec::new(),
             events: Vec::new(),
         }
     }
@@ -363,6 +377,9 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         for handle in session.streams.keys() {
             self.by_stream.remove(handle);
         }
+        // The session's end stands for its streams' held resets.
+        self.held_resets
+            .retain(|(handle, _)| !session.streams.contains_key(handle));
         self.unsettled.insert(
             id,
             session
@@ -410,7 +427,7 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
         }
     }
 
-    fn on_io_event(&mut self, event: IoEvent) {
+    fn on_io_event(&mut self, event: IoEvent, now: Now) {
         match event {
             IoEvent::SessionReady { session } => self.on_session_ready(session),
             IoEvent::SessionClosed {
@@ -425,7 +442,13 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             IoEvent::IncomingStream { session, stream } => self.on_incoming_stream(session, stream),
             IoEvent::Data { stream, bytes } => self.on_data(stream, bytes),
             IoEvent::Fin { stream } => self.on_fin(stream),
-            IoEvent::Reset { stream, .. } => self.on_reset(stream),
+            IoEvent::Reset { stream, .. } => match self.owner(stream) {
+                Some((_, false)) => self.held_resets.push((
+                    stream,
+                    now.monotonic_ms.saturating_add(SESSION_END_GRACE_MS),
+                )),
+                _ => self.on_reset(stream),
+            },
             IoEvent::StopSending { stream, code } => self.on_stop_sending(stream, code),
             IoEvent::WriteCompleted { stream, bytes } => {
                 let Some((id, noise)) = self.owner(stream) else {
@@ -737,6 +760,17 @@ impl<Io: WebTransportIo, E: EntropySource> WebTransportClient<Io, E> {
             stream_id: stream_id(handle),
         });
         self.close_if_done(id, handle);
+    }
+
+    /// Applies the held resets that are due.
+    fn release_resets(&mut self, now: Now) {
+        let (due, held) = mem::take(&mut self.held_resets)
+            .into_iter()
+            .partition::<Vec<_>, _>(|&(_, at)| at <= now.monotonic_ms);
+        self.held_resets = held;
+        for (handle, _) in due {
+            self.on_reset(handle);
+        }
     }
 
     fn on_reset(&mut self, handle: StreamHandle) {
@@ -1165,8 +1199,9 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
 
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
         while let Some(event) = self.io.poll_event() {
-            self.on_io_event(event);
+            self.on_io_event(event, now);
         }
+        self.release_resets(now);
         self.expire_handshakes(now);
         Ok(mem::take(&mut self.events))
     }
@@ -1178,6 +1213,7 @@ impl<Io: WebTransportIo, E: EntropySource> Transport for WebTransportClient<Io, 
         self.connections
             .values()
             .filter_map(|conn| conn.handshake_deadline)
+            .chain(self.held_resets.iter().map(|&(_, at)| at))
             .min()
             .map(Deadline::from_millis)
     }
