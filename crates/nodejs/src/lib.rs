@@ -7,7 +7,7 @@ use std::sync::Arc;
 use minip2p_ffi_core::{
     ConfigCapability, CongestionController, ConnectTarget, DiscoveryOptions, EndpointConfig,
     EventDoorbell, FfiError, LimitsOptions, MdnsOptions, P2pEndpoint, QuicLimitsOptions,
-    TcpLimitsOptions, TimeoutLimit, WindowLimit, YamuxOptions,
+    TcpLimitsOptions, TimeoutLimit, TimeoutsOptions, WindowLimit, YamuxOptions,
 };
 use napi::bindgen_prelude::{BigInt, Either, JsObjectValue, JsValue, Uint8Array};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -140,6 +140,17 @@ pub struct NodeYamuxOptions {
     pub max_pending_control: Option<BigInt>,
 }
 
+/// Protocol deadline overrides accepted from Node.js; see `TimeoutsOptions`.
+#[napi(object)]
+pub struct NodeTimeoutsOptions {
+    /// How long an outbound stream may negotiate its protocol, in ms.
+    pub negotiation_ms: Option<BigInt>,
+    /// How long a connection's first Identify may take, in ms.
+    pub identify_ms: Option<BigInt>,
+    /// How long a ping waits for its echo, in ms.
+    pub ping_ms: Option<BigInt>,
+}
+
 /// Endpoint configuration accepted from Node.js.
 #[napi(object)]
 pub struct NodeEndpointConfig {
@@ -163,6 +174,8 @@ pub struct NodeEndpointConfig {
     pub mdns: Option<NodeMdnsOptions>,
     /// Transport limit overrides.
     pub limits: Option<NodeLimitsOptions>,
+    /// Protocol deadline overrides.
+    pub timeouts: Option<NodeTimeoutsOptions>,
 }
 
 impl TryFrom<NodeEndpointConfig> for EndpointConfig {
@@ -181,8 +194,18 @@ impl TryFrom<NodeEndpointConfig> for EndpointConfig {
             mdns: config.mdns.map(convert_mdns).transpose()?,
             // Converted by the constructor, which tags limit errors.
             limits: None,
+            timeouts: config.timeouts.map(convert_timeouts).transpose()?,
         })
     }
+}
+
+fn convert_timeouts(options: NodeTimeoutsOptions) -> Result<TimeoutsOptions> {
+    let ms = |value: Option<BigInt>, name| value.map(|value| bigint_u64(value, name)).transpose();
+    Ok(TimeoutsOptions {
+        negotiation_ms: ms(options.negotiation_ms, "timeouts.negotiationMs")?,
+        identify_ms: ms(options.identify_ms, "timeouts.identifyMs")?,
+        ping_ms: ms(options.ping_ms, "timeouts.pingMs")?,
+    })
 }
 
 fn convert_discovery(options: NodeDiscoveryOptions) -> Result<DiscoveryOptions> {

@@ -89,6 +89,7 @@ fn endpoint(seed: u8, relay: String) -> Arc<P2pEndpoint> {
             discovery: None,
             mdns: None,
             limits: None,
+            timeouts: None,
         },
     )
     .expect("construct relay endpoint")

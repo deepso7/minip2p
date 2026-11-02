@@ -93,10 +93,10 @@ pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_quic::{CongestionController, QuicBindError, QuicLimits};
 #[cfg(feature = "quic")]
 use minip2p_quic::{QuicNodeConfig, QuicTransport, WebTransportCertificates};
-use minip2p_swarm::SwarmBuilder;
 pub use minip2p_swarm::{
     DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, Swarm, SwarmError, WaitDeadline,
 };
+use minip2p_swarm::{SwarmBuilder, SwarmTimeouts};
 #[cfg(feature = "tcp")]
 use minip2p_tcp::{StdTcpProvider, TcpConfig, TcpTransport};
 #[cfg(any(feature = "quic", feature = "tcp"))]
@@ -1270,6 +1270,7 @@ pub struct EndpointBuilder {
     capabilities: Capabilities,
     connect_deadline: std::time::Duration,
     simultaneous_dial_window: std::time::Duration,
+    timeouts: SwarmTimeouts,
 }
 
 impl Default for EndpointBuilder {
@@ -1281,6 +1282,7 @@ impl Default for EndpointBuilder {
             simultaneous_dial_window: std::time::Duration::from_millis(
                 minip2p_swarm::SIMULTANEOUS_DIAL_WINDOW_MS,
             ),
+            timeouts: SwarmTimeouts::default(),
             #[cfg(feature = "quic")]
             quic_limits: QuicLimits::default(),
             #[cfg(feature = "quic")]
@@ -1331,6 +1333,16 @@ impl EndpointBuilder {
     /// slow candidate races less reliably.
     pub fn simultaneous_dial_window(mut self, window: Duration) -> Self {
         self.simultaneous_dial_window = window;
+        self
+    }
+
+    /// Overrides the negotiation, first-Identify and ping deadlines
+    /// (default [`SwarmTimeouts::default`], 10 s each). A zero deadline
+    /// fails [`bind`](Self::bind) with [`SwarmError::ZeroTimeout`] before any
+    /// socket is bound. See the crate README's deadline table for how they
+    /// relate to the connect deadline and the transports' own deadlines.
+    pub fn timeouts(mut self, timeouts: SwarmTimeouts) -> Self {
+        self.timeouts = timeouts;
         self
     }
 
@@ -1705,11 +1717,12 @@ impl EndpointBuilder {
 
     /// Validates the static configuration.
     ///
-    /// Reserved protocol ids are rejected here -- before any socket is
+    /// Zero deadlines and reserved protocol ids are rejected here -- before any socket is
     /// bound -- so a configuration error can neither allocate resources
     /// nor be masked by a bind failure. Capabilities are validated by
     /// Endpoint setup, also before binding.
     fn validate(&self) -> Result<(), BindError> {
+        self.timeouts.validate()?;
         if let Some(protocol) = self
             .protocols
             .iter()
@@ -2107,7 +2120,8 @@ fn build_endpoint(
         .agent_version(options.agent_version)
         .simultaneous_dial_window_ms(
             u64::try_from(options.simultaneous_dial_window.as_millis()).unwrap_or(u64::MAX),
-        );
+        )
+        .timeouts(options.timeouts);
     for protocol in options.protocols {
         builder = builder.protocol(protocol);
     }
@@ -4509,6 +4523,27 @@ mod tests {
         assert!(matches!(
             error,
             BindError::Swarm(SwarmError::ReservedProtocol { .. })
+        ));
+    }
+
+    #[test]
+    fn builder_rejects_a_zero_timeout_before_binding() {
+        let error = Endpoint::builder()
+            .timeouts(SwarmTimeouts {
+                identify_ms: 0,
+                ..SwarmTimeouts::default()
+            })
+            // TEST-NET-1 is never a local address, so this bind would fail.
+            .listen_on("/ip4/192.0.2.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .err()
+            .expect("a zero deadline must fail the build");
+        assert!(matches!(
+            error,
+            BindError::Swarm(SwarmError::ZeroTimeout {
+                field: "identify_ms"
+            })
         ));
     }
 

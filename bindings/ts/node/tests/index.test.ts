@@ -127,6 +127,16 @@ describe("@minip2p/node", () => {
     );
   });
 
+  test("a zero timeout is an Options config error naming the field", () => {
+    expect(createWithZeroIdentify).toThrow(InvalidConfigError);
+    expect(createWithZeroIdentify).toThrow(
+      expect.objectContaining({
+        capability: "Options",
+        detail: expect.stringMatching(/identify_ms/u),
+      })
+    );
+  });
+
   test("Connection targets settle through the native endpoint", async () => {
     const a = createDualStackEndpoint();
     const b = createDualStackEndpoint();
@@ -428,6 +438,14 @@ function createWithUndersizedMdnsPackets(): nodeSdk.Minip2p {
     listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
     mdns: { maxPacketBytes: 511 },
     secretKey: nodeSdk.generateSecretKey(),
+  });
+}
+
+function createWithZeroIdentify(): nodeSdk.Minip2p {
+  return nodeSdk.Minip2p.create({
+    listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
+    secretKey: nodeSdk.generateSecretKey(),
+    timeouts: { identifyMs: 0 },
   });
 }
 

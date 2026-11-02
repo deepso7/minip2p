@@ -9,7 +9,7 @@
 use minip2p::Now;
 use minip2p_ffi_core::{
     ConnectTarget, DiscoveryOptions, EndpointConfig, FfiError, LimitsOptions, MdnsOptions,
-    PUMP_DRAIN_LIMIT,
+    PUMP_DRAIN_LIMIT, TimeoutsOptions,
 };
 use minip2p_webtransport::WebTransportClient;
 use serde::{Deserialize, Serialize};
@@ -392,6 +392,15 @@ struct WebEndpointConfig {
     mdns: Option<WebMdnsOptions>,
     /// Read only to be refused: the browser build has no limits to tune.
     limits: Option<serde::de::IgnoredAny>,
+    timeouts: Option<WebTimeoutsOptions>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebTimeoutsOptions {
+    negotiation_ms: Option<u64>,
+    identify_ms: Option<u64>,
+    ping_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -441,6 +450,11 @@ impl From<WebEndpointConfig> for EndpointConfig {
                 auto_dial: options.auto_dial,
             }),
             limits: config.limits.map(|_| LimitsOptions::default()),
+            timeouts: config.timeouts.map(|options| TimeoutsOptions {
+                negotiation_ms: options.negotiation_ms,
+                identify_ms: options.identify_ms,
+                ping_ms: options.ping_ms,
+            }),
         }
     }
 }

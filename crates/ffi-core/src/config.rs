@@ -217,6 +217,39 @@ pub enum TimeoutLimit {
     Never,
 }
 
+/// Protocol deadline overrides, in milliseconds; each mirrors a
+/// `minip2p::SwarmTimeouts` field.
+///
+/// An absent record or field keeps the native default (10 s each). A zero
+/// fails construction with `InvalidConfig { capability: Options }`. Keep
+/// `identify_ms` at least `negotiation_ms`: the first Identify includes a
+/// negotiation.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct TimeoutsOptions {
+    /// How long an outbound stream may negotiate its protocol.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub negotiation_ms: Option<u64>,
+    /// How long a connection's first Identify may take before the
+    /// connection is closed.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub identify_ms: Option<u64>,
+    /// How long a ping waits for its echo.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub ping_ms: Option<u64>,
+}
+
+impl From<TimeoutsOptions> for minip2p::SwarmTimeouts {
+    fn from(options: TimeoutsOptions) -> Self {
+        let defaults = Self::default();
+        Self {
+            negotiation_ms: options.negotiation_ms.unwrap_or(defaults.negotiation_ms),
+            identify_ms: options.identify_ms.unwrap_or(defaults.identify_ms),
+            ping_ms: options.ping_ms.unwrap_or(defaults.ping_ms),
+        }
+    }
+}
+
 /// Configuration used to construct an FFI endpoint.
 #[derive(Clone)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
@@ -245,6 +278,8 @@ pub struct EndpointConfig {
     pub mdns: Option<MdnsOptions>,
     /// Transport limit overrides, or every native default when absent.
     pub limits: Option<LimitsOptions>,
+    /// Protocol deadline overrides, or every native default when absent.
+    pub timeouts: Option<TimeoutsOptions>,
 }
 
 /// One peer in the shared discovery address book.

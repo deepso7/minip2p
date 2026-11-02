@@ -59,6 +59,15 @@ test("the manual entry loads nothing at import, and initMinip2p({ wasm }) loads 
     capability: "Transport",
     message: expect.stringMatching(/omit limits/u),
   });
+
+  // Protocol deadlines do apply in the browser; zero is refused by name.
+  await web.Minip2p.create({
+    secretKey,
+    timeouts: { identifyMs: 20_000 },
+  }).close();
+  expect(() =>
+    web.Minip2p.create({ secretKey, timeouts: { pingMs: 0 } })
+  ).toThrow(/ping_ms/u);
 });
 
 test("initMinip2p({ wasm }) takes a promised URL", async () => {

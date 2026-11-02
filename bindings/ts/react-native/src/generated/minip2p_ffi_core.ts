@@ -1205,6 +1205,75 @@ const FfiConverterTypeLimitsOptions = (() => {
 })();
 
 /**
+ * Protocol deadline overrides, in milliseconds; each mirrors a
+ * `minip2p::SwarmTimeouts` field.
+ *
+ * An absent record or field keeps the native default (10 s each). A zero
+ * fails construction with `InvalidConfig { capability: Options }`. Keep
+ * `identify_ms` at least `negotiation_ms`: the first Identify includes a
+ * negotiation.
+ */
+export type TimeoutsOptions = {
+    /**
+     * How long an outbound stream may negotiate its protocol.
+     */
+    negotiationMs?: bigint,
+    /**
+     * How long a connection's first Identify may take before the
+     * connection is closed.
+     */
+    identifyMs?: bigint,
+    /**
+     * How long a ping waits for its echo.
+     */
+    pingMs?: bigint
+}
+
+/**
+ * Generated factory for {@link TimeoutsOptions} record objects.
+ */
+export const TimeoutsOptions = (() => {
+    const defaults = () => ({
+        negotiationMs: undefined,
+        identifyMs: undefined,
+        pingMs: undefined
+    });
+    const create = (() => {
+        return uniffiCreateRecord<TimeoutsOptions, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<TimeoutsOptions>,
+    });
+})();
+
+const FfiConverterTypeTimeoutsOptions = (() => {
+    type TypeName = TimeoutsOptions;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            return {
+                negotiationMs: FfiConverterOptionalUInt64.readFromCursor(c),
+                identifyMs: FfiConverterOptionalUInt64.readFromCursor(c),
+                pingMs: FfiConverterOptionalUInt64.readFromCursor(c)
+            };
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            FfiConverterOptionalUInt64.writeIntoCursor(value.negotiationMs, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.identifyMs, c);
+            FfiConverterOptionalUInt64.writeIntoCursor(value.pingMs, c);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterOptionalUInt64.allocationSize(value.negotiationMs) +
+             FfiConverterOptionalUInt64.allocationSize(value.identifyMs) +
+             FfiConverterOptionalUInt64.allocationSize(value.pingMs);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
  * Configuration used to construct an FFI endpoint.
  */
 export type EndpointConfig = {
@@ -1251,7 +1320,11 @@ export type EndpointConfig = {
     /**
      * Transport limit overrides, or every native default when absent.
      */
-    limits?: LimitsOptions
+    limits?: LimitsOptions,
+    /**
+     * Protocol deadline overrides, or every native default when absent.
+     */
+    timeouts?: TimeoutsOptions
 }
 
 /**
@@ -1284,7 +1357,8 @@ const FfiConverterTypeEndpointConfig = (() => {
                 protocols: FfiConverterSequenceString.readFromCursor(c),
                 discovery: FfiConverterOptionalTypeDiscoveryOptions.readFromCursor(c),
                 mdns: FfiConverterOptionalTypeMdnsOptions.readFromCursor(c),
-                limits: FfiConverterOptionalTypeLimitsOptions.readFromCursor(c)
+                limits: FfiConverterOptionalTypeLimitsOptions.readFromCursor(c),
+                timeouts: FfiConverterOptionalTypeTimeoutsOptions.readFromCursor(c)
             };
         }
         writeIntoCursor(value: TypeName, c: Cursor): void {
@@ -1298,6 +1372,7 @@ const FfiConverterTypeEndpointConfig = (() => {
             FfiConverterOptionalTypeDiscoveryOptions.writeIntoCursor(value.discovery, c);
             FfiConverterOptionalTypeMdnsOptions.writeIntoCursor(value.mdns, c);
             FfiConverterOptionalTypeLimitsOptions.writeIntoCursor(value.limits, c);
+            FfiConverterOptionalTypeTimeoutsOptions.writeIntoCursor(value.timeouts, c);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterOptionalString.allocationSize(value.agentVersion) +
@@ -1309,7 +1384,8 @@ const FfiConverterTypeEndpointConfig = (() => {
              FfiConverterSequenceString.allocationSize(value.protocols) +
              FfiConverterOptionalTypeDiscoveryOptions.allocationSize(value.discovery) +
              FfiConverterOptionalTypeMdnsOptions.allocationSize(value.mdns) +
-             FfiConverterOptionalTypeLimitsOptions.allocationSize(value.limits);
+             FfiConverterOptionalTypeLimitsOptions.allocationSize(value.limits) +
+             FfiConverterOptionalTypeTimeoutsOptions.allocationSize(value.timeouts);
 
         }
     };
@@ -5477,6 +5553,9 @@ const FfiConverterOptionalTypeTcpLimitsOptions = new FfiConverterOptional(FfiCon
 // FfiConverter for LimitsOptions | undefined
 const FfiConverterOptionalTypeLimitsOptions = new FfiConverterOptional(FfiConverterTypeLimitsOptions);
 
+// FfiConverter for TimeoutsOptions | undefined
+const FfiConverterOptionalTypeTimeoutsOptions = new FfiConverterOptional(FfiConverterTypeTimeoutsOptions);
+
 // FfiConverter for ArrayBuffer | undefined
 const FfiConverterOptionalBytes = new FfiConverterOptional(FfiConverterArrayBuffer);
 
@@ -5537,6 +5616,7 @@ export default Object.freeze({
     FfiConverterTypeRelayReservationInfo,
     FfiConverterTypeTcpLimitsOptions,
     FfiConverterTypeTimeoutLimit,
+    FfiConverterTypeTimeoutsOptions,
     FfiConverterTypeUnfinishedConnection,
     FfiConverterTypeWindowLimit,
     FfiConverterTypeYamuxOptions,

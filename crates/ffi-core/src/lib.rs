@@ -42,7 +42,7 @@ pub use carry::{DriverStats, EventCarry, PUMP_DRAIN_LIMIT};
 pub use config::{
     CongestionController, DiscoveryOptions, EndpointConfig, KnownPeerInfo, LimitsOptions,
     MdnsOptions, QuicLimitsOptions, RelayReservationInfo, TcpLimitsOptions, TimeoutLimit,
-    WindowLimit, YamuxOptions,
+    TimeoutsOptions, WindowLimit, YamuxOptions,
 };
 pub use connect::{ConnectTarget, parse_connect_target};
 #[cfg(feature = "driver")]

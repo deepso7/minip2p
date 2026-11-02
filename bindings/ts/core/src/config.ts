@@ -8,6 +8,7 @@ import type {
   Minip2pMdnsOptions,
   Minip2pQuicLimits,
   Minip2pTcpLimits,
+  Minip2pTimeouts,
   Minip2pYamuxLimits,
 } from "./types.js";
 
@@ -43,7 +44,13 @@ export interface BackendEndpointConfig {
   };
   readonly protocols: string[];
   readonly relays: string[];
+  readonly timeouts?: BackendTimeouts;
 }
+
+/** {@link Minip2pTimeouts} in native form; absent fields keep native defaults. */
+export type BackendTimeouts = {
+  readonly [Field in keyof Minip2pTimeouts]: bigint;
+};
 
 /** {@link Minip2pLimits} in native form; absent fields keep native defaults. */
 export interface BackendLimits {
@@ -107,6 +114,7 @@ export function resolveEndpointConfig(
     mdns: resolveMdns(config.mdns, config.discovery),
     protocols: [...(config.protocols ?? [])],
     relays: [...(config.relays ?? [])],
+    timeouts: config.timeouts && resolveTimeouts(config.timeouts),
   };
 }
 
@@ -150,6 +158,17 @@ function resolveMdns(
     queryIntervalMs: u64(options.queryIntervalMs ?? 300_000, "queryIntervalMs"),
     ttlMs: u64(options.ttlMs ?? 120_000, "ttlMs"),
   };
+}
+
+function resolveTimeouts(timeouts: Minip2pTimeouts): BackendTimeouts {
+  return withoutUndefined({
+    identifyMs: optionalU64(timeouts.identifyMs, "timeouts.identifyMs"),
+    negotiationMs: optionalU64(
+      timeouts.negotiationMs,
+      "timeouts.negotiationMs"
+    ),
+    pingMs: optionalU64(timeouts.pingMs, "timeouts.pingMs"),
+  });
 }
 
 function resolveLimits(limits: Minip2pLimits): BackendLimits {

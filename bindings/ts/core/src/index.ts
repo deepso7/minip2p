@@ -49,6 +49,7 @@ export {
   type Minip2pNamedEventMap,
   type Minip2pQuicLimits,
   type Minip2pTcpLimits,
+  type Minip2pTimeouts,
   type Minip2pYamuxLimits,
   type OnceOptions,
   type OpOptions,

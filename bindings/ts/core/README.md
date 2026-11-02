@@ -62,6 +62,15 @@ const endpoint = Minip2p.create({
 });
 ```
 
+`timeouts` overrides the protocol deadlines, in milliseconds: `negotiationMs` (one outbound stream's protocol negotiation), `identifyMs` (a connection's first Identify, after which it is closed) and `pingMs` (one ping's echo). Each defaults to 10 s; omitted fields keep it. Keep `identifyMs` at least `negotiationMs`, and raise both on links whose loaded RTT exceeds a few seconds. A zero throws `InvalidConfigError` with capability `Options`. Unlike `limits`, `timeouts` applies in `@minip2p/web` too. The `minip2p-rs` README's Deadlines table lists every deadline and how they relate.
+
+```ts
+const endpoint = Minip2p.create({
+  secretKey,
+  timeouts: { negotiationMs: 30_000, identifyMs: 45_000 },
+});
+```
+
 `create` throws `InvalidConfigError` when native rejects the configuration. Its `capability` (`Gossipsub`, `Mdns`, `Discovery`, `Transport`, or `Options`, from `ConfigCapability`) names the part to change, and `detail` carries the native diagnostic. A malformed listen address and a socket the platform refused are not config errors; they keep their native error codes.
 
 With mDNS enabled, `mdnsFailed` (`{ kind, detail }`, `kind` from `MdnsFailureKind`) reports a hard mDNS failure once per change in failure state. mDNS keeps running and retries, and `mdnsRecovered` follows once a retry succeeds; a goodbye that failed during shutdown is final.

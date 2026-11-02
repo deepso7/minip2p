@@ -28,6 +28,7 @@ fn config() -> EndpointConfig {
         discovery: None,
         mdns: None,
         limits: None,
+        timeouts: None,
     }
 }
 

@@ -333,6 +333,15 @@ pub enum SwarmError {
     /// receive traffic. See [`crate::RESERVED_PROTOCOL_IDS`].
     #[error("protocol '{protocol_id}' is reserved for the swarm's built-in handlers")]
     ReservedProtocol { protocol_id: String },
+    /// A [`crate::SwarmTimeouts`] deadline was zero, which would expire
+    /// everything it bounds at once.
+    #[error(
+        "swarm timeout `{field}` is 0 ms; set it above zero, or leave it at its default (SwarmTimeouts::default())"
+    )]
+    ZeroTimeout {
+        /// The [`crate::SwarmTimeouts`] field, such as `"identify_ms"`.
+        field: &'static str,
+    },
     /// The peer has completed Identify and did not advertise the requested protocol.
     #[error("peer {peer_id} does not support user protocol '{protocol_id}'")]
     RemoteDoesNotSupport {

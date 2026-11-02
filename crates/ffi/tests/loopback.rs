@@ -240,6 +240,7 @@ fn config_on(listen_addr: &str) -> EndpointConfig {
         discovery: None,
         mdns: None,
         limits: None,
+        timeouts: None,
     }
 }
 

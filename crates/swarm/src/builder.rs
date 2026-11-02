@@ -12,14 +12,14 @@ use alloc::{
 use minip2p_core::PeerId;
 use minip2p_identify::{IDENTIFY_PROTOCOL_ID, IdentifyConfig};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_ping::{PING_PROTOCOL_ID, PingConfig};
+use minip2p_ping::PING_PROTOCOL_ID;
 use minip2p_transport::Transport;
 
 use minip2p_core::platform::EntropySource;
 
 #[cfg(feature = "std")]
 use crate::Swarm;
-use crate::{SwarmCore, SwarmError};
+use crate::{SwarmCore, SwarmError, SwarmTimeouts};
 
 /// Default protocol-version string advertised to peers on Identify.
 const DEFAULT_PROTOCOL_VERSION: &str = "minip2p/0.1.0";
@@ -33,7 +33,8 @@ const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 /// - `protocolVersion = "minip2p/0.1.0"`
 /// - `agentVersion = "minip2p/0.1.0"`
 /// - Supported protocols: `/ipfs/id/1.0.0` and `/ipfs/ping/1.0.0`
-/// - Ping timeout: 10 seconds (the ping default)
+/// - Deadlines: [`SwarmTimeouts::default`] (10 s each for negotiation,
+///   first Identify and ping)
 /// - Simultaneous-dial window: [`crate::SIMULTANEOUS_DIAL_WINDOW_MS`]
 ///
 /// Use the setter methods to override. Call
@@ -54,7 +55,7 @@ pub struct SwarmBuilder {
     /// Derived once from the keypair and cached so the swarm's
     /// `local_peer_id` accessor is infallible.
     local_peer_id: PeerId,
-    ping_config: PingConfig,
+    timeouts: SwarmTimeouts,
     simultaneous_dial_window_ms: u64,
 }
 
@@ -75,7 +76,7 @@ impl SwarmBuilder {
             user_protocols: Vec::new(),
             public_key: keypair.public_key().encode_protobuf(),
             local_peer_id: keypair.peer_id(),
-            ping_config: PingConfig::default(),
+            timeouts: SwarmTimeouts::default(),
             simultaneous_dial_window_ms: crate::SIMULTANEOUS_DIAL_WINDOW_MS,
         }
     }
@@ -113,9 +114,11 @@ impl SwarmBuilder {
         self
     }
 
-    /// Overrides the ping configuration (timeout, etc.).
-    pub fn ping_config(mut self, config: PingConfig) -> Self {
-        self.ping_config = config;
+    /// Overrides the protocol deadlines: negotiation, first Identify and
+    /// ping. A zero deadline fails the build with
+    /// [`SwarmError::ZeroTimeout`].
+    pub fn timeouts(mut self, timeouts: SwarmTimeouts) -> Self {
+        self.timeouts = timeouts;
         self
     }
 
@@ -136,6 +139,8 @@ impl SwarmBuilder {
     ///
     /// The caller supplies entropy explicitly, keeping construction usable in
     /// `no_std + alloc` environments without assuming an operating-system RNG.
+    /// Fails with [`SwarmError::ZeroTimeout`] if a deadline is zero, and
+    /// with [`SwarmError::ReservedProtocol`] for a reserved protocol id.
     pub fn build_core<T, E>(self, transport: T, entropy: E) -> Result<SwarmCore<T, E>, SwarmError>
     where
         T: Transport,
@@ -151,10 +156,10 @@ impl SwarmBuilder {
         let mut core = SwarmCore::new(
             transport,
             identify,
-            self.ping_config,
+            self.timeouts,
             self.local_peer_id,
             entropy,
-        );
+        )?;
         core.state.simultaneous_dial_window_ms = self.simultaneous_dial_window_ms;
         for protocol in user_protocols {
             core.add_protocol(protocol)?;
@@ -168,7 +173,8 @@ impl SwarmBuilder {
     /// The swarm attaches the transport to its readiness poll here (see
     /// [`Swarm::new`]), and fails with a transport error if that does. Fails
     /// with [`SwarmError::ReservedProtocol`] if a built-in protocol id was
-    /// registered via [`SwarmBuilder::protocol`].
+    /// registered via [`SwarmBuilder::protocol`], and with
+    /// [`SwarmError::ZeroTimeout`] if a deadline is zero.
     #[cfg(feature = "std")]
     pub fn build<T: minip2p_transport::BlockingTransport>(
         self,
@@ -181,7 +187,7 @@ impl SwarmBuilder {
             protocols: self.protocols,
             public_key: self.public_key,
         };
-        let mut swarm = Swarm::new(transport, identify, self.ping_config, self.local_peer_id)?;
+        let mut swarm = Swarm::new(transport, identify, self.timeouts, self.local_peer_id)?;
         swarm.core_mut().state.simultaneous_dial_window_ms = self.simultaneous_dial_window_ms;
         for protocol in user_protocols {
             swarm.core_mut().add_protocol(protocol)?;
@@ -343,6 +349,42 @@ mod tests {
         {
             let mut swarm = builder().build(NoopTransport).expect("std swarm builds");
             assert_eq!(swarm.core_mut().simultaneous_dial_window_ms(), 200);
+        }
+    }
+
+    #[test]
+    fn both_builds_reject_a_zero_timeout_by_name() {
+        let keypair = Ed25519Keypair::generate();
+        let zeroed = [
+            SwarmTimeouts {
+                negotiation_ms: 0,
+                ..SwarmTimeouts::default()
+            },
+            SwarmTimeouts {
+                identify_ms: 0,
+                ..SwarmTimeouts::default()
+            },
+            SwarmTimeouts {
+                ping_ms: 0,
+                ..SwarmTimeouts::default()
+            },
+        ];
+        for (timeouts, field) in
+            zeroed
+                .into_iter()
+                .zip(["negotiation_ms", "identify_ms", "ping_ms"])
+        {
+            let builder = || SwarmBuilder::new(&keypair).timeouts(timeouts);
+            let Err(error) = builder().build_core(NoopTransport, ZeroEntropy) else {
+                panic!("{field}: a zero deadline must not build");
+            };
+            assert_eq!(error, SwarmError::ZeroTimeout { field });
+            assert!(error.to_string().contains(field), "{error}");
+            #[cfg(feature = "std")]
+            assert!(matches!(
+                builder().build(NoopTransport),
+                Err(DriverError::Swarm(SwarmError::ZeroTimeout { field: named })) if named == field
+            ));
         }
     }
 

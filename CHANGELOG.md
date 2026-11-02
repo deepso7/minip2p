@@ -4,6 +4,16 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### Configurable negotiation, Identify and ping deadlines (#475)
+
+The swarm's three protocol deadlines are now one `SwarmTimeouts { negotiation_ms, identify_ms, ping_ms }`, with the same 10 s defaults.
+
+- **`SwarmBuilder::ping_config(PingConfig)` is gone.** Use `.timeouts(SwarmTimeouts { ping_ms, ..SwarmTimeouts::default() })`.
+- **`SwarmCore::new`, `Swarm::new` and `Swarm::with_clock` take `SwarmTimeouts` instead of `PingConfig`**, and `SwarmCore::new` now returns `Result<_, SwarmError>`.
+- **A zero deadline is rejected at build** with the new `SwarmError::ZeroTimeout { field }` (`BindError::Swarm` from `bind`, `PortableBuildError::Swarm` from the portable builders, `InvalidConfig { capability: Options }` in the bindings). Add an arm if you match `SwarmError` exhaustively.
+- **New setters:** `timeouts(SwarmTimeouts)` on `EndpointBuilder`, `PortableEndpointBuilder` and `SmoltcpEndpointBuilder`; a `timeouts` option (`negotiationMs`, `identifyMs`, `pingMs`) in `EndpointConfig` (UniFFI, `TimeoutsOptions`), `@minip2p/node` and `@minip2p/web`. The UniFFI `EndpointConfig` record gains the `timeouts` field.
+- `OUTBOUND_NEGOTIATION_TIMEOUT_MS` and `IDENTIFY_TIMEOUT_MS` remain, as the defaults. The `minip2p-rs` README has a new Deadlines table covering every deadline in the stack.
+
 ### A failed first Identify closes its connection (#470)
 
 A connection whose first Identify exchange fails used to stay open and never become ready. Now the whole exchange (open, negotiation, and reply) has `IDENTIFY_TIMEOUT_MS` (10 s) from the connection establishing, and any failure ends it:
