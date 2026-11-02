@@ -115,6 +115,17 @@ pub struct QuicLimitsOptions {
     /// non-zero.
     #[cfg_attr(feature = "uniffi", uniffi(default))]
     pub webtransport_handshake_timeout_ms: Option<u64>,
+    /// Congestion controller each connection runs (Cubic by default).
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub congestion_controller: Option<CongestionController>,
+    /// Packets acknowledged past a missing one before it is declared lost;
+    /// at least 3.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub packet_threshold: Option<u32>,
+    /// Multiple of the RTT a missing packet may wait before it is declared
+    /// lost; between 1.0 and 10.0.
+    #[cfg_attr(feature = "uniffi", uniffi(default))]
+    pub time_threshold: Option<f32>,
 }
 
 /// TCP overrides; each field mirrors `minip2p::TcpConfig` (its connection-id
@@ -179,6 +190,18 @@ pub enum WindowLimit {
     },
     /// No window.
     Unlimited,
+}
+
+/// A QUIC congestion controller; mirrors `minip2p::CongestionController`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum CongestionController {
+    /// CUBIC, the default.
+    Cubic,
+    /// NewReno.
+    NewReno,
+    /// BBR (experimental in quinn).
+    Bbr,
 }
 
 /// A timeout that may be disabled.

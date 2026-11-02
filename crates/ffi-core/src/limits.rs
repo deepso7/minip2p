@@ -3,8 +3,8 @@
 use minip2p::{CircuitLimits, NatConfig, QuicLimits, TcpConfig, YamuxConfig};
 
 use crate::{
-    ConfigCapability, FfiError, LimitsOptions, QuicLimitsOptions, TcpLimitsOptions, TimeoutLimit,
-    WindowLimit, YamuxOptions,
+    ConfigCapability, CongestionController, FfiError, LimitsOptions, QuicLimitsOptions,
+    TcpLimitsOptions, TimeoutLimit, WindowLimit, YamuxOptions,
 };
 
 /// The native limits an endpoint binds with.
@@ -113,6 +113,18 @@ fn apply_quic(limits: &mut QuicLimits, options: QuicLimitsOptions) -> Result<(),
         &mut limits.webtransport_handshake_timeout_ms,
         options.webtransport_handshake_timeout_ms,
     );
+    set(
+        &mut limits.congestion_controller,
+        options
+            .congestion_controller
+            .map(|controller| match controller {
+                CongestionController::Cubic => minip2p::CongestionController::Cubic,
+                CongestionController::NewReno => minip2p::CongestionController::NewReno,
+                CongestionController::Bbr => minip2p::CongestionController::Bbr,
+            }),
+    );
+    set(&mut limits.packet_threshold, options.packet_threshold);
+    set(&mut limits.time_threshold, options.time_threshold);
     Ok(())
 }
 

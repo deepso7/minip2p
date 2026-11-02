@@ -14,6 +14,7 @@ import type {
   Bytes,
   IdentifyInfo,
   KnownPeerInfo,
+  Minip2pCongestionController,
   Minip2pConfig,
   RelayReservationInfo,
 } from "@minip2p/core";
@@ -46,6 +47,7 @@ import type {
 import {
   CloseOutcome as NativeCloseOutcome,
   ConfigCapability as NativeConfigCapability,
+  CongestionController,
   ConnectTarget,
   DiscoverySource as NativeDiscoverySource,
   DriverFailureKind as NativeDriverFailureKind,
@@ -658,6 +660,9 @@ function nativeLimits({
     ...rest,
     quic: quic && {
       ...quic,
+      congestionController:
+        quic.congestionController &&
+        NATIVE_CONGESTION_CONTROLLERS[quic.congestionController],
       connectionReceiveWindow: nativeWindow(quic.connectionReceiveWindow),
     },
     tcp: tcp && {
@@ -667,6 +672,12 @@ function nativeLimits({
     },
   };
 }
+
+const NATIVE_CONGESTION_CONTROLLERS = {
+  bbr: CongestionController.Bbr,
+  cubic: CongestionController.Cubic,
+  newReno: CongestionController.NewReno,
+} as const satisfies Record<Minip2pCongestionController, CongestionController>;
 
 function nativeWindow(
   window: bigint | "unlimited" | undefined

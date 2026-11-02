@@ -261,6 +261,7 @@ export const nativeModuleMock = async () => {
   return {
     CloseOutcome: generated.CloseOutcome,
     ConfigCapability: generated.ConfigCapability,
+    CongestionController: generated.CongestionController,
     ConnectTarget: generated.ConnectTarget,
     DiscoverySource: generated.DiscoverySource,
     DriverFailureKind: generated.DriverFailureKind,
