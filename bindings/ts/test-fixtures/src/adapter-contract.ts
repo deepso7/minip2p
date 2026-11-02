@@ -784,7 +784,12 @@ export function describeAdapterContract(
           limits: {
             circuit: { maxStreams: 8 },
             maxCircuits: 4,
-            quic: { connectionReceiveWindow: "unlimited" },
+            quic: {
+              congestionController: "newReno",
+              connectionReceiveWindow: "unlimited",
+              packetThreshold: 10,
+              timeThreshold: 1.5,
+            },
             tcp: {
               handshakeTimeoutMs: "never",
               sendStallTimeoutMs: 5000,
@@ -798,7 +803,12 @@ export function describeAdapterContract(
       ).toStrictEqual({
         circuit: { maxStreams: 8n },
         maxCircuits: 4n,
-        quic: { connectionReceiveWindow: "unlimited" },
+        quic: {
+          congestionController: "newReno",
+          connectionReceiveWindow: "unlimited",
+          packetThreshold: 10,
+          timeThreshold: 1.5,
+        },
         tcp: {
           handshakeTimeoutMs: "never",
           sendStallTimeoutMs: 5000n,

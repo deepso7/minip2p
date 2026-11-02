@@ -8,6 +8,7 @@ import { afterEach, vi } from "vitest";
 import { Minip2p } from "../src/adapter";
 import {
   ConfigCapability,
+  CongestionController,
   ConnectTarget_Tags,
   FfiError,
   PathKind,
@@ -35,10 +36,16 @@ const generatedPath = (path: NativeConnectionInfo["path"]): PathKind => {
     : PathKind.Direct.new();
 };
 
+const CONGESTION_CONTROLLER_NAMES = {
+  [CongestionController.Bbr]: "bbr",
+  [CongestionController.Cubic]: "cubic",
+  [CongestionController.NewReno]: "newReno",
+} satisfies Record<CongestionController, string>;
+
 /**
  * Native limits in the runtime-neutral backend form: generated UniFFI
- * window and timeout enums back to `bigint | "unlimited" | "never"`, unset
- * fields dropped.
+ * window and timeout enums back to `bigint | "unlimited" | "never"`, the
+ * congestion controller back to its name, unset fields dropped.
  */
 const neutralLimits = (value: unknown): unknown => {
   if (typeof value !== "object" || value === null) {
@@ -59,7 +66,12 @@ const neutralLimits = (value: unknown): unknown => {
   return Object.fromEntries(
     Object.entries(value)
       .filter(([, field]) => field !== undefined)
-      .map(([key, field]) => [key, neutralLimits(field)])
+      .map(([key, field]) => [
+        key,
+        key === "congestionController"
+          ? CONGESTION_CONTROLLER_NAMES[field as CongestionController]
+          : neutralLimits(field),
+      ])
   );
 };
 

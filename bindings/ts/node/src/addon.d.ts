@@ -197,6 +197,12 @@ export interface NodeQuicLimitsOptions {
   sendWindow?: bigint
   /** WebTransport handshake timeout in milliseconds. */
   webtransportHandshakeTimeoutMs?: bigint
+  /** `"cubic"`, `"newReno"` or `"bbr"`. */
+  congestionController?: string
+  /** Packet reordering threshold. */
+  packetThreshold?: number
+  /** Time reordering threshold, as a multiple of the RTT. */
+  timeThreshold?: number
 }
 
 /** TCP limit overrides accepted from Node.js; see `TcpLimitsOptions`. */

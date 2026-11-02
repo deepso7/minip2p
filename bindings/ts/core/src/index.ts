@@ -40,6 +40,7 @@ export {
   type InboundStreamMeta,
   type KnownPeerInfo,
   type Minip2pCatchAllEventMap,
+  type Minip2pCongestionController,
   type Minip2pConfig,
   type Minip2pDiscoveryOptions,
   type Minip2pEvent,

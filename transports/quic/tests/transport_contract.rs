@@ -6,7 +6,9 @@
 
 use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{PeerAddr, Protocol};
-use minip2p_quic::{QuicBindError, QuicLimits, QuicNodeConfig, QuicTransport};
+use minip2p_quic::{
+    CongestionController, QuicBindError, QuicLimits, QuicNodeConfig, QuicTransport,
+};
 use minip2p_transport::{
     Bytes, ConnectionId, ConnectionToken, StreamId, Transport, TransportError, TransportEvent,
 };
@@ -341,6 +343,95 @@ fn pending_limits_that_could_never_wake_a_writer_are_rejected() {
             error,
             QuicBindError::InvalidLimit { field: rejected, .. } if rejected == field
         ));
+    }
+}
+
+/// Thresholds below RFC 9002's floors would declare in-order packets lost
+/// (a NaN or infinite time threshold would never declare any), so bind
+/// rejects them.
+#[test]
+fn loss_thresholds_below_the_rfc_floors_are_rejected() {
+    for (limits, field) in [
+        (
+            QuicLimits {
+                packet_threshold: 2,
+                ..QuicLimits::default()
+            },
+            "packet_threshold",
+        ),
+        (
+            QuicLimits {
+                time_threshold: 0.9,
+                ..QuicLimits::default()
+            },
+            "time_threshold",
+        ),
+        (
+            QuicLimits {
+                time_threshold: f32::NAN,
+                ..QuicLimits::default()
+            },
+            "time_threshold",
+        ),
+        (
+            QuicLimits {
+                time_threshold: f32::INFINITY,
+                ..QuicLimits::default()
+            },
+            "time_threshold",
+        ),
+    ] {
+        let result = QuicTransport::bind(
+            QuicNodeConfig::generate().with_limits(limits),
+            &["/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("multiaddr")],
+        );
+        assert!(
+            matches!(
+                result,
+                Err(QuicBindError::InvalidLimit { field: rejected, .. }) if rejected == field
+            ),
+            "{field} must be rejected"
+        );
+    }
+}
+
+/// A sender running each non-default controller, with both loss thresholds
+/// raised, still connects and delivers a transfer: the tuning reaches the
+/// engine without breaking it.
+#[test]
+fn tuned_congestion_control_still_connects_and_transfers() {
+    const LEN: usize = 64 * 1024;
+    for controller in [CongestionController::NewReno, CongestionController::Bbr] {
+        let limits = QuicLimits {
+            congestion_controller: controller,
+            packet_threshold: 10,
+            time_threshold: 2.0,
+            ..QuicLimits::default()
+        };
+        let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+        let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+        let stream = client.open_stream(client_conn).expect("open stream");
+        client
+            .send_stream(client_conn, stream, Bytes::from(vec![7; LEN]))
+            .expect("send");
+
+        let mut received = 0;
+        for _ in 0..200 {
+            let (se, _) = drive_pair_once(&mut server, &mut client);
+            received += se
+                .iter()
+                .filter_map(|e| match e {
+                    TransportEvent::StreamData { id, data, .. } if *id == server_conn => {
+                        Some(data.len())
+                    }
+                    _ => None,
+                })
+                .sum::<usize>();
+            if received >= LEN {
+                break;
+            }
+        }
+        assert_eq!(received, LEN, "{controller:?} sender must deliver it all");
     }
 }
 

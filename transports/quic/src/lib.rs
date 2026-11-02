@@ -23,7 +23,7 @@ use minip2p_transport::{
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn_proto::{
     ClientConfig, ConnectionHandle, DatagramEvent, EndpointConfig, IdleTimeout, Incoming,
-    ServerConfig, TransportConfig, ValidationTokenConfig, VarInt,
+    ServerConfig, TransportConfig, ValidationTokenConfig, VarInt, congestion,
 };
 use socket2::{Domain, Protocol as SocketProtocol, Socket as RawSocket, Type};
 
@@ -54,7 +54,7 @@ mod webtransport_tests;
 #[cfg(test)]
 mod write_fairness_tests;
 
-pub use config::{QuicLimits, QuicNodeConfig, WebTransportCertificates};
+pub use config::{CongestionController, QuicLimits, QuicNodeConfig, WebTransportCertificates};
 #[cfg(feature = "diagnostics")]
 pub use diagnostics::{
     ConnectionDiagnostics, DatagramCounters, SocketBuffers, datagram_counters, socket_buffers,
@@ -289,6 +289,18 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
             return Err(invalid(field, "must be greater than zero"));
         }
     }
+    // RFC 9002's floors: lower thresholds declare packets lost that are only
+    // reordered or still in flight. A NaN or infinite time threshold never
+    // declares one lost.
+    if limits.packet_threshold < 3 {
+        return Err(invalid("packet_threshold", "must be at least 3"));
+    }
+    if !(limits.time_threshold.is_finite() && limits.time_threshold >= 1.0) {
+        return Err(invalid(
+            "time_threshold",
+            "must be a finite number of at least 1.0",
+        ));
+    }
     let too_large = |field| invalid(field, "is too large for QUIC");
     let var_int = |field, value: usize| {
         u64::try_from(value)
@@ -310,8 +322,18 @@ fn transport_config(limits: &QuicLimits) -> Result<TransportConfig, QuicBindErro
     let send_window =
         u64::try_from(limits.send_window).map_err(|_overflow| too_large("send_window"))?;
 
+    let congestion: Arc<dyn congestion::ControllerFactory + Send + Sync> =
+        match limits.congestion_controller {
+            CongestionController::Cubic => Arc::new(congestion::CubicConfig::default()),
+            CongestionController::NewReno => Arc::new(congestion::NewRenoConfig::default()),
+            CongestionController::Bbr => Arc::new(congestion::BbrConfig::default()),
+        };
+
     let mut config = TransportConfig::default();
     config
+        .congestion_controller_factory(congestion)
+        .packet_threshold(limits.packet_threshold)
+        .time_threshold(limits.time_threshold)
         .stream_receive_window(stream_window)
         .receive_window(connection_window)
         .send_window(send_window)

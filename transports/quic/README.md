@@ -35,11 +35,12 @@ Every value the adapter relies on is set explicitly:
 - `max_streams_per_connection` concurrent bidirectional streams, and no unidirectional streams (libp2p uses only bidirectional ones);
 - QUIC DATAGRAM is not advertised;
 - idle timeout `idle_timeout_ms` (0 is rejected, because QUIC reads it as "no timeout"), keepalive at half of it;
+- congestion controller `congestion_controller` (`CongestionController::Cubic`; also `NewReno` and `Bbr`, which quinn marks experimental) and loss-detection thresholds `packet_threshold` (3 packets; at least 3) and `time_threshold` (1.125 RTTs; finite and at least 1.0), RFC 9002 §6.1. These are quinn's own defaults, kept pending measurement (#478): raising the thresholds stops reordering from counting as loss, and BBR keeps deep bottleneck queues shorter than CUBIC, which fills them;
 - TLS 1.3 only, ALPN `libp2p`, no session resumption.
 
 A socket that also serves WebTransport ([ALPN dispatch](#alpn-dispatch-and-webtransport)) differs in two parameters, for every connection to it (the server config is chosen per socket, before ALPN): three peer unidirectional streams (HTTP/3's control and QPACK streams, RFC 9114 §6.2), and the QUIC DATAGRAM parameter with a 16 KiB receive buffer (Firefox requires it; received datagrams are drained and dropped). Its TLS offers ALPN `libp2p` and `h3`, or only `h3` on a socket bound for WebTransport alone. Other sockets keep the parameters above exactly. Once an `h3` connection's QUIC handshake completes, its peer bidirectional credit grows by the session's own streams, so `max_streams_per_connection` still counts application streams only: by two (CONNECT and Noise) until Noise completes, then by one (CONNECT). A limit of 1 therefore still authenticates and carries one application stream; the adapter refuses any peer stream past the limit as usual.
 
-quinn-proto's own defaults stand for the rest: CUBIC congestion control, path MTU discovery (from 1200 bytes, probing up; enabled only where the platform keeps datagrams from being fragmented), 8-byte connection IDs, and passive connection migration. A migrated connection keeps the `ConnectionEndpoint` of its handshake address.
+quinn-proto's own defaults stand for the rest: path MTU discovery (from 1200 bytes, probing up; enabled only where the platform keeps datagrams from being fragmented), 8-byte connection IDs, and passive connection migration. A migrated connection keeps the `ConnectionEndpoint` of its handshake address.
 
 ## Basic usage
 

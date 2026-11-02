@@ -1,6 +1,7 @@
 /* oxlint-disable func-style, no-use-before-define -- The public resolver reads first; hoisted helpers follow in call order. */
 
 import type {
+  Minip2pCongestionController,
   Minip2pConfig,
   Minip2pDiscoveryOptions,
   Minip2pLimits,
@@ -54,6 +55,7 @@ export interface BackendLimits {
 
 /** {@link Minip2pQuicLimits} in native form. */
 export interface BackendQuicLimits {
+  readonly congestionController?: Minip2pCongestionController;
   readonly connectionReceiveWindow?: bigint | "unlimited";
   readonly controlStreamReserveBytes?: bigint;
   readonly idleTimeoutMs?: bigint;
@@ -62,9 +64,11 @@ export interface BackendQuicLimits {
   readonly maxPendingConnectionBytes?: bigint;
   readonly maxPendingDatagrams?: bigint;
   readonly maxStreamsPerConnection?: bigint;
+  readonly packetThreshold?: number;
   readonly requireAddressValidation?: boolean;
   readonly sendWindow?: bigint;
   readonly streamReceiveWindow?: bigint;
+  readonly timeThreshold?: number;
   readonly webtransportHandshakeTimeoutMs?: bigint;
 }
 
@@ -159,6 +163,7 @@ function resolveLimits(limits: Minip2pLimits): BackendLimits {
 
 function resolveQuic(quic: Minip2pQuicLimits): BackendQuicLimits {
   return withoutUndefined({
+    congestionController: quic.congestionController,
     connectionReceiveWindow: u64OrLiteral(
       quic.connectionReceiveWindow,
       "unlimited",
@@ -186,12 +191,18 @@ function resolveQuic(quic: Minip2pQuicLimits): BackendQuicLimits {
       quic.maxStreamsPerConnection,
       "quic.maxStreamsPerConnection"
     ),
+    packetThreshold:
+      quic.packetThreshold === undefined
+        ? undefined
+        : u32(quic.packetThreshold, "quic.packetThreshold"),
     requireAddressValidation: quic.requireAddressValidation,
     sendWindow: optionalU64(quic.sendWindow, "quic.sendWindow"),
     streamReceiveWindow: optionalU64(
       quic.streamReceiveWindow,
       "quic.streamReceiveWindow"
     ),
+    // Range-checked natively, which names the field.
+    timeThreshold: quic.timeThreshold,
     webtransportHandshakeTimeoutMs: optionalU64(
       quic.webtransportHandshakeTimeoutMs,
       "quic.webtransportHandshakeTimeoutMs"

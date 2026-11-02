@@ -89,6 +89,40 @@ pub struct QuicLimits {
     /// with `H3_EXCESSIVE_LOAD`, and its `Closed` reports
     /// [`TimedOut`](minip2p_transport::ConnectionCloseReason::TimedOut).
     pub webtransport_handshake_timeout_ms: u64,
+    /// The congestion controller each connection runs. Defaults to quinn's
+    /// [`Cubic`](CongestionController::Cubic).
+    pub congestion_controller: CongestionController,
+    /// Packets that must be acknowledged after an unacknowledged one before
+    /// loss detection declares it lost (RFC 9002 §6.1.1). Must be at least 3.
+    /// Defaults to quinn's 3.
+    ///
+    /// Raising it stops reordering on the path from counting as loss, which
+    /// would otherwise retransmit and shrink the congestion window.
+    pub packet_threshold: u32,
+    /// How long, as a multiple of the RTT, an unacknowledged packet may wait
+    /// behind a later acknowledged one before loss detection declares it lost
+    /// (RFC 9002 §6.1.2). Must be finite and at least 1.0. Defaults to
+    /// quinn's 1.125 (9/8).
+    ///
+    /// Raising it, like [`packet_threshold`](Self::packet_threshold),
+    /// tolerates more reordering at the cost of slower loss recovery.
+    pub time_threshold: f32,
+}
+
+/// Congestion controllers a QUIC connection can run; all are quinn-proto's.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CongestionController {
+    /// CUBIC (RFC 9438), quinn's default. Loss-based: it fills deep
+    /// bottleneck queues before backing off.
+    #[default]
+    Cubic,
+    /// NewReno (RFC 9002 §7), loss-based and gentler in its growth than
+    /// CUBIC.
+    NewReno,
+    /// BBR (v1), which paces to the estimated bottleneck rate and RTT rather
+    /// than reacting to loss, aiming to keep queues short. quinn marks its
+    /// implementation experimental.
+    Bbr,
 }
 
 impl Default for QuicLimits {
@@ -107,6 +141,10 @@ impl Default for QuicLimits {
             connection_receive_window: usize::MAX,
             send_window: 10_000_000,
             webtransport_handshake_timeout_ms: 10_000,
+            // quinn's own loss-detection and congestion defaults (#478).
+            congestion_controller: CongestionController::Cubic,
+            packet_threshold: 3,
+            time_threshold: 9.0 / 8.0,
         }
     }
 }
