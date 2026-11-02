@@ -13,8 +13,8 @@ use minip2p_transport::{
     ConnectionCloseReason, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
 };
 use minip2p_webtransport::{
-    IoError, IoEvent, SessionHandle, StreamHandle, WebTransportClient, WebTransportIo,
-    WebTransportLimits,
+    IoError, IoEvent, SESSION_END_GRACE_MS, SessionHandle, StreamHandle, WebTransportClient,
+    WebTransportIo, WebTransportLimits,
 };
 
 const HASH: &str = "uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g";
@@ -671,8 +671,16 @@ fn a_peer_reset_resets_the_platform_stream_and_frees_its_writes() {
         stream: a_handle,
         code: 0,
     });
+    // Held for the grace a session end gets to arrive in.
+    assert!(poll(&mut client).is_empty());
     assert_eq!(
-        poll(&mut client),
+        client.next_deadline(),
+        Some(Deadline::from_millis(SESSION_END_GRACE_MS))
+    );
+    assert_eq!(
+        client
+            .poll(Now::from_millis(SESSION_END_GRACE_MS))
+            .expect("poll"),
         [TransportEvent::StreamClosed {
             id: conn.id,
             stream_id: a
@@ -687,6 +695,34 @@ fn a_peer_reset_resets_the_platform_stream_and_frees_its_writes() {
     let (c, _) = open(&mut client, &conn);
     assert_eq!(send(&mut client, &conn, b, 100), 0);
     assert_eq!(send(&mut client, &conn, c, 100), 0);
+}
+
+/// A session close resets its streams first (draft-14 §6), and browsers
+/// report that reset like a peer's, code 0, a few ms before `closed`
+/// settles: the close is reported alone, with the peer's reason.
+#[test]
+fn a_reset_just_before_the_session_closes_is_reported_as_the_close() {
+    let mut client = client(small_limits());
+    let conn = connect(&mut client);
+    let (_, a_handle) = open(&mut client, &conn);
+    client.io_mut().events.push_back(IoEvent::Reset {
+        stream: a_handle,
+        code: 0,
+    });
+    assert!(poll(&mut client).is_empty());
+    client.io_mut().events.push_back(IoEvent::SessionClosed {
+        session: conn.session,
+        code: 0,
+        reason: String::new(),
+    });
+    assert_eq!(
+        client.poll(Now::from_millis(5)).expect("poll"),
+        [TransportEvent::Closed {
+            id: conn.id,
+            reason: ConnectionCloseReason::Remote { code: 0 },
+        }]
+    );
+    assert_eq!(client.next_deadline(), None);
 }
 
 /// Whether nothing but `payload` itself still holds its allocation.
