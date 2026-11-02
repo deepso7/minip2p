@@ -318,6 +318,46 @@ fn fin_waiting_for_stream_credit_stays_queued_until_granted() {
 }
 
 #[test]
+fn stream_opened_waits_for_the_peers_stream_credit() {
+    let mut server = server_with_idle_timeout(30_000);
+    let (mut peer, id) = accept(&mut server, &mut [], |config| {
+        config.max_concurrent_bidi_streams(VarInt::from_u32(1));
+    });
+    let opened = |events: &[TransportEvent], stream: StreamId| {
+        events.contains(&TransportEvent::StreamOpened {
+            id,
+            stream_id: stream,
+        })
+    };
+
+    let first = server.open_stream(id).expect("first stream");
+    // Beyond the peer's credit: handed out, but not on the wire yet.
+    let second = server.open_stream(id).expect("second stream");
+    let mut events = server.poll(now()).expect("poll");
+    assert!(opened(&events, first), "{events:?}");
+    assert!(!opened(&events, second), "{events:?}");
+
+    // Finishing the first stream lets the peer grant another.
+    server.close_stream_write(id, first).expect("fin first");
+    let mut first_done = false;
+    let start = Instant::now();
+    while !opened(&events, second) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "second stream never opened; events: {events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        peer.pump();
+        events.extend(server.poll(now()).expect("poll must not fail"));
+        peer.pump();
+        if !first_done && peer.read(first.as_u64()).1 {
+            peer.finish(first.as_u64());
+            first_done = true;
+        }
+    }
+}
+
+#[test]
 fn connection_fatal_send_error_closes_only_that_connection() {
     let mut server = server_with_idle_timeout(30_000);
     let (mut faulty, faulty_id) = accept(&mut server, &mut [], small_stream_window);

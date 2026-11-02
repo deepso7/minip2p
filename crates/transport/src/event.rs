@@ -12,7 +12,11 @@ pub enum TransportEvent {
         id: ConnectionId,
         endpoint: ConnectionEndpoint,
     },
-    /// A locally-opened stream is ready. Emitted after `open_stream()`.
+    /// A locally-opened stream is open and may send; the peer has not
+    /// necessarily seen it yet. Emitted after `open_stream()`, possibly much
+    /// later: a transport that must wait for the peer's stream credit (QUIC,
+    /// and WebTransport over it) emits it once the stream is opened. A stream
+    /// reset or closed before then ends without it.
     StreamOpened {
         id: ConnectionId,
         stream_id: StreamId,

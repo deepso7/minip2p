@@ -79,7 +79,10 @@ pub const SIMULTANEOUS_DIAL_WINDOW_MS: u64 = 5_000;
 
 /// How long an outbound stream may spend in multistream-select negotiation.
 ///
-/// A stream the peer has not agreed to by then is reset and reported as a
+/// The clock starts when the transport reports the stream opened
+/// ([`TransportEvent::StreamOpened`]), so time a transport holds the open
+/// (QUIC waiting for the peer's stream credit) does not count. A stream the
+/// peer has not agreed to by then is reset and reported as a
 /// [`SwarmErrorKind::OpenStreamFailed`] error naming it, timed by the `now`
 /// samples the host passes in.
 pub const OUTBOUND_NEGOTIATION_TIMEOUT_MS: u64 = 10_000;
@@ -128,8 +131,9 @@ struct PendingOutbound {
     negotiator: MultistreamSelect,
     target: ProtocolKind,
     /// When the negotiation is given up; see
-    /// [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`].
-    deadline_ms: u64,
+    /// [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`]. `None` until the transport
+    /// reports the stream opened.
+    deadline_ms: Option<u64>,
     /// The peer's stop-sending code, when it arrived after our proposal
     /// went out: handled as the negotiated protocol would once it is.
     write_stopped: Option<u64>,
@@ -789,7 +793,7 @@ impl SwarmState {
         let negotiations = self
             .outbound_negotiators
             .values()
-            .map(|pending| pending.deadline_ms);
+            .filter_map(|pending| pending.deadline_ms);
         self.ping_deadlines
             .values()
             .copied()
@@ -1410,9 +1414,14 @@ impl SwarmState {
             TransportEvent::IncomingStream { id, stream_id } => {
                 self.handle_incoming_stream(id, stream_id);
             }
-            TransportEvent::StreamOpened { .. } => {
+            TransportEvent::StreamOpened { id, stream_id } => {
                 // Outbound stream ids come back synchronously from
-                // `Transport::open_stream`; see `start_outbound`. No-op here.
+                // `Transport::open_stream` (see `start_outbound`); this marks
+                // the stream as actually opened, which starts its deadline.
+                if let Some(pending) = self.outbound_negotiators.get_mut(&(id, stream_id)) {
+                    pending.deadline_ms =
+                        Some(now_ms.saturating_add(OUTBOUND_NEGOTIATION_TIMEOUT_MS));
+                }
             }
             TransportEvent::StreamData {
                 id,
@@ -1484,7 +1493,7 @@ impl SwarmState {
         let expired: Vec<(ConnectionId, StreamId)> = self
             .outbound_negotiators
             .iter()
-            .filter(|(_, pending)| pending.deadline_ms <= now_ms)
+            .filter(|(_, pending)| pending.deadline_ms.is_some_and(|due| due <= now_ms))
             .map(|(key, _)| *key)
             .collect();
         for (conn_id, stream_id) in expired {
@@ -1506,14 +1515,14 @@ impl SwarmState {
     }
 
     /// Starts multistream-select negotiation of `protocol` on an outbound
-    /// stream the core just opened on `conn_id` at `now_ms`.
+    /// stream the core just opened on `conn_id`. Its deadline is armed by the
+    /// transport's `StreamOpened`.
     pub fn start_outbound(
         &mut self,
         conn_id: ConnectionId,
         stream_id: StreamId,
         protocol: &str,
         target: ProtocolKind,
-        now_ms: u64,
     ) {
         self.mark_control(conn_id, stream_id, true);
         let mut negotiator = MultistreamSelect::dialer(protocol);
@@ -1527,7 +1536,7 @@ impl SwarmState {
             PendingOutbound {
                 negotiator,
                 target,
-                deadline_ms: now_ms.saturating_add(OUTBOUND_NEGOTIATION_TIMEOUT_MS),
+                deadline_ms: None,
                 write_stopped: None,
             },
         );
@@ -3055,7 +3064,7 @@ mod tests {
                     _ => None,
                 })
                 .expect("an OpenStream for the protocol on the connection");
-            self.start_outbound(conn_id, stream_id, protocol_id, target, 0);
+            self.start_outbound(conn_id, stream_id, protocol_id, target);
         }
     }
 
@@ -3231,7 +3240,14 @@ mod tests {
                 _ => None,
             })
             .expect("an open");
-        core.start_outbound(conn, stream, "/app/1", target, now_ms);
+        core.start_outbound(conn, stream, "/app/1", target);
+        core.handle_transport_event(
+            TransportEvent::StreamOpened {
+                id: conn,
+                stream_id: stream,
+            },
+            now_ms,
+        );
         drain_actions(&mut core);
         (core, conn, stream)
     }
@@ -3348,7 +3364,7 @@ mod tests {
             PendingOutbound {
                 negotiator,
                 target: ProtocolKind::User("/test/1".into()),
-                deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+                deadline_ms: Some(OUTBOUND_NEGOTIATION_TIMEOUT_MS),
                 write_stopped: None,
             },
         );
@@ -4307,7 +4323,7 @@ mod tests {
             PendingOutbound {
                 negotiator: MultistreamSelect::dialer("/test/1"),
                 target: ProtocolKind::User("/test/1".into()),
-                deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+                deadline_ms: Some(OUTBOUND_NEGOTIATION_TIMEOUT_MS),
                 write_stopped: None,
             },
         );
@@ -4339,7 +4355,7 @@ mod tests {
             PendingOutbound {
                 negotiator: MultistreamSelect::dialer("/test/1"),
                 target: ProtocolKind::User("/test/1".into()),
-                deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+                deadline_ms: Some(OUTBOUND_NEGOTIATION_TIMEOUT_MS),
                 write_stopped: None,
             },
         );
@@ -5542,7 +5558,7 @@ mod tests {
             PendingOutbound {
                 negotiator: MultistreamSelect::dialer("/test/1"),
                 target: ProtocolKind::User("/test/1".into()),
-                deadline_ms: OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+                deadline_ms: Some(OUTBOUND_NEGOTIATION_TIMEOUT_MS),
                 write_stopped: None,
             },
         );
