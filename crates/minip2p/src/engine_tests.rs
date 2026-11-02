@@ -786,7 +786,12 @@ fn cancel_after_a_provisional_relayed_settle_keeps_the_circuit() {
         ]),
         &f.peer,
     );
-    f.endpoint.poll(now).expect("poll");
+    // The circuit lands just before the deadline, so the peer, which never
+    // answers Identify here, is still inside `IDENTIFY_TIMEOUT_MS` then.
+    let deadline = Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS);
+    f.endpoint
+        .poll(Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS - 1_000))
+        .expect("poll");
     assert!(
         f.endpoint.engine.connect.is_pending(id),
         "Relayed is provisional"
@@ -794,7 +799,6 @@ fn cancel_after_a_provisional_relayed_settle_keeps_the_circuit() {
 
     // The deadline settles the attempt on the circuit; a cancel arriving
     // before that terminal is drained finds nothing pending.
-    let deadline = Now::from_millis(crate::DEFAULT_CONNECT_DEADLINE_MS);
     f.endpoint.engine.expire_attempts(deadline);
     f.endpoint.cancel_connect(id, deadline);
     let events = f.endpoint.poll(deadline).expect("poll");

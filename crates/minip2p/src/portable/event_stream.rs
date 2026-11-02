@@ -5,7 +5,7 @@
 //! leave through [`EndpointEvent`].
 
 use minip2p_core::{Bytes, PeerAddr, PeerId};
-use minip2p_swarm::{IdentifyMessage, SwarmEvent, SwarmRuntimeError};
+use minip2p_swarm::{IdentifyFailure, IdentifyMessage, SwarmEvent, SwarmRuntimeError};
 use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamId};
 
 use crate::connect::{ConnectId, ConnectOutcome};
@@ -91,6 +91,14 @@ pub enum EndpointEvent {
         peer_id: PeerId,
         conn_id: ConnectionId,
         protocols: alloc::vec::Vec<alloc::string::String>,
+    },
+    /// The first Identify exchange on `conn_id` failed for `cause`, so it
+    /// never becomes ready: the endpoint closes it, and its
+    /// [`Self::ConnectionClosed`] names Identify. Redial to try again.
+    IdentifyFailed {
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+        cause: IdentifyFailure,
     },
     /// A ping RTT measurement completed on `conn_id`.
     PingRttMeasured {
@@ -314,7 +322,15 @@ impl From<SwarmEvent> for EndpointEvent {
                 conn_id,
                 protocols,
             },
-
+            SwarmEvent::IdentifyFailed {
+                peer_id,
+                conn_id,
+                cause,
+            } => Self::IdentifyFailed {
+                peer_id,
+                conn_id,
+                cause,
+            },
             SwarmEvent::PingRttMeasured {
                 peer_id,
                 conn_id,

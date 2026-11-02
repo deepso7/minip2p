@@ -38,7 +38,7 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Endpoint close reason**: Why a binding's endpoint stopped: the application closed it, or its driver failed. Distinct from a Connection close reason. _Avoid_: close reason (unqualified)
 
-**Peer readiness**: A peer's current connection has completed Identify, so its protocols are known. Readiness belongs to a connection: after a Connection replacement the peer becomes ready again once the new connection is identified.
+**Peer readiness**: A peer's current connection has completed Identify, so its protocols are known. Readiness belongs to a connection: after a Connection replacement the peer becomes ready again once the new connection is identified. A connection whose first Identify fails (times out after `IDENTIFY_TIMEOUT_MS`, fails to open, is rejected, closes early, or replies malformed) never becomes ready: the swarm reports `IdentifyFailed` and closes it, and Identify is not retried. Identify trouble on a ready connection never ends it.
 
 ### NAT traversal
 

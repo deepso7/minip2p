@@ -82,6 +82,19 @@ pub enum SwarmEvent {
         conn_id: ConnectionId,
         protocols: Vec<String>,
     },
+    /// The first Identify exchange on `conn_id` failed, so the connection
+    /// can never become ready: no [`PeerReady`](Self::PeerReady) follows for
+    /// it. The swarm closes the connection, and its
+    /// [`ConnectionClosed`](Self::ConnectionClosed) names Identify as the
+    /// reason. Redial to try again.
+    ///
+    /// Only a connection that is not yet ready fails this way: Identify
+    /// trouble on a ready connection never ends it.
+    IdentifyFailed {
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+        cause: IdentifyFailure,
+    },
     /// A ping RTT measurement completed on `conn_id`.
     PingRttMeasured {
         peer_id: PeerId,
@@ -176,6 +189,7 @@ impl SwarmEvent {
             | Self::ConnectionReplaced { peer_id, .. }
             | Self::IdentifyReceived { peer_id, .. }
             | Self::PeerReady { peer_id, .. }
+            | Self::IdentifyFailed { peer_id, .. }
             | Self::PingRttMeasured { peer_id, .. }
             | Self::PingTimeout { peer_id, .. }
             | Self::StreamReady { peer_id, .. }
@@ -215,6 +229,36 @@ impl SwarmEvent {
                 | Self::StreamClosed { peer_id: peer, conn_id: conn, stream_id: stream, .. }
                 if peer == peer_id && *conn == conn_id && *stream == stream_id
         )
+    }
+}
+
+/// Why a connection's first Identify exchange failed; see
+/// [`SwarmEvent::IdentifyFailed`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum IdentifyFailure {
+    /// The exchange did not finish within
+    /// [`IDENTIFY_TIMEOUT_MS`](crate::IDENTIFY_TIMEOUT_MS) of the connection
+    /// establishing: the peer never agreed to Identify, or never replied.
+    TimedOut,
+    /// The transport refused to open the Identify stream.
+    OpenFailed,
+    /// The peer refused Identify during protocol negotiation.
+    Rejected,
+    /// The stream closed before the peer's reply arrived.
+    ClosedEarly,
+    /// The peer's negotiation or Identify reply was malformed.
+    Malformed,
+}
+
+impl core::fmt::Display for IdentifyFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::TimedOut => "identify timed out",
+            Self::OpenFailed => "identify stream failed to open",
+            Self::Rejected => "identify rejected by the peer",
+            Self::ClosedEarly => "identify stream closed before the reply",
+            Self::Malformed => "identify reply malformed",
+        })
     }
 }
 

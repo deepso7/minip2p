@@ -4,6 +4,14 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### A failed first Identify closes its connection (#470)
+
+A connection whose first Identify exchange fails used to stay open and never become ready. Now the whole exchange (open, negotiation, and reply) has `IDENTIFY_TIMEOUT_MS` (10 s) from the connection establishing, and any failure ends it:
+
+- **`SwarmEvent::IdentifyFailed` / `EndpointEvent::IdentifyFailed { peer_id, conn_id, cause }`** is new, with `cause: IdentifyFailure` (`TimedOut`, `OpenFailed`, `Rejected`, `ClosedEarly`, `Malformed`). It replaces the generic `OpenStreamFailed` / `UnsupportedProtocol` / `Identify` error that used to be the only signal. Add an arm if you match these enums exhaustively.
+- **The connection is then closed**; its `ConnectionClosed` reason is `ConnectionCloseReason::Error` naming Identify. Identify is not retried: redial to try again. A ready connection is never closed for Identify.
+- **`SwarmErrorKind::Identify` errors now carry the peer, connection, and stream.**
+
 ### Relay server drives the swarm through `RelaySwarm` (#443)
 
 `RelayServerAgent` now runs its commands on a borrowed swarm instead of emitting tokenized actions, as `NatAgent` does with `NatSwarm`. Breaking changes for direct `minip2p-relay-server` users (the `Endpoint` API is unchanged):
