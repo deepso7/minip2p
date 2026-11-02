@@ -36,7 +36,8 @@ minip2p-identity = { path = "../../crates/identity", version = "0.11.1", default
 minip2p-secure-mux = { path = "../../crates/secure-mux", version = "0.11.1", default-features = false }
 minip2p-transport = { path = "../../crates/transport", version = "0.11.1", default-features = false }
 mio = { workspace = true, optional = true }
-socket2 = { workspace = true, optional = true }
+# `all` exposes `TCP_NOTSENT_LOWAT`.
+socket2 = { workspace = true, optional = true, features = ["all"] }
 minip2p-smoltcp = { path = "../../crates/smoltcp", version = "0.11.1", optional = true }
 thiserror = { workspace = true }
 

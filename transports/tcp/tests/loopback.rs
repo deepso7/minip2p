@@ -731,8 +731,8 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
 
     // Queue more than the peer's Yamux window allows without the peer reading,
     // so the remainder sits in the dialer's buffer waiting for credit. On
-    // loopback the kernel takes everything the window lets through; it is the
-    // window, not the socket, that holds the rest back.
+    // loopback the kernel ends up taking everything the window lets through;
+    // it is the window, not the socket, that holds the rest back.
     let payload = vec![7u8; 512 * 1024];
     let held = send_or_hold(&mut pair.dialer, id, stream, Bytes::from(payload));
     assert!(held.is_some(), "past the window and send buffer is Full");
@@ -742,9 +742,12 @@ fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
     // rest of the test needs, so wait for it rather than for a slice of time:
     // under load a fixed slice buys far fewer polls than it looks like it does.
     // A timeout means parked: nothing arrived, and nothing is left to send.
+    // `TCP_NOTSENT_LOWAT` keeps the socket from taking the window in one go,
+    // so it drains in steps paced by the peer's delayed ACKs (up to ~40 ms);
+    // the quiet slice outlasts them.
     pair.dialer.attach();
     let parking = Instant::now();
-    while pair.dialer.wait_for_input(Duration::from_millis(10)) != WaitOutcome::TimedOut {
+    while pair.dialer.wait_for_input(Duration::from_millis(50)) != WaitOutcome::TimedOut {
         let _ = pair.dialer.poll(Now::from_millis(0)).expect("poll dialer");
         assert!(parking.elapsed() < PATIENCE, "the dialer never parked");
     }
