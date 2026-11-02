@@ -1001,6 +1001,11 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
                 match self.transport.reset_stream(conn_id, stream_id) {
                     // The connection's close clears the pending reset.
                     Ok(()) | Err(TransportError::ConnectionClosed { .. }) => {}
+                    // The stream is already gone (the peer reset it first),
+                    // which is what the reset wanted; just drop the marker.
+                    Err(TransportError::StreamNotFound { .. }) => {
+                        self.state.reset_stream_failed(conn_id, stream_id);
+                    }
                     Err(e) => {
                         self.state.reset_stream_failed(conn_id, stream_id);
                         self.state.record_runtime_error(transport_error(
@@ -1190,6 +1195,9 @@ mod tests {
         /// Every `send_stream` ends its connection, as a fatal session
         /// failure does: `Closed` is queued and `ConnectionClosed` returned.
         sends_end_connection: bool,
+        /// Every `reset_stream` fails with `StreamNotFound`, as when the
+        /// peer's own reset already made the transport forget the stream.
+        reset_unknown: bool,
         /// Bound addresses; `listen` accepts these (certhashes ignored).
         addrs: Vec<Multiaddr>,
         address_revision: u64,
@@ -1315,7 +1323,14 @@ mod tests {
             Ok(())
         }
 
-        fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
+        fn reset_stream(
+            &mut self,
+            id: ConnectionId,
+            stream_id: StreamId,
+        ) -> Result<(), TransportError> {
+            if self.reset_unknown {
+                return Err(TransportError::StreamNotFound { id, stream_id });
+            }
             Ok(())
         }
 
@@ -1712,6 +1727,39 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, SwarmEvent::Error(_))),
             "already-gone close must not surface as Error: {events:?}"
+        );
+    }
+
+    #[test]
+    fn resetting_a_stream_the_transport_already_forgot_is_not_a_runtime_error() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let conn = ConnectionId::new(1);
+        let address = "/ip4/198.51.100.7/udp/4001/quic-v1"
+            .parse()
+            .expect("endpoint");
+        let mut swarm = swarm_with(
+            ScriptedTransport {
+                initial: vec![TransportEvent::Connected {
+                    id: conn,
+                    endpoint: ConnectionEndpoint::with_peer_id(address, peer.clone()),
+                }],
+                reset_unknown: true,
+                ..ScriptedTransport::default()
+            },
+            SeqEntropy(1),
+        );
+        swarm.add_protocol("/app/1").expect("protocol");
+        swarm.poll(Now::from_millis(0)).expect("connect");
+        let (conn_id, stream_id) = swarm.open_stream(&peer, "/app/1", 1).expect("open");
+        swarm
+            .abandon_stream(&peer, conn_id, stream_id, 2)
+            .expect("abandon");
+        let events = swarm.poll(Now::from_millis(3)).expect("poll");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::Error(_))),
+            "an already-gone stream's reset must not surface as Error: {events:?}"
         );
     }
 
