@@ -1976,6 +1976,15 @@ impl RelayServerAgent {
             None
         };
         if let Some(status) = status {
+            if self.accepting && self.selected_addrs().is_empty() {
+                self.runtime_error(
+                    RelayServerRuntimeErrorKind::NoAdvertisableAddrs,
+                    Some(peer_id.clone()),
+                    "reservation refused: the relay has no dialable address to advertise; \
+                     a wildcard listener (0.0.0.0 or ::) needs announce addresses"
+                        .into(),
+                );
+            }
             self.events.push_back(RelayServerEvent::ReservationDenied {
                 peer_id: peer_id.clone(),
                 status,
