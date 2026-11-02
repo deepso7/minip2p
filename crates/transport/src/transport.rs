@@ -52,6 +52,10 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 ///   No further events are emitted for that stream after `StreamClosed`.
 /// - `reset_stream()` immediately closes both directions and emits
 ///   `StreamClosed` (if not already emitted).
+/// - `Closed` ends every stream still open on the connection. A transport
+///   need not emit their `StreamClosed` first, and does not when the
+///   connection fails (a QUIC loss, a Yamux keepalive timeout): the close's
+///   reason is then the streams' cause too.
 ///
 /// ## Backpressure
 ///

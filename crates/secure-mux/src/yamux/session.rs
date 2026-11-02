@@ -1123,9 +1123,7 @@ impl YamuxSession {
     }
 
     /// Fails the session for good: queued frames and events are dropped,
-    /// and no stream gets a terminal event of its own. The failure ends them
-    /// all, so the host reports it once, on the connection's close (as QUIC
-    /// does), rather than as bare stream closes ahead of the cause.
+    /// and no stream gets a terminal event of its own; the failure ends them.
     fn fail(&mut self) {
         self.failed = true;
         // Data still queued is dropped below and never delivered, so it is

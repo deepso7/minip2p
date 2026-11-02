@@ -97,6 +97,8 @@ pub enum SessionOutput {
 #[derive(Debug, Error)]
 pub enum SessionError {
     /// The session failed and cannot continue; tear the connection down.
+    /// Open substreams end with it, without a [`SessionOutput::StreamClosed`]
+    /// each.
     #[error("{0}")]
     Protocol(String),
     /// A stream operation was attempted before the upgrade completed.
