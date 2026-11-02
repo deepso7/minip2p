@@ -329,8 +329,9 @@ impl YamuxSession {
     /// [`KEEPALIVE_HANDOFF_TIMEOUT_MS`], and acknowledged with its nonce
     /// within [`KEEPALIVE_ACK_TIMEOUT_MS`] of the first poll after that.
     /// Either bound running out fails the session with
-    /// [`YamuxError::KeepaliveTimeout`]; its streams close as on a protocol
-    /// failure, but no GoAway is queued for a peer presumed dead.
+    /// [`YamuxError::KeepaliveTimeout`]; its streams end with it, without
+    /// per-stream events, as on a protocol failure, but no GoAway is queued
+    /// for a peer presumed dead.
     ///
     /// Frames received between polls are dated by the next poll's sample.
     pub fn poll(&mut self, now: Now) -> Result<(), YamuxError> {
@@ -582,10 +583,8 @@ impl YamuxSession {
     /// Feeds ordered bytes received from the underlying connection.
     ///
     /// A protocol error fails the session closed: queued frames are replaced
-    /// by a protocol GoAway, queued events are dropped, and terminal events
-    /// follow for tracked streams. A caller must therefore tolerate
-    /// [`YamuxOutput::StreamClosed`] for a stream whose queued
-    /// [`YamuxOutput::IncomingStream`] was discarded.
+    /// by a protocol GoAway and queued events are dropped. No per-stream
+    /// terminal events follow; every stream ends with the session.
     pub fn handle_data(&mut self, bytes: &[u8]) -> Result<(), YamuxError> {
         if self.failed {
             return Err(YamuxError::Failed);
@@ -1123,10 +1122,15 @@ impl YamuxSession {
         Err(error)
     }
 
+    /// Whether the session failed: a protocol error or keepalive timeout
+    /// ended it, and every stream with it.
+    pub(crate) fn has_failed(&self) -> bool {
+        self.failed
+    }
+
     /// Fails the session for good: queued frames and events are dropped,
-    /// and every tracked stream gets its terminal event.
+    /// and no stream gets a terminal event of its own; the failure ends them.
     fn fail(&mut self) {
-        let streams = self.streams.keys().copied().collect::<Vec<_>>();
         self.failed = true;
         // Data still queued is dropped below and never delivered, so it is
         // nobody's to acknowledge.
@@ -1152,9 +1156,6 @@ impl YamuxSession {
         self.control.clear();
         self.peer_control = 0;
         self.probe = None;
-        for stream in streams {
-            self.events.push_back(YamuxOutput::StreamClosed { stream });
-        }
     }
 }
 
@@ -2175,10 +2176,7 @@ mod tests {
         let go_away = decode(&outbound(&mut server));
         assert_eq!(go_away.frame_type(), FrameType::GoAway);
         assert_eq!(go_away.value(), 1);
-        assert_eq!(
-            server.poll_output(),
-            Some(YamuxOutput::StreamClosed { stream: 1 })
-        );
+        assert_eq!(server.poll_output(), None, "the failure ends the stream");
     }
 
     #[test]
@@ -2334,9 +2332,9 @@ mod tests {
             session.poll(Now::from_millis(due + KEEPALIVE_HANDOFF_TIMEOUT_MS)),
             Err(YamuxError::KeepaliveTimeout)
         );
-        assert_eq!(
-            session.poll_events(),
-            vec![YamuxOutput::StreamClosed { stream }]
+        assert!(
+            session.poll_events().is_empty(),
+            "stream {stream} ends with the session, not with a close of its own"
         );
         assert_eq!(session.poll_frame(), None, "no GoAway for a dead peer");
         assert_eq!(session.next_deadline(), None);

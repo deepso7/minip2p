@@ -9,7 +9,9 @@ mod support;
 use minip2p_core::platform::{Deadline, EntropySource, Now};
 use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_identity::{Ed25519Keypair, PeerId};
-use minip2p_secure_mux::{KEEPALIVE_HANDOFF_TIMEOUT_MS, KEEPALIVE_INTERVAL_MS};
+use minip2p_secure_mux::{
+    KEEPALIVE_ACK_TIMEOUT_MS, KEEPALIVE_HANDOFF_TIMEOUT_MS, KEEPALIVE_INTERVAL_MS,
+};
 use minip2p_tcp::{TcpConfig, TcpTransport};
 use minip2p_transport::ConnectionCloseReason;
 use minip2p_transport::{
@@ -1337,6 +1339,36 @@ fn a_quiet_connection_keeps_alive_without_opening_a_stream() {
         pair.dialer.connection_ids().len(),
         1,
         "keepalive must not tear the connection down"
+    );
+}
+
+/// A peer that goes silent mid-transfer ends the connection with one event,
+/// `Closed { TimedOut }`, as QUIC does. Its streams end with it rather than
+/// each closing first with no cause the application could see.
+#[test]
+fn a_keepalive_timeout_ends_open_streams_with_the_connection() {
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    pair.dialer
+        .send_stream(id, stream, Bytes::from_static(b"mid-transfer"))
+        .expect("send");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // The listener is never polled again: the ping goes unanswered.
+    let sent = KEEPALIVE_INTERVAL_MS;
+    let _ = pair.dialer.poll(Now::from_millis(sent)).expect("ping");
+    let _ = pair.dialer.poll(Now::from_millis(sent)).expect("hand-off");
+    let events = pair
+        .dialer
+        .poll(Now::from_millis(sent + KEEPALIVE_ACK_TIMEOUT_MS))
+        .expect("ack deadline");
+    assert_eq!(
+        events,
+        [TransportEvent::Closed {
+            id,
+            reason: ConnectionCloseReason::TimedOut,
+        }]
     );
 }
 
