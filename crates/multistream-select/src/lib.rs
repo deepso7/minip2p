@@ -2,6 +2,10 @@
 //!
 //! Messages use varint-length-prefixed framing per the libp2p spec.
 //! `no_std` + `alloc` compatible.
+//!
+//! The dialer sends its header and its proposal together, as go-libp2p and
+//! rust-libp2p do, so a negotiation takes one round trip. It still requires
+//! the listener's header before the listener's answer.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -64,7 +68,8 @@ enum Role {
 /// Internal state machine states for the multistream-select handshake.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
-    /// Expecting the remote's multistream protocol header.
+    /// Expecting the remote's multistream protocol header. A started dialer
+    /// has already sent its proposal too.
     WaitingForRemoteHeader,
     /// Listener waiting for the dialer's protocol proposal.
     WaitingForProtocolRequest,
@@ -112,17 +117,20 @@ impl MultistreamSelect {
         }
     }
 
-    /// Queues the initial multistream header to send. Idempotent.
+    /// Queues the initial write: the multistream header, and for a dialer its
+    /// protocol proposal right after it in the same `OutboundData`. Idempotent.
     pub fn start(&mut self) {
         if self.started {
             return;
         }
 
         self.started = true;
+        let mut first_write = encode_message(MULTISTREAM_PROTOCOL_ID);
+        if let Some(desired) = &self.desired_protocol {
+            first_write.extend_from_slice(&encode_message(desired));
+        }
         self.pending_outputs
-            .push_back(MultistreamOutput::OutboundData(encode_message(
-                MULTISTREAM_PROTOCOL_ID,
-            )));
+            .push_back(MultistreamOutput::OutboundData(first_write));
     }
 
     /// Returns `true` if negotiation has completed (successfully or with an error).
@@ -131,11 +139,13 @@ impl MultistreamSelect {
         self.state == State::Done
     }
 
-    /// Returns `true` while a dialer has sent its proposal and only reads
-    /// the reply: it has nothing left to write.
+    /// Returns `true` while a dialer has drained its proposal and only reads
+    /// the reply: it has nothing left to write. That holds from the moment
+    /// `start`'s write is polled, before the remote header arrives.
     pub fn awaits_response(&self) -> bool {
         self.role == Role::Dialer
-            && self.state == State::WaitingForProtocolResponse
+            && self.started
+            && self.state != State::Done
             && self.pending_outputs.is_empty()
     }
 
@@ -215,14 +225,9 @@ fn handle_message(
                 });
             }
 
+            // The dialer's proposal went out with its header in `start`.
             match role {
-                Role::Dialer => {
-                    let desired = desired_protocol.expect("dialer must have desired protocol");
-                    (
-                        State::WaitingForProtocolResponse,
-                        vec![MultistreamOutput::OutboundData(encode_message(desired))],
-                    )
-                }
+                Role::Dialer => (State::WaitingForProtocolResponse, Vec::new()),
                 Role::Listener => (State::WaitingForProtocolRequest, Vec::new()),
             }
         }
@@ -377,6 +382,13 @@ mod tests {
         }
     }
 
+    /// The dialer's header followed by its proposal, as one start queues them.
+    fn header_and(protocol: &str) -> Vec<u8> {
+        let mut bytes = encode_message(MULTISTREAM_PROTOCOL_ID);
+        bytes.extend_from_slice(&encode_message(protocol));
+        bytes
+    }
+
     #[test]
     fn dialer_and_listener_negotiate_ping() {
         let mut dialer = MultistreamSelect::dialer(PING);
@@ -391,25 +403,10 @@ mod tests {
                 MULTISTREAM_PROTOCOL_ID
             ))]
         );
-        assert_eq!(
-            dialer_start,
-            vec![MultistreamOutput::OutboundData(encode_message(
-                MULTISTREAM_PROTOCOL_ID
-            ))]
-        );
 
-        let dialer_after_header = dialer.receive(&encode_message(MULTISTREAM_PROTOCOL_ID));
+        let listener_after_offer = listener.receive(&dialer_start_bytes(dialer_start));
         assert_eq!(
-            dialer_after_header,
-            vec![MultistreamOutput::OutboundData(encode_message(PING))]
-        );
-
-        let listener_after_header = listener.receive(&encode_message(MULTISTREAM_PROTOCOL_ID));
-        assert!(listener_after_header.is_empty());
-
-        let listener_after_request = listener.receive(&encode_message(PING));
-        assert_eq!(
-            listener_after_request,
+            listener_after_offer,
             vec![
                 MultistreamOutput::OutboundData(encode_message(PING)),
                 MultistreamOutput::Negotiated {
@@ -418,12 +415,35 @@ mod tests {
             ]
         );
 
-        let dialer_after_response = dialer.receive(&encode_message(PING));
+        assert!(
+            dialer
+                .receive(&encode_message(MULTISTREAM_PROTOCOL_ID))
+                .is_empty()
+        );
         assert_eq!(
-            dialer_after_response,
+            dialer.receive(&encode_message(PING)),
             vec![MultistreamOutput::Negotiated {
                 protocol: PING.to_string()
             }]
+        );
+    }
+
+    fn dialer_start_bytes(outputs: Vec<MultistreamOutput>) -> Vec<u8> {
+        outputs
+            .into_iter()
+            .flat_map(|output| match output {
+                MultistreamOutput::OutboundData(bytes) => bytes,
+                other => panic!("dialer start queued {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dialer_start_sends_header_then_proposal() {
+        let mut dialer = MultistreamSelect::dialer(PING);
+        assert_eq!(
+            dialer.start_drained(),
+            vec![MultistreamOutput::OutboundData(header_and(PING))]
         );
     }
 
@@ -482,9 +502,16 @@ mod tests {
         assert!(out.is_empty());
 
         let out = dialer.receive(b);
+        assert!(out.is_empty(), "the proposal already went out with start");
+
+        let full = encode_message(PING);
+        let (a, b) = full.split_at(full.len() / 2);
+        assert!(dialer.receive(a).is_empty());
         assert_eq!(
-            out,
-            vec![MultistreamOutput::OutboundData(encode_message(PING))]
+            dialer.receive(b),
+            vec![MultistreamOutput::Negotiated {
+                protocol: PING.to_string()
+            }]
         );
     }
 
@@ -498,6 +525,55 @@ mod tests {
             out.as_slice(),
             [MultistreamOutput::ProtocolError { .. }]
         ));
+    }
+
+    #[test]
+    fn dialer_requires_header_before_the_echo() {
+        // The proposal is already out, but the listener's answer still has
+        // to come after its header.
+        for first in [PING, NOT_AVAILABLE] {
+            let mut dialer = MultistreamSelect::dialer(PING);
+            let _ = dialer.start_drained();
+
+            let out = dialer.receive(&encode_message(first));
+            assert_eq!(
+                out,
+                vec![MultistreamOutput::ProtocolError {
+                    reason: MultistreamError::UnexpectedHeader {
+                        actual: first.to_string()
+                    }
+                    .to_string()
+                }]
+            );
+            assert!(dialer.is_done());
+        }
+    }
+
+    #[test]
+    fn awaits_response_once_the_proposal_is_drained() {
+        let mut dialer = MultistreamSelect::dialer(PING);
+        assert!(!dialer.awaits_response(), "nothing sent before start");
+
+        dialer.start();
+        assert!(
+            !dialer.awaits_response(),
+            "header and proposal are still held unsent"
+        );
+        let _ = dialer.poll_output();
+        assert!(
+            dialer.awaits_response(),
+            "proposal is out before the remote header arrives"
+        );
+
+        let _ = dialer.receive(&encode_message(MULTISTREAM_PROTOCOL_ID));
+        assert!(dialer.awaits_response());
+
+        let _ = dialer.receive(&encode_message(PING));
+        assert!(!dialer.awaits_response(), "negotiation finished");
+
+        let mut listener = MultistreamSelect::listener([PING.to_string()]);
+        let _ = listener.start_drained();
+        assert!(!listener.awaits_response());
     }
 
     #[test]
@@ -563,12 +639,9 @@ mod tests {
         let out = dialer.receive(&combined);
         assert_eq!(
             out,
-            vec![
-                MultistreamOutput::OutboundData(encode_message(PING)),
-                MultistreamOutput::Negotiated {
-                    protocol: PING.to_string()
-                }
-            ]
+            vec![MultistreamOutput::Negotiated {
+                protocol: PING.to_string()
+            }]
         );
     }
 
@@ -576,10 +649,10 @@ mod tests {
     fn dialer_receives_na() {
         let mut dialer = MultistreamSelect::dialer(PING);
         let _ = dialer.start_drained();
-        let _ = dialer.receive(&encode_message(MULTISTREAM_PROTOCOL_ID));
-
-        let out = dialer.receive(&encode_message("na"));
+        // `na` ends this dialer; a caller falls back with a fresh stream.
+        let out = dialer.receive(&header_and(NOT_AVAILABLE));
         assert_eq!(out, vec![MultistreamOutput::NotAvailable]);
+        assert!(dialer.is_done());
     }
 
     #[test]
@@ -588,16 +661,19 @@ mod tests {
 
         dialer.start();
         dialer.start();
-        assert!(matches!(
-            dialer.poll_output(),
-            Some(MultistreamOutput::OutboundData(_))
-        ));
-        assert!(dialer.poll_output().is_none(), "start is idempotent");
-
-        dialer.on_data(&encode_message(MULTISTREAM_PROTOCOL_ID));
         assert_eq!(
             dialer.poll_output(),
-            Some(MultistreamOutput::OutboundData(encode_message(PING)))
+            Some(MultistreamOutput::OutboundData(header_and(PING))),
+            "header and proposal leave in one write"
+        );
+        assert!(dialer.poll_output().is_none(), "start is idempotent");
+
+        dialer.on_data(&header_and(PING));
+        assert_eq!(
+            dialer.poll_output(),
+            Some(MultistreamOutput::Negotiated {
+                protocol: PING.to_string()
+            })
         );
     }
 }

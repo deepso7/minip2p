@@ -2233,21 +2233,19 @@ mod tests {
             .poll(Now::from_millis(0))
             .expect("initiator consumes pipelined response");
 
-        // Receiving the real selection reply emits the duplicate protocol
-        // proposal and Noise msg1 before msg3 and the encrypted Yamux
-        // selection. Drop those first two data events, then route the
-        // remaining bridge events through the wrapper.
+        // Receiving the real selection reply emits the duplicate Noise msg1
+        // before msg3 and the encrypted Yamux selection (the proposal already
+        // went out with the header). Drop that first data event, then route
+        // the remaining bridge events through the wrapper.
         let mut real_followup = b
             .inner_mut()
             .poll(Now::from_millis(0))
             .expect("real Noise follow-up");
-        for expected in ["protocol proposal", "Noise msg1"] {
-            let duplicate = real_followup
-                .iter()
-                .position(|event| matches!(event, TransportEvent::StreamData { .. }))
-                .unwrap_or_else(|| panic!("duplicate {expected}"));
-            real_followup.remove(duplicate);
-        }
+        let duplicate = real_followup
+            .iter()
+            .position(|event| matches!(event, TransportEvent::StreamData { .. }))
+            .expect("duplicate Noise msg1");
+        real_followup.remove(duplicate);
         for event in real_followup {
             b.handle_inner_event(event);
         }

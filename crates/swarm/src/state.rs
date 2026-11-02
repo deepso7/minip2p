@@ -4569,7 +4569,9 @@ mod tests {
     }
 
     /// go-libp2p's WebTransport `Close` stops our sending as it answers, so
-    /// a write stop can overtake the reply to a proposal already sent.
+    /// a write stop can overtake the reply to a proposal already sent. The
+    /// proposal leaves with the header, so the stop can even beat the
+    /// listener's header.
     #[test]
     fn a_write_stop_after_the_proposal_waits_for_the_reply() {
         let (mut core, conn, stream) = negotiating_user_stream(0);
@@ -4578,8 +4580,6 @@ mod tests {
             stream_id: stream,
             data: ms_line(text),
         };
-        feed(&mut core, data("/multistream/1.0.0\n"));
-        drain_actions(&mut core);
         feed(
             &mut core,
             TransportEvent::StreamWriteStopped {
@@ -4596,6 +4596,7 @@ mod tests {
             "{actions:?}"
         );
 
+        feed(&mut core, data("/multistream/1.0.0\n"));
         feed(&mut core, data("/app/1\n"));
         let events: Vec<_> = drain_events(&mut core)
             .into_iter()
@@ -4616,6 +4617,32 @@ mod tests {
             ),
             "{events:?}"
         );
+    }
+
+    /// A dialer whose header and proposal are still queued cannot finish, so
+    /// a write stop resets the stream.
+    #[test]
+    fn a_write_stop_before_the_proposal_is_drained_resets() {
+        let (mut core, conn, stream) = negotiating_user_stream(0);
+        let mut unsent = MultistreamSelect::dialer("/app/1");
+        unsent.start();
+        core.outbound_negotiators
+            .get_mut(&(conn, stream))
+            .expect("negotiating")
+            .negotiator = unsent;
+
+        feed(
+            &mut core,
+            TransportEvent::StreamWriteStopped {
+                id: conn,
+                stream_id: stream,
+                error_code: 3,
+            },
+        );
+        assert!(drain_actions(&mut core).iter().any(|action| matches!(
+            action,
+            Action::ResetStream { conn_id, stream_id } if *conn_id == conn && *stream_id == stream
+        )));
     }
 
     #[test]

@@ -8,6 +8,7 @@ This crate implements the [multistream-select](https://github.com/multiformats/m
 
 - Varint-length-prefixed wire format (spec-compliant framing).
 - Dialer and listener roles.
+- One round trip per negotiation: the dialer sends its header and proposal in one write, as go-libp2p and rust-libp2p do, and still requires the listener's header before its answer.
 - Incremental `on_data` handling for chunked/partial input.
 - `MultistreamOutput` events for outbound data, negotiation result, and errors.
 - Typed `MultistreamError` with actionable context.
@@ -30,7 +31,7 @@ use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect, MULTISTRE
 
 // Dialer side
 let mut dialer = MultistreamSelect::dialer("/ipfs/ping/1.0.0");
-dialer.start(); // queues multistream header
+dialer.start(); // queues the multistream header and the proposal, in one write
 
 // Listener side
 let mut listener = MultistreamSelect::listener(["/ipfs/ping/1.0.0".to_string()]);
@@ -59,4 +60,4 @@ minip2p-multistream-select = { path = "crates/multistream-select", default-featu
 
 ## Scope
 
-This crate handles single-protocol negotiation only. It does not implement `ls` or multi-protocol fallback. Concrete transport integration (feeding stream bytes in, sending outbound data out) is the caller's responsibility.
+This crate handles single-protocol negotiation only. It does not implement `ls` or multi-protocol fallback on the dialer: `na` ends a dialer, so a caller falls back on a fresh stream. A listener stays open after `na` for the dialer's next proposal. It does not send application data before the protocol is confirmed (rust-libp2p's `V1Lazy`). Concrete transport integration (feeding stream bytes in, sending outbound data out) is the caller's responsibility.
