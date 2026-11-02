@@ -631,9 +631,12 @@ impl Endpoint {
     /// connection, so every later stream operation takes both. The open ends
     /// in exactly one terminal: [`EndpointEvent::StreamReady`], or an error
     /// event naming the stream (see [`crate::SwarmErrorKind`]) when negotiation
-    /// fails, the peer closes the stream first, or
-    /// the negotiation deadline ([`SwarmTimeouts::negotiation_ms`], set with
-    /// [`EndpointBuilder::timeouts`]) passes; a closed or replaced connection ends it with its own event.
+    /// fails, the peer closes the stream first, or the negotiation deadline
+    /// ([`SwarmTimeouts::negotiation_ms`], set with
+    /// [`EndpointBuilder::timeouts`]) passes. That deadline starts when the
+    /// transport reports `StreamOpened`, so a QUIC open still waiting for
+    /// the peer's stream credit is not timed. A closed or replaced connection
+    /// ends it with its own event.
     pub fn open_stream(
         &mut self,
         peer_id: &PeerId,

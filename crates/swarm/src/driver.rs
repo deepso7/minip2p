@@ -221,6 +221,8 @@ impl<T: BlockingTransport> Swarm<T> {
         local_peer_id: PeerId,
         clock: Box<dyn Clock + Send + Sync>,
     ) -> Result<Self, DriverError> {
+        // Reject bad configuration before the poll opens or a socket attaches.
+        timeouts.validate()?;
         let mut poll =
             SharedPoll::new().map_err(|error| poll_error("opening the readiness poll", &error))?;
         poll.attach(&mut transport)

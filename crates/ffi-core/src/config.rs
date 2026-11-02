@@ -339,6 +339,7 @@ impl fmt::Debug for EndpointConfig {
             .field("discovery", &self.discovery)
             .field("mdns", &self.mdns)
             .field("limits", &self.limits)
+            .field("timeouts", &self.timeouts)
             .finish()
     }
 }
