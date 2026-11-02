@@ -60,4 +60,4 @@ minip2p-multistream-select = { path = "crates/multistream-select", default-featu
 
 ## Scope
 
-This crate handles single-protocol negotiation only. It does not implement `ls` or multi-protocol fallback on the dialer: `na` ends a dialer, so a caller falls back on a fresh stream. A listener stays open after `na` for the dialer's next proposal. It does not send application data before the protocol is confirmed (rust-libp2p's `V1Lazy`). Concrete transport integration (feeding stream bytes in, sending outbound data out) is the caller's responsibility.
+This crate handles single-protocol negotiation only. It does not implement `ls` or multi-protocol fallback on the dialer: `na` ends a dialer, so a caller falls back on a fresh stream. A listener stays open after `na` for the dialer's next proposal. Unlike rust-libp2p's `V1Lazy`, it does not send application data before the protocol is confirmed. Concrete transport integration (feeding stream bytes in, sending outbound data out) is the caller's responsibility.

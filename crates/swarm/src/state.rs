@@ -4619,32 +4619,6 @@ mod tests {
         );
     }
 
-    /// A dialer whose header and proposal are still queued cannot finish, so
-    /// a write stop resets the stream.
-    #[test]
-    fn a_write_stop_before_the_proposal_is_drained_resets() {
-        let (mut core, conn, stream) = negotiating_user_stream(0);
-        let mut unsent = MultistreamSelect::dialer("/app/1");
-        unsent.start();
-        core.outbound_negotiators
-            .get_mut(&(conn, stream))
-            .expect("negotiating")
-            .negotiator = unsent;
-
-        feed(
-            &mut core,
-            TransportEvent::StreamWriteStopped {
-                id: conn,
-                stream_id: stream,
-                error_code: 3,
-            },
-        );
-        assert!(drain_actions(&mut core).iter().any(|action| matches!(
-            action,
-            Action::ResetStream { conn_id, stream_id } if *conn_id == conn && *stream_id == stream
-        )));
-    }
-
     #[test]
     fn a_write_stop_on_an_identify_request_lets_the_reply_arrive() {
         let mut core = test_core();

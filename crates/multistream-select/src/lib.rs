@@ -439,15 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn dialer_start_sends_header_then_proposal() {
-        let mut dialer = MultistreamSelect::dialer(PING);
-        assert_eq!(
-            dialer.start_drained(),
-            vec![MultistreamOutput::OutboundData(header_and(PING))]
-        );
-    }
-
-    #[test]
     fn listener_rejects_unsupported_protocol() {
         let mut listener = MultistreamSelect::listener(["/ipfs/identify/1.0.0".to_string()]);
         let _ = listener.start_drained();

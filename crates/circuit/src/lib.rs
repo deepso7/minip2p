@@ -2034,24 +2034,24 @@ mod tests {
                 remote_write_closed: false,
             })
             .expect("initiator adoption");
-        let header = b
+        let first_write = b
             .inner_mut()
             .poll(Now::from_millis(0))
-            .expect("read pipelined header")
+            .expect("read pipelined header and proposal")
             .into_iter()
             .find_map(|event| match event {
                 TransportEvent::StreamData { data, .. } => Some(data),
                 _ => None,
             })
-            .expect("initiator multistream header");
-        let split = header.len() / 2;
+            .expect("initiator header and proposal");
+        let split = first_write.len() / 2;
         b.adopt_bridge(BridgeAdoption {
             inner_conn,
             bridge_stream: bridge,
             relay,
             remote_peer: a_peer.clone(),
             role: CircuitRole::Responder,
-            pending_data: Bytes::from(header[..split].to_vec()),
+            pending_data: Bytes::from(first_write[..split].to_vec()),
             unsent_prefix: Bytes::new(),
             remote_write_closed: false,
         })
@@ -2062,7 +2062,11 @@ mod tests {
                 .as_slice(),
             [TransportEvent::IncomingConnection { .. }]
         ));
-        b.inject_bridge_data(inner_conn, bridge, Bytes::from(header[split..].to_vec()));
+        b.inject_bridge_data(
+            inner_conn,
+            bridge,
+            Bytes::from(first_write[split..].to_vec()),
+        );
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
     }
 
