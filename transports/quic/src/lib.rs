@@ -1300,8 +1300,8 @@ impl Transport for QuicTransport {
             .ok_or(TransportError::ConnectionNotFound { id })?;
 
         let stream_id = conn.open_stream()?;
-        self.pending_events
-            .push(TransportEvent::StreamOpened { id, stream_id });
+        // `StreamOpened` follows once the peer's stream credit lets the
+        // engine open it, from this service or a later one.
         self.service(id, Instant::now());
         Ok(stream_id)
     }

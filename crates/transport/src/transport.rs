@@ -38,7 +38,9 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 ///
 /// ## Stream lifecycle
 ///
-/// - `open_stream()` returns a `StreamId` and emits `StreamOpened`.
+/// - `open_stream()` returns a `StreamId` and emits `StreamOpened` once the
+///   stream is open on the wire, which may wait for the peer's stream credit.
+///   Writes and FIN may be issued before it and queue until then.
 /// - Remote-initiated streams emit `IncomingStream` before any `StreamData`.
 /// - `StreamData` may be emitted zero or more times for a stream.
 /// - `StreamRemoteWriteClosed` is emitted at most once per stream when the
@@ -153,7 +155,7 @@ pub trait Transport {
     /// Open a new bidirectional stream on an existing connection.
     ///
     /// Returns `InvalidState` if the connection is not yet `Connected`.
-    /// Emits `StreamOpened` on success.
+    /// Emits `StreamOpened` once the stream is open on the wire.
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError>;
 
     /// Write data to a stream.

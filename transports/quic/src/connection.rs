@@ -443,7 +443,7 @@ impl QuicConnection {
                 self.after_wt(now, cx.events);
                 self.poll_wt_close(now);
             }
-            self.bind_pending_opens(now);
+            self.bind_pending_opens(now, cx.events);
             self.drain_send_queues(now, cx.events);
             // Endpoint events (new connection ids, retirements, the final
             // `Drained`) go out before the transmit below, so their output
@@ -539,7 +539,7 @@ impl QuicConnection {
                 }
             }
             Event::Stream(StreamEvent::Available { dir: Dir::Bi }) => {
-                self.bind_pending_opens(now);
+                self.bind_pending_opens(now, cx.events);
             }
             // Only WebTransport-serving sockets advertise DATAGRAM, and
             // datagrams are not served there: drained and dropped.
@@ -1028,8 +1028,9 @@ impl QuicConnection {
         }
     }
 
-    /// Opens pending streams in the engine, in order, as peer credit allows.
-    fn bind_pending_opens(&mut self, now: Instant) {
+    /// Opens pending streams in the engine, in order, as peer credit allows,
+    /// reporting each as `StreamOpened`.
+    fn bind_pending_opens(&mut self, now: Instant, events: &mut Vec<TransportEvent>) {
         // A closing connection opens nothing more.
         while !self.pending_opens.is_empty() && !self.is_closing() {
             // A WebTransport session may also wait on the client's credit.
@@ -1058,6 +1059,10 @@ impl QuicConnection {
                 self.reset_on_wire(raw, self.stream_code());
             } else {
                 self.bound_local_bidi_streams += 1;
+                events.push(TransportEvent::StreamOpened {
+                    id: self.id,
+                    stream_id: StreamId::new(raw),
+                });
             }
         }
     }
@@ -1088,8 +1093,9 @@ impl QuicConnection {
                 resource: "local QUIC bidirectional streams",
             });
         }
-        // Handed out now, opened in the engine by the next service once the
-        // peer grants credit; writes and FIN queue until then.
+        // Handed out now, opened in the engine (and reported as
+        // `StreamOpened`) by the next service once the peer grants credit;
+        // writes and FIN queue until then.
         let raw = self.next_local_bidi_stream_id;
         self.next_local_bidi_stream_id += 4;
         self.stream_states

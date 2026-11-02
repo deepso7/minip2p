@@ -547,14 +547,14 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             .fill_bytes(&mut payload)
             .map_err(|_| DriverError::Entropy)?;
         self.state.ping(peer_id, payload, now_ms)?;
-        self.flush(now_ms);
+        self.flush();
         Ok(())
     }
 
     /// Closes the connection to a peer.
-    pub fn disconnect(&mut self, peer_id: &PeerId, now_ms: u64) -> Result<(), DriverError> {
+    pub fn disconnect(&mut self, peer_id: &PeerId, _now_ms: u64) -> Result<(), DriverError> {
         self.state.disconnect(peer_id)?;
-        self.flush(now_ms);
+        self.flush();
         Ok(())
     }
 
@@ -581,19 +581,18 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         &mut self,
         peer_id: &PeerId,
         protocol_id: &str,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> Result<(ConnectionId, StreamId), DriverError> {
         // Earlier queued work keeps its place ahead of this open, and its
         // failures keep flowing as events.
-        self.flush(now_ms);
+        self.flush();
         let conn_id = self.state.admit_user_open(peer_id, protocol_id)?;
         let stream_id = self.open(
             conn_id,
             protocol_id,
             ProtocolKind::User(protocol_id.to_string()),
-            now_ms,
         )?;
-        self.flush(now_ms);
+        self.flush();
         Ok((conn_id, stream_id))
     }
 
@@ -610,10 +609,10 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         conn_id: ConnectionId,
         stream_id: StreamId,
         data: Bytes,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> Result<(), DriverError> {
         // Earlier queued writes for the stream go out first.
-        self.flush(now_ms);
+        self.flush();
         let data = self
             .state
             .admit_user_write(peer_id, conn_id, stream_id, data)
@@ -655,10 +654,10 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> Result<(), DriverError> {
         self.state.close_stream_write(peer_id, conn_id, stream_id)?;
-        self.flush(now_ms);
+        self.flush();
         Ok(())
     }
 
@@ -672,10 +671,10 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> Result<(), DriverError> {
         self.state.reset_stream(peer_id, conn_id, stream_id)?;
-        self.flush(now_ms);
+        self.flush();
         Ok(())
     }
 
@@ -742,10 +741,10 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         peer_id: &PeerId,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> Result<(), DriverError> {
         self.state.abandon_stream(peer_id, conn_id, stream_id)?;
-        self.flush(now_ms);
+        self.flush();
         Ok(())
     }
 
@@ -760,10 +759,10 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         &mut self,
         conn_id: ConnectionId,
         stream_id: StreamId,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> Result<(), DriverError> {
         self.state.abandon_ended_stream(conn_id, stream_id)?;
-        self.flush(now_ms);
+        self.flush();
         Ok(())
     }
 
@@ -800,7 +799,7 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         // Closes deferred behind events the caller has since drained are now
         // due. Run them before reading more transport input so replaced
         // connections cannot produce another batch ahead of their close.
-        self.flush(now_ms);
+        self.flush();
 
         let events = self.transport.poll(now)?;
 
@@ -830,12 +829,12 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         // assumes an earlier event's transport actions have already run.
         for event in events {
             self.state.handle_transport_event(event, now_ms);
-            self.flush(now_ms);
+            self.flush();
         }
 
         // Timers tick after the transport batch.
         self.state.handle_tick(now_ms);
-        self.flush(now_ms);
+        self.flush();
         Ok(())
     }
 
@@ -920,12 +919,9 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
 
     /// Dispatches queued transport work until none is due, feeding each
     /// result back into the state (which may queue more).
-    ///
-    /// `now_ms` is the caller's sample for this step; an outbound open
-    /// starts its negotiation deadline from it.
-    fn flush(&mut self, now_ms: u64) {
+    fn flush(&mut self) {
         while let Some(action) = self.state.next_action() {
-            self.dispatch(action, now_ms);
+            self.dispatch(action);
         }
     }
 
@@ -938,11 +934,10 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
         conn_id: ConnectionId,
         protocol: &str,
         target: ProtocolKind,
-        now_ms: u64,
     ) -> Result<StreamId, TransportError> {
         let stream_id = self.transport.open_stream(conn_id)?;
         self.state
-            .start_outbound(conn_id, stream_id, protocol, target, now_ms);
+            .start_outbound(conn_id, stream_id, protocol, target);
         Ok(stream_id)
     }
 
@@ -951,13 +946,13 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     ///
     /// A [`TransportError::ConnectionClosed`] is not reported here: the
     /// operation ended the connection, whose close reports the failure once.
-    fn dispatch(&mut self, action: Action, now_ms: u64) {
+    fn dispatch(&mut self, action: Action) {
         match action {
             Action::OpenStream {
                 conn_id,
                 protocol,
                 target,
-            } => match self.open(conn_id, &protocol, target, now_ms) {
+            } => match self.open(conn_id, &protocol, target) {
                 Ok(_) | Err(TransportError::ConnectionClosed { .. }) => {}
                 Err(error) => self
                     .state
@@ -1554,6 +1549,12 @@ mod tests {
             StreamId::new(1),
             "/app/1",
             ProtocolKind::User("/app/1".to_string()),
+        );
+        swarm.state.handle_transport_event(
+            TransportEvent::StreamOpened {
+                id: ConnectionId::new(1),
+                stream_id: StreamId::new(1),
+            },
             now.monotonic_ms,
         );
     }
@@ -1761,6 +1762,54 @@ mod tests {
                 .any(|event| matches!(event, SwarmEvent::Error(_))),
             "an already-gone stream's reset must not surface as Error: {events:?}"
         );
+    }
+
+    #[test]
+    fn negotiation_deadline_starts_when_the_transport_opens_the_stream() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let conn = ConnectionId::new(1);
+        let address = "/ip4/198.51.100.7/udp/4001/quic-v1"
+            .parse()
+            .expect("endpoint");
+        let mut swarm = swarm(vec![TransportEvent::Connected {
+            id: conn,
+            endpoint: ConnectionEndpoint::with_peer_id(address, peer.clone()),
+        }]);
+        swarm.add_protocol("/app/1").expect("protocol");
+        swarm.poll(Now::from_millis(0)).expect("connect");
+        // The transport holds the open (no `StreamOpened`), as QUIC does
+        // while it waits for the peer's stream credit.
+        let (conn_id, stream_id) = swarm.open_stream(&peer, "/app/1", 0).expect("open");
+        let timed_out = |events: &[SwarmEvent]| {
+            events.iter().any(|event| {
+                matches!(event, SwarmEvent::Error(error) if error.stream_id == Some(stream_id))
+            })
+        };
+
+        let opened_at = 3 * OUTBOUND_NEGOTIATION_TIMEOUT_MS;
+        let events = swarm.poll(Now::from_millis(opened_at)).expect("held");
+        assert!(
+            !timed_out(&events),
+            "a held open is not negotiating: {events:?}"
+        );
+
+        swarm
+            .transport_mut()
+            .initial
+            .push(TransportEvent::StreamOpened {
+                id: conn_id,
+                stream_id,
+            });
+        swarm.poll(Now::from_millis(opened_at)).expect("opened");
+        let due = opened_at + OUTBOUND_NEGOTIATION_TIMEOUT_MS;
+        assert_eq!(
+            swarm.next_deadline(Now::from_millis(opened_at)),
+            Some(Deadline::from_millis(due))
+        );
+        let events = swarm.poll(Now::from_millis(due - 1)).expect("not yet due");
+        assert!(!timed_out(&events), "{events:?}");
+        let events = swarm.poll(Now::from_millis(due)).expect("due");
+        assert!(timed_out(&events), "{events:?}");
     }
 
     #[test]
