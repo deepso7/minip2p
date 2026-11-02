@@ -163,7 +163,7 @@ function resolveLimits(limits: Minip2pLimits): BackendLimits {
 
 function resolveQuic(quic: Minip2pQuicLimits): BackendQuicLimits {
   return withoutUndefined({
-    congestionController: quic.congestionController,
+    congestionController: congestionController(quic.congestionController),
     connectionReceiveWindow: u64OrLiteral(
       quic.connectionReceiveWindow,
       "unlimited",
@@ -267,6 +267,24 @@ function withoutUndefined<T extends object>(value: T): T {
   return Object.fromEntries(
     Object.entries(value).filter(([, field]) => field !== undefined)
   ) as T;
+}
+
+const CONGESTION_CONTROLLERS: readonly string[] = [
+  "cubic",
+  "newReno",
+  "bbr",
+] satisfies Minip2pCongestionController[];
+
+/** Rejects a name no backend knows, which RN would otherwise drop to Cubic. */
+function congestionController(
+  value: Minip2pCongestionController | undefined
+): Minip2pCongestionController | undefined {
+  if (value !== undefined && !CONGESTION_CONTROLLERS.includes(value)) {
+    throw new RangeError(
+      'quic.congestionController must be "cubic", "newReno" or "bbr"'
+    );
+  }
+  return value;
 }
 
 function optionalU64(

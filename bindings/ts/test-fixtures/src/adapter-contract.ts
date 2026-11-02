@@ -10,7 +10,11 @@ import {
   StreamClosedError,
   TimeoutError,
 } from "../../core/src/index.js";
-import type { Minip2pBase, Minip2pConfig } from "../../core/src/index.js";
+import type {
+  Minip2pBase,
+  Minip2pCongestionController,
+  Minip2pConfig,
+} from "../../core/src/index.js";
 
 /** A native event literal; both fakes accept `{ tag, inner }` with bigints. */
 export interface NativeEventLiteral {
@@ -818,6 +822,15 @@ export function describeAdapterContract(
 
       expect(() =>
         harness.create({ limits: { quic: { sendWindow: -1 } } })
+      ).toThrow(RangeError);
+      expect(() =>
+        harness.create({
+          limits: {
+            quic: {
+              congestionController: "newreno" as Minip2pCongestionController,
+            },
+          },
+        })
       ).toThrow(RangeError);
       expect(() =>
         harness.create({

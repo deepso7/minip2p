@@ -2145,4 +2145,51 @@ mod tests {
             Err(TransportError::ConnectionNotFound { id: foreign })
         );
     }
+
+    /// The controller and thresholds reach each connection's engine: the
+    /// built transport config carries both thresholds, and an accepted
+    /// connection runs the chosen controller.
+    #[test]
+    fn congestion_tuning_reaches_the_engine() {
+        use crate::test_peer::{accept, listening_server};
+        for controller in [
+            CongestionController::Cubic,
+            CongestionController::NewReno,
+            CongestionController::Bbr,
+        ] {
+            let limits = QuicLimits {
+                congestion_controller: controller,
+                packet_threshold: 10,
+                time_threshold: 2.0,
+                ..QuicLimits::default()
+            };
+            // quinn keeps the thresholds private; its Debug shows them.
+            let config = format!("{:?}", transport_config(&limits).expect("valid limits"));
+            assert!(
+                config.contains("packet_threshold: 10") && config.contains("time_threshold: 2.0"),
+                "{config}"
+            );
+
+            let mut server = listening_server(limits);
+            let (_peer, id) = accept(&mut server, &mut [], |_| {});
+            let running = server
+                .connections
+                .get_mut(&id)
+                .expect("connection")
+                .engine()
+                .congestion_state()
+                .clone_box()
+                .into_any();
+            let running = if running.is::<congestion::Cubic>() {
+                CongestionController::Cubic
+            } else if running.is::<congestion::NewReno>() {
+                CongestionController::NewReno
+            } else if running.is::<congestion::Bbr>() {
+                CongestionController::Bbr
+            } else {
+                panic!("an unknown controller runs")
+            };
+            assert_eq!(running, controller);
+        }
+    }
 }

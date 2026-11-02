@@ -719,7 +719,7 @@ export type QuicLimitsOptions = {
     packetThreshold?: number,
     /**
      * Multiple of the RTT a missing packet may wait before it is declared
-     * lost; finite and at least 1.0.
+     * lost; between 1.0 and 10.0.
      */
     timeThreshold?: number
 }
