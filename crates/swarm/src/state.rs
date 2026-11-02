@@ -2383,6 +2383,18 @@ impl SwarmState {
 
     fn handle_stream_remote_write_closed(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
         let Some(protocol) = self.stream_protocol(conn_id, stream_id).cloned() else {
+            // A peer done writing mid-negotiation can never send its Identify.
+            let key = (conn_id, stream_id);
+            if let Some(target) = self
+                .outbound_negotiators
+                .get(&key)
+                .map(|p| p.target.clone())
+                && self.fail_identify_stream(&target, conn_id, IdentifyFailure::ClosedEarly)
+            {
+                self.outbound_negotiators.remove(&key);
+                self.actions
+                    .push_back(Action::ResetStream { conn_id, stream_id });
+            }
             return;
         };
         let peer_id = self.ensure_peer_id_for_conn(conn_id);
@@ -6898,6 +6910,8 @@ mod tests {
         Rejected,
         /// The peer resets the stream mid-negotiation.
         ClosedNegotiating,
+        /// The peer closes its write side mid-negotiation.
+        FinNegotiating,
         /// The peer resets the stream after negotiating, before replying.
         ClosedNegotiated,
         /// The peer sends a frame Identify refuses.
@@ -6965,6 +6979,13 @@ mod tests {
                 data(&mut core, na);
             }
             IdentifyBreak::ClosedNegotiating => closed(&mut core),
+            IdentifyBreak::FinNegotiating => feed(
+                &mut core,
+                TransportEvent::StreamRemoteWriteClosed {
+                    id: conn,
+                    stream_id: stream,
+                },
+            ),
             IdentifyBreak::ClosedNegotiated => {
                 data(&mut core, accept);
                 closed(&mut core);
@@ -6990,6 +7011,7 @@ mod tests {
             (OpenFails, IdentifyFailure::OpenFailed),
             (Rejected, IdentifyFailure::Rejected),
             (ClosedNegotiating, IdentifyFailure::ClosedEarly),
+            (FinNegotiating, IdentifyFailure::ClosedEarly),
             (ClosedNegotiated, IdentifyFailure::ClosedEarly),
             (Malformed, IdentifyFailure::Malformed),
             (BadNegotiation, IdentifyFailure::Malformed),
