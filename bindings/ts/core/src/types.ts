@@ -190,6 +190,22 @@ export const MdnsFailureKind = {
 export type MdnsFailureKind =
   (typeof MdnsFailureKind)[keyof typeof MdnsFailureKind];
 
+/** Why a connection's first Identify failed, reported by `identifyFailed`. */
+export const IdentifyFailure = {
+  /** The stream was reset, or closed during negotiation, before the reply. */
+  ClosedEarly: "ClosedEarly",
+  /** The peer's negotiation or Identify reply was malformed. */
+  Malformed: "Malformed",
+  /** The transport refused to open the Identify stream. */
+  OpenFailed: "OpenFailed",
+  /** The peer refused Identify during protocol negotiation. */
+  Rejected: "Rejected",
+  /** The exchange did not finish within the Identify deadline. */
+  TimedOut: "TimedOut",
+} as const;
+export type IdentifyFailure =
+  (typeof IdentifyFailure)[keyof typeof IdentifyFailure];
+
 /** The part of an endpoint's configuration an `InvalidConfigError` names. */
 export const ConfigCapability = {
   /** Signed discovery or peer-book settings. */
@@ -389,6 +405,15 @@ export interface Minip2pNamedEventMap {
     readonly peerId: string;
     readonly connId: number;
     readonly info: IdentifyInfo;
+  };
+  /**
+   * The first Identify on `connId` failed, so it never becomes ready; its
+   * `connectionClosed` follows. Redial to try again.
+   */
+  identifyFailed: {
+    readonly peerId: string;
+    readonly connId: number;
+    readonly cause: IdentifyFailure;
   };
   /** A ping round trip completed on `connId`. */
   pingRttMeasured: {
@@ -708,6 +733,7 @@ export const P2pEvent_Tags = {
   GossipsubOutboundFailure: "GossipsubOutboundFailure",
   GossipsubProtocolViolation: "GossipsubProtocolViolation",
   HolePunchFailed: "HolePunchFailed",
+  IdentifyFailed: "IdentifyFailed",
   IdentifyReceived: "IdentifyReceived",
   InboundDirectUpgrade: "InboundDirectUpgrade",
   InboundPathEstablished: "InboundPathEstablished",
@@ -779,6 +805,10 @@ export type P2pEvent =
   | RawEvent<
       typeof P2pEvent_Tags.IdentifyReceived,
       Minip2pNamedEventMap["identifyReceived"]
+    >
+  | RawEvent<
+      typeof P2pEvent_Tags.IdentifyFailed,
+      Minip2pNamedEventMap["identifyFailed"]
     >
   | RawEvent<
       typeof P2pEvent_Tags.PingRttMeasured,

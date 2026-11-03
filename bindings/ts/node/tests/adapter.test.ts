@@ -273,6 +273,29 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
+  test("an Identify failure reaches listeners with its cause", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const seen: unknown[] = [];
+    endpoint.on("identifyFailed", (event) => seen.push(event));
+    fake.enqueue(
+      [
+        {
+          inner: { cause: "TimedOut", connId: 7n, peerId: "peer" },
+          tag: "IdentifyFailed",
+        },
+      ],
+      []
+    );
+
+    fake.ring();
+    await settle();
+
+    expect(seen).toEqual([{ cause: "TimedOut", connId: 1, peerId: "peer" }]);
+    endpoint.close();
+  });
+
   test("mDNS failure and recovery reach listeners", async () => {
     vi.useFakeTimers();
     const endpoint = createEndpoint();

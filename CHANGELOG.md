@@ -9,7 +9,7 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 - **`PingTimeout` is replaced by `PingFailed { peer_id, conn_id, cause }`** in `SwarmEvent`, `EndpointEvent` and the UniFFI `P2pEvent`, with `cause: PingFailure` (`TimedOut`, `OpenFailed`, `Rejected`, `StreamClosed`). Every accepted ping now ends in exactly one `PingRttMeasured` or `PingFailed`, unless its connection closes first; an open that failed, a refused or broken negotiation, or a stream that closed used to end it with a generic `Error` or nothing at all.
 - **The ping deadline (`ping_ms`) runs from the `ping` call** and covers opening and negotiating the ping stream as well as the echo. It used to start at the send, with the stream's negotiation under the negotiation deadline.
 - **The default first-Identify deadline (`IDENTIFY_TIMEOUT_MS`, `identify_ms`) is 30 s**, up from 10 s, and the negotiation deadline no longer applies to the first Identify stream or to ping streams: their own deadlines cover their negotiation.
-- **TypeScript:** the `pingTimeout` event is now `pingFailed` (`{ peerId, connId, cause }`), and `ping()` rejects with the new `PingFailedError` (with `cause`, a `PingFailure`) instead of `TimeoutError`. `waitPeerReady`'s default timeout is now the connect deadline plus `timeouts.identifyMs` plus 5 s (65 s by default). `Minip2pBase`'s protected constructor takes the config (`relays`, `timeouts`) instead of the relay list.
+- **TypeScript:** the `pingTimeout` event is now `pingFailed` (`{ peerId, connId, cause }`), and `ping()` rejects with the new `PingFailedError` (with `kind`, a `PingFailure`) instead of `TimeoutError`. `waitPeerReady`'s default timeout is now the connect deadline plus `timeouts.identifyMs` plus 5 s (65 s by default). `Minip2pBase`'s protected constructor takes the config (`relays`, `timeouts`) instead of the relay list.
 
 ### Stream actions on an ended stream are not errors (#494)
 
@@ -34,7 +34,8 @@ A connection whose first Identify exchange fails used to stay open and never bec
 - **The connection is then closed**; its `ConnectionClosed` reason is `ConnectionCloseReason::Error` naming Identify. Identify is not retried: redial to try again. A ready connection is never closed for Identify.
 - **`SwarmErrorKind::Identify` errors now carry the peer, connection, and stream.**
 - **The 10 s also bounds a provisional relayed connection**: a circuit whose peer never completes Identify is closed then, even inside a longer connect deadline.
-- **Foreign bindings (UniFFI, `@minip2p/web`, `@minip2p/node`) have no `IdentifyFailed` event yet.** They see the `connectionClosed` that follows, whose reason names Identify, so `waitPeerReady` rejects at once.
+- **The bindings carry it (#491)**: ffi-core's `P2pEvent::IdentifyFailed { peer_id, conn_id, cause }`, with a UniFFI and serde `IdentifyFailure` cause, reaches UniFFI, `@minip2p/node`, `@minip2p/web` and React Native as the TS SDK's `identifyFailed` event (`{ peerId, connId, cause }`, `cause` from `IdentifyFailure`), ahead of the `connectionClosed` that follows. Add an arm if you match `P2pEvent` exhaustively.
+- **`waitPeerReady` rejects with `IdentifyFailedError`** when the current connection's first Identify fails. It is a `PeerDisconnectedError`, so existing `instanceof` checks still match, and adds `connId` and `kind` (the `IdentifyFailure`).
 
 ### A failed Yamux session ends its streams with the connection close (#480)
 

@@ -267,6 +267,7 @@ export const nativeModuleMock = async () => {
     DriverFailureKind: generated.DriverFailureKind,
     EndpointErrorKind: generated.EndpointErrorKind,
     FfiError_Tags: generated.FfiError_Tags,
+    IdentifyFailure: generated.IdentifyFailure,
     MdnsFailureKind: generated.MdnsFailureKind,
     NatErrorKind: generated.NatErrorKind,
     P2pEndpoint: FakeNativeEndpoint,

@@ -3125,6 +3125,64 @@ const FfiConverterTypeFfiError = (() => {
 })();
 
 /**
+ * Why a connection's first Identify exchange failed; see
+ * [`P2pEvent::IdentifyFailed`].
+ */
+export enum IdentifyFailure {
+    /**
+     * The exchange did not finish within the Identify deadline of the
+     * connection establishing.
+     */
+    TimedOut,
+    /**
+     * The transport refused to open the Identify stream.
+     */
+    OpenFailed,
+    /**
+     * The peer refused Identify during protocol negotiation.
+     */
+    Rejected,
+    /**
+     * The stream was reset, or closed during negotiation, before the
+     * peer's reply arrived.
+     */
+    ClosedEarly,
+    /**
+     * The peer's negotiation or Identify reply was malformed.
+     */
+    Malformed
+}
+
+const FfiConverterTypeIdentifyFailure = (() => {
+    type TypeName = IdentifyFailure;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            switch (c.readI32()) {
+                case 1: return IdentifyFailure.TimedOut;
+                case 2: return IdentifyFailure.OpenFailed;
+                case 3: return IdentifyFailure.Rejected;
+                case 4: return IdentifyFailure.ClosedEarly;
+                case 5: return IdentifyFailure.Malformed;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            switch (value) {
+                case IdentifyFailure.TimedOut: return c.writeI32(1);
+                case IdentifyFailure.OpenFailed: return c.writeI32(2);
+                case IdentifyFailure.Rejected: return c.writeI32(3);
+                case IdentifyFailure.ClosedEarly: return c.writeI32(4);
+                case IdentifyFailure.Malformed: return c.writeI32(5);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return 4;
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
  * Category of an mDNS failure.
  */
 export enum MdnsFailureKind {
@@ -3383,7 +3441,8 @@ export enum P2pEvent_Tags {
     DiscoveryDialFailed = "DiscoveryDialFailed",
     MdnsFailed = "MdnsFailed",
     MdnsRecovered = "MdnsRecovered",
-    DiscoveryProtocolViolation = "DiscoveryProtocolViolation"
+    DiscoveryProtocolViolation = "DiscoveryProtocolViolation",
+    IdentifyFailed = "IdentifyFailed"
 }
 /**
  * Event delivered by the native endpoint driver.
@@ -4799,6 +4858,43 @@ inner: {peerId?: string; source: DiscoverySource; reason: string; suppressed: nu
 
     }
 
+    type IdentifyFailed__interface = {
+        tag: P2pEvent_Tags.IdentifyFailed;
+        inner:
+Readonly<{peerId: string; connId: bigint; cause: IdentifyFailure}>
+    };
+    /**
+     * The first Identify exchange on `conn_id` failed, so the connection
+     * never becomes ready. The Endpoint closes it, so its
+     * `ConnectionClosed` follows; redial to try again. A ready connection
+     * never fails this way.
+     */
+    class IdentifyFailed_ extends UniffiEnum implements IdentifyFailed__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "P2pEvent";
+        readonly tag = P2pEvent_Tags.IdentifyFailed;
+        readonly inner:
+Readonly<{peerId: string; connId: bigint; cause: IdentifyFailure}>;
+        constructor(
+inner: {peerId: string; connId: bigint; cause: IdentifyFailure }) {
+            super("P2pEvent", "IdentifyFailed");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {peerId: string; connId: bigint; cause: IdentifyFailure }): IdentifyFailed_ {
+            return new IdentifyFailed_(inner);
+        }
+
+        static instanceOf(obj: any): obj is IdentifyFailed_ {
+            return obj.tag === P2pEvent_Tags.IdentifyFailed;
+        }
+
+    }
+
     function instanceOf(obj: any): obj is P2pEvent {
         return obj[uniffiTypeNameSymbol] === "P2pEvent";
     }
@@ -4845,7 +4941,8 @@ inner: {peerId?: string; source: DiscoverySource; reason: string; suppressed: nu
   DiscoveryDialFailed: DiscoveryDialFailed_,
   MdnsFailed: MdnsFailed_,
   MdnsRecovered: MdnsRecovered_,
-  DiscoveryProtocolViolation: DiscoveryProtocolViolation_
+  DiscoveryProtocolViolation: DiscoveryProtocolViolation_,
+  IdentifyFailed: IdentifyFailed_
     });
 
 })();
@@ -4853,7 +4950,7 @@ inner: {peerId?: string; source: DiscoverySource; reason: string; suppressed: nu
  * Event delivered by the native endpoint driver.
  */
 export type P2pEvent = InstanceType<
-    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'EndpointClosed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingFailed' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'ListenAddressesChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation']
+    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'EndpointClosed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingFailed' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'ListenAddressesChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation' | 'IdentifyFailed']
 >;
 
 // FfiConverter for enum P2pEvent
@@ -4903,6 +5000,7 @@ const FfiConverterTypeP2pEvent = (() => {
                 case 39: return new P2pEvent.MdnsFailed({kind: FfiConverterTypeMdnsFailureKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
                 case 40: return new P2pEvent.MdnsRecovered();
                 case 41: return new P2pEvent.DiscoveryProtocolViolation({peerId: FfiConverterOptionalString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c), reason: FfiConverterString.readFromCursor(c), suppressed: FfiConverterUInt32.readFromCursor(c) });
+                case 42: return new P2pEvent.IdentifyFailed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), cause: FfiConverterTypeIdentifyFailure.readFromCursor(c) });
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -5225,6 +5323,14 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterTypeDiscoverySource.writeIntoCursor(inner.source, c);
                     FfiConverterString.writeIntoCursor(inner.reason, c);
                     FfiConverterUInt32.writeIntoCursor(inner.suppressed, c);
+                    return;
+                }
+                case P2pEvent_Tags.IdentifyFailed: {
+                    c.writeI32(42);
+                    const inner = value.inner;
+                    FfiConverterString.writeIntoCursor(inner.peerId, c);
+                    FfiConverterUInt64.writeIntoCursor(inner.connId, c);
+                    FfiConverterTypeIdentifyFailure.writeIntoCursor(inner.cause, c);
                     return;
                 }
                 default:
@@ -5552,6 +5658,14 @@ const FfiConverterTypeP2pEvent = (() => {
                     size += FfiConverterUInt32.allocationSize(inner.suppressed);
                     return size;
                 }
+                case P2pEvent_Tags.IdentifyFailed: {
+                    const inner = value.inner;
+                    let size = 4;
+                    size += FfiConverterString.allocationSize(inner.peerId);
+                    size += FfiConverterUInt64.allocationSize(inner.connId);
+                    size += FfiConverterTypeIdentifyFailure.allocationSize(inner.cause);
+                    return size;
+                }
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -5656,6 +5770,7 @@ export default Object.freeze({
     FfiConverterTypeEndpointConfig,
     FfiConverterTypeEndpointErrorKind,
     FfiConverterTypeFfiError,
+    FfiConverterTypeIdentifyFailure,
     FfiConverterTypeIdentifyInfo,
     FfiConverterTypeKnownPeerInfo,
     FfiConverterTypeLimitsOptions,

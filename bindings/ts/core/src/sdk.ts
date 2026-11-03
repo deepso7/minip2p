@@ -14,6 +14,7 @@ import {
   ConnectResultUnavailableError,
   DriverFailedError,
   EventQueueOverflowError,
+  IdentifyFailedError,
   OpenStreamError,
   PeerDisconnectedError,
   PingFailedError,
@@ -372,6 +373,7 @@ const connectionsOf = (event: P2pEvent): number[] => {
 const UNSEEN_CONNECTION_TAGS: ReadonlySet<string> = new Set<P2pEvent["tag"]>([
   P2pEvent_Tags.PeerReady,
   P2pEvent_Tags.IdentifyReceived,
+  P2pEvent_Tags.IdentifyFailed,
   P2pEvent_Tags.EndpointError,
   P2pEvent_Tags.StreamRemoteWriteClosed,
   P2pEvent_Tags.StreamWriteStopped,
@@ -1497,7 +1499,8 @@ export class Minip2pBase {
 
   /**
    * Waits until the peer's current connection is ready, or rejects if the
-   * peer disconnects.
+   * peer disconnects: with `IdentifyFailedError` (a `PeerDisconnectedError`
+   * whose `kind` is the cause) when that connection's first Identify failed.
    *
    * A `peerReady` resolves it only while its connection is still the peer's
    * current one, so a stale `peerReady` for a replaced connection does not.
@@ -1535,6 +1538,25 @@ export class Minip2pBase {
       signal: controller.signal,
       timeoutMs,
     }).then(({ protocols }) => ({ peerId, protocols }));
+    // The failed connection may already be gone natively, so a failure
+    // counts if it names the peer's current connection or, once native has
+    // none, the last one this wait knew.
+    let knownConnId = info?.connId;
+    const identifyFailed = this.waitFor("identifyFailed", {
+      ...options,
+      predicate: (event) => {
+        if (event.peerId !== peerId) {
+          return false;
+        }
+        knownConnId =
+          this.#backend.connectionInfo(peerId)?.connId ?? knownConnId;
+        return (knownConnId ?? event.connId) === event.connId;
+      },
+      signal: controller.signal,
+      timeoutMs,
+    }).then(({ connId, cause }) => {
+      throw new IdentifyFailedError(peerId, connId, cause);
+    });
     const disconnected = this.waitFor("connectionClosed", {
       ...options,
       predicate: (event) =>
@@ -1545,7 +1567,7 @@ export class Minip2pBase {
     }).then(() => {
       throw new PeerDisconnectedError(peerId, "waitPeerReady");
     });
-    return Promise.race([ready, disconnected]).finally(() => {
+    return Promise.race([ready, identifyFailed, disconnected]).finally(() => {
       removeExternalAbort?.();
       controller.abort();
     });
@@ -2438,6 +2460,7 @@ const SDK_EVENT_NAMES: {
   [P2pEvent_Tags.ConnectionReplaced]: "connectionReplaced",
   [P2pEvent_Tags.PeerReady]: "peerReady",
   [P2pEvent_Tags.IdentifyReceived]: "identifyReceived",
+  [P2pEvent_Tags.IdentifyFailed]: "identifyFailed",
   [P2pEvent_Tags.PingRttMeasured]: "pingRttMeasured",
   [P2pEvent_Tags.PingFailed]: "pingFailed",
   [P2pEvent_Tags.EndpointError]: "endpointError",

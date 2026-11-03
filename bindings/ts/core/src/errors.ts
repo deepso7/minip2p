@@ -4,6 +4,7 @@ import type {
   ConfigCapability,
   DriverFailureKind,
   EndpointErrorKind,
+  IdentifyFailure,
   NatErrorKind,
   PingFailure,
 } from "./types.js";
@@ -168,31 +169,51 @@ export class PeerDisconnectedError extends Error {
   readonly peerId: string;
   readonly operation?: string;
 
-  constructor(peerId: string, operation?: string) {
-    super(
+  /** `reason`, when given, is appended to the message. */
+  constructor(peerId: string, operation?: string, reason?: string) {
+    const base =
       operation === undefined
         ? `Peer ${peerId} disconnected`
-        : `Peer ${peerId} disconnected during ${operation}`
-    );
+        : `Peer ${peerId} disconnected during ${operation}`;
+    super(reason === undefined ? base : `${base}: ${reason}`);
     this.name = "PeerDisconnectedError";
     this.peerId = peerId;
     this.operation = operation;
   }
 }
 
-/** A ping attempt failed natively; `cause` says why. */
+/** A ping attempt failed natively; `kind` (the `pingFailed` event's `cause`) says why. */
 export class PingFailedError extends Error {
   readonly peerId: string;
   /** The connection the ping was sent on. */
   readonly connId: number;
-  readonly cause: PingFailure;
+  /** Why the ping failed. */
+  readonly kind: PingFailure;
 
   constructor(options: { peerId: string; connId: number; cause: PingFailure }) {
     super(`Ping to ${options.peerId} failed: ${options.cause}`);
     this.name = "PingFailedError";
     this.peerId = options.peerId;
     this.connId = options.connId;
-    this.cause = options.cause;
+    this.kind = options.cause;
+  }
+}
+
+/**
+ * The peer's connection failed its first Identify, so it never became ready
+ * and was closed. `kind` is the `identifyFailed` event's `cause`. Rejects `waitPeerReady`; redial to try again.
+ */
+export class IdentifyFailedError extends PeerDisconnectedError {
+  /** The connection whose first Identify failed. */
+  readonly connId: number;
+  /** Why Identify failed. */
+  readonly kind: IdentifyFailure;
+
+  constructor(peerId: string, connId: number, kind: IdentifyFailure) {
+    super(peerId, "waitPeerReady", `Identify failed (${kind})`);
+    this.name = "IdentifyFailedError";
+    this.connId = connId;
+    this.kind = kind;
   }
 }
 
