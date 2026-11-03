@@ -234,6 +234,39 @@ pub enum MdnsFailureKind {
     Io,
 }
 
+/// Why a connection's first Identify exchange failed; see
+/// [`P2pEvent::IdentifyFailed`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum IdentifyFailure {
+    /// The exchange did not finish within the Identify deadline of the
+    /// connection establishing.
+    TimedOut,
+    /// The transport refused to open the Identify stream.
+    OpenFailed,
+    /// The peer refused Identify during protocol negotiation.
+    Rejected,
+    /// The stream was reset, or closed during negotiation, before the
+    /// peer's reply arrived.
+    ClosedEarly,
+    /// The peer's negotiation or Identify reply was malformed.
+    Malformed,
+}
+
+impl From<minip2p::IdentifyFailure> for IdentifyFailure {
+    fn from(cause: minip2p::IdentifyFailure) -> Self {
+        use minip2p::IdentifyFailure as Upstream;
+        match cause {
+            Upstream::TimedOut => Self::TimedOut,
+            Upstream::OpenFailed => Self::OpenFailed,
+            Upstream::Rejected => Self::Rejected,
+            Upstream::ClosedEarly => Self::ClosedEarly,
+            Upstream::Malformed => Self::Malformed,
+        }
+    }
+}
+
 /// Category of a fatal background-driver failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
@@ -685,6 +718,18 @@ pub enum P2pEvent {
         /// Additional violations folded into this event.
         suppressed: u32,
     },
+    /// The first Identify exchange on `conn_id` failed, so the connection
+    /// never becomes ready. The Endpoint closes it, so its
+    /// `ConnectionClosed` follows; redial to try again. A ready connection
+    /// never fails this way.
+    IdentifyFailed {
+        /// Remote peer.
+        peer_id: String,
+        /// The connection whose first Identify failed.
+        conn_id: u64,
+        /// Why it failed.
+        cause: IdentifyFailure,
+    },
 }
 
 /// Edge-triggered notification implemented by a binding shell.
@@ -741,6 +786,15 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
             rtt_ms,
+        },
+        EndpointEvent::IdentifyFailed {
+            peer_id,
+            conn_id,
+            cause,
+        } => P2pEvent::IdentifyFailed {
+            peer_id: peer_id.to_base58(),
+            conn_id: conn_id.as_u64(),
+            cause: cause.into(),
         },
         EndpointEvent::PingTimeout { peer_id, conn_id } => P2pEvent::PingTimeout {
             peer_id: peer_id.to_base58(),
@@ -1214,6 +1268,33 @@ mod tests {
                 conn_id: 18,
             })
         );
+    }
+
+    #[test]
+    fn identify_failed_carries_its_typed_cause() {
+        use minip2p::IdentifyFailure as Upstream;
+
+        let remote = peer(3);
+        for (upstream, cause) in [
+            (Upstream::TimedOut, IdentifyFailure::TimedOut),
+            (Upstream::OpenFailed, IdentifyFailure::OpenFailed),
+            (Upstream::Rejected, IdentifyFailure::Rejected),
+            (Upstream::ClosedEarly, IdentifyFailure::ClosedEarly),
+            (Upstream::Malformed, IdentifyFailure::Malformed),
+        ] {
+            assert_eq!(
+                convert_endpoint_event(EndpointEvent::IdentifyFailed {
+                    peer_id: remote.clone(),
+                    conn_id: ConnectionId::new(18),
+                    cause: upstream,
+                }),
+                Some(P2pEvent::IdentifyFailed {
+                    peer_id: remote.to_base58(),
+                    conn_id: 18,
+                    cause,
+                })
+            );
+        }
     }
 
     #[test]

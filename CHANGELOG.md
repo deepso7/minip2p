@@ -27,7 +27,8 @@ A connection whose first Identify exchange fails used to stay open and never bec
 - **The connection is then closed**; its `ConnectionClosed` reason is `ConnectionCloseReason::Error` naming Identify. Identify is not retried: redial to try again. A ready connection is never closed for Identify.
 - **`SwarmErrorKind::Identify` errors now carry the peer, connection, and stream.**
 - **The 10 s also bounds a provisional relayed connection**: a circuit whose peer never completes Identify is closed then, even inside a longer connect deadline.
-- **Foreign bindings (UniFFI, `@minip2p/web`, `@minip2p/node`) have no `IdentifyFailed` event yet.** They see the `connectionClosed` that follows, whose reason names Identify, so `waitPeerReady` rejects at once.
+- **The bindings carry it (#491)**: ffi-core's `P2pEvent::IdentifyFailed { peer_id, conn_id, cause }`, with a UniFFI and serde `IdentifyFailure` cause, reaches UniFFI, `@minip2p/node`, `@minip2p/web` and React Native as the TS SDK's `identifyFailed` event (`{ peerId, connId, cause }`, `cause` from `IdentifyFailure`), ahead of the `connectionClosed` that follows. Add an arm if you match `P2pEvent` exhaustively.
+- **`waitPeerReady` rejects with `IdentifyFailedError`** when the current connection's first Identify fails. It is a `PeerDisconnectedError`, so existing `instanceof` checks still match, and adds `connId` and `kind` (the `IdentifyFailure`).
 
 ### A failed Yamux session ends its streams with the connection close (#480)
 

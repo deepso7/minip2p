@@ -5,6 +5,7 @@ import {
   DiscoverySource,
   DriverFailureKind,
   EndpointErrorKind,
+  IdentifyFailure,
   MdnsFailureKind,
   NatErrorKind,
   Reachability,
@@ -89,6 +90,33 @@ describe("React Native enum values", () => {
       "Timeout",
       "Panic",
     ]);
+    endpoint.close();
+  });
+
+  test("an Identify failure reaches listeners with its SDK cause", async () => {
+    vi.useFakeTimers();
+    const endpoint = Minip2p.create({ secretKey: new Uint8Array(32) });
+    const fake = FakeNativeEndpoint.current();
+    const seen: unknown[] = [];
+    endpoint.on("identifyFailed", (event) => seen.push(event));
+    fake.enqueue(
+      [
+        {
+          inner: {
+            cause: IdentifyFailure.Malformed,
+            connId: 7n,
+            peerId: "peer",
+          },
+          tag: "IdentifyFailed",
+        },
+      ],
+      []
+    );
+
+    fake.ring();
+    await vi.runAllTimersAsync();
+
+    expect(seen).toEqual([{ cause: "Malformed", connId: 1, peerId: "peer" }]);
     endpoint.close();
   });
 
