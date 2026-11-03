@@ -1840,18 +1840,13 @@ mod tests {
         Bytes::from(bytes)
     }
 
-    /// A swarm serving `/app/1`, connected to a peer, whose transport has
-    /// already ended every stream it is asked to touch.
-    fn swarm_with_ended_targets(
-        peer: &PeerId,
-        ended: Ended,
-    ) -> SwarmCore<ScriptedTransport, SeqEntropy> {
+    /// A swarm serving `/app/1`, connected to a peer.
+    fn app_swarm(peer: &PeerId) -> SwarmCore<ScriptedTransport, SeqEntropy> {
         let mut transport = negotiating_transport(peer);
         transport.negotiate = false;
         let mut swarm = swarm_with(transport, SeqEntropy(1));
         swarm.add_protocol("/app/1").expect("protocol");
         swarm.poll(Now::from_millis(0)).expect("connect");
-        swarm.transport_mut().ended = Some(ended);
         swarm
     }
 
@@ -1896,10 +1891,11 @@ mod tests {
         ];
         for (action, batch) in scenarios {
             for (ended, terminal) in ended_targets(conn, stream_id) {
-                let mut swarm = swarm_with_ended_targets(&peer, ended);
+                let mut swarm = app_swarm(&peer);
                 let mut batch = batch.clone();
                 batch.push(terminal.clone());
                 swarm.transport_mut().initial = batch;
+                swarm.transport_mut().ended = Some(ended);
                 let events = swarm.poll(Now::from_millis(1)).expect("poll");
                 let error = ended(conn, stream_id);
                 assert!(
@@ -1917,8 +1913,8 @@ mod tests {
         }
     }
 
-    /// Like [`swarm_with_ended_targets`], but with an inbound `/app/1`
-    /// stream that negotiated before the transport ended it.
+    /// An [`app_swarm`] with an inbound `/app/1` stream that negotiated
+    /// before the transport ended it with `ended`.
     fn ended_user_stream(
         peer: &PeerId,
         ended: Ended,
@@ -1928,8 +1924,7 @@ mod tests {
         StreamId,
     ) {
         let (conn, stream_id) = (ConnectionId::new(1), StreamId::new(7));
-        let mut swarm = swarm_with_ended_targets(peer, ended);
-        swarm.transport_mut().ended = None;
+        let mut swarm = app_swarm(peer);
         swarm.transport_mut().initial = vec![
             TransportEvent::IncomingStream {
                 id: conn,
@@ -1972,6 +1967,29 @@ mod tests {
                 ended(conn, stream_id)
             );
         }
+    }
+
+    #[test]
+    fn a_write_side_close_the_transport_refuses_is_still_reported() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let (mut swarm, conn, stream_id) = ended_user_stream(&peer, |id, stream_id| {
+            TransportError::StreamCloseWriteFailed {
+                id,
+                stream_id,
+                reason: String::from("local stream write side is already closed"),
+            }
+        });
+        swarm
+            .close_stream_write(&peer, conn, stream_id, 2)
+            .expect("close");
+        let events = swarm.poll(Now::from_millis(3)).expect("poll");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::Error(error) if error.stream_id == Some(stream_id)
+            )),
+            "{events:?}"
+        );
     }
 
     #[test]

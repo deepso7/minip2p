@@ -143,7 +143,7 @@ impl RelayMachine {
             // bridge; any other failure (`Full` included) is a relay fault.
             match endpoint.send_stream(other_conn, other_stream, data) {
                 Ok(()) => {}
-                Err(error) if error.is_stream_gone() => {
+                Err(error) if other_half_is_gone(&error) => {
                     self.trace
                         .push(format!("forward to closing half failed: {error}"));
                     self.drop_stream(endpoint, &key);
@@ -477,4 +477,15 @@ impl Drop for RelayServer {
         }
         self.assert_healthy();
     }
+}
+
+/// Whether a forward failed only because the other bridge half's stream or
+/// connection is gone or closing, or its write side already ended (the peer
+/// stopped it, say).
+fn other_half_is_gone(error: &minip2p::Error) -> bool {
+    error.is_stream_gone()
+        || matches!(
+            error,
+            minip2p::Error::Transport(minip2p::TransportError::StreamSendFailed { .. })
+        )
 }

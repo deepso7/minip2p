@@ -4,6 +4,11 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### Stream actions on an ended stream are not errors (#494)
+
+- **QUIC `send_stream` and `close_stream_write` on a closing connection fail with `TransportError::ConnectionClosed`**, not `StreamSendFailed` / `StreamCloseWriteFailed` with a "connection is closing" reason. `Error::is_stream_gone()` is now true for them; match on that, not the old variants. Writing to or closing a write side that is already closed is still `StreamSendFailed` / `StreamCloseWriteFailed`.
+- **The swarm emits no `SwarmEvent::Error` for a send, write-side close, or reset it dispatches to a stream or connection that already ended** (`StreamNotFound`, `ConnectionNotFound`, `ConnectionClosed`). The `StreamClosed` or `ConnectionClosed` that follows reports the end.
+
 ### Configurable negotiation, Identify and ping deadlines (#475)
 
 The swarm's three protocol deadlines are now one `SwarmTimeouts { negotiation_ms, identify_ms, ping_ms }`, with the same 10 s defaults.
