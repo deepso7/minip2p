@@ -359,6 +359,19 @@ impl QuicConnection {
         )
     }
 
+    /// A closing connection takes no more writes: it fails them with the
+    /// terminal [`TransportError::ConnectionClosed`], whose `Closed` event
+    /// reports the end.
+    fn reject_if_closing(&self) -> Result<(), TransportError> {
+        if self.is_closing() {
+            return Err(TransportError::ConnectionClosed {
+                id: self.id,
+                reason: self.close_reason().to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// The engine's next timeout, as of the last service.
     pub(crate) fn timeout(&self) -> Option<Instant> {
         self.timeout
@@ -1136,17 +1149,13 @@ impl QuicConnection {
             return Ok(());
         }
         let raw = stream_id.as_u64();
-        let closing = self.is_closing();
+        self.reject_if_closing()?;
         let state = self.stream_state_mut(stream_id)?;
-        if closing || state.local_write_closed {
+        if state.local_write_closed {
             return Err(TransportError::StreamSendFailed {
                 id: self.id,
                 stream_id,
-                reason: if closing {
-                    "connection is closing".into()
-                } else {
-                    "local stream write side is already closed".into()
-                },
+                reason: "local stream write side is already closed".into(),
             });
         }
         let control = state.control;
@@ -1245,17 +1254,13 @@ impl QuicConnection {
     /// Queues the stream's FIN behind its queued writes. A closing
     /// connection has reset every send half, so there is nothing to finish.
     pub(crate) fn close_stream_write(&mut self, stream_id: StreamId) -> Result<(), TransportError> {
-        let closing = self.is_closing();
+        self.reject_if_closing()?;
         let state = self.stream_state_mut(stream_id)?;
-        if closing || state.local_write_closed {
+        if state.local_write_closed {
             return Err(TransportError::StreamCloseWriteFailed {
                 id: self.id,
                 stream_id,
-                reason: if closing {
-                    "connection is closing".into()
-                } else {
-                    "local stream write side is already closed".into()
-                },
+                reason: "local stream write side is already closed".into(),
             });
         }
         state.local_write_closed = true;
