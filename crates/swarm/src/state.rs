@@ -2880,8 +2880,11 @@ impl SwarmState {
                         || self.fail_ping_stream(&target, conn_id, PingFailure::Rejected) =>
                 {
                     self.outbound_negotiators.remove(&key);
-                    self.actions
-                        .push_back(Action::ResetStream { conn_id, stream_id });
+                    // A failed ping already queued this stream's reset.
+                    if self.reset_pending.insert((conn_id, stream_id)) {
+                        self.actions
+                            .push_back(Action::ResetStream { conn_id, stream_id });
+                    }
                     return 0;
                 }
                 other => {
@@ -7529,6 +7532,21 @@ mod tests {
                     }))
                 )),
                 "{how:?}: PingFailed is the report: {outputs:?}"
+            );
+            let mut resets: Vec<_> = outputs
+                .iter()
+                .filter_map(|output| match output {
+                    Output::Action(Action::ResetStream { stream_id, .. }) => Some(*stream_id),
+                    _ => None,
+                })
+                .collect();
+            let all = resets.len();
+            resets.sort_unstable();
+            resets.dedup();
+            assert_eq!(
+                resets.len(),
+                all,
+                "{how:?}: one reset per stream: {outputs:?}"
             );
             assert!(core.pending_pings.is_empty(), "{how:?}: payload cleared");
             assert!(
