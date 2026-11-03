@@ -374,9 +374,7 @@ pub enum SwarmError {
     ReservedProtocol { protocol_id: String },
     /// A [`crate::SwarmTimeouts`] deadline was zero, which would expire
     /// everything it bounds at once.
-    #[error(
-        "the `{field}` deadline is 0 ms; set it above zero, or omit it to keep the 10 s default"
-    )]
+    #[error("the `{field}` deadline is 0 ms; set it above zero, or omit it to keep its default")]
     ZeroTimeout {
         /// The [`crate::SwarmTimeouts`] field, such as `"identify_ms"`.
         field: &'static str,

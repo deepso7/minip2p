@@ -2876,7 +2876,8 @@ impl SwarmState {
                     return 0;
                 }
                 MultistreamOutput::ProtocolError { .. }
-                    if self.fail_identify_stream(&target, conn_id, IdentifyFailure::Malformed) =>
+                    if self.fail_identify_stream(&target, conn_id, IdentifyFailure::Malformed)
+                        || self.fail_ping_stream(&target, conn_id, PingFailure::Rejected) =>
                 {
                     self.outbound_negotiators.remove(&key);
                     self.actions
@@ -7337,6 +7338,8 @@ mod tests {
         OpenFails,
         /// The peer answers `na` to `/ipfs/ping/1.0.0`.
         Rejected,
+        /// The peer answers with malformed multistream framing.
+        BadNegotiation,
         /// The peer resets the stream mid-negotiation.
         ClosedNegotiating,
         /// The peer closes its write side mid-negotiation.
@@ -7421,7 +7424,10 @@ mod tests {
                 core.open_failed(conn, PING_PROTOCOL_ID, "stream limit reached");
                 0
             }
-            PingBreak::Rejected | PingBreak::ClosedNegotiating | PingBreak::FinNegotiating => {
+            PingBreak::Rejected
+            | PingBreak::BadNegotiation
+            | PingBreak::ClosedNegotiating
+            | PingBreak::FinNegotiating => {
                 setup_outbound_ping_stream(&mut core, &peer, conn, negotiated);
                 at(&mut core, reset(negotiated), 0);
                 open_fresh(&mut core, 0);
@@ -7434,6 +7440,16 @@ mod tests {
                             id: conn,
                             stream_id: fresh,
                             data: Bytes::from(na),
+                        },
+                        3_000,
+                    );
+                } else if let PingBreak::BadNegotiation = how {
+                    at(
+                        &mut core,
+                        TransportEvent::StreamData {
+                            id: conn,
+                            stream_id: fresh,
+                            data: Bytes::from_static(b"\x05nope\n"),
                         },
                         3_000,
                     );
@@ -7473,6 +7489,7 @@ mod tests {
             (EchoSilent, PingFailure::TimedOut),
             (OpenFails, PingFailure::OpenFailed),
             (Rejected, PingFailure::Rejected),
+            (BadNegotiation, PingFailure::Rejected),
             (ClosedNegotiating, PingFailure::StreamClosed),
             (FinNegotiating, PingFailure::StreamClosed),
             (ClosedInFlight, PingFailure::StreamClosed),
@@ -7506,7 +7523,8 @@ mod tests {
                     output,
                     Output::Event(SwarmEvent::Error(SwarmRuntimeError {
                         kind: SwarmErrorKind::OpenStreamFailed
-                            | SwarmErrorKind::UnsupportedProtocol,
+                            | SwarmErrorKind::UnsupportedProtocol
+                            | SwarmErrorKind::Multistream,
                         ..
                     }))
                 )),
