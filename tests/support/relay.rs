@@ -22,7 +22,6 @@ use std::time::Duration;
 
 use minip2p::{
     ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId, StreamId,
-    TransportError,
 };
 use minip2p_relay::{FrameDecode, HOP_PROTOCOL_ID, HopMessage, HopMessageType, STOP_PROTOCOL_ID};
 use minip2p_test_support::{ConnectRequestOutcome, PendingConnectId, RelayEmulator};
@@ -481,16 +480,12 @@ impl Drop for RelayServer {
 }
 
 /// Whether a forward failed only because the other bridge half's stream or
-/// connection is already gone or closing.
+/// connection is gone or closing, or its write side already ended (the peer
+/// stopped it, say).
 fn other_half_is_gone(error: &minip2p::Error) -> bool {
-    matches!(
-        error,
-        minip2p::Error::Transport(
-            TransportError::StreamSendFailed { .. }
-                | TransportError::ConnectionNotFound { .. }
-                | TransportError::StreamNotFound { .. }
-        ) | minip2p::Error::Swarm(
-            minip2p::SwarmError::StreamNotFound { .. } | minip2p::SwarmError::NotConnected { .. }
+    error.is_stream_gone()
+        || matches!(
+            error,
+            minip2p::Error::Transport(minip2p::TransportError::StreamSendFailed { .. })
         )
-    )
 }
