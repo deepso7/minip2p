@@ -832,6 +832,23 @@ test("ping rejects promptly with the native PingFailed cause", async () => {
   endpoint.close();
 });
 
+test("waitPeerReady's default stays within the timer limit for a huge identifyMs", async () => {
+  vi.useFakeTimers();
+  try {
+    const backend = new MockBackend();
+    const endpoint = new TestMinip2p(backend, {
+      timeouts: { identifyMs: 2_147_483_647 },
+    });
+    const ready = endpoint.waitPeerReady("peer");
+    ready.catch(() => {});
+    await vi.advanceTimersByTimeAsync(10_000);
+    assert.equal(await remainsPending(ready), true);
+    endpoint.close();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("waitPeerReady by default allows the connect and Identify deadlines", async () => {
   vi.useFakeTimers();
   try {

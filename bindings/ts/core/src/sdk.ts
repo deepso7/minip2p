@@ -67,6 +67,8 @@ const CONNECT_DEADLINE_MS = 30_000;
 const IDENTIFY_DEADLINE_MS = 30_000;
 /** Margin a readiness wait keeps past the native deadlines. */
 const READY_SLACK_MS = 5000;
+/** The longest delay `setTimeout` honours; longer ones fire at once. */
+const MAX_TIMER_MS = 2_147_483_647;
 /**
  * Default close drain: the Rust `minip2p::DEFAULT_CLOSE_TIMEOUT` (500 ms)
  * that `Endpoint::close` and native's `DEFAULT_STOP_TIMEOUT_MS` use.
@@ -1163,10 +1165,12 @@ export class Minip2pBase {
   ) {
     this.#backend = backend;
     this.#relayAddrs = config.relays ?? [];
-    this.#readyTimeoutMs =
+    this.#readyTimeoutMs = Math.min(
       CONNECT_DEADLINE_MS +
-      (config.timeouts?.identifyMs ?? IDENTIFY_DEADLINE_MS) +
-      READY_SLACK_MS;
+        (config.timeouts?.identifyMs ?? IDENTIFY_DEADLINE_MS) +
+        READY_SLACK_MS,
+      MAX_TIMER_MS
+    );
     try {
       backend.start((event) => {
         this.#enqueueNative(event);
