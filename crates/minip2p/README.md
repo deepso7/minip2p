@@ -242,7 +242,7 @@ How they should relate:
 - **Identify and ping cover their own negotiation.** The negotiation deadline does not apply to their streams, so raising `identify_ms` or `ping_ms` alone is enough when their negotiation is the slow part.
 - **Connect ≥ transport handshake.** A connect deadline shorter than the handshake gives up on a dial that could still authenticate. Identify starts after a direct connect settles, so a host waiting for `PeerReady` should allow about connect + Identify, as the TypeScript SDK's `waitPeerReady` does by default. A provisional relayed circuit (with `dcutr`) runs Identify inside the connect attempt instead, so there the Identify deadline can end it first: on a slow relayed link, raise both.
 - **Ping and reservation keepalives below the idle timeout**, so an idle QUIC connection is kept alive rather than timed out.
-- **Slow or loaded links.** A negotiation costs two to three round trips and a TCP connect about eight. Once the loaded RTT is above a few seconds, raise negotiation and Identify together (say to 5 × RTT), and with them the connect deadline and, on TCP, `TcpConfig::handshake_timeout_ms`: it caps the Noise + Yamux upgrade on its own, so a raised connect deadline does not lift it. In the v0.11.2 netem retests at 64 kbit/s and 400 ms under load, TCP still failed its handshake at the 30 s default with the other deadlines raised. Automatic RTT scaling is tracked in #483.
+- **Slow or loaded links.** A negotiation costs two to three round trips and a TCP connect about eight. Once the loaded RTT is above a few seconds, raise the negotiation, Identify and ping deadlines (say to 5 × RTT), and with them the connect deadline and, on TCP, `TcpConfig::handshake_timeout_ms`: it caps the Noise + Yamux upgrade on its own, so a raised connect deadline does not lift it. In the v0.11.2 netem retests at 64 kbit/s and 400 ms under load, TCP still failed its handshake at the 30 s default with the other deadlines raised. Automatic RTT scaling is tracked in #483.
 
 For a link whose loaded RTT reaches about 6 s, set every value explicitly rather than leaning on a default:
 
@@ -254,7 +254,7 @@ let endpoint = Endpoint::builder()
     .listen_on("/ip4/0.0.0.0/tcp/0")?
     .timeouts(SwarmTimeouts {
         negotiation_ms: 30_000, // 5 × RTT
-        identify_ms: 60_000,    // ≥ negotiation: Identify includes one
+        identify_ms: 60_000,    // covers its own negotiation and reply
         ping_ms: 30_000,
     })
     .tcp_config(TcpConfig {

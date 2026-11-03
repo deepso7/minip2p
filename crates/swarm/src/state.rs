@@ -458,7 +458,8 @@ pub(crate) struct SwarmState {
     /// ([`SwarmTimeouts::ping_ms`] from the `ping` call). It covers the
     /// whole attempt: the open, the negotiation and the echo. An entry is
     /// removed exactly when the attempt ends: by `PingRttMeasured`, by
-    /// `PingFailed` ([`Self::fail_ping`]), or silently with its connection.
+    /// `PingFailed` (mostly [`Self::fail_ping`]), or silently with its
+    /// connection.
     ping_deadlines: BTreeMap<PeerId, u64>,
     /// The protocol deadlines; `ping_ms` computes `ping_deadlines` entries.
     timeouts: SwarmTimeouts,
@@ -1512,13 +1513,14 @@ impl SwarmState {
                 // Outbound stream ids come back synchronously from
                 // `Transport::open_stream` (see `start_outbound`); this marks
                 // the stream as actually opened, which starts its deadline.
-                let deadline_ms = now_ms.saturating_add(self.timeouts.negotiation_ms);
-                let covered = |target: &ProtocolKind| self.has_own_deadline(id, target);
-                if let Some(pending) = self.outbound_negotiators.get(&(id, stream_id))
-                    && !covered(&pending.target)
+                let covered = self
+                    .outbound_negotiators
+                    .get(&(id, stream_id))
+                    .is_some_and(|pending| self.has_own_deadline(id, &pending.target));
+                if !covered
                     && let Some(pending) = self.outbound_negotiators.get_mut(&(id, stream_id))
                 {
-                    pending.deadline_ms = Some(deadline_ms);
+                    pending.deadline_ms = Some(now_ms.saturating_add(self.timeouts.negotiation_ms));
                 }
             }
             TransportEvent::StreamData {

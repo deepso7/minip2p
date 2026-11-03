@@ -762,7 +762,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     }
 
     /// Overrides the negotiation, first-Identify and ping deadlines
-    /// (default [`SwarmTimeouts::default`], 10 s each). A zero deadline
+    /// (default [`SwarmTimeouts::default`]: 10 s, 30 s and 10 s). A zero deadline
     /// fails the build with [`SwarmError::ZeroTimeout`]. See the crate
     /// README's deadline table for how they relate to the connect deadline.
     pub fn timeouts(mut self, timeouts: SwarmTimeouts) -> Self {

@@ -147,7 +147,7 @@ pub struct NodeTimeoutsOptions {
     pub negotiation_ms: Option<BigInt>,
     /// How long a connection's first Identify may take, in ms.
     pub identify_ms: Option<BigInt>,
-    /// How long a ping waits for its echo, in ms.
+    /// How long a ping may take (open, negotiation and echo), in ms.
     pub ping_ms: Option<BigInt>,
 }
 

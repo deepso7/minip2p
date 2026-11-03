@@ -227,7 +227,7 @@ export interface NodeTimeoutsOptions {
   negotiationMs?: bigint
   /** How long a connection's first Identify may take, in ms. */
   identifyMs?: bigint
-  /** How long a ping waits for its echo, in ms. */
+  /** How long a ping may take (open, negotiation and echo), in ms. */
   pingMs?: bigint
 }
 

@@ -16,7 +16,8 @@ const endpoint = Minip2p.create({
 
 try {
   const connected = await endpoint.connect(address, { timeoutMs: 10_000 });
-  await endpoint.waitPeerReady(connected.peerId, { timeoutMs: 10_000 });
+  // The default timeout allows for the full Identify deadline.
+  await endpoint.waitPeerReady(connected.peerId);
   const rttMs = await endpoint.ping(connected.peerId, { timeoutMs: 5000 });
 
   console.log(`Connected to ${connected.peerId} over ${connected.path.kind}`);

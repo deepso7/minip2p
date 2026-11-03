@@ -33,8 +33,8 @@ const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 /// - `protocolVersion = "minip2p/0.1.0"`
 /// - `agentVersion = "minip2p/0.1.0"`
 /// - Supported protocols: `/ipfs/id/1.0.0` and `/ipfs/ping/1.0.0`
-/// - Deadlines: [`SwarmTimeouts::default`] (10 s each for negotiation,
-///   first Identify and ping)
+/// - Deadlines: [`SwarmTimeouts::default`] (10 s for negotiation and ping,
+///   30 s for the first Identify)
 /// - Simultaneous-dial window: [`crate::SIMULTANEOUS_DIAL_WINDOW_MS`]
 ///
 /// Use the setter methods to override. Call

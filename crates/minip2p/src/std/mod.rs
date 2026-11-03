@@ -1343,7 +1343,7 @@ impl EndpointBuilder {
     }
 
     /// Overrides the negotiation, first-Identify and ping deadlines
-    /// (default [`SwarmTimeouts::default`], 10 s each). A zero deadline
+    /// (default [`SwarmTimeouts::default`]: 10 s, 30 s and 10 s). A zero deadline
     /// fails [`bind`](Self::bind) with [`SwarmError::ZeroTimeout`] before any
     /// socket is bound. See the crate README's deadline table for how they
     /// relate to the connect deadline and the transports' own deadlines.
@@ -1413,7 +1413,7 @@ impl EndpointBuilder {
     ///     .listen_on("/ip4/0.0.0.0/tcp/0")?
     ///     .timeouts(SwarmTimeouts {
     ///         negotiation_ms: 30_000, // 5 × RTT
-    ///         identify_ms: 60_000,    // ≥ negotiation: Identify includes one
+    ///         identify_ms: 60_000,    // covers its own negotiation and reply
     ///         ping_ms: 30_000,
     ///     })
     ///     .tcp_config(TcpConfig {
