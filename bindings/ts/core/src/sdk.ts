@@ -1522,13 +1522,19 @@ export class Minip2pBase {
       signal: controller.signal,
     }).then(({ protocols }) => ({ peerId, protocols }));
     // The failed connection may already be gone natively, so a failure
-    // counts unless the peer has since moved to another connection.
+    // counts if it names the peer's current connection or, once native has
+    // none, the last one this wait knew.
+    let knownConnId = info?.connId;
     const identifyFailed = this.waitFor("identifyFailed", {
       ...options,
-      predicate: (event) =>
-        event.peerId === peerId &&
-        (this.#backend.connectionInfo(peerId)?.connId ?? event.connId) ===
-          event.connId,
+      predicate: (event) => {
+        if (event.peerId !== peerId) {
+          return false;
+        }
+        knownConnId =
+          this.#backend.connectionInfo(peerId)?.connId ?? knownConnId;
+        return (knownConnId ?? event.connId) === event.connId;
+      },
       signal: controller.signal,
     }).then(({ connId, cause }) => {
       throw new IdentifyFailedError(peerId, connId, cause);

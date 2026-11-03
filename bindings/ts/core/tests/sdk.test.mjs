@@ -2007,6 +2007,28 @@ test("waitPeerReady rejects with the current connection's Identify cause", async
   endpoint.close();
 });
 
+test("waitPeerReady ignores an older connection's failure once native forgot the peer", async () => {
+  const backend = new MockBackend();
+  backend.connected = ["peer"];
+  backend.connections.set("peer", connectionOn(2));
+  const endpoint = new TestMinip2p(backend);
+  const waiting = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
+
+  // Connection 2 closed natively; connection 1's failure is still queued.
+  backend.connected = [];
+  backend.connections.delete("peer");
+  backend.emit(identifyFailed(1));
+  assert.equal(await remainsPending(waiting), true);
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", reason: LOCAL_CLOSE },
+    tag: P2pEvent_Tags.ConnectionClosed,
+  });
+  const error = await waiting.catch((error_) => error_);
+  assert.ok(error instanceof PeerDisconnectedError);
+  assert.ok(!(error instanceof IdentifyFailedError));
+  endpoint.close();
+});
+
 test("connection replacement ends only the old connection's streams and opens", async () => {
   const backend = new MockBackend();
   backend.connected = ["peer"];
