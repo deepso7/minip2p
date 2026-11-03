@@ -1581,7 +1581,9 @@ export class Minip2pBase {
    * running attempt, including one whose earlier callers timed out or
    * aborted, until it ends. Rejects with {@link PingFailedError} when the native ping fails (its
    * `pingMs` deadline covers the open, negotiation and echo), and with
-   * {@link PeerDisconnectedError} when the connection closes first.
+   * {@link PeerDisconnectedError} when the connection closes first, or with
+   * {@link EventQueueOverflowError} when events are lost and its result may
+   * be among them.
    */
   ping(peerId: string, options: OpOptions = {}): Promise<number> {
     this.#assertOpen();
@@ -2005,6 +2007,12 @@ export class Minip2pBase {
     }
     if (event.tag === P2pEvent_Tags.EventsDropped) {
       this.#connectResultsLost(event.inner.terminalConnectIds);
+      // A ping's result may be among the lost events, and a ping kept
+      // without it would never settle, so end every pending ping.
+      for (const ping of this.#pings.values()) {
+        ping.cancel(new EventQueueOverflowError());
+      }
+      this.#pings.clear();
     }
 
     const normalized = normalizeEvent(event);

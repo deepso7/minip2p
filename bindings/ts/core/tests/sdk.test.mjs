@@ -745,6 +745,30 @@ test("EventsDropped settles pending connect results with a lost error", async ()
   endpoint.close();
 });
 
+test("native EventsDropped ends a pending ping so the next ping starts afresh", async () => {
+  const backend = new MockBackend();
+  backend.connected = ["peer"];
+  const endpoint = new TestMinip2p(backend);
+  const first = endpoint.ping("peer", { timeoutMs: 0 });
+
+  // Its result may be among the lost events, so it can never settle.
+  backend.emit({
+    inner: { dropped: 1, terminalConnectIds: [], totalDropped: 1 },
+    tag: P2pEvent_Tags.EventsDropped,
+  });
+  await tick();
+  await assert.rejects(first, EventQueueOverflowError);
+
+  const second = endpoint.ping("peer", { timeoutMs: 0 });
+  assert.equal(backend.pingCalls, 2, "a fresh native ping");
+  backend.emit({
+    inner: { connId: 1, peerId: "peer", rttMs: 7 },
+    tag: P2pEvent_Tags.PingRttMeasured,
+  });
+  assert.equal(await second, 7);
+  endpoint.close();
+});
+
 test("EventsDropped stores a lost terminal for results not yet awaited", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
