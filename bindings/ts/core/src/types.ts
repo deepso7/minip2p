@@ -133,8 +133,10 @@ export interface Minip2pTimeouts {
   /** How long an outbound stream may negotiate its protocol. */
   readonly negotiationMs?: number;
   /**
-   * How long a connection's first Identify (open, negotiation, reply) may take
-   * before it is closed. `waitPeerReady`'s default timeout allows for it.
+   * How long a connection's first Identify (open, negotiation, reply) may
+   * take. A first Identify that fails or runs out this deadline closes the
+   * connection with `identifyFailed`; later Identify exchanges are not bound
+   * by it. `waitPeerReady`'s default timeout allows for it.
    */
   readonly identifyMs?: number;
   /** How long a ping may take: opening its stream, negotiating it and the echo. */

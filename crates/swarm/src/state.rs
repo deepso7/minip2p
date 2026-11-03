@@ -7525,6 +7525,54 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_after_a_bad_echo_opens_a_fresh_stream() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(PING_PEER);
+        let conn = ConnectionId::new(92);
+        let stream = StreamId::new(4);
+        setup_outbound_ping_stream(&mut core, &peer, conn, stream);
+        core.ping(&peer, [2; PING_PAYLOAD_LEN], 0).expect("ping");
+        let _ = drain_actions(&mut core);
+
+        core.handle_transport_event(
+            TransportEvent::StreamData {
+                id: conn,
+                stream_id: stream,
+                data: Bytes::from(vec![9; PING_PAYLOAD_LEN]),
+            },
+            1_000,
+        );
+        let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+        assert_eq!(
+            ping_results(&outputs),
+            [(conn, Some(PingFailure::StreamClosed))],
+            "{outputs:?}"
+        );
+
+        // Before the transport reports the reset stream closed.
+        core.ping(&peer, [3; PING_PAYLOAD_LEN], 1_000)
+            .expect("retry");
+        let actions = drain_actions(&mut core);
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::OpenStream {
+                    target: ProtocolKind::Ping,
+                    ..
+                }
+            )),
+            "{actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::SendStream { stream_id, .. } if *stream_id == stream
+            )),
+            "the reset stream is not reused: {actions:?}"
+        );
+    }
+
+    #[test]
     fn a_ping_stream_has_no_negotiation_deadline_of_its_own() {
         let mut core = SwarmState::new(
             IdentifyConfig {

@@ -36,7 +36,7 @@ In another terminal, change to `examples/nodejs` and pass one of the printed add
 pnpm run ping /ip4/127.0.0.1/udp/54321/quic-v1/p2p/12D3KooW...
 ```
 
-Replace the entire address above with the listener's output. Use its TCP address to try TCP. The client prints the connected peer and Ping time, then exits. Connection and Identify waits each time out after 10 seconds; Ping times out after 5 seconds.
+Replace the entire address above with the listener's output. Use its TCP address to try TCP. The client prints the connected peer and Ping time, then exits. The connection wait times out after 10 seconds; the Identify wait uses `waitPeerReady`'s default, which allows the full Identify deadline (30 seconds by default); Ping times out after 5 seconds.
 
 Press Ctrl+C in the listener terminal to close its endpoint and exit.
 

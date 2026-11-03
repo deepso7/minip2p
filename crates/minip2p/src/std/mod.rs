@@ -484,7 +484,8 @@ impl Endpoint {
 
     /// Sends a ping to `peer_id`.
     ///
-    /// The attempt ends in one [`EndpointEvent::PingRttMeasured`] or
+    /// Once the call returns `Ok`, the attempt ends in one
+    /// [`EndpointEvent::PingRttMeasured`] or
     /// [`EndpointEvent::PingFailed`], unless the connection closes first. Its
     /// deadline (`SwarmTimeouts::ping_ms`) covers opening and negotiating the
     /// ping stream as well as the echo.

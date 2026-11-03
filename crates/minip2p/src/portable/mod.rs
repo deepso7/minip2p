@@ -382,9 +382,11 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         self.engine.set_external_addresses(addresses);
     }
 
-    /// Requests a ping using the caller's time sample. It ends in one
-    /// [`EndpointEvent::PingRttMeasured`] or [`EndpointEvent::PingFailed`],
-    /// unless the connection closes first.
+    /// Requests a ping using the caller's time sample. Once accepted (`Ok`),
+    /// it ends in one [`EndpointEvent::PingRttMeasured`] or
+    /// [`EndpointEvent::PingFailed`], unless the connection closes first. Its
+    /// deadline (`SwarmTimeouts::ping_ms`) covers opening and negotiating the
+    /// ping stream as well as the echo.
     pub fn ping(&mut self, peer_id: &PeerId, now: Now) -> Result<(), DriverError> {
         self.engine.core.ping(peer_id, now.monotonic_ms)
     }

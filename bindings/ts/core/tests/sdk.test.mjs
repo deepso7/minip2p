@@ -858,14 +858,22 @@ test("waitPeerReady by default allows the connect and Identify deadlines", async
   }
 });
 
-test("ping coalescing recovers after its last waiter leaves and rejects on teardown", async () => {
+test("a ping retry after a caller timeout joins the running attempt", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
   await assert.rejects(endpoint.ping("peer", { timeoutMs: 1 }), TimeoutError);
-  const retry = endpoint.ping("peer", { timeoutMs: 1000 });
-  assert.equal(backend.pingCalls, 2);
+  const retry = endpoint.ping("peer", { timeoutMs: 0 });
+  assert.equal(backend.pingCalls, 1, "the native attempt is still running");
+  backend.emit({
+    inner: { cause: PingFailure.TimedOut, connId: 1, peerId: "peer" },
+    tag: P2pEvent_Tags.PingFailed,
+  });
+  await assert.rejects(retry, PingFailedError);
+
+  const next = endpoint.ping("peer", { timeoutMs: 0 });
+  assert.equal(backend.pingCalls, 2, "a new attempt once the old one ended");
   endpoint.close();
-  await assert.rejects(retry, ClosedError);
+  await assert.rejects(next, ClosedError);
 });
 
 test("queue overflow rejects uncorrelated waits and exactly the lost connects", async () => {

@@ -119,7 +119,7 @@ Promise operations use `{ timeoutMs?, signal? }`. Their default timeout is 65 se
 | `connect(target, options?)` | First usable path to a `ConnectTarget`: a peer ID, one complete peer address, or a list of complete addresses naming one peer. |
 | `startConnect(target)` / `waitConnectResult(connectId, options?)` | Split-phase connection flow using a `connectId`. |
 | `cancelConnect(connectId)` | Cancel an attempt; its terminal event settles any pending wait. |
-| `waitPeerReady(peerId, options?)` | Peer ID and advertised protocol list once the peer's current connection completes Identify. A `peerReady` for a replaced connection does not resolve it; a failed first Identify on the current connection rejects it with `IdentifyFailedError`. Its default timeout allows a connect plus `timeouts.identifyMs` (65 s with the defaults). |
+| `waitPeerReady(peerId, options?)` | Peer ID and advertised protocol list once the peer's current connection completes Identify. A `peerReady` for a replaced connection does not resolve it; a failed first Identify on the current connection rejects it with `IdentifyFailedError`. Its default timeout is a connect (30 s) plus `timeouts.identifyMs` plus 5 s of slack (65 s with the defaults). |
 | `ping(peerId, options?)` | RTT in milliseconds. Rejects with `PingFailedError` when the native ping fails. |
 | `openStream(peerId, protocol, options?)` | Negotiated `Stream`. |
 | `disconnect(peerId)` | Close the active peer connection. |

@@ -104,13 +104,17 @@ pub enum SwarmEvent {
         conn_id: ConnectionId,
         rtt_ms: u64,
     },
-    /// A ping attempt on `conn_id` ended without an echo, for `cause`.
+    /// A ping attempt on `conn_id` ended without a matching echo, for
+    /// `cause`.
     ///
     /// Every accepted [`ping`](crate::SwarmCore::ping) ends in exactly one
     /// [`PingRttMeasured`](Self::PingRttMeasured) or `PingFailed`, unless
     /// the connection closes first, which ends it with
-    /// [`ConnectionClosed`](Self::ConnectionClosed). The connection stays
-    /// open; the next ping opens a fresh stream if this one was lost.
+    /// [`ConnectionClosed`](Self::ConnectionClosed). The failure does not
+    /// close the connection, and the next ping opens a fresh stream if this
+    /// one was lost. The exception is a replacement: a ping already overdue
+    /// when its connection is replaced fails on the old connection, which is
+    /// retired, and the next ping goes to the new one.
     PingFailed {
         peer_id: PeerId,
         conn_id: ConnectionId,
@@ -297,7 +301,7 @@ impl core::fmt::Display for PingFailure {
             Self::TimedOut => "ping timed out",
             Self::OpenFailed => "ping stream failed to open",
             Self::Rejected => "ping rejected by the peer",
-            Self::StreamClosed => "ping stream closed before the echo",
+            Self::StreamClosed => "ping stream closed or carried a bad echo",
         })
     }
 }

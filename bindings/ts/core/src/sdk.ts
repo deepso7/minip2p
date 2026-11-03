@@ -163,7 +163,6 @@ type StreamReceiveState =
 interface PingOperation {
   readonly promise: Promise<number>;
   readonly cancel: (error: unknown) => void;
-  callers: number;
 }
 
 class BoundedQueue<Item> {
@@ -1574,8 +1573,9 @@ export class Minip2pBase {
   }
 
   /**
-   * Measures round-trip latency in milliseconds, coalescing concurrent calls.
-   * Rejects with {@link PingFailedError} when the native ping fails (its
+   * Measures round-trip latency in milliseconds. Calls join the peer's
+   * running attempt, including one whose earlier callers timed out or
+   * aborted, until it ends. Rejects with {@link PingFailedError} when the native ping fails (its
    * `pingMs` deadline covers the open, negotiation and echo), and with
    * {@link PeerDisconnectedError} when the connection closes first.
    */
@@ -1583,24 +1583,21 @@ export class Minip2pBase {
     this.#assertOpen();
     let operation = this.#pings.get(peerId);
     if (operation === undefined) {
+      // Native events are flushed asynchronously, so none can arrive before
+      // the operation below listens.
+      this.#backend.ping(peerId);
       operation = this.#runPing(peerId);
+      // Kept until its terminal event, even after every caller stops
+      // waiting: a later call joins the native attempt still running, so an
+      // older attempt's result never settles a newer one.
       this.#pings.set(peerId, operation);
       const current = operation;
       void operation.promise.then(
         () => this.#removePing(peerId, current),
         () => this.#removePing(peerId, current)
       );
-      this.#backend.ping(peerId);
     }
-    operation.callers += 1;
-    const current = operation;
-    return withOptions(operation.promise, options).finally(() => {
-      current.callers -= 1;
-      if (current.callers === 0 && this.#pings.get(peerId) === current) {
-        current.cancel(new AbortError("No ping callers remain"));
-        this.#pings.delete(peerId);
-      }
-    });
+    return withOptions(operation.promise, options);
   }
 
   /** Opens and negotiates an application-protocol stream. */
@@ -1830,7 +1827,6 @@ export class Minip2pBase {
       };
     });
     return {
-      callers: 0,
       cancel: (error) => {
         if (!settled) {
           settled = true;

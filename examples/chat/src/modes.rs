@@ -245,6 +245,10 @@ pub fn run_join(
             EndpointWaitOutcome::Event(event) => {
                 host_subscribed |= is_topic_subscription(&event, &host_peer, &topic);
                 handle_event(&endpoint, "join", None, event);
+                // A failed first Identify closes the connection.
+                if endpoint.connection_id(&host_peer).is_none() {
+                    return Err("the connection closed before identify completed".into());
+                }
             }
             EndpointWaitOutcome::Deadline => {
                 return Err("identify never completed on the selected connection".into());
