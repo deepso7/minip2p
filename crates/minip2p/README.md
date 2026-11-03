@@ -242,7 +242,30 @@ How they should relate:
 - **Identify ≥ negotiation.** The first Identify includes a negotiation, so an Identify deadline below the negotiation one cuts it short.
 - **Connect ≥ transport handshake.** A connect deadline shorter than the handshake gives up on a dial that could still authenticate. Identify starts after a direct connect settles, so a host waiting for `PeerReady` should allow about connect + Identify. A provisional relayed circuit (with `dcutr`) runs Identify inside the connect attempt instead, so there the Identify deadline can end it first: on a slow relayed link, raise both.
 - **Ping and reservation keepalives below the idle timeout**, so an idle QUIC connection is kept alive rather than timed out.
-- **Slow or loaded links.** A negotiation costs two to three round trips and a TCP connect about eight. Once the loaded RTT is above a few seconds, raise negotiation and Identify together (say to 5 × RTT), and the connect deadline with them. Automatic RTT scaling is tracked in #483.
+- **Slow or loaded links.** A negotiation costs two to three round trips and a TCP connect about eight. Once the loaded RTT is above a few seconds, raise negotiation and Identify together (say to 5 × RTT), and with them the connect deadline and, on TCP, `TcpConfig::handshake_timeout_ms`: it caps the Noise + Yamux upgrade on its own, so a raised connect deadline does not lift it. In the v0.11.2 netem retests at 64 kbit/s and 400 ms under load, TCP still failed its handshake at the 30 s default with the other deadlines raised. Automatic RTT scaling is tracked in #483.
+
+For a link whose loaded RTT reaches about 6 s, set every value explicitly rather than leaning on a default:
+
+```rust,ignore
+use std::time::Duration;
+use minip2p::{Endpoint, SwarmTimeouts, TcpConfig};
+
+let endpoint = Endpoint::builder()
+    .listen_on("/ip4/0.0.0.0/tcp/0")?
+    .timeouts(SwarmTimeouts {
+        negotiation_ms: 30_000, // 5 × RTT
+        identify_ms: 60_000,    // ≥ negotiation: Identify includes one
+        ping_ms: 30_000,
+    })
+    .tcp_config(TcpConfig {
+        handshake_timeout_ms: Some(60_000), // ~8 RTTs plus slack
+        ..TcpConfig::default()
+    })
+    .connect_deadline(Duration::from_secs(90)) // ≥ the handshake
+    .bind()?;
+```
+
+This needs the `tcp` feature; the same example is a doctest on `EndpointBuilder::tcp_config`. Native QUIC has no handshake cap to raise, only `QuicLimits::idle_timeout_ms` (30 s), which a link this slow still clears. A WebTransport listener also caps the time from the QUIC handshake to Noise completion with `QuicLimits::webtransport_handshake_timeout_ms` (10 s); raise it too for slow WebTransport clients.
 
 ## Hosting a relay server
 
