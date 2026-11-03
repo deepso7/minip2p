@@ -1344,6 +1344,10 @@ impl EndpointBuilder {
     /// fails [`bind`](Self::bind) with [`SwarmError::ZeroTimeout`] before any
     /// socket is bound. See the crate README's deadline table for how they
     /// relate to the connect deadline and the transports' own deadlines.
+    ///
+    /// On a slow or loaded link, raise these together with
+    /// [`connect_deadline`](Self::connect_deadline) and, on TCP,
+    /// `TcpConfig::handshake_timeout_ms` (see `tcp_config` for an example).
     pub fn timeouts(mut self, timeouts: SwarmTimeouts) -> Self {
         self.timeouts = timeouts;
         self
@@ -1391,6 +1395,33 @@ impl EndpointBuilder {
     /// Overrides TCP connection, buffer, timeout and Yamux limits, and the
     /// connection-id namespace the TCP transport allocates in. Checked at bind
     /// ([`EndpointOptionsError::InvalidLimit`]).
+    ///
+    /// [`TcpConfig::handshake_timeout_ms`] (30 s) caps the Noise + Yamux
+    /// upgrade on its own, so a slow link needs it raised alongside the
+    /// connect and swarm deadlines: at 64 kbit/s and 400 ms under load, TCP
+    /// failed its handshake at 30 s with the others raised. For a loaded RTT
+    /// of about 6 s, set each value explicitly:
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use minip2p::{Endpoint, SwarmTimeouts, TcpConfig};
+    ///
+    /// let endpoint = Endpoint::builder()
+    ///     .listen_on("/ip4/0.0.0.0/tcp/0")?
+    ///     .timeouts(SwarmTimeouts {
+    ///         negotiation_ms: 30_000, // 5 × RTT
+    ///         identify_ms: 60_000,    // ≥ negotiation: Identify includes one
+    ///         ping_ms: 30_000,
+    ///     })
+    ///     .tcp_config(TcpConfig {
+    ///         handshake_timeout_ms: Some(60_000), // ~8 RTTs plus slack
+    ///         ..TcpConfig::default()
+    ///     })
+    ///     .connect_deadline(Duration::from_secs(90)) // ≥ the handshake
+    ///     .bind()?;
+    /// # drop(endpoint);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[cfg(feature = "tcp")]
     pub fn tcp_config(mut self, config: TcpConfig) -> Self {
         self.tcp_config = config;

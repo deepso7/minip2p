@@ -6,6 +6,41 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 ///
 /// The defaults are intentionally conservative: enough for normal peer-to-peer
 /// workloads while bounding memory and unauthenticated connection state.
+///
+/// # Lossy or reordering paths
+///
+/// [`congestion_controller`](Self::congestion_controller),
+/// [`packet_threshold`](Self::packet_threshold) and
+/// [`time_threshold`](Self::time_threshold) can help on unusual paths. These
+/// are measurements from the v0.11.2 netem retests, each on the link profile
+/// named, not universal settings; measure your own path:
+///
+/// - **Reordering** (5 Mbit/s, 100 ms, 5% reorder): the defaults (3 packets,
+///   1.125 RTTs) reached 1.3–1.4 Mbit/s; a packet threshold of 50 with a time
+///   threshold of 2.0 reached 4.5 Mbit/s. Raising only one of the two did not
+///   help. Rule of thumb: a packet threshold above the reorder depth, which
+///   grows with the rate, and a time threshold of at least 2.
+/// - **Random loss and long paths** (1–5% loss; GEO at 20 Mbit/s, 600 ms,
+///   0.5% loss): [`CongestionController::Bbr`] did clearly better than CUBIC,
+///   but worse under reordering and on bulk efficiency, and quinn marks it
+///   experimental.
+///
+/// CUBIC with 3 packets and 1.125 RTTs stays the default: they are quinn's
+/// and RFC 9002's values, higher thresholds slow recovery from real loss, and
+/// BBR lost under reordering and on bulk efficiency, so neither alternative
+/// suits every path.
+///
+/// ```
+/// use minip2p_quic::QuicLimits;
+///
+/// // The reordering profile above.
+/// let limits = QuicLimits {
+///     packet_threshold: 50,
+///     time_threshold: 2.0,
+///     ..QuicLimits::default()
+/// };
+/// # let _ = limits;
+/// ```
 #[derive(Clone, Debug)]
 pub struct QuicLimits {
     /// Maximum simultaneous QUIC connections across all of the transport's
@@ -97,7 +132,9 @@ pub struct QuicLimits {
     /// Defaults to quinn's 3.
     ///
     /// Raising it stops reordering on the path from counting as loss, which
-    /// would otherwise retransmit and shrink the congestion window.
+    /// would otherwise retransmit and shrink the congestion window. Raise it
+    /// with [`time_threshold`](Self::time_threshold); see
+    /// [Lossy or reordering paths](Self#lossy-or-reordering-paths).
     pub packet_threshold: u32,
     /// How long, as a multiple of the RTT, an unacknowledged packet may wait
     /// behind a later acknowledged one before loss detection declares it lost
