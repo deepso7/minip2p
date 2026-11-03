@@ -790,3 +790,28 @@ fn idle_polls_service_no_connection_and_traffic_services_only_its_own() {
     assert_eq!(stream_bytes(&events, stream), b"wake one");
     assert_eq!(server.services, 1, "only the connection with traffic");
 }
+
+#[test]
+fn ending_a_write_side_reports_a_closing_connection_as_closed() {
+    let (_server, mut client, _server_id, client_id) = connected_pair(QuicLimits::default());
+    let live = client.open_stream(client_id).expect("open");
+    let ended = client.open_stream(client_id).expect("open");
+    client.close_stream_write(client_id, live).expect("close");
+    // Closing a write side twice is a real fault, not an ended target.
+    assert!(matches!(
+        client.close_stream_write(client_id, live),
+        Err(TransportError::StreamCloseWriteFailed { .. })
+    ));
+
+    client.close(client_id).expect("close");
+    // A closing connection is terminal: its `Closed` reports the end.
+    for result in [
+        client.close_stream_write(client_id, ended),
+        client.send_stream(client_id, ended, Bytes::from_static(b"late")),
+    ] {
+        assert!(
+            matches!(result, Err(TransportError::ConnectionClosed { id, .. }) if id == client_id),
+            "{result:?}"
+        );
+    }
+}
