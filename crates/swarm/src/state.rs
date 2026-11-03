@@ -35,7 +35,9 @@ use minip2p_transport::{
     ConnectionCloseReason, ConnectionId, ConnectionToken, StreamId, TransportEvent,
 };
 
-use crate::events::{IdentifyFailure, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
+use crate::events::{
+    IdentifyFailure, PingFailure, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError,
+};
 use crate::held::HeldWrites;
 
 // ---------------------------------------------------------------------------
@@ -85,37 +87,44 @@ pub const SIMULTANEOUS_DIAL_WINDOW_MS: u64 = 5_000;
 /// (QUIC waiting for the peer's stream credit) does not count. A stream the
 /// peer has not agreed to by then is reset and reported as a
 /// [`SwarmErrorKind::OpenStreamFailed`] error naming it, timed by the `now`
-/// samples the host passes in. The swarm's own Identify stream instead fails
-/// its connection's first Identify ([`SwarmEvent::IdentifyFailed`]).
+/// samples the host passes in. It does not apply to a ping stream or to a
+/// connection's first Identify stream: their own deadlines
+/// ([`SwarmTimeouts::ping_ms`], [`SwarmTimeouts::identify_ms`]) cover their
+/// negotiation.
 pub const OUTBOUND_NEGOTIATION_TIMEOUT_MS: u64 = 10_000;
 
 /// Default for [`SwarmTimeouts::identify_ms`]: how long a connection's first
 /// Identify exchange may take: opening the stream, negotiating it, and the
 /// peer's reply, counted from the connection establishing. A connection that
 /// is not identified by then is reported in [`SwarmEvent::IdentifyFailed`]
-/// and closed.
-pub const IDENTIFY_TIMEOUT_MS: u64 = 10_000;
+/// and closed. Generous, because a peer that connects while the link is
+/// loaded (a bulk transfer filling a slow uplink) can take well over 10 s.
+pub const IDENTIFY_TIMEOUT_MS: u64 = 30_000;
 
 /// The swarm's protocol deadlines, in milliseconds. Every field must be
 /// above zero; [`crate::SwarmBuilder::build_core`] rejects a zero with
 /// [`crate::SwarmError::ZeroTimeout`].
 ///
-/// Identify's first exchange includes a negotiation, so keep `identify_ms`
-/// at least `negotiation_ms`. Each negotiation takes two to three round
-/// trips, so on a link whose loaded RTT exceeds a few seconds raise both.
-/// The `minip2p-rs` README's deadline table lists the Endpoint and transport
-/// deadlines beside these and how they relate.
+/// `identify_ms` and `ping_ms` each bound their whole exchange, its
+/// negotiation included, so `negotiation_ms` does not cut them short; it
+/// bounds the negotiation of every other outbound stream. Each negotiation
+/// takes two to three round trips, so on a link whose loaded RTT exceeds a
+/// few seconds raise the deadlines. The `minip2p-rs` README's deadline table
+/// lists the Endpoint and transport deadlines beside these and how they
+/// relate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SwarmTimeouts {
     /// How long an outbound stream may negotiate its protocol, from the
-    /// transport's `StreamOpened`. Default
-    /// [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`] (10 s).
+    /// transport's `StreamOpened`; not ping or first-Identify streams.
+    /// Default [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`] (10 s).
     pub negotiation_ms: u64,
-    /// How long a connection's first Identify may take, from the
-    /// connection establishing. Default [`IDENTIFY_TIMEOUT_MS`] (10 s).
+    /// How long a connection's first Identify may take (open, negotiation,
+    /// reply), from the connection establishing. Default
+    /// [`IDENTIFY_TIMEOUT_MS`] (30 s).
     pub identify_ms: u64,
-    /// How long a ping waits for its echo before
-    /// [`SwarmEvent::PingTimeout`]. Default 10 s
+    /// How long a ping attempt may take (open, negotiation, echo), from the
+    /// `ping` call, before [`SwarmEvent::PingFailed`] with
+    /// [`TimedOut`](crate::PingFailure::TimedOut). Default 10 s
     /// ([`PingConfig::default`]). The swarm only pings when the host asks.
     pub ping_ms: u64,
 }
@@ -359,7 +368,7 @@ fn event_peer_mut(event: &mut SwarmEvent) -> Option<&mut PeerId> {
         | SwarmEvent::PeerReady { peer_id, .. }
         | SwarmEvent::IdentifyFailed { peer_id, .. }
         | SwarmEvent::PingRttMeasured { peer_id, .. }
-        | SwarmEvent::PingTimeout { peer_id, .. }
+        | SwarmEvent::PingFailed { peer_id, .. }
         | SwarmEvent::StreamReady { peer_id, .. }
         | SwarmEvent::StreamData { peer_id, .. }
         | SwarmEvent::StreamWritable { peer_id, .. }
@@ -445,13 +454,12 @@ pub(crate) struct SwarmState {
     /// Peers with a pending `.ping(peer)` call: once the ping stream
     /// negotiates, the queued 32-byte payload is sent automatically.
     pending_pings: BTreeMap<PeerId, [u8; PING_PAYLOAD_LEN]>,
-    /// Absolute `now_ms` at which the in-flight ping to each peer becomes
-    /// overdue. The ping protocol keeps its deadline bookkeeping private,
-    /// so the core records its own copy whenever it forwards a successful
-    /// `SendPing`; [`SwarmState::next_deadline`] derives the earliest internal
-    /// timer from this map. Entries are cleared when the ping resolves
-    /// (RTT measured, timeout fired, outbound stream closed, peer removed)
-    /// and pruned on every tick once their deadline has passed.
+    /// Each peer's running ping attempt, by its absolute deadline
+    /// ([`SwarmTimeouts::ping_ms`] from the `ping` call). It covers the
+    /// whole attempt: the open, the negotiation and the echo. An entry is
+    /// removed exactly when the attempt ends: by `PingRttMeasured`, by
+    /// `PingFailed` (mostly [`Self::fail_ping`]), or silently with its
+    /// connection.
     ping_deadlines: BTreeMap<PeerId, u64>,
     /// The protocol deadlines; `ping_ms` computes `ping_deadlines` entries.
     timeouts: SwarmTimeouts,
@@ -857,9 +865,9 @@ impl SwarmState {
     /// Returns when the earliest internal protocol timer is due, or `None`
     /// when no timer is armed.
     ///
-    /// The internal timers are ping request timeouts, armed whenever a ping
-    /// payload is in flight to a peer, and outbound negotiation deadlines.
-    /// Both are stored as absolute due times, so `now` is unused; an overdue
+    /// The internal timers are ping attempt deadlines, first-Identify
+    /// deadlines, and outbound negotiation deadlines. All are stored as
+    /// absolute due times, so `now` is unused; an overdue
     /// timer reports its past due time, which tells the host to run
     /// [`Self::handle_tick`] now.
     pub fn next_deadline(&self, _now: Now) -> Option<Deadline> {
@@ -893,8 +901,12 @@ impl SwarmState {
     /// If a ping stream is already negotiated for this peer, the ping fires
     /// immediately (emits a `SendStream` action). If a ping stream is still
     /// negotiating, the payload is buffered and fires when the stream
-    /// becomes ready. Otherwise a new ping stream is opened and the payload
-    /// is buffered.
+    /// becomes ready; the attempt already running keeps its deadline.
+    /// Otherwise a new ping stream is opened and the payload is buffered.
+    ///
+    /// The attempt's deadline ([`SwarmTimeouts::ping_ms`]) starts now and
+    /// covers the open, the negotiation and the echo; the attempt ends in
+    /// one `PingRttMeasured` or `PingFailed` unless its connection ends.
     ///
     /// The payload should come from a cryptographic RNG; the core draws it
     /// from its injected entropy source.
@@ -917,7 +929,7 @@ impl SwarmState {
                 .map_err(|e| SwarmError::PingError {
                     reason: format!("{e}"),
                 })?;
-            self.record_ping_deadline(peer_id, now_ms);
+            self.start_ping_attempt(peer_id, now_ms);
             self.drain_ping_outputs();
             return Ok(());
         }
@@ -925,12 +937,14 @@ impl SwarmState {
         // Case 2: a ping stream is negotiating -- update the queued payload.
         if self.has_pending_ping_stream(peer_id) {
             self.pending_pings.insert(peer_id.clone(), payload);
+            self.start_ping_attempt(peer_id, now_ms);
             return Ok(());
         }
 
         // Case 3: no stream yet -- open one and queue the payload.
-        self.pending_pings.insert(peer_id.clone(), payload);
         self.queue_open_protocol_stream(peer_id, PING_PROTOCOL_ID, ProtocolKind::Ping)?;
+        self.pending_pings.insert(peer_id.clone(), payload);
+        self.start_ping_attempt(peer_id, now_ms);
         Ok(())
     }
 
@@ -1499,7 +1513,13 @@ impl SwarmState {
                 // Outbound stream ids come back synchronously from
                 // `Transport::open_stream` (see `start_outbound`); this marks
                 // the stream as actually opened, which starts its deadline.
-                if let Some(pending) = self.outbound_negotiators.get_mut(&(id, stream_id)) {
+                let covered = self
+                    .outbound_negotiators
+                    .get(&(id, stream_id))
+                    .is_some_and(|pending| self.has_own_deadline(id, &pending.target));
+                if !covered
+                    && let Some(pending) = self.outbound_negotiators.get_mut(&(id, stream_id))
+                {
                     pending.deadline_ms = Some(now_ms.saturating_add(self.timeouts.negotiation_ms));
                 }
             }
@@ -1558,12 +1578,15 @@ impl SwarmState {
     pub fn handle_tick(&mut self, now_ms: u64) {
         self.ping.on_tick(now_ms);
         self.collect_protocol_events();
-        // Safety net for deadlines whose ping was resolved without a
-        // corresponding ping event (e.g. the stream fully closed): the tick
-        // above has fired the Timeout for anything still pending at its
-        // deadline, so a past-due entry can never be load-bearing anymore.
-        // Dropping it keeps `next_deadline` from reporting a stale timer.
-        self.ping_deadlines.retain(|_, due| *due > now_ms);
+        let overdue: Vec<PeerId> = self
+            .ping_deadlines
+            .iter()
+            .filter(|(_, due)| **due <= now_ms)
+            .map(|(peer_id, _)| peer_id.clone())
+            .collect();
+        for peer_id in overdue {
+            self.fail_ping(&peer_id, PingFailure::TimedOut);
+        }
         self.expire_outbound_negotiations(now_ms);
         let expired: Vec<ConnectionId> = self
             .first_identify
@@ -1643,6 +1666,11 @@ impl SwarmState {
     pub fn open_failed(&mut self, conn_id: ConnectionId, protocol: &str, reason: &str) {
         if protocol == IDENTIFY_PROTOCOL_ID
             && self.fail_first_identify(conn_id, IdentifyFailure::OpenFailed)
+        {
+            return;
+        }
+        if protocol == PING_PROTOCOL_ID
+            && self.fail_ping_stream(&ProtocolKind::Ping, conn_id, PingFailure::OpenFailed)
         {
             return;
         }
@@ -1904,17 +1932,91 @@ impl SwarmState {
         self.ping.outbound_stream(peer_id)
     }
 
-    /// Arms the internal ping-timeout timer for `peer_id` after a
-    /// successful `SendPing`.
-    ///
-    /// The ping protocol fires its timeout on the first tick where
-    /// `now_ms - sent_at_ms > request_timeout_ms`, i.e. strictly past the
-    /// timeout, so the timer is due one millisecond after it.
-    fn record_ping_deadline(&mut self, peer_id: &PeerId, now_ms: u64) {
-        let due = now_ms
-            .saturating_add(self.timeouts.ping_ms)
-            .saturating_add(1);
-        self.ping_deadlines.insert(peer_id.clone(), due);
+    /// Starts a ping attempt to `peer_id` at `now_ms`, unless one is
+    /// already running: that one keeps its deadline.
+    fn start_ping_attempt(&mut self, peer_id: &PeerId, now_ms: u64) {
+        let due = now_ms.saturating_add(self.timeouts.ping_ms);
+        self.ping_deadlines.entry(peer_id.clone()).or_insert(due);
+    }
+
+    /// Whether the outbound stream for `target` on `conn_id` is bounded by
+    /// its protocol's own deadline, which covers its negotiation too: a ping
+    /// attempt's, or the connection's first Identify. The negotiation
+    /// deadline does not apply to it.
+    fn has_own_deadline(&self, conn_id: ConnectionId, target: &ProtocolKind) -> bool {
+        match target {
+            ProtocolKind::Ping => true,
+            ProtocolKind::IdentifyInitiator => matches!(
+                self.first_identify.get(&conn_id),
+                Some(FirstIdentify::Running { .. })
+            ),
+            _ => false,
+        }
+    }
+
+    /// Ends `peer_id`'s ping attempt as failed for `cause`: reports
+    /// [`SwarmEvent::PingFailed`] on its current connection and drops what
+    /// the attempt still holds (the queued payload, a queued open, a
+    /// negotiating stream, or the echo in flight), resetting its stream.
+    /// Returns whether an attempt was running.
+    fn fail_ping(&mut self, peer_id: &PeerId, cause: PingFailure) -> bool {
+        if self.ping_deadlines.remove(peer_id).is_none() {
+            return false;
+        }
+        self.pending_pings.remove(peer_id);
+        let Some(conn_id) = self.connection_id(peer_id) else {
+            return true;
+        };
+        self.actions.retain(|action| {
+            !matches!(
+                action,
+                Action::OpenStream { conn_id: c, target: ProtocolKind::Ping, .. } if *c == conn_id
+            )
+        });
+        let mut streams: Vec<StreamId> = self
+            .outbound_negotiators
+            .iter()
+            .filter(|((c, _), pending)| *c == conn_id && pending.target == ProtocolKind::Ping)
+            .map(|((_, stream_id), _)| *stream_id)
+            .collect();
+        for stream_id in &streams {
+            self.outbound_negotiators.remove(&(conn_id, *stream_id));
+        }
+        if self.ping.in_flight_payload(peer_id).is_some()
+            && let Some(stream_id) = self.ping.outbound_stream(peer_id)
+        {
+            // Forgets the stream and its echo; the next ping opens a new one.
+            self.ping.on_stream_closed(peer_id, stream_id);
+            streams.push(stream_id);
+        }
+        for stream_id in streams {
+            if self.reset_pending.insert((conn_id, stream_id)) {
+                self.actions
+                    .push_back(Action::ResetStream { conn_id, stream_id });
+            }
+        }
+        self.events.push_back(SwarmEvent::PingFailed {
+            peer_id: peer_id.clone(),
+            conn_id,
+            cause,
+        });
+        true
+    }
+
+    /// [`Self::fail_ping`] for a failed stream whose `target` is our ping
+    /// stream on `conn_id`; `false` for any other stream.
+    fn fail_ping_stream(
+        &mut self,
+        target: &ProtocolKind,
+        conn_id: ConnectionId,
+        cause: PingFailure,
+    ) -> bool {
+        *target == ProtocolKind::Ping
+            && self
+                .conn_to_peer
+                .get(&conn_id)
+                .cloned()
+                .is_some_and(|peer_id| self.fail_ping(&peer_id, cause))
     }
 
     fn has_pending_ping_stream(&self, peer_id: &PeerId) -> bool {
@@ -2060,15 +2162,16 @@ impl SwarmState {
         self.actions.push_back(Action::CloseConnection { conn_id });
     }
 
-    /// Clears Ping and Identify state for `peer_id`, including a pending
-    /// ping and its timer.
+    /// Clears Ping and Identify state for `peer_id`, including a ping
+    /// attempt, which ends without a ping event: the connection's own event
+    /// ends it.
     fn reset_peer_protocols(&mut self, peer_id: &PeerId) {
+        self.pending_pings.remove(peer_id);
+        self.ping_deadlines.remove(peer_id);
         self.ping.remove_peer(peer_id);
         self.identify.remove_peer(peer_id);
         self.drain_ping_outputs();
         self.drain_identify_outputs();
-        self.pending_pings.remove(peer_id);
-        self.ping_deadlines.remove(peer_id);
     }
 
     /// Drops the synthetic placeholder peer of a connection that never
@@ -2150,7 +2253,7 @@ impl SwarmState {
     /// retired until the transport reports it closed, and its close is
     /// ordered after the events queued so far. Returns the payload of a ping
     /// pending or in flight on `old`, which the caller re-sends on the new
-    /// connection; its timer restarts then, so no `PingTimeout` is reported
+    /// connection; its deadline restarts then, so no `PingFailed` is reported
     /// for the hand-over. A ping already past its deadline at `now_ms` times
     /// out instead of being re-sent.
     fn retire_for_replacement(
@@ -2171,9 +2274,10 @@ impl SwarmState {
         // before that state is reset.
         let ping_intent = if overdue {
             self.ping_deadlines.remove(peer_id);
-            self.events.push_back(SwarmEvent::PingTimeout {
+            self.events.push_back(SwarmEvent::PingFailed {
                 peer_id: peer_id.clone(),
                 conn_id: old,
+                cause: PingFailure::TimedOut,
             });
             None
         } else {
@@ -2222,6 +2326,7 @@ impl SwarmState {
         );
         if let Some(payload) = ping_intent {
             self.pending_pings.insert(peer_id.clone(), payload);
+            self.start_ping_attempt(peer_id, now_ms);
         }
         match old {
             Some(old) if self.established_peers.contains(peer_id) => {
@@ -2302,14 +2407,16 @@ impl SwarmState {
             self.peer_to_conn.remove(&stale);
             self.ping.migrate_peer(&stale, &new_peer_id);
             self.identify.migrate_peer(&stale, &new_peer_id);
-            self.drain_ping_outputs();
-            self.drain_identify_outputs();
+            // The ping attempt moves with the protocol state, before the
+            // drain looks for attempts that lost their stream.
             if let Some(payload) = self.pending_pings.remove(&stale) {
                 self.pending_pings.insert(new_peer_id.clone(), payload);
             }
             if let Some(due) = self.ping_deadlines.remove(&stale) {
                 self.ping_deadlines.insert(new_peer_id.clone(), due);
             }
+            self.drain_ping_outputs();
+            self.drain_identify_outputs();
             if let Some(info) = self.peer_info.remove(&stale) {
                 self.peer_info.insert(new_peer_id.clone(), info);
             }
@@ -2435,15 +2542,18 @@ impl SwarmState {
 
     fn handle_stream_remote_write_closed(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
         let Some(protocol) = self.stream_protocol(conn_id, stream_id).cloned() else {
-            // A peer done writing mid-negotiation can never send its Identify.
+            // A peer done writing mid-negotiation can never send its Identify
+            // or agree to ping.
             let key = (conn_id, stream_id);
             if let Some(target) = self
                 .outbound_negotiators
                 .get(&key)
                 .map(|p| p.target.clone())
-                && self.fail_identify_stream(&target, conn_id, IdentifyFailure::ClosedEarly)
+                && (self.fail_identify_stream(&target, conn_id, IdentifyFailure::ClosedEarly)
+                    || self.fail_ping_stream(&target, conn_id, PingFailure::StreamClosed))
+                // A failed ping already reset its stream.
+                && self.outbound_negotiators.remove(&key).is_some()
             {
-                self.outbound_negotiators.remove(&key);
                 self.actions
                     .push_back(Action::ResetStream { conn_id, stream_id });
             }
@@ -2563,7 +2673,9 @@ impl SwarmState {
         self.inbound_negotiators.remove(&key);
         // An open that never negotiated still gets its one terminal event.
         if let Some(pending) = self.outbound_negotiators.remove(&key) {
-            if self.fail_identify_stream(&pending.target, conn_id, IdentifyFailure::ClosedEarly) {
+            if self.fail_identify_stream(&pending.target, conn_id, IdentifyFailure::ClosedEarly)
+                || self.fail_ping_stream(&pending.target, conn_id, PingFailure::StreamClosed)
+            {
                 return;
             }
             self.emit_error_for_stream(
@@ -2747,7 +2859,10 @@ impl SwarmState {
             match output {
                 MultistreamOutput::Negotiated { .. } => negotiated = true,
                 MultistreamOutput::NotAvailable => {
-                    if !self.fail_identify_stream(&target, conn_id, IdentifyFailure::Rejected) {
+                    self.outbound_negotiators.remove(&key);
+                    if !self.fail_identify_stream(&target, conn_id, IdentifyFailure::Rejected)
+                        && !self.fail_ping_stream(&target, conn_id, PingFailure::Rejected)
+                    {
                         self.emit_error_for_stream(
                             SwarmErrorKind::UnsupportedProtocol,
                             self.established_peer_for_conn(conn_id),
@@ -2756,17 +2871,20 @@ impl SwarmState {
                             format!("remote peer does not support protocol for stream {stream_id}"),
                         );
                     }
-                    self.outbound_negotiators.remove(&key);
                     self.actions
                         .push_back(Action::ResetStream { conn_id, stream_id });
                     return 0;
                 }
                 MultistreamOutput::ProtocolError { .. }
-                    if self.fail_identify_stream(&target, conn_id, IdentifyFailure::Malformed) =>
+                    if self.fail_identify_stream(&target, conn_id, IdentifyFailure::Malformed)
+                        || self.fail_ping_stream(&target, conn_id, PingFailure::Rejected) =>
                 {
                     self.outbound_negotiators.remove(&key);
-                    self.actions
-                        .push_back(Action::ResetStream { conn_id, stream_id });
+                    // A failed ping already queued this stream's reset.
+                    if self.reset_pending.insert((conn_id, stream_id)) {
+                        self.actions
+                            .push_back(Action::ResetStream { conn_id, stream_id });
+                    }
                     return 0;
                 }
                 other => {
@@ -2774,6 +2892,7 @@ impl SwarmState {
                         self.outbound_negotiators.remove(&key);
                         self.actions
                             .push_back(Action::ResetStream { conn_id, stream_id });
+                        self.fail_ping_stream(&target, conn_id, PingFailure::Rejected);
                         return 0;
                     }
                 }
@@ -2945,10 +3064,7 @@ impl SwarmState {
 
                 if let Some(payload) = self.pending_pings.remove(&peer_id) {
                     match self.ping.send_ping(&peer_id, &payload, now_ms) {
-                        Ok(()) => {
-                            self.record_ping_deadline(&peer_id, now_ms);
-                            self.drain_ping_outputs();
-                        }
+                        Ok(()) => self.drain_ping_outputs(),
                         Err(e) => self.emit_error(
                             SwarmErrorKind::Ping,
                             Some(peer_id.clone()),
@@ -3062,12 +3178,27 @@ impl SwarmState {
         }
     }
 
+    /// Runs the ping protocol's outputs, then fails as `StreamClosed` every
+    /// attempt the protocol dropped without an event: its stream closed, or
+    /// broke the protocol, with the echo still due.
     fn drain_ping_outputs(&mut self) {
         while let Some(output) = self.ping.poll_output() {
             match output {
                 PingOutput::Action(action) => self.execute_ping_action(action),
                 PingOutput::Event(event) => self.handle_ping_event(event),
             }
+        }
+        let lost: Vec<PeerId> = self
+            .ping_deadlines
+            .keys()
+            .filter(|peer_id| {
+                !self.pending_pings.contains_key(*peer_id)
+                    && self.ping.in_flight_payload(peer_id).is_none()
+            })
+            .cloned()
+            .collect();
+        for peer_id in lost {
+            self.fail_ping(&peer_id, PingFailure::StreamClosed);
         }
     }
 
@@ -3103,17 +3234,10 @@ impl SwarmState {
                     });
                 }
             }
+            // The attempt's own deadline always comes first; this is the
+            // protocol's backstop.
             PingEvent::Timeout { peer_id, .. } => {
-                self.ping_deadlines.remove(&peer_id);
-                if let Some(conn_id) = self.connection_id(&peer_id) {
-                    self.events
-                        .push_back(SwarmEvent::PingTimeout { peer_id, conn_id });
-                }
-            }
-            PingEvent::OutboundStreamClosed { ref peer_id, .. } => {
-                // The outbound stream carried the in-flight ping (if any);
-                // its close disarms the timer.
-                self.ping_deadlines.remove(peer_id);
+                self.fail_ping(&peer_id, PingFailure::TimedOut);
             }
             PingEvent::ProtocolViolation {
                 peer_id, reason, ..
@@ -5560,7 +5684,7 @@ mod tests {
 
     #[test]
     fn in_flight_ping_is_resent_on_the_new_connection_without_timeout() {
-        let mut core = test_core(); // default request_timeout_ms = 10_000
+        let mut core = test_core(); // default ping_ms = 10_000
         let peer_id = PeerId::from_public_key_protobuf(b"ping-replaced-peer");
         let original = ConnectionId::new(60);
         let replacement = ConnectionId::new(61);
@@ -5569,21 +5693,27 @@ mod tests {
         core.ping(&peer_id, payload, 0).expect("ping in flight");
         let _ = drain_actions(&mut core);
 
-        connect_again(&mut core, &peer_id, replacement, false);
+        core.handle_transport_event(
+            TransportEvent::Connected {
+                id: replacement,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+            6_000,
+        );
         core.first_identify.clear();
         let actions = drain_actions(&mut core);
         assert_eq!(
-            core.next_deadline(Now::from_millis(5_000)),
-            None,
-            "the old timer is gone"
+            core.next_deadline(Now::from_millis(6_000)),
+            Some(Deadline::from_millis(16_000)),
+            "the deadline restarts at the hand-over"
         );
 
-        // Well past the original deadline: still no timeout for the hand-over.
-        core.handle_tick(20_000);
+        // Past the original deadline: no failure for the hand-over.
+        core.handle_tick(12_000);
         assert!(
             !drain_events(&mut core)
                 .iter()
-                .any(|event| matches!(event, SwarmEvent::PingTimeout { .. }))
+                .any(|event| matches!(event, SwarmEvent::PingFailed { .. }))
         );
 
         let stream_id = StreamId::new(8);
@@ -5597,7 +5727,7 @@ mod tests {
                 stream_id,
                 data: Bytes::from(accept),
             },
-            20_000,
+            12_000,
         );
         assert!(drain_actions(&mut core).iter().any(|action| matches!(
             action,
@@ -5605,9 +5735,9 @@ mod tests {
                 if *conn_id == replacement && data[..] == payload[..]
         )));
         assert_eq!(
-            core.next_deadline(Now::from_millis(20_000)),
-            Some(Deadline::from_millis(30_001)),
-            "the timeout restarts at the re-send"
+            core.next_deadline(Now::from_millis(12_000)),
+            Some(Deadline::from_millis(16_000)),
+            "the re-send stays inside the restarted attempt"
         );
     }
 
@@ -5638,7 +5768,7 @@ mod tests {
         let timed_out: Vec<_> = outputs
             .iter()
             .filter_map(|output| match output {
-                Output::Event(SwarmEvent::PingTimeout { peer_id, .. }) => Some(peer_id),
+                Output::Event(SwarmEvent::PingFailed { peer_id, .. }) => Some(peer_id),
                 _ => None,
             })
             .collect();
@@ -6019,18 +6149,17 @@ mod tests {
         let payload = [7u8; PING_PAYLOAD_LEN];
         core.ping(&peer_id, payload, 1_000).expect("send ping");
 
-        // The ping protocol times out strictly past request_timeout_ms, so
-        // the timer is due one millisecond after sent_at + timeout.
-        let due = Deadline::from_millis(11_001);
+        // The attempt is due ping_ms after the ping call.
+        let due = Deadline::from_millis(11_000);
         assert_eq!(core.next_deadline(Now::from_millis(1_000)), Some(due));
         assert_eq!(
             core.next_deadline(Now::from_millis(5_000)),
             Some(due),
             "the deadline is absolute, not relative to now"
         );
-        assert!(!due.is_expired_at(Now::from_millis(11_000)));
+        assert!(!due.is_expired_at(Now::from_millis(10_999)));
         assert!(
-            due.is_expired_at(Now::from_millis(11_001)),
+            due.is_expired_at(Now::from_millis(11_000)),
             "due exactly now"
         );
         assert_eq!(
@@ -6074,57 +6203,21 @@ mod tests {
         core.handle_tick(5_000);
         assert_eq!(
             core.next_deadline(Now::from_millis(5_000)),
-            Some(Deadline::from_millis(11_001))
+            Some(Deadline::from_millis(11_000))
         );
 
-        // A tick past the deadline fires the timeout and disarms the timer.
-        core.handle_tick(11_001);
+        // A tick at the deadline fires the timeout and disarms the timer.
+        core.handle_tick(11_000);
         let events = drain_events(&mut core);
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                SwarmEvent::PingTimeout { conn_id: id, .. } if *id == conn_id
+                SwarmEvent::PingFailed { conn_id: id, cause: PingFailure::TimedOut, .. }
+                    if *id == conn_id
             )),
             "the timeout names the connection the ping was sent on: {events:?}"
         );
-        assert_eq!(core.next_deadline(Now::from_millis(11_001)), None);
-    }
-
-    #[test]
-    fn next_deadline_prunes_stale_deadline_after_silent_stream_close() {
-        let mut core = test_core();
-        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
-        let conn_id = ConnectionId::new(1);
-        let stream_id = StreamId::new(4);
-        setup_outbound_ping_stream(&mut core, &peer_id, conn_id, stream_id);
-
-        core.ping(&peer_id, [7u8; PING_PAYLOAD_LEN], 0)
-            .expect("send ping");
-
-        // A full stream close clears the ping protocol's pending state
-        // without emitting a ping event; the core's deadline entry goes
-        // stale until the first tick at/past its due time prunes it.
-        feed(
-            &mut core,
-            TransportEvent::StreamClosed {
-                id: conn_id,
-                stream_id,
-            },
-        );
-        assert_eq!(
-            core.next_deadline(Now::from_millis(0)),
-            Some(Deadline::from_millis(10_001))
-        );
-
-        core.handle_tick(10_001);
-        assert_eq!(core.next_deadline(Now::from_millis(10_001)), None);
-        let events = drain_events(&mut core);
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, SwarmEvent::PingTimeout { .. })),
-            "the ping was already resolved; pruning must not surface a timeout"
-        );
+        assert_eq!(core.next_deadline(Now::from_millis(11_000)), None);
     }
 
     #[test]
@@ -6139,7 +6232,7 @@ mod tests {
             .expect("send ping");
         assert_eq!(
             core.next_deadline(Now::from_millis(0)),
-            Some(Deadline::from_millis(10_001))
+            Some(Deadline::from_millis(10_000))
         );
 
         feed(
@@ -6150,6 +6243,12 @@ mod tests {
             },
         );
         assert_eq!(core.next_deadline(Now::from_millis(0)), None);
+        assert!(
+            !drain_events(&mut core)
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::PingFailed { .. })),
+            "ConnectionClosed alone ends the ping"
+        );
     }
 
     fn noted_dial_addr(label: &[u8]) -> (PeerId, PeerAddr, ConnectionId) {
@@ -6539,7 +6638,7 @@ mod tests {
     }
 
     #[test]
-    fn next_deadline_armed_by_deferred_ping_send() {
+    fn ping_deadline_runs_from_the_ping_call_not_the_deferred_send() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
         let conn_id = ConnectionId::new(2);
@@ -6547,15 +6646,15 @@ mod tests {
 
         core.conn_to_peer.insert(conn_id, peer_id.clone());
         core.peer_to_conn.insert(peer_id.clone(), conn_id);
-        core.pending_pings
-            .insert(peer_id.clone(), [7u8; PING_PAYLOAD_LEN]);
+        core.ping(&peer_id, [7u8; PING_PAYLOAD_LEN], 1_000)
+            .expect("queue ping");
 
-        // Negotiation completing at 2_000 fires the queued payload and must
-        // arm the timer from that send time.
+        // Negotiation completing at 2_000 fires the queued payload; the
+        // timer still runs from the ping call.
         core.on_outbound_negotiated(conn_id, stream_id, ProtocolKind::Ping, 2_000);
         assert_eq!(
             core.next_deadline(Now::from_millis(4_000)),
-            Some(Deadline::from_millis(12_001))
+            Some(Deadline::from_millis(11_000))
         );
     }
 
@@ -7226,5 +7325,335 @@ mod tests {
             "{outputs:?}"
         );
         assert!(core.is_peer_ready(&peer));
+    }
+
+    // --- Every ping attempt ends in one ping event (#495) ---
+
+    /// How a test scenario breaks a ping attempt.
+    #[derive(Clone, Copy, Debug)]
+    enum PingBreak {
+        /// An echo times out, and the retry's fresh stream never finishes
+        /// negotiating.
+        NegotiationAfterTimeout,
+        /// The echo never arrives on a negotiated stream.
+        EchoSilent,
+        /// The transport refuses to open the ping stream.
+        OpenFails,
+        /// The peer answers `na` to `/ipfs/ping/1.0.0`.
+        Rejected,
+        /// The peer answers with malformed multistream framing.
+        BadNegotiation,
+        /// The peer resets the stream mid-negotiation.
+        ClosedNegotiating,
+        /// The peer closes its write side mid-negotiation.
+        FinNegotiating,
+        /// The peer resets the negotiated stream with the ping in flight.
+        ClosedInFlight,
+    }
+
+    const PING_PEER: &[u8] = b"ping-attempt-peer";
+
+    /// The `PingFailed` and `PingRttMeasured` events among `outputs`.
+    fn ping_results(outputs: &[Output]) -> Vec<(ConnectionId, Option<PingFailure>)> {
+        outputs
+            .iter()
+            .filter_map(|output| match output {
+                Output::Event(SwarmEvent::PingFailed { conn_id, cause, .. }) => {
+                    Some((*conn_id, Some(*cause)))
+                }
+                Output::Event(SwarmEvent::PingRttMeasured { conn_id, .. }) => {
+                    Some((*conn_id, None))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Runs one broken attempt to a peer connected at time 0 and returns
+    /// every output from the attempt's `ping` on, the connection, and the
+    /// time by which it must have ended.
+    fn break_ping(how: PingBreak) -> (SwarmState, Vec<Output>, ConnectionId, u64) {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(PING_PEER);
+        let conn = ConnectionId::new(90);
+        let negotiated = StreamId::new(4);
+        let fresh = StreamId::new(8);
+        let mut outputs = Vec::new();
+        let at = |core: &mut SwarmState, event, now_ms| core.handle_transport_event(event, now_ms);
+        let reset = |stream_id| TransportEvent::StreamClosed {
+            id: conn,
+            stream_id,
+        };
+        // Opens a fresh ping stream for the attempt started at `start`, the
+        // transport reporting it opened at `start + 2_000`.
+        let open_fresh = |core: &mut SwarmState, start: u64| {
+            core.ping(&peer, [3; PING_PAYLOAD_LEN], start)
+                .expect("ping");
+            let actions = drain_actions(core);
+            core.opened(actions, conn, PING_PROTOCOL_ID, fresh);
+            core.handle_transport_event(
+                TransportEvent::StreamOpened {
+                    id: conn,
+                    stream_id: fresh,
+                },
+                start + 2_000,
+            );
+        };
+        let ends_by = match how {
+            PingBreak::NegotiationAfterTimeout => {
+                setup_outbound_ping_stream(&mut core, &peer, conn, negotiated);
+                core.ping(&peer, [2; PING_PAYLOAD_LEN], 0).expect("ping");
+                core.handle_tick(PING_TIMEOUT);
+                let first: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+                assert_eq!(
+                    ping_results(&first),
+                    [(conn, Some(PingFailure::TimedOut))],
+                    "the first echo times out: {first:?}"
+                );
+                at(&mut core, reset(negotiated), PING_TIMEOUT);
+                open_fresh(&mut core, PING_TIMEOUT);
+                2 * PING_TIMEOUT
+            }
+            PingBreak::EchoSilent => {
+                setup_outbound_ping_stream(&mut core, &peer, conn, negotiated);
+                core.ping(&peer, [2; PING_PAYLOAD_LEN], 0).expect("ping");
+                PING_TIMEOUT
+            }
+            PingBreak::OpenFails => {
+                setup_outbound_ping_stream(&mut core, &peer, conn, negotiated);
+                at(&mut core, reset(negotiated), 0);
+                core.ping(&peer, [2; PING_PAYLOAD_LEN], 0).expect("ping");
+                outputs.extend(core::iter::from_fn(|| core.poll_output()));
+                core.open_failed(conn, PING_PROTOCOL_ID, "stream limit reached");
+                0
+            }
+            PingBreak::Rejected
+            | PingBreak::BadNegotiation
+            | PingBreak::ClosedNegotiating
+            | PingBreak::FinNegotiating => {
+                setup_outbound_ping_stream(&mut core, &peer, conn, negotiated);
+                at(&mut core, reset(negotiated), 0);
+                open_fresh(&mut core, 0);
+                if let PingBreak::Rejected = how {
+                    let mut na = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+                    na.extend_from_slice(&multistream_frame("na"));
+                    at(
+                        &mut core,
+                        TransportEvent::StreamData {
+                            id: conn,
+                            stream_id: fresh,
+                            data: Bytes::from(na),
+                        },
+                        3_000,
+                    );
+                } else if let PingBreak::BadNegotiation = how {
+                    at(
+                        &mut core,
+                        TransportEvent::StreamData {
+                            id: conn,
+                            stream_id: fresh,
+                            data: Bytes::from_static(b"\x05nope\n"),
+                        },
+                        3_000,
+                    );
+                } else if let PingBreak::FinNegotiating = how {
+                    at(
+                        &mut core,
+                        TransportEvent::StreamRemoteWriteClosed {
+                            id: conn,
+                            stream_id: fresh,
+                        },
+                        3_000,
+                    );
+                } else {
+                    at(&mut core, reset(fresh), 3_000);
+                }
+                3_000
+            }
+            PingBreak::ClosedInFlight => {
+                setup_outbound_ping_stream(&mut core, &peer, conn, negotiated);
+                core.ping(&peer, [2; PING_PAYLOAD_LEN], 0).expect("ping");
+                at(&mut core, reset(negotiated), 3_000);
+                3_000
+            }
+        };
+        outputs.extend(core::iter::from_fn(|| core.poll_output()));
+        (core, outputs, conn, ends_by)
+    }
+
+    /// The default ping deadline.
+    const PING_TIMEOUT: u64 = 10_000;
+
+    #[test]
+    fn a_failed_ping_attempt_ends_in_exactly_one_ping_failed() {
+        use PingBreak::*;
+        let cases = [
+            (NegotiationAfterTimeout, PingFailure::TimedOut),
+            (EchoSilent, PingFailure::TimedOut),
+            (OpenFails, PingFailure::OpenFailed),
+            (Rejected, PingFailure::Rejected),
+            (BadNegotiation, PingFailure::Rejected),
+            (ClosedNegotiating, PingFailure::StreamClosed),
+            (FinNegotiating, PingFailure::StreamClosed),
+            (ClosedInFlight, PingFailure::StreamClosed),
+        ];
+        for (how, cause) in cases {
+            let (mut core, mut outputs, conn, ends_by) = break_ping(how);
+            if cause == PingFailure::TimedOut {
+                assert_eq!(
+                    core.next_deadline(Now::from_millis(0)),
+                    Some(Deadline::from_millis(ends_by)),
+                    "{how:?}: the ping deadline runs from the ping call"
+                );
+                core.handle_tick(ends_by - 1);
+                assert!(ping_results(&outputs).is_empty(), "{how:?}: {outputs:?}");
+                let early: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+                assert!(ping_results(&early).is_empty(), "{how:?}: early {early:?}");
+                core.handle_tick(ends_by);
+                outputs.extend(core::iter::from_fn(|| core.poll_output()));
+            }
+            // Long after: nothing more, whatever other deadline was running.
+            core.handle_tick(ends_by + 10 * PING_TIMEOUT);
+            outputs.extend(core::iter::from_fn(|| core.poll_output()));
+
+            assert_eq!(
+                ping_results(&outputs),
+                [(conn, Some(cause))],
+                "{how:?}: {outputs:?}"
+            );
+            assert!(
+                !outputs.iter().any(|output| matches!(
+                    output,
+                    Output::Event(SwarmEvent::Error(SwarmRuntimeError {
+                        kind: SwarmErrorKind::OpenStreamFailed
+                            | SwarmErrorKind::UnsupportedProtocol
+                            | SwarmErrorKind::Multistream,
+                        ..
+                    }))
+                )),
+                "{how:?}: PingFailed is the report: {outputs:?}"
+            );
+            let mut resets: Vec<_> = outputs
+                .iter()
+                .filter_map(|output| match output {
+                    Output::Action(Action::ResetStream { stream_id, .. }) => Some(*stream_id),
+                    _ => None,
+                })
+                .collect();
+            let all = resets.len();
+            resets.sort_unstable();
+            resets.dedup();
+            assert_eq!(
+                resets.len(),
+                all,
+                "{how:?}: one reset per stream: {outputs:?}"
+            );
+            assert!(core.pending_pings.is_empty(), "{how:?}: payload cleared");
+            assert!(
+                !core
+                    .outbound_negotiators
+                    .values()
+                    .any(|pending| pending.target == ProtocolKind::Ping),
+                "{how:?}: no ping stream left negotiating"
+            );
+            assert_eq!(core.next_deadline(Now::from_millis(0)), None, "{how:?}");
+        }
+    }
+
+    #[test]
+    fn a_retry_after_a_bad_echo_opens_a_fresh_stream() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(PING_PEER);
+        let conn = ConnectionId::new(92);
+        let stream = StreamId::new(4);
+        setup_outbound_ping_stream(&mut core, &peer, conn, stream);
+        core.ping(&peer, [2; PING_PAYLOAD_LEN], 0).expect("ping");
+        let _ = drain_actions(&mut core);
+
+        core.handle_transport_event(
+            TransportEvent::StreamData {
+                id: conn,
+                stream_id: stream,
+                data: Bytes::from(vec![9; PING_PAYLOAD_LEN]),
+            },
+            1_000,
+        );
+        let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+        assert_eq!(
+            ping_results(&outputs),
+            [(conn, Some(PingFailure::StreamClosed))],
+            "{outputs:?}"
+        );
+
+        // Before the transport reports the reset stream closed.
+        core.ping(&peer, [3; PING_PAYLOAD_LEN], 1_000)
+            .expect("retry");
+        let actions = drain_actions(&mut core);
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::OpenStream {
+                    target: ProtocolKind::Ping,
+                    ..
+                }
+            )),
+            "{actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::SendStream { stream_id, .. } if *stream_id == stream
+            )),
+            "the reset stream is not reused: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_ping_stream_has_no_negotiation_deadline_of_its_own() {
+        let mut core = SwarmState::new(
+            IdentifyConfig {
+                protocol_version: "minip2p-test/0.1.0".into(),
+                agent_version: "minip2p-test/0.1.0".into(),
+                protocols: Vec::new(),
+                public_key: Vec::new(),
+            },
+            SwarmTimeouts {
+                ping_ms: 25_000,
+                ..SwarmTimeouts::default()
+            },
+        );
+        let peer = PeerId::from_public_key_protobuf(PING_PEER);
+        let conn = ConnectionId::new(91);
+        let stream = StreamId::new(8);
+        connect_again(&mut core, &peer, conn, false);
+        core.first_identify.clear();
+        let _ = drain_actions(&mut core);
+        let payload = [5; PING_PAYLOAD_LEN];
+        core.ping(&peer, payload, 0).expect("ping");
+        let actions = drain_actions(&mut core);
+        core.opened(actions, conn, PING_PROTOCOL_ID, stream);
+        feed(
+            &mut core,
+            TransportEvent::StreamOpened {
+                id: conn,
+                stream_id: stream,
+            },
+        );
+        // Past the 10 s negotiation deadline, inside the ping deadline.
+        core.handle_tick(15_000);
+        let mut accept = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        accept.extend_from_slice(&multistream_frame(PING_PROTOCOL_ID));
+        for (data, now_ms) in [(accept, 15_000), (payload.to_vec(), 20_000)] {
+            core.handle_transport_event(
+                TransportEvent::StreamData {
+                    id: conn,
+                    stream_id: stream,
+                    data: Bytes::from(data),
+                },
+                now_ms,
+            );
+        }
+        let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+        assert_eq!(ping_results(&outputs), [(conn, None)], "{outputs:?}");
     }
 }

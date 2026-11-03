@@ -43,13 +43,13 @@ export async function initMinip2p(
 
 /** High-level browser owner for one minip2p endpoint. */
 export class Minip2p extends Minip2pBase {
-  private constructor(backend: Minip2pBackend, relays: readonly string[]) {
-    super(backend, relays);
+  private constructor(backend: Minip2pBackend, config: Minip2pConfig) {
+    super(backend, config);
   }
 
   /** Constructs and starts a browser endpoint. */
   static create(config: Minip2pConfig): Minip2p {
-    return new Minip2p(webBackend(config), config.relays ?? []);
+    return new Minip2p(webBackend(config), config);
   }
 }
 

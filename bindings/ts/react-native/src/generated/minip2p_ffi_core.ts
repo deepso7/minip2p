@@ -1208,10 +1208,10 @@ const FfiConverterTypeLimitsOptions = (() => {
  * Protocol deadline overrides, in milliseconds; each mirrors a
  * `minip2p::SwarmTimeouts` field.
  *
- * An absent record or field keeps the native default (10 s each). A zero
- * fails construction with `InvalidConfig { capability: Options }`. Keep
- * `identify_ms` at least `negotiation_ms`: the first Identify includes a
- * negotiation.
+ * An absent record or field keeps the native default (`identify_ms` 30 s,
+ * the others 10 s). A zero fails construction with
+ * `InvalidConfig { capability: Options }`. `identify_ms` and `ping_ms` each
+ * cover their own negotiation, which `negotiation_ms` does not cut short.
  */
 export type TimeoutsOptions = {
     /**
@@ -1224,7 +1224,8 @@ export type TimeoutsOptions = {
      */
     identifyMs?: bigint,
     /**
-     * How long a ping waits for its echo.
+     * How long a ping may take: opening its stream, negotiating it and the
+     * echo.
      */
     pingMs?: bigint
 }
@@ -3305,6 +3306,56 @@ const FfiConverterTypeNatErrorKind = (() => {
 })();
 
 /**
+ * Why a ping attempt failed; see `minip2p::PingFailure`.
+ */
+export enum PingFailure {
+    /**
+     * The ping deadline (`pingMs`, from the ping call) ran out before the
+     * echo: opening the stream, negotiating it, or the echo itself.
+     */
+    TimedOut,
+    /**
+     * The transport refused to open the ping stream.
+     */
+    OpenFailed,
+    /**
+     * The peer refused the ping protocol, or broke its negotiation.
+     */
+    Rejected,
+    /**
+     * The ping stream closed, was reset, or carried a bad echo first.
+     */
+    StreamClosed
+}
+
+const FfiConverterTypePingFailure = (() => {
+    type TypeName = PingFailure;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            switch (c.readI32()) {
+                case 1: return PingFailure.TimedOut;
+                case 2: return PingFailure.OpenFailed;
+                case 3: return PingFailure.Rejected;
+                case 4: return PingFailure.StreamClosed;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            switch (value) {
+                case PingFailure.TimedOut: return c.writeI32(1);
+                case PingFailure.OpenFailed: return c.writeI32(2);
+                case PingFailure.Rejected: return c.writeI32(3);
+                case PingFailure.StreamClosed: return c.writeI32(4);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return 4;
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
  * Coarse local reachability state.
  */
 export enum Reachability {
@@ -3359,7 +3410,7 @@ export enum P2pEvent_Tags {
     PeerReady = "PeerReady",
     IdentifyReceived = "IdentifyReceived",
     PingRttMeasured = "PingRttMeasured",
-    PingTimeout = "PingTimeout",
+    PingFailed = "PingFailed",
     StreamReady = "StreamReady",
     StreamData = "StreamData",
     StreamWriteAccepted = "StreamWriteAccepted",
@@ -3711,36 +3762,37 @@ inner: {peerId: string; connId: bigint; rttMs: bigint }): PingRttMeasured_ {
 
     }
 
-    type PingTimeout__interface = {
-        tag: P2pEvent_Tags.PingTimeout;
+    type PingFailed__interface = {
+        tag: P2pEvent_Tags.PingFailed;
         inner:
-Readonly<{peerId: string; connId: bigint}>
+Readonly<{peerId: string; connId: bigint; cause: PingFailure}>
     };
     /**
-     * A ping timed out.
+     * A ping attempt ended without an echo. Every accepted ping ends in one
+     * `PingRttMeasured` or `PingFailed`, unless its connection closes first.
      */
-    class PingTimeout_ extends UniffiEnum implements PingTimeout__interface {
+    class PingFailed_ extends UniffiEnum implements PingFailed__interface {
         /**
          * @private
          * This field is private and should not be used, use `tag` instead.
          */
         readonly [uniffiTypeNameSymbol] = "P2pEvent";
-        readonly tag = P2pEvent_Tags.PingTimeout;
+        readonly tag = P2pEvent_Tags.PingFailed;
         readonly inner:
-Readonly<{peerId: string; connId: bigint}>;
+Readonly<{peerId: string; connId: bigint; cause: PingFailure}>;
         constructor(
-inner: {peerId: string; connId: bigint }) {
-            super("P2pEvent", "PingTimeout");
+inner: {peerId: string; connId: bigint; cause: PingFailure }) {
+            super("P2pEvent", "PingFailed");
 
             this.inner = Object.freeze(inner);
         }
         static new(
-inner: {peerId: string; connId: bigint }): PingTimeout_ {
-            return new PingTimeout_(inner);
+inner: {peerId: string; connId: bigint; cause: PingFailure }): PingFailed_ {
+            return new PingFailed_(inner);
         }
 
-        static instanceOf(obj: any): obj is PingTimeout_ {
-            return obj.tag === P2pEvent_Tags.PingTimeout;
+        static instanceOf(obj: any): obj is PingFailed_ {
+            return obj.tag === P2pEvent_Tags.PingFailed;
         }
 
     }
@@ -4858,7 +4910,7 @@ inner: {peerId: string; connId: bigint; cause: IdentifyFailure }): IdentifyFaile
   PeerReady: PeerReady_,
   IdentifyReceived: IdentifyReceived_,
   PingRttMeasured: PingRttMeasured_,
-  PingTimeout: PingTimeout_,
+  PingFailed: PingFailed_,
   StreamReady: StreamReady_,
   StreamData: StreamData_,
   StreamWriteAccepted: StreamWriteAccepted_,
@@ -4898,7 +4950,7 @@ inner: {peerId: string; connId: bigint; cause: IdentifyFailure }): IdentifyFaile
  * Event delivered by the native endpoint driver.
  */
 export type P2pEvent = InstanceType<
-    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'EndpointClosed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingTimeout' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'ListenAddressesChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation' | 'IdentifyFailed']
+    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'EndpointClosed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'ConnectionReplaced' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingFailed' | 'StreamReady' | 'StreamData' | 'StreamWriteAccepted' | 'StreamWriteStopped' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'ListenAddressesChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'MdnsFailed' | 'MdnsRecovered' | 'DiscoveryProtocolViolation' | 'IdentifyFailed']
 >;
 
 // FfiConverter for enum P2pEvent
@@ -4916,7 +4968,7 @@ const FfiConverterTypeP2pEvent = (() => {
                 case 7: return new P2pEvent.PeerReady({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), protocols: FfiConverterSequenceString.readFromCursor(c) });
                 case 8: return new P2pEvent.IdentifyReceived({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), info: FfiConverterTypeIdentifyInfo.readFromCursor(c) });
                 case 9: return new P2pEvent.PingRttMeasured({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), rttMs: FfiConverterUInt64.readFromCursor(c) });
-                case 10: return new P2pEvent.PingTimeout({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
+                case 10: return new P2pEvent.PingFailed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), cause: FfiConverterTypePingFailure.readFromCursor(c) });
                 case 11: return new P2pEvent.StreamReady({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c), protocolId: FfiConverterString.readFromCursor(c), initiatedLocally: FfiConverterBool.readFromCursor(c) });
                 case 12: return new P2pEvent.StreamData({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c), data: FfiConverterArrayBuffer.readFromCursor(c) });
                 case 13: return new P2pEvent.StreamWriteAccepted({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c), streamId: FfiConverterUInt64.readFromCursor(c) });
@@ -5023,11 +5075,12 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterUInt64.writeIntoCursor(inner.rttMs, c);
                     return;
                 }
-                case P2pEvent_Tags.PingTimeout: {
+                case P2pEvent_Tags.PingFailed: {
                     c.writeI32(10);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterUInt64.writeIntoCursor(inner.connId, c);
+                    FfiConverterTypePingFailure.writeIntoCursor(inner.cause, c);
                     return;
                 }
                 case P2pEvent_Tags.StreamReady: {
@@ -5356,11 +5409,12 @@ const FfiConverterTypeP2pEvent = (() => {
                     size += FfiConverterUInt64.allocationSize(inner.rttMs);
                     return size;
                 }
-                case P2pEvent_Tags.PingTimeout: {
+                case P2pEvent_Tags.PingFailed: {
                     const inner = value.inner;
                     let size = 4;
                     size += FfiConverterString.allocationSize(inner.peerId);
                     size += FfiConverterUInt64.allocationSize(inner.connId);
+                    size += FfiConverterTypePingFailure.allocationSize(inner.cause);
                     return size;
                 }
                 case P2pEvent_Tags.StreamReady: {
@@ -5726,6 +5780,7 @@ export default Object.freeze({
     FfiConverterTypeOpenStreamResult,
     FfiConverterTypeP2pEvent,
     FfiConverterTypePathKind,
+    FfiConverterTypePingFailure,
     FfiConverterTypeQuicLimitsOptions,
     FfiConverterTypeReachability,
     FfiConverterTypeRelayReservationInfo,

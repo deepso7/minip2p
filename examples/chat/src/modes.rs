@@ -27,7 +27,10 @@ const CONNECT_DEADLINE: Duration = Duration::from_secs(65);
 const RESERVATION_DEADLINE: Duration = Duration::from_secs(30);
 /// Budget for waiting until Identify finishes so this demo can treat the
 /// peer as mesh-ready; app streams themselves do not require PeerReady.
-const READY_DEADLINE: Duration = Duration::from_secs(15);
+/// Identify started when the connection established, before the connect
+/// settled, so the swarm ends it (`PeerReady`, or `IdentifyFailed` and a
+/// close) within its own deadline from there.
+const READY_DEADLINE: Duration = Duration::from_millis(minip2p::IDENTIFY_TIMEOUT_MS);
 
 struct ChatEndpoint {
     endpoint: Endpoint,
@@ -242,6 +245,10 @@ pub fn run_join(
             EndpointWaitOutcome::Event(event) => {
                 host_subscribed |= is_topic_subscription(&event, &host_peer, &topic);
                 handle_event(&endpoint, "join", None, event);
+                // A failed first Identify closes the connection.
+                if endpoint.connection_id(&host_peer).is_none() {
+                    return Err("the connection closed before identify completed".into());
+                }
             }
             EndpointWaitOutcome::Deadline => {
                 return Err("identify never completed on the selected connection".into());

@@ -22,6 +22,8 @@ pub use minip2p_swarm::{
     IdentifyMessage,
     // The default negotiation deadline (`SwarmTimeouts::negotiation_ms`).
     OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+    // Part of `EndpointEvent::PingFailed`.
+    PingFailure,
     SwarmError,
     SwarmErrorKind,
     SwarmEvent,
@@ -380,7 +382,11 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         self.engine.set_external_addresses(addresses);
     }
 
-    /// Requests a ping using the caller's time sample.
+    /// Requests a ping using the caller's time sample. Once accepted (`Ok`),
+    /// it ends in one [`EndpointEvent::PingRttMeasured`] or
+    /// [`EndpointEvent::PingFailed`], unless the connection closes first. Its
+    /// deadline (`SwarmTimeouts::ping_ms`) covers opening and negotiating the
+    /// ping stream as well as the echo.
     pub fn ping(&mut self, peer_id: &PeerId, now: Now) -> Result<(), DriverError> {
         self.engine.core.ping(peer_id, now.monotonic_ms)
     }
@@ -758,7 +764,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     }
 
     /// Overrides the negotiation, first-Identify and ping deadlines
-    /// (default [`SwarmTimeouts::default`], 10 s each). A zero deadline
+    /// (default [`SwarmTimeouts::default`]: 10 s, 30 s and 10 s). A zero deadline
     /// fails the build with [`SwarmError::ZeroTimeout`]. See the crate
     /// README's deadline table for how they relate to the connect deadline.
     pub fn timeouts(mut self, timeouts: SwarmTimeouts) -> Self {

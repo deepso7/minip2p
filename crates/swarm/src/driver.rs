@@ -1798,6 +1798,12 @@ mod tests {
                 matches!(
                     event,
                     SwarmEvent::Error(error) if error.kind == SwarmErrorKind::OpenStreamFailed
+                ) || matches!(
+                    event,
+                    SwarmEvent::PingFailed {
+                        cause: crate::PingFailure::OpenFailed,
+                        ..
+                    }
                 )
             })
             .count()
@@ -1855,7 +1861,7 @@ mod tests {
         assert_eq!(stream_id, StreamId::new(3), "caller gets its own stream id");
 
         // The stale open's failure was not tied to a synchronous call, so it
-        // must keep flowing to the application as SwarmEvent::Error.
+        // must keep flowing to the application, as the ping's PingFailed.
         assert_eq!(
             buffered_open_failures(&swarm),
             1,
@@ -2140,7 +2146,7 @@ mod tests {
         // at the cap instead of buffering them forever.
         let error = swarm
             .run_until(WaitDeadline::NEVER, |event| {
-                matches!(event, SwarmEvent::PingTimeout { .. })
+                matches!(event, SwarmEvent::PingFailed { .. })
             })
             .expect_err("skip cap must abort an unbounded wait");
         assert!(matches!(
@@ -2170,9 +2176,7 @@ mod tests {
             .checked_sub(Duration::from_secs(1))
             .expect("fresh instant is at least one second after its origin");
         let error = swarm
-            .run_until(past, |event| {
-                matches!(event, SwarmEvent::PingTimeout { .. })
-            })
+            .run_until(past, |event| matches!(event, SwarmEvent::PingFailed { .. }))
             .expect_err("skip cap must bound the expired-deadline scan");
         assert!(matches!(
             error,
@@ -2413,7 +2417,7 @@ mod tests {
                 .state
                 .next_deadline(Now::from_millis(clock.now_ms())),
             Some(minip2p_core::platform::Deadline::from_millis(
-                clock.now_ms() + PING_TIMEOUT_MS + 1
+                clock.now_ms() + PING_TIMEOUT_MS
             )),
             "ping must be in flight with an armed core timer"
         );
@@ -2430,14 +2434,14 @@ mod tests {
             .expect("ping timeout event");
         assert!(matches!(
             event,
-            SwarmEvent::PingTimeout { peer_id, .. } if peer_id == remote_peer
+            SwarmEvent::PingFailed { peer_id, .. } if peer_id == remote_peer
         ));
 
         let waits = &swarm.wait_budgets;
         assert_eq!(waits.len(), 1, "one blocking wait resolves the timer");
         assert_eq!(
             waits[0],
-            Duration::from_millis(PING_TIMEOUT_MS + 1),
+            Duration::from_millis(PING_TIMEOUT_MS),
             "wait budget must shrink to the core's ping deadline instead of MAX_IDLE_WAIT"
         );
     }

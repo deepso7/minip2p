@@ -271,6 +271,7 @@ export const nativeModuleMock = async () => {
     MdnsFailureKind: generated.MdnsFailureKind,
     NatErrorKind: generated.NatErrorKind,
     P2pEndpoint: FakeNativeEndpoint,
+    PingFailure: generated.PingFailure,
     Reachability: generated.Reachability,
     TimeoutLimit: generated.TimeoutLimit,
     WindowLimit: generated.WindowLimit,

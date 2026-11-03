@@ -28,6 +28,8 @@ import {
   NatErrorKind,
   OpenStreamError,
   PeerDisconnectedError,
+  PingFailedError,
+  PingFailure,
   Stream,
   StreamClosedError,
   TimeoutError,
@@ -35,8 +37,8 @@ import {
 } from "../src/index.ts";
 
 class TestMinip2p extends Minip2pBase {
-  constructor(backend) {
-    super(backend, []);
+  constructor(backend, config = {}) {
+    super(backend, config);
   }
 }
 
@@ -743,6 +745,30 @@ test("EventsDropped settles pending connect results with a lost error", async ()
   endpoint.close();
 });
 
+test("native EventsDropped ends a pending ping so the next ping starts afresh", async () => {
+  const backend = new MockBackend();
+  backend.connected = ["peer"];
+  const endpoint = new TestMinip2p(backend);
+  const first = endpoint.ping("peer", { timeoutMs: 0 });
+
+  // Its result may be among the lost events, so it can never settle.
+  backend.emit({
+    inner: { dropped: 1, terminalConnectIds: [], totalDropped: 1 },
+    tag: P2pEvent_Tags.EventsDropped,
+  });
+  await tick();
+  await assert.rejects(first, EventQueueOverflowError);
+
+  const second = endpoint.ping("peer", { timeoutMs: 0 });
+  assert.equal(backend.pingCalls, 2, "a fresh native ping");
+  backend.emit({
+    inner: { connId: 1, peerId: "peer", rttMs: 7 },
+    tag: P2pEvent_Tags.PingRttMeasured,
+  });
+  assert.equal(await second, 7);
+  endpoint.close();
+});
+
 test("EventsDropped stores a lost terminal for results not yet awaited", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
@@ -809,14 +835,86 @@ test("ping coalesces native work while caller abort remains independent", async 
   endpoint.close();
 });
 
-test("ping coalescing recovers after its last waiter leaves and rejects on teardown", async () => {
+test("ping rejects promptly with the native PingFailed cause", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const ping = endpoint.ping("peer", { timeoutMs: 0 });
+  backend.emit({
+    inner: { cause: PingFailure.Rejected, connId: 3, peerId: "peer" },
+    tag: P2pEvent_Tags.PingFailed,
+  });
+  await tick();
+
+  assert.equal(await remainsPending(ping), false);
+  await assert.rejects(ping, (error) => {
+    assert.ok(error instanceof PingFailedError);
+    assert.equal(error.kind, PingFailure.Rejected);
+    assert.equal(error.connId, 3);
+    assert.equal(error.peerId, "peer");
+    return true;
+  });
+  endpoint.close();
+});
+
+test("waitPeerReady's default stays within the timer limit for a huge identifyMs", async () => {
+  vi.useFakeTimers();
+  try {
+    const backend = new MockBackend();
+    const endpoint = new TestMinip2p(backend, {
+      timeouts: { identifyMs: 2_147_483_647 },
+    });
+    const ready = endpoint.waitPeerReady("peer");
+    ready.catch(() => {});
+    await vi.advanceTimersByTimeAsync(10_000);
+    assert.equal(await remainsPending(ready), true);
+    endpoint.close();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("waitPeerReady by default allows the connect and Identify deadlines", async () => {
+  vi.useFakeTimers();
+  try {
+    const backend = new MockBackend();
+    const endpoint = new TestMinip2p(backend, {
+      timeouts: { identifyMs: 60_000 },
+    });
+    const ready = endpoint.waitPeerReady("peer");
+    const settled = (async () => {
+      try {
+        return await ready;
+      } catch (error) {
+        return error;
+      }
+    })();
+    // Connect (30 s) + Identify (60 s) + 5 s.
+    await vi.advanceTimersByTimeAsync(94_999);
+    assert.equal(await remainsPending(settled), true);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.ok((await settled) instanceof TimeoutError);
+    endpoint.close();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a ping retry after a caller timeout joins the running attempt", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
   await assert.rejects(endpoint.ping("peer", { timeoutMs: 1 }), TimeoutError);
-  const retry = endpoint.ping("peer", { timeoutMs: 1000 });
-  assert.equal(backend.pingCalls, 2);
+  const retry = endpoint.ping("peer", { timeoutMs: 0 });
+  assert.equal(backend.pingCalls, 1, "the native attempt is still running");
+  backend.emit({
+    inner: { cause: PingFailure.TimedOut, connId: 1, peerId: "peer" },
+    tag: P2pEvent_Tags.PingFailed,
+  });
+  await assert.rejects(retry, PingFailedError);
+
+  const next = endpoint.ping("peer", { timeoutMs: 0 });
+  assert.equal(backend.pingCalls, 2, "a new attempt once the old one ended");
   endpoint.close();
-  await assert.rejects(retry, ClosedError);
+  await assert.rejects(next, ClosedError);
 });
 
 test("queue overflow rejects uncorrelated waits and exactly the lost connects", async () => {

@@ -8,6 +8,7 @@ import {
   IdentifyFailure,
   MdnsFailureKind,
   NatErrorKind,
+  PingFailure,
   Reachability,
 } from "../src/generated/minip2p_ffi_core";
 import { FakeNativeEndpoint } from "./fake-native-endpoint";
@@ -41,6 +42,7 @@ describe("React Native enum values", () => {
     endpoint.on("peerDiscovered", ({ source }) => seen.push(source));
     endpoint.on("driverFailed", ({ kind }) => seen.push(kind));
     endpoint.on("connectFailed", ({ kind }) => seen.push(kind));
+    endpoint.on("pingFailed", ({ cause }) => seen.push(cause));
     fake.enqueue(
       [
         {
@@ -72,6 +74,10 @@ describe("React Native enum values", () => {
           tag: "ConnectFailed",
         },
         {
+          inner: { cause: PingFailure.Rejected, connId: 1n, peerId: PEER },
+          tag: "PingFailed",
+        },
+        {
           inner: { detail: "gone", kind: DriverFailureKind.Panic },
           tag: "DriverFailed",
         },
@@ -88,6 +94,7 @@ describe("React Native enum values", () => {
       "Private",
       "Mdns",
       "Timeout",
+      "Rejected",
       "Panic",
     ]);
     endpoint.close();

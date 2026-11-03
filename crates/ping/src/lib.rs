@@ -473,10 +473,6 @@ impl PingProtocol {
 
         if peer.outbound_stream == Some(stream_id) {
             if peer.pending_ping.is_some() {
-                // Clear stale state before emitting the violation.
-                peer.pending_ping = None;
-                peer.outbound_stream = None;
-                peer.recv_bufs.remove(&stream_id);
                 return self.protocol_violation(
                     peer_id,
                     stream_id,
@@ -583,8 +579,17 @@ impl PingProtocol {
         }
     }
 
-    /// Emits a ProtocolViolation event and queues a ResetStream action.
+    /// Emits a ProtocolViolation event and queues a ResetStream action. A
+    /// reset outbound stream is forgotten with its ping, so the next ping
+    /// needs a fresh one.
     fn protocol_violation(&mut self, peer_id: &PeerId, stream_id: StreamId, reason: String) {
+        if let Some(peer) = self.peers.get_mut(peer_id)
+            && peer.outbound_stream == Some(stream_id)
+        {
+            peer.outbound_stream = None;
+            peer.pending_ping = None;
+            peer.recv_bufs.remove(&stream_id);
+        }
         self.pending_events.push_back(PingEvent::ProtocolViolation {
             peer_id: peer_id.clone(),
             stream_id,
@@ -704,6 +709,29 @@ mod tests {
                 } if peer_id == &peer && *stream_id == stream && *rtt_ms == 35
             )
         }));
+    }
+
+    #[test]
+    fn bad_echo_forgets_the_reset_outbound_stream() {
+        let mut ping = PingProtocol::default();
+        let peer = test_peer();
+        let stream = StreamId::new(0);
+        ping.register_outbound_stream(peer.clone(), stream)
+            .expect("register stream");
+        ping.send_ping(&peer, &[1u8; PING_PAYLOAD_LEN], 0)
+            .expect("send ping");
+        let _ = ping.poll_actions();
+
+        ping.on_stream_data(&peer, stream, &[2u8; PING_PAYLOAD_LEN], 5);
+        assert!(ping.poll_actions().contains(&PingAction::ResetStream {
+            peer_id: peer.clone(),
+            stream_id: stream,
+        }));
+        assert_eq!(ping.outbound_stream(&peer), None, "the stream was reset");
+        assert!(matches!(
+            ping.send_ping(&peer, &[3u8; PING_PAYLOAD_LEN], 6),
+            Err(PingError::OutboundStreamMissing { .. })
+        ));
     }
 
     #[test]

@@ -124,18 +124,37 @@ export interface Minip2pYamuxLimits {
 
 /**
  * Protocol deadline overrides, in milliseconds; omitted fields keep the native
- * default of 10 s. A zero makes `create` throw `InvalidConfigError` with
- * capability `Options`. Keep `identifyMs` at least `negotiationMs`: the first
- * Identify includes a negotiation.
+ * defaults (30 s for `identifyMs`, 10 s for the others). A zero makes `create`
+ * throw `InvalidConfigError` with capability `Options`. `identifyMs` and
+ * `pingMs` each cover their own negotiation, which `negotiationMs` does not
+ * cut short.
  */
 export interface Minip2pTimeouts {
   /** How long an outbound stream may negotiate its protocol. */
   readonly negotiationMs?: number;
-  /** How long a connection's first Identify may take before it is closed. */
+  /**
+   * How long a connection's first Identify (open, negotiation, reply) may
+   * take. A first Identify that fails or runs out this deadline closes the
+   * connection with `identifyFailed`; later Identify exchanges are not bound
+   * by it. `waitPeerReady`'s default timeout allows for it.
+   */
   readonly identifyMs?: number;
-  /** How long a ping waits for its echo. */
+  /** How long a ping may take: opening its stream, negotiating it and the echo. */
   readonly pingMs?: number;
 }
+
+/** Why a ping attempt failed; see the `pingFailed` event. */
+export const PingFailure = {
+  /** The transport refused to open the ping stream. */
+  OpenFailed: "OpenFailed",
+  /** The peer refused the ping protocol, or broke its negotiation. */
+  Rejected: "Rejected",
+  /** The ping stream closed, was reset, or carried a bad echo first. */
+  StreamClosed: "StreamClosed",
+  /** The ping deadline (`pingMs`, from the ping call) ran out first. */
+  TimedOut: "TimedOut",
+} as const;
+export type PingFailure = (typeof PingFailure)[keyof typeof PingFailure];
 
 /** Coarse local reachability states. */
 export const Reachability = {
@@ -404,8 +423,16 @@ export interface Minip2pNamedEventMap {
     readonly connId: number;
     readonly rttMs: number;
   };
-  /** A ping sent on `connId` timed out. */
-  pingTimeout: { readonly peerId: string; readonly connId: number };
+  /**
+   * A ping attempt on `connId` ended without an echo, for `cause`. Every
+   * accepted ping ends in one `pingRttMeasured` or `pingFailed`, unless its
+   * connection closes first.
+   */
+  pingFailed: {
+    readonly peerId: string;
+    readonly connId: number;
+    readonly cause: PingFailure;
+  };
   stream: Stream;
   endpointError: {
     readonly kind: EndpointErrorKind;
@@ -724,8 +751,8 @@ export const P2pEvent_Tags = {
   PeerSubscribed: "PeerSubscribed",
   PeerUnsubscribed: "PeerUnsubscribed",
   PeerUpdated: "PeerUpdated",
+  PingFailed: "PingFailed",
   PingRttMeasured: "PingRttMeasured",
-  PingTimeout: "PingTimeout",
   PublicAddressesChanged: "PublicAddressesChanged",
   ReachabilityChanged: "ReachabilityChanged",
   RelayReservationLost: "RelayReservationLost",
@@ -790,8 +817,8 @@ export type P2pEvent =
       Minip2pNamedEventMap["pingRttMeasured"]
     >
   | RawEvent<
-      typeof P2pEvent_Tags.PingTimeout,
-      Minip2pNamedEventMap["pingTimeout"]
+      typeof P2pEvent_Tags.PingFailed,
+      Minip2pNamedEventMap["pingFailed"]
     >
   | RawEvent<typeof P2pEvent_Tags.StreamReady, InboundStreamMeta>
   | RawEvent<

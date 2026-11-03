@@ -76,8 +76,10 @@ const CONNECT_DEADLINE: Duration = Duration::from_secs(65);
 const RESERVATION_DEADLINE: Duration = Duration::from_secs(30);
 /// Post-`--count` grace period for the last pongs to arrive.
 const DRAIN_DEADLINE: Duration = Duration::from_secs(3);
-/// Ceiling on identify/stream setup after a connection exists.
-const SETUP_DEADLINE: Duration = Duration::from_secs(10);
+/// Ceiling on identify/stream setup after a connection exists: the
+/// first-Identify deadline, then the echo stream's negotiation.
+const SETUP_DEADLINE: Duration =
+    Duration::from_millis(minip2p::IDENTIFY_TIMEOUT_MS + minip2p::OUTBOUND_NEGOTIATION_TIMEOUT_MS);
 
 // --- shared plumbing -------------------------------------------------------
 

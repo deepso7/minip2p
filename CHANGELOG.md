@@ -4,6 +4,13 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### Ping failures are events; ping and Identify deadlines cover their negotiation (#495, #496)
+
+- **`PingTimeout` is replaced by `PingFailed { peer_id, conn_id, cause }`** in `SwarmEvent`, `EndpointEvent` and the UniFFI `P2pEvent`, with `cause: PingFailure` (`TimedOut`, `OpenFailed`, `Rejected`, `StreamClosed`). Every accepted ping now ends in exactly one `PingRttMeasured` or `PingFailed`, unless its connection closes first; an open that failed, a refused or broken negotiation, or a stream that closed used to end it with a generic `Error` or nothing at all.
+- **The ping deadline (`ping_ms`) runs from the `ping` call** and covers opening and negotiating the ping stream as well as the echo. It used to start at the send, with the stream's negotiation under the negotiation deadline.
+- **The default first-Identify deadline (`IDENTIFY_TIMEOUT_MS`, `identify_ms`) is 30 s**, up from 10 s, and the negotiation deadline no longer applies to the first Identify stream or to ping streams: their own deadlines cover their negotiation.
+- **TypeScript:** the `pingTimeout` event is now `pingFailed` (`{ peerId, connId, cause }`), and `ping()` rejects with the new `PingFailedError` (with `kind`, a `PingFailure`) instead of `TimeoutError`. `waitPeerReady`'s default timeout is now the connect deadline plus `timeouts.identifyMs` plus 5 s (65 s by default). `Minip2pBase`'s protected constructor takes the config (`relays`, `timeouts`) instead of the relay list.
+
 ### Stream actions on an ended stream are not errors (#494)
 
 - **QUIC `send_stream` (with non-empty data) and `close_stream_write` on a closing connection fail with `TransportError::ConnectionClosed`**, not `StreamSendFailed` / `StreamCloseWriteFailed` with a "connection is closing" reason. `DriverError::is_stream_gone()` (`Error` in the std API) is now true for them; match on that, or on `TransportError::ConnectionClosed` when calling the transport directly, not the old variants. Writing non-empty data to or closing a write side that is already closed is still `StreamSendFailed` / `StreamCloseWriteFailed`.

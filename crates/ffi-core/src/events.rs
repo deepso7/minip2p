@@ -2,7 +2,8 @@
 
 use minip2p::{
     ConnectFailure, ConnectOutcome, ConnectionCloseReason as UpstreamConnectionCloseReason,
-    EndpointEvent, GossipsubEvent, IdentifyMessage, Multiaddr, Path, SwarmErrorKind,
+    EndpointEvent, GossipsubEvent, IdentifyMessage, Multiaddr, Path,
+    PingFailure as UpstreamPingFailure, SwarmErrorKind,
 };
 #[cfg(feature = "driver")]
 use minip2p::{DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource};
@@ -157,6 +158,33 @@ impl From<UpstreamConnectionCloseReason> for ConnectionCloseReason {
             other => Self::Error {
                 message: other.to_string(),
             },
+        }
+    }
+}
+
+/// Why a ping attempt failed; see `minip2p::PingFailure`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum PingFailure {
+    /// The ping deadline (`pingMs`, from the ping call) ran out before the
+    /// echo: opening the stream, negotiating it, or the echo itself.
+    TimedOut,
+    /// The transport refused to open the ping stream.
+    OpenFailed,
+    /// The peer refused the ping protocol, or broke its negotiation.
+    Rejected,
+    /// The ping stream closed, was reset, or carried a bad echo first.
+    StreamClosed,
+}
+
+impl From<UpstreamPingFailure> for PingFailure {
+    fn from(cause: UpstreamPingFailure) -> Self {
+        match cause {
+            UpstreamPingFailure::TimedOut => Self::TimedOut,
+            UpstreamPingFailure::OpenFailed => Self::OpenFailed,
+            UpstreamPingFailure::Rejected => Self::Rejected,
+            UpstreamPingFailure::StreamClosed => Self::StreamClosed,
         }
     }
 }
@@ -421,12 +449,15 @@ pub enum P2pEvent {
         /// Round-trip duration in milliseconds.
         rtt_ms: u64,
     },
-    /// A ping timed out.
-    PingTimeout {
+    /// A ping attempt ended without an echo. Every accepted ping ends in one
+    /// `PingRttMeasured` or `PingFailed`, unless its connection closes first.
+    PingFailed {
         /// Remote peer.
         peer_id: String,
         /// The connection the ping was sent on.
         conn_id: u64,
+        /// Why it failed.
+        cause: PingFailure,
     },
     /// A custom application stream completed protocol negotiation.
     StreamReady {
@@ -796,9 +827,14 @@ pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
             conn_id: conn_id.as_u64(),
             cause: cause.into(),
         },
-        EndpointEvent::PingTimeout { peer_id, conn_id } => P2pEvent::PingTimeout {
+        EndpointEvent::PingFailed {
+            peer_id,
+            conn_id,
+            cause,
+        } => P2pEvent::PingFailed {
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
+            cause: cause.into(),
         },
         EndpointEvent::StreamReady {
             peer_id,
@@ -1259,13 +1295,15 @@ mod tests {
             })
         );
         assert_eq!(
-            convert_swarm(EndpointEvent::PingTimeout {
+            convert_swarm(EndpointEvent::PingFailed {
                 peer_id: remote.clone(),
                 conn_id: ConnectionId::new(18),
+                cause: UpstreamPingFailure::Rejected,
             }),
-            Some(P2pEvent::PingTimeout {
+            Some(P2pEvent::PingFailed {
                 peer_id: remote.to_base58(),
                 conn_id: 18,
+                cause: PingFailure::Rejected,
             })
         );
     }

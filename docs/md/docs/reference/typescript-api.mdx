@@ -119,8 +119,8 @@ Promise operations use `{ timeoutMs?, signal? }`. Their default timeout is 65 se
 | `connect(target, options?)` | First usable path to a `ConnectTarget`: a peer ID, one complete peer address, or a list of complete addresses naming one peer. |
 | `startConnect(target)` / `waitConnectResult(connectId, options?)` | Split-phase connection flow using a `connectId`. |
 | `cancelConnect(connectId)` | Cancel an attempt; its terminal event settles any pending wait. |
-| `waitPeerReady(peerId, options?)` | Peer ID and advertised protocol list once the peer's current connection completes Identify. A `peerReady` for a replaced connection does not resolve it; a failed first Identify on the current connection rejects it with `IdentifyFailedError`. |
-| `ping(peerId, options?)` | RTT in milliseconds. |
+| `waitPeerReady(peerId, options?)` | Peer ID and advertised protocol list once the peer's current connection completes Identify. A `peerReady` for a replaced connection does not resolve it; a failed first Identify on the current connection rejects it with `IdentifyFailedError`. Its default timeout is a connect (30 s) plus `timeouts.identifyMs` plus 5 s of slack (65 s with the defaults). |
+| `ping(peerId, options?)` | RTT in milliseconds. Rejects with `PingFailedError` when the native ping fails. |
 | `openStream(peerId, protocol, options?)` | Negotiated `Stream`. |
 | `disconnect(peerId)` | Close the active peer connection. |
 
@@ -161,7 +161,7 @@ Stream events are `data`, `remoteWriteClosed`, `writeStopped`, and `closed`. Str
 | --- | --- |
 | Endpoint and queue | `eventsDropped`, `queueOverflow`, `driverFailed`, `handlerError`, `endpointError` |
 | Connection and Identify | `connectionEstablished`, `connectionClosed`, `connectionReplaced`, `peerReady`, `identifyReceived`, `identifyFailed` |
-| Ping and streams | `pingRttMeasured`, `pingTimeout`, `stream` |
+| Ping and streams | `pingRttMeasured`, `pingFailed`, `stream` |
 | Relay and NAT | `reachabilityChanged`, `publicAddressesChanged`, `relayReserved`, `relayReservationLost`, `pathEstablished`, `pathUpgraded`, `holePunchFailed`, `connectFailed`, `connectCancelled`, `inboundDirectUpgrade` |
 | Pubsub | `message`, `peerSubscribed`, `peerUnsubscribed`, `gossipsubOutboundFailure`, `gossipsubProtocolViolation` |
 | Discovery | `peerDiscovered`, `peerUpdated`, `peerExpired`, `discoveryDialFailed`, `discoveryProtocolViolation` |
@@ -186,7 +186,8 @@ Use `instanceof` for control flow and the typed `kind` fields for telemetry.
 | `ConnectFailedError` | NAT orchestration ended without a path; includes `connectId`, `peerId`, and `kind`. |
 | `ConnectResultUnavailableError` | A split-phase result is unknown, already awaited, or consumed. |
 | `PeerDisconnectedError` | The peer disconnected during a pending operation. |
-| `IdentifyFailedError` | A `PeerDisconnectedError` from `waitPeerReady`: the connection's first Identify failed, so it closed without becoming ready; includes `connId` and `kind` (`IdentifyFailure`). Redial to retry. |
+| `PingFailedError` | A ping failed natively; `kind` is a `PingFailure`: `TimedOut` (the `pingMs` deadline, covering the stream's open and negotiation and the echo), `OpenFailed`, `Rejected` or `StreamClosed`. Includes `peerId` and `connId`. |
+| `IdentifyFailedError` | A `PeerDisconnectedError` from `waitPeerReady`: the connection's first Identify failed, so it never became ready; includes `connId` and `kind` (`IdentifyFailure`). Redial to retry. |
 | `OpenStreamError` | Opening or negotiation failed, with structured peer/stream context. |
 | `StreamClosedError` | A stream closed before outbound negotiation completed. |
 | `WriteBufferFullError` | A stream `write` would push buffered bytes past `writeHighWaterMark`; includes `buffered` and `highWaterMark`. Await earlier writes before writing more. |

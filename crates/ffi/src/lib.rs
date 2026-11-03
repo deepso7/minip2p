@@ -10,7 +10,7 @@ pub use endpoint::P2pEndpoint;
 pub use minip2p_ffi_core::{
     ConnectTarget, ConnectionCloseReason, ConnectionInfo, DiscoveryOptions, DiscoverySource,
     DriverFailureKind, EndpointConfig, EndpointErrorKind, FfiError, IdentifyInfo, KnownPeerInfo,
-    LimitsOptions, MdnsOptions, NatErrorKind, OpenStreamResult, P2pEvent, PathKind,
+    LimitsOptions, MdnsOptions, NatErrorKind, OpenStreamResult, P2pEvent, PathKind, PingFailure,
     QuicLimitsOptions, Reachability, RelayReservationInfo, TcpLimitsOptions, TimeoutLimit,
     WindowLimit, YamuxOptions,
 };

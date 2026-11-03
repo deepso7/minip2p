@@ -539,9 +539,13 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// Pings a peer, sending a random 32-byte payload and measuring RTT.
     ///
     /// If a ping stream isn't yet negotiated the payload is queued and
-    /// fires when the stream becomes ready. The resulting RTT is delivered
-    /// via [`SwarmEvent::PingRttMeasured`]; a reply that does not arrive in
-    /// time is reported as [`SwarmEvent::PingTimeout`].
+    /// fires when the stream becomes ready. The attempt ends in exactly one
+    /// [`SwarmEvent::PingRttMeasured`] or [`SwarmEvent::PingFailed`], whose
+    /// cause says whether the deadline ([`crate::SwarmTimeouts::ping_ms`],
+    /// from this call, covering the open, the negotiation and the echo) ran
+    /// out, the open failed, the peer refused ping, or the stream closed. A
+    /// connection that closes first ends it with its `ConnectionClosed`. A
+    /// call while an attempt is still opening joins it.
     ///
     /// A failed entropy draw refuses the ping with [`DriverError::Entropy`].
     /// There is no fallback: a predictable nonce lets a remote pre-compute the
@@ -1225,6 +1229,10 @@ mod tests {
         /// negotiates, are held until the first poll at or past this time.
         answer_at_ms: Option<u64>,
         held: Vec<TransportEvent>,
+        /// With `answer_at_ms`, holds the Identify reply further, until the
+        /// first poll at or past this time.
+        reply_at_ms: Option<u64>,
+        held_reply: Vec<TransportEvent>,
     }
 
     impl ScriptedTransport {
@@ -1348,6 +1356,11 @@ mod tests {
                     data: Bytes::from(data),
                 });
             }
+            let answers = if self.reply_at_ms.is_some() {
+                &mut self.held_reply
+            } else {
+                answers
+            };
             if self.answer_at_ms.is_some() && negotiated.as_deref() == Some(IDENTIFY_PROTOCOL_ID) {
                 let reply = minip2p_identify::IdentifyMessage {
                     protocol_version: None,
@@ -1403,6 +1416,9 @@ mod tests {
             let mut events = core::mem::take(&mut self.initial);
             if self.answer_at_ms.is_some_and(|at| now.monotonic_ms >= at) {
                 events.append(&mut self.held);
+            }
+            if self.reply_at_ms.is_some_and(|at| now.monotonic_ms >= at) {
+                events.append(&mut self.held_reply);
             }
             if let Some(addrs) = self.rotate_to.take() {
                 for addr in &addrs {
@@ -2051,13 +2067,20 @@ mod tests {
         );
     }
 
-    /// Polls a swarm with `timeouts` against a peer that answers Identify
-    /// (its negotiation and its reply) only 15 s after connecting, as on a
-    /// loaded slow link, and returns every event.
-    fn identify_a_peer_answering_after_15s(timeouts: SwarmTimeouts) -> Vec<SwarmEvent> {
+    /// Polls a swarm with `timeouts` at each of `polls` against a peer that
+    /// agrees to Identify only at `answer_at_ms` and replies at
+    /// `reply_at_ms`, as on a loaded slow link, and returns every event with
+    /// the time of the poll that produced it.
+    fn identify_a_slow_peer(
+        timeouts: SwarmTimeouts,
+        answer_at_ms: u64,
+        reply_at_ms: u64,
+        polls: &[u64],
+    ) -> Vec<(u64, SwarmEvent)> {
         let peer = Ed25519Keypair::generate().peer_id();
         let transport = ScriptedTransport {
-            answer_at_ms: Some(15_000),
+            answer_at_ms: Some(answer_at_ms),
+            reply_at_ms: Some(reply_at_ms),
             ..negotiating_transport(&peer)
         };
         let keypair = Ed25519Keypair::generate();
@@ -2066,44 +2089,85 @@ mod tests {
             .build_core(transport, SeqEntropy(1))
             .expect("build");
         let mut events = Vec::new();
-        for now_ms in [0, 1, 2, 5_000, 12_000, 15_000, 15_001, 15_002, 15_003] {
-            events.extend(swarm.poll(Now::from_millis(now_ms)).expect("poll"));
+        for &now_ms in polls {
+            for event in swarm.poll(Now::from_millis(now_ms)).expect("poll") {
+                events.push((now_ms, event));
+            }
         }
         events
     }
 
-    #[test]
-    fn raised_deadlines_let_a_slow_peer_become_ready() {
-        let failed = |events: &[SwarmEvent]| {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    SwarmEvent::IdentifyFailed { cause, .. } => Some(*cause),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        let ready = |events: &[SwarmEvent]| {
-            events
-                .iter()
-                .any(|event| matches!(event, SwarmEvent::PeerReady { .. }))
-        };
+    fn identify_failures(events: &[(u64, SwarmEvent)]) -> Vec<(u64, IdentifyFailure)> {
+        events
+            .iter()
+            .filter_map(|(at, event)| match event {
+                SwarmEvent::IdentifyFailed { cause, .. } => Some((*at, *cause)),
+                _ => None,
+            })
+            .collect()
+    }
 
-        let defaults = identify_a_peer_answering_after_15s(SwarmTimeouts::default());
+    fn became_ready(events: &[(u64, SwarmEvent)]) -> bool {
+        events
+            .iter()
+            .any(|(_, event)| matches!(event, SwarmEvent::PeerReady { .. }))
+    }
+
+    #[test]
+    fn the_default_first_identify_deadline_covers_a_slow_negotiation() {
+        // 15 s negotiating, 25 s in all: past the negotiation deadline, inside
+        // the Identify one.
+        let events = identify_a_slow_peer(
+            SwarmTimeouts::default(),
+            15_000,
+            25_000,
+            &[
+                0, 1, 2, 12_000, 15_000, 15_001, 20_000, 25_000, 25_001, 25_002,
+            ],
+        );
+        assert!(identify_failures(&events).is_empty(), "{events:?}");
+        assert!(became_ready(&events), "{events:?}");
+    }
+
+    #[test]
+    fn a_first_identify_that_never_completes_fails_at_30s() {
+        let events = identify_a_slow_peer(
+            SwarmTimeouts::default(),
+            u64::MAX,
+            u64::MAX,
+            &[0, 1, 2, 10_000, 20_000, 29_999, 30_000, 60_000],
+        );
         assert_eq!(
-            failed(&defaults),
-            [IdentifyFailure::TimedOut],
+            identify_failures(&events),
+            [(30_000, IdentifyFailure::TimedOut)],
+            "{events:?}"
+        );
+        assert!(!became_ready(&events), "{events:?}");
+    }
+
+    #[test]
+    fn a_raised_identify_deadline_alone_lets_a_slower_peer_become_ready() {
+        let polls = [0, 1, 2, 30_000, 35_000, 35_001, 35_002, 35_003];
+        let defaults = identify_a_slow_peer(SwarmTimeouts::default(), 35_000, 35_000, &polls);
+        assert_eq!(
+            identify_failures(&defaults),
+            [(30_000, IdentifyFailure::TimedOut)],
             "{defaults:?}"
         );
-        assert!(!ready(&defaults), "{defaults:?}");
+        assert!(!became_ready(&defaults), "{defaults:?}");
 
-        let raised = identify_a_peer_answering_after_15s(SwarmTimeouts {
-            negotiation_ms: 20_000,
-            identify_ms: 20_000,
-            ..SwarmTimeouts::default()
-        });
-        assert!(failed(&raised).is_empty(), "{raised:?}");
-        assert!(ready(&raised), "{raised:?}");
+        // The negotiation deadline stays at its 10 s default.
+        let raised = identify_a_slow_peer(
+            SwarmTimeouts {
+                identify_ms: 40_000,
+                ..SwarmTimeouts::default()
+            },
+            35_000,
+            35_000,
+            &polls,
+        );
+        assert!(identify_failures(&raised).is_empty(), "{raised:?}");
+        assert!(became_ready(&raised), "{raised:?}");
     }
 
     #[test]
