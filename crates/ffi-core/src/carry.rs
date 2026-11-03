@@ -355,6 +355,7 @@ impl Carry {
             // naming it is something the binding acts on or must hear about.
             P2pEvent::PeerReady { .. }
             | P2pEvent::IdentifyReceived { .. }
+            | P2pEvent::IdentifyFailed { .. }
             | P2pEvent::EndpointError { .. }
             | P2pEvent::StreamReady {
                 initiated_locally: false,
@@ -545,6 +546,7 @@ fn connection_ids(event: &P2pEvent) -> Vec<u64> {
         | P2pEvent::ConnectionClosed { conn_id, .. }
         | P2pEvent::PeerReady { conn_id, .. }
         | P2pEvent::IdentifyReceived { conn_id, .. }
+        | P2pEvent::IdentifyFailed { conn_id, .. }
         | P2pEvent::PingRttMeasured { conn_id, .. }
         | P2pEvent::PingTimeout { conn_id, .. }
         | P2pEvent::StreamReady { conn_id, .. }
@@ -961,6 +963,27 @@ mod tests {
             carry.push(event);
         }
         assert_eq!(carry.take(20), kept);
+    }
+
+    #[test]
+    fn identify_failure_goes_with_its_unseen_connection() {
+        let identify_failed = |conn_id| P2pEvent::IdentifyFailed {
+            peer_id: "peer".into(),
+            conn_id,
+            cause: crate::IdentifyFailure::TimedOut,
+        };
+        let mut carry = Carry::default();
+        for event in [established(1), identify_failed(1), closed(1)] {
+            assert!(!carry.push(event));
+        }
+        assert!(carry.is_empty());
+
+        // A connection the binding saw keeps it, ahead of the close.
+        carry.push(established(2));
+        assert_eq!(carry.take(1), [established(2)]);
+        carry.push(identify_failed(2));
+        carry.push(closed(2));
+        assert_eq!(carry.take(10), [identify_failed(2), closed(2)]);
     }
 
     #[test]

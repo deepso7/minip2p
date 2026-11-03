@@ -22,6 +22,8 @@ import {
   DriverFailureKind,
   EndpointErrorKind,
   EventQueueOverflowError,
+  IdentifyFailedError,
+  IdentifyFailure,
   Minip2pBase,
   NatErrorKind,
   OpenStreamError,
@@ -1032,6 +1034,13 @@ function connectionEvent(tag, connId) {
     : { inner, tag };
 }
 
+function identifyFailed(connId) {
+  return {
+    inner: { cause: IdentifyFailure.Rejected, connId, peerId: "peer" },
+    tag: P2pEvent_Tags.IdentifyFailed,
+  };
+}
+
 test("connections that end unseen without data leave the queue whole", async () => {
   // ADR 0012 (#356): peer churn while nothing is dispatched leaves no trace,
   // and every elided event still reaches the adapter.
@@ -1050,12 +1059,13 @@ test("connections that end unseen without data leave the queue whole", async () 
       tag: P2pEvent_Tags.PeerReady,
     });
     backend.emit(streamReady({ connId, streamId: 1 }));
+    backend.emit(identifyFailed(connId));
     backend.emit(connectionEvent(P2pEvent_Tags.ConnectionClosed, connId));
   }
   await tick();
 
   assert.deepEqual(seen, []);
-  assert.equal(handled, 4000);
+  assert.equal(handled, 5000);
 
   // A connection that carried data is kept, with its end.
   backend.emit(connectionEvent(P2pEvent_Tags.ConnectionEstablished, 5));
@@ -1966,6 +1976,34 @@ test("waitPeerReady rejects only once the peer is disconnected", async () => {
     tag: P2pEvent_Tags.ConnectionClosed,
   });
   await assert.rejects(disconnected, PeerDisconnectedError);
+  endpoint.close();
+});
+
+test("waitPeerReady rejects with the current connection's Identify cause", async () => {
+  const backend = new MockBackend();
+  backend.connected = ["peer"];
+  backend.connections.set("peer", connectionOn(2));
+  const endpoint = new TestMinip2p(backend);
+  const failed = endpoint.waitPeerReady("peer", { timeoutMs: 1000 });
+
+  // A replaced connection's failure does not end the wait.
+  backend.emit(identifyFailed(1));
+  assert.equal(await remainsPending(failed), true);
+
+  // Native state is ahead: the failed connection is already closed.
+  backend.connected = [];
+  backend.connections.delete("peer");
+  backend.emit(identifyFailed(2));
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", reason: LOCAL_CLOSE },
+    tag: P2pEvent_Tags.ConnectionClosed,
+  });
+  const error = await failed.catch((error_) => error_);
+  assert.ok(error instanceof IdentifyFailedError);
+  assert.ok(error instanceof PeerDisconnectedError);
+  assert.equal(error.kind, IdentifyFailure.Rejected);
+  assert.equal(error.connId, 2);
+  assert.equal(error.peerId, "peer");
   endpoint.close();
 });
 

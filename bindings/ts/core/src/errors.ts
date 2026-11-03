@@ -4,6 +4,7 @@ import type {
   ConfigCapability,
   DriverFailureKind,
   EndpointErrorKind,
+  IdentifyFailure,
   NatErrorKind,
 } from "./types.js";
 
@@ -167,15 +168,34 @@ export class PeerDisconnectedError extends Error {
   readonly peerId: string;
   readonly operation?: string;
 
-  constructor(peerId: string, operation?: string) {
-    super(
+  /** `reason`, when given, is appended to the message. */
+  constructor(peerId: string, operation?: string, reason?: string) {
+    const base =
       operation === undefined
         ? `Peer ${peerId} disconnected`
-        : `Peer ${peerId} disconnected during ${operation}`
-    );
+        : `Peer ${peerId} disconnected during ${operation}`;
+    super(reason === undefined ? base : `${base}: ${reason}`);
     this.name = "PeerDisconnectedError";
     this.peerId = peerId;
     this.operation = operation;
+  }
+}
+
+/**
+ * The peer's connection failed its first Identify, so it never became ready
+ * and was closed. `kind` is the `identifyFailed` event's `cause`. Rejects `waitPeerReady`; redial to try again.
+ */
+export class IdentifyFailedError extends PeerDisconnectedError {
+  /** The connection whose first Identify failed. */
+  readonly connId: number;
+  /** Why Identify failed. */
+  readonly kind: IdentifyFailure;
+
+  constructor(peerId: string, connId: number, kind: IdentifyFailure) {
+    super(peerId, "waitPeerReady", `Identify failed (${kind})`);
+    this.name = "IdentifyFailedError";
+    this.connId = connId;
+    this.kind = kind;
   }
 }
 
