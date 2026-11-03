@@ -265,7 +265,7 @@ let endpoint = Endpoint::builder()
     .bind()?;
 ```
 
-This needs the `tcp` feature; the same example is a doctest on `EndpointBuilder::tcp_config`. QUIC has no handshake cap to raise, only `QuicLimits::idle_timeout_ms` (30 s), which a link this slow still clears.
+This needs the `tcp` feature; the same example is a doctest on `EndpointBuilder::tcp_config`. Native QUIC has no handshake cap to raise, only `QuicLimits::idle_timeout_ms` (30 s), which a link this slow still clears. A WebTransport listener also caps the time from the QUIC handshake to Noise completion with `QuicLimits::webtransport_handshake_timeout_ms` (10 s); raise it too for slow WebTransport clients.
 
 ## Hosting a relay server
 
