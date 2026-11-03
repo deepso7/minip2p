@@ -84,13 +84,20 @@ impl DriverError {
         matches!(
             self,
             Self::Swarm(SwarmError::StreamNotFound { .. } | SwarmError::NotConnected { .. })
-                | Self::Transport(
-                    TransportError::StreamNotFound { .. }
-                        | TransportError::ConnectionNotFound { .. }
-                        | TransportError::ConnectionClosed { .. }
-                )
-        )
+        ) || matches!(self, Self::Transport(error) if target_ended(error))
     }
+}
+
+/// Whether a transport stream operation failed only because its stream or
+/// connection had already ended (or begun closing). The transport reports
+/// that end with its own `StreamClosed` or `Closed`.
+fn target_ended(error: &TransportError) -> bool {
+    matches!(
+        error,
+        TransportError::StreamNotFound { .. }
+            | TransportError::ConnectionNotFound { .. }
+            | TransportError::ConnectionClosed { .. }
+    )
 }
 
 /// The swarm: connection and protocol orchestration over a concrete
@@ -657,7 +664,9 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// The FIN follows every write the transport accepted. A caller holding
     /// an unsent tail of its own must send it before closing. No
     /// [`SwarmEvent::StreamWritable`] for the stream follows, including one
-    /// already queued. A transport failure arrives as [`SwarmEvent::Error`].
+    /// already queued. A transport failure arrives as [`SwarmEvent::Error`],
+    /// unless the stream or connection already ended: its `StreamClosed` or
+    /// `ConnectionClosed` reports that.
     pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
@@ -673,8 +682,9 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// Resets (abruptly closes) a user stream.
     ///
     /// No [`SwarmEvent::StreamWritable`] for the stream follows, including
-    /// one already queued. A transport failure arrives as [`SwarmEvent::Error`], and the reset
-    /// may be retried.
+    /// one already queued. A transport failure arrives as
+    /// [`SwarmEvent::Error`], and the reset may be retried; a stream or
+    /// connection that already ended needs no reset and reports nothing.
     pub fn reset_stream(
         &mut self,
         peer_id: &PeerId,
@@ -954,7 +964,11 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
     /// into the state.
     ///
     /// A [`TransportError::ConnectionClosed`] is not reported here: the
-    /// operation ended the connection, whose close reports the failure once.
+    /// connection's close reports the failure once. Nor is any stream
+    /// operation on a target that already ended ([`target_ended`]): the
+    /// transport can emit a stream's last events together with its end and
+    /// forget it in the same poll, so actions those events queued find it
+    /// gone, and the `StreamClosed` or `Closed` behind them reports the end.
     fn dispatch(&mut self, action: Action) {
         match action {
             Action::OpenStream {
@@ -974,7 +988,8 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             } => {
                 let counted = data.len();
                 match self.transport.send_stream(conn_id, stream_id, data) {
-                    Ok(()) | Err(TransportError::ConnectionClosed { .. }) => {}
+                    Ok(()) => {}
+                    Err(e) if target_ended(&e) => {}
                     // The state's own write: it holds the tail.
                     Err(TransportError::Full { unsent, .. }) => {
                         self.state
@@ -991,7 +1006,8 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             }
             Action::CloseStreamWrite { conn_id, stream_id } => {
                 match self.transport.close_stream_write(conn_id, stream_id) {
-                    Ok(()) | Err(TransportError::ConnectionClosed { .. }) => {}
+                    Ok(()) => {}
+                    Err(e) if target_ended(&e) => {}
                     Err(e) => self.state.record_runtime_error(transport_error(
                         Some(conn_id),
                         Some(stream_id),
@@ -1003,11 +1019,11 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             }
             Action::ResetStream { conn_id, stream_id } => {
                 match self.transport.reset_stream(conn_id, stream_id) {
-                    // The connection's close clears the pending reset.
-                    Ok(()) | Err(TransportError::ConnectionClosed { .. }) => {}
-                    // The stream is already gone (the peer reset it first),
-                    // which is what the reset wanted; just drop the marker.
-                    Err(TransportError::StreamNotFound { .. }) => {
+                    Ok(()) => {}
+                    // The stream is already gone, which is what the reset
+                    // wanted. No terminal event may be left to clear the
+                    // pending reset, so drop it here.
+                    Err(e) if target_ended(&e) => {
                         self.state.reset_stream_failed(conn_id, stream_id);
                     }
                     Err(e) => {
@@ -1036,13 +1052,9 @@ impl<T: Transport, E: EntropySource> SwarmCore<T, E> {
             },
             Action::SettleStream { conn_id, stream_id } => {
                 match self.transport.reset_stream(conn_id, stream_id) {
+                    Ok(()) => {}
                     // Nothing held is nothing to settle.
-                    Ok(())
-                    | Err(
-                        TransportError::ConnectionNotFound { .. }
-                        | TransportError::ConnectionClosed { .. }
-                        | TransportError::StreamNotFound { .. },
-                    ) => {}
+                    Err(e) if target_ended(&e) => {}
                     Err(e) => self.state.record_runtime_error(transport_error(
                         Some(conn_id),
                         Some(stream_id),
@@ -1200,9 +1212,12 @@ mod tests {
         /// Every `send_stream` ends its connection, as a fatal session
         /// failure does: `Closed` is queued and `ConnectionClosed` returned.
         sends_end_connection: bool,
-        /// Every `reset_stream` fails with `StreamNotFound`, as when the
-        /// peer's own reset already made the transport forget the stream.
-        reset_unknown: bool,
+        /// The stream or connection has already ended in the transport:
+        /// every `send_stream`, `close_stream_write` and `reset_stream` fails
+        /// with this error.
+        ended: Option<Ended>,
+        /// The stream operations attempted, in order.
+        stream_ops: Vec<&'static str>,
         /// Bound addresses; `listen` accepts these (certhashes ignored).
         addrs: Vec<Multiaddr>,
         address_revision: u64,
@@ -1291,6 +1306,10 @@ mod tests {
             stream_id: StreamId,
             data: Bytes,
         ) -> Result<(), TransportError> {
+            self.stream_ops.push("send");
+            if let Some(ended) = self.ended {
+                return Err(ended(id, stream_id));
+            }
             if self.sends_end_connection {
                 let reason = String::from("session failed");
                 self.initial.push(TransportEvent::Closed {
@@ -1363,10 +1382,11 @@ mod tests {
 
         fn close_stream_write(
             &mut self,
-            _: ConnectionId,
-            _: StreamId,
+            id: ConnectionId,
+            stream_id: StreamId,
         ) -> Result<(), TransportError> {
-            Ok(())
+            self.stream_ops.push("close_write");
+            self.ended.map_or(Ok(()), |ended| Err(ended(id, stream_id)))
         }
 
         fn reset_stream(
@@ -1374,10 +1394,8 @@ mod tests {
             id: ConnectionId,
             stream_id: StreamId,
         ) -> Result<(), TransportError> {
-            if self.reset_unknown {
-                return Err(TransportError::StreamNotFound { id, stream_id });
-            }
-            Ok(())
+            self.stream_ops.push("reset");
+            self.ended.map_or(Ok(()), |ended| Err(ended(id, stream_id)))
         }
 
         fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
@@ -1789,6 +1807,233 @@ mod tests {
         );
     }
 
+    /// How a scripted transport fails an operation on an ended target.
+    type Ended = fn(ConnectionId, StreamId) -> TransportError;
+
+    fn stream_not_found(id: ConnectionId, stream_id: StreamId) -> TransportError {
+        TransportError::StreamNotFound { id, stream_id }
+    }
+
+    fn connection_not_found(id: ConnectionId, _: StreamId) -> TransportError {
+        TransportError::ConnectionNotFound { id }
+    }
+
+    fn connection_closed(id: ConnectionId, _: StreamId) -> TransportError {
+        TransportError::ConnectionClosed {
+            id,
+            reason: String::from("connection is closing"),
+        }
+    }
+
+    /// Each way a transport says the target already ended, paired with the
+    /// terminal event that reports the end right behind it.
+    fn ended_targets(conn: ConnectionId, stream_id: StreamId) -> [(Ended, TransportEvent); 3] {
+        let stream_closed = TransportEvent::StreamClosed {
+            id: conn,
+            stream_id,
+        };
+        let closed = TransportEvent::Closed {
+            id: conn,
+            reason: ConnectionCloseReason::Remote { code: 0 },
+        };
+        [
+            (stream_not_found, stream_closed),
+            (connection_not_found, closed.clone()),
+            (connection_closed, closed),
+        ]
+    }
+
+    /// What a remote dialer writes to propose `protocol` on a new stream.
+    fn proposal(protocol: &str) -> Bytes {
+        let mut dialer = MultistreamSelect::dialer(protocol);
+        dialer.start();
+        let mut bytes = Vec::new();
+        while let Some(output) = dialer.poll_output() {
+            if let MultistreamOutput::OutboundData(data) = output {
+                bytes.extend_from_slice(&data);
+            }
+        }
+        Bytes::from(bytes)
+    }
+
+    /// A swarm serving `/app/1`, connected to a peer.
+    fn app_swarm(peer: &PeerId) -> SwarmCore<ScriptedTransport, SeqEntropy> {
+        let mut transport = negotiating_transport(peer);
+        transport.negotiate = false;
+        let mut swarm = swarm_with(transport, SeqEntropy(1));
+        swarm.add_protocol("/app/1").expect("protocol");
+        swarm.poll(Now::from_millis(0)).expect("connect");
+        swarm
+    }
+
+    /// The transport emits a stream's last events and its end in one poll,
+    /// and has already forgotten the stream (or connection) by the time the
+    /// swarm acts on the earlier ones. Each action the swarm queues hits the
+    /// ended target; the terminal event right behind reports the end, so no
+    /// action may add a runtime error.
+    #[test]
+    fn queued_actions_on_an_already_ended_target_are_not_runtime_errors() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let conn = ConnectionId::new(1);
+        let stream_id = StreamId::new(7);
+        let opened = TransportEvent::IncomingStream {
+            id: conn,
+            stream_id,
+        };
+        let propose = |protocol| TransportEvent::StreamData {
+            id: conn,
+            stream_id,
+            data: proposal(protocol),
+        };
+        // Negotiating answers with a send; an Identify reply then closes its
+        // write side; a stop on a stream still negotiating resets it.
+        let scenarios = [
+            ("send", vec![opened.clone(), propose("/app/1")]),
+            (
+                "close_write",
+                vec![opened.clone(), propose(IDENTIFY_PROTOCOL_ID)],
+            ),
+            (
+                "reset",
+                vec![
+                    opened.clone(),
+                    TransportEvent::StreamWriteStopped {
+                        id: conn,
+                        stream_id,
+                        error_code: 0,
+                    },
+                ],
+            ),
+        ];
+        for (action, batch) in scenarios {
+            for (ended, terminal) in ended_targets(conn, stream_id) {
+                let mut swarm = app_swarm(&peer);
+                let mut batch = batch.clone();
+                batch.push(terminal.clone());
+                swarm.transport_mut().initial = batch;
+                swarm.transport_mut().ended = Some(ended);
+                let events = swarm.poll(Now::from_millis(1)).expect("poll");
+                let error = ended(conn, stream_id);
+                assert!(
+                    swarm.transport().stream_ops.contains(&action),
+                    "{action} never reached the transport ({error}): {:?}",
+                    swarm.transport().stream_ops
+                );
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, SwarmEvent::Error(_))),
+                    "{action} on an ended target ({error}) surfaced as Error: {events:?}"
+                );
+            }
+        }
+    }
+
+    /// An [`app_swarm`] with an inbound `/app/1` stream that negotiated
+    /// before the transport ended it with `ended`.
+    fn ended_user_stream(
+        peer: &PeerId,
+        ended: Ended,
+    ) -> (
+        SwarmCore<ScriptedTransport, SeqEntropy>,
+        ConnectionId,
+        StreamId,
+    ) {
+        let (conn, stream_id) = (ConnectionId::new(1), StreamId::new(7));
+        let mut swarm = app_swarm(peer);
+        swarm.transport_mut().initial = vec![
+            TransportEvent::IncomingStream {
+                id: conn,
+                stream_id,
+            },
+            TransportEvent::StreamData {
+                id: conn,
+                stream_id,
+                data: proposal("/app/1"),
+            },
+        ];
+        let events = swarm.poll(Now::from_millis(1)).expect("poll");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::StreamReady { .. })),
+            "{events:?}"
+        );
+        swarm.transport_mut().ended = Some(ended);
+        (swarm, conn, stream_id)
+    }
+
+    #[test]
+    fn a_reset_of_an_ended_stream_leaves_no_reset_pending() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        for ended in [stream_not_found, connection_not_found, connection_closed] {
+            let (mut swarm, conn, stream_id) = ended_user_stream(&peer, ended);
+            // No terminal event follows: the reset alone must clear its
+            // marker, so a second reset reaches the transport again.
+            for at in [2, 3] {
+                swarm
+                    .reset_stream(&peer, conn, stream_id, at)
+                    .expect("reset");
+            }
+            let resets = swarm.transport().stream_ops.iter();
+            assert_eq!(
+                resets.filter(|op| **op == "reset").count(),
+                2,
+                "{}",
+                ended(conn, stream_id)
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_side_close_the_transport_refuses_is_still_reported() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let (mut swarm, conn, stream_id) = ended_user_stream(&peer, |id, stream_id| {
+            TransportError::StreamCloseWriteFailed {
+                id,
+                stream_id,
+                reason: String::from("local stream write side is already closed"),
+            }
+        });
+        swarm
+            .close_stream_write(&peer, conn, stream_id, 2)
+            .expect("close");
+        let events = swarm.poll(Now::from_millis(3)).expect("poll");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::Error(error) if error.stream_id == Some(stream_id)
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn application_writes_and_closes_on_an_ended_stream_still_fail() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        for (ended, terminal) in ended_targets(ConnectionId::new(1), StreamId::new(7)) {
+            let (mut swarm, conn, stream_id) = ended_user_stream(&peer, ended);
+            // Before the swarm reads the end, the transport's refusal is the
+            // caller's: the write must not look accepted.
+            let write = swarm.send_stream(&peer, conn, stream_id, Bytes::from_static(b"x"), 2);
+            assert!(
+                write.as_ref().is_err_and(DriverError::is_stream_gone),
+                "{write:?}"
+            );
+
+            swarm.transport_mut().initial = vec![terminal];
+            swarm.poll(Now::from_millis(3)).expect("poll");
+            let write = swarm.send_stream(&peer, conn, stream_id, Bytes::from_static(b"x"), 4);
+            let close = swarm.close_stream_write(&peer, conn, stream_id, 4);
+            for result in [write, close] {
+                assert!(
+                    result.as_ref().is_err_and(DriverError::is_stream_gone),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn resetting_a_stream_the_transport_already_forgot_is_not_a_runtime_error() {
         let peer = Ed25519Keypair::generate().peer_id();
@@ -1802,7 +2047,7 @@ mod tests {
                     id: conn,
                     endpoint: ConnectionEndpoint::with_peer_id(address, peer.clone()),
                 }],
-                reset_unknown: true,
+                ended: Some(stream_not_found),
                 ..ScriptedTransport::default()
             },
             SeqEntropy(1),
