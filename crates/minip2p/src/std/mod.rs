@@ -484,7 +484,10 @@ impl Endpoint {
 
     /// Sends a ping to `peer_id`.
     ///
-    /// The RTT is emitted later as [`EndpointEvent::PingRttMeasured`].
+    /// The attempt ends in one [`EndpointEvent::PingRttMeasured`] or
+    /// [`EndpointEvent::PingFailed`], unless the connection closes first. Its
+    /// deadline (`SwarmTimeouts::ping_ms`) covers opening and negotiating the
+    /// ping stream as well as the echo.
     pub fn ping(&mut self, peer_id: &PeerId) -> Result<(), Error> {
         let now = self.now();
         self.engine.core.ping(peer_id, now.monotonic_ms)
@@ -2665,9 +2668,10 @@ mod tests {
         // Let the lookup thread queue its answer and wake the poll.
         std::thread::sleep(Duration::from_millis(100));
         let other = Ed25519Keypair::generate().peer_id();
-        dialer.engine.events.push_back(EndpointEvent::PingTimeout {
+        dialer.engine.events.push_back(EndpointEvent::PingFailed {
             peer_id: other.clone(),
             conn_id: ConnectionId::new(1),
+            cause: minip2p_swarm::PingFailure::TimedOut,
         });
 
         let (mut settled, mut queued) = (false, false);
@@ -2678,7 +2682,7 @@ mod tests {
                     connect_id: id,
                     ..
                 }) if id == connect_id => settled = true,
-                EndpointWaitOutcome::Event(EndpointEvent::PingTimeout { peer_id, .. })
+                EndpointWaitOutcome::Event(EndpointEvent::PingFailed { peer_id, .. })
                     if peer_id == other =>
                 {
                     queued = true;

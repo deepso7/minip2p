@@ -22,6 +22,8 @@ pub use minip2p_swarm::{
     IdentifyMessage,
     // The default negotiation deadline (`SwarmTimeouts::negotiation_ms`).
     OUTBOUND_NEGOTIATION_TIMEOUT_MS,
+    // Part of `EndpointEvent::PingFailed`.
+    PingFailure,
     SwarmError,
     SwarmErrorKind,
     SwarmEvent,
@@ -380,7 +382,9 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         self.engine.set_external_addresses(addresses);
     }
 
-    /// Requests a ping using the caller's time sample.
+    /// Requests a ping using the caller's time sample. It ends in one
+    /// [`EndpointEvent::PingRttMeasured`] or [`EndpointEvent::PingFailed`],
+    /// unless the connection closes first.
     pub fn ping(&mut self, peer_id: &PeerId, now: Now) -> Result<(), DriverError> {
         self.engine.core.ping(peer_id, now.monotonic_ms)
     }

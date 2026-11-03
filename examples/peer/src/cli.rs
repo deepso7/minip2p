@@ -334,8 +334,12 @@ pub fn print_event(role: &str, event: &EndpointEvent) {
         } => {
             println!("[{role}] ping peer={peer_id} conn={conn_id} rtt={rtt_ms}ms");
         }
-        EndpointEvent::PingTimeout { peer_id, conn_id } => {
-            println!("[{role}] ping-timeout peer={peer_id} conn={conn_id}");
+        EndpointEvent::PingFailed {
+            peer_id,
+            conn_id,
+            cause,
+        } => {
+            println!("[{role}] ping-failed peer={peer_id} conn={conn_id} cause={cause}");
         }
         EndpointEvent::StreamReady {
             peer_id,

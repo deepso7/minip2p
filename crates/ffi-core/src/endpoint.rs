@@ -1250,28 +1250,32 @@ mod tests {
         let endpoint = endpoint(config()).expect("endpoint");
         {
             let mut events = endpoint.shared.lock_events();
-            events.carry.carry.push(P2pEvent::PingTimeout {
+            events.carry.carry.push(P2pEvent::PingFailed {
                 peer_id: "a".into(),
                 conn_id: 1,
+                cause: crate::PingFailure::TimedOut,
             });
-            events.carry.carry.push(P2pEvent::PingTimeout {
+            events.carry.carry.push(P2pEvent::PingFailed {
                 peer_id: "b".into(),
                 conn_id: 1,
+                cause: crate::PingFailure::TimedOut,
             });
         }
 
         assert_eq!(
             endpoint.drain_events(1),
-            vec![P2pEvent::PingTimeout {
+            vec![P2pEvent::PingFailed {
                 peer_id: "a".into(),
                 conn_id: 1,
+                cause: crate::PingFailure::TimedOut,
             }]
         );
         assert_eq!(
             endpoint.drain_events(1),
-            vec![P2pEvent::PingTimeout {
+            vec![P2pEvent::PingFailed {
                 peer_id: "b".into(),
                 conn_id: 1,
+                cause: crate::PingFailure::TimedOut,
             }]
         );
         assert!(endpoint.drain_events(1).is_empty());
@@ -1301,9 +1305,10 @@ mod tests {
     #[test]
     fn draining_neither_waits_for_nor_interrupts_the_driver() {
         let endpoint = endpoint(config()).expect("endpoint");
-        let ping = P2pEvent::PingTimeout {
+        let ping = P2pEvent::PingFailed {
             peer_id: "a".into(),
             conn_id: 1,
+            cause: crate::PingFailure::TimedOut,
         };
         endpoint.shared.lock_events().carry.carry.push(ping.clone());
         // A driver parked in `wait` holds the state lock.

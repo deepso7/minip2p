@@ -8,6 +8,7 @@ import {
   MdnsFailureKind,
   Minip2pBase,
   NatErrorKind,
+  PingFailure,
   Reachability,
 } from "@minip2p/core";
 import type {
@@ -55,6 +56,7 @@ import {
   MdnsFailureKind as NativeMdnsFailureKind,
   NatErrorKind as NativeNatErrorKind,
   P2pEndpoint,
+  PingFailure as NativePingFailure,
   Reachability as NativeReachability,
   TimeoutLimit,
   WindowLimit,
@@ -398,13 +400,13 @@ const backendFactory: Minip2pBackendFactory = {
 
 /** High-level React Native owner for one native minip2p endpoint. */
 export class Minip2p extends Minip2pBase {
-  private constructor(backend: Minip2pBackend, relays: readonly string[]) {
-    super(backend, relays);
+  private constructor(backend: Minip2pBackend, config: Minip2pConfig) {
+    super(backend, config);
   }
 
   /** Constructs and starts a React Native endpoint. */
   static create(config: Minip2pConfig): Minip2p {
-    return new Minip2p(backendFactory.create(config), config.relays ?? []);
+    return new Minip2p(backendFactory.create(config), config);
   }
 }
 
@@ -469,6 +471,7 @@ const ENUM_FIELDS: Readonly<
   MdnsFailed: { kind: [MdnsFailureKind, NativeMdnsFailureKind] },
   PeerDiscovered: { source: [DiscoverySource, NativeDiscoverySource] },
   PeerUpdated: { source: [DiscoverySource, NativeDiscoverySource] },
+  PingFailed: { cause: [PingFailure, NativePingFailure] },
   ReachabilityChanged: {
     current: [Reachability, NativeReachability],
     previous: [Reachability, NativeReachability],

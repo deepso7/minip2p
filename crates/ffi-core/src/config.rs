@@ -220,10 +220,10 @@ pub enum TimeoutLimit {
 /// Protocol deadline overrides, in milliseconds; each mirrors a
 /// `minip2p::SwarmTimeouts` field.
 ///
-/// An absent record or field keeps the native default (10 s each). A zero
-/// fails construction with `InvalidConfig { capability: Options }`. Keep
-/// `identify_ms` at least `negotiation_ms`: the first Identify includes a
-/// negotiation.
+/// An absent record or field keeps the native default (`identify_ms` 30 s,
+/// the others 10 s). A zero fails construction with
+/// `InvalidConfig { capability: Options }`. `identify_ms` and `ping_ms` each
+/// cover their own negotiation, which `negotiation_ms` does not cut short.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TimeoutsOptions {
@@ -234,7 +234,8 @@ pub struct TimeoutsOptions {
     /// connection is closed.
     #[cfg_attr(feature = "uniffi", uniffi(default))]
     pub identify_ms: Option<u64>,
-    /// How long a ping waits for its echo.
+    /// How long a ping may take: opening its stream, negotiating it and the
+    /// echo.
     #[cfg_attr(feature = "uniffi", uniffi(default))]
     pub ping_ms: Option<u64>,
 }

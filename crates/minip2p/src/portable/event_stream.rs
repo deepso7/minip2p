@@ -5,7 +5,7 @@
 //! leave through [`EndpointEvent`].
 
 use minip2p_core::{Bytes, PeerAddr, PeerId};
-use minip2p_swarm::{IdentifyFailure, IdentifyMessage, SwarmEvent, SwarmRuntimeError};
+use minip2p_swarm::{IdentifyFailure, IdentifyMessage, PingFailure, SwarmEvent, SwarmRuntimeError};
 use minip2p_transport::{ConnectionCloseReason, ConnectionId, StreamId};
 
 use crate::connect::{ConnectId, ConnectOutcome};
@@ -106,10 +106,14 @@ pub enum EndpointEvent {
         conn_id: ConnectionId,
         rtt_ms: u64,
     },
-    /// A ping sent on `conn_id` timed out.
-    PingTimeout {
+    /// A ping attempt on `conn_id` ended without an echo, for `cause`.
+    /// Every accepted `ping` ends in one [`Self::PingRttMeasured`] or
+    /// `PingFailed`, unless the connection closes first
+    /// ([`Self::ConnectionClosed`] then ends it). The connection stays open.
+    PingFailed {
         peer_id: PeerId,
         conn_id: ConnectionId,
+        cause: PingFailure,
     },
     /// A user-registered protocol was successfully negotiated on a stream.
     StreamReady {
@@ -340,7 +344,15 @@ impl From<SwarmEvent> for EndpointEvent {
                 conn_id,
                 rtt_ms,
             },
-            SwarmEvent::PingTimeout { peer_id, conn_id } => Self::PingTimeout { peer_id, conn_id },
+            SwarmEvent::PingFailed {
+                peer_id,
+                conn_id,
+                cause,
+            } => Self::PingFailed {
+                peer_id,
+                conn_id,
+                cause,
+            },
             SwarmEvent::StreamReady {
                 peer_id,
                 conn_id,

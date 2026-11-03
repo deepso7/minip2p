@@ -16,6 +16,7 @@ import {
   EventQueueOverflowError,
   OpenStreamError,
   PeerDisconnectedError,
+  PingFailedError,
   StreamClosedError,
   TimeoutError,
   WriteBufferFullError,
@@ -39,6 +40,7 @@ import type {
   InboundStreamMeta,
   KnownPeerInfo,
   Minip2pCatchAllEventMap,
+  Minip2pConfig,
   Minip2pEvent,
   Minip2pNamedEventMap,
   OnceOptions,
@@ -59,6 +61,11 @@ declare const TextEncoder: new () => {
 };
 
 const DEFAULT_TIMEOUT_MS = 65_000;
+/** The native connect deadline and default first-Identify deadline. */
+const CONNECT_DEADLINE_MS = 30_000;
+const IDENTIFY_DEADLINE_MS = 30_000;
+/** Margin a readiness wait keeps past the native deadlines. */
+const READY_SLACK_MS = 5000;
 /**
  * Default close drain: the Rust `minip2p::DEFAULT_CLOSE_TIMEOUT` (500 ms)
  * that `Endpoint::close` and native's `DEFAULT_STOP_TIMEOUT_MS` use.
@@ -1128,6 +1135,8 @@ export interface StreamEventMap {
 export class Minip2pBase {
   readonly #backend: Minip2pBackend;
   readonly #relayAddrs: readonly string[];
+  /** `waitPeerReady`'s default timeout: connect + Identify + slack. */
+  readonly #readyTimeoutMs: number;
   readonly #named = new Map<EventKind, Set<(payload: AnyPayload) => void>>();
   readonly #catchAll = new Set<CatchAllHandler>();
   readonly #closeHandlers = new Set<(report: EndpointCloseReport) => void>();
@@ -1149,10 +1158,14 @@ export class Minip2pBase {
 
   protected constructor(
     backend: Minip2pBackend,
-    relayAddresses: readonly string[]
+    config: Pick<Minip2pConfig, "relays" | "timeouts">
   ) {
     this.#backend = backend;
-    this.#relayAddrs = relayAddresses;
+    this.#relayAddrs = config.relays ?? [];
+    this.#readyTimeoutMs =
+      CONNECT_DEADLINE_MS +
+      (config.timeouts?.identifyMs ?? IDENTIFY_DEADLINE_MS) +
+      READY_SLACK_MS;
     try {
       backend.start((event) => {
         this.#enqueueNative(event);
@@ -1488,6 +1501,8 @@ export class Minip2pBase {
    *
    * A `peerReady` resolves it only while its connection is still the peer's
    * current one, so a stale `peerReady` for a replaced connection does not.
+   * The default timeout outlasts a connect plus the first-Identify deadline
+   * (`timeouts.identifyMs`), so the native side settles readiness first.
    */
   waitPeerReady(
     peerId: string,
@@ -1508,6 +1523,7 @@ export class Minip2pBase {
     const removeExternalAbort = listenAbort(options.signal, () => {
       controller.abort();
     });
+    const timeoutMs = options.timeoutMs ?? this.#readyTimeoutMs;
     // Events trail the native state, so a queued `peerReady` counts only if
     // its connection is still the peer's current one; a replaced
     // connection's readiness never resolves the wait.
@@ -1517,6 +1533,7 @@ export class Minip2pBase {
         event.peerId === peerId &&
         this.#backend.connectionInfo(peerId)?.connId === event.connId,
       signal: controller.signal,
+      timeoutMs,
     }).then(({ protocols }) => ({ peerId, protocols }));
     const disconnected = this.waitFor("connectionClosed", {
       ...options,
@@ -1524,6 +1541,7 @@ export class Minip2pBase {
         event.peerId === peerId &&
         !this.#backend.connectedPeers().includes(peerId),
       signal: controller.signal,
+      timeoutMs,
     }).then(() => {
       throw new PeerDisconnectedError(peerId, "waitPeerReady");
     });
@@ -1533,7 +1551,12 @@ export class Minip2pBase {
     });
   }
 
-  /** Measures round-trip latency in milliseconds, coalescing concurrent calls. */
+  /**
+   * Measures round-trip latency in milliseconds, coalescing concurrent calls.
+   * Rejects with {@link PingFailedError} when the native ping fails (its
+   * `pingMs` deadline covers the open, negotiation and echo), and with
+   * {@link PeerDisconnectedError} when the connection closes first.
+   */
   ping(peerId: string, options: OpOptions = {}): Promise<number> {
     this.#assertOpen();
     let operation = this.#pings.get(peerId);
@@ -1757,10 +1780,10 @@ export class Minip2pBase {
           resolve(event.rttMs);
         }
       });
-      const offTimeout = this.on("pingTimeout", (event) => {
+      const offFailed = this.on("pingFailed", (event) => {
         if (event.peerId === peerId) {
           finish();
-          reject(new TimeoutError());
+          reject(new PingFailedError(event));
         }
       });
       const offClosed = this.on("connectionClosed", (event) => {
@@ -1774,7 +1797,7 @@ export class Minip2pBase {
       });
       cleanup = () => {
         offRtt();
-        offTimeout();
+        offFailed();
         offClosed();
       };
       const finish = () => {
@@ -2416,7 +2439,7 @@ const SDK_EVENT_NAMES: {
   [P2pEvent_Tags.PeerReady]: "peerReady",
   [P2pEvent_Tags.IdentifyReceived]: "identifyReceived",
   [P2pEvent_Tags.PingRttMeasured]: "pingRttMeasured",
-  [P2pEvent_Tags.PingTimeout]: "pingTimeout",
+  [P2pEvent_Tags.PingFailed]: "pingFailed",
   [P2pEvent_Tags.EndpointError]: "endpointError",
   [P2pEvent_Tags.ReachabilityChanged]: "reachabilityChanged",
   [P2pEvent_Tags.ListenAddressesChanged]: "listenAddressesChanged",

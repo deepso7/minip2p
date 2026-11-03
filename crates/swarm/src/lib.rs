@@ -41,7 +41,7 @@ mod driver;
 
 pub use crate::core::{DriverError, SwarmCore};
 pub use crate::events::{
-    IdentifyFailure, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError,
+    IdentifyFailure, PingFailure, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError,
 };
 pub use crate::held::{HeldStream, HeldWrites};
 pub use crate::state::{

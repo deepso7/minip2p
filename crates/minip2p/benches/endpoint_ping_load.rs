@@ -10,7 +10,7 @@
 //! takes [`SAMPLES`] samples with at most one ping outstanding, each sent
 //! [`INTERVAL`] after the previous one or as soon as it completes, whichever
 //! is later. A sample that takes longer than [`SAMPLE_TIMEOUT`], or a
-//! `PingTimeout`, fails the run.
+//! `PingFailed`, fails the run.
 //!
 //! Loads, running on M throughout the sampling window, with the load peers on
 //! loopback QUIC:
@@ -282,8 +282,8 @@ fn sample(m: &mut Endpoint, peer: &PeerId) -> Duration {
                 assert!(rtt <= SAMPLE_TIMEOUT, "ping sample took {rtt:?}");
                 return rtt;
             }
-            EndpointEvent::PingTimeout { peer_id, .. } => {
-                assert!(&peer_id != peer, "ping timed out");
+            EndpointEvent::PingFailed { peer_id, cause, .. } => {
+                assert!(&peer_id != peer, "ping failed: {cause}");
             }
             _ => {}
         }

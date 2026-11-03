@@ -104,10 +104,17 @@ pub enum SwarmEvent {
         conn_id: ConnectionId,
         rtt_ms: u64,
     },
-    /// A ping sent on `conn_id` timed out.
-    PingTimeout {
+    /// A ping attempt on `conn_id` ended without an echo, for `cause`.
+    ///
+    /// Every accepted [`ping`](crate::SwarmCore::ping) ends in exactly one
+    /// [`PingRttMeasured`](Self::PingRttMeasured) or `PingFailed`, unless
+    /// the connection closes first, which ends it with
+    /// [`ConnectionClosed`](Self::ConnectionClosed). The connection stays
+    /// open; the next ping opens a fresh stream if this one was lost.
+    PingFailed {
         peer_id: PeerId,
         conn_id: ConnectionId,
+        cause: PingFailure,
     },
     /// A user-registered protocol was successfully negotiated on a stream.
     /// `initiated_locally` is `true` when we opened the stream and `false`
@@ -194,7 +201,7 @@ impl SwarmEvent {
             | Self::PeerReady { peer_id, .. }
             | Self::IdentifyFailed { peer_id, .. }
             | Self::PingRttMeasured { peer_id, .. }
-            | Self::PingTimeout { peer_id, .. }
+            | Self::PingFailed { peer_id, .. }
             | Self::StreamReady { peer_id, .. }
             | Self::StreamData { peer_id, .. }
             | Self::StreamWritable { peer_id, .. }
@@ -263,6 +270,34 @@ impl core::fmt::Display for IdentifyFailure {
             Self::Rejected => "identify rejected by the peer",
             Self::ClosedEarly => "identify stream closed before the reply",
             Self::Malformed => "identify reply malformed",
+        })
+    }
+}
+
+/// Why a ping attempt failed; see [`SwarmEvent::PingFailed`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum PingFailure {
+    /// The attempt did not finish within the ping deadline
+    /// ([`SwarmTimeouts::ping_ms`](crate::SwarmTimeouts::ping_ms)) of the
+    /// `ping` call: opening the stream, negotiating it, or the echo ran out.
+    TimedOut,
+    /// The transport refused to open the ping stream.
+    OpenFailed,
+    /// The peer refused `/ipfs/ping/1.0.0` during protocol negotiation, or
+    /// broke the negotiation.
+    Rejected,
+    /// The ping stream closed, was reset, or carried a bad echo before a
+    /// matching echo arrived.
+    StreamClosed,
+}
+
+impl core::fmt::Display for PingFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::TimedOut => "ping timed out",
+            Self::OpenFailed => "ping stream failed to open",
+            Self::Rejected => "ping rejected by the peer",
+            Self::StreamClosed => "ping stream closed before the echo",
         })
     }
 }

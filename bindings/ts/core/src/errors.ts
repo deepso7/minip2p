@@ -5,6 +5,7 @@ import type {
   DriverFailureKind,
   EndpointErrorKind,
   NatErrorKind,
+  PingFailure,
 } from "./types.js";
 
 /** Pubsub rejected a publish because its bounded native queue is full. */
@@ -176,6 +177,22 @@ export class PeerDisconnectedError extends Error {
     this.name = "PeerDisconnectedError";
     this.peerId = peerId;
     this.operation = operation;
+  }
+}
+
+/** A ping attempt failed natively; `cause` says why. */
+export class PingFailedError extends Error {
+  readonly peerId: string;
+  /** The connection the ping was sent on. */
+  readonly connId: number;
+  readonly cause: PingFailure;
+
+  constructor(options: { peerId: string; connId: number; cause: PingFailure }) {
+    super(`Ping to ${options.peerId} failed: ${options.cause}`);
+    this.name = "PingFailedError";
+    this.peerId = options.peerId;
+    this.connId = options.connId;
+    this.cause = options.cause;
   }
 }
 

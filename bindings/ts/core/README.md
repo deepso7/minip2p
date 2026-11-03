@@ -62,7 +62,7 @@ const endpoint = Minip2p.create({
 });
 ```
 
-`timeouts` overrides the protocol deadlines, in milliseconds: `negotiationMs` (one outbound stream's protocol negotiation), `identifyMs` (the time a connection's first Identify may take; the connection is closed if it fails or runs out) and `pingMs` (one ping's echo). Each defaults to 10 s; omitted fields keep it. Keep `identifyMs` at least `negotiationMs`, and raise both on links whose loaded RTT exceeds a few seconds. A zero throws `InvalidConfigError` with capability `Options`. Unlike `limits`, `timeouts` applies in `@minip2p/web` too. The `minip2p-rs` README's Deadlines table lists every deadline and how they relate.
+`timeouts` overrides the protocol deadlines, in milliseconds: `negotiationMs` (one outbound stream's protocol negotiation), `identifyMs` (the time a connection's first Identify may take, its negotiation included; the connection is closed if it fails or runs out) and `pingMs` (one ping, from opening its stream to the echo). `identifyMs` defaults to 30 s and the others to 10 s; omitted fields keep their default. Raise them on links whose loaded RTT exceeds a few seconds. `waitPeerReady`'s default timeout allows a connect plus `identifyMs`. A zero throws `InvalidConfigError` with capability `Options`. Unlike `limits`, `timeouts` applies in `@minip2p/web` too. The `minip2p-rs` README's Deadlines table lists every deadline and how they relate.
 
 ```ts
 const endpoint = Minip2p.create({

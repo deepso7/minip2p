@@ -546,7 +546,7 @@ fn connection_ids(event: &P2pEvent) -> Vec<u64> {
         | P2pEvent::PeerReady { conn_id, .. }
         | P2pEvent::IdentifyReceived { conn_id, .. }
         | P2pEvent::PingRttMeasured { conn_id, .. }
-        | P2pEvent::PingTimeout { conn_id, .. }
+        | P2pEvent::PingFailed { conn_id, .. }
         | P2pEvent::StreamReady { conn_id, .. }
         | P2pEvent::StreamData { conn_id, .. }
         | P2pEvent::StreamWriteAccepted { conn_id, .. }
@@ -993,9 +993,10 @@ mod tests {
 
         // A ping the application waits on keeps its connection.
         carry.push(established(5));
-        let ping = P2pEvent::PingTimeout {
+        let ping = P2pEvent::PingFailed {
             peer_id: "peer".into(),
             conn_id: 5,
+            cause: crate::PingFailure::TimedOut,
         };
         carry.push(ping.clone());
         carry.push(closed(5));
@@ -1073,14 +1074,16 @@ mod tests {
         carry.push(established(2));
         // Other droppable events push both openings out.
         for index in 0..MAX_CARRY_EVENTS - 1 {
-            carry.push(P2pEvent::PingTimeout {
+            carry.push(P2pEvent::PingFailed {
                 peer_id: index.to_string(),
                 conn_id: 100,
+                cause: crate::PingFailure::TimedOut,
             });
         }
-        assert!(carry.push(P2pEvent::PingTimeout {
+        assert!(carry.push(P2pEvent::PingFailed {
             peer_id: "last".into(),
             conn_id: 100,
+            cause: crate::PingFailure::TimedOut,
         }));
         carry.push(peer_ready(1));
         carry.push(closed(1));
@@ -1089,7 +1092,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .all(|event| matches!(event, P2pEvent::PingTimeout { conn_id: 100, .. })),
+                .all(|event| matches!(event, P2pEvent::PingFailed { conn_id: 100, .. })),
             "nothing about connections 1, 2 or 3 is left"
         );
     }
@@ -1111,9 +1114,10 @@ mod tests {
         let mut carry = Carry::default();
         let mut dropped = 0;
         for index in 0..=MAX_CARRY_EVENTS {
-            dropped += usize::from(carry.push(P2pEvent::PingTimeout {
+            dropped += usize::from(carry.push(P2pEvent::PingFailed {
                 peer_id: index.to_string(),
                 conn_id: 1,
+                cause: crate::PingFailure::TimedOut,
             }));
         }
 
@@ -1122,9 +1126,10 @@ mod tests {
         let retained = carry.take(MAX_CARRY_EVENTS);
         assert_eq!(
             retained.first(),
-            Some(&P2pEvent::PingTimeout {
+            Some(&P2pEvent::PingFailed {
                 peer_id: "1".into(),
                 conn_id: 1,
+                cause: crate::PingFailure::TimedOut,
             })
         );
     }
@@ -1174,9 +1179,10 @@ mod tests {
             kind: crate::NatErrorKind::NoPathAvailable,
             detail: "no path".into(),
         };
-        let ping = |index: usize| P2pEvent::PingTimeout {
+        let ping = |index: usize| P2pEvent::PingFailed {
             peer_id: index.to_string(),
             conn_id: 1,
+            cause: crate::PingFailure::TimedOut,
         };
 
         // A full carry of non-payload events drops the oldest event — the
@@ -1242,9 +1248,10 @@ mod tests {
             kind: crate::NatErrorKind::NoPathAvailable,
             detail: "no path".into(),
         };
-        let ping = |index: usize| P2pEvent::PingTimeout {
+        let ping = |index: usize| P2pEvent::PingFailed {
             peer_id: index.to_string(),
             conn_id: 1,
+            cause: crate::PingFailure::TimedOut,
         };
         let lost = MAX_CARRY_EVENTS as u64;
 

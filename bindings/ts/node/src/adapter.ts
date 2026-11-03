@@ -28,13 +28,13 @@ function nodeBackend(config: Minip2pConfig): Minip2pBackend {
 
 /** High-level Node.js owner for one native minip2p endpoint. */
 export class Minip2p extends Minip2pBase {
-  private constructor(backend: Minip2pBackend, relays: readonly string[]) {
-    super(backend, relays);
+  private constructor(backend: Minip2pBackend, config: Minip2pConfig) {
+    super(backend, config);
   }
 
   /** Constructs and starts a Node.js endpoint. */
   static create(config: Minip2pConfig): Minip2p {
-    return new Minip2p(nodeBackend(config), config.relays ?? []);
+    return new Minip2p(nodeBackend(config), config);
   }
 }
 

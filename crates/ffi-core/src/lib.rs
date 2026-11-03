@@ -56,7 +56,7 @@ pub use events::convert_reachability;
 pub use events::{
     CloseOutcome, ConnectionCloseReason, ConnectionInfo, DiscoverySource, DriverFailureKind,
     EndpointErrorKind, EventDoorbell, IdentifyInfo, MdnsFailureKind, NatErrorKind,
-    OpenStreamResult, P2pEvent, PathKind, Reachability, UnfinishedConnection,
+    OpenStreamResult, P2pEvent, PathKind, PingFailure, Reachability, UnfinishedConnection,
     convert_endpoint_event, convert_identify, convert_path,
 };
 pub use writes::{map_write_error, stream_writer, write_accepted_event};

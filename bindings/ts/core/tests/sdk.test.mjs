@@ -26,6 +26,8 @@ import {
   NatErrorKind,
   OpenStreamError,
   PeerDisconnectedError,
+  PingFailedError,
+  PingFailure,
   Stream,
   StreamClosedError,
   TimeoutError,
@@ -33,8 +35,8 @@ import {
 } from "../src/index.ts";
 
 class TestMinip2p extends Minip2pBase {
-  constructor(backend) {
-    super(backend, []);
+  constructor(backend, config = {}) {
+    super(backend, config);
   }
 }
 
@@ -805,6 +807,53 @@ test("ping coalesces native work while caller abort remains independent", async 
   });
   assert.equal(await second, 7);
   endpoint.close();
+});
+
+test("ping rejects promptly with the native PingFailed cause", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const ping = endpoint.ping("peer", { timeoutMs: 0 });
+  backend.emit({
+    inner: { cause: PingFailure.Rejected, connId: 3, peerId: "peer" },
+    tag: P2pEvent_Tags.PingFailed,
+  });
+  await tick();
+
+  assert.equal(await remainsPending(ping), false);
+  await assert.rejects(ping, (error) => {
+    assert.ok(error instanceof PingFailedError);
+    assert.equal(error.cause, PingFailure.Rejected);
+    assert.equal(error.connId, 3);
+    assert.equal(error.peerId, "peer");
+    return true;
+  });
+  endpoint.close();
+});
+
+test("waitPeerReady by default allows the connect and Identify deadlines", async () => {
+  vi.useFakeTimers();
+  try {
+    const backend = new MockBackend();
+    const endpoint = new TestMinip2p(backend, {
+      timeouts: { identifyMs: 60_000 },
+    });
+    const ready = endpoint.waitPeerReady("peer");
+    const settled = (async () => {
+      try {
+        return await ready;
+      } catch (error) {
+        return error;
+      }
+    })();
+    // Connect (30 s) + Identify (60 s) + 5 s.
+    await vi.advanceTimersByTimeAsync(94_999);
+    assert.equal(await remainsPending(settled), true);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.ok((await settled) instanceof TimeoutError);
+    endpoint.close();
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("ping coalescing recovers after its last waiter leaves and rejects on teardown", async () => {
