@@ -4,6 +4,10 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### TCP holds one encrypted frame above the socket (#477)
+
+`TcpConfig::default().max_buffered_send` is now 0, down from 1 MiB: a TCP connection holds one encrypted Yamux frame for its socket at a time, so streams share a slow link in Yamux's round-robin order and pings and window updates are not queued behind up to 1 MiB of earlier writes. The kernel's send buffer still keeps the link busy. To restore the deep queue, set `max_buffered_send: 1024 * 1024` (`limits.tcp.maxBufferedSend` in the bindings).
+
 ### The default negotiation deadline is 30 s (#505)
 
 `SwarmTimeouts::default().negotiation_ms` (`OUTBOUND_NEGOTIATION_TIMEOUT_MS`) is now 30 s, up from 10 s, so an outbound stream whose negotiation queues behind a bulk transfer on a slow link waits instead of failing. Ping streams and the first Identify stream are not affected: `ping_ms` and `identify_ms` bound their negotiation. Every surface on the default picks it up (Endpoint, the portable and smoltcp endpoints, UniFFI, Node and web). A peer that never answers a proposal now takes 30 s to fail; one that rejects the protocol still fails at once. To keep the old bound on those streams, set `negotiation_ms: 10_000` (`negotiationMs` in the bindings).
