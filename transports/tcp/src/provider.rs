@@ -287,6 +287,13 @@ pub trait TcpProvider {
     /// and retries on its next poll. Accepting nothing is a valid short write.
     /// `data` is never empty.
     ///
+    /// Once the stream is connected, accept nothing only while the send
+    /// buffer is full, so room comes back only as the peer acknowledges data:
+    /// the transport takes the first write accepted after a refusal as proof
+    /// the peer is alive, and skips the Yamux keepalive ping for it. A
+    /// provider that refused for any other reason (a per-poll write budget,
+    /// say) could keep a dead peer's connection alive.
+    ///
     /// A socket that keeps accepting nothing eventually fails the connection,
     /// so a provider that can tell a busy peer from a dead one should report
     /// the dead one as [`TcpEvent::Closed`] rather than refuse writes forever.
