@@ -912,11 +912,13 @@ blume-tabs [data-blume-tab-panel] {
     transform: scale(1);
   }
 }
+/* `scale`, not `transform`: the segment's `scale-x-0` sets `scale`, which
+   would otherwise multiply the fill back to nothing. */
 @keyframes scene-fill {
   0% {
-    transform: scaleX(0);
+    scale: 0 1;
   }
   100% {
-    transform: scaleX(1);
+    scale: 1 1;
   }
 }
