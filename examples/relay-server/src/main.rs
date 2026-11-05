@@ -77,12 +77,24 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         endpoint.peer_id(),
         options.accepting
     );
-    for address in endpoint.listen_all()? {
+    let listening = endpoint.listen_all()?;
+    for address in &listening {
         println!("[relay] listening={address}");
         if address.transport().is_webtransport() && certificate.is_none() {
             // What a browser dials: the certhash pins this node's certificate.
             println!("[relay] webtransport={address}");
         }
+    }
+    // Wildcard listeners are never advertised. With nothing announced the
+    // relay still grants reservations, with an empty address list.
+    if options.announce_addrs.is_empty()
+        && listening
+            .iter()
+            .all(|address| address.transport().is_wildcard_host())
+    {
+        println!(
+            "[relay] no public address to advertise; clients will use the address they dialed (set --announce to advertise one)"
+        );
     }
     // A CA-signed certificate names a domain, so browsers dial the announced
     // `/dns` address, not a listener's IP.
@@ -331,9 +343,13 @@ fn print_event(event: RelayServerEvent) {
             "[relay] reservation accepted peer={peer_id} renewed={renewed} expires_unix_secs={}",
             expires_unix_secs.map_or_else(|| "unavailable".into(), |value| value.to_string())
         ),
-        RelayServerEvent::ReservationDenied { peer_id, status } => {
-            println!("[relay] reservation denied peer={peer_id} status={status:?}")
-        }
+        RelayServerEvent::ReservationDenied {
+            peer_id,
+            status,
+            reason,
+        } => println!(
+            "[relay] reservation denied peer={peer_id} status={status:?} reason={reason:?}"
+        ),
         RelayServerEvent::ReservationClosed { peer_id, reason } => {
             println!("[relay] reservation closed peer={peer_id} cause={reason:?}")
         }
