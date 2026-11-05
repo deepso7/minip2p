@@ -29,11 +29,14 @@ pub use session::YamuxSession;
 /// Multistream-select protocol identifier for libp2p Yamux.
 pub const YAMUX_PROTOCOL_ID: &str = "/yamux/1.0.0";
 
-/// How long a session may go without receiving a frame before it probes
-/// the peer with a keepalive ping.
+/// How long a session may go without hearing from the peer before it probes
+/// it with a keepalive ping.
 ///
-/// Only received frames count: a session that keeps writing to a peer that
-/// never answers still probes. The host drives keepalive through
+/// Received frames count, and so does the host reporting that the peer
+/// acknowledged sent bytes ([`YamuxSession::note_peer_acked`]): a bulk upload
+/// whose replies are stuck behind it on a slow link is not probed while its
+/// socket keeps draining. Writing alone does not count, so a session that
+/// keeps writing to a peer that never answers still probes. The host drives keepalive through
 /// [`YamuxSession::poll`] / [`YamuxSession::next_deadline`]; the session
 /// never reads a clock of its own. 30 seconds matches go-libp2p yamux's
 /// default `KeepAliveInterval`.
