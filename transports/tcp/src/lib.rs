@@ -64,9 +64,12 @@
 //! connection as
 //! [`ConnectionCloseReason::TimedOut`](minip2p_transport::ConnectionCloseReason::TimedOut).
 //! A socket that accepts bytes after refusing some counts as hearing from
-//! the peer, like a received frame: its full send buffer freed room, which
-//! takes the peer's TCP acknowledgements. So a bulk upload whose replies are
-//! stuck behind it on a slow link is not probed while it keeps draining.
+//! the peer, like a received frame. This is best-effort evidence resting on
+//! the [`TcpProvider::send`] contract: a full send buffer frees room as the
+//! peer's TCP acknowledges data, so a bulk upload whose replies are stuck
+//! behind it on a slow link is not probed while it keeps draining. A ping
+//! already sent still needs its own reply, and once local writes stop there
+//! is nothing left to drain, so delivery still in flight can time out.
 //! A keepalive timeout or Yamux protocol failure ends the open streams with
 //! that `Closed`, not with a `StreamClosed` each, as QUIC reports a lost
 //! connection. A local close or a remote `GoAway` still closes each stream
