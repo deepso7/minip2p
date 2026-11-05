@@ -29,16 +29,16 @@ std = [
 smoltcp = ["dep:minip2p-smoltcp"]
 
 [dependencies]
-minip2p-core = { path = "../../crates/core", version = "0.11.3", default-features = false }
-minip2p-identity = { path = "../../crates/identity", version = "0.11.3", default-features = false, features = [
+minip2p-core = { path = "../../crates/core", version = "0.11.4", default-features = false }
+minip2p-identity = { path = "../../crates/identity", version = "0.11.4", default-features = false, features = [
   "ed25519",
 ] }
-minip2p-secure-mux = { path = "../../crates/secure-mux", version = "0.11.3", default-features = false }
-minip2p-transport = { path = "../../crates/transport", version = "0.11.3", default-features = false }
+minip2p-secure-mux = { path = "../../crates/secure-mux", version = "0.11.4", default-features = false }
+minip2p-transport = { path = "../../crates/transport", version = "0.11.4", default-features = false }
 mio = { workspace = true, optional = true }
 # `all` exposes `TCP_NOTSENT_LOWAT`.
 socket2 = { workspace = true, optional = true, features = ["all"] }
-minip2p-smoltcp = { path = "../../crates/smoltcp", version = "0.11.3", optional = true }
+minip2p-smoltcp = { path = "../../crates/smoltcp", version = "0.11.4", optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
