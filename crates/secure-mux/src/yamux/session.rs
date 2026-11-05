@@ -2435,6 +2435,23 @@ mod tests {
     }
 
     #[test]
+    fn peer_acknowledged_sends_do_not_answer_a_ping() {
+        let mut session = probing_session();
+        let _ping = decode(&outbound(&mut session));
+        let sent = KEEPALIVE_INTERVAL_MS + 1;
+        session.poll(Now::from_millis(sent)).unwrap();
+
+        session.note_peer_acked();
+        session
+            .poll(Now::from_millis(sent + KEEPALIVE_ACK_TIMEOUT_MS - 1))
+            .unwrap();
+        assert_eq!(
+            session.poll(Now::from_millis(sent + KEEPALIVE_ACK_TIMEOUT_MS)),
+            Err(YamuxError::KeepaliveTimeout)
+        );
+    }
+
+    #[test]
     fn a_matching_ack_restarts_the_quiet_interval() {
         let mut session = probing_session();
         let ping = decode(&outbound(&mut session));
