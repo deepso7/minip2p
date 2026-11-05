@@ -267,6 +267,39 @@ fn quic_clients_exchange_payload_through_quic_relay_endpoint() {
     });
 }
 
+/// A relay bound only to a wildcard, with nothing announced, has no address
+/// to advertise: it grants reservations with an empty address list, and
+/// clients build circuit addresses from the address they dialed it at.
+#[cfg(feature = "quic")]
+#[test]
+fn a_wildcard_only_relay_grants_reservations_and_relays_circuits() {
+    let relay = Endpoint::builder()
+        .relay_server()
+        .listen_on("/ip4/0.0.0.0/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind relay");
+    let bound = relay.bound_addresses().pop().expect("bound address");
+    let port = bound
+        .iter()
+        .find_map(|protocol| match protocol {
+            minip2p::Protocol::Udp(port) => Some(*port),
+            _ => None,
+        })
+        .expect("bound UDP port");
+    let dialed = format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+        .parse()
+        .unwrap();
+    let relay_addr = PeerAddr::new(dialed, relay.peer_id().clone()).unwrap();
+    exercise_relay(relay, relay_addr, |builder| {
+        builder
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind client")
+    });
+}
+
 #[cfg(feature = "tcp")]
 #[test]
 fn tcp_clients_exchange_payload_through_tcp_relay_endpoint() {

@@ -12,8 +12,8 @@ use minip2p_core::{Multiaddr, PeerId, Protocol};
 use minip2p_relay::{FrameDecode, HopMessage, MAX_MESSAGE_SIZE, decode_frame};
 use minip2p_relay_server::{
     RateLimit, RelayServerAddrSource, RelayServerAddressError, RelayServerConfig, RelayServerEvent,
-    RelayServerRuntimeError, RelayServerRuntimeErrorKind, ReservationCloseReason, Status,
-    StreamKey,
+    RelayServerRuntimeError, RelayServerRuntimeErrorKind, ReservationCloseReason,
+    ReservationDenialReason, Status, StreamKey,
 };
 use minip2p_transport::ConnectionId;
 
@@ -187,6 +187,7 @@ fn paused_reservation_is_denied_without_consuming_capacity() {
         [RelayServerEvent::ReservationDenied {
             ref peer_id,
             status: Status::ReservationRefused,
+            reason: ReservationDenialReason::Paused,
         }] if *peer_id == remote
     ));
     assert_eq!(node.reservation_count(), 0);
@@ -255,6 +256,7 @@ fn a_reservation_refused_for_capacity_spends_no_rate_token() {
         node.events()[..],
         [RelayServerEvent::ReservationDenied {
             status: Status::ResourceLimitExceeded,
+            reason: ReservationDenialReason::ReservationLimit,
             ..
         }]
     ));
@@ -420,9 +422,10 @@ fn address_sources_fail_and_restore_independently() {
 }
 
 /// A relay bound only to a wildcard, with nothing announced, has no address
-/// to put in a reservation: the refusal names that cause.
+/// to advertise: it still grants, with an empty address list and an expiry.
+/// The client builds circuit addresses from the address it dialed.
 #[test]
-fn reservation_refused_for_lack_of_addresses_names_the_cause() {
+fn a_relay_with_no_advertisable_address_grants_with_no_addresses() {
     let remote = peer(b"client-wildcard-relay");
     let stream = key(38, 1);
     let mut node = Node::unannounced(RelayServerConfig::default());
@@ -434,22 +437,21 @@ fn reservation_refused_for_lack_of_addresses_names_the_cause() {
     .unwrap();
     node.events();
     node.establish(&remote, stream.conn_id);
-    node.feed_hop(&remote, stream, reserve_request(), &[]);
+    let now = Now::new(10, 1_000);
+    node.hop_ready(&remote, stream, now);
+    let request = minip2p_relay::encode_frame(&reserve_request().encode());
+    node.data(&remote, stream, &request, now);
 
+    let reply = reply_on(&node.calls(), stream);
+    assert_eq!(reply.status, Some(Status::Ok));
+    let reservation = reply.reservation.expect("a reservation");
+    assert!(reservation.addrs.is_empty());
+    assert_eq!(reservation.expire, Some(4_600));
     assert!(matches!(
         &node.events()[..],
-        [
-            RelayServerEvent::Error(RelayServerRuntimeError {
-                kind: RelayServerRuntimeErrorKind::NoAdvertisableAddrs,
-                peer_id: Some(error_peer),
-                ..
-            }),
-            RelayServerEvent::ReservationDenied {
-                peer_id,
-                status: Status::ReservationRefused,
-            },
-        ] if *peer_id == remote && *error_peer == remote
+        [RelayServerEvent::ReservationAccepted { peer_id, .. }] if *peer_id == remote
     ));
+    assert_eq!(node.reservation_connection(&remote), Some(stream.conn_id));
 }
 
 #[test]
@@ -465,6 +467,7 @@ fn hop_over_circuit_negotiates_then_denies_with_permission_status() {
         [RelayServerEvent::ReservationDenied {
             ref peer_id,
             status: Status::PermissionDenied,
+            reason: ReservationDenialReason::OverCircuit,
         }] if *peer_id == remote
     ));
     assert_eq!(

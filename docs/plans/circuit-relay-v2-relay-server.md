@@ -147,7 +147,7 @@ pub enum RelayServerEvent {
         renewed: bool,
         expires_unix_secs: Option<u64>,
     },
-    ReservationDenied { peer_id: PeerId, status: Status },
+    ReservationDenied { peer_id: PeerId, status: Status, reason: ReservationDenialReason },
     ReservationClosed { peer_id: PeerId, reason: ReservationCloseReason },
     CircuitDenied {
         source_peer_id: PeerId,
@@ -189,9 +189,9 @@ pub enum CircuitCloseReason {
 }
 ```
 
-Denial events expose the exact `minip2p_relay::Status`, re-exported from `minip2p`. All event and reason types above, `RelayServerConfig`, `RateLimit`, the three error types, `RelayServerAddressErrorKind`, and `RelayServerRuntimeError{,Kind}` are also re-exported.
+Denial events expose the exact `minip2p_relay::Status`, re-exported from `minip2p`. `ReservationDenied` also carries a local `ReservationDenialReason` (`Paused`, `OverCircuit`, `RateLimited`, `ReservationLimit`, `ResponseNotEncodable`) whose `status()` is the wire status, so a paused relay's refusal is distinguishable from a limit; the reason never goes on the wire. All event and reason types above, `RelayServerConfig`, `RateLimit`, the three error types, `RelayServerAddressErrorKind`, and `RelayServerRuntimeError{,Kind}` are also re-exported.
 
-`RelayServerRuntimeError` follows the Swarm error pattern: public `kind`, optional `peer_id`, and human-readable `detail`, with no connection/stream key or agent token. `RelayServerRuntimeErrorKind` has stable operation categories `OpenStream`, `SendStream`, `CloseStream`, `ResetStream`, `InternalInvariant`, and `NoAdvertisableAddrs`. Synchronous configuration/control failures use returned errors; asynchronous transport/driver failures use `RelayServerEvent::Error`. `NoAdvertisableAddrs` is the one diagnostic that is not a failure: it accompanies `ReservationDenied { status: ReservationRefused }` when the relay is accepting but no address source has a usable address, and is not emitted while paused. An internal failure that terminates a committed lifecycle emits both its stable close reason and one diagnostic error event.
+`RelayServerRuntimeError` follows the Swarm error pattern: public `kind`, optional `peer_id`, and human-readable `detail`, with no connection/stream key or agent token. `RelayServerRuntimeErrorKind` has stable operation categories `OpenStream`, `SendStream`, `CloseStream`, `ResetStream`, and `InternalInvariant`. Synchronous configuration/control failures use returned errors; asynchronous transport/driver failures use `RelayServerEvent::Error`. An internal failure that terminates a committed lifecycle emits both its stable close reason and one diagnostic error event.
 
 Emit each `ReservationDenied`/`CircuitDenied` once when the agent makes the stable denial decision. Failure to deliver that status adds one runtime error; it neither suppresses nor duplicates the denial event. Acceptance/open events, by contrast, require transport acceptance at the commit points defined below.
 
@@ -274,9 +274,9 @@ For every new reservation or renewal, choose exactly the first non-empty usable 
 
 Never promote raw Identify observed addresses. Normalize in source order and deduplicate first-wins. The only accepted shapes are `/{ip4|ip6|dns|dns4|dns6}/.../tcp/<port>` and `/{ip4|ip6|dns|dns4|dns6}/.../udp/<port>/quic-v1`, each with an optional trailing `/p2p/<local-peer-id>`. Reject wildcard hosts, any `/p2p-circuit`, a conflicting peer ID, and every other protocol shape. Strip an optional matching peer ID from the normalized transport form, then append the local peer ID exactly once when encoding a RESERVE response.
 
-The normalized selected set contributes to future Identify responses. A RESERVE response encodes the longest source-order prefix that fits the 8 KiB relay control frame, dropping only trailing addresses. If no address can be sent, treat the source as unusable.
+The normalized selected set contributes to future Identify responses. A RESERVE response encodes the longest source-order prefix that fits the 8 KiB relay control frame, dropping only trailing addresses, down to none.
 
-With no usable address, deny new reservations and renewals with `RESERVATION_REFUSED`. A failed renewal keeps its prior reservation and deadline. Address changes never terminate reservations or circuits; existing reservations remain valid CONNECT destinations.
+With no usable address (say, a relay bound only to `0.0.0.0` or `::` with nothing announced or confirmed), grant reservations and renewals with an empty `addrs` list, still with the expiry and limit; clients build circuit addresses from the address they dialed the relay at. Wildcards are never advertised or expanded into interface addresses. A failed renewal keeps its prior reservation and deadline. Address changes never terminate reservations or circuits; existing reservations remain valid CONNECT destinations.
 
 ### Reservation cardinality and lifecycle
 
@@ -285,7 +285,7 @@ There is at most one committed reservation per peer. The record stores its ownin
 - RESERVE on the owning connection is a renewal.
 - A replacement connection (`ConnectionReplaced`) takes over a reservation when it is direct, keeping the original expiry; a circuit replacement closes the reservation with `ConnectionClosed`.
 - A renewal consumes no peer/IP reservation limiter token and replaces its capacity slot rather than consuming another global slot; a fresh reservation consumes both.
-- Admission order for every syntactically valid RESERVE is: accepting and a usable address set; peer limiter; IP limiter; exact global capacity; response acceptance and commit. A denial at the availability step consumes no token. The peer token is consumed before the IP check, and a capacity-denied attempt consumes both applicable tokens but no slot. Capacity uses would-exceed semantics, so equality is allowed and zero denies new work. Renewal performs the same checks but treats its existing slot as replacement capacity.
+- Admission order for every syntactically valid RESERVE is: accepting and an encodable response; peer limiter; IP limiter; exact global capacity; response acceptance and commit. A denial at an availability or admission check consumes no token. Tokens are spent together only after the capacity check passes, so a capacity-denied attempt spends no token and takes no slot. Capacity uses would-exceed semantics, so equality is allowed and zero denies new work. A renewal skips the rate-limit and capacity checks, spends no token, and keeps its existing slot.
 
 The IP key is the first IP4/IP6 component of the exact connection's remote transport address. When none exists, the IP limiter is not applicable. Failed availability returns `RESERVATION_REFUSED`; rate/capacity denial returns `RESOURCE_LIMIT_EXCEEDED`.
 
