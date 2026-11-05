@@ -146,14 +146,14 @@ export const initScene = (root: HTMLElement) => {
     }
   });
 
-  // Start when the stage itself is on screen (not the step list beside it);
+  // Start when the stage itself is on screen (not just its footer);
   // pause when it scrolls away and pick up again on return. A stage taller
   // than the viewport (phone landscape) counts once it fills half the screen.
   // A reader who asks for less motion gets the finished frame and steps
   // through it by hand.
   const stage = root.querySelector("figure") ?? root;
   let seen = false;
-  new IntersectionObserver(
+  const observer = new IntersectionObserver(
     ([entry]) => {
       if (!entry) {
         return;
@@ -173,5 +173,17 @@ export const initScene = (root: HTMLElement) => {
       }
     },
     { threshold: [0, 0.1, 0.2, 0.3, 0.4] }
-  ).observe(stage);
+  );
+  observer.observe(stage);
+
+  // An observer stays alive while it observes, so let the scene go when
+  // Blume's client router swaps the page out.
+  document.addEventListener(
+    "astro:before-swap",
+    () => {
+      observer.disconnect();
+      stop();
+    },
+    { once: true }
+  );
 };
