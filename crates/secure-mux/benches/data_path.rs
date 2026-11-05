@@ -14,11 +14,11 @@ const IDLE_STREAMS: usize = 1024;
 const ACTIVE_STREAMS: usize = 8;
 const SPARSE_LEN: usize = 64;
 
-/// A session with the specification's 256 KiB window and 64 KiB frames: the
-/// default grants more window with each stream's first window update, which
-/// these benches would otherwise measure as an extra frame per fresh stream,
-/// and splits each 64 KiB payload into 16 KiB frames. Pinned so the data path
-/// stays comparable across releases.
+/// A session with the specification's 256 KiB window and 64 KiB frames. The
+/// default config would grant more window with each stream's first window
+/// update, which these benches would measure as an extra frame per fresh
+/// stream, and would split each 64 KiB payload into 16 KiB frames. Pinned so
+/// the data path stays comparable across releases.
 fn session(role: YamuxRole) -> YamuxSession {
     let config = YamuxConfig {
         receive_window: DEFAULT_RECEIVE_WINDOW,
