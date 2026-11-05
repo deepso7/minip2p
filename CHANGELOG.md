@@ -6,7 +6,7 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ### The default negotiation deadline is 30 s (#505)
 
-`SwarmTimeouts::default().negotiation_ms` (`OUTBOUND_NEGOTIATION_TIMEOUT_MS`) is now 30 s, up from 10 s, so a stream whose negotiation queues behind a bulk transfer on a slow link waits instead of failing. Every surface on the default picks it up (Endpoint, the portable and smoltcp endpoints, UniFFI, Node and web). A peer that never answers a proposal now takes 30 s to fail; one that rejects the protocol still fails at once. To keep the old bound, set `negotiation_ms: 10_000` (`negotiationMs` in the bindings).
+`SwarmTimeouts::default().negotiation_ms` (`OUTBOUND_NEGOTIATION_TIMEOUT_MS`) is now 30 s, up from 10 s, so an outbound stream whose negotiation queues behind a bulk transfer on a slow link waits instead of failing. Ping streams and the first Identify stream are not affected: `ping_ms` and `identify_ms` bound their negotiation. Every surface on the default picks it up (Endpoint, the portable and smoltcp endpoints, UniFFI, Node and web). A peer that never answers a proposal now takes 30 s to fail; one that rejects the protocol still fails at once. To keep the old bound on those streams, set `negotiation_ms: 10_000` (`negotiationMs` in the bindings).
 
 ### Ping failures are events; ping and Identify deadlines cover their negotiation (#495, #496)
 
