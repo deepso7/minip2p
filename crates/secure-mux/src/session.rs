@@ -364,8 +364,9 @@ impl SecureMuxSession {
     /// Advances Yamux keepalive using the host's time sample.
     ///
     /// A no-op until the upgrade has finished: there is no Yamux session to
-    /// ping during negotiation. After that, a session that has received
-    /// nothing for a while queues a ping for [`poll_write`](Self::poll_write),
+    /// ping during negotiation. After that, a session that has heard nothing
+    /// from its peer for a while (no frame, no
+    /// [`note_peer_acked`](Self::note_peer_acked)) queues a ping for [`poll_write`](Self::poll_write),
     /// and one whose ping is not pulled or not answered in time fails with
     /// [`YamuxError::KeepaliveTimeout`] (see [`YamuxSession::poll`]): the
     /// peer went silent. Its substreams end with the session, without a
@@ -377,6 +378,15 @@ impl SecureMuxSession {
         match self.with_yamux(|yamux| yamux.poll(now)) {
             Ok(()) | Err(SessionError::NotEstablished) => Ok(()),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Tells Yamux keepalive the peer acknowledged bytes this session wrote;
+    /// see [`YamuxSession::note_peer_acked`] for what counts as evidence.
+    /// A no-op until the upgrade has finished.
+    pub fn note_peer_acked(&mut self) {
+        if let Some(Phase::Ready { yamux, .. }) = self.phase.as_mut() {
+            yamux.note_peer_acked();
         }
     }
 

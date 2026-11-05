@@ -1534,7 +1534,7 @@ fn closing_a_connection_drops_its_queued_writable() {
 }
 
 #[test]
-fn only_received_traffic_restarts_the_keepalive_clock() {
+fn a_write_the_socket_takes_does_not_restart_the_keepalive_clock() {
     const LATER: u64 = 10_000;
     let mut pair = upgraded_pair();
     let id = pair.connection;
@@ -1543,7 +1543,7 @@ fn only_received_traffic_restarts_the_keepalive_clock() {
         Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
     );
 
-    // Sending proves nothing about the peer: the deadline stands.
+    // A socket with room takes bytes for a dead peer too: the deadline stands.
     let stream = pair.dialer.open_stream(id).expect("open substream");
     pair.dialer
         .send_stream(id, stream, Bytes::from_static(b"hello"))
@@ -1620,6 +1620,101 @@ fn a_backed_up_connection_to_a_silent_peer_times_out() {
         "{events:?}"
     );
     assert!(pair.dialer.connection_ids().is_empty());
+}
+
+#[test]
+fn a_socket_that_keeps_draining_is_a_live_peer_until_it_stops() {
+    // No stall timeout: only keepalive can notice the peer is gone.
+    let config = TcpConfig {
+        send_stall_timeout_ms: None,
+        ..TcpConfig::default()
+    };
+    let mut pair = upgraded_pair_with(config, TcpConfig::default());
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // A bulk upload over a slow link: the socket takes 1 KiB a second, and
+    // nothing the peer sends back arrives (it is all queued behind data).
+    pair.dialer
+        .provider_mut()
+        .set_in_flight_capacity(Some(1024));
+    pair.dialer
+        .send_stream(id, stream, Bytes::from(vec![7u8; 200 * 1024]))
+        .expect("queue an upload that outlasts the test");
+    const ALIVE_UNTIL: u64 = 4 * KEEPALIVE_INTERVAL_MS;
+    for t in (0..=ALIVE_UNTIL).step_by(1_000) {
+        pair.listener.provider_mut().discard_received();
+        let events = pair.dialer.poll(Now::from_millis(t)).expect("poll");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TransportEvent::Closed { .. })),
+            "a socket that keeps draining is a live peer, at {t} ms: {events:?}"
+        );
+    }
+
+    // The peer dies: the socket stops draining. Keepalive is again the
+    // bound, measured from the last drain: the ping comes due a quiet
+    // interval later and cannot be handed off to the full socket.
+    let mut now = ALIVE_UNTIL;
+    let closed_at = loop {
+        let events = pair.dialer.poll(Now::from_millis(now)).expect("poll");
+        if events.iter().any(|event| {
+            *event
+                == TransportEvent::Closed {
+                    id,
+                    reason: ConnectionCloseReason::TimedOut,
+                }
+        }) {
+            break now;
+        }
+        now = pair
+            .dialer
+            .next_deadline()
+            .expect("a live connection has a keepalive deadline")
+            .as_millis()
+            .max(now + 1);
+    };
+    assert_eq!(
+        closed_at,
+        ALIVE_UNTIL + KEEPALIVE_INTERVAL_MS + KEEPALIVE_HANDOFF_TIMEOUT_MS
+    );
+}
+
+#[test]
+fn a_socket_with_room_to_spare_is_no_sign_of_life() {
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // A dead peer's socket still takes bytes while its buffer has room, so
+    // writes that never fill it say nothing: the ping goes out and goes
+    // unanswered.
+    let mut now = 0;
+    let closed_at = loop {
+        pair.listener.provider_mut().discard_received();
+        pair.dialer
+            .send_stream(id, stream, Bytes::from_static(b"tick"))
+            .expect("send");
+        let events = pair.dialer.poll(Now::from_millis(now)).expect("poll");
+        if events.iter().any(|event| {
+            *event
+                == TransportEvent::Closed {
+                    id,
+                    reason: ConnectionCloseReason::TimedOut,
+                }
+        }) {
+            break now;
+        }
+        now += 1_000;
+        assert!(now <= 2 * KEEPALIVE_INTERVAL_MS, "never timed out");
+    };
+    assert_eq!(
+        closed_at,
+        KEEPALIVE_INTERVAL_MS + 1_000 + KEEPALIVE_ACK_TIMEOUT_MS
+    );
 }
 
 #[test]

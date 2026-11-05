@@ -264,12 +264,13 @@ pub struct YamuxSession {
     failed: bool,
     local_go_away: bool,
     remote_go_away: bool,
-    /// Monotonic milliseconds of the first poll after the last received
-    /// frame, or of the first poll if none has arrived yet. `None` until the
-    /// host supplies a time sample.
-    last_received_ms: Option<u64>,
-    /// A frame arrived since `last_received_ms` was stamped.
-    received: bool,
+    /// Monotonic milliseconds of the first poll after the peer last showed
+    /// it was alive (a received frame, or [`Self::note_peer_acked`]), or of
+    /// the first poll if it has not yet. `None` until the host supplies a
+    /// time sample.
+    last_alive_ms: Option<u64>,
+    /// The peer showed it was alive since `last_alive_ms` was stamped.
+    alive: bool,
     /// The keepalive ping in flight, if any.
     probe: Option<Probe>,
     /// Nonce for the next keepalive ping; never zero.
@@ -314,8 +315,8 @@ impl YamuxSession {
             failed: false,
             local_go_away: false,
             remote_go_away: false,
-            last_received_ms: None,
-            received: false,
+            last_alive_ms: None,
+            alive: false,
             probe: None,
             next_ping_nonce: 1,
         }
@@ -323,8 +324,9 @@ impl YamuxSession {
 
     /// Advances keepalive using the host's time sample.
     ///
-    /// Once [`KEEPALIVE_INTERVAL_MS`] passes without a received frame, this
-    /// queues a ping; outbound traffic does not postpone it. The ping must
+    /// Once [`KEEPALIVE_INTERVAL_MS`] passes without a received frame or a
+    /// [`note_peer_acked`](Self::note_peer_acked), this queues a ping;
+    /// outbound traffic alone does not postpone it. The ping must
     /// then be pulled by [`poll_frame`](Self::poll_frame) within
     /// [`KEEPALIVE_HANDOFF_TIMEOUT_MS`], and acknowledged with its nonce
     /// within [`KEEPALIVE_ACK_TIMEOUT_MS`] of the first poll after that.
@@ -333,16 +335,17 @@ impl YamuxSession {
     /// per-stream events, as on a protocol failure, but no GoAway is queued
     /// for a peer presumed dead.
     ///
-    /// Frames received between polls are dated by the next poll's sample.
+    /// Frames received and acknowledgements noted between polls are dated by
+    /// the next poll's sample.
     pub fn poll(&mut self, now: Now) -> Result<(), YamuxError> {
         self.ensure_active()?;
         let now = now.monotonic_ms;
-        if self.received || self.last_received_ms.is_none() {
-            self.last_received_ms = Some(now);
-            self.received = false;
+        if self.alive || self.last_alive_ms.is_none() {
+            self.last_alive_ms = Some(now);
+            self.alive = false;
         }
         let Some(probe) = &mut self.probe else {
-            let quiet_since = self.last_received_ms.expect("stamped above");
+            let quiet_since = self.last_alive_ms.expect("stamped above");
             if now.saturating_sub(quiet_since) >= KEEPALIVE_INTERVAL_MS {
                 let nonce = self.next_ping_nonce;
                 self.next_ping_nonce = nonce.wrapping_add(1).max(1);
@@ -386,7 +389,7 @@ impl YamuxSession {
             return None;
         }
         let at = match self.probe.map(|probe| probe.phase) {
-            None => self.last_received_ms?.saturating_add(KEEPALIVE_INTERVAL_MS),
+            None => self.last_alive_ms?.saturating_add(KEEPALIVE_INTERVAL_MS),
             Some(ProbePhase::Queued { since }) => {
                 since.saturating_add(KEEPALIVE_HANDOFF_TIMEOUT_MS)
             }
@@ -396,6 +399,20 @@ impl YamuxSession {
             }
         };
         Some(Deadline::from_millis(at))
+    }
+
+    /// Tells keepalive the peer acknowledged bytes this session sent, which
+    /// shows it is alive as a received frame does: the quiet interval
+    /// restarts at the next [`poll`](Self::poll). An outstanding ping is
+    /// unaffected; only its own acknowledgement answers it.
+    ///
+    /// Call it only on evidence that needs the peer, such as a TCP socket
+    /// that refused bytes and later accepted more: a full send buffer frees
+    /// room only as the peer's TCP acknowledges data. A write the socket took
+    /// straight away is no such evidence, because a send buffer with room
+    /// takes bytes for a dead peer too, the keepalive ping included.
+    pub fn note_peer_acked(&mut self) {
+        self.alive = true;
     }
 
     /// Opens a local stream and returns its role-partitioned identifier.
@@ -602,7 +619,7 @@ impl YamuxSession {
             if let Err(error) = self.process_frame(frame) {
                 return self.fail_protocol(error);
             }
-            self.received = true;
+            self.alive = true;
             if self.remote_go_away {
                 self.decoder.clear();
                 return Ok(());
@@ -2296,7 +2313,35 @@ mod tests {
         assert_eq!(
             (ping.frame_type(), ping.flags()),
             (FrameType::Ping, FLAG_SYN),
-            "only received frames show the peer is alive"
+            "writing alone does not show the peer is alive"
+        );
+    }
+
+    #[test]
+    fn peer_acknowledged_sends_postpone_the_probe() {
+        let mut session = YamuxSession::new(YamuxRole::Client);
+        session.poll(Now::from_millis(0)).unwrap();
+
+        // Dated by the next poll, like a received frame.
+        session.note_peer_acked();
+        session.poll(Now::from_millis(5)).unwrap();
+        session
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .unwrap();
+        assert_eq!(session.poll_frame(), None, "the peer is alive: no probe");
+        assert_eq!(
+            session.next_deadline(),
+            Some(Deadline::from_millis(5 + KEEPALIVE_INTERVAL_MS))
+        );
+
+        session
+            .poll(Now::from_millis(5 + KEEPALIVE_INTERVAL_MS))
+            .unwrap();
+        let ping = decode(&outbound(&mut session));
+        assert_eq!(
+            (ping.frame_type(), ping.flags()),
+            (FrameType::Ping, FLAG_SYN),
+            "an interval without progress probes again"
         );
     }
 

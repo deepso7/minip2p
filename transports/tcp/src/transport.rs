@@ -61,6 +61,10 @@ struct Connection {
     /// `None` means the last flush made progress. Cleared the moment the
     /// socket accepts anything again.
     stalled_since: Option<u64>,
+    /// The socket refused bytes and has not accepted any since. Its next
+    /// acceptance shows the peer is alive: a full send buffer frees room only
+    /// as the peer's TCP acknowledges data.
+    refused: bool,
     /// When this connection stops being given time to authenticate.
     ///
     /// Stamped by the first poll to see it rather than by the call that made
@@ -93,6 +97,7 @@ impl Connection {
             session,
             outbound: VecDeque::new(),
             stalled_since: None,
+            refused: false,
             authenticate_by: None,
             wake_at: None,
         }
@@ -413,7 +418,13 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 self.provider.send(connection.socket, pending)?
             };
             if accepted == 0 {
+                connection.refused = true;
                 break;
+            }
+            if core::mem::take(&mut connection.refused) {
+                // Drained after refusing: the peer's TCP acknowledged data, so
+                // keepalive need not probe it (#497).
+                connection.session.note_peer_acked();
             }
             connection.outbound.drain(..accepted);
             // Progress, even if the session refills the buffer right after.
