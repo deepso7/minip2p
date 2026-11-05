@@ -98,8 +98,15 @@ pub struct YamuxConfig {
     /// up to the credit it was granted, and anything larger already exceeds
     /// it, so the decoder rejects it as soon as its header arrives.
     pub receive_window: u32,
-    /// Largest data-frame payload this side sends. Smaller frames let
-    /// streams share the connection more evenly.
+    /// Largest data-frame payload this side sends, 16 KiB by default.
+    ///
+    /// Streams take turns one frame each, so this is the grain they share the
+    /// connection in, and how long a control frame can wait behind data
+    /// already on its way. Smaller frames interleave more finely and keep
+    /// pings prompt on slow links; larger ones cost fewer headers, Noise
+    /// messages and writes per byte. The turn-taking only holds if the host
+    /// pulls frames as the link takes them rather than queueing many ahead
+    /// (the TCP transport holds one by default).
     pub max_frame_len: u32,
     /// Maximum number of simultaneously tracked inbound and outbound streams,
     /// counting closed streams that are still unsettled.

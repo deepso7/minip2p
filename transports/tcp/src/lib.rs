@@ -44,7 +44,9 @@
 //! socket that takes nothing would spin a deadline-driven host for as long as
 //! the peer stayed silent. Two limits bound the damage --
 //! [`TcpConfig::max_buffered_send`] on how much ciphertext may queue (a soft
-//! limit: one pull may overshoot it by one encrypted frame), and
+//! limit: one pull may overshoot it by one encrypted frame; by default one
+//! frame at a time, so the order streams share the link in is Yamux's
+//! round-robin rather than a queue's), and
 //! [`TcpConfig::send_stall_timeout_ms`] on how long it may sit there.
 //!
 //! Ciphertext is produced only while that buffer is below the limit, so a

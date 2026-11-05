@@ -34,14 +34,27 @@ pub struct TcpConfig {
     /// that sees the connection, since a transport owns no clock and that is
     /// the first time it is told what the time is.
     pub handshake_timeout_ms: Option<u64>,
-    /// How many encrypted bytes one connection holds for its socket.
+    /// How many encrypted bytes one connection holds above its socket, beyond
+    /// the one frame it always may.
     ///
-    /// The session is pulled for more only while the buffer is below this,
-    /// so a peer that reads slowly or not at all fills Yamux's send caps
-    /// instead, and stream writes report
+    /// The session is pulled for the next frame only while this queue is
+    /// below the limit, so a peer that reads slowly or not at all fills
+    /// Yamux's send caps instead, and stream writes report
     /// [`TransportError::Full`](minip2p_transport::TransportError::Full)
     /// rather than tearing the connection down. A pull may overshoot by one
-    /// Noise-encrypted Yamux frame; zero holds one frame at a time.
+    /// Noise-encrypted Yamux frame; zero, the default, holds one frame at a
+    /// time.
+    ///
+    /// The queue is first in, first out, so whatever sits in it has its order
+    /// fixed: a deep one lets the first stream to write claim the link ahead
+    /// of streams that write a moment later, and puts pings and window
+    /// updates behind it. Shallow, frames wait in Yamux instead, which
+    /// interleaves streams round-robin, at most
+    /// [`YamuxConfig::max_frame_len`] each, and sends control frames first.
+    /// The kernel's send buffer still keeps the link busy (`StdTcpProvider`
+    /// caps its unsent part at 32 KiB on Linux and Android). Raising this
+    /// trades that fairness and control latency for fewer, larger socket
+    /// writes.
     pub max_buffered_send: usize,
     /// How long a connection may hold bytes its socket refuses before it is
     /// failed, or `None` to wait indefinitely.
@@ -77,9 +90,10 @@ impl Default for TcpConfig {
             // Generous next to the handful of round trips an upgrade actually
             // takes, so only a peer that has stopped participating trips it.
             handshake_timeout_ms: Some(30_000),
-            // Several Yamux windows' worth, so a healthy socket is never
-            // starved between polls.
-            max_buffered_send: 1024 * 1024,
+            // One frame at a time: the kernel's own buffer keeps the link
+            // busy, and everything else waits in Yamux, which interleaves
+            // streams and sends control frames first.
+            max_buffered_send: 0,
             // Long enough that a briefly wedged peer recovers, short enough
             // that a dead one does not hold a connection indefinitely.
             send_stall_timeout_ms: Some(30_000),

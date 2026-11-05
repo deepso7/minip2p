@@ -181,7 +181,7 @@ fn a_bulk_transfer_to_a_slow_reader_over_quic_completes_without_teardown() {
 #[cfg(feature = "tcp")]
 #[test]
 fn a_bulk_transfer_to_a_slow_reader_over_tcp_completes_without_teardown() {
-    // Past Yamux's 256 KiB stream cap and TCP's 1 MiB socket buffer.
+    // Past Yamux's 256 KiB stream cap and the kernel's socket buffer.
     bulk_transfer_to_slow_reader("/ip4/127.0.0.1/tcp/0", 8 * 1024 * 1024);
 }
 
