@@ -76,7 +76,7 @@ pub use minip2p_relay_server::{
     CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
     RelayServerAddrSource, RelayServerAddressError, RelayServerAddressErrorKind, RelayServerConfig,
     RelayServerConfigError, RelayServerConfigErrorKind, RelayServerEvent, RelayServerRuntimeError,
-    RelayServerRuntimeErrorKind, ReservationCloseReason, Status,
+    RelayServerRuntimeErrorKind, ReservationCloseReason, ReservationDenialReason, Status,
 };
 /// Yamux limits, set per connection through `TcpConfig::yamux` and
 /// `CircuitLimits::yamux`.
