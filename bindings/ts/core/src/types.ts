@@ -124,10 +124,10 @@ export interface Minip2pYamuxLimits {
 
 /**
  * Protocol deadline overrides, in milliseconds; omitted fields keep the native
- * defaults (30 s for `identifyMs`, 10 s for the others). A zero makes `create`
- * throw `InvalidConfigError` with capability `Options`. `identifyMs` and
- * `pingMs` each cover their own negotiation, which `negotiationMs` does not
- * cut short.
+ * defaults (30 s for `negotiationMs` and `identifyMs`, 10 s for `pingMs`). A
+ * zero makes `create` throw `InvalidConfigError` with capability `Options`.
+ * `identifyMs` and `pingMs` each cover their own negotiation, which
+ * `negotiationMs` does not cut short.
  */
 export interface Minip2pTimeouts {
   /** How long an outbound stream may negotiate its protocol. */

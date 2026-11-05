@@ -2156,7 +2156,8 @@ mod tests {
         );
         assert!(!became_ready(&defaults), "{defaults:?}");
 
-        // The negotiation deadline stays at its 10 s default.
+        // The negotiation deadline stays at its 30 s default, which the 35 s
+        // answer also exceeds.
         let raised = identify_a_slow_peer(
             SwarmTimeouts {
                 identify_ms: 40_000,

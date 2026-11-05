@@ -91,7 +91,7 @@ pub const SIMULTANEOUS_DIAL_WINDOW_MS: u64 = 5_000;
 /// connection's first Identify stream: their own deadlines
 /// ([`SwarmTimeouts::ping_ms`], [`SwarmTimeouts::identify_ms`]) cover their
 /// negotiation.
-pub const OUTBOUND_NEGOTIATION_TIMEOUT_MS: u64 = 10_000;
+pub const OUTBOUND_NEGOTIATION_TIMEOUT_MS: u64 = 30_000;
 
 /// Default for [`SwarmTimeouts::identify_ms`]: how long a connection's first
 /// Identify exchange may take: opening the stream, negotiating it, and the
@@ -116,7 +116,7 @@ pub const IDENTIFY_TIMEOUT_MS: u64 = 30_000;
 pub struct SwarmTimeouts {
     /// How long an outbound stream may negotiate its protocol, from the
     /// transport's `StreamOpened`; not ping or first-Identify streams.
-    /// Default [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`] (10 s).
+    /// Default [`OUTBOUND_NEGOTIATION_TIMEOUT_MS`] (30 s).
     pub negotiation_ms: u64,
     /// How long a connection's first Identify may take (open, negotiation,
     /// reply), from the connection establishing. Default
@@ -3438,6 +3438,18 @@ mod tests {
         frame.extend_from_slice(protocol.as_bytes());
         frame.push(b'\n');
         frame
+    }
+
+    #[test]
+    fn default_timeouts_are_30_s_negotiation_and_identify_and_10_s_ping() {
+        assert_eq!(
+            SwarmTimeouts::default(),
+            SwarmTimeouts {
+                negotiation_ms: 30_000,
+                identify_ms: 30_000,
+                ping_ms: 10_000,
+            }
+        );
     }
 
     #[test]
@@ -7618,6 +7630,7 @@ mod tests {
                 public_key: Vec::new(),
             },
             SwarmTimeouts {
+                negotiation_ms: 10_000,
                 ping_ms: 25_000,
                 ..SwarmTimeouts::default()
             },
@@ -7639,7 +7652,7 @@ mod tests {
                 stream_id: stream,
             },
         );
-        // Past the 10 s negotiation deadline, inside the ping deadline.
+        // Past the 10 s negotiation deadline, inside the 25 s ping deadline.
         core.handle_tick(15_000);
         let mut accept = multistream_frame(MULTISTREAM_PROTOCOL_ID);
         accept.extend_from_slice(&multistream_frame(PING_PROTOCOL_ID));
