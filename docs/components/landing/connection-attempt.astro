@@ -15,11 +15,11 @@ const steps = [
     title: "A relay leg starts 200 ms later",
   },
   {
-    body: "One peer dials while the other fires timed UDP packets back, so both NATs open for the same path. The path upgrades.",
+    body: "One peer dials while the other fires timed UDP packets back, so both NATs open for the same path. The direct connection replaces the circuit.",
     title: "DCUtR punches a direct path",
   },
   {
-    body: "One `ConnectSettled` ends the attempt, and the relay circuit closes.",
+    body: "One `ConnectSettled` ends the attempt.",
     title: "The attempt settles, once",
   },
 ];
@@ -83,6 +83,7 @@ const row = "flex items-baseline justify-between gap-3 border-t border-border px
           </div>
           <span
             class="absolute right-1/4 bottom-8 mr-2 translate-y-1/2 font-mono text-sm text-accent data-on:animate-pop-late"
+            role="img"
             aria-label="no route"
             data-show="1"
             data-hide="3"
@@ -109,7 +110,7 @@ const row = "flex items-baseline justify-between gap-3 border-t border-border px
           />
 
           <span class={`${node} left-0`}>you</span>
-          <span class={`${node} right-0`}>peer</span>
+          <span class={`${node} right-0`} data-show="1" data-hide="4">peer</span>
           <span
             class={`${node} right-0 border-accent text-accent`}
             data-show="4"
@@ -153,16 +154,13 @@ const row = "flex items-baseline justify-between gap-3 border-t border-border px
             <span><span class="text-muted-foreground">wait → </span>Nat(PathEstablished)</span><span class="text-muted-foreground">Relayed</span>
           </li>
           <li class={row} data-show="3" data-rise>
-            <span><span class="text-muted-foreground">wait → </span>ConnectionEstablished</span><span class="text-muted-foreground">direct</span>
+            <span><span class="text-muted-foreground">wait → </span>ConnectionReplaced</span><span class="text-muted-foreground">circuit → direct</span>
           </li>
           <li class={`${row} delay-300`} data-show="3" data-rise>
             <span><span class="text-muted-foreground">wait → </span>Nat(PathUpgraded)</span><span class="text-muted-foreground">→ Punched</span>
           </li>
           <li class={`${row} text-accent`} data-show="4" data-rise>
             <span><span class="text-muted-foreground">wait → </span>ConnectSettled</span><span>Connected</span>
-          </li>
-          <li class={`${row} delay-300`} data-show="4" data-rise>
-            <span><span class="text-muted-foreground">wait → </span>ConnectionClosed</span><span class="text-muted-foreground">circuit</span>
           </li>
         </ol>
       </div>
