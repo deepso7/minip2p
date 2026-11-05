@@ -92,6 +92,10 @@ pub struct QuicLimits {
     ///
     /// Quiet connections send an ack-eliciting keepalive at half this value
     /// so the idle timer does not fire on a live but silent path.
+    ///
+    /// Not a hard bound: the connection uses the lower of the two peers'
+    /// advertised values, and quinn never waits less than 3 × PTO, so on a
+    /// high-RTT link a dead connection can outlive this value.
     pub idle_timeout_ms: u64,
     /// Require a stateless Retry before allocating an inbound connection.
     pub require_address_validation: bool,
