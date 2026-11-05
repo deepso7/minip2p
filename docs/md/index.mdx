@@ -67,6 +67,14 @@ There is no async runtime: the protocols are deterministic sans-I/O state machin
 
 The core builds as `no_std + alloc` for microcontrollers. Node.js, React Native, and the browser drive the same endpoint through bindings, with Promises and typed events.
 
+<LandingEventLoop />
+
+## Many routes, one outcome
+
+Call `connect` once. Every route races inside one attempt, and your loop hears how it ends exactly once. See [Traverse NAT](/docs/rust/traverse-nat).
+
+<LandingConnectionAttempt />
+
 ## Cargo features
 
 Each feature of `minip2p-rs` adds a capability without changing the endpoint interface.

@@ -1,0 +1,114 @@
+---
+// One turn of the caller-driven loop, played as a short scene (see scene.ts):
+// your `wait` call drives the adapter, which feeds bytes and a timestamp to
+// the I/O-free core, and one event comes back to your match arm. Each layer
+// is one row, so the stage stays short in the landing page's column.
+import SceneFooter from "./scene-footer.astro";
+
+const steps = [
+  { body: "Nothing runs until you do. The call drives the endpoint.", title: "You call `wait(deadline)`" },
+  { body: "It sleeps on its socket and the core's next timer. A datagram lands.", title: "The adapter waits" },
+  {
+    body: "The core is plain state machines: no sockets, no clock. Same input, same output.",
+    title: "Bytes and the time go in",
+  },
+  { body: "`wait` returns a single event: here, the path upgrade.", title: "One event comes out" },
+  {
+    body: "Handle it and go around again. Connections, streams, NAT, Gossipsub and discovery all arrive this way.",
+    title: "Your match arm runs",
+  },
+];
+
+const mono = "font-mono text-xs";
+const layer =
+  "relative flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 rounded-blume border border-border bg-background px-4 py-3";
+const name = "m-0! text-sm font-medium";
+const hint = `${mono} m-0! text-muted-foreground`;
+// Accent outline over a layer while its step plays.
+const lit = "pointer-events-none absolute -inset-px rounded-blume border border-accent";
+const connector = "relative h-11";
+// Rails between layers: calls go down on the left, data comes up on the right.
+const railDown = "absolute inset-y-0 left-8 w-0.5 bg-border";
+const railUp = "absolute inset-y-0 right-8 w-0.5 bg-border";
+const dotDown = "absolute -top-1 left-1/2 size-2 -translate-x-1/2 rounded-full bg-accent";
+const dotUp = "absolute -bottom-1 left-1/2 size-2 -translate-x-1/2 rounded-full bg-accent";
+const labelLeft = `${mono} absolute top-1/2 left-12 -translate-y-1/2`;
+const labelRight = `${mono} absolute top-1/2 right-12 -translate-y-1/2 text-right`;
+// `m-0!`, not `m-0`: Blume's unlayered `.prose :where(p, ul, ol)` margins
+// beat utilities, even inside `not-prose`.
+---
+
+<div class="group/scene not-prose my-8" data-scene data-durations="2200,2400,2400,2400,2600">
+  <figure class="m-0" aria-label="One turn of a wait loop">
+    <div class={layer}>
+      <span class={`${lit} data-on:animate-pop`} data-show="1" data-hide="2" />
+      <span class={`${lit} data-on:animate-pop`} data-show="5" />
+      <p class={name}>Your code</p>
+      {/* The call while it goes out, the match arm once the event is back. */}
+      <p class={`${hint} grid text-right`}>
+        <span class="col-start-1 row-start-1" data-show="1" data-hide="5">loop {"{"} node.wait(deadline)? {"}"}</span>
+        <span class="col-start-1 row-start-1 text-accent" data-show="5">Event(e) =&gt; handle(e)</span>
+      </p>
+    </div>
+
+    <div class={connector}>
+      <div class={railDown}>
+        <div class="absolute inset-0 data-on:animate-travel-down" data-show="1" data-hide="2">
+          <span class={dotDown} />
+        </div>
+      </div>
+      <span class={`${labelLeft} text-foreground`} data-show="1" data-hide="3">wait(deadline)</span>
+      <div class={railUp}>
+        <div class="absolute inset-0 data-on:animate-travel-up" data-show="4" data-hide="5">
+          <span class={dotUp} />
+        </div>
+      </div>
+      <span class={`${labelRight} text-accent`} data-show="4">Nat(PathUpgraded)</span>
+    </div>
+
+    <div class={layer}>
+      <span class={`${lit} data-on:animate-pop`} data-show="3" data-hide="5" />
+      <p class={name}>Endpoint core</p>
+      <p class={hint}>sans-I/O · no sockets · no clock</p>
+    </div>
+
+    <div class={connector}>
+      <div class={railDown}>
+        <div class="absolute inset-0 data-on:animate-travel-down-late" data-show="1" data-hide="2">
+          <span class={dotDown} />
+        </div>
+      </div>
+      <span class={`${labelLeft} text-muted-foreground`} data-show="1" data-hide="3">sleep on socket + timer</span>
+      <div class={railUp}>
+        <div class="absolute inset-0 data-on:animate-travel-up" data-show="3" data-hide="4">
+          <span class={dotUp} />
+        </div>
+      </div>
+      <span class={`${labelRight} text-foreground`} data-show="3" data-hide="5">bytes + now</span>
+    </div>
+
+    <div class={layer}>
+      <span class={`${lit} data-on:animate-pop`} data-show="2" data-hide="3" />
+      <p class={name}>Transport adapter</p>
+      <p class={hint}>
+        {/* The socket lights while the datagram lands. */}
+        <span class="relative">
+          UDP socket
+          <span class="pointer-events-none absolute -inset-x-1.5 -inset-y-0.5 rounded-sm bg-accent/15" data-show="2" data-hide="3" />
+        </span>{" "}
+        · clock
+      </p>
+    </div>
+
+    <div class={connector}>
+      <div class={railUp}>
+        <div class="absolute inset-0 data-on:animate-travel-up" data-show="2" data-hide="3">
+          <span class={dotUp} />
+        </div>
+      </div>
+      <span class={`${labelRight} text-muted-foreground`}>datagram from the peer</span>
+    </div>
+  </figure>
+
+  <SceneFooter steps={steps} />
+</div>
