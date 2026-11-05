@@ -273,6 +273,24 @@ impl VirtualProvider {
         }
     }
 
+    /// Drops every byte this node's peers wrote to it, unread, so its
+    /// transport never sees them.
+    ///
+    /// The writers get room back as if this node had read them: a peer whose
+    /// TCP acknowledges data but whose replies are stuck far behind it, like
+    /// a deep queue on a slow link.
+    pub fn discard_received(&mut self) {
+        let mut net = self.net.borrow_mut();
+        let handles = net.owned.get(&self.node).cloned().unwrap_or_default();
+        for handle in handles {
+            if let Some((link, index)) = net.end(handle)
+                && let Some((local, _)) = link.ends_mut(index)
+            {
+                local.inbox.clear();
+            }
+        }
+    }
+
     /// How many bytes are queued for the peer but not yet read.
     pub fn bytes_in_flight_to_peer(&self) -> usize {
         let net = self.net.borrow();

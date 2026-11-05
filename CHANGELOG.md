@@ -4,6 +4,10 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 
 ## Unreleased
 
+### TCP holds one encrypted frame above the socket (#477)
+
+`TcpConfig::default().max_buffered_send` is now 0, down from 1 MiB: a TCP connection holds one encrypted Yamux frame for its socket at a time, so streams share a slow link in Yamux's round-robin order and pings and window updates are not queued behind up to 1 MiB of earlier writes. The kernel's send buffer still keeps the link busy. To restore the deep queue, set `max_buffered_send: 1024 * 1024` (`limits.tcp.maxBufferedSend` in the bindings).
+
 ### A relay with no advertisable address grants reservations (#504)
 
 - **A relay bound only to `0.0.0.0` or `::`, with no announce or AutoNAT-confirmed address, grants RESERVE with an empty `addrs` list** instead of refusing it; clients build circuit addresses from the address they dialed the relay at. `RelayServerRuntimeErrorKind::NoAdvertisableAddrs` (#486) is removed; drop any arm matching it.

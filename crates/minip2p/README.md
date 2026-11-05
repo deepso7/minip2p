@@ -235,7 +235,7 @@ Every deadline in the stack, in one place. The three swarm deadlines are set tog
 | Ping | 10 s | One ping attempt (open, negotiation, echo), from the `ping` call. Failure: `PingFailed { cause }`; the connection stays. The swarm pings only when asked (and for QUIC relay reservations, every `NatConfig::reservation_keep_alive_interval_ms`). | `SwarmTimeouts::ping_ms` |
 | Idle | QUIC 30 s | A QUIC connection with no packets from the peer; closes as `TimedOut`. Not a hard bound: the connection uses the lower of the two peers' advertised values, and quinn waits at least 3 × PTO, so on a high-RTT link a dead connection can outlive the configured value. | `QuicLimits::idle_timeout_ms` |
 | Send stall | TCP 30 s | A TCP connection whose socket accepts nothing while bytes wait; closes as `Stalled`. | `TcpConfig::send_stall_timeout_ms` |
-| Yamux keepalive | ping after 30 s quiet; 10 s to send, 10 s to answer | A TCP or relayed connection that has received nothing; closes as `TimedOut`. | fixed |
+| Yamux keepalive | ping after 30 s quiet; 10 s to send, 10 s to answer | A TCP or relayed connection that has heard nothing from its peer (a TCP socket that drains after filling counts as hearing from it); closes as `TimedOut`. | fixed |
 
 How they should relate:
 

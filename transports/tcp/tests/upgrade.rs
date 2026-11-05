@@ -747,6 +747,61 @@ fn a_socket_that_takes_a_frame_every_poll_is_not_stalled() {
 }
 
 #[test]
+fn concurrent_writes_to_a_backed_up_socket_interleave_on_the_wire() {
+    // With the default config, a socket that is taking nothing holds back at
+    // most a frame or so of ciphertext, so the rest stays in Yamux and goes
+    // out round-robin. A deep queue would already hold all of the first
+    // stream's frames ahead of the second's.
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    let first = pair.dialer.open_stream(id).expect("open first substream");
+    let second = pair.dialer.open_stream(id).expect("open second substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    let base = pair.dialer.provider_mut().bytes_in_flight_to_peer();
+    pair.dialer
+        .provider_mut()
+        .set_in_flight_capacity(Some(base));
+    for stream in [first, second] {
+        pair.dialer
+            .send_stream(id, stream, Bytes::from(vec![1u8; 192 * 1024]))
+            .expect("Yamux queues the whole write");
+    }
+    pair.dialer.provider_mut().set_in_flight_capacity(None);
+    let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // Only data events, in arrival order; a run is consecutive chunks of one
+    // stream.
+    let data: Vec<(StreamId, usize)> = listener_events
+        .iter()
+        .filter_map(|event| match event {
+            TransportEvent::StreamData {
+                stream_id, data, ..
+            } => Some((*stream_id, data.len())),
+            _ => None,
+        })
+        .collect();
+    for stream in [first, second] {
+        let delivered: usize = data
+            .iter()
+            .filter(|(id, _)| *id == stream)
+            .map(|(_, len)| len)
+            .sum();
+        assert_eq!(delivered, 192 * 1024, "every byte of {stream:?} arrives");
+    }
+    let order: Vec<StreamId> = data.iter().map(|(stream, _)| *stream).collect();
+    let longest_run = order
+        .chunk_by(|a, b| a == b)
+        .map(<[StreamId]>::len)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        longest_run <= 2,
+        "no stream should get more than a frame or two ahead: {order:?}"
+    );
+}
+
+#[test]
 fn a_peer_that_stops_reading_fills_the_stream_instead_of_failing_the_connection() {
     let mut config = TcpConfig {
         max_buffered_send: 4096,
@@ -1479,7 +1534,7 @@ fn closing_a_connection_drops_its_queued_writable() {
 }
 
 #[test]
-fn only_received_traffic_restarts_the_keepalive_clock() {
+fn a_write_the_socket_takes_does_not_restart_the_keepalive_clock() {
     const LATER: u64 = 10_000;
     let mut pair = upgraded_pair();
     let id = pair.connection;
@@ -1488,7 +1543,7 @@ fn only_received_traffic_restarts_the_keepalive_clock() {
         Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
     );
 
-    // Sending proves nothing about the peer: the deadline stands.
+    // A socket with room takes bytes for a dead peer too: the deadline stands.
     let stream = pair.dialer.open_stream(id).expect("open substream");
     pair.dialer
         .send_stream(id, stream, Bytes::from_static(b"hello"))
@@ -1565,6 +1620,101 @@ fn a_backed_up_connection_to_a_silent_peer_times_out() {
         "{events:?}"
     );
     assert!(pair.dialer.connection_ids().is_empty());
+}
+
+#[test]
+fn a_socket_that_keeps_draining_is_a_live_peer_until_it_stops() {
+    // No stall timeout: only keepalive can notice the peer is gone.
+    let config = TcpConfig {
+        send_stall_timeout_ms: None,
+        ..TcpConfig::default()
+    };
+    let mut pair = upgraded_pair_with(config, TcpConfig::default());
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // A bulk upload over a slow link: the socket takes 1 KiB a second, and
+    // nothing the peer sends back arrives (it is all queued behind data).
+    pair.dialer
+        .provider_mut()
+        .set_in_flight_capacity(Some(1024));
+    pair.dialer
+        .send_stream(id, stream, Bytes::from(vec![7u8; 200 * 1024]))
+        .expect("queue an upload that outlasts the test");
+    const ALIVE_UNTIL: u64 = 4 * KEEPALIVE_INTERVAL_MS;
+    for t in (0..=ALIVE_UNTIL).step_by(1_000) {
+        pair.listener.provider_mut().discard_received();
+        let events = pair.dialer.poll(Now::from_millis(t)).expect("poll");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TransportEvent::Closed { .. })),
+            "a socket that keeps draining is a live peer, at {t} ms: {events:?}"
+        );
+    }
+
+    // The peer dies: the socket stops draining. Keepalive is again the
+    // bound, measured from the last drain: the ping comes due a quiet
+    // interval later and cannot be handed off to the full socket.
+    let mut now = ALIVE_UNTIL;
+    let closed_at = loop {
+        let events = pair.dialer.poll(Now::from_millis(now)).expect("poll");
+        if events.iter().any(|event| {
+            *event
+                == TransportEvent::Closed {
+                    id,
+                    reason: ConnectionCloseReason::TimedOut,
+                }
+        }) {
+            break now;
+        }
+        now = pair
+            .dialer
+            .next_deadline()
+            .expect("a live connection has a keepalive deadline")
+            .as_millis()
+            .max(now + 1);
+    };
+    assert_eq!(
+        closed_at,
+        ALIVE_UNTIL + KEEPALIVE_INTERVAL_MS + KEEPALIVE_HANDOFF_TIMEOUT_MS
+    );
+}
+
+#[test]
+fn a_socket_with_room_to_spare_is_no_sign_of_life() {
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // A dead peer's socket still takes bytes while its buffer has room, so
+    // writes that never fill it say nothing: the ping goes out and goes
+    // unanswered.
+    let mut now = 0;
+    let closed_at = loop {
+        pair.listener.provider_mut().discard_received();
+        pair.dialer
+            .send_stream(id, stream, Bytes::from_static(b"tick"))
+            .expect("send");
+        let events = pair.dialer.poll(Now::from_millis(now)).expect("poll");
+        if events.iter().any(|event| {
+            *event
+                == TransportEvent::Closed {
+                    id,
+                    reason: ConnectionCloseReason::TimedOut,
+                }
+        }) {
+            break now;
+        }
+        now += 1_000;
+        assert!(now <= 2 * KEEPALIVE_INTERVAL_MS, "never timed out");
+    };
+    assert_eq!(
+        closed_at,
+        KEEPALIVE_INTERVAL_MS + 1_000 + KEEPALIVE_ACK_TIMEOUT_MS
+    );
 }
 
 #[test]

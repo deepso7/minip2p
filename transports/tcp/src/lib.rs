@@ -44,7 +44,9 @@
 //! socket that takes nothing would spin a deadline-driven host for as long as
 //! the peer stayed silent. Two limits bound the damage --
 //! [`TcpConfig::max_buffered_send`] on how much ciphertext may queue (a soft
-//! limit: one pull may overshoot it by one encrypted frame), and
+//! limit: one pull may overshoot it by one encrypted frame; by default one
+//! frame at a time, so streams share the link in Yamux's round-robin order
+//! rather than in the order they queued), and
 //! [`TcpConfig::send_stall_timeout_ms`] on how long it may sit there.
 //!
 //! Ciphertext is produced only while that buffer is below the limit, so a
@@ -61,6 +63,13 @@
 //! get into the outbound buffer, or that goes unanswered, closes the
 //! connection as
 //! [`ConnectionCloseReason::TimedOut`](minip2p_transport::ConnectionCloseReason::TimedOut).
+//! A socket that accepts bytes after refusing some counts as hearing from
+//! the peer, like a received frame. This is best-effort evidence resting on
+//! the [`TcpProvider::send`] contract: a full send buffer frees room as the
+//! peer's TCP acknowledges data, so a bulk upload whose replies are stuck
+//! behind it on a slow link is not probed while it keeps draining. A ping
+//! already sent still needs its own reply, and once local writes stop there
+//! is nothing left to drain, so delivery still in flight can time out.
 //! A keepalive timeout or Yamux protocol failure ends the open streams with
 //! that `Closed`, not with a `StreamClosed` each, as QUIC reports a lost
 //! connection. A local close or a remote `GoAway` still closes each stream
