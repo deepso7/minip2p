@@ -1402,9 +1402,12 @@ impl EndpointBuilder {
     ///
     /// [`TcpConfig::handshake_timeout_ms`] (30 s) caps the Noise + Yamux
     /// upgrade on its own, so a slow link needs it raised alongside the
-    /// connect and swarm deadlines: at 64 kbit/s and 400 ms under load, TCP
-    /// failed its handshake at 30 s with the others raised. For a loaded RTT
-    /// of about 6 s, set each value explicitly:
+    /// connect and swarm deadlines. Size each from how long that exchange
+    /// takes on the loaded link, plus slack for at least one retransmission;
+    /// no fixed multiple of the RTT is enough, and no deadline keeps a link
+    /// usable while a bulk transfer keeps its queue full (shape or pause the
+    /// bulk traffic instead). The values below are placeholders for your own
+    /// measurements, as in the `minip2p-rs` README's Deadlines section:
     ///
     /// ```no_run
     /// use std::time::Duration;
@@ -1413,15 +1416,15 @@ impl EndpointBuilder {
     /// let endpoint = Endpoint::builder()
     ///     .listen_on("/ip4/0.0.0.0/tcp/0")?
     ///     .timeouts(SwarmTimeouts {
-    ///         negotiation_ms: 30_000, // 5 × RTT, which is also the default
-    ///         identify_ms: 60_000,    // covers its own negotiation and reply
-    ///         ping_ms: 30_000,
+    ///         negotiation_ms: 30_000, // the default: one stream's protocol negotiation
+    ///         identify_ms: 60_000,    // the first Identify: open, negotiation and reply
+    ///         ping_ms: 30_000,        // one ping: open, negotiation and echo
     ///     })
     ///     .tcp_config(TcpConfig {
-    ///         handshake_timeout_ms: Some(60_000), // ~8 RTTs plus slack
+    ///         handshake_timeout_ms: Some(60_000), // the Noise + Yamux upgrade
     ///         ..TcpConfig::default()
     ///     })
-    ///     .connect_deadline(Duration::from_secs(90)) // ≥ the handshake
+    ///     .connect_deadline(Duration::from_secs(90)) // dials plus their handshake
     ///     .bind()?;
     /// # drop(endpoint);
     /// # Ok::<(), Box<dyn std::error::Error>>(())

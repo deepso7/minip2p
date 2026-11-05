@@ -228,12 +228,12 @@ Every deadline in the stack, in one place. The three swarm deadlines are set tog
 | Deadline | Default | Bounds | Set with |
 | --- | --- | --- | --- |
 | Connect | 30 s | A Connection attempt, from `connect` to `ConnectSettled`: name resolution, candidate dials and their transport handshakes, the relay leg. A direct connection settles it on `ConnectionEstablished`, before Identify; with `dcutr`, a relayed circuit stays provisional while a direct upgrade is tried, so its Identify runs inside the attempt. | `connect_deadline` |
-| Transport handshake | TCP 30 s; WebTransport 10 s; QUIC: none | Authenticating one connection: TCP's Noise + Yamux upgrade, WebTransport's `h3` session through Noise. QUIC has no separate one: quinn's idle timeout closes a handshake that goes quiet, but does not cap one that keeps making progress. | `TcpConfig::handshake_timeout_ms`, `QuicLimits::webtransport_handshake_timeout_ms` / `idle_timeout_ms` |
+| Transport handshake | TCP 30 s; WebTransport 10 s; QUIC: none | Authenticating one connection: TCP's Noise + Yamux upgrade, WebTransport's `h3` session through Noise. QUIC has no separate one: quinn's idle timeout closes a handshake that goes quiet (after at least 3 × PTO, see Idle), but does not cap one that keeps making progress. | `TcpConfig::handshake_timeout_ms`, `QuicLimits::webtransport_handshake_timeout_ms` / `idle_timeout_ms` |
 | Negotiation | 30 s | One outbound stream's multistream-select negotiation, from the transport's `StreamOpened`. Failure: an `Error` naming the stream. Not ping streams or a connection's first Identify stream: their own deadlines cover their negotiation. | `SwarmTimeouts::negotiation_ms` |
 | Stream credit wait | none | A QUIC open waiting for the peer's stream credit. For an ordinary stream it is not timed: the open waits as long as the connection lives, and the negotiation deadline starts only once credit arrives. A ping or first-Identify open stays bounded by its own deadline, which includes this wait. | — |
 | Identify | 30 s | A connection's first Identify (open, negotiation, reply), from `ConnectionEstablished`. Failure: `IdentifyFailed`, then the connection closes. | `SwarmTimeouts::identify_ms` |
 | Ping | 10 s | One ping attempt (open, negotiation, echo), from the `ping` call. Failure: `PingFailed { cause }`; the connection stays. The swarm pings only when asked (and for QUIC relay reservations, every `NatConfig::reservation_keep_alive_interval_ms`). | `SwarmTimeouts::ping_ms` |
-| Idle | QUIC 30 s | A QUIC connection with no packets from the peer; closes as `TimedOut`. | `QuicLimits::idle_timeout_ms` |
+| Idle | QUIC 30 s | A QUIC connection with no packets from the peer; closes as `TimedOut`. Not a hard bound: quinn waits `max(idle_timeout_ms, 3 × PTO)`, so on a high-RTT link a dead connection can outlive the configured value. | `QuicLimits::idle_timeout_ms` |
 | Send stall | TCP 30 s | A TCP connection whose socket accepts nothing while bytes wait; closes as `Stalled`. | `TcpConfig::send_stall_timeout_ms` |
 | Yamux keepalive | ping after 30 s quiet; 10 s to send, 10 s to answer | A TCP or relayed connection that has received nothing; closes as `TimedOut`. | fixed |
 
@@ -242,9 +242,11 @@ How they should relate:
 - **Identify and ping cover their own negotiation.** The negotiation deadline does not apply to their streams, so raising `identify_ms` or `ping_ms` alone is enough when their negotiation is the slow part.
 - **Connect ≥ transport handshake.** A connect deadline shorter than the handshake gives up on a dial that could still authenticate. Identify starts after a direct connect settles, so a host waiting for `PeerReady` should allow about connect + Identify, as the TypeScript SDK's `waitPeerReady` does by default. A provisional relayed circuit (with `dcutr`) runs Identify inside the connect attempt instead, so there the Identify deadline can end it first: on a slow relayed link, raise both.
 - **Ping and reservation keepalives below the idle timeout**, so an idle QUIC connection is kept alive rather than timed out.
-- **Slow or loaded links.** A negotiation costs two to three round trips and a TCP connect about eight. Once the loaded RTT is above a few seconds, raise the negotiation, Identify and ping deadlines (say to 5 × RTT), and with them the connect deadline and, on TCP, `TcpConfig::handshake_timeout_ms`: it caps the Noise + Yamux upgrade on its own, so a raised connect deadline does not lift it. In the v0.11.3 netem retests at 64 kbit/s and 400 ms under load, TCP still failed its handshake at the 30 s default with the other deadlines raised. Relayed connections also need `NatConfig::relay_timeout_ms` raised (12 s per relay, from its first dial to a usable circuit, and per reservation or STOP exchange), or the relay leg gives up first. Automatic RTT scaling is tracked in #483.
+- **Slow or loaded links: size deadlines from measured delay.** Under load, queueing delay sets the cost, not the idle RTT: in the v0.11.3 netem retests at 64 kbit/s and 400 ms with a bulk transfer, one TCP connect took 51.6 s. Measure how long each exchange (a connect, an Identify, a ping) actually takes on the loaded link, then add slack for at least one retransmission; no fixed multiple of the RTT is enough on its own. Raise the negotiation, Identify and ping deadlines to fit, and with them the connect deadline and, on TCP, `TcpConfig::handshake_timeout_ms`: it caps the Noise + Yamux upgrade on its own, so a raised connect deadline does not lift it. Relayed connections also need `NatConfig::relay_timeout_ms` raised (12 s per relay, from its first dial to a usable circuit, and per reservation or STOP exchange), or the relay leg gives up first. Automatic RTT scaling is tracked in #483.
+- **QUIC recovers slowly from loss on a very slow link.** quinn's probe timeout (PTO) starts at about 3 × the first RTT sample and backs off from there, so a handshake or Identify that loses a packet may not be resent before a deadline sized from the RTT alone runs out. Raising `idle_timeout_ms` does not help.
+- **Deadlines can't guarantee service under sustained bulk traffic.** While a bulk transfer keeps the link's queue full, its delay keeps growing, so no deadline is reliably large enough. Shape or pause the bulk traffic (rate-limit it below the link, or hold it while connections set up) rather than raising deadlines further.
 
-For a link whose loaded RTT reaches about 6 s, set every value explicitly rather than leaning on a default:
+An example for a slow TCP link, with every value set explicitly rather than leaning on a default. The values are placeholders: replace them with your own measurements plus slack.
 
 ```rust,ignore
 use std::time::Duration;
@@ -253,19 +255,19 @@ use minip2p::{Endpoint, SwarmTimeouts, TcpConfig};
 let endpoint = Endpoint::builder()
     .listen_on("/ip4/0.0.0.0/tcp/0")?
     .timeouts(SwarmTimeouts {
-        negotiation_ms: 30_000, // 5 × RTT, which is also the default
-        identify_ms: 60_000,    // covers its own negotiation and reply
-        ping_ms: 30_000,
+        negotiation_ms: 30_000, // the default: one stream's protocol negotiation
+        identify_ms: 60_000,    // the first Identify: open, negotiation and reply
+        ping_ms: 30_000,        // one ping: open, negotiation and echo
     })
     .tcp_config(TcpConfig {
-        handshake_timeout_ms: Some(60_000), // ~8 RTTs plus slack
+        handshake_timeout_ms: Some(60_000), // the Noise + Yamux upgrade
         ..TcpConfig::default()
     })
-    .connect_deadline(Duration::from_secs(90)) // ≥ the handshake
+    .connect_deadline(Duration::from_secs(90)) // dials plus their handshake
     .bind()?;
 ```
 
-This needs the `tcp` feature; the same example is a doctest on `EndpointBuilder::tcp_config`. Native QUIC has no handshake cap to raise, only `QuicLimits::idle_timeout_ms` (30 s), which a link this slow still clears. A WebTransport listener also caps the time from the QUIC handshake to Noise completion with `QuicLimits::webtransport_handshake_timeout_ms` (10 s); raise it too for slow WebTransport clients.
+This needs the `tcp` feature; the same example is a doctest on `EndpointBuilder::tcp_config`. Native QUIC has no handshake cap to raise: a dialer's connect deadline bounds its handshake, and a lost packet waits on loss recovery (above). A WebTransport listener also caps the time from the QUIC handshake to Noise completion with `QuicLimits::webtransport_handshake_timeout_ms` (10 s); raise it too for slow WebTransport clients.
 
 ## Hosting a relay server
 
