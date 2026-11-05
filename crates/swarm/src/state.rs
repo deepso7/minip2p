@@ -107,9 +107,9 @@ pub const IDENTIFY_TIMEOUT_MS: u64 = 30_000;
 ///
 /// `identify_ms` and `ping_ms` each bound their whole exchange, its
 /// negotiation included, so `negotiation_ms` does not cut them short; it
-/// bounds the negotiation of every other outbound stream. Each negotiation
-/// takes two to three round trips, so on a link whose loaded RTT exceeds a
-/// few seconds raise the deadlines. The `minip2p-rs` README's deadline table
+/// bounds the negotiation of every other outbound stream. On a slow or
+/// loaded link, size them from how long each exchange actually takes there,
+/// plus slack for a retransmission. The `minip2p-rs` README's deadline table
 /// lists the Endpoint and transport deadlines beside these and how they
 /// relate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
