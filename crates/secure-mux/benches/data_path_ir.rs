@@ -8,13 +8,14 @@ use std::hint::black_box;
 
 const PAYLOAD_LEN: usize = 64 * 1024;
 
-/// A session with the specification's 256 KiB window: the default grants
-/// more with each stream's first window update, which these benches would
-/// otherwise measure as an extra frame per fresh stream. Pinned so the data
-/// path stays comparable across releases.
+/// A session with the specification's 256 KiB window and 64 KiB frames, pinned
+/// so the data path stays comparable across releases: the default config
+/// would split each 64 KiB payload into 16 KiB frames, and a larger default
+/// window would add a window-update frame per fresh stream.
 fn session(role: YamuxRole) -> YamuxSession {
     let config = YamuxConfig {
         receive_window: DEFAULT_RECEIVE_WINDOW,
+        max_frame_len: PAYLOAD_LEN as u32,
         ..YamuxConfig::default()
     };
     YamuxSession::with_config(role, config).expect("valid config")
