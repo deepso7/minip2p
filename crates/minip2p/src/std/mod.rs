@@ -1416,7 +1416,7 @@ impl EndpointBuilder {
     /// let endpoint = Endpoint::builder()
     ///     .listen_on("/ip4/0.0.0.0/tcp/0")?
     ///     .timeouts(SwarmTimeouts {
-    ///         negotiation_ms: 30_000, // the default: one stream's protocol negotiation
+    ///         negotiation_ms: 30_000, // the default: an ordinary outbound stream's negotiation
     ///         identify_ms: 60_000,    // the first Identify: open, negotiation and reply
     ///         ping_ms: 30_000,        // one ping: open, negotiation and echo
     ///     })

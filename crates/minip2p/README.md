@@ -233,7 +233,7 @@ Every deadline in the stack, in one place. The three swarm deadlines are set tog
 | Stream credit wait | none | A QUIC open waiting for the peer's stream credit. For an ordinary stream it is not timed: the open waits as long as the connection lives, and the negotiation deadline starts only once credit arrives. A ping or first-Identify open stays bounded by its own deadline, which includes this wait. | — |
 | Identify | 30 s | A connection's first Identify (open, negotiation, reply), from `ConnectionEstablished`. Failure: `IdentifyFailed`, then the connection closes. | `SwarmTimeouts::identify_ms` |
 | Ping | 10 s | One ping attempt (open, negotiation, echo), from the `ping` call. Failure: `PingFailed { cause }`; the connection stays. The swarm pings only when asked (and for QUIC relay reservations, every `NatConfig::reservation_keep_alive_interval_ms`). | `SwarmTimeouts::ping_ms` |
-| Idle | QUIC 30 s | A QUIC connection with no packets from the peer; closes as `TimedOut`. Not a hard bound: quinn waits `max(idle_timeout_ms, 3 × PTO)`, so on a high-RTT link a dead connection can outlive the configured value. | `QuicLimits::idle_timeout_ms` |
+| Idle | QUIC 30 s | A QUIC connection with no packets from the peer; closes as `TimedOut`. Not a hard bound: the connection uses the lower of the two peers' advertised values, and quinn waits at least 3 × PTO, so on a high-RTT link a dead connection can outlive the configured value. | `QuicLimits::idle_timeout_ms` |
 | Send stall | TCP 30 s | A TCP connection whose socket accepts nothing while bytes wait; closes as `Stalled`. | `TcpConfig::send_stall_timeout_ms` |
 | Yamux keepalive | ping after 30 s quiet; 10 s to send, 10 s to answer | A TCP or relayed connection that has received nothing; closes as `TimedOut`. | fixed |
 
@@ -255,7 +255,7 @@ use minip2p::{Endpoint, SwarmTimeouts, TcpConfig};
 let endpoint = Endpoint::builder()
     .listen_on("/ip4/0.0.0.0/tcp/0")?
     .timeouts(SwarmTimeouts {
-        negotiation_ms: 30_000, // the default: one stream's protocol negotiation
+        negotiation_ms: 30_000, // the default: an ordinary outbound stream's negotiation
         identify_ms: 60_000,    // the first Identify: open, negotiation and reply
         ping_ms: 30_000,        // one ping: open, negotiation and echo
     })
