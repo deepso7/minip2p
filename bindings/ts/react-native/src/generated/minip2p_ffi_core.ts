@@ -1208,8 +1208,8 @@ const FfiConverterTypeLimitsOptions = (() => {
  * Protocol deadline overrides, in milliseconds; each mirrors a
  * `minip2p::SwarmTimeouts` field.
  *
- * An absent record or field keeps the native default (`identify_ms` 30 s,
- * the others 10 s). A zero fails construction with
+ * An absent record or field keeps the native default (`negotiation_ms` and
+ * `identify_ms` 30 s, `ping_ms` 10 s). A zero fails construction with
  * `InvalidConfig { capability: Options }`. `identify_ms` and `ping_ms` each
  * cover their own negotiation, which `negotiation_ms` does not cut short.
  */

@@ -9,6 +9,10 @@ Breaking changes and their migrations. Release notes for each tag are generated 
 - **A relay bound only to `0.0.0.0` or `::`, with no announce or AutoNAT-confirmed address, grants RESERVE with an empty `addrs` list** instead of refusing it; clients build circuit addresses from the address they dialed the relay at. `RelayServerRuntimeErrorKind::NoAdvertisableAddrs` (#486) is removed; drop any arm matching it.
 - **`RelayServerEvent::ReservationDenied` gains `reason: ReservationDenialReason`** (`Paused`, `OverCircuit`, `RateLimited`, `ReservationLimit`, `ResponseNotEncodable`). `status` is unchanged and equals `reason.status()`. Add `reason` (or `..`) to patterns that destructure the variant.
 
+### The default negotiation deadline is 30 s (#505)
+
+`SwarmTimeouts::default().negotiation_ms` (`OUTBOUND_NEGOTIATION_TIMEOUT_MS`) is now 30 s, up from 10 s, so an outbound stream whose negotiation queues behind a bulk transfer on a slow link waits instead of failing. Ping streams and the first Identify stream are not affected: `ping_ms` and `identify_ms` bound their negotiation. Every surface on the default picks it up (Endpoint, the portable and smoltcp endpoints, UniFFI, Node and web). A peer that never answers a proposal now takes 30 s to fail; one that rejects the protocol still fails at once. To keep the old bound on those streams, set `negotiation_ms: 10_000` (`negotiationMs` in the bindings).
+
 ### Ping failures are events; ping and Identify deadlines cover their negotiation (#495, #496)
 
 - **`PingTimeout` is replaced by `PingFailed { peer_id, conn_id, cause }`** in `SwarmEvent`, `EndpointEvent` and the UniFFI `P2pEvent`, with `cause: PingFailure` (`TimedOut`, `OpenFailed`, `Rejected`, `StreamClosed`). Every accepted ping now ends in exactly one `PingRttMeasured` or `PingFailed`, unless its connection closes first; an open that failed, a refused or broken negotiation, or a stream that closed used to end it with a generic `Error` or nothing at all.
