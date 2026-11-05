@@ -22,6 +22,8 @@ export default defineComponents({
     Callout: "./components/docs/callout.astro",
     Card: "./components/docs/card.astro",
     CardGroup: "./components/docs/card-group.astro",
+    LandingConnectionAttempt: "./components/landing/connection-attempt.astro",
+    LandingEventLoop: "./components/landing/event-loop.astro",
     LandingExample: "./components/landing/example.astro",
     LandingFeatures: "./components/landing/features.astro",
     LandingFoot: "./components/landing/foot.astro",
