@@ -99,12 +99,35 @@ pub enum RelayServerRuntimeErrorKind {
     ResetStream,
     /// An agent invariant failed.
     InternalInvariant,
-    /// A RESERVE was refused because the relay has no address to advertise:
-    /// no announce addresses, and no confirmed or listener address that is
-    /// dialable (a wildcard bind such as `0.0.0.0` is not). Set announce
-    /// addresses with
-    /// [`replace_announce_addrs`](crate::RelayServerAgent::replace_announce_addrs).
-    NoAdvertisableAddrs,
+}
+
+/// Why the relay denied a RESERVE. Local diagnostics only: the requester
+/// sees just the wire [`Status`], from [`status`](Self::status).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReservationDenialReason {
+    /// Admission is paused by
+    /// [`set_accepting(false)`](crate::RelayServerAgent::set_accepting).
+    Paused,
+    /// The RESERVE arrived over a relayed circuit.
+    OverCircuit,
+    /// The peer's or its IP key's reservation token bucket is empty, or the
+    /// rate limiter tracks `max_rate_limit_entries` keys already.
+    RateLimited,
+    /// `max_reservations` or `max_reservations_per_ip` is reached.
+    ReservationLimit,
+    /// No reservation reply fits in a HOP message.
+    ResponseNotEncodable,
+}
+
+impl ReservationDenialReason {
+    /// The HOP status the relay sends for this denial.
+    pub const fn status(self) -> Status {
+        match self {
+            Self::Paused | Self::ResponseNotEncodable => Status::ReservationRefused,
+            Self::OverCircuit => Status::PermissionDenied,
+            Self::RateLimited | Self::ReservationLimit => Status::ResourceLimitExceeded,
+        }
+    }
 }
 
 /// Actionable diagnostic for an asynchronous operational failure.
@@ -134,8 +157,10 @@ pub enum RelayServerEvent {
     ReservationDenied {
         /// Peer whose request was denied.
         peer_id: PeerId,
-        /// Exact response status.
+        /// Exact response status, `reason.status()`.
         status: Status,
+        /// Why the relay denied it.
+        reason: ReservationDenialReason,
     },
     /// Exactly-once terminal event for a committed reservation.
     ReservationClosed {

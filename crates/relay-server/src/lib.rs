@@ -50,5 +50,6 @@ pub use minip2p_relay::Status;
 pub use swarm::{RelaySwarm, RelaySwarmError};
 pub use types::{
     CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RelayServerEvent,
-    RelayServerRuntimeError, RelayServerRuntimeErrorKind, ReservationCloseReason, StreamKey,
+    RelayServerRuntimeError, RelayServerRuntimeErrorKind, ReservationCloseReason,
+    ReservationDenialReason, StreamKey,
 };

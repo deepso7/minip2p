@@ -23,7 +23,7 @@ use crate::{
     CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
     RelayServerAddrSource, RelayServerAddressError, RelayServerConfig, RelayServerConfigError,
     RelayServerEvent, RelayServerRuntimeError, RelayServerRuntimeErrorKind, RelaySwarm,
-    RelaySwarmError, ReservationCloseReason, StreamKey,
+    RelaySwarmError, ReservationCloseReason, ReservationDenialReason, StreamKey,
 };
 
 /// The key per-IP admission limits share: an IPv4 address (IPv4-mapped
@@ -1400,11 +1400,7 @@ impl RelayServerAgent {
                 HopResponderOutput::Request(HopRequest::Reserve) => {
                     worker.request_known = true;
                     if worker.is_circuit {
-                        self.events.push_back(RelayServerEvent::ReservationDenied {
-                            peer_id,
-                            status: Status::PermissionDenied,
-                        });
-                        self.feed_hop(key, |hop| hop.reject(Status::PermissionDenied));
+                        self.deny_reservation(key, peer_id, ReservationDenialReason::OverCircuit);
                     } else {
                         self.decide_reservation(io, key);
                     }
@@ -1963,37 +1959,26 @@ impl RelayServerAgent {
         let expires_unix_secs = now
             .unix_seconds
             .map(|unix| unix.saturating_add(self.config.reservation_duration_secs));
-        let wire = self
-            .accepting
-            .then(|| self.reservation_wire(expires_unix_secs))
-            .flatten();
-        let status = if wire.is_none() {
-            Some(Status::ReservationRefused)
-        // Renewals keep an admitted reservation alive and spend no token.
-        } else if !renewed && !self.admit_new_reservation(&peer_id, ip.as_ref(), now.monotonic_ms) {
-            Some(Status::ResourceLimitExceeded)
+        let wire = if self.accepting {
+            self.reservation_wire(expires_unix_secs)
+                .ok_or(ReservationDenialReason::ResponseNotEncodable)
         } else {
-            None
+            Err(ReservationDenialReason::Paused)
         };
-        if let Some(status) = status {
-            if self.accepting && self.selected_addrs().is_empty() {
-                self.runtime_error(
-                    RelayServerRuntimeErrorKind::NoAdvertisableAddrs,
-                    Some(peer_id.clone()),
-                    "reservation refused: the relay has no dialable address to advertise; \
-                     a wildcard listener (0.0.0.0 or ::) needs announce addresses"
-                        .into(),
-                );
+        // Renewals keep an admitted reservation alive and spend no token.
+        let admitted = wire.and_then(|wire| {
+            if !renewed {
+                self.admit_new_reservation(&peer_id, ip.as_ref(), now.monotonic_ms)?;
             }
-            self.events.push_back(RelayServerEvent::ReservationDenied {
-                peer_id: peer_id.clone(),
-                status,
-            });
-            self.feed_hop(key, |hop| hop.reject(status));
-            return;
-        }
-
-        let (reservation, limit) = wire.expect("availability checked above");
+            Ok(wire)
+        });
+        let (reservation, limit) = match admitted {
+            Ok(wire) => wire,
+            Err(reason) => {
+                self.deny_reservation(key, peer_id, reason);
+                return;
+            }
+        };
         if !self.feed_hop(key, |hop| hop.accept_reservation(reservation, Some(limit))) {
             return;
         }
@@ -2031,6 +2016,28 @@ impl RelayServerAgent {
         self.complete_hop(key);
     }
 
+    /// Queues `peer_id`'s RESERVE denial and rejects it with
+    /// `reason`'s wire status.
+    fn deny_reservation(
+        &mut self,
+        key: StreamKey,
+        peer_id: PeerId,
+        reason: ReservationDenialReason,
+    ) {
+        let status = reason.status();
+        self.events.push_back(RelayServerEvent::ReservationDenied {
+            peer_id,
+            status,
+            reason,
+        });
+        self.feed_hop(key, |hop| hop.reject(status));
+    }
+
+    /// The reservation reply: every selected address that fits in one HOP
+    /// message, in order, each ending in this relay's `/p2p`. With nothing
+    /// to advertise (say, only a wildcard listener) the list is empty, and
+    /// clients use the address they dialed. `None` only when not even the
+    /// address-less reply encodes.
     fn reservation_wire(&self, expires_unix_secs: Option<u64>) -> Option<(Reservation, Limit)> {
         let mut addrs = Vec::new();
         for address in self.selected_addrs() {
@@ -2039,7 +2046,7 @@ impl RelayServerAgent {
             addrs.push(advertised.to_bytes());
         }
         let limit = self.circuit_limit();
-        while !addrs.is_empty() {
+        loop {
             let reservation = Reservation {
                 expire: expires_unix_secs,
                 addrs: addrs.clone(),
@@ -2049,28 +2056,32 @@ impl RelayServerAgent {
             {
                 return Some((reservation, limit));
             }
-            addrs.pop();
+            addrs.pop()?;
         }
-        None
     }
 
     /// Admission for a new reservation: needs a rate-limit token and room
     /// under `max_reservations` and `max_reservations_per_ip`, and spends the
     /// token only when all hold.
-    fn admit_new_reservation(&mut self, peer_id: &PeerId, ip: Option<&IpKey>, now_ms: u64) -> bool {
+    fn admit_new_reservation(
+        &mut self,
+        peer_id: &PeerId,
+        ip: Option<&IpKey>,
+        now_ms: u64,
+    ) -> Result<(), ReservationDenialReason> {
         if !self.reservation_limiters.allows(peer_id, ip, now_ms) {
-            return false;
+            return Err(ReservationDenialReason::RateLimited);
         }
         if self.reservations.len() >= self.config.max_reservations
             || self
                 .ip_tally
                 .is_full(ip, Held::Reservations, self.config.max_reservations_per_ip)
         {
-            return false;
+            return Err(ReservationDenialReason::ReservationLimit);
         }
         self.reservation_limiters
             .consume(peer_id, ip.cloned(), now_ms);
-        true
+        Ok(())
     }
 
     /// The admission key of `conn_id`'s remote address's first IP.
