@@ -731,11 +731,13 @@ impl NatAgent {
     }
 
     /// Circuit slots held by machines whose circuit the host has not adopted
-    /// yet.
+    /// yet. Only attempts hold one across inputs: an inbound circuit reserves
+    /// its slot and hands its bridge to the host within the same input.
     fn circuits_reserved(&self) -> usize {
-        let inbound = self.inbound.values().filter(|c| c.holds_circuit_slot());
-        let outbound = self.attempts.values().filter(|a| a.holds_circuit_slot());
-        inbound.count() + outbound.count()
+        self.attempts
+            .values()
+            .filter(|a| a.holds_circuit_slot())
+            .count()
     }
 
     fn handle(

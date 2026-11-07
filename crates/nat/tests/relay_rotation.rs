@@ -747,3 +747,73 @@ fn a_relay_refused_at_once_never_reports_started() {
         "{events:?}"
     );
 }
+
+/// Connects `relay` on `conn_id` and reports it ready with `protocols`.
+fn relay_ready(w: &mut World, relay: &PeerId, conn_id: ConnectionId, protocols: &[&str]) {
+    for event in [
+        SwarmEvent::ConnectionEstablished {
+            peer_id: relay.clone(),
+            conn_id,
+        },
+        SwarmEvent::PeerReady {
+            peer_id: relay.clone(),
+            conn_id,
+            protocols: protocols.iter().map(|p| p.to_string()).collect(),
+        },
+    ] {
+        w.agent.handle_event(&event, false, at(10));
+    }
+}
+
+#[test]
+fn a_relay_without_hop_moves_to_the_next() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let (a, b) = (w.a.clone(), w.b.clone());
+    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
+
+    relay_ready(&mut w, &a, a_conn, &[]);
+    let actions = drain_actions(&mut w.agent);
+    assert!(!has_hop_open(&actions), "no HOP stream is opened");
+    assert_eq!(dial_count_for(&actions, &b), 1, "B is tried next");
+    let events = drain_all_events(&mut w.agent);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            NatEvent::RelayFailed { relay, error: NatError::Protocol(reason), .. }
+                if relay.peer_id() == &a && reason.contains("HOP")
+        )),
+        "{events:?}"
+    );
+
+    hop_exchange(&mut w, &b, dial_conn_for(&actions, &b), Status::Ok, 20);
+    assert_relayed_via(&mut w, &b, 21);
+}
+
+#[test]
+fn a_refused_hop_stream_open_moves_to_the_next() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let (a, b) = (w.a.clone(), w.b.clone());
+    let a_conn = dial_conn_for(&drain_actions(&mut w.agent), &a);
+
+    w.agent.swarm.refuse_opens = Some("stream limit".into());
+    relay_ready(&mut w, &a, a_conn, &[HOP_PROTOCOL_ID]);
+    w.agent.swarm.refuse_opens = None;
+    let actions = drain_actions(&mut w.agent);
+    assert_eq!(dial_count_for(&actions, &b), 1, "B is tried next");
+    let events = drain_all_events(&mut w.agent);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            NatEvent::RelayFailed { relay, error: NatError::Protocol(reason), .. }
+                if relay.peer_id() == &a && reason.contains("opening HOP stream failed")
+        )),
+        "{events:?}"
+    );
+
+    hop_exchange(&mut w, &b, dial_conn_for(&actions, &b), Status::Ok, 20);
+    assert_relayed_via(&mut w, &b, 21);
+}

@@ -89,9 +89,9 @@ fn renewal_delay_ms(lifetime_secs: u64) -> u64 {
     lifetime_secs.max(1).saturating_mul(1_000) / 2
 }
 
-/// Progress of one outbound single-stream exchange (probe or reservation).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExchangeStage {
+/// Progress of one outbound single-stream exchange (probe or reservation),
+/// driving the wire machine `M` once its stream exists.
+enum ExchangeStage<M> {
     /// Waiting for the server's connection to reach `PeerReady`
     /// (a dial may be in flight).
     WaitPeerReady,
@@ -99,21 +99,55 @@ enum ExchangeStage {
     WaitStreamReady {
         conn: ConnectionId,
         stream: StreamId,
+        machine: M,
     },
     /// Request sent; waiting for the response.
     AwaitResponse {
         conn: ConnectionId,
         stream: StreamId,
+        machine: M,
     },
 }
 
-impl ExchangeStage {
+impl<M> ExchangeStage<M> {
     fn stream(&self) -> Option<(ConnectionId, StreamId)> {
         match self {
-            Self::WaitStreamReady { conn, stream } | Self::AwaitResponse { conn, stream } => {
-                Some((*conn, *stream))
-            }
+            Self::WaitStreamReady { conn, stream, .. }
+            | Self::AwaitResponse { conn, stream, .. } => Some((*conn, *stream)),
             Self::WaitPeerReady => None,
+        }
+    }
+
+    fn waits_peer_ready(&self) -> bool {
+        matches!(self, Self::WaitPeerReady)
+    }
+
+    /// The machine of the exchange running on `stream`, if this one is.
+    fn machine_on(&mut self, stream: StreamId) -> Option<&mut M> {
+        match self {
+            Self::WaitStreamReady {
+                stream: s, machine, ..
+            }
+            | Self::AwaitResponse {
+                stream: s, machine, ..
+            } if *s == stream => Some(machine),
+            _ => None,
+        }
+    }
+
+    /// The request was flushed: the response is awaited next.
+    fn mark_sent(&mut self) {
+        if let Self::WaitStreamReady {
+            conn,
+            stream,
+            machine,
+        } = core::mem::replace(self, Self::WaitPeerReady)
+        {
+            *self = Self::AwaitResponse {
+                conn,
+                stream,
+                machine,
+            };
         }
     }
 
@@ -124,9 +158,9 @@ impl ExchangeStage {
 }
 
 /// Resets an abandoned exchange stream and releases it.
-fn abandon_stream(
+fn abandon_stream<M>(
     peer: &PeerId,
-    stage: ExchangeStage,
+    stage: &ExchangeStage<M>,
     swarm: &mut dyn NatSwarm,
     shared: &mut Shared,
     now: Now,
@@ -134,6 +168,13 @@ fn abandon_stream(
     if let Some((conn, stream)) = stage.stream() {
         reset(swarm, peer, conn, stream, now);
         shared.release_stream(conn, stream);
+    }
+}
+
+/// Emits the loss of the reservation an acquisition was renewing, once.
+fn emit_renewal_lost(renewing: &mut Option<(PeerId, ConnectionId)>, shared: &mut Shared) {
+    if let Some((relay, _)) = renewing.take() {
+        shared.push_event(NatEvent::RelayReservationLost { relay });
     }
 }
 
@@ -157,8 +198,7 @@ fn finish_stream(
 /// One in-flight AutoNAT probe.
 struct ProbeFlight {
     server: PeerAddr,
-    stage: ExchangeStage,
-    machine: Option<AutoNatClient>,
+    stage: ExchangeStage<AutoNatClient>,
     deadline: u64,
 }
 
@@ -254,7 +294,6 @@ impl Prober {
         self.flight = Some(ProbeFlight {
             server,
             stage: ExchangeStage::WaitPeerReady,
-            machine: None,
             deadline: now.monotonic_ms + deadline_ms,
         });
         self.next_probe_at = None;
@@ -282,11 +321,11 @@ impl Prober {
                     stream,
                     StreamRole::AutonatProbe,
                 );
-                flight.machine = Some(AutoNatClient::new(
-                    &shared.local_peer_id,
-                    &shared.probe_addrs(),
-                ));
-                flight.stage = ExchangeStage::WaitStreamReady { conn, stream };
+                flight.stage = ExchangeStage::WaitStreamReady {
+                    conn,
+                    stream,
+                    machine: AutoNatClient::new(&shared.local_peer_id, &shared.probe_addrs()),
+                };
             }
             Err(_) => self.abort_flight(swarm, shared, now),
         }
@@ -303,7 +342,7 @@ impl Prober {
         let Some(flight) = &self.flight else {
             return;
         };
-        if flight.stage != ExchangeStage::WaitPeerReady || flight.server.peer_id() != peer {
+        if !flight.stage.waits_peer_ready() || flight.server.peer_id() != peer {
             return;
         }
         if let Some(result) = acquire::on_ready(peer, conn, AUTONAT_PROTOCOL_ID, swarm, now) {
@@ -328,7 +367,7 @@ impl Prober {
             return;
         }
         let lost = flight.stage.is_on(conn_id)
-            || (flight.stage == ExchangeStage::WaitPeerReady
+            || (flight.stage.waits_peer_ready()
                 && !acquire::can_become_ready(peer, swarm, shared, now));
         if lost {
             self.lose_flight(shared, now);
@@ -377,7 +416,7 @@ impl Prober {
         now: Now,
     ) {
         if self.flight.as_ref().is_some_and(|f| {
-            f.stage == ExchangeStage::WaitPeerReady
+            f.stage.waits_peer_ready()
                 && f.server.peer_id() == peer
                 && !acquire::can_become_ready(peer, swarm, shared, now)
         }) {
@@ -415,27 +454,25 @@ impl Prober {
         let Some(flight) = &mut self.flight else {
             return false;
         };
-        let Some((conn, _)) = flight.stage.stream().filter(|(_, s)| *s == stream) else {
+        let Some((conn, _)) = flight.stage.stream() else {
             return false;
         };
-        let Some(machine) = flight.machine.as_mut() else {
+        let awaiting = matches!(flight.stage, ExchangeStage::AwaitResponse { .. });
+        let Some(machine) = flight.stage.machine_on(stream) else {
             return false;
         };
-        let fed = match (flight.stage, input) {
-            (ExchangeStage::WaitStreamReady { .. }, StreamInput::Ready) => {
-                let server_peer = flight.server.peer_id().clone();
+        let fed = match (awaiting, input) {
+            (false, StreamInput::Ready) => {
                 while let Some(output) = machine.poll_output() {
                     if let AutoNatClientOutput::Outbound(data) = output {
-                        send(swarm, &server_peer, conn, stream, data, now);
+                        send(swarm, flight.server.peer_id(), conn, stream, data, now);
                     }
                 }
-                flight.stage = ExchangeStage::AwaitResponse { conn, stream };
+                flight.stage.mark_sent();
                 return false;
             }
-            (ExchangeStage::AwaitResponse { .. }, StreamInput::Data(data)) => machine.on_data(data),
-            (ExchangeStage::AwaitResponse { .. }, StreamInput::RemoteWriteClosed) => {
-                machine.on_remote_write_closed()
-            }
+            (true, StreamInput::Data(data)) => machine.on_data(data),
+            (true, StreamInput::RemoteWriteClosed) => machine.on_remote_write_closed(),
             (_, StreamInput::Closed) => {
                 self.abort_flight(swarm, shared, now);
                 return false;
@@ -641,7 +678,7 @@ impl Prober {
     /// rotates servers, and schedules a quick retry.
     fn abort_flight(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
         if let Some(flight) = self.flight.take() {
-            abandon_stream(flight.server.peer_id(), flight.stage, swarm, shared, now);
+            abandon_stream(flight.server.peer_id(), &flight.stage, swarm, shared, now);
         }
         self.server_idx += 1;
         self.next_probe_at = Some(now.monotonic_ms + shared.config.probe_interval_unsettled_ms);
@@ -685,9 +722,11 @@ enum ResState {
     /// Acquisition (or renewal) exchange in flight.
     Acquiring {
         relay: PeerAddr,
-        stage: ExchangeStage,
-        machine: Option<HopReservation>,
+        stage: ExchangeStage<HopReservation>,
         deadline: u64,
+        /// The reservation being renewed and the connection it was made on,
+        /// so its loss emits [`NatEvent::RelayReservationLost`] exactly once.
+        renewing: Option<(PeerId, ConnectionId)>,
     },
     /// Reservation held on connection `conn`; renewal fires at
     /// `info.renew_at_mono_ms`.
@@ -714,9 +753,6 @@ pub(crate) struct ReservationManager {
     /// The initial policy reconciliation is an immediate timer source. Once
     /// it runs, later policy flips call `sync` directly from probe handling.
     needs_sync: bool,
-    /// The reservation being renewed and the connection it was made on, so
-    /// its loss emits [`NatEvent::RelayReservationLost`] exactly once.
-    held: Option<(PeerId, ConnectionId)>,
     /// Backoffs since the last held reservation; each doubles the next.
     failures: u32,
     /// SplitMix64 state for backoff jitter, seeded by the host.
@@ -730,7 +766,6 @@ impl ReservationManager {
             relay_idx: 0,
             needs_sync: !config.relays.is_empty()
                 && config.reservation_policy != ReservationPolicy::Never,
-            held: None,
             failures: 0,
             jitter: jitter_seed,
         }
@@ -764,13 +799,13 @@ impl ReservationManager {
             return;
         }
         match &self.state {
-            ResState::Idle => self.begin_acquire(swarm, shared, now),
+            ResState::Idle => self.begin_acquire(None, swarm, shared, now),
             ResState::Backoff { until } if now.monotonic_ms >= *until => {
-                self.begin_acquire(swarm, shared, now);
+                self.begin_acquire(None, swarm, shared, now);
             }
             ResState::Reserved { info, conn, .. } if now.monotonic_ms >= info.renew_at_mono_ms => {
-                self.held = Some((info.relay.clone(), *conn));
-                self.begin_acquire(swarm, shared, now);
+                let renewing = Some((info.relay.clone(), *conn));
+                self.begin_acquire(renewing, swarm, shared, now);
             }
             ResState::Reserved {
                 relay,
@@ -808,16 +843,28 @@ impl ReservationManager {
                     relay: relay.peer_id().clone(),
                 });
             }
-            ResState::Acquiring { relay, stage, .. } => {
-                abandon_stream(relay.peer_id(), stage, swarm, shared, now);
-                self.emit_held_lost(shared);
+            ResState::Acquiring {
+                relay,
+                stage,
+                mut renewing,
+                ..
+            } => {
+                abandon_stream(relay.peer_id(), &stage, swarm, shared, now);
+                emit_renewal_lost(&mut renewing, shared);
             }
             _ => {}
         }
-        self.held = None;
     }
 
-    fn begin_acquire(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
+    /// Starts acquiring from the current relay; `renewing` names the
+    /// reservation this replaces, if any.
+    fn begin_acquire(
+        &mut self,
+        renewing: Option<(PeerId, ConnectionId)>,
+        swarm: &mut dyn NatSwarm,
+        shared: &mut Shared,
+        now: Now,
+    ) {
         let relays = &shared.config.relays;
         if relays.is_empty() {
             self.state = ResState::Idle;
@@ -831,7 +878,7 @@ impl ReservationManager {
             )
             .expect("the checked relay cursor is within the configured list")
             .clone();
-        self.acquire_from(relay, swarm, shared, now);
+        self.acquire_from(relay, renewing, swarm, shared, now);
     }
 
     /// Starts a reservation exchange with `relay`. A connect attempt's relay
@@ -839,6 +886,7 @@ impl ReservationManager {
     fn acquire_from(
         &mut self,
         relay: PeerAddr,
+        renewing: Option<(PeerId, ConnectionId)>,
         swarm: &mut dyn NatSwarm,
         shared: &mut Shared,
         now: Now,
@@ -856,8 +904,8 @@ impl ReservationManager {
         self.state = ResState::Acquiring {
             relay,
             stage: ExchangeStage::WaitPeerReady,
-            machine: None,
             deadline: now.monotonic_ms + deadline_ms,
+            renewing,
         };
         self.on_acquired(result, swarm, shared, now);
     }
@@ -870,30 +918,32 @@ impl ReservationManager {
         shared: &mut Shared,
         now: Now,
     ) {
-        let ResState::Acquiring {
-            relay,
-            stage,
-            machine,
-            ..
-        } = &mut self.state
-        else {
+        let ResState::Acquiring { relay, stage, .. } = &mut self.state else {
             return;
         };
         match result {
             Ok(Acquired::Waiting) => {}
             Ok(Acquired::Opened(conn, stream)) => {
                 shared.own_stream(relay.peer_id(), conn, stream, StreamRole::HopReserve);
-                *machine = Some(HopReservation::new());
-                *stage = ExchangeStage::WaitStreamReady { conn, stream };
+                *stage = ExchangeStage::WaitStreamReady {
+                    conn,
+                    stream,
+                    machine: HopReservation::new(),
+                };
             }
             Err(_) => self.fail_acquire(swarm, shared, now),
         }
     }
 
-    /// Emits the loss of a reservation being renewed, once.
-    fn emit_held_lost(&mut self, shared: &mut Shared) {
-        if let Some((relay, _)) = self.held.take() {
-            shared.push_event(NatEvent::RelayReservationLost { relay });
+    /// Emits the loss of the reservation an acquisition renews when it
+    /// was made on `conn_id` to `peer`.
+    fn renewal_lost_on(&mut self, peer: &PeerId, conn_id: ConnectionId, shared: &mut Shared) {
+        if let ResState::Acquiring { renewing, .. } = &mut self.state
+            && renewing
+                .as_ref()
+                .is_some_and(|(relay, conn)| relay == peer && *conn == conn_id)
+        {
+            emit_renewal_lost(renewing, shared);
         }
     }
 
@@ -901,12 +951,16 @@ impl ReservationManager {
     /// error): emit `RelayReservationLost` if a reservation was being
     /// renewed, rotate relays, and back off.
     fn fail_acquire(&mut self, swarm: &mut dyn NatSwarm, shared: &mut Shared, now: Now) {
-        if let ResState::Acquiring { relay, stage, .. } =
-            core::mem::replace(&mut self.state, ResState::Idle)
+        if let ResState::Acquiring {
+            relay,
+            stage,
+            mut renewing,
+            ..
+        } = core::mem::replace(&mut self.state, ResState::Idle)
         {
-            abandon_stream(relay.peer_id(), stage, swarm, shared, now);
+            abandon_stream(relay.peer_id(), &stage, swarm, shared, now);
+            emit_renewal_lost(&mut renewing, shared);
         }
-        self.emit_held_lost(shared);
         self.back_off(shared, now);
     }
 
@@ -935,7 +989,7 @@ impl ReservationManager {
         let ResState::Acquiring { relay, stage, .. } = &self.state else {
             return;
         };
-        if *stage != ExchangeStage::WaitPeerReady || relay.peer_id() != peer {
+        if !stage.waits_peer_ready() || relay.peer_id() != peer {
             return;
         }
         if let Some(result) = acquire::on_ready(peer, conn, HOP_PROTOCOL_ID, swarm, now) {
@@ -955,10 +1009,8 @@ impl ReservationManager {
         shared: &mut Shared,
         now: Now,
     ) {
-        if self.held.as_ref() == Some(&(peer.clone(), conn_id)) {
-            self.emit_held_lost(shared);
-        }
-        match &self.state {
+        self.renewal_lost_on(peer, conn_id, shared);
+        match &mut self.state {
             ResState::Reserved { relay, conn, .. }
                 if relay.peer_id() == peer && *conn == conn_id =>
             {
@@ -967,17 +1019,21 @@ impl ReservationManager {
                 });
                 self.back_off(shared, now);
             }
-            ResState::Acquiring { relay, stage, .. }
-                if relay.peer_id() == peer
-                    && (stage.is_on(conn_id)
-                        || (*stage == ExchangeStage::WaitPeerReady
-                            && !acquire::can_become_ready(peer, swarm, shared, now))) =>
+            ResState::Acquiring {
+                relay,
+                stage,
+                renewing,
+                ..
+            } if relay.peer_id() == peer
+                && (stage.is_on(conn_id)
+                    || (stage.waits_peer_ready()
+                        && !acquire::can_become_ready(peer, swarm, shared, now))) =>
             {
                 if let Some((conn, stream)) = stage.stream() {
                     // The connection is terminal; nothing to reset.
                     shared.release_stream(conn, stream);
                 }
-                self.emit_held_lost(shared);
+                emit_renewal_lost(renewing, shared);
                 self.back_off(shared, now);
             }
             _ => {}
@@ -996,29 +1052,30 @@ impl ReservationManager {
         shared: &mut Shared,
         now: Now,
     ) {
-        if self.held.as_ref() == Some(&(peer.clone(), old)) {
-            self.emit_held_lost(shared);
-        }
-        let relay = match &self.state {
+        self.renewal_lost_on(peer, old, shared);
+        let (relay, renewing) = match &mut self.state {
             ResState::Reserved { relay, conn, .. } if relay.peer_id() == peer && *conn == old => {
                 shared.push_event(NatEvent::RelayReservationLost {
                     relay: peer.clone(),
                 });
-                relay.clone()
+                (relay.clone(), None)
             }
-            ResState::Acquiring { relay, stage, .. }
-                if relay.peer_id() == peer && stage.is_on(old) =>
-            {
+            ResState::Acquiring {
+                relay,
+                stage,
+                renewing,
+                ..
+            } if relay.peer_id() == peer && stage.is_on(old) => {
                 if let Some((conn, stream)) = stage.stream() {
                     // The stream lived on the retired connection: release
                     // it without a reset.
                     shared.release_stream(conn, stream);
                 }
-                relay.clone()
+                (relay.clone(), renewing.take())
             }
             _ => return,
         };
-        self.acquire_from(relay, swarm, shared, now);
+        self.acquire_from(relay, renewing, swarm, shared, now);
     }
 
     /// A reservation dial toward `peer` failed. It is moot for an
@@ -1053,36 +1110,28 @@ impl ReservationManager {
         shared: &mut Shared,
         now: Now,
     ) {
-        let ResState::Acquiring {
-            relay,
-            stage,
-            machine,
-            ..
-        } = &mut self.state
-        else {
+        let ResState::Acquiring { relay, stage, .. } = &mut self.state else {
             return;
         };
-        let Some((conn, _)) = stage.stream().filter(|(_, s)| *s == stream) else {
+        let Some((conn, _)) = stage.stream() else {
             return;
         };
-        let Some(m) = machine.as_mut() else {
+        let awaiting = matches!(stage, ExchangeStage::AwaitResponse { .. });
+        let Some(m) = stage.machine_on(stream) else {
             return;
         };
-        let fed = match (*stage, input) {
-            (ExchangeStage::WaitStreamReady { .. }, StreamInput::Ready) => {
-                let relay_peer = relay.peer_id().clone();
+        let fed = match (awaiting, input) {
+            (false, StreamInput::Ready) => {
                 while let Some(output) = m.poll_output() {
                     if let HopReservationOutput::Outbound(data) = output {
-                        send(swarm, &relay_peer, conn, stream, data, now);
+                        send(swarm, relay.peer_id(), conn, stream, data, now);
                     }
                 }
-                *stage = ExchangeStage::AwaitResponse { conn, stream };
+                stage.mark_sent();
                 return;
             }
-            (ExchangeStage::AwaitResponse { .. }, StreamInput::Data(data)) => m.on_data(data),
-            (ExchangeStage::AwaitResponse { .. }, StreamInput::RemoteWriteClosed) => {
-                m.on_remote_write_closed()
-            }
+            (true, StreamInput::Data(data)) => m.on_data(data),
+            (true, StreamInput::RemoteWriteClosed) => m.on_remote_write_closed(),
             (_, StreamInput::Closed) => {
                 self.fail_acquire(swarm, shared, now);
                 return;
@@ -1130,7 +1179,6 @@ impl ReservationManager {
     ) {
         let relay_peer = relay.peer_id().clone();
         finish_stream(&relay_peer, conn, stream, swarm, shared, now);
-        self.held = None;
 
         let default_ttl = shared.config.reservation_default_ttl_secs;
         // Renew at half the reported lifetime when both the expiry and a wall

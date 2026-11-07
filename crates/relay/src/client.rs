@@ -57,10 +57,9 @@ pub struct HopReservation {
     frames: FrameExchange,
     state: FlowState,
     outcome: Option<ReservationOutcome>,
-    emitted_outcome: bool,
 }
 
-/// Common flow states for client-initiated request/response exchanges.
+/// [`HopReservation`] states for its request/response exchange.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FlowState {
     /// Request pending; nothing sent yet.
@@ -68,6 +67,20 @@ enum FlowState {
     /// Request sent; waiting for a STATUS response frame.
     AwaitingResponse,
     /// Flow completed (success or failure). No further work.
+    Done,
+}
+
+/// [`HopConnect`] states: a request/response flow whose acceptance turns
+/// the stream into the bridged circuit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectState {
+    /// Request pending; nothing sent yet.
+    Pending,
+    /// Request sent; waiting for a STATUS response frame.
+    AwaitingResponse,
+    /// CONNECT accepted: later stream bytes are bridged traffic.
+    Bridged,
+    /// Refused or failed. No further work.
     Done,
 }
 
@@ -90,7 +103,6 @@ impl HopReservation {
             frames,
             state: FlowState::Pending,
             outcome: None,
-            emitted_outcome: false,
         }
     }
 
@@ -132,16 +144,13 @@ impl HopReservation {
             }
             return Some(HopReservationOutput::Outbound(self.frames.take_outbound()));
         }
-        if !self.emitted_outcome
-            && let Some(outcome) = self.outcome.clone()
-        {
-            self.emitted_outcome = true;
+        if let Some(outcome) = self.outcome.take() {
             return Some(HopReservationOutput::Outcome(outcome));
         }
         None
     }
 
-    /// Returns the outcome of the flow, if available.
+    /// Returns the outcome until [`poll_output`](Self::poll_output) emits it.
     #[cfg(test)]
     fn outcome(&self) -> Option<&ReservationOutcome> {
         self.outcome.as_ref()
@@ -177,7 +186,6 @@ impl HopReservation {
                 reason: describe_status(status),
             }
         });
-        self.emitted_outcome = false;
         Ok(())
     }
 }
@@ -233,9 +241,8 @@ pub enum HopConnectOutput {
 /// bridged traffic and are not bound by the control-frame limit.
 pub struct HopConnect {
     frames: FrameExchange,
-    state: FlowState,
+    state: ConnectState,
     outcome: Option<ConnectOutcome>,
-    emitted_outcome: bool,
     bridge_bytes: Vec<u8>,
 }
 
@@ -263,9 +270,8 @@ impl HopConnect {
 
         Ok(Self {
             frames,
-            state: FlowState::Pending,
+            state: ConnectState::Pending,
             outcome: None,
-            emitted_outcome: false,
             bridge_bytes: Vec::new(),
         })
     }
@@ -276,13 +282,13 @@ impl HopConnect {
     /// emitted as [`HopConnectOutput::BridgeData`]. Any error ends the flow;
     /// later input is ignored.
     pub fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
-        if self.state == FlowState::Done {
-            // Already bridged or errored — any further bytes belong to the
-            // bridged channel (or are garbage after an error).
-            if matches!(self.outcome, Some(ConnectOutcome::Bridged { .. })) {
+        match self.state {
+            ConnectState::Bridged => {
                 self.bridge_bytes.extend_from_slice(data);
+                return Ok(());
             }
-            return Ok(());
+            ConnectState::Done => return Ok(()),
+            ConnectState::Pending | ConnectState::AwaitingResponse => {}
         }
         let result = self
             .frames
@@ -294,7 +300,7 @@ impl HopConnect {
 
     /// Notifies the state machine that the remote closed its write side.
     pub fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
-        if self.state == FlowState::Done {
+        if self.is_done() {
             return Ok(());
         }
         let result = self.try_decode_response();
@@ -307,15 +313,12 @@ impl HopConnect {
     /// waiting on the stream again.
     pub fn poll_output(&mut self) -> Option<HopConnectOutput> {
         if self.frames.has_outbound() {
-            if self.state == FlowState::Pending {
-                self.state = FlowState::AwaitingResponse;
+            if self.state == ConnectState::Pending {
+                self.state = ConnectState::AwaitingResponse;
             }
             return Some(HopConnectOutput::Outbound(self.frames.take_outbound()));
         }
-        if !self.emitted_outcome
-            && let Some(outcome) = self.outcome.clone()
-        {
-            self.emitted_outcome = true;
+        if let Some(outcome) = self.outcome.take() {
             return Some(HopConnectOutput::Outcome(outcome));
         }
         let bridge_bytes = self.take_bridge_bytes();
@@ -325,15 +328,15 @@ impl HopConnect {
         None
     }
 
-    /// Returns the outcome of the flow, if available.
+    /// Returns the outcome until [`poll_output`](Self::poll_output) emits it.
     #[cfg(test)]
     fn outcome(&self) -> Option<&ConnectOutcome> {
         self.outcome.as_ref()
     }
 
-    /// Returns `true` if the flow has completed.
+    /// Returns `true` if the flow has completed (bridged, refused or failed).
     pub fn is_done(&self) -> bool {
-        self.state == FlowState::Done
+        matches!(self.state, ConnectState::Bridged | ConnectState::Done)
     }
 
     /// Drains any bridged relay traffic received since the last call.
@@ -345,7 +348,7 @@ impl HopConnect {
 
     fn finish_on_error(&mut self, result: Result<(), RelayError>) -> Result<(), RelayError> {
         if result.is_err() {
-            self.state = FlowState::Done;
+            self.state = ConnectState::Done;
         }
         result
     }
@@ -356,7 +359,11 @@ impl HopConnect {
             return Ok(());
         };
         let status = msg.status.unwrap_or(Status::Unused);
-        self.state = FlowState::Done;
+        self.state = if status == Status::Ok {
+            ConnectState::Bridged
+        } else {
+            ConnectState::Done
+        };
         self.outcome = Some(if status == Status::Ok {
             // Any bytes buffered after the STATUS frame belong to the bridged
             // stream. This catches the case where the relay pipelines the
@@ -369,7 +376,6 @@ impl HopConnect {
                 reason: describe_status(status),
             }
         });
-        self.emitted_outcome = false;
         Ok(())
     }
 }
@@ -418,7 +424,6 @@ pub struct StopResponder {
     frames: FrameExchange,
     state: StopState,
     request: Option<StopConnectRequest>,
-    emitted_request: bool,
     bridge_bytes: Vec<u8>,
 }
 
@@ -442,7 +447,6 @@ impl StopResponder {
             frames: handshake_frames(),
             state: StopState::AwaitingConnect,
             request: None,
-            emitted_request: false,
             bridge_bytes: Vec::new(),
         }
     }
@@ -499,10 +503,7 @@ impl StopResponder {
     /// Drain until `None` after every input, before waiting on the stream
     /// or the decision again.
     pub fn poll_output(&mut self) -> Option<StopResponderOutput> {
-        if !self.emitted_request
-            && let Some(request) = self.request.clone()
-        {
-            self.emitted_request = true;
+        if let Some(request) = self.request.take() {
             return Some(StopResponderOutput::Request(request));
         }
         if self.frames.has_outbound() {
@@ -515,7 +516,8 @@ impl StopResponder {
         None
     }
 
-    /// Returns the decoded CONNECT request, if received.
+    /// Returns the decoded CONNECT request until
+    /// [`poll_output`](Self::poll_output) emits it.
     #[cfg(test)]
     fn request(&self) -> Option<&StopConnectRequest> {
         self.request.as_ref()
@@ -583,7 +585,6 @@ impl StopResponder {
             source_peer_id: peer.id,
             limit: msg.limit,
         });
-        self.emitted_request = false;
         self.state = StopState::AwaitingDecision;
         Ok(())
     }
