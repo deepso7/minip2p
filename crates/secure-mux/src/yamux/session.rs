@@ -68,7 +68,7 @@ enum WriteSide {
     Closed,
 }
 
-/// Whether the session still carries streams, and if not, why.
+/// Whether the session is active, and if not, why.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Lifecycle {
     Active,

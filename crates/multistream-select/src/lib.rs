@@ -24,6 +24,10 @@ pub const MULTISTREAM_PROTOCOL_ID: &str = "/multistream/1.0.0";
 const NOT_AVAILABLE: &str = "na";
 /// Maximum allowed message payload length in bytes.
 const MAX_MESSAGE_LEN: usize = 1024;
+/// Most bytes held before [`MultistreamSelect::start`]. They cannot be decoded
+/// (and so length-checked) until then; an honest peer sends a header and a
+/// proposal or two, well under this.
+const MAX_UNSTARTED_BUFFER: usize = 4 * MAX_MESSAGE_LEN;
 
 /// Output produced by the negotiation state machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +60,8 @@ pub enum MultistreamError {
     UnexpectedHeader { actual: String },
     #[error("unexpected protocol response: {actual}")]
     UnexpectedProtocolResponse { actual: String },
+    #[error("{len} bytes received before start (max {MAX_UNSTARTED_BUFFER})")]
+    TooMuchBeforeStart { len: usize },
 }
 
 /// Which side of the negotiation this is, with the data only that side needs.
@@ -162,13 +168,25 @@ impl MultistreamSelect {
     }
 
     /// Feeds received bytes into the state machine, queuing any outputs.
-    /// Bytes received before [`start`](Self::start) wait for it.
+    /// Bytes received before [`start`](Self::start) wait for it; more than a
+    /// few KiB of them fail the negotiation.
     pub fn on_data(&mut self, bytes: &[u8]) {
         if self.state == State::Done {
             return;
         }
 
         self.recv_buf.extend_from_slice(bytes);
+        if self.state == State::Unstarted && self.recv_buf.len() > MAX_UNSTARTED_BUFFER {
+            self.state = State::Done;
+            self.pending_outputs
+                .push_back(MultistreamOutput::ProtocolError {
+                    reason: MultistreamError::TooMuchBeforeStart {
+                        len: self.recv_buf.len(),
+                    }
+                    .to_string(),
+                });
+            return;
+        }
         self.process_buffer();
     }
 
@@ -570,6 +588,21 @@ mod tests {
                     protocol: PING.to_string()
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn data_before_start_is_capped() {
+        let mut listener = MultistreamSelect::listener([PING.to_string()]);
+        assert!(listener.receive(&[0; MAX_UNSTARTED_BUFFER]).is_empty());
+        assert!(matches!(
+            listener.receive(&[0]).as_slice(),
+            [MultistreamOutput::ProtocolError { .. }]
+        ));
+        assert!(listener.is_done());
+        assert!(
+            listener.start_drained().is_empty(),
+            "a failed negotiation sends nothing"
         );
     }
 
