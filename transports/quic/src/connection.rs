@@ -189,6 +189,11 @@ pub(crate) struct QuicConnection {
     /// (`Connected`) until a local close or a failed authentication. Outside
     /// it, new peer streams are refused and data on existing ones is
     /// discarded without events.
+    ///
+    /// Not derived from `state`: a connection the engine lost while
+    /// `Connected` is `Closed` but keeps surfacing streams until it drains,
+    /// so what the peer sent before closing is still read (and delivered as
+    /// acknowledgements make room) ahead of `Closed`.
     surfaces_streams: bool,
     /// Why the connection is ending: the first cause seen, reported on its
     /// `Closed`.
@@ -420,6 +425,12 @@ impl QuicConnection {
     #[cfg(test)]
     pub(crate) fn is_gated(&self, stream_id: StreamId) -> bool {
         self.gated.contains(&stream_id.as_u64())
+    }
+
+    /// Whether the WebTransport session, if any, was accepted.
+    #[cfg(test)]
+    pub(crate) fn wt_accepted(&self) -> bool {
+        self.wt.as_ref().is_some_and(WtSession::accepted)
     }
 
     #[cfg(test)]
@@ -753,6 +764,7 @@ impl QuicConnection {
         self.close_reason.get_or_insert(reason);
         self.end_writes();
         self.disarm_wt();
+        // `surfaces_streams` stays as it was: see its doc.
         self.state = ConnectionState::Closed;
     }
 

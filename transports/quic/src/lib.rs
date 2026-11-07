@@ -392,15 +392,9 @@ pub struct QuicTransport {
     /// Installed on the endpoint by the first `listen`; until then it
     /// accepts nothing.
     server_config: Arc<ServerConfig>,
-    /// The per-connection overrides for sockets that serve WebTransport,
-    /// beside `quic-v1` (ALPN `libp2p` and `h3`) and alone (`h3`), with
-    /// optional client certificates and [`webtransport_transport_config`].
-    /// `None` when no socket does.
-    webtransport_config: Option<WebTransportConfigs>,
-    /// The served certificate (derived and rotating, or provided) and what
-    /// WebTransport connections authenticate with, when a socket serves
-    /// WebTransport.
-    webtransport: Option<Certificates>,
+    /// What WebTransport-serving sockets need; `None` when no socket
+    /// serves WebTransport.
+    webtransport: Option<WebTransport>,
     transport_config: Arc<TransportConfig>,
     tls: TlsIdentity,
     /// The host's wall-clock time, shared with the TLS verifiers.
@@ -444,11 +438,16 @@ pub struct QuicTransport {
     clock: Option<(Now, Instant)>,
 }
 
-/// The server configs of WebTransport-serving sockets.
-struct WebTransportConfigs {
-    /// ALPN `libp2p` then `h3`: the socket also serves `quic-v1`.
+/// The state of a transport with WebTransport-serving sockets.
+struct WebTransport {
+    /// The served certificate (derived and rotating, or provided) and what
+    /// WebTransport connections authenticate with.
+    certificates: Certificates,
+    /// The per-connection override for sockets that serve WebTransport
+    /// beside `quic-v1`: ALPN `libp2p` then `h3`. Both overrides take
+    /// optional client certificates and [`webtransport_transport_config`].
     dual: Arc<ServerConfig>,
-    /// ALPN `h3` only.
+    /// The override for sockets that serve WebTransport alone: ALPN `h3`.
     h3: Arc<ServerConfig>,
 }
 
@@ -620,10 +619,7 @@ impl QuicTransport {
             .transport_config(Arc::clone(&transport_config))
             .retry_token_lifetime(RETRY_TOKEN_LIFETIME)
             .validation_token_config(validation_tokens);
-        let (webtransport_config, webtransport) = if sockets
-            .iter()
-            .any(|socket| socket.webtransport)
-        {
+        let webtransport = if sockets.iter().any(|socket| socket.webtransport) {
             // Until the first poll's sample, the system clock picks the
             // period, or judges a provided certificate's expiry.
             let unix = host_time.now().as_secs();
@@ -649,13 +645,13 @@ impl QuicTransport {
                 config.transport = Arc::clone(&transport);
                 Ok(Arc::new(config))
             };
-            let configs = WebTransportConfigs {
+            Some(WebTransport {
                 dual: config(true)?,
                 h3: config(false)?,
-            };
-            (Some(configs), Some(certificates))
+                certificates,
+            })
         } else {
-            (None, None)
+            None
         };
 
         let endpoint_config = EndpointConfig::default();
@@ -681,7 +677,6 @@ impl QuicTransport {
                 None,
             ),
             server_config: Arc::new(server_config),
-            webtransport_config,
             webtransport,
             transport_config,
             tls,
@@ -761,7 +756,7 @@ impl QuicTransport {
     pub fn webtransport_certificate_handle(&self) -> Option<WebTransportCertificateHandle> {
         self.webtransport
             .as_ref()
-            .and_then(|certificates| certificates.handle(&self.tls))
+            .and_then(|wt| wt.certificates.handle(&self.tls))
     }
 
     /// A live connection's diagnostic counters (`diagnostics` feature).
@@ -791,7 +786,7 @@ impl QuicTransport {
             .webtransport
             .as_ref()
             .filter(|_| socket.webtransport)
-            .map(|certificates| webtransport_multiaddr(quic.clone(), certificates.advertised()));
+            .map(|wt| webtransport_multiaddr(quic.clone(), wt.certificates.advertised()));
         socket
             .quic_v1
             .then_some(quic)
@@ -1004,21 +999,15 @@ impl QuicTransport {
         // The receiving socket picks the config: libp2p-only sockets keep
         // the endpoint's.
         let config = self
-            .webtransport_config
+            .webtransport
             .as_ref()
             .filter(|_| socket.webtransport)
-            .map(|configs| {
-                Arc::clone(if socket.quic_v1 {
-                    &configs.dual
-                } else {
-                    &configs.h3
-                })
-            });
+            .map(|wt| Arc::clone(if socket.quic_v1 { &wt.dual } else { &wt.h3 }));
         let webtransport = self
             .webtransport
             .as_ref()
             .filter(|_| socket.webtransport)
-            .map(Certificates::context);
+            .map(|wt| wt.certificates.context());
         match self.endpoint.accept(incoming, now, buf, config) {
             Ok((handle, conn)) => {
                 // The accepted Initial never passes through `handle_event`.
@@ -1053,7 +1042,7 @@ impl QuicTransport {
     /// has left its period, announcing each listening WebTransport address
     /// with the new certhashes. A provided certificate never rotates.
     fn rotate(&mut self) {
-        let Some(certificates) = &mut self.webtransport else {
+        let Some(WebTransport { certificates, .. }) = &mut self.webtransport else {
             return;
         };
         let unix = self.host_time.now().as_secs();
@@ -1433,7 +1422,11 @@ impl Transport for QuicTransport {
     /// Sockets are bound once, at construction; only a derived WebTransport
     /// certificate's rotation moves the set.
     fn local_addresses_revision(&self) -> Option<u64> {
-        Some(self.webtransport.as_ref().map_or(0, Certificates::revision))
+        Some(
+            self.webtransport
+                .as_ref()
+                .map_or(0, |wt| wt.certificates.revision()),
+        )
     }
 
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
@@ -1528,7 +1521,7 @@ impl Transport for QuicTransport {
         let rotation = self
             .webtransport
             .as_ref()
-            .and_then(|certificates| certificates.deadline(now));
+            .and_then(|wt| wt.certificates.deadline(now));
         Deadline::earliest_opt(timer, rotation)
     }
 }
