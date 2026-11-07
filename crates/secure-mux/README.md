@@ -18,7 +18,7 @@ Relay circuits and TCP connections differ only in what the byte stream _is_ — 
 
 ## Usage
 
-The session owns no socket, no clock, and no executor. Feed it bytes read from the underlying stream, drain its events with `poll_output`, and pull bytes to write with `poll_write` -- but only while the stream below has room. Once the session is up, each `poll_write` frames and encrypts the next Yamux frame on demand, so a downstream that stops taking bytes stops the session from producing them (ADR 0012). After the upgrade, `poll(now)` / `next_deadline()` drive Yamux keepalive from the host's time sample; keep polling on the deadline even while the stream below is full, since a ping that cannot leave is how a backed-up connection to a dead peer is caught:
+The session owns no socket, no clock, and no executor. Feed it bytes read from the underlying stream, drain its events with `poll_output`, and pull bytes to write with `poll_write` -- but only while the stream below has room. Once the session is up, each `poll_write` frames and encrypts the next Yamux frame on demand (the frame is built with room for the Noise length prefix and tag and sealed in that buffer, so it is not copied again), so a downstream that stops taking bytes stops the session from producing them (ADR 0012). After the upgrade, `poll(now)` / `next_deadline()` drive Yamux keepalive from the host's time sample; keep polling on the deadline even while the stream below is full, since a ping that cannot leave is how a backed-up connection to a dead peer is caught:
 
 ```rust
 use minip2p_secure_mux::{SecureMuxSession, SessionConfig, SessionOutput, SessionRole, YamuxConfig};

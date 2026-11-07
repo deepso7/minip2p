@@ -6,9 +6,9 @@ use minip2p_core::platform::{Deadline, Now};
 use minip2p_core::{Bytes, retain_slice};
 
 use crate::yamux::{
-    DEFAULT_RECEIVE_WINDOW, FLAG_ACK, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, FrameType,
-    KEEPALIVE_ACK_TIMEOUT_MS, KEEPALIVE_HANDOFF_TIMEOUT_MS, KEEPALIVE_INTERVAL_MS, YamuxConfig,
-    YamuxError, YamuxOutput, YamuxRole,
+    DEFAULT_RECEIVE_WINDOW, FLAG_ACK, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, FrameRoom,
+    FrameType, KEEPALIVE_ACK_TIMEOUT_MS, KEEPALIVE_HANDOFF_TIMEOUT_MS, KEEPALIVE_INTERVAL_MS,
+    YamuxConfig, YamuxError, YamuxOutput, YamuxRole,
 };
 
 /// Who queued a control frame, which decides what pulling it settles.
@@ -665,6 +665,13 @@ impl YamuxSession {
     /// remote credit. Pulling a data frame releases its bytes from the send
     /// caps, which may queue [`YamuxOutput::Writable`] events.
     pub fn poll_frame(&mut self) -> Option<Vec<u8>> {
+        self.poll_frame_with_room(FrameRoom::default())
+    }
+
+    /// [`poll_frame`](Self::poll_frame), with every frame returned in a buffer
+    /// that carries `room`. Data frames are encoded straight into it; the
+    /// small control frames are moved in.
+    pub(crate) fn poll_frame_with_room(&mut self, room: FrameRoom) -> Option<Vec<u8>> {
         if let Some((frame, origin)) = self.control.pop_front() {
             match origin {
                 Origin::Local => {}
@@ -675,16 +682,16 @@ impl YamuxSession {
                     }
                 }
             }
-            return Some(frame);
+            return Some(room.wrap(frame));
         }
         if self.lifecycle != Lifecycle::Active {
             return None;
         }
         debug_assert!(self.work_indexed(), "stream work index out of sync");
         if let Some(frame) = self.deferred_control_frame() {
-            return Some(frame);
+            return Some(room.wrap(frame));
         }
-        let frame = self.data_frame()?;
+        let frame = self.data_frame(room)?;
         self.wake_writable();
         Some(frame)
     }
@@ -948,8 +955,8 @@ impl YamuxSession {
     }
 
     /// Frames the next stream's data, round-robin from `send_cursor`, or its
-    /// `FIN` once its accepted bytes have all gone.
-    fn data_frame(&mut self) -> Option<Vec<u8>> {
+    /// `FIN` once its accepted bytes have all gone, in a buffer with `room`.
+    fn data_frame(&mut self, room: FrameRoom) -> Option<Vec<u8>> {
         let after = self.send_cursor;
         // Exclusive, so a sendable `u32::MAX` cannot keep the turn.
         let stream = *self
@@ -974,7 +981,7 @@ impl YamuxSession {
                     flags |= FLAG_FIN;
                 }
                 let payload = chunk.bytes.get(..sent).unwrap_or_default();
-                let frame = Frame::encode_data(stream, flags, payload)
+                let frame = Frame::encode_data_with_room(stream, flags, payload, room)
                     .expect("payload length is bounded by the u32 send window");
                 if drained {
                     state.send_buffer.pop_front();
@@ -989,7 +996,8 @@ impl YamuxSession {
             // Only a pending close is sendable with nothing buffered.
             _ => {
                 flags |= FLAG_FIN;
-                Frame::encode_data(stream, flags, &[]).expect("empty FIN frame is valid")
+                Frame::encode_data_with_room(stream, flags, &[], room)
+                    .expect("empty FIN frame is valid")
             }
         };
         if flags & FLAG_FIN != 0 {

@@ -25,11 +25,15 @@ use handshake::{HandshakeResult, HandshakeState};
 use minip2p_identity::{Ed25519Keypair, PeerId, PublicKey};
 use thiserror::Error;
 
+pub(crate) use cipher::TAG_LEN;
 pub use frames::{FrameDecoder, MAX_FRAME_LEN, encode_frame};
 pub use payload::{NoiseExtensions, NoiseHandshakePayload};
 
 /// Multistream-select protocol identifier for libp2p Noise.
 pub const NOISE_PROTOCOL_ID: &str = "/noise";
+
+/// Length of the big-endian length prefix before every Noise frame.
+pub(crate) const FRAME_PREFIX_LEN: usize = 2;
 
 /// Largest plaintext carried by one encrypted transport frame.
 pub const MAX_TRANSPORT_PLAINTEXT: usize = MAX_FRAME_LEN - cipher::TAG_LEN;
@@ -240,6 +244,23 @@ impl NoiseSession {
         self.settle(result)
     }
 
+    /// [`encrypt`](Self::encrypt) for a plaintext that sits at
+    /// `frame[FRAME_PREFIX_LEN..]`, with the head reserved for the length
+    /// prefix. A plaintext that fits one transport frame is sealed in that
+    /// buffer, which is queued as the frame: give it [`TAG_LEN`] bytes
+    /// of spare capacity and nothing is allocated or copied. A larger one is
+    /// split and copied as `encrypt` does.
+    pub(crate) fn encrypt_in_place(&mut self, frame: Vec<u8>) -> Result<(), NoiseError> {
+        let result = self.check_live().and_then(|()| {
+            let plaintext_len = frame.len().saturating_sub(FRAME_PREFIX_LEN);
+            if plaintext_len > MAX_TRANSPORT_PLAINTEXT {
+                return self.encrypt_frames(frame.get(FRAME_PREFIX_LEN..).unwrap_or_default());
+            }
+            self.seal_frame(frame)
+        });
+        self.settle(result)
+    }
+
     /// Returns the next pending output, if any.
     ///
     /// Drain until `None` after every input, before waiting on the stream or
@@ -328,24 +349,37 @@ impl NoiseSession {
     /// Frames and encrypts `plaintext` in `MAX_TRANSPORT_PLAINTEXT` segments.
     /// Each segment is copied once into its outbound frame and encrypted there.
     fn encrypt_frames(&mut self, plaintext: &[u8]) -> Result<(), NoiseError> {
-        let State::Transport { send: cipher, .. } = &mut self.state else {
-            return Err(NoiseError::InvalidInput("handshake is not complete"));
-        };
         // An empty write still emits one tag-only frame.
         let empty = plaintext.is_empty().then_some(&[][..]);
         for segment in plaintext.chunks(MAX_TRANSPORT_PLAINTEXT).chain(empty) {
-            let len = segment.len() + cipher::TAG_LEN;
-            #[expect(
-                clippy::map_err_ignore,
-                reason = "The conversion error has no detail beyond the length stored in NoiseError."
-            )]
-            let prefix = u16::try_from(len).map_err(|_| NoiseError::FrameTooLarge { len })?;
-            let mut frame = Vec::with_capacity(2 + len);
-            frame.extend_from_slice(&prefix.to_be_bytes());
+            let mut frame = Vec::with_capacity(FRAME_PREFIX_LEN + segment.len() + cipher::TAG_LEN);
+            frame.extend_from_slice(&[0; FRAME_PREFIX_LEN]);
             frame.extend_from_slice(segment);
-            cipher.encrypt_with_ad(b"", &mut frame, 2)?;
-            self.pending.push_back(NoiseOutput::Outbound(frame));
+            self.seal_frame(frame)?;
         }
+        Ok(())
+    }
+
+    /// Writes the length prefix over `frame[..FRAME_PREFIX_LEN]`, encrypts the
+    /// plaintext after it in place, appends the tag and queues the frame.
+    fn seal_frame(&mut self, mut frame: Vec<u8>) -> Result<(), NoiseError> {
+        let State::Transport { send: cipher, .. } = &mut self.state else {
+            return Err(NoiseError::InvalidInput("handshake is not complete"));
+        };
+        let len = frame.len().saturating_sub(FRAME_PREFIX_LEN) + cipher::TAG_LEN;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "The conversion error has no detail beyond the length stored in NoiseError."
+        )]
+        let prefix = u16::try_from(len).map_err(|_| NoiseError::FrameTooLarge { len })?;
+        let Some(head) = frame.get_mut(..FRAME_PREFIX_LEN) else {
+            return Err(NoiseError::InvalidInput(
+                "frame has no room for its length prefix",
+            ));
+        };
+        head.copy_from_slice(&prefix.to_be_bytes());
+        cipher.encrypt_with_ad(b"", &mut frame, FRAME_PREFIX_LEN)?;
+        self.pending.push_back(NoiseOutput::Outbound(frame));
         Ok(())
     }
 }
@@ -651,6 +685,37 @@ mod tests {
             pair.responder.poll_output(),
             Some(NoiseOutput::Decrypted(plaintext))
         );
+    }
+
+    #[test]
+    fn in_place_encryption_matches_encrypt_and_keeps_the_buffer() {
+        let mut copied = Pair::new();
+        let mut in_place = Pair::new();
+        copied.handshake();
+        in_place.handshake();
+        for len in [0, 1, MAX_TRANSPORT_PLAINTEXT, MAX_TRANSPORT_PLAINTEXT + 1] {
+            let plaintext = alloc::vec![7; len];
+            copied.initiator.encrypt(&plaintext).unwrap();
+            let mut frame = Vec::with_capacity(FRAME_PREFIX_LEN + len + TAG_LEN);
+            frame.extend_from_slice(&[0; FRAME_PREFIX_LEN]);
+            frame.extend_from_slice(&plaintext);
+            let buffer = frame.as_ptr();
+            in_place.initiator.encrypt_in_place(frame).unwrap();
+            let mut first = true;
+            while let Some(expected) = copied.initiator.poll_output() {
+                let NoiseOutput::Outbound(sealed) = in_place.initiator.poll_output().unwrap()
+                else {
+                    panic!("expected outbound data");
+                };
+                // A plaintext that fits one frame is sealed in the given buffer.
+                if first && len <= MAX_TRANSPORT_PLAINTEXT {
+                    assert_eq!(sealed.as_ptr(), buffer);
+                }
+                first = false;
+                assert_eq!(NoiseOutput::Outbound(sealed), expected);
+            }
+            assert!(in_place.initiator.poll_output().is_none());
+        }
     }
 
     #[test]
