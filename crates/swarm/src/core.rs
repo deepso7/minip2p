@@ -2276,8 +2276,8 @@ mod tests {
         .expect("peer addr");
         let mut swarm = swarm_with(ScriptedTransport::default(), SeqEntropy(1));
         let conn_id = swarm.dial(&addr).expect("dial");
-        assert!(swarm.abort_dial(conn_id).expect("abort"));
-        // The transport had already queued the handshake's completion.
+        // The transport has already queued the handshake's completion when
+        // the host aborts; `close` does not drop it.
         swarm
             .transport_mut()
             .initial
@@ -2285,6 +2285,7 @@ mod tests {
                 id: conn_id,
                 endpoint: ConnectionEndpoint::with_peer_id(addr.transport().clone(), peer.clone()),
             });
+        assert!(swarm.abort_dial(conn_id).expect("abort"));
         let events = swarm.poll(Now::from_millis(1)).expect("late connected");
         assert!(
             events.is_empty(),
