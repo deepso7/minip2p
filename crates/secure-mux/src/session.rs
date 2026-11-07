@@ -4,8 +4,11 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::noise::{NOISE_PROTOCOL_ID, NoiseConfig, NoiseOutput, NoiseRole, NoiseSession};
-use crate::yamux::{YAMUX_PROTOCOL_ID, YamuxOutput, YamuxRole, YamuxSession};
+use crate::noise::{
+    FRAME_PREFIX_LEN, NOISE_PROTOCOL_ID, NoiseConfig, NoiseError, NoiseOutput, NoiseRole,
+    NoiseSession, TAG_LEN,
+};
+use crate::yamux::{FrameRoom, YAMUX_PROTOCOL_ID, YamuxOutput, YamuxRole, YamuxSession};
 use minip2p_core::Bytes;
 use minip2p_core::platform::{Deadline, Now};
 use minip2p_identity::{Ed25519Keypair, PeerId};
@@ -330,10 +333,10 @@ impl SecureMuxSession {
         let Phase::Ready { noise, yamux, .. } = &mut self.phase else {
             return Ok(None);
         };
-        let Some(frame) = yamux.poll_frame() else {
+        let Some(frame) = yamux.poll_frame_with_room(SEAL_ROOM) else {
             return Ok(None);
         };
-        let encrypted = encrypt_into(noise, frame, &mut self.writes);
+        let encrypted = seal_into(noise, frame, &mut self.writes);
         push_yamux_events(yamux, &mut self.outputs);
         if let Err(error) = encrypted {
             self.phase = Phase::Failed {
@@ -923,8 +926,8 @@ impl SecureMuxSession {
         failed: bool,
     ) -> Result<(), SessionError> {
         if failed {
-            while let Some(frame) = yamux.poll_frame() {
-                encrypt_into(noise, frame, &mut self.writes)?;
+            while let Some(frame) = yamux.poll_frame_with_room(SEAL_ROOM) {
+                seal_into(noise, frame, &mut self.writes)?;
             }
         }
         let go_away = push_yamux_events(yamux, &mut self.outputs);
@@ -973,8 +976,35 @@ fn encrypt_into(
     plaintext: Vec<u8>,
     writes: &mut WriteQueue,
 ) -> Result<(), SessionError> {
-    noise
-        .encrypt(&plaintext)
+    let encrypted = noise.encrypt(&plaintext);
+    queue_encrypted(noise, encrypted, writes)
+}
+
+/// The room Noise needs to seal a Yamux frame in its own buffer: the length
+/// prefix before it and the tag after it.
+const SEAL_ROOM: FrameRoom = FrameRoom {
+    head: FRAME_PREFIX_LEN,
+    tail: TAG_LEN,
+};
+
+/// [`encrypt_into`] for a Yamux frame polled with [`SEAL_ROOM`], which Noise
+/// seals in place: the frame's buffer goes to the wire.
+fn seal_into(
+    noise: &mut NoiseSession,
+    frame: Vec<u8>,
+    writes: &mut WriteQueue,
+) -> Result<(), SessionError> {
+    let encrypted = noise.encrypt_in_place(frame);
+    queue_encrypted(noise, encrypted, writes)
+}
+
+/// Moves what an encryption queued from Noise into `writes`.
+fn queue_encrypted(
+    noise: &mut NoiseSession,
+    encrypted: Result<(), NoiseError>,
+    writes: &mut WriteQueue,
+) -> Result<(), SessionError> {
+    encrypted
         .map_err(|error| SessionError::protocol(format!("Noise encryption failed: {error}")))?;
     while let Some(output) = noise.poll_output() {
         match output {

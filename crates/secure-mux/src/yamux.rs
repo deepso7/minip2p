@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use minip2p_core::Bytes;
 use thiserror::Error;
 
+pub(crate) use frame::FrameRoom;
 pub use frame::{
     FLAG_ACK, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, FrameType, HEADER_LEN,
 };
