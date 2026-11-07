@@ -112,7 +112,6 @@ pub(crate) struct Shared {
     driver_waiting: AtomicBool,
     commands_idle: Mutex<()>,
     commands_idle_cv: Condvar,
-    pub(crate) driver_running: AtomicBool,
     doorbell_running: AtomicBool,
 }
 
@@ -148,32 +147,42 @@ impl EventState {
 
 pub(crate) struct EndpointState {
     pub(crate) lifecycle: Lifecycle,
-    pub(crate) endpoint: Option<Endpoint>,
     pub(crate) driver_thread_id: Option<std::thread::ThreadId>,
     doorbell_thread_id: Option<std::thread::ThreadId>,
-    /// Unsent tails of the bindings' stream writes.
-    pub(crate) writes: minip2p::StreamWriter,
     /// The peer table last published to `connected_peers`.
     pub(crate) published_peers: Vec<PeerId>,
-    /// How long the exiting driver drains its close, set by `stop`.
-    pub(crate) close_timeout: Duration,
 }
 
-impl EndpointState {
-    /// Releases the Endpoint together with the tails held for it, which can
-    /// be large and are owed to streams that no longer exist.
-    pub(crate) fn release_endpoint(&mut self) -> Option<Endpoint> {
-        self.writes = crate::stream_writer();
-        self.endpoint.take()
-    }
+/// The endpoint with the unsent tails of the bindings' stream writes, which
+/// can be large and are owed to its streams, so they are released with it.
+pub(crate) struct Live {
+    pub(crate) endpoint: Endpoint,
+    pub(crate) writes: minip2p::StreamWriter,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Lifecycle {
-    Created,
-    Running,
-    Stopping,
+    /// Bound and accepting commands; no driver yet.
+    Created(Live),
+    /// The driver is running.
+    Running(Live),
+    /// Shutdown has begun. The driver holds `live` until it leaves its loop,
+    /// then takes it to close within `close_timeout` (at once after a failure).
+    Stopping {
+        live: Option<Live>,
+        close_timeout: Duration,
+    },
+    /// The endpoint is released.
     Stopped,
+}
+
+impl Lifecycle {
+    /// The live endpoint while it accepts commands: created or running.
+    fn accepting(&mut self) -> Result<&mut Live, FfiError> {
+        match self {
+            Self::Created(live) | Self::Running(live) => Ok(live),
+            Self::Stopping { .. } | Self::Stopped => Err(FfiError::Stopped),
+        }
+    }
 }
 
 struct DoorbellSender(SyncSender<()>);
@@ -312,13 +321,13 @@ impl P2pEndpoint {
         Ok(Arc::new(Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(EndpointState {
-                    lifecycle: Lifecycle::Created,
-                    endpoint: Some(endpoint),
+                    lifecycle: Lifecycle::Created(Live {
+                        endpoint,
+                        writes: crate::stream_writer(),
+                    }),
                     driver_thread_id: None,
                     doorbell_thread_id: None,
-                    writes: crate::stream_writer(),
                     published_peers: Vec::new(),
-                    close_timeout: Duration::ZERO,
                 }),
                 events: Mutex::new(EventState {
                     listen_addrs,
@@ -332,7 +341,6 @@ impl P2pEndpoint {
                 driver_waiting: AtomicBool::new(false),
                 commands_idle: Mutex::new(()),
                 commands_idle_cv: Condvar::new(),
-                driver_running: AtomicBool::new(false),
                 doorbell_running: AtomicBool::new(false),
             }),
             peer_id,
@@ -395,7 +403,7 @@ impl P2pEndpoint {
     /// [`P2pEndpoint::wait_stopped`] to observe complete driver exit.
     pub fn is_running(&self) -> bool {
         let _pending = PendingCommand::new(&self.shared);
-        self.shared.lock_state().lifecycle == Lifecycle::Running
+        matches!(self.shared.lock_state().lifecycle, Lifecycle::Running(_))
     }
 
     /// Starts the detached background endpoint driver.
@@ -438,27 +446,15 @@ impl P2pEndpoint {
     /// `DriverFailed`) themselves.
     pub fn stop(&self, timeout_ms: u64) {
         let _pending = PendingCommand::new(&self.shared);
-        let endpoint = {
-            let mut state = self.shared.lock_state();
-            match state.lifecycle {
-                Lifecycle::Created => {
-                    self.shared.set_lifecycle(&mut state, Lifecycle::Stopped);
-                    state.release_endpoint()
-                }
-                Lifecycle::Running => {
-                    self.shared.set_lifecycle(&mut state, Lifecycle::Stopping);
-                    state.close_timeout = Duration::from_millis(timeout_ms);
-                    None
-                }
-                Lifecycle::Stopping | Lifecycle::Stopped => None,
-            }
-        };
-        // Only a stop from `Created` releases the endpoint here; a running
-        // driver releases it on exit.
-        let released = endpoint.is_some();
-        drop(endpoint);
-        if released {
-            self.shared.latch_stopped();
+        let mut state = self.shared.lock_state();
+        match state.lifecycle {
+            // Only a stop from `Created` releases the endpoint here; a
+            // running driver releases it on exit.
+            Lifecycle::Created(_) => self.shared.finish_stop(state),
+            Lifecycle::Running(_) => self
+                .shared
+                .begin_stop(&mut state, Duration::from_millis(timeout_ms)),
+            Lifecycle::Stopping { .. } | Lifecycle::Stopped => {}
         }
     }
 
@@ -865,26 +861,31 @@ impl P2pEndpoint {
         // A second `start` finds the driver parked on the lock.
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
-        match state.lifecycle {
-            Lifecycle::Created => {}
-            Lifecycle::Running => return Err(FfiError::AlreadyStarted),
-            Lifecycle::Stopping | Lifecycle::Stopped => return Err(FfiError::Stopped),
-        }
-
-        let shared = Arc::clone(&self.shared);
-        state.lifecycle = Lifecycle::Running;
-        self.shared.driver_running.store(true, Ordering::Release);
-        let doorbell_thread_id = spawn(shared, doorbell).map_err(|error| {
-            self.shared.set_lifecycle(&mut state, Lifecycle::Stopped);
-            state.release_endpoint();
-            self.shared.driver_running.store(false, Ordering::Release);
-            self.shared.latch_stopped();
-            FfiError::Internal {
-                detail: format!("failed to spawn endpoint driver: {error}"),
+        state.lifecycle = match std::mem::replace(&mut state.lifecycle, Lifecycle::Stopped) {
+            Lifecycle::Created(live) => Lifecycle::Running(live),
+            other => {
+                let error = match other {
+                    Lifecycle::Running(_) => FfiError::AlreadyStarted,
+                    _ => FfiError::Stopped,
+                };
+                state.lifecycle = other;
+                return Err(error);
             }
-        })?;
-        state.doorbell_thread_id = Some(doorbell_thread_id);
-        Ok(())
+        };
+
+        // The driver parks on `state` until this returns.
+        match spawn(Arc::clone(&self.shared), doorbell) {
+            Ok(doorbell_thread_id) => {
+                state.doorbell_thread_id = Some(doorbell_thread_id);
+                Ok(())
+            }
+            Err(error) => {
+                self.shared.finish_stop(state);
+                Err(FfiError::Internal {
+                    detail: format!("failed to spawn endpoint driver: {error}"),
+                })
+            }
+        }
     }
     /// Returns Rust-side background-driver diagnostics.
     ///
@@ -895,10 +896,8 @@ impl P2pEndpoint {
 
     fn with_endpoint<T>(&self, operation: impl FnOnce(&Endpoint) -> T) -> Result<T, FfiError> {
         let _pending = PendingCommand::new(&self.shared);
-        let state = self.shared.lock_state();
-        ensure_accepting_commands(&state)?;
-        let endpoint = state.endpoint.as_ref().ok_or(FfiError::Stopped)?;
-        Ok(operation(endpoint))
+        let mut state = self.shared.lock_state();
+        Ok(operation(&state.lifecycle.accepting()?.endpoint))
     }
 
     fn with_endpoint_mut<T>(
@@ -915,11 +914,8 @@ impl P2pEndpoint {
     ) -> Result<T, FfiError> {
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
-        ensure_accepting_commands(&state)?;
-        let EndpointState {
-            endpoint, writes, ..
-        } = &mut *state;
-        operation(endpoint.as_mut().ok_or(FfiError::Stopped)?, writes)
+        let Live { endpoint, writes } = state.lifecycle.accepting()?;
+        operation(endpoint, writes)
     }
 }
 
@@ -940,13 +936,32 @@ impl Shared {
         self.events.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Moves `state` to `lifecycle`, and `connected_peers` to `Stopped` with
-    /// it once shutdown begins.
-    pub(crate) fn set_lifecycle(&self, state: &mut EndpointState, lifecycle: Lifecycle) {
-        state.lifecycle = lifecycle;
-        if matches!(lifecycle, Lifecycle::Stopping | Lifecycle::Stopped) {
-            self.lock_events().stopped = true;
-        }
+    /// Moves a running endpoint to `Stopping`, for the driver to close
+    /// within `close_timeout`, and `connected_peers` to `Stopped` with it.
+    /// Any other lifecycle is left as is.
+    pub(crate) fn begin_stop(&self, state: &mut EndpointState, close_timeout: Duration) {
+        state.lifecycle = match std::mem::replace(&mut state.lifecycle, Lifecycle::Stopped) {
+            Lifecycle::Running(live) => Lifecycle::Stopping {
+                live: Some(live),
+                close_timeout,
+            },
+            other => {
+                state.lifecycle = other;
+                return;
+            }
+        };
+        self.lock_events().stopped = true;
+    }
+
+    /// Moves `state` to `Stopped`, and `connected_peers` with it; then,
+    /// outside the lock, releases whatever endpoint it still held and wakes
+    /// `wait_stopped`.
+    pub(crate) fn finish_stop(&self, mut state: MutexGuard<'_, EndpointState>) {
+        let released = std::mem::replace(&mut state.lifecycle, Lifecycle::Stopped);
+        self.lock_events().stopped = true;
+        drop(state);
+        drop(released);
+        self.latch_stopped();
     }
 
     /// Publishes `endpoint`'s peer table to `connected_peers` when it differs
@@ -1013,7 +1028,7 @@ impl Shared {
     }
 
     /// Records that the lifecycle reached `Stopped` and wakes `wait_stopped`.
-    pub(crate) fn latch_stopped(&self) {
+    fn latch_stopped(&self) {
         *self.lock_stopped() = true;
         self.stopped_cv.notify_all();
     }
@@ -1141,13 +1156,6 @@ fn display_addrs(addrs: Vec<Multiaddr>) -> Vec<String> {
 
 fn age(now: Option<u64>, last_seen: Option<u64>) -> Option<u64> {
     Some(now?.saturating_sub(last_seen?))
-}
-
-fn ensure_accepting_commands(state: &EndpointState) -> Result<(), FfiError> {
-    match state.lifecycle {
-        Lifecycle::Created | Lifecycle::Running => Ok(()),
-        Lifecycle::Stopping | Lifecycle::Stopped => Err(FfiError::Stopped),
-    }
 }
 
 #[cfg(test)]
@@ -1322,9 +1330,10 @@ mod tests {
             "drain completes while the driver holds the state lock"
         );
         let outcome = parked
-            .endpoint
-            .as_mut()
+            .lifecycle
+            .accepting()
             .expect("endpoint")
+            .endpoint
             .wait(Duration::from_millis(20))
             .expect("wait");
         assert!(
@@ -1638,7 +1647,10 @@ mod tests {
         .join();
         assert!(result.is_err(), "the lock-poisoning worker must panic");
 
-        assert!(endpoint.shared.lock_state().endpoint.is_some());
+        assert!(matches!(
+            endpoint.shared.lock_state().lifecycle,
+            Lifecycle::Created(_)
+        ));
     }
 
     #[test]
@@ -1820,9 +1832,10 @@ mod tests {
             .expect("query completes while the driver holds the state lock");
         assert!(peers.expect("created endpoint").is_empty());
         let outcome = parked
-            .endpoint
-            .as_mut()
+            .lifecycle
+            .accepting()
             .expect("endpoint")
+            .endpoint
             .wait(Duration::from_millis(20))
             .expect("wait");
         assert!(!matches!(
@@ -2026,8 +2039,7 @@ mod tests {
 
         assert!(endpoint.wait_stopped(0));
         let state = endpoint.shared.lock_state();
-        assert_eq!(state.lifecycle, Lifecycle::Stopped);
-        assert!(state.endpoint.is_none());
+        assert!(matches!(state.lifecycle, Lifecycle::Stopped));
     }
 
     #[test]
@@ -2040,7 +2052,10 @@ mod tests {
 
         assert!(endpoint.wait_stopped(1_000));
         assert!(!endpoint.is_running());
-        assert!(endpoint.shared.lock_state().endpoint.is_none());
+        assert!(matches!(
+            endpoint.shared.lock_state().lifecycle,
+            Lifecycle::Stopped
+        ));
     }
 
     /// The last event drained once `endpoint` has stopped.
@@ -2260,8 +2275,7 @@ mod tests {
         assert!(endpoint.wait_stopped(0));
         assert!(matches!(endpoint.connected_peers(), Err(FfiError::Stopped)));
         let state = endpoint.shared.lock_state();
-        assert_eq!(state.lifecycle, Lifecycle::Stopped);
-        assert!(state.endpoint.is_none());
+        assert!(matches!(state.lifecycle, Lifecycle::Stopped));
     }
 
     #[test]
@@ -2343,19 +2357,22 @@ mod tests {
     fn fatal_driver_panic_is_reported_before_stopped() {
         let endpoint = endpoint(config()).expect("endpoint");
         let listener = Arc::new(RecordingDoorbell::default());
-        {
-            let mut state = endpoint.shared.lock_state();
-            state.lifecycle = Lifecycle::Running;
-            state.endpoint = None;
-        }
         endpoint
-            .shared
-            .driver_running
-            .store(true, Ordering::Release);
+            .start_with(Arc::new(NoopDoorbell), |_, _| {
+                Ok(std::thread::spawn(|| {}).thread().id())
+            })
+            .expect("mark running");
 
-        crate::driver::run(
+        // Panics holding `state`, as a panic inside `pump` would, so the
+        // driver's cleanup runs over a poisoned lock.
+        let shared = Arc::clone(&endpoint.shared);
+        crate::driver::run_with(
             Arc::clone(&endpoint.shared),
             Arc::clone(&listener) as Arc<dyn EventDoorbell>,
+            move |_| {
+                let _state = shared.lock_state();
+                panic!("injected driver panic")
+            },
         );
 
         assert!(matches!(
@@ -2382,20 +2399,17 @@ mod tests {
             endpoint: Arc::downgrade(&endpoint),
             result: Mutex::new(None),
         });
-        {
-            let mut state = endpoint.shared.lock_state();
-            state.lifecycle = Lifecycle::Running;
-            state.endpoint = None;
-        }
         endpoint
-            .shared
-            .driver_running
-            .store(true, Ordering::Release);
+            .start_with(Arc::new(NoopDoorbell), |_, _| {
+                Ok(std::thread::spawn(|| {}).thread().id())
+            })
+            .expect("mark running");
 
         let started = Instant::now();
-        crate::driver::run(
+        crate::driver::run_with(
             Arc::clone(&endpoint.shared),
             Arc::clone(&listener) as Arc<dyn EventDoorbell>,
+            |_| panic!("injected driver panic"),
         );
 
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -2411,19 +2425,16 @@ mod tests {
     #[test]
     fn pending_command_interrupts_a_waiter_and_balances_the_counter() {
         let endpoint = endpoint(config()).expect("endpoint");
-        endpoint
-            .shared
-            .driver_running
-            .store(true, Ordering::Release);
         let shared = Arc::clone(&endpoint.shared);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             let mut state = shared.lock_state();
             entered_tx.send(()).expect("signal waiter");
             let outcome = state
-                .endpoint
-                .as_mut()
+                .lifecycle
+                .accepting()
                 .expect("endpoint")
+                .endpoint
                 .wait(Duration::from_secs(5))
                 .expect("wait");
             assert!(matches!(outcome, minip2p::EndpointWaitOutcome::Interrupted));
@@ -2437,10 +2448,6 @@ mod tests {
         }
         waiter.join().expect("waiter exits after interrupt");
         assert_eq!(endpoint.shared.pending_commands.load(Ordering::Acquire), 0);
-        endpoint
-            .shared
-            .driver_running
-            .store(false, Ordering::Release);
     }
 
     #[test]
@@ -2533,7 +2540,10 @@ mod tests {
             Err(FfiError::MessageTooLarge)
         ));
 
-        endpoint.shared.lock_state().lifecycle = Lifecycle::Stopping;
+        endpoint.shared.lock_state().lifecycle = Lifecycle::Stopping {
+            live: None,
+            close_timeout: Duration::ZERO,
+        };
         assert!(matches!(
             endpoint.subscribe("room".into()),
             Err(FfiError::Stopped)

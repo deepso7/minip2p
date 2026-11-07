@@ -142,10 +142,6 @@ pub(crate) struct Engine<T: Transport, E: EntropySource, M: Carrier> {
     carrier: PhantomData<fn(M)>,
     #[cfg(feature = "relay-server")]
     pub(crate) relay_server: Option<RelayServerDriver>,
-    /// The transport address revision the relay server's listener addresses
-    /// were last taken at.
-    #[cfg(feature = "relay-server")]
-    relay_listeners_revision: Option<u64>,
     #[cfg(test)]
     pub(crate) stats: Stats,
 }
@@ -173,8 +169,6 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
             carrier: PhantomData,
             #[cfg(feature = "relay-server")]
             relay_server: None,
-            #[cfg(feature = "relay-server")]
-            relay_listeners_revision: None,
             #[cfg(test)]
             stats: Stats::default(),
         }
@@ -880,12 +874,12 @@ impl<T: Transport, E: EntropySource, M: Carrier> Engine<T, E, M> {
         #[cfg(not(feature = "autonat"))]
         let nat_moved = false;
         #[cfg(feature = "relay-server")]
-        let listeners_moved = self.relay_server.is_some() && {
+        let listeners_moved = self.relay_server.as_mut().is_some_and(|relay_server| {
             let revision = self.core.transport().local_addresses_revision();
-            let moved = revision.is_none() || revision != self.relay_listeners_revision;
-            self.relay_listeners_revision = revision;
+            let moved = revision.is_none() || revision != relay_server.listeners_revision;
+            relay_server.listeners_revision = revision;
             moved
-        };
+        });
         #[cfg(not(feature = "relay-server"))]
         let listeners_moved = false;
         if !(force || nat_moved || listeners_moved) {
