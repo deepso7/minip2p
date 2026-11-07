@@ -2363,10 +2363,16 @@ mod tests {
             })
             .expect("mark running");
 
+        // Panics holding `state`, as a panic inside `pump` would, so the
+        // driver's cleanup runs over a poisoned lock.
+        let shared = Arc::clone(&endpoint.shared);
         crate::driver::run_with(
             Arc::clone(&endpoint.shared),
             Arc::clone(&listener) as Arc<dyn EventDoorbell>,
-            |_| panic!("injected driver panic"),
+            move |_| {
+                let _state = shared.lock_state();
+                panic!("injected driver panic")
+            },
         );
 
         assert!(matches!(
