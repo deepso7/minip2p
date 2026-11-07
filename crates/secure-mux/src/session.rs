@@ -987,8 +987,9 @@ const SEAL_ROOM: FrameRoom = FrameRoom {
     tail: TAG_LEN,
 };
 
-/// [`encrypt_into`] for a Yamux frame polled with [`SEAL_ROOM`], which Noise
-/// seals in place: the frame's buffer goes to the wire.
+/// [`encrypt_into`] for a Yamux frame polled with [`SEAL_ROOM`]. A frame that
+/// fits one Noise message is sealed in place and its buffer goes to the wire;
+/// a larger one is split and copied.
 fn seal_into(
     noise: &mut NoiseSession,
     frame: Vec<u8>,
